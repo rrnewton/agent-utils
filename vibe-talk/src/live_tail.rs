@@ -23,6 +23,17 @@ use crate::slack::ids::ChannelRef;
 use crate::slack::tail::TailRecord;
 use crate::state::AppState;
 
+/// Why a channel whose event stream came back after a silence is not presented as complete.
+/// `#708 vt-live-push`.
+const STREAM_AWAY: &str =
+    "The chat service's event stream was away; what it missed has not been read yet.";
+/// Why a channel whose event stream lost records is not presented as complete.
+const STREAM_LOST: &str =
+    "The chat service's event stream lost messages; they have not been read yet.";
+/// Why a channel a record of which could not be applied is not presented as complete.
+const STREAM_UNAPPLIED: &str =
+    "A message the chat service's event stream announced has not been read yet.";
+
 /// What one record did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TailOutcome {
@@ -110,6 +121,13 @@ pub async fn ingest(
         let channels = channels_of(state, None);
         for (channel, _) in &channels {
             state.live.request_rewalk(&channel.id);
+            // `#708 vt-live-push`: until a live read after this one, the channel may lack what
+            // the stream did not carry while it was away.
+            state.live.note_unreconciled(
+                &channel.id,
+                state.live.reconciled_ms(&channel.id),
+                STREAM_AWAY,
+            );
         }
         tracing::info!(
             channels = channels.len(),
@@ -132,6 +150,11 @@ pub async fn ingest(
                 wake(state, &channel.id);
                 state.live.request_relist(&channel.id);
                 state.live.request_rewalk(&channel.id);
+                state.live.note_unreconciled(
+                    &channel.id,
+                    state.live.reconciled_ms(&channel.id),
+                    STREAM_LOST,
+                );
             }
             tracing::warn!(
                 channels = channels.len(),
@@ -187,11 +210,23 @@ pub async fn ingest(
                     }
                     continue;
                 }
-                let Some(mut message) = state
+                let pushed = state
                     .providers
                     .pushed_message(&channel.id, raw.clone())
-                    .await?
-                else {
+                    .await;
+                if let Err(error) = &pushed {
+                    if !matches!(error, ChatError::Shape(_)) {
+                        // `#708 vt-live-push`: seen, and not applied. The poller reads it; until
+                        // then the channel is not presented as complete.
+                        wake(state, &channel.id);
+                        state.live.note_unreconciled(
+                            &channel.id,
+                            state.live.reconciled_ms(&channel.id),
+                            STREAM_UNAPPLIED,
+                        );
+                    }
+                }
+                let Some(mut message) = pushed? else {
                     continue;
                 };
                 crate::ops::prepare_arrival(

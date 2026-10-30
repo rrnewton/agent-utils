@@ -64,6 +64,12 @@
 //! The first read of a conversation notes each root on the newest page as it stands and reports no
 //! reply, as the poller's first tick publishes nothing. From then on a reply newer than the newest
 //! instant that read saw is news in any thread, including one whose root it did not see.
+//!
+//! Where a root stands is only where the poller starts: a thread whose replies before the seed
+//! never reached the message cache (the server was restarting, or every read was refused) is read
+//! from its root on a later read when the poller asks for it
+//! ([`crate::chat::ChatClient::reread_thread`], `#708 vt-live-push`), as it does for every thread
+//! whose root counts more replies than the cache holds.
 
 use std::collections::{HashMap, HashSet};
 
@@ -286,6 +292,29 @@ impl LiveThreads {
         }
         moved.sort_by_key(|thread| thread.latest.unwrap_or(i64::MAX));
         self.moved.extend(moved);
+    }
+
+    /// Read `root`'s replies after `after` (microseconds; `None` for every reply) on the next
+    /// read, whatever this took the thread as read to. `#708 vt-live-push`. The thread is read
+    /// until its root's latest reply as this last saw it has come back, as any moved thread is.
+    fn reread(&mut self, root: &str, after: Option<i64>) {
+        let from = after.unwrap_or_else(|| ids::ts_micros(root).unwrap_or(0));
+        let floor = self.floor;
+        let place = self
+            .places
+            .entry(root.to_owned())
+            .or_insert(Place::at(floor, 0));
+        let latest = (place.through > from).then_some(place.through);
+        place.through = place.through.min(from);
+        place.misses = 0;
+        let count = place.count;
+        if !self.moved.iter().any(|thread| thread.root == root) {
+            self.moved.push(Moved {
+                root: root.to_owned(),
+                latest,
+                count,
+            });
+        }
     }
 
     /// Take the thread as read to what its root said: its latest reply, and its count.
@@ -599,6 +628,28 @@ impl HttpSlackClient {
         found.sort_by_key(|raw| raw.micros);
         found.dedup_by_key(|raw| raw.micros);
         (found, !held.moved.is_empty(), seen)
+    }
+
+    /// [`crate::chat::ChatClient::reread_thread`] for `conversation`, which the poller has seeded:
+    /// whether the thread will be read. `#708 vt-live-push`.
+    pub(super) fn reread_live_thread(
+        &self,
+        conversation: &str,
+        root: &str,
+        after: Option<i64>,
+    ) -> bool {
+        if ids::ts_micros(root).is_none() {
+            return false;
+        }
+        let mut held = self
+            .live_threads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(threads) = held.get_mut(conversation) else {
+            return false;
+        };
+        threads.reread(root, after);
+        true
     }
 
     /// What the poller holds for `conversation`, when it has seeded it.

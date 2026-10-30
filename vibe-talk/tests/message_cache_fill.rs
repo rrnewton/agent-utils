@@ -801,7 +801,9 @@ async fn a_slack_window_holding_a_thread_reply_keeps_its_rows_and_claims_nothing
 
 /// `#307 slack-reply-live`: the live poller reads a Slack conversation through `fetch_live`. Its
 /// seed, the conversation's own newest messages, is a recent window as before; a reply it reads
-/// apart is kept, in its thread alone, and claims nothing of Main or of the thread.
+/// apart is kept, in its thread alone, and claims nothing of Main or of the thread. `#708
+/// vt-live-push`: the thread's earlier reply, which no read brought before the seed, is read with
+/// the new one rather than skipped.
 #[tokio::test]
 async fn the_slack_pollers_replies_read_apart_are_kept_as_rows_and_claim_nothing() {
     let (fixture, root) = slack_conversation_with_a_thread();
@@ -842,9 +844,12 @@ async fn the_slack_pollers_replies_read_apart_are_kept_as_rows_and_claim_nothing
         vibe_talk::live::poll_once(state.chat.as_ref(), &state.live, &channel, 50, &mut cursor)
             .await
             .expect("polled");
-    assert_eq!(tick.published, 1, "the reply, read apart");
+    assert_eq!(
+        tick.published, 2,
+        "the new reply, and the earlier one the cache did not hold, read apart"
+    );
     let reply = slack_id(&slack_fake::ts(400, 0));
-    assert_eq!(held(&cache), 7);
+    assert_eq!(held(&cache), 8);
     assert_eq!(
         cache
             .memberships(&slack_chan(), &reply)
@@ -861,6 +866,204 @@ async fn the_slack_pollers_replies_read_apart_are_kept_as_rows_and_claim_nothing
     assert!(
         coverage(&cache, &slack_chan(), &CacheScope::Thread(root)).is_empty(),
         "nor of its thread"
+    );
+}
+
+/// The replies of `root` the cache holds, oldest first.
+fn thread_rows(cache: &MessageCache, root: &str) -> Vec<MessageId> {
+    cache
+        .newest(&slack_chan(), &CacheScope::Thread(root.to_owned()), 50)
+        .served()
+        .expect("a read")
+        .into_iter()
+        .filter(|row| {
+            row.message
+                .thread
+                .as_ref()
+                .is_some_and(|thread| !thread.is_root)
+        })
+        .map(|row| row.message.id)
+        .collect()
+}
+
+/// `#708 vt-live-push`, the owner's partial thread: three replies were posted while every read of
+/// the conversation was refused, and then the server restarted. The poller's seed took the
+/// thread as read to its root's latest reply, so the next tick read only the reply posted after
+/// the seed, which reached the page alone while the three before it stayed missing. Now the seed
+/// sees the root count three replies the cache does not hold, and the next tick reads the thread
+/// from its root: all four reach the cache, in order, and go out.
+#[tokio::test]
+async fn replies_no_read_brought_before_the_pollers_seed_are_read_on_its_next_tick() {
+    let mut fixture = slack_fake::FakeState::default();
+    let mut list: Vec<Value> = (0..3)
+        .map(|n| {
+            slack_fake::profiled(
+                &slack_fake::ts(n * 60, 0),
+                "UADA00001",
+                "Ada",
+                &format!("message {n}"),
+            )
+        })
+        .collect();
+    let root = slack_fake::ts(60, 0);
+    let before: Vec<(String, String)> = (1..=3)
+        .map(|n| (slack_fake::ts(60 + n * 10, 0), format!("reply {n}")))
+        .collect();
+    slack_fake::thread(&mut fixture, SLACK_CH, &mut list[1], &before);
+    fixture.history.insert(SLACK_CH.to_owned(), list);
+    let fake = slack_fake::Fake::start(fixture, 20).await;
+    let dir = TempDir::new("cache-fill-slack-seed-gap");
+    let clock = ManualClock::at(slack_ms(3_600));
+    let state = slack_deployment(&fake, &dir, &clock).await;
+    let cache = state.message_cache.cache().expect("installed");
+    let channel = id(SLACK_CH);
+    let mut cursor = None;
+    let mut live = state.live.subscribe(&channel, None).receiver;
+
+    vibe_talk::live::poll_once(state.chat.as_ref(), &state.live, &channel, 50, &mut cursor)
+        .await
+        .expect("seeded");
+    assert!(
+        thread_rows(&cache, &root).is_empty(),
+        "the seed reads no thread"
+    );
+
+    fake.with(|state| {
+        slack_fake::add_reply(state, SLACK_CH, &root, &slack_fake::ts(400, 0), "reply 4");
+    });
+    clock.advance(MINUTE);
+    let tick =
+        vibe_talk::live::poll_once(state.chat.as_ref(), &state.live, &channel, 50, &mut cursor)
+            .await
+            .expect("polled");
+    assert!(cache.quiesce_blocking(WAIT));
+    let every: Vec<MessageId> = [70, 80, 90, 400]
+        .iter()
+        .map(|at| slack_id(&slack_fake::ts(*at, 0)))
+        .collect();
+    assert_eq!(
+        tick.published, 4,
+        "the three missing replies and the new one"
+    );
+    assert_eq!(
+        thread_rows(&cache, &root),
+        every,
+        "the whole thread, in order"
+    );
+    let mut sent = Vec::new();
+    while let Ok(event) = live.try_recv() {
+        sent.push(event.message.id.clone());
+    }
+    assert_eq!(sent, every, "each went out once, oldest first");
+}
+
+/// `#708 vt-live-push`: a seed asks for no thread the cache already holds whole, so a restart
+/// costs no extra read of it; and of a thread missing a reply between two it holds, the missing one
+/// goes out as new while the held ones are not announced again.
+#[tokio::test]
+async fn the_seed_rereads_only_threads_the_cache_is_short_of_and_announces_only_what_was_missing() {
+    let mut fixture = slack_fake::FakeState::default();
+    let mut list: Vec<Value> = (0..4)
+        .map(|n| {
+            slack_fake::profiled(
+                &slack_fake::ts(n * 60, 0),
+                "UADA00001",
+                "Ada",
+                &format!("message {n}"),
+            )
+        })
+        .collect();
+    let whole = slack_fake::ts(60, 0);
+    let gapped = slack_fake::ts(120, 0);
+    slack_fake::thread(
+        &mut fixture,
+        SLACK_CH,
+        &mut list[1],
+        &[(slack_fake::ts(70, 0), "whole 1".to_owned())],
+    );
+    slack_fake::thread(
+        &mut fixture,
+        SLACK_CH,
+        &mut list[2],
+        &[
+            (slack_fake::ts(130, 0), "gapped 1".to_owned()),
+            (slack_fake::ts(150, 0), "gapped 3".to_owned()),
+        ],
+    );
+    fixture.history.insert(SLACK_CH.to_owned(), list);
+    let fake = slack_fake::Fake::start(fixture, 20).await;
+    let dir = TempDir::new("cache-fill-slack-seed-held");
+    let clock = ManualClock::at(slack_ms(3_600));
+    let state = slack_deployment(&fake, &dir, &clock).await;
+    let cache = state.message_cache.cache().expect("installed");
+    for root in [&whole, &gapped] {
+        get(
+            &state,
+            &format!("/api/v1/channels/{SLACK_CH}/timeline?view=thread&thread_id={root}&limit=50"),
+        )
+        .await;
+    }
+    assert!(cache.quiesce_blocking(WAIT));
+    assert_eq!(thread_rows(&cache, &whole).len(), 1);
+    assert_eq!(thread_rows(&cache, &gapped).len(), 2);
+    // A reply the cache never saw, between the two it holds: its root now counts three.
+    fake.with(|state| {
+        slack_fake::add_reply(
+            state,
+            SLACK_CH,
+            &gapped,
+            &slack_fake::ts(140, 0),
+            "gapped 2",
+        );
+        let replies = state
+            .replies
+            .get_mut(&(SLACK_CH.to_owned(), gapped.clone()))
+            .expect("the thread");
+        replies.sort_by_key(|reply| reply["ts"].as_str().expect("ts").to_owned());
+        let root = state
+            .history
+            .get_mut(SLACK_CH)
+            .and_then(|history| history.iter_mut().find(|m| m["ts"] == gapped.as_str()))
+            .expect("the root");
+        root["latest_reply"] = serde_json::json!(slack_fake::ts(150, 0));
+    });
+    let channel = id(SLACK_CH);
+    let mut cursor = None;
+    vibe_talk::live::poll_once(state.chat.as_ref(), &state.live, &channel, 50, &mut cursor)
+        .await
+        .expect("seeded");
+    let mut live = state.live.subscribe(&channel, None).receiver;
+    let replies_before = fake.calls("conversations.replies");
+    clock.advance(MINUTE);
+    let tick =
+        vibe_talk::live::poll_once(state.chat.as_ref(), &state.live, &channel, 50, &mut cursor)
+            .await
+            .expect("polled");
+    assert!(cache.quiesce_blocking(WAIT));
+    assert_eq!(
+        fake.calls("conversations.replies") - replies_before,
+        1,
+        "only the thread the cache was short of is read"
+    );
+    assert_eq!(tick.published, 1, "only the missing reply is news");
+    let missing = slack_id(&slack_fake::ts(140, 0));
+    let mut sent = Vec::new();
+    while let Ok(event) = live.try_recv() {
+        if event.kind == vibe_talk::live::LiveKind::Create {
+            sent.push(event.message.id.clone());
+        }
+    }
+    assert_eq!(
+        sent,
+        [missing],
+        "the held replies are not announced again"
+    );
+    assert_eq!(
+        thread_rows(&cache, &gapped),
+        [130, 140, 150]
+            .iter()
+            .map(|at| slack_id(&slack_fake::ts(*at, 0)))
+            .collect::<Vec<_>>()
     );
 }
 

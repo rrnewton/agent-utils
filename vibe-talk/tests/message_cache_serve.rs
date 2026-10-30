@@ -3159,3 +3159,126 @@ async fn a_step_back_over_a_drop_the_writer_has_not_recorded_reads_the_provider(
     assert_eq!(texts(&older).len(), 5, "{older}");
     assert_eq!(served_from(&capture, READ_CHANNEL), ["upstream"]);
 }
+
+/// The instant an answer says it is complete up to (`as_of`), in Unix milliseconds.
+fn as_of_ms(body: &Value) -> i64 {
+    body["as_of"]
+        .as_str()
+        .unwrap_or_else(|| panic!("an as_of: {body}"))
+        .parse::<jiff::Timestamp>()
+        .expect("an RFC 3339 instant")
+        .as_millisecond()
+}
+
+/// `#708 vt-live-push`, the owner's rule: the server never presents a thread as complete when it
+/// knows messages are missing. The cache holds a thread's two replies; a read of Main then brings
+/// its root counting three, and the thread's own read is refused. The answer from the cache says
+/// it lacks one, and is dated no later than the thread's last listing, so the page says it could
+/// not bring it up to date rather than "Updated" a minute ago.
+#[tokio::test]
+async fn a_thread_whose_root_counts_more_replies_than_are_held_is_never_answered_as_complete() {
+    let (state, fake, clock, _dir) = slack_threads_deployment("thread-shortfall", false).await;
+    state.message_cache.set_serve(true);
+    let listed = clock.now();
+    let root = slack_fake::ts(60, 0);
+    let thread = path(
+        SLACK_CH,
+        &format!("/timeline?view=thread&thread_id={root}&limit=50&reason=poll"),
+    );
+    rate_limit(&fake, "conversations.replies");
+    clock.advance(10 * MINUTE);
+    // Held whole: the answer from the cache is only the cache's.
+    let body = ok(&state, &thread, WRITE_TOKEN).await;
+    let held = body["refresh_failed"].as_str().expect("from the cache");
+    assert!(!held.contains("counts"), "{body}");
+
+    fake.with(|state| {
+        slack_fake::add_reply(
+            state,
+            SLACK_CH,
+            &root,
+            &slack_fake::ts(90, 0),
+            "third reply",
+        );
+    });
+    ok(
+        &state,
+        &path(SLACK_CH, "/timeline?view=main&limit=50"),
+        WRITE_TOKEN,
+    )
+    .await;
+    settled(&state).await;
+    clock.advance(MINUTE);
+    let body = ok(&state, &thread, WRITE_TOKEN).await;
+    let why = body["refresh_failed"]
+        .as_str()
+        .unwrap_or_else(|| panic!("an answer that admits it is short: {body}"));
+    assert!(
+        why.contains("counts 3 replies") && why.contains("holds 2"),
+        "{body}"
+    );
+    assert!(
+        as_of_ms(&body) <= listed,
+        "dated by the thread's last listing, never by when its rows were seen: {body}"
+    );
+    assert_eq!(
+        texts(&body),
+        ["message 1", "first reply", "second reply"],
+        "what is held is still shown"
+    );
+}
+
+/// `#708 vt-live-push`: a channel whose event stream reported records lost is not presented as
+/// complete by an answer from the cache, even for a thread the cache holds whole, until a live read
+/// begun after the report ends well.
+#[tokio::test]
+async fn a_channel_whose_stream_lost_records_is_not_answered_as_complete_until_read_again() {
+    let (state, fake, clock, _dir) = slack_threads_deployment("stream-gap", false).await;
+    state.message_cache.set_serve(true);
+    let listed = clock.now();
+    let thread = path(
+        SLACK_CH,
+        &format!(
+            "/timeline?view=thread&thread_id={}&limit=50&reason=poll",
+            slack_fake::ts(180, 0)
+        ),
+    );
+    rate_limit(&fake, "conversations.replies");
+    clock.advance(10 * MINUTE);
+    let outcome = vibe_talk::live_tail::ingest(
+        &state,
+        vibe_talk::slack::tail::TailRecord::Gap {
+            from: Some(10),
+            to: Some(20),
+        },
+        clock.now(),
+    )
+    .await
+    .expect("ingested");
+    assert_eq!(outcome, vibe_talk::live_tail::TailOutcome::Gap(1));
+    let body = ok(&state, &thread, WRITE_TOKEN).await;
+    let why = body["refresh_failed"].as_str().expect("from the cache");
+    assert!(why.contains("lost messages"), "{body}");
+    assert!(as_of_ms(&body) <= listed, "{body}");
+
+    let channel = ChannelId(SLACK_CH.to_owned());
+    // A live read that began before the report proves nothing of it…
+    state.live.note_reconciled(&channel, clock.now() - SECOND);
+    let body = ok(&state, &thread, WRITE_TOKEN).await;
+    assert!(
+        body["refresh_failed"]
+            .as_str()
+            .is_some_and(|why| why.contains("lost messages")),
+        "{body}"
+    );
+    // …and one begun after it, ending well, reads what was lost.
+    clock.advance(SECOND);
+    state.live.note_reconciled(&channel, clock.now());
+    let body = ok(&state, &thread, WRITE_TOKEN).await;
+    assert!(
+        body["refresh_failed"]
+            .as_str()
+            .is_some_and(|why| !why.contains("lost messages")),
+        "{body}"
+    );
+}

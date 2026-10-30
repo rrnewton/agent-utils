@@ -1168,6 +1168,12 @@ impl ChatClient for ChatRouter {
             .is_ok_and(|entry| entry.client.polls_thread_replies(channel))
     }
 
+    /// `#708 vt-live-push`. Forwarded, so the provider moves its own place in the thread.
+    fn reread_thread(&self, channel: &ChannelId, thread: &str, after: Option<&MessageId>) -> bool {
+        self.route(channel)
+            .is_ok_and(|entry| entry.client.reread_thread(channel, thread, after))
+    }
+
     /// `#452 slack-live-ingest`. Forwarded: the channel's own provider normalizes what its
     /// stream pushed.
     fn takes_pushed_messages(&self, channel: &ChannelId) -> bool {

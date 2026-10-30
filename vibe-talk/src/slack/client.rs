@@ -1722,6 +1722,24 @@ impl ChatClient for HttpSlackClient {
             .map_err(|error| error.with_provider(&self.provider_name))
     }
 
+    /// `#708 vt-live-push`; see `super::live`.
+    fn reread_thread(&self, channel: &ChannelId, thread: &str, after: Option<&MessageId>) -> bool {
+        let Ok(target) = Self::channel_ref(channel) else {
+            return false;
+        };
+        if target.thread_ts.is_some() {
+            return false;
+        }
+        let after = match after {
+            Some(after) => match super::timeline::cursor_micros(after) {
+                Ok(micros) => Some(micros),
+                Err(_) => return false,
+            },
+            None => None,
+        };
+        self.reread_live_thread(&target.conversation, thread, after)
+    }
+
     /// Slack's own event stream delivers each new message with its text, so it is normalized
     /// here as a read would normalize it. `#452 slack-live-ingest`; see `super::tail`.
     fn takes_pushed_messages(&self, channel: &ChannelId) -> bool {

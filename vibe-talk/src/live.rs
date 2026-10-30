@@ -285,6 +285,20 @@ pub struct LiveMessage {
 /// it posted it for, when that had one (`#468 send-dedupe`).
 type SelfPosted = (VecDeque<MessageId>, BTreeMap<MessageId, Option<String>>);
 
+/// Since when a channel may be missing messages, and why ([`LiveHub::note_unreconciled`]).
+/// `#708 vt-live-push`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Unreconciled {
+    /// From when, on the hub's clock ([`LiveHub::now_ms`]); `None` for from before anything this
+    /// process read, which no live read that ended well has covered yet.
+    pub since_ms: Option<i64>,
+    /// When the latest mark was made, on the hub's clock: only a live read begun at or after it
+    /// clears the channel.
+    pub noted_ms: i64,
+    /// Why, as a sentence for the reader.
+    pub why: &'static str,
+}
+
 /// One channel's remembered reaction sets: the order they were first noted in, and the set each
 /// message was last seen with (`None` for a known message no copy has reported one for).
 type ReactionSets = (
@@ -432,6 +446,12 @@ pub struct LiveHub {
     /// When the last stream record of any kind arrived, local time: what tells a stream that came
     /// back after a silence ([`LiveHub::note_stream_record`]).
     last_stream_record_ms: Mutex<Option<i64>>,
+    /// Since when each channel may be missing messages nobody has read yet, and why. `#708
+    /// vt-live-push`; see [`LiveHub::note_unreconciled`].
+    unreconciled: Mutex<BTreeMap<ChannelId, Unreconciled>>,
+    /// Each channel's latest live read that ended well: when it began. What an unreconciled
+    /// channel is complete as of.
+    reconciled_ms: Mutex<BTreeMap<ChannelId, i64>>,
     /// The threads each channel's stream recently pushed a reply in, newest last, with when.
     /// `#452 slack-live-ingest`: what the relist reads besides each channel's newest page.
     active_threads: Mutex<BTreeMap<ChannelId, VecDeque<(String, i64)>>>,
@@ -517,6 +537,8 @@ impl LiveHub {
             relist_wanted: Mutex::new(BTreeSet::new()),
             rewalk_wanted: Mutex::new(BTreeSet::new()),
             last_stream_record_ms: Mutex::new(None),
+            unreconciled: Mutex::new(BTreeMap::new()),
+            reconciled_ms: Mutex::new(BTreeMap::new()),
             active_threads: Mutex::new(BTreeMap::new()),
             all: Mutex::new(AllFeed {
                 sender: all_sender,
@@ -784,6 +806,27 @@ impl LiveHub {
         if let Some((order, sets)) = memory.get_mut(channel) {
             sets.remove(id);
             order.retain(|held| held != id);
+        }
+    }
+
+    /// Remember `messages`, which readers already have (the message cache holds them), as
+    /// created on `channel`, so a read that brings one of them again publishes it as known, or as
+    /// an update where its copy says more, never as a new arrival. `#708 vt-live-push`. A message
+    /// already remembered keeps the copy remembered for it.
+    pub fn note_created(&self, channel: &ChannelId, messages: Vec<Message>) {
+        let mut feeds = lock(&self.feeds);
+        let feed = feeds.entry(channel.clone()).or_insert_with(new_feed);
+        for message in messages {
+            if feed.created.contains_key(&message.id) {
+                continue;
+            }
+            feed.created_order.push_back(message.id.clone());
+            feed.created.insert(message.id.clone(), Some(message));
+            while feed.created_order.len() > CREATED_MEMORY {
+                if let Some(evicted) = feed.created_order.pop_front() {
+                    feed.created.remove(&evicted);
+                }
+            }
         }
     }
 
@@ -1158,6 +1201,84 @@ impl LiveHub {
         let silent = last.is_some_and(|last| now_ms.saturating_sub(last) >= STREAM_SILENCE_MS);
         *last = Some(now_ms);
         silent
+    }
+
+    /// When the last stream record arrived, local time, if one has since the server started.
+    #[must_use]
+    pub fn last_stream_record_ms(&self) -> Option<i64> {
+        *lock(&self.last_stream_record_ms)
+    }
+
+    /// Now, on the clock that dates the message cache's copies, when one is attached; otherwise
+    /// the wall clock. `#708 vt-live-push`.
+    #[must_use]
+    pub fn now_ms(&self) -> i64 {
+        self.cache
+            .get()
+            .and_then(|sink| sink.cache())
+            .map_or_else(crate::store::now_ms, |cache| cache.now_ms())
+    }
+
+    /// Note that `channel` may be missing messages from `since_ms` (this hub's clock) on, or from
+    /// before anything this process read (`None`), for `why`: its live read failed, left thread replies unread, or its event stream lost or could
+    /// not apply records. `#708 vt-live-push`. The owner's rule: the server never presents a view as
+    /// complete when it cannot rule out that messages are missing. An answer from this server's
+    /// copy says so until a live read that began at or after `since_ms` ends well
+    /// ([`LiveHub::note_reconciled`]). An earlier mark stands: the channel is complete only as of
+    /// the earliest.
+    pub fn note_unreconciled(&self, channel: &ChannelId, since_ms: Option<i64>, why: &'static str) {
+        let noted_ms = self.now_ms();
+        let mut marks = lock(&self.unreconciled);
+        match marks.get_mut(channel) {
+            Some(held) => {
+                held.noted_ms = held.noted_ms.max(noted_ms);
+                if since_ms < held.since_ms {
+                    held.since_ms = since_ms;
+                    held.why = why;
+                }
+            }
+            None => {
+                marks.insert(
+                    channel.clone(),
+                    Unreconciled {
+                        since_ms,
+                        noted_ms,
+                        why,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Note that a live read of `channel` that began at `began_ms` ended well, having read every
+    /// thread it had to: a mark made before that read began is now read; one made while it ran
+    /// stands. `#708 vt-live-push`.
+    pub fn note_reconciled(&self, channel: &ChannelId, began_ms: i64) {
+        lock(&self.reconciled_ms)
+            .entry(channel.clone())
+            .and_modify(|held| *held = (*held).max(began_ms))
+            .or_insert(began_ms);
+        let mut marks = lock(&self.unreconciled);
+        if marks
+            .get(channel)
+            .is_some_and(|held| held.noted_ms <= began_ms)
+        {
+            marks.remove(channel);
+        }
+    }
+
+    /// When a live read of `channel` that ended well last began, if one has since this process
+    /// started: what a mark made now dates the channel's completeness to. `#708 vt-live-push`.
+    #[must_use]
+    pub fn reconciled_ms(&self, channel: &ChannelId) -> Option<i64> {
+        lock(&self.reconciled_ms).get(channel).copied()
+    }
+
+    /// Since when `channel` may be missing messages, and why, when it may be. `#708
+    /// vt-live-push`.
+    #[must_use]
+    pub fn unreconciled(&self, channel: &ChannelId) -> Option<Unreconciled> {
+        lock(&self.unreconciled).get(channel).copied()
     }
 
     /// Remember that a reply was just pushed in `thread` of `channel`, at `now_ms`.
@@ -2161,6 +2282,11 @@ pub async fn poll_once(
         for message in &messages {
             hub.note_reactions(channel, message);
         }
+        let reread = if apart {
+            reread_unheld_threads(chat, hub, channel, &messages).await
+        } else {
+            0
+        };
         // Seed. `unwrap_or(0)` rather than leaving the cursor unset: an EMPTY channel is a
         // perfectly good starting point, and leaving it `None` would make the next tick seed
         // again and publish nothing for as long as the channel stayed quiet.
@@ -2173,7 +2299,11 @@ pub async fn poll_once(
         // `#452 slack-live-ingest`: what a provider's event stream pushes at or behind this is
         // history this read has just seen, and never news.
         hub.note_poller_cursor(channel, seed);
-        return Ok(Tick::default());
+        // `#708 vt-live-push`: threads asked to be read again are replies still to come.
+        return Ok(Tick {
+            replies_behind: reread > 0,
+            ..Tick::default()
+        });
     };
 
     let page_size = usize::from(limit.max(1));
@@ -2364,6 +2494,55 @@ pub async fn poll_once(
         replies_behind,
         changed,
     })
+}
+
+/// Ask the provider to read, on the poller's next tick, the replies of every thread rooted in
+/// `seed` whose root counts more replies than the message cache holds. `#708 vt-live-push`.
+///
+/// A seed takes each thread as read to where its root stands. Replies posted before it that no
+/// read brought (the server was restarting, or the provider refused every read meanwhile) were
+/// then never read by the poller at all: a reply posted after the seed reached the page while the
+/// ones before it stayed missing, until something else happened to read the thread. Each read
+/// asked for here costs one call on a later tick, and only for a thread the cache is short of.
+async fn reread_unheld_threads(
+    chat: &dyn ChatClient,
+    hub: &LiveHub,
+    channel: &ChannelId,
+    seed: &[Message],
+) -> usize {
+    let Some(sink) = hub.message_cache() else {
+        return 0;
+    };
+    let mut asked = 0_usize;
+    for message in seed {
+        let Some(thread) = message.thread.as_ref().filter(|thread| thread.is_root) else {
+            continue;
+        };
+        let Some(count) = thread.reply_count.filter(|count| *count > 0) else {
+            continue;
+        };
+        let Some(held) = sink.held_replies(channel, &thread.id, count).await else {
+            continue;
+        };
+        if u64::try_from(held.replies.len()).unwrap_or(u64::MAX) >= count {
+            continue;
+        }
+        // From the root: the replies missing may lie between ones the cache holds. Those it
+        // holds come back as known, never as news a second time.
+        hub.note_created(channel, held.replies);
+        if chat.reread_thread(channel, &thread.id, None) {
+            asked += 1;
+        }
+    }
+    if asked > 0 {
+        tracing::info!(
+            channel = %channel,
+            threads = asked,
+            "the live poller's seed found threads whose roots count more replies than the cache \
+             holds; their replies are read on the next ticks"
+        );
+    }
+    asked
 }
 
 /// How long to wait after `failures` consecutive failures on a channel.
@@ -2583,7 +2762,25 @@ async fn poll_loop_with_channels(
             }
             let cursor = cursors.entry(channel.clone()).or_default();
             let failed = failures.entry(channel.clone()).or_insert(0);
-            match poll_once(chat, hub, channel, limit, cursor).await {
+            let began_ms = hub.now_ms();
+            let polled = poll_once(chat, hub, channel, limit, cursor).await;
+            // `#708 vt-live-push`. What the channel is complete as of, for every answer from this
+            // server's copy: a read that ended well, every thread read, reconciles it; one that
+            // failed, or left replies unread, leaves it complete only as of the last that did.
+            match &polled {
+                Ok(tick) if !tick.replies_behind => hub.note_reconciled(channel, began_ms),
+                Ok(_) => hub.note_unreconciled(
+                    channel,
+                    hub.reconciled_ms(channel),
+                    "Some thread replies have not been read from the chat service yet.",
+                ),
+                Err(_) => hub.note_unreconciled(
+                    channel,
+                    hub.reconciled_ms(channel),
+                    "The chat service refused or failed the latest read of this channel.",
+                ),
+            }
+            match polled {
                 Ok(tick) => {
                     if *failed > 0 {
                         tracing::info!(

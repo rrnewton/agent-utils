@@ -1097,6 +1097,26 @@ pub struct StaleTimeline {
     pub reaches_start: bool,
 }
 
+/// How much of one thread the file holds ([`Sink::held_replies`]). `#708 vt-live-push`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeldThread {
+    /// Its newest replies, oldest first, up to what was asked and one more, each carrying the
+    /// observation that set it (`observed_ms`).
+    pub replies: Vec<Message>,
+}
+
+/// A thread whose root counts more replies than the file holds ([`Sink::thread_shortfall`]).
+/// `#708 vt-live-push`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Shortfall {
+    /// The replies the file holds.
+    pub held: u64,
+    /// The replies its root counts.
+    pub counted: u64,
+    /// When the root was created, provider time, when the file holds it.
+    pub root_ms: Option<i64>,
+}
+
 /// A step back from a page answered from the cache, answered from the file
 /// ([`Sink::held_below`]). `#650 cache-first-older-reads`.
 #[derive(Clone, Debug)]
@@ -1719,6 +1739,92 @@ impl Sink {
             (Some(cache), Some(chan)) => cache.thread_blocked(&chan, thread),
             _ => false,
         }
+    }
+
+    /// The replies of `thread` of `channel` the file holds, the newest `up_to` and one more:
+    /// what the live poller compares with what the thread's root counts (`#708 vt-live-push`). `None` when the file cannot say: no cache, the channel not
+    /// routed to it, or the thread's scope blocked. A partial text (a push no read proved whole)
+    /// counts: the reply is held, only its text is in doubt.
+    pub async fn held_replies(
+        &self,
+        channel: &ChannelId,
+        thread: &str,
+        up_to: u64,
+    ) -> Option<HeldThread> {
+        let cache = self.cache().filter(|cache| cache.is_open())?;
+        let chan = self.chan_key(channel)?;
+        let thread = thread.to_owned();
+        let limit = usize::try_from(up_to)
+            .unwrap_or(usize::MAX)
+            .saturating_add(2);
+        tokio::task::spawn_blocking(move || {
+            let Read::Served(rows) = cache.newest(&chan, &Scope::Thread(thread), limit) else {
+                return None;
+            };
+            let replies = rows
+                .into_iter()
+                .filter(|row| {
+                    row.message
+                        .thread
+                        .as_ref()
+                        .is_none_or(|thread| !thread.is_root)
+                })
+                .map(|row| Message {
+                    observed_ms: Some(row.observed_ms),
+                    ..row.message
+                })
+                .collect();
+            Some(HeldThread { replies })
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// Whether the file is short of `thread` of `channel`: its root counts more replies than the
+    /// file holds (`#708 vt-live-push`). `None` when it is not, or cannot say (no cache, the
+    /// channel not routed to it, the thread's scope blocked, no count known).
+    pub async fn thread_shortfall(&self, channel: &ChannelId, thread: &str) -> Option<Shortfall> {
+        let cache = self.cache().filter(|cache| cache.is_open())?;
+        let chan = self.chan_key(channel)?;
+        let thread = thread.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let record = cache.thread(&chan, &thread).served().flatten()?;
+            let counted = record.reply_count.filter(|count| *count > 0)?;
+            let limit = usize::try_from(counted)
+                .unwrap_or(usize::MAX)
+                .saturating_add(2);
+            let Read::Served(rows) = cache.newest(&chan, &Scope::Thread(thread.clone()), limit)
+            else {
+                return None;
+            };
+            let held = rows
+                .iter()
+                .filter(|row| {
+                    row.message
+                        .thread
+                        .as_ref()
+                        .is_none_or(|thread| !thread.is_root)
+                })
+                .count();
+            let held = u64::try_from(held).unwrap_or(u64::MAX);
+            if held >= counted {
+                return None;
+            }
+            let root_ms = record
+                .root_id
+                .as_ref()
+                .and_then(|root| cache.message(&chan, root).served().flatten())
+                .map(|root| root.created_ms);
+            Some(Shortfall {
+                held,
+                counted,
+                root_ms,
+            })
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     /// What opens, switches and erases the cache file, once the server has started it.

@@ -2541,6 +2541,7 @@ async fn stood_in(
 ) -> Result<(ChannelInfo, crate::threads::TimelinePage), OpError> {
     use crate::timeline_forward as forward;
     let StoodIn { held, why, dated } = stood;
+    let incomplete = incompleteness(state, &channel.id, request, &held).await;
     // `#622 cache-first-reads`: the copy is as new as the latest upstream read of the view that
     // answered, when that is later than the cache's latest listing of the view's newest end (a
     // catch-up read lists nothing, but brings everything that changed).
@@ -2580,6 +2581,14 @@ async fn stood_in(
         )
         .filter_map(|message| message.observed_ms)
         .min();
+    let (dated, why) = match &incomplete {
+        Some(incomplete) => (true, Some(incomplete.why.clone())),
+        None => (dated, why.map(str::to_owned)),
+    };
+    let as_of = match &incomplete {
+        Some(incomplete) => Some(incomplete.as_of_ms),
+        None => checked_ms.or(oldest_seen),
+    };
     let mut page = crate::threads::TimelinePage {
         messages: held.messages,
         threads: held.threads,
@@ -2591,9 +2600,9 @@ async fn stood_in(
         notice: held.notice,
         // A failure says how old the copy is. An answer beside a live feed is as new as the feed.
         as_of: dated
-            .then(|| checked_ms.or(oldest_seen).map(crate::clock::iso_from_ms))
+            .then(|| as_of.map(crate::clock::iso_from_ms))
             .flatten(),
-        refresh_failed: why.map(str::to_owned),
+        refresh_failed: why,
         ..crate::threads::TimelinePage::default()
     };
     page.next_after = Some(forward::encode(
@@ -2612,6 +2621,70 @@ async fn stood_in(
         }
     }
     Ok((channel, page))
+}
+
+/// Why an answer from this server's copy may be missing messages, and the instant it is complete
+/// up to. `#708 vt-live-push`.
+struct Incomplete {
+    why: String,
+    as_of_ms: i64,
+}
+
+/// Whether `held`, this server's copy answering `request`, may be missing messages: a thread
+/// whose root counts more replies than the copy holds, or a channel whose latest live read failed,
+/// left replies unread, or whose event stream lost or could not apply records
+/// ([`crate::live::LiveHub::unreconciled`]). The owner's rule (2026-10-30): the server never
+/// presents a view as complete when it knows, or cannot rule out, that messages are missing.
+///
+/// Such an answer says why (`refresh_failed`), and is dated (`as_of`) no later than the instant
+/// it is known complete to: the latest listing of the view's newest end for a short thread, or the
+/// thread's root when no listing reached it (a thread the poller's replies alone brought proves
+/// nothing between them); for a channel, when its last live read that ended well began. Never by
+/// when its rows were last seen: a root read again on every Main read is seen often, and dated so
+/// the page took a thread missing three replies for one brought up to date a minute ago.
+async fn incompleteness(
+    state: &AppState,
+    channel: &ChannelId,
+    request: &crate::threads::TimelineRequest,
+    held: &crate::cache::sink::StaleTimeline,
+) -> Option<Incomplete> {
+    // What nothing newer than is proven, when no listing dates the copy: its oldest message.
+    let oldest_created = held
+        .messages
+        .iter()
+        .filter_map(|message| message.id.created_at_ms())
+        .min();
+    let mut found: Option<Incomplete> = None;
+    let mut add = |why: String, as_of_ms: Option<i64>| {
+        let Some(as_of_ms) = as_of_ms else {
+            return;
+        };
+        match &mut found {
+            Some(held) if held.as_of_ms <= as_of_ms => {}
+            _ => found = Some(Incomplete { why, as_of_ms }),
+        }
+    };
+    if request.view == crate::threads::TimelineView::Thread {
+        if let Some(thread) = request.thread_id.as_deref() {
+            if let Some(short) = state.message_cache.thread_shortfall(channel, thread).await {
+                add(
+                    format!(
+                        "This thread's first message counts {} replies and this server holds {}; \
+                         the rest have not been read from the chat service yet.",
+                        short.counted, short.held
+                    ),
+                    held.checked_ms.or(short.root_ms).or(oldest_created),
+                );
+            }
+        }
+    }
+    if let Some(unreconciled) = state.live.unreconciled(channel) {
+        add(
+            unreconciled.why.to_owned(),
+            unreconciled.since_ms.or(held.checked_ms).or(oldest_created),
+        );
+    }
+    found
 }
 
 /// How long after the claims a step back answered from the file rests on were listed the step is
