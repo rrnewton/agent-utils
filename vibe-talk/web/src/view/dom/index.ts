@@ -2,3 +2,4 @@
 // interface. `#624 voice-page-modularity`, plan step 16.
 
 export { childByClass, nodeWithin, shownNode } from "./tree.ts";
+export { elementIn, focusMinimally } from "./shell.ts";

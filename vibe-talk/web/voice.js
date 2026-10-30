@@ -257,8 +257,8 @@ const ALL_CHANNELS = "*";
  */
 /** @param {string} id */
 function el(id) {
-  const standIn = sideActive ? COLUMN_IDS[id] : undefined;
-  return document.getElementById(standIn || id);
+  // The column worked on decides (web/src/view/dom `elementIn`, `#624 voice-page-modularity`).
+  return elementIn(id, sideActive, COLUMN_IDS);
 }
 
 /**
@@ -11115,8 +11115,8 @@ function focusLost() {
 
 // Whether a node and everything around it is shown (`shownNode`) is web/src/view/dom's.
 
-/** The message boxes are where Escape leaves the field before it goes Back. See `onEscape`. */
-const isComposer = (node) => Boolean(node) && COMPOSER_FIELDS.includes(String(node.id || ""));
+// Whether a node is one of the message boxes, where Escape leaves the field before it goes Back
+// (`isComposer`, see `onEscape`), is web/src/view/composer's.
 
 // --- the lists the keys move through
 
@@ -11756,18 +11756,8 @@ function focusList(pane) {
   }
 }
 
-/**
- * Give `node`, a control in a list — a message box at its foot, an item of a row's menu — the focus,
- * scrolling only when it is off screen, and then the least that shows it. `#280 scroll-stability`. A
- * browser's own `focus()` scrolls a control it cannot show whole to the MIDDLE of the list, which on a
- * list being read is a jump of half a screen for the sake of one control.
- *
- * @param {HTMLElement} node
- */
-function focusMinimally(node) {
-  node.focus({ preventScroll: true });
-  if (typeof node.scrollIntoView === "function") node.scrollIntoView({ block: "nearest", inline: "nearest" });
-}
+// Giving a control the focus scrolling only as far as shows it (`focusMinimally`, `#280
+// scroll-stability`) is web/src/view/dom's.
 
 /** `focusList`, unless the reader is typing in a field still on screen, which is never taken from them. */
 function settleFocus() {
@@ -30660,12 +30650,7 @@ function dropOutgoing(id) {
   renderOutgoingEverywhere();
 }
 
-/** Focus a message box with the caret after its last character, where the reader goes on writing. */
-function focusAtEnd(box) {
-  focusMinimally(box);
-  const end = box.value.length;
-  if (typeof box.setSelectionRange === "function") box.setSelectionRange(end, end);
-}
+// Focusing a message box with the caret at its end (`focusAtEnd`) is web/src/view/composer's.
 
 /**
  * Edit: a failed send's unsent text back in the box it was written in, and out of the outbox. Written

@@ -7451,7 +7451,7 @@ test("`#624 voice-page-modularity`: the boxes that grow, on stand-in elements, f
   assert.deepStrictEqual(record.kept_in_view, [["side-composer", "side-scroll"]]);
 });
 
-test("`#624 voice-page-modularity`: the DOM walks, on plain nodes, from the module alone", () => {
+test("`#624 voice-page-modularity`: the DOM walks and the box helpers, on plain nodes, from the module alone", () => {
   const { nodeWithin, shownNode, childByClass } = VIEW_DOM;
   const node = (className, children = [], extra = {}) => {
     const made = { className, children, nodeType: 1, hidden: false, parentNode: null, ...extra };
@@ -7473,6 +7473,14 @@ test("`#624 voice-page-modularity`: the DOM walks, on plain nodes, from the modu
   assert.equal(shownNode(author), true);
   meta.hidden = true;
   assert.equal(shownNode(author), false, "a node inside a hidden one counted as shown");
+  // The composer's helpers built on them.
+  const { isComposer, focusAtEnd } = VIEW_COMPOSER;
+  assert.deepStrictEqual([isComposer({ id: "reply-text" }), isComposer({ id: "search-input" }), isComposer(null)], [true, false, false]);
+  const calls = [];
+  const box = { value: "draft", focus: (options) => calls.push(["focus", options]), scrollIntoView: (options) => calls.push(["scroll", options]),
+    setSelectionRange: (start, end) => calls.push(["caret", start, end]) };
+  focusAtEnd(box);
+  assert.deepStrictEqual(calls, [["focus", { preventScroll: true }], ["scroll", { block: "nearest", inline: "nearest" }], ["caret", 5, 5]]);
 });
 
 test("`#624 voice-page-modularity`: which read a refresh makes, and how fresh it is, from the module alone", () => {

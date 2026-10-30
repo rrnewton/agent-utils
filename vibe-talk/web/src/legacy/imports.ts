@@ -156,7 +156,7 @@ export {
   createSettingsSync,
 } from "../core/settings/index.ts";
 export { createWebPorts } from "../platform/web/index.ts";
-export { childByClass, nodeWithin, shownNode } from "../view/dom/index.ts";
+export { childByClass, elementIn, focusMinimally, nodeWithin, shownNode } from "../view/dom/index.ts";
 export {
   COMPOSER_FIELDS,
   COMPOSER_GROW_BOXES,
@@ -164,6 +164,8 @@ export {
   NEWLINE_KEYS,
   createComposerGrow,
   createComposerKeys,
+  focusAtEnd,
+  isComposer,
   watchBoxInsertions as watchInsertions,
   wireNewlineKey,
 } from "../view/composer/index.ts";

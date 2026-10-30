@@ -3,6 +3,8 @@
 // moved from the legacy script; plan step 16, view/composer). Whether Enter sends is the reader's
 // setting, which the page keeps and draws; it is passed in, as is the clock.
 
+import { focusMinimally } from "../dom/index.ts";
+
 /** The message boxes, each of which hands its Enter to `onKey`. */
 const COMPOSER_FIELDS = ["compose-text", "channel-compose-text", "reply-text", "side-compose-text"];
 
@@ -132,6 +134,18 @@ export function wireNewlineKey(key: HTMLElement, box: HTMLElement): void {
     insertNewline(box);
     if (document.activeElement !== box) box.focus({ preventScroll: true });
   });
+}
+
+/** The message boxes are where Escape leaves the field before it goes Back (the page's `onEscape`). */
+export const isComposer = (node: unknown): boolean =>
+  Boolean(node) && COMPOSER_FIELDS.includes(String((node as { readonly id?: unknown }).id || ""));
+
+/** Focus a message box with the caret after its last character, where the reader goes on writing. */
+export function focusAtEnd(box: HTMLElement): void {
+  const field = box as HTMLTextAreaElement;
+  focusMinimally(field);
+  const end = field.value.length;
+  if (typeof field.setSelectionRange === "function") field.setSelectionRange(end, end);
 }
 
 /** Listen to `box` for what `note` notes (`noteInsertion`). Each message box, as it is given its Enter. */
