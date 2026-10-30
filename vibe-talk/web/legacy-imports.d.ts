@@ -41,6 +41,7 @@ declare const VISIBLE_REFRESH_MS: LegacyImports["VISIBLE_REFRESH_MS"];
 declare const deltaCursor: LegacyImports["deltaCursor"];
 declare const isCursorRefusal: LegacyImports["isCursorRefusal"];
 declare const isMutationKey: LegacyImports["isMutationKey"];
+declare const readEventFrames: LegacyImports["readEventFrames"];
 declare const syncStaleAsOf: LegacyImports["syncStaleAsOf"];
 declare const nextRetryAt: LegacyImports["nextRetryAt"];
 declare const outboxRetriesItself: LegacyImports["outboxRetriesItself"];

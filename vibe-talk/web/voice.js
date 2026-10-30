@@ -52781,65 +52781,12 @@ let liveAttachResumed = false;
  * @param {(frame: {id: string | null, event: string, data: string}) => (string | void)} onFrame
  * @returns {Promise<"reset" | "ended">}
  */
-async function readEventStream(reader, current, onFrame) {
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let reset = false;
-  for (;;) {
-    const chunk = await reader.read();
-    if (!current()) {
-      // Deliberately not awaited and deliberately not fatal: a reader that will not cancel must
-      // not keep this loop alive, and the check above has already stopped it mattering.
-      if (typeof reader.cancel === "function") {
-        Promise.resolve(reader.cancel()).catch(() => {});
-      }
-      return "ended";
-    }
-    if (chunk.done) {
-      return reset ? "reset" : "ended";
-    }
-    buffer += decoder.decode(chunk.value, { stream: true });
-    // An SSE event ends at a blank line. Anything after the last one is a partial frame and stays
-    // in the buffer — a chunk boundary falls wherever the network puts it, not where a message
-    // ends.
-    let at = buffer.indexOf("\n\n");
-    while (at >= 0) {
-      if (onFrame(parseEventFrame(buffer.slice(0, at))) === "reset") reset = true;
-      buffer = buffer.slice(at + 2);
-      at = buffer.indexOf("\n\n");
-    }
-  }
+function readEventStream(reader, current, onFrame) {
+  return readEventFrames(reader, current, onFrame, new TextDecoder());
 }
 
-/**
- * One SSE frame, as fields.
- *
- * Lines beginning with a colon are comments — which is what a keep-alive is — and produce a frame
- * with no data, so the caller ignores it without needing to know that.
- */
-function parseEventFrame(text) {
-  const frame = { id: null, event: "message", data: "" };
-  for (const raw of text.split("\n")) {
-    const line = raw.replace(/\r$/, "");
-    if (!line || line.startsWith(":")) {
-      continue;
-    }
-    const colon = line.indexOf(":");
-    const field = colon < 0 ? line : line.slice(0, colon);
-    let value = colon < 0 ? "" : line.slice(colon + 1);
-    if (value.startsWith(" ")) {
-      value = value.slice(1);
-    }
-    if (field === "id") {
-      frame.id = value;
-    } else if (field === "event") {
-      frame.event = value;
-    } else if (field === "data") {
-      frame.data = frame.data ? `${frame.data}\n${value}` : value;
-    }
-  }
-  return frame;
-}
+// One SSE frame, as fields (`parseEventFrame`), is web/src/core/sync's, with the reading
+// (`readEventStream`, `#624 voice-page-modularity`).
 
 function onStreamFrame(frame) {
   if (frame.id) {

@@ -12,3 +12,5 @@ export {
   staleAsOf,
 } from "./freshness.ts";
 export type { CursorCover, CursorFacts } from "./freshness.ts";
+export { parseEventFrame, readEventStream } from "./events.ts";
+export type { ByteReader, EventFrame, TextChunkDecoder } from "./events.ts";

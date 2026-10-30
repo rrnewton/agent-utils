@@ -7150,6 +7150,38 @@ test("`#624 voice-page-modularity`: prepared read-aloud tickets end on either cl
   assert.equal(prepared.size(), 0);
 });
 
+test("`#624 voice-page-modularity`: a Server-Sent Events stream read into frames, across chunk boundaries, from the module alone", async () => {
+  const { parseEventFrame, readEventStream } = SYNC;
+  assert.deepStrictEqual(parseEventFrame("id: 7\nevent: message_create\ndata: {\"a\":\ndata: 1}\r"),
+    { id: "7", event: "message_create", data: '{"a":\n1}' });
+  assert.deepStrictEqual(parseEventFrame(": keep-alive"), { id: null, event: "message", data: "" }, "a comment was a frame with data");
+  assert.deepStrictEqual(parseEventFrame("data"), { id: null, event: "message", data: "" });
+  const reading = (chunks, { stopAfter = Infinity } = {}) => {
+    let read = 0;
+    let cancelled = 0;
+    const reader = {
+      read: async () => (read < chunks.length ? { done: false, value: chunks[read++] } : { done: true }),
+      cancel: () => { cancelled += 1; return Promise.reject(new Error("refused")); },
+    };
+    const frames = [];
+    const decoder = { decode: (bytes, options) => { assert.deepStrictEqual(options, { stream: true }); return bytes; } };
+    const done = readEventStream(reader, () => read <= stopAfter, (frame) => {
+      frames.push(frame);
+      return frame.event === "reset" ? "reset" : undefined;
+    }, decoder);
+    return done.then((how) => ({ how, frames, cancelled: () => cancelled }));
+  };
+  // A frame split across chunks waits for its blank line; a partial last frame is never handed on.
+  const split = await reading(["data: one\n", "\nid: 2\nda", "ta: two\n\n: ping\n\ndata: partial"]);
+  assert.deepStrictEqual(split.frames.map((frame) => [frame.id, frame.data]), [[null, "one"], ["2", "two"], [null, ""]]);
+  assert.equal(split.how, "ended");
+  assert.equal((await reading(["event: reset\n\n", "data: after\n\n"])).how, "reset", "a reset frame did not end the read as a reset");
+  // Stopped: the reader is cancelled, its refusal swallowed, and no later frame is handed on.
+  const stopped = await reading(["data: a\n\n", "data: b\n\n"], { stopAfter: 1 });
+  assert.deepStrictEqual(stopped.frames.map((frame) => frame.data), ["a"]);
+  assert.deepStrictEqual([stopped.how, stopped.cancelled()], ["ended", 1]);
+});
+
 test("`#624 voice-page-modularity`: which read a refresh makes, and how fresh it is, from the module alone", () => {
   const { deltaCursor, isCursorRefusal, isMutationKey, staleAsOf, STALE_AS_OF_MS, TIMELINE_RECONCILE_MS } = SYNC;
   let now = 10 * TIMELINE_RECONCILE_MS;

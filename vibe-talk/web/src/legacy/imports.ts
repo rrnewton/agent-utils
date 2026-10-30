@@ -100,6 +100,7 @@ export {
   deltaCursor,
   isCursorRefusal,
   isMutationKey,
+  readEventStream as readEventFrames,
   staleAsOf as syncStaleAsOf,
 } from "../core/sync/index.ts";
 export {
