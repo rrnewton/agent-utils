@@ -501,3 +501,24 @@ fn a_bridge_under_the_registrys_bridges_directory_is_found_without_the_index() {
     assert_eq!(sent.code, Some(0), "{}", sent.stderr);
     assert!(sent.stdout.contains(&scratch.key), "{}", sent.stdout);
 }
+
+#[test]
+fn a_known_caller_never_reaches_a_bridge_that_targets_another_agent() {
+    let scratch = Scratch::new("lookup-other-agent");
+    let reply = scratch.file("reply.md", b"answer\n");
+    let index = index_naming(&scratch, &[&scratch.state]);
+    // The only bridge targets `worker`, and gave this ID; an agent known as `reviewer` is
+    // refused rather than replying through it.
+    let reviewer = Path::new("reviewer");
+    assert_failed(
+        &scratch.chat(
+            &["reply", &scratch.reply_id, "--file", &reply],
+            &[
+                ("AGENTCTL_CHAT_BRIDGE_INDEX", index.as_path()),
+                ("AGENTCTL_AGENT", reviewer),
+            ],
+        ),
+        1,
+        "no chat bridge targets you (reviewer)",
+    );
+}

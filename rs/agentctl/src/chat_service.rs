@@ -1050,10 +1050,11 @@ pub struct RunSettings {
 fn register_for_discovery(state_root: &Path, registry: &Path) -> PromptCommands {
     match crate::chat_lookup::register(state_root, registry) {
         Ok(entry) => {
-            let bare = crate::chat_lookup::agentctl_on_path_is_this_build();
+            let bare = crate::chat_lookup::agentctl_on_path_is_this_build_cached();
             service_log(format!(
                 "agentctl: bridge registered for discovery in {}; prompts print `{} chat reply \
-                 ID` and the other short commands",
+                 ID` and the other short commands (plain `agentctl` while the one on PATH is \
+                 this build, checked every minute)",
                 entry.display(),
                 if bare {
                     "agentctl"
@@ -1062,7 +1063,7 @@ fn register_for_discovery(state_root: &Path, registry: &Path) -> PromptCommands 
                 }
             ));
             PromptCommands {
-                bare,
+                bare: true,
                 discoverable: true,
             }
         }

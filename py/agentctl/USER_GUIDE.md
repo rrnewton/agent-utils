@@ -333,10 +333,12 @@ REGISTRY/
   agents/agent.json      the layout tripwire; not an agent
   locks/NAME.lock        the agent's lifecycle lock (and NAME.rank.lock)
   archive/NAME-TOKEN/    retired agents
+  bridges/NAME/          chat bridges (a state directory, or a link to one)
   .progress/  .waiting/  .renames/  .revives/  .inbox/
 ```
 
-`archive`, `agents` and `locks` are therefore reserved and cannot name an agent.
+`archive`, `agents`, `locks` and `bridges` are therefore reserved and cannot name an
+agent.
 
 Builds before layout 2 kept each agent at `REGISTRY/NAME/` and its locks at
 `REGISTRY/.NAME.lock` and `REGISTRY/.NAME.rank.lock`. Both editions still read

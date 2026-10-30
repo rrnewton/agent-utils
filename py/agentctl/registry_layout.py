@@ -60,7 +60,9 @@ RENAMES_TRIPWIRE_TEXT = (
     "This registry uses agentctl registry layout 2. agentctl builds older than layout 2 stop at "
     "this file; upgrade agentctl. Readers of rename journals skip it.\n"
 )
-RESERVED_NAMES = ("archive", AGENTS, LOCKS)
+#: The directory holding the registry's chat bridges, one entry each.
+BRIDGES = "bridges"
+RESERVED_NAMES = ("archive", AGENTS, LOCKS, BRIDGES)
 #: Registry-wide ``.<stem>.lock`` files that are fixed items, not agents' layout-1 locks.
 FIXED_LOCK_STEMS = ("identity", "coordinator", "restore")
 LEGACY_SUPPORT_ENDS = "2026-11-26"
@@ -643,7 +645,7 @@ def auto_migrate(registry: Path, environment: Callable[[str], str | None] = os.e
 
 __all__ = [
     "AGENTS", "AUTO_MIGRATE_VARIABLE", "CURRENT", "FIXED_LOCK_STEMS", "LEGACY", "LEGACY_SUPPORT_ENDS",
-    "LOCKS", "REMOVAL_ISSUE", "RENAMES_TRIPWIRE", "RENAMES_TRIPWIRE_TEXT", "RESERVED_NAMES", "TRIPWIRE", "TRIPWIRE_TEXT", "agents_directory",
+    "BRIDGES", "LOCKS", "REMOVAL_ISSUE", "RENAMES_TRIPWIRE", "RENAMES_TRIPWIRE_TEXT", "RESERVED_NAMES", "TRIPWIRE", "TRIPWIRE_TEXT", "agents_directory",
     "auto_migrate", "current_directory", "current_names", "directory", "directory_at", "is_agent_name",
     "is_tripwire", "legacy_directory", "legacy_lock_files", "legacy_names", "locate", "lock_paths",
     "lock_still_current", "locks_directory", "migrate", "names", "notice", "prepare", "prepare_locks", "record_directories", "stray_names",

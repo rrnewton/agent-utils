@@ -47,7 +47,7 @@ If you have trouble, run: agentctl chat help 5380
 ```
 
 - **Header.** `[from SENDER via ROUTE · KEY: VALUE ...]`, parsed by `sender_header::parse`.
-  SENDER is the sender's label from the bridge config's new optional `sender_labels` map
+  SENDER is the sender's label from the bridge config's new optional `labels.senders` map
   (provider ID to display name), else the provider ID. ROUTE is the subscription plugin
   (`slack`) and the channel's label from the new optional `channel_labels` map (`#team-chat`),
   else the channel ID. `sent:` carries what the old `Sent ...` opening carried, including
@@ -60,8 +60,8 @@ If you have trouble, run: agentctl chat help 5380
   these rules is refused when the configuration is read; a label is printed as configured.
 - **Fence.** `<chat_message>` and `</chat_message>` on lines of their own: unambiguous for a
   model, a few tokens, and they say exactly where the sender's words start and stop. A message
-  line that is itself the closing tag is printed as `<\/chat_message>`, so the fence cannot be
-  closed early. The tags are stable; tools may rely on them.
+  line that reads as a tag (any case, invisible characters ignored) is printed with `<\` in
+  place of its first `<`, as `<\/chat_message>`, so the fence cannot be closed early. The tags are stable; tools may rely on them.
 - **Footer.** The marker rule in one sentence, the thread command for a reply in an existing
   thread, and one help line. The long rules (when to use the reply command, sending each reply
   one way only, what to do when the command fails, checking `chat sent`) move to
@@ -99,7 +99,11 @@ and `agentctl chat help [5380]` take a positional reply ID and no `--bridge-stat
    `bridge.json` names its target agent (`agent_name`, kept current by `chat repoint`). The caller
    is the registered agent whose pinned harness is the nearest ancestor of the command (the
    registry's `caller_edge`, as `agentctl send` uses for its sender header), else
-   `AGENTCTL_AGENT`. Candidates whose target is not the caller are dropped.
+   `AGENTCTL_AGENT`, which counts only in the working registry and only when no registry knows
+   the caller. When the caller is known, candidates whose target is not the caller are dropped
+   (none left is an error); only when it is known nowhere are all candidates kept. Of those,
+   when any is live (a `chat run` holds its runner lock, read from `/proc/locks`), only the live
+   ones are kept, so a reply never goes to a stopped bridge whose state was left behind.
 4. A reply ID narrows further to the bridge that gave it: its reply alias record names the alias
    (bridges typing into one pane already have disjoint `reply_alias_range`s), or one of its
    requests has the long ID's nonce. With no caller identity the reply ID alone must pick one.
@@ -117,9 +121,10 @@ state directory, which `chat run` writes when it starts: the state directory, th
 the time. The index only says where to look; the state's own `bridge.json` and the registry
 decide. An entry whose state directory is gone is skipped.
 
-**Bare `agentctl`.** The prompt prints `agentctl` (not the service's absolute path) when the
+**Bare `agentctl`.** The prompt prints `agentctl` (not the service's absolute path) while the
 `agentctl` on the service's `PATH` is this executable or prints the same `--version` with a
-commit, so an older build on `PATH` never receives syntax it does not know. It prints the short
+commit (checked at most a minute before each prompt, so a rollback of the `PATH` program is
+followed), so an older build on `PATH` never receives syntax it does not know. It prints the short
 form (reply ID only) when the bridge registered itself in the index; otherwise it prints the old
 explicit form. `chat help 5380` always ends with the explicit absolute command as a last resort.
 
@@ -127,7 +132,9 @@ explicit form. `chat help 5380` always ends with the explicit absolute command a
 
 - New home: `REGISTRY/bridges/<name>/`, the whole state directory, one subdirectory per bridge
   (the rule for growing collections). `bridges` joins the registry's reserved names (`archive`,
-  `agents`, `locks`) in both editions' readers, so no agent can take it.
+  `agents`, `locks`) in both editions' readers already in piece 2, so no agent can take it.
+- Every chat command must accept a `--bridge-state` that is a link (canonicalized when the link
+  is the user's own), since today a state directory that is a symlink is refused as unsafe.
 - `agentctl chat init --bridge NAME` creates state there; every chat command accepts
   `--bridge NAME` for `--registry`'s `bridges/NAME`.
 - `agentctl chat migrate-state --bridge-state OLD --name NAME [--apply]`, a dry run by default:

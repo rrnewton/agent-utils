@@ -273,3 +273,8 @@ def test_retime_replaces_the_header_field_in_the_first_line() -> None:
     # A field that is not in the first line is not retimed: the text is typed as stored.
     moved = "[from Ada via slack #team]\nsent: 2026.10.07:08:45 EDT"
     assert prompt_time.retime(moved, "2026-10-07T12:45:00Z", recorded, at(MORNING)) == moved
+    # A sender whose name reads like the field is not taken for it: only a field after a separator is.
+    lookalike = "[from sent: 2026.10.07:08:45 EDT via slack #team · sent: 2026.10.07:08:45 EDT]"
+    assert (prompt_time.retime(lookalike, "2026-10-07T12:45:00Z", recorded, at(MORNING + 72 * 60))
+            == "[from sent: 2026.10.07:08:45 EDT via slack #team · sent: 2026.10.07:08:45 EDT,"
+               " delivered 1 h 12 min later]")
