@@ -175,7 +175,7 @@ def test_query_help_and_errors_match_python() -> None:
 
 
 def test_query_unported_actions_refuse_by_name(corpus: Path) -> None:
-    result = _cli(["query", "--output", str(corpus), "show", "team:synthetic-team-1"],
+    result = _cli(["query", "--output", str(corpus), "search", "needle"],
                   rust=True)
     assert result.returncode == 2
-    assert "has not ported 'query show' yet" in result.stderr
+    assert "has not ported 'query search' yet" in result.stderr

@@ -13,7 +13,8 @@
 
 use crate::inspect::{open_schema_3, schema_file, SchemaThree};
 use crate::json::{
-    as_array, as_int, as_object, as_string, dump_canonical, dump_oneline, py_repr, resolve_path,
+    as_array, as_int, as_object, as_string, dump_canonical, dump_oneline, py_number_str, py_repr,
+    resolve_path,
 };
 use serde_json::{Map, Value};
 use std::cell::RefCell;
@@ -145,6 +146,7 @@ fn timestamp(ms: i64) -> String {
 }
 
 type ReferenceOf = fn(&Map<String, Value>, &str) -> Result<String, String>;
+type LookupEntry = (String, Map<String, Value>);
 
 fn local_identifier<'a>(team: &str, identifier: &'a str) -> &'a str {
     let prefix = format!("{team}::");
@@ -238,6 +240,39 @@ fn optional_int(record: &Map<String, Value>, key: &str) -> Option<i64> {
 
 fn optional_string<'a>(record: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
     record.get(key).and_then(Value::as_str)
+}
+
+fn sorted_refs(mut references: Vec<String>) -> Value {
+    references.sort();
+    Value::Array(references.into_iter().map(Value::String).collect())
+}
+
+/// `PurePosixPath(name).suffix`: empty for a dotfile name
+/// like `.json`, where the dot leads the name.
+fn posix_suffix(parts: &[String]) -> &str {
+    let Some(name) = parts.last() else {
+        return "";
+    };
+    match name.rfind('.') {
+        Some(at) if at > 0 => &name[at..],
+        _ => "",
+    }
+}
+
+fn summary_available(record: &Map<String, Value>, key: &str) -> Result<bool, String> {
+    match record.get(key) {
+        None => Ok(true),
+        Some(Value::Bool(available)) => Ok(*available),
+        Some(_) => Err(format!("{key}: expected a boolean")),
+    }
+}
+
+fn agent_reference_for_id(team: &str, identifier: &str) -> String {
+    format!("agent:{team}::{}", local_identifier(team, identifier))
+}
+
+fn same_agent_identifier(team: &str, left: &str, right: &str) -> bool {
+    local_identifier(team, left) == local_identifier(team, right)
 }
 
 enum Generation {
@@ -504,16 +539,18 @@ impl Timeline {
         }
     }
 
-    /// Resolve one stable reference to its record kind, the
-    /// way `--agent` validation needs it.
-    fn lookup(&self, reference: &str) -> Result<Option<String>, String> {
+    fn lookup_entry(&self, reference: &str) -> Result<Option<LookupEntry>, String> {
         let Some((kind, remainder)) = reference.split_once(':') else {
             return Ok(None);
         };
         if kind == "team" {
-            for record in &self.teams {
-                if optional_string(record, "slug") == Some(remainder) {
-                    return Ok(Some("team".to_string()));
+            for (index, record) in self.teams.iter().enumerate() {
+                let slug = as_string(
+                    record.get("slug").unwrap_or(&Value::Null),
+                    &format!("timeline.teams[{index}].slug"),
+                )?;
+                if slug == remainder {
+                    return Ok(Some(("team".to_string(), record.clone())));
                 }
             }
             return Ok(None);
@@ -522,32 +559,63 @@ impl Timeline {
             return Ok(None);
         }
         match &self.generation {
-            Generation::Three(_) => {
+            Generation::Three(three) => {
                 let Some((team, _)) = remainder.split_once("::") else {
                     return Ok(None);
                 };
-                let (name, reference_of): (&'static str, ReferenceOf) = match kind {
-                    "agent" => ("agents", agent_ref),
-                    "phase" => ("phases", phase_ref),
-                    _ => ("rollups", rollup_ref),
+                let kind_name = match kind {
+                    "agent" => "agent",
+                    "phase" => "phase_card",
+                    _ => "rollup",
                 };
-                for record in self.for_team(name, team)? {
-                    let singular = match kind {
-                        "agent" => "agent",
-                        "phase" => "phase",
-                        _ => "rollup",
-                    };
-                    if reference_of(&record, singular)? == reference {
-                        return Ok(Some(kind.to_string()));
+                let reference_of: ReferenceOf = match kind {
+                    "agent" => agent_ref,
+                    "phase" => phase_ref,
+                    _ => rollup_ref,
+                };
+                let mut bounds = std::collections::BTreeMap::new();
+                for record in self.spine_group(three, "activity_bounds", team)? {
+                    let where_ = format!("{team} activity bounds");
+                    let bound_ref = as_string(
+                        record.get("ref").unwrap_or(&Value::Null),
+                        &format!("{where_}.ref"),
+                    )?
+                    .to_string();
+                    let start = as_int(
+                        record.get("activity_start_ms").unwrap_or(&Value::Null),
+                        &format!("{where_}.activity_start_ms"),
+                    )?;
+                    let end = as_int(
+                        record.get("activity_end_ms").unwrap_or(&Value::Null),
+                        &format!("{where_}.activity_end_ms"),
+                    )?;
+                    bounds.insert(bound_ref, (start, end));
+                }
+                // Python's refs() builds the whole team table,
+                // so any duplicate reference in it refuses.
+                let mut seen = std::collections::BTreeSet::new();
+                let mut table_entry = None;
+                for record in self.spine_group(three, kind_name, team)? {
+                    let found_ref = reference_of(&record, kind)?;
+                    if !seen.insert(found_ref.clone()) {
+                        return Err(format!(
+                            "duplicate stable reference {}",
+                            py_repr(&Value::String(found_ref))
+                        ));
+                    }
+                    if found_ref == reference {
+                        let mut merged = record.clone();
+                        if let Some((start, end)) = bounds.get(&found_ref) {
+                            merged.insert("activity_start_ms".to_string(), Value::from(*start));
+                            merged.insert("activity_end_ms".to_string(), Value::from(*end));
+                        }
+                        table_entry = Some((kind.to_string(), merged));
                     }
                 }
-                Ok(None)
+                Ok(table_entry)
             }
             Generation::One(_) => {
-                // Build the whole index first, the way
-                // `_index` does: a duplicate anywhere refuses
-                // the lookup, even after the sought reference.
-                let mut entries: Vec<(String, String)> = Vec::new();
+                let mut entries: Vec<(String, String, Map<String, Value>)> = Vec::new();
                 for (name, reference_of) in [
                     ("agents", agent_ref as ReferenceOf),
                     ("phases", phase_ref as ReferenceOf),
@@ -560,21 +628,27 @@ impl Timeline {
                     };
                     for record in self.collection(name, None)? {
                         let found = reference_of(&record, singular)?;
-                        if entries.iter().any(|(existing, _)| existing == &found) {
+                        if entries.iter().any(|(existing, _, _)| existing == &found) {
                             return Err(format!(
                                 "duplicate stable reference {}",
                                 py_repr(&Value::String(found))
                             ));
                         }
-                        entries.push((found, singular.to_string()));
+                        entries.push((found, singular.to_string(), record));
                     }
                 }
                 Ok(entries
                     .into_iter()
-                    .find(|(found, _)| found == reference)
-                    .map(|(_, kind)| kind))
+                    .find(|(found, _, _)| found == reference)
+                    .map(|(_, kind, record)| (kind, record)))
             }
         }
+    }
+
+    /// Resolve one stable reference to its record kind, the
+    /// way `--agent` validation needs it.
+    fn lookup(&self, reference: &str) -> Result<Option<String>, String> {
+        Ok(self.lookup_entry(reference)?.map(|(kind, _record)| kind))
     }
 
     fn validated_agent_filter(&self, filters: &Filters) -> Result<Option<String>, String> {
@@ -611,6 +685,224 @@ impl Timeline {
         let start = intervals.iter().map(|(start, _)| *start).min().unwrap_or(0);
         let end = intervals.iter().map(|(_, end)| *end).max().unwrap_or(0);
         Ok(Some((start, end)))
+    }
+
+    fn safe_file(&self, relative: &str) -> Result<(PathBuf, Vec<String>), String> {
+        let escaped = || {
+            format!(
+                "archive path escapes root: {}",
+                py_repr(&Value::String(relative.to_string()))
+            )
+        };
+        if relative.starts_with('/') || relative.is_empty() {
+            return Err(escaped());
+        }
+        let parts: Vec<String> = relative
+            .split('/')
+            .filter(|part| !part.is_empty() && *part != ".")
+            .map(str::to_string)
+            .collect();
+        if parts.is_empty() || parts.iter().any(|part| part == "..") {
+            return Err(escaped());
+        }
+        let mut joined = self.root.clone();
+        for part in &parts {
+            joined.push(part);
+        }
+        let path = resolve_path(&joined);
+        if !path.starts_with(&self.root) {
+            return Err(escaped());
+        }
+        if path.is_file() {
+            return Ok((path, parts));
+        }
+        let mut stored_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        stored_name.push_str(".gz");
+        let stored = path.with_file_name(stored_name);
+        if stored.is_file() {
+            return Ok((stored, parts));
+        }
+        Err(format!("archive file is missing: {relative}"))
+    }
+
+    fn detail_file(&self, relative: &str) -> Result<PathBuf, String> {
+        let (path, parts) = self.safe_file(relative)?;
+        let suffix = posix_suffix(&parts);
+        if parts.len() < 3 || parts[0] != "data" || parts[1] != "details" || suffix != ".json" {
+            return Err(format!(
+                "phase detail path is outside data/details: {}",
+                py_repr(&Value::String(relative.to_string()))
+            ));
+        }
+        Ok(path)
+    }
+
+    fn rollup_file(&self, relative: &str, team: &str) -> Result<PathBuf, String> {
+        let (path, parts) = self.safe_file(relative)?;
+        let suffix = posix_suffix(&parts);
+        if parts.len() < 5
+            || parts[0] != "teams"
+            || parts[1] != team
+            || parts[2] != "summaries"
+            || suffix != ".md"
+        {
+            return Err(format!(
+                "rollup path is outside teams/{team}/summaries: {}",
+                py_repr(&Value::String(relative.to_string()))
+            ));
+        }
+        Ok(path)
+    }
+
+    fn read_json_file(&self, path: &Path) -> Result<Value, String> {
+        let compressed = path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().ends_with(".gz"));
+        let bytes = std::fs::read(path).map_err(|error| crate::json::os_error(&error, path))?;
+        let bytes = if compressed {
+            let mut decoded = Vec::new();
+            flate2::read::MultiGzDecoder::new(&bytes[..])
+                .read_to_end(&mut decoded)
+                .map_err(|error| error.to_string())?;
+            decoded
+        } else {
+            bytes
+        };
+        let text = String::from_utf8(bytes).map_err(|error| error.to_string())?;
+        serde_json::from_str(&text).map_err(|error| error.to_string())
+    }
+
+    fn read_markdown(&self, path: &Path) -> Result<String, String> {
+        let bytes = std::fs::read(path).map_err(|error| crate::json::os_error(&error, path))?;
+        String::from_utf8(bytes).map_err(|error| error.to_string())
+    }
+
+    /// `TimelineQuery.show` for team, agent, phase, and rollup
+    /// references, after the transcript-reference refusal in
+    /// the CLI has handled `message:` and `tool:`.
+    pub fn show_record(
+        &self,
+        reference: &str,
+        transcript: bool,
+    ) -> Result<Map<String, Value>, String> {
+        let Some((kind, record)) = self.lookup_entry(reference)? else {
+            return Err(format!(
+                "unknown stable reference {}",
+                py_repr(&Value::String(reference.to_string()))
+            ));
+        };
+        let mut result = record.clone();
+        result.insert("ref".to_string(), Value::String(reference.to_string()));
+        result.insert("record_type".to_string(), Value::String(kind.clone()));
+        match kind.as_str() {
+            "team" => {
+                let slug =
+                    as_string(record.get("slug").unwrap_or(&Value::Null), "team.slug")?.to_string();
+                let mut agents = Vec::new();
+                for candidate in self.for_team("agents", &slug)? {
+                    agents.push(agent_ref(&candidate, "agent")?);
+                }
+                result.insert("agent_refs".to_string(), sorted_refs(agents));
+                let mut rollups = Vec::new();
+                for candidate in self.for_team("rollups", &slug)? {
+                    rollups.push(rollup_ref(&candidate, "rollup")?);
+                }
+                result.insert("rollup_refs".to_string(), sorted_refs(rollups));
+                if let Some((start, end)) = self.team_range(&slug)? {
+                    result.insert("start_ms".to_string(), Value::from(start));
+                    result.insert("end_ms".to_string(), Value::from(end));
+                    result.insert("start_time".to_string(), Value::String(timestamp(start)));
+                    result.insert("end_time".to_string(), Value::String(timestamp(end)));
+                }
+            }
+            "agent" => {
+                let team = team_of(&record, "agent")?;
+                let identifier =
+                    as_string(record.get("id").unwrap_or(&Value::Null), "agent.id")?.to_string();
+                let parent_ref = match record.get("parent_id") {
+                    None | Some(Value::Null) => Value::Null,
+                    Some(parent) => Value::String(agent_reference_for_id(
+                        &team,
+                        as_string(parent, "agent.parent_id")?,
+                    )),
+                };
+                result.insert("parent_ref".to_string(), parent_ref);
+                let mut children = Vec::new();
+                for candidate in self.for_team("agents", &team)? {
+                    if let Some(parent) = candidate.get("parent_id").and_then(Value::as_str) {
+                        if same_agent_identifier(&team, parent, &identifier) {
+                            children.push(agent_ref(&candidate, "agent")?);
+                        }
+                    }
+                }
+                result.insert("child_refs".to_string(), sorted_refs(children));
+                let mut phases = Vec::new();
+                for candidate in self.for_team("phases", &team)? {
+                    let agent_id = as_string(
+                        candidate.get("agent_id").unwrap_or(&Value::Null),
+                        "phase.agent_id",
+                    )?;
+                    if same_agent_identifier(&team, agent_id, &identifier) {
+                        phases.push(phase_ref(&candidate, "phase")?);
+                    }
+                }
+                result.insert("phase_refs".to_string(), sorted_refs(phases));
+                with_times(&mut result, &record, "agent")?;
+            }
+            "phase" => {
+                let team = team_of(&record, "phase")?;
+                let identifier = as_string(
+                    record.get("agent_id").unwrap_or(&Value::Null),
+                    "phase.agent_id",
+                )?;
+                result.insert(
+                    "agent_ref".to_string(),
+                    Value::String(agent_reference_for_id(&team, identifier)),
+                );
+                let relative = as_string(
+                    record.get("detail_path").unwrap_or(&Value::Null),
+                    "phase.detail_path",
+                )?
+                .to_string();
+                let detail_value = self.read_json_file(&self.detail_file(&relative)?)?;
+                let detail = as_object(&detail_value, &relative)?;
+                let mut shown = detail.clone();
+                if !transcript {
+                    shown.remove("transcript");
+                }
+                result.insert("detail".to_string(), Value::Object(shown));
+                with_times(&mut result, &record, "phase")?;
+            }
+            "rollup" => {
+                let team = team_of(&record, "rollup")?;
+                if summary_available(&record, "technical_summary_available")? {
+                    let relative = as_string(
+                        record.get("technical_path").unwrap_or(&Value::Null),
+                        "rollup.technical_path",
+                    )?;
+                    result.insert(
+                        "technical_markdown".to_string(),
+                        Value::String(self.read_markdown(&self.rollup_file(relative, &team)?)?),
+                    );
+                }
+                if summary_available(&record, "plain_language_summary_available")? {
+                    let relative = as_string(
+                        record.get("plain_language_path").unwrap_or(&Value::Null),
+                        "rollup.plain_language_path",
+                    )?;
+                    result.insert(
+                        "plain_language_markdown".to_string(),
+                        Value::String(self.read_markdown(&self.rollup_file(relative, &team)?)?),
+                    );
+                }
+                with_times(&mut result, &record, "rollup")?;
+            }
+            _ => unreachable!(),
+        }
+        Ok(result)
     }
 
     /// `TimelineQuery.list_records` for one resource.
@@ -845,7 +1137,7 @@ pub fn format_query(
             let body = items
                 .iter()
                 .map(markdown_item)
-                .collect::<Vec<_>>()
+                .collect::<Result<Vec<_>, String>>()?
                 .join("\n\n");
             Ok(format!(
                 "# wrkviz query: {command}\n\n{body}\n\n_{} result(s)._\n",
@@ -894,7 +1186,7 @@ fn title_case(key: &str) -> String {
         .join(" ")
 }
 
-fn markdown_item(item: &Map<String, Value>) -> String {
+fn markdown_item(item: &Map<String, Value>) -> Result<String, String> {
     let mut lines = vec![format!("## {}", markdown_title(item)), String::new()];
     for key in [
         "ref",
@@ -914,7 +1206,9 @@ fn markdown_item(item: &Map<String, Value>) -> String {
     ] {
         match item.get(key) {
             Some(Value::String(text)) => lines.push(format!("- {}: `{text}`", title_case(key))),
-            Some(Value::Number(number)) => lines.push(format!("- {}: `{number}`", title_case(key))),
+            Some(Value::Number(number)) => {
+                lines.push(format!("- {}: `{}`", title_case(key), py_number_str(number)))
+            }
             Some(Value::Bool(flag)) => {
                 let rendered = if *flag { "True" } else { "False" };
                 lines.push(format!("- {}: `{rendered}`", title_case(key)))
@@ -947,20 +1241,15 @@ fn markdown_item(item: &Map<String, Value>) -> String {
         if let Some(transcript) = detail.get("transcript").and_then(Value::as_array) {
             lines.push("### Transcript".to_string());
             lines.push(String::new());
-            for raw in transcript {
-                let message = raw.as_object();
-                let role = message
-                    .and_then(|m| m.get("role"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                let at_ms = message
-                    .and_then(|m| m.get("at_ms"))
-                    .and_then(Value::as_i64)
-                    .unwrap_or(0);
-                let text = message
-                    .and_then(|m| m.get("text"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
+            for (index, raw) in transcript.iter().enumerate() {
+                let where_ = format!("detail.transcript[{index}]");
+                let message = as_object(raw, &where_)?;
+                let role = as_string(message.get("role").unwrap_or(&Value::Null), &format!("{where_}.role"))?;
+                let at_ms = as_int(
+                    message.get("at_ms").unwrap_or(&Value::Null),
+                    &format!("{where_}.at_ms"),
+                )?;
+                let text = as_string(message.get("text").unwrap_or(&Value::Null), &format!("{where_}.text"))?;
                 lines.push(format!("#### {role} · {}", timestamp(at_ms)));
                 lines.push(String::new());
                 lines.push(text.trim_end().to_string());
@@ -968,7 +1257,7 @@ fn markdown_item(item: &Map<String, Value>) -> String {
             }
         }
     }
-    lines.join("\n").trim_end().to_string()
+    Ok(lines.join("\n").trim_end().to_string())
 }
 
 fn text_item(item: &Map<String, Value>) -> String {

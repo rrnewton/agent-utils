@@ -85,7 +85,7 @@ pub fn py_repr(value: &Value) -> String {
                 "False".to_string()
             }
         }
-        Value::Number(number) => number.to_string(),
+        Value::Number(number) => py_number_str(number),
         Value::String(text) => py_repr_str(text),
         Value::Array(items) => {
             let parts: Vec<String> = items.iter().map(py_repr).collect();
@@ -147,8 +147,10 @@ pub fn py_repr_str(text: &str) -> String {
     out
 }
 
-/// CPython `repr` of a float, closely enough for JSON output:
-/// shortest digits, exponent form signed and two digits wide.
+/// CPython `repr` of a float: shortest round-trip digits,
+/// exponent form (signed, at least two exponent digits) when
+/// the decimal exponent is below -4 or at least 16, fixed form
+/// otherwise, with a trailing `.0` on integral fixed values.
 pub fn py_float_repr(value: f64) -> String {
     if value.is_nan() {
         return "NaN".to_string();
@@ -164,26 +166,53 @@ pub fn py_float_repr(value: f64) -> String {
         }
         .to_string();
     }
-    let raw = value.to_string();
-    if let Some((mantissa, exponent)) = raw.split_once('e') {
-        let exponent: i64 = exponent.parse().unwrap_or(0);
-        let mantissa = if mantissa.contains('.') {
-            mantissa.to_string()
+    // Rust's LowerExp prints the same shortest digits CPython
+    // chooses, in `d.dddde<exp>` shape; re-render them under
+    // CPython's fixed-vs-exponent rule.
+    let sci = format!("{:e}", value.abs());
+    let (mantissa, exponent) = sci.split_once('e').unwrap_or((sci.as_str(), "0"));
+    let exponent: i64 = exponent.parse().unwrap_or(0);
+    let digits: String = mantissa.chars().filter(|ch| *ch != '.').collect();
+    let sign = if value < 0.0 { "-" } else { "" };
+    if !(-4..16).contains(&exponent) {
+        let fraction = if digits.len() > 1 {
+            format!(".{}", &digits[1..])
         } else {
-            format!("{mantissa}.0")
+            String::new()
         };
         return format!(
-            "{}e{}{:02}",
-            mantissa,
+            "{sign}{}{fraction}e{}{:02}",
+            &digits[..1],
             if exponent < 0 { "-" } else { "+" },
             exponent.abs()
         );
     }
-    if raw.contains('.') {
-        raw
-    } else {
-        format!("{raw}.0")
+    if exponent >= 0 {
+        let width = (exponent + 1) as usize;
+        let (integer, fraction) = if digits.len() > width {
+            (digits[..width].to_string(), digits[width..].to_string())
+        } else {
+            (format!("{digits:0<width$}"), String::new())
+        };
+        if fraction.is_empty() {
+            return format!("{sign}{integer}.0");
+        }
+        return format!("{sign}{integer}.{fraction}");
     }
+    format!("{sign}0.{}{digits}", "0".repeat((-exponent - 1) as usize))
+}
+
+/// How Python prints one JSON number: floats through
+/// `py_float_repr`, integers as their exact literal digits
+/// (arbitrary precision is preserved by the parser).
+pub fn py_number_str(number: &serde_json::Number) -> String {
+    let raw = number.to_string();
+    if raw.bytes().any(|byte| matches!(byte, b'.' | b'e' | b'E')) {
+        if let Some(float) = number.as_f64() {
+            return py_float_repr(float);
+        }
+    }
+    raw
 }
 
 /// `json.dumps(value, indent=2, sort_keys=True)`: two-space
@@ -215,15 +244,7 @@ fn write_oneline(value: &Value, out: &mut String) {
     match value {
         Value::Null => out.push_str("null"),
         Value::Bool(flag) => out.push_str(if *flag { "true" } else { "false" }),
-        Value::Number(number) => {
-            if let Some(float) = number.as_f64() {
-                if number.as_i64().is_none() && number.as_u64().is_none() {
-                    out.push_str(&py_float_repr(float));
-                    return;
-                }
-            }
-            out.push_str(&number.to_string())
-        }
+        Value::Number(number) => out.push_str(&py_number_str(number)),
         Value::String(text) => write_json_string_as(text, out, false),
         Value::Array(items) => {
             out.push('[');
@@ -262,15 +283,7 @@ fn write_value(value: &Value, depth: usize, out: &mut String, ascii_only: bool) 
     match value {
         Value::Null => out.push_str("null"),
         Value::Bool(flag) => out.push_str(if *flag { "true" } else { "false" }),
-        Value::Number(number) => {
-            if let Some(float) = number.as_f64() {
-                if number.as_i64().is_none() && number.as_u64().is_none() {
-                    out.push_str(&py_float_repr(float));
-                    return;
-                }
-            }
-            out.push_str(&number.to_string())
-        }
+        Value::Number(number) => out.push_str(&py_number_str(number)),
         Value::String(text) => write_json_string_as(text, out, ascii_only),
         Value::Array(items) => {
             if items.is_empty() {

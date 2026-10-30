@@ -125,7 +125,22 @@ options:
   --agent AGENT         canonical agent:TEAM::ID reference to select
 "#;
 
+/// The Python edition's query-show help, verbatim.
+pub const QUERY_SHOW_HELP: &str = r#"usage: wrkviz query show [-h] [--transcript] reference
+
+resolve one stable reference
+
+positional arguments:
+  reference     team:, agent:, phase:, rollup:, message:, or tool: reference
+
+options:
+  -h, --help    show this help message and exit
+  --transcript  include condensed transcript messages when showing a work
+                phase
+"#;
+
 const QUERY_USAGE: &str = "usage: wrkviz query [-h] --output OUTPUT [--format {json,jsonl,markdown,text}]\n                    {list,show,search,prompts,messages,stats} ...";
+const QUERY_SHOW_USAGE: &str = "usage: wrkviz query show [-h] [--transcript] reference";
 const QUERY_LIST_USAGE: &str = "usage: wrkviz query list [-h] [--team TEAM] [--start-time START_TIME]\n                         [--end-time END_TIME]\n                         [--kind {hourly,daily,weekly,monthly,quarterly}]\n                         [--agent AGENT]\n                         {teams,agents,phases,rollups}";
 
 const VERSION: &str = "wrkviz 0.1.0";
@@ -271,7 +286,12 @@ fn run_query(args: &[String]) -> u8 {
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
-        if arg == "--help" || arg == "-h" {
+        let help_plain = arg == "-h"
+            || (arg.len() > 2
+                && arg.starts_with("--")
+                && !arg.contains('=')
+                && "--help".starts_with(arg.as_str()));
+        if help_plain {
             match action.as_deref() {
                 None => {
                     print!("{QUERY_HELP}");
@@ -279,6 +299,10 @@ fn run_query(args: &[String]) -> u8 {
                 }
                 Some("list") => {
                     print!("{QUERY_LIST_HELP}");
+                    return 0;
+                }
+                Some("show") => {
+                    print!("{QUERY_SHOW_HELP}");
                     return 0;
                 }
                 Some(other) => {
@@ -337,6 +361,23 @@ fn run_query(args: &[String]) -> u8 {
         }
         index += 1;
     }
+    // A `show` flag carrying an explicit `=value` is refused
+    // during parsing, before argparse checks the query
+    // parser's required arguments; let the show parser say so
+    // even when --output is missing.
+    if action.as_deref() == Some("show") && output.is_none() {
+        let explicit = rest.iter().any(|arg| {
+            let Some((name, _)) = arg.split_once('=') else {
+                return false;
+            };
+            name.len() > 2
+                && name.starts_with("--")
+                && ("--help".starts_with(name) || "--transcript".starts_with(name))
+        });
+        if explicit {
+            return run_query_show("", &format, &rest);
+        }
+    }
     let mut missing: Vec<&str> = Vec::new();
     if output.is_none() {
         missing.push("--output");
@@ -357,6 +398,7 @@ fn run_query(args: &[String]) -> u8 {
     let output = output.unwrap_or_default();
     match action.as_deref() {
         Some("list") => run_query_list(&output, &format, &rest),
+        Some("show") => run_query_show(&output, &format, &rest),
         Some(other) => {
             eprintln!(
                 "wrkviz: the Rust edition has not ported 'query {other}' yet; the Python edition remains the oracle for it"
@@ -364,6 +406,118 @@ fn run_query(args: &[String]) -> u8 {
             2
         }
         None => 2,
+    }
+}
+
+fn run_query_show(output: &str, format: &str, args: &[String]) -> u8 {
+    let mut reference: Option<String> = None;
+    let mut transcript = false;
+    let mut extras: Vec<String> = Vec::new();
+    let mut after_separator = false;
+    for arg in args {
+        if !after_separator {
+            if arg == "--" {
+                after_separator = true;
+                continue;
+            }
+            if let Some(long) = arg.strip_prefix("--") {
+                // argparse long options: an exact name or an
+                // unambiguous abbreviation, with an optional
+                // `=value` a flag option refuses by name.
+                let (name, value) = match long.split_once('=') {
+                    Some((name, value)) => (name, Some(value)),
+                    None => (long, None),
+                };
+                let spelled = format!("--{name}");
+                if "--help".starts_with(spelled.as_str()) && name.len() > 1 {
+                    if let Some(value) = value {
+                        return argparse_error(
+                            QUERY_SHOW_USAGE,
+                            "wrkviz query show",
+                            &format!("argument -h/--help: ignored explicit argument '{value}'"),
+                        );
+                    }
+                    print!("{QUERY_SHOW_HELP}");
+                    return 0;
+                }
+                if "--transcript".starts_with(spelled.as_str()) && name.len() > 1 {
+                    if let Some(value) = value {
+                        return argparse_error(
+                            QUERY_SHOW_USAGE,
+                            "wrkviz query show",
+                            &format!(
+                                "argument --transcript: ignored explicit argument '{value}'"
+                            ),
+                        );
+                    }
+                    transcript = true;
+                    continue;
+                }
+                extras.push(arg.clone());
+                continue;
+            }
+            if arg.len() > 1 && arg.starts_with('-') {
+                if arg[1..].starts_with('h') {
+                    print!("{QUERY_SHOW_HELP}");
+                    return 0;
+                }
+                extras.push(arg.clone());
+                continue;
+            }
+        }
+        if reference.is_none() {
+            reference = Some(arg.clone());
+        } else {
+            extras.push(arg.clone());
+        }
+    }
+    let Some(reference) = reference else {
+        return argparse_error(
+            QUERY_SHOW_USAGE,
+            "wrkviz query show",
+            "the following arguments are required: reference",
+        );
+    };
+    if !extras.is_empty() {
+        // Once a subcommand parser is chosen, unknown
+        // arguments are reported by the root parser with
+        // the top-level usage (argparse's spelling here).
+        eprintln!(
+            "usage: wrkviz [-h] [--version] [--userguide]\n              {{quickstart,ingest-project,ingest,ingest-claude,ingest-claude-history,ingest-muse,ingest-orc,summarize,build,extract-transcripts,export,refresh,github-metadata,refresh-claude,refresh-orc,serve,inspect,gc,migrate-build-state,migrate-snapshots,audit-glossary,audit-losslessness,query,responsiveness,discover-agents}}\n              ...\nwrkviz: error: unrecognized arguments: {}",
+            extras.join(" ")
+        );
+        return 2;
+    }
+    let timeline = match crate::query::Timeline::open(&cli_path(output)) {
+        Ok(timeline) => timeline,
+        Err(error) => {
+            eprintln!("wrkviz: {error}");
+            return 2;
+        }
+    };
+    if reference.starts_with("message:") || reference.starts_with("tool:") {
+        eprintln!(
+            "wrkviz: the Rust edition has not ported 'query show' for transcript search references yet; the Python edition remains the oracle for it"
+        );
+        return 2;
+    }
+    match timeline.show_record(&reference, transcript) {
+        Ok(item) => {
+            match crate::query::format_query(&format!("show {reference}"), &[item], format) {
+                Ok(text) => {
+                    print!("{text}");
+                    0
+                }
+                Err(error) => {
+                    eprintln!("wrkviz: {error}");
+                    2
+                }
+            }
+        }
+        Err(error) => {
+            eprintln!("wrkviz: {error}");
+            2
+        }
     }
 }
 
