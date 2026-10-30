@@ -7197,6 +7197,21 @@ test("`#624 voice-page-modularity`: a read asked for while another is out joins 
   assert.deepStrictEqual([started, generation.current()], [0, 1]);
 });
 
+test("`#624 voice-page-modularity`: each column keeps its own record of its older pages, reached through the column worked on", () => {
+  const page = newPage();
+  const same = (expression) => page.pure(expression);
+  assert.equal(same("olderPages() === columns.main.older"), true, "the left column's record was not the one worked on");
+  assert.equal(same("inColumn(columns.side, () => olderPages()) === columns.side.older"), true,
+    "the right column's record was not the one worked on inside it");
+  assert.equal(same("columns.main.older !== columns.side.older"), true, "the columns shared one record");
+  // Written in one column, read in it; the other's untouched.
+  same("inColumn(columns.side, () => { olderPages().cursor = 'side-cursor'; olderPages().moreAbove = true; })");
+  assert.deepStrictEqual(JSON.parse(same("JSON.stringify([columns.side.older.cursor, columns.side.older.moreAbove, olderPages().cursor])")),
+    ["side-cursor", true, null]);
+  assert.deepStrictEqual(JSON.parse(same("JSON.stringify(freshOlderPages())")),
+    { moreAbove: false, cursor: null, inFlight: false, step: null, deferred: false });
+});
+
 test("`#624 voice-page-modularity`: the live events counted per channel, from the module alone", () => {
   const { createLiveEvents } = SYNC;
   const live = createLiveEvents();

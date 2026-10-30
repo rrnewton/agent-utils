@@ -129,14 +129,19 @@ const COLUMN_IDS = {
  * `fromCards` says the thread the right column shows was entered from its card, so that ← goes back
  * out to the cards (`#277 thread-card-focus`, `enterCard`).
  *
+ * `older` is the column's own record of its older pages (`freshOlderPages`, `olderPages`; `#624
+ * voice-page-modularity`, plan step 15), a field group kept on the column rather than in `state`.
+ *
  * @typedef {{matched: number, loaded: number, tally: any, pinned: boolean}} SearchCount
  * @typedef {{name: string, state: unknown[] | null, searched: SearchCount | null,
- *   searchWalk: any, searchNote: {key: string, text: string} | null}} ColumnFields
+ *   searchWalk: any, searchNote: {key: string, text: string} | null,
+ *   older: ReturnType<typeof freshOlderPages>}} ColumnFields
  * @type {{main: ColumnFields, side: ColumnFields & {mode: "list" | "thread", fromCards: boolean}}}
  */
 const columns = {
-  main: { name: "main", state: null, searched: null, searchWalk: null, searchNote: null },
-  side: { name: "side", state: null, searched: null, searchWalk: null, searchNote: null, mode: "list", fromCards: false },
+  main: { name: "main", state: null, searched: null, searchWalk: null, searchNote: null, older: freshOlderPages() },
+  side: { name: "side", state: null, searched: null, searchWalk: null, searchNote: null, mode: "list", fromCards: false,
+    older: freshOlderPages() },
 };
 /** The column the code is working on now. The left one, except inside `inColumn`. */
 let activeColumn = columns.main;
@@ -7615,7 +7620,7 @@ function filterHiddenSentence(anchor, walked) {
 
 /** Whether the anchor's message is older than everything the channel's list has loaded, with more above it. */
 function olderThanLoaded(anchor) {
-  if (sideActive || currentView !== "discord" || pinnedOnly || discordMoreAbove !== true ||
+  if (sideActive || currentView !== "discord" || pinnedOnly || olderPages().moreAbove !== true ||
       !Number.isFinite(anchor.time)) return false;
   const loaded = threadingSupported ? timelineMessages : [...el("discord-log").children].flatMap(rowMessages);
   const times = loaded.map((message) => timeOf(message, "timestamp")).filter(Number.isFinite);
@@ -7645,7 +7650,7 @@ async function walkToFilterAnchor(anchor) {
   let scrolled = false;
   try {
     while (pages < FILTER_WALK_PAGES && current() && olderThanLoaded(anchor) &&
-        (discordOlderCursor || walkCursorOwed())) {
+        (olderPages().cursor || walkCursorOwed())) {
       pages += 1;
       // The row the walk left the reader on, at the head of the list. A step keeps the row the reader
       // is on where it is (`preservingScroll`), so this one anywhere else afterwards is a reader who
@@ -17712,7 +17717,7 @@ const TRANSCRIPT_PAGE_LIMIT = 40;
 /**
  * Is anything older than the topmost row still in the record?
  *
- * Three values, for the same reason `discordMoreAbove` has three: `true` there is more, `false`
+ * Three values, for the same reason `olderPages().moreAbove` has three: `true` there is more, `false`
  * the reader has reached the beginning of everything stored, `undefined` the server did not say.
  */
 let transcriptMoreAbove = false;
@@ -23797,7 +23802,7 @@ function drawProjection() {
   // Main drawn from All's cover, read in this page: older history is known to exist, and the step
   // back to it is Main's own first read (`walkCursorOwed`). `#220 view-switch-instant`.
   if (cover.fromAll && cover.live && cover.more) {
-    discordMoreAbove = true;
+    olderPages().moreAbove = true;
     renderOlderControl();
   }
   // A delivered send whose row is saved here shows once, as that row — but its receipt stays until
@@ -23814,7 +23819,7 @@ function drawProjection() {
  * on from. `#220 view-switch-instant`.
  */
 function walkCursorOwed() {
-  if (discordOlderCursor || channelStore.current().channel !== String(selectedChannelId())) {
+  if (olderPages().cursor || channelStore.current().channel !== String(selectedChannelId())) {
     return false;
   }
   // A page that said more exists and carried no cursor, whatever the view's cover: one a
@@ -23918,7 +23923,7 @@ function saveChannelScope() {
       usedAt: now,
       messages,
       threads: [],
-      more: discordMoreAbove !== false,
+      more: olderPages().moreAbove !== false,
       cursor: null,
       // `#578 search-status-clarity`: where the rows saved stop being one stretch, if they do.
       gapFrom: plainGapFrom,
@@ -24018,8 +24023,8 @@ function clearChannelScreen() {
   timelineMessages = [];
   timelineThreads = [];
   archivedIds = new Set();
-  discordMoreAbove = false;
-  discordOlderCursor = null;
+  olderPages().moreAbove = false;
+  olderPages().cursor = null;
   discordWalkCursorOwed = false;
   discordNewestId = null;
   el("discord-log").replaceChildren();
@@ -25446,8 +25451,8 @@ function rememberChannelContext() {
     rows: [...el("discord-log").children],
     cards: [...el("thread-list").children],
     seam: [...el("channel-summary").children],
-    more: discordMoreAbove,
-    cursor: discordOlderCursor,
+    more: olderPages().moreAbove,
+    cursor: olderPages().cursor,
     newest: discordNewestId,
     position: captureScroll(),
     top: el("scroll-area").scrollTop,
@@ -25659,8 +25664,8 @@ async function changeChannelView(view, threadId = null, summary = null, origin =
   const inherited = !held && inheritAllCover(view, threadId, summary);
   const covered = !held && sameStore && channelStore.current().views.has(viewKey());
   const rows = held || covered ? [] : heldViewRows();
-  discordMoreAbove = held ? held.more : false;
-  discordOlderCursor = held ? held.cursor : null;
+  olderPages().moreAbove = held ? held.more : false;
+  olderPages().cursor = held ? held.cursor : null;
   discordWalkCursorOwed = false;
   discordNewestId = held ? held.newest : null;
   // The rows on screen stay until the new view's replace them, unless there is nothing to draw.
@@ -25889,7 +25894,7 @@ function catchUpFromAll() {
     setChannelFreshness("fresh");
     // Saved, now live: older history is known to exist, and the step back to it is Main's read.
     if (walkCursorOwed()) {
-      discordMoreAbove = true;
+      olderPages().moreAbove = true;
       renderOlderControl();
     }
   }
@@ -27961,19 +27966,19 @@ function applyTimelinePage(payload, older = false, saved = false, delta = false,
     // Saved on the device, a cursor is never kept, so whether older history exists is unknown
     // until a read supplies one — the seam says so and the walk-back control waits. A projection
     // of a view read in this page has its live cursor.
-    discordMoreAbove = payload.has_more === true ? (payload.next_before ? true : undefined) : false;
-    discordOlderCursor = payload.next_before || null;
+    olderPages().moreAbove = payload.has_more === true ? (payload.next_before ? true : undefined) : false;
+    olderPages().cursor = payload.next_before || null;
   } else if (!delta && (older || merged.length <= incoming.length || previousCount === 0 ||
       // No cursor to retain — saved rows, or Main drawn from All's cover (`walkCursorOwed`, `#220
       // view-switch-instant`), whose history reaches below this page: walking back from the page's
       // own cursor re-reads rows the store holds, which only add, rather than never walking at all.
-      (discordMoreAbove !== false && !discordOlderCursor))) {
-    discordMoreAbove = payload.has_more === true;
-    discordOlderCursor = payload.next_before || null;
+      (olderPages().moreAbove !== false && !olderPages().cursor))) {
+    olderPages().moreAbove = payload.has_more === true;
+    olderPages().cursor = payload.next_before || null;
     discordWalkCursorOwed = payload.has_more === true && !payload.next_before;
   }
   const cover = channelStore.current().views.get(viewKey());
-  if (cover && !saved && !delta) cover.cursor = discordOlderCursor;
+  if (cover && !saved && !delta) cover.cursor = olderPages().cursor;
   channelHasThreads = payload.has_threads === true || channelView === "thread";
   if (payload.thread) selectedThread = payload.thread;
   noteArchived(payload, !delta && !older && merged.length <= incoming.length);
@@ -28362,9 +28367,9 @@ async function loadTimeline(options) {
           // coverage afresh instead of claiming continuity across what was not read.
           timelineMessages = [];
           timelineThreads = [];
-          discordOlderCursor = null;
+          olderPages().cursor = null;
           discordWalkCursorOwed = false;
-          discordMoreAbove = false;
+          olderPages().moreAbove = false;
           channelStore.current().views.delete(viewKey());
           deltas.length = 0;
           sent = null;
@@ -28410,8 +28415,8 @@ async function loadTimeline(options) {
         // retain their expiring cursor forever, even though the newest request made a new one.
         timelineMessages = [];
         timelineThreads = [];
-        discordOlderCursor = null;
-        discordMoreAbove = false;
+        olderPages().cursor = null;
+        olderPages().moreAbove = false;
         channelStore.current().views.delete(viewKey());
       }
       // A thread entered on rows the store held has landed on its first unread among them: asked
@@ -28543,7 +28548,7 @@ async function pagesBackTo(payload, placeAt, current) {
  */
 async function readWalkCursor() {
   const steps = columnSteps();
-  olderFetchInFlight = true;
+  olderPages().inFlight = true;
   renderOlderControl();
   try {
     steps.pause();
@@ -28553,7 +28558,7 @@ async function readWalkCursor() {
     steps.resume();
     if (!(error && error.shownInPill)) throw error;
   } finally {
-    olderFetchInFlight = false;
+    olderPages().inFlight = false;
     renderOlderControl();
     steps.pause();
   }
@@ -28561,19 +28566,19 @@ async function readWalkCursor() {
 
 /** @param {AbortSignal} [signal] Stops the read on the wire: see `loadOlder`. */
 async function loadOlderTimeline(signal) {
-  if (!discordOlderCursor && discordMoreAbove && !olderFetchInFlight && walkCursorOwed()) {
+  if (!olderPages().cursor && olderPages().moreAbove && !olderPages().inFlight && walkCursorOwed()) {
     await readWalkCursor();
     return;
   }
-  if (!discordMoreAbove || !discordOlderCursor || olderFetchInFlight) return;
+  if (!olderPages().moreAbove || !olderPages().cursor || olderPages().inFlight) return;
   // `#229 desktop-two-column`. The column this step is for, which its work after the wait is done in.
   const steps = columnSteps();
   const context = channelContextKey();
   const generation = discordLoadGeneration;
-  olderFetchInFlight = true;
+  olderPages().inFlight = true;
   renderOlderControl();
   try {
-    const path = timelinePath(discordOlderCursor, null, olderReadReason());
+    const path = timelinePath(olderPages().cursor, null, olderReadReason());
     steps.pause();
     let payload;
     try {
@@ -28582,7 +28587,7 @@ async function loadOlderTimeline(signal) {
       steps.resume();
     }
     if (context !== channelContextKey() || generation !== discordLoadGeneration) return;
-    olderFetchInFlight = false;
+    olderPages().inFlight = false;
     preservingScroll(() => {
       applyTimelinePage(payload, true);
       // `#262 search-load-older`. The search's pass over the rows that just arrived, inside the same
@@ -28599,9 +28604,9 @@ async function loadOlderTimeline(signal) {
     if (signal && signal.aborted) return;
     if (generation !== discordLoadGeneration || context !== channelContextKey()) return;
     if (/cursor.*expired|snapshot.*expired/i.test(error.detail || error.message)) {
-      olderFetchInFlight = false;
-      discordOlderCursor = null;
-      discordMoreAbove = false;
+      olderPages().inFlight = false;
+      olderPages().cursor = null;
+      olderPages().moreAbove = false;
       steps.pause();
       try {
         await inColumn(steps.column, () => loadTimeline({ keepPosition: false, reason: "expired" }));
@@ -28615,7 +28620,7 @@ async function loadOlderTimeline(signal) {
     }
     throw error;
   } finally {
-    olderFetchInFlight = false;
+    olderPages().inFlight = false;
     renderOlderControl();
     steps.pause();
   }
@@ -33406,12 +33411,12 @@ function answeredElsewhere(id) {
  * message not in it is not in that part of the channel at all.
  *
  * Not the same as nothing being above the rows. A view no read has landed for yet has nothing
- * above it either: `discordMoreAbove` starts false. That is All, opened by a jump while another
+ * above it either: `olderPages().moreAbove` starts false. That is All, opened by a jump while another
  * read held the line, and the message the jump is for may be on the page still to come. Where the
  * provider has threads, only the store's cover for the view says which of the two it is.
  */
 function historyReadToStart() {
-  if (discordMoreAbove !== false) return false;
+  if (olderPages().moreAbove !== false) return false;
   if (!threadingSupported) return true;
   const cover = channelStore.current().views.get(viewKey());
   return Boolean(cover) && cover.more === false;
@@ -33507,7 +33512,7 @@ async function seekMessage(target, arrive, openAll) {
     }
     let walked = 0;
     // Main drawn from All takes its first step from its own read (`walkCursorOwed`, `#220`).
-    while (walked < REPLY_JUMP_PAGES && discordMoreAbove === true && (discordOlderCursor || walkCursorOwed())) {
+    while (walked < REPLY_JUMP_PAGES && olderPages().moreAbove === true && (olderPages().cursor || walkCursorOwed())) {
       walked += 1;
       const context = channelContextKey();
       setStatus(`Looking further back: page ${walked} of ${REPLY_JUMP_PAGES}…`);
@@ -39613,14 +39618,28 @@ const OLDER_TRIGGER_PX = 80;
  * summary from the NEWEST page's `has_more` while the control stayed hidden, so the page claimed
  * more existed and offered no way to reach it. `#62 message-count-accuracy`.
  */
-let discordMoreAbove = false;
-let discordOlderCursor = null;
+/**
+ * A column's own record of its older pages (`#624 voice-page-modularity`, plan step 15: a column's
+ * fields by group, on the column rather than swapped through the module's): `moreAbove`, the three
+ * values just above; `cursor`, the cursor a step back walks from; `inFlight`, whether a step back is
+ * being read; `step`, the step back under way (see below); `deferred`, a step back refused
+ * while a finger was down and owed the reader.
+ *
+ * @returns {{moreAbove: boolean | undefined, cursor: string | null, inFlight: boolean, step: Promise<any> | null, deferred: boolean}}
+ */
+function freshOlderPages() {
+  return { moreAbove: false, cursor: null, inFlight: false, step: null, deferred: false };
+}
+
+/** The column being worked on's record of its older pages (`freshOlderPages`). */
+function olderPages() {
+  return activeColumn.older;
+}
 // The last live page said more exists above but carried no cursor to walk back on — a page a
 // server before `#510 cache-serve-every-read` answered from its message cache (`#384
 // cache-serve`); a server now mints a cursor of its own for such a page. The first step back
 // then owes the view a read of its own newest page first (`readWalkCursor`).
 let discordWalkCursorOwed = false;
-let olderFetchInFlight = false;
 
 /** `has_more` absent means a server too old to say — which is UNKNOWN, and never "no". */
 const normaliseHasMore = (hasMore) => (typeof hasMore === "boolean" ? hasMore : undefined);
@@ -39629,7 +39648,7 @@ const normaliseHasMore = (hasMore) => (typeof hasMore === "boolean" ? hasMore : 
  * Is what is loaded the WHOLE channel? Read from the page's own state rather than from a payload,
  * so that a re-read of the newest page cannot contradict a walk that is still holding older rows.
  */
-const loadedIsWhole = () => (discordMoreAbove === undefined ? undefined : !discordMoreAbove);
+const loadedIsWhole = () => (olderPages().moreAbove === undefined ? undefined : !olderPages().moreAbove);
 
 /**
  * Is snowflake `a` older than snowflake `b`?
@@ -39685,7 +39704,7 @@ function renderOlderControl() {
   if (running && !searchWalkHolds(running, activeColumn)) endSearchWalk(activeColumn);
   const walk = activeColumn.searchWalk;
   // Not over the Pinned filter: its list is every pin already, and older history adds none.
-  const hidden = discordMoreAbove !== true || pinnedOnly;
+  const hidden = olderPages().moreAbove !== true || pinnedOnly;
   if (button.hidden !== hidden) button.hidden = hidden;
   // `#243 filter-keeps-selection`. A walk back to the message a filter change is keeping says what it
   // is doing, where the reader waits for it.
@@ -39693,9 +39712,9 @@ function renderOlderControl() {
   const offered = !walking && walk === null && searchOffered();
   // A tap while a step of the scroll's is on the wire starts the search, which takes that step as its
   // first page; and a walk under way is stopped by one, unless it is already stopping.
-  const disabled = walk ? walk.stopping : olderFetchInFlight && !offered;
+  const disabled = walk ? walk.stopping : olderPages().inFlight && !offered;
   if (button.disabled !== disabled) button.disabled = disabled;
-  let label = olderFetchInFlight ? (walking ? "Loading earlier messages…" : "Loading older messages…") : "Older messages";
+  let label = olderPages().inFlight ? (walking ? "Loading earlier messages…" : "Loading older messages…") : "Older messages";
   if (walk) {
     label = walk.stopping ? "Stopping…" : searchWalkProgress(walk);
   } else if (offered) {
@@ -39772,7 +39791,7 @@ const searchKey = () => JSON.stringify([filterKey(), searchOpen ? searchIdentity
  */
 function searchOffered() {
   return readRunsSuspended() && currentView === "discord" && channelView !== "threads" && !pinnedOnly &&
-    discordMoreAbove === true && !(todoMode && !threadingSupported) && (!sideActive || sideShowing());
+    olderPages().moreAbove === true && !(todoMode && !threadingSupported) && (!sideActive || sideShowing());
 }
 
 /** The view a column shows, as a sentence names it. */
@@ -39887,11 +39906,11 @@ function historyReach() {
     else return reach;
   } else {
     // Hide read's own list is a to-do list, not a stretch of the channel (`loadTodo`).
-    if (todoMode || discordMoreAbove === undefined) return reach;
+    if (todoMode || olderPages().moreAbove === undefined) return reach;
     // Drawn from this device: what was saved, and nothing it may have missed since.
     reach.saved = plainSaved;
     if (plainGapFrom !== null) floor = plainGapFrom;
-    else if (discordMoreAbove === false) reach.start = true;
+    else if (olderPages().moreAbove === false) reach.start = true;
     else floor = -Infinity;
   }
   reach.proven = !reach.saved;
@@ -40147,11 +40166,11 @@ function searchOlder() {
       let last = 0;
       while (walk.pages < SEARCH_OLDER_PAGES) {
         if (!searchWalkHolds(walk, column) || walk.stopping) break;
-        if (discordMoreAbove !== true) {
+        if (olderPages().moreAbove !== true) {
           reason = "start";
           break;
         }
-        if (!discordOlderCursor && !walkCursorOwed() && olderStep === null) {
+        if (!olderPages().cursor && !walkCursorOwed() && olderPages().step === null) {
           // Older history said to exist, and no cursor to reach it by: said, never a page that was not read.
           if (walk.pages === 0 && !walk.cursorRead) reason = "nowhere";
           break;
@@ -40170,7 +40189,7 @@ function searchOlder() {
         // Main drawn from All's cover takes its first step from its own newest page (`walkCursorOwed`),
         // which is no older page, and is not counted as one; once, for the cursor the walk goes on from.
         // What older messages it brings are counted as found like any others.
-        const owed = olderStep === null && !discordOlderCursor && walkCursorOwed();
+        const owed = olderPages().step === null && !olderPages().cursor && walkCursorOwed();
         if (owed && walk.cursorRead) break;
         walk.cursorRead = walk.cursorRead || owed;
         if (!owed) walk.pages += 1;
@@ -40193,7 +40212,7 @@ function searchOlder() {
         if (walk.found >= SEARCH_OLDER_HITS) break;
       }
       if (walk.stopping) reason = "stopped";
-      else if (reason !== "budget" && discordMoreAbove === false && walk.pages > 0) reason = "start";
+      else if (reason !== "budget" && olderPages().moreAbove === false && walk.pages > 0) reason = "start";
     } catch (error) {
       if (walk.ended || walk.stopping || (walk.controller && walk.controller.signal.aborted)) {
         reason = walk.stopping ? "stopped" : "done";
@@ -41080,22 +41099,21 @@ function applyNewestPage(payload, saved = false) {
   // Only when nothing was kept. If older rows survived, the cursor that belongs to them is the one
   // the older walk left behind, and overwriting it with this page's would rewind the walk.
   if (kept.length === 0) {
-    discordMoreAbove = normaliseHasMore(payload.has_more);
-    discordOlderCursor = payload.next_before || null;
+    olderPages().moreAbove = normaliseHasMore(payload.has_more);
+    olderPages().cursor = payload.next_before || null;
   }
   renderOlderControl();
   return list.children.length;
 }
 
 /**
- * The step back under way, or null.
+ * The step back under way, or null: a column's `olderPages().step`.
  *
  * `#204 reply-arrow`. A second caller while a step is in flight is handed THAT step rather than
  * turned away. The automatic trigger and the button never notice the difference — they asked for
  * a step, and one is coming — but the walk a reply's arrow makes counts the pages it reads, and
  * one turned away would have counted a page it never saw and looked for its message too early.
  */
-let olderStep = null;
 
 /**
  * One step further back.
@@ -41112,13 +41130,13 @@ let olderStep = null;
 function loadOlder(signal) {
   // A click's event is not a signal.
   const abort = signal && typeof signal === "object" && "aborted" in signal ? signal : undefined;
-  if (olderStep === null) {
+  if (olderPages().step === null) {
     // The step is this column's, and so is forgetting it, in the task it ends in. `#229`.
-    olderStep = (threadingSupported ? loadOlderTimeline(abort) : loadOlderPage(abort)).finally(inThisColumn(() => {
-      olderStep = null;
+    olderPages().step = (threadingSupported ? loadOlderTimeline(abort) : loadOlderPage(abort)).finally(inThisColumn(() => {
+      olderPages().step = null;
     }));
   }
-  return olderStep;
+  return olderPages().step;
 }
 
 /**
@@ -41127,7 +41145,7 @@ function loadOlder(signal) {
  * @param {AbortSignal} [signal]
  */
 async function loadOlderPage(signal) {
-  if (discordMoreAbove !== true || !discordOlderCursor || olderFetchInFlight) {
+  if (olderPages().moreAbove !== true || !olderPages().cursor || olderPages().inFlight) {
     return;
   }
   const channel = selectedChannelId();
@@ -41135,14 +41153,14 @@ async function loadOlderPage(signal) {
   if (!channel) {
     return;
   }
-  olderFetchInFlight = true;
+  olderPages().inFlight = true;
   renderOlderControl();
   try {
     let payload;
     try {
       payload = await api(
         `/api/v1/channels/${encodeURIComponent(channel)}/page` +
-          `?limit=${DISCORD_PAGE_LIMIT}&before=${encodeURIComponent(discordOlderCursor)}&render=html` +
+          `?limit=${DISCORD_PAGE_LIMIT}&before=${encodeURIComponent(olderPages().cursor)}&render=html` +
           `&reason=${olderReadReason()}`,
         signal ? { signal } : undefined
       );
@@ -41160,9 +41178,9 @@ async function loadOlderPage(signal) {
     // The step is OVER before the anchored mutation, so that every consequence of it — the rows,
     // the summary and the control's final state — is one change of height rather than three. The
     // block below is synchronous, so there is no window in which a second step could start.
-    discordMoreAbove = normaliseHasMore(payload.has_more);
-    discordOlderCursor = payload.next_before || null;
-    olderFetchInFlight = false;
+    olderPages().moreAbove = normaliseHasMore(payload.has_more);
+    olderPages().cursor = payload.next_before || null;
+    olderPages().inFlight = false;
     // Prepending is a mutation ABOVE the viewport, which is the one case browser scroll anchoring
     // does not handle. Same helper as the fold control, deliberately.
     // Additive: this step PREPENDS, so the rows already on screen keep the archive they arrived
@@ -41197,7 +41215,7 @@ async function loadOlderPage(signal) {
   } finally {
     // The success path has already done both, and doing them again is a no-op. This is here for
     // the FAILURE path, where the step must stop reporting itself in flight.
-    olderFetchInFlight = false;
+    olderPages().inFlight = false;
     renderOlderControl();
   }
 }
@@ -41207,7 +41225,7 @@ function maybeLoadOlder() {
   // Not at the head of the Pinned list, which is every pin already: older history adds none to it, and
   // a step taken behind it reads for a list that is not on screen. A pin older than what is loaded is
   // walked back to when the filter goes (`walkToFilterAnchor`, `#243 filter-keeps-selection`).
-  if (currentView !== "discord" || pinnedOnly || discordMoreAbove !== true || olderFetchInFlight) {
+  if (currentView !== "discord" || pinnedOnly || olderPages().moreAbove !== true || olderPages().inFlight) {
     return;
   }
   // `#262 search-load-older`. Nor while a filter chooses rows, where the step back offers a bounded walk
@@ -41232,7 +41250,7 @@ function maybeLoadOlder() {
   // Suspended, never dropped: the step is remembered and taken the moment the finger lifts, which
   // is what keeps `#65 scrollback-paging` automatic rather than turning it into a button.
   if (pull !== null) {
-    olderDeferred = true;
+    olderPages().deferred = true;
     return;
   }
   guardQuietly(loadOlder)();
@@ -41240,10 +41258,10 @@ function maybeLoadOlder() {
 
 /** The finger has left the glass. Take the step that was refused while it was down. */
 function takeDeferredOlder() {
-  if (!olderDeferred) {
+  if (!olderPages().deferred) {
     return;
   }
-  olderDeferred = false;
+  olderPages().deferred = false;
   maybeLoadOlder();
 }
 
@@ -41388,8 +41406,8 @@ const PULL_LABELS = {
  */
 let pull = null;
 
-/** A step back that `maybeLoadOlder` refused because a finger was down, and owes the reader. */
-let olderDeferred = false;
+// A step back that `maybeLoadOlder` refused because a finger was down, and owes the reader: a
+// column's `olderPages().deferred`.
 
 /** The timer that takes a pull up's result away again, or null. */
 let pullResultTimer = null;
@@ -41477,7 +41495,7 @@ function pullStart(event) {
   // would suspend the automatic step back for as long as the page stayed open.
   const point = touches[0];
   pull = null;
-  if (!point || currentScreen !== "main" || currentView !== "discord" || olderFetchInFlight) {
+  if (!point || currentScreen !== "main" || currentView !== "discord" || olderPages().inFlight) {
     return;
   }
   const area = el("scroll-area");
@@ -41580,7 +41598,7 @@ async function pullEnd() {
   }
   // An ARMED pull drops it instead: the reader has asked for the newest end of the channel, and
   // answering that by prepending more history is answering the opposite question.
-  olderDeferred = false;
+  olderPages().deferred = false;
   if (edge === "end") {
     await refreshFromNewest();
     return;
@@ -42736,8 +42754,8 @@ async function loadTodo(options) {
     renderChannelRows();
     // The walk back belongs to the UNFILTERED channel. Leaving a cursor armed here would let a
     // scroll to the top prepend unfiltered rows into a filtered list.
-    discordMoreAbove = false;
-    discordOlderCursor = null;
+    olderPages().moreAbove = false;
+    olderPages().cursor = null;
     discordWalkCursorOwed = false;
     renderOlderControl();
     backlogSize = messages.length;
@@ -47049,11 +47067,6 @@ const COLUMN_STATE = [
   [() => countedOutgoingKey, (value) => { countedOutgoingKey = value; }, () => ""],
   [() => gathered, (value) => { gathered = value; }, () => null],
   [() => rowsGathered, (value) => { rowsGathered = value; }, () => false],
-  [() => discordMoreAbove, (value) => { discordMoreAbove = value; }, () => false],
-  [() => discordOlderCursor, (value) => { discordOlderCursor = value; }, () => null],
-  [() => olderFetchInFlight, (value) => { olderFetchInFlight = value; }, () => false],
-  [() => olderStep, (value) => { olderStep = value; }, () => null],
-  [() => olderDeferred, (value) => { olderDeferred = value; }, () => false],
   [() => discordNewestId, (value) => { discordNewestId = value; }, () => null],
   [() => collapsedRunRows, (value) => { collapsedRunRows = value; }, () => 0],
   [() => archivedIds, (value) => { archivedIds = value; }, () => new Set()],
@@ -50805,6 +50818,8 @@ function resetSideColumn(reopen = false) {
     ++discordLoadGeneration;
   });
   columns.side.state = null;
+  // Its own records start again as its swapped fields do: only while it is not the column worked on.
+  if (activeColumn !== columns.side) columns.side.older = freshOlderPages();
   for (const id of ["side-log", "side-thread-list", "side-summary", "side-pinned-log", "side-outgoing-log"]) {
     leftEl(id).replaceChildren();
   }
@@ -57841,8 +57856,8 @@ function changeSelectedChannel() {
   void seedServerThreadHues(selectedChannelId());
   el("thread-list").replaceChildren();
   restoreChannelComposer();
-  discordMoreAbove = false;
-  discordOlderCursor = null;
+  olderPages().moreAbove = false;
+  olderPages().cursor = null;
   discordWalkCursorOwed = false;
   discordNewestId = null;
   el("discord-log").replaceChildren();
