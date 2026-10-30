@@ -3622,6 +3622,8 @@ pub struct CommandOutboundTransport {
     slack_format: Option<SlackFormat>,
     slack_format_by_channel: BTreeMap<String, SlackFormat>,
     slack_format_override: Option<SlackFormat>,
+    // `#708 vt-live-push`: the sinks told of every post and reaction this transport makes.
+    event_sink: Option<Arc<crate::chat_event_sink::EventSink>>,
 }
 
 /// Read-only provider directory operations used by the operator's grant command.
@@ -3702,7 +3704,35 @@ impl CommandOutboundTransport {
             slack_format: self.slack_format,
             slack_format_by_channel: self.slack_format_by_channel.clone(),
             slack_format_override: self.slack_format_override,
+            event_sink: self.event_sink.clone(),
         })
+    }
+
+    /// Tell `sink` of every message this transport posts and every reaction it adds from now on
+    /// (`crate::chat_event_sink`, `#708 vt-live-push`); `None` tells nobody.
+    pub(crate) fn set_event_sink(&mut self, sink: Option<Arc<crate::chat_event_sink::EventSink>>) {
+        self.event_sink = sink;
+    }
+
+    fn note_posted(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        thread_id: Option<&str>,
+        body: &str,
+        request_id: &str,
+    ) {
+        if let Some(sink) = &self.event_sink {
+            sink.record_posted(channel_id, message_id, thread_id, body, request_id);
+        }
+    }
+
+    // Recorded even when the provider found it already present: an earlier attempt may have
+    // added it and lost its answer, and a sink takes a reaction as present, not as one more.
+    fn note_reaction(&self, channel_id: &str, message_id: &str, emoji: &str, request_id: &str) {
+        if let Some(sink) = &self.event_sink {
+            sink.record_reaction(channel_id, message_id, emoji, request_id);
+        }
     }
 
     /// Validate and pin one native helper and its non-secret launch configuration.
@@ -3785,6 +3815,7 @@ impl CommandOutboundTransport {
             slack_format: None,
             slack_format_by_channel: BTreeMap::new(),
             slack_format_override: None,
+            event_sink: None,
         })
     }
 
@@ -3965,7 +3996,15 @@ impl ReplyTransport for CommandOutboundTransport {
         let format = self.slack_format_for(submission.channel_id);
         let request = encode_send_request_with_format(&submission, format)?;
         let response = self.exchange(&request)?;
-        decode_send_response(&response, &submission)
+        let message_id = decode_send_response(&response, &submission)?;
+        self.note_posted(
+            submission.channel_id,
+            &message_id,
+            Some(submission.thread_id),
+            submission.body,
+            submission.request_id,
+        );
+        Ok(message_id)
     }
 
     fn send_top_level(
@@ -3980,7 +4019,15 @@ impl ReplyTransport for CommandOutboundTransport {
         };
         let request = encode_root_message_request_with_format(&root, format)?;
         let response = self.exchange(&request)?;
-        decode_send_response(&response, &submission)
+        let message_id = decode_send_response(&response, &submission)?;
+        self.note_posted(
+            submission.channel_id,
+            &message_id,
+            None,
+            submission.body,
+            submission.request_id,
+        );
+        Ok(message_id)
     }
 }
 
@@ -3992,7 +4039,15 @@ impl RootMessageTransport for CommandOutboundTransport {
         let format = self.slack_format_for(submission.channel_id);
         let request = encode_root_message_request_with_format(&submission, format)?;
         let response = self.exchange(&request)?;
-        decode_root_message_response(&response, &submission)
+        let message_id = decode_root_message_response(&response, &submission)?;
+        self.note_posted(
+            submission.channel_id,
+            &message_id,
+            None,
+            submission.body,
+            submission.request_id,
+        );
+        Ok(message_id)
     }
 }
 
@@ -4003,7 +4058,14 @@ impl ReactionTransport for CommandOutboundTransport {
     ) -> std::result::Result<ReactionReceipt, OutboundFailure> {
         let request = encode_reaction_request(&submission)?;
         let response = self.exchange(&request)?;
-        decode_reaction_response(&response, &submission)
+        let receipt = decode_reaction_response(&response, &submission)?;
+        self.note_reaction(
+            submission.channel_id,
+            submission.message_id,
+            submission.emoji,
+            submission.request_id,
+        );
+        Ok(receipt)
     }
 
     fn ensure_rejection(
@@ -4012,7 +4074,14 @@ impl ReactionTransport for CommandOutboundTransport {
     ) -> std::result::Result<ReactionReceipt, OutboundFailure> {
         let request = encode_rejection_request(&submission)?;
         let response = self.exchange(&request)?;
-        decode_rejection_response(&response, &submission)
+        let receipt = decode_rejection_response(&response, &submission)?;
+        self.note_reaction(
+            submission.channel_id,
+            submission.message_id,
+            submission.emoji,
+            submission.request_id,
+        );
+        Ok(receipt)
     }
 }
 
@@ -5658,9 +5727,21 @@ impl BridgeState {
         &self.config
     }
 
-    /// Pin and open the configured one-shot outbound helper, when present.
+    /// Pin and open the configured one-shot outbound helper, when present, telling the event
+    /// sinks this state directory configures of every post and reaction it makes (`#708
+    /// vt-live-push`).
     pub fn outbound_transport(&self) -> Result<Option<CommandOutboundTransport>> {
-        self.config.outbound_transport()
+        let mut transport = self.config.outbound_transport()?;
+        if let Some(transport) = transport.as_mut() {
+            transport.set_event_sink(self.event_sink());
+        }
+        Ok(transport)
+    }
+
+    /// The event sinks this state directory configures (`event-sinks.json`), if any.
+    #[must_use]
+    pub fn event_sink(&self) -> Option<Arc<crate::chat_event_sink::EventSink>> {
+        crate::chat_event_sink::EventSink::load(&self.root, &self.config.agent_name)
     }
 
     /// Return the last durable inclusive provider replay cursor.
@@ -33471,6 +33552,107 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
                 .expect("send through helper"),
             "spaces/example/messages/reply"
         );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// `#708 vt-live-push`: a transport given event sinks queues a record of each post it makes
+    /// and of each reaction it ensured, under the operation's id, and a clone of its generation
+    /// keeps telling the same sinks.
+    #[test]
+    fn command_outbound_tells_its_event_sinks_of_each_post_and_each_reaction_it_ensured() {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let root = temporary("command-event-sink");
+        let private = |path: &Path, text: &str| {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(path)
+                .expect("a private file");
+            file.write_all(text.as_bytes()).expect("written");
+        };
+        private(&root.join("sink.token"), "token-1\n");
+        private(
+            &root.join(crate::chat_event_sink::SINKS_FILE),
+            r#"{"version": 1, "sender": {"id": "U0BRIDGE01"}, "sinks": [{"name": "reader",
+                "url": "https://reader.example/tail", "token_file": "sink.token",
+                "kinds": ["message.posted", "reaction.added"]}]}"#,
+        );
+        let sink = crate::chat_event_sink::EventSink::load(&root, "coordinator").expect("sinks");
+        let queue = root
+            .join(crate::chat_event_sink::SINKS_DIRECTORY)
+            .join("reader")
+            .join("queue");
+        let records = || -> Vec<Value> {
+            let mut paths: Vec<PathBuf> = fs::read_dir(&queue)
+                .map(|entries| entries.filter_map(|e| e.ok()).map(|e| e.path()).collect())
+                .unwrap_or_default();
+            paths.sort();
+            paths
+                .iter()
+                .map(|path| serde_json::from_slice(&fs::read(path).expect("read")).expect("json"))
+                .collect()
+        };
+        let helper = |response: &str| {
+            let script = format!("IFS= read -r request || exit 2; printf '%s\\n' '{response}'");
+            let mut transport = CommandOutboundTransport::new(
+                copied_shell(&root),
+                vec![OsString::from("-c"), OsString::from(script)],
+                &[],
+                Duration::from_secs(2),
+                Duration::from_millis(50),
+            )
+            .expect("pin helper");
+            transport.set_event_sink(Some(Arc::clone(&sink)));
+            transport
+        };
+        let sending = helper(
+            r#"{"version":1,"id":"123e4567-e89b-42d3-a456-426614174000","action":"send","ok":true,"receipt":{"message_id":"spaces/example/messages/reply"}}"#,
+        );
+        let mut cloned = sending.try_clone_generation().expect("clone");
+        cloned
+            .send(ReplySubmission {
+                channel_id: "spaces/example",
+                thread_id: "spaces/example/threads/one",
+                body: "hello",
+                request_id: "123e4567-e89b-42d3-a456-426614174000",
+            })
+            .expect("send");
+        let sent = records();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0]["kind"], "message.posted");
+        assert_eq!(sent[0]["message_id"], "spaces/example/messages/reply");
+        assert_eq!(sent[0]["thread_id"], "spaces/example/threads/one");
+        assert_eq!(sent[0]["text"], "hello");
+        assert_eq!(sent[0]["sender"]["id"], "U0BRIDGE01");
+        let reaction = |present: bool| {
+            format!(
+                r#"{{"version":1,"id":"123e4567-e89b-42d3-a456-426614174001","action":"ensure_reaction","ok":true,"receipt":{{"reaction_id":"spaces/example/messages/source/reactions/robot","already_present":{present}}}}}"#
+            )
+        };
+        let submission = ReactionSubmission {
+            channel_id: "spaces/example",
+            message_id: "spaces/example/messages/source",
+            emoji: "🤖",
+            request_id: "123e4567-e89b-42d3-a456-426614174001",
+        };
+        helper(&reaction(false))
+            .ensure_reaction(submission.clone())
+            .expect("added");
+        // Found present, as when an earlier attempt added it and lost its answer: still told.
+        helper(&reaction(true))
+            .ensure_reaction(submission)
+            .expect("already there");
+        let after = records();
+        assert_eq!(after.len(), 3);
+        assert_eq!(
+            after[2]["event_id"], after[1]["event_id"],
+            "the same operation"
+        );
+        assert_eq!(after[1]["kind"], "reaction.added");
+        assert_eq!(after[1]["emoji"], "🤖");
+        assert_eq!(after[1]["message_id"], "spaces/example/messages/source");
         fs::remove_dir_all(root).expect("cleanup");
     }
 

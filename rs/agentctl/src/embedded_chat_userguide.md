@@ -285,6 +285,86 @@ To run intentionally without reactions or replies, set `outbound_enabled` to
 prompt then explicitly identifies the bridge as inbound-only and forbids reply
 fences.
 
+### Event sinks: telling other readers what the bridge posted
+
+Another program that keeps its own copy of the conversation (a web client, a
+search index) sees the bridge's posts and reactions only when it reads the
+provider. If its reads are rate-limited, it sees them minutes late. A provider's
+event stream tailed as a person usually leaves other bots' posts out. An event
+sink fixes that: the bridge POSTs a small JSON record to an HTTP endpoint for
+every message it posts and every reaction it adds, the moment the provider
+confirms it.
+
+Configure sinks in `event-sinks.json` in the bridge's state directory, mode
+0600. It chooses the executable that delivers records, so a file that another
+user owns, or that others can write, is refused and no sinks run. If the file is absent, no sinks run. The file is read when the bridge
+opens its outbound helper, so a change takes effect at the bridge's next start
+and at the next `chat` command run beside it.
+
+```json
+{
+  "version": 1,
+  "sender": {"id": "U0BRIDGE01", "name": "bridge", "bot": true},
+  "sinks": [{
+    "name": "reader",
+    "url": "https://reader.example:8422/api/v1/live/tail",
+    "token_file": "event-sink-reader.token",
+    "kinds": ["message.posted", "reaction.added"]
+  }]
+}
+```
+
+- `sender`: the bridge's own account at the provider, as a reader names the
+  author of its posts. Optional: give `id` when the sink must file a post under
+  the same author a later read of the provider will name.
+- `name`: lowercase letters, digits and hyphens. It names the sink's directory.
+- `url`: where each record is POSTed, as `application/json`.
+- `token_file`: a path inside the state directory to a file of mode 0600
+  holding one token. It is sent as `Authorization: Bearer`, through `curl`'s
+  standard input, never as a command-line argument. A token file that others can
+  read is refused, and its records wait in the queue.
+- `kinds`: `message.posted` covers every reply, top-level fallback and root
+  message. `reaction.added` covers every reaction the bridge ensured (its 👀,
+  ✅ and ❌). It is sent even when the provider found the reaction already
+  there, because an earlier attempt may have added it and lost the answer. A
+  sink should take it as "present", not as "one more".
+- `max_queued`: optional, default 1000. The most records kept while the sink
+  cannot be reached. Past it, the oldest are dropped.
+- `max_age_seconds`: optional, default 900. Older records are dropped.
+- `curl`: optional, `{"executable": "/usr/bin/curl", "arguments": [...]}`, for
+  a CA bundle, a client certificate or a proxy. The default is `curl` on `PATH`.
+
+Each record is one object:
+
+```json
+{"schema": "agentctl.chat-event.v1", "event_id": "message.posted:<operation uuid>",
+ "kind": "message.posted", "at": "2026-10-30T16:25:17.953Z", "bridge": "coordinator",
+ "channel_id": "C0CHANNEL1", "message_id": "C0CHANNEL1/messages/1793377517.953000",
+ "thread_id": "C0CHANNEL1/threads/1793377304.077519", "text": "…", "text_format": "markdown",
+ "sender": {"id": "U0BRIDGE01", "name": "bridge", "bot": true}}
+```
+
+A `message.posted` record's `text_format` is `markdown`: the text the bridge
+was asked to post, before the provider converted it. A `reaction.added` record
+carries `emoji` instead of `thread_id`, `text` and `text_format`.
+`event_id` stays the same across the bridge's own retries of one operation, so
+a sink can deduplicate by it.
+
+Recording never fails or delays a post or a reaction. The record goes to
+`event-sinks/<name>/queue/` under the state directory, one file each. The
+running `chat run` delivers each sink's records oldest first, one at a time, and
+also picks up records that `chat reply` and other `chat` commands queued. The
+outcome depends on the answer:
+
+- a 2xx answer delivers the record;
+- a 400, 413, 415 or 422 answer refuses it for good, and it is dropped;
+- anything else (no answer, 401, 403, 404, 429, 5xx) leaves it queued, and it
+  is retried after a pause that doubles each time, up to five minutes.
+
+Every dropped record is counted in `event-sinks/<name>/dropped.json`, with the
+time and reason of the last drop, so a gap can be told from a quiet bridge. The
+service log says when sinks are on and when one starts failing.
+
 ## Initialize and run
 
 The named agent must already exist in the selected registry. Every channel in

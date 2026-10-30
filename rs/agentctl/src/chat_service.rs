@@ -1150,6 +1150,24 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
     };
     let outbound_cancellation = OutboundCancellation::new()?;
     let mut outbound = state.outbound_transport()?;
+    // `#708 vt-live-push`: deliver what this bridge, and any `chat` command run beside it, queued
+    // for the event sinks its state directory configures. Not joined at shutdown: a delivery
+    // runs at most curl's own time limit, and what is undelivered waits in the queue.
+    let event_sink_stop = Arc::new(AtomicBool::new(false));
+    if let Some(sink) = state.event_sink() {
+        let names: Vec<String> = sink.config().sinks.iter().map(|s| s.name.clone()).collect();
+        match crate::chat_event_sink::spawn_worker(sink, Arc::clone(&event_sink_stop), |line| {
+            service_log(line)
+        }) {
+            Ok(_) => service_log(format_args!(
+                "agentctl: chat event sinks on: {}",
+                names.join(", ")
+            )),
+            Err(error) => service_log(format_args!(
+                "agentctl: chat event sink worker could not start; records wait in the queue: {error}"
+            )),
+        }
+    }
     if let Some(transport) = outbound.as_mut() {
         transport.set_cancellation(outbound_cancellation.clone());
     }
@@ -1351,6 +1369,7 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
         outbound_join_timeout,
     );
     outbound_cancellation.cancel();
+    event_sink_stop.store(true, Ordering::SeqCst);
     wake_output(&output_wake);
     if let Err(error) = cancel_provider(&cancellation) {
         stop.record_cleanup_error(error.to_string());

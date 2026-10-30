@@ -7,6 +7,7 @@ pub mod agent;
 pub mod agent_watch;
 pub(crate) mod build_info;
 pub(crate) mod chat_context;
+pub mod chat_event_sink;
 pub(crate) mod chat_events;
 pub(crate) mod chat_history;
 pub(crate) mod chat_launch;
