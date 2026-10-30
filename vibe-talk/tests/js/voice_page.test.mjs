@@ -5988,8 +5988,8 @@ const SEAM_DETAIL_MAX_WORDS = 28;
  * failure, never an empty result that measures nothing.
  */
 function sourceStringTable(name) {
-  const found = new RegExp(`const ${name} = \\{([\\s\\S]*?)\\n\\};`).exec(SCRIPT_CODE);
-  assert.ok(found, `web/voice.js no longer states a ${name}`);
+  const found = new RegExp(`const ${name} = \\{([\\s\\S]*?)\\n\\};`).exec(PAGE_CODE);
+  assert.ok(found, `the page's code (web/voice.js, web/src/) no longer states a ${name}`);
   const table = {};
   for (const part of found[1].split(/\n {2}(?=[\w"]+:)/)) {
     const key = /^\s*"?([\w-]+)"?:/.exec(part);
@@ -7161,6 +7161,29 @@ test("`#624 voice-page-modularity`: when a call reconnects after a lost turn, an
   assert.equal(reconnectVerdict({ ...call, reconnects: 1, lastReconnectAt: 1000 }, 1000 + RECONNECT_MIN_GAP_MS - 1), "soon");
   assert.equal(reconnectVerdict({ ...call, reconnects: 1, lastReconnectAt: 1000 }, 1000 + RECONNECT_MIN_GAP_MS), "reconnect");
   assert.equal(reconnectVerdict({ ...call, reconnects: RECONNECTS_PER_CALL_MAX, lastReconnectAt: 0 }, 1e9), "count");
+});
+
+test("`#624 voice-page-modularity`: what a call's seams and the line under it say of its recap, from the module alone", () => {
+  const { boundaryFor, callRecapLine, recapChip, recapWords, seamDetailFor, reconnectFreshWords, STORED_SEAM_DETAIL } = CALL;
+  const fresh = (why) => `the page's reason for ${why}`;
+  const sent = { state: "sent", words: 1234, lines: 9, dropped: 2, transport: "replay" };
+  assert.deepStrictEqual([recapWords(sent), recapWords({ ...sent, words: 0 }), recapWords({ state: "sent" })], [1234, null, null]);
+  assert.deepStrictEqual([recapChip(sent), recapChip({ state: "none", why: "off" }), recapChip({ state: "none", why: "refused" })],
+    ["1,234-word recap sent", null, "recap refused"]);
+  assert.equal(callRecapLine(sent, "accepted", fresh), "Caught the agent up with 1,234 words from earlier; 2 older lines did not fit");
+  assert.equal(callRecapLine({ ...sent, transport: "profile", dropped: 0 }, "waiting", fresh), "Handing the agent 1,234 words from earlier");
+  assert.equal(callRecapLine({ state: "none", why: "empty" }, null, fresh), "Started fresh: nothing was said aloud earlier");
+  assert.equal(callRecapLine({ state: "none", why: "unsupported" }, null, fresh), "Started fresh: the page's reason for unsupported");
+  assert.equal(callRecapLine({ state: "none", why: "empty", reconnected: true }, null, fresh),
+    "Reconnected after a lost turn: started fresh, as nothing said in this call was recorded to send");
+  assert.equal(reconnectFreshWords("too_long"), "the earlier conversation was too long to send", "the reconnect table lost the call table's reasons");
+  // A seam: the resuming wording only where a recap went; the stored record's sentence with no cause.
+  assert.notEqual(seamDetailFor("closed", true), seamDetailFor("closed", false));
+  assert.equal(seamDetailFor("no such cause", false), seamDetailFor("ended", false));
+  assert.equal(boundaryFor(null, null).detail, STORED_SEAM_DETAIL);
+  assert.equal(boundaryFor(sent, null).detail, seamDetailFor("ended", true));
+  assert.equal(boundaryFor({ state: "none", why: "replaced_session" }, null).detail, seamDetailFor("replaced", false));
+  assert.equal(boundaryFor({ state: "none", why: "empty" }, "closed").detail, seamDetailFor("closed", false));
 });
 
 // --- the requests module, on its own ports (`#624 voice-page-modularity`) -----------------------
@@ -44414,8 +44437,8 @@ test("`#270 voice-transcript-markers`: a backend that cannot take a recap says '
 
 /** The stored record's own boundary sentence, read out of the page. */
 function SEAM_DETAILS_STORED() {
-  const found = /const STORED_SEAM_DETAIL =\s*((?:"(?:[^"\\]|\\.)*"\s*\+?\s*)+);/.exec(SCRIPT_CODE);
-  assert.ok(found, "web/voice.js no longer states a STORED_SEAM_DETAIL");
+  const found = /const STORED_SEAM_DETAIL =\s*((?:"(?:[^"\\]|\\.)*"\s*\+?\s*)+);/.exec(PAGE_CODE);
+  assert.ok(found, "the page's code (web/voice.js, web/src/) no longer states a STORED_SEAM_DETAIL");
   return [...found[1].matchAll(/"((?:[^"\\]|\\.)*)"/g)].map((m) => m[1]).join("");
 }
 

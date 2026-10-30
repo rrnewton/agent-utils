@@ -27,8 +27,16 @@ export { SLOW_WORDS, createApi, isSlowFailure, providerWords, readableFailure } 
 export {
   LOST_TURN,
   RECONNECT_RECORDS_WAIT_MS,
+  STORED_SEAM_DETAIL,
+  boundaryFor,
+  callRecapLine as recapLine,
   reconnectAsked as callReconnectAsked,
+  reconnectFreshWords,
   reconnectVerdict,
+  recapChip,
+  recapSentence,
+  recapWords,
+  seamDetailFor as callSeamDetailFor,
 } from "../core/call/index.ts";
 export {
   allPageAnswersFor,

@@ -11,3 +11,14 @@ export {
   reconnectVerdict,
 } from "./reconnect.ts";
 export type { ReconnectingCall } from "./reconnect.ts";
+export {
+  STORED_SEAM_DETAIL,
+  boundaryFor,
+  callRecapLine,
+  reconnectFreshWords,
+  recapChip,
+  recapSentence,
+  recapWords,
+  seamDetailFor,
+} from "./recap.ts";
+export type { Boundary, Recap } from "./recap.ts";

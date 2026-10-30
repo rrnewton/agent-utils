@@ -8655,64 +8655,13 @@ let conversationOpen = false;
  * is to mark the break rather than to promise a resume, and mute — which never closes the socket —
  * is the control that actually preserves context.
  */
-// What the seam says INSIDE its disclosure, per cause. The LABEL is the same three words in every
-// case, deliberately: the boundary is the same boundary — the agent below it has never seen
-// anything above it — however the socket happened to close. Only the explanation differs, because
-// only the cause differs, and each of these is a couple of clauses because the suite measures
-// them. `#54 resume-recovery`.
-const SEAM_DETAILS = {
-  ended:
-    "Anything below this line goes to an agent that has never seen anything above it. " +
-    "Mute, not Hang up, keeps its memory.",
-  suspended:
-    "The call dropped while this page was in the background. Resuming starts a NEW " +
-    "conversation: the agent below this line remembers nothing above it.",
-  failed:
-    "The connection dropped. Anything below this line goes to an agent that has never seen " +
-    "anything above it.",
-  // `#268 voice-call-drops`. A call the reader did not end says who did.
-  closed:
-    "The voice service ended this call; you did not hang up. Anything below this line goes to an " +
-    "agent that has never seen anything above it.",
-  error:
-    "The voice service reported an error and the call ended. Anything below this line goes to an " +
-    "agent that has never seen anything above it.",
-  // `#270 voice-transcript-markers`. Not an ending: the hosted service began a new session on the
-  // same call, and that session was handed nothing.
-  replaced:
-    "The voice service started a new session inside this call. Anything below this line goes to an " +
-    "agent that has never seen anything above it.",
-};
+// What the seam says inside its disclosure, per cause, and what it says when resuming is armed
+// (`SEAM_DETAILS`, `RESUME_SEAM_DETAILS`, `#54 resume-recovery`), are web/src/core/call's, with every
+// other word a seam and the line under a call say (`#624 voice-page-modularity`).
 
-// ...and what it says when resuming is armed, because every sentence above asserts that the agent
-// below the line remembers nothing above it — which stops being true the moment `#46
-// conversation-replay` is switched on. A seam that kept the old wording would be the feature
-// lying in the one place the reader looks to find out what just happened.
-const RESUME_SEAM_DETAILS = {
-  ended:
-    "This is where the conversation broke. The next call is NEW, but this server will read the " +
-    "lines above back to it: a reconstruction, not the same conversation.",
-  suspended:
-    "The call dropped while this page was in the background. Resuming opens a NEW conversation " +
-    "and reads the lines above back to it, so it can carry on.",
-  failed:
-    "The connection dropped. The next call is a NEW one, and this server will read the lines " +
-    "above back to it so it can carry on.",
-  closed:
-    "The voice service ended this call, not you. Next call is NEW; this server will read the " +
-    "lines above back to it: a reconstruction, not the same conversation.",
-  error:
-    "The voice service reported an error, ending the call. This server will read the lines above " +
-    "back to the next one: a reconstruction, not the same conversation.",
-  // A replacement session is never handed the lines above, resuming or not.
-  replaced:
-    "The voice service started a new session inside this call. Anything below this line goes to an " +
-    "agent that has never seen anything above it.",
-};
-
+/** The seam's sentence for how a call ended, by whether resuming is armed (web/src/core/call). */
 function seamDetailFor(cause) {
-  const table = resumeArmed() ? RESUME_SEAM_DETAILS : SEAM_DETAILS;
-  return table[cause] || table.ended;
+  return callSeamDetailFor(cause, resumeArmed());
 }
 
 function noteConversationEnded(cause = "ended") {
@@ -8772,46 +8721,8 @@ function noteConversationEnded(cause = "ended") {
 // before that first record — so a call that recorded nothing leaves no conversation at all, and never
 // becomes the one a new call resumes from.
 
-/** The recap sentence, per state. `{n}` is the words sent, `{d}` the older lines that did not fit. */
-// `#649 voice-agent-tools`. The owner asked whether the recap was only the call just before or
-// cumulative, and decided (2026-10-28 11:07 ET): cumulative across recent calls within a size budget,
-// over budget the most recent part, never summarised. The server builds it so (`recent_turns` in
-// src/replay.rs: the calls of the last 12 hours, newest kept), and these sentences say so.
-const RECAP_DETAILS = {
-  sent:
-    "This call was sent {n} words as a recap: the newest of what was said in your calls of the " +
-    "last 12 hours, word for word.",
-  dropped:
-    "This call was sent the last {n} words of your calls of the last 12 hours; {d} older lines did " +
-    "not fit, so it cannot see those.",
-  client_data:
-    "This call was sent {n} words above as a recap with its start request; the agent's own " +
-    "settings may ignore a recap sent that way.",
-  unsupported:
-    "Nothing was recapped: this server's voice service has no way to take a recap, so the agent " +
-    "below remembers nothing above.",
-  // `#331 resume-on-websocket`. The bridge took the frame and answered that it would not use it.
-  refused:
-    "Nothing was recapped: the voice service refused the recap it was sent, so the agent below " +
-    "remembers nothing above.",
-  // `#512 voice-recap-private-stack`. Armed in the instructions the voice service fetches, and not
-  // fetched with them before the page stopped asking.
-  not_taken:
-    "Nothing was recapped: the voice service did not take the recap armed for its instructions, so " +
-    "the agent below remembers nothing above.",
-  empty:
-    "No recap was sent: the conversation above held nothing said aloud to replay, so the agent " +
-    "below starts from nothing.",
-  too_long:
-    "No recap was sent: not even the last line above fit the recap budget, so the agent below " +
-    "starts from nothing.",
-  failed:
-    "No recap was sent: this page could not read the conversation above from the server, so the " +
-    "agent below starts from nothing.",
-  replaced_session:
-    "The voice service replaced this call's session, and the new session was sent no recap, so it " +
-    "remembers nothing above.",
-};
+// The recap sentence, per state (`RECAP_DETAILS`, `#649 voice-agent-tools`: cumulative across recent
+// calls within a size budget), is web/src/core/call's.
 
 /** The biggest number a stored marker may hold, as the server checks it. */
 const MARKER_NUMBER_MAX = 1000000;
@@ -8872,61 +8783,8 @@ function recapFor(resume, transport) {
   return { state: "none", why: "off", dropped: 0 };
 }
 
-/**
- * How many words a sent recap held, or null when nobody can say: an older server's replay names no
- * count, and a recap of lines with no words in them is one whose count was not known when it was filed.
- */
-function recapWords(recap) {
-  const words = recap.words;
-  return typeof words === "number" && !(words === 0 && Number(recap.lines) > 0) ? words : null;
-}
-
-/** The chip a seam shows for `recap`, or null for none. */
-function recapChip(recap) {
-  if (!recap || (recap.state === "none" && recap.why === "off")) return null;
-  if (recap.state === "sent") {
-    const words = recapWords(recap);
-    return words === null ? "recap sent" : `${words.toLocaleString("en-US")}-word recap sent`;
-  }
-  if (recap.why === "unsupported") return "recap unsupported";
-  if (recap.why === "not_taken") return "recap not taken";
-  return recap.why === "refused" ? "recap refused" : "no recap sent";
-}
-
-/** The recap sentence for `recap`, or null for none. */
-function recapSentence(recap) {
-  if (!recap || (recap.state === "none" && recap.why === "off")) return null;
-  if (recap.state === "sent") {
-    const which = recap.transport === "client_data" ? "client_data" : recap.dropped > 0 ? "dropped" : "sent";
-    // A count nobody can state is said as lines, not as a number of words.
-    const words = recapWords(recap);
-    const count = words !== null ? `${words.toLocaleString("en-US")} words` : which === "dropped" ? "lines" : "the lines";
-    const older = `${recap.dropped} older line${recap.dropped === 1 ? "" : "s"}`;
-    return RECAP_DETAILS[which].replace("{n} words", count).replace("{d} older lines", older);
-  }
-  return RECAP_DETAILS[recap.why] || null;
-}
-
-/**
- * Everything a "new conversation" seam says, from the recap the new call was handed and how the call
- * before it ended — the one source for the live seam and the restored one, so a reload says the same.
- * A seam never promises a read-back that did not happen, nor denies one that did: the cause's
- * sentence comes from the resuming wording only when a recap was sent. With no cause (the first call
- * after a load), the stored record's own sentence, or, when a recap went, the resuming one.
- *
- * @param {any} recap
- * @param {string | null | undefined} cause
- */
-function boundaryFor(recap, cause) {
-  const sent = Boolean(recap && recap.state === "sent");
-  const table = sent ? RESUME_SEAM_DETAILS : SEAM_DETAILS;
-  // A replacement session ended no call, so its marker names no cause; its recap says it was a
-  // replacement, and the restored line says what the live one did (`noteConversationNamed`).
-  const replaced = Boolean(recap && recap.state === "none" && recap.why === "replaced_session");
-  const why = cause || (replaced ? "replaced" : null);
-  const detail = why ? table[why] || table.ended : sent ? RESUME_SEAM_DETAILS.ended : STORED_SEAM_DETAIL;
-  return { word: "new conversation", chip: recapChip(recap), detail, recapDetail: recapSentence(recap) };
-}
+// How many words a recap held (`recapWords`), a seam's chip (`recapChip`) and recap sentence
+// (`recapSentence`), and everything a seam says (`boundaryFor`) are web/src/core/call's.
 
 /**
  * Write `boundary` onto the seam `li`: its label, chip, title and both sentences. Places nothing.
@@ -9029,75 +8887,17 @@ function noteCallRecap(recap) {
 // a seam exists only where something is above it and says it in a chip; this line is under the call,
 // in words, for as long as the call lasts, and the seam keeps the fact afterwards.
 
-/** Why a call started fresh, per recap `why`, as the end of "Started fresh: …". */
-const CALL_FRESH = {
-  empty: "nothing was said aloud earlier",
-  too_long: "the earlier conversation was too long to send",
-  failed: "the earlier conversation could not be read",
-  refused: "the voice service refused the recap",
-  not_taken: "the voice service did not take the recap",
-  replaced_session: "the voice service replaced the session",
-};
+// Why a call started fresh, per recap `why` (`CALL_FRESH`), is web/src/core/call's.
 
 /**
- * The line under a call for `recap`, given whether the voice service acknowledged it (`ack`).
- * Words from the server's own count of what its replay held; "the earlier conversation" where an
- * older server's replay named none.
+ * The line under a call for `recap`, given whether the voice service acknowledged it (`ack`): web/src/core/call
+ * `callRecapLine`, with this page's reason for a fresh start no table names (`freshBecause`).
  *
  * @param {any} recap
  * @param {string | null} ack `accepted` once a `vibe-talk-v1` bridge has said it took the record
  */
 function callRecapLine(recap, ack) {
-  if (recap.reconnected) return reconnectedRecapLine(recap, ack);
-  if (recap.state === "sent") {
-    const words = recapWords(recap);
-    const amount = words === null
-      ? "the earlier conversation"
-      : `${words.toLocaleString("en-US")} word${words === 1 ? "" : "s"} from earlier`;
-    const older = recap.dropped > 0
-      ? `; ${recap.dropped} older line${recap.dropped === 1 ? "" : "s"} did not fit`
-      : "";
-    return `${recapVerb(recap, ack, "Caught the agent up with", "Handing the agent", "Sent the agent")} ${amount}${older}`;
-  }
-  return `Started fresh: ${CALL_FRESH[recap.why] || freshBecause(recap.why)}`;
-}
-
-/**
- * `#352 voice-reconnect-on-bridge-error`. The line under a call the page carried on a new session:
- * that it did, and what the new session was handed of this call, or why nothing.
- *
- * @param {any} recap
- * @param {string | null} ack
- */
-function reconnectedRecapLine(recap, ack) {
-  if (recap.state === "sent") {
-    const words = recapWords(recap);
-    const amount = words === null
-      ? "this call so far"
-      : `${words.toLocaleString("en-US")} word${words === 1 ? "" : "s"} from this call`;
-    const older = recap.dropped > 0
-      ? `; ${recap.dropped} older line${recap.dropped === 1 ? "" : "s"} did not fit`
-      : "";
-    return `Reconnected after a lost turn: ${recapVerb(recap, ack, "caught the agent up with", "handing the agent", "sent the agent")} ` +
-      `${amount}${older}`;
-  }
-  return `Reconnected after a lost turn: started fresh, as ${RECONNECT_FRESH[recap.why] || freshBecause(recap.why)}`;
-}
-
-/**
- * What the line under a call says was done with a recap that went: taken, once the voice service
- * said so (`accepted`); being handed, while a recap armed in the profile waits to be asked about
- * (`#512 voice-recap-private-stack`); otherwise sent.
- *
- * @param {any} recap
- * @param {string | null} ack
- * @param {string} taken
- * @param {string} handing
- * @param {string} sent
- */
-function recapVerb(recap, ack, taken, handing, sent) {
-  if (ack === "accepted") return taken;
-  return recap.transport === "profile" && ack === "waiting" ? handing : sent;
+  return recapLine(recap, ack, freshBecause);
 }
 
 /** Why a call started fresh when it was resuming that was off or unsupported: the server's reason. */
@@ -17978,13 +17778,9 @@ let transcriptFetchInFlight = false;
  */
 let oldestRestoredConversation = null;
 
-// One wording for every boundary in the stored record, because it is the same boundary each time:
-// above the rule is a call that has ended and that nothing below it remembers. Held to the same
-// word budget as the other seams the page draws.
+// One wording for every boundary in the stored record (`STORED_SEAM_DETAIL`, held to the same word
+// budget as the other seams) is web/src/core/call's.
 const STORED_SEAM_LABEL = "earlier conversation";
-const STORED_SEAM_DETAIL =
-  "These lines are from a conversation that has already ended, restored from this server. " +
-  "The agent has no memory of them: a new call starts from nothing.";
 
 /**
  * How a stored speaker is shown.
@@ -22031,12 +21827,7 @@ const RECONNECT_SEAM_DETAILS = {
     "this line. Send your last message again.",
 };
 
-/** Why a reconnected call's new session was handed nothing, as the end of its line under the call. */
-const RECONNECT_FRESH = {
-  ...CALL_FRESH,
-  empty: "nothing said in this call was recorded to send",
-  failed: "this call's record could not be read",
-};
+// Why a reconnected call's new session was handed nothing (`RECONNECT_FRESH`) is web/src/core/call's.
 
 /**
  * @typedef {object} ReconnectAttempt
@@ -22344,7 +22135,7 @@ function offerReplayAtReconnect(message, attempt) {
     const why = listed ? fetched.why || "empty" : fetched.why === "off" ? "off" : "unsupported";
     session.recapAck = null;
     session.recap = { state: "none", why, dropped: 0, reconnected: true };
-    addDetail(`the reconnected session was sent no record: ${RECONNECT_FRESH[why] || freshBecause(why)}`);
+    addDetail(`the reconnected session was sent no record: ${reconnectFreshWords(why) || freshBecause(why)}`);
   }
   renderCallRecap();
   const notice = attempt.notice;
