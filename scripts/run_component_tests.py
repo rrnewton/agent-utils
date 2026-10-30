@@ -75,6 +75,7 @@ EXPECTED_COMPONENTS = frozenset(
         "dagrun",
         "experiment-runner",
         "herdr-run",
+        "local-ci-hub",
         "planner",
         "repository-infrastructure",
         "tick-hub",

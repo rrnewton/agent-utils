@@ -1,0 +1,102 @@
+"""Project configuration for local-ci-hub (local-ci-hub.toml)."""
+from __future__ import annotations
+
+import socket
+from dataclasses import dataclass, field
+from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10
+    import tomli as tomllib  # type: ignore[no-redef]
+
+
+class ConfigError(ValueError):
+    pass
+
+
+def short_host() -> str:
+    return socket.gethostname().split(".")[0]
+
+
+@dataclass
+class Config:
+    path: Path
+    root: Path
+    name: str = "example"
+    validate_command: list[str] = field(default_factory=lambda: ["make", "validate"])
+    cells: list[str] = field(default_factory=list)
+    admission_slots: int = 2
+    ledger_dir: Path = Path("ci-ledger")
+    team: str = "team"
+    publish: str = "none"  # none | git
+    provider: str = "none"  # none | github
+    workflows: list[str] = field(default_factory=list)
+    qualifying: list[str] = field(default_factory=lambda: ["local-ledger-pass"])
+    probes: list[dict] = field(default_factory=list)
+    state_dir: Path = Path("ignored/local-ci-hub")
+    repos: list[dict] = field(default_factory=list)
+
+    @property
+    def ledger_file(self) -> Path:
+        p = self.ledger_dir
+        return p if p.suffix == ".jsonl" else p / "ledger.jsonl"
+
+    @property
+    def spool_dir(self) -> Path:
+        return self.state_dir / "spool"
+
+
+def _resolve(root: Path, value: str) -> Path:
+    p = Path(value)
+    return p if p.is_absolute() else root / p
+
+
+def load(path: Path | None, root: Path | None = None) -> Config:
+    if path is None:
+        base = root or Path.cwd()
+        for cand in (base / "local-ci-hub.toml", base / "ci" / "local-ci-hub.toml"):
+            if cand.exists():
+                path = cand
+                break
+    if path is None or not Path(path).exists():
+        # Defaults for a toy/local-only project; doctor reports what is implicit.
+        base = root or Path.cwd()
+        return Config(path=Path("local-ci-hub.toml"), root=base,
+                      ledger_dir=base / "ci-ledger", state_dir=base / "ignored/local-ci-hub")
+    path = Path(path)
+    root = root or path.parent
+    try:
+        data = tomllib.loads(path.read_text())
+    except Exception as exc:
+        raise ConfigError(f"invalid TOML in {path}: {exc}") from exc
+    proj = data.get("project", {})
+    val = data.get("validate", {})
+    led = data.get("ledger", {})
+    rem = data.get("remote", {})
+    rec = data.get("receipt", {})
+    health = data.get("health", {})
+    loc = led.get("location", {})
+    ledger_raw = loc.get("path") or loc.get("repo_path") or "ci-ledger"
+    cfg = Config(
+        path=path, root=root,
+        name=str(proj.get("name", "example")),
+        repos=list(proj.get("repos", [])),
+        validate_command=list(val.get("command", ["make", "validate"])),
+        cells=list(val.get("cells", [])),
+        admission_slots=int(val.get("admission_slots", 2)),
+        ledger_dir=_resolve(root, str(ledger_raw)),
+        team=str(led.get("team", "team")),
+        publish=str(led.get("publish", "none")),
+        provider=str(rem.get("provider", "none")),
+        workflows=list(rem.get("workflows", [])),
+        qualifying=list(rec.get("qualifying", ["local-ledger-pass"])),
+        probes=list(health.get("probes", [])),
+        state_dir=_resolve(root, str(data.get("land", {}).get("state_dir", "ignored/local-ci-hub"))),
+    )
+    unknown = set(cfg.qualifying) - {"local-ledger-pass", "remote-pass"}
+    if unknown:
+        raise ConfigError(f"unknown qualifying rules: {sorted(unknown)}")
+    if cfg.provider == "none" and "remote-pass" in cfg.qualifying:
+        raise ConfigError("qualifying includes remote-pass but remote.provider is none")
+    return cfg

@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+[project]
+name = "local-ci-hub"
+version = "0.1.0"
+description = "Validation on a dev box: run, ledger, receipt, remote, health, land."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = []
+[project.scripts]
+local-ci-hub = "local_ci_hub.cli:main"
+[tool.setuptools]
+packages = ["local_ci_hub"]
+package-dir = { local_ci_hub = "." }

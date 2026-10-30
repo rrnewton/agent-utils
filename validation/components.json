@@ -187,6 +187,18 @@
         "py/tests/test_herdr_run_userguide_defaults.py"
       ]
     },
+    "local-ci-hub": {
+      "source_prefixes": [
+        "common/bin/local-ci-hub",
+        "common/docs/local-ci-hub/",
+        "py/bin/local-ci-hub",
+        "py/local_ci_hub/"
+      ],
+      "reverse_dependencies": [],
+      "test_files": [
+        "py/tests/test_local_ci_hub.py"
+      ]
+    },
     "planner": {
       "source_prefixes": [
         "common/docs/pr-landing-planner/",
