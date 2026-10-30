@@ -862,6 +862,47 @@ def _run_cargo(argv: Sequence[str], *, gate: str | None) -> int:
 # ---------------------------------------------------------------- CLI
 
 
+def family_weights(report: TimingReport) -> dict[str, float]:
+    """Total recorded seconds per pytest family (node ID before ``[``)."""
+
+    weights: dict[str, float] = {}
+    for case in report.primary_cases:
+        if case.runner != "pytest":
+            continue
+        family = case.case_id.split("[", 1)[0]
+        weights[family] = weights.get(family, 0.0) + (case.duration_s or 0.0)
+    return weights
+
+
+def _weights(directory: Path, out: Path) -> int:
+    """Write the shard weights ``scripts/run_pytest_shard.py`` balances by."""
+
+    verified = verify_directory(directory)
+    for problem in verified.problems:
+        print(f"case timings: {problem}", file=sys.stderr)
+    if verified.problems:
+        return 1
+    weights = family_weights(verified)
+    if not weights:
+        print("case-timings: no pytest cases in the timing records", file=sys.stderr)
+        return 1
+    recorded = sum(
+        1 for case in verified.primary_cases if case.runner == "pytest"
+    )
+    payload = {
+        "schema": "pytest-shard-weights/v1",
+        "recorded_cases": recorded,
+        "total_seconds": round(sum(weights.values()), 3),
+        "families": {family: round(weights[family], 3) for family in sorted(weights)},
+    }
+    out.write_text(json.dumps(payload, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+    print(
+        f"case-timings: wrote {len(weights)} family weights "
+        f"({recorded} cases, {payload['total_seconds']} s) to {out}"
+    )
+    return 0
+
+
 def _ingest(cases: list[CaseRecord], *, runner: str, gate: str, out: Path) -> int:
     if not cases:
         print("case-timings: no cases found in the input", file=sys.stderr)
@@ -922,6 +963,7 @@ def _self_test() -> int:
         )
         report = verify_directory(directory)
         assert report.problems == [] and report.primary_count == 1 and report.nested_count == 1
+        assert family_weights(report) == {"a": 0.1}
         (directory / "bad.json").write_text(
             json.dumps(
                 {
@@ -953,6 +995,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=[],
         help="gate that must have left a primary record (repeatable)",
     )
+    weights = sub.add_parser(
+        "weights", help="write pytest family shard weights from a timing directory"
+    )
+    weights.add_argument("--dir", type=Path, required=True)
+    weights.add_argument("--out", type=Path, required=True)
     cargo = sub.add_parser("run-cargo", help="run cargo test with per-case timings")
     cargo.add_argument("--gate", default=None, help="owning validation gate")
     cargo.add_argument("cargo_argv", nargs=argparse.REMAINDER, help="cargo test ... after --")
@@ -973,6 +1020,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command is not None:
             parser.error("--self-test does not take a subcommand")
         return _self_test()
+    if args.command == "weights":
+        return _weights(args.dir, args.out)
     if args.command == "run-cargo":
         cargo_argv = list(args.cargo_argv)
         if cargo_argv[:1] == ["--"]:

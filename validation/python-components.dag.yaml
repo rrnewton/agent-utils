@@ -8,7 +8,7 @@ description: Tool-owned Python regression suites
 resource_caps:
   # Shared with the lifecycle fragment when both are included in the repository graph; see the
   # measurements there.
-  lifecycle-io: 11
+  lifecycle-io: 13
 
 steps:
   - group: agentctl
@@ -284,31 +284,56 @@ steps:
       preferred_inner_jobs: 1
       rss_baseline_bytes: 134217728
 
-  # Two shards: one process measured 626 s on 2026-10-15 (763 tests), past the
-  # 600 s bound, once the ownerless-clone suite was added.
+  # Four shards, balanced by recorded family durations (`scripts/pytest_shard_weights.json`,
+  # regenerated with `scripts/case_timings.py weights`): on 2026-10-30 the count-balanced
+  # halves measured 836 s and 993 s solo (1,827.5 recorded seconds over 815 families), past
+  # the old 600 s bound, while duration-weighted quarters measured 447-554 s solo on the
+  # landing tree and 830-898 s inside a full gate (four shards and the lifecycle shards
+  # now contend for the same host). The 1500 s cap keeps clear headroom over both.
+  # #696 wrkslots-shard-timeout.
   - group: wrkslots
     job: shard-0
-    desc: wrkslots non-lifecycle Python tests, shard 1 of 2
-    cmd: python3 scripts/run_component_tests.py --component wrkslots --shard 0/2 -- -q
+    desc: wrkslots non-lifecycle Python tests, shard 1 of 4
+    cmd: python3 scripts/run_component_tests.py --component wrkslots --shard 0/4 -- -q
     jobs_flag: ""
     labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
-    timeout: 600
-    cpu_timeout: 1200
+    timeout: 1500
+    cpu_timeout: 2400
     hint: &wrkslots_test_hint
       resources: {lifecycle-io: 1}
-      est_duration_s: 330
+      est_duration_s: 520
       classification: latency-bound
       preferred_inner_jobs: 2
       rss_baseline_bytes: 1610612736
 
   - group: wrkslots
     job: shard-1
-    desc: wrkslots non-lifecycle Python tests, shard 2 of 2
-    cmd: python3 scripts/run_component_tests.py --component wrkslots --shard 1/2 -- -q
+    desc: wrkslots non-lifecycle Python tests, shard 2 of 4
+    cmd: python3 scripts/run_component_tests.py --component wrkslots --shard 1/4 -- -q
     jobs_flag: ""
     labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
-    timeout: 600
-    cpu_timeout: 1200
+    timeout: 1500
+    cpu_timeout: 2400
+    hint: *wrkslots_test_hint
+
+  - group: wrkslots
+    job: shard-2
+    desc: wrkslots non-lifecycle Python tests, shard 3 of 4
+    cmd: python3 scripts/run_component_tests.py --component wrkslots --shard 2/4 -- -q
+    jobs_flag: ""
+    labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
+    timeout: 1500
+    cpu_timeout: 2400
+    hint: *wrkslots_test_hint
+
+  - group: wrkslots
+    job: shard-3
+    desc: wrkslots non-lifecycle Python tests, shard 4 of 4
+    cmd: python3 scripts/run_component_tests.py --component wrkslots --shard 3/4 -- -q
+    jobs_flag: ""
+    labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
+    timeout: 1500
+    cpu_timeout: 2400
     hint: *wrkslots_test_hint
 
   - group: wrkviz

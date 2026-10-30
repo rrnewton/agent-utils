@@ -3,8 +3,11 @@
 
 Every shard performs the same collection and partitions the resulting node IDs. Parameterized
 cases from one test function stay together, which avoids turning one logical mutation matrix into
-concurrent processes. Families are assigned largest-first to the currently lightest shard, using
-case count as the weight; ties are stable by family name and shard index.
+concurrent processes. Families are assigned largest-first to the currently lightest shard; ties
+are stable by family name and shard index. The weight is the family's recorded duration from
+``scripts/pytest_shard_weights.json`` when that file knows the family (see
+``scripts/case_timings.py weights``), and its case count scaled by the median recorded
+seconds-per-case otherwise -- case count alone when no weights are recorded at all.
 
 Examples:
     cd py
@@ -19,10 +22,13 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
+import math
 import os
 import signal
 import shutil
 import stat
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -46,7 +52,51 @@ def _family(nodeid: str) -> str:
     return nodeid.split("[", 1)[0]
 
 
-def _assign(nodeids: Sequence[str], count: int) -> tuple[tuple[str, ...], ...]:
+#: The checked-in family durations the shard assignment balances by, written by
+#: ``scripts/case_timings.py weights`` from recorded per-case timings.
+WEIGHTS_SCHEMA = "pytest-shard-weights/v1"
+
+
+def _weights_path() -> Path:
+    return Path(__file__).resolve().parent / "pytest_shard_weights.json"
+
+
+def _load_weights(path: Path | None = None) -> dict[str, float]:
+    """Recorded family durations in seconds; empty when none were recorded.
+
+    A present but unreadable or malformed file is a hard error rather than a
+    silent fall back to case counts: the balance it was checked in to provide
+    would be lost without anyone noticing.
+    """
+    target = _weights_path() if path is None else path
+    if not target.is_file():
+        return {}
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"shard weights {target} are unreadable: {error}") from error
+    if not isinstance(payload, dict) or payload.get("schema") != WEIGHTS_SCHEMA:
+        raise ValueError(f"shard weights {target}: expected schema {WEIGHTS_SCHEMA!r}")
+    families = payload.get("families")
+    if not isinstance(families, dict):
+        raise ValueError(f"shard weights {target}: families must be an object")
+    weights: dict[str, float] = {}
+    for family, seconds in families.items():
+        if (
+            not isinstance(family, str)
+            or isinstance(seconds, bool)
+            or not isinstance(seconds, (int, float))
+            or not math.isfinite(seconds)
+            or seconds < 0
+        ):
+            raise ValueError(f"shard weights {target}: bad duration for {family!r}")
+        weights[family] = float(seconds)
+    return weights
+
+
+def _assign(
+    nodeids: Sequence[str], count: int, weights: dict[str, float] | None = None
+) -> tuple[tuple[str, ...], ...]:
     """Partition node IDs deterministically while keeping whole families together."""
     if count < 1:
         raise ValueError("shard count must be positive")
@@ -55,12 +105,27 @@ def _assign(nodeids: Sequence[str], count: int) -> tuple[tuple[str, ...], ...]:
     for nodeid in nodeids:
         families.setdefault(_family(nodeid), []).append(nodeid)
 
-    loads = [0] * count
+    recorded = weights or {}
+    known_rates = [
+        recorded[family] / len(members)
+        for family, members in families.items()
+        if family in recorded
+    ]
+    default_rate = statistics.median(known_rates) if known_rates else 1.0
+
+    def weight(family: str, members: list[str]) -> float:
+        if family in recorded:
+            return recorded[family]
+        return len(members) * default_rate
+
+    loads = [0.0] * count
     shards: list[list[str]] = [[] for _ in range(count)]
-    for family, members in sorted(families.items(), key=lambda item: (-len(item[1]), item[0])):
+    for family, members in sorted(
+        families.items(), key=lambda item: (-weight(item[0], item[1]), item[0])
+    ):
         target = min(range(count), key=lambda index: (loads[index], index))
         shards[target].extend(sorted(members))
-        loads[target] += len(members)
+        loads[target] += weight(family, members)
     return tuple(tuple(sorted(shard)) for shard in shards)
 
 
@@ -176,7 +241,7 @@ class _ShardPlugin:
     ) -> None:
         """Keep only this shard and report all other items as deselected."""
         del session
-        assignments = _assign([item.nodeid for item in items], self.count)
+        assignments = _assign([item.nodeid for item in items], self.count, _load_weights())
         selected_ids = set(assignments[self.index])
         selected = [item for item in items if item.nodeid in selected_ids]
         deselected = [item for item in items if item.nodeid not in selected_ids]
@@ -458,6 +523,48 @@ def _self_test() -> int:
         for shard in first
     )
     assert max(map(len, first)) - min(map(len, first)) <= 1
+    # Recorded durations, not case counts, set the balance when they are known:
+    # one 90 s family against nine 10 s families balances 90/90 by duration
+    # while case counts alone would put 130 s against 50 s.
+    skewed = ["tests/test_a.py::test_big"] + [
+        f"tests/test_{letter}.py::test_small" for letter in "bcdefghij"
+    ]
+    durations = {"tests/test_a.py::test_big": 90.0}
+    durations.update({f"tests/test_{letter}.py::test_small": 10.0 for letter in "bcdefghij"})
+
+    def true_loads(shards: tuple[tuple[str, ...], ...]) -> list[float]:
+        return sorted(
+            sum(durations.get(_family(nodeid), 0.0) for nodeid in shard) for shard in shards
+        )
+
+    weighted = _assign(skewed, 2, durations)
+    assert true_loads(weighted) == [90.0, 90.0]
+    assert true_loads(_assign(skewed, 2)) == [50.0, 130.0]
+    assert _assign(list(reversed(skewed)), 2, durations) == weighted
+    # A family the weights do not know is still partitioned, whole, exactly once.
+    with_unknown = [*skewed, "tests/test_new.py::test_new[x]", "tests/test_new.py::test_new[y]"]
+    partitioned = [nodeid for shard in _assign(with_unknown, 2, durations) for nodeid in shard]
+    assert sorted(partitioned) == sorted(with_unknown)
+    # Weights loading: a missing file means count weights; a malformed one fails closed.
+    weights_dir = Path(tempfile.mkdtemp(prefix="agent-utils-sharder-weights-"))
+    try:
+        assert _load_weights(weights_dir / "absent.json") == {}
+        bad_weights = weights_dir / "bad.json"
+        bad_weights.write_text('{"schema": "other/v9", "families": {}}', encoding="utf-8")
+        try:
+            _load_weights(bad_weights)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("accepted shard weights with the wrong schema")
+        good_weights = weights_dir / "good.json"
+        good_weights.write_text(
+            json.dumps({"schema": WEIGHTS_SCHEMA, "families": {"tests/test_a.py::t": 1.5}}),
+            encoding="utf-8",
+        )
+        assert _load_weights(good_weights) == {"tests/test_a.py::t": 1.5}
+    finally:
+        _remove_temp_root(weights_dir)
     for bad in ("", "1", "a/2", "-1/2", "2/2", "0/0"):
         try:
             _parse_shard(bad)

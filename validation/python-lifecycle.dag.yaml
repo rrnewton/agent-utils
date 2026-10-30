@@ -7,14 +7,14 @@
 description: Parallel, isolated shards of the wrkslots lifecycle regression suite
 
 resource_caps:
-  # Shared with the component fragment's two wrkslots shards: eleven steps in all, so this lets
-  # every one run at once. Five was chosen on 2026-09-25, when the whole suite took 190 s; by
-  # 2026-10-24 the eleven steps summed 3,794 s of wall, so five-at-a-time set about 760 s of an
-  # 830 s gate. The contention it guarded against is not measurable now: one 65-case namespace
-  # sub-shard took 53.2 s alone and 50.5-51.4 s, 53.9-54.5 s and 56.8-58.1 s with 5, 8 and 11
-  # copies at once (load average 36-64 on 316 CPUs). The cap stays, so a twelfth step has to be
-  # admitted by a deliberate change here.
-  lifecycle-io: 11
+  # Shared with the component fragment's four wrkslots shards: thirteen steps in all, so this
+  # lets every one run at once. Five was chosen on 2026-09-25, when the whole suite took 190 s;
+  # by 2026-10-24 the eleven steps summed 3,794 s of wall, so five-at-a-time set about 760 s of
+  # an 830 s gate. The contention it guarded against is not measurable now: one 65-case
+  # namespace sub-shard took 53.2 s alone and 50.5-51.4 s, 53.9-54.5 s and 56.8-58.1 s with 5, 8
+  # and 11 copies at once (load average 36-64 on 316 CPUs). The cap stays, so a fourteenth step
+  # has to be admitted by a deliberate change here.
+  lifecycle-io: 13
   # These tests require the initial identity namespace or host-visible process IDs. Limit their
   # concurrency independently from the safely namespaced partition until repeated sweeps prove a
   # higher setting is both faster and contamination-free.

@@ -245,6 +245,7 @@
         "scripts/check_standalone.py",
         "scripts/embed_userguides.py",
         "scripts/pid_namespace_init.py",
+        "scripts/pytest_shard_weights.json",
         "scripts/rebase-delta-guard",
         "scripts/run_component_tests.py",
         "scripts/run_pytest_shard.py",
