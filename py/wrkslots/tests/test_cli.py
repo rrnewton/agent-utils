@@ -1024,3 +1024,115 @@ def test_a_dash_b_placement_and_root_helper_write_no_bytecode(
     )
     assert unsuppressed.returncode == 0, unsuppressed.stderr
     assert _tree_digest(parent) != before
+
+
+# ------------------------------------ image status: the fields a caller binds to
+
+
+def _sparse_image(tmp_path: Path) -> slotimage.SlotImage:
+    """A slot image record whose files are sparse: 3 GiB apparent, 1 MiB written; 1 GiB state."""
+
+    directory = tmp_path / "control" / "slot-images" / "agent" / "s1"
+    (directory / "state").mkdir(parents=True)
+    location = tmp_path / "slot"
+    location.mkdir()
+    image = slotimage.SlotImage(
+        directory=directory, slot="s1", slot_type="agent", location=location,
+        ceiling_bytes=3 * GIB, state_ceiling_bytes=GIB, backend="kernel",
+        created_at="2026-10-30T00:00:00Z", phase="ready",
+    )
+    with open(image.slot_image, "wb") as handle:
+        handle.truncate(3 * GIB)
+        handle.write(b"x" * 1024 * 1024)
+    with open(image.state_image, "wb") as handle:
+        handle.truncate(GIB)
+    return image
+
+
+def test_image_status_reports_apparent_size_allocation_and_the_actual_mount_separately(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    image = _sparse_image(tmp_path)
+    mounted: list[tuple[Path, Path]] = []
+
+    def backend(image_file: Path, mount_point: Path, table: object = None) -> str | None:
+        mounted.append((image_file, mount_point))
+        return "kernel" if image_file == image.slot_image else None
+
+    monkeypatch.setattr(slotimage, "mount_table", lambda mountinfo=None: [])
+    monkeypatch.setattr(slotimage, "mounted_backend", backend)
+
+    report = slotimage.usage(image)
+
+    # Each image is judged against its own mount point, never another path.
+    assert mounted == [(image.slot_image, image.location), (image.state_image, image.state_mount)]
+    assert report["name"] == "s1" and report["slot_type"] == "agent"
+    assert report["location"] == str(image.location) and report["phase"] == "ready"
+    slot_stat = os.stat(image.slot_image)
+    vfs = os.statvfs(image.location)
+    slot = report["slot"]
+    assert isinstance(slot, dict)
+    assert slot["image"] == str(image.slot_image)
+    assert slot["ceiling_bytes"] == 3 * GIB == slot_stat.st_size  # apparent size C
+    assert slot["host_allocated_bytes"] == slot_stat.st_blocks * 512  # B_alloc
+    assert int(str(slot["host_allocated_bytes"])) < 3 * GIB
+    assert slot["mounted"] is True and slot["backend"] == "kernel"
+    assert slot["free_bytes"] == vfs.f_bavail * vfs.f_frsize  # F
+    assert slot["used_bytes"] == (vfs.f_blocks - vfs.f_bfree) * vfs.f_frsize  # U
+    assert set(slot) == {
+        "image", "ceiling_bytes", "host_allocated_bytes", "mounted", "backend",
+        "used_bytes", "free_bytes", "used_inodes",
+    }
+    # Not this image's own mount: no used or free figure is invented for it.
+    state = report["state"]
+    assert state == {
+        "image": str(image.state_image),
+        "ceiling_bytes": GIB,
+        "host_allocated_bytes": os.stat(image.state_image).st_blocks * 512,
+        "mounted": False,
+    }
+
+
+def test_image_status_marks_an_unreadable_backing_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    image = _sparse_image(tmp_path)
+    image.state_image.unlink()
+    monkeypatch.setattr(slotimage, "mount_table", lambda mountinfo=None: [])
+    monkeypatch.setattr(slotimage, "mounted_backend", lambda *args, **kwargs: None)
+
+    state = slotimage.usage(image)["state"]
+
+    assert isinstance(state, dict)
+    assert "error" in state and "ceiling_bytes" not in state and "host_allocated_bytes" not in state
+    assert state["mounted"] is False
+
+
+def test_image_status_json_carries_every_bound_field(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _create_fixture(tmp_path)
+    image = _sparse_image(tmp_path)
+    monkeypatch.setattr(slotimage, "all_images", lambda control: [image])
+    monkeypatch.setattr(slotimage, "mount_table", lambda mountinfo=None: [])
+    monkeypatch.setattr(
+        slotimage,
+        "mounted_backend",
+        lambda image_file, mount_point, table=None: "fuse" if image_file == image.slot_image else None,
+    )
+    capsys.readouterr()
+
+    assert imagecmd._cmd_image_status(
+        argparse.Namespace(project_root=str(root), machine="node-a", format="json")
+    ) == 0
+
+    document = json.loads(capsys.readouterr().out)
+    assert set(document) == {"new_slot_representation", "images"}
+    [entry] = document["images"]
+    assert {key: entry[key] for key in ("name", "slot_type", "location", "phase")} == {
+        "name": "s1", "slot_type": "agent", "location": str(image.location), "phase": "ready",
+    }
+    assert entry["slot"]["mounted"] is True and entry["slot"]["backend"] == "fuse"
+    assert entry["slot"]["ceiling_bytes"] == 3 * GIB
+    assert {"host_allocated_bytes", "free_bytes", "used_bytes"} <= set(entry["slot"])
+    assert entry["state"]["mounted"] is False and "free_bytes" not in entry["state"]
