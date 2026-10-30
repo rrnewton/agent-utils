@@ -29485,14 +29485,7 @@ function removedUpstream(id) {
  * @param {string} channel
  */
 function placeUnplacedWaits(channel) {
-  const now = Date.now();
-  let waits = false;
-  for (const [key, hold] of [...readHolds]) {
-    if (hold.channel !== channel) continue;
-    if (now >= hold.until) readHolds.delete(key);
-    else waits = true;
-  }
-  return waits;
+  return readHolds.channelWaits(channel);
 }
 
 /** `placeUnplaced`, once the read ending now has drawn what it brought. */
@@ -51601,25 +51594,14 @@ const CHANNEL_READ_TIMEOUT_MS = 20000;
 // something newer has replaced it meanwhile (`abandonedReadStands`).
 
 /**
- * The server's own bound on a read of a slow chat service, from when the read was sent: the longest a
- * view whose read the page gave up on goes unpolled.
- */
-const SERVER_READ_BOUND_MS = 50000;
-
-/**
- * The reasons a view's hold puts off: only the poll. Coming back to the page, a stream reset and the
- * replay tail's edits each stand for something the read given up on may not carry, and a live message
- * ends the hold before its own read is asked for (`noteLiveEvent`).
- */
-const HELD_REASONS = ["poll"];
-
-/**
  * By view (`readHoldKey`), until when a read of it the page gave up on may still be running at the
- * server, and the channel it is in.
+ * server, and the channel it is in; the server's bound (`SERVER_READ_BOUND_MS`) and the reasons a hold
+ * puts off (`HELD_REASONS`: only the poll) with it (web/src/core/sync `createReadHolds`, `#624
+ * voice-page-modularity`).
  *
- * @type {Map<string, {channel: string, until: number}>}
+ * @type {import("./src/core/sync/index.ts").ReadHolds}
  */
-const readHolds = new Map();
+const readHolds = createReadHolds({ now: () => Date.now() });
 
 /**
  * How many live events have arrived for each channel: a read given up on whose answer lands after one
@@ -51659,9 +51641,7 @@ function readHoldKey() {
  * @param {number} sentAt
  */
 function holdView(key, channel, sentAt) {
-  const hold = { channel, until: sentAt + SERVER_READ_BOUND_MS };
-  readHolds.set(key, hold);
-  return hold;
+  return readHolds.hold(key, channel, sentAt);
 }
 
 /**
@@ -51674,15 +51654,7 @@ function holdView(key, channel, sentAt) {
  * @param {{reason?: string | (string | undefined)[]} | undefined} options
  */
 function readHeld(key, options) {
-  const hold = readHolds.get(key);
-  if (!hold) return false;
-  if (Date.now() >= hold.until) {
-    readHolds.delete(key);
-    return false;
-  }
-  const reason = options && options.reason;
-  const reasons = Array.isArray(reason) ? reason : [reason];
-  return reasons.every((one) => typeof one === "string" && HELD_REASONS.includes(one));
+  return readHolds.held(key, options && options.reason);
 }
 
 /**
@@ -51699,9 +51671,7 @@ function noteLiveEvent(channel, fromTail) {
   liveEventsSeen.set(id, (liveEventsSeen.get(id) || 0) + 1);
   if (fromTail) return;
   liveNewsSeen.set(id, (liveNewsSeen.get(id) || 0) + 1);
-  for (const [key, hold] of [...readHolds]) {
-    if (hold.channel === id) readHolds.delete(key);
-  }
+  readHolds.liftChannel(id);
 }
 
 /**
@@ -51737,7 +51707,7 @@ function abandonRead(answer, read, land, settled = null) {
   const answering = (liveNewsSeen.get(read.channel) || 0) !== read.news;
   const hold = answering ? null : holdView(read.key, read.channel, read.sentAt);
   const release = () => {
-    if (hold && readHolds.get(read.key) === hold) readHolds.delete(read.key);
+    readHolds.release(read.key, hold);
   };
   answer.then((payload) => {
     release();

@@ -7197,6 +7197,31 @@ test("`#624 voice-page-modularity`: a read asked for while another is out joins 
   assert.deepStrictEqual([started, generation.current()], [0, 1]);
 });
 
+test("`#624 voice-page-modularity`: views held unpolled after a read given up on, from the module alone", () => {
+  const { createReadHolds, SERVER_READ_BOUND_MS } = SYNC;
+  let now = 1000;
+  const holds = createReadHolds({ now: () => now });
+  const hold = holds.hold("c main", "c", 1000);
+  holds.hold("c threads", "c", 1000);
+  holds.hold("d main", "d", 1000);
+  // Only a read whose every reason is the poll waits.
+  assert.deepStrictEqual([holds.held("c main", "poll"), holds.held("c main", ["poll", "poll"]), holds.held("c main", ["poll", "reset"]),
+    holds.held("c main", undefined), holds.held("e main", "poll")], [true, true, false, false, false]);
+  assert.equal(holds.channelWaits("c"), true);
+  // An answer takes away its own hold, not one set again since.
+  holds.release("c main", { channel: "c", until: 0 });
+  assert.equal(holds.held("c main", "poll"), true, "an answer took away a hold that was not its own");
+  holds.release("c main", hold);
+  assert.equal(holds.held("c main", "poll"), false);
+  // Live news ends a channel's holds; the server's bound ends the rest.
+  holds.liftChannel("c");
+  assert.deepStrictEqual([holds.channelWaits("c"), holds.channelWaits("d")], [false, true]);
+  now = 1000 + SERVER_READ_BOUND_MS;
+  assert.equal(holds.held("d main", "poll"), false, "a hold past the server's bound still held the poll");
+  holds.hold("d main", "d", 1000);
+  assert.equal(holds.channelWaits("d"), false, "a hold past its bound kept the placing read waiting");
+});
+
 test("`#624 voice-page-modularity`: which replayed events still wait for a read, from the module alone", () => {
   const { createReplayLedger } = SYNC;
   const ledger = createReplayLedger();
