@@ -1047,7 +1047,7 @@ def build_spec(
     }
 
 
-def writable_set(spec: Mapping[str, object]) -> dict[str, object]:
+def writable_set(spec: Mapping[str, object], *, created_sources: Sequence[Path] = ()) -> dict[str, object]:
     """Every place a command in the view described by ``spec`` can write.
 
     Derived from the same spec the helper builds, following :func:`build_view`:
@@ -1055,23 +1055,39 @@ def writable_set(spec: Mapping[str, object]) -> dict[str, object]:
     host, target in the view), the fresh ``/tmp`` tmpfs, and, with
     ``protect_system``, the kernel and runtime trees left writable; without it,
     every mount (``/``). Bind sources that do not exist are left out, as the
-    helper skips them.
+    helper skips them, except ``created_sources``: directories that
+    :func:`prepare_state` creates before the helper runs (see
+    :func:`planned_private_sources`), so a report made before preparing the
+    state names the binds the real entry will have.
     """
 
     raw_binds = spec.get("binds", [])
     assert isinstance(raw_binds, list)
     protect = bool(spec.get("protect_system", True))
+    created = {str(path) for path in created_sources}
     return {
         "home_layer": {"source": str(spec["home_layer"]), "target": str(spec["home"])},
         "binds": [
             {"source": str(pair[0]), "target": str(pair[1])}
             for pair in raw_binds
-            if isinstance(pair, list) and len(pair) == 2 and os.path.exists(str(pair[0]))
+            if isinstance(pair, list)
+            and len(pair) == 2
+            and (os.path.exists(str(pair[0])) or str(pair[0]) in created)
         ],
         "tmp": {"target": "/tmp", "size": str(spec.get("tmp_size", DEFAULT_TMP_SIZE))},
         "protect_system": protect,
         "always_writable": list(_ALWAYS_WRITABLE_PREFIXES) if protect else ["/"],
     }
+
+
+def planned_private_sources(view: SlotView, settings: SandboxSettings) -> tuple[Path, ...]:
+    """The bind sources :func:`prepare_state` creates: every ``home_private`` directory in the layer.
+
+    Only these; an arbitrary missing ``read_write`` or shared path is not created
+    by anything and stays skipped.
+    """
+
+    return tuple(private_home_directory(view, relative) for relative in settings.home_private)
 
 
 # ---------------------------------------------------------- building the view
@@ -1969,7 +1985,9 @@ def in_scope_plan(
     return {
         "unit": unit,
         "slices": expected.to_obj(),
-        "writable": writable_set(spec),
+        # Nothing is prepared here; the real entry creates the private
+        # directories first, and their binds are part of its writable set.
+        "writable": writable_set(spec, created_sources=planned_private_sources(view, settings)),
         "helper": root_helper("SPEC-FILE"),
         "command": list(command),
         "view": spec,

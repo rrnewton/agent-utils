@@ -1136,3 +1136,40 @@ def test_image_status_json_carries_every_bound_field(
     assert entry["slot"]["ceiling_bytes"] == 3 * GIB
     assert {"host_allocated_bytes", "free_bytes", "used_bytes"} <= set(entry["slot"])
     assert entry["state"]["mounted"] is False and "free_bytes" not in entry["state"]
+
+
+def test_in_scope_print_reports_the_private_binds_the_entry_will_create(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The printed writable set equals the one the real entry builds after preparing the state.
+
+    A nested home_private directory is bound from the slot's private layer;
+    on a fresh state it does not exist until prepare_state creates it. A
+    missing --read-write input is still skipped by both, as the helper does.
+    """
+
+    _home, target, cgroup, _log = _in_scope_host(tmp_path, monkeypatch)
+    view = _slot_view(tmp_path)
+    settings = dataclasses.replace(
+        _closed_settings(target),
+        home="hidden",
+        home_private=(".cargo", "nested/cache"),
+        read_write=(str(target), str(tmp_path / "missing-input")),
+    )
+    request = dict(unit="run-1.scope", expected=_APP, slot_writable=False, cgroup_file=cgroup)
+
+    planned = sandbox.in_scope_plan(view, settings, ["true"], **request)  # type: ignore[arg-type]
+    assert not (tmp_path / "state").exists()  # the plan prepared nothing
+    with pytest.raises(_Execed) as caught:
+        sandbox.enter_in_place(view, settings, ["true"], **request)  # type: ignore[arg-type]
+    actual_view = caught.value.spec["view"]
+    assert isinstance(actual_view, dict)
+
+    assert planned["writable"] == sandbox.writable_set(actual_view)
+    nested = str(tmp_path / "state" / "home" / "nested" / "cache")
+    assert _bind_targets(sandbox.writable_set(actual_view)) == [
+        str(_home / "nested" / "cache"), str(target)
+    ]
+    assert nested in [
+        item["source"] for item in planned["writable"]["binds"]  # type: ignore[index]
+    ]
