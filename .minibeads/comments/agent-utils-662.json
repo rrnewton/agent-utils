@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-662-c0b44036fc3",
+    "issue_id": "agent-utils-662",
+    "author": "cl-transcript",
+    "body": "[opus 5.5] Subsumed by #710 chat-transcript-extraction, which reads every reply text from the harness transcript.",
+    "created_at": "2026-10-30T20:38:20.260179877Z",
+    "updated_at": "2026-10-30T20:38:20.260179877Z"
+  }
+]
