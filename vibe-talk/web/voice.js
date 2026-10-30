@@ -132,14 +132,15 @@ const COLUMN_IDS = {
  * `fromCards` says the thread the right column shows was entered from its card, so that ← goes back
  * out to the cards (`#277 thread-card-focus`, `enterCard`).
  *
- * `older`, `arrows`, `load`, `entry`, `pins`, `tools`, `filter`, `list`, `rows` and `selection` are the column's own records of its older pages
+ * `older`, `arrows`, `load`, `entry`, `pins`, `tools`, `filter`, `list`, `rows`, `selection`, `composer` and `done` are the column's own records of its older pages
  * (`freshOlderPages`, `olderPages`), its reply arrows (`freshReplyArrows`, `replyArrows`), its reads'
  * state (`freshLoadState`, `loadState`), entering a view (`freshEntryState`, `entryState`), its Pinned
  * filter (`freshPinsView`, `pinsView`), its scroll tools' pass (`freshScrollTools`, `scrollTools`) and
  * its filters' hold (`freshFilterState`, `filterState`), what its list has drawn (`freshListState`,
  * `listState`), the rows it was drawn from (`freshTimelineRows`, `timelineRows`) and what it shows
- * (`freshSelection`, `selection`; `#624 voice-page-modularity`, plan step 15): field groups kept on the
- * column rather than in `state`.
+ * (`freshSelection`, `selection`), its message box (`freshComposerState`, `composerState`) and what it
+ * shows as Done (`freshDoneState`, `doneState`; `#624 voice-page-modularity`, plan step 15): field
+ * groups kept on the column rather than in `state`.
  *
  * @typedef {{matched: number, loaded: number, tally: any, pinned: boolean}} SearchCount
  * @typedef {{name: string, state: unknown[] | null, searched: SearchCount | null,
@@ -148,17 +149,19 @@ const COLUMN_IDS = {
  *   load: ReturnType<typeof freshLoadState>, entry: ReturnType<typeof freshEntryState>,
  *   pins: ReturnType<typeof freshPinsView>, tools: ReturnType<typeof freshScrollTools>,
  *   filter: ReturnType<typeof freshFilterState>, list: ReturnType<typeof freshListState>,
- *   rows: ReturnType<typeof freshTimelineRows>, selection: ReturnType<typeof freshSelection>}} ColumnFields
+ *   rows: ReturnType<typeof freshTimelineRows>, selection: ReturnType<typeof freshSelection>,
+ *   composer: ReturnType<typeof freshComposerState>, done: ReturnType<typeof freshDoneState>}} ColumnFields
  * @type {{main: ColumnFields, side: ColumnFields & {mode: "list" | "thread", fromCards: boolean}}}
  */
 const columns = {
   main: { name: "main", state: null, searched: null, searchWalk: null, searchNote: null, older: freshOlderPages(), arrows: freshReplyArrows(),
     load: freshLoadState(), entry: freshEntryState(), pins: freshPinsView(), tools: freshScrollTools(),
-    filter: freshFilterState(), list: freshListState(), rows: freshTimelineRows(), selection: freshSelection("main") },
+    filter: freshFilterState(), list: freshListState(), rows: freshTimelineRows(), selection: freshSelection("main"),
+    composer: freshComposerState(), done: freshDoneState() },
   side: { name: "side", state: null, searched: null, searchWalk: null, searchNote: null, mode: "list", fromCards: false,
     older: freshOlderPages(), arrows: freshReplyArrows(), load: freshLoadState(), entry: freshEntryState(),
     pins: freshPinsView(), tools: freshScrollTools(), filter: freshFilterState(), list: freshListState(),
-    rows: freshTimelineRows(), selection: freshSelection() },
+    rows: freshTimelineRows(), selection: freshSelection(), composer: freshComposerState(), done: freshDoneState() },
 };
 /** The column the code is working on now. The left one, except inside `inColumn`. */
 let activeColumn = columns.main;
@@ -2917,7 +2920,22 @@ const threadColors = new Map();
  * @type {import("./src/core/outbox/index.ts").ChannelDrafts}
  */
 const channelDrafts = createChannelDrafts({ storage: deviceStorageOnUse(), makeRoom: () => dropMessageCache() });
-let activeComposerKey = "";
+
+/**
+ * A column's own record of its message box (`#624 voice-page-modularity`, plan step 15, as
+ * `freshOlderPages`): `key`, the box the column is composing in (`channelComposerKey`), whose draft
+ * `channelDrafts` holds.
+ *
+ * @returns {{key: string}}
+ */
+function freshComposerState() {
+  return { key: "" };
+}
+
+/** The column being worked on's record of its message box (`freshComposerState`). */
+function composerState() {
+  return activeColumn.composer;
+}
 
 // Local send records never enter the provider message list or its read/archive/reply machinery.
 const OUTGOING_TIMEOUT_MS = 60000;
@@ -12241,7 +12259,7 @@ function doneFromKeyboard(target) {
   if (!pane || !row) return took;
   const ids = idsOf(row);
   if (ids.length === 0) return false;
-  const marking = !ids.every((id) => archivedIds.has(id));
+  const marking = !ids.every((id) => doneState().archived.has(id));
   const rows = paneRows(pane);
   const at = rows.indexOf(row);
   const next = marking ? unreadAfter(rows, at) : null;
@@ -12304,7 +12322,7 @@ function readCollapseFromKeyboard(target) {
 async function readAndCollapse(pane, row, ids) {
   const channel = String(selectedChannelId());
   const folded = foldForRead(pane, row);
-  const wasDone = ids.every((id) => archivedIds.has(id));
+  const wasDone = ids.every((id) => doneState().archived.has(id));
   if (!wasDone) await markRowDone(ids, row);
   if (!(await doneSaved(ids))) return;
   const mark = await markReadInService(channel, ids[ids.length - 1]);
@@ -12384,7 +12402,7 @@ function foldOneFromKeyboard(target) {
   foldedOnes.set(key, folded);
   const opened = openedReadRuns.get(key);
   if (opened) for (const id of ids) opened.delete(id);
-  if (!ids.every((id) => archivedIds.has(id))) guardQuietly(() => markRowDone(ids, at))();
+  if (!ids.every((id) => doneState().archived.has(id))) guardQuietly(() => markRowDone(ids, at))();
   if (unpack !== null) {
     renderSideColumn();
   } else {
@@ -23779,7 +23797,7 @@ function foldTimelineDelta(payload, sent, view = selection().view, thread = sele
     removals: removalRecord,
     numberOf: () => sentNumberOf(payload),
     readsSent: () => readOrder.asked(),
-    forgetArchived: (id) => archivedIds.delete(id),
+    forgetArchived: (id) => doneState().archived.delete(id),
     foldReadState: () => foldReadState(payload, view),
     noteReplyGaps: (before) => noteReplyGaps(payload, view, false, true, before),
     markUnchanged: () => unchangedDeltas.add(payload),
@@ -23825,7 +23843,7 @@ function syncCanonDismissed() {
   if (sideActive && columns.side.mode !== "thread") return;
   for (const message of timelineRows().messages) {
     const id = String(message.id);
-    if (archivedIds.has(id)) channelStore.current().dismissed.add(id);
+    if (doneState().archived.has(id)) channelStore.current().dismissed.add(id);
     else channelStore.current().dismissed.delete(id);
   }
 }
@@ -24009,7 +24027,7 @@ function saveChannelScope() {
       cursor: null,
       // `#578 search-status-clarity`: where the rows saved stop being one stretch, if they do.
       gapFrom: plainGapFrom,
-      dismissed: [...archivedIds].filter((id) => shown.has(id)),
+      dismissed: [...doneState().archived].filter((id) => shown.has(id)),
       bookmark: bookmarkToSave(key),
     };
   }
@@ -24104,7 +24122,7 @@ function clearChannelScreen() {
   channelStore.open();
   timelineRows().messages = [];
   timelineRows().threads = [];
-  archivedIds = new Set();
+  doneState().archived = new Set();
   olderPages().moreAbove = false;
   olderPages().cursor = null;
   discordWalkCursorOwed = false;
@@ -25500,20 +25518,20 @@ function saveChannelDrafts() {
 }
 
 function rememberChannelDraft() {
-  if (!activeComposerKey) return;
+  if (!composerState().key) return;
   const text = el("channel-compose-text").value;
-  if (text) channelDrafts.set(activeComposerKey, text);
-  else channelDrafts.delete(activeComposerKey);
+  if (text) channelDrafts.set(composerState().key, text);
+  else channelDrafts.delete(composerState().key);
   if (!saveChannelDrafts()) {
     el("channel-compose-state").textContent = CHANNEL_DRAFT_REFUSED;
   }
 }
 
 function restoreChannelComposer() {
-  activeComposerKey = channelComposerKey();
+  composerState().key = channelComposerKey();
   const channel = selectedChannelId();
   const readOnly = knownChannel(channel)?.writable === false;
-  el("channel-compose-text").value = channelDrafts.get(activeComposerKey) || "";
+  el("channel-compose-text").value = channelDrafts.get(composerState().key) || "";
   el("channel-compose-state").textContent = readOnly
     ? "This channel is read-only."
     : "";
@@ -25540,7 +25558,7 @@ function rememberChannelContext() {
     top: el("scroll-area").scrollTop,
     freshness: loadState().freshness,
     freshAt: loadState().freshAt,
-    dismissed: archivedIds,
+    dismissed: doneState().archived,
     // `#221 read-modes`. The read mode its rows were drawn under, so a mode chosen elsewhere since
     // redraws them on the way back rather than showing what the old mode left.
     readMode,
@@ -25759,7 +25777,7 @@ async function changeChannelView(view, threadId = null, summary = null, origin =
   el("timeline-notice").hidden = true;
   loadState().freshAt = held ? held.freshAt : 0;
   loadState().freshness = held ? held.freshness : "fresh";
-  if (held) archivedIds = held.dismissed;
+  if (held) doneState().archived = held.dismissed;
   // A read still on the wire is for the view the reader left: no loading line over this one.
   renderChannelLoading(discordFetchInFlight, true);
   restoreChannelComposer();
@@ -27860,7 +27878,7 @@ async function readTimeline(path, options) {
  */
 
 /**
- * Done, or put back, here: the store's read state for `ids` follows at once, as `archivedIds` does,
+ * Done, or put back, here: the store's read state for `ids` follows at once, as `doneState().archived` does,
  * so a reply dealt with from All, a thread or the Pinned list counts as read on Main straight away;
  * and no read sent before the write settles undoes it (`readSpeaksFor`). Answers what to give
  * `settleHeldDone` when the write has settled.
@@ -28016,7 +28034,7 @@ function olderReadReason() {
  */
 function rowsAsDrawn(pages) {
   if (selection().view === "threads" || gatheredParent() !== null || entryState().threadOwed !== null) return false;
-  if (!pages.every((page) => (page.dismissed || []).every((id) => archivedIds.has(String(id))))) return false;
+  if (!pages.every((page) => (page.dismissed || []).every((id) => doneState().archived.has(String(id))))) return false;
   const projected = projectView();
   if (!projected) return false;
   const keeps = readFilterKeeps();
@@ -30812,7 +30830,7 @@ async function editOutgoingMessage(id) {
   }
   const key = JSON.stringify([entry.channel, entry.threadId || null]);
   // The column whose box that is now, if one is showing it: this one first, then the other.
-  const boxShown = () => String(selectedChannelId()) === entry.channel && activeComposerKey === key;
+  const boxShown = () => String(selectedChannelId()) === entry.channel && composerState().key === key;
   const showing = () => [activeColumn, activeColumn === columns.main ? columns.side : columns.main]
     .find((column) => (column === columns.main || sideShowing()) && inColumn(column, boxShown)) || null;
   // From the store, which every keystroke in the box writes, and which holds the draft of a box no
@@ -31210,7 +31228,7 @@ el("dismissed-send-restore").addEventListener("click", () => {
 });
 
 async function sendChannelMessage() {
-  const key = activeComposerKey;
+  const key = composerState().key;
   const channel = selectedChannelId();
   const text = el("channel-compose-text").value;
   if (knownChannel(channel)?.writable === false) {
@@ -32186,7 +32204,7 @@ function dressChannelRow(row, { tally, answered, viewing, inMain, inAll }) {
   // EVERY constituent, or not at all. A row half of whose messages have been archived shows as
   // UNREAD: the other reading files an unseen message away behind one the reader has dealt with,
   // and the whole point of the archive is that it says what is left.
-  const isArchived = ids.length > 0 && ids.every((one) => archivedIds.has(one));
+  const isArchived = ids.length > 0 && ids.every((one) => doneState().archived.has(one));
   setAttributeIfChanged(row, "data-archived", isArchived ? "true" : "false");
   // `#245 done-feedback`. The moment of a Done, on whichever row now stands for the message.
   drawDoneFlash(row);
@@ -33113,7 +33131,7 @@ function singleDoneBump(ids) {
   const target = bookmarkTarget();
   if (!channel || !target || target.place !== "above") return null;
   const marking = new Set(ids.map(String));
-  const done = new Set([...archivedIds, ...marking]);
+  const done = new Set([...doneState().archived, ...marking]);
   if (!idsOf(target.row).some((id) => marking.has(id)) || !rowReadWith(target.row, done)) return null;
   const rows = /** @type {HTMLElement[]} */ ([...el("discord-log").children]).filter((row) => row.hasAttribute("data-id") && rowShown(row));
   const at = rows.indexOf(target.row);
@@ -33138,7 +33156,7 @@ function throughBump(row) {
   const line = target.place === "above" ? rows.indexOf(target.row) : rows.length;
   if (at < 0 || line < 0 || line > at) return null;
   const all = [...list.children];
-  const done = new Set([...archivedIds, ...all.slice(0, all.indexOf(row) + 1).flatMap(idsOf)]);
+  const done = new Set([...doneState().archived, ...all.slice(0, all.indexOf(row) + 1).flatMap(idsOf)]);
   const to = heldBackByMain(slideTarget(rows, at, done), target, rows, done);
   return to ? { channel, from: bookmarkAnchor(channel), to } : null;
 }
@@ -35211,7 +35229,7 @@ function noteStartsRead(messages) {
     readLedger.seed(id, epoch);
     if (String(message.channel_id) !== here) continue;
     if (threadingSupported && channelStore.current().channel === here) channelStore.current().dismissed.add(id);
-    archivedIds.add(id);
+    doneState().archived.add(id);
   }
 }
 
@@ -35241,7 +35259,7 @@ function isNoise(message) {
  * `done` is the read state asked: the marks for the rows on screen by default, and the store's for
  * a reply Main does not draw (`#222 unread-replies`, `replyTally`).
  */
-function stillToDo(message, done = archivedIds) {
+function stillToDo(message, done = doneState().archived) {
   return !done.has(String(message.id)) && !isNoise(message) && !hiddenEmpty(message);
 }
 
@@ -39460,7 +39478,7 @@ async function markReadThroughHere(row, upstreamId) {
   const at = rows.indexOf(row);
   if (at < 0) return;
   const covered = rows.slice(0, at + 1).flatMap(idsOf);
-  const ids = covered.filter((id) => !archivedIds.has(id));
+  const ids = covered.filter((id) => !doneState().archived.has(id));
   const channel = String(selectedChannelId());
   // `#327 done-races-remaining`. What the chat service's marker would pass, beyond the rows on
   // screen: a Done, or a put back, still on its way whose row is off the list — under Hide read a
@@ -42655,8 +42673,20 @@ function cycleReadMode() {
  *
  * Only ever the ids in the window on screen — see `ops::dismissed_within`. The store holds every
  * dismissal the channel ever had, and sending the lot would grow without bound.
+ *
+ * A column's own record (`#624 voice-page-modularity`, plan step 15, as `freshOlderPages`): `archived`,
+ * the set just described, a fresh empty one for each column.
+ *
+ * @returns {{archived: Set<string>}}
  */
-let archivedIds = new Set();
+function freshDoneState() {
+  return { archived: new Set() };
+}
+
+/** The column being worked on's record of what it shows as Done (`freshDoneState`). */
+function doneState() {
+  return activeColumn.done;
+}
 
 /**
  * Take down what a page said about which of its messages are archived.
@@ -42669,10 +42699,10 @@ function noteArchived(payload, replace) {
   // Not over a Done or a put back made here since the read was sent (`readSpeaksFor`, `#222
   // unread-replies`): the read answers for the state before it.
   if (replace) {
-    archivedIds = new Set([...archivedIds].filter((id) => !readSpeaksFor(payload, id)));
+    doneState().archived = new Set([...doneState().archived].filter((id) => !readSpeaksFor(payload, id)));
   }
   for (const id of payload.dismissed || []) {
-    if (readSpeaksFor(payload, String(id))) archivedIds.add(String(id));
+    if (readSpeaksFor(payload, String(id))) doneState().archived.add(String(id));
   }
   // `#327 done-races-remaining`. A message the read does not speak for keeps the state of the act made
   // here, which this copy holds only if it was there for it: a view drawn for the first time while a
@@ -42685,8 +42715,8 @@ function noteArchived(payload, replace) {
   if (threadingSupported && channelStore.current().channel === String(selectedChannelId())) {
     for (const id of readLedger.writtenIds()) {
       if (readSpeaksFor(payload, id)) continue;
-      if (channelStore.current().dismissed.has(id)) archivedIds.add(id);
-      else archivedIds.delete(id);
+      if (channelStore.current().dismissed.has(id)) doneState().archived.add(id);
+      else doneState().archived.delete(id);
     }
   }
 }
@@ -43064,7 +43094,7 @@ async function toggleArchived(ids, row = null) {
   // The row's own reading of itself, and it has to be the SAME `every` the row is drawn with:
   // a half-archived row shows as unread, so the act it offers is Done, and Done must archive the
   // part that is still outstanding rather than putting the whole row back.
-  if (all.length > 0 && all.every((id) => archivedIds.has(id))) {
+  if (all.length > 0 && all.every((id) => doneState().archived.has(id))) {
     await restoreMessages(all);
   } else {
     await markRowDone(all, row);
@@ -43258,7 +43288,7 @@ async function refreshAfterInboxChange() {
   if (todoMode) {
     const kept = [...el("discord-log").children].filter((row) => {
       const ids = idsOf(row);
-      return ids.length === 0 || !ids.every((id) => archivedIds.has(id));
+      return ids.length === 0 || !ids.every((id) => doneState().archived.has(id));
     });
     el("discord-log").replaceChildren(...kept);
     // A row gone from the list is a row gone from above another (`#214 reply-arrow`): the arrows are
@@ -43302,7 +43332,7 @@ function putBackRowsOff(listed, taken) {
   const list = el("discord-log");
   const drawn = new Set([...list.children].flatMap(idsOf));
   const back = listed.filter((row) => row.parentNode !== list && idsOf(row).some((id) => taken.has(id)) &&
-    !idsOf(row).some((id) => drawn.has(id)) && !idsOf(row).every((id) => archivedIds.has(id)));
+    !idsOf(row).some((id) => drawn.has(id)) && !idsOf(row).every((id) => doneState().archived.has(id)));
   /** The row on the list now that draws a message of `row`, which stood in `listed`, or undefined. */
   const drawing = (/** @type {Element} */ row) => {
     const ids = idsOf(row);
@@ -43331,7 +43361,7 @@ function putBackRowsOff(listed, taken) {
     list.insertBefore(row, next);
   }
   const stale = [...list.children].some((one) => idsOf(one).length > 0 &&
-    (one.getAttribute("data-archived") === "true") !== idsOf(one).every((id) => archivedIds.has(id)));
+    (one.getAttribute("data-archived") === "true") !== idsOf(one).every((id) => doneState().archived.has(id)));
   if (stale) renderChannelRows();
 }
 
@@ -43483,7 +43513,7 @@ function noteDoneSaving(ids) {
  * @param {string[]} ids
  * @param {() => boolean} [done]
  */
-async function doneSaved(ids, done = () => ids.every((id) => archivedIds.has(String(id)))) {
+async function doneSaved(ids, done = () => ids.every((id) => doneState().archived.has(String(id)))) {
   for (;;) {
     const saving = [...new Set(ids.map((id) => doneSaving.get(String(id))).filter(Boolean))];
     if (saving.length === 0) return done();
@@ -43513,7 +43543,7 @@ async function dismissMessages(body, bump = body.messages ? singleDoneBump(body.
   if (requested.length === 0) return;
   // Exactly what this changes, to put back if the write fails: never a copy of the whole set, which
   // would undo what reads folded meanwhile (`#222 unread-replies`).
-  const added = requested.filter((id) => !archivedIds.has(id));
+  const added = requested.filter((id) => !doneState().archived.has(id));
   const previousDismissal = lastDismissal;
   // `#245 done-feedback`. Named now, while the row is still drawn; see `dismissalName`.
   const name = dismissalName(requested);
@@ -43528,7 +43558,7 @@ async function dismissMessages(body, bump = body.messages ? singleDoneBump(body.
   // Before anything here changes, so that what the server holds is known if it refuses (`#326`).
   noteInboxWrite(requested);
   for (const id of requested) {
-    archivedIds.add(id);
+    doneState().archived.add(id);
   }
   // Done here from now on, and saved only once the write below is (`doneSaved`).
   const saved = noteDoneSaving(requested);
@@ -43607,7 +43637,7 @@ async function dismissMessages(body, bump = body.messages ? singleDoneBump(body.
     if (offered()) lastDismissal = landed.length > 0 ? { channel, messages: landed.slice(), bump: null, at } : previousDismissal;
     // Taken back in the column it was made in, and in the other. `#229 desktop-two-column`.
     inColumn(column, () => {
-      for (const id of added) if (back.has(id)) archivedIds.delete(id);
+      for (const id of added) if (back.has(id)) doneState().archived.delete(id);
       mirrorArchived(mirrored.filter((id) => back.has(id)), false);
       // ...and the rows it took off under Hide read without threads, while that list is still on screen.
       if (listed && todoMode && !threadingSupported && String(selectedChannelId()) === String(channel)) {
@@ -43672,13 +43702,13 @@ async function markReadUpstream(messageId) {
 async function restoreMessages(ids) {
   const channel = selectedChannelId();
   const restored = ids.map(String);
-  const removed = restored.filter((id) => archivedIds.has(id));
+  const removed = restored.filter((id) => doneState().archived.has(id));
   const previousDismissal = lastDismissal;
   // Before anything here changes, so that what the server holds is known if it refuses (`#326
   // refused-undo-restores-done`).
   noteInboxWrite(restored);
   for (const id of restored) {
-    archivedIds.delete(id);
+    doneState().archived.delete(id);
   }
   // On its way from now on, for what waits on a Done of these messages to be saved (`doneSaved`,
   // `#327 done-races-remaining`): settled once the write has been answered and a refusal taken back.
@@ -43752,7 +43782,7 @@ async function restoreMessages(ids) {
       lastDismissal = previousDismissal === null || left.length === 0 ? null : { ...previousDismissal, messages: left };
     }
     inColumn(column, () => {
-      for (const id of removed) if (back.has(id)) archivedIds.add(id);
+      for (const id of removed) if (back.has(id)) doneState().archived.add(id);
       mirrorArchived(mirrored.filter((id) => back.has(id)), true);
       guardQuietly(refreshAfterInboxChange)();
     });
@@ -43787,10 +43817,10 @@ function mirrorArchived(ids, done) {
   /** @type {string[]} */
   let changed = [];
   inOtherColumn(() => {
-    changed = ids.filter((id) => archivedIds.has(id) !== done);
+    changed = ids.filter((id) => doneState().archived.has(id) !== done);
     for (const id of changed) {
-      if (done) archivedIds.add(id);
-      else archivedIds.delete(id);
+      if (done) doneState().archived.add(id);
+      else doneState().archived.delete(id);
     }
     const drawn = [...el("discord-log").children].some((row) => idsOf(row).some((id) => ids.includes(id)));
     if (drawn && changed.length) renderCachedTimeline();
@@ -43803,7 +43833,7 @@ function mirrorArchived(ids, done) {
 //
 // `#306 done-stale-across-views`. Found in review of #295 shift-e-read-collapse: a message marked
 // Done in Main still showed as not Done in All, loaded earlier in the session, for seconds, until
-// some later read redrew it. Each view keeps its own copy of which messages are Done (`archivedIds`)
+// some later read redrew it. Each view keeps its own copy of which messages are Done (`doneState().archived`)
 // for when it is shown again — a view left in a column (`channelContexts`), and the right column's
 // thread while two columns are put away or show their cards — and only the list the Done was made in,
 // and the other column while it shows a thread (`mirrorArchived`), were told. Worse, a stale copy put
@@ -43877,7 +43907,7 @@ function followDoneEverywhere(ids, madeIn) {
   for (const held of channelContexts.values()) held.dismissed = caughtUp(held.dismissed);
   if (!sideShowing() && activeColumn !== columns.side && columns.side.state !== null) {
     inColumn(columns.side, () => {
-      archivedIds = caughtUp(archivedIds);
+      doneState().archived = caughtUp(doneState().archived);
     });
   }
   if (madeIn === columns.side && !sideShowing()) {
@@ -43885,7 +43915,7 @@ function followDoneEverywhere(ids, madeIn) {
     unpackDressedAfter = sideColumnUp();
     try {
       inColumn(columns.main, () => {
-        archivedIds = caughtUp(archivedIds);
+        doneState().archived = caughtUp(doneState().archived);
         // Its rows, or under Hide read which rows it draws; else Main's roots' counts of unread replies.
         if (rowsMissDone()) renderCachedTimeline();
         else syncUnreadReplies();
@@ -43896,7 +43926,7 @@ function followDoneEverywhere(ids, madeIn) {
   }
   if (madeIn !== columns.side && sideShowing()) {
     inColumn(columns.side, () => {
-      archivedIds = caughtUp(archivedIds);
+      doneState().archived = caughtUp(doneState().archived);
       // Its rows, or under Hide read which rows it draws. A thread draws no counts of unread replies.
       if (rowsMissDone()) renderCachedTimeline();
     });
@@ -43906,7 +43936,7 @@ function followDoneEverywhere(ids, madeIn) {
 
 /**
  * Whether the rows drawn in the column being worked on show a message's read state other than its own
- * copy (`archivedIds`) says: a row drawn Done, or not, against it, or under Hide read a message drawn,
+ * copy (`doneState().archived`) says: a row drawn Done, or not, against it, or under Hide read a message drawn,
  * or left out, against it. Rows held while a Done or an Undo was made in another view keep the look
  * they had; their copy was brought into line at once (`followDoneEverywhere`), and this says they are
  * to be drawn again as they are shown. `#306 done-stale-across-views`.
@@ -43916,7 +43946,7 @@ function rowsMissDone() {
   const rows = [...el("discord-log").children];
   if (rows.some((row) => {
     const ids = idsOf(row);
-    return ids.length > 0 && (row.getAttribute("data-archived") === "true") !== ids.every((id) => archivedIds.has(id));
+    return ids.length > 0 && (row.getAttribute("data-archived") === "true") !== ids.every((id) => doneState().archived.has(id));
   })) return true;
   if (!hidingRead()) return false;
   const keeps = readFilterKeeps();
@@ -46617,7 +46647,7 @@ function answeredRow(id) {
 function doneWhereNotDrawn(id) {
   if (threadingSupported && channelStore.current().channel === String(selectedChannelId()) &&
       channelStore.current().dismissed.has(id)) return true;
-  return inColumn(columns.main, () => archivedIds.has(id) || (todoMode && !threadingSupported));
+  return inColumn(columns.main, () => doneState().archived.has(id) || (todoMode && !threadingSupported));
 }
 
 /**
@@ -46630,7 +46660,7 @@ function doneWhereNotDrawn(id) {
  */
 function answeredDone(id, found = answeredRow(id)) {
   return inColumn(found ? found.column : columns.main, () => (found
-    ? idsOf(found.row).every((one) => archivedIds.has(one)) : doneWhereNotDrawn(id)));
+    ? idsOf(found.row).every((one) => doneState().archived.has(one)) : doneWhereNotDrawn(id)));
 }
 
 /**
@@ -46645,7 +46675,7 @@ function doneHeldHere(ids) {
   if (threadingSupported && channelStore.current().channel === String(selectedChannelId())) {
     return ids.every((id) => channelStore.current().dismissed.has(String(id)));
   }
-  return inColumn(columns.main, () => ids.every((id) => archivedIds.has(String(id))));
+  return inColumn(columns.main, () => ids.every((id) => doneState().archived.has(String(id))));
 }
 
 /**
@@ -47174,9 +47204,7 @@ const sideThreads = new Map();
  * @type {Array<[() => any, (value: any) => void, () => any]>}
  */
 const COLUMN_STATE = [
-  [() => activeComposerKey, (value) => { activeComposerKey = value; }, () => ""],
   [() => gathered, (value) => { gathered = value; }, () => null],
-  [() => archivedIds, (value) => { archivedIds = value; }, () => new Set()],
   [() => jumpNewestWanted.discord, (value) => { jumpNewestWanted.discord = value; }, () => false],
   [() => inScrollback.discord, (value) => { inScrollback.discord = value; }, () => false],
 ];
@@ -48325,7 +48353,7 @@ function renderSideCards() {
       const blocks = unpacked ? inColumn(columns.side, () => {
         const shown = cards.filter((card) => card.state === "unpacked")
           .flatMap((card) => unpackHeldMessages(card.choice).map((message) => String(message.id)));
-        archivedIds = caughtUpDone(archivedIds, shown);
+        doneState().archived = caughtUpDone(doneState().archived, shown);
         return cards.map((card, at) => {
           const was = kept[at];
           const now = parts[at];
@@ -48354,7 +48382,7 @@ function renderSideCards() {
       /** @type {Map<string, HTMLElement[]>} */
       const mainKept = new Map();
       const between = main.length ? inColumn(columns.side, () => {
-        archivedIds = caughtUpDone(archivedIds, main.map((message) => String(message.id)));
+        doneState().archived = caughtUpDone(doneState().archived, main.map((message) => String(message.id)));
         return runs.map((run) => {
           if (run.length === 0) return [];
           // By its messages as drawn: a Done or a put back is in how a row is dressed, done again below.
@@ -50930,6 +50958,8 @@ function resetSideColumn(reopen = false) {
     columns.side.list = freshListState();
     columns.side.rows = freshTimelineRows();
     columns.side.selection = freshSelection();
+    columns.side.composer = freshComposerState();
+    columns.side.done = freshDoneState();
   }
   for (const id of ["side-log", "side-thread-list", "side-summary", "side-pinned-log", "side-outgoing-log"]) {
     leftEl(id).replaceChildren();

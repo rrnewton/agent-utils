@@ -7197,7 +7197,7 @@ test("`#624 voice-page-modularity`: a read asked for while another is out joins 
   assert.deepStrictEqual([started, generation.current()], [0, 1]);
 });
 
-test("`#624 voice-page-modularity`: each column keeps its own records of its older pages, reply arrows, reads, entries, pins, scroll tools, filters, lists, rows and selection, reached through the column worked on", () => {
+test("`#624 voice-page-modularity`: each column keeps its own records of its older pages, reply arrows, reads, entries, pins, scroll tools, filters, lists, rows, selection, boxes and Done marks, reached through the column worked on", () => {
   const page = newPage();
   const same = (expression) => page.pure(expression);
   assert.equal(same("olderPages() === columns.main.older"), true, "the left column's record was not the one worked on");
@@ -7249,6 +7249,10 @@ test("`#624 voice-page-modularity`: each column keeps its own records of its old
   // And what it shows: the right column starts on a thread, as its swapped fields did.
   assert.equal(same("inColumn(columns.side, () => selection()) === columns.side.selection && selection() === columns.main.selection"), true);
   assert.deepStrictEqual(JSON.parse(same("JSON.stringify(freshSelection())")), { view: "thread", threadId: null, thread: null, origin: "main" });
+  // And its message box and what it shows as Done: a fresh empty set for each column.
+  assert.equal(same("columns.side.done.archived !== columns.main.done.archived && doneState() === columns.main.done"), true);
+  assert.equal(same("inColumn(columns.side, () => composerState()) === columns.side.composer"), true);
+  assert.deepStrictEqual(JSON.parse(same("JSON.stringify([freshComposerState(), freshDoneState().archived.size])")), [{ key: "" }, 0]);
 });
 
 test("`#624 voice-page-modularity`: the live events counted per channel, from the module alone", () => {
@@ -77307,8 +77311,8 @@ test("`#311 sent-read-waits-for-done`: under Hide read without threads a reply t
       `${how}: looking again for every message Done already still asked the chat service, so this test cannot see it`);
   }
   assert.deepStrictEqual((await heldHere(failing, lookedAlways)).asked, [], "the control changed what a failed Done asks");
-  const offList = brokenScript("  return inColumn(columns.main, () => ids.every((id) => archivedIds.has(String(id))));\n",
-    "  return inColumn(columns.main, () => todoMode || ids.every((id) => archivedIds.has(String(id))));\n");
+  const offList = brokenScript("  return inColumn(columns.main, () => ids.every((id) => doneState().archived.has(String(id))));\n",
+    "  return inColumn(columns.main, () => todoMode || ids.every((id) => doneState().archived.has(String(id))));\n");
   const offListFailed = await heldHere(failing, offList);
   assert.deepStrictEqual(offListFailed.whileSaving, [], "the control waited no longer");
   assert.deepStrictEqual(offListFailed.asked, [target],
