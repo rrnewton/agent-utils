@@ -113,7 +113,7 @@ PROJECTS: tuple[Project, ...] = (
         package="local_ci_hub",
         commands=("local-ci-hub",),
         resources=("README.md", "USER_GUIDE.md", "py.typed"),
-        required_dependencies=(),
+        required_dependencies=("tomli",),
     ),
     Project(
         directory="wrkviz",
