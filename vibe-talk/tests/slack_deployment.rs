@@ -19,45 +19,22 @@ use vibe_talk::upstream_clear::Clearer;
 
 const TEAM: &str = "C0000MAIN1";
 const OTHER: &str = "C0000OTHER";
-const VENDOR_TAIL_UNIT: &str = include_str!("../systemd/vibe-talk-live-hint.service.example");
-
-fn active_unit_value<'a>(unit: &'a str, key: &str) -> Vec<&'a str> {
-    unit.lines()
-        .map(str::trim)
-        .filter(|line| !line.starts_with('#'))
-        .filter_map(|line| line.strip_prefix(key))
-        .filter_map(|value| value.strip_prefix('='))
-        .collect()
-}
 
 #[test]
-fn the_vendor_tail_unit_pins_its_proven_runtime_constraints() {
-    let exec_start = active_unit_value(VENDOR_TAIL_UNIT, "ExecStart");
-    assert_eq!(
-        exec_start.len(),
-        1,
-        "the unit needs one literal event source"
-    );
-    assert!(
-        exec_start[0].contains(" -- /REPLACE_WITH_VENDOR_CLI conversation tail "),
-        "the exceptional runtime envelope belongs to the concrete vendor CLI tail command"
-    );
-    assert_eq!(active_unit_value(VENDOR_TAIL_UNIT, "MemoryHigh"), ["1G"]);
-    assert_eq!(active_unit_value(VENDOR_TAIL_UNIT, "MemoryMax"), ["2G"]);
-    assert_eq!(active_unit_value(VENDOR_TAIL_UNIT, "TasksMax"), ["2048"]);
-    assert!(
-        active_unit_value(VENDOR_TAIL_UNIT, "NoNewPrivileges").is_empty(),
-        "the vendor CLI's managed runtime aborts under NoNewPrivileges"
-    );
-    assert!(
-        active_unit_value(VENDOR_TAIL_UNIT, "PrivateTmp").is_empty(),
-        "the vendor CLI's managed runtime aborts under PrivateTmp"
-    );
-    assert!(
-        VENDOR_TAIL_UNIT
-            .contains("These are budgets for a vendor CLI that runs inside a managed runtime"),
-        "the large managed-runtime budget must not look like a generic adapter requirement"
-    );
+fn the_example_config_runs_the_vendor_tail_in_the_server() {
+    // `#709 vt-live-tail-rust`: no separate adapter unit remains; the server supervises the
+    // vendor CLI itself, so the example configuration is the deploy contract. The vendor CLI's
+    // managed runtime (hundreds of tasks, ~1 GiB measured under the retired adapter unit) now
+    // shares the server unit's limits: the README's deploy note says to size them for both.
+    let example = include_str!("../vibe-talk.example.toml");
+    for needed in [
+        "tail_command",
+        "slack.conversation",
+        "{channels}",
+        "{catchup}",
+    ] {
+        assert!(example.contains(needed), "{needed}");
+    }
 }
 
 fn config_text(api_base: &str, provider_extra: &str) -> String {

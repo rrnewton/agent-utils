@@ -237,6 +237,9 @@ mod slack_group_dm_names;
 #[path = "slack_ids.rs"]
 mod slack_ids;
 
+#[path = "live_tail_parity.rs"]
+mod live_tail_parity;
+
 #[path = "slack_live_ingest.rs"]
 mod slack_live_ingest;
 

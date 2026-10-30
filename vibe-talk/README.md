@@ -5917,55 +5917,25 @@ Provider failure backoff still wins over a hint, so a noisy event stream cannot 
 outage into a request storm. Catch-up events are safe too: the poller seeds its cursor from current
 history on startup and publishes none of that seed as new.
 
-Once the adapter is running, make `live_poll_seconds` the desired recovery bound rather than the
+Once a hint producer is running, make `live_poll_seconds` the desired recovery bound rather than the
 ordinary delivery latency (for example, `3600` for hourly reconciliation). Do not set it to zero:
 the hint deliberately has no second provider client or cursor of its own to consume it.
 
-`scripts/live-hint-adapter.py` supervises an external JSON-lines event command and turns each JSON
-object it emits into one such hint. It invokes the command literally, without a shell; caps each
-record; reads the ingest credential from a private file; retries only transport failures, `429`,
-and `5xx`; and exits on a permanent `4xx` or malformed stream so a service manager can restart or
-surface the fault. The event command owns event filtering: do not enable heartbeat output, because
-every valid JSON object is intentionally treated as a change hint.
-
-Run its offline protocol and privacy controls before installing it:
-
-```sh
-python3 scripts/live-hint-adapter.py --self-test
-```
-
-For a systemd user service, copy
-[`systemd/vibe-talk-live-hint.service.example`](systemd/vibe-talk-live-hint.service.example) to
-`~/.config/systemd/user/vibe-talk-live-hint.service`, replace its paths, channel, URL, and event
-command, and put the same value as `ingest.token` in `~/.config/vibe-talk/ingest-token` with mode
-`0600`. The example binds the adapter lifecycle to `vibe-talk.service`, treats even a clean event
-stream EOF as a failure, and restarts it without making the channel writable:
-
-```sh
-systemctl --user daemon-reload
-systemctl --user enable --now vibe-talk-live-hint.service
-```
-
-The adapter intentionally fixes one channel on its own command line, so an event cannot choose a
-different allowlisted destination. Install one unit per channel when the upstream source cannot be
-split that way itself.
-
-The checked-in service is specifically an example for **a vendor CLI tail command that runs
-inside a managed runtime**, not a statement of the generic adapter's minimum resources or sandbox
-compatibility. That runtime mounted its packaged client and settled above 512 tasks and 1 GiB; it
-also aborts when systemd gives it `NoNewPrivileges` or `PrivateTmp`. The example therefore leaves
-those two directives unset and allows 2 GiB and 2,048 tasks. The Python adapter itself does not need
-that footprint. If the command after `--` is a different event source, measure that command and
-restore the strongest sandbox and smallest limits it supports rather than copying the managed
-runtime's exceptions without evidence.
+A producer POSTs each hint itself, with the ingest token; the channel it names is the whole
+authority an event gets, so a producer that tails one channel can only ever wake that channel.
+The Python program that used to supervise an external event command and POST these hints
+(`scripts/live-hint-adapter.py`, both modes) was retired by `#709 vt-live-tail-rust`: the server
+supervises its stream tail itself (see Stream records below), and its last version remains in
+git history for anyone wiring a different producer.
 
 ### Stream records
 
 `#452 slack-live-ingest`. A content-free hint throws away the text the provider's event stream
 already carried and reads the channel again through the provider: one more round trip per
 arrival, and, while hints keep coming, at least five seconds between reads. For a Slack provider
-the adapter can instead post each record of `slack.conversation tail --output=json
---include-iris-seq-id` as it stands to `POST /api/v1/live/tail`, under the ingest token.
+each record of `slack.conversation tail --output=json --include-iris-seq-id` can instead be
+applied as it stands: by this server's own supervised tail (below), or by an external source
+POSTing it to `/api/v1/live/tail` under the ingest token.
 
 The server checks every field before it uses any (a conversation, `ts`, user, bot, app, team and
 subtype id each of its Slack shape, the conversation named consistently, the text at most 40,000
@@ -6053,17 +6023,27 @@ seconds wait for the hint floor. A record costs a few milliseconds, plus one aut
 first time an author is seen (the maximum above). The time from a message being sent to its
 record reaching the server is the stream's own and is the same either way.
 
-`scripts/live-hint-adapter.py --records` runs the tail and posts its records; see its `--help`
-and [`systemd/vibe-talk-live-tail.service.example`](systemd/vibe-talk-live-tail.service.example).
-It keeps the stream position of the last acknowledged record in `--state-file` and resumes from it
-(`{catchup}` in the command), tails every conversation `GET /api/v1/live/tail` names unless
-`--channel` fixes the list (`{channels}`), asks again every five minutes and restarts the stream
-when the answer changes, skips a record the server refuses as malformed, skips a line it cannot
-read at all (not JSON, or past the bound) and reports it as a gap, and reports a stream that
-cannot resume from its saved position as a gap before it exits. When vibe-talk does not answer
-its request for the conversation list (it starts or restarts beside the adapter), the adapter waits
-for it, pausing 1 s and doubling to 30 s, and says so once, rather than exit and be restarted into
-the same race. Contentless hints stay available as the adapter's default mode.
+**The server runs the tail itself** (`#709 vt-live-tail-rust`). Set `[ingest] tail_command` in
+`vibe-talk.example.toml`'s `[ingest]` section: an argv template the server executes directly,
+never by a shell, as its own user with its own environment, with `{channels}` (the
+comma-separated conversations) and `{catchup}` (the saved stream position, or
+`tail_initial_catchup`) filled in argument by argument. It keeps the position of the last record
+it applied in `tail_state_file` (beside `[storage] path` when unset; an existing adapter state
+file in the same `{"cursor": N}` shape is read as it stands, so a deployment keeps its position
+across the move) and resumes from it, tails every conversation `GET /api/v1/live/tail` names
+unless `tail_channels` fixes the list, asks again every `tail_channels_refresh_seconds` and
+restarts the stream when the answer changes, skips a record the checker refuses as malformed
+with the position moved past it, skips a line it cannot read at all (not JSON, or past the bound)
+and reports it as a gap, and reports a stream that cannot resume from its saved position as a gap
+with the position forgotten. With no conversation to tail yet it waits, pausing 1 s and doubling
+to 30 s, and says so once; a stream that ends or a record that cannot be applied is restarted with
+the same backoff instead of exiting for a service manager. There is no separate adapter process,
+token file, or unit: size the server unit's memory and task limits for the server plus the tail
+child (the vendor CLI's managed runtime measured ~1 GiB and ~800 tasks in its old unit). The HTTP
+route stays for external sources (a chat bridge's event sinks); the parity test
+(`tests/live_tail_parity.rs`) replays one recorded stream through the retired adapter's
+forwarding decisions and through the in-server path and requires the same outcomes, the same
+published messages, and the same saved position.
 
 ### Provider-adapter push
 

@@ -978,6 +978,7 @@ async fn main() -> anyhow::Result<()> {
         });
     }
     tokio::spawn(vibe_talk::service_health::run(state.clone()));
+    let tail_state = state.clone();
     let app = vibe_talk::http::router(state);
 
     let listener = tokio::net::TcpListener::bind(bind)
@@ -989,6 +990,21 @@ async fn main() -> anyhow::Result<()> {
         shutdown_signal().await;
         let _ = shutdown_tx.send(true);
     });
+    // `#709 vt-live-tail-rust`. The in-server tail, when configured: it waits for a conversation
+    // to tail inside its own loop, so spawning it never delays the listener.
+    let tail_handle = if tail_state.config.ingest.tail_enabled() {
+        tracing::info!(
+            state_file = ?tail_state.config.ingest.tail_state_file,
+            "the in-server event-stream tail is ON: this server runs the tail command itself \
+             and applies its records as /api/v1/live/tail does, with no separate adapter process"
+        );
+        Some(tokio::spawn(vibe_talk::live_tail_supervisor::run(
+            tail_state,
+            shutdown_rx.clone(),
+        )))
+    } else {
+        None
+    };
     let mut server_shutdown = shutdown_rx.clone();
     // With the peer address, which the pairing redemption counts failures by (`#369 pairing-link`).
     let server = axum::serve(
@@ -999,7 +1015,19 @@ async fn main() -> anyhow::Result<()> {
         wait_for_shutdown(&mut server_shutdown).await;
     })
     .into_future();
-    match run_with_shutdown_deadline(server, shutdown_rx, GRACEFUL_SHUTDOWN_TIMEOUT).await {
+    let served = run_with_shutdown_deadline(server, shutdown_rx, GRACEFUL_SHUTDOWN_TIMEOUT).await;
+    // The tail child group is terminated by its supervisor, awaited here within the same
+    // deadline the HTTP server got: returning first would drop the runtime under it and
+    // orphan the group (`#709 vt-live-tail-rust`).
+    if let Some(handle) = tail_handle {
+        if tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, handle)
+            .await
+            .is_err()
+        {
+            tracing::warn!("the in-server tail did not stop within the graceful shutdown deadline");
+        }
+    }
+    match served {
         Some(result) => result.context("serving")?,
         None => tracing::warn!(
             timeout_seconds = GRACEFUL_SHUTDOWN_TIMEOUT.as_secs(),

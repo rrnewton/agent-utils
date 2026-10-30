@@ -10,13 +10,13 @@
 # tool's lightweight unboxed gate. The root includes `tests.dag.yaml` directly so vibe-talk shares
 # one scheduler and browser cap with the other repository fragments.
 
-.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page web-build pwa-installability enter-to-send-browser pairing-link-browser offline-cache-browser reactions-browser system-bots-browser edited-mark-browser rich-headers-browser read-aloud-browser wit-read-aloud-browser local-read-aloud-browser fallback-chain-browser read-aloud-blocks-browser read-aloud-views-browser read-pause-reply-browser pace-stepper-browser post-confirm-browser approval-card-browser voice-call-drops-browser send-order-browser view-switch-browser read-modes-browser keyboard-browser search-chord-browser composer-key-browser command-bar-browser two-column-browser desktop-layout-browser bookmark-browser reply-continuity-browser inline-reply-browser threads-main-browser sent-receipts-browser threads-polish-browser pack-still-browser reply-marks-read-browser done-sync-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test screenshots-self-test container-smoke filter-place-browser search-dates-browser search-unmatched-browser link-url-chip-browser voice-composer-browser composer-grow-browser thread-button-browser done-feedback-browser elision-browser clean thread-card-focus-browser thread-card-header-browser thread-header-collapse-browser threads-unpack-browser thread-line-browser empty-messages-browser all-thread-strip-browser scroll-stability-browser copy-message-browser open-upstream-link-browser in-app-links-browser message-summaries-browser thread-hue-spread-browser server-thread-hues-browser fold-steps-browser back-gesture-browser live-pill-browser stale-live-read-browser provider-groups-browser voice-reconnect-browser live-relay-check-self-test live-relay-check channel-search-browser column-overscroll-browser channel-box-browser keyboard-hides-bar-browser
+.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page web-build pwa-installability enter-to-send-browser pairing-link-browser offline-cache-browser reactions-browser system-bots-browser edited-mark-browser rich-headers-browser read-aloud-browser wit-read-aloud-browser local-read-aloud-browser fallback-chain-browser read-aloud-blocks-browser read-aloud-views-browser read-pause-reply-browser pace-stepper-browser post-confirm-browser approval-card-browser voice-call-drops-browser send-order-browser view-switch-browser read-modes-browser keyboard-browser search-chord-browser composer-key-browser command-bar-browser two-column-browser desktop-layout-browser bookmark-browser reply-continuity-browser inline-reply-browser threads-main-browser sent-receipts-browser threads-polish-browser pack-still-browser reply-marks-read-browser done-sync-browser voice-read-acceptance-self-test android-speech-self-test screenshots-self-test container-smoke filter-place-browser search-dates-browser search-unmatched-browser link-url-chip-browser voice-composer-browser composer-grow-browser thread-button-browser done-feedback-browser elision-browser clean thread-card-focus-browser thread-card-header-browser thread-header-collapse-browser threads-unpack-browser thread-line-browser empty-messages-browser all-thread-strip-browser scroll-stability-browser copy-message-browser open-upstream-link-browser in-app-links-browser message-summaries-browser thread-hue-spread-browser server-thread-hues-browser fold-steps-browser back-gesture-browser live-pill-browser stale-live-read-browser provider-groups-browser voice-reconnect-browser live-relay-check-self-test live-relay-check channel-search-browser column-overscroll-browser channel-box-browser keyboard-hides-bar-browser
 
 # The whole gate for this tool, cheapest and most likely to fail first.
 #
 # UNBOXED, and deliberately the default: it needs Rust, Node, and the repository's Python typing
 # tools, but no cgroup delegation. `validate-boxed` is the bounded version where cgroups exist.
-validate: fmt check scripts-check contract-check typecheck test dag-check voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test live-relay-check-self-test screenshots-self-test
+validate: fmt check scripts-check contract-check typecheck test dag-check voice-read-acceptance-self-test android-speech-self-test live-relay-check-self-test screenshots-self-test
 
 # The complete portable suite, run through dagrun: per-step wall and CPU timeouts, memory caps,
 # and process-tree teardown inside nested cgroups. Container-runtime and alternate-toolchain
@@ -823,12 +823,6 @@ voice-read-acceptance-self-test:
 # later Android recording.
 android-speech-self-test:
 	python3 scripts/android-device-speech.py --self-test
-
-# A live hint carries no chat content, and its adapter owns a long-running child plus retries.
-# Keep the offline HTTP, framing, privacy, and process-cleanup controls in the ordinary gate so a
-# deployment does not have to discover a broken supervisor against a real provider event stream.
-live-hint-adapter-self-test:
-	python3 scripts/live-hint-adapter.py --self-test
 
 # The screenshot harness's offline controls: its capture judge and PNG decoder, and its scene table.
 screenshots-self-test:

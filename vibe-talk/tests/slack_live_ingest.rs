@@ -932,36 +932,22 @@ async fn a_message_too_new_for_the_provider_to_list_yet_is_never_taken_for_a_del
 }
 
 #[test]
-fn the_records_unit_lets_the_adapter_choose_the_channels_and_the_position() {
-    let unit = include_str!("../systemd/vibe-talk-live-tail.service.example");
-    let exec_start: Vec<&str> = unit
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.starts_with('#'))
-        .filter_map(|line| line.strip_prefix("ExecStart="))
-        .collect();
-    assert_eq!(exec_start.len(), 1, "one literal event source");
+fn the_example_config_lets_the_server_choose_the_channels_and_the_position() {
+    // `#709 vt-live-tail-rust`: the tail is the server's own `[ingest]` configuration, not a
+    // separate adapter unit; the example must show both placeholders it fills.
+    let example = include_str!("../vibe-talk.example.toml");
     for needed in [
-        "live-hint-adapter.py --records ",
-        "--state-file ",
-        " -- /REPLACE_WITH_VENDOR_CLI conversation tail ",
-        "--channel-id={channels}",
-        "--catchup={catchup}",
+        "tail_command",
+        "{channels}",
+        "{catchup}",
         "--include-iris-seq-id",
-        "--output=json",
     ] {
-        assert!(exec_start[0].contains(needed), "{needed}");
+        assert!(example.contains(needed), "{needed}");
     }
     assert!(
-        !exec_start[0].contains("--channel "),
-        "every conversation vibe-talk names is tailed"
+        !example.contains("live-hint-adapter"),
+        "the retired Python adapter is not the deploy path"
     );
-    for absent in ["NoNewPrivileges=", "PrivateTmp="] {
-        assert!(
-            !unit.lines().any(|line| line.trim().starts_with(absent)),
-            "the vendor CLI's managed runtime aborts under {absent}"
-        );
-    }
 }
 
 /// `#452 slack-live-ingest` and `#453 cache-backfill`, measured against the loopback Slack fake:

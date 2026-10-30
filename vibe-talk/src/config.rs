@@ -1178,7 +1178,7 @@ pub struct AuthConfig {
 }
 
 /// Authentication for provider-neutral live-event and change-hint ingestion.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct IngestConfig {
     /// Dedicated bearer token. `None` means every live-adapter route is disabled.
     pub token: Option<Secret>,
@@ -1190,6 +1190,21 @@ pub struct IngestConfig {
     /// The most recently active threads of one channel each relist reads, besides its newest
     /// page.
     pub relist_threads: usize,
+    /// The in-server event-stream tail (`#709 vt-live-tail-rust`): the command this server runs
+    /// itself, with `{channels}` and `{catchup}` filled in argument by argument. Empty (the
+    /// default) supervises no tail. See [`crate::live_tail_supervisor`].
+    pub tail_command: Vec<String>,
+    /// Fixed conversations to tail. Empty (the default) tails every conversation
+    /// [`crate::live_tail::conversations`] names, refreshed on
+    /// [`IngestConfig::tail_channels_refresh_seconds`].
+    pub tail_channels: Vec<String>,
+    /// Where the stream position of the last record this server applied is kept. `None` after
+    /// resolution means beside `[storage] path`; resolution refuses a tail with neither.
+    pub tail_state_file: Option<PathBuf>,
+    /// Where a stream with no saved position starts: `none` (from now) or `oldest`.
+    pub tail_initial_catchup: String,
+    /// Seconds between asking which conversations to tail, when `tail_channels` is empty.
+    pub tail_channels_refresh_seconds: u64,
 }
 
 /// The shortest relist interval the configuration accepts, in seconds.
@@ -1200,12 +1215,39 @@ pub const MAX_RELIST_SECONDS: u64 = 86_400;
 pub const DEFAULT_RELIST_THREADS: usize = 4;
 /// The most threads one relist of a channel may read.
 pub const MAX_RELIST_THREADS: usize = 16;
+/// Default `[ingest] tail_channels_refresh_seconds` (`#709 vt-live-tail-rust`).
+pub const DEFAULT_TAIL_CHANNELS_REFRESH_SECONDS: u64 = 300;
+/// The shortest `[ingest] tail_channels_refresh_seconds` the configuration accepts.
+pub const MIN_TAIL_CHANNELS_REFRESH_SECONDS: u64 = 10;
+/// `[ingest] tail_initial_catchup` when unset: from now; the poller reads what came before.
+pub const DEFAULT_TAIL_INITIAL_CATCHUP: &str = "none";
+
+impl Default for IngestConfig {
+    fn default() -> Self {
+        Self {
+            token: None,
+            relist_seconds: 0,
+            relist_threads: DEFAULT_RELIST_THREADS,
+            tail_command: Vec::new(),
+            tail_channels: Vec::new(),
+            tail_state_file: None,
+            tail_initial_catchup: DEFAULT_TAIL_INITIAL_CATCHUP.to_owned(),
+            tail_channels_refresh_seconds: DEFAULT_TAIL_CHANNELS_REFRESH_SECONDS,
+        }
+    }
+}
 
 impl IngestConfig {
     /// Whether an adapter may deliver events or change hints to this server.
     #[must_use]
     pub fn enabled(&self) -> bool {
         self.token.is_some()
+    }
+
+    /// Whether this server supervises an event-stream tail itself. `#709 vt-live-tail-rust`.
+    #[must_use]
+    pub fn tail_enabled(&self) -> bool {
+        !self.tail_command.is_empty()
     }
 }
 
@@ -1650,6 +1692,13 @@ struct FileIngest {
     token: Option<Secret>,
     relist_seconds: Option<u64>,
     relist_threads: Option<usize>,
+    #[serde(default)]
+    tail_command: Vec<String>,
+    #[serde(default)]
+    tail_channels: Vec<String>,
+    tail_state_file: Option<String>,
+    tail_initial_catchup: Option<String>,
+    tail_channels_refresh_seconds: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1947,6 +1996,92 @@ impl Config {
                 detail: format!("must be from 0 to {MAX_RELIST_THREADS}"),
             });
         }
+        // `#709 vt-live-tail-rust`. The in-server tail: the command is an argv template, never
+        // a shell line, and both placeholders are required so this server really chooses the
+        // channels and the resume position (the retired adapter's rule).
+        let tail_command = file.ingest.tail_command.clone();
+        if !tail_command.is_empty() {
+            if tail_command.iter().any(|arg| arg.is_empty()) {
+                return Err(ConfigError::Invalid {
+                    field: "ingest.tail_command".to_owned(),
+                    detail: "holds an empty argument; remove it".to_owned(),
+                });
+            }
+            let joined = tail_command.join("\0");
+            for placeholder in ["{channels}", "{catchup}"] {
+                if !joined.contains(placeholder) {
+                    return Err(ConfigError::Invalid {
+                        field: "ingest.tail_command".to_owned(),
+                        detail: format!(
+                            "must contain {placeholder} in some argument, so the server chooses \
+                             the channels and the resume position"
+                        ),
+                    });
+                }
+            }
+        }
+        let mut tail_channels: Vec<String> = Vec::new();
+        for raw in &file.ingest.tail_channels {
+            let id = raw.trim().to_owned();
+            if !crate::slack::ids::is_conversation_id(&id) {
+                return Err(ConfigError::Invalid {
+                    field: "ingest.tail_channels".to_owned(),
+                    detail: format!(
+                        "{raw:?} is not a conversation id such as C0123ABCD; name conversations, \
+                         not channel ids with a thread"
+                    ),
+                });
+            }
+            if !tail_channels.contains(&id) {
+                tail_channels.push(id);
+            }
+        }
+        tail_channels.sort_unstable();
+        let tail_initial_catchup = file
+            .ingest
+            .tail_initial_catchup
+            .clone()
+            .unwrap_or_else(|| DEFAULT_TAIL_INITIAL_CATCHUP.to_owned());
+        if tail_initial_catchup != "none" && tail_initial_catchup != "oldest" {
+            return Err(ConfigError::Invalid {
+                field: "ingest.tail_initial_catchup".to_owned(),
+                detail: "must be \"none\" (from now) or \"oldest\"".to_owned(),
+            });
+        }
+        let tail_channels_refresh_seconds = file
+            .ingest
+            .tail_channels_refresh_seconds
+            .unwrap_or(DEFAULT_TAIL_CHANNELS_REFRESH_SECONDS);
+        if tail_channels_refresh_seconds < MIN_TAIL_CHANNELS_REFRESH_SECONDS {
+            return Err(ConfigError::Invalid {
+                field: "ingest.tail_channels_refresh_seconds".to_owned(),
+                detail: format!("must be at least {MIN_TAIL_CHANNELS_REFRESH_SECONDS} seconds"),
+            });
+        }
+        let tail_state_file = match file
+            .ingest
+            .tail_state_file
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            None => None,
+            Some(raw) if Path::new(raw).is_absolute() => Some(PathBuf::from(raw)),
+            Some(raw) => {
+                return Err(ConfigError::Invalid {
+                    field: "ingest.tail_state_file".to_owned(),
+                    detail: format!("{raw} is relative; give an absolute path"),
+                })
+            }
+        };
+        if tail_state_file.is_some() && tail_command.is_empty() {
+            return Err(ConfigError::Invalid {
+                field: "ingest.tail_state_file".to_owned(),
+                detail: "names a resume file but ingest.tail_command is empty; set the command \
+                         or remove the file"
+                    .to_owned(),
+            });
+        }
         // Full pushed EVENTS and polling remain mutually exclusive PER CHANNEL: the event route
         // refuses a polled provider's channels below. The token may nevertheless coexist with a
         // polling provider because `/live/hints` carries no message — it wakes that provider's
@@ -1983,6 +2118,24 @@ impl Config {
         };
 
         let storage = storage_config(get(ENV_STORAGE_PATH), file.storage)?;
+        // `#709 vt-live-tail-rust`. A tail with no named resume file keeps its position beside
+        // the store; with neither, there is nowhere durable to keep it, so starting would
+        // silently replay or skip on every restart.
+        let tail_state_file = if !tail_command.is_empty() && tail_state_file.is_none() {
+            match storage.path.as_deref().and_then(Path::parent) {
+                Some(directory) => Some(directory.join("live-tail.json")),
+                None => {
+                    return Err(ConfigError::Invalid {
+                        field: "ingest.tail_state_file".to_owned(),
+                        detail: "is required when ingest.tail_command is set and storage.path \
+                                 is unset; give an absolute path for the resume position"
+                            .to_owned(),
+                    })
+                }
+            }
+        } else {
+            tail_state_file
+        };
         let message_cache = file
             .message_cache
             .map(|table| message_cache_config(table, storage.path.as_deref()))
@@ -2050,6 +2203,11 @@ impl Config {
                 token: ingest_token,
                 relist_seconds,
                 relist_threads,
+                tail_command,
+                tail_channels,
+                tail_state_file,
+                tail_initial_catchup,
+                tail_channels_refresh_seconds,
             },
             channels,
             read_aloud: ReadAloudConfig {
@@ -5443,6 +5601,68 @@ provider = "slack"
         assert_eq!(
             cfg.ingest.token.as_ref().map(Secret::expose),
             Some("environment-adapter-token-long-enough")
+        );
+    }
+
+    #[test]
+    fn the_in_server_tail_is_opt_in_and_checked() {
+        // Off by default: no command, no tail.
+        let cfg = Config::from_toml_and_env(FULL, &env(&[])).expect("valid config");
+        assert!(!cfg.ingest.tail_enabled());
+
+        // On: command, fixed channels (sorted, deduplicated), state file, defaults filled.
+        let text = format!(
+            "{FULL}\n[storage]\npath = \"/var/lib/vibe-talk/store.sqlite3\"\n\n[ingest]\n\
+             tail_command = [\"meta\", \"slack.conversation\", \"tail\", \"--channel-id={{channels}}\", \"--catchup={{catchup}}\"]\n\
+             tail_channels = [\"C0000BBBB2\", \"C0000AAAA1\", \"C0000AAAA1\"]\n"
+        );
+        let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid config");
+        assert!(cfg.ingest.tail_enabled());
+        assert_eq!(cfg.ingest.tail_channels, ["C0000AAAA1", "C0000BBBB2"]);
+        assert_eq!(
+            cfg.ingest.tail_state_file.as_deref(),
+            Some(std::path::Path::new("/var/lib/vibe-talk/live-tail.json")),
+            "beside the store by default"
+        );
+        assert_eq!(cfg.ingest.tail_initial_catchup, "none");
+        assert_eq!(cfg.ingest.tail_channels_refresh_seconds, 300);
+
+        // Both placeholders are required, the catchup word is checked, and a tail with no
+        // store and no state file has nowhere to keep its position.
+        for (bad, field) in [
+            (
+                "tail_command = [\"meta\", \"tail\", \"--channel-id={channels}\"]",
+                "ingest.tail_command",
+            ),
+            (
+                "tail_initial_catchup = \"middle\"",
+                "ingest.tail_initial_catchup",
+            ),
+            ("tail_channels = [\"general\"]", "ingest.tail_channels"),
+            (
+                "tail_state_file = \"relative.json\"",
+                "ingest.tail_state_file",
+            ),
+        ] {
+            let command = if bad.starts_with("tail_command") {
+                String::new()
+            } else {
+                "tail_command = [\"meta\", \"tail\", \"--channel-id={channels}\", \"--catchup={catchup}\"]\n".to_owned()
+            };
+            let text = format!("{FULL}\n[ingest]\n{command}{bad}\n");
+            let err = Config::from_toml_and_env(&text, &env(&[])).expect_err("must refuse");
+            assert!(
+                matches!(&err, ConfigError::Invalid { field: got, .. } if got == field),
+                "{bad}: unexpected error: {err}"
+            );
+        }
+        let text = format!(
+            "{FULL}\n[ingest]\ntail_command = [\"meta\", \"tail\", \"--channel-id={{channels}}\", \"--catchup={{catchup}}\"]\n"
+        );
+        let err = Config::from_toml_and_env(&text, &env(&[])).expect_err("must refuse");
+        assert!(
+            matches!(&err, ConfigError::Invalid { field, .. } if field == "ingest.tail_state_file"),
+            "unexpected error: {err}"
         );
     }
 

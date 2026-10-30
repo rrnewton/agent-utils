@@ -73,6 +73,7 @@ pub mod http;
 pub mod link_labels;
 pub mod live;
 pub mod live_tail;
+pub mod live_tail_supervisor;
 pub mod local_tts;
 pub mod mcp;
 pub mod mention_defuse;

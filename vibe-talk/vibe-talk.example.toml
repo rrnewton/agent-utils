@@ -221,6 +221,26 @@ write_token = "REPLACE-ME-different-and-at-least-24-characters"
 #                                   # recently active threads read again, for the edits, deletions
 #                                   # and other bots' posts the stream never carries
 # relist_threads = 4                # 0 to 16: recently active threads a relist reads per channel
+#
+# The event-stream tail, supervised by THIS server (#709 vt-live-tail-rust; there is no
+# separate adapter process or unit). The command is an argv template executed directly, never
+# by a shell; {channels} becomes the comma-separated conversations and {catchup} the saved
+# stream position (or tail_initial_catchup when none is saved), filled in argument by argument.
+# Both placeholders are required. The child runs as this server's user, with its environment:
+# whatever identity the command needs, it must find as that user finds it. Records are applied
+# exactly as POST /api/v1/live/tail applies them, the position is kept in tail_state_file
+# (beside [storage] path as live-tail.json when unset; an existing adapter state file in the
+# same {"cursor": N} shape is read as it stands), streams restart with backoff, and a stream
+# that cannot resume is reported as a gap with its position forgotten. Size the server unit's
+# MemoryHigh/MemoryMax/TasksMax for the server PLUS this child: a vendor CLI tail in a managed
+# runtime measured ~1 GiB and ~800 tasks under its old adapter unit.
+# tail_command = ["meta", "slack.conversation", "tail", "--channel-id={channels}", "--catchup={catchup}", "--event-types=message.created,reaction.created,reaction.deleted", "--include-iris-seq-id", "--heartbeats", "--quiet", "--output=json"]
+# tail_channels = []                # fixed conversations; empty (default): every conversation
+#                                   # this server names for a provider that takes pushed
+#                                   # messages, re-read every tail_channels_refresh_seconds
+# tail_state_file = "/absolute/path/to/live-tail.json"
+# tail_initial_catchup = "none"     # "none" (from now) or "oldest"
+# tail_channels_refresh_seconds = 300   # at least 10
 
 # Channels this server may touch. This list is an ALLOWLIST: a channel that is not here cannot be
 # read or posted to through the API even with a valid token, however many channels the bot is in.
