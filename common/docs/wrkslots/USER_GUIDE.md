@@ -59,7 +59,8 @@ type, task and purpose, owner process identity, coordinator history, heartbeat t
    an owner leaves resumption notes, so reading one does not by itself mean the owner released the
    slot: run `remove` only for a slot whose owner said it is done with it. `retire-pending` applies
    this release only when given `--include-owner-consented`; without that flag a scheduled batch
-   keeps retaining live-owner slots even when it passes `--coordinator-authorized`. An interrupted
+   never attempts a live-owner slot (it reports each one retained with the reason `recorded owner
+   is alive`) even when it passes `--coordinator-authorized`. An interrupted
    owner-consented removal must be finished by a `recover` from a `wrkslots` version that has this
    release. An older version refuses because the owner is still alive, and until a newer `recover`
    runs or the owner exits, the interrupted removal's journal blocks every other mutation.
@@ -700,13 +701,25 @@ command silently replaces either artifact. An operator must preserve and reconci
 outside this destructive workflow before a fresh slot can provide new retirement evidence.
 
 Inspect the queue with `wrkslots retirement-queue --format json`. A coordinator may attempt a
-bounded group with `wrkslots retire-pending --limit N --coordinator-pid PID --format json`. Each
-item runs the ordinary removal state machine independently; a live owner (unless it released the
-slot, or `--include-owner-consented` is given and step 6 above holds), fresh heartbeat, hold, process use,
-changed handoff, dirty or unpublished work that cannot be salvaged, remote mismatch, or path-fence
-race retains the slot in the queue. Successful archived removal clears its sidecar.
-Attempt events rotate blocked entries behind never-attempted and less-recently-attempted entries, so
-one retained slot cannot starve the rest of a bounded queue. Lock contention is deferred; corrupt,
+bounded group with `wrkslots retire-pending --limit N --coordinator-pid PID --format json`. A
+candidate carrying a blocked reason -- a coordinator hold, a recorded owner the liveness authority
+reports alive (unless it released the slot, or `--include-owner-consented` is given and step 6
+above holds), or a missing or drifted handoff artifact -- is never attempted: it is reported
+retained with that named reason, writes no attempt event, and does not consume the batch limit.
+Each remaining item runs the ordinary removal state machine independently; fresh heartbeat,
+process use, changed handoff, dirty or unpublished work that cannot be salvaged, remote mismatch,
+or path-fence race retains the slot in the queue. Successful archived removal clears its sidecar.
+Attempt events rotate attempted entries behind never-attempted and less-recently-attempted
+entries, so one retained slot cannot starve the rest of a bounded queue.
+
+When a live lane goes on using a slot its predecessor handed off for removal, the coordinator --
+not the lane -- voids the queued entry with `wrkslots supersede-handoff SLOT --agent AGENT
+--owner-pid PID --expected-generation N --coordinator-pid PID --coordinator-authorized --reason
+TEXT`. It refuses unless the slot is a handoff-read retirement candidate, the new owner PID is
+live, and a process in its tree is using the slot (a cwd, descriptor, mapping or mount inside
+it). The row is rebound to the new agent, the generation advances (orphaning the superseded
+read), and the supersession with its evidence is recorded in the event log. Holds, checkouts and
+handoffs are untouched, so a held slot stays held under its new owner. Lock contention is deferred; corrupt,
 partial, or indeterminate state stops the batch and requires recovery instead of being mislabeled as
 retained. A defect in one item's own storage that removal finds in its first check, before it
 changes the slot, such as an active row whose slot directory is gone or a Git worktree registered

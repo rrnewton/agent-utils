@@ -22068,7 +22068,9 @@ def test_safe_reread_supersedes_historical_unprovenanced_read(
         raw_command(project, "retirement-queue", "--format", "json").stdout
     )
     assert len(after["pending"]) == 1
-    assert after["pending"][0]["blocked_reason"] is None
+    # The handoff provenance is complete again; the candidate's only
+    # blocker is now its live recorded owner (this test process).
+    assert after["pending"][0]["blocked_reason"] == "registered liveness authority reports owner alive"
 
 
 def test_schema_one_write_handoff_sidecar_without_provenance_fails_closed(
@@ -22864,7 +22866,241 @@ def test_sidecar_cleanup_noreplace_preserves_planted_retired_destination(
     assert not (config.control / "ACTIVE.testhost.journal").exists()
 
 
-def test_retire_pending_retains_live_slot_and_queue_entry(
+def _queue_a_dead_owner_candidate(project: Path) -> None:
+    assert create(project).returncode == 0
+    source = project.parent / "handoff-input.md"
+    source.write_text("retire safely\n", encoding="utf-8")
+    assert raw_command(
+        project,
+        "write-handoff",
+        "slot01",
+        "--agent",
+        "codex-1",
+        "--owner-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        "--from-file",
+        str(source),
+    ).returncode == 0
+    assert _release(project).returncode == 0
+    assert raw_command(
+        project,
+        "read-handoff",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+    ).returncode == 0
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+
+
+def test_supersede_handoff_rebinds_a_live_lane_and_voids_the_queue_entry(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    _queue_a_dead_owner_candidate(project)
+    queued = raw_command(project, "retirement-queue", "--format", "json")
+    assert [entry["slot"] for entry in json.loads(queued.stdout)["pending"]] == [
+        "slot01"
+    ]
+
+    slot_dir = checkout(project).parent
+    successor = subprocess.Popen(["sleep", "60"], cwd=slot_dir)
+    try:
+        code = wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "supersede-handoff",
+                "slot01",
+                "--agent",
+                "liteinst-new",
+                "--owner-pid",
+                str(successor.pid),
+                "--expected-generation",
+                "1",
+                "--coordinator-pid",
+                str(os.getpid()),
+                "--coordinator-authorized",
+                "--reason",
+                "the live liteinst lane supersedes the 2026-09-29 handoff",
+            ]
+        )
+    finally:
+        successor.terminate()
+        successor.wait(timeout=10)
+    assert code == 0
+    assert "superseded slot=slot01 agent=liteinst-new generation=2" in (
+        capsys.readouterr().out
+    )
+
+    # The handoff-read entry is void, and the row names the live agent.
+    queued = raw_command(project, "retirement-queue", "--format", "json")
+    assert json.loads(queued.stdout)["pending"] == []
+    config = wrkslots._load_config(str(project), "testhost")
+    state = wrkslots._load_active(config)
+    [record] = state.slots
+    assert record.agent == "liteinst-new"
+    assert record.generation == 2
+    assert record.owner is not None and record.owner.pid == successor.pid
+    events = wrkslots._load_events(config, "testhost")
+    supersessions = [
+        event
+        for event in events
+        if event.get("kind") == "active-state-recorded"
+        and (event.get("payload") or {}).get("action") == "handoff-superseded"
+    ]
+    assert len(supersessions) == 1
+    evidence = supersessions[0]["payload"]["evidence"]
+    assert evidence["previous_agent"] == "codex-1"
+    assert evidence["superseded_handoff_read_sequence"] >= 1
+    assert evidence["voided_owner_release"] is True
+
+
+def test_supersede_handoff_refuses_without_coordinator_authorization(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    _queue_a_dead_owner_candidate(project)
+    slot_dir = checkout(project).parent
+    successor = subprocess.Popen(["sleep", "60"], cwd=slot_dir)
+    try:
+        result = raw_command(
+            project,
+            "supersede-handoff",
+            "slot01",
+            "--agent",
+            "liteinst-new",
+            "--owner-pid",
+            str(successor.pid),
+            "--expected-generation",
+            "1",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--reason",
+            "no authorization flag",
+        )
+    finally:
+        successor.terminate()
+        successor.wait(timeout=10)
+    assert result.returncode != 0
+    assert "REFUSED" in result.stderr + result.stdout
+
+
+def test_supersede_handoff_refuses_an_owner_that_does_not_use_the_slot(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    _queue_a_dead_owner_candidate(project)
+    successor = subprocess.Popen(["sleep", "60"], cwd=tmp_path)
+    try:
+        result = raw_command(
+            project,
+            "supersede-handoff",
+            "slot01",
+            "--agent",
+            "liteinst-new",
+            "--owner-pid",
+            str(successor.pid),
+            "--expected-generation",
+            "1",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--coordinator-authorized",
+            "--reason",
+            "owner never enters the slot",
+        )
+    finally:
+        successor.terminate()
+        successor.wait(timeout=10)
+    assert result.returncode != 0
+    assert "uses slot" in result.stderr + result.stdout
+
+
+def test_supersede_handoff_refuses_a_slot_with_no_handoff_read_entry(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    slot_dir = checkout(project).parent
+    successor = subprocess.Popen(["sleep", "60"], cwd=slot_dir)
+    try:
+        result = raw_command(
+            project,
+            "supersede-handoff",
+            "slot01",
+            "--agent",
+            "liteinst-new",
+            "--owner-pid",
+            str(successor.pid),
+            "--expected-generation",
+            "1",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--coordinator-authorized",
+            "--reason",
+            "nothing was handed off",
+        )
+    finally:
+        successor.terminate()
+        successor.wait(timeout=10)
+    assert result.returncode != 0
+    assert "no handoff-read entry" in result.stderr + result.stdout
+
+
+def test_retire_pending_never_attempts_a_held_slot(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    legacy = checkout(project).parent / "HANDOFF.md"
+    legacy.write_text("ready whenever\n", encoding="utf-8")
+    assert raw_command(
+        project,
+        "read-handoff",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+    ).returncode == 0
+    assert raw_command(
+        project, "hold", "slot01", "--reason", "live lane evidence store"
+    ).returncode == 0
+
+    # A held slot stays derived with its named blocked reason, and a
+    # bounded run reports it retained without attempting it.
+    queued = raw_command(project, "retirement-queue", "--format", "json")
+    [entry] = json.loads(queued.stdout)["pending"]
+    assert entry["slot"] == "slot01"
+    assert "slot is held: live lane evidence store" in entry["blocked_reason"]
+    code = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "retire-pending",
+            "--limit",
+            "1",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--format",
+            "json",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["removed"] == []
+    assert [item["slot"] for item in payload["retained"]] == ["slot01"]
+    assert "slot is held" in payload["retained"][0]["reason"]
+    assert payload["deferred"] == []
+    assert payload["could_not_determine"] == []
+    config = wrkslots._load_config(str(project), "testhost")
+    events = wrkslots._load_events(config, "testhost")
+    assert not [
+        event for event in events if event.get("kind") == "retirement-attempted"
+    ]
+
+
+def test_retire_pending_attempts_live_slots_only_when_owner_consented(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     project, _repository, _remote = make_project(tmp_path)
@@ -22878,21 +23114,11 @@ def test_retire_pending_retains_live_slot_and_queue_entry(
         "--coordinator-pid",
         str(os.getpid()),
     ).returncode == 0
-    assert create(
-        project,
-        slot="slot02",
-        agent="codex-2",
-        branch="codex/second",
-    ).returncode == 0
-    second = checkout(project, slot="slot02").parent / "HANDOFF.md"
-    second.write_text("also not yet dead\n", encoding="utf-8")
-    assert raw_command(
-        project,
-        "read-handoff",
-        "slot02",
-        "--coordinator-pid",
-        str(os.getpid()),
-    ).returncode == 0
+
+    queued = raw_command(project, "retirement-queue", "--format", "json")
+    [entry] = json.loads(queued.stdout)["pending"]
+    assert entry["slot"] == "slot01"
+    assert entry["blocked_reason"] == "registered liveness authority reports owner alive"
 
     code = wrkslots.main(
         [
@@ -22908,18 +23134,23 @@ def test_retire_pending_retains_live_slot_and_queue_entry(
         ]
     )
 
+    # The recorded owner is alive, so the default run attempts nothing:
+    # it reports the named reason and writes no attempt history.
     assert code == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["removed"] == []
-    assert payload["retained"][0]["slot"] == "slot01"
-    assert "registered liveness authority reports owner alive" in payload["retained"][0]["reason"]
-    assert payload["deferred"][0]["slot"] == "slot02"
-    assert payload["deferred"][0]["outcome"] == "deferred"
-    assert payload["deferred"][0]["reason"] == "batch limit"
-    queued = raw_command(project, "retirement-queue", "--format", "json")
-    assert len(json.loads(queued.stdout)["pending"]) == 2
+    assert [item["slot"] for item in payload["retained"]] == ["slot01"]
+    assert payload["retained"][0]["reason"] == "registered liveness authority reports owner alive"
+    assert payload["deferred"] == []
+    assert payload["could_not_determine"] == []
+    config = wrkslots._load_config(str(project), "testhost")
+    events = wrkslots._load_events(config, "testhost")
+    assert not [
+        event for event in events if event.get("kind") == "retirement-attempted"
+    ]
 
-    second_code = wrkslots.main(
+    # The owner-consented path is the one way a live slot is attempted.
+    code = wrkslots.main(
         [
             "--project-root",
             str(project),
@@ -22928,14 +23159,21 @@ def test_retire_pending_retains_live_slot_and_queue_entry(
             "1",
             "--coordinator-pid",
             str(os.getpid()),
+            "--coordinator-authorized",
+            "--include-owner-consented",
             "--format",
             "json",
         ]
     )
-    assert second_code == 0
-    second_payload = json.loads(capsys.readouterr().out)
-    assert second_payload["retained"][0]["slot"] == "slot02"
-    assert second_payload["deferred"][0]["slot"] == "slot01"
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    attempted = (
+        payload["removed"] + payload["retained"] + payload["could_not_determine"]
+    )
+    assert [item["slot"] for item in attempted] == ["slot01"]
+    assert all(
+        item.get("reason") != "registered liveness authority reports owner alive" for item in attempted
+    )
 
 
 def test_retire_pending_defers_superseded_candidate_inside_remove_lock(
@@ -22984,6 +23222,9 @@ def test_retire_pending_defers_superseded_candidate_inside_remove_lock(
         )
 
     monkeypatch.setattr(wrkslots, "_cmd_remove", supersede_then_remove)
+    # The recorded owner is alive, so only the owner-consented path
+    # attempts the candidate at all; the supersession inside the remove
+    # lock then defers it, as before.
     code = wrkslots.main(
         [
             "--project-root",
@@ -22993,6 +23234,8 @@ def test_retire_pending_defers_superseded_candidate_inside_remove_lock(
             "1",
             "--coordinator-pid",
             str(os.getpid()),
+            "--coordinator-authorized",
+            "--include-owner-consented",
             "--format",
             "json",
         ]

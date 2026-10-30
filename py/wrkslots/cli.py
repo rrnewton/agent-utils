@@ -7978,9 +7978,33 @@ def _retirement_candidates(
             if record.slot_type == "agent"
         },
     )
+    # A held slot is never attempted: a hold is a hard human protection,
+    # and holds refuse every removal mode, so an attempt could only burn
+    # the bounded batch and write attempt history.  The candidate is still
+    # derived, carrying the hold as its named blocked reason, so the queue
+    # and every sweep say why it is not retirable instead of retrying it.
+    # Holds replay from the same events (the _load_record_holds rule: the
+    # event log is authoritative when it exists, hold files otherwise); an
+    # unreadable hold records a blocked reason, never exposes the slot.
+    agent_slots = {
+        record.slot for record in state.slots if record.slot_type == "agent"
+    }
+    if events:
+        holds = _holds_from_events(events, state.machine, agent_slots)
+    else:
+        holds = {}
+        for slot in agent_slots:
+            try:
+                snapshot = _load_hold_snapshot(config, slot, state.machine)
+            except Refusal:
+                holds[slot] = {}
+            else:
+                if snapshot is not None:
+                    holds[slot] = snapshot
     for record in state.slots:
         if record.slot_type != "agent":
             continue
+        hold = holds.get(record.slot)
         latest = _latest_handoff_read(record, events)
         if (
             latest is None
@@ -8015,6 +8039,12 @@ def _retirement_candidates(
         except Refusal as exc:
             blocked_reason = str(exc)
         release, release_void = _owner_release_state(config, record, events, releases)
+        if hold is not None:
+            hold_reason = hold.get("reason")
+            if isinstance(hold_reason, str) and hold_reason.strip():
+                blocked_reason = f"slot is held: {hold_reason}"
+            else:
+                blocked_reason = "slot is held: hold record is unreadable"
         candidates.append(
             _RetirementCandidate(
                 machine=record.machine,
@@ -27332,6 +27362,153 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
     return 0
 
 
+def _process_ppid(pid_dir: Path) -> int | None:
+    try:
+        raw = (pid_dir / "stat").read_bytes().decode(
+            "utf-8", errors="surrogateescape"
+        )
+    except OSError:
+        return None
+    close = raw.rfind(")")
+    if close < 0:
+        return None
+    fields = raw[close + 2 :].split()
+    try:
+        return int(fields[1])
+    except (IndexError, ValueError):
+        return None
+
+
+def _descendant_pids(root_pid: int, *, limit: int = 4096) -> list[int]:
+    """The root PID and its live descendants, from one /proc ppid map."""
+    children: dict[int, list[int]] = {}
+    try:
+        entries = list(Path("/proc").iterdir())
+    except OSError as exc:
+        raise Refusal(f"cannot enumerate host processes: {exc}") from exc
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        ppid = _process_ppid(entry)
+        if ppid is not None:
+            children.setdefault(ppid, []).append(int(entry.name))
+    found = [root_pid]
+    queue = [root_pid]
+    while queue and len(found) <= limit:
+        current = queue.pop()
+        for child in children.get(current, []):
+            found.append(child)
+            queue.append(child)
+    return found
+
+
+def _cmd_supersede_handoff(args: argparse.Namespace) -> int:
+    """Supersede a handoff-read retirement entry and rebind the slot.
+
+    The coordinator's remedy when a live lane goes on using a slot its
+    predecessor handed off for removal: the queued retirement entry is
+    voided and the row is rebound to the live agent that actually uses the
+    slot.  Coordinator-authorized only.  The new owner must be a live
+    process whose tree is using the slot right now (a cwd, descriptor,
+    mapping or mount inside it, the same evidence classes as the removal
+    process-use check); liveness or use that cannot be proven refuses.
+    The generation advances, which also orphans the superseded
+    handoff-read, and the supersession is recorded as an
+    active-state-recorded event with its evidence.  Holds, checkouts and
+    handoffs are untouched.
+    """
+
+    config = _load_config(args.project_root, args.machine)
+    _validate_name(args.slot, "slot")
+    _validate_name(args.agent, "agent")
+    _validate_agent_name(args.agent)
+    _require_coordinator_authorized(args, "handoff supersession")
+    if not args.reason.strip():
+        raise Refusal("handoff supersession requires a non-empty --reason")
+    coordinator = _capture_caller_process(args.coordinator_pid, "coordinator")
+    successor = _read_process_identity(args.owner_pid)
+    with _mutation_locks(config, args.wait_lock):
+        _refuse_partial_state(config)
+        _assert_no_journal(config)
+        states, archives = _validate_global_state(config)
+        _assert_command_registry_storage(config, states, args)
+        before = _global_rows(states, archives)
+        state = _load_active(config)
+        record = _find_record(state, args.slot)
+        _expected_generation(record, args.expected_generation)
+        if record.slot_type != "agent":
+            raise Refusal(
+                f"slot {record.slot} is a {record.slot_type} slot; "
+                "supersede-handoff applies to agent slots"
+            )
+        events = _load_events(config, record.machine)
+        latest = _latest_handoff_read(record, events)
+        if latest is None or latest.retirement_enqueued is not True:
+            raise Refusal(
+                f"slot {record.slot} is not a handoff-read retirement candidate; "
+                "there is no handoff-read entry to supersede"
+            )
+        slot_dir = _slot_directory(config, record.slot, record.slot_type)
+        use: str | None = None
+        for pid in _descendant_pids(successor.pid):
+            found = _process_uses_slot(Path("/proc") / str(pid), slot_dir)
+            if found:
+                use = f"pid {pid}: {found[0]}"
+                break
+        if use is None:
+            raise Refusal(
+                f"no process in new owner PID {successor.pid}'s tree uses slot "
+                f"{record.slot} ({slot_dir}); supersede-handoff requires a live "
+                "owner that is using the slot. remedy: have the new owner's lane "
+                "run with a working directory or open file inside the slot, then rerun"
+            )
+        if _read_process_identity(successor.pid) != successor:
+            raise Refusal("owner process generation changed during supersede-handoff")
+        releases = _latest_owner_releases(events, {(record.slot, record.generation)})
+        released, _void_reason = _owner_release_state(
+            config, record, events, releases
+        )
+        superseded = dataclasses.replace(
+            record,
+            agent=args.agent,
+            owner=successor,
+            generation=record.generation + 1,
+            heartbeat_at=_utc_now(),
+        )
+        _write_active_state(
+            config,
+            _replace_record(state, superseded),
+            action="handoff-superseded",
+            slot=superseded.slot,
+            evidence={
+                "agent": args.agent,
+                "coordinator": _identity_to_obj(coordinator),
+                "owner": _identity_to_obj(successor),
+                "previous_agent": record.agent,
+                "previous_owner": (
+                    None if record.owner is None else _identity_to_obj(record.owner)
+                ),
+                "reason": args.reason,
+                "slot_use": use,
+                "superseded_handoff_read_sequence": latest.sequence,
+                "superseded_handoff_sha256": latest.sha256,
+                "voided_owner_release": released is not None,
+            },
+        )
+        after_states, after_archives = _validate_global_state(config)
+        _assert_only_slot_changed(
+            before,
+            _global_rows(after_states, after_archives),
+            args.slot,
+        )
+    print(
+        f"superseded slot={superseded.slot} agent={superseded.agent} "
+        f"generation={superseded.generation} owner_pid={successor.pid} "
+        f"previous_agent={record.agent}"
+    )
+    return 0
+
+
 def _cmd_recover_unbound_owner(args: argparse.Namespace) -> int:
     config = _load_config(args.project_root, args.machine)
     _validate_name(args.slot, "slot")
@@ -28357,7 +28534,11 @@ def _cmd_write_handoff(args: argparse.Namespace) -> int:
 
 
 def _current_retirement_candidates(
-    config: Config, wait_seconds: float, *, deadline: float | None = None
+    config: Config,
+    wait_seconds: float,
+    *,
+    deadline: float | None = None,
+    consented_live_owners: bool = False,
 ) -> tuple[_RetirementCandidate, ...]:
     effective_wait = (
         wait_seconds if deadline is None else _remaining_lock_wait(deadline)
@@ -28366,7 +28547,42 @@ def _current_retirement_candidates(
         _refuse_partial_state(config, allow_validate_batch_seals=True)
         state = _load_active(config, require_repository=False)
         events = _load_events(config, state.machine)
-        return _retirement_candidates(config, state, events)
+        candidates = _retirement_candidates(config, state, events)
+    if consented_live_owners or not candidates:
+        return candidates
+    # A slot whose recorded owner the liveness authority reports alive is
+    # never attempted either: the ordinary removal refuses it with
+    # certainty, so an attempt could only consume the bounded batch.  It
+    # stays derived with the named blocked reason, like a held slot.  Only
+    # an affirmative "alive" blocks; an unverifiable owner stays a plain
+    # candidate and the attempt itself classifies it, as today.  The one
+    # caller that may retire a live slot opts in with consented_live_owners
+    # (retire-pending --include-owner-consented), which leaves it
+    # unblocked.
+    records = {
+        (record.machine, record.slot, record.generation): record
+        for record in state.slots
+    }
+    probed = _registered_liveness_states(
+        config,
+        [
+            records[(candidate.machine, candidate.slot, candidate.generation)]
+            for candidate in candidates
+            if candidate.blocked_reason is None
+        ],
+    )
+    live = {
+        key for key, (owner_state, _detail) in probed.items() if owner_state == "alive"
+    }
+    if not live:
+        return candidates
+    return tuple(
+        dataclasses.replace(candidate, blocked_reason="registered liveness authority reports owner alive")
+        if (candidate.machine, candidate.slot, candidate.generation) in live
+        and candidate.blocked_reason is None
+        else candidate
+        for candidate in candidates
+    )
 
 
 def _emit_retirement_queue(
@@ -28592,14 +28808,36 @@ def _cmd_retire_pending(args: argparse.Namespace) -> int:
     deadline = time.monotonic() + wait_seconds
     config = _load_config(args.project_root, args.machine)
     pending = _current_retirement_candidates(
-        config, wait_seconds, deadline=deadline
+        config,
+        wait_seconds,
+        deadline=deadline,
+        consented_live_owners=bool(args.include_owner_consented),
     )
-    selected = pending[: args.limit]
     removed: list[dict[str, object]] = []
     retained: list[dict[str, object]] = []
     deferred: list[dict[str, object]] = []
     could_not_determine: list[dict[str, object]] = []
     stopped_at: int | None = None
+    # A blocked candidate (a hold, a live recorded owner, a missing or
+    # drifted handoff artifact) is never attempted: it is reported retained
+    # with its named reason, writes no attempt history, and does not
+    # consume the bounded batch.
+    attemptable: list[_RetirementCandidate] = []
+    for candidate in pending:
+        if candidate.blocked_reason is None:
+            attemptable.append(candidate)
+            continue
+        retained.append(
+            {
+                "machine": candidate.machine,
+                "slot": candidate.slot,
+                "generation": candidate.generation,
+                "sha256": candidate.sha256,
+                "outcome": "retained",
+                "reason": candidate.blocked_reason,
+            }
+        )
+    selected = attemptable[: args.limit]
     for index, candidate in enumerate(selected):
         identity = {
             "machine": candidate.machine,
@@ -28737,7 +28975,7 @@ def _cmd_retire_pending(args: argparse.Namespace) -> int:
                 "outcome": "deferred",
                 "reason": "batch limit",
             }
-            for candidate in pending[args.limit :]
+            for candidate in attemptable[args.limit :]
         ]
     )
     payload = {
@@ -60529,7 +60767,7 @@ Read-only: status, doctor, audit, import-existing without --apply, and
 clean-caches without --only or --yes. unpushed refreshes remote-tracking refs
 but does not mutate registry state.
 Mutating: init, create, register, import-existing --apply, adopt, transfer-owner,
-recover-unbound-owner, relocate-repository --apply, heartbeat, hold, unhold,
+supersede-handoff, recover-unbound-owner, relocate-repository --apply, heartbeat, hold, unhold,
 clean-caches deletion, finish,
 write-handoff, release, read-handoff, retire-pending, remove,
 recover-absent-validate-rows --apply, and recover. Registry mutations take a state lock and append
@@ -61262,6 +61500,55 @@ usage or audit gate unknown, 3 fail-closed refusal.
     )
     transfer.set_defaults(handler=_cmd_transfer_owner)
 
+    supersede = subparsers.add_parser(
+        "supersede-handoff",
+        help="void a handoff-read retirement entry and rebind the slot to its live agent",
+        description=(
+            "Coordinator-authorized remedy for a slot a live lane goes on using after its "
+            "predecessor handed it off for removal: the queued handoff-read retirement entry "
+            "is superseded and the row is rebound to the live agent that uses the slot now. "
+            "Refuses unless the slot is a handoff-read retirement candidate, the new owner "
+            "PID is live, and a process in its tree is using the slot (a cwd, descriptor, "
+            "mapping or mount inside it). The generation advances, orphaning the superseded "
+            "read; holds, checkouts and handoffs are untouched. The supersession and its "
+            "evidence are recorded in the append-only event log."
+        ),
+        formatter_class=_HelpFormatter,
+    )
+    supersede.add_argument("slot", help="active slot whose handoff-read entry is superseded")
+    supersede.add_argument(
+        "--agent", required=True, metavar="AGENT", help="live agent name to record on the slot"
+    )
+    supersede.add_argument(
+        "--owner-pid", type=int, required=True, metavar="PID", help="live new-owner PID to bind"
+    )
+    supersede.add_argument(
+        "--expected-generation",
+        type=int,
+        required=True,
+        metavar="N",
+        help="current slot generation; refuses stale callers",
+    )
+    supersede.add_argument(
+        "--coordinator-pid",
+        type=int,
+        required=True,
+        metavar="PID",
+        help="live coordinator PID recorded with the supersession",
+    )
+    supersede.add_argument(
+        "--coordinator-authorized",
+        action="store_true",
+        help="record that the coordinator authorized this supersession (required)",
+    )
+    supersede.add_argument(
+        "--reason",
+        required=True,
+        metavar="TEXT",
+        help="why the lane supersedes the handoff; recorded in the event log",
+    )
+    supersede.set_defaults(handler=_cmd_supersede_handoff)
+
     recover_unbound = subparsers.add_parser(
         "recover-unbound-owner",
         help="record coordinator recovery evidence without replacing historical ownership",
@@ -61501,8 +61788,8 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "Attempt one bounded group of handoff-read agent slots. Each target runs the "
             "ordinary remove state machine under its own lock scope; every liveness, hold, "
             "process-use, Git salvage, remote, digest, and path-fence refusal remains active."
-            " A target whose recorded owner is still alive keeps the ordinary refusal and"
-            " is retained unless --include-owner-consented is given; only then is it removed,"
+            " A held target is never selected, and a target whose recorded owner is still"
+            " alive is selected only with --include-owner-consented; only then is it removed,"
             " and only under the owner-consented-handoff conditions documented for remove,"
             " which include --coordinator-authorized and an expired heartbeat."
             " A target whose exact owner released it with 'wrkslots release' needs no"
@@ -61541,9 +61828,9 @@ usage or audit gate unknown, 3 fail-closed refusal.
         "--include-owner-consented",
         action="store_true",
         help=(
-            "also attempt owner-consented release (see remove --help) for a target whose "
-            "recorded owner is still alive; without this flag such a target keeps the "
-            "ordinary live-owner refusal and is retained, even with --coordinator-authorized. "
+            "also select owner-consented release (see remove --help) for a target whose "
+            "recorded owner is still alive; without this flag such a target is not a "
+            "retirement candidate and is never attempted. "
             "A handoff is also how an owner leaves resumption notes, so pass this only when "
             "every queued live-owner handoff is known to be a release"
         ),
