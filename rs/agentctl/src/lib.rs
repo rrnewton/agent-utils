@@ -10,6 +10,7 @@ pub(crate) mod chat_context;
 pub(crate) mod chat_events;
 pub(crate) mod chat_history;
 pub(crate) mod chat_launch;
+pub mod chat_lookup;
 pub mod chat_runtime;
 pub mod chat_service;
 pub mod cli;

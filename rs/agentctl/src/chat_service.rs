@@ -31,8 +31,9 @@ use crate::chat_events::{self, PaneEvent, PaneEventStream, PaneEventWake};
 use crate::chat_runtime::{
     self, AckResult, BridgeConfiguration, BridgeState, ChatRuntimeError, CommandOutboundTransport,
     CoordinatorDeliveryResult, DeliveryAlarm, DeliveryEntry, OutboundCancellation, OutboundFailure,
-    ReplyRoute, ReplyRouteEntry, ReplyStoreOutcome, ReplySubmission, ReplyTransport, RequestPhase,
-    RootMessageSubmission, RootMessageTransport, SlackFormat, SNAPSHOT_LINES,
+    PromptCommands, ReplyRoute, ReplyRouteEntry, ReplyStoreOutcome, ReplySubmission,
+    ReplyTransport, RequestPhase, RootMessageSubmission, RootMessageTransport, SlackFormat,
+    SNAPSHOT_LINES,
 };
 use crate::client::HerdrClient;
 use crate::error::AdapterErrorKind;
@@ -1035,6 +1036,44 @@ pub struct RunSettings {
     /// sends no reminder; `chat run` reminds after [`DEFAULT_REPLY_REMINDER_IDLE`] unless told
     /// otherwise. Reminders need `outbound_enabled`.
     pub reply_reminders: Option<ReplyReminderSettings>,
+    /// The registry the service runs with. When set, the service records its state directory
+    /// and this registry in the per-user bridge index at start (#707 chat-prompt-anatomy), so an
+    /// agent's `agentctl chat reply ID` finds the bridge by caller lookup, and its prompts then
+    /// print those short commands; see [`crate::chat_lookup`]. `None` registers nothing and
+    /// prints the explicit commands.
+    pub registry: Option<PathBuf>,
+}
+
+/// Record this bridge in the per-user bridge index, and say how its prompts print commands: the
+/// short forms once it is registered, with plain `agentctl` when the `agentctl` on `PATH` is this
+/// build. A failure is logged and leaves the explicit forms, which need no lookup.
+fn register_for_discovery(state_root: &Path, registry: &Path) -> PromptCommands {
+    match crate::chat_lookup::register(state_root, registry) {
+        Ok(entry) => {
+            let bare = crate::chat_lookup::agentctl_on_path_is_this_build();
+            service_log(format!(
+                "agentctl: bridge registered for discovery in {}; prompts print `{} chat reply \
+                 ID` and the other short commands",
+                entry.display(),
+                if bare {
+                    "agentctl"
+                } else {
+                    "<this executable>"
+                }
+            ));
+            PromptCommands {
+                bare,
+                discoverable: true,
+            }
+        }
+        Err(error) => {
+            service_log(format!(
+                "agentctl: bridge not registered for discovery ({error}); prompts print the \
+                 explicit commands with --bridge-state and --request"
+            ));
+            PromptCommands::default()
+        }
+    }
 }
 
 /// Run with process-local settings; the saved configuration remains unchanged.
@@ -1065,8 +1104,15 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
     // its queue, which its wrapper drains, and it replies only through `chat reply` (#594
     // headless-slack-trial).
     let headless = manager.is_headless(&state.config().agent_name)?;
+    let prompt_commands = settings
+        .registry
+        .as_deref()
+        .map_or_else(PromptCommands::default, |registry| {
+            register_for_discovery(state_root, registry)
+        });
     let state = state
         .with_ignored_text_prefixes(settings.ignored_text_prefixes)?
+        .with_prompt_commands(prompt_commands)
         .with_reply_command_offered(offer_reply_command)
         .with_command_only_replies(headless)
         .with_receipt_when_started(headless);
@@ -7291,6 +7337,7 @@ mod tests {
                 reply_alias_range: None,
                 slack_format: Some(SlackFormat::Markdown),
                 slack_format_by_channel: std::collections::BTreeMap::new(),
+                labels: None,
             },
         )
         .expect("initialize state");
@@ -8782,6 +8829,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 reply_alias_range: None,
                 slack_format: Some(SlackFormat::Markdown),
                 slack_format_by_channel: std::collections::BTreeMap::new(),
+                labels: None,
             },
         )
         .expect("initialize state");
@@ -9434,6 +9482,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 reply_alias_range: None,
                 slack_format: Some(SlackFormat::Markdown),
                 slack_format_by_channel: std::collections::BTreeMap::new(),
+                labels: None,
             },
         )
         .expect("initialize state without opening helper");
@@ -9505,6 +9554,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 reply_alias_range: None,
                 slack_format: Some(SlackFormat::Markdown),
                 slack_format_by_channel: std::collections::BTreeMap::new(),
+                labels: None,
             },
         )
         .expect("initialize state");
@@ -9568,6 +9618,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 reply_alias_range: None,
                 slack_format: None,
                 slack_format_by_channel: std::collections::BTreeMap::new(),
+                labels: None,
             },
         )
         .expect("initialize state without opening helper");
@@ -9663,6 +9714,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 reply_alias_range: None,
                 slack_format: None,
                 slack_format_by_channel: std::collections::BTreeMap::new(),
+                labels: None,
             },
         )
         .expect("initialize state");
@@ -10058,6 +10110,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 reply_alias_range: None,
                 slack_format: Some(SlackFormat::Markdown),
                 slack_format_by_channel: std::collections::BTreeMap::new(),
+                labels: None,
             },
         )
         .expect("initialize state");
@@ -10135,7 +10188,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
         chat_runtime::deliver_request_with(&state, &delivery, &key, DrainOptions::default())
             .expect("deliver request");
         assert!(delivery.prompts.lock().expect("prompts")[0]
-            .contains("Include the line <CHAT_REPLY_001> at the beginning"));
+            .contains("Reply between a line <CHAT_REPLY_001> and a line"));
         let route = state
             .next_reply_route(&key)
             .expect("route")
@@ -11879,6 +11932,7 @@ esac
             reply_alias_range: None,
             slack_format: Some(SlackFormat::Markdown),
             slack_format_by_channel: std::collections::BTreeMap::new(),
+            labels: None,
         };
         let outbound = configured_outbound_join_timeout(&configuration);
         assert_eq!(outbound, Duration::from_secs(67));
@@ -12338,6 +12392,7 @@ esac
                 reply_alias_range: None,
                 slack_format: Some(SlackFormat::Markdown),
                 slack_format_by_channel: std::collections::BTreeMap::new(),
+                labels: None,
             },
         )
         .expect("initialize state");
@@ -13128,7 +13183,7 @@ esac
         let (_, state) = worker_bridge_state(&fixture, true);
         let (key, prompt) = delivered_worker_request(&state);
         assert!(
-            prompt.contains("Include the line <CHAT_REPLY_001> at the beginning"),
+            prompt.contains("Reply between a line <CHAT_REPLY_001> and a line"),
             "{prompt}"
         );
         let answers = ["first answer", "second answer", "third answer"];
@@ -13245,7 +13300,7 @@ esac
             let (_, state) = worker_bridge_state(&fixture, true);
             let (key, prompt) = delivered_worker_request(&state);
             assert!(
-                prompt.contains("Include the line <CHAT_REPLY_001> at the beginning"),
+                prompt.contains("Reply between a line <CHAT_REPLY_001> and a line"),
                 "{prompt}"
             );
             let screen = |answers: &[&str]| {
@@ -13596,7 +13651,7 @@ esac
         let (_, state) = worker_bridge_state(&fixture, true);
         let (key, prompt) = delivered_worker_request(&state);
         assert!(
-            prompt.contains("Include the line <CHAT_REPLY_001> at the beginning"),
+            prompt.contains("Reply between a line <CHAT_REPLY_001> and a line"),
             "{prompt}"
         );
         fixture.client.screens.lock().expect("screens").extend([
@@ -13794,7 +13849,7 @@ esac
         let prompts = fixture.client.runs.lock().expect("runs").clone();
         assert_eq!(prompts.len(), 1, "{prompts:#?}");
         assert!(
-            prompts[0].contains("Include the line <CHAT_REPLY_002> at the beginning"),
+            prompts[0].contains("Reply between a line <CHAT_REPLY_002> and a line"),
             "{}",
             prompts[0]
         );
@@ -13878,7 +13933,10 @@ esac
         let item: Value =
             serde_json::from_slice(&fs::read(&item).expect("read item")).expect("item JSON");
         let text = item["text"].as_str().expect("item text");
-        assert!(text.starts_with("Sent "), "{text}");
+        assert!(
+            text.starts_with("[from users/owner via fixture spaces/example · sent: "),
+            "{text}"
+        );
         assert!(
             !text.chars().any(|c| c.is_control() && c != '\n'),
             "{text:?}"
@@ -14110,6 +14168,7 @@ esac
                 reply_alias_range: None,
                 slack_format: Some(SlackFormat::Markdown),
                 slack_format_by_channel: std::collections::BTreeMap::new(),
+                labels: None,
             },
         )
         .expect("initialize state")
@@ -14783,7 +14842,7 @@ esac
         let prompts = fixture.client.runs.lock().expect("runs").clone();
         assert_eq!(prompts.len(), 1, "{prompts:#?}");
         assert!(
-            prompts[0].contains("Include the line <CHAT_REPLY_001> at the beginning"),
+            prompts[0].contains("Reply between a line <CHAT_REPLY_001> and a line"),
             "{}",
             prompts[0]
         );
@@ -15704,7 +15763,7 @@ esac
             prompts[0]
         );
         assert!(
-            prompts[1].contains("Include the line <CHAT_REPLY_002> at the beginning"),
+            prompts[1].contains("Reply between a line <CHAT_REPLY_002> and a line"),
             "{}",
             prompts[1]
         );
@@ -15762,7 +15821,7 @@ esac
         assert!(
             prompts
                 .iter()
-                .any(|prompt| prompt.contains("Include the line <CHAT_REPLY_002> at the beginning")),
+                .any(|prompt| prompt.contains("Reply between a line <CHAT_REPLY_002> and a line")),
             "{prompts:#?}"
         );
         // A read that saves one, such as a capture's, shows that the check above can see it.
@@ -15873,7 +15932,7 @@ in the reply block marked {id}, so that block was not sent."
         assert!(state
             .prompt(&key, "")
             .expect("prompt")
-            .contains("Include the line <CHAT_REPLY_001> at the beginning"));
+            .contains("Reply between a line <CHAT_REPLY_001> and a line"));
         let block = "<CHAT_REPLY_001>\nan answer meant for another request\n</CHAT_REPLY_001>\n";
         let mut routes = RouteCache::new(vec![state
             .next_reply_route(&key)
@@ -15951,7 +16010,7 @@ request. No open chat request has been sent to you."]
         assert!(state
             .prompt(&key, "")
             .expect("prompt")
-            .contains("Include the line <CHAT_REPLY_001> at the beginning"));
+            .contains("Reply between a line <CHAT_REPLY_001> and a line"));
         let mut routes = RouteCache::new(vec![state
             .next_reply_route(&key)
             .expect("route")
@@ -17171,7 +17230,7 @@ printf '{"version":1,"id":"%s","action":"send","ok":true,"receipt":{"message_id"
         let prompts = fixture.client.runs.lock().expect("runs").clone();
         assert_eq!(prompts.len(), 1, "{prompts:#?}");
         assert!(
-            prompts[0].contains("_001> at the beginning"),
+            prompts[0].contains("Reply between a line <CHAT_REPLY_001> and a line"),
             "{}",
             prompts[0]
         );
@@ -17400,7 +17459,7 @@ printf '{"version":1,"id":"%s","action":"send","ok":true,"receipt":{"message_id"
         let prompts = fixture.client.runs.lock().expect("runs").clone();
         assert_eq!(prompts.len(), 1, "{prompts:#?}");
         assert!(
-            prompts[0].contains("_001> at the beginning"),
+            prompts[0].contains("Reply between a line <CHAT_REPLY_001> and a line"),
             "{}",
             prompts[0]
         );

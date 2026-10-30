@@ -120,36 +120,62 @@ def _duration_words(seconds: int) -> str:
     return f"{minutes} min"
 
 
-def opening(created_at: str, now_nanos: int) -> str:
-    """The opening for a message created at ``created_at``, typed at ``now_nanos``."""
+def _when(created_at: str, now_nanos: int) -> str | None:
     instant = rfc3339_instant(created_at)
     if instant is None:
-        return ""
+        return None
     seconds, nanos, finer = instant
     stamp = _stamp(seconds)
     waited = now_nanos - (seconds * 1_000_000_000 + nanos + int(finer))
     if waited >= LATE_PROMPT_AFTER_SECONDS * 1_000_000_000:
-        return f"Sent {stamp}, delivered {_duration_words(waited // 1_000_000_000)} later. "
-    return f"Sent {stamp}. "
+        return f"{stamp}, delivered {_duration_words(waited // 1_000_000_000)} later"
+    return stamp
+
+
+def opening(created_at: str, now_nanos: int) -> str:
+    """The opening for a message created at ``created_at``, typed at ``now_nanos``."""
+    when = _when(created_at, now_nanos)
+    return "" if when is None else f"Sent {when}. "
+
+
+_FIELD_KEY = "sent: "
+
+
+def field(created_at: str, now_nanos: int) -> str:
+    """The header line's ``sent:`` field for a message created at ``created_at`` (#707
+    chat-prompt-anatomy), typed at ``now_nanos``."""
+    when = _when(created_at, now_nanos)
+    return "" if when is None else f"{_FIELD_KEY}{when}"
 
 
 def retime(text: str, sent_at: object, recorded: object, now_nanos: int | None = None) -> str:
     """The text to type for a queued prompt: ``recorded``, its opening, replaced by one for now.
 
-    The text is returned unchanged unless it begins with exactly the recorded opening and
-    ``sent_at`` is a readable create time, so a record that does not fit is never used to cut it.
+    An opening ``Sent ...`` must begin the text; a ``sent: ...`` header field must be in its first
+    line, and its first occurrence there is replaced. The text is returned unchanged unless the
+    recorded opening is where it belongs and ``sent_at`` is a readable create time, so a record
+    that does not fit is never used to cut it.
     """
-    if (not isinstance(sent_at, str) or not isinstance(recorded, str)
-            or not recorded.startswith("Sent ") or not text.startswith(recorded)
-            or rfc3339_instant(sent_at) is None):
+    if not isinstance(sent_at, str) or not isinstance(recorded, str) or rfc3339_instant(sent_at) is None:
+        return text
+    if recorded.startswith("Sent "):
+        if not text.startswith(recorded):
+            return text
+        at, render = 0, opening
+    elif recorded.startswith(_FIELD_KEY):
+        at = text.split("\n", 1)[0].find(recorded)
+        if at < 0:
+            return text
+        render = field
+    else:
         return text
     try:
         now = time.time_ns() if now_nanos is None else now_nanos
         # The compiled drain reads its clock in milliseconds; the same instant renders the same
         # text.
-        fresh = opening(sent_at, now // 1_000_000 * 1_000_000)
+        fresh = render(sent_at, now // 1_000_000 * 1_000_000)
     except (ArithmeticError, OSError, ValueError, TypeError):
         # A clock or calendar failure never stops a prompt being typed. Anything else, such as
         # the service's own shutdown signal, propagates.
         return text
-    return fresh + text[len(recorded):] if fresh else text
+    return text[:at] + fresh + text[at + len(recorded):] if fresh else text

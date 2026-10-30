@@ -1,6 +1,6 @@
 ---
 name: agentctl-chat
-description: Answer chat requests that the agentctl chat bridge types into your pane, and check what reached the chat. Use when a prompt says "The user's request arrived through the configured chat bridge", when you need to reply to a chat user, or when you need to confirm that a reply was sent.
+description: Answer chat requests that the agentctl chat bridge types into your pane, and check what reached the chat. Use when a prompt opens with a header like "[from NAME via slack #channel · sent: ... · reply: <CHAT_REPLY_007>]" and holds a <chat_message> block (older bridges said "The user's request arrived through the configured chat bridge"), when you need to reply to a chat user, or when you need to confirm that a reply was sent.
 ---
 
 # agentctl chat bridge: answering requests
@@ -16,24 +16,37 @@ by default). `chat grants` lists active and expired grants and `chat revoke`
 removes a temporary grant. A running bridge applies these changes without a
 restart; permanent owners remain allowed.
 
-This skill describes the compiled (Rust) bridge, whose prompts say "The user's
-request arrived through the configured chat bridge" and open with the message's
-send time. The Python edition (`py/bin/agentctl chat`) words its prompts
-differently, has no `sent` or `thread` command (it has `chat context --state`)
-and adds no send-time line or delivery ✅; follow its own `--help` and the
-instructions in the prompt it types. When a prompt prints a command, run it as
-printed: it normally starts with the absolute path of the service's own
-executable, so it is the right edition. A `chat thread` command that starts
-with plain `agentctl` (printed when that executable's file is gone) needs the
-compiled edition to be the `agentctl` on `PATH`.
+This skill describes the compiled (Rust) bridge. Its request prompt is one
+header line, the message between `<chat_message>` and `</chat_message>`, and a
+short footer:
+
+```text
+[from Ada Lovelace via slack #team-chat · sent: 2026.10.30:10:51 EDT · reply: <CHAT_REPLY_007> or agentctl chat reply 007]
+
+<chat_message>
+the message
+</chat_message>
+
+Reply between a line <CHAT_REPLY_007> and a line </CHAT_REPLY_007>, ...
+Earlier messages in this thread: agentctl chat thread 007
+If you have trouble, run: agentctl chat help 007
+```
+
+`agentctl chat help 007` prints this request's rules and exact commands. The
+short commands (`chat reply 007 --file FILE`, `chat sent 007`, `chat thread
+007`) find the bridge that serves you on their own; when a prompt prints an
+explicit command instead (with `--bridge-state` and `--request`, from an older
+bridge or one that could not register), run it as printed. The Python edition
+(`py/bin/agentctl chat`) words its prompts differently, has no `sent`, `thread`
+or `help` command (it has `chat context --state`) and adds no send-time field
+or delivery ✅; follow its own `--help` and the instructions in its prompts.
 
 For the compiled bridge, use the installed command as the authority:
 
-- `agentctl chat quickstart`
+- `agentctl chat help ID`
+- `agentctl chat sent ID`
+- `agentctl chat thread ID --last 20`
 - `agentctl chat userguide`
-- `agentctl chat sent --bridge-state DIR`
-- `agentctl chat thread --bridge-state DIR --thread THREAD --last 20`
-- `agentctl chat reply --help`
 
 ## Reply with the two marker lines
 
@@ -79,9 +92,10 @@ next replies for at least 5 minutes.
 
 ## The reply command is the exception
 
-When the bridge runs with `--offer-reply-command`, the prompt also prints an
-exact `agentctl chat reply ... --file PATH_TO_YOUR_REPLY` command. Use it only
-when the marker lines cannot do the job:
+When the bridge runs with `--offer-reply-command`, the header names `agentctl
+chat reply ID` (write the reply to a file and add `--file FILE`), and `agentctl
+chat help ID` gives the exact command. Use it only when the marker lines cannot
+do the job:
 
 - you must send something **before your turn ends**, and the text would not
   otherwise appear until then; or
@@ -96,22 +110,20 @@ so it is a safe way to show the owner what you sent.
 
 ## Check what reached the chat
 
-`agentctl chat sent --bridge-state DIR` lists the replies the bridge holds,
-newest first: request, reply number, phase, the provider's message ID once it is
-sent, and when it was captured and sent. Phase `sent` with a provider message ID
-means the chat provider accepted the message. `pending` means captured and not
-yet sent; `sending` means a send is in progress or its outcome is unknown, and
-the bridge retries it with the same operation ID, so it is never posted twice.
-`agentctl chat thread` shows one thread's retained requests and replies in
-order. A retired request's replies are no longer held, so the chat thread
-itself remains the complete record. The state directory is the `--bridge-state`
-argument of the prompt's `chat thread` command (printed for a reply in an
-existing thread) or its `chat reply` command (printed when the bridge offers
-it); either can be left out when it cannot be printed safely. Otherwise it is
-the `--bridge-state` of the service's `agentctl chat run` command, which the
-owner or the deployment's notes give.
+`agentctl chat sent ID` lists the replies the bridge holds for that request,
+newest first (without an ID, every retained request's): reply number, phase,
+the provider's message ID once it is sent, and when it was captured and sent.
+Phase `sent` with a provider message ID means the chat provider accepted the
+message. `pending` means captured and not yet sent; `sending` means a send is
+in progress or its outcome is unknown, and the bridge retries it with the same
+operation ID, so it is never posted twice. `agentctl chat thread ID` shows the
+request's thread: its retained requests and replies in order. A retired
+request's replies are no longer held, so the chat thread itself remains the
+complete record. If a command cannot find the bridge, add `--bridge-state DIR`:
+the state directory `agentctl chat help ID` names, or the `--bridge-state` of
+the service's `agentctl chat run` command.
 
-## What the reactions and the first line mean
+## What the reactions and the header mean
 
 - The acknowledgement reaction (configured per deployment, for example 👀) is
   added when the bridge admits the message.
@@ -122,9 +134,10 @@ owner or the deployment's notes give.
   prompt was not delivered. An older deployment whose acknowledgement reaction
   is itself ✅ uses it to acknowledge admission instead; it can appear before
   or after the prompt reaches you, and no separate delivery receipt is added.
-- Each prompt's first line opens with the message's own send time, as
-  `Sent 2026.10.07:08:45 EDT.`, and says `delivered 1 h 12 min later` when it
-  reached you two minutes or more after that. Several held messages can arrive
+- The header's `sent:` field gives the message's own send time, as
+  `sent: 2026.10.07:08:45 EDT`, and adds `delivered 1 h 12 min later` when it
+  reached you two minutes or more after that (older bridges opened the prompt
+  with `Sent 2026.10.07:08:45 EDT.`). Several held messages can arrive
   together after an outage or a long turn; answer them knowing how old they
   are.
 

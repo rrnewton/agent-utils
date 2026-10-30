@@ -224,6 +224,7 @@ mod tests {
             reply_alias_range: None,
             slack_format: None,
             slack_format_by_channel: Default::default(),
+            labels: None,
         }
     }
 

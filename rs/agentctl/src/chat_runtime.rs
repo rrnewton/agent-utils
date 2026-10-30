@@ -96,6 +96,10 @@ const MAX_FEEDBACK_ID_BYTES: usize = 256;
 const MAX_REPORTED_REPLY_MARKERS: usize = MAX_VISIBLE_MARKERS;
 const MAX_FENCE_FEEDBACK_PROMPT_BYTES: usize = 64 * 1_024;
 const MAX_FENCE_FEEDBACK_BYTES: usize = 2 * 1_024 * 1_024;
+// The tag lines a request prompt puts around the sender's message (#707 chat-prompt-anatomy). They
+// are stable: tools and agents may rely on them.
+pub(crate) const PROMPT_MESSAGE_OPEN: &str = "<chat_message>";
+pub(crate) const PROMPT_MESSAGE_CLOSE: &str = "</chat_message>";
 // A reply alias is the short reply ID, `001` onward, that a request prompt shows in place of
 // `<nonce>_<ordinal>`: at least this many digits, zero padded, and at most as many as a u64 has.
 const MIN_REPLY_ALIAS_DIGITS: usize = 3;
@@ -710,6 +714,10 @@ pub struct BridgeConfiguration {
     /// Per-channel Slack outbound format, overriding `slack_format`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub slack_format_by_channel: BTreeMap<String, SlackFormat>,
+    /// Names a request prompt's header line prints for senders and channels in place of their
+    /// provider IDs: see [`PromptLabels`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels: Option<PromptLabels>,
     /// Top-level keys this build does not know: kept when the configuration is written back,
     /// otherwise ignored.
     #[serde(flatten)]
@@ -734,6 +742,56 @@ fn warn_unknown_keys(path: &Path, unknown: &BTreeMap<String, Value>) {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if warned.insert(warning.clone()) {
         eprintln!("{warning}");
+    }
+}
+
+/// Display names for a request prompt's header line (#707 chat-prompt-anatomy):
+/// `[from SENDER via PROVIDER CHANNEL ...]` prints `senders[sender ID]` and `channels[channel ID]`
+/// where they are given, and the provider IDs otherwise. A sender label is words joined by single
+/// spaces; neither kind holds `·`, `]`, a line break or another control character, and each is at
+/// most 64 bytes.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PromptLabels {
+    /// Provider sender ID to display name, such as `"U0EXAMPLE": "Ada Lovelace"`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub senders: BTreeMap<String, String>,
+    /// Provider channel ID to display name, such as `"C0EXAMPLE": "#team-chat"`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub channels: BTreeMap<String, String>,
+}
+
+/// Longest label [`PromptLabels`] accepts, in bytes.
+const MAX_PROMPT_LABEL_BYTES: usize = 64;
+
+impl PromptLabels {
+    fn validate(&self) -> Result<()> {
+        for (id, label) in &self.senders {
+            if label.len() > MAX_PROMPT_LABEL_BYTES
+                || label.chars().any(char::is_control)
+                || !crate::sender_header::is_sender_label(label)
+            {
+                return Err(ChatRuntimeError::invalid(format!(
+                    "labels.senders[{id:?}] must be words joined by single spaces, without `·`, \
+                     `]` or ` via `, at most {MAX_PROMPT_LABEL_BYTES} bytes"
+                )));
+            }
+        }
+        for (id, label) in &self.channels {
+            if label.trim().is_empty()
+                || label.trim() != label
+                || label.len() > MAX_PROMPT_LABEL_BYTES
+                || label
+                    .chars()
+                    .any(|c| c.is_control() || matches!(c, '·' | ']'))
+            {
+                return Err(ChatRuntimeError::invalid(format!(
+                    "labels.channels[{id:?}] must be one nonblank line without `·` or `]`, at \
+                     most {MAX_PROMPT_LABEL_BYTES} bytes, with no leading or trailing space"
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -844,6 +902,9 @@ impl BridgeConfiguration {
         }
         if let Some(outbound) = &self.outbound_command {
             outbound.validate()?;
+        }
+        if let Some(labels) = &self.labels {
+            labels.validate()?;
         }
         if let Some(range) = self.reply_alias_range {
             if range.first == 0 || range.first > range.last {
@@ -5244,6 +5305,20 @@ impl Drop for RunnerLease {
     }
 }
 
+/// How request prompts, reply reminders and `chat help` print agentctl commands (#707
+/// chat-prompt-anatomy). The default prints the explicit forms, with this executable's absolute
+/// path, the state directory and the request key, as every release before it did.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PromptCommands {
+    /// Print the program as plain `agentctl`: the `agentctl` on this process's `PATH` is this
+    /// build (see [`agentctl_on_path_is_this_build`]), so an agent with the same `PATH` runs it.
+    pub bare: bool,
+    /// Print the short forms, `chat reply REPLY_ID --file FILE`, `chat thread REPLY_ID`, `chat sent
+    /// REPLY_ID` and `chat help REPLY_ID`, with no state directory or request key: the bridge is
+    /// registered where an agent's `agentctl chat` finds it by caller lookup.
+    pub discoverable: bool,
+}
+
 /// Private, restartable durable state for one coordinator bridge.
 #[derive(Clone, Debug)]
 pub struct BridgeState {
@@ -5253,6 +5328,8 @@ pub struct BridgeState {
     ignored_text_prefixes: Arc<[String]>,
     // Whether request prompts name the `chat reply` command; also process-local.
     offer_reply_command: bool,
+    // How request prompts print agentctl commands; also process-local.
+    prompt_commands: PromptCommands,
     // Whether the coordinator's screen is never read, as for a headless agent, so request prompts
     // give only the `chat reply` command and no marker lines; also process-local.
     command_only_replies: bool,
@@ -5393,6 +5470,7 @@ impl BridgeState {
             config,
             ignored_text_prefixes: Arc::from([]),
             offer_reply_command: false,
+            prompt_commands: PromptCommands::default(),
             command_only_replies: false,
             receipt_when_started: false,
             typed_retirements: Arc::default(),
@@ -5491,6 +5569,7 @@ impl BridgeState {
             config: envelope.config,
             ignored_text_prefixes: Arc::from([]),
             offer_reply_command: false,
+            prompt_commands: PromptCommands::default(),
             command_only_replies: false,
             receipt_when_started: false,
             typed_retirements: Arc::default(),
@@ -5537,6 +5616,14 @@ impl BridgeState {
     #[must_use]
     pub fn with_reply_command_offered(mut self, offered: bool) -> Self {
         self.offer_reply_command = offered;
+        self
+    }
+
+    /// Set how request prompts print agentctl commands: see [`PromptCommands`]. Process-local,
+    /// never saved.
+    #[must_use]
+    pub fn with_prompt_commands(mut self, commands: PromptCommands) -> Self {
+        self.prompt_commands = commands;
         self
     }
 
@@ -8397,7 +8484,7 @@ impl BridgeState {
     /// [`Self::reveal_reply_alias`].
     pub fn prompt(&self, key: &str, screen: &str) -> Result<String> {
         self.prompt_opened(key, screen, &|created_at| {
-            crate::prompt_time::opening(created_at, crate::prompt_time::now_millis())
+            crate::prompt_time::field(created_at, crate::prompt_time::now_millis())
         })
     }
 
@@ -8412,15 +8499,21 @@ impl BridgeState {
             .map(|_| record.message.text.trim().to_owned())
     }
 
-    /// [`Self::prompt`] as it is queued for the coordinator: its opening is left for the queue to
-    /// decide when the prompt is typed, which may be long after it is queued. See `prompt_time`.
+    /// [`Self::prompt`] as it is queued for the coordinator: its `sent:` field is left for the
+    /// queue to decide when the prompt is typed, which may be long after it is queued. See
+    /// `prompt_time`.
     pub(crate) fn queued_prompt(&self, key: &str, screen: &str) -> Result<String> {
         self.prompt_opened(key, screen, &|created_at| {
-            crate::prompt_time::deferred(created_at, "")
+            crate::prompt_time::deferred_field(created_at)
         })
     }
 
-    /// The request prompt, its first line begun by `open` applied to the message's create time.
+    /// The request prompt (#707 chat-prompt-anatomy): one header line in the grammar of
+    /// `agentctl send`'s sender header, whose `sent:` field is `open` applied to the message's
+    /// create time (left out when that is empty), a blank line, the message between the
+    /// [`PROMPT_MESSAGE_OPEN`] and [`PROMPT_MESSAGE_CLOSE`] tag lines, a blank line, and a short
+    /// footer: how to reply, the thread command for a reply in an existing thread, and the
+    /// `chat help` command, which explains the rest.
     fn prompt_opened(
         &self,
         key: &str,
@@ -8428,15 +8521,18 @@ impl BridgeState {
         open: &dyn Fn(&str) -> String,
     ) -> Result<String> {
         let record = self.read_request(key)?;
-        let context = self.prompt_context(&record.message);
-        let sent = open(&record.message.created_at);
+        let message = &record.message;
+        let mut fields = Vec::new();
+        let sent = open(&message.created_at);
+        if !sent.is_empty() {
+            fields.push(sent);
+        }
+        let body = self.prompt_body(message);
         if !self.config.outbound_enabled {
             return Ok(format!(
-                "{sent}The user's request arrived through your configured inbound-only chat bridge.\n\
-{context}\n\
-{}\n\n\
-Complete this request using your normal instructions and tools. Outbound chat is disabled for this bridge; do not emit CHAT_REPLY fences.",
-                record.message.text,
+                "{}\n\n{body}\n\nOutbound chat is off for this bridge: nothing you write reaches \
+the chat, so write no reply markers.",
+                self.prompt_header(message, &fields),
             ));
         }
         // A request first prompted by a release without reply aliases keeps its long ID. So does
@@ -8449,22 +8545,41 @@ Complete this request using your normal instructions and tools. Outbound chat is
         // is out of view, or when it is a `❯` row first in a capture, which is skipped as Claude
         // Code's pinned copy. If the closing marker line also stands alone on a row, the text
         // before it can then be reported or, by a joined read, posted; the chat userguide states
-        // the limit.
+        // the limit. Every marker here is followed on its row by more text, so no row the prompt
+        // wraps into is a marker line unless the terminal is narrower than the marker and a word.
+        // Several replies stay welcome, split by time and by topic (#435 chat-reply-splitting).
         let (reply_id, numbering) = match self.reveal_reply_alias(key, screen) {
             Ok(alias) => (
                 format_reply_alias(alias),
-                "Use the same two lines for every reply, with no tool call between them.",
+                "send several replies when that helps (progress updates, one reply per topic), \
+each in its own pair.",
             ),
             Err(_) => (
                 format!("{}_{}", record.reply_nonce, record.next_reply_ordinal),
-                "For every later reply, add one to the last number in both lines, and make no tool \
-call between them.",
+                "send several replies when that helps (progress updates, one reply per topic), \
+adding one to the last number in both lines for each later reply.",
             ),
         };
+        let executable = || env::current_exe();
         let command = self
             .offer_reply_command
-            .then(|| self.reply_command(env::current_exe(), key, &reply_id))
+            .then(|| self.reply_command(executable(), key, &reply_id))
             .flatten();
+        let short_command = command
+            .as_ref()
+            .filter(|_| self.prompt_commands.discoverable)
+            .and_then(|_| self.short_reply_command(executable(), &reply_id));
+        let mut footer = Vec::new();
+        if message.thread_reply {
+            if let Some(thread) =
+                self.thread_history_command(executable(), key, &message.thread_id, &reply_id)
+            {
+                footer.push(format!("Earlier messages in this thread: {thread}"));
+            }
+        }
+        if let Some(help) = self.help_command(executable(), key, &reply_id) {
+            footer.push(format!("If you have trouble, run: {help}"));
+        }
         if self.command_only_replies {
             let Some(command) = command else {
                 return Err(ChatRuntimeError::invalid(
@@ -8474,123 +8589,251 @@ call between them.",
                      to reply",
                 ));
             };
-            return Ok(format!(
-                "{sent}The user's request arrived through the configured chat bridge.\n\
-{context}\n\
-{}\n\n\
-Complete this request using your normal instructions and tools. You may send one or multiple \
-replies, including progress updates; answer separate topics in separate replies. Nothing you \
-print reaches the user: send each reply by writing its text to a file and running this command \
-with the file's path in place of PATH_TO_YOUR_REPLY: {command}\nRun it once for each reply; \
-running it again with the same text does not send that text twice. If it fails, read its error, \
-fix the cause and run it again.",
-                record.message.text,
-            ));
-        }
-        let mut prompt = format!(
-            "{sent}The user's request arrived through the configured chat bridge.\n\
-{context}\n\
-{}\n\n\
-Complete this request using your normal instructions and tools. You may send one or multiple replies, including progress updates; answer separate topics in \
-separate replies. Include the line <CHAT_REPLY_{reply_id}> at the beginning of your response and end with </CHAT_REPLY_{reply_id}>. \
-Lines between will be sent to the user as a chat message. {numbering}",
-            record.message.text,
-        );
-        // Offered only with the two lines, so a reply has a way out when the command fails.
-        if let Some(command) = command {
-            prompt.push_str(&format!(
-                "\n\nReply between the two lines as usual: that text reaches the user both in \
-this terminal and in the chat. Only to send a reply before your turn ends, or to resend one \
-written between the two lines that did not reach the chat, write its text to a file, without \
-the two lines, and run this command with the file's path in place of PATH_TO_YOUR_REPLY: \
-{command}\nRun it once for each reply; running it again with the same text \
-does not send that text twice. Send each reply one way only, by this command or between the two \
-lines, not both. If the command fails twice for a reply, print that reply between the two lines \
-at the end of your turn instead."
-            ));
-        }
-        Ok(prompt)
-    }
-
-    /// The lines that follow the first line of every request prompt: source, sender, thread, any
-    /// quoted message, and for a reply in an existing thread the command that prints its earlier
-    /// messages.
-    ///
-    /// Identifiers are kept on one line, quoted text is sanitized, shortened if long, and every
-    /// line of it prefixed with `> `, or an empty line with `>`, and reply syntax in either is
-    /// neutralized, so nothing here can end the front matter early, form a standalone reply marker
-    /// or open a code fence however the terminal wraps it, or put a character in the pane that
-    /// makes a later capture fail.
-    fn prompt_context(&self, message: &SavedMessage) -> String {
-        let mut context = format!(
-            "Source: {}\nSender: {}\nThread: {} ({})\n",
-            single_line(&message.message_id),
-            single_line(&message.sender_id),
-            single_line(&message.thread_id),
-            if message.thread_reply {
-                "a reply in an existing thread"
-            } else {
-                "this message starts a new thread"
-            },
-        );
-        if let Some(quoted) = quoted_parent(message) {
-            context.push_str(&quoted);
-        }
-        if message.thread_reply {
-            if let Some(command) = self.thread_history_command(&message.thread_id) {
-                context.push_str("To read earlier messages in this thread, run: ");
-                context.push_str(&command);
-                context.push('\n');
+            if let Some(short) = &short_command {
+                fields.push(format!("reply: {short} --file FILE"));
             }
+            let command = short_command.map_or(command, |short| format!("{short} --file FILE"));
+            footer.insert(
+                0,
+                format!(
+                    "Nothing you print reaches the chat: send each reply by writing it to a file \
+and running this, once per reply: {command}"
+                ),
+            );
+        } else {
+            fields.push(match &short_command {
+                Some(short) => format!("reply: <CHAT_REPLY_{reply_id}> or {short}"),
+                None => format!("reply: <CHAT_REPLY_{reply_id}>"),
+            });
+            footer.insert(
+                0,
+                format!(
+                    "Reply between a line <CHAT_REPLY_{reply_id}> and a line \
+</CHAT_REPLY_{reply_id}>, with no tool call between them; {numbering}"
+                ),
+            );
         }
-        context
+        Ok(format!(
+            "{}\n\n{body}\n\n{}",
+            self.prompt_header(message, &fields),
+            footer.join("\n")
+        ))
     }
 
-    /// The exact `chat thread` command for this state and thread, or `None` when a word of it
-    /// cannot be printed safely on one line. A command holding reply syntax is not printed at
-    /// all, because a neutralized word would name a different state or thread.
-    fn thread_history_command(&self, thread_id: &str) -> Option<String> {
-        let root = std::path::absolute(&self.root).ok()?;
-        let command = format!(
-            "{} chat thread --bridge-state {} --thread {} --last {DEFAULT_THREAD_HISTORY_MESSAGES}",
-            history_program(env::current_exe()),
-            shell_word(root.to_str()?)?,
-            shell_word(thread_id)?,
+    /// The prompt's header line: `[from SENDER via PROVIDER CHANNEL · FIELD ...]`, with the
+    /// sender's and channel's labels from the configuration's `labels`, or their provider IDs.
+    /// Fields that would break the header's grammar are left out.
+    fn prompt_header(&self, message: &SavedMessage, fields: &[String]) -> String {
+        let labels = self.config.labels.as_ref();
+        let sender = labels
+            .and_then(|labels| labels.senders.get(&message.sender_id))
+            .map_or_else(
+                || header_words(&message.sender_id),
+                |label| header_words(label),
+            );
+        let channel = labels
+            .and_then(|labels| labels.channels.get(&message.channel_id))
+            .map_or_else(
+                || header_words(&message.channel_id),
+                |label| header_words(label),
+            );
+        let mut header = format!(
+            "[from {sender} via {} {channel}",
+            header_words(&self.config.subscription_plugin)
         );
+        for field in fields {
+            if field.contains(['·', ']', '\n']) {
+                continue;
+            }
+            header.push_str(crate::sender_header::SEPARATOR);
+            header.push_str(field);
+        }
+        header.push(']');
+        header
+    }
+
+    /// The message between its tag lines, after any quoted message. A line of the message that
+    /// is a tag line is printed with `<\/` in place of `</` (or `<\` in place of `<`), so the
+    /// message cannot close its fence early.
+    fn prompt_body(&self, message: &SavedMessage) -> String {
+        let mut body = String::new();
+        if let Some(quoted) = quoted_parent(message) {
+            body.push_str(&quoted);
+        }
+        body.push_str(PROMPT_MESSAGE_OPEN);
+        body.push('\n');
+        for line in message.text.split('\n') {
+            let tag = line.trim_end_matches('\r').trim();
+            if tag == PROMPT_MESSAGE_CLOSE {
+                body.push_str(&line.replacen("</", "<\\/", 1));
+            } else if tag == PROMPT_MESSAGE_OPEN {
+                body.push_str(&line.replacen('<', "<\\", 1));
+            } else {
+                body.push_str(line);
+            }
+            body.push('\n');
+        }
+        body.push_str(PROMPT_MESSAGE_CLOSE);
+        body
+    }
+
+    /// The prompt's header line with no fields, then any quoted message: the text of a prompt that
+    /// comes from the provider rather than from the bridge or the sender's message.
+    #[cfg(test)]
+    fn prompt_context(&self, message: &SavedMessage) -> String {
+        format!(
+            "{}\n{}",
+            self.prompt_header(message, &[]),
+            quoted_parent(message).unwrap_or_default()
+        )
+    }
+
+    /// The program word of the commands a prompt prints: `agentctl` when the `agentctl` on this
+    /// process's `PATH` is this build (see [`PromptCommands`]), else this executable's absolute
+    /// path; `None` when neither can be printed.
+    fn program_word(&self, executable: io::Result<PathBuf>) -> Option<String> {
+        if self.prompt_commands.bare {
+            return Some("agentctl".to_owned());
+        }
+        executable_word(executable)
+    }
+
+    /// `PROGRAM chat reply REPLY_ID` for a bridge that agents find by caller lookup, or `None`
+    /// when a word of it cannot be printed safely.
+    fn short_reply_command(
+        &self,
+        executable: io::Result<PathBuf>,
+        reply_id: &str,
+    ) -> Option<String> {
+        let id = shell_word(reply_id)?;
+        let command = if reply_id.starts_with('-') {
+            format!(
+                "{} chat reply --reply-id {id}",
+                self.program_word(executable)?
+            )
+        } else {
+            format!("{} chat reply {id}", self.program_word(executable)?)
+        };
+        (neutral_capture_syntax(&command) == command).then_some(command)
+    }
+
+    /// The command that prints a thread's earlier messages: `PROGRAM chat thread REPLY_ID` for a
+    /// bridge that agents find by caller lookup, else the explicit `chat thread --bridge-state DIR
+    /// --thread THREAD --last N`, or `None` when a word of it cannot be printed safely on one
+    /// line. A command holding reply syntax is not printed at all, because a neutralized word
+    /// would name a different state or thread.
+    fn thread_history_command(
+        &self,
+        executable: io::Result<PathBuf>,
+        _key: &str,
+        thread_id: &str,
+        reply_id: &str,
+    ) -> Option<String> {
+        let command = if self.prompt_commands.discoverable {
+            format!(
+                "{} chat thread {}",
+                self.program_word(executable)?,
+                positional_word(reply_id)?
+            )
+        } else {
+            let root = std::path::absolute(&self.root).ok()?;
+            format!(
+                "{} chat thread --bridge-state {} --thread {} --last {DEFAULT_THREAD_HISTORY_MESSAGES}",
+                history_program(executable),
+                shell_word(root.to_str()?)?,
+                shell_word(thread_id)?,
+            )
+        };
+        (neutral_capture_syntax(&command) == command).then_some(command)
+    }
+
+    /// The `chat help` command for a request's reply ID: `PROGRAM chat help REPLY_ID`, with
+    /// `--bridge-state DIR` unless agents find the bridge by caller lookup; `None` when a word of
+    /// it cannot be printed safely.
+    fn help_command(
+        &self,
+        executable: io::Result<PathBuf>,
+        _key: &str,
+        reply_id: &str,
+    ) -> Option<String> {
+        let command = if self.prompt_commands.discoverable {
+            format!(
+                "{} chat help {}",
+                self.program_word(executable)?,
+                positional_word(reply_id)?
+            )
+        } else {
+            let root = std::path::absolute(&self.root).ok()?;
+            format!(
+                "{} chat help --bridge-state {} {}",
+                executable_word(executable)?,
+                shell_word(root.to_str()?)?,
+                positional_word(reply_id)?,
+            )
+        };
         (neutral_capture_syntax(&command) == command).then_some(command)
     }
 
     /// The exact `chat sent` command that lists the replies this state holds for request `key`,
-    /// or `None` when a word of it cannot be printed safely on one line, as for
+    /// whose reply ID is `reply_id`: `PROGRAM chat sent REPLY_ID` for a bridge that agents find
+    /// by caller lookup, else the explicit `chat sent --bridge-state DIR --request KEY`; `None`
+    /// when a word of it cannot be printed safely on one line, as for
     /// [`Self::thread_history_command`]. A reply reminder prints it so the coordinator can tell a
     /// reply the bridge captured from one it never received before sending anything again.
-    fn sent_command(&self, key: &str) -> Option<String> {
-        let root = std::path::absolute(&self.root).ok()?;
-        let command = format!(
-            "{} chat sent --bridge-state {} --request {}",
-            history_program(env::current_exe()),
-            shell_word(root.to_str()?)?,
-            shell_word(key)?,
-        );
+    fn sent_command(&self, key: &str, reply_id: &str) -> Option<String> {
+        let command = if self.prompt_commands.discoverable {
+            format!(
+                "{} chat sent {}",
+                self.program_word(env::current_exe())?,
+                positional_word(reply_id)?
+            )
+        } else {
+            let root = std::path::absolute(&self.root).ok()?;
+            format!(
+                "{} chat sent --bridge-state {} --request {}",
+                history_program(env::current_exe()),
+                shell_word(root.to_str()?)?,
+                shell_word(key)?,
+            )
+        };
         (neutral_capture_syntax(&command) == command).then_some(command)
     }
 
-    /// The exact `chat reply` command for this state, request and reply ID, run by `executable`,
-    /// with `PATH_TO_YOUR_REPLY` in place of the reply file, or `None` when no file is at the
-    /// executable's path, a word of it cannot be printed safely on one line, or the command holds
-    /// reply syntax, as for [`Self::thread_history_command`]. Unlike that command, it is never
-    /// printed with the bare `agentctl`, which could run another build or none: the agent runs it
-    /// to send a reply.
+    /// The `chat reply` command for this state, request and reply ID: `PROGRAM chat reply
+    /// REPLY_ID --file FILE` for a bridge that agents find by caller lookup, else the explicit
+    /// `EXECUTABLE chat reply --bridge-state DIR --request KEY --reply-id ID --file
+    /// PATH_TO_YOUR_REPLY`, run by `executable`; `None` when no file is at the executable's path,
+    /// a word of it cannot be printed safely on one line, or the command holds reply syntax, as
+    /// for [`Self::thread_history_command`]. The explicit form is never printed with the bare
+    /// `agentctl`, which could run another build or none: the agent runs it to send a reply.
     fn reply_command(
         &self,
         executable: io::Result<PathBuf>,
         key: &str,
         reply_id: &str,
     ) -> Option<String> {
+        if self.prompt_commands.discoverable {
+            return self
+                .short_reply_command(executable, reply_id)
+                .map(|short| format!("{short} --file FILE"));
+        }
         let root = std::path::absolute(&self.root).ok()?;
         let command = format!(
             "{} chat reply --bridge-state {} --request {key} --reply-id {} --file PATH_TO_YOUR_REPLY",
             executable_word(executable)?,
+            shell_word(root.to_str()?)?,
+            shell_word(reply_id)?,
+        );
+        (neutral_capture_syntax(&command) == command).then_some(command)
+    }
+
+    /// The explicit `chat reply` command, whatever [`PromptCommands`] says: `chat help` prints it
+    /// as the last resort, for when caller lookup cannot find the bridge.
+    pub(crate) fn explicit_reply_command(&self, key: &str, reply_id: &str) -> Option<String> {
+        let root = std::path::absolute(&self.root).ok()?;
+        let command = format!(
+            "{} chat reply --bridge-state {} --request {key} --reply-id {} --file FILE",
+            history_program(env::current_exe()),
             shell_word(root.to_str()?)?,
             shell_word(reply_id)?,
         );
@@ -9490,6 +9733,121 @@ stay held until an operator repairs or deletes it, and deleting it forgets which
 
     fn reply_alias_path(&self) -> PathBuf {
         self.root.join("reply-aliases.json")
+    }
+
+    /// The thread of request `key`, for `agentctl chat thread REPLY_ID`.
+    ///
+    /// # Errors
+    ///
+    /// No retained request has this key, or its record cannot be read.
+    pub fn thread_of_request(&self, key: &str) -> Result<String> {
+        let _snapshot = self.lock_state_snapshot()?;
+        Ok(self.read_request(key)?.message.thread_id)
+    }
+
+    /// The page `agentctl chat help REPLY_ID` prints for request `key` of this state (#707
+    /// chat-prompt-anatomy): the rules a request prompt used to spell out, with this request's
+    /// commands, printed as [`PromptCommands`] says, and the explicit `chat reply` command last.
+    /// It spells the marker lines out in parts, so no line of it forms a marker.
+    #[must_use]
+    pub fn help_page(&self, reply_id: &str, key: &str) -> String {
+        let executable = || env::current_exe();
+        let mut page = format!(
+            "Chat request {reply_id}: request {key} of the bridge {} (agent {}).\n\n",
+            self.root.display(),
+            self.config.agent_name
+        );
+        if !self.config.outbound_enabled {
+            page.push_str(
+                "Outbound chat is off for this bridge: nothing you write reaches the chat, so \
+write no reply markers and send no replies.\n",
+            );
+            return page;
+        }
+        let numbering = if parse_reply_alias(reply_id).is_some() {
+            "Use the same two lines for every reply to this request"
+        } else {
+            "For each later reply to this request, add one to the last number in both lines"
+        };
+        let reply = self
+            .reply_command(executable(), key, reply_id)
+            .unwrap_or_else(|| "(the command cannot be printed for this request)".to_owned());
+        if self.command_only_replies {
+            page.push_str(&format!(
+                "This bridge never reads your screen: nothing you print reaches the chat. Send \
+each reply by writing it to a file and running:\n  {reply}\nRunning it again with the same text \
+sends that text once. If it fails, read its error, fix the cause and run it again.\n"
+            ));
+        } else {
+            page.push_str(&format!(
+                "The normal way to reply: print the reply as ordinary text between two marker \
+lines, each alone on its line and outside code fences. The opening line is `<CHAT_REPLY_`, then \
+{reply_id}, then `>`; the closing line is `</CHAT_REPLY_`, then {reply_id}, then `>`. The text \
+between them reaches the chat and also stays in your terminal, where the owner may be reading. \
+{numbering}, make no tool call between them, and give each reply new wording: a text the request \
+already sent is not sent again. Several replies are welcome: acknowledge long work at once, send \
+real progress, and answer separate topics in separate replies.\n\n\
+Use the command instead only when the marker lines cannot do the job: to send a reply before \
+your turn ends, such as a progress update during long work, or to send again a reply written \
+between the lines that did not reach the chat (a `Chat reply not sent` notice, or `chat sent` \
+does not list it). Write the reply to a file, without the marker lines, and run:\n  {reply}\n\
+Running it again with the same text sends that text once. Send each reply one way only, by the \
+command or between the lines. If the command fails twice for a reply, print that reply between \
+the lines at the end of your turn instead.\n"
+            ));
+        }
+        if let Some(sent) = self.sent_command(key, reply_id) {
+            page.push_str(&format!("\nWhat reached the chat:\n  {sent}\n"));
+        }
+        if let Ok(thread) = self.thread_of_request(key) {
+            if let Some(command) = self.thread_history_command(executable(), key, &thread, reply_id)
+            {
+                page.push_str(&format!("Earlier messages in this thread:\n  {command}\n"));
+            }
+        }
+        if self.prompt_commands.discoverable {
+            if let Some(explicit) = self.explicit_reply_command(key, reply_id) {
+                page.push_str(&format!(
+                    "\nIf `agentctl` cannot find this bridge from where you run it, the explicit \
+form works anywhere:\n  {explicit}\n"
+                ));
+            }
+        }
+        page.push_str("\nThe whole protocol: agentctl chat userguide\n");
+        page
+    }
+
+    /// The key of the request whose prompt gave reply ID `identifier` (#707 chat-prompt-anatomy):
+    /// a short alias this state assigned, or a long `<nonce>_<ordinal>` ID whose nonce is one of
+    /// its retained requests'. `None` when no request here gave it; a retired request's alias is
+    /// still found, so `chat reply` can say it is retired. Reads under the shared state lock.
+    ///
+    /// # Errors
+    ///
+    /// The state, its alias record or a request record cannot be read.
+    pub fn request_for_reply_id(&self, identifier: &str) -> Result<Option<String>> {
+        let _snapshot = self.lock_state_snapshot()?;
+        if let Some(alias) = parse_reply_alias(identifier) {
+            let record = self.read_reply_aliases()?;
+            return Ok(record
+                .aliases
+                .iter()
+                .find(|entry| entry.alias == alias)
+                .map(|entry| entry.request_key.clone()));
+        }
+        let Some((nonce, _)) = identifier.rsplit_once('_') else {
+            return Ok(None);
+        };
+        if !has_reply_ordinal(identifier) {
+            return Ok(None);
+        }
+        for (path, key) in self.request_paths()? {
+            let (record, _) = self.load_request_record(&path, &key)?;
+            if record.reply_nonce == nonce {
+                return Ok(Some(key));
+            }
+        }
+        Ok(None)
     }
 
     fn read_reply_aliases(&self) -> Result<ReplyAliasRecord> {
@@ -15745,6 +16103,19 @@ fn quoted_end(text: &str) -> Option<usize> {
 /// A provider value printed on one line: every control character and Unicode line or paragraph
 /// separator becomes U+FFFD, so the value cannot end its line or make a later capture fail, and
 /// no reply marker or code fence can form in it.
+/// `value` as words of a request prompt's header line: on one line, its reply syntax neutralized,
+/// `·` and `]` replaced by `-`, and white space runs as single spaces; `unknown` when nothing is
+/// left.
+fn header_words(value: &str) -> String {
+    let line = single_line(value).replace(['·', ']'], "-");
+    let words = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    if words.is_empty() {
+        "unknown".to_owned()
+    } else {
+        words
+    }
+}
+
 fn single_line(value: &str) -> String {
     neutral_capture_syntax(
         &value
@@ -16053,6 +16424,17 @@ fn shell_word(value: &str) -> Option<String> {
 /// it. With no such word, it is the bare `agentctl`.
 fn history_program(executable: io::Result<PathBuf>) -> String {
     executable_word(executable).unwrap_or_else(|| "agentctl".to_owned())
+}
+
+/// A reply ID as the last, positional word of a command: after `--` when it starts with `-`, so
+/// it is not read as an option; `None` when it cannot be printed as one shell word.
+fn positional_word(reply_id: &str) -> Option<String> {
+    let word = shell_word(reply_id)?;
+    Some(if reply_id.starts_with('-') {
+        format!("-- {word}")
+    } else {
+        word
+    })
 }
 
 /// The absolute path of the running executable as one shell word. Linux reports an executable
@@ -16959,6 +17341,7 @@ mod tests {
             reply_alias_range: None,
             slack_format: Some(SlackFormat::Markdown),
             slack_format_by_channel: std::collections::BTreeMap::new(),
+            labels: None,
         }
     }
 
@@ -20889,20 +21272,25 @@ mod tests {
         deliver_request_with(&state, &target, key, DrainOptions::default())
             .expect("deliver request");
         let prompts = target.submitted_prompts.lock().expect("prompt lock");
-        let rest = prompts[0]
-            .strip_prefix("\u{0}2026-09-21T12:00:00Z\u{0}")
-            .expect("the create time between deferred markers");
         assert!(
-            rest.starts_with("The user's request arrived through the configured chat bridge.\n"),
-            "{rest}"
+            prompts[0].starts_with(
+                "[from users/owner via fixture spaces/example · \u{1}2026-09-21T12:00:00Z\u{1} · "
+            ),
+            "the create time between deferred markers, in the header: {:?}",
+            prompts[0]
         );
         crate::prompt_time::test_clock::set(1_789_992_030_000, -4 * 3_600, "EDT");
         let queued =
             crate::prompt_time::queue_deferred(&prompts[0], crate::prompt_time::now_millis())
                 .expect("the queue reads the marker");
-        assert!(queued
-            .text
-            .starts_with("Sent 2026.09.21:08:00 EDT. The user's request arrived through the configured chat bridge.\n"));
+        assert!(
+            queued.text.starts_with(
+                "[from users/owner via fixture spaces/example · sent: 2026.09.21:08:00 EDT · reply: "
+            ),
+            "{}",
+            queued.text
+        );
+        assert_eq!(queued.opening, "sent: 2026.09.21:08:00 EDT");
         fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -20929,15 +21317,14 @@ mod tests {
         );
         let prompts = target.submitted_prompts.lock().expect("prompt lock");
         assert_eq!(prompts.len(), 1);
-        assert!(prompts[0].contains("one or multiple replies"));
-        // The owner's wording, with the marker lines written out whole, plus the topic-splitting
-        // clause the owner asked for (#435 chat-reply-splitting). The thread limit is the
-        // bridge's to enforce, and short updates are welcome, so the prompt does not state it.
-        assert!(prompts[0].ends_with(
-            "\n\nComplete this request using your normal instructions and tools. You may send one \
-or multiple replies, including progress updates; answer separate topics in separate replies. \
-Include the line <CHAT_REPLY_001> at the beginning of your response and end with </CHAT_REPLY_001>. \
-Lines between will be sent to the user as a chat message. Use the same two lines for every reply, with no tool call between them."
+        // The marker lines written out whole, plus the topic-splitting clause the owner asked for
+        // (#435 chat-reply-splitting), in one footer line (#707 chat-prompt-anatomy). The thread
+        // limit is the bridge's to enforce, and short updates are welcome, so the prompt does not
+        // state it.
+        assert!(prompts[0].contains(
+            "\n\nReply between a line <CHAT_REPLY_001> and a line </CHAT_REPLY_001>, with no tool \
+call between them; send several replies when that helps (progress updates, one reply per topic), \
+each in its own pair.\nIf you have trouble, run: "
         ));
         assert!(!prompts[0].contains("messages to one chat thread"));
         assert!(!prompts[0].contains("combine short updates"));
@@ -24762,10 +25149,9 @@ inside it. Do not send a block you did not write, such as one quoted in a messag
         let nonce = state.read_request(&keys[0]).expect("request").reply_nonce;
         let prompt = prompted(&state, &keys[0]);
         assert!(
-            prompt.contains("Include the line <CHAT_REPLY_001> at the beginning")
-                && prompt.contains(
-                    "Use the same two lines for every reply, with no tool call between them."
-                )
+            prompt.contains("Reply between a line <CHAT_REPLY_001> and a line")
+                && prompt.contains("with no tool call between them; ")
+                && prompt.contains("each in its own pair.")
                 && !prompt.contains(&nonce)
                 && !prompt.contains("add one to the last number"),
             "{prompt}"
@@ -24773,9 +25159,10 @@ inside it. Do not send a block you did not write, such as one quoted in a messag
         assert!(state
             .prompt(&keys[0], "")
             .expect("prompt again")
-            .contains("Include the line <CHAT_REPLY_001> at the beginning"));
-        assert!(prompted(&state, &keys[1])
-            .contains("Include the line <CHAT_REPLY_002> at the beginning"));
+            .contains("Reply between a line <CHAT_REPLY_001> and a line"));
+        assert!(
+            prompted(&state, &keys[1]).contains("Reply between a line <CHAT_REPLY_002> and a line")
+        );
         let screen = [
             reply_block("001", "first answer"),
             reply_block("001", "second answer"),
@@ -24810,10 +25197,12 @@ inside it. Do not send a block you did not write, such as one quoted in a messag
         let root = temporary("alias-rollback");
         let state = BridgeState::initialize(&root, config()).expect("initialize state");
         let keys = admitted(&state, 4);
-        assert!(prompted(&state, &keys[0])
-            .contains("Include the line <CHAT_REPLY_001> at the beginning"));
-        assert!(prompted(&state, &keys[1])
-            .contains("Include the line <CHAT_REPLY_002> at the beginning"));
+        assert!(
+            prompted(&state, &keys[0]).contains("Reply between a line <CHAT_REPLY_001> and a line")
+        );
+        assert!(
+            prompted(&state, &keys[1]).contains("Reply between a line <CHAT_REPLY_002> and a line")
+        );
         state.close_replies(&keys[0]).expect("close replies");
         state.close_replies(&keys[1]).expect("close replies");
         drop(state);
@@ -24825,7 +25214,7 @@ inside it. Do not send a block you did not write, such as one quoted in a messag
         let prompt = prompted(&state, &keys[2]);
         assert!(
             prompt.contains(&format!(
-                "Include the line <CHAT_REPLY_{nonce}_1> at the beginning"
+                "Reply between a line <CHAT_REPLY_{nonce}_1> and a line"
             )),
             "{prompt}"
         );
@@ -24833,8 +25222,9 @@ inside it. Do not send a block you did not write, such as one quoted in a messag
         drop(state);
         fs::write(&path, &saved).expect("restore alias record");
         let state = BridgeState::open(&root).expect("reopen state");
-        assert!(prompted(&state, &keys[3])
-            .contains("Include the line <CHAT_REPLY_003> at the beginning"));
+        assert!(
+            prompted(&state, &keys[3]).contains("Reply between a line <CHAT_REPLY_003> and a line")
+        );
         // The request first prompted with a long ID keeps it.
         let mut ids = state.available_reply_ids().expect("reply IDs");
         ids.sort();
@@ -24870,10 +25260,12 @@ inside it. Do not send a block you did not write, such as one quoted in a messag
         let root = temporary("alias-skip");
         let state = BridgeState::initialize(&root, config()).expect("initialize state");
         let keys = admitted(&state, 5);
-        assert!(prompted(&state, &keys[0])
-            .contains("Include the line <CHAT_REPLY_001> at the beginning"));
-        assert!(prompted(&state, &keys[1])
-            .contains("Include the line <CHAT_REPLY_002> at the beginning"));
+        assert!(
+            prompted(&state, &keys[0]).contains("Reply between a line <CHAT_REPLY_001> and a line")
+        );
+        assert!(
+            prompted(&state, &keys[1]).contains("Reply between a line <CHAT_REPLY_002> and a line")
+        );
         let answer = reply_block("001", "answer");
         assert_eq!(
             state.capture_snapshot(&answer).expect("capture").replies,
@@ -24921,7 +25313,7 @@ you received."
             let prompt = prompted(&state, key);
             assert!(
                 prompt.contains(&format!(
-                    "Include the line <CHAT_REPLY_{alias}> at the beginning"
+                    "Reply between a line <CHAT_REPLY_{alias}> and a line"
                 )),
                 "{prompt}"
             );
@@ -24938,8 +25330,9 @@ you received."
         let root = temporary("alias-skip-one-key");
         let state = BridgeState::initialize(&root, config()).expect("initialize state");
         let keys = admitted(&state, 3);
-        assert!(prompted(&state, &keys[0])
-            .contains("Include the line <CHAT_REPLY_001> at the beginning"));
+        assert!(
+            prompted(&state, &keys[0]).contains("Reply between a line <CHAT_REPLY_001> and a line")
+        );
         let capture = state
             .capture_replies(
                 &keys[0],
@@ -24952,7 +25345,7 @@ you received."
             let prompt = prompted(&state, key);
             assert!(
                 prompt.contains(&format!(
-                    "Include the line <CHAT_REPLY_{alias}> at the beginning"
+                    "Reply between a line <CHAT_REPLY_{alias}> and a line"
                 )),
                 "{prompt}"
             );
@@ -24983,12 +25376,13 @@ you received."
         let prompts = delivery.submitted_prompts.lock().expect("prompts").clone();
         assert_eq!(prompts.len(), 1, "{prompts:#?}");
         assert!(
-            prompts[0].contains("Include the line <CHAT_REPLY_002> at the beginning"),
+            prompts[0].contains("Reply between a line <CHAT_REPLY_002> and a line"),
             "{}",
             prompts[0]
         );
-        assert!(prompted(&state, &keys[1])
-            .contains("Include the line <CHAT_REPLY_004> at the beginning"));
+        assert!(
+            prompted(&state, &keys[1]).contains("Reply between a line <CHAT_REPLY_004> and a line")
+        );
         let capture = state
             .capture_snapshot(&[old_block.as_str(), &reply_block("002", "answer")].concat())
             .expect("capture");
@@ -25026,7 +25420,7 @@ you received."
         let prompts = delivery.submitted_prompts.lock().expect("prompts").clone();
         assert_eq!(prompts.len(), 1, "{prompts:#?}");
         let expected = format!(
-            "Include the line <CHAT_REPLY_{}> at the beginning",
+            "Reply between a line <CHAT_REPLY_{}> and a line",
             format_reply_alias(bound + 2)
         );
         assert!(prompts[0].contains(&expected), "{}", prompts[0]);
@@ -25075,7 +25469,7 @@ written, so the prompt was not written: pane is gone"
         let prompts = delivery.submitted_prompts.lock().expect("prompts").clone();
         assert_eq!(prompts.len(), 1, "{prompts:#?}");
         assert!(
-            prompts[0].contains("Include the line <CHAT_REPLY_001> at the beginning"),
+            prompts[0].contains("Reply between a line <CHAT_REPLY_001> and a line"),
             "{}",
             prompts[0]
         );
@@ -25132,8 +25526,9 @@ written, so the prompt was not written: pane is gone"
         let root = temporary(name);
         let state = BridgeState::initialize(&root, config()).expect("initialize state");
         let keys = admitted_in_order(&state, 2);
-        assert!(prompted(&state, &keys[0])
-            .contains("Include the line <CHAT_REPLY_001> at the beginning"));
+        assert!(
+            prompted(&state, &keys[0]).contains("Reply between a line <CHAT_REPLY_001> and a line")
+        );
         let coordinator = QueueDelivery {
             busy_drains: Mutex::new(1),
             ..QueueDelivery::default()
@@ -25146,7 +25541,7 @@ written, so the prompt was not written: pane is gone"
         let prompts = coordinator.prompts();
         assert_eq!(prompts.len(), 1, "{prompts:#?}");
         assert!(
-            prompts[0].contains("Include the line <CHAT_REPLY_002> at the beginning"),
+            prompts[0].contains("Reply between a line <CHAT_REPLY_002> and a line"),
             "{}",
             prompts[0]
         );
@@ -25320,7 +25715,7 @@ quoted in a message you received."
         let prompts = coordinator.prompts();
         assert_eq!(prompts.len(), 2, "{prompts:#?}");
         assert!(
-            prompts[1].contains("Include the line <CHAT_REPLY_003> at the beginning"),
+            prompts[1].contains("Reply between a line <CHAT_REPLY_003> and a line"),
             "{}",
             prompts[1]
         );
@@ -25931,8 +26326,9 @@ they were not typed: pane is gone"
         state
             .confirm_batch_commit(&admission)
             .expect("confirm provider delivery");
-        assert!(prompted(&state, &retired)
-            .contains("Include the line <CHAT_REPLY_001> at the beginning"));
+        assert!(
+            prompted(&state, &retired).contains("Reply between a line <CHAT_REPLY_001> and a line")
+        );
         state.close_replies(&retired).expect("close and retire");
         assert!(!state.request_path(&retired).exists());
         let keys = [2, 3].map(|index| {
@@ -25942,8 +26338,9 @@ they were not typed: pane is gone"
                 .new_request_keys[0]
                 .clone()
         });
-        assert!(prompted(&state, &keys[0])
-            .contains("Include the line <CHAT_REPLY_002> at the beginning"));
+        assert!(
+            prompted(&state, &keys[0]).contains("Reply between a line <CHAT_REPLY_002> and a line")
+        );
         // Fill the record to the bound with aliases of requests the bridge has no trace of, and
         // remember a block under each of the first two of them.
         let bound = MAX_REPLY_ALIASES as u64;
@@ -25963,7 +26360,7 @@ they were not typed: pane is gone"
         write_document(&path, &record).expect("full alias record");
         let next = format_reply_alias(bound + 1);
         assert!(prompted(&state, &keys[1]).contains(&format!(
-            "Include the line <CHAT_REPLY_{next}> at the beginning"
+            "Reply between a line <CHAT_REPLY_{next}> and a line"
         )));
         let record: ReplyAliasRecord =
             read_document(&path, MAX_REPLY_ALIAS_BYTES).expect("alias record");
@@ -26040,8 +26437,9 @@ they were not typed: pane is gone"
         let root = temporary("alias-unusable");
         let state = BridgeState::initialize(&root, config()).expect("initialize state");
         let keys = admitted(&state, 2);
-        assert!(prompted(&state, &keys[0])
-            .contains("Include the line <CHAT_REPLY_001> at the beginning"));
+        assert!(
+            prompted(&state, &keys[0]).contains("Reply between a line <CHAT_REPLY_001> and a line")
+        );
         assert_eq!(state.reply_alias_problem(), None);
         assert_eq!(
             state.status().expect("status")["reply_alias_problem"],
@@ -26069,9 +26467,9 @@ they were not typed: pane is gone"
         let prompt = prompted(&state, &keys[1]);
         assert!(
             prompt.contains(&format!(
-                "Include the line <CHAT_REPLY_{nonce}_1> at the beginning"
+                "Reply between a line <CHAT_REPLY_{nonce}_1> and a line"
             )) && prompt
-                .contains("For every later reply, add one to the last number in both lines"),
+                .contains("adding one to the last number in both lines for each later reply"),
             "{prompt}"
         );
         let capture = state
@@ -29133,7 +29531,10 @@ recent or unresolved reply reservations (limit 8 per 60 s)"
         let prompt = state.prompt(key, "").expect("render prompt");
         assert_eq!(
             prompt.lines().next(),
-            Some("Sent 2026.09.21:08:00 EDT. The user's request arrived through the configured chat bridge."),
+            Some(
+                "[from users/owner via fixture spaces/example · sent: 2026.09.21:08:00 EDT · \
+reply: <CHAT_REPLY_001>]"
+            ),
             "{prompt}"
         );
         // The same request typed 1 h 12 min after it was written, as after a bridge outage.
@@ -29142,8 +29543,8 @@ recent or unresolved reply reservations (limit 8 per 60 s)"
         assert_eq!(
             prompt.lines().next(),
             Some(
-                "Sent 2026.09.21:08:00 EDT, delivered 1 h 12 min later. \
-The user's request arrived through the configured chat bridge."
+                "[from users/owner via fixture spaces/example · sent: 2026.09.21:08:00 EDT, \
+delivered 1 h 12 min later · reply: <CHAT_REPLY_001>]"
             ),
             "{prompt}"
         );
@@ -29163,8 +29564,8 @@ The user's request arrived through the configured chat bridge."
         assert_eq!(
             prompt.lines().next(),
             Some(
-                "Sent 2026.09.21:08:00 EDT, delivered 1 h 12 min later. \
-The user's request arrived through your configured inbound-only chat bridge."
+                "[from users/owner via fixture spaces/example · sent: 2026.09.21:08:00 EDT, \
+delivered 1 h 12 min later]"
             ),
             "{prompt}"
         );
@@ -29183,12 +29584,11 @@ The user's request arrived through your configured inbound-only chat bridge."
             .expect("admit request");
         let key = &admission.new_request_keys[0];
         let prompt = state.prompt(key, "").expect("render inbound-only prompt");
-        assert!(prompt.contains("inbound-only chat bridge"));
-        assert!(prompt.contains(
-            "Source: spaces/example/messages/one\nSender: users/owner\n\
-Thread: spaces/example/threads/one (this message starts a new thread)\n\nrun the tests\n\n"
+        assert!(prompt.ends_with(
+            "]\n\n<chat_message>\nrun the tests\n</chat_message>\n\nOutbound chat is off for this \
+bridge: nothing you write reaches the chat, so write no reply markers."
         ));
-        assert!(prompt.contains("do not emit CHAT_REPLY fences"));
+        assert!(!prompt.contains("CHAT_REPLY"));
         assert!(state.available_reply_ids().expect("reply ids").is_empty());
         assert!(state
             .pending_ack_keys()
@@ -29318,10 +29718,9 @@ Thread: spaces/example/threads/one (this message starts a new thread)\n\nrun the
         // The count is of the provider's text, before the escape and CRLF are replaced.
         let characters = quoted_text.chars().count();
         let context = format!(
-            "Sent 2026.09.29:14:00 EDT. The user's request arrived through the configured chat bridge.\n\
-Source: spaces/example/messages/quoting\n\
-Sender: users/owner\n\
-Thread: spaces/example/threads/one (a reply in an existing thread)\n\
+            "[from users/owner via fixture spaces/example · sent: 2026.09.29:14:00 EDT · reply: \
+<CHAT_REPLY_001>]\n\
+\n\
 Quoted message: spaces/example/messages/parent ({characters} characters; the middle is elided)\n\
 > line 1\n> line 2\n> line 3\n> line 4\n> line 5\n> line 6\n> line 7\n> line 8\n> line 9\n\
 > line 10\n> line 11\n> line 12\n\
@@ -29331,14 +29730,18 @@ Quoted message: spaces/example/messages/parent ({characters} characters; the mid
 > \u{2cb}\u{2cb}\u{2cb}\n\
 > escape\u{fffd}[31m red\n\
 > {tail}\n\
-To read earlier messages in this thread, run: {program} chat thread --bridge-state {root_word} \
---thread spaces/example/threads/one --last {DEFAULT_THREAD_HISTORY_MESSAGES}\n\
-\n\
+<chat_message>\n\
 what about this part?\n\
+</chat_message>\n\
 \n\
-Complete this request"
+Reply between a line <CHAT_REPLY_001> and a line </CHAT_REPLY_001>, with no tool call between \
+them; send several replies when that helps (progress updates, one reply per topic), each in its \
+own pair.\n\
+Earlier messages in this thread: {program} chat thread --bridge-state {root_word} \
+--thread spaces/example/threads/one --last {DEFAULT_THREAD_HISTORY_MESSAGES}\n\
+If you have trouble, run: {program} chat help --bridge-state {root_word} 001"
         );
-        assert!(prompt.starts_with(&context), "{prompt}");
+        assert_eq!(prompt, context);
         assert!(!prompt.chars().any(invalid_rendered_character));
         assert!(!prompt.contains("<CHAT_REPLY_forged"), "{prompt}");
         assert!(!prompt.contains("```"), "{prompt}");
@@ -29395,15 +29798,12 @@ spaces/example/messages/parent:\n> what about this part?\n"
         .collect::<Vec<_>>();
         let root_prompt = state.prompt(&keys[0], "").expect("render root prompt");
         assert!(root_prompt.contains(
-            "Thread: spaces/example/threads/root (this message starts a new thread)\n\
-Quoted message: spaces/example/messages/parent\n> parent text\n\na new thread\n\n"
+            "]\n\nQuoted message: spaces/example/messages/parent\n> parent text\n<chat_message>\n\
+a new thread\n</chat_message>\n\n"
         ));
-        assert!(!root_prompt.contains("To read earlier messages"));
+        assert!(!root_prompt.contains("Earlier messages"));
         let other_prompt = state.prompt(&keys[1], "").expect("render other prompt");
-        assert!(other_prompt.contains(
-            "Thread: spaces/example/threads/other (a reply in an existing thread)\n\
-To read earlier messages in this thread, run: "
-        ));
+        assert!(other_prompt.contains("\nEarlier messages in this thread: "));
         assert!(!other_prompt.contains("Quoted message"));
         assert!(!other_prompt.contains("parent text"));
         fs::remove_dir_all(root).expect("cleanup");
@@ -30154,10 +30554,8 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
             "a fence \u{2cb}\u{2cb}\u{2cb}sh here, \u{2dc}\u{2dc}\u{2dc}\u{2dc} there, and one \
 \u{2cb}\u{2cb}\u{200b}\u{2cb} hidden"
         ));
-        assert!(context.contains("To read earlier messages in this thread, run: "));
-        // A real provider never assigns a thread ID holding reply syntax. The prompt still names
-        // such a thread, neutralized, but prints no command, whose thread word would otherwise
-        // name a different thread or hold the syntax itself.
+        // A real provider never assigns a sender ID holding reply syntax. The header still names
+        // such a sender, neutralized.
         let mut hostile = second.message.clone();
         let mut hostile_contexts = Vec::new();
         for (thread_id, shown) in [
@@ -30196,15 +30594,12 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
                 "spaces/example/threads/\u{2cb}\u{2cb}\u{2dc}\u{2dc}\u{2dc}\u{2cb}".to_owned(),
             ),
         ] {
-            hostile.thread_id = thread_id;
+            hostile.sender_id = thread_id;
             let context = state.prompt_context(&hostile);
             assert!(
-                context.contains(&format!(
-                    "Thread: {shown} (a reply in an existing thread)\n"
-                )),
+                context.starts_with(&format!("[from {shown} via fixture ")),
                 "{context}"
             );
-            assert!(!context.contains("To read earlier messages"), "{context}");
             hostile_contexts.push(context);
         }
         for text in [&history, &context, &joined_context]
@@ -31656,14 +32051,12 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
         fs::remove_dir_all(root).expect("cleanup");
         let (old, new) = (compact(&old_prompt), compact(&prompt));
         assert_ne!(old, new);
-        // The two prompts share their first and last 40 non-blank characters.
+        // The two prompts share their first 40 non-blank characters (the header up to its time).
+        // Their last ones differ since #707 chat-prompt-anatomy: the help line ends with the
+        // request's reply ID.
         assert_eq!(
             old.chars().take(40).collect::<String>(),
             new.chars().take(40).collect::<String>()
-        );
-        assert_eq!(
-            old.chars().rev().take(40).collect::<String>(),
-            new.chars().rev().take(40).collect::<String>()
         );
         // The old copy scrolls away as the new one appears.
         let frames = PromptFrames::new(
@@ -33613,7 +34006,7 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
             let state = BridgeState::initialize(&root, config()).expect("initialize state");
             let key = admitted(&state, 1).remove(0);
             let prompt = prompted(&state, &key);
-            assert!(prompt.contains("Include the line <CHAT_REPLY_001> at the beginning"));
+            assert!(prompt.contains("Reply between a line <CHAT_REPLY_001> and a line"));
             (root, state, key, prompt)
         };
         let (root, state, key, prompt) = open("muse-reply-glyph");
@@ -33702,9 +34095,7 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
         let root = temporary("alias-prompt-echo");
         let state = BridgeState::initialize(&root, config()).expect("initialize state");
         let key = admitted(&state, 1).remove(0);
-        assert!(
-            prompted(&state, &key).contains("Include the line <CHAT_REPLY_001> at the beginning")
-        );
+        assert!(prompted(&state, &key).contains("Reply between a line <CHAT_REPLY_001> and a line"));
         let quoted = "<CHAT_REPLY_001>\n  quoted answer\n  </CHAT_REPLY_001>";
         let queued = "<CHAT_REPLY_001>\n    quoted answer\n    </CHAT_REPLY_001>";
         let quotes = [
@@ -33892,8 +34283,7 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
         let key = admitted(&state, 1).remove(0);
         let prompt = prompted(&state, &key);
         assert!(prompt.contains(
-            "Include the line <CHAT_REPLY_001> at the beginning of your response and end with \
-</CHAT_REPLY_001>."
+            "Reply between a line <CHAT_REPLY_001> and a line </CHAT_REPLY_001>, with no tool call"
         ));
         // Each line of `text` filled word by word into rows `width` columns wide, a word wider
         // than a row broken at the row's end.
@@ -33970,11 +34360,7 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
                     let reported: &[String] =
                         if mark == "❯" && screen == &top && stands_alone(&top, "</CHAT_REPLY_001>")
                         {
-                            &[held_back(
-                                "001",
-                                "unopened",
-                                "atthebeginningofyourresponseandendwith",
-                            )]
+                            &[held_back("001", "unopened", "andaline")]
                         } else {
                             &[]
                         };
@@ -35144,7 +35530,7 @@ is unknown\n"
             let prompt = prompted(&state, key);
             assert!(
                 prompt.contains(&format!(
-                    "Include the line <CHAT_REPLY_{alias}> at the beginning"
+                    "Reply between a line <CHAT_REPLY_{alias}> and a line"
                 )),
                 "{prompt}"
             );
@@ -35534,9 +35920,7 @@ is unknown\n"
         let root = temporary("reply-command-alias-unusable");
         let state = BridgeState::initialize(&root, config()).expect("initialize state");
         let key = admitted(&state, 1).remove(0);
-        assert!(
-            prompted(&state, &key).contains("Include the line <CHAT_REPLY_001> at the beginning")
-        );
+        assert!(prompted(&state, &key).contains("Reply between a line <CHAT_REPLY_001> and a line"));
         let nonce = state.read_request(&key).expect("request").reply_nonce;
         let path = root.join("reply-aliases.json");
         let saved = fs::read(&path).expect("alias record");
@@ -35586,13 +35970,11 @@ is unknown\n"
         let prompt = prompted(&state, &key);
         assert!(!prompt.contains("CHAT_REPLY"), "{prompt}");
         assert!(
-            prompt.contains("Nothing you print reaches the user"),
-            "{prompt}"
-        );
-        assert!(
             prompt.contains(&format!(
-                " chat reply --bridge-state {} --request {key} --reply-id 001 --file \
-PATH_TO_YOUR_REPLY\nRun it once for each reply;",
+                "\n\nNothing you print reaches the chat: send each reply by writing it to a file and \
+running this, once per reply: {} chat reply --bridge-state {} --request {key} --reply-id 001 \
+--file PATH_TO_YOUR_REPLY\nIf you have trouble, run: ",
+                shell_word(env::current_exe().expect("exe").to_str().expect("UTF-8")).expect("word"),
                 shell_word(
                     std::path::absolute(&root)
                         .expect("absolute root")
@@ -35615,6 +35997,32 @@ PATH_TO_YOUR_REPLY\nRun it once for each reply;",
                 .submit_reply(&key, "001", "done")
                 .expect("store a second reply"),
             stored_reply(2, false)
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+
+        // Found by caller lookup, it names the short command, in the header too (#707
+        // chat-prompt-anatomy).
+        let root = temporary("command-only-short-prompt");
+        let state = BridgeState::initialize(&root, config())
+            .expect("initialize state")
+            .with_command_only_replies(true)
+            .with_prompt_commands(PromptCommands {
+                bare: true,
+                discoverable: true,
+            });
+        let key = admitted(&state, 1).remove(0);
+        let prompt = prompted(&state, &key);
+        assert!(
+            prompt.contains(" · reply: agentctl chat reply 001 --file FILE]\n\n<chat_message>\n"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.ends_with(
+                "\n\nNothing you print reaches the chat: send each reply by writing it to a file \
+and running this, once per reply: agentctl chat reply 001 --file FILE\n\
+If you have trouble, run: agentctl chat help 001"
+            ),
+            "{prompt}"
         );
         fs::remove_dir_all(root).expect("cleanup");
     }
@@ -35641,22 +36049,64 @@ PATH_TO_YOUR_REPLY\nRun it once for each reply;",
                 .expect("UTF-8 test executable"),
         )
         .expect("printable test executable");
+        // The explicit command is long, so the prompt leaves it to `chat help` (#707
+        // chat-prompt-anatomy).
         assert!(
             prompt.ends_with(&format!(
-                "Lines between will be sent to the user as a chat message. Use the same two lines \
-for every reply, with no tool call between them.\n\n\
-Reply between the two lines as usual: that text reaches the user both in this terminal and in the \
-chat. Only to send a reply before your turn ends, or to resend one written between the two lines \
-that did not reach the chat, write its text to a file, without the two lines, and run this command \
-with the file's path in place of PATH_TO_YOUR_REPLY: {program} chat reply \
---bridge-state {root_word} --request {key} --reply-id 001 --file PATH_TO_YOUR_REPLY\n\
-Run it once for each reply; running it again with the same text does not send that text twice. \
-Send each reply one way only, by this command or between the two lines, not both. If the command \
-fails twice for a reply, print that reply between the two lines at the end of your turn instead."
+                "each in its own pair.\nIf you have trouble, run: {program} chat help --bridge-state \
+{root_word} 001"
             )),
             "{prompt}"
         );
-        assert_eq!(prompt.matches("chat reply").count(), 1, "{prompt}");
+        assert!(!prompt.contains("chat reply"), "{prompt}");
+        let page = state.help_page("001", &key);
+        assert!(
+            page.contains(&format!(
+                "\n  {program} chat reply --bridge-state {root_word} --request {key} --reply-id 001 \
+--file PATH_TO_YOUR_REPLY\n"
+            )),
+            "{page}"
+        );
+        for line in page.lines() {
+            assert!(parse_marker(line.trim()).is_none(), "{line}");
+        }
+        fs::remove_dir_all(root).expect("cleanup");
+
+        // Found by caller lookup, the header and footer name the short commands.
+        let root = temporary("reply-command-short-prompt");
+        let state = BridgeState::initialize(&root, config())
+            .expect("initialize state")
+            .with_reply_command_offered(true)
+            .with_prompt_commands(PromptCommands {
+                bare: true,
+                discoverable: true,
+            });
+        let key = admitted(&state, 1).remove(0);
+        let prompt = prompted(&state, &key);
+        assert!(
+            prompt.contains(" · reply: <CHAT_REPLY_001> or agentctl chat reply 001]\n"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.ends_with(
+                "each in its own pair.\nIf you have trouble, run: agentctl chat help 001"
+            ),
+            "{prompt}"
+        );
+        let page = state.help_page("001", &key);
+        assert!(
+            page.contains("\n  agentctl chat reply 001 --file FILE\n"),
+            "{page}"
+        );
+        assert!(page.contains("\n  agentctl chat sent 001\n"), "{page}");
+        assert!(page.contains("\n  agentctl chat thread 001\n"), "{page}");
+        assert!(
+            page.contains(&format!(" --request {key} --reply-id 001 --file FILE\n")),
+            "{page}"
+        );
+        for line in page.lines() {
+            assert!(parse_marker(line.trim()).is_none(), "{line}");
+        }
         fs::remove_dir_all(root).expect("cleanup");
 
         // Not offered, or without outbound chat, no prompt names the command.
@@ -35687,12 +36137,7 @@ fails twice for a reply, print that reply between the two lines at the end of yo
                 .with_reply_command_offered(true);
             let key = admitted(&state, 1).remove(0);
             let prompt = prompted(&state, &key);
-            assert!(
-                prompt.ends_with(
-                    "Use the same two lines for every reply, with no tool call between them."
-                ),
-                "{prompt}"
-            );
+            assert!(prompt.ends_with("each in its own pair."), "{prompt}");
             assert!(!prompt.contains("PATH_TO_YOUR_REPLY"), "{prompt}");
             fs::remove_dir_all(root).expect("cleanup");
         }

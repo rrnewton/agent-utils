@@ -11,14 +11,17 @@
 //! [from human@host-a via agentctl]
 //! ```
 //!
-//! The grammar is `[from SENDER via ROUTE( · KEY: VALUE)*]` on a line of its own. SENDER holds no
-//! white space, `·` or `]`; ROUTE and each VALUE hold no `·` or `]`. Fields after the route are
-//! optional and a reader ignores keys it does not know; `reply` appears only when SENDER is an
-//! agent that can be answered with `agentctl send`. Other tools that hand agents messages may
-//! write the same grammar with a route of their own.
+//! The grammar is `[from SENDER via ROUTE( · KEY: VALUE)*]` on a line of its own. SENDER is words
+//! joined by single spaces, without `·` or `]` (an agent name is one word; the chat bridge's
+//! sender may be a display name, #707 chat-prompt-anatomy); ROUTE and each VALUE hold no `·` or
+//! `]`. Fields after the route are optional and a reader ignores keys it does not know; on the
+//! `agentctl` routes `reply` appears only when SENDER is an agent that can be answered with
+//! `agentctl send`. Other tools that hand agents messages write the same grammar with a route of
+//! their own: the chat bridge opens each request prompt with `[from SENDER via PROVIDER CHANNEL ·
+//! sent: TIME · reply: ...]`, its `reply` naming the request's reply markers.
 //!
-//! The header is mandatory: no option suppresses it. Only the chat bridge's owner messages, which
-//! carry their own opening and never pass through `agentctl send`, go without. A one-line harness
+//! The header is mandatory: no option suppresses it. The chat bridge's request prompts never pass
+//! through `agentctl send` and carry the bridge's own header instead. A one-line harness
 //! slash command (see [`is_slash_command`]) is a command for the harness rather than a message to
 //! the agent, and a header would stop the harness reading it as one, so it is sent as written.
 //!
@@ -135,11 +138,7 @@ pub fn parse(line: &str) -> Option<Header> {
     }
     let mut parts = inner.split(SEPARATOR);
     let (sender, route) = parts.next()?.split_once(" via ")?;
-    if sender.is_empty()
-        || sender.chars().any(|c| c.is_whitespace() || c == '·')
-        || route.trim().is_empty()
-        || route.contains('·')
-    {
+    if !is_sender_label(sender) || route.trim().is_empty() || route.contains('·') {
         return None;
     }
     let mut fields = Vec::new();
@@ -159,6 +158,20 @@ pub fn parse(line: &str) -> Option<Header> {
         route: route.to_owned(),
         fields,
     })
+}
+
+/// Whether `label` can stand as a header's SENDER: words joined by single spaces, with no other
+/// white space, `·` or `]`, and not holding ` via `, so the route is found where it begins.
+#[must_use]
+pub fn is_sender_label(label: &str) -> bool {
+    !label.is_empty()
+        && label.split(' ').all(|word| {
+            !word.is_empty()
+                && !word
+                    .chars()
+                    .any(|c| c.is_whitespace() || matches!(c, '·' | ']'))
+        })
+        && !label.contains(" via ")
 }
 
 /// Whether `text` opens with a header line.
@@ -353,12 +366,22 @@ mod tests {
         let teams = parse("[from tools@host-a via agent-teams · to: sim@host-b · id: tm-sim-1]")
             .expect("agent-teams header");
         assert_eq!(header_fields(&teams), ["to", "id"]);
+        // A chat bridge's sender is a display name (#707 chat-prompt-anatomy).
+        let chat = parse("[from Ada Lovelace via slack #team · sent: 2026.10.30:10:51 EDT]")
+            .expect("chat bridge header");
+        assert_eq!(chat.sender, "Ada Lovelace");
+        assert_eq!(chat.route, "slack #team");
+        assert_eq!(chat.field("sent"), Some("2026.10.30:10:51 EDT"));
         for bad in [
             "",
             "from x via y",
             "[from x]",
             "[from  via y]",
-            "[from a b via y]",
+            "[from a  b via y]",
+            "[from a\tb via y]",
+            "[from  a via y]",
+            "[from a  via y]",
+            "[from a·b via y]",
             "[from x via ]",
             "[from x via y · reply]",
             "[from x via y · Reply: z]",

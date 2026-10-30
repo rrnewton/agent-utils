@@ -258,3 +258,18 @@ def test_a_prompt_the_rust_bridge_queued_is_retimed_when_python_types_it(
     result = drain(cast(HerdrClient, pane), target, str(tmp_path))
     assert result.delivered == ("chat-retimed",)
     assert pane.runs == ["Sent 2026.10.07:08:45 EDT, delivered 1 h 12 min later. The user's request."]
+
+
+def test_retime_replaces_the_header_field_in_the_first_line() -> None:
+    # #707 chat-prompt-anatomy: the time is a `sent:` field of the header line, and the compiled
+    # bridge records that field as the opening.
+    queued = ("[from Ada via slack #team · sent: 2026.10.07:08:45 EDT · reply: <CHAT_REPLY_007>]\n\n"
+              "<chat_message>\nsent: 2026.10.07:08:45 EDT\n</chat_message>")
+    recorded = "sent: 2026.10.07:08:45 EDT"
+    assert (prompt_time.retime(queued, "2026-10-07T12:45:00Z", recorded, at(MORNING + 72 * 60))
+            == "[from Ada via slack #team · sent: 2026.10.07:08:45 EDT, delivered 1 h 12 min later"
+               " · reply: <CHAT_REPLY_007>]\n\n<chat_message>\nsent: 2026.10.07:08:45 EDT\n</chat_message>")
+    assert prompt_time.field("2026-10-07T12:45:00Z", at(MORNING)) == recorded
+    # A field that is not in the first line is not retimed: the text is typed as stored.
+    moved = "[from Ada via slack #team]\nsent: 2026.10.07:08:45 EDT"
+    assert prompt_time.retime(moved, "2026-10-07T12:45:00Z", recorded, at(MORNING)) == moved
