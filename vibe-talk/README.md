@@ -9891,8 +9891,8 @@ in for the left column's list. The poll reads Main and the selected thread (two 
 each), a live reply in that thread is read once as the thread, and a refresh that brings nothing
 draws nothing in either column. The thread is drawn by the same code as a thread in one column: the
 right column's elements stand in for the channel pane's while the code works on that column, and
-its state is swapped in around that work (`COLUMN_IDS`, `COLUMN_STATE` and `inColumn` in
-`web/voice.js`). `tests/two_column_browser.py` checks the layout in Chromium at 1440x900 and 1280x800,
+its state is the column's own records, reached through the column the code works on (`COLUMN_IDS`,
+`ColumnFields` and `inColumn` in `web/voice.js`). `tests/two_column_browser.py` checks the layout in Chromium at 1440x900 and 1280x800,
 `tests/thread_card_focus_browser.py` the highlight and the grey, by computed colour and by the
 pixels drawn, at 1280x800 and on a 412x915 phone, and `tests/thread_card_header_browser.py` the card at
 the top of a thread, its move up frame by frame, its line and its glide, at 1280x800 in both schemes and

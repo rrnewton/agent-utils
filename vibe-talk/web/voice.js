@@ -139,8 +139,8 @@ const COLUMN_IDS = {
  * (`freshSelection`, `selection`), its message box (`freshComposerState`, `composerState`) and what it
  * shows as Done (`freshDoneState`, `doneState`) and where its list stands against its newest message
  * (`freshScrollPlace`, `scrollPlace`) and what is gathered in its list (`freshGatherState`,
- * `gatherState`; `#624 voice-page-modularity`, plan step 15): field groups kept on the column rather
- * than in `state`.
+ * `gatherState`; `#624 voice-page-modularity`, plan step 15): every field group a column keeps, each
+ * on the column itself.
  *
  * @typedef {{matched: number, loaded: number, tally: any, pinned: boolean}} SearchCount
  * @typedef {{name: string, left: boolean, searched: SearchCount | null,
@@ -11782,8 +11782,8 @@ function pointRow(pane, row) {
   if (openRowMenu) return;
   const holding = nodeWithin(row, document.activeElement);
   // Lit is drawn selected (`drawSelection` lights only that), so a move within the row already lit
-  // asks no more: not the pane's kept selection, which in the right column swaps the column's state
-  // twice on every move to read.
+  // asks no more: not the pane's kept selection, which in the right column switches to that column
+  // and back on every move to read.
   if (!(lastPane === pane && pane.lit === row && (holding || !focusFollowsSelection()))) {
     takeRow(pane, row, !holding && focusFollowsSelection());
   }
