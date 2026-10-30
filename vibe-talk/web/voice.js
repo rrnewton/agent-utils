@@ -15822,24 +15822,9 @@ function postRecord(conversationId, body) {
 // Nothing for a draft a newer one replaced (the newer one is on the card), one that was committed (the
 // send memory draws what went), or one somebody else withdrew.
 
-/**
- * What a "Not sent" line says, per reason. A spoken no's is `SPOKEN_YES_SEAMS.declined`.
- *
- * `ended` stays true whatever comes after it: Hang up only puts the draft away on this page, and the
- * server keeps it until it lapses, so a reloaded page can still offer it, and a tap there still sends
- * it — under this line, as a card of its own.
- */
-const NOT_SENT_SEAMS = {
-  withdrawn:
-    "You tapped Don't send, so the draft was withdrawn and nothing was posted. Ask the assistant " +
-    "for new words if you want them.",
-  lapsed:
-    "The draft lapsed before anyone sent it, so nothing was posted. Ask the assistant to draft it " +
-    "again if you still want it sent.",
-  ended:
-    "You hung up with a draft still waiting, so it was not posted then, and the page stopped " +
-    "offering it.",
-};
+// What a "Not sent" line says, per reason (`NOT_SENT_SEAMS`; a spoken no's is the spoken yes's
+// `declined`), is web/src/core/call's (`notSentDetail`). `ended` stays true whatever comes after it:
+// Hang up only puts the draft away on this page, and the server keeps it until it lapses.
 
 /**
  * How long after a kept card's lapse the server is asked what became of it, so its "Not sent" line
@@ -15855,7 +15840,7 @@ const POST_FATE_RECHECK_MS = 1000;
  * @param {HTMLElement[]} into
  */
 function notSentSeam(why, into) {
-  const detail = why === "declined" ? SPOKEN_YES_SEAMS.declined : NOT_SENT_SEAMS[why] || NOT_SENT_SEAMS.lapsed;
+  const detail = notSentDetail(why);
   const li = transcriptSeam("Not sent", detail, into);
   li.setAttribute("data-not-sent", String(why));
   li.setAttribute("tabindex", "-1");
@@ -17341,48 +17326,9 @@ function absorbAnswerRow(conversationId, serial) {
   applySearch();
 }
 
-/**
- * The transcript seam's explanation, per outcome: fixed sentences, so each one's length is a fact a
- * test can hold to the same band as every other seam. The specifics are on the status line.
- */
-const SPOKEN_YES_SEAMS = {
-  sent:
-    "Posted after you said yes. This page decided it was a yes from what it heard, not the " +
-    "assistant, and told the assistant so.",
-  partial:
-    "Only part of the message was posted after your yes; the rest was not. The screen shows what " +
-    "is left, and the assistant was told.",
-  unknown:
-    "The page could not confirm whether your yes posted the message, so the assistant was told to " +
-    "say so. Check the channel before sending again.",
-  unconfirmed:
-    "The chat service's answer was lost, so nobody can say whether your yes posted it. The card " +
-    "above says so, and the assistant was told.",
-  refused:
-    "Your yes reached the server, which refused the send, so nothing was posted. The status line " +
-    "says why, and the assistant was told.",
-  gone:
-    "Nothing was posted: no draft was waiting by the time you answered. Ask the assistant to draft " +
-    "the message again if you still want it sent.",
-  not_armed:
-    "Nothing was posted: the page did not take that as a yes to the card. Tap Send, or ask the " +
-    "assistant to read it back again.",
-  declined:
-    "You said no to the read-back, so the draft was withdrawn and nothing was posted. Ask the " +
-    "assistant for new words if you want them.",
-};
+// The transcript seam's explanation per outcome of a spoken yes (`SPOKEN_YES_SEAMS`) is web/src/core/call's.
 
-/** The seam's label, per outcome. */
-const SPOKEN_YES_SEAM_LABELS = {
-  sent: "Sent by voice",
-  partial: "Partly sent",
-  unknown: "Not confirmed",
-  unconfirmed: "Not confirmed",
-  refused: "Not sent",
-  gone: "Not sent",
-  not_armed: "Not sent",
-  declined: "Not sent",
-};
+// The seam's label per outcome (`SPOKEN_YES_SEAM_LABELS`) is web/src/core/call's (`spokenYesSeam`).
 
 /**
  * The fixed sentence the agent is told about `outcome`, starting "Voice page:" — what its
@@ -17477,7 +17423,7 @@ function tellAgentOfLapse(proposal) {
  */
 function reportSpokenOutcome(outcome) {
   const channel = (outcome.proposal && outcome.proposal.channel_name) || "the channel";
-  const kind = outcome.kind in SPOKEN_YES_SEAMS ? outcome.kind : "not_armed";
+  const kind = spokenOutcomeKind(outcome.kind);
   let status;
   if (kind === "sent") {
     status = `Sent to ${channel}.`;
@@ -17503,7 +17449,8 @@ function reportSpokenOutcome(outcome) {
   if (kind === "declined") {
     if (outcome.withdrawn && outcome.proposal) noteNotSent("declined", outcome.proposal);
   } else if (kind !== "sent" && kind !== "partial" && kind !== "unconfirmed") {
-    transcriptSeam(SPOKEN_YES_SEAM_LABELS[kind], SPOKEN_YES_SEAMS[kind]);
+    const { label: word, detail } = spokenYesSeam(kind);
+    transcriptSeam(word, detail);
   }
   playSpokenYesTone(kind === "sent");
 }
@@ -21793,39 +21740,8 @@ function fileTurnIn(conversationId, speaker, text) {
 // (`RECONNECT_RECORDS_WAIT_MS`) are web/src/core/call's, with the decisions (`#624
 // voice-page-modularity`).
 
-/**
- * What the transcript's "reconnected" line says, by what the new session was handed, the record of
- * the call above (`recap_`) or nothing (`fresh_`), and by what went again: the lost turn's channel
- * messages (`relay`), the reader's typed message (`typed`), nothing (`none`), or nothing though a
- * typed message was lost (`unsent`). Each says what happened and what it means for the agent's
- * memory, within the band every seam keeps.
- */
-const RECONNECT_SEAM_DETAILS = {
-  recap_relay:
-    "The voice service lost a turn, so the call moved to a new session, which was sent this " +
-    "call's record, and the messages went again.",
-  recap_typed:
-    "The voice service lost a turn, so the call moved to a new session, which was sent this " +
-    "call's record, and your message went again.",
-  recap_none:
-    "The voice service lost a turn, so the call moved to a new session, which was sent this " +
-    "call's record. If you were speaking, say it again.",
-  recap_unsent:
-    "The voice service lost a turn, so the call moved to a new session, which was sent this " +
-    "call's record. Send your last message again.",
-  fresh_relay:
-    "The voice service lost a turn, so the call moved to a new session that has seen nothing above " +
-    "this line, and the messages went again.",
-  fresh_typed:
-    "The voice service lost a turn, so the call moved to a new session that has seen nothing above " +
-    "this line, and your message went again.",
-  fresh_none:
-    "The voice service lost a turn, so the call moved to a new session that has seen nothing above " +
-    "this line. If you were speaking, say it again.",
-  fresh_unsent:
-    "The voice service lost a turn, so the call moved to a new session that has seen nothing above " +
-    "this line. Send your last message again.",
-};
+// What the transcript's "reconnected" line says, by what the new session was handed and what went
+// again (`RECONNECT_SEAM_DETAILS`), is web/src/core/call's (`reconnectSeamDetail`).
 
 // Why a reconnected call's new session was handed nothing (`RECONNECT_FRESH`) is web/src/core/call's.
 
@@ -22206,7 +22122,7 @@ function settleNoticeForRecap(taken, why) {
  */
 function noteReconnected(attempt) {
   const handed = session.recap && session.recap.state === "sent" ? "recap" : "fresh";
-  const detail = RECONNECT_SEAM_DETAILS[`${handed}_${attempt.resend}`];
+  const detail = reconnectSeamDetail(handed, attempt.resend);
   const li = transcriptSeam("reconnected", detail);
   // What went again, so a refused record can change what the line says the session knows.
   li.setAttribute("data-reconnected", attempt.resend);
@@ -22224,7 +22140,7 @@ function reconnectedSessionRefused(verb = "refused") {
   for (let at = rows.length - 1; at >= 0; at -= 1) {
     const resend = rows[at].getAttribute("data-reconnected");
     if (resend === null) continue;
-    const detail = RECONNECT_SEAM_DETAILS[`fresh_${resend}`];
+    const detail = reconnectSeamDetail("fresh", resend);
     const summary = childByClass(rows[at], "seam-summary");
     const body = childByClass(rows[at], "seam-detail");
     if (!detail || !summary || !body) return;

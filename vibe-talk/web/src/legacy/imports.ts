@@ -30,13 +30,17 @@ export {
   STORED_SEAM_DETAIL,
   boundaryFor,
   callRecapLine as recapLine,
+  notSentDetail,
   reconnectAsked as callReconnectAsked,
   reconnectFreshWords,
+  reconnectSeamDetail,
   reconnectVerdict,
   recapChip,
   recapSentence,
   recapWords,
   seamDetailFor as callSeamDetailFor,
+  spokenOutcomeKind,
+  spokenYesSeam,
 } from "../core/call/index.ts";
 export {
   allPageAnswersFor,

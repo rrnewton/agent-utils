@@ -7186,6 +7186,19 @@ test("`#624 voice-page-modularity`: what a call's seams and the line under it sa
   assert.equal(boundaryFor({ state: "none", why: "empty" }, "closed").detail, seamDetailFor("closed", false));
 });
 
+test("`#624 voice-page-modularity`: what a reconnect and a draft's fate say in the transcript, from the module alone", () => {
+  const { reconnectSeamDetail, notSentDetail, spokenOutcomeKind, spokenYesSeam } = CALL;
+  assert.match(reconnectSeamDetail("recap", "typed"), /sent this call's record, and your message went again/);
+  assert.match(reconnectSeamDetail("fresh", "none"), /has seen nothing above this line/);
+  assert.equal(reconnectSeamDetail("fresh", "nothing"), undefined, "a pair no sentence names was given one");
+  assert.match(notSentDetail("withdrawn"), /^You tapped Don't send/);
+  assert.equal(notSentDetail("declined"), spokenYesSeam("declined").detail, "a spoken no did not say what the spoken yes's table says");
+  assert.equal(notSentDetail("something new"), notSentDetail("lapsed"));
+  assert.deepStrictEqual([spokenOutcomeKind("refused"), spokenOutcomeKind("mystery")], ["refused", "not_armed"]);
+  assert.equal(spokenYesSeam("sent").label, "Sent by voice");
+  assert.match(spokenYesSeam("gone").detail, /no draft was waiting/);
+});
+
 // --- the requests module, on its own ports (`#624 voice-page-modularity`) -----------------------
 
 /**

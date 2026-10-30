@@ -22,3 +22,4 @@ export {
   seamDetailFor,
 } from "./recap.ts";
 export type { Boundary, Recap } from "./recap.ts";
+export { notSentDetail, reconnectSeamDetail, spokenOutcomeKind, spokenYesSeam } from "./seams.ts";
