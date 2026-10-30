@@ -39,6 +39,8 @@ class Config:
     qualifying: list[str] = field(default_factory=lambda: ["local-ledger-pass"])
     probes: list[dict] = field(default_factory=list)
     state_dir: Path = Path("ignored/local-ci-hub")
+    evidence_root: Path | None = None
+    require_full_evidence: bool = True
     repos: list[dict] = field(default_factory=list)
 
     @property
@@ -99,7 +101,9 @@ def load(path: Path | None, root: Path | None = None) -> Config:
         workflows=list(rem.get("workflows", [])),
         qualifying=list(rec.get("qualifying", ["local-ledger-pass"])),
         probes=list(health.get("probes", [])),
-        state_dir=_resolve(root, str(data.get("land", {}).get("state_dir", "ignored/local-ci-hub"))),
+        state_dir=_resolve(root, str(data["land"]["state_dir"])) if data.get("land", {}).get("state_dir") else Path.home() / ".local" / "state" / "local-ci-hub",
+        evidence_root=_resolve(root, str(led["evidence_root"])) if led.get("evidence_root") else None,
+        require_full_evidence=bool(rec.get("require_full_evidence", True)),
     )
     unknown = set(cfg.qualifying) - {"local-ledger-pass", "remote-pass"}
     if unknown:

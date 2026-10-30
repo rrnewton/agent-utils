@@ -71,7 +71,7 @@ def main(argv: list[str] | None = None) -> int:
     rec = sub.add_parser("receipt"); rec.add_argument("op", choices=["show", "verify"]); rec.add_argument("commit")
     rem = sub.add_parser("remote"); rem.add_argument("op", choices=["status", "dispatch"]); rem.add_argument("--workflow", default=""); rem.add_argument("--ref", default="")
     hea = sub.add_parser("health"); hea.add_argument("--probe", default="")
-    lan = sub.add_parser("land"); lan.add_argument("op", choices=["acquire", "release", "run", "verify"]); lan.add_argument("--holder", default="agent"); lan.add_argument("--commit", default=""); lan.add_argument("--target", default="HEAD")
+    lan = sub.add_parser("land"); lan.add_argument("op", choices=["acquire", "release", "run", "verify"]); lan.add_argument("--holder", default="agent"); lan.add_argument("--commit", default=""); lan.add_argument("--target", default="HEAD"); lan.add_argument("command", nargs="*")
     args = p.parse_args(argv)
     if args.cmd == "quickstart":
         print(QUICKSTART); return 0
@@ -129,6 +129,10 @@ def main(argv: list[str] | None = None) -> int:
             res = land_mod.acquire(cfg, args.holder)
         elif args.op == "release":
             res = land_mod.release(cfg, args.holder)
+        elif args.op == "run":
+            cmd = args.command[1:] if args.command[:1] == ["--"] else args.command
+            res = land_mod.run_locked(cfg, args.holder, cmd) if cmd else {"status": "usage-error", "reason": "land run needs a command after --"}
+            _out(res, args.json); return int(res.get("exit_code", 1)) if res.get("status") == "ran" else 1
         else:
             res = land_mod.verify(cfg, args.commit, args.target)
         _out(res, args.json); return 0 if res.get("status") in ("acquired", "released", "free") or res.get("ancestor") else 1

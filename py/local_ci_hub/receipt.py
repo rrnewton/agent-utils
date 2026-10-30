@@ -34,12 +34,14 @@ def show(cfg: Config, commit: str, remote: dict | None = None) -> dict:
             pass
     rows = Ledger(cfg).for_commit(commit)
     def _strict_pass(r):
-        if r.get("result") != "PASS" or r.get("_digest_ok") is False:
+        if r.get("result") != "PASS" or r.get("_digest_ok") is False or r.get("_evidence_ok") is False:
             return False
         if r.get("commit_anchored") is False:
             return False
+        if cfg.require_full_evidence and not (r.get("commit_anchored") is True and isinstance(r.get("executed_tests"), (int, float)) and not isinstance(r.get("executed_tests"), bool) and r.get("executed_tests", 0) > 0):
+            return False  # full-evidence projects: anchoring and executed tests are mandatory, not optional
         tests = r.get("executed_tests")
-        if tests is not None and not (isinstance(tests, (int, float)) and tests > 0):
+        if tests is not None and not (isinstance(tests, (int, float)) and not isinstance(tests, bool) and tests > 0):
             return False
         return True
     local_pass = any(_strict_pass(r) for r in rows)

@@ -30,3 +30,20 @@ Delete after caller migration (aliases of CLI commands):
 Stay project-owned (not CI evidence): verified git/gh wrappers,
 task/chat/escalation scripts, landing sequence, health probes,
 compatibility website, series store.
+
+## Update: evidence dereference + 100-commit rerun
+
+row-ref/v1 evidence is now dereferenced (hash, length, and
+decompressor exit verified; referenced commit/run must match the
+envelope; a refusal is sticky across later events). With
+full-evidence strictness on (anchoring + executed tests mandatory):
+last 100 main commits agree 100/100 with ci-hub qualified-rows.
+Across all 2,672 distinct ledger commits: 2,483 agree, 189
+disagree — 169 where local-ci-hub is stricter (safe direction,
+mostly any-FAIL vetoes and missing full evidence) and 20 where it
+is looser (remaining canonical-predicate details such as gate
+completeness not yet ported; sample `ee303899`). Canonical digest
+still differs from the Rust HistoryRow digest (typed field order
+and defaults); the Rust digest remains the authority for the
+origin project. No PR field exists in ledger rows, so "PR heads in
+the ledger" resolved to all distinct ledger commits above.

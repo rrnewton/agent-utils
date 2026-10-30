@@ -30,10 +30,23 @@ def release(cfg: Config, holder: str) -> dict:
     lock = _lock(cfg)
     if not lock.exists():
         return {"status": "free"}
-    if lock.read_text().strip() not in (holder, ""):
-        return {"status": "held-by-other", "holder": lock.read_text().strip()}
+    if lock.read_text().strip() != holder:
+        return {"status": "held-by-other", "holder": lock.read_text().strip()}  # an empty lock is a live acquisition, never removable by others
     lock.unlink()
     return {"status": "released"}
+
+
+def run_locked(cfg: Config, holder: str, command: list[str]) -> dict:
+    """Run one project command while holding the landing lock; always releases."""
+    got = acquire(cfg, holder)
+    if got.get("status") != "acquired":
+        return got
+    try:
+        import subprocess as _sp
+        r = _sp.run(command, cwd=cfg.root, timeout=3600)
+        return {"schema": "local-ci-hub/land/v1", "status": "ran", "exit_code": r.returncode}
+    finally:
+        release(cfg, holder)
 
 
 def verify(cfg: Config, commit: str, target: str = "HEAD") -> dict:

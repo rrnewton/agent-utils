@@ -23,7 +23,7 @@ def toy_repo(tmp_path: Path, validate: str = "true") -> Path:
     (repo / "local-ci-hub.toml").write_text(
         '[project]\nname="toy"\n[validate]\ncommand=["/bin/sh","-c","' + validate + '"]\n'
         'admission_slots=2\n[ledger]\nteam="toy"\npublish="none"\nlocation={path="ci-ledger"}\n'
-        '[remote]\nprovider="none"\n[receipt]\nqualifying=["local-ledger-pass"]\n')
+        '[remote]\nprovider="none"\n[receipt]\nqualifying=["local-ledger-pass"]\nrequire_full_evidence=false\n[land]\nstate_dir="ignored/local-ci-hub"\n')
     subprocess.run(["git", "add", "-A"], cwd=repo, timeout=15)
     subprocess.run(["git", "commit", "-qm", "toy: init"], cwd=repo, timeout=15)
     return repo
@@ -85,3 +85,31 @@ def test_goalpost_prefix_and_enrich_cannot_qualify(tmp_path):
     run_cli(repo, "ledger", "publish")
     out = run_cli(repo, "--json", "receipt", "show", sha[:1])
     assert json.loads(out.stdout)["verdict"] != "qualified"
+
+
+def test_row_ref_missing_evidence_refuses(tmp_path):
+    repo = toy_repo(tmp_path)
+    sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
+    led = repo / "ci-ledger"; led.mkdir(exist_ok=True)
+    ev = {"schema": "validate-ledger/v1", "event_type": "run.result", "event_id": "e1",
+          "run_id": "r1", "commit": sha, "outcome": "pass", "legacy_row": {},
+          "legacy_row_codec": {"codec": "row-ref/v1", "locator": "run-evidence/x/y.json.zst",
+                               "sha256": "0" * 64, "bytes": 2, "compressed_sha256": "0" * 64}}
+    (led / "ledger.jsonl").write_text(json.dumps(ev) + "\n")
+    out = run_cli(repo, "--json", "receipt", "show", "HEAD")
+    assert json.loads(out.stdout)["verdict"] != "qualified"  # missing evidence refuses, never qualifies
+
+
+def test_canonical_bytes_deterministic():
+    from local_ci_hub.ledger import canonical_bytes, digest
+    a = {"b": 1, "a": {"y": [1, 2], "x": "é"}}
+    assert canonical_bytes(a) == canonical_bytes({"a": {"x": "é", "y": [1, 2]}, "b": 1})
+    assert digest(a) != digest({"b": 2, "a": {"y": [1, 2], "x": "é"}})
+
+
+def test_land_run_executes_under_lock(tmp_path):
+    repo = toy_repo(tmp_path)
+    r = run_cli(repo, "land", "run", "--holder", "a", "--", "/bin/sh", "-c", "echo landed > landed.txt")
+    assert r.returncode == 0 and (repo / "landed.txt").exists()
+    # lock was released afterwards
+    assert run_cli(repo, "land", "acquire", "--holder", "b").returncode == 0

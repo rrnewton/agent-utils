@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -79,7 +80,13 @@ class Ledger:
             if rid not in rows:
                 rows[rid] = {"run_id": rid}
                 order.append(rid)
-            src = ev.get("legacy_row") if isinstance(ev.get("legacy_row"), dict) else ev
+            src = ev.get("legacy_row") if isinstance(ev.get("legacy_row"), dict) and ev.get("legacy_row") else ev
+            evidence_ok = True
+            codec = ev.get("legacy_row_codec") or {}
+            if codec.get("codec") == "row-ref/v1":
+                src, evidence_ok = self._resolve_ref(codec)
+                if evidence_ok and (src.get("commit") not in (None, ev.get("commit")) or src.get("run_id") not in (None, rid)):
+                    src, evidence_ok = {}, False  # referenced evidence must name the same commit and run
             merged = dict(rows[rid])
             merged.update({k: v for k, v in src.items() if k not in ("kind", "event_type", "legacy_row")})
             for k in ("commit", "host", "team", "run_id", "event_id", "finished_at"):
@@ -92,8 +99,36 @@ class Ledger:
             if "digest" in ev:
                 expect = digest({k: v for k, v in ev.items() if k != "digest"})
                 merged["_digest_ok"] = (expect == ev["digest"])
+            merged["_evidence_ok"] = bool(evidence_ok and rows[rid].get("_evidence_ok", True))  # once refused, always refused
             rows[rid] = merged
         return [rows[r] for r in order]
+
+    def _resolve_ref(self, codec: dict):
+        """Dereference one row-ref/v1 evidence object; (row, ok). Refuses on any mismatch."""
+        root = self.cfg.evidence_root
+        loc = str(codec.get("locator", ""))
+        if root is None or not loc or Path(loc).is_absolute() or ".." in Path(loc).parts:
+            return {}, False
+        path = root / loc
+        try:
+            blob = path.read_bytes()
+        except OSError:
+            return {}, False
+        if hashlib.sha256(blob).hexdigest() != codec.get("compressed_sha256"):
+            return {}, False
+        if len(blob) != codec.get("compressed_bytes"):
+            return {}, False
+        proc = subprocess.run(["zstd", "-dc", str(path)], capture_output=True, timeout=60)
+        if proc.returncode != 0:
+            return {}, False
+        raw = proc.stdout
+        try:
+            row = json.loads(raw)
+        except Exception:
+            return {}, False
+        if not isinstance(row, dict) or hashlib.sha256(raw).hexdigest() != codec.get("sha256") or len(raw) != codec.get("bytes"):
+            return {}, False
+        return row, True
 
     def append_result(self, *, commit: str, result: str, run_id: str | None = None,
                       cell: str = "", command: str = "", host: str | None = None) -> dict:

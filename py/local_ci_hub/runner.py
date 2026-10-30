@@ -1,6 +1,7 @@
 """Run engine: admit, launch, list, stop validation runs on this machine."""
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import subprocess
@@ -28,7 +29,28 @@ def _commit(root: Path) -> str:
 def start(cfg: Config, *, wait: bool = True, commit: str = "", cell: str = "") -> dict:
     """Admit and run the validate command, recording its ledger result."""
     handles = _handles(cfg)
-    active = [h for h in handles.glob("*.json") if json.loads(h.read_text()).get("state") == "running"]
+    lock_fd = (handles / "admission.lock").open("a+")
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)  # machine-wide admission is atomic under this lock
+    active = []
+    for h in handles.glob("*.json"):
+        try:
+            data = json.loads(h.read_text())
+        except Exception:
+            continue
+        if data.get("state") != "running":
+            continue
+        pid = data.get("pid")
+        alive = False
+        if pid:
+            try:
+                os.kill(int(pid), 0); alive = True
+            except (ProcessLookupError, ValueError):
+                alive = False
+        if alive:
+            active.append(h)
+        else:
+            data["state"] = "stale"  # reaped: a dead pid never holds a slot forever
+            h.write_text(json.dumps(data, indent=1))
     if len(active) >= cfg.admission_slots:
         return {"schema": "local-ci-hub/run/v1", "state": "refused", "reason": f"admission full ({cfg.admission_slots} slots)"}
     run_id = f"run-{uuid.uuid4().hex[:12]}"
@@ -44,6 +66,7 @@ def start(cfg: Config, *, wait: bool = True, commit: str = "", cell: str = "") -
         proc = subprocess.Popen(cfg.validate_command, cwd=cfg.root, stdout=lf, stderr=subprocess.STDOUT)
     handle["pid"] = proc.pid
     hp.write_text(json.dumps(handle, indent=1))
+    lock_fd.close()  # admission decided and pid published; do not serialize the run itself
     if not wait:
         return handle
     rc = proc.wait()
