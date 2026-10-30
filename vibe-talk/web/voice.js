@@ -132,15 +132,16 @@ const COLUMN_IDS = {
  * `fromCards` says the thread the right column shows was entered from its card, so that ← goes back
  * out to the cards (`#277 thread-card-focus`, `enterCard`).
  *
- * `older`, `arrows`, `load`, `entry`, `pins`, `tools`, `filter`, `list`, `rows`, `selection`, `composer` and `done` are the column's own records of its older pages
+ * `older`, `arrows`, `load`, `entry`, `pins`, `tools`, `filter`, `list`, `rows`, `selection`, `composer`, `done` and `place` are the column's own records of its older pages
  * (`freshOlderPages`, `olderPages`), its reply arrows (`freshReplyArrows`, `replyArrows`), its reads'
  * state (`freshLoadState`, `loadState`), entering a view (`freshEntryState`, `entryState`), its Pinned
  * filter (`freshPinsView`, `pinsView`), its scroll tools' pass (`freshScrollTools`, `scrollTools`) and
  * its filters' hold (`freshFilterState`, `filterState`), what its list has drawn (`freshListState`,
  * `listState`), the rows it was drawn from (`freshTimelineRows`, `timelineRows`) and what it shows
  * (`freshSelection`, `selection`), its message box (`freshComposerState`, `composerState`) and what it
- * shows as Done (`freshDoneState`, `doneState`; `#624 voice-page-modularity`, plan step 15): field
- * groups kept on the column rather than in `state`.
+ * shows as Done (`freshDoneState`, `doneState`) and where its list stands against its newest message
+ * (`freshScrollPlace`, `scrollPlace`; `#624 voice-page-modularity`, plan step 15): field groups kept on
+ * the column rather than in `state`.
  *
  * @typedef {{matched: number, loaded: number, tally: any, pinned: boolean}} SearchCount
  * @typedef {{name: string, state: unknown[] | null, searched: SearchCount | null,
@@ -150,18 +151,20 @@ const COLUMN_IDS = {
  *   pins: ReturnType<typeof freshPinsView>, tools: ReturnType<typeof freshScrollTools>,
  *   filter: ReturnType<typeof freshFilterState>, list: ReturnType<typeof freshListState>,
  *   rows: ReturnType<typeof freshTimelineRows>, selection: ReturnType<typeof freshSelection>,
- *   composer: ReturnType<typeof freshComposerState>, done: ReturnType<typeof freshDoneState>}} ColumnFields
+ *   composer: ReturnType<typeof freshComposerState>, done: ReturnType<typeof freshDoneState>,
+ *   place: ReturnType<typeof freshScrollPlace>}} ColumnFields
  * @type {{main: ColumnFields, side: ColumnFields & {mode: "list" | "thread", fromCards: boolean}}}
  */
 const columns = {
   main: { name: "main", state: null, searched: null, searchWalk: null, searchNote: null, older: freshOlderPages(), arrows: freshReplyArrows(),
     load: freshLoadState(), entry: freshEntryState(), pins: freshPinsView(), tools: freshScrollTools(),
     filter: freshFilterState(), list: freshListState(), rows: freshTimelineRows(), selection: freshSelection("main"),
-    composer: freshComposerState(), done: freshDoneState() },
+    composer: freshComposerState(), done: freshDoneState(), place: freshScrollPlace() },
   side: { name: "side", state: null, searched: null, searchWalk: null, searchNote: null, mode: "list", fromCards: false,
     older: freshOlderPages(), arrows: freshReplyArrows(), load: freshLoadState(), entry: freshEntryState(),
     pins: freshPinsView(), tools: freshScrollTools(), filter: freshFilterState(), list: freshListState(),
-    rows: freshTimelineRows(), selection: freshSelection(), composer: freshComposerState(), done: freshDoneState() },
+    rows: freshTimelineRows(), selection: freshSelection(), composer: freshComposerState(), done: freshDoneState(),
+    place: freshScrollPlace() },
 };
 /** The column the code is working on now. The left one, except inside `inColumn`. */
 let activeColumn = columns.main;
@@ -5369,8 +5372,34 @@ const SUMMARY_MODE_ON = "Summaries on";
 // unknown, and "3 new" over sixty would be a lie. The number can be 0: something changed below
 // that is not a new message — a turn still being spoken, a seam — and the jump says only "New"
 // until a message that can be counted arrives after it.
-/** @type {{voice: boolean | number, discord: boolean | number}} */
-const jumpNewestWanted = { voice: false, discord: false };
+/**
+ * A column's own record of where its list stands against its newest message (`#624
+ * voice-page-modularity`, plan step 15, as `freshOlderPages`): `jumpWanted`, the channel list's entry
+ * of `jumpNewestWanted`; `inScrollback`, its entry of `inScrollback`. The voice list's entries are the
+ * page's, there being one voice list.
+ *
+ * @returns {{jumpWanted: boolean | number, inScrollback: boolean}}
+ */
+function freshScrollPlace() {
+  return { jumpWanted: false, inScrollback: false };
+}
+
+/** The column being worked on's record of where its list stands (`freshScrollPlace`). */
+function scrollPlace() {
+  return activeColumn.place;
+}
+
+/**
+ * By list, the arrival its jump to the newest message is for. The channel list's (`discord`) is the
+ * column worked on's (`scrollPlace`), reached through the property so every `[view]` lookup reads it.
+ *
+ * @type {{voice: boolean | number, discord: boolean | number}}
+ */
+const jumpNewestWanted = {
+  voice: false,
+  get discord() { return scrollPlace().jumpWanted; },
+  set discord(value) { scrollPlace().jumpWanted = value; },
+};
 
 /**
  * Raise or lower the arrival on one list's jump. `arrived` is how many new messages it was for:
@@ -5401,8 +5430,17 @@ function setJumpNewest(wanted, view = currentView, arrived = 0) {
  */
 const SCROLLBACK_PX = 64;
 
-/** Whether each list is in its scrollback, as the jump last decided it. See `SCROLLBACK_PX`. */
-const inScrollback = { voice: false, discord: false };
+/**
+ * Whether each list is in its scrollback, as the jump last decided it. See `SCROLLBACK_PX`. The channel
+ * list's (`discord`) is the column worked on's (`scrollPlace`), as `jumpNewestWanted`'s is.
+ *
+ * @type {{voice: boolean, discord: boolean}}
+ */
+const inScrollback = {
+  voice: false,
+  get discord() { return scrollPlace().inScrollback; },
+  set discord(value) { scrollPlace().inScrollback = value; },
+};
 
 /** The largest count the jump spells out; past it, "99+ new". A wider chip says nothing more. */
 const JUMP_COUNT_MAX = 99;
@@ -47205,8 +47243,6 @@ const sideThreads = new Map();
  */
 const COLUMN_STATE = [
   [() => gathered, (value) => { gathered = value; }, () => null],
-  [() => jumpNewestWanted.discord, (value) => { jumpNewestWanted.discord = value; }, () => false],
-  [() => inScrollback.discord, (value) => { inScrollback.discord = value; }, () => false],
 ];
 
 /** Work on column `column` from now on: its state into the module's, the other's put aside. */
@@ -50960,6 +50996,7 @@ function resetSideColumn(reopen = false) {
     columns.side.selection = freshSelection();
     columns.side.composer = freshComposerState();
     columns.side.done = freshDoneState();
+    columns.side.place = freshScrollPlace();
   }
   for (const id of ["side-log", "side-thread-list", "side-summary", "side-pinned-log", "side-outgoing-log"]) {
     leftEl(id).replaceChildren();

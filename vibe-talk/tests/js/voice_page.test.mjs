@@ -7197,7 +7197,7 @@ test("`#624 voice-page-modularity`: a read asked for while another is out joins 
   assert.deepStrictEqual([started, generation.current()], [0, 1]);
 });
 
-test("`#624 voice-page-modularity`: each column keeps its own records of its older pages, reply arrows, reads, entries, pins, scroll tools, filters, lists, rows, selection, boxes and Done marks, reached through the column worked on", () => {
+test("`#624 voice-page-modularity`: each column keeps its own records of its older pages, reply arrows, reads, entries, pins, scroll tools, filters, lists, rows, selection, boxes, Done marks and scroll places, reached through the column worked on", () => {
   const page = newPage();
   const same = (expression) => page.pure(expression);
   assert.equal(same("olderPages() === columns.main.older"), true, "the left column's record was not the one worked on");
@@ -7253,6 +7253,10 @@ test("`#624 voice-page-modularity`: each column keeps its own records of its old
   assert.equal(same("columns.side.done.archived !== columns.main.done.archived && doneState() === columns.main.done"), true);
   assert.equal(same("inColumn(columns.side, () => composerState()) === columns.side.composer"), true);
   assert.deepStrictEqual(JSON.parse(same("JSON.stringify([freshComposerState(), freshDoneState().archived.size])")), [{ key: "" }, 0]);
+  // And where its list stands: the channel list's entries of the shared lookups are the column's, the voice list's the page's.
+  same("inColumn(columns.side, () => { jumpNewestWanted.discord = 3; inScrollback.discord = true; }); jumpNewestWanted.voice = 2");
+  assert.deepStrictEqual(JSON.parse(same("JSON.stringify([columns.side.place, jumpNewestWanted.discord, inScrollback.discord, jumpNewestWanted.voice, inColumn(columns.side, () => jumpNewestWanted.voice)])")),
+    [{ jumpWanted: 3, inScrollback: true }, false, false, 2, 2]);
 });
 
 test("`#624 voice-page-modularity`: the live events counted per channel, from the module alone", () => {
