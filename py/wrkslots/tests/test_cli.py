@@ -1173,3 +1173,119 @@ def test_in_scope_print_reports_the_private_binds_the_entry_will_create(
     assert nested in [
         item["source"] for item in planned["writable"]["binds"]  # type: ignore[index]
     ]
+
+
+# ------------------------- --expect-writable: the entered set is the reported set
+
+
+def test_entry_refuses_a_writable_set_other_than_the_reported_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--print alone enforces nothing; the real entry compares its whole set with the report.
+
+    A --read-write input that was missing when the report was made (so the
+    report skipped it) and exists at entry would add a writable bind: refused
+    before any private state is written, sudo is probed or anything is executed.
+    """
+
+    _home, target, cgroup, log = _in_scope_host(tmp_path, monkeypatch)
+    view = _slot_view(tmp_path)
+    late = tmp_path / "late-input"
+    settings = dataclasses.replace(_closed_settings(target), read_write=(str(target), str(late)))
+    request = dict(unit="run-1.scope", expected=_APP, slot_writable=False, cgroup_file=cgroup)
+    reported = sandbox.in_scope_plan(view, settings, ["true"], **request)["writable"]  # type: ignore[arg-type]
+    assert isinstance(reported, dict)
+    assert _bind_targets(reported) == [str(target)]
+
+    late.mkdir()
+    with pytest.raises(sandbox.SandboxError, match="differs from the expected one"):
+        sandbox.enter_in_place(
+            view, settings, ["true"], expected_writable=reported, **request  # type: ignore[arg-type]
+        )
+    assert not (tmp_path / "state").exists()
+    assert not any(line.startswith("sudo") for line in _calls(log))
+
+    # Every member is compared, not only the binds.
+    late.rmdir()
+    for changed in (
+        {**reported, "tmp": {"target": "/tmp", "size": "2G"}},
+        {**reported, "protect_system": False},
+        {**reported, "binds": []},
+        {**reported, "extra": 1},
+    ):
+        with pytest.raises(sandbox.SandboxError, match="differs from the expected one"):
+            sandbox.in_scope_plan(
+                view, settings, ["true"], expected_writable=changed, **request  # type: ignore[arg-type]
+            )
+
+    # The reported set itself is accepted, and the entry proceeds to the helper.
+    with pytest.raises(_Execed) as caught:
+        sandbox.enter_in_place(
+            view, settings, ["true"], expected_writable=reported, **request  # type: ignore[arg-type]
+        )
+    actual = caught.value.spec["view"]
+    assert isinstance(actual, dict)
+    assert sandbox.writable_set(actual) == reported
+
+
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    [
+        (["--expect-writable", "{}", "--", "true"], "--expect-writable applies only with --in-scope"),
+        (["--place-only", "--expect-writable", "{}"], "--place-only runs nothing and takes no --expect-writable"),
+        (
+            ["--in-scope", "run-1.scope", "--expect-slices",
+             json.dumps({"enclosing": None, "all_slots": "wrkslots.slice", "slot": "wrkslots-slot\\x2db.slice"}),
+             "--expect-writable", "[1]", "--", "true"],
+            "--expect-writable must be the JSON object --print reported as writable",
+        ),
+    ],
+)
+def test_run_refuses_expect_writable_where_it_cannot_apply(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    extra: list[str],
+    message: str,
+) -> None:
+    root = _registered_slot(tmp_path)
+    log = _fake_systemd_tools(tmp_path, monkeypatch)
+    capsys.readouterr()
+
+    assert cli.main(["--project-root", str(root), "run", "slot-b", *extra]) != 0
+
+    assert message in capsys.readouterr().err
+    assert _calls(log) == []
+
+
+def test_run_in_scope_print_with_a_different_expected_set_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _registered_slot(tmp_path)
+    _home, _target, cgroup, _log = _in_scope_host(tmp_path, monkeypatch)
+    target = root / "worktrees" / "slot-b" / "target"
+    target.mkdir()
+    cgroup.write_text(
+        _MANAGER + "/app.slice/app-wrkslots.slice/app-wrkslots-slot\\x2db.slice/run-1.scope\n"
+    )
+    real = sandbox.in_scope_plan
+
+    def plan(*args: object, **kwargs: object) -> dict[str, object]:
+        return real(*args, **kwargs, cgroup_file=cgroup)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(sandbox, "in_scope_plan", plan)
+    slices = json.dumps(
+        {"enclosing": "app.slice", "all_slots": "app-wrkslots.slice", "slot": "app-wrkslots-slot\\x2db.slice"}
+    )
+    base = ["--project-root", str(root), "run", "slot-b", "--in-scope", "run-1.scope",
+            "--expect-slices", slices, "--isolation", "root", "--closed-set",
+            "--home-private", ".cargo", "--read-write", str(target), "--tmp-size", "1G"]
+    capsys.readouterr()
+    assert cli.main([*base, "--print", "--", "true"]) == 0
+    writable = json.loads(capsys.readouterr().out)["writable"]
+
+    assert cli.main([*base, "--expect-writable", json.dumps(writable), "--print", "--", "true"]) == 0
+    capsys.readouterr()
+    narrowed = {**writable, "binds": []}
+    assert cli.main([*base, "--expect-writable", json.dumps(narrowed), "--print", "--", "true"]) != 0
+    assert "differs from the expected one" in capsys.readouterr().err

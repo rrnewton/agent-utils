@@ -1970,28 +1970,48 @@ def in_scope_plan(
     cwd: Path | None = None,
     slot_writable: bool = True,
     deadline_ns: int | None = None,
+    expected_writable: Mapping[str, object] | None = None,
     cgroup_file: Path = Path("/proc/self/cgroup"),
 ) -> dict[str, object]:
     """What :func:`enter_in_place` would do, writing nothing in the slot's state.
 
     Verifies the scope and slices exactly as the real entry does, then returns
-    the view spec, its complete writable set, and the helper argv.
+    the view spec, its complete writable set, and the helper argv. With
+    ``expected_writable``, refuses unless that writable set is exactly it.
     """
 
     _check_in_scope_request(view, settings, command)
     verify_in_scope(view, unit, expected, deadline_ns=deadline_ns, cgroup_file=cgroup_file)
     home = Path(os.environ.get("HOME", str(Path.home())))
     spec = build_spec(view, settings, home, cwd or view.slot_path, slot_writable=slot_writable)
+    # Nothing is prepared here; the real entry creates the private
+    # directories first, and their binds are part of its writable set.
+    writable = writable_set(spec, created_sources=planned_private_sources(view, settings))
+    _check_expected_writable(writable, expected_writable)
     return {
         "unit": unit,
         "slices": expected.to_obj(),
-        # Nothing is prepared here; the real entry creates the private
-        # directories first, and their binds are part of its writable set.
-        "writable": writable_set(spec, created_sources=planned_private_sources(view, settings)),
+        "writable": writable,
         "helper": root_helper("SPEC-FILE"),
         "command": list(command),
         "view": spec,
     }
+
+
+def _check_expected_writable(actual: Mapping[str, object], expected: Mapping[str, object] | None) -> None:
+    """Refuse unless the writable set about to be entered is exactly the one the caller accepted.
+
+    ``expected`` is the ``writable`` object an earlier ``--print`` reported; it is
+    compared whole (every bind, in order, and every other member), so a set that
+    gained, lost or changed any member is refused. None means no expectation.
+    """
+
+    if expected is not None and dict(actual) != dict(expected):
+        raise SandboxError(
+            "the writable set this entry would have differs from the expected one: "
+            f"{json.dumps(actual, sort_keys=True)} is not {json.dumps(expected, sort_keys=True)}; "
+            "refusing to enter the box"
+        )
 
 
 def _check_in_scope_request(view: SlotView, settings: SandboxSettings, command: Sequence[str]) -> None:
@@ -2016,6 +2036,7 @@ def enter_in_place(
     cwd: Path | None = None,
     slot_writable: bool = True,
     deadline_ns: int | None = None,
+    expected_writable: Mapping[str, object] | None = None,
     cgroup_file: Path = Path("/proc/self/cgroup"),
 ) -> None:
     """Enter the slot's box from inside the caller's own scope; never creates or joins a scope.
@@ -2027,7 +2048,10 @@ def enter_in_place(
     :func:`write_root_spec`, :func:`root_helper` -- and execs the helper, which
     (:func:`enter_root`) unshares the mount namespace, drops privilege and
     execs ``command``. No slice limit is applied here: place_only did that.
-    Returns only by raising.
+    With ``expected_writable`` (the ``writable`` object a ``--print`` reported),
+    the writable set is compared whole before the private state is prepared
+    and again from the spec about to be written; any difference refuses and
+    nothing is executed. Returns only by raising.
     """
 
     _check_in_scope_request(view, settings, command)
@@ -2037,15 +2061,25 @@ def enter_in_place(
             "coordinator box hides every slot's private state; run it outside the box"
         )
     verify_in_scope(view, unit, expected, deadline_ns=deadline_ns, cgroup_file=cgroup_file)
-    check_sudo(deadline_ns=deadline_ns)
     home = Path(os.environ.get("HOME", str(Path.home())))
     workdir = cwd or view.slot_path
+    planned = planned_private_sources(view, settings)
+    if expected_writable is not None:
+        # Before anything is written: the same set the --print report derived.
+        _check_expected_writable(
+            writable_set(build_spec(view, settings, home, workdir, slot_writable=slot_writable),
+                         created_sources=planned),
+            expected_writable,
+        )
+    check_sudo(deadline_ns=deadline_ns)
     try:
         prepare_state(view, settings, home)
     except OSError as exc:
         raise SandboxError(f"cannot prepare the private state of {view.slot}: {exc}") from exc
     environment = child_environment(view, settings, os.environ)
     spec = build_spec(view, settings, home, workdir, slot_writable=slot_writable)
+    # And from the spec the helper will actually build.
+    _check_expected_writable(writable_set(spec, created_sources=planned), expected_writable)
     spec_file = write_root_spec(spec, command, environment)
     argv = root_helper(spec_file)
     try:

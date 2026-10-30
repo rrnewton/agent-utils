@@ -2230,7 +2230,10 @@ the options name plus the private layer and `/tmp`; it refuses `--no-protect-sys
 with `--home-private .cargo` gives COMMAND a private, writable `~/.cargo` in the slot's state
 instead of the real one. Adding `--print` verifies the placement the same way, writes nothing into
 the slot's state, and prints one JSON object with the view, its complete writable set (`writable`)
-and the helper argv.
+and the helper argv. The report alone enforces nothing: pass its `writable` object to the real
+entry as `--expect-writable JSON`, and the entry compares its own complete writable set with it,
+before writing any private state and again from the view it is about to build, and refuses on any
+difference instead of entering the box.
 
 ### Limits of the box
 

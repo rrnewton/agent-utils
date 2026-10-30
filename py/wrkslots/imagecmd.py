@@ -232,7 +232,8 @@ def register(subparsers: argparse._SubParsersAction[_ParserT], formatter: type[a
             "it checks that this process is in UNIT directly under those slices (it never reads the "
             "slice again), then runs the ordinary root-isolation steps and execs, creating no "
             "second scope and applying no limits. --closed-set makes the view's writable set "
-            "exactly what the options name; with --print it prints that complete set as JSON."
+            "exactly what the options name; with --print it prints that complete set as JSON, "
+            "and --expect-writable JSON makes the real entry refuse unless its set is exactly that."
         ),
         formatter_class=formatter,
     )
@@ -269,6 +270,17 @@ def register(subparsers: argparse._SubParsersAction[_ParserT], formatter: type[a
             "with --in-scope: the object --place-only --format json printed, "
             '{"enclosing": NAME or null, "all_slots": NAME, "slot": NAME}; it must name this '
             "slot's slices"
+        ),
+    )
+    run.add_argument(
+        "--expect-writable",
+        metavar="JSON",
+        default=None,
+        help=(
+            "with --in-scope: the \"writable\" object an earlier --print of the same command "
+            "reported; the entry compares its own complete writable set with it, before writing "
+            "any private state and again from the view it is about to build, and refuses on any "
+            "difference instead of entering the box"
         ),
     )
     run.add_argument(
@@ -1140,11 +1152,13 @@ def _cmd_run(args: argparse.Namespace) -> int:
         settings = _override_settings(config.sandbox_settings, args)
         in_scope: str | None = getattr(args, "in_scope", None)
         expect_slices: str | None = getattr(args, "expect_slices", None)
+        expect_writable: str | None = getattr(args, "expect_writable", None)
         closed_set = bool(getattr(args, "closed_set", False))
         if getattr(args, "place_only", False):
             for option, given in (
                 ("--in-scope", in_scope is not None),
                 ("--expect-slices", expect_slices is not None),
+                ("--expect-writable", expect_writable is not None),
                 ("--closed-set", closed_set),
             ):
                 if given:
@@ -1154,6 +1168,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
             raise _refuse("--format applies only with --place-only")
         if in_scope is not None or expect_slices is not None:
             return _in_scope(args, view, settings, in_scope, expect_slices, closed_set, deadline_ns)
+        if expect_writable is not None:
+            raise _refuse("--expect-writable applies only with --in-scope")
         for option, given in (
             ("--deadline-monotonic-ns", deadline_ns is not None),
             ("--closed-set", closed_set),
@@ -1220,6 +1236,18 @@ def _expected_slices(text: str) -> sandbox.SlicePlacement:
     return sandbox.SlicePlacement(enclosing=enclosing, all_slots=all_slots, slot=slot)
 
 
+def _expected_writable(text: str | None) -> dict[str, object] | None:
+    if text is None:
+        return None
+    try:
+        loaded: object = json.loads(text)
+    except ValueError as exc:
+        raise _refuse(f"--expect-writable must be the JSON object --print reported as writable: {exc}") from exc
+    if not isinstance(loaded, dict):
+        raise _refuse("--expect-writable must be the JSON object --print reported as writable")
+    return {str(key): value for key, value in loaded.items()}
+
+
 def _in_scope(
     args: argparse.Namespace,
     view: sandbox.SlotView,
@@ -1236,6 +1264,7 @@ def _in_scope(
     if closed_set and args.no_protect_system:
         raise _refuse("--closed-set refuses --no-protect-system: every other mount must stay read-only")
     expected = _expected_slices(expect_slices)
+    expected_writable = _expected_writable(getattr(args, "expect_writable", None))
     command = list(args.command)
     cwd = Path(args.cwd).absolute() if args.cwd else None
     if args.print_only:
@@ -1248,6 +1277,7 @@ def _in_scope(
             cwd=cwd,
             slot_writable=not closed_set,
             deadline_ns=deadline_ns,
+            expected_writable=expected_writable,
         )
         print(json.dumps(plan, indent=2, sort_keys=True))
         return 0
@@ -1260,6 +1290,7 @@ def _in_scope(
         cwd=cwd,
         slot_writable=not closed_set,
         deadline_ns=deadline_ns,
+        expected_writable=expected_writable,
     )
     raise AssertionError("enter_in_place returns only by raising")
 
