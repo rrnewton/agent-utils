@@ -22181,6 +22181,10 @@ def test_read_handoff_migrates_legacy_without_removing_and_enqueues_once(
         assert read.returncode == 0, read.stderr
         assert "read exactly once" in read.stdout
 
+    # The retirement view of a live-owned slot is blocked by the liveness
+    # authority's "alive" verdict; this test is about the migration, so
+    # report the owner dead and keep the original unblocked expectation.
+    set_liveness(project, "dead")
     config = wrkslots._load_config(str(project), "testhost")
     sidecar = wrkslots._handoff_sidecar_path(config, "slot01", 1)
     assert legacy.read_text(encoding="utf-8") == "read exactly once\n"
@@ -23367,6 +23371,9 @@ def test_same_digest_reenqueue_has_fresh_attempt_identity(
         "--coordinator-pid",
         str(os.getpid()),
     ).returncode == 0
+    # An attempt event now requires a dead owner: a live-owned slot is
+    # blocked before any attempt, so report the owner dead first.
+    set_liveness(project, "dead")
     assert (
         wrkslots.main(
             [
