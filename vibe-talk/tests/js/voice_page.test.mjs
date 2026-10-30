@@ -7372,6 +7372,39 @@ test("`#624 voice-page-modularity`: the quick retries after a stand-in read, fro
   assert.equal(retries.take(DISCORD_POLL_MS), DISCORD_POLL_MS, "a retry wanted before a current read was still taken");
 });
 
+test("`#624 voice-page-modularity`: what a key does in a message box, and a paste's own new line, from the module alone", () => {
+  const { createComposerKeys, PASTE_ENTER_MS } = VIEW_COMPOSER;
+  let now = 1000;
+  let enter = true;
+  const keys = createComposerKeys({ now: () => now, enterSends: () => enter });
+  const box = {};
+  let prevented = 0;
+  const key = (over = {}) => ({ key: "Enter", preventDefault: () => { prevented += 1; }, ...over });
+  const send = () => "sent";
+  assert.equal(keys.onKey(key(), send, box), "sent");
+  assert.equal(keys.onKey(key({ shiftKey: true }), send, box), undefined, "Shift+Enter sent");
+  assert.equal(keys.onKey(key({ isComposing: true }), send, box), undefined, "an Enter accepting a composed word sent");
+  assert.equal(keys.onKey(key({ keyCode: 229 }), send, box), undefined);
+  assert.equal(keys.onKey(key({ repeat: true }), send, box), undefined, "a held key's repeat sent again");
+  assert.equal(keys.onKey(key({ key: "a" }), send, box), undefined);
+  enter = false;
+  assert.equal(keys.onKey(key(), send, box), undefined, "a bare Enter sent with Enter to send off");
+  assert.equal(keys.onKey(key({ metaKey: true }), send, box), "sent", "the chord did not send with the setting off");
+  // An Enter within PASTE_ENTER_MS of a paste or a run of text in the same box is that paste's new line.
+  enter = true;
+  keys.noteInsertion(box, { type: "paste" });
+  assert.equal(keys.onKey(key(), send, box), undefined, "a paste's own new line sent it");
+  assert.equal(keys.onKey(key(), send, {}), "sent", "a paste in one box held another's Enter");
+  now += PASTE_ENTER_MS + 1;
+  assert.equal(keys.onKey(key(), send, box), "sent");
+  keys.noteInsertion(box, { inputType: "insertText", data: "x" });
+  assert.equal(keys.insertedJustNow(box), false, "one typed character counted as a paste");
+  keys.noteInsertion(box, { inputType: "insertText", data: "two words" });
+  assert.equal(keys.insertedJustNow(box), true);
+  keys.noteInsertion(box, { inputType: "insertText", data: "ab", isComposing: true });
+  assert.ok(prevented > 0);
+});
+
 test("`#624 voice-page-modularity`: the boxes that grow, on stand-in elements, from the module alone", () => {
   const { createComposerGrow, COMPOSER_GROW_BOXES, COMPOSER_GROW_IDS } = VIEW_COMPOSER;
   const made = new Map();

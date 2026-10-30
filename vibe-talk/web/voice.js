@@ -10809,8 +10809,8 @@ function keepGrowingBoxInView(field) {
 // handler at all, so Enter there was a new line and sending took the mouse. ONE handler now decides
 // for all of them, and the reader decides what it decides: "Enter to send" on the Settings screen.
 
-/** The message boxes, each of which hands its Enter to `onComposerKey`. */
-const COMPOSER_FIELDS = ["compose-text", "channel-compose-text", "reply-text", "side-compose-text"];
+// The message boxes, each of which hands its Enter to `onComposerKey` (`COMPOSER_FIELDS`), are
+// web/src/view/composer's, with what a key does in them (`#624 voice-page-modularity`).
 
 /**
  * Does a bare Enter send? ON unless the reader has turned it off — see `storedEnterSends`.
@@ -10886,6 +10886,15 @@ function renderEnterSends() {
 }
 
 /**
+ * What a key does in the message boxes, and when each last took a paste (web/src/view/composer
+ * `createComposerKeys`, `#624 voice-page-modularity`): on the clock, and on "Enter to send"
+ * (`enterSends`), read as each key arrives.
+ *
+ * @type {import("./src/view/composer/index.ts").ComposerKeys}
+ */
+const composerKeys = createComposerKeys({ now: () => Date.now(), enterSends: () => enterSends });
+
+/**
  * What a keystroke in a message box does: send, or leave the box to handle it.
  *
  * `send` is the box's own send — the very function its Send button calls — so the key and the
@@ -10931,115 +10940,16 @@ function renderEnterSends() {
  * @returns {unknown}
  */
 function onComposerKey(event, send, box = event && event.target) {
-  if (!event || event.key !== "Enter") return undefined;
-  if (event.isComposing || event.keyCode === 229) return undefined;
-  if (insertedJustNow(box)) return undefined;
-  const chord = Boolean(event.ctrlKey || event.metaKey);
-  const sends = chord || (enterSends && !event.shiftKey && !event.altKey);
-  if (sends && event.preventDefault) {
-    event.preventDefault();
-  }
-  return sends && !event.repeat ? send() : undefined;
+  return composerKeys.onKey(event, send, box);
 }
 
-/**
- * How long after a paste, a drop or a run of text put in outside a composition an Enter in the same
- * box is taken to be part of it, in milliseconds. `paste-never-sends`; see `onComposerKey`.
- *
- * Chrome delivers the Enter a pasted newline becomes in the same task as the text before it, so a few
- * milliseconds would do; the rest is room for a loaded phone. A person tapping the clipboard and then
- * Send's key takes far longer than this.
- */
-const PASTE_ENTER_MS = 250;
+// How long after a paste an Enter is part of it (`PASTE_ENTER_MS`), when each box last took one, each
+// box's new-line key (`NEWLINE_KEYS`) and putting a new line in a box (`insertNewline`) are
+// web/src/view/composer's (`paste-never-sends`, `#575 mobile-keyboard-compose`).
 
-/**
- * When each message box last took a paste, a drop or a run of text outside a composition, by box.
- *
- * @type {WeakMap<object, number>}
- */
-const boxInsertedAt = new WeakMap();
-
-/**
- * A message box's `beforeinput`, `input` or `paste`: note the moment text arrived in it other than by
- * typing a key or composing a word — a paste or a drop of any length, or text of more than one
- * character put in outside a composition, which is how a keyboard's clipboard hands over what it
- * pastes, whatever it was copied from (vibe-talk's own Copy included). `input` as well as
- * `beforeinput`, for a browser that reports an input method's commit on the one and not the other.
- * `paste-never-sends`.
- *
- * @param {any} box
- * @param {any} event
- */
+/** A message box's `beforeinput`, `input` or `paste`, noted (`composerKeys`). `paste-never-sends`. */
 function noteBoxInsertion(box, event) {
-  if (!box || !event) return;
-  const type = typeof event.inputType === "string" ? event.inputType : "";
-  const data = typeof event.data === "string" ? event.data : "";
-  const pasted = event.type === "paste" || /FromPaste$|FromDrop$|FromYank$/.test(type);
-  const run = type === "insertText" && !event.isComposing && (data.length > 1 || data.includes("\n"));
-  if (pasted || run) boxInsertedAt.set(box, Date.now());
-}
-
-/** Whether `box` took a paste or a run of text so lately that an Enter now is part of it. */
-function insertedJustNow(box) {
-  const at = box ? boxInsertedAt.get(box) : undefined;
-  return typeof at === "number" && Date.now() - at <= PASTE_ENTER_MS;
-}
-
-/**
- * `#575 mobile-keyboard-compose`. Each box's new-line key, drawn in its corner while a phone's keyboard is up
- * and Enter sends (web/voice.css), by the box it writes in.
- *
- * The owner, 2026-10-27: "I thought previously there was a way to put in new lines by pressing shift and
- * having the send button turn into an enter button but that's not working for me. It just stays a send
- * button and I have no way to place a new line." Whether a keyboard draws a return key under its Shift is
- * the keyboard's own choice, and none tells the page: Gboard and iOS both send their return key as an
- * Enter with no `shiftKey`, so from a phone's keys Shift+Enter is a bare Enter, and a bare Enter sends
- * while Enter to send is on. Nothing in this page took the Shift away (`paste-never-sends` leaves a
- * typed Enter as it was), and there was never a Shift to take. So the new line is a key of the page's.
- */
-const NEWLINE_KEYS = [["channel-newline", "channel-compose-text"], ["side-newline", "side-compose-text"],
-  ["reply-newline", "reply-text"]];
-
-/**
- * Put a new line in `box` where its caret is, over any selection, and tell the box as typing does, by an
- * `input`, so its draft, its Grow and what its Send says follow. Never through `onComposerKey`: there is
- * no Enter, so nothing here can send, and no paste is noted, so the reader's next Enter still sends.
- *
- * Through the browser's editor where it will (`insertLineBreak`, an `input` of that type, which
- * `noteBoxInsertion` does not take for a paste), so the box's undo keeps the new line and a word an input
- * method is still composing is committed by the editor rather than overwritten under it. Written into
- * the value, with its `input` made here, where the editor will not.
- *
- * @param {any} box
- */
-function insertNewline(box) {
-  const was = box.value;
-  if (typeof document.execCommand === "function" && document.activeElement === box &&
-    document.execCommand("insertLineBreak") && box.value !== was) return;
-  const value = String(box.value || "");
-  const start = typeof box.selectionStart === "number" ? box.selectionStart : value.length;
-  const end = typeof box.selectionEnd === "number" ? Math.max(start, box.selectionEnd) : start;
-  box.value = `${value.slice(0, start)}\n${value.slice(end)}`;
-  box.setSelectionRange(start + 1, start + 1);
-  box.dispatchEvent(typeof InputEvent === "function"
-    ? new InputEvent("input", { bubbles: true, inputType: "insertLineBreak" })
-    : { type: "input", inputType: "insertLineBreak", target: box });
-}
-
-/**
- * Give `key` its box. The focus is kept in the box through the press — `mousedown`, which a tap is
- * given too, would otherwise move it to the key and take the keyboard down — so the reader goes on
- * typing on the next line with the keyboard where it was.
- *
- * @param {any} key
- * @param {any} box
- */
-function wireNewlineKey(key, box) {
-  key.addEventListener("mousedown", (event) => event.preventDefault());
-  key.addEventListener("click", () => {
-    insertNewline(box);
-    if (document.activeElement !== box) box.focus({ preventScroll: true });
-  });
+  composerKeys.noteInsertion(box, event);
 }
 
 /**
@@ -11048,9 +10958,7 @@ function wireNewlineKey(key, box) {
  * @param {any} box
  */
 function watchBoxInsertions(box) {
-  for (const type of ["beforeinput", "input", "paste"]) {
-    box.addEventListener(type, (event) => noteBoxInsertion(box, event));
-  }
+  watchInsertions(box, noteBoxInsertion);
 }
 
 // --- the keyboard -------------------------------------------------------------------------------
