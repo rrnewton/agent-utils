@@ -1,0 +1,18 @@
+[package]
+name = "agent-harness"
+version = "0.1.0"
+description = "Find and read the session transcripts that coding-agent harnesses write as they run"
+readme = "README.md"
+keywords = ["agents", "transcripts", "claude", "codex", "muse"]
+categories = ["parser-implementations", "development-tools"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde_json = "1"
+
+[lints]
+workspace = true

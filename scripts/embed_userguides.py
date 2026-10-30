@@ -186,6 +186,12 @@ STANDALONE_DOCUMENTS: tuple[StandaloneDocument, ...] = (
         source="common/docs/term-backend/README.md",
     ),
     StandaloneDocument(
+        tool="agent-harness",
+        document="README",
+        language="rust",
+        source="common/docs/agent-harness/README.md",
+    ),
+    StandaloneDocument(
         tool="chat-subscription",
         document="README",
         language="rust",
@@ -316,6 +322,11 @@ def _package_links() -> tuple[PackageLink, ...]:
                 "common/docs/term-backend/README.md",
             ),
             PackageLink("rs/term-backend/LICENSE", "LICENSE"),
+            PackageLink(
+                "rs/agent-harness/README.md",
+                "common/docs/agent-harness/README.md",
+            ),
+            PackageLink("rs/agent-harness/LICENSE", "LICENSE"),
             PackageLink(
                 "rs/chat-subscription/README.md",
                 "common/docs/chat-subscription/README.md",

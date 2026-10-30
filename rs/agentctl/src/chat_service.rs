@@ -1117,6 +1117,23 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
         .with_reply_command_offered(offer_reply_command)
         .with_command_only_replies(headless)
         .with_receipt_when_started(headless);
+    // A headless coordinator's screen is never read, so it needs no clean text for screen
+    // blocks; every other coordinator's reply text comes from its transcript where that holds it
+    // (#710 chat-transcript-extraction). AGENTCTL_CHAT_REPLY_TEXT=screen keeps the screen's text.
+    let state = if headless
+        || std::env::var("AGENTCTL_CHAT_REPLY_TEXT").is_ok_and(|value| value == "screen")
+    {
+        state
+    } else {
+        let agent = state.config().agent_name.clone();
+        state.with_transcript_replies(Box::new(
+            crate::chat_transcript::CoordinatorTranscript::for_agent(
+                manager.registry().to_owned(),
+                agent,
+                Box::new(service_log),
+            ),
+        ))
+    };
     let _resume_request = state.subscribe_request()?;
     validate_service_outbound(state.config())?;
     if headless {
@@ -2414,6 +2431,7 @@ fn capture_recovery_snapshot<A: ManagedApi + ?Sized>(
     control: &mut PassControl<'_>,
 ) -> Result<CycleReport, ChatServiceError> {
     let (text, cut) = bounded_snapshot(snapshot.text);
+    state.settle_transcript(text);
     let gate = prompt_gate(state, manager, None, control.stop)?;
     let capture = state.capture_snapshot_with_gate(text, &gate)?;
     let route_entries = capture.route_entries.clone();
@@ -2476,7 +2494,12 @@ with other text, so the oldest were not read",
         .map(|(key, _)| key)
         .collect::<Vec<_>>();
     let fresh = RouteCache::from_entries(route_entries);
-    log_captured(control, &fresh, &report.captured);
+    log_captured(
+        control,
+        &fresh,
+        &report.captured,
+        &capture.transcript_replies,
+    );
     report.merge(process_keys(
         state,
         manager,
@@ -2524,6 +2547,7 @@ fn capture_direct<A: ManagedApi + ?Sized>(
         });
     }
     let (text, cut) = bounded_snapshot(snapshot.text);
+    state.settle_transcript(text);
     let gate = prompt_gate(state, manager, Some(&key), control.stop)?;
     let capture = state.capture_replies_with_gate(&key, text, &gate)?;
     let mut report = CycleReport {
@@ -2539,7 +2563,8 @@ fn capture_direct<A: ManagedApi + ?Sized>(
     }
     if !capture.ordinals.is_empty() {
         report.captured.push((key.clone(), capture.ordinals));
-        log_captured(control, routes, &report.captured);
+        let transcript = [(key.clone(), capture.transcript_ordinals)];
+        log_captured(control, routes, &report.captured, &transcript);
         report.merge(process_keys(
             state,
             manager,
@@ -2555,21 +2580,40 @@ fn capture_direct<A: ManagedApi + ?Sized>(
 /// Log each reply a capture of the coordinator's pane stored, by its request and the reply ID
 /// `routes` knows the request by, so the service log shows a reply arriving as well as any
 /// reminder sent for its request (#260 reminder-capture-race).
-fn log_captured(control: &PassControl<'_>, routes: &RouteCache, captured: &[(String, Vec<u32>)]) {
-    for line in captured_lines(routes, captured) {
+fn log_captured(
+    control: &PassControl<'_>,
+    routes: &RouteCache,
+    captured: &[(String, Vec<u32>)],
+    transcript: &[(String, Vec<u32>)],
+) {
+    for line in captured_lines(routes, captured, transcript) {
         control.log(line);
     }
 }
 
 /// The lines [`log_captured`] writes.
-fn captured_lines(routes: &RouteCache, captured: &[(String, Vec<u32>)]) -> Vec<String> {
+fn captured_lines(
+    routes: &RouteCache,
+    captured: &[(String, Vec<u32>)],
+    transcript: &[(String, Vec<u32>)],
+) -> Vec<String> {
+    let from_transcript = |key: &str, ordinal: u32| {
+        transcript
+            .iter()
+            .any(|(other, ordinals)| other == key && ordinals.contains(&ordinal))
+    };
     captured
         .iter()
         .flat_map(|(key, ordinals)| {
             ordinals.iter().map(move |ordinal| {
+                let source = if from_transcript(key, *ordinal) {
+                    "with its text from the coordinator's transcript"
+                } else {
+                    "from the coordinator's pane"
+                };
                 format!(
                     "agentctl: chat reply {ordinal} of request {key} (reply ID {}) was captured \
-from the coordinator's pane",
+{source}",
                     routes.reply_id_of(key, *ordinal)
                 )
             })
@@ -18933,7 +18977,8 @@ has been seen working and is idle again, or for 1s if it is not seen working"),
                     (aliased.clone(), vec![1, 2]),
                     (long.clone(), vec![3]),
                     ("c".repeat(64), vec![1]),
-                ]
+                ],
+                &[(aliased.clone(), vec![2])],
             ),
             [
                 format!(
@@ -18941,8 +18986,8 @@ has been seen working and is idle again, or for 1s if it is not seen working"),
 the coordinator's pane"
                 ),
                 format!(
-                    "agentctl: chat reply 2 of request {aliased} (reply ID 5002) was captured from \
-the coordinator's pane"
+                    "agentctl: chat reply 2 of request {aliased} (reply ID 5002) was captured with \
+its text from the coordinator's transcript"
                 ),
                 format!(
                     "agentctl: chat reply 3 of request {long} (reply ID {nonce}_3) was captured \

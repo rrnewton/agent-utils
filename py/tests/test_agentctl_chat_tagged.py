@@ -1852,3 +1852,60 @@ def test_settled_hint_from_wrong_pane_does_not_read_or_send(
     with pytest.raises(HerdrUnavailable, match="different coordinator pane"):
         bridge.capture_event(PaneAgentStatus("w9:p1", "idle"))
     assert not reads and len(chat.calls) == before
+
+
+class _FixedTranscript:
+    """A coordinator transcript that always holds the same reply blocks."""
+
+    def __init__(self, blocks: list[object]) -> None:
+        self._blocks = blocks
+        self.settled: list[list[str]] = []
+
+    def blocks(self) -> list[object]:
+        return list(self._blocks)
+
+    def settle(self, identifiers: list[str]) -> None:
+        self.settled.append(identifiers)
+
+
+_WRITTEN = "**Done.** The cause was `rate limiting`; see the [status page](https://example.com/s)."
+_DRAWN = "Done. The cause was rate limiting; see the\nstatus page."
+
+
+def test_capture_takes_reply_text_from_the_transcript_that_renders_it(tmp_path: Path) -> None:
+    # #710 chat-transcript-extraction: the screen lost the Markdown and wrapped the line.
+    from agentctl.chat_transcript import TranscriptBlock
+    bridge, _, chat = setup(tmp_path)
+    chat.message()
+    bridge.tick()
+    record = _records(tmp_path)["one"]
+    nonce = record["reply_nonce"]
+    later = int((datetime.now(timezone.utc) + timedelta(seconds=5)).timestamp() * 1000)
+    transcript = _FixedTranscript([TranscriptBlock(f"{nonce}_1", _WRITTEN, later)])
+    bridge._transcript = transcript  # type: ignore[assignment]
+    assert not bridge.capture_output(_snapshot(_block(record, _DRAWN, ordinal=1)))["errors"]
+    assert [str(request["text"]) for request in chat.sent.values()][-1].endswith(_WRITTEN)
+    assert transcript.settled == [[f"{nonce}_1"]]
+    # The same screen again sends nothing more.
+    assert bridge.capture_output(_snapshot(_block(record, _DRAWN, ordinal=1))) == {"captured": [], "errors": []}
+    assert len(chat.sent) == 1
+
+
+def test_capture_stores_the_next_transcript_block_the_screen_never_showed(tmp_path: Path) -> None:
+    from agentctl.chat_transcript import TranscriptBlock
+    bridge, _, chat = setup(tmp_path)
+    chat.message()
+    bridge.tick()
+    record = _records(tmp_path)["one"]
+    nonce = record["reply_nonce"]
+    later = int((datetime.now(timezone.utc) + timedelta(seconds=5)).timestamp() * 1000)
+    bridge._transcript = _FixedTranscript([  # type: ignore[assignment]
+        TranscriptBlock(f"{nonce}_1", "first, collapsed on screen", later),
+        TranscriptBlock(f"{nonce}_3", "skips an ordinal, so waits", later),
+        TranscriptBlock(f"{nonce}_1", "written before the request arrived", 1),
+    ])
+    assert not bridge.capture_output(_snapshot("no markers on screen"))["errors"]
+    assert [str(request["text"]) for request in chat.sent.values()][-1].endswith("first, collapsed on screen")
+    assert _records(tmp_path)["one"]["reply_next_ordinal"] == 2
+    assert bridge.capture_output(_snapshot("")) == {"captured": [], "errors": []}
+    assert len(chat.sent) == 1

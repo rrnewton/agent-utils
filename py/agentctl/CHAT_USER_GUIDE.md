@@ -287,6 +287,25 @@ subscriptions internally every 100 milliseconds; this is separate from the
 chat provider's polling interval. Retained terminal history is bounded, so
 capture is not a lossless stream of agent messages.
 
+### Reply text from the coordinator's transcript
+
+A terminal draws a reply rendered: wrapped at its width, with Markdown markers
+drawn as styles and tables as box drawing, and Claude Code shows text written
+before a tool call in the same turn as one summary line. `run` therefore also
+follows the transcript the coordinator's harness writes (Claude Code's session
+file, Codex's rollout, or Muse's session journal), found from the processes
+whose `HERDR_PANE_ID` names the coordinator's pane and looked for again every 30
+seconds. A captured block takes the text of the transcript block under the same
+reply ID when the screen's block renders it: the same characters apart from
+whitespace, box drawing, Markdown markup, link targets and list bullets, or the
+same characters in another order, as when a table's cells wrap. A block whose
+ordinal is already stored keeps its stored text when the screen renders that
+text. A complete transcript block for the request's next ordinal, recorded
+after the request arrived, is stored even when no snapshot shows it. Each
+change in what is read is logged once to standard error. With no transcript, or
+with `AGENTCTL_CHAT_REPLY_TEXT=screen` in `run`'s environment, every reply keeps
+the text read from the screen; `tick` reads only the screen.
+
 Exact-next predicates guarantee timely valid progress without a 1 Hz scan, but
 an unavailable or malformed marker does not itself wake an exact active-request
 predicate. It is diagnosed when it appears in a snapshot triggered by a valid

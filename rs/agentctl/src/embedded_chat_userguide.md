@@ -742,6 +742,32 @@ each reply's whole text. Like `thread`, it holds only replies of requests that
 are not retired, reads under the shared state lock, and never writes state or
 contacts Herdr, a helper, or a provider.
 
+A terminal draws a reply rendered: wrapped at its width, with Markdown markers
+drawn as styles and tables as box drawing, and Claude Code shows text written
+before a tool call in the same turn as one summary line. `chat run` therefore
+also follows the transcript the coordinator's harness writes (Claude Code's
+session file, Codex's rollout, or Muse's session journal), found from the
+coordinator's registry record (its harness, process, working directory and
+conversation ID) and looked for again every 30 seconds. A block read from the
+screen takes the text of the newest transcript block under the same reply ID
+that the screen's block renders: the same characters apart from whitespace, box
+drawing, Markdown markup, link targets and list bullets, or the same characters
+in another order, as when a table's cells wrap. A complete transcript block
+under the reply ID of an open request, recorded after that request was
+admitted, is stored even when no read of the screen shows it, unless the
+request already holds that text in another rendering, or a reply that shares
+most of its word triples, as a renumbered list does. Before a capture the
+service waits up to one second, once per reply ID, for the transcript to hold a
+block whose closing marker the screen already shows. The service log names the
+transcript it reads, says when none is found or one cannot be read, and says
+`captured with its text from the coordinator's transcript` for each reply
+stored with transcript text. A request already holds a text when a stored reply
+has the same characters in that sense, so the same reply read from the screen,
+from the transcript and through `chat reply` is stored once. With no
+transcript, for a headless coordinator, or with `AGENTCTL_CHAT_REPLY_TEXT=screen`
+in the service's environment, every reply keeps the text read from the screen.
+Screen reads decide everything else: delivery, readiness, forms and feedback.
+
 A reply printed between its two marker lines reaches the user only if the
 service reads it from the agent's screen, and a terminal agent can redraw or
 clear its screen before that read. With `chat run --offer-reply-command`, an

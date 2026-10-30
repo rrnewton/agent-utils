@@ -12,6 +12,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+agent-harness = { version = "0.1.0", path = "../agent-harness" }
 agent-queue = { version = "0.1.0", path = "../agent-queue" }
 term-backend = { version = "0.1.0", path = "../term-backend" }
 chat-subscription = { version = "0.1.0", path = "../chat-subscription" }

@@ -55,6 +55,9 @@ from agentctl.chat_storage import (
     CONFIG, LEGACY_REPLY, REPLY_INPUT, REQUEST, REST_RESPONSE, ArtifactClass,
     decode_json, encoded_json, read_json, read_text, write_json,
 )
+from agentctl.chat_transcript import (
+    CoordinatorTranscript, TranscriptBlock, closing_identifiers, near_duplicate, rendered_equivalent,
+)
 from agentctl.chat_replies import (
     extract_replies, extract_sequenced_replies, reply_marker_ids, reply_marker_sets,
     sequenced_reply_id,
@@ -1634,6 +1637,9 @@ class Bridge:
         # Rebuilt from constant-size request summaries at startup/recovery, then
         # maintained by the single bridge owner. Sent history is never scanned.
         self._usage: dict[str, int] | None = None
+        # The coordinator's transcript, read for the clean text of its replies (#710
+        # chat-transcript-extraction); the service turns it on: see read_transcript_replies.
+        self._transcript: CoordinatorTranscript | None = None
         # Full normalized message bytes are immutable after intake. Rebuild
         # this admission counter by streaming durable records at startup and
         # recovery, then maintain it after each atomic request create.
@@ -4084,6 +4090,42 @@ class Bridge:
         return self._capture_output(PaneOutputSnapshot(info.pane_id, text, None),
                                     deliver=deliver, verify_target=True, records=records)
 
+    def read_transcript_replies(self) -> None:
+        """Take reply text from the coordinator's transcript wherever it holds it.
+
+        The service does this unless ``AGENTCTL_CHAT_REPLY_TEXT=screen`` keeps the screen's text.
+        """
+        if self.config.outbound_mode != "disabled" and os.environ.get("AGENTCTL_CHAT_REPLY_TEXT") != "screen":
+            self._transcript = CoordinatorTranscript(
+                self._transcript_target, lambda line: print(line, file=sys.stderr, flush=True))
+
+    def _stored_sequenced_text(self, record: dict[str, object], ordinal: int) -> str | None:
+        """The stored text of protocol-v3 reply ``ordinal``, when the request holds it."""
+        count, sent, _, _ = self._reply_summary(record)
+        offset = record.get("reply_ordinal_offset", 0)
+        index = ordinal - 1 + (offset if type(offset) is int else 0)
+        if not 0 <= index < count:
+            return None
+        previous = self._read_reply_item(record, index, sent=index < sent)
+        return get_str(previous, "text", "reply item") if previous.get("reply_ordinal") == ordinal else None
+
+    def _transcript_target(self) -> tuple[str, str, str | None] | None:
+        """The coordinator's harness, pane and working directory, for finding its transcript."""
+        try:
+            info = resolve_target(self.client, self.config.target)
+        except (AgentDeliveryError, HerdrRunError, HerdrUnavailable, OSError, ValueError):
+            return None
+        if info.agent not in ("claude", "codex", "muse"):
+            return None
+        return info.agent, info.pane_id, info.cwd
+
+    def _transcript_blocks(self, rendered: str) -> list[TranscriptBlock]:
+        """The transcript's complete reply blocks, once it has caught up with ``rendered``."""
+        if self._transcript is None:
+            return []
+        self._transcript.settle(closing_identifiers(rendered))
+        return self._transcript.blocks()
+
     def capture_output(self, snapshot: PaneOutputSnapshot, *, deliver: bool = True) -> dict[str, object]:
         """Durably capture complete matching blocks and immediately reconcile the outbox."""
         return self._capture_output(snapshot, deliver=deliver, verify_target=True)
@@ -4103,6 +4145,7 @@ class Bridge:
             info = resolve_target(self.client, self.config.target)
             if snapshot.pane_id != info.pane_id:
                 raise HerdrUnavailable("chat reply output belongs to a different coordinator pane")
+        transcript = self._transcript_blocks(snapshot.text)
         descriptor = _open_private_lock(str(self.state / ".bridge.lock"), "chat bridge lock")
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -4142,7 +4185,8 @@ class Bridge:
                 record_snapshot = by_key[key]
                 protocol = record_snapshot.get("reply_protocol")
                 identifiers = closing_by_nonce.get(nonce, set())
-                if not identifiers:
+                own_blocks = _transcript_blocks_of(transcript, nonce, protocol, record_snapshot)
+                if not identifiers and not own_blocks:
                     continue
                 path = self.state / "requests" / f"{key}.json"
                 record = _read(path)
@@ -4158,14 +4202,22 @@ class Bridge:
                         answers_v3 = (parsed_v3.get(nonce, []) if parsed_v3 is not None
                                       else extract_sequenced_replies(
                                           text, (nonce,), marker_ids=marker_ids).get(nonce, []))
-                        if not answers_v3:
+                        if identifiers and not answers_v3:
                             raise ValueError("closing marker is visible but no complete protocol-v3 reply block is retained")
+                        answers_v3 = _sequenced_with_transcript(
+                            answers_v3, own_blocks, record.get("reply_next_ordinal", 1),
+                            lambda ordinal: self._stored_sequenced_text(record, ordinal))
                         added = self._append_sequenced_replies(record, answers_v3, pending)
                     else:
                         answers_v2 = (parsed_v2.get(nonce, []) if parsed_v2 is not None
                                       else extract_replies(text, (nonce,)).get(nonce, []))
-                        if not answers_v2:
+                        if identifiers and not answers_v2:
                             raise ValueError("closing marker is visible but no complete reply block is retained")
+                        answers_v2 = _legacy_with_transcript(
+                            answers_v2, own_blocks,
+                            [get_str(item, "text", "reply item") for item in self._all_reply_items(record)])
+                        if not answers_v2:
+                            continue
                         # Upgrade an already-delivered legacy prompt while keeping its old marker
                         # valid; historical completed legacy requests remain closed during migration.
                         record["reply_protocol"] = 2
@@ -5500,6 +5552,7 @@ commands. See '{prog} userguide' for exact scopes, lifecycle, and adapter protoc
                     raise ValueError("reconcile interval must be between 10 and 86400 seconds")
                 if not _MIN_OBSERVER_WRITE_INTERVAL <= args.observer_write_interval <= _MAX_OBSERVER_WRITE_INTERVAL:
                     raise ValueError("observer write interval must be between 60 and 3600 seconds")
+                bridge.read_transcript_replies()
                 _run_bridge(bridge, args.interval, prog, reconcile_interval=args.reconcile_interval,
                             observer_write_interval=args.observer_write_interval)
         return 0
@@ -5510,6 +5563,67 @@ commands. See '{prog} userguide' for exact scopes, lifecycle, and adapter protoc
         return 0
     except KeyboardInterrupt:
         return 130
+
+
+def _transcript_blocks_of(transcript: Sequence[TranscriptBlock], nonce: str, protocol: object,
+                          record: dict[str, object]) -> list[TranscriptBlock]:
+    """The transcript blocks addressed to the request with ``nonce``, recorded after it arrived.
+
+    Blocks with no time, or recorded before the request was received, answered something else.
+    """
+    received = record.get("received_at")
+    try:
+        since = int(datetime.fromisoformat(str(received).replace("Z", "+00:00")).timestamp() * 1000)
+    except ValueError:
+        return []
+    pattern = (re.compile(rf"{re.escape(nonce)}_[1-9][0-9]{{0,5}}\Z") if protocol == 3
+               else re.compile(rf"{re.escape(nonce)}\Z"))
+    return [block for block in transcript
+            if pattern.match(block.identifier) and block.at_millis is not None and block.at_millis >= since]
+
+
+def _sequenced_with_transcript(answers: list[tuple[int, str]], blocks: Sequence[TranscriptBlock],
+                               next_ordinal: object,
+                               stored: Callable[[int], str | None]) -> list[tuple[int, str]]:
+    """Protocol-v3 answers with the transcript's text in place of each new block's screen text it
+    renders, and the transcript's blocks for the next ordinals that the screen does not show.
+
+    A block the request already stored keeps its stored text when the screen renders it, so a
+    reply stored from the screen before the transcript held it is not read as changed text.
+    """
+    if not blocks:
+        return answers
+    first_new = next_ordinal if isinstance(next_ordinal, int) else 1
+    by_ordinal = {int(block.identifier.rsplit("_", 1)[1]): block.body for block in blocks}
+    merged: list[tuple[int, str]] = []
+    for ordinal, answer in answers:
+        source = stored(ordinal) if ordinal < first_new else by_ordinal.get(ordinal)
+        if source is not None and source != answer and rendered_equivalent(answer, source):
+            answer = source
+        merged.append((ordinal, answer))
+    shown = {ordinal for ordinal, _ in merged}
+    ordinal = max([first_new - 1, *shown])
+    while ordinal + 1 in by_ordinal and ordinal + 1 not in shown:
+        ordinal += 1
+        merged.append((ordinal, by_ordinal[ordinal]))
+    return merged
+
+
+def _legacy_with_transcript(answers: list[str], blocks: Sequence[TranscriptBlock],
+                            stored: Sequence[str]) -> list[str]:
+    """Legacy answers with the transcript's text in place of each unstored screen text it renders,
+    and the transcript's blocks that no answer or stored reply is."""
+    merged: list[str] = []
+    for answer in answers:
+        source = next((block.body for block in reversed(blocks)
+                       if rendered_equivalent(answer, block.body)), None)
+        merged.append(source if source is not None and answer not in stored else answer)
+    for block in blocks:
+        if any(block.body == other or rendered_equivalent(other, block.body)
+               or near_duplicate(other, block.body) for other in [*merged, *stored]):
+            continue
+        merged.append(block.body)
+    return merged
 
 
 def main(argv: Sequence[str] | None = None) -> int:

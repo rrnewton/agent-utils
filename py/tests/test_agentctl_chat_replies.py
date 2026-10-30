@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from agentctl.chat_replies import extract_replies, unknown_reply_ids
@@ -338,3 +340,101 @@ def test_a_muse_reply_after_its_response_glyph_is_extracted() -> None:
     after = "◆ Ran command · Check the bridge · ✓ · 0.4s · ctrl+o\n└ ok\n"
     assert extract_replies(echo, [FIRST]) == {}
     assert extract_replies(f"{echo}\n{answer}\n{after}", [FIRST]) == {FIRST: ["PINEAPPLE"]}
+
+
+# The coordinator's transcript as the source of reply text (#710 chat-transcript-extraction).
+
+WRITTEN = ("**Mitigated; please reload.** The cause was `rate limiting`, see the "
+           "[status page](https://example.com/s).\n\n| Leg | Before | After |\n|---|---:|---:|\n"
+           "| admitted to delivered | 990 s | 5.6 s |")
+DRAWN = ("Mitigated; please reload. The cause was rate\nlimiting, see the status page.\n\n"
+         "┌───────────────────────┬────────┬───────┐\n│ Leg                   │ Before │ After │\n"
+         "├───────────────────────┼────────┼───────┤\n│ admitted to delivered │  990 s │ 5.6 s │\n"
+         "└───────────────────────┴────────┴───────┘")
+
+
+def test_transcript_blocks_keep_their_markdown_and_skip_quoted_partial_and_inline_ones() -> None:
+    from agentctl.chat_transcript import complete_blocks
+    text = "\n".join([
+        "```text", "<CHAT_REPLY_001>", "quoted", "</CHAT_REPLY_001>", "```",
+        "<CHAT_REPLY_007>", "", "**Done.** See `x`:", "```sh", "echo '</CHAT_REPLY_007>'", "```",
+        "</CHAT_REPLY_007>",
+        "<CHAT_REPLY_003>Inline</CHAT_REPLY_003>",
+        "  <CHAT_REPLY_abc_2>", "    indented", "      more", "  </CHAT_REPLY_abc_2>",
+        "<CHAT_REPLY_009>", "never closed",
+    ])
+    assert complete_blocks(text) == [
+        ("007", "**Done.** See `x`:\n```sh\necho '</CHAT_REPLY_007>'\n```"),
+        ("abc_2", "indented\n  more"),
+    ]
+
+
+def test_a_screen_rendering_matches_its_transcript_source_and_other_text_does_not() -> None:
+    from agentctl.chat_transcript import label_key, near_duplicate, rendered_equivalent, rendered_key
+    assert rendered_equivalent(DRAWN, WRITTEN)
+    assert rendered_equivalent("│ admitted → │ 5.6s │\n│ delivered  │      │", "| admitted → delivered | 5.6s |")
+    assert rendered_equivalent("status page (https://example.com/s)", "[status page](https://example.com/s)")
+    assert not rendered_equivalent("Rollout: ███░░░░░░░", "Rollout: ████████░░")
+    assert not rendered_equivalent("- **`#`** -", "---")
+    assert rendered_key("| a | b |\n|---|:--:|\n| 1 | 2 |") == "ab12"
+    assert label_key("See [the page](https://x.test/p).") == "Seethepage."
+    steps = ("Steps taken on the voice stack this morning:\n"
+             "{0}. restarted the voice server after it stopped accepting new connections at dawn\n"
+             "{1}. rebuilt the browser bridge from a clean copy of main and started it again\n"
+             "{2}. checked both probes, conversation and read-aloud, and both of them passed")
+    assert near_duplicate(steps.format(1, 1, 1), steps.format(1, 2, 3))
+    assert not near_duplicate("Update 1: the build is running on the new host.",
+                              "Update 2: the build passed and the deploy starts now.")
+
+
+def test_transcript_lines_of_each_harness_decode_to_the_models_text() -> None:
+    import json
+    from agentctl.chat_transcript import decode_texts
+    claude = json.dumps({"type": "assistant", "timestamp": "1970-01-01T00:00:02Z",
+                         "message": {"content": [{"type": "thinking", "thinking": "x"},
+                                                 {"type": "text", "text": "**Hi**"}]}}).encode()
+    sidechain = json.dumps({"type": "assistant", "isSidechain": True,
+                            "message": {"content": [{"type": "text", "text": "sub"}]}}).encode()
+    codex = json.dumps({"timestamp": "1970-01-01T00:00:03Z", "type": "response_item", "payload": {
+        "type": "message", "role": "assistant",
+        "content": [{"type": "output_text", "text": "| a |"}]}}).encode()
+    record = json.dumps({"recorded_at": 4_000_000, "payload_type": "runtime.session", "payload": {
+        "kind": "run", "event": {"kind": "assistant_message_committed", "text": "Done."}}})
+    muse = json.dumps({"children": [{"record_json": record}]}).encode()
+    assert decode_texts("claude", claude) == [(2.0, "**Hi**")]
+    assert decode_texts("claude", sidechain) == []
+    assert decode_texts("codex", codex) == [(3.0, "| a |")]
+    assert decode_texts("muse", muse) == [(4.0, "Done.")]
+    assert decode_texts("muse", b"not json assistant_message_committed") == []
+    assert decode_texts("other", claude) == []
+
+
+def test_the_transcript_is_found_from_the_processes_of_the_coordinators_pane(tmp_path: Path) -> None:
+    import json
+    from agentctl.chat_transcript import CoordinatorTranscript, TranscriptBlock, project_name
+    root = tmp_path
+    proc, config = root / "proc", root / "config"
+    for pid, ppid, env in ((100, 1, f"HERDR_PANE_ID=w9:p9\0CLAUDE_CONFIG_DIR={config}\0"),
+                           (101, 100, "HERDR_PANE_ID=w9:p9\0"), (102, 1, "HERDR_PANE_ID=w9:p8\0")):
+        (proc / str(pid) / "fd").mkdir(parents=True)
+        (proc / str(pid) / "environ").write_bytes(env.encode())
+        (proc / str(pid) / "stat").write_text(f"{pid} (claude) S {ppid} " + "0 " * 16 + f"{pid}\n")
+    project = config / "projects" / project_name("/work/repo")
+    project.mkdir(parents=True)
+    (config / "sessions").mkdir()
+    (config / "sessions" / "101.json").write_text(json.dumps({"sessionId": "s-1", "cwd": "/work/repo"}))
+    transcript = project / "s-1.jsonl"
+    entry = {"type": "assistant", "timestamp": "2026-10-30T12:00:00Z",
+             "message": {"content": [{"type": "text", "text": "<CHAT_REPLY_7>\n**Done.**\n</CHAT_REPLY_7>"}]}}
+    transcript.write_text(json.dumps(entry) + "\n")
+    logs: list[str] = []
+    reader = CoordinatorTranscript(lambda: ("claude", "w9:p9", "/work/repo"), logs.append, proc_root=proc)
+    assert reader.blocks() == [TranscriptBlock("7", "**Done.**", 1_793_361_600_000)]
+    with transcript.open("a") as handle:
+        handle.write(json.dumps({**entry, "message": {"content": [
+            {"type": "text", "text": "<CHAT_REPLY_8>\nMore\n</CHAT_REPLY_8>"}]}}) + "\n")
+    assert [block.identifier for block in reader.blocks()] == ["7", "8"]
+    assert len(logs) == 1 and "s-1.jsonl" in logs[0], logs
+    nothing = CoordinatorTranscript(lambda: ("claude", "w0:p0", None), logs.append, proc_root=proc)
+    assert nothing.blocks() == [] and "no transcript" in logs[-1]
+    nothing.settle(["1"])
