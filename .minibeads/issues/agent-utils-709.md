@@ -1,10 +1,11 @@
 ---
 title: 'vt-live-tail-rust: supervise the Slack tail in the Rust server, retire the Python adapter'
-status: open
+status: closed
 priority: 1
 issue_type: task
 created_at: 2026-10-30T20:21:30.647074166+00:00
-updated_at: 2026-10-30T20:21:30.647074166+00:00
+updated_at: 2026-10-30T21:08:14.656414433+00:00
+closed_at: 2026-10-30T21:08:14.656414333+00:00
 ---
 
 # Description
