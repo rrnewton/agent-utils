@@ -1339,6 +1339,7 @@ struct BindSession {
 }
 
 #[derive(Args)]
+#[command(disable_help_subcommand = true)]
 struct Chat {
     #[command(subcommand)]
     command: ChatCommand,
@@ -1408,14 +1409,20 @@ enum ChatCommand {
     Latency(ChatLatency),
     /// Inspect one exact active retained request without writes or external access
     Inspect(ChatInspect),
+    /// Explain how to answer a chat request: the reply markers, and the commands for when they
+    /// cannot do the job; with a chat subcommand's name, print that subcommand's help
+    #[command(
+        after_help = "Examples:\n  agentctl chat help 007\n  agentctl chat help\n  agentctl chat help reply\n\nEvery request prompt ends with `If you have trouble, run: agentctl chat help ID`. With a reply\nID the page names that request's bridge, its markers and the exact commands for it (found as\nfor `chat reply`), and ends with the explicit command, state directory and request key\nincluded, for when lookup cannot find the bridge. Without one it explains the same in general\nterms. A chat subcommand's name (`reply`, `thread`, ...) prints that subcommand's --help, as the\nhelp subcommand did. Read-only; never contacts Herdr or a provider. Exit status 0, also when\nthe bridge cannot be found (the page then says why)."
+    )]
+    Help(ChatHelp),
     /// Print one thread's retained messages as quoted text, oldest first, without writes
     #[command(
-        after_help = "Example:\n  agentctl chat thread --bridge-state ~/.local/state/agentctl/chat \\\n    --thread spaces/example/threads/one --last 20\n\nA request prompt for a reply in an existing thread prints this command with the service's own\nexecutable, its exact state directory, and the thread. The output lists the thread's retained requests and the replies captured\nfor them, each with its UTC time and age. It drops the line breaks at the end of each request or\nreply and prefixes every line of message text with `> `, or an empty line with `>` alone.\nThe bridge retains only requests it admitted from allowed senders that have not been retired, so\nthe provider's own thread remains the complete record. It reads under the shared state lock\nand never writes state or contacts Herdr, a helper, or a provider."
+        after_help = "Examples:\n  agentctl chat thread 007\n  agentctl chat thread --bridge-state ~/.local/state/agentctl/chat \\\n    --thread spaces/example/threads/one --last 20\n\nWith a reply ID it prints the thread of the request that gave it, finding the bridge as\n`chat reply` does. A request prompt for a reply in an existing thread prints this command, with\nthe reply ID when agents find the bridge by caller lookup, else with the service's own\nexecutable, its exact state directory, and the thread. The output lists the thread's retained requests and the replies captured\nfor them, each with its UTC time and age. It drops the line breaks at the end of each request or\nreply and prefixes every line of message text with `> `, or an empty line with `>` alone.\nThe bridge retains only requests it admitted from allowed senders that have not been retired, so\nthe provider's own thread remains the complete record. It reads under the shared state lock\nand never writes state or contacts Herdr, a helper, or a provider."
     )]
     Thread(ChatThread),
     /// List the replies the bridge holds, newest first: what was sent, when, and as which message
     #[command(
-        after_help = "Examples:\n  agentctl chat sent --bridge-state ~/.local/state/agentctl/chat\n  agentctl chat sent --bridge-state ~/.local/state/agentctl/chat --request <KEY> --json\n\nEach reply shows when it was sent (or captured, while unsent, or for a record kept before send\ntimes were recorded, which it says) in UTC and how long ago, its\nnumber within its request, the request key, the chat message and thread it answers, and its\noutcome: `sent as <provider message ID>` once the chat provider accepted it, `captured, not yet\nsent`, or `send in progress or outcome unknown`, which the service retries with the same\noperation ID so it is never posted twice. The first 300 characters of each reply follow, every\nline prefixed with `> `. --json prints one document (schema agentctl-chat-sent/v1) with the\nsame fields, times as Unix milliseconds, and each reply's whole text.\n\nThe bridge holds only the replies of requests that are not retired, so the chat thread itself\nis the complete record. It reads under the shared state lock and never writes state or\ncontacts Herdr, a helper, or a provider."
+        after_help = "Examples:\n  agentctl chat sent 007\n  agentctl chat sent\n  agentctl chat sent --bridge-state ~/.local/state/agentctl/chat --request <KEY> --json\n\nWith a reply ID it lists that request's replies. Without --bridge-state or --bridge it finds the\nbridge as `chat reply` does.\n\nEach reply shows when it was sent (or captured, while unsent, or for a record kept before send\ntimes were recorded, which it says) in UTC and how long ago, its\nnumber within its request, the request key, the chat message and thread it answers, and its\noutcome: `sent as <provider message ID>` once the chat provider accepted it, `captured, not yet\nsent`, or `send in progress or outcome unknown`, which the service retries with the same\noperation ID so it is never posted twice. The first 300 characters of each reply follow, every\nline prefixed with `> `. --json prints one document (schema agentctl-chat-sent/v1) with the\nsame fields, times as Unix milliseconds, and each reply's whole text.\n\nThe bridge holds only the replies of requests that are not retired, so the chat thread itself\nis the complete record. It reads under the shared state lock and never writes state or\ncontacts Herdr, a helper, or a provider."
     )]
     Sent(ChatSent),
     /// Publish one explicit operator message through the configured helper: a new root message,
@@ -1437,7 +1444,7 @@ enum ChatCommand {
     /// Store one reply for an open request from a file, and wake a running service to send it.
     /// Normally an agent replies between the prompt's two marker lines instead
     #[command(
-        after_help = "Example:\n  agentctl chat reply --bridge-state ~/.local/state/agentctl/chat \\\n    --request <KEY> --reply-id 001 --file reply.md\n\nUse this command only when the two marker lines cannot do the job. A reply printed between\nthe request's two marker lines is the normal way: it reaches the user in the chat and also stays\nin the agent's terminal, where the owner may be reading. Use the command to send a reply before\nthe agent's turn ends, such as a progress update during long work, or to send again a reply that\nwas written between the lines but did not reach the chat: one reported as not sent, or one that\n`agentctl chat sent` does not list, as when the screen was redrawn before the service read it.\nSend each reply one way only. A copy printed in the terminal without the marker lines sends\nnothing, so it is a safe way to show a reply sent by the command.\n\nWhen `chat run` has --offer-reply-command and outbound replies are enabled, each request prompt\nprints this command with the service's own executable, the absolute path of its state\ndirectory, the request key, and the reply ID, unless no file is left at that executable's path\nor one of those words cannot be printed safely; then the prompt gives only the two marker\nlines.\n\nThe command stores the file's text as a reply of that request, as if the service had read it\nbetween the reply ID's two marker lines on the agent's screen, and the service sends it like\nany reply it reads. Line breaks at the end of the file are dropped. A text the request already\nholds is not stored again, so running the command twice sends it once. It then asks a service\nrunning on the same state directory to send the reply at once; a service that cannot listen\nsends it at its next reconciliation, when the agent goes idle, or when it starts.\n\nOn success it prints one JSON object: request, reply_id, outcome (stored or already_stored),\nordinal, phase, and service_woken, which says whether the wake was sent to a socket of the\ncurrent user in the state directory; nothing confirms that a service received it. Exit\nstatus: 0 when the request holds the reply; 1 when the reply is refused, with the reason on\nstandard error and nothing stored, as for an empty or blank text or one over 30,000 bytes;\n1 also when the state cannot be read or written, or when the result cannot be printed after\nthe reply was stored; 75 when nothing was stored but the same command can succeed later; 2\nfor a usage error, which includes a file that cannot be read or is not UTF-8. It never\ncontacts Herdr, a helper, or a provider."
+        after_help = "Examples:\n  agentctl chat reply 001 --file reply.md\n  agentctl chat reply --bridge-state ~/.local/state/agentctl/chat \\\n    --request <KEY> --reply-id 001 --file reply.md\n\nFinding the bridge (#707 chat-prompt-anatomy): --bridge-state DIR, or --bridge NAME for\nREGISTRY/bridges/NAME, when given; else $AGENTCTL_CHAT_BRIDGE; else every bridge registered for\ndiscovery (REGISTRY/bridges/ and the per-user index $XDG_STATE_HOME/agentctl/chat-bridges/, which\n`chat run` writes at start). Of those it keeps the bridges whose target agent is you (the\nregistered agent whose harness runs this command, else $AGENTCTL_AGENT), and of those the one\nthat gave the reply ID, which also names the request, so --request is needed only with an\nexplicit state. REGISTRY is --registry, or when that is the default .agentctl and absent here,\nthe nearest .agentctl above the working directory. None or several fitting is an error naming\nthe bridges considered.\n\nUse this command only when the two marker lines cannot do the job. A reply printed between\nthe request's two marker lines is the normal way: it reaches the user in the chat and also stays\nin the agent's terminal, where the owner may be reading. Use the command to send a reply before\nthe agent's turn ends, such as a progress update during long work, or to send again a reply that\nwas written between the lines but did not reach the chat: one reported as not sent, or one that\n`agentctl chat sent` does not list, as when the screen was redrawn before the service read it.\nSend each reply one way only. A copy printed in the terminal without the marker lines sends\nnothing, so it is a safe way to show a reply sent by the command.\n\nWhen `chat run` has --offer-reply-command and outbound replies are enabled, each request prompt\nnames this command as `agentctl chat reply ID` when agents find the bridge by caller lookup;\notherwise `agentctl chat help ID --bridge-state DIR` prints the explicit form, with the\nservice's own executable, the state directory and the request key.\n\nThe command stores the file's text as a reply of that request, as if the service had read it\nbetween the reply ID's two marker lines on the agent's screen, and the service sends it like\nany reply it reads. Line breaks at the end of the file are dropped. A text the request already\nholds is not stored again, so running the command twice sends it once. It then asks a service\nrunning on the same state directory to send the reply at once; a service that cannot listen\nsends it at its next reconciliation, when the agent goes idle, or when it starts.\n\nOn success it prints one JSON object: request, reply_id, outcome (stored or already_stored),\nordinal, phase, and service_woken, which says whether the wake was sent to a socket of the\ncurrent user in the state directory; nothing confirms that a service received it. Exit\nstatus: 0 when the request holds the reply; 1 when the reply is refused, with the reason on\nstandard error and nothing stored, as for an empty or blank text or one over 30,000 bytes;\n1 also when the state cannot be read or written, or when the result cannot be printed after\nthe reply was stored; 75 when nothing was stored but the same command can succeed later; 2\nfor a usage error, which includes a file that cannot be read or is not UTF-8. It never\ncontacts Herdr, a helper, or a provider."
     )]
     Reply(ChatReply),
     /// Stop accepting fenced replies for one exact retained request
@@ -1467,6 +1474,26 @@ struct ChatState {
     /// Private durable bridge state directory
     #[arg(long, value_name = "DIR")]
     bridge_state: PathBuf,
+}
+
+/// Which bridge an agent-facing `chat` command reads: see `chat reply --help`.
+#[derive(Args)]
+struct ChatTarget {
+    /// Bridge state directory (default: the bridge that serves you, found by caller lookup)
+    #[arg(long, value_name = "DIR", conflicts_with = "bridge")]
+    bridge_state: Option<PathBuf>,
+    /// The bridge REGISTRY/bridges/NAME
+    #[arg(long, value_name = "NAME")]
+    bridge: Option<String>,
+}
+
+#[derive(Args)]
+struct ChatHelp {
+    #[command(flatten)]
+    target: ChatTarget,
+    /// A request's reply ID, as its prompt gives it, or a chat subcommand's name
+    #[arg(value_name = "REPLY_ID|COMMAND")]
+    topic: Option<String>,
 }
 
 #[derive(Args)]
@@ -1517,7 +1544,10 @@ struct ChatGrantLimit {
 #[derive(Args)]
 struct ChatSent {
     #[command(flatten)]
-    state: ChatState,
+    target: ChatTarget,
+    /// Only the replies of the request whose prompt gave this reply ID
+    #[arg(value_name = "REPLY_ID", conflicts_with = "request")]
+    reply_id: Option<String>,
     /// Only this request's replies: its exact 64-character lowercase hexadecimal key
     #[arg(long, value_name = "KEY")]
     request: Option<String>,
@@ -1614,12 +1644,16 @@ struct ChatInspect {
 }
 
 #[derive(Args)]
+#[command(group(clap::ArgGroup::new("which").required(true).args(["reply_id", "thread"])))]
 struct ChatThread {
     #[command(flatten)]
-    state: ChatState,
+    target: ChatTarget,
+    /// The thread of the request whose prompt gave this reply ID
+    #[arg(value_name = "REPLY_ID")]
+    reply_id: Option<String>,
     /// Exact provider thread ID; the command a request prompt prints already quotes it for the shell
     #[arg(long, value_name = "THREAD", allow_hyphen_values = true)]
-    thread: String,
+    thread: Option<String>,
     /// Print this many of the thread's most recent retained messages, oldest first (1-100)
     #[arg(
         long,
@@ -1709,15 +1743,26 @@ impl ChatPublish {
 }
 
 #[derive(Args)]
+#[command(group(clap::ArgGroup::new("id").required(true).args(["reply_id_word", "reply_id"])))]
 struct ChatReply {
     #[command(flatten)]
-    state: ChatState,
-    /// Exact 64-character lowercase hexadecimal request key
+    target: ChatTarget,
+    /// Reply ID that the request's prompt gives in its two marker lines (one that starts with `-`
+    /// goes after `--`, or in --reply-id)
+    #[arg(value_name = "REPLY_ID")]
+    reply_id_word: Option<String>,
+    /// Exact 64-character lowercase hexadecimal request key (default: the request whose prompt
+    /// gave the reply ID)
     #[arg(long)]
-    request: String,
-    /// Reply ID that the request's prompt gives in its two marker lines
-    #[arg(long, value_name = "ID", allow_hyphen_values = true)]
-    reply_id: String,
+    request: Option<String>,
+    /// Reply ID that the request's prompt gives in its two marker lines; the same as REPLY_ID
+    #[arg(
+        long,
+        value_name = "ID",
+        allow_hyphen_values = true,
+        conflicts_with = "reply_id_word"
+    )]
+    reply_id: Option<String>,
     /// UTF-8 file containing the reply, read with a 30,000-byte bound
     #[arg(long, value_name = "PATH")]
     file: PathBuf,
@@ -3829,6 +3874,60 @@ fn caller_session(flag: Option<String>, environment: Option<String>) -> Option<S
     }
 }
 
+/// The bridge an agent-facing `chat` command reads, and with `reply_id` the request that gave it
+/// (#707 chat-prompt-anatomy): see `crate::chat_lookup`. The caller is the registered agent whose
+/// harness runs this command in the bridge's registry, else `AGENTCTL_AGENT`.
+fn chat_target(
+    registry: &Path,
+    herdr_bin: &Path,
+    target: &ChatTarget,
+    reply_id: Option<&str>,
+) -> Result<crate::chat_lookup::Resolved, Failure> {
+    let environment = std::env::var("AGENTCTL_AGENT")
+        .ok()
+        .filter(|name| crate::subagents::name(name).is_ok());
+    let caller = |candidate: &Path| -> Option<String> {
+        let registered = HerdrClient::with_executable("direct", herdr_bin)
+            .ok()
+            .and_then(|client| {
+                ManagedAgents::new(&client, candidate)
+                    .ok()
+                    .and_then(|manager| manager.caller_edge().map(|edge| edge.agent))
+            });
+        registered.or_else(|| environment.clone())
+    };
+    crate::chat_lookup::resolve(
+        &crate::chat_lookup::Query {
+            state: target.bridge_state.as_deref(),
+            name: target.bridge.as_deref(),
+            reply_id,
+            registry,
+        },
+        std::env::var_os(crate::chat_lookup::BRIDGE_VARIABLE)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from),
+        &caller,
+    )
+    .map_err(|problem| lookup_failure(&problem))
+}
+
+fn lookup_failure(problem: &str) -> Failure {
+    Failure::Chat(crate::chat_service::ChatServiceError::Runtime(
+        crate::chat_runtime::ChatRuntimeError::Invalid(problem.to_owned()),
+    ))
+}
+
+/// What a failure says, for a page that reports it instead of exiting.
+fn failure_text(failure: &Failure) -> String {
+    match failure {
+        Failure::Chat(error) => error.to_string(),
+        Failure::Usage(text) => text.clone(),
+        Failure::Agent(error) => error.to_string(),
+        Failure::Output(error) => error.to_string(),
+        Failure::Stop(_) | Failure::Inbox(_) => "lookup failed".to_owned(),
+    }
+}
+
 fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Failure> {
     match chat.command {
         ChatCommand::Quickstart => {
@@ -3984,20 +4083,91 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
             write_json(&result).map_err(Failure::Output)?;
             Ok(0)
         }
+        ChatCommand::Help(value) => {
+            let mut command = <Cli as clap::CommandFactory>::command();
+            if let Some(topic) = value.topic.as_deref() {
+                if let Some(chat) = command.find_subcommand_mut("chat") {
+                    if let Some(subcommand) = chat.find_subcommand_mut(topic) {
+                        let help = subcommand
+                            .clone()
+                            .bin_name(format!("agentctl chat {topic}"))
+                            .render_long_help();
+                        write_text(&help.to_string()).map_err(Failure::Output)?;
+                        return Ok(0);
+                    }
+                }
+            }
+            let page = match value.topic.as_deref() {
+                None => crate::chat_lookup::generic_help(None, None),
+                Some(reply_id) => {
+                    match chat_target(&registry, &herdr_bin, &value.target, Some(reply_id)) {
+                        Ok(crate::chat_lookup::Resolved {
+                            state,
+                            request: Some(key),
+                        }) => {
+                            let found_by_lookup = value.target.bridge_state.is_none()
+                                && value.target.bridge.is_none();
+                            match crate::chat_runtime::BridgeState::inspect(&state) {
+                                Ok(bridge) => bridge
+                                    .with_prompt_commands(crate::chat_runtime::PromptCommands {
+                                        bare: found_by_lookup
+                                            && crate::chat_lookup::agentctl_on_path_is_this_build(),
+                                        discoverable: found_by_lookup,
+                                    })
+                                    .help_page(reply_id, &key),
+                                Err(error) => crate::chat_lookup::generic_help(
+                                    Some(reply_id),
+                                    Some(&error.to_string()),
+                                ),
+                            }
+                        }
+                        Ok(_) => crate::chat_lookup::generic_help(
+                            Some(reply_id),
+                            Some("it names no request"),
+                        ),
+                        Err(failure) => crate::chat_lookup::generic_help(
+                            Some(reply_id),
+                            Some(&failure_text(&failure)),
+                        ),
+                    }
+                }
+            };
+            write_text(&page).map_err(Failure::Output)?;
+            Ok(0)
+        }
         ChatCommand::Thread(value) => {
-            let history = crate::chat_service::thread_history(
-                &value.state.bridge_state,
-                &value.thread,
-                value.last,
-            )
-            .map_err(Failure::Chat)?;
+            let resolved = chat_target(
+                &registry,
+                &herdr_bin,
+                &value.target,
+                value.reply_id.as_deref(),
+            )?;
+            let thread = match (value.thread, &resolved.request) {
+                (Some(thread), _) => thread,
+                (None, Some(key)) => crate::chat_runtime::BridgeState::inspect(&resolved.state)
+                    .and_then(|state| state.thread_of_request(key))
+                    .map_err(|error| Failure::Chat(error.into()))?,
+                (None, None) => {
+                    return Err(Failure::Usage(
+                        "chat thread requires a reply ID or --thread".to_owned(),
+                    ))
+                }
+            };
+            let history = crate::chat_service::thread_history(&resolved.state, &thread, value.last)
+                .map_err(Failure::Chat)?;
             write_text(&history).map_err(Failure::Output)?;
             Ok(0)
         }
         ChatCommand::Sent(value) => {
+            let resolved = chat_target(
+                &registry,
+                &herdr_bin,
+                &value.target,
+                value.reply_id.as_deref(),
+            )?;
             let listing = crate::chat_service::sent_replies(
-                &value.state.bridge_state,
-                value.request.as_deref(),
+                &resolved.state,
+                value.request.as_deref().or(resolved.request.as_deref()),
                 value.last,
                 value.json,
             )
@@ -4021,13 +4191,28 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
         }
         ChatCommand::Reply(value) => {
             let body = value.read_reply()?;
-            match crate::chat_service::reply(
-                &value.state.bridge_state,
-                &value.request,
-                &value.reply_id,
-                &body,
-            )
-            .map_err(Failure::Chat)?
+            let reply_id = value
+                .reply_id_word
+                .as_deref()
+                .or(value.reply_id.as_deref())
+                .ok_or_else(|| Failure::Usage("chat reply requires a reply ID".to_owned()))?;
+            // An explicit state and request, as every prompt before #707 chat-prompt-anatomy
+            // printed, are used as given; otherwise the reply ID finds the bridge and request.
+            let (state, key) = match (&value.target.bridge_state, &value.request) {
+                (Some(state), Some(key)) => (state.clone(), key.clone()),
+                _ => {
+                    let resolved =
+                        chat_target(&registry, &herdr_bin, &value.target, Some(reply_id))?;
+                    let key = value
+                        .request
+                        .clone()
+                        .or(resolved.request)
+                        .ok_or_else(|| lookup_failure("the reply ID names no request"))?;
+                    (resolved.state, key)
+                }
+            };
+            match crate::chat_service::reply(&state, &key, reply_id, &body)
+                .map_err(Failure::Chat)?
             {
                 crate::chat_service::ReplyCommandOutcome::Stored(result) => {
                     write_json(&result).map_err(Failure::Output)?;
@@ -4111,6 +4296,7 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
                             claude_bin: value.claude_bin.clone(),
                         }
                     }),
+                    registry: Some(registry.clone()),
                 },
             )
             .map_err(Failure::Chat)?;
@@ -5073,12 +5259,14 @@ mod tests {
         };
         assert_eq!(
             thread_last(&["--thread", "spaces/example/threads/one"]),
-            Ok(("spaces/example/threads/one".to_owned(), 10))
+            Ok((Some("spaces/example/threads/one".to_owned()), 10))
         );
         assert_eq!(
             thread_last(&["--thread", "-leading-hyphen", "--last", "100"]),
-            Ok(("-leading-hyphen".to_owned(), 100))
+            Ok((Some("-leading-hyphen".to_owned()), 100))
         );
+        // The short form a prompt prints names the request by its reply ID.
+        assert_eq!(thread_last(&["007"]), Ok((None, 10)));
         assert!(thread_last(&["--thread", "t", "--last", "0"]).is_err());
         assert!(thread_last(&["--thread", "t", "--last", "101"]).is_err());
         assert!(thread_last(&["--last", "5"]).is_err());
@@ -5092,7 +5280,8 @@ mod tests {
             "--last",
             "(1-100)",
             "[default: 10]",
-            "Example:",
+            "Examples:",
+            "REPLY_ID",
         ] {
             assert!(help.contains(required), "{required} missing from:\n{help}");
         }
@@ -5222,24 +5411,79 @@ mod tests {
             panic!("expected chat reply");
         };
         assert_eq!(
-            reply.state.bridge_state,
-            std::path::Path::new("/tmp/chat-state")
+            reply.target.bridge_state.as_deref(),
+            Some(std::path::Path::new("/tmp/chat-state"))
         );
-        assert_eq!(reply.request, key);
-        assert_eq!(reply.reply_id, "-AbC_1");
+        assert_eq!(reply.request.as_deref(), Some(key.as_str()));
+        assert_eq!(reply.reply_id.as_deref(), Some("-AbC_1"));
         assert_eq!(reply.file, std::path::Path::new("reply.md"));
-        for missing in 0..4 {
+        // The reply ID and the file are required; the state and request are found by lookup
+        // when left out (#707 chat-prompt-anatomy).
+        for (missing, required) in [(0, false), (1, false), (2, true), (3, true)] {
             let rest = arguments
                 .chunks(2)
                 .enumerate()
                 .filter(|(index, _)| *index != missing)
                 .flat_map(|(_, pair)| pair.iter().copied());
-            assert!(
+            assert_eq!(
                 Cli::try_parse_from(["agentctl", "chat", "reply"].into_iter().chain(rest)).is_err(),
-                "parsed without {}",
+                required,
+                "without {}",
                 arguments[2 * missing]
             );
         }
+        // The short form a prompt prints, and a hyphen-led ID after `--` or in --reply-id.
+        for argv in [
+            &["agentctl", "chat", "reply", "007", "--file", "reply.md"][..],
+            &[
+                "agentctl", "chat", "reply", "--file", "reply.md", "--", "-AbC_1",
+            ][..],
+            &[
+                "agentctl",
+                "chat",
+                "reply",
+                "--reply-id",
+                "-AbC_1",
+                "--file",
+                "reply.md",
+            ][..],
+        ] {
+            let Some(Commands::Chat(Chat {
+                command: ChatCommand::Reply(reply),
+            })) = Cli::try_parse_from(argv).unwrap().command
+            else {
+                panic!("expected chat reply");
+            };
+            assert!(reply.target.bridge_state.is_none() && reply.request.is_none());
+            assert!(
+                reply.reply_id_word.is_some() || reply.reply_id.is_some(),
+                "{argv:?}"
+            );
+        }
+        assert!(Cli::try_parse_from([
+            "agentctl",
+            "chat",
+            "reply",
+            "007",
+            "--reply-id",
+            "007",
+            "--file",
+            "f"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "agentctl",
+            "chat",
+            "reply",
+            "007",
+            "--bridge-state",
+            "d",
+            "--bridge",
+            "b",
+            "--file",
+            "f"
+        ])
+        .is_err());
         // Only `chat run` takes the flag that offers the command, and it is off by default.
         for (flag, offered) in [(None, false), (Some("--offer-reply-command"), true)] {
             let parsed = Cli::try_parse_from(

@@ -73,6 +73,7 @@ impl Scratch {
                 reply_alias_range: None,
                 slack_format: None,
                 slack_format_by_channel: std::collections::BTreeMap::new(),
+                labels: None,
             },
         )
         .expect("initialize state");
@@ -120,8 +121,18 @@ impl Scratch {
 
     /// Run `agentctl chat reply --bridge-state <state>` followed by `arguments`.
     fn reply(&self, arguments: &[&str]) -> Run {
+        let state = self.state.to_str().expect("UTF-8 state").to_owned();
+        let mut words = vec!["reply", "--bridge-state", state.as_str()];
+        words.extend_from_slice(arguments);
+        self.chat(&words, &[])
+    }
+
+    /// Run `agentctl chat` followed by `arguments`, with `environment` added to the scratch
+    /// environment, which sets no bridge index unless `environment` does.
+    fn chat(&self, arguments: &[&str], environment: &[(&str, &Path)]) -> Run {
         let home = self.root.join("home");
         let registry = self.root.join("registry");
+        let registry_existed = registry.exists();
         let stdout_path = self.root.join("stdout");
         let stderr_path = self.root.join("stderr");
         let mut child = Command::new(env!("CARGO_BIN_EXE_agentctl"))
@@ -135,10 +146,13 @@ impl Scratch {
             .env("XDG_RUNTIME_DIR", home.join("runtime"))
             .arg("--registry")
             .arg(&registry)
+            .env_remove("AGENTCTL_AGENT")
+            .env_remove("AGENTCTL_CHAT_BRIDGE")
+            .env("AGENTCTL_CHAT_BRIDGE_INDEX", "off")
+            .envs(environment.iter().copied())
             .arg("--herdr-bin")
             .arg(self.root.join("absent-herdr"))
-            .args(["chat", "reply", "--bridge-state"])
-            .arg(&self.state)
+            .arg("chat")
             .args(arguments)
             .stdin(Stdio::null())
             .stdout(fs::File::create(&stdout_path).expect("create standard output"))
@@ -151,9 +165,12 @@ impl Scratch {
         };
         let (stdout, stderr) = (read(&stdout_path), read(&stderr_path));
         let status = status.unwrap_or_else(|| {
-            panic!("chat reply ran longer than {RUN_LIMIT:?} and was killed: {stderr}")
+            panic!("chat {arguments:?} ran longer than {RUN_LIMIT:?} and was killed: {stderr}")
         });
-        assert!(!registry.exists(), "chat reply created a registry");
+        assert!(
+            registry_existed || !registry.exists(),
+            "chat {arguments:?} created a registry"
+        );
         Run {
             code: status.code(),
             stdout,
@@ -338,4 +355,149 @@ fn chat_reply_exits_75_when_a_short_reply_id_waits_for_an_unusable_alias_record(
         &scratch.reply_with(&scratch.reply_id, &reply),
         &scratch.result("stored", 1),
     );
+}
+
+/// An index entry naming `scratch`'s state, in a fresh index directory under the scratch root,
+/// as `chat run` writes one when it starts (#707 chat-prompt-anatomy).
+fn index_naming(scratch: &Scratch, states: &[&Path]) -> PathBuf {
+    let index = scratch.root.join("index");
+    fs::create_dir_all(&index).expect("index directory");
+    for (number, state) in states.iter().enumerate() {
+        fs::write(
+            index.join(format!("{number:016x}.json")),
+            serde_json::to_vec(&json!({
+                "schema": agentctl::chat_lookup::INDEX_SCHEMA,
+                "state": fs::canonicalize(state).expect("canonical state"),
+                "registry": scratch.root.join("registry"),
+                "updated_at_millis": 1,
+            }))
+            .expect("entry JSON"),
+        )
+        .expect("write index entry");
+    }
+    index
+}
+
+#[test]
+fn a_reply_id_alone_finds_the_bridge_and_its_request_through_the_index() {
+    let scratch = Scratch::new("lookup-index");
+    let reply = scratch.file("reply.md", b"answer\n");
+    let index = index_naming(&scratch, &[&scratch.state]);
+    let worker = Path::new("worker");
+    let environment = [
+        ("AGENTCTL_CHAT_BRIDGE_INDEX", index.as_path()),
+        ("AGENTCTL_AGENT", worker),
+    ];
+    // The short form a prompt prints, and the same with the ID in --reply-id.
+    assert_stored(
+        &scratch.chat(
+            &["reply", &scratch.reply_id, "--file", &reply],
+            &environment,
+        ),
+        &scratch.result("stored", 1),
+    );
+    assert_stored(
+        &scratch.chat(
+            &["reply", "--reply-id", &scratch.reply_id, "--file", &reply],
+            &environment[..1],
+        ),
+        &scratch.result("already_stored", 1),
+    );
+    // `chat sent`, `chat thread` and `chat help` take the same ID.
+    let sent = scratch.chat(&["sent", &scratch.reply_id], &environment);
+    assert_eq!(sent.code, Some(0), "{}", sent.stderr);
+    assert!(sent.stdout.contains(&scratch.key), "{}", sent.stdout);
+    let thread = scratch.chat(&["thread", &scratch.reply_id], &environment);
+    assert_eq!(thread.code, Some(0), "{}", thread.stderr);
+    assert!(thread.stdout.contains("> request"), "{}", thread.stdout);
+    let help = scratch.chat(&["help", &scratch.reply_id], &environment);
+    assert_eq!(help.code, Some(0), "{}", help.stderr);
+    assert!(
+        help.stdout
+            .contains(&format!("chat reply {} --file FILE", scratch.reply_id)),
+        "{}",
+        help.stdout
+    );
+    assert!(
+        help.stdout.contains(&format!("--request {}", scratch.key)),
+        "{}",
+        help.stdout
+    );
+    // An ID no bridge gave is refused, naming what was considered; help says so and exits 0.
+    let unknown = scratch.chat(&["reply", "999", "--file", &reply], &environment);
+    assert_failed(&unknown, 1, "gave the reply ID \"999\"");
+    let help = scratch.chat(&["help", "999"], &environment);
+    assert_eq!(help.code, Some(0), "{}", help.stderr);
+    assert!(
+        help.stdout
+            .starts_with("agentctl could not find the bridge for reply ID 999"),
+        "{}",
+        help.stdout
+    );
+    // A chat subcommand's name prints that subcommand's help, as clap's help subcommand did.
+    let reply_help = scratch.chat(&["help", "reply"], &[]);
+    assert_eq!(reply_help.code, Some(0), "{}", reply_help.stderr);
+    assert!(
+        reply_help.stdout.contains("--reply-id"),
+        "{}",
+        reply_help.stdout
+    );
+    // With nothing registered there is no bridge to find.
+    assert_failed(
+        &scratch.chat(&["reply", &scratch.reply_id, "--file", &reply], &[]),
+        1,
+        "no chat bridge is registered for discovery",
+    );
+}
+
+#[test]
+fn a_bridge_targeting_the_caller_is_chosen_and_an_ambiguous_one_is_refused() {
+    let first = Scratch::new("lookup-first");
+    let second = Scratch::new("lookup-second");
+    let reply = first.file("reply.md", b"answer\n");
+    let index = index_naming(&first, &[&first.state, &second.state]);
+    // Both bridges target `worker` and know only their own long IDs, so the ID picks one.
+    let environment = [("AGENTCTL_CHAT_BRIDGE_INDEX", index.as_path())];
+    assert_stored(
+        &first.chat(&["reply", &first.reply_id, "--file", &reply], &environment),
+        &first.result("stored", 1),
+    );
+    // Without an ID, two bridges fit and the command names both.
+    let sent = first.chat(&["sent"], &environment);
+    assert_eq!(sent.code, Some(1), "{}", sent.stdout);
+    assert!(
+        sent.stderr.contains("2 chat bridges fit"),
+        "{}",
+        sent.stderr
+    );
+    // --bridge-state still picks one explicitly.
+    let state = first.state.to_str().expect("UTF-8 state");
+    let sent = first.chat(&["sent", "--bridge-state", state], &environment);
+    assert_eq!(sent.code, Some(0), "{}", sent.stderr);
+    // AGENTCTL_CHAT_BRIDGE names one for every command.
+    let sent = first.chat(
+        &["sent"],
+        &[("AGENTCTL_CHAT_BRIDGE", first.state.as_path())],
+    );
+    assert_eq!(sent.code, Some(0), "{}", sent.stderr);
+}
+
+#[test]
+fn a_bridge_under_the_registrys_bridges_directory_is_found_without_the_index() {
+    let scratch = Scratch::new("lookup-registry");
+    let reply = scratch.file("reply.md", b"answer\n");
+    let bridges = scratch
+        .root
+        .join("registry")
+        .join(agentctl::chat_lookup::BRIDGES);
+    fs::create_dir_all(&bridges).expect("bridges directory");
+    std::os::unix::fs::symlink(&scratch.state, bridges.join("worker")).expect("link the state");
+    assert_stored(
+        &scratch.chat(&["reply", &scratch.reply_id, "--file", &reply], &[]),
+        &scratch.result("stored", 1),
+    );
+    // --bridge NAME names it too.
+    let sent = scratch.chat(&["sent", "--bridge", "worker"], &[]);
+    assert_eq!(sent.code, Some(0), "{}", sent.stderr);
+    assert!(sent.stdout.contains(&scratch.key), "{}", sent.stdout);
 }

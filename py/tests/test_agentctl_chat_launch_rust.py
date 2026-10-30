@@ -177,6 +177,9 @@ class Fixture:
                 "FAKE_HERDR_DIR": str(self.control),
                 "FAKE_PANE_CWD": str(self.root),
                 "AGENTCTL_HOME": str(self.home),
+                # `chat run` registers the bridge in the per-user index (#707
+                # chat-prompt-anatomy); keep that inside the fixture.
+                "AGENTCTL_CHAT_BRIDGE_INDEX": str(self.root / "chat-bridges"),
                 # One bridge per channel is host-wide; concurrent test runs share channel IDs.
                 "AGENTCTL_CHAT_CHANNEL_LOCK_DIR": str(self.root / "channel-locks"),
                 "PATH": f"{self.bin_dir}:{env['PATH']}",

@@ -7,14 +7,17 @@ delivers therefore opens with one line naming its sender and route, whatever the
     [from cl-foo via agentctl · reply: agentctl send cl-foo]
     [from human@host-a via agentctl]
 
-The grammar is ``[from SENDER via ROUTE( · KEY: VALUE)*]`` on a line of its own. SENDER holds no
-white space, ``·`` or ``]``; ROUTE and each VALUE hold no ``·`` or ``]``. Fields after the route
-are optional and a reader ignores keys it does not know; ``reply`` appears only when SENDER is an
-agent that can be answered with ``agentctl send``. Other tools that hand agents messages may write
-the same grammar with a route of their own.
+The grammar is ``[from SENDER via ROUTE( · KEY: VALUE)*]`` on a line of its own. SENDER is words
+joined by single spaces, without ``·`` or ``]`` (an agent name is one word; the chat bridge's
+sender may be a display name, #707 chat-prompt-anatomy); ROUTE and each VALUE hold no ``·`` or
+``]``. Fields after the route are optional and a reader ignores keys it does not know; on the
+``agentctl`` routes ``reply`` appears only when SENDER is an agent that can be answered with
+``agentctl send``. Other tools that hand agents messages write the same grammar with a route of
+their own: the compiled chat bridge opens each request prompt with
+``[from SENDER via PROVIDER CHANNEL · sent: TIME · reply: ...]``.
 
-The header is mandatory: no option suppresses it. Only the chat bridge's owner messages, which
-carry their own opening and never pass through ``agentctl send``, go without. A one-line harness
+The header is mandatory: no option suppresses it. The chat bridge's request prompts never pass
+through ``agentctl send`` and carry the bridge's own header instead. A one-line harness
 slash command (see :func:`is_slash_command`) is a command for the harness rather than a message to
 the agent, and a header would stop the harness reading it as one, so it is sent as written.
 
@@ -107,6 +110,14 @@ def _whitespace(text: str) -> bool:
     return any(character.isspace() for character in text)
 
 
+def is_sender_label(label: str) -> bool:
+    """Whether ``label`` can stand as a header's SENDER: words joined by single spaces, with no other
+    white space, ``·`` or ``]``, and not holding `` via ``, so the route is found where it begins."""
+    return (bool(label) and " via " not in label
+            and all(word and not _whitespace(word) and "·" not in word and "]" not in word
+                    for word in label.split(" ")))
+
+
 def parse(line: str) -> Header | None:
     """Parse one header line (the first line of a delivered prompt); ``None`` when it is not one."""
     if not line.startswith("[from ") or not line.endswith("]"):
@@ -116,8 +127,7 @@ def parse(line: str) -> Header | None:
         return None
     parts = inner.split(SEPARATOR)
     sender, via, route = parts[0].partition(" via ")
-    if (not via or not sender or _whitespace(sender) or "·" in sender
-            or not route.strip() or "·" in route):
+    if not via or not is_sender_label(sender) or not route.strip() or "·" in route:
         return None
     fields: list[tuple[str, str]] = []
     for part in parts[1:]:

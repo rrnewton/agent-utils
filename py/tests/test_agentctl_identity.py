@@ -1246,7 +1246,11 @@ def test_sender_headers_parse_back_and_malformed_lines_do_not() -> None:
     assert header.field("reply") == "agentctl send cl-foo"
     teams = sh.parse("[from tools@host-a via agent-teams · to: sim@host-b · id: tm-sim-1]")
     assert teams is not None and [key for key, _ in teams.fields] == ["to", "id"]
-    for bad in ("", "from x via y", "[from x]", "[from  via y]", "[from a b via y]",
+    # A chat bridge's sender is a display name (#707 chat-prompt-anatomy).
+    chat = sh.parse("[from Ada Lovelace via slack #team · sent: 2026.10.30:10:51 EDT]")
+    assert chat is not None and (chat.sender, chat.route) == ("Ada Lovelace", "slack #team")
+    for bad in ("", "from x via y", "[from x]", "[from  via y]", "[from a  b via y]", "[from a\tb via y]",
+                "[from  a via y]", "[from a  via y]", "[from a·b via y]",
                 "[from x via ]", "[from x via y · reply]", "[from x via y · Reply: z]",
                 "[from x via y] trailing", "[from x via y]]",
                 "D127030260 | HELD: x | SCOPE (proposed): y"):

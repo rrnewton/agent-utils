@@ -500,6 +500,7 @@ fn a_bridge_configuration_for_slack_is_accepted_by_the_plugin() {
         reply_alias_range: None,
         slack_format: Some(agentctl::chat_runtime::SlackFormat::Markdown),
         slack_format_by_channel: std::collections::BTreeMap::new(),
+        labels: None,
     };
     let request = configuration
         .subscribe_request(Some("slack1:seq:42"))

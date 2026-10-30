@@ -481,45 +481,113 @@ Herdr/provider evidence. The command accepts one exact key and reports only an
 active retained request. An acceptance harness that later calls `chat close`
 must copy and fsync this inspection document first.
 
-The first line of each request prompt opens with the message's own create
-time, as `Sent 2026.10.07:08:45 EDT.`, in the bridge service's local time zone:
-the one the C library resolves from `TZ` when it is set, otherwise from the
-host's `/etc/localtime`. Set `TZ` in the service's environment to choose it; the
-zone's abbreviation is always printed, or its offset as `UTC-04:00` when the
-abbreviation is unusable, and UTC is used when the local time cannot be read.
-When the prompt is typed 120 seconds or more after that time, as after a bridge
-outage or behind a busy agent, the line also says how much later, as
-`Sent 2026.10.07:08:45 EDT, delivered 1 h 12 min later.`, so an agent handed
-several held messages at once can tell how old each one is. The rest of that
-line says that the request arrived through the chat bridge. After it, each
-request prompt gives the message's `Source:` ID, its `Sender:`, and its
-`Thread:` ID, and says whether the message starts a new thread or replies in an
-existing one. When a provider payload with schema `google.chat.message.v1`
-quotes an earlier message, a `Quoted message:` line names that message and its
-text follows with every line prefixed by `> `, or an empty line by `>` alone. A
-long quote keeps whole lines from its beginning and its end, with one line
-`...N chars elided...` between them, where N is the number of characters left
-out (`...1 char elided...` when N is 1); only a line too long to show whole is
-cut inside. The `Quoted message:` line then states how many characters the
+Each request prompt (#707 chat-prompt-anatomy) is one header line, a blank
+line, the message between two tag lines, a blank line, and a short footer:
+
+```text
+[from Ada Lovelace via slack #team-chat · sent: 2026.10.30:10:51 EDT · reply: <CHAT_REPLY_007> or agentctl chat reply 007]
+
+<chat_message>
+the message, exactly as sent
+</chat_message>
+
+Reply between a line <CHAT_REPLY_007> and a line </CHAT_REPLY_007>, with no tool call between them; send several replies when that helps (progress updates, one reply per topic), each in its own pair.
+Earlier messages in this thread: agentctl chat thread 007
+If you have trouble, run: agentctl chat help 007
+```
+
+The header uses the grammar of `agentctl send`'s sender header, `[from SENDER
+via ROUTE · KEY: VALUE ...]`. SENDER is the sender's label from the
+configuration's optional `labels.senders` map (provider sender ID to display
+name), else the provider ID; ROUTE is the subscription plugin's name and the
+channel's label from `labels.channels`, else the channel ID:
+
+```json
+"labels": {
+  "senders": {"U0EXAMPLE": "Ada Lovelace"},
+  "channels": {"C0EXAMPLE": "#team-chat"}
+}
+```
+
+A sender label is words joined by single spaces; neither kind may hold `·`,
+`]`, a line break or another control character, and each is at most 64 bytes.
+A configuration that breaks these rules is refused when it is read.
+
+`sent:` gives the message's own create time in the bridge service's local time
+zone: the one the C library resolves from `TZ` when it is set, otherwise from
+the host's `/etc/localtime`. Set `TZ` in the service's environment to choose
+it; the zone's abbreviation is always printed, or its offset as `UTC-04:00`
+when the abbreviation is unusable, and UTC is used when the local time cannot
+be read. When the prompt is typed 120 seconds or more after that time, as after
+a bridge outage or behind a busy agent, the field also says how much later, as
+`sent: 2026.10.07:08:45 EDT, delivered 1 h 12 min later`, so an agent handed
+several held messages at once can tell how old each one is. The queue decides
+it when it types the prompt: the bridge queues the create time, and the drain
+rewrites the field in the first line. (Prompts queued by an earlier release
+open with `Sent 2026.10.07:08:45 EDT.` instead, and are still retimed.)
+`reply:` names the request's reply markers, and the reply command when the
+bridge offers it and agents find the bridge by caller lookup (below). An
+inbound-only bridge's header has no `reply:`, and its footer says that nothing
+the agent writes reaches the chat.
+
+The message stands between the tag lines `<chat_message>` and
+`</chat_message>`, exactly as sent; a line of it that is itself one of these
+tags is printed with `<\/` (or `<\`) in its place, so the message cannot close
+its fence early. The tags are stable. When a provider payload with schema
+`google.chat.message.v1` quotes an earlier message, a `Quoted message:` block
+comes before the opening tag: a line naming that message, then its text with
+every line prefixed by `> `, or an empty line by `>` alone. A long quote keeps
+whole lines from its beginning and its end, with one line `...N chars
+elided...` between them, where N is the number of characters left out (`...1
+char elided...` when N is 1); only a line too long to show whole is cut
+inside. The `Quoted message:` line then states how many characters the
 provider's quoted text has. N counts characters of the quote after each CR LF
 pair has become one line break and white space at both ends has been trimmed;
 the `Quoted message:` count is of the provider's text before those changes.
-Identifiers stay on one line and control characters are replaced, so this text
-cannot break a later terminal capture. In identifiers and quoted text, the `<`
+Header words and quoted text stay on one line each and control characters are
+replaced, so this text cannot break a later terminal capture. In them, the `<`
 of a reply-marker token such as `<CHAT_REPLY_` is printed as `‹`, and each
-character of a run of three or more backticks or tildes as `ˋ` or `˜`, so no row
-can form a reply marker or open a code fence however the terminal wraps a long
-line. These tokens are found as if every non-ASCII character and every tab were
-absent, because a terminal program may drop a character it draws with no width.
-The look-alikes count as absent too, so when replacing one token joins its
-neighbours into another, as in `<<CHAT_REPLY_`, that one is replaced as well,
-and no marker or fence forms whichever of these characters a terminal drops. The
-message's own text follows the front matter as sent. For a reply in an existing
-thread, the prompt also prints the exact command that shows the thread's earlier
-messages. The command is left out when a word of it cannot be printed on one
-line or holds such a token, because a rewritten word would name a different
-thread or state directory. The command starts with the absolute path of the
-service's own executable, because a service need not have `agentctl` on `PATH`:
+character of a run of three or more backticks or tildes as `ˋ` or `˜`, so no
+row can form a reply marker or open a code fence however the terminal wraps a
+long line. These tokens are found as if every non-ASCII character and every tab
+were absent, because a terminal program may drop a character it draws with no
+width. The look-alikes count as absent too, so when replacing one token joins
+its neighbours into another, as in `<<CHAT_REPLY_`, that one is replaced as
+well, and no marker or fence forms whichever of these characters a terminal
+drops.
+
+The footer gives the marker rule in one line, the command that prints the
+thread's earlier messages for a reply in an existing thread, and `agentctl chat
+help ID`, which explains the rest: when to use the reply command, sending each
+reply one way only, and checking `chat sent`, with this request's exact
+commands, ending with the explicit `chat reply` command (state directory and
+request key included) for when lookup cannot find the bridge. A command is
+left out when a word of it cannot be printed on one line or holds such a
+token.
+
+**Finding the bridge.** When `chat run` starts it records its state directory
+and `--registry` in the per-user bridge index,
+`$XDG_STATE_HOME/agentctl/chat-bridges/` (default `~/.local/state`; one JSON
+file per state directory, schema `agentctl-chat-bridge-index/v1`;
+`AGENTCTL_CHAT_BRIDGE_INDEX` names another directory, or `off`). Once it has,
+its prompts print the short commands, `agentctl chat reply ID --file FILE`,
+`agentctl chat thread ID`, `agentctl chat sent ID` and `agentctl chat help ID`,
+and those find the bridge the way `git` finds its repository: `--bridge-state
+DIR`, or `--bridge NAME` for `REGISTRY/bridges/NAME`, when given; else
+`$AGENTCTL_CHAT_BRIDGE`; else every bridge in `REGISTRY/bridges/` and the
+index. Of those it keeps the bridges whose `bridge.json` targets the calling
+agent (the registered agent whose pinned harness is the caller's nearest
+ancestor, as `agentctl send` finds its sender, else `$AGENTCTL_AGENT`), and of
+those the one that gave the reply ID: bridges that type into one pane already
+have disjoint `reply_alias_range`s. REGISTRY is `--registry`, or, when that is
+the default `.agentctl` and the working directory has none, the nearest
+`.agentctl` above it. None or several fitting is an error naming the bridges
+considered. The program is plain `agentctl` when the `agentctl` on the
+service's `PATH` is the service's own executable, or a program whose
+`--version` output is that build's (for a build that names its commit);
+otherwise it is the service's absolute executable path, so an older build on
+`PATH` never receives syntax it does not know. A service that cannot write the
+index logs why and prints the explicit forms, as releases before #707 did:
 
 ```sh
 /opt/agentctl/bin/agentctl chat thread \
@@ -527,9 +595,11 @@ service's own executable, because a service need not have `agentctl` on `PATH`:
   --thread spaces/example/threads/one --last 10
 ```
 
-If that executable's file has been deleted, the command names the file now at
-the same path, normally the build that replaced it; with no file there, it
-starts with plain `agentctl`.
+If that executable's file has been deleted, an explicit command names the file
+now at the same path, normally the build that replaced it; with no file there,
+`chat thread` starts with plain `agentctl`. Every command an earlier prompt
+printed keeps working: `--bridge-state`, `--request`, `--reply-id` and
+`--thread` are still accepted.
 
 `thread` prints the thread's retained requests and the replies captured for
 them, oldest first, each with its UTC time, its age, and whether a reply was
@@ -569,10 +639,11 @@ contacts Herdr, a helper, or a provider.
 
 A reply printed between its two marker lines reaches the user only if the
 service reads it from the agent's screen, and a terminal agent can redraw or
-clear its screen before that read. With `chat run --offer-reply-command`, each
-prompt of an outbound-enabled bridge also offers a way that does not depend on
-the screen: write the reply to a file and run the exact command the prompt
-prints, which starts with the absolute path of the service's own executable:
+clear its screen before that read. With `chat run --offer-reply-command`, an
+outbound-enabled bridge also offers a way that does not depend on the screen:
+write the reply to a file and run `agentctl chat reply ID --file FILE`, which
+the header names when agents find the bridge by caller lookup, and `chat help
+ID` always gives in full, with the explicit form last:
 
 ```sh
 /opt/agentctl/bin/agentctl chat reply \
@@ -580,19 +651,17 @@ prints, which starts with the absolute path of the service's own executable:
   --request 64_LOWERCASE_HEX_CHARACTERS --reply-id 001 --file PATH_TO_YOUR_REPLY
 ```
 
-When no file is left at the executable's path, or a word of that command, that
-path included, cannot be printed safely on one line, the prompt gives only the
-two marker lines. The prompt names the two marker lines as the normal way to
-reply, since that text also stays in the agent's terminal, where the owner may
-be reading, and the command only for a reply that must go before the agent's
-turn ends or one written between the lines that did not reach the chat: one
-reported as not sent, or one that `chat sent` does not list, as when the screen
-was redrawn before the service read it. It
-asks the agent to send each reply one way only, and to print a reply between
-the two lines at the end of its turn if the command fails twice for it.
+`chat help` names the two marker lines as the normal way to reply, since that
+text also stays in the agent's terminal, where the owner may be reading, and
+the command only for a reply that must go before the agent's turn ends or one
+written between the lines that did not reach the chat: one reported as not
+sent, or one that `chat sent` does not list, as when the screen was redrawn
+before the service read it. It asks the agent to send each reply one way only,
+and to print a reply between the two lines at the end of its turn if the
+command fails twice for it.
 
 `reply` stores the file's text as a reply of the request, as if the service had
-read it between the two marker lines of `--reply-id`, and the service sends it
+read it between the two marker lines of the reply ID, and the service sends it
 like any reply it reads. The same rules apply. The ID must be one that the
 request's prompt gives: the request's reply alias, or `<nonce>_<ordinal>` with
 any valid ordinal. Neither the key nor the ID is a secret; both must match so
@@ -2049,8 +2118,9 @@ It names up to 32 reply IDs, newest first, each with how long ago its prompt
 was typed, and counts the rest, whom it reminds too. It spells the marker lines
 out in parts, so no row of it is a marker however the terminal wraps it. For
 each request it names it prints, on a line of its own, the exact
-`agentctl chat sent --request` command that lists the replies the bridge holds
-for that request, with the full key, so the agent can tell a reply the bridge
+`agentctl chat sent` command that lists the replies the bridge holds for that
+request (`chat sent ID` once agents find the bridge by caller lookup, else
+`chat sent --bridge-state DIR --request KEY` with the full key), so the agent can tell a reply the bridge
 captured after the reminder was typed from one it never received before
 sending anything again; when a command cannot be printed safely, it names the
 command in general terms instead. With `--offer-reply-command`, it also prints,

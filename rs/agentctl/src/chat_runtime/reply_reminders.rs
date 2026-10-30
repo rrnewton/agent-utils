@@ -413,15 +413,16 @@ working on it, ignore this reminder; the bridge sends it only once for each requ
                 .collect::<Option<Vec<_>>>()
                 .map(|lines| lines.join("\n"))
         };
-        let check = listed_commands(&|request| self.sent_command(&request.key)).map_or_else(
-            || general_check.clone(),
-            |lines| {
-                format!(
+        let check = listed_commands(&|request| self.sent_command(&request.key, &request.reply_id))
+            .map_or_else(
+                || general_check.clone(),
+                |lines| {
+                    format!(
                     "{check_lead} Run this command for each request; a reply it lists reached the \
 bridge, so do not send that reply again:\n{lines}\n"
                 )
-            },
-        );
+                },
+            );
         let generic_with = |check: &str| {
             let separator = if check.ends_with('\n') { "" } else { " " };
             format!(
@@ -446,10 +447,15 @@ command, you can instead write the reply to a file and send it with that command
             return bounded_generic();
         };
         let separator = if check.ends_with('\n') { "" } else { " " };
+        let placeholder = if self.prompt_commands.discoverable {
+            "FILE"
+        } else {
+            "PATH_TO_YOUR_REPLY"
+        };
         let offered = format!(
             "{lead} {check}{separator}Otherwise you can write the reply to a file, without the two \
 lines, and send it with `agentctl chat reply`, putting the file's path in place of \
-PATH_TO_YOUR_REPLY:\n{commands}\n{close}"
+{placeholder}:\n{commands}\n{close}"
         );
         if offered.len() <= MAX_REPLY_REMINDER_PROMPT_BYTES {
             offered
@@ -661,6 +667,7 @@ mod tests {
                 reply_alias_range: None,
                 slack_format: Some(crate::chat_runtime::SlackFormat::Markdown),
                 slack_format_by_channel: std::collections::BTreeMap::new(),
+                labels: None,
             },
         )
         .expect("initialize state");

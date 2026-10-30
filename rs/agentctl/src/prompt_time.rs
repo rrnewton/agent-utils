@@ -27,11 +27,26 @@ pub(crate) const LATE_PROMPT_AFTER: Duration = Duration::from_secs(120);
 
 /// The opening of a request prompt's first line, as `Sent 2026.10.07:08:45 EDT. ` or, for a late
 /// one, `Sent 2026.10.07:08:45 EDT, delivered 1 h 12 min later. `; empty when `created_at` cannot
-/// be read, which a provider-accepted message never is.
+/// be read, which a provider-accepted message never is. Prompts rendered before #707
+/// chat-prompt-anatomy opened this way; queued ones are still retimed.
 pub(crate) fn opening(created_at: &str, now_millis: u64) -> String {
-    let Some(created) = rfc3339_instant(created_at) else {
-        return String::new();
-    };
+    when(created_at, now_millis).map_or_else(String::new, |when| format!("Sent {when}. "))
+}
+
+/// The `sent:` field of a request prompt's header line (#707 chat-prompt-anatomy), as
+/// `sent: 2026.10.07:08:45 EDT` or, for a late one, `sent: 2026.10.07:08:45 EDT, delivered 1 h 12
+/// min later`; empty when `created_at` cannot be read.
+pub(crate) fn field(created_at: &str, now_millis: u64) -> String {
+    when(created_at, now_millis).map_or_else(String::new, |when| format!("{FIELD_KEY}{when}"))
+}
+
+/// How a [`field`] begins; [`retime`] tells the two kinds of opening apart by it.
+const FIELD_KEY: &str = "sent: ";
+
+/// The message's create time as a stamp, and how much later it is typed when that is at least
+/// [`LATE_PROMPT_AFTER`]: `2026.10.07:08:45 EDT` or `2026.10.07:08:45 EDT, delivered 2 min later`.
+fn when(created_at: &str, now_millis: u64) -> Option<String> {
+    let created = rfc3339_instant(created_at)?;
     let stamp = stamp(created.seconds, zone_at(created.seconds));
     // Exact, fraction included, so a message 119.5 seconds old is not called late; a fraction
     // finer than a nanosecond counts as one more, so a message is never made older than it is.
@@ -39,22 +54,39 @@ pub(crate) fn opening(created_at: &str, now_millis: u64) -> String {
         - (i128::from(created.seconds) * 1_000_000_000
             + i128::from(created.nanos)
             + i128::from(created.finer));
-    if waited_nanos >= i128::from(LATE_PROMPT_AFTER.as_secs()) * 1_000_000_000 {
-        let waited = u64::try_from(waited_nanos / 1_000_000_000).unwrap_or(u64::MAX);
-        format!("Sent {stamp}, delivered {} later. ", duration_words(waited))
-    } else {
-        format!("Sent {stamp}. ")
-    }
+    Some(
+        if waited_nanos >= i128::from(LATE_PROMPT_AFTER.as_secs()) * 1_000_000_000 {
+            let waited = u64::try_from(waited_nanos / 1_000_000_000).unwrap_or(u64::MAX);
+            format!("{stamp}, delivered {} later", duration_words(waited))
+        } else {
+            stamp
+        },
+    )
 }
 
 /// Starts a [`deferred`] prompt. No rendered prompt holds it: prompts never carry control
 /// characters into the pane.
 const DEFERRED: char = '\u{0}';
 
+/// Encloses a [`deferred_field`] inside a prompt. No rendered prompt holds it either.
+const DEFERRED_FIELD: char = '\u{1}';
+
 /// A request prompt whose opening is decided when it is queued and again when it is typed:
-/// `rest` is the prompt after the opening, and `created_at` the message's create time.
+/// `rest` is the prompt after the opening, and `created_at` the message's create time. Prompts
+/// queued before #707 chat-prompt-anatomy were marked this way; [`queue_deferred`] still takes them.
+#[cfg(test)]
 pub(crate) fn deferred(created_at: &str, rest: &str) -> String {
     format!("{DEFERRED}{created_at}{DEFERRED}{rest}")
+}
+
+/// The placeholder for a [`field`] that is decided when the prompt is queued and again when it is
+/// typed, to be written into the prompt's first line where the field belongs; empty when
+/// `created_at` cannot be read, so a prompt never carries the placeholder's control characters.
+pub(crate) fn deferred_field(created_at: &str) -> String {
+    if rfc3339_instant(created_at).is_none() {
+        return String::new();
+    }
+    format!("{DEFERRED_FIELD}{created_at}{DEFERRED_FIELD}")
 }
 
 /// What the queue stores for a [`deferred`] prompt: the text it keeps, opening included, and the
@@ -66,29 +98,55 @@ pub(crate) struct QueuedOpening {
     pub(crate) opening: String,
 }
 
-/// The queued form of `text` when it is a [`deferred`] prompt with a readable create time, opened
-/// for `now_millis`; `None` for any other text, which is queued unchanged.
+/// The queued form of `text` when it is a [`deferred`] prompt, or holds a [`deferred_field`] in
+/// its first line, with a readable create time, opened for `now_millis`; `None` for any other
+/// text, which is queued unchanged.
 pub(crate) fn queue_deferred(text: &str, now_millis: u64) -> Option<QueuedOpening> {
-    let (sent_at, rest) = text.strip_prefix(DEFERRED)?.split_once(DEFERRED)?;
+    if let Some(marked) = text.strip_prefix(DEFERRED) {
+        let (sent_at, rest) = marked.split_once(DEFERRED)?;
+        rfc3339_instant(sent_at)?;
+        let opening = opening(sent_at, now_millis);
+        return Some(QueuedOpening {
+            text: format!("{opening}{rest}"),
+            sent_at: sent_at.to_owned(),
+            opening,
+        });
+    }
+    let first_line = text.split('\n').next().unwrap_or_default();
+    let (head, marked) = first_line.split_once(DEFERRED_FIELD)?;
+    let (sent_at, _) = marked.split_once(DEFERRED_FIELD)?;
     rfc3339_instant(sent_at)?;
-    let opening = opening(sent_at, now_millis);
+    let opening = field(sent_at, now_millis);
+    let rest = &text[head.len() + sent_at.len() + 2 * DEFERRED_FIELD.len_utf8()..];
     Some(QueuedOpening {
-        text: format!("{opening}{rest}"),
+        text: format!("{head}{opening}{rest}"),
         sent_at: sent_at.to_owned(),
         opening,
     })
 }
 
 /// The text to type for a queued prompt that recorded `sent_at` and `opening`: that opening
-/// replaced by one for `now_millis`. `None` when the text does not begin with exactly that
-/// opening, or `sent_at` cannot be read; the text is then typed as stored, never cut.
+/// replaced by one for `now_millis`. An opening `Sent ...` must begin the text; a `sent: ...`
+/// field must be in its first line, and its first occurrence there is replaced. `None` when the
+/// opening is not where it belongs, or `sent_at` cannot be read; the text is then typed as
+/// stored, never cut.
 pub(crate) fn retime(text: &str, sent_at: &str, opening: &str, now_millis: u64) -> Option<String> {
     rfc3339_instant(sent_at)?;
-    if !opening.starts_with("Sent ") {
+    if opening.starts_with("Sent ") {
+        let rest = text.strip_prefix(opening)?;
+        return Some(format!("{}{rest}", self::opening(sent_at, now_millis)));
+    }
+    if !opening.starts_with(FIELD_KEY) {
         return None;
     }
-    let rest = text.strip_prefix(opening)?;
-    Some(format!("{}{rest}", self::opening(sent_at, now_millis)))
+    let first_line = text.split('\n').next().unwrap_or_default();
+    let at = first_line.find(opening)?;
+    Some(format!(
+        "{}{}{}",
+        &text[..at],
+        field(sent_at, now_millis),
+        &text[at + opening.len()..]
+    ))
 }
 
 /// The wall clock a prompt is rendered against.
@@ -582,6 +640,54 @@ mod tests {
             retime(&queued.text, "soon", &queued.opening, at(MORNING)),
             None
         );
+    }
+
+    #[test]
+    fn a_deferred_header_field_is_queued_printable_and_retimed_in_the_first_line() {
+        test_clock::set(at(MORNING + 30), EDT, "EDT");
+        let marked = format!(
+            "[from Ada via slack #team · {} · reply: <CHAT_REPLY_007>]\n\nsent: an echo in the body",
+            deferred_field("2026-10-07T12:45:00Z")
+        );
+        let queued = queue_deferred(&marked, now_millis()).expect("deferred field");
+        assert_eq!(
+            queued,
+            QueuedOpening {
+                text: "[from Ada via slack #team · sent: 2026.10.07:08:45 EDT · reply: <CHAT_REPLY_007>]\n\nsent: an echo in the body".to_owned(),
+                sent_at: "2026-10-07T12:45:00Z".to_owned(),
+                opening: "sent: 2026.10.07:08:45 EDT".to_owned(),
+            }
+        );
+        assert!(!queued.text.chars().any(|c| c.is_control() && c != '\n'));
+        assert_eq!(
+            retime(
+                &queued.text,
+                &queued.sent_at,
+                &queued.opening,
+                at(MORNING + 72 * 60)
+            ),
+            Some(
+                "[from Ada via slack #team · sent: 2026.10.07:08:45 EDT, delivered 1 h 12 min later · reply: <CHAT_REPLY_007>]\n\nsent: an echo in the body"
+                    .to_owned()
+            )
+        );
+        // An unreadable create time gives no placeholder, so no control character is typed.
+        assert_eq!(deferred_field("soon"), "");
+        // A field that is not in the first line is not retimed: the text is typed as stored.
+        let moved = "[from Ada via slack #team]\nsent: 2026.10.07:08:45 EDT";
+        assert_eq!(
+            retime(moved, &queued.sent_at, &queued.opening, at(MORNING)),
+            None
+        );
+        // A placeholder below the first line is not one.
+        assert_eq!(
+            queue_deferred(
+                &format!("header\n{}", deferred_field("2026-10-07T12:45:00Z")),
+                now_millis()
+            ),
+            None
+        );
+        assert_eq!(field("yesterday", at(MORNING)), "");
     }
 
     /// Set in the child process [`the_process_zone_follows_tz_in_both_seasons`] starts.
