@@ -2,7 +2,20 @@
 // browser global it stands for at the moment it is used, never once at construction, so whatever
 // the page's environment holds then is what is used.
 
-import type { CancellationPort, ClockPort, HttpPort, HttpRequestInit, StoragePort, TimerHandle } from "../../ports/index.ts";
+import type {
+  AudioPort,
+  CancellationPort,
+  ClockPort,
+  HttpPort,
+  HttpRequestInit,
+  MicrophonePort,
+  SocketPort,
+  StoragePort,
+  TimerHandle,
+} from "../../ports/index.ts";
+
+/** The window as an older WebKit gives it: its audio context class under a prefixed name. */
+type PrefixedWindow = Window & { readonly webkitAudioContext?: typeof AudioContext };
 
 /** The ports the browser gives the core. */
 export interface WebPorts {
@@ -13,11 +26,18 @@ export interface WebPorts {
   readonly deviceStorage: StoragePort;
   /** This window's storage, `sessionStorage`. */
   readonly windowStorage: StoragePort;
+  /** `WebSocket`. */
+  readonly socket: SocketPort<WebSocket>;
+  /** `AudioContext` (or WebKit's prefixed one) and `Audio`. */
+  readonly audio: AudioPort<typeof AudioContext, HTMLAudioElement>;
+  /** `navigator.mediaDevices.getUserMedia`. */
+  readonly microphone: MicrophonePort<MediaStreamConstraints, MediaStream>;
 }
 
 /**
  * The browser's ports: `fetch`, `setTimeout`/`clearTimeout`, `AbortController` where there is one,
- * and `localStorage` and `sessionStorage`, whose very lookup throws where storage is refused.
+ * `localStorage` and `sessionStorage`, whose very lookup throws where storage is refused, and the
+ * socket, audio and microphone the voice call and reading aloud use.
  */
 export function createWebPorts(): WebPorts {
   return {
@@ -37,5 +57,11 @@ export function createWebPorts(): WebPorts {
       setItem: (key: string, value: string) => sessionStorage.setItem(key, value),
       removeItem: (key: string) => sessionStorage.removeItem(key),
     },
+    socket: { open: (url: string) => new WebSocket(url) },
+    audio: {
+      contextClass: () => window.AudioContext || (window as PrefixedWindow).webkitAudioContext,
+      element: (url: string) => new Audio(url),
+    },
+    microphone: { open: (constraints: MediaStreamConstraints) => navigator.mediaDevices.getUserMedia(constraints) },
   };
 }

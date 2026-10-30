@@ -57,3 +57,29 @@ export interface StoragePort {
   setItem(key: string, value: string): void;
   removeItem(key: string): void;
 }
+
+/**
+ * Opens a socket to a URL, of the platform's own kind (`Socket`): the voice call's connection to its
+ * voice service. Opening may throw where the URL is refused.
+ */
+export interface SocketPort<Socket = unknown> {
+  open(url: string): Socket;
+}
+
+/**
+ * The device's audio, of the platform's own kinds: the audio context class it has (`ContextClass`),
+ * if any, for the call's playback and a streamed read aloud; and a media element (`Element`) that
+ * plays one URL, for a read aloud played whole and the silent keeper that holds the media keys.
+ */
+export interface AudioPort<ContextClass = unknown, Element = unknown> {
+  contextClass(): ContextClass | undefined;
+  element(url: string): Element;
+}
+
+/**
+ * Opens the microphone with the platform's constraints (`Constraints`), as a stream of its own kind
+ * (`Stream`). Rejects where the reader or the platform refuses it, or there is no microphone.
+ */
+export interface MicrophonePort<Constraints = unknown, Stream = unknown> {
+  open(constraints: Constraints): Promise<Stream>;
+}

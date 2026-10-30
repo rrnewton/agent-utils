@@ -18416,7 +18416,7 @@ function pickCallInput(devices, prefs) {
  * `setSinkId` could not aim the call, so it does not earn the picker.
  */
 function outputSinkSupported() {
-  const Context = window.AudioContext || window.webkitAudioContext;
+  const Context = browserPorts().audio.contextClass();
   return Boolean(Context && Context.prototype && "setSinkId" in Context.prototype);
 }
 
@@ -18427,7 +18427,7 @@ function outputSinkSupported() {
  * the final stream; the first is stopped before the second opens.
  */
 async function openCallMicrophone(mic) {
-  let stream = await navigator.mediaDevices.getUserMedia(audioConstraints(mic));
+  let stream = await browserPorts().microphone.open(audioConstraints(mic));
   callAudioRoute = { inputKind: "other", outputKind: "other", inputLabel: "", outputLabel: "", sink: "" };
   const trackOf = (opened) => (opened && typeof opened.getTracks === "function" ? opened.getTracks()[0] : null);
   const noteTrack = (opened) => {
@@ -18468,7 +18468,7 @@ async function openCallMicrophone(mic) {
   const constraints = audioConstraints(mic);
   constraints.audio.deviceId = { exact: chosen.deviceId };
   try {
-    stream = await navigator.mediaDevices.getUserMedia(constraints);
+    stream = await browserPorts().microphone.open(constraints);
   } catch (_error) {
     // The chosen device went away between listing and opening: the stream already open
     // carries the call rather than the call dying on a device race.
@@ -20290,7 +20290,7 @@ async function openConversation(options) {
       addDetail("echo cancellation is off for this call, so the microphone pauses while the assistant " +
         "speaks: talking over it is not heard");
     }
-    session.audio = new (window.AudioContext || window.webkitAudioContext)();
+    session.audio = new (browserPorts().audio.contextClass())();
     await session.audio.resume(); // iOS starts it suspended until a gesture.
     await applyCallOutput(session.audio);
     refreshAudioDeviceSelects();
@@ -20309,7 +20309,7 @@ async function openConversation(options) {
   }
   setState("working");
   const socketUrl = voiceSocketUrl(minted.websocket_url);
-  const socket = new WebSocket(socketUrl);
+  const socket = browserPorts().socket.open(socketUrl);
   socket.binaryType = "arraybuffer";
   session.socket = socket;
   session.muted = false;
@@ -21960,7 +21960,7 @@ async function continueReconnect(attempt) {
     else if (armed.why !== "unavailable") attempt.recap = { resume: null, why: armed.why || "empty" };
   }
   const socketUrl = voiceSocketUrl(minted.websocket_url);
-  const socket = new WebSocket(socketUrl);
+  const socket = browserPorts().socket.open(socketUrl);
   socket.binaryType = "arraybuffer";
   session.socket = socket;
   const voiceTarget = String(minted.websocket_url).split(/[?#]/u, 1)[0]
@@ -36330,7 +36330,7 @@ let readAloudWantsOutput = false;
  */
 function readAloudAudioContext() {
   if (typeof ReadableStream === "undefined" || typeof AbortController !== "function") return null;
-  const Context = window.AudioContext || window.webkitAudioContext;
+  const Context = browserPorts().audio.contextClass();
   if (!Context) return null;
   // A browser may close the context under a long-held read (`#434 read-aloud-pause`): a closed
   // one never resumes, so the next read makes a fresh one rather than failing on it for good.
@@ -36705,7 +36705,7 @@ function streamingPlayer(url, context, clock = readClock()) {
  */
 function streamedSpeechPlayer(url, clock) {
   const context = readAloudAudioContext();
-  return context === null ? new Audio(url) : streamingPlayer(url, context, clock);
+  return context === null ? browserPorts().audio.element(url) : streamingPlayer(url, context, clock);
 }
 
 // --- reading a message block by block: `#376 read-aloud-blocks` ---------------------------------
@@ -37697,7 +37697,7 @@ function primeReadAloudKeeper() {
   if (mediaSessionOf() === null) return;
   if (readAloudKeeper === null && typeof Audio === "function" && typeof URL !== "undefined" &&
       typeof URL.createObjectURL === "function" && typeof Blob === "function") {
-    readAloudKeeper = new Audio(URL.createObjectURL(silentWav()));
+    readAloudKeeper = browserPorts().audio.element(URL.createObjectURL(silentWav()));
     readAloudKeeper.loop = true;
   }
   if (readAloudKeeper === null || readAloudKeeperWanted) return;
@@ -38001,7 +38001,7 @@ async function readAloud(ids, from = null) {
   };
   const addPlayer = (at) => {
     requestBegan[at] = speechTimingNow();
-    const audio = streamed ? streamedSpeechPlayer(sources[at], clock) : new Audio(sources[at]);
+    const audio = streamed ? streamedSpeechPlayer(sources[at], clock) : browserPorts().audio.element(sources[at]);
     players[at] = audio;
     // Only the Web Audio player hears its own samples; an `<audio>` element cannot.
     const hearsSpeech = "hearsSpeech" in audio && audio.hearsSpeech === true;

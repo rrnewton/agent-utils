@@ -39,8 +39,6 @@ export {
   reconnectSeamDetail,
   reconnectVerdict,
   recapChip,
-  recapSentence,
-  recapWords,
   seamDetailFor as callSeamDetailFor,
   spokenOutcomeKind,
   spokenYesSeam,

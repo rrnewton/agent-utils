@@ -1862,6 +1862,7 @@ const ANNOTATIONS = await moduleForTests("src/core/annotations/index.ts");
 /** The outbox: what waits to be sent, and what became of each send (web/src/core/outbox). */
 const OUTBOX = await moduleForTests("src/core/outbox/index.ts");
 const CALL = await moduleForTests("src/core/call/index.ts");
+const WEB_PLATFORM = await moduleForTests("src/platform/web/index.ts");
 /** The page's requests to its server, on ports a test supplies (web/src/core/api). */
 const SERVER_API = await moduleForTests("src/core/api/index.ts");
 
@@ -7146,6 +7147,37 @@ test("`#624 voice-page-modularity`: prepared read-aloud tickets end on either cl
   prepared.keep("10", entry);
   prepared.clear();
   assert.equal(prepared.size(), 0);
+});
+
+test("`#624 voice-page-modularity`: the browser's socket, audio and microphone ports look each global up when used, not when made", async () => {
+  const names = ["WebSocket", "Audio", "window", "navigator"];
+  const saved = names.map((name) => [name, Object.getOwnPropertyDescriptor(globalThis, name)]);
+  const put = (name, value) => Object.defineProperty(globalThis, name, { value, configurable: true, writable: true });
+  try {
+    const ports = WEB_PLATFORM.createWebPorts();
+    // Installed after the ports were made: a stand-in a test (or a browser walk) puts in late is used.
+    put("WebSocket", class { constructor(url) { this.url = url; } });
+    put("Audio", class { constructor(url) { this.src = url; } });
+    class Prefixed {}
+    put("window", { webkitAudioContext: Prefixed });
+    const asked = [];
+    put("navigator", { mediaDevices: { getUserMedia(constraints) { asked.push([this === globalThis.navigator.mediaDevices, constraints]); return Promise.resolve("stream"); } } });
+    assert.equal(ports.socket.open("wss://voice/a").url, "wss://voice/a");
+    assert.equal(ports.audio.element("/speech/1").src, "/speech/1");
+    assert.equal(ports.audio.contextClass(), Prefixed, "WebKit's prefixed context was not the fallback");
+    class Unprefixed {}
+    put("window", { AudioContext: Unprefixed, webkitAudioContext: Prefixed });
+    assert.equal(ports.audio.contextClass(), Unprefixed);
+    put("window", {});
+    assert.equal(ports.audio.contextClass(), undefined);
+    assert.equal(await ports.microphone.open({ audio: true }), "stream");
+    assert.deepStrictEqual(asked, [[true, { audio: true }]], "getUserMedia was not called on mediaDevices, with the constraints given");
+  } finally {
+    for (const [name, descriptor] of saved) {
+      if (descriptor) Object.defineProperty(globalThis, name, descriptor);
+      else delete globalThis[name];
+    }
+  }
 });
 
 test("`#624 voice-page-modularity`: when a cut-off read tries again, and when a ticket can no longer carry it, from the module alone", () => {

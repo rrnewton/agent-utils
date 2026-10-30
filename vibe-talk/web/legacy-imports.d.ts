@@ -27,8 +27,6 @@ declare const boundaryFor: LegacyImports["boundaryFor"];
 declare const recapLine: LegacyImports["recapLine"];
 declare const reconnectFreshWords: LegacyImports["reconnectFreshWords"];
 declare const recapChip: LegacyImports["recapChip"];
-declare const recapSentence: LegacyImports["recapSentence"];
-declare const recapWords: LegacyImports["recapWords"];
 declare const callSeamDetailFor: LegacyImports["callSeamDetailFor"];
 declare const notSentDetail: LegacyImports["notSentDetail"];
 declare const reconnectSeamDetail: LegacyImports["reconnectSeamDetail"];
