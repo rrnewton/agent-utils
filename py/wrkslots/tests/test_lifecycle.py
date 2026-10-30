@@ -23283,6 +23283,8 @@ def test_retirement_attempt_event_is_crash_safe_and_rotates_queue(
             str(os.getpid()),
         ).returncode == 0
 
+    set_liveness(project, "dead")
+
     class Crashed(BaseException):
         pass
 
