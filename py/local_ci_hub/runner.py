@@ -1,6 +1,7 @@
 """Run engine: admit, launch, list, stop validation runs on this machine."""
 from __future__ import annotations
 
+
 import fcntl
 import json
 import os
@@ -26,7 +27,7 @@ def _commit(root: Path) -> str:
         return ""
 
 
-def start(cfg: Config, *, wait: bool = True, commit: str = "", cell: str = "") -> dict:
+def start(cfg: Config, *, wait: bool = True, commit: str = "", cell: str = "") -> dict[str, object]:
     """Admit and run the validate command, recording its ledger result."""
     handles = _handles(cfg)
     lock_fd = (handles / "admission.lock").open("a+")
@@ -57,7 +58,7 @@ def start(cfg: Config, *, wait: bool = True, commit: str = "", cell: str = "") -
     commit = commit or _commit(cfg.root) or "unknown"
     log = cfg.state_dir / f"{run_id}.log"
     cfg.state_dir.mkdir(parents=True, exist_ok=True)
-    handle = {"schema": "local-ci-hub/run/v1", "run_id": run_id, "commit": commit, "cell": cell,
+    handle: dict[str, object] = {"schema": "local-ci-hub/run/v1", "run_id": run_id, "commit": commit, "cell": cell,
               "state": "running", "command": cfg.validate_command, "log": str(log),
               "started_at": datetime.now(timezone.utc).isoformat(), "pid": None}
     hp = handles / f"{run_id}.json"
@@ -76,32 +77,34 @@ def start(cfg: Config, *, wait: bool = True, commit: str = "", cell: str = "") -
     Ledger(cfg).publish()
     handle.update(state="finished", result=result, exit_code=rc)
     hp.write_text(json.dumps(handle, indent=1))
-    return handle
+    return dict(handle)
 
 
-def list_runs(cfg: Config) -> list[dict]:
+def list_runs(cfg: Config) -> list[dict[str, object]]:
     """List retained run handles on this machine."""
     out = []
     for h in sorted(_handles(cfg).glob("*.json")):
         try:
-            out.append(json.loads(h.read_text()))
+            data = json.loads(h.read_text())
+            out.append(data if isinstance(data, dict) else {"state": "unreadable"})
         except Exception:
             out.append({"run_id": h.stem, "state": "unreadable"})
     return out
 
 
-def stop(cfg: Config, run_id: str) -> dict:
+def stop(cfg: Config, run_id: str) -> dict[str, object]:
     """Stop one running validation by run id."""
     hp = _handles(cfg) / f"{run_id}.json"
     if not hp.exists():
         return {"run_id": run_id, "state": "not-found"}
-    handle = json.loads(hp.read_text())
+    loaded = json.loads(hp.read_text())
+    handle: dict[str, object] = loaded if isinstance(loaded, dict) else {}
     pid = handle.get("pid")
     if pid:
         try:
-            os.kill(int(pid), 15)
+            os.kill(int(str(pid)), 15)
             handle["state"] = "stopped"
         except ProcessLookupError:
             handle["state"] = "finished"
     hp.write_text(json.dumps(handle, indent=1))
-    return handle
+    return dict(handle)

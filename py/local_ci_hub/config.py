@@ -1,14 +1,17 @@
 """Project configuration for local-ci-hub (local-ci-hub.toml)."""
 from __future__ import annotations
 
+
 import socket
 from dataclasses import dataclass, field
 from pathlib import Path
 
-try:
+import sys
+
+if sys.version_info >= (3, 11):
     import tomllib
-except ModuleNotFoundError:  # Python 3.10
-    import tomli as tomllib  # type: ignore[no-redef]
+else:  # Python 3.10: the tomli package provides the same API
+    import tomli as tomllib
 
 
 class ConfigError(ValueError):
@@ -37,13 +40,13 @@ class Config:
     provider: str = "none"  # none | github
     workflows: list[str] = field(default_factory=list)
     qualifying: list[str] = field(default_factory=lambda: ["local-ledger-pass"])
-    probes: list[dict] = field(default_factory=list)
+    probes: list[dict[str, object]] = field(default_factory=list)
     state_dir: Path = Path("ignored/local-ci-hub")
     evidence_root: Path | None = None
     require_full_evidence: bool = True
-    release_payload: dict | None = None
+    release_payload: dict[str, object] | None = None
     digest_command: list[str] | None = None
-    repos: list[dict] = field(default_factory=list)
+    repos: list[dict[str, object]] = field(default_factory=list)
 
     @property
     def ledger_file(self) -> Path:

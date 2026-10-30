@@ -1,13 +1,14 @@
 """Remote CI (GitHub): read and dispatch. Reports; never gates by itself."""
 from __future__ import annotations
 
+
 import json
 import subprocess
 
 from .config import Config
 
 
-def _gh(cfg: Config, args: list[str]) -> dict:
+def _gh(cfg: Config, args: list[str]) -> dict[str, object]:
     if cfg.provider == "none":
         return {"status": "disabled", "reason": "remote.provider is none"}
     try:
@@ -22,12 +23,12 @@ def _gh(cfg: Config, args: list[str]) -> dict:
         return {"status": "ok", "data": r.stdout.strip()[:500]}
 
 
-def status(cfg: Config) -> dict:
+def status(cfg: Config) -> dict[str, object]:
     """Return recent remote workflow runs, or disabled."""
     return {"schema": "local-ci-hub/remote/v1", **_gh(cfg, ["run", "list", "--limit", "20", "--json", "databaseId,headSha,status,conclusion,workflowName"])}
 
 
-def dispatch(cfg: Config, workflow: str, ref: str = "") -> dict:
+def dispatch(cfg: Config, workflow: str, ref: str = "") -> dict[str, object]:
     """Dispatch one remote workflow explicitly; reports, never gates."""
     args = ["workflow", "run", workflow] + (["--ref", ref] if ref else [])
     return {"schema": "local-ci-hub/remote/v1", **_gh(cfg, args)}

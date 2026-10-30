@@ -9,7 +9,7 @@ from pathlib import Path
 BIN = Path(__file__).resolve().parents[2] / "py" / "bin" / "local-ci-hub"
 
 
-def run_cli(cwd: Path, *args: str) -> subprocess.CompletedProcess:
+def run_cli(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run([sys.executable, str(BIN), *args], cwd=cwd, capture_output=True, text=True, timeout=60)
 
 
@@ -29,14 +29,14 @@ def toy_repo(tmp_path: Path, validate: str = "true") -> Path:
     return repo
 
 
-def test_help_and_quickstart(tmp_path):
+def test_help_and_quickstart(tmp_path: Path) -> None:
     r = run_cli(tmp_path, "--help")
     assert r.returncode == 0 and "receipt" in r.stdout
     r = run_cli(tmp_path, "quickstart")
     assert r.returncode == 0 and "receipt show" in r.stdout
 
 
-def test_ledger_append_publish_query(tmp_path):
+def test_ledger_append_publish_query(tmp_path: Path) -> None:
     repo = toy_repo(tmp_path)
     sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
     assert run_cli(repo, "--json", "ledger", "append", "--commit", sha, "--result", "PASS").returncode == 0
@@ -47,7 +47,7 @@ def test_ledger_append_publish_query(tmp_path):
     assert json.loads(out.stdout)["commit"] == sha
 
 
-def test_receipt_qualified_and_no_result(tmp_path):
+def test_receipt_qualified_and_no_result(tmp_path: Path) -> None:
     repo = toy_repo(tmp_path)
     assert run_cli(repo, "receipt", "show", "deadbeef").returncode == 1  # no-result, not qualified
     assert run_cli(repo, "run", "start").returncode == 0
@@ -55,7 +55,7 @@ def test_receipt_qualified_and_no_result(tmp_path):
     assert out.returncode == 0 and json.loads(out.stdout)["verdict"] == "qualified"
 
 
-def test_run_failure_records_fail(tmp_path):
+def test_run_failure_records_fail(tmp_path: Path) -> None:
     repo = toy_repo(tmp_path, validate="false")
     assert run_cli(repo, "run", "start").returncode == 1  # a FAIL run exits nonzero
     out = run_cli(repo, "--json", "receipt", "show", "HEAD")
@@ -64,7 +64,7 @@ def test_run_failure_records_fail(tmp_path):
     assert json.loads(bad.stdout).get("result") in ("FAIL", "none")
 
 
-def test_health_remote_land_doctor(tmp_path):
+def test_health_remote_land_doctor(tmp_path: Path) -> None:
     repo = toy_repo(tmp_path)
     assert json.loads(run_cli(repo, "--json", "health").stdout)["status"] in ("pass", "fail")
     remote = run_cli(repo, "--json", "remote", "status")
@@ -77,7 +77,7 @@ def test_health_remote_land_doctor(tmp_path):
     assert run_cli(repo, "land", "verify", "--commit", sha).returncode == 0
 
 
-def test_goalpost_prefix_and_enrich_cannot_qualify(tmp_path):
+def test_goalpost_prefix_and_enrich_cannot_qualify(tmp_path: Path) -> None:
     repo = toy_repo(tmp_path)
     sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
     # a 1-char prefix must never bind evidence to a commit
@@ -87,7 +87,7 @@ def test_goalpost_prefix_and_enrich_cannot_qualify(tmp_path):
     assert json.loads(out.stdout)["verdict"] != "qualified"
 
 
-def test_row_ref_missing_evidence_refuses(tmp_path):
+def test_row_ref_missing_evidence_refuses(tmp_path: Path) -> None:
     repo = toy_repo(tmp_path)
     sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
     led = repo / "ci-ledger"; led.mkdir(exist_ok=True)
@@ -100,14 +100,14 @@ def test_row_ref_missing_evidence_refuses(tmp_path):
     assert json.loads(out.stdout)["verdict"] != "qualified"  # missing evidence refuses, never qualifies
 
 
-def test_canonical_bytes_deterministic():
+def test_canonical_bytes_deterministic() -> None:
     from local_ci_hub.ledger import canonical_bytes, digest
     a = {"b": 1, "a": {"y": [1, 2], "x": "é"}}
     assert canonical_bytes(a) == canonical_bytes({"a": {"x": "é", "y": [1, 2]}, "b": 1})
     assert digest(a) != digest({"b": 2, "a": {"y": [1, 2], "x": "é"}})
 
 
-def test_land_run_executes_under_lock(tmp_path):
+def test_land_run_executes_under_lock(tmp_path: Path) -> None:
     repo = toy_repo(tmp_path)
     r = run_cli(repo, "land", "run", "--holder", "a", "--", "/bin/sh", "-c", "echo landed > landed.txt")
     assert r.returncode == 0 and (repo / "landed.txt").exists()

@@ -27,6 +27,7 @@ PYTHON_ONLY_TOOLS = (
     "wrkslots",
     "herdr-subagents",
     "herdr-chat",
+    "local-ci-hub",
 )
 RESOLVER_TOOLS = RUST_TOOLS + PYTHON_ONLY_TOOLS
 NON_PUBLISHED_RUST_BINARIES = (

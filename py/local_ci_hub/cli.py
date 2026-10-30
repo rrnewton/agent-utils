@@ -1,6 +1,7 @@
 """local-ci-hub: validation on a dev box, with local+remote evidence in one ledger."""
 from __future__ import annotations
 
+
 import argparse
 import json
 import shutil
@@ -43,7 +44,7 @@ def _out(obj: object, as_json: bool) -> None:
         for k, v in obj.items():
             print(f"{k}: {v}")
     else:
-        for row in obj:  # type: ignore[union-attr]
+        for row in obj if isinstance(obj, list) else []:
             print(row)
 
 
@@ -91,6 +92,7 @@ def main(argv: list[str] | None = None) -> int:
         _out({"schema": "local-ci-hub/doctor/v1", "ok": bool(checks["git"]), "checks": checks}, args.json)
         return 0 if checks["git"] else 1
     if args.cmd == "run":
+        res: object = {}
         if args.op == "start":
             res = runner.start(cfg, wait=True)
         elif args.op == "stop":
@@ -115,7 +117,8 @@ def main(argv: list[str] | None = None) -> int:
         elif args.op == "first-bad":
             res = ledger.first_bad(args.cell) or {"result": "none"}
         else:
-            res = ledger.rows() if not args.commit else ledger.for_commit(args.commit)
+            rows_out = ledger.rows() if not args.commit else ledger.for_commit(args.commit)
+            _out(rows_out, args.json); return 0
         _out(res, args.json); return 0
     if args.cmd == "receipt":
         res = receipt_mod.show(cfg, args.commit)
@@ -135,7 +138,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.op == "run":
             cmd = args.command[1:] if args.command[:1] == ["--"] else args.command
             res = land_mod.run_locked(cfg, args.holder, cmd) if cmd else {"status": "usage-error", "reason": "land run needs a command after --"}
-            _out(res, args.json); return int(res.get("exit_code", 1)) if res.get("status") == "ran" else 1
+            _out(res, args.json); code = res.get("exit_code", 1); return code if isinstance(code, int) else 1
         else:
             res = land_mod.verify(cfg, args.commit, args.target)
         _out(res, args.json); return 0 if res.get("status") in ("acquired", "released", "free") or res.get("ancestor") else 1

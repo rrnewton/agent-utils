@@ -1065,6 +1065,6 @@ def test_every_package_build_declares_a_cpu_budget_above_the_small_step_default(
 
     config = dag_from_path(REPO_ROOT / "validation.dag.yaml")
     packages = [step for step in config.steps if step.tag.startswith("packages.python.")]
-    assert len(packages) == 8
+    assert len(packages) == 9
     for step in packages:
         assert step.cpu_timeout > DEFAULT_SMALL_CPU_TIMEOUT, step.tag

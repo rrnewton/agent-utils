@@ -1,6 +1,7 @@
 """Land primitives: machine-scoped lock + ancestry verify. Project owns merging."""
 from __future__ import annotations
 
+
 import subprocess
 from pathlib import Path
 
@@ -13,7 +14,7 @@ def _lock(cfg: Config) -> Path:
     return p
 
 
-def acquire(cfg: Config, holder: str) -> dict:
+def acquire(cfg: Config, holder: str) -> dict[str, object]:
     """Acquire the machine-scoped landing lock, or report its holder."""
     lock = _lock(cfg)
     try:
@@ -25,7 +26,7 @@ def acquire(cfg: Config, holder: str) -> dict:
     return {"status": "acquired", "holder": holder}
 
 
-def release(cfg: Config, holder: str) -> dict:
+def release(cfg: Config, holder: str) -> dict[str, object]:
     """Release the landing lock if held by the named holder."""
     lock = _lock(cfg)
     if not lock.exists():
@@ -36,7 +37,7 @@ def release(cfg: Config, holder: str) -> dict:
     return {"status": "released"}
 
 
-def run_locked(cfg: Config, holder: str, command: list[str]) -> dict:
+def run_locked(cfg: Config, holder: str, command: list[str]) -> dict[str, object]:
     """Run one project command while holding the landing lock; always releases."""
     got = acquire(cfg, holder)
     if got.get("status") != "acquired":
@@ -49,7 +50,7 @@ def run_locked(cfg: Config, holder: str, command: list[str]) -> dict:
         release(cfg, holder)
 
 
-def verify(cfg: Config, commit: str, target: str = "HEAD") -> dict:
+def verify(cfg: Config, commit: str, target: str = "HEAD") -> dict[str, object]:
     """Return whether a commit is an ancestor of the target."""
     try:
         r = subprocess.run(["git", "merge-base", "--is-ancestor", commit, target], cwd=cfg.root, capture_output=True, timeout=15)

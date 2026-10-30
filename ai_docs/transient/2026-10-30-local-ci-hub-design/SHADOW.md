@@ -1,7 +1,7 @@
 # Phase 3 shadow comparison (read-only)
 
 Method: local-ci-hub folded the real published ledger
-(`ledger/hermit/<host>/*.jsonl`, 4,395 rows) with no writes to the
+(`ledger/consumer-a/<host>/*.jsonl`, 4,395 rows) with no writes to the
 origin project, its ledger, or any lock. Verdicts for the last 30
 main commits plus the three named commits were compared with
 `ci-hub ledger qualified-rows` (1,372 qualified commits).

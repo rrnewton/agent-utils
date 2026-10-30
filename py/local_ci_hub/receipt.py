@@ -1,6 +1,7 @@
 """Receipt verdict: what is proven about one exact commit."""
 from __future__ import annotations
 
+
 import json
 from pathlib import Path
 
@@ -8,7 +9,7 @@ from .config import Config
 from .ledger import Ledger
 
 
-def remote_for_commit(cfg: Config, commit: str) -> dict:
+def remote_for_commit(cfg: Config, commit: str) -> dict[str, object]:
     """Return cached remote evidence for one exact commit, or unknown."""
     """Remote evidence: an optional JSON file written by `remote` ingest, else unknown."""
     p = cfg.state_dir / "remote.json"
@@ -24,7 +25,7 @@ def remote_for_commit(cfg: Config, commit: str) -> dict:
     return {"source": "remote", "status": "unknown"}
 
 
-def show(cfg: Config, commit: str, remote: dict | None = None) -> dict:
+def show(cfg: Config, commit: str, remote: dict[str, object] | None = None) -> dict[str, object]:
     """Return the receipt verdict for one exact commit."""
     if commit in ("HEAD", "@"):
         import subprocess
@@ -33,7 +34,7 @@ def show(cfg: Config, commit: str, remote: dict | None = None) -> dict:
         except Exception:
             pass
     rows = Ledger(cfg).for_commit(commit)
-    def _strict_pass(r):
+    def _strict_pass(r: dict[str, object]) -> bool:
         if r.get("result") != "PASS" or r.get("_digest_ok") is False or r.get("_evidence_ok") is False:
             return False
         if r.get("commit_anchored") is False:
@@ -42,7 +43,8 @@ def show(cfg: Config, commit: str, remote: dict | None = None) -> dict:
             # Ported from the canonical qualifying predicate: full profile and
             # selection, clean tree, no failures, no filtered tests, passed ==
             # executed, and complete gate accounting (when fields are present).
-            if not (r.get("commit_anchored") is True and isinstance(r.get("executed_tests"), (int, float)) and not isinstance(r.get("executed_tests"), bool) and r.get("executed_tests", 0) > 0):
+            tests_val = r.get("executed_tests")
+            if not (r.get("commit_anchored") is True and isinstance(tests_val, (int, float)) and not isinstance(tests_val, bool) and tests_val > 0):
                 return False
             if r.get("profile") not in (None, "full") or r.get("selection_mode") not in (None, "full"):
                 return False

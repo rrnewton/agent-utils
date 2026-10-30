@@ -30,3 +30,7 @@ markers = [
 module = "numpy.*"
 follow_imports = "skip"
 follow_imports_for_stubs = true
+
+[[tool.mypy.overrides]]
+module = "tomli"
+ignore_missing_imports = true
