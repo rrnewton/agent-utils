@@ -55,7 +55,81 @@ pub fn optional_int(value: &Value, where_: &str) -> Result<Option<i64>, String> 
 pub fn read_json(path: &Path) -> Result<Value, String> {
     let bytes = std::fs::read(path).map_err(|error| os_error(&error, path))?;
     let text = String::from_utf8(bytes).map_err(|error| error.to_string())?;
-    serde_json::from_str(&text).map_err(|error| error.to_string())
+    parse_json_lenient(&text)
+}
+
+/// Parse JSON the way CPython's `json` module does about the
+/// non-standard constants: `NaN`, `Infinity`, and `-Infinity`
+/// are accepted (as floats CPython's validators then refuse
+/// where an integer is required). They are rewritten to
+/// `null` outside string literals, which preserves every
+/// downstream verdict: a field that must be an integer still
+/// refuses, and a field nothing reads stays unread.
+pub fn parse_json_lenient(text: &str) -> Result<Value, String> {
+    match serde_json::from_str(text) {
+        Ok(value) => Ok(value),
+        Err(first) => {
+            serde_json::from_str(&replace_json_constants(text)).map_err(|_| first.to_string())
+        }
+    }
+}
+
+fn replace_json_constants(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut index = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        // Copy one whole UTF-8 character, not one byte.
+        let width = utf8_width(byte);
+        if in_string {
+            out.push_str(&text[index..index + width]);
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            index += width;
+            continue;
+        }
+        if byte == b'"' {
+            in_string = true;
+            out.push('"');
+            index += 1;
+            continue;
+        }
+        if text[index..].starts_with("-Infinity") {
+            out.push_str("null");
+            index += 9;
+            continue;
+        }
+        if text[index..].starts_with("Infinity") {
+            out.push_str("null");
+            index += 8;
+            continue;
+        }
+        if text[index..].starts_with("NaN") {
+            out.push_str("null");
+            index += 3;
+            continue;
+        }
+        out.push_str(&text[index..index + width]);
+        index += width;
+    }
+    out
+}
+
+fn utf8_width(first: u8) -> usize {
+    match first {
+        0x00..=0x7f => 1,
+        0xc0..=0xdf => 2,
+        0xe0..=0xef => 3,
+        _ => 4,
+    }
 }
 
 /// `[Errno N] <strerror>: '<path>'`, CPython's OSError spelling.

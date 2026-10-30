@@ -13,8 +13,8 @@
 
 use crate::inspect::{open_schema_3, schema_file, SchemaThree};
 use crate::json::{
-    as_array, as_int, as_object, as_string, dump_canonical, dump_oneline, py_number_str, py_repr,
-    resolve_path,
+    as_array, as_int, as_object, as_string, dump_canonical, dump_oneline, parse_json_lenient,
+    py_number_str, py_repr, resolve_path,
 };
 use serde_json::{Map, Value};
 use std::cell::RefCell;
@@ -106,13 +106,175 @@ fn parse_instant(raw: &str, label: &str) -> Result<i64, String> {
     if !zone_ok {
         return Err(message);
     }
-    let normalized = if let Some(stripped) = raw.strip_suffix('Z') {
-        format!("{stripped}+00:00")
+    // CPython's `fromisoformat` refuses a leap second and a
+    // clock field out of range, but accepts an offset minute
+    // of 60 (an hour by another spelling); chrono does the
+    // opposite on both. Validate the fields and normalize
+    // the offset before chrono sees them.
+    let field = |range: std::ops::Range<usize>| raw[range].parse::<i64>().unwrap_or(99);
+    if field(11..13) > 23 || field(14..16) > 59 || field(17..19) > 59 {
+        return Err(message);
+    }
+    let fraction = &raw[19..raw.len() - rest.len()];
+    let normalized = if rest == "Z" {
+        format!("{}+00:00", &raw[..raw.len() - 1])
     } else {
-        raw.to_string()
+        let sign: i64 = if rest.starts_with('-') { -1 } else { 1 };
+        let offset_hour: i64 = rest[1..3].parse().unwrap_or(99);
+        let offset_minute: i64 = rest[4..6].parse().unwrap_or(99);
+        let total = sign * (offset_hour * 60 + offset_minute);
+        if !(-1440..1440).contains(&total) {
+            return Err(message);
+        }
+        format!(
+            "{}{}{}{:02}:{:02}",
+            &raw[..19],
+            fraction,
+            if total < 0 { "-" } else { "+" },
+            total.abs() / 60,
+            total.abs() % 60
+        )
     };
     let parsed = chrono::DateTime::parse_from_rfc3339(&normalized).map_err(|_| message.clone())?;
     Ok(parsed.timestamp_millis())
+}
+
+/// An integer JSON value as a normalized decimal string
+/// (`as_int` without the `i64` ceiling: CPython integers are
+/// arbitrary precision, and a timestamp beyond `i64` is a
+/// value to compare, not a refusal).
+fn int_literal(value: &Value, where_: &str) -> Result<String, String> {
+    let raw = match value {
+        Value::Number(number) => number.to_string(),
+        _ => return Err(format!("{where_}: expected an integer")),
+    };
+    let digits = raw.strip_prefix('-').unwrap_or(&raw);
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!("{where_}: expected an integer"));
+    }
+    Ok(dec_normalize(&raw))
+}
+
+fn dec_normalize(raw: &str) -> String {
+    let (negative, digits) = match raw.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, raw),
+    };
+    let magnitude = digits.trim_start_matches('0');
+    if magnitude.is_empty() {
+        return "0".to_string();
+    }
+    if negative {
+        format!("-{magnitude}")
+    } else {
+        magnitude.to_string()
+    }
+}
+
+fn dec_cmp(left: &str, right: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (left_neg, left_mag) = (left.starts_with('-'), left.trim_start_matches('-'));
+    let (right_neg, right_mag) = (right.starts_with('-'), right.trim_start_matches('-'));
+    let left_mag = left_mag.trim_start_matches('0');
+    let right_mag = right_mag.trim_start_matches('0');
+    let (left_mag, right_mag) = (
+        if left_mag.is_empty() { "0" } else { left_mag },
+        if right_mag.is_empty() { "0" } else { right_mag },
+    );
+    let (left_neg, right_neg) = (left_neg && left_mag != "0", right_neg && right_mag != "0");
+    if left_neg != right_neg {
+        return if left_neg {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        };
+    }
+    let magnitude_order = left_mag
+        .len()
+        .cmp(&right_mag.len())
+        .then_with(|| left_mag.cmp(right_mag));
+    if left_neg {
+        magnitude_order.reverse()
+    } else {
+        magnitude_order
+    }
+}
+
+fn dec_add_one(value: &str) -> String {
+    let (negative, magnitude) = (value.starts_with('-'), value.trim_start_matches('-'));
+    let magnitude = magnitude.trim_start_matches('0');
+    let magnitude = if magnitude.is_empty() { "0" } else { magnitude };
+    if negative && magnitude != "0" {
+        // -(n) + 1 = -(n - 1)
+        let mut digits: Vec<u8> = magnitude.bytes().collect();
+        let mut index = digits.len();
+        loop {
+            index -= 1;
+            if digits[index] == b'0' {
+                digits[index] = b'9';
+            } else {
+                digits[index] -= 1;
+                break;
+            }
+        }
+        let reduced = String::from_utf8(digits).unwrap_or_default();
+        let reduced = reduced.trim_start_matches('0');
+        if reduced.is_empty() {
+            return "0".to_string();
+        }
+        return format!("-{reduced}");
+    }
+    let mut digits: Vec<u8> = magnitude.bytes().collect();
+    let mut carry = true;
+    for digit in digits.iter_mut().rev() {
+        if !carry {
+            break;
+        }
+        if *digit == b'9' {
+            *digit = b'0';
+        } else {
+            *digit += 1;
+            carry = false;
+        }
+    }
+    let mut out = String::from_utf8(digits).unwrap_or_default();
+    if carry {
+        out.insert(0, '1');
+    }
+    out
+}
+
+impl Window {
+    fn contains_dec(&self, timestamp: &str) -> bool {
+        if let Some(start) = self.start {
+            if dec_cmp(timestamp, &start.to_string()) == std::cmp::Ordering::Less {
+                return false;
+            }
+        }
+        match self.end {
+            None => true,
+            Some(end) => dec_cmp(timestamp, &end.to_string()) == std::cmp::Ordering::Less,
+        }
+    }
+
+    fn overlaps_dec(&self, start: &str, end: &str) -> bool {
+        let effective_end = if dec_cmp(end, start) != std::cmp::Ordering::Greater {
+            dec_add_one(start)
+        } else {
+            end.to_string()
+        };
+        if let Some(limit) = self.end {
+            if dec_cmp(start, &limit.to_string()) != std::cmp::Ordering::Less {
+                return false;
+            }
+        }
+        match self.start {
+            None => true,
+            Some(limit) => {
+                dec_cmp(&effective_end, &limit.to_string()) == std::cmp::Ordering::Greater
+            }
+        }
+    }
 }
 
 fn parse_window(filters: &Filters) -> Result<Option<Window>, String> {
@@ -191,7 +353,7 @@ fn rollup_ref(record: &Map<String, Value>, where_: &str) -> Result<String, Strin
         record.get("kind").unwrap_or(&Value::Null),
         &format!("{where_}.kind"),
     )?;
-    let start_ms = as_int(
+    let start_ms = int_literal(
         record.get("start_ms").unwrap_or(&Value::Null),
         &format!("{where_}.start_ms"),
     )?;
@@ -539,6 +701,200 @@ impl Timeline {
         }
     }
 
+    /// `TimelineQuery._project_overviews` for the selected teams.
+    fn project_overviews(&self, wanted: &[String]) -> Result<Vec<Map<String, Value>>, String> {
+        match &self.generation {
+            Generation::Three(three) => self.spine(three, "project_overview", wanted),
+            Generation::One(source) => {
+                if let Some(plural) = source.get("project_overviews") {
+                    if !plural.is_null() {
+                        let raw = as_array(plural, "timeline.project_overviews")?;
+                        let mut out = Vec::new();
+                        for (index, value) in raw.iter().enumerate() {
+                            out.push(
+                                as_object(value, &format!("timeline.project_overviews[{index}]"))?
+                                    .clone(),
+                            );
+                        }
+                        return Ok(out);
+                    }
+                }
+                let Some(singular) = source.get("project_overview") else {
+                    return Ok(Vec::new());
+                };
+                if singular.is_null() {
+                    return Ok(Vec::new());
+                }
+                if self.teams.len() != 1 {
+                    return Err(
+                        "timeline.project_overview requires exactly one timeline team".to_string(),
+                    );
+                }
+                let mut result = as_object(singular, "timeline.project_overview")?.clone();
+                let slug = as_string(
+                    self.teams[0].get("slug").unwrap_or(&Value::Null),
+                    "timeline.teams[0].slug",
+                )?
+                .to_string();
+                result.insert("team".to_string(), Value::String(slug));
+                Ok(vec![result])
+            }
+        }
+    }
+
+    /// `TimelineQuery.summary_stats`: availability and text
+    /// totals for every generated-summary surface.
+    pub fn summary_stats(
+        &self,
+        filters: &Filters,
+    ) -> Result<Vec<(String, SummaryKindStats)>, String> {
+        let window = parse_window(filters)?;
+        let selected =
+            |team: &str| filters.teams.is_empty() || filters.teams.iter().any(|t| t == team);
+        let overlaps = |record: &Map<String, Value>, reference: &str| -> Result<bool, String> {
+            match &window {
+                None => Ok(true),
+                Some(window) => {
+                    let start = int_literal(
+                        record.get("start_ms").unwrap_or(&Value::Null),
+                        &format!("{reference}.start_ms"),
+                    )?;
+                    let end = int_literal(
+                        record.get("end_ms").unwrap_or(&Value::Null),
+                        &format!("{reference}.end_ms"),
+                    )?;
+                    Ok(window.overlaps_dec(&start, &end))
+                }
+            }
+        };
+        let mut project_texts: Vec<String> = Vec::new();
+        let mut project_unavailable = 0i64;
+        if window.is_none() {
+            for record in self.project_overviews(&filters.teams)? {
+                let team = team_of(&record, "project_overview")?;
+                if !selected(&team) {
+                    continue;
+                }
+                if summary_available(&record, "summary_available")? {
+                    project_texts.push(
+                        as_string(
+                            record.get("text").unwrap_or(&Value::Null),
+                            "project_overview.text",
+                        )?
+                        .to_string(),
+                    );
+                } else {
+                    project_unavailable += 1;
+                }
+            }
+        }
+        let mut agent_texts: Vec<String> = Vec::new();
+        let mut agent_unavailable = 0i64;
+        for record in self.scoped("agents", filters)? {
+            let team = team_of(&record, "agent")?;
+            if !selected(&team) {
+                continue;
+            }
+            let reference = agent_ref(&record, "agent")?;
+            if !overlaps(&record, &reference)? {
+                continue;
+            }
+            if summary_available(&record, "summary_available")? {
+                agent_texts.push(
+                    as_string(
+                        record.get("lifetime_summary").unwrap_or(&Value::Null),
+                        "agent.lifetime_summary",
+                    )?
+                    .to_string(),
+                );
+            } else {
+                agent_unavailable += 1;
+            }
+        }
+        let mut phase_texts: Vec<String> = Vec::new();
+        let mut phase_unavailable = 0i64;
+        for record in self.scoped("phases", filters)? {
+            let team = team_of(&record, "phase")?;
+            if !selected(&team) {
+                continue;
+            }
+            let reference = phase_ref(&record, "phase")?;
+            if !overlaps(&record, &reference)? {
+                continue;
+            }
+            if summary_available(&record, "summary_available")? {
+                let phrase =
+                    as_string(record.get("phrase").unwrap_or(&Value::Null), "phase.phrase")?;
+                let paragraph = as_string(
+                    record.get("paragraph").unwrap_or(&Value::Null),
+                    "phase.paragraph",
+                )?;
+                phase_texts.push(format!("{phrase}\n{paragraph}"));
+            } else {
+                phase_unavailable += 1;
+            }
+        }
+        let mut technical_texts: Vec<String> = Vec::new();
+        let mut technical_unavailable = 0i64;
+        let mut plain_texts: Vec<String> = Vec::new();
+        let mut plain_unavailable = 0i64;
+        for record in self.scoped("rollups", filters)? {
+            let team = team_of(&record, "rollup")?;
+            let kind =
+                as_string(record.get("kind").unwrap_or(&Value::Null), "rollup.kind")?.to_string();
+            let reference = rollup_ref(&record, "rollup")?;
+            if !selected(&team) {
+                continue;
+            }
+            if !filters.kinds.is_empty() && !filters.kinds.iter().any(|k| k == &kind) {
+                continue;
+            }
+            if !overlaps(&record, &reference)? {
+                continue;
+            }
+            if summary_available(&record, "technical_summary_available")? {
+                let relative = as_string(
+                    record.get("technical_path").unwrap_or(&Value::Null),
+                    "rollup.technical_path",
+                )?;
+                technical_texts.push(self.read_markdown(&self.rollup_file(relative, &team)?)?);
+            } else {
+                technical_unavailable += 1;
+            }
+            if summary_available(&record, "plain_language_summary_available")? {
+                let relative = as_string(
+                    record.get("plain_language_path").unwrap_or(&Value::Null),
+                    "rollup.plain_language_path",
+                )?;
+                plain_texts.push(self.read_markdown(&self.rollup_file(relative, &team)?)?);
+            } else {
+                plain_unavailable += 1;
+            }
+        }
+        Ok(vec![
+            (
+                "project_overviews".to_string(),
+                SummaryKindStats::from_texts(project_texts, project_unavailable),
+            ),
+            (
+                "agent_lifetimes".to_string(),
+                SummaryKindStats::from_texts(agent_texts, agent_unavailable),
+            ),
+            (
+                "work_phases".to_string(),
+                SummaryKindStats::from_texts(phase_texts, phase_unavailable),
+            ),
+            (
+                "rollup_technical".to_string(),
+                SummaryKindStats::from_texts(technical_texts, technical_unavailable),
+            ),
+            (
+                "rollup_plain_language".to_string(),
+                SummaryKindStats::from_texts(plain_texts, plain_unavailable),
+            ),
+        ])
+    }
+
     fn lookup_entry(&self, reference: &str) -> Result<Option<LookupEntry>, String> {
         let Some((kind, remainder)) = reference.split_once(':') else {
             return Ok(None);
@@ -777,7 +1133,10 @@ impl Timeline {
 
     fn read_markdown(&self, path: &Path) -> Result<String, String> {
         let bytes = std::fs::read(path).map_err(|error| crate::json::os_error(&error, path))?;
-        String::from_utf8(bytes).map_err(|error| error.to_string())
+        match std::str::from_utf8(&bytes) {
+            Ok(text) => Ok(text.to_string()),
+            Err(error) => Err(py_utf8_error(&error, &bytes)),
+        }
     }
 
     /// `TimelineQuery.show` for team, agent, phase, and rollup
@@ -1106,6 +1465,1049 @@ impl Timeline {
             key(left).cmp(&key(right))
         });
         Ok(results)
+    }
+}
+
+/// `TextTotals`: records, whitespace-delimited words, and
+/// UTF-8 text bytes over a set of texts.
+#[derive(Clone, Copy, Default)]
+pub struct TextTotals {
+    records: i64,
+    words: i64,
+    utf8_bytes: i64,
+}
+
+impl TextTotals {
+    fn add_text(&mut self, text: &str) {
+        self.records += 1;
+        // Python `str.split()`: Unicode whitespace plus the
+        // U+001C..=U+001F separators `str.isspace` also admits.
+        self.words += text
+            .split(|ch: char| ch.is_whitespace() || matches!(ch, '\u{1c}'..='\u{1f}'))
+            .filter(|word| !word.is_empty())
+            .count() as i64;
+        self.utf8_bytes += text.len() as i64;
+    }
+
+    fn plus(&self, other: &TextTotals) -> TextTotals {
+        TextTotals {
+            records: self.records + other.records,
+            words: self.words + other.words,
+            utf8_bytes: self.utf8_bytes + other.utf8_bytes,
+        }
+    }
+
+    fn to_map(self) -> Map<String, Value> {
+        let mut map = Map::new();
+        map.insert("records".to_string(), Value::from(self.records));
+        map.insert("words".to_string(), Value::from(self.words));
+        map.insert("utf8_bytes".to_string(), Value::from(self.utf8_bytes));
+        map
+    }
+}
+
+/// `SummaryKindStats`: availability plus content totals for
+/// one summary surface.
+pub struct SummaryKindStats {
+    available: i64,
+    unavailable: i64,
+    content: TextTotals,
+}
+
+impl SummaryKindStats {
+    fn from_texts(texts: Vec<String>, unavailable: i64) -> SummaryKindStats {
+        let mut content = TextTotals::default();
+        for text in &texts {
+            content.add_text(text);
+        }
+        SummaryKindStats {
+            available: texts.len() as i64,
+            unavailable,
+            content,
+        }
+    }
+
+    fn to_map(&self) -> Map<String, Value> {
+        let mut map = Map::new();
+        map.insert("available".to_string(), Value::from(self.available));
+        map.insert("unavailable".to_string(), Value::from(self.unavailable));
+        map.insert(
+            "total".to_string(),
+            Value::from(self.available + self.unavailable),
+        );
+        map.insert("content".to_string(), Value::Object(self.content.to_map()));
+        map
+    }
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest.iter() {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+struct ChunkMember {
+    c_off: i64,
+    c_len: i64,
+    #[allow(dead_code)]
+    u_off: i64,
+    u_len: i64,
+    #[allow(dead_code)]
+    l0: i64,
+    #[allow(dead_code)]
+    n: i64,
+}
+
+struct ChunkIndex {
+    timestamp_key: String,
+    record_count: i64,
+    c_size: i64,
+    u_size: i64,
+    #[allow(dead_code)]
+    c_sha256: String,
+    u_sha256: String,
+    data_file: String,
+    members: Vec<ChunkMember>,
+}
+
+fn parse_chunk_index(text: &str, where_: &str) -> Result<ChunkIndex, String> {
+    let lines: Vec<&str> = text.split('\n').filter(|line| !line.is_empty()).collect();
+    if lines.is_empty() {
+        return Err(format!("{where_}: index is empty"));
+    }
+    let header_value: Value = serde_json::from_str(lines[0])
+        .map_err(|error| format!("{where_}: malformed index: {error}"))?;
+    let header = as_object(&header_value, &format!("{where_} header"))?;
+    if as_string(
+        header.get("format").unwrap_or(&Value::Null),
+        &format!("{where_} header.format"),
+    )? != "wrkviz/seekable-jsonl-index"
+    {
+        return Err(format!("{where_}: not a chunked-JSONL index"));
+    }
+    let version = as_int(
+        header.get("version").unwrap_or(&Value::Null),
+        &format!("{where_} header.version"),
+    )?;
+    if version != 1 {
+        return Err(format!("{where_}: unsupported index version {version}"));
+    }
+    let codec = as_string(
+        header.get("codec").unwrap_or(&Value::Null),
+        &format!("{where_} header.codec"),
+    )?;
+    if codec != "gzip" {
+        return Err(format!(
+            "{where_}: index describes codec {}; this reader implements 'gzip' only",
+            py_repr(&Value::String(codec.to_string()))
+        ));
+    }
+    let mut members: Vec<ChunkMember> = Vec::new();
+    let (mut c_off, mut u_off, mut line_no) = (0i64, 0i64, 0i64);
+    for (offset, raw_line) in lines[1..].iter().enumerate() {
+        let spot = format!("{where_} member {offset}");
+        let value: Value = serde_json::from_str(raw_line)
+            .map_err(|error| format!("{where_}: malformed index: {error}"))?;
+        let obj = as_object(&value, &spot)?;
+        let field = |key: &str| -> Result<i64, String> {
+            as_int(
+                obj.get(key).unwrap_or(&Value::Null),
+                &format!("{spot}.{key}"),
+            )
+        };
+        let member = ChunkMember {
+            c_off: field("c_off")?,
+            c_len: field("c_len")?,
+            u_off: field("u_off")?,
+            u_len: field("u_len")?,
+            l0: field("l0")?,
+            n: field("n")?,
+        };
+        // The timestamp bounds are validated as integers when
+        // present, the way the oracle validates them.
+        for key in ["t0", "t1"] {
+            let value = obj.get(key).unwrap_or(&Value::Null);
+            if !value.is_null() {
+                int_literal(value, &format!("{spot}.{key}"))?;
+            }
+        }
+        if member.c_off != c_off || member.u_off != u_off || member.l0 != line_no {
+            return Err(format!("{spot}: not contiguous with the preceding members"));
+        }
+        if member.c_len <= 0 || member.u_len < 0 || member.n < 0 {
+            return Err(format!("{spot}: non-positive extent"));
+        }
+        c_off += member.c_len;
+        u_off += member.u_len;
+        line_no += member.n;
+        members.push(member);
+    }
+    if members.is_empty() {
+        return Err(format!("{where_}: index describes no members"));
+    }
+    let member_count = as_int(
+        header.get("member_count").unwrap_or(&Value::Null),
+        &format!("{where_} header.member_count"),
+    )?;
+    if member_count != members.len() as i64 {
+        return Err(format!(
+            "{where_}: header member count disagrees with the table"
+        ));
+    }
+    let record_count = as_int(
+        header.get("record_count").unwrap_or(&Value::Null),
+        &format!("{where_} header.record_count"),
+    )?;
+    let c_size = as_int(
+        header.get("c_size").unwrap_or(&Value::Null),
+        &format!("{where_} header.c_size"),
+    )?;
+    let u_size = as_int(
+        header.get("u_size").unwrap_or(&Value::Null),
+        &format!("{where_} header.u_size"),
+    )?;
+    if record_count != line_no || c_size != c_off || u_size != u_off {
+        return Err(format!(
+            "{where_}: header totals disagree with the member table"
+        ));
+    }
+    match header.get("timestamps_sorted") {
+        Some(Value::Bool(_)) => {}
+        _ => {
+            return Err(format!(
+                "{where_} header.timestamps_sorted: expected a boolean"
+            ))
+        }
+    }
+    Ok(ChunkIndex {
+        timestamp_key: as_string(
+            header.get("timestamp_key").unwrap_or(&Value::Null),
+            &format!("{where_} header.timestamp_key"),
+        )?
+        .to_string(),
+        record_count,
+        c_size,
+        u_size,
+        c_sha256: as_string(
+            header.get("c_sha256").unwrap_or(&Value::Null),
+            &format!("{where_} header.c_sha256"),
+        )?
+        .to_string(),
+        u_sha256: as_string(
+            header.get("u_sha256").unwrap_or(&Value::Null),
+            &format!("{where_} header.u_sha256"),
+        )?
+        .to_string(),
+        data_file: as_string(
+            header.get("data_file").unwrap_or(&Value::Null),
+            &format!("{where_} header.data_file"),
+        )?
+        .to_string(),
+        members,
+    })
+}
+
+struct ManagedFile {
+    name: String,
+    path: PathBuf,
+    index_path: PathBuf,
+    sha256: String,
+    declared_bytes: Option<i64>,
+    records: Option<i64>,
+    #[allow(dead_code)]
+    compressed_sha256: Option<String>,
+    compressed_bytes: Option<i64>,
+}
+
+/// CPython's `UnicodeDecodeError` spelling for one bad byte.
+fn py_utf8_error(error: &std::str::Utf8Error, bytes: &[u8]) -> String {
+    let position = error.valid_up_to();
+    let byte = bytes.get(position).copied().unwrap_or(0);
+    let reason = match error.error_len() {
+        None => "unexpected end of data",
+        Some(_) if matches!(byte, 0x80..=0xbf) || byte > 0xf4 => "invalid start byte",
+        Some(_) => "invalid continuation byte",
+    };
+    format!("'utf-8' codec can't decode byte 0x{byte:02x} in position {position}: {reason}")
+}
+
+fn is_link_or_missing(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta.file_type().is_symlink() || !meta.is_file(),
+        Err(_) => true,
+    }
+}
+
+/// The transcript projections under `extracted/transcripts`,
+/// read through the chunked container the manifest declares
+/// (`TranscriptQuery`, full-stream path only: `query stats`
+/// reads every record and reproduces the declared digest).
+pub struct TranscriptQuery {
+    declared: std::collections::BTreeMap<String, ManagedFile>,
+}
+
+impl TranscriptQuery {
+    /// Open the manifest and check every declared projection
+    /// the way `TranscriptQuery.__init__` does.
+    pub fn open(root: &Path) -> Result<TranscriptQuery, String> {
+        let root = resolve_path(root);
+        let transcript_root = root.join("extracted").join("transcripts");
+        let manifest_path = transcript_root.join("manifest.json");
+        if is_link_or_missing(&manifest_path) {
+            return Err(format!(
+                "no extracted transcripts at {}; run extract-transcripts",
+                manifest_path.display()
+            ));
+        }
+        let manifest_value = crate::json::read_json(&manifest_path)?;
+        let manifest = as_object(&manifest_value, &manifest_path.display().to_string())?;
+        let schema = as_int(
+            manifest.get("schema_version").unwrap_or(&Value::Null),
+            "transcript manifest schema",
+        )?;
+        if schema != 1 {
+            return Err(format!(
+                "unsupported transcript export schema version {schema}; expected 1"
+            ));
+        }
+        let files = as_object(
+            manifest.get("files").unwrap_or(&Value::Null),
+            "transcript manifest files",
+        )?;
+        let mut declared = std::collections::BTreeMap::new();
+        for name in ["prompts.jsonl", "messages.jsonl", "system-inputs.jsonl"] {
+            let entry = as_object(
+                files.get(name).unwrap_or(&Value::Null),
+                &format!("transcript manifest files.{name}"),
+            )?;
+            let managed = Self::declare(&transcript_root, name, entry)?;
+            if let Some(expected) = managed.compressed_bytes {
+                let size = std::fs::metadata(&managed.path)
+                    .map(|meta| meta.len() as i64)
+                    .unwrap_or(-1);
+                if size != expected {
+                    let file_name = managed
+                        .path
+                        .file_name()
+                        .map(|part| part.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    return Err(format!(
+                        "transcript export generation is incomplete: {file_name} holds {size} bytes, the manifest declares {expected}"
+                    ));
+                }
+            }
+            declared.insert(name.to_string(), managed);
+        }
+        Ok(TranscriptQuery { declared })
+    }
+
+    fn declare(
+        transcript_root: &Path,
+        name: &str,
+        entry: &Map<String, Value>,
+    ) -> Result<ManagedFile, String> {
+        let Some(container) = entry.get("container") else {
+            return Err(format!(
+                "{name} is an uncompressed transcript projection; this reader reads the seekable container only -- re-run extract-transcripts to rebuild the corpus"
+            ));
+        };
+        let container = as_string(container, &format!("{name}.container"))?;
+        if container != "multi-member-gzip" {
+            return Err(format!(
+                "{name} declares container {}; this reader implements 'multi-member-gzip' only",
+                py_repr(&Value::String(container.to_string()))
+            ));
+        }
+        let expected_name = format!("{name}.gz");
+        let declared_path = as_string(
+            entry.get("path").unwrap_or(&Value::Null),
+            &format!("{name}.path"),
+        )?;
+        if declared_path != expected_name {
+            return Err(format!(
+                "{name} declares its container as {}, not {}",
+                py_repr(&Value::String(declared_path.to_string())),
+                py_repr(&Value::String(expected_name.clone()))
+            ));
+        }
+        let expected_index = format!("{expected_name}.index.jsonl");
+        let declared_index = as_string(
+            entry.get("index_path").unwrap_or(&Value::Null),
+            &format!("{name}.index_path"),
+        )?;
+        if declared_index != expected_index {
+            return Err(format!(
+                "{name} declares its index as {}, not {}",
+                py_repr(&Value::String(declared_index.to_string())),
+                py_repr(&Value::String(expected_index.clone()))
+            ));
+        }
+        let path = transcript_root.join(&expected_name);
+        if is_link_or_missing(&path) {
+            return Err(format!(
+                "transcript export file is missing or unsafe: {}",
+                path.display()
+            ));
+        }
+        let compressed_sha256 = match entry.get("c_sha256") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(as_string(value, &format!("{name}.c_sha256"))?.to_string()),
+        };
+        Ok(ManagedFile {
+            name: name.to_string(),
+            index_path: transcript_root.join(&expected_index),
+            path,
+            sha256: as_string(
+                entry.get("sha256").unwrap_or(&Value::Null),
+                &format!("{name}.sha256"),
+            )?
+            .to_string(),
+            declared_bytes: crate::json::optional_int(
+                entry.get("bytes").unwrap_or(&Value::Null),
+                &format!("{name}.bytes"),
+            )?,
+            records: crate::json::optional_int(
+                entry.get("records").unwrap_or(&Value::Null),
+                &format!("{name}.records"),
+            )?,
+            compressed_sha256,
+            compressed_bytes: crate::json::optional_int(
+                entry.get("c_bytes").unwrap_or(&Value::Null),
+                &format!("{name}.c_bytes"),
+            )?,
+        })
+    }
+
+    /// Every record of one projection, with the uncompressed
+    /// stream's digest reproduced over the inflated bytes.
+    fn stream(&self, name: &str) -> Result<Vec<Map<String, Value>>, String> {
+        let declared = self
+            .declared
+            .get(name)
+            .ok_or_else(|| format!("{name} is not a managed transcript projection"))?;
+        let data = self.inflate_verified(declared)?;
+        let mut records = Vec::new();
+        if data.is_empty() {
+            return Ok(records);
+        }
+        if !data.ends_with(b"\n") {
+            return Err(format!(
+                "{}: shard does not end at a line boundary",
+                declared.path.display()
+            ));
+        }
+        for (number, line) in data[..data.len() - 1]
+            .split(|byte| *byte == b'\n')
+            .enumerate()
+        {
+            let where_ = format!("{} line {number}", declared.path.display());
+            let line = std::str::from_utf8(line).map_err(|error| {
+                format!(
+                    "{where_}: not a JSON record: {}",
+                    py_utf8_error(&error, line)
+                )
+            })?;
+            let value = parse_json_lenient(line)
+                .map_err(|error| format!("{where_}: not a JSON record: {error}"))?;
+            records.push(as_object(&value, &where_)?.clone());
+        }
+        Ok(records)
+    }
+
+    fn inflate_verified(&self, declared: &ManagedFile) -> Result<Vec<u8>, String> {
+        let incomplete = || {
+            format!(
+                "transcript export generation is incomplete: {}",
+                declared.name
+            )
+        };
+        if is_link_or_missing(&declared.path) {
+            return Err(format!(
+                "archive shard is missing or unsafe: {}",
+                declared.path.display()
+            ));
+        }
+        let compressed = std::fs::read(&declared.path)
+            .map_err(|error| crate::json::os_error(&error, &declared.path))?;
+        let data = if is_link_or_missing(&declared.index_path) {
+            let mut decoded = Vec::new();
+            match flate2::read::MultiGzDecoder::new(&compressed[..]).read_to_end(&mut decoded) {
+                Ok(_) => decoded,
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    return Err(incomplete());
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "{}: not a gzip member: {error}",
+                        declared.path.display()
+                    ));
+                }
+            }
+        } else {
+            let raw = std::fs::read(&declared.index_path)
+                .map_err(|error| crate::json::os_error(&error, &declared.index_path))?;
+            let text = match std::str::from_utf8(&raw) {
+                Ok(text) => text.to_string(),
+                Err(error) => {
+                    return Err(format!(
+                        "{}: malformed index: {}",
+                        declared.index_path.display(),
+                        py_utf8_error(&error, &raw)
+                    ));
+                }
+            };
+            let index = parse_chunk_index(&text, &declared.index_path.display().to_string())?;
+            let file_name = declared
+                .path
+                .file_name()
+                .map(|part| part.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if index.data_file != file_name {
+                return Err(format!(
+                    "{}: index describes {}, not {}",
+                    declared.index_path.display(),
+                    py_repr(&Value::String(index.data_file.clone())),
+                    py_repr(&Value::String(file_name))
+                ));
+            }
+            if compressed.len() as i64 != index.c_size {
+                return Err(format!(
+                    "{}: index describes {} compressed bytes but {} holds {}",
+                    declared.index_path.display(),
+                    index.c_size,
+                    declared.path.display(),
+                    compressed.len()
+                ));
+            }
+            if index.timestamp_key != "timestamp_ms" {
+                return Err(format!(
+                    "{} is indexed on {}, not 'timestamp_ms'; a transcript seek would search the wrong axis",
+                    file_name,
+                    py_repr(&Value::String(index.timestamp_key.clone()))
+                ));
+            }
+            if index.u_sha256 != declared.sha256 {
+                return Err(format!(
+                    "transcript export generation is incomplete: {} indexes a stream the manifest does not describe",
+                    declared.name
+                ));
+            }
+            if let Some(expected) = declared.declared_bytes {
+                if index.u_size != expected {
+                    return Err(format!(
+                        "transcript export generation is incomplete: {} indexes {} uncompressed bytes, the manifest declares {expected}",
+                        declared.name, index.u_size
+                    ));
+                }
+            }
+            if let Some(expected) = declared.records {
+                if index.record_count != expected {
+                    return Err(format!(
+                        "transcript export generation is incomplete: {} indexes {} records, the manifest declares {expected}",
+                        declared.name, index.record_count
+                    ));
+                }
+            }
+            let mut data = Vec::new();
+            for member in &index.members {
+                let start = member.c_off as usize;
+                let available = compressed.len().saturating_sub(start);
+                if available < member.c_len as usize {
+                    return Err(format!(
+                        "{}: member at {} is {available} bytes, index says {}",
+                        declared.path.display(),
+                        member.c_off,
+                        member.c_len
+                    ));
+                }
+                let slice = &compressed[start..start + member.c_len as usize];
+                let mut decoded = Vec::new();
+                flate2::read::GzDecoder::new(slice)
+                    .read_to_end(&mut decoded)
+                    .map_err(|error| {
+                        // zlib's spellings for the two failures a
+                        // damaged member most plausibly hits.
+                        let message = error.to_string();
+                        let message = if message.contains("checksum") {
+                            "CRC check failed".to_string()
+                        } else if message.contains("unexpected end") {
+                            "Compressed file ended before the end-of-stream marker was reached"
+                                .to_string()
+                        } else {
+                            message
+                        };
+                        format!(
+                            "{}: member at {} did not inflate: {message}",
+                            declared.path.display(),
+                            member.c_off
+                        )
+                    })?;
+                if decoded.len() as i64 != member.u_len {
+                    return Err(format!(
+                        "{}: member at {} inflates to {} bytes, index says {}",
+                        declared.path.display(),
+                        member.c_off,
+                        decoded.len(),
+                        member.u_len
+                    ));
+                }
+                if !decoded.is_empty() && !decoded.ends_with(b"\n") {
+                    return Err(format!(
+                        "{}: member does not end at a line boundary",
+                        declared.path.display()
+                    ));
+                }
+                data.extend_from_slice(&decoded);
+            }
+            data
+        };
+        if hex_digest(&data) != declared.sha256 {
+            return Err(incomplete());
+        }
+        Ok(data)
+    }
+
+    fn selected(
+        record: &Map<String, Value>,
+        filters: &Filters,
+        window: &Option<Window>,
+    ) -> Result<bool, String> {
+        let team = as_string(
+            record.get("team_slug").unwrap_or(&Value::Null),
+            "transcript record.team_slug",
+        )?;
+        if !filters.teams.is_empty() && !filters.teams.iter().any(|t| t == team) {
+            return Ok(false);
+        }
+        let Some(window) = window else {
+            return Ok(true);
+        };
+        let at_ms = int_literal(
+            record.get("timestamp_ms").unwrap_or(&Value::Null),
+            "transcript record.timestamp_ms",
+        )?;
+        Ok(window.contains_dec(&at_ms))
+    }
+
+    /// `TranscriptQuery.content_stats`: the five prompt and
+    /// response totals.
+    pub fn content_stats(
+        &self,
+        filters: &Filters,
+    ) -> Result<(TextTotals, TextTotals, TextTotals, TextTotals, TextTotals), String> {
+        let window = parse_window(filters)?;
+        let (mut human, mut bot, mut unattributed) = (
+            TextTotals::default(),
+            TextTotals::default(),
+            TextTotals::default(),
+        );
+        for record in self.stream("prompts.jsonl")? {
+            if !Self::selected(&record, filters, &window)? {
+                continue;
+            }
+            let text = as_string(record.get("text").unwrap_or(&Value::Null), "prompt.text")?;
+            let author = as_string(
+                record.get("author_kind").unwrap_or(&Value::Null),
+                "prompt.author_kind",
+            )?;
+            match author {
+                "owner_human" | "other_human" => human.add_text(text),
+                "agent" | "system" => bot.add_text(text),
+                _ => unattributed.add_text(text),
+            }
+        }
+        let (mut linked, mut unlinked) = (TextTotals::default(), TextTotals::default());
+        for record in self.stream("messages.jsonl")? {
+            let record_type = as_string(
+                record.get("record_type").unwrap_or(&Value::Null),
+                "message.record_type",
+            )?;
+            if record_type != "response" {
+                continue;
+            }
+            if !Self::selected(&record, filters, &window)? {
+                continue;
+            }
+            let text = as_string(record.get("text").unwrap_or(&Value::Null), "response.text")?;
+            if matches!(record.get("in_reply_to_prompt_id"), Some(Value::String(_))) {
+                linked.add_text(text);
+            } else {
+                unlinked.add_text(text);
+            }
+        }
+        Ok((human, bot, unattributed, linked, unlinked))
+    }
+}
+
+/// `ArchiveStats` plus its rendering (`format_stats`).
+pub struct ArchiveStats {
+    human_prompts: TextTotals,
+    bot_prompts: TextTotals,
+    unattributed_prompts: TextTotals,
+    linked_responses: TextTotals,
+    unlinked_responses: TextTotals,
+    summary_kinds: Vec<(String, SummaryKindStats)>,
+    teams: Vec<String>,
+    time_filtered: bool,
+    rollup_kinds: Vec<String>,
+}
+
+impl ArchiveStats {
+    fn all_prompts(&self) -> TextTotals {
+        self.human_prompts
+            .plus(&self.bot_prompts)
+            .plus(&self.unattributed_prompts)
+    }
+
+    fn total_responses(&self) -> TextTotals {
+        self.linked_responses.plus(&self.unlinked_responses)
+    }
+
+    fn generated_summaries(&self) -> TextTotals {
+        let mut total = TextTotals::default();
+        for (_, item) in &self.summary_kinds {
+            total = total.plus(&item.content);
+        }
+        total
+    }
+
+    fn to_mapping(&self) -> Value {
+        let mut content = Map::new();
+        content.insert(
+            "human_prompts".to_string(),
+            Value::Object(self.human_prompts.to_map()),
+        );
+        content.insert(
+            "bot_prompts".to_string(),
+            Value::Object(self.bot_prompts.to_map()),
+        );
+        content.insert(
+            "unattributed_prompts".to_string(),
+            Value::Object(self.unattributed_prompts.to_map()),
+        );
+        content.insert(
+            "all_prompts".to_string(),
+            Value::Object(self.all_prompts().to_map()),
+        );
+        content.insert(
+            "mechanically_linked_responses".to_string(),
+            Value::Object(self.linked_responses.to_map()),
+        );
+        content.insert(
+            "unlinked_responses".to_string(),
+            Value::Object(self.unlinked_responses.to_map()),
+        );
+        content.insert(
+            "total_responses".to_string(),
+            Value::Object(self.total_responses().to_map()),
+        );
+        let generated = self.generated_summaries();
+        content.insert(
+            "generated_summaries".to_string(),
+            Value::Object(generated.to_map()),
+        );
+        let prompts_and_responses = self.all_prompts().plus(&self.total_responses());
+        content.insert(
+            "prompts_and_responses".to_string(),
+            Value::Object(prompts_and_responses.to_map()),
+        );
+        content.insert(
+            "all_counted_content".to_string(),
+            Value::Object(prompts_and_responses.plus(&generated).to_map()),
+        );
+        let mut by_kind = Map::new();
+        let (mut available, mut unavailable) = (0i64, 0i64);
+        for (key, item) in &self.summary_kinds {
+            by_kind.insert(key.clone(), Value::Object(item.to_map()));
+            available += item.available;
+            unavailable += item.unavailable;
+        }
+        let mut summary_availability = Map::new();
+        summary_availability.insert("available".to_string(), Value::from(available));
+        summary_availability.insert("unavailable".to_string(), Value::from(unavailable));
+        summary_availability.insert("total".to_string(), Value::from(available + unavailable));
+        summary_availability.insert("by_kind".to_string(), Value::Object(by_kind));
+        let mut scope = Map::new();
+        scope.insert(
+            "teams".to_string(),
+            Value::Array(self.teams.iter().cloned().map(Value::String).collect()),
+        );
+        scope.insert("all_teams".to_string(), Value::Bool(self.teams.is_empty()));
+        scope.insert("time_filtered".to_string(), Value::Bool(self.time_filtered));
+        scope.insert(
+            "rollup_kinds".to_string(),
+            Value::Array(
+                self.rollup_kinds
+                    .iter()
+                    .cloned()
+                    .map(Value::String)
+                    .collect(),
+            ),
+        );
+        let mut counting_contract = Map::new();
+        for (key, value) in [
+            ("words", "Unicode text split on whitespace"),
+            (
+                "utf8_bytes",
+                "UTF-8 encoded text only; serialization framing excluded",
+            ),
+            (
+                "rollup_text",
+                "referenced generated Markdown counted verbatim",
+            ),
+            ("phase_summary_text", "phrase plus newline plus paragraph"),
+            (
+                "time_unbounded_project_overviews",
+                "included only when no time filter is active",
+            ),
+            (
+                "human_prompts",
+                "records labeled owner_human or other_human",
+            ),
+            ("bot_prompts", "records labeled agent or system"),
+            (
+                "unattributed_prompts",
+                "all remaining prompt authorship labels",
+            ),
+        ] {
+            counting_contract.insert(key.to_string(), Value::String(value.to_string()));
+        }
+        let mut root = Map::new();
+        root.insert("schema_version".to_string(), Value::from(1));
+        root.insert("command".to_string(), Value::String("stats".to_string()));
+        root.insert("scope".to_string(), Value::Object(scope));
+        root.insert("content".to_string(), Value::Object(content));
+        root.insert(
+            "summary_availability".to_string(),
+            Value::Object(summary_availability),
+        );
+        root.insert(
+            "counting_contract".to_string(),
+            Value::Object(counting_contract),
+        );
+        Value::Object(root)
+    }
+}
+
+/// `archive_stats`: verified transcript totals, then summary
+/// totals, in the oracle's evaluation order.
+pub fn archive_stats(root: &Path, filters: &Filters) -> Result<ArchiveStats, String> {
+    // The CLI builds its filters (and so validates the window)
+    // before the archive is opened.
+    let window = parse_window(filters)?;
+    let transcripts = TranscriptQuery::open(root)?;
+    let (human, bot, unattributed, linked, unlinked) = transcripts.content_stats(filters)?;
+    let timeline = Timeline::open(root)?;
+    let summary_kinds = timeline.summary_stats(filters)?;
+    Ok(ArchiveStats {
+        human_prompts: human,
+        bot_prompts: bot,
+        unattributed_prompts: unattributed,
+        linked_responses: linked,
+        unlinked_responses: unlinked,
+        summary_kinds,
+        teams: filters.teams.clone(),
+        time_filtered: window.is_some(),
+        rollup_kinds: filters.kinds.clone(),
+    })
+}
+
+fn commas(value: i64) -> String {
+    let negative = value < 0;
+    let digits = value.unsigned_abs().to_string();
+    let mut out = String::new();
+    if negative {
+        out.push('-');
+    }
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn stats_scope(stats: &ArchiveStats) -> String {
+    let teams = if stats.teams.is_empty() {
+        "all teams".to_string()
+    } else {
+        stats.teams.join(", ")
+    };
+    let time_scope = if stats.time_filtered {
+        "filtered time window"
+    } else {
+        "all time"
+    };
+    let rollups = if stats.rollup_kinds.is_empty() {
+        "all rollup kinds".to_string()
+    } else {
+        stats.rollup_kinds.join(", ")
+    };
+    format!("{teams}; {time_scope}; {rollups}")
+}
+
+fn stats_content_rows(stats: &ArchiveStats) -> Vec<(String, TextTotals)> {
+    vec![
+        ("Identified human prompts".to_string(), stats.human_prompts),
+        (
+            "Identified bot/agent prompts".to_string(),
+            stats.bot_prompts,
+        ),
+        (
+            "Unattributed prompt records".to_string(),
+            stats.unattributed_prompts,
+        ),
+        ("All prompt records".to_string(), stats.all_prompts()),
+        (
+            "Mechanically linked responses".to_string(),
+            stats.linked_responses,
+        ),
+        ("Unlinked responses".to_string(), stats.unlinked_responses),
+        ("Total responses".to_string(), stats.total_responses()),
+        (
+            "Generated summaries".to_string(),
+            stats.generated_summaries(),
+        ),
+        (
+            "Prompts + responses".to_string(),
+            stats.all_prompts().plus(&stats.total_responses()),
+        ),
+        (
+            "All counted content".to_string(),
+            stats
+                .all_prompts()
+                .plus(&stats.total_responses())
+                .plus(&stats.generated_summaries()),
+        ),
+    ]
+}
+
+const STATS_FOOTER: &str = "Words are whitespace-delimited Unicode text. Byte totals are UTF-8 text bytes and exclude CLI/JSON serialization framing; generated rollup Markdown is counted verbatim.";
+
+/// `format_stats` for one stats report.
+pub fn format_stats(stats: &ArchiveStats, format: &str) -> Result<String, String> {
+    match format {
+        "json" => Ok(dump_canonical(&stats.to_mapping())),
+        "jsonl" => Ok(format!("{}\n", dump_oneline(&stats.to_mapping()))),
+        "markdown" => {
+            let mut lines = vec![
+                "# Archive content statistics".to_string(),
+                String::new(),
+                format!("Scope: {}.", stats_scope(stats)),
+                String::new(),
+                "| Content | Records | Words | UTF-8 bytes |".to_string(),
+                "| --- | ---: | ---: | ---: |".to_string(),
+            ];
+            for (label, totals) in stats_content_rows(stats) {
+                lines.push(format!(
+                    "| {label} | {} | {} | {} |",
+                    commas(totals.records),
+                    commas(totals.words),
+                    commas(totals.utf8_bytes)
+                ));
+            }
+            lines.extend([
+                String::new(),
+                "## Summary availability".to_string(),
+                String::new(),
+                "| Kind | Available | Unavailable | Total |".to_string(),
+                "| --- | ---: | ---: | ---: |".to_string(),
+            ]);
+            let (mut available, mut unavailable) = (0i64, 0i64);
+            for (key, item) in &stats.summary_kinds {
+                lines.push(format!(
+                    "| {} | {} | {} | {} |",
+                    title_case(key),
+                    commas(item.available),
+                    commas(item.unavailable),
+                    commas(item.available + item.unavailable)
+                ));
+                available += item.available;
+                unavailable += item.unavailable;
+            }
+            lines.push(format!(
+                "| **All summary slots** | **{}** | **{}** | **{}** |",
+                commas(available),
+                commas(unavailable),
+                commas(available + unavailable)
+            ));
+            lines.push(String::new());
+            lines.push(STATS_FOOTER.to_string());
+            Ok(format!("{}\n", lines.join("\n")))
+        }
+        "text" => {
+            let mut lines = vec![
+                "Archive content statistics".to_string(),
+                format!("Scope: {}", stats_scope(stats)),
+                String::new(),
+                format!(
+                    "{:<34} {:>12} {:>14} {:>16}",
+                    "Content", "Records", "Words", "UTF-8 bytes"
+                ),
+                format!(
+                    "{} {} {} {}",
+                    "-".repeat(34),
+                    "-".repeat(12),
+                    "-".repeat(14),
+                    "-".repeat(16)
+                ),
+            ];
+            for (label, totals) in stats_content_rows(stats) {
+                lines.push(format!(
+                    "{:<34} {:>12} {:>14} {:>16}",
+                    label,
+                    commas(totals.records),
+                    commas(totals.words),
+                    commas(totals.utf8_bytes)
+                ));
+            }
+            lines.extend([
+                String::new(),
+                "Summary availability".to_string(),
+                format!(
+                    "{:<34} {:>12} {:>14} {:>16}",
+                    "Kind", "Available", "Unavailable", "Total"
+                ),
+                format!(
+                    "{} {} {} {}",
+                    "-".repeat(34),
+                    "-".repeat(12),
+                    "-".repeat(14),
+                    "-".repeat(16)
+                ),
+            ]);
+            let (mut available, mut unavailable) = (0i64, 0i64);
+            for (key, item) in &stats.summary_kinds {
+                lines.push(format!(
+                    "{:<34} {:>12} {:>14} {:>16}",
+                    title_case(key),
+                    commas(item.available),
+                    commas(item.unavailable),
+                    commas(item.available + item.unavailable)
+                ));
+                available += item.available;
+                unavailable += item.unavailable;
+            }
+            lines.push(format!(
+                "{:<34} {:>12} {:>14} {:>16}",
+                "All summary slots",
+                commas(available),
+                commas(unavailable),
+                commas(available + unavailable)
+            ));
+            lines.push(String::new());
+            lines.push(STATS_FOOTER.to_string());
+            Ok(format!("{}\n", lines.join("\n")))
+        }
+        other => Err(format!(
+            "unsupported query output format {}",
+            py_repr(&Value::String(other.to_string()))
+        )),
     }
 }
 

@@ -454,7 +454,8 @@
         "py/tests/test_transcript_export.py",
         "py/tests/test_wrkviz_inspect_rust.py",
         "py/tests/test_wrkviz_query_list_rust.py",
-        "py/tests/test_wrkviz_query_show_rust.py"
+        "py/tests/test_wrkviz_query_show_rust.py",
+        "py/tests/test_wrkviz_query_stats_rust.py"
       ]
     }
   },

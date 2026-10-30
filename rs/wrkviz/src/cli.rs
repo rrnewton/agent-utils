@@ -139,7 +139,27 @@ options:
                 phase
 "#;
 
+/// The Python edition's query-stats help, verbatim.
+pub const QUERY_STATS_HELP: &str = r#"usage: wrkviz query stats [-h] [--team TEAM] [--start-time START_TIME]
+                          [--end-time END_TIME]
+                          [--kind {hourly,daily,weekly,monthly,quarterly}]
+
+count records, whitespace-delimited words, and UTF-8 text bytes for attributed
+and unattributed prompts, responses, and generated summaries; read-only and
+zero-model
+
+options:
+  -h, --help            show this help message and exit
+  --team TEAM           team slug; repeat as needed
+  --start-time START_TIME
+                        inclusive RFC3339 instant
+  --end-time END_TIME   exclusive RFC3339 instant
+  --kind {hourly,daily,weekly,monthly,quarterly}
+                        rollup kind to count; repeat as needed
+"#;
+
 const QUERY_USAGE: &str = "usage: wrkviz query [-h] --output OUTPUT [--format {json,jsonl,markdown,text}]\n                    {list,show,search,prompts,messages,stats} ...";
+const QUERY_STATS_USAGE: &str = "usage: wrkviz query stats [-h] [--team TEAM] [--start-time START_TIME]\n                          [--end-time END_TIME]\n                          [--kind {hourly,daily,weekly,monthly,quarterly}]";
 const QUERY_SHOW_USAGE: &str = "usage: wrkviz query show [-h] [--transcript] reference";
 const QUERY_LIST_USAGE: &str = "usage: wrkviz query list [-h] [--team TEAM] [--start-time START_TIME]\n                         [--end-time END_TIME]\n                         [--kind {hourly,daily,weekly,monthly,quarterly}]\n                         [--agent AGENT]\n                         {teams,agents,phases,rollups}";
 
@@ -253,15 +273,37 @@ fn named_value(
     name: &str,
 ) -> Result<Option<String>, (String, String)> {
     let arg = &args[*index];
+    // An abbreviated long option may also carry `=value`
+    // (`--te=alpha`): argparse matches the prefix before `=`.
+    let (head, explicit) = match arg.split_once('=') {
+        Some((head, value)) => (head, Some(value)),
+        None => (arg.as_str(), None),
+    };
+    if head == name || (head.len() > 2 && head.starts_with("--") && name.starts_with(head)) {
+        if let Some(value) = explicit {
+            return Ok(Some(value.to_string()));
+        }
+    }
     if let Some(value) = arg.strip_prefix(&format!("{name}=")) {
         return Ok(Some(value.to_string()));
     }
     // argparse also accepts an unambiguous prefix of a long option.
     if arg == name || (arg.len() > 2 && arg.starts_with("--") && name.starts_with(arg.as_str())) {
         *index += 1;
+        // argparse will not take an option-shaped token as the
+        // value: `--team --kind` is a missing value, not a team
+        // named `--kind`.
+        let looks_like_option = |value: &str| {
+            value.len() > 1
+                && value.starts_with('-')
+                && !value[1..]
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| ch.is_ascii_digit())
+        };
         return match args.get(*index) {
-            Some(value) => Ok(Some(value.clone())),
-            None => Err((
+            Some(value) if !looks_like_option(value) => Ok(Some(value.clone())),
+            _ => Err((
                 name.to_string(),
                 format!("argument {name}: expected one argument"),
             )),
@@ -271,10 +313,9 @@ fn named_value(
 }
 
 fn is_option_token(arg: &str, names: &[&str]) -> bool {
+    let head = arg.split_once('=').map_or(arg, |(head, _)| head);
     names.iter().any(|name| {
-        arg == *name
-            || arg.starts_with(&format!("{name}="))
-            || (arg.len() > 2 && arg.starts_with("--") && name.starts_with(arg))
+        head == *name || (head.len() > 2 && head.starts_with("--") && name.starts_with(head))
     })
 }
 
@@ -304,6 +345,14 @@ fn run_query(args: &[String]) -> u8 {
                 Some("show") => {
                     print!("{QUERY_SHOW_HELP}");
                     return 0;
+                }
+                Some("stats") => {
+                    // The stats parser validates its options
+                    // in order; a `--help` after an invalid
+                    // choice must not win over that error.
+                    rest.push(arg.clone());
+                    index += 1;
+                    continue;
                 }
                 Some(other) => {
                     eprintln!(
@@ -378,6 +427,26 @@ fn run_query(args: &[String]) -> u8 {
             return run_query_show("", &format, &rest);
         }
     }
+    if action.as_deref() == Some("stats") && output.is_none() {
+        // The stats parser runs before the query parser's
+        // required-argument check: its own errors (an invalid
+        // --kind choice, a refused explicit help value) and
+        // its help outrank a missing --output.
+        let early = rest.iter().any(|arg| {
+            let head = arg.split_once('=').map_or(arg.as_str(), |(head, _)| head);
+            head == "-h"
+                || head == "--help"
+                || (head.len() > 1 && head.starts_with("--") && "--help".starts_with(head))
+                || (head.len() > 2 && head.starts_with("--") && "--kind".starts_with(head))
+                || (head.len() > 1
+                    && !head.starts_with("--")
+                    && head.starts_with('-')
+                    && head[1..].starts_with('h'))
+        });
+        if early {
+            return run_query_stats("", &format, &rest, true);
+        }
+    }
     let mut missing: Vec<&str> = Vec::new();
     if output.is_none() {
         missing.push("--output");
@@ -399,6 +468,7 @@ fn run_query(args: &[String]) -> u8 {
     match action.as_deref() {
         Some("list") => run_query_list(&output, &format, &rest),
         Some("show") => run_query_show(&output, &format, &rest),
+        Some("stats") => run_query_stats(&output, &format, &rest, false),
         Some(other) => {
             eprintln!(
                 "wrkviz: the Rust edition has not ported 'query {other}' yet; the Python edition remains the oracle for it"
@@ -512,6 +582,137 @@ fn run_query_show(output: &str, format: &str, args: &[String]) -> u8 {
                 }
             }
         }
+        Err(error) => {
+            eprintln!("wrkviz: {error}");
+            2
+        }
+    }
+}
+
+fn run_query_stats(output: &str, format: &str, args: &[String], output_missing: bool) -> u8 {
+    let mut filters = crate::query::Filters {
+        teams: Vec::new(),
+        start_time: None,
+        end_time: None,
+        kinds: Vec::new(),
+        agent: None,
+    };
+    let mut extras: Vec<String> = Vec::new();
+    let mut after_separator = false;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if after_separator {
+            extras.push(arg.clone());
+            index += 1;
+            continue;
+        }
+        if arg == "--" {
+            after_separator = true;
+            // argparse names the separator itself among the
+            // unrecognized arguments when anything follows it.
+            extras.push(arg.clone());
+            index += 1;
+            continue;
+        }
+        // Help, in its plain and short-cluster spellings,
+        // fires when argparse reaches it -- after the options
+        // before it have been validated, before the rest.
+        {
+            let (head, explicit) = match arg.split_once('=') {
+                Some((head, value)) => (head, Some(value)),
+                None => (arg.as_str(), None),
+            };
+            let long_help = head.len() > 1 && head.starts_with("--") && "--help".starts_with(head);
+            let short_help = !head.starts_with("--")
+                && head.len() > 1
+                && head.starts_with('-')
+                && head[1..].starts_with('h');
+            if long_help || short_help {
+                if let Some(value) = explicit {
+                    return argparse_error(
+                        QUERY_STATS_USAGE,
+                        "wrkviz query stats",
+                        &format!("argument -h/--help: ignored explicit argument '{value}'"),
+                    );
+                }
+                print!("{QUERY_STATS_HELP}");
+                return 0;
+            }
+        }
+        let mut handled = true;
+        for (name, target) in [
+            ("--team", 0),
+            ("--start-time", 1),
+            ("--end-time", 2),
+            ("--kind", 3),
+        ] {
+            match named_value(args, &mut index, name) {
+                Ok(Some(value)) => {
+                    match target {
+                        0 => filters.teams.push(value),
+                        1 => filters.start_time = Some(value),
+                        2 => filters.end_time = Some(value),
+                        _ => {
+                            if !["hourly", "daily", "weekly", "monthly", "quarterly"]
+                                .contains(&value.as_str())
+                            {
+                                return argparse_error(
+                                    QUERY_STATS_USAGE,
+                                    "wrkviz query stats",
+                                    &format!(
+                                        "argument --kind: invalid choice: '{value}' (choose from hourly, daily, weekly, monthly, quarterly)"
+                                    ),
+                                );
+                            }
+                            filters.kinds.push(value);
+                        }
+                    }
+                    break;
+                }
+                Ok(None) => {}
+                Err((_, message)) => {
+                    return argparse_error(QUERY_STATS_USAGE, "wrkviz query stats", &message)
+                }
+            }
+        }
+        if !is_option_token(arg, &["--team", "--start-time", "--end-time", "--kind"]) {
+            handled = false;
+        }
+        if !handled {
+            extras.push(arg.clone());
+        }
+        index += 1;
+    }
+    if extras.iter().any(|arg| arg != "--") {
+        // Once a subcommand parser is chosen, unknown
+        // arguments are reported by the root parser with
+        // the top-level usage (argparse's spelling here).
+        eprintln!(
+            "usage: wrkviz [-h] [--version] [--userguide]\n              {{quickstart,ingest-project,ingest,ingest-claude,ingest-claude-history,ingest-muse,ingest-orc,summarize,build,extract-transcripts,export,refresh,github-metadata,refresh-claude,refresh-orc,serve,inspect,gc,migrate-build-state,migrate-snapshots,audit-glossary,audit-losslessness,query,responsiveness,discover-agents}}\n              ...\nwrkviz: error: unrecognized arguments: {}",
+            extras.join(" ")
+        );
+        return 2;
+    }
+    if output_missing {
+        return argparse_error(
+            QUERY_USAGE,
+            "wrkviz query",
+            "the following arguments are required: --output",
+        );
+    }
+    let root = cli_path(output);
+    match crate::query::archive_stats(&root, &filters) {
+        Ok(stats) => match crate::query::format_stats(&stats, format) {
+            Ok(text) => {
+                print!("{text}");
+                0
+            }
+            Err(error) => {
+                eprintln!("wrkviz: {error}");
+                2
+            }
+        },
         Err(error) => {
             eprintln!("wrkviz: {error}");
             2
