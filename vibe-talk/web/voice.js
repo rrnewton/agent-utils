@@ -82,9 +82,12 @@ const ACTIVE_CHANNEL_KEY = "vibe-talk.voice.active-channel";
 // The thread on the right is drawn by the same code that draws a thread on the left, and that code
 // keeps what it is showing in module state and in the elements of one pane. So the right column has
 // elements of its own (each `side-` id standing in for one of the pane's, `COLUMN_IDS`) and state of
-// its own (`COLUMN_STATE`, further down), and the code works on one column at a time: the LEFT ONE,
-// except inside `inColumn(columns.side, ...)`, which loads the right column's state, runs, and puts
-// the left column's back before it returns. Nothing is left pointing at the right column between
+// its own: records on the column object by field group (`olderPages`, `replyArrows`, `loadState`,
+// ...; `#624 voice-page-modularity`, plan step 15) and, until every group has moved, the module
+// variables `COLUMN_STATE` swaps, further down. The code works on one column at a time: the LEFT ONE,
+// except inside `inColumn(columns.side, ...)`, which makes the right column the one worked on (its
+// records, and its swapped variables loaded), runs, and puts the left column's back before it
+// returns. Nothing is left pointing at the right column between
 // one event and the next, so code that never heard of a second column keeps meaning the left one.
 
 /** The elements of the channel's pane, and the right column's that stand in for each. */
@@ -23326,19 +23329,18 @@ function loadState() {
   return activeColumn.load;
 }
 
-/**
+/*
  * How the channel rows on screen relate to the server: "fresh" from a read in this page, "saved"
  * from the device and not yet refreshed, or "offline"/"failed" when the refresh did not succeed —
  * "slow" when it failed because the chat service did not answer in time.
- */
+ **/
 // Kept per column: `loadState().freshness` (`freshLoadState`, `#624 voice-page-modularity`).
-/** When the rows on screen were last known to be current, or 0 when there are none. */
-// Kept per column: `loadState().freshAt` (`freshLoadState`, `#624 voice-page-modularity`).
-/**
+// When the rows on screen were last known to be current, or 0 when there are none. Kept per column: `loadState().freshAt` (`freshLoadState`, `#624 voice-page-modularity`).
+/*
  * Whether a read of the channel is on the wire, which the freshness pill says ("· refreshing…").
  * Its own state rather than read off the loading line: a read behind rows a view switch has already
  * drawn shows no loading line. `#220 view-switch-instant`.
- */
+ **/
 // Kept per column: `loadState().refreshing` (`freshLoadState`, `#624 voice-page-modularity`).
 /** Whether `/client-config` has answered in this page, as opposed to the saved shell standing in. */
 let clientConfigApplied = false;
@@ -25992,20 +25994,19 @@ function entryState() {
   return activeColumn.entry;
 }
 
-/** The thread entered and still owed its landing, as its `channelContextKey`, or null. */
-// Kept per column: `entryState().threadOwed` (`freshEntryState`, `#624 voice-page-modularity`).
+// The thread entered and still owed its landing, as its `channelContextKey`, or null. Kept per column: `entryState().threadOwed` (`freshEntryState`, `#624 voice-page-modularity`).
 
-/**
+/*
  * Whether the landing owed waits for the read behind rows the store held (`drawHeldRows`, `#220
  * view-switch-instant`), because none of them was unread. Those rows are the thread's newest stretch,
  * from where All's window starts: an older message the read brings may still be unread. Paid only to
  * a reader still on the newest line, where the switch left them. One who has scrolled since has
  * chosen what to read, and is not moved. Nor by a later read when that one fails: it is the read
  * that answers the entry, and a poll's, forty-five seconds on, is not.
- */
+ **/
 // Kept per column: `entryState().threadAwaitsRead` (`freshEntryState`, `#624 voice-page-modularity`).
 
-/**
+/*
  * The thread entered, as its `channelContextKey`, while its cover does not answer for it: its root
  * reports replies the store has not brought (`threadOutrunsStore`). `#222 unread-replies`. A tap on
  * "1 new" is the case. The thread is drawn at once from what this page holds — its rows from an
@@ -26014,7 +26015,7 @@ function entryState() {
  * made on them only on an unread message they hold, and otherwise waits for the read, which brings the
  * reply the reader came for (`payThreadEntry`), and keeps a landing made meanwhile (`keepEntryLanding`).
  * Null otherwise.
- */
+ **/
 // Kept per column: `entryState().readOwed` (`freshEntryState`, `#624 voice-page-modularity`).
 
 /**
@@ -26186,7 +26187,7 @@ function landAtFoot(first) {
   return true;
 }
 
-/**
+/*
  * Where the entry put the reader, as `{ key, row, first, at }`: the thread, the row it brought to
  * the head of the list, the first unread row it landed on (the same row, or the one under the root),
  * and the scroll position that did it. Null once the reader has moved.
@@ -26201,7 +26202,7 @@ function landAtFoot(first) {
  *
  * So until the reader scrolls, the landing outranks the newest line: those observers put the landed
  * row back at the head instead, as near as the list allows.
- */
+ **/
 // Kept per column: `entryState().landing` (`freshEntryState`, `#624 voice-page-modularity`).
 
 /**
@@ -26898,8 +26899,7 @@ function renderChannelLoading(loading, quiet = false, delayed = false) {
 
 /** How long a refresh nobody asked for may be out before its loading line shows: one second. `#226`. */
 const LOADING_LINE_DELAY_MS = 1000;
-/** The timer that shows that line, or null. */
-// Kept per column: `loadState().lineTimer` (`freshLoadState`, `#624 voice-page-modularity`).
+// The timer that shows that line, or null. Kept per column: `loadState().lineTimer` (`freshLoadState`, `#624 voice-page-modularity`).
 
 /**
  * Whether a read was asked for by nothing the reader did — the poll, a live message, coming back to
@@ -33217,11 +33217,9 @@ function replyArrows() {
   return activeColumn.arrows;
 }
 
-/** The reply the last jump left, as `{ id, context }`, while "Back to reply" is offered; else null. */
-// Kept per column: `replyArrows().back` (`freshReplyArrows`, `#624 voice-page-modularity`).
+// The reply the last jump left, as `{ id, context }`, while "Back to reply" is offered; else null. Kept per column: `replyArrows().back` (`freshReplyArrows`, `#624 voice-page-modularity`).
 
-/** The row lit by the last landing, and the timer that puts it out. */
-// Kept per column: `replyArrows().landed` (`freshReplyArrows`, `#624 voice-page-modularity`).
+// The row lit by the last landing, and the timer that puts it out. Kept per column: `replyArrows().landed` (`freshReplyArrows`, `#624 voice-page-modularity`).
 
 /**
  * How long a tap on a reply's arrow waits to learn whether a second tap follows, in milliseconds.
@@ -33237,16 +33235,15 @@ function replyArrows() {
  */
 const REPLY_DOUBLE_TAP_MS = 250;
 
-/** The first tap on an arrow, waiting for a possible second, as `{ arrow, jump, timer }`; else null. */
-// Kept per column: `replyArrows().tap` (`freshReplyArrows`, `#624 voice-page-modularity`).
+// The first tap on an arrow, waiting for a possible second, as `{ arrow, jump, timer }`; else null. Kept per column: `replyArrows().tap` (`freshReplyArrows`, `#624 voice-page-modularity`).
 
-/**
+/*
  * The timer of the moment after two taps on an arrow gathered, while taps on an arrow or on the X are
  * ignored; else null. A third tap that close is the same gesture running on, not a new one — a hand
  * that taps three times, or a mouse that reports three clicks — and it lands where the gathering has
  * just changed what is under the finger: on the X that has appeared in the gutter, which would put
  * the replies straight back, or on an arrow, which would wait and then jump away from them.
- */
+ **/
 // Kept per column: `replyArrows().settling` (`freshReplyArrows`, `#624 voice-page-modularity`).
 
 /** Forget a tap on an arrow still waiting to jump: the list it would have jumped in is going. */
@@ -33772,10 +33769,8 @@ function setArrowReach(arrow, reach, property, value, other) {
   if (arrow.style.getPropertyValue(other) !== "") arrow.style.removeProperty(other);
 }
 
-/** How many redraws are under way that measure the arrows once, at their end. `#226`. */
-// Kept per column: `replyArrows().held` (`freshReplyArrows`, `#624 voice-page-modularity`).
-/** Whether the arrows want measuring: asked inside a redraw, or of a hidden page. `#226`. */
-// Kept per column: `replyArrows().owed` (`freshReplyArrows`, `#624 voice-page-modularity`).
+// How many redraws are under way that measure the arrows once, at their end. `#226`. Kept per column: `replyArrows().held` (`freshReplyArrows`, `#624 voice-page-modularity`).
+// Whether the arrows want measuring: asked inside a redraw, or of a hidden page. `#226`. Kept per column: `replyArrows().owed` (`freshReplyArrows`, `#624 voice-page-modularity`).
 
 /**
  * Run `draw`, a redraw of the rows, measuring the arrows once at its end rather than at every pass
@@ -33893,8 +33888,7 @@ function listState() {
   return activeColumn.list;
 }
 
-/** Whether the channel's rows are drawn gathered now, so putting them back has something to undo. */
-// Kept per column: `listState().rowsGathered` (`freshListState`, `#624 voice-page-modularity`).
+// Whether the channel's rows are drawn gathered now, so putting them back has something to undo. Kept per column: `listState().rowsGathered` (`freshListState`, `#624 voice-page-modularity`).
 
 /** Whether the list on screen is one replies are gathered in: All, or a provider's only list. */
 const gatheringView = () => !threadingSupported || channelView === "flat";
@@ -34509,8 +34503,7 @@ const replyMarkerVisited = new Map();
 /** What each circle can take the reader to: the replies' ids in time order, and which are joined. */
 const replyMarkerTargets = new WeakMap();
 
-/** Whether any Reply on the list says a count, or any row has a circle: a pass then has something to undo. */
-// Kept per column: `replyArrows().countsDrawn` (`freshReplyArrows`, `#624 voice-page-modularity`).
+// Whether any Reply on the list says a count, or any row has a circle: a pass then has something to undo. Kept per column: `replyArrows().countsDrawn` (`freshReplyArrows`, `#624 voice-page-modularity`).
 
 /** The circle's accessible name, for the `at`th (from 1) of `of` replies. No channel data. */
 const replyMarkerName = (at, of) =>
@@ -34582,8 +34575,7 @@ function outgoingReplyKey() {
   return parts.join(" ");
 }
 
-/** `outgoingReplyKey` as it stood when the Reply counts were last drawn. */
-// Kept per column: `listState().outgoingKey` (`freshListState`, `#624 voice-page-modularity`).
+// `outgoingReplyKey` as it stood when the Reply counts were last drawn. Kept per column: `listState().outgoingKey` (`freshListState`, `#624 voice-page-modularity`).
 
 /** Say on a row's Reply how many replies it has: "Reply (2)", and in words to a screen reader. */
 function labelReplyButton(button, count) {
@@ -39708,8 +39700,8 @@ const DISCORD_PAGE_LIMIT = 50;
 // How close to the top counts as "the reader is looking for something older".
 const OLDER_TRIGGER_PX = 80;
 
-/**
- * Is anything older than the OLDEST ROW ON SCREEN still out there?
+/*
+ * Is anything older than the OLDEST ROW ON SCREEN still out there? A column's `olderPages().moreAbove`.
  *
  * THREE values, not two, and one variable rather than two that can disagree: `true` there is more
  * above, `false` the reader has reached the beginning, `undefined` the server did not say (a
@@ -41790,8 +41782,7 @@ function showPullResult(threw, asked) {
   }, PULL_RESULT_MS);
 }
 
-/** The id of the newest message the channel list is currently showing, or null. */
-// Kept per column: `listState().newestId` (`freshListState`, `#624 voice-page-modularity`).
+// The id of the newest message the channel list is currently showing, or null. Kept per column: `listState().newestId` (`freshListState`, `#624 voice-page-modularity`).
 
 /**
  * Settle the reader's position and the jump-newest chip after a read that replaced the list.
@@ -42230,10 +42221,10 @@ function foldedOneIds(key) {
   return foldedOnes.get(key) || new Set();
 }
 
-/**
+/*
  * How many rows the last pass left in collapsed runs. At zero, outside Fold read, there is
  * nothing to undo, and a pass — which runs with every redraw and every filter change — is free.
- */
+ **/
 // Kept per column: `listState().runRows` (`freshListState`, `#624 voice-page-modularity`).
 
 /** The mode a saved UI record holds: its own `read` when it has one, and otherwise its `todo`. */
@@ -42756,8 +42747,7 @@ function drawUndoLabel(dismissal) {
   label.replaceChildren(document.createTextNode("Undo "), named);
 }
 
-/** How many the backlog control is about to clear, so it can say so before it does it. */
-// Kept per column: `listState().backlog` (`freshListState`, `#624 voice-page-modularity`).
+// How many the backlog control is about to clear, so it can say so before it does it. Kept per column: `listState().backlog` (`freshListState`, `#624 voice-page-modularity`).
 
 function renderTodoControls() {
   // The read mode, said by the button in its word, its icon and its pressed state. `#221
@@ -47146,8 +47136,9 @@ let columnsRestoring = false;
 const sideThreads = new Map();
 
 /**
- * Everything the page keeps about the view a column shows, as `[get, set, fresh]`: saved and loaded
- * by `useColumn`, and `fresh()` what the right column starts with. The channel's store, the reads on
+ * What the page keeps about the view a column shows that is not yet a record on the column (the field
+ * groups that are: `ColumnFields`), as `[get, set, fresh]`: saved and loaded by `useColumn`, and
+ * `fresh()` what the right column starts with. The channel's store, the reads on
  * the wire, the read mode, the filters' settings, pins, summaries and the outbox are the channel's
  * and the page's, shared by both columns, and are not here.
  *
