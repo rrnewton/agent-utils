@@ -129,20 +129,23 @@ const COLUMN_IDS = {
  * `fromCards` says the thread the right column shows was entered from its card, so that ← goes back
  * out to the cards (`#277 thread-card-focus`, `enterCard`).
  *
- * `older` and `arrows` are the column's own records of its older pages (`freshOlderPages`, `olderPages`)
- * and its reply arrows (`freshReplyArrows`, `replyArrows`; `#624 voice-page-modularity`, plan step
- * 15): field groups kept on the column rather than in `state`.
+ * `older`, `arrows` and `load` are the column's own records of its older pages (`freshOlderPages`,
+ * `olderPages`), its reply arrows (`freshReplyArrows`, `replyArrows`) and its reads' state
+ * (`freshLoadState`, `loadState`; `#624 voice-page-modularity`, plan step 15): field groups kept on the
+ * column rather than in `state`.
  *
  * @typedef {{matched: number, loaded: number, tally: any, pinned: boolean}} SearchCount
  * @typedef {{name: string, state: unknown[] | null, searched: SearchCount | null,
  *   searchWalk: any, searchNote: {key: string, text: string} | null,
- *   older: ReturnType<typeof freshOlderPages>, arrows: ReturnType<typeof freshReplyArrows>}} ColumnFields
+ *   older: ReturnType<typeof freshOlderPages>, arrows: ReturnType<typeof freshReplyArrows>,
+ *   load: ReturnType<typeof freshLoadState>}} ColumnFields
  * @type {{main: ColumnFields, side: ColumnFields & {mode: "list" | "thread", fromCards: boolean}}}
  */
 const columns = {
-  main: { name: "main", state: null, searched: null, searchWalk: null, searchNote: null, older: freshOlderPages(), arrows: freshReplyArrows() },
+  main: { name: "main", state: null, searched: null, searchWalk: null, searchNote: null, older: freshOlderPages(), arrows: freshReplyArrows(),
+    load: freshLoadState() },
   side: { name: "side", state: null, searched: null, searchWalk: null, searchNote: null, mode: "list", fromCards: false,
-    older: freshOlderPages(), arrows: freshReplyArrows() },
+    older: freshOlderPages(), arrows: freshReplyArrows(), load: freshLoadState() },
 };
 /** The column the code is working on now. The left one, except inside `inColumn`. */
 let activeColumn = columns.main;
@@ -23277,19 +23280,36 @@ const MESSAGE_CACHE_SCOPES = 12;
 const MESSAGE_CACHE_CHARS = 600000;
 
 /**
+ * A column's own record of its reads' state (`#624 voice-page-modularity`, plan step 15, as
+ * `freshOlderPages`): `freshness` and `freshAt` and `refreshing` below; `lineTimer`, the loading line's
+ * timer (`renderChannelLoading`); `generation`, bumped by each read the column starts, so a completed
+ * read can tell whether it still describes the column (`currentDiscordLoad`).
+ *
+ * @returns {{freshness: string, freshAt: number, refreshing: boolean, lineTimer: any, generation: number}}
+ */
+function freshLoadState() {
+  return { freshness: "fresh", freshAt: 0, refreshing: false, lineTimer: null, generation: 0 };
+}
+
+/** The column being worked on's record of its reads' state (`freshLoadState`). */
+function loadState() {
+  return activeColumn.load;
+}
+
+/**
  * How the channel rows on screen relate to the server: "fresh" from a read in this page, "saved"
  * from the device and not yet refreshed, or "offline"/"failed" when the refresh did not succeed —
  * "slow" when it failed because the chat service did not answer in time.
  */
-let channelFreshness = "fresh";
+// Kept per column: `loadState().freshness` (`freshLoadState`, `#624 voice-page-modularity`).
 /** When the rows on screen were last known to be current, or 0 when there are none. */
-let channelFreshAt = 0;
+// Kept per column: `loadState().freshAt` (`freshLoadState`, `#624 voice-page-modularity`).
 /**
  * Whether a read of the channel is on the wire, which the freshness pill says ("· refreshing…").
  * Its own state rather than read off the loading line: a read behind rows a view switch has already
  * drawn shows no loading line. `#220 view-switch-instant`.
  */
-let channelRefreshing = false;
+// Kept per column: `loadState().refreshing` (`freshLoadState`, `#624 voice-page-modularity`).
 /** Whether `/client-config` has answered in this page, as opposed to the saved shell standing in. */
 let clientConfigApplied = false;
 /** The fingerprint of the token the channel rows on screen were read or drawn for. */
@@ -23797,7 +23817,7 @@ function drawProjection() {
     return false;
   }
   discordNewestId = timelineMessages.length > 0 ? String(timelineMessages[timelineMessages.length - 1].id) : null;
-  channelFreshAt = cover.at;
+  loadState().freshAt = cover.at;
   delete cover.landedHidden;
   setChannelFreshness(cover.live ? "fresh" : "saved");
   // Main drawn from All's cover, read in this page: older history is known to exist, and the step
@@ -23887,7 +23907,7 @@ function drawHeldRows(rows, freshAt, freshness) {
     return false;
   }
   discordNewestId = timelineMessages.length > 0 ? String(timelineMessages[timelineMessages.length - 1].id) : null;
-  channelFreshAt = freshAt;
+  loadState().freshAt = freshAt;
   setChannelFreshness(freshness);
   renderOutgoingMessages();
   return true;
@@ -23920,7 +23940,7 @@ function saveChannelScope() {
     const shown = new Set(messages.map((message) => String(message.id)));
     entry = {
       mode: "page",
-      savedAt: channelFreshAt || now,
+      savedAt: loadState().freshAt || now,
       usedAt: now,
       messages,
       threads: [],
@@ -23976,7 +23996,7 @@ function hydrateChannelScope() {
   }
   const rows = entry.messages;
   discordNewestId = rows.length > 0 ? String(rows[rows.length - 1].id) : null;
-  channelFreshAt = entry.savedAt;
+  loadState().freshAt = entry.savedAt;
   setChannelFreshness("saved");
   renderOutgoingMessages();
   return true;
@@ -24016,7 +24036,7 @@ function hydrateFromCache() {
 function clearChannelScreen() {
   // From the left column, whichever column's read found the credential refused. `#229`.
   if (sideActive) return inColumn(columns.main, clearChannelScreen);
-  ++discordLoadGeneration;
+  ++loadState().generation;
   stopReading();
   readingMode = false;
   channelContexts.clear();
@@ -24041,7 +24061,7 @@ function clearChannelScreen() {
   bookmarkDrawn.side = null;
   el("pinned-log").replaceChildren();
   renderOlderControl();
-  channelFreshAt = 0;
+  loadState().freshAt = 0;
   setChannelFreshness("fresh");
   screenIdentity = tokenFingerprint(token());
   // `#229 desktop-two-column`. What the right column read goes with the rest, and the threads selected
@@ -24096,7 +24116,7 @@ function noteChannelReadFailure(error) {
     return;
   }
   // With nothing on screen the error itself is the whole report.
-  if (channelFreshAt) {
+  if (loadState().freshAt) {
     setChannelFreshness(error && error.network ? "offline" : isSlowFailure(error) ? "slow" : "failed");
     // `#195 send-resilience`. Said, over the rows it is about: a refresh nobody asked for needs no
     // banner on top of it. See `refreshQuietly`.
@@ -24105,7 +24125,7 @@ function noteChannelReadFailure(error) {
 }
 
 function setChannelFreshness(state) {
-  channelFreshness = state;
+  loadState().freshness = state;
   renderChannelFreshness();
 }
 
@@ -24124,17 +24144,17 @@ function renderChannelFreshness() {
   }
   const pill = el("channel-freshness");
   const gesture = el("pull-refresh");
-  const at = stamp(channelFreshAt);
-  const refreshing = channelRefreshing;
+  const at = stamp(loadState().freshAt);
+  const refreshing = loadState().refreshing;
   // CURRENT IS SAID TOO, not left blank: a blank pill reads the same as a page that never managed
   // to refresh, which is what a reader opening the app in the car could not tell apart.
-  const current = channelFreshAt
+  const current = loadState().freshAt
     ? `${liveAttached && liveDelivery !== "off" ? "Live · updated" : "Updated"} ${at}` +
       (refreshing ? " · refreshing…" : "")
     : "";
-  const text = staleWords(channelFreshness, channelFreshAt, refreshing) || current;
+  const text = staleWords(loadState().freshness, loadState().freshAt, refreshing) || current;
   pill.textContent = text;
-  pill.setAttribute("data-state", channelFreshness);
+  pill.setAttribute("data-state", loadState().freshness);
   // It gives way to a pull at the TOP, which draws in the same place (a pull up at the foot leaves
   // "Offline" or "Refresh failed" standing, `#188 pull-refresh-bottom`), and — since `#197
   // floating-search` put the search glass on the same line — to the open search bar, which grows
@@ -24183,11 +24203,11 @@ function renderSideFreshness() {
   let text = "";
   if (columnsShown && columns.side.mode === "thread") {
     [state, text] = inColumn(columns.side, () =>
-      [channelFreshness, staleWords(channelFreshness, channelFreshAt, channelRefreshing)]);
+      [loadState().freshness, staleWords(loadState().freshness, loadState().freshAt, loadState().refreshing)]);
   } else if (sideColumnUp()) {
     const channel = String(selectedChannelId());
     state = threadListFailures.get(channel) || "fresh";
-    const at = threadListLandedAt.get(channel) || inColumn(columns.main, () => channelFreshAt);
+    const at = threadListLandedAt.get(channel) || inColumn(columns.main, () => loadState().freshAt);
     // With no time to give, the state alone, rather than a time nothing was read at.
     text = state === "fresh" ? "" : at ? staleWords(state, at, false, "threads")
       : state === "offline" ? "Offline" : "Refresh failed";
@@ -24776,7 +24796,7 @@ function payReopenRead() {
     if (currentView !== "discord" || replayLedger.started() !== owed.after) return;
     // Merged into the rows the snapshot drew, keeping the reader's message, as a channel change
     // does; with nothing drawn it is a first visit and settles on the newest.
-    readEnteredChannel(channelFreshAt > 0);
+    readEnteredChannel(loadState().freshAt > 0);
   };
   if (threadingSupported) whenLiveAttached(pay);
   else pay();
@@ -25457,8 +25477,8 @@ function rememberChannelContext() {
     newest: discordNewestId,
     position: captureScroll(),
     top: el("scroll-area").scrollTop,
-    freshness: channelFreshness,
-    freshAt: channelFreshAt,
+    freshness: loadState().freshness,
+    freshAt: loadState().freshAt,
     dismissed: archivedIds,
     // `#221 read-modes`. The read mode its rows were drawn under, so a mode chosen elsewhere since
     // redraws them on the way back rather than showing what the old mode left.
@@ -25598,7 +25618,7 @@ async function changeChannelView(view, threadId = null, summary = null, origin =
   // reader of the left column was before it (`before`, `leftColumnPlace`).
   const place = before && !sideActive ? before : readerPlace();
   const from = channelView;
-  const came = { freshAt: channelFreshAt, freshness: channelFreshness };
+  const came = { freshAt: loadState().freshAt, freshness: loadState().freshness };
   // `#206 pin-message`. Choosing a view is asking to see it, and the Pinned filter shows the same
   // pins in every view — so it steps aside, as it must for a pin opened in its thread. Placed by the
   // switch's own rules, not as a filter change (`#243 filter-keeps-selection`).
@@ -25626,7 +25646,7 @@ async function changeChannelView(view, threadId = null, summary = null, origin =
   // rows it was made on, at the scroll position it left, and must not hold the reader there again.
   entryLanding = null;
   if (view === "thread") openedReadRuns.delete(viewKey());
-  ++discordLoadGeneration;
+  ++loadState().generation;
   stopReading();
   readingMode = false;
   const held = channelContexts.get(channelContextKey());
@@ -25676,8 +25696,8 @@ async function changeChannelView(view, threadId = null, summary = null, origin =
     el("channel-summary").replaceChildren(...(held ? held.seam : []));
   }
   el("timeline-notice").hidden = true;
-  channelFreshAt = held ? held.freshAt : 0;
-  channelFreshness = held ? held.freshness : "fresh";
+  loadState().freshAt = held ? held.freshAt : 0;
+  loadState().freshness = held ? held.freshness : "fresh";
   if (held) archivedIds = held.dismissed;
   // A read still on the wire is for the view the reader left: no loading line over this one.
   renderChannelLoading(discordFetchInFlight, true);
@@ -25859,8 +25879,8 @@ function catchUpHeldView(words = true) {
   if (cover.landedHidden) {
     // A page read for this view arrived while it was hidden: it is as current as that read.
     delete cover.landedHidden;
-    channelFreshAt = cover.at;
-    channelFreshness = "fresh";
+    loadState().freshAt = cover.at;
+    loadState().freshness = "fresh";
   }
   const threads = channelView === "threads";
   const held = threads ? timelineThreads : timelineMessages;
@@ -25891,7 +25911,7 @@ function catchUpFromAll() {
   if (!threadingSupported || (channelView !== "main" && channelView !== "thread") ||
       channelStore.current().channel !== String(selectedChannelId()) || !channelStore.current().views.has(viewKey())) return;
   if (inheritAllCover(channelView, selectedThreadId, selectedThread)) {
-    channelFreshAt = channelStore.current().views.get(viewKey()).at;
+    loadState().freshAt = channelStore.current().views.get(viewKey()).at;
     setChannelFreshness("fresh");
     // Saved, now live: older history is known to exist, and the step back to it is Main's read.
     if (walkCursorOwed()) {
@@ -26807,15 +26827,15 @@ function threadCard(summary, tally) {
  */
 function renderChannelLoading(loading, quiet = false, delayed = false) {
   const indicator = el("channel-loading");
-  channelRefreshing = loading;
-  if (loadingLineTimer !== null) {
-    clearTimeout(loadingLineTimer);
-    loadingLineTimer = null;
+  loadState().refreshing = loading;
+  if (loadState().lineTimer !== null) {
+    clearTimeout(loadState().lineTimer);
+    loadState().lineTimer = null;
   }
   if (loading && delayed && !quiet && indicator.hidden) {
-    loadingLineTimer = setTimeout(() => {
-      loadingLineTimer = null;
-      if (channelRefreshing) indicator.hidden = false;
+    loadState().lineTimer = setTimeout(() => {
+      loadState().lineTimer = null;
+      if (loadState().refreshing) indicator.hidden = false;
     }, LOADING_LINE_DELAY_MS);
   } else {
     indicator.hidden = !loading || quiet;
@@ -26833,7 +26853,7 @@ function renderChannelLoading(loading, quiet = false, delayed = false) {
 /** How long a refresh nobody asked for may be out before its loading line shows: one second. `#226`. */
 const LOADING_LINE_DELAY_MS = 1000;
 /** The timer that shows that line, or null. */
-let loadingLineTimer = null;
+// Kept per column: `loadState().lineTimer` (`freshLoadState`, `#624 voice-page-modularity`).
 
 /**
  * Whether a read was asked for by nothing the reader did — the poll, a live message, coming back to
@@ -28169,14 +28189,14 @@ const standInRetries = createStandInRetries();
  */
 function noteFreshRead(payload) {
   const asOf = staleAsOf(payload);
-  channelFreshAt = asOf === null ? Date.now() : asOf;
+  loadState().freshAt = asOf === null ? Date.now() : asOf;
   const failed = refreshFailed(payload);
   const retryWanted = standInRetries.noteRead(failed);
   // A poll already armed comes forward; one armed after this read takes it up as it is armed.
   if (failed && retryWanted && discordPollTimer !== null) {
     scheduleDiscordPoll(Math.max(0, discordPollDueAt - Date.now()));
   }
-  const old = Date.now() - channelFreshAt > STALE_AS_OF_MS;
+  const old = Date.now() - loadState().freshAt > STALE_AS_OF_MS;
   setChannelFreshness(failed ? (old ? "failed" : "fresh") : asOf === null ? "fresh" : "slow");
   // `#206 pin-message`. Every landed read, delta included, says what revision the pins are at.
   notePinsRevision(payload.pins_revision);
@@ -28213,7 +28233,7 @@ async function loadTimeline(options) {
   // `remote-ops-audit` W7. No poll while a read of this view the page gave up on may still be running at
   // the server. Every other read goes.
   if (readHeld(readHoldKey(), options)) return;
-  const generation = ++discordLoadGeneration;
+  const generation = ++loadState().generation;
   // `#229 desktop-two-column`. The column this read is for: its work after every wait is done there.
   const steps = columnSteps();
   const context = channelContextKey();
@@ -28250,7 +28270,7 @@ async function loadTimeline(options) {
   const sameStore = () => canon === channelStore.current() && canon.channel === channel &&
     String(selectedChannelId()) === channel;
   const stillCurrent = () =>
-    inColumn(steps.column, () => generation === discordLoadGeneration && context === channelContextKey());
+    inColumn(steps.column, () => generation === loadState().generation && context === channelContextKey());
   // `#220 view-switch-instant`. Rows a switch drew from the store for a view no page has covered,
   // read behind them (`drawHeldRows`): the newest page replaces them, and the message the reader is
   // on may be older than that page reaches.
@@ -28325,7 +28345,7 @@ async function loadTimeline(options) {
         }
         throw error;
       }
-      const current = generation === discordLoadGeneration && context === channelContextKey();
+      const current = generation === loadState().generation && context === channelContextKey();
       // Folded by what ARRIVED, never by what was asked: a bridge that ignored `after` answers
       // with the newest page it is, and that is folded as one.
       if (sent && payload.delta) {
@@ -28411,7 +28431,7 @@ async function loadTimeline(options) {
       // the reader has, and the refresh MERGES into them rather than replacing them with one page.
       // Not for a page the server answered from its own copy (`#611 timeline-read-failures`): what is
       // on screen stands, as it does when a read fails.
-      if (!keepPosition && channelFreshness === "fresh" && !refreshFailed(payload)) {
+      if (!keepPosition && loadState().freshness === "fresh" && !refreshFailed(payload)) {
         // An explicit refresh starts a fresh provider snapshot. Retaining old pages here would
         // retain their expiring cursor forever, even though the newest request made a new one.
         timelineMessages = [];
@@ -28444,7 +28464,7 @@ async function loadTimeline(options) {
       return;
     }
   } catch (error) {
-    if (generation === discordLoadGeneration && context === channelContextKey()) {
+    if (generation === loadState().generation && context === channelContextKey()) {
       // A landing left to this read is not paid by a later one: that finds a reader who has been
       // reading the rows the failure left up. `#221 read-modes`.
       if (threadEntryAwaitsRead) threadEntryOwed = null;
@@ -28575,7 +28595,7 @@ async function loadOlderTimeline(signal) {
   // `#229 desktop-two-column`. The column this step is for, which its work after the wait is done in.
   const steps = columnSteps();
   const context = channelContextKey();
-  const generation = discordLoadGeneration;
+  const generation = loadState().generation;
   olderPages().inFlight = true;
   renderOlderControl();
   try {
@@ -28587,7 +28607,7 @@ async function loadOlderTimeline(signal) {
     } finally {
       steps.resume();
     }
-    if (context !== channelContextKey() || generation !== discordLoadGeneration) return;
+    if (context !== channelContextKey() || generation !== loadState().generation) return;
     olderPages().inFlight = false;
     preservingScroll(() => {
       applyTimelinePage(payload, true);
@@ -28603,7 +28623,7 @@ async function loadOlderTimeline(signal) {
   } catch (error) {
     // Stopped by the walk that asked for it: no failure, and nothing to draw. `#262 search-load-older`.
     if (signal && signal.aborted) return;
-    if (generation !== discordLoadGeneration || context !== channelContextKey()) return;
+    if (generation !== loadState().generation || context !== channelContextKey()) return;
     if (/cursor.*expired|snapshot.*expired/i.test(error.detail || error.message)) {
       olderPages().inFlight = false;
       olderPages().cursor = null;
@@ -41166,7 +41186,7 @@ async function loadOlderPage(signal) {
     return;
   }
   const channel = selectedChannelId();
-  const generation = discordLoadGeneration;
+  const generation = loadState().generation;
   if (!channel) {
     return;
   }
@@ -41186,7 +41206,7 @@ async function loadOlderPage(signal) {
       if (signal && signal.aborted) return;
       throw error;
     }
-    if (generation !== discordLoadGeneration || channel !== selectedChannelId()) return;
+    if (generation !== loadState().generation || channel !== selectedChannelId()) return;
     // `#427 server-thread-hues`: the step back's colours, before its rows are built.
     noteServerThreadHuesIn(payload.messages || [], [], String(channel));
     observeOutgoingMessages(payload.messages || []);
@@ -41688,9 +41708,9 @@ function showPullResult(threw, asked) {
   // the one already in flight that it waited on — but CURRENT only for a read that landed since
   // the release. A read that was superseded and never landed leaves the stamp from an older one.
   // Current wins over a throw: a read queued behind a failed one can still land for this view.
-  const current = channelFreshness === "fresh" && channelFreshAt >= asked.at;
+  const current = loadState().freshness === "fresh" && loadState().freshAt >= asked.at;
   const failed = !current &&
-    (threw || channelFreshness === "offline" || channelFreshness === "failed");
+    (threw || loadState().freshness === "offline" || loadState().freshness === "failed");
   if (!failed && !current) {
     renderPull(null);
     return;
@@ -41698,7 +41718,7 @@ function showPullResult(threw, asked) {
   const arrived = discordNewestId !== null && discordNewestId !== asked.newest;
   const label = failed
     ? PULL_LABELS.failed
-    : `Updated ${stamp(channelFreshAt)} · ${arrived ? "new messages" : "nothing new"}`;
+    : `Updated ${stamp(loadState().freshAt)} · ${arrived ? "new messages" : "nothing new"}`;
   renderPull(failed ? "failed" : "done", { edge: "end", travel: PULL_ARM_PX, label });
   pullResultTimer = setTimeout(() => {
     pullResultTimer = null;
@@ -41926,7 +41946,7 @@ async function loadDiscord(options) {
   // `remote-ops-audit` W7. As for a timeline read (`loadTimeline`).
   const holdKey = readHoldKey();
   if (readHeld(holdKey, options)) return;
-  const generation = ++discordLoadGeneration;
+  const generation = ++loadState().generation;
   const keepPosition = Boolean(options && options.keepPosition);
   const channel = selectedChannelId();
   if (!channel) {
@@ -41994,7 +42014,7 @@ function drawChannelPage(payload, area, at) {
   // What is drawn: an empty message the reader hides is not news at the foot (`#386 hide-empty-messages`).
   const messages = (payload.messages || []).filter((message) => !hiddenEmpty(message));
   settleAfterRead(messages, { area, ...at });
-  channelFreshAt = Date.now();
+  loadState().freshAt = Date.now();
   setChannelFreshness("fresh");
   notePinsRevision(payload.pins_revision);
   noteBookmark(payload);
@@ -42722,7 +42742,7 @@ function armBacklog() {
  */
 async function loadTodo(options) {
   if (threadingSupported) return loadTimeline(options);
-  const generation = ++discordLoadGeneration;
+  const generation = ++loadState().generation;
   const keepPosition = Boolean(options && options.keepPosition);
   const channel = selectedChannelId();
   if (!channel) {
@@ -47065,11 +47085,6 @@ const COLUMN_STATE = [
   [() => timelineMessages, (value) => { timelineMessages = value; }, () => []],
   [() => timelineThreads, (value) => { timelineThreads = value; }, () => []],
   [() => activeComposerKey, (value) => { activeComposerKey = value; }, () => ""],
-  [() => channelFreshness, (value) => { channelFreshness = value; }, () => "fresh"],
-  [() => channelFreshAt, (value) => { channelFreshAt = value; }, () => 0],
-  [() => channelRefreshing, (value) => { channelRefreshing = value; }, () => false],
-  [() => loadingLineTimer, (value) => { loadingLineTimer = value; }, () => null],
-  [() => discordLoadGeneration, (value) => { discordLoadGeneration = value; }, () => 0],
   [() => threadEntryOwed, (value) => { threadEntryOwed = value; }, () => null],
   [() => threadEntryAwaitsRead, (value) => { threadEntryAwaitsRead = value; }, () => false],
   [() => entryReadOwed, (value) => { entryReadOwed = value; }, () => null],
@@ -50798,7 +50813,7 @@ function closeSideThread() {
       putRepliesBack();
       rememberChannelDraft();
       rememberChannelContext();
-      ++discordLoadGeneration;
+      ++loadState().generation;
     });
   }
   showSideList();
@@ -50825,13 +50840,14 @@ function resetSideColumn(reopen = false) {
     dropReplyArrowTap();
     gathered = null;
     rowsGathered = false;
-    ++discordLoadGeneration;
+    ++loadState().generation;
   });
   columns.side.state = null;
   // Its own records start again as its swapped fields do: only while it is not the column worked on.
   if (activeColumn !== columns.side) {
     columns.side.older = freshOlderPages();
     columns.side.arrows = freshReplyArrows();
+    columns.side.load = freshLoadState();
   }
   for (const id of ["side-log", "side-thread-list", "side-summary", "side-pinned-log", "side-outgoing-log"]) {
     leftEl(id).replaceChildren();
@@ -51753,7 +51769,7 @@ function abandonedReadStands(read) {
     return read.canon === channelStore.current() && channelStore.current().channel === read.channel &&
       read.number === readOrder.asked();
   }
-  return read.generation === discordLoadGeneration && !todoMode;
+  return read.generation === loadState().generation && !todoMode;
 }
 
 /**
@@ -51804,7 +51820,7 @@ let timelineReadContext = null;
 // Every requested replacement gets a generation, including one that arrives while another request
 // is in flight. Only the newest generation may draw. The newest blocked request is queued so a
 // channel switch cannot be swallowed by a refresh of the channel the reader just left.
-let discordLoadGeneration = 0;
+// Kept per column: `loadState().generation` (`freshLoadState`, `#624 voice-page-modularity`).
 /**
  * The read queued behind the one on the wire, by the column it is for: one each, so a read of the
  * thread on the right never stands in for a refresh of Main or the other way round. `#229`.
@@ -51876,7 +51892,7 @@ async function finishDiscordLoad(column = activeColumn) {
 /** Whether a completed read still describes the channel and mode currently selected. */
 function currentDiscordLoad(generation, channel, readingTodo) {
   return (
-    generation === discordLoadGeneration &&
+    generation === loadState().generation &&
     String(channel) === String(selectedChannelId()) &&
     readingTodo === todoMode
   );
@@ -52908,15 +52924,15 @@ function receiveLiveMessage(message, selfPosted, replayed, fromTail) {
   }
   // A live message for this channel is proof the list is current as of now. Only a list already
   // current moves its stamp: saved or failed rows stay labelled until a read replaces them.
-  if (!replayed && channelFreshness === "fresh" && channelFreshAt) {
-    channelFreshAt = Date.now();
+  if (!replayed && loadState().freshness === "fresh" && loadState().freshAt) {
+    loadState().freshAt = Date.now();
     renderChannelFreshness();
   }
   if (!threadingSupported && discordFetchInFlight) {
     // This event is newer evidence than a read already on the wire. Invalidate that snapshot
     // even when the event's ID is already visible from a POST acknowledgement; otherwise it
     // could erase the row after this event retired its durable send receipt.
-    ++discordLoadGeneration;
+    ++loadState().generation;
     if (!discordQueuedLoads.has(columns.main)) queueDiscordLoad({ keepPosition: true, readAs: "live" });
   }
   if (threadingSupported) {
@@ -56233,7 +56249,7 @@ async function signIn() {
     showError(`Signed in, but vibe-talk did not answer: ${error.message}`);
     showScreen("main");
     // Saved rows stay up, and say they are saved rather than current.
-    if (channelFreshAt) setChannelFreshness(error.network ? "offline" : "failed");
+    if (loadState().freshAt) setChannelFreshness(error.network ? "offline" : "failed");
     // The token was not refused, and no stream will attach until `/client-config` answers: the
     // reopen's read goes now, and the poll it arms is what asks again. `#189 restore-ui-state`.
     payReopenRead();
@@ -57880,8 +57896,8 @@ function changeSelectedChannel() {
   // is the most confident possible way of being wrong.
   el("channel-summary").replaceChildren();
   renderOlderControl();
-  channelFreshAt = 0;
-  channelFreshness = "fresh";
+  loadState().freshAt = 0;
+  loadState().freshness = "fresh";
   // `#18 offline-message-cache`. The new channel as this device last saw it, until the read below
   // answers — which then merges into those rows rather than replacing them.
   const saved = hydrateChannelScope();

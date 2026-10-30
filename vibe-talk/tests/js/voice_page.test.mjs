@@ -7197,7 +7197,7 @@ test("`#624 voice-page-modularity`: a read asked for while another is out joins 
   assert.deepStrictEqual([started, generation.current()], [0, 1]);
 });
 
-test("`#624 voice-page-modularity`: each column keeps its own records of its older pages and reply arrows, reached through the column worked on", () => {
+test("`#624 voice-page-modularity`: each column keeps its own records of its older pages, reply arrows and reads, reached through the column worked on", () => {
   const page = newPage();
   const same = (expression) => page.pure(expression);
   assert.equal(same("olderPages() === columns.main.older"), true, "the left column's record was not the one worked on");
@@ -7216,6 +7216,13 @@ test("`#624 voice-page-modularity`: each column keeps its own records of its old
   assert.deepStrictEqual(JSON.parse(same("JSON.stringify([columns.side.arrows.held, replyArrows().held])")), [1, 0]);
   assert.deepStrictEqual(JSON.parse(same("JSON.stringify(freshReplyArrows())")),
     { back: null, landed: null, tap: null, settling: null, held: 0, owed: false, countsDrawn: false });
+  // And its reads' state.
+  assert.equal(same("inColumn(columns.side, () => loadState()) === columns.side.load && loadState() === columns.main.load"), true);
+  same("inColumn(columns.side, () => { ++loadState().generation; loadState().freshness = 'slow'; })");
+  assert.deepStrictEqual(JSON.parse(same("JSON.stringify([columns.side.load.generation, columns.side.load.freshness, loadState().freshness])")),
+    [1, "slow", "fresh"]);
+  assert.deepStrictEqual(JSON.parse(same("JSON.stringify(freshLoadState())")),
+    { freshness: "fresh", freshAt: 0, refreshing: false, lineTimer: null, generation: 0 });
 });
 
 test("`#624 voice-page-modularity`: the live events counted per channel, from the module alone", () => {
