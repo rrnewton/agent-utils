@@ -504,7 +504,7 @@ link to `.agents/skills/` if it has one, and commit the harness. For each tool, 
   (`common/docs/gh-paced/QUICKSTART.md`), then put it in front of the real `gh` for agents. To
   have every agent act as one GitHub account, link `agent-utils/rs/gh-paced/gh-team` as
   `$H/bin/gh` and export `GH_PACED_ACCOUNT` in the team env file (see 5.5 `launch_env`).
-- **minibeads**: needs `cargo`. `git -C agent-utils submodule update --init --checkout ext/minibeads`, then
+- **minibeads**: needs `cargo`. `git -C agent-utils submodule update --init ext/minibeads`, then
   `cargo install --path agent-utils/ext/minibeads --bin mb` (or `cargo install minibeads --version '^0.29'`), and
   `mb init` in the primary checkout if it has no `.minibeads/` yet. Record in the harness
   `AGENTS.md` that dispatched tasks are filed and claimed there and closed by the worker that

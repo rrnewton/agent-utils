@@ -75,11 +75,11 @@ repository uses, but nothing requires it: a design for driving any tracker CLI
 (minibeads, upstream beads, GitHub Issues, Gas Town, and others) through one
 JSON adapter format is
 [under review](ai_docs/transient/2026-10-28-task-tracker-adapters/README.md).
-To build `mb` from the submodule: `git submodule update --init --checkout ext/minibeads`,
-then `cargo install --path ext/minibeads --bin mb` (or
-`cargo install minibeads --version '^0.29'` from crates.io). The submodule is
-marked `update = none`, so a recursive update, here or in a project that embeds
-agent-utils, skips it; `--checkout` fetches it only on request.
+minibeads is an ordinary submodule: `git clone --recurse-submodules` fetches it, and in an
+existing clone `git submodule update --init ext/minibeads` does. A plain `git clone` leaves it
+empty, and nothing else needs it. Then build `mb` with
+`cargo install --path ext/minibeads --bin mb` (or `cargo install minibeads --version '^0.29'`
+from crates.io).
 
 The core tools are always set up; the optional ones are offered during setup
 and can be added later by asking the coordinator. Each tool has a skill under

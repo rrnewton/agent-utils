@@ -1,4 +1,3 @@
 [submodule "ext/minibeads"]
 	path = ext/minibeads
 	url = https://github.com/rrnewton/minibeads
-	update = none

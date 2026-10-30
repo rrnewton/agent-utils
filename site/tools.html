@@ -614,7 +614,7 @@
 <dt>What you get</dt>
 <dd>Issues with priorities, labels, comments and dependencies; <code>mb ready</code> for the unblocked work and <code>mb blocked</code> for the rest; an atomic claim with a lease, so a task is marked in progress for the agent working on it; JSON output for scripts; a sync to GitHub Issues for the few tasks that also belong there. Its command set follows upstream beads (<code>bd</code>), which it began as a lighter replacement for.</dd>
 <dt>Needs</dt>
-<dd>A Rust toolchain to build it (<code>git submodule update --init --checkout ext/minibeads</code>, then <code>cargo install --path ext/minibeads --bin mb</code>), or <code>cargo install minibeads --version '^0.29'</code> from crates.io. Nothing else: no database and no service.</dd>
+<dd>A Rust toolchain to build it (<code>git submodule update --init ext/minibeads</code>, then <code>cargo install --path ext/minibeads --bin mb</code>), or <code>cargo install minibeads --version '^0.29'</code> from crates.io. Nothing else: no database and no service.</dd>
 <dt>Use it when</dt>
 <dd>You want the suite's two-tier convention: GitHub Issues for serious bugs and outside reports, a local tracker for the dispatch queue.</dd>
 <dt>Status</dt>
