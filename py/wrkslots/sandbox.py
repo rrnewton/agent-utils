@@ -678,6 +678,8 @@ class SlicePlacement:
     slot: str
 
     def to_obj(self) -> dict[str, str | None]:
+        """The JSON form ``run --place-only --format json`` prints and ``--expect-slices`` takes."""
+
         return {"enclosing": self.enclosing, "all_slots": self.all_slots, "slot": self.slot}
 
 
