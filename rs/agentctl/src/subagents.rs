@@ -3447,6 +3447,10 @@ fn input_occurrences(screen: &str, text: &str) -> usize {
         .sum()
 }
 
+/// The key, never a pane ID, under which a read-back baseline keeps how often the prompt
+/// showed where typed input lands in the target itself (#704 misroute-shared-text).
+const TARGET_INPUT: &str = "\0target-input";
+
 /// The read-back state of `pane` that shows the text `count` times now, against the counts
 /// `before` sending: see `WorkspaceClient::observe`.
 fn state_of(count: usize, pane: &str, before: &BTreeMap<String, usize>) -> &'static str {
@@ -3475,16 +3479,25 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         let reads = self.client.read_scrollbacks(&panes);
         let mut windows = BTreeMap::new();
         for (pane, read) in panes.into_iter().zip(reads) {
-            // Another agent's pane counts the prompt only where typed input lands in it.
+            // Another agent's pane counts the prompt only where typed input lands in it. The
+            // target is counted both ways: anywhere, and where typed input lands, which
+            // decides attribution when another pane shows the same text (#704
+            // misroute-shared-text).
             let count = |screen: String| {
                 if pane == pane_id {
-                    occurrences(&screen, text)
+                    (
+                        occurrences(&screen, text),
+                        Some(input_occurrences(&screen, text)),
+                    )
                 } else {
-                    input_occurrences(&screen, text)
+                    (input_occurrences(&screen, text), None)
                 }
             };
             match read.map(count) {
-                Ok(window) => {
+                Ok((window, target_input)) => {
+                    if let Some(target_input) = target_input {
+                        windows.insert(TARGET_INPUT.to_owned(), target_input);
+                    }
                     windows.insert(pane, window);
                 }
                 Err(error) => match missing_target(&error).filter(|_| pane != pane_id) {
@@ -3561,7 +3574,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         let deadline = runtime.monotonic() + self.readback_limit();
         let peers: Vec<String> = before
             .keys()
-            .filter(|peer| peer.as_str() != pane_id)
+            .filter(|peer| peer.as_str() != pane_id && peer.as_str() != TARGET_INPUT)
             .cloned()
             .collect();
         // The first look at every peer is made at once where the client can.
@@ -3637,9 +3650,10 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
     /// newly in its scrollback within the read-back limit ([`READBACK`], or the working timeout
     /// for a start brief). Every other registered agent's pane is
     /// inspected as well. The prompt newly in exactly one of them, and not in the target, is
-    /// countermanded there. Newly in the target and a peer, in several peers, or a peer whose
-    /// last occurrence moved nearer the end without a new one, cannot be told apart: the
-    /// message is quarantined without a note. A verified submission that the target never
+    /// countermanded there. A target that printed the prompt, or newly shows it where typed
+    /// input lands, received it whatever the peers show (#704 misroute-shared-text). Otherwise
+    /// a prompt in several peers, or a peer whose last occurrence moved nearer the end without
+    /// a new one, cannot be told apart: the message is quarantined without a note. A verified submission that the target never
     /// shows is quarantined too; a native prompt goes on to Herdr's working-state
     /// confirmation, and is logged as not seen.
     fn read_back(
@@ -3685,6 +3699,26 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                 ),
                 runtime,
             ));
+        }
+        // One paste lands in one pane. A target that printed the prompt, or newly shows it
+        // where typed input lands, received it, whatever another pane shows: the same words
+        // sent there too, or still on its screen from earlier, are no evidence against that,
+        // and quarantining a delivered prompt invites a duplicate on retry (#704
+        // misroute-shared-text).
+        let typed_in_target = matches!(submission, Submission::Verified(receipt) if receipt.printed)
+            || (in_target
+                && self.client.read_scrollback(pane_id).is_ok_and(|screen| {
+                    input_occurrences(&screen, text)
+                        > before.get(TARGET_INPUT).copied().unwrap_or(0)
+                }));
+        if typed_in_target && states.values().any(|state| *state != "absent") {
+            self.log_readback(
+                pane_id,
+                text,
+                "attributed",
+                &json!({"in_target": true, "typed_in_target": true, "peers": states}),
+            );
+            return Ok(());
         }
         if states.values().any(|state| *state != "absent") {
             self.log_readback(

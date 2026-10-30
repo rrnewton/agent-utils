@@ -2181,17 +2181,22 @@ else is quarantined under `queue/failed` (exit 76) for the operator, and is
 never retried automatically:
 
 - a check after the write fails, or the prompt newly shows in another
-  registered agent's pane (`"probable_misroute": true`, with the panes involved
-  in the error and in `.agentctl/NAME/misroutes.jsonl`);
-- the prompt newly shows in the target and another pane, or in several panes;
-- another registered agent's pane already showed the prompt and its count did
-  not rise: an old copy may have scrolled out as a new one came in, so a new
-  occurrence cannot be ruled out, whatever the window's length. This fails safe
-  at a cost: a repeated identical prompt, or a broadcast while a peer that
-  already shows the old copy keeps producing output, is quarantined and needs
-  an operator resend. Removing that cost needs causal evidence from Herdr;
+  registered agent's pane and not in the target (`"probable_misroute": true`,
+  with the panes involved in the error and in `.agentctl/NAME/misroutes.jsonl`);
+- the target does not show the prompt where typed input lands, and the prompt
+  newly shows in several other panes, or another registered agent's pane
+  already showed it and its count did not rise (an old copy may have scrolled
+  out as a new one came in, so a new occurrence there cannot be ruled out);
 - the target never shows the prompt (delivery is unproven; recorded in
   `.agentctl/NAME/readback.jsonl`).
+
+One paste lands in one pane, so a target that printed the prompt, or newly
+shows it where typed input lands (its composer or a user turn, not a tool's
+output), received it whatever other panes show: the same words sent there too,
+as a broadcast does, or still on their screens from earlier, are no evidence
+against it. Such a send is delivered and logged as `attributed` in
+`readback.jsonl`; quarantining it would invite a duplicate when someone resent
+it.
 
 Nothing is typed into any other pane. Setting `AGENTCTL_MISROUTE_COUNTERMAND=1`
 enables an experimental countermand instead: Esc and "Ignore the previous

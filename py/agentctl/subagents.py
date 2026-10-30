@@ -1238,6 +1238,10 @@ class _WorkspaceClient:
         #: A longer read-back limit than ``READBACK_SECONDS``, for a just-started harness.
         self.readback_seconds = readback_seconds
 
+    # The key, never a pane ID, under which a read-back baseline keeps how often the prompt
+    # showed where typed input lands in the target itself (#704 misroute-shared-text).
+    _TARGET_INPUT = "\0target-input"
+
     def _snapshot(self, pane_id: str, text: str) -> dict[str, int]:
         """Before sending: how often the prompt shows in the target and, for a prompt long
         enough to attribute, in every other registered agent's pane. Only occurrences beyond these are evidence about this send.
@@ -1254,6 +1258,10 @@ class _WorkspaceClient:
             try:
                 # Another agent's pane counts the prompt only where typed input lands in it.
                 windows[pane] = self._window(pane, text, peer=pane != pane_id)
+                if pane == pane_id:
+                    # The target is also counted where typed input lands, which decides
+                    # attribution when another pane shows the same text (#704).
+                    windows[self._TARGET_INPUT] = self._window(pane, text, peer=True)
             except (HerdrUnavailable, AgentDeliveryError) as exc:
                 missing = _missing_target(exc) if pane != pane_id else None
                 if missing is None:
@@ -1305,7 +1313,7 @@ class _WorkspaceClient:
 
     def _peer_states(self, pane_id: str, text: str, before: dict[str, int]) -> dict[str, str]:
         return {peer: self._observe(peer, text, before, peer=True)
-                for peer in before if peer != pane_id}
+                for peer in before if peer not in (pane_id, self._TARGET_INPUT)}
 
     def _deliver_checked(
         self, pane_id: str, command: str, guarded: _GuardedTerminal,
@@ -1357,9 +1365,11 @@ class _WorkspaceClient:
         or the working timeout for a start brief), each followed by a
         passing recipient check. Every other registered agent's pane is inspected as
         well. The prompt newly in exactly one of them, and not in the target, is a
-        misroute (quarantined; countermanded only when that is enabled). Newly in the
-        target and a peer, in several peers, or a peer whose full window cannot rule
-        out a new occurrence: quarantined without a note. A prompt the target never
+        misroute (quarantined; countermanded only when that is enabled). A target that
+        printed the prompt, or newly shows it where typed input lands, received it whatever
+        the peers show (#704 misroute-shared-text). Otherwise a prompt in several peers, or
+        a peer whose full window cannot rule out a new occurrence: quarantined without a
+        note. A prompt the target never
         shows is unproven and quarantined, whatever confirmed the submission.
         """
         try:
@@ -1378,6 +1388,22 @@ class _WorkspaceClient:
         if len(fresh) == 1 and not in_target:
             self._countermand(fresh[0], text, "prompt-in-another-pane",
                               f"not newly in pane {pane_id} after {self._readback_seconds():g}s")
+        # One paste lands in one pane. A target that printed the prompt, or newly shows it
+        # where typed input lands, received it, whatever another pane shows: the same words
+        # sent there too, or still on its screen from earlier, are no evidence against that,
+        # and quarantining a delivered prompt invites a duplicate on retry (#704
+        # misroute-shared-text).
+        typed_in_target = receipt is not None and receipt.evidence in _PRINTED_EVIDENCE
+        if not typed_in_target and in_target:
+            try:
+                typed_in_target = (self._window(pane_id, text, peer=True)
+                                   > before.get(self._TARGET_INPUT, 0))
+            except (HerdrUnavailable, AgentDeliveryError):
+                typed_in_target = False
+        if typed_in_target and (fresh or uncertain):
+            self._log_readback(pane_id, text, "attributed",
+                               {"in_target": True, "typed_in_target": True, "peers": states})
+            return
         if fresh or uncertain:
             self._log_readback(pane_id, text, "ambiguous", {"in_target": in_target, "peers": states})
             raise ProbableMisroute(

@@ -18,14 +18,10 @@ from agentctl.subagents import ManagedAgents
 
 from .test_herdr_subagents import FakeManagedClient, setup
 
-#: A known, documented limitation of stage 1 (readback-gaps issue, Gap 3): a peer that already
-#: shows the prompt and whose count did not rise cannot exclude a new copy, so the send is
-#: quarantined (fails safe) until Herdr gives causal evidence. These tests keep the delivery
-#: they require; strict, so each fails loudly once it starts passing.
-KNOWN_LIMITATION_GAP3 = pytest.mark.xfail(
-    strict=True, raises=AgentPossiblySubmitted,
-    reason="readback-gaps Gap 3: equal counts in a peer that already shows the prompt quarantine",
-)
+#: Gap 3 of readback-gaps (a peer that already shows the prompt, with a count that did not rise,
+#: quarantined a prompt the target showed) is closed by #704 misroute-shared-text: a target that
+#: newly shows the prompt where typed input lands received it, whatever a peer shows. The tests
+#: that were marked as that known limitation now require the delivery outright.
 
 
 def _started(
@@ -130,7 +126,6 @@ def test_misroute_into_a_shell_types_nothing_more(
     assert _failed_documents(manager, "worker")[0]["probable_misroute"] is True
 
 
-@KNOWN_LIMITATION_GAP3
 def test_prompt_found_in_another_agents_pane_interrupts_that_agent_and_retries(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -711,7 +706,6 @@ def test_countermand_stops_when_the_occupant_changes_after_the_interrupt(
     assert entry["interrupted"] is True and entry["note_sent"] is False
 
 
-@KNOWN_LIMITATION_GAP3
 def test_old_matching_text_in_another_pane_is_not_a_misroute(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -726,7 +720,6 @@ def test_old_matching_text_in_another_pane_is_not_a_misroute(
     assert fake.transcripts[pane][-1] == text
 
 
-@KNOWN_LIMITATION_GAP3
 def test_lost_acknowledgement_after_a_write_elsewhere_is_countermanded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -943,7 +936,7 @@ def test_the_prompt_printed_in_another_agents_tool_output_is_no_misroute(
     assert subagents.MISROUTE_NOTE not in fake.submitted
 
 
-def test_prompt_new_in_target_and_peer_is_quarantined_without_a_note(
+def test_prompt_new_in_target_and_peer_is_attributed_to_the_target(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager, fake, pane = _started(tmp_path, monkeypatch)
@@ -957,8 +950,9 @@ def test_prompt_new_in_target_and_peer_is_quarantined_without_a_note(
         fake.transcripts.setdefault(other, []).append(text)
 
     fake.before_effect = echo_in_peer_too
-    with pytest.raises(AgentPossiblySubmitted, match="cannot be attributed"):
-        manager.send("worker", text)
+    # #704 misroute-shared-text: one paste lands in one pane; the target shows this one where
+    # typed input lands, so it is delivered, with no note anywhere.
+    manager.send("worker", text)
     assert fake.keys_sent == [] and subagents.MISROUTE_NOTE not in fake.submitted
 
 
@@ -1034,7 +1028,6 @@ def test_failed_readback_log_on_an_unverified_accept_quarantines(
         manager.send("worker", "a long enough instruction for the worker only")
 
 
-@KNOWN_LIMITATION_GAP3
 def test_a_peer_that_keeps_working_after_an_old_match_is_not_uncertain(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1054,11 +1047,12 @@ def test_a_peer_that_keeps_working_after_an_old_match_is_not_uncertain(
     assert fake.keys_sent == [] and fake.submitted[-1] == text
 
 
-def test_full_peer_window_with_an_old_match_is_uncertain(
+def test_full_peer_window_with_an_old_match_does_not_block_a_prompt_the_target_shows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # The peer's window is full, so an old match may have scrolled out as a new one came
-    # in: equal counts cannot tell those histories apart, even though the target shows it.
+    # The peer's window is full, so its old match is uncertain. The target newly shows the
+    # prompt where typed input lands, and one paste lands in one pane, so it was delivered
+    # (#704 misroute-shared-text).
     manager, fake, pane = _started(tmp_path, monkeypatch)
     manager.start("bystander", cwd=str(tmp_path), harness="claude")
     other = manager.get("bystander").pane_id or ""
@@ -1066,8 +1060,7 @@ def test_full_peer_window_with_an_old_match_is_uncertain(
     text = "a long enough instruction for the worker only"
     filler = [f"line {index}" for index in range(subagents.SCROLLBACK_LINES)]
     fake.transcripts[other] = [*filler[:-1], text]
-    with pytest.raises(AgentPossiblySubmitted, match="cannot be attributed"):
-        manager.send("worker", text)
+    manager.send("worker", text)
     assert fake.keys_sent == [] and fake.transcripts[pane][-1] == text
 
 

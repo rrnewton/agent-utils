@@ -1129,7 +1129,9 @@ fn a_countermand_needs_the_wrong_panes_input_lock() {
 }
 
 #[test]
-fn a_peer_window_moving_past_an_old_match_is_uncertain() {
+fn a_peer_window_moving_past_an_old_match_does_not_block_a_prompt_the_target_shows() {
+    // #704 misroute-shared-text: the peer's old copy is uncertain, but one paste lands in one
+    // pane and the target newly shows this one where typed input lands, so it was delivered.
     let fixture = Fixture::new();
     fixture.start(None);
     add_bystander(&fixture);
@@ -1141,12 +1143,62 @@ fn a_peer_window_moving_past_an_old_match_is_uncertain() {
         "peer".to_owned(),
         vec!["output after the old match".to_owned(), typed(LONG)],
     ));
+    send(&fixture, "worker", LONG).expect("attributed to the target that shows it");
+    assert!(failed_documents(&fixture, "worker").is_empty());
+    assert!(fixture.client.keys_sent.lock().unwrap().is_empty());
+    assert!(!runs(&fixture).contains(&MISROUTE_NOTE.to_owned()));
+}
+
+#[test]
+fn a_prompt_the_target_never_shows_with_an_uncertain_peer_is_still_quarantined() {
+    // #704 misroute-shared-text: without the target's own evidence an uncertain peer still
+    // makes the prompt unattributable.
+    TEST_READBACK.with(|limit| limit.set(Some(Duration::from_millis(250))));
+    let fixture = Fixture::new();
+    fixture.start(None);
+    add_bystander(&fixture);
+    *fixture.client.print_after.lock().unwrap() = Some(Duration::MAX);
+    fixture
+        .client
+        .scrollback
+        .lock()
+        .unwrap()
+        .insert("peer".to_owned(), vec![typed(LONG)]);
     let error = send(&fixture, "worker", LONG).expect_err("quarantined");
     assert!(
         error.to_string().contains("cannot be attributed"),
         "{error}"
     );
-    assert!(fixture.client.keys_sent.lock().unwrap().is_empty());
+    assert_eq!(failed_documents(&fixture, "worker").len(), 1);
+}
+
+#[test]
+fn a_target_showing_the_prompt_only_in_tool_output_does_not_outweigh_a_peer() {
+    // #704 misroute-shared-text: the target's evidence must be where typed input lands. Words
+    // in a tool's output (a coordinator reading another pane) prove nothing about this paste.
+    TEST_READBACK.with(|limit| limit.set(Some(Duration::from_millis(250))));
+    let fixture = Fixture::new();
+    fixture.start(None);
+    add_bystander(&fixture);
+    *fixture.client.print_after.lock().unwrap() = Some(Duration::MAX);
+    fixture
+        .client
+        .scrollback
+        .lock()
+        .unwrap()
+        .insert("peer".to_owned(), vec![typed(LONG)]);
+    *fixture.client.scrollback_on_effect.lock().unwrap() = Some((
+        "owned".to_owned(),
+        vec![
+            "● Bash(herdr pane read w1:p2)".to_owned(),
+            format!("  ⎿  {LONG}"),
+        ],
+    ));
+    let error = send(&fixture, "worker", LONG).expect_err("quarantined");
+    assert!(
+        error.to_string().contains("cannot be attributed"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -1175,7 +1227,7 @@ reply between the two lines at the end of your turn instead.";
 }
 
 #[test]
-fn a_full_peer_window_with_an_old_match_is_uncertain() {
+fn a_full_peer_window_with_an_old_match_does_not_block_a_prompt_the_target_shows() {
     let fixture = Fixture::new();
     fixture.start(None);
     add_bystander(&fixture);
@@ -1189,16 +1241,13 @@ fn a_full_peer_window_with_an_old_match_is_uncertain() {
         .lock()
         .unwrap()
         .insert("peer".to_owned(), lines);
-    let error = send(&fixture, "worker", LONG).expect_err("quarantined");
-    assert!(
-        error.to_string().contains("cannot be attributed"),
-        "{error}"
-    );
+    send(&fixture, "worker", LONG).expect("attributed to the target that shows it");
+    assert!(failed_documents(&fixture, "worker").is_empty());
     assert!(fixture.client.keys_sent.lock().unwrap().is_empty());
 }
 
 #[test]
-fn a_peer_that_changed_after_an_old_match_is_uncertain() {
+fn a_peer_that_changed_after_an_old_match_does_not_block_a_prompt_the_target_shows() {
     let fixture = Fixture::new();
     fixture.start(None);
     add_bystander(&fixture);
@@ -1215,11 +1264,8 @@ fn a_peer_that_changed_after_an_old_match_is_uncertain() {
             "more output".to_owned(),
         ],
     ));
-    let error = send(&fixture, "worker", LONG).expect_err("quarantined");
-    assert!(
-        error.to_string().contains("cannot be attributed"),
-        "{error}"
-    );
+    send(&fixture, "worker", LONG).expect("attributed to the target that shows it");
+    assert!(failed_documents(&fixture, "worker").is_empty());
     assert!(fixture.client.keys_sent.lock().unwrap().is_empty());
 }
 
@@ -1316,17 +1362,17 @@ fn the_prompt_printed_in_another_agents_tool_output_is_no_misroute() {
 }
 
 #[test]
-fn a_prompt_new_in_target_and_peer_is_quarantined_without_a_note() {
+fn a_prompt_new_in_target_and_peer_is_attributed_to_the_target() {
+    // #704 misroute-shared-text: the same text sent to the peer at the same time (a
+    // broadcast) shows newly there too; one paste lands in one pane, and the target shows
+    // this one where typed input lands, so it is delivered, with no note anywhere.
     let fixture = Fixture::new();
     fixture.start(None);
     add_bystander(&fixture);
     *fixture.client.scrollback_on_effect.lock().unwrap() =
         Some(("peer".to_owned(), vec![typed(LONG)]));
-    let error = send(&fixture, "worker", LONG).expect_err("quarantined");
-    assert!(
-        error.to_string().contains("cannot be attributed"),
-        "{error}"
-    );
+    send(&fixture, "worker", LONG).expect("attributed to the target");
+    assert!(failed_documents(&fixture, "worker").is_empty());
     assert!(fixture.client.keys_sent.lock().unwrap().is_empty());
     assert!(!runs(&fixture).contains(&MISROUTE_NOTE.to_owned()));
 }
@@ -1414,20 +1460,16 @@ fn a_peer_read_failure_that_persists_keeps_the_prompt_unproven() {
 }
 
 #[test]
-fn a_peer_prompt_discovered_after_a_transient_read_failure_is_still_quarantined() {
+fn a_peer_prompt_discovered_after_a_transient_read_failure_does_not_outweigh_the_target() {
     let fixture = Fixture::new();
     fixture.start(None);
     add_bystander(&fixture);
     *fixture.client.scrollback_on_effect.lock().unwrap() =
         Some(("peer".to_owned(), vec![typed(LONG)]));
     *fixture.client.fail_scrollback_after_effect.lock().unwrap() = Some(("peer".to_owned(), 1));
-    let error = send(&fixture, "worker", LONG).expect_err("the peer also shows this prompt");
-    assert!(
-        error.to_string().contains("cannot be attributed"),
-        "{error}"
-    );
+    send(&fixture, "worker", LONG).expect("the target shows it where typed input lands");
     assert_eq!(runs(&fixture), [LONG]);
-    assert_eq!(failed_documents(&fixture, "worker").len(), 1);
+    assert!(failed_documents(&fixture, "worker").is_empty());
     assert!(fixture.client.keys_sent.lock().unwrap().is_empty());
 }
 
