@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-707-c990bede4ec",
+    "issue_id": "agent-utils-707",
+    "author": "cl-chatux",
+    "body": "[opus 5.5] Delivered on main: pieces 1 and 2 (e4a03f3e, f2f4ff15) and piece 3's code (this commit). Prompts are one header line, a <chat_message> block and a short footer; `agentctl chat reply|thread|sent|help ID` find their bridge by caller lookup; bridge state can live at REGISTRY/bridges/NAME (`--bridge NAME`, `chat init --bridge`), and `agentctl chat migrate-state` (dry run unless --apply) moves a state there, leaving a link at the old path.\n\nNot done here, by design: moving each live bridge. That is an operator step after every registry reader is upgraded (a pre-#707 build lists REGISTRY/bridges as an agent with record_error), and it waits for the owner's OK. Unverified: a real `chat run` registering itself and real caller-edge lookup from a harness pane (covered by tests with fakes only).",
+    "created_at": "2026-10-30T18:08:33.977420200Z",
+    "updated_at": "2026-10-30T18:08:33.977420200Z"
+  }
+]

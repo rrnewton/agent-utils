@@ -367,6 +367,30 @@ service log says when sinks are on and when one starts failing.
 
 ## Initialize and run
 
+### Where bridge state lives
+
+A bridge's state belongs to the project it serves, as `.git` does: one
+directory per bridge under the registry, `REGISTRY/bridges/NAME/` (#707
+chat-prompt-anatomy). Every chat command that takes `--bridge-state DIR` also
+takes `--bridge NAME` for that directory, so `agentctl chat init --bridge coord
+--config chat.json` creates `REGISTRY/bridges/coord/` (and `REGISTRY/bridges/`,
+mode 0700). `bridges` is one of the registry's reserved names, like `agents`
+and `locks`. A state directory anywhere else keeps working with
+`--bridge-state DIR`; a `--bridge-state` that is a link the current user owns
+is followed.
+
+`agentctl chat migrate-state --bridge-state OLD [--name NAME] [--apply]`
+moves an existing state there: with the bridge's `chat run` stopped, one
+rename to `REGISTRY/bridges/NAME` (NAME defaults to the agent the bridge
+targets) and a link left at OLD, so a systemd unit, a `services` snapshot, an
+older prompt's command and `--bridge-state OLD` keep working unchanged. Without
+`--apply` it prints the plan; it refuses while the runner lock is held, when
+the target exists, or when the move would cross filesystems. Then start the
+bridge again. Upgrade every agentctl that reads the registry first (watchers,
+the team `bin`, a shared build on `PATH`): a build from before #707 lists
+`REGISTRY/bridges` as an agent with no record (`record_error`), and a watcher
+on such a build reports it.
+
 The named agent must already exist in the selected registry. Every channel in
 `channel_ids`, and every thread within it, routes to that one agent. To give
 several agents their own conversations, give each agent its own channel, its

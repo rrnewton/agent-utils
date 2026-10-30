@@ -1459,6 +1459,12 @@ enum ChatCommand {
         after_help = "Example: agentctl chat context --bridge-state ~/.local/state/agentctl/chat --request <KEY-OR-PREFIX> --limit 10"
     )]
     Context(ChatContext),
+    /// Move a bridge's state directory into the registry, REGISTRY/bridges/NAME, leaving a link
+    /// at the old path (a dry run unless --apply)
+    #[command(
+        after_help = "Examples:\n  agentctl --registry ~/project/.agentctl chat migrate-state --bridge-state ~/.local/state/agentctl/chat\n  agentctl --registry ~/project/.agentctl chat migrate-state --bridge-state ~/.local/state/agentctl/chat --name coord --apply\n\nBridge state lives with the project it serves (#707 chat-prompt-anatomy), like .git: one\ndirectory per bridge under REGISTRY/bridges/. This moves an existing state there with one\nrename and leaves a link at the old path, so a systemd unit, a services snapshot, an older\nprompt's command and --bridge-state OLD keep working unchanged (chat commands follow a link\nthe current user owns); --bridge NAME names the new place directly. NAME defaults to the agent\nthe bridge targets.\n\nWithout --apply it prints the plan and changes nothing. It is refused while a `chat run` holds\nthe state (stop the service first; the move holds the runner lock), when REGISTRY/bridges/NAME\nexists, when the registry does not exist, or when the move would cross filesystems (the\nrefusal gives the copy steps). After the move the per-user bridge index names the new place.\nUpgrade every agentctl that reads the registry (watchers, the team bin, a shared PATH build)\nfirst: a build without `bridges` among the registry's reserved names would list REGISTRY/bridges\nas an agent with no record.\n\nPrints one JSON object (schema agentctl-chat-migrate-state/v1): state, target, agent,\napplied, steps and next, or refused with the reason, or already_migrated when OLD is already\na link into REGISTRY/bridges. Exit status: 0 for a plan, a move, or one already made; 1 when\nrefused."
+    )]
+    MigrateState(ChatMigrateState),
     /// Launch a coordinator in this Herdr pane and bridge it to Chat for its lifetime
     #[command(
         after_help = "Example:\n  agentctl chat launch --config chat.json --model gpt-6-astra\n\nRun from a Herdr shell pane: launch pins the current pane, starts the native harness there, registers it under the config's agent_name, creates (or reopens) the bridge state, and runs the bridge for the coordinator's lifetime. A Python-format chat config or Python polling bridge state is refused, never converted: create fresh Rust state with 'agentctl chat init' instead."
@@ -1470,21 +1476,71 @@ enum ChatCommand {
 }
 
 #[derive(Args)]
+#[command(group(clap::ArgGroup::new("bridge_location").required(true).args(["bridge_state", "bridge"])))]
 struct ChatState {
-    /// Private durable bridge state directory
-    #[arg(long, value_name = "DIR")]
-    bridge_state: PathBuf,
+    /// Private durable bridge state directory; a link that the current user owns is followed
+    #[arg(long, value_name = "DIR", value_parser = bridge_state_path)]
+    bridge_state: Option<PathBuf>,
+    /// The bridge whose state is REGISTRY/bridges/NAME, in place of --bridge-state (REGISTRY is
+    /// --registry, or the nearest .agentctl above the working directory when that default is
+    /// absent)
+    #[arg(long, value_name = "NAME", value_parser = bridge_name, conflicts_with = "bridge_state")]
+    bridge: Option<String>,
+}
+
+impl ChatState {
+    /// The state directory: --bridge-state, or REGISTRY/bridges/NAME for --bridge NAME.
+    fn dir(&self, registry: &Path) -> PathBuf {
+        match (&self.bridge_state, &self.bridge) {
+            (Some(state), _) => state.clone(),
+            (None, Some(name)) => crate::chat_lookup::named_state(registry, name),
+            (None, None) => unreachable!("clap requires --bridge-state or --bridge"),
+        }
+    }
+}
+
+/// `--bridge-state`: a link that the current user owns is followed, so a state directory moved
+/// by `chat migrate-state` is still found at its old path; anything else is taken as given.
+fn bridge_state_path(value: &str) -> Result<PathBuf, String> {
+    Ok(crate::chat_lookup::follow_own_link(Path::new(value)))
+}
+
+/// `--bridge`: one entry of REGISTRY/bridges, `[a-z0-9][a-z0-9-]{0,63}`.
+fn bridge_name(value: &str) -> Result<String, String> {
+    if crate::chat_lookup::is_bridge_name(value) {
+        Ok(value.to_owned())
+    } else {
+        Err(
+            "a bridge name is a lowercase letter or digit, then up to 63 lowercase letters, \
+             digits or hyphens"
+                .to_owned(),
+        )
+    }
 }
 
 /// Which bridge an agent-facing `chat` command reads: see `chat reply --help`.
 #[derive(Args)]
 struct ChatTarget {
-    /// Bridge state directory (default: the bridge that serves you, found by caller lookup)
-    #[arg(long, value_name = "DIR", conflicts_with = "bridge")]
+    /// Bridge state directory (default: the bridge that serves you, found by caller lookup); a
+    /// link that the current user owns is followed
+    #[arg(long, value_name = "DIR", conflicts_with = "bridge", value_parser = bridge_state_path)]
     bridge_state: Option<PathBuf>,
     /// The bridge REGISTRY/bridges/NAME
-    #[arg(long, value_name = "NAME")]
+    #[arg(long, value_name = "NAME", value_parser = bridge_name)]
     bridge: Option<String>,
+}
+
+#[derive(Args)]
+struct ChatMigrateState {
+    /// The bridge state directory to move (followed as given, not through a link)
+    #[arg(long, value_name = "DIR")]
+    bridge_state: PathBuf,
+    /// Entry name under REGISTRY/bridges (default: the agent the bridge targets)
+    #[arg(long, value_name = "NAME", value_parser = bridge_name)]
+    name: Option<String>,
+    /// Move it; without this, only print the plan
+    #[arg(long)]
+    apply: bool,
 }
 
 #[derive(Args)]
@@ -3936,14 +3992,14 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
         }
         ChatCommand::Status(value) => {
             let mut result =
-                crate::chat_service::status(&value.bridge_state).map_err(Failure::Chat)?;
+                crate::chat_service::status(&value.dir(&registry)).map_err(Failure::Chat)?;
             with_agent_lock(&mut result, &registry);
             write_json(&result).map_err(Failure::Output)?;
             Ok(0)
         }
         ChatCommand::Grant(value) => {
             let result = crate::chat_service::grant(
-                &value.state.bridge_state,
+                &value.state.dir(&registry),
                 &value.senders,
                 value.all_members,
                 value.duration,
@@ -3954,27 +4010,27 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
             Ok(0)
         }
         ChatCommand::Grants(value) => {
-            let listing = crate::chat_service::grants(&value.state.bridge_state, value.json)
+            let listing = crate::chat_service::grants(&value.state.dir(&registry), value.json)
                 .map_err(Failure::Chat)?;
             write_text(&listing).map_err(Failure::Output)?;
             Ok(0)
         }
         ChatCommand::Revoke(value) => {
-            let result = crate::chat_service::revoke(&value.state.bridge_state, &value.senders)
+            let result = crate::chat_service::revoke(&value.state.dir(&registry), &value.senders)
                 .map_err(Failure::Chat)?;
             write_json(&result).map_err(Failure::Output)?;
             Ok(0)
         }
         ChatCommand::GrantLimit(value) => {
             let result =
-                crate::chat_service::grant_limit(&value.state.bridge_state, value.duration)
+                crate::chat_service::grant_limit(&value.state.dir(&registry), value.duration)
                     .map_err(Failure::Chat)?;
             write_json(&result).map_err(Failure::Output)?;
             Ok(0)
         }
         ChatCommand::RetryCheckpointGap(value) => {
             let result = crate::chat_service::retry_checkpoint_gap(
-                &value.state.bridge_state,
+                &value.state.dir(&registry),
                 &crate::chat_runtime::CheckpointGapRetryApproval {
                     expected_gap_sha256: &value.expected_gap_sha256,
                     expected_checkpoint_sha256: &value.expected_checkpoint_sha256,
@@ -3990,7 +4046,7 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
         }
         ChatCommand::RetryBoundaryGap(value) => {
             let result = crate::chat_service::retry_boundary_gap(
-                &value.state.bridge_state,
+                &value.state.dir(&registry),
                 &crate::chat_runtime::GapRetryApproval {
                     expected_gap_sha256: &value.expected_gap_sha256,
                     expected_checkpoint_sha256: &value.expected_checkpoint_sha256,
@@ -4006,7 +4062,7 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
         }
         ChatCommand::AcceptCheckpointBoundary(value) => {
             let result = crate::chat_service::accept_checkpoint_boundary(
-                &value.state.bridge_state,
+                &value.state.dir(&registry),
                 &crate::chat_runtime::CheckpointBoundaryAcceptance {
                     expected_checkpoint_sha256: &value.expected_checkpoint_sha256,
                     expected_configuration_sha256: &value.expected_configuration_sha256,
@@ -4022,7 +4078,7 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
                 HerdrClient::with_executable("direct", &herdr_bin).map_err(AgentError::from)?;
             let manager = ManagedAgents::new(&client, &registry)?;
             let report = crate::chat_service::health::health(
-                &value.state.bridge_state,
+                &value.state.dir(&registry),
                 &manager,
                 crate::chat_service::health::HealthOptions {
                     stale_after: value.stale_after,
@@ -4038,7 +4094,7 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
         }
         ChatCommand::Latency(value) => {
             let (document, text) = crate::chat_service::latency::latency(
-                &value.state.bridge_state,
+                &value.state.dir(&registry),
                 crate::chat_service::latency::LatencyOptions {
                     since_millis: value.since,
                     last: usize::from(value.last),
@@ -4061,7 +4117,7 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
                 std::env::var("AGENTCTL_AGENT").ok(),
             );
             let (result, code) = crate::chat_service::repoint(
-                &value.state.bridge_state,
+                &value.state.dir(&registry),
                 &manager,
                 &value.agent,
                 value.pane.as_deref(),
@@ -4074,10 +4130,20 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
         }
         ChatCommand::Inspect(value) => {
             let result =
-                crate::chat_service::inspect_request(&value.state.bridge_state, &value.request)
+                crate::chat_service::inspect_request(&value.state.dir(&registry), &value.request)
                     .map_err(Failure::Chat)?;
             write_json(&result).map_err(Failure::Output)?;
             Ok(0)
+        }
+        ChatCommand::MigrateState(value) => {
+            let (report, code) = crate::chat_lookup::migrate_state(
+                &value.bridge_state,
+                &registry,
+                value.name.as_deref(),
+                value.apply,
+            );
+            write_json(&report).map_err(Failure::Output)?;
+            Ok(code)
         }
         ChatCommand::Help(value) => {
             let mut command = <Cli as clap::CommandFactory>::command();
@@ -4190,7 +4256,7 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
         ChatCommand::Publish(value) => {
             let body = value.read_message().map_err(Failure::Usage)?;
             let result = crate::chat_service::publish(
-                &value.state.bridge_state,
+                &value.state.dir(&registry),
                 &value.channel_id,
                 value.thread_id.as_deref(),
                 &value.request_id,
@@ -4237,14 +4303,14 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
             }
         }
         ChatCommand::Close(value) => {
-            let result = crate::chat_service::close(&value.state.bridge_state, &value.request)
+            let result = crate::chat_service::close(&value.state.dir(&registry), &value.request)
                 .map_err(Failure::Chat)?;
             write_json(&result).map_err(Failure::Output)?;
             Ok(0)
         }
         ChatCommand::Context(value) => {
             let output = crate::chat_context::read_context(
-                &value.state.bridge_state,
+                &value.state.dir(&registry),
                 &value.request,
                 value.limit,
                 value.cursor.as_deref(),
@@ -4256,11 +4322,13 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
             Ok(0)
         }
         ChatCommand::History(value) => {
-            let output =
-                crate::chat_history::read_reply_history(&value.state.bridge_state, &value.request)
-                    .map_err(|error| {
-                        Failure::Chat(crate::chat_runtime::ChatRuntimeError::Invalid(error).into())
-                    })?;
+            let output = crate::chat_history::read_reply_history(
+                &value.state.dir(&registry),
+                &value.request,
+            )
+            .map_err(|error| {
+                Failure::Chat(crate::chat_runtime::ChatRuntimeError::Invalid(error).into())
+            })?;
             write_text(&format!("{output}\n")).map_err(Failure::Output)?;
             Ok(0)
         }
@@ -4268,9 +4336,12 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
             let client =
                 HerdrClient::with_executable("direct", &herdr_bin).map_err(AgentError::from)?;
             let manager = ManagedAgents::new(&client, &registry)?;
-            let result =
-                crate::chat_service::initialize(&value.state.bridge_state, &value.config, &manager)
-                    .map_err(Failure::Chat)?;
+            let result = crate::chat_service::initialize(
+                &value.state.dir(&registry),
+                &value.config,
+                &manager,
+            )
+            .map_err(Failure::Chat)?;
             write_json(&result).map_err(Failure::Output)?;
             Ok(0)
         }
@@ -4280,7 +4351,7 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
                 HerdrClient::with_executable("direct", &herdr_bin).map_err(AgentError::from)?;
             // A person's messages go ahead of agent-to-agent sends (#556 chat-delivery-latency).
             let manager = ManagedAgents::new(&client, &registry)?.with_lock_priority();
-            let result = crate::chat_service::tick(&value.state.bridge_state, &manager, options)
+            let result = crate::chat_service::tick(&value.state.dir(&registry), &manager, options)
                 .map_err(Failure::Chat)?;
             let code = if result.has_errors() { 75 } else { 0 };
             write_json(&result).map_err(Failure::Output)?;
@@ -4294,7 +4365,7 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
             // A person's messages go ahead of agent-to-agent sends (#556 chat-delivery-latency).
             let manager = ManagedAgents::new(&client, &registry)?.with_lock_priority();
             let result = crate::chat_service::run_with_settings(
-                &value.operate.state.bridge_state,
+                &value.operate.state.dir(&registry),
                 &client,
                 &manager,
                 options,
@@ -4320,7 +4391,7 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
                 &registry,
                 &herdr_bin,
                 &crate::chat_launch::LaunchOptions {
-                    state: value.state.bridge_state.clone(),
+                    state: value.state.dir(&registry),
                     config: value.config.clone(),
                     harness: value.harness.clone(),
                     model: value.model.clone(),

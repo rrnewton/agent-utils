@@ -561,7 +561,7 @@ pub(crate) fn name(value: &str) -> Result<&str> {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
     {
         return Err(fail(
-            "agent name must start with a lowercase letter and contain 1-32 lowercase letters, digits or hyphens; 'archive', 'agents' and 'locks' are reserved",
+            "agent name must start with a lowercase letter and contain 1-32 lowercase letters, digits or hyphens; 'archive', 'agents', 'locks' and 'bridges' are reserved",
         ));
     }
     Ok(value)

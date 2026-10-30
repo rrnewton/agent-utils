@@ -1,7 +1,8 @@
 # chat-prompt-anatomy: what a bridge types, and how an agent finds its bridge
 
-Date: 2026-10-30. Issue: #707 chat-prompt-anatomy. Status: design; pieces 1 and 2 are being
-implemented, piece 3 waits for the owner's go-ahead because it moves live bridge state.
+Date: 2026-10-30. Issue: #707 chat-prompt-anatomy. Status: pieces 1 and 2 landed (e4a03f3e,
+f2f4ff15); piece 3's code landed after them, and moving each live bridge is an operator step
+that waits for the owner's go-ahead.
 
 ## The problem
 
@@ -128,7 +129,7 @@ followed), so an older build on `PATH` never receives syntax it does not know. I
 form (reply ID only) when the bridge registered itself in the index; otherwise it prints the old
 explicit form. `chat help 5380` always ends with the explicit absolute command as a last resort.
 
-## Piece 3: bridge state lives with the project (needs the owner's OK)
+## Piece 3: bridge state lives with the project (code landed; each move needs the owner's OK)
 
 - New home: `REGISTRY/bridges/<name>/`, the whole state directory, one subdirectory per bridge
   (the rule for growing collections). `bridges` joins the registry's reserved names (`archive`,
@@ -144,8 +145,11 @@ explicit form. `chat help 5380` always ends with the explicit absolute command a
   units, `services` snapshots, older prompts' commands and `--bridge-state OLD` keep working
   without edits. The service is then started again.
 - Deployment order: every agentctl that reads the registry (watchers, the team `bin`, a shared
-  `~/.local/bin/agentctl`) must be upgraded first; a build without `bridges` in its reserved names
-  would list `REGISTRY/bridges` as a layout-1 agent with no record, exactly as with #593.
+  `~/.local/bin/agentctl`) must be upgraded first. Checked 2026-10-30 with the deployed build of
+  that day: `agentctl list` shows `bridges` as an agent with `record_error: true`, and `status
+  bridges` fails, so a watcher on such a build would report it; the new build lists nothing.
+  Older builds cannot be taught otherwise (a name they would skip, such as `.bridges`, would hide
+  the directory from people), so the upgrade comes first, as with #593.
 - Old locations are not deprecated: `--bridge-state DIR` remains a general way to name any state
   directory, so no removal issue is needed.
 
