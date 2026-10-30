@@ -1,0 +1,8 @@
+{"type": "user", "timestamp": "2026-10-30T12:00:00Z", "message": {"role": "user", "content": "[from Owner via slack #team \u00b7 reply: <CHAT_REPLY_041>]\n\n<chat_message>\nIs it fixed?\n</chat_message>"}}
+{"type": "assistant", "timestamp": "2026-10-30T12:00:01Z", "message": {"content": [{"type": "thinking", "thinking": "check"}]}}
+{"type": "assistant", "timestamp": "2026-10-30T12:00:02Z", "message": {"stop_reason": "tool_use", "content": [{"type": "text", "text": "<CHAT_REPLY_041>\nProgress: the gate is running on the rebased branch; I'll report when it finishes.\n</CHAT_REPLY_041>"}]}}
+{"type": "assistant", "timestamp": "2026-10-30T12:00:03Z", "message": {"content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "make validate"}}]}}
+{"type": "user", "timestamp": "2026-10-30T12:00:04Z", "message": {"content": [{"type": "tool_result", "tool_use_id": "t1", "content": "<CHAT_REPLY_041>\nfrom a tool\n</CHAT_REPLY_041>"}]}}
+{"type": "assistant", "isSidechain": true, "timestamp": "2026-10-30T12:00:05Z", "message": {"content": [{"type": "text", "text": "<CHAT_REPLY_041>\nsub-agent text\n</CHAT_REPLY_041>"}]}}
+{"type": "assistant", "timestamp": "2026-10-30T12:00:06Z", "message": {"stop_reason": "end_turn", "content": [{"type": "text", "text": "<CHAT_REPLY_041>\n**Mitigated; please reload.** The cause was `rate limiting`, see the [status page](https://example.com/s).\n\n| Leg | Before | After |\n|---|---:|---:|\n| admitted to delivered | 990 s | 5.6 s |\n</CHAT_REPLY_041>\n\nHere is the format, quoted:\n```text\n<CHAT_REPLY_041>\nexample only\n</CHAT_REPLY_041>\n```"}]}}
+{"type": "system", "subtype": "turn_duration", "timestamp": "2026-10-30T12:00:07Z"}
