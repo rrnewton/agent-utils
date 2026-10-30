@@ -17,22 +17,29 @@ def _now() -> str:
 
 
 def canonical_bytes(event: dict) -> bytes:
+    """Serialize an event to its canonical digest bytes."""
     return json.dumps(event, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
 
 
 def digest(event: dict) -> str:
+    """Return the SHA-256 digest of an event canonical bytes."""
     return hashlib.sha256(canonical_bytes(event)).hexdigest()
 
 
 class Ledger:
+    """An append-only JSONL validation ledger."""
     def __init__(self, cfg: Config):
         self.cfg = cfg
 
     def _files(self) -> list[Path]:
         f = self.cfg.ledger_file
-        return [f] if f.exists() else []
+        if f.exists():
+            return [f]
+        d = self.cfg.ledger_dir
+        return sorted(d.rglob("*.jsonl")) if d.exists() else []
 
     def events(self) -> list[dict]:
+        """Perform this ledger, receipt, or run operation as documented above."""
         out: list[dict] = []
         for f in self._files():
             for line in f.read_text(errors="replace").splitlines():
@@ -46,24 +53,51 @@ class Ledger:
         return out
 
     def rows(self) -> list[dict]:
-        """Fold events into terminal rows keyed by run_id (later events win per field)."""
+        """Fold events into terminal rows. Enrichments never change result/commit;
+        corrections only apply to an existing run; digest/schema failures are flagged, not trusted."""
         rows: dict[str, dict] = {}
         order: list[str] = []
+        seen_ids: dict[str, str] = {}
         for ev in self.events():
+            eid = ev.get("event_id")
+            body = canonical_bytes({k: v for k, v in ev.items() if k != "digest"})
+            if eid and eid in seen_ids and seen_ids[eid] != body.decode():
+                continue  # conflicting duplicate event_id: first wins
+            if eid:
+                seen_ids[eid] = body.decode()
             rid = ev.get("run_id")
             if not rid:
                 continue
+            kind = ev.get("kind") or ev.get("event_type") or "run.result"
+            if kind == "run.enrich" and rid in rows:
+                for k, v in ev.items():
+                    if k not in ("result", "commit", "kind", "event_type") and rows[rid].get(k) in (None, ""):
+                        rows[rid][k] = v
+                continue
+            if kind == "run.correct" and rid not in rows:
+                continue  # orphan correction: never manufactures a row
             if rid not in rows:
                 rows[rid] = {"run_id": rid}
                 order.append(rid)
-            if ev.get("kind") in ("run.result", "run.correct", "run.enrich", None):
-                for k, v in ev.items():
-                    if k not in ("kind",):
-                        rows[rid][k] = v
+            src = ev.get("legacy_row") if isinstance(ev.get("legacy_row"), dict) else ev
+            merged = dict(rows[rid])
+            merged.update({k: v for k, v in src.items() if k not in ("kind", "event_type", "legacy_row")})
+            for k in ("commit", "host", "team", "run_id", "event_id", "finished_at"):
+                if ev.get(k) is not None:
+                    merged[k] = ev[k]
+            if ev.get("outcome"):
+                merged["result"] = str(ev["outcome"]).upper()
+            elif src.get("result"):
+                merged["result"] = str(src["result"]).upper()
+            if "digest" in ev:
+                expect = digest({k: v for k, v in ev.items() if k != "digest"})
+                merged["_digest_ok"] = (expect == ev["digest"])
+            rows[rid] = merged
         return [rows[r] for r in order]
 
     def append_result(self, *, commit: str, result: str, run_id: str | None = None,
                       cell: str = "", command: str = "", host: str | None = None) -> dict:
+        """Append one run result to the spool for later publication."""
         run_id = run_id or f"run-{uuid.uuid4().hex[:12]}"
         ev = {
             "schema": SCHEMA, "kind": "run.result", "event_id": uuid.uuid4().hex,
@@ -99,13 +133,22 @@ class Ledger:
         return {"published": moved, "ledger": str(f)}
 
     def for_commit(self, commit: str) -> list[dict]:
-        return [r for r in self.rows() if r.get("commit", "").startswith(commit) or commit.startswith(r.get("commit", "~"))]
+        """Perform this operation as documented in the module guide."""
+        # Exact-commit binding: full SHA equality, or an unambiguous >=12-char prefix.
+        out = []
+        for r in self.rows():
+            c = str(r.get("commit", ""))
+            if c and (c == commit or (len(commit) >= 12 and c.startswith(commit))):
+                out.append(r)
+        return out
 
     def newest_green(self, cell: str = "") -> dict | None:
+        """Perform this operation as documented in the module guide."""
         greens = [r for r in self.rows() if r.get("result") == "PASS" and (not cell or r.get("cell", "") == cell)]
         return greens[-1] if greens else None
 
     def first_bad(self, cell: str = "") -> dict | None:
+        """Perform this operation as documented in the module guide."""
         seq = [r for r in self.rows() if not cell or r.get("cell", "") == cell]
         prev = None
         for r in seq:

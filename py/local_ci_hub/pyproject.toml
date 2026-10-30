@@ -9,9 +9,11 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE"]
-dependencies = []
+dependencies = ["tomli>=2; python_version < \"3.11\""]
 [project.scripts]
 local-ci-hub = "local_ci_hub.cli:main"
 [tool.setuptools]
 packages = ["local_ci_hub"]
 package-dir = { local_ci_hub = "." }
+[tool.setuptools.package-data]
+local_ci_hub = ["py.typed", "README.md", "USER_GUIDE.md"]

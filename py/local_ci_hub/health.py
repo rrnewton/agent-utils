@@ -1,4 +1,4 @@
-"""Health: run configured probes once; scheduling belongs to tick-hub."""
+"""Health: run configured probes once; scheduling is external."""
 from __future__ import annotations
 
 import subprocess
@@ -7,6 +7,7 @@ from .config import Config, short_host
 
 
 def builtin_load_probe() -> dict:
+    """Return the built-in host load probe result."""
     try:
         import os
         load = os.getloadavg()[0]
@@ -16,6 +17,7 @@ def builtin_load_probe() -> dict:
 
 
 def run_probes(cfg: Config, only: str = "") -> dict:
+    """Run configured health probes once and summarize."""
     results = [builtin_load_probe()]
     for probe in cfg.probes:
         name = str(probe.get("name", "probe"))
@@ -30,5 +32,5 @@ def run_probes(cfg: Config, only: str = "") -> dict:
                             "exit_code": r.returncode, "summary": (r.stdout or r.stderr).strip().splitlines()[-1][:200] if (r.stdout or r.stderr).strip() else ""})
         except Exception as exc:
             results.append({"name": name, "status": "unknown", "error": str(exc)})
-    overall = "fail" if any(r["status"] == "fail" for r in results) else "pass"
+    overall = "fail" if any(r["status"] != "pass" for r in results) else "pass"
     return {"schema": "local-ci-hub/health/v1", "status": overall, "probes": results}

@@ -12,15 +12,19 @@ except ModuleNotFoundError:  # Python 3.10
 
 
 class ConfigError(ValueError):
+    """Raised when local-ci-hub.toml is invalid or incomplete."""
+
     pass
 
 
 def short_host() -> str:
+    """Return the short (unqualified) host name for ledger sharding."""
     return socket.gethostname().split(".")[0]
 
 
 @dataclass
 class Config:
+    """A validated local-ci-hub project configuration."""
     path: Path
     root: Path
     name: str = "example"
@@ -39,11 +43,13 @@ class Config:
 
     @property
     def ledger_file(self) -> Path:
+        """See the module documentation for this operation."""
         p = self.ledger_dir
         return p if p.suffix == ".jsonl" else p / "ledger.jsonl"
 
     @property
     def spool_dir(self) -> Path:
+        """See the module documentation for this operation."""
         return self.state_dir / "spool"
 
 
@@ -53,6 +59,7 @@ def _resolve(root: Path, value: str) -> Path:
 
 
 def load(path: Path | None, root: Path | None = None) -> Config:
+    """Load and validate local-ci-hub.toml, or local-only defaults."""
     if path is None:
         base = root or Path.cwd()
         for cand in (base / "local-ci-hub.toml", base / "ci" / "local-ci-hub.toml"):

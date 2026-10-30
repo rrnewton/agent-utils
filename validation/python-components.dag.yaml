@@ -106,6 +106,16 @@ steps:
     cpu_timeout: 900
     hint: *python_test_hint
 
+  - group: local-ci-hub
+    job: test
+    desc: local-ci-hub Python tests
+    cmd: python3 scripts/run_component_tests.py --component local-ci-hub -- -q
+    jobs_flag: ""
+    labels: [validation-workspace, validation-python-component-tests, component-local-ci-hub]
+    timeout: 600
+    cpu_timeout: 900
+    hint: *python_test_hint
+
   - group: planner
     job: test
     desc: pr-landing-planner Python tests

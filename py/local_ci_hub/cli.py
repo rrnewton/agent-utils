@@ -27,7 +27,7 @@ Landing primitives: local-ci-hub land acquire|release|verify."""
 USERGUIDE = """local-ci-hub userguide
 Objects: run (executions on this machine), ledger (append-only evidence),
 receipt (verdict for one exact commit), remote (GitHub read/dispatch),
-health (configured probes; scheduling belongs to tick-hub), land (lock+verify).
+health (configured probes; scheduling is external), land (lock+verify).
 Config: local-ci-hub.toml in the project root. [validate] command is yours;
 [ledger] location/team/publish (none|git); [remote] provider (none|github);
 [receipt] qualifying is an AND list from {local-ledger-pass, remote-pass}.
@@ -48,9 +48,14 @@ def _out(obj: object, as_json: bool) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run the local-ci-hub command line; returns the process exit code."""
+    if "--userguide" in (argv if argv is not None else sys.argv[1:]):
+        print(USERGUIDE)
+        return 0
     p = argparse.ArgumentParser(prog="local-ci-hub", description="Validation on a dev box: run, ledger, receipt, remote, health, land.")
     p.add_argument("--config", type=Path)
     p.add_argument("--json", action="store_true")
+    p.add_argument("--version", action="version", version="local-ci-hub 0.1.0")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("quickstart")
     sub.add_parser("userguide")
@@ -93,7 +98,9 @@ def main(argv: list[str] | None = None) -> int:
         else:
             res = runner.list_runs(cfg)
         _out(res, args.json)
-        return 0 if not (isinstance(res, dict) and res.get("state") in ("refused",)) else 1
+        if isinstance(res, dict) and (res.get("state") == "refused" or res.get("result") == "FAIL"):
+            return 1
+        return 0
     if args.cmd == "ledger":
         ledger = Ledger(cfg)
         if args.op == "append":

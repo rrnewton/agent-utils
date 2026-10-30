@@ -108,6 +108,14 @@ PROJECTS: tuple[Project, ...] = (
         required_dependencies=("pyyaml",),
     ),
     Project(
+        directory="local_ci_hub",
+        distribution="local-ci-hub",
+        package="local_ci_hub",
+        commands=("local-ci-hub",),
+        resources=("README.md", "USER_GUIDE.md", "py.typed"),
+        required_dependencies=(),
+    ),
+    Project(
         directory="wrkviz",
         distribution="wrkviz",
         package="wrkviz",

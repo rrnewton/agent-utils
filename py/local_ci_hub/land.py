@@ -14,6 +14,7 @@ def _lock(cfg: Config) -> Path:
 
 
 def acquire(cfg: Config, holder: str) -> dict:
+    """Acquire the machine-scoped landing lock, or report its holder."""
     lock = _lock(cfg)
     try:
         fd = lock.open("x")
@@ -25,6 +26,7 @@ def acquire(cfg: Config, holder: str) -> dict:
 
 
 def release(cfg: Config, holder: str) -> dict:
+    """Release the landing lock if held by the named holder."""
     lock = _lock(cfg)
     if not lock.exists():
         return {"status": "free"}
@@ -35,6 +37,7 @@ def release(cfg: Config, holder: str) -> dict:
 
 
 def verify(cfg: Config, commit: str, target: str = "HEAD") -> dict:
+    """Return whether a commit is an ancestor of the target."""
     try:
         r = subprocess.run(["git", "merge-base", "--is-ancestor", commit, target], cwd=cfg.root, capture_output=True, timeout=15)
         return {"schema": "local-ci-hub/land/v1", "commit": commit, "target": target, "ancestor": r.returncode == 0}

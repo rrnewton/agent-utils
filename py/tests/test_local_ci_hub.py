@@ -57,7 +57,7 @@ def test_receipt_qualified_and_no_result(tmp_path):
 
 def test_run_failure_records_fail(tmp_path):
     repo = toy_repo(tmp_path, validate="false")
-    assert run_cli(repo, "run", "start").returncode == 0
+    assert run_cli(repo, "run", "start").returncode == 1  # a FAIL run exits nonzero
     out = run_cli(repo, "--json", "receipt", "show", "HEAD")
     assert json.loads(out.stdout)["verdict"] == "not-qualified"
     bad = run_cli(repo, "--json", "ledger", "first-bad")
@@ -75,3 +75,13 @@ def test_health_remote_land_doctor(tmp_path):
     assert run_cli(repo, "land", "release", "--holder", "a").returncode == 0
     sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
     assert run_cli(repo, "land", "verify", "--commit", sha).returncode == 0
+
+
+def test_goalpost_prefix_and_enrich_cannot_qualify(tmp_path):
+    repo = toy_repo(tmp_path)
+    sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
+    # a 1-char prefix must never bind evidence to a commit
+    assert run_cli(repo, "--json", "ledger", "append", "--commit", sha, "--result", "PASS").returncode == 0
+    run_cli(repo, "ledger", "publish")
+    out = run_cli(repo, "--json", "receipt", "show", sha[:1])
+    assert json.loads(out.stdout)["verdict"] != "qualified"

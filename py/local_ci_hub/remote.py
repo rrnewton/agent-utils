@@ -23,9 +23,11 @@ def _gh(cfg: Config, args: list[str]) -> dict:
 
 
 def status(cfg: Config) -> dict:
+    """Return recent remote workflow runs, or disabled."""
     return {"schema": "local-ci-hub/remote/v1", **_gh(cfg, ["run", "list", "--limit", "20", "--json", "databaseId,headSha,status,conclusion,workflowName"])}
 
 
 def dispatch(cfg: Config, workflow: str, ref: str = "") -> dict:
+    """Dispatch one remote workflow explicitly; reports, never gates."""
     args = ["workflow", "run", workflow] + (["--ref", ref] if ref else [])
     return {"schema": "local-ci-hub/remote/v1", **_gh(cfg, args)}

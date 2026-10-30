@@ -26,6 +26,7 @@ def _commit(root: Path) -> str:
 
 
 def start(cfg: Config, *, wait: bool = True, commit: str = "", cell: str = "") -> dict:
+    """Admit and run the validate command, recording its ledger result."""
     handles = _handles(cfg)
     active = [h for h in handles.glob("*.json") if json.loads(h.read_text()).get("state") == "running"]
     if len(active) >= cfg.admission_slots:
@@ -56,6 +57,7 @@ def start(cfg: Config, *, wait: bool = True, commit: str = "", cell: str = "") -
 
 
 def list_runs(cfg: Config) -> list[dict]:
+    """List retained run handles on this machine."""
     out = []
     for h in sorted(_handles(cfg).glob("*.json")):
         try:
@@ -66,6 +68,7 @@ def list_runs(cfg: Config) -> list[dict]:
 
 
 def stop(cfg: Config, run_id: str) -> dict:
+    """Stop one running validation by run id."""
     hp = _handles(cfg) / f"{run_id}.json"
     if not hp.exists():
         return {"run_id": run_id, "state": "not-found"}
