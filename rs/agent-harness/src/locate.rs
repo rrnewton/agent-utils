@@ -64,6 +64,19 @@ impl Hints {
             .map(|pid| crate::proc::tree_open_files(self.proc_root(), pid))
             .unwrap_or_default()
     }
+
+    /// The files each process of the harness's tree holds open, the harness process first and
+    /// its descendants after it, nearest first. A file its own process holds is the harness's; a
+    /// descendant's can belong to a sub-agent or another agent run from its shell.
+    pub(crate) fn open_files_by_process(&self) -> Vec<(u32, Vec<PathBuf>)> {
+        let Some(pid) = self.pid else {
+            return Vec::new();
+        };
+        crate::proc::tree(self.proc_root(), pid)
+            .into_iter()
+            .map(|member| (member, crate::proc::open_files(self.proc_root(), member)))
+            .collect()
+    }
 }
 
 /// A transcript that was found.

@@ -32,18 +32,20 @@ impl Transcript for Muse {
     }
 
     fn locate(&self, hints: &Hints) -> Option<Located> {
-        let held: Vec<PathBuf> = hints
-            .open_files()
-            .into_iter()
-            .filter(|path| {
-                let text = path.to_string_lossy();
-                path.file_name().is_some_and(|name| name == ".session.lock")
-                    && text.contains("/muse/sessions/")
-                    && !text.contains("/subagent/")
-            })
-            .filter_map(|lock| Some(lock.parent()?.join("session.jsonl")))
-            .filter(|path| path.is_file())
-            .collect();
+        let journals = |files: Vec<PathBuf>| -> Vec<PathBuf> {
+            files
+                .into_iter()
+                .filter(|path| {
+                    let text = path.to_string_lossy();
+                    path.file_name().is_some_and(|name| name == ".session.lock")
+                        && text.contains("/muse/sessions/")
+                        && !text.contains("/subagent/")
+                })
+                .filter_map(|lock| Some(lock.parent()?.join("session.jsonl")))
+                .filter(|path| path.is_file())
+                .collect()
+        };
+        let held = journals(hints.open_files());
         if let Some(session) = hints.session_id() {
             if let Some(path) = held.iter().find(|path| {
                 path.parent()
@@ -56,11 +58,15 @@ impl Transcript for Muse {
                 });
             }
         }
-        if let Some(path) = newest(held) {
-            return Some(Located {
-                path,
-                evidence: "the process holds its session lock".into(),
-            });
+        // The nearest process holding a session lock is the runtime: a descendant's lock can be
+        // another Muse session run from its shell.
+        for (pid, files) in hints.open_files_by_process() {
+            if let Some(path) = newest(journals(files)) {
+                return Some(Located {
+                    path,
+                    evidence: format!("process {pid} holds its session lock"),
+                });
+            }
         }
         let session = hints.session_id()?.to_owned();
         let data = hints
@@ -277,6 +283,13 @@ mod tests {
             proc_root: proc_root.clone(),
             ..Hints::default()
         };
+        assert_eq!(MUSE.locate(&hints).unwrap().path, own.join("session.jsonl"));
+        // Another Muse session run from the runtime's shell, newer, belongs to a descendant.
+        let other = sessions.join("s-other");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join("session.jsonl"), "").unwrap();
+        fs::write(other.join(".session.lock"), "").unwrap();
+        process(&proc_root, 72, 71, 3, &[], &[other.join(".session.lock")]);
         assert_eq!(MUSE.locate(&hints).unwrap().path, own.join("session.jsonl"));
         let hints = Hints {
             pid: None,

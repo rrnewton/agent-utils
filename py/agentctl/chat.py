@@ -56,7 +56,8 @@ from agentctl.chat_storage import (
     decode_json, encoded_json, read_json, read_text, write_json,
 )
 from agentctl.chat_transcript import (
-    CoordinatorTranscript, TranscriptBlock, closing_identifiers, near_duplicate, rendered_equivalent,
+    CoordinatorTranscript, TranscriptBlock, closing_identifiers, label_key, rendered_equivalent,
+    rendered_key, same_rendered_text,
 )
 from agentctl.chat_replies import (
     extract_replies, extract_sequenced_replies, reply_marker_ids, reply_marker_sets,
@@ -4215,7 +4216,8 @@ class Bridge:
                             raise ValueError("closing marker is visible but no complete reply block is retained")
                         answers_v2 = _legacy_with_transcript(
                             answers_v2, own_blocks,
-                            [get_str(item, "text", "reply item") for item in self._all_reply_items(record)])
+                            [get_str(item, "text", "reply item") for item in self._all_reply_items(record)],
+                            text)
                         if not answers_v2:
                             continue
                         # Upgrade an already-delivered legacy prompt while keeping its old marker
@@ -5585,42 +5587,68 @@ def _transcript_blocks_of(transcript: Sequence[TranscriptBlock], nonce: str, pro
 def _sequenced_with_transcript(answers: list[tuple[int, str]], blocks: Sequence[TranscriptBlock],
                                next_ordinal: object,
                                stored: Callable[[int], str | None]) -> list[tuple[int, str]]:
-    """Protocol-v3 answers with the transcript's text in place of each new block's screen text it
-    renders, and the transcript's blocks for the next ordinals that the screen does not show.
+    """Protocol-v3 answers with the transcript's text, and the transcript's blocks no snapshot shows.
 
-    A block the request already stored keeps its stored text when the screen renders it, so a
-    reply stored from the screen before the transcript held it is not read as changed text.
+    A protocol-v3 reply ID names one block, so a screen block takes the text of the one transcript
+    block under its ID; an ID the transcript holds twice is ambiguous and keeps its screen text,
+    unless one of the two renders as the screen's. An ordinal already stored keeps its stored text
+    when the screen block is that text or renders it, or the transcript holds that text under the
+    ID. Ordinals from the next one up to the highest visible one that no snapshot shows, and those
+    after it, are filled from the transcript in order, so a block collapsed on screen before a
+    visible later one does not leave a gap.
     """
     if not blocks:
         return answers
     first_new = next_ordinal if isinstance(next_ordinal, int) else 1
-    by_ordinal = {int(block.identifier.rsplit("_", 1)[1]): block.body for block in blocks}
+    by_ordinal: dict[int, list[str]] = {}
+    for block in blocks:
+        by_ordinal.setdefault(int(block.identifier.rsplit("_", 1)[1]), []).append(block.body)
     merged: list[tuple[int, str]] = []
     for ordinal, answer in answers:
-        source = stored(ordinal) if ordinal < first_new else by_ordinal.get(ordinal)
-        if source is not None and source != answer and rendered_equivalent(answer, source):
-            answer = source
+        sources = by_ordinal.get(ordinal, [])
+        if ordinal < first_new:
+            kept = stored(ordinal)
+            if kept is not None and kept != answer and (kept in sources or rendered_equivalent(answer, kept)):
+                answer = kept
+        elif len(sources) == 1:
+            answer = sources[0]
+        else:
+            answer = next((source for source in reversed(sources) if rendered_equivalent(answer, source)), answer)
         merged.append((ordinal, answer))
     shown = {ordinal for ordinal, _ in merged}
-    ordinal = max([first_new - 1, *shown])
-    while ordinal + 1 in by_ordinal and ordinal + 1 not in shown:
+    ordinal = first_new
+    while ordinal <= max(shown, default=0) or (ordinal in by_ordinal and ordinal not in shown):
+        if ordinal not in shown and len(by_ordinal.get(ordinal, [])) == 1:
+            merged.append((ordinal, by_ordinal[ordinal][0]))
+        elif ordinal not in shown:
+            break
         ordinal += 1
-        merged.append((ordinal, by_ordinal[ordinal]))
-    return merged
+    return sorted(merged, key=lambda item: item[0])
 
 
 def _legacy_with_transcript(answers: list[str], blocks: Sequence[TranscriptBlock],
-                            stored: Sequence[str]) -> list[str]:
-    """Legacy answers with the transcript's text in place of each unstored screen text it renders,
-    and the transcript's blocks that no answer or stored reply is."""
+                            stored: Sequence[str], rendered: str) -> list[str]:
+    """Legacy answers with the transcript's text, and the transcript's blocks no snapshot shows.
+
+    Each unstored screen answer takes the text of the newest transcript block it renders. A block
+    no answer renders is added unless its text is visible elsewhere on the screen or a stored
+    reply reads the same once rendered.
+    """
     merged: list[str] = []
+    paired: set[int] = set()
     for answer in answers:
-        source = next((block.body for block in reversed(blocks)
-                       if rendered_equivalent(answer, block.body)), None)
-        merged.append(source if source is not None and answer not in stored else answer)
-    for block in blocks:
-        if any(block.body == other or rendered_equivalent(other, block.body)
-               or near_duplicate(other, block.body) for other in [*merged, *stored]):
+        index = next((index for index in range(len(blocks) - 1, -1, -1)
+                      if rendered_equivalent(answer, blocks[index].body)), None)
+        if index is not None:
+            paired.add(index)
+        merged.append(blocks[index].body if index is not None and answer not in stored else answer)
+    shown = rendered_key(rendered)
+    for index, block in enumerate(blocks):
+        if index in paired or block.body in merged:
+            continue
+        if any(key and key in shown for key in (rendered_key(block.body), label_key(block.body))):
+            continue
+        if any(same_rendered_text(other, block.body) for other in stored):
             continue
         merged.append(block.body)
     return merged

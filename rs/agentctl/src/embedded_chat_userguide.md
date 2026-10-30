@@ -748,25 +748,29 @@ before a tool call in the same turn as one summary line. `chat run` therefore
 also follows the transcript the coordinator's harness writes (Claude Code's
 session file, Codex's rollout, or Muse's session journal), found from the
 coordinator's registry record (its harness, process, working directory and
-conversation ID) and looked for again every 30 seconds. A block read from the
-screen takes the text of the newest transcript block under the same reply ID
-that the screen's block renders: the same characters apart from whitespace, box
-drawing, Markdown markup, link targets and list bullets, or the same characters
-in another order, as when a table's cells wrap. A complete transcript block
-under the reply ID of an open request, recorded after that request was
-admitted, is stored even when no read of the screen shows it, unless the
-request already holds that text in another rendering, or a reply that shares
-most of its word triples, as a renumbered list does. Before a capture the
-service waits up to one second, once per reply ID, for the transcript to hold a
-block whose closing marker the screen already shows. The service log names the
+conversation ID) and looked for again every 30 seconds. Only transcript blocks
+recorded after a request's prompt reached the coordinator count for it, since
+the agent cannot have answered an ID it had not seen. A block read from the
+screen is paired with the newest such transcript block under the same reply ID
+that it renders: the same characters once whitespace, box drawing, inline
+Markdown markup, link targets, the markers that open a quote, heading or list
+item, and code fence and table delimiter lines are set aside, or the same
+characters in another order, as when a table's cells wrap. A paired block is
+skipped if the request already holds either text, and otherwise stored with the
+transcript's text. A complete transcript block that pairs with no screen block
+is stored even when no read of the screen shows it, as when Claude Code
+collapsed it or it scrolled away, unless its text is visible elsewhere on the
+screen or a stored reply of the request reads the same in that sense (the same
+characters in the same order). Before a capture the service waits up to one
+second, once per reply ID, for the transcript to hold a block whose closing
+marker the screen already shows on a row of its own. The service log names the
 transcript it reads, says when none is found or one cannot be read, and says
 `captured with its text from the coordinator's transcript` for each reply
-stored with transcript text. A request already holds a text when a stored reply
-has the same characters in that sense, so the same reply read from the screen,
-from the transcript and through `chat reply` is stored once. With no
-transcript, for a headless coordinator, or with `AGENTCTL_CHAT_REPLY_TEXT=screen`
-in the service's environment, every reply keeps the text read from the screen.
-Screen reads decide everything else: delivery, readiness, forms and feedback.
+stored with transcript text. With no transcript, for a headless coordinator, or
+with `AGENTCTL_CHAT_REPLY_TEXT=screen` in the service's environment, every reply
+keeps the text read from the screen, and replies are told apart as they always
+are. Screen reads decide everything else: delivery, readiness, forms and
+feedback.
 
 A reply printed between its two marker lines reaches the user only if the
 service reads it from the agent's screen, and a terminal agent can redraw or
