@@ -320,9 +320,10 @@ pub fn resolve(
 ) -> Result<Resolved, String> {
     let registry = find_registry(query.registry);
     if let Some(name) = query.name {
-        if name.is_empty() || name.starts_with('.') || name.contains('/') {
+        if !is_bridge_name(name) {
             return Err(format!(
-                "--bridge {name:?} must name an entry of {}, without `/`",
+                "--bridge {name:?} must name an entry of {}: a lowercase letter or digit, then \
+                 lowercase letters, digits or hyphens",
                 registry.join(BRIDGES).display()
             ));
         }
@@ -332,10 +333,7 @@ pub fn resolve(
         .map(Path::to_path_buf)
         .or_else(|| {
             // A registry entry may be a link to a state directory kept elsewhere.
-            query.name.map(|name| {
-                let entry = registry.join(BRIDGES).join(name);
-                fs::canonicalize(&entry).unwrap_or(entry)
-            })
+            query.name.map(|name| named_state(&registry, name))
         })
         .or(environment);
     if let Some(state) = named {
@@ -596,6 +594,209 @@ These find the bridge that serves you by caller lookup; when that fails, add --b
 (and --request KEY to `chat reply`). The whole protocol: agentctl chat userguide\n"
     ));
     page
+}
+
+/// Whether `name` can name an entry of `REGISTRY/bridges`: a lowercase letter or digit, then up
+/// to 63 lowercase letters, digits or hyphens.
+#[must_use]
+pub fn is_bridge_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 64
+        && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+}
+
+/// The state directory of the bridge `name`: `REGISTRY/bridges/NAME` of the registry
+/// [`find_registry`] gives for `registry`, through a link that the current user owns.
+#[must_use]
+pub fn named_state(registry: &Path, name: &str) -> PathBuf {
+    follow_own_link(&find_registry(registry).join(BRIDGES).join(name))
+}
+
+/// `path` with a link that the current user owns followed to the directory it names; any other
+/// path as given, so the state's own checks refuse a link someone else planted.
+#[must_use]
+pub fn follow_own_link(path: &Path) -> PathBuf {
+    // SAFETY: geteuid has no preconditions.
+    let uid = unsafe { libc::geteuid() };
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() && metadata.uid() == uid => {
+            fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+        }
+        _ => path.to_path_buf(),
+    }
+}
+
+/// The schema of the report `agentctl chat migrate-state` prints.
+pub const MIGRATE_SCHEMA: &str = "agentctl-chat-migrate-state/v1";
+
+/// Move the bridge state directory `old` to `REGISTRY/bridges/NAME` and leave a link at `old`
+/// pointing there (#707 chat-prompt-anatomy). `name` defaults to the agent the bridge targets.
+/// Without `apply` it only reports the plan. Refused while a `chat run` holds the state (its
+/// runner lock, which this takes for the move), when the target exists, or when the move would
+/// cross filesystems: a rename keeps every file, lock inode and permission as it was. Returns
+/// the report and the exit status: 0 for a plan that can be applied or a move made (or already
+/// made), 1 for a refusal.
+#[must_use]
+pub fn migrate_state(
+    old: &Path,
+    registry: &Path,
+    name: Option<&str>,
+    apply: bool,
+) -> (serde_json::Value, i32) {
+    let registry = find_registry(registry);
+    let refuse = |reason: String, target: Option<&Path>| {
+        (
+            serde_json::json!({
+                "schema": MIGRATE_SCHEMA,
+                "state": old,
+                "target": target,
+                "applied": false,
+                "refused": reason,
+            }),
+            1,
+        )
+    };
+    let bridges = registry.join(BRIDGES);
+    let old_metadata = match fs::symlink_metadata(old) {
+        Ok(metadata) => metadata,
+        Err(error) => return refuse(format!("cannot inspect {}: {error}", old.display()), None),
+    };
+    if old_metadata.file_type().is_symlink() {
+        let resolved = follow_own_link(old);
+        let canonical_bridges = fs::canonicalize(&bridges).ok();
+        if canonical_bridges.is_some() && resolved.parent() == canonical_bridges.as_deref() {
+            return (
+                serde_json::json!({
+                    "schema": MIGRATE_SCHEMA,
+                    "state": old,
+                    "target": resolved,
+                    "applied": false,
+                    "already_migrated": true,
+                }),
+                0,
+            );
+        }
+        return refuse(
+            format!(
+                "{} is a link to {}, not a state directory to move",
+                old.display(),
+                resolved.display()
+            ),
+            None,
+        );
+    }
+    let bridge = match BridgeState::inspect(old) {
+        Ok(bridge) => bridge,
+        Err(error) => {
+            return refuse(
+                format!("{} is not a bridge state directory: {error}", old.display()),
+                None,
+            )
+        }
+    };
+    let name = name.map_or_else(|| bridge.config().agent_name.clone(), str::to_owned);
+    if !is_bridge_name(&name) {
+        return refuse(
+            format!("{name:?} cannot name a bridge; pass --name with a lowercase letter or digit, then lowercase letters, digits or hyphens"),
+            None,
+        );
+    }
+    let target = bridges.join(&name);
+    if !registry.is_dir() {
+        return refuse(
+            format!(
+                "the registry {} does not exist; pass --registry",
+                registry.display()
+            ),
+            Some(&target),
+        );
+    }
+    if fs::symlink_metadata(&target).is_ok() {
+        return refuse(
+            format!("{} already exists", target.display()),
+            Some(&target),
+        );
+    }
+    let registry_device = fs::metadata(&registry).map(|metadata| metadata.dev());
+    if registry_device.ok() != Some(old_metadata.dev()) {
+        return refuse(
+            format!(
+                "{} and {} are on different filesystems; stop the bridge, copy the directory \
+                 with its permissions (cp -a), check it with `agentctl chat status --bridge-state \
+                 NEW`, and point the service at the copy",
+                old.display(),
+                registry.display()
+            ),
+            Some(&target),
+        );
+    }
+    let lease = match bridge.acquire_runner_lease() {
+        Ok(lease) => lease,
+        Err(error) => {
+            return refuse(
+                format!("stop the bridge's `chat run` first: {error}"),
+                Some(&target),
+            )
+        }
+    };
+    let plan = serde_json::json!({
+        "schema": MIGRATE_SCHEMA,
+        "state": old,
+        "target": target,
+        "agent": bridge.config().agent_name,
+        "applied": false,
+        "steps": [
+            format!("create {} (mode 0700) if it is missing", bridges.display()),
+            format!("rename {} to {}", old.display(), target.display()),
+            format!("link {} to {}", old.display(), target.display()),
+            "record the new place in the per-user bridge index".to_owned(),
+        ],
+        "next": "start the bridge again: a unit's --bridge-state OLD keeps working through the \
+    link, or use --bridge NAME",
+    });
+    if !apply {
+        drop(lease);
+        return (plan, 0);
+    }
+    let old_canonical = fs::canonicalize(old).ok();
+    let moved = (|| -> io::Result<()> {
+        match fs::DirBuilder::new().mode(0o700).create(&bridges) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+        fs::rename(old, &target)?;
+        if let Err(error) = std::os::unix::fs::symlink(&target, old) {
+            // Without the link, units naming the old path would not find the state: put it back.
+            fs::rename(&target, old)?;
+            return Err(error);
+        }
+        Ok(())
+    })();
+    drop(lease);
+    if let Err(error) = moved {
+        return refuse(
+            format!("the move failed and nothing moved: {error}"),
+            Some(&target),
+        );
+    }
+    let mut report = plan;
+    report["applied"] = serde_json::json!(true);
+    if let Some(directory) = index_directory() {
+        // The entry `chat run` wrote names the old place; the new one replaces it.
+        if let Some(canonical) = &old_canonical {
+            let _ = fs::remove_file(directory.join(entry_name(canonical)));
+        }
+        report["index"] = match register_in(&directory, &target, &registry) {
+            Ok(entry) => serde_json::json!(entry),
+            Err(error) => serde_json::json!(format!("not updated: {error}")),
+        };
+    }
+    (report, 0)
 }
 
 #[cfg(test)]

@@ -522,3 +522,116 @@ fn a_known_caller_never_reaches_a_bridge_that_targets_another_agent() {
         "no chat bridge targets you (reviewer)",
     );
 }
+
+#[test]
+fn migrate_state_moves_the_state_into_the_registry_and_the_old_path_keeps_working() {
+    let scratch = Scratch::new("migrate-state");
+    let reply = scratch.file("reply.md", b"answer\n");
+    let state = scratch.state.to_str().expect("UTF-8 state").to_owned();
+    let target = scratch.root.join("registry").join("bridges").join("worker");
+    let report =
+        |run: &Run| -> Value { serde_json::from_str(&run.stdout).expect("one JSON object") };
+    // Without a registry there is nowhere to move it.
+    let refused = scratch.chat(&["migrate-state", "--bridge-state", &state], &[]);
+    assert_eq!(refused.code, Some(1), "{}", refused.stdout);
+    assert!(report(&refused)["refused"]
+        .as_str()
+        .is_some_and(|reason| reason.contains("does not exist")));
+    fs::create_dir(scratch.root.join("registry")).expect("registry");
+    // A dry run prints the plan and moves nothing.
+    let plan = scratch.chat(&["migrate-state", "--bridge-state", &state], &[]);
+    assert_eq!(plan.code, Some(0), "{}{}", plan.stdout, plan.stderr);
+    let printed = report(&plan);
+    assert_eq!(printed["applied"], json!(false));
+    assert_eq!(printed["target"], json!(target));
+    assert!(scratch.state.is_dir() && !target.exists());
+    // Refused while a `chat run` holds the state.
+    {
+        let bridge = BridgeState::open(&scratch.state).expect("open state");
+        let _lease = bridge.acquire_runner_lease().expect("runner lease");
+        let held = scratch.chat(&["migrate-state", "--bridge-state", &state, "--apply"], &[]);
+        assert_eq!(held.code, Some(1), "{}", held.stdout);
+        assert!(report(&held)["refused"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("stop the bridge")));
+        assert!(!target.exists());
+    }
+    let index = scratch.root.join("index");
+    let applied = scratch.chat(
+        &["migrate-state", "--bridge-state", &state, "--apply"],
+        &[("AGENTCTL_CHAT_BRIDGE_INDEX", index.as_path())],
+    );
+    assert_eq!(
+        applied.code,
+        Some(0),
+        "{}{}",
+        applied.stdout,
+        applied.stderr
+    );
+    assert_eq!(report(&applied)["applied"], json!(true));
+    assert!(fs::symlink_metadata(&scratch.state)
+        .expect("old path")
+        .file_type()
+        .is_symlink());
+    assert!(target.join("bridge.json").is_file());
+    let mode = fs::metadata(target.parent().expect("bridges"))
+        .expect("bridges directory")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o077, 0, "REGISTRY/bridges is private");
+    // The old path's command, as an older prompt printed it, still stores the reply.
+    assert_stored(
+        &scratch.reply_with(&scratch.reply_id, &reply),
+        &scratch.result("stored", 1),
+    );
+    // --bridge NAME names the new place, and lookup finds it through the index.
+    let sent = scratch.chat(&["sent", "--bridge", "worker"], &[]);
+    assert_eq!(sent.code, Some(0), "{}", sent.stderr);
+    assert!(sent.stdout.contains(&scratch.key), "{}", sent.stdout);
+    assert_stored(
+        &scratch.chat(
+            &["reply", &scratch.reply_id, "--file", &reply],
+            &[("AGENTCTL_CHAT_BRIDGE_INDEX", index.as_path())],
+        ),
+        &scratch.result("already_stored", 1),
+    );
+    let status = scratch.chat(&["status", "--bridge", "worker"], &[]);
+    assert_eq!(status.code, Some(0), "{}", status.stderr);
+    // Running it again says it is done.
+    let again = scratch.chat(&["migrate-state", "--bridge-state", &state, "--apply"], &[]);
+    assert_eq!(again.code, Some(0), "{}", again.stdout);
+    assert_eq!(report(&again)["already_migrated"], json!(true));
+}
+
+#[test]
+fn migrate_state_never_replaces_an_existing_bridge() {
+    let scratch = Scratch::new("migrate-state-taken");
+    let state = scratch.state.to_str().expect("UTF-8 state").to_owned();
+    let taken = scratch.root.join("registry").join("bridges").join("worker");
+    fs::create_dir_all(&taken).expect("an existing bridge");
+    let refused = scratch.chat(&["migrate-state", "--bridge-state", &state, "--apply"], &[]);
+    assert_eq!(refused.code, Some(1), "{}", refused.stdout);
+    assert!(
+        refused.stdout.contains("already exists"),
+        "{}",
+        refused.stdout
+    );
+    assert!(scratch.state.is_dir());
+    // Another name is free.
+    let moved = scratch.chat(
+        &[
+            "migrate-state",
+            "--bridge-state",
+            &state,
+            "--name",
+            "worker-2",
+            "--apply",
+        ],
+        &[],
+    );
+    assert_eq!(moved.code, Some(0), "{}{}", moved.stdout, moved.stderr);
+    assert!(taken
+        .with_file_name("worker-2")
+        .join("bridge.json")
+        .is_file());
+}

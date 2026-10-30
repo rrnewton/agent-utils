@@ -1,10 +1,11 @@
 ---
 title: 'chat-prompt-anatomy: a one-line header, a fenced message, short commands that find their bridge'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 created_at: 2026-10-30T15:10:43.186330046+00:00
-updated_at: 2026-10-30T15:10:43.186330046+00:00
+updated_at: 2026-10-30T18:08:33.981221584+00:00
+closed_at: 2026-10-30T18:08:33.981221424+00:00
 ---
 
 # Description
