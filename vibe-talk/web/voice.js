@@ -129,23 +129,23 @@ const COLUMN_IDS = {
  * `fromCards` says the thread the right column shows was entered from its card, so that ← goes back
  * out to the cards (`#277 thread-card-focus`, `enterCard`).
  *
- * `older`, `arrows` and `load` are the column's own records of its older pages (`freshOlderPages`,
- * `olderPages`), its reply arrows (`freshReplyArrows`, `replyArrows`) and its reads' state
- * (`freshLoadState`, `loadState`; `#624 voice-page-modularity`, plan step 15): field groups kept on the
- * column rather than in `state`.
+ * `older`, `arrows`, `load` and `entry` are the column's own records of its older pages
+ * (`freshOlderPages`, `olderPages`), its reply arrows (`freshReplyArrows`, `replyArrows`), its reads'
+ * state (`freshLoadState`, `loadState`) and entering a view (`freshEntryState`, `entryState`; `#624
+ * voice-page-modularity`, plan step 15): field groups kept on the column rather than in `state`.
  *
  * @typedef {{matched: number, loaded: number, tally: any, pinned: boolean}} SearchCount
  * @typedef {{name: string, state: unknown[] | null, searched: SearchCount | null,
  *   searchWalk: any, searchNote: {key: string, text: string} | null,
  *   older: ReturnType<typeof freshOlderPages>, arrows: ReturnType<typeof freshReplyArrows>,
- *   load: ReturnType<typeof freshLoadState>}} ColumnFields
+ *   load: ReturnType<typeof freshLoadState>, entry: ReturnType<typeof freshEntryState>}} ColumnFields
  * @type {{main: ColumnFields, side: ColumnFields & {mode: "list" | "thread", fromCards: boolean}}}
  */
 const columns = {
   main: { name: "main", state: null, searched: null, searchWalk: null, searchNote: null, older: freshOlderPages(), arrows: freshReplyArrows(),
-    load: freshLoadState() },
+    load: freshLoadState(), entry: freshEntryState() },
   side: { name: "side", state: null, searched: null, searchWalk: null, searchNote: null, mode: "list", fromCards: false,
-    older: freshOlderPages(), arrows: freshReplyArrows(), load: freshLoadState() },
+    older: freshOlderPages(), arrows: freshReplyArrows(), load: freshLoadState(), entry: freshEntryState() },
 };
 /** The column the code is working on now. The left one, except inside `inColumn`. */
 let activeColumn = columns.main;
@@ -396,7 +396,7 @@ if (typeof window.ResizeObserver === "function") {
     el("frame-body").style.setProperty("--scroll-tools-height", `${height}px`);
     const screen = leftEl("screen-main");
     if (!screen.hidden) screen.style.setProperty("--scroll-tools-clearance", room);
-    if (landed) placeEntryLanding(entryLanding.row, entryLanding.first);
+    if (landed) placeEntryLanding(entryState().landing.row, entryState().landing.first);
     if (pinned) area.scrollTop = area.scrollHeight;
     // The room the channel's box keeps for them is above it, so it moved with them.
     placeChipsOverComposer();
@@ -433,7 +433,7 @@ if (typeof window.ResizeObserver === "function") {
     const screen = leftEl("screen-main");
     if (!screen.hidden) screen.style.setProperty("--read-steer-height", `${height}px`);
     if (!screen.hidden) screen.style.setProperty("--read-steer-clearance", room);
-    if (landed) placeEntryLanding(entryLanding.row, entryLanding.first);
+    if (landed) placeEntryLanding(entryState().landing.row, entryState().landing.first);
     if (pinned) area.scrollTop = area.scrollHeight;
     // The strip floats in the same band as the chips over the channel's box, so it moved with it.
     placeChipsOverComposer();
@@ -5691,9 +5691,9 @@ function applyFoldStep(step, folds, field = null) {
   if (field) {
     // A landing a thread's entry made, or still owes, is spent, as a filter change spends it: nothing
     // is held here to stand in its way.
-    entryLanding = null;
-    threadEntryOwed = null;
-    threadEntryAwaitsRead = false;
+    entryState().landing = null;
+    entryState().threadOwed = null;
+    entryState().threadAwaitsRead = false;
     const area = (sideActive ? sidePane : channelPane).scroller();
     const top = field.getBoundingClientRect().top;
     for (const entry of folds) setFolded(entry, !openAtStep(step, entry));
@@ -7482,9 +7482,9 @@ function keepingFilterPlace(change) {
   eachColumn(() => {
     kept.push([activeColumn, filterAnchor(), listEmptied()]);
     // A landing a thread's entry made, or still owes, is spent: the reader has acted since. `#221`.
-    entryLanding = null;
-    threadEntryOwed = null;
-    threadEntryAwaitsRead = false;
+    entryState().landing = null;
+    entryState().threadOwed = null;
+    entryState().threadAwaitsRead = false;
   });
   // A walk back for an earlier change is over: this one decides where the reader goes.
   endFilterWalk();
@@ -12014,7 +12014,7 @@ function stepSelection(pane, node, direction, held = false) {
   const current = currentRow(pane, node);
   const at = current ? rows.indexOf(current) : -1;
   if (at < 0 || !rowInView(pane, current)) {
-    const landed = entryLandingHolds() && rows.includes(entryLanding.first) ? entryLanding.first : null;
+    const landed = entryLandingHolds() && rows.includes(entryState().landing.first) ? entryState().landing.first : null;
     const seen = rows.filter((row) => rowInView(pane, row));
     const start = landed || (seen.length > 0 ? seen[direction > 0 ? 0 : seen.length - 1] : rows[direction > 0 ? 0 : rows.length - 1]);
     selectRow(pane, start);
@@ -25640,11 +25640,11 @@ async function changeChannelView(view, threadId = null, summary = null, origin =
   // `#221 read-modes`. Entering a thread owes the reader its first unread message, unfolded, once
   // its rows are drawn — from what this page holds, or when its read lands (`payThreadEntry`). The
   // thread is laid out afresh, so runs of read messages opened on an earlier visit collapse again.
-  threadEntryOwed = view === "thread" ? channelContextKey() : null;
-  threadEntryAwaitsRead = false;
+  entryState().threadOwed = view === "thread" ? channelContextKey() : null;
+  entryState().threadAwaitsRead = false;
   // ...and a landing made on an earlier visit is spent: a view this page held comes back with the
   // rows it was made on, at the scroll position it left, and must not hold the reader there again.
-  entryLanding = null;
+  entryState().landing = null;
   if (view === "thread") openedReadRuns.delete(viewKey());
   ++loadState().generation;
   stopReading();
@@ -25679,9 +25679,9 @@ async function changeChannelView(view, threadId = null, summary = null, origin =
   // `#222 unread-replies`. A thread whose root reports replies the store has not brought — the tap on
   // "1 new" — is drawn from what is held as any other, and read behind it however it is drawn: from
   // rows held since an earlier visit, or a cover saved on the device, neither of which has the reply
-  // the reader came for. Its landing waits for that read (`entryReadOwed`).
+  // the reader came for. Its landing waits for that read (`entryState().readOwed`).
   const outrun = view === "thread" && sameStore && threadOutrunsStore(threadId, summary);
-  entryReadOwed = outrun ? channelContextKey() : null;
+  entryState().readOwed = outrun ? channelContextKey() : null;
   const inherited = !held && inheritAllCover(view, threadId, summary);
   const covered = !held && sameStore && channelStore.current().views.has(viewKey());
   const rows = held || covered ? [] : heldViewRows();
@@ -25946,8 +25946,23 @@ function catchUpFromAll() {
 // redraw after — and a reader who folds it again has folded it for good, as with any message they
 // fold. Nothing after the entry moves the reader or opens anything.
 
+/**
+ * A column's own record of entering a view (`#624 voice-page-modularity`, plan step 15, as
+ * `freshOlderPages`): `threadOwed`, `threadAwaitsRead`, `readOwed` and `landing`, each said below.
+ *
+ * @returns {{threadOwed: string | null, threadAwaitsRead: boolean, readOwed: any, landing: any}}
+ */
+function freshEntryState() {
+  return { threadOwed: null, threadAwaitsRead: false, readOwed: null, landing: null };
+}
+
+/** The column being worked on's record of entering a view (`freshEntryState`). */
+function entryState() {
+  return activeColumn.entry;
+}
+
 /** The thread entered and still owed its landing, as its `channelContextKey`, or null. */
-let threadEntryOwed = null;
+// Kept per column: `entryState().threadOwed` (`freshEntryState`, `#624 voice-page-modularity`).
 
 /**
  * Whether the landing owed waits for the read behind rows the store held (`drawHeldRows`, `#220
@@ -25957,7 +25972,7 @@ let threadEntryOwed = null;
  * chosen what to read, and is not moved. Nor by a later read when that one fails: it is the read
  * that answers the entry, and a poll's, forty-five seconds on, is not.
  */
-let threadEntryAwaitsRead = false;
+// Kept per column: `entryState().threadAwaitsRead` (`freshEntryState`, `#624 voice-page-modularity`).
 
 /**
  * The thread entered, as its `channelContextKey`, while its cover does not answer for it: its root
@@ -25969,7 +25984,7 @@ let threadEntryAwaitsRead = false;
  * reply the reader came for (`payThreadEntry`), and keeps a landing made meanwhile (`keepEntryLanding`).
  * Null otherwise.
  */
-let entryReadOwed = null;
+// Kept per column: `entryState().readOwed` (`freshEntryState`, `#624 voice-page-modularity`).
 
 /**
  * How far down the room under the floating line the first unread message may start with the root
@@ -25984,24 +25999,24 @@ const ENTRY_ROOT_ROOM = 0.5;
  * any other view, or a thread left before its read landed, owes nothing.
  */
 function payThreadEntry() {
-  if (threadEntryOwed === null) return;
-  if (threadEntryOwed !== channelContextKey() || channelView !== "thread") {
-    threadEntryOwed = null;
+  if (entryState().threadOwed === null) return;
+  if (entryState().threadOwed !== channelContextKey() || channelView !== "thread") {
+    entryState().threadOwed = null;
     return;
   }
-  const covered = channelStore.current().views.has(viewKey()) && entryReadOwed !== channelContextKey();
-  if ((el("discord-log").children.length === 0 || threadEntryAwaitsRead) && !covered) return;
-  const awaited = threadEntryAwaitsRead;
-  threadEntryOwed = null;
-  threadEntryAwaitsRead = false;
+  const covered = channelStore.current().views.has(viewKey()) && entryState().readOwed !== channelContextKey();
+  if ((el("discord-log").children.length === 0 || entryState().threadAwaitsRead) && !covered) return;
+  const awaited = entryState().threadAwaitsRead;
+  entryState().threadOwed = null;
+  entryState().threadAwaitsRead = false;
   if (awaited && !atBottom(el("scroll-area"))) return;
   // The thread's runs were forgotten on entry; a view this page held was drawn before that.
   applyReadRuns();
   // On rows drawn from the store ahead of the thread's read (`drawHeldRows`) the landing is made now,
   // and that read keeps it (`keepEntryLanding`). With nothing unread among them, the read pays it.
   if (!landOnFirstUnread() && !covered) {
-    threadEntryOwed = channelContextKey();
-    threadEntryAwaitsRead = true;
+    entryState().threadOwed = channelContextKey();
+    entryState().threadAwaitsRead = true;
   }
 }
 
@@ -26013,7 +26028,7 @@ function payThreadEntry() {
  */
 function entryLandingMark() {
   if (!entryLandingHolds()) return null;
-  const { row, first } = entryLanding;
+  const { row, first } = entryState().landing;
   return { ids: idsOf(row), top: row.getBoundingClientRect().top, first: idsOf(first),
     open: first.getAttribute("data-collapsed") === "false" };
 }
@@ -26060,7 +26075,7 @@ function keepEntryLanding(mark) {
   } else {
     const row = kept && !kept.hidden ? kept : first;
     area.scrollTop += row.getBoundingClientRect().top - mark.top;
-    entryLanding = { key: channelContextKey(), row, first, at: area.scrollTop };
+    entryState().landing = { key: channelContextKey(), row, first, at: area.scrollTop };
   }
   renderScrollTools();
   requestVisibleSummaries();
@@ -26135,7 +26150,7 @@ function landAtFoot(first) {
     area.scrollTop = was;
     return false;
   }
-  entryLanding = null;
+  entryState().landing = null;
   setJumpNewest(false);
   return true;
 }
@@ -26156,7 +26171,7 @@ function landAtFoot(first) {
  * So until the reader scrolls, the landing outranks the newest line: those observers put the landed
  * row back at the head instead, as near as the list allows.
  */
-let entryLanding = null;
+// Kept per column: `entryState().landing` (`freshEntryState`, `#624 voice-page-modularity`).
 
 /**
  * Bring `row` to just under the floating line, as near as the list allows, and keep it there, for
@@ -26166,7 +26181,7 @@ function placeEntryLanding(row, first) {
   const area = el("scroll-area");
   // By where the row starts, its date rule included: `#324 live-pill-covers-row`, see `drawnTop`.
   area.scrollTop += drawnTop(row) - floatingClearance(area) - REPLY_LANDING_GAP_PX;
-  entryLanding = { key: channelContextKey(), row, first, at: area.scrollTop };
+  entryState().landing = { key: channelContextKey(), row, first, at: area.scrollTop };
 }
 
 /**
@@ -26174,12 +26189,12 @@ function placeEntryLanding(row, first) {
  * landed row still drawn in it, and nothing scrolled since. The landing is forgotten once it is not.
  */
 function entryLandingHolds() {
-  const landing = entryLanding;
+  const landing = entryState().landing;
   if (landing === null) return false;
   const holds = currentScreen === "main" && currentView === "discord" && channelView === "thread" &&
     !pinnedOnly && landing.key === channelContextKey() && landing.row.parentNode === el("discord-log") &&
     landing.row.getBoundingClientRect().height > 0 && Math.abs(el("scroll-area").scrollTop - landing.at) <= 1;
-  if (!holds) entryLanding = null;
+  if (!holds) entryState().landing = null;
   return holds;
 }
 
@@ -27940,7 +27955,7 @@ function olderReadReason() {
  * out of time order; and not while entering a thread waits on a read to land on.
  */
 function rowsAsDrawn(pages) {
-  if (channelView === "threads" || gatheredParent() !== null || threadEntryOwed !== null) return false;
+  if (channelView === "threads" || gatheredParent() !== null || entryState().threadOwed !== null) return false;
   if (!pages.every((page) => (page.dismissed || []).every((id) => archivedIds.has(String(id))))) return false;
   const projected = projectView();
   if (!projected) return false;
@@ -28281,7 +28296,7 @@ async function loadTimeline(options) {
     renderChannelLoading(false);
     // `#226 page-energy-profile`. Nothing changed, and every row on screen is the row a redraw
     // would draw: the refresh says how fresh the rows are and draws nothing.
-    if (keepPosition && !ownAct && entryReadOwed !== context &&
+    if (keepPosition && !ownAct && entryState().readOwed !== context &&
         deltas.every((page) => unchangedDeltas.has(page)) && rowsAsDrawn(deltas)) {
       timelineMessages = projectView() || timelineMessages;
       observeOutgoingMessages(deltas.flatMap((page) => page.messages || []));
@@ -28304,7 +28319,7 @@ async function loadTimeline(options) {
       renderScrollTools();
     });
     requestVisibleSummaries();
-    if (entryReadOwed === context) entryReadOwed = null;
+    if (entryState().readOwed === context) entryState().readOwed = null;
     payThreadEntry();
     // What it changed in the store may show in the other column too. `#229 desktop-two-column`.
     followInOtherColumn();
@@ -28442,8 +28457,8 @@ async function loadTimeline(options) {
       }
       // A thread entered on rows the store held has landed on its first unread among them: asked
       // BEFORE the rows are rebuilt, which takes the landed row with it. `#221 read-modes`. So has
-      // one entered on rows it held for replies they lack (`entryReadOwed`, `#222 unread-replies`).
-      const owed = entryReadOwed === context;
+      // one entered on rows it held for replies they lack (`entryState().readOwed`, `#222 unread-replies`).
+      const owed = entryState().readOwed === context;
       const landing = behindHeld || owed ? entryLandingMark() : null;
       holdingScrollTools(() => {
         let messages = applyTimelinePage(payload, false, false, false, null, sameStore() ? held : null);
@@ -28457,7 +28472,7 @@ async function loadTimeline(options) {
       // A thread entered with nothing of it on the page lands here, on its first read, and one landed
       // on held rows is landed again on what the read drew: LAST, once the freshness pill and the
       // chips it is measured against are up, as on every other entry. `#221 read-modes`.
-      if (owed) entryReadOwed = null;
+      if (owed) entryState().readOwed = null;
       if (landing) keepEntryLanding(landing);
       payThreadEntry();
       followInOtherColumn();
@@ -28467,9 +28482,9 @@ async function loadTimeline(options) {
     if (generation === loadState().generation && context === channelContextKey()) {
       // A landing left to this read is not paid by a later one: that finds a reader who has been
       // reading the rows the failure left up. `#221 read-modes`.
-      if (threadEntryAwaitsRead) threadEntryOwed = null;
-      threadEntryAwaitsRead = false;
-      if (entryReadOwed === context) entryReadOwed = null;
+      if (entryState().threadAwaitsRead) entryState().threadOwed = null;
+      entryState().threadAwaitsRead = false;
+      if (entryState().readOwed === context) entryState().readOwed = null;
       noteChannelReadFailure(error);
       throw error;
     }
@@ -28511,7 +28526,7 @@ function foldLateTimelinePage(payload, read) {
     // Words and all, unless a read of this view is queued behind this one: it draws them.
     catchUpHeldView(!discordQueuedLoads.has(activeColumn));
     renderChannelFreshness();
-    if (entryReadOwed === read.context) entryReadOwed = null;
+    if (entryState().readOwed === read.context) entryState().readOwed = null;
     if (landing) keepEntryLanding(landing);
     payThreadEntry();
   } else if (read.view === "flat") {
@@ -47085,10 +47100,6 @@ const COLUMN_STATE = [
   [() => timelineMessages, (value) => { timelineMessages = value; }, () => []],
   [() => timelineThreads, (value) => { timelineThreads = value; }, () => []],
   [() => activeComposerKey, (value) => { activeComposerKey = value; }, () => ""],
-  [() => threadEntryOwed, (value) => { threadEntryOwed = value; }, () => null],
-  [() => threadEntryAwaitsRead, (value) => { threadEntryAwaitsRead = value; }, () => false],
-  [() => entryReadOwed, (value) => { entryReadOwed = value; }, () => null],
-  [() => entryLanding, (value) => { entryLanding = value; }, () => null],
   [() => countedOutgoingKey, (value) => { countedOutgoingKey = value; }, () => ""],
   [() => gathered, (value) => { gathered = value; }, () => null],
   [() => rowsGathered, (value) => { rowsGathered = value; }, () => false],
@@ -50848,6 +50859,7 @@ function resetSideColumn(reopen = false) {
     columns.side.older = freshOlderPages();
     columns.side.arrows = freshReplyArrows();
     columns.side.load = freshLoadState();
+    columns.side.entry = freshEntryState();
   }
   for (const id of ["side-log", "side-thread-list", "side-summary", "side-pinned-log", "side-outgoing-log"]) {
     leftEl(id).replaceChildren();
@@ -58275,7 +58287,7 @@ if (typeof window.ResizeObserver === "function") {
     // since: on a desk the entry itself wrapped the dock, by putting the thread's name in the picker,
     // and the message is kept at the head however near the end of the list it is.
     if (entryLandingHolds()) {
-      placeEntryLanding(entryLanding.row, entryLanding.first);
+      placeEntryLanding(entryState().landing.row, entryState().landing.first);
       return;
     }
     // `#243 filter-keeps-selection`. Nor a message a filter change holds in place, which stays put.
@@ -58328,7 +58340,7 @@ if (typeof window.ResizeObserver === "function") {
     if (!sideShowing()) return;
     inColumn(columns.side, () => {
       if (entryLandingHolds()) {
-        placeEntryLanding(entryLanding.row, entryLanding.first);
+        placeEntryLanding(entryState().landing.row, entryState().landing.first);
         return;
       }
       if (keepFilterHold()) return;

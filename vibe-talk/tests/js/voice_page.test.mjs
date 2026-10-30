@@ -7197,7 +7197,7 @@ test("`#624 voice-page-modularity`: a read asked for while another is out joins 
   assert.deepStrictEqual([started, generation.current()], [0, 1]);
 });
 
-test("`#624 voice-page-modularity`: each column keeps its own records of its older pages, reply arrows and reads, reached through the column worked on", () => {
+test("`#624 voice-page-modularity`: each column keeps its own records of its older pages, reply arrows, reads and entries, reached through the column worked on", () => {
   const page = newPage();
   const same = (expression) => page.pure(expression);
   assert.equal(same("olderPages() === columns.main.older"), true, "the left column's record was not the one worked on");
@@ -7223,6 +7223,10 @@ test("`#624 voice-page-modularity`: each column keeps its own records of its old
     [1, "slow", "fresh"]);
   assert.deepStrictEqual(JSON.parse(same("JSON.stringify(freshLoadState())")),
     { freshness: "fresh", freshAt: 0, refreshing: false, lineTimer: null, generation: 0 });
+  // And entering a view.
+  assert.equal(same("inColumn(columns.side, () => entryState()) === columns.side.entry && entryState() === columns.main.entry"), true);
+  assert.deepStrictEqual(JSON.parse(same("JSON.stringify(freshEntryState())")),
+    { threadOwed: null, threadAwaitsRead: false, readOwed: null, landing: null });
 });
 
 test("`#624 voice-page-modularity`: the live events counted per channel, from the module alone", () => {
@@ -54094,7 +54098,7 @@ test("...but not a landing made on an earlier visit, when the thread comes back 
     "the first visit's landing opened the row the read drew under message 12, or the thread came back without the Done made in All");
   // Negative control: the landing left standing when the view changes, and the thread's rows come back
   // as they were left, the very row the landing was made on among them.
-  const control = brokenScriptEach(["  entryLanding = null;\n  if (view === \"thread\")", "  if (view === \"thread\")"],
+  const control = brokenScriptEach(["  entryState().landing = null;\n  if (view === \"thread\")", "  if (view === \"thread\")"],
     ["if (!caughtUp && (held.readMode !== readMode || rowsMissDone())) renderCachedTimeline();",
       "if (!caughtUp && held.readMode !== readMode) renderCachedTimeline();"]);
   assert.equal((await run(control)).collapsed, "false", "the first visit's landing did not hold without the reset; the control proves nothing");
@@ -54122,7 +54126,7 @@ test("...and held rows with nothing unread whose read fails leave the reader on 
   assert.deepStrictEqual(await run(SCRIPT), { atBottom: true, open: "true" },
     "the poll after the failed read paid the landing the read owed");
   // Negative control: the deferral kept through the failure, as before.
-  assert.deepStrictEqual(await run(brokenScript("      if (threadEntryAwaitsRead) threadEntryOwed = null;\n", "")),
+  assert.deepStrictEqual(await run(brokenScript("      if (entryState().threadAwaitsRead) entryState().threadOwed = null;\n", "")),
     { atBottom: false, open: "false" }, "the poll moved nobody without the failure ending the wait; the control proves nothing");
 });
 
@@ -54587,9 +54591,9 @@ test("...and lands the first unread's day rule under the floating line with it, 
   assert.ok(real.tile > real.rule, "the tile is not under its rule");
   // THE CONTROL: the landing measured from the tile, as it was.
   const control = await land(brokenScript(
-    "  area.scrollTop += drawnTop(row) - floatingClearance(area) - REPLY_LANDING_GAP_PX;\n  entryLanding =",
+    "  area.scrollTop += drawnTop(row) - floatingClearance(area) - REPLY_LANDING_GAP_PX;\n  entryState().landing =",
     "  area.scrollTop += row.getBoundingClientRect().top - floatingClearance(area) - REPLY_LANDING_GAP_PX;\n" +
-      "  entryLanding ="));
+      "  entryState().landing ="));
   assert.ok(control.rule < control.line,
     "the control left the day rule clear of the floating line too, so the check above proves nothing");
   assert.ok(Math.abs(control.tile - real.rule) <= 1, "the control did not land the tile where the rule now lands");
@@ -54644,7 +54648,7 @@ test("...and the dock and the chips changing as the thread opens leave the first
 
   // THE CONTROLS: either observer reading the landing as a reader on the newest line.
   const dockOnly = await run(brokenScript(
-    "    if (entryLandingHolds()) {\n      placeEntryLanding(entryLanding.row, entryLanding.first);\n      return;\n    }\n", ""));
+    "    if (entryLandingHolds()) {\n      placeEntryLanding(entryState().landing.row, entryState().landing.first);\n      return;\n    }\n", ""));
   assert.deepStrictEqual(dockOnly, { ...real, afterDock: false, afterChips: false });
   const chipsOnly = await run(brokenScript(
     "const landed = currentScreen === \"main\" && currentView === \"discord\" && entryLandingHolds();",
