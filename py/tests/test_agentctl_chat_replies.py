@@ -378,12 +378,16 @@ def test_a_screen_rendering_matches_its_transcript_source_and_other_text_does_no
     assert rendered_equivalent("1. first step\n2. second step\n  ◦ detail", "1. first step\n1. second step\n   - detail")
     assert not rendered_equivalent("Rollout: ███░░░░░░░", "Rollout: ████████░░")
     assert not rendered_equivalent("Delta: -3", "Delta: +3")
+    assert not rendered_equivalent("21 of 30 done", "12 of 30 done")
+    assert rendered_equivalent("a|b and foo_bar", "a\\|b and foo\\_bar")
     assert not rendered_equivalent("- **`#`** -", "---")
     assert rendered_key("| a | b |\n|---|:--:|\n| 1 | 2 |") == "ab12"
     assert rendered_key("> ## Title\n- a-b\n10. c+d\n---") == "Titlea-bc+d"
     assert label_key("See [the page](https://x.test/p).") == "Seethepage."
     assert same_rendered_text(DRAWN, WRITTEN)
-    assert not same_rendered_text("| A | ✓ | - |", "| A | - | ✓ |")
+    # Only a table's characters may be reordered (its cells wrap), not a sentence's.
+    assert same_rendered_text("│ admitted → │ 5.6s │\n│ delivered  │      │", "| admitted → delivered | 5.6s |")
+    assert not same_rendered_text("21 of 30 done", "12 of 30 done")
 
 
 def test_transcript_lines_of_each_harness_decode_to_the_models_text() -> None:

@@ -207,16 +207,40 @@ fn line_content(line: &str) -> &str {
 /// inside a line, and symbols such as a progress bar's `█` and `░` stay.
 #[must_use]
 pub fn rendered_key(text: &str) -> String {
-    text.lines()
-        .filter(|line| !layout_line(line))
-        .map(line_content)
-        .flat_map(str::chars)
-        .filter(|c| {
-            !c.is_whitespace()
-                && !('\u{2500}'..='\u{257f}').contains(c)
-                && !INLINE_MARKUP.contains(c)
-        })
-        .collect()
+    let mut key = String::new();
+    for line in text.lines().filter(|line| !layout_line(line)) {
+        let mut chars = line_content(line).chars().peekable();
+        while let Some(c) = chars.next() {
+            // A backslash escape (`\|`, `\_`) is drawn as the character it escapes, which then
+            // counts as any such character does.
+            let c = match chars.peek() {
+                Some(next) if c == '\\' && next.is_ascii_punctuation() => {
+                    let escaped = *next;
+                    chars.next();
+                    escaped
+                }
+                _ => c,
+            };
+            if !c.is_whitespace()
+                && !('\u{2500}'..='\u{257f}').contains(&c)
+                && !INLINE_MARKUP.contains(&c)
+            {
+                key.push(c);
+            }
+        }
+    }
+    key
+}
+
+/// Whether `text` holds a Markdown or box-drawn table row, whose cells a terminal can wrap
+/// across rows, reordering its characters.
+#[must_use]
+pub fn has_table(text: &str) -> bool {
+    text.lines().any(|line| {
+        let line = line.trim();
+        (line.starts_with('|') && line.ends_with('|') && line.len() > 1)
+            || (line.starts_with('│') && line.ends_with('│'))
+    })
 }
 
 /// [`rendered_key`] of `text` with its Markdown link targets left out: the same for the text as
@@ -256,9 +280,9 @@ fn sorted(key: &str) -> Vec<char> {
 /// the same block's text from a transcript.
 ///
 /// They are when their [`rendered_key`]s are the same (Markdown markers, bullets, box drawing and
-/// wrapping differ), with or without the source's link targets, or hold the same characters in
-/// another order, as when a table's cells wrap across rows. Text with nothing but markup and
-/// whitespace is never judged a rendering.
+/// wrapping differ), with or without the source's link targets, or, when the source holds a table
+/// ([`has_table`]), the same characters in another order, as when its cells wrap across rows.
+/// Text with nothing but markup and whitespace is never judged a rendering.
 #[must_use]
 pub fn rendered_equivalent(screen: &str, source: &str) -> bool {
     let shown = rendered_key(screen);
@@ -271,6 +295,9 @@ pub fn rendered_equivalent(screen: &str, source: &str) -> bool {
     ];
     if candidates.contains(&shown) {
         return true;
+    }
+    if !has_table(source) {
+        return false;
     }
     let shown = sorted(&shown);
     candidates.iter().any(|key| sorted(key) == shown)
@@ -381,8 +408,15 @@ mod tests {
             "1. first step\n2. second step\n  ◦ detail",
             "1. first step\n1. second step\n   - detail"
         ));
-        // Signs inside a line are text.
+        // Signs inside a line are text, and only a table's characters may be reordered.
         assert!(!rendered_equivalent("Delta: -3", "Delta: +3"));
+        assert!(!rendered_equivalent("21 of 30 done", "12 of 30 done"));
+        // An escape is drawn as the character it escapes.
+        assert!(rendered_equivalent(
+            "a|b and foo_bar",
+            "a\\|b and foo\\_bar"
+        ));
+        assert!(has_table("x\n| a |\ny") && !has_table("a | b"));
         assert_eq!(
             rendered_key("> ## Title\n- a-b\n10. c+d\n---"),
             "Titlea-bc+d"

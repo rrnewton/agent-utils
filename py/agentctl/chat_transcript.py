@@ -173,12 +173,23 @@ def rendered_key(text: str) -> str:
     that open a quote, heading or list item, or lines drawn as rules (table delimiter rows,
     thematic breaks, code fence lines). Letters, digits, other punctuation and symbols stay.
     """
-    return "".join(
-        character
-        for line in text.splitlines() if not _layout_line(line)
-        for character in _line_content(line)
-        if not character.isspace() and not "\u2500" <= character <= "\u257f"
-        and character not in _INLINE_MARKUP)
+    key: list[str] = []
+    for line in text.splitlines():
+        if _layout_line(line):
+            continue
+        # A backslash escape is drawn as the character it escapes.
+        content = re.sub(r"\\([!-/:-@\[-`{-~])", r"\1", _line_content(line))
+        key.extend(character for character in content
+                   if not character.isspace() and not "\u2500" <= character <= "\u257f"
+                   and character not in _INLINE_MARKUP)
+    return "".join(key)
+
+
+def has_table(text: str) -> bool:
+    """Whether ``text`` holds a Markdown or box-drawn table row, whose cells a terminal can wrap."""
+    return any((line.strip().startswith("|") and line.strip().endswith("|") and len(line.strip()) > 1)
+               or (line.strip().startswith("│") and line.strip().endswith("│"))
+               for line in text.splitlines())
 
 
 _LINK_TARGET = re.compile(r"\]\([^)\n]*\)")
@@ -192,8 +203,8 @@ def label_key(text: str) -> str:
 def rendered_equivalent(screen: str, source: str) -> bool:
     """Whether ``screen`` is a terminal's rendering of ``source``.
 
-    The same :func:`rendered_key`, with or without the source's link targets, or the same characters
-    in another order, as when a table's cells wrap across rows.
+    The same :func:`rendered_key`, with or without the source's link targets, or, when the source
+    holds a table, the same characters in another order, as when its cells wrap across rows.
     """
     shown = rendered_key(screen)
     if not shown:
@@ -201,13 +212,21 @@ def rendered_equivalent(screen: str, source: str) -> bool:
     candidates = (rendered_key(source), label_key(source))
     if shown in candidates:
         return True
-    return any(sorted(shown) == sorted(key) for key in candidates)
+    return has_table(source) and any(sorted(shown) == sorted(key) for key in candidates)
+
+
+#: The shortest rendered text judged visible elsewhere on a screen by containment.
+MIN_VISIBLE_KEY_CHARS = 24
 
 
 def same_rendered_text(left: str, right: str) -> bool:
-    """Whether two stored texts read the same once rendered, with or without link targets."""
+    """Whether two stored texts read the same once rendered, with or without link targets, or, when
+    either holds a table, hold the same characters in another order."""
     first, second = (rendered_key(left), label_key(left)), (rendered_key(right), label_key(right))
-    return any(key and key in second for key in first)
+    if any(key and key in second for key in first):
+        return True
+    return (has_table(left) or has_table(right)) and any(
+        key and sorted(key) == sorted(other) for key in first for other in second)
 
 
 def _parse_utc(text: object) -> float | None:

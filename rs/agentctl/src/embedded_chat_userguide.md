@@ -753,15 +753,18 @@ recorded after a request's prompt reached the coordinator count for it, since
 the agent cannot have answered an ID it had not seen. A block read from the
 screen is paired with the newest such transcript block under the same reply ID
 that it renders: the same characters once whitespace, box drawing, inline
-Markdown markup, link targets, the markers that open a quote, heading or list
-item, and code fence and table delimiter lines are set aside, or the same
-characters in another order, as when a table's cells wrap. A paired block is
-skipped if the request already holds either text, and otherwise stored with the
-transcript's text. A complete transcript block that pairs with no screen block
-is stored even when no read of the screen shows it, as when Claude Code
-collapsed it or it scrolled away, unless its text is visible elsewhere on the
-screen or a stored reply of the request reads the same in that sense (the same
-characters in the same order). Before a capture the service waits up to one
+Markdown markup, link targets, backslash escapes, the markers that open a
+quote, heading or list item, and code fence and table delimiter lines are set
+aside, or, for a text with a table, the same characters in another order, as
+when its cells wrap. A paired block is skipped if the request already holds
+either text, and otherwise stored with the transcript's text. A complete
+transcript block that pairs with no screen block is stored even when no read of
+the screen shows it, as when Claude Code collapsed it or it scrolled away,
+unless its text (of at least 24 such characters) is visible elsewhere on the
+screen, a stored reply of the request reads the same in that sense, or a screen
+block under the same ID that pairs with nothing is about as long; then the
+screen's block is stored and the transcript's waits. A transcript block a
+capture stored, or found already held, is not weighed again by that service. Before a capture the service waits up to one
 second, once per reply ID, for the transcript to hold a block whose closing
 marker the screen already shows on a row of its own. The service log names the
 transcript it reads, says when none is found or one cannot be read, and says

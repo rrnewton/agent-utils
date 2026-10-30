@@ -299,10 +299,10 @@ seconds. Only transcript blocks recorded after the request arrived count. A
 protocol-v3 reply ID names one block, so a captured block takes the text of the
 one transcript block under its ID; an ID the transcript holds twice keeps its
 screen text unless one of the two renders as it: the same characters once
-whitespace, box drawing, inline Markdown markup, link targets, the markers that
-open a quote, heading or list item, and code fence and table delimiter lines are
-set aside, or the same characters in another order, as when a table's cells
-wrap. A block whose ordinal is already stored keeps its stored text when the
+whitespace, box drawing, inline Markdown markup, link targets, backslash
+escapes, the markers that open a quote, heading or list item, and code fence and
+table delimiter lines are set aside, or, for a text with a table, the same
+characters in another order, as when its cells wrap. A block whose ordinal is already stored keeps its stored text when the
 screen shows that text, renders it, or the transcript holds it under the ID. The
 transcript's blocks for ordinals that no snapshot shows, from the next one up,
 are stored in order even when a later block is visible, as when Claude Code

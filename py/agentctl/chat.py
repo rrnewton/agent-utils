@@ -56,8 +56,8 @@ from agentctl.chat_storage import (
     decode_json, encoded_json, read_json, read_text, write_json,
 )
 from agentctl.chat_transcript import (
-    CoordinatorTranscript, TranscriptBlock, closing_identifiers, label_key, rendered_equivalent,
-    rendered_key, same_rendered_text,
+    MIN_VISIBLE_KEY_CHARS, CoordinatorTranscript, TranscriptBlock, closing_identifiers, label_key,
+    rendered_equivalent, rendered_key, same_rendered_text,
 )
 from agentctl.chat_replies import (
     extract_replies, extract_sequenced_replies, reply_marker_ids, reply_marker_sets,
@@ -5554,7 +5554,10 @@ commands. See '{prog} userguide' for exact scopes, lifecycle, and adapter protoc
                     raise ValueError("reconcile interval must be between 10 and 86400 seconds")
                 if not _MIN_OBSERVER_WRITE_INTERVAL <= args.observer_write_interval <= _MAX_OBSERVER_WRITE_INTERVAL:
                     raise ValueError("observer write interval must be between 60 and 3600 seconds")
-                bridge.read_transcript_replies()
+                # A stand-in bridge (as tests construct) need not read a transcript.
+                read_transcript = getattr(bridge, "read_transcript_replies", None)
+                if callable(read_transcript):
+                    read_transcript()
                 _run_bridge(bridge, args.interval, prog, reconcile_interval=args.reconcile_interval,
                             observer_write_interval=args.observer_write_interval)
         return 0
@@ -5636,17 +5639,24 @@ def _legacy_with_transcript(answers: list[str], blocks: Sequence[TranscriptBlock
     """
     merged: list[str] = []
     paired: set[int] = set()
+    unpaired: list[int] = []
     for answer in answers:
         index = next((index for index in range(len(blocks) - 1, -1, -1)
                       if rendered_equivalent(answer, blocks[index].body)), None)
         if index is not None:
             paired.add(index)
+        else:
+            unpaired.append(len(rendered_key(answer)))
         merged.append(blocks[index].body if index is not None and answer not in stored else answer)
     shown = rendered_key(rendered)
     for index, block in enumerate(blocks):
         if index in paired or block.body in merged:
             continue
-        if any(key and key in shown for key in (rendered_key(block.body), label_key(block.body))):
+        keys = (rendered_key(block.body), label_key(block.body))
+        if any(len(key) >= MIN_VISIBLE_KEY_CHARS and key in shown for key in keys):
+            continue
+        # An unpaired screen answer about as long is most likely this block drawn differently.
+        if any(4 * length >= 3 * len(keys[0]) and 4 * len(keys[0]) >= 3 * length for length in unpaired):
             continue
         if any(same_rendered_text(other, block.body) for other in stored):
             continue

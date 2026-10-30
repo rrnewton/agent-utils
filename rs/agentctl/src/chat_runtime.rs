@@ -9603,7 +9603,10 @@ and the replies captured for them. The provider's own thread is the complete rec
                 &withheld,
                 &text,
             )?;
-            self.settle_transcript_bodies(key, &text.consumed);
+            // A refusal may be temporary (a limit reached), so its blocks are weighed again.
+            if capture.refused.is_empty() {
+                self.settle_transcript_bodies(key, &text.consumed);
+            }
             if !capture.transcript_ordinals.is_empty() {
                 transcript_replies.push((key.clone(), capture.transcript_ordinals.clone()));
             }
@@ -11314,7 +11317,9 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
                     &withheld,
                     &text,
                 )?;
-                self.settle_transcript_bodies(key, &text.consumed);
+                if capture.refused.is_empty() {
+                    self.settle_transcript_bodies(key, &text.consumed);
+                }
                 capture
             }
         };
@@ -15941,6 +15946,8 @@ fn merge_transcript_blocks(
         return merged;
     }
     let mut paired = vec![false; candidates.len()];
+    // The rendered lengths of screen blocks no transcript block pairs with, by nonce and ID.
+    let mut unpaired: BTreeMap<(String, String), Vec<usize>> = BTreeMap::new();
     for (nonce, found) in by_nonce.iter() {
         for block in &found.blocks {
             if let Some(index) = candidates.iter().rposition(|(owner, source, _)| {
@@ -15953,6 +15960,11 @@ fn merge_transcript_blocks(
                 text.clean
                     .insert(block.body.clone(), candidates[index].1.body.clone());
                 text.consumed.insert(candidates[index].1.body.clone());
+            } else {
+                unpaired
+                    .entry((nonce.clone(), block.identifier.clone()))
+                    .or_default()
+                    .push(rendered_key(&block.body).chars().count());
             }
         }
     }
@@ -15963,9 +15975,25 @@ fn merge_transcript_blocks(
         }
         let key = rendered_key(&source.body);
         let label = agent_harness::replies::label_key(&source.body);
-        if [key, label]
+        // Visible elsewhere on the screen: the screen path handles it. A short text is visible
+        // inside almost any screen, so it is not judged that way.
+        if [&key, &label]
             .iter()
-            .any(|key| !key.is_empty() && shown.contains(key.as_str()))
+            .any(|key| key.chars().count() >= MIN_VISIBLE_KEY_CHARS && shown.contains(key.as_str()))
+        {
+            continue;
+        }
+        // A screen block under the same ID that pairs with nothing and is about as long is most
+        // likely this block drawn in a way the pairing does not know: it is stored from the
+        // screen, and this block waits (it is not settled) rather than be sent beside it.
+        let length = key.chars().count();
+        if unpaired
+            .get(&((*nonce).to_owned(), source.identifier.clone()))
+            .is_some_and(|lengths| {
+                lengths
+                    .iter()
+                    .any(|shown| shown * 4 >= length * 3 && length * 4 >= shown * 3)
+            })
         {
             continue;
         }
@@ -16008,16 +16036,33 @@ struct TranscriptText {
     consumed: BTreeSet<String>,
 }
 
+/// The shortest rendered text judged visible elsewhere on a screen by containment.
+const MIN_VISIBLE_KEY_CHARS: usize = 24;
+
 /// Whether `left` and `right` read the same once rendered: the same characters once whitespace,
-/// box drawing and Markdown markup are set aside, with or without Markdown link targets. Unlike
-/// the pairing of a screen block with its source, the same characters in another order do not
-/// count: here two stored texts are compared.
+/// box drawing and Markdown markup are set aside, with or without Markdown link targets, or,
+/// when either holds a table, the same characters in another order, as when its cells wrapped.
 fn same_rendered_text(left: &str, right: &str) -> bool {
-    use agent_harness::replies::{label_key, rendered_key};
+    use agent_harness::replies::{has_table, label_key, rendered_key};
     let keys = |text: &str| [rendered_key(text), label_key(text)];
-    let (left, right) = (keys(left), keys(right));
-    left.iter()
-        .any(|key| !key.is_empty() && right.contains(key))
+    let (left_keys, right_keys) = (keys(left), keys(right));
+    if left_keys
+        .iter()
+        .any(|key| !key.is_empty() && right_keys.contains(key))
+    {
+        return true;
+    }
+    if !(has_table(left) || has_table(right)) {
+        return false;
+    }
+    let sorted = |key: &String| {
+        let mut chars: Vec<char> = key.chars().collect();
+        chars.sort_unstable();
+        chars
+    };
+    left_keys
+        .iter()
+        .any(|key| !key.is_empty() && right_keys.iter().any(|other| sorted(key) == sorted(other)))
 }
 
 /// The most transcript blocks remembered as settled before the memory starts over.
@@ -28099,6 +28144,30 @@ opening line for, the reply block marked {nonce}_2, so that block was not sent.\
         assert!(reader
             .capture_snapshot("")
             .expect("empty")
+            .replies
+            .is_empty());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_screen_block_drawn_in_an_unknown_way_is_stored_once_from_the_screen() {
+        // The terminal drew the task box in a way the pairing does not know, so the screen block
+        // pairs with nothing; the transcript block about as long waits instead of going out too.
+        let (state, key, nonce, root) = open_request("transcript-unpaired");
+        let id = format!("{nonce}_1");
+        let written = "- [x] the release build passed and its checks are green on the host";
+        let drawn = "☑ the release build passed and its checks are green on the host";
+        let later = Some(unix_millis() + 1_000);
+        let reader = with_transcript(&state, vec![transcript_block(&id, written, later)]);
+        let capture = reader
+            .capture_snapshot(&reply_block(&id, drawn))
+            .expect("capture");
+        assert_eq!(capture.replies, [(key.clone(), vec![1])]);
+        assert!(capture.transcript_replies.is_empty(), "{capture:?}");
+        assert_eq!(state.read_reply(&key, 1).expect("reply").body, drawn);
+        assert!(reader
+            .capture_snapshot(&reply_block(&id, drawn))
+            .expect("again")
             .replies
             .is_empty());
         fs::remove_dir_all(root).expect("cleanup");

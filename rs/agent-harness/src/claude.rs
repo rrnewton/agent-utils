@@ -42,9 +42,15 @@ impl Transcript for Claude {
             .environment("CLAUDE_CONFIG_DIR")
             .map(PathBuf::from)
             .or_else(|| hints.home_dir().map(|home| home.join(".claude")))?;
-        let (session, evidence, cwd) = match hints.session_id() {
-            Some(session) => (session.to_owned(), "the session id given".to_owned(), None),
-            None => running_session(hints, &config)?,
+        // The live process's record beats a recorded id, which a cleared or resumed
+        // conversation leaves behind.
+        let (session, evidence, cwd) = match running_session(hints, &config) {
+            Some(found) => found,
+            None => (
+                hints.session_id()?.to_owned(),
+                "the session id given".to_owned(),
+                None,
+            ),
         };
         let projects = config.join("projects");
         let cwd = cwd.or_else(|| hints.cwd.clone());
