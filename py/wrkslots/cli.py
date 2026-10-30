@@ -4102,11 +4102,21 @@ def _remove_slot_directory(config: Config, path: Path) -> None:
 
 
 def _provision_slot_image(
-    config: Config, slot: str, slot_type: str, slot_path: Path
+    config: Config,
+    slot: str,
+    slot_type: str,
+    slot_path: Path,
+    settings: slotimage.ImageSettings | None = None,
 ) -> slotimage.SlotImage:
+    """Provision one slot's images with ``settings`` (default: the configured image settings)."""
+
     try:
         image = slotimage.provision(
-            config.control, slot_type, slot, slot_path, config.image_settings
+            config.control,
+            slot_type,
+            slot,
+            slot_path,
+            config.image_settings if settings is None else settings,
         )
     except slotimage.ImageError as exc:
         raise Refusal(
@@ -4220,6 +4230,44 @@ def _init_salvage_push_remotes(
     if isinstance(existing, list) and all(isinstance(item, str) for item in existing):
         return tuple(str(item) for item in existing)
     return ()
+
+
+def _create_image_settings(config: Config, args: argparse.Namespace) -> slotimage.ImageSettings:
+    """This create's image settings: the configured ones, with any per-create ceiling applied.
+
+    The result is a copy for this one slot; the configured defaults are never
+    edited. A ceiling given for a slot that will not be image-backed is refused
+    rather than silently ignored.
+    """
+
+    settings = config.image_settings
+    ceiling: object = getattr(args, "image_ceiling_gib", None)
+    state_ceiling: object = getattr(args, "image_state_ceiling_gib", None)
+    if ceiling is None and state_ceiling is None:
+        return settings
+    representation = _requested_representation(config, args)
+
+    def checked_bytes(option: str, value: object) -> int:
+        if representation != "image":
+            raise Refusal(
+                f"{option} applies only to image-backed slots, and this slot would be "
+                f"stored as {representation}",
+                remedy="add --representation image, or drop the ceiling option",
+            )
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise Refusal(f"{option} must be at least 1")
+        return value * GIB
+
+    if ceiling is not None:
+        settings = dataclasses.replace(
+            settings, ceiling_bytes=checked_bytes("--image-ceiling-gib", ceiling)
+        )
+    if state_ceiling is not None:
+        settings = dataclasses.replace(
+            settings,
+            state_ceiling_bytes=checked_bytes("--image-state-ceiling-gib", state_ceiling),
+        )
+    return settings
 
 
 def _requested_representation(config: Config, args: argparse.Namespace) -> str:
@@ -25918,6 +25966,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
     _validate_agent_name(args.agent)
     if not args.task or not args.purpose:
         raise Refusal("task and purpose must be non-empty")
+    image_settings = _create_image_settings(config, args)
     owner = (
         _capture_registration_owner(args.owner_pid)
         if args.owner_pid is not None
@@ -26039,7 +26088,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
         if representation == "image":
             # The slot directory becomes the mount point of a fresh image; for
             # the flat layout `git worktree add` then fills the empty image root.
-            _provision_slot_image(config, args.slot, args.slot_type, slot_path)
+            _provision_slot_image(
+                config, args.slot, args.slot_type, slot_path, image_settings
+            )
             _fsync_directory(slot_path.parent)
         elif config.layout == "nested":
             slot_path.mkdir(mode=0o755)
@@ -60948,6 +60999,31 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "slot directory is the mount point of one sparse ext4 disk image under "
             "<control>/slot-images/), or config (the configured slot_representation; "
             "default). The choice is recorded per slot and never changes lifecycle policy"
+        ),
+    )
+    create.add_argument(
+        "--image-ceiling-gib",
+        type=int,
+        default=None,
+        metavar="GIB",
+        help=(
+            "apparent size of THIS slot's image in GiB, recorded in its IMAGE.json; the "
+            "image is sparse, so this is an upper bound, not a reservation. Image-backed "
+            "slots only; refused for a worktree slot. The configured default is not changed "
+            "(default: configuration.image.ceiling_bytes, else "
+            f"{slotimage.DEFAULT_CEILING_BYTES // GIB})"
+        ),
+    )
+    create.add_argument(
+        "--image-state-ceiling-gib",
+        type=int,
+        default=None,
+        metavar="GIB",
+        help=(
+            "apparent size of THIS slot's state image (its private $HOME layer) in GiB. "
+            "Image-backed slots only; refused for a worktree slot. The configured default is "
+            "not changed (default: configuration.image.state_ceiling_bytes, else "
+            f"{slotimage.DEFAULT_STATE_CEILING_BYTES // GIB})"
         ),
     )
     create.add_argument("--format", choices=("human", "json"), default="human")

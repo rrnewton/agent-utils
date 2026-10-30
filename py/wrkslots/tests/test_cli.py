@@ -2,13 +2,22 @@
 
 from __future__ import annotations
 
+import argparse
+import dataclasses
+import json
+import os
+import re
 import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+from wrkslots import cli, sandbox, slotimage
+
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 COMPATIBILITY_COMMAND = PACKAGE_ROOT.parent / "wrkslots.py"
+GIB = 1024**3
 
 
 def _run(*args: str) -> subprocess.CompletedProcess[str]:
@@ -99,3 +108,247 @@ def test_userguide_is_the_packaged_document() -> None:
 
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout == (PACKAGE_ROOT / "USER_GUIDE.md").read_text(encoding="utf-8")
+
+
+# ------------------------------------------------- per-create image ceilings
+
+
+def _git(cwd: Path, *args: str) -> str:
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env.update(
+        {
+            "LC_ALL": "C",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+        }
+    )
+    result = subprocess.run(
+        [
+            "git", "-c", "user.email=test@example.invalid", "-c", "user.name=Test",
+            "-c", "commit.gpgsign=false", "-C", str(cwd), *args,
+        ],
+        capture_output=True, text=True, check=True, env=env, timeout=120,
+    )
+    return result.stdout.strip()
+
+
+def _create_fixture(base: Path) -> Path:
+    """A project with one upstream repository and no slots."""
+
+    root = base / "project"
+    (root / "worktrees").mkdir(parents=True)
+    (root / "live.py").write_text("# probe\n")
+    (root / ".wrkslots.yml").write_text(
+        "schema: 2\n"
+        "machine: node-a\n"
+        "worktrees_dir: worktrees\n"
+        "default_remote: origin\n"
+        "default_landed_ref: refs/remotes/origin/main\n"
+        "heartbeat_ttl_seconds: 60\n"
+        "liveness_command: live.py\n"
+    )
+    upstream = base / "upstream-repo"
+    upstream.mkdir()
+    _git(upstream, "init", "-q", "-b", "main")
+    (upstream / "file.txt").write_text("one\n")
+    _git(upstream, "add", "file.txt")
+    _git(upstream, "commit", "-q", "-m", "one")
+    _git(upstream, "remote", "add", "origin", str(upstream))
+    _git(upstream, "fetch", "-q", "origin", "+refs/heads/*:refs/remotes/origin/*")
+    return root
+
+
+def _create_args(root: Path, **overrides: object) -> argparse.Namespace:
+    """The namespace `create` parses, without the per-create ceiling options."""
+
+    values: dict[str, object] = dict(
+        project_root=str(root), machine="node-a", slot="slot-b", slot_type="agent",
+        coordinator_authorized=True, agent="agent-new", task="task-1",
+        purpose="testing", owner_pid=os.getpid(), coordinator_pid=os.getpid(),
+        task_scope_unit=None, task_scope_invocation_id=None,
+        repo=["repo=../upstream-repo"], remote=[], remote_url=[],
+        branch=["repo=suite/new"], start=[], override_disk_floor=False,
+        representation="config", format="human", wait_lock=0.0,
+    )
+    values.update(overrides)
+    return argparse.Namespace(**values)
+
+
+def _record_provisioning(monkeypatch: pytest.MonkeyPatch) -> list[slotimage.ImageSettings]:
+    """Replace image provisioning (sudo or FUSE) by a recorder that only makes the mount point."""
+
+    seen: list[slotimage.ImageSettings] = []
+
+    def provision(
+        control: Path, slot_type: str, slot: str, location: Path, settings: slotimage.ImageSettings
+    ) -> slotimage.SlotImage:
+        seen.append(settings)
+        location.mkdir(mode=0o755)
+        return slotimage.SlotImage(
+            directory=slotimage.image_directory(control, slot_type, slot),
+            slot=slot,
+            slot_type=slot_type,
+            location=location,
+            ceiling_bytes=settings.ceiling_bytes,
+            state_ceiling_bytes=settings.state_ceiling_bytes,
+            backend="kernel",
+            created_at="2026-10-30T00:00:00Z",
+            phase="ready",
+        )
+
+    monkeypatch.setattr(slotimage, "provision", provision)
+    return seen
+
+
+def test_create_help_documents_both_per_create_ceilings() -> None:
+    create = " ".join(_run("create", "--help").stdout.split())
+
+    assert "--image-ceiling-gib GIB" in create
+    assert "--image-state-ceiling-gib GIB" in create
+    assert "configuration.image.state_ceiling_bytes" in create
+
+
+def test_create_threads_per_create_ceilings_into_provisioning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen = _record_provisioning(monkeypatch)
+    root = _create_fixture(tmp_path)
+    configured = cli._load_config(str(root), "node-a")
+
+    assert cli._cmd_create(
+        _create_args(
+            root, representation="image", image_ceiling_gib=24, image_state_ceiling_gib=3
+        )
+    ) == 0
+
+    assert [(item.ceiling_bytes, item.state_ceiling_bytes) for item in seen] == [
+        (24 * GIB, 3 * GIB)
+    ]
+    # Only this slot's copy changed; the configured defaults are untouched.
+    assert seen[0].backend == configured.image_settings.backend
+    after = cli._load_config(str(root), "node-a")
+    assert after.image_settings == configured.image_settings == slotimage.ImageSettings()
+    assert "image" not in (root / ".wrkslots.yml").read_text()
+
+
+def test_create_keeps_the_configured_ceilings_without_the_options(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen = _record_provisioning(monkeypatch)
+    root = _create_fixture(tmp_path)
+
+    # A namespace with no ceiling attributes at all: callers that predate the options.
+    assert cli._cmd_create(_create_args(root, representation="image")) == 0
+
+    assert seen == [slotimage.ImageSettings()]
+
+
+def test_create_sets_only_the_ceiling_it_is_given(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen = _record_provisioning(monkeypatch)
+    root = _create_fixture(tmp_path)
+
+    assert cli._cmd_create(
+        _create_args(
+            root, representation="image", image_ceiling_gib=None, image_state_ceiling_gib=2
+        )
+    ) == 0
+
+    assert [(item.ceiling_bytes, item.state_ceiling_bytes) for item in seen] == [
+        (slotimage.DEFAULT_CEILING_BYTES, 2 * GIB)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        (
+            {"representation": "worktree", "image_ceiling_gib": 20},
+            "--image-ceiling-gib applies only to image-backed slots",
+        ),
+        (
+            {"representation": "config", "image_state_ceiling_gib": 2},
+            "--image-state-ceiling-gib applies only to image-backed slots",
+        ),
+        ({"representation": "image", "image_ceiling_gib": 0}, "--image-ceiling-gib must be at least 1"),
+        (
+            {"representation": "image", "image_state_ceiling_gib": -1},
+            "--image-state-ceiling-gib must be at least 1",
+        ),
+    ],
+)
+def test_create_refuses_a_ceiling_it_cannot_apply_before_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, overrides: dict[str, object], message: str
+) -> None:
+    seen = _record_provisioning(monkeypatch)
+    root = _create_fixture(tmp_path)
+    before = sorted(path.relative_to(root) for path in root.rglob("*"))
+
+    with pytest.raises(cli.Refusal, match=re.escape(message)):
+        cli._cmd_create(_create_args(root, **overrides))
+
+    assert seen == []
+    assert sorted(path.relative_to(root) for path in root.rglob("*")) == before
+
+
+def test_provision_slot_image_uses_the_settings_it_is_given(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen = _record_provisioning(monkeypatch)
+    monkeypatch.setattr(cli, "_refresh_owned_mounts", lambda config: None)
+    root = _create_fixture(tmp_path)
+    config = cli._load_config(str(root), "node-a")
+    custom = dataclasses.replace(config.image_settings, state_ceiling_bytes=5 * GIB)
+
+    cli._provision_slot_image(config, "a", "agent", tmp_path / "a", custom)
+    cli._provision_slot_image(config, "b", "agent", tmp_path / "b")
+
+    assert seen == [custom, config.image_settings]
+
+
+# ------------------------------------------- root launcher bytecode suppression
+
+
+def test_root_helper_adds_dont_write_bytecode_only_when_this_interpreter_has_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    helper = str(Path(sandbox.__file__).resolve())
+    interpreter = os.path.realpath(sys.executable)
+
+    monkeypatch.setattr(sys, "dont_write_bytecode", False)
+    assert sandbox.root_helper("SPEC") == [
+        "sudo", "-n", "--", interpreter, "-I", helper, "enter-root", "SPEC"
+    ]
+
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    assert sandbox.root_helper("SPEC") == [
+        "sudo", "-n", "--", interpreter, "-I", "-B", helper, "enter-root", "SPEC"
+    ]
+
+
+@pytest.mark.parametrize(("flags", "expected"), [((), ["-I"]), (("-B",), ["-I", "-B"])])
+def test_root_helper_carries_the_callers_dash_b_across_sudo_by_argv(
+    tmp_path: Path, flags: tuple[str, ...], expected: list[str]
+) -> None:
+    """A `python3 -B` caller yields a root helper argv with `-I -B`; sudo scrubs the environment."""
+
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key != "PYTHONDONTWRITEBYTECODE"
+    }
+    environment["PYTHONPATH"] = str(PACKAGE_ROOT.parent)
+    completed = subprocess.run(
+        [
+            sys.executable, *flags, "-c",
+            "import json; from wrkslots import sandbox; print(json.dumps(sandbox.root_helper('SPEC')))",
+        ],
+        cwd=tmp_path, env=environment, text=True, capture_output=True, check=False, timeout=60,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    argv = json.loads(completed.stdout)
+    assert argv[4 : 4 + len(expected)] == expected
+    assert argv[4 + len(expected)].endswith("sandbox.py")

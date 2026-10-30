@@ -1923,7 +1923,10 @@ Images are sparse and are never pre-allocated. `configuration.image.ceiling_byte
 image costs about 70 MiB of host space (the ext4 journal and metadata). Deleted files return
 their blocks to the host: kernel mounts use online discard, FUSE mounts return them on
 `wrkslots image trim` or unmount. `wrkslots image grow SLOT --ceiling-gib N` raises a ceiling
-without copying anything.
+without copying anything. `create --image-ceiling-gib N` and `create --image-state-ceiling-gib N`
+size one new slot's slot image and state image instead of the configured ceilings; the sizes are
+recorded in that slot's `IMAGE.json`, the configuration is not changed, and both options are
+refused for a slot that will be stored as plain worktrees.
 
 Host-wide space is still finite. Watch it with `wrkslots image status`, which reports each image's
 host-allocated bytes, bytes used inside it, and inode count.

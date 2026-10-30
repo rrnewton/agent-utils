@@ -1469,9 +1469,15 @@ def userns_helper(spec: Mapping[str, object], command: Sequence[str]) -> list[st
 
 
 def root_helper(spec_file: str) -> list[str]:
-    """Argv that builds the view as root through ``sudo -n``, then drops privilege."""
+    """Argv that builds the view as root through ``sudo -n``, then drops privilege.
 
-    return ["sudo", "-n", "--", _interpreter(), "-I", str(Path(__file__).resolve()), "enter-root", spec_file]
+    When this interpreter writes no bytecode (``python3 -B``), the root helper
+    gets ``-B`` too. It has to travel in argv: ``-I`` ignores
+    ``PYTHONDONTWRITEBYTECODE`` and sudo scrubs the environment anyway.
+    """
+
+    flags = ["-I", "-B"] if sys.dont_write_bytecode else ["-I"]
+    return ["sudo", "-n", "--", _interpreter(), *flags, str(Path(__file__).resolve()), "enter-root", spec_file]
 
 
 def check_sudo() -> None:
