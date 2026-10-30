@@ -22945,16 +22945,23 @@ def test_supersede_handoff_rebinds_a_live_lane_and_voids_the_queue_entry(
     assert record.generation == 2
     assert record.owner is not None and record.owner.pid == successor.pid
     events = wrkslots._load_events(config, "testhost")
-    supersessions = [
-        event
-        for event in events
-        if event.get("kind") == "active-state-recorded"
-        and (event.get("payload") or {}).get("action") == "handoff-superseded"
-    ]
+    supersessions: list[dict[str, object]] = []
+    for event in events:
+        payload = event.get("payload")
+        if (
+            event.get("kind") == "active-state-recorded"
+            and isinstance(payload, dict)
+            and payload.get("action") == "handoff-superseded"
+        ):
+            supersessions.append(event)
     assert len(supersessions) == 1
-    evidence = supersessions[0]["payload"]["evidence"]
+    supersession_payload = supersessions[0].get("payload")
+    assert isinstance(supersession_payload, dict)
+    evidence = supersession_payload.get("evidence")
+    assert isinstance(evidence, dict)
     assert evidence["previous_agent"] == "codex-1"
-    assert evidence["superseded_handoff_read_sequence"] >= 1
+    sequence = evidence.get("superseded_handoff_read_sequence")
+    assert isinstance(sequence, int) and sequence >= 1
     assert evidence["voided_owner_release"] is True
 
 
