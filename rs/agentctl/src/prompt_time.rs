@@ -43,6 +43,9 @@ pub(crate) fn field(created_at: &str, now_millis: u64) -> String {
 /// How a [`field`] begins; [`retime`] tells the two kinds of opening apart by it.
 const FIELD_KEY: &str = "sent: ";
 
+/// What stands before a [`field`] in a header line: the sender header's separator.
+const FIELD_SEPARATOR: &str = crate::sender_header::SEPARATOR;
+
 /// The message's create time as a stamp, and how much later it is typed when that is at least
 /// [`LATE_PROMPT_AFTER`]: `2026.10.07:08:45 EDT` or `2026.10.07:08:45 EDT, delivered 2 min later`.
 fn when(created_at: &str, now_millis: u64) -> Option<String> {
@@ -127,7 +130,8 @@ pub(crate) fn queue_deferred(text: &str, now_millis: u64) -> Option<QueuedOpenin
 
 /// The text to type for a queued prompt that recorded `sent_at` and `opening`: that opening
 /// replaced by one for `now_millis`. An opening `Sent ...` must begin the text; a `sent: ...`
-/// field must be in its first line, and its first occurrence there is replaced. `None` when the
+/// field must be in its first line after a ` · ` separator, and its first such occurrence there
+/// is replaced. `None` when the
 /// opening is not where it belongs, or `sent_at` cannot be read; the text is then typed as
 /// stored, never cut.
 pub(crate) fn retime(text: &str, sent_at: &str, opening: &str, now_millis: u64) -> Option<String> {
@@ -139,8 +143,10 @@ pub(crate) fn retime(text: &str, sent_at: &str, opening: &str, now_millis: u64) 
     if !opening.starts_with(FIELD_KEY) {
         return None;
     }
+    // The field follows a header separator, so a sender or channel name that happens to read
+    // like a field is never taken for it.
     let first_line = text.split('\n').next().unwrap_or_default();
-    let at = first_line.find(opening)?;
+    let at = first_line.find(&format!("{FIELD_SEPARATOR}{opening}"))? + FIELD_SEPARATOR.len();
     Some(format!(
         "{}{}{}",
         &text[..at],
@@ -669,6 +675,23 @@ mod tests {
             Some(
                 "[from Ada via slack #team · sent: 2026.10.07:08:45 EDT, delivered 1 h 12 min later · reply: <CHAT_REPLY_007>]\n\nsent: an echo in the body"
                     .to_owned()
+            )
+        );
+        // A sender whose name reads like the field is not taken for it: only a field after a
+        // separator is.
+        let lookalike =
+            "[from sent: 2026.10.07:08:45 EDT via slack #team · sent: 2026.10.07:08:45 EDT]";
+        assert_eq!(
+            retime(
+                lookalike,
+                &queued.sent_at,
+                &queued.opening,
+                at(MORNING + 72 * 60)
+            )
+            .as_deref(),
+            Some(
+                "[from sent: 2026.10.07:08:45 EDT via slack #team · sent: 2026.10.07:08:45 EDT, \
+delivered 1 h 12 min later]"
             )
         );
         // An unreadable create time gives no placeholder, so no control character is typed.

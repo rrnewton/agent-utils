@@ -72,8 +72,10 @@ pub const RENAMES_TRIPWIRE: &str = "upgrade-agentctl-registry-layout-2";
 /// Its content, for whoever opens it.
 pub const RENAMES_TRIPWIRE_TEXT: &str = "This registry uses agentctl registry layout 2. agentctl \
 builds older than layout 2 stop at this file; upgrade agentctl. Readers of rename journals skip it.\n";
+/// The directory holding the registry's chat bridges, one entry each.
+pub const BRIDGES: &str = "bridges";
 /// Names no agent may take: each is a directory of the registry itself.
-pub const RESERVED_NAMES: [&str; 3] = ["archive", AGENTS, LOCKS];
+pub const RESERVED_NAMES: [&str; 4] = ["archive", AGENTS, LOCKS, BRIDGES];
 /// The registry-wide lock files, `REGISTRY/.<stem>.lock`, that are fixed items, not agents'
 /// layout-1 locks. Layout 1 shared `.coordinator.lock` between the designation and an agent
 /// named `coordinator`; it stays, as the designation lock.
@@ -526,6 +528,8 @@ mod tests {
         assert_eq!(record_directories(&registry, "twice").unwrap().len(), 1);
         assert_eq!(names(&registry).unwrap(), ["new", "old", "twice"]);
         assert!(locate(&registry, "agents").is_err());
+        assert!(locate(&registry, "bridges").is_err());
+        assert!(!is_agent_name("bridges"));
         fs::remove_dir_all(registry).unwrap();
     }
 

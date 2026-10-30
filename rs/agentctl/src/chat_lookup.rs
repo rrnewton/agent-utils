@@ -18,7 +18,9 @@
 
 use std::fs;
 use std::io::{self, Read as _};
-use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+use std::os::unix::fs::{
+    DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
+};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -28,8 +30,9 @@ use sha2::{Digest as _, Sha256};
 
 use crate::chat_runtime::BridgeState;
 
-/// The registry's directory of bridges, one subdirectory (or link to a state directory) each.
-pub const BRIDGES: &str = "bridges";
+/// The registry's directory of bridges, one subdirectory (or link to a state directory) each;
+/// no agent may take its name.
+pub const BRIDGES: &str = agent_queue::registry::BRIDGES;
 /// The environment variable naming one bridge state directory for every `chat` command.
 pub const BRIDGE_VARIABLE: &str = "AGENTCTL_CHAT_BRIDGE";
 /// The environment variable naming the index directory in place of the default; `off` turns
@@ -66,8 +69,9 @@ pub fn index_directory() -> Option<PathBuf> {
         }
         return Some(PathBuf::from(value));
     }
+    // The XDG specification says a relative path in the variable is to be ignored.
     let state = std::env::var_os("XDG_STATE_HOME")
-        .filter(|value| !value.is_empty())
+        .filter(|value| Path::new(value).is_absolute())
         .map(PathBuf::from)
         .or_else(|| {
             std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state"))
@@ -102,8 +106,24 @@ pub fn register(state: &Path, registry: &Path) -> io::Result<PathBuf> {
 fn register_in(directory: &Path, state: &Path, registry: &Path) -> io::Result<PathBuf> {
     let state = fs::canonicalize(state)?;
     let registry = fs::canonicalize(registry).or_else(|_| std::path::absolute(registry))?;
-    fs::create_dir_all(directory)?;
-    fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+    if let Some(parent) = directory.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    match fs::DirBuilder::new().mode(0o700).create(directory) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    // The index must be this user's own private directory, not a link to another.
+    let metadata = fs::symlink_metadata(directory)?;
+    // SAFETY: geteuid has no preconditions.
+    let uid = unsafe { libc::geteuid() };
+    if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
+        return Err(io::Error::other(format!(
+            "the bridge index {} is not a private directory of this user (mode 0700)",
+            directory.display()
+        )));
+    }
     prune(directory);
     let entry = IndexEntry {
         schema: INDEX_SCHEMA.to_owned(),
@@ -118,11 +138,12 @@ fn register_in(directory: &Path, state: &Path, registry: &Path) -> io::Result<Pa
         std::process::id()
     ));
     {
+        let _ = fs::remove_file(&temporary);
         let mut file = fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(&temporary)?;
         serde_json::to_writer_pretty(&mut file, &entry).map_err(io::Error::other)?;
         io::Write::write_all(&mut file, b"\n")?;
@@ -151,9 +172,17 @@ fn index_entries_in(directory: &Path) -> Vec<(PathBuf, IndexEntry)> {
         if path.extension().is_none_or(|extension| extension != "json") {
             continue;
         }
-        let Ok(file) = fs::File::open(&path) else {
+        // A FIFO or a link planted in the index is skipped, never waited on or followed.
+        let Ok(file) = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&path)
+        else {
             continue;
         };
+        if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
+            continue;
+        }
         let mut text = String::new();
         if file
             .take(MAX_INDEX_ENTRY_BYTES)
@@ -253,6 +282,8 @@ pub struct Resolved {
     pub state: PathBuf,
     /// The key of the request that gave the reply ID, when one was given.
     pub request: Option<String>,
+    /// The registry the bridge serves, as far as the lookup knows it.
+    pub registry: Option<PathBuf>,
 }
 
 /// What a lookup was asked.
@@ -267,8 +298,16 @@ pub struct Query<'a> {
     pub registry: &'a Path,
 }
 
-/// Find the bridge for `query`: see the module documentation. `caller` names the calling agent
-/// in a registry, or `None` when it cannot tell; `environment` is `AGENTCTL_CHAT_BRIDGE`.
+/// Find the bridge for `query`: see the module documentation. `caller` names the registered
+/// agent whose pinned harness is the caller's nearest ancestor in a registry, or `None`;
+/// `agent_variable` is `AGENTCTL_AGENT`, which names the caller only in the working registry
+/// ([`find_registry`]), and only when `caller` names nobody there; `environment` is
+/// `AGENTCTL_CHAT_BRIDGE`.
+///
+/// When the caller is known in any registry, only bridges that target it are considered; only
+/// when it is known nowhere are all of them. Of those, when any is live (a `chat run` holds its
+/// runner lock), only the live ones are, so a reply never goes to a stopped bridge whose state
+/// is kept while a running one serves the caller.
 ///
 /// # Errors
 ///
@@ -276,6 +315,7 @@ pub struct Query<'a> {
 pub fn resolve(
     query: &Query<'_>,
     environment: Option<PathBuf>,
+    agent_variable: Option<&str>,
     caller: &dyn Fn(&Path) -> Option<String>,
 ) -> Result<Resolved, String> {
     let registry = find_registry(query.registry);
@@ -308,7 +348,11 @@ pub fn resolve(
             })?),
             None => None,
         };
-        return Ok(Resolved { state, request });
+        return Ok(Resolved {
+            state,
+            request,
+            registry: Some(registry),
+        });
     }
     let all = candidates(&registry);
     if all.is_empty() {
@@ -319,36 +363,31 @@ pub fn resolve(
             index_directory().map_or_else(|| "(off)".to_owned(), |path| path.display().to_string()),
         ));
     }
+    let working = fs::canonicalize(&registry).unwrap_or_else(|_| registry.clone());
     let mut callers = std::collections::BTreeMap::new();
-    let mut caller_of = |registry: &Path| {
+    for candidate in &all {
+        let key =
+            fs::canonicalize(&candidate.registry).unwrap_or_else(|_| candidate.registry.clone());
         callers
-            .entry(registry.to_path_buf())
-            .or_insert_with(|| caller(registry))
-            .clone()
+            .entry(key)
+            .or_insert_with(|| caller(&candidate.registry));
+    }
+    if !callers.values().any(Option::is_some) {
+        if let Some(name) = agent_variable {
+            callers.insert(working.clone(), Some(name.to_owned()));
+        }
+    }
+    let caller_in = |candidate: &Candidate| {
+        let key =
+            fs::canonicalize(&candidate.registry).unwrap_or_else(|_| candidate.registry.clone());
+        callers.get(&key).cloned().flatten()
     };
+    let known = callers.values().any(Option::is_some);
     let targeted = all
         .iter()
-        .filter(|candidate| {
-            caller_of(&candidate.registry).as_deref() == Some(candidate.agent.as_str())
-        })
+        .filter(|candidate| caller_in(candidate).as_deref() == Some(candidate.agent.as_str()))
         .cloned()
         .collect::<Vec<_>>();
-    let pool = if targeted.is_empty() {
-        all.clone()
-    } else {
-        targeted.clone()
-    };
-    let mut fitting = Vec::new();
-    for candidate in pool {
-        let request = match query.reply_id {
-            Some(reply_id) => match request_in(&candidate.state, reply_id) {
-                Ok(Some(key)) => Some(key),
-                Ok(None) | Err(_) => continue,
-            },
-            None => None,
-        };
-        fitting.push((candidate, request));
-    }
     let describe = |candidates: &[Candidate]| {
         candidates
             .iter()
@@ -363,33 +402,63 @@ pub fn resolve(
             .collect::<Vec<_>>()
             .join("; ")
     };
+    if known && targeted.is_empty() {
+        let names = callers
+            .values()
+            .flatten()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        return Err(format!(
+            "no chat bridge targets you ({}); bridges considered: {}; pass --bridge-state DIR to \
+             name one",
+            names.into_iter().collect::<Vec<_>>().join(", "),
+            describe(&all)
+        ));
+    }
+    let pool = if known { targeted } else { all.clone() };
+    let live = pool
+        .iter()
+        .filter(|candidate| {
+            crate::lock_wait::holder_of(&candidate.state.join(".run.lock")).is_some()
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let pool = if live.is_empty() { pool } else { live };
+    let mut fitting = Vec::new();
+    for candidate in &pool {
+        let request = match query.reply_id {
+            Some(reply_id) => match request_in(&candidate.state, reply_id) {
+                Ok(Some(key)) => Some(key),
+                Ok(None) | Err(_) => continue,
+            },
+            None => None,
+        };
+        fitting.push((candidate.clone(), request));
+    }
     match fitting.len() {
         1 => {
             let (candidate, request) = fitting.remove(0);
             Ok(Resolved {
                 state: candidate.state,
                 request,
+                registry: Some(candidate.registry),
             })
         }
         0 => Err(match query.reply_id {
             Some(reply_id) => format!(
                 "no chat bridge {}gave the reply ID {reply_id:?}; bridges considered: {}",
-                if targeted.is_empty() {
-                    ""
-                } else {
-                    "serving you "
-                },
-                describe(if targeted.is_empty() { &all } else { &targeted })
+                if known { "serving you " } else { "" },
+                describe(&pool)
             ),
             None => "no chat bridge fits".to_owned(),
         }),
         _ => Err(format!(
             "{} chat bridges fit{}; pass --bridge NAME or --bridge-state DIR: {}",
             fitting.len(),
-            if targeted.is_empty() {
-                " and agentctl cannot tell which agent you are"
-            } else {
+            if known {
                 ""
+            } else {
+                " and agentctl cannot tell which agent you are"
             },
             describe(
                 &fitting
@@ -428,6 +497,27 @@ pub fn agentctl_on_path_is_this_build() -> bool {
     version_output(&found, Duration::from_secs(3)).is_some_and(|output| {
         output.trim_end() == format!("agentctl {}", crate::build_info::version_text()).trim_end()
     })
+}
+
+/// How long [`agentctl_on_path_is_this_build_cached`] trusts its last answer.
+const PATH_CHECK_TTL: Duration = Duration::from_secs(60);
+
+/// [`agentctl_on_path_is_this_build`], asked again once its last answer is older than a minute,
+/// so a running bridge follows a `PATH` program that is replaced or rolled back.
+#[must_use]
+pub fn agentctl_on_path_is_this_build_cached() -> bool {
+    static LAST: std::sync::Mutex<Option<(Instant, bool)>> = std::sync::Mutex::new(None);
+    let mut last = LAST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((at, answer)) = *last {
+        if at.elapsed() < PATH_CHECK_TTL {
+            return answer;
+        }
+    }
+    let answer = agentctl_on_path_is_this_build();
+    *last = Some((Instant::now(), answer));
+    answer
 }
 
 fn on_path(program: &str) -> Option<PathBuf> {
@@ -500,7 +590,8 @@ Send each reply one way only. If the command fails twice, print the reply betwee
 the end of your turn instead.\n\n\
 What reached the chat:            agentctl chat sent {id}\n\
 Earlier messages in the thread:   agentctl chat thread {id}\n\
-This page for one request:        agentctl chat help {id}\n\n\
+This page for one request:        agentctl chat help {id}\n\
+Every chat subcommand:            agentctl chat --help\n\n\
 These find the bridge that serves you by caller lookup; when that fails, add --bridge-state DIR \
 (and --request KEY to `chat reply`). The whole protocol: agentctl chat userguide\n"
     ));
@@ -552,7 +643,7 @@ mod tests {
                 reply_id: None,
                 registry: Path::new("/nonexistent-registry"),
             };
-            assert!(resolve(&query, None, &|_| None).is_err(), "{name:?}");
+            assert!(resolve(&query, None, None, &|_| None).is_err(), "{name:?}");
         }
     }
 }

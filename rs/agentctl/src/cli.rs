@@ -3883,18 +3883,13 @@ fn chat_target(
     target: &ChatTarget,
     reply_id: Option<&str>,
 ) -> Result<crate::chat_lookup::Resolved, Failure> {
-    let environment = std::env::var("AGENTCTL_AGENT")
+    let agent_variable = std::env::var("AGENTCTL_AGENT")
         .ok()
         .filter(|name| crate::subagents::name(name).is_ok());
     let caller = |candidate: &Path| -> Option<String> {
-        let registered = HerdrClient::with_executable("direct", herdr_bin)
-            .ok()
-            .and_then(|client| {
-                ManagedAgents::new(&client, candidate)
-                    .ok()
-                    .and_then(|manager| manager.caller_edge().map(|edge| edge.agent))
-            });
-        registered.or_else(|| environment.clone())
+        let client = HerdrClient::with_executable("direct", herdr_bin).ok()?;
+        let manager = ManagedAgents::new(&client, candidate).ok()?;
+        manager.caller_edge().map(|edge| edge.agent)
     };
     crate::chat_lookup::resolve(
         &crate::chat_lookup::Query {
@@ -3906,6 +3901,7 @@ fn chat_target(
         std::env::var_os(crate::chat_lookup::BRIDGE_VARIABLE)
             .filter(|value| !value.is_empty())
             .map(PathBuf::from),
+        agent_variable.as_deref(),
         &caller,
     )
     .map_err(|problem| lookup_failure(&problem))
@@ -4104,17 +4100,33 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
                         Ok(crate::chat_lookup::Resolved {
                             state,
                             request: Some(key),
+                            registry: bridge_registry,
                         }) => {
                             let found_by_lookup = value.target.bridge_state.is_none()
                                 && value.target.bridge.is_none();
                             match crate::chat_runtime::BridgeState::inspect(&state) {
-                                Ok(bridge) => bridge
-                                    .with_prompt_commands(crate::chat_runtime::PromptCommands {
-                                        bare: found_by_lookup
-                                            && crate::chat_lookup::agentctl_on_path_is_this_build(),
-                                        discoverable: found_by_lookup,
-                                    })
-                                    .help_page(reply_id, &key),
+                                Ok(bridge) => {
+                                    // A headless agent replies only by the command, as its
+                                    // prompts say; `chat run` learns that from the registry too.
+                                    let agent = bridge.config().agent_name.clone();
+                                    let headless = bridge_registry.as_deref().is_some_and(|path| {
+                                        HerdrClient::with_executable("direct", &herdr_bin)
+                                            .ok()
+                                            .and_then(|client| {
+                                                ManagedAgents::new(&client, path).ok().and_then(
+                                                    |manager| manager.is_headless(&agent).ok(),
+                                                )
+                                            })
+                                            .unwrap_or(false)
+                                    });
+                                    bridge
+                                        .with_command_only_replies(headless)
+                                        .with_prompt_commands(crate::chat_runtime::PromptCommands {
+                                            bare: found_by_lookup,
+                                            discoverable: found_by_lookup,
+                                        })
+                                        .help_page(reply_id, &key)
+                                }
                                 Err(error) => crate::chat_lookup::generic_help(
                                     Some(reply_id),
                                     Some(&error.to_string()),

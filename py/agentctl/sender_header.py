@@ -44,7 +44,7 @@ SEPARATOR = " · "
 #: agent as the sender.
 _HARNESSES = ("claude", "codex", "muse")
 _AGENT_NAME = re.compile(r"[a-z][a-z0-9-]{0,31}")
-_RESERVED = ("archive", "agents", "locks")
+_RESERVED = ("archive", "agents", "locks", "bridges")
 _FIELD_KEY = re.compile(r"[a-z-]+")
 
 

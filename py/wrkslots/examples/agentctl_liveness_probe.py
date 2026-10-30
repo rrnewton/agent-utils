@@ -58,7 +58,7 @@ from typing import cast
 
 NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
 #: The registry's own directories, never agents (agentctl registry layout 2).
-RESERVED = ("archive", "agents", "locks")
+RESERVED = ("archive", "agents", "locks", "bridges")
 IDENTITY_KEYS = (
     "custom_process_identity", "foreign_shell_identity", "terminal_identity", "harness_identity",
 )

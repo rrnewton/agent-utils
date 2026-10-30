@@ -152,7 +152,7 @@ def retime(text: str, sent_at: object, recorded: object, now_nanos: int | None =
     """The text to type for a queued prompt: ``recorded``, its opening, replaced by one for now.
 
     An opening ``Sent ...`` must begin the text; a ``sent: ...`` header field must be in its first
-    line, and its first occurrence there is replaced. The text is returned unchanged unless the
+    line after a `` · `` separator, and its first such occurrence there is replaced. The text is returned unchanged unless the
     recorded opening is where it belongs and ``sent_at`` is a readable create time, so a record
     that does not fit is never used to cut it.
     """
@@ -163,9 +163,12 @@ def retime(text: str, sent_at: object, recorded: object, now_nanos: int | None =
             return text
         at, render = 0, opening
     elif recorded.startswith(_FIELD_KEY):
-        at = text.split("\n", 1)[0].find(recorded)
+        # The field follows a header separator, so a sender or channel name that happens to read
+        # like a field is never taken for it.
+        at = text.split("\n", 1)[0].find(" · " + recorded)
         if at < 0:
             return text
+        at += len(" · ")
         render = field
     else:
         return text

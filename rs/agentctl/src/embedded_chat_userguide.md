@@ -531,9 +531,10 @@ inbound-only bridge's header has no `reply:`, and its footer says that nothing
 the agent writes reaches the chat.
 
 The message stands between the tag lines `<chat_message>` and
-`</chat_message>`, exactly as sent; a line of it that is itself one of these
-tags is printed with `<\/` (or `<\`) in its place, so the message cannot close
-its fence early. The tags are stable. When a provider payload with schema
+`</chat_message>`, exactly as sent; a line of it that reads as one of these
+tags (in any case, whatever spaces or invisible characters it holds) is printed
+with `<\` in place of its first `<`, as `<\/chat_message>`, so the message
+cannot close its fence early. The tags are stable. When a provider payload with schema
 `google.chat.message.v1` quotes an earlier message, a `Quoted message:` block
 comes before the opening tag: a line naming that message, then its text with
 every line prefixed by `> `, or an empty line by `>` alone. A long quote keeps
