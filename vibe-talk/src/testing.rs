@@ -1221,6 +1221,15 @@ impl crate::chat::ChatClient for CountingChat {
         self.inner.polls_thread_replies(channel)
     }
 
+    fn reread_thread(
+        &self,
+        channel: &crate::model::ChannelId,
+        thread: &str,
+        after: Option<&crate::model::MessageId>,
+    ) -> bool {
+        self.inner.reread_thread(channel, thread, after)
+    }
+
     fn takes_pushed_messages(&self, channel: &crate::model::ChannelId) -> bool {
         self.inner.takes_pushed_messages(channel)
     }

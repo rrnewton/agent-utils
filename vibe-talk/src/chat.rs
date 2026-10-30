@@ -1159,6 +1159,24 @@ pub trait ChatClient: Send + Sync {
         })
     }
 
+    /// Have the live poller's next [`ChatClient::fetch_live`] of `channel` read the replies of
+    /// `thread` posted after `after` (the newest reply this server holds of it, or `None` for
+    /// every reply), whatever the provider took the thread as read to. `#708 vt-live-push`.
+    ///
+    /// A seed takes every thread as read to where its root says it stands, so replies that no
+    /// read brought before it (the server was down, or every read was refused) would otherwise
+    /// never reach the cache: the poller asks for them here when its root counts more replies
+    /// than the cache holds. Whether the provider will read them; false by default, for a
+    /// provider whose live read keeps no place in a thread.
+    fn reread_thread(
+        &self,
+        _channel: &ChannelId,
+        _thread: &str,
+        _after: Option<&MessageId>,
+    ) -> bool {
+        false
+    }
+
     /// Whether this provider can turn a message its own event stream delivered, content and all,
     /// into a [`Message`] for `channel` ([`ChatClient::pushed_message`]). `#452 slack-live-ingest`.
     ///

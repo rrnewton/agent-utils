@@ -1725,6 +1725,10 @@ impl ChatClient for ProfiledClient {
         self.inner.polls_thread_replies(channel)
     }
 
+    fn reread_thread(&self, channel: &ChannelId, thread: &str, after: Option<&MessageId>) -> bool {
+        self.inner.reread_thread(channel, thread, after)
+    }
+
     fn takes_pushed_messages(&self, channel: &ChannelId) -> bool {
         self.inner.takes_pushed_messages(channel)
     }

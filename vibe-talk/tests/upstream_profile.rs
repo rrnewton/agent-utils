@@ -460,6 +460,15 @@ impl ChatClient for Recorder {
         self.note("polls_thread_replies");
         true
     }
+    fn reread_thread(
+        &self,
+        _channel: &ChannelId,
+        _thread: &str,
+        _after: Option<&MessageId>,
+    ) -> bool {
+        self.note("reread_thread");
+        true
+    }
     fn takes_pushed_messages(&self, _channel: &ChannelId) -> bool {
         self.note("takes_pushed_messages");
         true
@@ -804,6 +813,8 @@ async fn every_method_reaches_the_wrapped_clients_own_override_and_each_upstream
     ran("polls_thread_replies");
     assert!(client.takes_pushed_messages(&channel));
     ran("takes_pushed_messages");
+    assert!(client.reread_thread(&channel, "1.0", None));
+    ran("reread_thread");
     let pushed = client
         .pushed_message(&channel, serde_json::json!({"ts": "1.0"}))
         .await
