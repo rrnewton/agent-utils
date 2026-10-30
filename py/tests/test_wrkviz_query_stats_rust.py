@@ -97,7 +97,11 @@ def _write_projection(root: Path, name: str, records: list[dict[str, object]]) -
     compressed = gzip.compress(raw, mtime=0)
     container = f"{name}.gz"
     (root / container).write_bytes(compressed)
-    timestamps = [int(record["timestamp_ms"]) for record in records]  # type: ignore[arg-type]
+    timestamps: list[int] = []
+    for record in records:
+        stamp = record["timestamp_ms"]
+        assert isinstance(stamp, int)
+        timestamps.append(stamp)
     header = {
         "format": "wrkviz/seekable-jsonl-index",
         "version": 1,
