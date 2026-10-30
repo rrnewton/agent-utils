@@ -100,9 +100,10 @@ test:
 # The page suites on their own, for the edit-run loop. Seconds rather than a full cargo test.
 #
 # EVERY suite, by glob, not a named file: the page's own suite and the contract's validators are
-# two, and naming one of them is how a third comes to exist without ever being run.
+# two, and naming one of them is how a third comes to exist without ever being run. The second glob
+# is the page modules' own suites, one directory down (tests/js/<layer>/<area>.test.mjs).
 page:
-	node --test tests/js/*.test.mjs
+	node --test tests/js/*.test.mjs tests/js/*/*.test.mjs
 
 # The page build (`#624 voice-page-modularity`): the shell, one minified script and one stylesheet
 # under content-hashed names, their source maps and assets.json, into target/web. Every cargo build

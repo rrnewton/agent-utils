@@ -126,12 +126,15 @@ def test_javascript_validation_entrypoints_are_owned_once() -> None:
         path.read_text(encoding="utf-8")
         for path in sorted((REPO_ROOT / "vibe-talk/tests").glob("*.rs"))
     ]
-    vibe_suites = sorted((REPO_ROOT / "vibe-talk/tests/js").glob("*.test.mjs"))
+    # The page modules' own suites sit a directory down (tests/js/<layer>/<area>.test.mjs), and
+    # two layers can share an area's name, so a suite is named by its path under tests/js.
+    vibe_root = REPO_ROOT / "vibe-talk/tests/js"
+    vibe_suites = sorted(vibe_root.rglob("*.test.mjs"))
     assert vibe_suites
     for path in vibe_suites:
-        suite = path.name
+        suite = f"tests/js/{path.relative_to(vibe_root).as_posix()}"
         assert sum(suite in harness for harness in harnesses) == 1
-        if suite != "voice_page.test.mjs":
+        if suite != "tests/js/voice_page.test.mjs":
             assert suite not in commands
 
 
