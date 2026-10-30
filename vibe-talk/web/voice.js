@@ -129,26 +129,26 @@ const COLUMN_IDS = {
  * `fromCards` says the thread the right column shows was entered from its card, so that ← goes back
  * out to the cards (`#277 thread-card-focus`, `enterCard`).
  *
- * `older`, `arrows`, `load`, `entry` and `pins` are the column's own records of its older pages
+ * `older`, `arrows`, `load`, `entry`, `pins` and `tools` are the column's own records of its older pages
  * (`freshOlderPages`, `olderPages`), its reply arrows (`freshReplyArrows`, `replyArrows`), its reads'
- * state (`freshLoadState`, `loadState`), entering a view (`freshEntryState`, `entryState`) and its
- * Pinned filter (`freshPinsView`, `pinsView`; `#624 voice-page-modularity`, plan step 15): field groups
- * kept on the column rather than in `state`.
+ * state (`freshLoadState`, `loadState`), entering a view (`freshEntryState`, `entryState`), its Pinned
+ * filter (`freshPinsView`, `pinsView`) and its scroll tools' pass (`freshScrollTools`, `scrollTools`;
+ * `#624 voice-page-modularity`, plan step 15): field groups kept on the column rather than in `state`.
  *
  * @typedef {{matched: number, loaded: number, tally: any, pinned: boolean}} SearchCount
  * @typedef {{name: string, state: unknown[] | null, searched: SearchCount | null,
  *   searchWalk: any, searchNote: {key: string, text: string} | null,
  *   older: ReturnType<typeof freshOlderPages>, arrows: ReturnType<typeof freshReplyArrows>,
  *   load: ReturnType<typeof freshLoadState>, entry: ReturnType<typeof freshEntryState>,
- *   pins: ReturnType<typeof freshPinsView>}} ColumnFields
+ *   pins: ReturnType<typeof freshPinsView>, tools: ReturnType<typeof freshScrollTools>}} ColumnFields
  * @type {{main: ColumnFields, side: ColumnFields & {mode: "list" | "thread", fromCards: boolean}}}
  */
 const columns = {
   main: { name: "main", state: null, searched: null, searchWalk: null, searchNote: null, older: freshOlderPages(), arrows: freshReplyArrows(),
-    load: freshLoadState(), entry: freshEntryState(), pins: freshPinsView() },
+    load: freshLoadState(), entry: freshEntryState(), pins: freshPinsView(), tools: freshScrollTools() },
   side: { name: "side", state: null, searched: null, searchWalk: null, searchNote: null, mode: "list", fromCards: false,
     older: freshOlderPages(), arrows: freshReplyArrows(), load: freshLoadState(), entry: freshEntryState(),
-    pins: freshPinsView() },
+    pins: freshPinsView(), tools: freshScrollTools() },
 };
 /** The column the code is working on now. The left one, except inside `inColumn`. */
 let activeColumn = columns.main;
@@ -5442,10 +5442,21 @@ function visibleFolds() {
   return foldsOf(list).filter((entry) => !entry.li.hasAttribute("data-read-run"));
 }
 
-/** How many redraws are under way that pass over the scroll tools once, at their end. `#226`. */
-let scrollToolsHeld = 0;
-/** Whether a pass over them was asked for inside one. */
-let scrollToolsOwed = false;
+/**
+ * A column's own record of its scroll tools' pass (`#624 voice-page-modularity`, plan step 15, as
+ * `freshOlderPages`): `held`, how many redraws are under way that pass over the scroll tools once, at
+ * their end (`#226`); `owed`, whether a pass over them was asked for inside one.
+ *
+ * @returns {{held: number, owed: boolean}}
+ */
+function freshScrollTools() {
+  return { held: 0, owed: false };
+}
+
+/** The column being worked on's record of its scroll tools' pass (`freshScrollTools`). */
+function scrollTools() {
+  return activeColumn.tools;
+}
 
 /**
  * Run `draw`, a redraw that ends with a pass over the scroll tools, passing over them once, at its
@@ -5454,21 +5465,21 @@ let scrollToolsOwed = false;
  * every row and decides every reply's arrow again.
  */
 function holdingScrollTools(draw) {
-  scrollToolsHeld += 1;
+  scrollTools().held += 1;
   try {
     return draw();
   } finally {
-    scrollToolsHeld -= 1;
-    if (scrollToolsHeld === 0 && scrollToolsOwed) renderScrollTools();
+    scrollTools().held -= 1;
+    if (scrollTools().held === 0 && scrollTools().owed) renderScrollTools();
   }
 }
 
 function renderScrollTools() {
-  if (scrollToolsHeld > 0) {
-    scrollToolsOwed = true;
+  if (scrollTools().held > 0) {
+    scrollTools().owed = true;
     return;
   }
-  scrollToolsOwed = false;
+  scrollTools().owed = false;
   // `#229 desktop-two-column`. The right column's chip is its jump to the newest message. The rest
   // float over the left column and act on it.
   if (sideActive) {
@@ -47123,8 +47134,6 @@ const COLUMN_STATE = [
   [() => archivedIds, (value) => { archivedIds = value; }, () => new Set()],
   [() => backlogSize, (value) => { backlogSize = value; }, () => 0],
   [() => filterHold, (value) => { filterHold = value; }, () => null],
-  [() => scrollToolsHeld, (value) => { scrollToolsHeld = value; }, () => 0],
-  [() => scrollToolsOwed, (value) => { scrollToolsOwed = value; }, () => false],
   [() => jumpNewestWanted.discord, (value) => { jumpNewestWanted.discord = value; }, () => false],
   [() => inScrollback.discord, (value) => { inScrollback.discord = value; }, () => false],
   [() => threadBackGesture, (value) => { threadBackGesture = value; }, () => null],
@@ -50874,6 +50883,7 @@ function resetSideColumn(reopen = false) {
     columns.side.load = freshLoadState();
     columns.side.entry = freshEntryState();
     columns.side.pins = freshPinsView();
+    columns.side.tools = freshScrollTools();
   }
   for (const id of ["side-log", "side-thread-list", "side-summary", "side-pinned-log", "side-outgoing-log"]) {
     leftEl(id).replaceChildren();
