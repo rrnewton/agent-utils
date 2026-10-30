@@ -7197,7 +7197,7 @@ test("`#624 voice-page-modularity`: a read asked for while another is out joins 
   assert.deepStrictEqual([started, generation.current()], [0, 1]);
 });
 
-test("`#624 voice-page-modularity`: each column keeps its own records of its older pages, reply arrows, reads, entries, pins and scroll tools, reached through the column worked on", () => {
+test("`#624 voice-page-modularity`: each column keeps its own records of its older pages, reply arrows, reads, entries, pins, scroll tools and filters, reached through the column worked on", () => {
   const page = newPage();
   const same = (expression) => page.pure(expression);
   assert.equal(same("olderPages() === columns.main.older"), true, "the left column's record was not the one worked on");
@@ -7226,7 +7226,7 @@ test("`#624 voice-page-modularity`: each column keeps its own records of its old
   // And entering a view.
   assert.equal(same("inColumn(columns.side, () => entryState()) === columns.side.entry && entryState() === columns.main.entry"), true);
   assert.deepStrictEqual(JSON.parse(same("JSON.stringify(freshEntryState())")),
-    { threadOwed: null, threadAwaitsRead: false, readOwed: null, landing: null });
+    { threadOwed: null, threadAwaitsRead: false, readOwed: null, landing: null, backGesture: null });
   // And its Pinned filter.
   same("inColumn(columns.side, () => { pinsView().only = true; })");
   assert.deepStrictEqual(JSON.parse(same("JSON.stringify([columns.side.pins.only, pinsView().only])")), [true, false]);
@@ -7235,6 +7235,9 @@ test("`#624 voice-page-modularity`: each column keeps its own records of its old
   same("inColumn(columns.side, () => { scrollTools().held += 1; })");
   assert.deepStrictEqual(JSON.parse(same("JSON.stringify([columns.side.tools.held, scrollTools().held])")), [1, 0]);
   assert.deepStrictEqual(JSON.parse(same("JSON.stringify(freshScrollTools())")), { held: 0, owed: false });
+  // And its filters' hold.
+  assert.equal(same("inColumn(columns.side, () => filterState()) === columns.side.filter && filterState() === columns.main.filter"), true);
+  assert.deepStrictEqual(JSON.parse(same("JSON.stringify(freshFilterState())")), { hold: null });
 });
 
 test("`#624 voice-page-modularity`: the live events counted per channel, from the module alone", () => {
@@ -63355,7 +63358,7 @@ test("`#243 filter-keeps-selection`: Pinned turned on at the newest line before 
   assert.equal(pinnedIds(page).length, 11, "the pins did not land");
   assert.ok(atBottomOf(area), "the pins landed with the reader at the oldest of them");
   // THE CONTROL: without the newest line kept for the pins, they land under a reader at their oldest.
-  const lost = await run(brokenScript("    filterHold = anchor\n      ? {", "    filterHold = anchor && !anchor.newest\n      ? {"));
+  const lost = await run(brokenScript("    filterState().hold = anchor\n      ? {", "    filterState().hold = anchor && !anchor.newest\n      ? {"));
   assert.ok(!atBottomOf(lost.area), "the test cannot see the pins land at their oldest");
 });
 
@@ -63633,7 +63636,7 @@ test("`#243 filter-keeps-selection`: after the reader acts in the list — a pre
     assert.ok(atBottomOf(page.el("scroll-area")), `after ${act}, a reader on the newest line was not followed down`);
   }
   // THE CONTROL: with the reader's act not ending the hold, the same tap leaves the new message unfollowed.
-  const page = await kept(brokenScript("function readerActed() {\n  filterHold = null;", "function readerActed() {\n  return;"));
+  const page = await kept(brokenScript("function readerActed() {\n  filterState().hold = null;", "function readerActed() {\n  return;"));
   await acts["a tap in the list"](page);
   page.messages = [...page.messages, message({ id: String(n), content: longMessage("arrived") })];
   await reReadChannel(page);

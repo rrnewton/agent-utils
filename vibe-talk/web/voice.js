@@ -129,26 +129,29 @@ const COLUMN_IDS = {
  * `fromCards` says the thread the right column shows was entered from its card, so that ← goes back
  * out to the cards (`#277 thread-card-focus`, `enterCard`).
  *
- * `older`, `arrows`, `load`, `entry`, `pins` and `tools` are the column's own records of its older pages
+ * `older`, `arrows`, `load`, `entry`, `pins`, `tools` and `filter` are the column's own records of its older pages
  * (`freshOlderPages`, `olderPages`), its reply arrows (`freshReplyArrows`, `replyArrows`), its reads'
  * state (`freshLoadState`, `loadState`), entering a view (`freshEntryState`, `entryState`), its Pinned
- * filter (`freshPinsView`, `pinsView`) and its scroll tools' pass (`freshScrollTools`, `scrollTools`;
- * `#624 voice-page-modularity`, plan step 15): field groups kept on the column rather than in `state`.
+ * filter (`freshPinsView`, `pinsView`), its scroll tools' pass (`freshScrollTools`, `scrollTools`) and
+ * its filters' hold (`freshFilterState`, `filterState`; `#624 voice-page-modularity`, plan step 15):
+ * field groups kept on the column rather than in `state`.
  *
  * @typedef {{matched: number, loaded: number, tally: any, pinned: boolean}} SearchCount
  * @typedef {{name: string, state: unknown[] | null, searched: SearchCount | null,
  *   searchWalk: any, searchNote: {key: string, text: string} | null,
  *   older: ReturnType<typeof freshOlderPages>, arrows: ReturnType<typeof freshReplyArrows>,
  *   load: ReturnType<typeof freshLoadState>, entry: ReturnType<typeof freshEntryState>,
- *   pins: ReturnType<typeof freshPinsView>, tools: ReturnType<typeof freshScrollTools>}} ColumnFields
+ *   pins: ReturnType<typeof freshPinsView>, tools: ReturnType<typeof freshScrollTools>,
+ *   filter: ReturnType<typeof freshFilterState>}} ColumnFields
  * @type {{main: ColumnFields, side: ColumnFields & {mode: "list" | "thread", fromCards: boolean}}}
  */
 const columns = {
   main: { name: "main", state: null, searched: null, searchWalk: null, searchNote: null, older: freshOlderPages(), arrows: freshReplyArrows(),
-    load: freshLoadState(), entry: freshEntryState(), pins: freshPinsView(), tools: freshScrollTools() },
+    load: freshLoadState(), entry: freshEntryState(), pins: freshPinsView(), tools: freshScrollTools(),
+    filter: freshFilterState() },
   side: { name: "side", state: null, searched: null, searchWalk: null, searchNote: null, mode: "list", fromCards: false,
     older: freshOlderPages(), arrows: freshReplyArrows(), load: freshLoadState(), entry: freshEntryState(),
-    pins: freshPinsView(), tools: freshScrollTools() },
+    pins: freshPinsView(), tools: freshScrollTools(), filter: freshFilterState() },
 };
 /** The column the code is working on now. The left one, except inside `inColumn`. */
 let activeColumn = columns.main;
@@ -3134,7 +3137,7 @@ function dismissBanner() {
 function scrollToNewest() {
   const area = el("scroll-area");
   // A message a filter change held in place is let go: the reader is going somewhere else. `#243`.
-  filterHold = null;
+  filterState().hold = null;
   // `#338 column-overscroll`: a reader in the room past the right column's foot is on that line already.
   followFoot(area);
   setJumpNewest(false);
@@ -5721,10 +5724,10 @@ function applyFoldStep(step, folds, field = null) {
     placeFilterAnchor(anchor);
     const row = anchor.row;
     const head = (sideActive ? sidePane : channelPane).head();
-    if (filterHold !== null && filterHold.row === row && row.getBoundingClientRect().bottom <= head) {
+    if (filterState().hold !== null && filterState().hold.row === row && row.getBoundingClientRect().bottom <= head) {
       const area = el("scroll-area");
       area.scrollTop += row.getBoundingClientRect().top - head;
-      filterHold = { ...filterHold, at: area.scrollTop,
+      filterState().hold = { ...filterState().hold, at: area.scrollTop,
         offset: row.getBoundingClientRect().top - listPlaceTop(area) };
     }
   }
@@ -7190,7 +7193,7 @@ function seamsAfterMidnight() {
 //
 //   * BEFORE the change, the anchor: the selected message (`#239 single-selection`; drawn, or chosen
 //     silently by a tap) while it shows; else the message the last change kept in place, while the
-//     reader has not scrolled since (`filterHold`), which makes turning a filter on and off again a
+//     reader has not scrolled since (`filterState().hold`), which makes turning a filter on and off again a
 //     round trip; else today's place-keeping — the newest line for a reader on it, or the first
 //     message showing under the floating line. Its message ids, its time and how far its top is below
 //     the top of the list's box are noted.
@@ -7229,9 +7232,21 @@ function seamsAfterMidnight() {
  * offset, at, origin, mark }` — the list it is in, the row and its messages, its height in the list's
  * box, the scroll position that put it there, the anchor the change was asked to keep, and the message
  * selected in that list then. `ids` is null when the filters emptied the list, and the anchor waits
- * for something to show. Per column.
+ * for something to show. Per column: a column's `filterState().hold`.
+ *
+ * A column's own record of its filters' hold (`#624 voice-page-modularity`, plan step 15, as
+ * `freshOlderPages`).
+ *
+ * @returns {{hold: any}}
  */
-let filterHold = null;
+function freshFilterState() {
+  return { hold: null };
+}
+
+/** The column being worked on's record of its filters' hold (`freshFilterState`). */
+function filterState() {
+  return activeColumn.filter;
+}
 
 /** True while a filter change is under way, so a filter turned off inside another is placed once, by the outer. */
 let filterChanging = 0;
@@ -7377,10 +7392,10 @@ function nearestShownRow(anchor) {
  * Null, and the hold forgotten, once the reader has moved.
  */
 function currentFilterHold() {
-  const hold = filterHold;
+  const hold = filterState().hold;
   if (hold === null) return null;
   if (currentScreen !== "main" || hold.key !== filterKey()) {
-    filterHold = null;
+    filterState().hold = null;
     return null;
   }
   if (hold.ids === null) return listEmptied() ? { hold, row: null } : null;
@@ -7389,7 +7404,7 @@ function currentFilterHold() {
   const unmoved = Math.abs(area.scrollTop - hold.at) <= 1 || (row !== null &&
     Math.abs(row.getBoundingClientRect().top - listPlaceTop(area) - hold.offset) <= 1);
   if (!unmoved) {
-    filterHold = null;
+    filterState().hold = null;
     return null;
   }
   // `row` null: its message has gone from the list — a read of what Hide read leaves — under a reader
@@ -7416,7 +7431,7 @@ function heldFilterRow() {
  * filter change put in place.
  */
 function readerActed() {
-  filterHold = null;
+  filterState().hold = null;
   if (!sideActive) endFilterWalk();
 }
 
@@ -7438,12 +7453,12 @@ function keepFilterHold() {
   if (held === null || held.hold.ids === null) return false;
   if (held.row === null) {
     placeFilterAnchor(held.hold.origin, false, true);
-    return filterHold !== null;
+    return filterState().hold !== null;
   }
   const row = held.row;
   const area = el("scroll-area");
-  area.scrollTop += row.getBoundingClientRect().top - listPlaceTop(area) - filterHold.offset;
-  filterHold = { ...filterHold, row, ids: idsOf(row).length ? idsOf(row) : filterHold.ids, at: area.scrollTop };
+  area.scrollTop += row.getBoundingClientRect().top - listPlaceTop(area) - filterState().hold.offset;
+  filterState().hold = { ...filterState().hold, row, ids: idsOf(row).length ? idsOf(row) : filterState().hold.ids, at: area.scrollTop };
   return true;
 }
 
@@ -7547,13 +7562,13 @@ function placeFilterAnchor(anchor, wasEmptied = false, walked = false) {
     area.scrollTop = 0;
     // Kept for what fills the list again — the newest line too: Pinned turned on there before the pins
     // were read shows "Loading…" until they land, and they land at the newest pin, not the oldest.
-    filterHold = anchor
+    filterState().hold = anchor
       ? { key: filterKey(), row: null, ids: null, offset: 0, at: area.scrollTop, origin: anchor, mark: null } : null;
     renderJumpNewest();
     return;
   }
   if (!anchor || anchor.newest) {
-    filterHold = null;
+    filterState().hold = null;
     if (anchor || wasEmptied) scrollToNewest();
     else renderJumpNewest();
     return;
@@ -7567,14 +7582,14 @@ function placeFilterAnchor(anchor, wasEmptied = false, walked = false) {
     id = anchor.alternate.ids.length ? anchor.alternate.ids[0] : null;
   }
   if (!row && !walked && olderThanLoaded(anchor)) {
-    filterHold = null;
+    filterState().hold = null;
     guardQuietly(walkToFilterAnchor)(anchor);
     return;
   }
   const substitute = row ? null : nearestShownRow(anchor);
   const placed = row || substitute;
   if (!placed) {
-    filterHold = null;
+    filterState().hold = null;
     renderJumpNewest();
     return;
   }
@@ -7583,7 +7598,7 @@ function placeFilterAnchor(anchor, wasEmptied = false, walked = false) {
   carrySelection(anchor, placed, substitute !== null);
   const pane = currentView === "discord" ? (sideActive ? sidePane : channelPane) : null;
   const mark = pane ? markOf(pane) : null;
-  filterHold = {
+  filterState().hold = {
     key: filterKey(), row: placed, ids: idsOf(placed), at: area.scrollTop, origin: anchor,
     offset: placed.getBoundingClientRect().top - listPlaceTop(area), mark: mark ? mark.id : null,
   };
@@ -7705,7 +7720,7 @@ async function walkToFilterAnchor(anchor) {
  * placed now. A filter change it waited through has placed the reader already.
  */
 function settlePendingFilterPlace() {
-  const hold = filterHold;
+  const hold = filterState().hold;
   if (hold === null || hold.ids !== null || hold.key !== filterKey() || listEmptied() || filterChanging > 0) return;
   placeFilterAnchor(hold.origin, true);
 }
@@ -25962,12 +25977,13 @@ function catchUpFromAll() {
 
 /**
  * A column's own record of entering a view (`#624 voice-page-modularity`, plan step 15, as
- * `freshOlderPages`): `threadOwed`, `threadAwaitsRead`, `readOwed` and `landing`, each said below.
+ * `freshOlderPages`): `threadOwed`, `threadAwaitsRead`, `readOwed` and `landing`, each said below;
+ * `backGesture`, a swipe back out of a thread under way (the scroll area's pointer handlers).
  *
- * @returns {{threadOwed: string | null, threadAwaitsRead: boolean, readOwed: any, landing: any}}
+ * @returns {{threadOwed: string | null, threadAwaitsRead: boolean, readOwed: any, landing: any, backGesture: any}}
  */
 function freshEntryState() {
-  return { threadOwed: null, threadAwaitsRead: false, readOwed: null, landing: null };
+  return { threadOwed: null, threadAwaitsRead: false, readOwed: null, landing: null, backGesture: null };
 }
 
 /** The column being worked on's record of entering a view (`freshEntryState`). */
@@ -33384,7 +33400,7 @@ function rowOnScreen(row) {
 function revealRow(row, center = false) {
   const area = el("scroll-area");
   // The reader asked for this message: a filter change's hold, and its walk back, give way. `#243`.
-  filterHold = null;
+  filterState().hold = null;
   endFilterWalk();
   const clear = floatingClearance(area) + REPLY_LANDING_GAP_PX;
   // `#580 open-in-chat-jump`: centred in the room under what floats over the list, or under the top
@@ -47133,10 +47149,8 @@ const COLUMN_STATE = [
   [() => collapsedRunRows, (value) => { collapsedRunRows = value; }, () => 0],
   [() => archivedIds, (value) => { archivedIds = value; }, () => new Set()],
   [() => backlogSize, (value) => { backlogSize = value; }, () => 0],
-  [() => filterHold, (value) => { filterHold = value; }, () => null],
   [() => jumpNewestWanted.discord, (value) => { jumpNewestWanted.discord = value; }, () => false],
   [() => inScrollback.discord, (value) => { inScrollback.discord = value; }, () => false],
-  [() => threadBackGesture, (value) => { threadBackGesture = value; }, () => null],
 ];
 
 /** Work on column `column` from now on: its state into the module's, the other's put aside. */
@@ -50884,6 +50898,7 @@ function resetSideColumn(reopen = false) {
     columns.side.entry = freshEntryState();
     columns.side.pins = freshPinsView();
     columns.side.tools = freshScrollTools();
+    columns.side.filter = freshFilterState();
   }
   for (const id of ["side-log", "side-thread-list", "side-summary", "side-pinned-log", "side-outgoing-log"]) {
     leftEl(id).replaceChildren();
@@ -57294,15 +57309,15 @@ el("channel-compose-text").addEventListener("keydown", (event) =>
   onComposerKey(event, guardQuietly(sendChannelMessage), el("channel-compose-text"))
 );
 watchBoxInsertions(el("channel-compose-text"));
-let threadBackGesture = null;
+// A thread's back gesture under way: a column's `entryState().backGesture` (`#624 voice-page-modularity`).
 el("scroll-area").addEventListener("pointerdown", (event) => {
   if (channelView !== "thread" || event.pointerType === "mouse") return;
   if (["TEXTAREA", "INPUT", "BUTTON"].includes(String(event.target && /** @type {Element} */ (event.target).tagName).toUpperCase())) return;
-  threadBackGesture = { x: event.clientX, y: event.clientY };
+  entryState().backGesture = { x: event.clientX, y: event.clientY };
 });
 el("scroll-area").addEventListener("pointerup", (event) => {
-  const start = threadBackGesture;
-  threadBackGesture = null;
+  const start = entryState().backGesture;
+  entryState().backGesture = null;
   if (!start || channelView !== "thread") return;
   const dx = event.clientX - start.x;
   const dy = event.clientY - start.y;
@@ -57311,7 +57326,7 @@ el("scroll-area").addEventListener("pointerup", (event) => {
     guardQuietly(closeThread)();
   }
 });
-el("scroll-area").addEventListener("pointercancel", () => { threadBackGesture = null; });
+el("scroll-area").addEventListener("pointercancel", () => { entryState().backGesture = null; });
 // `#229 desktop-two-column`. The layout button, and the right column's own controls: each acts in
 // the right column, as its counterpart in #pane-discord acts in the left.
 el("column-toggle").addEventListener("click", toggleColumns);
