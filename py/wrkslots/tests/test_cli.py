@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Sequence
 
 import pytest
 from wrkslots import cli, imagecmd, sandbox, slotimage
@@ -1774,6 +1775,51 @@ def test_build_view_masks_policy_paths_strictly_and_confirms_them(
     assert [event for event in events if event[0] in ("mask", "git-mask", "confirm")] == [
         ("mask", str(home / ".ssh")), ("mask", "/etc/gitconfig"), ("mask", str(home / ".gitconfig")),
     ]
+
+
+def test_a_location_created_after_the_final_observation_never_reaches_a_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Discriminator for creation AFTER the entry's final observation.
+
+    The policy path is missing while the view is built; a host process creates
+    it right after the in-view confirmation (the last observation before the
+    command would start). An unmounted missing location must never be accepted:
+    build_view refuses, so no command ever sees the file. STUB view: mount calls
+    and the steps around them are recorded; the strict mask and the confirmation
+    are the real functions.
+    """
+
+    events: list[tuple[object, ...]] = []
+    for name in ("_mount", "_bind_fd", "_remount_read_only", "_limit_propagation"):
+        monkeypatch.setattr(sandbox, name, lambda *args, name=name: events.append((name, *args)))
+    monkeypatch.setattr(sandbox, "_remount_tree_read_only", lambda *args, **kwargs: [])
+    monkeypatch.setattr(sandbox, "_mask", lambda path: events.append(("mask", path)))
+    monkeypatch.setattr(os, "chdir", lambda path: None)
+    late = tmp_path / "etc-gitconfig"
+    real_confirm = sandbox._confirm_git_config_masks
+
+    def confirm_then_create(outcomes: Sequence[tuple[str, str]]) -> None:
+        real_confirm(outcomes)
+        events.append(("confirmed", list(outcomes)))
+        late.write_text("[core]\n\tfsmonitor = created after the final observation\n")
+
+    monkeypatch.setattr(sandbox, "_confirm_git_config_masks", confirm_then_create)
+    home, layer = tmp_path / "home", tmp_path / "layer"
+    home.mkdir()
+    layer.mkdir()
+    spec: dict[str, object] = {
+        "home": str(home), "home_layer": str(layer), "home_mode": "ro", "home_aliases": [],
+        "home_binds": [], "read_only": [], "binds": [], "tmp_size": "1G", "protect_system": True,
+        "propagate": [], "cwd": str(tmp_path), "masks": [str(late)],
+        "git_config_policy": "isolated", "git_config_masks": [str(late)],
+    }
+
+    with pytest.raises(sandbox.SandboxError, match="does not exist, so no mount can keep it out"):
+        sandbox.build_view(spec)
+
+    assert not any(event[0] == "confirmed" for event in events)  # never accepted as a finished view
+    assert not late.exists()
 
 
 # ---- the Git lookup before the view (real git; hostile caller environment)
