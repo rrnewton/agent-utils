@@ -15,6 +15,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 from typing import cast
@@ -1113,6 +1114,131 @@ def test_audit_scoped_journal_differs_from_evidence_refuses(
         },
     )
     message = "scoped create journal differs from append-only progress evidence"
+    assert message in _python_refusal(root, tmp_path)
+    result = _rust(root, census_state=tmp_path / "rust-census.json")
+    assert result.returncode != 0
+    assert message in result.stderr
+
+
+def test_audit_scoped_journal_cache_matches_python(tmp_path: Path) -> None:
+    root = _fixture(tmp_path)
+    config = root / ".wrkslots.yml"
+    config.write_text(config.read_text() + "cache_globs:\n  - cache\n")
+    head = _git(tmp_path / "upstream-repo", "rev-parse", "HEAD").strip()
+    checkout = root / "worktrees" / "slot-j" / "repo"
+    _git(
+        tmp_path / "upstream-repo", "worktree", "add", "-q", "-b", "suite/j",
+        str(checkout), "HEAD",
+    )
+    cache = checkout / "cache"
+    cache.mkdir(parents=True)
+    for index in range(5):
+        (cache / f"f{index}.bin").write_bytes(b"x" * 1024)
+    journal = _scoped_create_journal(tmp_path)
+    journal["created"] = [
+        {
+            "name": "repo",
+            "path": "worktrees/slot-j/repo",
+            "repository": "../upstream-repo",
+            "branch": "suite/j",
+            "start_point": head,
+            "remote": "origin",
+            "remote_url_sha256": "0" * 64,
+            "landed_ref": "refs/remotes/origin/main",
+            "head": head,
+            "containing_remote_refs": [],
+            "vcs": "git",
+        }
+    ]
+    (root / "worktrees" / _SCOPED_CREATE_NAME).write_text(json.dumps(journal))
+    _append_event(
+        root,
+        "operation-progress-recorded",
+        {
+            "operation": "create",
+            "slot": "slot-j",
+            "journal_path": _SCOPED_CREATE_NAME,
+            "journal": journal,
+        },
+    )
+    actual = _check(root, tmp_path)
+    by_slot = {str(row["slot"]): row for row in _rows(actual)}
+    assert by_slot["slot-j"]["cache_status"] == "complete"
+    assert by_slot["slot-j"]["cache_error"] is None
+    assert by_slot["slot-j"]["cache_bytes"] == "counted"
+
+
+def _slot_j_worktree(tmp_path: Path, root: Path) -> tuple[str, Path]:
+    head = _git(tmp_path / "upstream-repo", "rev-parse", "HEAD").strip()
+    checkout = root / "worktrees" / "slot-j" / "repo"
+    _git(
+        tmp_path / "upstream-repo", "worktree", "add", "-q", "-b", "suite/j",
+        str(checkout), "HEAD",
+    )
+    return head, checkout
+
+
+def _created_entry(head: str) -> dict[str, object]:
+    return {
+        "name": "repo",
+        "path": "worktrees/slot-j/repo",
+        "repository": "../upstream-repo",
+        "branch": "suite/j",
+        "start_point": head,
+        "remote": "origin",
+        "remote_url_sha256": "0" * 64,
+        "landed_ref": "refs/remotes/origin/main",
+        "head": head,
+        "containing_remote_refs": [],
+        "vcs": "git",
+    }
+
+
+def test_audit_scoped_journal_missing_checkout_matches_python(
+    tmp_path: Path,
+) -> None:
+    root = _fixture(tmp_path)
+    head, checkout = _slot_j_worktree(tmp_path, root)
+    journal = _scoped_create_journal(tmp_path)
+    journal["created"] = [_created_entry(head)]
+    (root / "worktrees" / _SCOPED_CREATE_NAME).write_text(json.dumps(journal))
+    _append_event(
+        root,
+        "operation-progress-recorded",
+        {
+            "operation": "create",
+            "slot": "slot-j",
+            "journal_path": _SCOPED_CREATE_NAME,
+            "journal": journal,
+        },
+    )
+    _git(tmp_path / "upstream-repo", "worktree", "remove", str(checkout))
+    actual = _check(root, tmp_path)
+    by_slot = {str(row["slot"]): row for row in _rows(actual)}
+    assert by_slot["slot-j"]["cache_status"] == "complete"
+    assert by_slot["slot-j"]["cache_error"] is None
+
+
+def test_audit_scoped_journal_registered_missing_refuses(
+    tmp_path: Path,
+) -> None:
+    root = _fixture(tmp_path)
+    head, checkout = _slot_j_worktree(tmp_path, root)
+    journal = _scoped_create_journal(tmp_path)
+    journal["created"] = [_created_entry(head)]
+    (root / "worktrees" / _SCOPED_CREATE_NAME).write_text(json.dumps(journal))
+    _append_event(
+        root,
+        "operation-progress-recorded",
+        {
+            "operation": "create",
+            "slot": "slot-j",
+            "journal_path": _SCOPED_CREATE_NAME,
+            "journal": journal,
+        },
+    )
+    shutil.rmtree(checkout)
+    message = "journaled checkout repo is missing but Git still registers it"
     assert message in _python_refusal(root, tmp_path)
     result = _rust(root, census_state=tmp_path / "rust-census.json")
     assert result.returncode != 0

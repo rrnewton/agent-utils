@@ -2691,9 +2691,11 @@ pub(crate) struct ValidatedJournal {
     pub(crate) slot: String,
     pub(crate) machine: String,
     pub(crate) state: String,
+    /// The journal's evidence path; construction runs in path
+    /// order, as in the oracle.
+    pub(crate) path: PathBuf,
     /// The validated journal object; cache planning reads its
     /// checkouts from here.
-    #[allow(dead_code)]
     pub(crate) raw: Value,
 }
 
@@ -3343,7 +3345,8 @@ pub(crate) fn validated_journals(
     }
     // Validate every journal first; duplicates are detected
     // only after all of them pass, as in the oracle.
-    let mut validated: Vec<(String, String, String, Map<String, Value>)> = Vec::new();
+    type Validated = (String, String, String, PathBuf, Map<String, Value>);
+    let mut validated: Vec<Validated> = Vec::new();
     for path in &paths {
         let raw = if path.symlink_metadata().is_ok() {
             let (contents, _identity) =
@@ -3381,11 +3384,11 @@ pub(crate) fn validated_journals(
             )?,
             "slot",
         )?;
-        validated.push((slot, machine, kind, raw));
+        validated.push((slot, machine, kind, path.clone(), raw));
     }
     let mut journals: BTreeMap<String, ValidatedJournal> = BTreeMap::new();
     let mut machines_by_slot: BTreeMap<String, String> = BTreeMap::new();
-    for (slot, machine, kind, raw) in validated {
+    for (slot, machine, kind, path, raw) in validated {
         if let Some(previous) = machines_by_slot.get(&slot) {
             return Err(format!(
                 "slot '{slot}' has recovery journals on both {previous} and {machine}"
@@ -3398,6 +3401,7 @@ pub(crate) fn validated_journals(
                 slot,
                 machine,
                 state: format!("{kind}-journal"),
+                path,
                 raw: Value::Object(raw),
             },
         );

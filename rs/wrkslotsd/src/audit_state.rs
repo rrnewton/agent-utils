@@ -20,14 +20,17 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Value};
 
 use crate::active_state::{
-    as_int, as_list, as_mapping, as_str, exact_keys, load_cfg, parse_timestamp, slot_directory, Cfg,
+    as_int, as_list, as_mapping, as_str, checkout_from_obj, exact_keys, load_cfg, parse_timestamp,
+    slot_directory, Cfg,
 };
 use crate::canonical::canonical_sha256;
-use crate::config_validate::{load_config, refuse_symlink, relative_inside, validate_name};
+use crate::config_validate::{
+    ensure_no_symlink_components, load_config, refuse_symlink, relative_inside, validate_name,
+};
 use crate::ensure_states::refuse_partial_state_allow_seals;
 use crate::finish_write::{
-    assert_cache_policy_untracked, cache_globs_for, fnmatch_component, glob_parts, stored_path,
-    stored_repository_path, verify_existing_worktree,
+    assert_cache_policy_untracked, assert_record_paths, cache_globs_for, fnmatch_component,
+    glob_parts, stored_path, stored_repository_path, verify_existing_worktree,
 };
 use crate::global_state::{discover_machines, load_event_chain};
 use crate::handoff_state::{
@@ -973,6 +976,205 @@ fn unregistered_cache_subject(
         }
     }
     (dedup_cache_roots(planned), None, false)
+}
+
+/// One journaled checkout that exists and may be planned.
+#[derive(Clone)]
+struct JournalCheckout {
+    name: String,
+    destination: PathBuf,
+    repository: PathBuf,
+}
+
+fn listed_worktrees(repository: &Path) -> Result<BTreeSet<PathBuf>> {
+    let stdout =
+        crate::git_storage_state::git_run(repository, &["worktree", "list", "--porcelain"])?;
+    let mut paths = BTreeSet::new();
+    for line in stdout.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            paths.insert(PathBuf::from(path.trim()));
+        }
+    }
+    Ok(paths)
+}
+
+/// The present checkouts of one validated journal, inspected
+/// exactly as `_cache_slot_for_validated_journal` inspects them.
+/// Any refusal here refuses the whole audit, as in the oracle.
+fn journal_cache_checkouts(cfg: &Cfg, journal: &ValidatedJournal) -> Result<Vec<JournalCheckout>> {
+    let raw = journal
+        .raw
+        .as_object()
+        .ok_or_else(|| "cache recovery journal must be a JSON object".to_string())?;
+    let kind = raw.get("kind").and_then(Value::as_str).unwrap_or_default();
+    let slot = journal.slot.as_str();
+    let (slot_type, mut checkouts, layout): (String, Vec<(String, String, String)>, String) =
+        if kind == "create" {
+            let slot_type = raw
+                .get("slot_type")
+                .and_then(Value::as_str)
+                .unwrap_or("agent")
+                .to_string();
+            let mut parsed = Vec::new();
+            for (index, item) in raw
+                .get("created")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .enumerate()
+            {
+                let checkout =
+                    checkout_from_obj(item, &format!("cache recovery journal.created[{index}]"))?;
+                parsed.push((checkout.name, checkout.path, checkout.repository));
+            }
+            (slot_type, parsed, cfg.layout.clone())
+        } else {
+            let record_value = raw.get("record").cloned().unwrap_or(Value::Null);
+            let record = crate::active_state::record_from_obj(
+                &record_value,
+                "cache recovery journal.record",
+            )?;
+            if record.slot != slot || record.machine != journal.machine {
+                return Err(format!(
+                    "{kind} journal cache record does not match its shard or slot"
+                ));
+            }
+            assert_record_paths(cfg, &record_value)?;
+            let removed: BTreeSet<String> = if kind == "finish" {
+                raw.get("removed")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, item)| {
+                        item.as_str().map(str::to_owned).ok_or_else(|| {
+                            format!("cache recovery journal.removed[{index}] must be a string")
+                        })
+                    })
+                    .collect::<Result<BTreeSet<String>>>()?
+            } else {
+                BTreeSet::new()
+            };
+            let names: BTreeSet<&str> = record
+                .checkouts
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect();
+            if !removed.iter().all(|name| names.contains(name.as_str())) {
+                return Err(
+                    "finish journal cache record names an unknown removed checkout".to_string(),
+                );
+            }
+            let parsed = record
+                .checkouts
+                .iter()
+                .filter(|item| !removed.contains(&item.name))
+                .map(|item| {
+                    (
+                        item.name.clone(),
+                        item.path.clone(),
+                        item.repository.clone(),
+                    )
+                })
+                .collect();
+            let layout = record_value
+                .get("layout")
+                .and_then(Value::as_str)
+                .unwrap_or(&cfg.layout)
+                .to_string();
+            (record.slot_type.clone(), parsed, layout)
+        };
+    if layout == "flat" && checkouts.len() > 1 {
+        return Err("flat-layout create journal records multiple checkouts".to_string());
+    }
+    let slot_path = slot_directory(cfg, slot, &slot_type)?;
+    let mut present: Vec<JournalCheckout> = Vec::new();
+    for (name, path, repository_raw) in checkouts.drain(..) {
+        let destination = if layout == "flat" {
+            slot_path.clone()
+        } else {
+            slot_path.join(&name)
+        };
+        ensure_no_symlink_components(&cfg.root, &destination, "checkout")?;
+        let relative = destination
+            .strip_prefix(&cfg.root)
+            .unwrap_or(&destination)
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+        if path != relative {
+            return Err(format!(
+                "cache recovery journal checkout {name} escapes slot {slot}"
+            ));
+        }
+        let (_relative, repository) = stored_repository_path(cfg, &repository_raw)?;
+        match destination.symlink_metadata() {
+            Err(_) => {
+                if listed_worktrees(&repository)?.contains(&destination) {
+                    return Err(format!(
+                        "journaled checkout {name} is missing but Git still registers it"
+                    ));
+                }
+                continue;
+            }
+            Ok(meta) => {
+                if meta.file_type().is_symlink() || !meta.is_dir() {
+                    return Err(format!(
+                        "journaled checkout is unsafe for cache cleanup: {}",
+                        destination.display()
+                    ));
+                }
+            }
+        }
+        verify_existing_worktree(&repository, &destination)?;
+        present.push(JournalCheckout {
+            name,
+            destination,
+            repository,
+        });
+    }
+    Ok(present)
+}
+
+/// One journal slot's census subject from its journaled
+/// checkouts, planned like a registered slot's.
+fn journal_cache_subject(
+    cfg: &Cfg,
+    config: &Value,
+    checkouts: &[JournalCheckout],
+    budget: &mut PlanBudget,
+    mounts: &PlanMounts,
+) -> CensusSubject {
+    use std::os::unix::fs::MetadataExt as _;
+    if let Err(error) = budget.check(0.0) {
+        return (Vec::new(), Some(error), false);
+    }
+    let mut roots: Vec<(PathBuf, PathBuf, u64)> = Vec::new();
+    for checkout in checkouts {
+        let globs = cache_globs_for(config, &checkout.name);
+        let (candidates, error) = plan_one_checkout(
+            &checkout.destination,
+            &globs,
+            &checkout.name,
+            Some(&checkout.repository),
+            budget,
+            mounts,
+        );
+        if let Some(error) = error {
+            return (Vec::new(), Some(error), false);
+        }
+        let device = std::fs::metadata(&checkout.destination)
+            .map(|meta| meta.dev())
+            .unwrap_or(0);
+        for candidate in candidates {
+            roots.push((candidate, checkout.destination.clone(), device));
+        }
+    }
+    let _ = cfg;
+    (dedup_cache_roots(roots), None, false)
 }
 
 /// Mount identity of one path from /proc/self/mountinfo: the id of
@@ -4064,6 +4266,15 @@ pub(crate) fn parse_audit(
         events_by_machine.insert(machine.clone(), events);
     }
     let journals = validated_journals(&cfg, &config, &events_by_machine, &records)?;
+    let mut journal_checkouts: BTreeMap<String, Vec<JournalCheckout>> = BTreeMap::new();
+    let mut journals_by_path: Vec<&ValidatedJournal> = journals.values().collect();
+    journals_by_path.sort_by(|left, right| left.path.cmp(&right.path));
+    for journal in journals_by_path {
+        journal_checkouts.insert(
+            journal.slot.clone(),
+            journal_cache_checkouts(&cfg, journal)?,
+        );
+    }
     let (seal_targets, seal_errors) = seal_evidence(&cfg);
     let mut seal_by_slot: BTreeMap<(String, String), (i64, PathBuf)> = BTreeMap::new();
     for target in &seal_targets {
@@ -4160,26 +4371,30 @@ pub(crate) fn parse_audit(
     // Planning targets in the oracle's order: every record, then
     // unregistered agent slots. Each target plans with a fair
     // share of what earlier targets left of the work and wall
-    // allowances. A slot with an interrupted journal plans from
-    // its journal in the oracle; that stays Python-owned, as does
-    // an unregistered validation directory (no cache subject).
+    // allowances. An unregistered validation directory is not a
+    // cache subject.
     // Target positions follow the oracle: records first, then
-    // unregistered agent slots in sorted order. A journal slot
-    // occupies its position (and so shrinks its peers' shares)
-    // even though its own planning stays Python-owned.
-    let mut target_actions: Vec<Option<(String, String)>> = Vec::new();
+    // unregistered agent slots in sorted order; a journal slot
+    // plans from its journaled checkouts.
+    enum TargetAction {
+        Unregistered(String, String),
+        Journal(String),
+    }
+    let mut target_actions: Vec<TargetAction> = Vec::new();
     for (slot_type, slot) in on_disk.difference(&registered) {
-        if slot_type != "agent" || journals.contains_key(slot) {
-            if slot_type == "agent" {
-                target_actions.push(None);
-            }
+        if slot_type != "agent" {
             continue;
         }
-        target_actions.push(Some((slot_type.clone(), slot.clone())));
+        if journals.contains_key(slot) {
+            target_actions.push(TargetAction::Journal(slot.clone()));
+        } else {
+            target_actions.push(TargetAction::Unregistered(slot_type.clone(), slot.clone()));
+        }
     }
     let target_count = records.len() + target_actions.len();
     let mut census_subjects: Vec<CensusSubject> = Vec::new();
     let mut unregistered_subjects: BTreeMap<(String, String), usize> = BTreeMap::new();
+    let mut journal_subjects: BTreeMap<String, usize> = BTreeMap::new();
     let mut plan_work_consumed: i64 = 0;
     let mut plan_seconds = census.wall_seconds;
     let make_budget = |position: usize, consumed: i64, seconds_left: f64| PlanBudget {
@@ -4198,16 +4413,28 @@ pub(crate) fn parse_audit(
         census_subjects.push((roots, error, validation));
     }
     for (offset, action) in target_actions.iter().enumerate() {
-        let Some((slot_type, slot)) = action else {
-            continue;
-        };
         let position = records.len() + offset;
         let mut budget = make_budget(position, plan_work_consumed, plan_seconds);
-        let subject = unregistered_cache_subject(&cfg, &config, slot, &mut budget, &plan_mounts);
-        plan_work_consumed += budget.work_consumed;
-        plan_seconds = (plan_seconds - budget.spent).max(0.0);
-        unregistered_subjects.insert((slot_type.clone(), slot.clone()), census_subjects.len());
-        census_subjects.push(subject);
+        match action {
+            TargetAction::Unregistered(slot_type, slot) => {
+                let subject =
+                    unregistered_cache_subject(&cfg, &config, slot, &mut budget, &plan_mounts);
+                plan_work_consumed += budget.work_consumed;
+                plan_seconds = (plan_seconds - budget.spent).max(0.0);
+                unregistered_subjects
+                    .insert((slot_type.clone(), slot.clone()), census_subjects.len());
+                census_subjects.push(subject);
+            }
+            TargetAction::Journal(slot) => {
+                let checkouts = journal_checkouts.get(slot).cloned().unwrap_or_default();
+                let subject =
+                    journal_cache_subject(&cfg, &config, &checkouts, &mut budget, &plan_mounts);
+                plan_work_consumed += budget.work_consumed;
+                plan_seconds = (plan_seconds - budget.spent).max(0.0);
+                journal_subjects.insert(slot.clone(), census_subjects.len());
+                census_subjects.push(subject);
+            }
+        }
     }
     let registry_revision = {
         use sha2::Digest as _;
@@ -4295,12 +4522,13 @@ pub(crate) fn parse_audit(
         };
         // A validation directory is not a cache subject, so the
         // oracle's census reports it complete with no bytes. An
-        // agent slot's caches were planned as a census subject;
-        // a journal slot's planning stays with the Python edition.
+        // agent slot's caches were planned as a census subject,
+        // from its directory or from its journal.
         let (cache_bytes, cache_error, cache_status) = if slot_type == "validate" {
             (json!(0), Value::Null, "complete")
-        } else if let Some(measurement) = unregistered_subjects
-            .get(&(slot_type.clone(), slot.clone()))
+        } else if let Some(measurement) = journal_subjects
+            .get(slot)
+            .or_else(|| unregistered_subjects.get(&(slot_type.clone(), slot.clone())))
             .map(|index| &census_measurements[*index])
         {
             match measurement.status {

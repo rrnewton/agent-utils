@@ -121,18 +121,8 @@ fn ensure_no_symlink_components(root: &Path, path: &Path, label: &str) -> Result
     let mut current = root.to_path_buf();
     for part in relative.components() {
         current.push(part);
-        match std::fs::symlink_metadata(&current) {
-            Ok(metadata) => {
-                if metadata.file_type().is_symlink() {
-                    return Err(format!("{label} crosses a symlink: {}", current.display()));
-                }
-            }
-            Err(error) => {
-                return Err(format!(
-                    "cannot inspect {label} path {}: {error}",
-                    current.display()
-                ));
-            }
+        if current.is_symlink() {
+            return Err(format!("{label} crosses a symlink: {}", current.display()));
         }
     }
     Ok(())
