@@ -3,3 +3,4 @@
 
 export { childByClass, nodeWithin, shownNode } from "./tree.ts";
 export { elementIn, focusMinimally } from "./shell.ts";
+export type { ElementById } from "./ids.ts";

@@ -13,6 +13,7 @@ import { cpSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, write
 import { SourceMap } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import vm from "node:vm";
 
 import {
@@ -79,6 +80,19 @@ test("the shell is the source shell with its script tags made one and its styles
   assert.equal(text(SHELL), expected);
   assert.deepStrictEqual(shellScripts(text(SHELL)), [SCRIPT_PATH]);
   assert.deepStrictEqual(shellStyles(text(SHELL)), [STYLE_PATH]);
+});
+
+test("`#624 voice-page-modularity`: the element ids module is what web/ids.mjs generates from the shell's markup", async () => {
+  const { IDS_MODULE, idsModule } = await import(pathToFileURL(join(WEB, "ids.mjs")).href);
+  assert.equal(readFileSync(join(WEB, IDS_MODULE), "utf8"), idsModule(readFileSync(join(WEB, SHELL), "utf8")),
+    `${IDS_MODULE} is stale: run \`node web/ids.mjs --write\``);
+});
+
+test("`#624 voice-page-modularity`: the id generator refuses one id given twice, and reads no comment as markup", async () => {
+  const { elementIds } = await import(pathToFileURL(join(WEB, "ids.mjs")).href);
+  assert.throws(() => elementIds('<div id="a"></div><span id="a"></span>'), /two elements the id "a"/);
+  assert.deepStrictEqual([...elementIds('<!-- <input id="gone"> --><input id="kept"><svg id="art"></svg>')],
+    [["kept", "HTMLInputElement"], ["art", "HTMLElement"]]);
 });
 
 test("`#624 voice-page-modularity`: an assembled sheet's parts are each a run of complete top-level rules, listed once, in order", () => {

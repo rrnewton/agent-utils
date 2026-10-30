@@ -175,13 +175,15 @@ test("every root has a declaration the type checker can name", () => {
   }
 });
 
-// `el()` in web/voice.js is typed by JSDoc overloads that list the page's form controls by id, so
-// the checker knows `.value` and `.checked` exist on them. Those lists are only useful while they
-// are the page's real controls: an id missing from them silently types as a plain HTMLElement, and
-// an id that no longer exists is a claim about a page this repository does not serve.
-test("the el() overloads in voice.js list exactly voice.html's form controls", () => {
-  const html = read("web/voice.html");
-  const script = read("web/voice.js");
+// `el()` in web/voice.js is typed by web/src/view/dom/ids.ts, which web/ids.mjs generates from the
+// markup (`#624 voice-page-modularity`), so the checker knows `.value` and `.checked` exist on the page's
+// form controls. Generated code can be wrong, so this reads the markup on its own, by a different way
+// from the generator's, and holds the generated module's form controls to it: an id missing types as a
+// plain HTMLElement, and an id that no longer exists is a claim about a page this repository does not
+// serve.
+test("the generated element ids type exactly voice.html's form controls", () => {
+  const html = read("web/voice.html").replace(/<!--[\s\S]*?-->/g, " ");
+  const generated = read("web/src/view/dom/ids.ts");
   const TYPE_OF_TAG = {
     input: "HTMLInputElement",
     textarea: "HTMLTextAreaElement",
@@ -195,14 +197,11 @@ test("the el() overloads in voice.js list exactly voice.html's form controls", (
       (fromHtml[TYPE_OF_TAG[tag]] ||= []).push(id[1]);
     }
   }
-  const fromScript = {};
-  const overloads = /\/\*\*\s*\n\s*\* @overload\s*\n\s*\* @param \{([^}]*)\} id\s*\n\s*\* @returns \{(\w+)\}/g;
-  for (const [, union, type] of script.matchAll(overloads)) {
-    if (type !== "HTMLElement") {
-      fromScript[type] = [...union.matchAll(/"([^"]+)"/g)].map((match) => match[1]);
-    }
+  const fromGenerated = {};
+  for (const [, id, type] of generated.matchAll(/^ {2}"([^"]+)": (\w+);$/gm)) {
+    if (Object.values(TYPE_OF_TAG).includes(type)) (fromGenerated[type] ||= []).push(id);
   }
   const sorted = (lists) =>
     Object.fromEntries(Object.entries(lists).map(([type, ids]) => [type, [...ids].sort()]));
-  assert.deepEqual(sorted(fromScript), sorted(fromHtml));
+  assert.deepEqual(sorted(fromGenerated), sorted(fromHtml));
 });

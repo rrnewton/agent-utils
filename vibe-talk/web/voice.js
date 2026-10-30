@@ -176,89 +176,20 @@ let sideActive = false;
  */
 const ALL_CHANNELS = "*";
 
-// The element with this id: in the column being worked on, for the ids of the channel's pane (see
-// `COLUMN_IDS`). Form controls are typed by their tag in voice.html, so the checker knows `.value`
-// and `.checked` exist; tests/js/contract.test.mjs keeps these lists equal to the page's real
-// controls.
 /**
- * @overload
- * @param {"search-all-channels" | "api-token" | "pair-input" | "pair-transfer" | "channel-alias" | "channel-compose-grow" | "channel-directory-search"
- *   | "card-max-lines" | "collapsed-lines"
- *   | "combine-messages" | "compose-grow" | "enter-sends" | "hide-empty-messages" | "in-app-links" | "keyboard-debug" | "mark-own-read" | "mic-auto-gain"
- *   | "mic-echo-cancellation" | "audio-route-toggle" | "side-compose-grow"
- *   | "message-cache-enabled"
- *   | "mic-noise-suppression" | "msg-scale" | "new-channel-id" | "new-channel-label"
- *   | "new-channel-writable" | "noise-rule-new" | "read-speed-box" | "reading-width"
- *   | "reply-branch" | "reply-grow" | "resume-toggle" | "rich-headers" | "search-field" | "single-keys"
- *   | "summarize-collapsed"
- *   | "voice-ask-before-send" | "voice-post-prefix"} id
- * @returns {HTMLInputElement}
+ * The element with this id: in the column being worked on, for the ids of the channel's pane (see
+ * `COLUMN_IDS`). Typed by the kind of element voice.html gives the id (web/src/view/dom `ElementById`,
+ * generated from the markup by web/ids.mjs, `#624 voice-page-modularity`), so the checker knows `.value`
+ * and `.checked` exist on a form control; an id not known as a literal is a plain HTMLElement.
+ *
+ * @template {string} K
+ * @param {K} id
+ * @returns {K extends keyof import("./src/view/dom/index.ts").ElementById ? import("./src/view/dom/index.ts").ElementById[K] : HTMLElement}
  */
-/**
- * @overload
- * @param {"channel-compose-text" | "compose-text" | "prompt-blockers" | "prompt-summary"
- *   | "reply-text" | "side-compose-text" | "voice-instructions" | "voice-system-prompt"} id
- * @returns {HTMLTextAreaElement}
- */
-/**
- * @overload
- * @param {"audio-input-device" | "audio-output-device" | "bar-placement" | "discord-channel" | "relay-to-agent" | "settings-audio-source"
- *   | "open-in-view" | "settings-channel" | "settings-service" | "settings-wit-voice" | "slack-open-in" | "thread-select" | "upstream-clear-mode"
- *   | "channel-history-mode"} id
- * @returns {HTMLSelectElement}
- */
-/**
- * @overload
- * @param {"add-channel" | "add-noise-rule" | "audio-source" | "author-filter" | "back-to-reply"
- *   | "cancel-add-channel" | "cancel-rename" | "canned-blockers" | "canned-summary"
- *   | "channel-directory-more" | "channel-directory-retry" | "channel-newline" | "channel-send"
- *   | "channel-view-flat" | "channel-view-main" | "channel-view-threads" | "clear-alias"
- *   | "clear-backlog" | "clear-view" | "close-browse-channels" | "close-help"
- *   | "close-settings" | "collapse-all" | "column-toggle" | "dismiss-banner"
- *   | "dismiss-error" | "dismiss-status" | "expand-all" | "fold-help" | "fold-auto-read" | "fold-canned-prompts" | "fold-card-max-lines" | "fold-collapsed-lines" | "fold-combining" | "fold-connection" | "fold-control-bar" | "fold-dismissed" | "fold-opening-links" | "fold-empty-messages" | "fold-hidden-channels" | "fold-instructions" | "fold-keyboard" | "fold-mark-own" | "fold-message-cache" | "fold-message-links" | "fold-microphone" | "fold-provider" | "fold-reading-full" | "fold-reading-width" | "fold-relay" | "fold-resuming" | "fold-rich-headers" | "fold-sending" | "fold-settings-all" | "fold-settings-channels" | "fold-settings-messages" | "fold-settings-screen" | "fold-settings-storage" | "fold-settings-voice-agent" | "fold-storage" | "fold-summaries" | "fold-text-size" | "fold-token" | "fold-typing" | "forget-conversations"
- *   | "forget-dismissed-sends" | "forget-token"
- *   | "dismissed-send-close" | "dismissed-send-copy" | "dismissed-send-restore"
- *   | "retry-start"
- *   | "hang-up"
- *   | "card-max-lines-larger" | "card-max-lines-smaller"
- *   | "collapsed-lines-larger" | "collapsed-lines-smaller"
- *   | "help-link-auto-read" | "help-link-canned-prompts" | "help-link-card-max-lines" | "help-link-channel-alias" | "help-link-collapsed-lines"
- *   | "help-link-combining" | "help-link-connection" | "help-link-control-bar" | "help-link-empty-messages"
- *   | "help-link-identities" | "help-link-keyboard"
- *   | "help-link-live-messages" | "help-link-mark-own" | "help-link-message-links" | "help-link-microphone"
- *   | "help-link-reading-width" | "help-link-resuming" | "help-link-rich-headers" | "help-link-summaries"
- *   | "help-link-speech-prep"
- *   | "help-link-message-cache" | "help-link-storage" | "help-link-voice-instructions" | "help-link-voice-send" | "jump-bookmark" | "jump-newest" | "link-kind-action" | "link-kind-commit"
- *   | "link-kind-file" | "link-kind-issue" | "link-kind-other"
- *   | "link-kind-pr" | "link-raw" | "links-filter" | "load-older" | "load-older-turns"
- *   | "message-cache-confirm-no" | "message-cache-confirm-yes" | "message-cache-erase"
- *   | "msg-scale-larger" | "msg-scale-smaller"
- *   | "open-add-channel" | "open-browse-channels" | "open-help" | "open-settings" | "own-read-apply" | "own-read-undo" | "page-update"
- *   | "pair-confirm" | "pair-dismiss" | "pair-submit"
- *   | "pinned-filter" | "post-confirm-cancel" | "post-confirm-more" | "post-confirm-send" | "prompts-open" | "read-aloud" | "read-aloud-stop" | "read-new" | "read-next" | "read-on-device" | "read-prev" | "read-section-next" | "read-section-prev" | "read-speed" | "read-speed-down" | "read-speed-up" | "read-steer-grip" | "remove-channel"
- *   | "rename-channel" | "reply-cancel" | "reply-newline" | "reply-send"
- *   | "reset-voice-post-prefix"
- *   | "restore-voice-system-prompt" | "save-alias" | "save-token" | "save-voice-instructions"
- *   | "save-voice-post-prefix" | "save-voice-system-prompt"
- *   | "search-further" | "search-in-all" | "search-toggle" | "send-text" | "server-more" | "side-clear-backlog" | "side-close" | "side-jump-newest"
- *   | "side-more-threads" | "side-newline" | "side-older" | "side-search-replies" | "side-send" | "side-thread-card-text"
- *   | "side-main" | "side-order" | "side-unpack" | "speaker"
- *   | "summarise" | "talk"
- *   | "thread-back" | "thread-card-text"
- *   | "todo-filter" | "undo-bookmark" | "undo-dismiss" | "undo-send-dismiss" | "upstream-clear-push"
- *   | "upstream-clear-save" | "view-switch"
- *   | "channel-history-prioritize" | "channel-history-save"} id
- * @returns {HTMLButtonElement}
- */
-/**
- * @overload
- * @param {string} id
- * @returns {HTMLElement}
- */
-/** @param {string} id */
 function el(id) {
   // The column worked on decides (web/src/view/dom `elementIn`, `#624 voice-page-modularity`).
-  return elementIn(id, sideActive, COLUMN_IDS);
+  // Typed by the id, as the JSDoc above says; the lookup itself answers an HTMLElement.
+  return /** @type {any} */ (elementIn(id, sideActive, COLUMN_IDS));
 }
 
 /**
