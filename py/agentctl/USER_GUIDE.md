@@ -1847,6 +1847,15 @@ N` types at most N prompts; `--lock-timeout SECONDS` gives up with exit 75 and
 nothing typed when the queue's delivery lock or the host-wide target lock stays
 held that long. Prompts left over stay pending.
 
+A prompt for an interactive agent is typed through one Herdr call, and the
+system refuses a single argument over 128 KiB, so `send` refuses a prompt over
+120 KiB (the sender header included) with exit 2 and queues nothing. Over 16
+KiB it warns on standard error: every harness shows a paste that long
+collapsed (`[Pasted text]` in Claude Code, `[Pasted Content]` in Muse and Codex)
+and Muse caps it in its transcript, so for long material write it to a file and
+send a short prompt that names the file. Headless and agentcloud agents take
+their prompts another way and have neither limit.
+
 Every `send` and `drain` to an interactive agent has a hard deadline, counted
 from its start, that also bounds the wait for the agent's own lock: a send
 that has not typed its prompt by then exits 75, leaves the prompt pending (or,

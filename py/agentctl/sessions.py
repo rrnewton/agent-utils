@@ -232,6 +232,10 @@ class Sessions(ManagedAgents):
         if record.adapter in ("herdr", "herdr-pane", "herdr-foreign", "herdr-relay"):
             if model is not None:
                 raise AgentDeliveryError("per-turn model overrides require a headless session")
+            # A prompt too large to type is refused, a long one warned about (#705).
+            warning = agent.prompt_size_check(text)
+            if warning is not None:
+                print(f"agentctl send: {warning}", file=sys.stderr)
             return asdict(super().send(name, text, message_id=message_id, expected_token=record.token, **options))
         if message_id is not None:
             raise AgentDeliveryError("headless requests use monotonically numbered turns; message-id is interactive-only")

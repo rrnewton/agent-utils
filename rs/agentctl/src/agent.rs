@@ -1001,6 +1001,39 @@ fn validate_target_with_runtime<A: AgentApi + ?Sized>(
     }
 }
 
+/// Largest prompt `agentctl send` types into an interactive agent, in bytes (#705
+/// oversized-prompt): agentctl types a prompt through one Herdr call, whose argument the
+/// system refuses over 128 KiB, so a larger one could never be typed.
+pub const MAX_TYPED_PROMPT_BYTES: usize = 120 * 1024;
+
+/// Prompt size above which `agentctl send` warns (#705 oversized-prompt): every harness shows
+/// a paste this long collapsed, and Muse caps it in its transcript.
+pub const LARGE_PROMPT_BYTES: usize = 16 * 1024;
+
+/// Check the size of a prompt for an interactive agent (#705 oversized-prompt): an error over
+/// [`MAX_TYPED_PROMPT_BYTES`], a warning over [`LARGE_PROMPT_BYTES`], else nothing.
+pub fn prompt_size_check(text: &str) -> Result<Option<String>, String> {
+    let bytes = text.len();
+    if bytes > MAX_TYPED_PROMPT_BYTES {
+        return Err(format!(
+            "the prompt is {bytes} bytes, over the {MAX_TYPED_PROMPT_BYTES}-byte limit for an \
+             interactive agent: agentctl types a prompt through one Herdr call, and the system \
+             refuses a single argument over 128 KiB, so nothing was queued; write the content \
+             to a file and send a short prompt that names the file"
+        ));
+    }
+    if bytes > LARGE_PROMPT_BYTES {
+        return Ok(Some(format!(
+            "the prompt is {} KiB; every harness shows a paste this long collapsed ([Pasted \
+             text] in Claude Code, [Pasted Content] in Muse and Codex) and Muse caps it in its \
+             transcript, so neither the agent nor a person watching may read it whole; consider \
+             writing the content to a file and sending a short prompt that names the file",
+            bytes.div_ceil(1024)
+        )));
+    }
+    Ok(None)
+}
+
 /// Persist one prompt before any readiness or transport operation.
 pub fn enqueue(root: &Path, text: &str, message_id: Option<&str>) -> AgentResult<String> {
     enqueue_internal(
@@ -4080,6 +4113,31 @@ mod tests {
                     .push((count("inflight"), count("processed")));
             }
         }
+    }
+
+    #[test]
+    fn a_prompt_too_large_to_type_is_refused_and_a_long_one_warned_about() {
+        // #705 oversized-prompt: one Herdr call cannot carry an argument over 128 KiB, so
+        // agentctl refuses over 120 KiB before queueing, and warns over 16 KiB, where every
+        // harness shows the paste collapsed. Sizes are UTF-8 bytes.
+        assert_eq!(prompt_size_check("short"), Ok(None));
+        assert_eq!(prompt_size_check(&"x".repeat(LARGE_PROMPT_BYTES)), Ok(None));
+        let warning = prompt_size_check(&"x".repeat(LARGE_PROMPT_BYTES + 1))
+            .unwrap()
+            .expect("warned");
+        assert!(warning.starts_with("the prompt is 17 KiB;"), "{warning}");
+        assert!(warning.contains("names the file"), "{warning}");
+        assert!(prompt_size_check(&"x".repeat(MAX_TYPED_PROMPT_BYTES))
+            .unwrap()
+            .is_some());
+        let refusal = prompt_size_check(&"x".repeat(MAX_TYPED_PROMPT_BYTES + 1)).unwrap_err();
+        assert!(
+            refusal.starts_with("the prompt is 122881 bytes, over the 122880-byte limit"),
+            "{refusal}"
+        );
+        assert!(refusal.contains("nothing was queued"), "{refusal}");
+        // Bytes, not characters: 41,000 three-byte characters are 123,000 bytes.
+        assert!(prompt_size_check(&"€".repeat(41_000)).is_err());
     }
 
     #[test]

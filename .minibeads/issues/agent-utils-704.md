@@ -1,10 +1,11 @@
 ---
 title: 'misroute-shared-text: a delivered prompt is quarantined when the same text shows in another pane'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 created_at: 2026-10-30T00:50:50.044381340+00:00
-updated_at: 2026-10-30T00:50:50.044381340+00:00
+updated_at: 2026-10-30T00:54:30.118222535+00:00
+closed_at: 2026-10-30T00:54:30.118222414+00:00
 ---
 
 # Description

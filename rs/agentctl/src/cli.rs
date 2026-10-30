@@ -1186,7 +1186,7 @@ struct Adopt {
 
 #[derive(Args)]
 struct Prompt {
-    /// Prompt text; use --file for a multiline or large prompt
+    /// Prompt text; use --file for a multiline or large prompt. An interactive agent takes at most 120 KiB, the sender header included (one Herdr call carries the whole prompt); over 16 KiB, send warns that harnesses show the paste collapsed
     #[arg(conflicts_with = "file")]
     text: Option<String>,
     /// UTF-8 file containing prompt text
@@ -3511,6 +3511,8 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     ));
                 }
                 manager.send_cloud(&value.agent.name, &text, value.message_id.as_deref())?
+            } else if let Some(refusal) = interactive_prompt_size(&text) {
+                return Err(refusal);
             } else if value.urgent {
                 manager.send_urgent(
                     &value.agent.name,
@@ -3744,6 +3746,19 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
 /// The warning `send` prints when its prompt is waiting in the harness's own queue behind a
 /// running turn (#570 agent-progress-monitoring), from the agent's `turn` view; `None` when the
 /// harness holds no queued input.
+/// Refuse an interactive prompt too large to type, or warn about one that harnesses show
+/// collapsed (#705 oversized-prompt).
+fn interactive_prompt_size(text: &str) -> Option<Failure> {
+    match crate::agent::prompt_size_check(text) {
+        Err(refusal) => Some(Failure::Usage(refusal)),
+        Ok(Some(warning)) => {
+            eprintln!("agentctl send: {warning}");
+            None
+        }
+        Ok(None) => None,
+    }
+}
+
 fn queued_warning(name: &str, turn: &Value) -> Option<String> {
     if turn["harness_queued"].as_u64().unwrap_or(0) == 0 {
         return None;

@@ -1613,3 +1613,21 @@ def test_stop_refusal_changes_leave_ordinary_send_pending_json_and_stderr_unchan
         "outcome": error.outcome, "message_id": "m", "artifact": "retained.json",
         "error": str(error), "safe_to_retry": not possibly_submitted,
     }
+
+
+def test_a_prompt_too_large_to_type_is_refused_and_a_long_one_warned_about() -> None:
+    """#705 oversized-prompt: refused over 120 KiB, warned over 16 KiB, in UTF-8 bytes, worded
+    as the Rust edition words it."""
+    from agentctl import agent as agent_module
+
+    check = agent_module.prompt_size_check
+    assert check("short") is None
+    assert check("x" * agent_module.LARGE_PROMPT_BYTES) is None
+    warning = check("x" * (agent_module.LARGE_PROMPT_BYTES + 1))
+    assert warning is not None and warning.startswith("the prompt is 17 KiB;")
+    assert "names the file" in warning
+    assert check("x" * agent_module.MAX_TYPED_PROMPT_BYTES) is not None
+    with pytest.raises(ValueError, match=r"^the prompt is 122881 bytes, over the 122880-byte limit"):
+        check("x" * (agent_module.MAX_TYPED_PROMPT_BYTES + 1))
+    with pytest.raises(ValueError, match="nothing was queued"):
+        check("\u20ac" * 41_000)

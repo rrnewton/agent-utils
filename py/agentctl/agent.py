@@ -1864,6 +1864,41 @@ def _queue_order(path: str, max_artifact_bytes: int | None) -> tuple[bool, float
     return (True, seconds, path)
 
 
+#: Largest prompt ``agentctl send`` types into an interactive agent, in bytes (#705
+#: oversized-prompt): agentctl types a prompt through one Herdr call, whose argument the system
+#: refuses over 128 KiB, so a larger one could never be typed.
+MAX_TYPED_PROMPT_BYTES = 120 * 1024
+
+#: Prompt size above which ``agentctl send`` warns (#705 oversized-prompt): every harness shows
+#: a paste this long collapsed, and Muse caps it in its transcript.
+LARGE_PROMPT_BYTES = 16 * 1024
+
+
+def prompt_size_check(text: str) -> str | None:
+    """Check the size of a prompt for an interactive agent (#705 oversized-prompt).
+
+    Raise ``ValueError`` over ``MAX_TYPED_PROMPT_BYTES``; return a warning over
+    ``LARGE_PROMPT_BYTES``; else ``None``.
+    """
+    size = len(text.encode("utf-8"))
+    if size > MAX_TYPED_PROMPT_BYTES:
+        raise ValueError(
+            f"the prompt is {size} bytes, over the {MAX_TYPED_PROMPT_BYTES}-byte limit for an "
+            "interactive agent: agentctl types a prompt through one Herdr call, and the system "
+            "refuses a single argument over 128 KiB, so nothing was queued; write the content "
+            "to a file and send a short prompt that names the file"
+        )
+    if size > LARGE_PROMPT_BYTES:
+        return (
+            f"the prompt is {-(-size // 1024)} KiB; every harness shows a paste this long "
+            "collapsed ([Pasted text] in Claude Code, [Pasted Content] in Muse and Codex) and "
+            "Muse caps it in its transcript, so neither the agent nor a person watching may "
+            "read it whole; consider writing the content to a file and sending a short prompt "
+            "that names the file"
+        )
+    return None
+
+
 def _typed_text(document: dict[str, object]) -> str:
     """The text a drain types: the stored text, except that a chat request prompt the Rust bridge
     queued with its message's create time gets its opening decided now (see prompt_time)."""
