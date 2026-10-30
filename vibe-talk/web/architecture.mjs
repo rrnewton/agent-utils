@@ -41,6 +41,7 @@ export const PACKAGES = Object.freeze({
   "core/search": BASE,
   "core/settings": BASE,
   "core/speech": BASE,
+  "core/sync": BASE,
   "platform/web": BASE,
   legacy: "*",
 });

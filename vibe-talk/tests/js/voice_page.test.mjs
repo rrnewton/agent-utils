@@ -1863,6 +1863,7 @@ const ANNOTATIONS = await moduleForTests("src/core/annotations/index.ts");
 const OUTBOX = await moduleForTests("src/core/outbox/index.ts");
 const CALL = await moduleForTests("src/core/call/index.ts");
 const WEB_PLATFORM = await moduleForTests("src/platform/web/index.ts");
+const SYNC = await moduleForTests("src/core/sync/index.ts");
 /** The page's requests to its server, on ports a test supplies (web/src/core/api). */
 const SERVER_API = await moduleForTests("src/core/api/index.ts");
 
@@ -7147,6 +7148,43 @@ test("`#624 voice-page-modularity`: prepared read-aloud tickets end on either cl
   prepared.keep("10", entry);
   prepared.clear();
   assert.equal(prepared.size(), 0);
+});
+
+test("`#624 voice-page-modularity`: which read a refresh makes, and how fresh it is, from the module alone", () => {
+  const { deltaCursor, isCursorRefusal, isMutationKey, staleAsOf, STALE_AS_OF_MS, TIMELINE_RECONCILE_MS } = SYNC;
+  let now = 10 * TIMELINE_RECONCILE_MS;
+  const facts = (over = {}) => ({
+    storeChannel: () => "c", selectedChannel: () => "c", complete: () => true, mutationAwaits: () => false, now: () => now,
+    cover: () => ({ live: true, newest: "cur", fullAt: now - 1000 }), ...over,
+  });
+  assert.equal(deltaCursor("poll", facts()), "cur");
+  assert.equal(deltaCursor("enter", facts()), null, "a reason no delta serves read a delta");
+  assert.equal(deltaCursor(undefined, facts()), null);
+  assert.equal(deltaCursor("poll", facts({ storeChannel: () => "other" })), null, "another channel's cursor was used");
+  assert.equal(deltaCursor("poll", facts({ cover: () => ({ live: false, newest: "cur", fullAt: now }) })), null);
+  assert.equal(deltaCursor("poll", facts({ cover: () => ({ live: true, newest: "cur", fullAt: now - TIMELINE_RECONCILE_MS }) })), null,
+    "a view past its reconcile read a delta");
+  // Edits and removals need complete deltas; a replay only while one is waiting for a read.
+  assert.deepStrictEqual(["mutation", "replay", "poll", "live"].map((reason) => deltaCursor(reason, facts({ complete: () => false }))),
+    [null, "cur", null, "cur"]);
+  assert.equal(deltaCursor("replay", facts({ complete: () => false, mutationAwaits: () => true })), null);
+  // A queued read standing for several reasons is a delta only if every one could be.
+  assert.equal(deltaCursor(["poll", "live"], facts()), "cur");
+  assert.equal(deltaCursor(["poll", "enter"], facts()), null);
+  assert.equal(deltaCursor([], facts()), null);
+  assert.deepStrictEqual([isCursorRefusal({ status: 410, code: "cursor_expired" }), isCursorRefusal({ status: 400, code: "cursor_mismatch" }),
+    isCursorRefusal({ status: 410, code: "other" }), isCursorRefusal(null)], [true, true, false, false]);
+  assert.deepStrictEqual([isMutationKey("message_update:1"), isMutationKey("message_delete:1"), isMutationKey("message:1")], [true, true, false]);
+  // Freshness: now, unless the server says its copy is old enough to say so, or it answered from its own copy.
+  const at = (ms) => new Date(ms).toISOString();
+  now = Date.parse("2026-10-29T12:00:00Z");
+  const clock = () => now;
+  assert.equal(staleAsOf({ as_of: at(now - STALE_AS_OF_MS) }, false, clock), null);
+  assert.equal(staleAsOf({ as_of: at(now - STALE_AS_OF_MS - 1000) }, false, clock), now - STALE_AS_OF_MS - 1000);
+  assert.equal(staleAsOf({}, false, clock), null);
+  assert.equal(staleAsOf({ as_of: at(now - 5000) }, true, clock), now - 5000, "a stand-in copy was taken for a current one");
+  assert.equal(staleAsOf({ as_of: at(now + 5000) }, true, clock), now, "a stand-in copy dated ahead claimed to be newer than now");
+  assert.equal(staleAsOf(null, true, clock), now);
 });
 
 test("`#624 voice-page-modularity`: the browser's socket, audio, microphone and device-voice ports look each global up when used, not when made", async () => {

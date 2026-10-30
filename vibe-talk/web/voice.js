@@ -23667,11 +23667,7 @@ function pageFold(canon, payload, held) {
  * read would claim to be current when it is not.
  */
 function staleAsOf(payload) {
-  const asOf = payload && typeof payload.as_of === "string" ? Date.parse(payload.as_of) : NaN;
-  // `#611 timeline-read-failures`. A page the server answered from its own copy, the chat service
-  // having failed or kept it waiting, is as old as that copy, however recent.
-  if (refreshFailed(payload)) return Number.isFinite(asOf) ? Math.min(asOf, Date.now()) : Date.now();
-  return Number.isFinite(asOf) && Date.now() - asOf > STALE_AS_OF_MS ? asOf : null;
+  return syncStaleAsOf(payload, refreshFailed(payload), () => Date.now());
 }
 
 /**
@@ -28120,28 +28116,16 @@ function renderCachedTimeline() {
 // and its edits and deletions are no slower; deltas there serve a live arrival and a return to the
 // page, where speed is the point.
 
-/**
- * How old a view's last newest read may be before a refresh reads the newest page again: fifteen
- * minutes. A bridge with a change record reconciles its own snapshot and conveys what that finds in
- * its deltas, so this guards only against the page folding a delta wrongly; fifteen minutes is about
- * one reading session, so a session pays for at most one full read beyond the one it opened with.
- */
-const TIMELINE_RECONCILE_MS = 900000;
-/** How many delta pages one refresh follows before it reads the newest page instead. */
-const TIMELINE_DELTA_PAGES = 4;
-/** How long the page must have been hidden for coming back to refresh the channel. */
-const VISIBLE_REFRESH_MS = 15000;
-/** How far behind a page's `as_of` must be before the pill says the service is slow. */
-const STALE_AS_OF_MS = 120000;
-/** Why a read may be a delta. Anything else — entering a view, a stream reset — reads in full. */
-const DELTA_REASONS = ["live", "visible", "poll", "pull", "replay", "mutation"];
+// How old a view's last newest read may be (`TIMELINE_RECONCILE_MS`), how many delta pages one refresh
+// follows (`TIMELINE_DELTA_PAGES`), how long a hidden page refreshes after (`VISIBLE_REFRESH_MS`), when
+// the pill says the service is slow (`STALE_AS_OF_MS`) and why a read may be a delta (`DELTA_REASONS`)
+// are web/src/core/sync's, with the choice of cursor (`#624 voice-page-modularity`).
 
 /** Whether an edit or removal from the replay tail is waiting for a read to answer it. */
 function mutationAwaitsRead() {
   return [...replaysAwaitingRead.keys()].some(isMutationKey);
 }
 
-const isMutationKey = (key) => key.startsWith("message_update:") || key.startsWith("message_delete:");
 
 /**
  * The forward cursor this refresh may read from, or null for a full read. Only a view this page
@@ -28153,27 +28137,17 @@ const isMutationKey = (key) => key.startsWith("message_update:") || key.startsWi
  * @returns {string | null}
  */
 function forwardCursor(reason) {
-  if (Array.isArray(reason)) {
-    const cursors = reason.map(forwardCursor);
-    return cursors.length > 0 && cursors.every((cursor) => cursor !== null) ? cursors[0] : null;
-  }
-  if (reason === undefined || !DELTA_REASONS.includes(reason)) return null;
-  if (channelStore.current().channel !== String(selectedChannelId())) return null;
-  const cover = channelStore.current().views.get(viewKey());
-  if (!cover || !cover.live || !cover.newest) return null;
-  if (Date.now() - (cover.fullAt || 0) >= TIMELINE_RECONCILE_MS) return null;
-  const complete = channelStore.current().complete;
-  if (reason === "mutation") return complete === true ? cover.newest : null;
-  if (reason === "replay") return complete === true || !mutationAwaitsRead() ? cover.newest : null;
-  if (complete === false && reason !== "live" && reason !== "visible") return null;
-  return cover.newest;
+  return deltaCursor(reason, {
+    storeChannel: () => channelStore.current().channel,
+    selectedChannel: () => String(selectedChannelId()),
+    cover: () => channelStore.current().views.get(viewKey()),
+    complete: () => channelStore.current().complete,
+    mutationAwaits: mutationAwaitsRead,
+    now: () => Date.now(),
+  });
 }
 
-/** The server can no longer continue from that cursor, or it was not issued for this view. */
-function isCursorRefusal(error) {
-  return Boolean(error) && ((error.status === 410 && error.code === "cursor_expired") ||
-    (error.status === 400 && error.code === "cursor_mismatch"));
-}
+// Whether the server can no longer continue from a cursor (`isCursorRefusal`) is web/src/core/sync's.
 
 /**
  * `#617 cold-load-first-paint`. After a page the server answered from its own copy, the next reads
