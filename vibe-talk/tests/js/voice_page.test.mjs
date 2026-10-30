@@ -1865,6 +1865,7 @@ const CALL = await moduleForTests("src/core/call/index.ts");
 const WEB_PLATFORM = await moduleForTests("src/platform/web/index.ts");
 const SYNC = await moduleForTests("src/core/sync/index.ts");
 const VIEW_DOM = await moduleForTests("src/view/dom/index.ts");
+const VIEW_COMPOSER = await moduleForTests("src/view/composer/index.ts");
 /** The page's requests to its server, on ports a test supplies (web/src/core/api). */
 const SERVER_API = await moduleForTests("src/core/api/index.ts");
 
@@ -7369,6 +7370,52 @@ test("`#624 voice-page-modularity`: the quick retries after a stand-in read, fro
   assert.equal(retries.take(1000), 1000);
   assert.equal(retries.noteRead(false), false);
   assert.equal(retries.take(DISCORD_POLL_MS), DISCORD_POLL_MS, "a retry wanted before a current read was still taken");
+});
+
+test("`#624 voice-page-modularity`: the boxes that grow, on stand-in elements, from the module alone", () => {
+  const { createComposerGrow, COMPOSER_GROW_BOXES, COMPOSER_GROW_IDS } = VIEW_COMPOSER;
+  const made = new Map();
+  const element = (id) => {
+    if (!made.has(id)) {
+      const attributes = new Set();
+      made.set(id, { id, checked: false, scrollTop: 0, clientHeight: 400, drawn: true, removed: [],
+        setAttribute: (name) => attributes.add(name), removeAttribute: (name) => attributes.delete(name),
+        hasAttribute: (name) => attributes.has(name), getClientRects() { return this.drawn ? [{}] : []; },
+        getBoundingClientRect: () => ({ top: 0, bottom: 20, height: 20 }),
+        style: { removeProperty(name) { made.get(id).removed.push(name); } } });
+    }
+    return made.get(id);
+  };
+  const record = { kept: [], followed: [], kept_in_view: [] };
+  let focused = null;
+  let atFoot = false;
+  const grow = createComposerGrow({
+    lookup: element, listOf: (field) => element(field.id === "side-compose-text" ? "side-scroll" : "scroll-area"),
+    atBottom: () => atFoot, followFoot: (area) => record.followed.push(area.id),
+    keepBoxInView: (box, area) => record.kept_in_view.push([box.id, area.id]), activeElement: () => focused,
+    bottomSlack: 24, fieldSizing: true, keep: (on) => { if (on === "refuse") throw new Error("refused"); record.kept.push(on); },
+  });
+  assert.equal(grow.on(), false, "the boxes grew before Grow was ticked");
+  grow.render(true);
+  assert.equal(element("screen-main").hasAttribute("data-composer-grow"), true);
+  assert.deepStrictEqual(COMPOSER_GROW_IDS.map((id) => element(id).checked), [true, true, true, true], "a checkbox did not say the one choice");
+  assert.deepStrictEqual(COMPOSER_GROW_BOXES.map((id) => element(id).removed), [["height"], ["height"], ["height"], ["height"]],
+    "a dragged height was not let go as the boxes began to grow");
+  assert.equal(grow.shown(element("channel-compose-text")), true);
+  element("channel-compose-grow").drawn = false;
+  assert.equal(grow.shown(element("channel-compose-text")), false, "a box grew where its checkbox is not drawn");
+  // A list at its foot is put back there as Grow changes; storage refused still honours the choice.
+  atFoot = true;
+  grow.apply("refuse", element("compose-grow"));
+  assert.deepStrictEqual(record.followed, ["scroll-area", "side-scroll"]);
+  // Only the box with the focus is kept in view as it grows.
+  grow.render(true);
+  grow.keepInView(element("side-compose-text"));
+  assert.deepStrictEqual(record.kept_in_view, [], "a box without the focus moved its list");
+  focused = element("side-compose-text");
+  atFoot = false;
+  grow.keepInView(element("side-compose-text"));
+  assert.deepStrictEqual(record.kept_in_view, [["side-composer", "side-scroll"]]);
 });
 
 test("`#624 voice-page-modularity`: the DOM walks, on plain nodes, from the module alone", () => {
@@ -73377,13 +73424,13 @@ test("`#338 column-overscroll` x `#340 composer-grow-box`: A READER PART-WAY INT
 
   // THE CONTROLS. Each keeper putting the list at `scrollHeight` again, as both did: the reader is
   // taken on to the end of the room by that keeper alone.
-  const grewJump = await run(brokenScript(
-    "  if (grew > 0 && atBottom(area, BOTTOM_SLACK_PX + grew)) {\n    followFoot(area);\n",
-    "  if (grew > 0 && atBottom(area, BOTTOM_SLACK_PX + grew)) {\n    area.scrollTop = area.scrollHeight;\n"));
+  const grewJump = await run(await brokenModule([{ file: "src/view/composer/grow.ts",
+    find: "      if (grew > 0 && deps.atBottom(area, deps.bottomSlack + grew)) {\n        deps.followFoot(area);\n",
+    replace: "      if (grew > 0 && deps.atBottom(area, deps.bottomSlack + grew)) {\n        area.scrollTop = area.scrollHeight;\n" }]));
   assert.ok(grewJump.grewMoved > 1, `with the growing box's keeper at scrollHeight the reader was not moved, so this test cannot see it: ${JSON.stringify(grewJump)}`);
-  const untickJump = await run(brokenScript(
-    "  for (const area of footed) followFoot(area);\n",
-    "  for (const area of footed) area.scrollTop = area.scrollHeight;\n"));
+  const untickJump = await run(await brokenModule([{ file: "src/view/composer/grow.ts",
+    find: "      for (const area of footed) deps.followFoot(area);\n",
+    replace: "      for (const area of footed) area.scrollTop = area.scrollHeight;\n" }]));
   assert.equal(untickJump.grewMoved, 0, "the premise: the growing box's keeper still holds in this control");
   assert.ok(untickJump.untickMoved > 1, `with Grow's keeper at scrollHeight the reader was not moved, so this test cannot see it: ${JSON.stringify(untickJump)}`);
 });

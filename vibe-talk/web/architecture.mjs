@@ -43,6 +43,7 @@ export const PACKAGES = Object.freeze({
   "core/speech": BASE,
   "core/sync": BASE,
   "platform/web": BASE,
+  "view/composer": BASE,
   "view/dom": BASE,
   legacy: "*",
 });

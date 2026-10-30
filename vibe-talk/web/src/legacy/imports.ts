@@ -157,6 +157,7 @@ export {
 } from "../core/settings/index.ts";
 export { createWebPorts } from "../platform/web/index.ts";
 export { childByClass, nodeWithin, shownNode } from "../view/dom/index.ts";
+export { COMPOSER_GROW_BOXES, COMPOSER_GROW_IDS, createComposerGrow } from "../view/composer/index.ts";
 export {
   DEEP_LINK_PART_MAX,
   SPACE_EM,
