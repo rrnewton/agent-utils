@@ -960,9 +960,14 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # The 3 nested-repository repair cases of 2026-10-20 (an unabsorbed Git
     # directory moving with a fenced slot, its core.worktree refusal, and a
     # missing .git) are mapped.
-    assert len(all_tests) == 2110
+    # The 6 retirement and supersede-handoff cases of e01780af (a held slot
+    # never attempted, live-owned slots attempted only when owner-consented,
+    # a supersede that rebinds a live lane and voids the queue entry, and its
+    # three refusals) are mapped; the one case it replaced was mapped too,
+    # so the mapped partition grows by five net.
+    assert len(all_tests) == 2115
     assert len(ordinary) == 337
-    assert len(mapped) == 1773
+    assert len(mapped) == 1778
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {
