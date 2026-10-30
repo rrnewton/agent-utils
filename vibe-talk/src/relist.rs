@@ -158,6 +158,8 @@ async fn relist_channel(
         settle,
         ..
     } = options;
+    let began_ms = state.live.now_ms();
+    let mut failed = false;
     let mut requests = vec![TimelineRequest {
         view: TimelineView::Main,
         limit,
@@ -190,9 +192,15 @@ async fn relist_channel(
             }
             Err(error) => {
                 pass.failed += 1;
+                failed = true;
                 tracing::debug!(channel = %channel, %error, "a relist read failed; the next pass reads it");
             }
         }
+    }
+    // `#708 vt-live-push`: what the event stream lost before this relist began is read now, as far
+    // as a relist reads.
+    if !failed {
+        state.live.note_relisted(channel, began_ms);
     }
 }
 
@@ -252,6 +260,7 @@ pub async fn relist_forever(state: AppState, interval: Duration, limit: u16, thr
         interval,
         settle: RELIST_SETTLE,
     };
+    state.live.note_relist_running();
     let mut next = tokio::time::Instant::now() + interval;
     let mut passes: u32 = 0;
     loop {

@@ -2719,3 +2719,171 @@ mod measure {
         }
     }
 }
+
+/// A chat bridge's own record (`agentctl chat run`'s event sinks): a post, or a reaction.
+fn bridge(kind: &str, ts: &str, extra: Value) -> Value {
+    let mut record = json!({
+        "schema": "agentctl.chat-event.v1",
+        "event_id": format!("{kind}:{ts}"),
+        "kind": kind,
+        "at": "2026-10-30T16:25:17.953Z",
+        "bridge": "coordinator",
+        "channel_id": CH,
+        "message_id": format!("{CH}/messages/{ts}"),
+        "sender": {"id": "UBRIDGE001", "name": "bridge", "bot": true},
+    });
+    for (key, value) in extra.as_object().expect("an object") {
+        record[key] = value.clone();
+    }
+    record
+}
+
+/// `#708 vt-live-push`: the owner's own event stream never carries the bridge's posts nor its
+/// reactions, so each waited for a provider read that the rate limit kept refusing. The bridge's
+/// own record of a reply is published at once, as a reply by the bridge's account, with no read;
+/// its 👀 and ✅ on the owner's message go out as updates at once, each once, and a reaction on a
+/// message this server holds no copy of is left to the poller.
+#[tokio::test]
+async fn a_bridges_own_records_publish_its_reply_and_its_reactions_without_a_provider_read() {
+    let fake = Fake::start(fixture(), 20).await;
+    let state = deployment(&fake, "");
+    seeded(&state).await;
+    let reads = (
+        fake.calls("conversations.history"),
+        fake.calls("conversations.replies"),
+    );
+
+    let asked = now_ts(0, 100);
+    let (status, body) = post(&state, &record(51, &asked, None, "UOWNER001", "status?")).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+
+    let answer = now_ts(0, 900);
+    let (status, body) = post(
+        &state,
+        &bridge(
+            "message.posted",
+            &answer,
+            json!({"thread_id": format!("{CH}/threads/{asked}"), "text": "All green & <done>.",
+                "text_format": "markdown"}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        (status, body["outcome"].clone()),
+        (StatusCode::ACCEPTED, json!("published")),
+        "{body}"
+    );
+    let events = published(&state);
+    let reply = events.last().expect("the reply").clone();
+    assert_eq!(reply.kind, LiveKind::Create);
+    assert_eq!(reply.message.id, id_of(&answer));
+    assert_eq!(reply.message.author_id.0, "UBRIDGE001");
+    assert_eq!(reply.message.author, "bridge");
+    assert!(reply.message.author_is_bot);
+    assert_eq!(
+        reply.message.content, "All green & <done>.",
+        "the text as the bridge wrote it"
+    );
+    let thread = reply.message.thread.as_ref().expect("a thread");
+    assert!(!thread.is_root);
+    assert_eq!(thread.id, asked);
+
+    let reacted = |events: &[LiveMessage]| -> Vec<(String, u32)> {
+        events
+            .iter()
+            .rev()
+            .find(|event| event.message.id == id_of(&asked))
+            .and_then(|event| event.message.reactions.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|reaction| (reaction.emoji, reaction.count))
+            .collect()
+    };
+    let (status, body) = post(
+        &state,
+        &bridge("reaction.added", &asked, json!({"emoji": "👀"})),
+    )
+    .await;
+    assert_eq!(
+        (status, body["outcome"].clone()),
+        (StatusCode::ACCEPTED, json!("published")),
+        "{body}"
+    );
+    let events = published(&state);
+    assert_eq!(events.last().expect("an update").kind, LiveKind::Update);
+    assert_eq!(reacted(&events), [("👀".to_owned(), 1)]);
+    // The bridge retrying the same reaction changes nothing.
+    let (status, body) = post(
+        &state,
+        &bridge("reaction.added", &asked, json!({"emoji": "eyes"})),
+    )
+    .await;
+    assert_eq!(
+        (status, body["outcome"].clone()),
+        (StatusCode::OK, json!("known")),
+        "{body}"
+    );
+    assert_eq!(published(&state).len(), events.len());
+    let (status, _) = post(
+        &state,
+        &bridge(
+            "reaction.added",
+            &asked,
+            json!({"emoji": "white_check_mark"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(
+        reacted(&published(&state)),
+        [("👀".to_owned(), 1), ("✅".to_owned(), 1)]
+    );
+    assert_eq!(
+        (
+            fake.calls("conversations.history"),
+            fake.calls("conversations.replies")
+        ),
+        reads,
+        "no read of the provider for any of it"
+    );
+
+    // A message this server never gave a reader: the poller reads its set.
+    let unknown = now_ts(-3_600, 0);
+    let (status, body) = post(
+        &state,
+        &bridge("reaction.added", &unknown, json!({"emoji": "👀"})),
+    )
+    .await;
+    assert_eq!(
+        (status, body["outcome"].clone()),
+        (StatusCode::ACCEPTED, json!("hinted")),
+        "{body}"
+    );
+}
+
+/// `#708 vt-live-push`: a bridge's records say nothing of whether the owner's event stream is
+/// alive; counted as its records they would hide that stream's silence, and what it missed would
+/// never be read again.
+#[tokio::test]
+async fn a_bridges_records_never_stand_for_the_providers_stream() {
+    let fake = Fake::start(fixture(), 20).await;
+    let state = deployment(&fake, "");
+    let ts = now_ts(0, 300);
+    post(
+        &state,
+        &bridge("message.posted", &ts, json!({"text": "hello"})),
+    )
+    .await;
+    post(
+        &state,
+        &bridge("reaction.added", &ts, json!({"emoji": "👀"})),
+    )
+    .await;
+    assert_eq!(state.live.last_stream_record_ms(), None);
+    post(
+        &state,
+        &record(61, &now_ts(0, 400), None, "UOWNER001", "hi"),
+    )
+    .await;
+    assert!(state.live.last_stream_record_ms().is_some());
+}

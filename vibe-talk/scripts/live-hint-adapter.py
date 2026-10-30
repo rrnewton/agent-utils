@@ -79,6 +79,9 @@ CHANNELS_PLACEHOLDER = "{channels}"
 CATCHUP_PLACEHOLDER = "{catchup}"
 CONTROL_TYPES = frozenset({"HEARTBEAT", "STALL", "REVIVAL"})
 DEFAULT_CHANNELS_REFRESH_SECONDS = 300.0
+# How long the records loop waits for vibe-talk to answer its conversation list, doubling.
+UNAVAILABLE_FIRST_PAUSE_SECONDS = 1.0
+UNAVAILABLE_MAX_PAUSE_SECONDS = 30.0
 MIN_CHANNELS_REFRESH_SECONDS = 10.0
 CONVERSATION_ID = re.compile(r"[CGD][A-Z0-9]{8,31}")
 # What the stream client writes to stderr when it cannot resume from a saved position.
@@ -97,6 +100,10 @@ class AdapterFailure(Exception):
         super().__init__(message)
         self.code = code
         self.message = message
+
+
+class EndpointUnavailable(AdapterFailure):
+    """vibe-talk did not answer, or answered only with retryable errors, through every retry."""
 
 
 class StopRequested(Exception):
@@ -613,7 +620,7 @@ class HttpRecordSender:
             self.log(f"{method} attempt {attempt}/{attempts} had {result}; retrying")
             self.sleep(self.policy.delays[attempt - 1])
         result = "transport failure" if last is None else f"HTTP {last}"
-        raise AdapterFailure(
+        raise EndpointUnavailable(
             EXIT_DELIVERY_FAILED,
             f"{method} to the tail endpoint failed after {attempts} attempts; last result was {result}",
         )
@@ -930,14 +937,33 @@ def run_records(
     """Tail the conversations, restarting the stream whenever vibe-talk's list changes."""
 
     waiting_logged = False
+    unavailable_logged = False
+    pause = UNAVAILABLE_FIRST_PAUSE_SECONDS
     while True:
         if controller.stopping():
             raise StopRequested
-        channels = (
-            fixed_channels
-            if fixed_channels is not None
-            else sender.conversations(controller.stopping)
-        )
+        if fixed_channels is not None:
+            channels = fixed_channels
+        else:
+            try:
+                channels = sender.conversations(controller.stopping)
+            except EndpointUnavailable:
+                # vibe-talk is starting, or restarting beside this adapter (#708 vt-live-push):
+                # wait for it rather than exit and be restarted into the same race.
+                if not unavailable_logged:
+                    log("vibe-talk is not answering yet; waiting for it")
+                    unavailable_logged = True
+                deadline = time.monotonic() + pause
+                while time.monotonic() < deadline:
+                    if controller.stopping():
+                        raise StopRequested
+                    time.sleep(min(0.2, pause))
+                pause = min(pause * 2, UNAVAILABLE_MAX_PAUSE_SECONDS)
+                continue
+            if unavailable_logged:
+                log("vibe-talk is answering again")
+                unavailable_logged = False
+            pause = UNAVAILABLE_FIRST_PAUSE_SECONDS
         if not channels:
             if not waiting_logged:
                 log("vibe-talk names no conversation to tail yet; asking again later")
@@ -1297,12 +1323,14 @@ class ScriptedRecordSender:
         statuses: Sequence[int] = (),
         lists: Sequence[list[str]] = (),
         after_post: Callable[[int], None] | None = None,
+        unavailable: int = 0,
     ) -> None:
         self.posts: list[bytes] = []
         self.statuses = deque(statuses)
         self.lists = deque(lists)
         self.after_post = after_post
         self.lists_asked = 0
+        self.unavailable = unavailable
 
     def post(self, record: bytes, stopping: StopCheck) -> int:
         if stopping():
@@ -1317,6 +1345,9 @@ class ScriptedRecordSender:
         if stopping():
             raise StopRequested
         self.lists_asked += 1
+        if self.unavailable > 0:
+            self.unavailable -= 1
+            raise EndpointUnavailable(EXIT_DELIVERY_FAILED, "GET to the tail endpoint failed")
         if len(self.lists) > 1:
             return self.lists.popleft()
         return list(self.lists[0]) if self.lists else []
@@ -1491,6 +1522,50 @@ def records_self_test(secret: str, content_marker: str) -> int:
             raise AssertionError("an overflow did not report a gap and forget the position")
         if "gap" not in failure.message:
             raise AssertionError("the overflow failure did not say what happened")
+    controls += 1
+
+    # vibe-talk is not answering yet (it starts beside the adapter): the loop waits for it, saying
+    # so once, rather than exit and be restarted into the same race (#708 vt-live-push).
+    global UNAVAILABLE_FIRST_PAUSE_SECONDS
+    saved_pause = UNAVAILABLE_FIRST_PAUSE_SECONDS
+    UNAVAILABLE_FIRST_PAUSE_SECONDS = 0.05
+    try:
+        with tempfile.TemporaryDirectory(prefix="live-hint-adapter-unavailable-") as temporary:
+            cursor = StreamCursor(Path(temporary) / "tail.json")
+            controller = ShutdownController()
+            scripted = ScriptedRecordSender(
+                lists=[["C0000AAAA1"]],
+                unavailable=2,
+                after_post=lambda _count: controller.handler(signal.SIGTERM, None),
+            )
+            said: list[str] = []
+            one_record = (
+                "import json; print(json.dumps({'type':'message.created','iris_seq_id':5,"
+                "'payload':{}})); __import__('sys').stdout.flush(); __import__('time').sleep(30)"
+            )
+            try:
+                run_records(
+                    [sys.executable, "-c", one_record, "{channels}", "{catchup}"],
+                    scripted,
+                    controller,
+                    cursor,
+                    None,
+                    "none",
+                    60.0,
+                    said.append,
+                )
+            except StopRequested:
+                pass
+            else:
+                raise AssertionError("the records loop did not stop when asked")
+            if scripted.lists_asked != 3 or len(scripted.posts) != 1:
+                raise AssertionError("the records loop did not wait for vibe-talk and then tail")
+            if said.count("vibe-talk is not answering yet; waiting for it") != 1:
+                raise AssertionError("waiting for vibe-talk was not said exactly once")
+            if "vibe-talk is answering again" not in said:
+                raise AssertionError("vibe-talk answering again was not said")
+    finally:
+        UNAVAILABLE_FIRST_PAUSE_SECONDS = saved_pause
     controls += 1
 
     # vibe-talk's list changes while a stream runs: the stream is restarted with the new list

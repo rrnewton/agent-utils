@@ -10,6 +10,9 @@
 //! `STALL` and `REVIVAL` control records. Posts by other bots, edits and deletions are not in it:
 //! the live poller and the relist ([`crate::relist`]) find those.
 //!
+//! A chat bridge's own records arrive on the same route ([`CHAT_EVENT_SCHEMA`], `#708
+//! vt-live-push`): a message it posted, which the stream never carries, and a reaction it added.
+//!
 //! The stream is a trust boundary. Every identifier a message record carries must have its Slack
 //! shape, the conversation is named consistently, and the text is bounded; anything else refuses
 //! the whole record. A refusal names the field and the rule it broke, never its value, so a
@@ -56,6 +59,29 @@ pub enum TailRecord {
         broadcast: bool,
         /// The object to normalize.
         raw: Value,
+        /// Whether a chat bridge's own record said it, rather than the provider's stream: it says
+        /// nothing of whether that stream is alive. `#708 vt-live-push`.
+        bridge: bool,
+    },
+    /// A reaction a chat bridge added, from its own record (`agentctl.chat-event.v1`, `#708
+    /// vt-live-push`): applied to the message at once, as present.
+    ReactionAdded {
+        /// The conversation of the message reacted to.
+        conversation: String,
+        /// The canonical `ts` of the message reacted to.
+        ts: String,
+        /// The emoji itself, or a custom emoji's name.
+        emoji: String,
+        /// Whether `emoji` is a custom emoji's name.
+        custom: bool,
+    },
+    /// A record about a conversation that cannot be applied as it stands (a bridge's post that
+    /// names no author): the poller reads what it was about.
+    Unapplied {
+        /// The conversation.
+        conversation: String,
+        /// Why, in words a log may carry.
+        why: &'static str,
     },
     /// A reaction was added or removed. Its content is not read: the poller reads the set.
     Reaction {
@@ -83,6 +109,19 @@ pub enum TailRecord {
         /// Why it is not acted on, in words a log may carry.
         why: &'static str,
     },
+}
+
+impl TailRecord {
+    /// Whether a chat bridge's own record said it, rather than the provider's event stream: such a
+    /// record says nothing of whether that stream is alive. `#708 vt-live-push`.
+    #[must_use]
+    pub fn from_bridge(&self) -> bool {
+        match self {
+            Self::Message { bridge, .. } => *bridge,
+            Self::ReactionAdded { .. } | Self::Unapplied { .. } => true,
+            Self::Reaction { .. } | Self::Gap { .. } | Self::Control | Self::Other { .. } => false,
+        }
+    }
 }
 
 /// Why a record was refused: the field and the rule it broke, never its value.
@@ -198,6 +237,9 @@ pub fn parse(value: &Value) -> Result<TailRecord, TailError> {
     let record = value
         .as_object()
         .ok_or(refuse("record", "is not a JSON object"))?;
+    if record.get("schema").and_then(Value::as_str) == Some(CHAT_EVENT_SCHEMA) {
+        return chat_event(record);
+    }
     let kind = field(record, "type")?.ok_or(refuse("type", "is missing"))?;
     match kind {
         "HEARTBEAT" | "STALL" | "REVIVAL" => return Ok(TailRecord::Control),
@@ -260,6 +302,165 @@ pub fn parse(value: &Value) -> Result<TailRecord, TailError> {
         _ => Ok(TailRecord::Other {
             sequence,
             why: "a kind this server does not act on",
+        }),
+    }
+}
+
+/// The schema of a chat bridge's own records (`agentctl chat run`'s event sinks). `#708
+/// vt-live-push`.
+pub const CHAT_EVENT_SCHEMA: &str = "agentctl.chat-event.v1";
+
+/// The most characters of a sender's name or an emoji a bridge record may carry.
+const MAX_NAME_CHARS: usize = 80;
+
+/// The `ts` a bridge's resource names, `<conversation>/<kind>/<ts>`, checked.
+fn resource_ts(
+    record: &Map<String, Value>,
+    key: &'static str,
+    conversation: &str,
+    kind: &str,
+) -> Result<Option<String>, TailError> {
+    let Some(resource) = field(record, key)? else {
+        return Ok(None);
+    };
+    let ts = resource
+        .strip_prefix(conversation)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .and_then(|rest| rest.strip_prefix(kind))
+        .and_then(|rest| rest.strip_prefix('/'))
+        .ok_or(refuse(key, "does not name a resource of channel_id"))?;
+    ids::canonical_ts(ts)
+        .filter(|ts| ids::message_id_from_ts(ts).is_some())
+        .map(Some)
+        .ok_or(refuse(key, "does not end in a Slack ts"))
+}
+
+/// A short single-line name, trimmed; `None` for one that is empty or not text.
+fn short_name(value: Option<&Value>) -> Option<String> {
+    let name: String = value?
+        .as_str()?
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_NAME_CHARS)
+        .collect();
+    let name = name.trim();
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+/// One record of a chat bridge's event sink: a message it posted, or a reaction it added.
+/// `#708 vt-live-push`. The provider's own event stream, tailed as a person, never carries a bot's
+/// posts; the bridge says each one the moment the provider took it.
+///
+/// A post becomes the `conversations.history` object a read would return, authored by the
+/// bridge's account as its record names it, so a later read's copy is the same message by the
+/// same author; one that names no account is left to the poller. Checked as strictly as a stream
+/// record: every identifier its Slack shape, the resources of the one conversation, the text
+/// bounded.
+fn chat_event(record: &Map<String, Value>) -> Result<TailRecord, TailError> {
+    let kind = field(record, "kind")?.ok_or(refuse("kind", "is missing"))?;
+    let conversation = field(record, "channel_id")?.ok_or(refuse("channel_id", "is missing"))?;
+    if !ids::is_conversation_id(conversation) {
+        return Err(refuse("channel_id", "is not a Slack conversation id"));
+    }
+    let ts = resource_ts(record, "message_id", conversation, "messages")?
+        .ok_or(refuse("message_id", "is missing"))?;
+    let sender = record.get("sender").and_then(Value::as_object);
+    let sender_id = match sender {
+        Some(sender) => field(sender, "id")?,
+        None => None,
+    };
+    match kind {
+        "message.posted" => {
+            let thread_ts = resource_ts(record, "thread_id", conversation, "threads")?
+                .filter(|thread| *thread != ts);
+            let text = match record.get("text") {
+                None | Some(Value::Null) => "",
+                Some(Value::String(text)) => text,
+                Some(_) => return Err(refuse("text", NOT_A_STRING)),
+            };
+            if text.chars().count() > MAX_TEXT_CHARS {
+                return Err(refuse("text", "is longer than Slack's 40,000 characters"));
+            }
+            let author = match sender_id {
+                Some(id) if ids::is_user_id(id) => ("user", id),
+                Some(id) if is_prefixed_id(id, b"B") => ("bot_id", id),
+                Some(_) => return Err(refuse("sender.id", "is not a Slack user or bot id")),
+                None => {
+                    return Ok(TailRecord::Unapplied {
+                        conversation: conversation.to_owned(),
+                        why: "a bridge's post that names no author",
+                    })
+                }
+            };
+            // The bridge records the text it was asked to post, Markdown, which the provider
+            // converts as it posts; what a read returns is Slack's own text, which normalization
+            // reads back. Escaped as a post of it would be, its `&`, `<` and `>` come back as
+            // written, and its links and mentions as they are; emphasis the provider rewrites is
+            // put right by the next read of the message.
+            let text = match field(record, "text_format")? {
+                None | Some("markdown") => super::mrkdwn::escape_outgoing(text),
+                Some("mrkdwn") => text.to_owned(),
+                Some(_) => return Err(refuse("text_format", "is neither markdown nor mrkdwn")),
+            };
+            let mut raw = Map::new();
+            raw.insert("type".to_owned(), Value::from("message"));
+            raw.insert("ts".to_owned(), Value::from(ts.clone()));
+            raw.insert("text".to_owned(), Value::from(text));
+            raw.insert(author.0.to_owned(), Value::from(author.1));
+            let bot = sender
+                .and_then(|sender| sender.get("bot"))
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            if bot {
+                raw.insert("subtype".to_owned(), Value::from("bot_message"));
+            }
+            if let Some(name) = short_name(sender.and_then(|sender| sender.get("name"))) {
+                let profile = if bot { "bot_profile" } else { "user_profile" };
+                let key = if bot { "name" } else { "display_name" };
+                raw.insert(profile.to_owned(), serde_json::json!({ key: name }));
+            }
+            if let Some(thread) = &thread_ts {
+                raw.insert("thread_ts".to_owned(), Value::from(thread.clone()));
+            }
+            Ok(TailRecord::Message {
+                sequence: None,
+                conversation: conversation.to_owned(),
+                ts,
+                thread_ts,
+                broadcast: false,
+                raw: Value::Object(raw),
+                bridge: true,
+            })
+        }
+        "reaction.added" => {
+            let named = field(record, "emoji")?.ok_or(refuse("emoji", "is missing"))?;
+            let named = named.trim().trim_matches(':');
+            if named.is_empty()
+                || named.chars().count() > MAX_NAME_CHARS
+                || named.chars().any(char::is_control)
+            {
+                return Err(refuse("emoji", "is not one short emoji or name"));
+            }
+            // A Slack name (`white_check_mark`) is the emoji it names, as a read reports it; the
+            // emoji itself is taken as it is; any other name is a custom emoji's.
+            let (emoji, custom) = if named.is_ascii() {
+                match super::reactions::standard_emoji(named) {
+                    Some(emoji) => (emoji, false),
+                    None => (named.to_owned(), true),
+                }
+            } else {
+                (named.to_owned(), false)
+            };
+            Ok(TailRecord::ReactionAdded {
+                conversation: conversation.to_owned(),
+                ts,
+                emoji,
+                custom,
+            })
+        }
+        _ => Ok(TailRecord::Other {
+            sequence: None,
+            why: "a kind of bridge record this server does not act on",
         }),
     }
 }
@@ -345,6 +546,7 @@ fn message(
         thread_ts,
         broadcast: subtype == Some("thread_broadcast"),
         raw: Value::Object(raw),
+        bridge: false,
     })
 }
 
@@ -473,6 +675,7 @@ mod tests {
             thread_ts,
             broadcast,
             raw,
+            ..
         } = parse(&record).expect("valid")
         else {
             panic!("not a message");
@@ -727,5 +930,131 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// A chat bridge's record of a post, as `agentctl chat run`'s event sink writes it.
+    fn bridge_post(sender: Value, thread: Option<&str>) -> Value {
+        json!({
+            "schema": CHAT_EVENT_SCHEMA, "event_id": "message.posted:op-1",
+            "kind": "message.posted", "at": "2026-10-30T16:25:17.953Z", "bridge": "coordinator",
+            "channel_id": "C0000MAIN1", "message_id": "C0000MAIN1/messages/1792637725.398100",
+            "thread_id": thread, "text": "That's expected while polling is paused",
+            "text_format": "markdown",
+            "sender": sender,
+        })
+    }
+
+    #[test]
+    fn a_bridge_post_becomes_the_message_a_read_would_return_by_the_same_author() {
+        // `#708 vt-live-push`.
+        let record = bridge_post(
+            json!({"id": "UBRIDGE001", "name": "bridge", "bot": true}),
+            Some("C0000MAIN1/threads/1792637000.000100"),
+        );
+        let Ok(TailRecord::Message {
+            sequence,
+            conversation,
+            ts,
+            thread_ts,
+            broadcast,
+            raw,
+            bridge,
+        }) = parse(&record)
+        else {
+            panic!("a message: {:?}", parse(&record));
+        };
+        assert_eq!(sequence, None);
+        assert!(bridge);
+        assert_eq!(conversation, "C0000MAIN1");
+        assert_eq!(ts, "1792637725.398100");
+        assert_eq!(thread_ts.as_deref(), Some("1792637000.000100"));
+        assert!(!broadcast);
+        assert_eq!(raw["user"], "UBRIDGE001");
+        assert_eq!(raw["subtype"], "bot_message");
+        assert_eq!(raw["bot_profile"]["name"], "bridge");
+        assert_eq!(raw["thread_ts"], "1792637000.000100");
+        assert_eq!(raw["text"], "That's expected while polling is paused");
+        // Markdown's `&`, `<` and `>` reach normalization escaped, as Slack would hold them.
+        let mut symbols = bridge_post(json!({"id": "UBRIDGE001"}), None);
+        symbols["text"] = json!("a & b <c> <@UADA00001>");
+        let Ok(TailRecord::Message { raw, .. }) = parse(&symbols) else {
+            panic!("a message");
+        };
+        assert_eq!(raw["text"], "a &amp; b &lt;c&gt; <@UADA00001>");
+        // A root names no thread, and a post that names no author is left to the poller.
+        let root = bridge_post(
+            json!({"id": "UBRIDGE001"}),
+            Some("C0000MAIN1/threads/1792637725.398100"),
+        );
+        assert!(matches!(
+            parse(&root),
+            Ok(TailRecord::Message {
+                thread_ts: None,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse(&bridge_post(json!({"name": "bridge"}), None)),
+            Ok(TailRecord::Unapplied { .. })
+        ));
+    }
+
+    #[test]
+    fn a_bridge_reaction_names_the_emoji_a_read_would_report() {
+        let reaction = |emoji: &str| {
+            json!({
+                "schema": CHAT_EVENT_SCHEMA, "event_id": "reaction.added:op-2",
+                "kind": "reaction.added", "channel_id": "C0000MAIN1",
+                "message_id": "C0000MAIN1/messages/1792637725.398100", "emoji": emoji,
+                "sender": {"id": "UBRIDGE001"},
+            })
+        };
+        for (given, emoji, custom) in [
+            ("✅", "✅", false),
+            ("white_check_mark", "✅", false),
+            (":eyes:", "👀", false),
+            ("party-parrot", "party-parrot", true),
+        ] {
+            assert_eq!(
+                parse(&reaction(given)),
+                Ok(TailRecord::ReactionAdded {
+                    conversation: "C0000MAIN1".to_owned(),
+                    ts: "1792637725.398100".to_owned(),
+                    emoji: emoji.to_owned(),
+                    custom,
+                }),
+                "{given}"
+            );
+        }
+        assert_eq!(
+            parse(&reaction("::")),
+            Err(TailError {
+                field: "emoji",
+                rule: "is not one short emoji or name"
+            })
+        );
+    }
+
+    #[test]
+    fn a_bridge_record_naming_another_conversations_message_or_a_bad_author_is_refused() {
+        let mut other = bridge_post(json!({"id": "UBRIDGE001"}), None);
+        other["message_id"] = json!("C0000OTHR2/messages/1792637725.398100");
+        assert_eq!(
+            parse(&other),
+            Err(TailError {
+                field: "message_id",
+                rule: "does not name a resource of channel_id"
+            })
+        );
+        assert_eq!(
+            parse(&bridge_post(json!({"id": "not an id"}), None)),
+            Err(TailError {
+                field: "sender.id",
+                rule: "is not a Slack user or bot id"
+            })
+        );
+        let mut unknown = bridge_post(json!({"id": "UBRIDGE001"}), None);
+        unknown["kind"] = json!("message.admitted");
+        assert!(matches!(parse(&unknown), Ok(TailRecord::Other { .. })));
     }
 }

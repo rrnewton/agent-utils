@@ -1781,6 +1781,26 @@ impl Sink {
         .flatten()
     }
 
+    /// Message `id` of `channel` as the file holds it, when its text is whole: what a change to
+    /// it that arrives without its text is applied to (`#708 vt-live-push`). `None` when the file
+    /// cannot say: no cache, the channel not routed to it, the message not held, or held only as a
+    /// push no read proved whole.
+    pub async fn held_message(&self, channel: &ChannelId, id: &MessageId) -> Option<Message> {
+        let cache = self.cache().filter(|cache| cache.is_open())?;
+        let chan = self.chan_key(channel)?;
+        let id = id.clone();
+        tokio::task::spawn_blocking(move || {
+            let row = cache.message(&chan, &id).served().flatten()?;
+            (!row.content_partial).then_some(Message {
+                observed_ms: Some(row.observed_ms),
+                ..row.message
+            })
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
     /// Whether the file is short of `thread` of `channel`: its root counts more replies than the
     /// file holds (`#708 vt-live-push`). `None` when it is not, or cannot say (no cache, the
     /// channel not routed to it, the thread's scope blocked, no count known).
@@ -1789,33 +1809,7 @@ impl Sink {
         let chan = self.chan_key(channel)?;
         let thread = thread.to_owned();
         tokio::task::spawn_blocking(move || {
-            let record = cache.thread(&chan, &thread).served().flatten()?;
-            let counted = record.reply_count.filter(|count| *count > 0)?;
-            let limit = usize::try_from(counted)
-                .unwrap_or(usize::MAX)
-                .saturating_add(2);
-            let Read::Served(rows) = cache.newest(&chan, &Scope::Thread(thread.clone()), limit)
-            else {
-                return None;
-            };
-            let held = rows
-                .iter()
-                .filter(|row| {
-                    row.message
-                        .thread
-                        .as_ref()
-                        .is_none_or(|thread| !thread.is_root)
-                })
-                .count();
-            let held = u64::try_from(held).unwrap_or(u64::MAX);
-            if held >= counted {
-                return None;
-            }
-            let root_ms = record
-                .root_id
-                .as_ref()
-                .and_then(|root| cache.message(&chan, root).served().flatten())
-                .map(|root| root.created_ms);
+            let (held, counted, root_ms) = cache.thread_shortfall(&chan, &thread).served()??;
             Some(Shortfall {
                 held,
                 counted,

@@ -4736,6 +4736,21 @@ speech preparation `held` or `fetched`) and what it asked for (`read_view`: `fla
 `thread`, `threads`; `read_cursor`: `newest`, `after`, `before`, or `before-served` for a step back
 from a page this server answered from its cache) beside its `millis`.
 
+**Never complete while something may be missing** (`#708 vt-live-push`). The owner, 2026-10-30:
+"slow to refresh is one thing, but a partial refresh, even when I reload the page, is pretty bad."
+Every answer from the server's copy (cache first, stand-in, live-fed) is checked before it goes
+out. A thread whose root counts more replies than the cache holds, or a channel whose latest live
+read failed or left thread replies unread, or whose event stream lost records, came back after a
+silence, or announced a message that could not be applied, is answered with `refresh_failed`
+saying which. Its `as_of` is then no later than what the copy is known complete to: the thread's
+latest listing (its root when no listing reached it), or the start of the channel's last live read
+that ended well. It is never dated by when its rows were last seen, so the page says "Refresh
+failed · showing messages from …" rather than "Updated" a minute ago. A channel's mark clears only
+when a live read that began after the mark ends well. After a restart, the poller's first read also
+asks for every thread on the newest page whose root counts more replies than the cache holds. That
+thread is read from its root on the next tick, and replies the cache already held come back as
+known, not as news, instead of being taken as read to where the root stands.
+
 **Older pages and counts from the cache** (`#650`). Live after `#622`, every step back walked Slack
 from its newest page (2.6 s, once 21 s), because every newest page came from the cache with this
 server's own backward cursor; and one open page stepped back after every 45 s poll: its view's
@@ -5983,6 +5998,24 @@ that is not on the list is `unlisted`. Answers: `202` for a record that did some
 one that did not, `400` for a malformed one, which must not be retried as it is. `GET
 /api/v1/live/tail`, under the same token, answers `{"conversations": [...]}`: what to tail.
 
+**A chat bridge's own records** (`#708 vt-live-push`). A provider's event stream tailed as a
+person leaves other bots' posts out, and for Slack it carries no reaction a bot adds, so a chat
+bridge's replies and its 👀 and ✅ used to wait for a read of the provider, minutes under a rate
+limit. `agentctl chat run` can POST a record of each message it posts and each reaction it adds to
+this same route (its event sinks, schema `agentctl.chat-event.v1`; see `agentctl chat userguide`).
+A post (`message.posted`) is checked as strictly as a stream record (its `message_id` and
+`thread_id` resources of its `channel_id`, its sender a Slack user or bot id, its text bounded)
+and becomes the history object a read would return, authored by the bridge's account as the record
+names it, so a later read's copy is the same message by the same author. It is then published and
+cached exactly as a stream record's message is; one that names no author wakes the poller instead.
+A reaction (`reaction.added`; the emoji itself, or a Slack name such as `white_check_mark`) is put
+on the copy readers were last given, or else the message cache's, as present, and goes out as a
+live update at once: `published`, or `known` when the emoji was already there. It is "present", not
+"one more", since a read may already have counted it; a second reactor of the same emoji is put
+right by the next read. A copy that says nothing about reactions is taken as having none only
+while it is under fifteen minutes old. A message the server holds no copy of is `hinted`: the
+poller reads its set.
+
 **The relist** (`ingest.relist_seconds`, off by default). The stream carries no edits, no
 deletions and no other bots' posts. The poller's walk forward publishes the other bots' posts; the
 relist reads each fed channel's newest page, and each thread a reply was pushed in recently (at
@@ -6027,8 +6060,10 @@ It keeps the stream position of the last acknowledged record in `--state-file` a
 `--channel` fixes the list (`{channels}`), asks again every five minutes and restarts the stream
 when the answer changes, skips a record the server refuses as malformed, skips a line it cannot
 read at all (not JSON, or past the bound) and reports it as a gap, and reports a stream that
-cannot resume from its saved position as a gap before it exits. Contentless hints stay available
-as the adapter's default mode.
+cannot resume from its saved position as a gap before it exits. When vibe-talk does not answer
+its request for the conversation list (it starts or restarts beside the adapter), the adapter waits
+for it, pausing 1 s and doubling to 30 s, and says so once, rather than exit and be restarted into
+the same race. Contentless hints stay available as the adapter's default mode.
 
 ### Provider-adapter push
 

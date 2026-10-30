@@ -2438,6 +2438,95 @@ impl MessageCache {
         })
     }
 
+    /// Whether `thread_id`'s root counts more replies than the file holds, with the counts and
+    /// the root's time, provider time, when the file holds it: `Some` only when it does and no
+    /// listing proves the thread whole since the count was learned. `#708 vt-live-push`.
+    ///
+    /// A provider may count replies the file never keeps (a system event, a message with no
+    /// author): a listing of the whole thread, from its root, that began after the count was last
+    /// set therefore stands for the thread whatever the count says, so such a thread is not short
+    /// for ever.
+    #[must_use]
+    pub fn thread_shortfall(
+        &self,
+        chan: &ChanKey,
+        thread_id: &str,
+    ) -> Read<Option<(u64, u64, Option<i64>)>> {
+        let now_ms = self.now_ms();
+        let cutoff_ms = self.shared.limits.cutoff_ms(&chan.channel_id, now_ms);
+        let scope_key = Scope::Thread(thread_id.to_owned()).key();
+        self.read_scope(chan, &scope_key, |connection| {
+            let snapshot = connection.unchecked_transaction()?;
+            let found = (|| -> rusqlite::Result<Option<(u64, u64, Option<i64>)>> {
+                let Some(id) = reader::chan_id(&snapshot, chan)? else {
+                    return Ok(None);
+                };
+                let Some(record) = reader::thread(&snapshot, chan, thread_id)? else {
+                    return Ok(None);
+                };
+                let Some(counted) = record.reply_count.filter(|count| *count > 0) else {
+                    return Ok(None);
+                };
+                let want = usize::try_from(counted)
+                    .unwrap_or(usize::MAX)
+                    .saturating_add(2);
+                let rows = reader::newest(&snapshot, chan, &scope_key, want)?;
+                let root_ms = record
+                    .root_id
+                    .as_ref()
+                    .and_then(|root| rows.iter().find(|row| row.message.id == *root))
+                    .map(|row| row.created_ms)
+                    .or_else(|| {
+                        crate::slack::ids::ts_micros(thread_id).map(|micros| micros / 1000)
+                    });
+                let held = rows
+                    .iter()
+                    .filter(|row| {
+                        row.message
+                            .thread
+                            .as_ref()
+                            .is_none_or(|thread| !thread.is_root)
+                    })
+                    .count();
+                let held = u64::try_from(held).unwrap_or(u64::MAX);
+                if held >= counted {
+                    return Ok(None);
+                }
+                let counted_at: Option<i64> = snapshot
+                    .query_row(
+                        "SELECT verified_ms FROM thread WHERE chan = ?1 AND thread_id = ?2",
+                        rusqlite::params![id, thread_id],
+                        |row| row.get(0),
+                    )
+                    .ok();
+                let intervals = reader::coverage(&snapshot, chan, &scope_key)?;
+                let head = reader::head_record(&snapshot, chan, &scope_key)?;
+                // As a held thread is proven whole (`held::whole`): below the head's settled top
+                // by claims reaching down to the root, and in the unsettled band above it by the
+                // latest read of the newest end, its listing begun at or below where the thread
+                // enters the band; each since the count was learned.
+                let whole_since = match (head, root_ms, counted_at) {
+                    (Some(record), Some(root_ms), Some(counted_at)) => {
+                        let top = record.head.settled_top();
+                        let below = root_ms >= top
+                            || coverage::horizon(&intervals, Some(&record.head), cutoff_ms)
+                                .is_some_and(|horizon| {
+                                    horizon.from_ms <= root_ms && horizon.as_of_ms >= counted_at
+                                });
+                        let band = record
+                            .checked_from_ms
+                            .is_some_and(|from| from <= root_ms.max(top));
+                        below && band && record.checked_ms >= counted_at
+                    }
+                    _ => false,
+                };
+                Ok((!whole_since).then_some((held, counted, root_ms)))
+            })()?;
+            snapshot.finish()?;
+            Ok(found)
+        })
+    }
+
     /// The head of one scope, if a read of its newest end has landed.
     #[must_use]
     pub fn head(&self, chan: &ChanKey, scope: &Scope) -> Read<Option<coverage::Head>> {

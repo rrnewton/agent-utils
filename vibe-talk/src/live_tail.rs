@@ -15,6 +15,10 @@
 //! list while an adapter still tails it costs nothing. A record that says the stream lost records
 //! (`GAP`) reads every such channel again at once, and relists it; a reaction record wakes the
 //! poller, whose read reports the reaction set as it stands (`#378 live-reactions`).
+//!
+//! A chat bridge's own records (`agentctl.chat-event.v1`, `#708 vt-live-push`) arrive the same way:
+//! its posts are published as a stream record's message is, and a reaction it added is put on the
+//! message at once, as present (`add_reaction`). The owner's stream never carries either.
 
 use crate::chat::{ChatClient as _, ChatError};
 use crate::live::Published;
@@ -33,6 +37,68 @@ const STREAM_LOST: &str =
 /// Why a channel a record of which could not be applied is not presented as complete.
 const STREAM_UNAPPLIED: &str =
     "A message the chat service's event stream announced has not been read yet.";
+
+/// Put `emoji` on message `id` of `channel` as present, from the copy readers were last given
+/// or, failing that, the message cache's: `Some(true)` when it was not there and the message went
+/// out as an update, `Some(false)` when it was already there, `None` when no copy can say. `#708
+/// vt-live-push`.
+///
+/// "Present", not "one more": a bridge's record says it added the reaction, and the set a read
+/// reported may already count it, so a tally is never raised for an emoji already on the message.
+/// A count short by a second reactor of the same emoji is put right by the next read, which
+/// reports the set as it stands. A copy that says nothing of reactions is taken as having none
+/// only while it is new enough to have had no time to collect any unseen ([`PUSH_STALE_MS`]).
+async fn add_reaction(
+    state: &AppState,
+    channel: &ChannelId,
+    id: &crate::model::MessageId,
+    emoji: &str,
+    custom: bool,
+    now_ms: i64,
+) -> Option<bool> {
+    // The newer of the two: the copy readers were last given may be older than one a read has
+    // since put in the cache, and republished whole it would put the older text back.
+    let known = state.live.known_copy(channel, id);
+    let held = state.message_cache.held_message(channel, id).await;
+    let mut message = match (known, held) {
+        (Some(known), Some(held)) => {
+            if held.observed_ms.unwrap_or(i64::MIN) > known.observed_ms.unwrap_or(i64::MIN) {
+                held
+            } else {
+                known
+            }
+        }
+        (known, held) => known.or(held)?,
+    };
+    let reactions = match message.reactions.as_mut() {
+        Some(reactions) => reactions,
+        None => {
+            let fresh = id
+                .created_at_ms()
+                .is_some_and(|at| now_ms.saturating_sub(at) <= crate::live::PUSH_STALE_MS);
+            if !fresh {
+                return None;
+            }
+            message.reactions.insert(Vec::new())
+        }
+    };
+    let bare = |text: &str| text.replace('\u{FE0F}', "");
+    if reactions
+        .iter()
+        .any(|held| held.custom == custom && bare(&held.emoji) == bare(emoji))
+    {
+        return Some(false);
+    }
+    reactions.push(crate::model::Reaction {
+        emoji: emoji.to_owned(),
+        custom,
+        custom_id: None,
+        count: 1,
+        owner_reacted: false,
+    });
+    state.live.publish_update(channel, message);
+    Some(true)
+}
 
 /// What one record did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,18 +152,32 @@ pub fn conversations(state: &AppState) -> Vec<String> {
     conversations
 }
 
-/// Wake the poller of `channel`'s provider, when it polls. Whether a poller was woken.
-fn wake(state: &AppState, channel: &ChannelId) -> bool {
-    let Some(key) = state.providers.key_for(channel) else {
-        return false;
-    };
-    let polls = state
+/// Whether `channel`'s provider is polled, and its key.
+fn polled(state: &AppState, channel: &ChannelId) -> Option<String> {
+    let key = state.providers.key_for(channel)?;
+    state
         .providers
         .entry(&key)
-        .is_some_and(|entry| entry.live_poll_seconds > 0);
-    if !polls {
-        return false;
+        .is_some_and(|entry| entry.live_poll_seconds > 0)
+        .then_some(key)
+}
+
+/// Mark `channel` as possibly missing what its stream lost or could not apply, for `why`, when a
+/// poller runs to clear the mark: with none, nothing would ever read the channel again to prove it
+/// whole, and every answer would say so for ever. `#708 vt-live-push`.
+fn mark(state: &AppState, channel: &ChannelId, why: &'static str) {
+    if polled(state, channel).is_some() {
+        state
+            .live
+            .note_stream_unreconciled(channel, state.live.reconciled_ms(channel), why);
     }
+}
+
+/// Wake the poller of `channel`'s provider, when it polls. Whether a poller was woken.
+fn wake(state: &AppState, channel: &ChannelId) -> bool {
+    let Some(key) = polled(state, channel) else {
+        return false;
+    };
     let queue_key = state.providers.is_multi().then_some(key.as_str());
     // Queued or already pending: either way the poller reads it.
     let _ = state.live.queue_hint(queue_key, channel);
@@ -117,17 +197,15 @@ pub async fn ingest(
 ) -> Result<TailOutcome, ChatError> {
     // `#595 cache-full-history`. A stream that comes back after a silence may have missed
     // anything while it was away: its channels' hot walks read what it did not carry.
-    if state.live.note_stream_record(now_ms) {
+    // `#708 vt-live-push`: a bridge's own record says nothing of whether the stream is alive, and
+    // counted as one it would hide the stream's silence.
+    if !record.from_bridge() && state.live.note_stream_record(now_ms) {
         let channels = channels_of(state, None);
         for (channel, _) in &channels {
             state.live.request_rewalk(&channel.id);
-            // `#708 vt-live-push`: until a live read after this one, the channel may lack what
-            // the stream did not carry while it was away.
-            state.live.note_unreconciled(
-                &channel.id,
-                state.live.reconciled_ms(&channel.id),
-                STREAM_AWAY,
-            );
+            // `#708 vt-live-push`: until it is read again, the channel may lack what the stream
+            // did not carry while it was away.
+            mark(state, &channel.id, STREAM_AWAY);
         }
         tracing::info!(
             channels = channels.len(),
@@ -150,17 +228,58 @@ pub async fn ingest(
                 wake(state, &channel.id);
                 state.live.request_relist(&channel.id);
                 state.live.request_rewalk(&channel.id);
-                state.live.note_unreconciled(
-                    &channel.id,
-                    state.live.reconciled_ms(&channel.id),
-                    STREAM_LOST,
-                );
+                mark(state, &channel.id, STREAM_LOST);
             }
             tracing::warn!(
                 channels = channels.len(),
                 "the provider's event stream lost records; reading its channels again"
             );
             Ok(TailOutcome::Gap(channels.len()))
+        }
+        TailRecord::Unapplied { conversation, why } => {
+            tracing::debug!(why, "a stream record left to the poller");
+            let channels = channels_of(state, Some(&conversation));
+            if channels.is_empty() {
+                return Ok(TailOutcome::Unlisted);
+            }
+            let woken = channels
+                .iter()
+                .filter(|(channel, _)| wake(state, &channel.id))
+                .count();
+            Ok(TailOutcome::Hinted(woken))
+        }
+        TailRecord::ReactionAdded {
+            conversation,
+            ts,
+            emoji,
+            custom,
+        } => {
+            let channels = channels_of(state, Some(&conversation));
+            if channels.is_empty() {
+                return Ok(TailOutcome::Unlisted);
+            }
+            let Some(id) = crate::slack::ids::message_id_from_ts(&ts) else {
+                return Ok(TailOutcome::Ignored);
+            };
+            let mut outcome = TailOutcome::Ignored;
+            let mut woken = 0;
+            for (channel, _) in &channels {
+                match add_reaction(state, &channel.id, &id, &emoji, custom, now_ms).await {
+                    Some(true) => outcome = TailOutcome::Published,
+                    Some(false) => {
+                        if outcome == TailOutcome::Ignored {
+                            outcome = TailOutcome::Known;
+                        }
+                    }
+                    // Not a message this server holds a copy of that can say: the poller's read
+                    // brings the set as it stands.
+                    None => woken += usize::from(wake(state, &channel.id)),
+                }
+            }
+            if outcome == TailOutcome::Ignored && woken > 0 {
+                outcome = TailOutcome::Hinted(woken);
+            }
+            Ok(outcome)
         }
         TailRecord::Reaction { conversation, .. } => {
             let channels = channels_of(state, Some(&conversation));
@@ -219,11 +338,7 @@ pub async fn ingest(
                         // `#708 vt-live-push`: seen, and not applied. The poller reads it; until
                         // then the channel is not presented as complete.
                         wake(state, &channel.id);
-                        state.live.note_unreconciled(
-                            &channel.id,
-                            state.live.reconciled_ms(&channel.id),
-                            STREAM_UNAPPLIED,
-                        );
+                        mark(state, &channel.id, STREAM_UNAPPLIED);
                     }
                 }
                 let Some(mut message) = pushed? else {

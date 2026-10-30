@@ -3230,10 +3230,11 @@ async fn a_thread_whose_root_counts_more_replies_than_are_held_is_never_answered
 
 /// `#708 vt-live-push`: a channel whose event stream reported records lost is not presented as
 /// complete by an answer from the cache, even for a thread the cache holds whole, until a live read
-/// begun after the report ends well.
+/// begun after the report ends well, and, where the relist runs, a relist begun after it too.
 #[tokio::test]
 async fn a_channel_whose_stream_lost_records_is_not_answered_as_complete_until_read_again() {
-    let (state, fake, clock, _dir) = slack_threads_deployment("stream-gap", false).await;
+    let (state, fake, clock, _dir) = slack_threads_deployment("stream-gap", true).await;
+    state.live.note_relist_running();
     state.message_cache.set_serve(true);
     let listed = clock.now();
     let thread = path(
@@ -3271,7 +3272,18 @@ async fn a_channel_whose_stream_lost_records_is_not_answered_as_complete_until_r
             .is_some_and(|why| why.contains("lost messages")),
         "{body}"
     );
-    // …and one begun after it, ending well, reads what was lost.
+    // …and one begun after it is not enough while the relist has not read the channel since…
+    clock.advance(SECOND);
+    state.live.note_reconciled(&channel, clock.now());
+    let body = ok(&state, &thread, WRITE_TOKEN).await;
+    assert!(
+        body["refresh_failed"]
+            .as_str()
+            .is_some_and(|why| why.contains("lost messages")),
+        "{body}"
+    );
+    // …until it has, too.
+    state.live.note_relisted(&channel, clock.now());
     clock.advance(SECOND);
     state.live.note_reconciled(&channel, clock.now());
     let body = ok(&state, &thread, WRITE_TOKEN).await;
@@ -3280,5 +3292,72 @@ async fn a_channel_whose_stream_lost_records_is_not_answered_as_complete_until_r
             .as_str()
             .is_some_and(|why| !why.contains("lost messages")),
         "{body}"
+    );
+}
+
+/// `#708 vt-live-push`: the provider may count a reply the server never keeps (a system event). A
+/// listing of the whole thread from its root, begun after the count was learned, stands for the
+/// thread, so it is not answered as short for ever.
+#[tokio::test]
+async fn a_thread_listed_whole_since_its_count_is_complete_whatever_the_count_says() {
+    let (state, fake, clock, _dir) = slack_threads_deployment("thread-uncounted", false).await;
+    state.message_cache.set_serve(true);
+    let root = slack_fake::ts(60, 0);
+    fake.with(|state| {
+        slack_fake::add_reply_message(
+            state,
+            SLACK_CH,
+            &root,
+            slack_fake::system(&slack_fake::ts(90, 0), "channel_join"),
+        );
+    });
+    clock.advance(MINUTE);
+    ok(
+        &state,
+        &path(SLACK_CH, "/timeline?view=main&limit=50"),
+        WRITE_TOKEN,
+    )
+    .await;
+    settled(&state).await;
+    let thread = |reason: &str| {
+        path(
+            SLACK_CH,
+            &format!("/timeline?view=thread&thread_id={root}&limit=50{reason}"),
+        )
+    };
+    rate_limit(&fake, "conversations.replies");
+    clock.advance(MINUTE);
+    let body = ok(&state, &thread("&reason=poll"), WRITE_TOKEN).await;
+    assert!(
+        body["refresh_failed"]
+            .as_str()
+            .is_some_and(|why| why.contains("counts 3 replies")),
+        "the count was learned after the last listing: {body}"
+    );
+    fake.with(|state| {
+        state.rate_limit_many.clear();
+    });
+    clock.advance(MINUTE);
+    ok(&state, &thread(""), WRITE_TOKEN).await;
+    settled(&state).await;
+    rate_limit(&fake, "conversations.replies");
+    // Past what the serve rule trusts, so the answer is the cache's first, with its read behind.
+    clock.advance(30 * MINUTE);
+    // Another page size, so no read landed behind an earlier answer stands for this one.
+    let body = ok(
+        &state,
+        &path(
+            SLACK_CH,
+            &format!("/timeline?view=thread&thread_id={root}&limit=40&reason=poll"),
+        ),
+        WRITE_TOKEN,
+    )
+    .await;
+    let why = body["refresh_failed"]
+        .as_str()
+        .unwrap_or_else(|| panic!("an answer from the cache first: {body}"));
+    assert!(
+        !why.contains("counts"),
+        "a listing since proves it whole: {body}"
     );
 }

@@ -292,9 +292,11 @@ pub struct Unreconciled {
     /// From when, on the hub's clock ([`LiveHub::now_ms`]); `None` for from before anything this
     /// process read, which no live read that ended well has covered yet.
     pub since_ms: Option<i64>,
-    /// When the latest mark was made, on the hub's clock: only a live read begun at or after it
-    /// clears the channel.
+    /// When the latest mark was made, on the hub's clock: only a live read begun after it clears
+    /// the channel.
     pub noted_ms: i64,
+    /// Whether it also waits for a relist of the channel ([`LiveHub::note_relisted`]).
+    pub needs_relist: bool,
     /// Why, as a sentence for the reader.
     pub why: &'static str,
 }
@@ -452,6 +454,12 @@ pub struct LiveHub {
     /// Each channel's latest live read that ended well: when it began. What an unreconciled
     /// channel is complete as of.
     reconciled_ms: Mutex<BTreeMap<ChannelId, i64>>,
+    /// Whether the relist runs ([`crate::relist::relist_forever`]): then a mark the event stream
+    /// made waits for a relist of its channel too ([`LiveHub::note_relisted`]).
+    relist_running: std::sync::atomic::AtomicBool,
+    /// Each channel's replies a seed asked to be read again that the message cache already held:
+    /// read again, they are not news. `#708 vt-live-push`; see [`LiveHub::note_reread_held`].
+    reread_held: Mutex<BTreeMap<ChannelId, BTreeSet<MessageId>>>,
     /// The threads each channel's stream recently pushed a reply in, newest last, with when.
     /// `#452 slack-live-ingest`: what the relist reads besides each channel's newest page.
     active_threads: Mutex<BTreeMap<ChannelId, VecDeque<(String, i64)>>>,
@@ -539,6 +547,8 @@ impl LiveHub {
             last_stream_record_ms: Mutex::new(None),
             unreconciled: Mutex::new(BTreeMap::new()),
             reconciled_ms: Mutex::new(BTreeMap::new()),
+            relist_running: std::sync::atomic::AtomicBool::new(false),
+            reread_held: Mutex::new(BTreeMap::new()),
             active_threads: Mutex::new(BTreeMap::new()),
             all: Mutex::new(AllFeed {
                 sender: all_sender,
@@ -809,25 +819,32 @@ impl LiveHub {
         }
     }
 
-    /// Remember `messages`, which readers already have (the message cache holds them), as
-    /// created on `channel`, so a read that brings one of them again publishes it as known, or as
-    /// an update where its copy says more, never as a new arrival. `#708 vt-live-push`. A message
-    /// already remembered keeps the copy remembered for it.
-    pub fn note_created(&self, channel: &ChannelId, messages: Vec<Message>) {
-        let mut feeds = lock(&self.feeds);
-        let feed = feeds.entry(channel.clone()).or_insert_with(new_feed);
-        for message in messages {
-            if feed.created.contains_key(&message.id) {
-                continue;
+    /// The newest copy of message `id` of `channel` readers were given, when the hub still
+    /// remembers it: the copy it published or updated last, or the one the channel's held window
+    /// keeps. `#708 vt-live-push`.
+    #[must_use]
+    pub fn known_copy(&self, channel: &ChannelId, id: &MessageId) -> Option<Message> {
+        // The replay tail's copy first: it carries the version it went out as (`observed_ms`),
+        // which a caller weighs against the message cache's.
+        let published = lock(&self.feeds).get(channel).and_then(|feed| {
+            match feed.created.get(id) {
+                // Deleted since.
+                Some(None) => None,
+                held => feed
+                    .tail
+                    .iter()
+                    .rev()
+                    .find(|live| live.message.id == *id && live.kind != LiveKind::Delete)
+                    .map(|live| live.message.clone())
+                    .or_else(|| held.cloned().flatten()),
             }
-            feed.created_order.push_back(message.id.clone());
-            feed.created.insert(message.id.clone(), Some(message));
-            while feed.created_order.len() > CREATED_MEMORY {
-                if let Some(evicted) = feed.created_order.pop_front() {
-                    feed.created.remove(&evicted);
-                }
-            }
-        }
+        });
+        published.or_else(|| {
+            self.recent
+                .snapshot(channel)
+                .held
+                .and_then(|held| held.messages.into_iter().find(|message| message.id == *id))
+        })
     }
 
     /// Publish one already-known message whose reactions changed, as a live update carrying its
@@ -1167,6 +1184,9 @@ impl LiveHub {
     /// back.
     pub fn forget_seeded(&self, channel: &ChannelId) {
         lock(&self.seeded).remove(channel);
+        // `#708 vt-live-push`: no poller is left to clear them.
+        lock(&self.unreconciled).remove(channel);
+        lock(&self.reread_held).remove(channel);
     }
 
     /// Ask for `channel`'s next relist now rather than at its interval. `#452 slack-live-ingest`.
@@ -1227,11 +1247,32 @@ impl LiveHub {
     /// ([`LiveHub::note_reconciled`]). An earlier mark stands: the channel is complete only as of
     /// the earliest.
     pub fn note_unreconciled(&self, channel: &ChannelId, since_ms: Option<i64>, why: &'static str) {
+        self.mark(channel, since_ms, why, false);
+    }
+
+    /// [`LiveHub::note_unreconciled`] for what the provider's event stream lost or could not
+    /// apply: while the relist runs, cleared only once a relist of the channel begun after it has
+    /// read it too ([`LiveHub::note_relisted`]), since the poller's read reaches only the newest
+    /// page and the threads whose roots moved.
+    pub fn note_stream_unreconciled(
+        &self,
+        channel: &ChannelId,
+        since_ms: Option<i64>,
+        why: &'static str,
+    ) {
+        let relisted = self
+            .relist_running
+            .load(std::sync::atomic::Ordering::Relaxed);
+        self.mark(channel, since_ms, why, relisted);
+    }
+
+    fn mark(&self, channel: &ChannelId, since_ms: Option<i64>, why: &'static str, relist: bool) {
         let noted_ms = self.now_ms();
         let mut marks = lock(&self.unreconciled);
         match marks.get_mut(channel) {
             Some(held) => {
                 held.noted_ms = held.noted_ms.max(noted_ms);
+                held.needs_relist |= relist;
                 if since_ms < held.since_ms {
                     held.since_ms = since_ms;
                     held.why = why;
@@ -1244,10 +1285,53 @@ impl LiveHub {
                         since_ms,
                         noted_ms,
                         why,
+                        needs_relist: relist,
                     },
                 );
             }
         }
+    }
+
+    /// Note that the relist runs, so marks the event stream makes wait for it. Called once, by
+    /// [`crate::relist::relist_forever`].
+    pub fn note_relist_running(&self) {
+        self.relist_running
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Note that a relist of `channel` begun at `began_ms` (this hub's clock) read every scope it
+    /// meant to: a mark made before it began no longer waits for a relist. `#708 vt-live-push`.
+    pub fn note_relisted(&self, channel: &ChannelId, began_ms: i64) {
+        if let Some(held) = lock(&self.unreconciled).get_mut(channel) {
+            if held.noted_ms < began_ms {
+                held.needs_relist = false;
+            }
+        }
+    }
+
+    /// Remember `held`, replies of `channel` the message cache holds whose thread a seed asked to
+    /// be read again (`#708 vt-live-push`): the read brings them back, and they are not news. A
+    /// set with no bound, unlike the hub's memory of what it published, so a long thread cannot
+    /// push its own oldest replies out of it and have them announced again.
+    pub fn note_reread_held(&self, channel: &ChannelId, held: impl IntoIterator<Item = MessageId>) {
+        lock(&self.reread_held)
+            .entry(channel.clone())
+            .or_default()
+            .extend(held);
+    }
+
+    /// Whether `id` is one of `channel`'s replies a re-read brought back that the cache held,
+    /// forgetting it.
+    fn take_reread_held(&self, channel: &ChannelId, id: &MessageId) -> bool {
+        let mut held = lock(&self.reread_held);
+        let Some(ids) = held.get_mut(channel) else {
+            return false;
+        };
+        let found = ids.remove(id);
+        if ids.is_empty() {
+            held.remove(channel);
+        }
+        found
     }
 
     /// Note that a live read of `channel` that began at `began_ms` ended well, having read every
@@ -1261,7 +1345,7 @@ impl LiveHub {
         let mut marks = lock(&self.unreconciled);
         if marks
             .get(channel)
-            .is_some_and(|held| held.noted_ms <= began_ms)
+            .is_some_and(|held| held.noted_ms < began_ms && !held.needs_relist)
         {
             marks.remove(channel);
         }
@@ -2396,6 +2480,11 @@ pub async fn poll_once(
         }
         arrivals.sort_by_key(|(id, _, _)| *id);
         for (_, message, reply) in arrivals {
+            // `#708 vt-live-push`: a reply the cache held, back because its thread was read again
+            // from its root after a seed, is not news; the cache is offered it with the walk.
+            if reply && hub.take_reread_held(channel, &message.id) {
+                continue;
+            }
             published_ids.insert(message.id.clone());
             let outcome = if reply {
                 hub.publish_reply_read(channel, message, read_start.clone())
@@ -2529,8 +2618,8 @@ async fn reread_unheld_threads(
         }
         // From the root: the replies missing may lie between ones the cache holds. Those it
         // holds come back as known, never as news a second time.
-        hub.note_created(channel, held.replies);
         if chat.reread_thread(channel, &thread.id, None) {
+            hub.note_reread_held(channel, held.replies.into_iter().map(|reply| reply.id));
             asked += 1;
         }
     }
