@@ -5,13 +5,13 @@
 
 import assert from "node:assert/strict";
 
-import { CAPTURE_RESUME_MS, CHANNEL, CLEAR_ARMED_MS, DEFAULT_POST_PREFIX, HTML, HTML_CODE, MINTED,
-  OTHER_CHANNEL, PAGE_CODE, PAGE_ELEMENTS, RECORD_EPOCH, REDRAFT_WAIT_MS, REPLAY_PREAMBLE, SCRIPT,
-  SEAM_DETAIL_MAX_WORDS, SEAM_DETAIL_MIN_WORDS, SETTINGS, SHIPPED_SYSTEM_PROMPT, SPOKEN_SETTLE_MS,
-  TRANSCRIPT_PAGE_LIMIT, assistantSays, backFacts, boundaryLines, boundaryWords, brokenScript,
-  compose, cssBlock, cssBlockIn, deliver, fillTranscript, framesOfType, framesSent, helpEntry,
-  hosted, hostedAudio, hostedHears, hostedSays, initiationFrame, json, longMessage, message,
-  neutralReadBack, newPage, openReplyOn, optionalSourceConstant, promptsSent, proposal,
+import { CALL, CAPTURE_RESUME_MS, CHANNEL, CLEAR_ARMED_MS, DEFAULT_POST_PREFIX, HTML, HTML_CODE,
+  MINTED, OTHER_CHANNEL, PAGE_CODE, PAGE_ELEMENTS, RECORD_EPOCH, REDRAFT_WAIT_MS, REPLAY_PREAMBLE,
+  SCRIPT, SEAM_DETAIL_MAX_WORDS, SEAM_DETAIL_MIN_WORDS, SETTINGS, SHIPPED_SYSTEM_PROMPT,
+  SPOKEN_SETTLE_MS, TRANSCRIPT_PAGE_LIMIT, assistantSays, backFacts, boundaryLines, boundaryWords,
+  brokenScript, compose, cssBlock, cssBlockIn, deliver, fillTranscript, framesOfType, framesSent,
+  helpEntry, hosted, hostedAudio, hostedHears, hostedSays, initiationFrame, json, longMessage,
+  message, neutralReadBack, newPage, openReplyOn, optionalSourceConstant, promptsSent, proposal,
   proposedDuringACall, readBackDuringACall, recordingCall, relayed, reloadOf, resumeFrame,
   rowWithId, seamChip, seamDetail, seamLabel, seamRecapDetail, sentCards, session_lines, setReadNew,
   settingsGroup, settleRedraftWait, settleSpokenYes, showDiscord, signIn, sourceConstant,
@@ -1773,7 +1773,7 @@ test("`#270 voice-transcript-markers`: a replay that does not say how many words
 });
 
 test("`#270 voice-transcript-markers`: the recap chip is at most three words and 24 characters, and every recap sentence is inside the seam band", async () => {
-  const chip = newPage().pure("recapChip");
+  const chip = CALL.recapChip;
   for (const recap of [
     { state: "sent", words: 99999, lines: 1, dropped: 0, transport: "contextual_update" },
     { state: "none", why: "unsupported", dropped: 0 },

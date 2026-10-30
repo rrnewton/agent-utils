@@ -8,23 +8,23 @@ import assert from "node:assert/strict";
 import { ACKNOWLEDGED, BASE_CSS, CHANNEL, CODER, COLLAPSE_OVER_CHARS, CSS, CSS_CODE,
   CSS_UNCONDITIONAL, DISCORD_POLL_MS, FIXTURE_TREE, FakeElement, GATHERED, GLYPHS, HOVER_QUERY,
   HTML, INBOX, LINK_ATTRS, OWNERS_MESSAGE, PAGE_CODE, PAGE_ELEMENTS, PULL_ARM_PX, SANITIZED_TAGS,
-  SCRIPT, SCRIPT_CODE, SCROLLERS, SHORT_MESSAGE, TIMELINE_RECONCILE_MS, TWO_COLUMN_QUERY, asksFor,
-  assertMarkupContains, assistantSays, atBottomOf, bodyOf, bookmarkAt, bookmarkRow, boxesOf,
-  brokenModule, brokenScript, builtSince, cardPart, cardRow, channelSummaryText, chipsOf,
-  chooseReadMode, cssBlock, cssBlockIn, cssBlockOutside, cssRules, deliver, doneButton, elidedOf,
-  errorResponse, excerptOf, focused, foldButton, forwardPage, forwardReadKinds, forwardTimeline,
-  freshness, gate, gatherChip, headOf, headerCard, hitsIn, hold, holdCountsRead, inReadingMode,
-  inboxChannel, inboxId, inboxOnMain, inlineAnchors, joined, json, keyboardPage, lineText,
-  linkPairs, longMessage, marksPending, mdBoxes, mediaBody, message, metaOf, newPage,
-  nodeWithinFixture, openerOf, parseSanitizedHtml, passing, pcm, pickThread, pinnedIds, pollOnce,
-  press, pullDown, reReadChannel, reactionStripOf, readButton, readRunLineOf, refreshDiscord,
-  reloadPage, reloadWith, reopenedChannel, replyButton, replyInStream, row, rowMoreButton, rowOf,
-  rowState, rowWithId, savedScopes, scaleOf, scatteredThread, scopeKey, seamDetail, seamLabel,
-  search, selectedId, settingsGroup, showDiscord, showLinks, showPinned, shownIds, signIn,
-  sourceConstant, splitPost, sseMessage, startTalking, statusText, storedPin, summaryText, tagged,
-  tallChannel, tapArrow, tapKind, test, textOfRow, threadBadge, threadData, tokenValues,
-  turnSummariesOn, twoColumnServer, twoColumns, typeAndPause, typingPaused, unreadSaid, wavHeader,
-  withLiveChannel } from "./fixture.mjs";
+  SCRIPT, SCRIPT_CODE, SCROLLERS, SHORT_MESSAGE, SPEECH_PIECES, TIMELINE_RECONCILE_MS,
+  TWO_COLUMN_QUERY, asksFor, assertMarkupContains, assistantSays, atBottomOf, bodyOf, bookmarkAt,
+  bookmarkRow, boxesOf, brokenModule, brokenScript, builtSince, cardPart, cardRow,
+  channelSummaryText, chipsOf, chooseReadMode, cssBlock, cssBlockIn, cssBlockOutside, cssRules,
+  deliver, doneButton, elidedOf, errorResponse, excerptOf, focused, foldButton, forwardPage,
+  forwardReadKinds, forwardTimeline, freshness, gate, gatherChip, headOf, headerCard, hitsIn, hold,
+  holdCountsRead, inReadingMode, inboxChannel, inboxId, inboxOnMain, inlineAnchors, joined, json,
+  keyboardPage, lineText, linkPairs, longMessage, marksPending, mdBoxes, mediaBody, message, metaOf,
+  newPage, nodeWithinFixture, openerOf, parseSanitizedHtml, passing, pcm, pickThread, pinnedIds,
+  pollOnce, press, pullDown, reReadChannel, reactionStripOf, readButton, readRunLineOf,
+  refreshDiscord, reloadPage, reloadWith, reopenedChannel, replyButton, replyInStream, row,
+  rowMoreButton, rowOf, rowState, rowWithId, savedScopes, scaleOf, scatteredThread, scopeKey,
+  seamDetail, seamLabel, search, selectedId, settingsGroup, showDiscord, showLinks, showPinned,
+  shownIds, signIn, sourceConstant, splitPost, sseMessage, startTalking, statusText, storedPin,
+  summaryText, tagged, tallChannel, tapArrow, tapKind, test, textOfRow, threadBadge, threadData,
+  tokenValues, turnSummariesOn, twoColumnServer, twoColumns, typeAndPause, typingPaused, unreadSaid,
+  wavHeader, withLiveChannel } from "./fixture.mjs";
 
 // --- clearing the view ----------------------------------------------------------------------------
 
@@ -211,8 +211,8 @@ const DESK_CLASS = FOLD_WIDTHS_EM.indexOf(45);
 const wordsOfLength = (count, letters) => Array(count).fill("n".repeat(letters)).join(" ");
 /** How many such words a line of `widthEm` holds, by the model's own glyph widths. */
 const wordsPerLine = (page, letters, widthEm) => {
-  const letter = page.pure('glyphEm("n")');
-  const space = page.pure("SPACE_EM");
+  const letter = GLYPHS.glyphEm("n");
+  const space = GLYPHS.SPACE_EM;
   return Math.floor((widthEm + space) / (letters * letter + space) + 1e-9);
 };
 /** What a floor of `count` hidden words or characters says, rounded down as the page rounds it. */
@@ -353,8 +353,8 @@ test("TEXT POOR IN SPACES IS COUNTED IN CHARACTERS: Chinese, a long bare address
   const page = newPage();
   await signIn(page);
   const ideograph = "漢";
-  const wide = page.pure(`glyphEm("${ideograph}")`);
-  const letter = page.pure('glyphEm("x")');
+  const wide = GLYPHS.glyphEm(ideograph);
+  const letter = GLYPHS.glyphEm("x");
   const chinese = ideograph.repeat(300);
   const address = `x${"x".repeat(419)}`;
   const rows = await showDiscord(page, [
@@ -484,7 +484,7 @@ test("A CODE BLOCK is counted in lines of its own, in code's face, and the line 
   // Ten lines of fifty m's and a number. In code's face a line is 50 × MONO_EM, well inside a phone's
   // line; at the proportional font's 0.72em an "m", each would be counted as wrapping onto two.
   const mono = GLYPHS.MONO_EM;
-  assert.ok(50 * mono < 28.5 && 50 * page.pure('glyphEm("m")') > 28.5, "the fixture no longer tells the two faces apart");
+  assert.ok(50 * mono < 28.5 && 50 * GLYPHS.glyphEm("m") > 28.5, "the fixture no longer tells the two faces apart");
   const wide = Array.from({ length: 10 }, (_unused, i) => `${"m".repeat(50)} ${i}\n`).join("");
   const rows = await showDiscord(page, [
     message({ id: "7440000000000000801", content: "code",
@@ -3601,7 +3601,7 @@ test("a streamed read CUT OFF part-way, or refused, says so and archives nothing
   page.audioStreams[0].controller.fail();
   await page.settle();
   assert.equal(page.audio.sources[0].halted, true);
-  for (const wait of page.pure("READ_RECOVERY_WAITS_MS")) {
+  for (const wait of SPEECH_PIECES.READ_RECOVERY_WAITS_MS) {
     assert.match(page.el("status").textContent, /cut off; trying again/);
     assert.equal(page.expireTimers(wait), 1, `nothing waited ${wait} ms to try again`);
     await page.settle();

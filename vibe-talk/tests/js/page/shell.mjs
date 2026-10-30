@@ -1898,10 +1898,10 @@ test("`#521 server-side-search`: the page's search language folds, parses, match
   // its legacy script has always called them by.
   const page = newPage();
   for (const name of ["searchQueryParse", "searchQueryTree", "searchQueryMatches", "searchSubject", "searchPositiveTerms"]) {
-    assert.equal(page.pure(`typeof ${name}`), "function", name);
+    assert.equal(typeof page.preludeBinding(name), "function", name);
   }
-  const node = page.pure("searchQueryParse")("from:Ada (a OR b) -c");
-  assert.deepEqual(JSON.parse(JSON.stringify(page.pure("searchQueryTree")(node))),
+  const node = page.preludeBinding("searchQueryParse")("from:Ada (a OR b) -c");
+  assert.deepEqual(JSON.parse(JSON.stringify(page.preludeBinding("searchQueryTree")(node))),
     JSON.parse(JSON.stringify(SEARCH_LANGUAGE.searchQueryTree(SEARCH_LANGUAGE.searchQueryParse("from:Ada (a OR b) -c")))));
 });
 

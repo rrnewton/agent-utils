@@ -11,17 +11,18 @@ import { WEB } from "../../../web/page_sources.mjs";
 
 import { BASE_CSS, BOTTOM_SLACK_PX, CHANNEL, CODER, COLLAPSE_OVER_CHARS, CSS_CODE, DESKTOP_QUERY,
   DISCORD_POLL_MS, HTML_CODE, MODULE_CODE, NOISE_MATCHING, OWN, PAGE_ELEMENTS, PULL_ARM_PX,
-  RUN_THREAD, SCRIPT, SCRIPT_CODE, assertMarkupContains, atBottomOf, bookmarkAt, brokenModule,
-  brokenScript, channelRow, cssBlock, cssBlockIn, cssBlockOutside, cssRules, delayedReply, deliver,
-  doneButton, errorResponse, focusOn, foldButton, helpEntry, hold, inReadingMode, joined, json,
-  keyboardPageAtTop, longMessage, mainOnlyThreadPage, markupPlace, message, newPage, openReplyOn,
-  optionText, outgoingRetry, outgoingRows, outgoingSpinner, parkMidway, pcm, pickThread, press,
-  pressHere, pullDown, reReadChannel, readAloudMessages, readButton, relayed, reloadWith,
-  reopenedChannel, replyArrowOf, replyButton, replyInStream, row, rowState, rowWithId, runId,
-  runThread, savedOutgoing, selectedId, sentWithoutKey, setReadNew, settingsGroup, showDiscord,
-  shownIds, signIn, sourceConstant, speakRelay, splitPost, sseMessage, startTalking, takesASide,
-  tallChannel, test, threadBadge, threadButton, threadData, threadOptions, threadPage,
-  timelineAnswer, turnSummariesOn, turnTodoOn, unreadChip, viewOf, wavHeader, whoOf, withLiveChannel } from "./fixture.mjs";
+  RUN_THREAD, SCRIPT, SCRIPT_CODE, SPEECH_PIECES, assertMarkupContains, atBottomOf, bookmarkAt,
+  brokenModule, brokenScript, channelRow, cssBlock, cssBlockIn, cssBlockOutside, cssRules,
+  delayedReply, deliver, doneButton, errorResponse, focusOn, foldButton, helpEntry, hold,
+  inReadingMode, joined, json, keyboardPageAtTop, longMessage, mainOnlyThreadPage, markupPlace,
+  message, newPage, openReplyOn, optionText, outgoingRetry, outgoingRows, outgoingSpinner,
+  parkMidway, pcm, pickThread, press, pressHere, pullDown, reReadChannel, readAloudMessages,
+  readButton, relayed, reloadWith, reopenedChannel, replyArrowOf, replyButton, replyInStream, row,
+  rowState, rowWithId, runId, runThread, savedOutgoing, selectedId, sentWithoutKey, setReadNew,
+  settingsGroup, showDiscord, shownIds, signIn, sourceConstant, speakRelay, splitPost, sseMessage,
+  startTalking, takesASide, tallChannel, test, threadBadge, threadButton, threadData, threadOptions,
+  threadPage, timelineAnswer, turnSummariesOn, turnTodoOn, unreadChip, viewOf, wavHeader, whoOf,
+  withLiveChannel } from "./fixture.mjs";
 
 // Device speech is selected by the backend; cloud audio remains covered by the existing tests.
 const DEVICE_SPEECH = { backend: "browser", label: "Device voice", playback: "browser", local_only: true };
@@ -2077,11 +2078,9 @@ test("a stall in the middle of a block holds the sentence light through the sile
 const PIECES_FIXTURE = JSON.parse(readFileSync(join(WEB, "..", "tests", "fixtures", "read_aloud_pieces.json"), "utf8"));
 
 test("THE PAGE CUTS A BLOCK INTO THE PIECES THE SERVER READS IT IN, case by case", () => {
-  const page = newPage();
-  const readPieces = page.pure("readPieces");
+  const { readPieces } = SPEECH_PIECES;
   for (const { name, text, pieces, alone } of PIECES_FIXTURE.cases) {
-    // Through JSON: the page's arrays are of its own realm.
-    assert.deepEqual(JSON.parse(JSON.stringify(readPieces(text, alone === true).map(({ start, end }) => text.slice(start, end)))), pieces, name);
+    assert.deepEqual(readPieces(text, alone === true).map(({ start, end }) => text.slice(start, end)), pieces, name);
   }
   // The control: a bullet typed as a dash is a sentence, not a piece, and a short block is whole.
   assert.equal(readPieces("Intro.\n- a\n- b").length, 1);
@@ -3446,7 +3445,7 @@ test("A READ CUT OFF BY A RESTART prepares again and carries on from the block i
   assert.equal(page.el("read-steer").hidden, false, "the strip went for the wait to try again");
   assert.equal(page.el("read-steer-count").text(), "2 of 3");
   assert.equal(readStrip(page), "playing", "the playback layout dropped for the wait to try again");
-  assert.equal(page.expireTimers(page.pure("READ_RECOVERY_WAITS_MS")[0]), 1, "nothing waited to try again");
+  assert.equal(page.expireTimers(SPEECH_PIECES.READ_RECOVERY_WAITS_MS[0]), 1, "nothing waited to try again");
   await page.settle();
   assert.ok(page.prepareCalls.slice(before).some((call) => (call.ids || []).includes(BLOCKED_ID)),
     "the read went on without preparing again");
@@ -3468,7 +3467,7 @@ test("a tap after a read that could not be played prepares again, rather than pl
   page.ticketStatus = 404;
   await rows[0].dispatch("click", {});
   await page.settle();
-  for (const wait of page.pure("READ_RECOVERY_WAITS_MS")) {
+  for (const wait of SPEECH_PIECES.READ_RECOVERY_WAITS_MS) {
     assert.equal(page.expireTimers(wait), 1);
     await page.settle();
   }

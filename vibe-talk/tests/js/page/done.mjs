@@ -6,7 +6,7 @@
 import assert from "node:assert/strict";
 
 import { CHANNEL, CLEAR_ARMED_MS, CSS, CSS_CODE, DISCORD_POLL_MS, DONE_FLASH_FADE_MS,
-  DONE_FLASH_HOLD_MS, HOLD_MS, INBOX_NOTICE, OTHER_CHANNEL, SCRIPT, SCRIPT_CODE, backlog,
+  DONE_FLASH_HOLD_MS, GLYPHS, HOLD_MS, INBOX_NOTICE, OTHER_CHANNEL, SCRIPT, SCRIPT_CODE, backlog,
   brokenScript, brokenScriptEach, channelRow, chooseReadMode, conversation, cssBlock, cssRules,
   delayedReply, deliver, doneButton, elidedOf, errorResponse, focusName, focused, inboxChannel,
   inboxId, json, jumpSaysArrived, keyboardPageAtTop, listCardSays, longMessage, message, newPage,
@@ -683,11 +683,11 @@ test("`#462 webapp-deep-links`: Copy vibe-talk link copies durable upstream iden
   assert.equal(page.el("status").textContent, "Copied the vibe-talk link.");
 
   // The pure round-trip: a ref out and back is itself, separators inside ids included.
-  const pure = page.pure(`JSON.stringify(deepLinkRefFrom(deepLinkRefText(
-    {provider: "google chat", channel: "spaces/A", message: "spaces/A/messages/x.y", thread: "spaces/A/threads/one & two"})))`);
-  assert.deepStrictEqual(JSON.parse(pure),
+  const pure = GLYPHS.deepLinkRefFrom(GLYPHS.deepLinkRefText(
+    { provider: "google chat", channel: "spaces/A", message: "spaces/A/messages/x.y", thread: "spaces/A/threads/one & two" }));
+  assert.deepStrictEqual(pure,
     { provider: "google chat", channel: "spaces/A", message: "spaces/A/messages/x.y", thread: "spaces/A/threads/one & two" });
-  assert.equal(page.pure(`deepLinkRefFrom("garbage")`), null, "a malformed ref was taken for one");
+  assert.equal(GLYPHS.deepLinkRefFrom("garbage"), null, "a malformed ref was taken for one");
 
   // And the address follows the reader: opening that thread writes its place, state untouched.
   await pickThread(page, "thread:spaces/A/threads/one & two");

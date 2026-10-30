@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 
 import { moduleForTests } from "../../../web/build.mjs";
 
-import { CHANNEL, CSS, HOLD_MS, HTML_CODE, REPO, SCRIPT, SCRIPT_CODE, SETTINGS,
+import { CHANNEL, CSS, GLYPHS, HOLD_MS, HTML_CODE, REPO, SCRIPT, SCRIPT_CODE, SETTINGS,
   assertMarkupContains, assistantSays, atBottomOf, backFacts, backlog, brokenModule, brokenScript,
   cssBlock, cssRules, doneButton, inReadingMode, linkPairs, linksOf, longMessage, message, newPage,
   pagedTimeline, passTime, reReadChannel, readAloudMessages, reloadWith, reopenedChannel, rowMore,
@@ -122,10 +122,10 @@ test("`#543 in-app-message-links`: a marked link to a channel this app reads is 
   assert.equal((await tapLink(page, off)).prevented, false, "with the switch off a tap was still kept in the app");
   assert.ok(SETTINGS.SYNCED_SETTING_KEYS.includes(page.pure("IN_APP_LINKS_KEY")), "the switch is not one of the synced settings");
   // The pure reading of a mark: four escaped parts, an absent one empty; nothing else is one.
-  assert.deepStrictEqual(JSON.parse(page.pure(`JSON.stringify(messageLinkRef("gchat:spaces%2FA:spaces%2FA%2Fmessages%2FT.M:"))`)),
+  assert.deepStrictEqual(GLYPHS.messageLinkRef("gchat:spaces%2FA:spaces%2FA%2Fmessages%2FT.M:"),
     { service: "gchat", channel: "spaces/A", message: "spaces/A/messages/T.M", thread: null });
-  assert.equal(page.pure(`messageLinkRef("slack:C1:2")`), null);
-  assert.equal(page.pure(`messageLinkRef(":C1::")`), null);
+  assert.equal(GLYPHS.messageLinkRef("slack:C1:2"), null);
+  assert.equal(GLYPHS.messageLinkRef(":C1::"), null);
 });
 
 test("`#543 in-app-message-links`: a tap jumps to a reply — its thread opens over All and the message is landed — as ONE history entry, and Back puts the reader back in All on the message their eye was on, at the same height", async () => {
@@ -755,7 +755,7 @@ const shownHrefs = (page, id = "discord-log") => Object.fromEntries(
   unfiltered(page, id).map((li) => [li.getAttribute("data-id"), linkPairs(li).map(([, href]) => href)]));
 
 test("a link's kind is read from its address alone, and every address is of exactly one of the six", async () => {
-  const kindOf = newPage().pure("linkKind");
+  const kindOf = GLYPHS.linkKind;
   const cases = {
     pr: [
       `${REPO}/pull/41`, `${REPO}/pull/41/`, `${REPO}/pull/41/files`, `${REPO}/pull/41/checks`,

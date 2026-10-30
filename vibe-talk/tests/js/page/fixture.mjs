@@ -1844,8 +1844,18 @@ const PRELUDE_COMPILED = PRELUDE && new vm.Script(PRELUDE.code, { filename: "pre
 /** The search language module, with `overlays` patched into its sources. */
 const searchLanguage = (overlays = []) => moduleForTests("src/core/search/index.ts", { overlays });
 const SEARCH_LANGUAGE = await searchLanguage();
-/** The glyph widths the fold model counts lines by (web/src/foundation/). */
+/** The glyph widths the fold model counts lines by, links and refs (web/src/foundation/). */
 const GLYPHS = await moduleForTests("src/foundation/index.ts");
+/** The speech module: what a read plays, how a block is cut, and when a cut-off read goes again. */
+const SPEECH_PIECES = await moduleForTests("src/core/speech/index.ts");
+/** A call's reconnects and the words its seams and recap say (web/src/core/call). */
+const CALL = await moduleForTests("src/core/call/index.ts");
+/**
+ * The names the page takes from its modules: what the prelude declares for the legacy script
+ * (web/src/legacy/imports.ts). `page.pure` refuses them: what moved into a module is tested through
+ * that module, which the page runs as it is (`#624 voice-page-modularity`).
+ */
+const PRELUDE_NAMES = new Set(PRELUDE ? PRELUDE.names : []);
 /** The device's settings and, on its own handle, its token (web/src/core/settings). */
 const SETTINGS = await moduleForTests("src/core/settings/index.ts");
 /** The page's requests to its server, on ports a test supplies (web/src/core/api). */
@@ -4743,7 +4753,22 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
   // `#212 link-filter`. One of the page's own functions, by name, for the few that are PURE — an
   // address in, a kind out — and so are pinned down as values, a table of them at a time. Only for
   // those: everything the reader sees is asserted through the page as it draws it.
-  page.pure = (name) => vm.runInContext(name, context);
+  //
+  // Never a name the page takes from its modules (`PRELUDE_NAMES`): that is the module's to answer,
+  // through the module, so this accessor shrinks as the legacy script does.
+  page.pure = (expression) => {
+    const owned = [...new Set(expression.match(/[A-Za-z_$][\w$]*/g) || [])].filter((name) => PRELUDE_NAMES.has(name));
+    if (owned.length > 0) {
+      throw new Error(`page.pure(${JSON.stringify(expression)}) reaches ${owned.join(", ")}, which the page takes from web/src: test it through its module`);
+    }
+    return vm.runInContext(expression, context);
+  };
+  // The binding the prelude gave the legacy script for one of `PRELUDE_NAMES`, and only those: for
+  // the tests that the page runs a module's own functions under the names its script calls.
+  page.preludeBinding = (name) => {
+    if (!PRELUDE_NAMES.has(name)) throw new Error(`${name} is not a name the page takes from its modules`);
+    return vm.runInContext(name, context);
+  };
   // A binary socket frame from the page's own realm, where `instanceof ArrayBuffer` is asked.
   page.binaryFrame = (bytes) => vm.runInContext(`new ArrayBuffer(${bytes})`, context);
   // The same, with every sample at `amplitude`: 0 is digital silence, thousands is speech.
@@ -9917,39 +9942,39 @@ const heldRow = (page) => {
 };
 
 export { ACKNOWLEDGED, ALIAS_NOTICE, ALICE, BASE_CSS, BIG, BIG_ROOT, BOTTOM_SLACK_PX, BOUND_NOTICE,
-  CANNED, CAPTURE_RESUME_MS, CHANNEL, CHARS_PER_LINE, CLEAR_ARMED_MS, CODER, COLLAPSE_OVER_CHARS,
-  CONVAI_WRITE, COUNTS_ALL_READ_MS, CSS, CSS_CODE, CSS_UNCONDITIONAL, DEFAULT_POST_PREFIX,
-  DESKTOP_QUERY, DISCORD_POLL_MS, DONE_FLASH_FADE_MS, DONE_FLASH_HOLD_MS, FIXTURE_TREE, FakeElement,
-  GATHERED, GLYPHS, HELP_SLUGS, HOLD_MS, HOVER_QUERY, HTML, HTML_CODE, INBOX, INBOX_NOTICE, LINE_PX,
-  LINK_ATTRS, MESSAGE_CACHE_KEY, MESSAGE_DAY, MESSAGE_SPACING_MS, MIC_TOGGLE_IDS, MINTED,
-  MODULE_CODE, NOISE_MATCHING, OTHER_CHANNEL, OWN, OWNER, OWNERS_MESSAGE, PAGE_CODE, PAGE_ELEMENTS,
-  PAGE_IDS, PAGE_READ_REASONS, PAGE_SCRIPTS, PRELUDE, PULL_ARM_PX, PULL_WAIT_MS, RECORD_EPOCH,
-  REDRAFT_WAIT_MS, RELAY_COALESCE_MS, RELAY_FENCE_OPEN, REPLAY_PREAMBLE, REPLY_DOUBLE_TAP_MS,
-  REPLY_JUMP_PAGES, REPO, RETRY_FIRST_MS, RUN_TAIL, RUN_THREAD, SANITIZED_TAGS, SCATTERED, SCRIPT,
-  SCRIPT_CODE, SCRIPT_FILE, SCROLLBACK_PX, SCROLLERS, SCROLL_VIEWPORT_PX, SEAM_DETAIL_MAX_WORDS,
-  SEAM_DETAIL_MIN_WORDS, SEARCH_LANGUAGE, SEND_UNDO_MS, SERVER_API, SETTINGS, SHIPPED_SYSTEM_PROMPT,
-  SHORT_MESSAGE, SLOW_SEND, SMALL, SPACE_A, SPACE_B, SPEECH, SPOKEN_SETTLE_MS, TEAM_A, TEAM_B,
-  THREADS_MAIN_STORAGE, TIMELINE_RECONCILE_MS, TOKEN_STORAGE_KEY, TRANSCRIPT_PAGE_LIMIT,
-  TUNING_BANDS, TWO_COLUMN_QUERY, UI_STATE_KEY, UNPACK_STORAGE, allLeavingOut, arrowStyle, asksFor,
-  assertCurrent, assertMarkupContains, assistantSays, atBottomOf, atTheHead, authorChannel,
-  authorState, backFacts, backlog, barSlice, beforeOf, bid, bigCardData, bodyOf, bookmarkAt,
-  bookmarkClearOf, bookmarkRow, boundaryLines, boundaryWords, boxesOf, bridgeReply, brokenModule,
-  brokenScript, brokenScriptEach, browsingPage, builtSince, cardIds, cardOf, cardPart, cardRow,
-  cardsListed, cardsUp, changeChannelTo, channelBoxCode, channelReads, channelRow,
-  channelSummaryText, chipsOf, chooseAuthor, chooseReadMode, chooseService,
-  clampedAsShownLikeChromium, clearingPage, clickRow, collapsedRows, compose, conversation,
-  countingChannel, cssBlock, cssBlockIn, cssBlockOutside, cssRules, cssRulesElsewhere, cssWithout,
-  cssWithoutIn, delayedReply, deliver, dismissedItems, dismissedOpenerOf, distinctReplies,
-  doneButton, draftMarkerOf, drawnLines, drawnLinks, elidedOf, enterKey, enterRunThread,
-  errorResponse, excerptOf, failedSend, fillTranscript, firstCardInView, floatingLine, focusName,
-  focusOn, focused, foldButton, forwardPage, forwardReadKinds, forwardTimeline, framesOfType,
-  framesSent, freshMessageData, freshMessagePage, freshness, gate, gatherChip, groupsIn,
-  gutterChild, headOf, headerCard, heldRow, helpEntry, hitsIn, hold, holdChannelReads,
-  holdCountsRead, hosted, hostedAudio, hostedHears, hostedSays, inPlaceRows, inReadingMode,
-  inTwoColumns, inboxChannel, inboxId, inboxOnMain, initiationFrame, inlineAnchors, joined,
-  joiningChannel, json, jumpSaysArrived, jumpShown, keptAt, keyOn, keyboardMedia, keyboardPage,
-  keyboardPageAtTop, keyboardSaid, keyedChannel, keyless, layColumnsOut, lineText, linkPairs,
-  linksOf, listCardSays, litCards, litIds, litRows, literal, liveReply, longMessage,
+  CALL, CANNED, CAPTURE_RESUME_MS, CHANNEL, CHARS_PER_LINE, CLEAR_ARMED_MS, CODER,
+  COLLAPSE_OVER_CHARS, CONVAI_WRITE, COUNTS_ALL_READ_MS, CSS, CSS_CODE, CSS_UNCONDITIONAL,
+  DEFAULT_POST_PREFIX, DESKTOP_QUERY, DISCORD_POLL_MS, DONE_FLASH_FADE_MS, DONE_FLASH_HOLD_MS,
+  FIXTURE_TREE, FakeElement, GATHERED, GLYPHS, HELP_SLUGS, HOLD_MS, HOVER_QUERY, HTML, HTML_CODE,
+  INBOX, INBOX_NOTICE, LINE_PX, LINK_ATTRS, MESSAGE_CACHE_KEY, MESSAGE_DAY, MESSAGE_SPACING_MS,
+  MIC_TOGGLE_IDS, MINTED, MODULE_CODE, NOISE_MATCHING, OTHER_CHANNEL, OWN, OWNER, OWNERS_MESSAGE,
+  PAGE_CODE, PAGE_ELEMENTS, PAGE_IDS, PAGE_READ_REASONS, PAGE_SCRIPTS, PRELUDE, PULL_ARM_PX,
+  PULL_WAIT_MS, RECORD_EPOCH, REDRAFT_WAIT_MS, RELAY_COALESCE_MS, RELAY_FENCE_OPEN, REPLAY_PREAMBLE,
+  REPLY_DOUBLE_TAP_MS, REPLY_JUMP_PAGES, REPO, RETRY_FIRST_MS, RUN_TAIL, RUN_THREAD, SANITIZED_TAGS,
+  SCATTERED, SCRIPT, SCRIPT_CODE, SCRIPT_FILE, SCROLLBACK_PX, SCROLLERS, SCROLL_VIEWPORT_PX,
+  SEAM_DETAIL_MAX_WORDS, SEAM_DETAIL_MIN_WORDS, SEARCH_LANGUAGE, SEND_UNDO_MS, SERVER_API, SETTINGS,
+  SHIPPED_SYSTEM_PROMPT, SHORT_MESSAGE, SLOW_SEND, SMALL, SPACE_A, SPACE_B, SPEECH, SPEECH_PIECES,
+  SPOKEN_SETTLE_MS, TEAM_A, TEAM_B, THREADS_MAIN_STORAGE, TIMELINE_RECONCILE_MS, TOKEN_STORAGE_KEY,
+  TRANSCRIPT_PAGE_LIMIT, TUNING_BANDS, TWO_COLUMN_QUERY, UI_STATE_KEY, UNPACK_STORAGE,
+  allLeavingOut, arrowStyle, asksFor, assertCurrent, assertMarkupContains, assistantSays,
+  atBottomOf, atTheHead, authorChannel, authorState, backFacts, backlog, barSlice, beforeOf, bid,
+  bigCardData, bodyOf, bookmarkAt, bookmarkClearOf, bookmarkRow, boundaryLines, boundaryWords,
+  boxesOf, bridgeReply, brokenModule, brokenScript, brokenScriptEach, browsingPage, builtSince,
+  cardIds, cardOf, cardPart, cardRow, cardsListed, cardsUp, changeChannelTo, channelBoxCode,
+  channelReads, channelRow, channelSummaryText, chipsOf, chooseAuthor, chooseReadMode,
+  chooseService, clampedAsShownLikeChromium, clearingPage, clickRow, collapsedRows, compose,
+  conversation, countingChannel, cssBlock, cssBlockIn, cssBlockOutside, cssRules, cssRulesElsewhere,
+  cssWithout, cssWithoutIn, delayedReply, deliver, dismissedItems, dismissedOpenerOf,
+  distinctReplies, doneButton, draftMarkerOf, drawnLines, drawnLinks, elidedOf, enterKey,
+  enterRunThread, errorResponse, excerptOf, failedSend, fillTranscript, firstCardInView,
+  floatingLine, focusName, focusOn, focused, foldButton, forwardPage, forwardReadKinds,
+  forwardTimeline, framesOfType, framesSent, freshMessageData, freshMessagePage, freshness, gate,
+  gatherChip, groupsIn, gutterChild, headOf, headerCard, heldRow, helpEntry, hitsIn, hold,
+  holdChannelReads, holdCountsRead, hosted, hostedAudio, hostedHears, hostedSays, inPlaceRows,
+  inReadingMode, inTwoColumns, inboxChannel, inboxId, inboxOnMain, initiationFrame, inlineAnchors,
+  joined, joiningChannel, json, jumpSaysArrived, jumpShown, keptAt, keyOn, keyboardMedia,
+  keyboardPage, keyboardPageAtTop, keyboardSaid, keyedChannel, keyless, layColumnsOut, lineText,
+  linkPairs, linksOf, listCardSays, litCards, litIds, litRows, literal, liveReply, longMessage,
   mainMessagesPage, mainOnlyThreadPage, manyThreadColumns, manyThreads, marksPending, markupHolds,
   markupPlace, mdBoxes, mediaBody, mediaBodyOf, message, messageCacheStatus, messageRows, metaOf,
   mouseOnto, mouseTo, neutralReadBack, newPage, nodeIn, nodeWithinFixture, offline, olderReads,

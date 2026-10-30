@@ -135,6 +135,15 @@ test("`#624 voice-page-modularity`: the bar's picker shows the selection, and a 
   assert.deepStrictEqual([page.pure("selectedChannelId()"), page.el("discord-channel").value], ["", ""]);
 });
 
+test("`#624 voice-page-modularity`: page.pure reaches only what is still the legacy script's own, and the prelude's names only as its bindings", () => {
+  const page = newPage();
+  assert.equal(page.pure("selectedChannelId()"), "", "a binding of the legacy script's own was refused");
+  assert.throws(() => page.pure("readPieces"), /reaches readPieces, which the page takes from web\/src/);
+  assert.throws(() => page.pure('JSON.stringify(messageLinkRef("slack:C1:2"))'), /reaches messageLinkRef/);
+  assert.equal(typeof page.preludeBinding("readPieces"), "function");
+  assert.throws(() => page.preludeBinding("selectedChannelId"), /not a name the page takes from its modules/);
+});
+
 test("`#624 voice-page-modularity`: each column keeps its own records of its older pages, reply arrows, reads, entries, pins, scroll tools, filters, lists, rows, selection, boxes, Done marks, scroll places and gatherings, reached through the column worked on", () => {
   const page = newPage();
   const same = (expression) => page.pure(expression);
