@@ -490,9 +490,10 @@ class CoordinatorTranscript:
 
 
 def closing_identifiers(rendered: str) -> list[str]:
-    """The IDs of the closing markers in ``rendered``, first appearance first."""
+    """The IDs of the closing markers alone on their lines in ``rendered``, first appearance first."""
     found: list[str] = []
-    for match in re.finditer(r"</CHAT_REPLY_([A-Za-z0-9_-]+)>", rendered):
-        if match.group(1) not in found:
+    for line in rendered.splitlines():
+        match = re.fullmatch(r"\s*(?:[⏺●•◆]\s*)?</CHAT_REPLY_([A-Za-z0-9_-]+)>\s*", line)
+        if match is not None and match.group(1) not in found:
             found.append(match.group(1))
     return found

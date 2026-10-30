@@ -5454,6 +5454,9 @@ pub struct BridgeState {
     typed_retirements: Arc<std::sync::Mutex<VecDeque<(String, u64)>>>,
     // The coordinator's transcript, read for the clean text of its replies; also process-local.
     transcript_replies: Option<Arc<std::sync::Mutex<Box<dyn TranscriptReplies>>>>,
+    // Digests of the request keys and texts of transcript blocks a capture already settled,
+    // stored or found already held, so later captures do not weigh them again.
+    transcript_settled: Arc<std::sync::Mutex<BTreeSet<[u8; 32]>>>,
     #[cfg(test)]
     admission_fault_after: Arc<std::sync::Mutex<Option<usize>>>,
     #[cfg(test)]
@@ -5588,6 +5591,7 @@ impl BridgeState {
             receipt_when_started: false,
             typed_retirements: Arc::default(),
             transcript_replies: None,
+            transcript_settled: Arc::default(),
             #[cfg(test)]
             admission_fault_after: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
@@ -5688,6 +5692,7 @@ impl BridgeState {
             receipt_when_started: false,
             typed_retirements: Arc::default(),
             transcript_replies: None,
+            transcript_settled: Arc::default(),
             #[cfg(test)]
             admission_fault_after: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
@@ -5793,21 +5798,29 @@ impl BridgeState {
         let Some(source) = self.transcript_replies.as_ref() else {
             return;
         };
+        // Only a closing marker alone on its row (after a harness's bullet, if any) can end a
+        // block; one inside a line, as in a request prompt's own instructions, cannot.
         let mut identifiers = Vec::new();
         for line in rendered.lines() {
-            let mut rest = line;
-            while let Some(index) = rest.find("</CHAT_REPLY_") {
-                rest = &rest[index + "</CHAT_REPLY_".len()..];
-                let end = rest
-                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
-                    .unwrap_or(rest.len());
-                if rest[end..].starts_with('>') && end > 0 {
-                    let identifier = rest[..end].to_owned();
-                    if !identifiers.contains(&identifier) {
-                        identifiers.push(identifier);
-                    }
-                }
-                rest = &rest[end..];
+            let line = line.trim();
+            let line = ['⏺', '●', '•', '◆']
+                .iter()
+                .find_map(|bullet| line.strip_prefix(*bullet))
+                .map_or(line, str::trim_start);
+            let Some(identifier) = line
+                .strip_prefix("</CHAT_REPLY_")
+                .and_then(|rest| rest.strip_suffix('>'))
+                .filter(|identifier| {
+                    !identifier.is_empty()
+                        && identifier
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                })
+            else {
+                continue;
+            };
+            if !identifiers.iter().any(|known| known == identifier) {
+                identifiers.push(identifier.to_owned());
             }
         }
         if !identifiers.is_empty() {
@@ -5816,6 +5829,30 @@ impl BridgeState {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .settle(&identifiers);
         }
+    }
+
+    /// The transcript blocks captures already settled; see [`transcript_digest`].
+    fn settled_transcript(&self) -> BTreeSet<[u8; 32]> {
+        self.transcript_settled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Remember that the transcript texts `bodies` of request `key` are settled.
+    fn settle_transcript_bodies(&self, key: &str, bodies: &BTreeSet<String>) {
+        if bodies.is_empty() {
+            return;
+        }
+        let mut settled = self
+            .transcript_settled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A bound: forgetting only costs one more check of each block.
+        if settled.len() > MAX_SETTLED_TRANSCRIPT_BLOCKS {
+            settled.clear();
+        }
+        settled.extend(bodies.iter().map(|body| transcript_digest(key, body)));
     }
 
     /// The ordinals among `ordinals` of request `key` whose stored text is one of `bodies`.
@@ -9520,7 +9557,12 @@ and the replies captured for them. The provider's own thread is the complete rec
         let open_since = records
             .iter()
             .filter(|(record, _)| !record.reply_closed)
-            .map(|(record, _)| (record.reply_nonce.clone(), record.admitted_at_millis))
+            .map(|(record, _)| {
+                (
+                    record.reply_nonce.clone(),
+                    (record.key.clone(), record.admitted_at_millis),
+                )
+            })
             .collect::<BTreeMap<_, _>>();
         let transcript_merge = merge_transcript_blocks(
             &mut scan.by_nonce,
@@ -9528,6 +9570,7 @@ and the replies captured for them. The provider's own thread is the complete rec
             &open_since,
             &known_nonces,
             &aliases,
+            &self.settled_transcript(),
         );
         let burned = alias_record
             .as_mut()
@@ -9573,13 +9616,19 @@ and the replies captured for them. The provider's own thread is the complete rec
                 .as_ref()
                 .and_then(|record| Some(record.withheld_identities(record.alias_of(key)?)))
                 .unwrap_or_default();
+            let added = transcript_merge
+                .added
+                .get(&nonce)
+                .cloned()
+                .unwrap_or_default();
             let capture = self.capture_scanned_replies_locked(
                 key,
                 &found.blocks,
                 found.refused,
                 &withheld,
-                &transcript_merge.added,
+                &added,
             )?;
+            self.settle_transcript_bodies(key, &added);
             let from_transcript =
                 self.ordinals_with_bodies(key, &capture.ordinals, &transcript_merge.used);
             if !from_transcript.is_empty() {
@@ -11236,9 +11285,13 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         let transcript_merge = merge_transcript_blocks(
             &mut scan.by_nonce,
             &transcript,
-            &BTreeMap::from([(request.reply_nonce.clone(), request.admitted_at_millis)]),
+            &BTreeMap::from([(
+                request.reply_nonce.clone(),
+                (key.to_owned(), request.admitted_at_millis),
+            )]),
             &expected,
             &alias_routes,
+            &self.settled_transcript(),
         );
         let found = scan
             .by_nonce
@@ -11277,13 +11330,19 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
                     .zip(aliases.as_ref())
                     .map(|(alias, record)| record.withheld_identities(alias))
                     .unwrap_or_default();
+                let added = transcript_merge
+                    .added
+                    .get(&request.reply_nonce)
+                    .cloned()
+                    .unwrap_or_default();
                 let mut capture = self.capture_scanned_replies_locked(
                     key,
                     &found.blocks,
                     found.refused,
                     &withheld,
-                    &transcript_merge.added,
+                    &added,
                 )?;
+                self.settle_transcript_bodies(key, &added);
                 capture.transcript_ordinals =
                     self.ordinals_with_bodies(key, &capture.ordinals, &transcript_merge.used);
                 capture
@@ -15872,8 +15931,9 @@ impl KnownReplies {
 /// Each block the screen shows takes the text of the newest transcript block under the same ID
 /// that it renders: the same letters and digits, whatever the wrapping, styles, borders or table
 /// layout. Then each complete transcript
-/// block of a request in `open_since` (open requests' nonces, with when each was admitted) is
-/// added when the scan holds no block with its text: one the screen never showed, or showed only
+/// block of a request in `open_since` (open requests' nonces, with each one's key and when it was
+/// admitted) that no earlier capture settled (`settled`, see `transcript_digest`) is added when
+/// the scan holds no block with its text: one the screen never showed, or showed only
 /// in part, whose partial blocks it replaces. A transcript block recorded before its request was
 /// admitted, or with no time, is not added: reply aliases are reused once their requests retire,
 /// so an older block under the same alias answered another request. What the transcript adds
@@ -15881,9 +15941,10 @@ impl KnownReplies {
 fn merge_transcript_blocks(
     by_nonce: &mut BTreeMap<String, NonceScan>,
     transcript: &[TranscriptBlock],
-    open_since: &BTreeMap<String, u64>,
+    open_since: &BTreeMap<String, (String, u64)>,
     expected_nonces: &BTreeSet<String>,
     aliases: &BTreeMap<String, String>,
+    settled: &BTreeSet<[u8; 32]>,
 ) -> TranscriptMerge {
     use agent_harness::replies::rendered_equivalent;
     let mut merge = TranscriptMerge::default();
@@ -15906,10 +15967,10 @@ fn merge_transcript_blocks(
         else {
             continue;
         };
-        let (Some(admitted), Some(at)) = (open_since.get(nonce), source.at_millis) else {
+        let (Some((key, admitted)), Some(at)) = (open_since.get(nonce), source.at_millis) else {
             continue;
         };
-        if at < *admitted {
+        if at < *admitted || settled.contains(&transcript_digest(key, &source.body)) {
             continue;
         }
         let found = by_nonce.entry(nonce.to_owned()).or_default();
@@ -15928,9 +15989,25 @@ fn merge_transcript_blocks(
             body: source.body.clone(),
         });
         merge.used.insert(source.body.clone());
-        merge.added.insert(source.body.clone());
+        merge
+            .added
+            .entry(nonce.to_owned())
+            .or_default()
+            .insert(source.body.clone());
     }
     merge
+}
+
+/// The most transcript blocks remembered as settled before the memory starts over.
+const MAX_SETTLED_TRANSCRIPT_BLOCKS: usize = 16_384;
+
+/// The digest a settled transcript block is remembered by: its request key and its text.
+fn transcript_digest(key: &str, body: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(key.as_bytes());
+    hasher.update([0]);
+    hasher.update(body.as_bytes());
+    hasher.finalize().into()
 }
 
 /// The texts a capture took from the coordinator's transcript.
@@ -15938,8 +16015,8 @@ fn merge_transcript_blocks(
 struct TranscriptMerge {
     /// Every text it put in place of a screen block's, or added.
     used: BTreeSet<String>,
-    /// The texts of the blocks it added, which no screen block rendered.
-    added: BTreeSet<String>,
+    /// The texts of the blocks it added, which no screen block rendered, by request nonce.
+    added: BTreeMap<String, BTreeSet<String>>,
 }
 
 /// The lowercase word triples of `text`'s letters and digits, or its words when it has fewer
@@ -28028,7 +28105,8 @@ opening line for, the reply block marked {nonce}_2, so that block was not sent.\
             }));
         let id = format!("{nonce}_1");
         reader.settle_transcript(&format!(
-            "{}⏺ </CHAT_REPLY_002> and </CHAT_REPLY_002>\n</CHAT_REPLY_bad id>\n",
+            "{}⏺ </CHAT_REPLY_002>\n  </CHAT_REPLY_002>\nReply between a line <CHAT_REPLY_003> and a line \
+</CHAT_REPLY_003>.\n</CHAT_REPLY_bad id>\n",
             reply_block(&id, "x")
         ));
         reader.settle_transcript("no markers\n");
