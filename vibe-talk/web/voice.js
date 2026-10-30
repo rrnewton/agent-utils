@@ -35952,16 +35952,8 @@ async function prepareSpeechFor(ids) {
   }
 }
 
-/** How long a prepared entry's ticket has left, on the nearer of its two deadlines. */
-function ticketLeftMs(entry) {
-  return preparedTicketLeftMs(entry, speechDeadlineNow());
-}
-
-/**
- * `#376 read-aloud-blocks`. The life a ticket must still have for a read in blocks to start on it:
- * half of the ten minutes a ticket lasts, longer than the messages read aloud take.
- */
-const BLOCK_READ_TICKET_MARGIN_MS = 5 * 60 * 1000;
+// `#376 read-aloud-blocks`. The life a ticket must still have for a read in blocks to start on it
+// (`BLOCK_READ_TICKET_MARGIN_MS`, `ticketTooShortForBlocks`) is web/src/core/speech's.
 
 /**
  * Forget what was prepared. The pace is baked into a ticket, so changing it invalidates them, and a
@@ -37539,7 +37531,7 @@ function heldReadStale(playing) {
   for (const part of ahead) {
     const ticket = playing.tickets[part];
     if (!ticket) continue;
-    if (now.mono >= ticket.until.mono || now.wall >= ticket.until.wall) return true;
+    if (ticketEnded(ticket, now)) return true;
     const entry = preparedEntry(playing.parts[part]);
     if (entry === null || entry.url !== ticket.url) return true;
   }
@@ -37570,8 +37562,8 @@ function restartHeldBlock(playing) {
 // fails forgets what was prepared and starts the read again from that part, after a short wait for a
 // server that is coming back, a few times before it says the message could not be played.
 
-/** How long to wait before each try at starting a cut-off read again: about as long as a restart. */
-const READ_RECOVERY_WAITS_MS = [1000, 3000, 8000];
+// How long to wait before each try at starting a cut-off read again (`READ_RECOVERY_WAITS_MS`,
+// `recoveryWait`) is web/src/core/speech's.
 
 /**
  * Start read `parts` again from `from` (`{part, block, recovery}`) after `wait` ms, on fresh tickets.
@@ -37617,8 +37609,9 @@ function recoverRead(parts, from, wait) {
       if (pendingRead !== null || nowPlaying !== null) return;
       // Not even prepared or fetched (the server still away): another try, while there are tries;
       // after the last, the media keys and the audio output it held go back.
-      if (from.recovery < READ_RECOVERY_WAITS_MS.length) {
-        recoverRead(parts, { ...from, recovery: from.recovery + 1 }, READ_RECOVERY_WAITS_MS[from.recovery]);
+      const wait = recoveryWait(from.recovery);
+      if (wait !== null) {
+        recoverRead(parts, { ...from, recovery: from.recovery + 1 }, wait);
       } else {
         releaseMediaSession();
         quietReadAloudContext();
@@ -37848,7 +37841,7 @@ async function readAloud(ids, from = null) {
   // ticket with little life left is prepared again now rather than failing part-way through.
   for (const part of parts) {
     const entry = preparedEntry(part);
-    if (entry && entry.blocks && ticketLeftMs(entry) < BLOCK_READ_TICKET_MARGIN_MS) preparedSpeech.forget(part);
+    if (entry && entry.blocks && ticketTooShortForBlocks(entry, speechDeadlineNow())) preparedSpeech.forget(part);
   }
   // THE FAST PATH, and the whole point of preparing: every part already has a URL that streams, so
   // there is nothing to fetch and nothing to wait for. The player is handed the URL and the browser
@@ -38104,11 +38097,11 @@ async function readAloud(ids, from = null) {
         // is started again from that part on fresh tickets, a few times, before it is given up. A part
         // fetched ahead that fails while the one before it is still heard starts the read again from
         // the one being heard, so nothing is skipped.
-        if (streamed && lost && recovery < READ_RECOVERY_WAITS_MS.length) {
+        const wait = streamed && lost ? recoveryWait(recovery) : null;
+        if (wait !== null) {
           const heard = nowPlaying !== null && nowPlaying.id === id && !started[at] ? nowPlaying.segment : at;
           const segment = segments[heard] || segments[at];
-          recoverRead(parts, { part: segment.part, block: segment.block, recovery: recovery + 1 },
-            READ_RECOVERY_WAITS_MS[recovery]);
+          recoverRead(parts, { part: segment.part, block: segment.block, recovery: recovery + 1 }, wait);
           return;
         }
         // `#487`: and what was prepared before a lost part with it, so the next tap prepares again

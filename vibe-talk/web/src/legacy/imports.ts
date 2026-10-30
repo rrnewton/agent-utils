@@ -17,11 +17,14 @@ export {
   searchSubject,
 } from "../core/search/index.ts";
 export {
+  READ_RECOVERY_WAITS_MS,
   createPreparedSpeech,
   readPieces,
+  recoveryWait,
   sentenceEnds,
   speechSegments,
-  ticketLeftMs as preparedTicketLeftMs,
+  ticketEnded,
+  ticketTooShortForBlocks,
 } from "../core/speech/index.ts";
 export { SLOW_WORDS, createApi, isSlowFailure, providerWords, readableFailure } from "../core/api/index.ts";
 export {

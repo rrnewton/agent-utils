@@ -7148,6 +7148,18 @@ test("`#624 voice-page-modularity`: prepared read-aloud tickets end on either cl
   assert.equal(prepared.size(), 0);
 });
 
+test("`#624 voice-page-modularity`: when a cut-off read tries again, and when a ticket can no longer carry it, from the module alone", () => {
+  const { recoveryWait, ticketEnded, ticketTooShortForBlocks, READ_RECOVERY_WAITS_MS, BLOCK_READ_TICKET_MARGIN_MS } = SPEECH_PIECES;
+  assert.deepStrictEqual(READ_RECOVERY_WAITS_MS.map((_, at) => recoveryWait(at)), READ_RECOVERY_WAITS_MS);
+  assert.equal(recoveryWait(READ_RECOVERY_WAITS_MS.length), null, "a read tried again after its last try");
+  const ticket = { until: { mono: 100, wall: 1000 } };
+  assert.deepStrictEqual([ticketEnded(ticket, { mono: 99, wall: 999 }), ticketEnded(ticket, { mono: 100, wall: 0 }), ticketEnded(ticket, { mono: 0, wall: 1000 })],
+    [false, true, true]);
+  const entry = { url: "/u", until: { mono: BLOCK_READ_TICKET_MARGIN_MS, wall: 10 * BLOCK_READ_TICKET_MARGIN_MS }, blocks: null };
+  assert.equal(ticketTooShortForBlocks(entry, { mono: 0, wall: 0 }), false);
+  assert.equal(ticketTooShortForBlocks(entry, { mono: 1, wall: 0 }), true, "a ticket with less than the margin left started a read in blocks");
+});
+
 test("`#624 voice-page-modularity`: when a call reconnects after a lost turn, and when it ends, from the module alone", () => {
   const { reconnectAsked, reconnectVerdict, LOST_TURN, RECONNECT_MIN_GAP_MS, RECONNECTS_PER_CALL_MAX } = CALL;
   const call = { protocol: "vibe-talk-v1", v1Ready: true, reconnects: 0, lastReconnectAt: 0 };
