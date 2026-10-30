@@ -19,6 +19,12 @@
     // What the legacy script's own test held its top-level bindings to (unusedBindings), held here
     // for the modules.
     "noUnusedLocals": true,
+    // `#624 voice-page-modularity`, step 17: held to these too from the first module that would break
+    // one. Not exactOptionalPropertyTypes: the generated contract types do not yet say `| undefined`
+    // where a page's copy carries an explicit undefined, and that is the generator's change to make.
+    "noUnusedParameters": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
     "skipLibCheck": false
   },
   "include": ["web/src/core/**/*.ts", "web/src/ports/**/*.ts", "web/src/foundation/**/*.ts", "web/src/contract/**/*.ts"]

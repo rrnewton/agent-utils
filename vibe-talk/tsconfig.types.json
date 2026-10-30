@@ -1,0 +1,7 @@
+{
+  // The negative type examples in tests/types (`#624 voice-page-modularity`): writes a foreign module
+  // must not be able to make, each marked @ts-expect-error, so a record that stops refusing one fails
+  // here. Strict and portable, as the core is. Run with `make -C vibe-talk typecheck`.
+  "extends": "./tsconfig.core.json",
+  "include": ["tests/types/**/*.ts"]
+}

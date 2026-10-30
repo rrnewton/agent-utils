@@ -7,6 +7,14 @@
 // a module in a directory no row names is itself a violation, so a new package cannot escape by
 // being new.
 //
+// It holds what the modules say as well as what they import (plan §3, "type-check ownership as
+// well as imports"). In every handwritten module: no `any`, no comment that turns the checker off
+// (@ts-nocheck, @ts-ignore, @ts-expect-error), and no exported binding another module could see
+// change. And outside the browser's implementation of the ports and the legacy script, none of the
+// browser's own capabilities (`PLATFORM_GLOBALS`): the network, storage and the audio hardware
+// reach a module through its ports. The core is held to that by its library as well
+// (tsconfig.core.json); views have the DOM, and are held to it here.
+//
 //   node web/architecture.mjs [--src DIR]     prints every violation; exits 1 if there is one
 //
 // Run by `make -C vibe-talk typecheck` and by tests/js/page_build.test.mjs.
@@ -47,6 +55,83 @@ export const PACKAGES = Object.freeze({
   "view/dom": BASE,
   legacy: "*",
 });
+
+/**
+ * The browser capabilities that are web/src/platform/web's to wrap, as the ports declare them: what no
+ * other package names, as a global or as a property of `window`, `self` or `globalThis`. A view
+ * that needs one takes the port, as the core does.
+ */
+export const PLATFORM_GLOBALS = Object.freeze([
+  "fetch", "XMLHttpRequest", "WebSocket", "EventSource", "localStorage", "sessionStorage", "indexedDB",
+  "caches", "navigator", "AudioContext", "webkitAudioContext", "Audio", "MediaRecorder", "speechSynthesis",
+  "SpeechSynthesisUtterance", "Notification",
+]);
+/** The packages that may name `PLATFORM_GLOBALS`. */
+const PLATFORM_PACKAGES = new Set(["platform/web", "legacy"]);
+/** The objects whose properties are globals. */
+const GLOBAL_OBJECTS = new Set(["window", "self", "globalThis"]);
+
+/**
+ * What one handwritten module says that the page's modules do not: `{ line, what }` for each `any`,
+ * each comment turning the checker off, each exported binding that can change, and, unless the
+ * module is allowed them, each use of a `PLATFORM_GLOBALS` capability.
+ */
+function sayingsOf(ts, file, text, platformAllowed) {
+  const source = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true,
+    file.endsWith(".ts") ? ts.ScriptKind.TS : ts.ScriptKind.JS);
+  const found = [];
+  const at = (pos) => source.getLineAndCharacterOfPosition(pos).line + 1;
+  // Every comment, wherever it sits: the scanner, not a pattern, so a directive inside a string is not one.
+  const scanner = ts.createScanner(ts.ScriptTarget.Latest, false, source.languageVariant, text);
+  for (let kind = scanner.scan(); kind !== ts.SyntaxKind.EndOfFileToken; kind = scanner.scan()) {
+    if ((kind === ts.SyntaxKind.SingleLineCommentTrivia || kind === ts.SyntaxKind.MultiLineCommentTrivia) &&
+        /@ts-(?:nocheck|ignore|expect-error)\b/.test(scanner.getTokenText())) {
+      found.push({ line: at(scanner.getTokenStart()), what: `a comment that turns type checking off (${scanner.getTokenText().trim().slice(0, 40)})` });
+    }
+  }
+  const mutable = new Set();
+  for (const statement of source.statements) {
+    if (ts.isVariableStatement(statement) && !(statement.declarationList.flags & ts.NodeFlags.Const)) {
+      for (const declaration of statement.declarationList.declarations) {
+        if (ts.isIdentifier(declaration.name)) mutable.add(declaration.name.text);
+      }
+      if (statement.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword)) {
+        found.push({ line: at(statement.getStart(source)), what: "an exported binding that can change (export let or var)" });
+      }
+    }
+  }
+  const visit = (node) => {
+    if (!platformAllowed && ts.isElementAccessExpression(node) && ts.isIdentifier(node.expression) &&
+        GLOBAL_OBJECTS.has(node.expression.text) && ts.isStringLiteralLike(node.argumentExpression) &&
+        PLATFORM_GLOBALS.includes(node.argumentExpression.text)) {
+      found.push({ line: at(node.getStart(source)), what: `the browser's ${node.argumentExpression.text}, which reaches a module through its port (web/src/ports)` });
+    }
+    if (node.kind === ts.SyntaxKind.AnyKeyword) {
+      found.push({ line: at(node.getStart(source)), what: "the type `any`" });
+    } else if (ts.isExportDeclaration(node) && !node.moduleSpecifier && node.exportClause && ts.isNamedExports(node.exportClause)) {
+      for (const element of node.exportClause.elements) {
+        const local = (element.propertyName ?? element.name).text;
+        if (mutable.has(local)) found.push({ line: at(element.getStart(source)), what: `an exported binding that can change (${local} is a let or var)` });
+      }
+    } else if (!platformAllowed && ts.isIdentifier(node) && PLATFORM_GLOBALS.includes(node.text)) {
+      const parent = node.parent;
+      const named = ts.isPropertyAccessExpression(parent) && parent.name === node;
+      const onGlobal = named && ts.isIdentifier(parent.expression) && GLOBAL_OBJECTS.has(parent.expression.text);
+      const declared = (ts.isPropertySignature(parent) || ts.isPropertyDeclaration(parent) || ts.isMethodSignature(parent) ||
+        ts.isMethodDeclaration(parent) || ts.isPropertyAssignment(parent) || ts.isBindingElement(parent) ||
+        ts.isParameter(parent) || ts.isVariableDeclaration(parent) || ts.isImportSpecifier(parent) ||
+        ts.isExportSpecifier(parent)) && parent.name === node;
+      // A type of that name is no use of the capability: `typeof fetch` or a parameter typed `Audio`.
+      const typeOnly = ts.isTypeReferenceNode(parent) || ts.isTypeQueryNode(parent) || ts.isQualifiedName(parent);
+      if ((!named && !declared && !typeOnly) || onGlobal) {
+        found.push({ line: at(node.getStart(source)), what: `the browser's ${node.text}, which reaches a module through its port (web/src/ports)` });
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  return found;
+}
 
 /** The package `file` (relative to src, with "/") belongs to: the longest row that contains it, or null. */
 function packageOf(file) {
@@ -115,7 +200,13 @@ export function checkArchitecture(src = join(WEB, "src"), ts = loadTool("typescr
     }
     const next = [];
     graph.set(file, next);
-    for (const { specifier, line, kind } of importsOf(ts, file, readFileSync(join(src, file), "utf8"))) {
+    const text = readFileSync(join(src, file), "utf8");
+    if (!text.startsWith("// GENERATED by ")) {
+      for (const { line, what } of sayingsOf(ts, file, text, own !== null && PLATFORM_PACKAGES.has(own))) {
+        problems.push(`${file}:${line}: ${what}`);
+      }
+    }
+    for (const { specifier, line, kind } of importsOf(ts, file, text)) {
       const where = `${file}:${line}`;
       if (kind !== "static") {
         problems.push(`${where}: a ${kind} import (${specifier}); the page's modules import statically, by relative path`);
@@ -173,5 +264,5 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   const problems = checkArchitecture(at > 0 ? resolve(process.argv[at + 1]) : undefined);
   for (const problem of problems) console.error(problem);
   if (problems.length > 0) process.exit(1);
-  console.log("web/src: every import goes the page's way");
+  console.log("web/src: every import goes the page's way, and no module says what the page's modules do not");
 }

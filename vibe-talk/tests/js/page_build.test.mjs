@@ -399,23 +399,7 @@ test("every handwritten module is TypeScript, so the strict and portable checks 
   assert.ok(moduleSources().length > 0, "no module found, so this checks nothing");
 });
 
-test("no module opts out of type checking: no @ts-nocheck, @ts-ignore or @ts-expect-error, and no `any`", () => {
-  const found = [];
-  for (const { name, text } of moduleSources().filter(({ generated }) => !generated)) {
-    const code = text.replace(/\/\*[\s\S]*?\*\//g, (comment) => comment.replace(/[^\n]/g, " "));
-    code.split("\n").forEach((line, at) => {
-      if (/@ts-(?:nocheck|ignore|expect-error)\b/.test(line) || /(?::|<|\bas)\s*any\b/.test(line.replace(/\/\/.*$/, ""))) {
-        found.push(`${name}:${at + 1}: ${line.trim()}`);
-      }
-    });
-  }
-  assert.deepStrictEqual(found, [], "a module turns type checking off where the plan holds it strict");
-  // The scan sees an opt-out where there is one.
-  assert.ok(/@ts-(?:nocheck|ignore|expect-error)\b/.test("// @ts-nocheck"));
-  assert.ok(/(?::|<|\bas)\s*any\b/.test("const x: any = 1;") && /(?::|<|\bas)\s*any\b/.test("y as any"));
-});
-
-test("`#624 voice-page-modularity`: every import under web/src goes the page's way", () => {
+test("`#624 voice-page-modularity`: every import under web/src goes the page's way, and no module says what the modules may not", () => {
   assert.deepStrictEqual(checkArchitecture(), [], "web/architecture.mjs finds the page's modules importing against their direction");
   // Every package the tree has is a row, and every row a package the tree has.
   const dirs = new Set(moduleSources().map(({ name }) => name.split("/").slice(1, -1).join("/"))
@@ -442,6 +426,20 @@ test("`#624 voice-page-modularity`: the import checker fails closed on every wro
     ["core/api/bad.ts", 'import ajv from "ajv";\nexport const a = ajv;\n', /not a relative path/],
     ["core/api/bad.ts", 'import { gone } from "./nowhere.ts";\nexport const b = gone;\n', /no module under web\/src/],
     ["view/bad.ts", "export const c = 1;\n", /in no package/],
+    // What a module says (`sayingsOf`): no `any` however it is written, no comment turning the
+    // checker off in either kind of comment, no exported binding that can change.
+    ["core/api/bad.ts", "export const d: any = 1;\n", /the type `any`/],
+    ["core/api/bad.ts", "export const e = [] as Array<string | any>;\n", /the type `any`/],
+    ["foundation/bad.ts", "// @ts-ignore\nexport const f: number = \"1\";\n", /turns type checking off/],
+    ["foundation/bad.ts", "/* @ts-expect-error */\nexport const g: number = \"1\";\n", /turns type checking off/],
+    ["view/dom/bad.ts", "// @ts-nocheck\nexport const h = 1;\n", /turns type checking off/],
+    ["core/sync/bad.ts", "export let i = 0;\n", /an exported binding that can change/],
+    ["core/sync/bad.ts", "let j = 0;\nexport { j as k };\n", /j is a let or var/],
+    // The browser's capabilities, outside platform/web: as globals, and as properties of the global.
+    ["view/dom/bad.ts", 'export const l = () => localStorage.getItem("x");\n', /the browser's localStorage/],
+    ["view/composer/bad.ts", 'export const m = () => window.fetch("/");\n', /the browser's fetch/],
+    ["view/dom/bad.ts", 'export const n = () => globalThis["WebSocket"];\n', /the browser's WebSocket/],
+    ["core/call/bad.ts", "export const o = () => navigator.onLine;\n", /the browser's navigator/],
   ];
   for (const [file, text, wanted] of cases) {
     const copy = mkdtempSync(join(scratch, "architecture-"));
@@ -451,6 +449,20 @@ test("`#624 voice-page-modularity`: the import checker fails closed on every wro
     writeFileSync(path, text);
     const problems = checkArchitecture(copy);
     assert.ok(problems.some((problem) => wanted.test(problem)), `${file} (${text.trim()}) was not refused: ${JSON.stringify(problems)}`);
+    rmSync(copy, { recursive: true, force: true });
+  }
+  // And none of those where they are allowed or are no use of the thing: platform/web wraps the
+  // browser; a directive or a name in a string, a property of that name, a type of it are none.
+  for (const [file, text] of [
+    ["platform/web/fine.ts", 'export const p = () => fetch("/");\nexport const q = () => window.localStorage;\n'],
+    ["view/dom/fine.ts", 'export const r = "@ts-ignore localStorage";\nexport const s = (x: { fetch: number }) => x.fetch;\n' +
+      "export type T = typeof fetch;\nlet u = 0;\nexport const v = () => (u += 1);\n"],
+  ]) {
+    const copy = mkdtempSync(join(scratch, "architecture-"));
+    cpSync(join(WEB, "src"), copy, { recursive: true });
+    writeFileSync(join(copy, file), text);
+    const problems = checkArchitecture(copy).filter((problem) => problem.startsWith(file));
+    assert.deepStrictEqual(problems, [], `${file} was refused`);
     rmSync(copy, { recursive: true, force: true });
   }
   // A cycle, even inside one package and through its own index.
