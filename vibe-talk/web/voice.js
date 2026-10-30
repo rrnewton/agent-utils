@@ -28299,7 +28299,7 @@ async function loadTimeline(options) {
         steps.pause();
         // `remote-ops-audit` W7. Given up on, the read is kept, and its view held (`abandonRead`).
         const abandoned = { key: holdKey, context, channel, view, thread, canon, column: steps.column, sent, held,
-          sentAt: Date.now(), live: liveEventsSeen.get(channel) || 0, news: liveNewsSeen.get(channel) || 0, number: 0 };
+          sentAt: Date.now(), live: liveEvents.seen(channel), news: liveEvents.news(channel), number: 0 };
         const asked = within(CHANNEL_READ_TIMEOUT_MS, (signal) => readTimeline(path, { signal }),
           // Once it settles, the placing read that waited for it goes (`placeUnplacedWaits`). `#308`.
           (answer) => abandonRead(answer, abandoned, (late) => landAbandonedTimelineRead(late, abandoned),
@@ -29498,7 +29498,7 @@ function queuePlaceUnplaced() {
  * @typedef {AbandonedRead & {sent: string | null, seen: number, number: number, held: Map<string, any>,
  *   removals: number}} PlacingRead A placing read: the position in All it continues, or null for All's
  *   newest page, `unplacedArrivals` and `readOrder` when it was sent, the store's copies of
- *   the messages it held then (`heldAsSent`), and `liveRemovalsSeen` for its channel then. Its `key` is
+ *   the messages it held then (`heldAsSent`), and `liveEvents.removals` for its channel then. Its `key` is
  *   the view on screen in the left column, whose poll waits for it once it is given up on.
  */
 
@@ -29529,8 +29529,8 @@ async function placeUnplaced() {
     for (;;) {
       /** @type {PlacingRead} */
       const read = { key, channel, canon, sent, seen: unplacedArrivals, sentAt: Date.now(),
-        live: liveEventsSeen.get(channel) || 0, news: liveNewsSeen.get(channel) || 0, number: 0,
-        held: heldNow(canon), removals: liveRemovalsSeen.get(channel) || 0 };
+        live: liveEvents.seen(channel), news: liveEvents.news(channel), number: 0,
+        held: heldNow(canon), removals: liveEvents.removals(channel) };
       const path = `${base}${sent ? `&after=${encodeURIComponent(sent)}` : ""}&reason=place`;
       /** @type {VibeTalk.TimelineResponse} */
       let payload;
@@ -29598,8 +29598,8 @@ function landPlacingRead(payload, read) {
   const { canon, channel } = read;
   if (channelStore.current() !== canon || canon.channel !== channel || String(selectedChannelId()) !== channel) return true;
   const delta = Boolean(read.sent && payload.delta);
-  const quiet = (liveEventsSeen.get(channel) || 0) === read.live;
-  const unremoved = (liveRemovalsSeen.get(channel) || 0) === read.removals;
+  const quiet = liveEvents.seen(channel) === read.live;
+  const unremoved = liveEvents.removals(channel) === read.removals;
   const unchanged = heldAsSent(canon, read.held);
   let folded = false;
   if (delta) {
@@ -41917,7 +41917,7 @@ async function loadDiscord(options) {
     const sent = readLedger.epoch();
     // `remote-ops-audit` W7. Given up on, the read is kept, and its view held (`abandonRead`).
     const abandoned = { key: holdKey, channel: String(channel), sentAt: Date.now(),
-      live: liveEventsSeen.get(String(channel)) || 0, news: liveNewsSeen.get(String(channel)) || 0, canon: null,
+      live: liveEvents.seen(String(channel)), news: liveEvents.news(String(channel)), canon: null,
       generation };
     const payload = await within(CHANNEL_READ_TIMEOUT_MS, (signal) => api(path, { signal }),
       (answer) => abandonRead(answer, abandoned, (late) => {
@@ -51605,27 +51605,15 @@ const readHolds = createReadHolds({ now: () => Date.now() });
 
 /**
  * How many live events have arrived for each channel: a read given up on whose answer lands after one
- * may be older than what the event brought (`abandonedReadStands`).
+ * may be older than what the event brought (`abandonedReadStands`); how many of those were news, not
+ * the stream's replay tail, which says the service is answering and sets no hold when that read is
+ * given up on; and how many were removals (`noteLiveRemoval`), after which a placing read out as one
+ * arrived is not folded (`landPlacingRead`, `#308 live-reply-in-main`). web/src/core/sync
+ * `createLiveEvents` (`#624 voice-page-modularity`).
  *
- * @type {Map<string, number>}
+ * @type {import("./src/core/sync/index.ts").LiveEvents}
  */
-const liveEventsSeen = new Map();
-
-/**
- * How many of those were news, not the stream's replay tail: one that arrived after a read was sent
- * says the service is answering for the channel, and no hold is set when that read is given up on.
- *
- * @type {Map<string, number>}
- */
-const liveNewsSeen = new Map();
-
-/**
- * How many of those were removals (`noteLiveRemoval`): a placing read out as one arrived may carry
- * the message removed, and is not folded (`landPlacingRead`). `#308 live-reply-in-main`.
- *
- * @type {Map<string, number>}
- */
-const liveRemovalsSeen = new Map();
+const liveEvents = createLiveEvents();
 
 /** The view a read of the column being worked on is for: its context, and the to-do list apart. */
 function readHoldKey() {
@@ -51668,9 +51656,9 @@ function readHeld(key, options) {
 function noteLiveEvent(channel, fromTail) {
   if (channel === undefined || channel === null) return;
   const id = String(channel);
-  liveEventsSeen.set(id, (liveEventsSeen.get(id) || 0) + 1);
+  liveEvents.noteEvent(id);
   if (fromTail) return;
-  liveNewsSeen.set(id, (liveNewsSeen.get(id) || 0) + 1);
+  liveEvents.noteNews(id);
   readHolds.liftChannel(id);
 }
 
@@ -51679,8 +51667,8 @@ function noteLiveEvent(channel, fromTail) {
  * @property {string} key the view it read (`readHoldKey`)
  * @property {string} channel
  * @property {number} sentAt when it was sent, by the clock
- * @property {number} live `liveEventsSeen` for its channel when it was sent
- * @property {number} news `liveNewsSeen` for its channel when it was sent
+ * @property {number} live `liveEvents.seen` for its channel when it was sent
+ * @property {number} news `liveEvents.news` for its channel when it was sent
  * @property {any} canon the store it was read for
  */
 
@@ -51704,7 +51692,7 @@ function noteLiveEvent(channel, fromTail) {
  * @param {((landed: boolean, unused: T | null) => void) | null} [settled]
  */
 function abandonRead(answer, read, land, settled = null) {
-  const answering = (liveNewsSeen.get(read.channel) || 0) !== read.news;
+  const answering = liveEvents.news(read.channel) !== read.news;
   const hold = answering ? null : holdView(read.key, read.channel, read.sentAt);
   const release = () => {
     readHolds.release(read.key, hold);
@@ -51732,7 +51720,7 @@ function abandonRead(answer, read, land, settled = null) {
  */
 function abandonedReadStands(read) {
   if (String(selectedChannelId()) !== read.channel) return false;
-  if ((liveEventsSeen.get(read.channel) || 0) !== read.live) return false;
+  if (liveEvents.seen(read.channel) !== read.live) return false;
   if (threadingSupported) {
     return read.canon === channelStore.current() && channelStore.current().channel === read.channel &&
       read.number === readOrder.asked();
@@ -53092,7 +53080,7 @@ function takeThreadRecord(message) {
  * @param {number | null} [observedMs] when the server observed the removal (`removalsObserved`)
  */
 function noteLiveRemoval(channel, id, observedMs = null) {
-  liveRemovalsSeen.set(String(channel), (liveRemovalsSeen.get(String(channel)) || 0) + 1);
+  liveEvents.noteRemoval(String(channel));
   // `#466 reply-promotes-thread`. Heard of in any channel: a post of this page's removed upstream is no
   // longer kept against reads that do not carry it (`ownPostStands`).
   // `#500 sent-receipts-pile-up`: nor on the device, whichever of its windows sent it.

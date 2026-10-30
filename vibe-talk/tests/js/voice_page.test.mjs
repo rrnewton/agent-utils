@@ -7197,6 +7197,18 @@ test("`#624 voice-page-modularity`: a read asked for while another is out joins 
   assert.deepStrictEqual([started, generation.current()], [0, 1]);
 });
 
+test("`#624 voice-page-modularity`: the live events counted per channel, from the module alone", () => {
+  const { createLiveEvents } = SYNC;
+  const live = createLiveEvents();
+  assert.deepStrictEqual([live.seen("c"), live.news("c"), live.removals("c")], [0, 0, 0]);
+  live.noteEvent("c");
+  live.noteEvent("c");
+  live.noteNews("c");
+  live.noteRemoval("d");
+  assert.deepStrictEqual([live.seen("c"), live.news("c"), live.removals("c"), live.removals("d"), live.seen("d")], [2, 1, 0, 1, 0],
+    "one channel's or one kind's events were counted as another's");
+});
+
 test("`#624 voice-page-modularity`: views held unpolled after a read given up on, from the module alone", () => {
   const { createReadHolds, SERVER_READ_BOUND_MS } = SYNC;
   let now = 1000;
@@ -75404,7 +75416,7 @@ test("`#308 live-reply-in-main`: a placing page of All that lands after the stre
 
   // THE CONTROL: folded regardless — of the stream, and of the store having gained the aside since it
   // was sent (review round 4) — the page sent before the aside takes it out as deleted.
-  const control = await run(brokenScriptEach(["  const quiet = (liveEventsSeen.get(channel) || 0) === read.live;",
+  const control = await run(brokenScriptEach(["  const quiet = liveEvents.seen(channel) === read.live;",
     "  const quiet = true;"], FOLD_OVER_ANY_STORE));
   assert.ok(!shownIds(control.page).includes("207"),
     "the stale placing page left the aside alone anyway, so this test cannot see it");
@@ -76053,7 +76065,7 @@ for (const placing of ["newest", "delta"]) {
         // taken though the reply was removed after it was sent (`#316 late-counts-resurrect`), brings the
         // reply back itself: landing first, as it is; landing after Main's read took the reply out, only
         // if also folded whatever the store has lost since (`heldAsSent`).
-        const unremoved = ["  const unremoved = (liveRemovalsSeen.get(channel) || 0) === read.removals;\n",
+        const unremoved = ["  const unremoved = liveEvents.removals(channel) === read.removals;\n",
           "  const unremoved = true;\n"];
         const folded = await run(await brokenModule([REMOVALS_FORGOTTEN], landsFirst === "placing"
           ? brokenScriptEach(unremoved) : brokenScriptEach(unremoved, FOLD_OVER_ANY_STORE)));

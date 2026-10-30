@@ -99,6 +99,7 @@ export {
   TIMELINE_DELTA_PAGES,
   TIMELINE_RECONCILE_MS,
   VISIBLE_REFRESH_MS,
+  createLiveEvents,
   createReadHolds,
   createReadOrder,
   createReplayLedger,

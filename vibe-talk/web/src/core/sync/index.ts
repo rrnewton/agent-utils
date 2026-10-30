@@ -24,3 +24,5 @@ export { LIVE_RETRY_MS, createStreamGeneration, joinQueuedReads } from "./stream
 export type { QueuedReadOptions, StreamGeneration } from "./streams.ts";
 export { SERVER_READ_BOUND_MS, createReadHolds } from "./holds.ts";
 export type { ReadHold, ReadHolds, ReadHoldsDependencies } from "./holds.ts";
+export { createLiveEvents } from "./live.ts";
+export type { LiveEvents } from "./live.ts";

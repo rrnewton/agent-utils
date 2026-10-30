@@ -39,6 +39,7 @@ declare const TIMELINE_DELTA_PAGES: LegacyImports["TIMELINE_DELTA_PAGES"];
 declare const TIMELINE_RECONCILE_MS: LegacyImports["TIMELINE_RECONCILE_MS"];
 declare const VISIBLE_REFRESH_MS: LegacyImports["VISIBLE_REFRESH_MS"];
 declare const DISCORD_POLL_MS: LegacyImports["DISCORD_POLL_MS"];
+declare const createLiveEvents: LegacyImports["createLiveEvents"];
 declare const createReadHolds: LegacyImports["createReadHolds"];
 declare const createReadOrder: LegacyImports["createReadOrder"];
 declare const createReplayLedger: LegacyImports["createReplayLedger"];
