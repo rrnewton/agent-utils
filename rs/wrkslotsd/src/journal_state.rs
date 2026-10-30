@@ -27,7 +27,7 @@ type Result<T> = std::result::Result<T, String>;
 
 const SCHEMA: i64 = 2;
 
-fn planned_from_obj(value: &Value, label: &str) -> Result<()> {
+pub(crate) fn planned_from_obj(value: &Value, label: &str) -> Result<()> {
     let raw = as_mapping(value, label)?;
     exact_keys(
         raw,
@@ -477,7 +477,7 @@ fn finish_shape(
     }
     let phase = as_str(&raw["phase"], "finish journal.phase")?;
     if !matches!(phase, "prepared" | "fenced" | "removed") {
-        return Err(format!("unknown finish journal phase {phase:?}"));
+        return Err(format!("unknown finish journal phase '{phase}'"));
     }
     as_str(&raw["fenced"], "finish journal.fenced")?;
     for (index, item) in as_list(&raw["removed"], "finish journal.removed")?
@@ -822,7 +822,7 @@ fn exclusion_from_obj(cfg: &Cfg, fenced: &Path, value: &Value) -> Result<()> {
     let phase = as_str(&raw["phase"], &format!("{label}.phase"))?;
     if !matches!(phase, "guard-created" | "payload-moved") {
         return Err(format!(
-            "unknown ownerless validation exclusion phase {phase:?}"
+            "unknown ownerless validation exclusion phase '{phase}'"
         ));
     }
     let root = as_str(&raw["root"], &format!("{label}.root"))?;
@@ -1082,7 +1082,7 @@ fn ownerless_agent_shape(cfg: &Cfg, raw: &Map<String, Value>, journal_machine: &
     }
     let phase = as_str(&raw["phase"], "ownerless agent journal.phase")?;
     if !matches!(phase, "prepared" | "preserved" | "fenced" | "removed") {
-        return Err(format!("unknown ownerless agent phase {phase:?}"));
+        return Err(format!("unknown ownerless agent phase '{phase}'"));
     }
     let present = |path: &Path| path.symlink_metadata().is_ok();
     let target_present = present(&target);
@@ -1236,7 +1236,7 @@ fn ownerless_clone_shape(cfg: &Cfg, raw: &Map<String, Value>, journal_machine: &
         phase,
         "prepared" | "rescued" | "fenced" | "removing" | "removed"
     ) {
-        return Err(format!("unknown ownerless clone phase {phase:?}"));
+        return Err(format!("unknown ownerless clone phase '{phase}'"));
     }
     for (index, item) in as_list(&raw["rescue"], "ownerless clone journal.rescue")?
         .iter()
@@ -1380,7 +1380,7 @@ fn ownerless_cache_shape(cfg: &Cfg, raw: &Map<String, Value>, journal_machine: &
     }
     let phase = as_str(&raw["phase"], "ownerless agent cache phase")?;
     if !matches!(phase, "prepared" | "fenced" | "relocated") {
-        return Err(format!("unknown ownerless agent cache phase {phase:?}"));
+        return Err(format!("unknown ownerless agent cache phase '{phase}'"));
     }
     let present = |path: &PathBuf| path.symlink_metadata().is_ok();
     let candidates = [source.clone(), fenced.clone(), destination.clone()];
@@ -2059,7 +2059,7 @@ fn absent_agent_shape(raw: &Map<String, Value>, journal_machine: &str) -> Result
     }
     let phase = as_str(&raw["phase"], "absent-agent-row journal.phase")?;
     if !matches!(phase, "prepared" | "preserved" | "registrations-removed") {
-        return Err(format!("unknown absent-agent-row phase {phase:?}"));
+        return Err(format!("unknown absent-agent-row phase '{phase}'"));
     }
     let record = record_from_obj(&raw["record"], "absent-agent-row journal.record")?;
     if record.slot_type != "agent" {
@@ -2440,7 +2440,7 @@ fn ownerless_validate_shape(
     )?;
     let phase = as_str(&raw["phase"], "ownerless validation journal.phase")?;
     if !matches!(phase, "prepared" | "fenced" | "removing" | "removed") {
-        return Err(format!("unknown ownerless validation phase {phase:?}"));
+        return Err(format!("unknown ownerless validation phase '{phase}'"));
     }
     as_str(&raw["fenced"], "ownerless validation journal.fenced")?;
     let (target_kind, auth_path) = validation_authorization(&raw["authorization"])?;
@@ -2498,29 +2498,16 @@ fn ownerless_validate_shape(
     Ok(())
 }
 
-/// Read and shape-validate one recovery journal in the control directory,
-/// printing it as stored.
-pub(crate) fn parse_journal(
-    root: Option<&Path>,
-    machine_override: Option<&str>,
+/// Shape-validate one journal object against its file name,
+/// exactly as the oracle's `_validate_journal_shape`: schema,
+/// machine/kind/slot agreement with the name, then the
+/// kind-specific key sets and sub-objects. Returns
+/// (machine, kind, slot).
+pub(crate) fn validate_journal_shape(
+    cfg: &Cfg,
     name: &str,
-) -> Result<Value> {
-    if name.is_empty() || name.contains(['/', '\\']) || matches!(name, "." | "..") {
-        return Err("journal name must be a file name inside the control directory".to_owned());
-    }
-    let (cfg, _selected) = load_cfg(root, machine_override)?;
-    let path: PathBuf = cfg.control.join(name);
-    refuse_symlink(&path, "recovery journal")?;
-    let text = std::fs::read_to_string(&path).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            format!("missing recovery journal: {}", path.display())
-        } else {
-            format!("cannot read recovery journal {}: {error}", path.display())
-        }
-    })?;
-    let value: Value = serde_json::from_str(&text)
-        .map_err(|error| format!("recovery journal is malformed JSON: {error}"))?;
-    let raw = as_mapping(&value, "recovery journal")?;
+    raw: &Map<String, Value>,
+) -> Result<(String, String, String)> {
     if as_int(
         raw.get("schema").unwrap_or(&Value::Null),
         "recovery journal.schema",
@@ -2529,11 +2516,13 @@ pub(crate) fn parse_journal(
     {
         return Err("unsupported recovery journal schema".to_owned());
     }
-    let machine = as_str(
-        raw.get("machine").unwrap_or(&Value::Null),
-        "recovery journal.machine",
-    )?
-    .to_owned();
+    let machine = validate_name(
+        as_str(
+            raw.get("machine").unwrap_or(&Value::Null),
+            "recovery journal.machine",
+        )?,
+        "machine",
+    )?;
     let kind = as_str(
         raw.get("kind").unwrap_or(&Value::Null),
         "recovery journal.kind",
@@ -2635,24 +2624,783 @@ pub(crate) fn parse_journal(
             }
         }
         "ownerless-validate-remove" => {
-            ownerless_validate_shape(&cfg, raw, &machine)?;
+            ownerless_validate_shape(cfg, raw, &machine)?;
         }
         "recover-absent-validate-rows" => {
             absent_validate_shape(raw, &machine)?;
         }
         "ownerless-agent-remove" => {
-            ownerless_agent_shape(&cfg, raw, &machine)?;
+            ownerless_agent_shape(cfg, raw, &machine)?;
         }
         "ownerless-clone-remove" => {
-            ownerless_clone_shape(&cfg, raw, &machine)?;
+            ownerless_clone_shape(cfg, raw, &machine)?;
         }
         "ownerless-agent-cache-relocate" => {
-            ownerless_cache_shape(&cfg, raw, &machine)?;
+            ownerless_cache_shape(cfg, raw, &machine)?;
         }
         "recover-absent-agent-row" => {
             absent_agent_shape(raw, &machine)?;
         }
-        _ => return Err(format!("unsupported recovery journal kind {kind:?}")),
+        _ => return Err(format!("unsupported recovery journal kind '{kind}'")),
     }
-    Ok(Value::Object(raw.clone()))
+    Ok((machine, kind, slot))
+}
+
+/// Read and shape-validate one recovery journal in the control directory,
+/// printing it as stored.
+pub(crate) fn parse_journal(
+    root: Option<&Path>,
+    machine_override: Option<&str>,
+    name: &str,
+) -> Result<Value> {
+    if name.is_empty() || name.contains(['/', '\\']) || matches!(name, "." | "..") {
+        return Err("journal name must be a file name inside the control directory".to_owned());
+    }
+    let (cfg, _selected) = load_cfg(root, machine_override)?;
+    let path: PathBuf = cfg.control.join(name);
+    refuse_symlink(&path, "recovery journal")?;
+    let text = std::fs::read_to_string(&path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            format!("missing recovery journal: {}", path.display())
+        } else {
+            format!("cannot read recovery journal {}: {error}", path.display())
+        }
+    })?;
+    let value: Value = serde_json::from_str(&text)
+        .map_err(|error| format!("recovery journal is malformed JSON: {error}"))?;
+    let raw = as_mapping(&value, "recovery journal")?;
+    validate_journal_shape(&cfg, name, raw)?;
+    Ok(value)
+}
+
+// ---------------------------------------------------------------------
+// Provenance: shape-validated journals checked against the
+// append-only operation evidence, as `_validated_cache_journal`
+// and `_all_journal_cache_slots` do. A journal that fails here
+// refuses the whole audit, as in the oracle.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use crate::active_state::identity_to_obj;
+use crate::canonical::canonical_json;
+use crate::handoff_state::{read_regular_file_identity, strict_json_object};
+
+/// One outstanding recovery journal, validated against its
+/// append-only evidence.
+pub(crate) struct ValidatedJournal {
+    pub(crate) slot: String,
+    pub(crate) machine: String,
+    pub(crate) state: String,
+    /// The validated journal object; cache planning reads its
+    /// checkouts from here.
+    #[allow(dead_code)]
+    pub(crate) raw: Value,
+}
+
+fn journal_legacy_path(cfg: &Cfg, machine: &str) -> PathBuf {
+    cfg.control.join(format!("ACTIVE.{machine}.journal"))
+}
+
+fn journal_scoped_path(cfg: &Cfg, operation: &str, machine: &str, slot: &str) -> PathBuf {
+    cfg.control.join(format!(
+        "{operation}.{}.{}.{}.{}.journal",
+        machine.chars().count(),
+        machine,
+        slot.chars().count(),
+        slot
+    ))
+}
+
+fn json_equal(left: &Value, right: &Value) -> bool {
+    match (canonical_json(left), canonical_json(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+/// The path one append-only operation event claims for its
+/// journal, with the oracle's identity checks.
+fn operation_event_journal_path(
+    cfg: &Cfg,
+    machine: &str,
+    payload: &Map<String, Value>,
+    journal: Option<&Map<String, Value>>,
+) -> Result<PathBuf> {
+    let Some(raw_name) = payload.get("journal_path").filter(|value| !value.is_null()) else {
+        return Ok(journal_legacy_path(cfg, machine));
+    };
+    let name = as_str(raw_name, "append-only operation journal_path")?;
+    if name.contains('/') || name.ends_with('/') || matches!(name, "." | "..") {
+        return Err("append-only operation journal_path is not a filename".to_owned());
+    }
+    let operation = as_str(
+        payload.get("operation").unwrap_or(&Value::Null),
+        "append-only operation kind",
+    )?;
+    let slot = validate_name(
+        as_str(
+            payload.get("slot").unwrap_or(&Value::Null),
+            "append-only operation slot",
+        )?,
+        "slot",
+    )?;
+    let expected = if operation == "create" && name.starts_with("CREATE.") {
+        journal_scoped_path(cfg, "CREATE", machine, &slot)
+    } else if operation == "finish" && name.starts_with("FINISH.") {
+        journal_scoped_path(cfg, "FINISH", machine, &slot)
+    } else {
+        journal_legacy_path(cfg, machine)
+    };
+    let selected = cfg.control.join(name);
+    if selected != expected {
+        return Err(
+            "append-only operation journal_path does not match its operation identity".to_owned(),
+        );
+    }
+    if let Some(journal) = journal {
+        if journal.get("kind").and_then(Value::as_str) != Some(operation)
+            || journal.get("slot").and_then(Value::as_str) != Some(slot.as_str())
+            || journal.get("machine").and_then(Value::as_str) != Some(machine)
+        {
+            return Err(
+                "append-only operation event does not match its embedded journal".to_owned(),
+            );
+        }
+    }
+    Ok(selected)
+}
+
+/// Pending journal evidence from one machine's append-only log:
+/// progress records a journal, a matching completion clears it.
+fn pending_operations(
+    cfg: &Cfg,
+    machine: &str,
+    events: &[Value],
+) -> Result<BTreeMap<PathBuf, Map<String, Value>>> {
+    let mut pending: BTreeMap<PathBuf, Map<String, Value>> = BTreeMap::new();
+    for event in events {
+        let kind = as_str(
+            event.get("kind").unwrap_or(&Value::Null),
+            "append-only event.kind",
+        )?;
+        let payload = as_mapping(
+            event.get("payload").unwrap_or(&Value::Null),
+            "append-only event.payload",
+        )?;
+        if kind == "operation-progress-recorded" {
+            let journal = as_mapping(
+                payload.get("journal").unwrap_or(&Value::Null),
+                "append-only operation journal",
+            )?;
+            let path = operation_event_journal_path(cfg, machine, payload, Some(journal))?;
+            for (existing_path, existing) in &pending {
+                if *existing_path != path
+                    && existing.get("kind") == journal.get("kind")
+                    && existing.get("slot") == journal.get("slot")
+                {
+                    return Err(
+                        "append-only history has the same pending operation under multiple journal paths"
+                            .to_owned(),
+                    );
+                }
+            }
+            pending.insert(path, journal.clone());
+        } else if kind == "operation-completed" {
+            let path = operation_event_journal_path(cfg, machine, payload, None)?;
+            if let Some(current) = pending.get(&path) {
+                if payload.get("slot") == current.get("slot")
+                    && payload.get("operation") == current.get("kind")
+                {
+                    pending.remove(&path);
+                } else {
+                    return Err(
+                        "append-only completion does not match its pending operation".to_owned(),
+                    );
+                }
+            }
+        }
+    }
+    Ok(pending)
+}
+
+fn pending_journal_for_path(
+    cfg: &Cfg,
+    events_by_machine: &BTreeMap<String, Vec<Value>>,
+    path: &Path,
+) -> Result<Option<Map<String, Value>>> {
+    let mut matches: Vec<Map<String, Value>> = Vec::new();
+    for (machine, events) in events_by_machine {
+        let pending = pending_operations(cfg, machine, events)?;
+        if let Some(journal) = pending.get(path) {
+            matches.push(journal.clone());
+        }
+    }
+    if matches.len() > 1 {
+        return Err(format!(
+            "multiple append-only histories claim pending journal {}",
+            path.display()
+        ));
+    }
+    Ok(matches.into_iter().next())
+}
+
+fn scoped_operation_identity(journal: &Map<String, Value>, operation: &str) -> Option<String> {
+    let field = if operation == "finish" {
+        "fenced"
+    } else {
+        "operation_id"
+    };
+    journal
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+fn scoped_operation_opens(journal: &Map<String, Value>, operation: &str) -> bool {
+    if operation == "finish" {
+        journal.get("phase").and_then(Value::as_str) == Some("prepared")
+    } else {
+        journal
+            .get("created")
+            .is_some_and(|created| created.as_array().is_some_and(|items| items.is_empty()))
+            && journal.get("hook_progress").is_some_and(|value| {
+                matches!(value, Value::Bool(false)) || value.as_f64() == Some(0.0)
+            })
+    }
+}
+
+/// Whether a scoped journal's append-only episode completed,
+/// refusing any disagreement with that evidence.
+fn scoped_operation_completed(
+    cfg: &Cfg,
+    path: &Path,
+    raw: &Map<String, Value>,
+    operation: &str,
+    events: &[Value],
+) -> Result<bool> {
+    let label = format!("scoped {operation} journal");
+    let machine = as_str(
+        raw.get("machine").unwrap_or(&Value::Null),
+        &format!("{operation} journal.machine"),
+    )?;
+    validate_name(
+        as_str(
+            raw.get("slot").unwrap_or(&Value::Null),
+            &format!("{operation} journal.slot"),
+        )?,
+        "slot",
+    )?;
+    let mut recorded: Option<Map<String, Value>> = None;
+    let mut current: Option<String> = None;
+    let mut retired: BTreeSet<String> = BTreeSet::new();
+    let mut completed = false;
+    for event in events {
+        let kind = as_str(
+            event.get("kind").unwrap_or(&Value::Null),
+            "append-only event.kind",
+        )?;
+        if kind != "operation-progress-recorded" && kind != "operation-completed" {
+            continue;
+        }
+        let payload = as_mapping(
+            event.get("payload").unwrap_or(&Value::Null),
+            "append-only event.payload",
+        )?;
+        let journal = if kind == "operation-progress-recorded" {
+            Some(as_mapping(
+                payload.get("journal").unwrap_or(&Value::Null),
+                "append-only operation journal",
+            )?)
+        } else {
+            None
+        };
+        if operation_event_journal_path(cfg, machine, payload, journal)? != path {
+            continue;
+        }
+        if kind == "operation-progress-recorded" {
+            let journal = journal.expect("progress journal");
+            let identity = scoped_operation_identity(journal, operation);
+            if completed && (!scoped_operation_opens(journal, operation) || identity.is_none()) {
+                return Err(format!(
+                    "{label} path was reused after completion without a new operation"
+                ));
+            }
+            if let Some(identity) = &identity {
+                if retired.contains(identity) {
+                    return Err(format!(
+                        "{label} path was reopened with the identity of a completed operation"
+                    ));
+                }
+            }
+            if recorded.is_none() || completed {
+                current = identity;
+            } else if identity != current {
+                return Err(format!("{label} progress changed its operation identity"));
+            }
+            recorded = Some(journal.clone());
+            completed = false;
+        } else {
+            if recorded.is_none() {
+                return Err(format!(
+                    "scoped {operation} completion has no preceding progress evidence"
+                ));
+            }
+            if let Some(identity) = current.take() {
+                retired.insert(identity);
+            }
+            completed = true;
+        }
+    }
+    let Some(recorded) = recorded else {
+        return Err(format!(
+            "{label} has no matching append-only progress evidence"
+        ));
+    };
+    if !json_equal(&Value::Object(raw.clone()), &Value::Object(recorded)) {
+        return Err(format!(
+            "{label} differs from append-only progress evidence"
+        ));
+    }
+    Ok(completed)
+}
+
+/// The exact ACTIVE row a completed scoped create produced.
+fn completed_create_expected(config: &Value, raw: &Map<String, Value>) -> Result<Value> {
+    let machine = as_str(
+        raw.get("machine").unwrap_or(&Value::Null),
+        "create journal.machine",
+    )?
+    .to_owned();
+    let slot = validate_name(
+        as_str(
+            raw.get("slot").unwrap_or(&Value::Null),
+            "create journal.slot",
+        )?,
+        "slot",
+    )?;
+    let agent = validate_name(
+        as_str(
+            raw.get("agent").unwrap_or(&Value::Null),
+            "create journal.agent",
+        )?,
+        "agent",
+    )?;
+    let default_slot_type = Value::String("agent".to_owned());
+    let slot_type = as_str(
+        raw.get("slot_type").unwrap_or(&default_slot_type),
+        "create journal.slot_type",
+    )?;
+    if !matches!(slot_type, "agent" | "validate") {
+        return Err("create journal has an invalid slot type".to_owned());
+    }
+    let planned = as_list(
+        raw.get("planned").unwrap_or(&Value::Null),
+        "create journal.planned",
+    )?;
+    let created = as_list(
+        raw.get("created").unwrap_or(&Value::Null),
+        "create journal.created",
+    )?;
+    for (index, item) in planned.iter().enumerate() {
+        planned_from_obj(item, &format!("create journal.planned[{index}]"))?;
+    }
+    for (index, item) in created.iter().enumerate() {
+        checkout_from_obj(item, &format!("create journal.created[{index}]"))?;
+    }
+    if created.len() != planned.len() {
+        return Err("completed create journal has an incomplete checkout plan".to_owned());
+    }
+    for (plan, checkout) in planned.iter().zip(created.iter()) {
+        let plan = as_mapping(plan, "create journal.planned")?;
+        let checkout = as_mapping(checkout, "create journal.created")?;
+        let fields = |map: &Map<String, Value>, keys: &[&str]| -> Vec<String> {
+            keys.iter()
+                .map(|key| {
+                    map.get(*key)
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned()
+                })
+                .collect()
+        };
+        let checkout_fields = fields(
+            checkout,
+            &[
+                "name",
+                "path",
+                "repository",
+                "branch",
+                "start_point",
+                "remote",
+                "remote_url_sha256",
+                "landed_ref",
+                "head",
+            ],
+        );
+        let plan_fields = fields(
+            plan,
+            &[
+                "name",
+                "destination",
+                "repository",
+                "branch",
+                "start_point",
+                "remote",
+                "remote_url_sha256",
+                "landed_ref",
+                "start_point",
+            ],
+        );
+        if checkout_fields != plan_fields {
+            return Err("completed create journal differs from its checkout plan".to_owned());
+        }
+    }
+    let mut hooks: Vec<String> = Vec::new();
+    for (index, item) in as_list(
+        raw.get("post_provision_hooks")
+            .unwrap_or(&Value::Array(Vec::new())),
+        "create journal.post_provision_hooks",
+    )?
+    .iter()
+    .enumerate()
+    {
+        let hook = as_str(
+            item,
+            &format!("create journal.post_provision_hooks[{index}]"),
+        )?;
+        validate_hook(hook)?;
+        hooks.push(hook.to_owned());
+    }
+    let config_hooks: Vec<String> = config
+        .get("post_provision_hooks")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    if hooks != config_hooks {
+        return Err("create journal post-provision hooks differ from configuration".to_owned());
+    }
+    let hook_progress = as_int(
+        raw.get("hook_progress").unwrap_or(&Value::from(0)),
+        "create journal.hook_progress",
+        0,
+    )?;
+    if hook_progress != (planned.len() * hooks.len()) as i64
+        || !raw.get("hook_failure").is_none_or(Value::is_null)
+    {
+        return Err("completed create journal has unfinished post-provision hooks".to_owned());
+    }
+    let heartbeat_ttl = as_int(
+        raw.get("heartbeat_ttl_seconds").unwrap_or(&Value::Null),
+        "create journal.heartbeat_ttl_seconds",
+        1,
+    )?;
+    let config_ttl = config
+        .get("heartbeat_ttl_seconds")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    if heartbeat_ttl != config_ttl {
+        return Err("create journal heartbeat TTL differs from configuration".to_owned());
+    }
+    let owner = identity_from_obj(
+        raw.get("owner").unwrap_or(&Value::Null),
+        "create journal.owner",
+    )?;
+    let task_scope = if raw.contains_key("task_scope") {
+        Some(scope_from_obj(
+            raw.get("task_scope").unwrap_or(&Value::Null),
+            "create journal.task_scope",
+        )?)
+    } else {
+        None
+    };
+    if let Some(scope) = &task_scope {
+        let Some(owner) = &owner else {
+            return Err("create journal.task_scope has no bound owner process".to_owned());
+        };
+        if scope.leader_pid != owner.pid
+            || scope.leader_start_ticks != owner.start_ticks
+            || scope.boot_id != owner.boot_id
+            || scope.cgroup_path != owner.cgroup_path
+        {
+            return Err(
+                "create journal.task_scope does not match its bound owner process".to_owned(),
+            );
+        }
+    }
+    let coordinator = identity_from_obj(
+        raw.get("coordinator_lease").unwrap_or(&Value::Null),
+        "create journal.coordinator_lease",
+    )?;
+    if coordinator.is_none() {
+        return Err("create journal has no coordinator lease".to_owned());
+    }
+    let created_at = as_str(
+        raw.get("created_at").unwrap_or(&Value::Null),
+        "create journal.created_at",
+    )?;
+    parse_timestamp(created_at, "create journal.created_at")?;
+    let heartbeat_at = as_str(
+        raw.get("heartbeat_at").unwrap_or(&Value::Null),
+        "create journal.heartbeat_at",
+    )?;
+    parse_timestamp(heartbeat_at, "create journal.heartbeat_at")?;
+    let task = as_str(
+        raw.get("task").unwrap_or(&Value::Null),
+        "create journal.task",
+    )?;
+    let purpose = as_str(
+        raw.get("purpose").unwrap_or(&Value::Null),
+        "create journal.purpose",
+    )?;
+    if task.is_empty() || purpose.is_empty() {
+        return Err("create journal has an empty task or purpose".to_owned());
+    }
+    let mut checkouts: Vec<Value> = Vec::new();
+    for item in created {
+        let checkout = as_mapping(item, "create journal.created")?;
+        let mut object = Map::new();
+        for key in [
+            "name",
+            "path",
+            "repository",
+            "branch",
+            "start_point",
+            "remote",
+            "remote_url_sha256",
+            "landed_ref",
+            "head",
+            "containing_remote_refs",
+            "vcs",
+        ] {
+            object.insert(
+                key.to_owned(),
+                checkout.get(key).cloned().unwrap_or(Value::Null),
+            );
+        }
+        checkouts.push(Value::Object(object));
+    }
+    let mut expected = serde_json::json!({
+        "slot": slot,
+        "agent": agent,
+        "task": task,
+        "purpose": purpose,
+        "slot_type": slot_type,
+        "machine": machine,
+        "generation": 1,
+        "created_at": created_at,
+        "heartbeat_at": heartbeat_at,
+        "heartbeat_ttl_seconds": heartbeat_ttl,
+        "owner": identity_to_obj(&owner),
+        "coordinator_lease": identity_to_obj(&coordinator),
+        "coordinator_recovery_note": Value::Null,
+        "handoff": Value::Null,
+        "checkouts": checkouts,
+    });
+    if task_scope.is_some() {
+        expected.as_object_mut().expect("record object").insert(
+            "task_scope".to_owned(),
+            raw.get("task_scope").cloned().unwrap_or(Value::Null),
+        );
+    }
+    Ok(expected)
+}
+
+fn scoped_create_completed(
+    cfg: &Cfg,
+    config: &Value,
+    path: &Path,
+    raw: &Map<String, Value>,
+    events_by_machine: &BTreeMap<String, Vec<Value>>,
+    records: &[Value],
+) -> Result<()> {
+    let machine = as_str(
+        raw.get("machine").unwrap_or(&Value::Null),
+        "create journal.machine",
+    )?
+    .to_owned();
+    let slot = validate_name(
+        as_str(
+            raw.get("slot").unwrap_or(&Value::Null),
+            "create journal.slot",
+        )?,
+        "slot",
+    )?;
+    if path != journal_scoped_path(cfg, "CREATE", &machine, &slot) {
+        return Err("scoped create journal filename does not match its target".to_owned());
+    }
+    let events = events_by_machine
+        .get(&machine)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    if !scoped_operation_completed(cfg, path, raw, "create", events)? {
+        return Ok(());
+    }
+    let expected = completed_create_expected(config, raw)?;
+    let matches: Vec<&Value> = records
+        .iter()
+        .filter(|record| {
+            record.get("machine").and_then(Value::as_str) == Some(machine.as_str())
+                && record.get("slot").and_then(Value::as_str) == Some(slot.as_str())
+        })
+        .collect();
+    if matches.len() != 1 {
+        return Err("completed scoped create journal has no exact durable ACTIVE row".to_owned());
+    }
+    let actual = crate::active_state::record_from_obj(matches[0], "active record")?;
+    if !json_equal(&expected, &actual.normalized) {
+        return Err("completed scoped create journal has no exact durable ACTIVE row".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_journal_provenance(
+    cfg: &Cfg,
+    config: &Value,
+    path: &Path,
+    raw: &Map<String, Value>,
+    events_by_machine: &BTreeMap<String, Vec<Value>>,
+    records: &[Value],
+) -> Result<()> {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let (machine, kind, _slot) = validate_journal_shape(cfg, &name, raw)?;
+    if path == journal_legacy_path(cfg, &machine) {
+        if let Some(pending) = pending_journal_for_path(cfg, events_by_machine, path)? {
+            if !json_equal(&Value::Object(raw.clone()), &Value::Object(pending)) {
+                return Err(
+                    "standalone recovery journal differs from append-only operation evidence"
+                        .to_owned(),
+                );
+            }
+        }
+        return Ok(());
+    }
+    match kind.as_str() {
+        "create" => scoped_create_completed(cfg, config, path, raw, events_by_machine, records),
+        "finish" => {
+            let slot = validate_name(
+                as_str(
+                    raw.get("slot").unwrap_or(&Value::Null),
+                    "finish journal.slot",
+                )?,
+                "slot",
+            )?;
+            if path != journal_scoped_path(cfg, "FINISH", &machine, &slot) {
+                return Err("scoped finish journal filename does not match its target".to_owned());
+            }
+            let events = events_by_machine
+                .get(&machine)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            scoped_operation_completed(cfg, path, raw, "finish", events)?;
+            Ok(())
+        }
+        _ => Err("only create and finish journals may use a scoped journal path".to_owned()),
+    }
+}
+
+/// Every outstanding journal in the registry, shape- and
+/// provenance-validated, keyed by slot.
+pub(crate) fn validated_journals(
+    cfg: &Cfg,
+    config: &Value,
+    events_by_machine: &BTreeMap<String, Vec<Value>>,
+    records: &[Value],
+) -> Result<BTreeMap<String, ValidatedJournal>> {
+    let mut paths: BTreeSet<PathBuf> = BTreeSet::new();
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        let listing = std::fs::read_dir(&cfg.control).map_err(|error| {
+            format!(
+                "cannot list control directory {}: {error}",
+                cfg.control.display()
+            )
+        })?;
+        for entry in listing {
+            let entry = entry.map_err(|error| format!("cannot list control directory: {error}"))?;
+            let bytes = entry.file_name();
+            let bytes = bytes.as_bytes();
+            if (bytes.starts_with(b"ACTIVE.")
+                || bytes.starts_with(b"CREATE.")
+                || bytes.starts_with(b"FINISH."))
+                && bytes.ends_with(b".journal")
+            {
+                paths.insert(entry.path());
+            }
+        }
+    }
+    for (machine, events) in events_by_machine {
+        for path in pending_operations(cfg, machine, events)?.into_keys() {
+            paths.insert(path);
+        }
+    }
+    // Validate every journal first; duplicates are detected
+    // only after all of them pass, as in the oracle.
+    let mut validated: Vec<(String, String, String, Map<String, Value>)> = Vec::new();
+    for path in &paths {
+        let raw = if path.symlink_metadata().is_ok() {
+            let (contents, _identity) =
+                read_regular_file_identity(path, "cache recovery journal", 16 * 1024 * 1024)?;
+            strict_json_object(&contents, "cache recovery journal")?
+        } else {
+            match pending_journal_for_path(cfg, events_by_machine, path)? {
+                Some(journal) => journal,
+                None => {
+                    return Err(format!(
+                        "journal has neither standalone nor append-only evidence: {}",
+                        path.display()
+                    ));
+                }
+            }
+        };
+        validate_journal_provenance(cfg, config, path, &raw, events_by_machine, records)?;
+        let machine = as_str(
+            raw.get("machine").unwrap_or(&Value::Null),
+            "recovery journal.machine",
+        )?
+        .to_owned();
+        let kind = as_str(
+            raw.get("kind").unwrap_or(&Value::Null),
+            "recovery journal.kind",
+        )?
+        .to_owned();
+        if !matches!(kind.as_str(), "create" | "import-existing" | "finish") {
+            return Err(format!("unsupported cache recovery journal kind '{kind}'"));
+        }
+        let slot = validate_name(
+            as_str(
+                raw.get("slot").unwrap_or(&Value::Null),
+                "recovery journal.slot",
+            )?,
+            "slot",
+        )?;
+        validated.push((slot, machine, kind, raw));
+    }
+    let mut journals: BTreeMap<String, ValidatedJournal> = BTreeMap::new();
+    let mut machines_by_slot: BTreeMap<String, String> = BTreeMap::new();
+    for (slot, machine, kind, raw) in validated {
+        if let Some(previous) = machines_by_slot.get(&slot) {
+            return Err(format!(
+                "slot '{slot}' has recovery journals on both {previous} and {machine}"
+            ));
+        }
+        machines_by_slot.insert(slot.clone(), machine.clone());
+        journals.insert(
+            slot.clone(),
+            ValidatedJournal {
+                slot,
+                machine,
+                state: format!("{kind}-journal"),
+                raw: Value::Object(raw),
+            },
+        );
+    }
+    Ok(journals)
 }

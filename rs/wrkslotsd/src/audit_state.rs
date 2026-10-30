@@ -40,62 +40,7 @@ use crate::status_state::process_state;
 
 type Result<T> = std::result::Result<T, String>;
 
-struct JournalSlot {
-    slot: String,
-    machine: String,
-    state: String,
-}
-
-fn journal_slots(cfg: &Cfg) -> Result<BTreeMap<String, JournalSlot>> {
-    let mut found: BTreeMap<String, JournalSlot> = BTreeMap::new();
-    let entries = std::fs::read_dir(&cfg.control).map_err(|error| {
-        format!(
-            "cannot list control directory {}: {error}",
-            cfg.control.display()
-        )
-    })?;
-    for entry in entries {
-        let entry = entry.map_err(|error| format!("cannot list control directory: {error}"))?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let machine = ["ACTIVE.", "CREATE.", "FINISH."].iter().find_map(|prefix| {
-            name.strip_prefix(prefix)
-                .and_then(|rest| rest.strip_suffix(".journal"))
-        });
-        let Some(machine) = machine else { continue };
-        if machine.is_empty() {
-            continue;
-        }
-        let text = std::fs::read_to_string(entry.path())
-            .map_err(|error| format!("cannot read recovery journal {name}: {error}"))?;
-        let raw: Value = serde_json::from_str(&text)
-            .map_err(|error| format!("recovery journal {name} is malformed JSON: {error}"))?;
-        let kind = raw.get("kind").and_then(Value::as_str).unwrap_or_default();
-        if !matches!(kind, "create" | "finish" | "import-existing") {
-            continue;
-        }
-        let slot = raw
-            .get("slot")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        validate_name(&slot, "slot")?;
-        if let Some(previous) = found.get(&slot) {
-            return Err(format!(
-                "slot '{slot}' has recovery journals on both {} and {machine}",
-                previous.machine
-            ));
-        }
-        found.insert(
-            slot.clone(),
-            JournalSlot {
-                slot,
-                machine: machine.to_string(),
-                state: format!("{kind}-journal"),
-            },
-        );
-    }
-    Ok(found)
-}
+use crate::journal_state::{validated_journals, ValidatedJournal};
 
 /// The latest owner release for one generation and why it is void,
 /// mirroring `_owner_release_state` / `_owner_release_void_reason`.
@@ -2139,7 +2084,7 @@ fn heartbeat_diagnosis(record: &Value) -> Result<(i64, bool)> {
 /// Git registrations block it too.
 fn apply_overrides(
     row: &mut Value,
-    journals: &BTreeMap<String, JournalSlot>,
+    journals: &BTreeMap<String, ValidatedJournal>,
     strays: &BTreeMap<(String, String), Vec<String>>,
     slot: &str,
     slot_type: &str,
@@ -3586,7 +3531,7 @@ fn audit_record(
     config: &Value,
     record: &Value,
     events: &[Value],
-    journals: &BTreeMap<String, JournalSlot>,
+    journals: &BTreeMap<String, ValidatedJournal>,
     strays: &BTreeMap<(String, String), Vec<String>>,
     sealed_generation: Option<i64>,
     validation_paths: &[PathBuf],
@@ -4094,7 +4039,6 @@ pub(crate) fn parse_audit(
     let config = load_config(root, machine_override)?;
     refuse_partial_state_allow_seals(&cfg.control)?;
     validate_global(root, &cfg)?;
-    let journals = journal_slots(&cfg)?;
     let machines = discover_machines(&cfg.control)?;
     let mut records: Vec<Value> = Vec::new();
     let mut shard_revisions: Vec<(String, i64)> = Vec::new();
@@ -4119,6 +4063,7 @@ pub(crate) fn parse_audit(
         };
         events_by_machine.insert(machine.clone(), events);
     }
+    let journals = validated_journals(&cfg, &config, &events_by_machine, &records)?;
     let (seal_targets, seal_errors) = seal_evidence(&cfg);
     let mut seal_by_slot: BTreeMap<(String, String), (i64, PathBuf)> = BTreeMap::new();
     for target in &seal_targets {

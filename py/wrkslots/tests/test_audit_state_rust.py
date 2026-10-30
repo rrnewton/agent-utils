@@ -1003,3 +1003,142 @@ def test_audit_journal_row_matches_python(tmp_path: Path) -> None:
     by_slot = {str(row["slot"]): row for row in _rows(actual)}
     assert by_slot["slot-j"]["verdict"] == "BLOCKED"
     assert by_slot["slot-j"]["owner_state"] == "create-journal"
+
+
+_SCOPED_CREATE_NAME = "CREATE.6.node-a.6.slot-j.journal"
+
+
+def _scoped_create_journal(base: Path) -> dict[str, object]:
+    head = _git(base / "upstream-repo", "rev-parse", "HEAD").strip()
+    return {
+        "schema": 2,
+        "kind": "create",
+        "machine": "node-a",
+        "slot": "slot-j",
+        "agent": "agent-j",
+        "task": "scoped work",
+        "purpose": "testing",
+        "created_at": "2026-10-26T00:00:00Z",
+        "heartbeat_at": "2026-10-26T01:00:00Z",
+        "planned": [
+            {
+                "name": "repo",
+                "destination": "worktrees/slot-j/repo",
+                "repository": "../upstream-repo",
+                "branch": "suite/j",
+                "start_point": head,
+                "remote": "origin",
+                "remote_url_sha256": "0" * 64,
+                "landed_ref": "refs/remotes/origin/main",
+            }
+        ],
+        "created": [],
+        "post_provision_hooks": [],
+        "heartbeat_ttl_seconds": 60,
+        "owner": None,
+        "coordinator_lease": {
+            "pid": 4242,
+            "start_ticks": 100,
+            "boot_id": "boot-1",
+            "host_id": "host-a",
+            "cgroup_path": "/init.scope",
+        },
+    }
+
+
+def _append_event(root: Path, kind: str, payload: dict[str, object]) -> None:
+    config = wrkslots_cli._load_config(str(root), None)
+    wrkslots_cli._ensure_event_log(config, "node-a")
+    wrkslots_cli._write_event_file(config, "node-a", kind, payload)
+
+
+def _python_refusal(root: Path, tmp_path: Path) -> str:
+    with pytest.raises(Exception) as caught:
+        _python(root, tmp_path)
+    return str(caught.value)
+
+
+def test_audit_scoped_journal_without_evidence_refuses(
+    tmp_path: Path,
+) -> None:
+    root = _fixture(tmp_path)
+    (root / "worktrees" / _SCOPED_CREATE_NAME).write_text(
+        json.dumps(_scoped_create_journal(tmp_path))
+    )
+    message = "scoped create journal has no matching append-only progress evidence"
+    assert message in _python_refusal(root, tmp_path)
+    result = _rust(root, census_state=tmp_path / "rust-census.json")
+    assert result.returncode != 0
+    assert message in result.stderr
+
+
+def test_audit_scoped_journal_with_progress_matches_python(
+    tmp_path: Path,
+) -> None:
+    root = _fixture(tmp_path)
+    journal = _scoped_create_journal(tmp_path)
+    (root / "worktrees" / _SCOPED_CREATE_NAME).write_text(json.dumps(journal))
+    _append_event(
+        root,
+        "operation-progress-recorded",
+        {
+            "operation": "create",
+            "slot": "slot-j",
+            "journal_path": _SCOPED_CREATE_NAME,
+            "journal": journal,
+        },
+    )
+    actual = _check(root, tmp_path)
+    by_slot = {str(row["slot"]): row for row in _rows(actual)}
+    assert by_slot["slot-j"]["verdict"] == "BLOCKED"
+    assert by_slot["slot-j"]["owner_state"] == "create-journal"
+
+
+def test_audit_scoped_journal_differs_from_evidence_refuses(
+    tmp_path: Path,
+) -> None:
+    root = _fixture(tmp_path)
+    journal = _scoped_create_journal(tmp_path)
+    (root / "worktrees" / _SCOPED_CREATE_NAME).write_text(json.dumps(journal))
+    recorded = _scoped_create_journal(tmp_path)
+    recorded["task"] = "other work"
+    _append_event(
+        root,
+        "operation-progress-recorded",
+        {
+            "operation": "create",
+            "slot": "slot-j",
+            "journal_path": _SCOPED_CREATE_NAME,
+            "journal": recorded,
+        },
+    )
+    message = "scoped create journal differs from append-only progress evidence"
+    assert message in _python_refusal(root, tmp_path)
+    result = _rust(root, census_state=tmp_path / "rust-census.json")
+    assert result.returncode != 0
+    assert message in result.stderr
+
+
+def test_audit_legacy_journal_differs_from_evidence_refuses(
+    tmp_path: Path,
+) -> None:
+    root = _fixture(tmp_path)
+    journal = _scoped_create_journal(tmp_path)
+    (root / "worktrees" / "ACTIVE.node-a.journal").write_text(
+        json.dumps(journal)
+    )
+    recorded = _scoped_create_journal(tmp_path)
+    recorded["task"] = "other work"
+    _append_event(
+        root,
+        "operation-progress-recorded",
+        {"journal": recorded},
+    )
+    message = (
+        "standalone recovery journal differs from "
+        "append-only operation evidence"
+    )
+    assert message in _python_refusal(root, tmp_path)
+    result = _rust(root, census_state=tmp_path / "rust-census.json")
+    assert result.returncode != 0
+    assert message in result.stderr

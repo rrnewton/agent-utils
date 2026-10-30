@@ -196,6 +196,19 @@ pub(crate) fn validate_ref(value: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn identity_to_obj(identity: &Option<Identity>) -> Value {
+    match identity {
+        None => Value::Null,
+        Some(identity) => serde_json::json!({
+            "pid": identity.pid,
+            "start_ticks": identity.start_ticks,
+            "boot_id": identity.boot_id,
+            "host_id": identity.host_id,
+            "cgroup_path": identity.cgroup_path,
+        }),
+    }
+}
+
 pub(crate) fn identity_from_obj(value: &Value, label: &str) -> Result<Option<Identity>> {
     if value.is_null() {
         return Ok(None);
