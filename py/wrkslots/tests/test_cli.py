@@ -1059,17 +1059,40 @@ def test_image_status_reports_apparent_size_allocation_and_the_actual_mount_sepa
         mounted.append((image_file, mount_point))
         return "kernel" if image_file == image.slot_image else None
 
+    # The mounted file system's figures come from one fixed observation, not the live
+    # host file system, whose free space moves between any two reads. Every field
+    # differs from every other, so reading the wrong field cannot give the right number.
+    observed: list[str] = []
+    fixed = os.statvfs_result((
+        4096,     # f_bsize
+        1024,     # f_frsize: the unit every byte figure is counted in
+        1000003,  # f_blocks
+        400009,   # f_bfree
+        300007,   # f_bavail
+        70001,    # f_files
+        20011,    # f_ffree
+        20003,    # f_favail
+        0,        # f_flag
+        255,      # f_namemax
+    ))
+
+    def statvfs(path: str | os.PathLike[str]) -> os.statvfs_result:
+        observed.append(os.fspath(path))
+        return fixed
+
     monkeypatch.setattr(slotimage, "mount_table", lambda mountinfo=None: [])
     monkeypatch.setattr(slotimage, "mounted_backend", backend)
+    monkeypatch.setattr(os, "statvfs", statvfs)  # slotimage reads os.statvfs at call time
 
     report = slotimage.usage(image)
 
     # Each image is judged against its own mount point, never another path.
     assert mounted == [(image.slot_image, image.location), (image.state_image, image.state_mount)]
+    # Only the mounted image's own mount point is measured, and only once.
+    assert observed == [str(image.location)]
     assert report["name"] == "s1" and report["slot_type"] == "agent"
     assert report["location"] == str(image.location) and report["phase"] == "ready"
     slot_stat = os.stat(image.slot_image)
-    vfs = os.statvfs(image.location)
     slot = report["slot"]
     assert isinstance(slot, dict)
     assert slot["image"] == str(image.slot_image)
@@ -1077,8 +1100,10 @@ def test_image_status_reports_apparent_size_allocation_and_the_actual_mount_sepa
     assert slot["host_allocated_bytes"] == slot_stat.st_blocks * 512  # B_alloc
     assert int(str(slot["host_allocated_bytes"])) < 3 * GIB
     assert slot["mounted"] is True and slot["backend"] == "kernel"
-    assert slot["free_bytes"] == vfs.f_bavail * vfs.f_frsize  # F
-    assert slot["used_bytes"] == (vfs.f_blocks - vfs.f_bfree) * vfs.f_frsize  # U
+    assert slot["free_bytes"] == 300007 * 1024 == 307207168  # F: f_bavail * f_frsize
+    # U: (f_blocks - f_bfree) * f_frsize
+    assert slot["used_bytes"] == (1000003 - 400009) * 1024 == 614393856
+    assert slot["used_inodes"] == 70001 - 20011 == 49990  # f_files - f_ffree
     assert set(slot) == {
         "image", "ceiling_bytes", "host_allocated_bytes", "mounted", "backend",
         "used_bytes", "free_bytes", "used_inodes",
