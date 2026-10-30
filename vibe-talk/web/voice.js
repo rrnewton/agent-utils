@@ -129,19 +129,20 @@ const COLUMN_IDS = {
  * `fromCards` says the thread the right column shows was entered from its card, so that ← goes back
  * out to the cards (`#277 thread-card-focus`, `enterCard`).
  *
- * `older` is the column's own record of its older pages (`freshOlderPages`, `olderPages`; `#624
- * voice-page-modularity`, plan step 15), a field group kept on the column rather than in `state`.
+ * `older` and `arrows` are the column's own records of its older pages (`freshOlderPages`, `olderPages`)
+ * and its reply arrows (`freshReplyArrows`, `replyArrows`; `#624 voice-page-modularity`, plan step
+ * 15): field groups kept on the column rather than in `state`.
  *
  * @typedef {{matched: number, loaded: number, tally: any, pinned: boolean}} SearchCount
  * @typedef {{name: string, state: unknown[] | null, searched: SearchCount | null,
  *   searchWalk: any, searchNote: {key: string, text: string} | null,
- *   older: ReturnType<typeof freshOlderPages>}} ColumnFields
+ *   older: ReturnType<typeof freshOlderPages>, arrows: ReturnType<typeof freshReplyArrows>}} ColumnFields
  * @type {{main: ColumnFields, side: ColumnFields & {mode: "list" | "thread", fromCards: boolean}}}
  */
 const columns = {
-  main: { name: "main", state: null, searched: null, searchWalk: null, searchNote: null, older: freshOlderPages() },
+  main: { name: "main", state: null, searched: null, searchWalk: null, searchNote: null, older: freshOlderPages(), arrows: freshReplyArrows() },
   side: { name: "side", state: null, searched: null, searchWalk: null, searchNote: null, mode: "list", fromCards: false,
-    older: freshOlderPages() },
+    older: freshOlderPages(), arrows: freshReplyArrows() },
 };
 /** The column the code is working on now. The left one, except inside `inColumn`. */
 let activeColumn = columns.main;
@@ -19919,9 +19920,9 @@ function onVisibility() {
   // `#226 page-energy-profile`. What the stream delivered while the page was hidden is drawn now,
   // from the store, and the arrows a hidden page did not measure are measured.
   const owed = catchUpHiddenArrivals();
-  if (replyArrowsOwed) measureReplyArrows();
+  if (replyArrows().owed) measureReplyArrows();
   inOtherColumn(() => {
-    if (replyArrowsOwed) measureReplyArrows();
+    if (replyArrows().owed) measureReplyArrows();
   });
   const resume = liveResumeAfterHidden;
   liveResumeAfterHidden = null;
@@ -33134,11 +33135,27 @@ const REPLY_JUMP_NAME = "Jump to the message this answers";
 /** Every tap on an arrow takes a ticket, and a walk whose ticket has moved on stops where it is. */
 let replyJumpTicket = 0;
 
+/**
+ * A column's own record of its reply arrows and jumps (`#624 voice-page-modularity`, plan step 15, as
+ * `freshOlderPages`): `back`, `landed`, `tap` and `settling` below; `held` and `owed`, the arrows'
+ * measuring held through a redraw (`holdReplyArrows`); `countsDrawn`, whether any Reply says a count.
+ *
+ * @returns {{back: any, landed: any, tap: any, settling: any, held: number, owed: boolean, countsDrawn: boolean}}
+ */
+function freshReplyArrows() {
+  return { back: null, landed: null, tap: null, settling: null, held: 0, owed: false, countsDrawn: false };
+}
+
+/** The column being worked on's record of its reply arrows (`freshReplyArrows`). */
+function replyArrows() {
+  return activeColumn.arrows;
+}
+
 /** The reply the last jump left, as `{ id, context }`, while "Back to reply" is offered; else null. */
-let replyReturn = null;
+// Kept per column: `replyArrows().back` (`freshReplyArrows`, `#624 voice-page-modularity`).
 
 /** The row lit by the last landing, and the timer that puts it out. */
-let replyLanded = null;
+// Kept per column: `replyArrows().landed` (`freshReplyArrows`, `#624 voice-page-modularity`).
 
 /**
  * How long a tap on a reply's arrow waits to learn whether a second tap follows, in milliseconds.
@@ -33155,7 +33172,7 @@ let replyLanded = null;
 const REPLY_DOUBLE_TAP_MS = 250;
 
 /** The first tap on an arrow, waiting for a possible second, as `{ arrow, jump, timer }`; else null. */
-let replyArrowTap = null;
+// Kept per column: `replyArrows().tap` (`freshReplyArrows`, `#624 voice-page-modularity`).
 
 /**
  * The timer of the moment after two taps on an arrow gathered, while taps on an arrow or on the X are
@@ -33164,12 +33181,12 @@ let replyArrowTap = null;
  * just changed what is under the finger: on the X that has appeared in the gutter, which would put
  * the replies straight back, or on an arrow, which would wait and then jump away from them.
  */
-let replyTapsSettling = null;
+// Kept per column: `replyArrows().settling` (`freshReplyArrows`, `#624 voice-page-modularity`).
 
 /** Forget a tap on an arrow still waiting to jump: the list it would have jumped in is going. */
 function dropReplyArrowTap() {
-  if (replyArrowTap) clearTimeout(replyArrowTap.timer);
-  replyArrowTap = null;
+  if (replyArrows().tap) clearTimeout(replyArrows().tap.timer);
+  replyArrows().tap = null;
 }
 
 /**
@@ -33177,7 +33194,7 @@ function dropReplyArrowTap() {
  *
  * One tap jumps to the message the reply answers; two, within `REPLY_DOUBLE_TAP_MS`, gather the
  * conversation the reply is in under its first message (`#215 reply-coalesce`, `conversationHead`),
- * and a third that soon after is ignored (`replyTapsSettling`). Counted from the clicks themselves
+ * and a third that soon after is ignored (`replyArrows().settling`). Counted from the clicks themselves
  * rather than from `dblclick`, which a phone does not reliably send for two taps — and a keyboard's
  * Enter, pressed twice, is two clicks as well.
  */
@@ -33207,21 +33224,21 @@ function replyArrow(li) {
     // The row's own tap handler would fold the row, or start reading it aloud in reading mode. It
     // already ignores a click on a button, and this does not rely on that: the click ends here.
     if (event) event.stopPropagation();
-    if (replyTapsSettling !== null) return;
-    if (replyArrowTap && replyArrowTap.arrow === arrow) {
+    if (replyArrows().settling !== null) return;
+    if (replyArrows().tap && replyArrows().tap.arrow === arrow) {
       dropReplyArrowTap();
-      replyTapsSettling = setTimeout(inThisColumn(() => {
-        replyTapsSettling = null;
+      replyArrows().settling = setTimeout(inThisColumn(() => {
+        replyArrows().settling = null;
       }), REPLY_DOUBLE_TAP_MS);
       guardQuietly(() => gatherFromReply(li))();
       return;
     }
     // A first tap on ANOTHER arrow still waiting is that arrow's single tap, and it is taken now:
     // the reader has moved on to this one, and dropping it would be a tap that did nothing.
-    if (replyArrowTap) {
-      const waiting = replyArrowTap;
+    if (replyArrows().tap) {
+      const waiting = replyArrows().tap;
       clearTimeout(waiting.timer);
-      replyArrowTap = null;
+      replyArrows().tap = null;
       waiting.jump();
     }
     // Both bound to this column: the wait ends in a later task. `#229 desktop-two-column`.
@@ -33229,11 +33246,11 @@ function replyArrow(li) {
       arrow,
       jump: inThisColumn(() => guardQuietly(() => jumpToAnswered(li))()),
       timer: setTimeout(inThisColumn(() => {
-        if (replyArrowTap === tap) replyArrowTap = null;
+        if (replyArrows().tap === tap) replyArrows().tap = null;
         tap.jump();
       }), REPLY_DOUBLE_TAP_MS),
     };
-    replyArrowTap = tap;
+    replyArrows().tap = tap;
   }));
   return arrow;
 }
@@ -33326,19 +33343,19 @@ function revealRow(row, center = false) {
   const height = row.getBoundingClientRect().bottom - drawnTop(row);
   const lead = center ? Math.max(clear, (clear + area.getBoundingClientRect().bottom - height) / 2) : clear;
   area.scrollTop += drawnTop(row) - lead;
-  if (replyLanded) {
-    clearTimeout(replyLanded.timer);
-    replyLanded.row.removeAttribute("data-landed");
+  if (replyArrows().landed) {
+    clearTimeout(replyArrows().landed.timer);
+    replyArrows().landed.row.removeAttribute("data-landed");
   }
   row.setAttribute("data-landed", "true");
   const landed = {
     row,
     timer: setTimeout(inThisColumn(() => {
       row.removeAttribute("data-landed");
-      if (replyLanded === landed) replyLanded = null;
+      if (replyArrows().landed === landed) replyArrows().landed = null;
     }), REPLY_LANDED_MS),
   };
-  replyLanded = landed;
+  replyArrows().landed = landed;
   // `#239 single-selection`. The message the reader asked for is the one every key now acts on, and
   // the flash is on it: never a lit row beside a selected one.
   selectLanded(row);
@@ -33346,10 +33363,10 @@ function revealRow(row, center = false) {
 
 /** Put out the flash of the last landing, unless it is on `row`. See `drawSelection`. */
 function putOutLanding(row) {
-  if (!replyLanded || replyLanded.row === row) return;
-  clearTimeout(replyLanded.timer);
-  replyLanded.row.removeAttribute("data-landed");
-  replyLanded = null;
+  if (!replyArrows().landed || replyArrows().landed.row === row) return;
+  clearTimeout(replyArrows().landed.timer);
+  replyArrows().landed.row.removeAttribute("data-landed");
+  replyArrows().landed = null;
 }
 
 /**
@@ -33357,18 +33374,18 @@ function putOutLanding(row) {
  * A different channel, view or thread is a different list, and the chip goes with the list.
  */
 function replyReturnRow() {
-  if (replyReturn === null) return null;
-  if (replyReturn.context !== channelContextKey()) {
-    replyReturn = null;
+  if (replyArrows().back === null) return null;
+  if (replyArrows().back.context !== channelContextKey()) {
+    replyArrows().back = null;
     return null;
   }
-  return rowHolding(replyReturn.id);
+  return rowHolding(replyArrows().back.id);
 }
 
 /** "Back to reply": where the jump started, lit as the landing was. */
 function backToReply() {
   const row = replyReturnRow();
-  replyReturn = null;
+  replyArrows().back = null;
   if (row) {
     revealRow(row);
     setStatus("Back at the reply.");
@@ -33391,7 +33408,7 @@ function landOnAnswered(target, from) {
   openReadRun(row);
   revealRow(row);
   const reply = rowHolding(from);
-  replyReturn = reply && reply !== row && !rowOnScreen(reply) ? { id: from, context: channelContextKey() } : null;
+  replyArrows().back = reply && reply !== row && !rowOnScreen(reply) ? { id: from, context: channelContextKey() } : null;
   renderScrollTools();
   setStatus("Here is the message it answers.");
   return true;
@@ -33619,15 +33636,15 @@ const rowShown = (row) => !row.hidden && !String(row.className).split(/\s+/).inc
  * and the row-by-row geometry it asked for were a third of the page's work. Now one layout, and only
  * what changed is written, so a second measure of an unchanged list lays nothing out again. Nothing
  * at all is asked of a list with no adjacent arrow, nor of a hidden page, which has no frame to draw
- * and is measured when it is shown again (`replyArrowsOwed`); nor inside a redraw, which measures
+ * and is measured when it is shown again (`replyArrows().owed`); nor inside a redraw, which measures
  * once, at its end (`holdingReplyArrows`).
  */
 function measureReplyArrows() {
-  if (replyArrowsHeld > 0) {
-    replyArrowsOwed = true;
+  if (replyArrows().held > 0) {
+    replyArrows().owed = true;
     return;
   }
-  replyArrowsOwed = false;
+  replyArrows().owed = false;
   const list = el("discord-log");
   /** @type {{row: any, arrow: any, above: any}[]} */
   const pairs = [];
@@ -33639,7 +33656,7 @@ function measureReplyArrows() {
   }
   if (pairs.length === 0) return;
   if (document.hidden) {
-    replyArrowsOwed = true;
+    replyArrows().owed = true;
     return;
   }
   if (list.hidden || !(list.getBoundingClientRect().width > 0)) return;
@@ -33690,9 +33707,9 @@ function setArrowReach(arrow, reach, property, value, other) {
 }
 
 /** How many redraws are under way that measure the arrows once, at their end. `#226`. */
-let replyArrowsHeld = 0;
+// Kept per column: `replyArrows().held` (`freshReplyArrows`, `#624 voice-page-modularity`).
 /** Whether the arrows want measuring: asked inside a redraw, or of a hidden page. `#226`. */
-let replyArrowsOwed = false;
+// Kept per column: `replyArrows().owed` (`freshReplyArrows`, `#624 voice-page-modularity`).
 
 /**
  * Run `draw`, a redraw of the rows, measuring the arrows once at its end rather than at every pass
@@ -33701,15 +33718,15 @@ let replyArrowsOwed = false;
  * page-energy-profile`.
  */
 function holdingReplyArrows(draw) {
-  replyArrowsHeld += 1;
+  replyArrows().held += 1;
   try {
     return draw();
   } finally {
-    replyArrowsHeld -= 1;
-    if (replyArrowsHeld === 0 && replyArrowsOwed) {
+    replyArrows().held -= 1;
+    if (replyArrows().held === 0 && replyArrows().owed) {
       // In the column whose rows were drawn: the end of this task is in the left one. `#229`.
       const measure = inThisColumn(() => {
-        if (replyArrowsHeld === 0 && replyArrowsOwed && !document.hidden) measureReplyArrows();
+        if (replyArrows().held === 0 && replyArrows().owed && !document.hidden) measureReplyArrows();
       });
       Promise.resolve().then(measure);
     }
@@ -34298,7 +34315,7 @@ function bridgePiece(row) {
       return;
     }
     // ...or the end of the taps on an arrow that put the bridge here, as with the X.
-    if (replyTapsSettling !== null) return;
+    if (replyArrows().settling !== null) return;
     const holder = bridge.parentNode || row;
     if (holder) glideToBridgeTop(holder);
   });
@@ -34322,8 +34339,8 @@ function ungatherButton() {
   button.addEventListener("click", inThisColumn((event) => {
     // The row's own tap would fold the reply or read it aloud; this tap is the X's.
     if (event) event.stopPropagation();
-    // ...unless it is the end of the taps on an arrow that put the X here (`replyTapsSettling`).
-    if (replyTapsSettling !== null) return;
+    // ...unless it is the end of the taps on an arrow that put the X here (`replyArrows().settling`).
+    if (replyArrows().settling !== null) return;
     scatterReplies();
   }));
   return button;
@@ -34409,7 +34426,7 @@ const replyMarkerVisited = new Map();
 const replyMarkerTargets = new WeakMap();
 
 /** Whether any Reply on the list says a count, or any row has a circle: a pass then has something to undo. */
-let replyCountsDrawn = false;
+// Kept per column: `replyArrows().countsDrawn` (`freshReplyArrows`, `#624 voice-page-modularity`).
 
 /** The circle's accessible name, for the `at`th (from 1) of `of` replies. No channel data. */
 const replyMarkerName = (at, of) =>
@@ -34603,7 +34620,7 @@ function renderReplyCounts() {
   countedOutgoingKey = outgoingReplyKey();
   const rows = /** @type {HTMLLIElement[]} */ ([...el("discord-log").children]);
   const { replies, held } = heldReplies(rows);
-  if (replies.size === 0 && !replyCountsDrawn) return;
+  if (replies.size === 0 && !replyArrows().countsDrawn) return;
   /** @type {Map<string, any>} */
   const drawn = new Map();
   for (const row of rows) {
@@ -34673,7 +34690,7 @@ function renderReplyCounts() {
       else arrow.removeAttribute("data-reply-hub");
     }
   }
-  replyCountsDrawn = shown;
+  replyArrows().countsDrawn = shown;
 }
 
 /** Which of a circle's replies the next tap goes to, as an index into them. */
@@ -47057,13 +47074,6 @@ const COLUMN_STATE = [
   [() => threadEntryAwaitsRead, (value) => { threadEntryAwaitsRead = value; }, () => false],
   [() => entryReadOwed, (value) => { entryReadOwed = value; }, () => null],
   [() => entryLanding, (value) => { entryLanding = value; }, () => null],
-  [() => replyReturn, (value) => { replyReturn = value; }, () => null],
-  [() => replyLanded, (value) => { replyLanded = value; }, () => null],
-  [() => replyArrowTap, (value) => { replyArrowTap = value; }, () => null],
-  [() => replyTapsSettling, (value) => { replyTapsSettling = value; }, () => null],
-  [() => replyArrowsHeld, (value) => { replyArrowsHeld = value; }, () => 0],
-  [() => replyArrowsOwed, (value) => { replyArrowsOwed = value; }, () => false],
-  [() => replyCountsDrawn, (value) => { replyCountsDrawn = value; }, () => false],
   [() => countedOutgoingKey, (value) => { countedOutgoingKey = value; }, () => ""],
   [() => gathered, (value) => { gathered = value; }, () => null],
   [() => rowsGathered, (value) => { rowsGathered = value; }, () => false],
@@ -50819,7 +50829,10 @@ function resetSideColumn(reopen = false) {
   });
   columns.side.state = null;
   // Its own records start again as its swapped fields do: only while it is not the column worked on.
-  if (activeColumn !== columns.side) columns.side.older = freshOlderPages();
+  if (activeColumn !== columns.side) {
+    columns.side.older = freshOlderPages();
+    columns.side.arrows = freshReplyArrows();
+  }
   for (const id of ["side-log", "side-thread-list", "side-summary", "side-pinned-log", "side-outgoing-log"]) {
     leftEl(id).replaceChildren();
   }
@@ -57294,10 +57307,10 @@ inColumn(columns.side, () => {
   el("scroll-area").addEventListener("scroll", inThisColumn(() => {
     if (!sideShowing()) return;
     renderJumpNewest();
-    if (replyReturn !== null) {
+    if (replyArrows().back !== null) {
       const reply = replyReturnRow();
       if (reply === null || rowOnScreen(reply)) {
-        replyReturn = null;
+        replyArrows().back = null;
         renderScrollTools();
       }
     }
@@ -58069,10 +58082,10 @@ el("scroll-area").addEventListener("scroll", () => {
   renderJumpNewest();
   // `#204 reply-arrow`. The way back to a reply goes once the reply is on screen again, however
   // the reader brought it there: a chip offering to go where they already are is clutter.
-  if (replyReturn !== null) {
+  if (replyArrows().back !== null) {
     const reply = replyReturnRow();
     if (reply === null || rowOnScreen(reply)) {
-      replyReturn = null;
+      replyArrows().back = null;
       renderScrollTools();
     }
   }

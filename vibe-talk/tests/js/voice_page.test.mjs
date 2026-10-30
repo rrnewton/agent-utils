@@ -7197,7 +7197,7 @@ test("`#624 voice-page-modularity`: a read asked for while another is out joins 
   assert.deepStrictEqual([started, generation.current()], [0, 1]);
 });
 
-test("`#624 voice-page-modularity`: each column keeps its own record of its older pages, reached through the column worked on", () => {
+test("`#624 voice-page-modularity`: each column keeps its own records of its older pages and reply arrows, reached through the column worked on", () => {
   const page = newPage();
   const same = (expression) => page.pure(expression);
   assert.equal(same("olderPages() === columns.main.older"), true, "the left column's record was not the one worked on");
@@ -7210,6 +7210,12 @@ test("`#624 voice-page-modularity`: each column keeps its own record of its olde
     ["side-cursor", true, null]);
   assert.deepStrictEqual(JSON.parse(same("JSON.stringify(freshOlderPages())")),
     { moreAbove: false, cursor: null, inFlight: false, step: null, deferred: false });
+  // The same for its reply arrows.
+  assert.equal(same("inColumn(columns.side, () => replyArrows()) === columns.side.arrows && replyArrows() === columns.main.arrows"), true);
+  same("inColumn(columns.side, () => { replyArrows().held += 1; })");
+  assert.deepStrictEqual(JSON.parse(same("JSON.stringify([columns.side.arrows.held, replyArrows().held])")), [1, 0]);
+  assert.deepStrictEqual(JSON.parse(same("JSON.stringify(freshReplyArrows())")),
+    { back: null, landed: null, tap: null, settling: null, held: 0, owed: false, countsDrawn: false });
 });
 
 test("`#624 voice-page-modularity`: the live events counted per channel, from the module alone", () => {
