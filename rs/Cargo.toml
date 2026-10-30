@@ -13,6 +13,7 @@ members = [
     "chat-subscription-fake",
     "chat-subscription-slack",
     "wrkslotsd",
+    "wrkviz",
     "gh-paced",
     "agent-usage",
     "agent-teams",

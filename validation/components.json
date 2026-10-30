@@ -381,6 +381,7 @@
         "py/tests/timeline_projection.py",
         "py/tests/timeline_snapshots.py",
         "py/wrkviz/",
+        "rs/wrkviz/",
         "skills/wrkviz/"
       ],
       "reverse_dependencies": [],
@@ -435,7 +436,8 @@
         "py/tests/test_timeline_v3_search.py",
         "py/tests/test_timeline_v3_website.py",
         "py/tests/test_timeline_window.py",
-        "py/tests/test_transcript_export.py"
+        "py/tests/test_transcript_export.py",
+        "py/tests/test_wrkviz_inspect_rust.py"
       ]
     }
   },

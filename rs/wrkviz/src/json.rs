@@ -1,0 +1,370 @@
+//! JSON helpers shared by the archive readers: the Python
+//! edition's `as_object`/`as_array`/`as_string`/`as_int`
+//! validators (same refusal sentences), its `json.dumps(...,
+//! indent=2, sort_keys=True)` output shape, and Python `repr`
+//! for the values refusal sentences quote.
+
+use serde_json::Value;
+use std::path::{Path, PathBuf};
+
+/// Require one JSON object.
+pub fn as_object<'a>(
+    value: &'a Value,
+    where_: &str,
+) -> Result<&'a serde_json::Map<String, Value>, String> {
+    value
+        .as_object()
+        .ok_or_else(|| format!("{where_}: expected an object"))
+}
+
+/// Require one JSON array.
+pub fn as_array<'a>(value: &'a Value, where_: &str) -> Result<&'a Vec<Value>, String> {
+    value
+        .as_array()
+        .ok_or_else(|| format!("{where_}: expected an array"))
+}
+
+/// Require one JSON string.
+pub fn as_string<'a>(value: &'a Value, where_: &str) -> Result<&'a str, String> {
+    value
+        .as_str()
+        .ok_or_else(|| format!("{where_}: expected a string"))
+}
+
+/// Require one JSON integer (booleans are not integers).
+pub fn as_int(value: &Value, where_: &str) -> Result<i64, String> {
+    match value {
+        Value::Bool(_) => Err(format!("{where_}: expected an integer")),
+        _ => value
+            .as_i64()
+            .ok_or_else(|| format!("{where_}: expected an integer")),
+    }
+}
+
+/// One integer or `null`.
+pub fn optional_int(value: &Value, where_: &str) -> Result<Option<i64>, String> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    as_int(value, where_).map(Some)
+}
+
+/// Read and parse a JSON document at `path`, mirroring the
+/// Python `read_json`. OS failures render in CPython's
+/// `[Errno N] ...: 'path'` shape.
+pub fn read_json(path: &Path) -> Result<Value, String> {
+    let bytes = std::fs::read(path).map_err(|error| os_error(&error, path))?;
+    let text = String::from_utf8(bytes).map_err(|error| error.to_string())?;
+    serde_json::from_str(&text).map_err(|error| error.to_string())
+}
+
+/// `[Errno N] <strerror>: '<path>'`, CPython's OSError spelling.
+pub fn os_error(error: &std::io::Error, path: &Path) -> String {
+    let message = error.to_string();
+    let message = message
+        .strip_suffix(&format!(
+            " (os error {})",
+            error.raw_os_error().unwrap_or(0)
+        ))
+        .unwrap_or(&message);
+    match error.raw_os_error() {
+        Some(errno) => format!("[Errno {errno}] {message}: '{}'", path.display()),
+        None => format!("{message}: '{}'", path.display()),
+    }
+}
+
+/// Python `repr` of a JSON value, for refusal sentences that
+/// quote a found value (`{found!r}`).
+pub fn py_repr(value: &Value) -> String {
+    match value {
+        Value::Null => "None".to_string(),
+        Value::Bool(flag) => {
+            if *flag {
+                "True".to_string()
+            } else {
+                "False".to_string()
+            }
+        }
+        Value::Number(number) => number.to_string(),
+        Value::String(text) => py_repr_str(text),
+        Value::Array(items) => {
+            let parts: Vec<String> = items.iter().map(py_repr).collect();
+            format!("[{}]", parts.join(", "))
+        }
+        Value::Object(map) => {
+            let parts: Vec<String> = map
+                .iter()
+                .map(|(key, item)| format!("{}: {}", py_repr_str(key), py_repr(item)))
+                .collect();
+            format!("{{{}}}", parts.join(", "))
+        }
+    }
+}
+
+fn py_nonprintable(ch: char) -> bool {
+    let code = ch as u32;
+    matches!(code, 0x00..=0x1f | 0x7f..=0xa0)
+        || matches!(code, 0x1680 | 0x2000..=0x200a | 0x2028 | 0x2029 | 0x202f | 0x205f | 0x3000 | 0xfeff | 0xfff9..=0xfffb)
+        || (0xd800..=0xdfff).contains(&code)
+}
+
+/// Python `repr` of a string: single quotes unless the string
+/// holds a single quote and no double quote, escaped the way
+/// CPython escapes them.
+pub fn py_repr_str(text: &str) -> String {
+    let quote = if text.contains('\'') && !text.contains('"') {
+        '"'
+    } else {
+        '\''
+    };
+    let mut out = String::new();
+    out.push(quote);
+    for ch in text.chars() {
+        if ch == quote {
+            out.push('\\');
+            out.push(ch);
+            continue;
+        }
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if py_nonprintable(ch) => {
+                let code = ch as u32;
+                if code <= 0xff {
+                    out.push_str(&format!("\\x{code:02x}"));
+                } else if code <= 0xffff {
+                    out.push_str(&format!("\\u{code:04x}"));
+                } else {
+                    out.push_str(&format!("\\U{code:08x}"));
+                }
+            }
+            ch => out.push(ch),
+        }
+    }
+    out.push(quote);
+    out
+}
+
+/// CPython `repr` of a float, closely enough for JSON output:
+/// shortest digits, exponent form signed and two digits wide.
+pub fn py_float_repr(value: f64) -> String {
+    if value.is_nan() {
+        return "NaN".to_string();
+    }
+    if value.is_infinite() {
+        return if value > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
+    }
+    if value == 0.0 {
+        return if value.is_sign_negative() {
+            "-0.0"
+        } else {
+            "0.0"
+        }
+        .to_string();
+    }
+    let raw = value.to_string();
+    if let Some((mantissa, exponent)) = raw.split_once('e') {
+        let exponent: i64 = exponent.parse().unwrap_or(0);
+        let mantissa = if mantissa.contains('.') {
+            mantissa.to_string()
+        } else {
+            format!("{mantissa}.0")
+        };
+        return format!(
+            "{}e{}{:02}",
+            mantissa,
+            if exponent < 0 { "-" } else { "+" },
+            exponent.abs()
+        );
+    }
+    if raw.contains('.') {
+        raw
+    } else {
+        format!("{raw}.0")
+    }
+}
+
+/// `json.dumps(value, indent=2, sort_keys=True)`: two-space
+/// indent, keys sorted, ASCII-only string escapes.
+pub fn dump_pretty(value: &Value) -> String {
+    let mut out = String::new();
+    write_value(value, 0, &mut out);
+    out
+}
+
+fn write_indent(out: &mut String, depth: usize) {
+    for _ in 0..depth {
+        out.push_str("  ");
+    }
+}
+
+fn write_value(value: &Value, depth: usize, out: &mut String) {
+    match value {
+        Value::Null => out.push_str("null"),
+        Value::Bool(flag) => out.push_str(if *flag { "true" } else { "false" }),
+        Value::Number(number) => {
+            if let Some(float) = number.as_f64() {
+                if number.as_i64().is_none() && number.as_u64().is_none() {
+                    out.push_str(&py_float_repr(float));
+                    return;
+                }
+            }
+            out.push_str(&number.to_string())
+        }
+        Value::String(text) => write_json_string(text, out),
+        Value::Array(items) => {
+            if items.is_empty() {
+                out.push_str("[]");
+                return;
+            }
+            out.push_str("[\n");
+            for (index, item) in items.iter().enumerate() {
+                write_indent(out, depth + 1);
+                write_value(item, depth + 1, out);
+                if index + 1 < items.len() {
+                    out.push(',');
+                }
+                out.push('\n');
+            }
+            write_indent(out, depth);
+            out.push(']');
+        }
+        Value::Object(map) => {
+            if map.is_empty() {
+                out.push_str("{}");
+                return;
+            }
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            out.push_str("{\n");
+            for (index, key) in keys.iter().enumerate() {
+                write_indent(out, depth + 1);
+                write_json_string(key, out);
+                out.push_str(": ");
+                write_value(&map[*key], depth + 1, out);
+                if index + 1 < keys.len() {
+                    out.push(',');
+                }
+                out.push('\n');
+            }
+            write_indent(out, depth);
+            out.push('}');
+        }
+    }
+}
+
+/// A JSON string literal escaped the way CPython's
+/// `ensure_ascii=True` escapes it.
+fn write_json_string(text: &str, out: &mut String) {
+    out.push('"');
+    for ch in text.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            ch if (ch as u32) < 0x20 || (ch as u32) == 0x7f => {
+                out.push_str(&format!("\\u{:04x}", ch as u32))
+            }
+            ch if (ch as u32) < 0x80 => out.push(ch),
+            ch => {
+                let code = ch as u32;
+                if code <= 0xffff {
+                    out.push_str(&format!("\\u{code:04x}"));
+                } else {
+                    let rest = code - 0x10000;
+                    out.push_str(&format!(
+                        "\\u{:04x}\\u{:04x}",
+                        0xd800 + (rest >> 10),
+                        0xdc00 + (rest & 0x3ff)
+                    ));
+                }
+            }
+        }
+    }
+    out.push('"');
+}
+
+/// Resolve a path the way Python's `Path.resolve()` does:
+/// absolute, with symlinks resolved for the deepest existing
+/// prefix and the remainder appended lexically normalized.
+pub fn resolve_path(path: &Path) -> std::path::PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| Path::new("/").to_path_buf())
+            .join(path)
+    };
+    let part_of = |value: &std::ffi::OsStr| value.to_os_string();
+    let mut current: Vec<std::ffi::OsString> = absolute
+        .components()
+        .filter_map(|part| match part {
+            std::path::Component::Normal(name) => Some(part_of(name)),
+            std::path::Component::ParentDir => Some(std::ffi::OsString::from("..")),
+            _ => None,
+        })
+        .collect();
+    // Component walk substituting symlinks as they are met --
+    // including broken links, whose targets Python resolves
+    // lexically -- the way Path.resolve() does it.
+    let mut resolved = PathBuf::from("/");
+    let mut index = 0usize;
+    let mut substituted = 0u32;
+    while index < current.len() {
+        let name = current[index].clone();
+        if name == ".." {
+            resolved.pop();
+            index += 1;
+            continue;
+        }
+        resolved.push(&name);
+        let is_link =
+            std::fs::symlink_metadata(&resolved).is_ok_and(|meta| meta.file_type().is_symlink());
+        if is_link && substituted <= 40 {
+            if let Ok(target) = std::fs::read_link(&resolved) {
+                substituted += 1;
+                let mut joined: Vec<std::ffi::OsString> = Vec::new();
+                if !target.is_absolute() {
+                    if let Some(parent) = resolved.parent() {
+                        joined.extend(parent.components().filter_map(|part| match part {
+                            std::path::Component::Normal(name) => Some(part_of(name)),
+                            _ => None,
+                        }));
+                    }
+                }
+                joined.extend(target.components().filter_map(|part| match part {
+                    std::path::Component::Normal(name) => Some(part_of(name)),
+                    std::path::Component::ParentDir => Some(std::ffi::OsString::from("..")),
+                    _ => None,
+                }));
+                joined.extend(current.iter().skip(index + 1).cloned());
+                current = joined;
+                resolved = PathBuf::from("/");
+                index = 0;
+                continue;
+            }
+        }
+        index += 1;
+    }
+    normalize(&resolved)
+}
+
+fn normalize(path: &Path) -> std::path::PathBuf {
+    let mut out = std::path::PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}

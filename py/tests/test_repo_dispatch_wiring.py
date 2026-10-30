@@ -37,6 +37,7 @@ NON_PUBLISHED_RUST_BINARIES = (
     "chat-subscription-fake-plugin",
     "gh-paced",
     "wrkslotsd",
+    "wrkviz",
 )
 
 

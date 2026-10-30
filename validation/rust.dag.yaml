@@ -211,6 +211,19 @@ steps:
     cpu_timeout: 1200
     hint: *rust_test_hint
 
+  - group: wrkviz
+    job: test
+    desc: wrkviz Rust tests
+    cmd: >-
+      host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
+      RUST_TEST_THREADS=4 python3 scripts/case_timings.py run-cargo -- cargo test --release --no-fail-fast --manifest-path rs/Cargo.toml
+      --target "$host_target" --target-dir rs/target/validation-tests -p wrkviz ${DAGRUN_EXTRA_ARGS}
+    cmdtype: cargo-test
+    labels: [validation-workspace, validation-rust-workspace-tests, component-wrkviz]
+    timeout: 600
+    cpu_timeout: 1200
+    hint: *rust_test_hint
+
   - group: rust-only
     job: check
     desc: dispatched Rust tools run with no Python interpreter on PATH (campaign progress meter)
