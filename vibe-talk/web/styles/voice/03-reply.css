@@ -1,0 +1,228 @@
+/* ---------------------------------------------------------------------------------- reply -- */
+/*
+ * `#410 inline-reply-editor`. The reply's box: the label and who it answers, the box, the `#185
+ * reply-new-thread` choice and destination, the buttons and the state line, each a size of its own,
+ * a gap apart, a part that is hidden leaving no gap behind. Drawn in the stream, under the message it
+ * answers (below). There is no reply screen.
+ */
+.reply-compose {
+  flex: none;
+  display: grid;
+  gap: 0.4rem;
+}
+
+/* "Your reply", and who it answers on the same line, at the far end. */
+.reply-label-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0 0.75rem;
+}
+
+/* The title bar's words, one word on Settings and on Help: shrinking inside the bar's flex row. */
+#topbar-title {
+  min-width: 0;
+  line-height: 1.2;
+}
+
+/* Small and quiet beside its label: who is being answered, and the id the answer goes to, in type a
+   snowflake can be read in digit by digit. */
+#reply-target-meta {
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.72rem;
+  overflow-wrap: anywhere;
+}
+
+/* The generic `input` rule in web/style.css does not reach a textarea, so it says its own size. */
+#reply-text {
+  min-height: 5rem;
+  padding: 0.5rem 0.6rem;
+  background: var(--panel);
+  color: var(--ink);
+  border: 1px solid var(--edge);
+  border-radius: 0.4rem;
+  font: inherit;
+  resize: vertical;
+}
+
+/*
+ * `#410 inline-reply-editor`. A reply open IN THE STREAM, under the message it answers and the replies
+ * gathered under it, with the later messages below it. The owner, 2026-10-21: "our new Reply interface
+ * is just the existing inline-message editor (with Grow button) inserted in the stream." So it reads as
+ * the composers do — the box across, at the composers' size, Grow at the start of the row under it and
+ * Send at its end — on the reply's tint, in a row's own border and corners, as wide as the list's rows.
+ *
+ * Never a row of the list: web/voice.js names the row it goes under (`data-inline-reply`), and the box
+ * is drawn there by anchor positioning, the row keeping room under itself as tall as the box
+ * (`--inline-reply-room`, kept by an observer of the box). The box follows its row through every redraw,
+ * fold and arrival above it with no script. The list holding that row is the box's other anchor, for its
+ * width. Without anchor positioning, or with no row drawn to go under (`data-anchored` absent), the box
+ * is in the list's flow at its foot, where the column's own box was, which is hidden while it is open.
+ */
+#column-reply,
+#side-reply {
+  box-sizing: border-box;
+  margin: 0.25rem 0 0.5rem;
+  padding: 0.55rem 0.7rem 0.45rem;
+  background: var(--reply-tint);
+  border: 1px solid var(--edge);
+  border-radius: 0.5rem;
+  overflow-anchor: none;
+}
+
+#column-reply .reply-compose,
+#side-reply .reply-compose {
+  width: auto;
+  margin-inline: 0;
+}
+
+#column-reply .reply-label-row,
+#side-reply .reply-label-row {
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+#column-reply #reply-text,
+#side-reply #reply-text {
+  width: 100%;
+  box-sizing: border-box;
+  font-size: max(1rem, 16px);
+}
+
+.reply-actions {
+  align-items: center;
+  justify-content: flex-end;
+}
+
+/* The lines under the box take only the room of what they say: the grid's gap is the space between
+   them, and the state line, a live region kept in the layout, is no height until it speaks. */
+#column-reply .reply-compose .hint,
+#side-reply .reply-compose .hint {
+  margin: 0;
+}
+
+/* The room the column's own box kept at the foot of the list for the chips, the status pill and the
+   phone's home bar (`#194`, `#245`, `#241`): kept by the list while a reply is open in it and that box
+   is hidden, so a reply under the newest message can still be scrolled clear of what floats over the
+   foot, as the box could. */
+#pane-discord:has(> #column-reply:not([hidden])),
+#side-pane:has(> #side-reply:not([hidden])),
+#side-list:has(> #side-reply:not([hidden])) {
+  padding-bottom: calc(max(1rem, env(safe-area-inset-bottom)) + var(--scroll-tools-clearance, 0px) + var(--read-steer-clearance, 0px) + 2.4rem);
+}
+
+/* Grow at the start of the row, though it follows Send in the markup, as in the composers. */
+.reply-actions > .composer-grow {
+  order: -1;
+  margin-inline-end: auto;
+}
+
+/*
+ * `#467 inline-send-in-place`. A reply sent from the box in the stream, drawn where the box was: under
+ * the row it answers (`data-outgoing-anchor`, named `--outgoing-N` by web/voice.js on both), that row
+ * keeping room under itself as tall as the rows drawn there (`--outgoing-room`). As wide as that row.
+ * Without anchor positioning they are drawn after the list, at its foot.
+ */
+.outgoing-inplace {
+  margin: 0;
+}
+
+@supports (anchor-name: --a) {
+  li[data-outgoing-anchor] {
+    margin-bottom: calc(0.75rem + var(--outgoing-room, 0px)) !important;
+  }
+
+  .outgoing-inplace {
+    position: absolute;
+    z-index: 1;
+    top: calc(anchor(bottom) + 0.25rem);
+    left: anchor(left);
+    right: anchor(right);
+  }
+}
+
+@supports (anchor-name: --a) {
+  ol:has(> li[data-inline-reply]),
+  ul:has(> li[data-inline-reply]) {
+    anchor-name: --inline-reply-list;
+  }
+
+  li[data-inline-reply] {
+    anchor-name: --inline-reply-row;
+    margin-bottom: calc(0.75rem + var(--inline-reply-room, 0px)) !important;
+  }
+
+  #column-reply[data-anchored],
+  #side-reply[data-anchored] {
+    position: absolute;
+    z-index: 1;
+    position-anchor: --inline-reply-row;
+    top: calc(anchor(--inline-reply-row bottom) + 0.25rem);
+    left: anchor(--inline-reply-list left);
+    right: anchor(--inline-reply-list right);
+    margin: 0;
+  }
+}
+
+/* Sized like `.fold` beside it: a quiet control on the metadata row, not a second action
+   competing with the dock. */
+.reply-button {
+  flex: 0 0 auto;
+  /* Hard right, on whichever line it lands on. On a wide screen that is the end of the metadata
+     row, which is where Discord puts a row's actions; on a phone the row wraps and this keeps the
+     control in the same corner rather than stranding it under the author's name. */
+  margin-left: auto;
+  padding: 0.05rem 0.5rem;
+  background: none;
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  color: var(--muted);
+  font: inherit;
+  font-size: 0.72rem;
+  letter-spacing: 0.02em;
+  min-height: 0;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* `#193 compose-draft-loss`. A reply saved unsent to this message: a pencil and "Draft", in the
+   accent, directly left of Reply, which it opens as Reply does. It takes Reply's place at the right
+   edge, so the two stay together on whichever line the row's controls wrap to. Every row has one,
+   and `[hidden]` keeps it out of every row without a draft. */
+.draft-marker {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  margin-left: auto;
+  padding: 0.05rem 0.5rem 0.05rem 0.4rem;
+  background: none;
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  color: var(--accent);
+  font: inherit;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  min-height: 0;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.draft-marker:not([hidden]) + .reply-button {
+  margin-left: 0.35rem;
+}
+
+/* The pencil, a mask filled with the chip's ink, as the pin chip draws its pin. */
+.draft-marker::before {
+  content: "";
+  width: 0.8rem;
+  height: 0.8rem;
+  background: currentColor;
+  -webkit-mask: var(--pencil-mask) center / contain no-repeat;
+  mask: var(--pencil-mask) center / contain no-repeat;
+  --pencil-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 20h4L19 9l-4-4L4 16z'/%3E%3Cpath d='M13 7l4 4'/%3E%3C/svg%3E");
+}
+

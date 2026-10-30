@@ -1,0 +1,139 @@
+/* ------------------------------------------------------------------- the labelled seam ----- */
+/*
+ * Where one conversation ends and the next begins, the page used to print four sentences about
+ * what a vendor does and does not document. That is not user-interface text: it was cut off
+ * behind the control pane, and being cut off is the screen reporting that it does not belong
+ * there.
+ *
+ * What is left on the surface is a thin rule carrying two or three words. The explanation is
+ * inside the same element, one tap away on a phone, and named by `title` for a pointer device.
+ */
+.messages li.seam {
+  background: none;
+  border: none;
+  padding: 0.25rem 0;
+  margin: 0.35rem 0;
+}
+
+.seam-summary {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  list-style: none;
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 0.75rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+/* Safari draws its own disclosure triangle unless this is said. */
+.seam-summary::-webkit-details-marker {
+  display: none;
+}
+
+/* The rule itself: one hairline on each side of the label. */
+.seam-summary::before,
+.seam-summary::after {
+  content: "";
+  flex: 1 1 auto;
+  height: 1px;
+  background: var(--edge);
+}
+
+.seam-info {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.05rem;
+  height: 1.05rem;
+  border: 1px solid var(--edge);
+  border-radius: 50%;
+  font-size: 0.7rem;
+  font-style: italic;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.seam-detail,
+.seam-recap-detail {
+  margin: 0.5rem 0 0;
+  padding: 0.5rem 0.7rem;
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: 0.5rem;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+/*
+ * `#270 voice-transcript-markers`. What recap the call below a "new conversation" line was sent, in
+ * at most three words beside the label: "412-word recap sent", "no recap sent", "recap
+ * unsupported". In the label's quiet colour, not shouted in capitals, and free to wrap onto a
+ * second line inside its pill on a narrow phone rather than push the rule off the screen. Its
+ * sentence is a paragraph of its own under the label's, inside the disclosure.
+ */
+.seam-recap {
+  flex: 0 1 auto;
+  min-width: 0;
+  padding: 0.05rem 0.5rem;
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  letter-spacing: 0;
+  text-transform: none;
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+
+/* Beside a chip the label keeps to one line, and the chip is what wraps. */
+.seam-summary:has(.seam-recap) .seam-label {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+/*
+ * `#331 resume-on-websocket`. The line at the head of the call's box: what the call was given of the
+ * conversation before it, or why it started fresh. Small, centred and muted like a seam, so it reads
+ * as a fact about the call rather than a turn in it; a recap the voice service said it took is drawn
+ * in the colour of a thing that worked.
+ */
+#call-recap {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.8rem;
+  line-height: 1.35;
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+
+/* It gives way to a send card: the card sits close on the box, with nothing between them. */
+#screen-main[data-draft] #call-recap {
+  display: none;
+}
+
+#call-recap[data-recap="accepted"] {
+  color: var(--ok);
+}
+
+/*
+ * ...and on Settings, the reason beside Resuming's switch where this server cannot resume: under the
+ * switch's words, indented by the box and its gap (`.toggle` in web/style.css), in the warning
+ * colour, with the words of a switch that cannot be used dimmed beside it.
+ */
+.toggle-why {
+  margin: -0.35rem 0 0.5rem;
+  padding-left: 1.75rem;
+  color: var(--warn);
+  font-size: 0.85rem;
+}
+
+.toggle:has(input:disabled) {
+  color: var(--muted);
+}
+
+.seam-recap-detail {
+  margin-top: 0.35rem;
+}
+

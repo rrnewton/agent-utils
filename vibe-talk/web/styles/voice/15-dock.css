@@ -1,0 +1,362 @@
+/* ---------------------------------------------------------------------------- the dock ----- */
+
+#dock {
+  background: var(--dock);
+  border-top: 1px solid var(--edge);
+}
+
+/* THE status line, and the only one. The same fact used to be stated under the header and again
+   at the foot of the screen, in two vocabularies, by two mechanisms that did not know about each
+   other. There is one now, and the dot carries the state the second line used to spell out.
+ *
+ * `#63 status-line-placement` made it TRANSIENT. It used to be a permanent grid row at the top of
+ * the dock, holding a strip of a phone screen on every frame for a line that is blank most of the
+ * time — and the governing rule of this file is that the majority of the space belongs to content.
+ *
+ * AN OVERLAY, AND THIS IS THE ONE EXCEPTION TO "NOTHING HERE IS POSITIONED". A row that appears
+ * and disappears resizes #scroll-area, and resizing the scrolling element moves the transcript
+ * under the reader's thumb — the very defect `#47 scrollback-stability` exists to remove. Floating
+ * it costs no reflow at all. Do not "clean this up" into a grid row.
+ *
+ * WHAT THE OVERLAY COSTS, said plainly rather than left for a screenshot to reveal: for the few
+ * seconds it is up, the pill COVERS the last line of the content underneath it — a channel message
+ * or the newest transcript line. That is a real trade against the reserved row, not a free win,
+ * and it is accepted because the row cost that strip on every frame forever while this costs it
+ * only while there is something to say. The cost is bounded here rather than merely regretted:
+ * `pointer-events: none` on the pill and `auto` on its dismiss control, the same idiom as
+ * #scroll-tools, so the line underneath can still be tapped, replied to and folded THROUGH the
+ * message covering it. A reader is never blocked by it, only briefly reading around it.
+ *
+ * The HISTORY that must survive the move: it sits above the dock, not on the bottom edge. On a
+ * phone with rounded corners the bottom edge is exactly where a line of text is eaten by the
+ * curve, and the owner photographed the first word of this line missing on an iPhone 16. The
+ * horizontal safe-area insets in the padding are the other half of that fix; only the bottom inset
+ * was ever applied before it. Both halves are still here, and both are still asserted. */
+#status-line {
+  position: absolute;
+  z-index: 5;
+  inset-inline: 0;
+  /* Follow the actual tool height, including wrapped rows and larger phone fonts. Both layers
+     stay outside the scrolling content, so showing a banner never moves the reader's place. On the
+     chips, wherever they stand: over the channel's message box they rise with it (`--chips-foot`,
+     `#245 done-feedback`), and the pill with them, so it is never over the box being typed in. */
+  /* `#433 read-strip-low`: while the read-aloud strip is up the pill stands on it in turn
+     (`--read-steer-clearance`, its measured height), rather than the strip keeping a pill's
+     worth of empty room under itself on every frame the pill is not there. */
+  bottom: calc(var(--chips-foot, 0.5rem) + var(--scroll-tools-clearance, 0px) + var(--read-steer-clearance, 0px));
+  width: max-content;
+  max-width: calc(100% - 1.5rem);
+  margin-inline: auto;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.3rem calc(0.5rem + env(safe-area-inset-right)) 0.3rem
+    calc(0.85rem + env(safe-area-inset-left));
+  min-height: 1.9rem;
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  box-shadow: 0 1px 8px rgb(0 0 0 / 35%);
+  color: var(--muted);
+  pointer-events: none;
+  /* The small type is on #status below, not here. Same reason as #connection-banner: the desktop
+     regime caps this pill in `ch`, `ch` follows the element's own font size, and a pill set in
+     0.8rem would be a fifth narrower than the control pane beneath it. */
+}
+
+/* `#376 read-aloud-blocks`. Previous, "2 of 5", Next, Pause, Stop, while a read of several blocks plays.
+   Floating for the reason the status line floats: coming and going, it moves nothing under the
+   reader's thumb. Only its buttons take taps; between them the row underneath can still be tapped.
+   Large targets, because the reader may be in a car.
+ *
+ * `#433 read-strip-low`. AS LOW AS IT CAN SIT: directly on the chips row, by its MEASURED height
+ * (`--scroll-tools-height`, written beside `--scroll-tools-clearance` by the same ResizeObserver),
+ * so it hugs that row as it wraps, empties, rises over the message box or is hidden away. It used
+ * to stand a fixed 2.6rem over the chips' room — the status pill's place, reserved on every frame
+ * though the pill is transient and usually absent — which reads as a hover and spends a strip of
+ * screen. The pill now stacks over the strip while both are up (`#status-line`). */
+#read-steer {
+  position: absolute;
+  z-index: 5;
+  inset-inline: 0;
+  bottom: calc(var(--chips-foot, 0.5rem) + var(--scroll-tools-height, 0px));
+  width: max-content;
+  max-width: calc(100% - 1.5rem);
+  margin-inline: auto;
+  display: flex;
+  align-items: center;
+  /* `#442 read-strip-order`: a fifth target, Stop, and still one line on a 375px phone, with room
+     for a count of two-digit blocks ("12 of 12", a size down below): the air between them is what
+     gave way. Chromium at 375x812 measures that line 346px of the 351 it may take. */
+  gap: 0.25rem;
+  padding: 0.3rem;
+  background: var(--panel);
+  border: 1px solid var(--warn);
+  border-radius: 999px;
+  box-shadow: 0 1px 8px rgb(0 0 0 / 35%);
+  pointer-events: none;
+}
+
+#read-steer[hidden] {
+  display: none;
+}
+
+/* `#380 read-aloud-timeline`. A second line of the strip: the read's blocks, each as wide as it is
+   long, with a gap between. Tall enough to tap, though a block of a few words is narrow. */
+#read-steer {
+  flex-wrap: wrap;
+  justify-content: center;
+  border-radius: 1.4rem;
+}
+
+#read-timeline {
+  pointer-events: auto;
+  display: flex;
+  flex: 1 0 100%;
+  gap: 0.2rem;
+  min-height: 1.5rem;
+  padding: 0 0.3rem 0.1rem;
+}
+
+#read-timeline:empty {
+  display: none;
+}
+
+.read-timeline-block {
+  flex: var(--block-weight, 1) 1 0;
+  min-width: 0.4rem;
+  min-height: 1.5rem;
+  padding: 0;
+  border: 1px solid var(--warn);
+  border-radius: 0.3rem;
+  background: transparent;
+}
+
+/* `read-chunk-balance`. The pieces of one drawn block stand closer together than two blocks do, so the
+   line reads as the message's blocks and the steps inside each. */
+.read-timeline-block[data-continues] {
+  margin-inline-start: -0.1rem;
+}
+
+.read-timeline-block[data-heard] {
+  background: color-mix(in srgb, var(--warn) 35%, var(--panel));
+}
+
+.read-timeline-block[aria-current="true"] {
+  background: var(--warn);
+}
+
+.read-steer-button {
+  pointer-events: auto;
+  min-height: 2.75rem;
+  /* `#434 read-aloud-pause`: four targets and the count in one line on a narrow phone — at the
+     old 6rem the row wrapped under 375px and covered a taller strip of the list. `#442
+     read-strip-order` added Stop, a fifth, and the words keep their room by losing padding. */
+  min-width: 4rem;
+  padding: 0 0.5rem;
+  border-radius: 999px;
+  border: 1px solid var(--warn);
+  background: color-mix(in srgb, var(--warn) 18%, var(--panel));
+  color: inherit;
+  font: inherit;
+}
+
+.read-steer-button:disabled {
+  opacity: 0.45;
+}
+
+/* `#627 scrubber-thumb-arrows`. Four arrows where the words were: the fat pair steps a section, the
+   thin pair a block, all pointing along the timeline under them. The thin glyph is a hairline, and its
+   target is still a 44px square: a thin arrow is a fine step, not a small button. */
+.read-steer-arrow {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 2.75rem;
+  padding: 0;
+}
+
+.read-steer-arrow svg {
+  width: 1.5rem;
+  height: 1.5rem;
+}
+
+.read-steer-arrow[data-weight="fat"] {
+  background: color-mix(in srgb, var(--warn) 32%, var(--panel));
+}
+
+.read-steer-arrow[data-weight="thin"] svg {
+  width: 1.6rem;
+}
+
+#read-steer-count {
+  min-width: 3rem;
+  font-size: 0.9rem;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The grip that moves the strip: drawn on a desk only (below). A phone keeps the strip docked. */
+#read-steer-grip {
+  display: none;
+}
+
+/* `scrubber-full-width`. ON A PHONE, A READ PLAYING HAS THE BOTTOM OF THE SCREEN. The owner,
+   2026-10-27: "I want to conserve screen real estate and I would like the scrubber bar to the full
+   width and the flush with the top of the bottom row of the controls. Those other controls you don't
+   need to access while we are in active playback mode." `data-read-strip` on the root says the strip
+   is up and whether its read plays or is held (`renderReadLayout` in web/voice.js).
+ *
+ *   * THE STRIP IS A ROW, edge to edge, standing on the dock: on the bottom row (Pace, Stop, Pause)
+ *     with nothing between. Its insets are the safe area's, so the curve of a phone's corners keeps
+ *     clear of the arrows. `#627 scrubber-thumb-arrows`: the four arrows and the count stand together
+ *     at the RIGHT edge, under the right thumb (they used to go to the two edges), and the timeline
+ *     takes the whole width under them.
+ *   * THE LIST ENDS AT ITS TOP EDGE. #screen-main keeps the strip's measured height
+ *     (`--read-steer-height`) under the list, so no message scrolls under the strip and the lists'
+ *     feet keep no room for it besides (`--read-steer-clearance` is nothing inside). The chips, the
+ *     status pill and the pull's report stand on it (`--chips-foot`; over a send card docked under
+ *     the screen, on the card and the strip both: `placeChipsOverComposer`).
+ *   * WHILE IT PLAYS, the bar's second row (the gear, the pickers, the switch: in the dock, or in the
+ *     header where the reader moved it, and the header with it while the bar is all it holds) and the
+ *     chips go. The list grows into the room.
+ *   * HELD, the chips come back, floating over the list on the strip as they do over the dock. The
+ *     second row stays away until the read stops, so a pause or a resume never resizes the list's
+ *     frame or lifts the strip from under the thumb reaching for it (only the room the list's foot
+ *     keeps for the chips comes and goes with them, as it does whenever a chip does).
+ *
+ * Coarse pointers only, as `#429 keyboard-hides-bar`: a desk's strip floats on its chips row as it
+ * did, and moves by its grip. */
+@media (pointer: coarse) {
+  :root[data-read-strip] #screen-main {
+    padding-bottom: var(--read-steer-height, 0px);
+  }
+
+  :root[data-read-strip] #read-steer {
+    bottom: 0;
+    inset-inline: 0;
+    width: auto;
+    max-width: none;
+    margin-inline: 0;
+    justify-content: flex-end;
+    padding: 0.35rem calc(0.6rem + env(safe-area-inset-right)) 0.35rem
+      calc(0.6rem + env(safe-area-inset-left));
+    border-width: 1px 0 0;
+    border-radius: 0;
+    box-shadow: none;
+    background: var(--dock);
+  }
+
+  :root[data-read-strip] #read-timeline {
+    padding-inline: 0;
+  }
+
+  :root[data-read-strip] #frame-body {
+    --chips-foot: max(calc(var(--read-steer-height, 0px) + 0.5rem), calc(var(--composer-top, 0px) + 0.25rem));
+  }
+
+  :root[data-read-strip] #scroll-area,
+  :root[data-read-strip] #side-column,
+  :root[data-read-strip] #status-line,
+  :root[data-read-strip] #pull-refresh {
+    --read-steer-clearance: 0px;
+  }
+
+  :root[data-read-strip] #control-bar,
+  :root[data-read-strip] #topbar:has(#control-bar-top > #control-bar):not(:has(#close-settings:not([hidden]), #close-help:not([hidden]))),
+  :root[data-read-strip="playing"] #scroll-tools {
+    display: none;
+  }
+
+  /* The header gone this way is not `hidden`, so the body takes the top safe-area inset over here as
+     `#197 floating-search` has it do for a hidden header: a read lasts minutes, and the notch would
+     sit on the list's first line and the glass for all of them. */
+  :root[data-read-strip] #topbar:has(#control-bar-top > #control-bar):not(:has(#close-settings:not([hidden]), #close-help:not([hidden]))) + #frame-body {
+    padding-top: env(safe-area-inset-top);
+  }
+}
+
+/* The block being read, inside the row being read: the row's own colour, stronger. */
+.md [data-reading-block="current"] {
+  background: color-mix(in srgb, var(--warn) 45%, var(--theirs));
+  border-radius: 0.3rem;
+  box-shadow: 0 0 0 0.2rem color-mix(in srgb, var(--warn) 45%, var(--theirs));
+}
+
+/* `#379 read-aloud-sentences`. The sentence being said, inside the block being read: stronger again,
+   and underlined, so it is found by more than its colour. */
+::highlight(read-aloud-sentence) {
+  background-color: color-mix(in srgb, var(--warn) 75%, var(--theirs));
+  text-decoration: underline 0.12em var(--warn);
+}
+
+/* An item's nested lists are blocks of their own, and are not lit with it: the row's colour. */
+.md li[data-reading-block="current"] > :is(ul, ol) {
+  background: color-mix(in srgb, var(--warn) 22%, var(--theirs));
+}
+
+/* Quiet, and the same size as the dot beside it. It is the way out for somebody who has read the
+   message and does not want to wait six seconds; it is not a thing to notice. */
+#dismiss-status {
+  /* The one part of the pill that is still a target: the pill itself lets taps through to the
+     message it is covering (see above), and this button has to take its own back. */
+  pointer-events: auto;
+  padding: 0 0.4rem;
+  min-height: 0;
+  line-height: 1.1;
+  font-size: 0.95rem;
+  background: none;
+  border: none;
+}
+
+/* A member of the pill, never pinned to the viewport: a status strip fixed to the bottom edge is
+   precisely what put this line in a rounded phone's curvature zone. It takes what the dot and the
+   dismiss button leave, on one line, in the pill's muted ink. */
+#status {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.8rem;
+}
+
+.status-dot {
+  flex: 0 0 auto;
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  background: var(--idle);
+}
+
+#status-line[data-state="live"] .status-dot {
+  background: var(--ok);
+}
+
+#status-line[data-state="working"] .status-dot {
+  background: var(--accent);
+}
+
+#status-line[data-state="ended"] .status-dot {
+  background: var(--muted);
+}
+
+#status-line[data-state="error"] .status-dot {
+  background: var(--warn);
+}
+
+/* `#54 resume-recovery`. The call dropped while the page was in the background — recoverable, and
+   NOT the same thing as either of the two above it. Reading it as `ended` would say the reader
+   chose to hang up; reading it as `error` would say something is broken, which is what the page
+   used to do and what the issue is about. */
+#status-line[data-state="suspended"] .status-dot {
+  background: var(--paused);
+}
+
+/* `voice-unresponsive-signal`. The call is open and may recover, but the service has stopped
+   producing anything audible or readable. Neither `live` (which is what a whole call of silence
+   used to show) nor `error` (which says the call is broken): paused-coloured, ringed in warning. */
+#status-line[data-state="unresponsive"] .status-dot {
+  background: var(--paused);
+  box-shadow: 0 0 0 2px var(--warn);
+}
+

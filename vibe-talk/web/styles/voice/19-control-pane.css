@@ -1,0 +1,532 @@
+/* --------------------------------------------------------------------- the control pane ---- */
+/*
+ * A dense tile that fills the width and stops there. Two small controls stack in the left column
+ * to exactly the height of the two large ones, because the large ones each SPAN both rows — the
+ * heights cannot drift apart, since they are the same two rows.
+ *
+ * The large controls are shorter and wider than they were: a rectangle under the thumb, not a
+ * pair of tall slabs eating a third of the display.
+ */
+/* Positioned, so the pace popover has something to be absolute AGAINST. Without this it resolved
+   against the initial containing block and `bottom: calc(100% + 0.4rem)` put it a full viewport
+   height above the page — the button worked, the panel was simply off screen. */
+#control-pane {
+  position: relative;
+  display: grid;
+  grid-template-columns: 3.5rem 1fr 1fr;
+  grid-template-rows: 1fr 1fr;
+  gap: 0.4rem;
+  /* The top padding used to come from the status row sitting on top of this one. That row is an
+     overlay now, so the separation from the dock's own border has to be stated. */
+  padding: 0.6rem calc(0.6rem + env(safe-area-inset-right)) 0.6rem
+    calc(0.6rem + env(safe-area-inset-left));
+  /* Clear of the home indicator on a phone that has one, and zero on one that does not. */
+  padding-bottom: calc(0.6rem + env(safe-area-inset-bottom));
+}
+
+.control {
+  /* `manipulation` removes the legacy 300 ms tap delay and double-tap-to-zoom, which is most of
+     what makes a web button feel unlike an app button. */
+  touch-action: manipulation;
+  /* No grey flash on tap. */
+  -webkit-tap-highlight-color: transparent;
+  /* A long press on a control should not start selecting its label. */
+  user-select: none;
+  -webkit-user-select: none;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.15rem;
+  padding: 0;
+  border: none;
+  border-radius: 0.85rem;
+  font: inherit;
+  color: #fff;
+}
+
+.control-label {
+  font-size: 0.82rem;
+  letter-spacing: 0.01em;
+}
+
+.control-icon {
+  width: 1.6rem;
+  height: 1.6rem;
+}
+
+/* The two small controls: left column, one per row. Stacked they are exactly as tall as either
+   large control, because all four live in the same two grid rows. */
+.control-mini {
+  grid-column: 1;
+  min-height: 2.4rem;
+  background: var(--panel);
+  color: var(--ink);
+  border: 1px solid var(--edge);
+  gap: 0.05rem;
+}
+
+/* Named individually rather than by position: a nth-of-type rule silently retargets the moment
+   anything else is added to the pane. */
+#speaker {
+  grid-row: 1;
+}
+
+#clear-view {
+  grid-row: 2;
+}
+
+.mini-icon {
+  width: 1.15rem;
+  height: 1.15rem;
+}
+
+.mini-label {
+  font-size: 0.55rem;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+/* Armed: the first tap on Clear does not clear. It changes the control — colour AND word — and
+   the second tap within a few seconds is the one that acts. The control is destructive and it now
+   sits under a thumb, which makes an accidental tap more likely, not less. */
+#clear-view.armed {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
+#clear-view.armed .mini-label {
+  color: var(--warn);
+}
+
+/* Sound off: the agent's VOICE is silenced, not the agent. Its replies keep arriving as text, so
+   the control is drawn as a struck-through speaker rather than as anything that suggests the
+   conversation stopped. */
+.speaker-slash {
+  opacity: 0;
+}
+
+.control-mini.off .speaker-slash {
+  opacity: 1;
+}
+
+.control-mini.off .speaker-wave {
+  opacity: 0;
+}
+
+.control-mini.on {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* Hang up: to the left of Talk, spanning both rows, because it is the rarer action and the more
+   expensive mistake. */
+.control-hangup {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  background: var(--warn);
+}
+
+/* Talk: lower right, under the thumb, spanning both rows. */
+.control-talk {
+  grid-column: 3;
+  grid-row: 1 / span 2;
+  background: var(--accent);
+}
+
+/* With no call to hang up — idle, and after one has ended — there is exactly one thing to do, and
+   it gets both columns. The alternative, which this replaces, was a fully saturated Hang up
+   sitting next to it doing nothing at all. */
+#control-pane.solo .control-talk {
+  grid-column: 2 / -1;
+}
+
+/* READING MODE: the channel view, with no call.
+ *
+ * Read used to carry `control-talk`, which meant the idle rule above gave it BOTH columns — a
+ * double-width control with nothing beside it. It is one of two now: Read, and the pace it is
+ * read at. Same 3x2 grid, two members, no second layout.
+ */
+/*
+ * PLACEMENT IS EXPLICIT, and that is the fix rather than a tidy-up.
+ *
+ * All three of these carried `grid-row: 1 / span 2` and no column, so the grid auto-placed them in
+ * DOM ORDER: Read landed in column 1 -- the narrow 3.5rem strip meant for Sound and Clear -- and
+ * Pace took column 3, which on a phone is the easiest place on the whole screen to reach. The most
+ * used control got the worst position and the least used got the best, decided by nothing but the
+ * order the buttons happen to appear in the markup.
+ *
+ * Read is the reason this view has a bar, so Read owns the thumb. Pace sits beside it. `Hide read`
+ * is a filter you set and forget, so it takes the mini column the other views use for exactly that
+ * kind of control.
+ */
+#control-pane #read-aloud {
+  grid-column: 3;
+  grid-row: 1 / span 2;
+}
+
+#control-pane #read-speed {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+}
+
+/* `#442 read-strip-order`. While a read plays, Read is its Pause and Stop stands beside it, both
+   under the thumb: the tile takes a fourth column for the time Stop is shown, and gives it back.
+   Stop takes the new column on Read's LEFT, so Read keeps the edge a thumb reaches for without
+   looking and a blind tap to pause never lands on Stop. At 375px each of the three wide columns
+   is still well over a 44px target. */
+#control-pane:has(#read-aloud-stop:not([hidden])) {
+  grid-template-columns: 3.5rem 1fr 1fr 1fr;
+}
+
+#control-pane:has(#read-aloud-stop:not([hidden])) #read-aloud {
+  grid-column: 4;
+}
+
+#control-pane #read-aloud-stop {
+  grid-column: 3;
+  grid-row: 1 / span 2;
+  background: var(--warn);
+  color: var(--on-warn, #10131a);
+}
+
+#control-pane #todo-filter {
+  grid-column: 1;
+  grid-row: 1 / span 2;
+}
+
+/* `#221 read-modes`. The narrow column holds the mode's name, and "Collapse" was its longest word: a
+   size down, so the word stands clear of the tile's edges instead of touching both. */
+#control-pane #todo-filter .control-label {
+  font-size: 0.72rem;
+  line-height: 1.15;
+  text-align: center;
+}
+
+/* `#432 read-mode-unify`. And in two lines, its two words one above the other, as at a desk (below):
+   "Fold read", once Collapse read, is just narrow enough to stand on one line, touching both sides. */
+#control-pane #todo-filter .read-mode-verb,
+#control-pane #todo-filter .read-mode-noun {
+  display: block;
+}
+
+/*
+ * READING MODE, ON. The control that starts a session has to look like the control that ends one,
+ * or the reader cannot tell from the bar whether they are in the mode at all -- which is how a tap
+ * meant to stop becomes a tap that reads another message.
+ *
+ * `--warn` rather than the accent: this is the way OUT, and it should read as the same kind of
+ * thing as Hang up rather than as another thing to start.
+ */
+#control-pane .control-read[data-active="true"] {
+  background: var(--warn);
+  color: var(--on-warn, #10131a);
+}
+
+#control-pane .control-read[data-active="true"] .control-icon {
+  stroke: currentColor;
+}
+
+/* The pace popover. Anchored to the dock because it belongs to the MODE, not to any one message,
+   and it must not be clipped by the row it was opened from. */
+.popover {
+  position: absolute;
+  bottom: calc(100% + 0.4rem);
+  right: calc(0.6rem + env(safe-area-inset-right));
+  z-index: 5;
+  min-width: 14rem;
+  padding: 0.7rem 0.8rem;
+  border: 1px solid var(--edge);
+  border-radius: 0.8rem;
+  background: var(--dock);
+  box-shadow: 0 0.5rem 1.5rem rgb(0 0 0 / 35%);
+}
+
+/* `#567 pace-stepper`. [-] [100%] [+]: the buttons a thumb's width at least (44px), the box between
+ * them as tall, its percent large and centred. */
+#speed-popover {
+  /* The help under the stepper wraps rather than stretching the popover across a desk. */
+  width: min(20rem, calc(100vw - 1.2rem));
+}
+
+.pace-stepper {
+  display: grid;
+  grid-template-columns: 3rem minmax(5rem, 1fr) 3rem;
+  gap: 0.5rem;
+  align-items: stretch;
+}
+
+.pace-step {
+  min-width: 2.75rem;
+  min-height: 3rem;
+  font-size: 1.6rem;
+  line-height: 1;
+  border: 1px solid var(--edge);
+  border-radius: 0.6rem;
+  background: var(--theirs);
+  color: inherit;
+}
+
+.pace-step:disabled {
+  opacity: 0.4;
+}
+
+#read-speed-box {
+  min-height: 3rem;
+  width: 100%;
+  font-size: 1.3rem;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+
+#speed-value {
+  display: block;
+  font-size: 0.8rem;
+  margin-bottom: 0.2rem;
+}
+
+/* CHAT MODE: a typed conversation, with no microphone open and nothing to play.
+ *
+ * Two of the four controls have nothing to act on and web/voice.js hides them — Talk, because
+ * there is no capture graph to mute, and Sound, because there is no playback to silence. What is
+ * left is arranged rather than left with holes in it: Hang up takes the whole large area the way
+ * Talk does when idle, and Clear grows to the full height of the small column instead of sitting
+ * in the bottom half of an otherwise empty tile.
+ *
+ * The pane keeps its shape and its metrics. This is the same 3x2 grid with two members absent, not
+ * a second layout that has to be maintained alongside the first. */
+#control-pane.chat .control-hangup {
+  grid-column: 2 / -1;
+}
+
+#control-pane.chat #clear-view {
+  grid-row: 1 / span 2;
+}
+
+/* `#429 keyboard-hides-bar`. WHILE THE ON-SCREEN KEYBOARD IS UP IN THE CHANNEL VIEW, the page is the list
+ * and the box being typed in, and nothing else. The owner: the keyboard and the bars together left too
+ * little of the list to read the message being answered, and a reader writing is not being read to —
+ * "hide the entire bar, both rows of it, until the keyboard is dismissed again". web/voice.js says when
+ * the keyboard is up (`data-keyboard` on the root, from a focused field AND a visual viewport that has
+ * lost a keyboard's height); this says what goes, and only where the pointer is coarse, so a desk never
+ * loses its bars whatever the script decides.
+ *
+ *   * THE CHANNEL VIEW ONLY (#pane-discord shown). The call's view keeps its dock over the keyboard, which
+ *     is what `#241 voice-composer` laid it out for: the switch, Talk and Hang up beside the box the reader
+ *     is talking to the agent through.
+ *   * BOTH ROWS: the control bar (the gear, the channel and view pickers, the Voice/Channel switch), in
+ *     the dock or in the header where the reader moved it, and the tile under it. The header goes with the
+ *     bar only while the bar is all it holds; Settings' title and way back stay.
+ *   * NOTHING THE BOX NEEDS: Send, Grow and the box itself are in the list, not in either bar.
+ *   * A WAY OUT OF SOUND STAYS. A reading already playing keeps playing, and a call keeps going, so the
+ *     tile shrinks to ONE slim row holding Stop, or Hang up, instead of going: the sound is a tap from
+ *     stopping. Everything else in the tile goes. */
+@media (pointer: coarse) {
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #control-bar,
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #topbar:has(#control-bar-top > #control-bar):not(:has(#close-settings:not([hidden]), #close-help:not([hidden]))) {
+    display: none;
+  }
+
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #dock:not(:has(#read-aloud[data-active="true"]:not([hidden]), #hang-up:not([hidden]))) {
+    display: none;
+  }
+
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #control-pane {
+    grid-template-rows: 2.75rem;
+    padding-top: 0.35rem;
+    padding-bottom: calc(0.35rem + env(safe-area-inset-bottom));
+  }
+
+  /* `#532 shift-o-latency`. Named by class, the tile's controls and its speed popover, never as a bare
+     `:not(…)`: a rule under `:root:has(…)` whose last part names no class, id or attribute is one the
+     browser can only check again on every element of the page, and it did so whenever anything on the
+     page was shown or hidden — a fold, a filter, a card unpacked — about 20 ms a time on a phone. */
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #control-pane > :is(.control, .popover):not(#hang-up, #read-aloud[data-active="true"], #read-aloud-stop) {
+    display: none;
+  }
+
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #control-pane > :is(#hang-up, #read-aloud, #read-aloud-stop) {
+    grid-column: 1 / -1;
+    grid-row: 1;
+    flex-direction: row;
+    gap: 0.4rem;
+  }
+
+  /* `#442 read-strip-order`. A read playing makes Read its Pause, so the slim row keeps Stop beside
+     it, half and half, on its left as in the tile: the sound is still a tap from stopping. */
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #control-pane:has(#read-aloud-stop:not([hidden])) {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #control-pane:has(#read-aloud-stop:not([hidden])) > #read-aloud {
+    grid-column: 2;
+  }
+
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #control-pane > #read-aloud-stop {
+    grid-column: 1;
+  }
+
+  /* `#575 mobile-keyboard-compose`. The owner, 2026-10-27, on Android and iOS: a tap in the box left Send and
+     "some useless white space" between it and the keyboard, "but on both Android and iOS, there's a send
+     button available on the keyboard ... scroll it so that the bottom of the text entry box is flush with
+     the top of the keyboard and there's no wasted space and the send button is off screen". So while the
+     keyboard is up and the box being written in has the focus:
+
+       * ITS FOOT IS THE KEYBOARD'S TOP. The composer keeps no room under itself but what the keyboard
+         covers of the list (`--keyboard-inset`: none where the browser resizes the content, as Chrome on
+         Android does; the keyboard's height where only the visual viewport shrinks, as in Safari), and
+         web/voice.js brings that foot to the keyboard's top as it comes up (`fitComposerToKeyboard`, told
+         by `--keyboard-fit` that the composer is laid out for it).
+       * SEND GOES WHILE ENTER SENDS. The keyboard's own key is the send then (`enterkeyhint="send"`, which
+         is what the box says while Enter to send is on). With it off, that key is a new line, so Send
+         stays, the last thing above the keyboard.
+       * A NEW-LINE KEY IN THE BOX'S CORNER, while Enter sends. A phone keyboard's Shift is its own: neither
+         Gboard nor iOS reports it on the return key, so Shift+Enter cannot reach the page from one. The
+         box keeps room on its right for the key, so no word is written under it. */
+  /* ...and the right column's list keeps none under it either: that list holds a reader at its very end
+     (`#280 scroll-stability`), which would leave its own padding between the box and the keys. The left
+     list's keepers leave the reader within its padding of the end, so its box is on the keys already, and
+     its padding is left as it is: taken away there, the reader was left far above the foot as the
+     keyboard went down (tests/keyboard_hides_bar_browser.py). */
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #side-scroll:has(:is(#channel-compose-text, #side-compose-text):focus) {
+    padding-bottom: 0;
+  }
+
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) :is(#channel-composer, #side-composer):has(> textarea:focus) {
+    padding-bottom: var(--keyboard-inset, 0px);
+    --keyboard-fit: on;
+  }
+
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) :is(#channel-compose-text, #side-compose-text)[enterkeyhint="send"]:focus ~ :is(#channel-send, #side-send) {
+    display: none;
+  }
+
+  /* The box's state line, with nothing to say, is a row and a gap of nothing under the box. Something to
+     say (a send failed, a send waits) still shows, under the box. */
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) :is(#channel-compose-text, #side-compose-text):focus ~ :is(#channel-compose-state, #side-compose-state):empty {
+    display: none;
+  }
+
+  /* Under a send card the box has Send's column beside it (`#screen-main[data-draft]`): one column, so the
+     box takes the row. */
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #channel-composer:has(> #channel-compose-text[enterkeyhint="send"]:focus) {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) :is(#channel-compose-text, #side-compose-text)[enterkeyhint="send"]:focus {
+    grid-row: 1;
+    grid-column: 1;
+    padding-right: 3.25rem;
+    resize: none;
+  }
+
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #reply-text[enterkeyhint="send"]:focus {
+    grid-row: 2;
+    grid-column: 1 / -1;
+    padding-right: 3.25rem;
+    resize: none;
+  }
+
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) :is(#channel-compose-text, #side-compose-text, #reply-text)[enterkeyhint="send"]:focus ~ .newline-key {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    grid-row: 1;
+    grid-column: 1;
+    align-self: end;
+    justify-self: end;
+    z-index: 1;
+    /* 44px, the touch target iOS asks for. */
+    width: 2.75rem;
+    height: 2.75rem;
+    margin: 0 0.35rem 0.35rem 0;
+    padding: 0;
+    border-radius: 50%;
+    background: var(--panel);
+    color: var(--ink);
+    border: 1px solid var(--edge);
+    font-size: 1.25rem;
+    line-height: 1;
+  }
+
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #reply-text[enterkeyhint="send"]:focus ~ .newline-key {
+    grid-row: 2;
+    grid-column: 1 / -1;
+  }
+}
+
+/* The caveat that used to be a paragraph in the transcript: one clause, attached to the action it
+   is about, and only on the screen where it applies. */
+.control-note {
+  max-width: 90%;
+  font-size: 0.62rem;
+  line-height: 1.25;
+  letter-spacing: 0.01em;
+  opacity: 0.85;
+  text-align: center;
+}
+
+/* The slash across the microphone is the muted state, so it is absent by default. */
+.control-slash {
+  opacity: 0;
+}
+
+.control-talk.muted .control-slash {
+  opacity: 1;
+}
+
+.control-talk.muted {
+  background: var(--panel);
+  color: var(--ink);
+  border: 1px solid var(--edge);
+}
+
+/* The animation while the agent can hear you. A ring that expands and fades out of the button,
+   once a second — visible at arm's length, and unmistakably *live* rather than merely coloured.
+   It is drawn on a child element so it cannot move the button's own layout. */
+.control-ring {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  border: 2px solid currentColor;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.control-talk.live .control-ring {
+  animation: talk-pulse 1.4s ease-out infinite;
+}
+
+@keyframes talk-pulse {
+  0% {
+    transform: scale(1);
+    opacity: 0.55;
+  }
+  100% {
+    transform: scale(1.06);
+    opacity: 0;
+  }
+}
+
+/* Somebody who has asked for less motion gets the state without the movement: the ring simply
+   sits there at a steady opacity rather than pulsing. */
+@media (prefers-reduced-motion: reduce) {
+  .control-talk.live .control-ring {
+    animation: none;
+    opacity: 0.55;
+  }
+}
+
+/* A control that cannot act must not look like the loudest thing on the screen. Hang up is not
+   merely dimmed when there is no call — it is not in the pane at all — but anything that is
+   present and cannot act drops its fill entirely here. Opacity alone would not be enough: an
+   orange rectangle at 50% is still the brightest element in a dark interface. */
+.control[disabled] {
+  background: var(--panel);
+  color: var(--muted);
+  border: 1px solid var(--edge);
+  opacity: 0.75;
+}
+

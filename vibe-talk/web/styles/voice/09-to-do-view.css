@@ -1,0 +1,1163 @@
+/* ---------------------------------------------------------------------- the to-do view ----- */
+/*
+ * `#50 todo-view`. Three controls and one sentence, and the sentence is the load-bearing one:
+ * `#inbox-note` carries the server's own statement that this read state is not Discord's, in
+ * either direction. It is quiet because it is a standing fact rather than a message, and it
+ * scrolls away with the top of the history rather than holding a strip of a phone screen.
+ */
+/* `row-more-menu`. "⋯" on the row, and a small menu under it holding the rarely used actions.
+ *
+ * THE MENU HANGS FROM THE ROW'S META LINE, NOT FROM THE "⋯". It used to hang from the button, its
+ * right edge on the button's, which only works while the button is at the right of the row — and
+ * the meta line wraps, so on a narrow phone, under a larger system font, or with the "Pinned" chip
+ * taking room, the "⋯" lands at the START of a line and a menu right-aligned to it opened wholly
+ * off the left of the screen, Unpin included (`#206 pin-message`). Measured in Chromium, never in
+ * the page suite, which lays nothing out: tests/offline_cache_browser.py opens every row's menu at
+ * the widths and font sizes that wrap it.
+ *
+ * So the meta line is the menu's containing block, `.row-more` is not, and the menu's right edge is
+ * the row's: under the button whenever the button is at the end of its line, and inside the row
+ * wherever the button is. No `white-space: nowrap` — a menu wider than the row wraps its labels
+ * instead, each item growing taller rather than any item, or the menu, running off the screen.
+ */
+#side-log .meta,
+#side-cards .meta,
+#discord-log .meta,
+#pinned-log .meta {
+  position: relative;
+}
+
+.row-more {
+  position: static;
+  flex: 0 0 auto;
+}
+
+.row-more-menu {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 0.25rem);
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  max-width: 100%;
+  padding: 0.4rem;
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: 0.6rem;
+  overflow-wrap: anywhere;
+}
+
+.row-more-menu[hidden] {
+  display: none;
+}
+
+/* `#202 read-through-here`. Every item in the ⋯ menu the same size, and the larger, easier one to
+   hit with a thumb: the menu's items were a pill the size of the row's own small controls beside a
+   full-size button, and the owner asked for the larger size throughout. The two in the read group
+   below are items of the menu too, and keep that size inside it. */
+.row-more-menu > button,
+.row-more-menu > a,
+.row-more-group > button,
+.row-more-group > .upstream-read-button {
+  min-height: 2.75rem;
+  padding: 0.5rem 0.9rem;
+  border: 1px solid var(--edge);
+  border-radius: 0.6rem;
+  background: none;
+  color: var(--ink);
+  font: inherit;
+  font-size: 1rem;
+  letter-spacing: normal;
+  text-align: left;
+}
+
+/* `#409 open-upstream-link`. The one item that is a link, "Open in …": sized and coloured as
+   its neighbours above, and a flex item of the menu as they are, but still a link — no
+   underline in its rest state, as no button here has one, and its text set on the item's
+   lines as a button's is. */
+.row-more-menu > a {
+  display: flex;
+  align-items: center;
+  box-sizing: border-box;
+  text-decoration: none;
+}
+
+.row-more-menu > button[hidden],
+.row-more-group > button[hidden] {
+  display: none;
+}
+
+/* `#206 pin-message`. The owner: "put the copy text button first and then group the two mark read
+   buttons." Copy text and Pin are the everyday items and come first; the two that mark read sit
+   under a hairline and a caption of their own, so they read as one choice made two ways rather
+   than as two more unrelated buttons — and a provider with no read marker of its own leaves one
+   item under the caption, not a stray rule. */
+.row-more-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  margin-top: 0.15rem;
+  padding-top: 0.45rem;
+  border-top: 1px solid var(--edge);
+}
+
+.row-more-caption {
+  padding: 0 0.2rem;
+  color: var(--muted);
+  font-size: 0.72rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+/*
+ * `#206 pin-message`. A pinned row says so IN WORDS, in its meta line: the owner rejects a lone
+ * glyph as useless, so the chip carries the word "Pinned" beside its icon, in a colour of its own,
+ * and the row adds a gold edge on its RIGHT — the left edge already belongs to the row being read,
+ * and a pin must not be mistaken for it. Every rule for a channel row in
+ * this file names `#pinned-log` beside `#discord-log`, so a row in the Pinned filter is drawn
+ * exactly as it is in the channel.
+ */
+.pin-chip {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.05rem 0.45rem 0.05rem 0.35rem;
+  border: 1px solid var(--pin-edge);
+  border-radius: 999px;
+  background: var(--pin-bg);
+  color: var(--pin-ink);
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  line-height: 1.35;
+}
+
+/* The pin, drawn from the same path as the Pinned filter's icon and filled with the chip's ink. A
+   mask rather than an inline <svg> so the row builder makes no element it would have to name. */
+.pin-chip::before {
+  content: "";
+  width: 0.8rem;
+  height: 0.8rem;
+  background: currentColor;
+  -webkit-mask: var(--pin-mask) center / contain no-repeat;
+  mask: var(--pin-mask) center / contain no-repeat;
+  --pin-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M8.5 3.5h7'/%3E%3Cpath d='M10 3.5v6L7 13.5h10l-3-4v-6z' fill='black'/%3E%3Cpath d='M12 13.5v7'/%3E%3C/svg%3E");
+}
+
+/*
+ * `#320 slack-edited-mark`. "(edited)" after a row's time, when the provider says the message was
+ * changed after it was sent. In the time's own muted ink and size, which it takes from the meta line,
+ * so it reads as a fact about the message and not as words of it; kept whole when the meta line wraps
+ * on a narrow phone. A label, not a control: its tooltip says when, and nothing happens on a tap.
+ */
+.edited-mark {
+  flex: 0 0 auto;
+  white-space: nowrap;
+  cursor: default;
+}
+
+/* `left: auto` because a reply already draws its veil on this same pseudo-element with `inset: 0`,
+   and with both sides set and a width the box is overconstrained and the right one is dropped: the
+   gold edge landed on a pinned reply's LEFT side, against its arrow. */
+#side-log li.discord-message[data-pinned="true"]::after,
+#side-cards li.discord-message[data-pinned="true"]::after,
+#discord-log li.discord-message[data-pinned="true"]::after,
+#pinned-log li.discord-message[data-pinned="true"]::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: auto;
+  width: 0.25rem;
+  background: var(--pin-edge);
+  pointer-events: none;
+}
+
+/* While the Pinned filter is up, the lines that describe the CHANNEL's list — how much of it is
+   loaded, a provider's note about it, the to-do controls — describe a list that is not on screen,
+   and go with it. The lists themselves are hidden by script, which is what the search count reads. */
+#pane-discord[data-pinned-only] #channel-summary,
+#pane-discord[data-pinned-only] #summary-note,
+#pane-discord[data-pinned-only] #inbox-note,
+#pane-discord[data-pinned-only] #clear-backlog,
+#pane-discord[data-pinned-only] #timeline-notice {
+  display: none;
+}
+
+/*
+ * `#219 emoji-reactions`. The reactions under a row's text: one quiet chip per emoji, the emoji and
+ * how many reacted with it. Its own line below the text, never in `.meta`, which the row's controls
+ * already fill on a phone, and wrapping rather than overflowing at 360px however many there are.
+ * Drawn as labels and not as controls — no hover, no pointer — because they are not buttons; a tap
+ * on one is a tap on the row. Under the Links filter they go with the text, above.
+ *
+ * Neutral and in the theme's own colours, so they sit on every speaker's tint, dimmed with the row
+ * when it is read, and stay legible in the light scheme and the dark. The emoji at the reader's
+ * message size; a custom emoji's `:name:` may be long, and breaks rather than widening the row.
+ */
+.discord-message > .reactions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  margin-top: 0.35rem;
+  font-size: calc(0.82rem * var(--msg-scale));
+}
+
+.reaction {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3em;
+  min-width: 0;
+  max-width: 100%;
+  padding: 0.05rem 0.5rem;
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--ink) 6%, transparent);
+  line-height: 1.45;
+  cursor: default;
+}
+
+.reaction-emoji {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.reaction-custom .reaction-emoji {
+  color: var(--muted);
+  font-size: 0.9em;
+}
+
+.reaction-count {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 0.9em;
+  font-variant-numeric: tabular-nums;
+}
+
+/* `#312 slack-reactions`. A tally the owner is among: outlined and tinted in the accent, as Slack
+   draws your own reaction, and still a label, with no hover and no pointer. Its count is in the
+   text's own ink rather than muted, which reads at 4.5:1 on every speaker's tint in both schemes;
+   the accent itself does not, on the agent's rows in the dark one. */
+.reaction-own {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+}
+
+.reaction-own .reaction-count {
+  color: var(--ink);
+}
+
+/* The rescue is offered only on a noise row; `renderChannelRows` sets `hidden`, and a class rule
+   for the button's display must not overrule it. */
+.not-noise-button[hidden] {
+  display: none;
+}
+
+/*
+ * `#196 auto-read-noise`. The rules in Settings: one line each, the rule as the owner typed it and
+ * its Remove at the end of the same line, so a list of a handful reads as a list rather than a
+ * stack of forms.
+ */
+.noise-rules {
+  list-style: none;
+  margin: 0.3rem 0;
+  padding: 0;
+}
+
+.noise-rule {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.25rem 0;
+  border-bottom: 1px solid var(--edge);
+}
+
+.noise-rule-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.noise-rule-remove {
+  flex: 0 0 auto;
+}
+
+.row-more-button,
+.done-button,
+.not-noise-button,
+.upstream-read-button {
+  flex: 0 0 auto;
+  padding: 0.05rem 0.5rem;
+  background: none;
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  color: var(--muted);
+  font: inherit;
+  font-size: 0.72rem;
+  letter-spacing: 0.02em;
+  min-height: 0;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* The filter reads as thrown, drawn from the SAME attribute that says so to a screen reader:
+   `true` for Hide read and `mixed` for Fold read, the two modes that take read messages out of
+   the way. `#221 read-modes`. */
+#todo-filter[aria-pressed="true"],
+#todo-filter[aria-pressed="mixed"] {
+  border-color: var(--accent);
+  color: var(--ink);
+}
+
+
+#side-inbox-note,
+#inbox-note {
+  margin: 0 0 0.4rem;
+}
+
+/* Bulk AND destructive, so it is armed the way #clear-view is: the first tap changes the word and
+   the colour, and only the second acts. Same treatment, because a reader who has learnt one of
+   these has learnt the other, and two different confirmation idioms on one screen is worse than
+   either. */
+#side-clear-backlog,
+#clear-backlog {
+  display: block;
+  margin: 0 0 0.4rem;
+}
+
+#side-clear-backlog.armed,
+#clear-backlog.armed {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
+/* The reading-width handle does not exist outside the desktop regime at the foot of this file:
+   there is no room for a column to resize and no pointer precise enough to grab the edge of one.
+   Stated HERE, before the media query, so the query's `display: block` is the later rule and wins
+   where it applies — the reverse order would silently hide the handle everywhere. */
+#width-grip {
+  display: none;
+}
+
+/* Over the bottom of the list, clear of the dock. `pointer-events: none` on the strip and `auto`
+   on the chips so the empty space beside them still scrolls the transcript under it.
+
+   `#207 scrollback-jump`. ACROSS the list, inset like the rest of the row from both safe-area
+   edges, rather than in its right-hand corner: the jump to the newest message stands at the left
+   end and the other chips keep the right (`#jump-newest`, below). `wrap-reverse` decides what
+   gives way on a narrow phone with a large font: the row's FIRST line is its bottom one, so the
+   jump keeps the lower-left corner it is looked for in and the chips that do not fit beside it go
+   up a line, still at the right, never over it. They are the optional ones; the way back is the
+   control the reader reaches for without looking. */
+#scroll-tools {
+  position: absolute;
+  z-index: 2;
+  left: calc(0.75rem + env(safe-area-inset-left));
+  right: calc(0.75rem + env(safe-area-inset-right));
+  /* Never lower than the channel's message box: see `--chips-foot` on #frame-body. */
+  bottom: var(--chips-foot, 0.5rem);
+  display: flex;
+  flex-wrap: wrap-reverse;
+  justify-content: flex-end;
+  gap: 0.4rem;
+  pointer-events: none;
+}
+
+/* The auto margin takes whatever the line has spare, which is what puts every chip after the jump
+   at the right-hand end. */
+#jump-newest,
+#side-jump-newest {
+  position: relative;
+  margin-inline-end: auto;
+}
+
+/* `#240 reading-bookmark`. The jump to the bookmark stands DIRECTLY RIGHT of the jump to the newest
+   message, the pair a reader goes between, so while it is up it takes the auto margin and the jump
+   beside it gives it up. In the accent, as the line it goes to is; its arrow points toward it. */
+#jump-newest:has(+ #jump-bookmark:not([hidden])) {
+  margin-inline-end: 0;
+}
+
+#jump-bookmark {
+  position: relative;
+  margin-inline-end: auto;
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+#jump-bookmark[data-direction="down"] .bookmark-arrow {
+  transform: rotate(180deg);
+}
+
+/* The 44px target, drawn as nothing, the idiom `#search-toggle::after` uses: a pseudo-element is
+   part of its button for hit-testing, so the chip stays the row's height while a thumb that lands
+   a few pixels above or below it still lands on it. `min` with 0 because a large font can draw the
+   chip taller than 44px, and then it is its own target. Measured from the padding box, so 100% is
+   the chip less its two borders. The row stands 0.5rem above the dock and the square reaches less
+   than that below the chip, so a tap on the dock's top edge is still the dock's. */
+#jump-newest::after,
+#side-jump-newest::after,
+#jump-bookmark::after {
+  content: "";
+  position: absolute;
+  inset: min(0px, calc((100% - 2.75rem) / 2));
+}
+
+/* Something arrived below while the reader was up in the history. The accent the armed pull and
+   the pressed toggles use, so "there is news down there" is told from "this is the way down" at a
+   glance and not by the word alone. */
+#jump-newest[data-arrivals],
+#side-jump-newest[data-arrivals] {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+/* `#277 reply-in-column`. A reply sent from this column did not go, and its outbox row, with Retry, is
+   down at the foot of the list: "Reply not sent", in the orange that row's own words are in
+   (`.outgoing-message[data-send-state="failed"]`), so the chip and what it leads to read as one thing.
+   After the arrivals rule, which it outranks: the failure is the reason to go down. */
+#jump-newest[data-unsent],
+#side-jump-newest[data-unsent] {
+  color: var(--warn);
+  border-color: var(--warn);
+}
+
+/* `#68 pull-to-refresh`. What the gesture says while it is happening, at the top edge of the list
+   and over it — positioned against #screen-main exactly as #scroll-tools is, and for the same
+   reason: inside #scroll-area it would be faded by the header mask, which is strongest at precisely
+   this edge, and it would scroll away from the gesture that is producing it.
+
+   `pointer-events: none`, because it is a report and never a control. The finger that summoned it
+   is mid-drag on the list underneath, and a strip that swallowed that drag would cancel the gesture
+   it exists to describe.
+
+   `#188 pull-refresh-bottom`. It follows the finger: `--pull-rise` is the resisted travel and
+   `--pull-turn` winds the spinner up toward the threshold, both written by `renderPull`. One line,
+   and as wide as its words, because "Updated 07:15 · nothing new" in a box only half the pane wide
+   — which is what `left: 50%` leaves an auto width — wraps. */
+#pull-refresh {
+  position: absolute;
+  z-index: 2;
+  top: 0.4rem;
+  left: 50%;
+  transform: translate(-50%, var(--pull-rise, 0px));
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  box-sizing: border-box;
+  width: max-content;
+  max-width: calc(100% - 2rem);
+  white-space: nowrap;
+  padding: 0.25rem 0.75rem;
+  background: var(--panel);
+  color: var(--muted);
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  font-size: 0.78rem;
+  box-shadow: 0 1px 6px rgb(0 0 0 / 35%);
+  pointer-events: none;
+}
+
+/* The same spinner as the channel's loading line, so "this is fetching" looks one way everywhere.
+   Turned by the pull until the release, then spun by the fetch. */
+#pull-refresh::before {
+  content: "";
+  flex: 0 0 auto;
+  width: 0.75rem;
+  height: 0.75rem;
+  border: 2px solid var(--edge);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  transform: rotate(var(--pull-turn, 0deg));
+}
+
+#pull-refresh[data-state="busy"]::before {
+  animation: outgoing-spin 0.8s linear infinite;
+}
+
+/* A result is a sentence, not a fetch: no spinner beside it. */
+#pull-refresh[data-state="done"]::before,
+#pull-refresh[data-state="failed"]::before {
+  display: none;
+}
+
+/* `#188 pull-refresh-bottom`. A pull UP past the newest message reports at the foot of the list,
+   where the reader's thumb and eyes already are, and rises from there. It stands where the status
+   line does and clears the floating chips the same way, by their measured height: the two are the
+   same kind of thing — what was true a moment ago — and neither may cover a control. */
+#pull-refresh[data-edge="end"] {
+  top: auto;
+  /* `#433 read-strip-low`: over the read-aloud strip too, as the status pill stands. */
+  bottom: calc(var(--chips-foot, 0.5rem) + var(--scroll-tools-clearance, 0px) + var(--read-steer-clearance, 0px));
+  transform: translate(-50%, calc(-1 * var(--pull-rise, 0px)));
+}
+
+#pull-refresh[data-state="failed"] {
+  color: var(--warn);
+  border-color: currentColor;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #pull-refresh[data-state="busy"]::before { animation: none; }
+}
+
+/* `#18 offline-message-cache`. The same pill as #pull-refresh, which it gives way to: rows saved
+   on this device, or kept after a refresh that failed, say how old they are over the list rather
+   than at the head of it, where the reader at the bottom would never see it. Anchored to the top
+   of the scroller, not of the pane: pinned to the pane it sat over the Main/Threads/All tabs and
+   hid one.
+
+   `#32 freshness-pill-overlap`. Over the scroller's top it covered the list's own header instead —
+   the channel summary, the first thing a cold start shows. So while there is a freshness to state,
+   the list reserves the pill's height at its head (`data-freshness` on #pane-discord, below) and
+   the header starts under it. Nothing outside the list's own cell moves; `renderChannelFreshness`
+   holds a scrolled reader's place while it changes. One line, ellipsised, so that the reservation
+   is exact: a pill that wrapped to two on a narrow phone would outgrow it. Since `#324
+   live-pill-covers-row` the room is the list's top edge moved down rather than padding inside it,
+   which scrolled away and left the pill over whatever row was passing.
+
+   `#197 floating-search`. The anchor is a zero-height LINE through the pill's middle, and the
+   search glass sits on it too, at the right-hand end: the owner asked for the glass "on the same
+   vertical height as the refresh status floating widget", and centring both on one line makes that
+   a fact of the layout rather than two sums that happen to agree. The pill is a flex item on the
+   line and the glass is positioned at its end, so the line's right padding is the glass's room.
+
+   The pill stays CENTRED over the list while it fits beside the glass — the spacer before it is
+   the glass's width again, so the two sides balance. A longer sentence takes the spacer first and
+   slides left, and is ellipsised only when it would otherwise run under the glass. That is the
+   difference between "Refresh failed · showing messages from 07:23" keeping its time on a 360px
+   phone and losing it. */
+#channel-freshness-anchor {
+  /* The scroller's own grid cell, at its top: auto-placed, it took the tabs' row. */
+  grid-row: 3;
+  grid-column: 1;
+  align-self: start;
+  position: relative;
+  /* Above the scroller, whose mask makes it a stacking context of its own. */
+  z-index: 2;
+  height: 0;
+  margin-top: var(--float-line);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0
+    calc(var(--float-edge) + var(--search-disc) + var(--float-gap) + env(safe-area-inset-right)) 0
+    calc(var(--float-edge) + env(safe-area-inset-left));
+}
+
+/* The balance on the left for the glass's room on the right. It is the ONLY thing on the line that
+   shrinks, so the pill slides before it is cut. (Two shrinkable items share a shortfall in
+   proportion, however lopsided their factors, so a pill that could shrink at all lost a fraction
+   of a pixel to every slide — and a fraction of a pixel is enough to ellipsise the time.) */
+#channel-freshness-anchor::before {
+  content: "";
+  flex: 0 1 calc(var(--search-disc) + var(--float-gap));
+}
+
+/* `#529 page-build-stale-notice`. Beside the pill on its line, never shrunk by it. */
+#page-update {
+  flex: 0 0 auto;
+  margin-left: var(--float-gap);
+  pointer-events: auto;
+}
+
+/* Never shrunk by the line; capped at its width instead, which is where the ellipsis starts. */
+#channel-freshness {
+  flex: 0 0 auto;
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  margin: 0;
+  /* 0.6rem rather than the 0.75rem #pull-refresh has: on a 360px phone the glass beside it takes
+     what the pill used to spend on air, and the longest sentence here still has to fit. */
+  padding: var(--freshness-pad) 0.6rem;
+  line-height: var(--freshness-line);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  background: var(--panel);
+  color: var(--muted);
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  /* 0.75rem, down from 0.78rem when `#211 link-filter` made the glass beside it 10px wider: the
+     longest thing it says, "Refresh failed · showing messages from 09:28", needed 309px of the 303px
+     a 360px phone then left it, and the time at its end is the part the ellipsis would take. */
+  font-size: 0.75rem;
+  text-align: center;
+  box-shadow: 0 1px 6px rgb(0 0 0 / 35%);
+  pointer-events: none;
+}
+
+#channel-freshness[data-state="offline"],
+#channel-freshness[data-state="slow"] {
+  color: var(--warn);
+  border-color: currentColor;
+}
+
+/* `#617 cold-load-first-paint`. A refresh that failed while the rows are still shown is said, not
+   alarmed: the owner, 2026-10-28, of an orange "Refresh failed" pill over messages a minute old.
+   The pill's own colours, its text a step quieter. */
+#channel-freshness[data-state="failed"] {
+  opacity: 0.85;
+}
+
+/* The pill's bottom edge, measured from the top of the list's cell; #scroll-area's own top padding is
+   then the gap between it and the header. The 2px is the pill's border.
+
+   `#211 link-filter`. Or the glass's bottom edge, which is lower now that the glass is the larger
+   of the two things centred on the line: the room is made for whichever reaches further, so the
+   head of the list is clear of both.
+
+   `#324 live-pill-covers-row`. The room was padding at the head of #pane-discord, inside the
+   scroller, and room at the head scrolls away: on a 412px phone "Live · updated" stood over the
+   first row on screen whenever the list was not at its very top — over a thread's date rule when
+   entering it landed on the root, with a clipped strip of the header showing between the thread's
+   card and the pill, and over an unread chip in Main. With a live channel the pill is nearly always
+   up, so that was most of the time. So, as the author filter hanging under the open bar on a narrow
+   phone already does (`#251 author-filter`, below), the list's top edge moves down to the line's
+   foot and the room at its head is given back by as much: at any scroll position every row is where
+   it was, and the list scrolls as far, but nothing is drawn under the pill or the glass. The fade
+   under the header shortens to the scroller's own top padding, so the first row is never faded.
+   Only while the channel's pane is the one shown, and not while the search bar is open, which the
+   pill gives way to and which makes its own room. */
+#screen-main:not([data-searching]) > #scroll-area:has(> #pane-discord[data-freshness]:not([hidden])) {
+  margin-top: calc(var(--float-line) + max(var(--freshness-box), var(--search-disc)) / 2);
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 0.35rem);
+  mask-image: linear-gradient(to bottom, transparent 0, #000 0.35rem);
+}
+
+/* `#197 floating-search`. The glass: a disc at the right-hand end of the line, in the pill's own
+   panel, edge and shadow, so the two read as one band and neither as the louder. Positioned rather
+   than a flex item so that it stays in the corner when the pill is not on the line (the call view
+   has none) and so that, open, it can take the whole line without the pill's arithmetic having a
+   say. `translateY(-50%)` centres it on the line at whatever height it is. */
+#search-float {
+  position: absolute;
+  top: 0;
+  right: calc(var(--float-edge) + env(safe-area-inset-right));
+  transform: translateY(-50%);
+  display: flex;
+  align-items: center;
+  gap: var(--bar-gap);
+}
+
+#search-toggle {
+  position: relative;
+  width: var(--search-disc);
+  height: var(--search-disc);
+  background: var(--panel);
+  color: var(--muted);
+  border: 1px solid var(--edge);
+  box-shadow: 0 1px 6px rgb(0 0 0 / 35%);
+}
+
+/* `#211 link-filter`: 21px, up from 0.95rem — the glyph is most of what made it look small. In px
+   with the disc around it (see --search-disc). */
+#search-toggle .icon {
+  width: 21px;
+  height: 21px;
+}
+
+/* The 48px target, drawn as nothing. A pseudo-element is part of its button for hit-testing, so a
+   tap anywhere in this square presses the glass while the disc stays its own size. Its box is
+   measured from the button's padding box, hence the border's 1px on every side.
+
+   Centred on the disc vertically, but NOT sideways: the disc sits --float-edge from the list's
+   right edge, which is less than half the difference, so the square reaches exactly to that edge
+   and makes up the rest on the left. Centred, it stuck a pixel out of the viewport, and a page one
+   pixel wider than the phone is the overflow `#36 thread-view-phone-overflow` exists to forbid. It
+   reaches a few px over the pill's end, which takes no taps (`pointer-events: none`), and a
+   couple of px into the room the list makes at its head, never the thread heading's Back button:
+   since `#211 link-filter` the line sits low enough that the square starts inside the list. */
+#search-toggle::after {
+  content: "";
+  position: absolute;
+  inset: calc((var(--search-disc) - var(--search-hit)) / 2 - 1px)
+    calc(-1 * var(--float-edge) - 1px)
+    calc((var(--search-disc) - var(--search-hit)) / 2 - 1px)
+    calc(var(--search-disc) + var(--float-edge) - var(--search-hit) - 1px);
+}
+
+/* `#206 pin-message` and `#211 link-filter`. The two filters on the open bar, Links then Pinned,
+   immediately left of the glass. Each one's whole 44px SQUARE is the target — no rounded corners to
+   fall off — and what is drawn inside it is the glass's own disc size, so the three read as a set
+   on the line. The squares abut: the discs drawn inside them are what the eye separates, and the
+   width the gap would have cost is the field's. */
+#author-filter,
+#links-filter,
+#pinned-filter {
+  position: relative;
+  width: var(--toggle-hit);
+  height: var(--toggle-hit);
+  border-radius: 0;
+  color: var(--muted);
+}
+
+/* On the filter that only ever shows with Links before it, so the squares abut where both are up
+   and nothing changes over the call, where Links stands beside the glass alone. */
+#pinned-filter {
+  margin-left: calc(-1 * var(--bar-gap));
+}
+
+#author-filter::before,
+#links-filter::before,
+#pinned-filter::before {
+  content: "";
+  position: absolute;
+  inset: calc((var(--toggle-hit) - var(--search-disc)) / 2);
+  border-radius: 999px;
+  pointer-events: none;
+}
+
+#author-filter .icon,
+#links-filter .icon,
+#pinned-filter .icon {
+  position: relative;
+  width: 21px;
+  height: 21px;
+}
+
+/* ON says so twice, from the one attribute that says it to a screen reader: the pin fills in and
+   takes the pin colour, on a gold-ringed disc. */
+#pinned-filter[aria-pressed="true"] {
+  color: var(--pin-ink);
+}
+
+#pinned-filter[aria-pressed="true"]::before {
+  background: var(--pin-bg);
+  box-shadow: inset 0 0 0 1px var(--pin-edge);
+}
+
+#pinned-filter[aria-pressed="true"] .pin-head {
+  fill: currentColor;
+}
+
+/* `#251 author-filter`. Whose messages, left of Links: its square abuts Links' as Pinned's does, on
+   the call view as on the channel, because the two are always up together. Each state draws its own
+   icon, a speech bubble with its tail on the side the messages it keeps are drawn on, both for
+   everyone's; and a state that keeps only some messages is on, in the accent, as Links on is. */
+#author-filter + #links-filter {
+  margin-left: calc(-1 * var(--bar-gap));
+}
+
+#author-filter .author-icon {
+  display: none;
+}
+
+#author-filter[data-author="everyone"] .author-icon[data-author="everyone"],
+#author-filter[data-author="mine"] .author-icon[data-author="mine"],
+#author-filter[data-author="theirs"] .author-icon[data-author="theirs"] {
+  display: block;
+}
+
+#author-filter[aria-pressed="true"] {
+  color: var(--accent);
+}
+
+#author-filter[aria-pressed="true"]::before {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+/* `#520 search-whose-toggle-hint`. The tooltip over the author filter: what the control does and the
+   state it is in, the same words as its `title`. Shown while a pointer rests on the button or it
+   holds keyboard focus; a touch has neither, so there the chip below is the telling. It floats under
+   the button (the bar stands at the screen's top, so above it there is no room) and takes no room,
+   so the bar and the list never move for it. */
+#author-filter .author-tip {
+  display: none;
+  position: absolute;
+  top: calc(100% + 0.4rem);
+  left: 50%;
+  transform: translateX(-50%);
+  width: max-content;
+  max-width: min(16rem, calc(100vw - 1rem));
+  padding: 0.3rem 0.55rem;
+  background: var(--panel);
+  color: var(--ink);
+  border: 1px solid var(--edge);
+  border-radius: 0.5rem;
+  box-shadow: 0 1px 6px rgb(0 0 0 / 35%);
+  font-size: 0.75rem;
+  line-height: 1.3;
+  pointer-events: none;
+  z-index: 30;
+}
+
+#author-filter:hover .author-tip,
+#author-filter:focus-visible .author-tip {
+  display: block;
+}
+
+/* While the chip a press left is up it holds the place under the button, so the tooltip waits. */
+#author-filter:has(.author-chip:not([hidden])) .author-tip {
+  display: none;
+}
+
+/* `#520 search-whose-toggle-hint`. The chip a press leaves under the button, naming the state it
+   landed on in the owner's words (Both, My messages, Their messages). It wears the page's chip
+   dress (`.chip`), floats under the button so nothing shifts, and fades once web/voice.js adds
+   `.author-chip-out`; under reduced motion it simply goes, with no fade. */
+#author-filter .author-chip {
+  position: absolute;
+  top: calc(100% + 0.35rem);
+  left: 50%;
+  transform: translateX(-50%);
+  white-space: nowrap;
+  pointer-events: none;
+  transition: opacity 0.35s ease;
+  z-index: 30;
+}
+
+#author-filter .author-chip[hidden] {
+  display: none;
+}
+
+#author-filter .author-chip.author-chip-out {
+  opacity: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #author-filter .author-chip {
+    transition: none;
+  }
+}
+
+
+
+/* `#211 link-filter`. Links ON in the accent, the colour every other pressed toggle here wears and
+   the colour its links are drawn in; gold is the pin's alone. */
+#links-filter[aria-pressed="true"] {
+  color: var(--accent);
+}
+
+#links-filter[aria-pressed="true"]::before {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+/* OPEN: the glass grows along the line into a bar across the top of the list, and the pill has
+   given way to it (`renderChannelFreshness`). The bar is a panel of its own, because the count is
+   small grey type and would otherwise be printed straight onto whatever message is underneath. */
+#screen-main[data-searching] #search-float {
+  left: calc(var(--float-edge) + env(safe-area-inset-left));
+  height: var(--search-bar);
+  /* Less on the right, where the open glass has shed its disc and its icon has air of its own. In
+     px with the controls it holds (see --search-disc). */
+  padding: 3px 2px 3px 3px;
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  box-shadow: 0 1px 6px rgb(0 0 0 / 35%);
+}
+
+/* Whichever filter is beside the glass — Pinned over the channel, Links over the call, which has
+   no pins — keeps its square out of the glass's (`#search-toggle::after` reaches this far left of
+   the disc), so neither steals the other's taps. On the glass, so it holds for either. */
+#screen-main[data-searching] #search-toggle {
+  margin-left: var(--glass-clear);
+}
+
+/* Pressed is the open state, and it has to be legible at a glance — the field beside it is the
+   other half of the signal, but the icon is what the eye returns to. Inside the bar it sheds its
+   own disc: a ring within a ring reads as a second, separate control. */
+#search-toggle[aria-pressed="true"] {
+  color: var(--ink);
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+}
+
+/* ...and the list makes room for the bar at its head while it is open, so the first match is never
+   under it. The pill is not on screen while the bar is, so its room gives way to this rather than
+   stacking under it (`#324 live-pill-covers-row`: the pill's room is not made while searching). */
+#screen-main[data-searching] #scroll-area {
+  padding-top: calc(var(--float-line) + var(--search-bar) / 2 + 0.35rem);
+}
+
+/* `#212 link-filter`. The kinds of link — PRs, Commits, Actions, and since `#266 link-filter-kinds`
+   Issues, Files and Other — hung UNDER Links while it is on: a row of toggles floating below the bar
+   as the bar floats over the list. Centred under the
+   Links button; and where centred would run past the bar's right-hand end — always over the call
+   view, where Links stands beside the glass, and over the channel once the numbers on them are up on
+   a narrow phone — right-aligned under the bar's end instead, so it never leaves the screen.
+
+   Placed from the bar's right-hand inner edge, because everything right of Links on the bar has a
+   size this sheet already knows: the bar's 2px of right padding, the glass's disc and the clearance
+   before it, the gap, and — over the channel — Pinned's square, whose negative margin cancels the
+   gap after Links. `--links-mid` is the distance from that edge to the middle of Links. The row's
+   right-hand end is put there, then moved right by half the row's own width, which centres the row
+   on Links, or by `--links-mid` if that is less, which puts its end on the bar's. One rule for both
+   cases, and no script measuring anything: it holds at every width and every type size.
+
+   `#266 link-filter-kinds`. Six with their numbers up are wider than a phone — a little over the
+   394px bar of a 412px phone at the ordinary type size, and 582px under 130% type or more with all
+   six reading 99+ — so the row is never wider than the bar, and scrolls sideways inside that width
+   instead: a swipe brings Other into view, and a button the focus reaches is scrolled wholly into
+   view (web/voice.js). Right-aligned under the bar's end, as the rule above already puts a row that
+   wide, it spans the bar exactly. No scrollbar is drawn, because one would add to its height and
+   cover the first row; the button cut off at its end says there is more. */
+#link-kinds {
+  --links-mid: calc(2px + var(--search-disc) + var(--glass-clear) + var(--bar-gap) + 1.5 * var(--toggle-hit));
+  position: absolute;
+  top: calc(100% + 1px + var(--kinds-gap));
+  right: var(--links-mid);
+  display: flex;
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior-x: contain;
+  scrollbar-width: none;
+  transform: translateX(min(50%, var(--links-mid)));
+}
+
+#link-kinds::-webkit-scrollbar {
+  display: none;
+}
+
+/* Over the call view there are no pins, and Links stands next to the glass. */
+#pinned-filter[hidden] ~ #link-kinds {
+  --links-mid: calc(2px + var(--search-disc) + var(--glass-clear) + var(--bar-gap) + 0.5 * var(--toggle-hit));
+}
+
+/* Each kind a whole 44px-tall target, never narrower than tall, abutting the next as the filters on
+   the bar abut; what is drawn inside is a pill in the bar's panel and edge, and the pills are what
+   the eye separates. The target is px, as the bar's buttons are; the words are type, and grow with
+   the reader's font inside it — up to 16px, a quarter larger than at the default size. Past that,
+   three of them with three-figure numbers ("99+") were wider than a 360px phone: at 150% type the
+   row measured 355px in Chromium, and right-aligned under the bar it ran off the left of the screen
+   with half of PRs. Capped, it is about 305px there. (Since `#266 link-filter-kinds` the six scroll
+   inside the bar's width instead, and the cap keeps each one short.) Never squeezed by the row: a
+   button narrower than its words would cut them, and the row scrolls instead. */
+.link-kind {
+  position: relative;
+  z-index: 0;
+  flex: 0 0 auto;
+  min-width: var(--toggle-hit);
+  height: var(--toggle-hit);
+  padding: 0 9px;
+  background: none;
+  border: none;
+  border-radius: 0;
+  color: var(--muted);
+  font-size: min(0.8rem, 16px);
+  line-height: 1;
+  white-space: nowrap;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* The pill, behind the words: opaque, because the row floats over whatever message is scrolled
+   under it, and shadowed as the bar is. */
+.link-kind::before {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  inset: 6px 2px;
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  box-shadow: 0 1px 6px rgb(0 0 0 / 35%);
+  pointer-events: none;
+}
+
+/* ON — the kind is shown — ringed and tinted in the accent, as Links on is, with its words in the
+   ink, as the pressed To do chip's are: accent words on the accent's own tint come to 4.2:1 in the
+   dark theme, short of the 4.5 type this small needs, and the ink is over 9:1. OFF is the quiet grey
+   of a control at rest on the bare panel, AND struck through, because what is off is hidden: told
+   apart by more than its colour, in either theme. */
+.link-kind[aria-pressed="true"] {
+  color: var(--ink);
+}
+
+.link-kind[aria-pressed="true"]::before {
+  background: color-mix(in srgb, var(--accent) 18%, var(--panel));
+  border-color: var(--accent);
+}
+
+.link-kind[aria-pressed="false"] {
+  text-decoration: line-through;
+}
+
+/* `#620 link-url-chip`. URL is no kind: off hides nothing, so it is never struck through, and a little
+   room after it sets it apart from the kinds it stands before. */
+#link-raw[aria-pressed="false"] {
+  text-decoration: none;
+}
+
+#link-raw {
+  margin-right: 6px;
+}
+
+/* `#266 link-filter-kinds`. The row clips what spills past it, now that it scrolls, and a focus ring
+   drawn outside the button would be cut off top and bottom; so it is drawn inside, as the rows' own
+   buttons draw theirs. */
+.link-kind:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/* How many links in view are of that kind, a size below the name it qualifies. Blank at none, and
+   then it takes no room either. */
+.link-kind-count {
+  margin-left: 0.3em;
+  font-size: 0.8em;
+  font-variant-numeric: tabular-nums;
+}
+
+.link-kind-count:empty {
+  display: none;
+}
+
+/* ...and the list STARTS at the row's foot, so the first row is below the kinds of link rather than
+   underneath them. `#620 link-url-chip`: it used to make room at its head instead, as it does for the
+   bar, but room at the head scrolls away, and a scrolled list ran under the row, its words showing in
+   the clear space between and around the pills — the owner's screenshot had an unmatched line's
+   letters between Commits, Actions and Issues. So, as under the narrow phone's hung author filter
+   below, the list's top edge moves down to the row's foot and the room at its head is given back:
+   nothing is drawn under the row at any scroll position. The fade under the header shortens to the
+   room left at the head. */
+#screen-main[data-searching][data-link-kinds] #scroll-area {
+  --hang-foot: calc(var(--float-line) + var(--search-bar) / 2 + var(--kinds-gap) + var(--toggle-hit));
+  margin-top: var(--hang-foot);
+  padding-top: 0.35rem;
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 0.35rem);
+  mask-image: linear-gradient(to bottom, transparent 0, #000 0.35rem);
+}
+
+/* `#251 author-filter`, on a NARROW phone. A third 44px square on the bar's line would take the field
+   under 100px at 360px and leave it a few letters at 313px or under a larger font — the room `#211
+   link-filter` fought for. So up to 400px the author filter hangs UNDER the bar's left end, a disc on
+   the bar's panel, as the kinds of link hang under Links, and the list starts below it; with the kinds
+   up as well it hangs under their row, so the two never meet. Wider, it stays on the line, left of
+   Links. */
+@media (max-width: 400px) {
+  #screen-main[data-searching] #author-filter {
+    position: absolute;
+    top: calc(100% + 1px + var(--kinds-gap));
+    left: 3px;
+  }
+
+  /* `#520 search-whose-toggle-hint`. At the bar's left end a centred chip or tooltip would run off
+     the screen: there each starts at the button's own left edge instead. */
+  #author-filter .author-chip,
+  #author-filter .author-tip {
+    left: 0;
+    transform: none;
+  }
+
+  #screen-main[data-searching][data-link-kinds] #author-filter {
+    top: calc(100% + 1px + 2 * var(--kinds-gap) + var(--toggle-hit));
+  }
+
+  #author-filter + #links-filter {
+    margin-left: 0;
+  }
+
+  #author-filter:not([aria-pressed="true"])::before {
+    background: var(--panel);
+    box-shadow: inset 0 0 0 1px var(--edge), 0 1px 6px rgb(0 0 0 / 35%);
+  }
+
+  /* ...and the list STARTS at the disc's foot, rather than only making room for it at its head: room
+     at the head scrolls away, and a scrolled list ran under the disc, which covered the corner of
+     whichever tile was passing. So the list's top edge moves down to the disc's foot and the room at
+     its head is given back by as much: at any scroll position every row is where it was, and the
+     list scrolls as far, but nothing is drawn under the disc. The fade under the header shortens to
+     the room left at the head, so the first row is never faded. With the kinds of link up, the disc
+     hangs under their row, and the list starts under that. */
+  #screen-main[data-searching] #scroll-area {
+    --hang-foot: calc(var(--float-line) + var(--search-bar) / 2 + var(--kinds-gap) + var(--toggle-hit));
+    margin-top: var(--hang-foot);
+    padding-top: 0.35rem;
+    -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 0.35rem);
+    mask-image: linear-gradient(to bottom, transparent 0, #000 0.35rem);
+  }
+
+  #screen-main[data-searching][data-link-kinds] #scroll-area {
+    --hang-foot: calc(var(--float-line) + var(--search-bar) / 2 + 2 * (var(--kinds-gap) + var(--toggle-hit)));
+    padding-top: 0.35rem;
+  }
+}
+
+/* Armed reads differently from merely being dragged, because the difference is the whole of what
+   the reader has to know before letting go. Same accent idiom the pressed Type toggle uses. */
+#pull-refresh[data-state="armed"] {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+#scroll-tools .chip,
+#side-tools .chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  pointer-events: auto;
+  box-shadow: 0 1px 6px rgb(0 0 0 / 35%);
+}
+
+/*
+ * `#245 done-feedback`. The Undo chip names the message it would put back — "Undo “Backup check
+ * finished on…”" — where the row of chips has room for a name, and says only "Undo" where it has
+ * not. The whole label is the chip's tooltip and what a screen reader says either way
+ * (`drawUndoLabel`).
+ *
+ *   * ON A PHONE, "UNDO". From review: at 412px, beside Newest, Summaries and Expand all, the name
+ *     gave way to one letter — "Undo “B… ”" — which names nothing, and laid out at its own width it
+ *     had wrapped the row up over the list and out over the dock. So a row narrower than 30rem (every
+ *     phone, and a desk's column dragged narrow) draws the plain word: `scroll-tools` is a size
+ *     container, the row as wide as it is drawn.
+ *   * WIDER, THE NAME GIVES WAY, NEVER THE ROW: a named chip goes onto its line at a width that shows
+ *     the opening words — its basis is nothing and its least width stated, about a dozen characters of
+ *     the name with "Undo “”" and the padding, because the least width of its content would be the
+ *     whole name — then grows into whatever the line has spare, to the whole name or the name's
+ *     `max-width`, before the auto margin beside the jump to the newest message takes the rest. The
+ *     ellipsis is the chip's own, INSIDE the quotation marks: it shortens a label, never the message.
+ *   * A chip that counts ("Undo Done (12)") or says only "Undo" keeps its own width everywhere.
+ */
+#scroll-tools {
+  container: scroll-tools / inline-size;
+}
+
+#undo-dismiss-label {
+  display: flex;
+  min-width: 0;
+  white-space: nowrap;
+}
+
+/* The space after "Undo" ends a line of the label's flex row, where a browser drops it: drawn here. */
+#undo-dismiss .undo-named {
+  display: flex;
+  min-width: 0;
+  margin-inline-start: 0.3em;
+}
+
+#undo-dismiss .undo-name {
+  min-width: 1em;
+  max-width: 14em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+@container scroll-tools (width >= 30rem) {
+  #undo-dismiss:has(.undo-name) {
+    flex: 1 1 0;
+    min-width: 12em;
+    max-width: max-content;
+  }
+}
+
+@container scroll-tools (width < 30rem) {
+  #undo-dismiss .undo-named {
+    display: none;
+  }
+}
+
+.chip-icon {
+  width: 0.9rem;
+  height: 0.9rem;
+}
+

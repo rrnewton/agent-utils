@@ -1,0 +1,263 @@
+/* ---------------------------------------------------------------- the post confirmation --- */
+/*
+ * `#34 voice-chat-write-confirm`, and since `#269 approval-card-inline` THE TENTATIVE NEXT MESSAGE.
+ *
+ * It used to be an overlay at the top of the body area, over the transcript, far from the thumb and
+ * on top of the very lines being read back. Now it is the owner's own outgoing tile — the channel's
+ * `.outgoing-message`, at `li.mine`'s inset — as the last thing in the list on screen, just above that
+ * list's message box (`placePostCard` in web/voice.js moves it). Tentative and frozen cards differ in
+ * their words and buttons, never in geometry, so nothing moves sideways when a draft is sent.
+ *
+ * From top to bottom: a small heading, the words, More for a long draft, where it goes, the status
+ * line, and the buttons — Send last, under everything it confirms.
+ */
+#post-confirm {
+  background: var(--mine);
+  border: 1px solid var(--mine-edge);
+  border-radius: 0.5rem;
+  border-bottom-right-radius: 0.15rem;
+  padding: 0.6rem 0.7rem;
+  margin: 0.5rem 0;
+  overflow-wrap: anywhere;
+}
+
+/* In the call's pane, exactly where a turn of the owner's sits: `.messages li.mine`. */
+#pane-voice > #post-confirm {
+  margin-left: 15%;
+}
+
+/* In the channel, where its own outgoing messages sit. */
+#pane-discord > #post-confirm {
+  margin-left: var(--speaker-inset);
+}
+
+#post-confirm-title {
+  margin: 0 0 0.3rem;
+  color: var(--muted-on-mine);
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+
+#post-confirm p {
+  margin: 0.3rem 0;
+}
+
+/* The words that will be posted, verbatim. Kept as the owner's line breaks and wrapped anywhere,
+   because a long URL that ran off the card would be text the owner confirmed without seeing.
+   Folded, a long draft is held to the room the screen actually has — never less than three lines,
+   never more than about ten — with More to open it in place: never a scroll box inside the list. */
+#post-confirm-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: calc(0.88rem * var(--msg-scale, 1));
+}
+
+#post-confirm[data-folded] #post-confirm-text {
+  max-height: clamp(4.5rem, 100dvh - 38rem, 14rem);
+  overflow: hidden;
+}
+
+/* Docked at the foot of another screen, the words are three lines and More — and opened, they are
+   the ONE part of the card that scrolls. The card itself never does: a card that scrolled as a whole
+   put the line saying where it goes, the status line, Don't send and Send below its own fold, which
+   is exactly what a settling spoken yes must never do to Don't send. So the words are bounded by
+   the room the screen has once the rest of the card and a strip of the screen above it are laid
+   out (about 28rem of a phone), never less than two lines, and every other line of the card is
+   always on screen. */
+#post-confirm[data-place="dock"] #post-confirm-text {
+  max-height: max(2.6rem, min(14rem, 100dvh - 28rem));
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+#post-confirm[data-place="dock"][data-folded] #post-confirm-text {
+  max-height: max(2.6rem, min(4.5rem, 100dvh - 28rem));
+  overflow: hidden;
+}
+
+/* A short screen — a phone turned sideways, or Reply with the keyboard up taking half of it — has
+   no room for the card as a phone held upright does. Docked there it drops the heading, which the
+   card's accessible name still carries, and the words are two lines that scroll in place rather
+   than a fold and a More under them: what the card confirms, where it goes, its status and both
+   buttons, and nothing else. */
+@media (max-height: 500px) {
+  #post-confirm[data-place="dock"] #post-confirm-title,
+  #post-confirm[data-place="dock"] #post-confirm-more {
+    display: none;
+  }
+
+  #post-confirm[data-place="dock"][data-folded] #post-confirm-text {
+    overflow-y: auto;
+  }
+}
+
+#post-confirm-more {
+  margin: 0.1rem 0 0.2rem;
+}
+
+#post-confirm-where {
+  color: var(--muted-on-mine);
+  font-size: 0.82rem;
+}
+
+/* ONE LINE, ALWAYS, so the status changing its words never moves the buttons under a thumb — least
+   of all when a spoken yes starts to settle, and Don't send is the only way to stop the send. A
+   fixed height, not a minimum: a line that wrapped moved Don't send down 19px at exactly that
+   moment. The page's sentences fit the narrowest card (`POST_CARD_STATUS` in web/voice.js); a larger
+   type size is cut with an ellipsis rather than wrapped, and read out whole either way, because the
+   card's accessible description includes this line. */
+#post-confirm-expiry {
+  height: 1.45em;
+  line-height: 1.45;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--muted-on-mine);
+  font-size: 0.82rem;
+}
+
+/* ONE ROW, as designed: Don't send, then Send, which is the filled primary button and takes the
+   room, both at least 44px tall. Stacked, Don't send stood straight above Send with half a rem
+   between them, which is the wrong button for a thumb that lands a little high. A slightly smaller
+   label and padding are what let "Send to lead team" sit beside Don't send whole on the narrowest
+   card the page draws (a 360px phone's call pane); a longer name is cut on screen, and the
+   accessible name is always whole. */
+.post-confirm-actions {
+  flex-wrap: nowrap;
+  gap: 0.4rem;
+  margin: 0.45rem 0 0;
+}
+
+#post-confirm-send,
+#post-confirm-cancel {
+  min-height: 2.75rem;
+  padding-inline: 0.55rem;
+  font-size: 0.9rem;
+}
+
+#post-confirm-send {
+  flex: 1 1 8rem;
+  min-width: 0;
+}
+
+#post-confirm-cancel {
+  flex: 0 0 auto;
+}
+
+#post-confirm-send-label {
+  display: block;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/*
+ * THUMB REACH, while a draft is up. `#269 approval-card-inline`. The card takes the space above the
+ * message box and the box gives up its height: one line, with its own Send beside it on the same row
+ * — hidden while the box is empty, so "Send" at the right-hand edge always means the card — and an
+ * outlined Send once something is typed, so it is never mistaken for the card's. Focusing the box
+ * opens it again for typing. `margin-top: auto` moves from the box to the card: a short transcript
+ * leaves the gap ABOVE the card, not between it and the box.
+ */
+#screen-main[data-draft] #pane-voice > #post-confirm {
+  margin-top: auto;
+}
+
+/* Measured, not guessed: on a 375x667 phone Send's centre only reaches the thumb's line with the
+   card sitting close on the box — a quarter rem between them, the box's own top padding cut to
+   0.3rem, and half a rem rather than a whole one between the box and the status pill's room under
+   it. The card's height never matters here: it grows upward from the box. */
+#screen-main[data-draft] #pane-voice > #post-confirm,
+#screen-main[data-draft] #pane-discord > #post-confirm {
+  margin-bottom: 0.25rem;
+  padding-bottom: 0.45rem;
+}
+
+#screen-main[data-draft] #voice-composer {
+  margin-top: 0;
+  padding-bottom: calc(max(0.5rem, env(safe-area-inset-bottom)) + var(--scroll-tools-clearance, 0px) + var(--read-steer-clearance, 0px) + 2.4rem);
+}
+
+#screen-main[data-draft] #voice-composer,
+#screen-main[data-draft] #channel-composer {
+  padding-top: 0.3rem;
+}
+
+#screen-main[data-draft] #voice-composer,
+#screen-main[data-draft] #channel-composer {
+  grid-template-columns: 1fr auto;
+  align-items: end;
+}
+
+#screen-main[data-draft] #channel-compose-state {
+  grid-column: 1 / -1;
+}
+
+#screen-main[data-draft] #compose-text,
+#screen-main[data-draft] #channel-compose-text {
+  height: 2.75rem;
+  min-height: 2.75rem;
+  resize: none;
+}
+
+#screen-main[data-draft] #compose-text:focus,
+#screen-main[data-draft] #channel-compose-text:focus {
+  height: auto;
+  min-height: 5rem;
+}
+
+#screen-main[data-draft] #compose-text:placeholder-shown ~ #send-text,
+#screen-main[data-draft] #channel-compose-text:placeholder-shown ~ #channel-send {
+  display: none;
+}
+
+#screen-main[data-draft] #send-text,
+#screen-main[data-draft] #channel-send {
+  min-width: 0;
+  background: transparent;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+}
+
+/* Docked at the foot of Reply, the thread list, Settings or Help: its own row of the body, under the
+   screen, so the screen above it still scrolls and nothing is covered. Never a scroll box of its own:
+   only its words scroll (above), so its buttons are always laid out on screen. The thread list
+   (`#281 view-keys`) docks it because it has no box of its own to stand on, as the Threads screen it
+   replaced did not, and the left column's box is behind it, out of sight.
+
+   EVERY inset, the bottom one included. Off the main screen the control pane, which carries the
+   bottom inset everywhere else, is hidden, and this card is the last thing on the screen: on a phone
+   with a home indicator, Send would sit half under it and Don't send in the corner's curve — the
+   curve that ate the first word of the status line on the owner's iPhone. A desktop browser and
+   Chromium's emulation both report a zero inset, so nothing but this declaration can catch that. */
+#frame-body > #post-confirm {
+  grid-row: 3;
+  margin: 0;
+  border-radius: 0.5rem 0.5rem 0 0;
+  padding: 0.6rem calc(0.75rem + env(safe-area-inset-right)) calc(0.6rem + env(safe-area-inset-bottom))
+    calc(0.75rem + env(safe-area-inset-left));
+}
+
+/* Under the thread list, the main screen's: the control bar is under the card and carries the bottom
+   inset, so the card does not carry it again. And it is as wide as the reading column the cards and
+   the dock stand in, which is the whole of a phone: at a desk, across the window, its Send was a bar a
+   metre long under a column of cards a third as wide. */
+#frame-body > #post-confirm[data-screen="main"] {
+  justify-self: center;
+  box-sizing: border-box;
+  width: 100%;
+  max-width: var(--reading-width);
+  padding-bottom: 0.6rem;
+}
+
+/* Docked under Reply, whose own filled "Send reply" is the screen's purpose and goes to the same
+   channel: the card's Send is OUTLINED there, so the filled button the thumb finds lower down is
+   never taken for the reply's — a slip that would post the agent's draft instead. The same in two
+   columns while a reply is open at the foot of one (`#277 reply-in-column`): its box and filled Send
+   stand just under the list the card ends, or level with it in the other column. */
+#post-confirm[data-beside-reply] #post-confirm-send {
+  background: transparent;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+}
+

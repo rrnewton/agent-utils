@@ -1,6 +1,26 @@
 {
   "assembles": "voice.css",
   "parts": [
-    "voice/all.css"
+    "voice/00-frame.css",
+    "voice/01-top-bar.css",
+    "voice/02-body.css",
+    "voice/03-reply.css",
+    "voice/04-who-is-speaking.css",
+    "voice/05-inbox-view.css",
+    "voice/06-two-speakers.css",
+    "voice/07-long-messages.css",
+    "voice/08-summaries.css",
+    "voice/09-to-do-view.css",
+    "voice/10-labelled-seam.css",
+    "voice/11-message-text.css",
+    "voice/12-channel-rows.css",
+    "voice/13-collapsed-row.css",
+    "voice/14-rich-headers.css",
+    "voice/15-dock.css",
+    "voice/16-post-confirmation.css",
+    "voice/17-frozen-send-cards.css",
+    "voice/18-control-bar.css",
+    "voice/19-control-pane.css",
+    "voice/20-desktop-regime.css"
   ]
 }

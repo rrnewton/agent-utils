@@ -1,0 +1,1042 @@
+/* ------------------------------------------------------------------------------ the body --- */
+
+#frame-body {
+  /* The anchor for #status-line, which floats over the bottom of the body area, above the dock.
+     `#63 status-line-placement`. */
+  position: relative;
+  /* `#245 done-feedback`. Where the floating chips stand: half a rem above the foot of the list, or
+     just above the channel's message box wherever it reaches down into the strip they float in, so
+     the box and its Send never pass under them (`placeChipsOverComposer` in web/voice.js writes
+     `--composer-top`, how far above the foot the box's top edge is, and 0 when they stay at the
+     foot). The status pill and the pull's report stand on the chips, so they rise with them. */
+  --chips-foot: max(0.5rem, calc(var(--composer-top, 0px) + 0.25rem));
+  /* `min-height: 0` is the load-bearing one: without it a grid item refuses to shrink below its
+     content, the body row grows past the viewport, and the document scrolls again — which is the
+     exact behaviour this whole file removes. */
+  min-height: 0;
+  display: grid;
+  /* The third row is the send card's when it is docked under a screen other than the main one, or
+     under the thread list (`#269 approval-card-inline`, `#281 view-keys`); empty, it takes no room. */
+  grid-template-rows: auto 1fr auto;
+  padding: 0;
+}
+
+#screens {
+  min-height: 0;
+  display: grid;
+}
+
+.screen {
+  /* All three screens occupy the same cell; `hidden` chooses. No router, no framework. */
+  grid-area: 1 / 1;
+  min-height: 0;
+}
+
+/* The secondary screens are ordinary documents and may be longer than the frame, so they get
+   their own scroll — still inside the frame, never the page. */
+#screen-signin,
+#screen-settings,
+#screen-help {
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 0.75rem calc(1rem + env(safe-area-inset-right)) 1rem
+    calc(1rem + env(safe-area-inset-left));
+}
+
+/*
+ * `#85 voice-desktop-review`. A COLUMN, on every screen size.
+ *
+ * The reading-column rule at the foot of this file deliberately exempted the settings screen —
+ * "they are forms rather than reading, and giving them a column is a separate judgement nobody has
+ * made yet". The owner has now made it: on a desktop browser the settings screen ran the full width
+ * of the window, which puts a checkbox at one end of a metre of desk and its label at the other.
+ *
+ * A form is read before it is used, so it gets the same treatment as the transcript — but a FIXED
+ * measure rather than `var(--reading-width)`. That variable is the reader's choice about the
+ * transcript, and dragging the transcript wider has no business reflowing the settings screen; a
+ * form's comfortable width is a property of the form.
+ */
+.settings-column {
+  max-width: 34rem;
+  margin-inline: auto;
+}
+
+/*
+ * The separators the owner asked for, as CARDS rather than rules.
+ *
+ * A horizontal rule between groups says "these are different" and nothing else. A bordered block
+ * says which controls belong to which heading, which is the actual question when a screen is a
+ * dozen switches long — and it is what stops a stray `aria-live` line reading as though it belonged
+ * to the group below it.
+ */
+.settings-group {
+  margin: 0 0 0.75rem;
+  padding: 0.6rem 0.8rem 0.8rem;
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: 0.8rem;
+}
+
+/*
+ * `#271 settings-groups`. The SECTION is the card now, and the groups inside it are rows.
+ *
+ * Twenty-two cards of equal weight read as twenty-two separate decisions — "so many individual
+ * granular options", in the owner's words. Five cards, each with a heading a size up, read as five
+ * places to look; inside one, a control's group keeps its small heading and its `?`, and a rule
+ * above it says where it starts, which is all a row needs. The border, the fill and the corners
+ * move from the group to the section, so a group inside a section draws none of its own.
+ */
+/* `#457 settings-server-side`. The one per-device section says so beside its title,
+   small and faint: a fact to notice once, not a thing to read every time. */
+.settings-scope-note {
+  margin-left: 0.45em;
+  font-size: 0.72em;
+  font-weight: 400;
+  opacity: 0.55;
+}
+
+.settings-section {
+  margin: 0 0 1rem;
+  padding: 0.6rem 0.8rem 0.2rem;
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: 0.8rem;
+}
+
+.settings-section > .fold-body > .settings-group {
+  margin: 0;
+  padding: 0.55rem 0 0.7rem;
+  background: none;
+  border: none;
+  border-top: 1px solid var(--edge);
+  border-radius: 0;
+}
+
+/* The section's heading is the loudest thing on the screen after the title bar: a size up from a
+   group's, so the five read before the rows inside them. */
+#screen-settings .settings-section > h2,
+#screen-settings .settings-section > .group-head > h2 {
+  font-size: 1.05rem;
+  margin: 0.15rem 0 0.35rem;
+}
+
+/* `#372 settings-header-layout`. The head of the screen is ONE ROW: the server line, then Expand all
+   and Open help at its end. It wraps rather than squeezes: the server line asks for 16rem, so on a
+   phone, where it and the two buttons do not fit one line, the buttons go under it together, still
+   at the row's end, and on a desk all three share the line. */
+.settings-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem 0.75rem;
+  margin: 0 0 0.75rem;
+}
+
+/* The Server section, drawn as a line of the head rather than as a card: its label, then its host,
+   on one baseline. `min-width: 0` lets the host's ellipsis start inside it instead of the line
+   pushing the buttons off the screen. */
+#screen-settings #settings-server {
+  flex: 1 1 16rem;
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  background: none;
+  border: none;
+}
+
+#screen-settings #settings-server > h2 {
+  flex: 0 0 auto;
+  margin: 0;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+/* `#342 settings-server-hostname`, quietened by `#372 settings-header-layout`. The answer to "which
+   server is this?" is secondary information, not the loudest line on the screen: small, ordinary
+   type on one line, whole in its tooltip, and plain text a reader can select and copy. In two parts
+   (web/voice.js, `renderServerHost`): the name, cut with an ellipsis where the line is too short for
+   it, and the port after it, never cut, since the port is what tells two instances on one host apart
+   and a phone has no tooltip. The name leaves the port its room, `--port-width`, which the script
+   gives in `ch`: the type is monospaced, so a character is exactly that wide. An inline block and not
+   a flex row, whose items would be blocks, and copying the host would put a line break before its
+   port. */
+#screen-settings .settings-server-host {
+  min-width: 0;
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85rem;
+  font-weight: 400;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+#screen-settings .settings-server-name {
+  display: inline-block;
+  max-width: calc(100% - var(--port-width, 0ch));
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: bottom;
+}
+
+.settings-head-actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-inline-start: auto;
+}
+
+/* A group's own heading, inside a section: what a card's heading used to be, one step quieter.
+   `#402 who-is-who-channel-box`: Who is who, at the foot of the channel box, is headed as one. */
+#screen-settings .settings-group > .group-head > h3,
+#screen-settings #identity-group > .group-head > h3 {
+  font-size: 0.92rem;
+  margin: 0.15rem 0 0.3rem;
+}
+
+/* `#272 voice-agent-instructions`. The system prompt, folded under the instructions box: a native
+   disclosure, so its summary is a button to a screen reader and to Enter and Space, sized as a tap
+   target like Help's headings. The prompt is long; its box is tall and keeps its line breaks. */
+.settings-fold {
+  margin: 0.6rem 0 0;
+}
+
+.settings-fold > summary {
+  box-sizing: border-box;
+  min-height: 2.75rem;
+  padding: 0.6rem 0;
+  color: var(--accent);
+  font-size: 0.9rem;
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+#voice-system-prompt {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.8rem;
+  white-space: pre-wrap;
+}
+
+/* Restore deletes the owner's own copy of the prompt, so it is armed the way #clear-view is: the
+   first tap changes the word and the colour, and only the second acts. */
+#restore-voice-system-prompt.armed {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
+/* `#208 persistent-cache`. The question asked before the server's saved messages are erased: ruled
+   down its edge in the warning colour, as the warning beside the clear-unread choice is, so it reads
+   as a caution rather than as one more hint. The button that erases wears the colour an armed
+   Restore wears; the one that keeps them stays as every other button. */
+#message-cache-confirm {
+  margin: 0.4rem 0 0.6rem;
+  padding-left: 0.5rem;
+  border-left: 3px solid var(--warn);
+}
+
+#message-cache-confirm > p {
+  margin: 0;
+}
+
+#message-cache-confirm-yes {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
+/* The heading and its `?` on one line, the `?` hard right. */
+.group-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+/* `#346 settings-collapsible`. A heading that folds: the heading's words are a button as wide as the
+   row up to its `?`, a tap target, with a chevron in front that points right while it is folded and
+   down while it is open. It keeps the heading's own size and weight, so a section's title still reads
+   a size above a group's. */
+.group-head > :is(h2, h3) {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.fold-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 2.6rem;
+  margin: 0;
+  padding: 0.15rem 0;
+  background: none;
+  border: none;
+  border-radius: 0.3rem;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.fold-toggle::before {
+  content: "";
+  flex: 0 0 auto;
+  width: 0.42rem;
+  height: 0.42rem;
+  margin-left: 0.1rem;
+  border-right: 2px solid var(--muted);
+  border-bottom: 2px solid var(--muted);
+  transform: rotate(-45deg);
+  transition: transform 0.12s ease-out;
+}
+
+.fold-toggle[aria-expanded="true"]::before {
+  transform: rotate(45deg);
+}
+
+.fold-toggle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fold-toggle::before { transition: none; }
+}
+
+/* A fold's body draws no box of its own: folded, `content-visibility: hidden` leaves a box of nothing,
+   and open, its groups are the section's rows as they always were. */
+.fold-body {
+  margin: 0;
+  padding: 0;
+}
+
+/* `#347 settings-prose`. A heading whose one-line description is its tooltip says so to a mouse. */
+#screen-settings :is(h2, h3)[title] {
+  cursor: help;
+}
+
+/* Small, round, and quiet: it is an offer, not an instruction, and there is one on nearly every
+   group. Sized to the 2.4rem tap target everything else on this page uses even though it is drawn
+   much smaller than that. */
+.help-link {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.5rem;
+  height: 1.5rem;
+  padding: 0;
+  background: none;
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  color: var(--muted);
+  font: inherit;
+  font-size: 0.8rem;
+  line-height: 1;
+  min-height: 0;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.help-link:focus-visible {
+  color: var(--ink);
+  border-color: var(--accent);
+}
+
+/* `#347 settings-prose`. "How messages are pre-processed for speech": the one entry into Help that is
+   words rather than a `?`, so it reads as a link — the accent, underlined, at the size of a hint — and
+   not as a round button stretched round a sentence. Still a button: it opens a screen of this page and
+   goes nowhere, which is what a link would claim. Tall enough to be a tap target on a phone. */
+.help-link.help-link-text {
+  display: inline-flex;
+  width: auto;
+  height: auto;
+  min-height: 2.4rem;
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  color: var(--accent);
+  font-size: 0.85rem;
+  line-height: 1.3;
+  text-align: left;
+  text-decoration: underline;
+  text-underline-offset: 0.15em;
+}
+
+.help-link.help-link-text:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.help-text-row {
+  margin: 0.3rem 0 0;
+}
+
+/* `#224 keyboard-shortcuts`. Help's Keyboard entry: each key, then what it does, one per line, under
+   a heading for each part of the list. The keys in the reader's ink and a column of their own, so the
+   list reads down the keys at a glance; the meanings quiet, as every hint on this screen is. On a
+   phone too narrow for the column a line wraps with its meaning under its key rather than squeezing
+   either. */
+.key-group {
+  margin: 1rem 0 0.4rem;
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.key-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.35rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.key-list li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.15rem 0.75rem;
+}
+
+.key-list kbd {
+  flex: 0 0 10.5rem;
+  color: var(--ink);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.8rem;
+}
+
+.key-list span {
+  flex: 1 1 14rem;
+}
+
+/* One entry per settings group, and the target of its `?`. `scroll-margin-top` is what makes the
+   deep link land with the heading visible rather than jammed under the top edge of the scroller. */
+.help-entry {
+  margin: 0;
+  border-bottom: 1px solid var(--edge);
+  scroll-margin-top: 0.75rem;
+}
+
+.help-entry:last-child {
+  border-bottom: none;
+}
+
+/* `#246 help-sections`. Each entry is a <details>, folded to its heading, so the screen is a list of
+   headings and the one a ? opened. The heading is the <summary>: a whole row to tap, at least the
+   44px target everything else here is, with the browser's own triangle in front of it saying which
+   way it will go. An open entry keeps the space under its text that every entry used to have. */
+.help-entry > summary {
+  box-sizing: border-box;
+  min-height: 2.75rem;
+  padding: 0.6rem 0;
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.help-entry > summary::marker {
+  color: var(--muted);
+}
+
+#screen-help .help-entry > summary > h2 {
+  display: inline;
+  margin: 0;
+}
+
+.help-entry[open] {
+  padding-bottom: 0.75rem;
+}
+
+/* Expand all / Fold all: above the first heading, where it is met before any of them. */
+#fold-help {
+  margin: 0 0 0.5rem;
+}
+
+#screen-main {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  /* `#36 thread-view-phone-overflow`. The implicit column is `auto`, which may not shrink below
+     its widest item's min-content width — and the heading over a thread was a `nowrap` title, so
+     that was the whole title. A thread named longer than the phone widened the column, and every
+     message row, the composer and the tabs with it, off the right edge instead of ellipsising the
+     title. The same trap as `min-height: 0` above, sideways; the card that heads a thread now
+     (`#298 thread-card-header`) wraps, but whatever heads it next must not widen the screen. */
+  grid-template-columns: minmax(0, 1fr);
+  min-height: 0;
+  /* The anchor for #scroll-tools, which floats over the bottom corner of the list. It has to be
+     THIS element rather than #scroll-area: a child of the scroll area would be faded by the mask
+     below and would scroll away with the content. */
+  position: relative;
+}
+
+#channel-navigation {
+  grid-row: 2;
+  padding: 0.4rem max(0.75rem, env(safe-area-inset-right)) 0.4rem
+    max(0.75rem, env(safe-area-inset-left));
+  border-bottom: 1px solid var(--edge);
+}
+
+#channel-view-tabs {
+  display: flex;
+  gap: 0.25rem;
+  max-width: 28rem;
+  margin-inline: auto;
+}
+
+#channel-view-tabs button {
+  flex: 1;
+  min-height: 2.5rem;
+  background: transparent;
+  color: inherit;
+  border: 1px solid var(--edge);
+}
+
+#channel-view-tabs button[aria-pressed="true"] {
+  background: var(--accent);
+  color: var(--bg);
+}
+
+/* `#298 thread-card-header`. Over a thread across the window the heading is the thread's card, drawn
+   by the rules of the card at the top of the right column (`.thread-card-header`, with the cards' own
+   below), in the reading column as the thread list's cards are. */
+#thread-heading {
+  display: flex;
+  align-items: flex-start;
+  max-width: var(--reading-width);
+  margin-inline: auto;
+}
+
+/* The card has its own border: no rule under it as well. */
+#channel-navigation:has(> #thread-heading:not([hidden])) {
+  border-bottom: 0;
+}
+
+.thread-badge,
+.thread-replies {
+  border: 1px solid hsl(var(--thread-hue, 210) 55% 50%);
+  border-radius: 1rem;
+  background: hsl(var(--thread-hue, 210) 55% 50% / 0.12);
+  color: inherit;
+  padding: 0.2rem 0.65rem;
+  min-height: 2rem;
+  font-size: 0.85rem;
+}
+
+/* `#377 compact-collapsed-rows`. The tag on the header line is a button of that line, as Reply, ⋯ and
+   Done beside it are: their padding, type and height, so a Thread(32) no longer stands taller than
+   its row's other controls and pushes the line apart. Its thread's colour stays on its edge and tint;
+   only N replies at the foot of a root keeps the larger chip. */
+.thread-badge {
+  flex: 0 0 auto;
+  padding: 0.05rem 0.5rem;
+  border-radius: 999px;
+  font: inherit;
+  font-size: 0.72rem;
+  letter-spacing: 0.02em;
+  min-height: 0;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* `#252 thread-button-state`. A thread nobody has answered is not one yet: its tag is drawn as Reply
+   beside it is, a quiet control on the metadata row with no colour of its own, until the first
+   reply makes it a thread's coloured Thread(N) (web/voice.js, `paintThreadBadge`). */
+.thread-badge[data-thread-state="start"] {
+  padding: 0.05rem 0.5rem;
+  background: none;
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  color: var(--muted);
+  font: inherit;
+  font-size: 0.72rem;
+  letter-spacing: 0.02em;
+  min-height: 0;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* ...and it gains the accent with the selected row, as Reply does. */
+#side-log li.discord-message[data-selected="true"] .thread-badge[data-thread-state="start"],
+#side-cards li.discord-message[data-selected="true"] .thread-badge[data-thread-state="start"],
+#discord-log li.discord-message[data-selected="true"] .thread-badge[data-thread-state="start"],
+#pinned-log li.discord-message[data-selected="true"] .thread-badge[data-thread-state="start"] {
+  color: var(--ink);
+  border-color: var(--accent);
+}
+
+.thread-replies {
+  display: block;
+  width: fit-content;
+  margin-top: 0.6rem;
+  /* `#222 unread-replies`. One line each, so on a narrow row the unread count beside it moves down
+     whole rather than either chip breaking inside itself ("about 52 / replies"). */
+  white-space: nowrap;
+}
+
+/* `#222 unread-replies`. On Main, beside a root's N replies, how many of them are unread: "12 replies
+   3 unread", one line. The accent, on its edge, its tint and its words, is what the jump to the
+   newest message wears when something has arrived below — on this page that colour says "something
+   here is waiting for you". The chips' shape and size otherwise, as one of them. */
+.thread-unread {
+  display: inline-block;
+  border: 1px solid var(--accent);
+  border-radius: 1rem;
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  color: var(--accent);
+  font-weight: 600;
+  padding: 0.2rem 0.65rem;
+  min-height: 2rem;
+  font-size: 0.85rem;
+  margin-top: 0.6rem;
+  white-space: nowrap;
+}
+
+/* N replies gives up its line to share it. */
+#side-log li.discord-message[data-unread-replies] > .thread-replies,
+#side-cards li.discord-message[data-unread-replies] > .thread-replies,
+#discord-log li.discord-message[data-unread-replies] > .thread-replies {
+  display: inline-block;
+}
+
+.thread-replies + .thread-unread {
+  margin-inline-start: 0.4rem;
+}
+
+/* `#215 reply-coalesce`. Pressed while its replies are gathered under it, in the bridge's colour, so
+   the chip that gathered them says it is the one that will put them back. */
+.thread-replies[aria-pressed="true"] {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
+/* `#277 thread-card-focus`. A card of the Threads list: its name, which highlights it, and beside it the
+   button into the thread — or under it, at its end, where the name needs the line, so that a long name
+   or what the thread is about has the card's width rather than a phone's half of it. What the thread is
+   about shows on the card highlighted alone, which is ringed and tinted in its thread's colour; every
+   other card's edge and unread count go grey while it shows. */
+#thread-list .thread-card {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.3rem 0.6rem;
+  border-inline-start: 3px solid hsl(var(--thread-hue, 210) 55% 50%);
+  /* `#483 thread-card-read-style`: a card recedes by the message rows' amounts (below). */
+  opacity: var(--row-opacity, 1);
+  filter: var(--row-filter, none);
+}
+
+/* `#483 thread-card-read-style`: read whole, a card of this list recedes as the Threads view's
+   cards and the read message rows do, and comes back where the reader is on it. */
+#thread-list .thread-card[data-thread-read] {
+  --row-opacity: 0.42;
+  --row-filter: grayscale(1);
+  --row-grey: 1;
+}
+
+#thread-list .thread-card[data-thread-read][data-selected="true"],
+#thread-list .thread-card[data-thread-read][data-highlighted],
+#thread-list .thread-card[data-thread-read]:focus-within {
+  --row-opacity: 1;
+  --row-filter: none;
+  --row-grey: 0;
+}
+
+#thread-list .thread-card > .thread-open {
+  flex: 1 1 auto;
+  width: auto;
+  min-width: 0;
+}
+
+.thread-card-text {
+  display: none;
+}
+
+.thread-card[data-highlighted] .thread-card-text {
+  display: block;
+  margin-top: 0.3rem;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+#thread-list .thread-card[data-highlighted] {
+  border-color: hsl(var(--thread-hue, 210) 55% 50%);
+  background: color-mix(in srgb, hsl(var(--thread-hue, 210) 55% 50%) 14%, var(--panel));
+}
+
+#thread-list:has(> .thread-card[data-highlighted]:not([hidden]):not(.search-hidden)) > .thread-card:not([data-highlighted]) {
+  border-inline-start-color: var(--thread-grey);
+}
+
+#thread-list:has(> .thread-card[data-highlighted]:not([hidden]):not(.search-hidden)) > .thread-card:not([data-highlighted]) .thread-card-unread {
+  color: var(--muted);
+}
+
+.thread-card-open {
+  flex: none;
+  margin-inline-start: auto;
+  min-height: 2.75rem;
+  padding: 0.25rem 0.75rem;
+  background: transparent;
+  color: var(--ink);
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  font: inherit;
+  font-size: 0.85rem;
+  white-space: nowrap;
+}
+
+.thread-card-unread {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.thread-open {
+  display: block;
+  width: 100%;
+  text-align: start;
+  background: transparent;
+  color: inherit;
+  border: 0;
+  padding: 0.65rem;
+}
+
+.channel-loading {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+}
+
+.channel-loading::before {
+  content: "";
+  flex: 0 0 auto;
+  width: 0.85rem;
+  height: 0.85rem;
+  border: 2px solid var(--edge);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: outgoing-spin 0.8s linear infinite;
+}
+
+/* Local sends live beside the confirmed history until their provider IDs arrive. They look like
+   the reader's own messages, but carry delivery state instead of actions on a server message. */
+#side-outgoing-log .outgoing-message,
+#outgoing-log .outgoing-message,
+.outgoing-inplace .outgoing-message {
+  background: var(--mine);
+  border-color: var(--mine-edge);
+  margin-left: var(--speaker-inset);
+  border-bottom-right-radius: 0.15rem;
+  overflow-wrap: anywhere;
+}
+
+#side-outgoing-log .msg-text,
+#outgoing-log .msg-text,
+.outgoing-inplace .msg-text {
+  white-space: pre-wrap;
+  font-size: calc(0.88rem * var(--msg-scale));
+}
+
+.outgoing-status {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-top: 0.4rem;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.outgoing-spinner {
+  flex: 0 0 auto;
+  width: 0.85rem;
+  height: 0.85rem;
+  border: 2px solid var(--mine-edge);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: outgoing-spin 0.8s linear infinite;
+}
+
+.outgoing-message[data-send-state="failed"] .outgoing-status,
+.outgoing-message[data-send-state="unconfirmed"] .outgoing-status {
+  color: var(--warn);
+}
+
+/* `#621 send-double-check`: two very small ticks after the Sending ellipsis. */
+.send-ticks { display: inline-flex; gap: 1px; margin-left: 2px; cursor: pointer; }
+.send-tick { font-size: 9px; line-height: 1; color: #9aa0a6; }
+.send-tick.ok { color: #1a9e54; }
+.send-tick.bad { color: #c0392b; }
+.send-times { font-size: 0.72rem; color: var(--muted); }
+
+.outgoing-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-top: 0.5rem;
+}
+
+.outgoing-actions button {
+  min-height: 2.5rem;
+}
+
+/* `#348 settings-dynamic-lists`. A READOUT, drawn as one: the dark, monospaced panel of a terminal, in
+   both colour schemes, so a list of records or a connection's facts reads as data to look at and not as
+   a row of controls. Its own two colours, legible on each other whatever the page's scheme is. */
+.data-panel {
+  --data-bg: #0e1116;
+  --data-ink: #d3dae3;
+  --data-muted: #8b96a5;
+  --data-rule: #252b34;
+  background: var(--data-bg);
+  color: var(--data-ink);
+  border: 1px solid var(--data-rule);
+  border-radius: 0.45rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+
+/* `#193 compose-draft-loss`, drawn as data by `#348 settings-dynamic-lists`. Settings' Recently
+   dismissed: a panel of a fixed height that the reader can drag taller or shorter (`resize`), its rows
+   scrolling inside it; each row where the message was going and how long ago, and ONE line of its
+   text, cut off here and not by the script. */
+.dismissed-sends {
+  box-sizing: border-box;
+  height: 11rem;
+  min-height: 5.5rem;
+  max-height: 70vh;
+  resize: vertical;
+  overflow: auto;
+  overscroll-behavior: contain;
+  margin: 0.25rem 0 0.5rem;
+  padding: 0;
+  list-style: none;
+}
+
+.dismissed-send + .dismissed-send {
+  border-top: 1px solid var(--data-rule);
+}
+
+/* The row is one button, and must not look like one: no border, no fill, the panel's ink, full width. */
+.dismissed-send-open {
+  display: grid;
+  gap: 0.1rem;
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 2.75rem;
+  padding: 0.35rem 0.6rem;
+  background: none;
+  border: none;
+  border-radius: 0;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.dismissed-send-open:hover,
+.dismissed-send-open:focus-visible {
+  background: var(--data-rule);
+}
+
+.dismissed-send-open:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.dismissed-send-meta {
+  color: var(--data-muted, var(--muted));
+  font-size: 0.72rem;
+}
+
+/* The shorter preview: one line, an ellipsis where it is cut. */
+.dismissed-send-text {
+  display: block;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* The pop-out: one message whole, laid over its own group from the group's top edge and as wide as it,
+   scrolling inside itself when the message is long. Absolute, against the group (`#dismissed-group`),
+   and never fixed: nothing on this page escapes the box it is laid out in (`#226`). */
+#dismissed-group {
+  position: relative;
+}
+
+.data-popout {
+  position: absolute;
+  /* Above the frame's overlays, the status pill's 5 among them (`#351 settings-polish`): a modal is
+     drawn over everything. Brought on screen by its foot, its buttons stand where the pill floats. */
+  z-index: 6;
+  left: -0.3rem;
+  right: -0.3rem;
+  top: 0;
+  box-sizing: border-box;
+  max-height: min(36rem, 80dvh);
+  overflow: auto;
+  padding: 0.8rem 0.9rem 0.6rem;
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: 0.8rem;
+  /* The screen behind dimmed, so it reads as over the list rather than as part of it. A shadow, not an
+     element: it takes no tap of its own, and what is under it takes none either while the pop-out is up,
+     because web/voice.js makes it inert (`#351 settings-polish`). Close, Escape or Back is how it goes.
+     A shadow is clipped like any overflow, so this one ends at the edges of Settings' scrolling box;
+     what is inert beyond them is dimmed by the rule below. The status pill, which floats over the box
+     from outside it, is drawn under this shadow, and so dimmed by it. */
+  box-shadow: 0 0 0 100vmax rgb(0 0 0 / 0.45), 0 0.6rem 2rem rgb(0 0 0 / 0.45);
+}
+
+/* `#351 settings-polish`. What the pop-out makes inert beyond the box its shadow is drawn in (`dimBoxOf`
+   in web/voice.js), laid out beside that box: the top bar with its Back, and the dock (`inertAround`).
+   The shadow's own depth, which leaves 0.55 of every colour under it, so the whole screen reads as one
+   dim and no control a tap cannot reach is left looking as if it could be pressed. Not the status pill:
+   it floats over the box, under the pop-out and its shadow, and the shadow dims it (`floatsOverDimBox`).
+   It was once dimmed here instead, with the box made a stacking context of its own to keep the shadow
+   off it, and then the box, the pop-out in it, was drawn under the pill: at the foot of the screen the
+   pill covered Copy, Put back and Close. */
+[data-under-dim] {
+  filter: brightness(0.55);
+}
+
+.data-popout > .dismissed-send-meta {
+  margin: 0 0 0.45rem;
+  color: var(--muted);
+}
+
+.dismissed-send-full {
+  max-height: 50dvh;
+  overflow: auto;
+  padding: 0.55rem 0.65rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+/* `#348 settings-dynamic-lists`. Connection status: the same panel, one fact to a line. */
+.connection-panel {
+  margin: 0.25rem 0 0.4rem;
+  padding: 0.55rem 0.7rem;
+}
+
+.connection-panel > .data-line {
+  margin: 0;
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+}
+
+.connection-panel > .data-line + .data-line {
+  margin-top: 0.35rem;
+  color: var(--data-muted);
+}
+
+.connection-panel > .data-line:empty {
+  display: none;
+}
+
+@keyframes outgoing-spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .outgoing-spinner,
+  .channel-loading::before { animation: none; }
+}
+
+/* `#241 voice-composer`. The call's view has the channel's composer: the same box, the same Send,
+   the last thing in the scrolling list, so the three are one rule and cannot come to look different.
+   It replaced the Type toggle that turned the control bar into a text field. */
+#voice-composer,
+#side-composer,
+#channel-composer {
+  display: grid;
+  gap: 0.5rem;
+  /* `#194 thread-picker-polish`. The floating chips (#scroll-tools) sit over the bottom of the list,
+     and the composer is the last thing in it, so scrolled to the end the chips covered the box the
+     owner was typing a thread reply into. The composer keeps their measured height as room under
+     itself — `--scroll-tools-clearance`, which web/voice.js sets from a ResizeObserver and which is
+     zero when no chip is showing — so at the end of the list the chips float over that room. */
+  padding: 1rem 0.75rem calc(max(1rem, env(safe-area-inset-bottom)) + var(--scroll-tools-clearance, 0px) + var(--read-steer-clearance, 0px));
+  border-top: 1px solid var(--edge);
+}
+
+/* `#245 done-feedback`. The channel's box keeps that room ABOVE itself instead. From review: the Undo
+   chip stood on Send in the 412px captures, the list a little short of its end — a room under the box
+   is only where the chips float when the list is at its very end, and a few pixels up the box's Send
+   slides under them. So on the channel the chips never go lower than the box's top edge
+   (`--chips-foot`, above): scrolled up they float over the list at its foot, and as the box comes up
+   they stand on it and rise with it, the way a sticky row does, into this room between the last
+   message and the box at the end of the list. The call's box keeps its room under itself: its view
+   says something on the status pill at every turn, and there the pill floats in that room rather
+   than over the newest line. */
+#channel-composer {
+  /* `#433 read-strip-low`: the read-aloud strip floats in this room over the chips while a read
+     plays, so the room grows by its measured height and the last message still scrolls clear. */
+  margin-top: calc(var(--scroll-tools-clearance, 0px) + var(--read-steer-clearance, 0px));
+  padding-bottom: max(1rem, env(safe-area-inset-bottom));
+}
+
+#compose-text,
+#side-compose-text,
+#channel-compose-text {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 5rem;
+  resize: vertical;
+  font: inherit;
+  font-size: max(1rem, 16px);
+}
+
+#send-text,
+#side-send,
+#channel-send {
+  justify-self: end;
+  min-width: 5rem;
+}
+
+/* `#340 composer-grow-box`. The Grow choice beside Send is a desk's alone: a phone's box is as it was,
+   and has no row to spare for it. Drawn in the desktop block below. */
+.composer-grow {
+  display: none;
+}
+
+/* `#575 mobile-keyboard-compose`. A box's new line for a phone's keyboard, whose return key sends: drawn only
+   while that keyboard is up, in the keyboard's block below. */
+.newline-key {
+  display: none;
+}
+
+/* `#610 mobile-keyboard-compose`. The keyboard's numbers, for a screenshot from a phone (Settings › Typing ›
+   Keyboard layout debug): over the top of everything, taking no touch. Placed against the layout viewport,
+   as the document never scrolls (absolute, not fixed: nothing here escapes a scroller's containment), and
+   moved down by web/voice.js as far as Safari pans the visual viewport off that viewport's top. */
+#keyboard-debug-readout {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 2147483647;
+  margin: 0;
+  padding: 0.25rem 0.4rem;
+  background: rgb(0 0 0 / 0.8);
+  color: #8f8;
+  font: 11px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  pointer-events: none;
+}
+
+#keyboard-debug-readout[hidden] {
+  display: none;
+}
+

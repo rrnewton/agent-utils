@@ -1,0 +1,2157 @@
+/* ------------------------------------------------------------------- the desktop regime ---- */
+/*
+ * `#55 voice-desktop-app`.
+ *
+ * Everything above this line was written for a phone held in one hand, and a phone layout
+ * stretched to 1440px is not a desktop application: the transcript ran to ~180 characters a line,
+ * "Start a new call" was a button thirteen hundred pixels wide, and the dock was sized for a thumb
+ * nobody is using. That was photographed, not guessed.
+ *
+ * THE REGIME IS CHOSEN BY CAPABILITY, NEVER BY USER AGENT. `min-width: 900px` says there is room
+ * for a column with margin either side of it; `pointer: fine` says the input device can put a
+ * cursor on a nine-pixel handle. A user-agent string answers neither question — a tablet with a
+ * trackpad and a phone in desktop-mode both lie to it — and the page suite asserts that no such
+ * string appears in this file or in web/voice.js.
+ *
+ * ONE block, deliberately: desktop rules sprinkled through the file are how a phone rule and a
+ * desktop rule end up disagreeing about one selector with nothing on the page saying which wins.
+ * It is LAST in the file so that every override here is the later rule at equal specificity, and
+ * so that the phone declaration is still the first one `cssBlock()` finds.
+ */
+@media (min-width: 900px) and (pointer: fine) {
+  /* `#345 settings-multi-column`. Settings' sections in columns, as many as the window has room for at
+     24rem or more each: two at 900px, three at 1280, four at 1920, and no more than the 125rem the
+     screen is held to. Each section is kept whole (`break-inside: avoid`) and the columns are balanced,
+     so the sections pack under one another; they fill down a column and on into the next in the
+     markup's order, which is the Tab order. The row naming the server, with Expand all and Open help at
+     its end (`#372 settings-header-layout`), spans them above. */
+  #screen-settings > .settings-column {
+    max-width: 125rem;
+  }
+
+  .settings-panes {
+    column-width: 24rem;
+    column-gap: 1rem;
+    column-fill: balance;
+  }
+
+  .settings-panes > .settings-section {
+    break-inside: avoid;
+  }
+
+  /* THE reading column. Both panes, because the channel is read the same way the transcript is
+     and a 180-character line is no better for being somebody else's words. */
+  #pane-voice,
+  #pane-discord {
+    max-width: var(--reading-width);
+    margin-inline: auto;
+  }
+
+  /* The status pill follows the column, so it sits over the thing it reports on instead of
+     floating in the middle of a metre of desk. `max-width` and an auto margin, NOT a new
+     `position` — it is already the one overlay in the dock's neighbourhood, and only that. */
+  #status-line {
+    max-width: var(--reading-width);
+    margin-inline: auto;
+  }
+
+  /* `#338 column-overscroll`. The room past the right column's foot, at a desk: drawn, with no height
+     until web/voice.js gives it one (`openOverscroll`), so the last card can be brought to the middle of
+     a tall monitor. By its parent as well as its id, so it outranks the rule that takes it away
+     elsewhere (beside #side-scroll, later in this file). A phone's thread list has none. */
+  #side-scroll > #side-overscroll {
+    display: block;
+  }
+
+  /*
+   * `#218 desktop-dock`. THE DOCK, AT DESKTOP SIZE.
+   *
+   * Everything about the dock above was priced for a thumb: a 2.4rem strip of 44px targets, and
+   * under it a tile of large buttons, each half the width of a phone. On a desk the owner
+   * photographed exactly what that becomes — Read and Pace as slabs over three hundred pixels
+   * wide, "Hide read" broken over two lines in a 3.5rem column, the channel and view pickers cut
+   * off at nine rem beside two hundred pixels of nothing, and the whole dock 149px tall. "Way
+   * bigger than buttons would ever need to be on desktop, and also wasting a significant amount of
+   * precious vertical space."
+   *
+   * So on a desk the dock is ONE WRAPPING ROW of ordinary controls, 2.25rem (36px) tall: the bar,
+   * then the pane's buttons beside it. A mouse needs a 32px target, not a 44px one, so nothing
+   * here is smaller than the first or as large as the second. Measured at 1280x800: 149px before,
+   * 50px when everything fits one row, 92px when it needs two.
+   *
+   * `#406 command-bar-one-row`. IT SPANS THE WINDOW, IN ONE ROW. The dock used to follow the reading
+   * column, drawn as its own padding, and to wrap the pane's buttons onto a second row when the
+   * pickers and they did not fit that column together. "Thread list" or a thread's name was enough
+   * to do it, beside half a window of nothing; the owner: "spills onto two rows in the command bar
+   * even though there is PLENTY of horizontal space.. an artificial width construction ... Let's
+   * keep that bar one row that can go up to full width on desktop and size our widgets
+   * appropriately." So the dock spans the window less the 0.6rem inset the controls always had, in
+   * one view as in two columns (`#373 two-column-full-width` spanned it there already), and so the
+   * switch no longer moves when two columns come and go. It does not wrap: the pane keeps its width
+   * and the bar takes what is left, where a picker too long for it ends in an ellipsis — the view
+   * picker first, and the channel's only once the view picker is at its floor — and the view
+   * picker's tooltip names the whole thread (`renderThreadSelect`). Padding rather than `position`:
+   * the dock is still the third grid row of the frame, and the suite asserts that it is.
+   *
+   * THE SWITCH DOES NOT MOVE. It is the control you actually flick, and flicking it is what changes
+   * everything else in the row: the call's buttons become the channel's, a long name arrives.
+   * A switch that rode along with all that was a different place to click after every click —
+   * measured, about 265px sideways and a row up between the call and the channel. So on a desk it
+   * has one place: the lower right corner of the window, at the end of the row, whatever the view,
+   * the call or the channel's name. See `#view-switch` below.
+   *
+   * `--dock-inset` is the dock's inset from either side of the window. It is stated once here
+   * because four things are placed by it: the dock's own padding, and the switch, the prompts tray
+   * and the pace popover, which are placed against the dock.
+   */
+  #dock {
+    --dock-inset: 0.6rem;
+    --dock-switch: 7.5rem;
+    /* The bar's floor: see `#control-bar-bottom`. */
+    --bar-floor: 8rem;
+    position: relative;
+    display: flex;
+    flex-wrap: nowrap;
+    align-items: end;
+    gap: 0.4rem 0.5rem;
+    padding: 0.4rem var(--dock-inset);
+  }
+
+  /* The bar takes what the pane leaves, so its pack can give the pickers their names. Its floor is the
+     gear and one picker at its own floor beside it (`#406 command-bar-one-row`): past that the pane is
+     what gives way, never the bar under the pane. */
+  #control-bar-bottom {
+    flex: 1 1 auto;
+    min-width: var(--bar-floor);
+  }
+
+  /* The dock carries the padding on a desk: there is no curved corner to clear and no band to
+     separate from the pane below, because the pane is beside it now.
+     `static`, so the switch and the prompts tray are placed against the DOCK rather than the bar.
+     The bar is the part of the row that gives way, so its own box is a different shape in every
+     state; the dock's is the window less its inset, and that is where both of them belong. */
+  #control-bar[data-placement="bottom"] {
+    padding: 0;
+    position: static;
+  }
+
+  /*
+   * THE SWITCH'S ONE PLACE: the lower right corner of the window, at the end of the dock's row.
+   *
+   * Taken out of the bar's flow and set in the corner, with the pane keeping the room for it — the
+   * pane's right margin, below, is exactly the switch's fixed width and the pane's own gap. So the
+   * row ends Hide read, Pace, Read, switch, the switch the same width in the same corner whatever
+   * the bar holds. Placed against the dock and kept clear by the pane, never over anything: the dock is
+   * still the frame's third grid row, and the switch's room is in its flow.
+   *
+   * 7.5rem holds "Channel" in DejaVu Sans, one of the widest common faces, at the 0.85rem every
+   * other word in the desktop dock is set in, with a little air after it: the width the switch had
+   * in the bar, give or take a few pixels, so the row that fitted still fits.
+   *
+   * Every row stands on one floor (`align-items: end`, on the dock and in the pane): the switch is
+   * set at the foot of the dock, so the controls beside it stand there too. The floor only shows
+   * after a call, when Talk carries its note and is the one control taller than the rest.
+   *
+   * Tab still reaches it where the markup puts it, after the bar's last control and before the
+   * pane's first — the same order as on the phone, and in either of the bar's homes.
+   *
+   * The pane is shown wherever the switch is (web/voice.js shows both on the main screen only, and
+   * text mode hides the switch alone), so the corner always has its room kept; and where the
+   * switch is hidden, the pane keeps none.
+   */
+  #control-bar[data-placement="bottom"] #view-switch {
+    position: absolute;
+    right: var(--dock-inset);
+    bottom: 0.4rem;
+    width: var(--dock-switch);
+    box-sizing: border-box;
+    padding-right: 0.4rem;
+    /* The page's type size, not the switch's 0.9rem, and the reason is the column: it is measured
+       in `ch`, and a `ch` is a width of the type of the element that uses it. Measured in the
+       switch's smaller type the column came out narrower and the switch landed on Talk. The word,
+       below, is given its size of its own. */
+    font-size: inherit;
+  }
+
+  #control-bar-bottom:has(#view-switch:not([hidden])) + #control-pane {
+    margin-right: calc(var(--dock-switch) + 0.4rem);
+  }
+
+  /* A fixed width needs a word that cannot push past it: "Channel" fits with room to spare, and a
+     wider face ends it in an ellipsis inside the pill rather than across the column's edge. */
+  #control-bar[data-placement="bottom"] .switch-word {
+    min-width: 0;
+    overflow: hidden;
+    font-size: 0.85rem;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* The tray opens above the dock across its width, placed against the dock, whose padding box is
+     the whole window. */
+  #control-bar[data-placement="bottom"] #prompts-tray {
+    left: var(--dock-inset);
+    right: var(--dock-inset);
+  }
+
+  /* Room for a focus ring. The pack scrolls sideways, and a scrolling box clips whatever is drawn
+     outside it — including the outline that tells a keyboard reader where they are. The padding
+     makes room for the ring and the equal negative margin gives the room back, so nothing moves. */
+  #bar-pack {
+    padding: 0.25rem;
+    margin: -0.25rem;
+  }
+
+  /* The pane is a row of buttons, not a tile, in markup order — Sound, Clear, Hang up, Talk on
+     the call; Hide read, Pace, Read on the channel, the order the phone tile shows them in.
+     `margin-left: auto` keeps it at the right of the row, against the room it keeps for the
+     switch. It keeps its width (`#406 command-bar-one-row`): the bar beside it is what gives way,
+     its pickers ending in an ellipsis and its pack scrolling sideways, so the row stays one row.
+     Only with the bar at its floor — a large default font, after a call, when Talk carries its
+     note, in the narrowest desk — does the pane wrap its own buttons, as a last resort, rather than
+     run under the bar or the switch: its widest is what the dock has less the bar's floor, the
+     switch's room and the gaps.
+     `static`, so the pace popover is placed against the dock: see `.popover` below. */
+  #control-pane {
+    flex: 0 0 auto;
+    min-width: 0;
+    max-width: calc(100% - var(--bar-floor) - var(--dock-switch) - 0.4rem - 0.5rem);
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    align-items: end;
+    gap: 0.4rem;
+    margin-left: auto;
+    padding: 0;
+    position: static;
+  }
+
+  /* The pace popover opens ABOVE THE DOCK, over the list, at the window's right edge. Placed against
+     the pane, as on a phone, it opened over whatever row was above the pane — on a desk, the switch
+     and the pickers, which the popover then sat on top of until it was dismissed. */
+  .popover {
+    right: var(--dock-inset);
+  }
+
+  /* Sound silences a CALL's voice, and the channel view without a call has none. web/voice.js
+     leaves it unhidden there, and on a phone that never shows: Hide read is placed in the same
+     grid cell, later in the markup, and covers it. A row has no cells to cover anything with, so
+     the reading view says here what the phone tile already shows — Hide read, Pace, Read. */
+  #control-pane:has(#read-aloud:not([hidden])) #speaker {
+    display: none;
+  }
+
+  /* `#442 read-strip-order`. On a desk the read-aloud strip can be moved off what it covers, by the
+     grip at its left. web/voice.js keeps the offset, held inside the window; it is applied only
+     here, so a phone's strip stays docked on the chips row whatever was stored. */
+  #read-steer {
+    translate: var(--read-steer-dx, 0px) var(--read-steer-dy, 0px);
+  }
+
+  #read-steer-grip {
+    pointer-events: auto;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.5rem;
+    min-height: 2.75rem;
+    padding: 0;
+    border: none;
+    border-radius: 999px;
+    background: transparent;
+    color: var(--muted);
+    cursor: grab;
+    touch-action: none;
+  }
+
+  #read-steer-grip:active {
+    cursor: grabbing;
+  }
+
+  #read-steer-grip:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+
+  #read-steer-grip svg {
+    width: 0.5rem;
+    height: 1rem;
+  }
+
+  /* Ordinary desktop controls: the icon and its word side by side, at reading size. The phone's
+     0.55rem capital caption under the icon was the price of a 44px square, and nothing here is
+     paying it. A grid rather than a flex row because of Talk's one-clause note after a call: it
+     goes under the word, beside the icon, instead of making the button as wide as the sentence. */
+  .bar-button,
+  #control-pane .control {
+    min-height: 2.25rem;
+    border-radius: 0.6rem;
+  }
+
+  .bar-button {
+    flex-direction: row;
+    gap: 0.4rem;
+    min-width: 2.25rem;
+    padding: 0 0.5rem;
+  }
+
+  #control-pane .control {
+    display: grid;
+    grid-template-columns: auto auto;
+    justify-content: center;
+    align-content: center;
+    align-items: center;
+    column-gap: 0.4rem;
+    padding: 0 0.65rem;
+    text-align: start;
+  }
+
+  /* The icon stands beside the word, on its line. It spans a second line only when there IS one —
+     Talk's note — because spanning an empty one gave that line a pixel or two of the icon's height
+     and stood every word in the pane that much above its icon. */
+  #control-pane .control > svg {
+    grid-row: 1;
+  }
+
+  #control-pane .control:has(> .control-note:not([hidden])) > svg {
+    grid-row: 1 / span 2;
+  }
+
+  /* The pane's icons at the bar's size, so a row of them reads as one set. */
+  .control-icon {
+    width: 1.15rem;
+    height: 1.15rem;
+  }
+
+  /* `inherit` rather than muted: beside the icon the word IS the label, and the states that colour
+     a button — Sound on, Gist, an armed Clear — colour it whole. */
+  .mini-label,
+  .control-label {
+    font-size: 0.85rem;
+    letter-spacing: 0.01em;
+    text-transform: none;
+    color: inherit;
+  }
+
+  /* `#221 read-modes`. The read mode's WHOLE name, here as on the phone tile. Its first word alone
+     — "Hide", "Collapse" — reads as the act a tap performs, beside Pace and Read and under the
+     "Collapse all" chip, which is the ambiguity the button names its mode to avoid. This row was
+     fitted to "Hide read" with nothing to spare, and "Collapse read" (Fold read now) on one line
+     beside its icon pushed the dock onto a second row, the button with it. So the name stands in two short lines a
+     size down from the row's words: no wider than its first word was at the row's size, and inside
+     the row's height. */
+  #control-pane #todo-filter .control-label {
+    font-size: 0.78rem;
+    line-height: 1.1;
+    text-align: start;
+  }
+
+  #control-pane #todo-filter .read-mode-verb,
+  #control-pane #todo-filter .read-mode-noun {
+    display: block;
+  }
+
+  #control-pane .control-note {
+    grid-column: 2;
+    max-width: 16rem;
+    padding-bottom: 0.3rem;
+    font-size: 0.72rem;
+    text-align: start;
+  }
+
+  /* The pickers show their names. `field-sizing: content` sizes each to the option it is showing
+     rather than to the longest option it holds — "All" no longer reserves the width of a thread
+     title — and where a browser lacks it, the longest option is the size, under the same caps.
+     The caps are the "sensible max": a channel name of thirty-odd characters, a thread label of
+     its age, replies and twenty-eight characters of name. A name that does not fit ends in an
+     ellipsis, so a cut name says it was cut.
+     Still sixteen pixels: an iPad with a trackpad can be in this regime, and iPadOS zooms on a
+     smaller field exactly as iOS does. */
+  .bar-select {
+    min-height: 2.25rem;
+    max-width: 20rem;
+    field-sizing: content;
+    text-overflow: ellipsis;
+    border-radius: 0.6rem;
+  }
+
+  /* THE VIEW PICKER GIVES WAY FIRST: which channel this is matters more than how much of a thread
+     title shows. So the channel's picker does not shrink at all — a share of the shrinking, however
+     small, is a fraction of a pixel the text no longer fits, and the ellipsis turns that into a
+     visible "…" — and is capped instead at what the pack has left once its other members are at
+     their floors: the view picker's 5rem, the audio button's 2.25rem and the two gaps between
+     them. Until the view picker is down to its floor the channel's name is whole; past that, it is
+     the channel's that ends in the ellipsis, and nothing is pushed out of the pack. */
+  #discord-channel {
+    flex-shrink: 0;
+    max-width: min(24rem, 100% - 5rem - 2.25rem - 2 * 0.4rem);
+  }
+
+  /* The row's height, and a little less air inside it: at the default column the switch is what
+     decides whether a short channel's name and the three reading buttons share one row. */
+  .switch {
+    min-height: 2.25rem;
+    gap: 0.4rem;
+    padding-right: 0.6rem;
+  }
+
+  /* Visible focus on every control in the dock, in the accent, outside the control so it shows
+     on a filled button as well as on a quiet one. Without it the browser's own ring is the only
+     sign, and on the filled buttons it is the same blue as the button. */
+  #control-bar :is(button, select):focus-visible,
+  #control-pane button:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  /* The two notices are held to the reading column too. A full-width strip over a narrow column is
+     the same "phone layout stretched sideways" this whole block exists to remove — it was there in
+     the first capture of it, which is what these review rounds are for. (#screen-signin and
+     #screen-settings are deliberately NOT capped here: they are forms rather than reading, and
+     giving them a column is a separate judgement nobody has made yet.) */
+  #error-wrap,
+  #connection-banner {
+    max-width: var(--reading-width);
+    margin-inline: auto;
+  }
+
+  /* The chips belong to the LIST, not to the window. Anchored to the window's edges they end up
+     half a screen away from the thing they act on, offering to scroll a column the reader is not
+     looking at the corner of. `#207 scrollback-jump` spans the row across the column, a gutter
+     inside each of its edges, so the jump is at the column's lower left and the other chips at its
+     right: as wide as the column, or as the window when that is the narrower, and centred on it. */
+  #scroll-tools {
+    right: auto;
+    left: 50%;
+    width: calc(min(var(--reading-width), 100%) - 1.2rem);
+    transform: translateX(-50%);
+  }
+
+  /* `#197 floating-search`, for the same reason: the line the pill and the search glass float on
+     is the column's, so the glass sits at the column's top corner rather than at the far edge of
+     the window, and the open bar is as wide as what it searches. */
+  #channel-freshness-anchor {
+    justify-self: center;
+    width: 100%;
+    max-width: var(--reading-width);
+  }
+
+  /* A percentage inset is proportionate inside a capped column and absurd across a full-width
+     one. Capping the pane above is what actually fixes the 600px gutter; this only stops a reader
+     who has dragged the column out to 120ch from getting it back. */
+  .messages li.mine,
+  #pane-voice > #post-confirm {
+    margin-left: min(15%, 6rem);
+  }
+
+  .messages li.theirs {
+    margin-right: min(15%, 6rem);
+  }
+
+  /* `#85 voice-desktop-review`. The channel's two principals, bounded exactly as the transcript's
+     two speakers directly above — same numbers, because they are the same two people and a reader
+     switching views must not see the column change shape under them.
+
+     `#373 two-column-full-width`. The agent's inset and a third party's, here and in the stack rules
+     after them, are read through a custom property whose fallback is the number they always were,
+     `--desk-agent-inset` and `--desk-third-inset`. Nothing sets them in one column, so one column is
+     exactly as it was; two columns set them to nothing (the two-column block below), so those rows
+     span their column. The owner's inset is not one of them: the owner's rows keep it everywhere. */
+  #side-log li.discord-message[data-who="me"],
+  #side-cards li.discord-message[data-who="me"],
+  #discord-log li.discord-message[data-who="me"],
+  #pinned-log li.discord-message[data-who="me"] {
+    margin-left: min(15%, 6rem); /* a desk has the room a phone does not */
+  }
+  #side-log li.discord-message[data-who="coder"],
+  #side-cards li.discord-message[data-who="coder"],
+  #discord-log li.discord-message[data-who="coder"],
+  #pinned-log li.discord-message[data-who="coder"] {
+    /* A desk has the room, and a full-bleed tile a metre wide is the "phone layout stretched
+       sideways" the whole block exists to remove. The inset comes back. */
+    margin-left: 0;
+    margin-right: var(--desk-agent-inset, min(15%, 6rem));
+  }
+  #side-log li.discord-message[data-who="human"],
+  #side-cards li.discord-message[data-who="human"],
+  #discord-log li.discord-message[data-who="human"],
+  #pinned-log li.discord-message[data-who="human"],
+  #side-log li.discord-message[data-who="bot"],
+  #side-cards li.discord-message[data-who="bot"],
+  #discord-log li.discord-message[data-who="bot"],
+  #pinned-log li.discord-message[data-who="bot"] {
+    margin-inline: var(--desk-third-inset, min(7%, 3rem));
+  }
+
+  /* `#204 reply-arrow`. A reply's gutter is a touch target wide everywhere, and the owner's own
+     inset is wider than that here: his reply keeps the larger of the two, so it is still drawn on
+     his side of the column. The arrow follows the box (`right: 100%`). */
+  #side-log li.discord-message[data-is-reply="true"][data-who="me"],
+  #side-cards li.discord-message[data-is-reply="true"][data-who="me"],
+  #discord-log li.discord-message[data-is-reply="true"][data-who="me"] {
+    margin-left: max(var(--reply-gutter), min(15%, 6rem));
+  }
+
+  /* `#424 threads-main-own-center`. The owner's main-channel rows among the Threads view's cards, centred
+     at the width the rules above give them (see the unconditional rule). */
+  #side-cards li.discord-message[data-who="me"][data-main-row] {
+    margin-inline: calc(min(15%, 6rem) / 2);
+  }
+
+  /* `#249 search-highlight` and `#250 date-separators`. The insets the lines between rows reach back
+     across, as the margins just above give them on a desk. */
+  #side-log li.discord-message[data-who="me"],
+  #side-cards li.discord-message[data-who="me"],
+  #discord-log li.discord-message[data-who="me"],
+  #pinned-log li.discord-message[data-who="me"] {
+    --row-inset-left: min(15cqw, 6rem);
+  }
+
+  #side-cards li.discord-message[data-who="me"][data-main-row] {
+    --row-inset-left: calc(min(15cqw, 6rem) / 2);
+    --row-inset-right: calc(min(15cqw, 6rem) / 2);
+  }
+
+  #side-log li.discord-message[data-who="coder"],
+  #side-cards li.discord-message[data-who="coder"],
+  #discord-log li.discord-message[data-who="coder"],
+  #pinned-log li.discord-message[data-who="coder"] {
+    --row-inset-left: 0px;
+    --row-inset-right: var(--desk-agent-inset, min(15cqw, 6rem));
+  }
+
+  #side-log li.discord-message[data-who="human"],
+  #side-cards li.discord-message[data-who="human"],
+  #discord-log li.discord-message[data-who="human"],
+  #pinned-log li.discord-message[data-who="human"],
+  #side-log li.discord-message[data-who="bot"],
+  #side-cards li.discord-message[data-who="bot"],
+  #discord-log li.discord-message[data-who="bot"],
+  #pinned-log li.discord-message[data-who="bot"] {
+    --row-inset-left: var(--desk-third-inset, min(7cqw, 3rem));
+    --row-inset-right: var(--desk-third-inset, min(7cqw, 3rem));
+  }
+
+  #side-log li.discord-message[data-is-reply="true"][data-who],
+  #side-cards li.discord-message[data-is-reply="true"][data-who],
+  #discord-log li.discord-message[data-is-reply="true"][data-who] {
+    --row-inset-left: var(--reply-gutter);
+  }
+
+  #side-log li.discord-message[data-is-reply="true"][data-who="me"],
+  #side-cards li.discord-message[data-is-reply="true"][data-who="me"],
+  #discord-log li.discord-message[data-is-reply="true"][data-who="me"] {
+    --row-inset-left: max(var(--reply-gutter), min(15cqw, 6rem));
+  }
+
+  /* `#424 threads-main-own-center`. The owner's main-channel reply among the cards, centred at the width
+     his replies have here, never with less than the arrow's gutter either side. */
+  #side-cards li.discord-message[data-is-reply="true"][data-who="me"][data-main-row] {
+    margin-inline: max(var(--reply-gutter), calc(min(15%, 6rem) / 2));
+    --row-inset-left: max(var(--reply-gutter), calc(min(15cqw, 6rem) / 2));
+    --row-inset-right: max(var(--reply-gutter), calc(min(15cqw, 6rem) / 2));
+  }
+
+  /* `#215 reply-coalesce`. Gathered replies hang one gutter in from their parent's left edge, and
+     these are the desk's edges, restated from the rules just above as the phone's are restated
+     beside the stack's own rules. After the owner's reply, which they outrank in a stack. */
+  #side-log li.discord-message[data-stack-under="coder"][data-who],
+  #side-cards li.discord-message[data-stack-under="coder"][data-who],
+  #discord-log li.discord-message[data-stack-under="coder"][data-who] {
+    margin-left: var(--reply-gutter);
+  }
+  #side-log li.discord-message[data-stack-under="me"][data-who],
+  #side-cards li.discord-message[data-stack-under="me"][data-who],
+  #discord-log li.discord-message[data-stack-under="me"][data-who] {
+    margin-left: calc(min(15%, 6rem) + var(--reply-gutter));
+  }
+  #side-log li.discord-message[data-stack-under="third"][data-who],
+  #side-cards li.discord-message[data-stack-under="third"][data-who],
+  #discord-log li.discord-message[data-stack-under="third"][data-who] {
+    margin-left: calc(var(--desk-third-inset, min(7%, 3rem)) + var(--reply-gutter));
+  }
+
+  /* `#407 unpack-row-parity`. And a collapsed run's line in an unpacked thread, as on a phone: the
+     extra attribute puts it over the phone's rule, which comes later in the file. */
+  #side-cards li.discord-message[data-read-run="head"][data-stack-under="third"][data-who] {
+    margin-left: calc(var(--desk-third-inset, min(7%, 3rem)) + var(--reply-gutter)) !important;
+  }
+  #side-log li.discord-message[data-stack-under="reply"][data-who],
+  #side-cards li.discord-message[data-stack-under="reply"][data-who],
+  #discord-log li.discord-message[data-stack-under="reply"][data-who] {
+    margin-left: calc(var(--reply-gutter) * 2);
+  }
+  #side-log li.discord-message[data-stack-under="me-reply"][data-who],
+  #side-cards li.discord-message[data-stack-under="me-reply"][data-who],
+  #discord-log li.discord-message[data-stack-under="me-reply"][data-who] {
+    margin-left: calc(max(var(--reply-gutter), min(15%, 6rem)) + var(--reply-gutter));
+  }
+
+  /* `#228 reply-visible`. On a desk the agent's tile stands inside the list's gutter, never at the
+     window's edge, so it has room beside it, and its circle goes back to the corner, as every other
+     row's is. */
+  #side-log li.discord-message[data-who="coder"]:not([data-is-reply="true"]):not([data-stack-under]) > .reply-marker,
+  #side-cards li.discord-message[data-who="coder"]:not([data-is-reply="true"]):not([data-stack-under]) > .reply-marker,
+  #discord-log li.discord-message[data-who="coder"]:not([data-is-reply="true"]):not([data-stack-under]) > .reply-marker {
+    left: calc(-1px - var(--reply-marker-target) / 2);
+  }
+
+  /* The identity rows go back to two tracks. The phone stacks them because 27 characters of option
+     text and a display name cannot share 375px; a desk has the room, and a name beside the thing
+     it is being called is easier to read down a list of five than a name above it. The name track
+     keeps `minmax(0, ...)` so that a very long one still cannot squeeze itself — the defect the
+     phone rule exists for is a narrower screen away, not gone. */
+  .identity-row {
+    grid-template-columns: minmax(6rem, 1fr) auto;
+  }
+
+  /* The handle, on the right edge of the column and the height of the body. Absolutely positioned
+     against #screen-main, which already carries `position: relative` for #scroll-tools. Out of
+     flow on purpose: a grid row for a drag handle would change the height of the thing being read
+     the moment it appeared. `touch-action: none` so a drag is a drag and not a scroll. */
+  #width-grip {
+    display: block;
+    position: absolute;
+    z-index: 3;
+    top: 0;
+    bottom: 0;
+    left: 50%;
+    transform: translateX(calc(var(--reading-width) / 2));
+    width: 0.9rem;
+    padding: 0;
+    background: none;
+    border: none;
+    cursor: ew-resize;
+    touch-action: none;
+  }
+
+  /* Drawn as a hairline rather than as a slab: it is an edge you may grab, not a piece of
+     furniture. It brightens under the pointer and under keyboard focus, which is the only thing
+     that tells a reader it is a control at all. */
+  #width-grip::before {
+    content: "";
+    position: absolute;
+    top: 12%;
+    bottom: 12%;
+    left: 50%;
+    width: 2px;
+    margin-left: -1px;
+    border-radius: 999px;
+    background: var(--edge);
+  }
+
+  #width-grip:hover::before,
+  #width-grip:focus-visible::before {
+    background: var(--accent);
+  }
+
+  /* `#340 composer-grow-box`. The owner: a long message pasted into the box left it tiny, while the
+     room left of Send was empty. So that room holds a Grow checkbox, and the box grows with its text
+     while it is ticked (`data-composer-grow` on #screen-main, `applyComposerGrow`).
+
+     THE ROW. Two columns, the box, the state line, the call's recap line above its box (`#331
+     resume-on-websocket`) and anything else across both, said here even where a rule outside this
+     block already says it, so `dense` can never bring Send up beside one of them; Send in the second
+     and the label in the first: `dense` puts the label on Send's row though it comes after Send in the
+     markup, which it does so that Tab goes from the box to Send first. Not while a send card is up:
+     the card's own rules give the box one line with Send beside it, and the label is not drawn. */
+  #screen-main:not([data-draft]) #voice-composer,
+  #screen-main:not([data-draft]) #channel-composer,
+  #side-composer {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-auto-flow: row dense;
+    align-items: center;
+  }
+
+  #screen-main:not([data-draft]) #call-recap,
+  #screen-main:not([data-draft]) #compose-text,
+  #screen-main:not([data-draft]) #channel-compose-text,
+  #side-compose-text,
+  #screen-main:not([data-draft]) #channel-compose-state,
+  #side-compose-state {
+    grid-column: 1 / -1;
+  }
+
+  #screen-main:not([data-draft]) #send-text,
+  #screen-main:not([data-draft]) #channel-send,
+  #side-send {
+    grid-column: 2;
+  }
+
+  .composer-grow {
+    display: inline-flex;
+    grid-column: 1;
+    justify-self: start;
+    align-items: center;
+    gap: 0.35rem;
+    min-height: 24px;
+    font-size: 0.85rem;
+    color: var(--muted);
+    cursor: pointer;
+  }
+
+  #screen-main[data-draft] #voice-composer > .composer-grow,
+  #screen-main[data-draft] #channel-composer > .composer-grow {
+    display: none;
+  }
+
+  /* THE BOX GROWS with what is in it, `field-sizing: content` where the browser has it; where it does
+     not, web/voice.js measures the text and writes `--composer-grow-height` (`fitGrowingBox`). Up to
+     60% of the window, then it scrolls inside, so Send below it stays on screen. AT REST IT IS THE
+     HEIGHT IT ALWAYS WAS: a box sized by its text no longer takes its height from `rows="3"`, so its
+     least height is those three lines said in CSS, with the generic textarea rule's padding and border
+     (0.45rem and 1px, top and bottom); measured in Chromium, 86px either way. */
+  #screen-main[data-composer-grow]:not([data-draft]) #compose-text,
+  #screen-main[data-composer-grow]:not([data-draft]) #channel-compose-text,
+  #screen-main[data-composer-grow] #side-compose-text,
+  #screen-main[data-composer-grow] #reply-text {
+    field-sizing: content;
+    height: var(--composer-grow-height, auto);
+    min-height: max(5rem, calc(3lh + 0.9rem + 2px));
+    max-height: 60vh;
+    overflow-y: auto;
+    resize: none;
+  }
+}
+
+/* `#229 desktop-two-column`. Never drawn outside the block below — not on a phone, not in a narrow
+   window, not in one column — but for the right column as the thread list (`#281 view-keys`, after the
+   block). First, so the later rules for the same elements win. */
+#side-column,
+#column-links,
+#column-toggle {
+  display: none;
+}
+
+/* `#261 two-column-connectors`. How a glide to a link's other end moves the column it scrolls: smoothly,
+   or at once for a reader whose system asks for less motion. The script reads this, and never the
+   query itself. */
+#screen-main {
+  --column-glide: smooth;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #screen-main {
+    --column-glide: auto;
+  }
+}
+
+/*
+ * `#229 desktop-two-column`. MAIN ON THE LEFT AND A THREAD ON THE RIGHT, on a desk at least 1000px
+ * wide, while the reader has chosen two columns (web/voice.js sets `data-columns="two"` on
+ * #screen-main then, and only on the channel). Outside this block the layout button is never drawn,
+ * nor the right column beside Main — above, unconditionally — so a phone and a narrow window are
+ * exactly as they were, and a window narrowed below 1000px falls back to one column by this block
+ * ceasing to apply.
+ *
+ * WHY 1000px. Each column then gets about 490px, which after a desk's speaker insets held about 45
+ * characters: the narrowest reading width the width setting allows for the page's only column. Any
+ * narrower and one of the two would be narrower than the page lets a reader make its one column.
+ * (Since `#373 two-column-full-width` every row there but the owner's spans its column, so it holds
+ * a little more, and a wider window gives each column more again.)
+ *
+ * The two columns are the window's two halves, each holding its list across it (`#373
+ * two-column-full-width`, below; until then, in the reading column centred in it),
+ * a hairline between them. The width handle goes: the reading width is one column's, and a handle at
+ * one column's edge would say it sized only that one. The dock, the chips and the line
+ * the pill and the search glass float on follow the left column, which is Main's; the right column
+ * has a heading of its own above its list and its own jump to its newest message.
+ *
+ * web/voice.js asks whether #side-column has a box to know whether two columns are in force, and
+ * never reads this query itself.
+ */
+@media (min-width: 1000px) and (pointer: fine) {
+  /* The layout button: a bar button joined to the view picker it greys out, as two halves of one
+     control, with no gap between them and the desk's least target width. That is also what lets the
+     desk's dock keep its one row in the default column with a short channel name: #218 fitted that
+     row with about 38px to spare, and a button with the pack's gap before it is 42px. `hidden` still
+     wins, off the channel. */
+  #column-toggle {
+    display: flex;
+    min-width: 2rem;
+    padding: 0;
+    margin-inline-start: -0.4rem;
+    border-start-start-radius: 0;
+    border-end-start-radius: 0;
+  }
+
+  #bar-pack:has(> #column-toggle:not([hidden])) > #thread-select {
+    border-start-end-radius: 0;
+    border-end-end-radius: 0;
+  }
+
+  /* The channel's picker is capped at what the pack leaves once the others are at their floors
+     (`#218 desktop-dock`), and the layout button is one more of them: 2rem, with no gap. */
+  #bar-pack:has(> #column-toggle:not([hidden])) > #discord-channel {
+    max-width: min(24rem, 100% - 5rem - 2.25rem - 2rem - 2 * 0.4rem);
+  }
+
+  #column-toggle[aria-pressed="true"] {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  /* A fourth row, under the lists, for a reply open in the left column (`#277 reply-in-column`): no
+     height at all while none is, so the lists are exactly as they were. */
+  #screen-main[data-columns="two"] {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-rows: auto auto minmax(0, 1fr) auto;
+  }
+
+  #screen-main[data-columns="two"] > #connection-banner,
+  #screen-main[data-columns="two"] > #channel-navigation,
+  #screen-main[data-columns="two"] > #channel-freshness-anchor,
+  #screen-main[data-columns="two"] > #scroll-area {
+    grid-column: 1;
+  }
+
+  /* Its heading, the line saying how old its rows are when they are not current (`#231
+     two-column-polish`; hidden, it is no box, and its row is none), and its list. */
+  #screen-main[data-columns="two"] > #side-column {
+    display: grid;
+    grid-column: 2;
+    grid-row: 1 / -1;
+    /* ...and its own fourth row for a reply open in it, as the left column's. */
+    grid-template-rows: auto auto minmax(0, 1fr) auto;
+    grid-template-columns: minmax(0, 1fr);
+    min-height: 0;
+    position: relative;
+    border-left: 1px solid var(--edge);
+  }
+
+  #screen-main[data-columns="two"] > #width-grip {
+    display: none;
+  }
+
+  /* `#261 two-column-connectors`. The links, over the whole main screen and in front of both lists, but
+     behind the chips and the menus, and never in the way of a press. web/voice.js draws them in the gap
+     between the columns alone, so no row is drawn over. */
+  #screen-main[data-columns="two"] > #column-links {
+    display: block;
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    pointer-events: none;
+    z-index: 1;
+  }
+
+  /* In the thread's own colour, the tag's and the card edge's. Quiet, all but the selection's. */
+  #column-links .column-link {
+    fill: none;
+    stroke: hsl(var(--thread-hue, 210) 55% 50%);
+    stroke-width: 2px;
+    stroke-linejoin: round;
+    stroke-linecap: round;
+    opacity: 0.8;
+  }
+
+  #column-links .column-link-marks {
+    fill: hsl(var(--thread-hue, 210) 55% 50%);
+    stroke: none;
+    opacity: 0.8;
+  }
+
+  #column-links [data-selected] {
+    opacity: 1;
+  }
+
+  #column-links .column-link[data-selected] {
+    stroke-width: 3px;
+  }
+
+  /* `#277 thread-card-focus`. Beside a highlighted card every other link is grey, and fainter. */
+  #column-links .column-link[data-dimmed] {
+    stroke: var(--thread-grey);
+    opacity: 0.55;
+  }
+
+  #column-links .column-link-marks[data-dimmed] {
+    fill: var(--thread-grey);
+    opacity: 0.55;
+  }
+
+  /* The chips over the foot of the LEFT list: the left half's centre, as wide as its column, which
+     since `#373 two-column-full-width` is the whole half, less the gutter inside each edge. */
+  #screen-main[data-columns="two"] > #scroll-tools {
+    left: 25%;
+    width: calc(50% - 1.2rem);
+  }
+
+  /* The transient status speaks over the left column, where its chips are, not across the divider. */
+  body:has(#screen-main[data-columns="two"]:not([hidden])) #status-line {
+    inset-inline: 0 50%;
+  }
+
+  /* `#261 two-column-connectors`. In two columns the cards stand a little further from the divider than
+     the column's own inset, so that a few of the links' lanes fit in the gap beside their arrowheads.
+     `#373 two-column-full-width`: 2.5rem, up from 1.25rem, now that Main's rows reach their gutter at
+     every width and the gap is only that: at 1.25rem the first of three lanes lay on the divider's own
+     hairline and read as the divider recoloured. */
+  #screen-main[data-columns="two"] .side-cards {
+    margin-inline-start: 2.5rem;
+  }
+
+  /* `#298 thread-card-header`. ...and so does the card at the top of a thread, level with them: the
+     line from its root arrives at its left edge where it arrived at its card's. */
+  #screen-main[data-columns="two"] .thread-card-header {
+    margin-inline-start: 2.5rem;
+  }
+
+  /* `#385 thread-line-overlap`. ...and so does the thread under it, its rows level with the card that
+     heads them. The line from the root runs down the gap beside the card, which is the gap beside its
+     rows too: with the rows at the column's own inset and the card 2.5rem in, the lane lay a few
+     pixels inside every row the line passed, on the agent's full-width boxes' left border. The owner,
+     2026-10-19: "why does it CROSS over my (now-full-width) text boxes?" The rows keep the rest of
+     the column's width, and the owner's own keep their inset from this edge. */
+  #screen-main[data-columns="two"] #side-pane {
+    margin-inline-start: 2.5rem;
+  }
+
+  /*
+   * `#373 two-column-full-width`. IN TWO COLUMNS A ROW SPANS ITS COLUMN, up to the divider. The owner,
+   * 2026-10-19: "I asked a while ago for full-width messages from the coding agent in two-column mode.
+   * Why don't I have this? In this screenshot it shows wasted space." Each column held its list to the
+   * one-column reading width, centred in its half, and the desk's speaker insets cut the agent's tile
+   * shorter again, so on a 2000px desk the agent's long reply stopped about 160px short of the divider,
+   * in a strip holding nothing but the search glass. Two columns are the reader's choice of a wider
+   * view, and a half of a desk is already a column, so its rows take all of it.
+   *
+   * So in two columns the lists, the right column's heading and the line saying how old its rows are,
+   * and the line the pill and the glass float on, span their halves; and every row but the owner's
+   * spans its column, the agent's long tiles and other people's alike. The owner's own rows keep their
+   * partial width, set in from the left, as on a phone, where the owner's row is the one inset and the
+   * agent's tile takes the whole width. The owner, correcting the first version of this: "MY messages
+   * are still partial width to make them visually distinct. The agents usually-long messages are full
+   * column. That's how we previously did it on narrow phone columns." The inset is the desk's own,
+   * `min(15%, 6rem)`, which in a half of a desk is its 6rem: a phone's 1.5rem would not tell a row
+   * 900px wide from its neighbours.
+   * The glass stays on the line over the head of the left list, at its right end, by the divider: the
+   * list starts below that line (`#324 live-pill-covers-row`), so it covers no row and reserves no strip
+   * beside them. One column, the thread list across the window, and a phone are untouched: none of this
+   * applies outside two columns, so a single column keeps its reading width.
+   */
+  #screen-main[data-columns="two"] {
+    --desk-third-inset: 0px;
+    --desk-agent-inset: 0px;
+  }
+
+  #screen-main[data-columns="two"] #pane-discord,
+  #screen-main[data-columns="two"] > #connection-banner,
+  #screen-main[data-columns="two"] > #channel-freshness-anchor,
+  #screen-main[data-columns="two"] #side-heading,
+  #screen-main[data-columns="two"] #side-freshness,
+  #screen-main[data-columns="two"] #side-list,
+  #screen-main[data-columns="two"] #side-pane {
+    max-width: none;
+  }
+
+  /* The right column's jump over its foot, as wide as its column as the left one's chips are. */
+  #screen-main[data-columns="two"] #side-tools {
+    width: calc(100% - 1.2rem);
+  }
+
+}
+
+/*
+ * `#229 desktop-two-column`, `#281 view-keys`. THE RIGHT COLUMN'S OWN PARTS — its heading, the line
+ * saying how old its rows are, its scroller, its jump, and the thread list's cards — wherever the
+ * column is drawn: beside Main in the block above, or on its own as the thread list below, at every
+ * width. Outside both, #side-column is not drawn, and none of this shows.
+ */
+
+/* The heading says "Thread list" over the cards, beside Unread only; over a thread it is the thread's
+   card, with the X (`#298 thread-card-header`, below). */
+#side-heading {
+  grid-row: 1;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  box-sizing: border-box;
+  width: 100%;
+  max-width: var(--reading-width);
+  min-height: 2.75rem;
+  margin-inline: auto;
+  padding: 0.35rem 0.75rem;
+  border-bottom: 1px solid var(--edge);
+}
+
+#side-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+
+/* The heading's chips at its far end, where the X stands over a thread: quiet at rest, and pressed as every
+   toggle chip is (`.chip[aria-pressed="true"]`, `#421 chip-states`). Unread only (`#259`) led them until
+   the read mode took its place (`#432 read-mode-unify`). */
+#side-unpack {
+  margin-inline-start: auto;
+}
+
+/* `#404 threads-unpack-all`. A thread unpacked under its card: its rows are channel rows in the
+   cards list (every `#side-log` row rule above has its `#side-cards` twin), hung one gutter in on
+   a bridge in the thread's own colour, as All's gathered replies hang on theirs in the accent. */
+#side-cards .reply-bridge {
+  color: hsl(var(--thread-hue, 210) 55% 50%);
+}
+
+/* `#407 unpack-row-parity`. A collapsed run of read rows in an unpacked thread is the run line every
+   list draws on the run's first row (`#221 read-modes`), which in a block keeps its row's place on
+   the bridge: the stack's indent, restated from the stack's own rules (and the desk's, at the foot
+   of this file) over the line's, and its piece of the spine, whose stub joins the grey words in
+   place of the line's left hairline. */
+#side-cards li.discord-message[data-read-run="head"][data-stack-under="third"] {
+  margin-left: calc(var(--speaker-inset) / 2 + var(--reply-gutter)) !important;
+}
+
+#side-cards li.discord-message[data-read-run="head"] > .reply-bridge {
+  display: block !important;
+}
+
+#side-cards li.discord-message[data-read-run="head"][data-stack-under] > .read-run::before {
+  content: none;
+}
+
+/* `#405 root-under-summary`. The root as a summarized card's first child: unpacked, on its bridge
+   in the thread's colour; in a thread, an edge in that colour inside its own box, so the row keeps
+   its width and its place beside the link's lane (`#385 thread-line-overlap`). */
+li.discord-message[data-root-child] > .reply-bridge {
+  color: hsl(var(--thread-hue, 210) 55% 50%);
+}
+
+#side-log li.discord-message[data-root-child],
+#discord-log li.discord-message[data-root-child] {
+  box-shadow: inset 3px 0 hsl(var(--thread-hue, 210) 55% 50%);
+}
+
+/* `#522 thread-card-max-lines`. The rest of a root split for its card, unpacked as the card's first
+   child (`data-root-continuation`, `cardSplit` in web/voice.js): the root's own row, its author and
+   time, starting "…". It has no controls of its own — Reply, Done, the thread tag and ⋯ are the
+   root's, and the root is the card — so none are drawn; the row's own keys and tap still act on the
+   root, whose row it is. */
+li.discord-message[data-root-continuation] .row-acts,
+li.discord-message[data-root-continuation] > .thread-replies {
+  display: none;
+}
+
+/* `#231 two-column-polish`. The right column's freshness: the pill's words, the pill's size and its
+   warning colour, but a line of the column rather than a pill floating over it — quiet, and never
+   over a row. Centred under the heading, cut with an ellipsis rather than wrapped. */
+#side-freshness {
+  grid-row: 2;
+  box-sizing: border-box;
+  width: 100%;
+  max-width: var(--reading-width);
+  margin: 0 auto;
+  padding: 0.25rem 0.75rem;
+  color: var(--muted);
+  font-size: 0.75rem;
+  line-height: var(--freshness-line);
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#side-freshness[data-state="offline"],
+#side-freshness[data-state="slow"] {
+  color: var(--warn);
+}
+
+/* The right column's one scrolling element, built as #scroll-area is: its size is its cell's. */
+#side-scroll {
+  grid-row: 3;
+  contain: size layout;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 0.35rem 0.75rem 0.5rem;
+}
+
+#side-list,
+#side-pane {
+  max-width: var(--reading-width);
+  margin-inline: auto;
+}
+
+/* `#338 column-overscroll`. The room past the foot: none, except at a desk (the desktop regime above). */
+#side-overscroll {
+  display: none;
+  height: 0;
+  pointer-events: none;
+}
+
+/* `#459 pack-keeps-card-still`. The room past the foot that holds a packed card still: on a phone and at a
+   desk alike, with no height until web/voice.js gives it one (`keepingCardStill`). Blank, so never the
+   browser's scroll anchor. */
+#side-overextend {
+  height: 0;
+  pointer-events: none;
+  overflow-anchor: none;
+}
+
+#side-tools {
+  position: absolute;
+  z-index: 2;
+  left: 50%;
+  bottom: 0.5rem;
+  width: calc(min(var(--reading-width), 100%) - 1.2rem);
+  transform: translateX(-50%);
+  display: flex;
+  pointer-events: none;
+}
+
+/* The threads, one card each, fitted to at most the reader's collapsed lines of what the
+   thread is about (`--collapsed-lines`, three until they say otherwise, never under one on a card),
+   clamped with an ellipsis, then how long since it moved beside the button into it — save the
+   card highlighted, which shows all of it (below). Edged in the thread's own colour, as its tag. */
+.side-cards {
+  display: grid;
+  /* `#564 message-summary-toggle`. One track the list's width and NEVER WIDER. The implicit track
+     is `auto`, which is as wide as the widest row's min-content: a code block opened in an unpacked
+     row (`white-space: pre`, one unbroken line per source line) stretched the track, and with it
+     every card and row in the list, off a phone's right edge. Pinned at zero, the rows keep the
+     list's width and the block scrolls inside its own box (`.md pre`). */
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0.45rem;
+  margin: 0.2rem 0 0.6rem;
+  padding: 0;
+  list-style: none;
+}
+
+/* `#277 thread-card-focus`. The row is the card, its surface and its edge: its first button, what the
+   thread is about, spans it, and under that its facts and the button into the thread share a line.
+   A press anywhere on it but that button highlights it, so all of it says it can be pressed. Under a
+   finger, in the thread list on a phone (`#281 view-keys`), a tap draws no flash of the browser's own
+   over the card: the highlight it puts on is what says it was pressed, as the bar's buttons do. */
+.side-card-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.3rem 0.6rem;
+  box-sizing: border-box;
+  padding: 0 0.6rem 0.45rem 0;
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-left: 3px solid hsl(var(--thread-hue, 210) 55% 50%);
+  border-radius: 0.6rem;
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  /* `#483 thread-card-read-style`: a card recedes by the message rows' amounts (below). */
+  opacity: var(--row-opacity, 1);
+  filter: var(--row-filter, none);
+}
+
+.side-card {
+  grid-column: 1 / -1;
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  padding: 0.55rem 0.75rem 0;
+  background: transparent;
+  color: inherit;
+  border: 0;
+  border-radius: 0.6rem 0.6rem 0 0;
+  font: inherit;
+  text-align: start;
+  cursor: pointer;
+}
+
+/* `#239 single-selection`. The selected card is lit as a selected message is, by `data-selected`
+   alone and whether the mouse or the keys chose it: a `:hover` here was a second lit card beside
+   the keys' one. The card's own buttons keep the browser's ring for the Tab that lands on them. */
+.side-card-row[data-selected="true"] {
+  border-color: var(--accent);
+  border-left-color: hsl(var(--thread-hue, 210) 55% 50%);
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* `#432 read-mode-unify`. A card standing as the line of a run of read threads under Fold read: the line
+   alone, as a message row heading a run is (`li.discord-message[data-read-run="head"]` above), the card's
+   surface, edge and words given up while it is the line; the card is still the thread, for every act that
+   finds it by its id. The line is the one every run draws (`.read-run`). */
+#side-cards li.side-card-row[data-read-run="head"] {
+  display: block;
+  padding: 0;
+  background: none;
+  border-color: transparent;
+  border-left-color: transparent;
+  outline: none;
+  /* The run's line at full strength, as a message row heading a run keeps its line. */
+  --row-opacity: 1;
+  --row-filter: none;
+  --row-grey: 0;
+}
+
+#side-cards li.side-card-row[data-read-run="head"] > :not(.read-run) {
+  display: none;
+}
+
+#side-cards li.side-card-row[data-read-run="head"][data-selected="true"] > .read-run {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/* `#540 read-aloud-desktop`. A card whose first message is being read (a press in reading mode reads
+   it), drawn as the message row being read is: the Stop colour's edge, inset bar and tint, at full
+   strength however read its thread is; and asked for, the pulsing outline of a row asked for. Not while
+   the card stands as the line of a run of read threads. */
+#side-cards li.side-card-row[data-reading="true"]:not([data-read-run="head"]) {
+  --row-opacity: 1;
+  --row-filter: none;
+  --row-grey: 0;
+  border-color: var(--warn);
+  box-shadow: inset 0.25rem 0 0 var(--warn);
+  background: color-mix(in srgb, var(--warn) 22%, var(--panel));
+}
+
+#side-cards li.side-card-row[data-pending="true"]:not([data-read-run="head"]) {
+  --row-opacity: 1;
+  --row-filter: none;
+  --row-grey: 0;
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  animation: pending-pulse 1.2s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #side-cards li.side-card-row[data-pending="true"]:not([data-read-run="head"]) {
+    animation: none;
+    outline-color: var(--accent);
+  }
+}
+
+/* `#277 thread-card-focus`. The card highlighted: ringed and tinted in its thread's colour. */
+.side-card-row[data-highlighted] {
+  border-color: hsl(var(--thread-hue, 210) 55% 50%);
+  background: color-mix(in srgb, hsl(var(--thread-hue, 210) 55% 50%) 14%, var(--panel));
+}
+
+/* ...and every other card's edge and unread count grey, while the highlighted one shows: a card the
+   filters hide greys nothing. `#440 thread-card-pack-toggle`: and, by the same rule, a read thread's card
+   under Unpack unread, packed while the unread ones stand unpacked, and in no other state. */
+.side-cards:has(> .side-card-row[data-highlighted]:not([hidden]):not(.search-hidden)) > .side-card-row:not([data-highlighted]),
+.side-cards[data-unpack="unread"] > .side-card-row[data-thread-read] {
+  border-left-color: var(--thread-grey);
+}
+
+.side-cards:has(> .side-card-row[data-highlighted]:not([hidden]):not(.search-hidden)) > .side-card-row:not([data-highlighted]) .side-card-unread,
+.side-cards[data-unpack="unread"] > .side-card-row[data-thread-read] .side-card-unread {
+  color: var(--muted);
+}
+
+/* `#483 thread-card-read-style`. A card whose thread is read whole (`data-thread-read`,
+   `threadIsRead`) recedes as a read message row does: the archived rows' own amounts, above
+   (`li.discord-message[data-archived="true"]`), in every read mode — Fold read folds such
+   cards into runs and Hide read leaves them out before this is seen; under Show read this is
+   what says the thread wants nothing. The desaturation drains the edge's colour with the rest
+   of the card, as it drains a read row's speaker tint; the grey-edge RULE above, which recolours
+   the edge itself, stays Unpack unread's alone. The card heading an open thread is never
+   marked read, so it never recedes. */
+.side-card-row[data-thread-read] {
+  --row-opacity: 0.42;
+  --row-filter: grayscale(1);
+  --row-grey: 1;
+}
+
+/* Back at full strength where the reader is on it, as a read row is: selected, highlighted,
+   or holding the focus, its buttons have to read as buttons. */
+.side-card-row[data-thread-read][data-selected="true"],
+.side-card-row[data-thread-read][data-highlighted],
+.side-card-row[data-thread-read]:focus-within {
+  --row-opacity: 1;
+  --row-filter: none;
+  --row-grey: 0;
+}
+
+/*
+ * `#425 collapsed-lines`. A card's text follows the reader's collapsed-lines count as a message's
+ * does, but never under ONE line: this text is the card's name — what a screen reader calls it
+ * and what tells one thread from another — and a list of nameless cards at 0 would be the count
+ * breaking the view it was only meant to tighten. The plain `var()` is stated first for a browser
+ * that takes no arithmetic in a clamp; at 0 such a browser unclamps, and the most height below,
+ * whose `max()` every browser takes, still holds the card to its one line.
+ *
+ * `#482 thread-card-fit`: the count is a MAXIMUM, as it is on a message's clamped body. A card
+ * whose words take fewer lines is that much shorter — no fixed height reserving lines its text
+ * never fills between the words and the facts under them.
+ */
+.side-card-text {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: var(--collapsed-lines);
+  -webkit-line-clamp: max(1, var(--collapsed-lines));
+  line-clamp: var(--collapsed-lines);
+  line-clamp: max(1, var(--collapsed-lines));
+  overflow: hidden;
+  max-height: calc(max(1, var(--collapsed-lines)) * 1.35em);
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+/* `#489 card-root-lines`. A card that shows its thread's first message, for want of a summary, shows
+   it line by line as the message is drawn (`cardLines` in web/voice.js), clamped as before. */
+.side-card-text,
+.thread-card-text {
+  white-space: pre-line;
+}
+
+/* `#257 summary-truncation`, made `#277 thread-card-focus`. An even number of lines keeps the list
+   even, but a name and a summary longer than those lines of this column were cut by the clamp with
+   no way to read the rest short of opening the thread, whose heading gives only the name. The card
+   the reader was on showed its whole text, and under a moving mouse that was a card growing and
+   shrinking at every move; the owner: "I also don't like the cards expanding." So the card
+   HIGHLIGHTED, by a press, shows it, and no other. */
+/*
+ * `#428 summary-cards-full`. A card saying a SUMMARY (`data-summarised-card`, from
+ * `cardIsSummarized` in web/voice.js) in the same rule, and for keeps: a summary is already the
+ * shortening, its length roughly chosen where it was made, so there is nothing left for a clamp
+ * to protect the reader from — only meaning for an ellipsis to cut. Summarised cards are drawn
+ * whole at every collapsed-lines count, 0 included; the count is for raw text, which is
+ * unbounded. The card at the top of a thread is stated by id further down,
+ * where its phone rule has to be outranked. `#440 thread-card-pack-toggle`: and a card the Threads view's
+ * pack toggle has opened, whole or unpacked (`data-card-state`).
+ *
+ * `#482 thread-card-fit`: no least height either — a short summary's card is its own size, not
+ * its neighbours', and a highlighted short card keeps the height it already had fitted.
+ */
+.side-card-row[data-highlighted] > .side-card > .side-card-text,
+.side-card-row[data-summarised-card] > .side-card > .side-card-text,
+.side-card-row[data-card-state="expanded"] > .side-card > .side-card-text,
+.side-card-row[data-card-state="unpacked"] > .side-card > .side-card-text {
+  display: block;
+  -webkit-line-clamp: none;
+  line-clamp: none;
+  overflow: visible;
+  height: auto;
+  max-height: none;
+}
+
+/*
+ * `#528 thread-card-markdown-and-cap`. A card saying its root says it as the root's row does: the
+ * root's own body (`.md`, web/voice.js `cardView`), its lists, line breaks and code, a little tighter
+ * between blocks than a row, as a card is a heading. Its links are underlined words, not
+ * links (`.card-link`): the card is a button.
+ */
+.side-card-text .md > * + *,
+.side-card-text .md :is(li, blockquote) > * + * {
+  margin-top: 0.3em;
+}
+
+.side-card-text .md li + li,
+.side-card-text .md li > :is(ul, ol) {
+  margin-top: 0.1em;
+}
+
+.side-card-text .card-link {
+  color: inherit;
+  text-decoration: underline;
+}
+
+.side-card-text .card-ellipsis {
+  color: var(--muted);
+}
+
+/*
+ * A first unit longer than K on its own — one long paragraph — is clamped (`data-card-clamp`): shown
+ * whole, highlighted or opened, to K lines, its root under it whole when unpacked: the one card whose
+ * words a clamp may cut, because they are all in the row under it. Collapsed, to the reader's
+ * collapsed lines as every card is, or K where that is fewer. K is `--card-max-lines`, written by
+ * web/voice.js `applyCardMaxLines`. The card at the top of a thread keeps its own clamp.
+ */
+.side-card-row[data-card-clamp][data-highlighted] > .side-card > .side-card-text,
+.side-card-row[data-card-clamp][data-card-state="expanded"] > .side-card > .side-card-text,
+.side-card-row[data-card-clamp][data-card-state="unpacked"] > .side-card > .side-card-text {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: var(--card-max-lines, 5);
+  line-clamp: var(--card-max-lines, 5);
+  overflow: hidden;
+  max-height: calc(var(--card-max-lines, 5) * 1.35em);
+}
+
+.side-card-row[data-card-clamp][data-card-state="collapsed"]:not([data-highlighted]) > .side-card > .side-card-text {
+  -webkit-line-clamp: min(var(--card-max-lines, 5), max(1, var(--collapsed-lines)));
+  line-clamp: min(var(--card-max-lines, 5), max(1, var(--collapsed-lines)));
+  max-height: calc(min(var(--card-max-lines, 5), max(1, var(--collapsed-lines))) * 1.35em);
+}
+
+.side-card-facts {
+  grid-column: 1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 0.6rem;
+  padding-inline-start: 0.75rem;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+/* `#277 thread-card-focus`. The way into the thread, "3 replies · 2 unread": a chip at the foot of the
+   card, on its facts' line, in their size. */
+.side-card-open {
+  grid-column: 2;
+  min-height: 1.75rem;
+  padding: 0.15rem 0.6rem;
+  background: transparent;
+  color: var(--ink);
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  font: inherit;
+  font-size: 0.8rem;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.side-card-unread {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+/* Found by the search in the thread's replies rather than the card's own words: said quietly. */
+.side-card-hint {
+  font-style: italic;
+}
+
+/*
+ * `#298 thread-card-header`. OVER A THREAD THE HEADING IS THE THREAD'S CARD: the list card's own look
+ * and words (`.side-card-row` and its parts, above and below), ringed and tinted in the thread's colour
+ * as a highlighted card is, and the X at the end of its facts. It is the heading's only content then,
+ * so the heading gives up its rule and its least height, the card having its own border, and lines the
+ * card up with the cards of the list under it.
+ *
+ * FITTED, as a list card is (`#482 thread-card-fit`): its text is its own height up to the
+ * reader's collapsed lines, clamped as a list card's are (two at most on a phone, below), then a
+ * facts line as tall as the X. Until `#482` the height was fixed so a summary arriving moved
+ * nothing; the owner traded that for cards that waste no room, and a summary arriving after the
+ * thread opened now grows the heading once, to what the summary needs.
+ *
+ * LARGER TYPE ON A PHONE. The facts line holds the age, the count and the X, and at 150% type on a
+ * 360px phone they no longer fit on one line. The age is never narrower than its own words, which
+ * were drawn over the count when it was the only column that could give way, and the X is a thumb's
+ * 44px rather than a size that grows with the type until it is off the screen. The count gives way:
+ * it wraps, between its parts first ("123 replies ·" over "99+ unread"), in a line height that puts
+ * two of its lines in the facts line's least height, so wrapping moves nothing either. The gaps
+ * between the three stop growing with the type at 10px, which leaves the count that much more room
+ * before it has to break inside a part.
+ *
+ * It must never carry `data-highlighted`, whose rule unclamps a card's text: the ring and the tint are
+ * stated here instead.
+ */
+#side-heading:has(> #side-thread-card:not([hidden])) {
+  align-items: flex-start;
+  min-height: 0;
+  padding-block: 0.45rem 0.4rem;
+  border-bottom: 0;
+}
+
+.side-card-row.thread-card-header {
+  flex: 1 1 auto;
+  min-width: 0;
+  grid-template-columns: minmax(min-content, 1fr) minmax(min-content, auto) auto;
+  grid-template-rows: auto minmax(1.75rem, auto);
+  column-gap: min(0.6rem, 10px);
+  padding-inline-end: 0.3rem;
+  border-color: hsl(var(--thread-hue, 210) 55% 50%);
+  background: color-mix(in srgb, hsl(var(--thread-hue, 210) 55% 50%) 14%, var(--panel));
+}
+
+/* `#252 thread-button-state`: a thread nobody has answered spends no colour, here as on its tag. */
+.side-card-row.thread-card-header[data-thread-state="start"] {
+  border-color: var(--thread-grey);
+  background: color-mix(in srgb, var(--thread-grey) 14%, var(--panel));
+}
+
+/* "3 replies · 2 unread", said rather than pressed: the thread is open. Its unread in the accent, as
+   on the card's button (`.side-card-unread`). Where the facts line is too narrow for it, it wraps
+   (above): each part as a whole, onto a line of its own, and within a part only where the part alone
+   is wider than the line. Two of its lines are the facts line's least height. */
+.thread-card-count {
+  grid-column: 2;
+  font-size: 0.8rem;
+  line-height: calc(1.75rem / 2);
+  text-align: end;
+  color: var(--ink);
+}
+
+.thread-card-count > span {
+  display: inline-block;
+  max-width: 100%;
+}
+
+/* The X, at the end of the facts line: a mouse's way back to the cards, the size of the card's own
+   chip on a desk, and a thumb's under a finger — 44px whatever the type size, which a size in rem
+   was not: at 175% type it ended past the edge of a 360px phone, and at 200% it was off it. */
+.thread-card-close {
+  grid-column: 3;
+  width: 1.75rem;
+  height: 1.75rem;
+}
+
+@media (pointer: coarse) {
+  .thread-card-close {
+    width: 44px;
+    height: 44px;
+  }
+}
+
+/* On a phone, over a thread across the window, two lines of it at most rather than the reader's
+   full count: the card is the screen's heading there, and another line of it is a line less of
+   the thread. Fewer than two where the reader's count is fewer (`#425 collapsed-lines`), never
+   under the one line a card keeps for its name. Fitted below that most, as a list card is. */
+@media (max-width: 599.98px) {
+  #thread-card:not([data-folded]) > .side-card > .side-card-text {
+    -webkit-line-clamp: 2;
+    -webkit-line-clamp: max(1, min(var(--collapsed-lines), 2));
+    line-clamp: 2;
+    line-clamp: max(1, min(var(--collapsed-lines), 2));
+    max-height: calc(max(1, min(var(--collapsed-lines), 2)) * 1.35em);
+  }
+}
+
+/*
+ * `#428 summary-cards-full`. The card at the top of a thread, summarised: whole at every width,
+ * stated by id so the phone's two lines above do not cut a summary either. Fitted like the list
+ * cards (`#482 thread-card-fit`), so a one-line summary is a one-line heading. Folded to a bar
+ * (`data-folded`, `#388 thread-header-collapse`) it is the bar and nothing else, summary or not:
+ * that fold is the reader's own press on the card, kept as asked.
+ */
+:is(#thread-card, #side-thread-card)[data-summarised-card]:not([data-folded]) > .side-card > .side-card-text {
+  display: block;
+  -webkit-line-clamp: none;
+  line-clamp: none;
+  overflow: visible;
+  height: auto;
+  max-height: none;
+}
+
+/*
+ * `#388 thread-header-collapse`. FOLDED TO A BAR by a press on it (web/voice.js, `threadCardPressed`),
+ * the owner's "thin colored bar. Just enough vertical height that you can see the inside color as well
+ * as the border color and so it's wide enough to tap on": the card's own edge and tint, 14px from edge
+ * to edge, and nothing in it but its text's button, which the keys reach and which says the card is
+ * folded. That button is the bar's press target, out of sight and 6px past the bar above and below,
+ * so 24px of the heading's height is the bar to a thumb, inside the room the heading pads it with.
+ * Where it stands is where the card's left edge was, so the line from the root meets the bar there.
+ */
+.side-card-row.thread-card-header[data-folded] {
+  display: block;
+  position: relative;
+  box-sizing: border-box;
+  height: 14px;
+  padding: 0;
+}
+
+.thread-card-header[data-folded] > :not(.side-card) {
+  display: none;
+}
+
+.thread-card-header[data-folded] > .side-card {
+  position: absolute;
+  inset: -6px 0;
+  width: auto;
+  padding: 0;
+  border-radius: 0;
+}
+
+.thread-card-header[data-folded] > .side-card > .side-card-text {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/*
+ * `#298 thread-card-header`. THE CARD MOVES UP. The owner: "I would like to see the SAME colorful card
+ * move up to the top of the screen ... So it just moves up and disgorges its internal messages
+ * underneath". A thread opened from its card while that card is on screen — in the list on the right,
+ * or in the thread list across the window — has its card at the top start where the card in the list
+ * was and slide to its place, and the thread's messages fade in under it. web/voice.js measures both
+ * places and writes the distance between them (`--flight-x`, `--flight-y`) and `data-flying` on the
+ * card and `data-arriving` on the thread's pane; these rules do the moving. Only a transform and an
+ * opacity are animated, so nothing is laid out again and nothing moves in the list under the card
+ * (`#280 scroll-stability`): the thread is already at its place when it fades in.
+ *
+ * How long it takes is said here, and nowhere else, and the script reads it (`cardFlightMs`), as it
+ * reads `--column-glide`; for a reader whose system asks for less motion it is 0, and nothing moves or
+ * fades at all.
+ */
+#screen-main {
+  --card-flight: 220ms;
+}
+
+@keyframes card-flight {
+  from {
+    transform: translate(var(--flight-x, 0px), var(--flight-y, 0px));
+  }
+}
+
+@keyframes thread-arrive {
+  from {
+    opacity: 0;
+  }
+}
+
+/* Over the list it flies across. */
+.thread-card-header[data-flying] {
+  position: relative;
+  z-index: 3;
+  animation: card-flight var(--card-flight) cubic-bezier(0.2, 0, 0, 1) backwards;
+}
+
+#pane-discord[data-arriving],
+#side-pane[data-arriving] {
+  animation: thread-arrive 180ms ease-out 60ms backwards;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #screen-main {
+    --card-flight: 0ms;
+  }
+
+  .thread-card-header[data-flying],
+  #pane-discord[data-arriving],
+  #side-pane[data-arriving] {
+    animation: none;
+  }
+}
+
+/*
+ * `#460 pack-gap-slide`. A thread packed in the Threads view leaves its gap for a moment, and what is below it
+ * on the screen slides up into place; unpacked, what is below slides down off its rows as they come in. The
+ * script draws it with a transform alone over the cards as they now stand (`slideIntoPlace`) and reads how
+ * long from here: the gap's hold, and the slide. Under reduced motion both are 0, and nothing moves.
+ */
+#screen-main {
+  --pack-gap-hold: 200ms;
+  --pack-slide: 260ms;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #screen-main {
+    --pack-gap-hold: 0ms;
+    --pack-slide: 0ms;
+  }
+}
+
+/* `#460 pack-gap-slide`. While what is below slides, the card it slides for and that card's rows are drawn over
+   it: sliding down from where it was, it would otherwise cover the room the card or its rows just took, and
+   take a press meant for them. */
+#side-cards > [data-slide-over] {
+  position: relative;
+  z-index: 1;
+}
+
+#side-more-threads {
+  margin: 0 auto 0.6rem;
+  display: block;
+}
+
+/*
+ * `#281 view-keys`. THE THREAD LIST: the right column on its own, across the window, at every width,
+ * while #screen-main carries `data-columns="list"` (web/voice.js, `renderColumns`). The owner wanted
+ * the thread list "converged with the two-column rendering of threads on the right", so it IS that
+ * column — its heading, Unread only, its freshness line, Older threads and its cards — drawn in the
+ * list's own cell over the left column, which stays laid out behind it, out of sight, so that coming
+ * back to it finds the reader where they were. The pill speaks for that column and is put out of sight
+ * with it; the search glass stays on the line over the head of the list, which makes room for it as
+ * the left column's list does for the pill (`#pane-discord[data-freshness]`), and for the bar when it
+ * is open. The filters about messages — Pinned, Links, whose — have nothing to filter among cards and
+ * are not shown.
+ */
+#screen-main[data-columns="list"] > #side-column {
+  display: grid;
+  grid-row: 3;
+  grid-column: 1;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
+  min-height: 0;
+  position: relative;
+  /* Under the floating line (the anchor is 2), over the column behind. */
+  z-index: 1;
+  padding-top: calc(var(--float-line) + max(var(--freshness-box), var(--search-disc)) / 2);
+}
+
+#screen-main[data-columns="list"][data-searching] > #side-column {
+  padding-top: calc(var(--float-line) + var(--search-bar) / 2 + 0.35rem);
+}
+
+/*
+ * `#419 threads-view-main-messages`. THE HEADING ON THE GLASS'S ROW. The owner, 2026-10-21, of the
+ * Threads view: "buttons for Unread Only and Unpack Only... these are weirdly BELOW the Search icon when
+ * they should fit on the same row." So, the search shut, the heading is drawn on the floating line the
+ * glass sits on — its middle level with the glass's, its end clear of it — and the cards start under it,
+ * the row the heading took given back to them. Open, the search bar has the line, and the heading goes
+ * back under it (above).
+ */
+#screen-main[data-columns="list"]:not([data-searching]) > #side-column {
+  padding-top: max(0px, calc(var(--float-line) - 2.75rem / 2));
+}
+
+#screen-main[data-columns="list"]:not([data-searching]) #side-heading {
+  padding-inline-end: calc(var(--search-disc) + 1.1rem);
+}
+
+/* `#426 threads-sort-toggle`. The order chip says its order whole, or on a phone (below) in a word. */
+#side-heading .chip-short {
+  display: none;
+}
+
+/* On a phone the chips say less, so they and the title fit the row beside the glass. */
+@media (max-width: 599px) {
+  #side-heading .chip-more,
+  #side-heading .chip-whole {
+    display: none;
+  }
+
+  #side-heading .chip-short {
+    display: inline;
+  }
+
+  #side-heading .chip {
+    padding-inline: 0.55rem;
+  }
+}
+
+/* `#419 threads-view-main-messages`. The main channel's box as the last card of the Threads view: the
+   composer, moved to the foot of the cards, with the cards' own spacing over it. */
+#channel-composer[data-main-card] {
+  margin-top: 0.45rem;
+}
+
+#screen-main[data-columns="list"] > #scroll-area,
+#screen-main[data-columns="list"] > #scroll-tools,
+#screen-main[data-columns="list"] #channel-freshness {
+  visibility: hidden;
+}
+
+#screen-main[data-columns="list"] > #width-grip,
+#screen-main[data-columns="list"] #pinned-filter,
+#screen-main[data-columns="list"] #links-filter,
+#screen-main[data-columns="list"] #author-filter,
+#screen-main[data-columns="list"] #link-kinds {
+  display: none;
+}
+
+/* On a phone the column reaches the screen's edges, past a notch's inset. */
+#screen-main[data-columns="list"] #side-scroll {
+  padding-inline: calc(0.75rem + env(safe-area-inset-left)) calc(0.75rem + env(safe-area-inset-right));
+}
+
+/* `#279 thread-card-focus`, under a finger: a card's way into its thread, "3 replies · 2 unread", is a
+   thumb's height, as a bar button is, where the desk's chip is the height of the facts beside it. */
+@media (pointer: coarse) {
+  #screen-main[data-columns="list"] .side-card-open {
+    min-height: 2.75rem;
+    padding-inline: 0.75rem;
+  }
+}
+
+/* The divider inside the Channels group, between "this channel" and "add another".
+   One group, two acts, and without a rule the second reads as more of the first. */
+.settings-rule {
+  border: none;
+  border-top: 1px solid var(--edge);
+  margin: 0.9rem 0 0.2rem;
+  width: 100%;
+}
+
+/* A heading BELOW a group heading must not compete with the one above it. `#271 settings-groups`
+   made every group's own heading an `h3`, under its section's `h2`; those are sized above. */
+.settings-group h3 {
+  font-size: 0.85rem;
+  margin: 0.2rem 0 0;
+}
+
+/* The one link on this page that LEAVES it, and the only anchor in the document.
+ *
+ * Sized and spaced as a tap target rather than as a word in a sentence: it stands alone in its own
+ * paragraph on a phone, where a 0.9rem underlined phrase is a thing you miss twice before hitting.
+ * Underlined as well as coloured, because colour alone is not a signal to a reader who cannot see
+ * this one. */
+.external-link {
+  display: inline-block;
+  padding: 0.25rem 0;
+  color: var(--accent);
+  font-size: 0.95rem;
+  text-underline-offset: 0.2em;
+}
+
+/* An identifier, so it is monospaced and selectable — the point of printing it is that it can be
+   copied when the link stops landing where the vendor used to keep the page. */
+.agent-id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.8rem;
+  overflow-wrap: break-word;
+  user-select: all;
+}
+
+/* The verbs in the channel box, on one line while they fit. They are the resting state of that
+   group: the fields each belongs to appear underneath only when one is pressed. */
+.channel-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin: 0.4rem 0 0;
+}
+
+/* `#232 upstream-mark-read`. The warning beside the choice that marks people's messages read in the
+   chat service's own app: in the warning colour, ruled down its edge, so it reads as a caution
+   rather than as one more hint. */
+#upstream-clear-warning {
+  color: var(--warn);
+  border-left: 3px solid var(--warn);
+  padding-left: 0.5rem;
+}
+
+/* `#19 channel-browser`. One row per channel: the name takes the width and wraps rather than
+   pushing the Add button off a narrow phone, and the button keeps a finger-sized target. */
+.channel-directory {
+  list-style: none;
+  margin: 0.4rem 0 0;
+  padding: 0;
+  max-height: 22rem;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.channel-directory li {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: 2.75rem;
+  padding: 0.25rem 0;
+  border-bottom: 1px solid var(--edge);
+}
+
+.channel-directory .directory-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.channel-directory .directory-tracked {
+  flex: 0 0 auto;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.channel-directory button {
+  flex: 0 0 auto;
+  min-height: 2.75rem;
+  min-width: 4rem;
+}
+
+/*
+ * `#299 all-thread-strip`. THE THREAD'S STRIP ON A ROW OF ALL. The owner, 2026-10-14: "In the
+ * interleaved All view I would like a little color strip along the left edge of the rectangular
+ * messages that are messages in threads. Not the curved style of the thread cards, just the normal
+ * message view but with a color accent on the left. Somewhat thicker than the normal border so it is
+ * clickable. But when this border is clicked ... I want it to just SELECT that thread, dimming all
+ * messages that are not part of the thread but keeping us in the global view."
+ *
+ *   * THE LANE, kept on EVERY row of All (`data-view="flat"` on the list, written by web/voice.js), a
+ *     strip or none: a strip that comes with a thread's first reply moves no word of its row. The
+ *     agent's tile, which meets the screen's edge on a phone, keeps the notch's inset as well.
+ *   * THE STRIP is a button over the row's left border, the row's full height and a hit area wide
+ *     (16px; 22px under a finger), drawn as a straight bar in the thread's colour, by the formula its
+ *     tag and its card are edged in: five times a border (six under a finger), widening under a
+ *     resting mouse, and ringed in the accent for the keys. Over the read row's veil, and in no filter
+ *     (above): a read message's strip is its thread's colour too.
+ *   * SELECTED, the rows not in the thread recede further than a read row and lose their colour, and
+ *     their strips go grey; the thread's own come to full strength, a read one keeping its drained
+ *     tint. Only amounts are changed, never a size, so nothing moves; and with no transition, so a row
+ *     arriving dimmed does not flash. A row the keys or the mouse are on, the focus is in, or that is
+ *     being read aloud, answered or asked for comes back, as a read row does.
+ */
+:root {
+  --strip-hit: 16px;
+  --strip-bar: 5px;
+}
+
+@media (pointer: coarse) {
+  :root {
+    --strip-hit: 22px;
+    --strip-bar: 6px;
+  }
+}
+
+#discord-log[data-view="flat"] > li.discord-message[data-who] {
+  padding-left: calc(var(--strip-hit) + 0.35rem);
+}
+
+#discord-log[data-view="flat"] > li.discord-message[data-who="coder"] {
+  padding-left: calc(var(--strip-hit) + 0.35rem + env(safe-area-inset-left));
+}
+
+#discord-log > li.discord-message > .thread-strip {
+  position: absolute;
+  top: -1px;
+  bottom: -1px;
+  left: -1px;
+  z-index: 1;
+  width: var(--strip-hit);
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  background: none;
+  border: 0;
+  border-radius: inherit;
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+#discord-log > li.discord-message[data-who="coder"] > .thread-strip {
+  left: calc(-1px + env(safe-area-inset-left));
+}
+
+#discord-log > li.discord-message > .thread-strip::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: var(--strip-bar);
+  border-radius: inherit;
+  background: hsl(var(--thread-hue, 210) 55% 50%);
+}
+
+#discord-log > li.discord-message > .thread-strip:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/* A thread selected: the rest recede and drain, and their strips go grey (a resting mouse still shows
+   a strip's own colour, the way to select its thread instead: in the pointer's block, above). */
+#discord-log[data-view="flat"][data-focus-thread] > li.discord-message[data-who]:not([data-thread-in]) {
+  --row-opacity: 0.3;
+  --row-filter: grayscale(1);
+  --row-grey: 1;
+}
+
+#discord-log[data-view="flat"][data-focus-thread] > li.discord-message[data-who][data-thread-in] {
+  --row-opacity: 1;
+}
+
+#discord-log[data-view="flat"][data-focus-thread] > li.discord-message:not([data-thread-in]) > .thread-strip::before {
+  background: var(--thread-grey);
+}
+
+#discord-log[data-view="flat"][data-focus-thread] > li.discord-message[data-who]:not([data-thread-in]):is([data-selected="true"], :focus-within, [data-reading="true"], [data-replying], [data-pending="true"]) {
+  --row-opacity: 1;
+  --row-filter: none;
+  --row-grey: 0;
+}
+
+/*
+ * `#492 threads-row-widths`. A thread unpacked under its card in the Threads view. The owner, 2026-10-22:
+ * "The thread messages are less wide than the card above them ... I understand that they need to be
+ * indented on their left edge, good. But why does the right edge need to come in!!?" and "My messages
+ * should be the shorter ones. And I think the difference in their width could be HALF what it is now."
+ * So every row of the thread reaches the card's right edge; each begins at the thread's indent (the
+ * stack's, above), the owner's own narrower by half the old difference, `min(15%, 6rem) / 2` — since
+ * `#524 thread-bridge-even-connectors` that room is on their right, so they begin where the rest
+ * begin; and a reply opened under one of them is as wide as the thread's rows, where the reply will
+ * be drawn.
+ *
+ * `--unpack-row-left` is that indent, stated on the list holding the cards and the reply's box, so both
+ * read it; a phone's and a desk's, as the stack's own rules state it.
+ */
+#side-list {
+  --unpack-row-left: calc(var(--speaker-inset) / 2 + var(--reply-gutter));
+  --unpack-row-left-cqw: var(--unpack-row-left);
+}
+
+/* The `cqw` twin is for what is placed inside a row (its bookmark line, `--row-inset-left`), where a
+   percentage would be of the row and not of the list, as the stack's own inset rules say. */
+@media (min-width: 900px) and (pointer: fine) {
+  #side-list {
+    --unpack-row-left: calc(var(--desk-third-inset, min(7%, 3rem)) + var(--reply-gutter));
+    --unpack-row-left-cqw: calc(var(--desk-third-inset, min(7cqw, 3rem)) + var(--reply-gutter));
+  }
+}
+
+#side-cards > li.discord-message.unpack-row[data-who] {
+  margin-right: 0;
+  --row-inset-right: 0px;
+}
+
+/* A run's line keeps the stack's indent (`#407 unpack-row-parity`, above): it stands for rows, not for one
+   speaker. */
+/* `#524 thread-bridge-even-connectors`. The owner, 2026-10-25: "I don't like the variable
+   length thread bridge connectors. Right now we've made MY messages less wide and
+   right-indented them. Let's have them left-justified so the colored line is the SAME
+   length. We already have a color distinction for mine/theirs messages, and if we keep
+   the current width for my messages we'll have a ragged edge on the right, but at least
+   we won't have these variable length connectors." So the owner's unpacked rows begin
+   where the thread's other rows begin, at `--unpack-row-left`, and keep the narrower
+   width `#492 threads-row-widths` gave them: the half inset they used to begin further
+   in is now the room they stop short on the right. Every bridge piece is the one width
+   again, the spine one line down the thread, and the Pack triangle stands in the
+   thread's gutter whoever wrote the first row. Their colour still tells them apart. */
+#side-cards > li.discord-message.unpack-row[data-who="me"]:not([data-read-run="head"]) {
+  margin-left: var(--unpack-row-left);
+  margin-right: calc(min(15%, 6rem) / 2);
+  --row-inset-left: var(--unpack-row-left-cqw);
+  --row-inset-right: calc(min(15cqw, 6rem) / 2);
+}
+
+@supports (anchor-name: --a) {
+  #side-list:has(> #side-cards > li.unpack-row[data-inline-reply]) > #side-reply[data-anchored] {
+    left: calc(anchor(--inline-reply-list left) + var(--unpack-row-left));
+  }
+}
+
+/*
+ * `#501 thread-bridge-gutter`. ON A PHONE the bridge hugs the left edge. The owner, 2026-10-25:
+ * "In mobile we waste too much space on this connector bridge. I would like to push it left so
+ * that the triangle is almost touching the left screen edge." A stack hung a whole touch target
+ * (2.75rem) in from what it hangs from, because the X's disc, a gap, the spine and a 0.9rem
+ * branch were laid out across that gutter; on a 393px phone an unpacked thread's rows began
+ * 68px from the edge and the triangle's ink 29px.
+ *
+ * Here a stack hangs less far in instead, on a 0.55rem branch: the spine still comes out of the
+ * flat of the foot of what the replies hang from and each row still begins visibly inside its
+ * parent, while the mark left of the spine takes the room the parent itself does not use, out
+ * to a few pixels from the screen's edge, notch room included where the list keeps it. How far
+ * in is set by what stands at the first row's gutter. Under a card that is the pack triangle,
+ * whose target may go to 2rem here — still a thumb's, at the 2rem floor it
+ * states for itself — so an unpacked thread's rows hang 0.85rem in past the third speaker's
+ * half inset, 1.6rem in from their card's face altogether. In a channel list it is the X, which
+ * keeps its whole gutter square (its target has always been the full 2.75rem, every point of
+ * it on the screen), so there a stack hangs 1.25rem in: the least that keeps that square on
+ * the screen and the spine on its parent's flat, past the parent's corner. The agent's tile is
+ * the one parent with no room to give: it runs edge to edge, and a stack under it keeps the
+ * inset it always had, which is that least room already; only its branch shortens with the
+ * rest, and its disc follows the spine.
+ *
+ * Every list the bridge is drawn in, restated from the stack's own rules above as a desk
+ * restates them in its block; a desk keeps the room it has, and a reply's arrow keeps its whole
+ * gutter everywhere — only what hangs on a bridge moves.
+ */
+@media (max-width: 599.98px) {
+  #side-cards li.discord-message[data-stack-under="me"][data-who] {
+    margin-left: calc(var(--speaker-inset) + 0.85rem);
+  }
+  #side-cards li.discord-message[data-stack-under="third"][data-who] {
+    margin-left: calc(var(--speaker-inset) / 2 + 0.85rem);
+  }
+  #side-cards li.discord-message[data-stack-under="reply"][data-who],
+  #side-cards li.discord-message[data-stack-under="me-reply"][data-who] {
+    margin-left: calc(var(--reply-gutter) + 0.85rem);
+  }
+  #side-log li.discord-message[data-stack-under="me"][data-who],
+  #discord-log li.discord-message[data-stack-under="me"][data-who] {
+    margin-left: calc(var(--speaker-inset) + 1.25rem);
+  }
+  #side-log li.discord-message[data-stack-under="third"][data-who],
+  #discord-log li.discord-message[data-stack-under="third"][data-who] {
+    margin-left: calc(var(--speaker-inset) / 2 + 1.25rem);
+  }
+  #side-log li.discord-message[data-stack-under="reply"][data-who],
+  #discord-log li.discord-message[data-stack-under="reply"][data-who],
+  #side-log li.discord-message[data-stack-under="me-reply"][data-who],
+  #discord-log li.discord-message[data-stack-under="me-reply"][data-who] {
+    margin-left: calc(var(--reply-gutter) + 1.25rem);
+  }
+
+  #side-log .reply-bridge,
+  #side-cards .reply-bridge,
+  #discord-log .reply-bridge {
+    width: calc(0.55rem + var(--reply-stroke) / 2);
+  }
+
+  /* `#526 pack-triangle-dim`: at its 32px floor, so centred in the button (and shifted a
+     touch left with it) its ink still sits a few px from the screen's edge. Only a touch:
+     the gutter left of the spine is narrower than the button and the room the rule above
+     keeps from the line (`#558 pack-triangle-clear-bridge`), so here it stays where it was. */
+  #side-cards .reply-ungather.unpack-pack {
+    width: 2rem;
+    transform: translateX(-0.375rem);
+  }
+
+  /* `#558 pack-triangle-clear-bridge`, on a phone. The 32px target reaches over the bridge's
+     line, so it draws nothing of its own: its press, its keyboard ring and (in a narrow window
+     with a mouse, by the hover rules' own block) its hover wash are a 1.5rem rectangle at its
+     left, clear of the line, and the triangle is centred in that. The target stays the whole button, invisible over the
+     bridge's own tap room (`#501 thread-bridge-gutter`) as it was. */
+  #side-cards .reply-ungather.unpack-pack::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: 1.5rem;
+    border-radius: 0.5rem;
+    pointer-events: none;
+  }
+
+  #side-cards .reply-ungather.unpack-pack .unpack-pack-mark {
+    left: 0.75rem;
+  }
+
+  #side-cards .reply-ungather.unpack-pack:active,
+  #side-cards .reply-ungather.unpack-pack:focus-visible,
+  :root:not([data-input="keys"]) #side-cards .reply-ungather.unpack-pack:hover {
+    background: none;
+    outline: none;
+  }
+
+  #side-cards .reply-ungather.unpack-pack:active::before,
+  #side-cards .reply-ungather.unpack-pack:focus-visible::before {
+    background: color-mix(in srgb, currentColor 18%, transparent);
+  }
+
+  #side-cards .reply-ungather.unpack-pack:focus-visible::before {
+    outline: 2px solid currentColor;
+    outline-offset: -2px;
+  }
+
+  /* The disc in its whole square, and the triangle in its slim one, by the arithmetic their own
+     rules state: the button's width, less the branch, half the spine, the gap to it, and the
+     mark itself. */
+  #side-log .reply-ungather-mark,
+  #side-cards .reply-ungather-mark,
+  #discord-log .reply-ungather-mark {
+    left: calc(var(--reply-gutter) - 0.55rem - 0.09375rem - 0.25rem - 1.2rem);
+  }
+
+  /* The pack triangle is centred across its button (`#526`, above), and on a phone across the
+     wash at its button's left (`#558`, above, which outranks this). */
+  #side-cards .unpack-pack-mark {
+    left: 50%;
+  }
+
+  /* A collapsed run's line in an unpacked thread keeps the stack's slim indent, as above. */
+  #side-cards li.discord-message[data-read-run="head"][data-stack-under="third"] {
+    margin-left: calc(var(--speaker-inset) / 2 + 0.85rem) !important;
+  }
+
+  /* `#492 threads-row-widths`, restated: this is the one left edge every unpacked row
+     begins at, the owner's included (`#524 thread-bridge-even-connectors`); a reply opened
+     under one is as wide as the thread's rows are. */
+  #side-list {
+    --unpack-row-left: calc(var(--speaker-inset) / 2 + 0.85rem);
+    --unpack-row-left-cqw: calc(var(--speaker-inset) / 2 + 0.85rem);
+  }
+
+}
+
+/* `#543 in-app-message-links`. A link to a message this app opens itself, where every other link leaves
+   for a new tab: a small hook before it says the tap stays here. Generated, so copying the text and a
+   screen reader (the empty alternative after the slash) still read the link's own words. */
+.md a[data-in-app]::before {
+  content: "\21AA\FE0E\00A0" / "";
+  opacity: 0.7;
+}

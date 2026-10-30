@@ -1,0 +1,174 @@
+/* ----------------------------------------------------------------- who is speaking, in the channel */
+/*
+ * `#85 voice-desktop-review`. The transcript tells its two speakers apart by SIDE, COLOUR and CORNER
+ * — three signals at once, because one small grey word was not enough — and the channel view told
+ * them apart by nothing. These rules give the channel the same idiom, and deliberately the SAME
+ * custom properties rather than a parallel palette: `me` in the channel and `mine` in the
+ * transcript are the same person saying things in two places, and they must not be two colours.
+ *
+ * `me` includes the voice bot, because it posts on the owner's behalf. The words are his; the
+ * account that delivered them is an implementation detail of this bridge.
+ */
+#side-log li.discord-message[data-who="me"],
+#side-cards li.discord-message[data-who="me"],
+#discord-log li.discord-message[data-who="me"],
+#pinned-log li.discord-message[data-who="me"] {
+  background: var(--mine);
+  border-color: var(--mine-edge);
+  margin-left: var(--speaker-inset);
+  border-bottom-right-radius: 0.15rem;
+  /* `#555 own-row-dark-contrast`. The quiet ink of everything on his row — the time, "(edited)",
+     a reaction's count — is the one that reads at 4.5:1 on his tint (`--muted-on-mine`, as the send
+     card's notes are). The shared `--muted` is 3.5:1 to 4.2:1 there, which a read row's grey hid
+     until his rows could stand unread (`#549 own-read-stored`). */
+  --muted: var(--muted-on-mine);
+}
+
+/*
+ * `#424 threads-main-own-center`. The owner, 2026-10-22, of the Threads view with Main channel on: "my
+ * messages now look like they're follow ups to the prior thread because they look the same as the prior
+ * thread messages except without the colorful connector. I propose in this view we actually CENTER my
+ * messages to the main channel, keeping their current width, so their left edge is no longer lined up
+ * with the intra-thread messages." So there, and only on the main channel's rows among the cards
+ * (`data-main-row`), the owner's inset is split into halves either side: the same width, centred. The
+ * agent's main rows, and the owner's rows in every other list, keep the rule above. A desk restates it
+ * where it restates that rule.
+ */
+#side-cards li.discord-message[data-who="me"][data-main-row] {
+  margin-inline: calc(var(--speaker-inset) / 2);
+}
+
+/*
+ * THE CODING AGENT'S MESSAGES ARE TILES, NOT CELLS.
+ *
+ * They are the thing this view exists to read, and they are long, so they get the whole width:
+ * negative margins cancel the scroll area's own gutter exactly, and what is left between the words
+ * and the edge of the screen is the smallest gutter that still reads as text rather than as
+ * something falling off the display.
+ *
+ * No rounding, because a full-width box with rounded corners reads as a card that has outgrown its
+ * container. But a border on ALL FOUR SIDES, the hairline every row has (`.messages li` in
+ * web/style.css). The tile used to drop its two sides, and on a desk — where it is held inside the
+ * reading column (the desktop block at the foot of this file) and never reaches the screen's edge —
+ * the owner saw square boxes with a top and a bottom and no sides, which looked weird
+ * (`#213 row-side-borders`). With four it is a rectangle at any width. On a phone its sides sit at
+ * the screen's edges, which the owner accepts, and cost no width: a border is inside the box the
+ * negative margins size.
+ *
+ * They still cannot be confused with the owner's own messages, which keep their right indent AND
+ * their colour -- two signals, either of which would do on its own.
+ */
+#side-log li.discord-message[data-who="coder"],
+#side-cards li.discord-message[data-who="coder"],
+#discord-log li.discord-message[data-who="coder"],
+#pinned-log li.discord-message[data-who="coder"] {
+  background: var(--theirs);
+  margin-left: calc(-0.75rem - env(safe-area-inset-left));
+  margin-right: calc(-0.75rem - env(safe-area-inset-right));
+  padding-left: calc(0.4rem + env(safe-area-inset-left));
+  padding-right: calc(0.4rem + env(safe-area-inset-right));
+  border-radius: 0;
+}
+
+/* THIRD PARTIES: other people, and any bot that is not the coding agent.
+ *
+ * A THIRD tint, and one only — not a fourth. An earlier reading of this refused a third colour on
+ * the grounds that two speakers is what the eye can sort at a glance and a four-colour channel
+ * would be a legend to learn. Half of that still holds and is why `human` and `bot` share one
+ * treatment rather than taking two; the other half was wrong, and the owner said so: a channel
+ * with other people in it needs to show at a glance that a message came from NEITHER principal,
+ * and indentation alone was too quiet to do it on a phone.
+ *
+ * Warm rather than a third blue, so it is not read as a variant of `me`, and centred between the
+ * two insets so the geometry still says "neither side of this conversation". */
+#side-log li.discord-message[data-who="human"],
+#side-cards li.discord-message[data-who="human"],
+#discord-log li.discord-message[data-who="human"],
+#pinned-log li.discord-message[data-who="human"],
+#side-log li.discord-message[data-who="bot"],
+#side-cards li.discord-message[data-who="bot"],
+#discord-log li.discord-message[data-who="bot"],
+#pinned-log li.discord-message[data-who="bot"] {
+  background: var(--third);
+  border-color: var(--third-edge);
+  margin-inline: calc(var(--speaker-inset) / 2);
+}
+
+/* The percentage insets are proportionate in a capped column and absurd across a full-width one,
+   exactly as they are for the transcript. They are bounded in THE desktop block at the foot of
+   this file, beside the transcript's own pair — there is one such block, deliberately, and adding
+   a second would split the composition across two places that can drift apart. */
+
+/* The Settings panel that assigns them.
+ *
+ * ONE COLUMN ON A PHONE, and this is the fix for a real defect rather than a preference. The row
+ * was `1fr auto`: the name took the flexible track and the `select` the intrinsic one. A `select`
+ * is as wide as the option it is SHOWING, "Me (including my voice bot)" is by some way the longest
+ * of the four, and so the one row that mattered most — the owner's own voice bot — sized its
+ * intrinsic track to nearly the whole panel. The flexible track can be squeezed to its automatic
+ * minimum, `overflow-wrap: anywhere` below put that minimum at ONE CHARACTER, and the name came out
+ * as a tall vertical column one letter wide. Photographed on the owner's iPhone, with the other
+ * four rows beside it looking perfectly ordinary — which is exactly what made it look like a
+ * mystery rather than arithmetic.
+ *
+ * Two tracks cannot be made to fit: 27 characters of option text and a display name do not share
+ * 375px however the minimums are written. So on a phone they do not share a line at all. The name
+ * is one row, the `select` is the next and spans the full width — which is a better tap target
+ * besides — and the snowflake is the third. The desktop block at the foot of this file puts them
+ * back on one line, where there genuinely is room. */
+.identity-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: center;
+  gap: 0.35rem 0.6rem;
+  padding: 0.45rem 0;
+  border-bottom: 1px solid var(--edge);
+}
+
+/* `#401 hidden-channels-fold`. The last row needs no rule of its own: the hidden channels' fold under
+   it opens with one, and the two together read as a gap with nothing in it. */
+#identity-list > .identity-row:last-child {
+  border-bottom: none;
+}
+
+/* `break-word`, NOT `anywhere`, and the difference is the whole of the defect above: both break a
+   word that cannot fit, but `anywhere` ALSO drops the element's min-content to a single character,
+   which is what let a neighbouring track take the line. This keeps the wrapping and gives the name
+   back a minimum that means something. */
+.identity-name {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  min-width: 0;
+  font-size: 0.9rem;
+  overflow-wrap: break-word;
+}
+
+.identity-tag {
+  flex: 0 0 auto;
+  padding: 0 0.35rem;
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 0.68rem;
+  letter-spacing: 0.02em;
+}
+
+/* The snowflake, last in the row and spanning whatever columns there are: it is the thing that
+   actually IDENTIFIES the account, and the only way to tell two accounts with the same display
+   name apart. Small, because it is evidence rather than a label. */
+.identity-id {
+  grid-column: 1 / -1;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.68rem;
+}
+
+/* A value nobody has confirmed. The distinction is the point of showing the guesses at all: a
+   wrong guess and a deliberate choice look identical otherwise, so there is no way to tell what
+   still needs attention. */
+.identity-row select[data-guessed="true"] {
+  color: var(--muted);
+  font-style: italic;
+}
+

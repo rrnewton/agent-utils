@@ -1,0 +1,77 @@
+/* ------------------------------------------------------------ a collapsed row, on one line ----- */
+/*
+ * `#377 compact-collapsed-rows`. The owner, 2026-10-19, on a phone: a message already collapsed took
+ * two header lines, Done or Unarchive wrapped alone onto the second. "We want collapsed messages to be
+ * tight."
+ *
+ * THE NAME GIVES WAY, NOT THE LINE. It is the one part of the line that can be cut: a prefix and an
+ * ellipsis say who as well as the whole name does on a row whose colour and thread already say much of
+ * it. It asks the line for three letters' room and no more, so a long one never pushes the controls
+ * onto another line; it grows back to its own width (and no wider) wherever the line has the room, and
+ * the time stays right beside it. Its whole name is in its tooltip, set by web/voice.js, and in the
+ * details a press-and-hold opens.
+ *
+ * THE CONTROLS GO TOGETHER. They are one box (`.row-acts`) at the end of the line: where the line has
+ * no room for them beside the name and the time they take the next line as one, at its right, never
+ * Done alone; only where they are wider than the whole line do they wrap among themselves.
+ *
+ * WHERE THE LIST IS NARROW (under 32rem: a phone, a column of two at a small desk window), a collapsed
+ * row's controls are its Thread tag and ⋯ and nothing else, so its header is one line. Reply and Done
+ * (or Unarchive, or Not noise) are acts on a message the reader has opened: they are not drawn, and are
+ * out of the accessibility tree, until it is -- except Quote reply, which words of the message selected
+ * bring back (`#267`), that being the reader asking to answer them. A keyboard opens the row with
+ * Enter, and r and e press Reply and Done on the selected row either way; a finger still swipes a
+ * collapsed row Done. A rich
+ * header (`#242`) keeps its own line there, over the text it heads, rather than squeezing onto the
+ * header line. Where the list is wider, every control stays on every row: there is room for them.
+ */
+/* The time beside the name on a line the controls have left, never spread to its far end. */
+#side-log li.discord-message > .meta,
+#side-cards li.discord-message > .meta,
+#discord-log li.discord-message > .meta,
+#pinned-log li.discord-message > .meta {
+  justify-content: flex-start;
+}
+
+#side-log li.discord-message > .meta > .msg-author,
+#side-cards li.discord-message > .meta > .msg-author,
+#discord-log li.discord-message > .meta > .msg-author,
+#pinned-log li.discord-message > .meta > .msg-author {
+  flex: 1 1 3em;
+  min-width: 0;
+  max-width: max-content;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.row-acts {
+  display: flex;
+  flex: 0 1 auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 0.15rem 0.5rem;
+  min-width: 0;
+  margin-left: auto;
+}
+
+/* Inside the box, the box is what is pushed to the end of the line, not the first control in it. */
+.row-acts > .reply-button,
+.row-acts > .draft-marker {
+  margin-left: 0;
+}
+
+@container rows (max-width: 31.99rem) {
+  :is(#side-log, #side-cards, #discord-log, #pinned-log) li.discord-message[data-collapsed="true"] .row-acts > :is(.reply-button:not([data-quote]), .not-noise-button, .done-button) {
+    display: none;
+  }
+
+  /* Never promoted onto the header line here, however short: its own line, under it. */
+  :is(#side-log, #side-cards, #discord-log, #pinned-log) li.discord-message > .meta > .rh-head {
+    order: 99;
+    flex-basis: 100%;
+    font-size: calc(0.88rem * var(--msg-scale));
+  }
+}
+

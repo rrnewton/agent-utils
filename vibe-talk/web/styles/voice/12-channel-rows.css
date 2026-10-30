@@ -1,0 +1,335 @@
+/* ------------------------------------------------------- one channel row at a time --------- */
+/*
+ * `#56 message-hover-highlight`, then `#239 single-selection`. A long channel is a wall of blocks,
+ * and the row the reader is on is delineated: its surface turns `--row-hover`, its edge the accent,
+ * its controls come up to full contrast, and a dimmed row comes back to full strength.
+ *
+ * ONE ROW AT A TIME, AND ONE LOOK. That row used to be lit two ways: by `:hover` under the mouse,
+ * and by the focus when the keyboard selected a message. The owner, on a desk, lit a message with the
+ * mouse and pressed ↓, and two messages were lit at once, with nothing to say which one Enter would
+ * open. So the row is lit by the selection alone, `data-selected` (the keyboard section of
+ * web/voice.js): the mouse moving over a row selects it, a key moves the selection on from there,
+ * and the attribute is on one row of the page at most. The ring is part of the look whichever put it
+ * there, so a message chosen by the mouse is drawn exactly as one chosen by the keys.
+ *
+ * NOTHING HERE IS A `:hover` ON A ROW. A pointer standing still while a key scrolls the list under
+ * it, or while a message arrives, would light the row that slid beneath it, and that is the second
+ * lit message again. It also keeps the old promise of the pointer query: on a touch screen `:hover`
+ * fires on a tap and stays until the next tap somewhere else, a row that looks selected when nothing
+ * is; a tap selects silently, and draws nothing.
+ */
+#side-log li.discord-message[data-selected="true"],
+#side-cards li.discord-message[data-selected="true"],
+#discord-log li.discord-message[data-selected="true"],
+#pinned-log li.discord-message[data-selected="true"] {
+  background: var(--row-hover);
+  border-color: var(--accent);
+  /* Inside the row's own border, which the scroller's edge would otherwise clip. */
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  --row-opacity: 1;
+}
+
+/* The selected row's own controls gain the accent WITH it rather than appearing out of nothing.
+   Discord hides its row actions until hover; this page does not, and that is a decision rather than
+   an omission: the standing rule here is that a control which cannot act is ABSENT, so a control
+   that CAN act must not be invisible. A reader who has never selected a row still has to be able to
+   see that a reply is possible. */
+#side-log li.discord-message[data-selected="true"] .reply-button,
+#side-cards li.discord-message[data-selected="true"] .reply-button,
+#discord-log li.discord-message[data-selected="true"] .reply-button,
+#pinned-log li.discord-message[data-selected="true"] .reply-button,
+#side-log li.discord-message[data-selected="true"] .done-button,
+#side-cards li.discord-message[data-selected="true"] .done-button,
+#discord-log li.discord-message[data-selected="true"] .done-button,
+#pinned-log li.discord-message[data-selected="true"] .done-button,
+#side-log li.discord-message[data-selected="true"] .not-noise-button,
+#side-cards li.discord-message[data-selected="true"] .not-noise-button,
+#discord-log li.discord-message[data-selected="true"] .not-noise-button,
+#pinned-log li.discord-message[data-selected="true"] .not-noise-button,
+#side-log li.discord-message[data-selected="true"] .upstream-read-button,
+#side-cards li.discord-message[data-selected="true"] .upstream-read-button,
+#discord-log li.discord-message[data-selected="true"] .upstream-read-button,
+#pinned-log li.discord-message[data-selected="true"] .upstream-read-button {
+  color: var(--ink);
+  border-color: var(--accent);
+}
+
+/* `#221 read-modes`. A collapsed run's line gives up the row's tile, ring included, so its selection
+   is drawn on the line: the look it has when pressed, and the ring. */
+#side-log li.discord-message[data-read-run="head"][data-selected="true"] > .read-run,
+#side-cards li.discord-message[data-read-run="head"][data-selected="true"] > .read-run,
+#discord-log li.discord-message[data-read-run="head"][data-selected="true"] > .read-run {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--ink);
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/*
+ * `#245 done-feedback`. SELECTED AND READ IS RINGED GREY AND DASHED; selected and unread keeps the
+ * solid accent. A selected read message still comes all the way back to the lit surface and full
+ * strength (the rule above, and the archived one further up), because it is being read; what the
+ * grey says is that it has been dealt with. Before this a lit read row and a lit unread one were the
+ * same picture, so marking the selected message Done changed nothing the eye could find. Read is what
+ * `stillToDo` says it is: archived, the owner's own when that setting is on, or noise. The run line
+ * stands for read messages only, so its ring is grey too, and so are the edges of the row's controls.
+ *
+ * DASHED, AND A LIGHTER GREY (`--read-ring`), NOT HUE ALONE. In the light scheme `--muted` and
+ * `--accent` are both dark inks that differ only a little in hue, so a grey ring and a blue one read
+ * as the same ring there; a broken line against a solid one is told apart in either scheme and by a
+ * reader who does not see the hue. The row's own edge goes transparent under it, so the gaps between
+ * the dashes are gaps, not a thin solid line.
+ */
+#side-log li.discord-message[data-selected="true"]:is([data-archived="true"], [data-noise="true"]),
+#side-cards li.discord-message[data-selected="true"]:is([data-archived="true"], [data-noise="true"]),
+#discord-log li.discord-message[data-selected="true"]:is([data-archived="true"], [data-noise="true"]),
+#pinned-log li.discord-message[data-selected="true"]:is([data-archived="true"], [data-noise="true"]) {
+  border-color: transparent;
+  outline-style: dashed;
+  outline-color: var(--read-ring);
+}
+
+#side-log li.discord-message[data-selected="true"]:is([data-archived="true"], [data-noise="true"]) :is(.reply-button, .done-button, .not-noise-button, .upstream-read-button),
+#side-cards li.discord-message[data-selected="true"]:is([data-archived="true"], [data-noise="true"]) :is(.reply-button, .done-button, .not-noise-button, .upstream-read-button),
+#discord-log li.discord-message[data-selected="true"]:is([data-archived="true"], [data-noise="true"]) :is(.reply-button, .done-button, .not-noise-button, .upstream-read-button),
+#pinned-log li.discord-message[data-selected="true"]:is([data-archived="true"], [data-noise="true"]) :is(.reply-button, .done-button, .not-noise-button, .upstream-read-button) {
+  border-color: var(--muted);
+}
+
+#side-log li.discord-message[data-read-run="head"][data-selected="true"] > .read-run,
+#side-cards li.discord-message[data-read-run="head"][data-selected="true"] > .read-run,
+#discord-log li.discord-message[data-read-run="head"][data-selected="true"] > .read-run {
+  outline-style: dashed;
+  outline-color: var(--read-ring);
+}
+
+/*
+ * ...AND THE MOMENT OF MARKING IS DRAWN ON THE ROW THAT WAS MARKED, though the selection has moved on
+ * to the next unread message. web/voice.js puts `data-done-flash` on it: "marking" holds the dashed
+ * grey ring while the row goes from the selected unread look to the read look over a quarter of a
+ * second (the solid accent ring giving way to the dashed grey one half way through), and
+ * "fading" then lets the ring and the edge go back to the row's own, unless the row is still
+ * selected, whose grey ring is the rule above.
+ *
+ * ANIMATIONS, NOT TRANSITIONS. On a threaded channel the Done redraws every row from the store, so
+ * the row drawn read is a new element with no earlier style for a transition to start from. An
+ * animation runs FROM a stated look TO whatever the row now is, on a new element as on a kept one:
+ * from the accent ring, the lit surface and full strength, to the read row with its grey ring.
+ */
+@keyframes done-marking {
+  from {
+    outline-style: solid;
+    outline-color: var(--accent);
+    border-color: var(--accent);
+    background-color: var(--row-hover);
+    opacity: 1;
+    filter: none;
+  }
+}
+
+@keyframes done-fading {
+  from {
+    outline-color: var(--read-ring);
+    border-color: transparent;
+  }
+}
+
+/* A reply recedes by a veil over its box rather than by its opacity (see the section on replies),
+   so the veil comes in with it. */
+@keyframes done-veil {
+  from {
+    background-color: transparent;
+  }
+}
+
+/* The ring stays dashed while it lets go, so letting go is a colour fading out rather than a ring
+   switched off; and only on a row the selection is not drawing, so it never hides a ring the
+   selection is. */
+#side-log li.discord-message[data-done-flash]:not([data-selected="true"]),
+#side-cards li.discord-message[data-done-flash]:not([data-selected="true"]),
+#discord-log li.discord-message[data-done-flash]:not([data-selected="true"]),
+#pinned-log li.discord-message[data-done-flash]:not([data-selected="true"]) {
+  outline: 2px dashed transparent;
+  outline-offset: -2px;
+}
+
+/* The grey ring itself, the selected read row's. A row still selected has it from the rule above. */
+#side-log li.discord-message[data-done-flash="marking"]:not([data-selected="true"]),
+#side-cards li.discord-message[data-done-flash="marking"]:not([data-selected="true"]),
+#discord-log li.discord-message[data-done-flash="marking"]:not([data-selected="true"]),
+#pinned-log li.discord-message[data-done-flash="marking"]:not([data-selected="true"]) {
+  border-color: transparent;
+  outline-color: var(--read-ring);
+}
+
+#side-log li.discord-message[data-done-flash="marking"],
+#side-cards li.discord-message[data-done-flash="marking"],
+#discord-log li.discord-message[data-done-flash="marking"],
+#pinned-log li.discord-message[data-done-flash="marking"] {
+  animation: done-marking 0.25s ease-out;
+}
+
+#side-log li.discord-message[data-done-flash="marking"]::after,
+#side-cards li.discord-message[data-done-flash="marking"]::after,
+#discord-log li.discord-message[data-done-flash="marking"]::after {
+  animation: done-veil 0.25s ease-out;
+}
+
+#side-log li.discord-message[data-done-flash="fading"]:not([data-selected="true"]),
+#side-cards li.discord-message[data-done-flash="fading"]:not([data-selected="true"]),
+#discord-log li.discord-message[data-done-flash="fading"]:not([data-selected="true"]),
+#pinned-log li.discord-message[data-done-flash="fading"]:not([data-selected="true"]) {
+  animation: done-fading 0.3s ease-out;
+}
+
+/* No motion asked for: the same grey ring, held, and the same read look, at once. */
+@media (prefers-reduced-motion: reduce) {
+  #side-log li.discord-message[data-done-flash],
+  #side-cards li.discord-message[data-done-flash],
+  #discord-log li.discord-message[data-done-flash],
+  #pinned-log li.discord-message[data-done-flash],
+  #side-log li.discord-message[data-done-flash]::after,
+  #side-cards li.discord-message[data-done-flash]::after,
+  #discord-log li.discord-message[data-done-flash]::after {
+    animation: none;
+  }
+}
+
+/*
+ * What a pointer resting on a CONTROL in a row lights: the disc of a reply's arrow and of the X beside
+ * gathered replies (`#204 reply-arrow`, `#215 reply-coalesce`), the halo of the circle at a row's
+ * corner (`#228 reply-visible`). Only where a pointer can hover, for the sticky-tap reason above, and
+ * not while the keys are in use (`data-input="keys"` on the root, until the mouse really moves): a
+ * key scrolling the list under a still pointer lights nothing it did not select.
+ */
+@media (hover: hover) and (pointer: fine) {
+  :root:not([data-input="keys"]) #side-log .reply-jump:hover,
+  :root:not([data-input="keys"]) #discord-log .reply-jump:hover,
+  :root:not([data-input="keys"]) #side-log .reply-ungather:hover,
+  :root:not([data-input="keys"]) #discord-log .reply-ungather:hover {
+    background: color-mix(in srgb, var(--accent) 18%, transparent);
+  }
+
+  /* `#450 pack-triangle-hue`: the pack triangle's hover wash, in its own colour as its press is. */
+  :root:not([data-input="keys"]) #side-cards .reply-ungather.unpack-pack:hover {
+    background: color-mix(in srgb, currentColor 18%, transparent);
+  }
+
+  /* `#526 pack-triangle-dim`: and the triangle itself comes to full strength with that wash,
+     under the same gate, so nothing brightens it that the wash would not light. */
+  :root:not([data-input="keys"]) #side-cards .reply-ungather.unpack-pack:hover .unpack-pack-mark {
+    opacity: 1;
+  }
+
+  /* `#558 pack-triangle-clear-bridge`: in a window a phone's width, the wash is the button's
+     `::before` at its left (the phone rule), which has no box at any other width. */
+  :root:not([data-input="keys"]) #side-cards .reply-ungather.unpack-pack:hover::before {
+    background: color-mix(in srgb, currentColor 18%, transparent);
+  }
+
+  :root:not([data-input="keys"]) #side-log .reply-marker:hover::before,
+  :root:not([data-input="keys"]) #discord-log .reply-marker:hover::before {
+    box-shadow: 0 0 0 0.25rem color-mix(in srgb, var(--accent) 30%, transparent);
+  }
+
+  /* `#299 all-thread-strip`. A thread's strip in All widens under a resting mouse, and while another
+     thread is selected shows its own colour again: the way to select its thread instead. */
+  :root:not([data-input="keys"]) #discord-log .thread-strip:hover::before {
+    width: calc(var(--strip-bar) + 2px);
+  }
+
+  :root:not([data-input="keys"]) #discord-log[data-focus-thread] > li:not([data-thread-in]) > .thread-strip:hover::before {
+    background: hsl(var(--thread-hue, 210) 55% 50%);
+  }
+}
+
+/* A touch screen keeps what it had: a row holding the focus (a finger on one of its controls focuses
+   it, on some phones) is lit as the selection is, without the ring, because a tap there draws no
+   selection of its own. Not where a mouse is: there the focus and the selection are one row, and
+   the selection draws it. */
+@media (hover: none), (pointer: coarse) {
+  #side-log li.discord-message:focus-within,
+  #side-cards li.discord-message:focus-within,
+  #discord-log li.discord-message:focus-within,
+  #pinned-log li.discord-message:focus-within {
+    background: var(--row-hover);
+    border-color: var(--accent);
+  }
+
+  #side-log li.discord-message:focus-within .reply-button,
+  #side-cards li.discord-message:focus-within .reply-button,
+  #discord-log li.discord-message:focus-within .reply-button,
+  #pinned-log li.discord-message:focus-within .reply-button {
+    color: var(--ink);
+    border-color: var(--accent);
+  }
+}
+
+/* ...and a finger on a touch laptop, which has a mouse as well and answers the query above as a
+   desk does: `data-input="touch"` is on the root from a tap until the mouse moves or a key is
+   pressed (web/voice.js), and a tap there draws no selection of its own either. */
+:root[data-input="touch"] #side-log li.discord-message:focus-within,
+:root[data-input="touch"] #discord-log li.discord-message:focus-within,
+:root[data-input="touch"] #pinned-log li.discord-message:focus-within {
+  background: var(--row-hover);
+  border-color: var(--accent);
+}
+
+:root[data-input="touch"] #side-log li.discord-message:focus-within .reply-button,
+:root[data-input="touch"] #discord-log li.discord-message:focus-within .reply-button,
+:root[data-input="touch"] #pinned-log li.discord-message:focus-within .reply-button {
+  color: var(--ink);
+  border-color: var(--accent);
+}
+
+/* `#267 quote-reply`. Words selected in the message make its Reply a Quote reply, in the accent as
+   Draft beside it is, whether or not the row is selected or holds the focus. As specific as the
+   touch rule just above and after it, so it is drawn over that and the rules before it, which would
+   otherwise draw it in the ink. */
+:root #side-log li.discord-message .meta .reply-button[data-quote],
+:root #discord-log li.discord-message .meta .reply-button[data-quote],
+:root #pinned-log li.discord-message .meta .reply-button[data-quote] {
+  color: var(--accent);
+  border-color: var(--accent);
+  font-weight: 600;
+}
+
+/* ...and where the header line has no room for "Quote reply", "Quote" in the box Reply had: web/voice.js
+   sets the width Reply was drawn at, and this keeps the words inside it, at Reply's own weight, so
+   nothing on the line, and nothing under it, moves (`drawReplyLabel`). */
+:root #side-log li.discord-message .meta .reply-button[data-quote="short"],
+:root #discord-log li.discord-message .meta .reply-button[data-quote="short"],
+:root #pinned-log li.discord-message .meta .reply-button[data-quote="short"] {
+  box-sizing: border-box;
+  padding-left: 0;
+  padding-right: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  font-weight: inherit;
+}
+
+/* THE CHANNEL ROW'S METADATA LINE MUST WRAP, and this is not tidying.
+ *
+ * It carries five things — author, time, message id, the fold control and the reply control — and
+ * a phone is 393 CSS pixels wide. `.meta` is a flex row (web/style.css) with no wrap, and the last
+ * two are `flex: 0 0 auto`, so they cannot shrink: the row simply became WIDER THAN THE SCREEN the
+ * moment `#51 reply-view` added the second of them. Every message body then ran off the right edge
+ * and the reply control was entirely off it.
+ *
+ * Nothing in the page suite could see that — it has no layout engine — and it was found by looking
+ * at `dark--iphone15--10-discord-view.png`, which is the whole reason those pictures are taken.
+ * The scene now also asserts that the channel does not overflow horizontally, because a rule this
+ * easy to lose deserves a check that runs.
+ *
+ * Scoped to the channel's lists rather than put on `.meta` in web/style.css: the transcript's own
+ * metadata line has three things on it and fits.
+ */
+#side-log .meta,
+#side-cards .meta,
+#discord-log .meta,
+#pinned-log .meta {
+  flex-wrap: wrap;
+  row-gap: 0.15rem;
+}
+

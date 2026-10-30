@@ -1,0 +1,444 @@
+/* ---------------------------------------------------------- message text, as rendered ----- */
+/*
+ * `#217 markdown-blocks`. Every message body is a `.md` box: the server's rendering of it, or its
+ * text as plain paragraphs. These rules are what make the two read like the chat service's own
+ * client — round bullets with the text hanging clear of them, a gap at each blank line, headings a
+ * little larger than the text, and code set apart — and they are the only rules that style
+ * message text, so the channel, the cards, the pinned list and a message still being sent
+ * all read alike.
+ *
+ * `white-space: normal`, against the `pre-wrap` the shared `.body` rule gives everything else:
+ * the server's HTML has a newline between its blocks, and pre-wrap would draw each one as an empty
+ * line. A line break inside a paragraph is a `<br>`, so nothing written is lost. Only `pre` keeps
+ * its own spacing.
+ */
+.md {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+/* No margin of their own at either end, so a one-line message is one line tall and the row's own
+   padding is what spaces it from the next. `:where`, which adds nothing to the selector's weight,
+   so the gap below — a rule no heavier than `.md` — still wins over it. */
+.md :where(p, ul, ol, pre, blockquote, table, h1, h2, h3, h4, hr) {
+  margin: 0;
+}
+
+/* THE GAP AT A BLANK LINE: between any two blocks, at every depth — paragraphs, a list after its
+   introduction, the paragraph after a list, two parts of a combined row. Less than a full line,
+   the way a chat client spaces paragraphs rather than the way a document does. 0.8em since
+   `markdown-tables-render` (2026-10-26): at 0.55em an agent's long report of paragraphs, lists and
+   tables read as one squeezed block ("pretty squished together without much spacing around
+   paragraphs and bullets", the owner), where a document renderer puts a full line between blocks. */
+.md > * + *,
+.md + .md,
+.md :is(li, blockquote) > * + * {
+  margin-top: 0.8em;
+}
+
+/* A heading after anything is set further from what it ends than from what it starts, so it reads
+   as the head of the part below it. */
+.md > * + :is(h1, h2, h3, h4) {
+  margin-top: 1.15em;
+}
+
+.md > :is(h1, h2, h3, h4) + * {
+  margin-top: 0.35em;
+}
+
+/* HANGING INDENT. The marker sits in the padding, outside the text, so a second line of an item —
+   a wrapped one or a continuation the writer indented — starts under the first line's text and
+   not under the bullet. */
+.md :is(ul, ol) {
+  padding-left: 1.35em;
+  list-style-position: outside;
+}
+
+.md ul {
+  list-style-type: disc;
+}
+
+/* A number is wider than a bullet, and `10.` wider still. A numbered list's gutter holds two digits
+   and the full stop, so the steps of a long checklist neither stick out past the text above them
+   nor move to a different indent at the tenth step. `#237 nested-lists`. */
+.md ol {
+  padding-left: 2em;
+}
+
+/* AN ITEM IN A MESSAGE IS NOT A ROW. Every row of a list here is an `li` too, and the shared sheet's
+   `.messages li` gives each one a panel, a border, a radius and padding — which, before this, drew
+   every bullet point of a message as a little card of its own. */
+.md li {
+  background: none;
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+  margin: 0;
+}
+
+/* Disc, circle, then square from the third level down, as the chat clients and a browser's own
+   sheet mark depth, so a reader can tell two levels of a deep list apart by their markers. Every
+   list a bullet is inside counts, numbered or not, as it does in the browser's sheet: the steps
+   under a numbered item are circles (`#237 nested-lists`). Spelled out rather than with `:is`,
+   as the browser's own sheet spells them. */
+.md ul ul,
+.md ol ul {
+  list-style-type: circle;
+}
+
+.md ul ul ul,
+.md ul ol ul,
+.md ol ul ul,
+.md ol ol ul {
+  list-style-type: square;
+}
+
+.md li + li,
+.md li > :is(ul, ol) {
+  margin-top: 0.3em;
+}
+
+.md li::marker {
+  color: var(--muted);
+}
+
+/* A task list's checkbox is its marker. */
+.md .contains-task-list {
+  padding-left: 0.2em;
+  list-style: none;
+}
+
+.md .task-list-item-checkbox {
+  margin: 0 0.4em 0 0;
+  vertical-align: -0.1em;
+}
+
+.md :is(h1, h2, h3, h4) {
+  font-weight: 650;
+  line-height: 1.25;
+}
+
+.md h1 {
+  font-size: 1.25em;
+}
+
+.md h2 {
+  font-size: 1.16em;
+}
+
+.md h3 {
+  font-size: 1.08em;
+}
+
+.md h4 {
+  font-size: 1em;
+}
+
+.md code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85em;
+  background: var(--bg);
+  border: 1px solid var(--edge);
+  border-radius: 0.25rem;
+  padding: 0 0.25em;
+}
+
+/* A code block keeps its lines as written and SCROLLS SIDEWAYS inside its row when one is wider than
+   the row, as a table does below: code wrapped at the screen's edge reads as two lines, and
+   indentation is meaning in half the languages it holds. `#531 server-side-syntax-highlight`. */
+.md pre {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85em;
+  background: var(--bg);
+  border: 1px solid var(--edge);
+  border-radius: 0.35rem;
+  padding: 0.4rem 0.5rem;
+  white-space: pre;
+  overflow-wrap: normal;
+  overflow-x: auto;
+  max-width: 100%;
+  tab-size: 4;
+}
+
+/* EXCEPT FOLDED. A clamp counts only the lines it can reach, and a scroll box is a box of its own
+   that it draws whole, past the fold (as it does a table), under a "(~N more words)" that is then
+   untrue. So a folded message's code wraps as it always did and is cut with the text; opened, it
+   scrolls. A card is a heading and is folded as a message is. */
+.body.clamped pre,
+.side-card-text pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  overflow-x: visible;
+}
+
+.md pre code {
+  font-size: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+}
+
+/* HIGHLIGHTED CODE. The server marks each token of a block whose language it knows with one of a
+   few classes (src/render/highlight.rs, `CLASSES`), and these are their colours: after GitHub's
+   Primer palette, every one at least 4.5:1 on the block's background in its scheme, so a phone in
+   sunlight still reads a comment. Operators and punctuation keep the text's own colour. */
+.md pre {
+  --hl-comment: #8b949e;
+  --hl-string: #a5d6ff;
+  --hl-constant: #79c0ff;
+  --hl-keyword: #ff7b72;
+  --hl-type: #ffa657;
+  --hl-function: #d2a8ff;
+  --hl-escape: #56d4dd;
+  --hl-property: #7ee787;
+  --hl-macro: #f2cc60;
+  --hl-variable: #ffa198;
+  --hl-inserted: #7ee787;
+  --hl-inserted-bg: rgba(46, 160, 67, 0.15);
+  --hl-deleted: #ffa198;
+  --hl-deleted-bg: rgba(248, 81, 73, 0.15);
+}
+
+@media (prefers-color-scheme: light) {
+  .md pre {
+    --hl-comment: #57606a;
+    --hl-string: #0a3069;
+    --hl-constant: #0550ae;
+    --hl-keyword: #cf222e;
+    --hl-type: #953800;
+    --hl-function: #8250df;
+    --hl-escape: #1b7c83;
+    --hl-property: #116329;
+    --hl-macro: #7d4e00;
+    --hl-variable: #a40e26;
+    --hl-inserted: #116329;
+    --hl-inserted-bg: #dafbe1;
+    --hl-deleted: #82071e;
+    --hl-deleted-bg: #ffebe9;
+  }
+}
+
+.md .hl-c {
+  color: var(--hl-comment);
+  font-style: italic;
+}
+
+.md :is(.hl-s, .hl-u) {
+  color: var(--hl-string);
+}
+
+.md :is(.hl-n, .hl-h) {
+  color: var(--hl-constant);
+}
+
+.md .hl-k {
+  color: var(--hl-keyword);
+}
+
+.md .hl-t {
+  color: var(--hl-type);
+}
+
+.md :is(.hl-f, .hl-gh) {
+  color: var(--hl-function);
+}
+
+.md .hl-e {
+  color: var(--hl-escape);
+}
+
+.md .hl-p {
+  color: var(--hl-property);
+}
+
+.md .hl-m {
+  color: var(--hl-macro);
+}
+
+.md .hl-v {
+  color: var(--hl-variable);
+}
+
+/* A diff's added and removed lines are tinted across their text, the way every review tool shows
+   them, so the change is visible before a single line is read. */
+.md .hl-gi {
+  color: var(--hl-inserted);
+  background: var(--hl-inserted-bg);
+}
+
+.md .hl-gd {
+  color: var(--hl-deleted);
+  background: var(--hl-deleted-bg);
+}
+
+.md :is(.hl-h, .hl-b) {
+  font-weight: 650;
+}
+
+.md .hl-i {
+  font-style: italic;
+}
+
+.md .hl-u {
+  text-decoration: underline;
+}
+
+.md blockquote {
+  border-left: 3px solid var(--edge);
+  padding-left: 0.6rem;
+  color: var(--muted);
+}
+
+.md hr {
+  border: 0;
+  border-top: 1px solid var(--edge);
+}
+
+/* A table scrolls sideways inside its row rather than widening the row past a phone's screen. */
+.md table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+}
+
+.md :is(th, td) {
+  border: 1px solid var(--edge);
+  padding: 0.2em 0.5em;
+  text-align: left;
+  overflow-wrap: normal;
+}
+
+.md th {
+  font-weight: 650;
+}
+
+.md :is(th, td)[align="center"] {
+  text-align: center;
+}
+
+.md :is(th, td)[align="right"] {
+  text-align: right;
+}
+
+/* A mention is the id it is: no directory here turns it into a name. */
+.md .mention {
+  color: var(--accent);
+}
+
+/* `#65 scrollback-paging`. Centred above the oldest message loaded, and absent when there is
+   nothing older — the same rule Hang up follows. A control that is always there and usually inert
+   teaches the eye to skip the place it lives in, and the place this lives in is the one the reader
+   arrives at when they are looking for something old. */
+#side-older,
+#load-older,
+#load-older-turns {
+  display: block;
+  margin: 0.6rem auto 0.2rem;
+}
+
+#side-older[disabled],
+#load-older[disabled],
+#load-older-turns[disabled] {
+  opacity: 0.7;
+}
+
+/* `#262 search-load-older`. While a search chooses rows the step back is "Search before Oct 3", a thumb's
+   way to more matches on a phone, so it gets the 44px target the floating chips have, drawn as nothing
+   (`#jump-newest::after`): the chip stays its height, and a tap a few pixels off it still lands. */
+#side-older,
+#load-older,
+#side-search-replies {
+  position: relative;
+}
+
+#side-older::after,
+#load-older::after,
+#side-search-replies::after {
+  content: "";
+  position: absolute;
+  inset: min(0px, calc((100% - 2.75rem) / 2));
+}
+
+/* The cards' own way further back, "Search replies before Oct 3", at their head under the line that says
+   none matches, as the step back stands at the head of a list of messages. */
+#side-search-replies {
+  display: block;
+  margin: 0.2rem auto 0.4rem;
+}
+
+#side-search-replies[disabled] {
+  opacity: 0.7;
+}
+
+/* What the last walk found, directly under the control, in the hint's quiet type. */
+.search-older-note {
+  margin: 0 1rem 0.4rem;
+  text-align: center;
+}
+
+/* `#605`-`#608 server-side-search`. The server's copy, searched: the line saying what was searched, All
+   channels, and the server's hits, each alone with its way to the channel, under the step back. The
+   hits are the list's own quiet rows, so they read as messages and not as a second pane. */
+.server-search {
+  margin: 0 1rem 0.6rem;
+}
+
+.search-scope {
+  margin: 0 0 0.3rem;
+  text-align: center;
+}
+
+.search-all-channels {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.35rem;
+  width: fit-content;
+  font-size: 0.8rem;
+  margin: 0 auto 0.4rem;
+}
+
+.search-all-channels input {
+  width: auto;
+  margin: 0;
+}
+
+.server-hits {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.server-hit {
+  padding: 0.45rem 0.6rem;
+  border-left: 2px solid var(--accent);
+  margin: 0 0 0.4rem;
+  overflow-wrap: anywhere;
+}
+
+.server-hit-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.15rem 0.5rem;
+  font-size: 0.75rem;
+  opacity: 0.8;
+}
+
+.server-hit .md {
+  margin: 0.2rem 0;
+}
+
+#server-more,
+#search-further {
+  display: block;
+  margin: 0.2rem auto 0.4rem;
+}
+
+/* One column on Main, a search nothing loaded matches: All, which has the replies. Under the sentence
+   saying so. */
+#search-in-all {
+  display: block;
+  margin: 0 auto 0.6rem;
+}
+

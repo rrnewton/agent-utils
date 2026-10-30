@@ -1,0 +1,301 @@
+/*
+ * The app's frame.
+ *
+ * style.css gives this page its colours and its components; this file makes it behave like
+ * an application rather than a document. Everything here exists to remove one specific web-page
+ * behaviour, and each rule is annotated with which one, because otherwise they look arbitrary and
+ * get "cleaned up" by the next person.
+ *
+ * There is no framework, no build step, and no external request. The app feel is entirely these
+ * properties.
+ *
+ * The governing rule, from the owner: THE MAJORITY OF THE SPACE BELONGS TO CONTENT — the
+ * transcript you want to read, or the controls you want to press. Everything else is small, quiet,
+ * or one tap away.
+ */
+
+/* A few tokens this page needs and the shared sheet does not have: the two speakers, and the
+   surfaces the dock is built from. Declared for both schemes here, next to each other, rather
+   than being derived at use-site with a colour function some phone browser may not have. */
+:root {
+  --mine: #24405c; /* what YOU said */
+  --mine-edge: #33587b;
+  /* Small quiet text and a warning ON `--mine`: the send card's heading, where it goes, its status
+     and a frozen card's notes. `--muted` and `--warn` are 4.1:1 and 3.9:1 there, under the 4.5:1
+     small text needs; these are 5.0:1 or better. In light, the shared ones already pass (4.7:1). `#269
+     approval-card-inline`. `#555 own-row-dark-contrast`: the owner's rows take it as their `--muted`,
+     and a reaction's count on his row sits on its chip's tint as well, so it is 5.6:1 on `--mine` and
+     4.8:1 on the chip (it was #aab2c0, 4.3:1 there). */
+  --muted-on-mine: #b4bcc8;
+  --warn-on-mine: #e8a27a;
+  --theirs: #1d2026; /* what the AGENT said */
+  /* Everyone else in the channel: other people, and any bot that is not the coding agent.
+     Warm, so it is not read as a lighter or darker version of either principal, but QUIET --
+     the coding agent is the thing being read and must stay the loudest row on the list. An
+     earlier version of this was strong enough to dominate the view, which only showed up
+     because a classification bug was sending every message here. */
+  --third: #26221b;
+  --third-edge: #3b3529;
+  /*
+   * How far a message is pushed off its own side of the list.
+   *
+   * It was 15% of the pane, which on a 393px phone is nearly sixty pixels of nothing on every
+   * single row -- and it bought what the COLOUR now buys, twice over. A small fixed hint keeps the
+   * asymmetry that says which side of the conversation a message is on while giving the text back
+   * the width. Bounded in `rem`, not `%`, so a wider window spends the extra on words.
+   */
+  --speaker-inset: 1.5rem;
+  /* `#204 reply-arrow`. The gutter a reply is inset by, and the arrow in it is that square: one
+     touch target, 44px at the default size, in `rem` so it grows with the reader's type. Wider
+     than either speaker inset on a phone, so every reply leaves the same room for its arrow
+     whoever sent it. */
+  --reply-gutter: 2.75rem;
+  /* The reader's own type size for message text. Settings drives it; see `--msg-scale`. */
+  --msg-scale: 1;
+  /* `#425 collapsed-lines`. How many lines a collapsed message shows, 0 to 8, the reader's own
+     per device: Settings drives it, and Ctrl+( and Ctrl+) (Cmd on a Mac) step it. One property
+     for every list the page draws, so Main, All, a thread in either column, rows unpacked under
+     their cards and the call's transcript cannot disagree. 0 is header only: web/voice.js also
+     states the value as `data-collapsed-lines` on the root, because a line clamp of 0 is no
+     clamp at all in a browser (it reads as none and shows every line), so the folded body is
+     hidden outright there instead. Overwritten per reader; see `applyCollapsedLines`. */
+  --collapsed-lines: 3;
+  --dock: #191c22;
+  --ok: #5bd98a;
+  --idle: #6b7484;
+  /* `#54 resume-recovery`. A call that was dropped while the page was in the background is not a
+     failure and is not an ordinary hang-up, so its dot is neither `--warn` nor `--muted`. Violet,
+     because nothing else on this page is: the three states it has to be told apart from at a
+     glance are green, orange and grey. */
+  --paused: #9b8cf0;
+  /* `#56 message-hover-highlight`. The surface a channel row takes on under a pointer. A row rests
+     on `--panel` (web/style.css), so this has to be a visibly DIFFERENT surface rather than a hair
+     off it — and it has to be judged in DARK, because a tint that reads on white is invisible on
+     #1d2026, which is the theme the owner's devices are in. */
+  --row-hover: #262c36;
+  /* `#49 cached-summaries`. The ink of the one standing sentence that says this SERVER cannot
+     summarise at all (`#summary-note[data-unavailable]`). A red that exists nowhere else in this
+     interface: `--warn` is orange and already means the row being read aloud and an armed Clear.
+     A ROW whose summary failed no longer takes it (`#564 message-summary-toggle`, below). */
+  --summary-fail-ink: #ff9aa2;
+  /* THE reading column, in characters. Only the desktop regime at the foot of this file consults
+     it — a phone has no room for a column and no margin to put beside one — but it is declared
+     here, with the other tokens, rather than inside the media query, so that web/voice.js can set
+     it on `document.documentElement` at load without knowing which regime is in force. `ch` and
+     not `rem`: what makes a line hard to read is how many CHARACTERS are on it, and that is the
+     unit that says so. Overwritten per reader; see `applyReadingWidth`. */
+  --reading-width: 72ch;
+  /* `#32 freshness-pill-overlap`. The saved-messages pill's box, in the tokens its reservation at
+     the head of #pane-discord is computed from, so that the two cannot drift apart.
+
+     `#211 link-filter`. Its TOP is no longer a number of its own: it is wherever the pill's middle
+     has to be for the open search bar, centred on the same line, to start just inside the list —
+     the bar is the tallest thing on that line now. */
+  --freshness-top: calc(var(--search-bar) / 2 + 0.1rem - var(--freshness-box) / 2);
+  --freshness-pad: 0.25rem;
+  --freshness-line: 1rem;
+  /* `#197 floating-search`. The pill's whole height (the 2px is its border), and the line through
+     its middle that the search glass is centred on — derived from the tokens above rather than
+     restated, so the glass follows the pill wherever the pill is moved. */
+  --freshness-box: calc(2 * var(--freshness-pad) + var(--freshness-line) + 2px);
+  --float-line: calc(var(--freshness-top) + var(--freshness-box) / 2);
+  /* The glass was DRAWN the pill's height until `#211 link-filter`, when the owner, on his phone,
+     called it "very small": a 26px disc holding a 15px glyph. It is a 36px disc now with a glyph
+     a third larger, and HIT at 48px. The hit is still an invisible margin around the disc
+     (`#search-toggle::after`), so the disc can stay the size that reads as a quiet control beside
+     the pill rather than a button the size of the toggles in the dock.
+
+     The glass, the filters beside it, their glyphs and the space between them are in PX, not rem,
+     as a phone sizes its buttons in dp and its text in sp: a reader who asks for larger type is
+     asking for larger words, not larger buttons. In rem every one of them grew with the root font
+     and took the width from the field, the one thing on the bar that is text: with Links on, a
+     360px phone at 150% type left the field's text no room at all, and at 130% five letters. */
+  --search-disc: 36px;
+  --search-hit: 48px;
+  /* The square each filter toggle in the open bar is hit by, and draws a disc the glass's size
+     inside: 44px, the touch target both platforms' guidelines ask for, and no more, because two
+     of them and the glass share a 360px line with the field. */
+  --toggle-hit: 44px;
+  /* The open bar: as tall as the glass's target, so everything on it is inside it, and tall enough
+     for a 17px field. Centred on the line, it starts just inside the list (see --freshness-top).
+     Still 3rem where that is taller: the count beside the field is type, and grows with it. */
+  --search-bar: max(var(--search-hit), 3rem);
+  /* The space between the things on the open bar. */
+  --bar-gap: 3px;
+  /* How far the floating line keeps from the list's edges, and the space between pill and glass.
+     Small on purpose: on a 360px phone the longest thing the pill says and the glass only just
+     share the line, and every pixel spent here comes off the end of that sentence.
+
+     The edge in px with the glass (`#211 link-filter`): the glass's 48px target reaches the list's
+     edge across it and makes up the rest on the left of the disc (`#search-toggle::after`), so an
+     edge that grew with the font, against a target that does not, left no target left of the disc
+     at 150% type, where the filter beside it is. */
+  --float-edge: 8px;
+  --float-gap: 0.3rem;
+  /* How far the open glass keeps whichever filter stands beside it, so the filter's square stays
+     out of the glass's 48px target (see `#screen-main[data-searching] #search-toggle`). A token
+     since `#212 link-filter`, because the kinds of link under Links are placed by it as well. */
+  --glass-clear: max(0px, calc(var(--search-hit) - var(--search-disc) - var(--float-edge) + 1px - var(--bar-gap)));
+  /* `#212 link-filter`. The space between the open bar's lower edge and the targets of the kinds of
+     link hung under it. The pills drawn inside those targets sit lower again, so the eye sees a
+     clear gap while the targets meet nothing on the bar. */
+  --kinds-gap: 2px;
+  /* `#206 pin-message`. A pinned row's chip and edge. GOLD, because nothing else here is: the
+     reading row is `--warn` orange, the bookmark and pressed toggles are `--accent` blue, and the
+     summary is teal — so "pinned" cannot be mistaken for "being read" or "where I left off". Judged
+     in dark first, on the three speaker surfaces, as every row tint here has to be. */
+  --pin-ink: #f0c75e;
+  --pin-edge: #d4a63a;
+  --pin-bg: #3a3017;
+  /* `#249 search-highlight`. A search's hits in the text: a highlighter's yellow, deep in dark and
+     pale in light, with the words in a colour of their own over it, so a hit reads as marked text and
+     never as a pin's chip or the bookmark's accent. */
+  --hit-bg: #6b5410;
+  --hit-ink: #fff4c7;
+  /* `#247 reply-continuity`, `#410 inline-reply-editor`. Behind a reply's box in the stream: the page's
+     own colour with six parts in a hundred of the accent in it, so the box reads as a mode of the list
+     rather than a thing of its own. The owner: "MAYBE change the background color subtly to indicate
+     the shift." Mixed here per scheme, not with a colour function at the use site, for the reason the
+     tokens above give. */
+  --reply-tint: #181e25;
+  /* `#245 done-feedback`. The dashed ring of a selected READ message, beside the solid `--accent`
+     ring of a selected unread one. In dark it is `--muted`, as light as the accent and plainly not
+     blue. In light it has its own value: `--muted` is a dark ink there, as dark as the accent, so
+     this is a lighter grey that still stands at 3:1 against the lit surface (`--row-hover`), the
+     least a ring needs to be seen at all. */
+  --read-ring: #99a1b0;
+  /* `#277 thread-card-focus`. What the thread colours go to beside a highlighted thread card: every
+     other card's edge and every other link between the columns. Half `--muted` and half `--edge`, so
+     it is plainly grey, quieter than any thread's colour, and still a line on the panel. */
+  --thread-grey: #626975;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --mine: #dbeaf8;
+    --mine-edge: #b4d0e8;
+    /* `#555 own-row-dark-contrast`: on a reaction chip's tint over `--mine` the shared `--muted` is
+       4.2:1; this is 5.0:1 there and 5.6:1 on `--mine`. */
+    --muted-on-mine: #525b68;
+    --warn-on-mine: var(--warn);
+    --theirs: #ffffff;
+    --third: #faf6ee;
+    --third-edge: #e8e0cf;
+    --dock: #eef1f5;
+    --ok: #1f8f4c;
+    --idle: #98a1b0;
+    --paused: #5b48c4;
+    --row-hover: #edf1f7;
+    /* The unavailable sentence's ink, in light: a token with only one scheme renders as nothing
+       at all in the other. */
+    --summary-fail-ink: #8f1d28;
+    --pin-ink: #7a5300;
+    --pin-edge: #c08b14;
+    --pin-bg: #fbf0d2;
+    --hit-bg: #ffe066;
+    --hit-ink: #1a1d22;
+    /* The same six parts of the light scheme's accent in its page colour. */
+    --reply-tint: #e9eef3;
+    --read-ring: #7f8896;
+    /* Half the light scheme's `--muted` and half its `--edge`. */
+    --thread-grey: #9ba1ac;
+  }
+}
+
+/* The rigid frame.
+ *
+ * `100dvh` — the DYNAMIC viewport unit — is the one that accounts for a mobile browser's toolbar
+ * sliding in and out. `100vh` does not, which is why a `100vh` app is either clipped or leaves a
+ * gap depending on scroll direction.
+ *
+ * `overflow: hidden` plus `overscroll-behavior: none` is what stops the whole interface moving
+ * when a finger drags: the document has nowhere to go, and there is no rubber-band at the edges
+ * of the one element that does scroll.
+ */
+html {
+  height: 100%;
+  overscroll-behavior: none;
+}
+
+body {
+  height: 100dvh;
+  overflow: hidden;
+  overscroll-behavior: none;
+  /* Three rows: top bar, body, dock. The dock holds its place because it is a grid row, not
+     because anything is pinned or absolutely positioned — so it cannot drift over the transcript,
+     and the transcript cannot scroll underneath it. */
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  /* Constrain the shared overlay anchor to the viewport even when a control's text is wider. */
+  grid-template-columns: minmax(0, 1fr);
+}
+
+/*
+ * EVERY ROW OF EVERY GRID ON THIS PAGE IS ASSIGNED BY NAME, NEVER BY SOURCE ORDER.
+ *
+ * This is not tidiness. `display: none` REMOVES an element from its grid's item list, so a track
+ * list written as `auto 1fr auto` silently becomes a different layout the moment the first child is
+ * hidden — every remaining child slides up one row, and the one that was meant to be elastic is not
+ * the one that gets `1fr` any more.
+ *
+ * That is the defect this block fixes, and it was visible: web/voice.js hides #topbar outright
+ * whenever it holds nothing. That is the ORDINARY main-screen state with the control bar in its
+ * default bottom placement (`#58 control-bar` — an empty 2.4rem strip at the top of a phone is
+ * rent nobody is paying), and it is again since `#197 floating-search` moved the magnifying glass
+ * that `#129 message-search` had put up there out over the list. With the header gone,
+ * #frame-body took the `auto` row and THE DOCK TOOK `1fr` — so the dock stretched to whatever
+ * space the content left over, and the controls sat at the TOP of that stretched box. The owner
+ * saw the effect exactly as it is:
+ * switching from a long channel to an empty transcript walked the button bar up the screen, because
+ * the bar's position was tracking the height of the content above it. Measured before the fix, on a
+ * 900px-tall desktop window: the bar sat at y=752 on the channel and y=675 on the empty transcript.
+ *
+ * The same trap is set twice more, and both are disarmed here rather than left for the next person
+ * to rediscover from a screenshot: #error and #connection-banner are hidden most of the time, so
+ * #screens and #scroll-area were landing in `auto` rows and being sized by their content instead of
+ * filling the frame — which is also why a scrolling element could grow past its container rather
+ * than scroll inside it.
+ *
+ * Assigning the row explicitly makes a hidden sibling a non-event: the row it would have occupied
+ * collapses to zero and nothing else moves.
+ */
+#topbar {
+  grid-row: 1;
+}
+
+#frame-body {
+  grid-row: 2;
+}
+
+#dock {
+  grid-row: 3;
+}
+
+#error-wrap {
+  grid-row: 1;
+}
+
+#screens {
+  grid-row: 2;
+}
+
+#connection-banner {
+  grid-row: 1;
+}
+
+#scroll-area {
+  grid-row: 3;
+  /* Explicit, because #channel-freshness-anchor shares this cell: two items auto-placed into one
+     row are given two columns. */
+  grid-column: 1;
+}
+
+/* `hidden` has to beat the layout modes below, all of which set `display`.
+
+   `#346 settings-collapsible`. EXCEPT `hidden="until-found"`, a folded part of Settings: the browser
+   draws it as `content-visibility: hidden`, which keeps its words searchable, and `display: none`
+   here would take them out of find-in-page, which is the whole point of the attribute. */
+[hidden]:not([hidden="until-found"]) {
+  display: none !important;
+}
+

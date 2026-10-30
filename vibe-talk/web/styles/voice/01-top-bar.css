@@ -1,0 +1,301 @@
+/* ---------------------------------------------------------------------------- the top bar --- */
+
+/* A title bar and a way back, and — only when the reader has asked for it there — the control bar.
+   `#58 control-bar` moved the gear and the view switch out of here into a strip of their own,
+   because on the main screen with the default placement this header then held NOTHING, and an
+   empty 2.4rem row at the top of a phone is exactly the rent that issue exists to stop paying.
+   web/voice.js hides the header outright when it is empty. `#129 message-search` briefly made the
+   main screen an exception by parking its glass in the corner here, which the owner called a
+   wasteful strip; `#197 floating-search` floats the glass over the list instead, so on the main
+   screen with the bar in the dock the header is gone again. */
+#topbar {
+  display: block;
+  padding: 0.45rem calc(0.7rem + env(safe-area-inset-right)) 0.45rem
+    calc(0.7rem + env(safe-area-inset-left));
+  padding-top: calc(0.45rem + env(safe-area-inset-top));
+  background: var(--panel);
+  border-bottom: 1px solid var(--edge);
+}
+
+.topbar-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: 2.4rem;
+}
+
+.topbar-title {
+  font-size: 1rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+/* `#197 floating-search`. With the header gone, nothing on the main screen was applying the TOP
+   safe-area inset: it lived only in the header's padding above, so a notch or a status bar drawn
+   over the page (`viewport-fit=cover`) would sit on the first line of the list and on the floating
+   glass. The body takes it over whenever the header is not there to. A sibling selector and not a
+   script, because the header's `hidden` is already the one statement of whether it is up. */
+#topbar[hidden] + #frame-body {
+  padding-top: env(safe-area-inset-top);
+}
+
+/* Elastic, so the field takes the bar when it opens. `min-width: 0` because a flex item's default
+   minimum is its content width, and without it a long query pushes the glass off the edge of a
+   375px phone instead of scrolling inside the field. `align-self: stretch` so its height is the
+   bar's, whatever the font's line height makes of its type. */
+.search-field {
+  flex: 1 1 auto;
+  align-self: stretch;
+  min-width: 0;
+  /* In px, as its type is: a rem inset grew with the reader's font around text that does not. */
+  padding: 4px 12px;
+  background: var(--bg);
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  color: var(--ink);
+  font: inherit;
+  /* In px, not a rem, and never under 16px — the rule the message boxes keep: iOS Safari zooms the
+     whole frame when an input smaller than that takes focus, and this page is a fixed 100dvh grid
+     that cannot scroll back. A search field is a field you focus every single time you use it.
+     17px since `#211 link-filter`, which made the bar it sits in larger. */
+  font-size: 17px;
+  /* A placeholder longer than a narrow field ends in an ellipsis rather than mid-letter. */
+  text-overflow: ellipsis;
+}
+
+/* `#211 link-filter`. TWO short lines, the numbers over the word: "12 of 140" above "loaded". Two
+   filters and the glass now share a 360px line with the field, and the count on one line took 96px
+   of it, which left the field under 110. The words stay whole, because "of N loaded" is the point
+   of the count (see `applySearch`), and a short one — "3 pinned" — still sits on one line. The
+   cap holds "88 of 888" on its first line in a font with wide digits, so a count wraps between
+   its numbers and its word; only a three-digit numerator takes a third line, which the bar has
+   the height for. */
+.search-count {
+  flex: 0 0 auto;
+  max-width: 8.25ch;
+  color: var(--muted);
+  font-size: 0.7rem;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.15;
+  text-align: center;
+}
+
+/* The statement a reader gets instead of a blank list. Centred and given room, because it is the
+   only thing on screen when it is on screen at all — not a footnote under something else. */
+.search-empty {
+  margin: 1.6rem 0.5rem;
+  color: var(--muted);
+  text-align: center;
+  line-height: 1.45;
+}
+
+/* What the filter does to a row it does not match.
+ *
+ * A CLASS AND NOT THE `hidden` ATTRIBUTE, and that is the whole reason this rule exists rather
+ * than a line of script setting `row.hidden`. A row already carries state that decides whether it
+ * belongs on screen — to-do mode, archived, which channel view is up — and `hidden` is where that
+ * state is written. A filter that borrowed it would turn every row it hid into a row the next
+ * render believes was hidden for a different reason, and unfiltering would then show rows the
+ * reader had archived.
+ *
+ * `!important` for the same reason `[hidden]` has it: the layout modes below set `display` on
+ * these rows, and a filter that loses to the thing it is filtering is not a filter. */
+.search-hidden {
+  display: none !important;
+}
+
+/* `#211 link-filter`. A row under the Links filter shows its links IN PLACE of its text: the text,
+ * the summary that stands in for it, and the fold that opens it all go, and the row keeps its
+ * author, its time and its controls, so the reader knows where each link came from and can still
+ * act on the message. By the row's own attribute rather than a class on the list, because it is
+ * the row that knows whether it has links to show — one without any is not on screen at all.
+ *
+ * `!important` for the reason `.search-hidden` has it: the fold and the summary set their own
+ * `display`, and the text must not come back because a later rule was more specific. */
+.messages li[data-links-view="true"] > .body,
+.messages li[data-links-view="true"] > .msg-text,
+.messages li[data-links-view="true"] > .summary,
+.messages li[data-links-view="true"] > .reactions,
+.messages li[data-links-view="true"] > .elided,
+.messages li[data-links-view="true"] > .search-excerpt,
+.messages li[data-links-view="true"] .fold {
+  display: none !important;
+}
+
+/* `#249 search-highlight`. Each hit of the search, where it is in the text: marked as a highlighter
+   marks a page, in its own colours over whatever the row is drawn in. The author's name is lit whole
+   when it holds a term, and a link whose ADDRESS alone holds one — matched, but not on the screen —
+   is outlined in the same colour. */
+mark.search-hit,
+.msg-author[data-search-hit],
+.who[data-search-hit] {
+  background: var(--hit-bg);
+  color: var(--hit-ink);
+  border-radius: 0.2em;
+  box-shadow: 0 0 0 1px var(--hit-bg);
+}
+
+a.search-hit-link {
+  outline: 2px solid var(--hit-bg);
+  outline-offset: 1px;
+  border-radius: 0.2em;
+}
+
+/* Under a folded message whose hit is beyond its fold: the hits, each with a few words either side,
+   in a quiet line of their own, so the reader sees where the word is without the message opening
+   under every keystroke. A tap opens the message, as a tap on the row does. */
+.search-excerpt {
+  margin-top: 0.3rem;
+  color: var(--muted);
+  font-size: calc(0.82rem * var(--msg-scale));
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.search-excerpt-more {
+  white-space: nowrap;
+}
+
+/* One link per line, each the width of the row and tall enough to be a target on its own: these
+   are the things the reader came here to tap, several to a row, one above another. */
+.row-links {
+  display: flex;
+  flex-direction: column;
+  font-size: calc(0.88rem * var(--msg-scale));
+}
+
+/* An address is one unbroken word, often longer than a phone is wide: it is cut short with an
+   ellipsis rather than wrapped across lines or run off the side of the row. The href stays whole,
+   and the title says where it goes. */
+.row-link {
+  display: block;
+  min-width: 0;
+  min-height: 2.75rem;
+  padding: 0.75rem 0;
+  overflow: hidden;
+  color: var(--accent);
+  line-height: 1.4;
+  text-decoration: underline;
+  text-underline-offset: 0.15em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  touch-action: manipulation;
+}
+
+.row-link + .row-link {
+  border-top: 1px solid var(--edge);
+}
+
+/* `#620 link-url-chip`. Under URL each link is its whole address, which is what the reader pressed it
+   to see: wrapped, never cut short. web/voice.js offers a break after each slash; a part too long for
+   a line breaks anywhere rather than run off the side. */
+.row-links[data-raw] .row-link {
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+/* The view switch: ONE control with two positions, carrying the word for the position it is in.
+   Two differently-styled text labels read as one item being disabled, which is what the previous
+   header did. */
+.switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.25rem 0.7rem 0.25rem 0.3rem;
+  background: var(--bg);
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  color: var(--ink);
+  font: inherit;
+  font-size: 0.9rem;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.switch-track {
+  position: relative;
+  display: inline-block;
+  width: 2.5rem;
+  height: 1.4rem;
+  border-radius: 999px;
+  background: var(--edge);
+  transition: background 140ms ease;
+}
+
+.switch-knob {
+  position: absolute;
+  top: 0.15rem;
+  left: 0.15rem;
+  width: 1.1rem;
+  height: 1.1rem;
+  border-radius: 50%;
+  background: var(--ink);
+  transition: transform 140ms ease;
+}
+
+/* Checked means "the other view": the knob travels, the track lights, and the word changes. All
+   three say the same thing, so the state survives being read quickly. */
+.switch[aria-checked="true"] .switch-track {
+  background: var(--accent);
+}
+
+.switch[aria-checked="true"] .switch-knob {
+  transform: translateX(1.1rem);
+  background: #fff;
+}
+
+.switch-word {
+  min-width: 3.6rem;
+  text-align: left;
+  letter-spacing: 0.01em;
+}
+
+/* A gear, not the word "Settings". A destination does not need to introduce itself every time the
+   screen is looked at. */
+.icon-button {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2.4rem;
+  height: 2.4rem;
+  padding: 0;
+  background: none;
+  border: none;
+  border-radius: 999px;
+  color: var(--muted);
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.icon {
+  width: 1.35rem;
+  height: 1.35rem;
+}
+
+/* Housekeeping controls: deliberately small and quiet, so they do not compete with the controls
+   in the pane below. */
+.chip {
+  flex: 0 0 auto;
+  padding: 0.35rem 0.6rem;
+  background: var(--panel);
+  color: var(--muted);
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  font: inherit;
+  font-size: 0.8rem;
+}
+
+/* `#421 chip-states`. A chip that is a toggle says so in `aria-pressed`, and wears it from that one
+   attribute, the same way wherever it is: ringed and tinted in the accent, its words in the ink, as the
+   bar's filters are. One rule for all of them, so a toggle chip added later (as `#419`'s Main channel
+   was, drawn the same on and off until this) is pressed like the rest without a rule of its own. */
+.chip[aria-pressed="true"],
+.chip[aria-pressed="mixed"] {
+  border-color: var(--accent);
+  color: var(--ink);
+  background: color-mix(in srgb, var(--accent) 18%, var(--panel));
+}
+

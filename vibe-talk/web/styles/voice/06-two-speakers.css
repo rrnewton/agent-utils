@@ -1,0 +1,46 @@
+/* --------------------------------------------------------------- the two speakers ---------- */
+/*
+ * They were distinguished only by a small grey label, on the same width, background and
+ * alignment. Now they differ in three ways at once — side, colour, and the corner that is
+ * squared off — so the shape of the conversation is readable without reading any of it.
+ */
+
+.messages li.mine {
+  background: var(--mine);
+  border-color: var(--mine-edge);
+  margin-left: 15%;
+  border-bottom-right-radius: 0.15rem;
+}
+
+.messages li.theirs {
+  background: var(--theirs);
+  margin-right: 15%;
+  border-bottom-left-radius: 0.15rem;
+}
+
+/*
+ * `#269 approval-card-inline`. A spoken yes the page may act on is drawn out of sight from its first
+ * frame, and stays so only when it sends the card, whose frozen form says "approved by voice". An
+ * attribute and not `hidden`, which the search owns: a row the search lets through is still one the
+ * card speaks for.
+ */
+.messages li[data-absorbed] {
+  display: none;
+}
+
+.messages li .meta {
+  justify-content: space-between;
+}
+
+.who {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+/* A surface that is also a debugging record needs to say WHEN, and the answer is worth exactly
+   this much space. */
+.at {
+  font-variant-numeric: tabular-nums;
+  opacity: 0.75;
+}
+

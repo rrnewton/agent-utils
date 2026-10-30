@@ -1,0 +1,122 @@
+/* ------------------------------------------------------------ summaries, in place of it ----- */
+/*
+ * `#49 cached-summaries`. The other collapsed form: instead of the first three lines of a wall of
+ * text, one short line about it. When a summary ARRIVED it occupies the same place on the row that
+ * `.body.clamped` does and never sits beside it — web/voice.js hides one to show the other — so the
+ * row keeps the uniform height that makes a long list scannable at all.
+ *
+ * A row whose summary FAILED is the exception, and deliberately: it shows the note AND the message,
+ * because the message is the one thing the reader still has and taking it away to apologise would
+ * be a worse row than the one they had with the mode off. That row is therefore taller than its
+ * neighbours, which is why the failure arrives inside `preservingScroll` — see the scroll-anchoring
+ * tests, which measure exactly that added height.
+ *
+ * `.summary-mark` is not decoration. A short line where a message should be, with nothing saying
+ * who wrote it, reads as the message; the mark is what stops the reader taking a machine's
+ * paraphrase for what somebody actually said.
+ */
+.summary {
+  display: flex;
+  gap: 0.4rem;
+  align-items: baseline;
+}
+
+/*
+ * A SUMMARISED ROW MUST NOT LOOK LIKE A ROW WHOSE MARKDOWN BROKE.
+ *
+ * That was the whole of the reported bug. A summary is plain text where the message was markdown,
+ * so if the row keeps the colour it had, the only visible difference between "this is a machine's
+ * one-line reading" and "the formatter gave up" is that the text got shorter. Both readings were
+ * available and the wrong one is the one a reader reaches for.
+ *
+ * So the row changes SURFACE, not just content: a tint, and a bar down the summarised edge, applied
+ * to the row rather than to the note and over every `data-who` colour.
+ *
+ * IN ITS THREAD'S COLOUR (`#564 message-summary-toggle`). The tint was a fixed teal, and the owner,
+ * 2026-10-26: "their little highlight color doesn't match the thread they're part of. It should."
+ * So `--summary-tint` is the thread's hue (`--summary-hue`, set by `setFolded` in web/voice.js from
+ * the row's own message), drawn as the card's edge and the bridge are (`#427 server-thread-hues`);
+ * a message in no thread has no colour to match and takes the muted grey, never a fixed accent.
+ */
+#side-log li.discord-message[data-summarised="true"],
+#side-cards li.discord-message[data-summarised="true"],
+#discord-log li.discord-message[data-summarised="true"],
+#pinned-log li.discord-message[data-summarised="true"] {
+  --summary-tint: var(--muted);
+  background: color-mix(in srgb, var(--summary-tint) 16%, var(--panel));
+  border-color: var(--summary-tint);
+  /* The bar, IN PLACE OF the left side's hairline and three times as wide. Every row has a side
+     there, the coder's tile too since `#213 row-side-borders`, so a bar that merely recoloured it
+     would be one more one-pixel border, and nobody reads a border as the mark that says the row
+     is not showing the message. The width is what does that. */
+  border-left: 3px solid var(--summary-tint);
+}
+
+#side-log li.discord-message[data-summarised="true"][data-summary-hue],
+#side-cards li.discord-message[data-summarised="true"][data-summary-hue],
+#discord-log li.discord-message[data-summarised="true"][data-summary-hue],
+#pinned-log li.discord-message[data-summarised="true"][data-summary-hue] {
+  --summary-tint: hsl(var(--summary-hue, 210) 55% 50%);
+}
+
+/* A coding agent's row stacked under another (`[data-stack-under][data-who="coder"]`) puts its left
+   hairline back with more weight than the rule above, which took the bar off every such row in an
+   unpacked thread. The bar is the summary's mark, so it wins there too. */
+:is(#side-log, #side-cards, #discord-log, #pinned-log) li.discord-message[data-stack-under][data-who][data-summarised="true"] {
+  border-left: 3px solid var(--summary-tint);
+}
+
+/*
+ * ...AND A ROW WHOSE SUMMARY DID NOT ARRIVE SAYS SO QUIETLY, AND IS OTHERWISE ITS OWN ROW.
+ *
+ * `#564 message-summary-toggle`. It used to turn red: its own surface, a 3px bar down its edge, and
+ * the read row's greyscale and fade overridden so the red would show on a filed row. The owner,
+ * 2026-10-26: "The summary failed is very invasive. I'm fine with a subtle label but it makes the UI
+ * non functional. I can no longer see if it's archived or mark it as read." A failed summary is the
+ * vendor's problem, not the reader's: the row still shows its whole message, so nothing here may
+ * change what the row says about itself — its speaker surface, its read and archived greyscale, its
+ * edge, its Done. All that is left of the failure is the two words, small and in the muted ink every
+ * other aside on a row is in, and the reason on the row's title.
+ */
+#side-log li.discord-message[data-summary-failed="true"] .summary-mark,
+#side-cards li.discord-message[data-summary-failed="true"] .summary-mark,
+#discord-log li.discord-message[data-summary-failed="true"] .summary-mark,
+#pinned-log li.discord-message[data-summary-failed="true"] .summary-mark {
+  color: var(--muted);
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.summary-mark {
+  flex: 0 0 auto;
+  font-size: 0.66rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  /* NOT `--muted` where there is a colour to have. This is the one word telling the reader that
+     what follows was written by a machine about the message rather than by the author of it, and
+     muted grey is what the eye is trained to skip: it is in the row's tint, its thread's hue. */
+  color: var(--summary-tint, var(--muted));
+  font-weight: 600;
+}
+
+.summary-text {
+  font-style: italic;
+}
+
+/* The standing sentence naming the summariser, at the head of the channel view while the mode is
+   on. Quiet, because it is a fact about the view rather than a message. */
+#side-summary-note,
+#summary-note {
+  margin: 0 0 0.4rem;
+}
+
+/* ...except when what it is stating is that this server cannot summarise at all. That is the one
+   thing this line ever says that the reader has to ACT on, and the reported failure of its
+   predecessor is precisely that a quiet grey hint at the head of a view goes unread for weeks. */
+#side-summary-note[data-unavailable="true"],
+#summary-note[data-unavailable="true"] {
+  color: var(--summary-fail-ink);
+  font-weight: 600;
+}
+

@@ -1,0 +1,278 @@
+/* ------------------------------------------------------------------------- rich headers ----- */
+/*
+ * `#242 rich-headers`. An agent's own first line — "[build-bot coordinator] Backup check, 10:52 PM
+ * ET." — drawn in the row's header: the tag in quiet italics, the title in bold, and the time after
+ * an `@` in the muted ink the row's own time uses. No separator characters; the gap spaces them.
+ *
+ * THE HEADER WHERE IT FITS, THE FIRST LINE WHERE IT DOES NOT, and never cut short. Each list is a
+ * size container, and web/voice.js gives each headed row a length class from its strings alone
+ * (`data-rh-len`: its characters rounded up to a multiple of 8 from 16 to 96, or `long`). The
+ * queries below promote a class into the header line only where the
+ * list is wide enough for it beside the time and the row's buttons; anywhere else the pieces take a
+ * line of their own at the foot of the meta line, straight above the body, where they read as its
+ * first line. An estimate that comes out wrong costs a wrap, never a word: there is no ellipsis and
+ * no overflow anywhere here. No layout is read to decide any of it (`#226`).
+ *
+ * The words the pieces restate stay in the body, marked `.rh-src`, and are hidden only while the
+ * heading shows. `data-rich-headers="off"` on the root hides the heading and puts them back.
+ */
+#side-log,
+#side-cards,
+#discord-log,
+#pinned-log {
+  container: rows / inline-size;
+}
+
+.rh-head {
+  /* The first line of the message, by default: a line of its own under the time and the buttons. */
+  order: 99;
+  flex-basis: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0 0.55em;
+  min-width: 0;
+  color: var(--ink);
+  font-size: calc(0.88rem * var(--msg-scale));
+  line-height: 1.35;
+}
+
+/*
+ * Each piece breaks where it must, as a body does (`.md` has the same rule). A title that is one
+ * unbroken token — a commit hash, a path, a host name — otherwise keeps its whole width as a flex
+ * item's minimum and pushes out of the row and off a phone's screen, and the words it restates are
+ * hidden in the body: lost twice over. `min-width: 0` lets the piece be narrower than that token.
+ */
+.rh-head > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.rh-tag {
+  font-style: italic;
+  /* The subdued look of a row already read, on the tag alone. */
+  opacity: 0.6;
+}
+
+.rh-title {
+  font-weight: 650;
+}
+
+.rh-time {
+  color: var(--muted);
+  font-size: 0.9em;
+  font-variant-numeric: tabular-nums;
+}
+
+/*
+ * PROMOTED into the header line, between the time and the buttons, at the header's own size: a
+ * length class from the narrowest list it fits in. Measured in Chromium at a desk: a row is about
+ * 0.87 of its list (the speaker insets), the time and Reply, ⋯ and Done take about 14rem of it,
+ * and a header's characters average under half a rem at this size — so a class of N characters
+ * needs a list of about (N / 2 + 15.6) / 0.87 rem. Every class at least that wide joins the line;
+ * a row with more buttons than those (a thread's, the Pinned chip) that then does not fit wraps.
+ * `long` is never promoted.
+ */
+@container rows (min-width: 27rem) {
+  li.discord-message[data-rh-len="16"] > .meta > .rh-head {
+    order: 0;
+    flex-basis: auto;
+    font-size: 0.86rem;
+  }
+}
+
+@container rows (min-width: 31.5rem) {
+  li.discord-message[data-rh-len="24"] > .meta > .rh-head {
+    order: 0;
+    flex-basis: auto;
+    font-size: 0.86rem;
+  }
+}
+
+@container rows (min-width: 36rem) {
+  li.discord-message[data-rh-len="32"] > .meta > .rh-head {
+    order: 0;
+    flex-basis: auto;
+    font-size: 0.86rem;
+  }
+}
+
+@container rows (min-width: 41rem) {
+  li.discord-message[data-rh-len="40"] > .meta > .rh-head {
+    order: 0;
+    flex-basis: auto;
+    font-size: 0.86rem;
+  }
+}
+
+@container rows (min-width: 45.5rem) {
+  li.discord-message[data-rh-len="48"] > .meta > .rh-head {
+    order: 0;
+    flex-basis: auto;
+    font-size: 0.86rem;
+  }
+}
+
+@container rows (min-width: 50rem) {
+  li.discord-message[data-rh-len="56"] > .meta > .rh-head {
+    order: 0;
+    flex-basis: auto;
+    font-size: 0.86rem;
+  }
+}
+
+@container rows (min-width: 55rem) {
+  li.discord-message[data-rh-len="64"] > .meta > .rh-head {
+    order: 0;
+    flex-basis: auto;
+    font-size: 0.86rem;
+  }
+}
+
+@container rows (min-width: 59.5rem) {
+  li.discord-message[data-rh-len="72"] > .meta > .rh-head {
+    order: 0;
+    flex-basis: auto;
+    font-size: 0.86rem;
+  }
+}
+
+@container rows (min-width: 64rem) {
+  li.discord-message[data-rh-len="80"] > .meta > .rh-head {
+    order: 0;
+    flex-basis: auto;
+    font-size: 0.86rem;
+  }
+}
+
+@container rows (min-width: 68.5rem) {
+  li.discord-message[data-rh-len="88"] > .meta > .rh-head {
+    order: 0;
+    flex-basis: auto;
+    font-size: 0.86rem;
+  }
+}
+
+@container rows (min-width: 73rem) {
+  li.discord-message[data-rh-len="96"] > .meta > .rh-head {
+    order: 0;
+    flex-basis: auto;
+    font-size: 0.86rem;
+  }
+}
+
+:root:not([data-rich-headers="off"]) .md[data-rh] .rh-src {
+  display: none;
+}
+
+/* The paragraph after a hidden first one is the first the reader sees, and starts at the top. */
+:root:not([data-rich-headers="off"]) .md[data-rh] > .rh-src + * {
+  margin-top: 0;
+}
+
+:root[data-rich-headers="off"] .rh-head {
+  display: none;
+}
+
+/* The message id is what lets the operator say "that message does not exist", so it is still
+   reachable — by PRESS AND HOLD, in the details sheet, rather than by spending a line of every
+   row on a nineteen-digit number nobody reads. Monospaced there, so a snowflake can be read digit
+   by digit. */
+.msg-id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.72rem;
+  overflow-wrap: anywhere;
+}
+
+/*
+ * MESSAGE TEXT IS THE POINT OF THIS VIEW, so it is the thing the reader may resize.
+ *
+ * On the body and the summary rather than on the row, deliberately: scaling the whole row would
+ * scale the metadata and the controls with it, and the reader asking for more words on screen is
+ * not asking for a bigger Reply button. The base is a little under the old 0.95rem, because the
+ * owner asked for slightly denser by default and the width reclaimed above pays for it.
+ */
+#pinned-log .body,
+#pinned-log .summary-text,
+#side-log .body,
+#side-cards .body,
+#side-log .summary-text,
+#side-cards .summary-text,
+#discord-log .body,
+#discord-log .summary-text {
+  font-size: calc(0.88rem * var(--msg-scale));
+}
+
+/* `#244 elision-word-count`. The line under a folded body is measured in em of the body's text, so it
+   is at the body's size; the label in it keeps its own small size (`.elided > span`). */
+#pinned-log .elided,
+#side-log .elided,
+#side-cards .elided,
+#discord-log .elided {
+  font-size: calc(0.88rem * var(--msg-scale));
+}
+
+/*
+ * THE FOLD CONTROL IS NOT PRINTED ON THE ROW ANY MORE. Tapping the message toggles it.
+ *
+ * Kept in the DOM and kept focusable rather than deleted, because a tap is a pointer gesture and
+ * this page's rule is that a gesture is never the only way in: somebody arriving by keyboard tabs
+ * to this and it appears. `clip` rather than `display: none` is what keeps it in the tab order at
+ * all -- a hidden button is not focusable, and would have removed the keyboard path entirely.
+ *
+ * The call's transcript too (`#431 voice-transcript-expand`): a turn is opened by a tap on it as a
+ * channel row is, so it is the same row there, not one with a small pill on its metadata line that
+ * is the only part of the card a tap opens.
+ */
+#transcript .fold,
+#side-log .fold,
+#side-cards .fold,
+#discord-log .fold,
+#pinned-log .fold {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+#transcript .fold:focus-visible,
+#side-log .fold:focus-visible,
+#side-cards .fold:focus-visible,
+#discord-log .fold:focus-visible,
+#pinned-log .fold:focus-visible {
+  position: static;
+  width: auto;
+  height: auto;
+  overflow: visible;
+  clip-path: none;
+}
+
+/*
+ * The summary's label took a COLUMN, and then it took a LINE. It should take neither.
+ *
+ * `.summary` began as a flex row with `.summary-mark` at `flex: 0 0 auto`, so on a phone the word
+ * SUMMARY held a fixed strip down the left and the summary itself was squeezed into whatever was
+ * left -- a few characters per line. Moving the mark onto its own line fixed that, and broke the
+ * one claim the mode rests on: a summarised row measured TALLER than the three-line clamp it
+ * replaces, because a two-line summary under a label line is three lines, which is exactly what
+ * the clamp already gives the message itself. Summarising cost a round trip to a vendor and
+ * bought the reader nothing.
+ *
+ * Inline answers both. The mark leads the first line and the text wraps UNDER it at full width,
+ * so there is no column to squeeze into and no line spent on a label.
+ *
+ * The screenshot walk measures this and nothing else does -- see `32-channel-summarised`, which
+ * compares the row against its own clamped height on a 375px phone. A page suite can assert this
+ * declaration; only a browser can say whether the row actually got shorter.
+ */
+.summary {
+  display: block;
+}
+
+.summary-mark {
+  display: inline;
+  margin-right: 0.4rem;
+}
+

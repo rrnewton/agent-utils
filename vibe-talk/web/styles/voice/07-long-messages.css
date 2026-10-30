@@ -1,0 +1,208 @@
+/* --------------------------------------------------------------- long messages, folded ----- */
+/*
+ * `#47 scrollback-stability`. An agent answers in paragraphs, and ten of those in a row is a list
+ * you cannot skim: finding the reply you remember means scrolling through the ones you do not. So
+ * a long message ARRIVES showing its opening lines — three until the reader says otherwise
+ * (`#425 collapsed-lines`: `--collapsed-lines`, 0 to 8) — and opens on a tap.
+ *
+ * A count of LINES, not a character budget, because what the reader is protected from is a wall of
+ * text and a wall is measured in lines. `-webkit-line-clamp` is the only way to say that in CSS
+ * that Safari and Chromium both honour today; `line-clamp` is the standard property it is becoming
+ * and is stated beside it so this stops needing the prefix on its own.
+ *
+ * NOTE for anyone trimming this: `overflow: hidden` is not decoration. Without it the box shows
+ * every line and the clamp does nothing at all.
+ */
+.body.clamped {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: var(--collapsed-lines);
+  line-clamp: var(--collapsed-lines);
+  overflow: hidden;
+}
+
+/*
+ * `#425 collapsed-lines`. Zero lines: no body text at all, and no room where it was. The fold's
+ * "(~N more words)" line goes with it — it is a line about the text, and a header-only row has
+ * given the text up; the counts come back with the first line. The row's header, its colour and
+ * its chips are untouched, and an OPEN message is untouched: this is only the clamped body, so
+ * expanding at 0 shows the message whole, as at any other count.
+ */
+:root[data-collapsed-lines="0"] .body.clamped,
+:root[data-collapsed-lines="0"] .elided {
+  display: none;
+}
+
+/*
+ * `#244 elision-word-count`. What the fold is keeping back, "(~240 more words)", on the line under
+ * the clamped text: the clamp ends that text with its own ellipsis, and this continues it. Quiet,
+ * like the fold control it belongs with — it is a measure of the message, not a part of it — and
+ * never wrapped, so a narrow bubble cannot break the count from its word. web/voice.js hides it
+ * whenever the message is open or a summary stands in for its lines.
+ *
+ * THE LINE IS A SIZE CONTAINER, as wide as the text above it (both fill the row) and at the text's
+ * own size (set with the bodies' type size further down; in the transcript both take the row's), so
+ * the queries below measure the row's lines IN EM OF ITS TEXT, wherever and however large it is
+ * drawn: a phone, a desk's column, one of two columns, a reply's inset, the reader's text size. No
+ * layout is read to decide it (`#226`). web/voice.js writes one label per width class, `data-w`
+ * naming the classes it is for, each counted at the widest line of its class so it never says more
+ * is hidden than is; these show the label of the class the line is in. The edges are
+ * `FOLD_WIDTHS_EM` in web/voice.js, and the page suite holds the two lists to each other. Past the
+ * last edge there is no label at all.
+ */
+.elided {
+  container: elided / inline-size;
+  line-height: 1.3;
+}
+
+.elided > span {
+  display: none;
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+@container elided (width < 14em) {
+  .elided > [data-w~="0"] {
+    display: inline;
+  }
+}
+
+@container elided (14em <= width < 16em) {
+  .elided > [data-w~="1"] {
+    display: inline;
+  }
+}
+
+@container elided (16em <= width < 18em) {
+  .elided > [data-w~="2"] {
+    display: inline;
+  }
+}
+
+@container elided (18em <= width < 20em) {
+  .elided > [data-w~="3"] {
+    display: inline;
+  }
+}
+
+@container elided (20em <= width < 22em) {
+  .elided > [data-w~="4"] {
+    display: inline;
+  }
+}
+
+@container elided (22em <= width < 23.5em) {
+  .elided > [data-w~="5"] {
+    display: inline;
+  }
+}
+
+@container elided (23.5em <= width < 25em) {
+  .elided > [data-w~="6"] {
+    display: inline;
+  }
+}
+
+@container elided (25em <= width < 27em) {
+  .elided > [data-w~="7"] {
+    display: inline;
+  }
+}
+
+@container elided (27em <= width < 28.5em) {
+  .elided > [data-w~="8"] {
+    display: inline;
+  }
+}
+
+@container elided (28.5em <= width < 30em) {
+  .elided > [data-w~="9"] {
+    display: inline;
+  }
+}
+
+@container elided (30em <= width < 33em) {
+  .elided > [data-w~="10"] {
+    display: inline;
+  }
+}
+
+@container elided (33em <= width < 36em) {
+  .elided > [data-w~="11"] {
+    display: inline;
+  }
+}
+
+@container elided (36em <= width < 40em) {
+  .elided > [data-w~="12"] {
+    display: inline;
+  }
+}
+
+@container elided (40em <= width < 45em) {
+  .elided > [data-w~="13"] {
+    display: inline;
+  }
+}
+
+@container elided (45em <= width < 50em) {
+  .elided > [data-w~="14"] {
+    display: inline;
+  }
+}
+
+@container elided (50em <= width < 56em) {
+  .elided > [data-w~="15"] {
+    display: inline;
+  }
+}
+
+@container elided (56em <= width < 63em) {
+  .elided > [data-w~="16"] {
+    display: inline;
+  }
+}
+
+@container elided (63em <= width < 72em) {
+  .elided > [data-w~="17"] {
+    display: inline;
+  }
+}
+
+@container elided (72em <= width < 84em) {
+  .elided > [data-w~="18"] {
+    display: inline;
+  }
+}
+
+@container elided (84em <= width < 100em) {
+  .elided > [data-w~="19"] {
+    display: inline;
+  }
+}
+
+/* A rich header's row (`#242 rich-headers`) has a label for each state of the switch: its text with
+   the words the header restates hidden, while the header shows, and with them, while it does not. */
+:root[data-rich-headers="off"] .elided > [data-rh="on"],
+:root:not([data-rich-headers="off"]) .elided > [data-rh="off"] {
+  display: none;
+}
+
+/* Sized like `.seam-info` and `.chip`: a quiet control on the metadata row, not a second action
+   competing with the dock. */
+.fold {
+  flex: 0 0 auto;
+  padding: 0.05rem 0.5rem;
+  background: none;
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  color: var(--muted);
+  font: inherit;
+  font-size: 0.72rem;
+  letter-spacing: 0.02em;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
