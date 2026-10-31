@@ -158,6 +158,65 @@ options:
                         rollup kind to count; repeat as needed
 "#;
 
+/// The Python edition's query-prompts help, verbatim.
+pub const QUERY_PROMPTS_HELP: &str = r#"usage: wrkviz query prompts [-h] [--range ORDINAL_RANGE]
+                            [--which {human,bot,all}] [--limit N] [--tail N]
+                            [--verify] [--team TEAM] [--start-time START_TIME]
+                            [--end-time END_TIME]
+
+list verbatim human-authored prompts in global timestamp order
+
+options:
+  -h, --help            show this help message and exit
+  --range ORDINAL_RANGE
+                        one prompt ordinal or inclusive range, for example
+                        200-300
+  --which {human,bot,all}
+                        select human, bot, or all prompt authorship (default:
+                        human)
+  --limit N             return at most N records from the start of the
+                        selection
+  --tail N              return the last N records of the selection
+  --verify              re-read every consulted projection end to end and
+                        reproduce its manifest digest, and resolve
+                        prompt/response linkage by full scan rather than seek
+  --team TEAM           team slug; repeat as needed
+  --start-time START_TIME
+                        inclusive RFC3339 instant
+  --end-time END_TIME   exclusive RFC3339 instant
+"#;
+
+/// The Python edition's query-messages help, verbatim.
+pub const QUERY_MESSAGES_HELP: &str = r#"usage: wrkviz query messages [-h] [--range ORDINAL_RANGE]
+                             [--which {human,bot,all}] [--limit N] [--tail N]
+                             [--verify] [--team TEAM]
+                             [--start-time START_TIME] [--end-time END_TIME]
+
+list prompts and their mechanically associated responses
+
+options:
+  -h, --help            show this help message and exit
+  --range ORDINAL_RANGE
+                        one prompt ordinal or inclusive range, for example
+                        200-300
+  --which {human,bot,all}
+                        select human, bot, or all prompt authorship (default:
+                        human)
+  --limit N             return at most N records from the start of the
+                        selection
+  --tail N              return the last N records of the selection
+  --verify              re-read every consulted projection end to end and
+                        reproduce its manifest digest, and resolve
+                        prompt/response linkage by full scan rather than seek
+  --team TEAM           team slug; repeat as needed
+  --start-time START_TIME
+                        inclusive RFC3339 instant
+  --end-time END_TIME   exclusive RFC3339 instant
+"#;
+
+const QUERY_PROMPTS_USAGE: &str = "usage: wrkviz query prompts [-h] [--range ORDINAL_RANGE]\n                            [--which {human,bot,all}] [--limit N] [--tail N]\n                            [--verify] [--team TEAM] [--start-time START_TIME]\n                            [--end-time END_TIME]";
+const QUERY_MESSAGES_USAGE: &str = "usage: wrkviz query messages [-h] [--range ORDINAL_RANGE]\n                             [--which {human,bot,all}] [--limit N] [--tail N]\n                             [--verify] [--team TEAM]\n                             [--start-time START_TIME] [--end-time END_TIME]";
+
 const QUERY_USAGE: &str = "usage: wrkviz query [-h] --output OUTPUT [--format {json,jsonl,markdown,text}]\n                    {list,show,search,prompts,messages,stats} ...";
 const QUERY_STATS_USAGE: &str = "usage: wrkviz query stats [-h] [--team TEAM] [--start-time START_TIME]\n                          [--end-time END_TIME]\n                          [--kind {hourly,daily,weekly,monthly,quarterly}]";
 const QUERY_SHOW_USAGE: &str = "usage: wrkviz query show [-h] [--transcript] reference";
@@ -346,10 +405,10 @@ fn run_query(args: &[String]) -> u8 {
                     print!("{QUERY_SHOW_HELP}");
                     return 0;
                 }
-                Some("stats") => {
-                    // The stats parser validates its options
-                    // in order; a `--help` after an invalid
-                    // choice must not win over that error.
+                Some("stats") | Some("prompts") | Some("messages") => {
+                    // These parsers validate their options in
+                    // order; a `--help` after an invalid choice
+                    // must not win over that error.
                     rest.push(arg.clone());
                     index += 1;
                     continue;
@@ -447,6 +506,13 @@ fn run_query(args: &[String]) -> u8 {
             return run_query_stats("", &format, &rest, true);
         }
     }
+    if matches!(action.as_deref(), Some("prompts") | Some("messages")) && output.is_none() {
+        // The subcommand parser runs before the query parser's
+        // required-argument check: its own errors and help
+        // outrank a missing --output, so always delegate.
+        let action = action.clone().unwrap_or_default();
+        return run_query_transcript(&action, "", &format, &rest, true);
+    }
     let mut missing: Vec<&str> = Vec::new();
     if output.is_none() {
         missing.push("--output");
@@ -469,6 +535,9 @@ fn run_query(args: &[String]) -> u8 {
         Some("list") => run_query_list(&output, &format, &rest),
         Some("show") => run_query_show(&output, &format, &rest),
         Some("stats") => run_query_stats(&output, &format, &rest, false),
+        Some(action @ ("prompts" | "messages")) => {
+            run_query_transcript(action, &output, &format, &rest, false)
+        }
         Some(other) => {
             eprintln!(
                 "wrkviz: the Rust edition has not ported 'query {other}' yet; the Python edition remains the oracle for it"
@@ -582,6 +651,229 @@ fn run_query_show(output: &str, format: &str, args: &[String]) -> u8 {
                 }
             }
         }
+        Err(error) => {
+            eprintln!("wrkviz: {error}");
+            2
+        }
+    }
+}
+
+fn run_query_transcript(
+    action: &str,
+    output: &str,
+    format: &str,
+    args: &[String],
+    output_missing: bool,
+) -> u8 {
+    let (usage, help) = if action == "prompts" {
+        (QUERY_PROMPTS_USAGE, QUERY_PROMPTS_HELP)
+    } else {
+        (QUERY_MESSAGES_USAGE, QUERY_MESSAGES_HELP)
+    };
+    let prog = format!("wrkviz query {action}");
+    let mut range_raw: Option<String> = None;
+    let mut which = "human".to_string();
+    let mut limit: Option<i64> = None;
+    let mut tail: Option<i64> = None;
+    let mut verify = false;
+    let mut filters = crate::query::Filters {
+        teams: Vec::new(),
+        start_time: None,
+        end_time: None,
+        kinds: Vec::new(),
+        agent: None,
+    };
+    let mut extras: Vec<String> = Vec::new();
+    let mut after_separator = false;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if after_separator {
+            extras.push(arg.clone());
+            index += 1;
+            continue;
+        }
+        if arg == "--" {
+            after_separator = true;
+            extras.push(arg.clone());
+            index += 1;
+            continue;
+        }
+        {
+            let (head, explicit) = match arg.split_once('=') {
+                Some((head, value)) => (head, Some(value)),
+                None => (arg.as_str(), None),
+            };
+            let long_help = head.len() > 1 && head.starts_with("--") && "--help".starts_with(head);
+            let short_help = !head.starts_with("--")
+                && head.len() > 1
+                && head.starts_with('-')
+                && head[1..].starts_with('h');
+            if long_help || short_help {
+                if let Some(value) = explicit {
+                    return argparse_error(
+                        usage,
+                        &prog,
+                        &format!("argument -h/--help: ignored explicit argument '{value}'"),
+                    );
+                }
+                print!("{help}");
+                return 0;
+            }
+            if head.len() > 1 && head.starts_with("--") && "--verify".starts_with(head) {
+                if let Some(value) = explicit {
+                    return argparse_error(
+                        usage,
+                        &prog,
+                        &format!("argument --verify: ignored explicit argument '{value}'"),
+                    );
+                }
+                verify = true;
+                index += 1;
+                continue;
+            }
+        }
+        let mut handled = true;
+        for (name, target) in [
+            ("--range", 0),
+            ("--which", 1),
+            ("--limit", 2),
+            ("--tail", 3),
+            ("--team", 4),
+            ("--start-time", 5),
+            ("--end-time", 6),
+        ] {
+            match named_value(args, &mut index, name) {
+                Ok(Some(value)) => {
+                    match target {
+                        0 => range_raw = Some(value),
+                        1 => {
+                            if !["human", "bot", "all"].contains(&value.as_str()) {
+                                return argparse_error(
+                                    usage,
+                                    &prog,
+                                    &format!(
+                                        "argument --which: invalid choice: '{value}' (choose from human, bot, all)"
+                                    ),
+                                );
+                            }
+                            which = value;
+                        }
+                        2 | 3 => {
+                            // Python ints are unbounded: a huge
+                            // integer is a value, clamped here;
+                            // anything else is argparse's error.
+                            let int_shaped = {
+                                let digits = value.strip_prefix('-').unwrap_or(&value);
+                                !digits.is_empty()
+                                    && digits.bytes().all(|byte| byte.is_ascii_digit())
+                            };
+                            let parsed = match value.parse::<i64>() {
+                                Ok(parsed) => parsed,
+                                Err(_) if int_shaped && value.starts_with('-') => i64::MIN + 1,
+                                Err(_) if int_shaped => i64::MAX,
+                                Err(_) => {
+                                    return argparse_error(
+                                        usage,
+                                        &prog,
+                                        &format!("argument {name}: invalid int value: '{value}'"),
+                                    );
+                                }
+                            };
+                            if target == 2 {
+                                limit = Some(parsed);
+                            } else {
+                                tail = Some(parsed);
+                            }
+                        }
+                        4 => filters.teams.push(value),
+                        5 => filters.start_time = Some(value),
+                        _ => filters.end_time = Some(value),
+                    }
+                    break;
+                }
+                Ok(None) => {}
+                Err((_, message)) => return argparse_error(usage, &prog, &message),
+            }
+        }
+        if !is_option_token(
+            arg,
+            &[
+                "--range",
+                "--which",
+                "--limit",
+                "--tail",
+                "--verify",
+                "--team",
+                "--start-time",
+                "--end-time",
+            ],
+        ) {
+            handled = false;
+        }
+        if !handled {
+            extras.push(arg.clone());
+        }
+        index += 1;
+    }
+    if extras.iter().any(|arg| arg != "--") {
+        eprintln!(
+            "usage: wrkviz [-h] [--version] [--userguide]\n              {{quickstart,ingest-project,ingest,ingest-claude,ingest-claude-history,ingest-muse,ingest-orc,summarize,build,extract-transcripts,export,refresh,github-metadata,refresh-claude,refresh-orc,serve,inspect,gc,migrate-build-state,migrate-snapshots,audit-glossary,audit-losslessness,query,responsiveness,discover-agents}}\n              ...\nwrkviz: error: unrecognized arguments: {}",
+            extras.join(" ")
+        );
+        return 2;
+    }
+    if output_missing {
+        return argparse_error(
+            QUERY_USAGE,
+            "wrkviz query",
+            "the following arguments are required: --output",
+        );
+    }
+    let root = cli_path(output);
+    let transcripts = match crate::query::TranscriptQuery::open(&root) {
+        Ok(transcripts) => transcripts,
+        Err(error) => {
+            eprintln!("wrkviz: {error}");
+            return 2;
+        }
+    };
+    if verify {
+        if let Err(error) = transcripts.verify_all() {
+            eprintln!("wrkviz: {error}");
+            return 2;
+        }
+    }
+    let ordinal_range = match &range_raw {
+        None => None,
+        Some(raw) => match crate::query::parse_ordinal_range(raw) {
+            Ok(range) => Some(range),
+            Err(error) => {
+                eprintln!("wrkviz: {error}");
+                return 2;
+            }
+        },
+    };
+    if let Err(error) = crate::query::check_window(&filters) {
+        eprintln!("wrkviz: {error}");
+        return 2;
+    }
+    let items = if action == "prompts" {
+        transcripts.list_prompts(&filters, ordinal_range, &which, limit, tail)
+    } else {
+        transcripts.list_messages(&filters, ordinal_range, &which, limit, tail, verify)
+    };
+    match items {
+        Ok(items) => match crate::query::format_query(action, &items, format) {
+            Ok(text) => {
+                print!("{text}");
+                0
+            }
+            Err(error) => {
+                eprintln!("wrkviz: {error}");
+                2
+            }
+        },
         Err(error) => {
             eprintln!("wrkviz: {error}");
             2

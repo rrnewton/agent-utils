@@ -21,6 +21,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
+use std::str::FromStr as _;
 
 /// The list filters the CLI collects (`_add_query_filters`).
 pub struct Filters {
@@ -1711,6 +1712,43 @@ fn parse_chunk_index(text: &str, where_: &str) -> Result<ChunkIndex, String> {
     })
 }
 
+struct LineSource {
+    name: String,
+    path: String,
+    lines: Vec<Vec<u8>>,
+    data: Vec<u8>,
+    sha256: String,
+    check_on_exhaust: bool,
+}
+
+impl LineSource {
+    fn parse(&self, number: usize) -> Result<Map<String, Value>, String> {
+        let line = &self.lines[number];
+        let where_ = format!("{} line {number}", self.path);
+        let line = std::str::from_utf8(line).map_err(|error| {
+            format!(
+                "{where_}: not a JSON record: {}",
+                py_utf8_error(&error, line)
+            )
+        })?;
+        let value = parse_json_lenient(line)
+            .map_err(|error| format!("{where_}: not a JSON record: {error}"))?;
+        Ok(as_object(&value, &where_)?.clone())
+    }
+
+    /// The digest verdict an end-to-end read reaches when the
+    /// consumer actually exhausts the stream.
+    fn finish(&self, exhausted: bool) -> Result<(), String> {
+        if exhausted && self.check_on_exhaust && hex_digest(&self.data) != self.sha256 {
+            return Err(format!(
+                "transcript export generation is incomplete: {}",
+                self.name
+            ));
+        }
+        Ok(())
+    }
+}
+
 struct ManagedFile {
     name: String,
     path: PathBuf,
@@ -1885,11 +1923,25 @@ impl TranscriptQuery {
     /// Every record of one projection, with the uncompressed
     /// stream's digest reproduced over the inflated bytes.
     fn stream(&self, name: &str) -> Result<Vec<Map<String, Value>>, String> {
+        self.stream_mode(name, true)
+    }
+
+    /// Every record of one projection; the digest is checked
+    /// only on the oracle's end-to-end paths (and always when
+    /// no sidecar vouches for the stream).
+    fn stream_mode(
+        &self,
+        name: &str,
+        verify_digest: bool,
+    ) -> Result<Vec<Map<String, Value>>, String> {
         let declared = self
             .declared
             .get(name)
             .ok_or_else(|| format!("{name} is not a managed transcript projection"))?;
-        let data = self.inflate_verified(declared)?;
+        // Without a sidecar nothing else vouches for the
+        // stream, so the digest is reproduced on every path.
+        let verify = verify_digest || is_link_or_missing(&declared.index_path);
+        let data = self.inflate(declared, verify)?;
         let mut records = Vec::new();
         if data.is_empty() {
             return Ok(records);
@@ -1918,7 +1970,39 @@ impl TranscriptQuery {
         Ok(records)
     }
 
-    fn inflate_verified(&self, declared: &ManagedFile) -> Result<Vec<u8>, String> {
+    /// One projection inflated but not yet parsed: the list
+    /// commands parse records on demand, the way the oracle's
+    /// generators do, so a defect beyond the returned page is
+    /// never read.
+    fn line_source(&self, name: &str, verify_digest: bool) -> Result<LineSource, String> {
+        let declared = self
+            .declared
+            .get(name)
+            .ok_or_else(|| format!("{name} is not a managed transcript projection"))?;
+        let data = self.inflate(declared, false)?;
+        let mut lines: Vec<&[u8]> = Vec::new();
+        if !data.is_empty() {
+            if !data.ends_with(b"\n") {
+                return Err(format!(
+                    "{}: shard does not end at a line boundary",
+                    declared.path.display()
+                ));
+            }
+            lines = data[..data.len() - 1]
+                .split(|byte| *byte == b'\n')
+                .collect();
+        }
+        Ok(LineSource {
+            name: declared.name.clone(),
+            path: declared.path.display().to_string(),
+            lines: lines.iter().map(|line| line.to_vec()).collect(),
+            data,
+            sha256: declared.sha256.clone(),
+            check_on_exhaust: verify_digest || is_link_or_missing(&declared.index_path),
+        })
+    }
+
+    fn inflate(&self, declared: &ManagedFile, verify_digest: bool) -> Result<Vec<u8>, String> {
         let incomplete = || {
             format!(
                 "transcript export generation is incomplete: {}",
@@ -2065,10 +2149,37 @@ impl TranscriptQuery {
             }
             data
         };
-        if hex_digest(&data) != declared.sha256 {
+        if verify_digest && hex_digest(&data) != declared.sha256 {
             return Err(incomplete());
         }
         Ok(data)
+    }
+
+    /// `--verify`: reproduce every managed projection's
+    /// compressed and uncompressed digests, consulted or not.
+    pub fn verify_all(&self) -> Result<(), String> {
+        for name in ["prompts.jsonl", "messages.jsonl", "system-inputs.jsonl"] {
+            let declared = self
+                .declared
+                .get(name)
+                .ok_or_else(|| format!("{name} is not a managed transcript projection"))?;
+            if let Some(expected) = &declared.compressed_sha256 {
+                let bytes = std::fs::read(&declared.path)
+                    .map_err(|error| crate::json::os_error(&error, &declared.path))?;
+                if hex_digest(&bytes) != *expected {
+                    let file_name = declared
+                        .path
+                        .file_name()
+                        .map(|part| part.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    return Err(format!(
+                        "transcript export generation is incomplete: {file_name} does not hash to the compressed digest the manifest declares"
+                    ));
+                }
+            }
+            self.stream(name)?;
+        }
+        Ok(())
     }
 
     fn selected(
@@ -2140,6 +2251,427 @@ impl TranscriptQuery {
             }
         }
         Ok((human, bot, unattributed, linked, unlinked))
+    }
+}
+
+fn check_page(limit: Option<i64>, tail: Option<i64>) -> Result<(), String> {
+    if let Some(limit) = limit {
+        if limit < 1 {
+            return Err("--limit must be at least 1".to_string());
+        }
+    }
+    if let Some(tail) = tail {
+        if tail < 1 {
+            return Err("--tail must be at least 1".to_string());
+        }
+    }
+    if limit.is_some() && tail.is_some() {
+        return Err("--limit and --tail select opposite ends; choose one".to_string());
+    }
+    Ok(())
+}
+
+/// `parse_ordinal_range`: `N` or inclusive `N-M`.
+pub fn parse_ordinal_range(raw: &str) -> Result<(i64, i64), String> {
+    let parse = |text: &str| -> Option<i64> {
+        if text.is_empty()
+            || !text.bytes().all(|byte| byte.is_ascii_digit())
+            || text.starts_with('0')
+        {
+            return None;
+        }
+        // Ordinals beyond i64 simply name no line.
+        Some(text.parse::<i64>().unwrap_or(i64::MAX))
+    };
+    let (first, last) = match raw.split_once('-') {
+        None => match parse(raw) {
+            Some(value) => (value, value),
+            None => {
+                return Err("--range must be a positive ordinal or inclusive N-M range".to_string())
+            }
+        },
+        Some((head, tail)) => {
+            if tail.contains('-') {
+                return Err("--range must be a positive ordinal or inclusive N-M range".to_string());
+            }
+            match (parse(head), parse(tail)) {
+                (Some(first), Some(last)) => (first, last),
+                _ => {
+                    return Err(
+                        "--range must be a positive ordinal or inclusive N-M range".to_string()
+                    )
+                }
+            }
+        }
+    };
+    if first > last {
+        return Err("--range first ordinal must not exceed its last ordinal".to_string());
+    }
+    Ok((first, last))
+}
+
+/// Validate a window once, the way the CLI's filter
+/// construction does before any reading.
+pub fn check_window(filters: &Filters) -> Result<(), String> {
+    parse_window(filters).map(|_| ())
+}
+
+impl TranscriptQuery {
+    fn prompt_class(record: &Map<String, Value>) -> Result<String, String> {
+        let author = as_string(
+            record.get("author_kind").unwrap_or(&Value::Null),
+            "prompt.author_kind",
+        )?;
+        Ok(match author {
+            "owner_human" | "other_human" => "human".to_string(),
+            "agent" | "system" => "bot".to_string(),
+            _ => "unclassified".to_string(),
+        })
+    }
+
+    fn accept_prompt(
+        record: &Map<String, Value>,
+        filters: &Filters,
+        window: &Option<Window>,
+        which: &str,
+    ) -> Result<bool, String> {
+        if !["human", "bot", "all"].contains(&which) {
+            return Err("prompt selection must be human, bot, or all".to_string());
+        }
+        if which != "all" && Self::prompt_class(record)? != which {
+            return Ok(false);
+        }
+        Self::selected(record, filters, window)
+    }
+
+    /// Records before the first line at or after the window
+    /// end, parsed on demand from the end backwards, stopping
+    /// once `tail` records have been accepted (`_tail_matching`
+    /// at line rather than member granularity).
+    #[allow(clippy::type_complexity)]
+    fn tail_accepted(
+        &self,
+        name: &str,
+        end_ms: Option<i64>,
+        tail: i64,
+        accept: &dyn Fn(&Map<String, Value>) -> Result<bool, String>,
+    ) -> Result<Vec<Map<String, Value>>, String> {
+        let source = self.line_source(name, false)?;
+        let mut end_line = source.lines.len();
+        if let Some(end) = end_ms {
+            end_line = 0;
+            for number in 0..source.lines.len() {
+                let record = source.parse(number)?;
+                let at = int_literal(
+                    record.get("timestamp_ms").unwrap_or(&Value::Null),
+                    "transcript record.timestamp_ms",
+                )?;
+                if dec_cmp(&at, &end.to_string()) != std::cmp::Ordering::Less {
+                    break;
+                }
+                end_line = number + 1;
+            }
+        }
+        let mut accepted: Vec<Map<String, Value>> = Vec::new();
+        let mut number = end_line;
+        while number > 0 && (accepted.len() as i64) < tail {
+            number -= 1;
+            let record = source.parse(number)?;
+            if accept(&record)? {
+                accepted.push(record);
+            }
+        }
+        accepted.reverse();
+        Ok(accepted)
+    }
+
+    /// `TranscriptQuery.list_prompts` in global timestamp order.
+    pub fn list_prompts(
+        &self,
+        filters: &Filters,
+        ordinal_range: Option<(i64, i64)>,
+        which: &str,
+        limit: Option<i64>,
+        tail: Option<i64>,
+    ) -> Result<Vec<Map<String, Value>>, String> {
+        check_page(limit, tail)?;
+        let window = parse_window(filters)?;
+        let (start_ms, end_ms) = match &window {
+            None => (None, None),
+            Some(window) => (window.start, window.end),
+        };
+        if let (Some(tail), None, None) = (tail, ordinal_range, start_ms) {
+            return self.tail_accepted("prompts.jsonl", end_ms, tail, &|record| {
+                Self::accept_prompt(record, filters, &window, which)
+            });
+        }
+        let source = self.line_source(
+            "prompts.jsonl",
+            start_ms.is_none() && ordinal_range.is_none(),
+        )?;
+        let mut result = Vec::new();
+        let mut previous: Option<String> = None;
+        let mut started = start_ms.is_none() && ordinal_range.is_none();
+        let mut exhausted = false;
+        let mut number = 0usize;
+        if let Some((first, _)) = ordinal_range {
+            number = (first - 1).max(0) as usize;
+            started = true;
+        }
+        while number < source.lines.len() {
+            let record = source.parse(number)?;
+            if let Some((_, last)) = ordinal_range {
+                let ordinal = int_literal(
+                    record.get("ordinal").unwrap_or(&Value::Null),
+                    "prompt.ordinal",
+                )?;
+                if dec_cmp(&ordinal, &last.to_string()) == std::cmp::Ordering::Greater {
+                    break;
+                }
+                if ordinal != (number + 1).to_string() {
+                    return Err(format!(
+                        "{} line {number}: prompt ordinal is {ordinal}, not {}; the projection is not the dense chronological index its manifest declares, so an ordinal range cannot be located by line",
+                        source.path,
+                        number + 1
+                    ));
+                }
+            }
+            if start_ms.is_some() || end_ms.is_some() {
+                let at = int_literal(
+                    record.get("timestamp_ms").unwrap_or(&Value::Null),
+                    "transcript record.timestamp_ms",
+                )?;
+                if !started {
+                    if dec_cmp(&at, &start_ms.unwrap_or(0).to_string()) == std::cmp::Ordering::Less
+                    {
+                        number += 1;
+                        continue;
+                    }
+                    started = true;
+                } else if start_ms.is_some() {
+                    if let Some(previous) = &previous {
+                        if dec_cmp(&at, previous) == std::cmp::Ordering::Less {
+                            return Err(format!(
+                                "{} line {number}: records are not ordered by timestamp_ms, so a seeked read would under-return; rebuild the transcript export",
+                                source.path
+                            ));
+                        }
+                    }
+                }
+                previous = Some(at.clone());
+                if let Some(end) = end_ms {
+                    if dec_cmp(&at, &end.to_string()) != std::cmp::Ordering::Less {
+                        break;
+                    }
+                }
+            }
+            if Self::accept_prompt(&record, filters, &window, which)? {
+                result.push(record);
+                if let Some(limit) = limit {
+                    if result.len() >= limit as usize {
+                        break;
+                    }
+                }
+            }
+            number += 1;
+            if number >= source.lines.len() {
+                exhausted = true;
+            }
+        }
+        if source.lines.is_empty() {
+            exhausted = true;
+        }
+        source.finish(exhausted)?;
+        if let Some(tail) = tail {
+            let skip = result.len().saturating_sub(tail as usize);
+            return Ok(result[skip..].to_vec());
+        }
+        Ok(result)
+    }
+
+    fn message_belongs(
+        record: &Map<String, Value>,
+        selected_ids: &std::collections::BTreeSet<String>,
+    ) -> Result<bool, String> {
+        let record_type = as_string(
+            record.get("record_type").unwrap_or(&Value::Null),
+            "message.record_type",
+        )?;
+        match record_type {
+            "prompt" => {
+                let record_id = as_string(
+                    record.get("record_id").unwrap_or(&Value::Null),
+                    "prompt.record_id",
+                )?;
+                Ok(selected_ids.contains(record_id))
+            }
+            "response" => Ok(matches!(
+                record.get("in_reply_to_prompt_id"),
+                Some(Value::String(prompt_id)) if selected_ids.contains(prompt_id)
+            )),
+            other => Err(format!(
+                "unknown transcript message type {}",
+                py_repr(&Value::String(other.to_string()))
+            )),
+        }
+    }
+
+    /// `TranscriptQuery.list_messages`: selected prompts plus
+    /// their mechanically associated responses.
+    pub fn list_messages(
+        &self,
+        filters: &Filters,
+        ordinal_range: Option<(i64, i64)>,
+        which: &str,
+        limit: Option<i64>,
+        tail: Option<i64>,
+        exhaustive: bool,
+    ) -> Result<Vec<Map<String, Value>>, String> {
+        check_page(limit, tail)?;
+        let selected_prompts = self.list_prompts(filters, ordinal_range, which, None, None)?;
+        if selected_prompts.is_empty() {
+            return Ok(Vec::new());
+        }
+        // The oracle reads identity, ordinals, and timestamps
+        // in three passes; field errors surface in that order.
+        let mut selected_ids = std::collections::BTreeSet::new();
+        for record in &selected_prompts {
+            selected_ids.insert(
+                as_string(
+                    record.get("record_id").unwrap_or(&Value::Null),
+                    "prompt.record_id",
+                )?
+                .to_string(),
+            );
+        }
+        let mut prompt_ordinals: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        for record in &selected_prompts {
+            let record_id = as_string(
+                record.get("record_id").unwrap_or(&Value::Null),
+                "prompt.record_id",
+            )?
+            .to_string();
+            let ordinal = int_literal(
+                record.get("ordinal").unwrap_or(&Value::Null),
+                "prompt.ordinal",
+            )?;
+            prompt_ordinals.insert(record_id, ordinal);
+        }
+        let mut earliest: Option<String> = None;
+        for record in &selected_prompts {
+            let at = int_literal(
+                record.get("timestamp_ms").unwrap_or(&Value::Null),
+                "prompt.timestamp_ms",
+            )?;
+            if earliest
+                .as_ref()
+                .is_none_or(|current| dec_cmp(&at, current) == std::cmp::Ordering::Less)
+            {
+                earliest = Some(at);
+            }
+        }
+        let window = parse_window(filters)?;
+        let (window_start, window_end) = match &window {
+            None => (None, None),
+            Some(window) => (window.start, window.end),
+        };
+        let lower: Option<String> = if exhaustive {
+            window_start.map(|value| value.to_string())
+        } else {
+            match window_start {
+                Some(start) => {
+                    let earliest = earliest.clone().unwrap_or_default();
+                    Some(
+                        if dec_cmp(&earliest, &start.to_string()) == std::cmp::Ordering::Less {
+                            start.to_string()
+                        } else {
+                            earliest
+                        },
+                    )
+                }
+                None => earliest.clone(),
+            }
+        };
+        let project = |record: &Map<String, Value>| -> Result<Map<String, Value>, String> {
+            let mut item = record.clone();
+            let record_type = as_string(
+                record.get("record_type").unwrap_or(&Value::Null),
+                "message.record_type",
+            )?;
+            if record_type == "response" {
+                let ordinal = match record.get("in_reply_to_prompt_id") {
+                    Some(Value::String(prompt_id)) => prompt_ordinals
+                        .get(prompt_id)
+                        .map(|text| {
+                            serde_json::Number::from_str(text)
+                                .map(Value::Number)
+                                .unwrap_or(Value::Null)
+                        })
+                        .unwrap_or(Value::Null),
+                    _ => Value::Null,
+                };
+                item.insert("prompt_ordinal".to_string(), ordinal);
+            }
+            Ok(item)
+        };
+        if let Some(tail) = tail {
+            let accepted = self.tail_accepted("messages.jsonl", window_end, tail, &|record| {
+                if !Self::message_belongs(record, &selected_ids)? {
+                    return Ok(false);
+                }
+                Self::selected(record, filters, &window)
+            })?;
+            return accepted.iter().map(&project).collect();
+        }
+        let source = self.line_source("messages.jsonl", false)?;
+        let mut result = Vec::new();
+        let mut previous: Option<String> = None;
+        let mut started = lower.is_none();
+        let mut exhausted = false;
+        for number in 0..source.lines.len() {
+            let record = source.parse(number)?;
+            let at = int_literal(
+                record.get("timestamp_ms").unwrap_or(&Value::Null),
+                "transcript record.timestamp_ms",
+            )?;
+            if !started {
+                if dec_cmp(&at, lower.as_deref().unwrap_or("0")) == std::cmp::Ordering::Less {
+                    continue;
+                }
+                started = true;
+            } else if let Some(previous) = &previous {
+                if dec_cmp(&at, previous) == std::cmp::Ordering::Less {
+                    return Err(format!(
+                        "{} line {number}: records are not ordered by timestamp_ms, so a seeked read would under-return; rebuild the transcript export",
+                        source.path
+                    ));
+                }
+            }
+            previous = Some(at.clone());
+            if let Some(end) = window_end {
+                if dec_cmp(&at, &end.to_string()) != std::cmp::Ordering::Less {
+                    break;
+                }
+            }
+            let belongs = Self::message_belongs(&record, &selected_ids)?;
+            if belongs && Self::selected(&record, filters, &window)? {
+                result.push(project(&record)?);
+                if let Some(limit) = limit {
+                    if result.len() >= limit as usize {
+                        break;
+                    }
+                }
+            }
+            if number + 1 >= source.lines.len() {
+                exhausted = true;
+            }
+        }
+        if source.lines.is_empty() {
+            exhausted = true;
+        }
+        source.finish(exhausted)?;
+        Ok(result)
     }
 }
 
