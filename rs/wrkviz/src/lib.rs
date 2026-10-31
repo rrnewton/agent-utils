@@ -44,6 +44,8 @@ pub mod json;
 pub mod muse;
 /// Orc SQLite session lineage ingestion (staged port).
 pub mod orc;
+/// Hindsight agent naming.
+pub mod naming;
 /// Content-addressed tool payload storage.
 pub mod payloads;
 /// Archive transactions: writer lock, team loading, run records.
@@ -62,6 +64,18 @@ pub mod serve;
 /// The snapshot pointer (`snapshot-root.json`) and the legacy
 /// in-archive snapshot layout.
 pub mod snapshot_store;
+/// Summary artifact provenance envelopes.
+pub mod summary_artifacts;
+/// Summarize spend planning and run state.
+pub mod summary_budget;
+/// The logical-key summary artifact catalog.
+pub mod summary_catalog;
+/// Registered summarizer contracts and context coverage.
+pub mod summary_registry;
+/// The summarize engine: jobs, cache, backends, accounting.
+pub mod summarize_core;
+/// Token-usage records and batch receipts.
+pub mod token_usage;
 /// The normalized team snapshot (`raw/team.json`) reader.
 pub mod team_data;
 /// The extract-transcripts projection.
