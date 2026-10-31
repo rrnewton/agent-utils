@@ -7,7 +7,9 @@ use serde_json::{Map, Value};
 use sha2::Digest as _;
 
 use crate::json::py_repr_str;
-use crate::team_data::{Event, ToolCall, Turn};
+use crate::team_data::{
+    task_note_key, Agent, Edge, Event, SourceSnapshot, TaskNote, TeamData, ToolCall, Turn,
+};
 
 /// The `auxiliary-policy-legacy` policy/state constant.
 pub const AUXILIARY_POLICY_LEGACY: &str = "legacy-message-prefix-v1";
@@ -8883,4 +8885,1414 @@ pub fn snapshot_orc_lineage(
         }
     }
     outcome
+}
+
+// ---------------------------------------------------------------- team assembly
+
+/// The latest spawn of *owner* under *coordinator_id*
+/// at or before *timestamp_ms*.
+pub fn select_spawn(
+    spawns: &[((String, String), Vec<Spawn>)],
+    coordinator_id: &str,
+    owner: &str,
+    timestamp_ms: i64,
+) -> Option<Spawn> {
+    let values = spawns
+        .iter()
+        .find(|((held_coordinator, held_owner), _)| {
+            held_coordinator == coordinator_id && held_owner == owner
+        })
+        .map(|(_, held)| held)?;
+    values
+        .iter()
+        .rev()
+        .find(|spawn| spawn.timestamp_ms <= timestamp_ms)
+        .cloned()
+}
+
+/// Render one task source's frozen notes into events
+/// and turns.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
+pub fn task_records(
+    path: &Path,
+    source_path: &str,
+    coordinator_id: &str,
+    task_source_ordinal: i64,
+    spawns: &[((String, String), Vec<Spawn>)],
+    records: &[FrozenTaskNote],
+    start_at_ms: Option<i64>,
+    end_at_ms: Option<i64>,
+    id_namespace: &str,
+) -> Result<(Vec<Event>, Vec<Turn>, Vec<Spawn>), String> {
+    let mut events: Vec<Event> = Vec::new();
+    let mut turns: Vec<Turn> = Vec::new();
+    let mut inferred: Vec<(String, Spawn)> = Vec::new();
+    let mut ordered: Vec<&FrozenTaskNote> = records.iter().collect();
+    ordered.sort_by(|left, right| {
+        (left.created_at.as_str(), left.note_id).cmp(&(right.created_at.as_str(), right.note_id))
+    });
+    for record in ordered {
+        let note_id = record.note_id;
+        let task_id = &record.task_id;
+        let content = &record.content;
+        let timestamp_ms = iso_ms(
+            &SqlValue::Text(record.created_at.clone()),
+            &format!("{}: note created_at", path.display()),
+        )?;
+        if let Some(start) = start_at_ms {
+            if timestamp_ms < start {
+                continue;
+            }
+        }
+        if let Some(end) = end_at_ms {
+            if timestamp_ms >= end {
+                continue;
+            }
+        }
+        let title = &record.title;
+        let namespace = if task_source_ordinal == 0 {
+            String::new()
+        } else {
+            format!("-s{task_source_ordinal}")
+        };
+        let coordinator_prefix = session_prefix8(coordinator_id);
+        let turn_id =
+            format!("{id_namespace}orc-note-turn-{coordinator_prefix}{namespace}-{note_id}");
+        let event_id = format!("{id_namespace}orc-note-{coordinator_prefix}{namespace}-{note_id}");
+        if let Some(server_author) = &record.server_author {
+            let text =
+                format!("[{task_id} · {title} · external author: {server_author}]\n\n{content}");
+            events.push(Event {
+                event_id,
+                thread_id: coordinator_id.to_string(),
+                turn_id: Some(turn_id.clone()),
+                timestamp_ms,
+                kind: "external_message".to_string(),
+                role: Some("user".to_string()),
+                phase: None,
+                text: Some(text),
+                content_availability: "plaintext".to_string(),
+                encrypted_content: None,
+                author: Some(server_author.clone()),
+                recipient: None,
+                source_line: note_id,
+                ingress_kind: None,
+                author_kind: None,
+                source_native_id: None,
+                classification_version: None,
+            });
+            turns.push(Turn {
+                turn_id,
+                thread_id: coordinator_id.to_string(),
+                started_at_ms: timestamp_ms,
+                ended_at_ms: Some(timestamp_ms + 1000),
+                status: "completed".to_string(),
+                first_token_ms: None,
+                error: None,
+                last_agent_message: None,
+            });
+            continue;
+        }
+        let owner = &record.task_owner;
+        let inferred_key = owner
+            .clone()
+            .unwrap_or_else(|| "__unattributed__".to_string());
+        let mut spawn = match owner {
+            None => None,
+            Some(held) => select_spawn(spawns, coordinator_id, held, timestamp_ms),
+        };
+        if spawn.is_none() {
+            spawn = inferred
+                .iter()
+                .find(|(held, _)| *held == inferred_key)
+                .map(|(_, held)| held.clone());
+        }
+        let spawn = match spawn {
+            Some(held) => held,
+            None => {
+                let (official_name, thread_id) = match owner {
+                    None => (
+                        "Unattributed Task Work".to_string(),
+                        format!(
+                            "orc-unattributed-{coordinator_prefix}{}",
+                            if namespace.is_empty() {
+                                "-s0"
+                            } else {
+                                namespace.as_str()
+                            }
+                        ),
+                    ),
+                    Some(held) => {
+                        let mut slug = String::new();
+                        let mut in_run = false;
+                        for ch in held.chars() {
+                            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+                                slug.push(ch);
+                                in_run = false;
+                            } else if !in_run {
+                                slug.push('-');
+                                in_run = true;
+                            }
+                        }
+                        let slug = slug.trim_matches('-');
+                        let slug = if slug.is_empty() { "agent" } else { slug };
+                        let digest = sha256_hex(format!("{coordinator_id}\0{held}").as_bytes());
+                        (
+                            held.clone(),
+                            format!(
+                                "orc-owner-{}-{}",
+                                slug.chars().take(80).collect::<String>(),
+                                &digest[..12]
+                            ),
+                        )
+                    }
+                };
+                let created = Spawn {
+                    thread_id,
+                    parent_thread_id: coordinator_id.to_string(),
+                    official_name,
+                    timestamp_ms,
+                    source_line: note_id,
+                    source_path: source_path.to_string(),
+                };
+                inferred.push((inferred_key, created.clone()));
+                created
+            }
+        };
+        let provenance = if owner.is_none() {
+            " · unattributed local task work"
+        } else {
+            ""
+        };
+        let text = format!("[{task_id} · {title}{provenance}]\n\n{content}");
+        events.push(Event {
+            event_id,
+            thread_id: spawn.thread_id.clone(),
+            turn_id: Some(turn_id.clone()),
+            timestamp_ms,
+            kind: "inter_agent_message".to_string(),
+            role: Some("agent".to_string()),
+            phase: None,
+            text: Some(text.clone()),
+            content_availability: "plaintext".to_string(),
+            encrypted_content: None,
+            author: Some(spawn.thread_id.clone()),
+            recipient: Some(coordinator_id.to_string()),
+            source_line: note_id,
+            ingress_kind: None,
+            author_kind: None,
+            source_native_id: None,
+            classification_version: None,
+        });
+        turns.push(Turn {
+            turn_id,
+            thread_id: spawn.thread_id.clone(),
+            started_at_ms: timestamp_ms,
+            ended_at_ms: Some(timestamp_ms + 1000),
+            status: "completed".to_string(),
+            first_token_ms: None,
+            error: None,
+            last_agent_message: Some(text),
+        });
+    }
+    Ok((
+        events,
+        turns,
+        inferred.into_iter().map(|(_, held)| held).collect(),
+    ))
+}
+
+/// Lift one task source's frozen note history into
+/// normalized model records.
+pub fn promoted_task_notes(
+    source: &SourceCopy,
+    source_path: &Path,
+    records: &[FrozenTaskNote],
+) -> Result<Vec<TaskNote>, String> {
+    let live_note_ids: Vec<i64> = observed_task_notes(source_path)?
+        .iter()
+        .map(|record| record.note_id)
+        .collect();
+    Ok(records
+        .iter()
+        .map(|record| TaskNote {
+            note_id: record.note_id,
+            source_path: source.source_path.clone(),
+            task_source_ordinal: source.task_source_ordinal.unwrap_or(0),
+            task_id: record.task_id.clone(),
+            title: record.title.clone(),
+            content: record.content.clone(),
+            created_at: record.created_at.clone(),
+            server_author: record.server_author.clone(),
+            task_owner: record.task_owner.clone(),
+            upstream_present: live_note_ids.contains(&record.note_id),
+            projection_policy: source
+                .task_projection
+                .as_ref()
+                .map(|projection| projection.policy.clone()),
+            projection_sha256: source
+                .task_projection
+                .as_ref()
+                .map(|projection| projection.sha256.clone()),
+        })
+        .collect())
+}
+
+/// Depth of *thread_id* in the parent map.
+pub fn agent_depth(thread_id: &str, parents: &[(String, Option<String>)]) -> i64 {
+    let lookup = |id: &str| -> Option<Option<String>> {
+        parents
+            .iter()
+            .find(|(held, _)| held == id)
+            .map(|(_, held)| held.clone())
+    };
+    let mut depth: i64 = 0;
+    let mut seen: Vec<String> = vec![thread_id.to_string()];
+    let mut parent = lookup(thread_id).flatten();
+    while let Some(held) = parent {
+        if seen.contains(&held) {
+            break;
+        }
+        seen.push(held.clone());
+        depth += 1;
+        parent = lookup(&held).flatten();
+    }
+    depth
+}
+
+/// Validate configured continuation roots against the
+/// snapshot set.
+pub fn validated_continuation_roots(
+    snapshot_root: &Path,
+    root_session_id: &str,
+    source_copies: &[SourceCopy],
+    metas: &[(String, SessionMeta)],
+    continuation_links: &[ContinuationLink],
+) -> Result<Vec<String>, String> {
+    let meta_of = |id: &str| -> Option<&SessionMeta> {
+        metas
+            .iter()
+            .find(|(held, _)| held == id)
+            .map(|(_, held)| held)
+    };
+    let continuation_ids: Vec<String> = continuation_links
+        .iter()
+        .map(|link| link.session_id.clone())
+        .collect();
+    let roots = lineage_roots(root_session_id, &continuation_ids)?;
+    let mut prior_start: Option<i64> = None;
+    for (index, root) in roots.iter().enumerate() {
+        let Some(meta) = meta_of(root) else {
+            return Err(format!(
+                "snapshot set does not contain configured Orc root {}",
+                py_repr_str(root)
+            ));
+        };
+        if meta.parent_id.is_some() {
+            return Err(format!(
+                "configured Orc continuation {} is not a parentless root",
+                py_repr_str(root)
+            ));
+        }
+        if index == 0 {
+            prior_start = Some(meta.created_at_ms);
+            continue;
+        }
+        let link = &continuation_links[index - 1];
+        let predecessor = &roots[index - 1];
+        let predecessor_source_path = format!(".orc/sessions/{predecessor}/session.db");
+        let successor_source_path = format!(".orc/sessions/{root}/session.db");
+        let validated = match link.to_json() {
+            Value::Object(map) => {
+                ContinuationLink::from_json(&map, &format!("continuation_links[{}]", index - 1))?
+            }
+            _ => {
+                return Err(format!(
+                    "continuation_links[{}]: expected an object",
+                    index - 1
+                ))
+            }
+        };
+        if validated.predecessor_session_id != *predecessor
+            || validated.session_id != *root
+            || validated.predecessor_source_path != predecessor_source_path
+            || validated.source_path != successor_source_path
+        {
+            return Err(format!(
+                "Orc continuation {} does not follow the configured order",
+                index - 1
+            ));
+        }
+        let (Some(predecessor_source), Some(successor_source)) = (
+            source_copies
+                .iter()
+                .find(|held| held.source_path == predecessor_source_path),
+            source_copies
+                .iter()
+                .find(|held| held.source_path == successor_source_path),
+        ) else {
+            return Err(format!(
+                "Orc continuation {} refers to an absent source snapshot",
+                index - 1
+            ));
+        };
+        let successor_path = snapshot_path(snapshot_root, &successor_source.snapshot_path)?;
+        let (resolved, resolved_at) = resolve_continuation_start(
+            &successor_path,
+            meta,
+            &ContinuationSpec {
+                session_id: root.clone(),
+                start_message_id: validated.start_message_id.clone(),
+            },
+        )?;
+        let resolved_line: Option<i64> = resolved.map(|pair| pair.0);
+        if resolved_line != validated.start_source_line
+            || resolved_at != validated.started_at_ms
+            || prior_start.is_none()
+            || resolved_at <= prior_start.unwrap_or(i64::MAX)
+        {
+            return Err(format!(
+                "Orc continuation {} start boundary changed or is unordered",
+                index - 1
+            ));
+        }
+        prior_start = Some(resolved_at);
+        let path = snapshot_path(snapshot_root, &predecessor_source.snapshot_path)?;
+        let connection = read_only(&path)?;
+        // Same resolver as the snapshot path, deliberately. This read is against the frozen
+        // snapshot object rather than the live database, so the two can legitimately be at
+        // different Orc storage schemas at the same instant -- which is exactly the situation
+        // in which two independently written "which table is this?" rules would drift apart and
+        // only one of them would be believed. Nothing is adopted here: this path validates, and
+        // the snapshot path is the only writer of `predecessor_source_table`.
+        let boundary = resolve_continuation_boundary(
+            &connection,
+            &validated,
+            (index - 1) as i64,
+            &path.display().to_string(),
+        );
+        drop(connection);
+        boundary?;
+    }
+    Ok(roots)
+}
+
+fn resolve_lineage_root(
+    session_id: &str,
+    metas: &[(String, SessionMeta)],
+    roots: &[String],
+    root_start_ms: &[(String, i64)],
+    recorded_roots: &[(String, String)],
+    result: &mut Vec<(String, String)>,
+    visiting: &[String],
+) -> Result<String, String> {
+    if let Some((_, held)) = result.iter().find(|(key, _)| key == session_id) {
+        return Ok(held.clone());
+    }
+    if let Some((_, recorded)) = recorded_roots.iter().find(|(key, _)| key == session_id) {
+        if !roots.iter().any(|held| held == recorded) {
+            return Err(format!(
+                "Orc session {} records unknown lineage root {}",
+                py_repr_str(session_id),
+                py_repr_str(recorded)
+            ));
+        }
+        result.push((session_id.to_string(), recorded.clone()));
+        return Ok(recorded.clone());
+    }
+    if roots.iter().any(|held| held == session_id) {
+        result.push((session_id.to_string(), session_id.to_string()));
+        return Ok(session_id.to_string());
+    }
+    if visiting.iter().any(|held| held == session_id) {
+        return Err(format!(
+            "cycle in Orc session lineage at {}",
+            py_repr_str(session_id)
+        ));
+    }
+    let meta = metas
+        .iter()
+        .find(|(held, _)| held == session_id)
+        .map(|(_, held)| held)
+        .ok_or_else(|| {
+            format!(
+                "Orc session {} is outside the configured root lineages",
+                py_repr_str(session_id)
+            )
+        })?;
+    let Some(parent_id) = &meta.parent_id else {
+        return Err(format!(
+            "Orc session {} is outside the configured root lineages",
+            py_repr_str(session_id)
+        ));
+    };
+    if !metas.iter().any(|(held, _)| held == parent_id) {
+        let mut best: Option<(String, i64)> = None;
+        for root in roots {
+            let start = root_start_ms
+                .iter()
+                .find(|(held, _)| held == root)
+                .map(|(_, held)| *held)
+                .unwrap_or(i64::MIN);
+            if start <= meta.updated_at_ms
+                && best.as_ref().map(|(_, held)| start > *held).unwrap_or(true)
+            {
+                best = Some((root.clone(), start));
+            }
+        }
+        let Some((root, _)) = best else {
+            return Err(format!(
+                "Orc session {} has no retained lineage root",
+                py_repr_str(session_id)
+            ));
+        };
+        result.push((session_id.to_string(), root.clone()));
+        return Ok(root);
+    }
+    let mut next_visiting = visiting.to_vec();
+    next_visiting.push(session_id.to_string());
+    let root = resolve_lineage_root(
+        parent_id,
+        metas,
+        roots,
+        root_start_ms,
+        recorded_roots,
+        result,
+        &next_visiting,
+    )?;
+    result.push((session_id.to_string(), root.clone()));
+    Ok(root)
+}
+
+/// Assign every session to its lineage root.
+pub fn continuation_lineages(
+    metas: &[(String, SessionMeta)],
+    roots: &[String],
+    root_start_ms: &[(String, i64)],
+    recorded_roots: &[(String, String)],
+) -> Result<Vec<(String, String)>, String> {
+    let mut result: Vec<(String, String)> = Vec::new();
+    for (session_id, _) in metas {
+        resolve_lineage_root(
+            session_id,
+            metas,
+            roots,
+            root_start_ms,
+            recorded_roots,
+            &mut result,
+            &[],
+        )?;
+    }
+    let root_of = |id: &str| -> Option<String> {
+        result
+            .iter()
+            .find(|(held, _)| held == id)
+            .map(|(_, held)| held.clone())
+    };
+    for (session_id, meta) in metas {
+        if let Some(parent_id) = &meta.parent_id {
+            if metas.iter().any(|(held, _)| held == parent_id)
+                && root_of(parent_id) != root_of(session_id)
+            {
+                return Err(format!(
+                    "Orc retained parent/child sessions disagree on lineage root: {} -> {}",
+                    py_repr_str(parent_id),
+                    py_repr_str(session_id)
+                ));
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// The id namespace a lineage root's records are
+/// prefixed with.
+pub fn continuation_namespace(lineage_root: &str, roots: &[String]) -> String {
+    let index = roots
+        .iter()
+        .position(|held| held == lineage_root)
+        .unwrap_or(0);
+    if index == 0 {
+        String::new()
+    } else {
+        format!("orc-cont-{index}-{}-", session_prefix8(lineage_root))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn orc_agent_path(
+    session_id: &str,
+    root_session_id: &str,
+    metas: &[(String, SessionMeta)],
+    parents: &[(String, Option<String>)],
+    included: &[String],
+    continuation_parents: &[(String, String)],
+    has_links: bool,
+    memo: &mut Vec<(String, String)>,
+) -> String {
+    if let Some((_, held)) = memo.iter().find(|(key, _)| key == session_id) {
+        return held.clone();
+    }
+    let meta = metas
+        .iter()
+        .find(|(held, _)| held == session_id)
+        .map(|(_, held)| held);
+    let result = if session_id == root_session_id {
+        "/root".to_string()
+    } else if !has_links {
+        format!(
+            "/root/{}",
+            meta.map(|held| held.name.as_str()).unwrap_or_default()
+        )
+    } else {
+        let parent = parents
+            .iter()
+            .find(|(held, _)| held == session_id)
+            .and_then(|(_, held)| held.clone());
+        let parent_path = match &parent {
+            Some(held) if included.iter().any(|item| item == held) => orc_agent_path(
+                held,
+                root_session_id,
+                metas,
+                parents,
+                included,
+                continuation_parents,
+                has_links,
+                memo,
+            ),
+            _ => "/root".to_string(),
+        };
+        let component = if continuation_parents
+            .iter()
+            .any(|(held, _)| held == session_id)
+        {
+            format!(
+                "continuation-{}-{}",
+                meta.map(|held| held.name.as_str()).unwrap_or_default(),
+                session_prefix8(session_id)
+            )
+        } else {
+            meta.map(|held| held.name.clone()).unwrap_or_default()
+        };
+        format!("{}/{component}", parent_path.trim_end_matches('/'))
+    };
+    memo.push((session_id.to_string(), result.clone()));
+    result
+}
+
+/// Normalize validated archive-local Orc SQLite backups
+/// into `TeamData`.
+pub fn load_orc_team(
+    snapshot_root: &Path,
+    root_session_id: &str,
+    team_slug: &str,
+    display_timezone: &str,
+    source_copies: &[SourceCopy],
+    continuation_links: &[ContinuationLink],
+) -> Result<TeamData, String> {
+    let session_sources: Vec<&SourceCopy> = source_copies
+        .iter()
+        .filter(|source| source.kind == "session")
+        .collect();
+    let task_sources: Vec<&SourceCopy> = source_copies
+        .iter()
+        .filter(|source| source.kind == "task")
+        .collect();
+    {
+        let mut paths: Vec<&str> = source_copies
+            .iter()
+            .map(|source| source.source_path.as_str())
+            .collect();
+        paths.sort();
+        paths.dedup();
+        if paths.len() != source_copies.len() {
+            return Err("snapshot set contains duplicate Orc source records".to_string());
+        }
+    }
+    for source in source_copies {
+        if source.auxiliary.policy != AUXILIARY_POLICY_LEGACY {
+            validate_source_semantic_identity(snapshot_root, source)?;
+        }
+    }
+    let meta_of = |metas: &[(String, SessionMeta)], id: &str| -> Option<SessionMeta> {
+        metas
+            .iter()
+            .find(|(held, _)| held == id)
+            .map(|(_, held)| held.clone())
+    };
+    let mut metas: Vec<(String, SessionMeta)> = Vec::new();
+    let mut session_snapshot_paths: Vec<(String, String)> = Vec::new();
+    for source in &session_sources {
+        let path = snapshot_path(snapshot_root, &source.snapshot_path)?;
+        let meta = session_meta(&path, &source.source_path)?;
+        if meta.session_id != source.owner_session_id {
+            return Err(format!(
+                "session snapshot {} contains {}, not manifest owner {}",
+                py_repr_str(&source.source_path),
+                py_repr_str(&meta.session_id),
+                py_repr_str(&source.owner_session_id)
+            ));
+        }
+        if metas.iter().any(|(held, _)| held == &meta.session_id) {
+            return Err(format!(
+                "duplicate Orc session id {}",
+                py_repr_str(&meta.session_id)
+            ));
+        }
+        session_snapshot_paths.push((meta.session_id.clone(), source.snapshot_path.clone()));
+        metas.push((meta.session_id.clone(), meta));
+    }
+    if meta_of(&metas, root_session_id).is_none() {
+        return Err(format!(
+            "snapshot set does not contain root session {}",
+            py_repr_str(root_session_id)
+        ));
+    }
+    {
+        let mut sorted_ids: Vec<&String> = metas.iter().map(|(held, _)| held).collect();
+        sorted_ids.sort();
+        let mut prefixes: Vec<(String, String)> = Vec::new();
+        for session_id in sorted_ids {
+            let prefix = session_prefix8(session_id);
+            if let Some((_, prior)) = prefixes.iter().find(|(held, _)| held == &prefix) {
+                if prior != session_id {
+                    return Err(format!(
+                        "Orc session-id prefix collision {}: {} and {}",
+                        py_repr_str(&prefix),
+                        py_repr_str(prior),
+                        py_repr_str(session_id)
+                    ));
+                }
+            } else {
+                prefixes.push((prefix, session_id.clone()));
+            }
+        }
+    }
+    for source in &task_sources {
+        if meta_of(&metas, &source.owner_session_id).is_none() {
+            return Err(format!(
+                "task source {} has unknown owner {}",
+                py_repr_str(&source.source_path),
+                py_repr_str(&source.owner_session_id)
+            ));
+        }
+    }
+    let roots: Vec<String> = if !continuation_links.is_empty() {
+        validated_continuation_roots(
+            snapshot_root,
+            root_session_id,
+            source_copies,
+            &metas,
+            continuation_links,
+        )?
+    } else {
+        vec![root_session_id.to_string()]
+    };
+    let mut root_start_ms: Vec<(String, i64)> = vec![(
+        root_session_id.to_string(),
+        meta_of(&metas, root_session_id)
+            .map(|held| held.created_at_ms)
+            .unwrap_or(0),
+    )];
+    for link in continuation_links {
+        root_start_ms.push((link.session_id.clone(), link.started_at_ms));
+    }
+    let root_start_source_line: Vec<(String, Option<i64>)> = continuation_links
+        .iter()
+        .map(|link| (link.session_id.clone(), link.start_source_line))
+        .collect();
+    let lineage_by_session: Vec<(String, String)> = if !continuation_links.is_empty() {
+        let recorded: Vec<(String, String)> = session_sources
+            .iter()
+            .filter_map(|source| {
+                source
+                    .lineage_root_session_id
+                    .clone()
+                    .map(|held| (source.owner_session_id.clone(), held))
+            })
+            .collect();
+        continuation_lineages(&metas, &roots, &root_start_ms, &recorded)?
+    } else {
+        metas
+            .iter()
+            .map(|(held, _)| (held.clone(), root_session_id.to_string()))
+            .collect()
+    };
+    let lineage_of = |id: &str| -> String {
+        lineage_by_session
+            .iter()
+            .find(|(held, _)| held == id)
+            .map(|(_, held)| held.clone())
+            .unwrap_or_else(|| root_session_id.to_string())
+    };
+    let start_of = |id: &str| -> i64 {
+        root_start_ms
+            .iter()
+            .find(|(held, _)| held == id)
+            .map(|(_, held)| *held)
+            .unwrap_or(0)
+    };
+
+    let mut session_events: Vec<Event> = Vec::new();
+    let mut tools: Vec<ToolCall> = Vec::new();
+    let mut turns: Vec<Turn> = Vec::new();
+    let mut all_spawns: Vec<Spawn> = Vec::new();
+    {
+        let mut sorted_metas: Vec<(String, SessionMeta)> = metas.clone();
+        sorted_metas.sort_by(|left, right| left.0.cmp(&right.0));
+        for (session_id, meta) in &sorted_metas {
+            let snapshot_relative = session_snapshot_paths
+                .iter()
+                .find(|(held, _)| held == session_id)
+                .map(|(_, held)| held.clone())
+                .unwrap_or_default();
+            let path = snapshot_path(snapshot_root, &snapshot_relative)?;
+            let lineage_root = lineage_of(session_id);
+            let lineage_start = start_of(&lineage_root);
+            let source_line_start = if session_id == &lineage_root {
+                root_start_source_line
+                    .iter()
+                    .find(|(held, _)| held == &lineage_root)
+                    .and_then(|(_, held)| *held)
+            } else {
+                None
+            };
+            let window = if lineage_root != root_session_id {
+                Some(lineage_start)
+            } else {
+                None
+            };
+            let (content_events, session_tools, session_turns) = content_records(
+                &path,
+                meta,
+                &continuation_namespace(&lineage_root, &roots),
+                window,
+                source_line_start,
+            )?;
+            session_events.extend(content_events);
+            tools.extend(session_tools);
+            turns.extend(session_turns);
+            all_spawns.extend(conversation_spawns(&path, meta, window, source_line_start)?);
+        }
+    }
+
+    let mut spawns_by_name: Vec<((String, String), Vec<Spawn>)> = Vec::new();
+    for spawn in &all_spawns {
+        let key = (spawn.parent_thread_id.clone(), spawn.official_name.clone());
+        match spawns_by_name.iter_mut().find(|(held, _)| held == &key) {
+            Some((_, values)) => values.push(spawn.clone()),
+            None => spawns_by_name.push((key, vec![spawn.clone()])),
+        }
+    }
+    for (_, values) in spawns_by_name.iter_mut() {
+        values.sort_by_key(|item| (item.timestamp_ms, item.source_line));
+    }
+
+    let mut task_roots_by_path: Vec<(String, Vec<String>)> = Vec::new();
+    if !continuation_links.is_empty() {
+        let task_source_paths: Vec<&str> = task_sources
+            .iter()
+            .map(|source| source.source_path.as_str())
+            .collect();
+        let mut referenced: Vec<(String, Vec<String>)> = Vec::new();
+        for (session_id, meta) in &metas {
+            let snapshot_relative = session_snapshot_paths
+                .iter()
+                .find(|(held, _)| held == session_id)
+                .map(|(_, held)| held.clone())
+                .unwrap_or_default();
+            let path = snapshot_path(snapshot_root, &snapshot_relative)?;
+            for (task_path, _, _) in session_task_relatives(&path, meta)? {
+                if task_source_paths.contains(&task_path.as_str()) {
+                    let root = lineage_of(session_id);
+                    match referenced.iter_mut().find(|(held, _)| held == &task_path) {
+                        Some((_, values)) => {
+                            if !values.contains(&root) {
+                                values.push(root);
+                            }
+                        }
+                        None => referenced.push((task_path, vec![root])),
+                    }
+                }
+            }
+        }
+        let root_order = |id: &str| -> usize {
+            roots
+                .iter()
+                .position(|held| held == id)
+                .unwrap_or(usize::MAX)
+        };
+        for (path, mut values) in referenced {
+            values.sort_by_key(|held| root_order(held));
+            task_roots_by_path.push((path, values));
+        }
+    }
+
+    let mut task_events: Vec<Event> = Vec::new();
+    let mut task_notes: Vec<TaskNote> = Vec::new();
+    let mut inferred_spawns: Vec<Spawn> = Vec::new();
+    for source in &task_sources {
+        let path = snapshot_path(snapshot_root, &source.snapshot_path)?;
+        let frozen_records = bootstrap_frozen_task_projection(snapshot_root, source, &path)?;
+        task_notes.extend(promoted_task_notes(source, &path, &frozen_records)?);
+        let mut task_roots: Vec<String> = task_roots_by_path
+            .iter()
+            .find(|(held, _)| held == &source.source_path)
+            .map(|(_, held)| held.clone())
+            .unwrap_or_default();
+        let owner_root = lineage_of(&source.owner_session_id);
+        if !task_roots.is_empty() && !task_roots.contains(&owner_root) {
+            task_roots.push(owner_root.clone());
+            let root_order = |id: &str| -> usize {
+                roots
+                    .iter()
+                    .position(|held| held == id)
+                    .unwrap_or(usize::MAX)
+            };
+            task_roots.sort_by_key(|held| root_order(held));
+        }
+        let assignments: Vec<(String, Option<i64>, Option<i64>)> = if task_roots.len() <= 1 {
+            vec![(
+                source.owner_session_id.clone(),
+                if owner_root != root_session_id {
+                    Some(start_of(&owner_root))
+                } else {
+                    None
+                },
+                None,
+            )]
+        } else {
+            task_roots
+                .iter()
+                .enumerate()
+                .map(|(index, coordinator_id)| {
+                    (
+                        coordinator_id.clone(),
+                        if coordinator_id != root_session_id {
+                            Some(start_of(coordinator_id))
+                        } else {
+                            None
+                        },
+                        task_roots.get(index + 1).map(|held| start_of(held)),
+                    )
+                })
+                .collect()
+        };
+        for (coordinator_id, start_at_ms, end_at_ms) in &assignments {
+            let (note_events, note_turns, inferred) = task_records(
+                &path,
+                &source.source_path,
+                coordinator_id,
+                source.task_source_ordinal.unwrap_or(0),
+                &spawns_by_name,
+                &frozen_records,
+                *start_at_ms,
+                *end_at_ms,
+                &continuation_namespace(&lineage_of(coordinator_id), &roots),
+            )?;
+            task_events.extend(note_events);
+            turns.extend(note_turns);
+            inferred_spawns.extend(inferred);
+        }
+    }
+    all_spawns.extend(inferred_spawns);
+    let mut spawn_ids: Vec<(String, Spawn)> = Vec::new();
+    for spawn in &all_spawns {
+        if let Some((_, prior_spawn)) = spawn_ids.iter().find(|(held, _)| held == &spawn.thread_id)
+        {
+            if spawn.thread_id.starts_with("orc-owner-")
+                && spawn.parent_thread_id == prior_spawn.parent_thread_id
+                && spawn.official_name == prior_spawn.official_name
+            {
+                if (
+                    spawn.timestamp_ms,
+                    spawn.source_path.as_str(),
+                    spawn.source_line,
+                ) < (
+                    prior_spawn.timestamp_ms,
+                    prior_spawn.source_path.as_str(),
+                    prior_spawn.source_line,
+                ) {
+                    let position = spawn_ids
+                        .iter()
+                        .position(|(held, _)| held == &spawn.thread_id)
+                        .unwrap_or(0);
+                    spawn_ids[position] = (spawn.thread_id.clone(), spawn.clone());
+                }
+                continue;
+            }
+            return Err(format!(
+                "Orc agent id collision {} between {} and {}",
+                py_repr_str(&spawn.thread_id),
+                py_repr_str(&prior_spawn.source_path),
+                py_repr_str(&spawn.source_path)
+            ));
+        }
+        if metas.iter().any(|(held, _)| held == &spawn.thread_id) {
+            return Err(format!(
+                "Orc generated agent id collides with session id {}",
+                py_repr_str(&spawn.thread_id)
+            ));
+        }
+        spawn_ids.push((spawn.thread_id.clone(), spawn.clone()));
+    }
+    let mut all_spawns: Vec<Spawn> = spawn_ids.into_iter().map(|(_, held)| held).collect();
+
+    let mut normalized_events: Vec<Event> = session_events
+        .iter()
+        .chain(task_events.iter())
+        .cloned()
+        .collect();
+    normalized_events.sort_by(|left, right| {
+        (left.timestamp_ms, left.event_id.as_str())
+            .cmp(&(right.timestamp_ms, right.event_id.as_str()))
+    });
+    let mut events_by_thread: Vec<(String, Vec<Event>)> = Vec::new();
+    for event in &normalized_events {
+        match events_by_thread
+            .iter_mut()
+            .find(|(held, _)| held == &event.thread_id)
+        {
+            Some((_, values)) => values.push(event.clone()),
+            None => events_by_thread.push((event.thread_id.clone(), vec![event.clone()])),
+        }
+    }
+    let events_for = |thread_id: &str| -> Vec<Event> {
+        events_by_thread
+            .iter()
+            .find(|(held, _)| held == thread_id)
+            .map(|(_, held)| held.clone())
+            .unwrap_or_default()
+    };
+
+    let bounded_roots: Vec<String> = continuation_links
+        .iter()
+        .filter(|link| link.start_message_id.is_some())
+        .map(|link| link.session_id.clone())
+        .collect();
+    let mut evidence_sessions: Vec<String> = Vec::new();
+    let mut note_evidence = |id: &str| {
+        if metas.iter().any(|(held, _)| held == id)
+            && !evidence_sessions.iter().any(|held| held == id)
+        {
+            evidence_sessions.push(id.to_string());
+        }
+    };
+    for event in session_events.iter().chain(task_events.iter()) {
+        note_evidence(&event.thread_id);
+    }
+    for tool in &tools {
+        note_evidence(&tool.thread_id);
+    }
+    for turn in &turns {
+        note_evidence(&turn.thread_id);
+    }
+    for spawn in &all_spawns {
+        note_evidence(&spawn.parent_thread_id);
+    }
+    let mut included_sessions: Vec<String> = Vec::new();
+    for (session_id, meta) in &metas {
+        let lineage_root = lineage_of(session_id);
+        if !bounded_roots.contains(&lineage_root)
+            || session_id == &lineage_root
+            || meta.created_at_ms >= start_of(&lineage_root)
+            || evidence_sessions.contains(session_id)
+        {
+            included_sessions.push(session_id.clone());
+        }
+    }
+
+    let continuation_parents: Vec<(String, String)> = continuation_links
+        .iter()
+        .map(|link| (link.session_id.clone(), link.predecessor_session_id.clone()))
+        .collect();
+    let included_parent = |session_id: &str,
+                           metas: &[(String, SessionMeta)],
+                           included: &[String],
+                           continuation_parents: &[(String, String)],
+                           lineage_by_session: &[(String, String)]|
+     -> Result<Option<String>, String> {
+        if let Some((_, held)) = continuation_parents
+            .iter()
+            .find(|(key, _)| key == session_id)
+        {
+            return Ok(Some(held.clone()));
+        }
+        let mut parent = metas
+            .iter()
+            .find(|(held, _)| held == session_id)
+            .and_then(|(_, held)| held.parent_id.clone());
+        let mut seen: Vec<String> = vec![session_id.to_string()];
+        while let Some(held) = &parent {
+            if !metas.iter().any(|(key, _)| key == held) || included.contains(held) {
+                break;
+            }
+            if seen.contains(held) {
+                return Err(format!(
+                    "cycle in Orc session parents at {}",
+                    py_repr_str(held)
+                ));
+            }
+            seen.push(held.clone());
+            parent = metas
+                .iter()
+                .find(|(key, _)| key == held)
+                .and_then(|(_, held)| held.parent_id.clone());
+        }
+        if let Some(held) = &parent {
+            if included.contains(held) {
+                return Ok(Some(held.clone()));
+            }
+        }
+        let lineage_root = lineage_by_session
+            .iter()
+            .find(|(held, _)| held == session_id)
+            .map(|(_, held)| held.clone())
+            .unwrap_or_else(|| root_session_id.to_string());
+        Ok(if lineage_root != session_id {
+            Some(lineage_root)
+        } else {
+            None
+        })
+    };
+    let mut parents: Vec<(String, Option<String>)> = Vec::new();
+    for session_id in &included_sessions {
+        let held = included_parent(
+            session_id,
+            &metas,
+            &included_sessions,
+            &continuation_parents,
+            &lineage_by_session,
+        )?;
+        parents.push((session_id.clone(), held));
+    }
+    all_spawns.retain(|spawn| {
+        !metas
+            .iter()
+            .any(|(held, _)| held == &spawn.parent_thread_id)
+            || included_sessions.contains(&spawn.parent_thread_id)
+    });
+    for spawn in &all_spawns {
+        parents.push((
+            spawn.thread_id.clone(),
+            Some(spawn.parent_thread_id.clone()),
+        ));
+    }
+
+    let mut agents: Vec<Agent> = Vec::new();
+    let mut path_memo: Vec<(String, String)> = Vec::new();
+    {
+        let mut sorted_included = included_sessions.clone();
+        sorted_included.sort();
+        for session_id in &sorted_included {
+            let meta = meta_of(&metas, session_id).ok_or_else(|| {
+                format!(
+                    "snapshot set does not contain root session {}",
+                    py_repr_str(session_id)
+                )
+            })?;
+            let raw_parent = parents
+                .iter()
+                .find(|(held, _)| held == session_id)
+                .and_then(|(_, held)| held.clone());
+            let parent = raw_parent.filter(|held| metas.iter().any(|(key, _)| key == held));
+            let agent_path = orc_agent_path(
+                session_id,
+                root_session_id,
+                &metas,
+                &parents,
+                &included_sessions,
+                &continuation_parents,
+                !continuation_links.is_empty(),
+                &mut path_memo,
+            );
+            let own = events_for(session_id);
+            let mut activity_ends: Vec<i64> = vec![meta.created_at_ms + 1];
+            activity_ends.extend(own.iter().map(|event| event.timestamp_ms + 1));
+            let or_started = |ended: Option<i64>, started: i64| -> i64 {
+                match ended {
+                    Some(value) if value != 0 => value,
+                    _ => started,
+                }
+            };
+            activity_ends.extend(
+                tools
+                    .iter()
+                    .filter(|tool| tool.thread_id == *session_id)
+                    .map(|tool| or_started(tool.ended_at_ms, tool.started_at_ms) + 1),
+            );
+            activity_ends.extend(
+                turns
+                    .iter()
+                    .filter(|turn| turn.thread_id == *session_id)
+                    .map(|turn| or_started(turn.ended_at_ms, turn.started_at_ms) + 1),
+            );
+            activity_ends.extend(
+                all_spawns
+                    .iter()
+                    .filter(|spawn| spawn.parent_thread_id == *session_id)
+                    .map(|spawn| spawn.timestamp_ms + 1),
+            );
+            let ended = activity_ends
+                .into_iter()
+                .max()
+                .unwrap_or(meta.created_at_ms + 1);
+            let started = meta.created_at_ms.max(start_of(&lineage_of(session_id)));
+            agents.push(Agent {
+                thread_id: session_id.clone(),
+                parent_thread_id: parent,
+                agent_path,
+                nickname: if session_id != root_session_id {
+                    Some(meta.name.clone())
+                } else {
+                    None
+                },
+                role: Some("coordinator".to_string()),
+                depth: agent_depth(session_id, &parents),
+                started_at_ms: started,
+                ended_at_ms: Some((started + 1).max(ended)),
+                status: "completed".to_string(),
+                source_path: meta.source_path.clone(),
+            });
+        }
+    }
+
+    let mut spawns_by_official: Vec<((String, String), Vec<Spawn>)> = Vec::new();
+    for spawn in &all_spawns {
+        let key = (spawn.parent_thread_id.clone(), spawn.official_name.clone());
+        match spawns_by_official.iter_mut().find(|(held, _)| held == &key) {
+            Some((_, values)) => values.push(spawn.clone()),
+            None => spawns_by_official.push((key, vec![spawn.clone()])),
+        }
+    }
+    for (_, values) in spawns_by_official.iter_mut() {
+        values.sort_by_key(|item| (item.timestamp_ms, item.source_line));
+    }
+    let mut official_keys: Vec<(String, String)> = spawns_by_official
+        .iter()
+        .map(|(held, _)| held.clone())
+        .collect();
+    official_keys.sort();
+    for spawn_key in &official_keys {
+        let values = spawns_by_official
+            .iter()
+            .find(|(held, _)| held == spawn_key)
+            .map(|(_, held)| held.clone())
+            .unwrap_or_default();
+        let official_name = &spawn_key.1;
+        for (index, spawn) in values.iter().enumerate() {
+            let own = events_for(&spawn.thread_id);
+            let activity_end = own
+                .iter()
+                .map(|event| event.timestamp_ms + 1000)
+                .max()
+                .unwrap_or(spawn.timestamp_ms + 1000);
+            let next_start = values.get(index + 1).map(|held| held.timestamp_ms);
+            let ended = match next_start {
+                Some(held) => activity_end.min(held),
+                None => activity_end,
+            };
+            let parent_path = agents
+                .iter()
+                .find(|agent| agent.thread_id == spawn.parent_thread_id)
+                .map(|agent| agent.agent_path.clone())
+                .unwrap_or_else(|| "/root".to_string());
+            agents.push(Agent {
+                thread_id: spawn.thread_id.clone(),
+                parent_thread_id: Some(spawn.parent_thread_id.clone()),
+                agent_path: format!("{}/{official_name}", parent_path.trim_end_matches('/')),
+                nickname: None,
+                role: Some("worker".to_string()),
+                depth: agent_depth(&spawn.thread_id, &parents),
+                started_at_ms: spawn.timestamp_ms,
+                ended_at_ms: Some((spawn.timestamp_ms + 1).max(ended)),
+                status: "completed".to_string(),
+                source_path: spawn.source_path.clone(),
+            });
+        }
+    }
+
+    let mut propagated_ends: Vec<(String, i64)> = agents
+        .iter()
+        .map(|agent| {
+            let held = match agent.ended_at_ms {
+                Some(value) if value != 0 => value,
+                _ => agent.started_at_ms + 1,
+            };
+            (agent.thread_id.clone(), held)
+        })
+        .collect();
+    {
+        let mut ordered: Vec<Agent> = agents.clone();
+        ordered.sort_by_key(|agent| std::cmp::Reverse(agent.depth));
+        for agent in &ordered {
+            let Some(parent_id) = &agent.parent_thread_id else {
+                continue;
+            };
+            let child_end = propagated_ends
+                .iter()
+                .find(|(held, _)| held == &agent.thread_id)
+                .map(|(_, held)| *held)
+                .unwrap_or(agent.started_at_ms + 1);
+            match propagated_ends
+                .iter_mut()
+                .find(|(held, _)| held == parent_id)
+            {
+                Some((_, held)) => *held = (*held).max(child_end),
+                None => propagated_ends.push((parent_id.clone(), child_end)),
+            }
+        }
+    }
+    for agent in agents.iter_mut() {
+        if let Some((_, held)) = propagated_ends
+            .iter()
+            .find(|(key, _)| key == &agent.thread_id)
+        {
+            agent.ended_at_ms = Some(*held);
+        }
+    }
+
+    let agent_ids: Vec<String> = agents.iter().map(|agent| agent.thread_id.clone()).collect();
+    let filtered_events: Vec<Event> = normalized_events
+        .into_iter()
+        .filter(|event| agent_ids.contains(&event.thread_id))
+        .collect();
+    let mut edges: Vec<Edge> = Vec::new();
+    for link in continuation_links {
+        edges.push(Edge {
+            edge_id: format!("orc-continuation-{}", link.session_id),
+            call_id: format!("orc-continuation-{}", link.session_id),
+            from_thread_id: link.predecessor_session_id.clone(),
+            to_thread_id: link.session_id.clone(),
+            kind: "continuation".to_string(),
+            timestamp_ms: link.predecessor_at_ms,
+            message_text: Some(format!(
+                "Explicit Orc session continuation. Predecessor source {} row {} was recorded at {} ms UTC; successor source {} started at {} ms UTC ({} ms later).",
+                link.predecessor_source_path,
+                link.predecessor_source_line,
+                link.predecessor_at_ms,
+                link.source_path,
+                link.started_at_ms,
+                link.gap_ms
+            )),
+            content_availability: "plaintext".to_string(),
+            encrypted_content: None,
+            source_line: link.predecessor_source_line,
+        });
+    }
+    {
+        let mut ordered_spawns = all_spawns.clone();
+        ordered_spawns.sort_by(|left, right| {
+            (left.timestamp_ms, left.thread_id.as_str())
+                .cmp(&(right.timestamp_ms, right.thread_id.as_str()))
+        });
+        for spawn in &ordered_spawns {
+            if agent_ids.contains(&spawn.parent_thread_id) {
+                edges.push(Edge {
+                    edge_id: format!("orc-spawn-{}", spawn.thread_id),
+                    call_id: format!("orc-spawn-{}", spawn.source_line),
+                    from_thread_id: spawn.parent_thread_id.clone(),
+                    to_thread_id: spawn.thread_id.clone(),
+                    kind: "spawn".to_string(),
+                    timestamp_ms: spawn.timestamp_ms,
+                    message_text: None,
+                    content_availability: "none".to_string(),
+                    encrypted_content: None,
+                    source_line: spawn.source_line,
+                });
+            }
+        }
+    }
+    for event in &task_events {
+        if event.kind == "inter_agent_message"
+            && agent_ids.contains(&event.thread_id)
+            && event.recipient.as_deref() != Some(event.thread_id.as_str())
+            && event
+                .recipient
+                .as_ref()
+                .map(|held| agent_ids.contains(held))
+                .unwrap_or(false)
+        {
+            edges.push(Edge {
+                edge_id: format!("orc-message-{}", event.event_id),
+                call_id: event.event_id.clone(),
+                from_thread_id: event.thread_id.clone(),
+                to_thread_id: event.recipient.clone().unwrap_or_default(),
+                kind: "message".to_string(),
+                timestamp_ms: event.timestamp_ms,
+                message_text: event.text.clone(),
+                content_availability: event.content_availability.clone(),
+                encrypted_content: event.encrypted_content.clone(),
+                source_line: event.source_line,
+            });
+        }
+    }
+    let mut sorted_copies: Vec<&SourceCopy> = source_copies.iter().collect();
+    sorted_copies.sort_by(|left, right| left.source_path.cmp(&right.source_path));
+    let mut source_snapshots: Vec<SourceSnapshot> = Vec::new();
+    for source in sorted_copies {
+        let held_path = snapshot_path(snapshot_root, &source.snapshot_path)?;
+        let metadata = std::fs::metadata(&held_path)
+            .map_err(|error| crate::json::os_error(&error, &held_path))?;
+        let mtime_ns = metadata
+            .modified()
+            .ok()
+            .and_then(|held| held.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|held| held.as_nanos() as i64)
+            .unwrap_or(0);
+        source_snapshots.push(SourceSnapshot {
+            path: source.source_path.clone(),
+            thread_id: source.owner_session_id.clone(),
+            size_bytes: source.snapshot_size,
+            mtime_ns,
+            sha256: source.sha256.clone(),
+            complete_bytes: source.snapshot_size,
+            line_count: match (&source.kind, &source.task_projection) {
+                (held, Some(projection)) if held == "task" => projection.note_count,
+                _ => source.append_count,
+            },
+            working_directory: None,
+            repository_url: None,
+            semantic_sha256: Some(source.semantic_sha256.clone()),
+            semantic_complete_bytes: Some(source.semantic_complete_bytes),
+        });
+    }
+    let mut sorted_agents = agents;
+    sorted_agents.sort_by(|left, right| {
+        (left.started_at_ms, left.thread_id.as_str())
+            .cmp(&(right.started_at_ms, right.thread_id.as_str()))
+    });
+    let mut sorted_turns = turns;
+    sorted_turns.sort_by(|left, right| {
+        (left.started_at_ms, left.turn_id.as_str())
+            .cmp(&(right.started_at_ms, right.turn_id.as_str()))
+    });
+    let mut sorted_tools = tools;
+    sorted_tools.sort_by(|left, right| {
+        (left.started_at_ms, left.call_id.as_str())
+            .cmp(&(right.started_at_ms, right.call_id.as_str()))
+    });
+    let mut sorted_edges = edges;
+    sorted_edges.sort_by(|left, right| {
+        (left.timestamp_ms, left.edge_id.as_str())
+            .cmp(&(right.timestamp_ms, right.edge_id.as_str()))
+    });
+    let mut sorted_notes = task_notes;
+    sorted_notes.sort_by_key(task_note_key);
+    Ok(TeamData {
+        team_slug: team_slug.to_string(),
+        provider: "orc".to_string(),
+        root_thread_id: root_session_id.to_string(),
+        display_timezone: display_timezone.to_string(),
+        sources: source_snapshots,
+        agents: sorted_agents,
+        turns: sorted_turns,
+        events: filtered_events,
+        tool_calls: sorted_tools,
+        edges: sorted_edges,
+        task_notes: sorted_notes,
+        window_start_ms: None,
+        window_end_ms: None,
+    })
 }
