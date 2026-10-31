@@ -2,8 +2,8 @@
 //!
 //! The event decoder (`muse.rs`) reduces a journal to the
 //! shared event model, unwrapping transaction frames. An
-//! archivist reads the journal the way its Python oracle
-//! does: line by line, each line one JSON value, and only
+//! archivist reads the journal line by line as recorded:
+//! each line one JSON value, and only
 //! object lines are records. Frames are bookkeeping lines
 //! whose `payload_type` is absent, so they drop out of the
 //! record stream without unwrapping.
