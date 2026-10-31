@@ -353,6 +353,20 @@ def test_orc_continuation(tmp_path: Path, rust_wrkviz: Path) -> None:
     assert manifest["continuation_sessions"][0]["session_id"] == CONT_ID
 
 
+def test_orc_bounded_continuation(tmp_path: Path, rust_wrkviz: Path) -> None:
+    spec = json.dumps({"session_id": CONT_ID, "start_message_id": "m1"})
+    oracle, result = _pair(tmp_path, rust_wrkviz,
+                           ["--continuation-session", spec],
+                           continuation=True)
+    assert oracle.returncode == 0
+    manifest = json.loads(
+        (tmp_path / "rs" / "archive.build" / "orc-team" / "raw"
+         / "source-manifest.json").read_text())
+    link = manifest["continuation_sessions"][0]
+    assert link["start_message_id"] == "m1"
+    assert link["start_source_line"] == 1
+
+
 def test_orc_window_and_identity(tmp_path: Path, rust_wrkviz: Path) -> None:
     _pair(tmp_path, rust_wrkviz, [
         "--project", "Widget=https://github.com/example/widget.git",
