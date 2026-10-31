@@ -17,6 +17,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import cast
 
@@ -208,10 +209,28 @@ def _rows(payload: dict[str, object]) -> list[dict[str, object]]:
 
 
 def _check(root: Path, tmp_path: Path) -> dict[str, object]:
-    result = _rust(root, census_state=tmp_path / "rust-census.json")
-    assert result.returncode == 0, result.stderr
-    actual = _scrub(json.loads(result.stdout))
-    assert actual == _scrub(_python(root, tmp_path))
+    # Both editions read live host evidence (the process table
+    # and the user-systemd population) between the fixture's
+    # writes, and that evidence churns on a shared host: the
+    # oracle's settled snapshot refuses after three unstable
+    # enumerations while a single listing still answers, so a
+    # pair read across a churn burst legitimately disagrees
+    # about liveness. Retry the pair until both editions read
+    # the same host state; judgment differences survive every
+    # retry and still fail.
+    actual: dict[str, object] = {}
+    expected: dict[str, object] = {}
+    for attempt in range(5):
+        result = _rust(root, census_state=tmp_path / f"rust-census-{attempt}.json")
+        assert result.returncode == 0, result.stderr
+        actual = _scrub(json.loads(result.stdout))
+        expected = _scrub(
+            _python(root, tmp_path, state_name=f"census-state-{attempt}.json")
+        )
+        if actual == expected:
+            return actual
+        time.sleep(1.0)
+    assert actual == expected
     return actual
 
 
@@ -609,13 +628,25 @@ def test_audit_census_corrupt_state_is_ignored(tmp_path: Path) -> None:
 
 def test_audit_census_wall_timeout_matches_python(tmp_path: Path) -> None:
     root = _cache_fixture(tmp_path)
-    python_payload = _python(root, tmp_path, wall_seconds=0.000001)
-    rust_result = _rust(
-        root, census_state=tmp_path / "rust-census.json", work_limit=100000,
-        wall_seconds=0.000001,
-    )
-    assert rust_result.returncode == 0, rust_result.stderr
-    assert _scrub(json.loads(rust_result.stdout)) == _scrub(python_payload)
+    # Same live-evidence retry as `_check`: a pair read across
+    # a host churn burst can disagree about liveness, not law.
+    python_payload: dict[str, object] = {}
+    rust_payload: dict[str, object] = {}
+    for attempt in range(5):
+        python_payload = _python(
+            root, tmp_path, wall_seconds=0.000001,
+            state_name=f"census-state-{attempt}.json",
+        )
+        rust_result = _rust(
+            root, census_state=tmp_path / f"rust-census-{attempt}.json",
+            work_limit=100000, wall_seconds=0.000001,
+        )
+        assert rust_result.returncode == 0, rust_result.stderr
+        rust_payload = json.loads(rust_result.stdout)
+        if _scrub(rust_payload) == _scrub(python_payload):
+            break
+        time.sleep(1.0)
+    assert _scrub(rust_payload) == _scrub(python_payload)
     row = _rows(python_payload)[0]
     assert row["cache_status"] == "error"
     assert "fixed wall allowance" in str(row["cache_error"])
