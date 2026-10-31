@@ -349,7 +349,10 @@ pub(crate) fn require_exact_keys(
     ))
 }
 
-fn knowledge_epoch_from_json(value: &Value, where_: &str) -> Result<KnowledgeEpoch, String> {
+pub(crate) fn knowledge_epoch_from_json(
+    value: &Value,
+    where_: &str,
+) -> Result<KnowledgeEpoch, String> {
     let obj = as_object(value, where_)?;
     require_exact_keys(obj, &["epoch_id", "cutoff_ms", "cutoff_reason"], where_)?;
     let epoch_id = as_string(obj.get("epoch_id").unwrap(), &format!("{where_}.epoch_id"))?;

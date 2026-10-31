@@ -57,11 +57,24 @@ pub fn event_text(event: &Event) -> String {
                 break;
             }
         }
-        let route = if event.author.is_some() || event.recipient.is_some() {
+        let route = if event.author.as_deref().is_some_and(|item| !item.is_empty())
+            || event
+                .recipient
+                .as_deref()
+                .is_some_and(|item| !item.is_empty())
+        {
             format!(
                 " from {} to {}",
-                event.author.as_deref().unwrap_or("unknown"),
-                event.recipient.as_deref().unwrap_or("unknown")
+                event
+                    .author
+                    .as_deref()
+                    .filter(|item| !item.is_empty())
+                    .unwrap_or("unknown"),
+                event
+                    .recipient
+                    .as_deref()
+                    .filter(|item| !item.is_empty())
+                    .unwrap_or("unknown")
             )
         } else {
             String::new()
@@ -91,8 +104,8 @@ fn tool_text(tool: &crate::team_data::ToolCall) -> String {
         )
     } else {
         let qualified = match &tool.namespace {
-            Some(namespace) => format!("{namespace}.{}", tool.name),
-            None => tool.name.clone(),
+            Some(namespace) if !namespace.is_empty() => format!("{namespace}.{}", tool.name),
+            _ => tool.name.clone(),
         };
         (vec![format!("1 {qualified}")], 1)
     };

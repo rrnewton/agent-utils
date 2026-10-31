@@ -121,7 +121,7 @@ def _scrub(value: object) -> object:
                 out[key] = "<gen>"
             elif key == "command" and isinstance(item, list):
                 out[key] = [
-                    re.sub(r"(py|rs)-out", "OUT", str(arg)) for arg in item
+                    re.sub(r"(py|rs)-(out|multi)", "OUT", str(arg)) for arg in item
                 ]
             else:
                 out[key] = _scrub(item)
@@ -129,7 +129,7 @@ def _scrub(value: object) -> object:
     if isinstance(value, list):
         return [_scrub(item) for item in value]
     if isinstance(value, str):
-        value = re.sub(r"(py|rs)-out", "OUT", value)
+        value = re.sub(r"(py|rs)-(out|multi)", "OUT", value)
         return re.sub(r"[0-9a-f]{64}", "HASH", value)
     return value
 
@@ -251,6 +251,154 @@ def test_build_help(rust_wrkviz: Path) -> None:
     assert result.returncode == 0
     assert result.stdout == oracle.stdout
     assert result.stderr == oracle.stderr
+
+
+CHILD = "child-thread"
+
+
+def _sessions_multi(base: Path) -> Path:
+    root = _sessions(base / "multi-src")
+    sessions = base / "multi-sessions"
+    sessions.mkdir(parents=True, exist_ok=True)
+    for path in root.iterdir():
+        (sessions / path.name).write_bytes(path.read_bytes())
+
+    def rec(ts: int, kind: str, payload: dict[str, object]) -> dict[str, object]:
+        return {"timestamp": _iso(ts), "type": kind, "payload": payload}
+
+    child_meta: dict[str, object] = {
+        "id": CHILD, "session_id": CODEX_ROOT,
+        "parent_thread_id": CODEX_ROOT, "timestamp": _iso(1020),
+        "cwd": "/work/project", "thread_source": "subagent",
+        "agent_path": "/root/worker", "agent_nickname": "Ada",
+        "source": {"subagent": {"thread_spawn": {
+            "parent_thread_id": CODEX_ROOT, "depth": 1,
+            "agent_path": "/root/worker", "agent_nickname": "Ada",
+            "agent_role": "reviewer"}}},
+    }
+    records = [
+        rec(1020, "session_meta", child_meta),
+        rec(1030, "event_msg", {
+            "type": "task_started", "turn_id": "child-turn",
+            "started_at": 1030}),
+        rec(1031, "response_item", {
+            "type": "message", "id": "msg-child-user", "role": "user",
+            "content": [{"type": "input_text",
+                         "text": "Review the widget parser"}]}),
+        rec(1031, "event_msg", {
+            "type": "user_message", "message": "Review the widget parser"}),
+        rec(1040, "response_item", {
+            "type": "message", "id": "msg-child-asst", "role": "assistant",
+            "phase": "commentary",
+            "content": [{"type": "output_text",
+                         "text": "Reviewed the widget parser and verified "
+                                 "the edge cases were tested"}]}),
+        rec(1050, "event_msg", {
+            "type": "task_complete", "turn_id": "child-turn",
+            "started_at": 1030, "completed_at": 1050}),
+    ]
+    path = sessions / "rollout-2026-01-01T00-00-00-child-thread.jsonl"
+    path.write_bytes(b"".join(
+        json.dumps(item, sort_keys=True).encode() + b"\n"
+        for item in records))
+    return sessions
+
+
+def test_build_multi_agent(tmp_path: Path, rust_wrkviz: Path) -> None:
+    sessions = _sessions_multi(tmp_path)
+    archives = {}
+    for label, command in (("py", [sys.executable, str(PYTHON_WRKVIZ)]),
+                           ("rs", [str(rust_wrkviz)])):
+        archive = tmp_path / f"{label}-multi"
+        outcome = _run(command, [
+            "ingest", "--sessions-root", str(sessions),
+            "--root-session", CODEX_ROOT, "--team", "widget",
+            "--output", str(archive),
+        ])
+        assert outcome.returncode == 0, outcome.stderr
+        archives[label] = archive
+    _both(archives, ["summarize", "--backend", "heuristic",
+                     "--model", "offline"])
+    _both(archives, ["build"])
+
+
+def _tamper_archives(
+    tmp_path: Path,
+    rust_wrkviz: Path,
+    mutate: object,
+) -> dict[str, Path]:
+    archives = _ingest(tmp_path, rust_wrkviz)
+    _both(archives, ["summarize", "--backend", "heuristic",
+                     "--model", "offline"])
+    for archive in archives.values():
+        mutate(archive)  # type: ignore[operator]
+    return archives
+
+
+def test_build_legacy_overview_tampered(
+    tmp_path: Path, rust_wrkviz: Path
+) -> None:
+    def mutate(archive: Path) -> None:
+        path = (archive / "teams" / "widget" / "summary_data"
+                / "project_overview.json")
+        current = json.loads(path.read_text())
+        legacy = {
+            "schema_version": 2,
+            "style": current["style"],
+            "source": {
+                "event_ids": [],
+                "start_ms": 0,
+                "end_ms": 1,
+                "context_sha256": "0" * 64,
+                "transcript": "tampered transcript",
+            },
+            "summary": current["summary"],
+            "knowledge_epoch": {
+                "epoch_id": "knowledge-1",
+                "cutoff_ms": 1,
+                "cutoff_reason": "archive-window-end",
+            },
+        }
+        path.write_text(json.dumps(legacy, sort_keys=True))
+
+    archives = _tamper_archives(tmp_path, rust_wrkviz, mutate)
+    _both(archives, ["build"], expect=2)
+
+
+def test_build_invalid_pull_cache(tmp_path: Path, rust_wrkviz: Path) -> None:
+    def mutate(archive: Path) -> None:
+        path = (archive / "teams" / "widget" / "summary_data"
+                / "github" / "pulls.json")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "repository": "bad", "number": 0, "title": "",
+            "state": "merged", "draft": False, "merged_at": None,
+            "body_excerpt": "", "base_ref": "", "head_label": "",
+            "author": None, "updated_at": "", "etag": 123,
+            "fetched_at": "",
+        }
+        path.write_text(json.dumps(
+            {"schema_version": 1, "records": {"bad#0": record}},
+            sort_keys=True))
+
+    archives = _tamper_archives(tmp_path, rust_wrkviz, mutate)
+    _both(archives, ["build"], expect=2)
+
+
+def test_build_parent_symlink_refused(
+    tmp_path: Path, rust_wrkviz: Path
+) -> None:
+    def mutate(archive: Path) -> None:
+        summaries = archive / "teams" / "widget" / "summaries"
+        import shutil
+        shutil.rmtree(summaries, ignore_errors=True)
+        summaries.symlink_to(
+            archive / "teams" / "widget" / "summary_data",
+            target_is_directory=True,
+        )
+
+    archives = _tamper_archives(tmp_path, rust_wrkviz, mutate)
+    _both(archives, ["build"], expect=2)
 
 
 def test_build_missing_team(tmp_path: Path, rust_wrkviz: Path) -> None:

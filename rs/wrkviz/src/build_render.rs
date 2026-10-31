@@ -180,15 +180,20 @@ fn iso_ms(at_ms: i64) -> String {
     }
 }
 
-fn local_time(at_ms: i64, display_timezone: &str) -> String {
+fn local_time(at_ms: i64, display_timezone: &str) -> Result<String, String> {
     use chrono::TimeZone as _;
-    let Ok(zone) = display_timezone.parse::<chrono_tz::Tz>() else {
-        return iso_ms(at_ms);
-    };
+    let zone = display_timezone
+        .parse::<chrono_tz::Tz>()
+        .map_err(|_| format!("No time zone found with key {display_timezone}"))?;
     let utc = chrono::Utc.timestamp_millis_opt(at_ms).single().unwrap();
-    utc.with_timezone(&zone)
+    Ok(utc
+        .with_timezone(&zone)
         .format("%Y-%m-%d %H:%M:%S %Z")
-        .to_string()
+        .to_string())
+}
+
+fn bullet_line(at_ms: i64, text: &str, tz: &str) -> Result<String, String> {
+    Ok(format!("- **{}** — {}", local_time(at_ms, tz)?, text))
 }
 
 fn rstrip(text: &str) -> String {
@@ -196,8 +201,32 @@ fn rstrip(text: &str) -> String {
 }
 
 fn generated_path(archive: &Path, relative_path: &str) -> Result<PathBuf, String> {
-    let candidate = archive.join(relative_path);
+    let parts: Vec<&str> = relative_path.split('/').collect();
+    if relative_path.starts_with('/')
+        || parts.is_empty()
+        || parts.iter().any(|part| matches!(*part, "" | "." | ".."))
+    {
+        return Err(format!(
+            "unsafe generated presentation path: {}",
+            py_repr_str(relative_path)
+        ));
+    }
     let root = std::fs::canonicalize(archive).unwrap_or_else(|_| archive.to_path_buf());
+    let mut cursor = archive.to_path_buf();
+    for part in &parts[..parts.len() - 1] {
+        cursor.push(part);
+        if cursor
+            .symlink_metadata()
+            .map(|meta| meta.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return Err(format!(
+                "refusing generated presentation parent symlink: {}",
+                cursor.display()
+            ));
+        }
+    }
+    let candidate = archive.join(relative_path);
     if let Some(parent) = candidate.parent() {
         if parent.exists() {
             let parent_real =
@@ -205,7 +234,7 @@ fn generated_path(archive: &Path, relative_path: &str) -> Result<PathBuf, String
             if !parent_real.starts_with(&root) {
                 return Err(format!(
                     "generated presentation path escapes archive: {}",
-                    py_repr_str(relative_path)
+                    relative_path
                 ));
             }
         }
@@ -316,9 +345,10 @@ fn time_range(team: &TeamData, phases: &[PhaseWindow]) -> (i64, i64) {
 
 type PullMap = HashMap<(String, i64), PullRequestMetadata>;
 
-fn pull_request_references(text: &str, metadata: &PullMap) -> Vec<Value> {
+fn pull_request_references(text: &str, metadata: &PullMap) -> Result<Vec<Value>, String> {
     let mut result = Vec::new();
     for reference in find_pull_request_references(text) {
+        validate_reference_repository(&reference.repository)?;
         let mut item = serde_json::Map::new();
         item.insert("start".into(), reference.start.into());
         item.insert("end".into(), reference.end.into());
@@ -352,7 +382,42 @@ fn pull_request_references(text: &str, metadata: &PullMap) -> Vec<Value> {
         }
         result.push(Value::Object(item));
     }
-    result
+    Ok(result)
+}
+
+fn validate_reference_repository(repository: &str) -> Result<(), String> {
+    let Some((owner, name)) = repository.split_once('/') else {
+        return Err(format!(
+            "GitHub repository context must be an owner/repository slug: {}",
+            py_repr_str(repository)
+        ));
+    };
+    let owner_ok = !owner.is_empty()
+        && owner.len() <= 39
+        && owner
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+        && !owner.starts_with('-')
+        && !owner.ends_with('-');
+    if !owner_ok {
+        return Err(format!(
+            "invalid GitHub repository owner: {}",
+            py_repr_str(owner)
+        ));
+    }
+    let name_ok = !name.is_empty()
+        && name.len() <= 100
+        && !matches!(name, "." | "..")
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-'));
+    if !name_ok {
+        return Err(format!(
+            "invalid GitHub repository name: {}",
+            py_repr_str(name)
+        ));
+    }
+    Ok(())
 }
 
 fn agent_name<'a>(
@@ -423,7 +488,7 @@ fn phase_markdown(
     name: &AgentNameResult,
     phase: &PhaseWindow,
     summary: &SummaryResult,
-) -> String {
+) -> Result<String, String> {
     let stats = &phase.stats;
     let tz = &team.display_timezone;
     let mut lines: Vec<String> = vec![
@@ -434,8 +499,8 @@ fn phase_markdown(
         format!("Official agent path: `{}`  ", agent.agent_path),
         format!(
             "Window: {} to {}",
-            local_time(phase.start_ms, tz),
-            local_time(phase.end_ms, tz)
+            local_time(phase.start_ms, tz)?,
+            local_time(phase.end_ms, tz)?
         ),
         String::new(),
         format!("> {}", summary.paragraph),
@@ -448,7 +513,8 @@ fn phase_markdown(
             summary
                 .work_summary
                 .iter()
-                .map(|item| format!("- **{}** — {}", local_time(item.at_ms, tz), item.text)),
+                .map(|item| bullet_line(item.at_ms, &item.text, tz))
+                .collect::<Result<Vec<_>, _>>()?,
         );
     } else {
         lines.push("_No substantive work item survived the archival filter._".into());
@@ -473,7 +539,7 @@ fn phase_markdown(
         format!("- Prompt: `{}`", summary.prompt_version),
         format!("- Input hash: `{}`", summary.input_hash),
     ]);
-    format!("{}\n", rstrip(&lines.join("\n")))
+    Ok(format!("{}\n", rstrip(&lines.join("\n"))))
 }
 
 fn rollup_markdown(
@@ -482,7 +548,7 @@ fn rollup_markdown(
     summary: &SummaryResult,
     stats: &PhaseStats,
     audience: &str,
-) -> String {
+) -> Result<String, String> {
     let tz = &team.display_timezone;
     let mut lines: Vec<String> = vec![
         format!(
@@ -503,7 +569,8 @@ fn rollup_markdown(
             summary
                 .work_summary
                 .iter()
-                .map(|item| format!("- **{}** — {}", local_time(item.at_ms, tz), item.text)),
+                .map(|item| bullet_line(item.at_ms, &item.text, tz))
+                .collect::<Result<Vec<_>, _>>()?,
         );
     } else {
         lines.push("_No substantive work item was recorded in this range._".into());
@@ -529,7 +596,7 @@ fn rollup_markdown(
             summary.model, summary.prompt_version, summary.input_hash
         ),
     ]);
-    format!("{}\n", rstrip(&lines.join("\n")))
+    Ok(format!("{}\n", rstrip(&lines.join("\n"))))
 }
 
 fn plain_language_path(period: &Period) -> Result<String, String> {
@@ -551,7 +618,7 @@ fn agent_markdown(
     name: &AgentNameResult,
     phases: &[PhaseWindow],
     summaries: &HashMap<String, SummaryResult>,
-) -> String {
+) -> Result<String, String> {
     let tz = &team.display_timezone;
     let lifetime = clean_summary_prose(name.lifetime_summary.as_deref().unwrap_or_default());
     let mut lines: Vec<String> = vec![
@@ -582,7 +649,11 @@ fn agent_markdown(
     for phase in phases {
         let result = &summaries[&phase.summary_key];
         lines.extend([
-            format!("### {} — {}", local_time(phase.start_ms, tz), result.phrase),
+            format!(
+                "### {} — {}",
+                local_time(phase.start_ms, tz)?,
+                result.phrase
+            ),
             String::new(),
             result.paragraph.clone(),
             String::new(),
@@ -591,11 +662,12 @@ fn agent_markdown(
             result
                 .work_summary
                 .iter()
-                .map(|item| format!("- **{}** — {}", local_time(item.at_ms, tz), item.text)),
+                .map(|item| bullet_line(item.at_ms, &item.text, tz))
+                .collect::<Result<Vec<_>, _>>()?,
         );
         lines.push(String::new());
     }
-    format!("{}\n", rstrip(&lines.join("\n")))
+    Ok(format!("{}\n", rstrip(&lines.join("\n"))))
 }
 
 fn event_objs(team: &TeamData, visible: &BTreeSet<String>) -> Vec<Value> {
@@ -687,11 +759,12 @@ fn safe_presentation_file(relative: &str) -> Result<String, String> {
             py_repr_str(relative)
         ));
     }
-    let parts: Vec<&str> = base.split('/').collect();
-    if base.starts_with('/')
-        || parts.is_empty()
-        || parts.iter().any(|part| matches!(*part, "" | "." | ".."))
-    {
+    // Path.parts semantics: empty and "." components collapse.
+    let parts: Vec<&str> = base
+        .split('/')
+        .filter(|part| !matches!(*part, "" | "."))
+        .collect();
+    if relative.starts_with('/') || parts.is_empty() || parts.contains(&"..") {
         return Err(format!(
             "unsafe presentation manifest path: {}",
             py_repr_str(relative)
@@ -709,10 +782,17 @@ fn safe_presentation_file(relative: &str) -> Result<String, String> {
     if presentation_common().contains(base) || base == "query.py" || fixed.contains(base) {
         return Ok(relative.to_string());
     }
+    let has_suffix = |suffix: &str| -> bool {
+        let last = parts.last().copied().unwrap_or_default();
+        match last.rfind('.') {
+            Some(0) | None => false,
+            Some(_) => last.ends_with(suffix),
+        }
+    };
     if (parts.len() == 3 || parts.len() == 4)
         && parts[0] == "data"
         && parts[1] == "details"
-        && base.ends_with(".json")
+        && has_suffix(".json")
     {
         return Ok(relative.to_string());
     }
@@ -720,7 +800,7 @@ fn safe_presentation_file(relative: &str) -> Result<String, String> {
         && parts[0] == "data"
         && parts[1] == "timeline-v2"
         && parts[2] == "objects"
-        && base.ends_with(".json")
+        && has_suffix(".json")
     {
         let stem = parts[3].strip_suffix(".json").unwrap_or_default();
         if stem.len() == 64
@@ -731,7 +811,7 @@ fn safe_presentation_file(relative: &str) -> Result<String, String> {
             return Ok(relative.to_string());
         }
     }
-    if parts.len() >= 4 && parts[0] == "teams" && parts[2] == "summaries" && base.ends_with(".md") {
+    if parts.len() >= 4 && parts[0] == "teams" && parts[2] == "summaries" && has_suffix(".md") {
         return Ok(relative.to_string());
     }
     Err(format!(
@@ -922,7 +1002,10 @@ fn prune_retired_query_artifacts(archive: &Path, manifest_owned: bool) -> Result
     if let Ok(entries) = std::fs::read_dir(&cache) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with("query.") && name.ends_with(".pyc") {
+            if name.starts_with("query.")
+                && name.ends_with(".pyc")
+                && name.len() >= "query..pyc".len()
+            {
                 candidates.push(entry.path());
             }
         }
@@ -1044,7 +1127,7 @@ fn edge_obj(
             String::new(),
             "Codex persisted this collaboration payload encrypted. The exact plaintext is not available to an offline transcript parser; the paragraph is inferred from the receiving agent's work.".to_string(),
         )
-    } else if edge.message_text.is_none() {
+    } else if edge.message_text.as_deref().unwrap_or_default().is_empty() {
         (
             String::new(),
             "No plaintext message body was present in the source log.".to_string(),
@@ -1292,7 +1375,7 @@ fn result_target<'a>(
     Some(trigger.from_thread_id.as_str())
 }
 
-fn transcript_entry_obj(entry: &TranscriptEntry, metadata: &PullMap) -> Value {
+fn transcript_entry_obj(entry: &TranscriptEntry, metadata: &PullMap) -> Result<Value, String> {
     let mut obj = serde_json::Map::new();
     obj.insert("at_ms".into(), entry.at_ms.into());
     obj.insert("role".into(), Value::String(entry.role.clone()));
@@ -1316,10 +1399,10 @@ fn transcript_entry_obj(entry: &TranscriptEntry, metadata: &PullMap) -> Value {
     if let Value::Object(obj) = &mut value {
         obj.insert(
             "pull_requests".into(),
-            Value::Array(pull_request_references(&entry.text, metadata)),
+            Value::Array(pull_request_references(&entry.text, metadata)?),
         );
     }
-    value
+    Ok(value)
 }
 
 /// Regenerate all presentation files without a summary backend.
@@ -1395,7 +1478,7 @@ pub fn render_archive(archive: &Path, inputs: RenderInputs) -> Result<BuildRepor
         if summary.summary_available {
             changed += write_text_with_gzip_invalidation(
                 &generated_path(archive, &raw_path)?,
-                &phase_markdown(&team, agent, name, phase, summary),
+                &phase_markdown(&team, agent, name, phase, summary)?,
             )?;
             published_summary_paths.insert(raw_path.clone());
         } else {
@@ -1431,11 +1514,11 @@ pub fn render_archive(archive: &Path, inputs: RenderInputs) -> Result<BuildRepor
                         entry.insert("text".into(), Value::String(item.text.clone()));
                         entry.insert(
                             "pull_requests".into(),
-                            Value::Array(pull_request_references(&item.text, &pull_metadata)),
+                            Value::Array(pull_request_references(&item.text, &pull_metadata)?),
                         );
-                        Value::Object(entry)
+                        Ok(Value::Object(entry))
                     })
-                    .collect(),
+                    .collect::<Result<Vec<_>, String>>()?,
             ),
         );
         detail.insert(
@@ -1445,7 +1528,7 @@ pub fn render_archive(archive: &Path, inputs: RenderInputs) -> Result<BuildRepor
                     .transcript
                     .iter()
                     .map(|entry| transcript_entry_obj(entry, &pull_metadata))
-                    .collect(),
+                    .collect::<Result<Vec<_>, _>>()?,
             ),
         );
         detail.insert(
@@ -1503,7 +1586,7 @@ pub fn render_archive(archive: &Path, inputs: RenderInputs) -> Result<BuildRepor
         if agent_summary_available(name) {
             changed += write_text_with_gzip_invalidation(
                 &generated_path(archive, &agent_path)?,
-                &agent_markdown(&team, agent, name, &own_sorted, &phase_summaries),
+                &agent_markdown(&team, agent, name, &own_sorted, &phase_summaries)?,
             )?;
             published_summary_paths.insert(agent_path);
         } else {
@@ -1534,7 +1617,7 @@ pub fn render_archive(archive: &Path, inputs: RenderInputs) -> Result<BuildRepor
         if !technical_path.is_empty() {
             changed += write_text_with_gzip_invalidation(
                 &generated_path(archive, &technical_path)?,
-                &rollup_markdown(&team, period, summary, stats, "technical"),
+                &rollup_markdown(&team, period, summary, stats, "technical")?,
             )?;
             published_summary_paths.insert(technical_path);
         } else {
@@ -1546,7 +1629,7 @@ pub fn render_archive(archive: &Path, inputs: RenderInputs) -> Result<BuildRepor
         if !plain_path.is_empty() {
             changed += write_text_with_gzip_invalidation(
                 &generated_path(archive, &plain_path)?,
-                &rollup_markdown(&team, period, plain_summary, stats, "plain-language"),
+                &rollup_markdown(&team, period, plain_summary, stats, "plain-language")?,
             )?;
             published_summary_paths.insert(plain_path);
         } else {

@@ -19,10 +19,10 @@ use crate::summarize_core::{
     SummaryResult,
 };
 use crate::summarize_pipeline::{
-    agent_name_jobs, frozen_project_overview_input, period_key, period_range, phase_jobs,
-    phases_in, prior_catalog_rollups, require_exact_keys, rollup_index, rollup_job_for_period,
-    root_overview_input, summary_from_catalog_reference, summary_from_json, summary_root,
-    unavailable_summary, validate_project_overview, FrozenOverview,
+    agent_name_jobs, frozen_project_overview_input, knowledge_epoch_from_json, period_key,
+    period_range, phase_jobs, phases_in, prior_catalog_rollups, require_exact_keys, rollup_index,
+    rollup_job_for_period, root_overview_input, summary_from_catalog_reference, summary_from_json,
+    summary_root, unavailable_summary, validate_project_overview, FrozenOverview,
     PROJECT_OVERVIEW_SCHEMA_VERSION,
 };
 use crate::summary_artifacts::SummaryArtifactProvenance;
@@ -441,7 +441,7 @@ fn agent_name_from_catalog_reference(
         || result.prompt_version != provenance.prompt_version
     {
         return Err(format!(
-            "{}: cached agent name differs from artifact provenance",
+            "{}: cached agent lifetime differs from artifact provenance",
             path.display()
         ));
     }
@@ -678,10 +678,10 @@ fn validate_legacy_project_overview(
         ));
     }
     if version == 2 {
-        // Epoch shape is validated by summarize's writer; here we only
-        // require the object to be present and object-shaped.
-        let epoch = root.get("knowledge_epoch").unwrap_or(&Value::Null);
-        as_object(epoch, &format!("{}.knowledge_epoch", path.display()))?;
+        knowledge_epoch_from_json(
+            root.get("knowledge_epoch").unwrap_or(&Value::Null),
+            &format!("{}.knowledge_epoch", path.display()),
+        )?;
     }
     let source = as_object(
         root.get("source").unwrap_or(&Value::Null),
@@ -712,6 +712,28 @@ fn validate_legacy_project_overview(
         source.get("end_ms").unwrap(),
         &format!("{}.source.end_ms", path.display()),
     )?;
+    let expected_sha = nonempty_string(
+        source.get("context_sha256"),
+        &format!("{}.source.context_sha256", path.display()),
+    )?;
+    if version == 2 {
+        let transcript = as_string(
+            source.get("transcript").unwrap_or(&Value::Null),
+            &format!("{}.source.transcript", path.display()),
+        )?;
+        let actual_sha = crate::orc::sha256_hex(transcript.as_bytes());
+        if actual_sha != expected_sha {
+            return Err(format!(
+                "{}.source: transcript digest mismatch",
+                path.display()
+            ));
+        }
+    }
+    let summary = summary_from_json(
+        root.get("summary").unwrap_or(&Value::Null),
+        &format!("{}.summary", path.display()),
+    )?;
+    validate_project_overview(&summary, &format!("{}.summary", path.display()))?;
     Ok(())
 }
 
@@ -1119,7 +1141,32 @@ fn load_pull_cache_records(path: &Path) -> Result<Vec<PullRequestMetadata>, Stri
             &format!("{where_}.repository"),
         )?
         .to_string();
+        {
+            let (owner, name) = repository.split_once('/').unwrap_or((&repository, ""));
+            let owner_ok = !owner.is_empty()
+                && owner.len() <= 39
+                && owner
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+                && !owner.starts_with('-')
+                && !owner.ends_with('-');
+            let name_ok = !name.is_empty()
+                && name.len() <= 100
+                && !matches!(name, "." | "..")
+                && name
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-'));
+            if !owner_ok || !name_ok || repository.matches('/').count() != 1 {
+                return Err(format!(
+                    "GitHub repository must be an owner/repository slug: {}",
+                    py_repr_str(&repository)
+                ));
+            }
+        }
         let number = as_int(item.get("number").unwrap(), &format!("{where_}.number"))?;
+        if number <= 0 {
+            return Err("a GitHub pull-request number must be positive".into());
+        }
         let expected_key = format!("{repository}#{number}");
         if *cache_key != expected_key {
             return Err(format!(
@@ -1138,31 +1185,51 @@ fn load_pull_cache_records(path: &Path) -> Result<Vec<PullRequestMetadata>, Stri
             Some(Value::Bool(value)) => *value,
             _ => return Err(format!("{where_}.draft: expected a boolean")),
         };
+        let title = as_string(item.get("title").unwrap(), &format!("{where_}.title"))?.to_string();
+        if title.is_empty() {
+            return Err("pull-request title must not be empty".into());
+        }
+        let state = as_string(item.get("state").unwrap(), &format!("{where_}.state"))?.to_string();
+        if !matches!(state.as_str(), "open" | "closed") {
+            return Err("pull-request state must be 'open' or 'closed'".into());
+        }
+        let body_excerpt = as_string(
+            item.get("body_excerpt").unwrap(),
+            &format!("{where_}.body_excerpt"),
+        )?
+        .to_string();
+        if body_excerpt.chars().count() > 600 {
+            return Err("pull-request body excerpt is too long".into());
+        }
+        let nonempty = |key: &str| -> Result<String, String> {
+            let value = as_string(item.get(key).unwrap(), &format!("{where_}.{key}"))?.to_string();
+            if value.is_empty() {
+                return Err(format!("pull-request {key} must not be empty"));
+            }
+            Ok(value)
+        };
+        let _fetched_at = nonempty("fetched_at")?;
+        match item.get("etag") {
+            None | Some(Value::Null) => {}
+            Some(other) => {
+                let etag = as_string(other, &format!("{where_}.etag"))?;
+                if etag.is_empty() || etag.len() > 1024 || etag.contains(['\r', '\n']) {
+                    return Err("invalid ETag".into());
+                }
+            }
+        }
         records.push(PullRequestMetadata {
             repository,
             number,
-            title: as_string(item.get("title").unwrap(), &format!("{where_}.title"))?.to_string(),
-            state: as_string(item.get("state").unwrap(), &format!("{where_}.state"))?.to_string(),
+            title,
+            state,
             draft,
             merged_at: opt("merged_at")?,
-            body_excerpt: as_string(
-                item.get("body_excerpt").unwrap(),
-                &format!("{where_}.body_excerpt"),
-            )?
-            .to_string(),
-            base_ref: as_string(item.get("base_ref").unwrap(), &format!("{where_}.base_ref"))?
-                .to_string(),
-            head_label: as_string(
-                item.get("head_label").unwrap(),
-                &format!("{where_}.head_label"),
-            )?
-            .to_string(),
+            body_excerpt,
+            base_ref: nonempty("base_ref")?,
+            head_label: nonempty("head_label")?,
             author: opt("author")?,
-            updated_at: as_string(
-                item.get("updated_at").unwrap(),
-                &format!("{where_}.updated_at"),
-            )?
-            .to_string(),
+            updated_at: nonempty("updated_at")?,
         });
     }
     Ok(records)
