@@ -225,6 +225,16 @@ fn load_promoted_task_notes_inner(
     Ok(notes)
 }
 
+/// The normalized-generation marker value (shared with
+/// ingest).
+pub fn normalized_generation_value_pub(
+    archive: &Path,
+    team_slug: &str,
+    team: &TeamData,
+) -> Result<serde_json::Map<String, Value>, String> {
+    normalized_generation_value(archive, team_slug, team)
+}
+
 fn normalized_generation_value(
     archive: &Path,
     team_slug: &str,

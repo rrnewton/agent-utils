@@ -1398,3 +1398,514 @@ fn ingest_muse_locked(
     report.upstream_retired_sources = source_copies.upstream_retired.clone();
     Ok((team, report))
 }
+
+// ---------------------------------------------------------------- Orc
+
+/// The recorded Orc manifest: sources, continuation
+/// links, and the effective continuation specs.
+#[derive(Clone, Debug)]
+pub struct OrcManifestState {
+    /// Retained source copies.
+    pub sources: Vec<crate::orc::SourceCopy>,
+    /// Recorded continuation links.
+    pub continuation_links: Vec<crate::orc::ContinuationLink>,
+    /// Effective continuation specs.
+    pub continuation_specs: Vec<crate::orc::ContinuationSpec>,
+}
+
+fn py_str_list(items: &[String]) -> String {
+    format!(
+        "[{}]",
+        items
+            .iter()
+            .map(|held| py_repr_str(held))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+fn orc_continuation_specs(
+    values: &[crate::orc::ContinuationSpec],
+    where_: &str,
+) -> Result<Vec<crate::orc::ContinuationSpec>, String> {
+    let mut ids: Vec<&str> = values.iter().map(|spec| spec.session_id.as_str()).collect();
+    ids.sort();
+    ids.dedup();
+    if ids.len() != values.len() {
+        return Err(format!("{where_}: duplicate session ids are not allowed"));
+    }
+    Ok(values.to_vec())
+}
+
+/// Load the recorded Orc source manifest, if any.
+pub fn load_orc_manifest(
+    archive: &Path,
+    team_slug: &str,
+    root_session_id: &str,
+    date_window: Option<&DateWindow>,
+    requested_continuations: &[crate::orc::ContinuationSpec],
+) -> Result<OrcManifestState, String> {
+    let requested_specs =
+        orc_continuation_specs(requested_continuations, "requested continuation sessions")?;
+    let path = build_raw(archive, team_slug, "source-manifest.json")?;
+    if !path.is_file() {
+        return Ok(OrcManifestState {
+            sources: Vec::new(),
+            continuation_links: Vec::new(),
+            continuation_specs: requested_specs,
+        });
+    }
+    let document = read_json(&path)?;
+    let object = as_object(&document, &path.display().to_string())?;
+    let schema_version = crate::json::as_int(
+        object.get("schema_version").unwrap_or(&Value::Null),
+        &format!("{}: schema_version", path.display()),
+    )?;
+    if !(1..=5).contains(&schema_version)
+        || object.get("provider").and_then(Value::as_str) != Some("orc")
+    {
+        return Err(format!("invalid Orc source manifest at {}", path.display()));
+    }
+    if (2..=5).contains(&schema_version) {
+        let mut expected: Vec<&str> = vec![
+            "schema_version",
+            "provider",
+            "root_session_id",
+            "source_root",
+            "snapshot_root",
+            "date_window",
+            "sources",
+        ];
+        if (3..=5).contains(&schema_version) {
+            expected.push("continuation_sessions");
+        }
+        let present: Vec<&str> = object.keys().map(|held| held.as_str()).collect();
+        if present.len() != expected.len() || !expected.iter().all(|held| present.contains(held)) {
+            let missing: Vec<String> = expected
+                .iter()
+                .filter(|held| !present.contains(held))
+                .map(|held| held.to_string())
+                .collect();
+            let unknown: Vec<String> = present
+                .iter()
+                .filter(|held| !expected.contains(held))
+                .map(|held| held.to_string())
+                .collect();
+            return Err(format!(
+                "invalid Orc source manifest fields at {}: missing={}, unknown={}",
+                path.display(),
+                py_str_list(&missing),
+                py_str_list(&unknown)
+            ));
+        }
+        let recorded_source_root = crate::json::as_string(
+            object.get("source_root").unwrap_or(&Value::Null),
+            &format!("{}: source_root", path.display()),
+        )?;
+        if !Path::new(recorded_source_root).is_absolute() {
+            return Err(format!("{}: source_root must be absolute", path.display()));
+        }
+        // Recorded, shape-checked, and deliberately *not* compared against where this run is
+        // about to write.
+        //
+        // It used to be compared, against the single hardcoded `teams/<slug>/source_snapshots`,
+        // and that check stopped being expressible the moment the store became configurable and
+        // relocatable: after a migration the manifest still says where the bytes were at the last
+        // ingest, which is the honest thing for it to say and is no longer where they are. Making
+        // `migrate-snapshots` rewrite the manifest instead was rejected -- `raw/source-manifest.json`
+        // is bound by digest into `raw/normalized-generation.json`, so touching it would leave
+        // every reader refusing the archive as a mixed generation until someone re-ingested, which
+        // is a much worse outcome than a stale descriptive field.
+        //
+        // Nothing is lost, because the string equality was only ever a proxy for the question that
+        // matters -- "are the previous snapshots this manifest names actually here?" -- and that
+        // question is answered properly, per object and by SHA-256, in `prepare_snapshot_candidate`
+        // a few frames down. A relocated tree whose contents are wrong fails there, on the bytes,
+        // rather than here, on a path.
+        //
+        // The shape check stays: relative, non-empty. An absolute path in a tracked, HTTP-served
+        // file would publish somebody's home directory, and a manifest that recorded one would keep
+        // being wrong every time the archive moved.
+        let recorded_snapshot_root = crate::json::as_string(
+            object.get("snapshot_root").unwrap_or(&Value::Null),
+            &format!("{}: snapshot_root", path.display()),
+        )?;
+        if recorded_snapshot_root.is_empty() || Path::new(recorded_snapshot_root).is_absolute() {
+            return Err(format!(
+                "{}: snapshot_root must be a non-empty path relative to the archive",
+                path.display()
+            ));
+        }
+    }
+    let recorded_root = crate::json::as_string(
+        object.get("root_session_id").unwrap_or(&Value::Null),
+        &format!("{}: root_session_id", path.display()),
+    )?;
+    if recorded_root != root_session_id {
+        return Err(format!(
+            "source manifest belongs to root {}, not {}",
+            py_repr_str(recorded_root),
+            py_repr_str(root_session_id)
+        ));
+    }
+    let null = Value::Null;
+    validate_manifest_window(
+        object.get("date_window").unwrap_or(&null),
+        date_window,
+        &path.display().to_string(),
+    )?;
+    let raw_sources = crate::json::as_array(
+        object.get("sources").unwrap_or(&null),
+        &format!("{}: sources", path.display()),
+    )?;
+    let record_schema = if (3..=5).contains(&schema_version) {
+        2
+    } else {
+        schema_version
+    };
+    let mut sources = Vec::new();
+    for (index, raw_source) in raw_sources.iter().enumerate() {
+        let where_ = format!("{}: sources[{index}]", path.display());
+        let held = as_object(raw_source, &where_)?;
+        sources.push(crate::orc::SourceCopy::from_json(
+            held,
+            &where_,
+            record_schema,
+        )?);
+    }
+    let mut links: Vec<crate::orc::ContinuationLink> = Vec::new();
+    if let Some(raw_continuations) = object.get("continuation_sessions") {
+        if !(3..=5).contains(&schema_version) {
+            return Err(format!(
+                "{}: continuation_sessions requires manifest schema version 3, 4 or 5",
+                path.display()
+            ));
+        }
+        let held = crate::json::as_array(
+            raw_continuations,
+            &format!("{}: continuation_sessions", path.display()),
+        )?;
+        for (index, raw_link) in held.iter().enumerate() {
+            let where_ = format!("{}: continuation_sessions[{index}]", path.display());
+            let link = as_object(raw_link, &where_)?;
+            let has_bounded_fields =
+                link.contains_key("start_message_id") || link.contains_key("start_source_line");
+            let has_boundary_table = link.contains_key("predecessor_source_table");
+            if schema_version == 3 && has_bounded_fields {
+                return Err(format!(
+                    "{path}: schema-v3 continuation record cannot contain bounded fields",
+                    path = path.display()
+                ));
+            }
+            if (3..=4).contains(&schema_version) && has_boundary_table {
+                return Err(format!(
+                    "{}: schema-v{schema_version} continuation record cannot name a predecessor boundary table",
+                    path.display()
+                ));
+            }
+            if (4..=5).contains(&schema_version)
+                && !(link.contains_key("start_message_id")
+                    && link.contains_key("start_source_line"))
+            {
+                return Err(format!(
+                    "{}: schema-v{schema_version} continuation record lacks bounded fields",
+                    path.display()
+                ));
+            }
+            // v5 is the version at which the boundary ordinal stopped being a bare integer whose
+            // table had to be re-derived at read time. The key must be present; its *value* may
+            // still be null, because a boundary whose ordinal resolves identically in both candidate
+            // tables is deliberately left unresolved rather than guessed. Presence is therefore the
+            // only thing worth demanding: it distinguishes "a table-aware writer looked at this
+            // link" from "this link predates the question".
+            if schema_version == 5 && !has_boundary_table {
+                return Err(format!(
+                    "{}: schema-v5 continuation record lacks its predecessor_source_table field",
+                    path.display()
+                ));
+            }
+            links.push(crate::orc::ContinuationLink::from_json(link, &where_)?);
+        }
+    }
+    let mut recorded_specs: Vec<crate::orc::ContinuationSpec> = Vec::new();
+    for (index, link) in links.iter().enumerate() {
+        let mut held = Map::new();
+        held.insert("session_id".into(), Value::String(link.session_id.clone()));
+        held.insert(
+            "start_message_id".into(),
+            link.start_message_id
+                .clone()
+                .map_or(Value::Null, Value::String),
+        );
+        recorded_specs.push(crate::orc::ContinuationSpec::from_value(
+            &Value::Object(held),
+            &format!("{}: continuation_sessions[{index}]", path.display()),
+        )?);
+    }
+    let effective_specs = if !requested_specs.is_empty() {
+        if requested_specs.len() < recorded_specs.len()
+            || requested_specs[..recorded_specs.len()] != recorded_specs[..]
+        {
+            return Err(
+                "requested continuation sessions do not extend the recorded ordered prefix"
+                    .to_string(),
+            );
+        }
+        requested_specs
+    } else {
+        recorded_specs
+    };
+    Ok(OrcManifestState {
+        sources,
+        continuation_links: links,
+        continuation_specs: effective_specs,
+    })
+}
+
+/// Refuse a retired Orc lineage whose own snapshot
+/// objects are missing or altered.
+pub fn verify_retained_orc_snapshots(
+    snapshot_root: &Path,
+    sources: &[crate::orc::SourceCopy],
+) -> Result<(), String> {
+    for source in sources {
+        let path = crate::orc::snapshot_path(snapshot_root, &source.snapshot_path)?;
+        let is_symlink = std::fs::symlink_metadata(&path)
+            .map(|meta| meta.file_type().is_symlink())
+            .unwrap_or(false);
+        if is_symlink || !path.is_file() {
+            return Err(format!(
+                "Orc lineage is gone upstream and the archive's own snapshot is missing too: {} (expected {})",
+                source.source_path,
+                path.display()
+            ));
+        }
+        if crate::orc::sha256_file(&path)? != source.sha256 {
+            return Err(format!(
+                "Orc lineage is gone upstream and the archive's own snapshot does not match its manifest: {}",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Snapshot and normalize one Orc lineage as a
+/// serialized raw-data transaction.
+#[allow(clippy::too_many_arguments)]
+pub fn ingest_orc(
+    archive: &Path,
+    source_root: &Path,
+    root_session_id: &str,
+    team_slug: &str,
+    display_timezone: &str,
+    date_window: Option<&DateWindow>,
+    identity_overrides: &IdentityOverrides,
+    continuation_specs: &[crate::orc::ContinuationSpec],
+    accept_prefix_rewrite: &[String],
+    requested_snapshot_root: Option<&Path>,
+) -> Result<(TeamData, IngestReport), String> {
+    let _lock = crate::pipeline::archive_writer_lock(archive)?;
+    ingest_orc_locked(
+        archive,
+        source_root,
+        root_session_id,
+        team_slug,
+        display_timezone,
+        date_window,
+        identity_overrides,
+        continuation_specs,
+        accept_prefix_rewrite,
+        requested_snapshot_root,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ingest_orc_locked(
+    archive: &Path,
+    source_root: &Path,
+    root_session_id: &str,
+    team_slug: &str,
+    display_timezone: &str,
+    date_window: Option<&DateWindow>,
+    identity_overrides: &IdentityOverrides,
+    continuation_specs: &[crate::orc::ContinuationSpec],
+    accept_prefix_rewrite: &[String],
+    requested_snapshot_root: Option<&Path>,
+) -> Result<(TeamData, IngestReport), String> {
+    crate::pipeline::ensure_archive_pub(archive, team_slug, true)?;
+    let mut changed = i64::from(ensure_bulk_content_ignored(archive)?);
+    let manifest_state = load_orc_manifest(
+        archive,
+        team_slug,
+        root_session_id,
+        date_window,
+        continuation_specs,
+    )?;
+    let location = source_snapshot_location(archive, team_slug, requested_snapshot_root)?;
+    let snapshot_root = location.root.clone();
+    changed += crate::orc::prune_orc_staging(&snapshot_root)?;
+    // Absent in both spellings, not merely unreadable: a root that is present but irregular is
+    // left to the snapshot path below, which refuses it. Child sessions that outlive a retired
+    // root are not followed; the lineage is frozen at its last import.
+    let root_database = source_root
+        .join(".orc")
+        .join("sessions")
+        .join(root_session_id)
+        .join("session.db");
+    let retired_lineage = !manifest_state.sources.is_empty()
+        && crate::compressed::resolve_source(&root_database).is_none();
+    let snapshot = if retired_lineage {
+        // The root session database is gone upstream in both spellings: the whole lineage has
+        // retired, and the archive's content-addressed snapshots are the record. Re-normalize
+        // from them -- after checking each against its manifest digest -- instead of refusing.
+        // Nothing new can arrive for a lineage whose root is gone, so the checkpoint stands.
+        verify_retained_orc_snapshots(&snapshot_root, &manifest_state.sources)?;
+        crate::orc::SnapshotResult {
+            sources: manifest_state.sources.clone(),
+            files_changed: 0,
+            continuations: manifest_state.continuation_links.clone(),
+            prefix_overrides: Vec::new(),
+        }
+    } else {
+        crate::orc::snapshot_orc_lineage(
+            source_root,
+            root_session_id,
+            &snapshot_root,
+            &manifest_state.sources,
+            &crate::pipeline::utc_now(),
+            &manifest_state.continuation_specs,
+            &manifest_state.continuation_links,
+            accept_prefix_rewrite,
+        )?
+    };
+    changed += snapshot.files_changed;
+    let mut resolved_specs: Vec<crate::orc::ContinuationSpec> = Vec::new();
+    for (index, link) in snapshot.continuations.iter().enumerate() {
+        let mut held = Map::new();
+        held.insert("session_id".into(), Value::String(link.session_id.clone()));
+        held.insert(
+            "start_message_id".into(),
+            link.start_message_id
+                .clone()
+                .map_or(Value::Null, Value::String),
+        );
+        resolved_specs.push(crate::orc::ContinuationSpec::from_value(
+            &Value::Object(held),
+            &format!("resolved continuation sessions[{index}]"),
+        )?);
+    }
+    if resolved_specs != manifest_state.continuation_specs {
+        return Err(
+            "resolved continuation sessions differ from the requested ordered specs".to_string(),
+        );
+    }
+    let team = apply_date_window(
+        crate::orc::load_orc_team(
+            &snapshot_root,
+            root_session_id,
+            team_slug,
+            display_timezone,
+            &snapshot.sources,
+            &snapshot.continuations,
+        )?,
+        date_window,
+    );
+    let mut parsed_paths: Vec<String> = team
+        .sources
+        .iter()
+        .map(|source| source.path.clone())
+        .collect();
+    let mut expected_paths: Vec<String> = snapshot
+        .sources
+        .iter()
+        .map(|source| source.source_path.clone())
+        .collect();
+    parsed_paths.sort();
+    expected_paths.sort();
+    if parsed_paths != expected_paths {
+        return Err(
+            "parsed source set differs from the validated Orc source snapshots".to_string(),
+        );
+    }
+    if record_site_identity(archive, &team, identity_overrides)? {
+        changed += 1;
+    }
+    let mut source_manifest = Map::new();
+    source_manifest.insert(
+        "schema_version".into(),
+        if snapshot.continuations.is_empty() {
+            2.into()
+        } else {
+            5.into()
+        },
+    );
+    source_manifest.insert("provider".into(), Value::String("orc".to_string()));
+    source_manifest.insert(
+        "root_session_id".into(),
+        Value::String(root_session_id.to_string()),
+    );
+    source_manifest.insert(
+        "source_root".into(),
+        Value::String(crate::json::resolve_path(source_root).display().to_string()),
+    );
+    source_manifest.insert(
+        "snapshot_root".into(),
+        Value::String(location.archive_relative()),
+    );
+    source_manifest.insert(
+        "date_window".into(),
+        date_window.map_or(Value::Null, DateWindow::to_json),
+    );
+    source_manifest.insert(
+        "sources".into(),
+        Value::Array(
+            snapshot
+                .sources
+                .iter()
+                .map(crate::orc::SourceCopy::to_json)
+                .collect(),
+        ),
+    );
+    if !snapshot.continuations.is_empty() {
+        source_manifest.insert(
+            "continuation_sessions".into(),
+            Value::Array(
+                snapshot
+                    .continuations
+                    .iter()
+                    .map(crate::orc::ContinuationLink::to_json)
+                    .collect(),
+            ),
+        );
+    }
+    if write_json_if_changed(
+        &build_raw(archive, team_slug, "source-manifest.json")?,
+        &Value::Object(source_manifest),
+    )? {
+        changed += 1;
+    }
+    let (archived, mut report) =
+        write_ingested_team(archive, team_slug, &team, date_window, changed, &location)?;
+    let marker_changed = write_json_if_changed(
+        &build_raw(archive, team_slug, "normalized-generation.json")?,
+        &Value::Object(crate::pipeline::normalized_generation_value_pub(
+            archive, team_slug, &archived,
+        )?),
+    )?;
+    let gc_changed = crate::orc::prune_orc_snapshot_objects(&snapshot_root, &snapshot.sources)?;
+    report.files_changed += i64::from(marker_changed) + gc_changed;
+    report.orc_prefix_overrides = snapshot.prefix_overrides.clone();
+    report.upstream_retired_sources = if retired_lineage {
+        let mut held: Vec<String> = snapshot
+            .sources
+            .iter()
+            .map(|source| source.source_path.clone())
+            .collect();
+        held.sort();
+        held
+    } else {
+        Vec::new()
+    };
+    Ok((archived, report))
+}

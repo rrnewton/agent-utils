@@ -367,6 +367,7 @@ pub fn run(args: &[String]) -> u8 {
         "ingest-claude-history" => run_ingest_claude_history(&args[1..]),
         "ingest-claude" => run_ingest_session_claude(&args[1..]),
         "ingest-muse" => run_ingest_session_muse(&args[1..]),
+        "ingest-orc" => run_ingest_session_orc(&args[1..]),
         "ingest" => run_ingest(&args[1..]),
         other => {
             eprintln!(
@@ -1563,6 +1564,406 @@ const INGEST_CLAUDE_OPTIONS: [&str; 11] = [
     "--project",
     "--source-host",
 ];
+
+/// The Python edition's ingest-orc help, verbatim.
+pub const INGEST_ORC_HELP: &str = r#"usage: wrkviz ingest-orc [-h] --output OUTPUT --team TEAM
+                         [--snapshot-root DIR] --source-root SOURCE_ROOT
+                         --root-session ROOT_SESSION
+                         [--continuation-session SESSION_OR_JSON]
+                         [--accept-orc-prefix-rewrite SESSION]
+                         [--timezone TIMEZONE]
+                         [--start-date START_DATE | --start-time START_TIME]
+                         [--end-date END_DATE | --end-time END_TIME]
+                         [--project LABEL=REPOSITORY_URL]
+                         [--source-host HOSTNAME]
+
+snapshot and normalize Orc SQLite logs; do not call a model
+
+options:
+  -h, --help            show this help message and exit
+  --output OUTPUT       version-controllable archive directory
+  --team TEAM           stable team slug, for example example-team
+  --snapshot-root DIR   where to keep the vendor source snapshots, which are
+                        ingest input rather than published output and are the
+                        largest thing here (default: <output>.sources, a
+                        sibling of the archive; an archive that already keeps
+                        them inside itself keeps doing so until `migrate-
+                        snapshots` is run)
+  --source-root SOURCE_ROOT
+                        project root containing Orc .orc/ and task .tg/
+                        directories
+  --root-session ROOT_SESSION
+                        Orc coordinator session UUID
+  --continuation-session SESSION_OR_JSON
+                        explicit successor coordinator session; use a session
+                        id for the whole session or compact JSON with
+                        session_id and start_message_id for a reused session;
+                        repeat in chronological order
+  --accept-orc-prefix-rewrite SESSION
+                        operator override: accept this one session's recorded
+                        append prefix having been rewritten in place, re-
+                        baselining its digest and marking the source degraded;
+                        repeat per session; the changed rows and columns are
+                        printed and recorded; a rewritten session not named
+                        here still refuses, and rows that disappeared from or
+                        appeared inside the prefix are refused for every
+                        session
+  --timezone TIMEZONE   IANA display/calendar timezone (UTC instants remain
+                        canonical)
+  --start-date START_DATE
+                        first local calendar date to include (YYYY-MM-DD,
+                        inclusive)
+  --start-time START_TIME
+                        first instant to include (RFC3339 with offset or Z,
+                        inclusive)
+  --end-date END_DATE   local calendar boundary to stop at (YYYY-MM-DD,
+                        exclusive)
+  --end-time END_TIME   instant to stop at (RFC3339 with offset or Z,
+                        exclusive)
+  --project LABEL=REPOSITORY_URL
+                        project/repository identity; repeat for multi-repo
+                        work (the first is primary); Codex git metadata is
+                        used when omitted
+  --source-host HOSTNAME
+                        execution hostname captured by the source data; repeat
+                        for multi-host work
+"#;
+
+const INGEST_ORC_USAGE: &str = "usage: wrkviz ingest-orc [-h] --output OUTPUT --team TEAM\n                         [--snapshot-root DIR] --source-root SOURCE_ROOT\n                         --root-session ROOT_SESSION\n                         [--continuation-session SESSION_OR_JSON]\n                         [--accept-orc-prefix-rewrite SESSION]\n                         [--timezone TIMEZONE]\n                         [--start-date START_DATE | --start-time START_TIME]\n                         [--end-date END_DATE | --end-time END_TIME]\n                         [--project LABEL=REPOSITORY_URL]\n                         [--source-host HOSTNAME]";
+
+const INGEST_ORC_OPTIONS: [&str; 14] = [
+    "--output",
+    "--team",
+    "--snapshot-root",
+    "--source-root",
+    "--root-session",
+    "--continuation-session",
+    "--accept-orc-prefix-rewrite",
+    "--timezone",
+    "--start-date",
+    "--start-time",
+    "--end-date",
+    "--end-time",
+    "--project",
+    "--source-host",
+];
+
+fn run_ingest_session_orc(args: &[String]) -> u8 {
+    let mut output: Option<String> = None;
+    let mut team: Option<String> = None;
+    let mut snapshot_root: Option<String> = None;
+    let mut source_root: Option<String> = None;
+    let mut root_session: Option<String> = None;
+    let mut continuation_sessions: Vec<String> = Vec::new();
+    let mut accept_rewrites: Vec<String> = Vec::new();
+
+    let mut timezone = "America/New_York".to_string();
+    let mut start_date: Option<String> = None;
+    let mut start_time: Option<String> = None;
+    let mut end_date: Option<String> = None;
+    let mut end_time: Option<String> = None;
+    let mut projects: Vec<String> = Vec::new();
+    let mut hosts: Vec<String> = Vec::new();
+    let mut extras: Vec<String> = Vec::new();
+    let mut sep_extras: Vec<String> = Vec::new();
+    let mut seen: Vec<&'static str> = Vec::new();
+    let mut separated = false;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if separated {
+            sep_extras.push(arg.clone());
+            index += 1;
+            continue;
+        }
+        if arg == "--" {
+            separated = true;
+            index += 1;
+            continue;
+        }
+        // argparse resolution: an exact long name wins, else
+        // the prefix must name exactly one candidate, with
+        // `--help` itself among the candidates.
+        let head = arg.split_once('=').map_or(arg.as_str(), |(head, _)| head);
+        if arg == "-h" || (arg.len() > 2 && arg.starts_with("-h") && !arg.starts_with("--")) {
+            // argparse fires the `-h` action at the head of a
+            // single-dash cluster (`-help`) too.
+            print!("{INGEST_ORC_HELP}");
+            return 0;
+        }
+        if head.len() > 2
+            && head.starts_with("--")
+            && head != "--help"
+            && !INGEST_ORC_OPTIONS.contains(&head)
+        {
+            let mut candidates: Vec<&str> = vec!["--help"];
+            candidates.extend(INGEST_ORC_OPTIONS.iter().copied());
+            let matches: Vec<&str> = candidates
+                .into_iter()
+                .filter(|name| name.starts_with(head))
+                .collect();
+            if matches.len() > 1 {
+                return argparse_error(
+                    INGEST_ORC_USAGE,
+                    "wrkviz ingest-orc",
+                    &format!(
+                        "ambiguous option: {head} could match {}",
+                        matches.join(", ")
+                    ),
+                );
+            }
+            if matches == ["--help"] {
+                if let Some((_, value)) = arg.split_once('=') {
+                    return argparse_error(
+                        INGEST_ORC_USAGE,
+                        "wrkviz ingest-orc",
+                        &format!("argument -h/--help: ignored explicit argument '{value}'"),
+                    );
+                }
+                print!("{INGEST_ORC_HELP}");
+                return 0;
+            }
+        }
+        if head == "--help" {
+            if let Some((_, value)) = arg.split_once('=') {
+                return argparse_error(
+                    INGEST_ORC_USAGE,
+                    "wrkviz ingest-orc",
+                    &format!("argument -h/--help: ignored explicit argument '{value}'"),
+                );
+            }
+            print!("{INGEST_ORC_HELP}");
+            return 0;
+        }
+        let mut handled = true;
+        let canonical: Option<&'static str> = if INGEST_ORC_OPTIONS.contains(&head) {
+            INGEST_ORC_OPTIONS
+                .iter()
+                .copied()
+                .find(|name| *name == head)
+        } else if head.len() > 2 && head.starts_with("--") {
+            let matches: Vec<&'static str> = INGEST_ORC_OPTIONS
+                .iter()
+                .copied()
+                .filter(|name| name.starts_with(head))
+                .collect();
+            matches.first().copied()
+        } else {
+            None
+        };
+        let ordered: Vec<&'static str> = canonical
+            .into_iter()
+            .chain(
+                INGEST_ORC_OPTIONS
+                    .iter()
+                    .copied()
+                    .filter(|name| Some(*name) != canonical),
+            )
+            .collect();
+        for name in ordered {
+            match named_value(args, &mut index, name) {
+                Ok(Some(value)) => {
+                    seen.push(name);
+                    // argparse validates the mutually exclusive
+                    // bounds once the second value is in hand.
+                    let conflict = match name {
+                        "--start-time" if start_date.is_some() => Some("--start-date"),
+                        "--start-date" if start_time.is_some() => Some("--start-time"),
+                        "--end-time" if end_date.is_some() => Some("--end-date"),
+                        "--end-date" if end_time.is_some() => Some("--end-time"),
+                        _ => None,
+                    };
+                    if let Some(other) = conflict {
+                        return argparse_error(
+                            INGEST_ORC_USAGE,
+                            "wrkviz ingest-orc",
+                            &format!("argument {name}: not allowed with argument {other}"),
+                        );
+                    }
+                    match name {
+                        "--output" => output = Some(value),
+                        "--team" => team = Some(value),
+                        "--snapshot-root" => snapshot_root = Some(value),
+                        "--source-root" => source_root = Some(value),
+                        "--root-session" => root_session = Some(value),
+                        "--continuation-session" => continuation_sessions.push(value),
+                        "--accept-orc-prefix-rewrite" => accept_rewrites.push(value),
+
+                        "--timezone" => timezone = value,
+                        "--start-date" => start_date = Some(value),
+                        "--start-time" => start_time = Some(value),
+                        "--end-date" => end_date = Some(value),
+                        "--end-time" => end_time = Some(value),
+                        "--project" => projects.push(value),
+                        "--source-host" => hosts.push(value),
+                        _ => {}
+                    }
+                    break;
+                }
+                Ok(None) => {}
+                Err((_, message)) => {
+                    return argparse_error(INGEST_ORC_USAGE, "wrkviz ingest-orc", &message)
+                }
+            }
+        }
+        if !is_option_token(arg, &INGEST_ORC_OPTIONS) {
+            handled = false;
+        }
+        if !handled {
+            extras.push(arg.clone());
+        }
+        index += 1;
+    }
+    let mut required: Vec<&str> = Vec::new();
+    if output.is_none() {
+        required.push("--output");
+    }
+    if team.is_none() {
+        required.push("--team");
+    }
+    if source_root.is_none() {
+        required.push("--source-root");
+    }
+    if root_session.is_none() {
+        required.push("--root-session");
+    }
+    if !required.is_empty() {
+        return argparse_error(
+            INGEST_ORC_USAGE,
+            "wrkviz ingest-orc",
+            &format!(
+                "the following arguments are required: {}",
+                required.join(", ")
+            ),
+        );
+    }
+    if !extras.is_empty() || !sep_extras.is_empty() {
+        let mut reported = extras.clone();
+        if !sep_extras.is_empty() {
+            reported.push("--".to_string());
+            reported.extend(sep_extras.iter().cloned());
+        }
+        eprintln!(
+            "usage: wrkviz [-h] [--version] [--userguide]\n              {{quickstart,ingest-project,ingest,ingest-claude,ingest-claude-history,ingest-muse,ingest-orc,summarize,build,extract-transcripts,export,refresh,github-metadata,refresh-claude,refresh-orc,serve,inspect,gc,migrate-build-state,migrate-snapshots,audit-glossary,audit-losslessness,query,responsiveness,discover-agents}}\n              ...\nwrkviz: error: unrecognized arguments: {}",
+            reported.join(" ")
+        );
+        return 2;
+    }
+    let output = output.unwrap();
+    let team_slug = team.unwrap();
+    let source_root = source_root.unwrap();
+    let root_session = root_session.unwrap();
+    let archive = cli_path(&output);
+    let started = crate::pipeline::utc_now();
+    let mut command: Vec<String> = vec!["wrkviz".to_string(), "ingest-orc".to_string()];
+    command.extend(args.iter().cloned());
+    let outcome: Result<crate::ingest::IngestReport, String> = (|| {
+        let timezone_explicit = args
+            .iter()
+            .any(|item| item == "--timezone" || item.starts_with("--timezone="));
+        let (parsed_projects, parsed_hosts) =
+            crate::identity::parse_identity_overrides(&projects, &hosts)?;
+        let overrides = crate::identity::IdentityOverrides {
+            projects: parsed_projects,
+            hosts: parsed_hosts,
+            display_timezone_source: if timezone_explicit {
+                "explicit".to_string()
+            } else {
+                "default".to_string()
+            },
+        };
+        let date_window = crate::window::parse_date_window(
+            start_date.as_deref(),
+            end_date.as_deref(),
+            &timezone,
+            start_time.as_deref(),
+            end_time.as_deref(),
+        )?;
+        let mut continuations: Vec<crate::orc::ContinuationSpec> = Vec::new();
+        for raw in &continuation_sessions {
+            continuations.push(orc_continuation_arg(raw)?);
+        }
+        let (_, report) = crate::ingest::ingest_orc(
+            &archive,
+            &cli_path(&source_root),
+            &root_session,
+            &team_slug,
+            &timezone,
+            date_window.as_ref(),
+            &overrides,
+            &continuations,
+            &accept_rewrites,
+            snapshot_root.as_deref().map(cli_path).as_deref(),
+        )?;
+        Ok(report)
+    })();
+    let report = match outcome {
+        Ok(report) => report,
+        Err(error) => {
+            if let Ok(run_path) = crate::pipeline::record_run(
+                &archive,
+                &crate::pipeline::RunReceipt {
+                    command: &command,
+                    started_at: &started,
+                    status: "failed",
+                    team_slug: &team_slug,
+                    error: Some(&error),
+                    team_slugs: &[],
+                    mechanical: None,
+                    ingest: None,
+                },
+            ) {
+                eprintln!("run metadata: {}", run_path.display());
+            }
+            eprintln!("wrkviz: {error}");
+            return 2;
+        }
+    };
+    print_ingest_receipt(&report, &archive);
+    for override_ in &report.orc_prefix_overrides {
+        for line in override_.describe() {
+            eprintln!("wrkviz: {}: {line}", report.team_slug);
+        }
+    }
+    let ingest_json = report.to_json();
+    match crate::pipeline::record_run(
+        &archive,
+        &crate::pipeline::RunReceipt {
+            command: &command,
+            started_at: &started,
+            status: "completed",
+            team_slug: &team_slug,
+            error: None,
+            team_slugs: &[],
+            mechanical: None,
+            ingest: Some(ingest_json),
+        },
+    ) {
+        Ok(run_path) => println!("run metadata: {}", run_path.display()),
+        Err(error) => {
+            eprintln!("wrkviz: {error}");
+            return 2;
+        }
+    }
+    0
+}
+
+fn orc_continuation_arg(raw: &str) -> Result<crate::orc::ContinuationSpec, String> {
+    let value: serde_json::Value = if raw.trim_start().starts_with('{') {
+        serde_json::from_str(raw)
+            .map_err(|error| format!("invalid --continuation-session JSON: {error}"))?
+    } else {
+        serde_json::Value::String(raw.to_string())
+    };
+    let is_string = value.as_str().is_some();
+    let spec = crate::orc::ContinuationSpec::from_value(&value, "--continuation-session")?;
+    if !is_string && spec.start_message_id.is_none() {
+        return Err(
+            "--continuation-session.start_message_id: expected a non-empty string".to_string(),
+        );
+    }
+    Ok(spec)
+}
 
 fn run_ingest_session_claude(args: &[String]) -> u8 {
     let mut output: Option<String> = None;

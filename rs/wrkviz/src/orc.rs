@@ -2687,12 +2687,27 @@ pub fn provider_schema_version(path: &Path, where_: &str) -> Result<Option<i64>,
 /// Read one session database's metadata.
 pub fn session_meta(path: &Path, source_path: &str) -> Result<SessionMeta, String> {
     let connection = read_only(path)?;
+    // The oracle wraps every SQLite failure of this inspection
+    // (but not its own refusals) in one message.
+    let wrap = |error: String| -> String {
+        let display = path.display().to_string();
+        if error.starts_with(&format!("{display}: missing ")) {
+            error
+        } else {
+            let inner = error
+                .strip_prefix(&format!("{display}: "))
+                .unwrap_or(&error)
+                .to_string();
+            format!("failed to inspect Orc session metadata at {display}: {inner}")
+        }
+    };
     require_tables(
         &connection,
         &["session_meta", "content_blocks"],
         &path.display().to_string(),
-    )?;
-    session_storage_table(&connection, &path.display().to_string())?;
+    )
+    .map_err(wrap)?;
+    session_storage_table(&connection, &path.display().to_string()).map_err(wrap)?;
     let row = (|| -> Result<Vec<SqlValue>, String> {
         let mut statement = connection
             .prepare(
@@ -6508,19 +6523,19 @@ pub fn validate_source_semantic_identity(
 /// See the enclosing record's documentation.
 pub const PREFIX_DIFF_MAX_ROWS: usize = 20;
 /// See the enclosing record's documentation.
-pub const PREFIX_DIFF_MAX_KEYS: usize = 20;
+pub const PREFIX_DIFF_MAX_KEYS: usize = 8;
 /// See the enclosing record's documentation.
-pub const PREFIX_DIFF_MAX_MESSAGE_CHARS: usize = 2000;
+pub const PREFIX_DIFF_MAX_MESSAGE_CHARS: usize = 4000;
 /// See the enclosing record's documentation.
-pub const PREFIX_DIFF_CONTEXT_CHARS: usize = 40;
+pub const PREFIX_DIFF_CONTEXT_CHARS: usize = 24;
 /// See the enclosing record's documentation.
 pub const PREFIX_DIFF_EXCERPT_CHARS: usize = 160;
 /// See the enclosing record's documentation.
-pub const PREFIX_DIFF_MAX_JSON_CHARS: usize = 65_536;
+pub const PREFIX_DIFF_MAX_JSON_CHARS: usize = 1_000_000;
 /// See the enclosing record's documentation.
-pub const PREFIX_DIFF_MAX_JSON_PATHS: usize = 12;
+pub const PREFIX_DIFF_MAX_JSON_PATHS: usize = 8;
 /// See the enclosing record's documentation.
-pub const PREFIX_DIFF_MAX_JSON_DEPTH: usize = 16;
+pub const PREFIX_DIFF_MAX_JSON_DEPTH: usize = 6;
 
 /// Discovery output: what to snapshot, against what prior.
 pub struct DiscoveryPlan {
