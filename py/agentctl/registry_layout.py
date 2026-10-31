@@ -535,6 +535,24 @@ def _legacy_agents(registry: Path) -> tuple[list[str], list[str]]:
     return [name for name in legacy_names(registry) if name not in strays], strays
 
 
+
+def nested_agents_registry(registry: Path) -> Path | None:
+    """The layout-2 registry this path nests inside, if it is that registry\'s ``agents/`` dir.
+
+    Pointing a registry at ``REGISTRY/agents`` makes every agent look like a
+    layout-1 agent of a registry rooted there, so a migration would move each
+    agent into ``agents/agents/<name>`` and empty the real registry. Refuse:
+    the parent is a registry when it holds the layout sentinel, the renames
+    tripwire, or the fixed registry files.
+    """
+    if registry.name != AGENTS:
+        return None
+    parent = registry.parent
+    markers = (parent / AGENTS / TRIPWIRE, parent / ".renames" / RENAMES_TRIPWIRE,
+               parent / "profiles.json", parent / "coordinator.json")
+    return parent if any(marker.exists() for marker in markers) else None
+
+
 def migrate(registry: Path, *, apply: bool, wait: float) -> dict[str, object]:
     """Move every idle layout-1 agent to layout 2; without ``apply``, only report. Idempotent.
 
@@ -546,6 +564,11 @@ def migrate(registry: Path, *, apply: bool, wait: float) -> dict[str, object]:
         "registry": str(registry), "apply": apply,
         "legacy_support_ends": LEGACY_SUPPORT_ENDS, "removal_issue": REMOVAL_ISSUE,
     }
+    nested = nested_agents_registry(registry)
+    if nested is not None:
+        raise AgentDeliveryError(
+            f"{registry} is the agents/ subdirectory of the registry at {nested}; "
+            "refusing to migrate a registry nested inside another registry")
     if not registry.exists():
         report.update({"layout_before": "empty", "layout": "empty", moved_key: [], "left": [],
                        "conflicts": [], "strays": [], removed_key: 0, "kept_lock_files": []})
@@ -647,6 +670,6 @@ __all__ = [
     "AGENTS", "AUTO_MIGRATE_VARIABLE", "CURRENT", "FIXED_LOCK_STEMS", "LEGACY", "LEGACY_SUPPORT_ENDS",
     "BRIDGES", "LOCKS", "REMOVAL_ISSUE", "RENAMES_TRIPWIRE", "RENAMES_TRIPWIRE_TEXT", "RESERVED_NAMES", "TRIPWIRE", "TRIPWIRE_TEXT", "agents_directory",
     "auto_migrate", "current_directory", "current_names", "directory", "directory_at", "is_agent_name",
-    "is_tripwire", "legacy_directory", "legacy_lock_files", "legacy_names", "locate", "lock_paths",
+    "is_tripwire", "legacy_directory", "nested_agents_registry", "legacy_lock_files", "legacy_names", "locate", "lock_paths",
     "lock_still_current", "locks_directory", "migrate", "names", "notice", "prepare", "prepare_locks", "record_directories", "stray_names",
 ]

@@ -27,7 +27,7 @@
 
 use std::fs::{self, File};
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -352,6 +352,23 @@ fn legacy_agents(registry: &Path) -> Result<(Vec<String>, Vec<String>)> {
     Ok((agents, strays))
 }
 
+/// The layout-2 registry this path nests inside, if it is that registry's `agents/` dir.
+/// Pointing a registry at `REGISTRY/agents` makes every agent look like a layout-1 agent
+/// of a registry rooted there; migrating would move each into `agents/agents/<name>`.
+fn nested_agents_registry(registry: &Path) -> Option<PathBuf> {
+    if registry.file_name().and_then(|name| name.to_str()) != Some(registry::AGENTS) {
+        return None;
+    }
+    let parent = registry.parent()?;
+    let markers = [
+        parent.join(registry::AGENTS).join(registry::TRIPWIRE),
+        parent.join(".renames").join(registry::RENAMES_TRIPWIRE),
+        parent.join("profiles.json"),
+        parent.join("coordinator.json"),
+    ];
+    markers.iter().any(|marker| marker.exists()).then(|| parent.to_path_buf())
+}
+
 /// Move every layout-1 agent of `registry` to layout 2 and delete the layout-1 lock files
 /// nobody holds; with `apply` off, only report. Running it again does nothing more.
 ///
@@ -365,6 +382,7 @@ fn legacy_agents(registry: &Path) -> Result<(Vec<String>, Vec<String>)> {
 /// # Errors
 ///
 /// The registry is unsafe or cannot be listed, or layout 2 cannot be prepared.
+
 pub fn migrate(registry: &Path, options: MigrateOptions) -> Result<Value> {
     let mut report = json!({
         "registry": registry.display().to_string(),
@@ -377,6 +395,13 @@ pub fn migrate(registry: &Path, options: MigrateOptions) -> Result<Value> {
     } else {
         ("would_move", "would_remove_lock_files")
     };
+    if let Some(nested) = nested_agents_registry(registry) {
+        return Err(fail(format!(
+            "{} is the agents/ subdirectory of the registry at {}; refusing to migrate a registry nested inside another registry",
+            registry.display(),
+            nested.display()
+        )));
+    }
     if !registry.exists() {
         report["layout_before"] = json!("empty");
         report["layout"] = json!("empty");
@@ -815,5 +840,20 @@ mod tests {
         migrate(&registry, APPLY).unwrap();
         assert!(!lock_still_current(&registry, "alpha", Location::Legacy, &file, &path).unwrap());
         fs::remove_dir_all(registry).unwrap();
+    }
+
+    #[test]
+    fn migrate_refuses_the_agents_subdirectory_of_a_layout_two_registry() {
+        // Regression 2026-10-31: REGISTRY=<registry>/agents nested the whole fleet.
+        let registry = scratch("nested-refusal");
+        let agents = registry.join("agents");
+        fs::create_dir(&agents).unwrap();
+        fs::write(agents.join("agent.json"), "\"sentinel\"").unwrap();
+        fs::create_dir(agents.join("lane-a")).unwrap();
+        let error = migrate(&agents, APPLY_NOW).unwrap_err();
+        assert!(error.to_string().contains("agents/ subdirectory"), "{error}");
+        assert!(agents.join("lane-a").is_dir());
+        assert!(!agents.join("agents").exists());
+        let _ = fs::remove_dir_all(&registry);
     }
 }

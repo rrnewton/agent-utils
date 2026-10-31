@@ -2907,3 +2907,18 @@ def test_a_stray_left_by_an_older_queue_writer_is_reported_not_moved(tmp_path: P
     (registry / "agents/agent.json").write_text('{"name": "agents"}', encoding="utf-8")
     with pytest.raises(AgentDeliveryError, match="named 'agents'"):
         registry_layout.prepare(registry)
+
+
+def test_layout_migration_refuses_agents_subdirectory_of_layout2_registry(tmp_path: Path) -> None:
+    """Regression 2026-10-31: REGISTRY=<registry>/agents nested the whole fleet."""
+    registry = tmp_path / "reg"
+    agents = registry / "agents"
+    agents.mkdir(parents=True)
+    (agents / "agent.json").write_text('"sentinel"')
+    (agents / "lane-a").mkdir()
+    with pytest.raises(AgentDeliveryError, match="agents/ subdirectory"):
+        registry_layout.migrate(agents, apply=True, wait=0)
+    assert (agents / "lane-a").is_dir()
+    assert not (agents / "agents").exists()
+    assert registry_layout.auto_migrate(agents) is None or "could not move" in (registry_layout.auto_migrate(agents) or "")
+    assert (agents / "lane-a").is_dir()
