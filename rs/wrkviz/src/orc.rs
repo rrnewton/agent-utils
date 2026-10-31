@@ -2191,6 +2191,31 @@ pub fn row_values(row: &rusqlite::Row<'_>) -> Vec<SqlValue> {
     values
 }
 
+/// Run a query, returning the raw SQLite error text.
+pub fn query_all_inner(
+    connection: &Connection,
+    sql: &str,
+    parameters: &[SqlValue],
+) -> Result<Vec<Vec<SqlValue>>, String> {
+    let mut statement = connection.prepare(sql).map_err(|error| error.to_string())?;
+    let params: Vec<&dyn rusqlite::ToSql> = parameters
+        .iter()
+        .map(|value| value as &dyn rusqlite::ToSql)
+        .collect();
+    let mut rows = statement
+        .query(params.as_slice())
+        .map_err(|error| error.to_string())?;
+    let mut out = Vec::new();
+    loop {
+        match rows.next() {
+            Ok(Some(row)) => out.push(row_values(row)),
+            Ok(None) => break,
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(out)
+}
+
 /// Run a query to completion, collecting rows.
 pub fn query_all(
     connection: &Connection,
@@ -3533,4 +3558,554 @@ pub fn validate_session_meta_extension(
         ));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------- task projections
+
+/// Frozen per-note enrichment evidence (schema 1).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TaskNoteEnrichment {
+    /// See the enclosing record's documentation.
+    pub note_id: i64,
+    /// See the enclosing record's documentation.
+    pub task_id: String,
+    /// See the enclosing record's documentation.
+    pub server_author: Option<String>,
+    /// See the enclosing record's documentation.
+    pub task_owner: Option<String>,
+    /// See the enclosing record's documentation.
+    pub title: String,
+}
+
+/// One frozen task note (schema 2 history).
+#[derive(Clone, Debug, PartialEq)]
+pub struct FrozenTaskNote {
+    /// See the enclosing record's documentation.
+    pub note_id: i64,
+    /// See the enclosing record's documentation.
+    pub task_id: String,
+    /// See the enclosing record's documentation.
+    pub content: String,
+    /// See the enclosing record's documentation.
+    pub created_at: String,
+    /// See the enclosing record's documentation.
+    pub server_author: Option<String>,
+    /// See the enclosing record's documentation.
+    pub task_owner: Option<String>,
+    /// See the enclosing record's documentation.
+    pub title: String,
+}
+
+impl FrozenTaskNote {
+    /// The schema-1 enrichment view of this note.
+    pub fn enrichment(&self) -> TaskNoteEnrichment {
+        TaskNoteEnrichment {
+            note_id: self.note_id,
+            task_id: self.task_id.clone(),
+            server_author: self.server_author.clone(),
+            task_owner: self.task_owner.clone(),
+            title: self.title.clone(),
+        }
+    }
+}
+
+/// One currently-visible task note.
+#[derive(Clone, Debug)]
+pub struct ObservedTaskNote {
+    /// See the enclosing record's documentation.
+    pub note_id: i64,
+    /// See the enclosing record's documentation.
+    pub task_id: String,
+    /// See the enclosing record's documentation.
+    pub content: String,
+    /// See the enclosing record's documentation.
+    pub created_at: String,
+    /// See the enclosing record's documentation.
+    pub server_author: Option<String>,
+    /// See the enclosing record's documentation.
+    pub task_owner: Option<String>,
+    /// See the enclosing record's documentation.
+    pub title: Option<String>,
+}
+
+/// Canonical schema-1 projection text.
+pub fn task_projection_text(records: &[TaskNoteEnrichment]) -> String {
+    let items: Vec<JsonValue> = records
+        .iter()
+        .map(|record| {
+            let mut item = Map::new();
+            item.insert("note_id".into(), JsonValue::from(record.note_id));
+            item.insert("task_id".into(), JsonValue::String(record.task_id.clone()));
+            item.insert(
+                "server_author".into(),
+                record
+                    .server_author
+                    .clone()
+                    .map_or(JsonValue::Null, JsonValue::String),
+            );
+            item.insert(
+                "task_owner".into(),
+                record
+                    .task_owner
+                    .clone()
+                    .map_or(JsonValue::Null, JsonValue::String),
+            );
+            item.insert("title".into(), JsonValue::String(record.title.clone()));
+            JsonValue::Object(item)
+        })
+        .collect();
+    let mut root = Map::new();
+    root.insert("schema_version".into(), JsonValue::from(1));
+    root.insert("records".into(), JsonValue::Array(items));
+    crate::json::dump_compact(&JsonValue::Object(root)) + "\n"
+}
+
+/// Canonical schema-2 frozen history text.
+pub fn frozen_task_projection_text(records: &[FrozenTaskNote]) -> String {
+    let items: Vec<JsonValue> = records
+        .iter()
+        .map(|record| {
+            let mut item = Map::new();
+            item.insert("note_id".into(), JsonValue::from(record.note_id));
+            item.insert("task_id".into(), JsonValue::String(record.task_id.clone()));
+            item.insert("content".into(), JsonValue::String(record.content.clone()));
+            item.insert(
+                "created_at".into(),
+                JsonValue::String(record.created_at.clone()),
+            );
+            item.insert(
+                "server_author".into(),
+                record
+                    .server_author
+                    .clone()
+                    .map_or(JsonValue::Null, JsonValue::String),
+            );
+            item.insert(
+                "task_owner".into(),
+                record
+                    .task_owner
+                    .clone()
+                    .map_or(JsonValue::Null, JsonValue::String),
+            );
+            item.insert("title".into(), JsonValue::String(record.title.clone()));
+            JsonValue::Object(item)
+        })
+        .collect();
+    let mut root = Map::new();
+    root.insert("schema_version".into(), JsonValue::from(2));
+    root.insert("records".into(), JsonValue::Array(items));
+    crate::json::dump_compact(&JsonValue::Object(root)) + "\n"
+}
+
+/// A task database's enrichment records and their digest.
+pub struct TaskEnrichmentObservation {
+    /// See the enclosing record's documentation.
+    pub records: Vec<TaskNoteEnrichment>,
+    /// See the enclosing record's documentation.
+    pub sha256: String,
+}
+
+/// Observe a task database's enrichment.
+pub fn task_enrichment_observation(path: &Path) -> Result<TaskEnrichmentObservation, String> {
+    let connection = read_only(path)?;
+    let rows = query_all_inner(
+        &connection,
+        "SELECT n.id, n.task_id, n.author_unixname, t.owner, t.title \
+         FROM task_notes n LEFT JOIN tasks t ON t.local_id = n.task_id \
+         ORDER BY n.id",
+        &[],
+    )
+    .map_err(|error| format!("failed to inspect Orc tasks at {}: {error}", path.display()))?;
+    drop(connection);
+    let mut records = Vec::new();
+    let mut seen: Vec<i64> = Vec::new();
+    for row in &rows {
+        let cell = |i: usize| row.get(i).cloned().unwrap_or(SqlValue::Null);
+        let note_id = cell_nonnegative(&cell(0), &format!("{}: note id", path.display()))?;
+        let record = TaskNoteEnrichment {
+            note_id,
+            task_id: cell_string(&cell(1), &format!("{}: note task_id", path.display()))?,
+            server_author: cell_optional_string(
+                &cell(2),
+                &format!("{}: note author", path.display()),
+            )?,
+            task_owner: cell_optional_string(&cell(3), &format!("{}: task owner", path.display()))?,
+            title: cell_string(&cell(4), &format!("{}: task title", path.display()))?,
+        };
+        if seen.contains(&note_id) {
+            return Err(format!(
+                "{}: duplicate task note id {note_id}",
+                path.display()
+            ));
+        }
+        seen.push(note_id);
+        records.push(record);
+    }
+    let digest = sha256_hex(task_projection_text(&records).as_bytes());
+    Ok(TaskEnrichmentObservation {
+        records,
+        sha256: digest,
+    })
+}
+
+/// Every currently-visible note in a task database.
+pub fn observed_task_notes(path: &Path) -> Result<Vec<ObservedTaskNote>, String> {
+    let connection = read_only(path)?;
+    let rows = query_all_inner(
+        &connection,
+        "SELECT n.id, n.task_id, n.content, n.created_at, n.author_unixname, \
+         t.owner, t.title FROM task_notes n LEFT JOIN tasks t \
+         ON t.local_id = n.task_id ORDER BY n.id",
+        &[],
+    )
+    .map_err(|error| format!("failed to inspect Orc tasks at {}: {error}", path.display()))?;
+    drop(connection);
+    let mut records = Vec::new();
+    for row in &rows {
+        let cell = |i: usize| row.get(i).cloned().unwrap_or(SqlValue::Null);
+        records.push(ObservedTaskNote {
+            note_id: cell_nonnegative(&cell(0), &format!("{}: note id", path.display()))?,
+            task_id: cell_string(&cell(1), &format!("{}: note task_id", path.display()))?,
+            content: cell_text(&cell(2), &format!("{}: note content", path.display()))?,
+            created_at: cell_string(&cell(3), &format!("{}: note created_at", path.display()))?,
+            server_author: cell_optional_string(
+                &cell(4),
+                &format!("{}: note author", path.display()),
+            )?,
+            task_owner: cell_optional_string(&cell(5), &format!("{}: task owner", path.display()))?,
+            title: cell_optional_string(&cell(6), &format!("{}: task title", path.display()))?,
+        });
+    }
+    if {
+        let mut ids: Vec<i64> = records.iter().map(|record| record.note_id).collect();
+        ids.sort();
+        ids.dedup();
+        ids.len()
+    } != records.len()
+    {
+        return Err(format!("{}: duplicate task note id", path.display()));
+    }
+    Ok(records)
+}
+
+/// Orc's durable task-note allocation high-water mark.
+pub fn task_note_sequence(path: &Path) -> Result<i64, String> {
+    let connection = read_only(path)?;
+    let outcome: Result<i64, String> = (|| {
+        let tables = table_names(&connection, &path.display().to_string())?;
+        if tables.iter().any(|held| held == "sqlite_sequence") {
+            let rows = query_all_inner(
+                &connection,
+                "SELECT seq FROM sqlite_sequence WHERE name = 'task_notes'",
+                &[],
+            )?;
+            if let Some(row) = rows.first() {
+                return cell_nonnegative(
+                    row.first().unwrap_or(&SqlValue::Null),
+                    &format!("{}: task note sequence", path.display()),
+                );
+            }
+        }
+        let row = query_one(
+            &connection,
+            "SELECT COALESCE(MAX(id), 0) FROM task_notes",
+            &path.display().to_string(),
+        )?;
+        cell_nonnegative(
+            row.first().unwrap_or(&SqlValue::Null),
+            &format!("{}: task note highwater", path.display()),
+        )
+    })();
+    drop(connection);
+    outcome.map_err(|error| {
+        if error.contains(": task note") || error.contains("expected one row") {
+            error
+        } else {
+            format!(
+                "failed to inspect Orc task-note sequence at {}: {error}",
+                path.display()
+            )
+        }
+    })
+}
+
+fn read_projection_text(
+    snapshot_root: &Path,
+    status: &TaskProjection,
+) -> Result<(PathBuf, String), String> {
+    let path = snapshot_path(snapshot_root, &status.path)?;
+    let is_symlink = std::fs::symlink_metadata(&path)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false);
+    if is_symlink || !path.is_file() {
+        return Err(format!(
+            "task projection is missing or unsafe: {}",
+            path.display()
+        ));
+    }
+    let data = std::fs::read(&path).map_err(|error| crate::json::os_error(&error, &path))?;
+    let text = String::from_utf8(data).map_err(|error| {
+        format!(
+            "'utf-8' codec can't decode bytes from {}: {error}",
+            path.display()
+        )
+    })?;
+    if sha256_hex(text.as_bytes()) != status.sha256 {
+        return Err(format!("task projection hash mismatch: {}", path.display()));
+    }
+    Ok((path, text))
+}
+
+fn parse_projection_records(
+    path: &Path,
+    text: &str,
+    schema: i64,
+    frozen: bool,
+) -> Result<Vec<JsonValue>, String> {
+    let parsed: JsonValue = serde_json::from_str(text).map_err(|error| {
+        format!(
+            "invalid task projection JSON at {}: {error}",
+            path.display()
+        )
+    })?;
+    let root = parsed
+        .as_object()
+        .ok_or_else(|| format!("{}: expected an object", path.display()))?;
+    require_exact_keys(
+        root,
+        &["schema_version", "records"],
+        &path.display().to_string(),
+    )?;
+    if root.get("schema_version").and_then(JsonValue::as_i64) != Some(schema) {
+        return Err(if frozen {
+            format!(
+                "unsupported frozen task projection schema at {}",
+                path.display()
+            )
+        } else {
+            format!("unsupported task projection schema at {}", path.display())
+        });
+    }
+    match root.get("records") {
+        Some(JsonValue::Array(items)) => Ok(items.clone()),
+        _ => Err(format!("{}.records: expected an array", path.display())),
+    }
+}
+
+/// Load and authenticate a schema-1 task projection.
+pub fn load_legacy_task_projection(
+    snapshot_root: &Path,
+    status: &TaskProjection,
+) -> Result<Vec<TaskNoteEnrichment>, String> {
+    let (path, raw_text) = read_projection_text(snapshot_root, status)?;
+    let items = parse_projection_records(&path, &raw_text, 1, false)?;
+    let mut records = Vec::new();
+    let mut prior_id = -1i64;
+    for (index, raw_record) in items.iter().enumerate() {
+        let held = format!("{}.records[{index}]", path.display());
+        let obj = mapping(Some(raw_record), &held)?;
+        require_exact_keys(
+            obj,
+            &["note_id", "task_id", "server_author", "task_owner", "title"],
+            &held,
+        )?;
+        let record = TaskNoteEnrichment {
+            note_id: nonnegative_integer(obj.get("note_id"), &format!("{held}.note_id"))?,
+            task_id: required_string(obj.get("task_id"), &format!("{held}.task_id"))?,
+            server_author: optional_string(
+                obj.get("server_author"),
+                &format!("{held}.server_author"),
+            )?,
+            task_owner: optional_string(obj.get("task_owner"), &format!("{held}.task_owner"))?,
+            title: required_string(obj.get("title"), &format!("{held}.title"))?,
+        };
+        if record.note_id <= prior_id {
+            return Err(format!(
+                "task projection note IDs are not strictly ordered: {}",
+                path.display()
+            ));
+        }
+        prior_id = record.note_id;
+        records.push(record);
+    }
+    if records.len() as i64 != status.note_count {
+        return Err(format!(
+            "task projection count mismatch: {}",
+            path.display()
+        ));
+    }
+    if task_projection_text(&records) != raw_text {
+        return Err(format!(
+            "task projection is not canonical: {}",
+            path.display()
+        ));
+    }
+    Ok(records)
+}
+
+/// Load and authenticate a schema-2 frozen task history.
+pub fn load_frozen_task_projection(
+    snapshot_root: &Path,
+    status: &TaskProjection,
+) -> Result<Vec<FrozenTaskNote>, String> {
+    let (path, raw_text) = read_projection_text(snapshot_root, status)?;
+    let items = parse_projection_records(&path, &raw_text, 2, true)?;
+    let mut records = Vec::new();
+    let mut prior_id = -1i64;
+    for (index, raw_record) in items.iter().enumerate() {
+        let held = format!("{}.records[{index}]", path.display());
+        let obj = mapping(Some(raw_record), &held)?;
+        require_exact_keys(
+            obj,
+            &[
+                "note_id",
+                "task_id",
+                "content",
+                "created_at",
+                "server_author",
+                "task_owner",
+                "title",
+            ],
+            &held,
+        )?;
+        let record = FrozenTaskNote {
+            note_id: nonnegative_integer(obj.get("note_id"), &format!("{held}.note_id"))?,
+            task_id: required_string(obj.get("task_id"), &format!("{held}.task_id"))?,
+            content: string_value(obj.get("content"), &format!("{held}.content"))?,
+            created_at: required_string(obj.get("created_at"), &format!("{held}.created_at"))?,
+            server_author: optional_string(
+                obj.get("server_author"),
+                &format!("{held}.server_author"),
+            )?,
+            task_owner: optional_string(obj.get("task_owner"), &format!("{held}.task_owner"))?,
+            title: required_string(obj.get("title"), &format!("{held}.title"))?,
+        };
+        if record.note_id <= prior_id {
+            return Err(format!(
+                "task projection note IDs are not strictly ordered: {}",
+                path.display()
+            ));
+        }
+        prior_id = record.note_id;
+        records.push(record);
+    }
+    if records.len() as i64 != status.note_count
+        || frozen_task_projection_text(&records) != raw_text
+    {
+        return Err(format!(
+            "frozen task projection mismatch: {}",
+            path.display()
+        ));
+    }
+    Ok(records)
+}
+
+/// Freeze one currently-visible note.
+pub fn freeze_current_task_note(
+    record: &ObservedTaskNote,
+    relative: &str,
+) -> Result<FrozenTaskNote, String> {
+    let Some(title) = &record.title else {
+        return Err(format!(
+            "new task note {} lacks its task row in {relative}",
+            record.note_id
+        ));
+    };
+    Ok(FrozenTaskNote {
+        note_id: record.note_id,
+        task_id: record.task_id.clone(),
+        content: record.content.clone(),
+        created_at: record.created_at.clone(),
+        server_author: record.server_author.clone(),
+        task_owner: record.task_owner.clone(),
+        title: title.clone(),
+    })
+}
+
+/// Load v3 history or upgrade one older projection.
+pub fn bootstrap_frozen_task_projection(
+    snapshot_root: &Path,
+    source: &SourceCopy,
+    source_path: &Path,
+) -> Result<Vec<FrozenTaskNote>, String> {
+    if let Some(projection) = &source.task_projection {
+        if projection.policy == TASK_HISTORY_POLICY {
+            return load_frozen_task_projection(snapshot_root, projection);
+        }
+    }
+    let observed = observed_task_notes(source_path)?;
+    let Some(projection) = &source.task_projection else {
+        let mut frozen = Vec::new();
+        for record in &observed {
+            frozen.push(freeze_current_task_note(record, &source.source_path)?);
+        }
+        return Ok(frozen);
+    };
+    let enrichments = load_legacy_task_projection(snapshot_root, projection)?;
+    if observed.len() != enrichments.len() {
+        return Err(format!(
+            "legacy task projection count does not match its snapshot for {}",
+            source.source_path
+        ));
+    }
+    let mut frozen = Vec::new();
+    for record in &observed {
+        let enrichment = enrichments
+            .iter()
+            .find(|held| held.note_id == record.note_id);
+        match enrichment {
+            Some(enrichment) if enrichment.task_id == record.task_id => {
+                frozen.push(FrozenTaskNote {
+                    note_id: record.note_id,
+                    task_id: record.task_id.clone(),
+                    content: record.content.clone(),
+                    created_at: record.created_at.clone(),
+                    server_author: enrichment.server_author.clone(),
+                    task_owner: enrichment.task_owner.clone(),
+                    title: enrichment.title.clone(),
+                });
+            }
+            _ => {
+                return Err(format!(
+                    "legacy task projection does not match note {} in {}",
+                    record.note_id, source.source_path
+                ));
+            }
+        }
+    }
+    Ok(frozen)
+}
+
+/// Digest of frozen records' enrichment view.
+pub fn task_enrichment_sha256(records: &[FrozenTaskNote]) -> String {
+    let enrichments: Vec<TaskNoteEnrichment> =
+        records.iter().map(FrozenTaskNote::enrichment).collect();
+    sha256_hex(task_projection_text(&enrichments).as_bytes())
+}
+
+/// Write a frozen history under `.staging` and return
+/// (temporary, target, digest, relative path).
+pub fn stage_task_projection(
+    records: &[FrozenTaskNote],
+    snapshot_root: &Path,
+) -> Result<(PathBuf, PathBuf, String, String), String> {
+    let text = frozen_task_projection_text(records);
+    let digest = sha256_hex(text.as_bytes());
+    let relative = task_projection_relative(&digest)?;
+    let target = snapshot_path(snapshot_root, &relative)?;
+    let token = format!(
+        "{:016x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|held| held.as_nanos() as u64)
+            .unwrap_or(0)
+    );
+    let temporary = snapshot_root.join(".staging").join(format!(
+        "task-projection-{}-{token}.json",
+        std::process::id()
+    ));
+    ensure_snapshot_parent(&temporary, snapshot_root)?;
+    std::fs::write(&temporary, text.as_bytes())
+        .map_err(|error| crate::json::os_error(&error, &temporary))?;
+    Ok((temporary, target, digest, relative))
 }
