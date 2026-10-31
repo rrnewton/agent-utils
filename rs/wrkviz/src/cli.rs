@@ -4600,6 +4600,7 @@ fn run_inspect(args: &[String]) -> u8 {
 const SUMMARIZE_USAGE: &str = "usage: wrkviz summarize [-h] --output OUTPUT --team TEAM\n                        [--backend {codex,claude,heuristic}] [--model MODEL]\n                        [--reasoning-effort REASONING_EFFORT]\n                        [--service-tier SERVICE_TIER]\n                        [--summary-workers SUMMARY_WORKERS]\n                        [--summary-batch-size SUMMARY_BATCH_SIZE]\n                        [--name-batch-size NAME_BATCH_SIZE]\n                        [--phase-minutes PHASE_MINUTES]\n                        [--context-chars CONTEXT_CHARS]\n                        [--transcript-chars TRANSCRIPT_CHARS]\n                        [--codex-command CODEX_COMMAND]\n                        [--claude-command CLAUDE_COMMAND]\n                        [--summary-start-date SUMMARY_START_DATE | --summary-start-time SUMMARY_START_TIME]\n                        [--summary-end-date SUMMARY_END_DATE | --summary-end-time SUMMARY_END_TIME]\n                        [--summary-timezone SUMMARY_TIMEZONE]\n                        [--rollup-kind {hourly,daily,weekly,monthly,quarterly}]\n                        [--budget-usd USD] [--price RATES] [--plan]";
 
 fn run_summarize(args: &[String]) -> u8 {
+    crate::summarize_core::install_interrupt_handler();
     if args
         .iter()
         .any(|arg| arg == "--help" || arg == "-h")
@@ -4641,21 +4642,7 @@ fn run_summarize(args: &[String]) -> u8 {
             Some((head, value)) => (head, Some(value.to_string())),
             None => (arg.as_str(), None),
         };
-        if head == "--plan"
-            || (head.len() > 2 && head.starts_with("--") && "--plan".starts_with(head))
-        {
-            if explicit.is_some() {
-                return argparse_error(
-                    SUMMARIZE_USAGE,
-                    "wrkviz summarize",
-                    &format!("argument --plan: ignored explicit argument {explicit:?}"),
-                );
-            }
-            plan = true;
-            index += 1;
-            continue;
-        }
-        let matched: Vec<&str> = VALUE_OPTIONS
+        let mut candidates: Vec<&str> = VALUE_OPTIONS
             .iter()
             .copied()
             .filter(|name| {
@@ -4663,16 +4650,39 @@ fn run_summarize(args: &[String]) -> u8 {
                     || (head.len() > 2 && head.starts_with("--") && name.starts_with(head))
             })
             .collect();
-        if matched.len() > 1 {
+        if head == "--plan"
+            || (head.len() > 2 && head.starts_with("--") && "--plan".starts_with(head))
+        {
+            candidates.push("--plan");
+        }
+        if candidates.len() > 1 && !candidates.contains(&head) {
             return argparse_error(
                 SUMMARIZE_USAGE,
                 "wrkviz summarize",
                 &format!(
                     "ambiguous option: {head} could match {}",
-                    matched.join(", ")
+                    candidates.join(", ")
                 ),
             );
         }
+        let plan_selected = candidates.contains(&"--plan")
+            && !VALUE_OPTIONS.contains(&head);
+        if plan_selected {
+            if let Some(value) = &explicit {
+                return argparse_error(
+                    SUMMARIZE_USAGE,
+                    "wrkviz summarize",
+                    &format!("argument --plan: ignored explicit argument '{value}'"),
+                );
+            }
+            plan = true;
+            index += 1;
+            continue;
+        }
+        let matched: Vec<&str> = candidates
+            .into_iter()
+            .filter(|name| *name != "--plan")
+            .collect();
         let Some(name) = matched.first() else {
             return argparse_error(
                 SUMMARIZE_USAGE,
@@ -4987,6 +4997,27 @@ fn run_summarize(args: &[String]) -> u8 {
             }
         }
         Err((error, is_budget)) => {
+            if crate::summarize_core::interrupted() {
+                let interruption = "interrupted by user";
+                if let Ok(run_path) = crate::pipeline::record_run_summaries(
+                    &archive,
+                    &crate::pipeline::RunReceipt {
+                        command: &command,
+                        started_at: &started,
+                        status: "interrupted",
+                        team_slug: &team_slug,
+                        error: Some(interruption),
+                        team_slugs: &[],
+                        mechanical: None,
+                        ingest: None,
+                    },
+                    None,
+                ) {
+                    eprintln!("run metadata: {}", run_path.display());
+                }
+                eprintln!("wrkviz: {interruption}");
+                return 130;
+            }
             if plan && error.is_empty() && is_budget {
                 return 3;
             }

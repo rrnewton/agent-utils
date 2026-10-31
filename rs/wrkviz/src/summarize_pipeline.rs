@@ -2042,6 +2042,8 @@ pub enum SummarizeFailure {
     BudgetExceeded(String),
     /// Budget reached mid-run (exit 3).
     BudgetStop(String),
+    /// Interrupted by SIGINT (exit 130).
+    Interrupted,
 }
 
 impl SummarizeFailure {
@@ -2049,6 +2051,7 @@ impl SummarizeFailure {
     pub fn message(&self) -> &str {
         match self {
             Self::Message(text) | Self::BudgetExceeded(text) | Self::BudgetStop(text) => text,
+            Self::Interrupted => "interrupted by user",
         }
     }
 
@@ -2059,7 +2062,9 @@ impl SummarizeFailure {
 }
 
 fn classify_error(error: String) -> SummarizeFailure {
-    if error.starts_with("budget reached:") {
+    if crate::summarize_core::interrupted() {
+        SummarizeFailure::Interrupted
+    } else if error.starts_with("budget reached:") {
         SummarizeFailure::BudgetStop(error)
     } else {
         SummarizeFailure::Message(error)
@@ -2432,7 +2437,9 @@ fn summarize_archive_locked(
         }
         Err(error) => {
             let failure = classify_error(error.clone());
-            let reason = if failure.is_budget() && error.starts_with("budget reached:") {
+            let reason = if matches!(failure, SummarizeFailure::Interrupted) {
+                "interrupted"
+            } else if failure.is_budget() && error.starts_with("budget reached:") {
                 "budget"
             } else {
                 "error"
@@ -2454,7 +2461,11 @@ fn summarize_archive_locked(
             );
             stopped.insert(
                 "detail".into(),
-                Value::String(char_take(&one_line(&error), 500)),
+                Value::String(if matches!(failure, SummarizeFailure::Interrupted) {
+                    String::new()
+                } else {
+                    char_take(&one_line(&error), 500)
+                }),
             );
             state.insert("stopped".into(), Value::Object(stopped));
             let _ = write_state(&summary_root, &state);

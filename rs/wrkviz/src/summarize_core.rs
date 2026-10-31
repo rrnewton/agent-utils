@@ -256,10 +256,10 @@ type BatchOutcome = (
     Option<String>,
 );
 
-struct BatchFailure {
-    message: String,
-    usage: Option<TokenUsage>,
-    backend_output: Option<String>,
+pub(crate) struct BatchFailure {
+    pub(crate) message: String,
+    pub(crate) usage: Option<TokenUsage>,
+    pub(crate) backend_output: Option<String>,
 }
 
 impl BatchFailure {
@@ -300,7 +300,6 @@ pub fn validate_job(job: &SummaryJob) -> Result<(), String> {
         TECHNICAL_ROLLUP_STYLE,
         PLAIN_LANGUAGE_ROLLUP_STYLE,
         PROJECT_OVERVIEW_STYLE,
-        GLOSSARY_DEFINITION_STYLE,
     ];
     if !styles.contains(&job.summary_style.as_str()) {
         return Err(format!(
@@ -903,7 +902,7 @@ pub fn build_summary_prompt(jobs: &[SummaryJob]) -> Result<String, String> {
     Ok(format!(
         "{common}{audience}Prompt version: {}\nBEGIN_JOBS_JSON\n{}END_JOBS_JSON\n",
         prompt_version(&jobs[0])?,
-        dump_compact(&payload)
+        dump_canonical(&payload)
     ))
 }
 
@@ -1771,11 +1770,59 @@ pub(crate) struct CompletedProcess {
     pub(crate) stderr: String,
 }
 
+static BACKEND_GROUPS: std::sync::Mutex<std::collections::BTreeSet<i32>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+static INTERRUPTED: std::sync::LazyLock<
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+> = std::sync::LazyLock::new(|| {
+    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))
+});
+
+/// Whether SIGINT has interrupted this process.
+pub fn interrupted() -> bool {
+    INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Terminate every registered backend process group.
+pub fn terminate_backend_processes() {
+    let groups: Vec<i32> = BACKEND_GROUPS
+        .lock()
+        .map(|set| set.iter().copied().collect())
+        .unwrap_or_default();
+    for group in groups {
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", &format!("-{group}")])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
+
+/// Install the SIGINT flag that terminates backend process groups.
+///
+/// A watcher thread performs the termination so no unsafe signal
+/// handler is needed: SIGINT sets the flag, the watcher kills the
+/// registered groups, and the blocked backend calls then fail, which
+/// the CLI reports as an interrupted run (exit 130).
+pub fn install_interrupt_handler() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = signal_hook::flag::register(libc::SIGINT, INTERRUPTED.clone());
+        std::thread::spawn(|| loop {
+            if INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
+                terminate_backend_processes();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        });
+    });
+}
+
 pub(crate) fn run_process(
     command: &[String],
     input_text: &str,
     cwd: &Path,
 ) -> Result<CompletedProcess, std::io::Error> {
+    use std::os::unix::process::CommandExt as _;
     use std::process::{Command, Stdio};
     let mut child = Command::new(&command[0])
         .args(&command[1..])
@@ -1783,11 +1830,20 @@ pub(crate) fn run_process(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .current_dir(cwd)
+        .process_group(0)
         .spawn()?;
+    let group = child.id() as i32;
+    if let Ok(mut set) = BACKEND_GROUPS.lock() {
+        set.insert(group);
+    }
     if let Some(stdin) = child.stdin.as_mut() {
         let _ = stdin.write_all(input_text.as_bytes());
     }
-    let output = child.wait_with_output()?;
+    let output = child.wait_with_output();
+    if let Ok(mut set) = BACKEND_GROUPS.lock() {
+        set.remove(&group);
+    }
+    let output = output?;
     Ok(CompletedProcess {
         returncode: output.status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -2009,9 +2065,9 @@ fn codex_batch(
     }
 }
 
-struct ClaudeResult {
-    output: String,
-    usage: TokenUsage,
+pub(crate) struct ClaudeResult {
+    pub(crate) output: String,
+    pub(crate) usage: TokenUsage,
 }
 
 fn claude_failure_detail(root: Option<&Value>, stderr: &str) -> String {
@@ -2032,7 +2088,7 @@ fn claude_failure_detail(root: Option<&Value>, stderr: &str) -> String {
     char_take(&detail, 500).trim_end().to_string()
 }
 
-fn run_claude_json(
+pub(crate) fn run_claude_json(
     command: &[String],
     prompt: &str,
     model: &str,
@@ -2058,7 +2114,7 @@ fn run_claude_json(
     ] {
         args.push(arg.into());
     }
-    args.push(py_trim(&dump_compact(&Value::Object(schema))).to_string());
+    args.push(py_dumps_compact(&Value::Object(schema)));
     for arg in ["--model", model, "--safe-mode", "--no-session-persistence", "--permission-mode", "dontAsk", "--tools", ""] {
         args.push(arg.into());
     }
@@ -2153,7 +2209,7 @@ fn run_claude_json(
         }
     };
     Ok(ClaudeResult {
-        output: dump_compact(&structured),
+        output: dump_canonical(&structured),
         usage,
     })
 }
@@ -2186,6 +2242,30 @@ fn claude_batch(
             usage: Some(result.usage),
             backend_output: Some(result.output),
         }),
+    }
+}
+
+/// CPython `json.dumps` with default separators (`, ` and `: `).
+pub(crate) fn py_dumps_compact(value: &Value) -> String {
+    match value {
+        Value::Object(map) => {
+            let items: Vec<String> = map
+                .iter()
+                .map(|(key, item)| {
+                    format!(
+                        "{}: {}",
+                        serde_json::to_string(key).unwrap_or_default(),
+                        py_dumps_compact(item)
+                    )
+                })
+                .collect();
+            format!("{{{}}}", items.join(", "))
+        }
+        Value::Array(items) => {
+            let rendered: Vec<String> = items.iter().map(py_dumps_compact).collect();
+            format!("[{}]", rendered.join(", "))
+        }
+        other => dump_compact(other),
     }
 }
 
@@ -2597,28 +2677,51 @@ pub fn summarize_jobs(
             )?;
         }
     } else if !batches.is_empty() {
-        // Run batches concurrently; publish and retry sequentially.
-        let outcomes: Vec<Result<GeneratedBatch, BatchFailure>> = std::thread::scope(|scope| {
-            let handles: Vec<_> = batches
-                .iter()
-                .map(|batch| {
-                    let batch = batch.clone();
-                    scope.spawn(move || run_one(&batch))
-                })
-                .collect();
-            handles
+        // Run batches on a bounded pool (max_workers), cancelling
+        // queued batches after the first fatal error; publish and
+        // retry sequentially, as the Python executor loop does.
+        let outcomes: Vec<Option<Result<GeneratedBatch, BatchFailure>>> = {
+            let slots: Vec<std::sync::Mutex<Option<Result<GeneratedBatch, BatchFailure>>>> =
+                batches.iter().map(|_| std::sync::Mutex::new(None)).collect();
+            let next_index = std::sync::atomic::AtomicUsize::new(0);
+            let stop = std::sync::atomic::AtomicBool::new(false);
+            std::thread::scope(|scope| {
+                for _ in 0..max_workers.min(batches.len().max(1)) {
+                    scope.spawn(|| loop {
+                        if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                            break;
+                        }
+                        let index = next_index
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if index >= batches.len() {
+                            break;
+                        }
+                        let result = run_one(&batches[index]);
+                        if let Err(error) = &result {
+                            let retryable = error.message.starts_with(
+                                "codex output: missing summaries for ",
+                            ) || error.message.starts_with(
+                                "codex output: summaries under invented keys ",
+                            );
+                            if !retryable && error.message != "__budget_refusal__" {
+                                stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                            }
+                        }
+                        *slots[index].lock().unwrap() = Some(result);
+                    });
+                }
+            });
+            slots
                 .into_iter()
-                .map(|handle| {
-                    handle.join().unwrap_or_else(|_| {
-                        Err(BatchFailure::plain(
-                            "summary backend failed: thread panicked".to_string(),
-                        ))
-                    })
-                })
+                .map(|slot| slot.into_inner().unwrap())
                 .collect()
-        });
+        };
         let mut retried_alone: BTreeSet<String> = BTreeSet::new();
         for (batch, outcome) in batches.iter().zip(outcomes) {
+            let Some(outcome) = outcome else {
+                // Cancelled after the first fatal error elsewhere.
+                continue;
+            };
             match outcome {
                 Ok(batch_result) => publish(
                     batch,
@@ -2654,21 +2757,13 @@ pub fn summarize_jobs(
                                             refused_jobs += 1;
                                             continue;
                                         }
-                                        // One more attempt for a one-job batch.
-                                        match run_one(&single) {
-                                            Ok(batch_result) => publish(
-                                                &single,
-                                                &batch_result,
-                                                &mut generated,
-                                                &mut generated_receipt_by_key,
-                                                &mut new_receipts,
-                                            )?,
-                                            Err(final_error) => {
-                                                if first_error.is_none() {
-                                                    first_error = Some(final_error.message);
-                                                }
-                                            }
+                                        // The key is already marked
+                                        // retried-alone: fatal, and the
+                                        // remaining singles are cancelled.
+                                        if first_error.is_none() {
+                                            first_error = Some(single_error.message);
                                         }
+                                        break;
                                     }
                                 }
                             }

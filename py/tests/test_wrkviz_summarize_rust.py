@@ -466,3 +466,73 @@ def test_summarize_multi_agent(tmp_path: Path, rust_wrkviz: Path) -> None:
         if label == "rs":
             assert "agent names" in outcome.stdout
     assert _tree(archives["rs"]) == _tree(archives["py"])
+
+
+STATEFUL_CODEX = """#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+out_path = args[args.index("--output-last-message") + 1]
+prompt = sys.stdin.read()
+state_path = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    f"state-{os.getppid()}.json")
+try:
+    state = json.load(open(state_path))
+except Exception:
+    state = {"singles": {}}
+if "BEGIN_AGENT_NAME_JOBS_JSON" in prompt:
+    body = prompt.split("BEGIN_AGENT_NAME_JOBS_JSON" + chr(10), 1)[1].split(
+        "END_AGENT_NAME_JOBS_JSON", 1)[0]
+    jobs = json.loads(body)
+    result = {"names": [{
+        "key": job["key"], "thread_id": job["thread_id"],
+        "short_name": "Coordinator" if job["official_path"] == "/root"
+        else "Widget Worker",
+        "rationale": "Fake wrapper name.",
+        "lifetime_summary": "Built the widget parser and verified it.",
+    } for job in jobs]}
+else:
+    body = prompt.split("BEGIN_JOBS_JSON" + chr(10), 1)[1].split(
+        "END_JOBS_JSON", 1)[0]
+    jobs = json.loads(body)
+    if len(jobs) > 1:
+        jobs = jobs[1:]
+    elif jobs:
+        key = jobs[0]["key"]
+        state["singles"][key] = state["singles"].get(key, 0) + 1
+        if state["singles"][key] < 2:
+            jobs = []
+    summaries = []
+    for job in jobs:
+        if job.get("summary_style") == "project-overview":
+            summaries.append({
+                "key": job["key"], "phrase": "Project overview supported",
+                "paragraph": "The widget project builds a parser for "
+                             "widget files.",
+                "work_summary": []})
+        else:
+            summaries.append({
+                "key": job["key"], "phrase": "Built the widget parser",
+                "paragraph": "The widget parser was implemented and "
+                             "verified with tests.",
+                "work_summary": [{"at_ms": job["start_ms"],
+                                  "text": "Implemented the widget parser"}]})
+    result = {"summaries": summaries}
+with open(state_path, "w") as handle:
+    json.dump(state, handle)
+with open(out_path, "w") as handle:
+    json.dump(result, handle)
+print(json.dumps({"type": "turn.completed", "usage": {
+    "input_tokens": 100, "cached_input_tokens": 10,
+    "output_tokens": 40, "reasoning_output_tokens": 5}}))
+"""
+
+
+def test_summarize_retryable_split_is_fatal(
+    tmp_path: Path, rust_wrkviz: Path
+) -> None:
+    fake = _write_executable(tmp_path / "stateful-codex", STATEFUL_CODEX)
+    _compare(tmp_path, rust_wrkviz, [
+        "--backend", "codex", "--model", "fake-model",
+        "--codex-command", str(fake), "--summary-batch-size", "2",
+    ], expect=2)

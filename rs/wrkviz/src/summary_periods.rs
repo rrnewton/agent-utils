@@ -33,11 +33,20 @@ fn parse_zone(name: &str) -> Result<Tz, String> {
 }
 
 fn midnight(day: NaiveDate, zone: Tz) -> i64 {
+    use chrono::Offset as _;
     let naive = day.and_hms_opt(0, 0, 0).unwrap();
-    zone.from_local_datetime(&naive)
-        .single()
-        .map(|item| item.timestamp_millis())
-        .unwrap_or_else(|| naive.and_utc().timestamp_millis())
+    match zone.from_local_datetime(&naive) {
+        chrono::LocalResult::Single(item) => item.timestamp_millis(),
+        // Python ZoneInfo fold=0: the earlier instant.
+        chrono::LocalResult::Ambiguous(earlier, _) => earlier.timestamp_millis(),
+        // Midnight fell in a spring-forward gap: fold=0 applies the
+        // offset in effect before the transition.
+        chrono::LocalResult::None => {
+            let guess = naive.and_utc() - chrono::Duration::hours(24);
+            let offset = guess.with_timezone(&zone).offset().fix();
+            naive.and_utc().timestamp_millis() - offset.local_minus_utc() as i64 * 1000
+        }
+    }
 }
 
 fn day_of(ms: i64, zone: Tz) -> NaiveDate {
