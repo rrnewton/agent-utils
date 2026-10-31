@@ -34699,17 +34699,51 @@ def _cmd_audit(args: argparse.Namespace) -> int:
         or (
                 row["verdict"] == "BLOCKED"
                 and row.get("heartbeat_expired") is True
-                and (
-                row["owner_state"] not in ("live", "dead")
-                    or row["liveness_state"] not in ("alive", "dead")
-                    or row["cache_error"] is not None
-                    or row.get("cache_status") == "partial"
-                    or any(
-                    token in str(reason).lower()
+                and row["owner_state"] not in ("live", "dead")
+                and row["liveness_state"] not in ("alive", "dead")
+        )
+        # A cache-census failure also leaves the reclaim state undetermined
+        # when it is the only blocker: nothing proves live use, yet the
+        # unsized cache cannot be weighed. When liveness or the owner
+        # record proves a live lane, the BLOCKED verdict already answers
+        # the reclaim question and a bounded/failed cache census must not
+        # reclassify the slot as unknown (every large live target tree
+        # exhausts the census allowance; that is a sizing gap, reported
+        # per slot, not indeterminacy about reclaimability).
+        or (
+                row["verdict"] == "BLOCKED"
+                and row.get("heartbeat_expired") is True
+                and row["cache_error"] is not None
+                and row["liveness_state"] != "alive"
+                and row["owner_state"] != "live"
+        )
+        # The same applies to a partial (bounded) cache census: partial
+        # sizing cannot upgrade deletion eligibility, so the state stays
+        # undetermined until a complete census weighs the cache. With a
+        # live lane proven, the row is BLOCKED for that reason instead
+        # and the partial size is only a reporting gap.
+        or (
+                row["verdict"] == "BLOCKED"
+                and row.get("heartbeat_expired") is True
+                and row.get("cache_status") == "partial"
+                and row["liveness_state"] != "alive"
+                and row["owner_state"] != "live"
+        )
+        # A failed occupancy/process census is structural indeterminacy
+        # whatever the registry fields say: the removal authority relies
+        # on that scan to prove a slot unused, so its failure (not a
+        # finding of use) leaves the reclaim state undetermined. These
+        # two reason strings are emitted by the audit row builder at the
+        # census call sites; matching them here keeps the classification
+        # tied to the census outcome rather than to arbitrary prose.
+        or (
+                row["verdict"] == "BLOCKED"
+                and row.get("heartbeat_expired") is True
+                and any(
+                    "occupancy scan failed" in str(reason)
+                    or "process census" in str(reason)
                     for reason in _as_list(row["reasons"], "audit row.reasons")
-                    for token in ("cannot", "failed", "unavailable", "unknown")
                 )
-            )
         )
     ]
     # ⚠️ DEDUPLICATE BOTH LISTS, NOT JUST ONE, AND DEDUPLICATE BY THE PUBLISHED
