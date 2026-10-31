@@ -42,6 +42,8 @@ pub mod inspect;
 pub mod json;
 /// Muse session lineage ingestion.
 pub mod muse;
+/// Orc SQLite session lineage ingestion (staged port).
+pub mod orc;
 /// Content-addressed tool payload storage.
 pub mod payloads;
 /// Archive transactions: writer lock, team loading, run records.
