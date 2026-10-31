@@ -686,13 +686,28 @@ fn manifest_window_bounds(
     if !is_base && !is_exact {
         return Err(format!("{where_}: invalid date-window fields"));
     }
+    // CPython compares 1000.0 == 1000: an integral float in
+    // a recorded window reads as that integer.
+    let window_int = |value: &Value, key: &str| -> Result<i64, String> {
+        match value {
+            Value::Number(number) if number.is_f64() => {
+                let held = number.as_f64().unwrap_or_default();
+                if held.fract() == 0.0 && held.abs() < 9.223_372_036_854_776e18 {
+                    Ok(held as i64)
+                } else {
+                    Err(format!("{where_}.{key}: expected an integer"))
+                }
+            }
+            other => crate::json::as_int(other, &format!("{where_}.{key}")),
+        }
+    };
     let start = match object.get("start_ms") {
         None | Some(Value::Null) => None,
-        Some(value) => Some(crate::json::as_int(value, &format!("{where_}.start_ms"))?),
+        Some(value) => Some(window_int(value, "start_ms")?),
     };
     let end = match object.get("end_ms") {
         None | Some(Value::Null) => None,
-        Some(value) => Some(crate::json::as_int(value, &format!("{where_}.end_ms"))?),
+        Some(value) => Some(window_int(value, "end_ms")?),
     };
     Ok((start, end))
 }
@@ -1021,4 +1036,195 @@ fn record_site_identity_inferred(
         previous.as_ref(),
     )?;
     write_json_if_changed(&path, &identity.to_json())
+}
+
+// ---------------------------------------------------------------- Claude
+
+/// Load the recorded Claude source manifest, if any.
+pub fn load_claude_manifest(
+    archive: &Path,
+    team_slug: &str,
+    root_thread_id: &str,
+    date_window: Option<&DateWindow>,
+) -> Result<Vec<crate::history::SourceCopy>, String> {
+    let path = build_raw(archive, team_slug, "source-manifest.json")?;
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    let document = read_json(&path)?;
+    let object = as_object(&document, &path.display().to_string())?;
+    if !crate::json::json_eq_one(object.get("schema_version"))
+        || object.get("provider").and_then(Value::as_str) != Some("claude")
+    {
+        return Err(format!(
+            "invalid Claude source manifest at {}",
+            path.display()
+        ));
+    }
+    let recorded_root = crate::json::as_string(
+        object.get("root_thread_id").unwrap_or(&Value::Null),
+        &format!("{}: root_thread_id", path.display()),
+    )?;
+    if recorded_root != root_thread_id {
+        return Err(format!(
+            "source manifest belongs to root {}, not {}",
+            py_repr_str(recorded_root),
+            py_repr_str(root_thread_id)
+        ));
+    }
+    let null = Value::Null;
+    validate_manifest_window(
+        object.get("date_window").unwrap_or(&null),
+        date_window,
+        &path.display().to_string(),
+    )?;
+    let raw_sources = crate::json::as_array(
+        object.get("sources").unwrap_or(&null),
+        &format!("{}: sources", path.display()),
+    )?;
+    let mut sources = Vec::new();
+    for (index, raw_source) in raw_sources.iter().enumerate() {
+        let where_ = format!("{}: sources[{index}]", path.display());
+        let _ = as_object(raw_source, &where_)?;
+        sources.push(crate::history::SourceCopy::from_json(raw_source, &where_)?);
+    }
+    Ok(sources)
+}
+
+/// Snapshot and normalize one Claude coordinator lineage.
+#[allow(clippy::too_many_arguments)]
+pub fn ingest_claude(
+    archive: &Path,
+    session_file: &Path,
+    team_slug: &str,
+    display_timezone: &str,
+    date_window: Option<&DateWindow>,
+    identity_overrides: &IdentityOverrides,
+    requested_snapshot_root: Option<&Path>,
+) -> Result<(TeamData, IngestReport), String> {
+    let _lock = crate::pipeline::archive_writer_lock(archive)?;
+    ingest_claude_locked(
+        archive,
+        session_file,
+        team_slug,
+        display_timezone,
+        date_window,
+        identity_overrides,
+        requested_snapshot_root,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ingest_claude_locked(
+    archive: &Path,
+    session_file: &Path,
+    team_slug: &str,
+    display_timezone: &str,
+    date_window: Option<&DateWindow>,
+    identity_overrides: &IdentityOverrides,
+    requested_snapshot_root: Option<&Path>,
+) -> Result<(TeamData, IngestReport), String> {
+    let root_thread_id = session_file
+        .file_stem()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    crate::pipeline::ensure_archive_pub(archive, team_slug, true)?;
+    let mut changed = i64::from(ensure_bulk_content_ignored(archive)?);
+    let previous_sources = load_claude_manifest(archive, team_slug, &root_thread_id, date_window)?;
+    let location = source_snapshot_location(archive, team_slug, requested_snapshot_root)?;
+    let source_copies = crate::claude::snapshot_claude_lineage(
+        session_file,
+        &location.root,
+        &previous_sources,
+        &crate::pipeline::utc_now(),
+    )?;
+    changed += source_copies.files_changed;
+    let allowed_sources: Vec<String> = source_copies
+        .sources
+        .iter()
+        .map(|source| source.snapshot_path.clone())
+        .collect();
+    let snapshot_session = location.root.join(
+        session_file
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    );
+    let team = apply_date_window(
+        crate::claude::load_claude_team(
+            &snapshot_session,
+            team_slug,
+            display_timezone,
+            Some(&allowed_sources),
+        )?,
+        date_window,
+    );
+    let mut parsed_paths: Vec<String> = team
+        .sources
+        .iter()
+        .map(|source| source.path.clone())
+        .collect();
+    let mut allowed_sorted = allowed_sources.clone();
+    parsed_paths.sort();
+    allowed_sorted.sort();
+    if parsed_paths != allowed_sorted {
+        return Err(
+            "parsed source set differs from the just-validated source snapshot manifest"
+                .to_string(),
+        );
+    }
+    if record_site_identity(archive, &team, identity_overrides)? {
+        changed += 1;
+    }
+    let mut manifest = Map::new();
+    manifest.insert("schema_version".into(), 1.into());
+    manifest.insert("provider".into(), Value::String("claude".to_string()));
+    manifest.insert(
+        "root_thread_id".into(),
+        Value::String(root_thread_id.clone()),
+    );
+    manifest.insert(
+        "source_root".into(),
+        Value::String(
+            crate::json::resolve_path(session_file.parent().unwrap_or(Path::new("")))
+                .display()
+                .to_string(),
+        ),
+    );
+    manifest.insert(
+        "root_session_file".into(),
+        Value::String(
+            crate::json::resolve_path(session_file)
+                .display()
+                .to_string(),
+        ),
+    );
+    manifest.insert(
+        "snapshot_root".into(),
+        Value::String(location.archive_relative()),
+    );
+    manifest.insert(
+        "date_window".into(),
+        date_window.map_or(Value::Null, DateWindow::to_json),
+    );
+    manifest.insert(
+        "sources".into(),
+        Value::Array(
+            source_copies
+                .sources
+                .iter()
+                .map(crate::history::SourceCopy::to_json)
+                .collect(),
+        ),
+    );
+    if write_json_if_changed(
+        &build_raw(archive, team_slug, "source-manifest.json")?,
+        &Value::Object(manifest),
+    )? {
+        changed += 1;
+    }
+    let (team, mut report) =
+        write_ingested_team(archive, team_slug, &team, date_window, changed, &location)?;
+    report.upstream_retired_sources = source_copies.upstream_retired.clone();
+    Ok((team, report))
 }

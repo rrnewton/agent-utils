@@ -139,6 +139,55 @@ pub fn read_first_line(path: &Path) -> Result<Vec<u8>, String> {
     })
 }
 
+/// Whether *path* is present as a regular file in either
+/// spelling (a symlink spelling does not count).
+pub fn source_exists(path: &Path) -> bool {
+    resolve_source(path).is_some_and(|physical| {
+        physical.is_file()
+            && !std::fs::symlink_metadata(&physical)
+                .map(|meta| meta.file_type().is_symlink())
+                .unwrap_or(false)
+    })
+}
+
+/// Logical paths matching `agent-*.jsonl` below *root*
+/// (recursively), `.zst` spellings counted as their plain
+/// name, sorted.
+pub fn iter_logical_glob_agents(root: &Path) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = Vec::new();
+    collect_agents(root, &mut found);
+    found.sort();
+    found.dedup();
+    found
+}
+
+fn collect_agents(dir: &Path, found: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let is_dir = path.is_dir()
+            && !std::fs::symlink_metadata(&path)
+                .map(|meta| meta.file_type().is_symlink())
+                .unwrap_or(false);
+        // A directory whose name matches is still a glob
+        // match (the oracle's `rglob` yields it, and its
+        // regular-file check then refuses); recursion into
+        // it also happens.
+        if name.starts_with("agent-") && name.ends_with(".jsonl") {
+            found.push(path.clone());
+        }
+        if name.starts_with("agent-") && name.ends_with(".jsonl.zst") {
+            found.push(logical_path(&path));
+        }
+        if is_dir {
+            collect_agents(&path, found);
+        }
+    }
+}
+
 /// Logical paths matching `rollout-*.jsonl` below *root*,
 /// `.zst` spellings counted as their plain name, sorted.
 pub fn iter_logical_glob_rollouts(root: &Path) -> Vec<PathBuf> {

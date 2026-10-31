@@ -128,7 +128,7 @@ pub fn parse_rollout_records(complete: &[u8]) -> Result<Vec<RolloutRecord>, Roll
 /// serde_json with CPython's non-standard constants (`NaN`,
 /// `Infinity`, `-Infinity`) rewritten to `null` outside
 /// string literals, which preserves downstream verdicts.
-fn parse_lenient(raw: &[u8]) -> Option<Value> {
+pub(crate) fn parse_lenient(raw: &[u8]) -> Option<Value> {
     if let Ok(value) = serde_json::from_slice::<Value>(raw) {
         return Some(value);
     }

@@ -36,6 +36,7 @@
 //! ```
 
 pub mod claude;
+pub mod claude_records;
 pub mod codex;
 mod event;
 mod follow;

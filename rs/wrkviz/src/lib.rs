@@ -20,6 +20,8 @@
 pub mod artifacts;
 /// Where a team's build state lives.
 pub mod build_store;
+/// Claude Code session lineage ingestion.
+pub mod claude;
 /// The CLI surface: `wrkviz inspect --output <archive>`.
 pub mod cli;
 /// Codex rollout lineage ingestion.
