@@ -273,3 +273,24 @@ Remaining composites: refresh/refresh-claude/refresh-orc,
 audit-glossary, audit-losslessness, responsiveness,
 discover-agents, `--userguide`, multi-team export; then the edition
 switch at parity and the generated-schema collapse.
+
+`refresh`/`refresh-claude`/`refresh-orc` are ported (`6d1bece6` on
+main): one generic Rust `run_refresh` composes ingest + summarize +
+build (plus optional GitHub enrichment and rebuild) as a single
+recorded pipeline run, via `pipeline::record_run_full`. Differential:
+`py/tests/test_wrkviz_refresh_rust.py` (6 cases). Gate 154 on the
+final commit: every selected step passed in some run
+(`vibe-talk.check.scroll-stability-browser` solo PASS).
+
+`audit-glossary` is ported (`1218df97` on main): read-only triage of
+retired schema-3 glossary caches in `rs/wrkviz/src/glossary_audit.rs`
+(every mechanical rejection reason, semantic-kind hints, missing
+caches, team discovery/selection, schema/term-id refusals).
+Differential: `py/tests/test_wrkviz_glossary_audit_rust.py` (4
+cases, both editions over the same fixture archive). Gate 155 on the
+final commit: every selected step passed (PARTIAL only from allowed
+delegated-live-scope cross skips).
+
+Remaining composites: audit-losslessness, responsiveness,
+discover-agents, `--userguide`, multi-team export; then the edition
+switch at parity and the generated-schema collapse.
