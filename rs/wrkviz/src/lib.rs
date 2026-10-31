@@ -16,16 +16,26 @@
 
 #![forbid(unsafe_code)]
 
+/// Deterministic work-output artifact extraction.
+pub mod artifacts;
 /// Where a team's build state lives.
 pub mod build_store;
 /// The CLI surface: `wrkviz inspect --output <archive>`.
 pub mod cli;
+/// Claude Code prompt-history ingestion.
+pub mod history;
+/// Site identity records.
+pub mod identity;
+/// The shared ingest writer and ingest commands.
+pub mod ingest;
 /// The `inspect` subcommand and the schema-3 archive reader it
 /// is built on.
 pub mod inspect;
 /// The archive JSON value domain and the Python-shaped readers
 /// over it.
 pub mod json;
+/// Content-addressed tool payload storage.
+pub mod payloads;
 /// Archive transactions: writer lock, team loading, run records.
 pub mod pipeline;
 /// The `query list` subcommand over schema-3 and schema-1
@@ -45,3 +55,5 @@ pub mod team_data;
 pub mod transcript_export;
 /// Archive file IO (replace-if-changed writes, JSONL).
 pub mod transcript_io;
+/// Calendar-date and exact-time windows.
+pub mod window;

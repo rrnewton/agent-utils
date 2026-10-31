@@ -335,6 +335,250 @@ pub struct TeamData {
     pub window_end_ms: Option<i64>,
 }
 
+fn opt_str(value: &Option<String>) -> Value {
+    value.clone().map_or(Value::Null, Value::String)
+}
+
+fn opt_num(value: &Option<i64>) -> Value {
+    value.map_or(Value::Null, Into::into)
+}
+
+/// A source snapshot as JSON.
+pub fn source_to_json(source: &SourceSnapshot) -> Value {
+    let mut out = serde_json::Map::new();
+    out.insert("path".into(), Value::String(source.path.clone()));
+    out.insert("thread_id".into(), Value::String(source.thread_id.clone()));
+    out.insert("size_bytes".into(), source.size_bytes.into());
+    out.insert("mtime_ns".into(), source.mtime_ns.into());
+    out.insert("sha256".into(), Value::String(source.sha256.clone()));
+    out.insert("complete_bytes".into(), source.complete_bytes.into());
+    out.insert("line_count".into(), source.line_count.into());
+    out.insert(
+        "working_directory".into(),
+        opt_str(&source.working_directory),
+    );
+    out.insert("repository_url".into(), opt_str(&source.repository_url));
+    out.insert("semantic_sha256".into(), opt_str(&source.semantic_sha256));
+    out.insert(
+        "semantic_complete_bytes".into(),
+        opt_num(&source.semantic_complete_bytes),
+    );
+    Value::Object(out)
+}
+
+/// An agent as JSON.
+pub fn agent_to_json(agent: &Agent) -> Value {
+    let mut out = serde_json::Map::new();
+    out.insert("thread_id".into(), Value::String(agent.thread_id.clone()));
+    out.insert("parent_thread_id".into(), opt_str(&agent.parent_thread_id));
+    out.insert("agent_path".into(), Value::String(agent.agent_path.clone()));
+    out.insert("nickname".into(), opt_str(&agent.nickname));
+    out.insert("role".into(), opt_str(&agent.role));
+    out.insert("depth".into(), agent.depth.into());
+    out.insert("started_at_ms".into(), agent.started_at_ms.into());
+    out.insert("ended_at_ms".into(), opt_num(&agent.ended_at_ms));
+    out.insert("status".into(), Value::String(agent.status.clone()));
+    out.insert(
+        "source_path".into(),
+        Value::String(agent.source_path.clone()),
+    );
+    Value::Object(out)
+}
+
+/// A turn as JSON.
+pub fn turn_to_json(turn: &Turn) -> Value {
+    let mut out = serde_json::Map::new();
+    out.insert("turn_id".into(), Value::String(turn.turn_id.clone()));
+    out.insert("thread_id".into(), Value::String(turn.thread_id.clone()));
+    out.insert("started_at_ms".into(), turn.started_at_ms.into());
+    out.insert("ended_at_ms".into(), opt_num(&turn.ended_at_ms));
+    out.insert("status".into(), Value::String(turn.status.clone()));
+    out.insert("first_token_ms".into(), opt_num(&turn.first_token_ms));
+    out.insert("error".into(), opt_str(&turn.error));
+    out.insert(
+        "last_agent_message".into(),
+        opt_str(&turn.last_agent_message),
+    );
+    Value::Object(out)
+}
+
+/// An event as JSON.
+pub fn event_to_json(event: &Event) -> Value {
+    let mut out = serde_json::Map::new();
+    out.insert("event_id".into(), Value::String(event.event_id.clone()));
+    out.insert("thread_id".into(), Value::String(event.thread_id.clone()));
+    out.insert("turn_id".into(), opt_str(&event.turn_id));
+    out.insert("timestamp_ms".into(), event.timestamp_ms.into());
+    out.insert("kind".into(), Value::String(event.kind.clone()));
+    out.insert("role".into(), opt_str(&event.role));
+    out.insert("phase".into(), opt_str(&event.phase));
+    out.insert("text".into(), opt_str(&event.text));
+    out.insert(
+        "content_availability".into(),
+        Value::String(event.content_availability.clone()),
+    );
+    out.insert(
+        "encrypted_content".into(),
+        opt_str(&event.encrypted_content),
+    );
+    out.insert("author".into(), opt_str(&event.author));
+    out.insert("recipient".into(), opt_str(&event.recipient));
+    out.insert("source_line".into(), event.source_line.into());
+    out.insert("ingress_kind".into(), opt_str(&event.ingress_kind));
+    out.insert("author_kind".into(), opt_str(&event.author_kind));
+    out.insert("source_native_id".into(), opt_str(&event.source_native_id));
+    out.insert(
+        "classification_version".into(),
+        opt_str(&event.classification_version),
+    );
+    Value::Object(out)
+}
+
+fn payload_ref_to_json(payload: &PayloadRef) -> Value {
+    let mut out = serde_json::Map::new();
+    out.insert("sha256".into(), Value::String(payload.sha256.clone()));
+    out.insert("byte_length".into(), payload.byte_length.into());
+    Value::Object(out)
+}
+
+/// A tool call as JSON.
+pub fn tool_to_json(tool: &ToolCall) -> Value {
+    let mut out = serde_json::Map::new();
+    out.insert("call_id".into(), Value::String(tool.call_id.clone()));
+    out.insert("item_id".into(), opt_str(&tool.item_id));
+    out.insert("thread_id".into(), Value::String(tool.thread_id.clone()));
+    out.insert("turn_id".into(), opt_str(&tool.turn_id));
+    out.insert("name".into(), Value::String(tool.name.clone()));
+    out.insert("namespace".into(), opt_str(&tool.namespace));
+    out.insert("started_at_ms".into(), tool.started_at_ms.into());
+    out.insert("ended_at_ms".into(), opt_num(&tool.ended_at_ms));
+    out.insert("status".into(), Value::String(tool.status.clone()));
+    out.insert("input_text".into(), opt_str(&tool.input_text));
+    out.insert("output_text".into(), opt_str(&tool.output_text));
+    out.insert(
+        "nested_tools".into(),
+        Value::Array(
+            tool.nested_tools
+                .iter()
+                .map(|(name, count)| {
+                    let mut entry = serde_json::Map::new();
+                    entry.insert("name".into(), Value::String(name.clone()));
+                    entry.insert("count".into(), (*count).into());
+                    Value::Object(entry)
+                })
+                .collect(),
+        ),
+    );
+    out.insert("source_line".into(), tool.source_line.into());
+    if let Some(payload) = &tool.input_payload {
+        out.insert("input_payload".into(), payload_ref_to_json(payload));
+    }
+    if let Some(payload) = &tool.output_payload {
+        out.insert("output_payload".into(), payload_ref_to_json(payload));
+    }
+    Value::Object(out)
+}
+
+/// An edge as JSON.
+pub fn edge_to_json(edge: &Edge) -> Value {
+    let mut out = serde_json::Map::new();
+    out.insert("edge_id".into(), Value::String(edge.edge_id.clone()));
+    out.insert("call_id".into(), Value::String(edge.call_id.clone()));
+    out.insert(
+        "from_thread_id".into(),
+        Value::String(edge.from_thread_id.clone()),
+    );
+    out.insert(
+        "to_thread_id".into(),
+        Value::String(edge.to_thread_id.clone()),
+    );
+    out.insert("kind".into(), Value::String(edge.kind.clone()));
+    out.insert("timestamp_ms".into(), edge.timestamp_ms.into());
+    out.insert("message_text".into(), opt_str(&edge.message_text));
+    out.insert(
+        "content_availability".into(),
+        Value::String(edge.content_availability.clone()),
+    );
+    out.insert("encrypted_content".into(), opt_str(&edge.encrypted_content));
+    out.insert("source_line".into(), edge.source_line.into());
+    Value::Object(out)
+}
+
+/// A task note as JSON.
+pub fn task_note_to_json(note: &TaskNote) -> Value {
+    let mut out = serde_json::Map::new();
+    out.insert("note_id".into(), note.note_id.into());
+    out.insert(
+        "source_path".into(),
+        Value::String(note.source_path.clone()),
+    );
+    out.insert(
+        "task_source_ordinal".into(),
+        note.task_source_ordinal.into(),
+    );
+    out.insert("task_id".into(), Value::String(note.task_id.clone()));
+    out.insert("title".into(), Value::String(note.title.clone()));
+    out.insert("content".into(), Value::String(note.content.clone()));
+    out.insert("created_at".into(), Value::String(note.created_at.clone()));
+    out.insert("server_author".into(), opt_str(&note.server_author));
+    out.insert("task_owner".into(), opt_str(&note.task_owner));
+    out.insert(
+        "upstream_present".into(),
+        Value::Bool(note.upstream_present),
+    );
+    out.insert("projection_policy".into(), opt_str(&note.projection_policy));
+    out.insert("projection_sha256".into(), opt_str(&note.projection_sha256));
+    Value::Object(out)
+}
+
+/// The complete team snapshot as JSON.
+pub fn team_to_json(team: &TeamData) -> Value {
+    let mut out = serde_json::Map::new();
+    out.insert("team_slug".into(), Value::String(team.team_slug.clone()));
+    out.insert("provider".into(), Value::String(team.provider.clone()));
+    out.insert(
+        "root_thread_id".into(),
+        Value::String(team.root_thread_id.clone()),
+    );
+    out.insert(
+        "display_timezone".into(),
+        Value::String(team.display_timezone.clone()),
+    );
+    out.insert(
+        "sources".into(),
+        Value::Array(team.sources.iter().map(source_to_json).collect()),
+    );
+    out.insert(
+        "agents".into(),
+        Value::Array(team.agents.iter().map(agent_to_json).collect()),
+    );
+    out.insert(
+        "turns".into(),
+        Value::Array(team.turns.iter().map(turn_to_json).collect()),
+    );
+    out.insert(
+        "events".into(),
+        Value::Array(team.events.iter().map(event_to_json).collect()),
+    );
+    out.insert(
+        "tool_calls".into(),
+        Value::Array(team.tool_calls.iter().map(tool_to_json).collect()),
+    );
+    out.insert(
+        "edges".into(),
+        Value::Array(team.edges.iter().map(edge_to_json).collect()),
+    );
+    out.insert("window_start_ms".into(), opt_num(&team.window_start_ms));
+    out.insert("window_end_ms".into(), opt_num(&team.window_end_ms));
+    if !team.task_notes.is_empty() {
+        out.insert(
+            "task_notes".into(),
+            Value::Array(team.task_notes.iter().map(task_note_to_json).collect()),
+        );
+    }
+    Value::Object(out)
+}
+
 /// Reconstruct the team written by `TeamData.to_json_obj`.
 pub fn team_from_json(value: &Value) -> Result<TeamData, String> {
     let root = as_object(value, "team")?;

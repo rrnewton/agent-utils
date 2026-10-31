@@ -112,7 +112,8 @@ pub fn team_build_root(archive: &Path, team_slug: &str) -> Result<PathBuf, Strin
     Ok(default_store_root(archive).join(team_slug))
 }
 
-fn candidate_store_roots(archive: &Path) -> Result<Vec<PathBuf>, String> {
+/// The candidate build-store roots for *archive*.
+pub fn candidate_store_roots(archive: &Path) -> Result<Vec<PathBuf>, String> {
     let mut roots = Vec::new();
     match read_pointer(archive)? {
         Some(pointer) if pointer.external => roots.push(pointer.store_root),

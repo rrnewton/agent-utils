@@ -10,6 +10,8 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+agent-harness = { version = "0.1.0", path = "../agent-harness" }
+regex = "1"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 ctrlc = "3"
 chrono-tz = "0.10"

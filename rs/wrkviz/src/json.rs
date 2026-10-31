@@ -54,7 +54,18 @@ pub fn optional_int(value: &Value, where_: &str) -> Result<Option<i64>, String> 
 /// `[Errno N] ...: 'path'` shape.
 pub fn read_json(path: &Path) -> Result<Value, String> {
     let bytes = std::fs::read(path).map_err(|error| os_error(&error, path))?;
-    let text = String::from_utf8(bytes).map_err(|error| error.to_string())?;
+    let text = String::from_utf8(bytes).map_err(|error| {
+        let utf8 = error.utf8_error();
+        let position = utf8.valid_up_to();
+        let bytes = error.as_bytes();
+        let byte = bytes.get(position).copied().unwrap_or(0);
+        let reason = match utf8.error_len() {
+            None => "unexpected end of data",
+            Some(_) if matches!(byte, 0x80..=0xbf) || byte > 0xf4 => "invalid start byte",
+            Some(_) => "invalid continuation byte",
+        };
+        format!("'utf-8' codec can't decode byte 0x{byte:02x} in position {position}: {reason}")
+    })?;
     parse_json_lenient(&text)
 }
 

@@ -35,6 +35,11 @@ fn file_sha256(path: &Path) -> Result<String, String> {
         .collect())
 }
 
+/// Validate an archive identifier (shared with ingest).
+pub fn validate_archive_id_pub(value: &str, label: &str) -> Result<(), String> {
+    validate_archive_id(value, label)
+}
+
 fn validate_archive_id(value: &str, label: &str) -> Result<(), String> {
     let bytes = value.as_bytes();
     let valid = !bytes.is_empty()
@@ -78,6 +83,11 @@ fn marker_value() -> Value {
     marker.insert("schema_version".into(), 1.into());
     marker.insert("tool".into(), Value::String("wrkviz".into()));
     Value::Object(marker)
+}
+
+/// Ensure the archive marker (shared with ingest).
+pub fn ensure_archive_pub(archive: &Path, team_slug: &str, create: bool) -> Result<(), String> {
+    ensure_archive(archive, team_slug, create)
 }
 
 fn ensure_archive(archive: &Path, team_slug: &str, create: bool) -> Result<(), String> {
@@ -185,7 +195,15 @@ fn task_notes_path(archive: &Path, team_slug: &str) -> Result<PathBuf, String> {
         .join("task-notes.jsonl"))
 }
 
-fn load_promoted_task_notes(archive: &Path, team_slug: &str) -> Result<Vec<TaskNote>, String> {
+/// Load promoted task notes (shared with ingest).
+pub fn load_promoted_task_notes(archive: &Path, team_slug: &str) -> Result<Vec<TaskNote>, String> {
+    load_promoted_task_notes_inner(archive, team_slug)
+}
+
+fn load_promoted_task_notes_inner(
+    archive: &Path,
+    team_slug: &str,
+) -> Result<Vec<TaskNote>, String> {
     let path = task_notes_path(archive, team_slug)?;
     let mut notes = Vec::new();
     let mut previous_key: Option<(String, i64)> = None;
@@ -338,6 +356,8 @@ pub struct RunReceipt<'a> {
     pub team_slugs: &'a [String],
     /// Mechanical payload.
     pub mechanical: Option<Value>,
+    /// Ingest report payload.
+    pub ingest: Option<Value>,
 }
 
 /// Append run provenance as one serialized manifest transaction.
@@ -402,7 +422,10 @@ fn record_run_locked(archive: &Path, receipt: &RunReceipt<'_>) -> Result<PathBuf
                 .collect(),
         ),
     );
-    run_obj.insert("ingest".into(), Value::Null);
+    run_obj.insert(
+        "ingest".into(),
+        receipt.ingest.clone().unwrap_or(Value::Null),
+    );
     run_obj.insert("summaries".into(), Value::Null);
     run_obj.insert("build".into(), Value::Object(serde_json::Map::new()));
     run_obj.insert(
@@ -470,6 +493,14 @@ fn record_run_locked(archive: &Path, receipt: &RunReceipt<'_>) -> Result<PathBuf
                 .collect(),
         ),
     );
+    if let Some(ingest) = &receipt.ingest {
+        if let Some(digest) = ingest.get("source_digest").and_then(Value::as_str) {
+            manifest.insert(
+                "latest_source_digest".into(),
+                Value::String(digest.to_string()),
+            );
+        }
+    }
     write_json_if_changed(&manifest_path, &Value::Object(manifest))?;
     Ok(path)
 }

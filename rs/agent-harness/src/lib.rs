@@ -39,6 +39,7 @@ pub mod claude;
 pub mod codex;
 mod event;
 mod follow;
+pub mod history;
 mod locate;
 pub mod muse;
 mod proc;
@@ -46,6 +47,7 @@ pub mod replies;
 
 pub use event::{Event, Via};
 pub use follow::{Follower, DEFAULT_MAX_READ};
+pub use history::{parse_history_line, HistoryError, HistoryPrompt};
 pub use locate::{Hints, Located};
 
 /// One harness's session file: where it is and how its lines read.

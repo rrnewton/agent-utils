@@ -1283,11 +1283,13 @@ dependencies = [
 name = "wrkviz"
 version = "0.1.0"
 dependencies = [
+ "agent-harness",
  "chrono",
  "chrono-tz",
  "ctrlc",
  "flate2",
  "fs2",
+ "regex",
  "serde_json",
  "sha2",
 ]
