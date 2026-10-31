@@ -161,3 +161,43 @@ Where wrkviz's Python parsing maps onto it:
 - Oracle surface: `_build_archive_locked`/`build_archive` in `py/wrkviz/pipeline.py` (~5410-5660: cached phase/name/overview/rollup loading with catalog selection and stale/partial suppression, `_ensure_archive`, precompress) and `py/wrkviz/render.py` (1,767 lines: phase/rollup/agent Markdown, timeline JSON edges and events, standalone server source, archive Makefile/README). Loaders `_load_phase_summaries`, `_load_agent_names`, `_load_project_overview`, `_select_catalog_summary`, `_summary_projection_missing`, `_load_rollup_projection` sit between the slice-7 writers and the renderer.
 - Reuse: slice 7 already ported phases/periods/provenance/catalog and the summary JSON shapes the renderer consumes; the site assets (JS/CSS/HTML) carry over unchanged. Zero tokens: build never calls a backend, so the differential is a pure fixture comparison (ingest + summarize-heuristic, then build in both editions and compare the generated trees).
 - Staging: (1) loaders + build orchestration; (2) render.py port (Markdown/JSON/Makefile/README/standalone); (3) CLI `build` with verbatim help. Composites (`refresh*` = ingest+summarize+build chains) stay for the composites slice.
+
+## Slice 8 landed: `build` in Rust (2026-10-31)
+
+`wrkviz build` is ported at differential parity: cache loaders
+(phase, agent-name, rollup, project-overview, artifact catalog,
+site identity, pull-metadata cache), `render_archive` (Markdown
+phases/agents/rollups/glossary, per-phase detail documents,
+schema-3 timeline/search/bloom/link shards, stale-presentation
+retirement, retired `query.py` pruning), `build_archive` under the
+archive writer locks, and the `build` CLI including the run-record
+`build` payload. Landings: `f9caee5f` (stage B1 helpers and the
+schema-3 writer), `c2541e22` (loaders, render, CLI), `8455f239`
+(differential and registration), `9dbfa84e` (rustfmt), `32e695d5`
+(adversarial-review fixes) on main. The review's two highs are
+closed: generated paths screen relatives and refuse parent
+symlinks like the oracle, and legacy project-overview validation
+(epoch shape, transcript digest, summary contract) is complete.
+`GlossaryTerm` is consolidated to one Rust type
+(`build_assets.rs`), per the single-source-of-truth rule.
+
+Gate 143 (`/tmp/gate143-build.log`) on `32e695d5`: every selected
+step passed in some run on the final commit; the only failure,
+`rust.agentctl.test`, passed solo
+(`/tmp/gate143-solo.log`). New differential:
+`py/tests/test_wrkviz_build_rust.py` (9 cases: no summaries,
+summarize-then-build plus idempotent rebuild, multi-agent edges,
+`--phase-minutes`, `--help`, missing team, tampered legacy
+overview, invalid pull cache, parent-symlink refusal). Trees
+compare gzip members by decompressed content and scrub only
+zlib-generation fields (compressed sizes/digests and shard byte
+totals).
+
+Coordinator's full gate on slice 7's `e8cd2b64`
+(`/tmp/coord-gate-slice7.log`): every selected node passed
+(PARTIAL only from delegated-live-scope skips), so slice 7 is
+verified on the commit that landed.
+
+Remaining wrkviz: composites (refresh/export/gc/migrate/audit/
+responsiveness/discover-agents/userguide), the edition switch at
+parity, and the generated-schema collapse.
