@@ -16,6 +16,8 @@
 
 #![forbid(unsafe_code)]
 
+/// Where a team's build state lives.
+pub mod build_store;
 /// The CLI surface: `wrkviz inspect --output <archive>`.
 pub mod cli;
 /// The `inspect` subcommand and the schema-3 archive reader it
@@ -24,12 +26,22 @@ pub mod inspect;
 /// The archive JSON value domain and the Python-shaped readers
 /// over it.
 pub mod json;
+/// Archive transactions: writer lock, team loading, run records.
+pub mod pipeline;
 /// The `query list` subcommand over schema-3 and schema-1
 /// timelines.
 pub mod query;
+/// The seekable JSONL writer.
+pub mod seekable;
 /// The `serve` subcommand: a loopback static server for a
 /// built archive.
 pub mod serve;
 /// The snapshot pointer (`snapshot-root.json`) and the legacy
 /// in-archive snapshot layout.
 pub mod snapshot_store;
+/// The normalized team snapshot (`raw/team.json`) reader.
+pub mod team_data;
+/// The extract-transcripts projection.
+pub mod transcript_export;
+/// Archive file IO (replace-if-changed writes, JSONL).
+pub mod transcript_io;

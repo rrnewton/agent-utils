@@ -306,6 +306,116 @@ pub fn dump_canonical(value: &Value) -> String {
     out
 }
 
+/// CPython `value == 1` for a JSON value (so `true` and `1.0`
+/// also pass a schema-version check).
+pub fn json_eq_one(value: Option<&Value>) -> bool {
+    match value {
+        Some(Value::Bool(true)) => true,
+        Some(Value::Number(number)) => number.as_f64() == Some(1.0),
+        _ => false,
+    }
+}
+
+/// `json.dumps(value, ensure_ascii=False, sort_keys=True,
+/// separators=(",", ":"))`: the canonical JSONL record line.
+pub fn dump_compact(value: &Value) -> String {
+    let mut out = String::new();
+    write_compact(value, &mut out);
+    out
+}
+
+fn write_compact(value: &Value, out: &mut String) {
+    match value {
+        Value::Null => out.push_str("null"),
+        Value::Bool(flag) => out.push_str(if *flag { "true" } else { "false" }),
+        Value::Number(number) => out.push_str(&py_number_str(number)),
+        Value::String(text) => write_json_string_as(text, out, false),
+        Value::Array(items) => {
+            out.push('[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                write_compact(item, out);
+            }
+            out.push(']');
+        }
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            out.push('{');
+            for (index, key) in keys.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                write_json_string_as(key, out, false);
+                out.push(':');
+                write_compact(&map[*key], out);
+            }
+            out.push('}');
+        }
+    }
+}
+
+/// Compact JSON in the value's own key order (the seekable
+/// index's declared line order).
+pub fn dump_compact_ordered(value: &Value) -> String {
+    let mut out = String::new();
+    write_compact_ordered(value, &mut out);
+    out
+}
+
+fn write_compact_ordered(value: &Value, out: &mut String) {
+    match value {
+        Value::Object(map) => {
+            out.push('{');
+            for (index, (key, item)) in map.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                write_json_string_as(key, out, false);
+                out.push(':');
+                write_compact_ordered(item, out);
+            }
+            out.push('}');
+        }
+        Value::Array(items) => {
+            out.push('[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                write_compact_ordered(item, out);
+            }
+            out.push(']');
+        }
+        other => write_compact(other, out),
+    }
+}
+
+/// Whether any number in the value is NaN or infinite (the
+/// values `allow_nan=False` refuses).
+pub fn has_nonfinite(value: &Value) -> bool {
+    match value {
+        Value::Number(number) => {
+            // Integer tokens are finite however large; only a
+            // non-integer literal can spell NaN or infinity.
+            let text = number.to_string();
+            if text
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte == b'-')
+            {
+                false
+            } else {
+                number.as_f64().is_some_and(|v| !v.is_finite())
+            }
+        }
+        Value::Array(items) => items.iter().any(has_nonfinite),
+        Value::Object(map) => map.values().any(has_nonfinite),
+        _ => false,
+    }
+}
+
 /// `json.dumps(value, ensure_ascii=False, sort_keys=True)`:
 /// one line, `, ` and `: ` separators.
 pub fn dump_oneline(value: &Value) -> String {

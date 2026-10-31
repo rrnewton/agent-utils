@@ -363,6 +363,7 @@ pub fn run(args: &[String]) -> u8 {
         "query" => run_query(&args[1..]),
         "serve" => run_serve(&args[1..]),
         "quickstart" => run_quickstart(&args[1..]),
+        "extract-transcripts" => run_extract_transcripts(&args[1..]),
         other => {
             eprintln!(
                 "wrkviz: the Rust edition has not ported '{other}' yet; the Python edition remains the oracle for it"
@@ -418,6 +419,208 @@ fn run_quickstart(args: &[String]) -> u8 {
         "wrkviz v0.1.0\n\nBuild a version-controllable, multi-resolution website from an agent team's append-only logs.\n\n1. Ingest, summarize only cache misses, and build the site:\n\n   wrkviz refresh \\\n     --root-session SESSION_UUID --team example-team \\\n     --output ./timelines/example-team \\\n     --timezone America/New_York --model {model}\n\n2. Open it locally:\n\n   cd ./timelines/example-team\n   make serve\n   # http://127.0.0.1:8765/\n\n3. Rerun the same refresh later. New log records are normalized; content-addressed summaries are\n   reused; only changed time windows and calendar rollups spend model tokens.\n\n4. See what a summarize run would spend before it spends anything, and cap it:\n\n   wrkviz summarize --team example-team --output ./timelines/example-team      --price input=2,output=10 --plan\n   wrkviz summarize --team example-team --output ./timelines/example-team      --price input=2,output=10 --budget-usd 20\n\n   A run estimated over the budget refuses to start; one that reaches it anyway stops, marks\n   summary_data/summarize_state.json partial, and the next run resumes from the cache.\n\nThe stages are separate on purpose: `ingest`, `summarize`, and `build`. The `build` command never\ncalls a model, so formatting and UI changes can be regenerated for free.\n"
     );
     println!();
+    0
+}
+
+/// The Python edition's extract-transcripts help, verbatim.
+pub const EXTRACT_HELP: &str = r#"usage: wrkviz extract-transcripts [-h] --output OUTPUT [--team TEAM]
+
+write append-only prompt/response JSONL from normalized logs, as seekable gzip
+with a sidecar index; zero tokens. Run it once on an archive an older wrkviz
+extracted: it migrates the plain .jsonl corpus in place, which prompts,
+messages and stats queries need before they will read it.
+
+options:
+  -h, --help       show this help message and exit
+  --output OUTPUT  durable archive directory
+  --team TEAM      ingested team slug to include; repeat as needed (default:
+                   all teams)
+"#;
+
+const EXTRACT_USAGE: &str = "usage: wrkviz extract-transcripts [-h] --output OUTPUT [--team TEAM]";
+
+fn run_extract_transcripts(args: &[String]) -> u8 {
+    let mut output: Option<String> = None;
+    let mut teams: Vec<String> = Vec::new();
+    let mut extras: Vec<String> = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        let help_plain = arg == "-h"
+            || (arg.len() > 2
+                && arg.starts_with("--")
+                && !arg.contains('=')
+                && "--help".starts_with(arg.as_str()));
+        if help_plain {
+            print!("{EXTRACT_HELP}");
+            return 0;
+        }
+        if let Some((head, value)) = arg.split_once('=') {
+            if head.len() > 2 && head.starts_with("--") && "--help".starts_with(head) {
+                return argparse_error(
+                    EXTRACT_USAGE,
+                    "wrkviz extract-transcripts",
+                    &format!("argument -h/--help: ignored explicit argument '{value}'"),
+                );
+            }
+        }
+        let mut handled = true;
+        for name in ["--output", "--team"] {
+            match named_value(args, &mut index, name) {
+                Ok(Some(value)) => {
+                    if name == "--output" {
+                        output = Some(value);
+                    } else {
+                        teams.push(value);
+                    }
+                    break;
+                }
+                Ok(None) => {}
+                Err((_, message)) => {
+                    return argparse_error(EXTRACT_USAGE, "wrkviz extract-transcripts", &message)
+                }
+            }
+        }
+        if !is_option_token(arg, &["--output", "--team"]) {
+            handled = false;
+        }
+        if !handled {
+            extras.push(arg.clone());
+        }
+        index += 1;
+    }
+    let Some(output) = output else {
+        return argparse_error(
+            EXTRACT_USAGE,
+            "wrkviz extract-transcripts",
+            "the following arguments are required: --output",
+        );
+    };
+    if !extras.is_empty() {
+        eprintln!(
+            "usage: wrkviz [-h] [--version] [--userguide]\n              {{quickstart,ingest-project,ingest,ingest-claude,ingest-claude-history,ingest-muse,ingest-orc,summarize,build,extract-transcripts,export,refresh,github-metadata,refresh-claude,refresh-orc,serve,inspect,gc,migrate-build-state,migrate-snapshots,audit-glossary,audit-losslessness,query,responsiveness,discover-agents}}\n              ...\nwrkviz: error: unrecognized arguments: {}",
+            extras.join(" ")
+        );
+        return 2;
+    }
+    let archive = cli_path(&output);
+    let started = crate::pipeline::utc_now();
+    let mut command: Vec<String> = vec!["wrkviz".to_string(), "extract-transcripts".to_string()];
+    command.extend(args.iter().cloned());
+    let selected: Result<Vec<String>, String> = (|| {
+        if !teams.is_empty() {
+            let unique: std::collections::BTreeSet<&String> = teams.iter().collect();
+            if unique.len() != teams.len() {
+                return Err("--team must not repeat a team slug".to_string());
+            }
+            return Ok(teams.clone());
+        }
+        let discovered = crate::build_store::ingested_team_slugs(&archive)?;
+        if discovered.is_empty() {
+            return Err(format!("no ingested teams found in {}", archive.display()));
+        }
+        Ok(discovered)
+    })();
+    let selected = match selected {
+        Ok(selected) => selected,
+        Err(error) => {
+            eprintln!("wrkviz: {error}");
+            return 2;
+        }
+    };
+    let report = match crate::transcript_export::extract_transcripts_archive(&archive, &selected) {
+        Ok(report) => report,
+        Err(error) => {
+            if let Ok(run_path) = crate::pipeline::record_run(
+                &archive,
+                &crate::pipeline::RunReceipt {
+                    command: &command,
+                    started_at: &started,
+                    status: "failed",
+                    team_slug: &selected[0],
+                    error: Some(&error),
+                    team_slugs: &selected,
+                    mechanical: None,
+                },
+            ) {
+                eprintln!("run metadata: {}", run_path.display());
+            }
+            eprintln!("wrkviz: {error}");
+            return 2;
+        }
+    };
+    let partiality = report.partiality_summary();
+    let mechanical = {
+        let mut value = serde_json::Map::new();
+        value.insert("transcript_extraction".to_string(), report.to_json());
+        serde_json::Value::Object(value)
+    };
+    let run_path = match crate::pipeline::record_run(
+        &archive,
+        &crate::pipeline::RunReceipt {
+            command: &command,
+            started_at: &started,
+            status: if partiality.is_some() {
+                "failed"
+            } else {
+                "completed"
+            },
+            team_slug: &selected[0],
+            error: partiality.as_deref(),
+            team_slugs: &selected,
+            mechanical: Some(mechanical),
+        },
+    ) {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("wrkviz: {error}");
+            return 2;
+        }
+    };
+    for skip in &report.skipped_teams {
+        eprintln!(
+            "wrkviz: transcripts: team {} -- carried forward unchanged from its last good extraction; nothing since is projected",
+            skip.summary()
+        );
+    }
+    for dropped in &report.dropped_authorship_rules {
+        eprintln!(
+            "wrkviz: transcripts: prompt authorship rule {} -- not applied",
+            dropped.summary()
+        );
+    }
+    let skipped_note = if report.skipped_teams.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " ({} further team(s) carried forward unread)",
+            report.skipped_teams.len()
+        )
+    };
+    println!(
+        "transcripts: {} prompts, {} responses, {} system inputs across {} teams{}; {} historical records retained, {} source records reclassified, {} files changed",
+        report.prompts,
+        report.responses,
+        report.system_inputs,
+        report.teams,
+        skipped_note,
+        report.carried_forward,
+        report.reclassified,
+        report.files_changed
+    );
+    println!(
+        "JSONL: {}",
+        archive
+            .join("extracted")
+            .join("transcripts")
+            .join("prompts.jsonl.gz")
+            .display()
+    );
+    println!("run metadata: {}", run_path.display());
+    if let Some(partiality) = partiality {
+        eprintln!("wrkviz: {partiality}");
+        return 2;
+    }
     0
 }
 

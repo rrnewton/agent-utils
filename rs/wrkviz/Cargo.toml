@@ -12,7 +12,9 @@ authors.workspace = true
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 ctrlc = "3"
-flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+chrono-tz = "0.10"
+fs2 = "0.4"
+flate2 = { version = "1", default-features = false, features = ["zlib"] }
 serde_json = { version = "1", features = ["arbitrary_precision", "float_roundtrip", "preserve_order"] }
 sha2 = { version = "0.10", default-features = false }
 
