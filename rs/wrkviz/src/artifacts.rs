@@ -161,7 +161,8 @@ pub struct WorkArtifact {
 }
 
 impl WorkArtifact {
-    fn to_json(&self) -> Value {
+    /// JSON form.
+    pub fn to_json(&self) -> Value {
         let mut out = Map::new();
         out.insert(
             "artifact_id".into(),
@@ -224,7 +225,8 @@ pub struct ProjectIdentity {
 }
 
 impl ProjectIdentity {
-    fn to_json(&self) -> Value {
+    /// JSON form.
+    pub fn to_json(&self) -> Value {
         let mut out = Map::new();
         out.insert("project_id".into(), Value::String(self.project_id.clone()));
         out.insert("host".into(), Value::String(self.host.clone()));
@@ -243,6 +245,70 @@ impl ProjectIdentity {
     }
 }
 
+/// Evidence-based interval index over one catalog (render-time).
+pub struct ArtifactRangeIndex {
+    all: Vec<(i64, String, bool)>,
+    by_thread: std::collections::HashMap<String, Vec<(i64, String, bool)>>,
+}
+
+impl ArtifactRangeIndex {
+    /// Build the index from a catalog's evidence records.
+    pub fn from_catalog(catalog: &ArtifactCatalog) -> Self {
+        let mut all: Vec<(i64, String, bool)> = Vec::new();
+        let mut by_thread: std::collections::HashMap<String, Vec<(i64, String, bool)>> =
+            std::collections::HashMap::new();
+        for artifact in &catalog.artifacts {
+            for evidence in &artifact.evidence {
+                let output = matches!(
+                    evidence.relation,
+                    Relation::Produced | Relation::Published | Relation::Updated
+                );
+                let entry = (evidence.timestamp_ms, artifact.artifact_id.clone(), output);
+                all.push(entry.clone());
+                by_thread
+                    .entry(evidence.thread_id.clone())
+                    .or_default()
+                    .push(entry);
+            }
+        }
+        all.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+        for entries in by_thread.values_mut() {
+            entries.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+        }
+        Self { all, by_thread }
+    }
+
+    /// Deduplicated sorted artifact ids in the half-open interval.
+    pub fn ids_for_range(
+        &self,
+        start_ms: i64,
+        end_ms: i64,
+        thread_id: Option<&str>,
+        outputs_only: bool,
+    ) -> Vec<String> {
+        if end_ms <= start_ms {
+            return Vec::new();
+        }
+        let series: &[(i64, String, bool)] = match thread_id {
+            None => &self.all,
+            Some(thread) => match self.by_thread.get(thread) {
+                Some(entries) => entries,
+                None => return Vec::new(),
+            },
+        };
+        let left = series.partition_point(|entry| entry.0 < start_ms);
+        let right = series.partition_point(|entry| entry.0 < end_ms);
+        let mut ids: Vec<String> = series[left..right]
+            .iter()
+            .filter(|entry| !outputs_only || entry.2)
+            .map(|entry| entry.1.clone())
+            .collect();
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+}
+
 /// The versioned artifact extraction result for one team.
 #[derive(Clone, Debug)]
 pub struct ArtifactCatalog {
@@ -255,6 +321,294 @@ pub struct ArtifactCatalog {
 }
 
 impl ArtifactCatalog {
+    /// Strictly load a catalog, rejecting unstable identifiers.
+    /// Mirrors `artifact_catalog_from_json`.
+    pub fn from_json(value: &Value) -> Result<Self, String> {
+        use crate::json::{as_array, as_int, as_object, as_string};
+        fn optional_string(value: Option<&Value>, where_: &str) -> Result<Option<String>, String> {
+            match value {
+                None | Some(Value::Null) => Ok(None),
+                Some(other) => Ok(Some(as_string(other, where_)?.to_string())),
+            }
+        }
+        let root = as_object(value, "artifact catalog")?;
+        let schema_version = as_int(
+            root.get("schema_version").unwrap_or(&Value::Null),
+            "artifact catalog.schema_version",
+        )?;
+        if schema_version != 1 {
+            return Err(format!(
+                "unsupported artifact catalog schema {schema_version}"
+            ));
+        }
+        let _extractor_version = as_string(
+            root.get("extractor_version").unwrap_or(&Value::Null),
+            "artifact catalog.extractor_version",
+        )?;
+        let mut artifacts = Vec::new();
+        for (index, raw_artifact) in as_array(
+            root.get("artifacts").unwrap_or(&Value::Null),
+            "artifact catalog.artifacts",
+        )?
+        .iter()
+        .enumerate()
+        {
+            let where_ = format!("artifact catalog.artifacts[{index}]");
+            let item = as_object(raw_artifact, &where_)?;
+            let mut evidence = Vec::new();
+            for (evidence_index, raw_evidence) in as_array(
+                item.get("evidence").unwrap_or(&Value::Null),
+                &format!("{where_}.evidence"),
+            )?
+            .iter()
+            .enumerate()
+            {
+                let evidence_where = format!("{where_}.evidence[{evidence_index}]");
+                let evidence_item = as_object(raw_evidence, &evidence_where)?;
+                let relation_raw = as_string(
+                    evidence_item.get("relation").unwrap_or(&Value::Null),
+                    &format!("{evidence_where}.relation"),
+                )?;
+                let relation = match relation_raw {
+                    "produced" => Relation::Produced,
+                    "published" => Relation::Published,
+                    "updated" => Relation::Updated,
+                    "referenced" => Relation::Referenced,
+                    other => {
+                        return Err(format!("'{other}' is not a valid EvidenceRelation"));
+                    }
+                };
+                let confidence_raw = as_string(
+                    evidence_item.get("confidence").unwrap_or(&Value::Null),
+                    &format!("{evidence_where}.confidence"),
+                )?;
+                let confidence: &'static str = match confidence_raw {
+                    "high" => "high",
+                    "medium" => "medium",
+                    other => {
+                        return Err(format!("'{other}' is not a valid EvidenceConfidence"));
+                    }
+                };
+                evidence.push(Evidence {
+                    evidence_id: as_string(
+                        evidence_item.get("evidence_id").unwrap_or(&Value::Null),
+                        &format!("{evidence_where}.evidence_id"),
+                    )?
+                    .to_string(),
+                    source_kind: as_string(
+                        evidence_item.get("source_kind").unwrap_or(&Value::Null),
+                        &format!("{evidence_where}.source_kind"),
+                    )?
+                    .to_string(),
+                    source_id: as_string(
+                        evidence_item.get("source_id").unwrap_or(&Value::Null),
+                        &format!("{evidence_where}.source_id"),
+                    )?
+                    .to_string(),
+                    source_line: as_int(
+                        evidence_item.get("source_line").unwrap_or(&Value::Null),
+                        &format!("{evidence_where}.source_line"),
+                    )?,
+                    thread_id: as_string(
+                        evidence_item.get("thread_id").unwrap_or(&Value::Null),
+                        &format!("{evidence_where}.thread_id"),
+                    )?
+                    .to_string(),
+                    turn_id: optional_string(
+                        evidence_item.get("turn_id"),
+                        &format!("{evidence_where}.turn_id"),
+                    )?,
+                    timestamp_ms: as_int(
+                        evidence_item.get("timestamp_ms").unwrap_or(&Value::Null),
+                        &format!("{evidence_where}.timestamp_ms"),
+                    )?,
+                    relation,
+                    action: as_string(
+                        evidence_item.get("action").unwrap_or(&Value::Null),
+                        &format!("{evidence_where}.action"),
+                    )?
+                    .to_string(),
+                    confidence,
+                    matched_text: as_string(
+                        evidence_item.get("matched_text").unwrap_or(&Value::Null),
+                        &format!("{evidence_where}.matched_text"),
+                    )?
+                    .to_string(),
+                });
+                let _ = as_string(
+                    evidence_item.get("extractor").unwrap_or(&Value::Null),
+                    &format!("{evidence_where}.extractor"),
+                )?;
+            }
+            let kind_raw = as_string(
+                item.get("kind").unwrap_or(&Value::Null),
+                &format!("{where_}.kind"),
+            )?;
+            let kind = match kind_raw {
+                "commit" => Kind::Commit,
+                "pull_request" => Kind::PullRequest,
+                "merge_request" => Kind::MergeRequest,
+                "diff" => Kind::Diff,
+                "issue" => Kind::Issue,
+                "task" => Kind::Task,
+                "repository" => Kind::Repository,
+                "gist" => Kind::Gist,
+                "paste" => Kind::Paste,
+                "uploaded_file" => Kind::UploadedFile,
+                "build_artifact" => Kind::BuildArtifact,
+                "url" => Kind::Url,
+                other => {
+                    return Err(format!("'{other}' is not a valid ArtifactKind"));
+                }
+            };
+            let locator = as_string(
+                item.get("locator").unwrap_or(&Value::Null),
+                &format!("{where_}.locator"),
+            )?
+            .to_string();
+            let identity = UrlIdentity {
+                kind,
+                url: locator.clone(),
+                label: as_string(
+                    item.get("label").unwrap_or(&Value::Null),
+                    &format!("{where_}.label"),
+                )?
+                .to_string(),
+                external_id: optional_string(
+                    item.get("external_id"),
+                    &format!("{where_}.external_id"),
+                )?,
+                project_url: optional_string(
+                    item.get("project_url"),
+                    &format!("{where_}.project_url"),
+                )?,
+                project_slug: optional_string(
+                    item.get("project_slug"),
+                    &format!("{where_}.project_slug"),
+                )?,
+            };
+            let mut evidence_ids = std::collections::HashSet::new();
+            for record in &evidence {
+                if !evidence_ids.insert(record.evidence_id.clone()) {
+                    return Err(format!("{where_}: duplicate evidence IDs"));
+                }
+            }
+            for record in &evidence {
+                let material = [
+                    record.source_kind.as_str(),
+                    record.source_id.as_str(),
+                    &record.source_line.to_string(),
+                    identity.kind.value(),
+                    identity.url.as_str(),
+                    record.relation.value(),
+                    record.action.as_str(),
+                ]
+                .join("\0");
+                if record.evidence_id != hash_id("evidence-", &material) {
+                    return Err(format!(
+                        "{where_}: evidence_id does not match its source and artifact"
+                    ));
+                }
+            }
+            let recorded_id = as_string(
+                item.get("artifact_id").unwrap_or(&Value::Null),
+                &format!("{where_}.artifact_id"),
+            )?
+            .to_string();
+            if recorded_id != artifact_id(&identity) {
+                return Err(format!("{where_}: artifact_id does not match kind and URL"));
+            }
+            let link_url = optional_string(item.get("url"), &format!("{where_}.url"))?;
+            let allowed: Vec<Option<&str>> = if kind == Kind::Commit && !locator.starts_with("urn:")
+            {
+                vec![None, Some(locator.as_str())]
+            } else if locator.starts_with("urn:") {
+                vec![None]
+            } else {
+                vec![Some(locator.as_str())]
+            };
+            if !allowed.contains(&link_url.as_deref()) {
+                return Err(format!("{where_}: URL does not match its stable locator"));
+            }
+            artifacts.push(WorkArtifact {
+                artifact_id: recorded_id,
+                kind: kind_raw.to_string(),
+                locator: identity.url.clone(),
+                url: link_url,
+                label: identity.label.clone(),
+                title: optional_string(item.get("title"), &format!("{where_}.title"))?,
+                external_id: identity.external_id.clone(),
+                project_url: identity.project_url.clone(),
+                project_slug: identity.project_slug.clone(),
+                producer_thread_id: optional_string(
+                    item.get("producer_thread_id"),
+                    &format!("{where_}.producer_thread_id"),
+                )?,
+                produced_at_ms: match item.get("produced_at_ms") {
+                    None | Some(Value::Null) => None,
+                    Some(other) => Some(as_int(other, &format!("{where_}.produced_at_ms"))?),
+                },
+                evidence,
+            });
+        }
+        let mut projects = Vec::new();
+        for (index, raw_project) in as_array(
+            root.get("projects").unwrap_or(&Value::Null),
+            "artifact catalog.projects",
+        )?
+        .iter()
+        .enumerate()
+        {
+            let where_ = format!("artifact catalog.projects[{index}]");
+            let item = as_object(raw_project, &where_)?;
+            let url = as_string(
+                item.get("url").unwrap_or(&Value::Null),
+                &format!("{where_}.url"),
+            )?
+            .to_string();
+            let project_id = as_string(
+                item.get("project_id").unwrap_or(&Value::Null),
+                &format!("{where_}.project_id"),
+            )?
+            .to_string();
+            if project_id != hash_id("project-", &url) {
+                return Err(format!("{where_}: project_id does not match URL"));
+            }
+            projects.push(ProjectIdentity {
+                project_id,
+                host: as_string(
+                    item.get("host").unwrap_or(&Value::Null),
+                    &format!("{where_}.host"),
+                )?
+                .to_string(),
+                slug: as_string(
+                    item.get("slug").unwrap_or(&Value::Null),
+                    &format!("{where_}.slug"),
+                )?
+                .to_string(),
+                url,
+                evidence_ids: as_array(
+                    item.get("evidence_ids").unwrap_or(&Value::Null),
+                    &format!("{where_}.evidence_ids"),
+                )?
+                .iter()
+                .map(|raw_id| {
+                    as_string(raw_id, &format!("{where_}.evidence_ids[]")).map(str::to_string)
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            });
+        }
+        Ok(Self {
+            source_digest: as_string(
+                root.get("source_digest").unwrap_or(&Value::Null),
+                "artifact catalog.source_digest",
+            )?
+            .to_string(),
+            artifacts,
+            projects,
+        })
+    }
+
     /// The complete deterministic catalog JSON.
     pub fn to_json(&self) -> Value {
         let mut out = Map::new();

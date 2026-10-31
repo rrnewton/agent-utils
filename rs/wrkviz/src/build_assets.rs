@@ -23,10 +23,7 @@ pub fn gzip_sidecar_path(path: &Path) -> PathBuf {
 
 /// A reproducible gzip-6 stream with no filename or timestamp.
 pub fn deterministic_gzip(data: &[u8]) -> Vec<u8> {
-    let mut encoder = flate2::write::GzEncoder::new(
-        Vec::new(),
-        flate2::Compression::new(6),
-    );
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(6));
     // flate2's header carries an mtime; rewrite it to zero afterwards
     // (bytes 4..8 of the gzip header).
     let _ = encoder.write_all(data);
@@ -51,10 +48,7 @@ fn is_symlink(path: &Path) -> bool {
 }
 
 /// Write text without pairing new identity bytes with an old sidecar.
-pub fn write_text_with_gzip_invalidation(
-    path: &Path,
-    text: &str,
-) -> Result<i64, String> {
+pub fn write_text_with_gzip_invalidation(path: &Path, text: &str) -> Result<i64, String> {
     write_text_with_gzip_invalidation_executable(path, text, false)
 }
 
@@ -96,8 +90,7 @@ pub fn write_text_with_gzip_invalidation_executable(
     }
     let mut changed = 0i64;
     if sidecar.is_file() {
-        std::fs::remove_file(&sidecar)
-            .map_err(|error| crate::json::os_error(&error, &sidecar))?;
+        std::fs::remove_file(&sidecar).map_err(|error| crate::json::os_error(&error, &sidecar))?;
         changed += 1;
     }
     let written = if executable {
@@ -127,8 +120,7 @@ pub fn write_gzip_only(path: &Path, text: &str) -> Result<i64, String> {
     let mut changed = 0i64;
     let body = deterministic_gzip(text.as_bytes());
     if !sidecar.is_file()
-        || std::fs::read(&sidecar).map_err(|error| crate::json::os_error(&error, &sidecar))?
-            != body
+        || std::fs::read(&sidecar).map_err(|error| crate::json::os_error(&error, &sidecar))? != body
     {
         crate::transcript_io::atomic_write(&sidecar, &body)?;
         changed += 1;
@@ -166,8 +158,7 @@ pub fn sync_gzip_sidecar_min(path: &Path, minimum_bytes: u64) -> Result<bool, St
                 sidecar.display()
             ));
         }
-        std::fs::remove_file(&sidecar)
-            .map_err(|error| crate::json::os_error(&error, &sidecar))?;
+        std::fs::remove_file(&sidecar).map_err(|error| crate::json::os_error(&error, &sidecar))?;
         return Ok(true);
     }
     if is_symlink(path) {
@@ -179,8 +170,7 @@ pub fn sync_gzip_sidecar_min(path: &Path, minimum_bytes: u64) -> Result<bool, St
     let data = std::fs::read(path).map_err(|error| crate::json::os_error(&error, path))?;
     let body = deterministic_gzip(&data);
     if sidecar.is_file()
-        && std::fs::read(&sidecar).map_err(|error| crate::json::os_error(&error, &sidecar))?
-            == body
+        && std::fs::read(&sidecar).map_err(|error| crate::json::os_error(&error, &sidecar))? == body
     {
         return Ok(false);
     }
@@ -278,7 +268,8 @@ pub fn glossary_markdown(team_slug: &str, week: &str, terms: &[GlossaryTerm]) ->
     let mut lines: Vec<String> = vec![
         format!("# {week} {team_slug} terminology"),
         String::new(),
-        "Terms are ordered by first appearance. Definitions are generated only from retained".into(),
+        "Terms are ordered by first appearance. Definitions are generated only from retained"
+            .into(),
         "source occurrences; first-use evidence is shown separately.".into(),
         String::new(),
     ];
@@ -332,8 +323,10 @@ pub fn glossary_catalog_markdown(
         String::new(),
         "## Project terms".into(),
         String::new(),
-        "These source-bounded terms are ordered by first appearance. In the website, recognized".into(),
-        "uses of an exact term link to its stable `#glossary/<term-id>` entry. Definitions and".into(),
+        "These source-bounded terms are ordered by first appearance. In the website, recognized"
+            .into(),
+        "uses of an exact term link to its stable `#glossary/<term-id>` entry. Definitions and"
+            .into(),
         "their first-use evidence are deliberately separate.".into(),
         String::new(),
     ];
@@ -470,9 +463,7 @@ pub fn find_pull_request_references(text: &str) -> Vec<PullRequestReference> {
             r"(?P<reference>(?P<owner>{OWNER_PATTERN})/(?P<repository>{REPO_PATTERN})#(?P<number>[1-9][0-9]*))"
         ),
         "qualified",
-        |before| {
-            !matches!(before, Some(ch) if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '/' | '-'))
-        },
+        |before| !matches!(before, Some(ch) if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '/' | '-')),
         |after| !matches!(after, Some(ch) if ch.is_ascii_digit()),
     );
     let mut all = explicit;

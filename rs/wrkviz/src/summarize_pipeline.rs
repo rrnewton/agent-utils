@@ -39,7 +39,7 @@ use crate::window::{apply_date_window, DateWindow};
 
 const OVERVIEW_CONTEXT_CHARS: usize = 48_000;
 const PRESENTATION_FALLBACK_VERSION: &str = "agent-team-timeline-presentation-fallback-v1";
-const PROJECT_OVERVIEW_SCHEMA_VERSION: i64 = 3;
+pub(crate) const PROJECT_OVERVIEW_SCHEMA_VERSION: i64 = 3;
 
 /// The summary root for one team.
 pub fn summary_root(archive: &Path, team_slug: &str) -> Result<PathBuf, String> {
@@ -47,20 +47,7 @@ pub fn summary_root(archive: &Path, team_slug: &str) -> Result<PathBuf, String> 
     Ok(archive.join("teams").join(team_slug).join("summary_data"))
 }
 
-/// One glossary term (the summarize tree currently supplies none).
-#[derive(Clone, Debug)]
-pub struct GlossaryTerm {
-    /// Exact term.
-    pub term: String,
-    /// Context.
-    pub context: String,
-    /// Definition.
-    pub definition: String,
-    /// Definition status.
-    pub definition_status: String,
-    /// When it may first affect summaries.
-    pub summary_available_at_ms: i64,
-}
+pub use crate::build_assets::GlossaryTerm;
 
 fn glossary_prompt_text(terms: &[GlossaryTerm]) -> String {
     let mut lines = vec!["Project terminology (prefer these exact names):".to_string()];
@@ -94,10 +81,10 @@ fn plain_language_context_text(project_overview: &str, terms: &[GlossaryTerm]) -
 }
 
 #[derive(Clone, Debug)]
-struct KnowledgeEpoch {
-    epoch_id: String,
-    cutoff_ms: i64,
-    cutoff_reason: String,
+pub(crate) struct KnowledgeEpoch {
+    pub(crate) epoch_id: String,
+    pub(crate) cutoff_ms: i64,
+    pub(crate) cutoff_reason: String,
 }
 
 impl KnowledgeEpoch {
@@ -114,13 +101,13 @@ impl KnowledgeEpoch {
 }
 
 #[derive(Clone, Debug)]
-struct ProjectOverviewInput {
-    epoch: KnowledgeEpoch,
-    start_ms: i64,
-    end_ms: i64,
-    transcript: String,
-    event_ids: Vec<String>,
-    context_sha256: String,
+pub(crate) struct ProjectOverviewInput {
+    pub(crate) epoch: KnowledgeEpoch,
+    pub(crate) start_ms: i64,
+    pub(crate) end_ms: i64,
+    pub(crate) transcript: String,
+    pub(crate) event_ids: Vec<String>,
+    pub(crate) context_sha256: String,
 }
 
 fn sha256_hex(text: &str) -> String {
@@ -217,7 +204,10 @@ fn overview_input_from_events(
     }
 }
 
-fn root_overview_input(team: &TeamData, epoch: Option<KnowledgeEpoch>) -> ProjectOverviewInput {
+pub(crate) fn root_overview_input(
+    team: &TeamData,
+    epoch: Option<KnowledgeEpoch>,
+) -> ProjectOverviewInput {
     let epoch = epoch.unwrap_or_else(|| current_knowledge_epoch(team));
     let mut events: Vec<crate::team_data::Event> = team
         .events
@@ -326,7 +316,7 @@ fn renewed_project_overview_input(
     ProjectOverviewInput { epoch, ..current }
 }
 
-fn require_exact_keys(
+pub(crate) fn require_exact_keys(
     obj: &serde_json::Map<String, Value>,
     expected: &[&str],
     where_: &str,
@@ -386,13 +376,13 @@ fn knowledge_epoch_from_json(value: &Value, where_: &str) -> Result<KnowledgeEpo
     })
 }
 
-enum FrozenOverview {
+pub(crate) enum FrozenOverview {
     Current(ProjectOverviewInput),
     SourceChanged(KnowledgeEpoch),
     None,
 }
 
-fn frozen_project_overview_input(
+pub(crate) fn frozen_project_overview_input(
     archive: &Path,
     team: &TeamData,
 ) -> Result<FrozenOverview, String> {
@@ -547,7 +537,7 @@ fn project_overview_job(team: &TeamData, source: &ProjectOverviewInput) -> Summa
     job
 }
 
-fn phase_jobs(
+pub(crate) fn phase_jobs(
     team: &TeamData,
     phases: &[PhaseWindow],
     terms: &[GlossaryTerm],
@@ -558,7 +548,7 @@ fn phase_jobs(
         .map(|phase| {
             let chronological: Vec<GlossaryTerm> = terms
                 .iter()
-                .filter(|term| term.summary_available_at_ms < phase.end_ms)
+                .filter(|term| term.summary_available_at_ms() < phase.end_ms)
                 .cloned()
                 .collect();
             let coverage = ContextCoverage::new(
@@ -631,7 +621,7 @@ pub fn summary_json(summary: &SummaryResult) -> Value {
     Value::Object(out)
 }
 
-fn summary_from_json(value: &Value, where_: &str) -> Result<SummaryResult, String> {
+pub(crate) fn summary_from_json(value: &Value, where_: &str) -> Result<SummaryResult, String> {
     let obj = as_object(value, where_)?;
     let base = [
         "key",
@@ -688,7 +678,7 @@ fn summary_from_json(value: &Value, where_: &str) -> Result<SummaryResult, Strin
     }))
 }
 
-fn summary_from_catalog_reference(
+pub(crate) fn summary_from_catalog_reference(
     summary_root: &Path,
     reference: &SummaryArtifactReference,
 ) -> Result<SummaryResult, String> {
@@ -749,11 +739,11 @@ fn summary_from_catalog_reference(
     })
 }
 
-fn period_key(period: &Period) -> String {
+pub(crate) fn period_key(period: &Period) -> String {
     format!("{}:{}", period.key, period.kind)
 }
 
-fn phases_in<'a>(period: &Period, phases: &'a [PhaseWindow]) -> Vec<&'a PhaseWindow> {
+pub(crate) fn phases_in<'a>(period: &Period, phases: &'a [PhaseWindow]) -> Vec<&'a PhaseWindow> {
     phases
         .iter()
         .filter(|phase| phase.start_ms < period.end_ms && phase.end_ms > period.start_ms)
@@ -812,7 +802,7 @@ pub fn unavailable_summary(key: &str, at_ms: i64, subject: &str) -> SummaryResul
     }
 }
 
-fn prior_catalog_rollups(
+pub(crate) fn prior_catalog_rollups(
     summary_root: &Path,
     catalog: &SummaryArtifactCatalog,
     kind: &str,
@@ -899,7 +889,7 @@ fn prior_same_level<'a>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn rollup_job_for_period(
+pub(crate) fn rollup_job_for_period(
     team: &TeamData,
     period: &Period,
     phases: &[PhaseWindow],
@@ -968,7 +958,7 @@ fn rollup_job_for_period(
     }
     let chronological: Vec<GlossaryTerm> = terms
         .iter()
-        .filter(|term| term.summary_available_at_ms < period.end_ms)
+        .filter(|term| term.summary_available_at_ms() < period.end_ms)
         .cloned()
         .collect();
     let mut glossary = glossary_prompt_text(&chronological);
@@ -1230,7 +1220,7 @@ fn walk_rollups(
     Ok((all_results, all_plain_results))
 }
 
-fn agent_name_jobs(
+pub(crate) fn agent_name_jobs(
     team: &TeamData,
     phases: &[PhaseWindow],
     phase_results: &HashMap<String, SummaryResult>,
@@ -1443,7 +1433,10 @@ fn write_agent_name_data(
     Ok(changed)
 }
 
-fn validate_project_overview(summary: &SummaryResult, where_: &str) -> Result<(), String> {
+pub(crate) fn validate_project_overview(
+    summary: &SummaryResult,
+    where_: &str,
+) -> Result<(), String> {
     if crate::summary_registry::summarizer_change_for_prompt(
         &PROJECT_OVERVIEW_SUMMARIZER,
         &summary.prompt_version,
@@ -1645,7 +1638,7 @@ struct SummaryTree {
     periods: Vec<Period>,
 }
 
-fn period_range(team: &TeamData, phases: &[PhaseWindow]) -> Result<(i64, i64), String> {
+pub(crate) fn period_range(team: &TeamData, phases: &[PhaseWindow]) -> Result<(i64, i64), String> {
     let phase_start = phases.iter().map(|phase| phase.start_ms).min();
     let phase_end = phases.iter().map(|phase| phase.end_ms).max();
     let start_ms = team.window_start_ms.or(phase_start);
@@ -1767,7 +1760,7 @@ fn request_json(
     Value::Object(out)
 }
 
-fn rollup_index(summary_root: &Path) -> PathBuf {
+pub(crate) fn rollup_index(summary_root: &Path) -> PathBuf {
     summary_root.join("rollup_inputs")
 }
 

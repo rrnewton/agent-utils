@@ -53,16 +53,12 @@ fn round6(value: f64) -> f64 {
 impl ActivityBin {
     /// Stable JSON representation.
     pub fn to_json_obj(&self) -> Value {
-        let num = |value: f64| {
-            serde_json::Number::from_f64(value).map_or(Value::Null, Value::Number)
-        };
+        let num =
+            |value: f64| serde_json::Number::from_f64(value).map_or(Value::Null, Value::Number);
         let mut out = serde_json::Map::new();
         out.insert("team".into(), Value::String(self.team.clone()));
         out.insert("role".into(), Value::String(self.role.clone()));
-        out.insert(
-            "resolution".into(),
-            Value::String(self.resolution.clone()),
-        );
+        out.insert("resolution".into(), Value::String(self.resolution.clone()));
         out.insert("start_ms".into(), self.start_ms.into());
         out.insert("end_ms".into(), self.end_ms.into());
         out.insert(
@@ -128,8 +124,12 @@ fn aligned_start(timestamp_ms: i64, size_ms: i64, offset_ms: i64) -> i64 {
 }
 
 fn parse_zone(name: &str) -> Result<Tz, String> {
-    name.parse::<Tz>()
-        .map_err(|_| format!("unknown display timezone {}", crate::json::py_repr_str(name)))
+    name.parse::<Tz>().map_err(|_| {
+        format!(
+            "unknown display timezone {}",
+            crate::json::py_repr_str(name)
+        )
+    })
 }
 
 fn midnight_ms(day: chrono::NaiveDate, zone: Tz) -> i64 {
@@ -209,8 +209,7 @@ fn split_intervals(
                 let mut cursor = (*start).max(observed_start_ms);
                 let effective_end = (*end).min(observed_end_ms);
                 while cursor < effective_end {
-                    let (calendar_start, calendar_end) =
-                        bucket_bounds(cursor, resolution, zone);
+                    let (calendar_start, calendar_end) = bucket_bounds(cursor, resolution, zone);
                     let bucket_start = calendar_start.max(observed_start_ms);
                     let bucket_end = calendar_end.min(observed_end_ms);
                     let clipped_start = (*start).max(bucket_start);
@@ -287,7 +286,11 @@ fn build_resolution(
     );
     let mut evidence_counts: HashMap<BinKey, i64> = HashMap::new();
     for role in ROLES {
-        for timestamp_ms in evidence_events_by_role.get(role).cloned().unwrap_or_default() {
+        for timestamp_ms in evidence_events_by_role
+            .get(role)
+            .cloned()
+            .unwrap_or_default()
+        {
             if timestamp_ms < observed_start_ms || timestamp_ms >= observed_end_ms {
                 continue;
             }
@@ -351,9 +354,7 @@ fn build_resolution(
                 distinct_active_agents: intervals_by_agent.len() as i64,
                 avg_present_concurrency: round6(present_agent_ms as f64 / duration_ms as f64),
                 peak_present_concurrency: peak_concurrency(&present_by_agent),
-                activity_evidence_fraction: round6(
-                    evidence_covered_ms as f64 / duration_ms as f64,
-                ),
+                activity_evidence_fraction: round6(evidence_covered_ms as f64 / duration_ms as f64),
                 activity_evidence_events: *evidence_counts.get(&key).unwrap_or(&0),
                 timing_quality: "inferred".to_string(),
             });
@@ -408,10 +409,7 @@ pub fn build_activity_bins(
             .extend(phase_active.iter().copied());
         let mut phase_evidence: Vec<Interval> = Vec::new();
         for entry in &phase.transcript {
-            evidence_events
-                .get_mut(role)
-                .unwrap()
-                .push(entry.at_ms);
+            evidence_events.get_mut(role).unwrap().push(entry.at_ms);
             phase_evidence.push((
                 entry.at_ms - EVIDENCE_HALF_WINDOW_MS,
                 entry.at_ms + EVIDENCE_HALF_WINDOW_MS,

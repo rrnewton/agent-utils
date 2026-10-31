@@ -29,7 +29,7 @@ pub const SCHEMA_3_SEARCH_LINKS_ROOT: &str = "data/timeline-v3/search-links";
 /// Bins path.
 pub const SCHEMA_3_BINS_PATH: &str = "data/timeline-v3/bins.jsonl.gz";
 /// Bootstrap path.
-pub const SCHEMA_3_BOOTSTRAP_PATH: &str = "data/timeline-v3/bootstrap.json";
+pub const SCHEMA_3_BOOTSTRAP_PATH: &str = "data/timeline-v3.json";
 /// Search streams.
 pub const SCHEMA_3_SEARCH_STREAMS: [&str; 3] = ["search", "search_bloom", "search_links"];
 /// Record kind key.
@@ -44,53 +44,42 @@ pub const INDEX_SUFFIX: &str = ".index.jsonl";
 pub const DAY_MS: i64 = 86_400_000;
 const TARGET_CHUNK_BYTES: u64 = 1 << 20;
 
-const BOOTSTRAP_FIELDS: [&str; 11] = [
-    "schema_version",
-    "site",
-    "date_range",
+const BOOTSTRAP_FIELDS: [&str; 8] = [
+    "generated_at",
+    "source_digest",
     "display_timezone",
-    "project_overview",
-    "glossary",
-    "generation_inputs",
-    "generation_inputs_revision",
-    "objective_counts",
-    "objective_digest",
-    "project_overviews",
+    "display_timezone_source",
+    "range",
+    "stats",
+    "artifact_catalog_path",
+    "glossary_path",
 ];
-const BOOTSTRAP_SINGLE_FIELDS: [&str; 6] = [
-    "site",
-    "date_range",
+const KNOWN_FIELDS: [&str; 21] = [
+    "generated_at",
+    "source_digest",
     "display_timezone",
-    "project_overview",
-    "glossary",
-    "project_overviews",
-];
-const KNOWN_FIELDS: [&str; 20] = [
-    "schema_version",
-    "site",
+    "display_timezone_source",
+    "range",
+    "stats",
+    "artifact_catalog_path",
+    "glossary_path",
     "teams",
     "agents",
     "phases",
-    "events",
     "edges",
+    "events",
     "rollups",
     "projects",
     "summary_files",
-    "activity_bins",
-    "date_range",
-    "display_timezone",
-    "project_overview",
     "glossary",
-    "generation_inputs",
-    "generation_inputs_revision",
-    "objective_counts",
-    "objective_digest",
+    "activity_bins",
+    "project_overview",
     "project_overviews",
+    "schema_version",
 ];
 const SPINE_KIND_ORDER: [&str; 10] = [
     "team",
     "agent",
-    "activity_bounds",
     "phase_card",
     "structural_edge",
     "rollup",
@@ -98,53 +87,42 @@ const SPINE_KIND_ORDER: [&str; 10] = [
     "summary_file",
     "glossary_term",
     "project_overview",
+    "activity_bounds",
 ];
-const PHASE_CARD_FIELDS: [&str; 14] = [
-    "activity_source_counts",
-    "agent_label",
-    "end_ms",
-    "generated_at",
+const PHASE_CARD_FIELDS: [&str; 10] = [
     "id",
-    "input_hash",
-    "model",
-    "paragraph",
-    "phrase",
-    "prompt_version",
+    "agent_id",
     "start_ms",
+    "end_ms",
+    "phrase",
+    "paragraph",
     "summary_available",
+    "detail_path",
+    "stats",
     "team",
-    "work_summary",
 ];
 const SPINE_SORT_FIELD: [(&str, &str); 10] = [
+    ("team", "slug"),
     ("agent", "id"),
-    ("activity_bounds", "ref"),
     ("phase_card", "id"),
     ("structural_edge", "id"),
-    ("rollup", "id"),
-    ("project", "id"),
+    ("rollup", "path"),
+    ("project", "project_id"),
     ("summary_file", "path"),
-    ("glossary_term", "term_id"),
+    ("glossary_term", "id"),
     ("project_overview", "team"),
-    ("team", "path"),
+    ("activity_bounds", "ref"),
 ];
-const STRUCTURAL_EDGE_KINDS: [&str; 2] = ["spawn", "continuation"];
-const SEARCH_KNOWLEDGE_KIND: &str = "knowledge";
+const STRUCTURAL_EDGE_KINDS: [&str; 3] = ["spawn", "continuation", "result"];
 const SEARCH_RECORD_KIND: &str = "search_record";
 const ACTIVITY_BOUNDS_KIND: &str = "activity_bounds";
 const SEARCH_BLOOM_KIND: &str = "search_bloom";
-const SEARCH_PROMPT_KIND: &str = "search_prompt_excerpt";
-const SEARCH_RESPONSE_KIND: &str = "search_response_link";
+const SEARCH_PROMPT_KIND: &str = "search_prompt";
+const SEARCH_RESPONSE_KIND: &str = "search_response";
 const SEARCH_LINK_KIND_ORDER: [&str; 2] = [SEARCH_PROMPT_KIND, SEARCH_RESPONSE_KIND];
-const SEARCH_EXCERPT_CHARACTERS: usize = 200;
+const SEARCH_EXCERPT_CHARACTERS: usize = 320;
 const SEARCH_PROMPT_TYPES: [&str; 2] = ["prompt", "inter_agent_prompt"];
-const SEARCH_RESPONSE_TYPES: [&str; 6] = [
-    "response",
-    "inter_agent",
-    "inter_agent_prompt",
-    "inter_agent_response",
-    "tool",
-    "external",
-];
+const SEARCH_RESPONSE_TYPES: [&str; 2] = ["response", "inter_agent_response"];
 
 fn slug_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-')
@@ -162,7 +140,11 @@ struct Line {
 
 impl Line {
     fn time_order(&self) -> (i64, String, String) {
-        (self.at_ms.unwrap_or(0), self.kind.clone(), self.line.clone())
+        (
+            self.at_ms.unwrap_or(0),
+            self.kind.clone(),
+            self.line.clone(),
+        )
     }
     fn kind_order(&self) -> (String, String) {
         (self.key.clone(), self.line.clone())
@@ -196,41 +178,7 @@ impl ShardReport {
     }
     fn catalog_obj(&self) -> Value {
         let index = &self.write.index;
-        let members: Vec<Value> = index.members.iter().map(|member| {
-            let mut entry = serde_json::Map::new();
-            entry.insert("c_off".into(), member.c_off.into());
-            entry.insert("c_len".into(), member.c_len.into());
-            entry.insert("u_off".into(), member.u_off.into());
-            entry.insert("u_len".into(), member.u_len.into());
-            entry.insert("l0".into(), member.l0.into());
-            entry.insert("n".into(), member.n.into());
-            entry.insert("t0".into(), member.t0.map_or(Value::Null, Into::into));
-            entry.insert("t1".into(), member.t1.map_or(Value::Null, Into::into));
-            Value::Object(entry)
-        }).collect();
-        let ranges: Value = {
-            let mut out = serde_json::Map::new();
-            for (kind, (start, line_count)) in &self.line_ranges {
-                let mut entry = serde_json::Map::new();
-                entry.insert("start".into(), (*start).into());
-                entry.insert("lines".into(), (*line_count).into());
-                out.insert(kind.clone(), Value::Object(entry));
-            }
-            Value::Object(out)
-        };
-        let counts: Value = {
-            let mut out = serde_json::Map::new();
-            for (kind, count) in &self.counts {
-                out.insert(kind.clone(), (*count).into());
-            }
-            Value::Object(out)
-        };
         let mut out = serde_json::Map::new();
-        out.insert("file".into(), Value::String(self.relative_path.clone()));
-        out.insert(
-            "index_file".into(),
-            Value::String(self.index_relative_path()),
-        );
         out.insert("stream".into(), Value::String(self.stream.clone()));
         out.insert(
             "team".into(),
@@ -240,24 +188,21 @@ impl ShardReport {
             "day".into(),
             self.day.clone().map_or(Value::Null, Value::String),
         );
+        out.insert("path".into(), Value::String(self.relative_path.clone()));
+        out.insert(
+            "index_path".into(),
+            Value::String(self.index_relative_path()),
+        );
         out.insert("records".into(), index.record_count.into());
-        out.insert("c_size".into(), index.c_size.into());
-        out.insert("u_size".into(), index.u_size.into());
-        out.insert(
-            "c_sha256".into(),
-            Value::String(index.c_sha256.clone()),
-        );
-        out.insert(
-            "u_sha256".into(),
-            Value::String(index.u_sha256.clone()),
-        );
+        out.insert("members".into(), (index.members.len() as i64).into());
+        out.insert("c_bytes".into(), index.c_size.into());
+        out.insert("u_bytes".into(), index.u_size.into());
+        out.insert("c_sha256".into(), Value::String(index.c_sha256.clone()));
+        out.insert("u_sha256".into(), Value::String(index.u_sha256.clone()));
         out.insert(
             "timestamps_sorted".into(),
             Value::Bool(index.timestamps_sorted()),
         );
-        out.insert("members".into(), Value::Array(members));
-        out.insert("counts".into(), counts);
-        out.insert("line_ranges".into(), ranges);
         out.insert(
             "t0".into(),
             index
@@ -270,14 +215,31 @@ impl ShardReport {
             "t1".into(),
             index
                 .members
-                .last()
-                .and_then(|member| member.t1)
+                .iter()
+                .filter_map(|member| member.t1)
+                .max()
                 .map_or(Value::Null, Into::into),
         );
         out.insert(
             "t_end_exclusive".into(),
             self.t_end_exclusive.map_or(Value::Null, Into::into),
         );
+        if !self.line_ranges.is_empty() {
+            let mut ranges = serde_json::Map::new();
+            for (kind, (first, count)) in &self.line_ranges {
+                ranges.insert(
+                    kind.clone(),
+                    Value::Array(vec![(*first).into(), (*count).into()]),
+                );
+            }
+            out.insert("line_ranges".into(), Value::Object(ranges));
+        } else if !self.counts.is_empty() {
+            let mut counts = serde_json::Map::new();
+            for (kind, count) in &self.counts {
+                counts.insert(kind.clone(), (*count).into());
+            }
+            out.insert("counts".into(), Value::Object(counts));
+        }
         Value::Object(out)
     }
 }
@@ -416,12 +378,7 @@ fn safe_slug(slug: &str, where_: &str) -> Result<String, String> {
     Ok(slug.to_string())
 }
 
-fn envelope(
-    record: &Value,
-    kind: &str,
-    at_ms: Option<i64>,
-    where_: &str,
-) -> Result<Value, String> {
+fn envelope(record: &Value, kind: &str, at_ms: Option<i64>, where_: &str) -> Result<Value, String> {
     let mut projected = match record.clone() {
         Value::Object(map) => map,
         _ => return Err(format!("{where_}: expected an object")),
@@ -432,15 +389,10 @@ fn envelope(
             py_repr_str(SCHEMA_3_RECORD_KIND_KEY)
         ));
     }
-    projected.insert(
-        SCHEMA_3_RECORD_KIND_KEY.into(),
-        Value::String(kind.into()),
-    );
+    projected.insert(SCHEMA_3_RECORD_KIND_KEY.into(), Value::String(kind.into()));
     if let Some(at_ms) = at_ms {
         if let Some(existing) = projected.get(SCHEMA_3_TIMESTAMP_KEY) {
-            if !existing.is_null()
-                && existing.as_i64() != Some(at_ms)
-            {
+            if !existing.is_null() && existing.as_i64() != Some(at_ms) {
                 return Err(format!(
                     "{where_}: record carries {}={} but the schema-3 projection places it at {at_ms}",
                     SCHEMA_3_TIMESTAMP_KEY,
@@ -498,7 +450,11 @@ fn output_path(output: &Path, relative: &str, make_parents: bool) -> Result<Path
     let parts: Vec<&str> = relative.split('/').collect();
     for part in &parts[..parts.len().saturating_sub(1)] {
         cursor = cursor.join(part);
-        if cursor.symlink_metadata().map(|meta| meta.file_type().is_symlink()).unwrap_or(false) {
+        if cursor
+            .symlink_metadata()
+            .map(|meta| meta.file_type().is_symlink())
+            .unwrap_or(false)
+        {
             return Err(format!(
                 "schema-3 output path crosses a symlink: {}",
                 py_repr_str(relative)
@@ -653,12 +609,13 @@ fn timeline_lines(
     sole_team: Option<&str>,
 ) -> Result<BTreeMap<(String, i64), Vec<Line>>, String> {
     let mut buckets: BTreeMap<(String, i64), Vec<Line>> = BTreeMap::new();
-    let place = |buckets: &mut BTreeMap<(String, i64), Vec<Line>>,
-                 team: String,
-                 at_ms: i64,
-                 item: Line| {
-        buckets.entry((team, utc_day_start(at_ms))).or_default().push(item);
-    };
+    let place =
+        |buckets: &mut BTreeMap<(String, i64), Vec<Line>>, team: String, at_ms: i64, item: Line| {
+            buckets
+                .entry((team, utc_day_start(at_ms)))
+                .or_default()
+                .push(item);
+        };
     for (index, record) in collection(timeline, "events")?.iter().enumerate() {
         let where_ = format!("timeline.events[{index}]");
         let at_ms = field_int(record, "at_ms", &where_)?;
@@ -699,7 +656,9 @@ fn timeline_lines(
     for (index, record) in collection(timeline, "edges")?.iter().enumerate() {
         let where_ = format!("timeline.edges[{index}]");
         let obj = as_object(record, &where_)?;
-        if STRUCTURAL_EDGE_KINDS.contains(&obj.get("kind").and_then(Value::as_str).unwrap_or_default()) {
+        if STRUCTURAL_EDGE_KINDS
+            .contains(&obj.get("kind").and_then(Value::as_str).unwrap_or_default())
+        {
             continue;
         }
         let source_ms = field_int(record, "source_ms", &where_)?;
@@ -775,7 +734,10 @@ fn phase_intervals(record: &Value, where_: &str) -> Result<Vec<(i64, i64)>, Stri
     let mut intervals = Vec::new();
     let mut valid_state = false;
     if let Some(states) = obj.get("states") {
-        for (index, raw) in as_array(states, &format!("{where_}.states"))?.iter().enumerate() {
+        for (index, raw) in as_array(states, &format!("{where_}.states"))?
+            .iter()
+            .enumerate()
+        {
             let state_where = format!("{where_}.states[{index}]");
             let state_start = field_int(raw, "start_ms", &state_where)?;
             let state_end = field_int(raw, "end_ms", &state_where)?;
@@ -799,17 +761,11 @@ fn phase_intervals(record: &Value, where_: &str) -> Result<Vec<(i64, i64)>, Stri
     Ok(intervals)
 }
 
+type BoundsMap = BTreeMap<String, (i64, i64)>;
+type ActivityBounds = (BoundsMap, BoundsMap, Vec<(i64, i64)>);
+
 /// Phase/agent/rollup activity bounds.
-pub fn activity_bounds(
-    timeline: &Value,
-) -> Result<
-    (
-        BTreeMap<String, (i64, i64)>,
-        BTreeMap<String, (i64, i64)>,
-        Vec<(i64, i64)>,
-    ),
-    String,
-> {
+pub fn activity_bounds(timeline: &Value) -> Result<ActivityBounds, String> {
     let mut phase_intervals_map: BTreeMap<String, Vec<(i64, i64)>> = BTreeMap::new();
     let mut agent_intervals: BTreeMap<String, Vec<(i64, i64)>> = BTreeMap::new();
     let mut global_intervals: Vec<(i64, i64)> = Vec::new();
@@ -820,7 +776,10 @@ pub fn activity_bounds(
         let agent_id = record_id(record, "agent_id");
         let intervals = phase_intervals(record, &where_)?;
         phase_intervals_map.insert(phase_id.clone(), intervals.clone());
-        agent_intervals.entry(agent_id).or_default().extend(intervals.iter().copied());
+        agent_intervals
+            .entry(agent_id)
+            .or_default()
+            .extend(intervals.iter().copied());
         global_intervals.extend(intervals);
         phase_records.push(record.clone());
     }
@@ -829,15 +788,24 @@ pub fn activity_bounds(
     for (index, record) in collection(timeline, "events")?.iter().enumerate() {
         let where_ = format!("timeline.events[{index}]");
         let at_ms = field_int(record, "at_ms", &where_)?;
-        agent_points.entry(record_id(record, "agent_id")).or_default().push(at_ms);
+        agent_points
+            .entry(record_id(record, "agent_id"))
+            .or_default()
+            .push(at_ms);
         global_points.push(at_ms);
     }
     for (index, record) in collection(timeline, "edges")?.iter().enumerate() {
         let where_ = format!("timeline.edges[{index}]");
         let source_ms = field_int(record, "source_ms", &where_)?;
         let target_ms = field_int(record, "target_ms", &where_)?;
-        agent_points.entry(record_id(record, "source_id")).or_default().push(source_ms);
-        agent_points.entry(record_id(record, "target_id")).or_default().push(target_ms);
+        agent_points
+            .entry(record_id(record, "source_id"))
+            .or_default()
+            .push(source_ms);
+        agent_points
+            .entry(record_id(record, "target_id"))
+            .or_default()
+            .push(target_ms);
         global_points.extend([source_ms, target_ms]);
     }
     for points in agent_points.values_mut() {
@@ -857,7 +825,10 @@ pub fn activity_bounds(
             minimum_activity_range(
                 start,
                 end,
-                phase_intervals_map.get(&phase_id).map(|v| v.as_slice()).unwrap_or(&[]),
+                phase_intervals_map
+                    .get(&phase_id)
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]),
                 agent_points.get(&agent_id).unwrap_or(&empty),
             ),
         );
@@ -873,7 +844,10 @@ pub fn activity_bounds(
             minimum_activity_range(
                 start,
                 end,
-                agent_intervals.get(&agent_id).map(|v| v.as_slice()).unwrap_or(&[]),
+                agent_intervals
+                    .get(&agent_id)
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]),
                 agent_points.get(&agent_id).unwrap_or(&empty),
             ),
         );
@@ -920,11 +894,11 @@ fn spine_lines(
             .map(|(_, field)| *field)
             .unwrap_or("")
     }
-    let mut place = |buckets: &mut BTreeMap<String, BTreeMap<String, Vec<Line>>>,
-                     team: String,
-                     kind: &str,
-                     record: &Value,
-                     where_: &str|
+    let place = |buckets: &mut BTreeMap<String, BTreeMap<String, Vec<Line>>>,
+                 team: String,
+                 kind: &str,
+                 record: &Value,
+                 where_: &str|
      -> Result<(), String> {
         let raw = record.get(sort_field(kind));
         let key = match raw {
@@ -950,7 +924,11 @@ fn spine_lines(
     for (index, record) in collection(timeline, "teams")?.iter().enumerate() {
         let where_ = format!("timeline.teams[{index}]");
         let obj = as_object(record, &where_)?;
-        let team = as_string(obj.get("slug").unwrap_or(&Value::Null), &format!("{where_}.slug"))?.to_string();
+        let team = as_string(
+            obj.get("slug").unwrap_or(&Value::Null),
+            &format!("{where_}.slug"),
+        )?
+        .to_string();
         place(&mut buckets, team, "team", record, &where_)?;
     }
     for (index, record) in collection(timeline, "agents")?.iter().enumerate() {
@@ -968,12 +946,20 @@ fn spine_lines(
                 card.insert(key.clone(), value.clone());
             }
         }
-        place(&mut buckets, team, "phase_card", &Value::Object(card), &where_)?;
+        place(
+            &mut buckets,
+            team,
+            "phase_card",
+            &Value::Object(card),
+            &where_,
+        )?;
     }
     for (index, record) in collection(timeline, "edges")?.iter().enumerate() {
         let where_ = format!("timeline.edges[{index}]");
         let obj = as_object(record, &where_)?;
-        if !STRUCTURAL_EDGE_KINDS.contains(&obj.get("kind").and_then(Value::as_str).unwrap_or_default()) {
+        if !STRUCTURAL_EDGE_KINDS
+            .contains(&obj.get("kind").and_then(Value::as_str).unwrap_or_default())
+        {
             continue;
         }
         let team = team_of(record, sole_team, &where_)?;
@@ -999,7 +985,10 @@ fn spine_lines(
         let team = team_of(record, sole_team, &where_)?;
         place(&mut buckets, team, "glossary_term", record, &where_)?;
     }
-    for (index, record) in collection(timeline, "project_overviews")?.iter().enumerate() {
+    for (index, record) in collection(timeline, "project_overviews")?
+        .iter()
+        .enumerate()
+    {
         let where_ = format!("timeline.project_overviews[{index}]");
         let team = team_of(record, sole_team, &where_)?;
         place(&mut buckets, team, "project_overview", record, &where_)?;
@@ -1018,7 +1007,11 @@ fn spine_lines(
         let where_ = format!("timeline.agents[{index}]");
         let team = team_of(record, sole_team, &where_)?;
         let obj = as_object(record, &where_)?;
-        let identifier = as_string(obj.get("id").unwrap_or(&Value::Null), &format!("{where_}.id"))?.to_string();
+        let identifier = as_string(
+            obj.get("id").unwrap_or(&Value::Null),
+            &format!("{where_}.id"),
+        )?
+        .to_string();
         let bounds = agent_bounds
             .get(&identifier)
             .copied()
@@ -1035,7 +1028,11 @@ fn spine_lines(
         let where_ = format!("timeline.phases[{index}]");
         let team = team_of(record, sole_team, &where_)?;
         let obj = as_object(record, &where_)?;
-        let identifier = as_string(obj.get("id").unwrap_or(&Value::Null), &format!("{where_}.id"))?.to_string();
+        let identifier = as_string(
+            obj.get("id").unwrap_or(&Value::Null),
+            &format!("{where_}.id"),
+        )?
+        .to_string();
         let bounds = phase_bounds
             .get(&identifier)
             .copied()
@@ -1059,7 +1056,11 @@ fn spine_lines(
         let where_ = format!("timeline.rollups[{index}]");
         let team = team_of(record, sole_team, &where_)?;
         let obj = as_object(record, &where_)?;
-        let kind = as_string(obj.get("kind").unwrap_or(&Value::Null), &format!("{where_}.kind"))?.to_string();
+        let kind = as_string(
+            obj.get("kind").unwrap_or(&Value::Null),
+            &format!("{where_}.kind"),
+        )?
+        .to_string();
         place(
             &mut buckets,
             team.clone(),
@@ -1077,7 +1078,7 @@ fn spine_lines(
 fn ordered_spine(
     by_kind: &BTreeMap<String, Vec<Line>>,
     where_: &str,
-) -> Result<(Vec<Line>, BTreeMap<String, (i64, i64)>), String> {
+) -> Result<(Vec<Line>, BoundsMap), String> {
     let unknown: Vec<&String> = by_kind
         .keys()
         .filter(|kind| !SPINE_KIND_ORDER.contains(&kind.as_str()))
@@ -1104,7 +1105,7 @@ fn ordered_spine(
             continue;
         }
         let mut group = group.clone();
-        group.sort_by(|a, b| a.kind_order().cmp(&b.kind_order()));
+        group.sort_by_key(|line| line.kind_order());
         ranges.insert(kind.to_string(), (ordered.len() as i64, group.len() as i64));
         ordered.extend(group);
     }
@@ -1114,7 +1115,7 @@ fn ordered_spine(
 fn ordered_links(
     by_kind: &BTreeMap<String, Vec<Line>>,
     where_: &str,
-) -> Result<(Vec<Line>, BTreeMap<String, (i64, i64)>), String> {
+) -> Result<(Vec<Line>, BoundsMap), String> {
     let unknown: Vec<&String> = by_kind
         .keys()
         .filter(|kind| !SEARCH_LINK_KIND_ORDER.contains(&kind.as_str()))
@@ -1141,17 +1142,14 @@ fn ordered_links(
             continue;
         }
         let mut group = group.clone();
-        group.sort_by(|a, b| a.kind_order().cmp(&b.kind_order()));
+        group.sort_by_key(|line| line.kind_order());
         ranges.insert(kind.to_string(), (ordered.len() as i64, group.len() as i64));
         ordered.extend(group);
     }
     Ok((ordered, ranges))
 }
 
-fn bins_lines(
-    timeline: &Value,
-    sole_team: Option<&str>,
-) -> Result<Vec<Line>, String> {
+fn bins_lines(timeline: &Value, sole_team: Option<&str>) -> Result<Vec<Line>, String> {
     let mut lines = Vec::new();
     for (index, record) in collection(timeline, "activity_bins")?.iter().enumerate() {
         let where_ = format!("timeline.activity_bins[{index}]");
@@ -1168,7 +1166,7 @@ fn bins_lines(
             end_ms: Some(end_ms),
         });
     }
-    lines.sort_by(|a, b| a.time_order().cmp(&b.time_order()));
+    lines.sort_by_key(|line| line.time_order());
     Ok(lines)
 }
 
@@ -1180,7 +1178,11 @@ struct SearchPlan {
 
 fn search_string(record: &Value, field: &str, where_: &str) -> Result<String, String> {
     let obj = as_object(record, where_)?;
-    Ok(as_string(obj.get(field).unwrap_or(&Value::Null), &format!("{where_}.{field}"))?.to_string())
+    Ok(as_string(
+        obj.get(field).unwrap_or(&Value::Null),
+        &format!("{where_}.{field}"),
+    )?
+    .to_string())
 }
 
 fn link_line(kind: &str, key: &str, record: Value, where_: &str) -> Result<Line, String> {
@@ -1225,17 +1227,14 @@ fn search_lines(
         let text = search_string(record, "text", &where_)?;
         let bucket = (team.clone(), utc_day_start(at_ms));
         let enveloped = envelope(record, SEARCH_RECORD_KIND, Some(at_ms), &where_)?;
-        plan.records
-            .entry(bucket.clone())
-            .or_default()
-            .push(Line {
-                at_ms: Some(at_ms),
-                kind: SEARCH_RECORD_KIND.into(),
-                key: reference.clone(),
-                line: encode(&enveloped)?,
-                record: enveloped,
-                end_ms: Some(at_ms + 1),
-            });
+        plan.records.entry(bucket.clone()).or_default().push(Line {
+            at_ms: Some(at_ms),
+            kind: SEARCH_RECORD_KIND.into(),
+            key: reference.clone(),
+            line: encode(&enveloped)?,
+            record: enveloped,
+            end_ms: Some(at_ms + 1),
+        });
         plan.texts.entry(bucket).or_default().push(text.clone());
 
         let record_type = search_string(record, "record_type", &where_)?;
@@ -1308,10 +1307,7 @@ fn search_bloom_lines(
         let mut record = serde_json::Map::new();
         record.insert("team".into(), Value::String(team.clone()));
         record.insert("day".into(), Value::String(utc_day_label(*day_start)));
-        record.insert(
-            "shard".into(),
-            Value::String(relative_of[bucket].clone()),
-        );
+        record.insert("shard".into(), Value::String(relative_of[bucket].clone()));
         record.insert("records".into(), (plan.records[bucket].len() as i64).into());
         record.insert("bloom".into(), bloom.catalog_obj());
         let record = Value::Object(record);
@@ -1338,10 +1334,7 @@ fn bootstrap(
     let timeline_obj = as_object(timeline, "timeline").unwrap();
     let mut root = serde_json::Map::new();
     root.insert("schema_version".into(), SCHEMA_3_VERSION.into());
-    root.insert(
-        "kind".into(),
-        Value::String("timeline-v3-bootstrap".into()),
-    );
+    root.insert("kind".into(), Value::String("timeline-v3-bootstrap".into()));
     for field in BOOTSTRAP_FIELDS {
         if let Some(value) = timeline_obj.get(field) {
             root.insert(field.into(), value.clone());
@@ -1366,7 +1359,14 @@ fn bootstrap(
     root.insert("codec".into(), Value::Object(codec));
     root.insert("teams".into(), Value::Array(teams.to_vec()));
     let mut by_stream: BTreeMap<String, Vec<Value>> = BTreeMap::new();
-    for stream in ["timeline", "spine", "bins", "search", "search_bloom", "search_links"] {
+    for stream in [
+        "timeline",
+        "spine",
+        "bins",
+        "search",
+        "search_bloom",
+        "search_links",
+    ] {
         by_stream.insert(stream.to_string(), Vec::new());
     }
     for shard in shards {
@@ -1491,7 +1491,10 @@ pub fn write_timeline_v3(
     for (index, team) in teams.iter().enumerate() {
         let obj = as_object(team, &format!("timeline.teams[{index}]"))?;
         slugs.push(safe_slug(
-            as_string(obj.get("slug").unwrap_or(&Value::Null), &format!("timeline.teams[{index}].slug"))?,
+            as_string(
+                obj.get("slug").unwrap_or(&Value::Null),
+                &format!("timeline.teams[{index}].slug"),
+            )?,
             "timeline.teams",
         )?);
     }
@@ -1516,7 +1519,7 @@ pub fn write_timeline_v3(
             ));
         }
         let mut lines = lines.clone();
-        lines.sort_by(|a, b| a.time_order().cmp(&b.time_order()));
+        lines.sort_by_key(|line| line.time_order());
         let day = utc_day_label(*day_start);
         planned.push(PlannedShard {
             relative_path: format!("{SCHEMA_3_TIMELINE_ROOT}/{team}/{day}.jsonl.gz"),
@@ -1561,7 +1564,7 @@ pub fn write_timeline_v3(
         let relative = format!("{SCHEMA_3_SEARCH_ROOT}/{team}/{day}.jsonl.gz");
         search_paths.insert(bucket.clone(), relative.clone());
         let mut lines = lines.clone();
-        lines.sort_by(|a, b| a.search_order().cmp(&b.search_order()));
+        lines.sort_by_key(|line| line.search_order());
         planned.push(PlannedShard {
             relative_path: relative,
             stream: "search".into(),
@@ -1575,7 +1578,7 @@ pub fn write_timeline_v3(
         let bloom_lines = search_bloom_lines(&search_plan, &search_paths)?;
         for (team, lines) in &bloom_lines {
             let mut lines = lines.clone();
-            lines.sort_by(|a, b| a.time_order().cmp(&b.time_order()));
+            lines.sort_by_key(|line| line.time_order());
             planned.push(PlannedShard {
                 relative_path: format!("{SCHEMA_3_SEARCH_BLOOM_ROOT}/{team}.jsonl.gz"),
                 stream: "search_bloom".into(),
@@ -1659,7 +1662,10 @@ pub fn write_timeline_v3(
     Ok(TimelineV3Report {
         files_changed: changed,
         generated_files: generated,
-        timeline_shards: shards.iter().filter(|item| item.stream == "timeline").count() as i64,
+        timeline_shards: shards
+            .iter()
+            .filter(|item| item.stream == "timeline")
+            .count() as i64,
         spine_shards: shards.iter().filter(|item| item.stream == "spine").count() as i64,
         search_shards: shards.iter().filter(|item| item.stream == "search").count() as i64,
         search_records: shards

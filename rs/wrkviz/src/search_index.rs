@@ -114,10 +114,9 @@ fn agent_routes(team: &TeamData) -> AgentRoutes {
         .collect();
     let mut aliases_by_thread: HashMap<String, BTreeSet<String>> = HashMap::new();
     for agent in &team.agents {
-        let mut aliases: BTreeSet<String> =
-            [agent.thread_id.clone(), agent.agent_path.clone()]
-                .into_iter()
-                .collect();
+        let mut aliases: BTreeSet<String> = [agent.thread_id.clone(), agent.agent_path.clone()]
+            .into_iter()
+            .collect();
         for prefix in &continuation_prefixes {
             if agent.agent_path == *prefix {
                 aliases.insert("/root".to_string());
@@ -207,9 +206,17 @@ fn resolved_route(routes: &AgentRoutes, event: &Event) -> (Option<String>, Optio
                     active += 1;
                 }
             }
-            (active, *starts.iter().max().unwrap(), pair.0.clone(), pair.1.clone())
+            (
+                active,
+                *starts.iter().max().unwrap(),
+                pair.0.clone(),
+                pair.1.clone(),
+            )
         };
-        let best = candidates.iter().max_by(|a, b| score(a).cmp(&score(b))).unwrap();
+        let best = candidates
+            .iter()
+            .max_by(|a, b| score(a).cmp(&score(b)))
+            .unwrap();
         return (Some(best.0.clone()), Some(best.1.clone()));
     }
     (
@@ -233,13 +240,7 @@ fn message_type(event: &Event) -> Option<String> {
         }
         let (label, value) = line.split_once(':')?;
         if label.trim().to_lowercase() == "message type" {
-            return Some(
-                value
-                    .trim()
-                    .to_lowercase()
-                    .replace('-', "_")
-                    .replace(' ', "_"),
-            );
+            return Some(value.trim().to_lowercase().replace(['-', ' '], "_"));
         }
         return None;
     }
@@ -269,9 +270,7 @@ fn inter_agent_record_type(routes: &AgentRoutes, event: &Event) -> String {
     {
         return "inter_agent_prompt".to_string();
     }
-    if event.phase.as_deref() == Some("final_answer")
-        || kind.as_deref() == Some("final_answer")
-    {
+    if event.phase.as_deref() == Some("final_answer") || kind.as_deref() == Some("final_answer") {
         return "inter_agent_response".to_string();
     }
     let default_aliases: BTreeSet<String> = [event.thread_id.clone()].into_iter().collect();
@@ -279,7 +278,10 @@ fn inter_agent_record_type(routes: &AgentRoutes, event: &Event) -> String {
         .aliases_by_thread
         .get(&event.thread_id)
         .unwrap_or(&default_aliases);
-    let author_is_thread = event.author.as_ref().is_some_and(|item| aliases.contains(item));
+    let author_is_thread = event
+        .author
+        .as_ref()
+        .is_some_and(|item| aliases.contains(item));
     let recipient_is_thread = event
         .recipient
         .as_ref()
@@ -538,12 +540,8 @@ pub fn build_search_records(
         let event_record_type = record_type(&routes, event);
         let event_author_kind = record_author_kind(event, &event_record_type);
         let route = prompt_route(&routes, event, &event_record_type);
-        let record_thread_id = record_agent_thread(
-            &routes,
-            event,
-            &event_record_type,
-            visible_agent_ids,
-        );
+        let record_thread_id =
+            record_agent_thread(&routes, event, &event_record_type, visible_agent_ids);
         let prompt = if matches!(event_record_type.as_str(), "prompt" | "inter_agent_prompt") {
             Some(PromptLink {
                 at_ms: event.timestamp_ms,
@@ -566,9 +564,7 @@ pub fn build_search_records(
         };
         let agent = agents.get(record_thread_id.as_str());
         let mut record = serde_json::Map::new();
-        let opt = |value: &Option<String>| {
-            value.clone().map_or(Value::Null, Value::String)
-        };
+        let opt = |value: &Option<String>| value.clone().map_or(Value::Null, Value::String);
         record.insert("schema_version".into(), SEARCH_RECORD_SCHEMA_VERSION.into());
         record.insert("ref".into(), Value::String(reference.clone()));
         record.insert(
@@ -579,7 +575,11 @@ pub fn build_search_records(
         record.insert("team".into(), Value::String(team.team_slug.clone()));
         record.insert(
             "agent_id".into(),
-            Value::String(agent_id(&team.team_slug, &record_thread_id, namespace_agents)),
+            Value::String(agent_id(
+                &team.team_slug,
+                &record_thread_id,
+                namespace_agents,
+            )),
         );
         record.insert(
             "agent_ref".into(),
@@ -616,7 +616,9 @@ pub fn build_search_records(
         );
         record.insert(
             "prompt_at_ms".into(),
-            prompt.as_ref().map_or(Value::Null, |item| item.at_ms.into()),
+            prompt
+                .as_ref()
+                .map_or(Value::Null, |item| item.at_ms.into()),
         );
         record.insert(
             "prompt_in_scope".into(),
@@ -691,14 +693,8 @@ pub fn build_search_records(
         );
         record.insert("at_ms".into(), tool.started_at_ms.into());
         record.insert("text".into(), Value::String(tool_text(tool)));
-        record.insert(
-            "author_kind".into(),
-            Value::String("agent".into()),
-        );
-        record.insert(
-            "ingress_kind".into(),
-            Value::String("tool".into()),
-        );
+        record.insert("author_kind".into(), Value::String("agent".into()));
+        record.insert("ingress_kind".into(), Value::String("tool".into()));
         record.insert(
             "prompt_ref".into(),
             prompt.as_ref().map_or(Value::Null, |item| {
@@ -713,7 +709,9 @@ pub fn build_search_records(
         );
         record.insert(
             "prompt_at_ms".into(),
-            prompt.as_ref().map_or(Value::Null, |item| item.at_ms.into()),
+            prompt
+                .as_ref()
+                .map_or(Value::Null, |item| item.at_ms.into()),
         );
         record.insert(
             "prompt_in_scope".into(),
@@ -723,10 +721,7 @@ pub fn build_search_records(
                     .is_some_and(|item| in_scope(item.at_ms, start_ms, end_ms)),
             ),
         );
-        record.insert(
-            "content_fidelity".into(),
-            Value::String("condensed".into()),
-        );
+        record.insert("content_fidelity".into(), Value::String("condensed".into()));
         sortable.push((tool.started_at_ms, 0, reference, Value::Object(record)));
     }
 

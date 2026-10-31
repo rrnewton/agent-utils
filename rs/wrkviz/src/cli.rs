@@ -371,6 +371,7 @@ pub fn run(args: &[String]) -> u8 {
         "ingest-project" => run_ingest_project(&args[1..]),
         "ingest" => run_ingest(&args[1..]),
         "summarize" => run_summarize(&args[1..]),
+        "build" => run_build(&args[1..]),
         other => {
             eprintln!(
                 "wrkviz: the Rust edition has not ported '{other}' yet; the Python edition remains the oracle for it"
@@ -4597,6 +4598,190 @@ fn run_inspect(args: &[String]) -> u8 {
 }
 
 const SUMMARIZE_USAGE: &str = "usage: wrkviz summarize [-h] --output OUTPUT --team TEAM\n                        [--backend {codex,claude,heuristic}] [--model MODEL]\n                        [--reasoning-effort REASONING_EFFORT]\n                        [--service-tier SERVICE_TIER]\n                        [--summary-workers SUMMARY_WORKERS]\n                        [--summary-batch-size SUMMARY_BATCH_SIZE]\n                        [--name-batch-size NAME_BATCH_SIZE]\n                        [--phase-minutes PHASE_MINUTES]\n                        [--context-chars CONTEXT_CHARS]\n                        [--transcript-chars TRANSCRIPT_CHARS]\n                        [--codex-command CODEX_COMMAND]\n                        [--claude-command CLAUDE_COMMAND]\n                        [--summary-start-date SUMMARY_START_DATE | --summary-start-time SUMMARY_START_TIME]\n                        [--summary-end-date SUMMARY_END_DATE | --summary-end-time SUMMARY_END_TIME]\n                        [--summary-timezone SUMMARY_TIMEZONE]\n                        [--rollup-kind {hourly,daily,weekly,monthly,quarterly}]\n                        [--budget-usd USD] [--price RATES] [--plan]";
+
+/// Verbatim `wrkviz build --help` text.
+pub const BUILD_HELP: &str = r##"usage: wrkviz build [-h] --output OUTPUT --team TEAM
+                    [--phase-minutes PHASE_MINUTES]
+
+regenerate Markdown/site from cached data; zero tokens
+
+options:
+  -h, --help            show this help message and exit
+  --output OUTPUT       version-controllable archive directory
+  --team TEAM           stable team slug, for example example-team
+  --phase-minutes PHASE_MINUTES
+"##;
+
+const BUILD_USAGE: &str = "usage: wrkviz build [-h] --output OUTPUT --team TEAM\n                    [--phase-minutes PHASE_MINUTES]";
+
+fn run_build(args: &[String]) -> u8 {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print!("{BUILD_HELP}");
+        return 0;
+    }
+    const VALUE_OPTIONS: &[&str] = &["--output", "--team", "--phase-minutes"];
+    let mut values: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        let (head, explicit) = match arg.split_once('=') {
+            Some((head, value)) => (head, Some(value.to_string())),
+            None => (arg.as_str(), None),
+        };
+        let candidates: Vec<&str> = VALUE_OPTIONS
+            .iter()
+            .copied()
+            .filter(|name| {
+                head == *name
+                    || (head.len() > 2 && head.starts_with("--") && name.starts_with(head))
+            })
+            .collect();
+        if candidates.len() > 1 && !candidates.contains(&head) {
+            return argparse_error(
+                BUILD_USAGE,
+                "wrkviz build",
+                &format!(
+                    "ambiguous option: {head} could match {}",
+                    candidates.join(", ")
+                ),
+            );
+        }
+        let Some(name) = candidates.first() else {
+            return argparse_error(
+                BUILD_USAGE,
+                "wrkviz build",
+                &format!("unrecognized arguments: {arg}"),
+            );
+        };
+        let name = *name;
+        let value = match explicit {
+            Some(value) => value,
+            None => {
+                index += 1;
+                match args.get(index) {
+                    Some(value) => value.clone(),
+                    None => {
+                        return argparse_error(
+                            BUILD_USAGE,
+                            "wrkviz build",
+                            &format!("argument {name}: expected one argument"),
+                        )
+                    }
+                }
+            }
+        };
+        values.entry(name.to_string()).or_default().push(value);
+        index += 1;
+    }
+    let get = |name: &str| values.get(name).and_then(|items| items.last()).cloned();
+    let missing: Vec<&str> = ["--output", "--team"]
+        .into_iter()
+        .filter(|name| get(name).is_none())
+        .collect();
+    if !missing.is_empty() {
+        return argparse_error(
+            BUILD_USAGE,
+            "wrkviz build",
+            &format!(
+                "the following arguments are required: {}",
+                missing.join(", ")
+            ),
+        );
+    }
+    let phase_minutes: i64 = match get("--phase-minutes") {
+        None => 30,
+        Some(raw) => match raw.parse::<i64>() {
+            Ok(value) => value,
+            Err(_) => {
+                return argparse_error(
+                    BUILD_USAGE,
+                    "wrkviz build",
+                    &format!(
+                        "argument --phase-minutes: invalid int value: {}",
+                        crate::json::py_repr_str(&raw)
+                    ),
+                )
+            }
+        },
+    };
+    let output = get("--output").unwrap();
+    let team_slug = get("--team").unwrap();
+    let archive = cli_path(&output);
+    let started = crate::pipeline::utc_now();
+    let mut command: Vec<String> = vec!["wrkviz".to_string(), "build".to_string()];
+    command.extend(args.iter().cloned());
+
+    let outcome = crate::build_pipeline::build_archive(
+        &archive,
+        &team_slug,
+        phase_minutes,
+        None,
+        &[],
+        None,
+        true,
+        true,
+    );
+    match outcome {
+        Ok(report) => {
+            println!(
+                "build: {} tracks, {} phases, {} edges, {} Markdown files; {} presentation files changed",
+                report.agents, report.phases, report.edges, report.summary_files, report.files_changed
+            );
+            if let Ok(root) = crate::summarize_pipeline::summary_root(&archive, &team_slug) {
+                let state = crate::summary_budget::load_state(&root);
+                if let Some(warning) = crate::summary_budget::partial_warning(state.as_ref()) {
+                    eprintln!("wrkviz: warning: {warning}");
+                }
+            }
+            let build_json = report.to_json_obj();
+            match crate::pipeline::record_run_build(
+                &archive,
+                &crate::pipeline::RunReceipt {
+                    command: &command,
+                    started_at: &started,
+                    status: "completed",
+                    team_slug: &team_slug,
+                    error: None,
+                    team_slugs: &[],
+                    mechanical: None,
+                    ingest: None,
+                },
+                Some(build_json),
+            ) {
+                Ok(run_path) => {
+                    println!("run metadata: {}", run_path.display());
+                    println!("open: cd {} && make serve", archive.display());
+                    0
+                }
+                Err(error) => {
+                    eprintln!("wrkviz: {error}");
+                    2
+                }
+            }
+        }
+        Err(error) => {
+            if let Ok(run_path) = crate::pipeline::record_run_build(
+                &archive,
+                &crate::pipeline::RunReceipt {
+                    command: &command,
+                    started_at: &started,
+                    status: "failed",
+                    team_slug: &team_slug,
+                    error: Some(&error),
+                    team_slugs: &[],
+                    mechanical: None,
+                    ingest: None,
+                },
+                None,
+            ) {
+                eprintln!("run metadata: {}", run_path.display());
+            }
+            eprintln!("wrkviz: {error}");
+            2
+        }
+    }
+}
 
 fn run_summarize(args: &[String]) -> u8 {
     crate::summarize_core::install_interrupt_handler();

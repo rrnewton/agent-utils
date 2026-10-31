@@ -388,10 +388,30 @@ pub fn record_run_summaries(
     record_run_locked(archive, receipt, summaries)
 }
 
+/// Record a run carrying a build report payload.
+pub fn record_run_build(
+    archive: &Path,
+    receipt: &RunReceipt<'_>,
+    build: Option<Value>,
+) -> Result<PathBuf, String> {
+    let _lock = archive_writer_lock(archive)?;
+    record_run_locked_full(archive, receipt, None, build)
+}
+
 fn record_run_locked(
     archive: &Path,
     receipt: &RunReceipt<'_>,
     summaries: Option<Value>,
+) -> Result<PathBuf, String> {
+    record_run_locked_full(archive, receipt, summaries, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_run_locked_full(
+    archive: &Path,
+    receipt: &RunReceipt<'_>,
+    summaries: Option<Value>,
+    build: Option<Value>,
 ) -> Result<PathBuf, String> {
     let (command, started_at, status, team_slug, error, team_slugs, mechanical) = (
         receipt.command,
@@ -451,7 +471,10 @@ fn record_run_locked(
         receipt.ingest.clone().unwrap_or(Value::Null),
     );
     run_obj.insert("summaries".into(), summaries.unwrap_or(Value::Null));
-    run_obj.insert("build".into(), Value::Object(serde_json::Map::new()));
+    run_obj.insert(
+        "build".into(),
+        build.unwrap_or_else(|| Value::Object(serde_json::Map::new())),
+    );
     run_obj.insert(
         "error".into(),
         error.map_or(Value::Null, |text| Value::String(text.to_string())),

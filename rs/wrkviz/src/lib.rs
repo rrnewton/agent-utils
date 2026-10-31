@@ -16,8 +16,14 @@
 
 #![forbid(unsafe_code)]
 
+/// Token-free activity bins.
+pub mod activity_bins;
 /// Deterministic work-output artifact extraction.
 pub mod artifacts;
+/// Deterministic gzip sidecars, glossary rendering, GitHub refs.
+pub mod build_assets;
+pub mod build_pipeline;
+pub mod build_render;
 /// Where a team's build state lives.
 pub mod build_store;
 /// Claude Code session lineage ingestion.
@@ -56,6 +62,10 @@ pub mod project_config;
 /// The `query list` subcommand over schema-3 and schema-1
 /// timelines.
 pub mod query;
+/// Trigram Bloom filters for search shards.
+pub mod search_bloom;
+/// Transcript search records.
+pub mod search_index;
 /// The seekable JSONL writer.
 pub mod seekable;
 /// The `serve` subcommand: a loopback static server for a
@@ -78,20 +88,12 @@ pub mod summary_catalog;
 pub mod summary_periods;
 /// Phase windows and transcript views for summaries.
 pub mod summary_phases;
-/// Deterministic gzip sidecars, glossary rendering, GitHub refs.
-pub mod build_assets;
-/// Token-free activity bins.
-pub mod activity_bins;
-/// Transcript search records.
-pub mod search_index;
-/// Trigram Bloom filters for search shards.
-pub mod search_bloom;
-/// Schema 3 timeline shards and bootstrap.
-pub mod timeline_v3;
 /// Registered summarizer contracts and context coverage.
 pub mod summary_registry;
 /// The normalized team snapshot (`raw/team.json`) reader.
 pub mod team_data;
+/// Schema 3 timeline shards and bootstrap.
+pub mod timeline_v3;
 /// Token-usage records and batch receipts.
 pub mod token_usage;
 /// The extract-transcripts projection.

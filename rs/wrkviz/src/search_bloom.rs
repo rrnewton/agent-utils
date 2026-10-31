@@ -137,9 +137,8 @@ pub fn build_trigram_bloom(texts: &[String]) -> TrigramBloom {
     for text in texts {
         trigrams.extend(search_text_trigrams(text));
     }
-    let bit_count = next_power_of_two(
-        (trigrams.len() as i64 * BITS_PER_TRIGRAM).max(MINIMUM_BIT_COUNT),
-    );
+    let bit_count =
+        next_power_of_two((trigrams.len() as i64 * BITS_PER_TRIGRAM).max(MINIMUM_BIT_COUNT));
     let mut bits = vec![0u8; (bit_count / 8) as usize];
     for trigram in &trigrams {
         for position in bit_positions(trigram, bit_count, TRIGRAM_BLOOM_HASH_COUNT) {
