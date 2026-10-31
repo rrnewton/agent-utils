@@ -201,3 +201,28 @@ verified on the commit that landed.
 Remaining wrkviz: composites (refresh/export/gc/migrate/audit/
 responsiveness/discover-agents/userguide), the edition switch at
 parity, and the generated-schema collapse.
+
+## Slice 9 scoping: composites, in porting order
+
+Remaining unported commands (help sizes in lines: export 26,
+gc 20, migrate-build-state 27, migrate-snapshots 28,
+github-metadata 14, audit-glossary 14, audit-losslessness 19,
+refresh 124, refresh-claude 121, refresh-orc 139,
+responsiveness 50, discover-agents 50, `--userguide`):
+
+1. `export` — CLI-side window parsing over the landed
+   `build_archive` output/display-window support; multi-team
+   alignment is the open question at slice start.
+2. `gc` — manifest-authoritative file classification
+   (`py/wrkviz/gc.py`), report first, `--delete` to trash.
+3. `migrate-build-state` / `migrate-snapshots` — filesystem
+   moves with existing Rust store helpers nearby.
+4. `github-metadata` — cache load/validate already ported for
+   build; enrichment fetch is the remaining piece.
+5. `refresh`, `refresh-claude`, `refresh-orc` — orchestration
+   over landed ingest/summarize/build.
+6. `audit-glossary`, `audit-losslessness` — report generators.
+7. `responsiveness`, `discover-agents`, `--userguide`.
+
+Each lands with its own fixture differential, gate, and note,
+same rules as slices 1-8.
