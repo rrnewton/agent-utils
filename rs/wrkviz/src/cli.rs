@@ -372,6 +372,7 @@ pub fn run(args: &[String]) -> u8 {
         "ingest" => run_ingest(&args[1..]),
         "summarize" => run_summarize(&args[1..]),
         "build" => run_build(&args[1..]),
+        "export" => run_export(&args[1..]),
         other => {
             eprintln!(
                 "wrkviz: the Rust edition has not ported '{other}' yet; the Python edition remains the oracle for it"
@@ -4613,6 +4614,285 @@ options:
 "##;
 
 const BUILD_USAGE: &str = "usage: wrkviz build [-h] --output OUTPUT --team TEAM\n                    [--phase-minutes PHASE_MINUTES]";
+
+/// Verbatim `wrkviz export --help` text.
+pub const EXPORT_HELP: &str = r##"usage: wrkviz export [-h] --archive ARCHIVE --output OUTPUT --team TEAM
+                     [--phase-minutes PHASE_MINUTES]
+                     [--start-date START_DATE | --start-time START_TIME]
+                     [--end-date END_DATE | --end-time END_TIME]
+                     [--timezone TIMEZONE]
+                     [--rollup-kind {hourly,daily,weekly,monthly,quarterly}]
+
+build a zero-token website slice in a separate directory
+
+options:
+  -h, --help            show this help message and exit
+  --archive ARCHIVE     durable source archive
+  --output OUTPUT       website export directory
+  --team TEAM           team slug to export; repeat to align multiple teams in
+                        one site
+  --phase-minutes PHASE_MINUTES
+  --start-date START_DATE
+                        first local date to export
+  --start-time START_TIME
+                        first RFC3339 instant to export
+  --end-date END_DATE   exclusive local date boundary
+  --end-time END_TIME   exclusive RFC3339 instant
+  --timezone TIMEZONE   IANA timezone for date bounds (defaults to the
+                        archived team timezone)
+  --rollup-kind {hourly,daily,weekly,monthly,quarterly}
+                        calendar summary level to include; repeat as needed
+"##;
+
+const EXPORT_USAGE: &str = "usage: wrkviz export [-h] --archive ARCHIVE --output OUTPUT --team TEAM\n                     [--phase-minutes PHASE_MINUTES]\n                     [--start-date START_DATE | --start-time START_TIME]\n                     [--end-date END_DATE | --end-time END_TIME]\n                     [--timezone TIMEZONE]\n                     [--rollup-kind {hourly,daily,weekly,monthly,quarterly}]";
+
+fn run_export(args: &[String]) -> u8 {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print!("{EXPORT_HELP}");
+        return 0;
+    }
+    const VALUE_OPTIONS: &[&str] = &[
+        "--archive",
+        "--output",
+        "--team",
+        "--phase-minutes",
+        "--start-date",
+        "--start-time",
+        "--end-date",
+        "--end-time",
+        "--timezone",
+        "--rollup-kind",
+    ];
+    let mut values: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        let (head, explicit) = match arg.split_once('=') {
+            Some((head, value)) => (head, Some(value.to_string())),
+            None => (arg.as_str(), None),
+        };
+        let candidates: Vec<&str> = VALUE_OPTIONS
+            .iter()
+            .copied()
+            .filter(|name| {
+                head == *name
+                    || (head.len() > 2 && head.starts_with("--") && name.starts_with(head))
+            })
+            .collect();
+        if candidates.len() > 1 && !candidates.contains(&head) {
+            return argparse_error(
+                EXPORT_USAGE,
+                "wrkviz export",
+                &format!(
+                    "ambiguous option: {head} could match {}",
+                    candidates.join(", ")
+                ),
+            );
+        }
+        let Some(name) = candidates.first() else {
+            return argparse_error(
+                EXPORT_USAGE,
+                "wrkviz export",
+                &format!("unrecognized arguments: {arg}"),
+            );
+        };
+        let name = *name;
+        let value = match explicit {
+            Some(value) => value,
+            None => {
+                index += 1;
+                match args.get(index) {
+                    Some(value) => value.clone(),
+                    None => {
+                        return argparse_error(
+                            EXPORT_USAGE,
+                            "wrkviz export",
+                            &format!("argument {name}: expected one argument"),
+                        )
+                    }
+                }
+            }
+        };
+        values.entry(name.to_string()).or_default().push(value);
+        index += 1;
+    }
+    let get = |name: &str| values.get(name).and_then(|items| items.last()).cloned();
+    let get_all = |name: &str| values.get(name).cloned().unwrap_or_default();
+    let missing: Vec<&str> = ["--archive", "--output", "--team"]
+        .into_iter()
+        .filter(|name| get(name).is_none())
+        .collect();
+    if !missing.is_empty() {
+        return argparse_error(
+            EXPORT_USAGE,
+            "wrkviz export",
+            &format!(
+                "the following arguments are required: {}",
+                missing.join(", ")
+            ),
+        );
+    }
+    if get("--start-date").is_some() && get("--start-time").is_some() {
+        return argparse_error(
+            EXPORT_USAGE,
+            "wrkviz export",
+            "argument --start-time: not allowed with argument --start-date",
+        );
+    }
+    if get("--end-date").is_some() && get("--end-time").is_some() {
+        return argparse_error(
+            EXPORT_USAGE,
+            "wrkviz export",
+            "argument --end-time: not allowed with argument --end-date",
+        );
+    }
+    let rollup_kinds = get_all("--rollup-kind");
+    for kind in &rollup_kinds {
+        if !matches!(
+            kind.as_str(),
+            "hourly" | "daily" | "weekly" | "monthly" | "quarterly"
+        ) {
+            return argparse_error(
+                EXPORT_USAGE,
+                "wrkviz export",
+                &format!(
+                    "argument --rollup-kind: invalid choice: {} (choose from 'hourly', 'daily', 'weekly', 'monthly', 'quarterly')",
+                    crate::json::py_repr_str(kind)
+                ),
+            );
+        }
+    }
+    let phase_minutes: i64 = match get("--phase-minutes") {
+        None => 30,
+        Some(raw) => match raw.parse::<i64>() {
+            Ok(value) => value,
+            Err(_) => {
+                return argparse_error(
+                    EXPORT_USAGE,
+                    "wrkviz export",
+                    &format!(
+                        "argument --phase-minutes: invalid int value: {}",
+                        crate::json::py_repr_str(&raw)
+                    ),
+                )
+            }
+        },
+    };
+    let archive = cli_path(&get("--archive").unwrap());
+    let target = cli_path(&get("--output").unwrap());
+    let team_slugs = get_all("--team");
+    let team_slug = team_slugs[0].clone();
+    let started = crate::pipeline::utc_now();
+    let mut command: Vec<String> = vec!["wrkviz".to_string(), "export".to_string()];
+    command.extend(args.iter().cloned());
+
+    if team_slugs.len() != 1 {
+        let error = "the Rust edition has not ported multi-team export ('build_combined_archive') yet; the Python edition remains the oracle for it".to_string();
+        eprintln!("wrkviz: {error}");
+        return 2;
+    }
+
+    let selection = (|| -> Result<(Option<crate::window::DateWindow>, Vec<String>), String> {
+        let team = crate::pipeline::load_archived_team(&archive, &team_slug)?;
+        let timezone_name = match get("--timezone") {
+            Some(name) => name,
+            None => team.display_timezone.clone(),
+        };
+        let window = crate::window::parse_date_window(
+            get("--start-date").as_deref(),
+            get("--end-date").as_deref(),
+            &timezone_name,
+            get("--start-time").as_deref(),
+            get("--end-time").as_deref(),
+        )?;
+        let kinds = if rollup_kinds.is_empty() {
+            ["daily", "weekly", "monthly", "quarterly"]
+                .iter()
+                .map(|item| item.to_string())
+                .collect()
+        } else {
+            rollup_kinds.clone()
+        };
+        Ok((window, kinds))
+    })();
+
+    let outcome = selection.and_then(|(window, kinds)| {
+        crate::build_pipeline::build_archive(
+            &archive,
+            &team_slug,
+            phase_minutes,
+            window.as_ref(),
+            &kinds,
+            Some(&target),
+            true,
+            true,
+        )
+    });
+    match outcome {
+        Ok(report) => {
+            let build_json = report.to_json_obj();
+            let mechanical = {
+                let mut website = serde_json::Map::new();
+                website.insert("schema_version".into(), 1.into());
+                website.insert("model_calls".into(), 0.into());
+                website.insert("model_tokens".into(), 0.into());
+                website.insert("website_build_performed".into(), true.into());
+                let mut outer = serde_json::Map::new();
+                outer.insert("website_export".into(), serde_json::Value::Object(website));
+                serde_json::Value::Object(outer)
+            };
+            println!(
+                "export: 1 team(s), {} tracks, {} phases, {} rollups; {} files changed",
+                report.agents, report.phases, report.rollups, report.files_changed
+            );
+            match crate::pipeline::record_run_build(
+                &target,
+                &crate::pipeline::RunReceipt {
+                    command: &command,
+                    started_at: &started,
+                    status: "completed",
+                    team_slug: &team_slug,
+                    error: None,
+                    team_slugs: &team_slugs,
+                    mechanical: Some(mechanical.clone()),
+                    ingest: None,
+                },
+                Some(build_json),
+            ) {
+                Ok(run_path) => {
+                    println!("run metadata: {}", run_path.display());
+                    println!("open: cd {} && make serve", target.display());
+                    0
+                }
+                Err(error) => {
+                    eprintln!("wrkviz: {error}");
+                    2
+                }
+            }
+        }
+        Err(error) => {
+            if let Ok(run_path) = crate::pipeline::record_run_build(
+                &target,
+                &crate::pipeline::RunReceipt {
+                    command: &command,
+                    started_at: &started,
+                    status: "failed",
+                    team_slug: &team_slug,
+                    error: Some(&error),
+                    team_slugs: &team_slugs,
+                    mechanical: None,
+                    ingest: None,
+                },
+                None,
+            ) {
+                eprintln!("run metadata: {}", run_path.display());
+            }
+            eprintln!("wrkviz: {error}");
+            2
+        }
+    }
+}
 
 fn run_build(args: &[String]) -> u8 {
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {

@@ -37,7 +37,8 @@ ID_KEYS = {"usage_receipt_id", "receipt_id", "batch_receipt_ids",
 # Compressed-size/digest fields depend on the zlib generation that
 # produced a member; the uncompressed digests are compared as-is.
 GEN_KEYS = {"c_bytes", "c_size", "c_sha256", "c_off", "c_len",
-            "shard_object_bytes", "shard_transfer_bytes"}
+            "shard_object_bytes", "shard_transfer_bytes",
+            "bootstrap_bytes", "bootstrap_transfer_bytes"}
 
 
 @pytest.fixture(scope="module")
@@ -121,7 +122,7 @@ def _scrub(value: object) -> object:
                 out[key] = "<gen>"
             elif key == "command" and isinstance(item, list):
                 out[key] = [
-                    re.sub(r"(py|rs)-(out|multi)", "OUT", str(arg)) for arg in item
+                    re.sub(r"(py|rs)-[a-z]+", "OUT", str(arg)) for arg in item
                 ]
             else:
                 out[key] = _scrub(item)
@@ -129,7 +130,7 @@ def _scrub(value: object) -> object:
     if isinstance(value, list):
         return [_scrub(item) for item in value]
     if isinstance(value, str):
-        value = re.sub(r"(py|rs)-(out|multi)", "OUT", value)
+        value = re.sub(r"(py|rs)-[a-z]+", "OUT", value)
         return re.sub(r"[0-9a-f]{64}", "HASH", value)
     return value
 
@@ -399,6 +400,45 @@ def test_build_parent_symlink_refused(
 
     archives = _tamper_archives(tmp_path, rust_wrkviz, mutate)
     _both(archives, ["build"], expect=2)
+
+
+def _export_both(
+    archives: dict[str, Path],
+    targets: dict[str, Path],
+    args: list[str],
+) -> None:
+    outcomes = {}
+    for label, command in (("py", [sys.executable, str(PYTHON_WRKVIZ)]),
+                           ("rs", [str(RUST_WRKVIZ)])):
+        outcomes[label] = _run(command, [
+            "export", "--archive", str(archives[label]),
+            "--output", str(targets[label]),
+            "--team", "widget", *args,
+        ])
+    oracle, result = outcomes["py"], outcomes["rs"]
+    assert oracle.returncode == 0, oracle.stderr
+    assert result.returncode == oracle.returncode
+    assert _normalize(result.stdout, targets["rs"]) == _normalize(
+        oracle.stdout, targets["py"])
+    assert _normalize(result.stderr, targets["rs"]) == _normalize(
+        oracle.stderr, targets["py"])
+    assert _tree(targets["rs"]) == _tree(targets["py"])
+    assert _tree(archives["rs"]) == _tree(archives["py"])
+
+
+def test_export_full_and_windowed(tmp_path: Path, rust_wrkviz: Path) -> None:
+    archives = _ingest(tmp_path, rust_wrkviz)
+    _both(archives, ["summarize", "--backend", "heuristic",
+                     "--model", "offline"])
+    full = {label: tmp_path / f"{label}-export"
+            for label in ("py", "rs")}
+    _export_both(archives, full, [])
+    windowed = {label: tmp_path / f"{label}-slice"
+                for label in ("py", "rs")}
+    _export_both(archives, windowed, [
+        "--start-date", "2026-01-01", "--end-date", "2026-01-02",
+        "--rollup-kind", "daily",
+    ])
 
 
 def test_build_missing_team(tmp_path: Path, rust_wrkviz: Path) -> None:
