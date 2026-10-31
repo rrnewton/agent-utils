@@ -366,7 +366,10 @@ fn nested_agents_registry(registry: &Path) -> Option<PathBuf> {
         parent.join("profiles.json"),
         parent.join("coordinator.json"),
     ];
-    markers.iter().any(|marker| marker.exists()).then(|| parent.to_path_buf())
+    markers
+        .iter()
+        .any(|marker| marker.exists())
+        .then(|| parent.to_path_buf())
 }
 
 /// Move every layout-1 agent of `registry` to layout 2 and delete the layout-1 lock files
@@ -850,7 +853,10 @@ mod tests {
         fs::write(agents.join("agent.json"), "\"sentinel\"").unwrap();
         fs::create_dir(agents.join("lane-a")).unwrap();
         let error = migrate(&agents, APPLY_NOW).unwrap_err();
-        assert!(error.to_string().contains("agents/ subdirectory"), "{error}");
+        assert!(
+            error.to_string().contains("agents/ subdirectory"),
+            "{error}"
+        );
         assert!(agents.join("lane-a").is_dir());
         assert!(!agents.join("agents").exists());
         let _ = fs::remove_dir_all(&registry);
