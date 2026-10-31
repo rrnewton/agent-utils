@@ -394,7 +394,10 @@ fn check_fields(
 
 fn required_string(value: Option<&Value>, where_: &str) -> Result<String, String> {
     let held = as_string(value.unwrap_or(&Value::Null), where_)?;
-    let held = held.trim().to_string();
+    // CPython's strip also removes U+001C..U+001F.
+    let held = held
+        .trim_matches(|held: char| held.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&held))
+        .to_string();
     if held.is_empty() || held.contains('\0') {
         return Err(format!("{where_}: expected a non-empty string"));
     }
@@ -473,17 +476,24 @@ impl WindowSpec {
     }
 }
 
-fn expand_user(raw: &str) -> PathBuf {
+fn expand_user(raw: &str) -> Result<PathBuf, String> {
+    // The oracle raises for an unknown ~user or a missing
+    // HOME (a crash there); refuse by name rather than
+    // inventing a directory under the config tree.
     if raw == "~" || raw.starts_with("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(&raw[2.min(raw.len())..]);
-        }
+        let Some(home) = std::env::var_os("HOME") else {
+            return Err(format!("could not determine home directory for {raw}"));
+        };
+        return Ok(PathBuf::from(home).join(&raw[2.min(raw.len())..]));
     }
-    PathBuf::from(raw)
+    if raw.starts_with('~') {
+        return Err(format!("could not determine home directory for {raw}"));
+    }
+    Ok(PathBuf::from(raw))
 }
 
 fn relative_output(config_path: &Path, raw: &str) -> Result<PathBuf, String> {
-    let candidate = expand_user(raw);
+    let candidate = expand_user(raw)?;
     if candidate.is_absolute() {
         return Err("project config output must be relative to the config file".to_string());
     }
@@ -491,8 +501,8 @@ fn relative_output(config_path: &Path, raw: &str) -> Result<PathBuf, String> {
     Ok(crate::json::resolve_path(&parent.join(candidate)))
 }
 
-fn resolved_against(config_path: &Path, raw: &str) -> PathBuf {
-    let candidate = expand_user(raw);
+fn resolved_against(config_path: &Path, raw: &str) -> Result<PathBuf, String> {
+    let candidate = expand_user(raw)?;
     let absolute = if candidate.is_absolute() {
         candidate
     } else {
@@ -501,7 +511,7 @@ fn resolved_against(config_path: &Path, raw: &str) -> PathBuf {
             .unwrap_or(Path::new("/"))
             .join(candidate)
     };
-    crate::json::resolve_path(&absolute)
+    Ok(crate::json::resolve_path(&absolute))
 }
 
 fn project_values(value: &Value, where_: &str) -> Result<Vec<String>, String> {
@@ -622,7 +632,7 @@ fn codex_source(
                 value.get("sessions_root"),
                 &format!("{where_}.sessions_root"),
             )?,
-        ),
+        )?,
         root_session,
         continuation_sessions: continuations,
     })
@@ -638,7 +648,7 @@ fn claude_source(
         session_file: resolved_against(
             config_path,
             &required_string(value.get("session_file"), &format!("{where_}.session_file"))?,
-        ),
+        )?,
     })
 }
 
@@ -652,7 +662,7 @@ fn muse_source(
         session_dir: resolved_against(
             config_path,
             &required_string(value.get("session_dir"), &format!("{where_}.session_dir"))?,
-        ),
+        )?,
     })
 }
 
@@ -686,7 +696,7 @@ fn claude_history_source(
         history_file: resolved_against(
             config_path,
             &required_string(value.get("history_file"), &format!("{where_}.history_file"))?,
-        ),
+        )?,
         project_pattern: pattern,
         covered_sessions: covered,
     })
@@ -721,7 +731,7 @@ fn orc_source(
         source_root: resolved_against(
             config_path,
             &required_string(value.get("source_root"), &format!("{where_}.source_root"))?,
-        ),
+        )?,
         root_session,
         continuation_sessions: continuations,
     })
@@ -829,7 +839,7 @@ fn valid_team_slug(slug: &str) -> bool {
 /// Load and strictly validate one project-ingest schema-v1
 /// JSON file.
 pub fn load_project_ingest_config(path: &Path) -> Result<ProjectIngestConfig, String> {
-    let config_path = crate::json::resolve_path(&expand_user(&path.to_string_lossy()));
+    let config_path = crate::json::resolve_path(&expand_user(&path.to_string_lossy())?);
     let config_bytes =
         std::fs::read(&config_path).map_err(|error| crate::json::os_error(&error, &config_path))?;
     let text = String::from_utf8(config_bytes.clone())
@@ -850,11 +860,19 @@ pub fn load_project_ingest_config(path: &Path) -> Result<ProjectIngestConfig, St
             "snapshot_root",
         ],
     )?;
-    let schema_version = as_int(
-        root.get("schema_version").unwrap_or(&Value::Null),
-        &format!("{where_}.schema_version"),
-    )?;
-    if schema_version != PROJECT_INGEST_SCHEMA_VERSION {
+    // The oracle's integers are unbounded: an out-of-i64
+    // version still reads as a version, and is refused by
+    // value, not by type.
+    let schema_raw = root.get("schema_version").unwrap_or(&Value::Null);
+    let schema_version: i128 = match schema_raw {
+        Value::Number(held) => held
+            .as_i64()
+            .map(i128::from)
+            .or_else(|| held.to_string().parse::<i128>().ok())
+            .ok_or_else(|| format!("{where_}.schema_version: expected an integer"))?,
+        _ => as_int(schema_raw, &format!("{where_}.schema_version"))? as i128,
+    };
+    if schema_version != i128::from(PROJECT_INGEST_SCHEMA_VERSION) {
         return Err(format!(
             "{}: unsupported schema_version {}; expected {}",
             config_path.display(),
@@ -870,7 +888,7 @@ pub fn load_project_ingest_config(path: &Path) -> Result<ProjectIngestConfig, St
         Some(held) => Some(resolved_against(
             &config_path,
             &required_string(Some(held), &format!("{where_}.snapshot_root"))?,
-        )),
+        )?),
         None => None,
     };
     let timezone = match root.get("timezone") {
@@ -1036,11 +1054,14 @@ fn errno_error_type(message: &str) -> Option<&'static str> {
     let rest = message.strip_prefix("[Errno ")?;
     let errno: i64 = rest.split(']').next()?.parse().ok()?;
     Some(match errno {
+        1 | 13 => "PermissionError",
         2 => "FileNotFoundError",
-        13 => "PermissionError",
+        4 => "InterruptedError",
+        11 => "BlockingIOError",
         17 => "FileExistsError",
         20 => "NotADirectoryError",
         21 => "IsADirectoryError",
+        110 => "TimeoutError",
         _ => "OSError",
     })
 }

@@ -1006,6 +1006,26 @@ fn print_ingest_receipt(report: &crate::ingest::IngestReport, archive: &std::pat
             );
         }
     }
+    if report.history_unmatched_prompts != 0 || report.history_covered_prompts != 0 {
+        let mut parts: Vec<String> = Vec::new();
+        if report.history_unmatched_prompts != 0 {
+            parts.push(format!(
+                "{} prompt(s) typed outside the project pattern",
+                report.history_unmatched_prompts
+            ));
+        }
+        if report.history_covered_prompts != 0 {
+            parts.push(format!(
+                "{} prompt(s) from {} session(s) whose full transcript is archived as its own team",
+                report.history_covered_prompts, report.history_covered_sessions
+            ));
+        }
+        eprintln!(
+            "wrkviz: {}: left out {}",
+            report.team_slug,
+            parts.join("; ")
+        );
+    }
     if report.retired_message_projections != 0 {
         eprintln!(
             "wrkviz: {}: removed {} retired raw/messages/<thread-id>.json file(s) ({:.1} MiB); the tool no longer writes that per-thread projection, which nothing read and which raw/team.json still fully describes",

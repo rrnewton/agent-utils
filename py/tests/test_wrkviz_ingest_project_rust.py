@@ -300,6 +300,60 @@ def test_project_failing_team(tmp_path: Path, rust_wrkviz: Path) -> None:
     assert "team orc-team (orc):" in result.stderr
 
 
+def test_project_history_team(tmp_path: Path, rust_wrkviz: Path) -> None:
+    shared = tmp_path / "shared"
+    shared.mkdir(parents=True)
+    base = 1767225600000
+    rows = [
+        {"display": "Fix the widget parser", "timestamp": base,
+         "project": "/work/widget", "sessionId": "sess-new"},
+        {"display": "Other project prompt", "timestamp": base + 60_000,
+         "project": "/other/place", "sessionId": "sess-b"},
+        {"display": "Covered prompt", "timestamp": base + 120_000,
+         "project": "/work/widget", "sessionId": "sess-covered"},
+    ]
+    (shared / "history.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows))
+    stamp = "2026-01-01T00:00:00.000Z"
+    records = [
+        {"type": "user", "uuid": "u1", "sessionId": "sess-covered",
+         "timestamp": stamp,
+         "message": {"role": "user", "content": "Covered prompt"}},
+        {"type": "assistant", "uuid": "u2", "sessionId": "sess-covered",
+         "timestamp": stamp,
+         "message": {"role": "assistant",
+                     "content": [{"type": "text", "text": "Done"}]}},
+    ]
+    (shared / "sess-covered.jsonl").write_bytes(b"".join(
+        json.dumps(item, sort_keys=True).encode() + b"\n" for item in records))
+    outcomes = {}
+    for label, cmd in (("py", [sys.executable, str(PYTHON_WRKVIZ)]),
+                       ("rs", [str(rust_wrkviz)])):
+        doc: dict[str, object] = {
+            "schema_version": 1, "output": f"{label}-out",
+            "teams": [
+                {"slug": "claude-team", "provider": "claude",
+                 "source": {"session_file": "sess-covered.jsonl"}},
+                {"slug": "history-team", "provider": "claude-history",
+                 "source": {"history_file": "history.jsonl",
+                            "project_pattern": "/work/widget"}},
+            ],
+        }
+        cfg = shared / f"project-{label}.json"
+        cfg.write_text(json.dumps(doc, indent=1))
+        outcomes[label] = _run(cmd, ["--config", str(cfg)])
+    oracle, result = outcomes["py"], outcomes["rs"]
+    assert oracle.returncode == 0, oracle.stderr
+    assert result.returncode == 0
+    assert "left out 1 prompt(s) typed outside the project pattern; " \
+        "1 prompt(s) from 1 session(s)" in result.stderr
+    assert _normalize(result.stdout, shared, "rs") == \
+        _normalize(oracle.stdout, shared, "py")
+    assert _normalize(result.stderr, shared, "rs") == \
+        _normalize(oracle.stderr, shared, "py")
+    assert _archives(shared, "rs") == _archives(shared, "py")
+
+
 def test_project_bad_configs(tmp_path: Path, rust_wrkviz: Path) -> None:
     shared = tmp_path / "shared"
     shared.mkdir(parents=True)
