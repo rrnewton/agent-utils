@@ -22,6 +22,10 @@ pub mod artifacts;
 pub mod build_store;
 /// The CLI surface: `wrkviz inspect --output <archive>`.
 pub mod cli;
+/// Codex rollout lineage ingestion.
+pub mod codex;
+/// Upstream sources compressed in place.
+pub mod compressed;
 /// Claude Code prompt-history ingestion.
 pub mod history;
 /// Site identity records.

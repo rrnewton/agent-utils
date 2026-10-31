@@ -532,3 +532,115 @@ pub fn merge_site_identity(
         display_timezone_source: timezone_source,
     })
 }
+
+fn inferred_project(
+    metadata: &serde_json::Map<String, Value>,
+    primary: bool,
+) -> Option<ProjectIdentity> {
+    let git = map_of(metadata.get("git"));
+    let remote =
+        str_of(git.get("repository_url")).or_else(|| str_of(metadata.get("repository_url")));
+    if let Some(remote) = remote {
+        if let Ok(canonical) = canonical_repository_url(&remote) {
+            if let Ok(label) = project_label_from_url(&canonical) {
+                return Some(ProjectIdentity {
+                    label,
+                    repository_url: Some(canonical),
+                    primary,
+                    source: "session_metadata".to_string(),
+                });
+            }
+        }
+    }
+    let cwd = str_of(metadata.get("cwd"))?;
+    let cwd = cwd.trim();
+    let label = cwd
+        .rsplit('/')
+        .find(|part| !part.is_empty() && *part != ".")
+        .unwrap_or_default()
+        .to_string();
+    if label.is_empty() {
+        return None;
+    }
+    Some(ProjectIdentity {
+        label,
+        repository_url: None,
+        primary,
+        source: "session_metadata".to_string(),
+    })
+}
+
+fn inferred_host(metadata: &serde_json::Map<String, Value>) -> Option<HostIdentity> {
+    let environment = map_of(metadata.get("environment"));
+    let raw = str_of(metadata.get("hostname"))
+        .or_else(|| str_of(metadata.get("host_name")))
+        .or_else(|| str_of(environment.get("hostname")))?;
+    let validated = explicit_host(&raw).ok()?;
+    Some(HostIdentity {
+        hostname: validated.hostname,
+        source: "session_metadata".to_string(),
+    })
+}
+
+/// Infer identity only from structured, provider-owned
+/// metadata fields.
+pub fn infer_structured_identity(
+    records: &[serde_json::Map<String, Value>],
+) -> (Vec<ProjectIdentity>, Vec<HostIdentity>) {
+    let mut projects: Vec<ProjectIdentity> = Vec::new();
+    let mut project_keys: Vec<String> = Vec::new();
+    let mut hosts: Vec<HostIdentity> = Vec::new();
+    for metadata in records {
+        if let Some(project) = inferred_project(metadata, projects.is_empty()) {
+            let key = project
+                .repository_url
+                .clone()
+                .unwrap_or_else(|| casefold(&project.label));
+            let label_match = projects.iter().position(|prior| {
+                casefold(&prior.label) == casefold(&project.label)
+                    && (prior.repository_url.is_none() || project.repository_url.is_none())
+            });
+            match label_match {
+                Some(index) => {
+                    let prior = projects[index].clone();
+                    if prior.repository_url.is_none() && project.repository_url.is_some() {
+                        project_keys.retain(|held| *held != casefold(&prior.label));
+                        let mut replacement = project.clone();
+                        replacement.primary = prior.primary || project.primary;
+                        projects[index] = replacement;
+                        project_keys.push(key);
+                    }
+                }
+                None => {
+                    if !project_keys.contains(&key) {
+                        project_keys.push(key);
+                        projects.push(project);
+                    }
+                }
+            }
+        }
+        if let Some(host) = inferred_host(metadata) {
+            if !hosts.iter().any(|held| held.hostname == host.hostname) {
+                hosts.push(host);
+            }
+        }
+    }
+    (projects, hosts)
+}
+
+fn str_of(value: Option<&Value>) -> Option<String> {
+    // The Python `_string`: stripped, with empty reading as
+    // absent.
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+}
+
+fn map_of(value: Option<&Value>) -> serde_json::Map<String, Value> {
+    value
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default()
+}

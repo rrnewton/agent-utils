@@ -12,7 +12,7 @@ use crate::history::{
     HistorySelection,
 };
 use crate::identity::{merge_site_identity, site_identity_from_json, IdentityOverrides};
-use crate::json::{dump_compact, py_repr_str, read_json};
+use crate::json::{as_object, dump_compact, py_repr_str, read_json};
 use crate::payloads::merge_payloads;
 use crate::snapshot_store::{
     ensure_snapshot_store, resolve_snapshot_root, write_pointer, SnapshotLocation,
@@ -645,4 +645,380 @@ fn ingest_claude_history_locked(
     report.history_covered_prompts = selection.covered_prompts;
     report.history_covered_sessions = selection.covered_sessions;
     Ok((team, report))
+}
+
+// ---------------------------------------------------------------- Codex
+
+/// The recorded Codex manifest state for one team.
+pub struct CodexManifestState {
+    /// Recorded sources.
+    pub sources: Vec<crate::history::SourceCopy>,
+    /// Recorded continuation links.
+    pub continuation_links: Vec<crate::codex::ContinuationLink>,
+    /// Effective continuation thread ids.
+    pub continuation_thread_ids: Vec<String>,
+}
+
+fn manifest_window_value(window: Option<&DateWindow>) -> Value {
+    window.map_or(Value::Null, DateWindow::to_json)
+}
+
+fn manifest_window_bounds(
+    value: &Value,
+    where_: &str,
+) -> Result<(Option<i64>, Option<i64>), String> {
+    if value.is_null() {
+        return Ok((None, None));
+    }
+    let object = as_object(value, where_)?;
+    let keys: Vec<&str> = object.keys().map(String::as_str).collect();
+    let base = ["start_date", "end_date", "start_ms", "end_ms"];
+    let exact = [
+        "start_date",
+        "end_date",
+        "start_ms",
+        "end_ms",
+        "start_time",
+        "end_time",
+    ];
+    let is_base = keys.len() == base.len() && base.iter().all(|key| object.contains_key(*key));
+    let is_exact = keys.len() == exact.len() && exact.iter().all(|key| object.contains_key(*key));
+    if !is_base && !is_exact {
+        return Err(format!("{where_}: invalid date-window fields"));
+    }
+    let start = match object.get("start_ms") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(crate::json::as_int(value, &format!("{where_}.start_ms"))?),
+    };
+    let end = match object.get("end_ms") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(crate::json::as_int(value, &format!("{where_}.end_ms"))?),
+    };
+    Ok((start, end))
+}
+
+fn window_is_same_or_narrower(
+    recorded: &Value,
+    requested: &Value,
+    where_: &str,
+) -> Result<bool, String> {
+    let (recorded_start, recorded_end) =
+        manifest_window_bounds(recorded, &format!("{where_}.recorded"))?;
+    let (requested_start, requested_end) =
+        manifest_window_bounds(requested, &format!("{where_}.requested"))?;
+    let start_is_narrower = recorded_start.is_none()
+        || requested_start.is_some_and(|start| start >= recorded_start.unwrap());
+    let end_is_narrower =
+        recorded_end.is_none() || requested_end.is_some_and(|end| end <= recorded_end.unwrap());
+    Ok(start_is_narrower && end_is_narrower)
+}
+
+fn validate_manifest_window(
+    recorded: &Value,
+    window: Option<&DateWindow>,
+    where_: &str,
+) -> Result<(), String> {
+    let requested = manifest_window_value(window);
+    if recorded == &requested {
+        return Ok(());
+    }
+    match window_is_same_or_narrower(recorded, &requested, where_) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(
+            "archive date window may only stay unchanged or become narrower; \
+             choose a new output directory to widen it"
+                .to_string(),
+        ),
+        Err(error) => Err(format!("invalid archived date window: {error}")),
+    }
+}
+
+/// Load the recorded Codex source manifest, if any.
+pub fn load_codex_manifest(
+    archive: &Path,
+    team_slug: &str,
+    root_thread_id: &str,
+    date_window: Option<&DateWindow>,
+    requested_continuation_thread_ids: &[String],
+) -> Result<CodexManifestState, String> {
+    let path = build_raw(archive, team_slug, "source-manifest.json")?;
+    if !path.is_file() {
+        return Ok(CodexManifestState {
+            sources: Vec::new(),
+            continuation_links: Vec::new(),
+            continuation_thread_ids: requested_continuation_thread_ids.to_vec(),
+        });
+    }
+    let document = read_json(&path)?;
+    let object = as_object(&document, &path.display().to_string())?;
+    if !crate::json::json_eq_one(object.get("schema_version"))
+        || object.get("provider").and_then(Value::as_str) != Some("codex")
+    {
+        return Err(format!(
+            "invalid Codex source manifest at {}",
+            path.display()
+        ));
+    }
+    let recorded_root = crate::json::as_string(
+        object.get("root_thread_id").unwrap_or(&Value::Null),
+        &format!("{}: root_thread_id", path.display()),
+    )?;
+    if recorded_root != root_thread_id {
+        return Err(format!(
+            "source manifest belongs to root {}, not {}",
+            py_repr_str(recorded_root),
+            py_repr_str(root_thread_id)
+        ));
+    }
+    let null = Value::Null;
+    validate_manifest_window(
+        object.get("date_window").unwrap_or(&null),
+        date_window,
+        &path.display().to_string(),
+    )?;
+    let raw_sources = crate::json::as_array(
+        object.get("sources").unwrap_or(&null),
+        &format!("{}: sources", path.display()),
+    )?;
+    let mut sources = Vec::new();
+    for (index, raw_source) in raw_sources.iter().enumerate() {
+        let where_ = format!("{}: sources[{index}]", path.display());
+        let _ = as_object(raw_source, &where_)?;
+        sources.push(crate::codex::codex_source_from_json(raw_source, &where_)?);
+    }
+    let mut links = Vec::new();
+    if let Some(raw_continuations) = object
+        .get("continuation_sessions")
+        .filter(|value| !value.is_null())
+    {
+        let values = crate::json::as_array(
+            raw_continuations,
+            &format!("{}: continuation_sessions", path.display()),
+        )?;
+        for (index, raw_link) in values.iter().enumerate() {
+            links.push(crate::codex::ContinuationLink::from_json(
+                raw_link,
+                &format!("{}: continuation_sessions[{index}]", path.display()),
+            )?);
+        }
+    }
+    let recorded_ids: Vec<String> = links.iter().map(|link| link.thread_id.clone()).collect();
+    let effective_ids = if !requested_continuation_thread_ids.is_empty() {
+        if recorded_ids.as_slice()
+            != &requested_continuation_thread_ids[..recorded_ids
+                .len()
+                .min(requested_continuation_thread_ids.len())]
+            || recorded_ids.len() > requested_continuation_thread_ids.len()
+        {
+            return Err(
+                "requested continuation sessions do not extend the recorded ordered prefix"
+                    .to_string(),
+            );
+        }
+        requested_continuation_thread_ids.to_vec()
+    } else {
+        recorded_ids
+    };
+    Ok(CodexManifestState {
+        sources,
+        continuation_links: links,
+        continuation_thread_ids: effective_ids,
+    })
+}
+
+/// Snapshot and normalize one Codex lineage.
+#[allow(clippy::too_many_arguments)]
+pub fn ingest_codex(
+    archive: &Path,
+    sessions_root: &Path,
+    root_thread_id: &str,
+    team_slug: &str,
+    display_timezone: &str,
+    date_window: Option<&DateWindow>,
+    identity_overrides: &IdentityOverrides,
+    continuation_thread_ids: &[String],
+    requested_snapshot_root: Option<&Path>,
+) -> Result<(TeamData, IngestReport), String> {
+    let _lock = crate::pipeline::archive_writer_lock(archive)?;
+    ingest_codex_locked(
+        archive,
+        sessions_root,
+        root_thread_id,
+        team_slug,
+        display_timezone,
+        date_window,
+        identity_overrides,
+        continuation_thread_ids,
+        requested_snapshot_root,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ingest_codex_locked(
+    archive: &Path,
+    sessions_root: &Path,
+    root_thread_id: &str,
+    team_slug: &str,
+    display_timezone: &str,
+    date_window: Option<&DateWindow>,
+    identity_overrides: &IdentityOverrides,
+    continuation_thread_ids: &[String],
+    requested_snapshot_root: Option<&Path>,
+) -> Result<(TeamData, IngestReport), String> {
+    crate::pipeline::ensure_archive_pub(archive, team_slug, true)?;
+    let mut changed = i64::from(ensure_bulk_content_ignored(archive)?);
+    let manifest_state = load_codex_manifest(
+        archive,
+        team_slug,
+        root_thread_id,
+        date_window,
+        continuation_thread_ids,
+    )?;
+    let location = source_snapshot_location(archive, team_slug, requested_snapshot_root)?;
+    let source_copies = crate::codex::snapshot_codex_lineage(
+        sessions_root,
+        root_thread_id,
+        &location.root,
+        &manifest_state.sources,
+        &crate::pipeline::utc_now(),
+        &manifest_state.continuation_thread_ids,
+        &manifest_state.continuation_links,
+    )?;
+    changed += source_copies.files_changed;
+    let allowed_sources: Vec<String> = source_copies
+        .sources
+        .iter()
+        .map(|source| source.snapshot_path.clone())
+        .collect();
+    let team = apply_date_window(
+        crate::codex::load_codex_team(
+            &location.root,
+            root_thread_id,
+            team_slug,
+            display_timezone,
+            Some(&allowed_sources),
+            &source_copies.continuations,
+        )?,
+        date_window,
+    );
+    let mut parsed_paths: Vec<String> = team
+        .sources
+        .iter()
+        .map(|source| source.path.clone())
+        .collect();
+    let mut allowed_sorted = allowed_sources.clone();
+    parsed_paths.sort();
+    allowed_sorted.sort();
+    if parsed_paths != allowed_sorted {
+        return Err(
+            "parsed source set differs from the just-validated source snapshot manifest"
+                .to_string(),
+        );
+    }
+    let inferred =
+        crate::identity::infer_structured_identity(&crate::codex::codex_identity_metadata(
+            &location.root,
+            &allowed_sources,
+            root_thread_id,
+            &manifest_state.continuation_thread_ids,
+        )?);
+    if record_site_identity_inferred(archive, &team, &inferred, identity_overrides)? {
+        changed += 1;
+    }
+    let mut manifest = Map::new();
+    manifest.insert("schema_version".into(), 1.into());
+    manifest.insert("provider".into(), Value::String("codex".to_string()));
+    manifest.insert(
+        "root_thread_id".into(),
+        Value::String(root_thread_id.to_string()),
+    );
+    manifest.insert(
+        "source_root".into(),
+        Value::String(
+            crate::json::resolve_path(sessions_root)
+                .display()
+                .to_string(),
+        ),
+    );
+    manifest.insert(
+        "snapshot_root".into(),
+        Value::String(location.archive_relative()),
+    );
+    manifest.insert(
+        "date_window".into(),
+        date_window.map_or(Value::Null, DateWindow::to_json),
+    );
+    manifest.insert(
+        "sources".into(),
+        Value::Array(
+            source_copies
+                .sources
+                .iter()
+                .map(crate::history::SourceCopy::to_json)
+                .collect(),
+        ),
+    );
+    if !source_copies.continuations.is_empty() {
+        manifest.insert(
+            "continuation_sessions".into(),
+            Value::Array(
+                source_copies
+                    .continuations
+                    .iter()
+                    .map(crate::codex::ContinuationLink::to_json)
+                    .collect(),
+            ),
+        );
+    }
+    if write_json_if_changed(
+        &build_raw(archive, team_slug, "source-manifest.json")?,
+        &Value::Object(manifest),
+    )? {
+        changed += 1;
+    }
+    let (team, mut report) =
+        write_ingested_team(archive, team_slug, &team, date_window, changed, &location)?;
+    report.upstream_retired_sources = source_copies.upstream_retired.clone();
+    Ok((team, report))
+}
+
+fn record_site_identity_inferred(
+    archive: &Path,
+    team: &TeamData,
+    inferred: &(
+        Vec<crate::identity::ProjectIdentity>,
+        Vec<crate::identity::HostIdentity>,
+    ),
+    overrides: &IdentityOverrides,
+) -> Result<bool, String> {
+    let path = build_raw(archive, &team.team_slug, "site-identity.json")?;
+    let previous = if path.is_file() {
+        let document = read_json(&path)?;
+        Some(site_identity_from_json(
+            &document,
+            &path.display().to_string(),
+        )?)
+    } else {
+        None
+    };
+    if let Some(previous) = &previous {
+        if previous.team_slug != team.team_slug {
+            return Err(format!(
+                "site identity team {} does not match {}",
+                py_repr_str(&previous.team_slug),
+                py_repr_str(&team.team_slug)
+            ));
+        }
+    }
+    let identity = merge_site_identity(
+        &team.team_slug,
+        &team.display_timezone,
+        &overrides.display_timezone_source,
+        &inferred.0,
+        &inferred.1,
+        &overrides.projects,
+        &overrides.hosts,
+        previous.as_ref(),
+    )?;
+    write_json_if_changed(&path, &identity.to_json())
 }

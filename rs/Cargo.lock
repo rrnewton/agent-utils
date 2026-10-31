@@ -1289,6 +1289,7 @@ dependencies = [
  "ctrlc",
  "flate2",
  "fs2",
+ "libc",
  "regex",
  "serde_json",
  "sha2",

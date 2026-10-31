@@ -44,6 +44,7 @@ mod locate;
 pub mod muse;
 mod proc;
 pub mod replies;
+pub mod rollout;
 
 pub use event::{Event, Via};
 pub use follow::{Follower, DEFAULT_MAX_READ};

@@ -365,6 +365,7 @@ pub fn run(args: &[String]) -> u8 {
         "quickstart" => run_quickstart(&args[1..]),
         "extract-transcripts" => run_extract_transcripts(&args[1..]),
         "ingest-claude-history" => run_ingest_claude_history(&args[1..]),
+        "ingest" => run_ingest(&args[1..]),
         other => {
             eprintln!(
                 "wrkviz: the Rust edition has not ported '{other}' yet; the Python edition remains the oracle for it"
@@ -625,6 +626,422 @@ fn run_extract_transcripts(args: &[String]) -> u8 {
         return 2;
     }
     0
+}
+
+/// The Python edition's ingest help, verbatim.
+pub const INGEST_HELP: &str = r#"usage: wrkviz ingest [-h] --output OUTPUT --team TEAM [--snapshot-root DIR]
+                     [--sessions-root SESSIONS_ROOT] --root-session
+                     ROOT_SESSION [--continuation-session UUID]
+                     [--timezone TIMEZONE]
+                     [--start-date START_DATE | --start-time START_TIME]
+                     [--end-date END_DATE | --end-time END_TIME]
+                     [--project LABEL=REPOSITORY_URL] [--source-host HOSTNAME]
+
+normalize Codex logs; do not call a model
+
+options:
+  -h, --help            show this help message and exit
+  --output OUTPUT       version-controllable archive directory
+  --team TEAM           stable team slug, for example example-team
+  --snapshot-root DIR   where to keep the vendor source snapshots, which are
+                        ingest input rather than published output and are the
+                        largest thing here (default: <output>.sources, a
+                        sibling of the archive; an archive that already keeps
+                        them inside itself keeps doing so until `migrate-
+                        snapshots` is run)
+  --sessions-root SESSIONS_ROOT
+                        Codex rollout tree (default: ~/.codex/sessions)
+  --root-session ROOT_SESSION
+                        coordinator thread UUID
+  --continuation-session UUID
+                        explicit successor coordinator session; repeat in
+                        chronological order
+  --timezone TIMEZONE   IANA display/calendar timezone (UTC instants remain
+                        canonical)
+  --start-date START_DATE
+                        first local calendar date to include (YYYY-MM-DD,
+                        inclusive)
+  --start-time START_TIME
+                        first instant to include (RFC3339 with offset or Z,
+                        inclusive)
+  --end-date END_DATE   local calendar boundary to stop at (YYYY-MM-DD,
+                        exclusive)
+  --end-time END_TIME   instant to stop at (RFC3339 with offset or Z,
+                        exclusive)
+  --project LABEL=REPOSITORY_URL
+                        project/repository identity; repeat for multi-repo
+                        work (the first is primary); Codex git metadata is
+                        used when omitted
+  --source-host HOSTNAME
+                        execution hostname captured by the source data; repeat
+                        for multi-host work"
+"#;
+
+const INGEST_USAGE: &str = "usage: wrkviz ingest [-h] --output OUTPUT --team TEAM [--snapshot-root DIR]\n                     [--sessions-root SESSIONS_ROOT] --root-session\n                     ROOT_SESSION [--continuation-session UUID]\n                     [--timezone TIMEZONE]\n                     [--start-date START_DATE | --start-time START_TIME]\n                     [--end-date END_DATE | --end-time END_TIME]\n                     [--project LABEL=REPOSITORY_URL] [--source-host HOSTNAME]";
+
+const INGEST_OPTIONS: [&str; 13] = [
+    "--output",
+    "--team",
+    "--snapshot-root",
+    "--sessions-root",
+    "--root-session",
+    "--continuation-session",
+    "--timezone",
+    "--start-date",
+    "--start-time",
+    "--end-date",
+    "--end-time",
+    "--project",
+    "--source-host",
+];
+
+#[allow(clippy::too_many_arguments)]
+fn run_ingest(args: &[String]) -> u8 {
+    run_ingest_impl(args)
+}
+
+fn run_ingest_impl(args: &[String]) -> u8 {
+    let mut output: Option<String> = None;
+    let mut team: Option<String> = None;
+    let mut snapshot_root: Option<String> = None;
+    let mut sessions_root: Option<String> = None;
+    let mut root_session: Option<String> = None;
+    let mut continuations: Vec<String> = Vec::new();
+    let mut timezone = "America/New_York".to_string();
+    let mut start_date: Option<String> = None;
+    let mut start_time: Option<String> = None;
+    let mut end_date: Option<String> = None;
+    let mut end_time: Option<String> = None;
+    let mut projects: Vec<String> = Vec::new();
+    let mut hosts: Vec<String> = Vec::new();
+    let mut extras: Vec<String> = Vec::new();
+    let mut sep_extras: Vec<String> = Vec::new();
+    let mut separated = false;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if separated {
+            sep_extras.push(arg.clone());
+            index += 1;
+            continue;
+        }
+        if arg == "--" {
+            separated = true;
+            index += 1;
+            continue;
+        }
+        let head = arg.split_once('=').map_or(arg.as_str(), |(head, _)| head);
+        if arg == "-h" {
+            print!("{INGEST_HELP}");
+            return 0;
+        }
+        if head.len() > 2
+            && head.starts_with("--")
+            && head != "--help"
+            && !INGEST_OPTIONS.contains(&head)
+        {
+            let mut candidates: Vec<&str> = vec!["--help"];
+            candidates.extend(INGEST_OPTIONS.iter().copied());
+            let matches: Vec<&str> = candidates
+                .into_iter()
+                .filter(|name| name.starts_with(head))
+                .collect();
+            if matches.len() > 1 {
+                return argparse_error(
+                    INGEST_USAGE,
+                    "wrkviz ingest",
+                    &format!(
+                        "ambiguous option: {head} could match {}",
+                        matches.join(", ")
+                    ),
+                );
+            }
+            if matches == ["--help"] {
+                if let Some((_, value)) = arg.split_once('=') {
+                    return argparse_error(
+                        INGEST_USAGE,
+                        "wrkviz ingest",
+                        &format!("argument -h/--help: ignored explicit argument '{value}'"),
+                    );
+                }
+                print!("{INGEST_HELP}");
+                return 0;
+            }
+        }
+        if head == "--help" {
+            if let Some((_, value)) = arg.split_once('=') {
+                return argparse_error(
+                    INGEST_USAGE,
+                    "wrkviz ingest",
+                    &format!("argument -h/--help: ignored explicit argument '{value}'"),
+                );
+            }
+            print!("{INGEST_HELP}");
+            return 0;
+        }
+        let mut handled = true;
+        let canonical: Option<&'static str> = if INGEST_OPTIONS.contains(&head) {
+            INGEST_OPTIONS.iter().copied().find(|name| *name == head)
+        } else if head.len() > 2 && head.starts_with("--") {
+            let matches: Vec<&'static str> = INGEST_OPTIONS
+                .iter()
+                .copied()
+                .filter(|name| name.starts_with(head))
+                .collect();
+            matches.first().copied()
+        } else {
+            None
+        };
+        let ordered: Vec<&'static str> = canonical
+            .into_iter()
+            .chain(
+                INGEST_OPTIONS
+                    .iter()
+                    .copied()
+                    .filter(|name| Some(*name) != canonical),
+            )
+            .collect();
+        for name in ordered {
+            match named_value(args, &mut index, name) {
+                Ok(Some(value)) => {
+                    let conflict = match name {
+                        "--start-time" if start_date.is_some() => Some("--start-date"),
+                        "--start-date" if start_time.is_some() => Some("--start-time"),
+                        "--end-time" if end_date.is_some() => Some("--end-date"),
+                        "--end-date" if end_time.is_some() => Some("--end-time"),
+                        _ => None,
+                    };
+                    if let Some(other) = conflict {
+                        return argparse_error(
+                            INGEST_USAGE,
+                            "wrkviz ingest",
+                            &format!("argument {name}: not allowed with argument {other}"),
+                        );
+                    }
+                    match name {
+                        "--output" => output = Some(value),
+                        "--team" => team = Some(value),
+                        "--snapshot-root" => snapshot_root = Some(value),
+                        "--sessions-root" => sessions_root = Some(value),
+                        "--root-session" => root_session = Some(value),
+                        "--continuation-session" => continuations.push(value),
+                        "--timezone" => timezone = value,
+                        "--start-date" => start_date = Some(value),
+                        "--start-time" => start_time = Some(value),
+                        "--end-date" => end_date = Some(value),
+                        "--end-time" => end_time = Some(value),
+                        "--project" => projects.push(value),
+                        "--source-host" => hosts.push(value),
+                        _ => {}
+                    }
+                    break;
+                }
+                Ok(None) => {}
+                Err((_, message)) => {
+                    return argparse_error(INGEST_USAGE, "wrkviz ingest", &message)
+                }
+            }
+        }
+        if !is_option_token(arg, &INGEST_OPTIONS) {
+            handled = false;
+        }
+        if !handled {
+            extras.push(arg.clone());
+        }
+        index += 1;
+    }
+    let mut required: Vec<&str> = Vec::new();
+    if output.is_none() {
+        required.push("--output");
+    }
+    if team.is_none() {
+        required.push("--team");
+    }
+    if root_session.is_none() {
+        required.push("--root-session");
+    }
+    if !required.is_empty() {
+        return argparse_error(
+            INGEST_USAGE,
+            "wrkviz ingest",
+            &format!(
+                "the following arguments are required: {}",
+                required.join(", ")
+            ),
+        );
+    }
+    if !extras.is_empty() || !sep_extras.is_empty() {
+        let mut reported = extras.clone();
+        if !sep_extras.is_empty() {
+            reported.push("--".to_string());
+            reported.extend(sep_extras.iter().cloned());
+        }
+        eprintln!(
+            "usage: wrkviz [-h] [--version] [--userguide]\n              {{quickstart,ingest-project,ingest,ingest-claude,ingest-claude-history,ingest-muse,ingest-orc,summarize,build,extract-transcripts,export,refresh,github-metadata,refresh-claude,refresh-orc,serve,inspect,gc,migrate-build-state,migrate-snapshots,audit-glossary,audit-losslessness,query,responsiveness,discover-agents}}\n              ...\nwrkviz: error: unrecognized arguments: {}",
+            reported.join(" ")
+        );
+        return 2;
+    }
+    let output = output.unwrap();
+    let team_slug = team.unwrap();
+    let root_session = root_session.unwrap();
+    let archive = cli_path(&output);
+    let started = crate::pipeline::utc_now();
+    let mut command: Vec<String> = vec!["wrkviz".to_string(), "ingest".to_string()];
+    command.extend(args.iter().cloned());
+    let outcome: Result<crate::ingest::IngestReport, String> = (|| {
+        let timezone_explicit = args
+            .iter()
+            .any(|item| item == "--timezone" || item.starts_with("--timezone="));
+        let (parsed_projects, parsed_hosts) =
+            crate::identity::parse_identity_overrides(&projects, &hosts)?;
+        let overrides = crate::identity::IdentityOverrides {
+            projects: parsed_projects,
+            hosts: parsed_hosts,
+            display_timezone_source: if timezone_explicit {
+                "explicit".to_string()
+            } else {
+                "default".to_string()
+            },
+        };
+        let date_window = crate::window::parse_date_window(
+            start_date.as_deref(),
+            end_date.as_deref(),
+            &timezone,
+            start_time.as_deref(),
+            end_time.as_deref(),
+        )?;
+        let sessions = match &sessions_root {
+            Some(raw) => cli_path(raw),
+            None => cli_path("~/.codex/sessions"),
+        };
+        let (_, report) = crate::ingest::ingest_codex(
+            &archive,
+            &sessions,
+            &root_session,
+            &team_slug,
+            &timezone,
+            date_window.as_ref(),
+            &overrides,
+            &continuations,
+            snapshot_root.as_deref().map(cli_path).as_deref(),
+        )?;
+        Ok(report)
+    })();
+    let report = match outcome {
+        Ok(report) => report,
+        Err(error) => {
+            if let Ok(run_path) = crate::pipeline::record_run(
+                &archive,
+                &crate::pipeline::RunReceipt {
+                    command: &command,
+                    started_at: &started,
+                    status: "failed",
+                    team_slug: &team_slug,
+                    error: Some(&error),
+                    team_slugs: &[],
+                    mechanical: None,
+                    ingest: None,
+                },
+            ) {
+                eprintln!("run metadata: {}", run_path.display());
+            }
+            eprintln!("wrkviz: {error}");
+            return 2;
+        }
+    };
+    print_ingest_receipt(&report, &archive);
+    let ingest_json = report.to_json();
+    match crate::pipeline::record_run(
+        &archive,
+        &crate::pipeline::RunReceipt {
+            command: &command,
+            started_at: &started,
+            status: "completed",
+            team_slug: &team_slug,
+            error: None,
+            team_slugs: &[],
+            mechanical: None,
+            ingest: Some(ingest_json),
+        },
+    ) {
+        Ok(run_path) => println!("run metadata: {}", run_path.display()),
+        Err(error) => {
+            eprintln!("wrkviz: {error}");
+            return 2;
+        }
+    }
+    0
+}
+
+fn print_ingest_receipt(report: &crate::ingest::IngestReport, archive: &std::path::Path) {
+    println!(
+        "ingest: {} agents, {} messages/events, {} outer tools, {} edges from {} source files ({:.1} MiB); {} archive files changed",
+        report.agents,
+        report.events,
+        report.tool_calls,
+        report.edges,
+        report.sources,
+        report.source_bytes as f64 / (1024.0 * 1024.0),
+        report.files_changed
+    );
+    if report.snapshot_root_established {
+        let where_ = crate::json::resolve_path(&archive.join(&report.snapshot_root));
+        if report.snapshot_root_layout == "in-archive-legacy" {
+            eprintln!(
+                "wrkviz: {}: this archive keeps its vendor source snapshots inside itself, at {}; they are ingest input rather than published output, and they are reachable over HTTP from `make serve` until they are moved. `wrkviz migrate-snapshots --output {}` says what moving them would do",
+                report.team_slug,
+                where_.display(),
+                archive.display()
+            );
+        } else {
+            eprintln!(
+                "wrkviz: {}: vendor source snapshots are being kept in {}, outside the published archive, because they are ingest input and are usually the largest thing here. The archive records the location; back it up with the archive if you want incremental ingest to keep working",
+                report.team_slug,
+                where_.display()
+            );
+        }
+    }
+    if report.retired_message_projections != 0 {
+        eprintln!(
+            "wrkviz: {}: removed {} retired raw/messages/<thread-id>.json file(s) ({:.1} MiB); the tool no longer writes that per-thread projection, which nothing read and which raw/team.json still fully describes",
+            report.team_slug,
+            report.retired_message_projections,
+            report.retired_message_projection_bytes as f64 / (1024.0 * 1024.0)
+        );
+    }
+    if report.newly_promoted_task_notes != 0 {
+        eprintln!(
+            "wrkviz: {}: promoted {} task note(s) into raw/task-notes.jsonl ({} total); the archive now keeps this text under version control instead of only inside gitignored source_snapshots/",
+            report.team_slug, report.newly_promoted_task_notes, report.task_notes
+        );
+        if report.task_notes_upstream_deleted != 0 {
+            eprintln!(
+                "wrkviz: {}: {} of those notes no longer exist in the upstream task table; for those this archive is the only copy",
+                report.team_slug, report.task_notes_upstream_deleted
+            );
+        }
+    }
+    for shard in &report.damaged_payload_shards {
+        eprintln!("wrkviz: {}: payload store: {shard}", report.team_slug);
+    }
+    if !report.pruned_payload_shards.is_empty() {
+        eprintln!(
+            "wrkviz: {}: {} payload shard(s) recorded by the previous ingest are no longer in the tree; the manifest no longer claims them",
+            report.team_slug,
+            report.pruned_payload_shards.len()
+        );
+    }
+    if report.newly_stored_tool_payloads != 0 {
+        eprintln!(
+            "wrkviz: {}: stored {} tool payload(s) ({:.1} MiB) into gitignored teams/{}/payloads/ ({} total); the archive now keeps command arguments and output instead of discarding them and deferring to the vendor logs",
+            report.team_slug,
+            report.newly_stored_tool_payloads,
+            report.newly_stored_tool_payload_bytes as f64 / (1024.0 * 1024.0),
+            report.team_slug,
+            report.tool_payloads
+        );
+    }
 }
 
 /// The Python edition's ingest-claude-history help, verbatim.
