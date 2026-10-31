@@ -388,6 +388,18 @@ pub fn record_run_summaries(
     record_run_locked(archive, receipt, summaries)
 }
 
+/// Record a run carrying summarize and build report payloads
+/// (the refresh composition).
+pub fn record_run_full(
+    archive: &Path,
+    receipt: &RunReceipt<'_>,
+    summaries: Option<Value>,
+    build: Option<Value>,
+) -> Result<PathBuf, String> {
+    let _lock = archive_writer_lock(archive)?;
+    record_run_locked_full(archive, receipt, summaries, build)
+}
+
 /// Record a run carrying a build report payload.
 pub fn record_run_build(
     archive: &Path,

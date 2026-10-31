@@ -377,6 +377,9 @@ pub fn run(args: &[String]) -> u8 {
         "migrate-build-state" => run_migrate_build_state(&args[1..]),
         "migrate-snapshots" => run_migrate_snapshots(&args[1..]),
         "github-metadata" => run_github_metadata(&args[1..]),
+        "refresh" => run_refresh(&args[1..], RefreshKind::Codex),
+        "refresh-claude" => run_refresh(&args[1..], RefreshKind::Claude),
+        "refresh-orc" => run_refresh(&args[1..], RefreshKind::Orc),
         other => {
             eprintln!(
                 "wrkviz: the Rust edition has not ported '{other}' yet; the Python edition remains the oracle for it"
@@ -4752,6 +4755,399 @@ options:
                         15.0)
 "##;
 
+const REFRESH_HELP: &str = r##"usage: wrkviz refresh [-h] --output OUTPUT --team TEAM [--snapshot-root DIR]
+                      [--sessions-root SESSIONS_ROOT] --root-session
+                      ROOT_SESSION [--continuation-session UUID]
+                      [--timezone TIMEZONE]
+                      [--start-date START_DATE | --start-time START_TIME]
+                      [--end-date END_DATE | --end-time END_TIME]
+                      [--project LABEL=REPOSITORY_URL]
+                      [--source-host HOSTNAME]
+                      [--backend {codex,claude,heuristic}] [--model MODEL]
+                      [--reasoning-effort REASONING_EFFORT]
+                      [--service-tier SERVICE_TIER]
+                      [--summary-workers SUMMARY_WORKERS]
+                      [--summary-batch-size SUMMARY_BATCH_SIZE]
+                      [--name-batch-size NAME_BATCH_SIZE]
+                      [--phase-minutes PHASE_MINUTES]
+                      [--context-chars CONTEXT_CHARS]
+                      [--transcript-chars TRANSCRIPT_CHARS]
+                      [--codex-command CODEX_COMMAND]
+                      [--claude-command CLAUDE_COMMAND]
+                      [--summary-start-date SUMMARY_START_DATE | --summary-start-time SUMMARY_START_TIME]
+                      [--summary-end-date SUMMARY_END_DATE | --summary-end-time SUMMARY_END_TIME]
+                      [--summary-timezone SUMMARY_TIMEZONE]
+                      [--rollup-kind {hourly,daily,weekly,monthly,quarterly}]
+                      [--budget-usd USD] [--price RATES] [--github-metadata]
+                      [--github-timeout GITHUB_TIMEOUT]
+
+idempotent ingest + summarize + build
+
+options:
+  -h, --help            show this help message and exit
+  --output OUTPUT       version-controllable archive directory
+  --team TEAM           stable team slug, for example example-team
+  --snapshot-root DIR   where to keep the vendor source snapshots, which are
+                        ingest input rather than published output and are the
+                        largest thing here (default: <output>.sources, a
+                        sibling of the archive; an archive that already keeps
+                        them inside itself keeps doing so until `migrate-
+                        snapshots` is run)
+  --sessions-root SESSIONS_ROOT
+                        Codex rollout tree (default: ~/.codex/sessions)
+  --root-session ROOT_SESSION
+                        coordinator thread UUID
+  --continuation-session UUID
+                        explicit successor coordinator session; repeat in
+                        chronological order
+  --timezone TIMEZONE   IANA display/calendar timezone (UTC instants remain
+                        canonical)
+  --start-date START_DATE
+                        first local calendar date to include (YYYY-MM-DD,
+                        inclusive)
+  --start-time START_TIME
+                        first instant to include (RFC3339 with offset or Z,
+                        inclusive)
+  --end-date END_DATE   local calendar boundary to stop at (YYYY-MM-DD,
+                        exclusive)
+  --end-time END_TIME   instant to stop at (RFC3339 with offset or Z,
+                        exclusive)
+  --project LABEL=REPOSITORY_URL
+                        project/repository identity; repeat for multi-repo
+                        work (the first is primary); Codex git metadata is
+                        used when omitted
+  --source-host HOSTNAME
+                        execution hostname captured by the source data; repeat
+                        for multi-host work
+  --backend {codex,claude,heuristic}
+                        summary backend (heuristic is deterministic/offline)
+  --model MODEL         backend model name; required for Claude, otherwise
+                        defaults to 'gpt-5.5' (or WRKVIZ_MODEL)
+  --reasoning-effort REASONING_EFFORT
+                        backend reasoning effort, recorded in cache provenance
+                        (default: medium). A model/provider failure aborts
+                        instead of selecting another model or backend
+  --service-tier SERVICE_TIER
+                        Codex service tier; Fast uses 'priority', omission
+                        means 'default', and the effective value is recorded
+                        in cache and run provenance
+  --summary-workers SUMMARY_WORKERS
+  --summary-batch-size SUMMARY_BATCH_SIZE
+  --name-batch-size NAME_BATCH_SIZE
+                        agents per hindsight-naming model call
+  --phase-minutes PHASE_MINUTES
+  --context-chars CONTEXT_CHARS
+  --transcript-chars TRANSCRIPT_CHARS
+  --codex-command CODEX_COMMAND
+                        Codex executable (primarily for testing/wrappers)
+  --claude-command CLAUDE_COMMAND
+                        Claude executable (primarily for testing/wrappers)
+  --summary-start-date SUMMARY_START_DATE
+                        first local date to summarize without truncating
+                        archived data
+  --summary-start-time SUMMARY_START_TIME
+                        first RFC3339 instant to summarize, inclusive
+  --summary-end-date SUMMARY_END_DATE
+                        local date boundary where summarization stops,
+                        exclusive
+  --summary-end-time SUMMARY_END_TIME
+                        RFC3339 instant where summarization stops, exclusive
+  --summary-timezone SUMMARY_TIMEZONE
+                        IANA timezone for summary date bounds (defaults to the
+                        archived team timezone)
+  --rollup-kind {hourly,daily,weekly,monthly,quarterly}
+                        calendar summary level to generate; repeat as needed
+                        (default: daily, weekly, monthly, quarterly)
+  --budget-usd USD      spending cap for this run in US dollars; requires
+                        --price. Before any model call the whole remaining
+                        tree (phase summaries, agent names, overview, every
+                        rollup) is estimated, and the run refuses to start,
+                        spending nothing, when the estimate is over the cap.
+                        If actual spend still reaches the cap, no new model
+                        call starts, calls already running finish and are
+                        cached, the run exits 3, and the team's
+                        summary_data/summarize_state.json marks it partial;
+                        rerun to resume (default: no cap)
+  --price RATES         model prices in US dollars per million tokens, as inpu
+                        t=N,output=N[,cached_input=N][,cache_write_input=N]; a
+                        cache rate defaults to the input rate. Used to price
+                        the plan and to enforce --budget-usd, e.g. --price inp
+                        ut=2,output=10,cached_input=0.2,cache_write_input=2.5
+                        (default: none; the plan then shows tokens only)
+  --github-metadata     conditionally cache titles for evidenced GitHub pull
+                        links after the build
+  --github-timeout GITHUB_TIMEOUT
+                        per-request GitHub API timeout in seconds (default:
+                        15.0)
+"##;
+
+const REFRESH_CLAUDE_HELP: &str = r##"usage: wrkviz refresh-claude [-h] --output OUTPUT --team TEAM
+                             [--snapshot-root DIR] --session-file SESSION_FILE
+                             [--timezone TIMEZONE]
+                             [--start-date START_DATE | --start-time START_TIME]
+                             [--end-date END_DATE | --end-time END_TIME]
+                             [--project LABEL=REPOSITORY_URL]
+                             [--source-host HOSTNAME]
+                             [--backend {codex,claude,heuristic}]
+                             [--model MODEL]
+                             [--reasoning-effort REASONING_EFFORT]
+                             [--service-tier SERVICE_TIER]
+                             [--summary-workers SUMMARY_WORKERS]
+                             [--summary-batch-size SUMMARY_BATCH_SIZE]
+                             [--name-batch-size NAME_BATCH_SIZE]
+                             [--phase-minutes PHASE_MINUTES]
+                             [--context-chars CONTEXT_CHARS]
+                             [--transcript-chars TRANSCRIPT_CHARS]
+                             [--codex-command CODEX_COMMAND]
+                             [--claude-command CLAUDE_COMMAND]
+                             [--summary-start-date SUMMARY_START_DATE | --summary-start-time SUMMARY_START_TIME]
+                             [--summary-end-date SUMMARY_END_DATE | --summary-end-time SUMMARY_END_TIME]
+                             [--summary-timezone SUMMARY_TIMEZONE]
+                             [--rollup-kind {hourly,daily,weekly,monthly,quarterly}]
+                             [--budget-usd USD] [--price RATES]
+                             [--github-metadata]
+                             [--github-timeout GITHUB_TIMEOUT]
+
+idempotent Claude ingest + summarize + build
+
+options:
+  -h, --help            show this help message and exit
+  --output OUTPUT       version-controllable archive directory
+  --team TEAM           stable team slug, for example example-team
+  --snapshot-root DIR   where to keep the vendor source snapshots, which are
+                        ingest input rather than published output and are the
+                        largest thing here (default: <output>.sources, a
+                        sibling of the archive; an archive that already keeps
+                        them inside itself keeps doing so until `migrate-
+                        snapshots` is run)
+  --session-file SESSION_FILE
+                        Claude coordinator JSONL; nested subagents are
+                        discovered beside it
+  --timezone TIMEZONE   IANA display/calendar timezone (UTC instants remain
+                        canonical)
+  --start-date START_DATE
+                        first local calendar date to include (YYYY-MM-DD,
+                        inclusive)
+  --start-time START_TIME
+                        first instant to include (RFC3339 with offset or Z,
+                        inclusive)
+  --end-date END_DATE   local calendar boundary to stop at (YYYY-MM-DD,
+                        exclusive)
+  --end-time END_TIME   instant to stop at (RFC3339 with offset or Z,
+                        exclusive)
+  --project LABEL=REPOSITORY_URL
+                        project/repository identity; repeat for multi-repo
+                        work (the first is primary); Codex git metadata is
+                        used when omitted
+  --source-host HOSTNAME
+                        execution hostname captured by the source data; repeat
+                        for multi-host work
+  --backend {codex,claude,heuristic}
+                        summary backend (heuristic is deterministic/offline)
+  --model MODEL         backend model name; required for Claude, otherwise
+                        defaults to 'gpt-5.5' (or WRKVIZ_MODEL)
+  --reasoning-effort REASONING_EFFORT
+                        backend reasoning effort, recorded in cache provenance
+                        (default: medium). A model/provider failure aborts
+                        instead of selecting another model or backend
+  --service-tier SERVICE_TIER
+                        Codex service tier; Fast uses 'priority', omission
+                        means 'default', and the effective value is recorded
+                        in cache and run provenance
+  --summary-workers SUMMARY_WORKERS
+  --summary-batch-size SUMMARY_BATCH_SIZE
+  --name-batch-size NAME_BATCH_SIZE
+                        agents per hindsight-naming model call
+  --phase-minutes PHASE_MINUTES
+  --context-chars CONTEXT_CHARS
+  --transcript-chars TRANSCRIPT_CHARS
+  --codex-command CODEX_COMMAND
+                        Codex executable (primarily for testing/wrappers)
+  --claude-command CLAUDE_COMMAND
+                        Claude executable (primarily for testing/wrappers)
+  --summary-start-date SUMMARY_START_DATE
+                        first local date to summarize without truncating
+                        archived data
+  --summary-start-time SUMMARY_START_TIME
+                        first RFC3339 instant to summarize, inclusive
+  --summary-end-date SUMMARY_END_DATE
+                        local date boundary where summarization stops,
+                        exclusive
+  --summary-end-time SUMMARY_END_TIME
+                        RFC3339 instant where summarization stops, exclusive
+  --summary-timezone SUMMARY_TIMEZONE
+                        IANA timezone for summary date bounds (defaults to the
+                        archived team timezone)
+  --rollup-kind {hourly,daily,weekly,monthly,quarterly}
+                        calendar summary level to generate; repeat as needed
+                        (default: daily, weekly, monthly, quarterly)
+  --budget-usd USD      spending cap for this run in US dollars; requires
+                        --price. Before any model call the whole remaining
+                        tree (phase summaries, agent names, overview, every
+                        rollup) is estimated, and the run refuses to start,
+                        spending nothing, when the estimate is over the cap.
+                        If actual spend still reaches the cap, no new model
+                        call starts, calls already running finish and are
+                        cached, the run exits 3, and the team's
+                        summary_data/summarize_state.json marks it partial;
+                        rerun to resume (default: no cap)
+  --price RATES         model prices in US dollars per million tokens, as inpu
+                        t=N,output=N[,cached_input=N][,cache_write_input=N]; a
+                        cache rate defaults to the input rate. Used to price
+                        the plan and to enforce --budget-usd, e.g. --price inp
+                        ut=2,output=10,cached_input=0.2,cache_write_input=2.5
+                        (default: none; the plan then shows tokens only)
+  --github-metadata     conditionally cache titles for evidenced GitHub pull
+                        links after the build
+  --github-timeout GITHUB_TIMEOUT
+                        per-request GitHub API timeout in seconds (default:
+                        15.0)
+"##;
+
+const REFRESH_ORC_HELP: &str = r##"usage: wrkviz refresh-orc [-h] --output OUTPUT --team TEAM
+                          [--snapshot-root DIR] --source-root SOURCE_ROOT
+                          --root-session ROOT_SESSION
+                          [--continuation-session SESSION_OR_JSON]
+                          [--accept-orc-prefix-rewrite SESSION]
+                          [--timezone TIMEZONE]
+                          [--start-date START_DATE | --start-time START_TIME]
+                          [--end-date END_DATE | --end-time END_TIME]
+                          [--project LABEL=REPOSITORY_URL]
+                          [--source-host HOSTNAME]
+                          [--backend {codex,claude,heuristic}] [--model MODEL]
+                          [--reasoning-effort REASONING_EFFORT]
+                          [--service-tier SERVICE_TIER]
+                          [--summary-workers SUMMARY_WORKERS]
+                          [--summary-batch-size SUMMARY_BATCH_SIZE]
+                          [--name-batch-size NAME_BATCH_SIZE]
+                          [--phase-minutes PHASE_MINUTES]
+                          [--context-chars CONTEXT_CHARS]
+                          [--transcript-chars TRANSCRIPT_CHARS]
+                          [--codex-command CODEX_COMMAND]
+                          [--claude-command CLAUDE_COMMAND]
+                          [--summary-start-date SUMMARY_START_DATE | --summary-start-time SUMMARY_START_TIME]
+                          [--summary-end-date SUMMARY_END_DATE | --summary-end-time SUMMARY_END_TIME]
+                          [--summary-timezone SUMMARY_TIMEZONE]
+                          [--rollup-kind {hourly,daily,weekly,monthly,quarterly}]
+                          [--budget-usd USD] [--price RATES]
+                          [--github-metadata]
+                          [--github-timeout GITHUB_TIMEOUT]
+
+idempotent Orc ingest + summarize + build
+
+options:
+  -h, --help            show this help message and exit
+  --output OUTPUT       version-controllable archive directory
+  --team TEAM           stable team slug, for example example-team
+  --snapshot-root DIR   where to keep the vendor source snapshots, which are
+                        ingest input rather than published output and are the
+                        largest thing here (default: <output>.sources, a
+                        sibling of the archive; an archive that already keeps
+                        them inside itself keeps doing so until `migrate-
+                        snapshots` is run)
+  --source-root SOURCE_ROOT
+                        project root containing Orc .orc/ and task .tg/
+                        directories
+  --root-session ROOT_SESSION
+                        Orc coordinator session UUID
+  --continuation-session SESSION_OR_JSON
+                        explicit successor coordinator session; use a session
+                        id for the whole session or compact JSON with
+                        session_id and start_message_id for a reused session;
+                        repeat in chronological order
+  --accept-orc-prefix-rewrite SESSION
+                        operator override: accept this one session's recorded
+                        append prefix having been rewritten in place, re-
+                        baselining its digest and marking the source degraded;
+                        repeat per session; the changed rows and columns are
+                        printed and recorded; a rewritten session not named
+                        here still refuses, and rows that disappeared from or
+                        appeared inside the prefix are refused for every
+                        session
+  --timezone TIMEZONE   IANA display/calendar timezone (UTC instants remain
+                        canonical)
+  --start-date START_DATE
+                        first local calendar date to include (YYYY-MM-DD,
+                        inclusive)
+  --start-time START_TIME
+                        first instant to include (RFC3339 with offset or Z,
+                        inclusive)
+  --end-date END_DATE   local calendar boundary to stop at (YYYY-MM-DD,
+                        exclusive)
+  --end-time END_TIME   instant to stop at (RFC3339 with offset or Z,
+                        exclusive)
+  --project LABEL=REPOSITORY_URL
+                        project/repository identity; repeat for multi-repo
+                        work (the first is primary); Codex git metadata is
+                        used when omitted
+  --source-host HOSTNAME
+                        execution hostname captured by the source data; repeat
+                        for multi-host work
+  --backend {codex,claude,heuristic}
+                        summary backend (heuristic is deterministic/offline)
+  --model MODEL         backend model name; required for Claude, otherwise
+                        defaults to 'gpt-5.5' (or WRKVIZ_MODEL)
+  --reasoning-effort REASONING_EFFORT
+                        backend reasoning effort, recorded in cache provenance
+                        (default: medium). A model/provider failure aborts
+                        instead of selecting another model or backend
+  --service-tier SERVICE_TIER
+                        Codex service tier; Fast uses 'priority', omission
+                        means 'default', and the effective value is recorded
+                        in cache and run provenance
+  --summary-workers SUMMARY_WORKERS
+  --summary-batch-size SUMMARY_BATCH_SIZE
+  --name-batch-size NAME_BATCH_SIZE
+                        agents per hindsight-naming model call
+  --phase-minutes PHASE_MINUTES
+  --context-chars CONTEXT_CHARS
+  --transcript-chars TRANSCRIPT_CHARS
+  --codex-command CODEX_COMMAND
+                        Codex executable (primarily for testing/wrappers)
+  --claude-command CLAUDE_COMMAND
+                        Claude executable (primarily for testing/wrappers)
+  --summary-start-date SUMMARY_START_DATE
+                        first local date to summarize without truncating
+                        archived data
+  --summary-start-time SUMMARY_START_TIME
+                        first RFC3339 instant to summarize, inclusive
+  --summary-end-date SUMMARY_END_DATE
+                        local date boundary where summarization stops,
+                        exclusive
+  --summary-end-time SUMMARY_END_TIME
+                        RFC3339 instant where summarization stops, exclusive
+  --summary-timezone SUMMARY_TIMEZONE
+                        IANA timezone for summary date bounds (defaults to the
+                        archived team timezone)
+  --rollup-kind {hourly,daily,weekly,monthly,quarterly}
+                        calendar summary level to generate; repeat as needed
+                        (default: daily, weekly, monthly, quarterly)
+  --budget-usd USD      spending cap for this run in US dollars; requires
+                        --price. Before any model call the whole remaining
+                        tree (phase summaries, agent names, overview, every
+                        rollup) is estimated, and the run refuses to start,
+                        spending nothing, when the estimate is over the cap.
+                        If actual spend still reaches the cap, no new model
+                        call starts, calls already running finish and are
+                        cached, the run exits 3, and the team's
+                        summary_data/summarize_state.json marks it partial;
+                        rerun to resume (default: no cap)
+  --price RATES         model prices in US dollars per million tokens, as inpu
+                        t=N,output=N[,cached_input=N][,cache_write_input=N]; a
+                        cache rate defaults to the input rate. Used to price
+                        the plan and to enforce --budget-usd, e.g. --price inp
+                        ut=2,output=10,cached_input=0.2,cache_write_input=2.5
+                        (default: none; the plan then shows tokens only)
+  --github-metadata     conditionally cache titles for evidenced GitHub pull
+                        links after the build
+  --github-timeout GITHUB_TIMEOUT
+                        per-request GitHub API timeout in seconds (default:
+                        15.0)
+"##;
+
+const REFRESH_USAGE: &str = "usage: wrkviz refresh [-h] --output OUTPUT --team TEAM [--snapshot-root DIR]\n                      [--sessions-root SESSIONS_ROOT] --root-session\n                      ROOT_SESSION [--continuation-session UUID]\n                      [--timezone TIMEZONE]\n                      [--start-date START_DATE | --start-time START_TIME]\n                      [--end-date END_DATE | --end-time END_TIME]\n                      [--project LABEL=REPOSITORY_URL]\n                      [--source-host HOSTNAME]\n                      [--backend {codex,claude,heuristic}] [--model MODEL]\n                      [--reasoning-effort REASONING_EFFORT]\n                      [--service-tier SERVICE_TIER]\n                      [--summary-workers SUMMARY_WORKERS]\n                      [--summary-batch-size SUMMARY_BATCH_SIZE]\n                      [--name-batch-size NAME_BATCH_SIZE]\n                      [--phase-minutes PHASE_MINUTES]\n                      [--context-chars CONTEXT_CHARS]\n                      [--transcript-chars TRANSCRIPT_CHARS]\n                      [--codex-command CODEX_COMMAND]\n                      [--claude-command CLAUDE_COMMAND]\n                      [--summary-start-date SUMMARY_START_DATE | --summary-start-time SUMMARY_START_TIME]\n                      [--summary-end-date SUMMARY_END_DATE | --summary-end-time SUMMARY_END_TIME]\n                      [--summary-timezone SUMMARY_TIMEZONE]\n                      [--rollup-kind {hourly,daily,weekly,monthly,quarterly}]\n                      [--budget-usd USD] [--price RATES] [--github-metadata]\n                      [--github-timeout GITHUB_TIMEOUT]";
+const REFRESH_CLAUDE_USAGE: &str = "usage: wrkviz refresh-claude [-h] --output OUTPUT --team TEAM\n                             [--snapshot-root DIR] --session-file SESSION_FILE\n                             [--timezone TIMEZONE]\n                             [--start-date START_DATE | --start-time START_TIME]\n                             [--end-date END_DATE | --end-time END_TIME]\n                             [--project LABEL=REPOSITORY_URL]\n                             [--source-host HOSTNAME]\n                             [--backend {codex,claude,heuristic}]\n                             [--model MODEL]\n                             [--reasoning-effort REASONING_EFFORT]\n                             [--service-tier SERVICE_TIER]\n                             [--summary-workers SUMMARY_WORKERS]\n                             [--summary-batch-size SUMMARY_BATCH_SIZE]\n                             [--name-batch-size NAME_BATCH_SIZE]\n                             [--phase-minutes PHASE_MINUTES]\n                             [--context-chars CONTEXT_CHARS]\n                             [--transcript-chars TRANSCRIPT_CHARS]\n                             [--codex-command CODEX_COMMAND]\n                             [--claude-command CLAUDE_COMMAND]\n                             [--summary-start-date SUMMARY_START_DATE | --summary-start-time SUMMARY_START_TIME]\n                             [--summary-end-date SUMMARY_END_DATE | --summary-end-time SUMMARY_END_TIME]\n                             [--summary-timezone SUMMARY_TIMEZONE]\n                             [--rollup-kind {hourly,daily,weekly,monthly,quarterly}]\n                             [--budget-usd USD] [--price RATES]\n                             [--github-metadata]\n                             [--github-timeout GITHUB_TIMEOUT]";
+const REFRESH_ORC_USAGE: &str = "usage: wrkviz refresh-orc [-h] --output OUTPUT --team TEAM\n                          [--snapshot-root DIR] --source-root SOURCE_ROOT\n                          --root-session ROOT_SESSION\n                          [--continuation-session SESSION_OR_JSON]\n                          [--accept-orc-prefix-rewrite SESSION]\n                          [--timezone TIMEZONE]\n                          [--start-date START_DATE | --start-time START_TIME]\n                          [--end-date END_DATE | --end-time END_TIME]\n                          [--project LABEL=REPOSITORY_URL]\n                          [--source-host HOSTNAME]\n                          [--backend {codex,claude,heuristic}] [--model MODEL]\n                          [--reasoning-effort REASONING_EFFORT]\n                          [--service-tier SERVICE_TIER]\n                          [--summary-workers SUMMARY_WORKERS]\n                          [--summary-batch-size SUMMARY_BATCH_SIZE]\n                          [--name-batch-size NAME_BATCH_SIZE]\n                          [--phase-minutes PHASE_MINUTES]\n                          [--context-chars CONTEXT_CHARS]\n                          [--transcript-chars TRANSCRIPT_CHARS]\n                          [--codex-command CODEX_COMMAND]\n                          [--claude-command CLAUDE_COMMAND]\n                          [--summary-start-date SUMMARY_START_DATE | --summary-start-time SUMMARY_START_TIME]\n                          [--summary-end-date SUMMARY_END_DATE | --summary-end-time SUMMARY_END_TIME]\n                          [--summary-timezone SUMMARY_TIMEZONE]\n                          [--rollup-kind {hourly,daily,weekly,monthly,quarterly}]\n                          [--budget-usd USD] [--price RATES]\n                          [--github-metadata]\n                          [--github-timeout GITHUB_TIMEOUT]";
 const GITHUB_METADATA_USAGE: &str = "usage: wrkviz github-metadata [-h] --output OUTPUT --team TEAM\n                              [--phase-minutes PHASE_MINUTES]\n                              [--github-timeout GITHUB_TIMEOUT]";
 
 const MIGRATE_SNAPSHOTS_USAGE: &str = "usage: wrkviz migrate-snapshots [-h] --output OUTPUT [--snapshot-root DIR]\n                                [--move] [--copy] [--format {text,json}]";
@@ -4856,6 +5252,644 @@ fn run_migrate_build_state(args: &[String]) -> u8 {
                     flags.contains("--move"),
                 )
             );
+            0
+        }
+        Err(error) => {
+            eprintln!("wrkviz: {error}");
+            2
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum RefreshKind {
+    Codex,
+    Claude,
+    Orc,
+}
+
+fn run_refresh(args: &[String], kind: RefreshKind) -> u8 {
+    crate::summarize_core::install_interrupt_handler();
+    let (help, usage, prog) = match kind {
+        RefreshKind::Codex => (REFRESH_HELP, REFRESH_USAGE, "wrkviz refresh"),
+        RefreshKind::Claude => (
+            REFRESH_CLAUDE_HELP,
+            REFRESH_CLAUDE_USAGE,
+            "wrkviz refresh-claude",
+        ),
+        RefreshKind::Orc => (REFRESH_ORC_HELP, REFRESH_ORC_USAGE, "wrkviz refresh-orc"),
+    };
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print!("{help}");
+        return 0;
+    }
+    let mut value_options: Vec<&str> = vec![
+        "--output",
+        "--team",
+        "--snapshot-root",
+        "--timezone",
+        "--start-date",
+        "--start-time",
+        "--end-date",
+        "--end-time",
+        "--project",
+        "--source-host",
+        "--backend",
+        "--model",
+        "--reasoning-effort",
+        "--service-tier",
+        "--summary-workers",
+        "--summary-batch-size",
+        "--name-batch-size",
+        "--phase-minutes",
+        "--context-chars",
+        "--transcript-chars",
+        "--codex-command",
+        "--claude-command",
+        "--summary-start-date",
+        "--summary-start-time",
+        "--summary-end-date",
+        "--summary-end-time",
+        "--summary-timezone",
+        "--rollup-kind",
+        "--budget-usd",
+        "--price",
+        "--github-timeout",
+    ];
+    match kind {
+        RefreshKind::Codex => value_options.extend([
+            "--sessions-root",
+            "--root-session",
+            "--continuation-session",
+        ]),
+        RefreshKind::Claude => value_options.push("--session-file"),
+        RefreshKind::Orc => value_options.extend([
+            "--source-root",
+            "--root-session",
+            "--continuation-session",
+            "--accept-orc-prefix-rewrite",
+        ]),
+    }
+    const FLAG_OPTIONS: &[&str] = &["--github-metadata"];
+    let mut values: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    let mut flags: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        let (head, explicit) = match arg.split_once('=') {
+            Some((head, value)) => (head, Some(value.to_string())),
+            None => (arg.as_str(), None),
+        };
+        let resolve = |set: &[&str]| -> Vec<String> {
+            set.iter()
+                .copied()
+                .filter(|name| {
+                    head == *name
+                        || (head.len() > 2 && head.starts_with("--") && name.starts_with(head))
+                })
+                .map(str::to_string)
+                .collect()
+        };
+        let value_candidates = resolve(value_options.as_slice());
+        let flag_candidates = resolve(FLAG_OPTIONS);
+        if explicit.is_none() && flag_candidates.len() == 1 {
+            flags.insert(flag_candidates[0].clone());
+            index += 1;
+            continue;
+        }
+        if value_candidates.len() > 1 && !value_candidates.contains(&head.to_string()) {
+            return argparse_error(
+                usage,
+                prog,
+                &format!(
+                    "ambiguous option: {head} could match {}",
+                    value_candidates.join(", ")
+                ),
+            );
+        }
+        let Some(name) = value_candidates.first().cloned() else {
+            return argparse_error(usage, prog, &format!("unrecognized arguments: {arg}"));
+        };
+        let value = match explicit {
+            Some(value) => value,
+            None => {
+                index += 1;
+                match args.get(index) {
+                    Some(value) => value.clone(),
+                    None => {
+                        return argparse_error(
+                            usage,
+                            prog,
+                            &format!("argument {name}: expected one argument"),
+                        )
+                    }
+                }
+            }
+        };
+        values.entry(name).or_default().push(value);
+        index += 1;
+    }
+    let get = |name: &str| values.get(name).and_then(|items| items.last()).cloned();
+    let all = |name: &str| values.get(name).cloned().unwrap_or_default();
+    let mut required: Vec<&str> = vec!["--output", "--team"];
+    match kind {
+        RefreshKind::Codex => required.push("--root-session"),
+        RefreshKind::Claude => required.push("--session-file"),
+        RefreshKind::Orc => required.extend(["--source-root", "--root-session"]),
+    }
+    let missing: Vec<&str> = required
+        .into_iter()
+        .filter(|name| get(name).is_none())
+        .collect();
+    if !missing.is_empty() {
+        return argparse_error(
+            usage,
+            prog,
+            &format!(
+                "the following arguments are required: {}",
+                missing.join(", ")
+            ),
+        );
+    }
+    for (later, earlier) in [
+        ("--start-time", "--start-date"),
+        ("--end-time", "--end-date"),
+        ("--summary-start-time", "--summary-start-date"),
+        ("--summary-end-time", "--summary-end-date"),
+    ] {
+        if get(later).is_some() && get(earlier).is_some() {
+            return argparse_error(
+                usage,
+                prog,
+                &format!("argument {later}: not allowed with argument {earlier}"),
+            );
+        }
+    }
+    let parse_int = |name: &str, default: i64| -> Result<i64, u8> {
+        match get(name) {
+            None => Ok(default),
+            Some(raw) => raw.parse::<i64>().map_err(|_| {
+                argparse_error(
+                    usage,
+                    prog,
+                    &format!(
+                        "argument {name}: invalid int value: {}",
+                        crate::json::py_repr_str(&raw)
+                    ),
+                )
+            }),
+        }
+    };
+    let summary_workers = match parse_int("--summary-workers", 3) {
+        Ok(value) => value,
+        Err(code) => return code,
+    };
+    let summary_batch_size = match parse_int("--summary-batch-size", 6) {
+        Ok(value) => value,
+        Err(code) => return code,
+    };
+    let name_batch_size = match parse_int("--name-batch-size", 12) {
+        Ok(value) => value,
+        Err(code) => return code,
+    };
+    let phase_minutes = match parse_int("--phase-minutes", 30) {
+        Ok(value) => value,
+        Err(code) => return code,
+    };
+    let context_chars = match parse_int("--context-chars", 16000) {
+        Ok(value) => value,
+        Err(code) => return code,
+    };
+    let transcript_chars = match parse_int("--transcript-chars", 30000) {
+        Ok(value) => value,
+        Err(code) => return code,
+    };
+    let budget_usd: Option<f64> = match get("--budget-usd") {
+        None => None,
+        Some(raw) => match raw.parse::<f64>() {
+            Ok(value) => Some(value),
+            Err(_) => {
+                return argparse_error(
+                    usage,
+                    prog,
+                    &format!(
+                        "argument --budget-usd: invalid float value: {}",
+                        crate::json::py_repr_str(&raw)
+                    ),
+                )
+            }
+        },
+    };
+    let github_timeout: f64 = match get("--github-timeout") {
+        None => crate::github_metadata::DEFAULT_TIMEOUT_SECONDS,
+        Some(raw) => match raw.parse::<f64>() {
+            Ok(value) => value,
+            Err(_) => {
+                return argparse_error(
+                    usage,
+                    prog,
+                    &format!(
+                        "argument --github-timeout: invalid float value: {}",
+                        crate::json::py_repr_str(&raw)
+                    ),
+                )
+            }
+        },
+    };
+    let backend = get("--backend").unwrap_or_else(|| "codex".to_string());
+    if !matches!(backend.as_str(), "codex" | "claude" | "heuristic") {
+        return argparse_error(
+            usage,
+            prog,
+            &format!(
+                "argument --backend: invalid choice: {} (choose from 'codex', 'claude', 'heuristic')",
+                crate::json::py_repr_str(&backend)
+            ),
+        );
+    }
+    let mut rollup_kinds: Vec<String> = all("--rollup-kind");
+    for kind_name in &rollup_kinds {
+        if !matches!(
+            kind_name.as_str(),
+            "hourly" | "daily" | "weekly" | "monthly" | "quarterly"
+        ) {
+            return argparse_error(
+                usage,
+                prog,
+                &format!(
+                    "argument --rollup-kind: invalid choice: {} (choose from 'hourly', 'daily', 'weekly', 'monthly', 'quarterly')",
+                    crate::json::py_repr_str(kind_name)
+                ),
+            );
+        }
+    }
+    if rollup_kinds.is_empty() {
+        rollup_kinds = ["daily", "weekly", "monthly", "quarterly"]
+            .iter()
+            .map(|item| item.to_string())
+            .collect();
+    }
+
+    let output = get("--output").unwrap();
+    let team_slug = get("--team").unwrap();
+    let archive = cli_path(&output);
+    let timezone = get("--timezone").unwrap_or_else(|| "America/New_York".to_string());
+    let started = crate::pipeline::utc_now();
+    let verb = match kind {
+        RefreshKind::Codex => "refresh",
+        RefreshKind::Claude => "refresh-claude",
+        RefreshKind::Orc => "refresh-orc",
+    };
+    let mut command: Vec<String> = vec!["wrkviz".to_string(), verb.to_string()];
+    command.extend(args.iter().cloned());
+
+    let mut ingest_json: Option<serde_json::Value> = None;
+    let mut summaries_json: Option<serde_json::Value> = None;
+    let mut build_json: Option<serde_json::Value> = None;
+
+    macro_rules! fail {
+        ($error:expr, $code:expr) => {{
+            let error: String = $error;
+            if let Ok(run_path) = crate::pipeline::record_run_full(
+                &archive,
+                &crate::pipeline::RunReceipt {
+                    command: &command,
+                    started_at: &started,
+                    status: "failed",
+                    team_slug: &team_slug,
+                    error: Some(&error),
+                    team_slugs: &[],
+                    mechanical: None,
+                    ingest: ingest_json.clone(),
+                },
+                summaries_json.clone(),
+                build_json.clone(),
+            ) {
+                eprintln!("run metadata: {}", run_path.display());
+            }
+            eprintln!("wrkviz: {error}");
+            return $code;
+        }};
+    }
+
+    // Stage 1: ingest.
+    let ingest_outcome: Result<crate::ingest::IngestReport, String> = (|| {
+        let timezone_explicit = args
+            .iter()
+            .any(|item| item == "--timezone" || item.starts_with("--timezone="));
+        let (parsed_projects, parsed_hosts) =
+            crate::identity::parse_identity_overrides(&all("--project"), &all("--source-host"))?;
+        let overrides = crate::identity::IdentityOverrides {
+            projects: parsed_projects,
+            hosts: parsed_hosts,
+            display_timezone_source: if timezone_explicit {
+                "explicit".to_string()
+            } else {
+                "default".to_string()
+            },
+        };
+        let date_window = crate::window::parse_date_window(
+            get("--start-date").as_deref(),
+            get("--end-date").as_deref(),
+            &timezone,
+            get("--start-time").as_deref(),
+            get("--end-time").as_deref(),
+        )?;
+        let snapshot_root = get("--snapshot-root").map(|raw| cli_path(&raw));
+        let report = match kind {
+            RefreshKind::Codex => {
+                let sessions = match get("--sessions-root") {
+                    Some(raw) => cli_path(&raw),
+                    None => cli_path("~/.codex/sessions"),
+                };
+                let (_, report) = crate::ingest::ingest_codex(
+                    &archive,
+                    &sessions,
+                    &get("--root-session").unwrap(),
+                    &team_slug,
+                    &timezone,
+                    date_window.as_ref(),
+                    &overrides,
+                    &all("--continuation-session"),
+                    snapshot_root.as_deref(),
+                )?;
+                report
+            }
+            RefreshKind::Claude => {
+                let (_, report) = crate::ingest::ingest_claude(
+                    &archive,
+                    &cli_path(&get("--session-file").unwrap()),
+                    &team_slug,
+                    &timezone,
+                    date_window.as_ref(),
+                    &overrides,
+                    snapshot_root.as_deref(),
+                )?;
+                report
+            }
+            RefreshKind::Orc => {
+                let mut continuations: Vec<crate::orc::ContinuationSpec> = Vec::new();
+                for raw in &all("--continuation-session") {
+                    continuations.push(orc_continuation_arg(raw)?);
+                }
+                let (_, report) = crate::ingest::ingest_orc(
+                    &archive,
+                    &cli_path(&get("--source-root").unwrap()),
+                    &get("--root-session").unwrap(),
+                    &team_slug,
+                    &timezone,
+                    date_window.as_ref(),
+                    &overrides,
+                    &continuations,
+                    &all("--accept-orc-prefix-rewrite"),
+                    snapshot_root.as_deref(),
+                )?;
+                report
+            }
+        };
+        Ok(report)
+    })();
+    let ingest_report = match ingest_outcome {
+        Ok(report) => report,
+        Err(error) => fail!(error, 2),
+    };
+    print_ingest_receipt(&ingest_report, &archive);
+    ingest_json = Some(ingest_report.to_json());
+
+    // Stage 2: summarize.
+    let default_model = std::env::var("WRKVIZ_MODEL").unwrap_or_else(|_| "gpt-5.5".to_string());
+    let default_effort =
+        std::env::var("WRKVIZ_REASONING_EFFORT").unwrap_or_else(|_| "medium".to_string());
+    let reasoning_effort = Some(get("--reasoning-effort").unwrap_or(default_effort));
+    let service_tier = get("--service-tier");
+    let summarize_outcome: Result<crate::summarize_pipeline::SummarizeReport, (String, bool)> =
+        (|| {
+            let model = match get("--model") {
+                None => {
+                    if backend == "claude" {
+                        return Err((
+                            "--model is required when --backend=claude".to_string(),
+                            false,
+                        ));
+                    }
+                    default_model.clone()
+                }
+                Some(raw) => {
+                    let model = crate::summarize_core::py_trim(&raw).to_string();
+                    if model.is_empty() {
+                        return Err(("--model must not be empty".to_string(), false));
+                    }
+                    model
+                }
+            };
+            let has_date_bound =
+                get("--summary-start-date").is_some() || get("--summary-end-date").is_some();
+            let summary_timezone = match get("--summary-timezone") {
+                Some(value) => value,
+                None => {
+                    if has_date_bound {
+                        crate::pipeline::load_archived_team(&archive, &team_slug)
+                            .map_err(|error| (error, false))?
+                            .display_timezone
+                    } else {
+                        "UTC".to_string()
+                    }
+                }
+            };
+            let summary_window = crate::window::parse_date_window(
+                get("--summary-start-date").as_deref(),
+                get("--summary-end-date").as_deref(),
+                &summary_timezone,
+                get("--summary-start-time").as_deref(),
+                get("--summary-end-time").as_deref(),
+            )
+            .map_err(|error| (error, false))?;
+            if let Some(budget) = budget_usd {
+                if budget.is_nan() || budget < 0.0 {
+                    return Err((
+                        "--budget-usd must be a non-negative number".to_string(),
+                        false,
+                    ));
+                }
+            }
+            let prices = match get("--price") {
+                None => None,
+                Some(raw) => Some(
+                    crate::summary_budget::Prices::parse(&raw).map_err(|error| (error, false))?,
+                ),
+            };
+            if budget_usd.is_some() && prices.is_none() && backend != "heuristic" {
+                return Err((
+                    "--budget-usd needs --price to turn token estimates into dollars".to_string(),
+                    false,
+                ));
+            }
+            let options = crate::summarize_pipeline::SummarizeOptions {
+                max_workers: summary_workers.max(0) as usize,
+                batch_size: summary_batch_size.max(0) as usize,
+                name_batch_size: name_batch_size.max(0) as usize,
+                phase_minutes,
+                context_chars,
+                transcript_chars,
+                codex_command: vec![get("--codex-command").unwrap_or_else(|| "codex".to_string())],
+                claude_command: vec![
+                    get("--claude-command").unwrap_or_else(|| "claude".to_string())
+                ],
+                reasoning_effort: reasoning_effort.clone(),
+                service_tier: service_tier.clone(),
+                summary_window,
+                rollup_kinds: rollup_kinds.clone(),
+                budget_usd,
+                prices,
+            };
+            crate::summarize_pipeline::summarize_archive(
+                &archive,
+                &team_slug,
+                &backend,
+                &model,
+                &options,
+                &|plan| {
+                    for line in plan.lines() {
+                        println!("{line}");
+                    }
+                },
+            )
+            .map_err(|error| {
+                let is_budget = error.is_budget();
+                (error.message().to_string(), is_budget)
+            })
+        })();
+    let summary_report = match summarize_outcome {
+        Ok(report) => report,
+        Err((error, is_budget)) => {
+            if crate::summarize_core::interrupted() {
+                let interruption = "interrupted by user";
+                if let Ok(run_path) = crate::pipeline::record_run_full(
+                    &archive,
+                    &crate::pipeline::RunReceipt {
+                        command: &command,
+                        started_at: &started,
+                        status: "interrupted",
+                        team_slug: &team_slug,
+                        error: Some(interruption),
+                        team_slugs: &[],
+                        mechanical: None,
+                        ingest: ingest_json.clone(),
+                    },
+                    None,
+                    None,
+                ) {
+                    eprintln!("run metadata: {}", run_path.display());
+                }
+                eprintln!("wrkviz: {interruption}");
+                return 130;
+            }
+            fail!(error, if is_budget { 3 } else { 2 })
+        }
+    };
+    print_summaries(&summary_report);
+    summaries_json = Some(summary_report.to_json_obj());
+
+    // Stage 3: build.
+    let build_outcome = crate::build_pipeline::build_archive(
+        &archive,
+        &team_slug,
+        phase_minutes,
+        None,
+        &[],
+        None,
+        true,
+        true,
+    );
+    let build_report = match build_outcome {
+        Ok(report) => report,
+        Err(error) => fail!(error, 2),
+    };
+    println!(
+        "build: {} tracks, {} phases, {} edges, {} Markdown files; {} presentation files changed",
+        build_report.agents,
+        build_report.phases,
+        build_report.edges,
+        build_report.summary_files,
+        build_report.files_changed
+    );
+    if let Ok(root) = crate::summarize_pipeline::summary_root(&archive, &team_slug) {
+        let state = crate::summary_budget::load_state(&root);
+        if let Some(warning) = crate::summary_budget::partial_warning(state.as_ref()) {
+            eprintln!("wrkviz: warning: {warning}");
+        }
+    }
+    build_json = Some(build_report.to_json_obj());
+
+    // Stage 4: optional GitHub metadata, then rebuild.
+    if flags.contains("--github-metadata") {
+        let fetched_at = crate::pipeline::utc_now();
+        let github_report = match crate::github_enrich::enrich_pull_request_metadata(
+            &archive,
+            &team_slug,
+            github_timeout,
+            &fetched_at,
+        ) {
+            Ok(report) => report,
+            Err(error) => fail!(error, 2),
+        };
+        println!(
+            "github metadata: {} evidenced references / {} distinct pulls; {} fetched, {} unchanged, {} failed; cache {}",
+            github_report.references,
+            github_report.distinct_pulls,
+            github_report.fetched,
+            github_report.not_modified,
+            github_report.failures.len(),
+            github_report.cache_path
+        );
+        let rebuild = match crate::build_pipeline::build_archive(
+            &archive,
+            &team_slug,
+            phase_minutes,
+            None,
+            &[],
+            None,
+            true,
+            true,
+        ) {
+            Ok(report) => report,
+            Err(error) => fail!(error, 2),
+        };
+        println!(
+            "rebuild: {} presentation files changed after GitHub metadata",
+            rebuild.files_changed
+        );
+        build_json = Some(rebuild.to_json_obj());
+        if !github_report.failures.is_empty() {
+            fail!(
+                format!(
+                    "GitHub metadata refresh had failures (successful records were retained): {}",
+                    github_report.failures.join("; ")
+                ),
+                2
+            );
+        }
+    }
+
+    match crate::pipeline::record_run_full(
+        &archive,
+        &crate::pipeline::RunReceipt {
+            command: &command,
+            started_at: &started,
+            status: "completed",
+            team_slug: &team_slug,
+            error: None,
+            team_slugs: &[],
+            mechanical: None,
+            ingest: ingest_json,
+        },
+        summaries_json,
+        build_json,
+    ) {
+        Ok(run_path) => {
+            println!("run metadata: {}", run_path.display());
+            println!("open: cd {} && make serve", archive.display());
             0
         }
         Err(error) => {
