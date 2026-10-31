@@ -53,10 +53,12 @@ def test_config_round_trip() -> None:
         "slot_cpu_quotas": [{"slot_prefix": "kvm-", "cpu_quota": "2400%"}],
     }})
     obj = settings_to_obj(settings)
-    assert obj["limits"]["slot_cpu_quotas"] == [
+    limits_obj = obj["limits"]
+    assert isinstance(limits_obj, dict)
+    assert limits_obj["slot_cpu_quotas"] == [
         {"slot_prefix": "kvm-", "cpu_quota": "2400%"}
     ]
-    assert limits_from_obj(obj["limits"]) == settings.limits
+    assert limits_from_obj(limits_obj) == settings.limits
 
 
 @pytest.mark.parametrize("bad", [
@@ -78,6 +80,8 @@ def test_settings_to_obj_serializes_overrides() -> None:
         "slot_cpu_quotas": [{"slot_prefix": "kvm-", "cpu_quota": "2400%"}],
     }})
     obj = settings_to_obj(settings)
-    assert obj["limits"]["slot_cpu_quotas"] == [
+    limits_obj = obj["limits"]
+    assert isinstance(limits_obj, dict)
+    assert limits_obj["slot_cpu_quotas"] == [
         {"slot_prefix": "kvm-", "cpu_quota": "2400%"}
     ]
