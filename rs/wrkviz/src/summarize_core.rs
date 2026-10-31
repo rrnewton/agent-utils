@@ -374,19 +374,83 @@ pub fn overview_text_has_link(value: &str) -> bool {
     overview_link_re().is_match(value)
 }
 
+fn tail_removal_end(run: &str, min_end: usize) -> usize {
+    // Python's `\S+?(?=[.,;:!?)\]]*(?:\s|$))`: the shortest match whose
+    // remainder is only sentence punctuation. Character-based.
+    let chars: Vec<(usize, char)> = run.char_indices().collect();
+    let total = run.len();
+    let mut length = min_end.max(1);
+    loop {
+        let suffix = &run[length.min(total)..];
+        if suffix
+            .chars()
+            .all(|ch| matches!(ch, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']'))
+        {
+            return length.min(total);
+        }
+        // Advance one character.
+        match chars.iter().find(|(index, _)| *index >= length) {
+            Some((index, ch)) => length = index + ch.len_utf8(),
+            None => return total,
+        }
+        if length >= total {
+            return total;
+        }
+    }
+}
+
+fn remove_runs(
+    text: &str,
+    pattern: &str,
+    min_extra_from: fn(&regex::Captures) -> usize,
+    replacement: fn(&regex::Captures) -> String,
+) -> String {
+    let finder = regex::Regex::new(pattern).unwrap();
+    let mut out = String::new();
+    let mut last = 0usize;
+    for captures in finder.captures_iter(text) {
+        let whole = captures.get(0).unwrap();
+        let run = whole.as_str();
+        let end = tail_removal_end(run, min_extra_from(&captures));
+        out.push_str(&text[last..whole.start()]);
+        out.push_str(&replacement(&captures));
+        last = whole.start() + end;
+        if end < run.len() {
+            // The punctuation tail stays in the text.
+            continue;
+        }
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
 /// Remove link targets from a generated project overview.
 pub fn strip_overview_links(value: &str) -> String {
-    let tail = r"(?=[.,;:!?)\]]*(?:\s|$))";
     let markdown = regex::Regex::new(r"!?\[([^\]\n]*)\]\s*\([^)\n]*\)").unwrap();
     let text = markdown.replace_all(value, "$1").into_owned();
     let autolink = regex::Regex::new(r"(?i)<\s*(?:https?|ftp|mailto):[^>\s]*>").unwrap();
     let text = autolink.replace_all(&text, "").into_owned();
-    let scheme = regex::Regex::new(&format!(r"(?i)\b(?:https?|ftp|mailto):\S+?{tail}")).unwrap();
-    let text = scheme.replace_all(&text, "").into_owned();
-    let www = regex::Regex::new(&format!(r"(?i)\bwww\.\S+?{tail}")).unwrap();
-    let text = www.replace_all(&text, "").into_owned();
-    let domain = regex::Regex::new(&format!(r"(?i)\b([a-z0-9.-]+\.(?:com|org|net|io|dev|ai|gov|edu))/\S*?{tail}")).unwrap();
-    let text = domain.replace_all(&text, "$1").into_owned();
+    let text = remove_runs(
+        &text,
+        r"(?i)\b(?:https?|ftp|mailto):\S+",
+        |captures| {
+            let whole = captures.get(0).unwrap().as_str();
+            whole.find(':').map_or(1, |index| index + 2)
+        },
+        |_| String::new(),
+    );
+    let text = remove_runs(
+        &text,
+        r"(?i)\bwww\.\S+",
+        |_| 5,
+        |_| String::new(),
+    );
+    let text = remove_runs(
+        &text,
+        r"(?i)\b([a-z0-9.-]+\.(?:com|org|net|io|dev|ai|gov|edu))/\S*",
+        |captures| captures.get(1).unwrap().end() - captures.get(0).unwrap().start() + 1,
+        |captures| captures.get(1).unwrap().as_str().to_string(),
+    );
     let text = text.replace("#glossary/", "");
     let spacing = regex::Regex::new(r"\s+([.,;:!?])").unwrap();
     let text = spacing.replace_all(&text, "$1").into_owned();
