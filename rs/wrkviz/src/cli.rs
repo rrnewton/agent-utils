@@ -380,6 +380,7 @@ pub fn run(args: &[String]) -> u8 {
         "refresh" => run_refresh(&args[1..], RefreshKind::Codex),
         "refresh-claude" => run_refresh(&args[1..], RefreshKind::Claude),
         "refresh-orc" => run_refresh(&args[1..], RefreshKind::Orc),
+        "audit-glossary" => run_audit_glossary(&args[1..]),
         other => {
             eprintln!(
                 "wrkviz: the Rust edition has not ported '{other}' yet; the Python edition remains the oracle for it"
@@ -5252,6 +5253,138 @@ fn run_migrate_build_state(args: &[String]) -> u8 {
                     flags.contains("--move"),
                 )
             );
+            0
+        }
+        Err(error) => {
+            eprintln!("wrkviz: {error}");
+            2
+        }
+    }
+}
+
+const AUDIT_GLOSSARY_HELP: &str = r##"usage: wrkviz audit-glossary [-h] --output OUTPUT [--team TEAM]
+                             [--format {text,json}] [--details]
+
+read retired schema-3 glossary caches without a lock or model call; classify
+definite mechanical noise and candidates requiring a future semantic pass; no
+retired entry receives publication authority
+
+options:
+  -h, --help            show this help message and exit
+  --output OUTPUT       durable archive directory
+  --team TEAM           team slug to inspect; repeat as needed (default: every
+                        archive team)
+  --format {text,json}  report format (default: text)
+  --details             include every term and its disposition
+"##;
+
+const AUDIT_GLOSSARY_USAGE: &str = "usage: wrkviz audit-glossary [-h] --output OUTPUT [--team TEAM]\n                             [--format {text,json}] [--details]";
+
+fn run_audit_glossary(args: &[String]) -> u8 {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print!("{AUDIT_GLOSSARY_HELP}");
+        return 0;
+    }
+    const VALUE_OPTIONS: &[&str] = &["--output", "--team", "--format"];
+    const FLAG_OPTIONS: &[&str] = &["--details"];
+    let mut values: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    let mut flags: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        let (head, explicit) = match arg.split_once('=') {
+            Some((head, value)) => (head, Some(value.to_string())),
+            None => (arg.as_str(), None),
+        };
+        let resolve = |set: &[&str]| -> Vec<String> {
+            set.iter()
+                .copied()
+                .filter(|name| {
+                    head == *name
+                        || (head.len() > 2 && head.starts_with("--") && name.starts_with(head))
+                })
+                .map(str::to_string)
+                .collect()
+        };
+        let value_candidates = resolve(VALUE_OPTIONS);
+        let flag_candidates = resolve(FLAG_OPTIONS);
+        if explicit.is_none() && flag_candidates.len() == 1 {
+            flags.insert(flag_candidates[0].clone());
+            index += 1;
+            continue;
+        }
+        if value_candidates.len() > 1 && !value_candidates.contains(&head.to_string()) {
+            return argparse_error(
+                AUDIT_GLOSSARY_USAGE,
+                "wrkviz audit-glossary",
+                &format!(
+                    "ambiguous option: {head} could match {}",
+                    value_candidates.join(", ")
+                ),
+            );
+        }
+        let Some(name) = value_candidates.first() else {
+            return argparse_error(
+                AUDIT_GLOSSARY_USAGE,
+                "wrkviz audit-glossary",
+                &format!("unrecognized arguments: {arg}"),
+            );
+        };
+        let name = name.clone();
+        let value = match explicit {
+            Some(value) => value,
+            None => {
+                index += 1;
+                match args.get(index) {
+                    Some(value) => value.clone(),
+                    None => {
+                        return argparse_error(
+                            AUDIT_GLOSSARY_USAGE,
+                            "wrkviz audit-glossary",
+                            &format!("argument {name}: expected one argument"),
+                        )
+                    }
+                }
+            }
+        };
+        values.entry(name).or_default().push(value);
+        index += 1;
+    }
+    let get = |name: &str| values.get(name).and_then(|items| items.last()).cloned();
+    if get("--output").is_none() {
+        return argparse_error(
+            AUDIT_GLOSSARY_USAGE,
+            "wrkviz audit-glossary",
+            "the following arguments are required: --output",
+        );
+    }
+    let format = get("--format").unwrap_or_else(|| "text".to_string());
+    if format != "text" && format != "json" {
+        return argparse_error(
+            AUDIT_GLOSSARY_USAGE,
+            "wrkviz audit-glossary",
+            &format!("argument --format: invalid choice: '{format}' (choose from 'text', 'json')"),
+        );
+    }
+    let teams: Vec<String> = values.get("--team").cloned().unwrap_or_default();
+    let archive = cli_path(&get("--output").unwrap());
+    match crate::glossary_audit::audit_legacy_glossaries(&archive, &teams) {
+        Ok(report) => {
+            if format == "json" {
+                print!(
+                    "{}",
+                    crate::json::dump_canonical(&report.to_json_obj(flags.contains("--details")))
+                );
+            } else {
+                print!(
+                    "{}",
+                    crate::glossary_audit::format_glossary_audit(
+                        &report,
+                        flags.contains("--details")
+                    )
+                );
+            }
             0
         }
         Err(error) => {

@@ -37,6 +37,8 @@ pub mod compressed;
 pub mod gc;
 pub mod github_enrich;
 pub mod github_metadata;
+/// Read-only audit of retired glossary projections.
+pub mod glossary_audit;
 /// Claude Code prompt-history ingestion.
 pub mod history;
 /// Site identity records.
