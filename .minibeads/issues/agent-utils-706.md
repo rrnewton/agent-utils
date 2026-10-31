@@ -237,3 +237,14 @@ rc=0 (log `/tmp/gate145-export.log`). The differential's scrub
 list grew `bootstrap_bytes`/`bootstrap_transfer_bytes`: the
 bootstrap text embeds compressed shard sizes, so its length is
 zlib-generation dependent across a digit boundary.
+
+## Slice 9b landed: `gc` (2026-10-26)
+
+`wrkviz gc` is ported (`dad9ec24` on main): generation
+classification (schema-1/2/3, search corpus, snapshots, trash),
+dry-run/swept/emptied reports in text and JSON, trash generations
+with pre/post receipts. Gate 147 rc=0 after fixing the component
+test-file sort order (log `/tmp/gate147-gc.log`). Also fixed the
+schema-2 bootstrap path constant (`data/timeline-v2.json`) shared
+with render's retired-generation detection. Differential:
+`py/tests/test_wrkviz_gc_rust.py` (6 cases).
