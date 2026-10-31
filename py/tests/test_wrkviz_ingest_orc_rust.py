@@ -261,7 +261,8 @@ def _tree(root: Path) -> dict[str, object]:
                if "/.objects/" in key}
     for key in objects:
         del result[key]
-    for index, dump in enumerate(sorted(objects.values())):
+    dumps = [value for value in objects.values() if isinstance(value, str)]
+    for index, dump in enumerate(sorted(dumps)):
         result[f"objects/DB-{index}.db"] = dump
     return result
 
