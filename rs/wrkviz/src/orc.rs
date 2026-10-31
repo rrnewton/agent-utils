@@ -110,18 +110,22 @@ fn integer(value: Option<&Value>, where_: &str) -> Result<i64, String> {
 
 /// See the enclosing record's documentation.
 /// See the module documentation.
-pub fn nonnegative_u128(value: Option<&Value>, where_: &str) -> Result<u128, String> {
+pub fn nonnegative_big(value: Option<&Value>, where_: &str) -> Result<BigUint, String> {
     // Append watermarks pack two 64-bit ids and a tag bit.
     match value {
-        Some(Value::Number(number)) => {
-            let text = number.to_string();
-            if text.starts_with('-') {
-                return Err(format!("{where_}: expected a non-negative integer"));
-            }
-            text.parse::<u128>()
-                .map_err(|_| format!("{where_}: expected a non-negative integer"))
-        }
+        Some(Value::Number(number)) => BigUint::from_decimal(&number.to_string())
+            .ok_or_else(|| format!("{where_}: expected a non-negative integer")),
         _ => Err(format!("{where_}: expected a non-negative integer")),
+    }
+}
+
+/// A JSON number holding a BigUint exactly.
+pub struct JsonNumber;
+
+impl JsonNumber {
+    /// See the enclosing record's documentation.
+    pub fn from_decimal(value: &BigUint) -> Value {
+        serde_json::from_str::<Value>(&value.to_decimal()).unwrap_or(Value::Null)
     }
 }
 
@@ -291,6 +295,126 @@ pub fn task_projection_relative(sha256: &str) -> Result<String, String> {
         "{TASK_PROJECTION_ROOT}/{}/{sha256}.json",
         &sha256[..2]
     ))
+}
+
+/// A non-negative integer wider than any machine word:
+/// packed session watermarks carry a tag bit at position
+/// 128, and manifest integers are unbounded in the oracle.
+/// Four little-endian limbs are far beyond any real value.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BigUint(pub [u64; 4]);
+
+impl BigUint {
+    /// See the enclosing record's documentation.
+    pub fn from_u64(value: u64) -> BigUint {
+        BigUint([value, 0, 0, 0])
+    }
+
+    /// See the enclosing record's documentation.
+    pub fn from_u128(value: u128) -> BigUint {
+        BigUint([value as u64, (value >> 64) as u64, 0, 0])
+    }
+
+    /// See the enclosing record's documentation.
+    pub fn zero() -> BigUint {
+        BigUint([0, 0, 0, 0])
+    }
+
+    /// Pack content and message watermarks under the tag.
+    pub fn packed(content: u64, message: u64) -> BigUint {
+        BigUint([message, content, 1, 0])
+    }
+
+    /// Whether the session-state tag bit is set.
+    pub fn has_session_tag(&self) -> bool {
+        self.0[2] & 1 == 1
+    }
+
+    /// (content, message) watermarks with the tag removed.
+    pub fn unpacked(&self) -> (u64, u64) {
+        (self.0[1], self.0[0])
+    }
+
+    /// The value as u64 when it fits.
+    pub fn as_u64(&self) -> Option<u64> {
+        if self.0[1] == 0 && self.0[2] == 0 && self.0[3] == 0 {
+            Some(self.0[0])
+        } else {
+            None
+        }
+    }
+
+    /// Decimal digits (canonical JSON spelling).
+    pub fn to_decimal(&self) -> String {
+        if self.0.iter().all(|limb| *limb == 0) {
+            return "0".to_string();
+        }
+        let mut limbs = self.0;
+        let mut chunks: Vec<u64> = Vec::new();
+        loop {
+            let mut remainder: u128 = 0;
+            for index in (0..4).rev() {
+                let current = (remainder << 64) | u128::from(limbs[index]);
+                let quotient = current / 10_000_000_000_000_000_000u128;
+                remainder = current % 10_000_000_000_000_000_000u128;
+                limbs[index] = quotient as u64;
+            }
+            chunks.push(remainder as u64);
+            if limbs.iter().all(|limb| *limb == 0) {
+                break;
+            }
+        }
+        let mut out = chunks.last().copied().unwrap_or(0).to_string();
+        for chunk in chunks.iter().rev().skip(1) {
+            out.push_str(&format!("{chunk:019}"));
+        }
+        out
+    }
+
+    /// Parse canonical decimal digits.
+    pub fn from_decimal(text: &str) -> Option<BigUint> {
+        if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let mut value = BigUint::zero();
+        for byte in text.bytes() {
+            // value = value * 10 + digit, limb-wise.
+            let mut carry: u128 = u128::from(byte - b'0');
+            for limb in value.0.iter_mut() {
+                let current = u128::from(*limb) * 10 + carry;
+                *limb = current as u64;
+                carry = current >> 64;
+            }
+            if carry != 0 {
+                return None;
+            }
+        }
+        Some(value)
+    }
+}
+
+impl PartialOrd for BigUint {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for BigUint {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        for index in (0..4).rev() {
+            match self.0[index].cmp(&other.0[index]) {
+                std::cmp::Ordering::Equal => continue,
+                held => return held,
+            }
+        }
+        std::cmp::Ordering::Equal
+    }
+}
+
+impl std::fmt::Display for BigUint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.to_decimal())
+    }
 }
 
 // ---------------------------------------------------------------- records
@@ -1315,7 +1439,7 @@ pub struct SourceCopy {
     /// See the enclosing record's documentation.
     pub append_count: i64,
     /// See the enclosing record's documentation.
-    pub append_max_id: u128,
+    pub append_max_id: BigUint,
     /// See the enclosing record's documentation.
     pub append_prefix_sha256: String,
     /// See the enclosing record's documentation.
@@ -1397,7 +1521,10 @@ impl SourceCopy {
         out.insert("snapshot_size".into(), self.snapshot_size.into());
         out.insert("sha256".into(), Value::String(self.sha256.clone()));
         out.insert("append_count".into(), self.append_count.into());
-        out.insert("append_max_id".into(), self.append_max_id.into());
+        out.insert(
+            "append_max_id".into(),
+            JsonNumber::from_decimal(&self.append_max_id),
+        );
         out.insert(
             "append_prefix_sha256".into(),
             Value::String(self.append_prefix_sha256.clone()),
@@ -1745,7 +1872,7 @@ impl SourceCopy {
                 raw.get("append_count"),
                 &format!("{where_}.append_count"),
             )?,
-            append_max_id: nonnegative_u128(
+            append_max_id: nonnegative_big(
                 raw.get("append_max_id"),
                 &format!("{where_}.append_max_id"),
             )?,
@@ -4108,4 +4235,693 @@ pub fn stage_task_projection(
     std::fs::write(&temporary, text.as_bytes())
         .map_err(|error| crate::json::os_error(&error, &temporary))?;
     Ok((temporary, target, digest, relative))
+}
+
+// ---------------------------------------------------------------- logical state
+
+/// Columns the content-blocks append digest covers, in
+/// digest order.
+pub const CONTENT_BLOCK_PREFIX_COLUMNS: [&str; 18] = [
+    "rowid",
+    "id",
+    "message_id",
+    "session_id",
+    "block_index",
+    "created_at_ms",
+    "turn_index",
+    "role",
+    "block_type",
+    "content",
+    "searchable_text",
+    "code_input",
+    "code_output",
+    "code_exit_code",
+    "model",
+    "user_source",
+    "token_count",
+    "extra",
+];
+
+/// Columns the messages append digest covers, in order.
+pub const MESSAGE_PREFIX_COLUMNS: [&str; 6] = [
+    "id",
+    "session_id",
+    "role",
+    "created_at_ms",
+    "message_json",
+    "search_text",
+];
+
+/// See the enclosing record's documentation.
+pub const SESSION_STATE_SHIFT: u32 = 64;
+/// See the enclosing record's documentation.
+pub const SESSION_STATE_MASK: u128 = (1 << SESSION_STATE_SHIFT) - 1;
+/// The packed session-state tag value (bit 128).
+pub fn session_state_tag() -> BigUint {
+    BigUint([0, 0, 1, 0])
+}
+
+/// One source's counted, watermarked, digested prefix.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LogicalState {
+    /// See the enclosing record's documentation.
+    pub append_count: i64,
+    /// See the enclosing record's documentation.
+    pub append_max_id: BigUint,
+    /// See the enclosing record's documentation.
+    pub append_prefix_sha256: String,
+}
+
+/// Row counts and watermarks for a session's tables.
+#[derive(Clone, Debug)]
+pub struct SessionGeometry {
+    /// See the enclosing record's documentation.
+    pub storage_table: String,
+    /// See the enclosing record's documentation.
+    pub content_count: i64,
+    /// See the enclosing record's documentation.
+    pub content_max_id: i64,
+    /// See the enclosing record's documentation.
+    pub message_count: i64,
+    /// See the enclosing record's documentation.
+    pub message_max_id: i64,
+}
+
+/// One guarded table, its digest columns, and its
+/// watermark.
+#[derive(Clone, Debug)]
+pub struct PrefixScope {
+    /// See the enclosing record's documentation.
+    pub table: String,
+    /// See the enclosing record's documentation.
+    pub columns: Vec<&'static str>,
+    /// See the enclosing record's documentation.
+    pub limit: u128,
+}
+
+impl PrefixScope {
+    /// The one statement both the digest and the diff
+    /// read rows through.
+    pub fn query(&self) -> String {
+        let key = self.columns[0];
+        format!(
+            "SELECT {} FROM {} WHERE {key} <= ? ORDER BY {key}",
+            self.columns.join(", "),
+            self.table
+        )
+    }
+}
+
+/// Measure a session's tables, honouring legacy modes.
+pub fn session_geometry(
+    connection: &Connection,
+    path: &Path,
+    session_state_mode: Option<&str>,
+) -> Result<SessionGeometry, String> {
+    let mut storage_table = session_storage_table(connection, &path.display().to_string())?;
+    match session_state_mode {
+        Some("messages-only") => {
+            if storage_table != "messages" {
+                return Err(format!(
+                    "{}: messages-only legacy state lacks messages table",
+                    path.display()
+                ));
+            }
+        }
+        Some("content-only") => storage_table = "content_blocks".to_string(),
+        Some(other) => {
+            return Err(format!(
+                "unsupported legacy Orc session state mode {}",
+                py_repr_str(other)
+            ))
+        }
+        None => {}
+    }
+    let mut content_count = 0i64;
+    let mut content_max_id = 0i64;
+    if session_state_mode != Some("messages-only") {
+        let row = query_one(
+            connection,
+            "SELECT COUNT(*), COALESCE(MAX(rowid), 0) FROM content_blocks",
+            &path.display().to_string(),
+        )?;
+        content_count = cell_nonnegative(&row[0], &format!("{}: content count", path.display()))?;
+        content_max_id =
+            cell_nonnegative(&row[1], &format!("{}: max content rowid", path.display()))?;
+    }
+    let mut message_count = 0i64;
+    let mut message_max_id = 0i64;
+    if storage_table == "messages" {
+        let row = query_one(
+            connection,
+            "SELECT COUNT(*), COALESCE(MAX(id), 0) FROM messages",
+            &path.display().to_string(),
+        )?;
+        message_count = cell_nonnegative(&row[0], &format!("{}: message count", path.display()))?;
+        message_max_id = cell_nonnegative(&row[1], &format!("{}: max message id", path.display()))?;
+    }
+    Ok(SessionGeometry {
+        storage_table,
+        content_count,
+        content_max_id,
+        message_count,
+        message_max_id,
+    })
+}
+
+/// What the append-prefix digest covers, and whether it
+/// is a legacy prefix.
+pub fn session_prefix_scopes(
+    geometry: &SessionGeometry,
+    session_state_mode: Option<&str>,
+    prefix_max_id: Option<BigUint>,
+) -> (Vec<PrefixScope>, bool) {
+    if session_state_mode == Some("messages-only") {
+        let limit = prefix_max_id
+            .and_then(|held| held.as_u64())
+            .map(u128::from)
+            .unwrap_or(geometry.message_max_id as u128);
+        return (
+            vec![PrefixScope {
+                table: "messages".to_string(),
+                columns: MESSAGE_PREFIX_COLUMNS.to_vec(),
+                limit,
+            }],
+            false,
+        );
+    }
+    if geometry.storage_table == "messages" {
+        let (content_limit, message_limit, legacy_prefix) = match prefix_max_id {
+            None => (
+                geometry.content_max_id as u128,
+                geometry.message_max_id as u128,
+                false,
+            ),
+            Some(packed_max) => {
+                if packed_max.has_session_tag() {
+                    let (content, message) = packed_max.unpacked();
+                    (u128::from(content), u128::from(message), false)
+                } else {
+                    (
+                        packed_max.as_u64().map(u128::from).unwrap_or(u128::MAX),
+                        0,
+                        true,
+                    )
+                }
+            }
+        };
+        let content_scope = PrefixScope {
+            table: "content_blocks".to_string(),
+            columns: CONTENT_BLOCK_PREFIX_COLUMNS.to_vec(),
+            limit: content_limit,
+        };
+        if legacy_prefix {
+            return (vec![content_scope], true);
+        }
+        return (
+            vec![
+                content_scope,
+                PrefixScope {
+                    table: "messages".to_string(),
+                    columns: MESSAGE_PREFIX_COLUMNS.to_vec(),
+                    limit: message_limit,
+                },
+            ],
+            false,
+        );
+    }
+    let limit = prefix_max_id
+        .and_then(|held| held.as_u64())
+        .map(u128::from)
+        .unwrap_or(geometry.content_max_id as u128);
+    (
+        vec![PrefixScope {
+            table: "content_blocks".to_string(),
+            columns: CONTENT_BLOCK_PREFIX_COLUMNS.to_vec(),
+            limit,
+        }],
+        false,
+    )
+}
+
+/// Measure one source's append state.
+pub fn logical_state(
+    path: &Path,
+    kind: &str,
+    prefix_max_id: Option<BigUint>,
+    legacy_task_fields: bool,
+    session_state_mode: Option<&str>,
+) -> Result<LogicalState, String> {
+    let connection = read_only(path)?;
+    let outcome = logical_state_inner(
+        &connection,
+        path,
+        kind,
+        prefix_max_id,
+        legacy_task_fields,
+        session_state_mode,
+    );
+    drop(connection);
+    outcome.map_err(|error| {
+        if error.starts_with("SQLite quick_check failed")
+            || error.contains(": missing required tables:")
+            || error.contains(": missing both modern messages")
+            || error.contains("session row identity exceeds 64 bits")
+            || error.contains("messages-only legacy state lacks")
+            || error.starts_with("unsupported legacy Orc session state mode")
+            || error.starts_with("unsupported Orc source kind")
+        {
+            error
+        } else {
+            format!(
+                "failed to inspect Orc SQLite source {}: {error}",
+                path.display()
+            )
+        }
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn logical_state_inner(
+    connection: &Connection,
+    path: &Path,
+    kind: &str,
+    prefix_max_id: Option<BigUint>,
+    legacy_task_fields: bool,
+    session_state_mode: Option<&str>,
+) -> Result<LogicalState, String> {
+    let check = query_one(
+        connection,
+        "PRAGMA quick_check",
+        &path.display().to_string(),
+    )?;
+    let first = check.first().cloned().unwrap_or(SqlValue::Null);
+    if first != SqlValue::Text("ok".to_string()) {
+        let rendered = match &first {
+            SqlValue::Text(text) => text.clone(),
+            other => format!("{other:?}"),
+        };
+        return Err(format!(
+            "SQLite quick_check failed for {}: ('{rendered}',)",
+            path.display()
+        ));
+    }
+    if kind == "session" {
+        require_tables(
+            connection,
+            &["session_meta", "content_blocks"],
+            &path.display().to_string(),
+        )?;
+        let geometry = session_geometry(connection, path, session_state_mode)?;
+        let (scopes, legacy_prefix) =
+            session_prefix_scopes(&geometry, session_state_mode, prefix_max_id);
+        if session_state_mode == Some("messages-only") {
+            let scope = &scopes[0];
+            let (prefix_count, prefix_digest) = query_digest(
+                connection,
+                &scope.query(),
+                &[SqlValue::Int(scope.limit as i64)],
+            )?;
+            return Ok(LogicalState {
+                append_count: if prefix_max_id.is_none() {
+                    geometry.message_count
+                } else {
+                    prefix_count
+                },
+                append_max_id: BigUint::from_u64(geometry.message_max_id as u64),
+                append_prefix_sha256: prefix_digest,
+            });
+        }
+        if geometry.storage_table == "messages" {
+            if geometry.content_max_id as u128 > SESSION_STATE_MASK
+                || geometry.message_max_id as u128 > SESSION_STATE_MASK
+            {
+                return Err(format!(
+                    "{}: session row identity exceeds 64 bits",
+                    path.display()
+                ));
+            }
+            let packed_max_id = BigUint::packed(
+                geometry.content_max_id as u64,
+                geometry.message_max_id as u64,
+            );
+            let content_scope = &scopes[0];
+            let (content_prefix_count, content_prefix_digest) = query_digest(
+                connection,
+                &content_scope.query(),
+                &[SqlValue::Int(content_scope.limit as i64)],
+            )?;
+            if legacy_prefix {
+                return Ok(LogicalState {
+                    append_count: content_prefix_count,
+                    append_max_id: packed_max_id,
+                    append_prefix_sha256: content_prefix_digest,
+                });
+            }
+            let message_scope = &scopes[1];
+            let (message_prefix_count, message_prefix_digest) = query_digest(
+                connection,
+                &message_scope.query(),
+                &[SqlValue::Int(message_scope.limit as i64)],
+            )?;
+            let mut combined = sha2::Sha256::new();
+            update_digest(&mut combined, &SqlValue::Text("content_blocks".to_string()));
+            update_digest(&mut combined, &SqlValue::Int(content_prefix_count));
+            update_digest(&mut combined, &SqlValue::Int(content_scope.limit as i64));
+            update_digest(&mut combined, &SqlValue::Text(content_prefix_digest));
+            update_digest(&mut combined, &SqlValue::Text("messages".to_string()));
+            update_digest(&mut combined, &SqlValue::Int(message_prefix_count));
+            update_digest(&mut combined, &SqlValue::Int(message_scope.limit as i64));
+            update_digest(&mut combined, &SqlValue::Text(message_prefix_digest));
+            return Ok(LogicalState {
+                append_count: if prefix_max_id.is_none() {
+                    geometry.content_count + geometry.message_count
+                } else {
+                    content_prefix_count + message_prefix_count
+                },
+                append_max_id: packed_max_id,
+                append_prefix_sha256: hex_digest(&combined),
+            });
+        }
+        let scope = &scopes[0];
+        let (prefix_count, prefix_digest) = query_digest(
+            connection,
+            &scope.query(),
+            &[SqlValue::Int(scope.limit as i64)],
+        )?;
+        return Ok(LogicalState {
+            append_count: if prefix_max_id.is_none() {
+                geometry.content_count
+            } else {
+                prefix_count
+            },
+            append_max_id: BigUint::from_u64(geometry.content_max_id as u64),
+            append_prefix_sha256: prefix_digest,
+        });
+    }
+    if kind == "task" {
+        require_tables(
+            connection,
+            &["tasks", "task_notes"],
+            &path.display().to_string(),
+        )?;
+        let row = query_one(
+            connection,
+            "SELECT COUNT(*), COALESCE(MAX(id), 0) FROM task_notes",
+            &path.display().to_string(),
+        )?;
+        let append_count = cell_nonnegative(&row[0], &format!("{}: note count", path.display()))?;
+        let append_max_id = cell_nonnegative(&row[1], &format!("{}: max note id", path.display()))?;
+        let limit = prefix_max_id
+            .and_then(|held| held.as_u64())
+            .map(u128::from)
+            .unwrap_or_else(|| append_max_id as u128);
+        let selected_fields = if legacy_task_fields {
+            "id, task_id, content, created_at, server_comment_id, author_unixname"
+        } else {
+            "id, task_id, content, created_at"
+        };
+        let (prefix_count, prefix_digest) = query_digest(
+            connection,
+            &format!("SELECT {selected_fields} FROM task_notes WHERE id <= ? ORDER BY id"),
+            &[SqlValue::Int(limit as i64)],
+        )?;
+        return Ok(LogicalState {
+            append_count: if prefix_max_id.is_none() {
+                append_count
+            } else {
+                prefix_count
+            },
+            append_max_id: BigUint::from_u64(append_max_id as u64),
+            append_prefix_sha256: prefix_digest,
+        });
+    }
+    Err(format!("unsupported Orc source kind {}", py_repr_str(kind)))
+}
+
+// ---------------------------------------------------------------- semantic identity
+
+/// Deterministic cache identity for one normalized state.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SemanticIdentity {
+    /// See the enclosing record's documentation.
+    pub sha256: String,
+    /// See the enclosing record's documentation.
+    pub complete_bytes: i64,
+}
+
+/// Hash one canonical semantic payload.
+pub fn semantic_identity(payload: &Map<String, JsonValue>) -> SemanticIdentity {
+    let encoded = crate::json::dump_compact(&JsonValue::Object(payload.clone()));
+    SemanticIdentity {
+        sha256: sha256_hex(encoded.as_bytes()),
+        complete_bytes: encoded.len() as i64,
+    }
+}
+
+fn identity_payload(entries: Vec<(&str, JsonValue)>) -> Map<String, JsonValue> {
+    entries
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value))
+        .collect()
+}
+
+/// A session's semantic identity at one schema version.
+pub fn session_semantic_identity(
+    source_path: &str,
+    owner_session_id: &str,
+    state: &LogicalState,
+    meta: &SessionMeta,
+    auxiliary: &AuxiliaryObservation,
+    schema_version: i64,
+) -> Result<SemanticIdentity, String> {
+    if !(2..=4).contains(&schema_version) {
+        return Err(format!(
+            "unsupported Orc session semantic schema {schema_version}"
+        ));
+    }
+    Ok(semantic_identity(&identity_payload(vec![
+        ("schema_version", JsonValue::from(schema_version)),
+        ("kind", JsonValue::String("session".to_string())),
+        ("source_path", JsonValue::String(source_path.to_string())),
+        (
+            "owner_session_id",
+            JsonValue::String(owner_session_id.to_string()),
+        ),
+        ("append_count", JsonValue::from(state.append_count)),
+        (
+            "append_max_id",
+            JsonNumber::from_decimal(&state.append_max_id),
+        ),
+        (
+            "append_prefix_sha256",
+            JsonValue::String(state.append_prefix_sha256.clone()),
+        ),
+        (
+            "stable_spawn_sha256",
+            JsonValue::String(auxiliary.stable_spawn_sha256.clone()),
+        ),
+        ("session_id", JsonValue::String(meta.session_id.clone())),
+        (
+            "parent_id",
+            meta.parent_id
+                .clone()
+                .map_or(JsonValue::Null, JsonValue::String),
+        ),
+        ("name", JsonValue::String(meta.name.clone())),
+        ("created_at_ms", JsonValue::from(meta.created_at_ms)),
+    ])))
+}
+
+/// A task source's semantic identity at one schema
+/// version.
+pub fn task_semantic_identity(
+    source_path: &str,
+    owner_session_id: &str,
+    task_source_ordinal: i64,
+    state: &LogicalState,
+    projection_sha256: &str,
+    schema_version: i64,
+) -> Result<SemanticIdentity, String> {
+    if !(2..=3).contains(&schema_version) {
+        return Err(format!(
+            "unsupported Orc task semantic schema {schema_version}"
+        ));
+    }
+    Ok(semantic_identity(&identity_payload(vec![
+        ("schema_version", JsonValue::from(schema_version)),
+        ("kind", JsonValue::String("task".to_string())),
+        ("source_path", JsonValue::String(source_path.to_string())),
+        (
+            "owner_session_id",
+            JsonValue::String(owner_session_id.to_string()),
+        ),
+        ("task_source_ordinal", JsonValue::from(task_source_ordinal)),
+        ("append_count", JsonValue::from(state.append_count)),
+        (
+            "append_max_id",
+            JsonNumber::from_decimal(&state.append_max_id),
+        ),
+        (
+            "append_prefix_sha256",
+            JsonValue::String(state.append_prefix_sha256.clone()),
+        ),
+        (
+            "task_projection_sha256",
+            JsonValue::String(projection_sha256.to_string()),
+        ),
+    ])))
+}
+
+/// The logical state frozen task history authenticates.
+pub fn frozen_task_logical_state(records: &[FrozenTaskNote]) -> LogicalState {
+    let mut digest = sha2::Sha256::new();
+    for record in records {
+        digest.update(b"R");
+        update_digest(&mut digest, &SqlValue::Int(record.note_id));
+        update_digest(&mut digest, &SqlValue::Text(record.task_id.clone()));
+        update_digest(&mut digest, &SqlValue::Text(record.content.clone()));
+        update_digest(&mut digest, &SqlValue::Text(record.created_at.clone()));
+    }
+    LogicalState {
+        append_count: records.len() as i64,
+        append_max_id: BigUint::from_u64(
+            records
+                .iter()
+                .map(|record| record.note_id as u64)
+                .max()
+                .unwrap_or(0),
+        ),
+        append_prefix_sha256: hex_digest(&digest),
+    }
+}
+
+/// (rewrite digest, missing count, missing-ids digest)
+/// for frozen history against current notes.
+pub fn task_rewrite_observation(
+    frozen: &[FrozenTaskNote],
+    current: &[ObservedTaskNote],
+) -> (String, i64, String) {
+    let missing_ids: Vec<i64> = frozen
+        .iter()
+        .filter(|record| !current.iter().any(|held| held.note_id == record.note_id))
+        .map(|record| record.note_id)
+        .collect();
+    let mut facts: Vec<JsonValue> = Vec::new();
+    for record in frozen {
+        let observed = current.iter().find(|held| held.note_id == record.note_id);
+        match observed {
+            None => {
+                let mut fact = Map::new();
+                fact.insert("note_id".into(), JsonValue::from(record.note_id));
+                fact.insert("state".into(), JsonValue::String("missing".to_string()));
+                facts.push(JsonValue::Object(fact));
+            }
+            Some(observed) => {
+                if (
+                    &observed.server_author,
+                    &observed.task_owner,
+                    &observed.title,
+                ) != (
+                    &record.server_author,
+                    &record.task_owner,
+                    &Some(record.title.clone()),
+                ) {
+                    let mut fact = Map::new();
+                    fact.insert("note_id".into(), JsonValue::from(record.note_id));
+                    fact.insert(
+                        "state".into(),
+                        JsonValue::String("enrichment-changed".to_string()),
+                    );
+                    fact.insert(
+                        "server_author".into(),
+                        observed
+                            .server_author
+                            .clone()
+                            .map_or(JsonValue::Null, JsonValue::String),
+                    );
+                    fact.insert(
+                        "task_owner".into(),
+                        observed
+                            .task_owner
+                            .clone()
+                            .map_or(JsonValue::Null, JsonValue::String),
+                    );
+                    fact.insert(
+                        "title".into(),
+                        observed
+                            .title
+                            .clone()
+                            .map_or(JsonValue::Null, JsonValue::String),
+                    );
+                    facts.push(JsonValue::Object(fact));
+                }
+            }
+        }
+    }
+    let facts_empty = facts.is_empty();
+    let payload = crate::json::dump_compact(&JsonValue::Array(facts));
+    let rewrite_sha = if facts_empty {
+        empty_task_rewrite_sha256()
+    } else {
+        sha256_hex(payload.as_bytes())
+    };
+    let missing_payload = crate::json::dump_compact(&JsonValue::Array(
+        missing_ids.iter().copied().map(JsonValue::from).collect(),
+    ));
+    (
+        rewrite_sha,
+        missing_ids.len() as i64,
+        sha256_hex(missing_payload.as_bytes()),
+    )
+}
+
+/// (gap count, gap digest) below the allocation mark.
+pub fn task_unobserved_id_gaps(frozen: &[FrozenTaskNote], sequence: i64) -> (i64, String) {
+    let mut gaps: Vec<JsonValue> = Vec::new();
+    let mut count = 0i64;
+    for note_id in 1..=sequence {
+        if !frozen.iter().any(|record| record.note_id == note_id) {
+            gaps.push(JsonValue::from(note_id));
+            count += 1;
+        }
+    }
+    let payload = crate::json::dump_compact(&JsonValue::Array(gaps));
+    (count, sha256_hex(payload.as_bytes()))
+}
+
+/// Refuse when measured state disagrees with a manifest.
+pub fn validate_manifest_logical_state(
+    source: &SourceCopy,
+    state: &LogicalState,
+    where_: &str,
+) -> Result<(), String> {
+    if state.append_count != source.append_count
+        || state.append_max_id != source.append_max_id
+        || state.append_prefix_sha256 != source.append_prefix_sha256
+    {
+        return Err(format!(
+            "Orc logical state does not match its manifest: {where_}"
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse when a deterministic identity disagrees.
+pub fn validate_recorded_semantic_identity(
+    source: &SourceCopy,
+    identity: &SemanticIdentity,
+    where_: &str,
+) -> Result<(), String> {
+    if source.semantic_identity_mode != SEMANTIC_IDENTITY_DETERMINISTIC {
+        return Ok(());
+    }
+    if source.semantic_sha256 != identity.sha256
+        || source.semantic_complete_bytes != identity.complete_bytes
+    {
+        return Err(format!(
+            "Orc deterministic semantic identity does not match artifacts: {where_}"
+        ));
+    }
+    Ok(())
 }
