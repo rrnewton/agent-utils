@@ -84,7 +84,7 @@ impl Prices {
                     crate::json::py_repr_str(raw)
                 )
             })?;
-            if !(value >= 0.0) || value.is_infinite() {
+            if value.is_nan() || value < 0.0 || value.is_infinite() {
                 return Err(format!(
                     "--price: {name} must be a finite non-negative number"
                 ));
@@ -142,13 +142,13 @@ impl JobUsage {
     pub fn times(&self, jobs: i64) -> Result<TokenUsage, String> {
         let scale = |value: f64| -> i64 { (value * jobs as f64).ceil() as i64 };
         let input = scale(self.input_tokens);
-        Ok(TokenUsage::new(
+        TokenUsage::new(
             input,
             input.min(scale(self.cached_input_tokens)),
             input.min(scale(self.cache_write_input_tokens)),
             scale(self.output_tokens),
             0,
-        )?)
+        )
     }
 }
 
@@ -452,13 +452,11 @@ impl SummaryPlan {
     /// Human-readable plan lines.
     pub fn lines(&self) -> Vec<String> {
         let mut out = vec![format!("summary plan for {} (before any model call):", self.team_slug)];
-        if let Some(previous) = &self.previous_state {
-            if let Value::Object(state) = previous {
-                out.push(format!(
-                    "  {}",
-                    describe_previous_state(state, self.request.as_ref())
-                ));
-            }
+        if let Some(Value::Object(state)) = &self.previous_state {
+            out.push(format!(
+                "  {}",
+                describe_previous_state(state, self.request.as_ref())
+            ));
         }
         for stage in &self.stages {
             let usage = self.stage_usage(stage);
@@ -549,7 +547,7 @@ pub struct SpendGuard {
 impl SpendGuard {
     /// Construct.
     pub fn new(budget_usd: f64, prices: Prices, costs: CostModel) -> Result<Self, String> {
-        if !(budget_usd >= 0.0) {
+        if budget_usd.is_nan() || budget_usd < 0.0 {
             return Err("budget must be a non-negative number of US dollars".to_string());
         }
         Ok(Self {

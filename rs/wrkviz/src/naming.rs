@@ -134,6 +134,13 @@ struct ParsedNameOutput {
     repairs: Vec<NameRepair>,
 }
 
+type NameBatchOutcome = (
+    HashMap<String, AgentNameResult>,
+    Option<TokenUsage>,
+    Vec<NameRepair>,
+    Option<String>,
+);
+
 struct NameOutcome {
     parsed: ParsedNameOutput,
     usage: Option<TokenUsage>,
@@ -1323,7 +1330,7 @@ fn run_backend_batch(
 ) -> Result<GeneratedNameBatch, BatchFailure> {
     let started_at = utc_now_iso();
     let input_hashes: Vec<String> = batch.iter().map(|item| item.input_hash.clone()).collect();
-    let outcome: Result<(HashMap<String, AgentNameResult>, Option<TokenUsage>, Vec<NameRepair>, Option<String>), BatchFailure> =
+    let outcome: Result<NameBatchOutcome, BatchFailure> =
         (|| {
             if backend == "heuristic" {
                 let results = heuristic_batch(batch, model).map_err(BatchFailure::plain)?;

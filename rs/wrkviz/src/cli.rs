@@ -4878,7 +4878,7 @@ fn run_summarize(args: &[String]) -> u8 {
         )
         .map_err(|error| (error, false))?;
         if let Some(budget) = budget_usd {
-            if !(budget >= 0.0) {
+            if budget.is_nan() || budget < 0.0 {
                 return Err((
                     "--budget-usd must be a non-negative number".to_string(),
                     false,
@@ -4956,12 +4956,8 @@ fn run_summarize(args: &[String]) -> u8 {
 
     match outcome {
         Ok(None) => {
-            // --plan without going over budget records no run.
-            if plan {
-                0
-            } else {
-                0
-            }
+            // --plan records no run.
+            0
         }
         Ok(Some(report)) => {
             print_summaries(&report);

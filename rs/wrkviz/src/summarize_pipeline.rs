@@ -30,13 +30,13 @@ use crate::summary_phases::{
     aggregate_stats, build_phases, phase_agent_ids, PhaseWindow,
 };
 use crate::summary_registry::{
-    registry_json_obj, ContextComponent, ContextCoverage, AGENT_LIFETIME_SUMMARIZER,
-    GLOSSARY_DEFINITION_SUMMARIZER, PROJECT_OVERVIEW_SUMMARIZER, PLAIN_LANGUAGE_ROLLUP_STYLE,
+    registry_json_obj, ContextComponent, ContextCoverage,
+    PROJECT_OVERVIEW_SUMMARIZER, PLAIN_LANGUAGE_ROLLUP_STYLE,
     PROJECT_OVERVIEW_STYLE, TECHNICAL_ROLLUP_STYLE,
 };
 use crate::summarize_core::{
     cached_summary, carried_forward_summary, char_len, char_take, clean_summary_result,
-    input_hash_for_provenance, one_line, py_trim, record_rollup_inputs, summarize_jobs,
+    one_line, py_trim, record_rollup_inputs, summarize_jobs,
     SummaryJob, SummaryResult, SummaryRunStats, WorkBullet,
 };
 use crate::team_data::{Agent, TeamData};
@@ -741,22 +741,6 @@ fn summary_from_catalog_reference(
     })
 }
 
-fn summary_provenance_matches_job(
-    provenance: &SummaryArtifactProvenance,
-    job: &SummaryJob,
-) -> Result<bool, String> {
-    if provenance.logical_key != job.key
-        || provenance.team_slug != job.team_slug
-        || provenance.start_ms != job.start_ms
-        || provenance.end_ms != job.end_ms
-        || provenance.dependency_keys != job.dependency_keys
-        || provenance.context_coverage != job.context_coverage
-    {
-        return Ok(false);
-    }
-    Ok(input_hash_for_provenance(job, provenance)? == provenance.input_hash)
-}
-
 fn period_key(period: &Period) -> String {
     format!("{}:{}", period.key, period.kind)
 }
@@ -1013,7 +997,7 @@ fn rollup_job_for_period(
             period.start_ms - 1,
             &team.display_timezone,
             &team.team_slug,
-            &[period.kind.clone()],
+            std::slice::from_ref(&period.kind),
         )?
         .len()
             .min(10) as i64;
@@ -1089,6 +1073,11 @@ fn rollup_job_for_period(
     Ok(job)
 }
 
+type RollupMaps = (
+    HashMap<String, SummaryResult>,
+    HashMap<String, SummaryResult>,
+);
+
 type RollupResolver<'a> =
     &'a mut dyn FnMut(&SummaryJob, bool, bool) -> Result<Option<SummaryResult>, String>;
 
@@ -1107,7 +1096,7 @@ fn walk_rollups(
     resolve: RollupResolver<'_>,
     unknown_phase_keys: &BTreeSet<String>,
     overview_known: bool,
-) -> Result<(HashMap<String, SummaryResult>, HashMap<String, SummaryResult>), String> {
+) -> Result<RollupMaps, String> {
     let selected_kinds: Vec<&str> = ROLLUP_KINDS
         .iter()
         .copied()
@@ -1810,7 +1799,7 @@ fn plan_tree(
     let reasoning_effort = options.reasoning_effort.as_deref();
     let service_tier = options.service_tier.as_deref();
     let mut stages: Vec<StageCount> = Vec::new();
-    let mut add_stage = |name: &str, kind: &str, stages: &mut Vec<StageCount>| {
+    let add_stage = |name: &str, kind: &str, stages: &mut Vec<StageCount>| {
         stages.push(StageCount {
             name: name.to_string(),
             kind: kind.to_string(),
@@ -2023,8 +2012,8 @@ pub fn plan_summaries(
     tree_options.service_tier = effective.clone();
     // Python resolves the tier inside the locked helpers; keep the
     // effective value for job identities.
-    let tree = summary_tree(archive, team_slug, &tree_options)?;
     let _lock = crate::pipeline::archive_writer_lock(archive)?;
+    let tree = summary_tree(archive, team_slug, &tree_options)?;
     plan_tree(&tree, backend, model, &tree_options)
 }
 
@@ -2359,7 +2348,7 @@ pub fn summarize_archive(
     on_plan: &dyn Fn(&SummaryPlan),
 ) -> Result<SummarizeReport, SummarizeFailure> {
     let _lock = crate::pipeline::archive_writer_lock(archive)
-        .map_err(|error| SummarizeFailure::Message(error))?;
+        .map_err(SummarizeFailure::Message)?;
     summarize_archive_locked(archive, team_slug, backend, model, options, on_plan)
 }
 

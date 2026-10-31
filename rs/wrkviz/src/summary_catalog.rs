@@ -349,7 +349,7 @@ pub fn select_summary_artifact(
                 provenance
                     .context_coverage
                     .coverage_basis_points()
-                    .map_or(-1, |value| value),
+                    .unwrap_or(-1),
                 provenance.generated_at.clone(),
                 provenance.artifact_id.clone(),
             )

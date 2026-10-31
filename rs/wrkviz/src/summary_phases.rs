@@ -496,7 +496,8 @@ fn prior_context(
     start_ms: i64,
     max_chars: i64,
 ) -> String {
-    let mut candidates: Vec<(&Vec<(i64, String, String)>, usize)> = Vec::new();
+    type Candidate<'a> = (&'a Vec<(i64, String, String)>, usize);
+    let mut candidates: Vec<Candidate<'_>> = Vec::new();
     for thread_id in ancestor_ids {
         let Some(entries) = context_by_thread.get(thread_id) else {
             continue;

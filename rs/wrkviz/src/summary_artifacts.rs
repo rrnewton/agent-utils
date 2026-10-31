@@ -15,6 +15,7 @@ pub const ARTIFACT_ENVELOPE_FORMAT: &str = "agent-team-timeline-model-artifact";
 /// Stored envelope version.
 pub const ARTIFACT_ENVELOPE_VERSION: i64 = 1;
 
+#[allow(clippy::too_many_arguments)]
 fn identity_json(
     summarizer_id: &str,
     summarizer_version: i64,

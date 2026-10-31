@@ -121,6 +121,7 @@ pub struct SummaryJob {
 
 impl SummaryJob {
     /// A phase-style job with default coverage.
+    #[allow(clippy::too_many_arguments)]
     pub fn phase(
         key: &str,
         team_slug: &str,
@@ -248,11 +249,17 @@ struct ParsedBackendOutput {
     repairs: Vec<SummaryRepair>,
 }
 
+type BatchOutcome = (
+    HashMap<String, SummaryResult>,
+    Option<TokenUsage>,
+    Vec<SummaryRepair>,
+    Option<String>,
+);
+
 struct BatchFailure {
     message: String,
     usage: Option<TokenUsage>,
     backend_output: Option<String>,
-    wrapped: bool,
 }
 
 impl BatchFailure {
@@ -261,7 +268,6 @@ impl BatchFailure {
             message,
             usage: None,
             backend_output: None,
-            wrapped: false,
         }
     }
 }
@@ -723,7 +729,7 @@ fn require_keys(
 }
 
 fn strict_object<'a>(value: &'a Value, where_: &str) -> Result<&'a serde_json::Map<String, Value>, String> {
-    as_object(value, where_).map_err(|error| error)
+    as_object(value, where_)
 }
 
 fn strict_string(value: &Value, where_: &str) -> Result<String, String> {
@@ -1506,7 +1512,7 @@ pub fn clean_summary_prose(text: &str) -> String {
     }
     let cleaned = one_line(&without_prefixes);
     cleaned
-        .trim_start_matches(|ch| matches!(ch, ' ' | '.' | ';' | ',' | ':' | '—' | '-'))
+        .trim_start_matches([' ', '.', ';', ',', ':', '—', '-'])
         .to_string()
 }
 
@@ -1544,7 +1550,7 @@ pub fn clean_summary_result(result: &SummaryResult) -> SummaryResult {
 /// Python `_shorten`.
 pub fn shorten(text: &str, limit: usize) -> String {
     let cleaned = one_line(text);
-    let clean = cleaned.trim_start_matches(|ch| matches!(ch, '-' | '*' | '#' | '>' | ' '));
+    let clean = cleaned.trim_start_matches(['-', '*', '#', '>', ' ']);
     if char_len(clean) <= limit {
         return clean.to_string();
     }
@@ -1638,7 +1644,7 @@ fn heuristic_sentences(transcript: &str) -> Vec<String> {
         }
         let lowered_full = sentence.to_lowercase();
         let lowered = lowered_full
-            .trim_start_matches(|ch| matches!(ch, '-' | '*' | '#' | '>' | ' '))
+            .trim_start_matches(['-', '*', '#', '>', ' '])
             .to_string();
         if NOISE_PREFIXES
             .iter()
@@ -1969,7 +1975,6 @@ fn codex_batch(
                 message: format!("codex summary batch reported invalid usage: {error}"),
                 usage: None,
                 backend_output,
-                wrapped: false,
             })
         }
     };
@@ -1981,7 +1986,6 @@ fn codex_batch(
             ),
             usage,
             backend_output,
-            wrapped: false,
         });
     }
     let Some(backend_output) = backend_output else {
@@ -1989,7 +1993,6 @@ fn codex_batch(
             message: "codex summary batch produced no output message".to_string(),
             usage,
             backend_output: None,
-            wrapped: false,
         });
     };
     match parse_backend_output_with_repairs(&backend_output, pending, model, &utc_now_iso()) {
@@ -2002,7 +2005,6 @@ fn codex_batch(
             message: error,
             usage,
             backend_output: Some(backend_output),
-            wrapped: false,
         }),
     }
 }
@@ -2078,19 +2080,19 @@ fn run_claude_json(
     } else {
         crate::token_usage::parse_claude_json_usage(&raw_output).ok()
     };
-    if root.is_none() || usage.is_none() {
-        if completed.returncode == 0 && !raw_output.is_empty() {
-            let message = match crate::token_usage::parse_claude_json_usage(&raw_output) {
-                Err(error) => error,
-                Ok(_) => "invalid Claude JSON result".to_string(),
-            };
-            return Err(BatchFailure {
-                message: format!("claude backend returned malformed result: {message}"),
-                usage: None,
-                backend_output: None,
-                wrapped: false,
-            });
-        }
+    if (root.is_none() || usage.is_none())
+        && completed.returncode == 0
+        && !raw_output.is_empty()
+    {
+        let message = match crate::token_usage::parse_claude_json_usage(&raw_output) {
+            Err(error) => error,
+            Ok(_) => "invalid Claude JSON result".to_string(),
+        };
+        return Err(BatchFailure {
+            message: format!("claude backend returned malformed result: {message}"),
+            usage: None,
+            backend_output: None,
+        });
     }
     if completed.returncode != 0 {
         let detail = claude_failure_detail(root.as_ref(), &completed.stderr);
@@ -2106,7 +2108,6 @@ fn run_claude_json(
             ),
             usage,
             backend_output: None,
-            wrapped: false,
         });
     }
     let Some(root_value) = root else {
@@ -2122,7 +2123,6 @@ fn run_claude_json(
                 message: format!("claude backend returned malformed result: {error}"),
                 usage: None,
                 backend_output: None,
-                wrapped: false,
             })
         }
     };
@@ -2133,7 +2133,6 @@ fn run_claude_json(
             message: "claude backend did not report a successful result".to_string(),
             usage: Some(usage),
             backend_output: None,
-            wrapped: false,
         });
     }
     if root_obj.get("is_error") != Some(&Value::Bool(false)) {
@@ -2141,7 +2140,6 @@ fn run_claude_json(
             message: "claude backend marked its result as an error".to_string(),
             usage: Some(usage),
             backend_output: None,
-            wrapped: false,
         });
     }
     let structured = match root_obj.get("structured_output") {
@@ -2151,7 +2149,6 @@ fn run_claude_json(
                 message: "claude backend returned malformed structured output: Claude JSON result.structured_output: expected an object".to_string(),
                 usage: Some(usage),
                 backend_output: None,
-                wrapped: false,
             })
         }
     };
@@ -2188,7 +2185,6 @@ fn claude_batch(
             message: error,
             usage: Some(result.usage),
             backend_output: Some(result.output),
-            wrapped: false,
         }),
     }
 }
@@ -2277,7 +2273,7 @@ fn run_backend_batch(
 ) -> Result<GeneratedBatch, BatchFailure> {
     let started_at = utc_now_iso();
     let input_hashes: Vec<String> = batch.iter().map(|item| item.input_hash.clone()).collect();
-    let outcome: Result<(HashMap<String, SummaryResult>, Option<TokenUsage>, Vec<SummaryRepair>, Option<String>), BatchFailure> =
+    let outcome: Result<BatchOutcome, BatchFailure> =
         (|| {
             if backend == "heuristic" {
                 Ok((heuristic_batch(batch, model), Some(TokenUsage::default()), Vec::new(), None))
@@ -2337,7 +2333,6 @@ fn run_backend_batch(
                 ),
                 usage: error.usage,
                 backend_output: None,
-                wrapped: true,
             });
         }
     };
@@ -2552,7 +2547,6 @@ pub fn summarize_jobs(
                             message: "__budget_refusal__".into(),
                             usage: None,
                             backend_output: None,
-                            wrapped: false,
                         })
                     }
                     Some(value) => Some(value),
