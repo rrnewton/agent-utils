@@ -1050,3 +1050,707 @@ impl TaskProjection {
         })
     }
 }
+
+/// Tables a continuation boundary's row ordinal can index.
+pub const CONTINUATION_BOUNDARY_TABLES: [&str; 2] = ["messages", "content_blocks"];
+
+/// One explicitly configured successor coordinator.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ContinuationSpec {
+    /// See the enclosing record's documentation.
+    pub session_id: String,
+    /// See the enclosing record's documentation.
+    pub start_message_id: Option<String>,
+}
+
+impl ContinuationSpec {
+    /// See the enclosing record's documentation.
+    pub fn to_json(&self) -> Value {
+        let mut out = Map::new();
+        out.insert("session_id".into(), Value::String(self.session_id.clone()));
+        out.insert(
+            "start_message_id".into(),
+            self.start_message_id
+                .clone()
+                .map_or(Value::Null, Value::String),
+        );
+        Value::Object(out)
+    }
+
+    /// See the enclosing record's documentation.
+    pub fn from_json(raw: &Map<String, Value>, where_: &str) -> Result<ContinuationSpec, String> {
+        require_exact_keys(raw, &["session_id", "start_message_id"], where_)?;
+        Ok(ContinuationSpec {
+            session_id: safe_component(
+                &required_string(raw.get("session_id"), &format!("{where_}.session_id"))?,
+                &format!("{where_}.session_id"),
+            )?,
+            start_message_id: optional_string(
+                raw.get("start_message_id"),
+                &format!("{where_}.start_message_id"),
+            )?,
+        })
+    }
+
+    /// See the enclosing record's documentation.
+    pub fn from_value(raw: &Value, where_: &str) -> Result<ContinuationSpec, String> {
+        if let Some(text) = raw.as_str() {
+            return Ok(ContinuationSpec {
+                session_id: safe_component(&required_string(Some(raw), where_)?, where_)?,
+                start_message_id: None,
+            });
+        }
+        ContinuationSpec::from_json(mapping(Some(raw), where_)?, where_)
+    }
+}
+
+/// One explicit, frozen transition between parentless
+/// coordinators.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ContinuationLink {
+    /// See the enclosing record's documentation.
+    pub predecessor_session_id: String,
+    /// See the enclosing record's documentation.
+    pub session_id: String,
+    /// See the enclosing record's documentation.
+    pub predecessor_source_path: String,
+    /// See the enclosing record's documentation.
+    pub predecessor_source_line: i64,
+    /// See the enclosing record's documentation.
+    pub predecessor_at_ms: i64,
+    /// See the enclosing record's documentation.
+    pub source_path: String,
+    /// See the enclosing record's documentation.
+    pub start_message_id: Option<String>,
+    /// See the enclosing record's documentation.
+    pub start_source_line: Option<i64>,
+    /// See the enclosing record's documentation.
+    pub started_at_ms: i64,
+    /// See the enclosing record's documentation.
+    pub gap_ms: i64,
+    /// See the enclosing record's documentation.
+    pub predecessor_source_table: Option<String>,
+}
+
+const LINK_LEGACY_FIELDS: &[&str] = &[
+    "predecessor_session_id",
+    "session_id",
+    "predecessor_source_path",
+    "predecessor_source_line",
+    "predecessor_at_ms",
+    "source_path",
+    "started_at_ms",
+    "gap_ms",
+];
+
+impl ContinuationLink {
+    /// See the enclosing record's documentation.
+    pub fn to_json(&self) -> Value {
+        let mut out = Map::new();
+        out.insert(
+            "predecessor_session_id".into(),
+            Value::String(self.predecessor_session_id.clone()),
+        );
+        out.insert("session_id".into(), Value::String(self.session_id.clone()));
+        out.insert(
+            "predecessor_source_path".into(),
+            Value::String(self.predecessor_source_path.clone()),
+        );
+        out.insert(
+            "predecessor_source_line".into(),
+            self.predecessor_source_line.into(),
+        );
+        out.insert(
+            "predecessor_source_table".into(),
+            self.predecessor_source_table
+                .clone()
+                .map_or(Value::Null, Value::String),
+        );
+        out.insert("predecessor_at_ms".into(), self.predecessor_at_ms.into());
+        out.insert(
+            "source_path".into(),
+            Value::String(self.source_path.clone()),
+        );
+        out.insert(
+            "start_message_id".into(),
+            self.start_message_id
+                .clone()
+                .map_or(Value::Null, Value::String),
+        );
+        out.insert(
+            "start_source_line".into(),
+            self.start_source_line.map_or(Value::Null, Value::from),
+        );
+        out.insert("started_at_ms".into(), self.started_at_ms.into());
+        out.insert("gap_ms".into(), self.gap_ms.into());
+        Value::Object(out)
+    }
+
+    /// See the enclosing record's documentation.
+    pub fn from_json(raw: &Map<String, Value>, where_: &str) -> Result<ContinuationLink, String> {
+        let mut bounded: Vec<&str> = LINK_LEGACY_FIELDS.to_vec();
+        bounded.extend(["start_message_id", "start_source_line"]);
+        let mut current: Vec<&str> = bounded.clone();
+        current.push("predecessor_source_table");
+        if !exact_field_sets(raw, &[LINK_LEGACY_FIELDS, &bounded, &current]) {
+            require_exact_keys(raw, &current, where_)?;
+        }
+        let predecessor_session_id = safe_component(
+            &required_string(
+                raw.get("predecessor_session_id"),
+                &format!("{where_}.predecessor_session_id"),
+            )?,
+            &format!("{where_}.predecessor_session_id"),
+        )?;
+        let session_id = safe_component(
+            &required_string(raw.get("session_id"), &format!("{where_}.session_id"))?,
+            &format!("{where_}.session_id"),
+        )?;
+        let predecessor_source_path = required_string(
+            raw.get("predecessor_source_path"),
+            &format!("{where_}.predecessor_source_path"),
+        )?;
+        let source_path =
+            required_string(raw.get("source_path"), &format!("{where_}.source_path"))?;
+        safe_relative(&predecessor_source_path)?;
+        safe_relative(&source_path)?;
+        let start_message_id = optional_string(
+            raw.get("start_message_id"),
+            &format!("{where_}.start_message_id"),
+        )?;
+        let start_source_line = match raw.get("start_source_line") {
+            None | Some(Value::Null) => None,
+            Some(other) => Some(nonnegative_integer(
+                Some(other),
+                &format!("{where_}.start_source_line"),
+            )?),
+        };
+        let predecessor_source_line = nonnegative_integer(
+            raw.get("predecessor_source_line"),
+            &format!("{where_}.predecessor_source_line"),
+        )?;
+        let predecessor_source_table = optional_string(
+            raw.get("predecessor_source_table"),
+            &format!("{where_}.predecessor_source_table"),
+        )?;
+        if let Some(table) = &predecessor_source_table {
+            if !CONTINUATION_BOUNDARY_TABLES.contains(&table.as_str()) {
+                return Err(format!(
+                    "{where_}.predecessor_source_table: unsupported Orc boundary table {}",
+                    py_repr_str(table)
+                ));
+            }
+        }
+        let predecessor_at_ms = nonnegative_integer(
+            raw.get("predecessor_at_ms"),
+            &format!("{where_}.predecessor_at_ms"),
+        )?;
+        let started_at_ms =
+            nonnegative_integer(raw.get("started_at_ms"), &format!("{where_}.started_at_ms"))?;
+        let gap_ms = nonnegative_integer(raw.get("gap_ms"), &format!("{where_}.gap_ms"))?;
+        if predecessor_session_id == session_id
+            || predecessor_source_line == 0
+            || predecessor_at_ms == 0
+            || started_at_ms == 0
+            || gap_ms == 0
+            || gap_ms != started_at_ms - predecessor_at_ms
+            || start_message_id.is_none() != start_source_line.is_none()
+            || start_source_line == Some(0)
+        {
+            return Err(format!("{where_}: malformed Orc continuation record"));
+        }
+        Ok(ContinuationLink {
+            predecessor_session_id,
+            session_id,
+            predecessor_source_path,
+            predecessor_source_line,
+            predecessor_at_ms,
+            source_path,
+            start_message_id,
+            start_source_line,
+            started_at_ms,
+            gap_ms,
+            predecessor_source_table,
+        })
+    }
+}
+
+/// One consistent SQLite backup and its logical
+/// append-prefix evidence.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SourceCopy {
+    /// See the enclosing record's documentation.
+    pub source_path: String,
+    /// See the enclosing record's documentation.
+    pub snapshot_path: String,
+    /// See the enclosing record's documentation.
+    pub kind: String,
+    /// See the enclosing record's documentation.
+    pub owner_session_id: String,
+    /// See the enclosing record's documentation.
+    pub lineage_root_session_id: Option<String>,
+    /// See the enclosing record's documentation.
+    pub source_size: i64,
+    /// See the enclosing record's documentation.
+    pub snapshot_size: i64,
+    /// See the enclosing record's documentation.
+    pub sha256: String,
+    /// See the enclosing record's documentation.
+    pub append_count: i64,
+    /// See the enclosing record's documentation.
+    pub append_max_id: i64,
+    /// See the enclosing record's documentation.
+    pub append_prefix_sha256: String,
+    /// See the enclosing record's documentation.
+    pub semantic_identity_mode: String,
+    /// See the enclosing record's documentation.
+    pub semantic_sha256: String,
+    /// See the enclosing record's documentation.
+    pub semantic_complete_bytes: i64,
+    /// See the enclosing record's documentation.
+    pub canonical_semantic_sha256: Option<String>,
+    /// See the enclosing record's documentation.
+    pub canonical_semantic_complete_bytes: Option<i64>,
+    /// See the enclosing record's documentation.
+    pub semantic_alias_baseline_path: Option<String>,
+    /// See the enclosing record's documentation.
+    pub semantic_baseline_path: Option<String>,
+    /// See the enclosing record's documentation.
+    pub source_state: String,
+    /// See the enclosing record's documentation.
+    pub task_source_ordinal: Option<i64>,
+    /// See the enclosing record's documentation.
+    pub auxiliary: AuxiliaryStatus,
+    /// See the enclosing record's documentation.
+    pub task_projection: Option<TaskProjection>,
+    /// See the enclosing record's documentation.
+    pub captured_at: String,
+    /// See the enclosing record's documentation.
+    pub append_prefix_override: Option<AppendPrefixOverride>,
+    /// See the enclosing record's documentation.
+    pub provider_schema_version: Option<i64>,
+}
+
+const COPY_LEGACY_FIELDS: &[&str] = &[
+    "source_path",
+    "snapshot_path",
+    "kind",
+    "owner_session_id",
+    "source_size",
+    "snapshot_size",
+    "sha256",
+    "append_count",
+    "append_max_id",
+    "append_prefix_sha256",
+    "semantic_identity_mode",
+    "semantic_sha256",
+    "semantic_complete_bytes",
+    "semantic_baseline_path",
+    "source_state",
+    "task_source_ordinal",
+    "auxiliary",
+    "task_projection",
+    "captured_at",
+];
+
+impl SourceCopy {
+    /// See the enclosing record's documentation.
+    pub fn to_json(&self) -> Value {
+        let mut out = Map::new();
+        out.insert(
+            "source_path".into(),
+            Value::String(self.source_path.clone()),
+        );
+        out.insert(
+            "snapshot_path".into(),
+            Value::String(self.snapshot_path.clone()),
+        );
+        out.insert("kind".into(), Value::String(self.kind.clone()));
+        out.insert(
+            "owner_session_id".into(),
+            Value::String(self.owner_session_id.clone()),
+        );
+        out.insert(
+            "lineage_root_session_id".into(),
+            self.lineage_root_session_id
+                .clone()
+                .map_or(Value::Null, Value::String),
+        );
+        out.insert("source_size".into(), self.source_size.into());
+        out.insert("snapshot_size".into(), self.snapshot_size.into());
+        out.insert("sha256".into(), Value::String(self.sha256.clone()));
+        out.insert("append_count".into(), self.append_count.into());
+        out.insert("append_max_id".into(), self.append_max_id.into());
+        out.insert(
+            "append_prefix_sha256".into(),
+            Value::String(self.append_prefix_sha256.clone()),
+        );
+        out.insert(
+            "semantic_identity_mode".into(),
+            Value::String(self.semantic_identity_mode.clone()),
+        );
+        out.insert(
+            "semantic_sha256".into(),
+            Value::String(self.semantic_sha256.clone()),
+        );
+        out.insert(
+            "semantic_complete_bytes".into(),
+            self.semantic_complete_bytes.into(),
+        );
+        out.insert(
+            "canonical_semantic_sha256".into(),
+            self.canonical_semantic_sha256
+                .clone()
+                .map_or(Value::Null, Value::String),
+        );
+        out.insert(
+            "canonical_semantic_complete_bytes".into(),
+            self.canonical_semantic_complete_bytes
+                .map_or(Value::Null, Value::from),
+        );
+        out.insert(
+            "semantic_alias_baseline_path".into(),
+            self.semantic_alias_baseline_path
+                .clone()
+                .map_or(Value::Null, Value::String),
+        );
+        out.insert(
+            "semantic_baseline_path".into(),
+            self.semantic_baseline_path
+                .clone()
+                .map_or(Value::Null, Value::String),
+        );
+        out.insert(
+            "source_state".into(),
+            Value::String(self.source_state.clone()),
+        );
+        out.insert(
+            "task_source_ordinal".into(),
+            self.task_source_ordinal.map_or(Value::Null, Value::from),
+        );
+        out.insert("auxiliary".into(), self.auxiliary.to_json());
+        out.insert(
+            "task_projection".into(),
+            self.task_projection
+                .as_ref()
+                .map_or(Value::Null, TaskProjection::to_json),
+        );
+        out.insert(
+            "captured_at".into(),
+            Value::String(self.captured_at.clone()),
+        );
+        out.insert(
+            "append_prefix_override".into(),
+            self.append_prefix_override
+                .as_ref()
+                .map_or(Value::Null, AppendPrefixOverride::to_json),
+        );
+        out.insert(
+            "provider_schema_version".into(),
+            self.provider_schema_version
+                .map_or(Value::Null, Value::from),
+        );
+        Value::Object(out)
+    }
+
+    /// See the enclosing record's documentation.
+    pub fn from_json(
+        raw: &Map<String, Value>,
+        where_: &str,
+        manifest_schema_version: i64,
+    ) -> Result<SourceCopy, String> {
+        let source_path =
+            required_string(raw.get("source_path"), &format!("{where_}.source_path"))?;
+        let snapshot_path =
+            required_string(raw.get("snapshot_path"), &format!("{where_}.snapshot_path"))?;
+        safe_relative(&source_path)?;
+        safe_relative(&snapshot_path)?;
+        if manifest_schema_version == 2 {
+            let mut lineage: Vec<&str> = COPY_LEGACY_FIELDS.to_vec();
+            lineage.push("lineage_root_session_id");
+            let mut canonical: Vec<&str> = lineage.clone();
+            canonical.extend([
+                "canonical_semantic_sha256",
+                "canonical_semantic_complete_bytes",
+            ]);
+            let mut alias: Vec<&str> = canonical.clone();
+            alias.push("semantic_alias_baseline_path");
+            let mut override_fields: Vec<&str> = alias.clone();
+            override_fields.push("append_prefix_override");
+            let mut current: Vec<&str> = override_fields.clone();
+            current.push("provider_schema_version");
+            if !exact_field_sets(
+                raw,
+                &[
+                    COPY_LEGACY_FIELDS,
+                    &lineage,
+                    &canonical,
+                    &alias,
+                    &override_fields,
+                    &current,
+                ],
+            ) {
+                require_exact_keys(raw, &current, where_)?;
+            }
+        }
+        let kind = required_string(raw.get("kind"), &format!("{where_}.kind"))?;
+        if kind != "session" && kind != "task" {
+            return Err(format!(
+                "{where_}.kind: unsupported Orc database kind {}",
+                py_repr_str(&kind)
+            ));
+        }
+        let sha256_text = required_string(raw.get("sha256"), &format!("{where_}.sha256"))?;
+        let append_digest = required_string(
+            raw.get("append_prefix_sha256"),
+            &format!("{where_}.append_prefix_sha256"),
+        )?;
+        sha256_string(
+            Some(&Value::String(sha256_text.clone())),
+            &format!("{where_}.sha256"),
+        )?;
+        sha256_string(
+            Some(&Value::String(append_digest.clone())),
+            &format!("{where_}.append_prefix_sha256"),
+        )?;
+        let auxiliary: AuxiliaryStatus;
+        let task_projection: Option<TaskProjection>;
+        let semantic_identity_mode: String;
+        let semantic_sha256: String;
+        let semantic_complete_bytes: i64;
+        let canonical_semantic_sha256: Option<String>;
+        let canonical_semantic_complete_bytes: Option<i64>;
+        let semantic_alias_baseline_path: Option<String>;
+        let semantic_baseline_path: Option<String>;
+        let source_state: String;
+        let task_source_ordinal: Option<i64>;
+        let append_prefix_override: Option<AppendPrefixOverride>;
+        let provider_schema_version: Option<i64>;
+        if manifest_schema_version == 1 {
+            if source_path != snapshot_path {
+                return Err(format!(
+                    "{where_}: schema-v1 source and snapshot paths must match"
+                ));
+            }
+            auxiliary = AuxiliaryStatus {
+                policy: AUXILIARY_POLICY_LEGACY.to_string(),
+                message_count: nonnegative_integer(
+                    raw.get("auxiliary_count"),
+                    &format!("{where_}.auxiliary_count"),
+                )?,
+                message_sha256: sha256_string(
+                    raw.get("auxiliary_prefix_sha256"),
+                    &format!("{where_}.auxiliary_prefix_sha256"),
+                )?,
+                stable_spawn_count: 0,
+                stable_spawn_sha256: empty_sha256(),
+                rewrite_count: 0,
+                last_rewrite_at: None,
+                degraded: false,
+                degradation_reason: None,
+            };
+            task_projection = None;
+            semantic_identity_mode = SEMANTIC_IDENTITY_LEGACY.to_string();
+            semantic_sha256 = sha256_text.clone();
+            semantic_complete_bytes =
+                nonnegative_integer(raw.get("snapshot_size"), &format!("{where_}.snapshot_size"))?;
+            canonical_semantic_sha256 = None;
+            canonical_semantic_complete_bytes = None;
+            semantic_alias_baseline_path = None;
+            semantic_baseline_path = Some(snapshot_path.clone());
+            source_state = SOURCE_STATE_LIVE.to_string();
+            task_source_ordinal = if kind == "task" { Some(0) } else { None };
+            append_prefix_override = None;
+            provider_schema_version = None;
+        } else if manifest_schema_version == 2 {
+            let expected_snapshot_path = snapshot_object_relative(&sha256_text)?;
+            if snapshot_path != expected_snapshot_path {
+                return Err(format!(
+                    "{where_}.snapshot_path: expected content-addressed path {}",
+                    py_repr_str(&expected_snapshot_path)
+                ));
+            }
+            auxiliary = AuxiliaryStatus::from_json(
+                mapping(raw.get("auxiliary"), &format!("{where_}.auxiliary"))?,
+                &format!("{where_}.auxiliary"),
+            )?;
+            task_projection = match raw.get("task_projection") {
+                None | Some(Value::Null) => None,
+                Some(other) => Some(TaskProjection::from_json(
+                    mapping(Some(other), &format!("{where_}.task_projection"))?,
+                    &format!("{where_}.task_projection"),
+                )?),
+            };
+            semantic_sha256 = sha256_string(
+                raw.get("semantic_sha256"),
+                &format!("{where_}.semantic_sha256"),
+            )?;
+            semantic_identity_mode = required_string(
+                raw.get("semantic_identity_mode"),
+                &format!("{where_}.semantic_identity_mode"),
+            )?;
+            if semantic_identity_mode != SEMANTIC_IDENTITY_LEGACY
+                && semantic_identity_mode != SEMANTIC_IDENTITY_DETERMINISTIC
+            {
+                return Err(format!(
+                    "{where_}.semantic_identity_mode: unsupported mode {}",
+                    py_repr_str(&semantic_identity_mode)
+                ));
+            }
+            semantic_complete_bytes = nonnegative_integer(
+                raw.get("semantic_complete_bytes"),
+                &format!("{where_}.semantic_complete_bytes"),
+            )?;
+            canonical_semantic_sha256 = match raw.get("canonical_semantic_sha256") {
+                None | Some(Value::Null) => None,
+                Some(other) => Some(sha256_string(
+                    Some(other),
+                    &format!("{where_}.canonical_semantic_sha256"),
+                )?),
+            };
+            canonical_semantic_complete_bytes = match raw.get("canonical_semantic_complete_bytes") {
+                None | Some(Value::Null) => None,
+                Some(other) => Some(nonnegative_integer(
+                    Some(other),
+                    &format!("{where_}.canonical_semantic_complete_bytes"),
+                )?),
+            };
+            if canonical_semantic_sha256.is_none() != canonical_semantic_complete_bytes.is_none() {
+                return Err(format!(
+                    "{where_}: canonical semantic identity must be complete"
+                ));
+            }
+            semantic_alias_baseline_path = optional_string(
+                raw.get("semantic_alias_baseline_path"),
+                &format!("{where_}.semantic_alias_baseline_path"),
+            )?;
+            if let Some(held) = &semantic_alias_baseline_path {
+                safe_relative(held)?;
+            }
+            semantic_baseline_path = optional_string(
+                raw.get("semantic_baseline_path"),
+                &format!("{where_}.semantic_baseline_path"),
+            )?;
+            if let Some(held) = &semantic_baseline_path {
+                safe_relative(held)?;
+            }
+            source_state =
+                required_string(raw.get("source_state"), &format!("{where_}.source_state"))?;
+            if source_state != SOURCE_STATE_LIVE && source_state != SOURCE_STATE_DETACHED {
+                return Err(format!(
+                    "{where_}.source_state: unsupported state {}",
+                    py_repr_str(&source_state)
+                ));
+            }
+            task_source_ordinal = match raw.get("task_source_ordinal") {
+                None | Some(Value::Null) => None,
+                Some(other) => Some(nonnegative_integer(
+                    Some(other),
+                    &format!("{where_}.task_source_ordinal"),
+                )?),
+            };
+            append_prefix_override = match raw.get("append_prefix_override") {
+                None | Some(Value::Null) => None,
+                Some(other) => Some(AppendPrefixOverride::from_json(
+                    mapping(Some(other), &format!("{where_}.append_prefix_override"))?,
+                    &format!("{where_}.append_prefix_override"),
+                )?),
+            };
+            if let Some(held) = &append_prefix_override {
+                if held.source_path != source_path {
+                    return Err(format!(
+                        "{where_}.append_prefix_override.source_path: recorded override belongs to {}",
+                        py_repr_str(&held.source_path)
+                    ));
+                }
+            }
+            if let Some(held) = &append_prefix_override {
+                if held.superseded_snapshot_path == snapshot_path {
+                    return Err(format!(
+                        "{where_}.append_prefix_override.superseded_snapshot_path: the pre-rewrite snapshot cannot be the current snapshot"
+                    ));
+                }
+            }
+            provider_schema_version = match raw.get("provider_schema_version") {
+                None | Some(Value::Null) => None,
+                Some(other) => Some(positive_integer(
+                    Some(other),
+                    &format!("{where_}.provider_schema_version"),
+                )?),
+            };
+        } else {
+            return Err(format!(
+                "{where_}: unsupported Orc manifest schema {manifest_schema_version}"
+            ));
+        }
+        if manifest_schema_version == 2
+            && ((kind == "session" && auxiliary.policy != AUXILIARY_POLICY_STABLE_SPAWNS)
+                || (kind == "task" && auxiliary.policy != AUXILIARY_POLICY_NOT_APPLICABLE)
+                || (kind == "session" && task_projection.is_some())
+                || (kind == "task" && task_projection.is_none())
+                || (kind == "session" && source_state != SOURCE_STATE_LIVE)
+                || (kind == "session" && task_source_ordinal.is_some())
+                || (kind == "task" && task_source_ordinal.is_none())
+                || (kind == "task"
+                    && !matches!(raw.get("lineage_root_session_id"), None | Some(Value::Null)))
+                || (semantic_identity_mode == SEMANTIC_IDENTITY_LEGACY
+                    && semantic_baseline_path.is_none())
+                || (semantic_identity_mode == SEMANTIC_IDENTITY_DETERMINISTIC
+                    && semantic_baseline_path.is_some())
+                || (kind == "task" && append_prefix_override.is_some()))
+        {
+            return Err(format!(
+                "{where_}: invalid schema-v2 projections for {kind} source"
+            ));
+        }
+        Ok(SourceCopy {
+            source_path,
+            snapshot_path,
+            kind,
+            owner_session_id: required_string(
+                raw.get("owner_session_id"),
+                &format!("{where_}.owner_session_id"),
+            )?,
+            lineage_root_session_id: optional_string(
+                raw.get("lineage_root_session_id"),
+                &format!("{where_}.lineage_root_session_id"),
+            )?,
+            source_size: nonnegative_integer(
+                raw.get("source_size"),
+                &format!("{where_}.source_size"),
+            )?,
+            snapshot_size: nonnegative_integer(
+                raw.get("snapshot_size"),
+                &format!("{where_}.snapshot_size"),
+            )?,
+            sha256: sha256_text,
+            append_count: nonnegative_integer(
+                raw.get("append_count"),
+                &format!("{where_}.append_count"),
+            )?,
+            append_max_id: nonnegative_integer(
+                raw.get("append_max_id"),
+                &format!("{where_}.append_max_id"),
+            )?,
+            append_prefix_sha256: append_digest,
+            semantic_identity_mode,
+            semantic_sha256,
+            semantic_complete_bytes,
+            canonical_semantic_sha256,
+            canonical_semantic_complete_bytes,
+            semantic_alias_baseline_path: if manifest_schema_version == 2 {
+                semantic_alias_baseline_path
+            } else {
+                None
+            },
+            semantic_baseline_path,
+            source_state,
+            task_source_ordinal,
+            auxiliary,
+            task_projection,
+            captured_at: required_string(raw.get("captured_at"), &format!("{where_}.captured_at"))?,
+            append_prefix_override,
+            provider_schema_version,
+        })
+    }
+}
