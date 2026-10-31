@@ -174,6 +174,9 @@ class SandboxLimits:
     io_weight: int | None = None
     all_slots_memory_max: str | None = None
     all_slots_cpu_quota: str | None = None
+    # Ordered (slot-name prefix, CPUQuota) overrides; first match wins over
+    # cpu_quota, so a host can cap wide lanes without raising every lane.
+    slot_cpu_quotas: tuple[tuple[str, str], ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -287,6 +290,7 @@ LIMIT_DOCS: dict[str, str] = {
     "io_weight": "Slot IO weight, 1 to 10000.",
     "all_slots_memory_max": "Memory ceiling shared by all slots together.",
     "all_slots_cpu_quota": "CPU ceiling shared by all slots together.",
+    "slot_cpu_quotas": "Ordered per-slot CPU ceilings: a list of {slot_prefix, cpu_quota}; the first prefix matching the slot name wins over cpu_quota.",
 }
 
 
@@ -356,6 +360,36 @@ def _env_pairs(value: object) -> tuple[tuple[str, str], ...]:
     return tuple(pairs)
 
 
+def _slot_cpu_quotas(value: object) -> tuple[tuple[str, str], ...]:
+    label = "configuration.sandbox.limits.slot_cpu_quotas"
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise SandboxError(f"{label} must be a list of {{slot_prefix, cpu_quota}} objects")
+    result: list[tuple[str, str]] = []
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {"slot_prefix", "cpu_quota"}:
+            raise SandboxError(f"{label} entries must be {{slot_prefix, cpu_quota}} objects")
+        prefix = item["slot_prefix"]
+        if not isinstance(prefix, str) or not prefix:
+            raise SandboxError(f"{label} slot_prefix must be a non-empty string")
+        quota = _optional_str(item["cpu_quota"], label + ".cpu_quota")
+        if quota is None:
+            raise SandboxError(f"{label} cpu_quota must not be null")
+        result.append((prefix, quota))
+    return tuple(result)
+
+
+def effective_cpu_quota(limits: SandboxLimits, slot: str | None) -> str | None:
+    """The CPU ceiling for one slot: first matching prefix override, else cpu_quota."""
+
+    if slot:
+        for prefix, quota in limits.slot_cpu_quotas:
+            if slot.startswith(prefix):
+                return quota
+    return limits.cpu_quota
+
+
 def limits_from_obj(raw: object) -> SandboxLimits:
     """Validate a ``configuration.sandbox.limits`` mapping."""
 
@@ -374,6 +408,7 @@ def limits_from_obj(raw: object) -> SandboxLimits:
         io_weight=_optional_int(raw.get("io_weight"), label + "io_weight"),
         all_slots_memory_max=_optional_str(raw.get("all_slots_memory_max"), label + "all_slots_memory_max"),
         all_slots_cpu_quota=_optional_str(raw.get("all_slots_cpu_quota"), label + "all_slots_cpu_quota"),
+        slot_cpu_quotas=_slot_cpu_quotas(raw.get("slot_cpu_quotas")),
     )
 
 
@@ -441,7 +476,17 @@ def settings_to_obj(settings: SandboxSettings) -> dict[str, object]:
         "tmp_size": settings.tmp_size,
         "protect_system": settings.protect_system,
         "coordinator_writable": settings.coordinator_writable,
-        "limits": {key: getattr(settings.limits, key) for key in LIMIT_KEYS},
+        "limits": {
+            key: (
+                [
+                    {"slot_prefix": prefix, "cpu_quota": quota}
+                    for prefix, quota in settings.limits.slot_cpu_quotas
+                ]
+                if key == "slot_cpu_quotas"
+                else getattr(settings.limits, key)
+            )
+            for key in LIMIT_KEYS
+        },
     }
 
 
@@ -605,7 +650,7 @@ def slice_name(
     return root_slice(parent).removesuffix(".slice") + f"-{escaped}.slice"
 
 
-def slice_limit_properties(limits: SandboxLimits) -> list[str]:
+def slice_limit_properties(limits: SandboxLimits, slot: str | None = None) -> list[str]:
     """systemd properties for the per-slot slice."""
 
     properties: list[str] = []
@@ -614,8 +659,9 @@ def slice_limit_properties(limits: SandboxLimits) -> list[str]:
         properties.append("MemorySwapMax=0")
     if limits.memory_high:
         properties.append(f"MemoryHigh={limits.memory_high}")
-    if limits.cpu_quota:
-        properties.append(f"CPUQuota={limits.cpu_quota}")
+    cpu_quota = effective_cpu_quota(limits, slot)
+    if cpu_quota:
+        properties.append(f"CPUQuota={cpu_quota}")
     if limits.tasks_max:
         properties.append(f"TasksMax={limits.tasks_max}")
     if limits.io_weight:
@@ -647,7 +693,7 @@ def apply_slice_limits(
         (root_slice(parent), root_limits),
         (
             slice_name(view.slot_type, view.slot, parent, deadline_ns=deadline_ns),
-            slice_limit_properties(limits),
+            slice_limit_properties(limits, view.slot),
         ),
     ):
         if not properties:
