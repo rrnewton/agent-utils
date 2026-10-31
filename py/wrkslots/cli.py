@@ -34699,17 +34699,8 @@ def _cmd_audit(args: argparse.Namespace) -> int:
         or (
                 row["verdict"] == "BLOCKED"
                 and row.get("heartbeat_expired") is True
-                and (
-                row["owner_state"] not in ("live", "dead")
-                    or row["liveness_state"] not in ("alive", "dead")
-                    or row["cache_error"] is not None
-                    or row.get("cache_status") == "partial"
-                    or any(
-                    token in str(reason).lower()
-                    for reason in _as_list(row["reasons"], "audit row.reasons")
-                    for token in ("cannot", "failed", "unavailable", "unknown")
-                )
-            )
+                and row["owner_state"] not in ("live", "dead")
+                and row["liveness_state"] not in ("alive", "dead")
         )
     ]
     # ⚠️ DEDUPLICATE BOTH LISTS, NOT JUST ONE, AND DEDUPLICATE BY THE PUBLISHED
