@@ -622,7 +622,11 @@ fn event_objs(team: &TeamData, visible: &BTreeSet<String>) -> Vec<Value> {
         let count: i64 = tool.nested_tools.iter().map(|item| item.1).sum();
         let count = if count == 0 { 1 } else { count };
         for _ in 0..count {
-            result.push((tool.started_at_ms, tool.thread_id.clone(), "tool_call".into()));
+            result.push((
+                tool.started_at_ms,
+                tool.thread_id.clone(),
+                "tool_call".into(),
+            ));
         }
     }
     result.sort();
