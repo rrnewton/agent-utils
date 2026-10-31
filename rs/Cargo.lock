@@ -1284,6 +1284,7 @@ name = "wrkviz"
 version = "0.1.0"
 dependencies = [
  "agent-harness",
+ "base64",
  "chrono",
  "chrono-tz",
  "ctrlc",

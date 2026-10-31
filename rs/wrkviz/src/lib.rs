@@ -78,6 +78,16 @@ pub mod summary_catalog;
 pub mod summary_periods;
 /// Phase windows and transcript views for summaries.
 pub mod summary_phases;
+/// Deterministic gzip sidecars, glossary rendering, GitHub refs.
+pub mod build_assets;
+/// Token-free activity bins.
+pub mod activity_bins;
+/// Transcript search records.
+pub mod search_index;
+/// Trigram Bloom filters for search shards.
+pub mod search_bloom;
+/// Schema 3 timeline shards and bootstrap.
+pub mod timeline_v3;
 /// Registered summarizer contracts and context coverage.
 pub mod summary_registry;
 /// The normalized team snapshot (`raw/team.json`) reader.

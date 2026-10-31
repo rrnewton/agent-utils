@@ -73,6 +73,11 @@ pub struct ChunkIndex {
 }
 
 impl ChunkIndex {
+    /// Whether member timestamps are sorted.
+    pub fn timestamps_sorted(&self) -> bool {
+        self.timestamps_sorted
+    }
+
     fn to_text(&self) -> String {
         let mut header = serde_json::Map::new();
         header.insert("format".into(), Value::String(INDEX_FORMAT.to_string()));

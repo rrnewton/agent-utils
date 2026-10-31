@@ -18,6 +18,7 @@ chrono-tz = "0.10"
 fs2 = "0.4"
 libc = "0.2"
 signal-hook = "0.4.4"
+base64 = "0.22"
 flate2 = { version = "1", default-features = false, features = ["zlib"] }
 rusqlite = { version = "0.37", features = ["bundled", "backup"] }
 serde_json = { version = "1", features = ["arbitrary_precision", "float_roundtrip", "preserve_order"] }
