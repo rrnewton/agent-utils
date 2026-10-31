@@ -72,8 +72,14 @@ pub mod summary_budget;
 pub mod summary_catalog;
 /// Registered summarizer contracts and context coverage.
 pub mod summary_registry;
+/// Phase windows and transcript views for summaries.
+pub mod summary_phases;
+/// Calendar rollup periods.
+pub mod summary_periods;
 /// The summarize engine: jobs, cache, backends, accounting.
 pub mod summarize_core;
+/// The summarize tree: plan, run, writers, report.
+pub mod summarize_pipeline;
 /// Token-usage records and batch receipts.
 pub mod token_usage;
 /// The normalized team snapshot (`raw/team.json`) reader.

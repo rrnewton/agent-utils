@@ -370,6 +370,7 @@ pub fn run(args: &[String]) -> u8 {
         "ingest-orc" => run_ingest_session_orc(&args[1..]),
         "ingest-project" => run_ingest_project(&args[1..]),
         "ingest" => run_ingest(&args[1..]),
+        "summarize" => run_summarize(&args[1..]),
         other => {
             eprintln!(
                 "wrkviz: the Rust edition has not ported '{other}' yet; the Python edition remains the oracle for it"
@@ -3301,6 +3302,92 @@ fn is_option_token(arg: &str, names: &[&str]) -> bool {
     })
 }
 
+
+/// The Python edition's summarize help, verbatim.
+pub const SUMMARIZE_HELP: &str = r##"usage: wrkviz summarize [-h] --output OUTPUT --team TEAM
+                        [--backend {codex,claude,heuristic}] [--model MODEL]
+                        [--reasoning-effort REASONING_EFFORT]
+                        [--service-tier SERVICE_TIER]
+                        [--summary-workers SUMMARY_WORKERS]
+                        [--summary-batch-size SUMMARY_BATCH_SIZE]
+                        [--name-batch-size NAME_BATCH_SIZE]
+                        [--phase-minutes PHASE_MINUTES]
+                        [--context-chars CONTEXT_CHARS]
+                        [--transcript-chars TRANSCRIPT_CHARS]
+                        [--codex-command CODEX_COMMAND]
+                        [--claude-command CLAUDE_COMMAND]
+                        [--summary-start-date SUMMARY_START_DATE | --summary-start-time SUMMARY_START_TIME]
+                        [--summary-end-date SUMMARY_END_DATE | --summary-end-time SUMMARY_END_TIME]
+                        [--summary-timezone SUMMARY_TIMEZONE]
+                        [--rollup-kind {hourly,daily,weekly,monthly,quarterly}]
+                        [--budget-usd USD] [--price RATES] [--plan]
+
+fill structured summary cache misses
+
+options:
+  -h, --help            show this help message and exit
+  --output OUTPUT       version-controllable archive directory
+  --team TEAM           stable team slug, for example example-team
+  --backend {codex,claude,heuristic}
+                        summary backend (heuristic is deterministic/offline)
+  --model MODEL         backend model name; required for Claude, otherwise
+                        defaults to 'gpt-5.5' (or WRKVIZ_MODEL)
+  --reasoning-effort REASONING_EFFORT
+                        backend reasoning effort, recorded in cache provenance
+                        (default: medium). A model/provider failure aborts
+                        instead of selecting another model or backend
+  --service-tier SERVICE_TIER
+                        Codex service tier; Fast uses 'priority', omission
+                        means 'default', and the effective value is recorded
+                        in cache and run provenance
+  --summary-workers SUMMARY_WORKERS
+  --summary-batch-size SUMMARY_BATCH_SIZE
+  --name-batch-size NAME_BATCH_SIZE
+                        agents per hindsight-naming model call
+  --phase-minutes PHASE_MINUTES
+  --context-chars CONTEXT_CHARS
+  --transcript-chars TRANSCRIPT_CHARS
+  --codex-command CODEX_COMMAND
+                        Codex executable (primarily for testing/wrappers)
+  --claude-command CLAUDE_COMMAND
+                        Claude executable (primarily for testing/wrappers)
+  --summary-start-date SUMMARY_START_DATE
+                        first local date to summarize without truncating
+                        archived data
+  --summary-start-time SUMMARY_START_TIME
+                        first RFC3339 instant to summarize, inclusive
+  --summary-end-date SUMMARY_END_DATE
+                        local date boundary where summarization stops,
+                        exclusive
+  --summary-end-time SUMMARY_END_TIME
+                        RFC3339 instant where summarization stops, exclusive
+  --summary-timezone SUMMARY_TIMEZONE
+                        IANA timezone for summary date bounds (defaults to the
+                        archived team timezone)
+  --rollup-kind {hourly,daily,weekly,monthly,quarterly}
+                        calendar summary level to generate; repeat as needed
+                        (default: daily, weekly, monthly, quarterly)
+  --budget-usd USD      spending cap for this run in US dollars; requires
+                        --price. Before any model call the whole remaining
+                        tree (phase summaries, agent names, overview, every
+                        rollup) is estimated, and the run refuses to start,
+                        spending nothing, when the estimate is over the cap.
+                        If actual spend still reaches the cap, no new model
+                        call starts, calls already running finish and are
+                        cached, the run exits 3, and the team's
+                        summary_data/summarize_state.json marks it partial;
+                        rerun to resume (default: no cap)
+  --price RATES         model prices in US dollars per million tokens, as inpu
+                        t=N,output=N[,cached_input=N][,cache_write_input=N]; a
+                        cache rate defaults to the input rate. Used to price
+                        the plan and to enforce --budget-usd, e.g. --price inp
+                        ut=2,output=10,cached_input=0.2,cache_write_input=2.5
+                        (default: none; the plan then shows tokens only)
+  --plan                print what the run would generate and its estimated
+                        tokens and cost (with --price), then exit without any
+                        model call; exits 3 when over --budget-usd
+"##;
+
 fn run_query(args: &[String]) -> u8 {
     let mut output: Option<String> = None;
     let mut format = "json".to_string();
@@ -4508,4 +4595,489 @@ fn run_inspect(args: &[String]) -> u8 {
             2
         }
     }
+}
+
+const SUMMARIZE_USAGE: &str = "usage: wrkviz summarize [-h] --output OUTPUT --team TEAM\n                        [--backend {codex,claude,heuristic}] [--model MODEL]\n                        [--reasoning-effort REASONING_EFFORT]\n                        [--service-tier SERVICE_TIER]\n                        [--summary-workers SUMMARY_WORKERS]\n                        [--summary-batch-size SUMMARY_BATCH_SIZE]\n                        [--name-batch-size NAME_BATCH_SIZE]\n                        [--phase-minutes PHASE_MINUTES]\n                        [--context-chars CONTEXT_CHARS]\n                        [--transcript-chars TRANSCRIPT_CHARS]\n                        [--codex-command CODEX_COMMAND]\n                        [--claude-command CLAUDE_COMMAND]\n                        [--summary-start-date SUMMARY_START_DATE | --summary-start-time SUMMARY_START_TIME]\n                        [--summary-end-date SUMMARY_END_DATE | --summary-end-time SUMMARY_END_TIME]\n                        [--summary-timezone SUMMARY_TIMEZONE]\n                        [--rollup-kind {hourly,daily,weekly,monthly,quarterly}]\n                        [--budget-usd USD] [--price RATES] [--plan]";
+
+fn run_summarize(args: &[String]) -> u8 {
+    if args
+        .iter()
+        .any(|arg| arg == "--help" || arg == "-h")
+    {
+        print!("{SUMMARIZE_HELP}");
+        return 0;
+    }
+    const VALUE_OPTIONS: &[&str] = &[
+        "--output",
+        "--team",
+        "--backend",
+        "--model",
+        "--reasoning-effort",
+        "--service-tier",
+        "--summary-workers",
+        "--summary-batch-size",
+        "--name-batch-size",
+        "--phase-minutes",
+        "--context-chars",
+        "--transcript-chars",
+        "--codex-command",
+        "--claude-command",
+        "--summary-start-date",
+        "--summary-start-time",
+        "--summary-end-date",
+        "--summary-end-time",
+        "--summary-timezone",
+        "--rollup-kind",
+        "--budget-usd",
+        "--price",
+    ];
+    let mut values: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    let mut plan = false;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        let (head, explicit) = match arg.split_once('=') {
+            Some((head, value)) => (head, Some(value.to_string())),
+            None => (arg.as_str(), None),
+        };
+        if head == "--plan"
+            || (head.len() > 2 && head.starts_with("--") && "--plan".starts_with(head))
+        {
+            if explicit.is_some() {
+                return argparse_error(
+                    SUMMARIZE_USAGE,
+                    "wrkviz summarize",
+                    &format!("argument --plan: ignored explicit argument {explicit:?}"),
+                );
+            }
+            plan = true;
+            index += 1;
+            continue;
+        }
+        let matched: Vec<&str> = VALUE_OPTIONS
+            .iter()
+            .copied()
+            .filter(|name| {
+                head == *name
+                    || (head.len() > 2 && head.starts_with("--") && name.starts_with(head))
+            })
+            .collect();
+        if matched.len() > 1 {
+            return argparse_error(
+                SUMMARIZE_USAGE,
+                "wrkviz summarize",
+                &format!(
+                    "ambiguous option: {head} could match {}",
+                    matched.join(", ")
+                ),
+            );
+        }
+        let Some(name) = matched.first() else {
+            return argparse_error(
+                SUMMARIZE_USAGE,
+                "wrkviz summarize",
+                &format!("unrecognized arguments: {arg}"),
+            );
+        };
+        let value = match explicit {
+            Some(value) => value,
+            None => {
+                index += 1;
+                match args.get(index) {
+                    Some(value) => value.clone(),
+                    None => {
+                        return argparse_error(
+                            SUMMARIZE_USAGE,
+                            "wrkviz summarize",
+                            &format!("argument {name}: expected one argument"),
+                        )
+                    }
+                }
+            }
+        };
+        values.entry(name.to_string()).or_default().push(value);
+        index += 1;
+    }
+    let get = |name: &str| values.get(name).and_then(|items| items.last()).cloned();
+    let missing: Vec<&str> = ["--output", "--team"]
+        .into_iter()
+        .filter(|name| get(name).is_none())
+        .collect();
+    if !missing.is_empty() {
+        return argparse_error(
+            SUMMARIZE_USAGE,
+            "wrkviz summarize",
+            &format!(
+                "the following arguments are required: {}",
+                missing.join(", ")
+            ),
+        );
+    }
+    if get("--summary-start-date").is_some() && get("--summary-start-time").is_some() {
+        return argparse_error(
+            SUMMARIZE_USAGE,
+            "wrkviz summarize",
+            "argument --summary-start-time: not allowed with argument --summary-start-date",
+        );
+    }
+    if get("--summary-end-date").is_some() && get("--summary-end-time").is_some() {
+        return argparse_error(
+            SUMMARIZE_USAGE,
+            "wrkviz summarize",
+            "argument --summary-end-time: not allowed with argument --summary-end-date",
+        );
+    }
+    let parse_int = |name: &str, default: i64| -> Result<i64, u8> {
+        match get(name) {
+            None => Ok(default),
+            Some(raw) => raw.parse::<i64>().map_err(|_| {
+                argparse_error(
+                    SUMMARIZE_USAGE,
+                    "wrkviz summarize",
+                    &format!(
+                        "argument {name}: invalid int value: {}",
+                        crate::json::py_repr_str(&raw)
+                    ),
+                )
+            }),
+        }
+    };
+    let summary_workers = match parse_int("--summary-workers", 3) {
+        Ok(value) => value,
+        Err(code) => return code,
+    };
+    let summary_batch_size = match parse_int("--summary-batch-size", 6) {
+        Ok(value) => value,
+        Err(code) => return code,
+    };
+    let name_batch_size = match parse_int("--name-batch-size", 12) {
+        Ok(value) => value,
+        Err(code) => return code,
+    };
+    let phase_minutes = match parse_int("--phase-minutes", 30) {
+        Ok(value) => value,
+        Err(code) => return code,
+    };
+    let context_chars = match parse_int("--context-chars", 16000) {
+        Ok(value) => value,
+        Err(code) => return code,
+    };
+    let transcript_chars = match parse_int("--transcript-chars", 30000) {
+        Ok(value) => value,
+        Err(code) => return code,
+    };
+    let budget_usd: Option<f64> = match get("--budget-usd") {
+        None => None,
+        Some(raw) => match raw.parse::<f64>() {
+            Ok(value) => Some(value),
+            Err(_) => {
+                return argparse_error(
+                    SUMMARIZE_USAGE,
+                    "wrkviz summarize",
+                    &format!(
+                        "argument --budget-usd: invalid float value: {}",
+                        crate::json::py_repr_str(&raw)
+                    ),
+                )
+            }
+        },
+    };
+    let backend = get("--backend").unwrap_or_else(|| "codex".to_string());
+    if !matches!(backend.as_str(), "codex" | "claude" | "heuristic") {
+        return argparse_error(
+            SUMMARIZE_USAGE,
+            "wrkviz summarize",
+            &format!(
+                "argument --backend: invalid choice: {} (choose from 'codex', 'claude', 'heuristic')",
+                crate::json::py_repr_str(&backend)
+            ),
+        );
+    }
+    let mut rollup_kinds: Vec<String> = values
+        .get("--rollup-kind")
+        .cloned()
+        .unwrap_or_default();
+    for kind in &rollup_kinds {
+        if !matches!(
+            kind.as_str(),
+            "hourly" | "daily" | "weekly" | "monthly" | "quarterly"
+        ) {
+            return argparse_error(
+                SUMMARIZE_USAGE,
+                "wrkviz summarize",
+                &format!(
+                    "argument --rollup-kind: invalid choice: {} (choose from 'hourly', 'daily', 'weekly', 'monthly', 'quarterly')",
+                    crate::json::py_repr_str(kind)
+                ),
+            );
+        }
+    }
+    if rollup_kinds.is_empty() {
+        rollup_kinds = ["daily", "weekly", "monthly", "quarterly"]
+            .iter()
+            .map(|item| item.to_string())
+            .collect();
+    }
+
+    let output = get("--output").unwrap();
+    let team_slug = get("--team").unwrap();
+    let archive = cli_path(&output);
+    let started = crate::pipeline::utc_now();
+    let mut command: Vec<String> = vec!["wrkviz".to_string(), "summarize".to_string()];
+    command.extend(args.iter().cloned());
+
+    let default_model = std::env::var("WRKVIZ_MODEL").unwrap_or_else(|_| "gpt-5.5".to_string());
+    let default_effort =
+        std::env::var("WRKVIZ_REASONING_EFFORT").unwrap_or_else(|_| "medium".to_string());
+    let reasoning_effort = Some(get("--reasoning-effort").unwrap_or(default_effort));
+    let service_tier = get("--service-tier");
+
+    let outcome: Result<
+        Option<crate::summarize_pipeline::SummarizeReport>,
+        (String, bool),
+    > = (|| {
+        let model = match get("--model") {
+            None => {
+                if backend == "claude" {
+                    return Err((
+                        "--model is required when --backend=claude".to_string(),
+                        false,
+                    ));
+                }
+                default_model.clone()
+            }
+            Some(raw) => {
+                let model = crate::summarize_core::py_trim(&raw).to_string();
+                if model.is_empty() {
+                    return Err(("--model must not be empty".to_string(), false));
+                }
+                model
+            }
+        };
+        let has_date_bound =
+            get("--summary-start-date").is_some() || get("--summary-end-date").is_some();
+        let summary_timezone = match get("--summary-timezone") {
+            Some(value) => value,
+            None => {
+                if has_date_bound {
+                    crate::pipeline::load_archived_team(&archive, &team_slug)
+                        .map_err(|error| (error, false))?
+                        .display_timezone
+                } else {
+                    "UTC".to_string()
+                }
+            }
+        };
+        let summary_window = crate::window::parse_date_window(
+            get("--summary-start-date").as_deref(),
+            get("--summary-end-date").as_deref(),
+            &summary_timezone,
+            get("--summary-start-time").as_deref(),
+            get("--summary-end-time").as_deref(),
+        )
+        .map_err(|error| (error, false))?;
+        if let Some(budget) = budget_usd {
+            if !(budget >= 0.0) {
+                return Err((
+                    "--budget-usd must be a non-negative number".to_string(),
+                    false,
+                ));
+            }
+        }
+        let prices = match get("--price") {
+            None => None,
+            Some(raw) => Some(
+                crate::summary_budget::Prices::parse(&raw)
+                    .map_err(|error| (error, false))?,
+            ),
+        };
+        if budget_usd.is_some() && prices.is_none() && backend != "heuristic" {
+            return Err((
+                "--budget-usd needs --price to turn token estimates into dollars"
+                    .to_string(),
+                false,
+            ));
+        }
+        let options = crate::summarize_pipeline::SummarizeOptions {
+            max_workers: summary_workers.max(0) as usize,
+            batch_size: summary_batch_size.max(0) as usize,
+            name_batch_size: name_batch_size.max(0) as usize,
+            phase_minutes,
+            context_chars,
+            transcript_chars,
+            codex_command: vec![get("--codex-command").unwrap_or_else(|| "codex".to_string())],
+            claude_command: vec![
+                get("--claude-command").unwrap_or_else(|| "claude".to_string()),
+            ],
+            reasoning_effort: reasoning_effort.clone(),
+            service_tier: service_tier.clone(),
+            summary_window,
+            rollup_kinds: rollup_kinds.clone(),
+            budget_usd,
+            prices,
+        };
+        if plan {
+            let plan = crate::summarize_pipeline::plan_summaries(
+                &archive,
+                &team_slug,
+                &backend,
+                &model,
+                &options,
+            )
+            .map_err(|error| (error, false))?;
+            for line in plan.lines() {
+                println!("{line}");
+            }
+            if plan.over_budget() {
+                // _PlanOverBudget: exit 3 with no run record.
+                return Err((String::new(), true));
+            }
+            return Ok(None);
+        }
+        let report = crate::summarize_pipeline::summarize_archive(
+            &archive,
+            &team_slug,
+            &backend,
+            &model,
+            &options,
+            &|plan| {
+                for line in plan.lines() {
+                    println!("{line}");
+                }
+            },
+        )
+        .map_err(|error| {
+            let is_budget = error.is_budget();
+            (error.message().to_string(), is_budget)
+        })?;
+        Ok(Some(report))
+    })();
+
+    match outcome {
+        Ok(None) => {
+            // --plan without going over budget records no run.
+            if plan {
+                0
+            } else {
+                0
+            }
+        }
+        Ok(Some(report)) => {
+            print_summaries(&report);
+            let summaries_json = report.to_json_obj();
+            match crate::pipeline::record_run_summaries(
+                &archive,
+                &crate::pipeline::RunReceipt {
+                    command: &command,
+                    started_at: &started,
+                    status: "completed",
+                    team_slug: &team_slug,
+                    error: None,
+                    team_slugs: &[],
+                    mechanical: None,
+                    ingest: None,
+                },
+                Some(summaries_json),
+            ) {
+                Ok(run_path) => {
+                    println!("run metadata: {}", run_path.display());
+                    0
+                }
+                Err(error) => {
+                    eprintln!("wrkviz: {error}");
+                    2
+                }
+            }
+        }
+        Err((error, is_budget)) => {
+            if plan && error.is_empty() && is_budget {
+                return 3;
+            }
+            if let Ok(run_path) = crate::pipeline::record_run_summaries(
+                &archive,
+                &crate::pipeline::RunReceipt {
+                    command: &command,
+                    started_at: &started,
+                    status: "failed",
+                    team_slug: &team_slug,
+                    error: Some(&error),
+                    team_slugs: &[],
+                    mechanical: None,
+                    ingest: None,
+                },
+                None,
+            ) {
+                eprintln!("run metadata: {}", run_path.display());
+            }
+            eprintln!("wrkviz: {error}");
+            if is_budget {
+                3
+            } else {
+                2
+            }
+        }
+    }
+}
+
+fn print_summaries(report: &crate::summarize_pipeline::SummarizeReport) {
+    let tier = report.service_tier.as_deref().unwrap_or("unspecified");
+    println!(
+        "summarize ({} / {} / tier={tier}): {} phases + {} hindsight agent names + {} calendar periods × 2 summary audiences; cache {} hit / {} miss in {} backend batch(es); {} project overview + {} glossary definitions; catalog {} immutable artifacts",
+        report.backend,
+        report.model,
+        report.phases,
+        report.agent_names,
+        report.rollups,
+        report.cache_hits,
+        report.cache_misses,
+        report.backend_batches,
+        report.project_overviews,
+        report.glossary_definitions,
+        report.catalog_artifacts
+    );
+    if report.carried_forward_rollups != 0 {
+        println!(
+            "rollups carried forward: {} (what they summarize is unchanged; only earlier periods they read as context changed)",
+            report.carried_forward_rollups
+        );
+    }
+    println!(
+        "{}",
+        usage_line(
+            "tokens newly spent",
+            &report.newly_spent_usage,
+            report.newly_spent_unknown_receipts
+        )
+    );
+    println!(
+        "{}",
+        usage_line(
+            "tokens behind returned cached artifacts",
+            &report.artifact_generation_usage,
+            report.artifact_generation_unknown_receipts
+        )
+    );
+    if report.unknown_legacy_artifacts != 0 {
+        println!(
+            "token accounting: {} legacy artifact(s) have no usage receipt",
+            report.unknown_legacy_artifacts
+        );
+    }
+}
+
+fn usage_line(
+    label: &str,
+    usage: &crate::token_usage::TokenUsage,
+    unknown_receipts: i64,
+) -> String {
+    format!(
+        "{label}: input={}, cached_input={}, cache_write_input={}, output={}, reasoning_output={}, total={}; unknown_receipts={unknown_receipts}",
+        usage.input_tokens,
+        usage.cached_input_tokens,
+        usage.cache_write_input_tokens,
+        usage.output_tokens,
+        usage.reasoning_output_tokens,
+        usage.total_tokens()
+    )
 }

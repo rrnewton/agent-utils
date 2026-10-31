@@ -375,10 +375,24 @@ pub struct RunReceipt<'a> {
 /// ingest/summary/build receipts arrive with their commands.
 pub fn record_run(archive: &Path, receipt: &RunReceipt<'_>) -> Result<PathBuf, String> {
     let _lock = archive_writer_lock(archive)?;
-    record_run_locked(archive, receipt)
+    record_run_locked(archive, receipt, None)
 }
 
-fn record_run_locked(archive: &Path, receipt: &RunReceipt<'_>) -> Result<PathBuf, String> {
+/// Record a run carrying a summarize report payload.
+pub fn record_run_summaries(
+    archive: &Path,
+    receipt: &RunReceipt<'_>,
+    summaries: Option<Value>,
+) -> Result<PathBuf, String> {
+    let _lock = archive_writer_lock(archive)?;
+    record_run_locked(archive, receipt, summaries)
+}
+
+fn record_run_locked(
+    archive: &Path,
+    receipt: &RunReceipt<'_>,
+    summaries: Option<Value>,
+) -> Result<PathBuf, String> {
     let (command, started_at, status, team_slug, error, team_slugs, mechanical) = (
         receipt.command,
         receipt.started_at,
@@ -436,7 +450,7 @@ fn record_run_locked(archive: &Path, receipt: &RunReceipt<'_>) -> Result<PathBuf
         "ingest".into(),
         receipt.ingest.clone().unwrap_or(Value::Null),
     );
-    run_obj.insert("summaries".into(), Value::Null);
+    run_obj.insert("summaries".into(), summaries.unwrap_or(Value::Null));
     run_obj.insert("build".into(), Value::Object(serde_json::Map::new()));
     run_obj.insert(
         "error".into(),
