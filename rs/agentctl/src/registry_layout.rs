@@ -382,7 +382,6 @@ fn nested_agents_registry(registry: &Path) -> Option<PathBuf> {
 /// # Errors
 ///
 /// The registry is unsafe or cannot be listed, or layout 2 cannot be prepared.
-
 pub fn migrate(registry: &Path, options: MigrateOptions) -> Result<Value> {
     let mut report = json!({
         "registry": registry.display().to_string(),
