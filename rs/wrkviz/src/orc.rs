@@ -3040,7 +3040,12 @@ pub fn discover_sources(
                 &cell(1),
                 &format!("{}: sessions[{index}].parent_id", index_path.display()),
             )?;
-            parents.push((session_id, parent));
+            // The oracle reads the index into a dict: a repeated
+            // session id keeps its last row, not its first.
+            match parents.iter_mut().find(|(held, _)| *held == session_id) {
+                Some((_, held)) => *held = parent,
+                None => parents.push((session_id, parent)),
+            }
         }
         if !parents.iter().any(|(held, _)| *held == root_id) {
             return Err(format!(
@@ -4232,31 +4237,67 @@ pub fn task_enrichment_sha256(records: &[FrozenTaskNote]) -> String {
     sha256_hex(task_projection_text(&enrichments).as_bytes())
 }
 
+/// One staging token: 16 lowercase hex digits, unique
+/// within this process even inside one clock tick (the
+/// oracle draws a random token per file).
+pub fn staging_token() -> String {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|held| held.as_nanos() as u64)
+        .unwrap_or(0);
+    format!(
+        "{:016x}",
+        nanos ^ sequence.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+    )
+}
+
 /// Write a frozen history under `.staging` and return
 /// (temporary, target, digest, relative path).
 pub fn stage_task_projection(
     records: &[FrozenTaskNote],
     snapshot_root: &Path,
 ) -> Result<(PathBuf, PathBuf, String, String), String> {
+    use std::io::Write as _;
     let text = frozen_task_projection_text(records);
     let digest = sha256_hex(text.as_bytes());
     let relative = task_projection_relative(&digest)?;
     let target = snapshot_path(snapshot_root, &relative)?;
-    let token = format!(
-        "{:016x}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|held| held.as_nanos() as u64)
-            .unwrap_or(0)
-    );
-    let temporary = snapshot_root.join(".staging").join(format!(
-        "task-projection-{}-{token}.json",
-        std::process::id()
-    ));
-    ensure_snapshot_parent(&temporary, snapshot_root)?;
-    std::fs::write(&temporary, text.as_bytes())
-        .map_err(|error| crate::json::os_error(&error, &temporary))?;
-    Ok((temporary, target, digest, relative))
+    let mut last_error: Option<std::io::Error> = None;
+    for _ in 0..64 {
+        let temporary = snapshot_root.join(".staging").join(format!(
+            "task-projection-{}-{}.json",
+            std::process::id(),
+            staging_token()
+        ));
+        ensure_snapshot_parent(&temporary, snapshot_root)?;
+        // The oracle opens with "x": never truncate a file
+        // another transaction may still own.
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(mut handle) => {
+                return match handle
+                    .write_all(text.as_bytes())
+                    .and_then(|()| handle.flush())
+                {
+                    Ok(()) => Ok((temporary, target, digest, relative)),
+                    Err(error) => Err(crate::json::os_error(&error, &temporary)),
+                };
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_error = Some(error);
+            }
+            Err(error) => return Err(crate::json::os_error(&error, &temporary)),
+        }
+    }
+    Err(crate::json::os_error(
+        &last_error.unwrap_or_else(|| std::io::Error::from(std::io::ErrorKind::AlreadyExists)),
+        &snapshot_root.join(".staging"),
+    ))
 }
 
 // ---------------------------------------------------------------- logical state
@@ -5634,19 +5675,27 @@ pub fn modern_content_records(
         let Some(inner) = block_identity.strip_prefix("v2-block-") else {
             continue;
         };
+        // A repeated block id keeps its last row, as the
+        // oracle's dict does. (Non-ASCII decimal digits,
+        // which the oracle's \d and int() accept, stay the
+        // campaign's recorded Unicode-digit gap.)
         if inner.is_empty() || !inner.bytes().all(|b| b.is_ascii_digit()) {
             continue;
         }
         let Ok(block_number) = inner.parse::<i64>() else {
             continue;
         };
-        existing_block_turns.push((
-            block_number,
-            cell_integer(
-                &cell(1),
-                &format!("{}: content block turn_index", path.display()),
-            )?,
-        ));
+        let turn = cell_integer(
+            &cell(1),
+            &format!("{}: content block turn_index", path.display()),
+        )?;
+        match existing_block_turns
+            .iter_mut()
+            .find(|(held, _)| *held == block_number)
+        {
+            Some((_, held)) => *held = turn,
+            None => existing_block_turns.push((block_number, turn)),
+        }
     }
     let turn_of_block = |block_id: i64| -> Option<i64> {
         existing_block_turns
@@ -6708,13 +6757,17 @@ pub fn plan_snapshot_sources(
         }
     }
     let planned_live_task_paths: Vec<String> = {
-        let mut held: Vec<String> = session_task_paths
-            .iter()
-            .flat_map(|(_, paths)| paths.iter().cloned())
-            .filter(|path| {
-                live_source_path(source_root, path).is_ok_and(|held| source_exists(&held))
-            })
-            .collect();
+        // The oracle's live-path proof raises on a symlink
+        // or irregular component; it never degrades to
+        // "not there".
+        let mut held: Vec<String> = Vec::new();
+        for (_, paths) in &session_task_paths {
+            for path in paths {
+                if source_exists(&live_source_path(source_root, path)?) {
+                    held.push(path.clone());
+                }
+            }
+        }
         held.sort();
         held.dedup();
         held
@@ -6741,18 +6794,20 @@ pub fn plan_snapshot_sources(
             .map(|source| source.source_path.clone())
             .collect::<Vec<_>>(),
     );
-    let mut frozen_paths: Vec<String> = previous_sources
-        .iter()
-        .filter(|source| {
-            source.kind == "task"
-                && !discovered_paths.contains(&source.source_path)
-                && (source.source_state == SOURCE_STATE_DETACHED
-                    || newly_detached_paths.contains(&source.source_path)
-                    || live_source_path(source_root, &source.source_path)
-                        .is_ok_and(|held| !source_exists(&held)))
-        })
-        .map(|source| source.source_path.clone())
-        .collect();
+    let mut frozen_paths: Vec<String> = Vec::new();
+    for source in previous_sources.iter() {
+        if source.kind != "task" || discovered_paths.contains(&source.source_path) {
+            continue;
+        }
+        // Same proof as above: a symlink parent raises
+        // rather than freezing the source.
+        if source.source_state == SOURCE_STATE_DETACHED
+            || newly_detached_paths.contains(&source.source_path)
+            || !source_exists(&live_source_path(source_root, &source.source_path)?)
+        {
+            frozen_paths.push(source.source_path.clone());
+        }
+    }
     frozen_paths.sort();
     frozen_paths.dedup();
     let mut disappeared: Vec<String> = previous_by_path
@@ -7013,8 +7068,9 @@ fn prefix_values_equal_json(previous: &JsonValue, observed: &JsonValue) -> bool 
 }
 
 fn json_change_paths(previous_body: &str, observed_body: &str) -> (Vec<String>, bool) {
-    if previous_body.len() > PREFIX_DIFF_MAX_JSON_CHARS
-        || observed_body.len() > PREFIX_DIFF_MAX_JSON_CHARS
+    // The oracle caps on characters, not UTF-8 bytes.
+    if previous_body.chars().count() > PREFIX_DIFF_MAX_JSON_CHARS
+        || observed_body.chars().count() > PREFIX_DIFF_MAX_JSON_CHARS
     {
         return (Vec::new(), false);
     }
@@ -7363,31 +7419,25 @@ pub fn backup_database(
         }
     }
     let source_connection = read_only(source)?;
-    let outcome = (|| -> Result<(), String> {
-        source_connection
-            .backup(rusqlite::MAIN_DB, destination, None)
-            .map_err(|error| {
-                format!(
-                    "failed to back up Orc SQLite source {}: {error}",
-                    source.display()
-                )
-            })?;
-        let destination_connection =
-            Connection::open(destination).map_err(|error| error.to_string())?;
-        let mode: String = destination_connection
-            .query_row("PRAGMA journal_mode = DELETE", [], |row| row.get(0))
-            .map_err(|error| error.to_string())?;
-        if mode.to_lowercase() != "delete" {
-            return Err(format!(
-                "failed to normalize Orc snapshot journal mode for {}",
-                source.display()
-            ));
-        }
-        Ok(())
-    })();
-    if let Err(error) = outcome {
-        return Err(format!(
+    // SQLite failures carry the backup prefix; the
+    // journal-mode refusal passes through bare, exactly
+    // as the oracle's exception types split them.
+    let wrap = |error: rusqlite::Error| -> String {
+        format!(
             "failed to back up Orc SQLite source {}: {error}",
+            source.display()
+        )
+    };
+    source_connection
+        .backup(rusqlite::MAIN_DB, destination, None)
+        .map_err(wrap)?;
+    let destination_connection = Connection::open(destination).map_err(wrap)?;
+    let mode: String = destination_connection
+        .query_row("PRAGMA journal_mode = DELETE", [], |row| row.get(0))
+        .map_err(wrap)?;
+    if mode.to_lowercase() != "delete" {
+        return Err(format!(
+            "failed to normalize Orc snapshot journal mode for {}",
             source.display()
         ));
     }
@@ -7707,18 +7757,16 @@ pub fn prune_orc_staging(snapshot_root: &Path) -> Result<i64, String> {
                     .bytes()
                     .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         }
-        if staged_ok(name, "orc-", ".db") || staged_ok(name, "task-projection-", ".json") {
-            return true;
+        // The oracle's managed pattern: a database name
+        // may carry one -wal/-shm suffix; projections may
+        // not.
+        if let Some(base) = name
+            .strip_suffix("-wal")
+            .or_else(|| name.strip_suffix("-shm"))
+        {
+            return staged_ok(base, "orc-", ".db");
         }
-        for suffix in ["-wal", "-shm"] {
-            if let Some(base) = name.strip_suffix(suffix) {
-                let base = format!("{base}.db");
-                if staged_ok(&base, "orc-", ".db") {
-                    return true;
-                }
-            }
-        }
-        false
+        staged_ok(name, "orc-", ".db") || staged_ok(name, "task-projection-", ".json")
     };
     let mut removed = 0i64;
     let mut candidates: Vec<PathBuf> = Vec::new();
@@ -8730,13 +8778,7 @@ pub fn snapshot_orc_lineage(
             let kind = &discovered_source.kind;
             let previous = plan.previous(relative);
             let staging_root = snapshot_root.join(".staging");
-            let token = format!(
-                "{:016x}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|held| held.as_nanos() as u64)
-                    .unwrap_or(0)
-            );
+            let token = staging_token();
             let temporary = staging_root.join(format!("orc-{}-{token}.db", std::process::id()));
             temporary_paths.push(temporary.clone());
             temporary_by_source.push((relative.clone(), temporary.clone()));
@@ -9434,7 +9476,6 @@ pub fn continuation_namespace(lineage_root: &str, roots: &[String]) -> String {
         format!("orc-cont-{index}-{}-", session_prefix8(lineage_root))
     }
 }
-
 #[allow(clippy::too_many_arguments)]
 fn orc_agent_path(
     session_id: &str,
@@ -9445,10 +9486,21 @@ fn orc_agent_path(
     continuation_parents: &[(String, String)],
     has_links: bool,
     memo: &mut Vec<(String, String)>,
-) -> String {
+    visiting: &mut Vec<String>,
+) -> Result<String, String> {
     if let Some((_, held)) = memo.iter().find(|(key, _)| key == session_id) {
-        return held.clone();
+        return Ok(held.clone());
     }
+    // The oracle recurses without a guard and dies with
+    // RecursionError; refuse the cycle by name instead of
+    // overflowing the stack.
+    if visiting.iter().any(|held| held == session_id) {
+        return Err(format!(
+            "cycle in Orc session parents at {}",
+            py_repr_str(session_id)
+        ));
+    }
+    visiting.push(session_id.to_string());
     let meta = metas
         .iter()
         .find(|(held, _)| held == session_id)
@@ -9475,7 +9527,8 @@ fn orc_agent_path(
                 continuation_parents,
                 has_links,
                 memo,
-            ),
+                visiting,
+            )?,
             _ => "/root".to_string(),
         };
         let component = if continuation_parents
@@ -9492,8 +9545,9 @@ fn orc_agent_path(
         };
         format!("{}/{component}", parent_path.trim_end_matches('/'))
     };
+    visiting.pop();
     memo.push((session_id.to_string(), result.clone()));
-    result
+    Ok(result)
 }
 
 /// Normalize validated archive-local Orc SQLite backups
@@ -10021,7 +10075,8 @@ pub fn load_orc_team(
                 &continuation_parents,
                 !continuation_links.is_empty(),
                 &mut path_memo,
-            );
+                &mut Vec::new(),
+            )?;
             let own = events_for(session_id);
             let mut activity_ends: Vec<i64> = vec![meta.created_at_ms + 1];
             activity_ends.extend(own.iter().map(|event| event.timestamp_ms + 1));

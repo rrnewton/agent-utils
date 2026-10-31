@@ -1481,16 +1481,18 @@ pub fn load_orc_manifest(
         }
         let present: Vec<&str> = object.keys().map(|held| held.as_str()).collect();
         if present.len() != expected.len() || !expected.iter().all(|held| present.contains(held)) {
-            let missing: Vec<String> = expected
+            let mut missing: Vec<String> = expected
                 .iter()
                 .filter(|held| !present.contains(held))
                 .map(|held| held.to_string())
                 .collect();
-            let unknown: Vec<String> = present
+            let mut unknown: Vec<String> = present
                 .iter()
                 .filter(|held| !expected.contains(held))
                 .map(|held| held.to_string())
                 .collect();
+            missing.sort();
+            unknown.sort();
             return Err(format!(
                 "invalid Orc source manifest fields at {}: missing={}, unknown={}",
                 path.display(),
@@ -1709,7 +1711,10 @@ pub fn ingest_orc(
     requested_snapshot_root: Option<&Path>,
 ) -> Result<(TeamData, IngestReport), String> {
     let _lock = crate::pipeline::archive_writer_lock(archive)?;
-    ingest_orc_locked(
+    // Decompressed copies live in a per-process temp dir
+    // the oracle removes at exit; remove them as this
+    // ingest ends instead.
+    let outcome = ingest_orc_locked(
         archive,
         source_root,
         root_session_id,
@@ -1720,7 +1725,9 @@ pub fn ingest_orc(
         continuation_specs,
         accept_prefix_rewrite,
         requested_snapshot_root,
-    )
+    );
+    crate::orc::cleanup_decompressed();
+    outcome
 }
 
 #[allow(clippy::too_many_arguments)]

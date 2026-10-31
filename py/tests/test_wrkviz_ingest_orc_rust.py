@@ -422,6 +422,67 @@ def test_orc_legacy_session(tmp_path: Path, rust_wrkviz: Path) -> None:
     assert oracle.returncode == 0
 
 
+def test_orc_duplicate_index_rows(tmp_path: Path, rust_wrkviz: Path) -> None:
+    # A repeated index id keeps its last row in the oracle:
+    # CHILD's parent becomes the ghost, so CHILD is never
+    # selected into the lineage.
+    source_root = _upstream(tmp_path / "shared")
+    index = source_root / ".orc" / "index.db"
+    con = sqlite3.connect(index)
+    con.execute("INSERT INTO sessions VALUES (?, ?)", (CHILD_ID, "ghost-session"))
+    con.commit()
+    con.close()
+    oracle, result = _compare(tmp_path / "flow", rust_wrkviz, [],
+                              source_root=source_root)
+    assert oracle.returncode == 0
+    assert "2 agents" in result.stdout
+
+
+def test_orc_duplicate_v2_block_turns(tmp_path: Path,
+                                      rust_wrkviz: Path) -> None:
+    # A repeated v2-block id keeps its last turn_index.
+    source_root = _upstream(tmp_path / "shared")
+    target = source_root / ".orc" / "sessions" / ROOT_ID / "session.db"
+    con = sqlite3.connect(target)
+    for turn in (3, 9):
+        con.execute(
+            "INSERT INTO content_blocks (id, message_id, session_id, "
+            "created_at_ms, turn_index, role, block_type, content, "
+            "searchable_text) VALUES ('v2-block-10', 'm1', ?, ?, ?, "
+            "'assistant', 'text', '', '')",
+            (ROOT_ID, T0 + 120_000, turn))
+    con.commit()
+    con.close()
+    oracle, result = _compare(tmp_path / "flow", rust_wrkviz, [],
+                              source_root=source_root)
+    assert oracle.returncode == 0
+    team = json.loads(
+        (tmp_path / "flow" / "rs" / "archive.build" / "orc-team" / "raw"
+         / "team.json").read_text())
+    assert any(turn["turn_id"].endswith("-9")
+               for turn in team["turns"])
+
+
+def test_orc_staging_leftovers_pruned(tmp_path: Path,
+                                      rust_wrkviz: Path) -> None:
+    source_root = _upstream(tmp_path / "shared")
+    flow = tmp_path / "flow"
+    oracle, result = _compare(flow, rust_wrkviz, [], source_root=source_root)
+    assert oracle.returncode == 0
+    for label in ("py", "rs"):
+        staging = (flow / label / "archive.sources" / "orc-team" / ".staging")
+        staging.mkdir(parents=True, exist_ok=True)
+        for name in ("orc-123-0123456789abcdef.db-wal",
+                     "orc-123-0123456789abcdef.db-shm",
+                     "task-projection-123-0123456789abcdef.json"):
+            (staging / name).write_bytes(b"leftover")
+    oracle, result = _compare(flow, rust_wrkviz, [], source_root=source_root)
+    assert oracle.returncode == 0
+    for label in ("py", "rs"):
+        staging = (flow / label / "archive.sources" / "orc-team" / ".staging")
+        assert list(staging.iterdir()) == []
+
+
 def test_orc_window_and_identity(tmp_path: Path, rust_wrkviz: Path) -> None:
     _pair(tmp_path, rust_wrkviz, [
         "--project", "Widget=https://github.com/example/widget.git",
