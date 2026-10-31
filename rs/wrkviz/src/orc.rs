@@ -7288,13 +7288,43 @@ pub fn resolve_prefix_rewrite(
 /// One backed-up candidate ready to publish.
 pub struct PreparedCandidate {
     /// See the enclosing record's documentation.
-    pub source: SourceCopy,
+    pub discovered: DiscoveredSource,
     /// See the enclosing record's documentation.
-    pub temporary: Option<PathBuf>,
+    pub previous: Option<SourceCopy>,
     /// See the enclosing record's documentation.
-    pub target_relative: String,
+    pub owner_session_id: String,
     /// See the enclosing record's documentation.
-    pub canonical_identity: SemanticIdentity,
+    pub source_path: PathBuf,
+    /// See the enclosing record's documentation.
+    pub previous_path: Option<PathBuf>,
+    /// See the enclosing record's documentation.
+    pub temporary_path: PathBuf,
+    /// See the enclosing record's documentation.
+    pub state: LogicalState,
+    /// See the enclosing record's documentation.
+    pub previous_state: Option<LogicalState>,
+    /// See the enclosing record's documentation.
+    pub prefix_override: Option<AppendPrefixOverride>,
+}
+
+/// Provider-specific semantic/projection result for a
+/// prepared source.
+#[derive(Clone, Debug)]
+pub struct SourceAdvance {
+    /// See the enclosing record's documentation.
+    pub auxiliary: AuxiliaryStatus,
+    /// See the enclosing record's documentation.
+    pub task_projection: Option<TaskProjection>,
+    /// See the enclosing record's documentation.
+    pub task_source_ordinal: Option<i64>,
+    /// See the enclosing record's documentation.
+    pub previous_identity: Option<SemanticIdentity>,
+    /// See the enclosing record's documentation.
+    pub current_identity: SemanticIdentity,
+    /// See the enclosing record's documentation.
+    pub staged_objects: Vec<(PathBuf, PathBuf, String)>,
+    /// See the enclosing record's documentation.
+    pub temporary_paths: Vec<PathBuf>,
 }
 
 /// Create a SQLite snapshot of one source.
@@ -7705,4 +7735,601 @@ pub fn prune_orc_staging(snapshot_root: &Path) -> Result<i64, String> {
         fsync_directory(&staging)?;
     }
     Ok(removed)
+}
+
+// ---------------------------------------------------------------- candidate advance
+
+/// Back up one discovered source and validate its prior
+/// state against the manifest.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_snapshot_candidate(
+    source_root: &Path,
+    snapshot_root: &Path,
+    discovered: &DiscoveredSource,
+    previous: Option<&SourceCopy>,
+    selected_session_ids: &[String],
+    temporary: &Path,
+    captured_at: &str,
+    accept_prefix_rewrite: &[String],
+) -> Result<PreparedCandidate, String> {
+    let relative = &discovered.source_path;
+    let (owner_session_id, previous_path, source_path) = match previous {
+        None => (
+            discovered.owner_candidates[0].clone(),
+            None,
+            live_source_path(source_root, relative)?,
+        ),
+        Some(previous) => {
+            if previous.kind != discovered.kind {
+                return Err(format!(
+                    "Orc source kind changed for {relative}: {} to {}",
+                    py_repr_str(&previous.kind),
+                    py_repr_str(&discovered.kind)
+                ));
+            }
+            if !discovered
+                .owner_candidates
+                .contains(&previous.owner_session_id)
+                && !selected_session_ids.contains(&previous.owner_session_id)
+            {
+                return Err(format!(
+                    "Orc source ownership changed for {relative}: prior owner {} no longer references the source",
+                    py_repr_str(&previous.owner_session_id)
+                ));
+            }
+            let previous_path = snapshot_path(snapshot_root, &previous.snapshot_path)?;
+            let is_symlink = std::fs::symlink_metadata(&previous_path)
+                .map(|meta| meta.file_type().is_symlink())
+                .unwrap_or(false);
+            if is_symlink
+                || !previous_path.is_file()
+                || sha256_file(&previous_path)? != previous.sha256
+            {
+                return Err(format!(
+                    "previous Orc snapshot does not match its manifest: {}",
+                    previous_path.display()
+                ));
+            }
+            let source_path = if discovered.source_state == SOURCE_STATE_DETACHED {
+                previous_path.clone()
+            } else {
+                live_source_path(source_root, relative)?
+            };
+            (
+                previous.owner_session_id.clone(),
+                Some(previous_path),
+                source_path,
+            )
+        }
+    };
+    backup_database(&source_path, temporary, snapshot_root)?;
+    let state = logical_state(temporary, &discovered.kind, None, false, None)?;
+    let mut previous_state: Option<LogicalState> = None;
+    let mut previous_session_mode: Option<String> = None;
+    let mut prefix_override: Option<AppendPrefixOverride> = None;
+    if let Some(previous) = previous {
+        let previous_path = previous_path
+            .clone()
+            .ok_or_else(|| "validated previous snapshot path is missing".to_string())?;
+        if discovered.kind == "session" && !previous.append_max_id.has_session_tag() {
+            let mut candidates: Vec<(&str, LogicalState)> = vec![(
+                "content-only",
+                logical_state(
+                    &previous_path,
+                    &discovered.kind,
+                    None,
+                    false,
+                    Some("content-only"),
+                )?,
+            )];
+            let connection = read_only(&previous_path)?;
+            let names = table_names(&connection, &previous_path.display().to_string())?;
+            drop(connection);
+            if names.iter().any(|held| held == "messages") {
+                candidates.push((
+                    "messages-only",
+                    logical_state(
+                        &previous_path,
+                        &discovered.kind,
+                        None,
+                        false,
+                        Some("messages-only"),
+                    )?,
+                ));
+            }
+            let matches: Vec<(&str, LogicalState)> = candidates
+                .into_iter()
+                .filter(|(_, candidate)| {
+                    candidate.append_count == previous.append_count
+                        && candidate.append_max_id == previous.append_max_id
+                        && candidate.append_prefix_sha256 == previous.append_prefix_sha256
+                })
+                .collect();
+            let Some((mode, matched)) = matches.into_iter().last() else {
+                return Err(format!(
+                    "legacy Orc session prefix does not match its manifest: {relative}"
+                ));
+            };
+            previous_session_mode = Some(mode.to_string());
+            previous_state = Some(matched);
+        } else if discovered.kind == "task" && previous.task_projection.is_none() {
+            let legacy_state = logical_state(&previous_path, &discovered.kind, None, true, None)?;
+            if legacy_state.append_count != previous.append_count
+                || legacy_state.append_max_id != previous.append_max_id
+                || legacy_state.append_prefix_sha256 != previous.append_prefix_sha256
+            {
+                return Err(format!(
+                    "legacy Orc task prefix does not match its manifest: {relative}"
+                ));
+            }
+            previous_state = Some(logical_state(
+                &previous_path,
+                &discovered.kind,
+                None,
+                false,
+                None,
+            )?);
+        } else {
+            let held = logical_state(&previous_path, &discovered.kind, None, false, None)?;
+            validate_manifest_logical_state(previous, &held, relative)?;
+            previous_state = Some(held);
+        }
+        if discovered.kind == "session" {
+            let held_previous = previous_state
+                .clone()
+                .ok_or_else(|| "validated previous snapshot path is missing".to_string())?;
+            let prefix = logical_state(
+                temporary,
+                &discovered.kind,
+                Some(previous.append_max_id),
+                false,
+                previous_session_mode.as_deref(),
+            )?;
+            if state.append_count < previous.append_count {
+                return Err(format!(
+                    "Orc {} append history shrank for {relative}: {} to {} rows",
+                    discovered.kind, previous.append_count, state.append_count
+                ));
+            }
+            if prefix.append_count != previous.append_count {
+                return Err(format!(
+                    "Orc {} append prefix lost rows for {relative}",
+                    discovered.kind
+                ));
+            }
+            // Only the *digest* comparison is overridable. The two guards above stay absolute
+            // because both of them mean rows are gone or unaccounted for, and no operator flag in
+            // this tool is allowed to wave through record loss -- the override exists for the
+            // narrow case of an upstream metadata backfill rewriting a column in place.
+            if prefix.append_prefix_sha256 != held_previous.append_prefix_sha256 {
+                prefix_override = Some(resolve_prefix_rewrite(
+                    relative,
+                    &discovered.kind,
+                    // The owner session id, not the directory name parsed out of the path: for a
+                    // session source with a previous record these are the same string (discovery
+                    // refuses a session directory whose database says otherwise), and taking it
+                    // from the manifest keeps the authorization keyed to the identity the archive
+                    // already committed to rather than to a path the operator could rename.
+                    &owner_session_id,
+                    previous,
+                    &held_previous,
+                    &prefix,
+                    &append_prefix_diff(
+                        &previous_path,
+                        temporary,
+                        &prefix_scopes_for(
+                            temporary,
+                            previous_session_mode.as_deref(),
+                            previous.append_max_id,
+                        )?,
+                    )?,
+                    accept_prefix_rewrite,
+                    captured_at,
+                )?);
+            }
+        }
+    }
+    let previous_path_final = match previous {
+        None => None,
+        Some(_) => previous_path,
+    };
+    Ok(PreparedCandidate {
+        discovered: discovered.clone(),
+        previous: previous.cloned(),
+        owner_session_id,
+        source_path,
+        previous_path: previous_path_final,
+        temporary_path: temporary.to_path_buf(),
+        state,
+        previous_state,
+        prefix_override,
+    })
+}
+
+/// Advance one prepared session source: validate its
+/// predecessor and derive its auxiliary status and
+/// semantic identity.
+pub fn advance_session_candidate(
+    candidate: &PreparedCandidate,
+    snapshot_root: &Path,
+    captured_at: &str,
+) -> Result<SourceAdvance, String> {
+    let relative = &candidate.discovered.source_path;
+    let current_meta = session_meta(&candidate.temporary_path, relative)?;
+    if current_meta.session_id != candidate.owner_session_id {
+        return Err(format!(
+            "Orc session identity changed for {relative}: {} to {}",
+            py_repr_str(&candidate.owner_session_id),
+            py_repr_str(&current_meta.session_id)
+        ));
+    }
+    let current_auxiliary = auxiliary_observation(&candidate.temporary_path, &current_meta)?;
+    let mut rewrite_count: i64 = 0;
+    let mut last_rewrite_at: Option<String> = None;
+    let mut degraded = false;
+    let mut previous_identity: Option<SemanticIdentity> = None;
+    if let Some(previous) = &candidate.previous {
+        let (Some(previous_path), Some(previous_state)) =
+            (&candidate.previous_path, &candidate.previous_state)
+        else {
+            return Err("validated previous session state is missing".to_string());
+        };
+        let previous_meta = session_meta(previous_path, relative)?;
+        validate_session_meta_extension(&previous_meta, &current_meta, relative)?;
+        let previous_auxiliary = auxiliary_observation(previous_path, &previous_meta)?;
+        if previous.auxiliary.policy == AUXILIARY_POLICY_LEGACY {
+            if previous.auxiliary.message_count != previous_auxiliary.messages.len() as i64
+                || previous.auxiliary.message_sha256 != previous_auxiliary.message_sha256
+            {
+                return Err(format!(
+                    "previous Orc auxiliary message evidence does not match its snapshot for {relative}"
+                ));
+            }
+            previous_identity = Some(session_semantic_identity(
+                relative,
+                &candidate.owner_session_id,
+                &session_canonical_state(previous_path, &previous_meta)?,
+                &previous_meta,
+                &previous_auxiliary,
+                4,
+            )?);
+            validate_legacy_semantic_identity(
+                snapshot_root,
+                previous,
+                previous_identity.as_ref().unwrap(),
+                None,
+            )?;
+        } else {
+            if previous.append_max_id.has_session_tag() {
+                previous_identity =
+                    Some(validate_source_semantic_identity(snapshot_root, previous)?);
+            } else {
+                let previous_legacy_identity = session_semantic_identity(
+                    relative,
+                    &candidate.owner_session_id,
+                    previous_state,
+                    &previous_meta,
+                    &previous_auxiliary,
+                    2,
+                )?;
+                let held_identity = session_semantic_identity(
+                    relative,
+                    &candidate.owner_session_id,
+                    &session_canonical_state(previous_path, &previous_meta)?,
+                    &previous_meta,
+                    &previous_auxiliary,
+                    4,
+                )?;
+                if previous.semantic_identity_mode == SEMANTIC_IDENTITY_DETERMINISTIC
+                    && (previous.semantic_sha256 != held_identity.sha256
+                        || previous.semantic_complete_bytes != held_identity.complete_bytes)
+                {
+                    validate_recorded_semantic_identity(
+                        previous,
+                        &previous_legacy_identity,
+                        relative,
+                    )?;
+                }
+                previous_identity = Some(held_identity);
+                validate_legacy_semantic_identity(
+                    snapshot_root,
+                    previous,
+                    previous_identity.as_ref().unwrap(),
+                    None,
+                )?;
+            }
+        }
+        if !previous_state.append_max_id.has_session_tag()
+            && candidate.state.append_max_id.has_session_tag()
+        {
+            validate_stable_spawn_storage_migration(
+                &previous_auxiliary,
+                &current_auxiliary,
+                relative,
+            )?;
+        } else {
+            validate_stable_spawn_extension(&previous_auxiliary, &current_auxiliary, relative)?;
+        }
+        let rewrite_detected =
+            !conversation_is_append_extension(&previous_auxiliary, &current_auxiliary)?;
+        rewrite_count = previous.auxiliary.rewrite_count + i64::from(rewrite_detected);
+        last_rewrite_at = if rewrite_detected {
+            Some(captured_at.to_string())
+        } else {
+            previous.auxiliary.last_rewrite_at.clone()
+        };
+        degraded = previous.auxiliary.degraded || rewrite_detected;
+    }
+    let auxiliary = AuxiliaryStatus {
+        policy: AUXILIARY_POLICY_STABLE_SPAWNS.to_string(),
+        message_count: current_auxiliary.messages.len() as i64,
+        message_sha256: current_auxiliary.message_sha256.clone(),
+        stable_spawn_count: current_auxiliary.stable_spawns.len() as i64,
+        stable_spawn_sha256: current_auxiliary.stable_spawn_sha256.clone(),
+        rewrite_count,
+        last_rewrite_at,
+        degraded,
+        degradation_reason: if degraded {
+            Some(AUXILIARY_DEGRADATION_REASON.to_string())
+        } else {
+            None
+        },
+    };
+    let current_identity = session_semantic_identity(
+        relative,
+        &candidate.owner_session_id,
+        &session_canonical_state(&candidate.temporary_path, &current_meta)?,
+        &current_meta,
+        &current_auxiliary,
+        4,
+    )?;
+    Ok(SourceAdvance {
+        auxiliary,
+        task_projection: None,
+        task_source_ordinal: None,
+        previous_identity,
+        current_identity,
+        staged_objects: Vec::new(),
+        temporary_paths: Vec::new(),
+    })
+}
+
+/// Advance one prepared task source: freeze its note
+/// history and derive its projection and semantic
+/// identity.
+pub fn advance_task_candidate(
+    candidate: &PreparedCandidate,
+    snapshot_root: &Path,
+    captured_at: &str,
+    task_source_ordinal: i64,
+) -> Result<SourceAdvance, String> {
+    let relative = &candidate.discovered.source_path;
+    let auxiliary = AuxiliaryStatus {
+        policy: AUXILIARY_POLICY_NOT_APPLICABLE.to_string(),
+        message_count: 0,
+        message_sha256: empty_sha256(),
+        stable_spawn_count: 0,
+        stable_spawn_sha256: empty_sha256(),
+        rewrite_count: 0,
+        last_rewrite_at: None,
+        degraded: false,
+        degradation_reason: None,
+    };
+    let current_records = observed_task_notes(&candidate.temporary_path)?;
+    let current_sequence = task_note_sequence(&candidate.temporary_path)?;
+    if current_records.len() as i64 != candidate.state.append_count {
+        return Err(format!(
+            "task note count does not match its source for {relative}"
+        ));
+    }
+    let current_max = current_records
+        .iter()
+        .map(|record| record.note_id)
+        .max()
+        .unwrap_or(0);
+    if current_sequence < current_max {
+        return Err(format!(
+            "task note allocation sequence is invalid for {relative}"
+        ));
+    }
+    let mut previous_identity: Option<SemanticIdentity> = None;
+    let (
+        previous_records,
+        prior_allocation_highwater,
+        prior_rewrite_sha256,
+        prior_rewrite_count,
+        prior_last_rewrite_at,
+        prior_degraded,
+    ) = match &candidate.previous {
+        None => (
+            Vec::new(),
+            0i64,
+            empty_task_rewrite_sha256(),
+            0i64,
+            None,
+            false,
+        ),
+        Some(previous) => {
+            let (Some(previous_path), Some(previous_state)) =
+                (&candidate.previous_path, &candidate.previous_state)
+            else {
+                return Err("validated previous task state is missing".to_string());
+            };
+            let frozen = bootstrap_frozen_task_projection(snapshot_root, previous, previous_path)?;
+            let previous_sequence = match &previous.task_projection {
+                Some(projection) => match projection.observed_note_sequence {
+                    Some(sequence) => sequence,
+                    None => task_note_sequence(previous_path)?,
+                },
+                None => task_note_sequence(previous_path)?,
+            };
+            let frozen_max = frozen
+                .iter()
+                .map(|record| record.note_id)
+                .max()
+                .unwrap_or(0);
+            if current_sequence < previous_sequence.max(frozen_max) {
+                return Err(format!(
+                        "task note allocation sequence regressed for {relative}: {previous_sequence} to {current_sequence}"
+                    ));
+            }
+            let (rewrite_sha256, rewrite_count, last_rewrite_at, degraded) =
+                match &previous.task_projection {
+                    None => {
+                        let projection_sha256 = task_enrichment_sha256(&frozen);
+                        let identity = task_semantic_identity(
+                            relative,
+                            &candidate.owner_session_id,
+                            task_source_ordinal,
+                            previous_state,
+                            &projection_sha256,
+                            2,
+                        )?;
+                        validate_legacy_semantic_identity(
+                            snapshot_root,
+                            previous,
+                            &identity,
+                            Some(&projection_sha256),
+                        )?;
+                        previous_identity = Some(identity);
+                        (empty_task_rewrite_sha256(), 0, None, false)
+                    }
+                    Some(projection) => {
+                        previous_identity =
+                            Some(validate_source_semantic_identity(snapshot_root, previous)?);
+                        let rewrite_sha256 = if projection.policy == TASK_HISTORY_POLICY {
+                            projection.observed_note_rewrite_sha256.clone()
+                        } else {
+                            let prior_current = observed_task_notes(previous_path)?;
+                            task_rewrite_observation(&frozen, &prior_current).0
+                        };
+                        (
+                            rewrite_sha256,
+                            projection.rewrite_count,
+                            projection.last_rewrite_at.clone(),
+                            projection.degraded,
+                        )
+                    }
+                };
+            (
+                frozen,
+                previous_sequence,
+                rewrite_sha256,
+                rewrite_count,
+                last_rewrite_at,
+                degraded,
+            )
+        }
+    };
+    let previous_max = previous_records
+        .iter()
+        .map(|record| record.note_id)
+        .max()
+        .unwrap_or(0);
+    let highwater = previous_max.max(prior_allocation_highwater);
+    let mut merged: Vec<FrozenTaskNote> = previous_records.clone();
+    for observed in &current_records {
+        if let Some(prior) = previous_records
+            .iter()
+            .find(|held| held.note_id == observed.note_id)
+        {
+            if (
+                observed.task_id.as_str(),
+                observed.content.as_str(),
+                observed.created_at.as_str(),
+            ) != (
+                prior.task_id.as_str(),
+                prior.content.as_str(),
+                prior.created_at.as_str(),
+            ) {
+                return Err(format!(
+                    "task note immutable core was rewritten for note {} in {relative}",
+                    observed.note_id
+                ));
+            }
+            continue;
+        }
+        if observed.note_id <= highwater {
+            return Err(format!(
+                "task note ID {} was reused below frozen highwater {highwater} in {relative}",
+                observed.note_id
+            ));
+        }
+        merged.push(freeze_current_task_note(observed, relative)?);
+    }
+    merged.sort_by_key(|record| record.note_id);
+    let enrichment_sha256 = task_enrichment_sha256(&merged);
+    let (rewrite_sha256, missing_count, missing_ids_sha256) =
+        task_rewrite_observation(&merged, &current_records);
+    let (gap_count, gap_sha256) = task_unobserved_id_gaps(&merged, current_sequence);
+    let rewrite_detected = candidate.previous.is_some() && rewrite_sha256 != prior_rewrite_sha256;
+    let projection_rewrite_count = prior_rewrite_count + i64::from(rewrite_detected);
+    let projection_last_rewrite_at = if rewrite_detected {
+        Some(captured_at.to_string())
+    } else {
+        prior_last_rewrite_at
+    };
+    let projection_degraded = prior_degraded || rewrite_sha256 != empty_task_rewrite_sha256();
+    let (projection_temporary, projection_target, projection_sha256, projection_relative) =
+        stage_task_projection(&merged, snapshot_root)?;
+    let task_projection = TaskProjection {
+        policy: TASK_HISTORY_POLICY.to_string(),
+        path: projection_relative,
+        note_count: merged.len() as i64,
+        sha256: projection_sha256.clone(),
+        observed_enrichment_sha256: enrichment_sha256.clone(),
+        observed_note_rewrite_sha256: rewrite_sha256,
+        missing_note_count: missing_count,
+        missing_note_ids_sha256: missing_ids_sha256,
+        observed_note_sequence: Some(current_sequence),
+        unobserved_note_id_gap_count: Some(gap_count),
+        unobserved_note_id_gap_sha256: Some(gap_sha256),
+        rewrite_count: projection_rewrite_count,
+        last_rewrite_at: projection_last_rewrite_at,
+        degraded: projection_degraded,
+        degradation_reason: if projection_degraded {
+            Some(TASK_HISTORY_DEGRADATION_REASON.to_string())
+        } else {
+            None
+        },
+    };
+    let current_identity = task_semantic_identity(
+        relative,
+        &candidate.owner_session_id,
+        task_source_ordinal,
+        &frozen_task_logical_state(&merged),
+        &enrichment_sha256,
+        2,
+    )?;
+    Ok(SourceAdvance {
+        auxiliary,
+        task_projection: Some(task_projection),
+        task_source_ordinal: Some(task_source_ordinal),
+        previous_identity,
+        current_identity,
+        staged_objects: vec![(
+            projection_temporary.clone(),
+            projection_target,
+            projection_sha256,
+        )],
+        temporary_paths: vec![projection_temporary],
+    })
+}
+
+/// Publish every staged object, returning how many were
+/// newly created.
+pub fn publish_staged_objects(
+    staged_objects: &[(PathBuf, PathBuf, String)],
+    snapshot_root: &Path,
+) -> Result<i64, String> {
+    let mut changed: i64 = 0;
+    for (temporary, target, sha256) in staged_objects {
+        changed += i64::from(publish_snapshot_candidate(
+            temporary,
+            target,
+            sha256,
+            snapshot_root,
+        )?);
+    }
+    Ok(changed)
 }
