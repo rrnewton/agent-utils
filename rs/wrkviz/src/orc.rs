@@ -1094,7 +1094,7 @@ impl ContinuationSpec {
 
     /// See the enclosing record's documentation.
     pub fn from_value(raw: &Value, where_: &str) -> Result<ContinuationSpec, String> {
-        if let Some(text) = raw.as_str() {
+        if raw.as_str().is_some() {
             return Ok(ContinuationSpec {
                 session_id: safe_component(&required_string(Some(raw), where_)?, where_)?,
                 start_message_id: None,
@@ -1753,4 +1753,677 @@ impl SourceCopy {
             provider_schema_version,
         })
     }
+}
+
+// ---------------------------------------------------------------- SQLite layer
+
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+use crate::compressed::{is_compressed, read_source_bytes, resolve_source};
+use rusqlite::Connection;
+use serde_json::Value as JsonValue;
+
+/// One SQLite value, in SQLite's own type classes.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SqlValue {
+    /// NULL.
+    Null,
+    /// INTEGER.
+    Int(i64),
+    /// REAL.
+    Real(f64),
+    /// TEXT.
+    Text(String),
+    /// BLOB.
+    Blob(Vec<u8>),
+}
+
+impl SqlValue {
+    fn from_rusqlite(value: rusqlite::types::Value) -> SqlValue {
+        use rusqlite::types::Value as Held;
+        match value {
+            Held::Null => SqlValue::Null,
+            Held::Integer(held) => SqlValue::Int(held),
+            Held::Real(held) => SqlValue::Real(held),
+            Held::Text(held) => SqlValue::Text(held),
+            Held::Blob(held) => SqlValue::Blob(held),
+        }
+    }
+}
+
+/// CPython `float.hex()`.
+pub fn py_float_hex(value: f64) -> String {
+    if value.is_nan() {
+        return "nan".to_string();
+    }
+    if value.is_infinite() {
+        return if value < 0.0 { "-inf" } else { "inf" }.to_string();
+    }
+    let bits = value.to_bits();
+    let sign = if bits >> 63 == 1 { "-" } else { "" };
+    let exponent = ((bits >> 52) & 0x7ff) as i64;
+    let fraction = bits & ((1u64 << 52) - 1);
+    if exponent == 0 && fraction == 0 {
+        return format!("{sign}0x0.0p+0");
+    }
+    if exponent == 0 {
+        return format!("{sign}0x0.{fraction:013x}p-1022");
+    }
+    format!("{sign}0x1.{fraction:013x}p{:+}", exponent - 1023)
+}
+
+/// Feed one value to a prefix digest, tagged the way the
+/// oracle's digest tags it.
+pub fn update_digest(digest: &mut sha2::Sha256, value: &SqlValue) {
+    match value {
+        SqlValue::Null => digest.update(b"N"),
+        SqlValue::Int(held) => {
+            let payload = held.to_string();
+            digest.update(b"I");
+            digest.update((payload.len() as u64).to_be_bytes());
+            digest.update(payload.as_bytes());
+        }
+        SqlValue::Real(held) => {
+            let payload = py_float_hex(*held);
+            digest.update(b"F");
+            digest.update((payload.len() as u64).to_be_bytes());
+            digest.update(payload.as_bytes());
+        }
+        SqlValue::Text(held) => {
+            digest.update(b"S");
+            digest.update((held.len() as u64).to_be_bytes());
+            digest.update(held.as_bytes());
+        }
+        SqlValue::Blob(held) => {
+            digest.update(b"B");
+            digest.update((held.len() as u64).to_be_bytes());
+            digest.update(held);
+        }
+    }
+}
+
+/// The same tagging for a JSON value (stable-spawn and
+/// semantic digests).
+pub fn update_digest_json(digest: &mut sha2::Sha256, value: &JsonValue) {
+    match value {
+        JsonValue::Null => digest.update(b"N"),
+        JsonValue::Bool(flag) => digest.update(if *flag { b"I1" } else { b"I0" }),
+        JsonValue::Number(number) => {
+            if let Some(held) = number
+                .as_i64()
+                .or_else(|| number.as_u64().and_then(|v| i64::try_from(v).ok()))
+            {
+                update_digest(digest, &SqlValue::Int(held));
+            } else if let Some(held) = number.as_f64() {
+                update_digest(digest, &SqlValue::Real(held));
+            }
+        }
+        JsonValue::String(held) => update_digest(digest, &SqlValue::Text(held.clone())),
+        _ => {}
+    }
+}
+
+/// Run a query, digesting every row.
+pub fn query_digest(
+    connection: &Connection,
+    sql: &str,
+    parameters: &[SqlValue],
+) -> Result<(i64, String), String> {
+    let mut statement = connection
+        .prepare(sql)
+        .map_err(|error| format!("SQLite digest query: {error}"))?;
+    let params: Vec<&dyn rusqlite::ToSql> = parameters
+        .iter()
+        .map(|value| value as &dyn rusqlite::ToSql)
+        .collect();
+    let mut rows = statement
+        .query(params.as_slice())
+        .map_err(|error| format!("SQLite digest query: {error}"))?;
+    let mut digest = sha2::Sha256::new();
+    let mut count = 0i64;
+    loop {
+        match rows.next() {
+            Ok(Some(row)) => {
+                digest.update(b"R");
+                for value in row_values(row) {
+                    update_digest(&mut digest, &value);
+                }
+                count += 1;
+            }
+            Ok(None) => break,
+            Err(error) => return Err(format!("SQLite digest query: {error}")),
+        }
+    }
+    Ok((count, hex_digest(&digest)))
+}
+
+impl rusqlite::ToSql for SqlValue {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        use rusqlite::types::{ToSqlOutput, Value as Held};
+        Ok(match self {
+            SqlValue::Null => ToSqlOutput::Owned(Held::Null),
+            SqlValue::Int(held) => ToSqlOutput::from(*held),
+            SqlValue::Real(held) => ToSqlOutput::from(*held),
+            SqlValue::Text(held) => ToSqlOutput::from(held.as_str()),
+            SqlValue::Blob(held) => ToSqlOutput::from(held.as_slice()),
+        })
+    }
+}
+
+/// Hex of a finished digest.
+pub fn hex_digest(digest: &sha2::Sha256) -> String {
+    digest
+        .clone()
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Digest of a file's bytes.
+pub fn sha256_file(path: &Path) -> Result<String, String> {
+    let data = std::fs::read(path).map_err(|error| crate::json::os_error(&error, path))?;
+    Ok(sha256_hex(&data))
+}
+
+type DecompressedCache = (PathBuf, Vec<(String, i64, i64, PathBuf)>);
+
+static DECOMPRESSED: Mutex<Option<DecompressedCache>> = Mutex::new(None);
+
+fn decompressed_database(physical: &Path) -> Result<PathBuf, String> {
+    let metadata =
+        std::fs::metadata(physical).map_err(|error| crate::json::os_error(&error, physical))?;
+    use std::os::unix::fs::MetadataExt as _;
+    let key = (
+        physical.display().to_string(),
+        metadata.size() as i64,
+        metadata.mtime() * 1_000_000_000 + metadata.mtime_nsec(),
+    );
+    let mut guard = DECOMPRESSED.lock().unwrap_or_else(|held| held.into_inner());
+    if guard.is_none() {
+        let root =
+            std::env::temp_dir().join(format!("wrkviz-orc-decompressed-{}", std::process::id()));
+        *guard = Some((root, Vec::new()));
+    }
+    let (root, cache) = guard.as_mut().expect("decompressed root");
+    if let Some(cached) = cache
+        .iter()
+        .find(|(a, b, c, _)| (a.as_str(), *b, *c) == (key.0.as_str(), key.1, key.2))
+        .map(|(_, _, _, cached)| cached.clone())
+    {
+        if cached.is_file() {
+            return Ok(cached);
+        }
+    }
+    let data = read_source_bytes(physical)?;
+    std::fs::create_dir_all(root.as_path()).map_err(|error| crate::json::os_error(&error, root))?;
+    let name = physical
+        .file_name()
+        .map(|held| held.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let logical = name.strip_suffix(".zst").unwrap_or(&name).to_string();
+    let target = root.join(format!(".decompressed-{}-{logical}", cache.len()));
+    std::fs::write(&target, &data).map_err(|error| crate::json::os_error(&error, &target))?;
+    cache.push((key.0, key.1, key.2, target.clone()));
+    Ok(target)
+}
+
+/// Remove decompressed database copies (process end).
+pub fn cleanup_decompressed() {
+    let mut guard = DECOMPRESSED.lock().unwrap_or_else(|held| held.into_inner());
+    if let Some((root, _)) = guard.take() {
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+/// The byte size of a live database as SQLite sees it.
+pub fn logical_source_size(path: &Path) -> Result<i64, String> {
+    if let Some(physical) = resolve_source(path) {
+        if physical != path && is_compressed(&physical) {
+            let copy = decompressed_database(&physical)?;
+            return std::fs::metadata(&copy)
+                .map(|meta| {
+                    use std::os::unix::fs::MetadataExt as _;
+                    meta.size() as i64
+                })
+                .map_err(|error| crate::json::os_error(&error, &copy));
+        }
+    }
+    std::fs::metadata(path)
+        .map(|meta| {
+            use std::os::unix::fs::MetadataExt as _;
+            meta.size() as i64
+        })
+        .map_err(|error| crate::json::os_error(&error, path))
+}
+
+fn percent_encode_path(path: &Path) -> String {
+    let mut out = String::new();
+    for byte in path.as_os_str().as_encoded_bytes() {
+        let keep = byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'_' | b'.' | b'-' | b'~');
+        if keep {
+            out.push(*byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+/// Open an Orc SQLite source read-only.
+pub fn read_only(path: &Path) -> Result<Connection, String> {
+    let mut effective = path.to_path_buf();
+    if let Some(physical) = resolve_source(path) {
+        if physical != path && is_compressed(&physical) {
+            let is_file = physical.is_file();
+            let is_symlink = std::fs::symlink_metadata(&physical)
+                .map(|meta| meta.file_type().is_symlink())
+                .unwrap_or(false);
+            if !is_file || is_symlink {
+                return Err(format!(
+                    "Orc SQLite source is missing or not a regular file: {}",
+                    path.display()
+                ));
+            }
+            effective = decompressed_database(&physical).map_err(|error| {
+                format!(
+                    "cannot decompress Orc SQLite source {}: {error}",
+                    physical.display()
+                )
+            })?;
+        }
+    }
+    let is_symlink = std::fs::symlink_metadata(&effective)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false);
+    if is_symlink || !effective.is_file() {
+        return Err(format!(
+            "Orc SQLite source is missing or not a regular file: {}",
+            effective.display()
+        ));
+    }
+    let resolved = std::fs::canonicalize(&effective)
+        .map_err(|error| crate::json::os_error(&error, &effective))?;
+    let parent_name = resolved
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let grandparent_name = resolved
+        .parent()
+        .and_then(|parent| parent.parent())
+        .and_then(|parent| parent.file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let file_name = resolved
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let immutable = grandparent_name == SNAPSHOT_OBJECT_ROOT
+        && parent_name.len() == 2
+        && parent_name
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        && file_name.len() == 67
+        && file_name.ends_with(".db")
+        && file_name[..64]
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    let query = if immutable {
+        "?mode=ro&immutable=1"
+    } else {
+        "?mode=ro"
+    };
+    let uri = format!("file://{}{query}", percent_encode_path(&resolved));
+    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI;
+    let connection = Connection::open_with_flags(&uri, flags).map_err(|error| {
+        format!(
+            "cannot open Orc SQLite source read-only at {}: {error}",
+            effective.display()
+        )
+    })?;
+    connection
+        .execute_batch("PRAGMA query_only = ON")
+        .map_err(|error| {
+            format!(
+                "cannot open Orc SQLite source read-only at {}: {error}",
+                effective.display()
+            )
+        })?;
+    Ok(connection)
+}
+
+/// Every table name in a database.
+pub fn table_names(connection: &Connection, where_: &str) -> Result<Vec<String>, String> {
+    let mut statement = connection
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .map_err(|error| format!("{where_}: {error}"))?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| format!("{where_}: {error}"))?;
+    let mut names = Vec::new();
+    for row in rows {
+        names.push(row.map_err(|error| format!("{where_}: {error}"))?);
+    }
+    Ok(names)
+}
+
+/// Refuse unless every named table exists.
+pub fn require_tables(connection: &Connection, names: &[&str], where_: &str) -> Result<(), String> {
+    let found = table_names(connection, where_)?;
+    let mut missing: Vec<&str> = names
+        .iter()
+        .filter(|name| !found.iter().any(|held| held == *name))
+        .copied()
+        .collect();
+    missing.sort();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{where_}: missing required tables: {}",
+            missing.join(", ")
+        ))
+    }
+}
+
+/// Which table holds the session transcript.
+pub fn session_storage_table(connection: &Connection, where_: &str) -> Result<String, String> {
+    let tables = table_names(connection, where_)?;
+    if tables.iter().any(|held| held == "messages") {
+        return Ok("messages".to_string());
+    }
+    if tables.iter().any(|held| held == "conversation_state") {
+        return Ok("content_blocks".to_string());
+    }
+    Err(format!(
+        "{where_}: missing both modern messages and legacy conversation_state"
+    ))
+}
+
+/// One required row of a query.
+pub fn query_one(
+    connection: &Connection,
+    sql: &str,
+    where_: &str,
+) -> Result<Vec<SqlValue>, String> {
+    let mut statement = connection
+        .prepare(sql)
+        .map_err(|error| format!("{where_}: {error}"))?;
+    let mut rows = statement
+        .query([])
+        .map_err(|error| format!("{where_}: {error}"))?;
+    match rows.next() {
+        Ok(Some(row)) => Ok(row_values(row)),
+        Ok(None) => Err(format!("{where_}: expected one row")),
+        Err(error) => Err(format!("{where_}: {error}")),
+    }
+}
+
+/// All values of one result row.
+pub fn row_values(row: &rusqlite::Row<'_>) -> Vec<SqlValue> {
+    let mut values = Vec::new();
+    let mut index = 0;
+    while let Ok(value_ref) = row.get_ref(index) {
+        values.push(SqlValue::from_rusqlite(rusqlite::types::Value::from(
+            value_ref,
+        )));
+        index += 1;
+    }
+    values
+}
+
+/// Run a query to completion, collecting rows.
+pub fn query_all(
+    connection: &Connection,
+    sql: &str,
+    parameters: &[SqlValue],
+    where_: &str,
+) -> Result<Vec<Vec<SqlValue>>, String> {
+    let mut statement = connection
+        .prepare(sql)
+        .map_err(|error| format!("{where_}: {error}"))?;
+    let params: Vec<&dyn rusqlite::ToSql> = parameters
+        .iter()
+        .map(|value| value as &dyn rusqlite::ToSql)
+        .collect();
+    let mut rows = statement
+        .query(params.as_slice())
+        .map_err(|error| format!("{where_}: {error}"))?;
+    let mut out = Vec::new();
+    loop {
+        match rows.next() {
+            Ok(Some(row)) => out.push(row_values(row)),
+            Ok(None) => break,
+            Err(error) => return Err(format!("{where_}: {error}")),
+        }
+    }
+    Ok(out)
+}
+
+/// An SQLite integer cell, with the oracle's wording.
+pub fn cell_integer(value: &SqlValue, where_: &str) -> Result<i64, String> {
+    match value {
+        SqlValue::Int(held) => Ok(*held),
+        _ => Err(format!("{where_}: expected an integer")),
+    }
+}
+
+/// An SQLite non-negative integer cell.
+pub fn cell_nonnegative(value: &SqlValue, where_: &str) -> Result<i64, String> {
+    let held = cell_integer(value, where_)
+        .map_err(|_| format!("{where_}: expected a non-negative integer"))?;
+    if held < 0 {
+        return Err(format!("{where_}: expected a non-negative integer"));
+    }
+    Ok(held)
+}
+
+/// An SQLite required-string cell.
+pub fn cell_string(value: &SqlValue, where_: &str) -> Result<String, String> {
+    match value {
+        SqlValue::Text(held) if !held.is_empty() => Ok(held.clone()),
+        _ => Err(format!("{where_}: expected a non-empty string")),
+    }
+}
+
+/// An SQLite optional-string cell (null and empty read as
+/// absent).
+pub fn cell_optional_string(value: &SqlValue, where_: &str) -> Result<Option<String>, String> {
+    match value {
+        SqlValue::Null => Ok(None),
+        SqlValue::Text(held) if held.is_empty() => Ok(None),
+        SqlValue::Text(held) => Ok(Some(held.clone())),
+        _ => Err(format!("{where_}: expected a string or null")),
+    }
+}
+
+/// An SQLite string-valued cell (any text, including empty).
+pub fn cell_text(value: &SqlValue, where_: &str) -> Result<String, String> {
+    match value {
+        SqlValue::Text(held) => Ok(held.clone()),
+        _ => Err(format!("{where_}: expected a string")),
+    }
+}
+
+/// An ISO timestamp cell in epoch milliseconds (naive
+/// reads as UTC).
+pub fn iso_ms(value: &SqlValue, where_: &str) -> Result<i64, String> {
+    let text = cell_string(value, where_)?;
+    let normalized = text
+        .strip_suffix('Z')
+        .map(|head| format!("{head}+00:00"))
+        .unwrap_or_else(|| text.clone());
+    use agent_harness::claude_records::{timestamp_ms, TimestampError};
+    let candidate = JsonValue::String(normalized.clone());
+    match timestamp_ms(&candidate) {
+        Ok(Some(ms)) => Ok(ms),
+        Ok(None) => Err(format!(
+            "{where_}: invalid ISO timestamp {}",
+            py_repr_str(&text)
+        )),
+        Err(TimestampError::NoTimezone) => {
+            let with_zone = if normalized.len() == 10 {
+                format!("{normalized}T00:00:00+00:00")
+            } else {
+                format!("{normalized}+00:00")
+            };
+            match timestamp_ms(&JsonValue::String(with_zone)) {
+                Ok(Some(ms)) => Ok(ms),
+                _ => Err(format!(
+                    "{where_}: invalid ISO timestamp {}",
+                    py_repr_str(&text)
+                )),
+            }
+        }
+        Err(TimestampError::Invalid(_)) => Err(format!(
+            "{where_}: invalid ISO timestamp {}",
+            py_repr_str(&text)
+        )),
+    }
+}
+
+/// A snapshot path joined without following symlinks.
+pub fn snapshot_path(snapshot_root: &Path, relative: &str) -> Result<PathBuf, String> {
+    let parts = safe_relative_parts(relative)?;
+    let mut current = snapshot_root.to_path_buf();
+    for (index, part) in parts.iter().enumerate() {
+        if let Ok(metadata) = std::fs::symlink_metadata(&current) {
+            let mode = metadata.file_type();
+            if mode.is_symlink() || (index > 0 && !mode.is_dir()) || (index == 0 && !mode.is_dir())
+            {
+                return Err(format!(
+                    "snapshot path component is a symlink or non-directory: {}",
+                    current.display()
+                ));
+            }
+        }
+        current.push(part);
+    }
+    Ok(current)
+}
+
+/// A live source path resolved without following symlinks.
+pub fn live_source_path(source_root: &Path, relative: &str) -> Result<PathBuf, String> {
+    let parts = safe_relative_parts(relative)?;
+    let mut current = source_root.to_path_buf();
+    let last = parts.len() - 1;
+    for (index, part) in parts.iter().enumerate() {
+        current.push(part);
+        let Ok(metadata) = std::fs::symlink_metadata(&current) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "symlink in Orc live source path: {}",
+                current.display()
+            ));
+        }
+        if index < last && !metadata.is_dir() {
+            return Err(format!(
+                "non-directory in Orc live source path: {}",
+                current.display()
+            ));
+        }
+    }
+    Ok(current)
+}
+
+/// fsync one regular file without following symlinks.
+pub fn fsync_regular_file(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|error| {
+            format!(
+                "cannot open snapshot object for fsync {}: {error}",
+                path.display()
+            )
+        })?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| crate::json::os_error(&error, path))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "snapshot fsync target is not a regular file: {}",
+            path.display()
+        ));
+    }
+    file.sync_all()
+        .map_err(|error| crate::json::os_error(&error, path))
+}
+
+/// fsync one directory.
+pub fn fsync_directory(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|error| {
+            format!(
+                "cannot open snapshot directory for fsync {}: {error}",
+                path.display()
+            )
+        })?;
+    file.sync_all()
+        .map_err(|error| crate::json::os_error(&error, path))
+}
+
+/// Create a snapshot parent chain, refusing symlinks.
+pub fn ensure_snapshot_parent(path: &Path, snapshot_root: &Path) -> Result<(), String> {
+    let root_existed = snapshot_root.exists();
+    std::fs::create_dir_all(snapshot_root)
+        .map_err(|error| crate::json::os_error(&error, snapshot_root))?;
+    let root_symlink = std::fs::symlink_metadata(snapshot_root)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false);
+    if root_symlink || !snapshot_root.is_dir() {
+        return Err(format!(
+            "snapshot root is a symlink or non-directory: {}",
+            snapshot_root.display()
+        ));
+    }
+    if !root_existed {
+        if let Some(parent) = snapshot_root.parent() {
+            fsync_directory(parent)?;
+        }
+    }
+    let parent = path.parent().unwrap_or(snapshot_root);
+    let relative = parent.strip_prefix(snapshot_root).map_err(|_| {
+        format!(
+            "snapshot path is outside the snapshot root: {}",
+            path.display()
+        )
+    })?;
+    let mut current = snapshot_root.to_path_buf();
+    for part in relative.components() {
+        current.push(part.as_os_str());
+        if current.exists() {
+            let symlink = std::fs::symlink_metadata(&current)
+                .map(|meta| meta.file_type().is_symlink())
+                .unwrap_or(false);
+            if symlink || !current.is_dir() {
+                return Err(format!(
+                    "snapshot path component is a symlink or non-directory: {}",
+                    current.display()
+                ));
+            }
+        } else {
+            std::fs::create_dir(&current)
+                .map_err(|error| crate::json::os_error(&error, &current))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let _ = std::fs::set_permissions(&current, std::fs::Permissions::from_mode(0o700));
+            }
+            if let Some(parent) = current.parent() {
+                fsync_directory(parent)?;
+            }
+        }
+    }
+    Ok(())
 }

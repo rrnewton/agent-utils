@@ -84,6 +84,8 @@ pub struct IngestReport {
     pub history_covered_sessions: i64,
     /// Sources kept from the archive.
     pub upstream_retired_sources: Vec<String>,
+    /// Append-prefix overrides accepted this run (Orc).
+    pub orc_prefix_overrides: Vec<crate::orc::AppendPrefixOverride>,
 }
 
 impl IngestReport {
@@ -104,7 +106,15 @@ impl IngestReport {
         out.insert("files_changed".into(), self.files_changed.into());
         out.insert("artifacts".into(), self.artifacts.into());
         out.insert("projects".into(), self.projects.into());
-        out.insert("orc_prefix_overrides".into(), Value::Array(Vec::new()));
+        out.insert(
+            "orc_prefix_overrides".into(),
+            Value::Array(
+                self.orc_prefix_overrides
+                    .iter()
+                    .map(crate::orc::AppendPrefixOverride::to_json)
+                    .collect(),
+            ),
+        );
         out.insert(
             "retired_message_projections".into(),
             self.retired_message_projections.into(),
