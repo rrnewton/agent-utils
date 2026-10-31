@@ -376,6 +376,7 @@ pub fn run(args: &[String]) -> u8 {
         "gc" => run_gc(&args[1..]),
         "migrate-build-state" => run_migrate_build_state(&args[1..]),
         "migrate-snapshots" => run_migrate_snapshots(&args[1..]),
+        "github-metadata" => run_github_metadata(&args[1..]),
         other => {
             eprintln!(
                 "wrkviz: the Rust edition has not ported '{other}' yet; the Python edition remains the oracle for it"
@@ -4735,6 +4736,24 @@ options:
                     command only reports
 "##;
 
+const GITHUB_METADATA_HELP: &str = r##"usage: wrkviz github-metadata [-h] --output OUTPUT --team TEAM
+                              [--phase-minutes PHASE_MINUTES]
+                              [--github-timeout GITHUB_TIMEOUT]
+
+conditionally cache GitHub pull titles, then rebuild the site
+
+options:
+  -h, --help            show this help message and exit
+  --output OUTPUT       version-controllable archive directory
+  --team TEAM           stable team slug, for example example-team
+  --phase-minutes PHASE_MINUTES
+  --github-timeout GITHUB_TIMEOUT
+                        per-request GitHub API timeout in seconds (default:
+                        15.0)
+"##;
+
+const GITHUB_METADATA_USAGE: &str = "usage: wrkviz github-metadata [-h] --output OUTPUT --team TEAM\n                              [--phase-minutes PHASE_MINUTES]\n                              [--github-timeout GITHUB_TIMEOUT]";
+
 const MIGRATE_SNAPSHOTS_USAGE: &str = "usage: wrkviz migrate-snapshots [-h] --output OUTPUT [--snapshot-root DIR]\n                                [--move] [--copy] [--format {text,json}]";
 
 const MIGRATE_BUILD_STATE_USAGE: &str = "usage: wrkviz migrate-build-state [-h] --output OUTPUT [--build-root DIR]\n                                  [--move]";
@@ -4840,6 +4859,250 @@ fn run_migrate_build_state(args: &[String]) -> u8 {
             0
         }
         Err(error) => {
+            eprintln!("wrkviz: {error}");
+            2
+        }
+    }
+}
+
+fn run_github_metadata(args: &[String]) -> u8 {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print!("{GITHUB_METADATA_HELP}");
+        return 0;
+    }
+    const VALUE_OPTIONS: &[&str] = &["--output", "--team", "--phase-minutes", "--github-timeout"];
+    let mut values: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        let (head, explicit) = match arg.split_once('=') {
+            Some((head, value)) => (head, Some(value.to_string())),
+            None => (arg.as_str(), None),
+        };
+        let candidates: Vec<&str> = VALUE_OPTIONS
+            .iter()
+            .copied()
+            .filter(|name| {
+                head == *name
+                    || (head.len() > 2 && head.starts_with("--") && name.starts_with(head))
+            })
+            .collect();
+        if candidates.len() > 1 && !candidates.contains(&head) {
+            return argparse_error(
+                GITHUB_METADATA_USAGE,
+                "wrkviz github-metadata",
+                &format!(
+                    "ambiguous option: {head} could match {}",
+                    candidates.join(", ")
+                ),
+            );
+        }
+        let Some(name) = candidates.first() else {
+            return argparse_error(
+                GITHUB_METADATA_USAGE,
+                "wrkviz github-metadata",
+                &format!("unrecognized arguments: {arg}"),
+            );
+        };
+        let name = *name;
+        let value = match explicit {
+            Some(value) => value,
+            None => {
+                index += 1;
+                match args.get(index) {
+                    Some(value) => value.clone(),
+                    None => {
+                        return argparse_error(
+                            GITHUB_METADATA_USAGE,
+                            "wrkviz github-metadata",
+                            &format!("argument {name}: expected one argument"),
+                        )
+                    }
+                }
+            }
+        };
+        values.entry(name.to_string()).or_default().push(value);
+        index += 1;
+    }
+    let get = |name: &str| values.get(name).and_then(|items| items.last()).cloned();
+    let missing: Vec<&str> = ["--output", "--team"]
+        .into_iter()
+        .filter(|name| get(name).is_none())
+        .collect();
+    if !missing.is_empty() {
+        return argparse_error(
+            GITHUB_METADATA_USAGE,
+            "wrkviz github-metadata",
+            &format!(
+                "the following arguments are required: {}",
+                missing.join(", ")
+            ),
+        );
+    }
+    let phase_minutes: i64 = match get("--phase-minutes") {
+        None => 30,
+        Some(raw) => match raw.parse::<i64>() {
+            Ok(value) => value,
+            Err(_) => {
+                return argparse_error(
+                    GITHUB_METADATA_USAGE,
+                    "wrkviz github-metadata",
+                    &format!(
+                        "argument --phase-minutes: invalid int value: {}",
+                        crate::json::py_repr_str(&raw)
+                    ),
+                )
+            }
+        },
+    };
+    let github_timeout: f64 = match get("--github-timeout") {
+        None => crate::github_metadata::DEFAULT_TIMEOUT_SECONDS,
+        Some(raw) => match raw.parse::<f64>() {
+            Ok(value) => value,
+            Err(_) => {
+                return argparse_error(
+                    GITHUB_METADATA_USAGE,
+                    "wrkviz github-metadata",
+                    &format!(
+                        "argument --github-timeout: invalid float value: {}",
+                        crate::json::py_repr_str(&raw)
+                    ),
+                )
+            }
+        },
+    };
+    let archive = cli_path(&get("--output").unwrap());
+    let team_slug = get("--team").unwrap();
+    let started = crate::pipeline::utc_now();
+    let mut command: Vec<String> = vec!["wrkviz".to_string(), "github-metadata".to_string()];
+    command.extend(args.iter().cloned());
+    let fetched_at = crate::pipeline::utc_now();
+    let enrich = crate::github_enrich::enrich_pull_request_metadata(
+        &archive,
+        &team_slug,
+        github_timeout,
+        &fetched_at,
+    );
+    let github_report = match enrich {
+        Ok(report) => report,
+        Err(error) => {
+            if let Ok(run_path) = crate::pipeline::record_run_build(
+                &archive,
+                &crate::pipeline::RunReceipt {
+                    command: &command,
+                    started_at: &started,
+                    status: "failed",
+                    team_slug: &team_slug,
+                    error: Some(&error),
+                    team_slugs: &[],
+                    mechanical: None,
+                    ingest: None,
+                },
+                None,
+            ) {
+                eprintln!("run metadata: {}", run_path.display());
+            }
+            eprintln!("wrkviz: {error}");
+            return 2;
+        }
+    };
+    println!(
+        "github metadata: {} evidenced references / {} distinct pulls; {} fetched, {} unchanged, {} failed; cache {}",
+        github_report.references,
+        github_report.distinct_pulls,
+        github_report.fetched,
+        github_report.not_modified,
+        github_report.failures.len(),
+        github_report.cache_path
+    );
+    let outcome = crate::build_pipeline::build_archive(
+        &archive,
+        &team_slug,
+        phase_minutes,
+        None,
+        &[],
+        None,
+        true,
+        true,
+    );
+    let failure_error = if github_report.failures.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "GitHub metadata refresh had failures (successful records were retained): {}",
+            github_report.failures.join("; ")
+        ))
+    };
+    match outcome {
+        Ok(report) => {
+            println!(
+                "rebuild: {} presentation files changed after GitHub metadata",
+                report.files_changed
+            );
+            let build_json = report.to_json_obj();
+            if let Some(error) = &failure_error {
+                if let Ok(run_path) = crate::pipeline::record_run_build(
+                    &archive,
+                    &crate::pipeline::RunReceipt {
+                        command: &command,
+                        started_at: &started,
+                        status: "failed",
+                        team_slug: &team_slug,
+                        error: Some(error),
+                        team_slugs: &[],
+                        mechanical: None,
+                        ingest: None,
+                    },
+                    Some(build_json),
+                ) {
+                    eprintln!("run metadata: {}", run_path.display());
+                }
+                eprintln!("wrkviz: {error}");
+                return 2;
+            }
+            match crate::pipeline::record_run_build(
+                &archive,
+                &crate::pipeline::RunReceipt {
+                    command: &command,
+                    started_at: &started,
+                    status: "completed",
+                    team_slug: &team_slug,
+                    error: None,
+                    team_slugs: &[],
+                    mechanical: None,
+                    ingest: None,
+                },
+                Some(build_json),
+            ) {
+                Ok(run_path) => {
+                    println!("run metadata: {}", run_path.display());
+                    println!("open: cd {} && make serve", archive.display());
+                    0
+                }
+                Err(error) => {
+                    eprintln!("wrkviz: {error}");
+                    2
+                }
+            }
+        }
+        Err(error) => {
+            if let Ok(run_path) = crate::pipeline::record_run_build(
+                &archive,
+                &crate::pipeline::RunReceipt {
+                    command: &command,
+                    started_at: &started,
+                    status: "failed",
+                    team_slug: &team_slug,
+                    error: Some(&error),
+                    team_slugs: &[],
+                    mechanical: None,
+                    ingest: None,
+                },
+                None,
+            ) {
+                eprintln!("run metadata: {}", run_path.display());
+            }
             eprintln!("wrkviz: {error}");
             2
         }

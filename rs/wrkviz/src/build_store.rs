@@ -281,7 +281,7 @@ fn copy_tree(source: &Path, target: &Path) -> Result<(), String> {
     items.sort();
     for item in items {
         let name = item.file_name().unwrap_or_default();
-        let dest = target.join(&name);
+        let dest = target.join(name);
         if is_symlink(&item) {
             #[cfg(unix)]
             {
@@ -333,7 +333,7 @@ fn copy_tenant_across_devices(source: &Path, target: &Path, verify: bool) -> Res
         }
     }
     remove_dir_all(source)?;
-    fsync_directory(&target.parent().unwrap_or(target).to_path_buf())
+    fsync_directory(target.parent().unwrap_or(target))
 }
 
 fn tenant_files(source: &Path, target: &Path) -> Vec<(PathBuf, PathBuf)> {
@@ -504,10 +504,10 @@ fn write_build_pointer(archive: &Path, store_root: &Path) -> Result<bool, String
     record.insert("schema_version".into(), 1.into());
     record.insert("layout".into(), Value::String("external".into()));
     record.insert("store_root".into(), Value::String(relative));
-    Ok(crate::transcript_io::write_text_if_changed(
+    crate::transcript_io::write_text_if_changed(
         &archive.join("build-root.json"),
         &crate::json::dump_canonical(&Value::Object(record)),
-    )?)
+    )
 }
 
 fn pathdiff_relative(target: &Path, base: &Path) -> String {
@@ -587,14 +587,14 @@ pub fn migrate_build_state(
             std::fs::create_dir_all(parent)
                 .map_err(|error| crate::json::os_error(&error, parent))?;
         }
-        if device_of(source)? == device_of(&target.parent().unwrap_or(target).to_path_buf())? {
+        if device_of(source)? == device_of(target.parent().unwrap_or(target))? {
             std::fs::rename(source, target)
                 .map_err(|error| crate::json::os_error(&error, source))?;
         } else {
             std::fs::copy(source, target).map_err(|error| crate::json::os_error(&error, target))?;
             std::fs::remove_file(source).map_err(|error| crate::json::os_error(&error, source))?;
         }
-        fsync_directory(&target.parent().unwrap_or(target).to_path_buf())?;
+        fsync_directory(target.parent().unwrap_or(target))?;
     }
     std::fs::create_dir_all(&plan.store_root)
         .map_err(|error| crate::json::os_error(&error, &plan.store_root))?;

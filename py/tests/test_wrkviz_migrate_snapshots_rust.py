@@ -7,6 +7,7 @@ must agree byte-for-byte, including the store trees. Fixtures only.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import json
 import subprocess
 import sys
@@ -75,7 +76,7 @@ _SEQUENCE = [0]
 
 
 def _pair(tmp_path: Path, rust_wrkviz: Path, args: list[str],
-          setup=None) -> tuple[int, str, str, Path, Path]:
+          setup: Callable[[Path], None] | None = None) -> tuple[int, str, str, Path, Path]:
     _SEQUENCE[0] += 1
     py_base = tmp_path / f"py{_SEQUENCE[0]}"
     rs_base = tmp_path / f"rs{_SEQUENCE[0]}"

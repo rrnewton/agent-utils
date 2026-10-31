@@ -35,6 +35,8 @@ pub mod codex;
 /// Upstream sources compressed in place.
 pub mod compressed;
 pub mod gc;
+pub mod github_enrich;
+pub mod github_metadata;
 /// Claude Code prompt-history ingestion.
 pub mod history;
 /// Site identity records.
