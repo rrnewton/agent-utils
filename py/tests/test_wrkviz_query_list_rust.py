@@ -174,8 +174,14 @@ def test_query_help_and_errors_match_python() -> None:
         assert result.stderr == oracle.stderr, args
 
 
-def test_query_unported_actions_refuse_by_name(corpus: Path) -> None:
+def test_query_search_now_matches_python(corpus: Path) -> None:
+    # `query search` was the last unported query action; it is
+    # covered by test_wrkviz_query_search_rust.py. Here the
+    # compatibility scope simply agrees with the oracle.
+    oracle = _cli(["query", "--output", str(corpus), "search", "needle"],
+                  rust=False)
     result = _cli(["query", "--output", str(corpus), "search", "needle"],
                   rust=True)
-    assert result.returncode == 2
-    assert "has not ported 'query search' yet" in result.stderr
+    assert result.returncode == oracle.returncode == 0
+    assert result.stdout == oracle.stdout
+    assert result.stderr == oracle.stderr
