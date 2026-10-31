@@ -120,7 +120,14 @@ def test_sandbox_settings_validation() -> None:
 def test_default_sandbox_section_spells_out_every_key() -> None:
     section = sandbox.default_config_obj()
     assert list(section) == list(sandbox.SETTING_KEYS)
-    assert section["limits"] == {key: getattr(sandbox.SandboxLimits(), key) for key in sandbox.LIMIT_KEYS}
+    assert section["limits"] == {
+        key: (
+            []
+            if key == "slot_cpu_quotas"
+            else getattr(sandbox.SandboxLimits(), key)
+        )
+        for key in sandbox.LIMIT_KEYS
+    }
     assert sandbox.settings_from_obj(section) == sandbox.SandboxSettings()
     assert sandbox.settings_from_obj({}) == sandbox.SandboxSettings()
     assert section["isolation"] == "userns" and section["home"] == "ro"

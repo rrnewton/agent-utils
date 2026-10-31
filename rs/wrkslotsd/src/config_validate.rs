@@ -375,7 +375,7 @@ const SANDBOX_KEYS: [&str; 14] = [
     "coordinator_writable",
     "limits",
 ];
-const LIMIT_KEYS: [&str; 7] = [
+const LIMIT_KEYS: [&str; 8] = [
     "memory_max",
     "memory_high",
     "cpu_quota",
@@ -383,6 +383,7 @@ const LIMIT_KEYS: [&str; 7] = [
     "io_weight",
     "all_slots_memory_max",
     "all_slots_cpu_quota",
+    "slot_cpu_quotas",
 ];
 const RENAMED_KEYS: [(&str, &str); 9] = [
     ("home_writable", "home_private"),
@@ -486,6 +487,47 @@ fn optional_positive_int(value: &Value, label: &str) -> Result<Value> {
         Some(number) if number >= 1 => Ok(json!(number)),
         _ => Err(format!("{label} must be a positive integer or null")),
     }
+}
+
+fn slot_cpu_quotas(value: &Value) -> Result<Value> {
+    const LABEL: &str = "configuration.sandbox.limits.slot_cpu_quotas";
+    if value.is_null() {
+        return Ok(json!([]));
+    }
+    let Some(items) = value.as_array() else {
+        return Err(format!(
+            "{LABEL} must be a list of {{slot_prefix, cpu_quota}} objects"
+        ));
+    };
+    let mut out = Vec::new();
+    for item in items {
+        let Some(entry) = item.as_object() else {
+            return Err(format!(
+                "{LABEL} entries must be {{slot_prefix, cpu_quota}} objects"
+            ));
+        };
+        let mut keys: Vec<&str> = entry.keys().map(String::as_str).collect();
+        keys.sort();
+        if keys != ["cpu_quota", "slot_prefix"] {
+            return Err(format!(
+                "{LABEL} entries must be {{slot_prefix, cpu_quota}} objects"
+            ));
+        }
+        let prefix = entry.get("slot_prefix").unwrap_or(&Value::Null);
+        let Some(prefix) = prefix.as_str().filter(|text| !text.is_empty()) else {
+            return Err(format!("{LABEL} slot_prefix must be a non-empty string"));
+        };
+        let quota = entry.get("cpu_quota").unwrap_or(&Value::Null);
+        if quota.is_null() {
+            return Err(format!("{LABEL} cpu_quota must not be null"));
+        }
+        let quota = optional_limit(
+            quota,
+            "configuration.sandbox.limits.slot_cpu_quotas.cpu_quota",
+        )?;
+        out.push(json!({"slot_prefix": prefix, "cpu_quota": quota}));
+    }
+    Ok(Value::Array(out))
 }
 
 fn sandbox_settings(raw: &Map<String, Value>) -> Result<Value> {
@@ -602,7 +644,7 @@ fn sandbox_settings(raw: &Map<String, Value>) -> Result<Value> {
         None => json!({
             "all_slots_cpu_quota": null, "all_slots_memory_max": null,
             "cpu_quota": null, "io_weight": null, "memory_high": null,
-            "memory_max": null, "tasks_max": 8192
+            "memory_max": null, "tasks_max": 8192, "slot_cpu_quotas": []
         }),
         Some(value) => {
             let object = value
@@ -627,6 +669,7 @@ fn sandbox_settings(raw: &Map<String, Value>) -> Result<Value> {
                 "io_weight": optional_positive_int(&get("io_weight"), "configuration.sandbox.limits.io_weight")?,
                 "memory_high": optional_limit(&get("memory_high"), "configuration.sandbox.limits.memory_high")?,
                 "memory_max": optional_limit(&get("memory_max"), "configuration.sandbox.limits.memory_max")?,
+                "slot_cpu_quotas": slot_cpu_quotas(&get("slot_cpu_quotas"))?,
                 "tasks_max": match object.get("tasks_max") {
                     None => json!(8192),
                     Some(value) => optional_positive_int(value, "configuration.sandbox.limits.tasks_max")?,
