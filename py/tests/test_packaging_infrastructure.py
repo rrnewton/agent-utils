@@ -968,9 +968,10 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # a supersede that rebinds a live lane and voids the queue entry, and its
     # three refusals) are mapped; the one case it replaced was mapped too,
     # so the mapped partition grows by five net.
-    assert len(all_tests) == 2115
+    # The live-lane exhausted-cache audit case (mirroring 33582924) is mapped.
+    assert len(all_tests) == 2116
     assert len(ordinary) == 337
-    assert len(mapped) == 1778
+    assert len(mapped) == 1779
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {

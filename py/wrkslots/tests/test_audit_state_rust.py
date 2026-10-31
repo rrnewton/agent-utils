@@ -520,6 +520,35 @@ def test_audit_census_partial_then_complete_matches_python(tmp_path: Path) -> No
     assert abs(rust_bytes - python_bytes) <= 4096
 
 
+def test_audit_live_lane_exhausted_cache_not_unknown_matches_python(
+    tmp_path: Path,
+) -> None:
+    # Mirrors test_lifecycle's regression (33582924): a BLOCKED lane
+    # whose liveness probe proves it alive stays BLOCKED even when
+    # the bounded cache census fails; it must not be reclassified
+    # UNKNOWN, in either edition.
+    root = _cache_fixture(tmp_path)
+    config = root / ".wrkslots.yml"
+    config.write_text(config.read_text().replace("- cache\n", "- cache/**\n"))
+    (root / "live.py").write_text(
+        "import sys\n"
+        "print('agent=agent-slot-a rc=1 state: alive')\n"
+        "sys.exit(1)\n"
+    )
+    python_payload = _python(root, tmp_path, work_limit=5)
+    rust_result = _rust(
+        root, census_state=tmp_path / "rust-census.json", work_limit=5
+    )
+    assert rust_result.returncode == 0, rust_result.stderr
+    assert _scrub(json.loads(rust_result.stdout)) == _scrub(python_payload)
+    row = _rows(python_payload)[0]
+    assert row["verdict"] == "BLOCKED"
+    assert row["liveness_state"] == "alive"
+    assert row["cache_error"] is not None
+    assert python_payload["unknown_slots"] == []
+    assert python_payload["state"] == "ok"
+
+
 def _state_without_mac(path: Path) -> dict[str, object]:
     payload = json.loads(path.read_text())
     assert isinstance(payload, dict)

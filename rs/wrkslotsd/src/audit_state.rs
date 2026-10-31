@@ -6318,26 +6318,43 @@ pub(crate) fn parse_audit(
                 verdict == "UNKNOWN"
                     || (verdict == "BLOCKED"
                         && row.get("heartbeat_expired").and_then(Value::as_bool) == Some(true)
-                        && (!matches!(
-                            row.get("owner_state").and_then(Value::as_str),
-                            Some("live" | "dead")
-                        ) || !matches!(
-                            row.get("liveness_state").and_then(Value::as_str),
-                            Some("alive" | "dead")
-                        ) || !row.get("cache_error").is_some_and(|value| value.is_null())
-                            || row.get("cache_status").and_then(Value::as_str) == Some("partial")
+                        && (
+                            // Neither authority can say whether the lane
+                            // is in use.
+                            (!matches!(
+                                row.get("owner_state").and_then(Value::as_str),
+                                Some("live" | "dead")
+                            ) && !matches!(
+                                row.get("liveness_state").and_then(Value::as_str),
+                                Some("alive" | "dead")
+                            ))
+                            // A failed cache census alone is
+                            // indeterminacy; with a live lane proven it
+                            // is only a sizing gap and stays BLOCKED.
+                            || (!row.get("cache_error").is_some_and(|value| value.is_null())
+                                && row.get("liveness_state").and_then(Value::as_str)
+                                    != Some("alive")
+                                && row.get("owner_state").and_then(Value::as_str)
+                                    != Some("live"))
+                            || (row.get("cache_status").and_then(Value::as_str)
+                                == Some("partial")
+                                && row.get("liveness_state").and_then(Value::as_str)
+                                    != Some("alive")
+                                && row.get("owner_state").and_then(Value::as_str)
+                                    != Some("live"))
+                            // A failed occupancy/process census is
+                            // structural indeterminacy.
                             || row.get("reasons").and_then(Value::as_array).is_some_and(
                                 |reasons| {
                                     reasons.iter().any(|reason| {
                                         reason.as_str().is_some_and(|text| {
-                                            let lower = text.to_lowercase();
-                                            ["cannot", "failed", "unavailable", "unknown"]
-                                                .iter()
-                                                .any(|token| lower.contains(token))
+                                            text.contains("occupancy scan failed")
+                                                || text.contains("process census")
                                         })
                                     })
                                 },
-                            )))
+                            )
+                        ))
             })
             .map(|row| {
                 row.get("slot")
