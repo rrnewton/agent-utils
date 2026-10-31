@@ -289,9 +289,7 @@ pub fn calibrate(
             Ok(entries) => entries
                 .flatten()
                 .map(|entry| entry.path())
-                .filter(|path| {
-                    path.extension().and_then(|ext| ext.to_str()) == Some("json")
-                })
+                .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
                 .collect(),
             Err(_) => Vec::new(),
         };
@@ -451,7 +449,10 @@ impl SummaryPlan {
 
     /// Human-readable plan lines.
     pub fn lines(&self) -> Vec<String> {
-        let mut out = vec![format!("summary plan for {} (before any model call):", self.team_slug)];
+        let mut out = vec![format!(
+            "summary plan for {} (before any model call):",
+            self.team_slug
+        )];
         if let Some(Value::Object(state)) = &self.previous_state {
             out.push(format!(
                 "  {}",
@@ -529,8 +530,9 @@ impl SummaryPlan {
         out.insert("estimated_usd".into(), rounded(self.estimated_usd()));
         out.insert(
             "budget_usd".into(),
-            self.budget_usd
-                .map_or(Value::Null, |value| serde_json::Number::from_f64(value).map_or(Value::Null, Value::Number)),
+            self.budget_usd.map_or(Value::Null, |value| {
+                serde_json::Number::from_f64(value).map_or(Value::Null, Value::Number)
+            }),
         );
         Value::Object(out)
     }
@@ -600,7 +602,10 @@ pub fn load_state(summary_root: &Path) -> Option<Value> {
 }
 
 /// Persist the run-state record.
-pub fn write_state(summary_root: &Path, state: &serde_json::Map<String, Value>) -> Result<(), String> {
+pub fn write_state(
+    summary_root: &Path,
+    state: &serde_json::Map<String, Value>,
+) -> Result<(), String> {
     let mut record = state.clone();
     record.insert("schema_version".into(), STATE_SCHEMA_VERSION.into());
     record.insert("updated_at".into(), Value::String(now_iso()));
@@ -615,13 +620,12 @@ pub fn running_state(
     previous: Option<&Value>,
 ) -> serde_json::Map<String, Value> {
     let resumed = match previous {
-        Some(Value::Object(state)) if state.get("status").and_then(Value::as_str) != Some("complete") => {
+        Some(Value::Object(state))
+            if state.get("status").and_then(Value::as_str) != Some("complete") =>
+        {
             let mut item = serde_json::Map::new();
             for key in ["status", "started_at", "updated_at", "stopped", "spent_usd"] {
-                item.insert(
-                    key.into(),
-                    state.get(key).cloned().unwrap_or(Value::Null),
-                );
+                item.insert(key.into(), state.get(key).cloned().unwrap_or(Value::Null));
             }
             Value::Object(item)
         }
@@ -635,8 +639,9 @@ pub fn running_state(
     out.insert("plan".into(), plan.to_json());
     out.insert(
         "budget_usd".into(),
-        plan.budget_usd
-            .map_or(Value::Null, |value| serde_json::Number::from_f64(value).map_or(Value::Null, Value::Number)),
+        plan.budget_usd.map_or(Value::Null, |value| {
+            serde_json::Number::from_f64(value).map_or(Value::Null, Value::Number)
+        }),
     );
     out.insert("spent_usd".into(), Value::Null);
     out.insert("stopped".into(), Value::Null);
@@ -649,7 +654,10 @@ pub fn describe_previous_state(
     state: &serde_json::Map<String, Value>,
     request: Option<&Value>,
 ) -> String {
-    let status = state.get("status").and_then(Value::as_str).unwrap_or_default();
+    let status = state
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let started = state
         .get("started_at")
         .map(|value| match value {

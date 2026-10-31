@@ -48,10 +48,7 @@ pub fn content_hash_json(value: &Value) -> String {
     content_hash(&crate::json::dump_canonical(value))
 }
 
-fn obj_get<'a>(
-    obj: &'a serde_json::Map<String, Value>,
-    key: &str,
-) -> &'a Value {
+fn obj_get<'a>(obj: &'a serde_json::Map<String, Value>, key: &str) -> &'a Value {
     obj.get(key).unwrap_or(&Value::Null)
 }
 
@@ -128,7 +125,10 @@ impl TokenUsage {
     pub fn to_json(&self) -> Value {
         let mut out = serde_json::Map::new();
         out.insert("input_tokens".into(), self.input_tokens.into());
-        out.insert("cached_input_tokens".into(), self.cached_input_tokens.into());
+        out.insert(
+            "cached_input_tokens".into(),
+            self.cached_input_tokens.into(),
+        );
         out.insert(
             "cache_write_input_tokens".into(),
             self.cache_write_input_tokens.into(),
@@ -158,7 +158,10 @@ impl TokenUsage {
             let sorted: Vec<String> = {
                 let mut items: Vec<&str> = expected.to_vec();
                 items.sort_unstable();
-                items.iter().map(|item| crate::json::py_repr_str(item)).collect()
+                items
+                    .iter()
+                    .map(|item| crate::json::py_repr_str(item))
+                    .collect()
             };
             return Err(format!(
                 "{where_}: expected exactly [{}]",
@@ -166,7 +169,10 @@ impl TokenUsage {
             ));
         }
         let usage = Self::new(
-            as_int(obj_get(obj, "input_tokens"), &format!("{where_}.input_tokens"))?,
+            as_int(
+                obj_get(obj, "input_tokens"),
+                &format!("{where_}.input_tokens"),
+            )?,
             as_int(
                 obj_get(obj, "cached_input_tokens"),
                 &format!("{where_}.cached_input_tokens"),
@@ -175,13 +181,19 @@ impl TokenUsage {
                 obj_get(obj, "cache_write_input_tokens"),
                 &format!("{where_}.cache_write_input_tokens"),
             )?,
-            as_int(obj_get(obj, "output_tokens"), &format!("{where_}.output_tokens"))?,
+            as_int(
+                obj_get(obj, "output_tokens"),
+                &format!("{where_}.output_tokens"),
+            )?,
             as_int(
                 obj_get(obj, "reasoning_output_tokens"),
                 &format!("{where_}.reasoning_output_tokens"),
             )?,
         )?;
-        let recorded = as_int(obj_get(obj, "total_tokens"), &format!("{where_}.total_tokens"))?;
+        let recorded = as_int(
+            obj_get(obj, "total_tokens"),
+            &format!("{where_}.total_tokens"),
+        )?;
         if recorded != usage.total_tokens() {
             return Err(format!("{where_}.total_tokens: inconsistent token total"));
         }
@@ -277,7 +289,12 @@ impl BatchUsageReceipt {
         identity.insert("completed_at".into(), Value::String(completed_at.into()));
         identity.insert(
             "input_hashes".into(),
-            Value::Array(input_hashes.iter().map(|item| Value::String(item.clone())).collect()),
+            Value::Array(
+                input_hashes
+                    .iter()
+                    .map(|item| Value::String(item.clone()))
+                    .collect(),
+            ),
         );
         identity.insert(
             "usage".into(),
@@ -308,9 +325,7 @@ impl BatchUsageReceipt {
 
     /// Persisted form.
     pub fn to_json(&self) -> Value {
-        let opt = |value: &Option<String>| {
-            value.clone().map_or(Value::Null, Value::String)
-        };
+        let opt = |value: &Option<String>| value.clone().map_or(Value::Null, Value::String);
         let mut out = serde_json::Map::new();
         out.insert("schema_version".into(), self.schema_version.into());
         out.insert("receipt_id".into(), Value::String(self.receipt_id.clone()));
@@ -319,7 +334,10 @@ impl BatchUsageReceipt {
         out.insert("reasoning_effort".into(), opt(&self.reasoning_effort));
         out.insert("status".into(), Value::String(self.status.clone()));
         out.insert("started_at".into(), Value::String(self.started_at.clone()));
-        out.insert("completed_at".into(), Value::String(self.completed_at.clone()));
+        out.insert(
+            "completed_at".into(),
+            Value::String(self.completed_at.clone()),
+        );
         out.insert(
             "input_hashes".into(),
             Value::Array(
@@ -343,7 +361,10 @@ impl BatchUsageReceipt {
     /// Strictly parse and hash-validate one receipt.
     pub fn from_json(value: &Value, where_: &str) -> Result<Self, String> {
         let obj = as_object(value, where_)?;
-        let version = as_int(obj_get(obj, "schema_version"), &format!("{where_}.schema_version"))?;
+        let version = as_int(
+            obj_get(obj, "schema_version"),
+            &format!("{where_}.schema_version"),
+        )?;
         let mut expected = vec![
             "schema_version",
             "receipt_id",
@@ -388,13 +409,15 @@ impl BatchUsageReceipt {
         )?;
         let mut input_hashes = Vec::new();
         for (index, item) in raw_hashes.iter().enumerate() {
-            input_hashes.push(
-                as_string(item, &format!("{where_}.input_hashes[{index}]"))?.to_string(),
-            );
+            input_hashes
+                .push(as_string(item, &format!("{where_}.input_hashes[{index}]"))?.to_string());
         }
         let usage = match obj_get(obj, "usage") {
             Value::Null => None,
-            value => Some(TokenUsage::from_json(Some(value), &format!("{where_}.usage"))?),
+            value => Some(TokenUsage::from_json(
+                Some(value),
+                &format!("{where_}.usage"),
+            )?),
         };
         let receipt = Self {
             receipt_id: as_string(obj_get(obj, "receipt_id"), &format!("{where_}.receipt_id"))?
@@ -521,7 +544,13 @@ pub fn parse_claude_json_usage(text: &str) -> Result<TokenUsage, String> {
         obj_get(usage, "output_tokens"),
         "claude JSON result.usage.output_tokens",
     )?;
-    TokenUsage::new(direct + cache_write + cache_read, cache_read, cache_write, output, 0)
+    TokenUsage::new(
+        direct + cache_write + cache_read,
+        cache_read,
+        cache_write,
+        output,
+        0,
+    )
 }
 
 /// Persist one batch receipt.
@@ -590,7 +619,12 @@ pub fn write_usage_run_receipt(
         .collect();
     artifact_ids.sort();
     let strings = |items: &[String]| -> Value {
-        Value::Array(items.iter().map(|item| Value::String(item.clone())).collect())
+        Value::Array(
+            items
+                .iter()
+                .map(|item| Value::String(item.clone()))
+                .collect(),
+        )
     };
     let opt = |value: Option<&str>| value.map_or(Value::Null, |text| Value::String(text.into()));
     let mut identity = serde_json::Map::new();
@@ -628,7 +662,10 @@ pub fn write_usage_run_receipt(
         "artifact_generation_unknown_receipts".into(),
         artifact_unknown.into(),
     );
-    obj.insert("unknown_legacy_artifacts".into(), unknown_legacy_artifacts.into());
+    obj.insert(
+        "unknown_legacy_artifacts".into(),
+        unknown_legacy_artifacts.into(),
+    );
     let path = root.join("runs").join(format!("{run_id}.json"));
     write_json_if_changed(&path, &Value::Object(obj))?;
     Ok(UsageRunAccounting {

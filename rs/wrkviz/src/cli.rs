@@ -3302,7 +3302,6 @@ fn is_option_token(arg: &str, names: &[&str]) -> bool {
     })
 }
 
-
 /// The Python edition's summarize help, verbatim.
 pub const SUMMARIZE_HELP: &str = r##"usage: wrkviz summarize [-h] --output OUTPUT --team TEAM
                         [--backend {codex,claude,heuristic}] [--model MODEL]
@@ -4601,10 +4600,7 @@ const SUMMARIZE_USAGE: &str = "usage: wrkviz summarize [-h] --output OUTPUT --te
 
 fn run_summarize(args: &[String]) -> u8 {
     crate::summarize_core::install_interrupt_handler();
-    if args
-        .iter()
-        .any(|arg| arg == "--help" || arg == "-h")
-    {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         print!("{SUMMARIZE_HELP}");
         return 0;
     }
@@ -4665,8 +4661,7 @@ fn run_summarize(args: &[String]) -> u8 {
                 ),
             );
         }
-        let plan_selected = candidates.contains(&"--plan")
-            && !VALUE_OPTIONS.contains(&head);
+        let plan_selected = candidates.contains(&"--plan") && !VALUE_OPTIONS.contains(&head);
         if plan_selected {
             if let Some(value) = &explicit {
                 return argparse_error(
@@ -4804,10 +4799,7 @@ fn run_summarize(args: &[String]) -> u8 {
             ),
         );
     }
-    let mut rollup_kinds: Vec<String> = values
-        .get("--rollup-kind")
-        .cloned()
-        .unwrap_or_default();
+    let mut rollup_kinds: Vec<String> = values.get("--rollup-kind").cloned().unwrap_or_default();
     for kind in &rollup_kinds {
         if !matches!(
             kind.as_str(),
@@ -4843,126 +4835,118 @@ fn run_summarize(args: &[String]) -> u8 {
     let reasoning_effort = Some(get("--reasoning-effort").unwrap_or(default_effort));
     let service_tier = get("--service-tier");
 
-    let outcome: Result<
-        Option<crate::summarize_pipeline::SummarizeReport>,
-        (String, bool),
-    > = (|| {
-        let model = match get("--model") {
-            None => {
-                if backend == "claude" {
+    let outcome: Result<Option<crate::summarize_pipeline::SummarizeReport>, (String, bool)> =
+        (|| {
+            let model = match get("--model") {
+                None => {
+                    if backend == "claude" {
+                        return Err((
+                            "--model is required when --backend=claude".to_string(),
+                            false,
+                        ));
+                    }
+                    default_model.clone()
+                }
+                Some(raw) => {
+                    let model = crate::summarize_core::py_trim(&raw).to_string();
+                    if model.is_empty() {
+                        return Err(("--model must not be empty".to_string(), false));
+                    }
+                    model
+                }
+            };
+            let has_date_bound =
+                get("--summary-start-date").is_some() || get("--summary-end-date").is_some();
+            let summary_timezone = match get("--summary-timezone") {
+                Some(value) => value,
+                None => {
+                    if has_date_bound {
+                        crate::pipeline::load_archived_team(&archive, &team_slug)
+                            .map_err(|error| (error, false))?
+                            .display_timezone
+                    } else {
+                        "UTC".to_string()
+                    }
+                }
+            };
+            let summary_window = crate::window::parse_date_window(
+                get("--summary-start-date").as_deref(),
+                get("--summary-end-date").as_deref(),
+                &summary_timezone,
+                get("--summary-start-time").as_deref(),
+                get("--summary-end-time").as_deref(),
+            )
+            .map_err(|error| (error, false))?;
+            if let Some(budget) = budget_usd {
+                if budget.is_nan() || budget < 0.0 {
                     return Err((
-                        "--model is required when --backend=claude".to_string(),
+                        "--budget-usd must be a non-negative number".to_string(),
                         false,
                     ));
                 }
-                default_model.clone()
             }
-            Some(raw) => {
-                let model = crate::summarize_core::py_trim(&raw).to_string();
-                if model.is_empty() {
-                    return Err(("--model must not be empty".to_string(), false));
-                }
-                model
-            }
-        };
-        let has_date_bound =
-            get("--summary-start-date").is_some() || get("--summary-end-date").is_some();
-        let summary_timezone = match get("--summary-timezone") {
-            Some(value) => value,
-            None => {
-                if has_date_bound {
-                    crate::pipeline::load_archived_team(&archive, &team_slug)
-                        .map_err(|error| (error, false))?
-                        .display_timezone
-                } else {
-                    "UTC".to_string()
-                }
-            }
-        };
-        let summary_window = crate::window::parse_date_window(
-            get("--summary-start-date").as_deref(),
-            get("--summary-end-date").as_deref(),
-            &summary_timezone,
-            get("--summary-start-time").as_deref(),
-            get("--summary-end-time").as_deref(),
-        )
-        .map_err(|error| (error, false))?;
-        if let Some(budget) = budget_usd {
-            if budget.is_nan() || budget < 0.0 {
+            let prices = match get("--price") {
+                None => None,
+                Some(raw) => Some(
+                    crate::summary_budget::Prices::parse(&raw).map_err(|error| (error, false))?,
+                ),
+            };
+            if budget_usd.is_some() && prices.is_none() && backend != "heuristic" {
                 return Err((
-                    "--budget-usd must be a non-negative number".to_string(),
+                    "--budget-usd needs --price to turn token estimates into dollars".to_string(),
                     false,
                 ));
             }
-        }
-        let prices = match get("--price") {
-            None => None,
-            Some(raw) => Some(
-                crate::summary_budget::Prices::parse(&raw)
-                    .map_err(|error| (error, false))?,
-            ),
-        };
-        if budget_usd.is_some() && prices.is_none() && backend != "heuristic" {
-            return Err((
-                "--budget-usd needs --price to turn token estimates into dollars"
-                    .to_string(),
-                false,
-            ));
-        }
-        let options = crate::summarize_pipeline::SummarizeOptions {
-            max_workers: summary_workers.max(0) as usize,
-            batch_size: summary_batch_size.max(0) as usize,
-            name_batch_size: name_batch_size.max(0) as usize,
-            phase_minutes,
-            context_chars,
-            transcript_chars,
-            codex_command: vec![get("--codex-command").unwrap_or_else(|| "codex".to_string())],
-            claude_command: vec![
-                get("--claude-command").unwrap_or_else(|| "claude".to_string()),
-            ],
-            reasoning_effort: reasoning_effort.clone(),
-            service_tier: service_tier.clone(),
-            summary_window,
-            rollup_kinds: rollup_kinds.clone(),
-            budget_usd,
-            prices,
-        };
-        if plan {
-            let plan = crate::summarize_pipeline::plan_summaries(
+            let options = crate::summarize_pipeline::SummarizeOptions {
+                max_workers: summary_workers.max(0) as usize,
+                batch_size: summary_batch_size.max(0) as usize,
+                name_batch_size: name_batch_size.max(0) as usize,
+                phase_minutes,
+                context_chars,
+                transcript_chars,
+                codex_command: vec![get("--codex-command").unwrap_or_else(|| "codex".to_string())],
+                claude_command: vec![
+                    get("--claude-command").unwrap_or_else(|| "claude".to_string())
+                ],
+                reasoning_effort: reasoning_effort.clone(),
+                service_tier: service_tier.clone(),
+                summary_window,
+                rollup_kinds: rollup_kinds.clone(),
+                budget_usd,
+                prices,
+            };
+            if plan {
+                let plan = crate::summarize_pipeline::plan_summaries(
+                    &archive, &team_slug, &backend, &model, &options,
+                )
+                .map_err(|error| (error, false))?;
+                for line in plan.lines() {
+                    println!("{line}");
+                }
+                if plan.over_budget() {
+                    // _PlanOverBudget: exit 3 with no run record.
+                    return Err((String::new(), true));
+                }
+                return Ok(None);
+            }
+            let report = crate::summarize_pipeline::summarize_archive(
                 &archive,
                 &team_slug,
                 &backend,
                 &model,
                 &options,
+                &|plan| {
+                    for line in plan.lines() {
+                        println!("{line}");
+                    }
+                },
             )
-            .map_err(|error| (error, false))?;
-            for line in plan.lines() {
-                println!("{line}");
-            }
-            if plan.over_budget() {
-                // _PlanOverBudget: exit 3 with no run record.
-                return Err((String::new(), true));
-            }
-            return Ok(None);
-        }
-        let report = crate::summarize_pipeline::summarize_archive(
-            &archive,
-            &team_slug,
-            &backend,
-            &model,
-            &options,
-            &|plan| {
-                for line in plan.lines() {
-                    println!("{line}");
-                }
-            },
-        )
-        .map_err(|error| {
-            let is_budget = error.is_budget();
-            (error.message().to_string(), is_budget)
-        })?;
-        Ok(Some(report))
-    })();
+            .map_err(|error| {
+                let is_budget = error.is_budget();
+                (error.message().to_string(), is_budget)
+            })?;
+            Ok(Some(report))
+        })();
 
     match outcome {
         Ok(None) => {

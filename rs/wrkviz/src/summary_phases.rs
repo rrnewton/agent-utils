@@ -28,10 +28,7 @@ impl PhaseStats {
         let mut out = BTreeMap::new();
         out.insert("user_prompts".into(), self.user_prompts);
         out.insert("agent_responses".into(), self.agent_responses);
-        out.insert(
-            "inter_agent_messages".into(),
-            self.inter_agent_messages,
-        );
+        out.insert("inter_agent_messages".into(), self.inter_agent_messages);
         out.insert("tool_calls".into(), self.tool_calls);
         if self.external_messages != 0 {
             out.insert("external_messages".into(), self.external_messages);
@@ -157,10 +154,7 @@ fn text_of(event: &Event) -> String {
         let mut message_type = "message".to_string();
         for line in event.text.as_deref().unwrap_or_default().lines() {
             if let Some(rest) = line.strip_prefix("Message Type:") {
-                let candidate = rest
-                    .trim()
-                    .to_lowercase()
-                    .replace('_', " ");
+                let candidate = rest.trim().to_lowercase().replace('_', " ");
                 if !candidate.is_empty() {
                     message_type = candidate;
                 }
@@ -213,12 +207,7 @@ fn tool_names(tool: &ToolCall) -> Vec<TranscriptTool> {
     }]
 }
 
-fn thread_end(
-    agent: &Agent,
-    events: &[Event],
-    tools: &[ToolCall],
-    turns: &[Turn],
-) -> i64 {
+fn thread_end(agent: &Agent, events: &[Event], tools: &[ToolCall], turns: &[Turn]) -> i64 {
     let mut candidates = vec![agent.started_at_ms + 1000];
     if let Some(end) = agent.ended_at_ms {
         candidates.push(end);
@@ -309,10 +298,7 @@ fn states(
         }
         let midpoint = (left as f64 + right as f64) / 2.0;
         let mut kind = "idle";
-        if blocked
-            .iter()
-            .any(|(bl, br)| contains(*bl, *br, midpoint))
-        {
+        if blocked.iter().any(|(bl, br)| contains(*bl, *br, midpoint)) {
             kind = "blocked";
         }
         let matching: Vec<&ToolCall> = tools
@@ -358,10 +344,7 @@ fn states(
     raw
 }
 
-fn transcript_entries(
-    events: &[&Event],
-    tools: &[&ToolCall],
-) -> Vec<TranscriptEntry> {
+fn transcript_entries(events: &[&Event], tools: &[&ToolCall]) -> Vec<TranscriptEntry> {
     enum Record<'a> {
         Event(&'a Event),
         Tool(&'a ToolCall),
@@ -514,14 +497,8 @@ fn prior_context(
             .iter()
             .enumerate()
             .max_by(|a, b| {
-                let key_a = (
-                    a.1 .0[a.1 .1].0,
-                    a.1 .0[a.1 .1].1.clone(),
-                );
-                let key_b = (
-                    b.1 .0[b.1 .1].0,
-                    b.1 .0[b.1 .1].1.clone(),
-                );
+                let key_a = (a.1 .0[a.1 .1].0, a.1 .0[a.1 .1].1.clone());
+                let key_b = (b.1 .0[b.1 .1].0, b.1 .0[b.1 .1].1.clone());
                 key_a.cmp(&key_b).then(b.0.cmp(&a.0))
             })
             .map(|item| item.0)
@@ -568,18 +545,12 @@ fn agent_overlaps_window(team: &TeamData, agent: &Agent) -> bool {
     if team.window_start_ms.is_none() || agent.ended_at_ms.is_none() {
         return true;
     }
-    let effective_end = agent
-        .ended_at_ms
-        .unwrap()
-        .max(agent.started_at_ms + 1);
+    let effective_end = agent.ended_at_ms.unwrap().max(agent.started_at_ms + 1);
     effective_end > team.window_start_ms.unwrap()
 }
 
 /// Agents alive in the window plus their lineage ancestors.
-pub fn phase_agent_ids(
-    team: &TeamData,
-    phases: &[PhaseWindow],
-) -> BTreeSet<String> {
+pub fn phase_agent_ids(team: &TeamData, phases: &[PhaseWindow]) -> BTreeSet<String> {
     let by_id: HashMap<String, &Agent> = team
         .agents
         .iter()
@@ -695,9 +666,15 @@ pub fn build_phases(
         let empty_events: Vec<Event> = Vec::new();
         let empty_tools: Vec<ToolCall> = Vec::new();
         let empty_turns: Vec<Turn> = Vec::new();
-        let own_events = events_by_thread.get(&agent.thread_id).unwrap_or(&empty_events);
-        let own_tools = tools_by_thread.get(&agent.thread_id).unwrap_or(&empty_tools);
-        let own_turns = turns_by_thread.get(&agent.thread_id).unwrap_or(&empty_turns);
+        let own_events = events_by_thread
+            .get(&agent.thread_id)
+            .unwrap_or(&empty_events);
+        let own_tools = tools_by_thread
+            .get(&agent.thread_id)
+            .unwrap_or(&empty_tools);
+        let own_turns = turns_by_thread
+            .get(&agent.thread_id)
+            .unwrap_or(&empty_turns);
         let mut end_ms = thread_end(agent, own_events, own_tools, own_turns);
         if let Some(window_end) = team.window_end_ms {
             end_ms = end_ms.min(window_end);
@@ -769,7 +746,10 @@ pub fn build_phases(
                 user_prompts: *counts.get("user_prompt").unwrap_or(&0),
                 agent_responses: *counts.get("assistant_message").unwrap_or(&0),
                 inter_agent_messages: *counts.get("inter_agent_message").unwrap_or(&0),
-                tool_calls: started_phase_tools.iter().map(|tool| tool_count(tool)).sum(),
+                tool_calls: started_phase_tools
+                    .iter()
+                    .map(|tool| tool_count(tool))
+                    .sum(),
                 external_messages: *counts.get("external_message").unwrap_or(&0),
             };
             let stable = format!(

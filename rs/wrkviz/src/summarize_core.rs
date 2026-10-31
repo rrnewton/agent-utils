@@ -20,8 +20,8 @@ use crate::summary_artifacts::{
 };
 use crate::summary_budget::SpendGuard;
 use crate::summary_registry::{
-    summarizer_for_style, ContextCoverage, SummarizerSpec, GLOSSARY_DEFINITION_STYLE,
-    PHASE_STYLE, PLAIN_LANGUAGE_ROLLUP_STYLE, PROJECT_OVERVIEW_STYLE, TECHNICAL_ROLLUP_STYLE,
+    summarizer_for_style, ContextCoverage, SummarizerSpec, GLOSSARY_DEFINITION_STYLE, PHASE_STYLE,
+    PLAIN_LANGUAGE_ROLLUP_STYLE, PROJECT_OVERVIEW_STYLE, TECHNICAL_ROLLUP_STYLE,
 };
 use crate::token_usage::{
     content_hash_json, load_batch_receipt, resolve_service_tier, write_batch_receipt,
@@ -323,7 +323,11 @@ pub fn validate_job(job: &SummaryJob) -> Result<(), String> {
             ));
         }
     }
-    if job.dependency_keys.iter().any(|key| py_trim(key).is_empty()) {
+    if job
+        .dependency_keys
+        .iter()
+        .any(|key| py_trim(key).is_empty())
+    {
         return Err(format!(
             "summary job {} has an empty dependency key",
             py_repr_str(&job.key)
@@ -342,7 +346,9 @@ pub fn validate_job(job: &SummaryJob) -> Result<(), String> {
 }
 
 fn prompt_version(job: &SummaryJob) -> Result<String, String> {
-    Ok(summarizer_for_style(&job.summary_style)?.prompt_version.to_string())
+    Ok(summarizer_for_style(&job.summary_style)?
+        .prompt_version
+        .to_string())
 }
 
 fn spec_of(job: &SummaryJob) -> Result<&'static SummarizerSpec, String> {
@@ -366,7 +372,8 @@ fn transcript_tool_entry_re() -> regex::Regex {
 }
 
 fn encrypted_collab_re() -> regex::Regex {
-    regex::Regex::new(r"(?i)\[Encrypted Codex collaboration\b(?:[^\]]*\]|[^.!?\n]{0,300}…)").unwrap()
+    regex::Regex::new(r"(?i)\[Encrypted Codex collaboration\b(?:[^\]]*\]|[^.!?\n]{0,300}…)")
+        .unwrap()
 }
 
 /// Whether generated knowledge contains a link or URL-like target.
@@ -444,12 +451,7 @@ pub fn strip_overview_links(value: &str) -> String {
         },
         |_| String::new(),
     );
-    let text = remove_runs(
-        &text,
-        r"(?i)\bwww\.\S+",
-        |_| 5,
-        |_| String::new(),
-    );
+    let text = remove_runs(&text, r"(?i)\bwww\.\S+", |_| 5, |_| String::new());
     let text = remove_runs(
         &text,
         r"(?i)\b([a-z0-9.-]+\.(?:com|org|net|io|dev|ai|gov|edu))/\S*",
@@ -474,7 +476,10 @@ fn job_json(job: &SummaryJob) -> Value {
     result.insert("agent_label".into(), Value::String(job.agent_label.clone()));
     result.insert("start_ms".into(), job.start_ms.into());
     result.insert("end_ms".into(), job.end_ms.into());
-    result.insert("prior_context".into(), Value::String(job.prior_context.clone()));
+    result.insert(
+        "prior_context".into(),
+        Value::String(job.prior_context.clone()),
+    );
     result.insert("transcript".into(), Value::String(job.transcript.clone()));
     result.insert("glossary".into(), Value::String(job.glossary.clone()));
     result.insert("stats".into(), Value::Object(stats));
@@ -520,10 +525,7 @@ fn legacy_input_hash(
     service_tier: Option<&str>,
 ) -> Result<String, String> {
     let mut payload = serde_json::Map::new();
-    payload.insert(
-        "prompt_version".into(),
-        Value::String(prompt_version(job)?),
-    );
+    payload.insert("prompt_version".into(), Value::String(prompt_version(job)?));
     payload.insert("job".into(), job_json(job));
     add_identity_fields(&mut payload, backend, model, reasoning_effort, service_tier);
     Ok(content_hash_json(&Value::Object(payload)))
@@ -538,7 +540,10 @@ fn input_hash(
 ) -> Result<String, String> {
     let spec = spec_of(job)?;
     let mut payload = serde_json::Map::new();
-    payload.insert("summarizer_id".into(), Value::String(spec.summarizer_id.into()));
+    payload.insert(
+        "summarizer_id".into(),
+        Value::String(spec.summarizer_id.into()),
+    );
     payload.insert("summarizer_version".into(), spec.current_version.into());
     payload.insert(
         "output_schema_version".into(),
@@ -727,7 +732,10 @@ fn require_keys(
     Err(format!("{where_}: {}", details.join("; ")))
 }
 
-fn strict_object<'a>(value: &'a Value, where_: &str) -> Result<&'a serde_json::Map<String, Value>, String> {
+fn strict_object<'a>(
+    value: &'a Value,
+    where_: &str,
+) -> Result<&'a serde_json::Map<String, Value>, String> {
     as_object(value, where_)
 }
 
@@ -750,7 +758,11 @@ fn rollup_inputs_entry(index_dir: &Path, own_hash: &str) -> Option<(String, Stri
         "rollup inputs index",
     )
     .ok()?;
-    if as_int(entry.get("schema_version").unwrap(), "rollup inputs index.schema_version").ok()?
+    if as_int(
+        entry.get("schema_version").unwrap(),
+        "rollup inputs index.schema_version",
+    )
+    .ok()?
         != 1
     {
         return None;
@@ -814,13 +826,7 @@ pub fn carried_forward_summary(
     service_tier: Option<&str>,
 ) -> Result<Option<SummaryResult>, String> {
     let effective = resolve_service_tier(backend, service_tier)?;
-    let own_hash = rollup_inputs_hash(
-        job,
-        backend,
-        model,
-        reasoning_effort,
-        effective.as_deref(),
-    )?;
+    let own_hash = rollup_inputs_hash(job, backend, model, reasoning_effort, effective.as_deref())?;
     let Some(entry) = rollup_inputs_entry(index_dir, &own_hash) else {
         return Ok(None);
     };
@@ -844,10 +850,8 @@ pub fn carried_forward_summary(
     if cached.result.artifact_provenance.is_none() {
         return Ok(None);
     }
-    if rollup_inputs_hash_for_provenance(
-        job,
-        cached.result.artifact_provenance.as_ref().unwrap(),
-    ) != Some(own_hash)
+    if rollup_inputs_hash_for_provenance(job, cached.result.artifact_provenance.as_ref().unwrap())
+        != Some(own_hash)
     {
         return Ok(None);
     }
@@ -855,11 +859,7 @@ pub fn carried_forward_summary(
 }
 
 /// Whether a result is the indexed rollup for a job's own inputs.
-pub fn carried_forward_matches(
-    job: &SummaryJob,
-    result: &SummaryResult,
-    index_dir: &Path,
-) -> bool {
+pub fn carried_forward_matches(job: &SummaryJob, result: &SummaryResult, index_dir: &Path) -> bool {
     let Some(provenance) = &result.artifact_provenance else {
         return false;
     };
@@ -874,8 +874,7 @@ pub fn carried_forward_matches(
     let Some(own_hash) = rollup_inputs_hash_for_provenance(job, provenance) else {
         return false;
     };
-    rollup_inputs_entry(index_dir, &own_hash)
-        == Some((job.key.clone(), result.input_hash.clone()))
+    rollup_inputs_entry(index_dir, &own_hash) == Some((job.key.clone(), result.input_hash.clone()))
 }
 
 /// Build the complete prompt for one backend batch.
@@ -920,7 +919,10 @@ pub fn output_schema() -> Value {
         item.insert("additionalProperties".into(), Value::Bool(false));
         item.insert(
             "required".into(),
-            Value::Array(vec![Value::String("at_ms".into()), Value::String("text".into())]),
+            Value::Array(vec![
+                Value::String("at_ms".into()),
+                Value::String("text".into()),
+            ]),
         );
         item.insert("properties".into(), Value::Object(props));
         Value::Object(item)
@@ -1111,7 +1113,10 @@ fn parse_backend_output_with_repairs(
         )?;
         let mut bullets = parsed_bullets.bullets.clone();
         if item.job.summary_style == PROJECT_OVERVIEW_STYLE {
-            if !matches!(phrase.as_str(), "Project overview supported" | "Insufficient evidence") {
+            if !matches!(
+                phrase.as_str(),
+                "Project overview supported" | "Insufficient evidence"
+            ) {
                 return Err(format!(
                     "{where_}.phrase: invalid project-overview evidence status"
                 ));
@@ -1121,8 +1126,7 @@ fn parse_backend_output_with_repairs(
                     "{where_}.work_summary: project overview must not contain bullets"
                 ));
             }
-            if phrase == "Insufficient evidence"
-                && !paragraph.starts_with("Insufficient evidence:")
+            if phrase == "Insufficient evidence" && !paragraph.starts_with("Insufficient evidence:")
             {
                 return Err(format!(
                     "{where_}.paragraph: insufficient overview must name its evidence limit"
@@ -1135,7 +1139,10 @@ fn parse_backend_output_with_repairs(
                 ));
             }
         } else if item.job.summary_style == GLOSSARY_DEFINITION_STYLE {
-            if !matches!(phrase.as_str(), "Definition supported" | "Insufficient evidence") {
+            if !matches!(
+                phrase.as_str(),
+                "Definition supported" | "Insufficient evidence"
+            ) {
                 return Err(format!(
                     "{where_}.phrase: invalid glossary-definition evidence status"
                 ));
@@ -1145,8 +1152,7 @@ fn parse_backend_output_with_repairs(
                     "{where_}.work_summary: glossary definition must not contain bullets"
                 ));
             }
-            if phrase == "Insufficient evidence"
-                && !paragraph.starts_with("Insufficient evidence:")
+            if phrase == "Insufficient evidence" && !paragraph.starts_with("Insufficient evidence:")
             {
                 return Err(format!(
                     "{where_}.paragraph: insufficient definition must name its evidence limit"
@@ -1160,10 +1166,7 @@ fn parse_backend_output_with_repairs(
         }
         if !parsed_bullets.rejected.is_empty() {
             if !bullets.is_empty() {
-                phrase = shorten(
-                    &bullets[0].text,
-                    PHRASE_LIMIT,
-                );
+                phrase = shorten(&bullets[0].text, PHRASE_LIMIT);
                 paragraph = shorten(
                     &bullets
                         .iter()
@@ -1352,7 +1355,12 @@ fn load_cache(
         )
         .ok()?;
         if version == 1 {
-            require_keys(root, &["cache_version", "backend", "result"], "summary cache").ok()?;
+            require_keys(
+                root,
+                &["cache_version", "backend", "result"],
+                "summary cache",
+            )
+            .ok()?;
             usage_receipt_id = None;
         } else if version == CACHE_VERSION {
             require_keys(
@@ -1371,7 +1379,8 @@ fn load_cache(
         } else {
             return None;
         }
-        cached_backend = strict_string(root.get("backend").unwrap(), "summary cache.backend").ok()?;
+        cached_backend =
+            strict_string(root.get("backend").unwrap(), "summary cache.backend").ok()?;
     }
     if cached_backend != backend {
         return None;
@@ -1394,9 +1403,8 @@ fn load_cache(
     .ok()?;
     let get = |key: &str| raw_result.get(key).unwrap();
     let key = strict_string(get("key"), "summary cache.result.key").ok()?;
-    let phrase = clean_summary_prose(
-        &strict_string(get("phrase"), "summary cache.result.phrase").ok()?,
-    );
+    let phrase =
+        clean_summary_prose(&strict_string(get("phrase"), "summary cache.result.phrase").ok()?);
     if phrase.is_empty() || char_len(&phrase) > PHRASE_LIMIT {
         return None;
     }
@@ -1614,9 +1622,7 @@ fn sentence_split(text: &str) -> Vec<String> {
             index = end;
             continue;
         }
-        if matches!(ch, '.' | '!' | '?')
-            && index + 1 < chars.len()
-            && is_py_space(chars[index + 1])
+        if matches!(ch, '.' | '!' | '?') && index + 1 < chars.len() && is_py_space(chars[index + 1])
         {
             let mut end = index + 1;
             while end < chars.len() && is_py_space(chars[end]) {
@@ -1760,7 +1766,12 @@ fn heuristic_batch(pending: &[PendingJob], model: &str) -> HashMap<String, Summa
     let generated_at = utc_now_iso();
     pending
         .iter()
-        .map(|item| (item.job.key.clone(), heuristic_result(item, model, &generated_at)))
+        .map(|item| {
+            (
+                item.job.key.clone(),
+                heuristic_result(item, model, &generated_at),
+            )
+        })
         .collect()
 }
 
@@ -1772,11 +1783,8 @@ pub(crate) struct CompletedProcess {
 
 static BACKEND_GROUPS: std::sync::Mutex<std::collections::BTreeSet<i32>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
-static INTERRUPTED: std::sync::LazyLock<
-    std::sync::Arc<std::sync::atomic::AtomicBool>,
-> = std::sync::LazyLock::new(|| {
-    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))
-});
+static INTERRUPTED: std::sync::LazyLock<std::sync::Arc<std::sync::atomic::AtomicBool>> =
+    std::sync::LazyLock::new(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
 
 /// Whether SIGINT has interrupted this process.
 pub fn interrupted() -> bool {
@@ -1861,11 +1869,8 @@ impl TempDir {
     pub(crate) fn new(prefix: &str) -> Result<Self, String> {
         for _ in 0..100 {
             let count = TEMP_COUNTER.fetch_add(1, Ordering::SeqCst);
-            let path = std::env::temp_dir().join(format!(
-                "{prefix}{}-{}",
-                std::process::id(),
-                count
-            ));
+            let path =
+                std::env::temp_dir().join(format!("{prefix}{}-{}", std::process::id(), count));
             match std::fs::create_dir(&path) {
                 Ok(()) => return Ok(Self { path }),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -1977,8 +1982,7 @@ fn codex_batch(
             "codex command must not be empty".to_string(),
         ));
     }
-    let temp = TempDir::new("wrkviz-summary-")
-        .map_err(BatchFailure::plain)?;
+    let temp = TempDir::new("wrkviz-summary-").map_err(BatchFailure::plain)?;
     let work_dir = temp.path.clone();
     initialize_codex_workspace(&work_dir).map_err(|error| {
         BatchFailure::plain(format!(
@@ -2020,9 +2024,8 @@ fn codex_batch(
     command.push("-".into());
     let jobs: Vec<SummaryJob> = pending.iter().map(|item| item.job.clone()).collect();
     let prompt = build_summary_prompt(&jobs).map_err(BatchFailure::plain)?;
-    let completed = run_process(&command, &prompt, &work_dir).map_err(|error| {
-        BatchFailure::plain(format!("could not start codex backend: {error}"))
-    })?;
+    let completed = run_process(&command, &prompt, &work_dir)
+        .map_err(|error| BatchFailure::plain(format!("could not start codex backend: {error}")))?;
     let backend_output = std::fs::read_to_string(&output_path).ok();
     let usage = match crate::token_usage::parse_codex_jsonl_usage(&completed.stdout) {
         Ok(usage) => usage,
@@ -2106,25 +2109,28 @@ pub(crate) fn run_claude_json(
     };
     schema.remove("$schema");
     let mut args: Vec<String> = command.to_vec();
-    for arg in [
-        "--print",
-        "--output-format",
-        "json",
-        "--json-schema",
-    ] {
+    for arg in ["--print", "--output-format", "json", "--json-schema"] {
         args.push(arg.into());
     }
     args.push(py_dumps_compact(&Value::Object(schema)));
-    for arg in ["--model", model, "--safe-mode", "--no-session-persistence", "--permission-mode", "dontAsk", "--tools", ""] {
+    for arg in [
+        "--model",
+        model,
+        "--safe-mode",
+        "--no-session-persistence",
+        "--permission-mode",
+        "dontAsk",
+        "--tools",
+        "",
+    ] {
         args.push(arg.into());
     }
     if let Some(effort) = reasoning_effort {
         args.push("--effort".into());
         args.push(effort.into());
     }
-    let completed = run_process(&args, prompt, cwd).map_err(|error| {
-        BatchFailure::plain(format!("could not start claude backend: {error}"))
-    })?;
+    let completed = run_process(&args, prompt, cwd)
+        .map_err(|error| BatchFailure::plain(format!("could not start claude backend: {error}")))?;
     let raw_output = py_trim(&completed.stdout).to_string();
     let root: Option<Value> = if raw_output.is_empty() {
         None
@@ -2136,10 +2142,7 @@ pub(crate) fn run_claude_json(
     } else {
         crate::token_usage::parse_claude_json_usage(&raw_output).ok()
     };
-    if (root.is_none() || usage.is_none())
-        && completed.returncode == 0
-        && !raw_output.is_empty()
-    {
+    if (root.is_none() || usage.is_none()) && completed.returncode == 0 && !raw_output.is_empty() {
         let message = match crate::token_usage::parse_claude_json_usage(&raw_output) {
             Err(error) => error,
             Ok(_) => "invalid Claude JSON result".to_string(),
@@ -2223,13 +2226,7 @@ fn claude_batch(
     let temp = TempDir::new("wrkviz-summary-").map_err(BatchFailure::plain)?;
     let jobs: Vec<SummaryJob> = pending.iter().map(|item| item.job.clone()).collect();
     let prompt = build_summary_prompt(&jobs).map_err(BatchFailure::plain)?;
-    let result = run_claude_json(
-        claude_command,
-        &prompt,
-        model,
-        reasoning_effort,
-        &temp.path,
-    )?;
+    let result = run_claude_json(claude_command, &prompt, model, reasoning_effort, &temp.path)?;
     // Claude transport errors retain usage but no backend output audit.
     match parse_backend_output_with_repairs(&result.output, pending, model, &utc_now_iso()) {
         Ok(parsed) => Ok(CodexOutcome {
@@ -2353,28 +2350,32 @@ fn run_backend_batch(
 ) -> Result<GeneratedBatch, BatchFailure> {
     let started_at = utc_now_iso();
     let input_hashes: Vec<String> = batch.iter().map(|item| item.input_hash.clone()).collect();
-    let outcome: Result<BatchOutcome, BatchFailure> =
-        (|| {
-            if backend == "heuristic" {
-                Ok((heuristic_batch(batch, model), Some(TokenUsage::default()), Vec::new(), None))
-            } else if backend == "codex" {
-                let outcome = codex_batch(batch, model, reasoning_effort, service_tier, codex_command)?;
-                Ok((
-                    outcome.parsed.results,
-                    outcome.usage,
-                    outcome.parsed.repairs,
-                    Some(outcome.raw_output),
-                ))
-            } else {
-                let outcome = claude_batch(batch, model, reasoning_effort, claude_command)?;
-                Ok((
-                    outcome.parsed.results,
-                    outcome.usage,
-                    outcome.parsed.repairs,
-                    Some(outcome.raw_output),
-                ))
-            }
-        })();
+    let outcome: Result<BatchOutcome, BatchFailure> = (|| {
+        if backend == "heuristic" {
+            Ok((
+                heuristic_batch(batch, model),
+                Some(TokenUsage::default()),
+                Vec::new(),
+                None,
+            ))
+        } else if backend == "codex" {
+            let outcome = codex_batch(batch, model, reasoning_effort, service_tier, codex_command)?;
+            Ok((
+                outcome.parsed.results,
+                outcome.usage,
+                outcome.parsed.repairs,
+                Some(outcome.raw_output),
+            ))
+        } else {
+            let outcome = claude_batch(batch, model, reasoning_effort, claude_command)?;
+            Ok((
+                outcome.parsed.results,
+                outcome.usage,
+                outcome.parsed.repairs,
+                Some(outcome.raw_output),
+            ))
+        }
+    })();
     let (results, usage, repairs, raw_output) = match outcome {
         Ok(values) => values,
         Err(error) => {
@@ -2608,8 +2609,10 @@ pub fn summarize_jobs(
             let mut enriched = result.clone();
             enriched.artifact_provenance = Some(provenance);
             write_json_if_changed(&item.cache_path, &cache_json(&enriched)?)?;
-            generated_receipt_by_key
-                .insert(item.job.key.clone(), batch_result.receipt.receipt_id.clone());
+            generated_receipt_by_key.insert(
+                item.job.key.clone(),
+                batch_result.receipt.receipt_id.clone(),
+            );
             generated.insert(item.job.key.clone(), enriched);
         }
         new_receipts.push(batch_result.receipt.clone());
@@ -2682,7 +2685,10 @@ pub fn summarize_jobs(
         // retry sequentially, as the Python executor loop does.
         let outcomes: Vec<Option<Result<GeneratedBatch, BatchFailure>>> = {
             let slots: Vec<std::sync::Mutex<Option<Result<GeneratedBatch, BatchFailure>>>> =
-                batches.iter().map(|_| std::sync::Mutex::new(None)).collect();
+                batches
+                    .iter()
+                    .map(|_| std::sync::Mutex::new(None))
+                    .collect();
             let next_index = std::sync::atomic::AtomicUsize::new(0);
             let stop = std::sync::atomic::AtomicBool::new(false);
             std::thread::scope(|scope| {
@@ -2691,18 +2697,18 @@ pub fn summarize_jobs(
                         if stop.load(std::sync::atomic::Ordering::SeqCst) {
                             break;
                         }
-                        let index = next_index
-                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let index = next_index.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         if index >= batches.len() {
                             break;
                         }
                         let result = run_one(&batches[index]);
                         if let Err(error) = &result {
-                            let retryable = error.message.starts_with(
-                                "codex output: missing summaries for ",
-                            ) || error.message.starts_with(
-                                "codex output: summaries under invented keys ",
-                            );
+                            let retryable = error
+                                .message
+                                .starts_with("codex output: missing summaries for ")
+                                || error
+                                    .message
+                                    .starts_with("codex output: summaries under invented keys ");
                             if !retryable && error.message != "__budget_refusal__" {
                                 stop.store(true, std::sync::atomic::Ordering::SeqCst);
                             }
@@ -2735,8 +2741,12 @@ pub fn summarize_jobs(
                         refused_jobs += batch.len();
                         continue;
                     }
-                    let retryable = error.message.starts_with("codex output: missing summaries for ")
-                        || error.message.starts_with("codex output: summaries under invented keys ");
+                    let retryable = error
+                        .message
+                        .starts_with("codex output: missing summaries for ")
+                        || error
+                            .message
+                            .starts_with("codex output: summaries under invented keys ");
                     if first_error.is_none() && retryable {
                         if batch.len() > 1 {
                             for item in batch {
@@ -2873,8 +2883,7 @@ pub fn summarize_jobs(
             newly_spent_usage: accounting.newly_spent_usage,
             newly_spent_unknown_receipts: accounting.newly_spent_unknown_receipts,
             artifact_generation_usage: accounting.artifact_generation_usage,
-            artifact_generation_unknown_receipts: accounting
-                .artifact_generation_unknown_receipts,
+            artifact_generation_unknown_receipts: accounting.artifact_generation_unknown_receipts,
             unknown_legacy_artifacts: unknown_legacy,
             usage_run_path: Some(accounting.path),
         },

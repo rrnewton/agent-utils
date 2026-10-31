@@ -35,7 +35,10 @@ fn identity_json(
     let mut out = serde_json::Map::new();
     out.insert("summarizer_id".into(), Value::String(summarizer_id.into()));
     out.insert("summarizer_version".into(), summarizer_version.into());
-    out.insert("prompt_version".into(), Value::String(prompt_version.into()));
+    out.insert(
+        "prompt_version".into(),
+        Value::String(prompt_version.into()),
+    );
     out.insert("output_schema_version".into(), output_schema_version.into());
     out.insert("logical_key".into(), Value::String(logical_key.into()));
     out.insert("team_slug".into(), Value::String(team_slug.into()));
@@ -175,10 +178,19 @@ impl SummaryArtifactProvenance {
             Value::Object(map) => map,
             _ => unreachable!(),
         };
-        out.insert("artifact_id".into(), Value::String(self.artifact_id.clone()));
-        out.insert("generated_at".into(), Value::String(self.generated_at.clone()));
+        out.insert(
+            "artifact_id".into(),
+            Value::String(self.artifact_id.clone()),
+        );
+        out.insert(
+            "generated_at".into(),
+            Value::String(self.generated_at.clone()),
+        );
         out.insert("usage_receipt_id".into(), opt(&self.usage_receipt_id));
-        out.insert("context_coverage".into(), self.context_coverage.to_json_obj());
+        out.insert(
+            "context_coverage".into(),
+            self.context_coverage.to_json_obj(),
+        );
         out.insert(
             "dependency_keys".into(),
             Value::Array(
@@ -224,7 +236,9 @@ impl SummaryArtifactProvenance {
         let opt_string = |key: &str| -> Result<Option<String>, String> {
             match get(key) {
                 Value::Null => Ok(None),
-                value => Ok(Some(as_string(value, &format!("{where_}.{key}"))?.to_string())),
+                value => Ok(Some(
+                    as_string(value, &format!("{where_}.{key}"))?.to_string(),
+                )),
             }
         };
         let legacy_storage = match get("legacy_storage") {
@@ -234,9 +248,8 @@ impl SummaryArtifactProvenance {
         let raw_deps = as_array(get("dependency_keys"), &format!("{where_}.dependency_keys"))?;
         let mut dependency_keys = Vec::new();
         for (index, item) in raw_deps.iter().enumerate() {
-            dependency_keys.push(
-                as_string(item, &format!("{where_}.dependency_keys[{index}]"))?.to_string(),
-            );
+            dependency_keys
+                .push(as_string(item, &format!("{where_}.dependency_keys[{index}]"))?.to_string());
         }
         let provenance = Self {
             artifact_id: as_string(get("artifact_id"), &format!("{where_}.artifact_id"))?

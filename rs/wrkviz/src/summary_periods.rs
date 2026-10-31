@@ -28,8 +28,12 @@ pub struct Period {
 }
 
 fn parse_zone(name: &str) -> Result<Tz, String> {
-    name.parse::<Tz>()
-        .map_err(|_| format!("unknown display timezone {}", crate::json::py_repr_str(name)))
+    name.parse::<Tz>().map_err(|_| {
+        format!(
+            "unknown display timezone {}",
+            crate::json::py_repr_str(name)
+        )
+    })
 }
 
 fn midnight(day: NaiveDate, zone: Tz) -> i64 {
@@ -75,12 +79,7 @@ fn daily(day: NaiveDate, zone: Tz, team: &str, last_ms: i64) -> Period {
     Period {
         kind: "daily".into(),
         key: key.clone(),
-        label: format!(
-            "{} {} {}",
-            day.format("%a"),
-            day.format("%b"),
-            day.day()
-        ),
+        label: format!("{} {} {}", day.format("%a"), day.format("%b"), day.day()),
         start_ms: start,
         end_ms: end,
         relative_path: format!(
@@ -127,11 +126,7 @@ fn weekly(day: NaiveDate, zone: Tz, team: &str, last_ms: i64) -> Period {
     Period {
         kind: "weekly".into(),
         key: key.clone(),
-        label: format!(
-            "Week {number} · {} {}",
-            monday.format("%b"),
-            monday.day()
-        ),
+        label: format!("Week {number} · {} {}", monday.format("%b"), monday.day()),
         start_ms: start,
         end_ms: end,
         relative_path: format!("teams/{team}/summaries/weekly/{year}/{key}-{team}-weekly.md"),
@@ -274,7 +269,12 @@ pub fn periods_for_range(
             result.push(quarterly(day, zone, team_slug, last_ms));
         }
     }
-    let order = |kind: &str| ROLLUP_KINDS.iter().position(|item| *item == kind).unwrap_or(9);
+    let order = |kind: &str| {
+        ROLLUP_KINDS
+            .iter()
+            .position(|item| *item == kind)
+            .unwrap_or(9)
+    };
     result.sort_by(|a, b| {
         a.start_ms
             .cmp(&b.start_ms)
@@ -289,16 +289,17 @@ pub fn period_heading(period: &Period, display_timezone: &str) -> String {
     let Ok(zone) = parse_zone(display_timezone) else {
         return period.label.clone();
     };
-    let start = zone
-        .timestamp_millis_opt(period.start_ms)
-        .single()
-        .unwrap();
+    let start = zone.timestamp_millis_opt(period.start_ms).single().unwrap();
     let end = zone.timestamp_millis_opt(period.end_ms).single().unwrap();
     let end_inclusive = end - chrono::Duration::milliseconds(1);
     let suffix = if period.partial { " (partial)" } else { "" };
     match period.kind.as_str() {
         "hourly" => format!("{}{suffix}", start.format("%Y-%m-%d %a %H:%M %Z")),
-        "daily" => format!("{} {}{suffix}", start.format("%Y-%m-%d"), start.format("%a")),
+        "daily" => format!(
+            "{} {}{suffix}",
+            start.format("%Y-%m-%d"),
+            start.format("%a")
+        ),
         "weekly" => format!(
             "{} · {} to {}{suffix}",
             period.key,

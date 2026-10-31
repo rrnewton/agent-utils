@@ -9,35 +9,28 @@ use serde_json::Value;
 use sha2::Digest as _;
 
 use crate::build_store::validate_team_slug;
-use crate::json::{
-    as_array, as_int, as_object, as_string, dump_canonical, py_repr_str, read_json,
-};
-use crate::naming::{
-    cached_agent_name, name_agents, AgentNameJob, AgentNameResult,
-};
+use crate::json::{as_array, as_int, as_object, as_string, dump_canonical, py_repr_str, read_json};
+use crate::naming::{cached_agent_name, name_agents, AgentNameJob, AgentNameResult};
 use crate::pipeline::load_archived_team;
+use crate::summarize_core::{
+    cached_summary, carried_forward_summary, char_len, char_take, clean_summary_result, one_line,
+    py_trim, record_rollup_inputs, summarize_jobs, SummaryJob, SummaryResult, SummaryRunStats,
+    WorkBullet,
+};
 use crate::summary_artifacts::SummaryArtifactProvenance;
 use crate::summary_budget::{
-    calibrate, load_state, running_state, write_state, Prices, SpendGuard, StageCount,
-    SummaryPlan, AGENT_NAME_KIND, OVERVIEW_KIND, PHASE_KIND,
+    calibrate, load_state, running_state, write_state, Prices, SpendGuard, StageCount, SummaryPlan,
+    AGENT_NAME_KIND, OVERVIEW_KIND, PHASE_KIND,
 };
 use crate::summary_catalog::{
-    load_summary_catalog, merge_summary_catalog, select_summary_artifact,
-    SummaryArtifactCatalog, SummaryArtifactReference,
+    load_summary_catalog, merge_summary_catalog, select_summary_artifact, SummaryArtifactCatalog,
+    SummaryArtifactReference,
 };
 use crate::summary_periods::{periods_for_range, Period, ROLLUP_KINDS};
-use crate::summary_phases::{
-    aggregate_stats, build_phases, phase_agent_ids, PhaseWindow,
-};
+use crate::summary_phases::{aggregate_stats, build_phases, phase_agent_ids, PhaseWindow};
 use crate::summary_registry::{
-    registry_json_obj, ContextComponent, ContextCoverage,
-    PROJECT_OVERVIEW_SUMMARIZER, PLAIN_LANGUAGE_ROLLUP_STYLE,
-    PROJECT_OVERVIEW_STYLE, TECHNICAL_ROLLUP_STYLE,
-};
-use crate::summarize_core::{
-    cached_summary, carried_forward_summary, char_len, char_take, clean_summary_result,
-    one_line, py_trim, record_rollup_inputs, summarize_jobs,
-    SummaryJob, SummaryResult, SummaryRunStats, WorkBullet,
+    registry_json_obj, ContextComponent, ContextCoverage, PLAIN_LANGUAGE_ROLLUP_STYLE,
+    PROJECT_OVERVIEW_STYLE, PROJECT_OVERVIEW_SUMMARIZER, TECHNICAL_ROLLUP_STYLE,
 };
 use crate::team_data::{Agent, TeamData};
 use crate::token_usage::TokenUsage;
@@ -90,8 +83,7 @@ fn plain_language_context_text(project_overview: &str, terms: &[GlossaryTerm]) -
         .collect();
     if supported.is_empty() {
         lines.push(
-            "- No model-backed glossary definitions are supported by current evidence."
-                .to_string(),
+            "- No model-backed glossary definitions are supported by current evidence.".to_string(),
         );
     } else {
         for term in supported {
@@ -178,7 +170,10 @@ fn overview_input_from_events(
         if remaining <= char_len(&prefix) {
             break;
         }
-        let line = format!("{prefix}{}", one_line(event.text.as_deref().unwrap_or_default()));
+        let line = format!(
+            "{prefix}{}",
+            one_line(event.text.as_deref().unwrap_or_default())
+        );
         let excerpt = char_take(&line, remaining);
         if !excerpt.is_empty() {
             parts.push(excerpt.clone());
@@ -222,10 +217,7 @@ fn overview_input_from_events(
     }
 }
 
-fn root_overview_input(
-    team: &TeamData,
-    epoch: Option<KnowledgeEpoch>,
-) -> ProjectOverviewInput {
+fn root_overview_input(team: &TeamData, epoch: Option<KnowledgeEpoch>) -> ProjectOverviewInput {
     let epoch = epoch.unwrap_or_else(|| current_knowledge_epoch(team));
     let mut events: Vec<crate::team_data::Event> = team
         .events
@@ -361,7 +353,10 @@ fn require_exact_keys(
     if !extra.is_empty() {
         details.push(format!("extra {}", extra.join(", ")));
     }
-    Err(format!("{where_}: schema mismatch ({})", details.join("; ")))
+    Err(format!(
+        "{where_}: schema mismatch ({})",
+        details.join("; ")
+    ))
 }
 
 fn knowledge_epoch_from_json(value: &Value, where_: &str) -> Result<KnowledgeEpoch, String> {
@@ -383,7 +378,10 @@ fn knowledge_epoch_from_json(value: &Value, where_: &str) -> Result<KnowledgeEpo
     }
     Ok(KnowledgeEpoch {
         epoch_id: epoch_id.to_string(),
-        cutoff_ms: as_int(obj.get("cutoff_ms").unwrap(), &format!("{where_}.cutoff_ms"))?,
+        cutoff_ms: as_int(
+            obj.get("cutoff_ms").unwrap(),
+            &format!("{where_}.cutoff_ms"),
+        )?,
         cutoff_reason: cutoff_reason.to_string(),
     })
 }
@@ -416,13 +414,24 @@ fn frozen_project_overview_input(
     }
     require_exact_keys(
         obj,
-        &["schema_version", "style", "knowledge_epoch", "source", "summary"],
+        &[
+            "schema_version",
+            "style",
+            "knowledge_epoch",
+            "source",
+            "summary",
+        ],
         &path.display().to_string(),
     )?;
-    if as_string(obj.get("style").unwrap(), &format!("{}.style", path.display()))?
-        != PROJECT_OVERVIEW_STYLE
+    if as_string(
+        obj.get("style").unwrap(),
+        &format!("{}.style", path.display()),
+    )? != PROJECT_OVERVIEW_STYLE
     {
-        return Err(format!("{}: invalid project-overview style", path.display()));
+        return Err(format!(
+            "{}: invalid project-overview style",
+            path.display()
+        ));
     }
     let epoch = knowledge_epoch_from_json(
         obj.get("knowledge_epoch").unwrap(),
@@ -442,9 +451,8 @@ fn frozen_project_overview_input(
         source.get("event_ids").unwrap(),
         &format!("{}.source.event_ids", path.display()),
     )? {
-        event_ids.push(
-            as_string(item, &format!("{}.source.event_ids[]", path.display()))?.to_string(),
-        );
+        event_ids
+            .push(as_string(item, &format!("{}.source.event_ids[]", path.display()))?.to_string());
     }
     let start_ms = as_int(
         source.get("start_ms").unwrap(),
@@ -983,13 +991,14 @@ fn rollup_job_for_period(
         .min()
         .unwrap_or(period.start_ms);
     let previous_period = completed_same_level.last().map(|(item, _)| item);
-    let frontier_status = if period.start_ms <= earliest_activity && earliest_activity < period.end_ms {
-        "project-start"
-    } else if previous_period.is_some_and(|item| item.end_ms == period.start_ms) {
-        "contiguous-extension"
-    } else {
-        "isolated-backfill"
-    };
+    let frontier_status =
+        if period.start_ms <= earliest_activity && earliest_activity < period.end_ms {
+            "project-start"
+        } else if previous_period.is_some_and(|item| item.end_ms == period.start_ms) {
+            "contiguous-extension"
+        } else {
+            "isolated-backfill"
+        };
     let mut expected_prior = 0i64;
     if earliest_activity < period.start_ms {
         expected_prior = periods_for_range(
@@ -1000,7 +1009,7 @@ fn rollup_job_for_period(
             std::slice::from_ref(&period.kind),
         )?
         .len()
-            .min(10) as i64;
+        .min(10) as i64;
     }
     let mut components = vec![
         ContextComponent {
@@ -1035,10 +1044,7 @@ fn rollup_job_for_period(
     let coverage = ContextCoverage::new(
         components,
         frontier_status,
-        prior
-            .iter()
-            .map(|(item, _)| period_key(item))
-            .collect(),
+        prior.iter().map(|(item, _)| period_key(item)).collect(),
         true,
     )
     .unwrap_or_default();
@@ -1052,7 +1058,10 @@ fn rollup_job_for_period(
     let mut job = SummaryJob::phase(
         &format!("{key_prefix}:{}:{}", period.kind, period.key),
         &team.team_slug,
-        &format!("{audience} {} super-summary · {}", period.kind, period.label),
+        &format!(
+            "{audience} {} super-summary · {}",
+            period.kind, period.label
+        ),
         period.start_ms,
         period.end_ms,
         prior_context,
@@ -1149,10 +1158,8 @@ fn walk_rollups(
                 None,
                 None,
             )?;
-            let own_known = children_known
-                && !lower
-                    .iter()
-                    .any(|item| unknown.contains(&period_key(item)));
+            let own_known =
+                children_known && !lower.iter().any(|item| unknown.contains(&period_key(item)));
             let prior_known = !prior_same_level(&completed, period)
                 .iter()
                 .any(|(item, _)| unknown.contains(&period_key(item)));
@@ -1208,12 +1215,7 @@ fn walk_rollups(
         previous_periods = current.clone();
         previous_results = current
             .iter()
-            .map(|period| {
-                (
-                    period_key(period),
-                    all_results[&period_key(period)].clone(),
-                )
-            })
+            .map(|period| (period_key(period), all_results[&period_key(period)].clone()))
             .collect();
         previous_plain_results = current
             .iter()
@@ -1257,7 +1259,9 @@ fn agent_name_jobs(
             .cloned()
             .unwrap_or_default();
         own_phases.sort_by(|a, b| {
-            a.start_ms.cmp(&b.start_ms).then(a.phase_id.cmp(&b.phase_id))
+            a.start_ms
+                .cmp(&b.start_ms)
+                .then(a.phase_id.cmp(&b.phase_id))
         });
         let work_lines: Vec<String> = own_phases
             .iter()
@@ -1353,10 +1357,7 @@ fn agent_name_json(job: &AgentNameJob, result: &AgentNameResult) -> Value {
         Value::String(result.short_name.clone()),
     );
     name.insert("rationale".into(), Value::String(result.rationale.clone()));
-    name.insert(
-        "lifetime_summary".into(),
-        opt(&result.lifetime_summary),
-    );
+    name.insert("lifetime_summary".into(), opt(&result.lifetime_summary));
     name.insert("model".into(), Value::String(result.model.clone()));
     name.insert(
         "prompt_version".into(),
@@ -1409,10 +1410,7 @@ fn write_phase_data(
         obj.insert("agent_id".into(), Value::String(phase.agent_id.clone()));
         obj.insert("start_ms".into(), phase.start_ms.into());
         obj.insert("end_ms".into(), phase.end_ms.into());
-        obj.insert(
-            "summary".into(),
-            summary_json(&results[&phase.summary_key]),
-        );
+        obj.insert("summary".into(), summary_json(&results[&phase.summary_key]));
         if write_json_if_changed(
             &summary_root(archive, team_slug)?
                 .join("phases")
@@ -1458,10 +1456,14 @@ fn validate_project_overview(summary: &SummaryResult, where_: &str) -> Result<()
         summary.phrase.as_str(),
         "Project overview supported" | "Insufficient evidence"
     ) {
-        return Err(format!("{where_}: invalid project-overview evidence status"));
+        return Err(format!(
+            "{where_}: invalid project-overview evidence status"
+        ));
     }
     if !summary.work_summary.is_empty() {
-        return Err(format!("{where_}: project overview must not contain work bullets"));
+        return Err(format!(
+            "{where_}: project overview must not contain work bullets"
+        ));
     }
     if summary.phrase == "Insufficient evidence"
         && !summary.paragraph.starts_with("Insufficient evidence:")
@@ -1506,10 +1508,7 @@ fn write_project_overview_data(
         "schema_version".into(),
         PROJECT_OVERVIEW_SCHEMA_VERSION.into(),
     );
-    obj.insert(
-        "style".into(),
-        Value::String(PROJECT_OVERVIEW_STYLE.into()),
-    );
+    obj.insert("style".into(), Value::String(PROJECT_OVERVIEW_STYLE.into()));
     obj.insert("knowledge_epoch".into(), source.epoch.to_json_obj());
     obj.insert("source".into(), Value::Object(source_obj));
     obj.insert("summary".into(), summary_json(summary));
@@ -1582,9 +1581,7 @@ impl SummarizeReport {
         );
         out.insert(
             "service_tier".into(),
-            self.service_tier
-                .clone()
-                .map_or(Value::Null, Value::String),
+            self.service_tier.clone().map_or(Value::Null, Value::String),
         );
         out.insert("phases".into(), self.phases.into());
         out.insert("rollups".into(), self.rollups.into());
@@ -1655,8 +1652,7 @@ fn period_range(team: &TeamData, phases: &[PhaseWindow]) -> Result<(i64, i64), S
     let end_ms = team.window_end_ms.or(phase_end);
     let (Some(start_ms), Some(end_ms)) = (start_ms, end_ms) else {
         return Err(
-            "selected timeline range contains no activity and lacks both date bounds"
-                .to_string(),
+            "selected timeline range contains no activity and lacks both date bounds".to_string(),
         );
     };
     if end_ms <= start_ms {
@@ -1716,9 +1712,7 @@ fn summary_tree(
     )?;
     let overview_source = match frozen_project_overview_input(archive, &team)? {
         FrozenOverview::Current(input) => input,
-        FrozenOverview::SourceChanged(epoch) => {
-            renewed_project_overview_input(&team, &epoch)
-        }
+        FrozenOverview::SourceChanged(epoch) => renewed_project_overview_input(&team, &epoch),
         FrozenOverview::None => root_overview_input(&team, None),
     };
     // Frozen may return None above via the None arm; root input covers it.
@@ -1812,14 +1806,7 @@ fn plan_tree(
     let mut unknown_phase_keys: BTreeSet<String> = BTreeSet::new();
     for job in &tree.phase_jobs {
         stages[phase_stage].total += 1;
-        let hit = cached_summary(
-            job,
-            &cache,
-            backend,
-            model,
-            reasoning_effort,
-            service_tier,
-        )?;
+        let hit = cached_summary(job, &cache, backend, model, reasoning_effort, service_tier)?;
         match hit {
             None => {
                 stages[phase_stage].to_generate += 1;
@@ -1901,11 +1888,7 @@ fn plan_tree(
                 (TECHNICAL_ROLLUP_STYLE, "technical"),
                 (PLAIN_LANGUAGE_ROLLUP_STYLE, "plain-language"),
             ] {
-                let index = add_stage(
-                    &format!("{kind} rollups ({audience})"),
-                    style,
-                    &mut stages,
-                );
+                let index = add_stage(&format!("{kind} rollups ({audience})"), style, &mut stages);
                 rollup_stage_index.insert((kind.to_string(), style.to_string()), index);
             }
         }
@@ -1915,23 +1898,11 @@ fn plan_tree(
                        own_known: bool,
                        prior_known: bool|
      -> Result<Option<SummaryResult>, String> {
-        let kind = job
-            .key
-            .split(':')
-            .nth(1)
-            .unwrap_or_default()
-            .to_string();
+        let kind = job.key.split(':').nth(1).unwrap_or_default().to_string();
         let stage_index = rollup_stage_index[&(kind, job.summary_style.clone())];
         stages[stage_index].total += 1;
         if own_known && prior_known {
-            let hit = cached_summary(
-                job,
-                &cache,
-                backend,
-                model,
-                reasoning_effort,
-                service_tier,
-            )?;
+            let hit = cached_summary(job, &cache, backend, model, reasoning_effort, service_tier)?;
             if let Some(hit) = hit {
                 stages[stage_index].cached += 1;
                 return Ok(Some(hit));
@@ -1975,13 +1946,7 @@ fn plan_tree(
     Ok(SummaryPlan {
         team_slug: tree.team.team_slug.clone(),
         stages,
-        costs: calibrate(
-            &cache,
-            &name_cache,
-            backend,
-            model,
-            reasoning_effort,
-        ),
+        costs: calibrate(&cache, &name_cache, backend, model, reasoning_effort),
         prices: options.prices,
         budget_usd: options.budget_usd,
         previous_state: unfinished_state(&tree.summary_root),
@@ -2004,10 +1969,8 @@ pub fn plan_summaries(
     model: &str,
     options: &SummarizeOptions,
 ) -> Result<SummaryPlan, String> {
-    let effective = crate::token_usage::resolve_service_tier(
-        backend,
-        options.service_tier.as_deref(),
-    )?;
+    let effective =
+        crate::token_usage::resolve_service_tier(backend, options.service_tier.as_deref())?;
     let mut tree_options = options.clone();
     tree_options.service_tier = effective.clone();
     // Python resolves the tier inside the locked helpers; keep the
@@ -2026,8 +1989,7 @@ fn accumulate_stats(stats: &[SummaryRunStats]) -> SummaryRunStats {
         out.newly_spent_usage += item.newly_spent_usage;
         out.newly_spent_unknown_receipts += item.newly_spent_unknown_receipts;
         out.artifact_generation_usage += item.artifact_generation_usage;
-        out.artifact_generation_unknown_receipts +=
-            item.artifact_generation_unknown_receipts;
+        out.artifact_generation_unknown_receipts += item.artifact_generation_unknown_receipts;
         out.unknown_legacy_artifacts += item.unknown_legacy_artifacts;
     }
     out
@@ -2087,10 +2049,7 @@ fn run_summary_tree(
     let reasoning_effort = options.reasoning_effort.as_deref();
     let service_tier = options.service_tier.as_deref();
     let mut changed: i64 = 0;
-    if write_json_if_changed(
-        &summary_root.join("summarizers.json"),
-        &registry_json_obj(),
-    )? {
+    if write_json_if_changed(&summary_root.join("summarizers.json"), &registry_json_obj())? {
         changed += 1;
     }
     let cache = summary_root.join("cache");
@@ -2142,15 +2101,10 @@ fn run_summary_tree(
     )?;
     let project_overview = overview_results[&tree.overview_job.key].clone();
     validate_project_overview(&project_overview, "generated project overview")?;
-    changed += write_project_overview_data(
-        archive,
-        team_slug,
-        &tree.overview_source,
-        &project_overview,
-    )?;
+    changed +=
+        write_project_overview_data(archive, team_slug, &tree.overview_source, &project_overview)?;
 
-    let mut backend_stats: Vec<SummaryRunStats> =
-        vec![phase_stats, name_stats, overview_stats];
+    let mut backend_stats: Vec<SummaryRunStats> = vec![phase_stats, name_stats, overview_stats];
     let mut carried_forward = 0i64;
 
     let mut resolve = |job: &SummaryJob,
@@ -2162,8 +2116,7 @@ fn run_summary_tree(
             job.key.split(':').nth(1).unwrap_or_default(),
             job.key
         );
-        if cached_summary(job, &cache, backend, model, reasoning_effort, service_tier)?.is_none()
-        {
+        if cached_summary(job, &cache, backend, model, reasoning_effort, service_tier)?.is_none() {
             let carried = carried_forward_summary(
                 job,
                 &index,
@@ -2227,10 +2180,7 @@ fn run_summary_tree(
         obj.insert("end_ms".into(), period.end_ms.into());
         obj.insert("partial".into(), Value::Bool(period.partial));
         obj.insert("technical_summary".into(), summary_json(result));
-        obj.insert(
-            "plain_language_summary".into(),
-            summary_json(plain_result),
-        );
+        obj.insert("plain_language_summary".into(), summary_json(plain_result));
         if write_json_if_changed(
             &summary_root
                 .join("rollups")
@@ -2302,8 +2252,7 @@ fn run_summary_tree(
         newly_spent_usage: combined.newly_spent_usage,
         newly_spent_unknown_receipts: combined.newly_spent_unknown_receipts,
         artifact_generation_usage: combined.artifact_generation_usage,
-        artifact_generation_unknown_receipts: combined
-            .artifact_generation_unknown_receipts,
+        artifact_generation_unknown_receipts: combined.artifact_generation_unknown_receipts,
         unknown_legacy_artifacts: combined.unknown_legacy_artifacts,
         usage_run_paths,
         files_changed: changed,
@@ -2352,8 +2301,7 @@ pub fn summarize_archive(
     options: &SummarizeOptions,
     on_plan: &dyn Fn(&SummaryPlan),
 ) -> Result<SummarizeReport, SummarizeFailure> {
-    let _lock = crate::pipeline::archive_writer_lock(archive)
-        .map_err(SummarizeFailure::Message)?;
+    let _lock = crate::pipeline::archive_writer_lock(archive).map_err(SummarizeFailure::Message)?;
     summarize_archive_locked(archive, team_slug, backend, model, options, on_plan)
 }
 
@@ -2365,11 +2313,9 @@ fn summarize_archive_locked(
     options: &SummarizeOptions,
     on_plan: &dyn Fn(&SummaryPlan),
 ) -> Result<SummarizeReport, SummarizeFailure> {
-    let effective = crate::token_usage::resolve_service_tier(
-        backend,
-        options.service_tier.as_deref(),
-    )
-    .map_err(SummarizeFailure::Message)?;
+    let effective =
+        crate::token_usage::resolve_service_tier(backend, options.service_tier.as_deref())
+            .map_err(SummarizeFailure::Message)?;
     let mut options = options.clone();
     options.service_tier = effective.clone();
     let options = &options;
@@ -2378,10 +2324,8 @@ fn summarize_archive_locked(
             "a summary budget needs model prices (--price)".to_string(),
         ));
     }
-    let tree = summary_tree(archive, team_slug, options)
-        .map_err(SummarizeFailure::Message)?;
-    let plan = plan_tree(&tree, backend, model, options)
-        .map_err(SummarizeFailure::Message)?;
+    let tree = summary_tree(archive, team_slug, options).map_err(SummarizeFailure::Message)?;
+    let plan = plan_tree(&tree, backend, model, options).map_err(SummarizeFailure::Message)?;
     on_plan(&plan);
     if plan.over_budget() {
         let estimate = plan.estimated_usd().unwrap_or(0.0);
@@ -2428,8 +2372,7 @@ fn summarize_archive_locked(
                 "spent_usd".into(),
                 guard.as_ref().map_or(Value::Null, |guard| {
                     let rounded = (guard.spent_usd() * 10_000.0).round() / 10_000.0;
-                    serde_json::Number::from_f64(rounded)
-                        .map_or(Value::Null, Value::Number)
+                    serde_json::Number::from_f64(rounded).map_or(Value::Null, Value::Number)
                 }),
             );
             write_state(&summary_root, &state).map_err(SummarizeFailure::Message)?;
@@ -2449,16 +2392,12 @@ fn summarize_archive_locked(
                 "spent_usd".into(),
                 guard.as_ref().map_or(Value::Null, |guard| {
                     let rounded = (guard.spent_usd() * 10_000.0).round() / 10_000.0;
-                    serde_json::Number::from_f64(rounded)
-                        .map_or(Value::Null, Value::Number)
+                    serde_json::Number::from_f64(rounded).map_or(Value::Null, Value::Number)
                 }),
             );
             let mut stopped = serde_json::Map::new();
             stopped.insert("reason".into(), Value::String(reason.into()));
-            stopped.insert(
-                "stage".into(),
-                Value::String(progress.borrow().clone()),
-            );
+            stopped.insert("stage".into(), Value::String(progress.borrow().clone()));
             stopped.insert(
                 "detail".into(),
                 Value::String(if matches!(failure, SummarizeFailure::Interrupted) {

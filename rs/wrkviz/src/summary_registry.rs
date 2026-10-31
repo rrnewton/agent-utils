@@ -367,7 +367,12 @@ pub fn summarizer_for_style(style: &str) -> Result<&'static SummarizerSpec, Stri
     summarizer_registry()
         .into_iter()
         .find(|spec| spec.summary_style == style)
-        .ok_or_else(|| format!("unregistered summary style {}", crate::json::py_repr_str(style)))
+        .ok_or_else(|| {
+            format!(
+                "unregistered summary style {}",
+                crate::json::py_repr_str(style)
+            )
+        })
 }
 
 /// The registered contract for one durable summarizer id.
@@ -375,7 +380,12 @@ pub fn summarizer_for_id(id: &str) -> Result<&'static SummarizerSpec, String> {
     summarizer_registry()
         .into_iter()
         .find(|spec| spec.summarizer_id == id)
-        .ok_or_else(|| format!("unregistered summarizer ID {}", crate::json::py_repr_str(id)))
+        .ok_or_else(|| {
+            format!(
+                "unregistered summarizer ID {}",
+                crate::json::py_repr_str(id)
+            )
+        })
 }
 
 /// Resolve a prompt identifier to its registered contract revision.
@@ -460,7 +470,10 @@ impl ContextComponent {
         out.insert("requested".into(), self.requested.into());
         out.insert("provided".into(), self.provided.into());
         out.insert("unit".into(), Value::String(self.unit.clone()));
-        out.insert("coverage_basis_points".into(), self.coverage_basis_points().into());
+        out.insert(
+            "coverage_basis_points".into(),
+            self.coverage_basis_points().into(),
+        );
         Value::Object(out)
     }
 
@@ -480,7 +493,10 @@ impl ContextComponent {
         }
         let result = Self::new(
             as_string(obj.get("name").unwrap(), &format!("{where_}.name"))?,
-            as_int(obj.get("requested").unwrap(), &format!("{where_}.requested"))?,
+            as_int(
+                obj.get("requested").unwrap(),
+                &format!("{where_}.requested"),
+            )?,
             as_int(obj.get("provided").unwrap(), &format!("{where_}.provided"))?,
             as_string(obj.get("unit").unwrap(), &format!("{where_}.unit"))?,
         )?;
@@ -489,7 +505,9 @@ impl ContextComponent {
             &format!("{where_}.coverage_basis_points"),
         )?;
         if recorded != result.coverage_basis_points() {
-            return Err(format!("{where_}: context coverage does not match raw counts"));
+            return Err(format!(
+                "{where_}: context coverage does not match raw counts"
+            ));
         }
         Ok(result)
     }
@@ -669,9 +687,8 @@ impl ContextCoverage {
         )?;
         let mut predecessor_keys = Vec::new();
         for (index, item) in raw_predecessors.iter().enumerate() {
-            predecessor_keys.push(
-                as_string(item, &format!("{where_}.predecessor_keys[{index}]"))?.to_string(),
-            );
+            predecessor_keys
+                .push(as_string(item, &format!("{where_}.predecessor_keys[{index}]"))?.to_string());
         }
         let result = Self::new(
             components,

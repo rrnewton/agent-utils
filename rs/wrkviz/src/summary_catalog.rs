@@ -16,9 +16,7 @@ pub const SUMMARY_CATALOG_SCHEMA_VERSION: i64 = 1;
 fn validate_relative_path(value: &str) -> Result<String, String> {
     let invalid = value.is_empty()
         || value.starts_with('/')
-        || value
-            .split('/')
-            .any(|part| matches!(part, "" | "." | ".."));
+        || value.split('/').any(|part| matches!(part, "" | "." | ".."));
     if invalid {
         return Err(format!(
             "unsafe summary artifact cache path {}",
@@ -39,16 +37,11 @@ pub struct SummaryArtifactReference {
 
 impl SummaryArtifactReference {
     /// Construct, validating the path/hash agreement.
-    pub fn new(
-        provenance: SummaryArtifactProvenance,
-        cache_path: &str,
-    ) -> Result<Self, String> {
+    pub fn new(provenance: SummaryArtifactProvenance, cache_path: &str) -> Result<Self, String> {
         validate_relative_path(cache_path)?;
         let filename = cache_path.rsplit('/').next().unwrap_or_default();
         if filename != format!("{}.json", provenance.input_hash) {
-            return Err(
-                "summary artifact cache filename does not match input hash".to_string(),
-            );
+            return Err("summary artifact cache filename does not match input hash".to_string());
         }
         Ok(Self {
             provenance,
@@ -60,10 +53,7 @@ impl SummaryArtifactReference {
     pub fn to_json_obj(&self) -> Value {
         let mut out = serde_json::Map::new();
         out.insert("artifact".into(), self.provenance.to_json_obj());
-        out.insert(
-            "cache_path".into(),
-            Value::String(self.cache_path.clone()),
-        );
+        out.insert("cache_path".into(), Value::String(self.cache_path.clone()));
         Value::Object(out)
     }
 
@@ -71,7 +61,9 @@ impl SummaryArtifactReference {
     pub fn from_json_obj(value: &Value, where_: &str) -> Result<Self, String> {
         let obj = as_object(value, where_)?;
         if obj.len() != 2 || !obj.contains_key("artifact") || !obj.contains_key("cache_path") {
-            return Err(format!("{where_}: invalid summary artifact reference fields"));
+            return Err(format!(
+                "{where_}: invalid summary artifact reference fields"
+            ));
         }
         Self::new(
             SummaryArtifactProvenance::from_json_obj(
@@ -102,9 +94,7 @@ fn record_order(
     )
 }
 
-fn ordered_records(
-    mut records: Vec<SummaryArtifactReference>,
-) -> Vec<SummaryArtifactReference> {
+fn ordered_records(mut records: Vec<SummaryArtifactReference>) -> Vec<SummaryArtifactReference> {
     records.sort_by_key(record_order);
     records
 }
@@ -120,10 +110,7 @@ pub struct SummaryArtifactCatalog {
 
 impl SummaryArtifactCatalog {
     /// Construct, validating canonical order and uniqueness.
-    pub fn new(
-        team_slug: &str,
-        records: Vec<SummaryArtifactReference>,
-    ) -> Result<Self, String> {
+    pub fn new(team_slug: &str, records: Vec<SummaryArtifactReference>) -> Result<Self, String> {
         if team_slug.is_empty() {
             return Err("summary artifact catalog team slug must not be empty".to_string());
         }
@@ -137,7 +124,10 @@ impl SummaryArtifactCatalog {
         if ids.len() != total {
             return Err("summary artifact catalog contains duplicate artifact IDs".to_string());
         }
-        if records.iter().any(|item| item.provenance.team_slug != team_slug) {
+        if records
+            .iter()
+            .any(|item| item.provenance.team_slug != team_slug)
+        {
             return Err("summary artifact catalog mixes team slugs".to_string());
         }
         if records != ordered_records(records.clone()) {
@@ -180,7 +170,10 @@ impl SummaryArtifactCatalog {
             Value::Object(out)
         };
         let mut out = serde_json::Map::new();
-        out.insert("schema_version".into(), SUMMARY_CATALOG_SCHEMA_VERSION.into());
+        out.insert(
+            "schema_version".into(),
+            SUMMARY_CATALOG_SCHEMA_VERSION.into(),
+        );
         out.insert("team_slug".into(), Value::String(self.team_slug.clone()));
         out.insert("artifact_count".into(), (self.records.len() as i64).into());
         out.insert("logical_key_count".into(), (logical.len() as i64).into());
@@ -215,12 +208,19 @@ impl SummaryArtifactCatalog {
         if obj.len() != expected.len() || !expected.iter().all(|key| obj.contains_key(*key)) {
             return Err(format!("{where_}: invalid summary artifact catalog fields"));
         }
-        if as_int(obj.get("schema_version").unwrap(), &format!("{where_}.schema_version"))?
-            != SUMMARY_CATALOG_SCHEMA_VERSION
+        if as_int(
+            obj.get("schema_version").unwrap(),
+            &format!("{where_}.schema_version"),
+        )? != SUMMARY_CATALOG_SCHEMA_VERSION
         {
-            return Err(format!("{where_}: unsupported summary artifact catalog schema"));
+            return Err(format!(
+                "{where_}: unsupported summary artifact catalog schema"
+            ));
         }
-        let raw = as_array(obj.get("artifacts").unwrap(), &format!("{where_}.artifacts"))?;
+        let raw = as_array(
+            obj.get("artifacts").unwrap(),
+            &format!("{where_}.artifacts"),
+        )?;
         let mut records = Vec::new();
         for (index, item) in raw.iter().enumerate() {
             records.push(SummaryArtifactReference::from_json_obj(
@@ -229,7 +229,10 @@ impl SummaryArtifactCatalog {
             )?);
         }
         let catalog = Self::new(
-            as_string(obj.get("team_slug").unwrap(), &format!("{where_}.team_slug"))?,
+            as_string(
+                obj.get("team_slug").unwrap(),
+                &format!("{where_}.team_slug"),
+            )?,
             ordered_records(records),
         )?;
         let rendered = catalog.to_json_obj();
@@ -301,10 +304,8 @@ pub fn merge_summary_catalog(
         }
         by_id.insert(artifact_id, addition.clone());
     }
-    let catalog = SummaryArtifactCatalog::new(
-        team_slug,
-        ordered_records(by_id.into_values().collect()),
-    )?;
+    let catalog =
+        SummaryArtifactCatalog::new(team_slug, ordered_records(by_id.into_values().collect()))?;
     let changed = write_json_if_changed(path, &catalog.to_json_obj())?;
     Ok((catalog, changed))
 }

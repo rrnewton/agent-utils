@@ -9,18 +9,16 @@ use sha2::Digest as _;
 use crate::json::{
     as_array, as_int, as_object, as_string, dump_canonical, dump_compact, py_repr_str, read_json,
 };
+use crate::summarize_core::{
+    clean_summary_prose, initialize_codex_workspace, one_line, py_trim, run_process, shorten,
+    utc_now_iso, SummaryRunStats, TempDir,
+};
 use crate::summary_artifacts::{
     make_summary_provenance, SummaryArtifactProvenance, ARTIFACT_ENVELOPE_FORMAT,
     ARTIFACT_ENVELOPE_VERSION,
 };
 use crate::summary_budget::SpendGuard;
-use crate::summary_registry::{
-    summarizer_for_style, ContextCoverage, AGENT_LIFETIME_SUMMARIZER,
-};
-use crate::summarize_core::{
-    clean_summary_prose, initialize_codex_workspace, one_line, py_trim, run_process, shorten,
-    utc_now_iso, SummaryRunStats, TempDir,
-};
+use crate::summary_registry::{summarizer_for_style, ContextCoverage, AGENT_LIFETIME_SUMMARIZER};
 use crate::token_usage::{
     content_hash_json, load_batch_receipt, resolve_service_tier, write_batch_receipt,
     write_usage_run_receipt, BatchUsageReceipt, TokenUsage, DEFAULT_SERVICE_TIER,
@@ -198,7 +196,11 @@ pub fn validate_job(job: &AgentNameJob) -> Result<(), String> {
             py_repr_str(&job.key)
         ));
     }
-    if job.dependency_keys.iter().any(|key| py_trim(key).is_empty()) {
+    if job
+        .dependency_keys
+        .iter()
+        .any(|key| py_trim(key).is_empty())
+    {
         return Err(format!(
             "agent name job {} has an empty dependency key",
             py_repr_str(&job.key)
@@ -225,7 +227,10 @@ fn job_json(job: &AgentNameJob) -> Value {
         "official_path".into(),
         Value::String(job.official_path.clone()),
     );
-    out.insert("coordinator_nickname".into(), opt(&job.coordinator_nickname));
+    out.insert(
+        "coordinator_nickname".into(),
+        opt(&job.coordinator_nickname),
+    );
     out.insert("role".into(), opt(&job.role));
     out.insert("depth".into(), job.depth.into());
     out.insert(
@@ -288,7 +293,10 @@ fn input_hash(
 ) -> String {
     let spec = &AGENT_LIFETIME_SUMMARIZER;
     let mut payload = serde_json::Map::new();
-    payload.insert("summarizer_id".into(), Value::String(spec.summarizer_id.into()));
+    payload.insert(
+        "summarizer_id".into(),
+        Value::String(spec.summarizer_id.into()),
+    );
     payload.insert("summarizer_version".into(), spec.current_version.into());
     payload.insert(
         "output_schema_version".into(),
@@ -444,9 +452,7 @@ fn validate_short_name(name: &str, job: &AgentNameJob, where_: &str) -> Result<S
         return Err(format!("{where_}: must use single spaces on one line"));
     }
     if char_len(name) > MAX_NAME_LENGTH {
-        return Err(format!(
-            "{where_}: exceeds {MAX_NAME_LENGTH} characters"
-        ));
+        return Err(format!("{where_}: exceeds {MAX_NAME_LENGTH} characters"));
     }
     if name.contains('/') || name.contains('_') {
         return Err(format!(
@@ -534,11 +540,7 @@ fn split_separators(text: &str) -> Vec<String> {
     words
 }
 
-fn repair_path_short_name(
-    name: &str,
-    job: &AgentNameJob,
-    where_: &str,
-) -> Result<String, String> {
+fn repair_path_short_name(name: &str, job: &AgentNameJob, where_: &str) -> Result<String, String> {
     if !name.contains('/') && !name.contains('_') {
         return Err(format!("{where_}: is not a repairable path or slug"));
     }
@@ -599,7 +601,13 @@ fn parse_backend_output_with_repairs(
         let item = as_object(raw_name, &where_)?;
         require_keys(
             item,
-            &["key", "thread_id", "short_name", "rationale", "lifetime_summary"],
+            &[
+                "key",
+                "thread_id",
+                "short_name",
+                "rationale",
+                "lifetime_summary",
+            ],
             &where_,
         )?;
         let get = |key: &str| item.get(key).unwrap();
@@ -705,7 +713,10 @@ fn parse_backend_output_with_repairs(
 fn result_json(result: &AgentNameResult) -> Value {
     let mut out = serde_json::Map::new();
     out.insert("thread_id".into(), Value::String(result.thread_id.clone()));
-    out.insert("short_name".into(), Value::String(result.short_name.clone()));
+    out.insert(
+        "short_name".into(),
+        Value::String(result.short_name.clone()),
+    );
     out.insert("rationale".into(), Value::String(result.rationale.clone()));
     out.insert(
         "lifetime_summary".into(),
@@ -719,7 +730,10 @@ fn result_json(result: &AgentNameResult) -> Value {
         "prompt_version".into(),
         Value::String(result.prompt_version.clone()),
     );
-    out.insert("input_hash".into(), Value::String(result.input_hash.clone()));
+    out.insert(
+        "input_hash".into(),
+        Value::String(result.input_hash.clone()),
+    );
     out.insert(
         "generated_at".into(),
         Value::String(result.generated_at.clone()),
@@ -808,7 +822,8 @@ fn load_cache(
             )
             .ok()?,
         );
-        cached_backend = strict_string(root.get("backend").unwrap(), "agent name cache.backend").ok()?;
+        cached_backend =
+            strict_string(root.get("backend").unwrap(), "agent name cache.backend").ok()?;
     }
     if cached_backend != backend {
         return None;
@@ -848,8 +863,11 @@ fn load_cache(
     )
     .ok()?;
     let cached_model = strict_string(get("model"), "agent name cache.result.model").ok()?;
-    let prompt_version_value =
-        strict_string(get("prompt_version"), "agent name cache.result.prompt_version").ok()?;
+    let prompt_version_value = strict_string(
+        get("prompt_version"),
+        "agent name cache.result.prompt_version",
+    )
+    .ok()?;
     let input_hash = strict_string(get("input_hash"), "agent name cache.result.input_hash").ok()?;
     let generated_at =
         strict_string(get("generated_at"), "agent name cache.result.generated_at").ok()?;
@@ -971,10 +989,7 @@ fn heuristic_short_name(job: &AgentNameJob) -> String {
     }
     let available = MAX_NAME_LENGTH - (words.len() - 1);
     let base = (available / words.len()).max(1);
-    let shortened: Vec<String> = words
-        .iter()
-        .map(|word| char_take(word, base))
-        .collect();
+    let shortened: Vec<String> = words.iter().map(|word| char_take(word, base)).collect();
     let rendered = shortened
         .iter()
         .enumerate()
@@ -1019,10 +1034,7 @@ fn heuristic_result(
     }
     let lifetime_summary = validate_lifetime_summary(
         &shorten_no_strip(&one_line(&lifetime_source), MAX_LIFETIME_SUMMARY_LENGTH),
-        &format!(
-            "heuristic lifetime summary for {}",
-            py_repr_str(&job.key)
-        ),
+        &format!("heuristic lifetime summary for {}", py_repr_str(&job.key)),
     )?;
     Ok(AgentNameResult {
         thread_id: job.thread_id.clone(),
@@ -1045,7 +1057,10 @@ fn heuristic_batch(
     let generated_at = utc_now_iso();
     let mut out = HashMap::new();
     for item in pending {
-        out.insert(item.job.key.clone(), heuristic_result(item, model, &generated_at)?);
+        out.insert(
+            item.job.key.clone(),
+            heuristic_result(item, model, &generated_at)?,
+        );
     }
     Ok(out)
 }
@@ -1053,8 +1068,16 @@ fn heuristic_batch(
 /// Codex failure diagnostic helper.
 pub fn codex_failure_detail(stdout: &str, stderr: &str, limit: usize) -> String {
     let hints = [
-        "error", "fail", "abort", "404", "421", "unavailable", "not found", "does not exist",
-        "repository", "deployment",
+        "error",
+        "fail",
+        "abort",
+        "404",
+        "421",
+        "unavailable",
+        "not found",
+        "does not exist",
+        "repository",
+        "deployment",
     ];
     let stderr_detail = one_line(stderr);
     let stdout_lines: Vec<String> = stdout
@@ -1089,7 +1112,9 @@ fn codex_batch(
     codex_command: &[String],
 ) -> Result<NameOutcome, BatchFailure> {
     if codex_command.is_empty() {
-        return Err(BatchFailure::plain("codex command must not be empty".to_string()));
+        return Err(BatchFailure::plain(
+            "codex command must not be empty".to_string(),
+        ));
     }
     let temp = TempDir::new("wrkviz-name-").map_err(BatchFailure::plain)?;
     let work_dir = temp.path.clone();
@@ -1130,8 +1155,8 @@ fn codex_batch(
     command.push(output_path.display().to_string());
     command.push("-".into());
     let jobs: Vec<AgentNameJob> = pending.iter().map(|item| item.job.clone()).collect();
-    let completed = run_process(&command, &build_agent_name_prompt(&jobs), &work_dir)
-        .map_err(|error| {
+    let completed =
+        run_process(&command, &build_agent_name_prompt(&jobs), &work_dir).map_err(|error| {
             BatchFailure::plain(format!("could not start codex naming backend: {error}"))
         })?;
     let usage = match crate::token_usage::parse_codex_jsonl_usage(&completed.stdout) {
@@ -1289,29 +1314,28 @@ fn run_backend_batch(
 ) -> Result<GeneratedNameBatch, BatchFailure> {
     let started_at = utc_now_iso();
     let input_hashes: Vec<String> = batch.iter().map(|item| item.input_hash.clone()).collect();
-    let outcome: Result<NameBatchOutcome, BatchFailure> =
-        (|| {
-            if backend == "heuristic" {
-                let results = heuristic_batch(batch, model).map_err(BatchFailure::plain)?;
-                Ok((results, Some(TokenUsage::default()), Vec::new(), None))
-            } else if backend == "codex" {
-                let outcome = codex_batch(batch, model, reasoning_effort, service_tier, codex_command)?;
-                Ok((
-                    outcome.parsed.results,
-                    outcome.usage,
-                    outcome.parsed.repairs,
-                    Some(outcome.raw_output),
-                ))
-            } else {
-                let outcome = claude_batch(batch, model, reasoning_effort, claude_command)?;
-                Ok((
-                    outcome.parsed.results,
-                    outcome.usage,
-                    outcome.parsed.repairs,
-                    Some(outcome.raw_output),
-                ))
-            }
-        })();
+    let outcome: Result<NameBatchOutcome, BatchFailure> = (|| {
+        if backend == "heuristic" {
+            let results = heuristic_batch(batch, model).map_err(BatchFailure::plain)?;
+            Ok((results, Some(TokenUsage::default()), Vec::new(), None))
+        } else if backend == "codex" {
+            let outcome = codex_batch(batch, model, reasoning_effort, service_tier, codex_command)?;
+            Ok((
+                outcome.parsed.results,
+                outcome.usage,
+                outcome.parsed.repairs,
+                Some(outcome.raw_output),
+            ))
+        } else {
+            let outcome = claude_batch(batch, model, reasoning_effort, claude_command)?;
+            Ok((
+                outcome.parsed.results,
+                outcome.usage,
+                outcome.parsed.repairs,
+                Some(outcome.raw_output),
+            ))
+        }
+    })();
     let (results, usage, repairs, raw_output) = match outcome {
         Ok(values) => values,
         Err(error) => {
@@ -1540,8 +1564,10 @@ pub fn name_agents(
             let mut enriched = result.clone();
             enriched.artifact_provenance = Some(provenance);
             write_json_if_changed(&item.cache_path, &cache_json(&enriched)?)?;
-            generated_receipt_by_key
-                .insert(item.job.key.clone(), batch_result.receipt.receipt_id.clone());
+            generated_receipt_by_key.insert(
+                item.job.key.clone(),
+                batch_result.receipt.receipt_id.clone(),
+            );
             generated.insert(item.job.key.clone(), enriched);
         }
         new_receipts.push(batch_result.receipt.clone());
@@ -1551,16 +1577,18 @@ pub fn name_agents(
     let run_one = |batch: &[PendingName]| -> Result<GeneratedNameBatch, BatchFailure> {
         let reservation = match guard {
             None => None,
-            Some(guard) => match guard.reserve(crate::summary_budget::AGENT_NAME_KIND, batch.len() as i64) {
-                None => {
-                    return Err(BatchFailure {
-                        message: "__budget_refusal__".into(),
-                        usage: None,
-                        backend_output: None,
-                    })
+            Some(guard) => {
+                match guard.reserve(crate::summary_budget::AGENT_NAME_KIND, batch.len() as i64) {
+                    None => {
+                        return Err(BatchFailure {
+                            message: "__budget_refusal__".into(),
+                            usage: None,
+                            backend_output: None,
+                        })
+                    }
+                    Some(value) => Some(value),
                 }
-                Some(value) => Some(value),
-            },
+            }
         };
         let result = run_backend_batch(
             batch,
@@ -1607,9 +1635,11 @@ pub fn name_agents(
         }
     } else if !batches.is_empty() {
         let outcomes: Vec<Option<Result<GeneratedNameBatch, BatchFailure>>> = {
-            let slots: Vec<
-                std::sync::Mutex<Option<Result<GeneratedNameBatch, BatchFailure>>>,
-            > = batches.iter().map(|_| std::sync::Mutex::new(None)).collect();
+            let slots: Vec<std::sync::Mutex<Option<Result<GeneratedNameBatch, BatchFailure>>>> =
+                batches
+                    .iter()
+                    .map(|_| std::sync::Mutex::new(None))
+                    .collect();
             let next_index = std::sync::atomic::AtomicUsize::new(0);
             let stop = std::sync::atomic::AtomicBool::new(false);
             std::thread::scope(|scope| {
@@ -1618,18 +1648,18 @@ pub fn name_agents(
                         if stop.load(std::sync::atomic::Ordering::SeqCst) {
                             break;
                         }
-                        let index = next_index
-                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let index = next_index.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         if index >= batches.len() {
                             break;
                         }
                         let result = run_one(&batches[index]);
                         if let Err(error) = &result {
-                            let retryable = error.message.starts_with(
-                                "backend output: missing names for ",
-                            ) || error.message.starts_with(
-                                "backend output: names under invented keys ",
-                            );
+                            let retryable = error
+                                .message
+                                .starts_with("backend output: missing names for ")
+                                || error
+                                    .message
+                                    .starts_with("backend output: names under invented keys ");
                             if !retryable && error.message != "__budget_refusal__" {
                                 stop.store(true, std::sync::atomic::Ordering::SeqCst);
                             }
@@ -1661,7 +1691,9 @@ pub fn name_agents(
                         refused_jobs += batch.len();
                         continue;
                     }
-                    let retryable = error.message.starts_with("backend output: missing names for ")
+                    let retryable = error
+                        .message
+                        .starts_with("backend output: missing names for ")
                         || error
                             .message
                             .starts_with("backend output: names under invented keys ");
@@ -1800,8 +1832,7 @@ pub fn name_agents(
             newly_spent_usage: accounting.newly_spent_usage,
             newly_spent_unknown_receipts: accounting.newly_spent_unknown_receipts,
             artifact_generation_usage: accounting.artifact_generation_usage,
-            artifact_generation_unknown_receipts: accounting
-                .artifact_generation_unknown_receipts,
+            artifact_generation_unknown_receipts: accounting.artifact_generation_unknown_receipts,
             unknown_legacy_artifacts: unknown_legacy,
             usage_run_path: Some(accounting.path),
         },

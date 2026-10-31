@@ -42,10 +42,10 @@ pub mod inspect;
 pub mod json;
 /// Muse session lineage ingestion.
 pub mod muse;
-/// Orc SQLite session lineage ingestion (staged port).
-pub mod orc;
 /// Hindsight agent naming.
 pub mod naming;
+/// Orc SQLite session lineage ingestion (staged port).
+pub mod orc;
 /// Content-addressed tool payload storage.
 pub mod payloads;
 /// Archive transactions: writer lock, team loading, run records.
@@ -64,26 +64,26 @@ pub mod serve;
 /// The snapshot pointer (`snapshot-root.json`) and the legacy
 /// in-archive snapshot layout.
 pub mod snapshot_store;
+/// The summarize engine: jobs, cache, backends, accounting.
+pub mod summarize_core;
+/// The summarize tree: plan, run, writers, report.
+pub mod summarize_pipeline;
 /// Summary artifact provenance envelopes.
 pub mod summary_artifacts;
 /// Summarize spend planning and run state.
 pub mod summary_budget;
 /// The logical-key summary artifact catalog.
 pub mod summary_catalog;
-/// Registered summarizer contracts and context coverage.
-pub mod summary_registry;
-/// Phase windows and transcript views for summaries.
-pub mod summary_phases;
 /// Calendar rollup periods.
 pub mod summary_periods;
-/// The summarize engine: jobs, cache, backends, accounting.
-pub mod summarize_core;
-/// The summarize tree: plan, run, writers, report.
-pub mod summarize_pipeline;
-/// Token-usage records and batch receipts.
-pub mod token_usage;
+/// Phase windows and transcript views for summaries.
+pub mod summary_phases;
+/// Registered summarizer contracts and context coverage.
+pub mod summary_registry;
 /// The normalized team snapshot (`raw/team.json`) reader.
 pub mod team_data;
+/// Token-usage records and batch receipts.
+pub mod token_usage;
 /// The extract-transcripts projection.
 pub mod transcript_export;
 /// Archive file IO (replace-if-changed writes, JSONL).
