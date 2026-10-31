@@ -373,6 +373,7 @@ pub fn run(args: &[String]) -> u8 {
         "summarize" => run_summarize(&args[1..]),
         "build" => run_build(&args[1..]),
         "export" => run_export(&args[1..]),
+        "gc" => run_gc(&args[1..]),
         other => {
             eprintln!(
                 "wrkviz: the Rust edition has not ported '{other}' yet; the Python edition remains the oracle for it"
@@ -4645,6 +4646,163 @@ options:
 "##;
 
 const EXPORT_USAGE: &str = "usage: wrkviz export [-h] --archive ARCHIVE --output OUTPUT --team TEAM\n                     [--phase-minutes PHASE_MINUTES]\n                     [--start-date START_DATE | --start-time START_TIME]\n                     [--end-date END_DATE | --end-time END_TIME]\n                     [--timezone TIMEZONE]\n                     [--rollup-kind {hourly,daily,weekly,monthly,quarterly}]";
+
+/// Verbatim `wrkviz gc --help` text.
+pub const GC_HELP: &str = r##"usage: wrkviz gc [-h] --output OUTPUT [--delete] [--empty-trash]
+                 [--format {text,json}]
+
+classify every file in a built archive as live, reclaimable or held, and print
+the bytes for each category. Reclaims nothing unless --delete is given, and
+even then moves files into .wrkviz-trash/ rather than unlinking them, so a
+mistake costs a copy back instead of an eight-hour rebuild. Emptying that
+trash is a separate --empty-trash pass. Nothing is ever reclaimed on the
+strength of 'the last build did not write it': a file goes only when a named
+superseding artifact is present and complete, or when a manifest authoritative
+over its directory disowns it
+
+options:
+  -h, --help            show this help message and exit
+  --output OUTPUT       built archive directory
+  --delete              move every reclaimable file into the archive's trash
+                        directory
+  --empty-trash         permanently delete the trash directory; this is the
+                        irreversible pass
+  --format {text,json}  report format (default: text)
+"##;
+
+const GC_USAGE: &str = "usage: wrkviz gc [-h] --output OUTPUT [--delete] [--empty-trash]\n                 [--format {text,json}]";
+
+fn run_gc(args: &[String]) -> u8 {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print!("{GC_HELP}");
+        return 0;
+    }
+    const VALUE_OPTIONS: &[&str] = &["--output", "--format"];
+    const FLAG_OPTIONS: &[&str] = &["--delete", "--empty-trash"];
+    let mut values: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    let mut flags: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        let (head, explicit) = match arg.split_once('=') {
+            Some((head, value)) => (head, Some(value.to_string())),
+            None => (arg.as_str(), None),
+        };
+        let resolve = |set: &[&str]| -> Vec<String> {
+            set.iter()
+                .copied()
+                .filter(|name| {
+                    head == *name
+                        || (head.len() > 2 && head.starts_with("--") && name.starts_with(head))
+                })
+                .map(str::to_string)
+                .collect()
+        };
+        let value_candidates = resolve(VALUE_OPTIONS);
+        let flag_candidates = resolve(FLAG_OPTIONS);
+        if explicit.is_some() {
+            if flag_candidates.contains(&head.to_string()) {
+                return argparse_error(
+                    GC_USAGE,
+                    "wrkviz gc",
+                    &format!("argument {head}: ignored explicit argument {explicit:?}"),
+                );
+            }
+            if value_candidates.len() > 1 {
+                return argparse_error(
+                    GC_USAGE,
+                    "wrkviz gc",
+                    &format!(
+                        "ambiguous option: {head} could match {}",
+                        value_candidates.join(", ")
+                    ),
+                );
+            }
+        }
+        if flag_candidates.len() == 1 && head.len() > 2 {
+            flags.insert(flag_candidates[0].clone());
+            index += 1;
+            continue;
+        }
+        if value_candidates.len() > 1 && !value_candidates.contains(&head.to_string()) {
+            return argparse_error(
+                GC_USAGE,
+                "wrkviz gc",
+                &format!(
+                    "ambiguous option: {head} could match {}",
+                    value_candidates.join(", ")
+                ),
+            );
+        }
+        let Some(name) = value_candidates.first() else {
+            return argparse_error(
+                GC_USAGE,
+                "wrkviz gc",
+                &format!("unrecognized arguments: {arg}"),
+            );
+        };
+        let name = name.clone();
+        let value = match explicit {
+            Some(value) => value,
+            None => {
+                index += 1;
+                match args.get(index) {
+                    Some(value) => value.clone(),
+                    None => {
+                        return argparse_error(
+                            GC_USAGE,
+                            "wrkviz gc",
+                            &format!("argument {name}: expected one argument"),
+                        )
+                    }
+                }
+            }
+        };
+        values.entry(name).or_default().push(value);
+        index += 1;
+    }
+    let get = |name: &str| values.get(name).and_then(|items| items.last()).cloned();
+    if get("--output").is_none() {
+        return argparse_error(
+            GC_USAGE,
+            "wrkviz gc",
+            "the following arguments are required: --output",
+        );
+    }
+    let format = get("--format").unwrap_or_else(|| "text".to_string());
+    if !matches!(format.as_str(), "text" | "json") {
+        return argparse_error(
+            GC_USAGE,
+            "wrkviz gc",
+            &format!(
+                "argument --format: invalid choice: {} (choose from 'text', 'json')",
+                crate::json::py_repr_str(&format)
+            ),
+        );
+    }
+    let root = cli_path(&get("--output").unwrap());
+    match crate::gc::collect(
+        &root,
+        flags.contains("--delete"),
+        flags.contains("--empty-trash"),
+    ) {
+        Ok(report) => match crate::gc::format_gc_report(&report, &format) {
+            Ok(text) => {
+                print!("{text}");
+                0
+            }
+            Err(error) => {
+                eprintln!("wrkviz: {error}");
+                2
+            }
+        },
+        Err(error) => {
+            eprintln!("wrkviz: {error}");
+            2
+        }
+    }
+}
 
 fn run_export(args: &[String]) -> u8 {
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {

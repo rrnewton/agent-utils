@@ -29,7 +29,7 @@ use crate::timeline_v3::{is_schema_3_path, write_timeline_v3};
 use crate::transcript_io::{write_text_if_changed, write_text_if_changed_executable};
 
 const SCHEMA_1_TIMELINE_PATH: &str = "data/timeline.json";
-const SCHEMA_2_BOOTSTRAP_PATH: &str = "data/timeline-v2/bootstrap.json";
+const SCHEMA_2_BOOTSTRAP_PATH: &str = "data/timeline-v2.json";
 const SCHEMA_2_PRESENTATION_ROOT: &str = "data/timeline-v2";
 const PRESENTATION_MANIFEST: &str = "data/export.json";
 
@@ -870,10 +870,7 @@ fn remove_stale_presentation_files(
 
 fn schema_2_presentation_files(archive: &Path) -> BTreeSet<String> {
     let mut found = BTreeSet::new();
-    for relative in [
-        SCHEMA_2_BOOTSTRAP_PATH,
-        "data/timeline-v2/bootstrap.json.gz",
-    ] {
+    for relative in [SCHEMA_2_BOOTSTRAP_PATH, "data/timeline-v2.json.gz"] {
         let path = archive.join(relative);
         if path.is_file()
             && !path

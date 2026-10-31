@@ -58,7 +58,7 @@ fn validate_archive_id(value: &str, label: &str) -> Result<(), String> {
     }
 }
 
-fn archive_marker_path(archive: &Path) -> PathBuf {
+pub(crate) fn archive_marker_path(archive: &Path) -> PathBuf {
     let current = archive.join(ARCHIVE_MARKER_FILE);
     if current.is_file() {
         return current;

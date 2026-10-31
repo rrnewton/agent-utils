@@ -34,6 +34,7 @@ pub mod cli;
 pub mod codex;
 /// Upstream sources compressed in place.
 pub mod compressed;
+pub mod gc;
 /// Claude Code prompt-history ingestion.
 pub mod history;
 /// Site identity records.
