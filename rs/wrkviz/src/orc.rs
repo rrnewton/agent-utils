@@ -8333,3 +8333,554 @@ pub fn publish_staged_objects(
     }
     Ok(changed)
 }
+
+/// The identity column a boundary ordinal indexes in
+/// one candidate table.
+fn boundary_identity(table: &str) -> Option<&'static str> {
+    match table {
+        "messages" => Some("id"),
+        "content_blocks" => Some("rowid"),
+        _ => None,
+    }
+}
+
+/// Read one row's timestamp from *table*, or `None` when
+/// that ordinal has no row there.
+pub fn session_record_timestamp(
+    connection: &Connection,
+    source_line: i64,
+    where_: &str,
+    table: &str,
+) -> Result<Option<i64>, String> {
+    let Some(identity) = boundary_identity(table) else {
+        return Err(format!(
+            "{where_}: unsupported Orc boundary table {}",
+            py_repr_str(table)
+        ));
+    };
+    let rows = query_all(
+        connection,
+        &format!("SELECT created_at_ms FROM {table} WHERE {identity} = ?"),
+        &[SqlValue::Int(source_line)],
+        where_,
+    )?;
+    let Some(row) = rows.into_iter().next() else {
+        return Ok(None);
+    };
+    let value = row.first().cloned().unwrap_or(SqlValue::Null);
+    Ok(Some(cell_integer(
+        &value,
+        &format!("{where_}: created_at_ms"),
+    )?))
+}
+
+/// Confirm a recorded boundary still holds, and say
+/// which table its ordinal indexes.
+pub fn resolve_continuation_boundary(
+    connection: &Connection,
+    link: &ContinuationLink,
+    index: i64,
+    where_: &str,
+) -> Result<Option<String>, String> {
+    let tables = table_names(connection, where_)?;
+    if let Some(recorded_table) = &link.predecessor_source_table {
+        if !tables.iter().any(|held| held == recorded_table) {
+            return Err(format!(
+                "recorded Orc continuation {index} boundary table {} is absent from {where_}",
+                py_repr_str(recorded_table)
+            ));
+        }
+        let observed = session_record_timestamp(
+            connection,
+            link.predecessor_source_line,
+            where_,
+            recorded_table,
+        )?;
+        let Some(observed) = observed else {
+            return Err(format!(
+                "recorded Orc continuation {index} boundary row disappeared from {recorded_table}"
+            ));
+        };
+        if observed != link.predecessor_at_ms {
+            return Err(format!(
+                "recorded Orc continuation {index} boundary evidence changed"
+            ));
+        }
+        return Ok(Some(recorded_table.clone()));
+    }
+    let mut observations: Vec<(&str, Option<i64>)> = Vec::new();
+    for table in CONTINUATION_BOUNDARY_TABLES {
+        if tables.iter().any(|held| held == table) {
+            observations.push((
+                table,
+                session_record_timestamp(connection, link.predecessor_source_line, where_, table)?,
+            ));
+        }
+    }
+    let agreeing: Vec<&str> = observations
+        .iter()
+        .filter(|(_, observed)| *observed == Some(link.predecessor_at_ms))
+        .map(|(table, _)| *table)
+        .collect();
+    if agreeing.is_empty() {
+        let detail = observations
+            .iter()
+            .map(|(table, observed)| match observed {
+                None => format!("{table}=absent"),
+                Some(value) => format!("{table}={value}"),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let detail = if detail.is_empty() {
+            "no candidate table present".to_string()
+        } else {
+            detail
+        };
+        return Err(format!(
+            "recorded Orc continuation {index} boundary evidence changed: row {} was recorded at {} ms and the link names no table, but no candidate table in {where_} still holds that row ({detail})",
+            link.predecessor_source_line, link.predecessor_at_ms
+        ));
+    }
+    if agreeing.len() > 1 {
+        return Ok(None);
+    }
+    Ok(Some(agreeing[0].to_string()))
+}
+
+/// Return the table, ordinal and timestamp of the last
+/// content record before *before_ms*.
+pub fn latest_session_record_before(
+    connection: &Connection,
+    before_ms: i64,
+    where_: &str,
+) -> Result<Option<(String, i64, i64)>, String> {
+    let tables = table_names(connection, where_)?;
+    let candidates: Vec<&str> = CONTINUATION_BOUNDARY_TABLES
+        .iter()
+        .filter(|table| tables.iter().any(|held| held == *table))
+        .copied()
+        .collect();
+    if candidates.is_empty() {
+        return Err(format!(
+            "{where_}: holds none of the Orc transcript tables ({})",
+            CONTINUATION_BOUNDARY_TABLES.join(", ")
+        ));
+    }
+    let mut best: Option<(String, i64, i64)> = None;
+    for table in candidates {
+        let identity = boundary_identity(table).unwrap_or("rowid");
+        let rows = query_all(
+            connection,
+            &format!(
+                "SELECT {identity}, created_at_ms FROM {table} WHERE created_at_ms > 0 AND created_at_ms < ? ORDER BY created_at_ms DESC, {identity} DESC LIMIT 1"
+            ),
+            &[SqlValue::Int(before_ms)],
+            where_,
+        )?;
+        let Some(row) = rows.into_iter().next() else {
+            continue;
+        };
+        let ordinal = cell_integer(
+            &row.first().cloned().unwrap_or(SqlValue::Null),
+            &format!("{where_}: source line"),
+        )?;
+        let timestamp = cell_integer(
+            &row.get(1).cloned().unwrap_or(SqlValue::Null),
+            &format!("{where_}: created_at_ms"),
+        )?;
+        // Strictly greater, so the declared order breaks a tie and the first table listed wins.
+        if best.as_ref().map(|held| timestamp > held.2).unwrap_or(true) {
+            best = Some((table.to_string(), ordinal, timestamp));
+        }
+    }
+    Ok(best)
+}
+
+/// Freeze one reproducible transcript boundary for each
+/// explicit successor.
+pub fn continuation_links(
+    root_session_id: &str,
+    continuation_specs: &[ContinuationSpec],
+    session_databases: &[(String, PathBuf)],
+    previous: &[ContinuationLink],
+) -> Result<Vec<ContinuationLink>, String> {
+    let database = |path: &str| -> Option<PathBuf> {
+        session_databases
+            .iter()
+            .find(|(held, _)| held == path)
+            .map(|(_, held)| held.clone())
+    };
+    let mut roots: Vec<String> = vec![root_session_id.to_string()];
+    roots.extend(
+        continuation_specs
+            .iter()
+            .map(|spec| spec.session_id.clone()),
+    );
+    let expected_pairs: Vec<(String, &ContinuationSpec)> = roots
+        .iter()
+        .cloned()
+        .zip(continuation_specs.iter())
+        .collect();
+    if previous.len() > expected_pairs.len() {
+        return Err(
+            "source manifest records more Orc continuations than were configured".to_string(),
+        );
+    }
+    let mut result: Vec<ContinuationLink> = Vec::new();
+    let root_relative = format!(".orc/sessions/{root_session_id}/session.db");
+    let root_path = database(&root_relative)
+        .ok_or_else(|| "configured Orc continuation lacks its root session snapshot".to_string())?;
+    let mut prior_effective_start = session_meta(&root_path, &root_relative)?.created_at_ms;
+    for (index, (predecessor_id, spec)) in expected_pairs.iter().enumerate() {
+        let successor_id = &spec.session_id;
+        let predecessor_source_path = format!(".orc/sessions/{predecessor_id}/session.db");
+        let successor_source_path = format!(".orc/sessions/{successor_id}/session.db");
+        let (Some(predecessor_path), Some(successor_path)) = (
+            database(&predecessor_source_path),
+            database(&successor_source_path),
+        ) else {
+            return Err("configured Orc continuation lacks its root session snapshot".to_string());
+        };
+        let successor_meta = session_meta(&successor_path, &successor_source_path)?;
+        let (start, started_at_ms) =
+            resolve_continuation_start(&successor_path, &successor_meta, spec)?;
+        let start_source_line: Option<i64> = start.map(|pair| pair.0);
+        if started_at_ms <= prior_effective_start {
+            return Err(
+                "Orc root and continuation sessions are not chronologically ordered".to_string(),
+            );
+        }
+        prior_effective_start = started_at_ms;
+        let connection = read_only(&predecessor_path)?;
+        // Ok(None) means a recorded link was re-adopted and pushed already.
+        let boundary_outcome = (|| -> Result<Option<(String, i64, i64)>, String> {
+            if index < previous.len() {
+                let link = &previous[index];
+                if link.predecessor_session_id != *predecessor_id
+                    || link.session_id != *successor_id
+                    || link.predecessor_source_path != predecessor_source_path
+                    || link.source_path != successor_source_path
+                    || link.start_message_id != spec.start_message_id
+                    || link.start_source_line != start_source_line
+                    || link.started_at_ms != started_at_ms
+                {
+                    return Err(format!(
+                        "recorded Orc continuation {index} no longer matches its configured sessions"
+                    ));
+                }
+                let resolved_table = resolve_continuation_boundary(
+                    &connection,
+                    link,
+                    index as i64,
+                    &predecessor_path.display().to_string(),
+                )?;
+                // Adopting the resolved table here is what makes the migration happen exactly once.
+                // The link is otherwise reused byte for byte, so a lineage whose links already name
+                // their tables rewrites nothing and the ingest stays idempotent.
+                let mut held = link.clone();
+                if resolved_table != link.predecessor_source_table {
+                    held.predecessor_source_table = resolved_table;
+                }
+                result.push(held);
+                return Ok(None);
+            }
+            let boundary = latest_session_record_before(
+                &connection,
+                started_at_ms,
+                &predecessor_path.display().to_string(),
+            )?;
+            let Some(boundary) = boundary else {
+                return Err(format!(
+                    "Orc continuation {} has no predecessor content record before its start",
+                    py_repr_str(successor_id)
+                ));
+            };
+            Ok(Some(boundary))
+        })();
+        drop(connection);
+        let Some(boundary) = boundary_outcome? else {
+            continue;
+        };
+        let (predecessor_source_table, predecessor_source_line, predecessor_at_ms) = boundary;
+        let gap_ms = started_at_ms - predecessor_at_ms;
+        if predecessor_source_line <= 0 || gap_ms <= 0 {
+            return Err(format!(
+                "Orc continuation {} does not follow its predecessor",
+                py_repr_str(successor_id)
+            ));
+        }
+        result.push(ContinuationLink {
+            predecessor_session_id: predecessor_id.clone(),
+            session_id: successor_id.clone(),
+            predecessor_source_path,
+            predecessor_source_line,
+            predecessor_at_ms,
+            source_path: successor_source_path,
+            start_message_id: spec.start_message_id.clone(),
+            start_source_line,
+            started_at_ms,
+            gap_ms,
+            predecessor_source_table: Some(predecessor_source_table),
+        });
+    }
+    Ok(result)
+}
+
+/// Validate the per-session append-prefix override list
+/// against this lineage's sessions.
+pub fn accepted_prefix_rewrite_sessions(
+    requested: &[String],
+    lineage_session_ids: &[String],
+) -> Result<Vec<String>, String> {
+    let mut sorted = requested.to_vec();
+    sorted.sort();
+    sorted.dedup();
+    if sorted.len() != requested.len() {
+        return Err(
+            "--accept-orc-prefix-rewrite selection contains duplicate session ids".to_string(),
+        );
+    }
+    for session_id in requested {
+        safe_component(session_id, "accepted Orc prefix-rewrite session id")?;
+    }
+    let mut unknown: Vec<&String> = requested
+        .iter()
+        .filter(|held| !lineage_session_ids.contains(held))
+        .collect();
+    unknown.sort();
+    if !unknown.is_empty() {
+        return Err(format!(
+            "--accept-orc-prefix-rewrite names sessions outside this lineage: {}",
+            unknown
+                .iter()
+                .map(|held| held.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    Ok(requested.to_vec())
+}
+
+/// Summary of source copies retained by one snapshot
+/// pass.
+#[derive(Clone, Debug)]
+pub struct SnapshotResult {
+    /// See the enclosing record's documentation.
+    pub sources: Vec<SourceCopy>,
+    /// See the enclosing record's documentation.
+    pub files_changed: i64,
+    /// See the enclosing record's documentation.
+    pub continuations: Vec<ContinuationLink>,
+    /// Only the overrides this pass actually accepted,
+    /// not every override the manifest remembers.
+    pub prefix_overrides: Vec<AppendPrefixOverride>,
+}
+
+/// Publish immutable SQLite objects after validating
+/// provider-specific monotonicity.
+#[allow(clippy::too_many_arguments)]
+pub fn snapshot_orc_lineage(
+    source_root: &Path,
+    root_session_id: &str,
+    snapshot_root: &Path,
+    previous_sources: &[SourceCopy],
+    captured_at: &str,
+    continuation_specs: &[ContinuationSpec],
+    previous_continuations: &[ContinuationLink],
+    accept_prefix_rewrite: &[String],
+) -> Result<SnapshotResult, String> {
+    let plan = plan_snapshot_sources(
+        source_root,
+        root_session_id,
+        snapshot_root,
+        previous_sources,
+        continuation_specs,
+    )?;
+    // Validated against the discovered lineage, so a mistyped id is caught here rather than being
+    // silently inert; the plan does no writing, so this still happens before anything is staged.
+    let accepted_sessions =
+        accepted_prefix_rewrite_sessions(accept_prefix_rewrite, &plan.selected_session_ids)?;
+    let plan = &plan;
+    let accepted_sessions: &[String] = &accepted_sessions;
+    let mut staged_objects: Vec<(PathBuf, PathBuf, String)> = Vec::new();
+    let mut result_sources: Vec<SourceCopy> = Vec::new();
+    let mut temporary_paths: Vec<PathBuf> = Vec::new();
+    let mut temporary_by_source: Vec<(String, PathBuf)> = Vec::new();
+    let mut accepted_overrides: Vec<AppendPrefixOverride> = Vec::new();
+    let outcome = (|| -> Result<SnapshotResult, String> {
+        for discovered_source in &plan.discovered {
+            let relative = &discovered_source.source_path;
+            let kind = &discovered_source.kind;
+            let previous = plan.previous(relative);
+            let staging_root = snapshot_root.join(".staging");
+            let token = format!(
+                "{:016x}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|held| held.as_nanos() as u64)
+                    .unwrap_or(0)
+            );
+            let temporary = staging_root.join(format!("orc-{}-{token}.db", std::process::id()));
+            temporary_paths.push(temporary.clone());
+            temporary_by_source.push((relative.clone(), temporary.clone()));
+            let candidate = prepare_snapshot_candidate(
+                source_root,
+                snapshot_root,
+                discovered_source,
+                previous,
+                &plan.selected_session_ids,
+                &temporary,
+                captured_at,
+                accepted_sessions,
+            )?;
+            if let Some(held) = &candidate.prefix_override {
+                accepted_overrides.push(held.clone());
+            }
+            // Sticky across later clean ingests: a source that was ever re-baselined keeps saying
+            // so. Dropping the record the moment the source went back to appending cleanly would
+            // erase exactly the fact a reader needs when the normalized data looks odd later.
+            let append_prefix_override = candidate
+                .prefix_override
+                .clone()
+                .or_else(|| previous.and_then(|held| held.append_prefix_override.clone()));
+            if kind == "session" {
+                let staged_meta = session_meta(&temporary, relative)?;
+                let restricted = continuation_specs
+                    .iter()
+                    .any(|spec| spec.start_message_id.is_some());
+                let mut staged_task_paths: Vec<String> =
+                    session_task_relatives(&temporary, &staged_meta)?
+                        .into_iter()
+                        .map(|(path, _, _)| path)
+                        .filter(|path| {
+                            !restricted || plan.task_ordinals.iter().any(|(held, _)| held == path)
+                        })
+                        .collect();
+                staged_task_paths.sort();
+                staged_task_paths.dedup();
+                let planned = plan.task_paths(relative).cloned().unwrap_or_default();
+                let mut planned_sorted = planned.clone();
+                planned_sorted.sort();
+                if staged_task_paths != planned_sorted {
+                    return Err(
+                        "Orc task database references changed during snapshot; retry ingest"
+                            .to_string(),
+                    );
+                }
+            }
+            let advance = if kind == "session" {
+                advance_session_candidate(&candidate, snapshot_root, captured_at)?
+            } else {
+                let ordinal = plan.ordinal(relative).ok_or_else(|| {
+                    format!("Orc task source lacks a snapshot ordinal: {relative}")
+                })?;
+                advance_task_candidate(&candidate, snapshot_root, captured_at, ordinal)?
+            };
+            temporary_paths.extend(advance.temporary_paths.iter().cloned());
+            staged_objects.extend(advance.staged_objects.iter().cloned());
+            let snapshot_size = std::fs::metadata(&temporary)
+                .map(|meta| meta.len() as i64)
+                .map_err(|error| crate::json::os_error(&error, &temporary))?;
+            let snapshot_sha256 = sha256_file(&temporary)?;
+            let snapshot_relative = snapshot_object_relative(&snapshot_sha256)?;
+            let target = snapshot_path(snapshot_root, &snapshot_relative)?;
+            let effective_captured_at = match previous {
+                Some(held) if held.sha256 == snapshot_sha256 => held.captured_at.clone(),
+                _ => captured_at.to_string(),
+            };
+            let semantic_changed = match &advance.previous_identity {
+                None => true,
+                Some(held) => *held != advance.current_identity,
+            };
+            let (
+                semantic_identity_mode,
+                semantic_sha256,
+                semantic_complete_bytes,
+                semantic_baseline_path,
+                semantic_alias_baseline_path,
+            ) = if let (Some(held), false) = (previous, semantic_changed) {
+                let alias = if held.semantic_identity_mode == SEMANTIC_IDENTITY_DETERMINISTIC
+                    && (held.semantic_sha256 != advance.current_identity.sha256
+                        || held.semantic_complete_bytes != advance.current_identity.complete_bytes)
+                {
+                    Some(
+                        held.semantic_alias_baseline_path
+                            .clone()
+                            .unwrap_or_else(|| held.snapshot_path.clone()),
+                    )
+                } else {
+                    None
+                };
+                (
+                    held.semantic_identity_mode.clone(),
+                    held.semantic_sha256.clone(),
+                    held.semantic_complete_bytes,
+                    held.semantic_baseline_path.clone(),
+                    alias,
+                )
+            } else {
+                (
+                    SEMANTIC_IDENTITY_DETERMINISTIC.to_string(),
+                    advance.current_identity.sha256.clone(),
+                    advance.current_identity.complete_bytes,
+                    None,
+                    None,
+                )
+            };
+            staged_objects.push((temporary.clone(), target, snapshot_sha256.clone()));
+            result_sources.push(SourceCopy {
+                source_path: relative.clone(),
+                snapshot_path: snapshot_relative,
+                kind: kind.clone(),
+                owner_session_id: candidate.owner_session_id.clone(),
+                lineage_root_session_id: if kind == "session" {
+                    discovered_source.lineage_root_session_id.clone()
+                } else {
+                    None
+                },
+                source_size: logical_source_size(&candidate.source_path)?,
+                snapshot_size,
+                sha256: snapshot_sha256,
+                append_count: candidate.state.append_count,
+                append_max_id: candidate.state.append_max_id,
+                append_prefix_sha256: candidate.state.append_prefix_sha256.clone(),
+                semantic_identity_mode,
+                semantic_sha256,
+                semantic_complete_bytes,
+                canonical_semantic_sha256: Some(advance.current_identity.sha256.clone()),
+                canonical_semantic_complete_bytes: Some(advance.current_identity.complete_bytes),
+                semantic_alias_baseline_path,
+                semantic_baseline_path,
+                source_state: discovered_source.source_state.clone(),
+                task_source_ordinal: advance.task_source_ordinal,
+                auxiliary: advance.auxiliary.clone(),
+                task_projection: advance.task_projection.clone(),
+                captured_at: effective_captured_at,
+                append_prefix_override,
+                // Read from the staged copy, not the live file: the manifest must describe the
+                // bytes it points at, and the live database can migrate between the backup and
+                // this line.
+                provider_schema_version: provider_schema_version(&temporary, relative)?,
+            });
+        }
+        let continuations = continuation_links(
+            root_session_id,
+            continuation_specs,
+            &temporary_by_source,
+            previous_continuations,
+        )?;
+        let changed = publish_staged_objects(&staged_objects, snapshot_root)?;
+        Ok(SnapshotResult {
+            sources: result_sources,
+            files_changed: changed,
+            continuations,
+            prefix_overrides: accepted_overrides,
+        })
+    })();
+    for temporary in &temporary_paths {
+        if temporary.exists() {
+            let _ = std::fs::remove_file(temporary);
+        }
+    }
+    outcome
+}
