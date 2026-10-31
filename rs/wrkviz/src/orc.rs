@@ -7,6 +7,7 @@ use serde_json::{Map, Value};
 use sha2::Digest as _;
 
 use crate::json::py_repr_str;
+use crate::team_data::{Event, ToolCall, Turn};
 
 /// The `auxiliary-policy-legacy` policy/state constant.
 pub const AUXILIARY_POLICY_LEGACY: &str = "legacy-message-prefix-v1";
@@ -4924,4 +4925,1574 @@ pub fn validate_recorded_semantic_identity(
         ));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------- content records
+
+/// See the enclosing record's documentation.
+pub const CLASSIFICATION_VERSION: &str = "authorship-v2";
+/// See the enclosing record's documentation.
+pub const ORC_PERIODIC_REMINDER: &str = "This is your periodic reminder to make sure your running state is aligned with your overarching goals";
+
+/// Decode one optional JSON object stored in a text
+/// column.
+pub fn optional_json_mapping(
+    value: &SqlValue,
+    where_: &str,
+) -> Result<Map<String, JsonValue>, String> {
+    let Some(text) = cell_optional_string(value, where_)? else {
+        return Ok(Map::new());
+    };
+    let decoded: JsonValue =
+        serde_json::from_str(&text).map_err(|error| format!("{where_}: invalid JSON ({error})"))?;
+    match decoded.as_object() {
+        Some(held) => Ok(held.clone()),
+        None => Err(format!("{where_}: expected an object")),
+    }
+}
+
+/// Decode structured modern provenance; named system
+/// sources read as empty.
+pub fn modern_source_mapping(
+    value: Option<&JsonValue>,
+    where_: &str,
+) -> Result<Map<String, JsonValue>, String> {
+    match value {
+        None | Some(JsonValue::Null) => Ok(Map::new()),
+        Some(JsonValue::String(text)) if text.is_empty() => Ok(Map::new()),
+        Some(JsonValue::String(text)) => {
+            if !text.starts_with('{') {
+                return Ok(Map::new());
+            }
+            let decoded: JsonValue = serde_json::from_str(text)
+                .map_err(|error| format!("{where_}: invalid JSON ({error})"))?;
+            match decoded.as_object() {
+                Some(held) => Ok(held.clone()),
+                None => Err(format!("{where_}: expected an object")),
+            }
+        }
+        Some(_) => Err(format!("{where_}: expected a string or null")),
+    }
+}
+
+/// A nested object, or empty.
+pub fn nested_mapping(raw: &Map<String, JsonValue>, key: &str) -> Map<String, JsonValue> {
+    raw.get(key)
+        .and_then(JsonValue::as_object)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn first_string(values: &[Option<&JsonValue>]) -> Option<String> {
+    for value in values {
+        if let Some(JsonValue::String(text)) = value {
+            if !text.is_empty() {
+                return Some(text.clone());
+            }
+        }
+    }
+    None
+}
+
+/// Whether the text is one of the two scheduled families.
+pub fn is_scheduled_orc_input(text: &str) -> bool {
+    if text.starts_with(ORC_PERIODIC_REMINDER) {
+        return true;
+    }
+    let Some(rest) =
+        text.strip_prefix("We're working in eastern time and the current date/time is `")
+    else {
+        return false;
+    };
+    // \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} (EDT|EST)`, use that to orient
+    let bytes = rest.as_bytes();
+    let digit = |i: usize| bytes.get(i).is_some_and(u8::is_ascii_digit);
+    let shape = bytes.len() >= 27
+        && digit(0)
+        && digit(1)
+        && digit(2)
+        && digit(3)
+        && bytes[4] == b'-'
+        && digit(5)
+        && digit(6)
+        && bytes[7] == b'-'
+        && digit(8)
+        && digit(9)
+        && bytes[10] == b' '
+        && digit(11)
+        && digit(12)
+        && bytes[13] == b':'
+        && digit(14)
+        && digit(15)
+        && bytes[16] == b':'
+        && digit(17)
+        && digit(18)
+        && bytes[19] == b' ';
+    if !shape {
+        return false;
+    }
+    let tail = &rest[20..];
+    (tail.starts_with("EDT") || tail.starts_with("EST"))
+        && tail[3..].starts_with("`, use that to orient ")
+}
+
+/// (kind, author, ingress, author kind, native id) for
+/// one user text block.
+#[allow(clippy::too_many_arguments)]
+pub fn orc_input_provenance(
+    user_source: &Map<String, JsonValue>,
+    extra: &Map<String, JsonValue>,
+    text: &str,
+    message_id: &str,
+    owner_gchat_senders: &[String],
+) -> Result<(String, Option<String>, String, String, String), String> {
+    let orc = nested_mapping(user_source, "Orc");
+    if user_source.contains_key("Orc") {
+        let author = first_string(&[orc.get("sender_session"), extra.get("sender_session")]);
+        return Ok((
+            "inter_agent_message".to_string(),
+            author,
+            "orc".to_string(),
+            "agent".to_string(),
+            message_id.to_string(),
+        ));
+    }
+    let gchat = nested_mapping(user_source, "GChat");
+    if user_source.contains_key("GChat") {
+        let mut explicit_owner: Option<bool> = match gchat.get("is_owner") {
+            Some(JsonValue::Bool(flag)) => Some(*flag),
+            _ => match extra.get("is_owner") {
+                Some(JsonValue::Bool(flag)) => Some(*flag),
+                _ => None,
+            },
+        };
+        let author = first_string(&[
+            gchat.get("sender_unixname"),
+            extra.get("sender_unixname"),
+            gchat.get("sender_display_name"),
+            extra.get("sender_display_name"),
+            gchat.get("sender_name"),
+            extra.get("sender_name"),
+        ]);
+        if explicit_owner.is_none() {
+            if let Some(author) = &author {
+                if owner_gchat_senders.contains(author) {
+                    explicit_owner = Some(true);
+                } else if !owner_gchat_senders.is_empty() {
+                    explicit_owner = Some(false);
+                }
+            }
+        }
+        let native_id = first_string(&[
+            gchat.get("message_name"),
+            extra.get("message_name"),
+            Some(&JsonValue::String(message_id.to_string())),
+        ]);
+        let Some(native_id) = native_id else {
+            return Err("GChat input lacks a native message identity".to_string());
+        };
+        let (event_kind, author_kind) = if explicit_owner == Some(false) {
+            ("external_message", "other_human")
+        } else if explicit_owner == Some(true) {
+            ("user_prompt", "owner_human")
+        } else {
+            ("user_prompt", "unknown")
+        };
+        return Ok((
+            event_kind.to_string(),
+            author,
+            "gchat".to_string(),
+            author_kind.to_string(),
+            native_id,
+        ));
+    }
+    let submitted = nested_mapping(user_source, "Submitted");
+    let submitted_source = submitted.get("source");
+    let is_tui = submitted_source.and_then(JsonValue::as_str) == Some("Tui");
+    let is_web = submitted_source
+        .and_then(JsonValue::as_object)
+        .is_some_and(|held| held.contains_key("Web"));
+    if (is_tui || is_web) && is_scheduled_orc_input(text) {
+        return Ok((
+            "system_input".to_string(),
+            Some("system".to_string()),
+            "scheduled".to_string(),
+            "system".to_string(),
+            message_id.to_string(),
+        ));
+    }
+    if is_tui {
+        return Ok((
+            "user_prompt".to_string(),
+            None,
+            "tui".to_string(),
+            "unknown".to_string(),
+            message_id.to_string(),
+        ));
+    }
+    if is_web {
+        return Ok((
+            "user_prompt".to_string(),
+            None,
+            "submitted_web".to_string(),
+            "external_or_unknown".to_string(),
+            message_id.to_string(),
+        ));
+    }
+    Ok((
+        "user_prompt".to_string(),
+        None,
+        "orc_unknown".to_string(),
+        "unknown".to_string(),
+        message_id.to_string(),
+    ))
+}
+
+fn session_prefix8(session_id: &str) -> String {
+    session_id.chars().take(8).collect()
+}
+
+/// Count `orc.<name>(` calls in code text.
+pub fn orc_tool_counts(code: &str) -> Vec<(String, i64)> {
+    let chars: Vec<char> = code.chars().collect();
+    let mut counts: Vec<(String, i64)> = Vec::new();
+    let mut index = 0usize;
+    while index < chars.len() {
+        // \borc\.
+        let boundary =
+            index == 0 || !(chars[index - 1].is_ascii_alphanumeric() || chars[index - 1] == '_');
+        if boundary && chars[index..].starts_with(&['o', 'r', 'c', '.']) {
+            let mut cursor = index + 4;
+            if cursor < chars.len() && (chars[cursor].is_ascii_alphabetic() || chars[cursor] == '_')
+            {
+                let start = cursor;
+                while cursor < chars.len()
+                    && (chars[cursor].is_ascii_alphanumeric() || chars[cursor] == '_')
+                {
+                    cursor += 1;
+                }
+                let mut after = cursor;
+                while after < chars.len() && chars[after].is_whitespace() {
+                    after += 1;
+                }
+                if after < chars.len() && chars[after] == '(' {
+                    let name: String = chars[start..cursor].iter().collect();
+                    match counts.iter_mut().find(|(held, _)| *held == name) {
+                        Some((_, count)) => *count += 1,
+                        None => counts.push((name, 1)),
+                    }
+                    index = after + 1;
+                    continue;
+                }
+            }
+        }
+        index += 1;
+    }
+    counts.sort();
+    counts
+}
+
+/// One spawn an event stream can attribute work to.
+#[derive(Clone, Debug)]
+pub struct Spawn {
+    /// See the enclosing record's documentation.
+    pub thread_id: String,
+    /// See the enclosing record's documentation.
+    pub parent_thread_id: String,
+    /// See the enclosing record's documentation.
+    pub official_name: String,
+    /// See the enclosing record's documentation.
+    pub timestamp_ms: i64,
+    /// See the enclosing record's documentation.
+    pub source_line: i64,
+    /// See the enclosing record's documentation.
+    pub source_path: String,
+}
+
+/// Spawns proven by a session's stable AgentBlocks.
+pub fn conversation_spawns(
+    path: &Path,
+    meta: &SessionMeta,
+    start_at_ms: Option<i64>,
+    start_source_line: Option<i64>,
+) -> Result<Vec<Spawn>, String> {
+    let observation = auxiliary_observation(path, meta)?;
+    let mut result: Vec<Spawn> = observation
+        .stable_spawns
+        .iter()
+        .filter(|record| match start_source_line {
+            Some(line) => record.message_id >= line,
+            None => start_at_ms.is_none_or(|start| record.timestamp_ms >= start),
+        })
+        .map(|record| Spawn {
+            thread_id: format!(
+                "orc-agent-{}-{}",
+                session_prefix8(&meta.session_id),
+                record.block_id
+            ),
+            parent_thread_id: meta.session_id.clone(),
+            official_name: record.agent_id.clone(),
+            timestamp_ms: record.timestamp_ms,
+            source_line: record.block_id,
+            source_path: meta.source_path.clone(),
+        })
+        .collect();
+    result.sort_by_key(|held| (held.timestamp_ms, held.source_line));
+    Ok(result)
+}
+
+/// Where a v2 block was first recorded.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModernBlockOrigin {
+    /// See the enclosing record's documentation.
+    pub source_line: i64,
+    /// See the enclosing record's documentation.
+    pub native_message_id: String,
+}
+
+/// Origins of v2 blocks in the modern messages table.
+pub fn modern_block_origins(path: &Path) -> Result<Vec<(String, ModernBlockOrigin)>, String> {
+    let connection = read_only(path)?;
+    if session_storage_table(&connection, &path.display().to_string())? != "messages" {
+        return Ok(Vec::new());
+    }
+    let rows = query_all(
+        &connection,
+        "SELECT id, message_json FROM messages ORDER BY id",
+        &[],
+        &path.display().to_string(),
+    )?;
+    drop(connection);
+    let mut result: Vec<(String, ModernBlockOrigin)> = Vec::new();
+    for row in &rows {
+        let cell = |i: usize| row.get(i).cloned().unwrap_or(SqlValue::Null);
+        let source_line = cell_nonnegative(&cell(0), &format!("{}: message id", path.display()))?;
+        let raw_json = cell_string(&cell(1), &format!("{}: message_json", path.display()))?;
+        let decoded: JsonValue = serde_json::from_str(&raw_json).map_err(|error| {
+            format!(
+                "{}: invalid message_json at row {source_line}: {error}",
+                path.display()
+            )
+        })?;
+        let message = decoded.as_object().ok_or_else(|| {
+            format!(
+                "{}: message_json[{source_line}]: expected an object",
+                path.display()
+            )
+        })?;
+        let native_message_id = required_string(
+            message.get("id"),
+            &format!("{}: message_json[{source_line}].id", path.display()),
+        )?;
+        let blocks = match message.get("blocks") {
+            Some(JsonValue::Array(items)) => items.clone(),
+            _ => {
+                return Err(format!(
+                    "{}: message_json[{source_line}].blocks: expected an array",
+                    path.display()
+                ))
+            }
+        };
+        for raw_block in &blocks {
+            let block = raw_block
+                .as_object()
+                .ok_or_else(|| format!("{}: message block: expected an object", path.display()))?;
+            let Some(block_id) = block.get("id").and_then(|held| match held {
+                JsonValue::Number(number) if !number.is_f64() => number.as_i64(),
+                _ => None,
+            }) else {
+                continue;
+            };
+            let identity = format!("v2-block-{block_id}");
+            let origin = ModernBlockOrigin {
+                source_line,
+                native_message_id: native_message_id.clone(),
+            };
+            match result.iter_mut().find(|(held, _)| *held == identity) {
+                Some((_, prior)) => {
+                    if *prior != origin {
+                        return Err(format!(
+                            "{}: modern block identity {} is duplicated",
+                            path.display(),
+                            py_repr_str(&identity)
+                        ));
+                    }
+                }
+                None => result.push((identity, origin)),
+            }
+        }
+    }
+    Ok(result)
+}
+
+type ContentRecords = (Vec<Event>, Vec<ToolCall>, Vec<Turn>);
+
+type TurnBounds = (i64, i64, Option<String>);
+
+/// Normalize the legacy content_blocks stream.
+#[allow(clippy::too_many_arguments)]
+pub fn legacy_content_records(
+    path: &Path,
+    meta: &SessionMeta,
+    id_namespace: &str,
+    start_at_ms: Option<i64>,
+    start_source_line: Option<i64>,
+    modern_origins: &[(String, ModernBlockOrigin)],
+) -> Result<ContentRecords, String> {
+    let rows = {
+        let connection = read_only(path)?;
+        let rows = query_all(
+            &connection,
+            "SELECT rowid, id, message_id, created_at_ms, turn_index, role, block_type, \
+             content, code_input, code_output, code_exit_code, user_source, extra \
+             FROM content_blocks ORDER BY created_at_ms, rowid",
+            &[],
+            &path.display().to_string(),
+        )?;
+        drop(connection);
+        rows
+    };
+    let origin_of = |block_id: &str| -> Option<&ModernBlockOrigin> {
+        modern_origins
+            .iter()
+            .find(|(held, _)| held == block_id)
+            .map(|(_, origin)| origin)
+    };
+    let row_is_included = |row: &[SqlValue]| -> Result<bool, String> {
+        let timestamp_ms = cell_integer(&row[3], &format!("{}: created_at_ms", path.display()))?;
+        if let Some(line) = start_source_line {
+            let block_id = cell_string(&row[1], &format!("{}: block id", path.display()))?;
+            return Ok(origin_of(&block_id).is_some_and(|origin| origin.source_line >= line));
+        }
+        Ok(start_at_ms.is_none_or(|start| timestamp_ms >= start))
+    };
+    let mut owner_gchat_senders: Vec<String> = Vec::new();
+    for row in &rows {
+        if !row_is_included(row)? {
+            continue;
+        }
+        let role = cell_string(&row[5], &format!("{}: role", path.display()))?;
+        if role != "user" {
+            continue;
+        }
+        let user_source = optional_json_mapping(
+            &row[11],
+            &format!("{}: content block user_source", path.display()),
+        )?;
+        if !user_source.contains_key("GChat") {
+            continue;
+        }
+        let gchat = nested_mapping(&user_source, "GChat");
+        let extra = optional_json_mapping(
+            &row[12],
+            &format!("{}: content block extra", path.display()),
+        )?;
+        let explicit_owner = match gchat.get("is_owner") {
+            Some(JsonValue::Bool(flag)) => Some(*flag),
+            _ => match extra.get("is_owner") {
+                Some(JsonValue::Bool(flag)) => Some(*flag),
+                _ => None,
+            },
+        };
+        if explicit_owner != Some(true) {
+            continue;
+        }
+        for value in [
+            gchat.get("sender_unixname"),
+            extra.get("sender_unixname"),
+            gchat.get("sender_display_name"),
+            extra.get("sender_display_name"),
+            gchat.get("sender_name"),
+            extra.get("sender_name"),
+        ] {
+            if let Some(JsonValue::String(text)) = value {
+                if !text.is_empty() && !owner_gchat_senders.contains(text) {
+                    owner_gchat_senders.push(text.clone());
+                }
+            }
+        }
+    }
+    let mut events: Vec<Event> = Vec::new();
+    let mut tools: Vec<ToolCall> = Vec::new();
+    let mut turn_bounds: Vec<(i64, TurnBounds)> = Vec::new();
+    for row in &rows {
+        let cell = |i: usize| row.get(i).cloned().unwrap_or(SqlValue::Null);
+        let rowid = cell_integer(&cell(0), &format!("{}: rowid", path.display()))?;
+        let block_id = cell_string(&cell(1), &format!("{}: block id", path.display()))?;
+        let message_id = cell_string(&cell(2), &format!("{}: message id", path.display()))?;
+        let timestamp_ms = cell_integer(&cell(3), &format!("{}: created_at_ms", path.display()))?;
+        if !row_is_included(row)? {
+            continue;
+        }
+        let modern_origin = origin_of(&block_id);
+        let turn_index = cell_integer(&cell(4), &format!("{}: turn_index", path.display()))?;
+        let role = cell_string(&cell(5), &format!("{}: role", path.display()))?;
+        let block_type = cell_string(&cell(6), &format!("{}: block_type", path.display()))?;
+        let content = cell_optional_string(&cell(7), &format!("{}: content", path.display()))?;
+        let turn_id = format!(
+            "{id_namespace}orc-turn-{}-{turn_index}",
+            session_prefix8(&meta.session_id)
+        );
+        match turn_bounds.iter_mut().find(|(held, _)| *held == turn_index) {
+            None => turn_bounds.push((
+                turn_index,
+                (
+                    timestamp_ms,
+                    timestamp_ms + 1,
+                    if matches!(role.as_str(), "assistant" | "notification") {
+                        content.clone()
+                    } else {
+                        None
+                    },
+                ),
+            )),
+            Some((_, bounds)) => {
+                let last_message = if matches!(role.as_str(), "assistant" | "notification") {
+                    content
+                        .clone()
+                        .filter(|held| !held.is_empty())
+                        .or_else(|| bounds.2.clone())
+                } else {
+                    bounds.2.clone()
+                };
+                *bounds = (
+                    bounds.0.min(timestamp_ms),
+                    bounds.1.max(timestamp_ms + 1),
+                    last_message,
+                );
+            }
+        }
+        let mut event_kind: Option<String> = None;
+        let mut event_role: Option<String> = None;
+        let mut event_author: Option<String> = None;
+        let mut event_recipient: Option<String> = None;
+        let mut ingress_kind: Option<String> = None;
+        let mut author_kind: Option<String> = None;
+        let mut source_native_id = message_id.clone();
+        if block_type == "text" && role == "user" {
+            let user_source = optional_json_mapping(
+                &cell(11),
+                &format!("{}: content block {block_id} user_source", path.display()),
+            )?;
+            let extra = optional_json_mapping(
+                &cell(12),
+                &format!("{}: content block {block_id} extra", path.display()),
+            )?;
+            let (kind, author, ingress, akind, native) = orc_input_provenance(
+                &user_source,
+                &extra,
+                content.as_deref().unwrap_or(""),
+                &message_id,
+                &owner_gchat_senders,
+            )?;
+            event_kind = Some(kind.clone());
+            event_author = author;
+            ingress_kind = Some(ingress);
+            author_kind = Some(akind);
+            source_native_id = native;
+            if kind == "inter_agent_message" {
+                event_role = None;
+                event_recipient = Some(meta.session_id.clone());
+            } else if kind == "system_input" {
+                event_role = Some("system".to_string());
+            } else {
+                event_role = Some("user".to_string());
+            }
+        } else if block_type == "text" && matches!(role.as_str(), "assistant" | "notification") {
+            event_kind = Some("assistant_message".to_string());
+            event_role = Some("assistant".to_string());
+            event_author = Some(meta.session_id.clone());
+            ingress_kind = Some("orc".to_string());
+            author_kind = Some("agent".to_string());
+        }
+        if let (Some(kind), Some(content_text)) = (&event_kind, &content) {
+            if !content_text.is_empty() {
+                events.push(Event {
+                    event_id: format!("{id_namespace}orc-block-{block_id}"),
+                    thread_id: meta.session_id.clone(),
+                    turn_id: Some(turn_id.clone()),
+                    timestamp_ms,
+                    kind: kind.clone(),
+                    role: event_role.clone(),
+                    phase: None,
+                    text: Some(content_text.clone()),
+                    content_availability: "plaintext".to_string(),
+                    encrypted_content: None,
+                    author: event_author.clone(),
+                    recipient: event_recipient.clone(),
+                    source_line: modern_origin.map_or(rowid, |origin| origin.source_line),
+                    ingress_kind: ingress_kind.clone(),
+                    author_kind: author_kind.clone(),
+                    source_native_id: Some(
+                        modern_origin.map_or(source_native_id.clone(), |origin| {
+                            origin.native_message_id.clone()
+                        }),
+                    ),
+                    classification_version: Some(CLASSIFICATION_VERSION.to_string()),
+                });
+            }
+        }
+        if block_type == "code_execution" {
+            let code_input =
+                cell_optional_string(&cell(8), &format!("{}: code_input", path.display()))?;
+            let code_output =
+                cell_optional_string(&cell(9), &format!("{}: code_output", path.display()))?;
+            let status = match &cell(10) {
+                SqlValue::Int(code) if *code != 0 => "failed",
+                _ => "completed",
+            };
+            tools.push(ToolCall {
+                call_id: format!("{id_namespace}orc-code-{block_id}"),
+                item_id: Some(format!("{id_namespace}{block_id}")),
+                thread_id: meta.session_id.clone(),
+                turn_id: Some(turn_id),
+                name: "code_execution".to_string(),
+                namespace: Some("orc".to_string()),
+                started_at_ms: timestamp_ms,
+                ended_at_ms: Some(timestamp_ms + 1),
+                status: status.to_string(),
+                input_text: code_input.clone(),
+                output_text: code_output,
+                nested_tools: orc_tool_counts(code_input.as_deref().unwrap_or("")),
+                source_line: modern_origin.map_or(rowid, |origin| origin.source_line),
+                input_payload: None,
+                output_payload: None,
+            });
+        }
+    }
+    turn_bounds.sort_by_key(|(index, _)| *index);
+    let turns = turn_bounds
+        .into_iter()
+        .map(|(turn_index, bounds)| Turn {
+            turn_id: format!(
+                "{id_namespace}orc-turn-{}-{turn_index}",
+                session_prefix8(&meta.session_id)
+            ),
+            thread_id: meta.session_id.clone(),
+            started_at_ms: bounds.0,
+            ended_at_ms: Some(bounds.1),
+            status: "completed".to_string(),
+            first_token_ms: None,
+            error: None,
+            last_agent_message: bounds.2,
+        })
+        .collect();
+    Ok((events, tools, turns))
+}
+
+/// Normalize the append-only schema-v5 messages table.
+pub fn modern_content_records(
+    path: &Path,
+    meta: &SessionMeta,
+    id_namespace: &str,
+    start_at_ms: Option<i64>,
+    start_source_line: Option<i64>,
+) -> Result<ContentRecords, String> {
+    let (rows, content_rows) = {
+        let connection = read_only(path)?;
+        let rows = query_all(
+            &connection,
+            "SELECT id, session_id, role, created_at_ms, message_json FROM messages ORDER BY id",
+            &[],
+            &path.display().to_string(),
+        )?;
+        let content_rows = query_all(
+            &connection,
+            "SELECT id, turn_index FROM content_blocks ORDER BY rowid",
+            &[],
+            &path.display().to_string(),
+        )?;
+        drop(connection);
+        (rows, content_rows)
+    };
+    let mut existing_block_turns: Vec<(i64, i64)> = Vec::new();
+    for row in &content_rows {
+        let cell = |i: usize| row.get(i).cloned().unwrap_or(SqlValue::Null);
+        let block_identity =
+            cell_string(&cell(0), &format!("{}: content block id", path.display()))?;
+        let Some(inner) = block_identity.strip_prefix("v2-block-") else {
+            continue;
+        };
+        if inner.is_empty() || !inner.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(block_number) = inner.parse::<i64>() else {
+            continue;
+        };
+        existing_block_turns.push((
+            block_number,
+            cell_integer(
+                &cell(1),
+                &format!("{}: content block turn_index", path.display()),
+            )?,
+        ));
+    }
+    let turn_of_block = |block_id: i64| -> Option<i64> {
+        existing_block_turns
+            .iter()
+            .find(|(held, _)| *held == block_id)
+            .map(|(_, held)| *held)
+    };
+    let message_is_included = |message_id: i64, timestamp_ms: i64| -> bool {
+        match start_source_line {
+            Some(line) => message_id >= line,
+            None => start_at_ms.is_none_or(|start| timestamp_ms >= start),
+        }
+    };
+    let mut parsed: Vec<(i64, i64, String, Map<String, JsonValue>)> = Vec::new();
+    let mut owner_gchat_senders: Vec<String> = Vec::new();
+    for (index, row) in rows.iter().enumerate() {
+        let cell = |i: usize| row.get(i).cloned().unwrap_or(SqlValue::Null);
+        let where_ = format!("{}: messages[{index}]", path.display());
+        let _ = &where_;
+        let message_id = cell_nonnegative(&cell(0), &format!("{}: message id", path.display()))?;
+        let session_id = cell_string(&cell(1), &format!("{}: message session_id", path.display()))?;
+        if session_id != meta.session_id {
+            return Err(format!(
+                "{}: message {message_id} belongs to {}, not {}",
+                path.display(),
+                py_repr_str(&session_id),
+                py_repr_str(&meta.session_id)
+            ));
+        }
+        let stored_role = cell_string(&cell(2), &format!("{}: message role", path.display()))?;
+        let timestamp_ms = cell_nonnegative(
+            &cell(3),
+            &format!("{}: message created_at_ms", path.display()),
+        )?;
+        let raw_json = cell_string(&cell(4), &format!("{}: message_json", path.display()))?;
+        let decoded: JsonValue = serde_json::from_str(&raw_json).map_err(|error| {
+            format!(
+                "{}: invalid message_json for row {message_id}: {error}",
+                path.display()
+            )
+        })?;
+        let message = decoded.as_object().cloned().ok_or_else(|| {
+            format!(
+                "{}: message_json[{message_id}]: expected an object",
+                path.display()
+            )
+        })?;
+        let role = required_string(
+            message.get("role"),
+            &format!("{}: message_json[{message_id}].role", path.display()),
+        )?;
+        if role.to_lowercase() != stored_role.to_lowercase() {
+            return Err(format!(
+                "{}: role differs for message row {message_id}",
+                path.display()
+            ));
+        }
+        let embedded_at = nonnegative_integer(
+            message.get("created_at_ms"),
+            &format!(
+                "{}: message_json[{message_id}].created_at_ms",
+                path.display()
+            ),
+        )?;
+        if embedded_at != timestamp_ms {
+            return Err(format!(
+                "{}: timestamp differs for message row {message_id}",
+                path.display()
+            ));
+        }
+        let source = modern_source_mapping(
+            message.get("source"),
+            &format!("{}: message_json[{message_id}].source", path.display()),
+        )?;
+        if message_is_included(message_id, timestamp_ms)
+            && role.to_lowercase() == "user"
+            && source.contains_key("GChat")
+        {
+            let gchat = nested_mapping(&source, "GChat");
+            if gchat.get("is_owner") == Some(&JsonValue::Bool(true)) {
+                for value in [
+                    gchat.get("sender_unixname"),
+                    gchat.get("sender_display_name"),
+                    gchat.get("sender_name"),
+                ] {
+                    if let Some(JsonValue::String(text)) = value {
+                        if !text.is_empty() && !owner_gchat_senders.contains(text) {
+                            owner_gchat_senders.push(text.clone());
+                        }
+                    }
+                }
+            }
+        }
+        parsed.push((message_id, timestamp_ms, role, message));
+    }
+    let mut events: Vec<Event> = Vec::new();
+    let mut tools: Vec<ToolCall> = Vec::new();
+    let mut turns: Vec<Turn> = Vec::new();
+    let mut current_turn_index = 0i64;
+    for (message_id, timestamp_ms, role, message) in &parsed {
+        let timestamp_ms = *timestamp_ms;
+        if timestamp_ms == 0 {
+            continue;
+        }
+        let blocks: Vec<JsonValue> = match message.get("blocks") {
+            Some(JsonValue::Array(items)) => items.clone(),
+            _ => {
+                return Err(format!(
+                    "{}: message_json[{message_id}].blocks: expected an array",
+                    path.display()
+                ))
+            }
+        };
+        let mut known_turns: Vec<i64> = Vec::new();
+        for raw_block in &blocks {
+            let block = raw_block
+                .as_object()
+                .ok_or_else(|| format!("{}: message block: expected an object", path.display()))?;
+            if let Some(JsonValue::Number(number)) = block.get("id") {
+                if !number.is_f64() {
+                    if let Some(id) = number.as_i64() {
+                        if let Some(turn) = turn_of_block(id) {
+                            if !known_turns.contains(&turn) {
+                                known_turns.push(turn);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if known_turns.len() > 1 {
+            return Err(format!(
+                "{}: message row {message_id} spans multiple legacy turns",
+                path.display()
+            ));
+        }
+        let turn_index = if let Some(known) = known_turns.first() {
+            current_turn_index = *known;
+            *known
+        } else {
+            if role.to_lowercase() == "user" || current_turn_index == 0 {
+                current_turn_index += 1;
+            }
+            current_turn_index
+        };
+        if !message_is_included(*message_id, timestamp_ms) {
+            continue;
+        }
+        let native_message_id = required_string(
+            message.get("id"),
+            &format!("{}: message_json[{message_id}].id", path.display()),
+        )?;
+        let turn_id = format!(
+            "{id_namespace}orc-turn-{}-{turn_index}",
+            session_prefix8(&meta.session_id)
+        );
+        let mut last_agent_message: Option<String> = None;
+        let mut error_text: Option<String> = None;
+        let mut emitted = false;
+        let source = modern_source_mapping(
+            message.get("source"),
+            &format!("{}: message_json[{message_id}].source", path.display()),
+        )?;
+        for (block_index, raw_block) in blocks.iter().enumerate() {
+            let block = raw_block.as_object().ok_or_else(|| {
+                format!(
+                    "{}: message_json[{message_id}].blocks[{block_index}]: expected an object",
+                    path.display()
+                )
+            })?;
+            let block_type = required_string(
+                block.get("type"),
+                &format!(
+                    "{}: message_json[{message_id}].blocks[{block_index}].type",
+                    path.display()
+                ),
+            )?;
+            let Some(block_id) = (match block.get("id") {
+                Some(JsonValue::Number(number)) if !number.is_f64() => number.as_i64(),
+                _ => None,
+            }) else {
+                continue;
+            };
+            if turn_of_block(block_id).is_some() {
+                continue;
+            }
+            if block_type == "ErrorBlock" {
+                error_text = optional_string(
+                    block.get("message"),
+                    &format!(
+                        "{}: message_json[{message_id}].blocks[{block_index}].message",
+                        path.display()
+                    ),
+                )?;
+                emitted = true;
+                continue;
+            }
+            if block_type == "CodeExecutionBlock" {
+                let code_input = optional_string(
+                    block.get("code"),
+                    &format!(
+                        "{}: message_json[{message_id}].blocks[{block_index}].code",
+                        path.display()
+                    ),
+                )?;
+                let code_output = optional_string(
+                    block.get("output"),
+                    &format!(
+                        "{}: message_json[{message_id}].blocks[{block_index}].output",
+                        path.display()
+                    ),
+                )?;
+                let is_error = match block.get("is_error") {
+                    Some(JsonValue::Bool(flag)) => *flag,
+                    _ => {
+                        return Err(format!(
+                            "{}: CodeExecutionBlock {block_id} lacks is_error",
+                            path.display()
+                        ))
+                    }
+                };
+                let identity = format!("v2-block-{block_id}");
+                tools.push(ToolCall {
+                    call_id: format!("{id_namespace}orc-code-{identity}"),
+                    item_id: Some(format!("{id_namespace}{identity}")),
+                    thread_id: meta.session_id.clone(),
+                    turn_id: Some(turn_id.clone()),
+                    name: "code_execution".to_string(),
+                    namespace: Some("orc".to_string()),
+                    started_at_ms: timestamp_ms,
+                    ended_at_ms: Some(timestamp_ms + 1),
+                    status: if is_error { "failed" } else { "completed" }.to_string(),
+                    input_text: code_input.clone(),
+                    output_text: code_output,
+                    nested_tools: orc_tool_counts(code_input.as_deref().unwrap_or("")),
+                    source_line: *message_id,
+                    input_payload: None,
+                    output_payload: None,
+                });
+                emitted = true;
+                continue;
+            }
+            let text_key = if matches!(block_type.as_str(), "text" | "NotificationBlock") {
+                Some("text")
+            } else {
+                None
+            };
+            let Some(text_key) = text_key else {
+                continue;
+            };
+            let Some(content) = optional_string(
+                block.get(text_key),
+                &format!(
+                    "{}: message_json[{message_id}].blocks[{block_index}].text",
+                    path.display()
+                ),
+            )?
+            else {
+                continue;
+            };
+            let role_key = role.to_lowercase();
+            let (
+                event_kind,
+                event_role,
+                event_author,
+                event_recipient,
+                ingress_kind,
+                author_kind,
+                source_native_id,
+            );
+            if role_key == "user" {
+                let (kind, author, ingress, akind, native) = orc_input_provenance(
+                    &source,
+                    &Map::new(),
+                    &content,
+                    &native_message_id,
+                    &owner_gchat_senders,
+                )?;
+                event_kind = kind.clone();
+                event_author = author;
+                ingress_kind = ingress;
+                author_kind = akind;
+                source_native_id = native;
+                if kind == "inter_agent_message" {
+                    event_role = None;
+                    event_recipient = Some(meta.session_id.clone());
+                } else if kind == "system_input" {
+                    event_role = Some("system".to_string());
+                    event_recipient = None;
+                } else {
+                    event_role = Some("user".to_string());
+                    event_recipient = None;
+                }
+            } else if role_key == "system" {
+                event_kind = "system_input".to_string();
+                event_role = Some("system".to_string());
+                event_author = Some("system".to_string());
+                event_recipient = None;
+                ingress_kind = "orc".to_string();
+                author_kind = "system".to_string();
+                source_native_id = native_message_id.clone();
+            } else {
+                event_kind = "assistant_message".to_string();
+                event_role = Some("assistant".to_string());
+                event_author = Some(meta.session_id.clone());
+                event_recipient = None;
+                ingress_kind = "orc".to_string();
+                author_kind = "agent".to_string();
+                source_native_id = native_message_id.clone();
+                last_agent_message = Some(content.clone());
+            }
+            events.push(Event {
+                event_id: format!("{id_namespace}orc-block-v2-block-{block_id}"),
+                thread_id: meta.session_id.clone(),
+                turn_id: Some(turn_id.clone()),
+                timestamp_ms,
+                kind: event_kind,
+                role: event_role,
+                phase: None,
+                text: Some(content),
+                content_availability: "plaintext".to_string(),
+                encrypted_content: None,
+                author: event_author,
+                recipient: event_recipient,
+                source_line: *message_id,
+                ingress_kind: Some(ingress_kind),
+                author_kind: Some(author_kind),
+                source_native_id: Some(source_native_id),
+                classification_version: Some(CLASSIFICATION_VERSION.to_string()),
+            });
+            emitted = true;
+        }
+        if emitted {
+            turns.push(Turn {
+                turn_id,
+                thread_id: meta.session_id.clone(),
+                started_at_ms: timestamp_ms,
+                ended_at_ms: Some(timestamp_ms + 1),
+                status: if error_text.is_some() {
+                    "failed"
+                } else {
+                    "completed"
+                }
+                .to_string(),
+                first_token_ms: None,
+                error: error_text,
+                last_agent_message,
+            });
+        }
+    }
+    Ok((events, tools, turns))
+}
+
+/// Both storage generations of one session, merged.
+pub fn content_records(
+    path: &Path,
+    meta: &SessionMeta,
+    id_namespace: &str,
+    start_at_ms: Option<i64>,
+    start_source_line: Option<i64>,
+) -> Result<ContentRecords, String> {
+    let modern = {
+        let connection = read_only(path)?;
+        let held = session_storage_table(&connection, &path.display().to_string())? == "messages";
+        drop(connection);
+        held
+    };
+    let origins = if modern {
+        modern_block_origins(path)?
+    } else {
+        Vec::new()
+    };
+    let legacy = legacy_content_records(
+        path,
+        meta,
+        id_namespace,
+        start_at_ms,
+        start_source_line,
+        &origins,
+    )?;
+    if !modern {
+        return Ok(legacy);
+    }
+    let additions =
+        modern_content_records(path, meta, id_namespace, start_at_ms, start_source_line)?;
+    let (legacy_events, legacy_tools, legacy_turns) = legacy;
+    let (mut events, mut tools, addition_turns) = additions;
+    let mut all_events = legacy_events;
+    all_events.append(&mut events);
+    let mut all_tools = legacy_tools;
+    all_tools.append(&mut tools);
+    let mut turns_by_id: Vec<Turn> = legacy_turns;
+    for turn in addition_turns {
+        match turns_by_id
+            .iter_mut()
+            .find(|held| held.turn_id == turn.turn_id)
+        {
+            None => turns_by_id.push(turn),
+            Some(prior) => {
+                let status = if prior.status == "failed" || turn.status == "failed" {
+                    "failed".to_string()
+                } else {
+                    prior.status.clone()
+                };
+                *prior = Turn {
+                    turn_id: prior.turn_id.clone(),
+                    thread_id: prior.thread_id.clone(),
+                    started_at_ms: prior.started_at_ms.min(turn.started_at_ms),
+                    ended_at_ms: Some(
+                        prior
+                            .ended_at_ms
+                            .unwrap_or(prior.started_at_ms)
+                            .max(turn.ended_at_ms.unwrap_or(turn.started_at_ms)),
+                    ),
+                    status,
+                    first_token_ms: prior.first_token_ms,
+                    error: prior.error.clone().or(turn.error.clone()),
+                    last_agent_message: turn
+                        .last_agent_message
+                        .clone()
+                        .or(prior.last_agent_message.clone()),
+                };
+            }
+        }
+    }
+    turns_by_id.sort_by(|a, b| (a.started_at_ms, &a.turn_id).cmp(&(b.started_at_ms, &b.turn_id)));
+    Ok((all_events, all_tools, turns_by_id))
+}
+
+/// Hash normalized transcript semantics independently
+/// of storage layout.
+pub fn session_canonical_state(path: &Path, meta: &SessionMeta) -> Result<LogicalState, String> {
+    let (mut events, mut tools, mut turns) = content_records(path, meta, "", None, None)?;
+    events.sort_by(|a, b| (a.timestamp_ms, &a.event_id).cmp(&(b.timestamp_ms, &b.event_id)));
+    tools.sort_by(|a, b| (a.started_at_ms, &a.call_id).cmp(&(b.started_at_ms, &b.call_id)));
+    turns.sort_by(|a, b| (a.started_at_ms, &a.turn_id).cmp(&(b.started_at_ms, &b.turn_id)));
+    let mut root = Map::new();
+    root.insert(
+        "events".into(),
+        JsonValue::Array(events.iter().map(crate::team_data::event_to_json).collect()),
+    );
+    root.insert(
+        "tool_calls".into(),
+        JsonValue::Array(tools.iter().map(crate::team_data::tool_to_json).collect()),
+    );
+    root.insert(
+        "turns".into(),
+        JsonValue::Array(turns.iter().map(crate::team_data::turn_to_json).collect()),
+    );
+    let payload = crate::json::dump_compact(&JsonValue::Object(root));
+    Ok(LogicalState {
+        append_count: (events.len() + tools.len() + turns.len()) as i64,
+        append_max_id: BigUint::zero(),
+        append_prefix_sha256: sha256_hex(payload.as_bytes()),
+    })
+}
+
+// ---------------------------------------------------------------- semantic validation
+
+/// Refuse when a legacy-raw baseline no longer proves
+/// the recorded identity.
+pub fn validate_legacy_semantic_identity(
+    snapshot_root: &Path,
+    source: &SourceCopy,
+    current_identity: &SemanticIdentity,
+    projection_sha256: Option<&str>,
+) -> Result<(), String> {
+    if source.semantic_identity_mode != SEMANTIC_IDENTITY_LEGACY {
+        return Ok(());
+    }
+    let Some(baseline_relative) = &source.semantic_baseline_path else {
+        return Err(format!(
+            "legacy Orc semantic identity lacks a baseline for {}",
+            source.source_path
+        ));
+    };
+    let baseline_path = snapshot_path(snapshot_root, baseline_relative)?;
+    let is_symlink = std::fs::symlink_metadata(&baseline_path)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false);
+    if is_symlink || !baseline_path.is_file() {
+        return Err(format!(
+            "legacy Orc semantic baseline is missing or unsafe: {}",
+            baseline_path.display()
+        ));
+    }
+    let size = std::fs::metadata(&baseline_path)
+        .map(|meta| meta.len() as i64)
+        .map_err(|error| crate::json::os_error(&error, &baseline_path))?;
+    if sha256_file(&baseline_path)? != source.semantic_sha256
+        || size != source.semantic_complete_bytes
+    {
+        return Err(format!(
+            "legacy Orc semantic baseline does not match its cache identity: {}",
+            baseline_path.display()
+        ));
+    }
+    let baseline_state = logical_state(&baseline_path, &source.kind, None, false, None)?;
+    let baseline_identity = if source.kind == "session" {
+        let baseline_meta = session_meta(&baseline_path, &source.source_path)?;
+        let baseline_auxiliary = auxiliary_observation(&baseline_path, &baseline_meta)?;
+        session_semantic_identity(
+            &source.source_path,
+            &source.owner_session_id,
+            &session_canonical_state(&baseline_path, &baseline_meta)?,
+            &baseline_meta,
+            &baseline_auxiliary,
+            4,
+        )?
+    } else {
+        let Some(projection_sha256) = projection_sha256 else {
+            return Err(format!(
+                "legacy task semantic identity lacks a projection for {}",
+                source.source_path
+            ));
+        };
+        task_semantic_identity(
+            &source.source_path,
+            &source.owner_session_id,
+            source.task_source_ordinal.unwrap_or(0),
+            &baseline_state,
+            projection_sha256,
+            2,
+        )?
+    };
+    if baseline_identity != *current_identity {
+        return Err(format!(
+            "legacy Orc semantic state changed without an identity transition: {}",
+            source.source_path
+        ));
+    }
+    Ok(())
+}
+
+fn managed_object_digest(relative: &str) -> Option<String> {
+    let rest = relative.strip_prefix(&format!("{SNAPSHOT_OBJECT_ROOT}/"))?;
+    let (shard, name) = rest.split_once('/')?;
+    let digest = name.strip_suffix(".db")?;
+    if shard.len() == 2
+        && digest.len() == 64
+        && shard
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        && digest
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        && &digest[..2] == shard
+    {
+        Some(digest.to_string())
+    } else {
+        None
+    }
+}
+
+/// Refuse when a recorded alias does not authenticate.
+pub fn validate_semantic_alias(
+    snapshot_root: &Path,
+    source: &SourceCopy,
+    canonical: &SemanticIdentity,
+) -> Result<(), String> {
+    let recorded = (
+        source.semantic_sha256.clone(),
+        source.semantic_complete_bytes,
+    );
+    let expected = (canonical.sha256.clone(), canonical.complete_bytes);
+    if source.kind == "task" {
+        if recorded != expected || source.semantic_alias_baseline_path.is_some() {
+            return Err(format!(
+                "task semantic alias differs from canonical history: {}",
+                source.source_path
+            ));
+        }
+        return Ok(());
+    }
+    if recorded == expected {
+        if source.semantic_alias_baseline_path.is_some() {
+            return Err(format!(
+                "canonical Orc semantic identity has an unnecessary alias baseline: {}",
+                source.source_path
+            ));
+        }
+        return Ok(());
+    }
+    let relative = source
+        .semantic_alias_baseline_path
+        .clone()
+        .unwrap_or_else(|| source.snapshot_path.clone());
+    let Some(digest) = managed_object_digest(&relative) else {
+        return Err(format!(
+            "Orc semantic alias baseline is not a managed object: {relative}"
+        ));
+    };
+    let path = snapshot_path(snapshot_root, &relative)?;
+    let is_symlink = std::fs::symlink_metadata(&path)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false);
+    if is_symlink || !path.is_file() || sha256_file(&path)? != digest {
+        return Err(format!(
+            "Orc semantic alias baseline is missing or unsafe: {}",
+            path.display()
+        ));
+    }
+    let meta = session_meta(&path, &source.source_path)?;
+    let auxiliary = auxiliary_observation(&path, &meta)?;
+    let baseline_canonical = session_semantic_identity(
+        &source.source_path,
+        &source.owner_session_id,
+        &session_canonical_state(&path, &meta)?,
+        &meta,
+        &auxiliary,
+        4,
+    )?;
+    if baseline_canonical != *canonical {
+        return Err(format!(
+            "Orc semantic alias baseline has different canonical semantics: {}",
+            source.source_path
+        ));
+    }
+    let mut states = vec![logical_state(&path, "session", None, false, None)?];
+    if states[0].append_max_id.has_session_tag() {
+        for mode in ["content-only", "messages-only"] {
+            states.push(logical_state(&path, "session", None, false, Some(mode))?);
+        }
+    }
+    let mut identities: Vec<(String, i64)> = Vec::new();
+    for state in &states {
+        let identity = session_semantic_identity(
+            &source.source_path,
+            &source.owner_session_id,
+            state,
+            &meta,
+            &auxiliary,
+            if state.append_max_id.has_session_tag() {
+                3
+            } else {
+                2
+            },
+        )?;
+        let held = (identity.sha256, identity.complete_bytes);
+        if !identities.contains(&held) {
+            identities.push(held);
+        }
+    }
+    if !identities.contains(&recorded) {
+        return Err(format!(
+            "Orc semantic alias does not match its authenticated baseline: {}",
+            source.source_path
+        ));
+    }
+    Ok(())
+}
+
+/// Authenticate one snapshotted source against its
+/// manifest record; returns its canonical identity.
+pub fn validate_source_semantic_identity(
+    snapshot_root: &Path,
+    source: &SourceCopy,
+) -> Result<SemanticIdentity, String> {
+    let path = snapshot_path(snapshot_root, &source.snapshot_path)?;
+    let is_symlink = std::fs::symlink_metadata(&path)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false);
+    if is_symlink || !path.is_file() || sha256_file(&path)? != source.sha256 {
+        return Err(format!(
+            "Orc snapshot does not match its manifest: {}",
+            path.display()
+        ));
+    }
+    let state = logical_state(&path, &source.kind, None, false, None)?;
+    validate_manifest_logical_state(source, &state, &path.display().to_string())?;
+    let mut projection_sha256: Option<String> = None;
+    let identity: SemanticIdentity;
+    if source.kind == "session" {
+        let meta = session_meta(&path, &source.source_path)?;
+        let auxiliary = auxiliary_observation(&path, &meta)?;
+        if source.auxiliary.message_count != auxiliary.messages.len() as i64
+            || source.auxiliary.message_sha256 != auxiliary.message_sha256
+            || source.auxiliary.stable_spawn_count != auxiliary.stable_spawns.len() as i64
+            || source.auxiliary.stable_spawn_sha256 != auxiliary.stable_spawn_sha256
+        {
+            return Err(format!(
+                "Orc auxiliary evidence does not match its snapshot: {}",
+                path.display()
+            ));
+        }
+        let legacy_identity = session_semantic_identity(
+            &source.source_path,
+            &source.owner_session_id,
+            &state,
+            &meta,
+            &auxiliary,
+            if state.append_max_id.has_session_tag() {
+                3
+            } else {
+                2
+            },
+        )?;
+        let mut accepted: Vec<(String, i64)> = vec![(
+            legacy_identity.sha256.clone(),
+            legacy_identity.complete_bytes,
+        )];
+        if state.append_max_id.has_session_tag() {
+            for mode in ["content-only", "messages-only"] {
+                let storage_state = logical_state(&path, "session", None, false, Some(mode))?;
+                let storage_identity = session_semantic_identity(
+                    &source.source_path,
+                    &source.owner_session_id,
+                    &storage_state,
+                    &meta,
+                    &auxiliary,
+                    2,
+                )?;
+                accepted.push((storage_identity.sha256, storage_identity.complete_bytes));
+            }
+        }
+        identity = session_semantic_identity(
+            &source.source_path,
+            &source.owner_session_id,
+            &session_canonical_state(&path, &meta)?,
+            &meta,
+            &auxiliary,
+            4,
+        )?;
+        if source.canonical_semantic_sha256.is_none()
+            && source.semantic_identity_mode == SEMANTIC_IDENTITY_DETERMINISTIC
+            && !accepted.contains(&(
+                source.semantic_sha256.clone(),
+                source.semantic_complete_bytes,
+            ))
+            && (
+                source.semantic_sha256.clone(),
+                source.semantic_complete_bytes,
+            ) != (identity.sha256.clone(), identity.complete_bytes)
+        {
+            return Err(format!(
+                "Orc deterministic semantic identity does not match artifacts: {}",
+                source.source_path
+            ));
+        }
+    } else {
+        let Some(projection) = &source.task_projection else {
+            return Err(format!(
+                "task source lacks frozen enrichment: {}",
+                source.source_path
+            ));
+        };
+        if projection.policy == TASK_HISTORY_POLICY {
+            let frozen = load_frozen_task_projection(snapshot_root, projection)?;
+            let current_records = observed_task_notes(&path)?;
+            let current_sequence = task_note_sequence(&path)?;
+            if let Some(recorded_sequence) = projection.observed_note_sequence {
+                if current_sequence != recorded_sequence {
+                    return Err(format!(
+                        "task note allocation sequence does not match its snapshot: {}",
+                        path.display()
+                    ));
+                }
+            }
+            let unexpected: Vec<i64> = current_records
+                .iter()
+                .filter(|record| !frozen.iter().any(|held| held.note_id == record.note_id))
+                .map(|record| record.note_id)
+                .collect();
+            if let Some(first) = unexpected.iter().min() {
+                return Err(format!(
+                    "task snapshot contains an unfrozen note for {}: {first}",
+                    source.source_path
+                ));
+            }
+            for observed in &current_records {
+                let prior = frozen
+                    .iter()
+                    .find(|held| held.note_id == observed.note_id)
+                    .expect("checked present");
+                if (
+                    observed.task_id.clone(),
+                    observed.content.clone(),
+                    observed.created_at.clone(),
+                ) != (
+                    prior.task_id.clone(),
+                    prior.content.clone(),
+                    prior.created_at.clone(),
+                ) {
+                    return Err(format!(
+                        "task note immutable core was rewritten for note {} in {}",
+                        observed.note_id, source.source_path
+                    ));
+                }
+            }
+            let enrichment_sha256 = task_enrichment_sha256(&frozen);
+            if enrichment_sha256 != projection.observed_enrichment_sha256 {
+                return Err(format!(
+                    "frozen task enrichment does not match its manifest: {}",
+                    path.display()
+                ));
+            }
+            let (rewrite_sha256, missing_count, missing_sha256) =
+                task_rewrite_observation(&frozen, &current_records);
+            let (gap_count, gap_sha256) = task_unobserved_id_gaps(&frozen, current_sequence);
+            if rewrite_sha256 != projection.observed_note_rewrite_sha256
+                || missing_count != projection.missing_note_count
+                || missing_sha256 != projection.missing_note_ids_sha256
+                || (projection.unobserved_note_id_gap_count.is_some()
+                    && (gap_count != projection.unobserved_note_id_gap_count.unwrap_or(0)
+                        || gap_sha256
+                            != projection
+                                .unobserved_note_id_gap_sha256
+                                .clone()
+                                .unwrap_or_default()))
+            {
+                return Err(format!(
+                    "task rewrite observation does not match its snapshot: {}",
+                    path.display()
+                ));
+            }
+            projection_sha256 = Some(enrichment_sha256.clone());
+            identity = task_semantic_identity(
+                &source.source_path,
+                &source.owner_session_id,
+                source.task_source_ordinal.unwrap_or(0),
+                &frozen_task_logical_state(&frozen),
+                &enrichment_sha256,
+                2,
+            )?;
+        } else {
+            load_legacy_task_projection(snapshot_root, projection)?;
+            let observation = task_enrichment_observation(&path)?;
+            if observation.sha256 != projection.observed_enrichment_sha256 {
+                return Err(format!(
+                    "task enrichment observation does not match its snapshot: {}",
+                    path.display()
+                ));
+            }
+            projection_sha256 = Some(projection.sha256.clone());
+            identity = task_semantic_identity(
+                &source.source_path,
+                &source.owner_session_id,
+                source.task_source_ordinal.unwrap_or(0),
+                &state,
+                &projection.sha256,
+                2,
+            )?;
+        }
+    }
+    if let Some(canonical_sha) = &source.canonical_semantic_sha256 {
+        if *canonical_sha != identity.sha256
+            || source.canonical_semantic_complete_bytes != Some(identity.complete_bytes)
+        {
+            return Err(format!(
+                "Orc canonical semantic identity does not match artifacts: {}",
+                source.source_path
+            ));
+        }
+    }
+    if source.canonical_semantic_sha256.is_some()
+        && source.semantic_identity_mode == SEMANTIC_IDENTITY_DETERMINISTIC
+    {
+        validate_semantic_alias(snapshot_root, source, &identity)?;
+    }
+    if source.kind != "session" && source.canonical_semantic_sha256.is_none() {
+        validate_recorded_semantic_identity(source, &identity, &source.source_path)?;
+    }
+    validate_legacy_semantic_identity(
+        snapshot_root,
+        source,
+        &identity,
+        projection_sha256.as_deref(),
+    )?;
+    Ok(identity)
 }
