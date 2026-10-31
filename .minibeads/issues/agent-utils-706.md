@@ -226,3 +226,14 @@ responsiveness 50, discover-agents 50, `--userguide`):
 
 Each lands with its own fixture differential, gate, and note,
 same rules as slices 1-8.
+
+## Slice 9a landed: `export` (single-team) (2026-10-26)
+
+`wrkviz export` single-team is ported (`5b2940e6` on main):
+verbatim help, argparse-compatible errors, windowed slices over
+`build_archive`, and `website_export` run records. Multi-team
+combined export refuses by name pending its own stage. Gate 145
+rc=0 (log `/tmp/gate145-export.log`). The differential's scrub
+list grew `bootstrap_bytes`/`bootstrap_transfer_bytes`: the
+bootstrap text embeds compressed shard sizes, so its length is
+zlib-generation dependent across a digit boundary.
