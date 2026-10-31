@@ -79,17 +79,14 @@ pub fn complete_prefix(data: &[u8]) -> &[u8] {
 }
 
 fn split_lines(data: &[u8]) -> Vec<&[u8]> {
-    // CPython `bytes.splitlines`: boundaries are \n, \r, \r\n,
-    // \v, \f, \x1c-\x1e and \x85, at the byte level.
+    // CPython `bytes.splitlines`: boundaries are \n, \r and
+    // \r\n only (the wide set belongs to `str.splitlines`).
     let mut lines = Vec::new();
     let mut start = 0;
     let mut index = 0;
     while index < data.len() {
         let byte = data[index];
-        if matches!(
-            byte,
-            b'\n' | b'\r' | 0x0b | 0x0c | 0x1c | 0x1d | 0x1e | 0x85
-        ) {
+        if matches!(byte, b'\n' | b'\r') {
             lines.push(&data[start..index]);
             if byte == b'\r' && data.get(index + 1) == Some(&b'\n') {
                 index += 1;
@@ -141,7 +138,10 @@ pub(crate) fn parse_lenient(raw: &[u8]) -> Option<Value> {
     while index < bytes.len() {
         let byte = bytes[index];
         if in_string {
-            out.push(byte as char);
+            // Push the full UTF-8 scalar, not one byte.
+            let ch_len = utf8_len(byte);
+            out.push_str(&text[index..(index + ch_len).min(text.len())]);
+            index += ch_len;
             if escaped {
                 escaped = false;
             } else if byte == b'\\' {
@@ -149,7 +149,6 @@ pub(crate) fn parse_lenient(raw: &[u8]) -> Option<Value> {
             } else if byte == b'"' {
                 in_string = false;
             }
-            index += 1;
             continue;
         }
         if byte == b'"' {

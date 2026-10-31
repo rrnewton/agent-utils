@@ -43,6 +43,7 @@ mod follow;
 pub mod history;
 mod locate;
 pub mod muse;
+pub mod muse_records;
 mod proc;
 pub mod replies;
 pub mod rollout;

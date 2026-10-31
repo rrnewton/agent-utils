@@ -76,10 +76,7 @@ fn split_lines(data: &[u8]) -> Vec<&[u8]> {
     let mut index = 0;
     while index < data.len() {
         let byte = data[index];
-        if matches!(
-            byte,
-            b'\n' | b'\r' | 0x0b | 0x0c | 0x1c | 0x1d | 0x1e | 0x85
-        ) {
+        if matches!(byte, b'\n' | b'\r') {
             lines.push(&data[start..index]);
             if byte == b'\r' && data.get(index + 1) == Some(&b'\n') {
                 index += 1;

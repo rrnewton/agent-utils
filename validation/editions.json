@@ -172,7 +172,7 @@
       "parity_check": null,
       "rust_entrypoint": null,
       "python_entrypoint": "py/bin/wrkviz",
-      "note": "Python-primary; the Rust edition grows in rs/wrkviz subcommand by subcommand (#706 rust-primary-wrkviz) at differential parity: inspect, query list, query show for team/agent/phase/rollup references, query stats, query prompts/messages, query search including message:/tool: show references, serve, quickstart, extract-transcripts (schema 3 and schema 1; the schema-2 generation is not yet ported and refuses by name) over synthetic corpora, and ingest-claude-history, Codex ingest, and Claude ingest (the shared ingest writer: snapshot store, payload store, artifact catalog, site identity) over history, rollout, and session fixtures. Commands the Rust edition has not ported refuse by name. Static site assets carry over to the Rust edition when it becomes primary."
+      "note": "Python-primary; the Rust edition grows in rs/wrkviz subcommand by subcommand (#706 rust-primary-wrkviz) at differential parity: inspect, query list, query show for team/agent/phase/rollup references, query stats, query prompts/messages, query search including message:/tool: show references, serve, quickstart, extract-transcripts (schema 3 and schema 1; the schema-2 generation is not yet ported and refuses by name) over synthetic corpora, and ingest-claude-history, Codex ingest, Claude ingest, and Muse ingest (the shared ingest writer: snapshot store, payload store, artifact catalog, site identity) over history, rollout, and session fixtures. Commands the Rust edition has not ported refuse by name. Static site assets carry over to the Rust edition when it becomes primary."
     },
     {
       "name": "agent-teams",

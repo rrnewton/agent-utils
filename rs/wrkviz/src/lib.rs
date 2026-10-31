@@ -40,6 +40,8 @@ pub mod inspect;
 /// The archive JSON value domain and the Python-shaped readers
 /// over it.
 pub mod json;
+/// Muse session lineage ingestion.
+pub mod muse;
 /// Content-addressed tool payload storage.
 pub mod payloads;
 /// Archive transactions: writer lock, team loading, run records.

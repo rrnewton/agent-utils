@@ -1228,3 +1228,163 @@ fn ingest_claude_locked(
     report.upstream_retired_sources = source_copies.upstream_retired.clone();
     Ok((team, report))
 }
+
+// ---------------------------------------------------------------- Muse
+
+/// Load the recorded Muse source manifest, if any.
+pub fn load_muse_manifest(
+    archive: &Path,
+    team_slug: &str,
+    root_session_id: &str,
+    date_window: Option<&DateWindow>,
+) -> Result<Vec<crate::muse::MuseSourceCopy>, String> {
+    let path = build_raw(archive, team_slug, "source-manifest.json")?;
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    let document = read_json(&path)?;
+    let object = as_object(&document, &path.display().to_string())?;
+    if !crate::json::json_eq_one(object.get("schema_version"))
+        || object.get("provider").and_then(Value::as_str) != Some("muse")
+    {
+        return Err(format!(
+            "invalid Muse source manifest at {}",
+            path.display()
+        ));
+    }
+    let recorded_root = crate::json::as_string(
+        object.get("root_thread_id").unwrap_or(&Value::Null),
+        &format!("{}: root_thread_id", path.display()),
+    )?;
+    if recorded_root != root_session_id {
+        return Err(format!(
+            "source manifest belongs to root {}, not {}",
+            py_repr_str(recorded_root),
+            py_repr_str(root_session_id)
+        ));
+    }
+    let null = Value::Null;
+    validate_manifest_window(
+        object.get("date_window").unwrap_or(&null),
+        date_window,
+        &path.display().to_string(),
+    )?;
+    let raw_sources = crate::json::as_array(
+        object.get("sources").unwrap_or(&null),
+        &format!("{}: sources", path.display()),
+    )?;
+    let mut sources = Vec::new();
+    for (index, raw_source) in raw_sources.iter().enumerate() {
+        let where_ = format!("{}: sources[{index}]", path.display());
+        let _ = as_object(raw_source, &where_)?;
+        sources.push(crate::muse::MuseSourceCopy::from_json(raw_source, &where_)?);
+    }
+    Ok(sources)
+}
+
+/// Snapshot and normalize one Muse session and its subagents.
+#[allow(clippy::too_many_arguments)]
+pub fn ingest_muse(
+    archive: &Path,
+    session_dir: &Path,
+    team_slug: &str,
+    display_timezone: &str,
+    date_window: Option<&DateWindow>,
+    identity_overrides: &IdentityOverrides,
+    requested_snapshot_root: Option<&Path>,
+) -> Result<(TeamData, IngestReport), String> {
+    let _lock = crate::pipeline::archive_writer_lock(archive)?;
+    ingest_muse_locked(
+        archive,
+        session_dir,
+        team_slug,
+        display_timezone,
+        date_window,
+        identity_overrides,
+        requested_snapshot_root,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ingest_muse_locked(
+    archive: &Path,
+    session_dir: &Path,
+    team_slug: &str,
+    display_timezone: &str,
+    date_window: Option<&DateWindow>,
+    identity_overrides: &IdentityOverrides,
+    requested_snapshot_root: Option<&Path>,
+) -> Result<(TeamData, IngestReport), String> {
+    let root_session_id = session_dir
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    crate::pipeline::ensure_archive_pub(archive, team_slug, true)?;
+    let mut changed = i64::from(ensure_bulk_content_ignored(archive)?);
+    let previous_sources = load_muse_manifest(archive, team_slug, &root_session_id, date_window)?;
+    let location = source_snapshot_location(archive, team_slug, requested_snapshot_root)?;
+    let source_copies = crate::muse::snapshot_muse_lineage(
+        session_dir,
+        &location.root,
+        &previous_sources,
+        &crate::pipeline::utc_now(),
+    )?;
+    changed += source_copies.files_changed;
+    let allowed_sources: Vec<String> = source_copies
+        .sources
+        .iter()
+        .map(|source| source.snapshot_path.clone())
+        .collect();
+    let team = apply_date_window(
+        crate::muse::load_muse_team(
+            &location.root,
+            &root_session_id,
+            team_slug,
+            display_timezone,
+            &allowed_sources,
+        )?,
+        date_window,
+    );
+    if record_site_identity(archive, &team, identity_overrides)? {
+        changed += 1;
+    }
+    let mut manifest = Map::new();
+    manifest.insert("schema_version".into(), 1.into());
+    manifest.insert("provider".into(), Value::String("muse".to_string()));
+    manifest.insert(
+        "root_thread_id".into(),
+        Value::String(root_session_id.clone()),
+    );
+    manifest.insert(
+        "source_root".into(),
+        Value::String(crate::json::resolve_path(session_dir).display().to_string()),
+    );
+    manifest.insert(
+        "snapshot_root".into(),
+        Value::String(location.archive_relative()),
+    );
+    manifest.insert(
+        "date_window".into(),
+        date_window.map_or(Value::Null, DateWindow::to_json),
+    );
+    manifest.insert(
+        "sources".into(),
+        Value::Array(
+            source_copies
+                .sources
+                .iter()
+                .map(crate::muse::MuseSourceCopy::to_json)
+                .collect(),
+        ),
+    );
+    if write_json_if_changed(
+        &build_raw(archive, team_slug, "source-manifest.json")?,
+        &Value::Object(manifest),
+    )? {
+        changed += 1;
+    }
+    let (team, mut report) =
+        write_ingested_team(archive, team_slug, &team, date_window, changed, &location)?;
+    report.upstream_retired_sources = source_copies.upstream_retired.clone();
+    Ok((team, report))
+}
