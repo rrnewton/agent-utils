@@ -217,6 +217,55 @@ options:
 const QUERY_PROMPTS_USAGE: &str = "usage: wrkviz query prompts [-h] [--range ORDINAL_RANGE]\n                            [--which {human,bot,all}] [--limit N] [--tail N]\n                            [--verify] [--team TEAM] [--start-time START_TIME]\n                            [--end-time END_TIME]";
 const QUERY_MESSAGES_USAGE: &str = "usage: wrkviz query messages [-h] [--range ORDINAL_RANGE]\n                             [--which {human,bot,all}] [--limit N] [--tail N]\n                             [--verify] [--team TEAM]\n                             [--start-time START_TIME] [--end-time END_TIME]";
 
+/// The Python edition's query-search help, verbatim.
+pub const QUERY_SEARCH_HELP: &str = r#"usage: wrkviz query search [-h]
+                           [--in {owner-prompts,agent-responses,all-transcript}]
+                           [--scope {summaries,transcripts,all}]
+                           [--match {smart,phrase,literal}]
+                           [--sort {relevance,newest,oldest}]
+                           [--prompt-author {any,owner,agent,unclassified}]
+                           [--linkage {any,linked,unlinked}]
+                           [--role {user,assistant,agent,system,external,goal,tool,event}]
+                           [--case-sensitive] [--offset OFFSET]
+                           [--limit LIMIT] [--team TEAM]
+                           [--start-time START_TIME] [--end-time END_TIME]
+                           [--kind {hourly,daily,weekly,monthly,quarterly}]
+                           [--agent AGENT]
+                           text
+
+search the canonical transcript corpus with stable message references, or use
+--scope for compatibility phase-transcript search
+
+positional arguments:
+  text                  text or pattern to find
+
+options:
+  -h, --help            show this help message and exit
+  --in {owner-prompts,agent-responses,all-transcript}
+                        search-v2 corpus: owner prompts, agent responses, or
+                        all transcript
+  --scope {summaries,transcripts,all}
+                        compatibility search scope (default when --in is
+                        absent: summaries)
+  --match {smart,phrase,literal}
+  --sort {relevance,newest,oldest}
+  --prompt-author {any,owner,agent,unclassified}
+  --linkage {any,linked,unlinked}
+  --role {user,assistant,agent,system,external,goal,tool,event}
+  --case-sensitive
+  --offset OFFSET
+  --limit LIMIT
+  --team TEAM           team slug to include; repeat to select multiple teams
+  --start-time START_TIME
+                        first RFC3339 instant to overlap (inclusive)
+  --end-time END_TIME   exclusive RFC3339 overlap boundary
+  --kind {hourly,daily,weekly,monthly,quarterly}
+                        rollup kind to include; repeat as needed
+  --agent AGENT         canonical agent:TEAM::ID reference to select
+"#;
+
+const QUERY_SEARCH_USAGE: &str = "usage: wrkviz query search [-h]\n                           [--in {owner-prompts,agent-responses,all-transcript}]\n                           [--scope {summaries,transcripts,all}]\n                           [--match {smart,phrase,literal}]\n                           [--sort {relevance,newest,oldest}]\n                           [--prompt-author {any,owner,agent,unclassified}]\n                           [--linkage {any,linked,unlinked}]\n                           [--role {user,assistant,agent,system,external,goal,tool,event}]\n                           [--case-sensitive] [--offset OFFSET]\n                           [--limit LIMIT] [--team TEAM]\n                           [--start-time START_TIME] [--end-time END_TIME]\n                           [--kind {hourly,daily,weekly,monthly,quarterly}]\n                           [--agent AGENT]\n                           text";
+
 const QUERY_USAGE: &str = "usage: wrkviz query [-h] --output OUTPUT [--format {json,jsonl,markdown,text}]\n                    {list,show,search,prompts,messages,stats} ...";
 const QUERY_STATS_USAGE: &str = "usage: wrkviz query stats [-h] [--team TEAM] [--start-time START_TIME]\n                          [--end-time END_TIME]\n                          [--kind {hourly,daily,weekly,monthly,quarterly}]";
 const QUERY_SHOW_USAGE: &str = "usage: wrkviz query show [-h] [--transcript] reference";
@@ -405,7 +454,7 @@ fn run_query(args: &[String]) -> u8 {
                     print!("{QUERY_SHOW_HELP}");
                     return 0;
                 }
-                Some("stats") | Some("prompts") | Some("messages") => {
+                Some("stats") | Some("prompts") | Some("messages") | Some("search") => {
                     // These parsers validate their options in
                     // order; a `--help` after an invalid choice
                     // must not win over that error.
@@ -506,6 +555,9 @@ fn run_query(args: &[String]) -> u8 {
             return run_query_stats("", &format, &rest, true);
         }
     }
+    if action.as_deref() == Some("search") && output.is_none() {
+        return run_query_search("", &format, &rest, true);
+    }
     if matches!(action.as_deref(), Some("prompts") | Some("messages")) && output.is_none() {
         // The subcommand parser runs before the query parser's
         // required-argument check: its own errors and help
@@ -538,6 +590,7 @@ fn run_query(args: &[String]) -> u8 {
         Some(action @ ("prompts" | "messages")) => {
             run_query_transcript(action, &output, &format, &rest, false)
         }
+        Some("search") => run_query_search(&output, &format, &rest, false),
         Some(other) => {
             eprintln!(
                 "wrkviz: the Rust edition has not ported 'query {other}' yet; the Python edition remains the oracle for it"
@@ -632,12 +685,6 @@ fn run_query_show(output: &str, format: &str, args: &[String]) -> u8 {
             return 2;
         }
     };
-    if reference.starts_with("message:") || reference.starts_with("tool:") {
-        eprintln!(
-            "wrkviz: the Rust edition has not ported 'query show' for transcript search references yet; the Python edition remains the oracle for it"
-        );
-        return 2;
-    }
     match timeline.show_record(&reference, transcript) {
         Ok(item) => {
             match crate::query::format_query(&format!("show {reference}"), &[item], format) {
@@ -865,6 +912,432 @@ fn run_query_transcript(
     };
     match items {
         Ok(items) => match crate::query::format_query(action, &items, format) {
+            Ok(text) => {
+                print!("{text}");
+                0
+            }
+            Err(error) => {
+                eprintln!("wrkviz: {error}");
+                2
+            }
+        },
+        Err(error) => {
+            eprintln!("wrkviz: {error}");
+            2
+        }
+    }
+}
+
+/// CPython `int()` grammar for `--offset`/`--limit`: optional
+/// surrounding whitespace and sign, digits with single
+/// underscores between them. Returns the clamped value and
+/// the canonical spelling (Python ints are unbounded).
+fn parse_py_int(value: &str) -> Option<(i64, String)> {
+    let trimmed = value.trim_matches([' ', '\t', '\n', '\r', '\u{b}', '\u{c}']);
+    let (negative, digits) = match trimmed.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, trimmed.strip_prefix('+').unwrap_or(trimmed)),
+    };
+    if digits.is_empty()
+        || digits.starts_with('_')
+        || digits.ends_with('_')
+        || digits.contains("__")
+        || !digits
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'_')
+    {
+        return None;
+    }
+    let cleaned: String = digits.chars().filter(|ch| *ch != '_').collect();
+    let magnitude = cleaned.trim_start_matches('0');
+    let magnitude = if magnitude.is_empty() { "0" } else { magnitude };
+    let canonical = if negative && magnitude != "0" {
+        format!("-{magnitude}")
+    } else {
+        magnitude.to_string()
+    };
+    let clamped =
+        canonical
+            .parse::<i64>()
+            .unwrap_or(if negative { i64::MIN + 1 } else { i64::MAX });
+    Some((clamped, canonical))
+}
+
+fn looks_like_negative_number(arg: &str) -> bool {
+    let Some(rest) = arg.strip_prefix('-') else {
+        return false;
+    };
+    if rest.starts_with('-') {
+        return false;
+    }
+    let (whole, fraction) = match rest.split_once('.') {
+        Some((whole, fraction)) => (whole, Some(fraction)),
+        None => (rest, None),
+    };
+    match fraction {
+        None => !whole.is_empty() && whole.bytes().all(|byte| byte.is_ascii_digit()),
+        Some(fraction) => {
+            (whole.is_empty() || whole.bytes().all(|byte| byte.is_ascii_digit()))
+                && !fraction.is_empty()
+                && fraction.bytes().all(|byte| byte.is_ascii_digit())
+        }
+    }
+}
+
+fn run_query_search(output: &str, format: &str, args: &[String], output_missing: bool) -> u8 {
+    let prog = "wrkviz query search";
+    let mut text: Option<String> = None;
+    let mut corpus: Option<String> = None;
+    let mut scope: Option<String> = None;
+    let mut match_mode: Option<String> = None;
+    let mut sort: Option<String> = None;
+    let mut prompt_author: Option<String> = None;
+    let mut linkage: Option<String> = None;
+    let mut roles: Vec<String> = Vec::new();
+    let mut case_sensitive = false;
+    let mut offset: Option<i64> = None;
+    let mut offset_display: Option<String> = None;
+    let mut limit: i64 = 50;
+    let mut filters = crate::query::Filters {
+        teams: Vec::new(),
+        start_time: None,
+        end_time: None,
+        kinds: Vec::new(),
+        agent: None,
+    };
+    let mut extras: Vec<String> = Vec::new();
+    let mut after_separator = false;
+    let mut index = 0;
+    let choice = |name: &str, value: &str, choices: &[&str], rendered: &str| -> Option<u8> {
+        if choices.contains(&value) {
+            return None;
+        }
+        Some(argparse_error(
+            QUERY_SEARCH_USAGE,
+            prog,
+            &format!("argument {name}: invalid choice: '{value}' (choose from {rendered})"),
+        ))
+    };
+    while index < args.len() {
+        let arg = &args[index];
+        if after_separator {
+            if text.is_none() {
+                text = Some(arg.clone());
+            } else {
+                extras.push(arg.clone());
+            }
+            index += 1;
+            continue;
+        }
+        if arg == "--" {
+            after_separator = true;
+            index += 1;
+            continue;
+        }
+        {
+            let (head, explicit) = match arg.split_once('=') {
+                Some((head, value)) => (head, Some(value)),
+                None => (arg.as_str(), None),
+            };
+            let long_help = head.len() > 1 && head.starts_with("--") && "--help".starts_with(head);
+            let short_help = !head.starts_with("--")
+                && head.len() > 1
+                && head.starts_with('-')
+                && head[1..].starts_with('h');
+            if long_help || short_help {
+                if let Some(value) = explicit {
+                    return argparse_error(
+                        QUERY_SEARCH_USAGE,
+                        prog,
+                        &format!("argument -h/--help: ignored explicit argument '{value}'"),
+                    );
+                }
+                print!("{QUERY_SEARCH_HELP}");
+                return 0;
+            }
+            if head.len() > 1 && head.starts_with("--") && "--case-sensitive".starts_with(head) {
+                if let Some(value) = explicit {
+                    return argparse_error(
+                        QUERY_SEARCH_USAGE,
+                        prog,
+                        &format!("argument --case-sensitive: ignored explicit argument '{value}'"),
+                    );
+                }
+                case_sensitive = true;
+                index += 1;
+                continue;
+            }
+        }
+        let mut handled = true;
+        for (name, target) in [
+            ("--in", 0),
+            ("--scope", 1),
+            ("--match", 2),
+            ("--sort", 3),
+            ("--prompt-author", 4),
+            ("--linkage", 5),
+            ("--role", 6),
+            ("--offset", 7),
+            ("--limit", 8),
+            ("--team", 9),
+            ("--start-time", 10),
+            ("--end-time", 11),
+            ("--kind", 12),
+            ("--agent", 13),
+        ] {
+            match named_value(args, &mut index, name) {
+                Ok(Some(value)) => {
+                    match target {
+                        0 => {
+                            if let Some(code) = choice(
+                                name,
+                                &value,
+                                &["owner-prompts", "agent-responses", "all-transcript"],
+                                "owner-prompts, agent-responses, all-transcript",
+                            ) {
+                                return code;
+                            }
+                            corpus = Some(value);
+                        }
+                        1 => {
+                            if let Some(code) = choice(
+                                name,
+                                &value,
+                                &["summaries", "transcripts", "all"],
+                                "summaries, transcripts, all",
+                            ) {
+                                return code;
+                            }
+                            scope = Some(value);
+                        }
+                        2 => {
+                            if let Some(code) = choice(
+                                name,
+                                &value,
+                                &["smart", "phrase", "literal"],
+                                "smart, phrase, literal",
+                            ) {
+                                return code;
+                            }
+                            match_mode = Some(value);
+                        }
+                        3 => {
+                            if let Some(code) = choice(
+                                name,
+                                &value,
+                                &["relevance", "newest", "oldest"],
+                                "relevance, newest, oldest",
+                            ) {
+                                return code;
+                            }
+                            sort = Some(value);
+                        }
+                        4 => {
+                            if let Some(code) = choice(
+                                name,
+                                &value,
+                                &["any", "owner", "agent", "unclassified"],
+                                "any, owner, agent, unclassified",
+                            ) {
+                                return code;
+                            }
+                            prompt_author = Some(value);
+                        }
+                        5 => {
+                            if let Some(code) = choice(
+                                name,
+                                &value,
+                                &["any", "linked", "unlinked"],
+                                "any, linked, unlinked",
+                            ) {
+                                return code;
+                            }
+                            linkage = Some(value);
+                        }
+                        6 => {
+                            if let Some(code) = choice(
+                                name,
+                                &value,
+                                &[
+                                    "user",
+                                    "assistant",
+                                    "agent",
+                                    "system",
+                                    "external",
+                                    "goal",
+                                    "tool",
+                                    "event",
+                                ],
+                                "user, assistant, agent, system, external, goal, tool, event",
+                            ) {
+                                return code;
+                            }
+                            roles.push(value);
+                        }
+                        7 | 8 => {
+                            let Some((parsed, canonical)) = parse_py_int(&value) else {
+                                return argparse_error(
+                                    QUERY_SEARCH_USAGE,
+                                    prog,
+                                    &format!("argument {name}: invalid int value: '{value}'"),
+                                );
+                            };
+                            if target == 7 {
+                                offset = Some(parsed);
+                                offset_display = Some(canonical);
+                            } else {
+                                limit = parsed;
+                            }
+                        }
+                        9 => filters.teams.push(value),
+                        10 => filters.start_time = Some(value),
+                        11 => filters.end_time = Some(value),
+                        12 => {
+                            if let Some(code) = choice(
+                                name,
+                                &value,
+                                &["hourly", "daily", "weekly", "monthly", "quarterly"],
+                                "hourly, daily, weekly, monthly, quarterly",
+                            ) {
+                                return code;
+                            }
+                            filters.kinds.push(value);
+                        }
+                        _ => filters.agent = Some(value),
+                    }
+                    break;
+                }
+                Ok(None) => {}
+                Err((_, message)) => return argparse_error(QUERY_SEARCH_USAGE, prog, &message),
+            }
+        }
+        if !is_option_token(
+            arg,
+            &[
+                "--in",
+                "--scope",
+                "--match",
+                "--sort",
+                "--prompt-author",
+                "--linkage",
+                "--role",
+                "--case-sensitive",
+                "--offset",
+                "--limit",
+                "--team",
+                "--start-time",
+                "--end-time",
+                "--kind",
+                "--agent",
+            ],
+        ) {
+            handled = false;
+        }
+        if !handled {
+            if text.is_none()
+                && (!arg.starts_with('-') || arg == "-" || looks_like_negative_number(arg))
+            {
+                text = Some(arg.clone());
+            } else {
+                extras.push(arg.clone());
+            }
+        }
+        index += 1;
+    }
+    let Some(needle) = text else {
+        return argparse_error(
+            QUERY_SEARCH_USAGE,
+            prog,
+            "the following arguments are required: text",
+        );
+    };
+    if extras.iter().any(|arg| arg != "--") {
+        eprintln!(
+            "usage: wrkviz [-h] [--version] [--userguide]\n              {{quickstart,ingest-project,ingest,ingest-claude,ingest-claude-history,ingest-muse,ingest-orc,summarize,build,extract-transcripts,export,refresh,github-metadata,refresh-claude,refresh-orc,serve,inspect,gc,migrate-build-state,migrate-snapshots,audit-glossary,audit-losslessness,query,responsiveness,discover-agents}}\n              ...\nwrkviz: error: unrecognized arguments: {}",
+            extras.join(" ")
+        );
+        return 2;
+    }
+    if output_missing {
+        return argparse_error(
+            QUERY_USAGE,
+            "wrkviz query",
+            "the following arguments are required: --output",
+        );
+    }
+    let timeline = match crate::query::Timeline::open(&cli_path(output)) {
+        Ok(timeline) => timeline,
+        Err(error) => {
+            eprintln!("wrkviz: {error}");
+            return 2;
+        }
+    };
+    let command = format!("search {needle}");
+    if let Some(corpus) = &corpus {
+        if scope.is_some() {
+            eprintln!("wrkviz: --in and --scope cannot be combined");
+            return 2;
+        }
+        if let Err(error) = crate::query::check_window(&filters) {
+            eprintln!("wrkviz: {error}");
+            return 2;
+        }
+        return match timeline.search_v2(
+            &needle,
+            corpus,
+            &filters,
+            case_sensitive,
+            match_mode.as_deref().unwrap_or("smart"),
+            sort.as_deref().unwrap_or("relevance"),
+            prompt_author.as_deref().unwrap_or("any"),
+            linkage.as_deref().unwrap_or("any"),
+            &roles,
+            offset.unwrap_or(0),
+            limit,
+        ) {
+            Ok(mut results) => {
+                if let Some(display) = &offset_display {
+                    results.offset_display = display.clone();
+                }
+                match crate::query::format_search_results(&results, &command, format) {
+                    Ok(text) => {
+                        print!("{text}");
+                        0
+                    }
+                    Err(error) => {
+                        eprintln!("wrkviz: {error}");
+                        2
+                    }
+                }
+            }
+            Err(error) => {
+                eprintln!("wrkviz: {error}");
+                2
+            }
+        };
+    }
+    if match_mode.is_some()
+        || sort.is_some()
+        || prompt_author.is_some()
+        || linkage.is_some()
+        || offset.is_some()
+        || !roles.is_empty()
+    {
+        eprintln!("wrkviz: search-v2 options require --in");
+        return 2;
+    }
+    if let Err(error) = crate::query::check_window(&filters) {
+        eprintln!("wrkviz: {error}");
+        return 2;
+    }
+    match timeline.search(
+        &needle,
+        scope.as_deref().unwrap_or("summaries"),
+        &filters,
+        case_sensitive,
+        limit,
+    ) {
+        Ok(items) => match crate::query::format_query(&command, &items, format) {
             Ok(text) => {
                 print!("{text}");
                 0

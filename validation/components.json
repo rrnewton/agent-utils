@@ -455,6 +455,7 @@
         "py/tests/test_wrkviz_inspect_rust.py",
         "py/tests/test_wrkviz_query_list_rust.py",
         "py/tests/test_wrkviz_query_prompts_rust.py",
+        "py/tests/test_wrkviz_query_search_rust.py",
         "py/tests/test_wrkviz_query_show_rust.py",
         "py/tests/test_wrkviz_query_stats_rust.py"
       ]

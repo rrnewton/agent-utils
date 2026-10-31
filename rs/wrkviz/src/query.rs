@@ -896,6 +896,1470 @@ impl Timeline {
         ])
     }
 
+    fn read_stream_records(
+        &self,
+        entry: &crate::inspect::ShardEntry,
+    ) -> Result<Vec<Map<String, Value>>, String> {
+        let Some(path) = schema_file(&self.root, &entry.path) else {
+            return Err(format!("schema-3 shard vanished: {}", entry.path));
+        };
+        let compressed =
+            std::fs::read(&path).map_err(|error| crate::json::os_error(&error, &path))?;
+        let mut decoded = Vec::new();
+        flate2::read::MultiGzDecoder::new(&compressed[..])
+            .read_to_end(&mut decoded)
+            .map_err(|error| error.to_string())?;
+        let text = String::from_utf8(decoded).map_err(|error| error.to_string())?;
+        let mut records = Vec::new();
+        for line in text.lines() {
+            if line.is_empty() {
+                continue;
+            }
+            let value = parse_json_lenient(line)?;
+            records.push(as_object(&value, &entry.path)?.clone());
+        }
+        Ok(records)
+    }
+
+    fn unwrap_record(
+        record: &Map<String, Value>,
+        kind: &str,
+        team: &str,
+        where_: &str,
+    ) -> Result<Map<String, Value>, String> {
+        let mut record = record.clone();
+        let found = record.remove("record_kind").unwrap_or(Value::Null);
+        if found.as_str() != Some(kind) {
+            return Err(format!(
+                "{where_}: expected a {} record, found {}",
+                py_repr(&Value::String(kind.to_string())),
+                py_repr(&found)
+            ));
+        }
+        match record.get("team") {
+            None | Some(Value::Null) => {
+                record.insert("team".to_string(), Value::String(team.to_string()));
+            }
+            Some(declared) => {
+                if declared.as_str() != Some(team) {
+                    return Err(format!(
+                        "{where_}: record names team {} in {}'s spine shard",
+                        py_repr(declared),
+                        py_repr(&Value::String(team.to_string()))
+                    ));
+                }
+            }
+        }
+        Ok(record)
+    }
+
+    fn has_search_corpus(three: &SchemaThree) -> bool {
+        three
+            .shards
+            .iter()
+            .any(|entry| entry.stream == "search" && entry.team.is_some() && entry.day.is_some())
+    }
+
+    fn search_blooms(
+        &self,
+        three: &SchemaThree,
+        wanted: &[String],
+    ) -> Result<std::collections::BTreeMap<String, Option<Value>>, String> {
+        let archive_teams: Vec<String> = {
+            let mut teams: Vec<String> = three
+                .shards
+                .iter()
+                .filter(|entry| entry.stream == "spine")
+                .filter_map(|entry| entry.team.clone())
+                .collect();
+            teams.sort();
+            teams.dedup();
+            teams
+        };
+        let in_scope: Vec<String> = if wanted.is_empty() {
+            archive_teams.clone()
+        } else {
+            archive_teams
+                .iter()
+                .filter(|team| wanted.iter().any(|item| item == *team))
+                .cloned()
+                .collect()
+        };
+        let mut blooms = std::collections::BTreeMap::new();
+        for team in in_scope {
+            let Some(entry) = three.shards.iter().find(|entry| {
+                entry.stream == "search_bloom" && entry.team.as_deref() == Some(&team)
+            }) else {
+                continue;
+            };
+            let owned: std::collections::BTreeSet<&str> = three
+                .shards
+                .iter()
+                .filter(|item| item.stream == "search" && item.team.as_deref() == Some(&team))
+                .map(|item| item.path.as_str())
+                .collect();
+            for record in self.read_stream_records(entry)? {
+                let where_ = format!("{} bloom", entry.path);
+                let record = Self::unwrap_record(&record, "search_bloom", &team, &where_)?;
+                let shard = as_string(
+                    record.get("shard").unwrap_or(&Value::Null),
+                    &format!("{where_}.shard"),
+                )?;
+                if !owned.contains(shard) {
+                    return Err(format!(
+                        "{where_}: prefilter names {}, which is not a search shard of team {}",
+                        py_repr(&Value::String(shard.to_string())),
+                        py_repr(&Value::String(team.clone()))
+                    ));
+                }
+                blooms.insert(shard.to_string(), record.get("bloom").cloned());
+            }
+        }
+        Ok(blooms)
+    }
+
+    fn validated_search_record(
+        &self,
+        record: &Map<String, Value>,
+        where_: &str,
+        shard_team: &str,
+        shard_start: i64,
+        shard_end: i64,
+        seen: &mut std::collections::BTreeSet<String>,
+    ) -> Result<Map<String, Value>, String> {
+        let reference = as_string(
+            record.get("ref").unwrap_or(&Value::Null),
+            &format!("{where_}.ref"),
+        )?
+        .to_string();
+        if as_int(
+            record.get("schema_version").unwrap_or(&Value::Null),
+            &format!("{where_}.schema_version"),
+        )? != 1
+        {
+            return Err(format!("unsupported transcript search record: {reference}"));
+        }
+        let record_team = as_string(
+            record.get("team").unwrap_or(&Value::Null),
+            &format!("{where_}.team"),
+        )?;
+        let at_ms = as_int(
+            record.get("at_ms").unwrap_or(&Value::Null),
+            &format!("{where_}.at_ms"),
+        )?;
+        if record_team != shard_team || !(shard_start <= at_ms && at_ms < shard_end) {
+            return Err(format!(
+                "transcript search record escapes shard: {reference}"
+            ));
+        }
+        let message_prefix = format!("message:{record_team}::");
+        let tool_prefix = format!("tool:{record_team}::");
+        if !reference.starts_with(&message_prefix) && !reference.starts_with(&tool_prefix) {
+            return Err(format!(
+                "invalid transcript search reference {}",
+                py_repr(&Value::String(reference.clone()))
+            ));
+        }
+        let record_type = as_string(
+            record.get("record_type").unwrap_or(&Value::Null),
+            &format!("{where_}.record_type"),
+        )?;
+        let event_identifier = as_string(
+            record.get("event_id").unwrap_or(&Value::Null),
+            &format!("{where_}.event_id"),
+        )?;
+        let expected = format!(
+            "{}{}",
+            if record_type == "tool" {
+                &tool_prefix
+            } else {
+                &message_prefix
+            },
+            event_identifier
+        );
+        if reference != expected {
+            return Err(format!(
+                "transcript search reference kind mismatch: {reference}"
+            ));
+        }
+        let agent_reference = as_string(
+            record.get("agent_ref").unwrap_or(&Value::Null),
+            &format!("{where_}.agent_ref"),
+        )?
+        .to_string();
+        let agent_identifier = as_string(
+            record.get("agent_id").unwrap_or(&Value::Null),
+            &format!("{where_}.agent_id"),
+        )?;
+        if agent_reference_for_id(record_team, agent_identifier) != agent_reference {
+            return Err(format!(
+                "transcript search record agent identity mismatch: {reference}"
+            ));
+        }
+        let Some((agent_kind, agent_record)) = self.lookup_entry(&agent_reference)? else {
+            return Err(format!(
+                "transcript search record has unknown agent {}",
+                py_repr(&Value::String(agent_reference.clone()))
+            ));
+        };
+        if agent_kind != "agent" {
+            return Err(format!(
+                "transcript search record has unknown agent {}",
+                py_repr(&Value::String(agent_reference.clone()))
+            ));
+        }
+        if team_of(&agent_record, "search record agent")? != record_team {
+            return Err(format!(
+                "transcript search record agent belongs to another team: {reference}"
+            ));
+        }
+        if let Some(prompt_reference) = record.get("prompt_ref") {
+            if !prompt_reference.is_null() {
+                let prompt_reference =
+                    as_string(prompt_reference, &format!("{where_}.prompt_ref"))?;
+                if !prompt_reference.starts_with(&message_prefix) {
+                    return Err(format!(
+                        "transcript search prompt reference belongs to another team: {reference}"
+                    ));
+                }
+            }
+        }
+        if let Some(in_scope) = record.get("prompt_in_scope") {
+            if !in_scope.is_null() && !matches!(in_scope, Value::Bool(_)) {
+                return Err(format!("{where_}.prompt_in_scope: expected a boolean"));
+            }
+        }
+        let role = as_string(
+            record.get("role").unwrap_or(&Value::Null),
+            &format!("{where_}.role"),
+        )?;
+        if ![
+            "user",
+            "assistant",
+            "agent",
+            "system",
+            "external",
+            "goal",
+            "tool",
+            "event",
+        ]
+        .contains(&role)
+        {
+            return Err(format!(
+                "unsupported transcript search role {}",
+                py_repr(&Value::String(role.to_string()))
+            ));
+        }
+        as_string(
+            record.get("text").unwrap_or(&Value::Null),
+            &format!("{where_}.text"),
+        )?;
+        if seen.contains(&reference) {
+            return Err(format!(
+                "duplicate transcript search reference {}",
+                py_repr(&Value::String(reference.clone()))
+            ));
+        }
+        seen.insert(reference);
+        Ok(record.clone())
+    }
+
+    fn iter_search_records(
+        &self,
+        filters: Option<&Filters>,
+        bloom_terms: &[String],
+    ) -> Result<Vec<Map<String, Value>>, String> {
+        match &self.generation {
+            Generation::Three(three) if Self::has_search_corpus(three) => {
+                let timeline_teams: std::collections::BTreeSet<String> = self
+                    .teams
+                    .iter()
+                    .map(|team| {
+                        as_string(
+                            team.get("slug").unwrap_or(&Value::Null),
+                            "timeline team.slug",
+                        )
+                        .map(str::to_string)
+                    })
+                    .collect::<Result<_, _>>()?;
+                let blooms = if bloom_terms.iter().any(|term| bloom_can_prune(term)) {
+                    self.search_blooms(
+                        three,
+                        filters.map(|item| item.teams.as_slice()).unwrap_or(&[]),
+                    )?
+                } else {
+                    std::collections::BTreeMap::new()
+                };
+                let window = match filters {
+                    None => None,
+                    Some(filters) => parse_window(filters)?,
+                };
+                let mut seen = std::collections::BTreeSet::new();
+                let mut out = Vec::new();
+                for entry in three.shards.iter().filter(|entry| entry.stream == "search") {
+                    let where_ = format!("timeline-v3.streams.search {}", entry.path);
+                    let (Some(shard_team), Some(day)) =
+                        (entry.team.as_deref(), entry.day.as_deref())
+                    else {
+                        return Err(format!("invalid transcript search shard scope at {where_}"));
+                    };
+                    if !timeline_teams.contains(shard_team) {
+                        return Err(format!("invalid transcript search shard scope at {where_}"));
+                    }
+                    let (shard_start, shard_end) = day_bounds(day, &where_)?;
+                    if let Some(filters) = filters {
+                        if !filters.teams.is_empty()
+                            && !filters.teams.iter().any(|team| team == shard_team)
+                        {
+                            continue;
+                        }
+                    }
+                    if let Some(window) = &window {
+                        if !window.overlaps(shard_start, shard_end) {
+                            continue;
+                        }
+                    }
+                    if !blooms.is_empty() {
+                        let raw = blooms.get(&entry.path).cloned().unwrap_or(None);
+                        if !bloom_might_match(
+                            raw.as_ref(),
+                            bloom_terms,
+                            &format!("{where_}.bloom"),
+                        )? {
+                            continue;
+                        }
+                    }
+                    let records = self.read_stream_records(entry)?;
+                    if records.len() as i64 != entry.records {
+                        return Err(format!(
+                            "transcript search shard count mismatch: {} holds {} records, the bootstrap says {}",
+                            entry.path,
+                            records.len(),
+                            entry.records
+                        ));
+                    }
+                    for (index, record) in records.iter().enumerate() {
+                        let record =
+                            Self::unwrap_record(record, "search_record", shard_team, &entry.path)?;
+                        out.push(self.validated_search_record(
+                            &record,
+                            &format!("{}.records[{index}]", entry.path),
+                            shard_team,
+                            shard_start,
+                            shard_end,
+                            &mut seen,
+                        )?);
+                    }
+                }
+                Ok(out)
+            }
+            _ => {
+                let bootstrap = self.root.join("data").join("timeline-v2.json");
+                if !bootstrap.is_file() {
+                    return Err(
+                        "this archive has no transcript search corpus; rebuild the website"
+                            .to_string(),
+                    );
+                }
+                Err("schema 2 transcript search is not yet ported in the Rust edition".to_string())
+            }
+        }
+    }
+
+    fn search_link_context(
+        &self,
+        filters: &Filters,
+        selected_agent: Option<&str>,
+        candidate_prompt_refs: &std::collections::BTreeSet<String>,
+        needed_prompt_refs: &std::collections::BTreeSet<String>,
+    ) -> Result<SearchLinkContext, String> {
+        let mut prompt_excerpts = std::collections::BTreeMap::new();
+        let mut response_counts: std::collections::BTreeMap<String, i64> =
+            std::collections::BTreeMap::new();
+        if candidate_prompt_refs.is_empty() && needed_prompt_refs.is_empty() {
+            return Ok(SearchLinkContext {
+                prompt_excerpts,
+                response_counts,
+            });
+        }
+        let Generation::Three(three) = &self.generation else {
+            // Without a schema-3 corpus the context comes from
+            // the same records the search walked.
+            let team_filters = Filters {
+                teams: filters.teams.clone(),
+                start_time: None,
+                end_time: None,
+                kinds: Vec::new(),
+                agent: None,
+            };
+            for record in self.iter_search_records(Some(&team_filters), &[])? {
+                let reference = as_string(
+                    record.get("ref").unwrap_or(&Value::Null),
+                    "search record.ref",
+                )?
+                .to_string();
+                let record_type = as_string(
+                    record.get("record_type").unwrap_or(&Value::Null),
+                    "search record.record_type",
+                )?;
+                if needed_prompt_refs.contains(&reference)
+                    && ["prompt", "inter_agent_prompt"].contains(&record_type)
+                {
+                    let text = as_string(
+                        record.get("text").unwrap_or(&Value::Null),
+                        "search record.text",
+                    )?;
+                    let compact: String = compact_text(text).chars().take(320).collect();
+                    prompt_excerpts.insert(reference.clone(), compact);
+                }
+                if !["response", "inter_agent_response"].contains(&record_type) {
+                    continue;
+                }
+                let prompt_reference = optional_string(&record, "prompt_ref");
+                let Some(prompt_reference) = prompt_reference else {
+                    continue;
+                };
+                if !candidate_prompt_refs.contains(prompt_reference) {
+                    continue;
+                }
+                let at_ms = as_int(
+                    record.get("at_ms").unwrap_or(&Value::Null),
+                    "search record.at_ms",
+                )?;
+                let window = parse_window(filters)?;
+                if let Some(window) = &window {
+                    if !window.contains_dec(&at_ms.to_string()) {
+                        continue;
+                    }
+                }
+                let agent_reference = as_string(
+                    record.get("agent_ref").unwrap_or(&Value::Null),
+                    "search record.agent_ref",
+                )?;
+                if let Some(selected) = selected_agent {
+                    if agent_reference != selected {
+                        continue;
+                    }
+                }
+                *response_counts
+                    .entry(prompt_reference.to_string())
+                    .or_insert(0) += 1;
+            }
+            return Ok(SearchLinkContext {
+                prompt_excerpts,
+                response_counts,
+            });
+        };
+        // Schema-3 linkage sidecars.
+        let mut days_by_team: std::collections::BTreeMap<String, std::collections::BTreeSet<i64>> =
+            std::collections::BTreeMap::new();
+        for entry in three.shards.iter().filter(|entry| entry.stream == "search") {
+            let (Some(team), Some(day)) = (entry.team.as_deref(), entry.day.as_deref()) else {
+                continue;
+            };
+            let (start_ms, _) =
+                day_bounds(day, &format!("timeline-v3.streams.search {}", entry.path))?;
+            days_by_team
+                .entry(team.to_string())
+                .or_default()
+                .insert(start_ms);
+        }
+        let archive_teams: Vec<String> = {
+            let mut teams: Vec<String> = three
+                .shards
+                .iter()
+                .filter(|entry| entry.stream == "spine")
+                .filter_map(|entry| entry.team.clone())
+                .collect();
+            teams.sort();
+            teams.dedup();
+            teams
+        };
+        let in_scope: Vec<String> = if filters.teams.is_empty() {
+            archive_teams.clone()
+        } else {
+            archive_teams
+                .iter()
+                .filter(|team| filters.teams.iter().any(|item| item == *team))
+                .cloned()
+                .collect()
+        };
+        let mut seen_prompts = std::collections::BTreeSet::new();
+        let mut seen_responses = std::collections::BTreeSet::new();
+        let window = parse_window(filters)?;
+        for team in in_scope {
+            let Some(entry) = three.shards.iter().find(|entry| {
+                entry.stream == "search_links" && entry.team.as_deref() == Some(&team)
+            }) else {
+                continue;
+            };
+            let where_ = format!("timeline-v3.streams.search_links {team}");
+            let message_prefix = format!("message:{team}::");
+            let agent_prefix = format!("agent:{team}::");
+            let days = days_by_team.get(&team).cloned().unwrap_or_default();
+            let read_half = |kind: &str| -> Result<Vec<Map<String, Value>>, String> {
+                let Some(&(first, count)) = entry.line_ranges.get(kind) else {
+                    return Ok(Vec::new());
+                };
+                let records = self.read_stream_records(entry)?;
+                let mut out = Vec::new();
+                for offset in 0..count {
+                    let Some(record) = records.get((first + offset) as usize) else {
+                        return Err(format!(
+                            "schema-3 shard {} ended before line {}",
+                            entry.path,
+                            first + offset
+                        ));
+                    };
+                    out.push(Self::unwrap_record(record, kind, &team, &entry.path)?);
+                }
+                Ok(out)
+            };
+            if !needed_prompt_refs.is_empty() {
+                for (index, prompt) in read_half("search_prompt")?.iter().enumerate() {
+                    let spot = format!("{where_}.prompts[{index}]");
+                    let reference = as_string(
+                        prompt.get("ref").unwrap_or(&Value::Null),
+                        &format!("{spot}.ref"),
+                    )?
+                    .to_string();
+                    if !reference.starts_with(&message_prefix) {
+                        return Err(format!(
+                            "transcript search linkage prompt belongs to another team: {reference}"
+                        ));
+                    }
+                    let excerpt = as_string(
+                        prompt.get("excerpt").unwrap_or(&Value::Null),
+                        &format!("{spot}.excerpt"),
+                    )?
+                    .to_string();
+                    if !needed_prompt_refs.contains(&reference) {
+                        continue;
+                    }
+                    if seen_prompts.contains(&reference) {
+                        return Err(format!(
+                            "duplicate transcript search linkage prompt {}",
+                            py_repr(&Value::String(reference.clone()))
+                        ));
+                    }
+                    seen_prompts.insert(reference.clone());
+                    prompt_excerpts.insert(reference, excerpt);
+                }
+            }
+            if !candidate_prompt_refs.is_empty() {
+                for (index, response) in read_half("search_response")?.iter().enumerate() {
+                    let spot = format!("{where_}.responses[{index}]");
+                    let reference = as_string(
+                        response.get("ref").unwrap_or(&Value::Null),
+                        &format!("{spot}.ref"),
+                    )?
+                    .to_string();
+                    if !reference.starts_with(&message_prefix) {
+                        return Err(format!(
+                            "transcript search linkage response belongs to another team: {reference}"
+                        ));
+                    }
+                    let prompt_reference = as_string(
+                        response.get("prompt_ref").unwrap_or(&Value::Null),
+                        &format!("{spot}.prompt_ref"),
+                    )?
+                    .to_string();
+                    if !prompt_reference.starts_with(&message_prefix) {
+                        return Err(format!(
+                            "transcript search linkage prompt belongs to another team: {reference}"
+                        ));
+                    }
+                    let at_ms = as_int(
+                        response.get("at_ms").unwrap_or(&Value::Null),
+                        &format!("{spot}.at_ms"),
+                    )?;
+                    if !days.contains(&(at_ms - at_ms.rem_euclid(86_400_000))) {
+                        return Err(format!(
+                            "transcript search linkage response escapes shard: {reference}"
+                        ));
+                    }
+                    let agent_reference = as_string(
+                        response.get("agent_ref").unwrap_or(&Value::Null),
+                        &format!("{spot}.agent_ref"),
+                    )?
+                    .to_string();
+                    if !agent_reference.starts_with(&agent_prefix) {
+                        return Err(format!(
+                            "transcript search linkage agent belongs to another team: {reference}"
+                        ));
+                    }
+                    let Some((agent_kind, agent_record)) = self.lookup_entry(&agent_reference)?
+                    else {
+                        return Err(format!(
+                            "transcript search linkage response has unknown agent {}",
+                            py_repr(&Value::String(agent_reference.clone()))
+                        ));
+                    };
+                    if agent_kind != "agent" {
+                        return Err(format!(
+                            "transcript search linkage response has unknown agent {}",
+                            py_repr(&Value::String(agent_reference.clone()))
+                        ));
+                    }
+                    if team_of(&agent_record, "search linkage response agent")? != team {
+                        return Err(format!(
+                            "transcript search linkage agent belongs to another team: {reference}"
+                        ));
+                    }
+                    if !candidate_prompt_refs.contains(&prompt_reference) {
+                        continue;
+                    }
+                    if let Some(window) = &window {
+                        if !window.contains_dec(&at_ms.to_string()) {
+                            continue;
+                        }
+                    }
+                    if let Some(selected) = selected_agent {
+                        if agent_reference != selected {
+                            continue;
+                        }
+                    }
+                    if seen_responses.contains(&reference) {
+                        return Err(format!(
+                            "duplicate transcript search linkage response {}",
+                            py_repr(&Value::String(reference.clone()))
+                        ));
+                    }
+                    seen_responses.insert(reference);
+                    *response_counts.entry(prompt_reference).or_insert(0) += 1;
+                }
+            }
+        }
+        Ok(SearchLinkContext {
+            prompt_excerpts,
+            response_counts,
+        })
+    }
+
+    fn phase_reference_for_search_record(
+        &self,
+        record: &Map<String, Value>,
+    ) -> Result<Option<String>, String> {
+        let team = as_string(
+            record.get("team").unwrap_or(&Value::Null),
+            "search record.team",
+        )?
+        .to_string();
+        let agent_id = as_string(
+            record.get("agent_id").unwrap_or(&Value::Null),
+            "search record.agent_id",
+        )?;
+        let at_ms = as_int(
+            record.get("at_ms").unwrap_or(&Value::Null),
+            "search record.at_ms",
+        )?;
+        let local = local_identifier(&team, agent_id);
+        let mut best: Option<(i64, String)> = None;
+        for phase in self.collection("phases", None)? {
+            let phase_team = team_of(&phase, "phase")?;
+            if phase_team != team {
+                continue;
+            }
+            let phase_agent = as_string(
+                phase.get("agent_id").unwrap_or(&Value::Null),
+                "phase.agent_id",
+            )?;
+            if local_identifier(&phase_team, phase_agent) != local {
+                continue;
+            }
+            let (start_ms, end_ms) = interval(&phase, "phase")?;
+            if start_ms <= at_ms && at_ms < end_ms {
+                let candidate = (end_ms - start_ms, phase_ref(&phase, "phase")?);
+                if best.as_ref().is_none_or(|current| candidate < *current) {
+                    best = Some(candidate);
+                }
+            }
+        }
+        Ok(best.map(|(_, reference)| reference))
+    }
+
+    /// `TimelineQuery.search_v2` over the canonical corpus.
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_v2(
+        &self,
+        needle: &str,
+        corpus: &str,
+        filters: &Filters,
+        case_sensitive: bool,
+        match_mode: &str,
+        sort: &str,
+        prompt_author: &str,
+        linkage: &str,
+        roles: &[String],
+        offset: i64,
+        limit: i64,
+    ) -> Result<SearchResults, String> {
+        if !["owner-prompts", "agent-responses", "all-transcript"].contains(&corpus) {
+            return Err(format!(
+                "unsupported search corpus {}",
+                py_repr(&Value::String(corpus.to_string()))
+            ));
+        }
+        if !["smart", "phrase", "literal"].contains(&match_mode) {
+            return Err(format!(
+                "unsupported search match mode {}",
+                py_repr(&Value::String(match_mode.to_string()))
+            ));
+        }
+        if !["relevance", "newest", "oldest"].contains(&sort) {
+            return Err(format!(
+                "unsupported search sort {}",
+                py_repr(&Value::String(sort.to_string()))
+            ));
+        }
+        if !["any", "owner", "agent", "unclassified"].contains(&prompt_author) {
+            return Err(format!(
+                "unsupported prompt author filter {}",
+                py_repr(&Value::String(prompt_author.to_string()))
+            ));
+        }
+        if !["any", "linked", "unlinked"].contains(&linkage) {
+            return Err(format!(
+                "unsupported linkage filter {}",
+                py_repr(&Value::String(linkage.to_string()))
+            ));
+        }
+        if roles.iter().any(|role| {
+            ![
+                "user",
+                "assistant",
+                "agent",
+                "system",
+                "external",
+                "goal",
+                "tool",
+                "event",
+            ]
+            .contains(&role.as_str())
+        }) {
+            return Err("unsupported transcript role filter".to_string());
+        }
+        if offset < 0 {
+            return Err("--offset must not be negative".to_string());
+        }
+        if limit < 1 {
+            return Err("--limit must be at least 1".to_string());
+        }
+        let selected_agent = self.validated_agent_filter(filters)?;
+        let matcher = compile_search_matcher(needle, match_mode, case_sensitive)?;
+        let window = parse_window(filters)?;
+        type Candidate = (i64, i64, String, Map<String, Value>, TextMatch);
+        let mut candidates: Vec<Candidate> = Vec::new();
+        for record in self.iter_search_records(Some(filters), &matcher.bloom_terms)? {
+            let reference = as_string(
+                record.get("ref").unwrap_or(&Value::Null),
+                "search record.ref",
+            )?
+            .to_string();
+            let record_type = as_string(
+                record.get("record_type").unwrap_or(&Value::Null),
+                "search record.record_type",
+            )?
+            .to_string();
+            let text = as_string(
+                record.get("text").unwrap_or(&Value::Null),
+                "search record.text",
+            )?
+            .to_string();
+            let team = as_string(
+                record.get("team").unwrap_or(&Value::Null),
+                "search record.team",
+            )?;
+            if !filters.teams.is_empty() && !filters.teams.iter().any(|item| item == team) {
+                continue;
+            }
+            let at_ms = as_int(
+                record.get("at_ms").unwrap_or(&Value::Null),
+                "search record.at_ms",
+            )?;
+            if let Some(window) = &window {
+                if !window.contains_dec(&at_ms.to_string()) {
+                    continue;
+                }
+            }
+            let agent_reference = as_string(
+                record.get("agent_ref").unwrap_or(&Value::Null),
+                "search record.agent_ref",
+            )?;
+            if let Some(selected) = &selected_agent {
+                if agent_reference != selected {
+                    continue;
+                }
+            }
+            let role = as_string(
+                record.get("role").unwrap_or(&Value::Null),
+                "search record.role",
+            )?;
+            if !roles.is_empty() && !roles.iter().any(|item| item == role) {
+                continue;
+            }
+            let author_kind = optional_string(&record, "author_kind");
+            let prompt_kind = optional_string(&record, "prompt_author_kind");
+            if corpus == "owner-prompts"
+                && !(record_type == "prompt" && author_kind == Some("owner_human"))
+            {
+                continue;
+            }
+            if corpus == "agent-responses"
+                && !["response", "inter_agent_response"].contains(&record_type.as_str())
+            {
+                continue;
+            }
+            let selected_prompt_kind =
+                if ["prompt", "inter_agent_prompt"].contains(&record_type.as_str()) {
+                    author_kind
+                } else {
+                    prompt_kind
+                };
+            if prompt_author == "owner" && selected_prompt_kind != Some("owner_human") {
+                continue;
+            }
+            if prompt_author == "agent"
+                && !matches!(selected_prompt_kind, Some(kind) if ["agent", "system"].contains(&kind))
+            {
+                continue;
+            }
+            if prompt_author == "unclassified"
+                && matches!(selected_prompt_kind, Some(kind) if ["owner_human", "other_human", "agent", "system"].contains(&kind))
+            {
+                continue;
+            }
+            let Some(text_match) = matcher.match_text(&text) else {
+                continue;
+            };
+            candidates.push((text_match.score, at_ms, reference, record, text_match));
+        }
+        let candidate_prompt_refs: std::collections::BTreeSet<String> = candidates
+            .iter()
+            .filter(|(_, _, _, record, _)| {
+                matches!(
+                    record.get("record_type").and_then(Value::as_str),
+                    Some("prompt") | Some("inter_agent_prompt")
+                )
+            })
+            .map(|(_, _, reference, _, _)| reference.clone())
+            .collect();
+        let needed_prompt_refs: std::collections::BTreeSet<String> = candidates
+            .iter()
+            .filter_map(|(_, _, reference, record, _)| {
+                optional_string(record, "prompt_ref")
+                    .filter(|prompt_ref| *prompt_ref != reference.as_str())
+                    .map(str::to_string)
+            })
+            .collect();
+        let SearchLinkContext {
+            prompt_excerpts,
+            response_counts,
+        } = self.search_link_context(
+            filters,
+            selected_agent.as_deref(),
+            &candidate_prompt_refs,
+            &needed_prompt_refs,
+        )?;
+        let mut matches: Vec<(i64, i64, String, Map<String, Value>)> = Vec::new();
+        for (score, at_ms, reference, record, text_match) in &candidates {
+            let record_type = as_string(
+                record.get("record_type").unwrap_or(&Value::Null),
+                "search record.record_type",
+            )?;
+            let prompt_reference = optional_string(record, "prompt_ref");
+            let linked = if ["prompt", "inter_agent_prompt"].contains(&record_type) {
+                response_counts.get(reference).copied().unwrap_or(0) > 0
+            } else {
+                prompt_reference.is_some() && prompt_reference != Some(reference.as_str())
+            };
+            if linkage == "linked" && !linked {
+                continue;
+            }
+            if linkage == "unlinked" && linked {
+                continue;
+            }
+            let excerpt_details = search_excerpt(text_match);
+            let excerpt = as_string(
+                excerpt_details.get("text").unwrap_or(&Value::Null),
+                "search excerpt.text",
+            )?
+            .to_string();
+            let mut item = Map::new();
+            item.insert("result_id".to_string(), Value::String(reference.clone()));
+            item.insert("ref".to_string(), Value::String(reference.clone()));
+            item.insert(
+                "record_type".to_string(),
+                Value::String(record_type.to_string()),
+            );
+            item.insert(
+                "role".to_string(),
+                record.get("role").cloned().unwrap_or(Value::Null),
+            );
+            item.insert(
+                "team".to_string(),
+                record.get("team").cloned().unwrap_or(Value::Null),
+            );
+            item.insert(
+                "agent_ref".to_string(),
+                record.get("agent_ref").cloned().unwrap_or(Value::Null),
+            );
+            item.insert(
+                "agent_path".to_string(),
+                record.get("agent_path").cloned().unwrap_or(Value::Null),
+            );
+            item.insert("at_ms".to_string(), Value::from(*at_ms));
+            item.insert("at_time".to_string(), Value::String(timestamp(*at_ms)));
+            item.insert(
+                "prompt_ref".to_string(),
+                record.get("prompt_ref").cloned().unwrap_or(Value::Null),
+            );
+            item.insert(
+                "prompt_at_ms".to_string(),
+                record.get("prompt_at_ms").cloned().unwrap_or(Value::Null),
+            );
+            item.insert(
+                "prompt_in_scope".to_string(),
+                record
+                    .get("prompt_in_scope")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            );
+            item.insert(
+                "prompt_author_kind".to_string(),
+                record
+                    .get("prompt_author_kind")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            );
+            item.insert(
+                "linked_response_count".to_string(),
+                Value::from(response_counts.get(reference).copied().unwrap_or(0)),
+            );
+            item.insert("score".to_string(), Value::from(*score));
+            item.insert(
+                "ranking_version".to_string(),
+                Value::String("search-rank-v1".to_string()),
+            );
+            item.insert(
+                "content_fidelity".to_string(),
+                record
+                    .get("content_fidelity")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            );
+            item.insert("excerpt".to_string(), Value::String(excerpt));
+            item.insert(
+                "excerpt_details".to_string(),
+                Value::Object(excerpt_details),
+            );
+            if let Some(phase_reference) = self.phase_reference_for_search_record(record)? {
+                item.insert("phase_ref".to_string(), Value::String(phase_reference));
+            }
+            if let Some(prompt_reference) = prompt_reference {
+                if prompt_reference != reference.as_str() {
+                    if let Some(prompt_excerpt) = prompt_excerpts.get(prompt_reference) {
+                        item.insert(
+                            "prompt_excerpt".to_string(),
+                            Value::String(prompt_excerpt.clone()),
+                        );
+                    }
+                }
+            }
+            matches.push((*score, *at_ms, reference.clone(), item));
+        }
+        match sort {
+            "relevance" => matches.sort_by(|a, b| {
+                b.0.cmp(&a.0)
+                    .then_with(|| b.1.cmp(&a.1))
+                    .then_with(|| a.2.cmp(&b.2))
+            }),
+            "newest" => matches.sort_by(|a, b| {
+                b.1.cmp(&a.1)
+                    .then_with(|| b.0.cmp(&a.0))
+                    .then_with(|| a.2.cmp(&b.2))
+            }),
+            _ => matches.sort_by(|a, b| {
+                a.1.cmp(&b.1)
+                    .then_with(|| b.0.cmp(&a.0))
+                    .then_with(|| a.2.cmp(&b.2))
+            }),
+        }
+        let total_matches = matches.len() as i64;
+        let page: Vec<Map<String, Value>> = matches
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .map(|(_, _, _, item)| item)
+            .collect();
+        Ok(SearchResults {
+            items: page,
+            total_matches,
+            offset,
+            offset_display: offset.to_string(),
+            limit,
+            corpus: corpus.to_string(),
+            match_mode: match_mode.to_string(),
+            sort: sort.to_string(),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn search_match(
+        results: &mut Vec<Map<String, Value>>,
+        needle: &str,
+        case_sensitive: bool,
+        reference: &str,
+        record_type: &str,
+        team: &str,
+        field: &str,
+        text: &str,
+        start_ms: Option<i64>,
+        at_ms: Option<i64>,
+    ) {
+        let contains = if case_sensitive {
+            text.contains(needle)
+        } else {
+            py_casefold(text).contains(&py_casefold(needle))
+        };
+        if !contains {
+            return;
+        }
+        let compact = compact_text(text);
+        // The oracle finds the needle in casefolded
+        // coordinates and slices the compact text with them;
+        // reproduce that, shifted windows and all.
+        let haystack: Vec<char> = (if case_sensitive {
+            compact.clone()
+        } else {
+            py_casefold(&compact)
+        })
+        .chars()
+        .collect();
+        let sought: Vec<char> = (if case_sensitive {
+            needle.to_string()
+        } else {
+            py_casefold(needle)
+        })
+        .chars()
+        .collect();
+        let compact_chars: Vec<char> = compact.chars().collect();
+        let position = haystack
+            .windows(sought.len().max(1))
+            .position(|window| window == sought.as_slice());
+        let excerpt = match position {
+            None => compact_chars.iter().take(240).collect::<String>(),
+            Some(position) => {
+                let start = position.saturating_sub(100);
+                let end = (position + needle.chars().count() + 140).min(compact_chars.len());
+                let prefix = if start > 0 { "…" } else { "" };
+                let suffix = if end < compact_chars.len() { "…" } else { "" };
+                format!(
+                    "{prefix}{}{suffix}",
+                    compact_chars[start..end].iter().collect::<String>()
+                )
+            }
+        };
+        let mut result = Map::new();
+        result.insert("ref".to_string(), Value::String(reference.to_string()));
+        result.insert(
+            "record_type".to_string(),
+            Value::String(record_type.to_string()),
+        );
+        result.insert("team".to_string(), Value::String(team.to_string()));
+        result.insert("field".to_string(), Value::String(field.to_string()));
+        result.insert("excerpt".to_string(), Value::String(excerpt));
+        if let Some(start_ms) = start_ms {
+            result.insert("start_ms".to_string(), Value::from(start_ms));
+            result.insert("start_time".to_string(), Value::String(timestamp(start_ms)));
+        }
+        if let Some(at_ms) = at_ms {
+            result.insert("at_ms".to_string(), Value::from(at_ms));
+            result.insert("at_time".to_string(), Value::String(timestamp(at_ms)));
+        }
+        results.push(result);
+    }
+
+    /// `TimelineQuery.search`: the compatibility scopes.
+    pub fn search(
+        &self,
+        needle: &str,
+        scope: &str,
+        filters: &Filters,
+        case_sensitive: bool,
+        limit: i64,
+    ) -> Result<Vec<Map<String, Value>>, String> {
+        if needle.is_empty() {
+            return Err("search text must not be empty".to_string());
+        }
+        if !["summaries", "transcripts", "all"].contains(&scope) {
+            return Err(format!(
+                "unsupported search scope {}",
+                py_repr(&Value::String(scope.to_string()))
+            ));
+        }
+        if limit < 1 {
+            return Err("--limit must be at least 1".to_string());
+        }
+        let selected_agent = self.validated_agent_filter(filters)?;
+        let window = parse_window(filters)?;
+        let mut matches: Vec<Map<String, Value>> = Vec::new();
+        if ["summaries", "all"].contains(&scope) {
+            // agents
+            for record in self.scoped("agents", filters)? {
+                let team = team_of(&record, "agent")?;
+                let reference = agent_ref(&record, "agent")?;
+                if !filters.teams.is_empty() && !filters.teams.iter().any(|item| item == &team) {
+                    continue;
+                }
+                if let Some(selected) = &selected_agent {
+                    if &reference != selected {
+                        continue;
+                    }
+                }
+                let (start_ms, _) = interval(&record, &reference)?;
+                if let Some(window) = &window {
+                    let (_, end_ms) = interval(&record, &reference)?;
+                    if !window.overlaps(start_ms, end_ms) {
+                        continue;
+                    }
+                }
+                let mut fields: Vec<&str> = vec!["short_name", "official_name", "nickname"];
+                if summary_available(&record, "summary_available")? {
+                    fields.extend(["lifetime_summary", "naming_rationale"]);
+                }
+                for field in fields {
+                    if let Some(text) = optional_string(&record, field) {
+                        if !text.is_empty() {
+                            Self::search_match(
+                                &mut matches,
+                                needle,
+                                case_sensitive,
+                                &reference,
+                                "agent",
+                                &team,
+                                field,
+                                text,
+                                Some(start_ms),
+                                None,
+                            );
+                        }
+                    }
+                }
+            }
+            // phases
+            for record in self.scoped("phases", filters)? {
+                let team = team_of(&record, "phase")?;
+                let current_agent = agent_reference_for_id(
+                    &team,
+                    as_string(
+                        record.get("agent_id").unwrap_or(&Value::Null),
+                        "phase.agent_id",
+                    )?,
+                );
+                if !filters.teams.is_empty() && !filters.teams.iter().any(|item| item == &team) {
+                    continue;
+                }
+                if let Some(selected) = &selected_agent {
+                    if &current_agent != selected {
+                        continue;
+                    }
+                }
+                let reference = phase_ref(&record, "phase")?;
+                let (start_ms, end_ms) = interval(&record, &reference)?;
+                if let Some(window) = &window {
+                    if !window.overlaps(start_ms, end_ms) {
+                        continue;
+                    }
+                }
+                if !summary_available(&record, "summary_available")? {
+                    continue;
+                }
+                for field in ["phrase", "paragraph"] {
+                    if let Some(text) = optional_string(&record, field) {
+                        if !text.is_empty() {
+                            Self::search_match(
+                                &mut matches,
+                                needle,
+                                case_sensitive,
+                                &reference,
+                                "phase",
+                                &team,
+                                field,
+                                text,
+                                Some(start_ms),
+                                None,
+                            );
+                        }
+                    }
+                }
+            }
+            // rollups
+            if selected_agent.is_none() {
+                for record in self.scoped("rollups", filters)? {
+                    let team = team_of(&record, "rollup")?;
+                    let kind =
+                        as_string(record.get("kind").unwrap_or(&Value::Null), "rollup.kind")?;
+                    let reference = rollup_ref(&record, "rollup")?;
+                    if !filters.teams.is_empty() && !filters.teams.iter().any(|item| item == &team)
+                    {
+                        continue;
+                    }
+                    if !filters.kinds.is_empty() && !filters.kinds.iter().any(|item| item == kind) {
+                        continue;
+                    }
+                    let (start_ms, end_ms) = interval(&record, &reference)?;
+                    if let Some(window) = &window {
+                        if !window.overlaps(start_ms, end_ms) {
+                            continue;
+                        }
+                    }
+                    let mut fields: Vec<(&str, String)> = Vec::new();
+                    if summary_available(&record, "technical_summary_available")? {
+                        fields.push((
+                            "technical_markdown",
+                            as_string(
+                                record.get("technical_path").unwrap_or(&Value::Null),
+                                "rollup.technical_path",
+                            )?
+                            .to_string(),
+                        ));
+                    }
+                    if summary_available(&record, "plain_language_summary_available")? {
+                        fields.push((
+                            "plain_language_markdown",
+                            as_string(
+                                record.get("plain_language_path").unwrap_or(&Value::Null),
+                                "rollup.plain_language_path",
+                            )?
+                            .to_string(),
+                        ));
+                    }
+                    for (field, relative) in fields {
+                        let text = self.read_markdown(&self.rollup_file(&relative, &team)?)?;
+                        Self::search_match(
+                            &mut matches,
+                            needle,
+                            case_sensitive,
+                            &reference,
+                            "rollup",
+                            &team,
+                            field,
+                            &text,
+                            Some(start_ms),
+                            None,
+                        );
+                    }
+                }
+            }
+        }
+        if ["transcripts", "all"].contains(&scope) {
+            for record in self.scoped("phases", filters)? {
+                let team = team_of(&record, "phase")?;
+                let current_agent = agent_reference_for_id(
+                    &team,
+                    as_string(
+                        record.get("agent_id").unwrap_or(&Value::Null),
+                        "phase.agent_id",
+                    )?,
+                );
+                if !filters.teams.is_empty() && !filters.teams.iter().any(|item| item == &team) {
+                    continue;
+                }
+                if let Some(selected) = &selected_agent {
+                    if &current_agent != selected {
+                        continue;
+                    }
+                }
+                let reference = phase_ref(&record, "phase")?;
+                let (start_ms, end_ms) = interval(&record, &reference)?;
+                if let Some(window) = &window {
+                    if !window.overlaps(start_ms, end_ms) {
+                        continue;
+                    }
+                }
+                let relative = as_string(
+                    record.get("detail_path").unwrap_or(&Value::Null),
+                    "phase.detail_path",
+                )?;
+                let detail_path = self.detail_file(relative)?;
+                let detail_value = self.read_json_file(&detail_path)?;
+                let detail = as_object(&detail_value, relative)?;
+                let transcript = as_array(
+                    detail.get("transcript").unwrap_or(&Value::Null),
+                    &format!("{relative}.transcript"),
+                )?;
+                for (index, raw_message) in transcript.iter().enumerate() {
+                    let message =
+                        as_object(raw_message, &format!("{relative}.transcript[{index}]"))?;
+                    let at_ms = as_int(
+                        message.get("at_ms").unwrap_or(&Value::Null),
+                        &format!("{relative}.transcript[{index}].at_ms"),
+                    )?;
+                    if let Some(window) = &window {
+                        if !window.contains_dec(&at_ms.to_string()) {
+                            continue;
+                        }
+                    }
+                    let text = as_string(
+                        message.get("text").unwrap_or(&Value::Null),
+                        &format!("{relative}.transcript[{index}].text"),
+                    )?;
+                    let contains = if case_sensitive {
+                        text.contains(needle)
+                    } else {
+                        py_casefold(text).contains(&py_casefold(needle))
+                    };
+                    if !contains {
+                        continue;
+                    }
+                    let role = as_string(
+                        message.get("role").unwrap_or(&Value::Null),
+                        &format!("{relative}.transcript[{index}].role"),
+                    )?;
+                    Self::search_match(
+                        &mut matches,
+                        needle,
+                        case_sensitive,
+                        &reference,
+                        "transcript",
+                        &team,
+                        role,
+                        text,
+                        None,
+                        Some(at_ms),
+                    );
+                }
+            }
+        }
+        matches.sort_by(|left, right| {
+            let left_at = optional_int(left, "at_ms")
+                .or_else(|| optional_int(left, "start_ms"))
+                .unwrap_or(-1);
+            let right_at = optional_int(right, "at_ms")
+                .or_else(|| optional_int(right, "start_ms"))
+                .unwrap_or(-1);
+            left_at
+                .cmp(&right_at)
+                .then_with(|| {
+                    optional_string(left, "ref")
+                        .unwrap_or("")
+                        .cmp(optional_string(right, "ref").unwrap_or(""))
+                })
+                .then_with(|| {
+                    optional_string(left, "field")
+                        .unwrap_or("")
+                        .cmp(optional_string(right, "field").unwrap_or(""))
+                })
+        });
+        matches.truncate(limit as usize);
+        Ok(matches)
+    }
+
+    /// `_show_search_record` for `message:`/`tool:` references.
+    pub fn show_search_record(&self, reference: &str) -> Result<Map<String, Value>, String> {
+        let (_, remainder) = reference.split_once(':').unzip();
+        let Some(remainder) = remainder else {
+            return Err(format!(
+                "invalid transcript search reference {}",
+                py_repr(&Value::String(reference.to_string()))
+            ));
+        };
+        let Some((team, _)) = remainder.split_once("::") else {
+            return Err(format!(
+                "invalid transcript search reference {}",
+                py_repr(&Value::String(reference.to_string()))
+            ));
+        };
+        if team.is_empty() {
+            return Err(format!(
+                "invalid transcript search reference {}",
+                py_repr(&Value::String(reference.to_string()))
+            ));
+        }
+        let team_filters = Filters {
+            teams: vec![team.to_string()],
+            start_time: None,
+            end_time: None,
+            kinds: Vec::new(),
+            agent: None,
+        };
+        let mut record: Option<Map<String, Value>> = None;
+        let mut prompts: std::collections::BTreeMap<String, Map<String, Value>> =
+            std::collections::BTreeMap::new();
+        let mut responses: Vec<Map<String, Value>> = Vec::new();
+        for candidate in self.iter_search_records(Some(&team_filters), &[])? {
+            let candidate_reference = as_string(
+                candidate.get("ref").unwrap_or(&Value::Null),
+                "search record.ref",
+            )?
+            .to_string();
+            let candidate_type = as_string(
+                candidate.get("record_type").unwrap_or(&Value::Null),
+                "search record.record_type",
+            )?;
+            if ["prompt", "inter_agent_prompt"].contains(&candidate_type) {
+                prompts.insert(candidate_reference.clone(), candidate.clone());
+            }
+            if candidate_reference == reference {
+                record = Some(candidate.clone());
+            }
+            if optional_string(&candidate, "prompt_ref") == Some(reference)
+                && candidate_reference != reference
+                && ["response", "inter_agent_response"].contains(&candidate_type)
+            {
+                responses.push(candidate);
+            }
+        }
+        let Some(record) = record else {
+            return Err(format!(
+                "unknown stable reference {}",
+                py_repr(&Value::String(reference.to_string()))
+            ));
+        };
+        let mut result = record.clone();
+        result.insert(
+            "at_time".to_string(),
+            Value::String(timestamp(as_int(
+                record.get("at_ms").unwrap_or(&Value::Null),
+                "search record.at_ms",
+            )?)),
+        );
+        if let Some(phase_reference) = self.phase_reference_for_search_record(&record)? {
+            result.insert("phase_ref".to_string(), Value::String(phase_reference));
+        }
+        let prompt_reference = optional_string(&record, "prompt_ref");
+        if let Some(prompt_reference) = prompt_reference {
+            if prompt_reference != reference {
+                let linked = prompts.get(prompt_reference).cloned();
+                result.insert(
+                    "linked_prompt".to_string(),
+                    linked.map(Value::Object).unwrap_or(Value::Null),
+                );
+            }
+        }
+        let record_type = as_string(
+            record.get("record_type").unwrap_or(&Value::Null),
+            "search record.record_type",
+        )?;
+        if ["prompt", "inter_agent_prompt"].contains(&record_type) {
+            responses.sort_by(|left, right| {
+                let left_at = optional_int(left, "at_ms").unwrap_or(0);
+                let right_at = optional_int(right, "at_ms").unwrap_or(0);
+                left_at.cmp(&right_at).then_with(|| {
+                    optional_string(left, "ref")
+                        .unwrap_or("")
+                        .cmp(optional_string(right, "ref").unwrap_or(""))
+                })
+            });
+            result.insert(
+                "linked_responses".to_string(),
+                Value::Array(responses.into_iter().map(Value::Object).collect()),
+            );
+        }
+        Ok(result)
+    }
+
     fn lookup_entry(&self, reference: &str) -> Result<Option<LookupEntry>, String> {
         let Some((kind, remainder)) = reference.split_once(':') else {
             return Ok(None);
@@ -1149,6 +2613,9 @@ impl Timeline {
         transcript: bool,
     ) -> Result<Map<String, Value>, String> {
         let Some((kind, record)) = self.lookup_entry(reference)? else {
+            if reference.starts_with("message:") || reference.starts_with("tool:") {
+                return self.show_search_record(reference);
+            }
             return Err(format!(
                 "unknown stable reference {}",
                 py_repr(&Value::String(reference.to_string()))
@@ -3035,6 +4502,589 @@ pub fn format_stats(stats: &ArchiveStats, format: &str) -> Result<String, String
             lines.push(String::new());
             lines.push(STATS_FOOTER.to_string());
             Ok(format!("{}\n", lines.join("\n")))
+        }
+        other => Err(format!(
+            "unsupported query output format {}",
+            py_repr(&Value::String(other.to_string()))
+        )),
+    }
+}
+
+fn is_search_whitespace(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{9}'..='\u{d}'
+            | '\u{1c}'..='\u{20}'
+            | '\u{85}'
+            | '\u{a0}'
+            | '\u{1680}'
+            | '\u{2000}'..='\u{200a}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202f}'
+            | '\u{205f}'
+            | '\u{3000}'
+    )
+}
+
+/// `_compact_text`: whitespace runs collapsed to one space.
+fn compact_text(value: &str) -> String {
+    let mut out = String::new();
+    let mut pending_space = false;
+    for ch in value.chars() {
+        if is_search_whitespace(ch) {
+            pending_space = !out.is_empty();
+            continue;
+        }
+        if pending_space {
+            out.push(' ');
+            pending_space = false;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// CPython `str.casefold()` for the compatibility search:
+/// the full-folding expansions plus ordinary lowering.
+fn py_casefold(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        match ch {
+            '\u{df}' | '\u{1e9e}' => out.push_str("ss"),
+            '\u{fb00}' => out.push_str("ff"),
+            '\u{fb01}' => out.push_str("fi"),
+            '\u{fb02}' => out.push_str("fl"),
+            '\u{fb03}' => out.push_str("ffi"),
+            '\u{fb04}' => out.push_str("ffl"),
+            '\u{fb05}' | '\u{fb06}' => out.push_str("st"),
+            '\u{130}' => out.push_str("i\u{307}"),
+            _ => out.extend(ch.to_lowercase()),
+        }
+    }
+    out
+}
+
+fn ascii_lower_utf8(value: &str) -> Vec<u8> {
+    value
+        .bytes()
+        .map(|byte| {
+            if byte.is_ascii_uppercase() {
+                byte + 32
+            } else {
+                byte
+            }
+        })
+        .collect()
+}
+
+struct SearchLinkContext {
+    prompt_excerpts: std::collections::BTreeMap<String, String>,
+    response_counts: std::collections::BTreeMap<String, i64>,
+}
+
+struct TextMatch {
+    compact: Vec<char>,
+    ranges: Vec<(usize, usize)>,
+    score: i64,
+}
+
+struct SearchMatcher {
+    compact_needle: Vec<char>,
+    parts: Vec<(Vec<char>, bool)>,
+    bloom_terms: Vec<String>,
+    case_sensitive: bool,
+}
+
+fn find_literal_ranges(
+    compact: &[char],
+    part: &[char],
+    case_sensitive: bool,
+    whole_word: bool,
+) -> Vec<(usize, usize)> {
+    let fold = |ch: char| {
+        if case_sensitive {
+            ch
+        } else {
+            ch.to_ascii_lowercase()
+        }
+    };
+    let word_char = |ch: char| ch == '_' || ch.is_alphanumeric();
+    let mut out = Vec::new();
+    if part.is_empty() || part.len() > compact.len() {
+        return out;
+    }
+    let mut start = 0usize;
+    while start + part.len() <= compact.len() {
+        let matches =
+            (0..part.len()).all(|offset| fold(compact[start + offset]) == fold(part[offset]));
+        if matches {
+            let end = start + part.len();
+            let blocked = whole_word
+                && ((start > 0 && word_char(compact[start - 1]))
+                    || (end < compact.len() && word_char(compact[end])));
+            if !blocked {
+                out.push((start, end));
+                if out.len() == 64 {
+                    break;
+                }
+            }
+            start = end;
+        } else {
+            start += 1;
+        }
+    }
+    out
+}
+
+fn smart_parts(needle: &str) -> Vec<(String, bool)> {
+    let chars: Vec<char> = needle.chars().collect();
+    let mut parts = Vec::new();
+    let mut index = 0usize;
+    while index < chars.len() {
+        if chars[index] == ' ' {
+            index += 1;
+            continue;
+        }
+        if chars[index] == '"' {
+            // Try the quoted alternative first.
+            let mut cursor = index + 1;
+            let mut content: Vec<char> = Vec::new();
+            let mut closed = false;
+            while cursor < chars.len() {
+                let ch = chars[cursor];
+                if ch == '\\' && cursor + 1 < chars.len() {
+                    content.push(ch);
+                    content.push(chars[cursor + 1]);
+                    cursor += 2;
+                    continue;
+                }
+                if ch == '"' {
+                    closed = true;
+                    break;
+                }
+                content.push(ch);
+                cursor += 1;
+            }
+            if closed {
+                let raw: String = content.iter().collect();
+                let value = raw.replace("\\\"", "\"").replace("\\\\", "\\");
+                if !value.is_empty() {
+                    parts.push((value, true));
+                }
+                index = cursor + 1;
+                continue;
+            }
+        }
+        let start = index;
+        while index < chars.len() && chars[index] != ' ' {
+            index += 1;
+        }
+        let value: String = chars[start..index].iter().collect();
+        if !value.is_empty() {
+            parts.push((value, false));
+        }
+    }
+    parts
+}
+
+fn compile_search_matcher(
+    needle: &str,
+    match_mode: &str,
+    case_sensitive: bool,
+) -> Result<SearchMatcher, String> {
+    let compact_needle = compact_text(needle);
+    if compact_needle.is_empty() {
+        return Err("search text must not be empty".to_string());
+    }
+    let needle_chars: Vec<char> = compact_needle.chars().collect();
+    let (parts, bloom_terms): (Vec<(Vec<char>, bool)>, Vec<String>) = match match_mode {
+        "literal" | "phrase" => (
+            vec![(needle_chars.clone(), false)],
+            vec![compact_needle.clone()],
+        ),
+        "smart" => {
+            let raw_parts = smart_parts(&compact_needle);
+            if raw_parts.is_empty() {
+                return Err("search text must contain a term".to_string());
+            }
+            let mut parts = Vec::new();
+            let mut terms = Vec::new();
+            for (part, quoted) in raw_parts {
+                let whole = !quoted
+                    && part
+                        .chars()
+                        .all(|ch| ch == '_' || ch == '-' || ch.is_alphanumeric());
+                terms.push(part.clone());
+                parts.push((part.chars().collect::<Vec<char>>(), whole));
+            }
+            (parts, terms)
+        }
+        other => {
+            return Err(format!(
+                "unsupported search match mode {}",
+                py_repr(&Value::String(other.to_string()))
+            ))
+        }
+    };
+    Ok(SearchMatcher {
+        compact_needle: needle_chars,
+        parts,
+        bloom_terms,
+        case_sensitive,
+    })
+}
+
+impl SearchMatcher {
+    fn match_text(&self, text: &str) -> Option<TextMatch> {
+        let compact: Vec<char> = compact_text(text).chars().collect();
+        let mut collected: Vec<(usize, usize)> = Vec::new();
+        for (part, whole) in &self.parts {
+            let candidate = find_literal_ranges(&compact, part, self.case_sensitive, *whole);
+            if candidate.is_empty() {
+                return None;
+            }
+            collected.extend(candidate);
+        }
+        collected.sort();
+        collected.dedup();
+        collected.truncate(64);
+        let first = collected.iter().map(|(start, _)| *start).min().unwrap_or(0);
+        let last = collected.iter().map(|(_, end)| *end).max().unwrap_or(0);
+        let span = (last as i64 - first as i64).max(1);
+        let comparable: Vec<char> = if self.case_sensitive {
+            compact.clone()
+        } else {
+            compact.iter().map(|ch| ch.to_ascii_lowercase()).collect()
+        };
+        let comparable_needle: Vec<char> = if self.case_sensitive {
+            self.compact_needle.clone()
+        } else {
+            self.compact_needle
+                .iter()
+                .map(|ch| ch.to_ascii_lowercase())
+                .collect()
+        };
+        let exact = comparable == comparable_needle;
+        let score = (if exact { 100_000 } else { 0 })
+            + (20_000 - span).max(0)
+            + collected.len() as i64 * 100
+            - (first as i64).min(10_000);
+        Some(TextMatch {
+            compact,
+            ranges: collected,
+            score,
+        })
+    }
+}
+
+fn search_excerpt(matched: &TextMatch) -> Map<String, Value> {
+    let first = matched
+        .ranges
+        .iter()
+        .map(|(start, _)| *start)
+        .min()
+        .unwrap_or(0);
+    let start = first.saturating_sub(120);
+    let end = (start + 480).min(matched.compact.len());
+    let excerpt: String = matched.compact[start..end].iter().collect();
+    let mut ranges = Vec::new();
+    for (left, right) in &matched.ranges {
+        if *right <= start || *left >= end {
+            continue;
+        }
+        ranges.push(Value::Array(vec![
+            Value::from(left.saturating_sub(start) as i64),
+            Value::from(((*right).min(end) - start) as i64),
+        ]));
+    }
+    let mut out = Map::new();
+    out.insert("text".to_string(), Value::String(excerpt));
+    out.insert(
+        "full_characters".to_string(),
+        Value::from(matched.compact.len() as i64),
+    );
+    out.insert(
+        "leading_omitted_characters".to_string(),
+        Value::from(start as i64),
+    );
+    out.insert(
+        "trailing_omitted_characters".to_string(),
+        Value::from((matched.compact.len() - end) as i64),
+    );
+    out.insert(
+        "is_truncated".to_string(),
+        Value::Bool(start > 0 || end < matched.compact.len()),
+    );
+    out.insert("match_ranges".to_string(), Value::Array(ranges));
+    out
+}
+
+fn base64_decode(encoded: &str, where_: &str) -> Result<Vec<u8>, String> {
+    let invalid = || format!("{where_}.bits_base64: invalid base64");
+    let mut table = [255u8; 256];
+    for (index, byte) in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+        .iter()
+        .enumerate()
+    {
+        table[*byte as usize] = index as u8;
+    }
+    let bytes = encoded.as_bytes();
+    if bytes.len() % 4 != 0 {
+        return Err(invalid());
+    }
+    let mut out = Vec::new();
+    let chunks = bytes.len() / 4;
+    for chunk_index in 0..chunks {
+        let chunk = &bytes[chunk_index * 4..chunk_index * 4 + 4];
+        let last = chunk_index + 1 == chunks;
+        let mut values = [0u8; 4];
+        let mut padding = 0;
+        for (index, byte) in chunk.iter().enumerate() {
+            if *byte == b'=' {
+                if !last || index < 2 {
+                    return Err(invalid());
+                }
+                padding += 1;
+            } else {
+                if padding > 0 || table[*byte as usize] == 255 {
+                    return Err(invalid());
+                }
+                values[index] = table[*byte as usize];
+            }
+        }
+        if padding > 2 {
+            return Err(invalid());
+        }
+        let triple = ((values[0] as u32) << 18)
+            | ((values[1] as u32) << 12)
+            | ((values[2] as u32) << 6)
+            | values[3] as u32;
+        out.push((triple >> 16) as u8);
+        if padding < 2 {
+            out.push((triple >> 8) as u8);
+        }
+        if padding < 1 {
+            out.push(triple as u8);
+        }
+    }
+    Ok(out)
+}
+
+fn trigram_positions(trigram: &[u8], bit_count: i64, hash_count: i64) -> Vec<i64> {
+    let digest = |seed: u32| -> u32 {
+        let mut result = seed;
+        for byte in trigram {
+            result ^= *byte as u32;
+            result = result.wrapping_mul(16_777_619);
+        }
+        result
+    };
+    let first = digest(2_166_136_261);
+    let second = digest(2_166_136_261 ^ 0x9E37_79B9) | 1;
+    let mask = (bit_count - 1) as u32;
+    (0..hash_count)
+        .map(|index| (first.wrapping_add((index as u32).wrapping_mul(second)) & mask) as i64)
+        .collect()
+}
+
+fn bloom_can_prune(term: &str) -> bool {
+    let compact = compact_text(term);
+    compact.is_ascii() && ascii_lower_utf8(&compact).len() >= 3
+}
+
+fn bloom_might_match(raw: Option<&Value>, terms: &[String], where_: &str) -> Result<bool, String> {
+    let Some(raw) = raw else {
+        return Ok(true);
+    };
+    let value = as_object(raw, where_)?;
+    let algorithm = as_string(
+        value.get("algorithm").unwrap_or(&Value::Null),
+        &format!("{where_}.algorithm"),
+    )?;
+    if algorithm != "ascii-lower-utf8-trigram-fnv1a32-double-v1" {
+        return Err(format!(
+            "{where_}.algorithm: unsupported value {}",
+            py_repr(&Value::String(algorithm.to_string()))
+        ));
+    }
+    let bit_count = as_int(
+        value.get("bit_count").unwrap_or(&Value::Null),
+        &format!("{where_}.bit_count"),
+    )?;
+    if bit_count < 64 || (bit_count & (bit_count - 1)) != 0 {
+        return Err(format!(
+            "{where_}.bit_count: expected a power of two of at least 64"
+        ));
+    }
+    let hash_count = as_int(
+        value.get("hash_count").unwrap_or(&Value::Null),
+        &format!("{where_}.hash_count"),
+    )?;
+    if hash_count != 7 {
+        return Err(format!("{where_}.hash_count: expected 7"));
+    }
+    let trigram_count = as_int(
+        value.get("trigram_count").unwrap_or(&Value::Null),
+        &format!("{where_}.trigram_count"),
+    )?;
+    if trigram_count < 0 {
+        return Err(format!(
+            "{where_}.trigram_count: expected a non-negative integer"
+        ));
+    }
+    let encoded = as_string(
+        value.get("bits_base64").unwrap_or(&Value::Null),
+        &format!("{where_}.bits_base64"),
+    )?;
+    let bits = base64_decode(encoded, where_)?;
+    if bits.len() as i64 * 8 != bit_count {
+        return Err(format!(
+            "{where_}.bits_base64: decoded {} bits, expected {bit_count}",
+            bits.len() * 8
+        ));
+    }
+    for term in terms {
+        let compact = compact_text(term);
+        if !compact.is_ascii() {
+            continue;
+        }
+        let term_bytes = ascii_lower_utf8(&compact);
+        if term_bytes.len() < 3 {
+            continue;
+        }
+        for offset in 0..term_bytes.len() - 2 {
+            let trigram = &term_bytes[offset..offset + 3];
+            for position in trigram_positions(trigram, bit_count, hash_count) {
+                if bits[(position / 8) as usize] & (1 << (position % 8)) == 0 {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn day_bounds(day: &str, where_: &str) -> Result<(i64, i64), String> {
+    let parsed = chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").map_err(|_| {
+        format!(
+            "{where_}: not a UTC day label: {}",
+            py_repr(&Value::String(day.to_string()))
+        )
+    })?;
+    // The label must be exactly the canonical spelling.
+    if parsed.format("%Y-%m-%d").to_string() != day {
+        return Err(format!(
+            "{where_}: not a UTC day label: {}",
+            py_repr(&Value::String(day.to_string()))
+        ));
+    }
+    let start_ms = parsed
+        .and_hms_opt(0, 0, 0)
+        .map(|moment| moment.and_utc().timestamp_millis())
+        .unwrap_or(0);
+    Ok((start_ms, start_ms + 86_400_000))
+}
+
+/// One ranked search page plus result-set metadata
+/// (`SearchResults`).
+pub struct SearchResults {
+    /// The page's items.
+    pub items: Vec<Map<String, Value>>,
+    /// Matches across the whole result set.
+    pub total_matches: i64,
+    /// The requested offset.
+    pub offset: i64,
+    /// The offset as CPython's unbounded `int` spells it.
+    pub offset_display: String,
+    /// The requested limit.
+    pub limit: i64,
+    /// The search corpus.
+    pub corpus: String,
+    /// The match mode.
+    pub match_mode: String,
+    /// The sort order.
+    pub sort: String,
+}
+
+impl SearchResults {
+    fn truncated(&self) -> bool {
+        self.offset > 0 || self.offset + (self.items.len() as i64) < self.total_matches
+    }
+}
+
+/// `format_search_results` for one search page.
+pub fn format_search_results(
+    results: &SearchResults,
+    command: &str,
+    format: &str,
+) -> Result<String, String> {
+    match format {
+        "json" => {
+            let mut envelope = Map::new();
+            envelope.insert("schema_version".to_string(), Value::from(1));
+            envelope.insert("search_schema_version".to_string(), Value::from(1));
+            envelope.insert("command".to_string(), Value::String(command.to_string()));
+            envelope.insert("corpus".to_string(), Value::String(results.corpus.clone()));
+            envelope.insert(
+                "match_mode".to_string(),
+                Value::String(results.match_mode.clone()),
+            );
+            envelope.insert("sort".to_string(), Value::String(results.sort.clone()));
+            envelope.insert(
+                "total_matches".to_string(),
+                Value::from(results.total_matches),
+            );
+            envelope.insert(
+                "offset".to_string(),
+                serde_json::Number::from_str(&results.offset_display)
+                    .map(Value::Number)
+                    .unwrap_or(Value::from(results.offset)),
+            );
+            envelope.insert(
+                "returned".to_string(),
+                Value::from(results.items.len() as i64),
+            );
+            envelope.insert("truncated".to_string(), Value::Bool(results.truncated()));
+            envelope.insert(
+                "items".to_string(),
+                Value::Array(results.items.iter().cloned().map(Value::Object).collect()),
+            );
+            Ok(dump_canonical(&Value::Object(envelope)))
+        }
+        "jsonl" => Ok(results
+            .items
+            .iter()
+            .map(|item| format!("{}\n", dump_oneline(&Value::Object(item.clone()))))
+            .collect()),
+        "markdown" => {
+            let body = results
+                .items
+                .iter()
+                .map(markdown_item)
+                .collect::<Result<Vec<_>, _>>()?
+                .join("\n\n");
+            Ok(format!(
+                "# wrkviz query: {command}\n\n{body}\n\n_Showing {} of {} result(s) from offset {}._\n",
+                results.items.len(),
+                results.total_matches,
+                results.offset_display
+            ))
+        }
+        "text" => {
+            let body = results
+                .items
+                .iter()
+                .map(text_item)
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            Ok(format!(
+                "Showing {} of {} result(s) from offset {}.\n\n{body}{}",
+                results.items.len(),
+                results.total_matches,
+                results.offset_display,
+                if body.is_empty() { "" } else { "\n" }
+            ))
         }
         other => Err(format!(
             "unsupported query output format {}",

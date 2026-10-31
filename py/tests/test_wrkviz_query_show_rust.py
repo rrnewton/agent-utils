@@ -105,13 +105,12 @@ def test_show_errors_match_python(corpus: Path) -> None:
         assert result.stderr == oracle.stderr
 
 
-def test_show_transcript_reference_refuses_by_name(corpus: Path) -> None:
-    result = _cli(
-        ["query", "--output", str(corpus), "show", "message:synthetic-team-1::x"],
-        rust=True,
+def test_show_transcript_reference_matches_python(corpus: Path) -> None:
+    # Ported in the search slice: an unknown message reference
+    # now answers with the oracle's unknown-reference error.
+    _check_error(
+        ["query", "--output", str(corpus), "show", "message:synthetic-team-1::x"]
     )
-    assert result.returncode == 2
-    assert "transcript search references yet" in result.stderr
 
 
 def _schema1_archive(root: Path) -> Path:
