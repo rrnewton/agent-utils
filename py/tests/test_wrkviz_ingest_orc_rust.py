@@ -143,6 +143,48 @@ def _upstream(base: Path, *, continuation: bool = False) -> Path:
     return src
 
 
+def _legacy_session_db(path: Path, session_id: str, created_iso: str) -> None:
+    """A pre-messages Orc session: content_blocks plus conversation_state."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        path.unlink()
+    con = sqlite3.connect(path)
+    con.execute("CREATE TABLE session_meta (id TEXT, parent_id TEXT, name TEXT, "
+                "db_name TEXT, created_at TEXT, updated_at TEXT)")
+    con.execute("CREATE TABLE content_blocks (rowid INTEGER PRIMARY KEY, id TEXT, "
+                "message_id TEXT, session_id TEXT, block_index INTEGER, "
+                "created_at_ms INTEGER, turn_index INTEGER, role TEXT, "
+                "block_type TEXT, content TEXT, searchable_text TEXT, "
+                "code_input TEXT, code_output TEXT, code_exit_code INTEGER, "
+                "model TEXT, user_source TEXT, token_count INTEGER, extra TEXT)")
+    con.execute("CREATE TABLE conversation_state (id INTEGER PRIMARY KEY, "
+                "conversation_json TEXT)")
+    con.execute("INSERT INTO session_meta VALUES (?,?,?,NULL,?,?)",
+                (session_id, None, "legacy-root", created_iso, created_iso))
+    blocks = [
+        (1, "b1", "m1", 0, T0 + 60_000, 1, "user", "text", "Legacy prompt"),
+        (2, "b2", "m2", 0, T0 + 120_000, 1, "assistant", "text",
+         "Legacy answer"),
+    ]
+    for rowid, block_id, message_id, index, ts, turn, role, kind, content in blocks:
+        con.execute(
+            "INSERT INTO content_blocks (rowid, id, message_id, session_id, "
+            "block_index, created_at_ms, turn_index, role, block_type, "
+            "content, searchable_text) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (rowid, block_id, message_id, session_id, index, ts, turn, role,
+             kind, content, content))
+    conversation = {"messages": [
+        {"id": 1, "role": "user", "created_at_ms": T0 + 60_000,
+         "blocks": [{"type": "text", "id": 1, "text": "Legacy prompt"}]},
+        {"id": 2, "role": "assistant", "created_at_ms": T0 + 120_000,
+         "blocks": [{"type": "text", "id": 2, "text": "Legacy answer"}]},
+    ]}
+    con.execute("INSERT INTO conversation_state VALUES (1, ?)",
+                (json.dumps(conversation, sort_keys=True),))
+    con.commit()
+    con.close()
+
+
 def _run(command: list[str], args: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [*command, "ingest-orc", *args],
@@ -185,6 +227,7 @@ def _scrub(value: object, root: Path) -> object:
         return [_scrub(item, root) for item in value]
     if isinstance(value, str):
         value = value.replace(str(root), "ROOT")
+        value = re.sub(r"orc-\d+-[0-9a-f]+\.db", "orc-TEMP.db", value)
         return re.sub(r"\.objects/[0-9a-f]{2}/[0-9a-f]{64}\.db",
                       ".objects/HASH.db", value)
     return value
@@ -365,6 +408,18 @@ def test_orc_bounded_continuation(tmp_path: Path, rust_wrkviz: Path) -> None:
     link = manifest["continuation_sessions"][0]
     assert link["start_message_id"] == "m1"
     assert link["start_source_line"] == 1
+
+
+def test_orc_legacy_session(tmp_path: Path, rust_wrkviz: Path) -> None:
+    src = tmp_path / "shared" / "upstream"
+    _legacy_session_db(src / ".orc" / "sessions" / ROOT_ID / "session.db",
+                       ROOT_ID, "2026-01-01T00:00:00Z")
+    oracle, result = _compare(tmp_path / "flow", rust_wrkviz, [],
+                              source_root=src)
+    assert oracle.returncode == 0, oracle.stderr
+    oracle, result = _compare(tmp_path / "flow", rust_wrkviz, [],
+                              source_root=src)
+    assert oracle.returncode == 0
 
 
 def test_orc_window_and_identity(tmp_path: Path, rust_wrkviz: Path) -> None:
