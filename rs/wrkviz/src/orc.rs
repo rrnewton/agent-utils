@@ -109,6 +109,23 @@ fn integer(value: Option<&Value>, where_: &str) -> Result<i64, String> {
 }
 
 /// See the enclosing record's documentation.
+/// See the module documentation.
+pub fn nonnegative_u128(value: Option<&Value>, where_: &str) -> Result<u128, String> {
+    // Append watermarks pack two 64-bit ids and a tag bit.
+    match value {
+        Some(Value::Number(number)) => {
+            let text = number.to_string();
+            if text.starts_with('-') {
+                return Err(format!("{where_}: expected a non-negative integer"));
+            }
+            text.parse::<u128>()
+                .map_err(|_| format!("{where_}: expected a non-negative integer"))
+        }
+        _ => Err(format!("{where_}: expected a non-negative integer")),
+    }
+}
+
+/// See the module documentation.
 pub fn nonnegative_integer(value: Option<&Value>, where_: &str) -> Result<i64, String> {
     let held =
         integer(value, where_).map_err(|_| format!("{where_}: expected a non-negative integer"))?;
@@ -1298,7 +1315,7 @@ pub struct SourceCopy {
     /// See the enclosing record's documentation.
     pub append_count: i64,
     /// See the enclosing record's documentation.
-    pub append_max_id: i64,
+    pub append_max_id: u128,
     /// See the enclosing record's documentation.
     pub append_prefix_sha256: String,
     /// See the enclosing record's documentation.
@@ -1728,7 +1745,7 @@ impl SourceCopy {
                 raw.get("append_count"),
                 &format!("{where_}.append_count"),
             )?,
-            append_max_id: nonnegative_integer(
+            append_max_id: nonnegative_u128(
                 raw.get("append_max_id"),
                 &format!("{where_}.append_max_id"),
             )?,
@@ -1760,7 +1777,7 @@ impl SourceCopy {
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use crate::compressed::{is_compressed, read_source_bytes, resolve_source};
+use crate::compressed::{is_compressed, read_source_bytes, resolve_source, source_exists};
 use rusqlite::Connection;
 use serde_json::Value as JsonValue;
 
@@ -2424,6 +2441,1095 @@ pub fn ensure_snapshot_parent(path: &Path, snapshot_root: &Path) -> Result<(), S
                 fsync_directory(parent)?;
             }
         }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------- discovery
+
+/// One session database's immutable identity and bounds.
+#[derive(Clone, Debug)]
+pub struct SessionMeta {
+    /// See the enclosing record's documentation.
+    pub session_id: String,
+    /// See the enclosing record's documentation.
+    pub parent_id: Option<String>,
+    /// See the enclosing record's documentation.
+    pub name: String,
+    /// See the enclosing record's documentation.
+    pub db_name: Option<String>,
+    /// See the enclosing record's documentation.
+    pub created_at_ms: i64,
+    /// See the enclosing record's documentation.
+    pub updated_at_ms: i64,
+    /// See the enclosing record's documentation.
+    pub source_path: String,
+}
+
+/// One discovered source database and its possible owners.
+#[derive(Clone, Debug)]
+pub struct DiscoveredSource {
+    /// See the enclosing record's documentation.
+    pub source_path: String,
+    /// See the enclosing record's documentation.
+    pub kind: String,
+    /// See the enclosing record's documentation.
+    pub owner_candidates: Vec<String>,
+    /// See the enclosing record's documentation.
+    pub lineage_root_session_id: Option<String>,
+}
+
+/// The Orc storage schema version a database declares.
+pub fn provider_schema_version(path: &Path, where_: &str) -> Result<Option<i64>, String> {
+    let connection = read_only(path)?;
+    let version_row: Result<Option<Vec<SqlValue>>, String> = (|| {
+        let tables = table_names(&connection, where_)?;
+        if !tables.iter().any(|held| held == "schema_version") {
+            return Ok(None);
+        }
+        let mut statement = connection
+            .prepare("SELECT version FROM schema_version WHERE id = 1")
+            .map_err(|error| error.to_string())?;
+        let mut rows = statement.query([]).map_err(|error| error.to_string())?;
+        match rows.next() {
+            Ok(Some(row)) => Ok(Some(row_values(row))),
+            Ok(None) => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
+    })();
+    drop(connection);
+    match version_row {
+        Ok(Some(row)) => {
+            let value = row.first().cloned().unwrap_or(SqlValue::Null);
+            match value {
+                SqlValue::Int(held) if held > 0 => Ok(Some(held)),
+                _ => Err(format!(
+                    "{where_}: schema_version.version: expected a positive integer"
+                )),
+            }
+        }
+        Ok(None) => {
+            // Distinguish absent table from a table with no
+            // version row by re-checking, like the oracle's
+            // two-step read.
+            let connection = read_only(path)?;
+            let tables = table_names(&connection, where_)?;
+            if tables.iter().any(|held| held == "schema_version") {
+                return Err(format!(
+                    "{where_}: Orc schema_version table holds no version row"
+                ));
+            }
+            Ok(None)
+        }
+        Err(error) => Err(format!(
+            "{where_}: Orc schema_version table is present but unreadable: {error}"
+        )),
+    }
+}
+
+/// Read one session database's metadata.
+pub fn session_meta(path: &Path, source_path: &str) -> Result<SessionMeta, String> {
+    let connection = read_only(path)?;
+    require_tables(
+        &connection,
+        &["session_meta", "content_blocks"],
+        &path.display().to_string(),
+    )?;
+    session_storage_table(&connection, &path.display().to_string())?;
+    let row = (|| -> Result<Vec<SqlValue>, String> {
+        let mut statement = connection
+            .prepare(
+                "SELECT id, parent_id, name, db_name, created_at, updated_at \
+                 FROM session_meta LIMIT 1",
+            )
+            .map_err(|error| error.to_string())?;
+        let mut rows = statement.query([]).map_err(|error| error.to_string())?;
+        match rows.next() {
+            Ok(Some(row)) => Ok(row_values(row)),
+            Ok(None) => Err("expected one row".to_string()),
+            Err(error) => Err(error.to_string()),
+        }
+    })()
+    .map_err(|error| {
+        if error == "expected one row" {
+            format!("{}: expected one row", path.display())
+        } else {
+            format!(
+                "failed to inspect Orc session metadata at {}: {error}",
+                path.display()
+            )
+        }
+    })?;
+    drop(connection);
+    let cell = |index: usize| row.get(index).cloned().unwrap_or(SqlValue::Null);
+    let session_id = safe_component(
+        &cell_string(&cell(0), &format!("{}: id", path.display()))?,
+        &format!("{}: id", path.display()),
+    )?;
+    let parent_id = cell_optional_string(&cell(1), &format!("{}: parent_id", path.display()))?;
+    if let Some(parent) = &parent_id {
+        safe_component(parent, &format!("{}: parent_id", path.display()))?;
+    }
+    let db_name = cell_optional_string(&cell(3), &format!("{}: db_name", path.display()))?;
+    if let Some(name) = &db_name {
+        safe_component(name, &format!("{}: db_name", path.display()))?;
+    }
+    Ok(SessionMeta {
+        session_id,
+        parent_id,
+        name: cell_string(&cell(2), &format!("{}: name", path.display()))?,
+        db_name,
+        created_at_ms: iso_ms(&cell(4), &format!("{}: created_at", path.display()))?,
+        updated_at_ms: iso_ms(&cell(5), &format!("{}: updated_at", path.display()))?,
+        source_path: source_path.to_string(),
+    })
+}
+
+/// Names of task databases a session lists as associated.
+pub fn associated_db_names(path: &Path) -> Result<Vec<String>, String> {
+    let connection = read_only(path)?;
+    let tables = table_names(&connection, &path.display().to_string())?;
+    if !tables.iter().any(|held| held == "associated_dbs") {
+        return Ok(Vec::new());
+    }
+    let rows = query_all(
+        &connection,
+        "SELECT db_name FROM associated_dbs ORDER BY db_name",
+        &[],
+        &path.display().to_string(),
+    )
+    .map_err(|error| {
+        format!(
+            "failed to inspect Orc associated task databases at {}: {error}",
+            path.display()
+        )
+    })?;
+    drop(connection);
+    let mut names = Vec::new();
+    for (index, row) in rows.iter().enumerate() {
+        let value = row.first().cloned().unwrap_or(SqlValue::Null);
+        names.push(safe_component(
+            &cell_string(
+                &value,
+                &format!("{}: associated_dbs[{index}].db_name", path.display()),
+            )?,
+            &format!("{}: associated_dbs[{index}].db_name", path.display()),
+        )?);
+    }
+    Ok(names)
+}
+
+/// Task database paths for one session, each flagged
+/// (path, required, is_primary).
+pub fn session_task_relatives(
+    database: &Path,
+    meta: &SessionMeta,
+) -> Result<Vec<(String, bool, bool)>, String> {
+    let primary_name: &str = if meta.parent_id.is_none() {
+        meta.db_name.as_deref().unwrap_or(&meta.session_id)
+    } else {
+        &meta.session_id
+    };
+    let primary_path = format!(".tg/{primary_name}.db");
+    let mut required_by_path: Vec<(String, bool)> = vec![(primary_path.clone(), false)];
+    for name in associated_db_names(database)? {
+        let relative = format!(".tg/{name}.db");
+        if !required_by_path.iter().any(|(held, _)| *held == relative) {
+            required_by_path.push((relative, false));
+        }
+    }
+    required_by_path.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(required_by_path
+        .into_iter()
+        .map(|(path, required)| {
+            let is_primary = path == primary_path;
+            (path, required, is_primary)
+        })
+        .collect())
+}
+
+/// Root session ids for a lineage (the root plus any
+/// continuations), uniqueness-checked.
+pub fn lineage_roots(
+    root_session_id: &str,
+    continuation_session_ids: &[String],
+) -> Result<Vec<String>, String> {
+    let mut roots = Vec::new();
+    roots.push(safe_component(
+        root_session_id,
+        "Orc root or continuation session id",
+    )?);
+    for item in continuation_session_ids {
+        roots.push(safe_component(item, "Orc root or continuation session id")?);
+    }
+    let mut unique = roots.clone();
+    unique.sort();
+    unique.dedup();
+    if unique.len() != roots.len() {
+        return Err("Orc root and continuation session IDs must be unique".to_string());
+    }
+    Ok(roots)
+}
+
+/// The parsed continuation specs for one ingest.
+pub fn continuation_specs(values: &[String]) -> Result<Vec<ContinuationSpec>, String> {
+    let mut specs = Vec::new();
+    for (index, value) in values.iter().enumerate() {
+        specs.push(ContinuationSpec::from_value(
+            &JsonValue::String(value.clone()),
+            &format!("continuation_specs[{index}]"),
+        )?);
+    }
+    Ok(specs)
+}
+
+/// Where a bounded continuation starts, and when.
+pub fn resolve_continuation_start(
+    path: &Path,
+    meta: &SessionMeta,
+    spec: &ContinuationSpec,
+) -> Result<(Option<(i64, i64)>, i64), String> {
+    let Some(start_message_id) = &spec.start_message_id else {
+        return Ok((None, meta.created_at_ms));
+    };
+    let connection = read_only(path)?;
+    if session_storage_table(&connection, &path.display().to_string())? != "messages" {
+        return Err(format!(
+            "bounded Orc continuation {} requires the append-only messages table",
+            py_repr_str(&spec.session_id)
+        ));
+    }
+    let rows = query_all(
+        &connection,
+        "SELECT id, created_at_ms, message_json FROM messages ORDER BY id",
+        &[],
+        &path.display().to_string(),
+    )
+    .map_err(|error| {
+        format!(
+            "failed to resolve Orc continuation start in {}: {error}",
+            path.display()
+        )
+    })?;
+    drop(connection);
+    let mut matches: Vec<(i64, i64)> = Vec::new();
+    for row in &rows {
+        let cell = |index: usize| row.get(index).cloned().unwrap_or(SqlValue::Null);
+        let source_line = cell_nonnegative(&cell(0), &format!("{}: message id", path.display()))?;
+        let timestamp_ms = cell_nonnegative(
+            &cell(1),
+            &format!("{}: message created_at_ms", path.display()),
+        )?;
+        let raw_json = cell_string(&cell(2), &format!("{}: message_json", path.display()))?;
+        let decoded: JsonValue = serde_json::from_str(&raw_json).map_err(|error| {
+            format!(
+                "{}: invalid message_json at row {source_line}: {error}",
+                path.display()
+            )
+        })?;
+        let message = decoded.as_object().ok_or_else(|| {
+            format!(
+                "{}: message_json[{source_line}]: expected an object",
+                path.display()
+            )
+        })?;
+        if message.get("id").and_then(JsonValue::as_str) == Some(start_message_id.as_str()) {
+            matches.push((source_line, timestamp_ms));
+        }
+    }
+    if matches.len() != 1 || matches[0].1 <= 0 {
+        return Err(format!(
+            "bounded Orc continuation {} start message {} resolved to {} valid rows",
+            py_repr_str(&spec.session_id),
+            py_repr_str(start_message_id),
+            matches.len()
+        ));
+    }
+    Ok((Some(matches[0]), matches[0].1))
+}
+
+/// Whether a session shows anything at or after an instant.
+pub fn session_has_activity_at_or_after(
+    source_root: &Path,
+    path: &Path,
+    meta: &SessionMeta,
+    lineage_root_session_id: &str,
+    start_at_ms: i64,
+) -> Result<bool, String> {
+    let _ = lineage_root_session_id;
+    if meta.created_at_ms >= start_at_ms {
+        return Ok(true);
+    }
+    {
+        let connection = read_only(path)?;
+        let table = session_storage_table(&connection, &path.display().to_string())?;
+        let rows = query_all(
+            &connection,
+            &format!("SELECT MAX(created_at_ms) FROM {table}"),
+            &[],
+            &path.display().to_string(),
+        )?;
+        drop(connection);
+        if let Some(SqlValue::Int(held)) = rows.first().and_then(|row| row.first()) {
+            if *held >= start_at_ms {
+                return Ok(true);
+            }
+        }
+        }
+    }
+    if auxiliary_observation(path, meta)?
+        .stable_spawns
+        .iter()
+        .any(|spawn| spawn.timestamp_ms >= start_at_ms)
+    {
+        return Ok(true);
+    }
+    for (relative, _, _) in session_task_relatives(path, meta)? {
+        let task_path = live_source_path(source_root, &relative)?;
+        if !source_exists(&task_path) {
+            continue;
+        }
+        let connection = read_only(&task_path)?;
+        require_tables(
+            &connection,
+            &["task_notes"],
+            &task_path.display().to_string(),
+        )?;
+        let rows = query_all(
+            &connection,
+            "SELECT MAX(created_at) FROM task_notes",
+            &[],
+            &task_path.display().to_string(),
+        )?;
+        drop(connection);
+        if let Some(value) = rows.first().and_then(|row| row.first()) {
+            if !matches!(value, SqlValue::Null)
+                && iso_ms(value, &format!("{}: latest task note created_at", task_path.display()))?
+                    >= start_at_ms
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Sources below one Orc installation root.
+pub fn discover_sources(
+    source_root: &Path,
+    root_session_id: &str,
+) -> Result<Vec<DiscoveredSource>, String> {
+    let root_id = safe_component(root_session_id, "root session id")?;
+    let sessions_root = live_source_path(source_root, ".orc/sessions")?;
+    let root_is_symlink = std::fs::symlink_metadata(&sessions_root)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false);
+    if !sessions_root.is_dir() || root_is_symlink {
+        return Err(format!(
+            "missing Orc sessions directory: {}",
+            sessions_root.display()
+        ));
+    }
+    let index_path = live_source_path(source_root, ".orc/index.db")?;
+    let mut selected: Option<Vec<String>> = None;
+    let mut index_parents: Option<Vec<(String, Option<String>)>> = None;
+    if source_exists(&index_path) {
+        let connection = read_only(&index_path)?;
+        require_tables(
+            &connection,
+            &["sessions"],
+            &index_path.display().to_string(),
+        )?;
+        let rows = query_all(
+            &connection,
+            "SELECT id, parent_id FROM sessions ORDER BY id",
+            &[],
+            &index_path.display().to_string(),
+        )
+        .map_err(|error| {
+            format!(
+                "failed to inspect Orc session index at {}: {error}",
+                index_path.display()
+            )
+        })?;
+        drop(connection);
+        let mut parents: Vec<(String, Option<String>)> = Vec::new();
+        for (index, row) in rows.iter().enumerate() {
+            let cell = |i: usize| row.get(i).cloned().unwrap_or(SqlValue::Null);
+            let session_id = safe_component(
+                &cell_string(
+                    &cell(0),
+                    &format!("{}: sessions[{index}].id", index_path.display()),
+                )?,
+                &format!("{}: sessions[{index}].id", index_path.display()),
+            )?;
+            let parent = cell_optional_string(
+                &cell(1),
+                &format!("{}: sessions[{index}].parent_id", index_path.display()),
+            )?;
+            parents.push((session_id, parent));
+        }
+        if !parents.iter().any(|(held, _)| *held == root_id) {
+            return Err(format!(
+                "root Orc session {} is absent from {}",
+                py_repr_str(&root_id),
+                index_path.display()
+            ));
+        }
+        let mut chosen: Vec<String> = vec![root_id.clone()];
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for (session_id, parent) in &parents {
+                if let Some(parent) = parent {
+                    if chosen.contains(parent) && !chosen.contains(session_id) {
+                        chosen.push(session_id.clone());
+                        changed = true;
+                    }
+                }
+            }
+        }
+        selected = Some(chosen);
+        index_parents = Some(parents);
+    }
+    let mut metas: Vec<SessionMeta> = Vec::new();
+    let mut candidate_names: Vec<String> = match &selected {
+        Some(chosen) => {
+            let mut held = chosen.clone();
+            held.sort();
+            held
+        }
+        None => vec![root_id.clone()],
+    };
+    candidate_names.dedup();
+    for session_name in &candidate_names {
+        let session_dir = sessions_root.join(session_name);
+        let dir_symlink = std::fs::symlink_metadata(&session_dir)
+            .map(|meta| meta.file_type().is_symlink())
+            .unwrap_or(false);
+        if dir_symlink || !session_dir.is_dir() {
+            if selected.is_some() {
+                return Err(format!(
+                    "selected Orc session directory is missing: {}",
+                    session_dir.display()
+                ));
+            }
+            continue;
+        }
+        let database = live_source_path(
+            source_root,
+            &format!(".orc/sessions/{session_name}/session.db"),
+        )?;
+        if !source_exists(&database) {
+            if selected.is_some() || *session_name == root_id {
+                return Err(format!(
+                    "selected Orc session database is missing: {}",
+                    database.display()
+                ));
+            }
+            continue;
+        }
+        let relative = database
+            .strip_prefix(source_root)
+            .map(|held| held.to_string_lossy().replace('\\', "/"))
+            .map_err(|_| {
+                format!(
+                    "Orc source is outside the source root: {}",
+                    database.display()
+                )
+            })?;
+        let meta = match session_meta(&database, &relative) {
+            Ok(meta) => meta,
+            Err(error) => {
+                if selected.is_some() || *session_name == root_id {
+                    return Err(error);
+                }
+                continue;
+            }
+        };
+        if meta.session_id != *session_name {
+            return Err(format!(
+                "Orc session directory {} contains session {}",
+                py_repr_str(session_name),
+                py_repr_str(&meta.session_id)
+            ));
+        }
+        if let Some(parents) = &index_parents {
+            let indexed = parents
+                .iter()
+                .find(|(held, _)| held == session_name)
+                .and_then(|(_, parent)| parent.clone());
+            if meta.parent_id != indexed {
+                return Err(format!(
+                    "Orc session parent differs between index and session DB for {}",
+                    py_repr_str(session_name)
+                ));
+            }
+        }
+        metas.push(meta);
+    }
+    if !metas.iter().any(|meta| meta.session_id == root_id) {
+        return Err(format!(
+            "root Orc session {} was not found under {}",
+            py_repr_str(&root_id),
+            sessions_root.display()
+        ));
+    }
+    let selected: Vec<String> = selected.unwrap_or_else(|| vec![root_id.clone()]);
+    let mut result: Vec<DiscoveredSource> = Vec::new();
+    let mut task_owner_evidence: Vec<(String, Vec<(String, bool)>)> = Vec::new();
+    let meta_of = |session_id: &str| -> &SessionMeta {
+        metas
+            .iter()
+            .find(|meta| meta.session_id == session_id)
+            .expect("selected session meta")
+    };
+    for session_id in {
+        let mut held = selected.clone();
+        held.sort();
+        held
+    } {
+        let meta = meta_of(&session_id);
+        result.push(DiscoveredSource {
+            source_path: meta.source_path.clone(),
+            kind: "session".to_string(),
+            owner_candidates: vec![session_id.clone()],
+            lineage_root_session_id: None,
+        });
+        let session_database = live_source_path(source_root, &meta.source_path)?;
+        for (task_relative, required, is_primary) in
+            session_task_relatives(&session_database, meta)?
+        {
+            let task_path = live_source_path(source_root, &task_relative)?;
+            if !source_exists(&task_path) {
+                if required {
+                    return Err(format!(
+                        "session {} references task database {}, but {} is missing",
+                        py_repr_str(&session_id),
+                        py_repr_str(&task_relative),
+                        task_path.display()
+                    ));
+                }
+                continue;
+            }
+            match task_owner_evidence
+                .iter_mut()
+                .find(|(held, _)| *held == task_relative)
+            {
+                Some((_, evidence)) => evidence.push((session_id.clone(), is_primary)),
+                None => task_owner_evidence
+                    .push((task_relative, vec![(session_id.clone(), is_primary)])),
+            }
+        }
+    }
+    fn session_depth(session_id: &str, metas: &[SessionMeta], selected: &[String]) -> i64 {
+        let mut depth = 0;
+        let mut seen: Vec<String> = vec![session_id.to_string()];
+        let mut parent = metas
+            .iter()
+            .find(|meta| meta.session_id == session_id)
+            .and_then(|meta| meta.parent_id.clone());
+        while let Some(held) = parent {
+            if !selected.contains(&held) || seen.contains(&held) {
+                break;
+            }
+            seen.push(held.clone());
+            depth += 1;
+            parent = metas
+                .iter()
+                .find(|meta| meta.session_id == held)
+                .and_then(|meta| meta.parent_id.clone());
+        }
+        depth
+    }
+    task_owner_evidence.sort_by(|a, b| a.0.cmp(&b.0));
+    for (path, mut evidence) in task_owner_evidence {
+        evidence.sort_by(|a, b| {
+            let meta_a = meta_of(&a.0);
+            let meta_b = meta_of(&b.0);
+            (
+                !a.1,
+                meta_a.parent_id.is_some(),
+                session_depth(&a.0, &metas, &selected),
+                meta_a.created_at_ms,
+                &a.0,
+            )
+                .cmp(&(
+                    !b.1,
+                    meta_b.parent_id.is_some(),
+                    session_depth(&b.0, &metas, &selected),
+                    meta_b.created_at_ms,
+                    &b.0,
+                ))
+        });
+        result.push(DiscoveredSource {
+            source_path: path,
+            kind: "task".to_string(),
+            owner_candidates: evidence.into_iter().map(|(held, _)| held).collect(),
+            lineage_root_session_id: None,
+        });
+    }
+    result.sort_by(|a, b| a.source_path.cmp(&b.source_path));
+    Ok(result)
+}
+
+/// Sources below one installation root and every
+/// configured continuation lineage.
+pub fn discover_continuation_sources(
+    source_root: &Path,
+    root_session_id: &str,
+    specs_in: &[ContinuationSpec],
+    previously_selected_session_ids: &[String],
+) -> Result<Vec<DiscoveredSource>, String> {
+    let mut all_specs: Vec<ContinuationSpec> = vec![ContinuationSpec {
+        session_id: root_session_id.to_string(),
+        start_message_id: None,
+    }];
+    // The root spec needs safe-component validation.
+    all_specs[0].session_id = safe_component(root_session_id, "continuation_specs[0].session_id")?;
+    all_specs.extend(specs_in.iter().cloned());
+    let mut merged: Vec<DiscoveredSource> = Vec::new();
+    let mut root_start: Option<i64> = None;
+    let mut selected_sessions: Vec<String> = Vec::new();
+    for spec in &all_specs {
+        let root = &spec.session_id;
+        let root_relative = format!(".orc/sessions/{root}/session.db");
+        let root_path = live_source_path(source_root, &root_relative)?;
+        let root_meta = session_meta(&root_path, &root_relative)?;
+        if root_meta.session_id != *root || root_meta.parent_id.is_some() {
+            return Err(format!(
+                "configured Orc continuation {} is not a parentless root session",
+                py_repr_str(root)
+            ));
+        }
+        let (_, effective_start) = resolve_continuation_start(&root_path, &root_meta, spec)?;
+        if let Some(previous) = root_start {
+            if effective_start <= previous {
+                return Err(
+                    "Orc root and continuation sessions must be ordered by strictly increasing start time"
+                        .to_string(),
+                );
+            }
+        }
+        root_start = Some(effective_start);
+        let mut lineage_sources = discover_sources(source_root, root)?;
+        if spec.start_message_id.is_some() {
+            let mut retained_sessions: Vec<String> = vec![root.clone()];
+            let mut allowed_task_paths: Vec<String> =
+                session_task_relatives(&root_path, &root_meta)?
+                    .into_iter()
+                    .filter(|(_, _, is_primary)| *is_primary)
+                    .map(|(path, _, _)| path)
+                    .collect();
+            let sessions_only: Vec<DiscoveredSource> = lineage_sources
+                .iter()
+                .filter(|source| source.kind == "session")
+                .cloned()
+                .collect();
+            for session_source in &sessions_only {
+                let session_path = live_source_path(source_root, &session_source.source_path)?;
+                let held_meta = session_meta(&session_path, &session_source.source_path)?;
+                if held_meta.session_id == *root {
+                    continue;
+                }
+                if !previously_selected_session_ids.contains(&held_meta.session_id)
+                    && !session_has_activity_at_or_after(
+                        source_root,
+                        &session_path,
+                        &held_meta,
+                        root,
+                        effective_start,
+                    )?
+                {
+                    continue;
+                }
+                retained_sessions.push(held_meta.session_id.clone());
+                for (path, _, _) in session_task_relatives(&session_path, &held_meta)? {
+                    if !allowed_task_paths.contains(&path) {
+                        allowed_task_paths.push(path);
+                    }
+                }
+            }
+            lineage_sources.retain(|source| {
+                (source.kind == "session"
+                    && source
+                        .owner_candidates
+                        .first()
+                        .is_some_and(|held| retained_sessions.contains(held)))
+                    || allowed_task_paths.contains(&source.source_path)
+            });
+        }
+        for source in lineage_sources {
+            let mut source = source;
+            if source.kind == "session" {
+                source.lineage_root_session_id = Some(root.clone());
+            }
+            let prior_index = merged
+                .iter()
+                .position(|held| held.source_path == source.source_path);
+            if source.kind == "session" {
+                let session_id = source.owner_candidates.first().cloned().unwrap_or_default();
+                if selected_sessions.contains(&session_id) || prior_index.is_some() {
+                    return Err(format!(
+                        "configured Orc root lineages overlap at session {}",
+                        py_repr_str(&session_id)
+                    ));
+                }
+                selected_sessions.push(session_id);
+                merged.push(source);
+                continue;
+            }
+            match prior_index {
+                None => merged.push(source),
+                Some(index) => {
+                    if merged[index].kind != "task" {
+                        return Err(format!(
+                            "Orc source path has conflicting database kinds: {}",
+                            source.source_path
+                        ));
+                    }
+                    for owner in &source.owner_candidates {
+                        if !merged[index].owner_candidates.contains(owner) {
+                            merged[index].owner_candidates.push(owner.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    merged.sort_by(|a, b| a.source_path.cmp(&b.source_path));
+    Ok(merged)
+}
+
+// ---------------------------------------------------------------- conversation evidence
+
+/// The normalized conversation from a session database.
+pub fn conversation_messages(connection: &Connection) -> Result<Vec<JsonValue>, String> {
+    if session_storage_table(connection, "Orc session")? == "messages" {
+        let rows = query_all(
+            connection,
+            "SELECT id, created_at_ms, message_json FROM messages ORDER BY id",
+            &[],
+            "messages",
+        )?;
+        let mut result = Vec::new();
+        for (index, row) in rows.iter().enumerate() {
+            let cell = |i: usize| row.get(i).cloned().unwrap_or(SqlValue::Null);
+            let message_id = cell_nonnegative(&cell(0), &format!("messages[{index}].id"))?;
+            let created_at_ms =
+                cell_nonnegative(&cell(1), &format!("messages[{index}].created_at_ms"))?;
+            let raw = cell_string(&cell(2), &format!("messages[{index}].message_json"))?;
+            let parsed: JsonValue = serde_json::from_str(&raw).map_err(|error| {
+                format!("invalid messages.message_json at row {message_id}: {error}")
+            })?;
+            let mut message = parsed
+                .as_object()
+                .cloned()
+                .ok_or_else(|| format!("messages[{index}].message_json: expected an object"))?;
+            let embedded_at = nonnegative_integer(
+                message.get("created_at_ms"),
+                &format!("messages[{index}].message_json.created_at_ms"),
+            )?;
+            if embedded_at != created_at_ms {
+                return Err(format!(
+                    "messages[{index}] timestamp differs from message_json"
+                ));
+            }
+            message.insert("id".into(), JsonValue::from(message_id));
+            message.insert("created_at_ms".into(), JsonValue::from(created_at_ms));
+            result.push(JsonValue::Object(message));
+        }
+        return Ok(result);
+    }
+    let row = query_one(
+        connection,
+        "SELECT conversation_json FROM conversation_state WHERE id = 1",
+        "conversation_state",
+    )?;
+    let raw = cell_string(
+        row.first().unwrap_or(&SqlValue::Null),
+        "conversation_state.conversation_json",
+    )?;
+    let parsed: JsonValue = serde_json::from_str(&raw)
+        .map_err(|error| format!("invalid conversation_state JSON: {error}"))?;
+    let root = parsed
+        .as_object()
+        .ok_or_else(|| "conversation_state: expected an object".to_string())?;
+    match root.get("messages") {
+        Some(JsonValue::Array(items)) => Ok(items.clone()),
+        _ => Err("conversation_state.messages: expected an array".to_string()),
+    }
+}
+
+/// Canonical digest of a normalized conversation.
+pub fn messages_digest(messages: &[JsonValue]) -> Result<String, String> {
+    let encoded = crate::json::dump_compact(&JsonValue::Array(messages.to_vec()));
+    Ok(sha256_hex(encoded.as_bytes()))
+}
+
+/// One spawn an append-only rewrite cannot take away.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StableSpawn {
+    /// See the enclosing record's documentation.
+    pub session_id: String,
+    /// See the enclosing record's documentation.
+    pub parent_session_id: Option<String>,
+    /// See the enclosing record's documentation.
+    pub message_id: i64,
+    /// See the enclosing record's documentation.
+    pub block_id: i64,
+    /// See the enclosing record's documentation.
+    pub timestamp_ms: i64,
+    /// See the enclosing record's documentation.
+    pub agent_id: String,
+}
+
+impl StableSpawn {
+    fn key(&self) -> (String, i64) {
+        (self.session_id.clone(), self.block_id)
+    }
+}
+
+/// Every stable spawn in a conversation, sorted by key.
+pub fn stable_spawn_records(
+    messages: &[JsonValue],
+    meta: &SessionMeta,
+    where_: &str,
+) -> Result<Vec<StableSpawn>, String> {
+    let mut records: Vec<StableSpawn> = Vec::new();
+    let mut seen: Vec<(String, i64)> = Vec::new();
+    for (message_index, raw_message) in messages.iter().enumerate() {
+        let message_where = format!("{where_}: messages[{message_index}]");
+        let message = raw_message
+            .as_object()
+            .ok_or_else(|| format!("{message_where}: expected an object"))?;
+        let message_id = signed_integer(message.get("id"), &format!("{message_where}.id"))?;
+        let timestamp_ms = signed_integer(
+            message.get("created_at_ms"),
+            &format!("{message_where}.created_at_ms"),
+        )?;
+        let blocks = match message.get("blocks") {
+            Some(JsonValue::Array(items)) => items.clone(),
+            _ => return Err(format!("{message_where}.blocks: expected an array")),
+        };
+        for (block_index, raw_block) in blocks.iter().enumerate() {
+            let block_where = format!("{message_where}.blocks[{block_index}]");
+            let block = raw_block
+                .as_object()
+                .ok_or_else(|| format!("{block_where}: expected an object"))?;
+            if block.get("type").and_then(JsonValue::as_str) != Some("AgentBlock") {
+                continue;
+            }
+            let block_id = signed_integer(block.get("id"), &format!("{block_where}.id"))?;
+            let record = StableSpawn {
+                session_id: meta.session_id.clone(),
+                parent_session_id: meta.parent_id.clone(),
+                message_id,
+                block_id,
+                timestamp_ms,
+                agent_id: required_string(
+                    block.get("agent_id"),
+                    &format!("{block_where}.agent_id"),
+                )?,
+            };
+            if seen.contains(&record.key()) {
+                return Err(format!(
+                    "{where_}: duplicate AgentBlock identity ({}, {})",
+                    py_repr_str(&record.session_id),
+                    record.block_id
+                ));
+            }
+            seen.push(record.key());
+            records.push(record);
+        }
+    }
+    records.sort_by_key(|a| a.key());
+    Ok(records)
+}
+
+/// Digest of stable spawn records.
+pub fn stable_spawn_digest(records: &[StableSpawn]) -> String {
+    let mut digest = sha2::Sha256::new();
+    for record in records {
+        digest.update(b"R");
+        update_digest_json(&mut digest, &JsonValue::String(record.session_id.clone()));
+        update_digest_json(
+            &mut digest,
+            &record
+                .parent_session_id
+                .clone()
+                .map_or(JsonValue::Null, JsonValue::String),
+        );
+        update_digest_json(&mut digest, &JsonValue::from(record.message_id));
+        update_digest_json(&mut digest, &JsonValue::from(record.block_id));
+        update_digest_json(&mut digest, &JsonValue::from(record.timestamp_ms));
+        update_digest_json(&mut digest, &JsonValue::String(record.agent_id.clone()));
+    }
+    hex_digest(&digest)
+}
+
+/// A session's conversation and the spawns it proves.
+#[derive(Clone, Debug)]
+pub struct AuxiliaryObservation {
+    /// See the enclosing record's documentation.
+    pub messages: Vec<JsonValue>,
+    /// See the enclosing record's documentation.
+    pub message_sha256: String,
+    /// See the enclosing record's documentation.
+    pub stable_spawns: Vec<StableSpawn>,
+    /// See the enclosing record's documentation.
+    pub stable_spawn_sha256: String,
+}
+
+/// Observe a session's conversation evidence.
+pub fn auxiliary_observation(
+    path: &Path,
+    meta: &SessionMeta,
+) -> Result<AuxiliaryObservation, String> {
+    let connection = read_only(path)?;
+    let messages = conversation_messages(&connection)?;
+    drop(connection);
+    let records = stable_spawn_records(&messages, meta, &path.display().to_string())?;
+    Ok(AuxiliaryObservation {
+        message_sha256: messages_digest(&messages)?,
+        stable_spawns: records.clone(),
+        stable_spawn_sha256: stable_spawn_digest(&records),
+        messages,
+    })
+}
+
+/// Whether the current conversation extends the recorded
+/// one unchanged to its length.
+pub fn conversation_is_append_extension(
+    previous: &AuxiliaryObservation,
+    current: &AuxiliaryObservation,
+) -> Result<bool, String> {
+    let previous_count = previous.messages.len();
+    Ok(current.messages.len() >= previous_count
+        && messages_digest(&current.messages[..previous_count])? == previous.message_sha256)
+}
+
+/// Refuse when stable spawns disappeared or changed.
+pub fn validate_stable_spawn_extension(
+    previous: &AuxiliaryObservation,
+    current: &AuxiliaryObservation,
+    relative: &str,
+) -> Result<(), String> {
+    let missing: Vec<&StableSpawn> = previous
+        .stable_spawns
+        .iter()
+        .filter(|record| {
+            !current
+                .stable_spawns
+                .iter()
+                .any(|held| held.key() == record.key())
+        })
+        .collect();
+    if let Some(first) = missing.first() {
+        return Err(format!(
+            "Orc stable spawn evidence disappeared for {relative}: ({}, {})",
+            py_repr_str(&first.session_id),
+            first.block_id
+        ));
+    }
+    let changed: Vec<&StableSpawn> = previous
+        .stable_spawns
+        .iter()
+        .filter(|record| {
+            current
+                .stable_spawns
+                .iter()
+                .find(|held| held.key() == record.key())
+                .is_some_and(|held| held != *record)
+        })
+        .collect();
+    if let Some(first) = changed.first() {
+        return Err(format!(
+            "Orc stable spawn evidence was rewritten for {relative}: ({}, {})",
+            py_repr_str(&first.session_id),
+            first.block_id
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse when storage migration changed anything but a
+/// spawn's message id.
+pub fn validate_stable_spawn_storage_migration(
+    previous: &AuxiliaryObservation,
+    current: &AuxiliaryObservation,
+    relative: &str,
+) -> Result<(), String> {
+    let missing: Vec<&StableSpawn> = previous
+        .stable_spawns
+        .iter()
+        .filter(|record| {
+            !current
+                .stable_spawns
+                .iter()
+                .any(|held| held.key() == record.key())
+        })
+        .collect();
+    if let Some(first) = missing.first() {
+        return Err(format!(
+            "Orc stable spawn evidence disappeared during storage migration for {relative}: ({}, {})",
+            py_repr_str(&first.session_id),
+            first.block_id
+        ));
+    }
+    for prior in &previous.stable_spawns {
+        let current_record = current
+            .stable_spawns
+            .iter()
+            .find(|held| held.key() == prior.key())
+            .expect("checked present");
+        if (
+            &prior.session_id,
+            &prior.parent_session_id,
+            prior.block_id,
+            prior.timestamp_ms,
+            &prior.agent_id,
+        ) != (
+            &current_record.session_id,
+            &current_record.parent_session_id,
+            current_record.block_id,
+            current_record.timestamp_ms,
+            &current_record.agent_id,
+        ) {
+            return Err(format!(
+                "Orc stable spawn evidence was rewritten during storage migration for {relative}: ({}, {})",
+                py_repr_str(&prior.session_id),
+                prior.block_id
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse when immutable session metadata was rewritten.
+pub fn validate_session_meta_extension(
+    previous: &SessionMeta,
+    current: &SessionMeta,
+    relative: &str,
+) -> Result<(), String> {
+    if (
+        &current.session_id,
+        &current.parent_id,
+        current.created_at_ms,
+    ) != (
+        &previous.session_id,
+        &previous.parent_id,
+        previous.created_at_ms,
+    ) {
+        return Err(format!(
+            "Orc immutable session metadata was rewritten for {relative}"
+        ));
+    }
+    if current.updated_at_ms < previous.updated_at_ms {
+        return Err(format!(
+            "Orc session updated_at moved backwards for {relative}: {} to {}",
+            previous.updated_at_ms, current.updated_at_ms
+        ));
     }
     Ok(())
 }
