@@ -1574,7 +1574,10 @@ pub fn load_orc_manifest(
         )?);
     }
     let mut links: Vec<crate::orc::ContinuationLink> = Vec::new();
-    if let Some(raw_continuations) = object.get("continuation_sessions") {
+    if let Some(raw_continuations) = object
+        .get("continuation_sessions")
+        .filter(|held| !held.is_null())
+    {
         if !(3..=5).contains(&schema_version) {
             return Err(format!(
                 "{}: continuation_sessions requires manifest schema version 3, 4 or 5",
