@@ -66,3 +66,9 @@ updated_at: 2026-10-30T06:44:42.826876431+00:00
 - Differential `py/tests/test_wrkviz_serve_rust.py` (4 cases: http.client comparison incl. header order/version, raw-socket malformed requests, CLI errors, pre-flight messages); all wrkviz differentials pass (44 cases). Strict mypy and clippy clean.
 - Gate 123 (`/tmp/gate123-serve.log`): only `python.wrkslots.shard-0/1` failed (audit differentials under load, unrelated); both pass solo on the final commit (`/tmp/gate123-shard0-solo.log`, `/tmp/gate123-shard1-solo.log`, rc=0). Pushed as 68db948b + 11474e18.
 - Remaining wrkviz: writers (ingest/summarize/build), then the edition switch at parity. Then parallel-experiment-runner.
+
+## Slice 5a landed: Rust `quickstart` (main 08fb6f24)
+
+- Writers stage opens with the trivial print: `quickstart` at byte parity, including the `WRKVIZ_MODEL` override and the oracle's triple-quoted-string line continuations (which join the step-4 command lines). Differential `py/tests/test_wrkviz_quickstart_rust.py`; 24 probe cases matched (help forms, extras, model env variants). No adversarial sub-review for this constant-print slice.
+- Gate 125 (`/tmp/gate125-quickstart.log`): only `rust.agentctl.test` failed (one chat-reply test under load); passes solo on the final commit (`/tmp/gate125-agentctl-solo.log`, rc=0). Pushed as 08fb6f24.
+- Writer plan from here: 5b `TeamData` archive reader (team.json + promoted task notes, the load_archived_team validations), 5c the seekable-JSONL writer, 5d the extract projection (grouping, authorship rules, monotonic union, container manifest) behind `extract-transcripts` with its run record and writer lock. Then the ingest normalizers (codex, claude, muse, claude-history, orc), `summarize`, `build`, and the composites (refresh/export/gc/migrate), each gated separately.
