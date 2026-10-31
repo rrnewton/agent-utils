@@ -1694,6 +1694,15 @@ pub fn export_transcripts(
     teams: &[TeamData],
     skipped_teams: &[TranscriptTeamSkip],
 ) -> Result<TranscriptExportReport, String> {
+    export_transcripts_inner(archive, teams, None, skipped_teams)
+}
+
+fn export_transcripts_inner(
+    archive: &Path,
+    teams: &[TeamData],
+    provided_rules: Option<&[PromptAuthorshipRule]>,
+    skipped_teams: &[TranscriptTeamSkip],
+) -> Result<TranscriptExportReport, String> {
     let mut ordered_teams: Vec<&TeamData> = teams.iter().collect();
     ordered_teams.sort_by(|left, right| left.team_slug.cmp(&right.team_slug));
     if ordered_teams.is_empty() {
@@ -1752,7 +1761,10 @@ pub fn export_transcripts(
         }
     }
     let previous_occurrences = read_jsonl(&shared_build_file(archive, BASELINE_FILE)?)?;
-    let configured_rules = load_rules(&root.join(AUTHORSHIP_RULES_FILE))?;
+    let configured_rules = match provided_rules {
+        Some(rules) => rules.to_vec(),
+        None => load_rules(&root.join(AUTHORSHIP_RULES_FILE))?,
+    };
     let mut projected_teams: BTreeSet<String> =
         loaded_slugs.union(&skipped_slugs).cloned().collect();
     for record in &previous_occurrences {
@@ -2045,6 +2057,45 @@ pub fn extract_transcripts_archive(
         ));
     }
     export_transcripts(archive, &teams, &skipped)
+}
+
+/// Export every normalized team in the archive with
+/// caller-supplied prompt authorship rules (the
+/// project-ingest path; the extract command reads its
+/// rules from the archive file instead).
+pub fn extract_transcripts_archive_with_rules(
+    archive: &Path,
+    rules: &[PromptAuthorshipRule],
+) -> Result<TranscriptExportReport, String> {
+    let _lock = crate::pipeline::archive_writer_lock(archive)?;
+    let selected = crate::build_store::ingested_team_slugs(archive)?;
+    if selected.is_empty() {
+        return Err(format!("no ingested teams found in {}", archive.display()));
+    }
+    let mut teams: Vec<TeamData> = Vec::new();
+    let mut skipped: Vec<TranscriptTeamSkip> = Vec::new();
+    for slug in &selected {
+        match load_archived_team(archive, slug) {
+            Ok(team) => teams.push(team),
+            Err(error) => skipped.push(TranscriptTeamSkip {
+                team_slug: slug.clone(),
+                error_type: classify_load_error(&error).to_string(),
+                error,
+            }),
+        }
+    }
+    if teams.is_empty() {
+        return Err(format!(
+            "no archive team in {} could be loaded for transcript extraction: {}",
+            archive.display(),
+            skipped
+                .iter()
+                .map(TranscriptTeamSkip::summary)
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+    export_transcripts_inner(archive, &teams, Some(rules), &skipped)
 }
 
 fn classify_load_error(message: &str) -> &'static str {

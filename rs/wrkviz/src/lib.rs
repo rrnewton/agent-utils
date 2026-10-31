@@ -48,6 +48,9 @@ pub mod orc;
 pub mod payloads;
 /// Archive transactions: writer lock, team loading, run records.
 pub mod pipeline;
+/// The `ingest-project` manifest: strict schema-v1 config
+/// and multi-team dispatch.
+pub mod project_config;
 /// The `query list` subcommand over schema-3 and schema-1
 /// timelines.
 pub mod query;
