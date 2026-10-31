@@ -248,3 +248,28 @@ test-file sort order (log `/tmp/gate147-gc.log`). Also fixed the
 schema-2 bootstrap path constant (`data/timeline-v2.json`) shared
 with render's retired-generation detection. Differential:
 `py/tests/test_wrkviz_gc_rust.py` (6 cases).
+
+## Slices 9c-9e landed: migrate-build-state, migrate-snapshots, github-metadata (2026-10-31)
+
+`migrate-build-state` and `migrate-snapshots` are ported
+(`0b9a94e1`/`40927f8d` on main): plan/validate, pointer-first atomic
+renames, cross-device copy-verify-delete through `.migrating`
+staging, refusal cases, text/JSON reports at parity.
+`github-metadata` is ported (`692fb693` on main): pull-metadata
+cache with exact-key validation, conditional ETag fetches through
+the gh resolver seam (AGENT_UTILS_GH / gh-paced / gh), evidenced
+reference discovery from generated phase details, enrich-then-
+rebuild composition with run receipts and the failures-retained
+error. Differentials: `py/tests/test_wrkviz_migrate_rust.py` (3),
+`py/tests/test_wrkviz_migrate_snapshots_rust.py` (3),
+`py/tests/test_wrkviz_github_metadata_rust.py` (2; fetch, 304
+refetch, 404 retention, help). Gate 152 on the final commit: every
+selected step passed in some run (format/clippy/agentctl-test solos
+on the final HEAD after two one-line fix-forwards to upstream
+`registry_layout.rs` formatting/doc-comment, credited in the commit
+bodies). Landed as `381af35f` after a no-overlap rebase.
+
+Remaining composites: refresh/refresh-claude/refresh-orc,
+audit-glossary, audit-losslessness, responsiveness,
+discover-agents, `--userguide`, multi-team export; then the edition
+switch at parity and the generated-schema collapse.
