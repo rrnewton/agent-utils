@@ -455,6 +455,8 @@
         "py/tests/test_wrkviz_build_rust.py",
         "py/tests/test_wrkviz_extract_rust.py",
         "py/tests/test_wrkviz_gc_rust.py",
+        "py/tests/test_wrkviz_migrate_rust.py",
+        "py/tests/test_wrkviz_migrate_snapshots_rust.py",
         "py/tests/test_wrkviz_ingest_claude_rust.py",
         "py/tests/test_wrkviz_ingest_codex_rust.py",
         "py/tests/test_wrkviz_ingest_history_rust.py",

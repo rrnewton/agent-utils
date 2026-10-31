@@ -374,6 +374,8 @@ pub fn run(args: &[String]) -> u8 {
         "build" => run_build(&args[1..]),
         "export" => run_export(&args[1..]),
         "gc" => run_gc(&args[1..]),
+        "migrate-build-state" => run_migrate_build_state(&args[1..]),
+        "migrate-snapshots" => run_migrate_snapshots(&args[1..]),
         other => {
             eprintln!(
                 "wrkviz: the Rust edition has not ported '{other}' yet; the Python edition remains the oracle for it"
@@ -4671,6 +4673,298 @@ options:
 "##;
 
 const GC_USAGE: &str = "usage: wrkviz gc [-h] --output OUTPUT [--delete] [--empty-trash]\n                 [--format {text,json}]";
+
+/// Verbatim `wrkviz migrate-build-state --help` text.
+pub const MIGRATE_SNAPSHOTS_HELP: &str =
+    "usage: wrkviz migrate-snapshots [-h] --output OUTPUT [--snapshot-root DIR]
+                                [--move] [--copy] [--format {text,json}]
+
+relocate teams/<slug>/source_snapshots/ into a store outside --output. The
+snapshots are ingest input, not published output: they are typically two
+thirds of an archive's bytes, they are reachable over HTTP from `make serve`,
+and the tool has always gitignored them. Nothing moves unless --move is given;
+without it this prints what would move, from where, to where, and what it
+refuses to touch. The move is a rename when the store is on the same
+filesystem, which it is by default, and the archive records the new layout
+before the first byte moves so that an interrupted run is resumable rather
+than ambiguous
+
+options:
+  -h, --help            show this help message and exit
+  --output OUTPUT       built or ingested archive directory
+  --snapshot-root DIR   where to keep the vendor source snapshots, which are
+                        ingest input rather than published output and are the
+                        largest thing here (default: <output>.sources, a
+                        sibling of the archive; an archive that already keeps
+                        them inside itself keeps doing so until `migrate-
+                        snapshots` is run)
+  --move                actually relocate the snapshots; without this the
+                        command only reports
+  --copy                permit a copy-verify-delete when the store is on a
+                        different filesystem; unlike a rename this is
+                        interruptible and the bytes exist twice while it runs
+  --format {text,json}  report format (default: text)
+";
+
+const MIGRATE_BUILD_STATE_HELP: &str = r##"usage: wrkviz migrate-build-state [-h] --output OUTPUT [--build-root DIR]
+                                  [--move]
+
+Relocate teams/*/raw and teams/*/payloads to a sibling store, so the archive
+holds only what a consumer of it opens. That state is what ingestion computes
+from the vendor snapshots -- the normalized team, the artifact catalogue, the
+provenance manifests -- and no browser or CLI reads any of it: on the measured
+archive it was 717 MiB of 1.5 GiB, shipped to every machine that served the
+site. It is relocated rather than deleted because it is what makes the next
+ingest incremental. Nothing moves unless --move is given; without it this
+prints what would move, from where, and to where. The move is a rename when
+the store is on the same filesystem, which it is by default. teams/*/summaries
+and teams/*/summary_data stay: the first is output the shipped CLI reads, the
+second holds the paid summary cache and the spend receipts run_stats reports
+from
+
+options:
+  -h, --help        show this help message and exit
+  --output OUTPUT   built or ingested archive directory
+  --build-root DIR  where to keep intermediate build state -- the normalized
+                    team, the artifact catalogue, the provenance manifests,
+                    the payload store -- which is what a rebuild reads and
+                    what nothing else does (default: <output>.build, a sibling
+                    of the archive; an archive that already keeps it inside
+                    itself keeps doing so until `migrate-build-state` is run)
+  --move            actually relocate the build state; without this the
+                    command only reports
+"##;
+
+const MIGRATE_SNAPSHOTS_USAGE: &str = "usage: wrkviz migrate-snapshots [-h] --output OUTPUT [--snapshot-root DIR]\n                                [--move] [--copy] [--format {text,json}]";
+
+const MIGRATE_BUILD_STATE_USAGE: &str = "usage: wrkviz migrate-build-state [-h] --output OUTPUT [--build-root DIR]\n                                  [--move]";
+
+fn run_migrate_build_state(args: &[String]) -> u8 {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print!("{MIGRATE_BUILD_STATE_HELP}");
+        return 0;
+    }
+    const VALUE_OPTIONS: &[&str] = &["--output", "--build-root"];
+    const FLAG_OPTIONS: &[&str] = &["--move"];
+    let mut values: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    let mut flags: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        let (head, explicit) = match arg.split_once('=') {
+            Some((head, value)) => (head, Some(value.to_string())),
+            None => (arg.as_str(), None),
+        };
+        let resolve = |set: &[&str]| -> Vec<String> {
+            set.iter()
+                .copied()
+                .filter(|name| {
+                    head == *name
+                        || (head.len() > 2 && head.starts_with("--") && name.starts_with(head))
+                })
+                .map(str::to_string)
+                .collect()
+        };
+        let value_candidates = resolve(VALUE_OPTIONS);
+        let flag_candidates = resolve(FLAG_OPTIONS);
+        if explicit.is_none() && flag_candidates.len() == 1 {
+            flags.insert(flag_candidates[0].clone());
+            index += 1;
+            continue;
+        }
+        if value_candidates.len() > 1 && !value_candidates.contains(&head.to_string()) {
+            return argparse_error(
+                MIGRATE_BUILD_STATE_USAGE,
+                "wrkviz migrate-build-state",
+                &format!(
+                    "ambiguous option: {head} could match {}",
+                    value_candidates.join(", ")
+                ),
+            );
+        }
+        let Some(name) = value_candidates.first() else {
+            return argparse_error(
+                MIGRATE_BUILD_STATE_USAGE,
+                "wrkviz migrate-build-state",
+                &format!("unrecognized arguments: {arg}"),
+            );
+        };
+        let name = name.clone();
+        let value = match explicit {
+            Some(value) => value,
+            None => {
+                index += 1;
+                match args.get(index) {
+                    Some(value) => value.clone(),
+                    None => {
+                        return argparse_error(
+                            MIGRATE_BUILD_STATE_USAGE,
+                            "wrkviz migrate-build-state",
+                            &format!("argument {name}: expected one argument"),
+                        )
+                    }
+                }
+            }
+        };
+        values.entry(name).or_default().push(value);
+        index += 1;
+    }
+    let get = |name: &str| values.get(name).and_then(|items| items.last()).cloned();
+    if get("--output").is_none() {
+        return argparse_error(
+            MIGRATE_BUILD_STATE_USAGE,
+            "wrkviz migrate-build-state",
+            "the following arguments are required: --output",
+        );
+    }
+    let archive = cli_path(&get("--output").unwrap());
+    let requested = get("--build-root").map(|raw| cli_path(&raw));
+    let outcome = (|| -> Result<crate::build_store::BuildMigrationResult, String> {
+        let _lock = crate::pipeline::archive_writer_lock(&archive)?;
+        crate::build_store::migrate_build_state(
+            &archive,
+            requested.as_deref(),
+            flags.contains("--move"),
+        )
+    })();
+    match outcome {
+        Ok(result) => {
+            print!(
+                "{}",
+                crate::build_store::format_build_migration_report(
+                    &result,
+                    flags.contains("--move"),
+                )
+            );
+            0
+        }
+        Err(error) => {
+            eprintln!("wrkviz: {error}");
+            2
+        }
+    }
+}
+
+fn run_migrate_snapshots(args: &[String]) -> u8 {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print!("{MIGRATE_SNAPSHOTS_HELP}");
+        return 0;
+    }
+    const VALUE_OPTIONS: &[&str] = &["--output", "--snapshot-root", "--format"];
+    const FLAG_OPTIONS: &[&str] = &["--move", "--copy"];
+    let mut values: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    let mut flags: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        let (head, explicit) = match arg.split_once('=') {
+            Some((head, value)) => (head, Some(value.to_string())),
+            None => (arg.as_str(), None),
+        };
+        let resolve = |set: &[&str]| -> Vec<String> {
+            set.iter()
+                .copied()
+                .filter(|name| {
+                    head == *name
+                        || (head.len() > 2 && head.starts_with("--") && name.starts_with(head))
+                })
+                .map(str::to_string)
+                .collect()
+        };
+        let value_candidates = resolve(VALUE_OPTIONS);
+        let flag_candidates = resolve(FLAG_OPTIONS);
+        if explicit.is_none() && flag_candidates.len() == 1 {
+            flags.insert(flag_candidates[0].clone());
+            index += 1;
+            continue;
+        }
+        if value_candidates.len() > 1 && !value_candidates.contains(&head.to_string()) {
+            return argparse_error(
+                MIGRATE_SNAPSHOTS_USAGE,
+                "wrkviz migrate-snapshots",
+                &format!(
+                    "ambiguous option: {head} could match {}",
+                    value_candidates.join(", ")
+                ),
+            );
+        }
+        let Some(name) = value_candidates.first() else {
+            return argparse_error(
+                MIGRATE_SNAPSHOTS_USAGE,
+                "wrkviz migrate-snapshots",
+                &format!("unrecognized arguments: {arg}"),
+            );
+        };
+        let name = name.clone();
+        let value = match explicit {
+            Some(value) => value,
+            None => {
+                index += 1;
+                match args.get(index) {
+                    Some(value) => value.clone(),
+                    None => {
+                        return argparse_error(
+                            MIGRATE_SNAPSHOTS_USAGE,
+                            "wrkviz migrate-snapshots",
+                            &format!("argument {name}: expected one argument"),
+                        )
+                    }
+                }
+            }
+        };
+        values.entry(name).or_default().push(value);
+        index += 1;
+    }
+    let get = |name: &str| values.get(name).and_then(|items| items.last()).cloned();
+    if get("--output").is_none() {
+        return argparse_error(
+            MIGRATE_SNAPSHOTS_USAGE,
+            "wrkviz migrate-snapshots",
+            "the following arguments are required: --output",
+        );
+    }
+    let format = get("--format").unwrap_or_else(|| "text".to_string());
+    if format != "text" && format != "json" {
+        return argparse_error(
+            MIGRATE_SNAPSHOTS_USAGE,
+            "wrkviz migrate-snapshots",
+            &format!("argument --format: invalid choice: '{format}' (choose from 'text', 'json')"),
+        );
+    }
+    let archive = cli_path(&get("--output").unwrap());
+    let requested = get("--snapshot-root").map(|raw| cli_path(&raw));
+    let outcome = (|| -> Result<crate::snapshot_store::SnapshotMigrationResult, String> {
+        let _lock = crate::pipeline::archive_writer_lock(&archive)?;
+        crate::snapshot_store::migrate_snapshots(
+            &archive,
+            requested.as_deref(),
+            flags.contains("--move"),
+            flags.contains("--copy"),
+        )
+    })();
+    match outcome {
+        Ok(result) => {
+            if format == "json" {
+                print!("{}", crate::json::dump_canonical(&result.to_json_obj()));
+            } else {
+                print!(
+                    "{}",
+                    crate::snapshot_store::format_snapshot_migration_report(
+                        &result,
+                        flags.contains("--move"),
+                    )
+                );
+            }
+            0
+        }
+        Err(error) => {
+            eprintln!("wrkviz: {error}");
+            2
+        }
+    }
+}
 
 fn run_gc(args: &[String]) -> u8 {
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {

@@ -600,3 +600,501 @@ pub fn pointer_summary(archive: &Path) -> Result<Value, String> {
     let _ = out;
     Ok(Value::Object(out))
 }
+
+const COPY_STAGING_DIRECTORY: &str = ".migrating";
+
+fn is_link(path: &Path) -> bool {
+    path.symlink_metadata()
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+fn device_of(path: &Path) -> Result<u64, String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let mut probe = path.to_path_buf();
+        loop {
+            if probe.exists() {
+                return std::fs::metadata(&probe)
+                    .map(|meta| meta.dev())
+                    .map_err(|error| crate::json::os_error(&error, &probe));
+            }
+            match probe.parent() {
+                Some(parent) if parent != probe => {
+                    probe = parent.to_path_buf();
+                }
+                _ => {
+                    return Err(format!("no existing ancestor for {}", path.display()));
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(0)
+    }
+}
+
+fn fsync_directory(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        let file =
+            std::fs::File::open(path).map_err(|error| crate::json::os_error(&error, path))?;
+        file.sync_all()
+            .map_err(|error| crate::json::os_error(&error, path))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
+fn copy_tree(source: &Path, target: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(target).map_err(|error| crate::json::os_error(&error, target))?;
+    let entries =
+        std::fs::read_dir(source).map_err(|error| crate::json::os_error(&error, source))?;
+    let mut items: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+    items.sort();
+    for item in items {
+        let dest = target.join(item.file_name().unwrap_or_default());
+        if is_link(&item) {
+            #[cfg(unix)]
+            {
+                let link_target = std::fs::read_link(&item)
+                    .map_err(|error| crate::json::os_error(&error, &item))?;
+                std::os::unix::fs::symlink(&link_target, &dest)
+                    .map_err(|error| crate::json::os_error(&error, &dest))?;
+            }
+        } else if item.is_dir() {
+            copy_tree(&item, &dest)?;
+        } else if item.is_file() {
+            std::fs::copy(&item, &dest).map_err(|error| crate::json::os_error(&error, &dest))?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_tree(path: &Path) -> Result<(), String> {
+    if is_link(path) || path.is_file() {
+        return std::fs::remove_file(path).map_err(|error| crate::json::os_error(&error, path));
+    }
+    if !path.is_dir() {
+        return Ok(());
+    }
+    let entries = std::fs::read_dir(path).map_err(|error| crate::json::os_error(&error, path))?;
+    for entry in entries.flatten() {
+        remove_tree(&entry.path())?;
+    }
+    std::fs::remove_dir(path).map_err(|error| crate::json::os_error(&error, path))
+}
+
+/// One team's snapshot relocation, described before anything moves.
+#[derive(Clone, Debug)]
+pub struct SnapshotTeamMigration {
+    /// Team slug.
+    pub team_slug: String,
+    /// Source directory.
+    pub source: PathBuf,
+    /// Target directory.
+    pub target: PathBuf,
+    /// File count.
+    pub files: i64,
+    /// Byte count.
+    pub bytes: i64,
+    /// Same device.
+    pub same_device: bool,
+    /// Refusal, if any.
+    pub refusal: Option<String>,
+}
+
+/// What migrate-snapshots would do, and what it refuses to do.
+#[derive(Clone, Debug)]
+pub struct SnapshotMigrationPlan {
+    /// Archive.
+    pub archive: PathBuf,
+    /// Store root.
+    pub store_root: PathBuf,
+    /// Teams.
+    pub teams: Vec<SnapshotTeamMigration>,
+    /// Already external.
+    pub already_external: bool,
+}
+
+impl SnapshotMigrationPlan {
+    fn movable(&self) -> Vec<&SnapshotTeamMigration> {
+        self.teams
+            .iter()
+            .filter(|team| team.refusal.is_none())
+            .collect()
+    }
+
+    fn total_files(&self) -> i64 {
+        self.movable().iter().map(|team| team.files).sum()
+    }
+
+    fn total_bytes(&self) -> i64 {
+        self.movable().iter().map(|team| team.bytes).sum()
+    }
+
+    /// JSON form of the plan.
+    pub fn to_json_obj(&self) -> Value {
+        let mut out = Map::new();
+        out.insert(
+            "archive".into(),
+            Value::String(self.archive.display().to_string()),
+        );
+        out.insert(
+            "store_root".into(),
+            Value::String(self.store_root.display().to_string()),
+        );
+        out.insert(
+            "already_external".into(),
+            Value::Bool(self.already_external),
+        );
+        out.insert(
+            "teams".into(),
+            Value::Array(
+                self.teams
+                    .iter()
+                    .map(|team| {
+                        let mut item = Map::new();
+                        item.insert("team".into(), Value::String(team.team_slug.clone()));
+                        item.insert(
+                            "source".into(),
+                            Value::String(team.source.display().to_string()),
+                        );
+                        item.insert(
+                            "target".into(),
+                            Value::String(team.target.display().to_string()),
+                        );
+                        item.insert("files".into(), team.files.into());
+                        item.insert("bytes".into(), team.bytes.into());
+                        item.insert("same_device".into(), Value::Bool(team.same_device));
+                        item.insert(
+                            "refusal".into(),
+                            team.refusal.clone().map_or(Value::Null, Value::String),
+                        );
+                        Value::Object(item)
+                    })
+                    .collect(),
+            ),
+        );
+        Value::Object(out)
+    }
+}
+
+/// What migrate-snapshots --move actually did.
+#[derive(Clone, Debug)]
+pub struct SnapshotMigrationResult {
+    /// The plan.
+    pub plan: SnapshotMigrationPlan,
+    /// Teams relocated by rename.
+    pub moved: Vec<String>,
+    /// Teams relocated by copy-verify-delete.
+    pub copied: Vec<String>,
+    /// Pointer changed.
+    pub pointer_changed: bool,
+}
+
+impl SnapshotMigrationResult {
+    /// JSON form of the result.
+    pub fn to_json_obj(&self) -> Value {
+        let mut out = Map::new();
+        out.insert("plan".into(), self.plan.to_json_obj());
+        out.insert(
+            "moved".into(),
+            Value::Array(
+                self.moved
+                    .iter()
+                    .map(|item| Value::String(item.clone()))
+                    .collect(),
+            ),
+        );
+        out.insert(
+            "copied".into(),
+            Value::Array(
+                self.copied
+                    .iter()
+                    .map(|item| Value::String(item.clone()))
+                    .collect(),
+            ),
+        );
+        out.insert("pointer_changed".into(), Value::Bool(self.pointer_changed));
+        Value::Object(out)
+    }
+}
+
+/// Describe the snapshot move without performing any part of it.
+pub fn plan_snapshot_migration(
+    archive: &Path,
+    requested: Option<&Path>,
+) -> Result<SnapshotMigrationPlan, String> {
+    let recorded = read_pointer(archive)?;
+    let store_root = if let Some(requested) = requested {
+        check_store_root(archive, requested)?
+    } else if let Some(pointer) = &recorded {
+        if pointer.layout == "external" {
+            let root = pointer.root.clone().unwrap_or_default();
+            check_store_root(archive, &resolve_path(archive).join(root))?
+        } else {
+            check_store_root(archive, &default_store_root(archive))?
+        }
+    } else {
+        check_store_root(archive, &default_store_root(archive))?
+    };
+    let foreign = if store_root.is_dir() {
+        foreign_marker(archive, &store_root)?
+    } else {
+        None
+    };
+    let expected_archive = relpath(&resolve_path(archive), &store_root);
+    let store_refusal = foreign.as_ref().map(|other| {
+        format!(
+            "{} says this store belongs to {other}, not to {expected_archive}, and that archive is still there",
+            store_root.join(STORE_MARKER_FILE).display()
+        )
+    });
+    let store_device = device_of(&store_root)?;
+    let mut teams = Vec::new();
+    for source in legacy_team_roots(archive)? {
+        let team_slug = source
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .map(|item| item.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let target = store_root.join(&team_slug);
+        let (files, total) = tree_size(&source);
+        let mut refusal = store_refusal.clone();
+        if refusal.is_none() && populated(&target) {
+            refusal = Some(format!(
+                "{target} already holds snapshots; merging two trees is not something this command will guess at",
+                target = target.display()
+            ));
+        }
+        if refusal.is_none() {
+            if let Err(error) = crate::build_store::validate_team_slug(&team_slug) {
+                refusal = Some(format!("{}: {error}", source.display()));
+            }
+        }
+        let source_device = std::fs::metadata(&source)
+            .map(|meta| {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt as _;
+                    meta.dev()
+                }
+                #[cfg(not(unix))]
+                {
+                    0
+                }
+            })
+            .unwrap_or(0);
+        teams.push(SnapshotTeamMigration {
+            team_slug,
+            same_device: source_device == store_device,
+            source,
+            target,
+            files,
+            bytes: total,
+            refusal,
+        });
+    }
+    Ok(SnapshotMigrationPlan {
+        archive: archive.to_path_buf(),
+        store_root,
+        teams,
+        already_external: recorded
+            .as_ref()
+            .is_some_and(|pointer| pointer.layout == "external"),
+    })
+}
+
+fn copy_across_devices(source: &Path, target: &Path) -> Result<(), String> {
+    let staging = target
+        .parent()
+        .unwrap_or(target)
+        .join(COPY_STAGING_DIRECTORY)
+        .join(target.file_name().unwrap_or_default());
+    if staging.exists() {
+        remove_tree(&staging)?;
+    }
+    if let Some(parent) = staging.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| crate::json::os_error(&error, parent))?;
+    }
+    copy_tree(source, &staging)?;
+    let before = tree_size(source);
+    let after = tree_size(&staging);
+    if before != after {
+        let _ = remove_tree(&staging);
+        return Err(format!(
+            "copy of {} to {} does not match: ({}, {}) files/bytes became ({}, {}); the original has been left alone",
+            source.display(),
+            target.display(),
+            before.0,
+            before.1,
+            after.0,
+            after.1,
+        ));
+    }
+    std::fs::rename(&staging, target).map_err(|error| crate::json::os_error(&error, &staging))?;
+    fsync_directory(target.parent().unwrap_or(target))?;
+    remove_tree(source)
+}
+
+/// Relocate an existing archive's snapshots out of the published tree.
+pub fn migrate_snapshots(
+    archive: &Path,
+    requested: Option<&Path>,
+    moving: bool,
+    copy_across_devices: bool,
+) -> Result<SnapshotMigrationResult, String> {
+    let plan = plan_snapshot_migration(archive, requested)?;
+    if !moving {
+        return Ok(SnapshotMigrationResult {
+            plan,
+            moved: Vec::new(),
+            copied: Vec::new(),
+            pointer_changed: false,
+        });
+    }
+    let blocked: Vec<&SnapshotTeamMigration> = plan
+        .teams
+        .iter()
+        .filter(|team| team.refusal.is_some())
+        .collect();
+    if !blocked.is_empty() {
+        let list = blocked
+            .iter()
+            .map(|team| {
+                format!(
+                    "{}: {}",
+                    team.team_slug,
+                    team.refusal.as_deref().unwrap_or_default()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n  ");
+        return Err(format!("refusing to migrate; nothing was moved:\n  {list}"));
+    }
+    let cross: Vec<&SnapshotTeamMigration> = plan
+        .movable()
+        .into_iter()
+        .filter(|team| !team.same_device)
+        .collect();
+    if !cross.is_empty() && !copy_across_devices {
+        let list = cross
+            .iter()
+            .map(|team| team.team_slug.clone())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "{} is on a different filesystem from {list}, so this cannot be a rename. Pass --copy to accept a copy-verify-delete instead: unlike a rename it is interruptible, and while it runs the bytes exist twice.",
+            plan.store_root.display()
+        ));
+    }
+    ensure_store_root(archive, &plan.store_root)?;
+    let pointer_changed = write_pointer(
+        archive,
+        &SnapshotLocation {
+            archive: archive.to_path_buf(),
+            team_slug: String::new(),
+            root: plan.store_root.clone(),
+            store_root: Some(plan.store_root.clone()),
+            layout: "external".into(),
+            origin: "requested",
+        },
+    )?;
+    let mut moved = Vec::new();
+    let mut copied = Vec::new();
+    for team in plan.movable() {
+        if team.same_device {
+            std::fs::rename(&team.source, &team.target)
+                .map_err(|error| crate::json::os_error(&error, &team.source))?;
+            moved.push(team.team_slug.clone());
+        } else {
+            copy_across_devices_impl(&team.source, &team.target)?;
+            copied.push(team.team_slug.clone());
+        }
+        if let Some(parent) = team.source.parent() {
+            fsync_directory(parent)?;
+        }
+        fsync_directory(&plan.store_root)?;
+    }
+    Ok(SnapshotMigrationResult {
+        plan,
+        moved,
+        copied,
+        pointer_changed,
+    })
+}
+
+fn copy_across_devices_impl(source: &Path, target: &Path) -> Result<(), String> {
+    copy_across_devices(source, target)
+}
+
+/// Render the plan or the outcome as operator text.
+pub fn format_snapshot_migration_report(result: &SnapshotMigrationResult, moved: bool) -> String {
+    let plan = &result.plan;
+    let mut lines: Vec<String> = vec![
+        format!("archive:    {}", plan.archive.display()),
+        format!("store root: {}", plan.store_root.display()),
+        String::new(),
+    ];
+    if plan.teams.is_empty() {
+        lines.push(format!(
+            "No team keeps snapshots inside the archive.{}",
+            if plan.already_external {
+                String::new()
+            } else {
+                " Recording the external layout is all this would do.".to_string()
+            }
+        ));
+    }
+    for team in &plan.teams {
+        let mut verb = "would move".to_string();
+        if moved {
+            verb = if result.moved.contains(&team.team_slug) {
+                "moved".into()
+            } else {
+                "copied".into()
+            };
+        }
+        if team.refusal.is_some() {
+            verb = "REFUSED".into();
+        }
+        let mut line = format!(
+            "{}: {verb} {} file(s), {} byte(s)\n    from {}\n      to {}",
+            team.team_slug,
+            team.files,
+            team.bytes,
+            team.source.display(),
+            team.target.display()
+        );
+        if !team.same_device {
+            line.push_str("\n    (different filesystem: copy, not rename)");
+        }
+        if let Some(refusal) = &team.refusal {
+            line.push_str(&format!("\n    refusal: {refusal}"));
+        }
+        lines.push(line);
+    }
+    lines.push(String::new());
+    if moved {
+        lines.push(format!(
+            "moved {} team(s), copied {}; {} now records the external layout",
+            result.moved.len(),
+            result.copied.len(),
+            plan.archive.join(POINTER_FILE).display()
+        ));
+    } else {
+        lines.push(format!(
+            "dry run: {} file(s), {} byte(s) would leave the published tree. Re-run with --move to do it.",
+            plan.total_files(),
+            plan.total_bytes()
+        ));
+    }
+    format!("{}\n", lines.join("\n"))
+}
