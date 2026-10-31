@@ -51,3 +51,10 @@ updated_at: 2026-10-30T06:44:42.826876431+00:00
 - Adversarial review (about 180 comparisons) found and fixed: materialization-vs-laziness exit flips (corrupt line, digest tamper, unsorted tail past a `--limit`; early-member defects on multi-member tails), i64 ceilings on timestamps and ordinals, missing-`--output` precedence, and the oracle's three-pass field validation order in `list_messages`. JSON syntax error wording remains the known cross-slice gap.
 - Gate 118: `validate: PARTIAL` with every selected step passed (209 passed, 0 failed); pushed as dd314ffa.
 - Next: `query search` (slice 4c, including `message:`/`tool:` show references), then `serve` reads, writers, edition switch.
+
+## Slice 4c landed: Rust `query search` + `message:`/`tool:` show (main 487a6e97)
+
+- Ports search_v2 (smart/phrase/literal matching and ranking, trigram bloom prefilter, prompt/response linkage context, phase references), the compatibility `--scope` search, `format_search_results`, and `query show` for transcript search references. Schema-2 search corpora refuse by name; archives without a corpus keep the oracle's rebuild refusal. Differential `py/tests/test_wrkviz_query_search_rust.py` (3 cases); the slice-3 show refusal test and the slice-2 unported-action test now assert parity.
+- Reviewer fixes: CPython `casefold()` semantics including its shifted excerpt windows, negative-number needles, Python `int()` grammar with unbounded offset spelling, and separator handling in search errors.
+- Gate 120: 206 passed; `python.wrkviz.shard-1` (the obsolete refusal test, fixed by fd1c430c), scroll-stability, and wrkslots shard-2 all pass solo on the final commit. Pushed as 487a6e97 + fd1c430c.
+- Next: `serve` reads, then writers (ingest/summarize/build), then the edition switch.
