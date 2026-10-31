@@ -368,6 +368,7 @@ pub fn run(args: &[String]) -> u8 {
         "ingest-claude" => run_ingest_session_claude(&args[1..]),
         "ingest-muse" => run_ingest_session_muse(&args[1..]),
         "ingest-orc" => run_ingest_session_orc(&args[1..]),
+        "ingest-project" => run_ingest_project(&args[1..]),
         "ingest" => run_ingest(&args[1..]),
         other => {
             eprintln!(
@@ -1647,6 +1648,363 @@ const INGEST_ORC_OPTIONS: [&str; 14] = [
     "--project",
     "--source-host",
 ];
+
+/// The Python edition's ingest-project help, verbatim.
+pub const INGEST_PROJECT_HELP: &str = r#"usage: wrkviz ingest-project [-h] --config CONFIG [--team TEAM]
+                             [--accept-orc-prefix-rewrite TEAM:SESSION]
+
+ingest teams from a strict JSON manifest, then refresh the global transcript
+JSONL; does not call a model or build the website
+
+options:
+  -h, --help            show this help message and exit
+  --config CONFIG       schema-v1 project ingest JSON file
+  --team TEAM           registered team slug to ingest; repeat as needed
+                        (default: every team); transcript extraction still
+                        covers every normalized archive team
+  --accept-orc-prefix-rewrite TEAM:SESSION
+                        operator override: accept an in-place append-prefix
+                        rewrite for this one session of this one Orc team, re-
+                        baselining its digest and marking the source degraded;
+                        repeat per session; the slug must be an Orc team this
+                        run ingests and the session id is the one that team's
+                        refusal named
+"#;
+
+const INGEST_PROJECT_USAGE: &str = "usage: wrkviz ingest-project [-h] --config CONFIG [--team TEAM]\n                             [--accept-orc-prefix-rewrite TEAM:SESSION]";
+
+const INGEST_PROJECT_OPTIONS: [&str; 3] = ["--config", "--team", "--accept-orc-prefix-rewrite"];
+
+fn run_ingest_project(args: &[String]) -> u8 {
+    let mut config: Option<String> = None;
+    let mut teams: Vec<String> = Vec::new();
+    let mut accepts: Vec<String> = Vec::new();
+    let mut extras: Vec<String> = Vec::new();
+    let mut sep_extras: Vec<String> = Vec::new();
+    let mut seen: Vec<&'static str> = Vec::new();
+    let mut separated = false;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if separated {
+            sep_extras.push(arg.clone());
+            index += 1;
+            continue;
+        }
+        if arg == "--" {
+            separated = true;
+            index += 1;
+            continue;
+        }
+        // argparse resolution: an exact long name wins, else
+        // the prefix must name exactly one candidate, with
+        // `--help` itself among the candidates.
+        let head = arg.split_once('=').map_or(arg.as_str(), |(head, _)| head);
+        if arg == "-h" || (arg.len() > 2 && arg.starts_with("-h") && !arg.starts_with("--")) {
+            // argparse fires the `-h` action at the head of a
+            // single-dash cluster (`-help`) too.
+            print!("{INGEST_PROJECT_HELP}");
+            return 0;
+        }
+        if head.len() > 2
+            && head.starts_with("--")
+            && head != "--help"
+            && !INGEST_PROJECT_OPTIONS.contains(&head)
+        {
+            let mut candidates: Vec<&str> = vec!["--help"];
+            candidates.extend(INGEST_PROJECT_OPTIONS.iter().copied());
+            let matches: Vec<&str> = candidates
+                .into_iter()
+                .filter(|name| name.starts_with(head))
+                .collect();
+            if matches.len() > 1 {
+                return argparse_error(
+                    INGEST_PROJECT_USAGE,
+                    "wrkviz ingest-project",
+                    &format!(
+                        "ambiguous option: {head} could match {}",
+                        matches.join(", ")
+                    ),
+                );
+            }
+            if matches == ["--help"] {
+                if let Some((_, value)) = arg.split_once('=') {
+                    return argparse_error(
+                        INGEST_PROJECT_USAGE,
+                        "wrkviz ingest-project",
+                        &format!("argument -h/--help: ignored explicit argument '{value}'"),
+                    );
+                }
+                print!("{INGEST_PROJECT_HELP}");
+                return 0;
+            }
+        }
+        if head == "--help" {
+            if let Some((_, value)) = arg.split_once('=') {
+                return argparse_error(
+                    INGEST_PROJECT_USAGE,
+                    "wrkviz ingest-project",
+                    &format!("argument -h/--help: ignored explicit argument '{value}'"),
+                );
+            }
+            print!("{INGEST_PROJECT_HELP}");
+            return 0;
+        }
+        let mut handled = true;
+        let canonical: Option<&'static str> = if INGEST_PROJECT_OPTIONS.contains(&head) {
+            INGEST_PROJECT_OPTIONS
+                .iter()
+                .copied()
+                .find(|name| *name == head)
+        } else if head.len() > 2 && head.starts_with("--") {
+            let matches: Vec<&'static str> = INGEST_PROJECT_OPTIONS
+                .iter()
+                .copied()
+                .filter(|name| name.starts_with(head))
+                .collect();
+            matches.first().copied()
+        } else {
+            None
+        };
+        let ordered: Vec<&'static str> = canonical
+            .into_iter()
+            .chain(
+                INGEST_PROJECT_OPTIONS
+                    .iter()
+                    .copied()
+                    .filter(|name| Some(*name) != canonical),
+            )
+            .collect();
+        for name in ordered {
+            match named_value(args, &mut index, name) {
+                Ok(Some(value)) => {
+                    seen.push(name);
+                    // argparse validates the mutually exclusive
+                    // bounds once the second value is in hand.
+                    let conflict: Option<&str> = None;
+                    if let Some(other) = conflict {
+                        return argparse_error(
+                            INGEST_PROJECT_USAGE,
+                            "wrkviz ingest-project",
+                            &format!("argument {name}: not allowed with argument {other}"),
+                        );
+                    }
+                    match name {
+                        "--config" => config = Some(value),
+                        "--team" => teams.push(value),
+                        "--accept-orc-prefix-rewrite" => accepts.push(value),
+                        _ => {}
+                    }
+                    break;
+                }
+                Ok(None) => {}
+                Err((_, message)) => {
+                    return argparse_error(INGEST_PROJECT_USAGE, "wrkviz ingest-project", &message)
+                }
+            }
+        }
+        if !is_option_token(arg, &INGEST_PROJECT_OPTIONS) {
+            handled = false;
+        }
+        if !handled {
+            extras.push(arg.clone());
+        }
+        index += 1;
+    }
+    let mut required: Vec<&str> = Vec::new();
+    if config.is_none() {
+        required.push("--config");
+    }
+    if !required.is_empty() {
+        return argparse_error(
+            INGEST_PROJECT_USAGE,
+            "wrkviz ingest-project",
+            &format!(
+                "the following arguments are required: {}",
+                required.join(", ")
+            ),
+        );
+    }
+    if !extras.is_empty() || !sep_extras.is_empty() {
+        let mut reported = extras.clone();
+        if !sep_extras.is_empty() {
+            reported.push("--".to_string());
+            reported.extend(sep_extras.iter().cloned());
+        }
+        eprintln!(
+            "usage: wrkviz [-h] [--version] [--userguide]\n              {{quickstart,ingest-project,ingest,ingest-claude,ingest-claude-history,ingest-muse,ingest-orc,summarize,build,extract-transcripts,export,refresh,github-metadata,refresh-claude,refresh-orc,serve,inspect,gc,migrate-build-state,migrate-snapshots,audit-glossary,audit-losslessness,query,responsiveness,discover-agents}}\n              ...\nwrkviz: error: unrecognized arguments: {}",
+            reported.join(" ")
+        );
+        return 2;
+    }
+    let config_raw = config.unwrap();
+    let started = crate::pipeline::utc_now();
+    let mut command: Vec<String> = vec!["wrkviz".to_string(), "ingest-project".to_string()];
+    command.extend(args.iter().cloned());
+    let loaded: Result<(crate::project_config::ProjectIngestConfig, Vec<String>), String> =
+        (|| {
+            let config = crate::project_config::load_project_ingest_config(&cli_path(&config_raw))?;
+            let selected: Vec<String> = config
+                .select_teams(&teams)?
+                .iter()
+                .map(|team| team.slug.clone())
+                .collect();
+            Ok((config, selected))
+        })();
+    let (config, selected_slugs) = match loaded {
+        Ok(pair) => pair,
+        Err(error) => {
+            eprintln!("wrkviz: {error}");
+            return 2;
+        }
+    };
+    let archive = config.output.clone();
+    let minimal_receipt = |config: &crate::project_config::ProjectIngestConfig,
+                           selected: &[String],
+                           error: &str|
+     -> Option<PathBuf> {
+        let mut inner = serde_json::Map::new();
+        inner.insert("schema_version".into(), 1.into());
+        inner.insert(
+            "config_sha256".into(),
+            serde_json::Value::String(config.config_sha256.clone()),
+        );
+        inner.insert("model_calls".into(), 0.into());
+        inner.insert("model_tokens".into(), 0.into());
+        inner.insert(
+            "website_build_performed".into(),
+            serde_json::Value::Bool(false),
+        );
+        let mut mechanical = serde_json::Map::new();
+        mechanical.insert("project_ingest".into(), serde_json::Value::Object(inner));
+        crate::pipeline::record_run(
+            &config.output,
+            &crate::pipeline::RunReceipt {
+                command: &command,
+                started_at: &started,
+                status: "failed",
+                team_slug: &selected[0],
+                error: Some(error),
+                team_slugs: selected,
+                mechanical: Some(serde_json::Value::Object(mechanical)),
+                ingest: None,
+            },
+        )
+        .ok()
+    };
+    let report = match crate::project_config::ingest_project(&config, &selected_slugs, &accepts) {
+        Ok(report) => report,
+        Err(error) => {
+            if let Some(run_path) = minimal_receipt(&config, &selected_slugs, &error) {
+                eprintln!("run metadata: {}", run_path.display());
+            }
+            eprintln!("wrkviz: {error}");
+            return 2;
+        }
+    };
+    let failure_summary = report.failure_summary();
+    let mut mechanical = serde_json::Map::new();
+    mechanical.insert("project_ingest".into(), report.to_json());
+    let run_path = match crate::pipeline::record_run(
+        &archive,
+        &crate::pipeline::RunReceipt {
+            command: &command,
+            started_at: &started,
+            status: if report.failed() {
+                "failed"
+            } else {
+                "completed"
+            },
+            team_slug: &selected_slugs[0],
+            error: failure_summary.as_deref(),
+            team_slugs: &selected_slugs,
+            mechanical: Some(serde_json::Value::Object(mechanical)),
+            ingest: None,
+        },
+    ) {
+        Ok(path) => path,
+        Err(error) => {
+            if let Some(run_path) = minimal_receipt(&config, &selected_slugs, &error) {
+                eprintln!("run metadata: {}", run_path.display());
+            }
+            eprintln!("wrkviz: {error}");
+            return 2;
+        }
+    };
+    for team in &report.teams {
+        print!("{} ({}): ", team.team_slug, team.provider);
+        std::io::Write::flush(&mut std::io::stdout()).ok();
+        print_ingest_receipt(&team.ingest, &archive);
+        for override_ in &team.ingest.orc_prefix_overrides {
+            for line in override_.describe() {
+                eprintln!("wrkviz: {}: {line}", team.ingest.team_slug);
+            }
+        }
+    }
+    for failure in &report.failures {
+        eprintln!("wrkviz: team {}", failure.summary());
+    }
+    println!(
+        "teams: {} succeeded, {} failed",
+        report.teams.len(),
+        report.failures.len()
+    );
+    match &report.transcripts {
+        None => {
+            eprintln!(
+                "wrkviz: transcript extraction failed: {}",
+                report.transcript_error.as_deref().unwrap_or_default()
+            );
+            println!("transcripts: not extracted");
+        }
+        Some(transcripts) => {
+            for skip in &transcripts.skipped_teams {
+                eprintln!(
+                    "wrkviz: transcripts: team {} -- carried forward unchanged from its last good extraction; nothing since is projected",
+                    skip.summary()
+                );
+            }
+            for dropped in &transcripts.dropped_authorship_rules {
+                eprintln!(
+                    "wrkviz: transcripts: prompt authorship rule {} -- not applied",
+                    dropped.summary()
+                );
+            }
+            let skipped_note = if transcripts.skipped_teams.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " ({} further team(s) carried forward unread)",
+                    transcripts.skipped_teams.len()
+                )
+            };
+            println!(
+                "transcripts: {} prompts, {} responses, {} system inputs across {} normalized archive teams{}; {} files changed",
+                transcripts.prompts,
+                transcripts.responses,
+                transcripts.system_inputs,
+                transcripts.teams,
+                skipped_note,
+                transcripts.files_changed
+            );
+            println!(
+                "JSONL: {}",
+                archive
+                    .join("extracted")
+                    .join("transcripts")
+                    .join("prompts.jsonl.gz")
+                    .display()
+            );
+        }
+    }
+    println!("website: not built (run `wrkviz build` separately)");
+    println!("run metadata: {}", run_path.display());
+    if report.failed() {
+        eprintln!("wrkviz: {}", failure_summary.unwrap_or_default());
+        return 2;
+    }
+    0
+}
 
 fn run_ingest_session_orc(args: &[String]) -> u8 {
     let mut output: Option<String> = None;
