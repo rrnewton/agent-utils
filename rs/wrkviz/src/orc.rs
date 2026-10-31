@@ -2775,7 +2775,6 @@ pub fn session_has_activity_at_or_after(
                 return Ok(true);
             }
         }
-        }
     }
     if auxiliary_observation(path, meta)?
         .stable_spawns
@@ -2804,8 +2803,10 @@ pub fn session_has_activity_at_or_after(
         drop(connection);
         if let Some(value) = rows.first().and_then(|row| row.first()) {
             if !matches!(value, SqlValue::Null)
-                && iso_ms(value, &format!("{}: latest task note created_at", task_path.display()))?
-                    >= start_at_ms
+                && iso_ms(
+                    value,
+                    &format!("{}: latest task note created_at", task_path.display()),
+                )? >= start_at_ms
             {
                 return Ok(true);
             }
