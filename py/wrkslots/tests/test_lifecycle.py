@@ -33074,6 +33074,52 @@ def test_audit_default_cache_setup_failure_preserves_lifecycle_rows(
     assert registry.read_bytes() == before
 
 
+def test_audit_live_lane_with_exhausted_cache_census_is_not_unknown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Regression (2026-10-31): on the real registry every large live lane
+    # exhausted the bounded cache census, and the audit classified all of
+    # them UNKNOWN ("could not determine reclaim state for 16 worktree
+    # slot(s)") even though liveness proved each one in use. A live lane
+    # with an unsized cache is BLOCKED, not unknown: the reclaim answer
+    # (do not reclaim) is already determined. Only a cache failure with
+    # nothing proving live use stays unknown (covered above).
+    project, repository, _remote = make_project(tmp_path, cache_globs=("target",))
+    made = create(project, slot="livelane", agent="agent-live", branch="test/live")
+    assert made.returncode == 0, made.stderr
+    tree = checkout(project, "livelane")
+    commit_task(repository, tree, "test/live")
+    (tree / "target").mkdir()
+    (tree / "target" / "artifact").write_bytes(b"cache")
+    set_liveness(project, "alive")
+    expire_heartbeat(project)
+    monkeypatch.setattr(
+        wrkslots, "_capture_process_path_census",
+        lambda _paths: wrkslots._ProcessPathCensus((), ()),
+    )
+
+    def exhausted(*_args: object, **_kwargs: object) -> None:
+        raise wrkslots._CachePlanExhausted(
+            "cache planning exhausted this subject's share of 5040 "
+            "directory listings; no cache total can be published within "
+            "this allowance"
+        )
+
+    monkeypatch.setattr(wrkslots, "_expand_cache_globs", exhausted)
+    code = wrkslots.main(["--project-root", str(project), "audit", "--format", "json"])
+    captured = capsys.readouterr()
+    assert code == 0, captured.err
+    payload = json.loads(captured.out)
+    row = payload["slots"][0]
+    assert row["verdict"] == "BLOCKED"
+    assert row["liveness_state"] == "alive"
+    assert row["cache_error"] is not None
+    assert payload["unknown_slots"] == []
+    assert payload["state"] == "ok"
+
+
 def test_audit_cache_ancestor_swap_stays_blocked(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
