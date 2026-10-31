@@ -27,6 +27,9 @@ pub mod json;
 /// The `query list` subcommand over schema-3 and schema-1
 /// timelines.
 pub mod query;
+/// The `serve` subcommand: a loopback static server for a
+/// built archive.
+pub mod serve;
 /// The snapshot pointer (`snapshot-root.json`) and the legacy
 /// in-archive snapshot layout.
 pub mod snapshot_store;

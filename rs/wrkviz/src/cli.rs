@@ -361,6 +361,7 @@ pub fn run(args: &[String]) -> u8 {
         }
         "inspect" => run_inspect(&args[1..]),
         "query" => run_query(&args[1..]),
+        "serve" => run_serve(&args[1..]),
         other => {
             eprintln!(
                 "wrkviz: the Rust edition has not ported '{other}' yet; the Python edition remains the oracle for it"
@@ -368,6 +369,112 @@ pub fn run(args: &[String]) -> u8 {
             2
         }
     }
+}
+
+/// The Python edition's serve help, verbatim.
+pub const SERVE_HELP: &str = r#"usage: wrkviz serve [-h] --output OUTPUT [--port PORT] [--open]
+
+serve a built archive on localhost
+
+options:
+  -h, --help       show this help message and exit
+  --output OUTPUT  built archive directory
+  --port PORT      0 chooses an available port
+  --open
+"#;
+
+const SERVE_USAGE: &str = "usage: wrkviz serve [-h] --output OUTPUT [--port PORT] [--open]";
+
+fn run_serve(args: &[String]) -> u8 {
+    let mut output: Option<String> = None;
+    let mut port: i64 = 8765;
+    let mut open_browser = false;
+    let mut extras: Vec<String> = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        let help_plain = arg == "-h"
+            || (arg.len() > 2
+                && arg.starts_with("--")
+                && !arg.contains('=')
+                && "--help".starts_with(arg.as_str()));
+        if help_plain {
+            print!("{SERVE_HELP}");
+            return 0;
+        }
+        if let Some((head, value)) = arg.split_once('=') {
+            if head.len() > 2 && head.starts_with("--") && "--help".starts_with(head) {
+                return argparse_error(
+                    SERVE_USAGE,
+                    "wrkviz serve",
+                    &format!("argument -h/--help: ignored explicit argument '{value}'"),
+                );
+            }
+        }
+        {
+            let head = arg.split_once('=').map_or(arg.as_str(), |(head, _)| head);
+            if head.len() > 1 && head.starts_with("--") && "--open".starts_with(head) {
+                if let Some((_, value)) = arg.split_once('=') {
+                    return argparse_error(
+                        SERVE_USAGE,
+                        "wrkviz serve",
+                        &format!("argument --open: ignored explicit argument '{value}'"),
+                    );
+                }
+                open_browser = true;
+                index += 1;
+                continue;
+            }
+        }
+        let mut handled = true;
+        for (name, is_port) in [("--output", false), ("--port", true)] {
+            match named_value(args, &mut index, name) {
+                Ok(Some(value)) => {
+                    if is_port {
+                        let Some((parsed, _)) = parse_py_int(&value) else {
+                            return argparse_error(
+                                SERVE_USAGE,
+                                "wrkviz serve",
+                                &format!("argument --port: invalid int value: '{value}'"),
+                            );
+                        };
+                        port = parsed;
+                    } else {
+                        output = Some(value);
+                    }
+                    break;
+                }
+                Ok(None) => {}
+                Err((_, message)) => return argparse_error(SERVE_USAGE, "wrkviz serve", &message),
+            }
+        }
+        if !is_option_token(arg, &["--output", "--port", "--open"]) {
+            handled = false;
+        }
+        if !handled {
+            extras.push(arg.clone());
+        }
+        index += 1;
+    }
+    let Some(output) = output else {
+        return argparse_error(
+            SERVE_USAGE,
+            "wrkviz serve",
+            "the following arguments are required: --output",
+        );
+    };
+    if !extras.is_empty() {
+        eprintln!(
+            "usage: wrkviz [-h] [--version] [--userguide]\n              {{quickstart,ingest-project,ingest,ingest-claude,ingest-claude-history,ingest-muse,ingest-orc,summarize,build,extract-transcripts,export,refresh,github-metadata,refresh-claude,refresh-orc,serve,inspect,gc,migrate-build-state,migrate-snapshots,audit-glossary,audit-losslessness,query,responsiveness,discover-agents}}\n              ...\nwrkviz: error: unrecognized arguments: {}",
+            extras.join(" ")
+        );
+        return 2;
+    }
+    if !(0..=65535).contains(&port) {
+        eprintln!("wrkviz: port must be between 0 and 65535");
+        return 2;
+    }
+    crate::serve::serve(&cli_path(&output), port as u16, open_browser)
 }
 
 fn argparse_error(usage: &str, prog: &str, message: &str) -> u8 {
