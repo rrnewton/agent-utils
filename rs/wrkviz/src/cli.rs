@@ -362,6 +362,7 @@ pub fn run(args: &[String]) -> u8 {
         "inspect" => run_inspect(&args[1..]),
         "query" => run_query(&args[1..]),
         "serve" => run_serve(&args[1..]),
+        "quickstart" => run_quickstart(&args[1..]),
         other => {
             eprintln!(
                 "wrkviz: the Rust edition has not ported '{other}' yet; the Python edition remains the oracle for it"
@@ -369,6 +370,55 @@ pub fn run(args: &[String]) -> u8 {
             2
         }
     }
+}
+
+/// The Python edition's quickstart help, verbatim.
+pub const QUICKSTART_HELP: &str = r#"usage: wrkviz quickstart [-h]
+
+print a short end-to-end example
+
+options:
+  -h, --help  show this help message and exit
+"#;
+
+const QUICKSTART_USAGE: &str = "usage: wrkviz quickstart [-h]";
+
+fn run_quickstart(args: &[String]) -> u8 {
+    let mut extras: Vec<String> = Vec::new();
+    for arg in args {
+        let help_plain = arg == "-h"
+            || (arg.len() > 2
+                && arg.starts_with("--")
+                && !arg.contains('=')
+                && "--help".starts_with(arg.as_str()));
+        if help_plain {
+            print!("{QUICKSTART_HELP}");
+            return 0;
+        }
+        if let Some((head, value)) = arg.split_once('=') {
+            if head.len() > 2 && head.starts_with("--") && "--help".starts_with(head) {
+                return argparse_error(
+                    QUICKSTART_USAGE,
+                    "wrkviz quickstart",
+                    &format!("argument -h/--help: ignored explicit argument '{value}'"),
+                );
+            }
+        }
+        extras.push(arg.clone());
+    }
+    if !extras.is_empty() {
+        eprintln!(
+            "usage: wrkviz [-h] [--version] [--userguide]\n              {{quickstart,ingest-project,ingest,ingest-claude,ingest-claude-history,ingest-muse,ingest-orc,summarize,build,extract-transcripts,export,refresh,github-metadata,refresh-claude,refresh-orc,serve,inspect,gc,migrate-build-state,migrate-snapshots,audit-glossary,audit-losslessness,query,responsiveness,discover-agents}}\n              ...\nwrkviz: error: unrecognized arguments: {}",
+            extras.join(" ")
+        );
+        return 2;
+    }
+    let model = std::env::var("WRKVIZ_MODEL").unwrap_or_else(|_| "gpt-5.5".to_string());
+    print!(
+        "wrkviz v0.1.0\n\nBuild a version-controllable, multi-resolution website from an agent team's append-only logs.\n\n1. Ingest, summarize only cache misses, and build the site:\n\n   wrkviz refresh \\\n     --root-session SESSION_UUID --team example-team \\\n     --output ./timelines/example-team \\\n     --timezone America/New_York --model {model}\n\n2. Open it locally:\n\n   cd ./timelines/example-team\n   make serve\n   # http://127.0.0.1:8765/\n\n3. Rerun the same refresh later. New log records are normalized; content-addressed summaries are\n   reused; only changed time windows and calendar rollups spend model tokens.\n\n4. See what a summarize run would spend before it spends anything, and cap it:\n\n   wrkviz summarize --team example-team --output ./timelines/example-team      --price input=2,output=10 --plan\n   wrkviz summarize --team example-team --output ./timelines/example-team      --price input=2,output=10 --budget-usd 20\n\n   A run estimated over the budget refuses to start; one that reaches it anyway stops, marks\n   summary_data/summarize_state.json partial, and the next run resumes from the cache.\n\nThe stages are separate on purpose: `ingest`, `summarize`, and `build`. The `build` command never\ncalls a model, so formatting and UI changes can be regenerated for free.\n"
+    );
+    println!();
+    0
 }
 
 /// The Python edition's serve help, verbatim.
