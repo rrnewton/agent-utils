@@ -2630,6 +2630,8 @@ pub struct DiscoveredSource {
     pub owner_candidates: Vec<String>,
     /// See the enclosing record's documentation.
     pub lineage_root_session_id: Option<String>,
+    /// See the enclosing record's documentation.
+    pub source_state: String,
 }
 
 /// The Orc storage schema version a database declares.
@@ -3149,6 +3151,7 @@ pub fn discover_sources(
             kind: "session".to_string(),
             owner_candidates: vec![session_id.clone()],
             lineage_root_session_id: None,
+            source_state: SOURCE_STATE_LIVE.to_string(),
         });
         let session_database = live_source_path(source_root, &meta.source_path)?;
         for (task_relative, required, is_primary) in
@@ -3221,6 +3224,7 @@ pub fn discover_sources(
             kind: "task".to_string(),
             owner_candidates: evidence.into_iter().map(|(held, _)| held).collect(),
             lineage_root_session_id: None,
+            source_state: SOURCE_STATE_LIVE.to_string(),
         });
     }
     result.sort_by(|a, b| a.source_path.cmp(&b.source_path));
@@ -6495,4 +6499,1210 @@ pub fn validate_source_semantic_identity(
         projection_sha256.as_deref(),
     )?;
     Ok(identity)
+}
+
+// ---------------------------------------------------------------- snapshot planning
+
+/// See the enclosing record's documentation.
+pub const PREFIX_DIFF_MAX_ROWS: usize = 20;
+/// See the enclosing record's documentation.
+pub const PREFIX_DIFF_MAX_KEYS: usize = 20;
+/// See the enclosing record's documentation.
+pub const PREFIX_DIFF_MAX_MESSAGE_CHARS: usize = 2000;
+/// See the enclosing record's documentation.
+pub const PREFIX_DIFF_CONTEXT_CHARS: usize = 40;
+/// See the enclosing record's documentation.
+pub const PREFIX_DIFF_EXCERPT_CHARS: usize = 160;
+/// See the enclosing record's documentation.
+pub const PREFIX_DIFF_MAX_JSON_CHARS: usize = 65_536;
+/// See the enclosing record's documentation.
+pub const PREFIX_DIFF_MAX_JSON_PATHS: usize = 12;
+/// See the enclosing record's documentation.
+pub const PREFIX_DIFF_MAX_JSON_DEPTH: usize = 16;
+
+/// Discovery output: what to snapshot, against what prior.
+pub struct DiscoveryPlan {
+    /// See the enclosing record's documentation.
+    pub discovered: Vec<DiscoveredSource>,
+    /// See the enclosing record's documentation.
+    pub previous_by_path: Vec<(String, SourceCopy)>,
+    /// See the enclosing record's documentation.
+    pub selected_session_ids: Vec<String>,
+    /// See the enclosing record's documentation.
+    pub task_ordinals: Vec<(String, i64)>,
+    /// See the enclosing record's documentation.
+    pub session_task_paths: Vec<(String, Vec<String>)>,
+}
+
+impl DiscoveryPlan {
+    /// See the enclosing record's documentation.
+    pub fn previous(&self, path: &str) -> Option<&SourceCopy> {
+        self.previous_by_path
+            .iter()
+            .find(|(held, _)| held == path)
+            .map(|(_, held)| held)
+    }
+
+    /// See the enclosing record's documentation.
+    pub fn ordinal(&self, path: &str) -> Option<i64> {
+        self.task_ordinals
+            .iter()
+            .find(|(held, _)| held == path)
+            .map(|(_, held)| *held)
+    }
+
+    /// See the enclosing record's documentation.
+    pub fn task_paths(&self, session_path: &str) -> Option<&Vec<String>> {
+        self.session_task_paths
+            .iter()
+            .find(|(held, _)| held == session_path)
+            .map(|(_, held)| held)
+    }
+}
+
+fn path_set(paths: &[String]) -> Vec<String> {
+    let mut held = paths.to_vec();
+    held.sort();
+    held.dedup();
+    held
+}
+
+/// Plan one snapshot run against the previous manifest.
+pub fn plan_snapshot_sources(
+    source_root: &Path,
+    root_session_id: &str,
+    snapshot_root: &Path,
+    previous_sources: &[SourceCopy],
+    continuation_specs_in: &[ContinuationSpec],
+) -> Result<DiscoveryPlan, String> {
+    lineage_roots(
+        root_session_id,
+        &continuation_specs_in
+            .iter()
+            .map(|spec| spec.session_id.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    let mut live_discovered = if continuation_specs_in.is_empty() {
+        discover_sources(source_root, root_session_id)?
+    } else {
+        discover_continuation_sources(
+            source_root,
+            root_session_id,
+            continuation_specs_in,
+            &previous_sources
+                .iter()
+                .filter(|source| source.kind == "session")
+                .map(|source| source.owner_session_id.clone())
+                .collect::<Vec<_>>(),
+        )?
+    };
+    {
+        let mut paths: Vec<&str> = live_discovered
+            .iter()
+            .map(|source| source.source_path.as_str())
+            .collect();
+        paths.sort();
+        paths.dedup();
+        if paths.len() != live_discovered.len() {
+            return Err("Orc source discovery produced duplicate source records".to_string());
+        }
+    }
+    let mut previous_by_path: Vec<(String, SourceCopy)> = Vec::new();
+    for source in previous_sources {
+        if previous_by_path
+            .iter()
+            .any(|(held, _)| *held == source.source_path)
+        {
+            return Err(format!(
+                "duplicate previous Orc source record: {}",
+                source.source_path
+            ));
+        }
+        previous_by_path.push((source.source_path.clone(), source.clone()));
+    }
+    let previous_of = |path: &str| -> Option<SourceCopy> {
+        previous_by_path
+            .iter()
+            .find(|(held, _)| held == path)
+            .map(|(_, held)| held.clone())
+    };
+    let selected_session_ids: Vec<String> = path_set(
+        &live_discovered
+            .iter()
+            .filter(|source| source.kind == "session")
+            .map(|source| source.owner_candidates[0].clone())
+            .collect::<Vec<_>>(),
+    );
+    let selected_task_paths: Vec<String> = path_set(
+        &live_discovered
+            .iter()
+            .filter(|source| source.kind == "task")
+            .map(|source| source.source_path.clone())
+            .collect::<Vec<_>>(),
+    );
+    let restricted_task_sources = continuation_specs_in
+        .iter()
+        .any(|spec| spec.start_message_id.is_some());
+    let mut newly_detached_paths: Vec<String> = Vec::new();
+    let mut session_task_paths: Vec<(String, Vec<String>)> = Vec::new();
+    let live_sessions: Vec<DiscoveredSource> = live_discovered
+        .iter()
+        .filter(|source| source.kind == "session")
+        .cloned()
+        .collect();
+    for discovered_source in &live_sessions {
+        let live_path = live_source_path(source_root, &discovered_source.source_path)?;
+        let live_meta = session_meta(&live_path, &discovered_source.source_path)?;
+        let mut live_task_paths: Vec<String> = session_task_relatives(&live_path, &live_meta)?
+            .into_iter()
+            .map(|(path, _, _)| path)
+            .filter(|path| !restricted_task_sources || selected_task_paths.contains(path))
+            .collect();
+        live_task_paths.sort();
+        live_task_paths.dedup();
+        session_task_paths.push((
+            discovered_source.source_path.clone(),
+            live_task_paths.clone(),
+        ));
+        let Some(previous) = previous_of(&discovered_source.source_path) else {
+            continue;
+        };
+        let previous_path = snapshot_path(snapshot_root, &previous.snapshot_path)?;
+        let is_symlink = std::fs::symlink_metadata(&previous_path)
+            .map(|meta| meta.file_type().is_symlink())
+            .unwrap_or(false);
+        if is_symlink || !previous_path.is_file() || sha256_file(&previous_path)? != previous.sha256
+        {
+            return Err(format!(
+                "previous Orc snapshot does not match its manifest: {}",
+                previous_path.display()
+            ));
+        }
+        let prior_meta = session_meta(&previous_path, &discovered_source.source_path)?;
+        let prior_task_paths: Vec<String> = session_task_relatives(&previous_path, &prior_meta)?
+            .into_iter()
+            .map(|(path, _, _)| path)
+            .filter(|path| !restricted_task_sources || selected_task_paths.contains(path))
+            .collect();
+        for path in &prior_task_paths {
+            if !live_task_paths.contains(path) && !newly_detached_paths.contains(path) {
+                newly_detached_paths.push(path.clone());
+            }
+        }
+    }
+    let planned_live_task_paths: Vec<String> = {
+        let mut held: Vec<String> = session_task_paths
+            .iter()
+            .flat_map(|(_, paths)| paths.iter().cloned())
+            .filter(|path| {
+                live_source_path(source_root, path).is_ok_and(|held| source_exists(&held))
+            })
+            .collect();
+        held.sort();
+        held.dedup();
+        held
+    };
+    let discovered_live_task_paths: Vec<String> = {
+        let mut held: Vec<String> = live_discovered
+            .iter()
+            .filter(|item| item.kind == "task")
+            .map(|item| item.source_path.clone())
+            .collect();
+        held.sort();
+        held.dedup();
+        held
+    };
+    if path_set(&planned_live_task_paths) != path_set(&discovered_live_task_paths) {
+        return Err(
+            "Orc task database references changed during source discovery; retry ingest"
+                .to_string(),
+        );
+    }
+    let discovered_paths = path_set(
+        &live_discovered
+            .iter()
+            .map(|source| source.source_path.clone())
+            .collect::<Vec<_>>(),
+    );
+    let mut frozen_paths: Vec<String> = previous_sources
+        .iter()
+        .filter(|source| {
+            source.kind == "task"
+                && !discovered_paths.contains(&source.source_path)
+                && (source.source_state == SOURCE_STATE_DETACHED
+                    || newly_detached_paths.contains(&source.source_path)
+                    || live_source_path(source_root, &source.source_path)
+                        .is_ok_and(|held| !source_exists(&held)))
+        })
+        .map(|source| source.source_path.clone())
+        .collect();
+    frozen_paths.sort();
+    frozen_paths.dedup();
+    let mut disappeared: Vec<String> = previous_by_path
+        .iter()
+        .map(|(path, _)| path.clone())
+        .filter(|path| !discovered_paths.contains(path) && !frozen_paths.contains(path))
+        .collect();
+    disappeared.sort();
+    if !disappeared.is_empty() {
+        return Err(format!(
+            "previously observed Orc source disappeared: {}",
+            disappeared.join(", ")
+        ));
+    }
+    for path in &frozen_paths {
+        let previous = previous_of(path).expect("frozen previous");
+        live_discovered.push(DiscoveredSource {
+            source_path: path.clone(),
+            kind: "task".to_string(),
+            owner_candidates: vec![previous.owner_session_id.clone()],
+            lineage_root_session_id: None,
+            source_state: SOURCE_STATE_DETACHED.to_string(),
+        });
+    }
+    live_discovered.sort_by(|a, b| a.source_path.cmp(&b.source_path));
+    let mut used_task_ordinals: Vec<(String, Vec<i64>)> = Vec::new();
+    for prior_source in previous_sources {
+        if prior_source.kind == "task" {
+            if let Some(ordinal) = prior_source.task_source_ordinal {
+                match used_task_ordinals
+                    .iter_mut()
+                    .find(|(held, _)| *held == prior_source.owner_session_id)
+                {
+                    Some((_, held)) => {
+                        if !held.contains(&ordinal) {
+                            held.push(ordinal);
+                        }
+                    }
+                    None => used_task_ordinals
+                        .push((prior_source.owner_session_id.clone(), vec![ordinal])),
+                }
+            }
+        }
+    }
+    let mut task_ordinals: Vec<(String, i64)> = Vec::new();
+    for discovered_item in &live_discovered {
+        if discovered_item.kind != "task" {
+            continue;
+        }
+        let previous = previous_of(&discovered_item.source_path);
+        let owner = previous
+            .as_ref()
+            .map(|held| held.owner_session_id.clone())
+            .unwrap_or_else(|| discovered_item.owner_candidates[0].clone());
+        let ordinal = match previous.as_ref().and_then(|held| held.task_source_ordinal) {
+            Some(ordinal) => ordinal,
+            None => {
+                let used: Vec<i64> = used_task_ordinals
+                    .iter()
+                    .find(|(held, _)| *held == owner)
+                    .map(|(_, held)| held.clone())
+                    .unwrap_or_default();
+                let mut ordinal = 0i64;
+                while used.contains(&ordinal) {
+                    ordinal += 1;
+                }
+                ordinal
+            }
+        };
+        task_ordinals.push((discovered_item.source_path.clone(), ordinal));
+        match used_task_ordinals
+            .iter_mut()
+            .find(|(held, _)| *held == owner)
+        {
+            Some((_, held)) => {
+                if !held.contains(&ordinal) {
+                    held.push(ordinal);
+                }
+            }
+            None => used_task_ordinals.push((owner, vec![ordinal])),
+        }
+    }
+    Ok(DiscoveryPlan {
+        discovered: live_discovered,
+        previous_by_path,
+        selected_session_ids,
+        task_ordinals,
+        session_task_paths,
+    })
+}
+
+// ---------------------------------------------------------------- prefix diff
+
+fn prefix_value(value: &SqlValue) -> (String, String) {
+    match value {
+        SqlValue::Null => ("null".to_string(), String::new()),
+        SqlValue::Int(held) => ("int".to_string(), held.to_string()),
+        SqlValue::Real(held) => ("real".to_string(), py_float_hex(*held)),
+        SqlValue::Text(held) => ("text".to_string(), held.clone()),
+        SqlValue::Blob(held) => (
+            "blob".to_string(),
+            held.iter().map(|byte| format!("{byte:02x}")).collect(),
+        ),
+    }
+}
+
+fn prefix_values_equal(previous: &SqlValue, observed: &SqlValue) -> bool {
+    // Type-strict, like the digest tags: 1 != 1.0.
+    std::mem::discriminant(previous) == std::mem::discriminant(observed) && previous == observed
+}
+
+fn prefix_rows_equal(previous: &[SqlValue], observed: &[SqlValue]) -> bool {
+    previous.len() == observed.len()
+        && previous
+            .iter()
+            .zip(observed.iter())
+            .all(|(a, b)| prefix_values_equal(a, b))
+}
+
+fn prefix_window(body: &str, start: i64, end: i64) -> (String, bool) {
+    let char_count = body.chars().count() as i64;
+    let start = start.clamp(0, char_count);
+    let end = end.clamp(start, char_count);
+    let end = if end - start > PREFIX_DIFF_EXCERPT_CHARS as i64 {
+        start + PREFIX_DIFF_EXCERPT_CHARS as i64
+    } else {
+        end
+    };
+    let text: String = body
+        .chars()
+        .skip(start as usize)
+        .take((end - start) as usize)
+        .collect();
+    let mut out = text;
+    if start > 0 {
+        out = format!("...{out}");
+    }
+    if end < char_count {
+        out = format!("{out}...");
+    }
+    (out, start > 0 || end < char_count)
+}
+
+fn prefix_excerpts(previous_body: &str, observed_body: &str) -> (String, String, bool) {
+    let previous_chars: Vec<char> = previous_body.chars().collect();
+    let observed_chars: Vec<char> = observed_body.chars().collect();
+    let shared = previous_chars.len().min(observed_chars.len());
+    let mut head = 0usize;
+    while head < shared && previous_chars[head] == observed_chars[head] {
+        head += 1;
+    }
+    let mut tail = 0usize;
+    while tail < shared - head
+        && previous_chars[previous_chars.len() - 1 - tail]
+            == observed_chars[observed_chars.len() - 1 - tail]
+    {
+        tail += 1;
+    }
+    let start = head as i64 - PREFIX_DIFF_CONTEXT_CHARS as i64;
+    let (previous_excerpt, previous_bounded) = prefix_window(
+        previous_body,
+        start,
+        previous_chars.len() as i64 - tail as i64 + PREFIX_DIFF_CONTEXT_CHARS as i64,
+    );
+    let (observed_excerpt, observed_bounded) = prefix_window(
+        observed_body,
+        start,
+        observed_chars.len() as i64 - tail as i64 + PREFIX_DIFF_CONTEXT_CHARS as i64,
+    );
+    (
+        previous_excerpt,
+        observed_excerpt,
+        previous_bounded || observed_bounded,
+    )
+}
+
+fn collect_json_changes(
+    previous: &JsonValue,
+    observed: &JsonValue,
+    path: &str,
+    depth: usize,
+    found: &mut Vec<String>,
+) -> bool {
+    if found.len() >= PREFIX_DIFF_MAX_JSON_PATHS {
+        return true;
+    }
+    if prefix_values_equal_json(previous, observed) {
+        return false;
+    }
+    if depth >= PREFIX_DIFF_MAX_JSON_DEPTH {
+        found.push(if path.is_empty() { "." } else { path }.to_string());
+        return true;
+    }
+    if let (Some(previous_object), Some(observed_object)) =
+        (previous.as_object(), observed.as_object())
+    {
+        let mut keys: Vec<&String> = previous_object
+            .keys()
+            .chain(observed_object.keys())
+            .collect();
+        keys.sort();
+        keys.dedup();
+        let mut bounded = false;
+        for key in keys {
+            let child = if path.is_empty() {
+                key.clone()
+            } else {
+                format!("{path}.{key}")
+            };
+            match (previous_object.get(key), observed_object.get(key)) {
+                (Some(left), Some(right)) => {
+                    bounded =
+                        collect_json_changes(left, right, &child, depth + 1, found) || bounded;
+                }
+                _ => {
+                    if found.len() >= PREFIX_DIFF_MAX_JSON_PATHS {
+                        return true;
+                    }
+                    found.push(child);
+                }
+            }
+        }
+        return bounded;
+    }
+    if let (Some(previous_array), Some(observed_array)) = (previous.as_array(), observed.as_array())
+    {
+        if previous_array.len() == observed_array.len() {
+            let mut bounded = false;
+            for (index, (left, right)) in
+                previous_array.iter().zip(observed_array.iter()).enumerate()
+            {
+                bounded = collect_json_changes(
+                    left,
+                    right,
+                    &format!("{path}[{index}]"),
+                    depth + 1,
+                    found,
+                ) || bounded;
+            }
+            return bounded;
+        }
+    }
+    found.push(if path.is_empty() { "." } else { path }.to_string());
+    false
+}
+
+fn prefix_values_equal_json(previous: &JsonValue, observed: &JsonValue) -> bool {
+    // The diff compares the way the digest does: int/float
+    // and bool/int are different kinds.
+    match (previous, observed) {
+        (JsonValue::Number(a), JsonValue::Number(b)) => {
+            (a.is_i64() || a.is_u64()) == (b.is_i64() || b.is_u64())
+                && crate::json::dump_compact(&JsonValue::Number(a.clone()))
+                    == crate::json::dump_compact(&JsonValue::Number(b.clone()))
+        }
+        _ => previous == observed,
+    }
+}
+
+fn json_change_paths(previous_body: &str, observed_body: &str) -> (Vec<String>, bool) {
+    if previous_body.len() > PREFIX_DIFF_MAX_JSON_CHARS
+        || observed_body.len() > PREFIX_DIFF_MAX_JSON_CHARS
+    {
+        return (Vec::new(), false);
+    }
+    let (Ok(previous_value), Ok(observed_value)) = (
+        serde_json::from_str::<JsonValue>(previous_body),
+        serde_json::from_str::<JsonValue>(observed_body),
+    ) else {
+        return (Vec::new(), false);
+    };
+    if !previous_value.is_object() && !previous_value.is_array() {
+        return (Vec::new(), false);
+    }
+    if !observed_value.is_object() && !observed_value.is_array() {
+        return (Vec::new(), false);
+    }
+    let mut found = Vec::new();
+    let bounded = collect_json_changes(&previous_value, &observed_value, "", 0, &mut found);
+    (found, bounded)
+}
+
+fn prefix_display(kind: &str, excerpt: &str) -> String {
+    if kind == "null" {
+        "null".to_string()
+    } else {
+        format!("{kind}:{excerpt}")
+    }
+}
+
+fn prefix_column_change(
+    column: &str,
+    previous_value: &SqlValue,
+    observed_value: &SqlValue,
+) -> PrefixColumnChange {
+    let (previous_kind, previous_body) = prefix_value(previous_value);
+    let (observed_kind, observed_body) = prefix_value(observed_value);
+    let mut json_paths = Vec::new();
+    let mut json_paths_bounded = false;
+    let (previous_excerpt, observed_excerpt, bounded);
+    if previous_kind == observed_kind {
+        let (a, b, held) = prefix_excerpts(&previous_body, &observed_body);
+        previous_excerpt = a;
+        observed_excerpt = b;
+        bounded = held;
+        if previous_kind == "text" {
+            (json_paths, json_paths_bounded) = json_change_paths(&previous_body, &observed_body);
+        }
+    } else {
+        let (pe, pb) = prefix_window(&previous_body, 0, previous_body.chars().count() as i64);
+        let (oe, ob) = prefix_window(&observed_body, 0, observed_body.chars().count() as i64);
+        previous_excerpt = pe;
+        observed_excerpt = oe;
+        bounded = pb || ob;
+    }
+    PrefixColumnChange {
+        column: column.to_string(),
+        previous: prefix_display(&previous_kind, &previous_excerpt),
+        observed: prefix_display(&observed_kind, &observed_excerpt),
+        bounded,
+        json_paths,
+        json_paths_bounded,
+    }
+}
+
+/// Bounded evidence about how a live prefix differs.
+pub struct PrefixDiff {
+    /// See the enclosing record's documentation.
+    pub changed_rows: Vec<PrefixRowChange>,
+    /// See the enclosing record's documentation.
+    pub changed_row_count: i64,
+    /// See the enclosing record's documentation.
+    pub missing_rows: Vec<String>,
+    /// See the enclosing record's documentation.
+    pub missing_row_count: i64,
+    /// See the enclosing record's documentation.
+    pub added_rows: Vec<String>,
+    /// See the enclosing record's documentation.
+    pub added_row_count: i64,
+}
+
+impl PrefixDiff {
+    /// See the enclosing record's documentation.
+    pub fn changed_rows_bounded(&self) -> bool {
+        (self.changed_rows.len() as i64) < self.changed_row_count
+    }
+}
+
+fn prefix_rows_stream(
+    connection: &Connection,
+    scope: &PrefixScope,
+) -> Result<Vec<Vec<SqlValue>>, String> {
+    query_all(
+        connection,
+        &scope.query(),
+        &[SqlValue::Int(scope.limit as i64)],
+        "prefix diff",
+    )
+}
+
+/// Walk both prefixes in key order and diff them,
+/// boundedly.
+pub fn append_prefix_diff(
+    previous_path: &Path,
+    current_path: &Path,
+    scopes: &[PrefixScope],
+) -> Result<PrefixDiff, String> {
+    let previous_connection = read_only(previous_path)?;
+    let current_connection = read_only(current_path).map_err(|error| {
+        format!(
+            "failed to compare Orc append prefixes for {}: {error}",
+            current_path.display()
+        )
+    })?;
+    let mut changed: Vec<PrefixRowChange> = Vec::new();
+    let mut changed_count = 0i64;
+    let mut missing: Vec<String> = Vec::new();
+    let mut missing_count = 0i64;
+    let mut added: Vec<String> = Vec::new();
+    let mut added_count = 0i64;
+    for scope in scopes {
+        let previous_rows = prefix_rows_stream(&previous_connection, scope).map_err(|error| {
+            format!(
+                "failed to compare Orc append prefixes for {}: {error}",
+                current_path.display()
+            )
+        })?;
+        let current_rows = prefix_rows_stream(&current_connection, scope).map_err(|error| {
+            format!(
+                "failed to compare Orc append prefixes for {}: {error}",
+                current_path.display()
+            )
+        })?;
+        let mut previous_iter = previous_rows.iter().peekable();
+        let mut current_iter = current_rows.iter().peekable();
+        let key_of =
+            |row: &[SqlValue]| -> Result<i64, String> { cell_integer(&row[0], "prefix diff: key") };
+        loop {
+            let previous_row = previous_iter.peek();
+            let current_row = current_iter.peek();
+            if previous_row.is_none() && current_row.is_none() {
+                break;
+            }
+            let previous_key = previous_row.map(|row| key_of(row)).transpose()?;
+            let current_key = current_row.map(|row| key_of(row)).transpose()?;
+            if current_key.is_none() || (previous_key.is_some() && previous_key < current_key) {
+                missing_count += 1;
+                if missing.len() < PREFIX_DIFF_MAX_KEYS {
+                    missing.push(format!("{} row {}", scope.table, previous_key.unwrap_or(0)));
+                }
+                previous_iter.next();
+                continue;
+            }
+            if previous_key.is_none() || current_key < previous_key {
+                added_count += 1;
+                if added.len() < PREFIX_DIFF_MAX_KEYS {
+                    added.push(format!("{} row {}", scope.table, current_key.unwrap_or(0)));
+                }
+                current_iter.next();
+                continue;
+            }
+            let (previous_row, current_row) = (
+                previous_iter.next().expect("row present"),
+                current_iter.next().expect("row present"),
+            );
+            if !prefix_rows_equal(previous_row, current_row) {
+                changed_count += 1;
+                if changed.len() < PREFIX_DIFF_MAX_ROWS {
+                    let mut columns = Vec::new();
+                    for (index, name) in scope.columns.iter().enumerate() {
+                        if !prefix_values_equal(&previous_row[index], &current_row[index]) {
+                            columns.push(prefix_column_change(
+                                name,
+                                &previous_row[index],
+                                &current_row[index],
+                            ));
+                        }
+                    }
+                    changed.push(PrefixRowChange {
+                        table: scope.table.clone(),
+                        row_id: previous_key.unwrap_or(0),
+                        columns,
+                    });
+                }
+            }
+        }
+    }
+    Ok(PrefixDiff {
+        changed_rows: changed,
+        changed_row_count: changed_count,
+        missing_rows: missing,
+        missing_row_count: missing_count,
+        added_rows: added,
+        added_row_count: added_count,
+    })
+}
+
+/// The scopes the guard digested for a path at a
+/// watermark.
+pub fn prefix_scopes_for(
+    path: &Path,
+    session_state_mode: Option<&str>,
+    prefix_max_id: BigUint,
+) -> Result<Vec<PrefixScope>, String> {
+    let connection = read_only(path)?;
+    let geometry = session_geometry(&connection, path, session_state_mode).map_err(|error| {
+        format!(
+            "failed to inspect Orc SQLite source {}: {error}",
+            path.display()
+        )
+    })?;
+    drop(connection);
+    let (scopes, _) = session_prefix_scopes(&geometry, session_state_mode, Some(prefix_max_id));
+    Ok(scopes)
+}
+
+/// Refuse a prefix rewrite, or record its acceptance.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_prefix_rewrite(
+    relative: &str,
+    kind: &str,
+    session_id: &str,
+    previous: &SourceCopy,
+    previous_state: &LogicalState,
+    observed: &LogicalState,
+    diff: &PrefixDiff,
+    accept_prefix_rewrite: &[String],
+    captured_at: &str,
+) -> Result<AppendPrefixOverride, String> {
+    let prefix_error = format!("Orc {kind} existing append prefix was rewritten for {relative}");
+    if diff.missing_row_count > 0 || diff.added_row_count > 0 {
+        return Err(format!(
+            "{prefix_error}: the recorded prefix lost {} row(s) ({}) and gained {} row(s) ({}) below its watermark; accepting a prefix rewrite covers changed column values only, never rows appearing or disappearing",
+            diff.missing_row_count,
+            if diff.missing_rows.is_empty() { "none".to_string() } else { diff.missing_rows.join(", ") },
+            diff.added_row_count,
+            if diff.added_rows.is_empty() { "none".to_string() } else { diff.added_rows.join(", ") }
+        ));
+    }
+    if diff.changed_row_count == 0 {
+        return Err(format!(
+            "{prefix_error}: the digest moved but no row differs, so the archive cannot describe what changed"
+        ));
+    }
+    if !accept_prefix_rewrite.iter().any(|held| held == session_id) {
+        let mut described: Vec<String> = Vec::new();
+        let mut budget = PREFIX_DIFF_MAX_MESSAGE_CHARS as i64;
+        for row in &diff.changed_rows {
+            let line = row.describe();
+            if budget - (line.chars().count() as i64) < 0 && !described.is_empty() {
+                break;
+            }
+            budget -= line.chars().count() as i64;
+            described.push(line);
+        }
+        let remaining = diff.changed_row_count - described.len() as i64;
+        let mut evidence = described.join("; ");
+        if remaining > 0 {
+            evidence += &format!("; ... {remaining} further changed row(s) not shown");
+        }
+        return Err(format!(
+            "{prefix_error}: {} row(s) changed at or below the append watermark [{evidence}]; re-run with --accept-orc-prefix-rewrite {session_id} to record this rewrite and re-baseline the digest -- that authorizes this one session and no other, so another rewritten session in this lineage refuses again with its own evidence -- accepting supersedes the pre-rewrite snapshot {} (kept for comparison until the next accepted override on this source, then reclaimed) and records only a bounded summary -- at most {PREFIX_DIFF_MAX_ROWS} of those {} changed row(s), at most {PREFIX_DIFF_EXCERPT_CHARS} characters per column value",
+            diff.changed_row_count,
+            previous.snapshot_path,
+            diff.changed_row_count
+        ));
+    }
+    Ok(AppendPrefixOverride {
+        policy: PREFIX_OVERRIDE_POLICY.to_string(),
+        source_path: relative.to_string(),
+        accepted_at: captured_at.to_string(),
+        override_count: previous
+            .append_prefix_override
+            .as_ref()
+            .map_or(1, |prior| prior.override_count + 1),
+        previous_append_prefix_sha256: previous_state.append_prefix_sha256.clone(),
+        observed_append_prefix_sha256: observed.append_prefix_sha256.clone(),
+        superseded_snapshot_path: previous.snapshot_path.clone(),
+        superseded_sha256: previous.sha256.clone(),
+        changed_row_count: diff.changed_row_count,
+        changed_rows: diff.changed_rows.clone(),
+        changed_rows_bounded: diff.changed_rows_bounded(),
+        degraded: true,
+        degradation_reason: PREFIX_OVERRIDE_DEGRADATION_REASON.to_string(),
+    })
+}
+
+// ---------------------------------------------------------------- prepare & publish
+
+/// One backed-up candidate ready to publish.
+pub struct PreparedCandidate {
+    /// See the enclosing record's documentation.
+    pub source: SourceCopy,
+    /// See the enclosing record's documentation.
+    pub temporary: Option<PathBuf>,
+    /// See the enclosing record's documentation.
+    pub target_relative: String,
+    /// See the enclosing record's documentation.
+    pub canonical_identity: SemanticIdentity,
+}
+
+/// Create a SQLite snapshot of one source.
+pub fn backup_database(
+    source: &Path,
+    destination: &Path,
+    snapshot_root: &Path,
+) -> Result<(), String> {
+    ensure_snapshot_parent(destination, snapshot_root)?;
+    if destination.exists() {
+        let is_symlink = std::fs::symlink_metadata(destination)
+            .map(|meta| meta.file_type().is_symlink())
+            .unwrap_or(false);
+        if is_symlink || !destination.is_file() {
+            return Err(format!(
+                "snapshot target is a symlink or non-file: {}",
+                destination.display()
+            ));
+        }
+    }
+    let source_connection = read_only(source)?;
+    let outcome = (|| -> Result<(), String> {
+        source_connection
+            .backup(rusqlite::MAIN_DB, destination, None)
+            .map_err(|error| {
+                format!(
+                    "failed to back up Orc SQLite source {}: {error}",
+                    source.display()
+                )
+            })?;
+        let destination_connection =
+            Connection::open(destination).map_err(|error| error.to_string())?;
+        let mode: String = destination_connection
+            .query_row("PRAGMA journal_mode = DELETE", [], |row| row.get(0))
+            .map_err(|error| error.to_string())?;
+        if mode.to_lowercase() != "delete" {
+            return Err(format!(
+                "failed to normalize Orc snapshot journal mode for {}",
+                source.display()
+            ));
+        }
+        Ok(())
+    })();
+    if let Err(error) = outcome {
+        return Err(format!(
+            "failed to back up Orc SQLite source {}: {error}",
+            source.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Atomically publish one immutable object, or reuse an
+/// identical orphan. Returns whether a new object was
+/// created.
+pub fn publish_snapshot_candidate(
+    temporary: &Path,
+    target: &Path,
+    expected_sha256: &str,
+    snapshot_root: &Path,
+) -> Result<bool, String> {
+    ensure_snapshot_parent(target, snapshot_root)?;
+    fsync_regular_file(temporary)?;
+    match std::fs::symlink_metadata(target) {
+        Ok(metadata) => {
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "snapshot object target is a symlink or non-file: {}",
+                    target.display()
+                ));
+            }
+            if sha256_file(target)? != expected_sha256 {
+                return Err(format!(
+                    "preexisting snapshot object has the wrong hash: {}",
+                    target.display()
+                ));
+            }
+            fsync_regular_file(target)?;
+            fsync_directory(target.parent().unwrap_or(target))?;
+            std::fs::remove_file(temporary)
+                .map_err(|error| crate::json::os_error(&error, temporary))?;
+            return Ok(false);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(crate::json::os_error(&error, target)),
+    }
+    match std::fs::hard_link(temporary, target) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let is_symlink = std::fs::symlink_metadata(target)
+                .map(|meta| meta.file_type().is_symlink())
+                .unwrap_or(false);
+            if is_symlink || !target.is_file() {
+                return Err(format!(
+                    "snapshot object target is a symlink or non-file: {}",
+                    target.display()
+                ));
+            }
+            if sha256_file(target)? != expected_sha256 {
+                return Err(format!(
+                    "raced snapshot object has the wrong hash: {}",
+                    target.display()
+                ));
+            }
+            fsync_regular_file(target)?;
+            fsync_directory(target.parent().unwrap_or(target))?;
+            std::fs::remove_file(temporary)
+                .map_err(|error| crate::json::os_error(&error, temporary))?;
+            return Ok(false);
+        }
+        Err(error) => return Err(crate::json::os_error(&error, target)),
+    }
+    if sha256_file(target)? != expected_sha256 {
+        return Err(format!(
+            "published snapshot object failed hash verification: {}",
+            target.display()
+        ));
+    }
+    fsync_directory(target.parent().unwrap_or(target))?;
+    std::fs::remove_file(temporary).map_err(|error| crate::json::os_error(&error, temporary))?;
+    Ok(true)
+}
+
+fn managed_name_parts(name: &str, extension: &str) -> Option<String> {
+    let digest = name.strip_suffix(extension)?;
+    if digest.len() == 64
+        && digest
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        Some(digest.to_string())
+    } else {
+        None
+    }
+}
+
+fn prune_managed_objects(
+    snapshot_root: &Path,
+    root_name: &str,
+    extension: &str,
+    retained: &[String],
+) -> Result<i64, String> {
+    let object_root = snapshot_root.join(root_name);
+    let metadata = match std::fs::symlink_metadata(&object_root) {
+        Ok(held) => held,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(crate::json::os_error(&error, &object_root)),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "Orc snapshot object root is unsafe: {}",
+            object_root.display()
+        ));
+    }
+    let mut removed = 0i64;
+    let mut prefixes: Vec<PathBuf> = Vec::new();
+    let entries = std::fs::read_dir(&object_root)
+        .map_err(|error| crate::json::os_error(&error, &object_root))?;
+    for entry in entries.flatten() {
+        prefixes.push(entry.path());
+    }
+    prefixes.sort_by_key(|path| path.file_name().map(|n| n.to_string_lossy().into_owned()));
+    for prefix in &prefixes {
+        let prefix_meta = std::fs::symlink_metadata(prefix)
+            .map_err(|error| crate::json::os_error(&error, prefix))?;
+        if prefix_meta.file_type().is_symlink() {
+            return Err(format!(
+                "symlink in Orc snapshot object store: {}",
+                prefix.display()
+            ));
+        }
+        let prefix_name = prefix
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let prefix_ok = prefix_name.len() == 2
+            && prefix_name
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        if !prefix_meta.is_dir() || !prefix_ok {
+            continue;
+        }
+        let mut prefix_changed = false;
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        let entries =
+            std::fs::read_dir(prefix).map_err(|error| crate::json::os_error(&error, prefix))?;
+        for entry in entries.flatten() {
+            candidates.push(entry.path());
+        }
+        candidates.sort_by_key(|path| path.file_name().map(|n| n.to_string_lossy().into_owned()));
+        for candidate in &candidates {
+            let candidate_meta = std::fs::symlink_metadata(candidate)
+                .map_err(|error| crate::json::os_error(&error, candidate))?;
+            if candidate_meta.file_type().is_symlink() {
+                return Err(format!(
+                    "symlink in Orc snapshot object store: {}",
+                    candidate.display()
+                ));
+            }
+            let name = candidate
+                .file_name()
+                .map(|held| held.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if extension == ".db" {
+                for suffix in ["-wal", "-shm"] {
+                    if let Some(base) = name.strip_suffix(suffix) {
+                        if base.len() == 67
+                            && base.ends_with(".db")
+                            && managed_name_parts(&base[..67], ".db")
+                                .is_some_and(|digest| digest[..2] == *prefix_name)
+                            && candidate_meta.is_file()
+                        {
+                            std::fs::remove_file(candidate)
+                                .map_err(|error| crate::json::os_error(&error, candidate))?;
+                            removed += 1;
+                            prefix_changed = true;
+                        }
+                    }
+                }
+            }
+            let Some(digest) = managed_name_parts(&name, extension) else {
+                continue;
+            };
+            if !candidate_meta.is_file() || digest[..2] != *prefix_name {
+                continue;
+            }
+            let relative = candidate
+                .strip_prefix(snapshot_root)
+                .map(|held| held.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default();
+            if retained.contains(&relative) {
+                continue;
+            }
+            std::fs::remove_file(candidate)
+                .map_err(|error| crate::json::os_error(&error, candidate))?;
+            removed += 1;
+            prefix_changed = true;
+        }
+        if prefix_changed {
+            fsync_directory(prefix)?;
+        }
+    }
+    Ok(removed)
+}
+
+/// Remove unreferenced managed objects after a durable
+/// manifest commit; returns the count removed.
+pub fn prune_orc_snapshot_objects(
+    snapshot_root: &Path,
+    retained_sources: &[SourceCopy],
+) -> Result<i64, String> {
+    let mut retained_databases: Vec<String> = Vec::new();
+    let mut retained_projections: Vec<String> = Vec::new();
+    for source in retained_sources {
+        let expected = snapshot_object_relative(&source.sha256)?;
+        if source.snapshot_path != expected {
+            return Err(format!(
+                "refusing Orc object GC for unmanaged snapshot path {}",
+                py_repr_str(&source.snapshot_path)
+            ));
+        }
+        retained_databases.push(source.snapshot_path.clone());
+        if let Some(held) = &source.append_prefix_override {
+            retained_databases.push(held.superseded_snapshot_path.clone());
+        }
+        let mut retained_items: Vec<(String, String)> =
+            vec![(source.snapshot_path.clone(), source.sha256.clone())];
+        if source.semantic_identity_mode == SEMANTIC_IDENTITY_LEGACY {
+            let Some(baseline) = &source.semantic_baseline_path else {
+                return Err(format!(
+                    "legacy Orc source lacks semantic baseline: {}",
+                    source.source_path
+                ));
+            };
+            retained_items.push((baseline.clone(), source.semantic_sha256.clone()));
+            if baseline.starts_with(&format!("{SNAPSHOT_OBJECT_ROOT}/")) {
+                retained_databases.push(baseline.clone());
+            }
+        }
+        if let Some(alias) = &source.semantic_alias_baseline_path {
+            let is_managed = managed_object_digest(alias);
+            let Some(digest) = is_managed else {
+                return Err(format!("invalid Orc semantic alias baseline: {alias}"));
+            };
+            retained_databases.push(alias.clone());
+            retained_items.push((alias.clone(), digest));
+        }
+        if let Some(projection) = &source.task_projection {
+            retained_projections.push(projection.path.clone());
+            retained_items.push((projection.path.clone(), projection.sha256.clone()));
+        }
+        for (relative, expected_sha256) in &retained_items {
+            let path = snapshot_path(snapshot_root, relative)?;
+            let metadata = std::fs::symlink_metadata(&path).map_err(|_| {
+                format!(
+                    "retained Orc snapshot artifact is missing: {}",
+                    path.display()
+                )
+            })?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(format!(
+                    "retained Orc snapshot artifact is unsafe: {}",
+                    path.display()
+                ));
+            }
+            if sha256_file(&path)? != *expected_sha256 {
+                return Err(format!(
+                    "retained Orc snapshot artifact has wrong hash: {}",
+                    path.display()
+                ));
+            }
+            if relative == source.semantic_baseline_path.as_deref().unwrap_or("")
+                && metadata.len() as i64 != source.semantic_complete_bytes
+            {
+                return Err(format!(
+                    "retained Orc semantic baseline has wrong size: {}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(prune_managed_objects(
+        snapshot_root,
+        SNAPSHOT_OBJECT_ROOT,
+        ".db",
+        &retained_databases,
+    )? + prune_managed_objects(
+        snapshot_root,
+        TASK_PROJECTION_ROOT,
+        ".json",
+        &retained_projections,
+    )?)
+}
+
+/// Remove managed candidates left by a terminated
+/// ingest transaction; returns the count removed.
+pub fn prune_orc_staging(snapshot_root: &Path) -> Result<i64, String> {
+    let staging = snapshot_path(snapshot_root, ".staging")?;
+    let metadata = match std::fs::symlink_metadata(&staging) {
+        Ok(held) => held,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(crate::json::os_error(&error, &staging)),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!("Orc staging root is unsafe: {}", staging.display()));
+    }
+    let managed = |name: &str| -> bool {
+        fn staged_ok(name: &str, prefix: &str, extension: &str) -> bool {
+            let Some(rest) = name.strip_prefix(prefix) else {
+                return false;
+            };
+            let Some(core) = rest.strip_suffix(extension) else {
+                return false;
+            };
+            // orc-<pid>-<16 hex> (suffixes wal/shm stripped by caller)
+            let Some((pid, token)) = core.split_once('-') else {
+                return false;
+            };
+            !pid.is_empty()
+                && pid.bytes().all(|b| b.is_ascii_digit())
+                && token.len() == 16
+                && token
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        }
+        if staged_ok(name, "orc-", ".db") || staged_ok(name, "task-projection-", ".json") {
+            return true;
+        }
+        for suffix in ["-wal", "-shm"] {
+            if let Some(base) = name.strip_suffix(suffix) {
+                let base = format!("{base}.db");
+                if staged_ok(&base, "orc-", ".db") {
+                    return true;
+                }
+            }
+        }
+        false
+    };
+    let mut removed = 0i64;
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    let entries =
+        std::fs::read_dir(&staging).map_err(|error| crate::json::os_error(&error, &staging))?;
+    for entry in entries.flatten() {
+        candidates.push(entry.path());
+    }
+    candidates.sort_by_key(|path| path.file_name().map(|n| n.to_string_lossy().into_owned()));
+    for candidate in &candidates {
+        let candidate_meta = std::fs::symlink_metadata(candidate)
+            .map_err(|error| crate::json::os_error(&error, candidate))?;
+        if candidate_meta.file_type().is_symlink() || !candidate_meta.is_file() {
+            return Err(format!(
+                "unsafe entry in Orc staging directory: {}",
+                candidate.display()
+            ));
+        }
+        let name = candidate
+            .file_name()
+            .map(|held| held.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if !managed(&name) {
+            continue;
+        }
+        std::fs::remove_file(candidate)
+            .map_err(|error| crate::json::os_error(&error, candidate))?;
+        removed += 1;
+    }
+    if removed > 0 {
+        fsync_directory(&staging)?;
+    }
+    Ok(removed)
 }
