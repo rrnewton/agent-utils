@@ -67,6 +67,175 @@ options:
   --version             show program's version number and exit
   --userguide           print the complete embedded guide
 "#;
+/// The Python edition's top-level usage block, verbatim.
+pub const TOP_USAGE: &str = "usage: wrkviz [-h] [--version] [--userguide]\n              {quickstart,ingest-project,ingest,ingest-claude,ingest-claude-history,ingest-muse,ingest-orc,summarize,build,extract-transcripts,export,refresh,github-metadata,refresh-claude,refresh-orc,serve,inspect,gc,migrate-build-state,migrate-snapshots,audit-glossary,audit-losslessness,query,responsiveness,discover-agents}\n              ...";
+
+/// The complete embedded guide, read from its single home (the
+/// Python edition ships the same file as `wrkviz/USER_GUIDE.md`),
+/// so both editions print one text.
+pub const USER_GUIDE: &str = include_str!("../../../common/docs/wrkviz/USER_GUIDE.md");
+
+/// Subcommand names the top-level parser accepts, in help order.
+const SUBCOMMANDS: [&str; 25] = [
+    "quickstart",
+    "ingest-project",
+    "ingest",
+    "ingest-claude",
+    "ingest-claude-history",
+    "ingest-muse",
+    "ingest-orc",
+    "summarize",
+    "build",
+    "extract-transcripts",
+    "export",
+    "refresh",
+    "github-metadata",
+    "refresh-claude",
+    "refresh-orc",
+    "serve",
+    "inspect",
+    "gc",
+    "migrate-build-state",
+    "migrate-snapshots",
+    "audit-glossary",
+    "audit-losslessness",
+    "query",
+    "responsiveness",
+    "discover-agents",
+];
+
+/// A top-level flag the oracle's parser defines ahead of the
+/// subcommands.
+#[derive(Clone, Copy, PartialEq)]
+enum TopFlag {
+    Help,
+    Version,
+    Userguide,
+}
+
+impl TopFlag {
+    fn label(self) -> &'static str {
+        match self {
+            TopFlag::Help => "-h/--help",
+            TopFlag::Version => "--version",
+            TopFlag::Userguide => "--userguide",
+        }
+    }
+}
+
+/// Classify a token as a top-level flag: the flag plus any
+/// explicit `=value`. Long names accept an unambiguous prefix,
+/// the way the oracle's parser abbreviates them; the three names
+/// start with distinct letters, so a prefix never matches two.
+fn top_flag(token: &str) -> Option<(TopFlag, Option<String>)> {
+    let (head, explicit) = match token.split_once('=') {
+        Some((head, value)) => (head, Some(value.to_string())),
+        None => (token, None),
+    };
+    if head == "-h" {
+        return Some((TopFlag::Help, explicit));
+    }
+    if head.len() <= 2 || !head.starts_with("--") {
+        return None;
+    }
+    let mut found: Option<TopFlag> = None;
+    for (name, flag) in [
+        ("--help", TopFlag::Help),
+        ("--version", TopFlag::Version),
+        ("--userguide", TopFlag::Userguide),
+    ] {
+        if name.starts_with(head) {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(flag);
+        }
+    }
+    found.map(|flag| (flag, explicit))
+}
+
+/// The oracle rejects a flag that carries an explicit argument.
+fn explicit_argument_error(flag: TopFlag, value: &str) -> u8 {
+    argparse_error(
+        TOP_USAGE,
+        "wrkviz",
+        &format!(
+            "argument {}: ignored explicit argument '{value}'",
+            flag.label()
+        ),
+    )
+}
+
+/// Print the embedded guide. The parser actions and errors that
+/// can still fire after `--userguide` are honoured: `-h`/`--help`
+/// and `--version` act as soon as they appear, unknown options
+/// are collected and reported at the end, and a subcommand that
+/// follows is only parsed, never run, so a well-formed one
+/// changes nothing. (A subcommand whose own arguments are
+/// invalid reports its error in the oracle; here it is not
+/// parsed, and the guide is printed.)
+fn run_userguide(rest: &[String]) -> u8 {
+    let mut unrecognized: Vec<&str> = Vec::new();
+    let mut after_separator = false;
+    for token in rest {
+        if !after_separator {
+            if token == "--" {
+                after_separator = true;
+                continue;
+            }
+            if let Some((flag, explicit)) = top_flag(token) {
+                if let Some(value) = &explicit {
+                    return explicit_argument_error(flag, value);
+                }
+                match flag {
+                    TopFlag::Help => {
+                        print!("{TOP_HELP}");
+                        return 0;
+                    }
+                    TopFlag::Version => {
+                        println!("{VERSION}");
+                        return 0;
+                    }
+                    TopFlag::Userguide => continue,
+                }
+            }
+            if token.starts_with('-') && token.len() > 1 {
+                unrecognized.push(token.as_str());
+                continue;
+            }
+        }
+        // The first positional token names the subcommand.
+        if !unrecognized.is_empty() {
+            return argparse_error(
+                TOP_USAGE,
+                "wrkviz",
+                &format!("unrecognized arguments: {}", unrecognized.join(" ")),
+            );
+        }
+        if SUBCOMMANDS.contains(&token.as_str()) {
+            print!("{USER_GUIDE}");
+            return 0;
+        }
+        return argparse_error(
+            TOP_USAGE,
+            "wrkviz",
+            &format!(
+                "argument command: invalid choice: '{token}' (choose from {})",
+                SUBCOMMANDS.join(", ")
+            ),
+        );
+    }
+    if !unrecognized.is_empty() {
+        return argparse_error(
+            TOP_USAGE,
+            "wrkviz",
+            &format!("unrecognized arguments: {}", unrecognized.join(" ")),
+        );
+    }
+    print!("{USER_GUIDE}");
+    0
+}
+
 /// The Python edition's inspect help, verbatim.
 pub const INSPECT_HELP: &str = r#"usage: wrkviz inspect [-h] --output OUTPUT
 
@@ -344,21 +513,23 @@ pub fn run(args: &[String]) -> u8 {
         print!("{TOP_HELP}");
         return 0;
     };
+    if let Some((flag, explicit)) = top_flag(first) {
+        if let Some(value) = &explicit {
+            return explicit_argument_error(flag, value);
+        }
+        return match flag {
+            TopFlag::Help => {
+                print!("{TOP_HELP}");
+                0
+            }
+            TopFlag::Version => {
+                println!("{VERSION}");
+                0
+            }
+            TopFlag::Userguide => run_userguide(&args[1..]),
+        };
+    }
     match first.as_str() {
-        "--help" | "-h" => {
-            print!("{TOP_HELP}");
-            0
-        }
-        "--version" => {
-            println!("{VERSION}");
-            0
-        }
-        "--userguide" => {
-            eprintln!(
-                "wrkviz: the Rust edition has not ported '--userguide' yet; the Python edition remains the oracle for it"
-            );
-            2
-        }
         "inspect" => run_inspect(&args[1..]),
         "query" => run_query(&args[1..]),
         "serve" => run_serve(&args[1..]),

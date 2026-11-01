@@ -410,6 +410,22 @@ generated-schema collapse.
   Accepted gaps, shared with the earlier wrkviz slices:
   large-integer and NaN JSON spellings, lone surrogates, and
   Python `re` features beyond the ported subset.
-- Remaining composites: `--userguide`, multi-team export;
-  then the edition switch at parity and the
-  generated-schema collapse.
+- `--userguide` ported: the Rust edition embeds the guide
+  from its single home (`common/docs/wrkviz/USER_GUIDE.md`,
+  the file the Python edition ships as `wrkviz/USER_GUIDE.md`)
+  via `USER_GUIDE`/`run_userguide` in `rs/wrkviz/src/cli.rs`,
+  so both editions print one text; the top-level flag
+  namespace (`-h`/`--help`, `--version`, `--userguide`, with
+  unambiguous-prefix abbreviation and the
+  ignored-explicit-argument errors) is matched as one unit.
+  Differential: `py/tests/test_wrkviz_userguide_rust.py`
+  (5 cases: the guide itself, abbreviations, explicit
+  arguments, neighbouring help/version actions, following
+  tokens), all passing; clippy clean. Known divergence,
+  unpinned and recorded in the test: after `--userguide`, a
+  subcommand with invalid arguments reports the subcommand's
+  parse error in the oracle but prints the guide in Rust;
+  a well-formed subcommand is only parsed, never run, by
+  both editions.
+- Remaining composite: multi-team export; then the edition
+  switch at parity and the generated-schema collapse.
