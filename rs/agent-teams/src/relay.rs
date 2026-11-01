@@ -302,6 +302,24 @@ pub fn confirm_peer(
 ) -> DataResult<()> {
     let _lock = lock_store(state)?;
     let mut store = load_store(state);
+    // One bot per team is a hard requirement: a sender ID already confirmed
+    // for a different team or host is a conflict, never a silent replacement.
+    if let Some(existing) = store_list(&store, "confirmed")
+        .iter()
+        .find(|c| c.get("sender_id").and_then(Value::as_str) == Some(sender_id))
+    {
+        let old_team = existing.get("team").and_then(Value::as_str).unwrap_or("");
+        let old_host = existing.get("host").and_then(Value::as_str).unwrap_or("");
+        if old_team != team || old_host != host {
+            return Err(DataError::new(
+                "relay-confirm-conflict",
+                format!(
+                    "sender {sender_id} is already confirmed for {old_team}@{old_host}; \
+                     refusing to silently remap it to {team}@{host} (one bot per team)"
+                ),
+            ));
+        }
+    }
     let confirmed = store
         .get_mut("confirmed")
         .and_then(Value::as_array_mut)
@@ -439,7 +457,19 @@ pub fn relay_in(
     let parsed = match parse_post(text) {
         Ok(parsed) => parsed,
         Err(reason) => {
-            let mut out = result(NOT_RECORDED, format!("unparseable relay post: {reason}"));
+            // Unparseable posts from a listed peer are stranger events:
+            // quarantine and alarm, never silently dropped. Provider
+            // formatting, splitting or truncation lands here.
+            let detail = format!("unparseable relay post: {reason}");
+            if let Err(error) =
+                record_unparseable_stranger(state, route, peer_sender, channel, text, &detail)
+            {
+                log_event(
+                    state,
+                    &json!({"event": "relay-in", "outcome": "stranger-record-failed", "route": route, "peer_sender": peer_sender, "detail": error.to_string()}),
+                );
+            }
+            let mut out = result(NOT_RECORDED, detail);
             out.receipt_text = Some(format!(
                 "agent-teams receipt: {NOT_RECORDED} (unparseable relay post)\n"
             ));
@@ -468,6 +498,18 @@ pub fn relay_in(
                 return Ok(result(NOT_RECORDED, "announcement integrity hash mismatch"));
             }
             let outcome = record_candidate(state, &announce, peer_sender, route)?;
+            if outcome == "candidate-conflict" {
+                // A second team claim for one confirmed sender ID is a
+                // conflict alarm, never a silent replacement.
+                let _ = record_unparseable_stranger(
+                    state,
+                    route,
+                    peer_sender,
+                    channel,
+                    text,
+                    "conflict: sender already confirmed for another team (one bot per team)",
+                );
+            }
             log_event(
                 state,
                 &json!({"event": "relay-in", "outcome": outcome, "route": route, "peer_sender": peer_sender, "team": announce.get("team")}),
@@ -525,22 +567,47 @@ pub fn relay_in(
             if is_banned(state, peer_sender) {
                 return Ok(result("banned-sender", "banned sender's receipt dropped"));
             }
+            // A receipt must arrive in the original post's thread: a
+            // top-level channel post (no thread) never settles anything.
+            if thread.is_empty() {
+                log_event(
+                    state,
+                    &json!({"event": "relay-in", "outcome": "receipt-refused", "route": route, "peer_sender": peer_sender, "id": id, "detail": "receipt not in a thread"}),
+                );
+                return Ok(result(
+                    "receipt-refused",
+                    "receipt did not arrive in the original post's thread",
+                ));
+            }
             let Some(mut entry) = read_outbox(state, &id) else {
                 return Ok(result("receipt-unknown", format!("no outbox entry {id}")));
             };
-            // The poster must speak for the fleet this message was sent to.
+            // The poster must speak for the exact team@host this message
+            // was sent to, confirmed on this route (never another route,
+            // fleet-only, or a different host of the same fleet).
             let to_fleet = entry["envelope"]["to"]["team"]
                 .as_str()
                 .unwrap_or("")
                 .to_string();
-            let poster_ok = confirmed_mapping(state, peer_sender)
-                .is_some_and(|(fleet, _)| fleet == to_fleet)
-                || load_declarations(state).is_ok_and(|declarations| {
+            let to_host = entry["envelope"]["to"]["host"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            let poster_ok =
+                confirmed_mapping_for(state, peer_sender, route).is_some_and(|(fleet, host)| {
+                    fleet == to_fleet && host.as_deref() == Some(to_host.as_str())
+                }) || load_declarations(state).is_ok_and(|declarations| {
                     declarations.iter().any(|(_, _, declaration)| {
                         declaration.relay_channels.iter().any(|entry| {
-                            entry.peers.get(peer_sender).is_some_and(|mapped| {
-                                mapped.split('@').next().unwrap_or(mapped) == to_fleet
-                            })
+                            (entry.route == route
+                                && (entry.channel.is_empty() || entry.channel == channel))
+                                && entry.peers.get(peer_sender).is_some_and(|mapped| {
+                                    let (fleet, host) = match mapped.split_once('@') {
+                                        Some((fleet, host)) => (fleet, Some(host)),
+                                        None => (mapped.as_str(), None),
+                                    };
+                                    fleet == to_fleet && host == Some(to_host.as_str())
+                                })
                         })
                     })
                 });
@@ -727,7 +794,7 @@ fn relay_in_envelope(
         .get(peer_sender)
         .map(String::as_str)
         .or_else(|| {
-            confirmed_mapping(state, peer_sender)
+            confirmed_mapping_for(state, peer_sender, route)
                 .filter(|(fleet, host)| {
                     fleet.as_str() == from_team
                         && host.as_deref().is_none_or(|host| host == from_host)
@@ -963,6 +1030,69 @@ pub fn ban_sender(state: &Path, sender_id: &str) -> DataResult<()> {
     write_json_atomic(&alarms_path(state), &doc)
 }
 
+/// Record an unparseable post as a STRANGER event. No envelope survived
+/// parsing, so quarantine is keyed by a hash of the raw post and the alarm
+/// carries no claimed team or host.
+fn record_unparseable_stranger(
+    state: &Path,
+    route: &str,
+    peer_sender: &str,
+    channel: &str,
+    text: &str,
+    reason: &str,
+) -> DataResult<()> {
+    let id = format!("unparseable-{}", &sha256_hex(text.as_bytes())[..12]);
+    let envelope = json!({"id": id, "from": Value::Null, "unparseable": true});
+    let declarations = load_declarations(state).unwrap_or_default();
+    for (_, _, declaration) in &declarations {
+        if let Some(entry) = declaration.relay_channels.iter().find(|entry| {
+            entry.route == route && (entry.channel.is_empty() || entry.channel == channel)
+        }) {
+            return record_stranger(
+                state,
+                declaration,
+                entry,
+                peer_sender,
+                &envelope,
+                text,
+                reason,
+            );
+        }
+    }
+    // No declaration matches this route: still quarantine durably and open
+    // an alarm against the first declaring team, so the post is never lost.
+    if let Some((_, _, declaration)) = declarations.first() {
+        if let Some(entry) = declaration.relay_channels.first() {
+            return record_stranger(
+                state,
+                declaration,
+                entry,
+                peer_sender,
+                &envelope,
+                text,
+                reason,
+            );
+        }
+    }
+    let _lock = lock_store(state)?;
+    let mut quarantine = load_json_list(&quarantine_path(state), "posts");
+    let posts = quarantine
+        .get_mut("posts")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| DataError::new("relay-quarantine", "posts is not a list"))?;
+    if !posts.iter().any(|post| {
+        post.get("id").and_then(Value::as_str) == Some(id.as_str())
+            && post.get("peer_sender").and_then(Value::as_str) == Some(peer_sender)
+    }) {
+        posts.push(json!({
+            "id": id, "peer_sender": peer_sender, "route": route,
+            "channel": channel, "envelope": envelope, "post": text,
+            "reason": reason, "quarantined_at": format_rfc3339_ms(now_unix_ms()),
+        }));
+    }
+    write_json_atomic(&quarantine_path(state), &quarantine)
+}
+
 /// Record a STRANGER event: quarantine the post (never delivered), open or
 /// refresh the alarm for this sender, and raise it to the team's
 /// coordinator at once. The alarm repeats until the sender is confirmed or
@@ -1119,17 +1249,19 @@ fn raise_alarm_at(state: &Path, index: usize, now_ms: i64) -> DataResult<bool> {
             .trim()
             .to_string()
     };
-    let claimed_team = claimed.get("team").and_then(Value::as_str).unwrap_or("?");
-    let claimed_host = claimed.get("host").and_then(Value::as_str).unwrap_or("?");
+    // Peer-controlled names never enter a coordinator notice verbatim:
+    // a name that fails validation renders as <invalid>, not cleaned text.
+    let claimed_team = claimed.get("team").and_then(Value::as_str).unwrap_or("");
+    let claimed_host = claimed.get("host").and_then(Value::as_str).unwrap_or("");
     let claimed_team = if crate::model::valid_team_name(claimed_team) {
         claimed_team.to_string()
     } else {
-        clean(Some(claimed_team))
+        "<invalid>".to_string()
     };
     let claimed_host = if crate::model::valid_host_name(claimed_host) {
         claimed_host.to_string()
     } else {
-        clean(Some(claimed_host))
+        "<invalid>".to_string()
     };
     let sender = clean(Some(&sender));
     let rendered = format!(
@@ -1311,19 +1443,22 @@ pub fn drain_quarantine(state: &Path, this_host: &str) -> DataResult<DrainOutcom
                 .and_then(|f| f.get("host"))
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            let admitted =
-                declaration.relay_channels.iter().any(|entry| {
-                    entry.peers.get(&peer_sender).is_some_and(|mapped| {
-                        let (fleet, host) = match mapped.split_once('@') {
-                            Some((fleet, host)) => (fleet, Some(host)),
-                            None => (mapped.as_str(), None),
-                        };
-                        fleet == from_team && host.is_none_or(|host| host == from_host)
-                    })
-                }) || confirmed_mapping(state, &peer_sender).is_some_and(|(fleet, host)| {
-                    fleet.as_str() == from_team
-                        && host.as_deref().is_none_or(|host| host == from_host)
-                });
+            let admitted = declaration.relay_channels.iter().any(|entry| {
+                entry.peers.get(&peer_sender).is_some_and(|mapped| {
+                    let (fleet, host) = match mapped.split_once('@') {
+                        Some((fleet, host)) => (fleet, Some(host)),
+                        None => (mapped.as_str(), None),
+                    };
+                    fleet == from_team && host.is_none_or(|host| host == from_host)
+                })
+            }) || confirmed_mapping_for(
+                state,
+                &peer_sender,
+                post.get("route").and_then(Value::as_str).unwrap_or(""),
+            )
+            .is_some_and(|(fleet, host)| {
+                fleet.as_str() == from_team && host.as_deref().is_none_or(|host| host == from_host)
+            });
             if !admitted || is_banned(state, &peer_sender) {
                 break 'deliver false;
             }

@@ -72,7 +72,7 @@ impl World {
             r#"{{
   "schema": "agent-teams-routes/v1",
   "routes": {{"relay-coord": {{
-    "driver": "command", "mode": "relay", "channel": "{CHAN}", "sender_id": "{BOT1}",
+    "driver": "command", "mode": "relay", "channel": "{CHAN}", "sender_id": "UBOTTOOLS",
     "post_argv": ["{}", "post", "--channel", "{{channel}}", "--text-file", "{{text_file}}"],
     "list_argv": ["{}", "list", "--channel", "{{channel}}"],
     "max_envelope_bytes": 10000, "limits": {{"per_hour": 100}}
@@ -457,6 +457,193 @@ fn banned_stranger_stops_the_alarm() {
     );
     let (_code, out, _) = world.run(&["relay", "alarms"]);
     assert!(out.contains("no open stranger alarms"), "{out}");
+}
+
+#[test]
+fn unparseable_listed_peer_post_is_quarantined_and_alarmed() {
+    let world = World::new();
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    let outcome = world.relay_in(BOT1, "mangled by the provider, no fence here");
+    assert_eq!(outcome["outcome"], "not-recorded", "{outcome}");
+    let quarantine =
+        std::fs::read_to_string(world.state.join("relay/quarantine.json")).expect("quarantine");
+    assert!(quarantine.contains(BOT1), "{quarantine}");
+    let (_code, out, _) = world.run(&["relay", "alarms"]);
+    assert!(out.contains(BOT1), "alarm is loud: {out}");
+    assert!(
+        !world
+            .hook_inbox_texts("tools")
+            .iter()
+            .any(|text| text.contains("mangled by the provider")),
+        "unparseable post never delivered"
+    );
+}
+
+#[test]
+fn receipt_from_wrong_host_is_refused_and_own_bot_envelope_ignored() {
+    let world = World::new();
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    let (id, post) = world.send_sim_to_tools("receipt host check", "relay-f5-1");
+    let outcome = world.relay_in(BOT1, &post);
+    assert_eq!(outcome["outcome"], "accepted", "{outcome}");
+    let receipt = outcome["receipt_text"]
+        .as_str()
+        .expect("receipt")
+        .to_string();
+    // Confirm a bot for the same fleet on a different host: its receipt
+    // must not settle a message addressed to tools@host-a.
+    let announce = agent_teams::relay::build_announce(
+        "tools",
+        "host-b",
+        "UBOTWRONGHOST",
+        "https://example.invalid/org/repo.git",
+    );
+    let outcome = world.relay_in(
+        "UBOTWRONGHOST",
+        &agent_teams::relay::render_announce(&announce),
+    );
+    assert_eq!(outcome["outcome"], "candidate-recorded", "{outcome}");
+    let (code, out, err) = world.run(&["relay", "confirm", "UBOTWRONGHOST", "--owner-approved"]);
+    assert_eq!(code, 0, "{out} {err}");
+    let outcome = world.relay_in("UBOTWRONGHOST", &receipt);
+    assert_eq!(outcome["outcome"], "receipt-refused", "{outcome}");
+    let (_code, out, _) = world.run(&["status", &id, "--json"]);
+    assert!(
+        out.contains("in-custody"),
+        "not settled by wrong host: {out}"
+    );
+    // Our own bot's envelope post loops back and is ignored, not delivered.
+    let outcome = world.relay_in("UBOTTOOLS", &post);
+    assert_eq!(outcome["outcome"], "ignored-own-bot", "{outcome}");
+}
+
+#[test]
+fn alarm_renders_invalid_claimed_names_and_confirm_conflict_is_refused() {
+    let world = World::new();
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    let envelope = agent_teams::envelope::build_envelope(
+        "tm-sim-eeeeeeeeffffffff",
+        "kf6",
+        "Bad Team ESCALATE",
+        "bad host!",
+        1,
+        "harness-ancestry",
+        "tools",
+        "host-a",
+        "info",
+        None,
+        &[],
+        false,
+        agent_teams::timeutil::now_unix_ms(),
+        agent_teams::timeutil::now_unix_ms() + 7_200_000,
+        None,
+        "alarm body",
+    );
+    let outcome = world.relay_in("UCLAIMBOT", &agent_teams::relay::render_post(&envelope));
+    assert_eq!(outcome["outcome"], "stranger-quarantined", "{outcome}");
+    let notices = world.hook_inbox_texts("tools").join("\n");
+    assert!(
+        notices.contains("<invalid>"),
+        "invalid names marked: {notices}"
+    );
+    assert!(
+        !notices.contains("Bad Team ESCALATE"),
+        "no peer text: {notices}"
+    );
+    // A second, different team claim for one confirmed sender is refused.
+    let first = agent_teams::relay::build_announce(
+        "tools",
+        "host-a",
+        "UDUALBOT",
+        "https://example.invalid/org/repo.git",
+    );
+    world.relay_in("UDUALBOT", &agent_teams::relay::render_announce(&first));
+    let (code, out, err) = world.run(&["relay", "confirm", "UDUALBOT", "--owner-approved"]);
+    assert_eq!(code, 0, "{out} {err}");
+    let second = agent_teams::relay::build_announce(
+        "sim",
+        "host-a",
+        "UDUALBOT",
+        "https://example.invalid/org/repo.git",
+    );
+    let outcome = world.relay_in("UDUALBOT", &agent_teams::relay::render_announce(&second));
+    assert_eq!(outcome["outcome"], "candidate-conflict", "{outcome}");
+    let alarms = std::fs::read_to_string(world.state.join("relay/alarms.json")).expect("alarms");
+    assert!(
+        alarms.contains("conflict"),
+        "conflict alarm raised: {alarms}"
+    );
+    let peers = std::fs::read_to_string(world.state.join("relay/peers.json")).expect("peers");
+    assert!(peers.contains("\"tools\""), "mapping not replaced: {peers}");
+    assert!(!peers.contains("\"sim\""), "mapping not replaced: {peers}");
+}
+
+#[test]
+fn long_envelope_survives_and_truncated_post_is_quarantined() {
+    let world = World::new();
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    let body = "x".repeat(7_000);
+    let envelope = agent_teams::envelope::build_envelope(
+        "tm-sim-1212121234343434",
+        "klong",
+        "sim",
+        "host-a",
+        1,
+        "harness-ancestry",
+        "tools",
+        "host-a",
+        "info",
+        None,
+        &[],
+        false,
+        agent_teams::timeutil::now_unix_ms(),
+        agent_teams::timeutil::now_unix_ms() + 7_200_000,
+        None,
+        &body,
+    );
+    let post = agent_teams::relay::render_post(&envelope);
+    let outcome = world.relay_in(BOT1, &post);
+    assert_eq!(outcome["outcome"], "accepted", "{outcome}");
+    // A provider-split half is unparseable: quarantined, never silent.
+    let half = &post[..post.len() / 2];
+    let outcome = world.relay_in(BOT1, half);
+    assert_eq!(outcome["outcome"], "not-recorded", "{outcome}");
+    let quarantine =
+        std::fs::read_to_string(world.state.join("relay/quarantine.json")).expect("quarantine");
+    assert!(quarantine.contains("unparseable-"), "{quarantine}");
+}
+
+#[test]
+fn confirmation_on_another_route_does_not_admit_here() {
+    let world = World::new();
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    let (id, post) = world.send_sim_to_tools("route scope check", "relay-f8-1");
+    let outcome = world.relay_in(BOT1, &post);
+    assert_eq!(outcome["outcome"], "accepted", "{outcome}");
+    let receipt = outcome["receipt_text"]
+        .as_str()
+        .expect("receipt")
+        .to_string();
+    let announce = agent_teams::relay::build_announce(
+        "tools",
+        "host-a",
+        "UBOTTOOLS",
+        "https://example.invalid/org/repo.git",
+    );
+    world.relay_in("UBOTTOOLS", &agent_teams::relay::render_announce(&announce));
+    let (code, out, err) = world.run(&["relay", "confirm", "UBOTTOOLS", "--owner-approved"]);
+    assert_eq!(code, 0, "{out} {err}");
+    // Move the confirmation to a different route: it must no longer
+    // settle receipts arriving on relay-coord.
+    let path = world.state.join("relay/peers.json");
+    let mut store: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("peers")).expect("json");
+    store["confirmed"][0]["route"] = serde_json::json!("other-route");
+    std::fs::write(&path, store.to_string()).expect("rewrite peers");
+    let outcome = world.relay_in("UBOTTOOLS", &receipt);
+    assert_eq!(outcome["outcome"], "receipt-refused", "{outcome}");
+    let (_code, out, _) = world.run(&["status", &id, "--json"]);
+    assert!(out.contains("in-custody"), "not settled cross-route: {out}");
 }
 
 #[test]

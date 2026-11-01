@@ -1153,11 +1153,20 @@ fn routes_for_host(
         .agent_teams
         .clone()
         .unwrap_or_else(|| "agent-teams".to_string());
+    // The chat relay is always the fallback: it never precedes a direct
+    // (ssh / node-exec / local) route, whatever order teams.json lists.
+    let mut ordered: Vec<&String> = host.routes.iter().collect();
+    ordered.sort_by_key(|name| {
+        routes
+            .routes
+            .get(name.as_str())
+            .is_some_and(crate::route::is_relay_def)
+    });
     let mut out = Vec::new();
-    for name in &host.routes {
+    for name in ordered {
         let def = routes
             .routes
-            .get(name)
+            .get(name.as_str())
             .ok_or_else(|| err("unknown-route", format!("route {name:?} is not defined")))?;
         out.push(route_for(
             def,
@@ -1611,6 +1620,23 @@ fn cmd_pump(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
                 continue;
             };
             let state = entry["state"].as_str().unwrap_or("deferred").to_string();
+            // In-custody (posted to the relay, awaiting its thread receipt)
+            // gets a deadline: 15 minutes after its last attempt pump
+            // re-walks it. Where a receipt-capable route exists the walk
+            // asks for the receipt; on a relay-only route it surfaces as
+            // ambiguous (loud, exit 76) instead of sitting silent forever.
+            let last_attempt_ms = entry["attempts"]
+                .as_array()
+                .and_then(|list| list.last())
+                .and_then(|attempt| attempt["at"].as_str())
+                .and_then(crate::timeutil::parse_rfc3339_ms)
+                .or_else(|| {
+                    entry["created_at"]
+                        .as_str()
+                        .and_then(crate::timeutil::parse_rfc3339_ms)
+                });
+            let stale_custody = state == "in-custody"
+                && last_attempt_ms.is_some_and(|at| now_unix_ms() - at > 900_000);
             // `undeliverable` is only what the first #721 build stored;
             // current builds store `deferred` with the reason beside it.
             let retryable = if deferred_only {
@@ -1619,7 +1645,8 @@ fn cmd_pump(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
                 matches!(
                     state.as_str(),
                     "deferred" | "ambiguous" | "accepted" | "claimed" | "undeliverable"
-                ) || (retry_refused && state == "refused")
+                ) || stale_custody
+                    || (retry_refused && state == "refused")
             };
             if !retryable {
                 continue;
@@ -1987,6 +2014,28 @@ fn cmd_relay_in(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
         .map_err(|e| err("io", e.to_string()))?;
     // Any relay activity re-raises overdue stranger alarms.
     let _ = crate::relay::raise_due_alarms(&globals.state, now_unix_ms());
+    // This bridge's own bot posts in the channel (its envelope posts and
+    // receipts echo back): an envelope from our own bot is a loop-back,
+    // never a peer delivery. One bot per team is a hard requirement, so a
+    // peer ID equal to our own bot ID is a setup error, not a peer.
+    if let Ok(routes) = globals.load_routes() {
+        let own_bot = routes.routes.values().any(|def| {
+            crate::route::is_relay_def(def)
+                && def.raw.get("sender_id").and_then(Value::as_str) == Some(peer_sender.as_str())
+        });
+        if own_bot
+            && matches!(
+                crate::relay::parse_post(&text),
+                Ok(crate::relay::RelayPost::Envelope(_))
+            )
+        {
+            println!(
+                "{}",
+                json!({"outcome": "ignored-own-bot", "detail": "envelope posted by this bridge's own bot; peer IDs must differ from the own bot ID (one bot per team)", "receipt_text": null, "receipt_posted": false})
+            );
+            return Ok(0);
+        }
+    }
     let out = crate::relay::relay_in(
         &globals.state,
         &globals.host,
@@ -2394,9 +2443,10 @@ fn cmd_relay_confirm(globals: &Globals, args: &[String]) -> Result<i32, DataErro
                                                     .get(&sender)
                                                     .and_then(Value::as_str)
                                                     .is_some_and(|mapped| {
-                                                        mapped == team
-                                                            || mapped
-                                                                .starts_with(&format!("{team}@"))
+                                                        // Mappings name TEAM@HOST; compare
+                                                        // the fleet part, not the whole string.
+                                                        mapped.split('@').next()
+                                                            == Some(team.as_str())
                                                     })
                                             },
                                         )

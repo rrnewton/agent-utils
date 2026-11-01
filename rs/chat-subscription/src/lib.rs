@@ -1055,9 +1055,11 @@ pub struct SubscribeRequest {
     channel_ids: Vec<ChannelId>,
     allowed_senders: Vec<SenderId>,
     relay_senders: Vec<SenderId>,
+    relay_channels: Vec<ChannelId>,
     channel_membership: HashSet<ChannelId>,
     sender_membership: HashSet<SenderId>,
     relay_membership: HashSet<SenderId>,
+    relay_channel_membership: HashSet<ChannelId>,
     resume_from: Option<ProviderCursor>,
     backend_configuration: Option<BackendConfiguration>,
 }
@@ -1106,9 +1108,11 @@ impl SubscribeRequest {
             channel_membership,
             sender_membership,
             relay_membership: HashSet::new(),
+            relay_channel_membership: HashSet::new(),
             channel_ids,
             allowed_senders,
             relay_senders: Vec::new(),
+            relay_channels: Vec::new(),
             resume_from,
             backend_configuration: None,
         })
@@ -1151,6 +1155,32 @@ impl SubscribeRequest {
     #[must_use]
     pub fn relay_senders(&self) -> &[SenderId] {
         &self.relay_senders
+    }
+
+    /// Attach relay channels: channels where any poster's post may be
+    /// delivered so the host can quarantine and alarm it as a stranger.
+    /// Posts there never create tasks; the host classifies them. Channels
+    /// must already be subscription channels.
+    pub fn with_relay_channels(
+        mut self,
+        relay_channels: Vec<ChannelId>,
+    ) -> Result<Self, ValidationError> {
+        for channel in &relay_channels {
+            if !self.channel_membership.contains(channel) {
+                return Err(ValidationError::new(
+                    "a relay channel must also be a subscription channel".to_owned(),
+                ));
+            }
+        }
+        self.relay_channel_membership = relay_channels.iter().cloned().collect();
+        self.relay_channels = relay_channels;
+        Ok(self)
+    }
+
+    /// Return the relay channels (stranger posts there are deliverable).
+    #[must_use]
+    pub fn relay_channels(&self) -> &[ChannelId] {
+        &self.relay_channels
     }
 
     /// Attach explicit non-secret provider resource configuration from the host.
@@ -1332,6 +1362,7 @@ pub struct ChatSubscription {
     channel_membership: HashSet<ChannelId>,
     sender_membership: HashSet<SenderId>,
     relay_membership: HashSet<SenderId>,
+    relay_channel_membership: HashSet<ChannelId>,
     last_sequence: Option<EventSequence>,
     outstanding: Option<DeliveryBatch>,
     needs_initial_boundary: bool,
@@ -1369,6 +1400,7 @@ impl ChatSubscription {
             channel_membership: request.channel_membership.clone(),
             sender_membership: request.sender_membership.clone(),
             relay_membership: request.relay_membership.clone(),
+            relay_channel_membership: request.relay_channel_membership.clone(),
             last_sequence: None,
             outstanding: None,
             needs_initial_boundary: request.resume_from().is_none(),
@@ -1478,9 +1510,13 @@ impl ChatSubscription {
                         // Allowed (owner) senders and relay delivery
                         // authorities may both be delivered; the host
                         // classifies relay posts and never turns them into
-                        // tasks. Nobody else may be delivered at all.
+                        // tasks. In a relay channel any poster may be
+                        // delivered so the host can quarantine and alarm a
+                        // stranger; nowhere else may an unlisted sender be
+                        // delivered at all.
                         if !self.sender_membership.contains(message.sender_id())
                             && !self.relay_membership.contains(message.sender_id())
+                            && !self.relay_channel_membership.contains(message.channel_id())
                         {
                             self.poisoned = true;
                             return Err(SubscriptionError::MessageOutsideSenderAuthority);
@@ -2148,6 +2184,51 @@ mod tests {
             Err(SubscriptionError::MessageOutsideSenderAuthority)
         );
         assert!(message_subscription.is_poisoned());
+    }
+
+    #[test]
+    fn stranger_in_relay_channel_is_delivered_but_nowhere_else() {
+        let relay_request = SubscribeRequest::new(
+            vec![
+                ChannelId::new("channels/one").expect("channel"),
+                ChannelId::new("channels/relay").expect("channel"),
+            ],
+            vec![SenderId::new("users/owner").expect("sender")],
+            None,
+        )
+        .expect("request")
+        .with_relay_channels(vec![ChannelId::new("channels/relay").expect("channel")])
+        .expect("relay channels");
+        let mut backend = Backend {
+            capabilities: capabilities(),
+            items: Some(VecDeque::from([SubscriptionItem::Batch(
+                DeliveryBatch::new(
+                    EventSequence::new(1).expect("sequence"),
+                    ProviderCursor::new("cursor").expect("cursor"),
+                    DeliveryId::new("delivery").expect("delivery"),
+                    vec![
+                        CommittableEvent::Checkpoint,
+                        CommittableEvent::message_created(message(
+                            "channels/relay",
+                            "users/stranger",
+                            "relay stranger post",
+                            Some(provider_payload(serde_json::json!({}))),
+                        )),
+                    ],
+                )
+                .expect("batch"),
+            )])),
+        };
+        let mut subscription =
+            ChatSubscription::open(&mut backend, &relay_request).expect("subscription opens");
+        assert!(
+            matches!(
+                subscription.next_item(),
+                Ok(Some(SubscriptionItem::Batch(_)))
+            ),
+            "stranger in relay channel delivered for quarantine"
+        );
+        assert!(!subscription.is_poisoned());
     }
 
     #[test]

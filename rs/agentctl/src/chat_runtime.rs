@@ -980,6 +980,48 @@ impl BridgeConfiguration {
                 }
             }
         }
+        // One bot per team is a hard requirement: one sender ID speaking
+        // for two teams (in any channel) mis-maps both directions.
+        {
+            let mut seen: BTreeMap<&str, &str> = BTreeMap::new();
+            for entry in &self.relay_channels {
+                for (sender, team) in &entry.peer_senders {
+                    if let Some(other) = seen.insert(sender, team) {
+                        if other != team {
+                            return Err(ChatRuntimeError::invalid(format!(
+                                "relay peer sender {sender:?} is mapped to both {other:?} and {team:?}: one bot per team is required; give each team its own bot"
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+        // The provider plugin's peer list is derived from this bridge's:
+        // a backend_configuration relay peer list that disagrees would let
+        // the provider admit a sender the bridge classifies differently.
+        if let Some(backend) = &self.backend_configuration {
+            if let Some(channels) = backend.data.get("relay_channels").and_then(Value::as_array) {
+                for item in channels {
+                    let channel = item.get("channel").and_then(Value::as_str).unwrap_or("");
+                    let bridge_peers: std::collections::BTreeSet<&str> = self
+                        .relay_channels
+                        .iter()
+                        .filter(|entry| entry.channel == channel)
+                        .flat_map(|entry| entry.peer_senders.keys().map(String::as_str))
+                        .collect();
+                    let backend_peers: std::collections::BTreeSet<&str> = item
+                        .get("peer_senders")
+                        .and_then(Value::as_array)
+                        .map(|list| list.iter().filter_map(Value::as_str).collect())
+                        .unwrap_or_default();
+                    if bridge_peers != backend_peers {
+                        return Err(ChatRuntimeError::invalid(format!(
+                            "backend relay peer list for channel {channel:?} drifts from the bridge relay_channels list; derive the plugin list from the bridge list"
+                        )));
+                    }
+                }
+            }
+        }
         if let Some(range) = self.reply_alias_range {
             if range.first == 0 || range.first > range.last {
                 return Err(ChatRuntimeError::invalid(format!(
@@ -1080,6 +1122,15 @@ impl BridgeConfiguration {
             .map_err(ChatRuntimeError::invalid)?;
         let request = request
             .with_relay_senders(relay_senders)
+            .map_err(|error| ChatRuntimeError::invalid(error.to_string()))?;
+        let relay_channels = self
+            .relay_channels
+            .iter()
+            .map(|entry| ChannelId::new(entry.channel.clone()).map_err(|error| error.to_string()))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(ChatRuntimeError::invalid)?;
+        let request = request
+            .with_relay_channels(relay_channels)
             .map_err(|error| ChatRuntimeError::invalid(error.to_string()))?;
         match self.backend_configuration.as_ref() {
             Some(document) => {
@@ -5129,11 +5180,16 @@ pub struct RelayDispatch {
     pub channel_id: String,
     /// Authenticated poster sender ID.
     pub sender_id: String,
-    /// Team the sender is mapped to in this channel.
+    /// Team the sender is mapped to in this channel (`unlisted` for a
+    /// stranger routed to relay-in in stranger-only mode).
     pub peer_team: String,
     /// The command's reported outcome (`accepted`, `not-recorded`, ...),
     /// or `command-failed` when it did not report one.
     pub outcome: String,
+    /// Receipt text relay-in returned for the bridge to post in the thread.
+    pub receipt_text: Option<String>,
+    /// Whether the receipt is durably posted (by relay-in or this bridge).
+    pub receipt_posted: bool,
 }
 
 /// One bounded result of durably admitting an upstream acknowledgement unit.
@@ -6948,15 +7004,97 @@ impl BridgeState {
     /// again, and the receiver's ledger absorbs the duplicate (the
     /// exactly-once point is the receiving `agent-teams` ledger, never the
     /// bridge). This never creates a request and never types anything.
-    fn dispatch_relay_post(&self, message: &SavedMessage) -> String {
+    /// Record one failed relay dispatch. Failures below the retry bound
+    /// refuse admission, so the cursor never commits past a post whose
+    /// outcome is unknown; at the bound a durable alarm is written and the
+    /// batch may proceed, so a poison post cannot wedge owner traffic and
+    /// is never silently lost either way.
+    fn relay_dispatch_failed(&self, message: &SavedMessage, detail: &str) -> Result<String> {
+        let path = self.root.join("relay-failures.json");
+        let mut doc: Value = fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_else(|| serde_json::json!({"failures": {}}));
+        let count = {
+            let failures = doc
+                .get_mut("failures")
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| ChatRuntimeError::invalid("relay failures file is corrupt"))?;
+            let entry = failures
+                .entry(message.message_id.clone())
+                .or_insert_with(|| serde_json::json!({"count": 0}));
+            let next = entry.get("count").and_then(Value::as_u64).unwrap_or(0) + 1;
+            entry["count"] = serde_json::json!(next);
+            entry["last_detail"] = serde_json::json!(detail.chars().take(512).collect::<String>());
+            next
+        };
+        write_document(&path, &doc)?;
+        if count < 3 {
+            return Err(ChatRuntimeError::invalid(format!(
+                "relay dispatch for {} failed (attempt {count}/3): {detail}; cursor not committed",
+                message.message_id
+            )));
+        }
+        let alarm_path = self.root.join("relay-alarms.json");
+        let mut alarms: Value = fs::read_to_string(&alarm_path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_else(|| serde_json::json!({"alarms": []}));
+        if let Some(list) = alarms.get_mut("alarms").and_then(Value::as_array_mut) {
+            list.push(serde_json::json!({
+                "message_id": message.message_id, "channel_id": message.channel_id,
+                "sender_id": message.sender_id, "detail": detail,
+                "attempts": count, "at_millis": unix_millis(),
+            }));
+        }
+        write_document(&alarm_path, &alarms)?;
+        Ok("command-failed-alarmed".to_string())
+    }
+
+    fn relay_already_dispatched(&self, message_id: &str) -> bool {
+        fs::read_to_string(self.root.join("relay-dispatched.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .and_then(|doc| doc.get("message_ids").and_then(Value::as_array).cloned())
+            .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(message_id)))
+    }
+
+    fn relay_note_dispatched(&self, message_id: &str) -> Result<()> {
+        let path = self.root.join("relay-dispatched.json");
+        let mut doc: Value = fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_else(|| serde_json::json!({"message_ids": []}));
+        if let Some(list) = doc.get_mut("message_ids").and_then(Value::as_array_mut) {
+            if !list.iter().any(|id| id.as_str() == Some(message_id)) {
+                list.push(serde_json::json!(message_id));
+            }
+            if list.len() > 4096 {
+                let excess = list.len() - 4096;
+                list.drain(0..excess);
+            }
+        }
+        write_document(&path, &doc)
+    }
+
+    /// Dispatch result: `(outcome, receipt_text, receipt_posted)`.
+    fn dispatch_relay_post(
+        &self,
+        message: &SavedMessage,
+    ) -> Result<(String, Option<String>, bool)> {
         use std::io::Write as _;
+        if self.relay_already_dispatched(&message.message_id) {
+            return Ok(("duplicate-skipped".to_string(), None, true));
+        }
+        let failed = |detail: &str| self.relay_dispatch_failed(message, detail);
         let Some(entry) = self
             .config
             .relay_channels
             .iter()
             .find(|entry| entry.channel == message.channel_id)
         else {
-            return "command-failed".to_string();
+            return failed("no relay channel configured for this channel")
+                .map(|outcome| (outcome, None, false));
         };
         let mut argv: Vec<String> = entry.command.clone();
         argv.extend([
@@ -6968,17 +7106,20 @@ impl BridgeState {
             message.thread_id.clone(),
         ]);
         let Some((program, args)) = argv.split_first() else {
-            return "command-failed".to_string();
+            return failed("relay command argv is empty").map(|outcome| (outcome, None, false));
         };
         let spawned = std::process::Command::new(program)
             .args(args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .spawn();
         let mut child = match spawned {
             Ok(child) => child,
-            Err(_) => return "command-failed".to_string(),
+            Err(error) => {
+                return failed(&format!("relay command failed to start: {error}"))
+                    .map(|outcome| (outcome, None, false))
+            }
         };
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(message.text.as_bytes());
@@ -6994,26 +7135,85 @@ impl BridgeState {
                 }
                 _ => {
                     let _ = child.kill();
-                    return "command-failed".to_string();
+                    return failed("relay command timed out after 30s")
+                        .map(|outcome| (outcome, None, false));
                 }
             }
         }
         let output = match child.wait_with_output() {
             Ok(output) => output,
-            Err(_) => return "command-failed".to_string(),
+            Err(error) => {
+                return failed(&format!("relay command wait failed: {error}"))
+                    .map(|outcome| (outcome, None, false))
+            }
         };
+        let stderr = String::from_utf8_lossy(&output.stderr);
         if !output.status.success() {
-            return "command-failed".to_string();
+            return failed(&format!(
+                "relay command exit {}: {}",
+                output.status.code().unwrap_or(-1),
+                stderr.trim()
+            ))
+            .map(|outcome| (outcome, None, false));
         }
         let stdout = String::from_utf8_lossy(&output.stdout);
         for line in stdout.lines() {
             if let Ok(value) = serde_json::from_str::<Value>(line.trim()) {
                 if let Some(outcome) = value.get("outcome").and_then(Value::as_str) {
-                    return outcome.to_string();
+                    let receipt_text = value
+                        .get("receipt_text")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    let mut receipt_posted = value
+                        .get("receipt_posted")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    // The bridge posts relay-in's receipt in the thread
+                    // itself when relay-in did not (no receipt_argv).
+                    if let Some(text) = &receipt_text {
+                        if !receipt_posted {
+                            match self.outbound_transport() {
+                                Ok(Some(mut transport)) => {
+                                    let submission = ReplySubmission {
+                                        channel_id: &message.channel_id,
+                                        thread_id: &message.thread_id,
+                                        body: text,
+                                        request_id: &message.message_id,
+                                    };
+                                    match transport.send(submission) {
+                                        Ok(_) => receipt_posted = true,
+                                        Err(error) => {
+                                            return failed(&format!("receipt post failed: {error}"))
+                                                .map(|outcome| (outcome, None, false))
+                                        }
+                                    }
+                                }
+                                Ok(None) => {
+                                    return failed(
+                                        "relay-in returned a receipt but no outbound \
+                                         helper is configured to post it",
+                                    )
+                                    .map(|outcome| (outcome, None, false))
+                                }
+                                Err(error) => {
+                                    return failed(&format!(
+                                        "receipt outbound unavailable: {error}"
+                                    ))
+                                    .map(|outcome| (outcome, None, false))
+                                }
+                            }
+                        }
+                    }
+                    self.relay_note_dispatched(&message.message_id)?;
+                    return Ok((outcome.to_string(), receipt_text, receipt_posted));
                 }
             }
         }
-        "command-failed".to_string()
+        failed(&format!(
+            "relay command reported no outcome (stderr: {})",
+            stderr.trim()
+        ))
+        .map(|outcome| (outcome, None, false))
     }
 
     /// Admit one provider batch durably.
@@ -7279,20 +7479,38 @@ impl BridgeState {
                         {
                             Some(peer_team) => {
                                 let peer_team = peer_team.to_owned();
-                                let outcome = self.dispatch_relay_post(&source);
+                                let (outcome, receipt_text, receipt_posted) =
+                                    self.dispatch_relay_post(&source)?;
                                 relay_dispatches.push(RelayDispatch {
                                     channel_id: source.channel_id.clone(),
                                     sender_id: source.sender_id.clone(),
                                     peer_team,
                                     outcome,
+                                    receipt_text,
+                                    receipt_posted,
                                 });
                             }
-                            None => {
+                            None if self.config.allowed_senders.contains(&source.sender_id) => {
                                 rejection_candidates.push(rejections::RejectionCandidate::new(
                                     &source.channel_id,
                                     &source.message_id,
                                     &source.sender_id,
                                 ));
+                            }
+                            None => {
+                                // Unlisted stranger in a relay channel:
+                                // route to relay-in in stranger-only mode
+                                // (quarantine plus alarm, never delivery).
+                                let (outcome, receipt_text, receipt_posted) =
+                                    self.dispatch_relay_post(&source)?;
+                                relay_dispatches.push(RelayDispatch {
+                                    channel_id: source.channel_id.clone(),
+                                    sender_id: source.sender_id.clone(),
+                                    peer_team: "unlisted".to_string(),
+                                    outcome,
+                                    receipt_text,
+                                    receipt_posted,
+                                });
                             }
                         }
                         continue;
@@ -18721,6 +18939,79 @@ mod tests {
             ))
             .expect("admit owner post");
         assert_eq!(admission.new_request_keys.len(), 1);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(script_root).unwrap();
+    }
+
+    #[test]
+    fn relay_failure_blocks_cursor_then_alarms_and_strangers_dispatch() {
+        let script_root = temporary("relay-fail-command");
+        fs::create_dir_all(&script_root).expect("script root");
+        let script_path = script_root.join("fail.sh");
+        fs::write(&script_path, "#!/bin/sh\necho boom >&2\nexit 3\n").expect("script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))
+                .expect("script permissions");
+        }
+        let mut configuration = config();
+        configuration.channel_ids = vec!["spaces/example".to_owned(), "relay/channel".to_owned()];
+        configuration.relay_channels = vec![RelayChannelConfig {
+            channel: "relay/channel".to_owned(),
+            peer_senders: BTreeMap::from([("bots/peer".to_owned(), "sim@host-b".to_owned())]),
+            command: vec![script_path.to_string_lossy().into_owned()],
+        }];
+        // One sender mapped to two teams is a setup error (one bot per team).
+        let mut shared = configuration.clone();
+        shared.relay_channels.push(RelayChannelConfig {
+            channel: "relay/other".to_owned(),
+            peer_senders: BTreeMap::from([("bots/peer".to_owned(), "tools@host-b".to_owned())]),
+            command: vec![script_path.to_string_lossy().into_owned()],
+        });
+        shared.channel_ids.push("relay/other".to_owned());
+        assert!(shared.validate().is_err(), "shared bot refused");
+        // A temporary grant to a relay peer is refused.
+        let root = temporary("relay-fail-admission");
+        let state = BridgeState::initialize(&root, configuration).expect("initialize state");
+        assert!(
+            state
+                .grant_senders(&["bots/peer".to_owned()], Duration::from_secs(60), None)
+                .is_err(),
+            "grant to relay peer refused"
+        );
+        let batch = |sequence: u64| {
+            let message = InboundMessage::new(
+                ChannelId::new("relay/channel").expect("channel"),
+                MessageId::new(format!("relay/channel/messages/{sequence}")).expect("message"),
+                ThreadId::new(format!("relay/channel/threads/{sequence}")).expect("thread"),
+                SenderId::new("bots/stranger").expect("sender"),
+                "stranger post",
+                "2026-09-21T12:00:00Z",
+                false,
+            )
+            .expect("normalized message");
+            DeliveryBatch::new(
+                EventSequence::new(sequence).expect("sequence"),
+                ProviderCursor::new(format!("cursor-{sequence}")).expect("cursor"),
+                DeliveryId::new(format!("delivery-{sequence}")).expect("delivery"),
+                vec![CommittableEvent::message_created(message)],
+            )
+            .expect("delivery")
+        };
+        // Unknown outcome is an admission failure: no cursor commit.
+        assert!(state.admit_batch(&batch(1)).is_err());
+        assert_eq!(state.cursor().expect("cursor"), None);
+        assert!(state.admit_batch(&batch(1)).is_err());
+        // Third failure writes a durable alarm and lets the batch proceed.
+        let admission = state.admit_batch(&batch(1)).expect("alarmed admission");
+        assert_eq!(admission.relay_dispatches.len(), 1);
+        assert_eq!(admission.relay_dispatches[0].peer_team, "unlisted");
+        assert_eq!(
+            admission.relay_dispatches[0].outcome,
+            "command-failed-alarmed"
+        );
+        assert!(root.join("relay-alarms.json").exists(), "durable alarm");
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(script_root).unwrap();
     }

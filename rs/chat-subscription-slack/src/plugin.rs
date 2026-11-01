@@ -1224,8 +1224,14 @@ impl SlackDriver {
                 .get(&message.channel_id)
                 .is_some_and(|peers| peers.iter().any(|peer| peer == user))
         });
+        // In a relay channel only, an unlisted bot or user post is also
+        // admitted so the bridge can route it to relay-in in stranger-only
+        // mode (quarantine plus alarm, never delivery, never a request).
+        // Announcements from new bots are discoverable only this way.
+        let relay_channel = self.config.relay_peers.contains_key(&message.channel_id);
         if message.subtype.as_deref().is_some_and(|subtype| {
-            !MESSAGE_SUBTYPES.contains(&subtype) && !(subtype == "bot_message" && relay_peer)
+            !MESSAGE_SUBTYPES.contains(&subtype)
+                && !(subtype == "bot_message" && (relay_peer || relay_channel))
         }) {
             return Err("non-message subtype");
         }
@@ -1245,7 +1251,7 @@ impl SlackDriver {
         let Some(user) = message
             .user_id
             .as_deref()
-            .filter(|user| self.senders.contains(*user) || relay_peer)
+            .filter(|user| self.senders.contains(*user) || relay_peer || relay_channel)
         else {
             return Err("sender not allowed");
         };

@@ -1231,8 +1231,10 @@ fn a_reply_whose_thread_root_the_stream_never_carried_is_delivered_and_the_root_
 #[test]
 fn relay_peer_bot_posts_are_delivered_only_in_the_relay_channel() {
     // A listed peer bot's bot_message post in the relay channel is delivered
-    // to the bridge (which classifies it as relay, never a request); the
-    // same bot elsewhere, and any unlisted bot there, are not delivered.
+    // to the bridge (which classifies it as relay, never a request). An
+    // unlisted bot in that channel is also delivered, so the bridge can
+    // route it to relay-in in stranger-only mode (quarantine plus alarm,
+    // never delivery, never a request); unlisted bots elsewhere are not.
     let peer = "U0PEERBOT01";
     let fake = FakeTransport::new();
     fake.push_script(vec![
@@ -1247,6 +1249,8 @@ fn relay_peer_bot_posts_are_delivered_only_in_the_relay_channel() {
         json!({"relay_channels": [{"channel": CHANNEL, "peer_senders": [peer]}]}),
     )
     .with_relay_senders(vec![SenderId::new(peer).unwrap()])
+    .unwrap()
+    .with_relay_channels(vec![chat_subscription::ChannelId::new(CHANNEL).unwrap()])
     .unwrap();
     let mut subscription = ChatSubscription::open(&mut backend, &relay_request).unwrap();
     // The lineage checkpoint(s), then the peer's relay post.
@@ -1259,7 +1263,18 @@ fn relay_peer_bot_posts_are_delivered_only_in_the_relay_channel() {
     let message = single_message(&relay);
     assert_eq!(message.sender_id().as_str(), peer);
     assert_eq!(message.text(), "relay post");
-    // The unlisted bot produces no message batch; the next message is the owner's.
+    // The unlisted bot in the relay channel is delivered as a stranger.
+    let stranger = loop {
+        let batch = commit_next(&mut subscription);
+        if matches!(batch.events(), [CommittableEvent::MessageCreated(_)]) {
+            break batch;
+        }
+    };
+    assert_eq!(
+        single_message(&stranger).sender_id().as_str(),
+        "U0OTHERBOT1"
+    );
+    // Then the owner's post still works.
     let owner = loop {
         let batch = commit_next(&mut subscription);
         if matches!(batch.events(), [CommittableEvent::MessageCreated(_)]) {

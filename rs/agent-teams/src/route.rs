@@ -493,6 +493,9 @@ pub struct ChatRelayRoute {
     pub rate_file: PathBuf,
     /// IDs already posted by this process (the relay never reposts).
     pub posted: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Durable posted-ID file, so a restart does not repost and draw a
+    /// duplicate `accepted` receipt cycle.
+    pub posted_file: PathBuf,
 }
 
 impl ChatRelayRoute {
@@ -503,6 +506,28 @@ impl ChatRelayRoute {
             .filter_map(|line| line.trim().parse::<i64>().ok())
             .filter(|at| now - at < 3_600_000)
             .count() as u64
+    }
+    fn note_posted_id(&self, id: &str) {
+        self.posted
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(id.to_string());
+        if let Some(parent) = self.posted_file.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let mut ids: Vec<String> = std::fs::read_to_string(&self.posted_file)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        if !ids.iter().any(|existing| existing == id) {
+            ids.push(id.to_string());
+        }
+        if ids.len() > 4096 {
+            let excess = ids.len() - 4096;
+            ids.drain(0..excess);
+        }
+        let _ = std::fs::write(&self.posted_file, ids.join("\n"));
     }
     fn note_post(&self) {
         let now = crate::timeutil::now_unix_ms();
@@ -561,10 +586,7 @@ impl Route for ChatRelayRoute {
                 let text = crate::relay::render_post(payload);
                 match crate::relay::run_post_argv(&self.post_argv, &self.channel, "", &id, &text) {
                     Ok(_) => {
-                        self.posted
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .insert(id.clone());
+                        self.note_posted_id(&id);
                         self.note_post();
                         AttemptOutcome::Answered(json!({
                             "outcome": "posted", "state": "in-custody",
@@ -577,10 +599,7 @@ impl Route for ChatRelayRoute {
                         AttemptOutcome::NotDelivered(reason)
                     }
                     Err(reason) => {
-                        self.posted
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .insert(id.clone());
+                        self.note_posted_id(&id);
                         AttemptOutcome::Ambiguous(reason)
                     }
                 }
@@ -619,6 +638,16 @@ pub fn relay_route_for(
             })
             .unwrap_or_default()
     };
+    let posted_file = links_dir
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| links_dir.to_path_buf())
+        .join(format!("relay-{}-posted.txt", def.name));
+    let persisted: std::collections::HashSet<String> = std::fs::read_to_string(&posted_file)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect();
     ChatRelayRoute {
         name: def.name.clone(),
         channel: def
@@ -646,7 +675,8 @@ pub fn relay_route_for(
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| links_dir.to_path_buf())
             .join(format!("relay-{}.log", def.name)),
-        posted: std::sync::Mutex::new(std::collections::HashSet::new()),
+        posted_file,
+        posted: std::sync::Mutex::new(persisted),
     }
 }
 

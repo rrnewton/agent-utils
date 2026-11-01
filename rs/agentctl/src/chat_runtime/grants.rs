@@ -180,6 +180,23 @@ impl BridgeState {
         for sender in ids {
             validate_grant_sender(sender)?;
         }
+        // A temporary grant must never give a relay peer request authority
+        // in normal channels: relay peers are delivery authorities only.
+        {
+            let envelope = self.read_grant_configuration_locked()?;
+            for sender in ids {
+                if envelope
+                    .config
+                    .relay_channels
+                    .iter()
+                    .any(|entry| entry.peer_senders.contains_key(sender))
+                {
+                    return Err(ChatRuntimeError::invalid(format!(
+                        "sender {sender:?} is a relay peer and cannot be granted request authority"
+                    )));
+                }
+            }
+        }
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         FileExt::lock_exclusive(&state_lock).map_err(ChatRuntimeError::Io)?;

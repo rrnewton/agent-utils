@@ -485,8 +485,10 @@ pub enum Designation {
 /// One chat relay channel in a declaration (design section 10.6, provider-neutral):
 /// the receiving bridge admits only `peers` in `channel`, and each peer sender ID
 /// speaks for exactly one team (a fleet on one host: `FLEET@HOST` in relay mappings). One bot per
-/// team is the normal case; several IDs may map to the same team (for example a
-/// team's two per-team bots on Discord). `fleet`, when set, scopes the channel
+/// team is a hard requirement: a sender ID must never speak for two teams, and
+/// no peer ID may equal this bridge's own bot user ID (setup refuses both;
+/// several IDs may still map to the same team, for example a team's two
+/// per-team bots on Discord). `fleet`, when set, scopes the channel
 /// to one fleet: posts naming another fleet are refused there.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RelayChannel {
