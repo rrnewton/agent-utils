@@ -6500,7 +6500,7 @@ function markSearchHits(row, terms) {
 const rowsChosen = () => readRunsSuspended();
 
 // `#439 search-unmatched-separators`. The unmatched runs the reader has opened, in each view, as the
-// ids of their messages: as a collapsed run's opened state is kept (`openedReadRuns`), because the
+// ids of their messages: as a collapsed run's opened state is kept (`readRuns`), because the
 // rows are rebuilt under the reader. Held under the searches that chose the rows (`searchKey`) and
 // forgotten the moment any filter changes: an opened run is an act on THIS search's list, and a new
 // word typed is a new list. The thread cards keep theirs beside them (`openedCardGaps`).
@@ -11826,8 +11826,7 @@ function foldOneFromKeyboard(target) {
   const folded = foldedOnes.get(key) || new Set();
   for (const id of ids) folded.add(id);
   foldedOnes.set(key, folded);
-  const opened = openedReadRuns.get(key);
-  if (opened) for (const id of ids) opened.delete(id);
+  readRuns.close(key, ids);
   if (!ids.every((id) => doneState().archived.has(id))) guardQuietly(() => markRowDone(ids, at))();
   if (unpack !== null) {
     renderSideColumn();
@@ -25124,7 +25123,7 @@ async function changeChannelView(view, threadId = null, summary = null, origin =
   // ...and a landing made on an earlier visit is spent: a view this page held comes back with the
   // rows it was made on, at the scroll position it left, and must not hold the reader there again.
   entryState().landing = null;
-  if (view === "thread") openedReadRuns.delete(viewKey());
+  if (view === "thread") readRuns.forget(viewKey());
   ++loadState().generation;
   stopReading();
   readingMode = false;
@@ -41310,13 +41309,6 @@ const READ_MODE_TITLES = {
   hide: "Read messages are hidden. Tap to show them again.",
 };
 
-/**
- * How few rows a run of read messages may have and still collapse: two. A line in place of ONE row
- * saves nothing — the line is as tall as a short message — and would hide the reader's own words
- * between the two answers on either side of them, which is the commonest read message there is.
- */
-const READ_RUN_MIN_ROWS = 2;
-
 /** The mode the list is in: one of `READ_MODES`. Kept with the rest of the UI state. */
 let readMode = "show";
 
@@ -41329,16 +41321,29 @@ let readMode = "show";
 const READ_MODE_KEY = "vibe-talk.voice.read-mode";
 
 /**
- * The runs of read messages the reader has opened, per view (`viewKey`), as the ids of the messages
- * in them. Ids, because the rows are rebuilt by every read; and a run with any opened message in it
- * stays open as it grows, so a message that joins it later is recorded too. Forgotten when the mode
- * changes, and a thread's when it is entered, since entering lays the thread out afresh.
+ * The runs of read messages, and the ones the reader has opened, per view (`viewKey`), as the ids of
+ * the messages in them: web/src/present/rows (`createReadRuns`), which says why ids and when they are
+ * forgotten.
  */
-const openedReadRuns = new Map();
+const readRuns = createReadRuns();
+
+/**
+ * Where each row of `rows` goes under Fold read (web/src/present/rows `ReadRuns.plan`, which says the
+ * rule), what a row stands for being its messages' ids unless `idsFor` says otherwise.
+ *
+ * @param {Element[]} rows
+ * @param {string} key
+ * @param {(row: Element) => boolean} joins
+ * @param {(row: Element) => string[]} [idsFor]
+ * @param {Set<string>} [forcedIds]
+ */
+function readRunPlan(rows, key, joins, idsFor = idsOf, forcedIds = new Set()) {
+  return readRuns.plan(rows, key, joins, idsFor, forcedIds);
+}
 
 /**
  * The messages the reader folded away one by one (Shift+O, `#480 fold-one-message-key`), per view
- * as `openedReadRuns` is kept: ids, so a redraw draws them folded again, in any read mode — a
+ * as `readRuns` keeps opened runs: ids, so a redraw draws them folded again, in any read mode — a
  * thread being worked through keeps the parts closed up until their line is opened, which takes
  * them out of this set (`openReadRun`). In memory only, as an opened run is: a reload lays the
  * thread out afresh.
@@ -41568,72 +41573,6 @@ function applyReadRuns() {
 }
 
 /**
- * Where each row of `rows`, a list's rows in order, goes under Fold read: every run of at least
- * `READ_RUN_MIN_ROWS` rows next to each other that `joins` is a run, its first row the "head" its line
- * is drawn on and the rest its "members", with how many messages it stands for; the last row never
- * joins one. A run with a message the reader opened in it, in the list `key` names (`viewKey`), stays
- * open, and what has joined it since is remembered as opened with it. The one rule of the runs, for
- * the channel's list (`applyReadRuns`) and for each thread unpacked under its card (`unpackBlock`,
- * `#407 unpack-row-parity`), which differ only in what may join one.
- *
- * `idsFor` says what a row stands for in a run, for remembering it opened: its messages' ids, or over the
- * Threads view's cards a card's thread (`cardRunIds`, `#432 read-mode-unify`).
- *
- * @param {Element[]} rows
- * @param {string} key
- * @param {(row: Element) => boolean} joins
- * @param {(row: Element) => string[]} [idsFor]
- * @param {Set<string>} [forcedIds] Messages folded away one by one (`#480 fold-one-message-key`):
- *   a run holding one collapses however short it is — one message is a run when the reader folded
- *   it themselves — and the last row may join for one, where a read run never takes it.
- * @returns {Map<Element, {role: string, count: number}>}
- */
-function readRunPlan(rows, key, joins, idsFor = idsOf, forcedIds = new Set()) {
-  const opened = openedReadRuns.get(key) || new Set();
-  /** @type {Map<Element, {role: string, count: number}>} */
-  const placed = new Map();
-  let run = [];
-  const place = (part) => {
-    const ids = part.flatMap(idsFor);
-    part.forEach((row, index) => placed.set(row, { role: index === 0 ? "head" : "member", count: ids.length }));
-  };
-  const close = () => {
-    const ids = run.flatMap(idsFor);
-    const forced = ids.some((id) => forcedIds.has(id));
-    if (run.length >= READ_RUN_MIN_ROWS && ids.some((id) => opened.has(id)) && !forced) {
-      // Opened: it stays open as it grows, so what joined it since is remembered with it.
-      for (const id of ids) opened.add(id);
-    } else if (run.length >= READ_RUN_MIN_ROWS || forced) {
-      if (forced && ids.some((id) => opened.has(id))) {
-        // One folded away inside a run the reader opened: only its own stretch collapses, and
-        // the rest of the run stays open as it was left.
-        let part = [];
-        for (const row of run) {
-          if (idsFor(row).some((id) => forcedIds.has(id))) part.push(row);
-          else if (part.length > 0) {
-            place(part);
-            part = [];
-          }
-        }
-        if (part.length > 0) place(part);
-        for (const id of ids) if (!forcedIds.has(id)) opened.add(id);
-      } else {
-        place(run);
-      }
-    }
-    run = [];
-  };
-  rows.forEach((row, index) => {
-    const forced = idsFor(row).some((id) => forcedIds.has(id));
-    if ((index < rows.length - 1 || forced) && joins(row)) run.push(row);
-    else close();
-  });
-  close();
-  if (opened.size > 0) openedReadRuns.set(key, opened);
-  return placed;
-}
-
-/**
  * The rows of the collapsed run `row` belongs to, its line's row first: in its own list, the channel's
  * or the cards' with threads unpacked under them, where a card ends a block's run (`#407
  * unpack-row-parity`).
@@ -41660,27 +41599,18 @@ function openReadRun(row) {
   // `#432 read-mode-unify`. A run of read threads (and Main's read messages) over the cards: kept open by
   // what its cards and rows stand for, and the cards drawn again.
   if (thread === null && row.parentNode === leftEl("side-cards")) {
-    const opened = openedReadRuns.get(cardRunKey()) || new Set();
-    for (const one of cardRunRows(row)) {
-      for (const id of cardRunIds(one)) opened.add(id);
-    }
-    openedReadRuns.set(cardRunKey(), opened);
+    readRuns.open(cardRunKey(), cardRunRows(row).flatMap(cardRunIds));
     sideCardsDrawn = "";
     renderSideColumn();
     keepSelection();
     return;
   }
   const key = thread === null ? viewKey() : viewKey("thread", thread);
-  const opened = openedReadRuns.get(key) || new Set();
+  const ids = readRunRows(row).flatMap(idsOf);
+  readRuns.open(key, ids);
   // Opening a run is also un-folding what was folded into it one by one (`#480 fold-one-message-key`).
   const folded = foldedOnes.get(key);
-  for (const one of readRunRows(row)) {
-    for (const id of idsOf(one)) {
-      opened.add(id);
-      if (folded) folded.delete(id);
-    }
-  }
-  openedReadRuns.set(key, opened);
+  if (folded) for (const id of ids) folded.delete(id);
   if (folded && folded.size === 0) foldedOnes.delete(key);
   if (thread !== null) {
     sideCardsDrawn = "";
@@ -43061,7 +42991,7 @@ function setReadMode(mode) {
     todoMode = mode === "hide";
     // Runs opened under Fold read are a way of looking at that list, and the reader has just
     // chosen another way: coming back to Fold read folds them all again.
-    openedReadRuns.clear();
+    readRuns.clear();
     // Kept across a reload, as the reader left it. `#189 restore-ui-state`.
     uiStateSettled = true;
     saveUiState();
@@ -48441,7 +48371,7 @@ function redrawUnpackBlock(choice, drawn, tally) {
 
 /** What one block would draw, as a signature, so a pass that changes nothing rebuilds nothing. */
 function unpackSignature(choice, held) {
-  const opened = openedReadRuns.get(viewKey("thread", choice.id));
+  const opened = readRuns.opened(viewKey("thread", choice.id));
   const cover = channelStore.current().views.get(viewKey("thread", choice.id));
   const view = cardView(choice);
   return JSON.stringify([choice.id, readMode, readRunsSuspended(), hideEmptyMessages, combineMessages,
@@ -48944,7 +48874,7 @@ function placeMainCard() {
 // rows are in it), a tap or Enter opening it (`openReadRun`). A read thread outside a run keeps its
 // unpacked rows folded as a thread's are (`unpackBlock`).
 
-/** The key the cards' opened runs are kept under, by channel (`openedReadRuns`). */
+/** The key the cards' opened runs are kept under, by channel (`readRuns`). */
 const cardRunKey = () => `cards:${String(selectedChannelId())}`;
 
 /** What an item of the cards stands for in a run: a card its thread, a Main row its messages. */

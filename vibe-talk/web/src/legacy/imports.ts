@@ -227,6 +227,7 @@ export {
   cardMaxLinesWords,
   cardRunText,
   collapsedLinesWords,
+  createReadRuns,
   elisionLabel,
   elisionLabels,
   forgetElisionCounts,

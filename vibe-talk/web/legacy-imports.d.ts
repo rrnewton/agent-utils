@@ -223,3 +223,4 @@ declare const elisionLabels: LegacyImports["elisionLabels"];
 declare const forgetElisionCounts: LegacyImports["forgetElisionCounts"];
 declare const isNoise: LegacyImports["isNoise"];
 declare const joinsGroup: LegacyImports["joinsGroup"];
+declare const createReadRuns: LegacyImports["createReadRuns"];

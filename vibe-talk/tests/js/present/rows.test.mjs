@@ -67,3 +67,30 @@ test("`#624 voice-page-modularity`: which messages are drawn as one row, from th
   assert.equal(joinsGroup(null, second, true), false);
   assert.deepStrictEqual([isNoise({ noise: true }), isNoise({}), isNoise(null)], [true, false, false]);
 });
+
+test("`#624 voice-page-modularity`: runs of read messages, and the ones the reader opened, from the module alone", () => {
+  const { createReadRuns, READ_RUN_MIN_ROWS } = ROWS;
+  assert.equal(READ_RUN_MIN_ROWS, 2);
+  const runs = createReadRuns();
+  // Rows a, b, c read; d unread; e, f read; g last. Each row stands for its own id.
+  const rows = ["a", "b", "c", "d", "e", "f", "g"];
+  const read = new Set(["a", "b", "c", "e", "f", "g"]);
+  const plan = () => runs.plan(rows, "k", (row) => read.has(row), (row) => [row]);
+  const roles = (placed) => rows.map((row) => (placed.get(row) || { role: "-" }).role.slice(0, 1)).join("");
+  // The last row never joins, so e and f are a run of two and g stands alone.
+  assert.equal(roles(plan()), "hmm-hm-");
+  assert.equal(plan().get("a").count, 3);
+  runs.open("k", ["b"]);
+  assert.equal(roles(plan()), "----hm-", "an opened run collapsed");
+  assert.deepStrictEqual([...runs.opened("k")].sort(), ["a", "b", "c"], "what joined an opened run was not remembered");
+  runs.close("k", ["a", "b", "c"]);
+  assert.equal(roles(plan()), "hmm-hm-");
+  runs.open("k", ["e"]);
+  runs.forget("k");
+  assert.equal(runs.opened("k"), undefined);
+  // One folded away by hand collapses on its own, even last.
+  assert.equal(roles(runs.plan(rows, "k", (row) => read.has(row), (row) => [row], new Set(["g"]))), "hmm-hmm");
+  runs.open("k", ["a"]);
+  runs.clear();
+  assert.equal(runs.opened("k"), undefined);
+});
