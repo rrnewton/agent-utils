@@ -419,24 +419,34 @@ fn selected_teams(archive: &Path, team_slugs: &[String]) -> Result<Vec<String>, 
         team_slugs.to_vec()
     } else {
         let teams_root = archive.join("teams");
-        if !teams_root.is_dir() {
+        let mut names: Vec<String> = crate::build_store::ingested_team_slugs(archive)?;
+        if teams_root.is_dir() {
+            let entries = std::fs::read_dir(&teams_root)
+                .map_err(|error| crate::json::os_error(&error, &teams_root))?;
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let is_link = path
+                    .symlink_metadata()
+                    .map(|meta| meta.file_type().is_symlink())
+                    .unwrap_or(false);
+                if path.is_dir() && !is_link {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if !names.contains(&name) {
+                        names.push(name);
+                    }
+                }
+            }
+        }
+        if names.is_empty()
+            && !teams_root.is_dir()
+            && !crate::build_store::candidate_store_roots(archive)?
+                .iter()
+                .any(|root| root.is_dir())
+        {
             return Err(format!(
                 "no team directory found at {}",
                 teams_root.display()
             ));
-        }
-        let mut names: Vec<String> = Vec::new();
-        let entries = std::fs::read_dir(&teams_root)
-            .map_err(|error| crate::json::os_error(&error, &teams_root))?;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let is_link = path
-                .symlink_metadata()
-                .map(|meta| meta.file_type().is_symlink())
-                .unwrap_or(false);
-            if path.is_dir() && !is_link {
-                names.push(entry.file_name().to_string_lossy().into_owned());
-            }
         }
         names.sort();
         names

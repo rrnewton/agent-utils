@@ -180,6 +180,22 @@ def test_audit_glossary_refusals(tmp_path: Path, rust_wrkviz: Path) -> None:
     _both(archive, ["--output", str(tmp_path / "missing")], expect=2)
 
 
+def test_audit_glossary_external_build_state(
+        tmp_path: Path, rust_wrkviz: Path) -> None:
+    # Build state outside the archive, no `teams/` yet: discovery
+    # must find the ingested team and report its missing cache
+    # instead of refusing with "no team directory found".
+    archive = tmp_path / "archive"
+    archive.mkdir()
+    raw = tmp_path / "archive.build" / "alpha" / "raw" / "team.json"
+    raw.parent.mkdir(parents=True)
+    raw.write_text("{}\n")
+    outcomes = _both(archive, ["--output", str(archive)])
+    assert "alpha: no legacy glossary cache" in outcomes["py"].stdout
+    _both(archive, ["--output", str(archive), "--team", "alpha",
+                    "--format", "json"])
+
+
 def test_audit_glossary_help(rust_wrkviz: Path) -> None:
     oracle = _run([sys.executable, str(PYTHON_WRKVIZ)],
                   ["audit-glossary", "--help"])

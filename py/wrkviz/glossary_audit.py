@@ -15,7 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from wrkviz.build_store import team_build_root as _build_root
+from wrkviz.build_store import candidate_store_roots as _candidate_roots
+from wrkviz.build_store import ingested_team_slugs as _ingested_slugs
 from wrkviz.archive import (
     JsonValue,
     as_array,
@@ -437,15 +438,19 @@ def _selected_teams(archive: Path, team_slugs: Sequence[str]) -> tuple[str, ...]
             raise ValueError("glossary audit team selection contains duplicates")
     else:
         teams_root = archive / "teams"
-        if not teams_root.is_dir():
-            raise ValueError(f"no team directory found at {teams_root}")
-        selected = tuple(
-            sorted(
+        found = set(_ingested_slugs(archive))
+        if teams_root.is_dir():
+            found.update(
                 path.name
                 for path in teams_root.iterdir()
                 if path.is_dir() and not path.is_symlink()
             )
-        )
+        if not found:
+            if not teams_root.is_dir() and not any(
+                root.is_dir() for root in _candidate_roots(archive)
+            ):
+                raise ValueError(f"no team directory found at {teams_root}")
+        selected = tuple(sorted(found))
     if not selected:
         raise ValueError(f"no teams found in {archive}")
     for team_slug in selected:
@@ -456,7 +461,7 @@ def _selected_teams(archive: Path, team_slugs: Sequence[str]) -> tuple[str, ...]
 
 def _audit_team(archive: Path, team_slug: str) -> LegacyTeamGlossaryAudit:
     path = archive / "teams" / team_slug / "summary_data" / "glossary.json"
-    relative_path = str(path.relative_to(archive))
+    relative_path = f"teams/{team_slug}/summary_data/glossary.json"
     if path.is_symlink():
         raise ValueError(f"refusing symlinked legacy glossary cache: {path}")
     if not path.is_file():
