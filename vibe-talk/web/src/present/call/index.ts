@@ -5,3 +5,29 @@
 export { closeReason, outcomeNotice } from "./notices.ts";
 export { CUT_OFF_MARK, containsWords, mergeHypothesis, revisionDistance, shownSpoken, spokenText, spokenWords, tidySpeech } from "./transcript.ts";
 export type { SpokenEntry } from "./transcript.ts";
+export {
+  READ_BACK_LEAD_INS,
+  SENDING_QUESTION_WORDS,
+  SENDING_WORDS,
+  SEND_DESTINATION_WORDS,
+  SHORT_ANSWER_WORDS,
+  SPOKEN_NO_STARTS,
+  SPOKEN_YES_ACKNOWLEDGEMENT,
+  SPOKEN_YES_FILLER,
+  SPOKEN_YES_HINTS,
+  SPOKEN_YES_PHRASES,
+  agentDraft,
+  answerWords,
+  askedAboutSending,
+  classifySpokenAnswer,
+  couldBeSpokenYes,
+  isExactReadBack,
+  isSpokenYes,
+  isSpokenYesAcknowledgement,
+  mayBeYes,
+  namesWhereToSend,
+  readBackRefusal,
+  turnAsksAboutSending,
+  unsayableDraft,
+  yesPrefix,
+} from "./answers.ts";

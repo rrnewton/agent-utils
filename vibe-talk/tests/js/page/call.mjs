@@ -10,21 +10,22 @@ import { join } from "node:path";
 import { WEB } from "../../../web/page_sources.mjs";
 
 import { CANNED, CAPTURE_RESUME_MS, CHANNEL, CHARS_PER_LINE, COLLAPSE_OVER_CHARS, CSS, HTML,
-  HTML_CODE, MIC_TOGGLE_IDS, MINTED, OTHER_CHANNEL, PAGE_ELEMENTS, PAGE_IDS, RECORD_EPOCH,
-  RELAY_COALESCE_MS, RELAY_FENCE_OPEN, REPLAY_PREAMBLE, SCRIPT, SCRIPT_CODE, SEAM_DETAIL_MAX_WORDS,
-  SEAM_DETAIL_MIN_WORDS, SHORT_MESSAGE, SPEECH, THREADS_MAIN_STORAGE, TRANSCRIPT_PAGE_LIMIT,
-  TUNING_BANDS, assertMarkupContains, assistantSays, atBottomOf, backlog, barSlice, boundaryLines,
-  boundaryWords, brokenModule, brokenScript, brokenScriptEach, compose, cssBlock, cssRules, deliver,
-  enterKey, errorResponse, fillTranscript, foldButton, framesOfType, framesSent, helpEntry, hosted,
-  hostedAudio, hostedHears, hostedSays, initiationFrame, json, longMessage, mainMessagesPage,
-  markupHolds, message, neutralReadBack, newPage, optionalSourceConstant, passTime, pinChip,
-  promptsSent, proposal, proposedDuringACall, readBackDuringACall, recordingCall, relayed, reloadOf,
-  replacedV1Call, resumeFrame, rowWithId, ruledRows, said, seamChip, seamDetail, seamLabel,
-  seamRecapDetail, secondOfSpeech, sentCards, session_lines, setReadNew, settingsGroup,
-  settleRedraftWait, settleSpokenYes, showDiscord, shownIds, signIn, sourceConstant,
-  sourceStringTable, speakRelay, speech, spokenDraft, sseMessage, startChatting, startNeutralCall,
-  startTalking, startTalkingNamed, startV1Call, state, storedTexts, tapPin, test, threadBadge,
-  turnDone, typedFrames, v1Minted, vendorAccepts, watchTurns, withEarlierConversation, words, youSay } from "./fixture.mjs";
+  HTML_CODE, MIC_TOGGLE_IDS, MINTED, OTHER_CHANNEL, PAGE_CODE, PAGE_ELEMENTS, PAGE_IDS,
+  RECORD_EPOCH, RELAY_COALESCE_MS, RELAY_FENCE_OPEN, REPLAY_PREAMBLE, SCRIPT, SCRIPT_CODE,
+  SEAM_DETAIL_MAX_WORDS, SEAM_DETAIL_MIN_WORDS, SHORT_MESSAGE, SPEECH, THREADS_MAIN_STORAGE,
+  TRANSCRIPT_PAGE_LIMIT, TUNING_BANDS, assertMarkupContains, assistantSays, atBottomOf, backlog,
+  barSlice, boundaryLines, boundaryWords, brokenModule, brokenScript, brokenScriptEach, compose,
+  cssBlock, cssRules, deliver, enterKey, errorResponse, fillTranscript, foldButton, framesOfType,
+  framesSent, helpEntry, hosted, hostedAudio, hostedHears, hostedSays, initiationFrame, json,
+  longMessage, mainMessagesPage, markupHolds, message, neutralReadBack, newPage,
+  optionalSourceConstant, passTime, pinChip, promptsSent, proposal, proposedDuringACall,
+  readBackDuringACall, recordingCall, relayed, reloadOf, replacedV1Call, resumeFrame, rowWithId,
+  ruledRows, said, seamChip, seamDetail, seamLabel, seamRecapDetail, secondOfSpeech, sentCards,
+  session_lines, setReadNew, settingsGroup, settleRedraftWait, settleSpokenYes, showDiscord,
+  shownIds, signIn, sourceConstant, sourceStringTable, speakRelay, speech, spokenDraft, sseMessage,
+  startChatting, startNeutralCall, startTalking, startTalkingNamed, startV1Call, state, storedTexts,
+  tapPin, test, threadBadge, turnDone, typedFrames, v1Minted, vendorAccepts, watchTurns,
+  withEarlierConversation, words, youSay } from "./fixture.mjs";
 
 /** One buffer of microphone audio arriving from the browser's audio graph. */
 function speakInto(page) {
@@ -5124,8 +5125,9 @@ test("`#268 voice-call-drops`: the acknowledgement a spoken yes excuses is the o
   // The page leaves "One moment." out of a read-back because the agent is told to say exactly that
   // on a yes. If the prompts said anything else, a cooperative agent's reply would refuse every yes
   // that the bridge answered before its final transcript.
-  const stated = /^const SPOKEN_YES_ACKNOWLEDGEMENT = \[([^\]]*)\];$/m.exec(SCRIPT_CODE);
-  assert.ok(stated, "web/voice.js states no SPOKEN_YES_ACKNOWLEDGEMENT");
+  // web/src/present/call states it now (`#624 voice-page-modularity`), typed.
+  const stated = /^const SPOKEN_YES_ACKNOWLEDGEMENT(?:: [^=]+)? = \[([^\]]*)\];$/m.exec(PAGE_CODE);
+  assert.ok(stated, "the page's code (web/voice.js, web/src/) states no SPOKEN_YES_ACKNOWLEDGEMENT");
   const excused = [...stated[1].matchAll(/"([^"]*)"/g)].map((m) => m[1]).join(" ");
   const ROOT = join(WEB, "..");
   for (const file of ["prompts/voice-agent-send.txt", "src/ops.rs", "src/mcp/mod.rs"]) {

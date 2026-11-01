@@ -1927,7 +1927,7 @@ test("`#264 voice-send-approval`: the box cannot be changed by a read token or o
 });
 
 test("`#264 voice-send-approval`: what counts as yes, as no, and as neither", () => {
-  const classify = newPage().pure("classifySpokenAnswer");
+  const classify = newPage().preludeBinding("classifySpokenAnswer");
   for (const said of [
     "yes", "Yes.", "YES!", "yeah", "yep", "send it", "Send.", "do it", "go ahead", "sure",
     "please do", "yes please", "yes, send it", "send it please", "ok send it", "yeah go ahead",
@@ -2437,8 +2437,8 @@ test("`#264 voice-send-approval`: with echo cancellation off, or in a typed call
 
 test("`#264 voice-send-approval`: the read-back must be exactly 'To {channel}: {text}. Send it?' — a lead-in is allowed, nothing added is", () => {
   const page = newPage();
-  const exact = page.pure("isExactReadBack");
-  const words = page.pure("answerWords");
+  const exact = page.preludeBinding("isExactReadBack");
+  const words = page.preludeBinding("answerWords");
   const card = { channel_name: "lead team", text: "merge the PR" };
   for (const said of [
     "To lead team: merge the PR. Send it?",
@@ -2489,7 +2489,7 @@ test("`#264 voice-send-approval`: a yes to a different question, after a digress
 
 test("`#264 voice-send-approval`: what makes an answer one about sending", () => {
   const page = newPage();
-  const asked = page.pure("askedAboutSending");
+  const asked = page.preludeBinding("askedAboutSending");
   const turns = (...texts) => texts.map((text) => ({ text }));
   for (const [said, answer] of [
     [["To lead team: on it. Send it?"], "yes"],
@@ -2713,7 +2713,7 @@ test("`#264 voice-send-approval`: a draft with a mention is never sent by voice,
 // is exactly what text-to-speech drops, so it could change what is posted while every word matched.
 
 test("`#264 voice-send-approval`: only plain words and sentence punctuation can be confirmed by voice", () => {
-  const unsayable = newPage().pure("unsayableDraft");
+  const unsayable = newPage().preludeBinding("unsayableDraft");
   for (const text of [
     "on it, rebasing now",
     "Don\u2019t merge the PR yet. I'll re-run the tests first!",
@@ -2846,7 +2846,7 @@ test("`#264 voice-send-approval`: on the neutral protocol a yes after a paraphra
 });
 
 test("`#264 voice-send-approval`: the yeses an agent takes that the page does not act on are classified as like a yes", () => {
-  const classify = newPage().pure("classifySpokenAnswer");
+  const classify = newPage().preludeBinding("classifySpokenAnswer");
   for (const said of [
     "sounds good", "Go for it.", "uh-huh", "Mm-hmm.", "mhm", "Perfect!", "alright", "That's right",
     "Affirmative.", "of course", "Ship it", "right", "great", "fine", "yup", "Absolutely.",
@@ -4548,14 +4548,14 @@ test("`#303 voice-post-prefix`: the card shows the tagged text exactly as it wil
 });
 
 test("`#303 voice-post-prefix`: the agent's words are judged for a spoken yes; the owner's tag in front of them is not", () => {
-  const draft = newPage().pure("agentDraft");
+  const draft = newPage().preludeBinding("agentDraft");
   assert.equal(draft({ text: `${DEFAULT_POST_PREFIX}on it`, prefix: DEFAULT_POST_PREFIX }), "on it");
   // Tagging off, or an older server: the whole text is the agent's.
   assert.equal(draft({ text: "(aside) on it" }), "(aside) on it");
   assert.equal(draft({ text: "(aside) on it", prefix: "" }), "(aside) on it");
   // A prefix the text does not start with names nothing.
   assert.equal(draft({ text: "on it", prefix: DEFAULT_POST_PREFIX }), "on it");
-  const unsayable = newPage().pure("unsayableDraft");
+  const unsayable = newPage().preludeBinding("unsayableDraft");
   assert.equal(unsayable(DEFAULT_POST_PREFIX), "symbols", "fixture: the default tag is not plain words");
 });
 

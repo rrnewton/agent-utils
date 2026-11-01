@@ -216,12 +216,23 @@ export {
 } from "../present/time/index.ts";
 export {
   CUT_OFF_MARK,
+  agentDraft,
+  answerWords,
+  askedAboutSending,
+  classifySpokenAnswer,
   closeReason,
+  couldBeSpokenYes,
+  isExactReadBack,
+  isSpokenYesAcknowledgement,
+  mayBeYes,
   mergeHypothesis,
+  namesWhereToSend,
   outcomeNotice,
+  readBackRefusal,
   shownSpoken,
   spokenText,
   spokenWords,
+  unsayableDraft,
 } from "../present/call/index.ts";
 export {
   SERVER_CACHE_NO_AGE_LIMIT,
