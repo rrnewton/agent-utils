@@ -10,8 +10,8 @@ import { join } from "node:path";
 import { WEB } from "../../../web/page_sources.mjs";
 
 import { CHANNEL, CSS_CODE, CSS_UNCONDITIONAL, DESKTOP_QUERY, HELP_SLUGS, HTML, HTML_CODE,
-  OTHER_CHANNEL, PAGE_ELEMENTS, SCRIPT, SCRIPT_CODE, SEND_UNDO_MS, SETTINGS, SPACE_A, TEAM_A,
-  TEAM_B, assertMarkupContains, brokenScript, browsingPage, cardRow, channelBoxCode, chooseService,
+  OTHER_CHANNEL, PAGE_CODE, PAGE_ELEMENTS, SCRIPT, SCRIPT_CODE, SEND_UNDO_MS, SETTINGS, SPACE_A, TEAM_A,
+  TEAM_B, assertMarkupContains, brokenModule, brokenScript, browsingPage, cardRow, channelBoxCode, chooseService,
   clearingPage, cssBlock, cssBlockIn, cssRules, cssWithoutIn, dismissedItems, dismissedOpenerOf,
   failedSend, focusName, focused, groupsIn, helpEntry, json, keyboardPage, literal, markupHolds,
   mediaBodyOf, message, newPage, nodeIn, openBrowser, openHelp, openReplyOn, openerOf,
@@ -483,8 +483,8 @@ test("EVERY SETTINGS GROUP THAT EXPLAINS ITSELF HAS A HELP ENTRY, AND A WAY TO R
   }
   // The script's own list has to agree with the markup in BOTH directions, or a group ships with a
   // ? that does nothing.
-  const listed = /const HELP_TOPICS = \[([\s\S]*?)\]/.exec(SCRIPT_CODE);
-  assert.ok(listed, "web/voice.js no longer declares HELP_TOPICS");
+  const listed = /const HELP_TOPICS(?:: [^=]*)? = (?:Object\.freeze\()?\[([\s\S]*?)\]/.exec(PAGE_CODE);
+  assert.ok(listed, "the page no longer declares HELP_TOPICS");
   const topics = [...listed[1].matchAll(/"([a-z-]+)"/g)].map((m) => m[1]);
   assert.deepStrictEqual(
     topics.slice().sort(),
@@ -500,7 +500,7 @@ test("EVERY SETTINGS GROUP THAT EXPLAINS ITSELF HAS A HELP ENTRY, AND A WAY TO R
   // `#332 settings-voice-agent-section`. EVERY `?` is wired by its id, not merely one per entry: its
   // own `help-link-<slug>` through HELP_TOPICS. `#347 settings-prose` took away the one `?` that was
   // wired otherwise, beside a label, so a `?` by any other id would be a button that does nothing.
-  assert.deepStrictEqual(helpLinkProblems(HTML, SCRIPT_CODE), []);
+  assert.deepStrictEqual(helpLinkProblems(HTML, PAGE_CODE), []);
 });
 
 /**
@@ -510,7 +510,7 @@ test("EVERY SETTINGS GROUP THAT EXPLAINS ITSELF HAS A HELP ENTRY, AND A WAY TO R
  * function of the two texts, so its negative control can hand it a page with a `?` unwired.
  */
 function helpLinkProblems(html, script) {
-  const topics = [.../const HELP_TOPICS = \[([\s\S]*?)\]/.exec(script)[1].matchAll(/"([a-z-]+)"/g)].map((m) => m[1]);
+  const topics = [.../const HELP_TOPICS(?:: [^=]*)? = (?:Object\.freeze\()?\[([\s\S]*?)\]/.exec(script)[1].matchAll(/"([a-z-]+)"/g)].map((m) => m[1]);
   const links = [...html.matchAll(/<button class="help-link(?: help-link-text)?" id="([a-z-]+)" type="button" data-help="([a-z-]+)"/g)]
     .map((m) => [m[1], m[2]]);
   const problems = [];
@@ -519,7 +519,7 @@ function helpLinkProblems(html, script) {
   }
   for (const [id, slug] of links) {
     if (id !== `help-link-${slug}` || !topics.includes(slug)) {
-      problems.push(`#${id} opens "${slug}" and nothing in web/voice.js wires it`);
+      problems.push(`#${id} opens "${slug}" and nothing on the page wires it`);
     }
   }
   return problems;
@@ -531,12 +531,12 @@ test("`#332 settings-voice-agent-section`: the ? check finds a ? nothing wires (
   const back = HTML.replace('<select id="relay-to-agent"',
     '<button class="help-link" id="help-link-speech-prep-relay" type="button" data-help="speech-prep">?</button><select id="relay-to-agent"');
   assert.notEqual(back, HTML, "the negative control changed nothing");
-  assert.deepStrictEqual(helpLinkProblems(back, SCRIPT_CODE),
-    ['#help-link-speech-prep-relay opens "speech-prep" and nothing in web/voice.js wires it']);
+  assert.deepStrictEqual(helpLinkProblems(back, PAGE_CODE),
+    ['#help-link-speech-prep-relay opens "speech-prep" and nothing on the page wires it']);
   // ...and an entry taken out of the script's list, which leaves its own ? unwired.
-  const unlisted = SCRIPT_CODE.replace(/(const HELP_TOPICS = \[[^\]]*?)  "combining",\n/, "$1");
-  assert.notEqual(unlisted, SCRIPT_CODE, "the negative control changed nothing");
-  assert.deepStrictEqual(helpLinkProblems(HTML, unlisted), ['#help-link-combining opens "combining" and nothing in web/voice.js wires it']);
+  const unlisted = PAGE_CODE.replace(/(const HELP_TOPICS(?:: [^=]*)? = (?:Object\.freeze\()?\[[^\]]*?)  "combining",\n/, "$1");
+  assert.notEqual(unlisted, PAGE_CODE, "the negative control changed nothing");
+  assert.deepStrictEqual(helpLinkProblems(HTML, unlisted), ['#help-link-combining opens "combining" and nothing on the page wires it']);
 });
 
 test("the settings screen is CONTROLS, not paragraphs", () => {
@@ -1942,7 +1942,7 @@ test("`#347 settings-prose`: How messages are pre-processed for speech opens Hel
     "the entry does not open on which arm this server is in");
   // The negative control: the link with its wiring taken out must then do nothing, or the check above
   // proves only that something opens Help.
-  const unwired = newPage(new Map(), brokenScript('  "speech-prep",\n', ""));
+  const unwired = newPage(new Map(), await brokenModule([{ file: "src/present/settings/folds.ts", find: '  "speech-prep",\n', replace: "" }]));
   await signIn(unwired);
   await unwired.el("open-settings").click();
   await unwired.el("help-link-speech-prep").click();
@@ -2385,8 +2385,8 @@ test("`#348 settings-dynamic-lists` x `#346 settings-collapsible`: folding the g
   await page.el("fold-typing").click();
   assert.equal(page.el("dismissed-send-popout").hidden, false, "folding another group closed the pop-out");
   // The negative control: a page whose folds do not know the pop-out leaves it open behind the fold.
-  const blind = newPage(new Map(), brokenScript(
-    "    if (!foldOpen(slug) && FOLDS_HOLDING_DISMISSED.includes(slug)) closeDismissedSend(false);\n", ""));
+  const blind = newPage(new Map(), await brokenModule([{ file: "src/view/settings/folds.ts",
+    find: "      if (!owner.open(slug) && FOLDS_HOLDING_DISMISSED.includes(slug)) deps.closeDismissed();\n", replace: "" }]));
   await signIn(blind);
   await showDiscord(blind, []);
   await outgoingDismiss(await failedSend(blind, "another message")).click();
@@ -2721,38 +2721,38 @@ function foldProblems(html, css, script) {
 }
 
 test("`#346 settings-collapsible`: every section but Server and every group in them folds, hidden until found", () => {
-  assert.deepStrictEqual(foldProblems(HTML, CSS_CODE, SCRIPT_CODE), []);
+  assert.deepStrictEqual(foldProblems(HTML, CSS_CODE, PAGE_CODE), []);
   // 31 since `#481 slack-app-deep-link` added Opening links, counted and checked above.
-  assert.equal(scriptFolds(SCRIPT_CODE).length, 34, "a fold went missing from the list, or one was added unchecked");
+  assert.equal(scriptFolds(PAGE_CODE).length, 34, "a fold went missing from the list, or one was added unchecked");
 });
 
 test("`#346 settings-collapsible`: the check refuses a fold out of find's reach, an unfolding group, and a list that disagrees (negative controls)", () => {
   const plain = HTML.replace('<div class="fold-body" id="fold-microphone-body" hidden="until-found">', '<div class="fold-body" id="fold-microphone-body" hidden>');
-  assert.deepStrictEqual(foldProblems(plain, CSS_CODE, SCRIPT_CODE), [
+  assert.deepStrictEqual(foldProblems(plain, CSS_CODE, PAGE_CODE), [
     "microphone's body is not under its heading, hidden until found",
     "a fold is plainly hidden, out of find's reach",
   ]);
   const oldCss = CSS_CODE.replace('[hidden]:not([hidden="until-found"]) {', "[hidden] {");
   assert.notEqual(oldCss, CSS_CODE, "the negative control changed nothing");
-  assert.deepStrictEqual(foldProblems(HTML, oldCss, SCRIPT_CODE), [
+  assert.deepStrictEqual(foldProblems(HTML, oldCss, PAGE_CODE), [
     "[hidden] takes hidden-until-found out of find as well",
     "nothing hides an ordinary [hidden] any more",
   ]);
   const flat = HTML.replace(/<button class="fold-toggle" id="fold-typing"[^>]*>Typing<\/button>/, "Typing");
-  assert.deepStrictEqual(foldProblems(flat, CSS_CODE, SCRIPT_CODE), ['the group "Typing" does not fold', "SETTINGS_FOLDS lists typing, which the markup does not have"]);
-  const unlisted = SCRIPT_CODE.replace(/(const SETTINGS_FOLDS = \[[^\]]*?)  "token",\n/, "$1");
-  assert.notEqual(unlisted, SCRIPT_CODE, "the negative control changed nothing");
+  assert.deepStrictEqual(foldProblems(flat, CSS_CODE, PAGE_CODE), ['the group "Typing" does not fold', "SETTINGS_FOLDS lists typing, which the markup does not have"]);
+  const unlisted = PAGE_CODE.replace(/(const SETTINGS_FOLDS(?:: [^=]*)? = (?:Object\.freeze\()?\[[^\]]*?)  "token",\n/, "$1");
+  assert.notEqual(unlisted, PAGE_CODE, "the negative control changed nothing");
   assert.deepStrictEqual(foldProblems(HTML, CSS_CODE, unlisted), ["SETTINGS_FOLDS does not list token"]);
   const server = HTML.replace('<h2 id="settings-server-title">Server</h2>',
     '<h2 id="settings-server-title"><button class="fold-toggle" id="fold-settings-server" type="button">Server</button></h2>');
-  assert.deepStrictEqual(foldProblems(server, CSS_CODE, SCRIPT_CODE), ["the Server section folds, hiding which server this is"]);
+  assert.deepStrictEqual(foldProblems(server, CSS_CODE, PAGE_CODE), ["the Server section folds, hiding which server this is"]);
 });
 
 test("`#346 settings-collapsible`: everything is folded as the page loads; a title opens its section, a heading its group, and again folds it", async () => {
   const page = newPage();
   await signIn(page);
   await page.el("open-settings").click();
-  for (const slug of scriptFolds(SCRIPT_CODE)) assert.equal(settingsFoldState(page, slug), false, `${slug} is open as the page loads`);
+  for (const slug of scriptFolds(PAGE_CODE)) assert.equal(settingsFoldState(page, slug), false, `${slug} is open as the page loads`);
   await page.el("fold-settings-voice-agent").click();
   assert.equal(settingsFoldState(page, "settings-voice-agent"), true);
   // The section opens to its groups' headings, each still folded.
@@ -2790,8 +2790,8 @@ test("`#346 settings-collapsible`: the browser's find opening a fold is heard, a
   assert.equal(settingsFoldState(page, "settings-voice-agent"), true);
   // The negative control: a page that does not listen leaves the buttons saying folded over open bodies,
   // which `foldState` refuses.
-  const deaf = newPage(new Map(), brokenScript(
-    '  el(`fold-${slug}-body`).addEventListener("beforematch", () => setFold(slug, true));\n', ""));
+  const deaf = newPage(new Map(), await brokenModule([{ file: "src/view/settings/folds.ts",
+    find: '    deps.lookup(`fold-${slug}-body`).addEventListener("beforematch", () => owner.set(slug, true));\n', replace: "" }]));
   await signIn(deaf);
   await deaf.el("open-settings").click();
   deaf.el("fold-microphone-body").removeAttribute("hidden");
@@ -2808,13 +2808,13 @@ test("`#346 settings-collapsible`: Expand all opens every fold and then reads Fo
   await page.el("fold-settings-messages").click();
   assert.equal(all.textContent, "Expand all", "one fold open, and the button offers to fold");
   await all.click();
-  for (const slug of scriptFolds(SCRIPT_CODE)) assert.equal(settingsFoldState(page, slug), true, `Expand all left ${slug} folded`);
+  for (const slug of scriptFolds(PAGE_CODE)) assert.equal(settingsFoldState(page, slug), true, `Expand all left ${slug} folded`);
   assert.equal(all.textContent, "Fold all");
   await page.el("fold-typing").click();
   assert.equal(all.textContent, "Expand all", "with a fold folded the button still offers to fold");
   await all.click();
   await all.click();
-  for (const slug of scriptFolds(SCRIPT_CODE)) assert.equal(settingsFoldState(page, slug), false, `Fold all left ${slug} open`);
+  for (const slug of scriptFolds(PAGE_CODE)) assert.equal(settingsFoldState(page, slug), false, `Fold all left ${slug} open`);
   assert.equal(all.textContent, "Expand all");
 });
 
@@ -2829,7 +2829,7 @@ test("`#351 settings-polish`: Expand all and Fold all count only the folds on th
   const hidden = ["provider", "message-cache"];
   const all = page.el("fold-settings-all");
   // Every fold the reader can see, opened by hand: nothing is left to expand.
-  for (const slug of scriptFolds(SCRIPT_CODE).filter((one) => !hidden.includes(one))) await page.el(`fold-${slug}`).click();
+  for (const slug of scriptFolds(PAGE_CODE).filter((one) => !hidden.includes(one))) await page.el(`fold-${slug}`).click();
   assert.equal(all.textContent, "Fold all", "with every fold on the page open, the button still offers to expand them all");
   // A group shown folded, as Provider is once the server names a console, is something to expand again.
   page.agentSettingsUrl = "https://voice.example/agents/1";
@@ -2843,14 +2843,15 @@ test("`#351 settings-polish`: Expand all and Fold all count only the folds on th
   assert.equal(all.textContent, "Fold all");
   // Fold all folds every fold, a hidden group's too, so one shown later is folded with the rest.
   await all.click();
-  for (const slug of scriptFolds(SCRIPT_CODE)) assert.equal(settingsFoldState(page, slug), false, `Fold all left ${slug} open`);
+  for (const slug of scriptFolds(PAGE_CODE)) assert.equal(settingsFoldState(page, slug), false, `Fold all left ${slug} open`);
   // The negative control: a button that counts every fold, shown or not.
-  const blind = newPage(new Map(), brokenScript(
-    'el("fold-settings-all").textContent = shownFolds().some(', 'el("fold-settings-all").textContent = SETTINGS_FOLDS.some('));
+  const blind = newPage(new Map(), await brokenModule([{ file: "src/view/settings/folds.ts",
+    find: 'deps.lookup("fold-settings-all").textContent = foldAllWords(shownFolds().some(',
+    replace: 'deps.lookup("fold-settings-all").textContent = foldAllWords(SETTINGS_FOLDS.some(' }]));
   blind.agentSettingsUrl = null;
   await signIn(blind);
   await blind.el("open-settings").click();
-  for (const slug of scriptFolds(SCRIPT_CODE).filter((one) => !hidden.includes(one))) await blind.el(`fold-${slug}`).click();
+  for (const slug of scriptFolds(PAGE_CODE).filter((one) => !hidden.includes(one))) await blind.el(`fold-${slug}`).click();
   assert.equal(blind.el("fold-settings-all").textContent, "Expand all",
     "the negative control counted only the folds on the page anyway, so the check above proves nothing");
 });

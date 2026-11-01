@@ -6,7 +6,7 @@
 import assert from "node:assert/strict";
 
 import { ALIAS_NOTICE, CHANNEL, CSS_CODE, DISCORD_POLL_MS, HTML, HTML_CODE, MESSAGE_CACHE_KEY,
-  OTHER_CHANNEL, SCRIPT, SCRIPT_CODE, SPACE_A, SPACE_B, TEAM_A, TEAM_B, TOKEN_STORAGE_KEY,
+  OTHER_CHANNEL, PAGE_CODE, SCRIPT, SCRIPT_CODE, SPACE_A, SPACE_B, TEAM_A, TEAM_B, TOKEN_STORAGE_KEY,
   UI_STATE_KEY, assertCurrent, assistantSays, atBottomOf, backFacts, backlog, beforeOf,
   brokenScript, browsingPage, cardsUp, changeChannelTo, channelBoxCode, channelReads, channelRow,
   chooseService, conversation, cssBlock, delayedReply, deliver, doneButton, errorResponse,
@@ -618,7 +618,7 @@ test("`#401 hidden-channels-fold`: folded on every load, its heading counting wh
   assert.equal(none.el("hidden-channels").hidden, true, "an empty fold is offered");
   assert.equal(none.el("agent-settings").hidden, true);
   assert.equal(none.el("message-cache-group").hidden, true);
-  for (const slug of scriptFolds(SCRIPT_CODE).filter((one) => !["provider", "message-cache", "hidden-channels"].includes(one))) {
+  for (const slug of scriptFolds(PAGE_CODE).filter((one) => !["provider", "message-cache", "hidden-channels"].includes(one))) {
     if (!foldOpenOn(none, slug)) await none.el(`fold-${slug}`).click();
   }
   assert.equal(none.el("fold-settings-all").textContent, "Fold all", "the empty fold is counted by Expand all");
@@ -666,10 +666,10 @@ test("`#401 hidden-channels-fold`: a picker change leaves the fold as the reader
   assert.equal(settingsFoldState(open.page, "hidden-channels"), true, "the fold closed itself behind the reader's back");
   // The negative controls: a box redraw that decides the fold, either way.
   const opens = await hiddenFoldAcrossPicker(false, brokenScript("function renderChannelBox() {\n",
-    'function renderChannelBox() {\n  setFold("hidden-channels", true);\n'));
+    'function renderChannelBox() {\n  settingsFolds.set("hidden-channels", true);\n'));
   assert.deepStrictEqual(opens.states, [true, true], "the negative control left the fold closed, so the check above proves nothing");
   const folds = await hiddenFoldAcrossPicker(true, brokenScript("function renderChannelBox() {\n",
-    'function renderChannelBox() {\n  setFold("hidden-channels", false);\n'));
+    'function renderChannelBox() {\n  settingsFolds.set("hidden-channels", false);\n'));
   assert.deepStrictEqual(folds.states, [false, false], "the negative control left the fold open, so the check above proves nothing");
 });
 

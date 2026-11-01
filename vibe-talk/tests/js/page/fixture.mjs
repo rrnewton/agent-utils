@@ -9348,8 +9348,8 @@ const pickerChoices = (page) => page.el("settings-channel").children.map((option
 // default; its H2 subsections collapsed too; find-in-page still finds hidden text (use
 // <details>/hidden=until-found)".
 
-/** The folds web/voice.js declares, from its source. */
-const scriptFolds = (script) => [.../const SETTINGS_FOLDS = \[([\s\S]*?)\]/.exec(script)[1].matchAll(/"([a-z-]+)"/g)].map((m) => m[1]);
+/** The folds the page declares (web/src/present/settings), from its source. */
+const scriptFolds = (script) => [.../const SETTINGS_FOLDS(?:: [^=]*)? = (?:Object\.freeze\()?\[([\s\S]*?)\]/.exec(script)[1].matchAll(/"([a-z-]+)"/g)].map((m) => m[1]);
 
 /** Whether the fold `slug` is open on `page`, by its button and its body, which must agree. */
 function settingsFoldState(page, slug) {

@@ -338,6 +338,8 @@ export {
   threadCardId,
   timeNode,
 } from "../view/channel/index.ts";
+export { HELP_TOPICS } from "../present/settings/index.ts";
+export { mountHelpFolds, mountSettingsFolds } from "../view/settings/index.ts";
 
 import { decode, decodeTagged, is, roots } from "../contract/index.ts";
 

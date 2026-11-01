@@ -1398,7 +1398,7 @@ function currentPlace() {
   if (currentScreen === "main") return channelPlace();
   if (currentScreen !== "settings" && currentScreen !== "help") return null;
   const under = screenBeforeSettings === "main" ? channelPlace() : null;
-  const open = currentScreen === "help" ? helpEntries().find((entry) => entry.open) : null;
+  const open = currentScreen === "help" ? helpFolds.entries().find((entry) => entry.open) : null;
   return {
     screen: currentScreen, channel: String(selectedChannelId() || ""), under,
     from: currentScreen === "help" ? helpReturn : null, entry: open ? String(open.id).replace(/^help-/, "") : null,
@@ -2458,168 +2458,21 @@ function closeSettings() {
 
 // --- Settings, folded -----------------------------------------------------------------------------
 //
-// `#346 settings-collapsible`. The owner, 2026-10-18: "every top-level section collapsible, collapsed
-// by default; its H2 subsections collapsed too; find-in-page still finds hidden text". Each fold is a
-// button in a heading (`#fold-<slug>`) over a body (`#fold-<slug>-body`) that is `hidden="until-found"`
-// while folded, so the browser's find still searches it and opens it on a match, firing `beforematch`,
-// which is when the button is told. A section's fold and the groups' folds inside it are separate: a
-// section opens to its groups' headings, each folded, and a match inside a group opens both.
-//
-// FOLDED ON EVERY LOAD, the markup's state and this script's, and as the reader leaves them while the
-// page is open: going to Help and back, or out of Settings and in again, keeps what is open.
+// `#346 settings-collapsible`. Every section on Settings and every headed group in them folds, folded on
+// every load and hidden until found, so the browser's find still opens one: web/src/view/settings
+// `mountSettingsFolds`, with the folds and the words web/src/present/settings says (`#624
+// voice-page-modularity`).
 
 /**
- * Every fold on Settings, by slug: the five sections (`settings-<id>`) and every headed group in them.
- * Declared in the markup like every id here; the page suite holds this list to it in both directions.
- */
-const SETTINGS_FOLDS = [
-  "settings-voice-agent",
-  "sending",
-  "instructions",
-  "resuming",
-  "relay",
-  "reading-full",
-  "canned-prompts",
-  "microphone",
-  "provider",
-  "settings-messages",
-  "mark-own",
-  "auto-read",
-  "empty-messages",
-  "combining",
-  "rich-headers",
-  "message-links",
-  "summaries",
-  "dismissed",
-  "settings-channels",
-  "hidden-channels",
-  "settings-screen",
-  "text-size",
-  "reading-width",
-  "collapsed-lines",
-  "card-max-lines",
-  "control-bar",
-  "opening-links",
-  "typing",
-  "keyboard",
-  "settings-storage",
-  "storage",
-  "message-cache",
-  "token",
-  "connection",
-];
-
-/** Whether the fold `slug` is open. */
-const foldOpen = (slug) => el(`fold-${slug}`).getAttribute("aria-expanded") === "true";
-
-/**
- * Open or fold `slug`: its body shown, or hidden until found, and its button saying which. The body's
- * attribute is written rather than its `hidden` property, which a browser that knows `until-found`
- * reads as the string and one that does not as plain hidden.
- */
-function setFold(slug, open) {
-  const body = el(`fold-${slug}-body`);
-  if (open) body.removeAttribute("hidden");
-  else body.setAttribute("hidden", "until-found");
-  el(`fold-${slug}`).setAttribute("aria-expanded", open ? "true" : "false");
-  renderSettingsFoldAll();
-}
-
-/**
- * Whether the fold `slug` is on the page: no element around it is hidden, the folds around it aside
- * (one inside a folded section is a fold Expand all opens), up to Settings, which is hidden whenever
- * another screen shows.
+ * The folds on Settings: whether one is open, open or fold one, whether one is on the page, and the
+ * button over them all redrawn, as a group shown or hidden must (`renderAgentLink`, `renderServerCache`).
  *
- * `#351 settings-polish`. Two groups are hidden where there is nothing to show — Provider without a
- * console to link to, the message cache without one to manage — and their folds were counted all the
- * same: with every fold the reader can see open, the button still offered to expand them all.
+ * @type {import("./src/view/settings/index.ts").SettingsFolds}
  */
-function foldShown(slug) {
-  for (let at = /** @type {HTMLElement | null} */ (el(`fold-${slug}`).parentNode);
-    at && at.id !== "screen-settings"; at = /** @type {HTMLElement | null} */ (at.parentNode)) {
-    if (at.hidden === true && !/^fold-.+-body$/.test(at.id)) return false;
-  }
-  return true;
-}
-
-/** The folds on the page now (`foldShown`): the ones Expand all and Fold all are about. */
-const shownFolds = () => SETTINGS_FOLDS.filter(foldShown);
-
-/**
- * Expand all while any fold on the page is folded, Fold all once none is, as Help's button does
- * (`#246`). Redrawn by every fold, and by a group shown or hidden (`renderAgentLink`,
- * `renderServerCache`), which can bring a folded fold into sight or take one out of it.
- */
-function renderSettingsFoldAll() {
-  el("fold-settings-all").textContent = shownFolds().some((slug) => !foldOpen(slug)) ? "Expand all" : "Fold all";
-}
-
-/**
- * The folds that hold the pop-out over Recently dismissed (`#348 settings-dynamic-lists`): folding one
- * would leave it open out of sight, where Escape and Back would spend themselves closing it unseen.
- */
-const FOLDS_HOLDING_DISMISSED = ["dismissed", "settings-messages"];
-
-for (const slug of SETTINGS_FOLDS) {
-  setFold(slug, false);
-  el(`fold-${slug}`).addEventListener("click", () => {
-    setFold(slug, !foldOpen(slug));
-    if (!foldOpen(slug) && FOLDS_HOLDING_DISMISSED.includes(slug)) closeDismissedSend(false);
-    // `#345 settings-multi-column`. In columns, a section opened or folded changes how they balance,
-    // and can move to another column: the heading just pressed is brought back on screen, by as
-    // little as it takes, so the reader does not lose what they opened.
-    const pressed = el(`fold-${slug}`);
-    if (typeof pressed.scrollIntoView === "function") pressed.scrollIntoView({ block: "nearest" });
-  });
-  // The browser's find (or a link to a text fragment) is opening the body: it removes `hidden`
-  // itself, and the button has to say so.
-  el(`fold-${slug}-body`).addEventListener("beforematch", () => setFold(slug, true));
-}
-el("fold-settings-all").addEventListener("click", () => {
-  // Decided by the folds on the page, as the button's words are; done to every fold, so a group shown
-  // later opens or stays folded with the rest.
-  const open = shownFolds().some((slug) => !foldOpen(slug));
-  for (const slug of SETTINGS_FOLDS) setFold(slug, open);
-  if (!open) closeDismissedSend(false);
+const settingsFolds = mountSettingsFolds({
+  lookup: (id) => el(id),
+  closeDismissed: () => closeDismissedSend(false),
 });
-
-/**
- * The settings groups that have an explanation, and the slug that names it.
- *
- * ONE LIST, and three things are keyed off it: the `?` in the group is `#help-link-<slug>`, the
- * entry it opens is `#help-<slug>`, and this is what wires them together. Both elements are
- * declared in web/voice.html — the page suite refuses an id invented at runtime, and that rule is
- * why this is a list here rather than a scan of the document.
- *
- * The suite also asserts this list against the markup in both directions, so a group added with no
- * entry, or an entry nothing links to, fails rather than merely being unreachable.
- */
-const HELP_TOPICS = [
-  "microphone",
-  "control-bar",
-  "keyboard",
-  "canned-prompts",
-  "identities",
-  "channel-alias",
-  "mark-own",
-  "auto-read",
-  "empty-messages",
-  "combining",
-  "rich-headers",
-  "message-links",
-  "summaries",
-  "reading-width",
-  "collapsed-lines",
-  "card-max-lines",
-  "resuming",
-  "live-messages",
-  "speech-prep",
-  "storage",
-  "message-cache",
-  "voice-send",
-  "voice-instructions",
-  "connection",
-];
 
 /**
  * Open Help, optionally at one entry.
@@ -2630,73 +2483,27 @@ const HELP_TOPICS = [
  *
  * A null slug opens the top, which is what the standing "Open help" button at the head of Settings
  * wants: it is not about any one control.
- *
- * `scrollIntoView` is called defensively because the page's test fixture models the DOM the page is
- * allowed to use and a layout method is not part of that — the SCREEN still changes there, which is
- * the behaviour worth asserting, and scrolling is a thing only a real browser can do anyway.
  */
 function showHelp(slug) {
   showScreen("help");
-  // `#246 help-sections`. EVERY TIME, not only the first: Help is reached to read one thing, and the
-  // entries opened on an earlier visit would put the screen back to the one long page this replaces.
-  for (const entry of helpEntries()) entry.open = Boolean(slug) && entry.id === `help-${slug}`;
-  renderHelpFolds();
-  if (!slug) {
-    return;
-  }
-  const entry = document.getElementById(`help-${slug}`);
-  if (entry && entry.scrollIntoView) {
-    entry.scrollIntoView({ block: "start" });
-  }
+  helpFolds.openAt(slug);
 }
 
 // --- Help, folded ---------------------------------------------------------------------------------
 //
-// `#246 help-sections`. The owner: "when I press "?" I jump to one section of one giant help page.
-// ... make them collapsable and all folded except the one that we click on to jump to help."
-//
-//   * EACH ENTRY IS A NATIVE <details> (web/voice.html), its heading the <summary>: a button to a
-//     screen reader, Enter and Space from the keyboard, a tap on a phone, with nothing written here
-//     to make it one.
-//   * FOLDED, EXCEPT THE ONE ASKED FOR. A settings group's ? opens its entry; "?" and Ctrl+? (Cmd+?)
-//     open Keyboard, the entry about the keys (`#224`); Open help at the head of Settings is about
-//     nothing in particular and opens none, so the screen is a list of what there is to read.
-//   * ONE BUTTON AT THE TOP opens every entry, and once they are all open folds them all. It names
-//     what it will do, like every toggle on this page that is an act rather than a mode.
-//   * FIND STILL FINDS. A browser that searches folded <details> (Chromium does, and so does Firefox)
-//     opens the entry its match is in and fires `toggle`, which keeps the button's word right. One
-//     that does not cannot find text in a folded entry: Expand all first.
+// `#246 help-sections`. Every entry of Help is a native <details>, folded but the one asked for, under
+// one button that opens or folds them all: web/src/view/settings `mountHelpFolds`; the entries a ?
+// reaches are web/src/present/settings's (`HELP_TOPICS`, `#624 voice-page-modularity`).
 
 /**
- * Every entry of the Help screen: the ones a ? reaches, and the two read from the screen itself. By id,
- * as everything on this page is found, from the list the suite holds to the markup in both directions.
+ * Help's folds: its entries, the button over them redrawn, and the screen opened at one entry.
+ *
+ * @type {import("./src/view/settings/index.ts").HelpFolds}
  */
-function helpEntries() {
-  return ["controls", "channel", ...HELP_TOPICS].map(
-    (slug) => /** @type {HTMLDetailsElement} */ (document.getElementById(`help-${slug}`))
-  );
-}
-
-/**
- * The entries on the screen. One hidden with the feature it explains is not, and must not hold the
- * button at Expand all while every entry the reader can see is open: `#208 persistent-cache` hides
- * the one about saved messages on a server that has no message cache.
- */
-const shownHelpEntries = () => helpEntries().filter((entry) => !entry.hidden);
-
-/** The button at the top: Expand all while any entry on the screen is folded, Fold all once none is. */
-function renderHelpFolds() {
-  const entries = shownHelpEntries();
-  el("fold-help").textContent = entries.some((entry) => !entry.open) ? "Expand all" : "Fold all";
-}
-
-el("fold-help").addEventListener("click", () => {
-  const entries = shownHelpEntries();
-  const open = entries.some((entry) => !entry.open);
-  for (const entry of entries) entry.open = open;
-  renderHelpFolds();
+const helpFolds = mountHelpFolds({
+  lookup: (id) => el(id),
+  byId: (id) => document.getElementById(id),
 });
-for (const entry of helpEntries()) entry.addEventListener("toggle", renderHelpFolds);
 
 let currentView = "voice";
 
@@ -42399,7 +42206,7 @@ function renderServerCache(note = "") {
   el("message-cache-group").hidden = !shown;
   el("help-message-cache").hidden = !shown;
   // `#351 settings-polish`. As in `renderAgentLink`: the group's fold counts for Expand all only shown.
-  renderSettingsFoldAll();
+  settingsFolds.renderAll();
   if (!shown) {
     serverCacheAsking = null;
     el("message-cache-confirm").hidden = true;
@@ -51239,8 +51046,8 @@ function renderRemoveChannel(channel) {
  *
  * `#401 hidden-channels-fold`. The list is a fold at the foot of the Channels section, and its
  * heading says how many it holds, so a folded list still says whether there is anything in it.
- * Whether it is open is the reader's (`setFold`), never this redraw's. The group shown or hidden
- * brings a fold into sight or takes it out, which Expand all counts (`renderSettingsFoldAll`).
+ * Whether it is open is the reader's (`settingsFolds.set`), never this redraw's. The group shown or hidden
+ * brings a fold into sight or takes it out, which Expand all counts (`settingsFolds.renderAll`).
  */
 function renderHiddenChannels() {
   // `#355 provider-grouped-channels`. With several services, the chosen service's hidden channels.
@@ -51266,7 +51073,7 @@ function renderHiddenChannels() {
   el("hidden-channel-list").replaceChildren(...rows);
   el("fold-hidden-channels").textContent = `Hidden channels (${rows.length})`;
   el("hidden-channels").hidden = rows.length === 0;
-  renderSettingsFoldAll();
+  settingsFolds.renderAll();
 }
 
 /** Take the server's whole answer about the list: both pickers, the hidden list, the cache. */
@@ -52624,7 +52431,7 @@ function renderAgentLink() {
   const id = conversationalVoice.instance_id;
   el("agent-settings").hidden = !url;
   // `#351 settings-polish`. A fold shown or hidden with it changes what Expand all is about.
-  renderSettingsFoldAll();
+  settingsFolds.renderAll();
   if (!url) {
     return;
   }

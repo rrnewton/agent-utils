@@ -315,3 +315,6 @@ declare const SPEECH_HOLD_CAP_MS_DEFAULT: LegacyImports["SPEECH_HOLD_CAP_MS_DEFA
 declare const SPEECH_HOLD_DBFS_DEFAULT: LegacyImports["SPEECH_HOLD_DBFS_DEFAULT"];
 declare const bufferDbfs: LegacyImports["bufferDbfs"];
 declare const speechHoldFrom: LegacyImports["speechHoldFrom"];
+declare const HELP_TOPICS: LegacyImports["HELP_TOPICS"];
+declare const mountHelpFolds: LegacyImports["mountHelpFolds"];
+declare const mountSettingsFolds: LegacyImports["mountSettingsFolds"];
