@@ -116,6 +116,34 @@ def test_search_compat_and_show_match_python(corpus: Path) -> None:
     _check(["query", "--output", str(corpus), "show", reference])
 
 
+def test_search_opens_each_spine_shard_once(corpus: Path) -> None:
+    """Perf regression: one query must not reopen the spine per record."""
+    import shutil
+
+    strace = shutil.which("strace")
+    if strace is None:
+        pytest.skip("strace unavailable")
+    trace = corpus.parent / "search.strace"
+    result = subprocess.run(
+        [strace, "-f", "-e", "trace=openat", "-o", str(trace),
+         "cargo", "run", "--quiet", "--release", "--manifest-path",
+         "rs/Cargo.toml", "-p", "wrkviz", "--",
+         "query", "--output", str(corpus), "search", "--in",
+         "all-transcript", "the"],
+        cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900,
+    )
+    assert result.returncode == 0, result.stderr
+    opens = [
+        line for line in trace.read_text(errors="replace").splitlines()
+        if "timeline-v3/spine/" in line and ".jsonl.gz" in line
+    ]
+    spine_files = list(corpus.glob("data/timeline-v3/spine/*.jsonl.gz"))
+    assert spine_files, "corpus has no spine shards"
+    assert len(opens) <= 4 * len(spine_files), (
+        f"{len(opens)} spine opens for {len(spine_files)} shards"
+    )
+
+
 def test_search_errors_match_python(corpus: Path) -> None:
     base = ["query", "--output", str(corpus), "search"]
     _check_error([*base, "--in", "bogus", "the"])

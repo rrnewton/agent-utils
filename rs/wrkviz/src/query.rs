@@ -451,6 +451,8 @@ pub struct Timeline {
     sole_team: Option<String>,
     generation: Generation,
     collections: RefCell<BTreeMap<&'static str, Vec<Map<String, Value>>>>,
+    spine_groups: RefCell<BTreeMap<(String, String), Vec<Map<String, Value>>>>,
+    stream_records: RefCell<BTreeMap<String, Vec<Map<String, Value>>>>,
 }
 
 fn record_array(source: &Map<String, Value>, key: &str) -> Result<Vec<Map<String, Value>>, String> {
@@ -526,12 +528,31 @@ impl Timeline {
             sole_team,
             generation,
             collections: RefCell::new(BTreeMap::new()),
+            spine_groups: RefCell::new(BTreeMap::new()),
+            stream_records: RefCell::new(BTreeMap::new()),
         })
     }
 
     /// One team's line range of one spine kind, unwrapped and
     /// team-stamped (`_SchemaThreeArchive._group`).
     fn spine_group(
+        &self,
+        three: &SchemaThree,
+        kind: &str,
+        team: &str,
+    ) -> Result<Vec<Map<String, Value>>, String> {
+        let cache_key = (kind.to_string(), team.to_string());
+        if let Some(cached) = self.spine_groups.borrow().get(&cache_key) {
+            return Ok(cached.clone());
+        }
+        let records = self.spine_group_uncached(three, kind, team)?;
+        self.spine_groups
+            .borrow_mut()
+            .insert(cache_key, records.clone());
+        Ok(records)
+    }
+
+    fn spine_group_uncached(
         &self,
         three: &SchemaThree,
         kind: &str,
@@ -897,6 +918,20 @@ impl Timeline {
     }
 
     fn read_stream_records(
+        &self,
+        entry: &crate::inspect::ShardEntry,
+    ) -> Result<Vec<Map<String, Value>>, String> {
+        if let Some(cached) = self.stream_records.borrow().get(&entry.path) {
+            return Ok(cached.clone());
+        }
+        let records = self.read_stream_records_uncached(entry)?;
+        self.stream_records
+            .borrow_mut()
+            .insert(entry.path.clone(), records.clone());
+        Ok(records)
+    }
+
+    fn read_stream_records_uncached(
         &self,
         entry: &crate::inspect::ShardEntry,
     ) -> Result<Vec<Map<String, Value>>, String> {
