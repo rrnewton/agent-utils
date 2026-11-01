@@ -1,10 +1,11 @@
 ---
 title: 'agent-teams-coordinator-handover: make coordinator handover unable to silently lose inter-team messages'
-status: open
+status: closed
 priority: 1
 issue_type: task
 created_at: 2026-11-01T08:29:46.328746936+00:00
-updated_at: 2026-11-01T12:44:22.113463789+00:00
+updated_at: 2026-11-01T12:58:03.397986328+00:00
+closed_at: 2026-11-01T12:58:03.397986198+00:00
 ---
 
 # Description
