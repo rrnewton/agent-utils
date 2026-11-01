@@ -42,6 +42,9 @@ pub fn unescape_provider_text(text: &str) -> String {
         .replace("&#39;", "'")
         .replace("&quot;", "\"")
         .replace("&amp;", "&")
+        // Smart quotes a provider's formatting conversion substitutes.
+        .replace(['\u{201c}', '\u{201d}'], "\"")
+        .replace(['\u{2018}', '\u{2019}'], "'")
 }
 
 /// Strip the note a provider rescan appends to a rescued message, plus any
@@ -129,6 +132,57 @@ pub fn parse_post(text: &str) -> Result<RelayPost, String> {
     }
 }
 
+/// Classify one parsed JSON object by its schema, never by fence label:
+/// providers strip fence info strings, so content is the only authority.
+fn classify_value(value: Value) -> Option<RelayPost> {
+    match value.get("schema").and_then(Value::as_str) {
+        Some("agent-teams-message/v1") => Some(RelayPost::Envelope(value)),
+        Some("agent-teams-announce/v1") => Some(RelayPost::Announce(value)),
+        Some("agent-teams-receipt/v1") => Some(RelayPost::Receipt(value)),
+        _ => {
+            // Receipts posted before they carried a schema field: an
+            // object with an id and a state and no sender is a receipt.
+            if value.get("id").is_some()
+                && value.get("state").is_some()
+                && value.get("from").is_none()
+                && value.get("schema").is_none()
+            {
+                Some(RelayPost::Receipt(value))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Every fenced block's content, whatever its info string (including a
+/// bare ``` fence), plus the whole text as a bare-JSON candidate.
+fn json_candidates(clean: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = clean;
+    while let Some(start) = rest.find("```") {
+        let after = &rest[start + 3..];
+        let Some(end) = after.find("```") else { break };
+        let block = &after[..end];
+        let block = block.trim();
+        // Drop an info-string line when present (any label, or none).
+        let block = match block.find('\n') {
+            Some(nl)
+                if !block[..nl].contains('{') && !block[..nl].contains(char::is_whitespace) =>
+            {
+                block[nl + 1..].trim()
+            }
+            _ => block,
+        };
+        if block.starts_with('{') {
+            out.push(block.to_string());
+        }
+        rest = &after[end + 3..];
+    }
+    out.push(clean.trim().to_string());
+    out
+}
+
 fn parse_post_clean(clean: &str) -> Result<RelayPost, String> {
     for (fence, make) in [
         (
@@ -145,6 +199,20 @@ fn parse_post_clean(clean: &str) -> Result<RelayPost, String> {
             let value: Value =
                 serde_json::from_str(&block).map_err(|e| format!("bad {fence} JSON: {e}"))?;
             return Ok(make(value));
+        }
+    }
+    // Content-based fallback: a fenced (any label, or bare) or bare JSON
+    // object classified by its schema. This is what survives a provider
+    // stripping the fence info string.
+    for candidate in json_candidates(clean) {
+        for (at, _) in candidate.match_indices('{') {
+            let mut stream =
+                serde_json::Deserializer::from_str(&candidate[at..]).into_iter::<Value>();
+            if let Some(Ok(value)) = stream.next() {
+                if let Some(post) = classify_value(value) {
+                    return Ok(post);
+                }
+            }
         }
     }
     Err("no agent-teams fenced block".to_string())
@@ -728,6 +796,37 @@ pub fn relay_in(
     };
     match parsed {
         RelayPost::Announce(announce) => {
+            // Our own announce loops back through our bridge: recognized
+            // by its team@host key and ignored, never a stranger.
+            let announce_team = announce.get("team").and_then(Value::as_str).unwrap_or("");
+            let announce_host = announce.get("host").and_then(Value::as_str).unwrap_or("");
+            let own = own_public_key(state, announce_team, announce_host);
+            // "Own" means the announcing team itself owns this relay route
+            // in its local declaration. Another local team's key material
+            // in a shared state dir (the simulated-peer case) is not own.
+            let owns_route = load_declarations(state).is_ok_and(|declarations| {
+                declarations.iter().any(|(team, _, declaration)| {
+                    team == announce_team
+                        && declaration.relay_channels.iter().any(|entry| {
+                            entry.route == route
+                                && (entry.channel.is_empty() || entry.channel == channel)
+                        })
+                })
+            });
+            if announce_host == this_host
+                && owns_route
+                && own.is_some()
+                && own.as_deref() == announce.get("pubkey").and_then(Value::as_str)
+            {
+                log_event(
+                    state,
+                    &json!({"event": "relay-in", "outcome": "ignored-own-announce", "route": route, "peer_sender": peer_sender}),
+                );
+                return Ok(result(
+                    "ignored-own-announce",
+                    "signed announce from our own team",
+                ));
+            }
             let claimed = announce
                 .get("sender_id")
                 .and_then(Value::as_str)
@@ -1055,7 +1154,7 @@ fn relay_in_envelope(
         .and_then(Value::as_str)
         .unwrap_or("");
     let receipt_for = |state_name: &str, detail: &str| -> RelayInResult {
-        let mut receipt = json!({"id": id, "state": state_name, "detail": detail, "at": format_rfc3339_ms(now_unix_ms())});
+        let mut receipt = json!({"schema": "agent-teams-receipt/v1", "id": id, "state": state_name, "detail": detail, "at": format_rfc3339_ms(now_unix_ms())});
         // Receipts are signed with this (receiving) team@host's key.
         let _ = sign_receipt(state, &mut receipt, &declaration.team, this_host);
         let mut out = result(state_name, detail.to_string());
@@ -1238,7 +1337,7 @@ fn relay_deliver(
         .and_then(Value::as_str)
         .unwrap_or("");
     let receipt_for = |state_name: &str, detail: &str| -> RelayInResult {
-        let mut receipt = json!({"id": id, "state": state_name, "detail": detail, "at": format_rfc3339_ms(now_unix_ms())});
+        let mut receipt = json!({"schema": "agent-teams-receipt/v1", "id": id, "state": state_name, "detail": detail, "at": format_rfc3339_ms(now_unix_ms())});
         let _ = sign_receipt(state, &mut receipt, &declaration.team, this_host);
         let mut out = result(state_name, detail.to_string());
         out.receipt_text = Some(render_receipt(envelope, &receipt));
@@ -1983,6 +2082,58 @@ mod tests {
         let parsed = parse_post(&escaped).expect("parse escaped post");
         assert_eq!(parsed, RelayPost::Envelope(envelope.clone()));
         assert_eq!(post_tag_line(&post), team_tag(&envelope));
+    }
+
+    #[test]
+    fn slack_mangled_shapes_parse_by_content() {
+        // Bare fence, no info string (Slack strips it): announce.
+        let announce = build_announce("sim", "host-b", "UBOTSIM", "x");
+        let post = render_announce(&announce).replace("```agent-teams-announce", "```");
+        assert_eq!(
+            parse_post(&post).expect("bare-fence announce"),
+            RelayPost::Announce(announce)
+        );
+        // Envelope with the tag stripped and HTML entities escaped.
+        let envelope = crate::envelope::build_envelope(
+            "tm-sim-0123456789abcdef",
+            "k",
+            "sim",
+            "host-b",
+            1,
+            "harness-ancestry",
+            "tools",
+            "host-a",
+            "info",
+            None,
+            &[],
+            false,
+            0,
+            7_200_000,
+            None,
+            "hello <team> & friends",
+        );
+        let mangled = render_post(&envelope)
+            .replace("```agent-teams-envelope", "```")
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;");
+        assert_eq!(
+            parse_post(&mangled).expect("mangled envelope"),
+            RelayPost::Envelope(envelope.clone())
+        );
+        // Receipt with no tag at all (bare JSON) and smart quotes in detail.
+        let receipt = json!({"schema": "agent-teams-receipt/v1", "id": "tm-sim-0123456789abcdef", "state": "accepted", "detail": "ok", "at": "2026-01-01T00:00:00Z"});
+        let bare = serde_json::to_string(&receipt).unwrap();
+        assert_eq!(
+            parse_post(&bare).expect("bare receipt"),
+            RelayPost::Receipt(receipt)
+        );
+        // Pre-schema receipt in a bare fence still classifies as a receipt.
+        let legacy = "```\n{\"id\":\"tm-x\",\"state\":\"accepted\"}\n```";
+        assert!(matches!(
+            parse_post(legacy).expect("legacy receipt"),
+            RelayPost::Receipt(_)
+        ));
     }
 
     #[test]

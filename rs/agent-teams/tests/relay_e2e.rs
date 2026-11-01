@@ -752,6 +752,53 @@ fn shared_bot_signed_identity_admits_forgery_is_stranger() {
 }
 
 #[test]
+fn slack_mangled_own_announce_is_ignored_not_stranger() {
+    // Exact live shape: Slack strips the fence info string, leaving a bare
+    // ``` fence around the announce JSON. Our own announce must loop back
+    // as ignored, never as a stranger alarm.
+    const SHARED: &str = "USHAREDBOT";
+    let world = World::new();
+    world.init_tools(&format!("relay-coord:{CHAN}:{SHARED}=sim@host-a"));
+    let (_, public) =
+        agent_teams::relay::ensure_signing_key(&world.state, "tools", "host-a").expect("key");
+    let mut announce = agent_teams::relay::build_announce(
+        "tools",
+        "host-a",
+        SHARED,
+        "https://example.invalid/org/repo.git",
+    );
+    announce["pubkey"] = serde_json::json!(public);
+    announce["integrity"] = serde_json::json!(agent_teams::relay::announce_integrity(&announce));
+    let mangled =
+        agent_teams::relay::render_announce(&announce).replace("```agent-teams-announce", "```");
+    assert!(mangled.contains("\n```\n{"), "{mangled}");
+    let outcome = world.relay_in(SHARED, &mangled);
+    assert_eq!(outcome["outcome"], "ignored-own-announce", "{outcome}");
+    assert!(
+        !world
+            .hook_inbox_texts("tools")
+            .iter()
+            .any(|text| text.contains("ESCALATE") || text.contains("stranger")),
+        "own announce raised no stranger alarm: {:?}",
+        world.hook_inbox_texts("tools")
+    );
+    // The same bare-fence mangling on a peer announce still records a
+    // candidate (content classification, not the fence tag).
+    let mut peer = agent_teams::relay::build_announce(
+        "sim",
+        "host-a",
+        SHARED,
+        "https://example.invalid/org/repo.git",
+    );
+    peer["pubkey"] = serde_json::json!("00".repeat(32));
+    peer["integrity"] = serde_json::json!(agent_teams::relay::announce_integrity(&peer));
+    let mangled_peer =
+        agent_teams::relay::render_announce(&peer).replace("```agent-teams-announce", "```");
+    let outcome = world.relay_in(SHARED, &mangled_peer);
+    assert_eq!(outcome["outcome"], "candidate-recorded", "{outcome}");
+}
+
+#[test]
 fn setup_suggests_a_per_fleet_channel_and_writes_nothing() {
     let world = World::new();
     let (code, out, _) = world.run(&[
