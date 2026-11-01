@@ -108,3 +108,17 @@ test("`#624 voice-page-modularity`: a card's lines by the server's proxy, and a 
   assert.equal(threadFacts(choice), "5m · 3");
   assert.equal(threadFacts({ ...choice, count: 0 }), "5m", "a count of nought was printed");
 });
+
+test("`#624 voice-page-modularity`: a new thread's colour stands clear of its neighbours, and a message's text, from the module alone", () => {
+  const { hueApart, spreadThreadHue, newestThreadHues, THREAD_HUE_APART, THREAD_HUE_BESIDE, rawTextOf, renderedHtmlOf, messageLook, BLANK_TEXT } = ROWS;
+  assert.deepStrictEqual([hueApart(10, 350), hueApart(0, 180), hueApart(90, 90)], [20, 180, 0]);
+  // The widest arc's middle when it clears; else the re-roll, which does.
+  assert.equal(spreadThreadHue(200, [0, 100], { near: [0], beside: [100] }), 200);
+  const rolled = spreadThreadHue(20, [0, 120, 240], { near: [0, 120, 240], beside: [0] });
+  assert.ok(hueApart(rolled, 0) >= THREAD_HUE_BESIDE && [120, 240].every((hue) => hueApart(rolled, hue) >= THREAD_HUE_APART), `${rolled}`);
+  assert.deepStrictEqual(Object.keys(newestThreadHues([["a", [1, 10]], ["b", [2, 30]], ["c", [3, 20]]], 2)), ["b", "c"]);
+  assert.deepStrictEqual([rawTextOf({ content: null }), rawTextOf({ content: "x" }), renderedHtmlOf({}), renderedHtmlOf({ content_html: "<p>x</p>" })],
+    ["", "x", "", "<p>x</p>"]);
+  assert.equal(messageLook({ id: 9, content: "abc", content_html: "<p>abc</p>" }), "9|3:10||null");
+  assert.ok(BLANK_TEXT.test(" ​\n") && !BLANK_TEXT.test(" x "));
+});

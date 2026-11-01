@@ -223,6 +223,7 @@ export {
   upstreamClearSentence,
 } from "../present/notices/index.ts";
 export {
+  BLANK_TEXT,
   CARD_INDENTED_CHARS,
   CARD_LINE_CHARS,
   cardGapWords,
@@ -240,10 +241,15 @@ export {
   isNoise,
   joinsGroup,
   lineLabel,
+  messageLook,
+  newestThreadHues,
   proxyLinesOf,
+  rawTextOf,
   reactionKey,
   reactionText,
   readRunText,
+  renderedHtmlOf,
+  spreadThreadHue,
   threadChoice,
   threadFacts,
   undoLabel,

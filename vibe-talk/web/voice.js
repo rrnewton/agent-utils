@@ -24414,15 +24414,6 @@ function threadHueScope(channel) {
 }
 
 /**
- * The newest `limit` of `entries` ([id, [hue, lastDrawn]]), by when each was last drawn, as an
- * object. Built by `fromEntries`, so an id such as `__proto__` is a key like any other.
- */
-function newestThreadHues(entries, limit) {
-  return Object.fromEntries(entries.length <= limit ? entries
-    : entries.slice().sort((a, b) => b[1][1] - a[1][1]).slice(0, limit));
-}
-
-/**
  * Every channel's remembered colours, as {scope: {thread id: [hue, lastDrawn]}}. Storage is a
  * boundary: anything unreadable is left out, and a refusal to read at all is an empty memory.
  *
@@ -24718,35 +24709,12 @@ function threadHue(id) {
   return hue;
 }
 
-// `#414 thread-hue-spread`. The widest arc is the colour farthest from every thread the channel has,
-// but once `#396` remembers two dozen of them that arc can be 15° wide, and nothing kept the threads
-// drawn either side of a new one out of it: three consecutive roots came out three shades of one
-// colour. A new thread's colour must now stand clear of its neighbours, and is re-rolled if it does not.
-/**
- * How far apart, in degrees of hue, a new thread's colour is kept from its neighbours'. 45° is one
- * step of the eight hue families the eye names (red, orange, yellow, green, cyan, blue, violet,
- * magenta) at the page's fixed 55% saturation and 50% lightness, so neighbours never share one: at
- * 30° yellow-green and green, or two blues, still read as one colour at a 3px edge. It is also as far
- * as can still be promised: eight neighbours spread 45° apart leave nothing that clears them all.
- */
-const THREAD_HUE_APART = 45;
-/**
- * How far, more strictly, from the thread drawn right before or after it, where it can be had. At 45°
- * three threads in a row can still step along the wheel — blue, violet, magenta — and read as a
- * gradient; a quarter turn puts blue beside magenta or green, which reads as unrelated.
- */
-const THREAD_HUE_BESIDE = 90;
 /** Threads either side of a new one, in the order their roots were posted, whose colours it avoids. */
 const THREAD_HUE_NEIGHBOURS = 3;
 /** Threads given a colour most recently on this page whose colours a new one avoids too. */
 const THREAD_HUE_RECENT = 3;
 /** The threads last given a colour on this page, oldest first. Cleared with `threadColors`. */
 const threadHuesGiven = [];
-
-const hueApart = (a, b) => {
-  const apart = Math.abs(a - b) % 360;
-  return Math.min(apart, 360 - apart);
-};
 
 /**
  * The colours of the threads drawn near `key`: those whose roots come just before and after its own
@@ -24785,34 +24753,6 @@ function threadHueNeighbours(key) {
   const last = threadHuesGiven[threadHuesGiven.length - 1];
   if (last !== undefined && last !== key && threadColors.has(last)) beside.push(threadColors.get(last));
   return { near, beside };
-}
-
-/**
- * `widest`, the widest arc's middle, if it clears the neighbours: `THREAD_HUE_APART` from every colour
- * in `near` and `THREAD_HUE_BESIDE` from every one in `beside`. Else the re-roll: every whole degree is
- * a candidate, the farthest from every colour in `used` first and the lower hue on a tie, so the same
- * colours in use and neighbours always re-roll to the same colour, and the first that clears them wins. Where none does,
- * the same again asking only `THREAD_HUE_APART` of every neighbour; where none does that either, the
- * candidate farthest from its nearest neighbour.
- */
-function spreadThreadHue(widest, used, { near, beside }) {
-  const clearance = (hue, of) => of.reduce((least, other) => Math.min(least, hueApart(hue, other)), 360);
-  const tiers = [
-    (hue) => clearance(hue, near) >= THREAD_HUE_APART && clearance(hue, beside) >= THREAD_HUE_BESIDE,
-    (hue) => clearance(hue, near) >= THREAD_HUE_APART,
-  ];
-  if (tiers[0](widest)) return widest;
-  const spread = (hue) => clearance(hue, used);
-  const candidates = Array.from({ length: 360 }, (_, hue) => ({ hue, spread: spread(hue) }))
-    .sort((a, b) => b.spread - a.spread || a.hue - b.hue);
-  for (const clears of tiers) {
-    if (clears(widest)) return widest;
-    const first = candidates.find((candidate) => clears(candidate.hue));
-    if (first) return first.hue;
-  }
-  let best = candidates[0];
-  for (const candidate of candidates) if (clearance(candidate.hue, near) > clearance(best.hue, near)) best = candidate;
-  return best.hue;
 }
 
 function threadCount(count, exact) {
@@ -30536,14 +30476,6 @@ function insertSanitizedHtml(parent, contentHtml) {
   parent.append(...template.content.childNodes);
 }
 
-/** A message's rendered body, or "" when it has none and is drawn from its text. */
-const renderedHtmlOf = (message) =>
-  message && typeof message.content_html === "string" ? message.content_html : "";
-
-/** A message's raw text, as written. */
-const rawTextOf = (message) =>
-  String(message && message.content !== null && message.content !== undefined ? message.content : "");
-
 /**
  * Text as plain paragraphs: each run of lines that are not blank is a paragraph, and the lines in
  * it are separated by line breaks. Exactly the shape the server compares against before it decides
@@ -34485,9 +34417,6 @@ function stillToDo(message, done = doneState().archived) {
 // (`stillToDo`), so no count, tally or Hide read list has it; no offer to jump to it, and nothing
 // relayed into a call. The store keeps it, as it keeps every message, so turning the switch off
 // draws it again from what is held, with no read.
-
-/** Text with nothing in it to see: white space, and the zero-width characters a body can carry. */
-const BLANK_TEXT = /^[\s\u200b-\u200d\u2060]*$/u;
 
 /** Is `message` one with nothing in it to show? See "WHAT EMPTY IS" above. */
 function emptyMessage(message) {
@@ -48293,18 +48222,6 @@ function unpackSignature(choice, held) {
     // `#532 shift-o-latency`: what decides its loading or end line (`unpackNeedsRead`, the cover), which
     // a block kept from the last pass would otherwise never ask again.
     typeof choice.count === "number" ? choice.count : null, cover ? cover.more !== false : null]);
-}
-
-/**
- * What a message's row draws from it beyond its id, as a signature: its words and their rendering (by
- * length, and the edit the provider reported) and its reactions. A row kept from the last pass
- * (`renderSideCards`) is drawn again when this changes: an edit or a reaction since. `#532 shift-o-latency`.
- *
- * @param {any} message
- */
-function messageLook(message) {
-  const words = `${rawTextOf(message).length}:${renderedHtmlOf(message).length}`;
-  return `${String(message.id)}|${words}|${message.edited_timestamp || ""}|${JSON.stringify(message.reactions || null)}`;
 }
 
 /**

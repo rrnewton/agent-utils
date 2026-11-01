@@ -1428,7 +1428,8 @@ test("the page has ONE html sink, and only a message's content_html ever reaches
   assert.deepStrictEqual(calls, ["parent, contentHtml", "box, html"], "insertSanitizedHtml gained a caller");
   assert.match(SCRIPT_CODE, /const html = renderedHtmlOf\(message\);\s*if \(html !== ""\) \{\s*insertSanitizedHtml\(box, html\);/,
     "the one caller no longer passes a message's content_html");
-  assert.match(SCRIPT_CODE, /const renderedHtmlOf = \(message\) =>\s*message && typeof message\.content_html === "string" \? message\.content_html : "";/);
+  // `renderedHtmlOf` is web/src/present/rows' now (`#624 voice-page-modularity`), typed.
+  assert.match(PAGE_CODE, /const renderedHtmlOf = \(message[^)]*\)(?:: string)? =>\s*message && typeof message\.content_html === "string" \? message\.content_html : "";/);
   assert.doesNotMatch(PAGE_CODE,
     /outerHTML|insertAdjacentHTML|document\.write|createContextualFragment|DOMParser|srcdoc/);
 

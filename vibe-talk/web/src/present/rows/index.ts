@@ -39,3 +39,5 @@ export {
   wrapCardLine,
 } from "./cards.ts";
 export type { ThreadChoice } from "./cards.ts";
+export { THREAD_HUE_APART, THREAD_HUE_BESIDE, hueApart, newestThreadHues, spreadThreadHue } from "./hues.ts";
+export { BLANK_TEXT, messageLook, rawTextOf, renderedHtmlOf } from "./message.ts";

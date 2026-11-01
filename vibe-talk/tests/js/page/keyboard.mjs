@@ -5054,7 +5054,7 @@ test("`#532 shift-o-latency`: a kept block is drawn again for what its rows show
 
   // An edit and a reaction are in what a kept row is drawn again for, though its id and read state are
   // the same; and the thread's reported count and its cover, which decide its loading line.
-  const look = page.pure("messageLook");
+  const look = page.preludeBinding("messageLook");
   const base = data.messages.find((one) => one.id === "9532112");
   assert.notEqual(look({ ...base, content: `${base.content} and more`, edited_timestamp: "2026-10-26T12:00:00Z" }), look(base),
     "an edit is not in a row's signature");
