@@ -331,6 +331,54 @@ async fn recap_refuses_bad_windows_and_unknown_channels() {
 }
 
 #[tokio::test]
+async fn recap_says_so_when_the_page_bound_cuts_the_window() {
+    let (mut state, _discord, _store) = testing::state_with_store();
+    let backend = Arc::new(RecapBackend::default());
+    let mut messages = fixtures();
+    // More newer messages than the walk's page bound can pass (50 pages of 99).
+    for index in 0..5_000u64 {
+        messages.push(message(
+            30,
+            100 + index,
+            "agent-a",
+            "newer noise",
+            None,
+            false,
+        ));
+    }
+    *backend.messages.lock().expect("messages") = messages;
+    state.replace_chat(backend);
+    let app = vibe_talk::http::router(state);
+    let (status, body) = call(&app, "GET", &window_path(), Some(READ_TOKEN)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["truncated"], json!(true), "{body}");
+}
+
+#[tokio::test]
+async fn recap_falls_back_to_the_main_walk_where_thread_timelines_are_refused() {
+    // FakeDiscord refuses thread timelines; its channels' own messages are the whole window.
+    let (state, discord, store) = testing::state_with_store();
+    let channel = ChannelId(WRITE_CHANNEL.to_owned());
+    let first = discord.seed_at(&channel, "agent-a", "fallback one", base_ms() + 11 * HOUR);
+    let second = discord.seed_at(&channel, "agent-b", "fallback two", base_ms() + 12 * HOUR);
+    store
+        .dismiss(&channel, std::slice::from_ref(&first))
+        .await
+        .expect("dismiss");
+    let app = vibe_talk::http::router(state);
+    let (status, body) = call(&app, "GET", &window_path(), Some(READ_TOKEN)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["counts"]["done"], json!(1), "{body}");
+    assert_eq!(body["counts"]["unread"], json!(1), "{body}");
+    let groups = body["groups"].as_array().expect("groups");
+    assert_eq!(groups.len(), 2, "{body}");
+    assert_eq!(groups[0]["messages"][0]["id"], json!(first.as_str()));
+    assert_eq!(groups[0]["messages"][0]["done"], json!(true));
+    assert_eq!(groups[1]["messages"][0]["id"], json!(second.as_str()));
+    assert_eq!(groups[1]["messages"][0]["done"], json!(false));
+}
+
+#[tokio::test]
 async fn recap_without_a_store_annotates_nothing() {
     let (mut state, _discord) =
         testing::state_with(Arc::new(vibe_talk::store::disabled::DisabledStore));

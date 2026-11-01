@@ -6607,6 +6607,7 @@ pub async fn recap(
         let mut held: Vec<Message> = Vec::new();
         let mut before: Option<String> = None;
         let mut truncated = false;
+        let mut finished = false;
         for _ in 0..MAX_RECAP_PAGES {
             let request = TimelineRequest {
                 view: TimelineView::Flat,
@@ -6617,6 +6618,7 @@ pub async fn recap(
             };
             let (_, page) = timeline(state, caller, channel_id, &request).await?;
             if page.messages.is_empty() {
+                finished = true;
                 break;
             }
             let reached_start = page
@@ -6631,12 +6633,22 @@ pub async fn recap(
                 break;
             }
             if !page.has_more || reached_start {
+                finished = true;
                 break;
             }
             match page.next_before {
                 Some(next) => before = Some(next),
-                None => break,
+                None => {
+                    truncated = true;
+                    finished = true;
+                    break;
+                }
             }
+        }
+        // The page bound ended the walk with more behind it: say so, never report a partial
+        // window as whole.
+        if !finished {
+            truncated = true;
         }
         Ok::<_, OpError>((held, truncated))
     };
@@ -6647,6 +6659,7 @@ pub async fn recap(
         {
             let mut held: Vec<Message> = Vec::new();
             let mut truncated = false;
+            let mut finished = false;
             let mut since_arg = crate::clock::iso_from_ms(since_ms);
             let until_arg = crate::clock::iso_from_ms(until_ms);
             for _ in 0..MAX_RECAP_PAGES {
@@ -6669,12 +6682,20 @@ pub async fn recap(
                     break;
                 }
                 if !step.has_more {
+                    finished = true;
                     break;
                 }
                 match step.next_since {
                     Some(next) => since_arg = next,
-                    None => break,
+                    None => {
+                        truncated = true;
+                        finished = true;
+                        break;
+                    }
                 }
+            }
+            if !finished {
+                truncated = true;
             }
             (held, truncated)
         }
@@ -6724,6 +6745,7 @@ pub async fn recap(
         let mut all: Vec<Message> = Vec::new();
         let mut before: Option<String> = None;
         let mut walk_truncated = false;
+        let mut walk_finished = false;
         for _ in 0..MAX_RECAP_PAGES {
             let request = TimelineRequest {
                 view: TimelineView::Thread,
@@ -6746,19 +6768,36 @@ pub async fn recap(
             let has_more = page.has_more;
             all.extend(page.messages);
             if !has_more {
+                walk_finished = true;
                 break;
             }
             match page.next_before {
                 Some(next) => before = Some(next),
                 None => {
                     walk_truncated = true;
+                    walk_finished = true;
                     break;
                 }
             }
         }
+        if !walk_finished {
+            walk_truncated = true;
+        }
         all.sort_by_key(|message| (message.created_ms().unwrap_or(i64::MAX), message.id.clone()));
         all.dedup_by(|next, kept| next.id == kept.id);
-        let Some(root) = all.first().cloned() else {
+        // Noise is never listed, in an opening any more than in the window.
+        all.retain(|message| !message.noise);
+        // Only a walk that reached the thread's start may call its oldest message the root.
+        let Some(root) = all.first().cloned().filter(|_| !walk_truncated) else {
+            contexts.insert(
+                thread_id.clone(),
+                crate::recap::ThreadContext {
+                    root: None,
+                    opening: Vec::new(),
+                    hidden_before: None,
+                    truncated: true,
+                },
+            );
             continue;
         };
         let before_window: Vec<Message> = all
@@ -6786,6 +6825,25 @@ pub async fn recap(
                 truncated: walk_truncated,
             },
         );
+    }
+    // Threads past the opening bound still say their opening was not read.
+    for thread_id in threads.iter().skip(MAX_RECAP_CONTEXT_THREADS) {
+        let has_root = visible.iter().any(|message| {
+            message
+                .thread
+                .as_ref()
+                .is_some_and(|thread| thread.id == *thread_id && thread.is_root)
+        });
+        if !has_root {
+            contexts
+                .entry(thread_id.clone())
+                .or_insert_with(|| crate::recap::ThreadContext {
+                    root: None,
+                    opening: Vec::new(),
+                    hidden_before: None,
+                    truncated: true,
+                });
+        }
     }
     let done = visible
         .iter()

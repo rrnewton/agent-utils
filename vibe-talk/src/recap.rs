@@ -320,7 +320,7 @@ fn message_et(message: &Message) -> String {
                 .unwrap_or_else(|_| jiff::tz::TimeZone::UTC);
             jiff::Timestamp::from_millisecond(ms).map_or_else(
                 |_| message.timestamp.clone(),
-                |instant| format!("{} ET", instant.to_zoned(zone).strftime("%H:%M")),
+                |instant| format!("{} ET", instant.to_zoned(zone).strftime("%Y-%m-%d %H:%M")),
             )
         },
     )
@@ -444,8 +444,8 @@ fn render_channel(response: &RecapResponse, mode: DoneMode) -> String {
                             et_label(started)
                         ));
                     }
-                    for (index, message) in group.context.iter().enumerate() {
-                        out.push_str(&message_line(message, mode, index > 0));
+                    for message in &group.context {
+                        out.push_str(&message_line(message, mode, true));
                         out.push('\n');
                     }
                 } else if group.context_truncated {
