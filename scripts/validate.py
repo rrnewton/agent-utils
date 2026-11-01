@@ -224,6 +224,7 @@ PREFIX_RULES: tuple[tuple[str, frozenset[str]], ...] = (
     # These define the planner or executable graph itself; only the complete portable contract can prove a
     # change to them. The exact rules beat the repository-infrastructure component mapping.
     ("scripts/validate.py", frozenset(GROUPS)),
+    ("scripts/gate.py", frozenset({PYTHON_COMPONENT_TESTS})),
     ("scripts/run_component_tests.py", frozenset({PYTHON_COMPONENT_TESTS})),
     ("scripts/run_pytest_shard.py", frozenset({PYTEST_SHARDS})),
     ("scripts/pid_namespace_init.py", frozenset({PYTHON_NAMESPACE_TESTS})),
