@@ -64,3 +64,22 @@ test("`#624 voice-page-modularity`: where a search's words are in a row, from th
   assert.equal(author.className, "msg-author");
   assert.equal(anchorsAmong(parts).length, 2);
 });
+
+test("`#624 voice-page-modularity`: a drawn row read back, from the module alone", () => {
+  const { idsOf, rowMessages, rowSentMs, shownRowFor, standingRow, authorLabel, isMessageRow } = CHANNEL_VIEW;
+  const row = (attrs, extra = {}) => ({ getAttribute: (name) => (name in attrs ? attrs[name] : null), className: "", hidden: false, ...extra });
+  assert.deepStrictEqual(idsOf(row({ "data-ids": "1 2  3" })), ["1", "2", "3"]);
+  assert.deepStrictEqual([idsOf(null), rowMessages(null)], [[], []]);
+  assert.equal(rowSentMs(row({}, { messages: [{ timestamp: "2026-10-12T00:00:00Z" }] })), Date.parse("2026-10-12T00:00:00Z"));
+  assert.equal(authorLabel(row({ "data-author": "Ada", "data-author-bot": "true" })), "Ada (bot)");
+  assert.equal(isMessageRow(row({ "data-search": "" })), true);
+  // A member of a collapsed run stands for its run's head row, which is shown unless hidden.
+  const head = row({ "data-read-run": "head" });
+  const member = row({ "data-read-run": "member" });
+  const parent = { children: [head, member] };
+  member.parentNode = parent;
+  assert.equal(shownRowFor(member), head);
+  assert.equal(standingRow(member), head);
+  head.hidden = true;
+  assert.equal(standingRow(member), null);
+});

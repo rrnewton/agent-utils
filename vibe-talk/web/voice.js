@@ -6611,39 +6611,6 @@ function endFilterWalk() {
 /** Which list a filter's place is in: the view on screen, and whether the Pinned list stands in for it. */
 const filterKey = () => JSON.stringify([filterPlace(), pinsView().only]);
 
-/** Whether `row` is a message the filters judge: it declares what it is findable by (`searchable`). */
-const isMessageRow = (row) => row.getAttribute("data-search") !== null;
-
-/** The row standing for `row` on the screen — itself, or the line of its collapsed run — or null when none does. */
-function standingRow(row) {
-  const shown = row ? shownRowFor(row) : null;
-  return shown && rowShown(shown) ? shown : null;
-}
-
-/**
- * Where message `id` stands in `row`, in the viewport, as the top of a row of its own would: the row's
- * top, less the parts of a combined row (`glom`) drawn above it. A combined row draws each of its
- * messages as a block of its `.body`, in order, so the second half of a long post split in two starts
- * as far below the row's first block as the first half is tall — and, as a row of its own in the
- * Pinned list, its text started right under the author line. The row's own top for its first message,
- * for a row that holds no such message (a run's line, the message standing in for one a filter hides),
- * and for a block its fold has cut off out of sight.
- *
- * From review: a pin found as the second part of a split post was put back by the row's top, and so
- * lower on the screen, by the height of the part above it, than it stood in the Pinned list.
- */
-function messageTop(row, id) {
-  const top = row.getBoundingClientRect().top;
-  const ids = idsOf(row);
-  const at = id === null ? -1 : ids.indexOf(id);
-  if (at <= 0) return top;
-  const body = childByClass(row, "body");
-  if (!body || body.children.length !== ids.length) return top;
-  const start = body.children[at].getBoundingClientRect().top;
-  if (start >= body.getBoundingClientRect().bottom) return top;
-  return top + start - body.children[0].getBoundingClientRect().top;
-}
-
 /** The anchor `row` makes, the selection's details given in `selection` when it is the selected row. */
 function anchorAt(row, selection = null) {
   const messages = rowMessages(row);
@@ -24942,7 +24909,7 @@ function entryLandingMark() {
  * landed message.
  */
 function keepEntryLanding(mark) {
-  const rows = [...el("discord-log").children];
+  const rows = /** @type {HTMLElement[]} */ ([...el("discord-log").children]);
   const rowFor = (ids) => shownRowFor(rows.find((candidate) => idsOf(candidate).some((id) => ids.includes(id))));
   const first = rowFor(mark.first);
   if (!first || first.hidden) return false;
@@ -30767,15 +30734,6 @@ function noteAuthor(channelId, id, name, isBot) {
  */
 // A row's own part, found by walking the row (`childByClass`), is web/src/view/dom's.
 
-const doneButtonOf = (row) => childByClass(row, "done-button");
-const notNoiseButtonOf = (row) => childByClass(row, "not-noise-button");
-
-/** How a row names its author: the display name, and `(bot)` when it is one. */
-function authorLabel(row) {
-  const name = row.getAttribute("data-author") || "";
-  return row.getAttribute("data-author-bot") === "true" ? `${name} (bot)` : name;
-}
-
 /**
  * The messages some row of `rows` answers, by their ids, with those a reply sent from here answers
  * once its post is acknowledged: what dims a row as replied to (`dressChannelRow`).
@@ -31124,13 +31082,6 @@ function bookmarkAnchor(channel = currentChannelId()) {
 
 // `sameAnchor`, `isBookmarkState` and `anchorOfMessage` are web/src/core/annotations's.
 
-/** The anchor for the line just above `row` (`above`), or just below it (`below`). */
-function anchorOfRow(row, place) {
-  const held = rowMessages(row);
-  const message = place === "below" ? held[held.length - 1] : held[0];
-  return message ? anchorOfMessage(message, place) : null;
-}
-
 /**
  * Forget every channel's bookmark: another credential. The writes on their way are still counted
  * (`bookmarkWrites`): the server keeps one bookmark whoever asks, so a read sent before one of them
@@ -31265,15 +31216,6 @@ function bookmarkListRefusal(anchor) {
   }
   return "The bookmark is in Main and All.";
 }
-
-/** The time a row was sent, in milliseconds, from its first message; NaN when it cannot be read. */
-const rowSentMs = (row) => Date.parse(String((rowMessages(row)[0] || {}).timestamp || ""));
-
-/** The time a row's newest message was sent, in milliseconds; NaN when it cannot be read. */
-const rowNewestMs = (row) => {
-  const held = rowMessages(row);
-  return Date.parse(String((held[held.length - 1] || {}).timestamp || ""));
-};
 
 /**
  * Whether Hide read's list, in a channel without threads, holds every message still to do from time
@@ -32365,9 +32307,6 @@ function rootFontPx() {
   const size = style ? parseFloat(style.fontSize) : NaN;
   return Number.isFinite(size) && size > 0 ? size : 16;
 }
-
-/** Whether the reader can see `row` in the list: not hidden, and not filtered out by the search. */
-const rowShown = (row) => !row.hidden && !String(row.className).split(/\s+/).includes("search-hidden");
 
 /**
  * Where each adjacent arrow meets the row above, from where the two rows are laid out: on its
@@ -37258,27 +37197,6 @@ function glom(messages) {
 }
 
 /**
- * The messages a rendered row stands for, oldest first.
- *
- * Held ON the element, because the row already is this page's record of what it is showing and a
- * second map keyed by id would have to be kept in step with a list three different reads rebuild.
- */
-const rowMessages = (row) => (row && row.messages) || [];
-
-/**
- * Every Discord id a row stands for, oldest first.
- *
- * Read from the ATTRIBUTE rather than from `rowMessages`, because that is the idiom every other
- * derivation in `renderChannelRows` follows and because it keeps the grouping visible in the
- * document rather than only in a property a debugger has to be told about. `discordNode` writes
- * both from the same array, so they cannot disagree.
- */
-const idsOf = (row) =>
-  String((row && row.getAttribute("data-ids")) || "")
-    .split(" ")
-    .filter(Boolean);
-
-/**
  * Redraw the channel list from the messages already on screen, under the current grouping.
  *
  * What the setting needs and a re-read cannot give it: turning combining on or off must not cost a
@@ -40941,16 +40859,6 @@ function liveUnpackedRow(row) {
     one.getAttribute("data-unpack-thread") === thread && idsOf(one).includes(first)) || null;
 }
 
-/** The row on screen standing for `row`: itself, or the line of the collapsed run it is hidden in. */
-function shownRowFor(row) {
-  if (!row || row.getAttribute("data-read-run") !== "member" || !row.parentNode) return row;
-  const rows = [...row.parentNode.children];
-  for (let at = rows.indexOf(row); at >= 0; at -= 1) {
-    if (rows[at].getAttribute("data-read-run") === "head") return rows[at];
-  }
-  return row;
-}
-
 /** Cycle to the next read mode. The Hide read button's tap. */
 function cycleReadMode() {
   setReadMode(nextReadMode(readMode));
@@ -44319,11 +44227,6 @@ function replyListOf(from) {
 /** The place in the stream for a reply opened on `list`: #side-reply in the right column, else #column-reply. */
 function replyMountFor(list) {
   return nodeWithin(leftEl("side-column"), list) ? leftEl("side-reply") : leftEl("column-reply");
-}
-
-/** The row of `list` holding message `id`, or null. */
-function rowIn(list, id) {
-  return /** @type {HTMLElement | undefined} */ ([...list.children].find((row) => idsOf(row).includes(String(id)))) || null;
 }
 
 /** Whether `message` is the root of the thread the list on screen is: every row after it is its thread. */
