@@ -11590,7 +11590,7 @@ async function renderAudioRouteReadout() {
 // text-entry-button` and `#60 canned-prompt-buttons` onward — every other small button.
 //
 // ONE bar, TWO possible parents. `#control-bar-top` sits in the header and `#control-bar-bottom`
-// sits in the dock directly above the big buttons; `setPlacement` moves the single element between
+// sits in the dock directly above the big buttons; `barPlacement.set` moves the single element between
 // them. Two copies would be two sets of ids, and the page would then have to keep two gears and
 // two switches agreeing about which screen is up.
 //
@@ -11598,58 +11598,18 @@ async function renderAudioRouteReadout() {
 // default placement is a fact about the served markup: a page whose script dies still shows the
 // controls where they belong.
 
-const BAR_PLACEMENT_KEY = "vibe-talk.voice.bar-placement";
-
-// Bottom, because that is where the thumb already is — and because with the bar down there the
-// header holds nothing on the main screen and can be collapsed entirely, which is the vertical
-// space the issue is actually about.
-const DEFAULT_PLACEMENT = "bottom";
-
-const PLACEMENTS = ["bottom", "top"];
-
-/** Where the reader last put the bar, validated. Anything else is somebody else's data. */
-function storedPlacement() {
-  let stored = null;
-  try {
-    stored = deviceStorage().getItem(BAR_PLACEMENT_KEY);
-  } catch (_error) {
-    stored = null;
-  }
-  return PLACEMENTS.includes(stored) ? stored : DEFAULT_PLACEMENT;
-}
-
-function persistPlacement(where) {
-  try {
-    deviceStorage().setItem(BAR_PLACEMENT_KEY, where);
-  } catch (_error) {
-    return false;
-  }
-  // Read back rather than assume, exactly as the microphone settings do: private browsing accepts
-  // setItem and stores nothing, so "Saved" would be a lie discovered only after a reload.
-  return deviceStorage().getItem(BAR_PLACEMENT_KEY) === where;
-}
-
-let placement = DEFAULT_PLACEMENT;
-
-/** Move the bar. The re-parent is the whole mechanism; everything else follows from it. */
-function setPlacement(where) {
-  placement = PLACEMENTS.includes(where) ? where : DEFAULT_PLACEMENT;
-  el("control-bar").setAttribute("data-placement", placement);
-  el(placement === "top" ? "control-bar-top" : "control-bar-bottom").append(el("control-bar"));
-  renderControlBar();
-}
-
-function placementChanged() {
-  const chosen = el("bar-placement").value;
-  const saved = persistPlacement(chosen);
-  setPlacement(chosen);
-  el("bar-placement-state").textContent = saved
-    ? placement === "top"
-      ? "Saved. The bar is under the title again."
-      : "Saved. The bar sits directly above the big buttons, and the header takes no room."
-    : "This browser refused to store the setting, so it will be back at the bottom when you " +
-      "reload (private browsing does this). The bar has moved for now.";
-}
+/**
+ * Where the bar is, where the reader last put it, and the moves between its two parents:
+ * web/src/view/settings `mountBarPlacement`, in the words of web/src/present/settings (`#624
+ * voice-page-modularity`).
+ *
+ * @type {import("./src/view/settings/index.ts").BarPlacement}
+ */
+const barPlacement = mountBarPlacement({
+  lookup: (id) => el(id),
+  storage: () => deviceStorage(),
+  renderControlBar: () => renderControlBar(),
+});
 
 /**
  * WHICH VIEW each member of #bar-pack belongs on. A table, and every member needs a line in it.
@@ -11770,7 +11730,7 @@ function renderControlBar() {
   el("topbar").hidden =
     el("close-settings").hidden &&
     el("topbar-title").hidden &&
-    (placement !== "top" || el("control-bar").hidden);
+    (barPlacement.where() !== "top" || el("control-bar").hidden);
 }
 
 // --- the reading column ---------------------------------------------------------------------
@@ -39358,8 +39318,8 @@ if (navigator.mediaDevices && typeof navigator.mediaDevices.addEventListener ===
 
 // `#58 control-bar`. Where the reader last put the bar, restored before the first screen is drawn
 // — the select carries the live truth, exactly as the microphone checkboxes do.
-el("bar-placement").value = storedPlacement();
-el("bar-placement").addEventListener("change", placementChanged);
+el("bar-placement").value = barPlacement.stored();
+el("bar-placement").addEventListener("change", () => barPlacement.changed());
 
 // `#481 slack-app-deep-link`. Where this device opens Slack links, as the bar's placement is.
 el("slack-open-in").value = storedSlackOpen();
@@ -41157,7 +41117,7 @@ if (token() && devicePairing.code() === null) {
 }
 // Before the first screen is shown, so the bar is in its home from the first frame rather than
 // visibly jumping out of the header once script catches up. `#58 control-bar`.
-setPlacement(storedPlacement());
+barPlacement.set(barPlacement.stored());
 // The read mode as the reader left it, before the first row is drawn or read. `#189
 // restore-ui-state`, and `#221 read-modes`: a record an older page kept says only Hide read or not.
 if (savedUi) {

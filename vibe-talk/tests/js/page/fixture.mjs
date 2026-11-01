@@ -541,7 +541,7 @@ const FIXTURE_TREE = {
   "prompts-tray": ["canned-summary", "canned-blockers"],
   // ...and the bar itself, in markup order, because "the gear is leftmost and the switch
   // rightmost" is an ordering claim and a fixture that held the members in a flat list could not
-  // check it. It is also what `setPlacement` re-parents, so the move has something real to move.
+  // check it. It is also what `barPlacement.set` (web/src/view/settings) re-parents, so the move has something real to move.
   "control-bar": ["open-settings", "bar-pack", "prompts-tray", "view-switch"],
   // `#410 inline-reply-editor`. The reply's box, kept in the left column's place while no reply is open
   // and moved into the stream of a column and back, so what is inside it goes with it: whether the focus

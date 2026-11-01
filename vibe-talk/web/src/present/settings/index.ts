@@ -70,3 +70,4 @@ export {
 export { GRIP_KEYS, MSG_SCALE_STEP, msgScaleStepTarget, msgScaleWords, readingWidthWords } from "./screen.ts";
 export { STRAY_SERVICE_FACTS, addChannelForm, allChannelsFacts, emptyServiceWords, serviceFacts, writeSourceWords } from "./channels.ts";
 export type { ServiceDescription, WriteSource } from "./channels.ts";
+export { DEFAULT_PLACEMENT, PLACEMENTS, placementOf, placementWords } from "./placement.ts";

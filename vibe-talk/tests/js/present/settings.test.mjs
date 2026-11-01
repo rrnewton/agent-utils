@@ -230,3 +230,13 @@ test("`#355 provider-grouped-channels`, `#374 registered-writable-follows-policy
   assert.match(writeSourceWords({ write_source: "provider_gone", writable: true }, "Slack"), /no longer configured/);
   assert.equal(writeSourceWords({}, "Slack"), "", "an older server says nothing more");
 });
+
+test("`#58 control-bar`: where the bar may sit, and what Settings says when it moves", () => {
+  const { PLACEMENTS, DEFAULT_PLACEMENT, placementOf, placementWords } = SETTINGS;
+  assert.deepStrictEqual(PLACEMENTS, ["bottom", "top"]);
+  assert.equal(DEFAULT_PLACEMENT, "bottom");
+  assert.deepStrictEqual(["top", "bottom", "side", null, undefined, 1].map(placementOf), ["top", "bottom", "bottom", "bottom", "bottom", "bottom"]);
+  assert.equal(placementWords(true, "top"), "Saved. The bar is under the title again.");
+  assert.match(placementWords(true, "bottom"), /^Saved\. The bar sits directly above the big buttons/);
+  assert.match(placementWords(false, "top"), /^This browser refused to store the setting/);
+});

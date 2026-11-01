@@ -122,6 +122,7 @@ export {
   writeSourceWords,
 } from "../present/settings/index.ts";
 export {
+  mountBarPlacement,
   mountChannelDirectory,
   mountChannelHistory,
   mountDismissedSends,

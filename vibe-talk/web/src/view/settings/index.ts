@@ -21,3 +21,5 @@ export { mountPairing } from "./pairing.ts";
 export type { Pairing, PairingDependencies } from "./pairing.ts";
 export { mountReadingWidth, mountTextSize } from "./screen.ts";
 export type { ReadingWidth, ScreenSettingDependencies, TextSize } from "./screen.ts";
+export { mountBarPlacement } from "./placement.ts";
+export type { BarPlacement, BarPlacementDependencies } from "./placement.ts";

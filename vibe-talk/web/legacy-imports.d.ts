@@ -270,3 +270,4 @@ declare const allChannelsFacts: LegacyImports["allChannelsFacts"];
 declare const emptyServiceWords: LegacyImports["emptyServiceWords"];
 declare const serviceFacts: LegacyImports["serviceFacts"];
 declare const writeSourceWords: LegacyImports["writeSourceWords"];
+declare const mountBarPlacement: LegacyImports["mountBarPlacement"];
