@@ -9987,54 +9987,8 @@ function watchBoxInsertions(box) {
 //     9): the call's view takes no keys but Escape and the search, Settings and help of the page.
 //   * Browser history is not touched: Back in the browser still leaves the page. A follow-up.
 
-/**
- * The input types that take no typing: on one of these a single key is a command, not a character.
- * Every other input (text, search, password, number, a date) is a field the reader types in.
- */
-const UNTYPED_INPUTS = ["checkbox", "radio", "range", "button", "submit", "reset", "image", "file", "color"];
-
-/** Whether `node` is somewhere the reader types: a text input, a textarea, or editable content. */
-function isTextField(node) {
-  if (!node) return false;
-  if (node.isContentEditable === true) return true;
-  const tag = String(node.tagName || "").toUpperCase();
-  if (tag === "TEXTAREA") return true;
-  return tag === "INPUT" && !UNTYPED_INPUTS.includes(String(node.type || "text").toLowerCase());
-}
-
-/**
- * Whether `node` keeps the arrow keys for itself: a picker, a slider, the reading-width handle. A
- * single key on one of those is the control's too: a picker's type-to-find, a slider's step.
- */
-function keepsOwnKeys(node) {
-  if (!node) return false;
-  const tag = String(node.tagName || "").toUpperCase();
-  if (tag === "SELECT") return true;
-  if (tag === "INPUT" && String(node.type || "").toLowerCase() === "range") return true;
-  const role = typeof node.getAttribute === "function" ? node.getAttribute("role") : null;
-  return role === "separator" || role === "slider" || role === "spinbutton";
-}
-
-/** The controls a Space presses, toggles or opens. On one of them Space is the control's own. */
-function pressedBySpace(node) {
-  const tag = String((node && node.tagName) || "").toUpperCase();
-  return ["BUTTON", "INPUT", "SELECT", "TEXTAREA", "SUMMARY"].includes(tag);
-}
-
-/** A link: Ctrl+Enter (Cmd+Enter) on one is the browser's, which opens it in a new tab. */
-const isLink = (node) => String((node && node.tagName) || "").toUpperCase() === "A";
-
-/** The controls an Enter presses or follows: on one of them Enter is its own, not the row's. */
-function answersEnter(node) {
-  const tag = String((node && node.tagName) || "").toUpperCase();
-  return ["BUTTON", "A", "INPUT", "SELECT", "TEXTAREA", "SUMMARY"].includes(tag) || isTextField(node);
-}
-
-/** A textarea holding more than it shows, which has a page of its own for the page keys to move through. */
-function scrollsItself(field) {
-  return String(field.tagName || "").toUpperCase() === "TEXTAREA" &&
-    Number(field.scrollHeight) > Number(field.clientHeight) + 1;
-}
+// Where a key landed (isTextField, keepsOwnKeys, pressedBySpace, isLink, answersEnter, scrollsItself)
+// is read in web/src/view/dom/ (`#624 voice-page-modularity`).
 
 /** Whether nothing holds the focus: the body has it, as after a load or a control that hid itself. */
 function focusLost() {

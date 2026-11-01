@@ -6,3 +6,4 @@ export { elementIn, focusMinimally } from "./shell.ts";
 export type { ElementById } from "./ids.ts";
 export { classWords, setClassWord } from "./classes.ts";
 export { sayingNodes, setAttributeIfChanged, setClassNameIfChanged, setHiddenIfChanged, setTextIfChanged, tagNameOf } from "./changes.ts";
+export { UNTYPED_INPUTS, answersEnter, isLink, isTextField, keepsOwnKeys, pressedBySpace, scrollsItself } from "./targets.ts";

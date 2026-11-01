@@ -167,11 +167,17 @@ export {
 } from "../core/settings/index.ts";
 export { createWebPorts } from "../platform/web/index.ts";
 export {
+  answersEnter,
   childByClass,
   classWords,
   elementIn,
   focusMinimally,
+  isLink,
+  isTextField,
+  keepsOwnKeys,
   nodeWithin,
+  pressedBySpace,
+  scrollsItself,
   setAttributeIfChanged,
   setClassNameIfChanged,
   setClassWord,

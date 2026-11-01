@@ -43,3 +43,35 @@ test("`#624 voice-page-modularity`: the DOM walks and the box helpers, on plain 
   focusAtEnd(box);
   assert.deepStrictEqual(calls, [["focus", { preventScroll: true }], ["scroll", { block: "nearest", inline: "nearest" }], ["caret", 5, 5]]);
 });
+
+test("`#624 voice-page-modularity`: where a key landed — a field typed in, a control keeping its own keys, a link — read from the target alone", () => {
+  const { isTextField, keepsOwnKeys, pressedBySpace, isLink, answersEnter, scrollsItself } = VIEW_DOM;
+  const node = (tagName, fields = {}) => ({ tagName, ...fields });
+  for (const missing of [null, undefined, "", 0]) {
+    assert.equal(isTextField(missing), false);
+    assert.equal(keepsOwnKeys(missing), false);
+    assert.equal(pressedBySpace(missing), false);
+    assert.equal(isLink(missing), false);
+    assert.equal(answersEnter(missing), false);
+  }
+  assert.equal(isTextField(node("input")), true, "an input of no type is text");
+  assert.equal(isTextField(node("INPUT", { type: "Search" })), true);
+  assert.equal(isTextField(node("INPUT", { type: "checkbox" })), false);
+  assert.equal(isTextField(node("textarea")), true);
+  assert.equal(isTextField(node("DIV", { isContentEditable: true })), true);
+  assert.equal(isTextField(node("DIV", { isContentEditable: "true" })), false);
+  assert.equal(keepsOwnKeys(node("select")), true);
+  assert.equal(keepsOwnKeys(node("INPUT", { type: "range" })), true);
+  assert.equal(keepsOwnKeys(node("DIV", { getAttribute: (name) => (name === "role" ? "slider" : null) })), true);
+  assert.equal(keepsOwnKeys(node("DIV", { getAttribute: () => "button" })), false);
+  assert.equal(keepsOwnKeys(node("DIV", { getAttribute: "separator" })), false, "a getAttribute that is no function is not called");
+  assert.equal(pressedBySpace(node("summary")), true);
+  assert.equal(pressedBySpace(node("A")), false);
+  assert.equal(isLink(node("a")), true);
+  assert.equal(answersEnter(node("A")), true);
+  assert.equal(answersEnter(node("DIV", { isContentEditable: true })), true);
+  assert.equal(answersEnter(node("LI")), false);
+  assert.equal(scrollsItself(node("TEXTAREA", { scrollHeight: 120, clientHeight: 100 })), true);
+  assert.equal(scrollsItself(node("TEXTAREA", { scrollHeight: 101, clientHeight: 100 })), false, "a pixel's rounding is not a page");
+  assert.equal(scrollsItself(node("DIV", { scrollHeight: 500, clientHeight: 100 })), false);
+});
