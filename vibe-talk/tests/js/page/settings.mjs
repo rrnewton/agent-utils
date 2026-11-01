@@ -1061,8 +1061,9 @@ test("`#402 who-is-who-channel-box`: the list follows the channel box's picker, 
   assert.deepStrictEqual(listedNames(page), ["alice"], "the channel being read moved the list off the box's channel");
   // The negative control: the list as `#349` drew it, following the channel being read. The box's picker
   // then leaves it where it was, which is how this test would fail.
-  const before = newPage(new Map(), brokenScript('  const host = el("identity-list");\n  const channelId = el("settings-channel").value;',
-    '  const host = el("identity-list");\n  const channelId = selectedChannelId();'));
+  const before = newPage(new Map(), await brokenModule([{ file: "src/view/settings/identities.ts",
+    find: '    const channelId = (deps.lookup("settings-channel") as HTMLSelectElement).value;',
+    replace: '    const channelId = (deps.lookup("discord-channel") as HTMLSelectElement).value;' }]));
   twoCasts(before);
   await signIn(before);
   await showDiscord(before, []);
@@ -1102,7 +1103,7 @@ test("`#402 who-is-who-channel-box`: on All channels the list asks for one chann
   await settingsChannel(services, "*");
   assert.equal(services.el("identity-list").text(), "Pick one channel to see who is who.");
   // The negative control: a list with no word for All channels draws one for a channel that is not one.
-  const blind = newPage(new Map(), brokenScript("  if (channelId === ALL_CHANNELS) {\n", "  if (false) {\n"));
+  const blind = newPage(new Map(), await brokenModule([{ file: "src/view/settings/identities.ts", find: "    if (channelId === deps.allChannels()) {\n", replace: "    if (false) {\n" }]));
   blind.chatProviderName = "Google Chat";
   blind.upstreamClearSupported = true;
   twoCasts(blind);
@@ -1158,7 +1159,7 @@ test("`#402 who-is-who-channel-box`: a service with no channel on the list draws
   assert.deepStrictEqual(settingsOptions(page), []);
   assert.deepStrictEqual(states, [false, true, false], "Who is who is headed over an empty list, or did not come back");
   // The negative control: a list that never hides its group.
-  const blind = await emptyService(brokenScript('  el("identity-group").hidden = none;\n', ""));
+  const blind = await emptyService(await brokenModule([{ file: "src/view/settings/identities.ts", find: '    deps.lookup("identity-group").hidden = none;\n', replace: "" }]));
   assert.deepStrictEqual(blind.states, [false, false, false],
     "the negative control hid the group anyway, so the check above proves nothing");
 });
@@ -1212,8 +1213,9 @@ test("`#351 settings-polish`: who is who's line about a choice goes when the box
   assert.deepStrictEqual(listedNames(page), ["alice"], "the list stayed on the channel removed from under it");
   assert.equal(page.el("identity-state").textContent, "", "the line outlived the list it was about");
   // The negative control: a list that never clears the line.
-  const blind = newPage(new Map(), brokenScript('    el("identity-state").textContent = "";\n    identityListChannel = String(channelId);\n',
-    "    identityListChannel = String(channelId);\n"));
+  const blind = newPage(new Map(), await brokenModule([{ file: "src/view/settings/identities.ts",
+    find: '      deps.lookup("identity-state").textContent = "";\n      identityListChannel = String(channelId);\n',
+    replace: "      identityListChannel = String(channelId);\n" }]));
   twoCasts(blind);
   await signIn(blind);
   await showDiscord(blind, []);
@@ -1322,7 +1324,7 @@ test("A LONG OPTION CANNOT SQUEEZE A NAME INTO A ONE-CHARACTER COLUMN", () => {
   // fell to its automatic minimum, and `overflow-wrap: anywhere` had put that minimum at one
   // character. Both halves are asserted, because either one alone brings the column back.
   assert.match(
-    SCRIPT_CODE,
+    PAGE_CODE,
     /Me \(including my voice bot\)/,
     "the option whose width provoked this is gone; check the arithmetic below still holds"
   );

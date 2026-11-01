@@ -158,3 +158,17 @@ test("`#208 persistent-cache`, `#595 cache-full-history`: what the server's mess
   assert.equal(SERVER_CACHE_ASK.erase.ask("12 messages"), "Erase 12 messages now? Saving carries on in an empty file.");
   assert.equal(serverCacheUnconfirmed("store_unavailable"), "The server did not confirm that: store_unavailable");
 });
+
+test("`#402 who-is-who-channel-box`: the order and the words of the list of who is who", () => {
+  const { BUCKET_LABELS, identityOrder, identityNobodyWords, identityChannelWords, identityPickerLabel, IDENTITY_PICK_ONE, IDENTITY_SAVED } = SETTINGS;
+  assert.deepStrictEqual(Object.keys(BUCKET_LABELS), ["me", "coder", "human", "bot"]);
+  const seen = { b1: { name: "zed", bot: true }, p2: { name: "bea", bot: false }, b2: { name: "ann", bot: true }, p1: { name: "al", bot: false } };
+  assert.deepStrictEqual(identityOrder(seen), ["p1", "p2", "b2", "b1"], "people first, then bots, then by name");
+  assert.deepStrictEqual(identityOrder({}), []);
+  assert.equal(identityNobodyWords("release"), "Nobody yet in release. Read that channel, and everyone who has spoken in it appears here.");
+  assert.equal(identityChannelWords("release"), "In release:");
+  assert.equal(identityPickerLabel("", "U1"), "what U1 is");
+  assert.equal(identityPickerLabel("alice", "U1"), "what alice is");
+  assert.equal(IDENTITY_PICK_ONE, "Pick one channel to see who is who.");
+  assert.match(IDENTITY_SAVED, /^Saved\./);
+});

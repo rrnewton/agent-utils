@@ -118,6 +118,7 @@ export {
   mountChannelHistory,
   mountDismissedSends,
   mountHelpFolds,
+  mountIdentityList,
   mountServerCache,
   mountSettingsFolds,
   mountUpstreamClear,

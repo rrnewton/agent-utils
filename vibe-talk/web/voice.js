@@ -2507,7 +2507,7 @@ function showScreen(name) {
   // `#193 compose-draft-loss`. Its ages and channel names as they are now, and none past its days.
   if (name === "settings" && previous !== "settings") dismissedSendsView.render();
   // `#402 who-is-who-channel-box`. Who is who in the box's channel, as the census stands now.
-  if (name === "settings" && previous !== "settings") renderIdentityRows();
+  if (name === "settings" && previous !== "settings") identityList.render();
   if (name !== previous || focusLost()) settleFocus();
   // `#304 back-gesture-in-app`. A screen opened has an entry to go back through, and one left has none.
   scheduleBackSync();
@@ -20438,12 +20438,8 @@ const SELF_ID_KEY = "vibe-talk.voice.self-id";
 
 const BUCKETS = ["me", "coder", "human", "bot"];
 
-const BUCKET_LABELS = {
-  me: "Me (including my voice bot)",
-  coder: "Coding agent",
-  human: "Another person",
-  bot: "Another bot",
-};
+// What each bucket is called in Settings' list of who is who is web/src/present/settings's
+// (`BUCKET_LABELS`, `#624 voice-page-modularity`).
 
 /**
  * Explicit choices the reader has made, `{ [authorId]: bucket }`. Beats every guess below.
@@ -20610,7 +20606,7 @@ function noteSelfAuthor(id) {
     // As above.
   }
   renderChannelRows();
-  renderIdentityRows();
+  identityList.render();
 }
 
 /** Everyone seen in one channel, as a plain map, whether or not that channel has been read yet. */
@@ -20692,159 +20688,29 @@ function bucketFor(authorId, isBot, channelId) {
   return "bot";
 }
 
-/** The channel the list of who is who was last drawn for (`renderIdentityRows`), or null before it was. */
-let identityListChannel = null;
-
 /**
- * `#402 who-is-who-channel-box`. What the list says in place of its rows with All channels chosen:
- * a list of who spoke is one channel's. The owner may ask for the list hidden there instead, which is
- * `el("identity-group").hidden` set for All channels too in `renderIdentityRows`, and this line gone.
+ * `#402 who-is-who-channel-box`. Settings' list of who is who, one row per account seen in the channel
+ * the channel box's picker is on, saying what it is and letting that be changed (web/src/view/settings
+ * `mountIdentityList`, `#624 voice-page-modularity`). The census and the buckets it draws from are here.
+ *
+ * @type {import("./src/view/settings/index.ts").IdentityList}
  */
-const IDENTITY_PICK_ONE = "Pick one channel to see who is who.";
-
-/**
- * The Settings panel: one row per account seen IN THE CHANNEL THE CHANNEL BOX'S PICKER IS ON, saying
- * what it is and letting that be changed.
- *
- * Rebuilt wholesale rather than patched, because the set of accounts grows as the channel is read
- * and the guesses for accounts ALREADY listed can change when a new one arrives — the sole-other-
- * bot rule is a statement about the whole census. A partial update would leave a stale "coding
- * agent" beside the second bot that has just disqualified it.
- *
- * `#402 who-is-who-channel-box`. The channel is `#settings-channel`, the picker at the head of the
- * box this list sits at the foot of, and NOT `#discord-channel`, which is what the reader is looking
- * at: everything in that box is about the channel its picker names, and pointing it elsewhere
- * navigates nowhere. `#349 channel-settings-all` had moved the list to Messages, following the
- * channel being read, when the picker gained All channels; the owner, 2026-10-21, wanted it back
- * "along with everything that varies depending on selecting the channel in the drop down". With All
- * channels chosen it says so in one line (`IDENTITY_PICK_ONE`) instead of rows. Still one channel's
- * census: a bot that only speaks somewhere else cannot spoil the guess here.
- *
- * `#351 settings-polish`. The line under the list (`#identity-state`) says what a choice just made in
- * it did, and the choice was made in one channel's list: under another channel's it reads as a report
- * about rows nobody has touched. So it goes when the list's channel changes (`identityListChannel`).
- */
-function renderIdentityRows() {
-  const host = el("identity-list");
-  const channelId = el("settings-channel").value;
-  if (String(channelId) !== identityListChannel) {
-    el("identity-state").textContent = "";
-    identityListChannel = String(channelId);
-  }
-  // No channel to be about (a service with none on the list, whose box already says how to add one):
-  // no heading over nothing.
-  const none = channelId !== ALL_CHANNELS && !knownChannel(channelId);
-  el("identity-group").hidden = none;
-  if (none) {
-    host.replaceChildren();
-    return;
-  }
-  if (channelId === ALL_CHANNELS) {
-    const pick = document.createElement("p");
-    pick.className = "hint";
-    pick.textContent = IDENTITY_PICK_ONE;
-    host.replaceChildren(pick);
-    return;
-  }
-  const seen = seenIn(channelId);
-  const ids = Object.keys(seen).sort((a, b) => {
-    const left = seen[a];
-    const right = seen[b];
-    // People first, then bots, then by name: the reader is looking for a name, and grouping the
-    // two kinds keeps the bridge and the coding agent beside each other.
-    if (left.bot !== right.bot) {
-      return left.bot ? 1 : -1;
-    }
-    return left.name < right.name ? -1 : left.name > right.name ? 1 : 0;
-  });
-  if (ids.length === 0) {
-    const empty = document.createElement("p");
-    empty.className = "hint";
-    // Names the channel it is empty ABOUT, through the one rule that names channels — so this
-    // says whatever the picker above it says. The list changes when that picker does, and "nobody
-    // yet" without a name reads as a broken panel rather than as an unread channel.
-    empty.textContent =
-      `Nobody yet in ${channelName(knownChannel(channelId))}. Read that channel, and everyone ` +
-      "who has spoken in it appears here.";
-    host.replaceChildren(empty);
-    return;
-  }
-  // Which channel the rows are about, through the one rule that names channels.
-  const about = document.createElement("p");
-  about.className = "hint identity-channel";
-  about.textContent = `In ${channelName(knownChannel(channelId))}:`;
-  const rows = ids.map((id) => {
-    const who = seen[id];
-    // A <label> WRAPPING its control, rather than a <div> plus `for="identity-<id>"`.
-    //
-    // The id would have to be minted from the author's snowflake at runtime, and this page's test
-    // fixture derives the element set from web/voice.html by regex and refuses anything else —
-    // deliberately, so that an element invented at runtime fails loudly instead of silently at the
-    // roadside. That rule is worth more than the attribute: a label containing its control is
-    // associated with it implicitly, which is the same accessibility outcome with no id at all.
-    const wrap = document.createElement("label");
-    wrap.className = "identity-row";
-
-    const label = document.createElement("span");
-    label.className = "identity-name";
-    // textContent, not innerHTML: a display name is channel data like any other, and this panel is
-    // the one place the page renders one outside the message list.
-    label.textContent = who.name || "(no name)";
-    if (who.bot) {
-      const tag = document.createElement("span");
-      tag.className = "identity-tag";
-      tag.textContent = "bot";
-      label.append(tag);
-    }
-    if (isSelfId(id)) {
-      const tag = document.createElement("span");
-      tag.className = "identity-tag";
-      // Says WHY this one is you, so "me" on a bot account does not read as a mistake.
-      tag.textContent = "this bridge";
-      label.append(tag);
-    }
-
-    const select = document.createElement("select");
-    // Named for a screen reader without an id, since the wrapping label is doing the association.
-    select.setAttribute("aria-label", `what ${who.name || id} is`);
-    // The snowflake, so a handler and the suite can both say WHICH row this is without an id.
-    select.setAttribute("data-author-id", id);
-    for (const bucket of BUCKETS) {
-      const option = document.createElement("option");
-      option.value = bucket;
-      option.textContent = BUCKET_LABELS[bucket];
-      select.append(option);
-    }
-    select.value = bucketFor(id, who.bot, channelId);
-    // Whether the value on screen is a CHOICE or a GUESS, which is the difference between "this is
-    // wrong" and "nobody has said". Without it a wrong guess is indistinguishable from a decision.
-    // Always set, both ways, rather than present-or-absent: "false" and "missing" are the same
-    // thing to a stylesheet but not to anything reading the attribute back, and a reader asking
-    // "was this a guess?" should get an answer rather than an absence.
-    select.setAttribute("data-guessed", identities[id] ? "false" : "true");
-    select.addEventListener("change", () => {
-      identities[id] = select.value;
-      persistJson(IDENTITY_KEY, identities);
-      select.setAttribute("data-guessed", "false");
-      el("identity-state").textContent =
-        "Saved. This account is drawn this way from now on, in every channel it speaks in.";
-      renderChannelRows();
-      // The row just changed can change the GUESS on its neighbours: naming one of two bots as the
-      // coding agent leaves the other as the only unnamed candidate. Only this channel's list is
-      // on screen, so only this channel's list is rebuilt — but rebuilt it must be, or the panel
-      // shows a stale guess beside the choice that invalidated it.
-      renderIdentityRows();
-    });
-
-    const id_ = document.createElement("span");
-    id_.className = "identity-id";
-    id_.textContent = id;
-
-    wrap.append(label, select, id_);
-    return wrap;
-  });
-  host.replaceChildren(about, ...rows);
-}
+const identityList = mountIdentityList({
+  lookup: (id) => el(id),
+  allChannels: () => ALL_CHANNELS,
+  known: (id) => Boolean(knownChannel(id)),
+  nameOf: (id) => channelName(knownChannel(id)),
+  seenIn: (channelId) => seenIn(channelId),
+  isSelf: (id) => isSelfId(id),
+  buckets: () => BUCKETS,
+  bucketOf: (id, isBot, channelId) => bucketFor(id, isBot, channelId),
+  chosen: (id) => Boolean(identities[id]),
+  choose: (id, bucket) => {
+    identities[id] = bucket;
+    persistJson(IDENTITY_KEY, identities);
+  },
+  renderChannelRows: () => renderChannelRows(),
+});
 
 /** Remember an author, in the channel they spoke in, so Settings can offer a row for them later. */
 function noteAuthor(channelId, id, name, isBot) {
@@ -21093,7 +20959,7 @@ function renderChannelRows() {
     persistJson(AUTHORS_KEY, authorsSeen);
     // `#402 who-is-who-channel-box`. Only if Settings' box is on the channel that just learned
     // something. Otherwise the list is another channel's, and rebuilding it draws the same rows again.
-    if (el("settings-channel").value === viewing) renderIdentityRows();
+    if (el("settings-channel").value === viewing) identityList.render();
   }
   // `#222 unread-replies`. The replies the store holds, counted once for every row's thread chip.
   const tally = replyTally();
@@ -38597,7 +38463,7 @@ function fillChannelSelect(id) {
   if (id === "discord-channel") rememberActiveChannel();
   // `#351 settings-polish`, `#402 who-is-who-channel-box`. Settings' picker redrawn onto another
   // channel than the one it showed (the box's channel removed from under it) moves who is who with it.
-  if (id === "settings-channel" && String(select.value) !== String(chosen)) renderIdentityRows();
+  if (id === "settings-channel" && String(select.value) !== String(chosen)) identityList.render();
 }
 
 /**
@@ -38790,7 +38656,7 @@ function renderChannelBox() {
   renderAliasEditor();
   upstreamClearBox.render();
   channelHistoryBox.render();
-  renderIdentityRows();
+  identityList.render();
 }
 
 /** Whether Settings' channel box is on All channels. `#349 channel-settings-all`. */
@@ -39700,7 +39566,7 @@ function applySyncedSetting(key) {
         }
         identities = held;
         eachColumn(renderChannelRows);
-        renderIdentityRows();
+        identityList.render();
         break;
       }
       default: break;
@@ -40822,7 +40688,7 @@ noteKeyboard();
 // Before the first channel read, so the very first list of rows is already filtered rather
 // than appearing unfiltered for a frame and then rearranging under the reader.
 loadIdentities();
-renderIdentityRows();
+identityList.render();
 renderChannelRows();
 for (const [key, box] of NEWLINE_KEYS) wireNewlineKey(leftEl(key), leftEl(box));
 el("reply-cancel").addEventListener("click", () => closeReply());

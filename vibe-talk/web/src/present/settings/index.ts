@@ -48,3 +48,13 @@ export { DISMISSED_LABEL_CHARS, dismissedListWords, dismissedRestoreLabel, dismi
 export type { DismissedEntry } from "./dismissed.ts";
 export { SERVER_CACHE_ASK, SERVER_CACHE_SENDING, serverCacheKeepsWords, serverCacheUnconfirmed, serverHoldsWholeHistory } from "./cache.ts";
 export type { ServerCacheAct } from "./cache.ts";
+export {
+  BUCKET_LABELS,
+  IDENTITY_PICK_ONE,
+  IDENTITY_SAVED,
+  identityChannelWords,
+  identityNobodyWords,
+  identityOrder,
+  identityPickerLabel,
+} from "./identities.ts";
+export type { SeenAccount } from "./identities.ts";

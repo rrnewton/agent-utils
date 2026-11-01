@@ -15,3 +15,5 @@ export { mountDismissedSends } from "./dismissed.ts";
 export type { DismissedSendsView, DismissedSendsViewDependencies } from "./dismissed.ts";
 export { mountServerCache } from "./cache.ts";
 export type { ServerCache, ServerCacheDependencies } from "./cache.ts";
+export { mountIdentityList } from "./identities.ts";
+export type { IdentityList, IdentityListDependencies } from "./identities.ts";
