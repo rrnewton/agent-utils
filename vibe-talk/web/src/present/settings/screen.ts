@@ -32,19 +32,21 @@ const readingWidthWords = (ch: number, kept: boolean): string => kept
     `reload (private browsing does this). The column is ${ch} characters wide until then.`;
 
 /**
- * The width handle's keys, each the width it moves to from `width`. A separator with `tabindex` is only
- * a control if the arrow keys move it: Shift for a bigger step, Home/End for the ends, which is what a
- * range input does and therefore what a reader who has used one expects.
+ * The width handle's keys, each the width it moves to from the width in force, `width()`. A separator
+ * with `tabindex` is only a control if the arrow keys move it: Shift for a bigger step, Home/End for the
+ * ends, which is what a range input does and therefore what a reader who has used one expects. A plain
+ * table, its entries called with nothing, as the legacy script's was: a key no entry names finds what
+ * any object has, exactly as it did there.
  */
-const GRIP_KEYS: { readonly [key: string]: ((width: number) => number) | undefined } = {
-  ArrowLeft: (width) => width - 1,
-  ArrowRight: (width) => width + 1,
-  ArrowDown: (width) => width - 1,
-  ArrowUp: (width) => width + 1,
-  PageDown: (width) => width - 10,
-  PageUp: (width) => width + 10,
+const gripKeysFor = (width: () => number): { readonly [key: string]: (() => number) | undefined } => ({
+  ArrowLeft: () => width() - 1,
+  ArrowRight: () => width() + 1,
+  ArrowDown: () => width() - 1,
+  ArrowUp: () => width() + 1,
+  PageDown: () => width() - 10,
+  PageUp: () => width() + 10,
   Home: () => MIN_READING_CH,
   End: () => MAX_READING_CH,
-};
+});
 
-export { GRIP_KEYS, MSG_SCALE_STEP, msgScaleStepTarget, msgScaleWords, readingWidthWords };
+export { MSG_SCALE_STEP, gripKeysFor, msgScaleStepTarget, msgScaleWords, readingWidthWords };

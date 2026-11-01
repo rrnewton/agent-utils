@@ -20,7 +20,7 @@
 // own controls no longer line up with the words they belong to.
 
 import { DEFAULT_READING_CH, MAX_MSG_SCALE, MIN_MSG_SCALE, clampMsgScale, clampReadingWidth } from "../../core/settings/index.ts";
-import { GRIP_KEYS, msgScaleStepTarget, msgScaleWords, readingWidthWords } from "../../present/settings/index.ts";
+import { gripKeysFor, msgScaleStepTarget, msgScaleWords, readingWidthWords } from "../../present/settings/index.ts";
 
 /** What a setting's control asks of the page: the element by id, and the device's copy of the value. */
 export interface ScreenSettingDependencies {
@@ -118,6 +118,8 @@ export function mountReadingWidth(deps: ScreenSettingDependencies): ReadingWidth
   // desktop touchscreen all work through one path; the regime that shows the handle at all is the
   // stylesheet's business, not this code's.
   let widthDrag: { centre: number; perCh: number } | null = null;
+  /** The handle's keys, each the width it moves to from the one in force. */
+  const gripKeys = gripKeysFor(() => readingWidth);
 
   /**
    * The custom property goes on `document.documentElement` because the two things it has to reach —
@@ -196,14 +198,14 @@ export function mountReadingWidth(deps: ScreenSettingDependencies): ReadingWidth
       changed(readingWidth);
     },
     gripKey(event) {
-      const next = event && GRIP_KEYS[event.key];
+      const next = event && gripKeys[event.key];
       if (!next) {
         return;
       }
       if (event.preventDefault) {
         event.preventDefault(); // PageUp and the arrows would otherwise scroll the list behind it.
       }
-      changed(next(readingWidth));
+      changed(next());
     },
   };
 }

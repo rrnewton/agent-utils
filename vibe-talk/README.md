@@ -9532,7 +9532,7 @@ where small icons would sit under the thumb reaching for Talk, and not pinned to
 floor, which on a real handset put the first word of the status line into the corner curvature and
 ate it. Top — under the title, where it used to be — is a setting, kept in `localStorage` under
 `vibe-talk.voice.bar-placement` and offered in Settings. There is **one** bar and two mount points,
-and `setPlacement()` moves the element between them; two copies would be two gears and two switches
+and the bar's placement (web/src/view/settings `mountBarPlacement`) moves the element between them; two copies would be two gears and two switches
 for the page to keep in agreement, which is the defect rather than the layout.
 
 **The bar is declared in the dock in `web/voice.html`**, not created from script, so the default

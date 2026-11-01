@@ -188,7 +188,7 @@ test("`#369 pairing-link`: what the sign-in screen says about a pairing link", (
 });
 
 test("`#55 voice-desktop-app`, `#230 text-size-buttons`: the text size's steps, the reading width's keys, and what Settings says of each", () => {
-  const { MSG_SCALE_STEP, msgScaleStepTarget, msgScaleWords, readingWidthWords, GRIP_KEYS } = SETTINGS;
+  const { MSG_SCALE_STEP, msgScaleStepTarget, msgScaleWords, readingWidthWords, gripKeysFor } = SETTINGS;
   assert.equal(MSG_SCALE_STEP, 5);
   // From a mark, the next mark; from between two (a hand-edited 83), the next mark that way.
   assert.equal(msgScaleStepTarget(100, 1), 105);
@@ -199,10 +199,14 @@ test("`#55 voice-desktop-app`, `#230 text-size-buttons`: the text size's steps, 
   assert.match(msgScaleWords(110, false), /^This browser refused to store the text size.* Message text is at 110% until then\.$/);
   assert.equal(readingWidthWords(72, true), "Saved — a column 72 characters wide.");
   assert.match(readingWidthWords(72, false), /The column is 72 characters wide until then\.$/);
-  assert.deepStrictEqual(["ArrowLeft", "ArrowRight", "ArrowDown", "ArrowUp", "PageDown", "PageUp"].map((key) => GRIP_KEYS[key](70)),
+  let width = 70;
+  const keys = gripKeysFor(() => width);
+  assert.deepStrictEqual(["ArrowLeft", "ArrowRight", "ArrowDown", "ArrowUp", "PageDown", "PageUp"].map((key) => keys[key]()),
     [69, 71, 69, 71, 60, 80]);
-  assert.ok(GRIP_KEYS.Home(70) < GRIP_KEYS.End(70));
-  assert.equal(GRIP_KEYS.Enter, undefined, "a key the handle does not take is left to the page");
+  width = 100;
+  assert.equal(keys.ArrowUp(), 101, "from the width in force when the key is pressed");
+  assert.ok(keys.Home() < keys.End());
+  assert.equal(keys.Enter, undefined, "a key the handle does not take is left to the page");
 });
 
 test("`#355 provider-grouped-channels`, `#374 registered-writable-follows-policy`: what the channel box and the Service picker say", () => {
