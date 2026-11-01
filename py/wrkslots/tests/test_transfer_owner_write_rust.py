@@ -20,6 +20,8 @@ from typing import cast
 import pytest
 from wrkslots import cli as wrkslots_cli
 
+from wrkslots.tests.rust_binary import rust_wrkslotsd
+
 
 AU_ROOT = Path(__file__).resolve().parents[3]
 DIGEST = "b" * 64
@@ -161,8 +163,7 @@ def _rust(root: Path, owner_pid: int, *, fixture: bool = True) -> subprocess.Com
         env.pop("WRKSLOTSD_FIXTURE_WRITER", None)
     return subprocess.run(
         [
-            "cargo", "run", "--quiet", "--release", "--manifest-path", "rs/Cargo.toml",
-            "-p", "wrkslotsd", "--", "transfer-owner", "slot-a",
+            str(rust_wrkslotsd()), "transfer-owner", "slot-a",
             "--agent", "agent-slot-a", "--owner-pid", str(owner_pid),
             "--expected-generation", "1", "--root", str(root),
         ],
@@ -296,8 +297,7 @@ def test_transfer_stale_generation_and_wrong_agent_refuse(tmp_path: Path) -> Non
     assert result.returncode == 0
     again = subprocess.run(
         [
-            "cargo", "run", "--quiet", "--release", "--manifest-path", "rs/Cargo.toml",
-            "-p", "wrkslotsd", "--", "transfer-owner", "slot-a",
+            str(rust_wrkslotsd()), "transfer-owner", "slot-a",
             "--agent", "agent-slot-a", "--owner-pid", str(os.getpid()),
             "--expected-generation", "9", "--root", str(rust_root),
         ],

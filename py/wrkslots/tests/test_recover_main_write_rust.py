@@ -24,6 +24,8 @@ from pathlib import Path
 import pytest
 from wrkslots import cli as wrkslots_cli
 
+from wrkslots.tests.rust_binary import rust_wrkslotsd
+
 
 AU_ROOT = Path(__file__).resolve().parents[3]
 MACHINE = socket.gethostname().split(".", 1)[0]
@@ -59,8 +61,7 @@ def _run(root: Path, extra: list[str], *, fixture: bool = True) -> subprocess.Co
         env.pop("WRKSLOTSD_FIXTURE_WRITER", None)
     return subprocess.run(
         [
-            "cargo", "run", "--quiet", "--release", "--manifest-path", "rs/Cargo.toml",
-            "-p", "wrkslotsd", "--", "recover",
+            str(rust_wrkslotsd()), "recover",
             "--coordinator-pid", str(os.getpid()), "--root", str(root), *extra,
         ],
         cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900, env=env,

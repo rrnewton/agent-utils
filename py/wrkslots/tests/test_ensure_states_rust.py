@@ -21,6 +21,8 @@ from pathlib import Path
 import pytest
 from wrkslots import cli as wrkslots_cli
 
+from wrkslots.tests.rust_binary import rust_wrkslotsd
+
 
 AU_ROOT = Path(__file__).resolve().parents[3]
 EMPTY_ACTIVE = {"schema": 2, "machine": "node-a", "revision": 0, "slots": []}
@@ -55,8 +57,7 @@ def _rust(root: Path, *, fixture: bool = True) -> subprocess.CompletedProcess[st
     else:
         env.pop("WRKSLOTSD_FIXTURE_WRITER", None)
     return subprocess.run(
-        ["cargo", "run", "--quiet", "--release", "--manifest-path", "rs/Cargo.toml",
-         "-p", "wrkslotsd", "--", "ensure-states", "--root", str(root)],
+        [str(rust_wrkslotsd()), "ensure-states", "--root", str(root)],
         cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900, env=env,
     )
 

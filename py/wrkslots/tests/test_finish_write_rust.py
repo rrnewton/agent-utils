@@ -22,6 +22,8 @@ from typing import cast
 import pytest
 from wrkslots import cli as wrkslots_cli
 
+from wrkslots.tests.rust_binary import rust_wrkslotsd
+
 
 AU_ROOT = Path(__file__).resolve().parents[3]
 VALIDATION = ["cargo test: 88 passed"]
@@ -153,8 +155,7 @@ def _rust_finish(
     else:
         env.pop("WRKSLOTSD_FIXTURE_WRITER", None)
     args = [
-        "cargo", "run", "--quiet", "--release", "--manifest-path", "rs/Cargo.toml",
-        "-p", "wrkslotsd", "--", "finish", "slot-a", "--agent", "agent-slot-a",
+        str(rust_wrkslotsd()), "finish", "slot-a", "--agent", "agent-slot-a",
         "--owner-pid", str(os.getpid()), "--expected-generation", str(generation),
         "--root", str(root),
     ]

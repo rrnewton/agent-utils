@@ -25,6 +25,8 @@ from typing import cast
 import pytest
 from wrkslots import cli as wrkslots_cli
 
+from wrkslots.tests.rust_binary import rust_wrkslotsd
+
 
 AU_ROOT = Path(__file__).resolve().parents[3]
 MACHINE = socket.gethostname().split(".", 1)[0]
@@ -194,8 +196,7 @@ def _rust_row(
         env.pop("WRKSLOTSD_FIXTURE_WRITER", None)
     return subprocess.run(
         [
-            "cargo", "run", "--quiet", "--release", "--manifest-path", "rs/Cargo.toml",
-            "-p", "wrkslotsd", "--", "recover-absent-agent-row", slot,
+            str(rust_wrkslotsd()), "recover-absent-agent-row", slot,
             "--expected-generation", "1", "--record-sha256", sha,
             "--root", str(root),
         ],
@@ -404,8 +405,7 @@ def test_absent_rows_batch_matches_python(tmp_path: Path) -> None:
         env["WRKSLOTSD_FIXTURE_WRITER"] = "1"
         result = subprocess.run(
             [
-                "cargo", "run", "--quiet", "--release", "--manifest-path", "rs/Cargo.toml",
-                "-p", "wrkslotsd", "--", "recover-absent-agent-rows",
+                str(rust_wrkslotsd()), "recover-absent-agent-rows",
                 "--row", f"slot-a=1={sha}", "--row", f"slot-b=1={EMPTY_SHA}",
                 "--root", str(root),
             ],

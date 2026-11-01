@@ -21,6 +21,8 @@ from pathlib import Path
 import pytest
 from wrkslots import cli as wrkslots_cli
 
+from wrkslots.tests.rust_binary import rust_wrkslotsd
+
 
 AU_ROOT = Path(__file__).resolve().parents[3]
 
@@ -147,8 +149,7 @@ def _python(root: Path, slot: str | None = None) -> dict[str, object]:
 def _rust(root: Path, slot: str | None = None) -> subprocess.CompletedProcess[str]:
     extra = ["--slot", slot] if slot else []
     return subprocess.run(
-        ["cargo", "run", "--quiet", "--release", "--manifest-path", "rs/Cargo.toml",
-         "-p", "wrkslotsd", "--", "unpushed", "--root", str(root), *extra],
+        [str(rust_wrkslotsd()), "unpushed", "--root", str(root), *extra],
         cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900,
     )
 

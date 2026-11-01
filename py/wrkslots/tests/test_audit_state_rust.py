@@ -25,6 +25,8 @@ import pytest
 
 from wrkslots import cli as wrkslots_cli
 
+from wrkslots.tests.rust_binary import rust_wrkslotsd
+
 
 AU_ROOT = Path(__file__).resolve().parents[3]
 
@@ -189,8 +191,7 @@ def _rust(
     work_limit: int | None = None,
     wall_seconds: float = 60.0,
 ) -> subprocess.CompletedProcess[str]:
-    command = ["cargo", "run", "--quiet", "--release", "--manifest-path", "rs/Cargo.toml",
-               "-p", "wrkslotsd", "--", "parse-audit", "--root", str(root)]
+    command = [str(rust_wrkslotsd()), "parse-audit", "--root", str(root)]
     if census_state is not None:
         command += ["--cache-census-state", str(census_state)]
     if work_limit is not None:

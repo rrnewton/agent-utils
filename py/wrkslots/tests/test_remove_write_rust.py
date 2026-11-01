@@ -31,6 +31,8 @@ from contextlib import contextmanager
 import pytest
 from wrkslots import cli as wrkslots_cli
 
+from wrkslots.tests.rust_binary import rust_wrkslotsd
+
 
 AU_ROOT = Path(__file__).resolve().parents[3]
 
@@ -179,8 +181,7 @@ def _rust_remove(root: Path, *, fixture: bool = True) -> subprocess.CompletedPro
         env.pop("WRKSLOTSD_FIXTURE_WRITER", None)
     return subprocess.run(
         [
-            "cargo", "run", "--quiet", "--release", "--manifest-path", "rs/Cargo.toml",
-            "-p", "wrkslotsd", "--", "remove", "slot-a",
+            str(rust_wrkslotsd()), "remove", "slot-a",
             "--coordinator-pid", str(os.getpid()), "--expected-generation", "1",
             "--root", str(root),
         ],
@@ -570,8 +571,7 @@ def test_remove_refuses_without_fixture_attestation(tmp_path: Path) -> None:
 def _rebuild(root: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
-            "cargo", "run", "--quiet", "--release", "--manifest-path", "rs/Cargo.toml",
-            "-p", "wrkslotsd", "--", "rebuild",
+            str(rust_wrkslotsd()), "rebuild",
             "--events-dir", str(root / "worktrees" / "EVENTS.node-a"),
             "--index", str(root / "rebuild.sqlite3"),
         ],

@@ -20,6 +20,8 @@ from pathlib import Path
 import pytest
 from wrkslots import cli as wrkslots_cli
 
+from wrkslots.tests.rust_binary import rust_wrkslotsd
+
 
 AU_ROOT = Path(__file__).resolve().parents[3]
 DIGEST = "b" * 64
@@ -130,8 +132,7 @@ def _rust(root: Path, slot: str, reason: str, *, fixture: bool = True) -> subpro
     else:
         env.pop("WRKSLOTSD_FIXTURE_WRITER", None)
     return subprocess.run(
-        ["cargo", "run", "--quiet", "--release", "--manifest-path", "rs/Cargo.toml",
-         "-p", "wrkslotsd", "--", "hold", slot, "--reason", reason, "--root", str(root)],
+        [str(rust_wrkslotsd()), "hold", slot, "--reason", reason, "--root", str(root)],
         cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900, env=env,
     )
 
@@ -191,8 +192,7 @@ def _rust_unhold(root: Path, slot: str, *, fixture: bool = True) -> subprocess.C
     else:
         env.pop("WRKSLOTSD_FIXTURE_WRITER", None)
     return subprocess.run(
-        ["cargo", "run", "--quiet", "--release", "--manifest-path", "rs/Cargo.toml",
-         "-p", "wrkslotsd", "--", "unhold", slot, "--root", str(root)],
+        [str(rust_wrkslotsd()), "unhold", slot, "--root", str(root)],
         cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900, env=env,
     )
 

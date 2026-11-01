@@ -25,6 +25,8 @@ from pathlib import Path
 import pytest
 from wrkslots import cli as wrkslots_cli
 
+from wrkslots.tests.rust_binary import rust_wrkslotsd
+
 
 AU_ROOT = Path(__file__).resolve().parents[3]
 MACHINE = socket.gethostname().split(".", 1)[0]
@@ -90,8 +92,7 @@ def _rust(root: Path, *, fixture: bool = True, extra: list[str] | None = None) -
     else:
         env.pop("WRKSLOTSD_FIXTURE_WRITER", None)
     args = [
-        "cargo", "run", "--quiet", "--release", "--manifest-path", "rs/Cargo.toml",
-        "-p", "wrkslotsd", "--", "recover-ownerless-agent-clone",
+        str(rust_wrkslotsd()), "recover-ownerless-agent-clone",
         "worktrees/old-clone",
         "--remote-url", f".git={root.parent / 'remote.git'}",
         "--root", str(root),

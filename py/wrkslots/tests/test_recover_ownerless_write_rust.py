@@ -22,6 +22,8 @@ from pathlib import Path
 import pytest
 from wrkslots import cli as wrkslots_cli
 
+from wrkslots.tests.rust_binary import rust_wrkslotsd
+
 
 AU_ROOT = Path(__file__).resolve().parents[3]
 MACHINE = socket.gethostname().split(".", 1)[0]
@@ -87,8 +89,7 @@ def _fixture(base: Path) -> tuple[Path, Path, str, str]:
 
 def _rust_args(root: Path, orphan: Path, head: str, digest: str) -> list[str]:
     return [
-        "cargo", "run", "--quiet", "--release", "--manifest-path", "rs/Cargo.toml",
-        "-p", "wrkslotsd", "--", "recover-ownerless-agent-worktree",
+        str(rust_wrkslotsd()), "recover-ownerless-agent-worktree",
         "worktrees/orphan", "--repository", "../upstream-repo", "--head", head,
         "--branch", "suite/orphan", "--remote", "origin",
         "--remote-url-sha256", digest, "--root", str(root),
@@ -202,8 +203,7 @@ def test_ownerless_worktree_absolute_path_refuses(tmp_path: Path) -> None:
     env["WRKSLOTSD_FIXTURE_WRITER"] = "1"
     result = subprocess.run(
         [
-            "cargo", "run", "--quiet", "--release", "--manifest-path", "rs/Cargo.toml",
-            "-p", "wrkslotsd", "--", "recover-ownerless-agent-worktree",
+            str(rust_wrkslotsd()), "recover-ownerless-agent-worktree",
             str(rust_orphan), "--repository", "../upstream-repo", "--head", head,
             "--branch", "suite/orphan", "--remote", "origin",
             "--remote-url-sha256", digest, "--root", str(rust_root),

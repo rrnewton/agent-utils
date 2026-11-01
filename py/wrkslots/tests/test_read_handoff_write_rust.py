@@ -21,6 +21,8 @@ from typing import cast
 import pytest
 from wrkslots import cli as wrkslots_cli
 
+from wrkslots.tests.rust_binary import rust_wrkslotsd
+
 
 AU_ROOT = Path(__file__).resolve().parents[3]
 DIGEST = "b" * 64
@@ -136,8 +138,7 @@ def _rust(root: Path, slot: str, reason: str, *, fixture: bool = True) -> subpro
     else:
         env.pop("WRKSLOTSD_FIXTURE_WRITER", None)
     return subprocess.run(
-        ["cargo", "run", "--quiet", "--release", "--manifest-path", "rs/Cargo.toml",
-         "-p", "wrkslotsd", "--", "hold", slot, "--reason", reason, "--root", str(root)],
+        [str(rust_wrkslotsd()), "hold", slot, "--reason", reason, "--root", str(root)],
         cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900, env=env,
     )
 
@@ -205,8 +206,7 @@ def _rust_hb(
     else:
         env.pop("WRKSLOTSD_FIXTURE_WRITER", None)
     return subprocess.run(
-        ["cargo", "run", "--quiet", "--release", "--manifest-path", "rs/Cargo.toml",
-         "-p", "wrkslotsd", "--", "heartbeat", slot, "--agent", agent,
+        [str(rust_wrkslotsd()), "heartbeat", slot, "--agent", agent,
          "--owner-pid", str(owner_pid), "--expected-generation", str(generation),
          "--root", str(root)],
         cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900, env=env,
@@ -249,8 +249,7 @@ def _rust_wh(
     else:
         env.pop("WRKSLOTSD_FIXTURE_WRITER", None)
     return subprocess.run(
-        ["cargo", "run", "--quiet", "--release", "--manifest-path", "rs/Cargo.toml",
-         "-p", "wrkslotsd", "--", "write-handoff", "slot-a", "--agent", "agent-slot-a",
+        [str(rust_wrkslotsd()), "write-handoff", "slot-a", "--agent", "agent-slot-a",
          "--owner-pid", str(os.getpid()), "--expected-generation", "1",
          "--from-file", str(source), "--root", str(root)],
         cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900, env=env,
@@ -286,8 +285,7 @@ def _rust_read(root: Path, *, fixture: bool = True) -> subprocess.CompletedProce
     else:
         env.pop("WRKSLOTSD_FIXTURE_WRITER", None)
     return subprocess.run(
-        ["cargo", "run", "--quiet", "--release", "--manifest-path", "rs/Cargo.toml",
-         "-p", "wrkslotsd", "--", "read-handoff", "slot-a",
+        [str(rust_wrkslotsd()), "read-handoff", "slot-a",
          "--coordinator-pid", str(os.getpid()), "--coordinator-authorized",
          "--root", str(root)],
         cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900, env=env,

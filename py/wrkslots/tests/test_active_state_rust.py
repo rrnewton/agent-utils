@@ -17,6 +17,58 @@ from typing import cast
 import pytest
 from wrkslots import cli as wrkslots_cli
 
+from wrkslots.tests.rust_binary import rust_wrkslotsd
+
+
+def test_rust_adapter_build_is_checked_once_per_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    binary = tmp_path / "explicit-target" / "release" / "wrkslotsd"
+    binary.parent.mkdir(parents=True)
+    binary.touch()
+    builds: list[list[str]] = []
+
+    def build(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        assert kwargs["check"] is True
+        assert command[command.index("--target-dir") + 1].endswith(
+            "/validation-adapters/wrkslotsd"
+        )
+        builds.append(command)
+        return subprocess.CompletedProcess(command, 0, json.dumps({
+            "reason": "compiler-artifact", "target": {"name": "wrkslotsd", "kind": ["bin"]},
+            "executable": str(binary),
+        }))
+
+    monkeypatch.setattr(subprocess, "run", build)
+    rust_wrkslotsd.cache_clear()
+    try:
+        assert rust_wrkslotsd() == binary
+        assert rust_wrkslotsd() == binary
+        assert len(builds) == 1
+        # A new test process must check source freshness, even with an existing executable.
+        rust_wrkslotsd.cache_clear()
+        assert rust_wrkslotsd() == binary
+        assert len(builds) == 2
+    finally:
+        rust_wrkslotsd.cache_clear()
+
+
+def test_rust_adapter_failed_build_cannot_use_an_old_binary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        raise subprocess.CalledProcessError(1, command, stderr="compile failed")
+
+    monkeypatch.setattr(subprocess, "run", fail)
+    rust_wrkslotsd.cache_clear()
+    try:
+        with pytest.raises(subprocess.CalledProcessError):
+            rust_wrkslotsd()
+        assert rust_wrkslotsd.cache_info().currsize == 0
+    finally:
+        rust_wrkslotsd.cache_clear()
+
 
 AU_ROOT = Path(__file__).resolve().parents[3]
 SHA = "a" * 40
@@ -102,8 +154,7 @@ def _expected(root: Path) -> dict[str, object]:
 
 def _rust(root: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["cargo", "run", "--quiet", "--release", "--manifest-path", "rs/Cargo.toml",
-         "-p", "wrkslotsd", "--", "parse-state", "--root", str(root)],
+        [str(rust_wrkslotsd()), "parse-state", "--root", str(root)],
         cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900,
     )
 

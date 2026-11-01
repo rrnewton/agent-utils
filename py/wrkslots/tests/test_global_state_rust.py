@@ -21,6 +21,8 @@ from pathlib import Path
 import pytest
 from wrkslots import cli as wrkslots_cli
 
+from wrkslots.tests.rust_binary import rust_wrkslotsd
+
 
 AU_ROOT = Path(__file__).resolve().parents[3]
 SHA = "a" * 40
@@ -159,8 +161,7 @@ def _expected(root: Path) -> dict[str, object]:
 
 def _rust(root: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["cargo", "run", "--quiet", "--release", "--manifest-path", "rs/Cargo.toml",
-         "-p", "wrkslotsd", "--", "parse-global", "--root", str(root)],
+        [str(rust_wrkslotsd()), "parse-global", "--root", str(root)],
         cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900,
     )
 

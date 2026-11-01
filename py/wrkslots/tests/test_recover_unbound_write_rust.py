@@ -22,6 +22,8 @@ from typing import cast
 import pytest
 from wrkslots import cli as wrkslots_cli
 
+from wrkslots.tests.rust_binary import rust_wrkslotsd
+
 
 AU_ROOT = Path(__file__).resolve().parents[3]
 NOTE = "owner evidence lost in a reboot; coordinator inspected the slot"
@@ -145,8 +147,7 @@ def _rust(root: Path, *, fixture: bool = True) -> subprocess.CompletedProcess[st
         env.pop("WRKSLOTSD_FIXTURE_WRITER", None)
     return subprocess.run(
         [
-            "cargo", "run", "--quiet", "--release", "--manifest-path", "rs/Cargo.toml",
-            "-p", "wrkslotsd", "--", "recover-unbound-owner", "slot-a",
+            str(rust_wrkslotsd()), "recover-unbound-owner", "slot-a",
             "--coordinator-pid", str(os.getpid()), "--expected-generation", "1",
             "--recovery-note", NOTE, "--validation", "checked the slot by hand",
             "--limitation", "owner identity unrecoverable",

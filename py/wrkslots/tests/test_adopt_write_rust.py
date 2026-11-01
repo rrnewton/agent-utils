@@ -22,6 +22,8 @@ from typing import cast
 import pytest
 from wrkslots import cli as wrkslots_cli
 
+from wrkslots.tests.rust_binary import rust_wrkslotsd
+
 
 AU_ROOT = Path(__file__).resolve().parents[3]
 DIGEST = "b" * 64
@@ -143,8 +145,7 @@ def _rust(root: Path, slot: str, reason: str, *, fixture: bool = True) -> subpro
     else:
         env.pop("WRKSLOTSD_FIXTURE_WRITER", None)
     return subprocess.run(
-        ["cargo", "run", "--quiet", "--release", "--manifest-path", "rs/Cargo.toml",
-         "-p", "wrkslotsd", "--", "hold", slot, "--reason", reason, "--root", str(root)],
+        [str(rust_wrkslotsd()), "hold", slot, "--reason", reason, "--root", str(root)],
         cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900, env=env,
     )
 
@@ -212,8 +213,7 @@ def _rust_hb(
     else:
         env.pop("WRKSLOTSD_FIXTURE_WRITER", None)
     return subprocess.run(
-        ["cargo", "run", "--quiet", "--release", "--manifest-path", "rs/Cargo.toml",
-         "-p", "wrkslotsd", "--", "heartbeat", slot, "--agent", agent,
+        [str(rust_wrkslotsd()), "heartbeat", slot, "--agent", agent,
          "--owner-pid", str(owner_pid), "--expected-generation", str(generation),
          "--root", str(root)],
         cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900, env=env,
@@ -254,8 +254,7 @@ def _rust_adopt(
     else:
         env.pop("WRKSLOTSD_FIXTURE_WRITER", None)
     return subprocess.run(
-        ["cargo", "run", "--quiet", "--release", "--manifest-path", "rs/Cargo.toml",
-         "-p", "wrkslotsd", "--", "adopt", "slot-a", "--agent", agent,
+        [str(rust_wrkslotsd()), "adopt", "slot-a", "--agent", agent,
          "--owner-pid", str(owner_pid), "--expected-generation", "1",
          *(extra or []), "--root", str(root)],
         cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900, env=env,

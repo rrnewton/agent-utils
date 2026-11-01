@@ -26,6 +26,8 @@ from typing import cast
 import pytest
 from wrkslots import cli as wrkslots_cli
 
+from wrkslots.tests.rust_binary import rust_wrkslotsd
+
 
 AU_ROOT = Path(__file__).resolve().parents[3]
 MACHINE = socket.gethostname().split(".", 1)[0]
@@ -202,8 +204,7 @@ def _rust(
         env.pop("WRKSLOTSD_FIXTURE_WRITER", None)
     return subprocess.run(
         [
-            "cargo", "run", "--quiet", "--release", "--manifest-path", "rs/Cargo.toml",
-            "-p", "wrkslotsd", "--", "recover-absent-validate-rows",
+            str(rust_wrkslotsd()), "recover-absent-validate-rows",
             "--input", str(input_path), "--format", "json", "--root", str(root),
         ],
         cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900, env=env,

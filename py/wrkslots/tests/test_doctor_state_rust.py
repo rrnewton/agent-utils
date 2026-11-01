@@ -21,6 +21,8 @@ from typing import cast
 
 from wrkslots import cli as wrkslots_cli
 
+from wrkslots.tests.rust_binary import rust_wrkslotsd
+
 
 AU_ROOT = Path(__file__).resolve().parents[3]
 SHA = "a" * 40
@@ -179,8 +181,7 @@ def _expected(root: Path, *, all_machines: bool = False) -> dict[str, object]:
 def _rust(root: Path, *, all_machines: bool = False) -> subprocess.CompletedProcess[str]:
     extra = ["--all-machines"] if all_machines else []
     return subprocess.run(
-        ["cargo", "run", "--quiet", "--release", "--manifest-path", "rs/Cargo.toml",
-         "-p", "wrkslotsd", "--", "parse-doctor", "--root", str(root), *extra],
+        [str(rust_wrkslotsd()), "parse-doctor", "--root", str(root), *extra],
         cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900,
     )
 
