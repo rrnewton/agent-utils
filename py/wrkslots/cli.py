@@ -14973,25 +14973,55 @@ class _GitVcs:
                     paths.append(path)
         return tuple(dict.fromkeys(paths))
 
+    def _indexed_gitlink_paths(self, repository: Path) -> tuple[str, ...]:
+        indexed = self._run(repository, ["ls-files", "--stage", "-z"])
+        paths: list[str] = []
+        for record in indexed.stdout.split("\x00"):
+            if not record:
+                continue
+            metadata, separator, path = record.partition("\t")
+            if separator and metadata.startswith("160000 "):
+                paths.append(path)
+        return tuple(dict.fromkeys(paths))
+
     def initialized_submodules(self, checkout: Path) -> tuple[str, ...]:
-        result = self._run(
-            checkout,
-            [
-                "submodule",
-                "foreach",
-                "--quiet",
-                "--recursive",
-                'printf "%s\\n" "$displaypath"',
-            ],
-        )
-        paths = tuple(line for line in result.stdout.splitlines() if line)
-        for path in paths:
+        """Return the populated submodule paths below ``checkout``, recursively.
+
+        Listed means a gitlink in the repository's index, as with
+        ``git submodule foreach``: a populated directory whose gitlink the
+        branch has dropped is not listed, so callers can still refuse it as
+        unkept state. A listed submodule with no resolvable worktree —
+        never cloned, an empty directory, or a ``.git`` file whose gitdir
+        the tree no longer carries (as a fenced copy can leave behind) —
+        has no authored work to inspect, so it is omitted.
+        ``git submodule foreach --recursive`` instead aborts the whole
+        enumeration when it cannot chdir into such a path, which once made
+        every checkout with an unpopulated nested submodule unremovable.
+        Populated submodules are listed exactly as before, so the
+        unpushed-work checks over them are unchanged.
+        """
+
+        found: list[str] = []
+
+        def visit(repository: Path, prefix: str) -> None:
+            for relative in self._indexed_gitlink_paths(repository):
+                nested = repository / Path(relative)
+                if nested.is_symlink():
+                    raise Refusal(f"nested repository path is unsafe: {nested}")
+                if not _submodule_worktree_populated(nested):
+                    continue
+                display = f"{prefix}{relative}"
+                found.append(display)
+                visit(nested, f"{display}/")
+
+        visit(checkout, "")
+        for path in found:
             candidate = Path(path)
             if candidate.is_absolute() or ".." in candidate.parts:
                 raise Refusal(
                     f"Git reported an unsafe initialized submodule path: {path!r}"
                 )
-        return tuple(dict.fromkeys(paths))
+        return tuple(dict.fromkeys(found))
 
     def assert_ordinary_index(self, checkout: Path) -> None:
         assume = self._run(checkout, ["ls-files", "-v"])
@@ -25758,22 +25788,15 @@ def _setup_hooks_configured_path(repository: Path) -> str | None:
 
 
 def _setup_hooks_repositories(checkout: Path) -> list[Path]:
-    """Return ``checkout`` and every initialized submodule below it, recursively."""
+    """Return ``checkout`` and every populated submodule below it, recursively.
 
-    completed = _GitVcs._run(
-        checkout,
-        [
-            "submodule",
-            "foreach",
-            "--quiet",
-            "--recursive",
-            'printf "%s\\0" "$displaypath"',
-        ],
-        timeout_seconds=_SETUP_HOOKS_GIT_SECONDS,
-        timeout_refusal=f"git submodule foreach in {checkout} did not finish",
-    )
+    Unpopulated submodules hold no installer to run, and enumerating them
+    must not abort the way ``git submodule foreach --recursive`` does on a
+    path it cannot enter (see ``_GitVcs.initialized_submodules``).
+    """
+
     return [checkout] + [
-        checkout / name for name in completed.stdout.split("\0") if name
+        checkout / name for name in _GitVcs().initialized_submodules(checkout)
     ]
 
 
@@ -35550,6 +35573,36 @@ def _repair_checkout_at_slot(
             f"fenced checkout {checkout.name} changed after finish was prepared; preserve it for inspection"
         )
     return path
+
+
+def _submodule_worktree_populated(nested: Path) -> bool:
+    """Whether a declared submodule has a worktree whose Git directory resolves.
+
+    ``nested/.git`` as a directory is an ordinary repository. As a file it
+    must name a gitdir that exists; a fenced copy can leave such a file
+    pointing at a gitdir the copy does not carry, and a missing or empty
+    directory likewise holds no worktree. Both are unpopulated: no authored
+    work can be inspected there.
+    """
+
+    git_entry = nested / ".git"
+    if git_entry.is_dir():
+        return True
+    if not git_entry.is_file():
+        return False
+    try:
+        text = git_entry.read_text(encoding="utf-8", errors="strict").strip()
+    except (OSError, UnicodeError):
+        return False
+    if not text.startswith("gitdir:"):
+        return False
+    target = text[len("gitdir:") :].strip()
+    if not target:
+        return False
+    gitdir = Path(target)
+    if not gitdir.is_absolute():
+        gitdir = nested / gitdir
+    return gitdir.is_dir()
 
 
 def _declared_initialized_submodules(checkout: Path) -> tuple[Path, ...]:

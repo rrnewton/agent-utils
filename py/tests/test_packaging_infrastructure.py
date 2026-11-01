@@ -972,9 +972,13 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # The mixed-slot clean-caches case of 36027c35 (one nested-Git cache
     # skipped in the bulk sweep while the slot's other caches are pruned) is
     # mapped.
-    assert len(all_tests) == 2117
+    # The unpopulated nested submodule enumeration case (a listed gitlink
+    # whose worktree is absent, or whose .git file names a gitdir the tree
+    # does not carry, is omitted from the initialized listing while a
+    # populated submodule is still listed) is mapped.
+    assert len(all_tests) == 2118
     assert len(ordinary) == 337
-    assert len(mapped) == 1780
+    assert len(mapped) == 1781
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {
