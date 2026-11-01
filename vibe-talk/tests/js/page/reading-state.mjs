@@ -10,7 +10,7 @@ import { ACKNOWLEDGED, ALICE, BOTTOM_SLACK_PX, BOUND_NOTICE, CHANNEL, CODER, COU
   MESSAGE_SPACING_MS, OTHER_CHANNEL, OWN, OWNERS_MESSAGE, PAGE_ELEMENTS, RUN_TAIL, RUN_THREAD,
   SCRIPT, SCRIPT_CODE, SCROLL_VIEWPORT_PX, UI_STATE_KEY, allLeavingOut, arrowStyle,
   assertMarkupContains, assistantSays, atBottomOf, atTheHead, authorChannel, authorState, backlog,
-  bid, bookmarkAt, bookmarkClearOf, bookmarkRow, brokenScript, brokenScriptEach, channelRow,
+  bid, bookmarkAt, bookmarkClearOf, bookmarkRow, brokenModule, brokenScript, brokenScriptEach, channelRow,
   chipsOf, chooseAuthor, chooseReadMode, clearingPage, clickRow, collapsedRows, conversation,
   cssBlock, cssBlockIn, cssRules, delayedReply, deliver, doneButton, enterRunThread, errorResponse,
   floatingLine, focusName, focused, foldButton, forwardPage, freshMessageData, freshMessagePage,
@@ -3393,9 +3393,9 @@ test("`#602 history-settings-and-limits`: the channel box says how the channel's
   assert.match(whole.el("channel-history-progress").textContent,
     /Complete: every message back to the channel's beginning\. Paused for 3 minutes: the chat service asked for fewer requests\.$/);
   // The negative control: a box never offered shows and reads nothing, so the checks above saw the box.
-  const blind = await historyPage(brokenScript(
-    "  return !allChannelsChosen() && Boolean(knownChannel(id)) && Boolean(serverCache && serverCache.available);\n",
-    "  return false;\n"));
+  const blind = await historyPage(await brokenModule([{ file: "src/view/settings/history.ts",
+    find: "  const offered = (id: string): boolean => !deps.allChannelsChosen() && Boolean(deps.knownChannel(id)) && deps.cacheOpen();\n",
+    replace: "  const offered = (id: string): boolean => false;\n" }]));
   assert.equal(blind.el("channel-history").hidden, true, "the negative control showed the box anyway");
   assert.deepEqual(blind.historyCalls, [], "the negative control read the server anyway, so the check above proves nothing");
 });

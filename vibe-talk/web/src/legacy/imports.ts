@@ -228,7 +228,6 @@ export {
 export {
   SERVER_CACHE_NO_AGE_LIMIT,
   browserSpeechFailure,
-  channelHistorySentence,
   doneReadWords,
   failureWords,
   fmtDuration,
@@ -339,7 +338,7 @@ export {
   timeNode,
 } from "../view/channel/index.ts";
 export { HELP_TOPICS } from "../present/settings/index.ts";
-export { mountHelpFolds, mountSettingsFolds } from "../view/settings/index.ts";
+export { mountChannelHistory, mountHelpFolds, mountSettingsFolds } from "../view/settings/index.ts";
 
 import { decode, decodeTagged, is, roots } from "../contract/index.ts";
 

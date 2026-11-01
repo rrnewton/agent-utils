@@ -26,3 +26,28 @@ test("`#624 voice-page-modularity`: the folds, the help topics and the one butto
   assert.equal(foldAllWords(true), "Expand all");
   assert.equal(foldAllWords(false), "Fold all");
 });
+
+test("`#602 history-settings-and-limits`: what the channel box says about the channel's history, and when it reads it again", () => {
+  const { historyChoiceOf, historyDefaultWords, historyPrioritizeOffered, historyPrioritizedWords, historyReadFailure,
+    historyRecheckWait, historyWaitingWords, CHANNEL_HISTORY_RECHECK_MS, CHANNEL_HISTORY_QUEUED_RECHECK_MS } = SETTINGS;
+  const view = (fields = {}) => ({ mode: "recent", server_mode: "recent", complete: false, queue_position: 3, ...fields });
+  assert.equal(historyChoiceOf(view()), "default");
+  assert.equal(historyChoiceOf(view({ mode_override: "full" })), "full");
+  assert.equal(historyDefaultWords(view({ server_mode: "full" })), "Server default (whole history)");
+  assert.equal(historyDefaultWords(view({ server_mode: "off" })), "Server default (none)");
+  assert.equal(historyDefaultWords(view({ server_mode: "later" })), "Server default (later)", "a mode it has no words for is named as it is");
+  assert.equal(historyPrioritizeOffered(view(), true), true);
+  for (const [why, shown, writable] of [["no answer", null, true], ["read-only token", view(), false], ["off", view({ mode: "off" }), true],
+    ["complete", view({ complete: true }), true], ["already first", view({ queue_position: 0 }), true]]) {
+    assert.equal(historyPrioritizeOffered(shown, writable), false, why);
+  }
+  assert.equal(historyRecheckWait(view({ queue_position: 0 })), CHANNEL_HISTORY_QUEUED_RECHECK_MS);
+  assert.equal(historyRecheckWait(view()), CHANNEL_HISTORY_RECHECK_MS);
+  assert.equal(historyRecheckWait(null), CHANNEL_HISTORY_RECHECK_MS);
+  assert.ok(CHANNEL_HISTORY_QUEUED_RECHECK_MS < CHANNEL_HISTORY_RECHECK_MS);
+  assert.equal(historyWaitingWords(""), "Checking with the server…");
+  assert.equal(historyWaitingWords("down"), "down");
+  assert.equal(historyReadFailure("timed out"), "Could not read this channel's history: timed out");
+  assert.equal(historyPrioritizedWords(view({ complete: true })), "Nothing older to read: every message is saved.");
+  assert.equal(historyPrioritizedWords(view()), "Its older messages are read next, within the chat service's limits.");
+});
