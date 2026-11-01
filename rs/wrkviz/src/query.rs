@@ -923,6 +923,13 @@ impl Timeline {
         &self,
         entry: &crate::inspect::ShardEntry,
     ) -> Result<Vec<Map<String, Value>>, String> {
+        // The search corpus itself is never memoized: it is the
+        // one stream a cache could not hold, and each shard is
+        // walked once. Sidecars (blooms, links) are small and
+        // read more than once, so they are memoized.
+        if entry.stream == "search" {
+            return self.read_stream_records_uncached(entry);
+        }
         if let Some(cached) = self.stream_records.borrow().get(&entry.path) {
             return Ok(cached.clone());
         }

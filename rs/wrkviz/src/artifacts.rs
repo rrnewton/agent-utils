@@ -1743,13 +1743,25 @@ fn is_slug_pair(slug: &str) -> bool {
     let Some((owner, repo)) = slug.split_once('/') else {
         return false;
     };
-    !owner.is_empty()
-        && !repo.is_empty()
+    // Mirror `_is_repository_slug` in the oracle: GitHub owner
+    // and repository rules, not just any two dotted segments.
+    let owner_ok = !owner.is_empty()
+        && owner.len() <= 39
+        && owner
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphanumeric())
+        && owner
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-');
+    let repo_ok = !repo.is_empty()
+        && repo.len() <= 100
         && !matches!(repo, "." | "..")
         && !repo.contains('/')
-        && slug
+        && repo
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-' | '/'))
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-'));
+    owner_ok && repo_ok
 }
 
 fn repo_from_slug(slug: &str) -> UrlIdentity {
@@ -2351,5 +2363,28 @@ pub fn extract_artifacts(team: &TeamData) -> ArtifactCatalog {
         source_digest: crate::team_data::source_digest(team),
         artifacts,
         projects,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repository_slug_validation_rejects_prose() {
+        assert!(is_slug_pair("owner/repo"));
+        assert!(is_slug_pair("owner/repo.js"));
+        for slug in [
+            "x/.",
+            "x/..",
+            "_foo/bar",
+            "-foo/bar",
+            "owner/",
+            "owner/repo/extra",
+        ] {
+            assert!(!is_slug_pair(slug), "{slug}");
+        }
+        assert!(!is_slug_pair(&format!("{}/repo", "o".repeat(40))));
+        assert!(!is_slug_pair(&format!("owner/{}", "r".repeat(101))));
     }
 }

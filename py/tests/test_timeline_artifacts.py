@@ -516,3 +516,14 @@ def test_ingest_never_persists_cwd_or_repository_credentials(tmp_path: Path) -> 
     )
     assert "supersecret" not in persisted
     assert "/home/private" not in persisted
+
+
+def test_repository_slug_validation_rejects_prose() -> None:
+    from wrkviz.artifacts import _is_repository_slug
+
+    assert _is_repository_slug("owner/repo")
+    assert _is_repository_slug("owner/repo.js")
+    for slug in ("x/.", "x/..", "_foo/bar", "-foo/bar", "owner/",
+                 "owner/repo/extra", "o" * 40 + "/repo",
+                 "owner/" + "r" * 101):
+        assert not _is_repository_slug(slug), slug

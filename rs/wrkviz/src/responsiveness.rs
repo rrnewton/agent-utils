@@ -1864,6 +1864,23 @@ fn py_round_int(value: f64) -> i64 {
     value.round_ties_even() as i64
 }
 
+/// CPython 3.12+ `sum` over floats: Neumaier compensated
+/// summation (a plain left fold can land one ulp away).
+pub fn py_sum(values: impl Iterator<Item = f64>) -> f64 {
+    let mut sum = 0.0f64;
+    let mut compensation = 0.0f64;
+    for value in values {
+        let total = sum + value;
+        if sum.abs() >= value.abs() {
+            compensation += (sum - total) + value;
+        } else {
+            compensation += (value - total) + sum;
+        }
+        sum = total;
+    }
+    sum + compensation
+}
+
 /// The sample at the rounded index `fraction * (n - 1)`; `None`
 /// for no values.
 pub fn percentile(values: &[f64], fraction: f64) -> Option<f64> {
@@ -2041,7 +2058,7 @@ pub fn summary(report: &Report) -> Value {
     queue_delivery.insert("from_children".into(), delivery(0));
     queue_delivery.insert("watch_notices".into(), delivery(1));
     queue_delivery.insert("chat".into(), delivery(2));
-    let idle_total: f64 = idle.values().sum();
+    let idle_total: f64 = py_sum(idle.values().copied());
     let mut idle_hours = Map::new();
     for (key, value) in &idle {
         idle_hours.insert(key.clone(), float_value(py_round(value / 3600.0, 1)));
@@ -2436,6 +2453,27 @@ mod tests {
         assert_eq!(py_round_int(1.5), 2);
         assert_eq!(py_round_int(2.5), 2);
         assert_eq!(py_round_int(0.5), 0);
+    }
+
+    #[test]
+    fn py_sum_matches_cpython_neumaier() {
+        // Verified against CPython 3.12 sum().
+        assert_eq!(py_sum([1e16, 1.0, -1e16, 1.0].into_iter()), 2.0);
+        let cost = |input: f64, output: f64| (input + output * 5.0) / 1_000_000.0;
+        let costs = [
+            cost(357000.0, 42500.0),
+            cost(261000.0, 8100.0),
+            cost(24000.0, 1200.0),
+            cost(60000.0, 3800.0),
+            cost(50000.0, 2900.0),
+            cost(60000.0, 3800.0),
+            cost(50000.0, 2900.0),
+            cost(60000.0, 3800.0),
+            cost(50000.0, 2900.0),
+            cost(60000.0, 3800.0),
+            cost(50000.0, 2900.0),
+        ];
+        assert_eq!(format!("{:.2}", py_sum(costs.into_iter())), "1.48");
     }
 
     #[test]

@@ -427,12 +427,14 @@ impl SummaryPlan {
     /// Estimated USD of the whole tree.
     pub fn estimated_usd(&self) -> Option<f64> {
         self.prices.map(|prices| {
-            // CPython `sum(...)` folds left-to-right from zero;
-            // Rust's float `sum` reassociates and can land one
-            // cent away when the total is formatted.
-            self.stages.iter().fold(0.0, |total, stage| {
-                total + self.costs.usd(&stage.kind, stage.to_generate, &prices)
-            })
+            // CPython `sum(...)` is Neumaier-compensated; a
+            // plain fold can land one cent away when the
+            // total is formatted (the trial's $1.48 vs $1.47).
+            crate::responsiveness::py_sum(
+                self.stages
+                    .iter()
+                    .map(|stage| self.costs.usd(&stage.kind, stage.to_generate, &prices)),
+            )
         })
     }
 
