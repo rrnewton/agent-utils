@@ -57563,3 +57563,34 @@ def test_a_missing_git_entry_still_refuses(tmp_path: Path) -> None:
 
     with pytest.raises(wrkslots.Refusal, match="no safe .git file"):
         wrkslots._GitVcs().repair_nested_repository(plain)
+
+
+def test_clean_caches_skips_one_nested_git_cache_and_cleans_the_slot(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path, cache_globs=("target", "node_modules")
+    )
+    assert create(project).returncode == 0
+    tree = checkout(project)
+    blocked = tree / "target" / "tmp" / "copy" / ".git"
+    blocked.mkdir(parents=True)
+    sentinel = blocked / "HEAD"
+    sentinel.write_text("ref: refs/heads/main\n", encoding="utf-8")
+    plain = tree / "node_modules" / "pkg"
+    plain.mkdir(parents=True)
+    (plain / "index.js").write_text("x", encoding="utf-8")
+
+    cleaned = command(project, "clean-caches", "--only", "slot01", "--format", "json")
+
+    assert cleaned.returncode == 0, cleaned.stderr
+    payload = json.loads(cleaned.stdout)
+    row = payload["slots"][0]
+    assert row["action"] == "REMOVED"
+    assert any(
+        skipped["path"].endswith("target")
+        and "nested Git metadata" in skipped["reason"]
+        for skipped in row["skipped"]
+    ), row
+    assert sentinel.is_file()
+    assert not plain.exists()

@@ -33866,10 +33866,28 @@ def _cmd_clean_caches(args: argparse.Namespace) -> int:
                 action = "HELD"
             else:
                 try:
-                    measured = tuple(
-                        (cache, _allocated_cache_bytes(config, cache))
-                        for cache in _cache_slot_directories(config, cache_slot)
-                    )
+                    measured_list: list[tuple[CacheDirectory, int]] = []
+                    for cache in _cache_slot_directories(config, cache_slot):
+                        try:
+                            size = _allocated_cache_bytes(config, cache)
+                        except Refusal as exc:
+                            # One cache directory holding nested Git
+                            # metadata (a tmp cargo-home checkout, say)
+                            # must not veto cleaning the slot's other
+                            # caches: skip that directory untouched and
+                            # keep going. Any other refusal still aborts.
+                            if not str(exc).startswith(
+                                "cache directory contains nested Git metadata"
+                            ):
+                                raise
+                            skipped.append({"path": str(cache.path), "reason": str(exc)})
+                            continue
+                        measured_list.append((cache, size))
+                    measured = tuple(measured_list)
+                    if not measured_list and skipped and slot in selected:
+                        # Every candidate is indeterminate: preserve the
+                        # original all-or-nothing refusal for this slot.
+                        raise Refusal(skipped[-1]["reason"])
                     # Every selected directory was measured, so its refusals
                     # (nested Git metadata, for one) have already applied.
                     kept: list[tuple[CacheDirectory, int]] = []
