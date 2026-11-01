@@ -13177,6 +13177,13 @@ class _GitVcs:
         if env_overrides:
             env.update(env_overrides)
         env.pop(_NETWORK_CONFIG_SHA256_ENV, None)
+        # A checkout that was renamed (the removal fence) still has its
+        # submodule gitdirs in the main repository, whose core.worktree
+        # names the pre-rename path; Git then refuses to chdir there.
+        # The repository argument is the worktree's true current
+        # location, so pin it unless the caller named one explicitly.
+        if "GIT_WORK_TREE" not in env and (repository / ".git").exists():
+            env["GIT_WORK_TREE"] = str(repository)
         network_operation = _GitVcs._network_operation(args)
         if expected_network_config is not None:
             observed_network_config = hashlib.sha256(

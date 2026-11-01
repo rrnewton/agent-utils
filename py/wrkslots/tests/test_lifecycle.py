@@ -14429,6 +14429,61 @@ def test_initialized_submodules_tolerates_unpopulated_nested_submodule(
     assert vcs.initialized_submodules(top) == ("agent-utils",)
 
 
+def test_initialized_submodules_after_fence_rename_of_linked_worktree(
+    tmp_path: Path,
+) -> None:
+    # A validate checkout is a linked worktree: submodule gitdirs live
+    # under the main repository and do not move when the removal fence
+    # renames the checkout, so their core.worktree names the old path
+    # and Git refuses to chdir there. Enumeration must still work.
+    leaf = tmp_path / "leaf"
+    mid = tmp_path / "mid"
+    top = tmp_path / "top"
+    for repository, name in ((leaf, "leaf"), (mid, "mid"), (top, "top")):
+        repository.mkdir()
+        git(repository, "init", "-q", "--initial-branch=main", ".")
+        git(repository, "config", "user.name", "Wrkslots Test")
+        git(repository, "config", "user.email", "wrkslots@example.invalid")
+        (repository / f"{name}.txt").write_text(f"{name}\n", encoding="utf-8")
+        git(repository, "add", ".")
+        git(repository, "commit", "-q", "-m", f"{name} base")
+    git(
+        mid,
+        "-c", "protocol.file.allow=always",
+        "submodule", "add", "-q", str(leaf), ".claude_template",
+    )
+    git(mid, "add", ".")
+    git(mid, "commit", "-q", "-m", "mid with leaf")
+    git(
+        top,
+        "-c", "protocol.file.allow=always",
+        "submodule", "add", "-q", str(mid), "agent-utils",
+    )
+    git(top, "add", ".")
+    git(top, "commit", "-q", "-m", "top with mid")
+
+    main = tmp_path / "main"
+    git(tmp_path, "clone", "-q", str(top), str(main))
+    slot = tmp_path / "slot"
+    git(main, "worktree", "add", "-q", str(slot), "HEAD")
+    git(
+        slot,
+        "-c", "protocol.file.allow=always",
+        "submodule", "update", "--init", "--recursive", "-q",
+    )
+    vcs = wrkslots._GitVcs()
+    assert vcs.initialized_submodules(slot) == (
+        "agent-utils",
+        "agent-utils/.claude_template",
+    )
+    fenced = tmp_path / ".slot.fenced.1.abcdef"
+    slot.rename(fenced)
+    assert vcs.initialized_submodules(fenced) == (
+        "agent-utils",
+        "agent-utils/.claude_template",
+    )
+
+
 @pytest.mark.parametrize(
     ("left", "right"),
     (

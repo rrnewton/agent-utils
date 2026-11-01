@@ -976,9 +976,11 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # whose worktree is absent, or whose .git file names a gitdir the tree
     # does not carry, is omitted from the initialized listing while a
     # populated submodule is still listed) is mapped.
-    assert len(all_tests) == 2118
+    # The fenced linked-worktree enumeration case (a populated submodule
+    # whose gitdir still names the pre-rename worktree) is mapped.
+    assert len(all_tests) == 2119
     assert len(ordinary) == 337
-    assert len(mapped) == 1781
+    assert len(mapped) == 1782
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {
