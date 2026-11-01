@@ -4181,9 +4181,12 @@ impl<A: ManagedApi + ?Sized> Notifier for ManagedNotifier<'_, A> {
 
     /// Start `agent-teams --state-dir DIR pump --deferred` (the binary named by
     /// `$AGENT_TEAMS_BIN`, else `agent-teams` on `PATH`) and return at once: a pump walks
-    /// network routes, and the pass must not wait for it. A thread reaps it, killing it past
-    /// [`TEAM_PUMP_DEADLINE`]; agent-teams' own lock keeps a second pump from overlapping it.
+    /// network routes, and the pass must not wait for it. It runs in its own process group,
+    /// which a thread kills past [`TEAM_PUMP_DEADLINE`] (route children included) and then
+    /// reaps; agent-teams' own lock keeps a second pump from overlapping it. A single pass
+    /// (`--once`) exits without waiting, leaving the pump to finish on its own.
     fn run_team_pump(&mut self) -> std::result::Result<String, String> {
+        use std::os::unix::process::CommandExt;
         let binary = std::env::var_os("AGENT_TEAMS_BIN")
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "agent-teams".into());
@@ -4194,16 +4197,22 @@ impl<A: ManagedApi + ?Sized> Notifier for ManagedNotifier<'_, A> {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
+            .process_group(0)
             .spawn()
             .map_err(|error| format!("cannot run {}: {error}", binary.to_string_lossy()))?;
         let pid = child.id();
+        let group = i32::try_from(pid).unwrap_or(0);
         std::thread::spawn(move || {
             let started = Instant::now();
             loop {
                 match child.try_wait() {
                     Ok(Some(_)) | Err(_) => return,
                     Ok(None) if started.elapsed() > TEAM_PUMP_DEADLINE => {
-                        let _ = child.kill();
+                        if group > 0 {
+                            // SAFETY: kill has no memory-safety preconditions; the group is the
+                            // one spawned here, and its leader is not yet reaped.
+                            unsafe { libc::kill(-group, libc::SIGKILL) };
+                        }
                         let _ = child.wait();
                         return;
                     }

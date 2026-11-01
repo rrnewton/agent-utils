@@ -194,7 +194,10 @@ watch-agents` tells the designated coordinator once per message and then
 moves to `notices-told/`. `pump` retries the message after the fix;
 `agentctl watch-agents` starts `pump --deferred` every 10 minutes while the
 outbox holds deferred messages. Senders see exit 75, never a silent
-`accepted` into a dead queue.
+`accepted` into a dead queue. Over the relay route the same answer comes
+back as a `deferred` receipt, which moves the sender's entry from
+`in-custody` to `deferred`; a quarantined relay post refused this way stays
+quarantined for the next drain.
 
 An agent with a record (`agent.json`) in the registry is always a
 deliverable target, whatever its archive holds (a stop and restart under

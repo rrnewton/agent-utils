@@ -1166,9 +1166,9 @@ declaration naming no registry (`agent-teams init --coordinator-self`),
 NEW's harness, so NEW may send for the team; any other pin is reported under
 `team_declarations`), get `agent-teams check` green, drain the old
 coordinator's queue, then retire it with `agentctl stop OLD --handover-to
-NEW` (the designation moves first, after the stop's own argument checks; if
-the stop fails it is put back, unless OLD's harness is already gone or
-someone re-designated meanwhile; declarations it unpinned stay unpinned).
+NEW` (the designation moves first, after the stop's own argument checks, and
+stays on NEW even if the stop then fails: a failed stop may already have
+closed OLD's pane, and NEW is live either way).
 Stopping the live designated coordinator without `--handover-to` is refused;
 an explicit `--force-coordinator` overrides with a warning, and a coordinator
 whose harness is gone, or the `--retire-dead-*` and

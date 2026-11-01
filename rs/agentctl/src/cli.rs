@@ -977,7 +977,7 @@ struct Stop {
     /// the agentcloud session (use when the session no longer exists or was retired elsewhere)
     #[arg(long)]
     skip_cloud_halt: bool,
-    /// Hand this registry's coordinator designation over to NEW before stopping (put back if the stop fails while the old coordinator's harness is still alive and nobody re-designated meanwhile): required when stopping the live designated coordinator, so team delivery keeps a live target (#721 agent-teams-coordinator-handover)
+    /// Hand this registry's coordinator designation over to NEW before stopping (it stays on NEW even if the stop then fails): required when stopping the live designated coordinator, so team delivery keeps a live target (#721 agent-teams-coordinator-handover)
     #[arg(long, value_name = "NEW")]
     handover_to: Option<String>,
     /// Stop the live designated coordinator without handing over (prints a warning; inter-team delivery to this registry loses its target until a new coordinator is designated). Not needed when its harness is gone or with --retire-dead-adoption, --retire-dead-native or --recover-legacy-adoption, which warn the same way
@@ -3547,7 +3547,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 .ok()
                 .flatten()
                 .is_some_and(|name| name == value.agent.name);
-            let mut restore_designation = None;
+            let mut handed_over = false;
             if is_coordinator {
                 let dead_path = value.retire_dead_adoption
                     || value.retire_dead_native
@@ -3560,10 +3560,10 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                         ));
                     }
                     // Designation first, so team delivery never resolves to the stopped
-                    // agent; put back if the stop fails.
-                    let previous = manager.designation_snapshot()?;
+                    // agent. It stays on NEW even if the stop fails: a failed stop may have
+                    // closed the old pane already, and NEW is live either way.
                     manager.coordinator_set(new)?;
-                    restore_designation = Some((previous, manager.designation_snapshot()?));
+                    handed_over = true;
                     eprintln!(
                         "agentctl stop: handed the coordinator designation over to {new} before stopping {}",
                         value.agent.name
@@ -3594,35 +3594,19 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     skip_cloud_halt: value.skip_cloud_halt,
                 },
             );
-            match (stopped, restore_designation) {
-                (Ok(report), _) => report,
-                (Err(error), Some((previous, handed))) => {
-                    // A stop can fail after closing the pane: never hand team delivery back
-                    // to a coordinator whose harness is gone.
-                    let new = value.handover_to.as_deref().unwrap_or("NEW");
-                    if manager.harness_dead(&value.agent.name) {
+            match stopped {
+                Ok(report) => report,
+                Err(error) => {
+                    if handed_over {
                         eprintln!(
-                            "agentctl stop: the stop failed, but {}'s harness is gone, so {new} stays the designated coordinator",
+                            "agentctl stop: the stop failed; the coordinator designation stays on {} (handing it back could give team delivery to a coordinator the failed stop half-closed). If {} should keep coordinating, run `agentctl coordinator set {}`",
+                            value.handover_to.as_deref().unwrap_or("NEW"),
+                            value.agent.name,
                             value.agent.name
                         );
-                    } else {
-                        match manager.coordinator_restore(previous.as_ref(), handed.as_ref()) {
-                            Ok(true) => eprintln!(
-                                "agentctl stop: the stop failed, so the coordinator designation was put back on {} (declarations the handover unpinned stay unpinned; they follow the designation)",
-                                value.agent.name
-                            ),
-                            Ok(false) => eprintln!(
-                                "agentctl stop: the stop failed; the designation changed again meanwhile, so it was left as it is"
-                            ),
-                            Err(restore) => eprintln!(
-                                "agentctl stop: the stop failed and the designation could not be put back ({restore}); run `agentctl coordinator set {}`",
-                                value.agent.name
-                            ),
-                        }
                     }
                     return Err(error.into());
                 }
-                (Err(error), None) => return Err(error.into()),
             }
         }
         Commands::Revive(value) => {

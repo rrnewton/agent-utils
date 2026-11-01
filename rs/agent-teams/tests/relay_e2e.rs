@@ -103,6 +103,8 @@ impl World {
             .env("XDG_CONFIG_HOME", &self.config)
             .env("AGENT_TEAMS_STATE_DIR", &self.state)
             .env("AGENT_TEAMS_HOST", "host-a")
+            // Designations are read from fixture files; never ask a real agentctl.
+            .env("AGENT_TEAMS_AGENTCTL", "/bin/false")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -475,4 +477,61 @@ fn setup_suggests_a_per_fleet_channel_and_writes_nothing() {
     assert!(out.contains("relay_channels"), "{out}");
     assert!(out.contains("Never admit an unconfirmed claim"), "{out}");
     assert!(!world.channel_file.exists(), "setup writes nothing");
+}
+
+/// #721 agent-teams-coordinator-handover over the relay: a receiving team whose delivery
+/// target is archived answers with a `deferred` receipt, and the sender records it as
+/// `deferred` (with the reason), so `pump` retries it instead of leaving it in custody.
+#[test]
+fn relay_undeliverable_target_answers_a_deferred_receipt_the_sender_records() {
+    let world = World::new();
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    let (id, post) = world.send_sim_to_tools("Are you there?", "relay-undeliverable-1");
+    // Then the receiving team is pointed at a registry whose designated coordinator is archived.
+    let registry = world.root.join("registry");
+    let archived = registry
+        .join("archive")
+        .join("old-1792931619150276422-1347278");
+    std::fs::create_dir_all(&archived).expect("archive");
+    std::fs::write(archived.join("agent.json"), r#"{"name": "old"}"#).expect("archived record");
+    std::fs::write(registry.join("coordinator.json"), r#"{"name": "old"}"#).expect("designation");
+    let path = world.state.join("teams.d/tools/declaration.json");
+    let mut declaration: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("declaration")).expect("json");
+    declaration["deliverer"] = serde_json::json!({"kind": "agentctl-queue", "registry": registry.to_string_lossy(), "auto_drain": false});
+    declaration["coordinator"] = serde_json::json!({"designation": "registry"});
+    std::fs::write(&path, serde_json::to_string_pretty(&declaration).unwrap()).expect("write");
+
+    let outcome = world.relay_in(BOT1, &post);
+    assert_eq!(outcome["outcome"], "undeliverable", "{outcome}");
+    let receipt = outcome["receipt_text"].as_str().expect("receipt text");
+    assert!(receipt.contains("receipt: deferred"), "{receipt}");
+    assert!(world
+        .state
+        .join(format!("teams.d/tools/notices/{id}.json"))
+        .exists());
+
+    let tools_announce = agent_teams::relay::build_announce(
+        "tools",
+        "host-a",
+        "UBOTTOOLS",
+        "https://example.invalid/org/repo.git",
+    );
+    world.relay_in(
+        "UBOTTOOLS",
+        &agent_teams::relay::render_announce(&tools_announce),
+    );
+    let (code, out, err) = world.run(&["relay", "confirm", "UBOTTOOLS", "--owner-approved"]);
+    assert_eq!(code, 0, "{out} {err}");
+    let outcome = world.relay_in("UBOTTOOLS", receipt);
+    assert_eq!(outcome["outcome"], "receipt-recorded", "{outcome}");
+    let (_, out, _) = world.run(&["status", &id, "--json"]);
+    let value: serde_json::Value = serde_json::from_str(&out).expect("status json");
+    assert_eq!(value["outbox"]["state"], "deferred", "{out}");
+    assert!(
+        value["outbox"]["undeliverable"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("archived")),
+        "{out}"
+    );
 }

@@ -506,6 +506,12 @@ pub fn relay_in(
                 "typing",
                 "presented",
                 "in-custody",
+                // A receiver whose delivery target is missing or archived
+                // answers `deferred` (#721 agent-teams-coordinator-handover;
+                // the first build of that said `undeliverable`): nothing was
+                // claimed there, so the message must become retryable here.
+                "deferred",
+                "undeliverable",
             ];
             if !crate::envelope::valid_message_id(&id)
                 || !KNOWN_STATES.contains(&receipt_state.as_str())
@@ -561,6 +567,16 @@ pub fn relay_in(
             }
             let mapped = crate::sender::map_receiver_state(&receipt_state);
             entry["state"] = json!(mapped);
+            if mapped == "deferred" {
+                // Kept beside the state, as the sender walk does, so `outbox`
+                // shows why; `pump` retries it once the target is fixed.
+                entry["undeliverable"] = receipt
+                    .get("detail")
+                    .cloned()
+                    .unwrap_or_else(|| json!("undeliverable"));
+            } else if let Some(entry) = entry.as_object_mut() {
+                entry.remove("undeliverable");
+            }
             let _ = write_json_atomic(&crate::sender::outbox_path(state, &id), &entry);
             log_event(
                 state,
@@ -1336,6 +1352,16 @@ pub fn drain_quarantine(state: &Path, this_host: &str) -> DataResult<DrainOutcom
                 // Only accepted/known count as delivered. A terminal
                 // refusal is reported as dropped with its state, logged,
                 // and removed — never silently counted as delivered.
+                // Undeliverable (#721): nothing was claimed and the target
+                // may be fixed, so the post stays quarantined for the next
+                // drain instead of being dropped.
+                Ok(answer) if answer.outcome == "undeliverable" => {
+                    log_event(
+                        state,
+                        &json!({"event": "relay-quarantine", "outcome": "undeliverable-kept", "id": id, "peer_sender": peer_sender}),
+                    );
+                    false
+                }
                 Ok(answer) if matches!(answer.outcome.as_str(), "accepted" | "known") => {
                     delivered.push(id);
                     log_event(

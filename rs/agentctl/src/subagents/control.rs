@@ -935,12 +935,10 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         &self,
         teams_state: &Path,
         old: Option<&str>,
+        old_identity: Option<CustomProcessIdentity>,
         new: &str,
     ) -> Value {
         let registry = self.registry_text();
-        let old_identity = old
-            .and_then(|name| self.load(name).ok())
-            .and_then(|record| record.acting_process().cloned());
         let new_identity = self
             .load(new)
             .ok()
@@ -1051,6 +1049,43 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         json!({"checked": checked, "fixed": fixed, "flagged": flagged})
     }
 
+    /// The acting process of the generation `designation` (the one being replaced) names, which
+    /// `old` (its current name) identifies: its live record when that record still is the designated
+    /// generation (its token or a former one), else its archived record (`archive/*/agent.json`
+    /// with the designated token), so a coordinator stopped before the handover is still known,
+    /// and a different agent registered since under the same name is never taken for it.
+    fn designated_generation_process(
+        &self,
+        old: &str,
+        designation: &Designation,
+    ) -> Option<CustomProcessIdentity> {
+        if let Ok(record) = self.load(old) {
+            if record.token == designation.token
+                || record.former_tokens().contains(&designation.token)
+            {
+                return record.acting_process().cloned();
+            }
+        }
+        let entries = fs::read_dir(self.registry.join("archive")).ok()?;
+        for entry in entries.flatten() {
+            let Some(document) = fs::read(entry.path().join("agent.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            else {
+                continue;
+            };
+            if document.get("token").and_then(Value::as_str) != Some(designation.token.as_str()) {
+                continue;
+            }
+            return ["harness_identity", "custom_process_identity"]
+                .iter()
+                .filter_map(|key| document.get(*key).cloned())
+                .filter_map(|value| serde_json::from_value::<CustomProcessIdentity>(value).ok())
+                .find(CustomProcessIdentity::valid);
+        }
+        None
+    }
+
     /// Designate the registered agent `agent_name` as this registry's coordinator.
     pub fn coordinator_set(&self, agent_name: &str) -> Result<Value> {
         self.coordinator_set_in(agent_name, &agent_teams_state_dir())
@@ -1061,12 +1096,16 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         let _lock = self.designation_lock()?;
         // The designated name even when its record is gone (stopped first, or retired dead),
         // so a deliverer pinned to it is still recognised as the old coordinator's.
+        let previous = read_designation(&self.registry).ok().flatten();
         let old = self.designated_coordinator().ok().flatten().or_else(|| {
-            read_designation(&self.registry)
-                .ok()
-                .flatten()
-                .map(|designation| designation.name)
+            previous
+                .as_ref()
+                .map(|designation| designation.name.clone())
         });
+        let old_identity = old
+            .as_deref()
+            .zip(previous.as_ref())
+            .and_then(|(name, designation)| self.designated_generation_process(name, designation));
         let record = self.load(agent_name)?;
         let designation = Designation {
             schema: DESIGNATION_SCHEMA.to_owned(),
@@ -1080,59 +1119,17 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             &serde_json::to_value(&designation).map_err(|error| fail(error.to_string()))?,
         )?;
         let mut report = self.coordinator_show()?;
-        report["team_declarations"] =
-            self.team_declarations_handover(teams_state, old.as_deref(), &record.name);
+        report["team_declarations"] = self.team_declarations_handover(
+            teams_state,
+            old.as_deref(),
+            old_identity,
+            &record.name,
+        );
         report["host_index"] = match self.host_index_refresh() {
             Ok(path) => json!({"registered": true, "path": path.to_string_lossy()}),
             Err(error) => json!({"registered": false, "error": error.to_string()}),
         };
         Ok(report)
-    }
-
-    /// The designation file's current content, for [`Self::coordinator_restore`].
-    pub fn designation_snapshot(&self) -> Result<Option<Value>> {
-        read_designation(&self.registry)?
-            .map(|designation| {
-                serde_json::to_value(&designation).map_err(|error| fail(error.to_string()))
-            })
-            .transpose()
-    }
-
-    /// Put back a designation taken with [`Self::designation_snapshot`] (`None` removes it),
-    /// as `stop --handover-to` does when the stop fails after the designation moved, but only
-    /// while the designation is still `expected` (what the handover wrote): a `coordinator set`
-    /// that ran meanwhile is kept. Returns whether it put the designation back.
-    pub fn coordinator_restore(
-        &self,
-        previous: Option<&Value>,
-        expected: Option<&Value>,
-    ) -> Result<bool> {
-        let _lock = self.designation_lock()?;
-        let current = read_designation(&self.registry)?
-            .map(|designation| {
-                serde_json::to_value(&designation).map_err(|error| fail(error.to_string()))
-            })
-            .transpose()?;
-        if current.as_ref() != expected {
-            return Ok(false);
-        }
-        let path = self.registry.join(DESIGNATION_FILE);
-        match previous {
-            Some(value) => agent::atomic_json(&path, value)?,
-            None => match fs::remove_file(&path) {
-                Ok(()) => agent::sync_directory(&self.registry)?,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(fail(format!("cannot remove {}: {error}", path.display())))
-                }
-            },
-        }
-        if previous.is_some() {
-            let _ = self.host_index_refresh();
-        } else {
-            self.host_index_remove();
-        }
-        Ok(true)
     }
 
     /// Whether `agent_name`'s recorded harness process is positively gone (kernel evidence of a

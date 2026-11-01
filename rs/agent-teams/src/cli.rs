@@ -1317,8 +1317,18 @@ fn cmd_send(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
                         &crate::sender::outbox_path(&globals.state, &id),
                         &outbox_entry,
                     )?;
-                    println!("{id}: undeliverable: {} — fix: {}", flag.detail, flag.fix);
-                    println!("kept in the outbox as deferred; fix the target, then `agent-teams pump` (agentctl watch-agents pumps this host's outbox every 10 minutes)");
+                    if globals.json || has_flag(args, "--json") {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&json!({
+                                "id": id, "key": key, "state": "deferred", "tag": team_tag(&envelope),
+                                "undeliverable": outbox_entry["undeliverable"], "steps": [],
+                            }))?
+                        );
+                    } else {
+                        println!("{id}: undeliverable: {} — fix: {}", flag.detail, flag.fix);
+                        println!("kept in the outbox as deferred; fix the target, then `agent-teams pump` (agentctl watch-agents pumps this host's outbox every 10 minutes)");
+                    }
                     return Ok(75);
                 }
             }
@@ -1562,15 +1572,14 @@ fn cmd_outbox(globals: &Globals) -> Result<i32, DataError> {
 }
 
 fn cmd_pump(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
-    // Stranger alarms repeat on their timer whenever pump runs.
-    let _ = crate::relay::raise_due_alarms(&globals.state, now_unix_ms());
-    let _ = crate::relay::drain_quarantine(&globals.state, &globals.host);
     let retry_refused = has_flag(args, "--retry-refused");
     // Only messages that never reached a receiver (`agentctl watch-agents` pumps this way,
     // so an accepted message is not re-asked about every few minutes).
     let deferred_only = has_flag(args, "--deferred");
     // One pump at a time per state directory: two watchers sharing it, or a watcher and a
     // person, would otherwise walk the same entry at once and the last outbox write would win.
+    // (`send` takes no lock, so a pump can still walk an entry a send is walking; the
+    // receiver's ledger claim keeps that delivery single.)
     std::fs::create_dir_all(&globals.state)?;
     let lock_file = std::fs::OpenOptions::new()
         .create(true)
@@ -1581,6 +1590,10 @@ fn cmd_pump(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
         println!("pump: another pump is running on this state directory; nothing done");
         return Ok(0);
     }
+    // Stranger alarms repeat on their timer whenever pump runs; under the
+    // lock, so two pumps never post the same alarm or race the quarantine.
+    let _ = crate::relay::raise_due_alarms(&globals.state, now_unix_ms());
+    let _ = crate::relay::drain_quarantine(&globals.state, &globals.host);
     let teams = globals.load_teams()?;
     let routes = globals.load_routes()?;
     let dir = crate::sender::outbox_dir(&globals.state);

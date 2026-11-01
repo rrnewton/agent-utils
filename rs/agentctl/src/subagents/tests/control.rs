@@ -636,45 +636,12 @@ fn team_undeliverable_notices_are_listed_and_set_aside() {
     assert_eq!(again[0].1["repeat"], true, "{again:?}");
 }
 
-/// `stop --handover-to` moves the designation before the stop and puts it back when the stop
-/// fails: a snapshot restores exactly, and restoring "none" removes the designation.
+/// An agent whose pinned harness the fake client cannot prove gone is not dead.
 #[test]
-fn a_designation_snapshot_restores_after_a_failed_handover_stop() {
+fn unknown_liveness_is_not_dead() {
     let fixture = Fixture::new();
     register(&fixture, "coord-old", 88);
-    register(&fixture, "coord-new", 89);
-    let manager = fixture.manager();
-    let none = fixture.root.join("none");
-    assert_eq!(manager.designation_snapshot().unwrap(), None);
-    manager.coordinator_set_in("coord-old", &none).unwrap();
-    let previous = manager.designation_snapshot().unwrap();
-    manager.coordinator_set_in("coord-new", &none).unwrap();
-    assert_eq!(
-        manager.designated_coordinator().unwrap().as_deref(),
-        Some("coord-new")
-    );
-    let handed = manager.designation_snapshot().unwrap();
-    // Someone re-designated meanwhile: kept.
-    assert!(!manager
-        .coordinator_restore(previous.as_ref(), previous.as_ref())
-        .unwrap());
-    assert_eq!(manager.designation_snapshot().unwrap(), handed);
-    assert!(manager
-        .coordinator_restore(previous.as_ref(), handed.as_ref())
-        .unwrap());
-    assert_eq!(
-        manager.designated_coordinator().unwrap().as_deref(),
-        Some("coord-old")
-    );
-    assert_eq!(manager.designation_snapshot().unwrap(), previous);
-    assert!(manager
-        .coordinator_restore(None, previous.as_ref())
-        .unwrap());
-    assert_eq!(manager.designated_coordinator().unwrap(), None);
-    assert!(
-        !manager.harness_dead("coord-old"),
-        "unknown liveness is not dead"
-    );
+    assert!(!fixture.manager().harness_dead("coord-old"));
 }
 
 /// Review of the fix, finding 3: `agent-teams init --coordinator-self` writes a pinned process
@@ -749,4 +716,45 @@ fn coordinator_set_unpins_the_old_name_after_its_record_is_gone() {
     );
     let fixed = agent::read_private_json(&path).unwrap();
     assert!(fixed["deliverer"].get("agent").is_none(), "{fixed}");
+}
+
+/// Review round 2, finding G: a registry-less pin to the old coordinator's harness is moved
+/// even when the old coordinator was stopped (archived) before `coordinator set`.
+#[test]
+fn coordinator_set_moves_a_registryless_pin_of_an_archived_coordinator() {
+    let fixture = Fixture::new();
+    let token = register(&fixture, "coord-old", 88);
+    register(&fixture, "coord-new", 89);
+    let manager = fixture.manager();
+    manager
+        .coordinator_set_in("coord-old", &fixture.root.join("none"))
+        .unwrap();
+    // Archive the old record as a stop does.
+    let archive = registry(&fixture).join("archive");
+    fs::create_dir_all(&archive).unwrap();
+    fs::rename(
+        agent_directory(&fixture, "coord-old"),
+        archive.join(format!("coord-old-{token}")),
+    )
+    .unwrap();
+    let state = fixture.root.join("teams-state-archived-self");
+    let dir = state.join("teams.d").join("tools");
+    fs::create_dir_all(&dir).unwrap();
+    let document = json!({
+        "schema": "agent-teams-declaration/v1", "team": "tools",
+        "deliverer": {"kind": "hook-inbox"},
+        "coordinator": {"designation": "pinned", "harness_identity": Fake::harness(88)},
+        "accepts_from": [], "limits": {},
+    });
+    agent::atomic_json(&dir.join("declaration.json"), &document).unwrap();
+    let report = manager.coordinator_set_in("coord-new", &state).unwrap();
+    assert_eq!(
+        report["team_declarations"]["fixed"][0]["repinned_designation"], true,
+        "{report}"
+    );
+    let moved = agent::read_private_json(&dir.join("declaration.json")).unwrap();
+    assert_eq!(
+        moved["coordinator"]["harness_identity"],
+        json!(Fake::harness(89))
+    );
 }
