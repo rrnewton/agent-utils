@@ -7146,7 +7146,6 @@ impl BridgeState {
         }
         // Drain both pipes on threads while polling: a command emitting
         // more than a pipe buffer must not deadlock into the timeout.
-        use std::io::Read as _;
         fn drain<R: std::io::Read + Send + 'static>(
             pipe: Option<R>,
         ) -> std::thread::JoinHandle<Vec<u8>> {
