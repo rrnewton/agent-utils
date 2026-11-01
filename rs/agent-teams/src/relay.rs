@@ -258,9 +258,11 @@ pub fn record_candidate(
         .and_then(Value::as_str)
         .unwrap_or("");
     let team = announce.get("team").and_then(Value::as_str).unwrap_or("");
+    let host = announce.get("host").and_then(Value::as_str).unwrap_or("");
     if store_list(&store, "confirmed").iter().any(|c| {
         c.get("sender_id").and_then(Value::as_str) == Some(sender)
-            && c.get("team").and_then(Value::as_str) != Some(team)
+            && (c.get("team").and_then(Value::as_str) != Some(team)
+                || c.get("host").and_then(Value::as_str) != Some(host))
     }) {
         return Ok("candidate-conflict".to_string());
     }
@@ -452,6 +454,7 @@ pub fn relay_in(
     peer_sender: &str,
     channel: &str,
     thread: &str,
+    in_thread: bool,
     text: &str,
 ) -> DataResult<RelayInResult> {
     let parsed = match parse_post(text) {
@@ -459,20 +462,27 @@ pub fn relay_in(
         Err(reason) => {
             // Unparseable posts from a listed peer are stranger events:
             // quarantine and alarm, never silently dropped. Provider
-            // formatting, splitting or truncation lands here.
+            // formatting, splitting or truncation lands here. A recording
+            // failure is an admission failure, never a silent drop.
             let detail = format!("unparseable relay post: {reason}");
-            if let Err(error) =
-                record_unparseable_stranger(state, route, peer_sender, channel, text, &detail)
-            {
-                log_event(
-                    state,
-                    &json!({"event": "relay-in", "outcome": "stranger-record-failed", "route": route, "peer_sender": peer_sender, "detail": error.to_string()}),
-                );
-            }
+            record_unparseable_stranger(state, route, peer_sender, channel, text, &detail)?;
             let mut out = result(NOT_RECORDED, detail);
-            out.receipt_text = Some(format!(
-                "agent-teams receipt: {NOT_RECORDED} (unparseable relay post)\n"
-            ));
+            // Only a listed peer earns a thread receipt; an unlisted
+            // stranger's mangled post is quarantined and alarmed without
+            // a bot reply in the channel.
+            let listed = load_declarations(state).is_ok_and(|declarations| {
+                declarations.iter().any(|(_, _, declaration)| {
+                    declaration
+                        .relay_channels
+                        .iter()
+                        .any(|entry| entry.route == route && entry.peers.contains_key(peer_sender))
+                })
+            }) || confirmed_mapping_for(state, peer_sender, route).is_some();
+            if listed {
+                out.receipt_text = Some(format!(
+                    "agent-teams receipt: {NOT_RECORDED} (unparseable relay post)\n"
+                ));
+            }
             return Ok(out);
         }
     };
@@ -483,6 +493,14 @@ pub fn relay_in(
                 .and_then(Value::as_str)
                 .unwrap_or("");
             if claimed != peer_sender {
+                record_unparseable_stranger(
+                    state,
+                    route,
+                    peer_sender,
+                    channel,
+                    text,
+                    "announcement claims a sender other than its poster",
+                )?;
                 log_event(
                     state,
                     &json!({"event": "relay-in", "outcome": "refused-announce-sender-mismatch", "route": route, "peer_sender": peer_sender, "claimed_sender": claimed}),
@@ -495,20 +513,28 @@ pub fn relay_in(
             if announce.get("integrity").and_then(Value::as_str)
                 != Some(&announce_integrity(&announce))
             {
+                record_unparseable_stranger(
+                    state,
+                    route,
+                    peer_sender,
+                    channel,
+                    text,
+                    "announcement integrity hash mismatch",
+                )?;
                 return Ok(result(NOT_RECORDED, "announcement integrity hash mismatch"));
             }
             let outcome = record_candidate(state, &announce, peer_sender, route)?;
             if outcome == "candidate-conflict" {
                 // A second team claim for one confirmed sender ID is a
                 // conflict alarm, never a silent replacement.
-                let _ = record_unparseable_stranger(
+                record_unparseable_stranger(
                     state,
                     route,
                     peer_sender,
                     channel,
                     text,
                     "conflict: sender already confirmed for another team (one bot per team)",
-                );
+                )?;
             }
             log_event(
                 state,
@@ -568,8 +594,10 @@ pub fn relay_in(
                 return Ok(result("banned-sender", "banned sender's receipt dropped"));
             }
             // A receipt must arrive in the original post's thread: a
-            // top-level channel post (no thread) never settles anything.
-            if thread.is_empty() {
+            // top-level channel post never settles anything. Providers
+            // synthesise a thread ID for top-level posts too, so the
+            // bridge's thread-reply flag, not the ID, decides.
+            if thread.is_empty() || !in_thread {
                 log_event(
                     state,
                     &json!({"event": "relay-in", "outcome": "receipt-refused", "route": route, "peer_sender": peer_sender, "id": id, "detail": "receipt not in a thread"}),
@@ -1059,21 +1087,8 @@ fn record_unparseable_stranger(
             );
         }
     }
-    // No declaration matches this route: still quarantine durably and open
-    // an alarm against the first declaring team, so the post is never lost.
-    if let Some((_, _, declaration)) = declarations.first() {
-        if let Some(entry) = declaration.relay_channels.first() {
-            return record_stranger(
-                state,
-                declaration,
-                entry,
-                peer_sender,
-                &envelope,
-                text,
-                reason,
-            );
-        }
-    }
+    // No declaration matches this route: quarantine durably without
+    // alarming an unrelated team (the post may belong to another fleet).
     let _lock = lock_store(state)?;
     let mut quarantine = load_json_list(&quarantine_path(state), "posts");
     let posts = quarantine
@@ -1128,6 +1143,11 @@ fn record_stranger(
                 "channel": entry.channel, "envelope": envelope, "post": text,
                 "reason": reason, "quarantined_at": format_rfc3339_ms(now_unix_ms()),
             }));
+            // Bounded: a flooding stranger cannot grow this without limit.
+            if posts.len() > 512 {
+                let excess = posts.len() - 512;
+                posts.drain(0..excess);
+            }
         }
     }
     write_json_atomic(&quarantine_path(state), &quarantine)?;

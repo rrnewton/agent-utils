@@ -180,6 +180,10 @@ impl World {
     }
 
     fn relay_in(&self, sender: &str, post: &str) -> serde_json::Value {
+        self.relay_in_threaded(sender, post, true)
+    }
+
+    fn relay_in_threaded(&self, sender: &str, post: &str, in_thread: bool) -> serde_json::Value {
         let (code, out, err) = self.run_stdin(
             &[
                 "relay-in",
@@ -191,6 +195,8 @@ impl World {
                 CHAN,
                 "--thread",
                 "T1",
+                "--thread-reply",
+                if in_thread { "true" } else { "false" },
             ],
             post,
         );
@@ -506,6 +512,9 @@ fn receipt_from_wrong_host_is_refused_and_own_bot_envelope_ignored() {
     let (code, out, err) = world.run(&["relay", "confirm", "UBOTWRONGHOST", "--owner-approved"]);
     assert_eq!(code, 0, "{out} {err}");
     let outcome = world.relay_in("UBOTWRONGHOST", &receipt);
+    assert_eq!(outcome["outcome"], "receipt-refused", "{outcome}");
+    // A top-level (non-thread) receipt post never settles either.
+    let outcome = world.relay_in_threaded("UBOTWRONGHOST", &receipt, false);
     assert_eq!(outcome["outcome"], "receipt-refused", "{outcome}");
     let (_code, out, _) = world.run(&["status", &id, "--json"]);
     assert!(

@@ -1229,7 +1229,7 @@ fn a_reply_whose_thread_root_the_stream_never_carried_is_delivered_and_the_root_
 }
 
 #[test]
-fn relay_peer_bot_posts_are_delivered_only_in_the_relay_channel() {
+fn relay_peer_and_stranger_bot_posts_are_delivered_in_the_relay_channel() {
     // A listed peer bot's bot_message post in the relay channel is delivered
     // to the bridge (which classifies it as relay, never a request). An
     // unlisted bot in that channel is also delivered, so the bridge can

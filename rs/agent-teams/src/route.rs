@@ -508,26 +508,23 @@ impl ChatRelayRoute {
             .count() as u64
     }
     fn note_posted_id(&self, id: &str) {
-        self.posted
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(id.to_string());
+        // Hold the mutex across the file update, and write through a
+        // temp file plus rename so a crash cannot truncate the history.
+        let mut posted = self.posted.lock().unwrap_or_else(|p| p.into_inner());
+        posted.insert(id.to_string());
         if let Some(parent) = self.posted_file.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let mut ids: Vec<String> = std::fs::read_to_string(&self.posted_file)
-            .unwrap_or_default()
-            .lines()
-            .map(str::to_string)
-            .collect();
-        if !ids.iter().any(|existing| existing == id) {
-            ids.push(id.to_string());
-        }
+        let mut ids: Vec<String> = posted.iter().cloned().collect();
+        ids.sort();
         if ids.len() > 4096 {
             let excess = ids.len() - 4096;
             ids.drain(0..excess);
         }
-        let _ = std::fs::write(&self.posted_file, ids.join("\n"));
+        let temp = self.posted_file.with_extension("tmp");
+        if std::fs::write(&temp, ids.join("\n")).is_ok() {
+            let _ = std::fs::rename(&temp, &self.posted_file);
+        }
     }
     fn note_post(&self) {
         let now = crate::timeutil::now_unix_ms();

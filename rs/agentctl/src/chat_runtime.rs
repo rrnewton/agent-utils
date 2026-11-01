@@ -999,6 +999,15 @@ impl BridgeConfiguration {
         // The provider plugin's peer list is derived from this bridge's:
         // a backend_configuration relay peer list that disagrees would let
         // the provider admit a sender the bridge classifies differently.
+        if !self.relay_channels.is_empty() {
+            if let Some(backend) = &self.backend_configuration {
+                if backend.data.get("relay_channels").is_none() {
+                    return Err(ChatRuntimeError::invalid(
+                        "bridge has relay_channels but backend_configuration names no relay_channels for the provider plugin; derive the plugin list from the bridge list",
+                    ));
+                }
+            }
+        }
         if let Some(backend) = &self.backend_configuration {
             if let Some(channels) = backend.data.get("relay_channels").and_then(Value::as_array) {
                 for item in channels {
@@ -7041,6 +7050,10 @@ impl BridgeState {
             .and_then(|text| serde_json::from_str(&text).ok())
             .unwrap_or_else(|| serde_json::json!({"alarms": []}));
         if let Some(list) = alarms.get_mut("alarms").and_then(Value::as_array_mut) {
+            // One alarm per message: replays refresh it, never grow it.
+            list.retain(|alarm| {
+                alarm.get("message_id").and_then(Value::as_str) != Some(&message.message_id)
+            });
             list.push(serde_json::json!({
                 "message_id": message.message_id, "channel_id": message.channel_id,
                 "sender_id": message.sender_id, "detail": detail,
@@ -7104,6 +7117,13 @@ impl BridgeState {
             message.channel_id.clone(),
             "--thread".to_string(),
             message.thread_id.clone(),
+            "--thread-reply".to_string(),
+            if message.thread_reply {
+                "true"
+            } else {
+                "false"
+            }
+            .to_string(),
         ]);
         let Some((program, args)) = argv.split_first() else {
             return failed("relay command argv is empty").map(|outcome| (outcome, None, false));
@@ -7124,39 +7144,49 @@ impl BridgeState {
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(message.text.as_bytes());
         }
-        // Bounded wait: a hung relay command must not wedge admission and
-        // leave the provider batch unacknowledged forever.
+        // Drain both pipes on threads while polling: a command emitting
+        // more than a pipe buffer must not deadlock into the timeout.
+        use std::io::Read as _;
+        fn drain<R: std::io::Read + Send + 'static>(
+            pipe: Option<R>,
+        ) -> std::thread::JoinHandle<Vec<u8>> {
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                if let Some(mut pipe) = pipe {
+                    let _ = pipe.read_to_end(&mut buf);
+                }
+                buf
+            })
+        }
+        let stdout_thread = drain(child.stdout.take());
+        let stderr_thread = drain(child.stderr.take());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        loop {
+        let status = loop {
             match child.try_wait() {
-                Ok(Some(_)) => break,
+                Ok(Some(status)) => break status,
                 Ok(None) if std::time::Instant::now() < deadline => {
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
                 _ => {
                     let _ = child.kill();
+                    let _ = child.wait();
                     return failed("relay command timed out after 30s")
                         .map(|outcome| (outcome, None, false));
                 }
             }
-        }
-        let output = match child.wait_with_output() {
-            Ok(output) => output,
-            Err(error) => {
-                return failed(&format!("relay command wait failed: {error}"))
-                    .map(|outcome| (outcome, None, false))
-            }
         };
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !output.status.success() {
+        let stdout =
+            String::from_utf8_lossy(&stdout_thread.join().unwrap_or_default()).into_owned();
+        let stderr =
+            String::from_utf8_lossy(&stderr_thread.join().unwrap_or_default()).into_owned();
+        if !status.success() {
             return failed(&format!(
                 "relay command exit {}: {}",
-                output.status.code().unwrap_or(-1),
+                status.code().unwrap_or(-1),
                 stderr.trim()
             ))
             .map(|outcome| (outcome, None, false));
         }
-        let stdout = String::from_utf8_lossy(&output.stdout);
         for line in stdout.lines() {
             if let Ok(value) = serde_json::from_str::<Value>(line.trim()) {
                 if let Some(outcome) = value.get("outcome").and_then(Value::as_str) {
@@ -7991,6 +8021,11 @@ impl BridgeState {
             (true, Some(_)) => "environment",
             (true, None) => "config",
         };
+        let relay_alarms: Value = fs::read_to_string(self.root.join("relay-alarms.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .and_then(|doc| doc.get("alarms").cloned())
+            .unwrap_or_else(|| serde_json::json!([]));
         let mut status = serde_json::json!({
             "subscription_plugin": self.config.subscription_plugin,
             "backend_configuration_schema": self.config.backend_configuration.as_ref().map(|value| &value.schema),
@@ -8078,6 +8113,7 @@ impl BridgeState {
         });
         // Beside `phases`, outside the literal above, which is at the macro's recursion limit.
         status["stages"] = Value::Object(stages);
+        status["relay_alarms"] = relay_alarms;
         status["repoint"] = self.repoint_status_locked();
         Ok(status).map(|mut status| {
             if let Some(object) = status.as_object_mut() {
@@ -19012,6 +19048,8 @@ mod tests {
             "command-failed-alarmed"
         );
         assert!(root.join("relay-alarms.json").exists(), "durable alarm");
+        let status = state.status().expect("status");
+        assert_eq!(status["relay_alarms"].as_array().map(Vec::len), Some(1));
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(script_root).unwrap();
     }

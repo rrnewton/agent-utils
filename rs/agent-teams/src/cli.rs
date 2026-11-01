@@ -2008,6 +2008,7 @@ fn cmd_relay_in(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
         .ok_or_else(|| err("usage", "relay-in needs --peer-sender ID"))?;
     let channel = flag_value(args, "--channel").unwrap_or_default();
     let thread = flag_value(args, "--thread").unwrap_or_default();
+    let in_thread = flag_value(args, "--thread-reply").as_deref() == Some("true");
     let mut text = String::new();
     std::io::stdin()
         .read_to_string(&mut text)
@@ -2043,6 +2044,7 @@ fn cmd_relay_in(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
         &peer_sender,
         &channel,
         &thread,
+        in_thread,
         &text,
     )?;
     // One compact JSON line: bridges parse the outcome from stdout.
@@ -2443,10 +2445,18 @@ fn cmd_relay_confirm(globals: &Globals, args: &[String]) -> Result<i32, DataErro
                                                     .get(&sender)
                                                     .and_then(Value::as_str)
                                                     .is_some_and(|mapped| {
-                                                        // Mappings name TEAM@HOST; compare
-                                                        // the fleet part, not the whole string.
-                                                        mapped.split('@').next()
-                                                            == Some(team.as_str())
+                                                        // Mappings name TEAM@HOST: the fleet
+                                                        // and, when named, the host must both
+                                                        // match the claimed team@host.
+                                                        let (fleet, mapped_host) =
+                                                            match mapped.split_once('@') {
+                                                                Some((fleet, host)) => {
+                                                                    (fleet, Some(host))
+                                                                }
+                                                                None => (mapped, None),
+                                                            };
+                                                        fleet == team
+                                                            && mapped_host.is_none_or(|h| h == host)
                                                     })
                                             },
                                         )
