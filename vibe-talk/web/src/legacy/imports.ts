@@ -183,6 +183,23 @@ export {
   sentenceStart,
 } from "../foundation/index.ts";
 
+export {
+  briefAge,
+  dayClock,
+  dayKeyOf,
+  dayLabel,
+  dayRangeWords,
+  dayTitle,
+  editedTitle,
+  fullLocalAt,
+  fullLocalTime,
+  messageDate,
+  searchDayWords,
+  shortLocalTime,
+  shortTimeFormat,
+  stamp,
+} from "../present/time/index.ts";
+
 import { decode, decodeTagged, is, roots } from "../contract/index.ts";
 
 /**

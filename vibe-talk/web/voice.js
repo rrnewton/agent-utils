@@ -3901,89 +3901,17 @@ function renderEmptyState() {
   el("empty-state").hidden = el("transcript").children.length > 0;
 }
 
-/** Wall-clock, as two numbers. A surface used as a debugging record has to say when. */
-function stamp(atMs) {
-  const now = atMs === undefined ? new Date() : new Date(atMs);
-  const pad = (n) => String(n).padStart(2, "0");
-  return `${pad(now.getHours())}:${pad(now.getMinutes())}`;
-}
-
 // --- which day a message was sent ----------------------------------------------------------------
 //
-// `#260 timestamp-hover`. The owner: "On an old thread a message says 5:25 PM but it is 3:56 PM now,
-// so it must be yesterday." A row's time is the hour and minute and nothing else, because that is all
-// a row has room for, and on its own it cannot say which day. Hovering it now says: "Yesterday,
-// Oct 11, Sun, 5:25 PM".
-//
-// `dayLabel` is THE ONE DAY FORMATTER on this page. The tooltip over every message's time and the
-// details sheet ask it, and so do `#250 date-separators`' lines between days in a list, rather than
-// make a second wording that drifts from this one:
-//
-//   the day the reader is in     Today, Oct 12, Mon
-//   the day before it            Yesterday, Oct 11, Sun
-//   any other day this year      Oct 9, Fri
-//   a day in another year        Oct 9, 2025, Thu
-//
-// The year appears only when it is not the reader's current year, and that holds for Today and
-// Yesterday too: on New Year's Day the evening before is "Yesterday, Dec 31, 2025, Wed".
-//
-//   * CALENDAR DAYS, NOT SPANS OF 24 HOURS. "Yesterday" is the date before today's, compared field
-//     by field in the reader's own zone, so a day that is 23 or 25 hours long because the clocks
-//     changed in it is still exactly one day. Thirty hours ago can be yesterday or the day before,
-//     and only the calendar knows which.
-//   * THE DATE GETTERS, NOT AN `Intl` FORMATTER. Every row's tooltip asks this on every redraw, and
-//     `#226 page-energy-profile` found a formatter made per row to be a twentieth of the page's work.
-//     The getters already answer in the device's zone and follow it when it moves.
-//   * FIXED ENGLISH NAMES. Every other word this page shows is English, and "Yesterday, 11 oct., lun."
-//     beside them would be a sentence in two languages.
-
-const DAY_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-const DAY_WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-
-/** Whether two instants fall on the same calendar date in the reader's zone. */
-const sameLocalDay = (a, b) =>
-  a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
-
-/**
- * The day `when` falls on, as the reader says it standing at `now`: "Today, Oct 12, Mon",
- * "Yesterday, Oct 11, Sun", "Oct 9, Fri", "Oct 9, 2025, Thu". Both are Dates, read in local time.
- * See the section note above: this is the only place a day is worded.
- *
- * @param {Date} when
- * @param {Date} [now]
- */
-function dayLabel(when, now = new Date()) {
-  const year = when.getFullYear() === now.getFullYear() ? "" : `, ${when.getFullYear()}`;
-  const day = `${DAY_MONTHS[when.getMonth()]} ${when.getDate()}${year}, ${DAY_WEEKDAYS[when.getDay()]}`;
-  if (sameLocalDay(when, now)) return `Today, ${day}`;
-  // Built from the date's own fields, so the constructor steps back a calendar day however long that
-  // day was. Noon, because in a zone whose clocks change at midnight that midnight may not exist.
-  const yesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1, 12);
-  return sameLocalDay(when, yesterday) ? `Yesterday, ${day}` : day;
-}
-
-/**
- * What hovering a message's time says: its day, then the time exactly as it is shown —
- * "Yesterday, Oct 11, Sun, 5:25 PM".
- *
- * @param {Date} at
- * @param {string} shown
- */
-const dayTitle = (at, shown) => `${dayLabel(at)}, ${shown}`;
+// `#260 timestamp-hover`. A row's time is the hour and minute; hovering it says the day as well.
+// How a day, a time and an age are worded is web/src/present/time's (`dayLabel`, THE ONE DAY
+// FORMATTER, and its section note); what is left here draws them.
 
 /** The classes of the time elements `timeNode` makes, and so the only ones `freshenDayTitle` touches. */
 const DAY_TITLED = new Set(["msg-time", "at"]);
 
 /** The class of a row's edited mark, whose title `freshenDayTitle` words as an edit. `#320 slack-edited-mark`. */
 const EDITED_MARK = "edited-mark";
-
-/**
- * What hovering an edited mark says: when the message was last edited, in the words its time's own
- * title uses — "Edited Yesterday, Oct 11, Sun, 5:25 PM".
- *
- * @param {Date} at
- */
-const editedTitle = (at) => `Edited ${dayTitle(at, shortTimeFormat().format(at))}`;
 
 /**
  * A message's time, as the element that shows it: `<time datetime>` holding the text `shown`, its
@@ -7005,11 +6933,7 @@ function placeSeam(row, seam, below) {
 // --- which day ------------------------------------------------------------------------------------
 //
 // `dayLabel` is the page's one wording of a single day, in the owner's words, and a day rule says
-// exactly what it does. It is defined once, with `DAY_MONTHS`, `DAY_WEEKDAYS` and `sameLocalDay`,
-// beside the time's tooltip (`#260 timestamp-hover`), which says a day in the same words.
-
-/** A local calendar day as a number that sorts as the days do: yyyymmdd. */
-const dayKeyOf = (date) => date.getFullYear() * 10000 + (date.getMonth() + 1) * 100 + date.getDate();
+// exactly what it does: web/src/present/time, with `dayRangeWords` for a run of days.
 
 /** The day of `row`'s first message on this device, or null: none readable, or a gathered reply. */
 function rowDay(row) {
@@ -7017,49 +6941,6 @@ function rowDay(row) {
   if ((gathered !== null && gathered !== "parent") || row.hasAttribute("data-stack-under")) return null;
   const sent = rowSentMs(row);
   return Number.isFinite(sent) ? dayKeyOf(new Date(sent)) : null;
-}
-
-/**
- * Now, and today, yesterday and this year on this device's calendar, read once for a pass.
- *
- * @typedef {{now: Date, today: number, yesterday: number, year: number}} DayClock
- * @returns {DayClock}
- */
-function dayClock() {
-  const now = new Date();
-  return {
-    now,
-    today: dayKeyOf(now),
-    yesterday: dayKeyOf(new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1, 12)),
-    year: now.getFullYear(),
-  };
-}
-
-/** A day key's year, month (from 0) and day of the month. */
-const dayParts = (key) => ({ year: Math.floor(key / 10000), month: Math.floor(key / 100) % 100 - 1, day: key % 100 });
-
-/** One day, as a rule says it: `dayLabel`'s words for the day's noon, which every zone's calendar has. */
-function dayWords(key, clock) {
-  const { year, month, day } = dayParts(key);
-  return dayLabel(new Date(year, month, day, 12), clock.now);
-}
-
-/**
- * The days from `from` to `to`, as a line says them: one day as `dayLabel` does; a range with no
- * weekdays, "Oct 3 – 5", "Sep 29 – Oct 2", "Dec 30, 2025 – Jan 2", "Oct 3 – 5, 2025", ending
- * "– Today" or "– Yesterday" — "Oct 9 – Today", "Yesterday – Today", "Dec 30, 2025 – Yesterday".
- */
-function dayRangeWords(from, to, clock) {
-  if (from >= to) return dayWords(to, clock);
-  const named = (key) => (key === clock.today ? "Today" : key === clock.yesterday ? "Yesterday" : null);
-  const start = dayParts(from);
-  const end = dayParts(to);
-  const date = (parts, withYear) => `${DAY_MONTHS[parts.month]} ${parts.day}${withYear ? `, ${parts.year}` : ""}`;
-  if (named(to)) return `${named(from) || date(start, start.year !== clock.year)} – ${named(to)}`;
-  const tail = start.year === end.year && start.year !== clock.year ? `, ${start.year}` : "";
-  if (start.year === end.year && start.month === end.month) return `${date(start, false)} – ${end.day}${tail}`;
-  if (start.year === end.year) return `${date(start, false)} – ${date(end, false)}${tail}`;
-  return `${date(start, start.year !== clock.year)} – ${date(end, end.year !== clock.year)}`;
 }
 
 /**
@@ -26111,35 +25992,6 @@ function firstLineOf(text, chars) {
 }
 
 /**
- * How long ago, as briefly as a picker option allows — and ONE SCALE wherever the page gives a
- * thread's age: the selector, the heading over an open thread, and the thread list's cards.
- * `#194 thread-picker-polish`: the owner read "42h" in the selector and asked for days and hours.
- *
- *   under a minute     now
- *   under an hour      59m
- *   under a day        23h
- *   under ten days     1d18h, and a whole day drops its "0h": 3d
- *   under four weeks   12d    — by then the hours no longer tell two threads apart
- *   under a year       6w
- *   beyond             2y
- *
- * Every step truncates and never rounds, so an age reads as the last whole unit it has passed:
- * 42 hours is 1d18h, never 2d, and 59 minutes is 59m, never 1h.
- */
-function briefAge(atMs) {
-  if (!Number.isFinite(atMs)) return "";
-  const minutes = Math.max(0, Math.floor((Date.now() - atMs) / 60000));
-  if (minutes < 1) return "now";
-  if (minutes < 60) return `${minutes}m`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours}h`;
-  const days = Math.floor(hours / 24);
-  if (days < 10) return hours % 24 === 0 ? `${days}d` : `${days}d${hours % 24}h`;
-  if (days < 28) return `${days}d`;
-  return days < 365 ? `${Math.floor(days / 7)}w` : `${Math.floor(days / 365)}y`;
-}
-
-/**
  * One thread as the page knows it: its summary and first message when the store holds them, when
  * it started and was last active, and its reply count. What every place that names a thread is
  * handed, so none of them can reach for a different field.
@@ -38290,79 +38142,6 @@ function swipeable(li, messages) {
   li.addEventListener("pointercancel", inThisColumn(reset));
 }
 
-/**
- * The clock the READER is standing in, not the one the server was configured with.
- *
- * `#52 operator-timezone` had the server convert once, into `server.timezone`, and the page simply
- * printed what it was handed. That is right for the voice agent — it has to SPEAK a time and
- * cannot ask a browser — and wrong for a phone: `server.timezone` defaults to UTC, so an operator
- * who never set it reads every message in UTC while holding a device that knows perfectly well
- * what time it is. The browser's own zone is not a guess; it is the answer.
- *
- * `spoken_time` stays as the fallback for a message with no parseable timestamp, so a server that
- * sends only the spoken form still shows something rather than nothing.
- */
-function messageDate(message) {
-  const raw = String(message.timestamp || "");
-  if (!raw) {
-    return null;
-  }
-  const at = new Date(raw);
-  return Number.isNaN(at.getTime()) ? null : at;
-}
-
-/** `13:40` — the hour and minute, which is all a row has room for. */
-function shortLocalTime(message) {
-  const at = messageDate(message);
-  if (at === null) {
-    return String(message.spoken_time || "");
-  }
-  return shortTimeFormat().format(at);
-}
-
-/**
- * The formatter `shortLocalTime` uses: what `toLocaleTimeString([], { hour, minute })` makes on every
- * call, made once. `#226 page-energy-profile`: every row asked for its own on every redraw, which was
- * a twentieth of the page's work in live traffic. Made again when the device's offset from UTC
- * moves — the reader travelled, or the clocks changed — since a formatter keeps the zone it was made
- * in.
- *
- * @type {{offset: number, format: Intl.DateTimeFormat} | null}
- */
-let shortTimeFormatter = null;
-function shortTimeFormat() {
-  const offset = new Date().getTimezoneOffset();
-  if (shortTimeFormatter === null || shortTimeFormatter.offset !== offset) {
-    shortTimeFormatter = { offset, format: new Intl.DateTimeFormat([], { hour: "2-digit", minute: "2-digit" }) };
-  }
-  return shortTimeFormatter.format;
-}
-
-/**
- * The whole truth, for the details sheet: day, time and zone, all local — "Yesterday, Oct 11, Sun,
- * 05:25 PM PDT". The day is `dayLabel`'s, so the sheet a phone opens with a press-and-hold says it in
- * the words a desk's tooltip uses (`#260 timestamp-hover`), and it is worded as the sheet opens.
- */
-function fullLocalTime(message) {
-  const at = messageDate(message);
-  if (at === null) {
-    return String(message.spoken_time || "unknown");
-  }
-  return fullLocalAt(at);
-}
-
-/**
- * `at` as the details sheet says an instant: "Yesterday, Oct 11, Sun, 05:25 PM PDT".
- *
- * @param {Date} at
- */
-function fullLocalAt(at) {
-  // Explicit components, NOT `timeStyle`. ECMA-402 forbids combining that with an individual field
-  // such as `timeZoneName`, and a browser answers that with a TypeError rather than by ignoring the
-  // option — so the sheet would have thrown instead of opening.
-  return `${dayLabel(at)}, ${at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", timeZoneName: "short" })}`;
-}
-
 // --- two messages that are really one -----------------------------------------------------------
 //
 // A coding agent writes past Discord's 2000-character limit and its client splits the post in two.
@@ -39681,14 +39460,6 @@ function oldestLoadedMs() {
     if (rowDay(row) !== null) return rowSentMs(row);
   }
   return null;
-}
-
-/** A day inside a sentence: "today", "yesterday", "Oct 3", or "Oct 3, 2025" for another year's. */
-function searchDayWords(key, clock = dayClock()) {
-  if (key === clock.today) return "today";
-  if (key === clock.yesterday) return "yesterday";
-  const { year, month, day } = dayParts(key);
-  return `${DAY_MONTHS[month]} ${day}${year !== clock.year ? `, ${year}` : ""}`;
 }
 
 // --- how far back, with no gaps -------------------------------------------------------------------

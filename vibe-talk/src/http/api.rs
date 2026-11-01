@@ -3487,8 +3487,10 @@ mod tests {
             VOICE_JS.contains("complete !== true"),
             "a server too old to send `complete` must be treated as unknown, not as complete"
         );
+        // How a message's time is worded moved into the presentation module (`#624
+        // voice-page-modularity`), which the page runs as it is.
         assert!(
-            VOICE_JS.contains("message.spoken_time ||"),
+            include_str!("../../web/src/present/time/clock.ts").contains("message.spoken_time ||"),
             "the channel view must prefer the zone-converted time the server already computed"
         );
     }

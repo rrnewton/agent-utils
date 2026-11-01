@@ -33,8 +33,10 @@ const BASE = ["contract", "foundation", "ports"];
  * Each package, and the packages it may import. The plan's direction, bottom up: the contract,
  * foundations and ports import no layer above them; core services take only those (a core
  * package's use of another core package is named here when it is wanted, never by default);
- * the browser's implementation of the ports takes the same; the legacy script's imports are the
- * one composition point, and take anything until the legacy script is gone.
+ * the browser's implementation of the ports takes the same; the presentation packages (present/*:
+ * how the page words and arranges what it shows, with no DOM, for any front end) take the same and
+ * the core packages they present, and the views take them, never the other way; the legacy script's
+ * imports are the one composition point, and take anything until the legacy script is gone.
  */
 export const PACKAGES = Object.freeze({
   contract: [],
@@ -51,6 +53,7 @@ export const PACKAGES = Object.freeze({
   "core/speech": BASE,
   "core/sync": BASE,
   "platform/web": BASE,
+  "present/time": BASE,
   "view/composer": [...BASE, "view/dom"],
   "view/dom": BASE,
   legacy: "*",

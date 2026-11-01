@@ -3648,7 +3648,7 @@ const shownTime = (at) => at.toLocaleTimeString([], { hour: "2-digit", minute: "
 
 test("ONE DAY FORMATTER: today, yesterday, this year, another year, across New Year, and across both clock changes", async () => {
   const page = newPage();
-  const dayLabel = page.pure("dayLabel");
+  const dayLabel = page.preludeBinding("dayLabel");
   await inZone("America/New_York", () => {
     const now = localAt(2026, 10, 12, 15, 56);
     const cases = [
@@ -3679,10 +3679,9 @@ test("ONE DAY FORMATTER: today, yesterday, this year, another year, across New Y
   });
   // The negative control: "yesterday" as 24 hours back, not a calendar day back, and both clock
   // changes above come out wrong — so those rows of the table are what pin the calendar down.
-  const bySpan = newPage(new Map(), brokenScript(
-    "const yesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1, 12);",
-    "const yesterday = new Date(now.getTime() - 86400000);"
-  )).pure("dayLabel");
+  const bySpan = newPage(new Map(), await brokenModule([{ file: "src/present/time/days.ts",
+    find: "const yesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1, 12);",
+    replace: "const yesterday = new Date(now.getTime() - 86400000);" }])).preludeBinding("dayLabel");
   await inZone("America/New_York", () => {
     assert.equal(bySpan(localAt(2026, 3, 8, 12), localAt(2026, 3, 9, 0, 30)), "Mar 8, Sun",
       "the control did not get the spring change wrong");
@@ -3796,7 +3795,7 @@ test("`#479 message-time-full-date`: a time's day is its name, a tap or Enter on
 test("the details sheet says the day in the same words, with the time and the zone", async () => {
   await inZone("America/New_York", async () => {
     const page = newPage();
-    const fullLocalTime = page.pure("fullLocalTime");
+    const fullLocalTime = page.preludeBinding("fullLocalTime");
     const before = localAt(2026, 8, 18, 17, 25);
     const zoned = before.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", timeZoneName: "short" });
     assert.equal(fullLocalTime({ timestamp: before.toISOString() }), `Yesterday, Aug 18, Tue, ${zoned}`);
@@ -5143,23 +5142,23 @@ test("`#250 date-separators`: replies gathered under their message, out of time 
 // both clock changes — so a day rule is checked here to BE that function, not a copy of it.
 
 test("`#250 date-separators`: one day is said in the owner's words by `dayLabel`, the page's one wording of a day", async () => {
-  const dayLabel = newPage().pure("dayLabel");
+  const dayLabel = newPage().preludeBinding("dayLabel");
   await inZone("America/New_York", () => {
     const at = (year, month, day, hour = 12, minute = 0) => new Date(year, month - 1, day, hour, minute);
     assert.equal(dayLabel(at(2026, 10, 11, 17, 25), at(2026, 10, 12, 15, 56)), "Yesterday, Oct 11, Sun");
     assert.equal(dayLabel(at(2025, 12, 31, 23, 50), at(2026, 1, 1, 0, 30)), "Yesterday, Dec 31, 2025, Wed");
   });
   // A day rule says exactly what `dayLabel` says of the day: the rule IS the function, not a copy.
-  assert.match(SCRIPT_CODE, /return dayLabel\(new Date\(year, month, day, 12\), clock\.now\);/,
+  assert.match(PAGE_CODE, /return dayLabel\(new Date\(year, month, day, 12\), clock\.now\);/,
     "a day's rule words its day without `dayLabel`");
-  assert.equal((SCRIPT_CODE.match(/^function dayLabel\(/gm) || []).length, 1, "there is more than one wording of a day");
-  assert.equal((SCRIPT_CODE.match(/^const DAY_MONTHS = /gm) || []).length, 1, "the names of the months are kept twice");
+  assert.equal((PAGE_CODE.match(/^function dayLabel\(/gm) || []).length, 1, "there is more than one wording of a day");
+  assert.equal((PAGE_CODE.match(/^const DAY_MONTHS = /gm) || []).length, 1, "the names of the months are kept twice");
 });
 
 test("`#250 date-separators`: a range stays compact — across a year, within a month of a past year, and ending Today or Yesterday", async () => {
   const page = newPage();
-  const range = page.pure("dayRangeWords");
-  const clockNow = page.pure("dayClock");
+  const range = page.preludeBinding("dayRangeWords");
+  const clockNow = page.preludeBinding("dayClock");
   clockAt(page, 10, 12);
   const now = clockNow();
   const cases = [

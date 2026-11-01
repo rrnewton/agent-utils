@@ -4764,7 +4764,8 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     return vm.runInContext(expression, context);
   };
   // The binding the prelude gave the legacy script for one of `PRELUDE_NAMES`, and only those: for
-  // the tests that the page runs a module's own functions under the names its script calls.
+  // the tests that the page runs a module's own functions under the names its script calls, and for
+  // a moved function read in the page's own realm, on its clock (`page.setClock`) and in its zone.
   page.preludeBinding = (name) => {
     if (!PRELUDE_NAMES.has(name)) throw new Error(`${name} is not a name the page takes from its modules`);
     return vm.runInContext(name, context);
