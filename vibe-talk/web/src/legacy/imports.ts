@@ -112,7 +112,15 @@ export const VibeTalkContract = Object.freeze({ roots, is, decode, decodeTagged 
 
 export { createVoiceCall, createVoiceTranscript, createReadAloud } from "../view/voice/index.ts";
 
-export { HELP_TOPICS } from "../present/settings/index.ts";
+export {
+  HELP_TOPICS,
+  STRAY_SERVICE_FACTS,
+  addChannelForm,
+  allChannelsFacts,
+  emptyServiceWords,
+  serviceFacts,
+  writeSourceWords,
+} from "../present/settings/index.ts";
 export {
   mountChannelDirectory,
   mountChannelHistory,

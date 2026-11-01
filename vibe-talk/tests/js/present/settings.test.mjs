@@ -204,3 +204,29 @@ test("`#55 voice-desktop-app`, `#230 text-size-buttons`: the text size's steps, 
   assert.ok(GRIP_KEYS.Home(70) < GRIP_KEYS.End(70));
   assert.equal(GRIP_KEYS.Enter, undefined, "a key the handle does not take is left to the page");
 });
+
+test("`#355 provider-grouped-channels`, `#374 registered-writable-follows-policy`: what the channel box and the Service picker say", () => {
+  const { serviceFacts, STRAY_SERVICE_FACTS, addChannelForm, emptyServiceWords, allChannelsFacts, writeSourceWords } = SETTINGS;
+  assert.equal(serviceFacts({ live_delivery: "push", threading_supported: true, channel_registration_supported: true,
+    channel_discovery_supported: true, upstream_clear_supported: true }, "Slack"),
+  "Slack: New messages arrive as they are sent. Threads are shown. Add a channel by pasting its link, or browse its channels. Unread can be cleared in Slack itself.");
+  assert.equal(serviceFacts({ live_delivery: "poll", live_poll_seconds: "30" }, "Chat"),
+    "Chat: New messages are checked for every 30 seconds. No threads. Add a channel by its ID. Unread cannot be cleared in Chat from here.");
+  assert.match(serviceFacts({ live_delivery: "poll", live_poll_seconds: 0 }, "Chat"), /New messages show when a channel is read again\./);
+  assert.match(STRAY_SERVICE_FACTS, /no longer reads/);
+  assert.deepStrictEqual(addChannelForm(true, false, "Slack"), { help: "Paste a channel link or reference from Slack. The channel is checked before it is added.",
+    label: "Channel link or provider reference", inputMode: "url", maxLength: 2048, placeholder: "paste a channel link or reference" });
+  assert.deepStrictEqual([addChannelForm(false, true, "Slack").maxLength, addChannelForm(false, false, "Discord").maxLength], [64, 20]);
+  assert.equal(addChannelForm(false, false, "Discord").placeholder, "17 to 20 digits");
+  assert.equal(emptyServiceWords(false, false, "Slack"), "No Slack channels on your list yet. Add one.");
+  assert.equal(emptyServiceWords(true, false, "Slack"), "No Slack channels on your list yet. Add one, or browse.");
+  assert.equal(emptyServiceWords(true, true, "Slack"), "No Slack channels on your list yet. Add one, browse, or show a hidden one again below.");
+  assert.equal(allChannelsFacts(3, "Slack"), "All 3 Slack channels on your list.");
+  assert.equal(allChannelsFacts(3, null), "All 3 channels on your list.");
+  assert.match(writeSourceWords({ write_source: "provider_policy", writable: true }, "Slack"), /^Posting follows Slack's policy/);
+  assert.match(writeSourceWords({ write_source: "provider_policy", writable: false }, "Slack"), /^Read only: Slack adds every channel/);
+  assert.equal(writeSourceWords({ write_source: "configuration", writable: true }, "Slack"), "");
+  assert.match(writeSourceWords({ write_source: "added", writable: false }, "Slack"), /^Read only: it was added read only/);
+  assert.match(writeSourceWords({ write_source: "provider_gone", writable: true }, "Slack"), /no longer configured/);
+  assert.equal(writeSourceWords({}, "Slack"), "", "an older server says nothing more");
+});
