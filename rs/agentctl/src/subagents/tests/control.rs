@@ -572,6 +572,32 @@ fn team_declaration_flags_match_the_archive_exactly_and_carry_severity() {
     assert_eq!(flags.len(), 1, "{flags:?}");
     assert_eq!(flags[0]["kind"], "pinned-agent");
     assert_eq!(flags[0]["severity"], "warning");
+    // A queue recreated for an archived name after its stop leaves it archived.
+    fs::create_dir_all(archive.join("old-17-42")).unwrap();
+    fs::write(
+        archive.join("old-17-42/agent.json"),
+        json!({"name": "old"}).to_string(),
+    )
+    .unwrap();
+    fs::create_dir_all(
+        agent_queue::registry::directory(&registry(&fixture), "old")
+            .unwrap()
+            .join("queue"),
+    )
+    .unwrap();
+    write_team_declaration(
+        &state,
+        "tools",
+        &canonical_registry(&fixture),
+        json!({"deliverer": {"kind": "agentctl-queue", "registry": canonical_registry(&fixture), "agent": "old"}}),
+    );
+    let flags = team_declaration_flags(&registry(&fixture), &state);
+    assert!(
+        flags
+            .iter()
+            .any(|flag| flag["kind"] == "target-archived" && flag["severity"] == "error"),
+        "{flags:?}"
+    );
 }
 
 /// Review finding 2: watch-agents reads the receiving host's undeliverable notices for teams
@@ -596,9 +622,18 @@ fn team_undeliverable_notices_are_listed_and_set_aside() {
     let found = team_undeliverable_notices(&registry(&fixture), &state);
     assert_eq!(found.len(), 1, "{found:?}");
     assert_eq!(found[0].1["team"], "tools");
+    assert_eq!(found[0].1.get("repeat"), None);
     acknowledge_team_notice(&found[0].0).unwrap();
     assert!(team_undeliverable_notices(&registry(&fixture), &state).is_empty());
     assert!(state.join("teams.d/tools/notices-told/tm-a.json").exists());
+    // The sender's retry is refused again: the same message, marked as a repeat.
+    fs::write(
+        &found[0].0,
+        json!({"event": "undeliverable-notice", "team": "tools", "id": "tm-a"}).to_string(),
+    )
+    .unwrap();
+    let again = team_undeliverable_notices(&registry(&fixture), &state);
+    assert_eq!(again[0].1["repeat"], true, "{again:?}");
 }
 
 /// `stop --handover-to` moves the designation before the stop and puts it back when the stop
@@ -618,16 +653,100 @@ fn a_designation_snapshot_restores_after_a_failed_handover_stop() {
         manager.designated_coordinator().unwrap().as_deref(),
         Some("coord-new")
     );
-    manager.coordinator_restore(previous.as_ref()).unwrap();
+    let handed = manager.designation_snapshot().unwrap();
+    // Someone re-designated meanwhile: kept.
+    assert!(!manager
+        .coordinator_restore(previous.as_ref(), previous.as_ref())
+        .unwrap());
+    assert_eq!(manager.designation_snapshot().unwrap(), handed);
+    assert!(manager
+        .coordinator_restore(previous.as_ref(), handed.as_ref())
+        .unwrap());
     assert_eq!(
         manager.designated_coordinator().unwrap().as_deref(),
         Some("coord-old")
     );
     assert_eq!(manager.designation_snapshot().unwrap(), previous);
-    manager.coordinator_restore(None).unwrap();
+    assert!(manager
+        .coordinator_restore(None, previous.as_ref())
+        .unwrap());
     assert_eq!(manager.designated_coordinator().unwrap(), None);
     assert!(
         !manager.harness_dead("coord-old"),
         "unknown liveness is not dead"
     );
+}
+
+/// Review of the fix, finding 3: `agent-teams init --coordinator-self` writes a pinned process
+/// and no registry. A handover moves a pin to exactly the old coordinator's harness onto the
+/// new one's, and leaves a pin to any other process alone.
+#[test]
+fn coordinator_set_moves_a_registryless_pin_from_the_old_harness_to_the_new() {
+    let fixture = Fixture::new();
+    register(&fixture, "coord-old", 88);
+    register(&fixture, "coord-new", 89);
+    let manager = fixture.manager();
+    manager
+        .coordinator_set_in("coord-old", &fixture.root.join("none"))
+        .unwrap();
+    let state = fixture.root.join("teams-state-self");
+    let pinned = |team: &str, pid: u64| {
+        let dir = state.join("teams.d").join(team);
+        fs::create_dir_all(&dir).unwrap();
+        let document = json!({
+            "schema": "agent-teams-declaration/v1", "team": team,
+            "deliverer": {"kind": "hook-inbox"},
+            "coordinator": {"designation": "pinned", "harness_identity": Fake::harness(pid)},
+            "accepts_from": [], "limits": {},
+        });
+        agent::atomic_json(&dir.join("declaration.json"), &document).unwrap();
+        dir.join("declaration.json")
+    };
+    let ours = pinned("tools", 88);
+    let theirs = pinned("other", 77);
+    let report = manager.coordinator_set_in("coord-new", &state).unwrap();
+    let handover = &report["team_declarations"];
+    assert_eq!(handover["checked"], 1, "{report}");
+    assert_eq!(
+        handover["fixed"][0]["repinned_designation"], true,
+        "{report}"
+    );
+    let moved = agent::read_private_json(&ours).unwrap();
+    assert_eq!(
+        moved["coordinator"]["harness_identity"],
+        json!(Fake::harness(89))
+    );
+    let left = agent::read_private_json(&theirs).unwrap();
+    assert_eq!(
+        left["coordinator"]["harness_identity"],
+        json!(Fake::harness(77))
+    );
+}
+
+/// Review of the fix, finding G: when the old coordinator's record is already gone (stopped
+/// first, or retired dead), a deliverer pinned to its name is still recognised and unpinned.
+#[test]
+fn coordinator_set_unpins_the_old_name_after_its_record_is_gone() {
+    let fixture = Fixture::new();
+    register(&fixture, "coord-old", 88);
+    register(&fixture, "coord-new", 89);
+    let manager = fixture.manager();
+    manager
+        .coordinator_set_in("coord-old", &fixture.root.join("none"))
+        .unwrap();
+    let state = fixture.root.join("teams-state-gone");
+    let path = write_team_declaration(
+        &state,
+        "tools",
+        &canonical_registry(&fixture),
+        json!({"deliverer": {"kind": "agentctl-queue", "registry": canonical_registry(&fixture), "agent": "coord-old"}}),
+    );
+    fs::remove_dir_all(agent_directory(&fixture, "coord-old")).unwrap();
+    let report = manager.coordinator_set_in("coord-new", &state).unwrap();
+    assert_eq!(
+        report["team_declarations"]["fixed"][0]["was_pinned"], "coord-old",
+        "{report}"
+    );
+    let fixed = agent::read_private_json(&path).unwrap();
+    assert!(fixed["deliverer"].get("agent").is_none(), "{fixed}");
 }

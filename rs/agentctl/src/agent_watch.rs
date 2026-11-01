@@ -956,8 +956,8 @@ pub trait Notifier {
     fn acknowledge_team_notice(&mut self, _path: &Path) -> std::result::Result<(), String> {
         Ok(())
     }
-    /// Run `agent-teams pump` for this host's outbox and return what it printed (#721). The
-    /// default cannot.
+    /// Start `agent-teams pump --deferred` for this host's outbox without waiting for it, and
+    /// say what was started (#721). The default cannot.
     fn run_team_pump(&mut self) -> std::result::Result<String, String> {
         Err("this watcher cannot run agent-teams pump".to_owned())
     }
@@ -3853,8 +3853,8 @@ impl<A: ManagedApi + ?Sized> Probe for ManagedProbe<'_, A> {
         crate::subagents::team_undeliverable_notices(&self.registry, &self.teams_state)
     }
 
-    /// Outbox entries `agent-teams pump` retries and that wait on this host: `deferred`, and
-    /// `undeliverable` as the first #721 build stored it.
+    /// Outbox entries `agent-teams pump --deferred` retries: `deferred`, and `undeliverable` as
+    /// the first #721 build stored it.
     fn team_outbox_waiting(&mut self) -> usize {
         let outbox = self.teams_state.join("outbox");
         let Ok(entries) = fs::read_dir(outbox) else {
@@ -4127,8 +4127,8 @@ impl<'a, A: ManagedApi + ?Sized> ManagedNotifier<'a, A> {
     }
 }
 
-/// The longest one `agent-teams pump` run may take inside a watch pass (#721).
-const TEAM_PUMP_TIMEOUT: Duration = Duration::from_secs(120);
+/// The longest a watcher-started `agent-teams pump` may run before it is killed (#721).
+const TEAM_PUMP_DEADLINE: Duration = Duration::from_secs(300);
 
 /// Attempts a batch is re-queued under a fresh ID after landing in the queue's
 /// failed set. A failed entry may have been typed, so agentctl never replays it
@@ -4179,32 +4179,42 @@ impl<A: ManagedApi + ?Sized> Notifier for ManagedNotifier<'_, A> {
         crate::subagents::acknowledge_team_notice(path).map_err(|error| error.to_string())
     }
 
-    /// `agent-teams --state-dir DIR pump`, the binary named by `$AGENT_TEAMS_BIN` or found on
-    /// `PATH`, bounded by [`TEAM_PUMP_TIMEOUT`].
+    /// Start `agent-teams --state-dir DIR pump --deferred` (the binary named by
+    /// `$AGENT_TEAMS_BIN`, else `agent-teams` on `PATH`) and return at once: a pump walks
+    /// network routes, and the pass must not wait for it. A thread reaps it, killing it past
+    /// [`TEAM_PUMP_DEADLINE`]; agent-teams' own lock keeps a second pump from overlapping it.
     fn run_team_pump(&mut self) -> std::result::Result<String, String> {
         let binary = std::env::var_os("AGENT_TEAMS_BIN")
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "agent-teams".into());
-        let mut command = std::process::Command::new(&binary);
-        command
+        let mut child = std::process::Command::new(&binary)
             .arg("--state-dir")
             .arg(&self.teams_state)
-            .arg("pump")
-            .stdin(std::process::Stdio::null());
-        let output = crate::client::bounded_output(command, TEAM_PUMP_TIMEOUT)
+            .args(["pump", "--deferred"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
             .map_err(|error| format!("cannot run {}: {error}", binary.to_string_lossy()))?;
-        let mut text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !stderr.trim().is_empty() {
-            text = format!("{text}\n{}", stderr.trim());
-        }
-        let text: String = text.chars().take(2_000).collect();
-        // Exit 75 and 76 mean some message is still unsettled, which pump reports; only a
-        // usage or data failure is an error here.
-        match output.status.code() {
-            Some(0 | 65 | 75 | 76) => Ok(text),
-            code => Err(format!("agent-teams pump exited {code:?}: {text}")),
-        }
+        let pid = child.id();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) | Err(_) => return,
+                    Ok(None) if started.elapsed() > TEAM_PUMP_DEADLINE => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return;
+                    }
+                    Ok(None) => std::thread::sleep(Duration::from_secs(1)),
+                }
+            }
+        });
+        Ok(format!(
+            "started {} pump --deferred (PID {pid})",
+            binary.to_string_lossy()
+        ))
     }
 
     fn interrupt_and_deliver(&mut self, agent: &str, expected: u64) -> Result<Interrupt> {

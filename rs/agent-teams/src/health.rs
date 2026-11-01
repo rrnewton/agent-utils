@@ -63,11 +63,14 @@ impl TargetHealth {
 /// What a registry says about one agent name.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Presence {
-    /// The agent has a directory in the registry (either layout): a live
-    /// record, or a queue created ahead of its registration.
+    /// The agent has a record (`agent.json`) in the registry, either
+    /// layout; or a directory without one (a queue created ahead of
+    /// registration) and no archived generation.
     Present,
-    /// No directory, and the archive holds a retired generation of exactly
-    /// this name.
+    /// No record, and the archive holds a retired generation of exactly
+    /// this name. A leftover queue directory (an older receiver, or a
+    /// router writing by path, recreates `agents/NAME/queue/` after the
+    /// stop) does not make a retired agent present.
     Archived,
     /// No directory and no archived generation.
     Missing,
@@ -75,18 +78,26 @@ pub enum Presence {
     Unknown(String),
 }
 
-/// Where `agent` stands in `registry`. A present directory wins over any
-/// archived generation of the same name (a stop and restart, or a
-/// re-adoption, leaves the predecessor in the archive), and the archive is
-/// matched by the entry's recorded name, never a file-name prefix.
+/// Where `agent` stands in `registry`. A record wins over any archived
+/// generation of the same name (a stop and restart, or a re-adoption,
+/// leaves the predecessor in the archive); the archive is matched by the
+/// entry's recorded name, never a file-name prefix, and it decides for a
+/// directory that holds no record.
 pub fn presence(registry: &Path, agent: &str) -> Presence {
-    match agent_queue::registry::names(registry) {
-        Ok(names) if names.iter().any(|name| name == agent) => return Presence::Present,
-        Ok(_) => {}
+    let listed = match agent_queue::registry::names(registry) {
+        Ok(names) => names.iter().any(|name| name == agent),
         Err(error) => return Presence::Unknown(error.to_string()),
+    };
+    if listed {
+        match agent_queue::registry::record_directories(registry, agent) {
+            Ok(found) if !found.is_empty() => return Presence::Present,
+            Ok(_) => {}
+            Err(error) => return Presence::Unknown(error.to_string()),
+        }
     }
     match agent_queue::registry::archived(registry, agent) {
         Ok(true) => Presence::Archived,
+        Ok(false) if listed => Presence::Present,
         Ok(false) => Presence::Missing,
         Err(error) => Presence::Unknown(error.to_string()),
     }
@@ -110,11 +121,11 @@ fn populated(registry: &Path) -> bool {
 }
 
 /// Why handing a message to `agent` in `registry` can never reach anyone:
-/// the agent has no directory and either its name is archived, or the
-/// registry otherwise has agents or a designation. An agent with a
-/// directory is deliverable; so is any agent of an unreadable or scratch
-/// registry, where absence proves nothing. Shared by `accept`'s deliverer
-/// and the sender-side pre-flight (#721).
+/// the agent has no record and its name is archived, or it has no
+/// directory at all in a registry that otherwise has agents or a
+/// designation. An agent with a record is deliverable; so is any agent of
+/// an unreadable or scratch registry, where absence proves nothing. Shared
+/// by `accept`'s deliverer and the sender-side pre-flight (#721).
 pub fn undeliverable_reason(registry: &Path, agent: &str) -> Option<String> {
     match presence(registry, agent) {
         Presence::Present | Presence::Unknown(_) => None,
@@ -210,7 +221,13 @@ pub fn evaluate(declaration: &Declaration) -> TargetHealth {
     if declaration.deliverer_kind != "agentctl-queue" {
         if let Designation::Pinned { .. } = declaration.designation {
             let registry = registry_of(declaration);
-            if !pinned_designation_live(declaration, registry.as_deref()) {
+            if pinned_designation_live(declaration, registry.as_deref()) {
+                flags.push(flag(
+                    "pinned-designation",
+                    format!("team {team}: declaration pins the coordinator's harness process; when that session is retired its successor cannot send for the team (`agentctl coordinator set NEW` moves a pin to exactly the old harness)"),
+                    format!("re-run `agent-teams init {team} --registry <registry> --deliver {}` so sender standing follows the registry's designated coordinator", declaration.deliverer_kind),
+                ));
+            } else {
                 flags.push(flag(
                     "target-not-live",
                     format!("team {team}: the pinned coordinator process is not live"),
@@ -636,6 +653,25 @@ mod tests {
             .find(|flag| flag.kind == "designation-not-live")
             .expect("dead pin flagged");
         assert!(dead.is_error());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review of the fix, finding A: a queue directory recreated after the
+    /// stop (by an older receiver) does not make an archived agent
+    /// deliverable again.
+    #[test]
+    fn leftover_queue_of_an_archived_agent_is_undeliverable() {
+        let dir = fixture(&[("coord", None, true)], Some("coord"));
+        archive(&dir, "old-1792931619150276422-1347278", Some("old"));
+        std::fs::create_dir_all(dir.join("agents/old/queue")).expect("leftover queue");
+        assert_eq!(presence(&dir, "old"), Presence::Archived);
+        assert!(undeliverable_reason(&dir, "old").is_some());
+        let health = evaluate(&declaration(&dir, Some("old")));
+        assert!(
+            kinds(&health).contains(&"target-archived"),
+            "{:?}",
+            health.flags
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

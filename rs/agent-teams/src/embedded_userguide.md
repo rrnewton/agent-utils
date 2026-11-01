@@ -155,11 +155,14 @@ explicit rule.
   `reply:<ID>`, so answering twice sends one reply.
 - `retract ID` — cancels a message not yet typed (this host's ledger).
 - `status ID [--json]`, `outbox [--json]` — sender-side views.
-- `pump [--retry-refused]` — retries deferred and ambiguous messages: asks
+- `pump [--retry-refused] [--deferred]` — retries deferred and ambiguous messages: asks
   the receiver first, resends the same ID only when the receipt says
   unknown, and never tries a second contact after ambiguity without a
   fence. `--retry-refused` only reports the successor key; a refused ID is
   never reopened.
+  `--deferred` retries only messages that never reached a receiver
+  (state `deferred`); `agentctl watch-agents` pumps that way. One pump runs
+  at a time per state directory (`pump.lock`); a second one does nothing.
 - `seen ID` — this host's ledger state for an ID.
 - `resolve ID (--fence | --mark-delivered)` — human-only settlement on the
   receiving host.
@@ -187,17 +190,20 @@ on the receiving host, the message stays in the sender's outbox as
 `deferred` with the reason beside it (`deferred` is a state every build's
 `pump` retries, so an older sender retries it too), and the receiving host
 records a notice under `teams.d/<team>/notices/`, which `agentctl
-watch-agents` tells the designated coordinator and then moves to
-`notices-told/`. `pump` retries the message after the fix; `agentctl
-watch-agents` runs it every 10 minutes while the outbox holds deferred
-messages. Senders see exit 75, never a silent `accepted` into a dead
-queue.
+watch-agents` tells the designated coordinator once per message and then
+moves to `notices-told/`. `pump` retries the message after the fix;
+`agentctl watch-agents` starts `pump --deferred` every 10 minutes while the
+outbox holds deferred messages. Senders see exit 75, never a silent
+`accepted` into a dead queue.
 
-An agent with a directory in the registry is always a deliverable target,
-whatever its archive holds (a stop and restart under the same name leaves
-the predecessor there); the archive is matched by each entry's recorded
-name, never a name prefix, and a registry that cannot be read is treated as
-unknown (deliverable, with a `target-unknown` warning in `check`). `check`
+An agent with a record (`agent.json`) in the registry is always a
+deliverable target, whatever its archive holds (a stop and restart under
+the same name leaves the predecessor there). The archive is matched by each
+entry's recorded name, never a name prefix, and it decides for a directory
+with no record: a queue recreated after the stop leaves the agent archived,
+while a queue made ahead of registration, with nothing archived, is
+deliverable. A registry that cannot be read is treated as unknown
+(deliverable, with a `target-unknown` warning in `check`). `check`
 marks each flag `error` (messages fail today: missing, archived or dead
 target, dead pinned coordinator process) or `warning` (a pinned name or
 process that goes stale later, a tree shape); warnings fail `check` only

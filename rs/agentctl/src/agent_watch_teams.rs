@@ -43,9 +43,10 @@ pub(super) fn report_team_declarations(
         .iter()
         .map(|flag| {
             format!(
-                "{}:{}",
+                "{}:{}:{}",
                 flag["team"].as_str().unwrap_or("?"),
-                flag["kind"].as_str().unwrap_or("?")
+                flag["kind"].as_str().unwrap_or("?"),
+                flag["detail"].as_str().unwrap_or("?")
             )
         })
         .collect::<Vec<_>>()
@@ -96,7 +97,9 @@ pub(super) fn report_team_declarations(
 }
 
 /// The receiving host's undeliverable notices: told in one message, then moved aside so each
-/// is told once. A notice whose message could not be queued stays for the next pass.
+/// message is told once (a refused retry of the same message rewrites its notice, which is set
+/// aside without telling again). A notice whose message could not be queued stays for the next
+/// pass.
 pub(super) fn report_team_notices(
     probe: &mut dyn Probe,
     notifier: &mut dyn Notifier,
@@ -110,6 +113,7 @@ pub(super) fn report_team_notices(
             json!({
                 "team": notice["team"], "id": notice["id"], "sender": notice["sender"],
                 "reason": notice["reason"], "at": notice["at"], "path": path,
+                "repeat": notice["repeat"] == true,
             })
         })
         .collect();
@@ -118,71 +122,80 @@ pub(super) fn report_team_notices(
     }
     if options.check_only {
         for row in &mut rows {
-            row["due"] = json!(true);
+            row["due"] = json!(row["repeat"] != true);
         }
         return rows;
     }
-    let mut lines: Vec<String> = notices
+    let fresh: Vec<&(PathBuf, Value)> = notices
         .iter()
-        .take(TEAM_NOTICE_LINES)
-        .map(|(_, notice)| {
-            format!(
-                "- team {}: {} from {}: {}",
-                notice["team"].as_str().unwrap_or("?"),
-                notice["id"].as_str().unwrap_or("?"),
-                notice["sender"].as_str().unwrap_or("?"),
-                notice["reason"].as_str().unwrap_or("?")
-            )
-        })
+        .filter(|(_, notice)| notice["repeat"] != true)
         .collect();
-    if notices.len() > TEAM_NOTICE_LINES {
-        lines.push(format!(
-            "- and {} more under teams.d/<team>/notices/",
-            notices.len() - TEAM_NOTICE_LINES
-        ));
-    }
-    let text = format!(
-        "[agentctl watch-agents] agent-teams refused {} inter-team message(s) to this host as undeliverable. Nothing was claimed here; each sender keeps its message and retries it with `agent-teams pump` (a sender's watch-agents pumps every {} min) once the delivery target is fixed. Fix the target first (`agent-teams check` names each fix):\n{}",
-        notices.len(),
-        (TEAM_PUMP_INTERVAL_SECONDS / 60.0) as u64,
-        lines.join("\n")
-    );
-    let ids: Vec<&str> = notices
-        .iter()
-        .map(|(_, notice)| notice["id"].as_str().unwrap_or("?"))
-        .collect();
-    let message_id = format!(
-        "agent-watch-team-undeliverable-{:016x}-{}",
-        stable_hash(&ids.join(",")),
-        now as u64
-    );
-    let recipient = team_recipient(probe, options);
-    match notifier.notify(&recipient, &text, &message_id) {
-        Ok(outcome) => {
-            for ((path, _), row) in notices.iter().zip(rows.iter_mut()) {
-                row["recipient"] = json!(recipient);
-                row["outcome"] = json!(outcome);
-                match notifier.acknowledge_team_notice(path) {
-                    Ok(()) => row["reported"] = json!(true),
-                    Err(error) => {
-                        row["reported"] = json!(true);
-                        row["acknowledge_error"] = json!(error);
-                    }
-                }
-            }
+    let mut told = Ok(Value::Null);
+    if !fresh.is_empty() {
+        let mut lines: Vec<String> = fresh
+            .iter()
+            .take(TEAM_NOTICE_LINES)
+            .map(|(_, notice)| {
+                format!(
+                    "- team {}: {} from {}: {}",
+                    notice["team"].as_str().unwrap_or("?"),
+                    notice["id"].as_str().unwrap_or("?"),
+                    notice["sender"].as_str().unwrap_or("?"),
+                    notice["reason"].as_str().unwrap_or("?")
+                )
+            })
+            .collect();
+        if fresh.len() > TEAM_NOTICE_LINES {
+            lines.push(format!(
+                "- and {} more under teams.d/<team>/notices/",
+                fresh.len() - TEAM_NOTICE_LINES
+            ));
         }
-        Err(error) => {
-            for row in &mut rows {
+        let text = format!(
+            "[agentctl watch-agents] agent-teams refused {} inter-team message(s) to this host as undeliverable. Nothing was claimed here; each sender keeps its message and retries it with `agent-teams pump` (a sender's watch-agents pumps every {} min) once the delivery target is fixed. Fix the target first (`agent-teams check` names each fix):\n{}",
+            fresh.len(),
+            (TEAM_PUMP_INTERVAL_SECONDS / 60.0) as u64,
+            lines.join("\n")
+        );
+        let ids: Vec<&str> = fresh
+            .iter()
+            .map(|(_, notice)| notice["id"].as_str().unwrap_or("?"))
+            .collect();
+        let message_id = format!(
+            "agent-watch-team-undeliverable-{:016x}-{}",
+            stable_hash(&ids.join(",")),
+            now as u64
+        );
+        let recipient = team_recipient(probe, options);
+        told = notifier
+            .notify(&recipient, &text, &message_id)
+            .map(|outcome| json!({"recipient": recipient, "outcome": outcome}))
+            .map_err(|error| error.to_string());
+    }
+    for ((path, notice), row) in notices.iter().zip(rows.iter_mut()) {
+        let repeat = notice["repeat"] == true;
+        match (&told, repeat) {
+            (Err(error), false) => {
                 row["reported"] = json!(false);
-                row["error"] = json!(error.to_string());
+                row["error"] = json!(error);
+                continue;
             }
+            (Ok(sent), false) => {
+                row["recipient"] = sent["recipient"].clone();
+                row["outcome"] = sent["outcome"].clone();
+            }
+            (_, true) => {}
+        }
+        row["reported"] = json!(true);
+        if let Err(error) = notifier.acknowledge_team_notice(path) {
+            row["acknowledge_error"] = json!(error);
         }
     }
     rows
 }
 
-/// Run `agent-teams pump` at most every [`TEAM_PUMP_INTERVAL_SECONDS`] while this host's
-/// outbox holds deferred messages, so a message refused as undeliverable is retried once its
+/// Start `agent-teams pump --deferred` at most every [`TEAM_PUMP_INTERVAL_SECONDS`] while this
+/// host's outbox holds deferred messages (the pass does not wait for it), so a message refused as undeliverable is retried once its
 /// target is fixed without anyone remembering to pump. `null` when nothing waits.
 pub(super) fn drive_team_pump(
     probe: &mut dyn Probe,
@@ -270,7 +283,7 @@ mod tests {
         }
         fn run_team_pump(&mut self) -> std::result::Result<String, String> {
             self.pumps += 1;
-            Ok("pump: nothing to do".to_owned())
+            Ok("started agent-teams pump --deferred (PID 1)".to_owned())
         }
     }
 
@@ -361,6 +374,25 @@ mod tests {
         assert_eq!(notifier.acknowledged, vec![path]);
     }
 
+    /// A refused retry of a message already told about is set aside without telling again.
+    #[test]
+    fn a_repeated_notice_is_set_aside_without_a_second_message() {
+        let options = options();
+        let path = PathBuf::from("/state/teams.d/tools/notices/tm-a.json");
+        let mut probe = TeamsProbe {
+            notices: vec![(
+                path.clone(),
+                json!({"team": "tools", "id": "tm-a", "repeat": true}),
+            )],
+            ..TeamsProbe::default()
+        };
+        let mut notifier = TeamsNotifier::default();
+        let rows = report_team_notices(&mut probe, &mut notifier, 1_000.0, &options);
+        assert_eq!(rows[0]["reported"], true);
+        assert!(notifier.sent.is_empty(), "{:?}", notifier.sent);
+        assert_eq!(notifier.acknowledged, vec![path]);
+    }
+
     /// Review finding 2: the watcher pumps a waiting outbox, at most once per interval.
     #[test]
     fn a_waiting_outbox_is_pumped_once_per_interval() {
@@ -373,7 +405,10 @@ mod tests {
         );
         probe.waiting = 2;
         let row = drive_team_pump(&mut probe, &mut notifier, &mut state, 1_000.0, &options);
-        assert_eq!(row["pumped"], "pump: nothing to do", "{row}");
+        assert_eq!(
+            row["pumped"], "started agent-teams pump --deferred (PID 1)",
+            "{row}"
+        );
         let row = drive_team_pump(&mut probe, &mut notifier, &mut state, 1_300.0, &options);
         assert_eq!(row["next_at"], 1_600.0, "{row}");
         drive_team_pump(&mut probe, &mut notifier, &mut state, 1_600.0, &options);

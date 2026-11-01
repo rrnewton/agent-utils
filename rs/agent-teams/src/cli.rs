@@ -66,7 +66,9 @@ MESSAGING
   retract ID [--json]
   status ID [--json]                   One message, from the outbox and receipts.
   outbox [--json]                      List the outbox.
-  pump [--retry-refused] [--json]      Retry deferred and ambiguous messages.
+  pump [--retry-refused] [--deferred] [--json]
+                                       Retry deferred and ambiguous messages;
+                                       --deferred retries only deferred ones.
   seen ID                              Has this host's ledger delivered ID?
   prune [TEAM]                         Drop terminal entries 30 days past not_after.
   resolve ID (--fence | --mark-delivered)   Human only, on the receiving host.
@@ -1564,6 +1566,21 @@ fn cmd_pump(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
     let _ = crate::relay::raise_due_alarms(&globals.state, now_unix_ms());
     let _ = crate::relay::drain_quarantine(&globals.state, &globals.host);
     let retry_refused = has_flag(args, "--retry-refused");
+    // Only messages that never reached a receiver (`agentctl watch-agents` pumps this way,
+    // so an accepted message is not re-asked about every few minutes).
+    let deferred_only = has_flag(args, "--deferred");
+    // One pump at a time per state directory: two watchers sharing it, or a watcher and a
+    // person, would otherwise walk the same entry at once and the last outbox write would win.
+    std::fs::create_dir_all(&globals.state)?;
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(globals.state.join("pump.lock"))?;
+    if fs2::FileExt::try_lock_exclusive(&lock_file).is_err() {
+        println!("pump: another pump is running on this state directory; nothing done");
+        return Ok(0);
+    }
     let teams = globals.load_teams()?;
     let routes = globals.load_routes()?;
     let dir = crate::sender::outbox_dir(&globals.state);
@@ -1583,10 +1600,14 @@ fn cmd_pump(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
             let state = entry["state"].as_str().unwrap_or("deferred").to_string();
             // `undeliverable` is only what the first #721 build stored;
             // current builds store `deferred` with the reason beside it.
-            let retryable = matches!(
-                state.as_str(),
-                "deferred" | "ambiguous" | "accepted" | "claimed" | "undeliverable"
-            ) || (retry_refused && state == "refused");
+            let retryable = if deferred_only {
+                matches!(state.as_str(), "deferred" | "undeliverable")
+            } else {
+                matches!(
+                    state.as_str(),
+                    "deferred" | "ambiguous" | "accepted" | "claimed" | "undeliverable"
+                ) || (retry_refused && state == "refused")
+            };
             if !retryable {
                 continue;
             }

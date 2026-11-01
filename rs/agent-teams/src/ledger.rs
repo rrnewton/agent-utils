@@ -146,6 +146,20 @@ fn write_terminal(
     Ok(())
 }
 
+/// Write an undeliverable notice as `NOTICES/<id>.json`, replacing an earlier one for the same
+/// message by rename: no backup copy beside it (a sender retrying every few minutes would pile
+/// them up) and no read of the old file, which `agentctl watch-agents` may be moving away at the
+/// same moment. Best-effort: the event is in the team log either way.
+fn write_notice(notices: &Path, id: &str, notice: &Value) {
+    let write = || -> std::io::Result<()> {
+        fs::create_dir_all(notices)?;
+        let tmp = notices.join(format!(".{id}.tmp-{}", std::process::id()));
+        fs::write(&tmp, format!("{notice:#}\n"))?;
+        fs::rename(&tmp, notices.join(format!("{id}.json")))
+    };
+    let _ = write();
+}
+
 /// Accept one envelope on this host. Claims the ID in the ledger before any
 /// hand-over; a second arrival returns the recorded state.
 pub fn accept(
@@ -297,8 +311,11 @@ pub fn accept(
             "at": format_rfc3339_ms(now_unix_ms()),
         });
         crate::sender::log_event(ctx.state, &notice);
-        let notice_dir = ctx.state.join("teams.d").join(team).join("notices");
-        let _ = crate::jsonfile::write_json_atomic(&notice_dir.join(format!("{id}.json")), &notice);
+        write_notice(
+            &ctx.state.join("teams.d").join(team).join("notices"),
+            &id,
+            &notice,
+        );
         unlock(lock);
         return Ok(AcceptAnswer {
             outcome: "undeliverable".to_string(),

@@ -977,7 +977,7 @@ struct Stop {
     /// the agentcloud session (use when the session no longer exists or was retired elsewhere)
     #[arg(long)]
     skip_cloud_halt: bool,
-    /// Hand this registry's coordinator designation over to NEW before stopping (put back if the stop fails): required when stopping the live designated coordinator, so team delivery keeps a live target (#721 agent-teams-coordinator-handover)
+    /// Hand this registry's coordinator designation over to NEW before stopping (put back if the stop fails while the old coordinator's harness is still alive and nobody re-designated meanwhile): required when stopping the live designated coordinator, so team delivery keeps a live target (#721 agent-teams-coordinator-handover)
     #[arg(long, value_name = "NEW")]
     handover_to: Option<String>,
     /// Stop the live designated coordinator without handing over (prints a warning; inter-team delivery to this registry loses its target until a new coordinator is designated). Not needed when its harness is gone or with --retire-dead-adoption, --retire-dead-native or --recover-legacy-adoption, which warn the same way
@@ -3515,6 +3515,27 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             },
         )?,
         Commands::Stop(value) => {
+            let recovery_selector = if value.retire_dead_adoption {
+                Some("--retire-dead-adoption")
+            } else if value.retire_dead_native {
+                Some("--retire-dead-native")
+            } else if value.recover_legacy_adoption {
+                Some("--recover-legacy-adoption")
+            } else {
+                None
+            };
+            if let Some(selector) = recovery_selector.filter(|_| {
+                value.expected_token.is_none() || value.expected_record_sha256.is_none()
+            }) {
+                return Err(Failure::Usage(format!(
+                    "{selector} requires --expected-token and --expected-record-sha256"
+                )));
+            }
+            if recovery_selector.is_none() && value.expected_record_sha256.is_some() {
+                return Err(Failure::Usage(
+                    "--expected-record-sha256 requires --recover-legacy-adoption, --retire-dead-adoption, or --retire-dead-native".to_owned(),
+                ));
+            }
             // #721: stopping the designated coordinator without a handover
             // strands every agent-teams declaration delivering through this
             // registry; refuse unless the designation moves first. Retiring a
@@ -3542,7 +3563,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     // agent; put back if the stop fails.
                     let previous = manager.designation_snapshot()?;
                     manager.coordinator_set(new)?;
-                    restore_designation = Some(previous);
+                    restore_designation = Some((previous, manager.designation_snapshot()?));
                     eprintln!(
                         "agentctl stop: handed the coordinator designation over to {new} before stopping {}",
                         value.agent.name
@@ -3562,27 +3583,6 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     )));
                 }
             }
-            let recovery_selector = if value.retire_dead_adoption {
-                Some("--retire-dead-adoption")
-            } else if value.retire_dead_native {
-                Some("--retire-dead-native")
-            } else if value.recover_legacy_adoption {
-                Some("--recover-legacy-adoption")
-            } else {
-                None
-            };
-            if let Some(selector) = recovery_selector.filter(|_| {
-                value.expected_token.is_none() || value.expected_record_sha256.is_none()
-            }) {
-                return Err(Failure::Usage(format!(
-                    "{selector} requires --expected-token and --expected-record-sha256"
-                )));
-            }
-            if recovery_selector.is_none() && value.expected_record_sha256.is_some() {
-                return Err(Failure::Usage(
-                    "--expected-record-sha256 requires --recover-legacy-adoption, --retire-dead-adoption, or --retire-dead-native".to_owned(),
-                ));
-            }
             let stopped = manager.advised_stop_with_options(
                 &value.agent.name,
                 StopOptions {
@@ -3596,16 +3596,29 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             );
             match (stopped, restore_designation) {
                 (Ok(report), _) => report,
-                (Err(error), Some(previous)) => {
-                    match manager.coordinator_restore(previous.as_ref()) {
-                        Ok(()) => eprintln!(
-                            "agentctl stop: the stop failed, so the coordinator designation was put back on {}",
+                (Err(error), Some((previous, handed))) => {
+                    // A stop can fail after closing the pane: never hand team delivery back
+                    // to a coordinator whose harness is gone.
+                    let new = value.handover_to.as_deref().unwrap_or("NEW");
+                    if manager.harness_dead(&value.agent.name) {
+                        eprintln!(
+                            "agentctl stop: the stop failed, but {}'s harness is gone, so {new} stays the designated coordinator",
                             value.agent.name
-                        ),
-                        Err(restore) => eprintln!(
-                            "agentctl stop: the stop failed and the designation could not be put back ({restore}); run `agentctl coordinator set {}`",
-                            value.agent.name
-                        ),
+                        );
+                    } else {
+                        match manager.coordinator_restore(previous.as_ref(), handed.as_ref()) {
+                            Ok(true) => eprintln!(
+                                "agentctl stop: the stop failed, so the coordinator designation was put back on {} (declarations the handover unpinned stay unpinned; they follow the designation)",
+                                value.agent.name
+                            ),
+                            Ok(false) => eprintln!(
+                                "agentctl stop: the stop failed; the designation changed again meanwhile, so it was left as it is"
+                            ),
+                            Err(restore) => eprintln!(
+                                "agentctl stop: the stop failed and the designation could not be put back ({restore}); run `agentctl coordinator set {}`",
+                                value.agent.name
+                            ),
+                        }
                     }
                     return Err(error.into());
                 }

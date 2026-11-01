@@ -516,3 +516,24 @@ fn registry_designation_lets_the_new_coordinator_send_after_a_stale_pin() {
     assert!(out.contains("accepted"), "{out}");
     assert_eq!(world.hook_inbox_count("tools"), 1);
 }
+
+/// One pump at a time per state directory: two watchers sharing it never walk the same outbox
+/// entry at once.
+#[test]
+fn a_second_pump_on_the_same_state_does_nothing() {
+    let world = World::new();
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(world.state.join("pump.lock"))
+        .expect("lock file");
+    fs2::FileExt::lock_exclusive(&lock).expect("hold the pump lock");
+    let (code, out, err) = world.run(&["pump", "--deferred"]);
+    assert_eq!(code, 0, "{out} {err}");
+    assert!(out.contains("another pump is running"), "{out}");
+    fs2::FileExt::unlock(&lock).expect("release");
+    let (code, out, _) = world.run(&["pump", "--deferred"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("nothing to do"), "{out}");
+}

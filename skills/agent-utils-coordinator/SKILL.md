@@ -69,7 +69,7 @@ they ask you, and you decide what goes.
 
 When you (the coordinator) are being replaced, or you replace another coordinator on a host, inter-team messages follow the registry's designated coordinator only through declarations that name the registry. Hand over in this order, and do not skip ahead:
 
-1. **Designate the new coordinator** while the old one is still live: `agentctl coordinator set NEW`. It fixes agent-teams declarations pinned to the old name, rewrites a pinned coordinator process that was the old harness into the registry designation (so you may send for the team), and flags any other pin (`team_declarations` in its output).
+1. **Designate the new coordinator** while the old one is still live: `agentctl coordinator set NEW`. It fixes agent-teams declarations pinned to the old name, moves a pinned coordinator process that was the old harness to the registry designation (or, for a declaration naming no registry, to your harness) so you may send for the team, and flags any other pin (`team_declarations` in its output).
 2. **Check team declarations**: `agent-teams check` green on every host of the fleet. Every red flag (pinned agent, target not live, missing or archived, not the designated coordinator, child tab, tree-root mismatch, designated not a root) names the command that fixes it.
 3. **Drain or forward the old inbox**: `agentctl drain OLD`; senders holding `undeliverable` messages (kept as `deferred`) retry with `agent-teams pump` after step 1; each sending host's `watch-agents` pumps every 10 minutes.
 4. **Retire the old coordinator** last: `agentctl stop OLD --handover-to NEW`. Stopping the live designated coordinator without a handover is refused for exactly this reason.
