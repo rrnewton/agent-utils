@@ -106,7 +106,7 @@ steps:
   - group: setup
     job: contract-tools
     desc: install the contract generator's lockfile-pinned tools
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: scripts/provision-node-packages vibe-talk/contract
     jobs_flag: ""
     timeout: 600
@@ -119,7 +119,7 @@ steps:
   - group: check
     job: contract
     desc: generated browser contract is current; tsc --checkJs over voice.js, and the page's modules strict and portable
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && make contract-check typecheck
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -178,7 +178,7 @@ steps:
   - group: check
     job: screenshots-self-test
     desc: offline controls for the screenshot harness's capture judge, PNG decoder and scene table
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 scripts/screenshots.py --self-test
     jobs_flag: ""
     timeout: 60
@@ -196,7 +196,7 @@ steps:
   - group: check
     job: pwa-installability
     desc: current Chromium CDP installability check with an Android viewport, at / and from /voice, against the real server
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/pwa_installability.py
     jobs_flag: ""
     deps: [build.release, setup.contract-tools]
@@ -216,7 +216,7 @@ steps:
   - group: check
     job: enter-to-send-browser
     desc: Enter in the reply box sends by default and is a new line with Enter to send off, in current Chromium
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/enter_to_send_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -235,7 +235,7 @@ steps:
   - group: check
     job: settings-sync-browser
     desc: two devices share one server settings document and converge live, in current Chromium
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/settings_sync_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -254,7 +254,7 @@ steps:
   - group: check
     job: pairing-link-browser
     desc: a pairing link signs a fresh browser in once and leaves no code in the address, in current Chromium
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/pairing_link_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -274,7 +274,7 @@ steps:
   - group: check
     job: offline-cache-browser
     desc: saved-message snapshot and a read-scope sign-in in current Chromium at 412x915 and 360x800 Android viewports and a 1280x800 desk
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/offline_cache_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -298,7 +298,7 @@ steps:
   - group: check
     job: reactions-browser
     desc: emoji reaction strips laid out in current Chromium at 412x915 and 360x800 Android viewports and a 1280x800 desk
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/reactions_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -315,7 +315,7 @@ steps:
   - group: check
     job: live-reactions-browser
     desc: a live reaction update drawn on the open page in current Chromium at a 412x915 Android viewport
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/live_reactions_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -333,7 +333,7 @@ steps:
   - group: check
     job: system-bots-browser
     desc: Slack system bots drawn as bots, and a named coding agent as the agent, in current Chromium at a 412x915 Android viewport and a 1280x800 desk
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/system_bots_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -351,7 +351,7 @@ steps:
   - group: check
     job: edited-mark-browser
     desc: the edited mark laid out in current Chromium at 412x915 and 360x800 Android viewports and a 1280x800 desk
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/edited_mark_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -369,7 +369,7 @@ steps:
   - group: check
     job: server-thread-hues-browser
     desc: two browser contexts drawing the same threads in the server's colours in current Chromium at a 1280x800 desk
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/server_thread_hues_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -389,7 +389,7 @@ steps:
   - group: check
     job: rich-headers-browser
     desc: rich headers laid out in current Chromium at a 412x915 Android viewport and a 1280x800 desk, one column and two
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/rich_headers_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -408,7 +408,7 @@ steps:
   - group: check
     job: read-aloud-browser
     desc: read-aloud tap to audible in current Chromium, with an <audio> negative control
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/read_aloud_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -426,7 +426,7 @@ steps:
   - group: check
     job: wit-read-aloud-browser
     desc: read-aloud with the Wit.ai backend in current Chromium, phone and desktop
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/wit_read_aloud_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -443,7 +443,7 @@ steps:
   - group: check
     job: local-read-aloud-browser
     desc: read-aloud with the local backend in current Chromium, phone and desktop
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/local_read_aloud_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -461,7 +461,7 @@ steps:
   - group: check
     job: fallback-chain-browser
     desc: read-aloud through a fallback chain in current Chromium, phone and desktop
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/fallback_chain_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -481,7 +481,7 @@ steps:
   - group: check
     job: read-aloud-blocks-browser
     desc: a long message read block by block in current Chromium, with boundary gaps measured on the audio clock and a slow-voice negative control
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/read_aloud_blocks_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -499,7 +499,7 @@ steps:
   - group: check
     job: read-aloud-views-browser
     desc: reading aloud from every view by both voices in current Chromium at 1280x800, audio started and the light on the message read, and a silent voice stopping the read unarchived
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/read_aloud_views_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -518,7 +518,7 @@ steps:
   - group: check
     job: read-pause-reply-browser
     desc: a read paused, the message replied to and sent, then resumed, by both voices in current Chromium at 393x852 touch, the read going on from where it was held
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/read_pause_reply_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -536,7 +536,7 @@ steps:
   - group: check
     job: pace-stepper-browser
     desc: the Pace popover's stepper in current Chromium at 393x852 by touch and 1280x800, stepping, typing, clamping and a mid-read change
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/pace_stepper_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -553,7 +553,7 @@ steps:
   - group: check
     job: post-confirm-browser
     desc: a tap on a just-shown post-confirmation card's Send commits nothing in current Chromium
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/post_confirm_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -576,7 +576,7 @@ steps:
   - group: check
     job: voice-call-drops-browser
     desc: a spoken call replaying the bridge's event order — the greeting hand-off, a yes answered before its final transcript, the notice's wait, how the call ended, a long answer heard out before another channel's message, a typed cut — in current Chromium
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/voice_call_drops_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -596,7 +596,7 @@ steps:
   - group: check
     job: voice-reconnect-browser
     desc: a voice bridge that loses a turn and asks to reconnect — the call carried on a new session, the lost relay sent again once, the bound and a non-reconnect error still ending it — in current Chromium
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/voice_reconnect_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -618,7 +618,7 @@ steps:
   - group: check
     job: voice-expand-browser
     desc: a long voice turn opened and closed by a tap on its card, a streamed reply kept whole as it grows and a reader's fold kept across its frames, the reader's place kept, in current Chromium at 393x852 and 1280x800
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/voice_expand_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -703,7 +703,7 @@ steps:
   - group: check
     job: approval-card-phone-place-browser
     desc: the send card's place, thumb reach, hold, docked layout and frozen card, the recap line of a new call, and the channel's list held still as the card comes and goes, at 393x852; docked under the thread list through the view keys, arriving there and back from it with the channel's reader where they were, a draft arriving while Settings or Help was up, the reader kept at the foot as the box takes back its room after Send, and a reader of a draft opened by More kept on it, at 393x852, in current Chromium
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/approval_card_browser.py --part phone-place
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -718,7 +718,7 @@ steps:
   - group: check
     job: approval-card-phone-alone-browser
     desc: a reader who saw only a long draft's card at the foot once it goes, there or from under the thread list, and back from Settings where they were, at 393x852, in current Chromium
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/approval_card_browser.py --part phone-alone
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -733,7 +733,7 @@ steps:
   - group: check
     job: approval-card-phone-help-browser
     desc: back from Help opened by its key on the newest line once the draft went or changed while Help was up, the chips' room kept for a reader, and the jump decided on the list as it is laid out, at 393x852, in current Chromium
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/approval_card_browser.py --part phone-help
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -748,7 +748,7 @@ steps:
   - group: check
     job: approval-card-small-screens-browser
     desc: the send card's place, reach, hold, docked layout, frozen card and recap line, the channel's list held still and a reader who saw only the card, at 360x780 and 375x667, the trips to Settings and Help at 375x667, and the docked card whole at 667x375 and 375x330, in current Chromium
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/approval_card_browser.py --part small-screens
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -763,7 +763,7 @@ steps:
   - group: check
     job: approval-card-desk-browser
     desc: beside a reply open in a column, docked under the thread list and back, the cards' reader kept across two columns, the reader kept at the foot after Send, a draft opened by More through two columns and back, the jump back from Settings and a draft arriving while Settings or Help was up, at 1280x800 with a mouse, in current Chromium
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/approval_card_browser.py --part desk
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -785,7 +785,7 @@ steps:
   - group: check
     job: voice-composer-browser
     desc: the call's message box and the view switch on screen while the box is focused, and its first send, in current Chromium at 412x915 and 1280x800
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/voice_composer_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -812,7 +812,7 @@ steps:
   - group: check
     job: composer-grow-browser
     desc: the Grow checkbox and the message box growing with a long paste up to 60% of the window, Send on screen, in current Chromium at 1280x800, 1920x1080, 1280x600 and two columns, without field-sizing, and unchanged on a 393x852 phone
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/composer_grow_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -833,7 +833,7 @@ steps:
   - group: check
     job: view-switch-browser
     desc: Main and All switched from what the page holds, with every timeline request counted, in current Chromium
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/view_switch_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -857,7 +857,7 @@ steps:
   - group: check
     job: read-modes-browser
     desc: a thread entered on its first unread, a collapsed read run opened by a real tap, and Main's unread-replies count, in current Chromium at 412x915 and 1280x800
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/read_modes_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -891,7 +891,7 @@ steps:
   - group: check
     job: keyboard-browser
     desc: the scroll, search and Settings keys and the keymap pressed through CDP in current Chromium at 1280x800
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/keyboard_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -916,7 +916,7 @@ steps:
   - group: check
     job: search-chord-browser
     desc: the search's Ctrl+/ (Cmd+/) from a box, a popover, a menu, a picker, Settings, Help, two columns, Reply and with single keys off, and Help's Ctrl+?, pressed through CDP in current Chromium at 1280x800
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/search_chord_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -934,7 +934,7 @@ steps:
   - group: check
     job: composer-key-browser
     desc: Ctrl+S (Cmd+S) to the message box the rule names in two columns, from cards, selections, a button, the body, a text field and the thread list, pressed through CDP in current Chromium at 1280x800
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/composer_key_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -952,7 +952,7 @@ steps:
   - group: check
     job: command-bar-browser
     desc: the desk's command bar one row across the window with Thread list and a 120-character thread chosen at 1280x800, 1920x1080 and 900x700, and a 393px phone's as it was, in current Chromium
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/command_bar_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -973,7 +973,7 @@ steps:
   - group: check
     job: provider-groups-browser
     desc: the bar's channel picker grouped by chat service, stepped with Alt+Down/Up through CDP and restored after a reload, in current Chromium at 1280x800 and 375x812
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/provider_groups_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -995,7 +995,7 @@ steps:
   - group: check
     job: channel-box-browser
     desc: Settings' channel section in current Chromium at 1280x800 and 393x852, Who is who in the channel box following its picker, and the hidden channels a folded fold at its foot that moves nothing above it
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/channel_box_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -1016,7 +1016,7 @@ steps:
   - group: check
     job: channel-search-browser
     desc: a Slack channel found by typing its name without the '#' into the real channel picker and the channel browser's search, and a slow first read counting its seconds, in current Chromium at 1280x800
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/channel_search_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -1048,7 +1048,7 @@ steps:
   - group: check
     job: two-column-browser
     desc: Main and a thread side by side, cards, selection, independent scrolling, the narrow fallback, the links between roots and cards with their glide, and the search's walk back to older matches, in current Chromium at 1440x900 and 1280x800, and the walk on a 412x915 phone
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/two_column_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -1073,7 +1073,7 @@ steps:
   - group: check
     job: desktop-layout-browser
     desc: Settings' head one quiet row (two on a phone) in reading and Tab order, and in two columns every row but the owner's across its column with the glass over none, in current Chromium at 1280x800, 1920x1080, 2560x1080 and 393x852
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/desktop_layout_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -1098,7 +1098,7 @@ steps:
   - group: check
     job: thread-card-focus-browser
     desc: one thread card highlighted and shown whole, every other card's edge and link grey by computed colour and by pixels, its replies button and -> entering it, <- and Esc coming back, in current Chromium at 1280x800 and 412x915
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/thread_card_focus_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -1120,7 +1120,7 @@ steps:
   - group: check
     job: copy-message-browser
     desc: Ctrl+C, Cmd+C and y copy the highlighted message whole, and leave a selection, a text box and nothing highlighted to the browser, read back from the clipboard in current Chromium at 1280x800 and 412x915
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/copy_message_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -1140,7 +1140,7 @@ steps:
   - group: check
     job: in-app-links-browser
     desc: a link to a message in a channel the app reads opens it in the app, landed on, as one history entry; a real Back returns to the reader's message at the same height, stacked jumps undone one at a time, in current Chromium at 1280x800 and 393x852 with touch
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/in_app_links_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -1159,7 +1159,7 @@ steps:
   - group: check
     job: message-summaries-browser
     desc: an unpacked row with a wide code block never pushes the thread list past a phone's edge, and a failed summary is a quiet label that leaves the row's Done state and Unarchive alone, in current Chromium at 393x852, 412x915 and 1280x800
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/message_summaries_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -1181,7 +1181,7 @@ steps:
   - group: check
     job: open-upstream-link-browser
     desc: Open in Slack in the ⋯ menu opens the message's own address in a new page with no opener, by the link and by Shift+O, l copies it, absent without one; Copy Slack link and Copy vibe-talk link beside it, a right-click reaching the anchor's own contextmenu, and deep links opening their view and message (the same query on a fresh server too), in current Chromium at 1280x800 and 393x852
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/open_upstream_link_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -1211,7 +1211,7 @@ steps:
   - group: check
     job: back-gesture-browser
     desc: the browser's Back closes a thread, the thread list, a thread opened from it and a menu over either in the same document, one per press, keeping the reader's place, stands on the earlier load's entries after a reload, and leaves the app only from the top, in current Chromium at a 412x915 Android phone in standalone mode and a 1440x900 desk
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/back_gesture_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -1236,7 +1236,7 @@ steps:
   - group: check
     job: live-pill-browser
     desc: the live pill and the search glass stand over no row, chip or date rule of the channel's list, in Main and in a thread, at any scroll position and as a thread lands, in current Chromium at a 412x915 phone in both schemes
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/live_pill_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -1268,7 +1268,7 @@ steps:
   - group: check
     job: thread-card-header-browser
     desc: a thread under its card at the top — on the right, joined to its root by one line a resting mouse glides Main along, and across the window from the thread list — the card moving up from its place in the list, a redraw of Main leaving the keys on the right, in current Chromium at 1280x800 in both schemes and with reduced motion, and at 412x915 by touch
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/thread_card_header_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -1293,7 +1293,7 @@ steps:
   - group: check
     job: threads-unpack-browser
     desc: every thread's messages unpacked under its card, bridged in the thread colour with the summarised root first, read modes inside each block, kept across a reload, in current Chromium at 1280x800 and 393x852 in both schemes
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/threads_unpack_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -1308,7 +1308,7 @@ steps:
   - group: check
     job: thread-header-collapse-browser
     desc: the card at the top of a thread folded by a press to a thin bar of its own colours and opened again, nothing under it moving, kept across a reload, joined to its root, in current Chromium at 393x852 by touch and 1280x800 with a mouse, in both schemes
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/thread_header_collapse_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -1329,7 +1329,7 @@ steps:
   - group: check
     job: thread-line-browser
     desc: the line from a thread's root to its card runs beside the thread's rows and never over them, and the owner's rows stay partial width, in current Chromium at 1000x800, 1280x800 in both schemes and 1920x1080, and at 393x852 by touch
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/thread_line_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -1350,7 +1350,7 @@ steps:
   - group: check
     job: empty-messages-browser
     desc: empty messages drawn nowhere and counted nowhere while the Settings switch is on, by default, and drawn again when it is off, kept across a reload, a file alone and a reaction alone still drawn, in current Chromium at 1280x800 and 393x852 in both schemes
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/empty_messages_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -1376,7 +1376,7 @@ steps:
   - group: check
     job: all-thread-strip-browser
     desc: a thread's colour strip on every row of All that is in an answered thread, thicker than a border and a hit area wide, and a click or tap on it selecting the thread in All with the rest dimmed and nothing moving, in current Chromium at 1280x800 and 412x915 in both schemes
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/all_thread_strip_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -1397,7 +1397,7 @@ steps:
   - group: check
     job: stale-live-read-browser
     desc: a live message the stream drew stays drawn in every frame when a read asked before it lands late, with a negative control against the page without the fix, in current Chromium at 1280x800
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/stale_live_read_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -1433,7 +1433,7 @@ steps:
   - group: check
     job: scroll-stability-browser
     desc: the message lists hold the reader's row through live messages, refreshes, a read landing after a scroll, summaries, focus moves, the view keys and the mouse crossing the cards with or without a card highlighted, follow only a reader on the newest line, and open threads and the thread list at their foot, in current Chromium at 1280x800 and 412x915; and the thread list holds the card being read while replies move other cards to its foot, at 393x852 and 1280x800
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/scroll_stability_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -1462,7 +1462,7 @@ steps:
   - group: check
     job: column-overscroll-browser
     desc: the right column scrolls past its foot into blank room at a desk until the last card's top is mid-column, by the wheel after a rest and by PgDn, Space and the down arrow, closes it going back up, by End and by a search, holds the reader in it as the last card changes size and as replies arrive, and stops a fling or a held key on the foot, in current Chromium at 1280x800 and 1920x1080, with six negative controls
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/column_overscroll_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -1485,7 +1485,7 @@ steps:
   - group: check
     job: bookmark-browser
     desc: the reading bookmark set, jumped to, kept across a reply and advanced by Done, and taken away by the X on its line with Undo (#420 bookmark-clear), in current Chromium at 1280x800 and 393x852
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/bookmark_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -1507,7 +1507,7 @@ steps:
   - group: check
     job: filter-place-browser
     desc: a pin chosen under Pinned stays where it stood when the filter is cleared, an old one walked back to, a combined row's second part by its own text, and a message the reader opens next stays put, in current Chromium at 1280x800 and 412x915
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/filter_place_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -1533,7 +1533,7 @@ steps:
   - group: check
     job: search-dates-browser
     desc: a search's hits and gaps, the days ruled off and ranged, and the author filter keeping the chosen prompt in place, in current Chromium at 1280x800 and 412x915
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/search_dates_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -1553,7 +1553,7 @@ steps:
   - group: check
     job: link-url-chip-browser
     desc: the URL chip under Links writes the links as their addresses and back, and nothing shows through the chip row, in current Chromium at 393x852, 412x915 and 1280x800
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/link_url_chip_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -1571,7 +1571,7 @@ steps:
   - group: check
     job: search-whose-browser
     desc: the author filter's chip and tooltip name whose messages it shows, in current Chromium at 393x852 and 1280x800
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/search_whose_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -1594,7 +1594,7 @@ steps:
   - group: check
     job: search-unmatched-browser
     desc: a search's unmatched lines opened by real presses, in All, in a thread and among the thread cards, in current Chromium at 393x852 and 1280x800
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/search_unmatched_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -1624,7 +1624,7 @@ steps:
   - group: check
     job: reply-continuity-browser
     desc: Reply opening under the message in the list without moving it, the box under its row through a resize, Send and Cancel moving nothing, and Quote reply, in current Chromium at 1280x800 and 412x915, and Quote reply moving no row at 393 and 360 wide
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/reply_continuity_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -1649,7 +1649,7 @@ steps:
   - group: check
     job: inline-reply-browser
     desc: Reply opening in the stream under the message and its replies, later rows below, one message box on screen, in two columns and one, at 1280x800 and 393x852, through Grow, Send, Cancel, a refusal, the view keys and two columns collapsing, in current Chromium
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/inline_reply_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -1670,7 +1670,7 @@ steps:
   - group: check
     job: threads-main-browser
     desc: the Threads view's chips on the search glass's row, Main channel among the cards with the main channel's box last, and a reply under one of them moving the one box, in current Chromium at 1280x800 and 393x852
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/threads_main_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -1691,7 +1691,7 @@ steps:
   - group: check
     job: sent-receipts-browser
     desc: the Sent receipts of thread replies sent from the Threads view go once shown, are never saved, and a reload draws none, in current Chromium at 1280x800
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/sent_receipts_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -1709,7 +1709,7 @@ steps:
   - group: check
     job: send-double-check-browser
     desc: the Sending card's two ticks mid-send and the duration tap readout, in current Chromium at 393x852
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/send_double_check_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -1731,7 +1731,7 @@ steps:
   - group: check
     job: threads-polish-browser
     desc: the Threads view's chips pressed alike, Cmd+S keeping it with Main channel on, the owner's main rows centred, and Cmd+[ and Cmd+] through the views, in current Chromium at 1280x800 and 393x852
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/threads_polish_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -1756,7 +1756,7 @@ steps:
   - group: check
     job: bridge-even-browser
     desc: even bridge connectors with the owner's rows left-justified, and the dimmed pack triangle centred against its card with its rectangle clear of the bridge's line, in current Chromium at 393x852, 412x915, 768x1024 and 1280x800 in both schemes
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/bridge_even_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -1769,7 +1769,7 @@ steps:
   - group: check
     job: bridge-gutter-browser
     desc: on a phone the bridge hugging the left edge with the rows wider for it, a tap on the spine gliding back to the thread's card, and the triangle still packing in place, in current Chromium at 393x852, 412x915 and 1280x800
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/bridge_gutter_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -1789,7 +1789,7 @@ steps:
   - group: check
     job: thread-card-max-lines-browser
     desc: a long Markdown first message split for its thread card at K lines between lines, the rest unpacked as its formatted continuation, the summary layout taking over in place, K from Settings and a link landing on the card, in current Chromium at 393x852 and 1280x800
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/thread_card_max_lines_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -1807,7 +1807,7 @@ steps:
   - group: check
     job: thread-card-markdown-browser
     desc: a long Markdown first message's thread card keeps its formatting, splits only between lines, waits for its summary in the summary's layout, and draws a known summary with the page, a table first is one line on the card and whole under it from the first frame (#533), and a page older than the server's offers a reload (#529), in current Chromium at 393x852 and 1280x800
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/thread_card_markdown_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -1824,7 +1824,7 @@ steps:
   - group: check
     job: fold-latency-browser
     desc: Shift+O and e in an unpacked Threads view each draw in the frame after the key within a 50 ms handler budget, and hiding a row restyles only what it touches (#532), in current Chromium at 393x852 and 1280x800
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/fold_latency_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -1844,7 +1844,7 @@ steps:
   - group: check
     job: pack-still-browser
     desc: a thread card packed or unpacked in the Threads view still in every frame, past the foot where it takes that, and what is below sliding into the gap, in current Chromium at 1280x800 and 393x852
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/pack_still_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -1864,7 +1864,7 @@ steps:
   - group: check
     job: keyboard-hides-bar-browser
     desc: both bars away while the on-screen keyboard is up and back as it goes or the box loses the focus, the reader's place kept and a slim Stop while reading, in current Chromium at 393x852 by touch and 1280x800
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/keyboard_hides_bar_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -1886,7 +1886,7 @@ steps:
   - group: check
     job: reply-marks-read-browser
     desc: a docked Reply and a new thread's first reply mark what they answer read, Done and at the provider, and a later thread message marks nothing, in current Chromium at 1280x800
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/reply_marks_read_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -1910,7 +1910,7 @@ steps:
   - group: check
     job: done-sync-browser
     desc: a Done and an Undo drawn in a view held from earlier from its first frame, a thread opened on the right for the first time drawing a held Done from its first frame, and a sent reply's provider mark waiting for a held Done, in current Chromium at 412x915 and 1280x800
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/done_sync_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -1933,7 +1933,7 @@ steps:
   - group: check
     job: thread-button-browser
     desc: a new message's grey Thread drawn as Reply, starting its thread with the box focused, and turning coloured at the first reply, in current Chromium at 412x915 and 1280x800
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/thread_button_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -1957,7 +1957,7 @@ steps:
   - group: check
     job: compact-rows-browser
     desc: a collapsed row's header on one line with its name cut by an ellipsis, Reply and Done only once it is opened and then together with the other controls, a Thread tag the size of Reply in its thread's colour, and a wide list keeping every control, in current Chromium at 393x852, 1280x800 and two columns at 1280x800 and 1024x768
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/compact_rows_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -1982,7 +1982,7 @@ steps:
   - group: check
     job: collapsed-lines-browser
     desc: collapsed messages at the reader's 0 to 8 lines in Main, a thread, unpacked rows and on thread cards, by Ctrl/Cmd+( and Ctrl/Cmd+) and by the Settings slider, the reader's place kept, in current Chromium at 1280x800 and 393x852
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/collapsed_lines_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -2004,7 +2004,7 @@ steps:
   - group: check
     job: thread-card-fit-browser
     desc: thread cards fitted to their words and fully read cards drawn read, packed, unpacked and under every read mode, in current Chromium at 1280x800 and 393x852
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/thread_card_fit_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -2031,7 +2031,7 @@ steps:
   - group: check
     job: done-feedback-browser
     desc: selected read ringed dashed grey and selected unread solid in the accent in both schemes, the moment of a Done and every Undo, reduced motion, a plain Undo chip on phones and a named one on a desk, and nothing floating over the message box at any scroll position, in current Chromium
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/done_feedback_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -2055,7 +2055,7 @@ steps:
   - group: check
     job: elision-browser
     desc: every folded message's label claims no more than its clamp hides, in seven layouts, in current Chromium
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/elision_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -2083,7 +2083,7 @@ steps:
   - group: check
     job: fold-steps-browser
     desc: "the semicolon and colon keys, and Ctrl or Cmd with them from a message box, step the long messages round expand all, unread only and collapse all, drawn as said, the reader's row held within a pixel at every frame, or for a chord in a message box that box, in one column and two, in current Chromium at 1280x800"
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/fold_steps_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -2099,7 +2099,7 @@ steps:
   - group: build
     job: release
     desc: the release binary the server-shaped suites run against
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && cargo build --release --locked
     jobs_flag: ""
     jobs_env: CARGO_BUILD_JOBS
@@ -2114,7 +2114,7 @@ steps:
   - group: smoke
     job: cli-help
     desc: the built service binary exposes its operator help without configuration
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && ./target/release/vibe-talk --help >/dev/null
     jobs_flag: ""
     deps: [build.release]
@@ -2135,7 +2135,7 @@ steps:
   - group: build
     job: tests
     desc: the release test binaries the Rust and page suites run
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && cargo test --release --locked --no-run
     jobs_flag: ""
     jobs_env: CARGO_BUILD_JOBS
@@ -2166,7 +2166,7 @@ steps:
   - group: test
     job: unit
     desc: the Rust suites, and the contract's page suite through its harness
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 ../scripts/case_timings.py run-cargo -- cargo test --release --locked --no-fail-fast -- --skip the_voice_page_suite_passes --exact
     jobs_flag: ""
     jobs_env: CARGO_BUILD_JOBS
@@ -2205,7 +2205,7 @@ steps:
   - group: test
     job: page-0
     desc: the app page's suite, slice 0 of four, node over web/voice.js
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: >-
       cd vibe-talk && mkdir -p "${AGENT_UTILS_CASE_TIMING_DIR:-target/case-timings}" &&
       VOICE_PAGE_SHARD=0/4 node --max-old-space-size=1024 --test-reporter=spec --test-reporter-destination=stdout
@@ -2225,7 +2225,7 @@ steps:
   - group: test
     job: page-1
     desc: the app page's suite, slice 1 of four, node over web/voice.js
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: >-
       cd vibe-talk && mkdir -p "${AGENT_UTILS_CASE_TIMING_DIR:-target/case-timings}" &&
       VOICE_PAGE_SHARD=1/4 node --max-old-space-size=1024 --test-reporter=spec --test-reporter-destination=stdout
@@ -2245,7 +2245,7 @@ steps:
   - group: test
     job: page-2
     desc: the app page's suite, slice 2 of four, node over web/voice.js
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: >-
       cd vibe-talk && mkdir -p "${AGENT_UTILS_CASE_TIMING_DIR:-target/case-timings}" &&
       VOICE_PAGE_SHARD=2/4 node --max-old-space-size=1024 --test-reporter=spec --test-reporter-destination=stdout
@@ -2265,7 +2265,7 @@ steps:
   - group: test
     job: page-3
     desc: the app page's suite, slice 3 of four, node over web/voice.js
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: >-
       cd vibe-talk && mkdir -p "${AGENT_UTILS_CASE_TIMING_DIR:-target/case-timings}" &&
       VOICE_PAGE_SHARD=3/4 node --max-old-space-size=1024 --test-reporter=spec --test-reporter-destination=stdout
@@ -2295,7 +2295,7 @@ steps:
   - group: check
     job: send-order-browser
     desc: messages to one destination land in the order written, through a bridge that fails the first, across a reload, past a Dismiss, on a slow bridge and after a caller hangs up, in current Chromium against the real server
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/send_order_browser.py
     jobs_flag: ""
     deps: [build.release, setup.contract-tools]
@@ -2313,7 +2313,7 @@ steps:
   - group: shots
     job: screenshots
     desc: the screenshot harness — a real server and a real browser
-    labels: [validation-vibe-talk]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && ./scripts/run.sh --screenshots --theme dark
     jobs_flag: ""
     deps: [build.release, setup.contract-tools]

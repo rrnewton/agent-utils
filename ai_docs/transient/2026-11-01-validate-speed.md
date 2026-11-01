@@ -59,6 +59,18 @@ Normalized timing summaries in `refactor-gate-16-30.log` and
 | Page Undo second-batch failure | 12.7 | Browser fixture timers |
 | `page_build::the_page_build_suite_passes` | 12.6 | Build contract test; must remain selected for page changes |
 
+## Controlled selection comparison (mu-validate, 2026-11-01)
+
+Same counting method on both trees (steps whose labels intersect the selected
+groups, plus `component-*` steps): old is `origin/main` (`0b7b5047`), new is
+this branch. An unclassified path still selects every group on both.
+
+| Workload | Old nodes | New nodes | What changed |
+| --- | ---: | ---: | --- |
+| Page-only (`vibe-talk/web/src/present/card.js`) | 122 | 116 | Skips fmt, clippy, operator mypy, and three script self-tests; every browser, page-build, and embedded-page Rust check still runs |
+| Rust-tool (`rs/agent-teams/src/ledger.rs`) | 40 | 24 | The crate's own Rust tests run via its component label instead of every crate's workspace tests |
+| Notes-only (`.minibeads/issues/agent-utils-725.md`) | 18 | 18 | Already hygiene-only; unchanged |
+
 ## Verification and after measurements
 
 Pending implementation and controlled runs. Full validation remains the

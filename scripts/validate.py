@@ -72,6 +72,7 @@ PACKAGES = "packages"
 PYTHON_PACKAGES = "python-packages"
 RUST_PACKAGES = "rust-packages"
 VIBE_TALK = "vibe-talk"
+VIBE_TALK_PAGE = "vibe-talk-page"
 TIMELINE_BROWSER = "timeline-browser"
 HYGIENE = "hygiene"
 
@@ -93,6 +94,7 @@ GROUPS: tuple[str, ...] = (
     RUST_PACKAGES,
     TIMELINE_BROWSER,
     VIBE_TALK,
+    VIBE_TALK_PAGE,
 )
 
 GROUP_LABELS: dict[str, str] = {
@@ -111,6 +113,7 @@ GROUP_LABELS: dict[str, str] = {
     RUST_PACKAGES: "validation-rust-packages",
     TIMELINE_BROWSER: "validation-timeline",
     VIBE_TALK: "validation-vibe-talk",
+    VIBE_TALK_PAGE: "validation-vibe-talk-page",
 }
 
 ALL_GROUPS: frozenset[str] = frozenset(GROUPS)
@@ -134,6 +137,7 @@ WHY: dict[str, str] = {
     PYTHON_PACKAGES: "Python packaging inputs or checks changed",
     RUST_PACKAGES: "Rust packaging inputs or checks changed",
     VIBE_TALK: "vibe-talk changed (it is outside the Rust workspace and has its own suite)",
+    VIBE_TALK_PAGE: "page assets changed: all browser, page, embedded-page Rust, and build checks",
     TIMELINE_BROWSER: (
         "the timeline's browser-facing assets or its browser suite changed; these drive a real"
         " Chromium and are the only checks that can see a rendering or interaction regression"
@@ -147,6 +151,9 @@ WHY: dict[str, str] = {
 
 #: Longest prefix wins, so `scripts/embed_userguides.py` beats the bare `scripts/` catch-all.
 PREFIX_RULES: tuple[tuple[str, frozenset[str]], ...] = (
+    # Page inputs cannot change Rust formatting/lints or the Python operator tools.
+    # Keep all Rust tests: several read page source or serve its embedded assets.
+    ("vibe-talk/web/", frozenset({VIBE_TALK_PAGE})),
     # The tool's own gate includes strict typing for its Python operator scripts. Keeping that
     # check beside the scripts means a one-line helper fix no longer drags in the unrelated Rust
     # and Python workspaces merely to reach the repository-wide mypy invocation.
@@ -188,18 +195,13 @@ PREFIX_RULES: tuple[tuple[str, frozenset[str]], ...] = (
     # `py/README.md.generated`, which `_rule_matches` prevents.
     ("py/README.md", frozenset({PYTHON_PACKAGES})),
     ("rs/README.md", frozenset({RUST_PACKAGES})),
-    # gh-paced is a Rust-only tool: it has no Python twin, no cross-language pair, and ships in no
-    # package. validation/components.json requires Python component tests, so it is routed here
-    # instead. Its crate tests carry the Rust workspace-tests label. It embeds its guides with
-    # include_str!, so a guide edit also rebuilds and tests the crate.
-    ("rs/gh-paced/", frozenset({RUST, RUST_WORKSPACE_TESTS})),
-    ("common/docs/gh-paced/", frozenset({DOCS, RUST, RUST_WORKSPACE_TESTS})),
-    # agent-usage is Rust-only for the same reasons as gh-paced, and embeds its guides the same way.
-    ("rs/agent-usage/", frozenset({RUST, RUST_WORKSPACE_TESTS})),
-    ("common/docs/agent-usage/", frozenset({DOCS, RUST, RUST_WORKSPACE_TESTS})),
-    # agent-teams is Rust-only for the same reasons, and embeds its guides the same way.
-    ("rs/agent-teams/", frozenset({RUST, RUST_WORKSPACE_TESTS})),
-    ("common/docs/agent-teams/", frozenset({DOCS, RUST, RUST_WORKSPACE_TESTS})),
+    # Rust-only components have crate-owned test labels, including embedded guide edits.
+    ("rs/gh-paced/", frozenset({RUST})),
+    ("common/docs/gh-paced/", frozenset({DOCS, RUST})),
+    ("rs/agent-usage/", frozenset({RUST})),
+    ("common/docs/agent-usage/", frozenset({DOCS, RUST})),
+    ("rs/agent-teams/", frozenset({RUST})),
+    ("common/docs/agent-teams/", frozenset({DOCS, RUST})),
     ("cross/", frozenset({CROSS})),
     ("common/docs/", frozenset({DOCS})),
     ("common/README.md", frozenset()),
@@ -873,7 +875,9 @@ def self_test() -> int:
             )
 
     expect(["vibe-talk/src/ops.rs"], {VIBE_TALK}, "a vibe-talk change must not drag in the workspace contract")
-    expect(["vibe-talk/web/voice.js", "vibe-talk/README.md"], {VIBE_TALK}, "vibe-talk docs are still vibe-talk")
+    expect(["vibe-talk/web/voice.js", "vibe-talk/README.md"], {VIBE_TALK, VIBE_TALK_PAGE}, "a page file plus a vibe-talk doc selects both the page group and the full vibe-talk group")
+    expect(["vibe-talk/web/src/present/card.js"], {VIBE_TALK_PAGE}, "a page-only change selects the page group, not the operator and formatting checks")
+    expect(["vibe-talk/web/voice.js", "rs/tick-hub/src/lib.rs"], {VIBE_TALK_PAGE, RUST}, "a cross-area change is the union of both areas", {"tick-hub"})
     expect(
         ["vibe-talk/scripts/smoke-agent.py"],
         {VIBE_TALK},
@@ -905,39 +909,45 @@ def self_test() -> int:
     )
     expect(
         ["rs/gh-paced/src/wrapper.rs"],
-        {RUST, RUST_WORKSPACE_TESTS},
+        {RUST},
         "the Rust-only gh-paced tool selects the Rust gate and the crate tests, not everything",
+        {"gh-paced"},
     )
     expect(
         ["common/docs/gh-paced/USER_GUIDE.md"],
-        {DOCS, RUST, RUST_WORKSPACE_TESTS},
+        {DOCS, RUST},
         "gh-paced compiles its guides into the binary, so a guide edit re-tests the crate",
+        {"gh-paced"},
     )
     expect(
         ["rs/agent-usage/src/burn.rs"],
-        {RUST, RUST_WORKSPACE_TESTS},
+        {RUST},
         "the Rust-only agent-usage tool selects the Rust gate and the crate tests, not everything",
+        {"agent-usage"},
     )
     expect(
         ["common/docs/agent-usage/USER_GUIDE.md"],
-        {DOCS, RUST, RUST_WORKSPACE_TESTS},
+        {DOCS, RUST},
         "agent-usage compiles its guides into the binary, so a guide edit re-tests the crate",
+        {"agent-usage"},
     )
     expect(
         ["rs/agent-teams/src/ledger.rs"],
-        {RUST, RUST_WORKSPACE_TESTS},
+        {RUST},
         "the Rust-only agent-teams tool selects the Rust gate and the crate tests, not everything",
+        {"agent-teams"},
     )
     expect(
         ["common/docs/agent-teams/USER_GUIDE.md"],
-        {DOCS, RUST, RUST_WORKSPACE_TESTS},
+        {DOCS, RUST},
         "agent-teams compiles its guides into the binary, so a guide edit re-tests the crate",
+        {"agent-teams"},
     )
     expect(
         ["skills/agentctl/SKILL.md"],
         {DOCS},
         "the bundled agentctl skill selects its owning component",
-        {"agentctl"},
+        {"agentctl", "agent-teams"},
     )
     expect(
         ["skills/herdr-run/SKILL.md"],

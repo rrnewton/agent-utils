@@ -72,8 +72,11 @@ DEFAULT_MANIFEST = REPO_ROOT / "validation" / "components.json"
 EXPECTED_COMPONENTS = frozenset(
     {
         "agentctl",
+        "agent-teams",
+        "agent-usage",
         "dagrun",
         "experiment-runner",
+        "gh-paced",
         "herdr-run",
         "local-ci-hub",
         "planner",
@@ -83,6 +86,8 @@ EXPECTED_COMPONENTS = frozenset(
         "wrkviz",
     }
 )
+
+RUST_ONLY_COMPONENTS = frozenset({"agent-teams", "agent-usage", "gh-paced"})
 
 
 class ManifestError(ValueError):
@@ -158,7 +163,10 @@ def _component(value: object, name: str) -> Component:
         f"components.{name}.reverse_dependencies",
         allow_empty=True,
     )
-    tests = _string_list(raw["test_files"], f"components.{name}.test_files", allow_empty=False)
+    tests = _string_list(
+        raw["test_files"], f"components.{name}.test_files",
+        allow_empty=name in RUST_ONLY_COMPONENTS,
+    )
     for index, prefix in enumerate(prefixes):
         _repo_relative_path(
             prefix,
@@ -430,7 +438,8 @@ def _exercise_inventory_guards(manifest: Manifest, discovered: frozenset[str]) -
         if "py/tests/new_test.py" not in actual:
             raise AssertionError("an untracked live test was absent from the inventory")
 
-    first_name = sorted(manifest.components)[0]
+    first_name = next(name for name in sorted(manifest.components)
+                      if manifest.components[name].test_files)
     first_component = manifest.components[first_name]
     first_test = first_component.test_files[0]
 
@@ -567,6 +576,9 @@ def _exercise_failure_identity() -> None:
 def _run_component(
     name: str, component: Component, shard: str | None, pytest_args: Sequence[str]
 ) -> int:
+    if not component.test_files:
+        print(f"component-tests: {name}: no Python tests; its Rust node owns the suite")
+        return 0
     test_files = [str((REPO_ROOT / path).relative_to(PY_ROOT)) for path in component.test_files]
     command = _pytest_command(
         ["-c", "pyproject.toml", "--rootdir=.", *pytest_args, *test_files], shard

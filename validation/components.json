@@ -1,6 +1,22 @@
 {
   "schema_version": 1,
   "components": {
+    "agent-teams": {
+      "source_prefixes": [
+        "common/docs/agent-teams/",
+        "rs/agent-teams/"
+      ],
+      "reverse_dependencies": [],
+      "test_files": []
+    },
+    "agent-usage": {
+      "source_prefixes": [
+        "common/docs/agent-usage/",
+        "rs/agent-usage/"
+      ],
+      "reverse_dependencies": [],
+      "test_files": []
+    },
     "agentctl": {
       "source_prefixes": [
         "common/docs/agent-harness/",
@@ -27,7 +43,9 @@
         "skills/agentctl/",
         "skills/herdr-agent/"
       ],
-      "reverse_dependencies": [],
+      "reverse_dependencies": [
+        "agent-teams"
+      ],
       "test_files": [
         "py/agentctl/foreign/tests/test_agent_runner.py",
         "py/agentctl/foreign/tests/test_backends.py",
@@ -160,6 +178,14 @@
         "py/tests/test_experiment_profile.py",
         "py/tests/test_wall_timeout_derivation.py"
       ]
+    },
+    "gh-paced": {
+      "source_prefixes": [
+        "common/docs/gh-paced/",
+        "rs/gh-paced/"
+      ],
+      "reverse_dependencies": [],
+      "test_files": []
     },
     "herdr-run": {
       "source_prefixes": [

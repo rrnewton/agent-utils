@@ -180,7 +180,7 @@ steps:
       RUST_TEST_THREADS=4 python3 scripts/case_timings.py run-cargo -- cargo test --release --no-fail-fast --manifest-path rs/Cargo.toml
       --target "$host_target" --target-dir rs/target/validation-tests -p gh-paced ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
-    labels: [validation-workspace, validation-rust-workspace-tests]
+    labels: [validation-workspace, validation-rust-workspace-tests, component-gh-paced]
     timeout: 600
     cpu_timeout: 1200
     hint: *rust_test_hint
@@ -193,7 +193,7 @@ steps:
       RUST_TEST_THREADS=1 python3 scripts/case_timings.py run-cargo -- cargo test --release --no-fail-fast --manifest-path rs/Cargo.toml
       --target "$host_target" --target-dir rs/target/validation-tests -p agent-usage ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
-    labels: [validation-workspace, validation-rust-workspace-tests]
+    labels: [validation-workspace, validation-rust-workspace-tests, component-agent-usage]
     timeout: 600
     cpu_timeout: 1200
     hint: *rust_test_hint
@@ -260,7 +260,7 @@ steps:
       RUST_TEST_THREADS=1 python3 scripts/case_timings.py run-cargo -- cargo test --release --no-fail-fast --manifest-path rs/Cargo.toml
       --target "$host_target" --target-dir rs/target/validation-tests -p agent-teams ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
-    labels: [validation-workspace, validation-rust-workspace-tests]
+    labels: [validation-workspace, validation-rust-workspace-tests, component-agent-teams]
     timeout: 600
     cpu_timeout: 1200
     hint: *rust_test_hint
