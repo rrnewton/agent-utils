@@ -39367,20 +39367,7 @@ let plainGapFrom = null;
 /** Without threads: whether the rows on screen were drawn from this device, and no read has landed since. */
 let plainSaved = false;
 
-/**
- * @typedef {object} HistoryReach
- * @property {number} total the messages loaded in the column being worked on, as the search counts them
- * @property {boolean} proven whether a stretch with no gaps is known; else only `total` may be said
- * @property {boolean} saved rows saved on this device that no read has checked since
- * @property {number} dense of `total`, those in the stretch with no gaps
- * @property {number} scattered of `total`, those older than the stretch, with messages unloaded between
- * @property {number | null} from when the stretch's oldest message was sent; with `saved`, the oldest's
- * @property {boolean} start the stretch reaches the view's first message (All: its first top-level one)
- * @property {boolean} whole every message of the view is loaded
- * @property {boolean} topLevel All in a channel with threads: the stretch is its top-level messages
- * @property {number} threads with `topLevel`, the threads started in the stretch that have replies
- * @property {number} full of those, the ones every reply of which is loaded
- */
+/** @typedef {import("./src/present/notices/index.ts").HistoryReach} HistoryReach */
 
 /**
  * What the column being worked on holds of its view, in the owner's terms: see the head of this section.
@@ -39443,40 +39430,6 @@ function historyReach() {
   }
   reach.whole = reach.start && reach.full === reach.threads;
   return reach;
-}
-
-/** "1 message", "82 messages". */
-const messagesWords = (count) => `${count} message${count === 1 ? "" : "s"}`;
-
-/** An instant inside a sentence, to the minute: "today, 3:14 PM", "Oct 3, 9:02 AM", as each row says its time. */
-function searchMomentWords(ms, clock = dayClock()) {
-  const at = new Date(ms);
-  return `${searchDayWords(dayKeyOf(at), clock)}, ${shortTimeFormat().format(at)}`;
-}
-
-/** ", back to Oct 3, 9:02 AM", or nothing for an instant not known. */
-const reachBackWords = (ms) => (ms === null ? "" : `, back to ${searchMomentWords(ms)}`);
-
-/**
- * The stretch `reach` proves, as a clause after its count: "a complete history back to Oct 26, 3:14 PM
- * (no gaps), plus 4 scattered older ones"; on All, "every top-level message back to …, and every reply
- * in 20 of their 31 threads". For a reach that is `proven`.
- *
- * @param {HistoryReach} reach
- */
-function reachClause(reach) {
-  const at = reach.from === null ? "" : searchMomentWords(reach.from);
-  const back = reach.start
-    ? `back to the first one${at ? ` (${at})` : ""}`
-    : `back to ${at || "the oldest loaded"} (no gaps)`;
-  const scattered = reach.scattered > 0
-    ? `, plus ${reach.scattered} scattered older one${reach.scattered === 1 ? "" : "s"}` : "";
-  if (!reach.topLevel) return `${reach.start ? "the complete history" : "a complete history"} ${back}${scattered}`;
-  const replies = reach.threads === 0 ? ""
-    : reach.full === reach.threads
-      ? `, and every reply in their ${reach.threads === 1 ? "thread" : `${reach.threads} threads`}`
-      : `, and every reply in ${reach.full} of their ${reach.threads} thread${reach.threads === 1 ? "" : "s"}`;
-  return `every top-level message ${back}${replies}${scattered}`;
 }
 
 /** The chat service the channel on screen is read from, as a sentence names it: "Slack", or "the chat service". */
@@ -39549,19 +39502,6 @@ function countSearchWalk(walk) {
   }
   walk.found = found;
   walk.arrived = arrived;
-}
-
-/**
- * What the control says while a walk fetches: how many older messages have come so far — "Fetching… 52
- * older messages · Stop" — and never a count of pages, which the reader has no notion of (`#578
- * search-status-clarity`). Short, as the control is one line on a phone; where they came from and how
- * far back they reach is the note's, when the walk ends (`searchWalkNote`).
- *
- * @param {{arrived: number}} walk
- */
-function searchWalkProgress(walk) {
-  return walk.arrived > 0
-    ? `Fetching… ${walk.arrived} older message${walk.arrived === 1 ? "" : "s"} · Stop` : "Fetching older messages… · Stop";
 }
 
 /**
@@ -46064,33 +46004,6 @@ async function markReadInService(channel, id) {
   } catch (error) {
     return { ...none, asked: true, why: readableFailure(error, service) };
   }
-}
-
-/**
- * The status line's words for a message marked read here, by what its chat service did
- * (`markReadInService`), with `also` — Shift+E's ", and collapsed" — said of the message after where
- * it was marked.
- *
- * @param {{service: string, marked: boolean, why: string}} mark
- * @param {string} [also]
- */
-function serviceReadWords(mark, also = "") {
-  if (mark.marked) return `Marked read here and in ${mark.service}${also}.`;
-  return `Marked read here, not in ${mark.service}${also}${mark.why ? `: ${mark.why}` : "."}`;
-}
-
-/**
- * `serviceReadWords` for a message that was Done here before Shift+E was pressed on it
- * (`readAndCollapse`): "already" said of here, and of the chat service only where the server answered
- * that its marker was through the message before it was asked. `#295 shift-e-read-collapse`.
- *
- * @param {{service: string, marked: boolean, already: boolean, why: string}} mark
- * @param {string} [also]
- */
-function doneReadWords(mark, also = "") {
-  if (mark.marked && mark.already) return `Already read here and in ${mark.service}${also}.`;
-  if (mark.marked) return `Already read here; now marked read in ${mark.service} too${also}.`;
-  return `Already read here, not in ${mark.service}${also}${mark.why ? `: ${mark.why}` : "."}`;
 }
 
 /**

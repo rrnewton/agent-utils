@@ -35,3 +35,19 @@ test("`#624 voice-page-modularity`: failures and the server's states in the read
   assert.equal(serverCacheLine({ ...off, enabled: true, reason: "locked" }), "On, but no file is open, so nothing is being saved: another process holds the file.");
   assert.equal(serverCacheErases({ ...off, available: true, messages: 2, bytes: 2048 }), "the 2 saved messages (2 KB)");
 });
+
+test("`#624 voice-page-modularity`: a search's reach and a message marked read, in the reader's words, from the module alone", () => {
+  const { messagesWords, reachClause, reachBackWords, searchWalkProgress, serviceReadWords, doneReadWords } = NOTICES;
+  assert.deepStrictEqual([messagesWords(1), messagesWords(82)], ["1 message", "82 messages"]);
+  assert.equal(reachBackWords(null), "");
+  const reach = { total: 9, proven: true, saved: false, dense: 5, scattered: 4, from: null, start: false, whole: false,
+    topLevel: false, threads: 0, full: 0 };
+  assert.equal(reachClause(reach), "a complete history back to the oldest loaded (no gaps), plus 4 scattered older ones");
+  assert.equal(reachClause({ ...reach, topLevel: true, start: true, scattered: 0, threads: 31, full: 20 }),
+    "every top-level message back to the first one, and every reply in 20 of their 31 threads");
+  assert.deepStrictEqual([searchWalkProgress({ arrived: 0 }), searchWalkProgress({ arrived: 52 })],
+    ["Fetching older messages… · Stop", "Fetching… 52 older messages · Stop"]);
+  assert.equal(serviceReadWords({ service: "Slack", marked: false, why: "no scope" }, ", and collapsed"),
+    "Marked read here, not in Slack, and collapsed: no scope");
+  assert.equal(doneReadWords({ service: "Slack", marked: true, already: true, why: "" }), "Already read here and in Slack.");
+});
