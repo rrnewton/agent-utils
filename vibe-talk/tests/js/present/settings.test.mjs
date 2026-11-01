@@ -124,3 +124,19 @@ test("`#19 channel-browser`, `#371 channel-search-hash`: what the channel browse
   assert.equal(directorySummary(shown({ entries: [1, 2], truncated: true }), "Slack"), "2 channels shown. The list stopped early, so search by name to find others.");
   assert.equal(directoryLabel(` ${"é".repeat(CHANNEL_LABEL_MAX + 5)}`).length, CHANNEL_LABEL_MAX - 1, "cut by characters, then trimmed");
 });
+
+test("`#348 settings-dynamic-lists`, `#351 settings-polish`: what Recently dismissed says about each send", () => {
+  const { dismissedSendMeta, dismissedRowLabel, dismissedListWords, dismissedRestoreLabel, DISMISSED_LABEL_CHARS } = SETTINGS;
+  const label = (id) => `#${id}`;
+  const held = (entry, ago = 0) => ({ at: Date.now() - ago, entry: { id: "o1", channel: "c1", text: "hello", ...entry } });
+  assert.equal(dismissedSendMeta(held({}), label), "#c1 · dismissed just now");
+  assert.equal(dismissedSendMeta(held({ replyTo: "m" }, 5 * 60000), label), "#c1 · Reply · dismissed 5m ago");
+  assert.equal(dismissedSendMeta(held({ threadId: "t" }, 3 * 3600000), label), "#c1 · Thread · dismissed 3h ago");
+  assert.equal(dismissedRowLabel(held({ text: "\n  \nfirst line\nsecond" }), label), "#c1 · dismissed just now: first line");
+  assert.ok(dismissedRowLabel(held({ text: "word ".repeat(100) }), label).length < 40 + DISMISSED_LABEL_CHARS, "a row is named by a line");
+  assert.equal(dismissedRowLabel(held({ text: "all of it", remaining: "it", postedCount: 1 }), label), "#c1 · dismissed just now: it",
+    "what a partial post left unsent");
+  assert.match(dismissedListWords(2), /^Messages you dismissed from the outbox unsent, kept on this device for \d+ days \(the newest \d+\)\./);
+  assert.match(dismissedListWords(0), /^Nothing dismissed in the last \d+ days\./);
+  assert.equal(dismissedRestoreLabel({ text: "bring  it\nback" }), "Put back “bring it back”");
+});

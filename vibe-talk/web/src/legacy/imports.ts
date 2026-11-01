@@ -43,7 +43,6 @@ export {
 } from "../core/sync/index.ts";
 export {
   DISMISSED_SENDS_DAYS,
-  DISMISSED_SENDS_LIMIT,
   OWN_POST_GRACE_MS,
   SENT_RECEIPT_MS,
   createChannelDrafts,
@@ -114,4 +113,11 @@ export const VibeTalkContract = Object.freeze({ roots, is, decode, decodeTagged 
 export { createVoiceCall, createVoiceTranscript, createReadAloud } from "../view/voice/index.ts";
 
 export { HELP_TOPICS } from "../present/settings/index.ts";
-export { mountChannelDirectory, mountChannelHistory, mountHelpFolds, mountSettingsFolds, mountUpstreamClear } from "../view/settings/index.ts";
+export {
+  mountChannelDirectory,
+  mountChannelHistory,
+  mountDismissedSends,
+  mountHelpFolds,
+  mountSettingsFolds,
+  mountUpstreamClear,
+} from "../view/settings/index.ts";

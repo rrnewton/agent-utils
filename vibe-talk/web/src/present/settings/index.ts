@@ -44,3 +44,5 @@ export {
   directoryWaitWords,
 } from "./directory.ts";
 export type { DirectoryEntry, DirectoryFailure } from "./directory.ts";
+export { DISMISSED_LABEL_CHARS, dismissedListWords, dismissedRestoreLabel, dismissedRowLabel, dismissedSendMeta } from "./dismissed.ts";
+export type { DismissedEntry } from "./dismissed.ts";

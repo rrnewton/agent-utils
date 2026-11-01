@@ -2452,7 +2452,7 @@ test("`#351 settings-polish`: Put back from the pop-out gives the focus to the r
   }
   // The negative control: a page that leaves the focus in the pop-out it has just hidden, on nothing
   // drawn, which a browser hands to the body.
-  const blind = await dismissedPageOf(["first", "second"], brokenScript("  focusDismissedAt(at);\n", ""));
+  const blind = await dismissedPageOf(["first", "second"], await brokenModule([{ file: "src/view/settings/dismissed.ts", find: "      focusDismissedAt(at);\n", replace: "" }]));
   await (await putBackOf(blind, dismissedItems(blind)[0])).click();
   await blind.settle();
   assert.equal(blind.el("dismissed-send-popout").hidden, true);
@@ -2517,10 +2517,10 @@ test("`#351 settings-polish`: the pop-out is a modal: marked so, the page behind
   await page.settle();
   assert.deepStrictEqual(inertIds(page), ["settings-screen"], "Put back gave back more, or less, than the pop-out took");
   // The negative controls: a pop-out that makes nothing inert, and one that does not keep Tab.
-  const open = await dismissedPageOf(["a message"], brokenScript("inert: inertAround(popout) }", "inert: [] }"));
+  const open = await dismissedPageOf(["a message"], await brokenModule([{ file: "src/view/settings/dismissed.ts", find: "inert: inertAround(popout) }", replace: "inert: [] }" }]));
   await dismissedOpenerOf(dismissedItems(open)[0]).click();
   assert.equal(inertNow(open.el("fold-dismissed")), false, "the negative control made the page inert anyway, so the check above proves nothing");
-  const loose = await dismissedPageOf(["a message"], brokenScript('document.addEventListener("keydown", trapDismissedTab);\n', ""));
+  const loose = await dismissedPageOf(["a message"], brokenScript('document.addEventListener("keydown", (event) => dismissedSendsView.trapTab(event));\n', ""));
   await dismissedOpenerOf(dismissedItems(loose)[0]).click();
   await press(loose, loose.el("dismissed-send-close"), "Tab");
   assert.equal(focused(loose), loose.el("dismissed-send-close"), "the negative control kept Tab anyway, so the check above proves nothing");
@@ -2585,7 +2585,7 @@ test("`#351 settings-polish`: what the pop-out makes inert beyond the box its sh
   await dismissedOpenerOf(dismissedItems(open)[0]).click();
   assert.deepStrictEqual(underDimIds(open), [], "something was dimmed where the shadow already covers it");
   // The negative control: a pop-out that makes the top bar inert and leaves it bright, as before.
-  const bright = await framedDismissedPage(brokenScript('      if (beyond && !floatsOverDimBox(beside)) beside.setAttribute("data-under-dim", "");\n', ""));
+  const bright = await framedDismissedPage(await brokenModule([{ file: "src/view/settings/dismissed.ts", find: '      if (beyond && !floatsOverDimBox(beside)) beside.setAttribute("data-under-dim", "");\n', replace: "" }]));
   await dismissedOpenerOf(dismissedItems(bright)[0]).click();
   assert.equal(bright.el("topbar").hasAttribute("inert"), true, "the negative control's top bar is not inert");
   assert.deepStrictEqual(underDimIds(bright), [], "the negative control dimmed the top bar anyway, so the check above proves nothing");
@@ -2623,7 +2623,7 @@ test("`#351 settings-polish`: the status pill, floating over Settings' box, is l
   await page.el("dismissed-send-close").click();
   assert.equal(page.el("status-line").hasAttribute("inert"), false, "Close did not give the pill back");
   // The negative control: a pop-out that dims everything beyond its box, the pill included, as before.
-  const twice = await framedDismissedPage(brokenScript("if (beyond && !floatsOverDimBox(beside))", "if (beyond)"));
+  const twice = await framedDismissedPage(await brokenModule([{ file: "src/view/settings/dismissed.ts", find: "if (beyond && !floatsOverDimBox(beside))", replace: "if (beyond)" }]));
   await dismissedOpenerOf(dismissedItems(twice)[0]).click();
   assert.equal(twice.el("status-line").hasAttribute("data-under-dim"), true,
     "the negative control left the pill to the shadow anyway, so the check above proves nothing");
@@ -2645,7 +2645,7 @@ test("`#351 settings-polish`: a row of Recently dismissed is named by its place,
     `a one-line message's row is named by ${nameOf(single).length} characters`);
   assert.match(single.text(), /to the end$/);
   // The negative control: a row with no name of its own is named by everything in it.
-  const blind = await dismissedPageOf([lines], brokenScript('    open.setAttribute("aria-label", dismissedRowLabel(held));\n', ""));
+  const blind = await dismissedPageOf([lines], await brokenModule([{ file: "src/view/settings/dismissed.ts", find: '        opener.setAttribute("aria-label", dismissedRowLabel(held, deps.channelLabel));\n', replace: "" }]));
   assert.match(nameOf(dismissedItems(blind)[0]), /the second line/, "the negative control's row is named by one line anyway, so the check above proves nothing");
 });
 

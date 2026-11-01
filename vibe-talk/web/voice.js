@@ -1068,7 +1068,7 @@ function closeOpenMenu(name) {
     el("prompts-open").focus();
     return true;
   }
-  if (name === "menu:dismissed" && !el("dismissed-send-popout").hidden) return closeDismissedSend();
+  if (name === "menu:dismissed" && !el("dismissed-send-popout").hidden) return dismissedSendsView.close();
   return false;
 }
 
@@ -2458,7 +2458,7 @@ function showScreen(name) {
     voiceTranscript().disarmClear();
   }
   // `#348 settings-dynamic-lists`. The pop-out over Recently dismissed is Settings', and goes with it.
-  if (name !== "settings") closeDismissedSend(false);
+  if (name !== "settings") dismissedSendsView.close(false);
   // Help is reached FROM settings and returns TO it, so it must not become the thing settings
   // remembers to go back to — that would make the gear's way out lead into the document the
   // reader just left. `#85 voice-desktop-review`.
@@ -2505,7 +2505,7 @@ function showScreen(name) {
   // `#303 voice-post-prefix`. Another device may have saved or reset the tag since sign-in.
   if (name === "settings" && previous !== "settings") refreshVoicePostPrefix();
   // `#193 compose-draft-loss`. Its ages and channel names as they are now, and none past its days.
-  if (name === "settings" && previous !== "settings") renderDismissedSends();
+  if (name === "settings" && previous !== "settings") dismissedSendsView.render();
   // `#402 who-is-who-channel-box`. Who is who in the box's channel, as the census stands now.
   if (name === "settings" && previous !== "settings") renderIdentityRows();
   if (name !== previous || focusLost()) settleFocus();
@@ -2542,7 +2542,7 @@ function closeSettings() {
  */
 const settingsFolds = mountSettingsFolds({
   lookup: (id) => el(id),
-  closeDismissed: () => closeDismissedSend(false),
+  closeDismissed: () => dismissedSendsView.close(false),
 });
 
 /**
@@ -2739,11 +2739,8 @@ const unseenColumnReplies = { main: null, side: null };
 /** How long the Undo chip offers to take a Dismiss back. */
 const SEND_UNDO_MS = 15000;
 // How much of a message a control quotes to name it is web/src/core/outbox's (`sendSnippet`).
-/**
- * `#351 settings-polish`. How much of a message's first line names its row in Recently dismissed to a
- * screen reader (`dismissedRowLabel`): a line, not a paragraph.
- */
-const DISMISSED_LABEL_CHARS = 120;
+// How much of a message's first line names its row in Recently dismissed to a screen reader is
+// web/src/present/settings's (`DISMISSED_LABEL_CHARS`, `#624 voice-page-modularity`).
 const CHANNEL_DRAFT_REFUSED = "This browser could not save the draft. Keep this page open until you send it.";
 /**
  * The sends dismissed from the outbox, newest first, each with when it was dismissed, and the device's
@@ -2758,12 +2755,22 @@ const dismissedSends = createDismissedSends({
   decode: (saved) => outgoingFromSaved(saved),
 });
 /**
- * `#348 settings-dynamic-lists`. The dismissed send the pop-out over Recently dismissed shows, and the row that opened it, which takes the focus back.
- * `inert` is what the pop-out made inert behind it while it is up, and dimmed where its shadow does not reach (`#351 settings-polish`, `inertAround`, `dimBoxOf`).
+ * `#348 settings-dynamic-lists`. Settings' Recently dismissed and the pop-out over it, with the dismissed
+ * send the pop-out shows (web/src/view/settings `mountDismissedSends`, `#624 voice-page-modularity`).
+ * Made here, beside the sends it lists; its wiring is under "the pop-out over Recently dismissed".
  *
- * @type {{id: string, opener: HTMLElement | null, inert: Element[]} | null}
+ * @type {import("./src/view/settings/index.ts").DismissedSendsView}
  */
-let dismissedPopout = null;
+const dismissedSendsView = mountDismissedSends({
+  lookup: (id) => el(id),
+  store: () => dismissedSends,
+  channelLabel: (id) => channelLabel(id),
+  styled: (tag, className, text) => styled(tag, className, text),
+  writeClipboard: (text) => writeClipboardText(text),
+  copyRefused: () => COPY_REFUSED,
+  putBack: (id) => putBackDismissedSend(id),
+  scheduleBackSync: () => scheduleBackSync(),
+});
 /**
  * `#443 undo-key-general`. The order undoable acts were done in, for the one undo key to take the
  * newest back first. Every offer an Undo chip makes is stamped from this as it is made — a Done
@@ -19994,7 +20001,7 @@ function dismissOutgoingMessage(id) {
   if (sendUndo) clearTimeout(sendUndo.timer);
   sendUndo = { id, hold, at: nextUndoAt(), timer: setTimeout(endSendUndo, SEND_UNDO_MS) };
   renderSendUndo();
-  renderDismissedSends();
+  dismissedSendsView.render();
   setStatus(kept
     ? "Dismissed. Undo it, or find it in Settings."
     : "Dismissed. This browser could not keep a copy, so Undo works only until this page is reloaded.");
@@ -20039,7 +20046,7 @@ function putBackDismissedSend(id) {
   dismissedSends.remove(held);
   if (sendUndo && sendUndo.id === id) endSendUndo();
   renderOutgoingEverywhere();
-  renderDismissedSends();
+  dismissedSendsView.render();
   if (!entry) return;
   setStatus(entry.channel === String(selectedChannelId())
     ? `Put back: “${sendSnippet(unsentText(entry))}”.`
@@ -20050,7 +20057,7 @@ function putBackDismissedSend(id) {
 function forgetDismissedSends() {
   dismissedSends.clear();
   endSendUndo();
-  renderDismissedSends();
+  dismissedSendsView.render();
   setStatus("Forgot the dismissed messages.");
 }
 
@@ -20059,69 +20066,8 @@ function loadDismissedSends() {
   dismissedSends.load();
 }
 
-/** Where a dismissed send was going, and how long ago it was dismissed, as one line. */
-function dismissedSendMeta(held) {
-  const entry = held.entry;
-  const age = briefAge(held.at);
-  const when = age === "now" ? "just now" : `${age} ago`;
-  return [channelLabel(entry.channel), entry.replyTo ? "Reply" : entry.threadId ? "Thread" : "", `dismissed ${when}`]
-    .filter(Boolean).join(" · ");
-}
-
-/**
- * What a row of Recently dismissed is called to a screen reader: its place and age, and the first line
- * of its text, cut to DISMISSED_LABEL_CHARS.
- *
- * `#351 settings-polish`. A button is named by everything inside it unless it is given a name, and the
- * row holds the whole message, for find-in-page: so each row passed read a whole message out, where the
- * eye sees one line. The pop-out the row opens is where the whole message is read.
- */
-function dismissedRowLabel(held) {
-  const first = String(unsentText(held.entry)).split("\n").find((line) => line.trim()) || "";
-  return [dismissedSendMeta(held), sendSnippet(first, DISMISSED_LABEL_CHARS)].filter(Boolean).join(": ");
-}
-
-/**
- * Settings' Recently dismissed: each send's place, its age and the first line of its text.
- *
- * `#348 settings-dynamic-lists`. A data panel rather than a column of cards with a Put back on each:
- * a row is one button, its two lines the place and age and the text, cut to one line by the stylesheet
- * (the whole text is still in the row, for find-in-page), and it opens the pop-out where the whole
- * message is, with Copy and Put back (`openDismissedSend`). A screen reader is told the row's name,
- * `dismissedRowLabel`, rather than everything in it.
- */
-function renderDismissedSends() {
-  dismissedSends.prune();
-  const items = dismissedSends.list().map((held) => {
-    const entry = held.entry;
-    const item = document.createElement("li");
-    item.className = "dismissed-send";
-    const open = document.createElement("button");
-    open.className = "dismissed-send-open";
-    open.setAttribute("type", "button");
-    open.setAttribute("aria-haspopup", "dialog");
-    open.setAttribute("aria-controls", "dismissed-send-popout");
-    open.setAttribute("data-outgoing-id", String(entry.id));
-    open.setAttribute("aria-label", dismissedRowLabel(held));
-    open.addEventListener("click", () => openDismissedSend(entry.id, open));
-    open.append(
-      styled("span", "dismissed-send-meta", dismissedSendMeta(held)),
-      styled("span", "dismissed-send-text", unsentText(entry))
-    );
-    item.append(open);
-    return item;
-  });
-  el("dismissed-sends").replaceChildren(...items);
-  el("dismissed-sends").hidden = items.length === 0;
-  el("forget-dismissed-sends").hidden = items.length === 0;
-  el("dismissed-sends-state").textContent = items.length
-    ? `Messages you dismissed from the outbox unsent, kept on this device for ${DISMISSED_SENDS_DAYS} days ` +
-      `(the newest ${DISMISSED_SENDS_LIMIT}). Open one to read it whole, copy it or put it back.`
-    : `Nothing dismissed in the last ${DISMISSED_SENDS_DAYS} days. A message you dismiss from the ` +
-      "outbox unsent is kept here that long, in case you want it back.";
-  // The pop-out is about one of them: gone from the list, it goes too.
-  if (dismissedPopout && !dismissedSends.find(dismissedPopout.id)) closeDismissedSend(false);
-}
+// Settings' Recently dismissed, each send's place, age and first line, is drawn by
+// web/src/view/settings (`dismissedSendsView.render`, `#624 voice-page-modularity`).
 
 // --- the pop-out over Recently dismissed ----------------------------------------------------------
 //
@@ -20144,160 +20090,12 @@ function renderDismissedSends() {
 // drawn over everything, its buttons included when it stands at the foot of the screen where the pill
 // is.
 
-/** The pop-out's Tab stops, in order: the message, Copy, Put back and Close. */
-const DISMISSED_POPOUT_STOPS = ["dismissed-send-popout-text", "dismissed-send-copy", "dismissed-send-restore", "dismissed-send-close"];
-
-/** The values of `overflow` that clip what overflows a box, a shadow drawn inside it included. */
-const CLIPPING_OVERFLOW = new Set(["auto", "scroll", "hidden", "clip"]);
-
-/**
- * The box `node`'s dim is drawn in: the nearest element around it that clips its overflow, or the
- * body. The dim is a shadow, and a shadow is overflow like any other, so on Settings it ends at the
- * edges of the scrolling #screen-settings and is not drawn over the top bar or the dock.
- * `#351 settings-polish`.
- *
- * @param {Element} node
- * @returns {Element}
- */
-function dimBoxOf(node) {
-  if (typeof window.getComputedStyle !== "function") return document.body;
-  for (let at = /** @type {Element | null} */ (node.parentNode); at && at !== document.body; at = /** @type {Element | null} */ (at.parentNode)) {
-    const style = window.getComputedStyle(at);
-    if (CLIPPING_OVERFLOW.has(style.overflowX) || CLIPPING_OVERFLOW.has(style.overflowY)) return at;
-  }
-  return document.body;
-}
-
-/**
- * Whether `node`, beside the box the pop-out's dim is drawn in or beside an element around that box,
- * floats over the box rather than standing next to it: taken out of the flow (`position: absolute`),
- * as the status pill is over the foot of the screens (`#63 status-line-placement`). What stays in the
- * flow there, the top bar, the error line, the dock, is laid out beside the box, where the shadow
- * cannot reach. What floats over it is drawn under the pop-out, whose z-index is above the frame's
- * overlays (web/voice.css), and so under its shadow already. `#351 settings-polish`.
- *
- * @param {Element} node
- * @returns {boolean}
- */
-function floatsOverDimBox(node) {
-  return typeof window.getComputedStyle === "function" && window.getComputedStyle(node).position === "absolute";
-}
-
-/**
- * Make everything on the page but `node` inert: each element beside it, and beside every element
- * around it, up to the body. Returns what it made inert, for the close to give back; an element
- * already inert is left as it was, to whatever made it so.
- *
- * `#351 settings-polish`. What it makes inert beyond the box `node`'s dim is drawn in (`dimBoxOf`),
- * laid out beside that box, is marked `data-under-dim` too, and web/voice.css dims it by the shadow's
- * own depth: a control nothing can reach is never left looking as if it could be pressed. What floats
- * over the box (`floatsOverDimBox`) is left to the shadow, which dims it already.
- *
- * @param {Element} node
- * @returns {Element[]}
- */
-function inertAround(node) {
-  /** @type {Element[]} */
-  const made = [];
-  const box = dimBoxOf(node);
-  let beyond = false;
-  for (let at = node; at !== document.body && at.parentNode; at = /** @type {Element} */ (at.parentNode)) {
-    // From the dim's own box outwards, what stands beside is out of the shadow's reach, unless it
-    // floats over the box, under the pop-out and its shadow.
-    if (at === box) beyond = true;
-    for (const beside of /** @type {Element} */ (at.parentNode).children) {
-      if (beside === at || beside.hasAttribute("inert")) continue;
-      beside.setAttribute("inert", "");
-      if (beyond && !floatsOverDimBox(beside)) beside.setAttribute("data-under-dim", "");
-      made.push(beside);
-    }
-  }
-  return made;
-}
-
-/** Open the pop-out on the dismissed send `id`, from the row `opener`. */
-function openDismissedSend(id, opener) {
-  const held = dismissedSends.find(id);
-  if (!held) return;
-  // One at a time: what the one before made inert is given back before this one makes its own.
-  closeDismissedSend(false);
-  el("dismissed-send-popout-meta").textContent = dismissedSendMeta(held);
-  el("dismissed-send-popout-text").textContent = unsentText(held.entry);
-  el("dismissed-send-restore").setAttribute("aria-label", `Put back “${sendSnippet(unsentText(held.entry))}”`);
-  el("dismissed-send-popout-state").textContent = "";
-  const popout = el("dismissed-send-popout");
-  popout.hidden = false;
-  // What it makes inert beyond the box its shadow is drawn in, and beside that box, is dimmed where it is.
-  dismissedPopout = { id, opener, inert: inertAround(popout) };
-  // Laid over its group, which may stand partly below the screen's edge: brought on screen whole.
-  if (typeof popout.scrollIntoView === "function") popout.scrollIntoView({ block: "nearest" });
-  el("dismissed-send-copy").focus({ preventScroll: true });
-  scheduleBackSync();
-}
-
-/** Close the pop-out, giving the focus back to the row that opened it when `refocus` and it is still there. */
-function closeDismissedSend(refocus = true) {
-  if (!dismissedPopout) return false;
-  const { opener, inert } = dismissedPopout;
-  dismissedPopout = null;
-  // The page behind it back first: an inert element cannot take the focus.
-  for (const node of inert) {
-    node.removeAttribute("inert");
-    node.removeAttribute("data-under-dim");
-  }
-  el("dismissed-send-popout").hidden = true;
-  if (refocus && opener && opener.parentNode && typeof opener.focus === "function") opener.focus({ preventScroll: true });
-  scheduleBackSync();
-  return true;
-}
-
-/**
- * Tab and Shift+Tab while the pop-out is up: round its own stops, from the last to the first and the
- * first to the last, and from anywhere outside them (the page, after a tap on the dim) to its first or
- * last. A key the page has already taken, or one held with Ctrl, Alt or Cmd, is left alone.
- *
- * @param {KeyboardEvent} event
- */
-function trapDismissedTab(event) {
-  if (!dismissedPopout || !event || event.key !== "Tab" || event.defaultPrevented ||
-      event.ctrlKey || event.altKey || event.metaKey) return;
-  const stops = DISMISSED_POPOUT_STOPS.map((id) => el(id));
-  const at = stops.indexOf(/** @type {HTMLElement} */ (document.activeElement));
-  if (at !== -1 && at !== (event.shiftKey ? 0 : stops.length - 1)) return;
-  event.preventDefault();
-  stops[event.shiftKey ? stops.length - 1 : 0].focus();
-}
-document.addEventListener("keydown", trapDismissedTab);
-
-/**
- * After Put back: the focus on the row that took the place of the one put back (`at` in the list),
- * else on the list, else on the line that says it is empty. `#351 settings-polish`. The row that
- * opened the pop-out went with its message, and the focus with it, to nowhere.
- *
- * @param {number} at
- */
-function focusDismissedAt(at) {
-  const list = el("dismissed-sends");
-  const item = at >= 0 ? list.children[at] : undefined;
-  const row = item ? /** @type {HTMLElement | null} */ (item.firstChild) : null;
-  (row || (list.hidden ? el("dismissed-sends-state") : list)).focus();
-}
-
-el("dismissed-send-close").addEventListener("click", () => closeDismissedSend());
-el("dismissed-send-copy").addEventListener("click", async () => {
-  const held = dismissedPopout && dismissedSends.find(dismissedPopout.id);
-  if (!held) return;
-  const copied = await writeClipboardText(unsentText(held.entry));
-  el("dismissed-send-popout-state").textContent = copied ? "Copied the whole message." : COPY_REFUSED;
-});
-el("dismissed-send-restore").addEventListener("click", () => {
-  if (!dismissedPopout) return;
-  const id = dismissedPopout.id;
-  const at = dismissedSends.list().findIndex((held) => held.entry.id === id);
-  closeDismissedSend(false);
-  putBackDismissedSend(id);
-  focusDismissedAt(at);
-});
+// The pop-out, its dim and its trap are web/src/view/settings's (`dismissedSendsView`, `#624
+// voice-page-modularity`); it is listened to here, where it always was.
+document.addEventListener("keydown", (event) => dismissedSendsView.trapTab(event));
+el("dismissed-send-close").addEventListener("click", () => dismissedSendsView.close());
+el("dismissed-send-copy").addEventListener("click", () => dismissedSendsView.copy());
+el("dismissed-send-restore").addEventListener("click", () => dismissedSendsView.restore());
 
 async function sendChannelMessage() {
   const key = composerState().key;
@@ -40622,7 +40420,7 @@ loadOwnPosts();
 loadOutgoingMessages();
 // `#193 compose-draft-loss`. What was dismissed from the outbox in the last days, for Settings.
 loadDismissedSends();
-renderDismissedSends();
+dismissedSendsView.render();
 el("undo-send-dismiss").addEventListener("click", () => {
   if (sendUndo) putBackDismissedSend(sendUndo.id);
 });

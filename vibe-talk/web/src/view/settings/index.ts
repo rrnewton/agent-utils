@@ -11,3 +11,5 @@ export { mountUpstreamClear } from "./upstream.ts";
 export type { UpstreamClearBox, UpstreamClearDependencies } from "./upstream.ts";
 export { mountChannelDirectory } from "./directory.ts";
 export type { ChannelDirectory, ChannelDirectoryDependencies } from "./directory.ts";
+export { mountDismissedSends } from "./dismissed.ts";
+export type { DismissedSendsView, DismissedSendsViewDependencies } from "./dismissed.ts";
