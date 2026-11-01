@@ -65,3 +65,27 @@ test("`read-chunk-balance`: a paragraph's sentences are cut into balanced pieces
   assert.deepEqual(balance([60, 1, 60], false), [1, 1, 1]);
   assert.deepEqual(balance([], true), []);
 });
+
+test("`#624 voice-page-modularity`: audio as bytes, and a read cut for a device voice, from the module alone", () => {
+  const { downsampleTo, floatToPcm16, joinBytes, wavLayout, browserSpeechChunks, BROWSER_SPEECH_CHUNK_CHARS } = SPEECH_PIECES;
+  assert.deepStrictEqual([...downsampleTo(new Float32Array([0, 0.5, 1, 0.5]), 4, 2)], [0, 1]);
+  assert.deepStrictEqual([...floatToPcm16(new Float32Array([-2, -1, 0, 1, 2]))], [-32768, -32768, 0, 32767, 32767]);
+  assert.deepStrictEqual([...joinBytes(new Uint8Array([1]), new Uint8Array([2, 3]))], [1, 2, 3]);
+  // A minimal 16-bit PCM WAV header: RIFF, WAVE, a fmt chunk, then data.
+  const header = new Uint8Array(44);
+  const view = new DataView(header.buffer);
+  [..."RIFF"].forEach((c, i) => (header[i] = c.charCodeAt(0)));
+  [..."WAVEfmt "].forEach((c, i) => (header[8 + i] = c.charCodeAt(0)));
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, 24000, true);
+  view.setUint16(34, 16, true);
+  [..."data"].forEach((c, i) => (header[36 + i] = c.charCodeAt(0)));
+  assert.deepStrictEqual(wavLayout(header), { channels: 1, rate: 24000, dataAt: 44 });
+  assert.equal(wavLayout(header.subarray(0, 30)), null, "a header not yet whole was read");
+  const long = `${"A sentence that is long enough to stand. ".repeat(10)}`;
+  const chunks = browserSpeechChunks(long);
+  assert.ok(chunks.length > 1 && chunks.every((chunk) => [...chunk].length <= BROWSER_SPEECH_CHUNK_CHARS));
+  assert.equal(chunks.join(" "), long.trim());
+});

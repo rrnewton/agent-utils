@@ -18,13 +18,19 @@ export {
 } from "../core/search/index.ts";
 export {
   READ_RECOVERY_WAITS_MS,
+  browserSpeechChunks,
   createPreparedSpeech,
+  downsampleTo,
+  floatToPcm16,
+  joinBytes,
   readPieces,
   recoveryWait,
   sentenceEnds,
+  speechElapsedMs,
   speechSegments,
   ticketEnded,
   ticketTooShortForBlocks,
+  wavLayout,
 } from "../core/speech/index.ts";
 export { SLOW_WORDS, createApi, isSlowFailure, providerWords, readableFailure } from "../core/api/index.ts";
 export {
