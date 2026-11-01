@@ -93,6 +93,7 @@ pub mod probe;
 pub mod providers;
 pub mod read_ahead;
 pub mod read_reason;
+pub mod recap;
 pub mod recent;
 pub mod recent_view;
 pub mod relist;

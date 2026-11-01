@@ -240,6 +240,12 @@ fn inventory() -> Vec<Route> {
         ),
         route("GET", "/api/v1/channels/{channel_id}/digest", Read, limit),
         route(
+            "GET",
+            "/api/v1/channels/{channel_id}/recap",
+            Read,
+            Query("?hours=2", "?hours=soon"),
+        ),
+        route(
             "POST",
             "/api/v1/channels/{channel_id}/resolve",
             Read,

@@ -5288,6 +5288,40 @@ What a line never contains:
 A refused request is logged as loudly as an accepted one, including a request to a path that does
 not exist — a client pointed at the wrong URL is exactly the case this log exists to catch.
 
+## Catching up: `vibe-talk recap`
+
+The owner marks messages Done as reading progress. After a day away, an agent asked "what did I
+miss?" needs the window *and* that progress: repeating what the owner already read wastes the
+recap, and burying what they have not read defeats it.
+
+```sh
+vibe-talk recap                      # the last 24 hours, every channel the read token sees
+vibe-talk recap --hours 12 --channel "lead team"
+vibe-talk recap --since 2026-10-30 --json
+```
+
+Run it where the server runs, with the server's `--config` and environment, exactly like
+`pair-link`: it reads the READ token from the same configuration (never printing it), reaches
+the server on its bind address, and prints markdown — oldest first, grouped by thread, times in
+ET (America/New_York). The header names the window, the channel's read-mark time, and the DONE /
+UNREAD counts. Each message carries its permalink (or a short id), ET time, sender, DONE or
+UNREAD tag, and text. A thread that started before the window opens with its start line and the
+count of earlier replies hidden, then its root and first two replies tagged CONTEXT, then only
+the replies inside the window. `--max-chars` (default 24000, 0 for none) shrinks DONE messages
+to one line first and never cuts UNREAD text. `--json` prints the same data structured. The
+footer reminds the reading agent not to repeat DONE content unless its status changed later in
+the window. See `vibe-talk recap --help` for every option, and the `vibe-talk-recap` skill for
+how an agent reports from it.
+
+What DONE means here: the per-message mark behind Done/Undo on the page
+(`POST /api/v1/channels/{id}/dismiss` and `/restore`), this server's own record. It is per
+message, never per thread — a root and each reply are marked independently, a reply's mark held
+under its parent channel's id. The per-channel read mark is secondary: shown in the header,
+never used to tag a message. Messages the owner's noise rules call read are counted in the
+header and not listed. The route behind it, `GET /api/v1/channels/{id}/recap`, is read-scope
+and writes nothing; with no durable store configured it still answers, with every message
+UNREAD and no read mark.
+
 ## The API
 
 All `/api/` routes require `Authorization: Bearer <token>`. The two live-adapter routes use their
@@ -5342,6 +5376,7 @@ link or existing strong pairing code is accepted; links for a different server a
 | GET | `/api/v1/channels/{id}/page?limit=&before=&since=&until=&hours=&render=&reason=` | read | **one step of a walk**, saying that it is one; `render=html` adds each message's `content_html`, which the page asks for and the voice agent's `read_page` does not; optional `reason=` says what the read is for, for the access log and the upstream profile only (`remote-ops-audit`), as on the next two routes |
 | GET | `/api/v1/channels/{id}/timeline?view=&thread_id=&limit=&before=&after=&reason=` | read | main channel, thread list, flattened history, or one thread; opaque backward cursor, or `after=` for what changed since a newest read: `400 cursor_mismatch` for a cursor from another channel, view or thread, `410 cursor_expired` for one the backend can no longer continue — read the newest page again (`#203 incremental-refresh`) |
 | GET | `/api/v1/channels/{id}/count?since=&hours=&cap=` | read | a bounded, honest count |
+| GET | `/api/v1/channels/{id}/recap?since_ms=&until_ms=&hours=` | read | a window of the whole history, thread replies included, grouped by thread with each message's Done tag and the channel's read mark — the route behind `vibe-talk recap`; see [Catching up](#catching-up-vibe-talk-recap) |
 | POST | `/api/v1/channels/{id}/resolve` | read | **semantic random access** |
 | POST | `/api/v1/channels/{id}/reply` | **write** | `{text, thread_id?, reply_to?, idempotency_key?}` — post to the channel or selected thread; quoting a message is optional. A post longer than the channel's provider takes in one message is cut into parts; one to the channel itself continues in the first part's thread where the provider threads a long message (Google Chat, Slack) and as consecutive messages on Discord (`#263 post-split-per-provider`). A split post that fails part-way answers `207` with `{posted, unsent, retryable, resumable, thread_id?}`, where `thread_id` names the thread `unsent` belongs in — send it there, and without `reply_to` when that is not the request's own thread; `idempotency_key` (1–64 of `A-Z a-z 0-9 - _`) names the post across attempts, and where client-config reports `idempotent_posts_supported` the same key and text are posted at most once (`#195 send-resilience`). Whatever the provider, this server also remembers each keyed post by its key for 24 hours, in memory and, once it landed, in the store, so across a restart too (`#448 send-dedupe`, `#471 replication-c5-post-keys`): a repeat with the same key, channel and text is answered with that post's own `200`, or its `207` when it landed in part, and posts nothing, even if its `thread_id` or `reply_to` changed since; a repeat that arrives while the first is still posting waits for it; the unsent rest of a `207`, sent under its key to the thread the `207` named, is the one other post a key may name; any other reuse of a key answers `409 key_reused` and posts nothing. A post that certainly posted nothing, or whose first part's answer was lost with nothing confirmed after it and which a read of its destination does not find (`#465 replication-c6-op-key-marker`), is not remembered, so sending it again is a fresh attempt (and in the second case may post that part twice, unless the provider honours the key itself); the same words under a new key are a new post. `unsent` is the request's own text when nothing posted; `resumable` says whether sending `unsent` again repeats the failed part under the same words and key, which a split code block can prevent. Posts to one destination — the channel, or one thread — are made one at a time, in the order they arrive, a long post's parts together; a post whose caller disconnects still holds its destination until the provider answers or its request timeout gives up (`#277 send-order`) |
 | POST | `/api/v1/channels/{id}/reply/outcome?wait=` | **write** | the reply's own body, `idempotency_key` required — what became of that post, posting nothing (`#448 send-dedupe`): `200` or `207` as the reply answered, `202 {state: "posting", posted, parts}` while it is still being posted after waiting up to `wait` seconds (at most 25, default 0), or `404 post_unknown` when this server has no record of it, which proves nothing either way. The page asks it after a send whose answer was lost and, every two seconds, while a send is slow, to say which part is going |

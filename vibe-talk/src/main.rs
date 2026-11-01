@@ -37,6 +37,7 @@ vibe-talk — a chat bridge for a voice agent
 USAGE:
     vibe-talk [--config PATH] [--config-overlay PATH]... [--fake-discord] [--skip-startup-probe]
     vibe-talk pair-link [--config PATH] [--config-overlay PATH]... [--base-url URL] [--ttl SECONDS]
+    vibe-talk recap [--config PATH] [--hours N | --since WHEN] [--channel NAME] [--json]
     vibe-talk cache-stats PATH
 
 COMMANDS:
@@ -44,6 +45,10 @@ COMMANDS:
     pair-link             print a one-time link, good for five minutes, that signs a phone in to
                           the server running on this host. Never prints the token. See
                           `vibe-talk pair-link --help`
+    recap                 print a window of chat history from the running server, oldest first,
+                          grouped by thread, each message tagged DONE or UNREAD (what the owner
+                          has marked read), for an agent catching the owner up. Uses the READ
+                          token. See `vibe-talk recap --help`
     cache-stats PATH      print, as JSON, what the message cache file at PATH holds and what its
                           storage costs: bytes on disk, per table and index, and per message; and
                           for each channel its messages, replies, text bytes, the span of days
@@ -337,6 +342,7 @@ async fn main() -> anyhow::Result<()> {
     let mut argv = std::env::args().skip(1);
     match argv.next().as_deref() {
         Some("pair-link") => return pair_link(argv).await,
+        Some("recap") => return recap(argv).await,
         Some("cache-stats") => return cache_stats(argv),
         _ => {}
     }
@@ -1072,6 +1078,25 @@ async fn pair_link(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
     println!("{}", link.link);
     println!("expires {}", link.expires_at);
     eprintln!("{}", vibe_talk::pair_link::SEND_WARNING);
+    Ok(())
+}
+
+/// `vibe-talk recap`. `#717 vt-unread-recap`.
+///
+/// Standard output carries the recap and nothing else; diagnostics go to standard error.
+async fn recap(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(log_in_colour(&std::io::stderr()))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .init();
+    let Some(options) = vibe_talk::recap::parse(args)? else {
+        return Ok(());
+    };
+    println!("{}", vibe_talk::recap::run(options).await?);
     Ok(())
 }
 

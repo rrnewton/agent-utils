@@ -6550,6 +6550,264 @@ pub fn reply_dismissals(
     })
 }
 
+// --- the recap: a window labelled with what the owner has read --------------------------------
+//
+// `#717 vt-unread-recap`. Read scope, and writes nothing: `own_read::settle` only answers *as
+// if* for a read-scope caller. Done is per message, never per thread — a root and each reply
+// carry independent marks under the parent channel's id, which is exactly the dismissal set
+// read here.
+
+/// The most in-window messages one recap carries.
+pub const MAX_RECAP_MESSAGES: usize = 2_000;
+
+/// The most timeline pages one recap (or one thread-opening walk) reads.
+pub const MAX_RECAP_PAGES: usize = 50;
+
+/// The most pre-window threads whose opening one recap fetches.
+pub const MAX_RECAP_CONTEXT_THREADS: usize = 25;
+
+/// One channel's recap over the half-open window `since_ms <= created < until_ms`.
+///
+/// The flat timeline is walked backwards from now inside the window; the walk, not the span,
+/// is bounded ([`MAX_RECAP_PAGES`], [`MAX_RECAP_MESSAGES`], and `truncated` says when the
+/// bound cut the window), so `--since` an event months ago still answers. Noise is counted
+/// and left out, as in [`digest`]. Each remaining message is tagged from the channel's
+/// dismissal set, and a thread whose root predates the window gets its opening fetched: the
+/// root plus its first [`crate::recap::CONTEXT_REPLIES`] replies before the window, with the
+/// count of the replies still hidden. A store that is not configured annotates nothing —
+/// every message UNREAD, no read mark — rather than refusing, because the window itself is
+/// the answer.
+///
+/// # Errors
+///
+/// [`OpError::UnknownChannel`] outside the allowlist, [`OpError::InvalidRange`] for an empty
+/// window, [`OpError::Chat`] when a timeline read fails, or [`OpError::Store`] when a
+/// configured store cannot be read.
+pub async fn recap(
+    state: &AppState,
+    caller: crate::auth::Scope,
+    channel_id: &str,
+    since_ms: i64,
+    until_ms: i64,
+) -> Result<crate::recap::RecapResponse, OpError> {
+    use crate::threads::{TimelineRequest, TimelineView};
+    let channel = allowed(state, channel_id).await?;
+    if until_ms <= since_ms {
+        return Err(OpError::InvalidRange);
+    }
+    let in_window = |message: &Message| {
+        message
+            .created_ms()
+            .is_some_and(|ms| ms >= since_ms && ms < until_ms)
+    };
+    // The flat timeline walked backwards. A backend with no thread timelines refuses it; such
+    // a channel has no thread replies to interleave, so its own messages are the whole window
+    // and the `/page` range walk answers instead.
+    let flat = async {
+        let mut held: Vec<Message> = Vec::new();
+        let mut before: Option<String> = None;
+        let mut truncated = false;
+        for _ in 0..MAX_RECAP_PAGES {
+            let request = TimelineRequest {
+                view: TimelineView::Flat,
+                thread_id: None,
+                before: before.clone(),
+                after: None,
+                limit: MAX_PAGE,
+            };
+            let (_, page) = timeline(state, caller, channel_id, &request).await?;
+            if page.messages.is_empty() {
+                break;
+            }
+            let reached_start = page
+                .messages
+                .iter()
+                .filter_map(Message::created_ms)
+                .min()
+                .is_some_and(|oldest| oldest < since_ms);
+            held.extend(page.messages.into_iter().filter(in_window));
+            if held.len() >= MAX_RECAP_MESSAGES {
+                truncated = true;
+                break;
+            }
+            if !page.has_more || reached_start {
+                break;
+            }
+            match page.next_before {
+                Some(next) => before = Some(next),
+                None => break,
+            }
+        }
+        Ok::<_, OpError>((held, truncated))
+    };
+    let (mut held, truncated) = match flat.await {
+        Ok(done) => done,
+        Err(OpError::Chat(error))
+            if matches!(error.cause(), crate::chat::ChatError::Refused(_)) =>
+        {
+            let mut held: Vec<Message> = Vec::new();
+            let mut truncated = false;
+            let mut since_arg = crate::clock::iso_from_ms(since_ms);
+            let until_arg = crate::clock::iso_from_ms(until_ms);
+            for _ in 0..MAX_RECAP_PAGES {
+                let step = page(
+                    state,
+                    caller,
+                    channel_id,
+                    PageRequest {
+                        limit: Some(MAX_PAGE),
+                        before: None,
+                        since: Some(&since_arg),
+                        until: Some(&until_arg),
+                        hours: None,
+                    },
+                )
+                .await?;
+                held.extend(step.messages);
+                if held.len() >= MAX_RECAP_MESSAGES {
+                    truncated = true;
+                    break;
+                }
+                if !step.has_more {
+                    break;
+                }
+                match step.next_since {
+                    Some(next) => since_arg = next,
+                    None => break,
+                }
+            }
+            (held, truncated)
+        }
+        Err(error) => return Err(error),
+    };
+    held.sort_by_key(|message| (message.created_ms().unwrap_or(i64::MAX), message.id.clone()));
+    held.dedup_by(|next, kept| next.id == kept.id);
+    let noise = held.iter().filter(|message| message.noise).count();
+    let visible: Vec<Message> = held.into_iter().filter(|message| !message.noise).collect();
+    let own = crate::own_read::settle(state, caller, &channel.id, &visible).await;
+    let mut dismissed: std::collections::HashSet<MessageId> =
+        match state.store.dismissals(&channel.id).await {
+            Ok(ids) => ids.into_iter().collect(),
+            Err(crate::store::StoreError::Unavailable(_)) => std::collections::HashSet::new(),
+            Err(error) => return Err(error.into()),
+        };
+    dismissed.extend(own);
+    let read_mark = match state.store.read_mark(&channel.id).await {
+        Ok(mark) => mark.map(|mark| crate::recap::RecapReadMark {
+            last_read: mark.last_read,
+            marked_at_ms: mark.marked_at_ms,
+        }),
+        Err(crate::store::StoreError::Unavailable(_)) => None,
+        Err(error) => return Err(error.into()),
+    };
+    // The openings of threads whose root predates the window.
+    let mut threads: Vec<String> = Vec::new();
+    for message in &visible {
+        if let Some(thread) = &message.thread {
+            if !threads.contains(&thread.id) {
+                threads.push(thread.id.clone());
+            }
+        }
+    }
+    let mut contexts: std::collections::BTreeMap<String, crate::recap::ThreadContext> =
+        std::collections::BTreeMap::new();
+    for thread_id in threads.iter().take(MAX_RECAP_CONTEXT_THREADS) {
+        let has_root = visible.iter().any(|message| {
+            message
+                .thread
+                .as_ref()
+                .is_some_and(|thread| thread.id == *thread_id && thread.is_root)
+        });
+        if has_root {
+            continue;
+        }
+        let mut all: Vec<Message> = Vec::new();
+        let mut before: Option<String> = None;
+        let mut walk_truncated = false;
+        for _ in 0..MAX_RECAP_PAGES {
+            let request = TimelineRequest {
+                view: TimelineView::Thread,
+                thread_id: Some(thread_id.clone()),
+                before: before.clone(),
+                after: None,
+                limit: MAX_PAGE,
+            };
+            // A backend that refuses thread reads leaves the group without its opening.
+            let (_, page) = match timeline(state, caller, channel_id, &request).await {
+                Ok(done) => done,
+                Err(OpError::Chat(error))
+                    if matches!(error.cause(), crate::chat::ChatError::Refused(_)) =>
+                {
+                    all.clear();
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
+            let has_more = page.has_more;
+            all.extend(page.messages);
+            if !has_more {
+                break;
+            }
+            match page.next_before {
+                Some(next) => before = Some(next),
+                None => {
+                    walk_truncated = true;
+                    break;
+                }
+            }
+        }
+        all.sort_by_key(|message| (message.created_ms().unwrap_or(i64::MAX), message.id.clone()));
+        all.dedup_by(|next, kept| next.id == kept.id);
+        let Some(root) = all.first().cloned() else {
+            continue;
+        };
+        let before_window: Vec<Message> = all
+            .iter()
+            .skip(1)
+            .filter(|message| message.created_ms().is_some_and(|ms| ms < since_ms))
+            .cloned()
+            .collect();
+        let opening: Vec<Message> = before_window
+            .iter()
+            .take(crate::recap::CONTEXT_REPLIES)
+            .cloned()
+            .collect();
+        let hidden_before = if walk_truncated {
+            None
+        } else {
+            Some(before_window.len().saturating_sub(opening.len()))
+        };
+        contexts.insert(
+            thread_id.clone(),
+            crate::recap::ThreadContext {
+                root: Some(root),
+                opening,
+                hidden_before,
+                truncated: walk_truncated,
+            },
+        );
+    }
+    let done = visible
+        .iter()
+        .filter(|message| dismissed.contains(&message.id))
+        .count();
+    let counts = crate::recap::RecapCounts {
+        done,
+        unread: visible.len() - done,
+        noise,
+    };
+    let groups = crate::recap::group_window(visible, &dismissed, &contexts);
+    Ok(crate::recap::RecapResponse {
+        channel,
+        window: crate::recap::RecapWindow { since_ms, until_ms },
+        read_mark,
+        counts,
+        truncated,
+        groups,
+        untrusted_content_notice: crate::untrusted::NOTICE.to_owned(),
+    })
+}
+
 /// What one dismissal or one restoration did.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct InboxChange {

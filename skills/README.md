@@ -34,6 +34,9 @@ copying its manual.
 
 - `herdr-run` — run an allowlisted command in a Herdr pane, outside whatever constrains the
   caller; a sandboxed agent's blocked `git` is one case, not the definition.
+- `vibe-talk-recap` — write a catch-up recap of vibe-talk chat from `vibe-talk recap`,
+  reporting what changed unread, what is in flight, and what awaits the owner's decision,
+  without repeating what the owner already marked Done.
 - `tick-hub` — evaluate recurring reminders and health checks from one scheduled tick.
 - `dagrun` — schedule a dependency graph under CPU, memory, and named-resource limits.
 - `cpuset-alloc` — reserve disjoint host CPU sets with stale-owner reclamation.

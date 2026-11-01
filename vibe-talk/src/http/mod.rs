@@ -287,6 +287,8 @@ fn routes(state: AppState) -> Router {
         )
         .route("/api/v1/search", get(api::search_all))
         .route("/api/v1/channels/{channel_id}/count", get(api::count))
+        // `#717 vt-unread-recap`. READ scope: a window grouped by thread with Done tags.
+        .route("/api/v1/channels/{channel_id}/recap", get(api::recap))
         .route("/api/v1/channels/{channel_id}/digest", get(api::digest))
         .route("/api/v1/channels/{channel_id}/resolve", post(api::resolve))
         .route("/api/v1/channels/{channel_id}/reply", post(api::reply))

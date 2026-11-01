@@ -156,6 +156,9 @@ mod provider_diagnostics_ids;
 #[path = "range_reads.rs"]
 mod range_reads;
 
+#[path = "recap.rs"]
+mod recap;
+
 #[path = "read_ahead.rs"]
 mod read_ahead;
 

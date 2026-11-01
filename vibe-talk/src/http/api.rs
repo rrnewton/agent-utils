@@ -2369,6 +2369,40 @@ pub async fn timeline(
     })))
 }
 
+/// Query parameters for a recap. `#717 vt-unread-recap`.
+#[derive(Debug, Default, Deserialize)]
+pub struct RecapQuery {
+    /// Start of the window, inclusive, in milliseconds since the Unix epoch.
+    pub since_ms: Option<i64>,
+    /// End of the window, exclusive, in milliseconds since the Unix epoch. Default: now.
+    pub until_ms: Option<i64>,
+    /// The window of this many hours to now. Stands alone, as on `/page`.
+    pub hours: Option<u64>,
+}
+
+/// `GET /api/v1/channels/{channel_id}/recap` — a window of the channel's whole history, thread
+/// replies included, oldest first and grouped by thread, every message tagged with the owner's
+/// per-message Done state. READ scope; see [`ops::recap`].
+pub async fn recap(
+    State(state): State<AppState>,
+    ReadScope(caller): ReadScope,
+    Path(channel_id): Path<String>,
+    Query(query): Query<RecapQuery>,
+) -> Result<Response, ApiError> {
+    let until_ms = query.until_ms.unwrap_or_else(ops::now_ms);
+    let since_ms = match (query.hours, query.since_ms) {
+        (Some(hours), None) => ops::hours_before(hours, until_ms)?,
+        (None, Some(since)) => since,
+        _ => {
+            return Err(ApiError::bad_request(
+                "give since_ms (until_ms optional), or hours alone",
+            ))
+        }
+    };
+    let response = ops::recap(&state, caller, &channel_id, since_ms, until_ms).await?;
+    Ok(no_store(Json(response)))
+}
+
 /// Query parameters for a bounded count.
 #[derive(Debug, Default, Deserialize)]
 pub struct CountQuery {

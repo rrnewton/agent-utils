@@ -542,6 +542,12 @@ against the live vendor — so if the agent still asks whether you are there dur
 is the open question and not a misconfiguration. Either way the call is still billed while muted:
 the meter runs on the conversation being open, not on anyone speaking.
 
+To catch up after time away without a call, `vibe-talk recap` (on the server's host, with the
+server's `--config` and environment) prints the last 24 hours of every channel, oldest first,
+grouped by thread, each message tagged DONE or UNREAD by what you have marked read — so an
+agent recapping for you can skip what you already read. See `vibe-talk recap --help` and the
+README's "Catching up" section.
+
 Conversation costs roughly $0.01/minute on ElevenLabs, and everything the read tools return —
 your channel text — transits ElevenLabs and whatever model is behind it. That is inherent to
 using a hosted voice agent, and it is worth knowing before you point it at a private channel.
