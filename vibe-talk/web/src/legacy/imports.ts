@@ -18,7 +18,10 @@ export {
 } from "../core/search/index.ts";
 export {
   READ_RECOVERY_WAITS_MS,
+  SPEECH_HOLD_CAP_MS_DEFAULT,
+  SPEECH_HOLD_DBFS_DEFAULT,
   browserSpeechChunks,
+  bufferDbfs,
   createPreparedSpeech,
   downsampleTo,
   floatToPcm16,
@@ -27,6 +30,7 @@ export {
   recoveryWait,
   sentenceEnds,
   speechElapsedMs,
+  speechHoldFrom,
   speechSegments,
   ticketEnded,
   ticketTooShortForBlocks,

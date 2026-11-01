@@ -338,3 +338,7 @@ declare const floatToPcm16: LegacyImports["floatToPcm16"];
 declare const joinBytes: LegacyImports["joinBytes"];
 declare const speechElapsedMs: LegacyImports["speechElapsedMs"];
 declare const wavLayout: LegacyImports["wavLayout"];
+declare const SPEECH_HOLD_CAP_MS_DEFAULT: LegacyImports["SPEECH_HOLD_CAP_MS_DEFAULT"];
+declare const SPEECH_HOLD_DBFS_DEFAULT: LegacyImports["SPEECH_HOLD_DBFS_DEFAULT"];
+declare const bufferDbfs: LegacyImports["bufferDbfs"];
+declare const speechHoldFrom: LegacyImports["speechHoldFrom"];

@@ -8843,10 +8843,10 @@ const ANSWER_PLAYED_GRACE_MS = 600;
 // — a relayed chat message, the page's word on a send card — waits, never longer than the server's
 // cap, so road noise above the level cannot keep a relay from ever going. The reader's own typed
 // words are not held: he chose to send them.
-
-/** The level and cap when the server names none, as the server's own defaults are. */
-const SPEECH_HOLD_DBFS_DEFAULT = -42;
-const SPEECH_HOLD_CAP_MS_DEFAULT = 20000;
+//
+// The level and cap when the server names none (SPEECH_HOLD_DBFS_DEFAULT, SPEECH_HOLD_CAP_MS_DEFAULT),
+// reading the server's (speechHoldFrom) and one capture buffer's level (bufferDbfs) are in
+// web/src/core/speech/ (`#624 voice-page-modularity`).
 
 /**
  * How long one capture buffer at or above the level keeps the owner "speaking": the pause between two
@@ -8867,35 +8867,6 @@ const SPEECH_HOLD_RECHECK_MS = 250;
  * @type {{levelDbfs: number, capMs: number}}
  */
 let speechHold = { levelDbfs: SPEECH_HOLD_DBFS_DEFAULT, capMs: SPEECH_HOLD_CAP_MS_DEFAULT };
-
-/**
- * The hold client-config names, or this page's defaults where it names none or something unusable.
- *
- * @param {unknown} named client-config's `speech_hold`
- * @returns {{levelDbfs: number, capMs: number}}
- */
-function speechHoldFrom(named) {
-  const given = named && typeof named === "object" ? /** @type {{level_dbfs?: unknown, cap_ms?: unknown}} */ (named) : {};
-  const level = Number(given.level_dbfs);
-  const cap = Number(given.cap_ms);
-  return {
-    levelDbfs: Number.isFinite(level) ? Math.min(0, level) : SPEECH_HOLD_DBFS_DEFAULT,
-    capMs: Number.isFinite(cap) && cap >= 0 ? Math.min(cap, 600000) : SPEECH_HOLD_CAP_MS_DEFAULT,
-  };
-}
-
-/**
- * One capture buffer's level, in dBFS: the RMS of its samples against full scale. -Infinity for
- * silence.
- *
- * @param {Float32Array} samples
- */
-function bufferDbfs(samples) {
-  let sum = 0;
-  for (let at = 0; at < samples.length; at += 1) sum += samples[at] * samples[at];
-  const rms = samples.length > 0 ? Math.sqrt(sum / samples.length) : 0;
-  return rms > 0 ? 20 * Math.log10(rms) : -Infinity;
-}
 
 /**
  * A capture buffer arrived: note when the microphone last heard the owner at or above the level.

@@ -89,3 +89,16 @@ test("`#624 voice-page-modularity`: audio as bytes, and a read cut for a device 
   assert.ok(chunks.length > 1 && chunks.every((chunk) => [...chunk].length <= BROWSER_SPEECH_CHUNK_CHARS));
   assert.equal(chunks.join(" "), long.trim());
 });
+
+test("`#624 voice-page-modularity`: the speech hold reads the server's level and cap, keeps its defaults for anything unusable, and measures a buffer in dBFS", () => {
+  const { speechHoldFrom, bufferDbfs, SPEECH_HOLD_DBFS_DEFAULT, SPEECH_HOLD_CAP_MS_DEFAULT } = SPEECH_PIECES;
+  const defaults = { levelDbfs: SPEECH_HOLD_DBFS_DEFAULT, capMs: SPEECH_HOLD_CAP_MS_DEFAULT };
+  assert.deepStrictEqual({ ...speechHoldFrom(null) }, defaults);
+  assert.deepStrictEqual({ ...speechHoldFrom({ level_dbfs: "loud", cap_ms: -1 }) }, defaults);
+  assert.deepStrictEqual({ ...speechHoldFrom({ level_dbfs: -30, cap_ms: 0 }) }, { levelDbfs: -30, capMs: 0 }, "a cap of 0 means never wait");
+  assert.deepStrictEqual({ ...speechHoldFrom({ level_dbfs: 6, cap_ms: 9e9 }) }, { levelDbfs: 0, capMs: 600000 });
+  assert.equal(bufferDbfs(new Float32Array(4)), -Infinity);
+  assert.equal(bufferDbfs(new Float32Array(0)), -Infinity);
+  assert.equal(bufferDbfs(new Float32Array([1, -1, 1, -1])), 0);
+  assert.ok(Math.abs(bufferDbfs(new Float32Array([0.1, -0.1])) + 20) < 1e-5, "a tenth of full scale is -20 dBFS (to float32 precision)");
+});
