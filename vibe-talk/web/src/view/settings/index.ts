@@ -13,3 +13,5 @@ export { mountChannelDirectory } from "./directory.ts";
 export type { ChannelDirectory, ChannelDirectoryDependencies } from "./directory.ts";
 export { mountDismissedSends } from "./dismissed.ts";
 export type { DismissedSendsView, DismissedSendsViewDependencies } from "./dismissed.ts";
+export { mountServerCache } from "./cache.ts";
+export type { ServerCache, ServerCacheDependencies } from "./cache.ts";

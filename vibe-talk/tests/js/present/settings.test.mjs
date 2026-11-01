@@ -140,3 +140,21 @@ test("`#348 settings-dynamic-lists`, `#351 settings-polish`: what Recently dismi
   assert.match(dismissedListWords(0), /^Nothing dismissed in the last \d+ days\./);
   assert.equal(dismissedRestoreLabel({ text: "bring  it\nback" }), "Put back “bring it back”");
 });
+
+test("`#208 persistent-cache`, `#595 cache-full-history`: what the server's message cache group says", () => {
+  const { SERVER_CACHE_ASK, SERVER_CACHE_SENDING, serverCacheKeepsWords, serverCacheUnconfirmed, serverHoldsWholeHistory } = SETTINGS;
+  const status = (history, fields = {}) => ({ available: true, enabled: true, max_days: 30, history, ...fields });
+  assert.equal(serverHoldsWholeHistory(null), false);
+  assert.equal(serverHoldsWholeHistory(status({ mode: "full", channels: 2, complete: 2 })), true);
+  assert.equal(serverHoldsWholeHistory(status({ mode: "full", channels: 2, complete: 1 })), false, "one channel still gathering");
+  assert.equal(serverHoldsWholeHistory(status({ mode: "full", channels: 0, complete: 0 })), false);
+  assert.equal(serverHoldsWholeHistory(status({ mode: "recent", channels: 2, complete: 2 })), false);
+  assert.equal(serverHoldsWholeHistory(status({ mode: "full", channels: 2, complete: 2 }, { available: false })), false);
+  assert.equal(serverCacheKeepsWords(status(null, { max_days: 1 })), "1 day");
+  assert.equal(serverCacheKeepsWords(status(null, { max_days: 30 })), "30 days");
+  assert.equal(serverCacheKeepsWords(status(null, { max_days: 65535 })), "their whole history");
+  assert.deepStrictEqual(Object.keys(SERVER_CACHE_SENDING), ["on", "off", "erase"]);
+  assert.equal(SERVER_CACHE_ASK.off.ask("12 messages"), "Turn saving off and erase 12 messages now?");
+  assert.equal(SERVER_CACHE_ASK.erase.ask("12 messages"), "Erase 12 messages now? Saving carries on in an empty file.");
+  assert.equal(serverCacheUnconfirmed("store_unavailable"), "The server did not confirm that: store_unavailable");
+});

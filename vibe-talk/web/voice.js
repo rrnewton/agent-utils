@@ -5566,7 +5566,7 @@ function searchEmptySentence(loaded) {
   }
   // `#595 cache-full-history`. When the browser's own search finds nothing, that the server holds
   // every message of the channel is worth saying: a search there would be complete.
-  if (serverHoldsWholeHistory()) {
+  if (serverCacheBox.holdsWholeHistory()) {
     said += " This server holds the complete history of this channel, which this search does not reach yet.";
   }
   // Main holds a thread's first message and nothing of the rest, and the cards on the right, or All,
@@ -25801,7 +25801,7 @@ let serverSearch = {
 let serverSearchTimer = null;
 
 /** Whether the server keeps a copy this page may search: an open cache, and not the read-only token. */
-const serverCopyOpen = () => Boolean(serverCache && serverCache.available) && tokenScope !== "read";
+const serverCopyOpen = () => serverCacheBox.open() && tokenScope !== "read";
 
 /** What identifies the server's search wanted now, or "" for none. */
 function serverSearchKeyNow() {
@@ -30415,156 +30415,19 @@ function renderAfterHandOver() {
 //     configuration turns the cache off — the operator's word wins — and the line says why.
 
 /**
- * The status as the server last reported it, or null when it reports none.
+ * The group, its question and its requests, and the status the server last reported, which search and
+ * the channel box read (web/src/view/settings `mountServerCache`, in the words of
+ * web/src/present/settings, `#624 voice-page-modularity`).
  *
- * @type {VibeTalk.MessageCacheStatus | null}
+ * @type {import("./src/view/settings/index.ts").ServerCache}
  */
-let serverCache = null;
-
-/** What is on its way to the server — "on", "off" or "erase" — or null, so a second press cannot race it. */
-let serverCacheSending = null;
-
-/** The erasing act the owner is being asked about — "off" or "erase" — or null. */
-let serverCacheAsking = null;
-
-/** What the line says while a request is out. */
-const SERVER_CACHE_SENDING = {
-  on: "Turning it on…",
-  off: "Turning it off and erasing its file…",
-  erase: "Erasing its file…",
-};
-
-/** The question before each erasing act, and its two buttons. */
-const SERVER_CACHE_ASK = {
-  off: {
-    ask: (what) => `Turn saving off and erase ${what} now?`,
-    yes: "Turn off and erase",
-    no: "Keep saving",
-  },
-  erase: {
-    ask: (what) => `Erase ${what} now? Saving carries on in an empty file.`,
-    yes: "Erase now",
-    no: "Keep them",
-  },
-};
-
-/**
- * Whether the server says it holds every message of every channel it caches back to its beginning,
- * so of the one on screen too. The status counts channels and never names one, so a server still
- * gathering one channel says this of none. `#595 cache-full-history`.
- */
-function serverHoldsWholeHistory() {
-  const history = serverCache && serverCache.available ? serverCache.history : null;
-  return Boolean(history && history.mode === "full" && history.channels > 0 &&
-    history.complete === history.channels);
-}
-
-/**
- * Take down what client-config said: the status, or null when it carries none.
- *
- * @param {VibeTalk.MessageCacheStatus | null | undefined} status
- */
-function applyServerCache(status) {
-  serverCache = status && typeof status.enabled === "boolean" ? status : null;
-  serverCacheAsking = null;
-  renderServerCache();
-  // `#602 history-settings-and-limits`. The channel box's history follows whether a file is open.
-  channelHistoryBox.render();
-}
-
-/**
- * Draw the group, the limits in its help entry, and any question, from `serverCache`. `note` leads
- * the line: what a request just did, or why it did not.
- */
-function renderServerCache(note = "") {
-  const shown = serverCache !== null && tokenScope === "write";
-  el("message-cache-group").hidden = !shown;
-  el("help-message-cache").hidden = !shown;
-  // `#351 settings-polish`. As in `renderAgentLink`: the group's fold counts for Expand all only shown.
-  settingsFolds.renderAll();
-  if (!shown) {
-    serverCacheAsking = null;
-    el("message-cache-confirm").hidden = true;
-    return;
-  }
-  const status = serverCache;
-  el("message-cache-help-days").textContent =
-    status.max_days === SERVER_CACHE_NO_AGE_LIMIT ? "their whole history" : nounCount(status.max_days, "day");
-  el("message-cache-help-megabytes").textContent = `${status.max_megabytes} MB`;
-  const busy = serverCacheSending !== null;
-  const box = el("message-cache-enabled");
-  // Ticked while the server says it is on, the question about turning it off included: nothing has
-  // changed until the owner answers.
-  box.checked = status.enabled;
-  box.disabled = busy || status.reason === "config_disabled";
-  el("message-cache-erase").disabled = busy || !status.available;
-  const line = busy ? SERVER_CACHE_SENDING[serverCacheSending] : serverCacheLine(status);
-  el("message-cache-state").textContent = note ? `${note} ${line}` : line;
-  const asking = busy ? null : serverCacheAsking;
-  el("message-cache-confirm").hidden = asking === null;
-  // While a question is up its own two buttons are the way on; a third that erases would blur it.
-  el("message-cache-erase").hidden = asking !== null;
-  if (asking !== null) {
-    const words = SERVER_CACHE_ASK[asking];
-    el("message-cache-confirm-text").textContent = words.ask(serverCacheErases(status));
-    el("message-cache-confirm-yes").textContent = words.yes;
-    el("message-cache-confirm-no").textContent = words.no;
-  }
-}
-
-/** Ask before an act that erases the file, and wait for the answer at the safe button. */
-function askServerCache(act) {
-  if (serverCache === null || serverCacheSending !== null) return;
-  if (act === "erase" && !serverCache.available) return;
-  serverCacheAsking = act;
-  renderServerCache();
-  el("message-cache-confirm-no").focus();
-}
-
-/** The switch, as the owner's finger left it: on sends at once, off asks first. */
-async function serverCacheSwitched() {
-  if (serverCache === null) return;
-  if (el("message-cache-enabled").checked) {
-    serverCacheAsking = null;
-    await sendServerCache("on");
-    return;
-  }
-  askServerCache("off");
-}
-
-/** The answer to the question: its own button sends; Keep sends nothing and goes back where it asked. */
-async function answerServerCache(yes) {
-  const act = serverCacheAsking;
-  serverCacheAsking = null;
-  if (!yes || act === null) {
-    renderServerCache();
-    el(act === "erase" ? "message-cache-erase" : "message-cache-enabled").focus();
-    return;
-  }
-  await sendServerCache(act);
-}
-
-/** Send one switch, then draw what the server says it LEFT; on failure, what it last said, and why. */
-async function sendServerCache(act) {
-  if (serverCacheSending !== null) return;
-  serverCacheSending = act;
-  renderServerCache();
-  let status = null;
-  try {
-    status = await apiDecoded(
-      "MessageCacheStatus",
-      "/api/v1/message-cache",
-      act === "erase" ? { method: "DELETE" } : { method: "PUT", body: { enabled: act === "on" } }
-    );
-  } catch (error) {
-    serverCacheSending = null;
-    renderServerCache(`The server did not confirm that: ${error.detail || error.message}`);
-    return;
-  }
-  serverCacheSending = null;
-  serverCache = status;
-  renderServerCache(act === "erase" ? "Erased." : "");
-}
+const serverCacheBox = mountServerCache({
+  lookup: (id) => el(id),
+  decoded: (type, path, options) => apiDecoded(type, path, options),
+  writable: () => tokenScope === "write",
+  renderFolds: () => settingsFolds.renderAll(),
+  renderHistory: () => channelHistoryBox.render(),
+});
 
 // --- replying to a channel message -------------------------------------------------------------
 //
@@ -39070,7 +38933,7 @@ const channelHistoryBox = mountChannelHistory({
   decoded: (type, path, options) => apiDecoded(type, path, options),
   allChannelsChosen: () => allChannelsChosen(),
   knownChannel: (id) => knownChannel(id),
-  cacheOpen: () => Boolean(serverCache && serverCache.available),
+  cacheOpen: () => serverCacheBox.open(),
   writable: () => tokenScope === "write",
   setTimeout: (run, ms) => setTimeout(run, ms),
   clearTimeout: (timer) => clearTimeout(timer),
@@ -39382,7 +39245,7 @@ function applyClientConfig(config) {
   // `#303 voice-post-prefix`. After `tokenScope` too, for the same reason.
   applyVoicePostPrefix(config.voice_post_prefix);
   // `#208 persistent-cache`. After `tokenScope` as well: only a write token is shown the group.
-  applyServerCache(config.message_cache);
+  serverCacheBox.apply(config.message_cache);
   // `#427 server-thread-hues`: this browser's remembered colours for the channel up are offered
   // to the server now — the token's scope is known, the picker holds its channel, and no read
   // or stream of it has gone out yet, so the offer is issued before anything that could colour
@@ -41193,10 +41056,10 @@ el("voice-post-prefix").addEventListener("input", renderVoicePostPrefix);
 el("save-voice-post-prefix").addEventListener("click", guardQuietly(() => saveVoicePostPrefix(false)));
 el("reset-voice-post-prefix").addEventListener("click", guardQuietly(() => saveVoicePostPrefix(true)));
 // `#208 persistent-cache`. Off and Erase only ask; the question's own button is what sends.
-el("message-cache-enabled").addEventListener("change", guardQuietly(serverCacheSwitched));
-el("message-cache-erase").addEventListener("click", () => askServerCache("erase"));
-el("message-cache-confirm-yes").addEventListener("click", guardQuietly(() => answerServerCache(true)));
-el("message-cache-confirm-no").addEventListener("click", guardQuietly(() => answerServerCache(false)));
+el("message-cache-enabled").addEventListener("change", guardQuietly(() => serverCacheBox.switched()));
+el("message-cache-erase").addEventListener("click", () => serverCacheBox.ask("erase"));
+el("message-cache-confirm-yes").addEventListener("click", guardQuietly(() => serverCacheBox.answer(true)));
+el("message-cache-confirm-no").addEventListener("click", guardQuietly(() => serverCacheBox.answer(false)));
 el("noise-rule-new").addEventListener("keydown", (event) => {
   if (event.key === "Enter") guardQuietly(addNoiseRule)();
 });

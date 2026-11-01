@@ -46,3 +46,5 @@ export {
 export type { DirectoryEntry, DirectoryFailure } from "./directory.ts";
 export { DISMISSED_LABEL_CHARS, dismissedListWords, dismissedRestoreLabel, dismissedRowLabel, dismissedSendMeta } from "./dismissed.ts";
 export type { DismissedEntry } from "./dismissed.ts";
+export { SERVER_CACHE_ASK, SERVER_CACHE_SENDING, serverCacheKeepsWords, serverCacheUnconfirmed, serverHoldsWholeHistory } from "./cache.ts";
+export type { ServerCacheAct } from "./cache.ts";

@@ -56,7 +56,7 @@ export const PACKAGES = Object.freeze({
   "present/call": BASE,
   "present/notices": [...BASE, "core/api", "present/time"],
   "present/rows": [...BASE, "core/channels", "present/time"],
-  "present/settings": [...BASE, "core/outbox", "present/time"],
+  "present/settings": [...BASE, "core/outbox", "present/notices", "present/time"],
   "present/time": BASE,
   "view/channel": [...BASE, "view/dom", "core/annotations", "core/channels", "present/rows", "present/time", "present/notices"],
   "view/composer": [...BASE, "view/dom"],

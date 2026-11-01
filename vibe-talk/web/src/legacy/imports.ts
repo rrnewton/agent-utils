@@ -97,7 +97,7 @@ export { HTTP_ADDRESS, createSerialQueue, deepLinkRefFrom, linkKind, linksIn, me
 
 export { briefAge, dayClock, dayKeyOf, dayRangeWords, editedTitle, fullLocalAt, fullLocalTime, messageDate, shortLocalTime, stamp } from "../present/time/index.ts";
 
-export { SERVER_CACHE_NO_AGE_LIMIT, doneReadWords, failureWords, fmtDuration, messagesWords, nounCount, reachBackWords, reachClause, readableCause, refusalSentence, refusalWords, searchMomentWords, searchWalkProgress, serverCacheErases, serverCacheLine, serviceReadWords, } from "../present/notices/index.ts";
+export { doneReadWords, failureWords, fmtDuration, messagesWords, reachBackWords, reachClause, readableCause, refusalSentence, refusalWords, searchMomentWords, searchWalkProgress, serviceReadWords, } from "../present/notices/index.ts";
 export { BLANK_TEXT, cardGapWords, cardMaxLinesWords, cardProxyLines, cardRunText, collapsedLinesWords, combinedContent, countOf, createReadRuns, editedDrawn, firstLineOf, foldedCardText, forgetElisionCounts, gapWords, isNoise, joinsGroup, lineLabel, mainRunsAmong, messageLook, newestThreadHues, proxyLinesOf, quoteBlock, rawTextOf, reactionText, reactionsDrawn, readRunText, renderedHtmlOf, replyMarkerName, rowEdited, rowReactions, spreadThreadHue, threadChoice, threadFacts, undoLabel, undoName } from "../present/rows/index.ts";
 export { DAY_TITLED, EDITED_MARK, RESTATED_CLASS, anchorOfRow, anchorsAmong, authorLabel, cardGapGroups, cardGapTally, cardMarkTarget, cardRunIds, cardStubText, cardUnits, doneButtonOf, drawLinkPath, fillCardText, findableParts, foldedTextLine, freshenDayTitle, fromGatheredThread, gutterPiece, idsOf, isMessageRow, keepCardUnits, laneOrder, linkAt, linkedRootThread, markCardLayout, messageTop, notNoiseButtonOf, pointerOn, quoteLabelFits, renderedText, rowIn, rowLinkY, rowMessages, rowNewestMs, rowQuotedBy, rowSentMs, rowShown, rowTimeTabStop, setArrowReach, setMarkerLift, shownRowFor, stackUnder, standingRow, textHits, textRunsOf, threadCardId, timeNode } from "../view/channel/index.ts";
 
@@ -118,6 +118,7 @@ export {
   mountChannelHistory,
   mountDismissedSends,
   mountHelpFolds,
+  mountServerCache,
   mountSettingsFolds,
   mountUpstreamClear,
 } from "../view/settings/index.ts";
