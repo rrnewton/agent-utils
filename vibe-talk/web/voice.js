@@ -7063,6 +7063,9 @@ function showSearchOpen(open) {
 /** Whether the Links filter is on. Only while the search bar is open: closing it turns this off. */
 let linksOnly = false;
 
+// Finding the links in a text (linksIn, markdownLinkAt, bareLinkAt, trimAddress, HTTP_ADDRESS) is
+// web/src/foundation/'s (`#624 voice-page-modularity`).
+
 /**
  * The links each part of a row holds: every message a channel row stands for, or a turn's text.
  *
@@ -14847,6 +14850,9 @@ const SPOKEN_YES_ECHO_GUARD_MS = 1500;
  * draft within a few seconds: the agent's reply, its tool call, and this page's watch waking.
  */
 const REDRAFT_WAIT_MS = 6500;
+
+// What a spoken answer says to "Send it?" (classifySpokenAnswer, isExactReadBack, unsayableDraft, ...)
+// is web/src/present/call/'s (`#624 voice-page-modularity`).
 
 /** Why a spoken yes was not taken, in words the agent can repeat to the owner. */
 const SPOKEN_YES_REASONS = {
@@ -46825,6 +46831,10 @@ function placeMainCard() {
 
 /** The key the cards' opened runs are kept under, by channel (`readRuns`). */
 const cardRunKey = () => `cards:${String(selectedChannelId())}`;
+
+// A card's DOM helpers (cardRootOf, threadCardId, cardGapGroups, markCardLayout, fillCardText, ...) are
+// web/src/view/channel/'s, and the Main runs among the cards (mainRunsAmong) web/src/present/rows/'s
+// (`#624 voice-page-modularity`).
 
 /** Whether an item of the cards is read: a card by its thread (`threadIsRead`), a Main row by its messages. */
 const cardRunRead = (row) => (row.hasAttribute("data-card") ? row.hasAttribute("data-thread-read") : rowIsRead(row));

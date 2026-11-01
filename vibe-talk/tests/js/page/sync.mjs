@@ -256,7 +256,10 @@ test("live updates and deletes re-read the authoritative channel without losing 
 const HELD_COMPARES_IDS = ["(!words || threads || projected.every((item, at) => item === held[at] || sameWords(held[at], item)))",
   "true"];
 /** ...and compared as JSON, in the order the fields came in (`sameMessage`), for another. */
-const HELD_COMPARES_JSON = ["item === held[at] || sameWords(held[at], item)", "item === held[at] || sameMessage(held[at], item)"];
+// The store's own JSON comparison (core/channels' `sameMessage`), written out: the legacy script no
+// longer takes that name from the prelude.
+const HELD_COMPARES_JSON = ["item === held[at] || sameWords(held[at], item)",
+  "item === held[at] || (held[at] !== undefined && JSON.stringify(held[at]) === JSON.stringify(item))"];
 
 /**
  * The channel of `threadData` on a server with a change record, read in All, then Main and the thread of

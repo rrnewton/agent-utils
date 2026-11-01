@@ -340,6 +340,25 @@ test("the prelude gives the legacy script exactly what web/src/legacy/imports.ts
   assert.deepStrictEqual(declared.sort(), [...expected].sort(), "web/legacy-imports.d.ts and imports.ts name different things");
 });
 
+test("every name the prelude gives the legacy script is one the script's code still uses", () => {
+  // imports.ts's own rule: a name the legacy script no longer needs comes off the list. A name read
+  // only in a comment, or only as a property (`x.name`, `{ name: ... }`), is not a use.
+  const { ts, file } = parseScript("voice.js", readWeb("voice.js"));
+  const used = new Set();
+  const visit = (node) => {
+    if (ts.isIdentifier(node)) {
+      const parent = node.parent;
+      const property = (ts.isPropertyAccessExpression(parent) && parent.name === node) ||
+        ((ts.isPropertyAssignment(parent) || ts.isMethodDeclaration(parent)) && parent.name === node);
+      if (!property) used.add(node.text);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(file);
+  const unused = MANIFEST.legacy_imports.filter((name) => name !== "VibeTalkContract" && !used.has(name));
+  assert.deepStrictEqual(unused, [], "web/src/legacy/imports.ts gives voice.js names its code no longer uses");
+});
+
 test("the bundle declares nothing of the modules but what the legacy script takes, strictly, just before it", () => {
   const script = text(SCRIPT_PATH);
   const legacy = topLevelNames("voice.js", readWeb("voice.js"));

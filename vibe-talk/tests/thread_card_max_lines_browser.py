@@ -277,9 +277,11 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             unpack_to(desk, "true")
             desk.wait_for(f"() => document.querySelector(\"#side-cards > li[data-unpack-thread='{REPLICA}'][data-root-continuation]\")",
                           "the replica did not unpack split again")
-            link = page.evaluate("() => `/?c=${encodeURIComponent(document.getElementById('discord-channel').value)}`"
-                                 " + `&v=threads&m=${deepLinkRefText(deepLinkRefOf(channelStore.current().messages.find("
-                                 f"(m) => m.thread && m.thread.id === '{REPLICA}' && m.thread.is_root)))}}`")
+            # The Threads view's address for the question, as the page writes one (`deepLinkQuery`).
+            link = page.evaluate("() => { const ref = deepLinkRefOf(channelStore.current().messages.find("
+                                 f"(m) => m.thread && m.thread.id === '{REPLICA}' && m.thread.is_root));"
+                                 " return '/?' + deepLinkQuery({ screen: 'main', channel: ref.channel, layout: 'list',"
+                                 " view: null, thread: null, origin: null, side: null }, ref); }")
             page.goto(f"http://127.0.0.1:{server.server_port}{link}", wait_until="load")
             desk.wait_for("() => /linked message's card/.test(document.getElementById('status').textContent)",
                           "the link did not land on a card", seconds=20)

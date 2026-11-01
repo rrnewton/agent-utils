@@ -5,7 +5,7 @@
 
 import assert from "node:assert/strict";
 
-import { ACKNOWLEDGED, BASE_CSS, CHANNEL, CODER, COLLAPSE_OVER_CHARS, CSS, CSS_CODE,
+import { ACKNOWLEDGED, BASE_CSS, PRESENT_ROWS, PRESENT_TIME, presentTime, CHANNEL, CODER, COLLAPSE_OVER_CHARS, CSS, CSS_CODE,
   CSS_UNCONDITIONAL, DISCORD_POLL_MS, FIXTURE_TREE, FakeElement, GATHERED, GLYPHS, HOVER_QUERY,
   HTML, INBOX, LINK_ATTRS, OWNERS_MESSAGE, PAGE_CODE, PAGE_ELEMENTS, PULL_ARM_PX, SANITIZED_TAGS,
   SCRIPT, SCRIPT_CODE, SCROLLERS, SHORT_MESSAGE, SPEECH_PIECES, TIMELINE_RECONCILE_MS,
@@ -260,7 +260,7 @@ test("A FOLDED MESSAGE ENDS WITH WHAT IT HIDES, counted at every width class, in
 
 test("EACH COUNT IS A FLOOR: fewer at a wider line, rounded down, and nothing under ten words (#244)", async () => {
   const page = newPage();
-  const says = (words, chars = words * 6) => page.preludeBinding("elisionLabel")({ words, chars });
+  const says = (words, chars = words * 6) => PRESENT_ROWS.elisionLabel({ words, chars });
   assert.equal(says(ELIDED_MIN_WORDS - 1), "", "a floor of a few words claims that words are hidden");
   assert.equal(says(ELIDED_MIN_WORDS), `(~${ELIDED_MIN_WORDS} more words)`);
   assert.equal(says(19), "(~19 more words)", "under twenty the count is not exact");
@@ -405,7 +405,7 @@ test("a body the server rendered is counted by the words it shows, a link by its
   })]);
   assert.equal(rows[0].getAttribute("data-collapsed"), "true", "the rendered message did not fold");
   // Spread into this realm's arrays: the page's run in a context of their own.
-  const labels = (text) => [...page.preludeBinding("elisionLabels")(text, page.pure("collapsedLines"))];
+  const labels = (text) => [...PRESENT_ROWS.elisionLabels(text, page.pure("collapsedLines"))];
   const shown = labels(`${words} the run log`);
   assert.deepStrictEqual(FOLD_WIDTHS_EM.map((_width, at) => labelAt(rows[0], at)), shown,
     "the rendered body is not counted by the words on the screen");
@@ -425,7 +425,7 @@ test("A RICH HEADER'S ROW counts its text without the words the header restates,
     message({ id: "7440000000000000602", content: `${lead}${rest}` }),
   ]);
   assert.ok(textOfRow(rows[0]).children[0].hasAttribute("data-rh"), "the fixture's heading was not shown");
-  const labels = (text) => [...page.preludeBinding("elisionLabels")(text, page.pure("collapsedLines"))];
+  const labels = (text) => [...PRESENT_ROWS.elisionLabels(text, page.pure("collapsedLines"))];
   assert.deepStrictEqual(FOLD_WIDTHS_EM.map((_width, at) => labelAt(rows[0], at, "on")), labels(rest),
     "with the header showing, the row is not counted by the text under it");
   assert.deepStrictEqual(FOLD_WIDTHS_EM.map((_width, at) => labelAt(rows[0], at, "off")), labels(`${lead}${rest}`),
@@ -526,7 +526,7 @@ test("WHAT THE MODEL HAS NO RULE FOR GETS NO LABEL, and every element the server
   odd.append(page.document.createTextNode(wordsOfLength(200, 4)));
   body.append(odd);
   assert.equal(VIEW_CHANNEL.foldRuns(body), null, "an element with no rule was laid out from a guess");
-  assert.deepStrictEqual([...page.preludeBinding("elisionLabels")(null, page.pure("collapsedLines"))], FOLD_WIDTHS_EM.map(() => ""));
+  assert.deepStrictEqual([...PRESENT_ROWS.elisionLabels(null, page.pure("collapsedLines"))], FOLD_WIDTHS_EM.map(() => ""));
 });
 
 test("A CHARACTER OF A WIDE SCRIPT IS A PLACE A LINE BREAKS: Chinese after a word fills the line it starts on (#244)", async () => {
@@ -3649,8 +3649,7 @@ const localAt = (year, month, day, hour = 12, minute = 0) => new Date(year, mont
 const shownTime = (at) => at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 
 test("ONE DAY FORMATTER: today, yesterday, this year, another year, across New Year, and across both clock changes", async () => {
-  const page = newPage();
-  const dayLabel = page.preludeBinding("dayLabel");
+  const { dayLabel } = PRESENT_TIME;
   await inZone("America/New_York", () => {
     const now = localAt(2026, 10, 12, 15, 56);
     const cases = [
@@ -3681,9 +3680,9 @@ test("ONE DAY FORMATTER: today, yesterday, this year, another year, across New Y
   });
   // The negative control: "yesterday" as 24 hours back, not a calendar day back, and both clock
   // changes above come out wrong — so those rows of the table are what pin the calendar down.
-  const bySpan = newPage(new Map(), await brokenModule([{ file: "src/present/time/days.ts",
+  const bySpan = (await presentTime([{ file: "src/present/time/days.ts",
     find: "const yesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1, 12);",
-    replace: "const yesterday = new Date(now.getTime() - 86400000);" }])).preludeBinding("dayLabel");
+    replace: "const yesterday = new Date(now.getTime() - 86400000);" }])).dayLabel;
   await inZone("America/New_York", () => {
     assert.equal(bySpan(localAt(2026, 3, 8, 12), localAt(2026, 3, 9, 0, 30)), "Mar 8, Sun",
       "the control did not get the spring change wrong");
@@ -5144,7 +5143,7 @@ test("`#250 date-separators`: replies gathered under their message, out of time 
 // both clock changes — so a day rule is checked here to BE that function, not a copy of it.
 
 test("`#250 date-separators`: one day is said in the owner's words by `dayLabel`, the page's one wording of a day", async () => {
-  const dayLabel = newPage().preludeBinding("dayLabel");
+  const { dayLabel } = PRESENT_TIME;
   await inZone("America/New_York", () => {
     const at = (year, month, day, hour = 12, minute = 0) => new Date(year, month - 1, day, hour, minute);
     assert.equal(dayLabel(at(2026, 10, 11, 17, 25), at(2026, 10, 12, 15, 56)), "Yesterday, Oct 11, Sun");

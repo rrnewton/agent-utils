@@ -1852,6 +1852,9 @@ const SPEECH_PIECES = await moduleForTests("src/core/speech/index.ts");
 const CALL = await moduleForTests("src/core/call/index.ts");
 /** How the page words and arranges its rows of messages, and its thread cards (web/src/present/rows). */
 const PRESENT_ROWS = await moduleForTests("src/present/rows/index.ts");
+/** How the page words a day, a time and an age (web/src/present/time); `overlays` break it for a negative control. */
+const presentTime = (overlays = []) => moduleForTests("src/present/time/index.ts", { overlays });
+const PRESENT_TIME = await presentTime();
 /** The channel's rows as the DOM draws them (web/src/view/channel): handed the page's own nodes. */
 const VIEW_CHANNEL = await moduleForTests("src/view/channel/index.ts");
 /**
@@ -9953,7 +9956,7 @@ export { ACKNOWLEDGED, ALIAS_NOTICE, ALICE, BASE_CSS, BIG, BIG_ROOT, BOTTOM_SLAC
   FIXTURE_TREE, FakeElement, GATHERED, GLYPHS, HELP_SLUGS, HOLD_MS, HOVER_QUERY, HTML, HTML_CODE,
   INBOX, INBOX_NOTICE, LINE_PX, LINK_ATTRS, MESSAGE_CACHE_KEY, MESSAGE_DAY, MESSAGE_SPACING_MS,
   MIC_TOGGLE_IDS, MINTED, MODULE_CODE, NOISE_MATCHING, OTHER_CHANNEL, OWN, OWNER, OWNERS_MESSAGE,
-  PAGE_CODE, PAGE_ELEMENTS, PAGE_IDS, PAGE_READ_REASONS, PAGE_SCRIPTS, PRELUDE, PRESENT_ROWS,
+  PAGE_CODE, PAGE_ELEMENTS, PAGE_IDS, PAGE_READ_REASONS, PAGE_SCRIPTS, PRELUDE, PRESENT_ROWS, PRESENT_TIME, presentTime,
   PULL_ARM_PX, PULL_WAIT_MS, RECORD_EPOCH, REDRAFT_WAIT_MS, RELAY_COALESCE_MS, RELAY_FENCE_OPEN,
   REPLAY_PREAMBLE, REPLY_DOUBLE_TAP_MS, REPLY_JUMP_PAGES, REPO, RETRY_FIRST_MS, RUN_TAIL,
   RUN_THREAD, SANITIZED_TAGS, SCATTERED, SCRIPT, SCRIPT_CODE, SCRIPT_FILE, SCROLLBACK_PX, SCROLLERS,
