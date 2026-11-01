@@ -1881,6 +1881,7 @@ fn cmd_accept(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
         proof_note: &format!("sender proved on {} ({proof})", globals.host),
         relayed_by: None,
         peer_host: &globals.host,
+        via_chat_relay: false,
     };
     let answer = accept(&ctx, &envelope, deliverer.as_ref())?;
     println!("{}", serde_json::to_string_pretty(&answer.to_json())?);
@@ -1962,10 +1963,11 @@ fn cmd_relay(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
         Some("teams") => cmd_relay_teams(globals, args),
         Some("confirm") => cmd_relay_confirm(globals, args),
         Some("ban") => cmd_relay_ban(globals, args),
+        Some("unban") => cmd_relay_unban(globals, args),
         Some("alarms") => cmd_relay_alarms(globals, args),
         _ => Err(err(
             "usage",
-            "relay subcommands: setup, status, announce, teams, confirm, ban, alarms",
+            "relay subcommands: setup, status, announce, teams, confirm, ban, unban, alarms",
         )),
     }
 }
@@ -2289,8 +2291,15 @@ fn cmd_relay_confirm(globals: &Globals, args: &[String]) -> Result<i32, DataErro
             format!("no announcement candidate for sender {sender}; nothing to confirm"),
         ));
     };
-    let team = flag_value(args, "--team")
-        .unwrap_or_else(|| candidate["team"].as_str().unwrap_or_default().to_string());
+    let team = candidate["team"].as_str().unwrap_or_default().to_string();
+    if let Some(asked) = flag_value(args, "--team") {
+        if asked != team {
+            return Err(err(
+                "usage",
+                format!("candidate {sender} claims team {team}, not {asked}; confirm the claim as announced, or have the bot re-announce"),
+            ));
+        }
+    }
     let host = candidate["host"].as_str().unwrap_or_default().to_string();
     let repo = candidate["repo_id"].as_str().map(str::to_string);
     // First try an already-trusted (non-relay) route: ask that host's own
@@ -2358,13 +2367,19 @@ fn cmd_relay_confirm(globals: &Globals, args: &[String]) -> Result<i32, DataErro
             &host,
             repo.as_deref(),
             "trusted-route",
+            candidate.get("route").and_then(Value::as_str),
         )?;
         crate::relay::close_alarm(&globals.state, &sender)?;
         let delivered = crate::relay::drain_quarantine(&globals.state, &globals.host)?;
         println!(
-            "confirmed {sender} -> {team}@{host} (verified over a trusted route); delivered {} quarantined post(s): {}",
-            delivered.len(),
-            delivered.join(", ")
+            "confirmed {sender} -> {team}@{host} (verified over a trusted route); delivered {} quarantined post(s): {}{}",
+            delivered.delivered.len(),
+            delivered.delivered.join(", "),
+            if delivered.dropped.is_empty() {
+                String::new()
+            } else {
+                format!("; dropped: {}", delivered.dropped.iter().map(|(id, state)| format!("{id} ({state})")).collect::<Vec<_>>().join(", "))
+            }
         );
         return Ok(0);
     }
@@ -2376,13 +2391,19 @@ fn cmd_relay_confirm(globals: &Globals, args: &[String]) -> Result<i32, DataErro
             &host,
             repo.as_deref(),
             "owner",
+            candidate.get("route").and_then(Value::as_str),
         )?;
         crate::relay::close_alarm(&globals.state, &sender)?;
         let delivered = crate::relay::drain_quarantine(&globals.state, &globals.host)?;
         println!(
-            "confirmed {sender} -> {team}@{host} (owner approval); delivered {} quarantined post(s): {}",
-            delivered.len(),
-            delivered.join(", ")
+            "confirmed {sender} -> {team}@{host} (owner approval); delivered {} quarantined post(s): {}{}",
+            delivered.delivered.len(),
+            delivered.delivered.join(", "),
+            if delivered.dropped.is_empty() {
+                String::new()
+            } else {
+                format!("; dropped: {}", delivered.dropped.iter().map(|(id, state)| format!("{id} ({state})")).collect::<Vec<_>>().join(", "))
+            }
         );
         return Ok(0);
     }
@@ -2400,6 +2421,16 @@ fn cmd_relay_ban(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
         .ok_or_else(|| err("usage", "relay ban needs a SENDER id"))?;
     crate::relay::ban_sender(&globals.state, &sender)?;
     println!("banned {sender} in the relay: its alarm stops and its posts are dropped");
+    Ok(0)
+}
+
+fn cmd_relay_unban(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
+    let sender = positional(args)
+        .into_iter()
+        .nth(1)
+        .ok_or_else(|| err("usage", "relay unban needs a SENDER id"))?;
+    crate::relay::unban_sender(&globals.state, &sender)?;
+    println!("unbanned {sender} in the relay: it is a stranger again until confirmed");
     Ok(0)
 }
 

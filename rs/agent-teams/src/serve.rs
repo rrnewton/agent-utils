@@ -83,6 +83,7 @@ fn handle_accept(state: &Path, this_host: &str, peer: &str, envelope: &Value) ->
         proof_note: &proof_note,
         relayed_by,
         peer_host: peer,
+        via_chat_relay: false,
     };
     let answer = accept(&ctx, envelope, deliverer.as_ref())?;
     Ok(answer.to_json())

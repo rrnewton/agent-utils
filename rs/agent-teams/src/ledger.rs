@@ -78,6 +78,10 @@ pub struct AcceptContext<'a> {
     /// Host the route authenticated (or asserted) as the origin; empty when
     /// unknown. A non-relayed envelope must claim this host as `from.host`.
     pub peer_host: &'a str,
+    /// Arrived by the chat relay: the same-host coordinator fallback never
+    /// applies, because a relay peer's asserted `from.host` must not turn
+    /// it into a local coordinator.
+    pub via_chat_relay: bool,
 }
 
 /// The answer `accept` gives.
@@ -335,6 +339,7 @@ pub fn accept(
             .iter()
             .any(|rule| rule.sender == sender);
         let same_host_coordinator = !explicit
+            && !ctx.via_chat_relay
             && envelope["from"]["proof"].as_str() == Some("harness-ancestry")
             && envelope["from"]["host"].as_str() == Some(ctx.this_host)
             && crate::hostindex::live_coordinator_for_team(&sender).is_some();

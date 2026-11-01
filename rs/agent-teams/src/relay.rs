@@ -109,11 +109,16 @@ fn fenced_block(text: &str, fence: &str) -> Option<String> {
     Some(rest[..end].trim().to_string())
 }
 
-/// Parse one relay post's text (after provider unescaping and note
-/// stripping). The first line of an envelope post must be the tag derived
-/// from its envelope; the caller checks that.
+/// Parse one relay post's text. The raw text is tried first — a provider
+/// that already unescaped its delivery must not be unescaped twice, or a
+/// body containing a literal `&lt;` would fail its hash — and the
+/// provider-escaped form is the fallback for providers that escape.
 pub fn parse_post(text: &str) -> Result<RelayPost, String> {
-    let clean = strip_provider_notes(&unescape_provider_text(text));
+    parse_post_clean(&strip_provider_notes(text))
+        .or_else(|_| parse_post_clean(&strip_provider_notes(&unescape_provider_text(text))))
+}
+
+fn parse_post_clean(clean: &str) -> Result<RelayPost, String> {
     for (fence, make) in [
         (
             ENVELOPE_FENCE,
@@ -125,7 +130,7 @@ pub fn parse_post(text: &str) -> Result<RelayPost, String> {
             RelayPost::Announce as fn(Value) -> RelayPost,
         ),
     ] {
-        if let Some(block) = fenced_block(&clean, fence) {
+        if let Some(block) = fenced_block(clean, fence) {
             let value: Value =
                 serde_json::from_str(&block).map_err(|e| format!("bad {fence} JSON: {e}"))?;
             return Ok(make(value));
@@ -189,6 +194,22 @@ pub fn store_path(state: &Path) -> PathBuf {
     state.join("relay").join("peers.json")
 }
 
+/// Take the relay store lock: every read-modify-write of `peers.json`,
+/// `alarms.json` and `quarantine.json` holds it, so a ban or confirm can
+/// never be overwritten by a concurrent raise or drain.
+fn lock_store(state: &Path) -> DataResult<std::fs::File> {
+    use fs2::FileExt;
+    let dir = state.join("relay");
+    std::fs::create_dir_all(&dir)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(dir.join(".store.lock"))?;
+    file.lock_exclusive()?;
+    Ok(file)
+}
+
 /// Load the relay discovery store (empty when absent).
 pub fn load_store(state: &Path) -> Value {
     std::fs::read_to_string(store_path(state))
@@ -213,7 +234,13 @@ fn store_list<'a>(store: &'a Value, key: &str) -> &'a [Value] {
 
 /// Record one announcement as a candidate (or a conflict when the poster is
 /// already confirmed for another team). Returns the recorded outcome.
-pub fn record_candidate(state: &Path, announce: &Value, poster: &str) -> DataResult<String> {
+pub fn record_candidate(
+    state: &Path,
+    announce: &Value,
+    poster: &str,
+    route: &str,
+) -> DataResult<String> {
+    let _lock = lock_store(state)?;
     let mut store = load_store(state);
     let sender = announce
         .get("sender_id")
@@ -233,7 +260,7 @@ pub fn record_candidate(state: &Path, announce: &Value, poster: &str) -> DataRes
     let entry = json!({
         "sender_id": sender, "team": team,
         "host": announce.get("host"), "repo_id": announce.get("repo_id"),
-        "poster": poster, "seen_at": format_rfc3339_ms(now_unix_ms()),
+        "poster": poster, "route": route, "seen_at": format_rfc3339_ms(now_unix_ms()),
     });
     if !candidates.iter().any(|c| {
         c.get("sender_id").and_then(Value::as_str) == Some(sender)
@@ -241,6 +268,12 @@ pub fn record_candidate(state: &Path, announce: &Value, poster: &str) -> DataRes
             && c.get("host") == announce.get("host")
     }) {
         candidates.push(entry);
+        // Candidates are claims, not a growing collection to keep forever:
+        // keep the newest 256.
+        if candidates.len() > 256 {
+            let excess = candidates.len() - 256;
+            candidates.drain(0..excess);
+        }
     }
     save_store(state, &store)?;
     Ok("candidate-recorded".to_string())
@@ -254,7 +287,9 @@ pub fn confirm_peer(
     host: &str,
     repo_id_value: Option<&str>,
     source: &str,
+    route: Option<&str>,
 ) -> DataResult<()> {
+    let _lock = lock_store(state)?;
     let mut store = load_store(state);
     let confirmed = store
         .get_mut("confirmed")
@@ -263,7 +298,7 @@ pub fn confirm_peer(
     confirmed.retain(|c| c.get("sender_id").and_then(Value::as_str) != Some(sender_id));
     confirmed.push(json!({
         "sender_id": sender_id, "team": team, "host": host,
-        "repo_id": repo_id_value, "source": source,
+        "repo_id": repo_id_value, "source": source, "route": route,
         "confirmed_at": format_rfc3339_ms(now_unix_ms()),
     }));
     save_store(state, &store)
@@ -421,7 +456,7 @@ pub fn relay_in(
             {
                 return Ok(result(NOT_RECORDED, "announcement integrity hash mismatch"));
             }
-            let outcome = record_candidate(state, &announce, peer_sender)?;
+            let outcome = record_candidate(state, &announce, peer_sender, route)?;
             log_event(
                 state,
                 &json!({"event": "relay-in", "outcome": outcome, "route": route, "peer_sender": peer_sender, "team": announce.get("team")}),
@@ -432,7 +467,12 @@ pub fn relay_in(
             ))
         }
         RelayPost::Receipt(receipt) => {
-            // A receipt never draws a receipt: record and stop.
+            // A receipt never draws a receipt: record and stop. Receipts are
+            // authenticated like envelopes: the ID must be a well-formed
+            // message ID (never a path), the poster must be mapped to the
+            // fleet the outbox entry was sent to, banned senders are
+            // dropped, the state must be a known ledger state, and a
+            // terminal outbox state is never rewritten by a replay.
             let id = receipt
                 .get("id")
                 .and_then(Value::as_str)
@@ -443,24 +483,82 @@ pub fn relay_in(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            match read_outbox(state, &id) {
-                Some(mut entry) => {
-                    let mapped = crate::sender::map_receiver_state(&receipt_state);
-                    if !mapped.is_empty() && mapped != "?" {
-                        entry["state"] = json!(mapped);
-                        let _ = write_json_atomic(&crate::sender::outbox_path(state, &id), &entry);
-                    }
-                    log_event(
-                        state,
-                        &json!({"event": "relay-in", "outcome": "receipt-recorded", "route": route, "id": id, "state": receipt_state}),
-                    );
-                    Ok(result(
-                        "receipt-recorded",
-                        format!("receipt {receipt_state} for {id}"),
-                    ))
-                }
-                None => Ok(result("receipt-unknown", format!("no outbox entry {id}"))),
+            const KNOWN_STATES: &[&str] = &[
+                "accepted",
+                "delivered",
+                "refused",
+                "expired",
+                "superseded",
+                "retracted",
+                "fenced",
+                "claimed",
+                "typing",
+                "presented",
+                "in-custody",
+            ];
+            if !crate::envelope::valid_message_id(&id)
+                || !KNOWN_STATES.contains(&receipt_state.as_str())
+            {
+                log_event(
+                    state,
+                    &json!({"event": "relay-in", "outcome": "receipt-refused", "route": route, "peer_sender": peer_sender, "detail": "bad id or state"}),
+                );
+                return Ok(result("receipt-refused", "receipt has a bad ID or state"));
             }
+            if is_banned(state, peer_sender) {
+                return Ok(result("banned-sender", "banned sender's receipt dropped"));
+            }
+            let Some(mut entry) = read_outbox(state, &id) else {
+                return Ok(result("receipt-unknown", format!("no outbox entry {id}")));
+            };
+            // The poster must speak for the fleet this message was sent to.
+            let to_fleet = entry["envelope"]["to"]["team"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            let poster_ok = confirmed_mapping(state, peer_sender)
+                .is_some_and(|(fleet, _)| fleet == to_fleet)
+                || load_declarations(state).is_ok_and(|declarations| {
+                    declarations.iter().any(|(_, _, declaration)| {
+                        declaration.relay_channels.iter().any(|entry| {
+                            entry.peers.get(peer_sender).is_some_and(|mapped| {
+                                mapped.split('@').next().unwrap_or(mapped) == to_fleet
+                            })
+                        })
+                    })
+                });
+            if !poster_ok {
+                log_event(
+                    state,
+                    &json!({"event": "relay-in", "outcome": "receipt-refused", "route": route, "peer_sender": peer_sender, "id": id, "detail": "poster not mapped to the addressed fleet"}),
+                );
+                return Ok(result(
+                    "receipt-refused",
+                    "receipt poster is not mapped to the addressed fleet",
+                ));
+            }
+            let current = entry["state"].as_str().unwrap_or("").to_string();
+            if crate::sender::is_terminal(&current) && current != receipt_state {
+                log_event(
+                    state,
+                    &json!({"event": "relay-in", "outcome": "receipt-ignored-terminal", "route": route, "id": id, "state": receipt_state}),
+                );
+                return Ok(result(
+                    "receipt-ignored-terminal",
+                    format!("outbox already terminal ({current})"),
+                ));
+            }
+            let mapped = crate::sender::map_receiver_state(&receipt_state);
+            entry["state"] = json!(mapped);
+            let _ = write_json_atomic(&crate::sender::outbox_path(state, &id), &entry);
+            log_event(
+                state,
+                &json!({"event": "relay-in", "outcome": "receipt-recorded", "route": route, "id": id, "state": receipt_state}),
+            );
+            Ok(result(
+                "receipt-recorded",
+                format!("receipt {receipt_state} for {id}"),
+            ))
         }
         RelayPost::Envelope(envelope) => {
             let to_team = envelope
@@ -684,6 +782,7 @@ fn relay_in_envelope(
         proof_note: &proof_note,
         relayed_by: None,
         peer_host: "",
+        via_chat_relay: true,
     };
     let answer = accept(&ctx, envelope, deliverer.as_ref())?;
     let state_name = answer
@@ -715,6 +814,38 @@ fn post_receipt(
         }
     }
     out
+}
+
+/// The confirmed mapping for one sender on one relay route, as
+/// `(fleet, host)`. Confirmations learned on a different route do not
+/// admit here; a confirmation without a recorded route admits anywhere.
+pub fn confirmed_mapping_for(
+    state: &Path,
+    sender_id: &str,
+    route: &str,
+) -> Option<(String, Option<String>)> {
+    let store = load_store(state);
+    let entry = store_list(&store, "confirmed").iter().find(|c| {
+        c.get("sender_id").and_then(Value::as_str) == Some(sender_id)
+            && c.get("route")
+                .and_then(Value::as_str)
+                .is_none_or(|r| r == route)
+    })?;
+    let team = entry
+        .get("team")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let host = entry
+        .get("host")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    Some(match team.split_once('@') {
+        Some((fleet, team_host)) => (fleet.to_string(), Some(team_host.to_string())),
+        None if !host.is_empty() => (team, Some(host)),
+        None => (team, None),
+    })
 }
 
 /// The confirmed discovery mapping for one sender, as `(fleet, host)`.
@@ -786,6 +917,7 @@ pub fn is_banned(state: &Path, sender_id: &str) -> bool {
 /// Ban one sender: stops its alarm repeats. Its quarantined posts stay
 /// quarantined (never delivered) until the owner removes the ban.
 pub fn ban_sender(state: &Path, sender_id: &str) -> DataResult<()> {
+    let _lock = lock_store(state)?;
     let mut doc = load_json_list(&alarms_path(state), "alarms");
     let list = doc
         .get_mut("alarms")
@@ -817,6 +949,7 @@ fn record_stranger(
     text: &str,
     reason: &str,
 ) -> DataResult<()> {
+    let _lock = lock_store(state)?;
     let id = envelope
         .get("id")
         .and_then(Value::as_str)
@@ -882,9 +1015,31 @@ fn record_stranger(
         state,
         &json!({"event": "stranger", "sender_id": peer_sender, "local_team": declaration.team, "id": id, "reason": reason}),
     );
-    // Raise at once (repeats are `raise_due_alarms`' job).
+    // Raise at once for a new alarm, then only when due: a flooding
+    // stranger coalesces into one alarm plus timer repeats, never one
+    // coordinator notice per post.
     if let Some(index) = alarm_index {
-        let _ = raise_alarm_at(state, index, now_ms);
+        let doc = load_json_list(&alarms_path(state), "alarms");
+        let due = doc
+            .get("alarms")
+            .and_then(Value::as_array)
+            .and_then(|list| list.get(index))
+            .is_none_or(|alarm| {
+                let interval_ms = alarm
+                    .get("interval_seconds")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(1800) as i64
+                    * 1000;
+                let last_ms = alarm
+                    .get("last_raised_at")
+                    .and_then(Value::as_str)
+                    .and_then(crate::timeutil::parse_rfc3339_ms)
+                    .unwrap_or(0);
+                last_ms == 0 || now_ms - last_ms >= interval_ms
+            });
+        if due {
+            let _ = raise_alarm_at(state, index, now_ms);
+        }
     }
     Ok(())
 }
@@ -924,14 +1079,40 @@ fn raise_alarm_at(state: &Path, index: usize, now_ms: i64) -> DataResult<bool> {
         return Ok(false);
     };
     let claimed = alarm.get("claimed_from").cloned().unwrap_or(Value::Null);
+    // Alarm fields are attacker-shaped until validated: only fleet/host
+    // names that pass the same checks as configuration, and single-line
+    // sender/reason text, may appear in the notice a coordinator reads.
+    let clean = |value: Option<&str>| -> String {
+        value
+            .unwrap_or("?")
+            .chars()
+            .filter(|c| !c.is_control() && *c != '[' && *c != ']')
+            .take(128)
+            .collect::<String>()
+            .trim()
+            .to_string()
+    };
+    let claimed_team = claimed.get("team").and_then(Value::as_str).unwrap_or("?");
+    let claimed_host = claimed.get("host").and_then(Value::as_str).unwrap_or("?");
+    let claimed_team = if crate::model::valid_team_name(claimed_team) {
+        claimed_team.to_string()
+    } else {
+        clean(Some(claimed_team))
+    };
+    let claimed_host = if crate::model::valid_host_name(claimed_host) {
+        claimed_host.to_string()
+    } else {
+        clean(Some(claimed_host))
+    };
+    let sender = clean(Some(&sender));
     let rendered = format!(
         "[stranger alarm: unconfirmed sender {sender} in the chat relay]\n\
          [team message: kind alarm; ESCALATE TO OWNER via this team's normal owner channel; sender {sender} claims {}@{}; reason: {}; posts quarantined, not delivered]\n\
          A bot the relay does not confirm posted to team {local_team} in the relay channel. It is quarantined, not delivered, and this alarm repeats until the sender is confirmed or banned.\n\
          Confirm: agent-teams relay confirm {sender}   Ban: agent-teams relay ban {sender}   Status: agent-teams relay status\n",
-        claimed.get("team").and_then(Value::as_str).unwrap_or("?"),
-        claimed.get("host").and_then(Value::as_str).unwrap_or("?"),
-        alarm.get("reason").and_then(Value::as_str).unwrap_or("?"),
+        claimed_team,
+        claimed_host,
+        clean(alarm.get("reason").and_then(Value::as_str)),
     );
     let notice_envelope = json!({
         "id": format!("alarm-{sender}"),
@@ -947,19 +1128,21 @@ fn raise_alarm_at(state: &Path, index: usize, now_ms: i64) -> DataResult<bool> {
         now_ms
     );
     let outcome = deliverer.handover(&raise_id, &notice_envelope, &rendered);
-    let (list_key, raised) = (
-        "alarms",
-        matches!(outcome, crate::deliver::Handover::Accepted),
-    );
-    let list = doc
-        .get_mut(list_key)
-        .and_then(Value::as_array_mut)
-        .ok_or_else(|| DataError::new("relay-alarms", "alarms is not a list"))?;
-    if let Some(alarm) = list.get_mut(index) {
-        alarm["last_raised_at"] = json!(format_rfc3339_ms(now_ms));
-        alarm["raises"] = json!(alarm.get("raises").and_then(Value::as_u64).unwrap_or(0) + 1);
+    let raised = matches!(outcome, crate::deliver::Handover::Accepted);
+    // Only a successful hand-over is stamped as raised: a failed raise
+    // stays due, so the next relay activity retries it instead of
+    // silently waiting out a full interval.
+    if raised {
+        let list = doc
+            .get_mut("alarms")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| DataError::new("relay-alarms", "alarms is not a list"))?;
+        if let Some(alarm) = list.get_mut(index) {
+            alarm["last_raised_at"] = json!(format_rfc3339_ms(now_ms));
+            alarm["raises"] = json!(alarm.get("raises").and_then(Value::as_u64).unwrap_or(0) + 1);
+        }
+        write_json_atomic(&alarms_path(state), &doc)?;
     }
-    write_json_atomic(&alarms_path(state), &doc)?;
     Ok(raised)
 }
 
@@ -967,6 +1150,7 @@ fn raise_alarm_at(state: &Path, index: usize, now_ms: i64) -> DataResult<bool> {
 /// `pump`, and `relay alarms`, so no daemon is needed: any relay activity
 /// or pump run re-raises overdue stranger alarms.
 pub fn raise_due_alarms(state: &Path, now_ms: i64) -> DataResult<Vec<String>> {
+    let _lock = lock_store(state)?;
     let mut raised = Vec::new();
     let count = alarms(state).len();
     for index in 0..count {
@@ -1005,13 +1189,17 @@ pub fn raise_due_alarms(state: &Path, now_ms: i64) -> DataResult<Vec<String>> {
     Ok(raised)
 }
 
-/// Close any open alarm for a sender (after confirmation).
+/// Close any open or banned alarm for a sender (after confirmation).
 pub fn close_alarm(state: &Path, sender_id: &str) -> DataResult<()> {
+    let _lock = lock_store(state)?;
     let mut doc = load_json_list(&alarms_path(state), "alarms");
     if let Some(list) = doc.get_mut("alarms").and_then(Value::as_array_mut) {
         for alarm in list.iter_mut() {
             if alarm.get("sender_id").and_then(Value::as_str) == Some(sender_id)
-                && alarm.get("state").and_then(Value::as_str) == Some("open")
+                && matches!(
+                    alarm.get("state").and_then(Value::as_str),
+                    Some("open") | Some("banned")
+                )
             {
                 alarm["state"] = json!("confirmed");
             }
@@ -1020,12 +1208,41 @@ pub fn close_alarm(state: &Path, sender_id: &str) -> DataResult<()> {
     write_json_atomic(&alarms_path(state), &doc)
 }
 
+/// Remove a sender's ban (the owner's reversal of `relay ban`): its open
+/// alarm can then be confirmed, and its quarantined posts stay held until
+/// confirmation like anyone else's.
+pub fn unban_sender(state: &Path, sender_id: &str) -> DataResult<()> {
+    let _lock = lock_store(state)?;
+    let mut doc = load_json_list(&alarms_path(state), "alarms");
+    if let Some(list) = doc.get_mut("alarms").and_then(Value::as_array_mut) {
+        for alarm in list.iter_mut() {
+            if alarm.get("sender_id").and_then(Value::as_str) == Some(sender_id)
+                && alarm.get("state").and_then(Value::as_str) == Some("banned")
+            {
+                alarm["state"] = json!("open");
+            }
+        }
+    }
+    write_json_atomic(&alarms_path(state), &doc)
+}
+
+/// What one quarantine drain did: posts delivered (or already known at the
+/// ledger), and posts dropped with their terminal ledger state named.
+pub struct DrainOutcome {
+    /// IDs accepted or already known at the receiving ledger.
+    pub delivered: Vec<String>,
+    /// `(id, state)` posts the ledger terminally refused (expired, ...).
+    pub dropped: Vec<(String, String)>,
+}
+
 /// Deliver quarantined posts whose sender is now confirmed, in arrival
 /// order, exactly once (the ledger claim is the dedupe). Returns the IDs
 /// delivered (or already known). Malformed posts stay quarantined.
-pub fn drain_quarantine(state: &Path, this_host: &str) -> DataResult<Vec<String>> {
+pub fn drain_quarantine(state: &Path, this_host: &str) -> DataResult<DrainOutcome> {
+    let _lock = lock_store(state)?;
     let posts = quarantined_posts(state);
     let mut delivered: Vec<String> = Vec::new();
+    let mut dropped: Vec<(String, String)> = Vec::new();
     let mut remaining: Vec<Value> = Vec::new();
     for post in posts {
         let envelope = post.get("envelope").cloned().unwrap_or(Value::Null);
@@ -1102,13 +1319,25 @@ pub fn drain_quarantine(state: &Path, this_host: &str) -> DataResult<Vec<String>
                 proof_note: &proof_note,
                 relayed_by: None,
                 peer_host: "",
+                via_chat_relay: true,
             };
             match accept(&ctx, &envelope, deliverer.as_ref()) {
-                Ok(answer) => {
+                // Only accepted/known count as delivered. A terminal
+                // refusal is reported as dropped with its state, logged,
+                // and removed — never silently counted as delivered.
+                Ok(answer) if matches!(answer.outcome.as_str(), "accepted" | "known") => {
                     delivered.push(id);
                     log_event(
                         state,
                         &json!({"event": "relay-quarantine", "outcome": answer.outcome, "id": delivered.last(), "peer_sender": peer_sender}),
+                    );
+                    true
+                }
+                Ok(answer) => {
+                    dropped.push((id.clone(), answer.state.unwrap_or(answer.outcome)));
+                    log_event(
+                        state,
+                        &json!({"event": "relay-quarantine", "outcome": "dropped", "id": id, "peer_sender": peer_sender}),
                     );
                     true
                 }
@@ -1121,7 +1350,7 @@ pub fn drain_quarantine(state: &Path, this_host: &str) -> DataResult<Vec<String>
     }
     let doc = json!({"schema": "agent-teams-relay/v1", "posts": remaining});
     write_json_atomic(&quarantine_path(state), &doc)?;
-    Ok(delivered)
+    Ok(DrainOutcome { delivered, dropped })
 }
 
 /// Teams known to the relay on this host, for `relay teams`: confirmed

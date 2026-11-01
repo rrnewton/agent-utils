@@ -1068,10 +1068,13 @@ impl BridgeConfiguration {
         // Relay peers are delivery authorities only: the provider may
         // deliver their posts so the bridge can classify them as relay,
         // but they are never allowed (owner) senders.
-        let relay_senders = self
+        let relay_senders: std::collections::BTreeSet<String> = self
             .relay_channels
             .iter()
             .flat_map(|entry| entry.peer_senders.keys().cloned())
+            .collect();
+        let relay_senders = relay_senders
+            .into_iter()
             .map(|value| SenderId::new(value).map_err(|error| error.to_string()))
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(ChatRuntimeError::invalid)?;
@@ -6979,6 +6982,21 @@ impl BridgeState {
         };
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(message.text.as_bytes());
+        }
+        // Bounded wait: a hung relay command must not wedge admission and
+        // leave the provider batch unacknowledged forever.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                _ => {
+                    let _ = child.kill();
+                    return "command-failed".to_string();
+                }
+            }
         }
         let output = match child.wait_with_output() {
             Ok(output) => output,

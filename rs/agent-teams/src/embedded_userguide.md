@@ -245,8 +245,11 @@ the sender asks for a receipt; it never resends blind.
   `max_envelope_bytes` (default 10000, one post per envelope, never split),
   `limits.per_hour` (default 6), `visible_to_owner: true`. It posts the
   envelope as one chat post and never reposts: ambiguity is settled by the
-  receipt in the post's thread, read back through `list_argv`, or by a
-  receipt over another route to the same contact. Bodies are visible to
+  receipt in the post's thread, delivered back through the sender's bridge
+  to `relay-in` (a channel listing has no authenticated poster, so the
+  route's receipt verb never settles from one), or by a receipt over
+  another route to the same contact. `list_argv` remains useful for
+  operator diagnostics. Bodies are visible to
   every channel member, so `--private` messages never take a relay route,
   and the walk's other rules (order, pinning, failover to ssh/node-exec)
   apply unchanged: the relay is a route like any other, chosen last.
@@ -323,7 +326,7 @@ deliverer, flagged for escalation to the owner through that team's normal
 owner channel (the chat bridge). The alarm repeats on a timer
 (`alarm_interval_seconds` in the declaration's relay entry, default
 1800) whenever `relay-in`, `pump`, or `relay alarms` runs, until the
-sender is confirmed (`relay confirm`) or banned (`relay ban`). A banned
+sender is confirmed (`relay confirm`) or banned (`relay ban`; `relay unban` reverses a ban, and confirming a sender also clears its ban). A banned
 sender's posts are dropped without new alarms. `relay status` shows open
 stranger alarms first. Quarantined posts addressed to us are delivered,
 in arrival order and exactly once, as soon as their sender is confirmed —

@@ -551,8 +551,8 @@ impl Route for ChatRelayRoute {
                     .unwrap_or("")
                     .to_string();
                 {
-                    let mut posted = self.posted.lock().unwrap_or_else(|p| p.into_inner());
-                    if !posted.insert(id.clone()) {
+                    let posted = self.posted.lock().unwrap_or_else(|p| p.into_inner());
+                    if posted.contains(&id) {
                         return AttemptOutcome::Ambiguous(
                             "relay route does not repost; settled by its receipt".to_string(),
                         );
@@ -561,63 +561,39 @@ impl Route for ChatRelayRoute {
                 let text = crate::relay::render_post(payload);
                 match crate::relay::run_post_argv(&self.post_argv, &self.channel, "", &id, &text) {
                     Ok(_) => {
+                        self.posted
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .insert(id.clone());
                         self.note_post();
                         AttemptOutcome::Answered(json!({
                             "outcome": "posted", "state": "in-custody",
                             "detail": "posted to the relay channel; receipt follows in its thread",
                         }))
                     }
+                    // A post command that never started definitely posted
+                    // nothing, so the ID is not poisoned for a retry.
                     Err(reason) if reason.contains("failed to start") => {
                         AttemptOutcome::NotDelivered(reason)
                     }
-                    Err(reason) => AttemptOutcome::Ambiguous(reason),
+                    Err(reason) => {
+                        self.posted
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .insert(id.clone());
+                        AttemptOutcome::Ambiguous(reason)
+                    }
                 }
             }
             "receipt" => {
-                if self.list_argv.is_empty() {
-                    return AttemptOutcome::NotDelivered(
-                        "relay route has no list_argv to read receipts with".to_string(),
-                    );
-                }
-                let id = payload
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                let listing = match crate::relay::run_post_argv(
-                    &self.list_argv,
-                    &self.channel,
-                    "",
-                    &id,
-                    "",
-                ) {
-                    Ok(text) => text,
-                    Err(reason) => return AttemptOutcome::Ambiguous(reason),
-                };
-                // Thread listings arrive as post texts; scan for our receipt.
-                for chunk in listing.split("\n---post---\n") {
-                    if let Ok(crate::relay::RelayPost::Receipt(receipt)) =
-                        crate::relay::parse_post(chunk)
-                    {
-                        if receipt.get("id").and_then(Value::as_str) == Some(id.as_str()) {
-                            let state = receipt
-                                .get("state")
-                                .and_then(Value::as_str)
-                                .unwrap_or("unknown")
-                                .to_string();
-                            if state == crate::relay::NOT_RECORDED {
-                                return AttemptOutcome::Answered(json!({
-                                    "known": false, "id": id, "state": "unknown",
-                                    "detail": "receiver answered not-recorded",
-                                }));
-                            }
-                            return AttemptOutcome::Answered(json!({
-                                "known": true, "id": id, "state": state,
-                            }));
-                        }
-                    }
-                }
-                AttemptOutcome::Answered(json!({"known": false, "id": id, "state": "unknown"}))
+                // A channel listing carries no authenticated poster, so a
+                // receipt found in it can never settle the sender on its
+                // own. Receipts settle through `relay-in` on the sender's
+                // bridge, where the poster is authenticated and mapped.
+                let _ = payload;
+                AttemptOutcome::NotDelivered(
+                    "relay receipts arrive through relay-in, not channel listings".to_string(),
+                )
             }
             other => AttemptOutcome::NotDelivered(format!(
                 "relay route carries accept/receipt only, not {other}"

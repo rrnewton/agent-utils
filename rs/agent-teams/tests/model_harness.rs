@@ -378,6 +378,7 @@ fn claimed_entry_recovers_once() {
         proof_note: "proved",
         relayed_by: None,
         peer_host: "host-a",
+        via_chat_relay: false,
     };
     // Simulate the crash: write the claim but never hand over.
     let claim = json!({
@@ -1000,6 +1001,7 @@ fn reconcile_folds_queue_terminal_state_into_the_ledger() {
         proof_note: "proved",
         relayed_by: None,
         peer_host: "host-a",
+        via_chat_relay: false,
     };
     let now_ms = agent_teams::timeutil::now_unix_ms();
     let deliver = |id: &str, seq: i64| {
@@ -1088,6 +1090,7 @@ fn per_sender_rate_limit_refuses_beyond_the_hour() {
         proof_note: "proved",
         relayed_by: None,
         peer_host: "host-a",
+        via_chat_relay: false,
     };
     let fake = FakeDeliverer::default();
     let now_ms = agent_teams::timeutil::now_unix_ms();
@@ -1222,6 +1225,7 @@ fn same_host_designated_coordinators_are_accepted_by_default() {
             proof_note: "proved",
             relayed_by: None,
             peer_host: "host-a",
+            via_chat_relay: false,
         };
         let fake = FakeDeliverer::default();
         let id = format!(
@@ -1275,6 +1279,7 @@ fn same_host_designated_coordinators_are_accepted_by_default() {
             proof_note: "proved",
             relayed_by: None,
             peer_host: "host-a",
+            via_chat_relay: false,
         };
         let fake = FakeDeliverer::default();
         let envelope = build_envelope(

@@ -262,9 +262,26 @@ fn relay_round_trip_two_bots_one_team_receipt_and_exactly_once() {
     assert_eq!(outcome["outcome"], "accepted", "{outcome}");
     assert_eq!(world.hook_inbox_texts("tools").len(), 2);
 
-    // The receipt comes back in the thread: the sender records it, and a
-    // receipt never draws a receipt.
-    let outcome = world.relay_in(BOT1, receipt);
+    // The receipt comes back in the thread, posted by the receiving team's
+    // bot. The sender confirms that bot's announcement first (the poster
+    // must be mapped to the fleet the message was sent to).
+    let tools_announce = agent_teams::relay::build_announce(
+        "tools",
+        "host-a",
+        "UBOTTOOLS",
+        "https://example.invalid/org/repo.git",
+    );
+    let outcome = world.relay_in(
+        "UBOTTOOLS",
+        &agent_teams::relay::render_announce(&tools_announce),
+    );
+    assert_eq!(outcome["outcome"], "candidate-recorded", "{outcome}");
+    let (code, out, err) = world.run(&["relay", "confirm", "UBOTTOOLS", "--owner-approved"]);
+    assert_eq!(code, 0, "{out} {err}");
+    // A stranger's forged receipt for the same ID is refused, state intact.
+    let outcome = world.relay_in(STRANGER, receipt);
+    assert_eq!(outcome["outcome"], "receipt-refused", "{outcome}");
+    let outcome = world.relay_in("UBOTTOOLS", receipt);
     assert_eq!(outcome["outcome"], "receipt-recorded", "{outcome}");
     assert!(outcome["receipt_text"].is_null(), "{outcome}");
     let (_, out, _) = world.run(&["status", &id, "--json"]);
