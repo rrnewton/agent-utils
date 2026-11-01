@@ -936,6 +936,42 @@ fn shared_bot_signed_both_ways_with_receipts() {
 }
 
 #[test]
+fn slack_one_line_tag_and_body_delivers() {
+    // Exact live shape: Slack stores the header tag and the body on ONE
+    // line (the newline after the bracketed tag became a space, middle
+    // dots intact). The tag cross-check compares only the bracketed
+    // prefix, so this delivers; a bracket that really disagrees stays a
+    // loud stranger.
+    let world = World::new();
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    let (id, post) = world.send_sim_to_tools("relay live test one-line", "relay-oneline-1");
+    let one_line = post.replacen("]\n", "] ", 1);
+    assert!(
+        !one_line.lines().next().unwrap().ends_with(']'),
+        "{one_line}"
+    );
+    let outcome = world.relay_in(BOT1, &one_line);
+    assert_eq!(outcome["outcome"], "accepted", "{outcome}");
+    assert!(world.ledger_has("tools", &id), "delivered");
+    // Bracket really disagrees (wrong id in the tag only; the envelope
+    // JSON is untouched): loud stranger, not delivered.
+    let (id2, post2) = world.send_sim_to_tools("relay live test tampered", "relay-oneline-2");
+    let one_line2 = post2.replacen("]\n", "] ", 1);
+    let bracket_end = one_line2.find(']').unwrap();
+    let tampered = format!(
+        "{}{}",
+        one_line2[..bracket_end].replace(&id2, "tm-sim-0000000000000000"),
+        &one_line2[bracket_end..]
+    );
+    let outcome = world.relay_in(BOT1, &tampered);
+    assert_eq!(outcome["outcome"], "stranger-quarantined", "{outcome}");
+    assert!(
+        !world.ledger_has("tools", &id2),
+        "tampered post not delivered"
+    );
+}
+
+#[test]
 fn quarantine_retry_recovers_prefix_posts_and_drop_discards() {
     // Posts quarantined by the pre-fix parser (bare-fence announces that
     // read as "no agent-teams fenced block") sit in quarantine with their

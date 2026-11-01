@@ -218,6 +218,24 @@ fn parse_post_clean(clean: &str) -> Result<RelayPost, String> {
     Err("no agent-teams fenced block".to_string())
 }
 
+/// Whether a post's visible tag agrees with its envelope. Only the
+/// bracketed `[from ... · to: ... · id: ...]` prefix is compared:
+/// providers collapse the newline after the tag (Slack stores tag and
+/// body on one line), and whatever follows the bracket is body, not
+/// tag. The signed envelope remains authoritative; this advisory
+/// cross-check stays loud only when the bracket itself disagrees.
+fn tag_matches(text: &str, envelope: &Value) -> bool {
+    let line = post_tag_line(text);
+    let line = line.trim_start();
+    if !line.starts_with('[') {
+        return false;
+    }
+    match line.find(']') {
+        Some(end) => line[..=end] == team_tag(envelope),
+        None => false,
+    }
+}
+
 /// The human tag line of a post (first line), when present.
 pub fn post_tag_line(text: &str) -> String {
     let clean = strip_provider_notes(&unescape_provider_text(text));
@@ -1345,7 +1363,7 @@ fn relay_deliver(
     };
     // Malformed posts from an admitted sender are stranger events too:
     // loud and quarantined, so a broken or forged post is never silent.
-    if post_tag_line(text) != team_tag(envelope) {
+    if !tag_matches(text, envelope) {
         record_stranger(
             state,
             declaration,
@@ -1919,7 +1937,7 @@ pub fn drain_quarantine(state: &Path, this_host: &str) -> DataResult<DrainOutcom
             if post
                 .get("post")
                 .and_then(Value::as_str)
-                .is_none_or(|text| post_tag_line(text) != team_tag(&envelope))
+                .is_none_or(|text| !tag_matches(text, &envelope))
             {
                 break 'deliver false;
             }
