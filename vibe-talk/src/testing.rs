@@ -427,6 +427,7 @@ fn state_pieces_with(
         .into(),
         summary_counters: Arc::new(crate::summarize::counters::SummaryCounters::new()),
         thread_names: Arc::new(crate::summarize::threads::ThreadNames::new()),
+        startup_probe: Arc::new(crate::probe::StartupStatus::default()),
     };
     state
         .message_cache

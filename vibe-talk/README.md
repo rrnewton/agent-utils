@@ -1376,8 +1376,9 @@ podman run --name vibe-talk -p 127.0.0.1:8080:8080 \
 
 ## The startup channel probe
 
-At startup, after the configuration is loaded and before the listener is bound, the server reads
-**one message from each configured channel** and refuses to start if it cannot.
+At startup, as soon as the listener is bound, the server reads **one message from each configured
+channel** in the background, and stops if it cannot. A provider's rate limit is waited out rather
+than treated as a failure; see "A rate limit is waited out" below.
 
 This exists because of a real failure. The server was configured, it started cleanly, it logged
 its channels — and the bot had never been added to the channel. Nothing said so. The mistake
@@ -1399,7 +1400,7 @@ not just the HTTP status, decide which message you get:
 | 403, code `50001` (Missing Access) | The bot **cannot see this channel at all**: either it is not in the server, or it has no `View Channel` there | Re-run the OAuth2 invite for the right server; then, for a private channel, add the bot or its role in **Edit Channel → Permissions**. Discord does not distinguish these two, so the message names both. |
 | 403, code `50013` (Missing Permissions) | The bot **can** see the channel but may not read its history | Grant **Read Message History** on that channel. The invite is fine; this is a per-channel override. |
 | 404, code `10003` (Unknown Channel) | Wrong snowflake, or a channel this bot was never invited to | Re-copy the id (Developer Mode → right-click → Copy Channel ID); if the id is right, re-check the invite. |
-| 429 that did not clear | Rate-limited beyond the client's own retry budget, so readability was **not** established | Wait and restart. The client already waited the time Discord asked for; if it did not clear, something else is very likely sharing this bot token. See "Discord rate limits". |
+| 429 that did not clear | Rate-limited beyond the client's own retry budget **and** the probe's wait budget, so readability was **not** established | The probe already waited as Discord asked, for up to `VIBE_TALK_STARTUP_PROBE_WAIT_SECONDS`; if it did not clear, something else is very likely sharing this bot token. See "A rate limit is waited out" below and "Discord rate limits". |
 | no response | The process cannot reach `discord.com` | Check egress: DNS, outbound HTTPS, proxy. |
 | success, but every message has **blank content** | Almost certainly **Message Content Intent** is off | Turn it on (Developer Portal → Bot → Privileged Gateway Intents) and restart. |
 
@@ -1411,7 +1412,42 @@ rather than left to be discovered as "the digest is empty".
 **Failure is fatal.** The server names every channel that failed, says why, says what to do, and
 exits non-zero. That is the same posture the configuration already takes toward two identical
 tokens or a token under 24 characters: for a single-user tool, a start in a state you did not mean
-is worse than a refusal.
+is worse than a refusal. A rejected token, a missing channel and a missing permission stop it at
+once, without waiting for anything.
+
+**A rate limit is waited out** (`#718 vt-startup-probe-restart`). A deploy starts the new process
+just after the old one spent the provider's read budget, so the probe's first read is often
+refused with a rate limit (Slack's `ratelimited`, Discord's 429) that clears within seconds. That
+says nothing about the configuration, and stopping on it only made the supervisor start the server
+again, whose probe spent the budget again, so each deploy took longer than the last. Instead:
+
+- The server **binds and serves first**, from the message cache, and probes in the background.
+  The live poller, the relist and the history backfill wait for the probe, so they do not spend
+  the same rate budget meanwhile, and do not start at all when it fails. Reads the page asks for
+  are served as usual and are not held back.
+- When the only failures in a round are rate limits, it **waits as the provider asks** (its
+  `retry_after`), or, when the provider names no time, for a backoff that starts at 2 s, doubles
+  each round up to 60 s, and is jittered into its upper half. Then it reads **only the channels
+  that were limited** again. Each wait is a `WARN` line, `the startup channel probe was RATE
+  LIMITED`, with `wait_seconds`, `budget_left_seconds` and `budget_seconds`. Slack's client gives
+  up at the first rate limit during the probe, so the probe does all of the waiting; Discord's
+  limiter waits inside each read first (up to its own 30 s), so with Discord the budget can be
+  overrun by one round of those reads.
+- While it waits, `GET /healthz` still answers 200 (it is liveness) but says `"status":
+  "starting"` and `"startup_probe": "probe pending (rate limited, retry in 12s)"`, and
+  `GET /readyz` answers **503** with the same body. Once the probe passes, both say `"status":
+  "ok"` and `"startup_probe": "passed"`, and `/readyz` answers 200.
+- The total is bounded: **five minutes** by default, counted from the probe's first read. Set it
+  with `--startup-probe-wait SECONDS` or `VIBE_TALK_STARTUP_PROBE_WAIT_SECONDS` (the flag wins; `0`
+  gives up at the first rate limit, as the server did before). A wait the provider names that
+  would not fit in what is left is refused before it is taken. When the budget runs out, the server
+  logs `startup channel probe GAVE UP`, prints the per-channel report on stderr, shuts down, and
+  exits non-zero, naming the budget and how to raise it.
+
+```sh
+# give a busy provider ten minutes
+VIBE_TALK_STARTUP_PROBE_WAIT_SECONDS=600 cargo run -- --config vibe-talk.toml
+```
 
 **Skipping it, for offline development:**
 
@@ -2532,6 +2568,7 @@ model provider or a real gateway.
 | Bind address | `server.bind` | `VIBE_TALK_BIND` | `0.0.0.0:8080` in a container |
 | Public URL | `server.public_url` (or `server.public_base_url`) | `VIBE_TALK_PUBLIC_BASE_URL` | the address a phone opens the app at; `vibe-talk pair-link` builds its link on it. See [Pairing a phone](#pairing-a-phone) |
 | Time zone | `server.timezone` | `VIBE_TALK_TIMEZONE` | IANA name, default `UTC`; an unknown one refuses to start |
+| Startup probe wait | — (flag `--startup-probe-wait SECONDS`) | `VIBE_TALK_STARTUP_PROBE_WAIT_SECONDS` | how long, in all, the startup channel probe waits out the chat provider's rate limits before the server gives up and exits; default `300`, `0` gives up at the first rate limit, anything but a whole number of seconds refuses to start. See [The startup channel probe](#the-startup-channel-probe) |
 | App name | `server.app_name` / `server.short_name` | `VIBE_TALK_APP_NAME` / `VIBE_TALK_APP_SHORT_NAME` | what the installed app is called, default `vibe-talk`: the manifest's `name`, the page's title and sign-in heading. `short_name`, the label under the icon, defaults to `app_name`. At most 64 characters, not blank, no whitespace at either end and no control characters, or the server refuses to start. Give each deployment its own, so two installed on one phone are told apart; see [Installing the reader](#installing-the-reader) |
 | Fetch size | `chat.default_fetch_limit` / `chat.max_fetch_limit` | — | messages a read returns by default and at most, default `50` / `100`; older files set them under `[discord]`, and setting one in both places is refused |
 | Count ceiling | `chat.max_count_scan` | — | how many messages a count may walk, default `500`; also accepted as `discord.max_count_scan` |
@@ -5342,11 +5379,13 @@ shows a copyable link before redemption. Copy it before signing in there: each l
 once. This saves the token in the installed app's own storage, separately from Safari. The entire
 link or existing strong pairing code is accepted; links for a different server are refused.
 
-`/healthz` and the static web app require neither, and neither reveals configuration.
+`/healthz`, `/readyz` and the static web app require neither, and none reveals configuration
+beyond where the startup channel probe stands (including whether it was skipped).
 
 | Method | Path | Scope | Purpose |
 |---|---|---|---|
-| GET | `/healthz` | none | liveness |
+| GET | `/healthz` | none | liveness: always 200; `status` is `starting` and `startup_probe` says why while the startup channel probe is pending — see "The startup channel probe" |
+| GET | `/readyz` | none | readiness: 200 once the startup channel probe has passed or was skipped, 503 while it is pending or after it failed; the body of `/healthz` |
 | GET | `/api/v1/channels` | read | configured channels |
 | GET | `/api/v1/activity?hours=&per_channel_limit=&channel_id=` | read | every listed channel's (or one channel's) last few hours in one read, the newest message named: the route behind `recent_activity` — see "The tools" |
 | POST | `/api/v1/channels` | **write** | direct mode: `{id,label,writable}`; managed mode: `{source,label}` — validate and add a tracked channel; with several services, `provider` names the service, whose own mode decides — see "Several chat providers in one server" |

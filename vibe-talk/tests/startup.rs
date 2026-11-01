@@ -738,3 +738,303 @@ fn the_binary_opens_the_message_cache_its_table_enables_and_erases_it_when_disab
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `#718 vt-startup-probe-restart`. A Discord stand-in on an ephemeral local port: every message
+/// read is answered by `messages`, which is given how many reads came before it; a channel object
+/// by one naming the channel asked for, when `others` is a success; and every other call by
+/// `others`. Each answer is `(status, body)`. Returns the API base to configure.
+fn fake_discord(
+    messages: impl Fn(u32) -> (u16, String) + Send + 'static,
+    others: (u16, &'static str),
+) -> String {
+    use std::io::{Read as _, Write as _};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binding the fake Discord");
+    let base = format!("http://{}", listener.local_addr().expect("address"));
+    std::thread::spawn(move || {
+        let mut reads = 0_u32;
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                match stream.read(&mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => request.extend_from_slice(&buffer[..read]),
+                }
+            }
+            let text = String::from_utf8_lossy(&request);
+            let path = text
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap_or("")
+                .split('?')
+                .next()
+                .unwrap_or("")
+                .to_owned();
+            let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
+            let (status, body) = match segments.as_slice() {
+                [.., "channels", _, "messages"] => {
+                    reads += 1;
+                    messages(reads - 1)
+                }
+                // The channel object the probe reads first, to learn the channel's kind.
+                [.., "channels", id] if others.0 == 200 => {
+                    (200, format!(r#"{{"id":"{id}","type":0}}"#))
+                }
+                _ => (others.0, others.1.to_owned()),
+            };
+            let reply = format!(
+                "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+                 connection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(reply.as_bytes());
+        }
+    });
+    base
+}
+
+/// Discord's own 429 body, asking for `seconds`.
+fn rate_limited(seconds: f64) -> (u16, String) {
+    (
+        429,
+        format!(
+            r#"{{"message":"You are being rate limited.","retry_after":{seconds},"global":false}}"#
+        ),
+    )
+}
+
+const IDENTITY: (u16, &str) = (
+    200,
+    r#"{"id":"3000000000000000001","username":"probe-bot"}"#,
+);
+
+fn write_config_against(name: &str, api_base: &str) -> std::path::PathBuf {
+    let path = write_config(name);
+    let text = config_text().replace("http://127.0.0.1:1", api_base);
+    std::fs::write(&path, text).expect("write config");
+    path
+}
+
+/// Start the binary with the probe on, its two output streams merged into one line channel.
+fn spawn_probing(
+    config: &std::path::Path,
+    extra_env: &[(&str, &str)],
+) -> (std::process::Child, mpsc::Receiver<String>) {
+    let mut command = Command::new(binary());
+    command
+        .arg("--config")
+        .arg(config)
+        .env_remove("VIBE_TALK_SKIP_STARTUP_PROBE")
+        .env_remove("VIBE_TALK_STARTUP_PROBE_WAIT_SECONDS")
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (name, value) in extra_env {
+        command.env(name, value);
+    }
+    let mut child = command.spawn().expect("spawning the binary");
+    let (tx, rx) = mpsc::channel::<String>();
+    for stream in [
+        Box::new(child.stdout.take().expect("stdout")) as Box<dyn std::io::Read + Send>,
+        Box::new(child.stderr.take().expect("stderr")),
+    ] {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stream).lines().map_while(Result::ok) {
+                if tx.send(line).is_err() {
+                    return;
+                }
+            }
+        });
+    }
+    (child, rx)
+}
+
+/// Everything printed so far, without waiting.
+fn drain(rx: &mpsc::Receiver<String>, seen: &mut String) {
+    while let Ok(line) = rx.try_recv() {
+        seen.push_str(&line);
+        seen.push('\n');
+    }
+}
+
+/// Wait for the "vibe-talk listening" line and return the address it names.
+fn listening_address(rx: &mpsc::Receiver<String>, seen: &mut String) -> String {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        if let Ok(line) = rx.recv_timeout(Duration::from_millis(200)) {
+            seen.push_str(&line);
+            seen.push('\n');
+            if line.contains("vibe-talk listening") {
+                let address = line
+                    .split("bind=")
+                    .nth(1)
+                    .and_then(|rest| rest.split_whitespace().next())
+                    .unwrap_or_else(|| panic!("no address on the listening line: {line}"));
+                return address.to_owned();
+            }
+        }
+    }
+    panic!("the server never said it was listening:\n{seen}");
+}
+
+/// `GET path` on the running server: the status code and the JSON body.
+fn get(address: &str, path: &str) -> (u16, serde_json::Value) {
+    use std::io::{Read as _, Write as _};
+    let mut stream = std::net::TcpStream::connect(address).expect("connecting to the server");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("timeout");
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n"
+    )
+    .expect("request");
+    let mut response = String::new();
+    stream.read_to_string(&mut response).expect("response");
+    let status = response
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or_else(|| panic!("no status line: {response}"));
+    let body = response.split("\r\n\r\n").nth(1).unwrap_or("");
+    (
+        status,
+        serde_json::from_str(body).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+#[test]
+fn a_rate_limited_probe_leaves_the_server_answering_and_it_becomes_ready_when_the_limit_clears() {
+    let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let api_base = {
+        let released = std::sync::Arc::clone(&released);
+        fake_discord(
+            move |_| {
+                if released.load(std::sync::atomic::Ordering::SeqCst) {
+                    (200, "[]".to_owned())
+                } else {
+                    rate_limited(0.2)
+                }
+            },
+            IDENTITY,
+        )
+    };
+    let config = write_config_against("rate-limited-recovers", &api_base);
+    let (mut child, rx) = spawn_probing(&config, &[]);
+    let mut seen = String::new();
+    let address = listening_address(&rx, &mut seen);
+
+    // The listener answers while the probe is still being rate-limited, and says so.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let (status, health) = loop {
+        let (status, health) = get(&address, "/healthz");
+        let probe = health["startup_probe"].as_str().unwrap_or("").to_owned();
+        if probe.starts_with("probe pending (rate limited, retry in") {
+            break (status, health);
+        }
+        drain(&rx, &mut seen);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "/healthz never reported the rate-limited probe; last {health}\n{seen}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(
+        status, 200,
+        "/healthz is liveness and answers 200: {health}"
+    );
+    assert_eq!(health["status"], "starting", "{health}");
+    let (status, ready) = get(&address, "/readyz");
+    assert_eq!(status, 503, "not ready while the probe is pending: {ready}");
+    assert_eq!(child.try_wait().expect("polling the child"), None, "{seen}");
+
+    released.store(true, std::sync::atomic::Ordering::SeqCst);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let (status, ready) = get(&address, "/readyz");
+        if status == 200 {
+            assert_eq!(ready["status"], "ok", "{ready}");
+            assert_eq!(ready["startup_probe"], "passed", "{ready}");
+            break;
+        }
+        drain(&rx, &mut seen);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the server never became ready once the limit cleared; last {ready}\n{seen}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let running = child.try_wait().expect("polling the child");
+    let _ = child.kill();
+    let _ = child.wait();
+    drain(&rx, &mut seen);
+    assert_eq!(
+        running, None,
+        "a rate limit must not end the process:\n{seen}"
+    );
+    let warned = seen
+        .lines()
+        .find(|line| line.contains("the startup channel probe was RATE LIMITED"))
+        .unwrap_or_else(|| panic!("each wait is logged at WARN:\n{seen}"));
+    assert!(
+        warned.contains("WARN") && warned.contains("budget_left_seconds="),
+        "{warned}"
+    );
+}
+
+#[test]
+fn a_probe_rate_limited_past_its_budget_stops_the_server_and_says_why() {
+    let api_base = fake_discord(|_| rate_limited(0.2), IDENTITY);
+    let config = write_config_against("rate-limited-forever", &api_base);
+    let (mut child, rx) = spawn_probing(&config, &[("VIBE_TALK_STARTUP_PROBE_WAIT_SECONDS", "2")]);
+    let status = wait_for_exit(&mut child, Duration::from_secs(60));
+    let mut seen = String::new();
+    // The reader threads end when the child's streams close.
+    while let Ok(line) = rx.recv_timeout(Duration::from_secs(5)) {
+        seen.push_str(&line);
+        seen.push('\n');
+    }
+    let status = status.unwrap_or_else(|| panic!("the server waited past its budget:\n{seen}"));
+    assert!(!status.success(), "{status:?}\n{seen}");
+    assert!(
+        seen.contains("vibe-talk listening"),
+        "it served meanwhile:\n{seen}"
+    );
+    assert!(seen.contains("GAVE UP"), "{seen}");
+    assert!(
+        seen.contains("still rate-limited after the startup probe waited")
+            && seen.contains("VIBE_TALK_STARTUP_PROBE_WAIT_SECONDS"),
+        "the refusal names the budget and how to raise it:\n{seen}"
+    );
+}
+
+#[test]
+fn a_rejected_token_still_stops_the_server_at_once() {
+    let unauthorized = r#"{"message":"401: Unauthorized","code":0}"#;
+    let api_base = fake_discord(move |_| (401, unauthorized.to_owned()), (401, unauthorized));
+    let config = write_config_against("rejected-token", &api_base);
+    let started = std::time::Instant::now();
+    let (mut child, rx) = spawn_probing(&config, &[]);
+    let status = wait_for_exit(&mut child, Duration::from_secs(30));
+    let elapsed = started.elapsed();
+    let mut seen = String::new();
+    while let Ok(line) = rx.recv_timeout(Duration::from_secs(5)) {
+        seen.push_str(&line);
+        seen.push('\n');
+    }
+    let status = status.unwrap_or_else(|| panic!("a rejected token must stop the server:\n{seen}"));
+    assert!(!status.success(), "{status:?}\n{seen}");
+    assert!(seen.contains("rejected the bot token"), "{seen}");
+    assert!(seen.contains("refusing to start"), "{seen}");
+    assert!(
+        !seen.contains("RATE LIMITED"),
+        "nothing is waited out:\n{seen}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "a definite failure refuses at once, not after a wait: {elapsed:?}\n{seen}"
+    );
+}

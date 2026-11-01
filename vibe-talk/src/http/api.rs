@@ -816,13 +816,34 @@ fn validate_ingest_id(field: &str, value: &str, max_bytes: usize) -> Result<(), 
     Ok(())
 }
 
-/// `GET /healthz` — liveness only. Deliberately says nothing about the configuration.
-pub async fn healthz() -> impl IntoResponse {
-    Json(serde_json::json!({
-        "status": "ok",
+/// `GET /healthz` — liveness: always 200 while the process serves. Deliberately says nothing
+/// about the configuration beyond where the startup channel probe stands, `skipped` included. `status` is `starting` while the startup channel probe is pending,
+/// and `startup_probe` says why, as `probe pending (rate limited, retry in 12s)`
+/// (`#718 vt-startup-probe-restart`).
+pub async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
+    Json(health_body(state.startup_probe.phase()))
+}
+
+/// `GET /readyz` — readiness: 200 once the startup channel probe has passed (or was skipped),
+/// 503 while it is pending or after it failed, with the body of `/healthz`.
+/// `#718 vt-startup-probe-restart`.
+pub async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
+    let phase = state.startup_probe.phase();
+    let code = if phase.is_ready() {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (code, Json(health_body(phase)))
+}
+
+fn health_body(phase: crate::probe::StartupPhase) -> serde_json::Value {
+    serde_json::json!({
+        "status": phase.status(),
         "service": "vibe-talk",
         "version": env!("CARGO_PKG_VERSION"),
-    }))
+        "startup_probe": phase.describe(),
+    })
 }
 
 /// Fallback for unrouted paths.

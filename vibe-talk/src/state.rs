@@ -58,6 +58,9 @@ pub struct AppState {
     /// Thread display names and sentences, and the background queue that produces them.
     /// `#182 thread-display-names`, `#233 llm-summarizer`. See [`crate::summarize::threads`].
     pub thread_names: Arc<crate::summarize::threads::ThreadNames>,
+    /// Where the startup channel probe stands, for `/healthz` and `/readyz`, and for the
+    /// background readers that wait for it. `#718 vt-startup-probe-restart`.
+    pub startup_probe: Arc<crate::probe::StartupStatus>,
     /// The one place this server keeps anything between restarts.
     ///
     /// Reached only through the trait, never as a concrete database, so the backend can be

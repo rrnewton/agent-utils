@@ -2,7 +2,8 @@
 //!
 //! Route policy, stated once so it is checkable:
 //!
-//! * `/healthz` is unauthenticated and returns nothing about the configuration.
+//! * `/healthz` and `/readyz` are unauthenticated and return nothing about the configuration
+//!   beyond where the startup channel probe stands (`#718 vt-startup-probe-restart`).
 //! * The static web app is unauthenticated — it is public code, and it holds no secret. It asks
 //!   the operator for an API token at runtime.
 //! * Everything under `/api/` requires a bearer token, and the write scope is required for
@@ -168,6 +169,7 @@ pub fn compressible_type(content_type: &str) -> bool {
 fn routes(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(api::healthz))
+        .route("/readyz", get(api::readyz))
         // The static web app. One handler, which finds the file by path and decides what a
         // browser may keep of it: see `assets` for why the shell revalidates and the files it
         // names are immutable under their hashed URLs.

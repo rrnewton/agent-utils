@@ -47,6 +47,16 @@
 //! that catches is a head read that does not work (a bridge configured with `head_reads` that does
 //! not serve it, say), which the poller and a catch-up survive by reading every channel as before,
 //! at the cost of a wasted call each time.
+//!
+//! # A rate limit is waited out, after the server is up
+//!
+//! A deploy starts the new process just after the old one spent the provider's read budget, so
+//! the probe's first read is often refused with a rate limit that clears in seconds. That says
+//! nothing about the configuration, and refusing to start on it only made the supervisor start
+//! the server again, whose probe spent the budget again. So the server binds first and probes
+//! in the background ([`startup_check_patiently`]), waits as the provider asks, and stops only on
+//! a definite failure or when its wait budget runs out (`#718 vt-startup-probe-restart`). Until
+//! then `/healthz` and `/readyz` say the probe is pending ([`StartupStatus`]).
 
 use std::borrow::Cow;
 use std::time::Duration;
@@ -333,9 +343,10 @@ impl Diagnosis {
                  re-check the invite."
             }
             Self::RateLimited => {
-                "Wait and restart. The client already waited the time the provider asked for and the \
-                 limit did not clear inside its budget, so something else is very likely sharing \
-                 this bot token and burning its rate limit."
+                "Wait and try again. The client already waited the time the provider asked for, and \
+                 at startup the probe goes on waiting for up to VIBE_TALK_STARTUP_PROBE_WAIT_SECONDS \
+                 (five minutes unless set), so a limit that did not clear means something else is \
+                 very likely sharing this credential and spending its rate limit."
             }
             Self::UnexpectedStatus { .. } => {
                 "Read the status and body above. A 5xx means the provider or a gateway failed; \
@@ -672,26 +683,55 @@ pub async fn probe_channels_within(
     channels: &[ChannelInfo],
     budget: Option<Duration>,
 ) -> ProbeReport {
+    probe_round(chat, channels, budget).await.0
+}
+
+/// One read of each channel, with what the provider asked for beside each outcome that was a rate
+/// limit naming a time. Kept beside the report rather than in it, because the report speaks the
+/// vocabulary every check shares and only the startup probe waits.
+async fn probe_round(
+    chat: &dyn ChatClient,
+    channels: &[ChannelInfo],
+    budget: Option<Duration>,
+) -> (ProbeReport, Vec<Option<Duration>>) {
     let mut outcomes = Vec::with_capacity(channels.len());
+    let mut asked = Vec::with_capacity(channels.len());
     let mut aborted = false;
     for channel in channels {
-        let read = crate::read_reason::ReadReason::Probe
-            .scope(chat.probe_channel(&channel.id, PROBE_LIMIT));
-        let answered = match budget {
-            Some(budget) => match tokio::time::timeout(budget, read).await {
-                Ok(answered) => answered,
-                Err(_elapsed) => {
-                    outcomes.push(ChannelProbe {
-                        channel: channel.clone(),
-                        diagnosis: Diagnosis::TimedOut(budget.as_secs()),
-                    });
-                    continue;
-                }
-            },
-            None => read.await,
-        };
-        let diagnosis = match answered {
-            Ok(messages) => Diagnosis::Readable {
+        let (diagnosis, retry_after) = probe_one(chat, channel, budget).await;
+        let is_token_failure = diagnosis == Diagnosis::InvalidToken;
+        outcomes.push(ChannelProbe {
+            channel: channel.clone(),
+            diagnosis,
+        });
+        asked.push(retry_after);
+        if is_token_failure {
+            aborted = true;
+            break;
+        }
+    }
+    (ProbeReport { outcomes, aborted }, asked)
+}
+
+/// Read one channel's newest message and classify the answer, with how long the provider asked
+/// to be left alone when the answer was a rate limit and it named a time.
+async fn probe_one(
+    chat: &dyn ChatClient,
+    channel: &ChannelInfo,
+    budget: Option<Duration>,
+) -> (Diagnosis, Option<Duration>) {
+    let read =
+        crate::read_reason::ReadReason::Probe.scope(chat.probe_channel(&channel.id, PROBE_LIMIT));
+    let answered = match budget {
+        Some(budget) => match tokio::time::timeout(budget, read).await {
+            Ok(answered) => answered,
+            Err(_elapsed) => return (Diagnosis::TimedOut(budget.as_secs()), None),
+        },
+        None => read.await,
+    };
+    match answered {
+        Ok(messages) => (
+            Diagnosis::Readable {
                 messages: messages.len(),
                 // Vacuously true on an empty channel would be a false alarm, so an empty result
                 // is not evidence of anything: require at least one message before suspecting the
@@ -699,19 +739,10 @@ pub async fn probe_channels_within(
                 suspect_message_content_intent: !messages.is_empty()
                     && messages.iter().all(|m| m.content.trim().is_empty()),
             },
-            Err(error) => classify(&error),
-        };
-        let is_token_failure = diagnosis == Diagnosis::InvalidToken;
-        outcomes.push(ChannelProbe {
-            channel: channel.clone(),
-            diagnosis,
-        });
-        if is_token_failure {
-            aborted = true;
-            break;
-        }
+            None,
+        ),
+        Err(error) => (classify(&error), error.retry_after()),
     }
-    ProbeReport { outcomes, aborted }
 }
 
 /// Whether the startup check ran, and what it concluded.
@@ -727,8 +758,17 @@ pub enum StartupCheck {
     },
     /// The probe ran and every channel is readable. May still carry warnings.
     Passed(ProbeReport),
-    /// The probe ran and at least one channel is not readable.
+    /// The probe ran and at least one channel is definitely not readable: a rejected token, a
+    /// missing channel, a missing permission, or anything else that is not a rate limit.
     Failed(ProbeReport),
+    /// The provider was still rate-limiting the probe when its wait budget ran out, so
+    /// readability was never established. `#718 vt-startup-probe-restart`.
+    RateLimited {
+        /// The last round's report: every channel still rate-limited says so.
+        report: ProbeReport,
+        /// How long the probe had been running when it gave up.
+        waited: Duration,
+    },
 }
 
 /// Whether an environment value asks for the probe to be skipped.
@@ -740,7 +780,221 @@ pub fn env_requests_skip(value: Option<&str>) -> bool {
     value.is_some_and(|v| !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"))
 }
 
-/// Run the startup check, honouring the skip switches.
+/// Environment variable bounding how long the startup probe waits out a provider's rate limit,
+/// in whole seconds. `#718 vt-startup-probe-restart`.
+pub const ENV_STARTUP_PROBE_WAIT: &str = "VIBE_TALK_STARTUP_PROBE_WAIT_SECONDS";
+
+/// Command-line flag for the same bound; it wins over [`ENV_STARTUP_PROBE_WAIT`].
+pub const WAIT_FLAG: &str = "--startup-probe-wait";
+
+/// How long the startup probe waits out rate limits when nothing says otherwise.
+pub const DEFAULT_RATE_LIMIT_WAIT: Duration = Duration::from_secs(300);
+
+/// The longest wait budget accepted: one day. Longer is a typo, and a deadline that far out
+/// would not fit in a clock reading.
+pub const MAX_RATE_LIMIT_WAIT: Duration = Duration::from_secs(86_400);
+
+/// The startup probe's wait budget from the flag's value, else the environment's, else
+/// [`DEFAULT_RATE_LIMIT_WAIT`]. An empty environment value counts as unset, as it does for the
+/// skip; `0` means "do not wait": the first rate limit stops the server, as it did before the
+/// probe learned to wait.
+///
+/// # Errors
+///
+/// The setting's name and the value, when the value is not a whole number of seconds up to
+/// [`MAX_RATE_LIMIT_WAIT`].
+pub fn wait_budget(flag: Option<&str>, env: Option<&str>) -> Result<Duration, String> {
+    let (name, value) = match (flag, env) {
+        (Some(value), _) => (WAIT_FLAG, value),
+        (None, Some(value)) if !value.trim().is_empty() => (ENV_STARTUP_PROBE_WAIT, value),
+        _ => return Ok(DEFAULT_RATE_LIMIT_WAIT),
+    };
+    value
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
+        .filter(|budget| *budget <= MAX_RATE_LIMIT_WAIT)
+        .ok_or_else(|| {
+            format!(
+                "{name} must be a whole number of seconds, at most {}, not {value:?}",
+                MAX_RATE_LIMIT_WAIT.as_secs()
+            )
+        })
+}
+
+/// How the startup probe waits out a provider's rate limit. `#718 vt-startup-probe-restart`.
+///
+/// A deploy restarts the server just after the previous process spent the provider's read
+/// budget, so the first probe is often refused with a rate limit that clears in seconds. Treated
+/// as a failure, it stopped the server, whose supervisor restarted it, whose probe spent the
+/// budget again. So a rate limit is waited out instead: for the time the provider names, or else
+/// for a growing, jittered backoff; and only the channels that were limited are read again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimitPatience {
+    /// The most time the probe may run, counted from its first read, before it gives up.
+    pub budget: Duration,
+    /// The first wait when the provider names no time; each later one doubles it.
+    pub first_backoff: Duration,
+    /// The longest wait when the provider names no time.
+    pub max_backoff: Duration,
+}
+
+impl RateLimitPatience {
+    /// Wait at most `budget` in all, backing off from 2 s up to 60 s when the provider names no
+    /// time.
+    #[must_use]
+    pub fn within(budget: Duration) -> Self {
+        Self {
+            budget,
+            first_backoff: Duration::from_secs(2),
+            max_backoff: Duration::from_secs(60),
+        }
+    }
+
+    /// The wait before re-reading after the `round`th rate-limited round (from 0): what the
+    /// provider asked for when it named a time, else the backoff for that round scaled by
+    /// `jitter` (in `[0, 1]`) into its upper half, so that it is never zero and never past
+    /// `max_backoff`.
+    #[must_use]
+    pub fn next_wait(&self, asked: Option<Duration>, round: u32, jitter: f64) -> Duration {
+        if let Some(asked) = asked.filter(|asked| !asked.is_zero()) {
+            return asked;
+        }
+        let doubled = self
+            .first_backoff
+            .saturating_mul(1_u32 << round.min(16))
+            .min(self.max_backoff);
+        doubled.mul_f64(0.5 + 0.5 * jitter.clamp(0.0, 1.0))
+    }
+}
+
+impl Default for RateLimitPatience {
+    fn default() -> Self {
+        Self::within(DEFAULT_RATE_LIMIT_WAIT)
+    }
+}
+
+/// A number in `[0, 1]` from the system's random source, so that servers restarted together do
+/// not retry together; `1.0`, the plain backoff, when there is no random source.
+fn jitter() -> f64 {
+    let mut bytes = [0_u8; 4];
+    match getrandom::fill(&mut bytes) {
+        Ok(()) => f64::from(u32::from_le_bytes(bytes)) / f64::from(u32::MAX),
+        Err(_) => 1.0,
+    }
+}
+
+/// Where the startup probe stands, for `/healthz` and `/readyz` and for the background work
+/// that should not read the provider before it is done. `#718 vt-startup-probe-restart`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupPhase {
+    /// No startup probe belongs to this server: one built by a test, say.
+    NotRun,
+    /// Reading each configured channel.
+    Probing,
+    /// The provider rate-limited the probe; it reads the limited channels again at `retry_at`.
+    RateLimited {
+        /// When the next read is due.
+        retry_at: tokio::time::Instant,
+    },
+    /// Every configured channel was readable.
+    Passed,
+    /// The probe was switched off.
+    Skipped,
+    /// The probe failed, or gave up waiting, and the server is stopping.
+    Failed,
+}
+
+impl StartupPhase {
+    /// Whether the probe is done, one way or the other.
+    #[must_use]
+    pub fn is_settled(self) -> bool {
+        !matches!(self, Self::Probing | Self::RateLimited { .. })
+    }
+
+    /// Whether the server is ready: its probe passed, was skipped, or was never part of it.
+    #[must_use]
+    pub fn is_ready(self) -> bool {
+        matches!(self, Self::NotRun | Self::Passed | Self::Skipped)
+    }
+
+    /// The overall word for `/healthz`: `ok` when ready, `starting` while the probe is pending,
+    /// `failed` once it has failed.
+    #[must_use]
+    pub fn status(self) -> &'static str {
+        match self {
+            Self::Failed => "failed",
+            phase if phase.is_ready() => "ok",
+            _ => "starting",
+        }
+    }
+
+    /// What the probe is doing, as `/healthz` says it: `probe pending (rate limited, retry in
+    /// 12s)` while it waits out a rate limit.
+    #[must_use]
+    pub fn describe(self) -> String {
+        match self {
+            Self::NotRun => "not run".to_owned(),
+            Self::Probing => "probe pending (reading each configured channel)".to_owned(),
+            Self::RateLimited { retry_at } => {
+                let left = retry_at.saturating_duration_since(tokio::time::Instant::now());
+                format!(
+                    "probe pending (rate limited, retry in {}s)",
+                    left.as_secs() + u64::from(left.subsec_nanos() > 0)
+                )
+            }
+            Self::Passed => "passed".to_owned(),
+            Self::Skipped => "skipped".to_owned(),
+            Self::Failed => "failed; the server is stopping".to_owned(),
+        }
+    }
+}
+
+/// The startup probe's [`StartupPhase`], shared between the probe and whoever asks.
+#[derive(Debug)]
+pub struct StartupStatus(tokio::sync::watch::Sender<StartupPhase>);
+
+impl StartupStatus {
+    /// A status in `phase`.
+    #[must_use]
+    pub fn new(phase: StartupPhase) -> Self {
+        Self(tokio::sync::watch::Sender::new(phase))
+    }
+
+    /// The phase now.
+    #[must_use]
+    pub fn phase(&self) -> StartupPhase {
+        *self.0.borrow()
+    }
+
+    /// Move to `phase`.
+    pub fn set(&self, phase: StartupPhase) {
+        self.0.send_replace(phase);
+    }
+
+    /// Return once the probe is done, one way or the other; at once when it already is.
+    pub async fn settled(&self) {
+        let mut phases = self.0.subscribe();
+        // The sender lives in `self`, so it cannot be dropped while this waits.
+        let _ = phases.wait_for(|phase| phase.is_settled()).await;
+    }
+
+    /// Wait until the probe is done, and say whether the server is ready: `false` once it
+    /// failed, when the server is stopping and background work should not start reading.
+    pub async fn ready(&self) -> bool {
+        self.settled().await;
+        self.phase().is_ready()
+    }
+}
+
+impl Default for StartupStatus {
+    fn default() -> Self {
+        Self::new(StartupPhase::NotRun)
+    }
+}
+
+/// Run the startup check once, honouring the skip switches; a rate limit fails it at once.
 ///
 /// The skip is resolved here rather than at the call site so that "was it skipped, and by what"
 /// is a value a test can assert on, instead of a branch that only exists inside `main`.
@@ -750,19 +1004,125 @@ pub async fn startup_check(
     skip_flag: bool,
     skip_env: Option<&str>,
 ) -> StartupCheck {
+    startup_check_patiently(
+        chat,
+        channels,
+        skip_flag,
+        skip_env,
+        RateLimitPatience::within(Duration::ZERO),
+        &StartupStatus::default(),
+    )
+    .await
+}
+
+/// Run the startup check, honouring the skip switches, waiting out provider rate limits within
+/// `patience`, and keeping `status` current throughout. `#718 vt-startup-probe-restart`.
+///
+/// A definite failure (a rejected token, a missing channel or permission, anything that is not a
+/// rate limit) ends it at once, as it always did. A round in which the only failures are rate
+/// limits is followed by a wait, logged at WARN with the budget left, and a second read of just
+/// those channels. When the next wait would not fit in what is left of the budget, it gives up
+/// with [`StartupCheck::RateLimited`]: a wait the provider named that is longer than the time
+/// left is refused before it is taken, and a backoff of this server's choosing is cut short to
+/// make one last read at the end of the budget.
+pub async fn startup_check_patiently(
+    chat: &dyn ChatClient,
+    channels: &[ChannelInfo],
+    skip_flag: bool,
+    skip_env: Option<&str>,
+    patience: RateLimitPatience,
+    status: &StartupStatus,
+) -> StartupCheck {
     if skip_flag {
+        status.set(StartupPhase::Skipped);
         return StartupCheck::Skipped { source: SKIP_FLAG };
     }
     if env_requests_skip(skip_env) {
+        status.set(StartupPhase::Skipped);
         return StartupCheck::Skipped {
             source: ENV_SKIP_STARTUP_PROBE,
         };
     }
-    let report = probe_channels(chat, channels).await;
-    if report.is_failure() {
-        StartupCheck::Failed(report)
-    } else {
-        StartupCheck::Passed(report)
+    status.set(StartupPhase::Probing);
+    let started = tokio::time::Instant::now();
+    let deadline = started + patience.budget;
+    let provider = chat.provider_name();
+    // With time to wait, the probe does the waiting: a client that can give up at a provider's
+    // first rate limit does, so `/healthz` says the probe is rate-limited while it waits and the
+    // wait counts against this budget. One that cannot (Discord's limiter waits inside the read,
+    // up to its own 30 s) waits there first, so the budget can be overrun by one round of those.
+    let hurried = !patience.budget.is_zero();
+    let (mut report, mut asked) =
+        crate::read_reason::hurry(hurried, probe_round(chat, channels, None)).await;
+    let mut round = 0_u32;
+    loop {
+        let limited: Vec<usize> = report
+            .outcomes
+            .iter()
+            .enumerate()
+            .filter(|(_, outcome)| outcome.diagnosis == Diagnosis::RateLimited)
+            .map(|(index, _)| index)
+            .collect();
+        let definite = report.aborted
+            || report
+                .outcomes
+                .iter()
+                .any(|o| o.diagnosis.is_failure() && o.diagnosis != Diagnosis::RateLimited);
+        if definite {
+            status.set(StartupPhase::Failed);
+            return StartupCheck::Failed(report);
+        }
+        if limited.is_empty() {
+            status.set(StartupPhase::Passed);
+            return StartupCheck::Passed(report);
+        }
+        let named = limited
+            .iter()
+            .filter_map(|&index| asked[index])
+            .filter(|asked| !asked.is_zero())
+            .max();
+        let now = tokio::time::Instant::now();
+        let left = deadline.saturating_duration_since(now);
+        let mut wait = patience.next_wait(named, round, jitter());
+        if wait > left {
+            if named.is_some() || left.is_zero() {
+                status.set(StartupPhase::Failed);
+                return StartupCheck::RateLimited {
+                    report,
+                    waited: now - started,
+                };
+            }
+            wait = left;
+        }
+        tracing::warn!(
+            provider,
+            rate_limited = limited.len(),
+            configured = channels.len(),
+            wait_seconds = wait.as_secs_f64(),
+            asked_by_provider = named.is_some(),
+            budget_left_seconds = (left - wait).as_secs(),
+            budget_seconds = patience.budget.as_secs(),
+            "the startup channel probe was RATE LIMITED; waiting, then reading only the limited \
+             channels again. The server is already serving meanwhile."
+        );
+        status.set(StartupPhase::RateLimited {
+            retry_at: now + wait,
+        });
+        tokio::time::sleep(wait).await;
+        status.set(StartupPhase::Probing);
+        for &index in &limited {
+            let channel = report.outcomes[index].channel.clone();
+            let (diagnosis, retry_after) =
+                crate::read_reason::hurry(hurried, probe_one(chat, &channel, None)).await;
+            let is_token_failure = diagnosis == Diagnosis::InvalidToken;
+            report.outcomes[index].diagnosis = diagnosis;
+            asked[index] = retry_after;
+            if is_token_failure {
+                report.aborted = true;
+                break;
+            }
+        }
+        round += 1;
     }
 }
 
@@ -774,6 +1134,7 @@ mod tests {
     use super::*;
     use crate::discord::fake::FakeDiscord;
     use crate::model::{ChannelId, ChannelInfo};
+    use std::sync::Arc;
 
     fn info(id: &str, label: &str, writable: bool) -> ChannelInfo {
         ChannelInfo {
@@ -1137,5 +1498,383 @@ mod tests {
                 suspect_message_content_intent: false
             }
         );
+    }
+
+    /// One scripted answer: given the channel and how many times it was read before.
+    type Script =
+        dyn Fn(&ChannelId, u32) -> Result<Vec<crate::model::Message>, ChatError> + Send + Sync;
+
+    /// `#718 vt-startup-probe-restart`. A chat client whose every read is answered by a script,
+    /// given the channel and how many times that channel has been read before.
+    struct Scripted {
+        answer: Box<Script>,
+        reads: std::sync::Mutex<std::collections::HashMap<String, u32>>,
+    }
+
+    impl Scripted {
+        fn new(
+            answer: impl Fn(&ChannelId, u32) -> Result<Vec<crate::model::Message>, ChatError>
+                + Send
+                + Sync
+                + 'static,
+        ) -> Self {
+            Self {
+                answer: Box::new(answer),
+                reads: std::sync::Mutex::default(),
+            }
+        }
+
+        fn reads_of(&self, channel: &str) -> u32 {
+            self.reads
+                .lock()
+                .expect("reads")
+                .get(channel)
+                .copied()
+                .unwrap_or(0)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChatClient for Scripted {
+        async fn identity(&self) -> Result<crate::chat::ChatIdentity, ChatError> {
+            Ok(crate::chat::ChatIdentity {
+                id: "U1".to_owned(),
+                username: "probe-test".to_owned(),
+                workspace: None,
+            })
+        }
+        async fn fetch_page(
+            &self,
+            channel: &ChannelId,
+            _limit: u16,
+            _before: Option<&crate::model::MessageId>,
+            _after: Option<&crate::model::MessageId>,
+        ) -> Result<Vec<crate::model::Message>, ChatError> {
+            let before = {
+                let mut reads = self.reads.lock().expect("reads");
+                let count = reads.entry(channel.0.clone()).or_insert(0);
+                *count += 1;
+                *count - 1
+            };
+            (self.answer)(channel, before)
+        }
+        async fn post_message(
+            &self,
+            _channel: &ChannelId,
+            _content: &str,
+            _reply_to: Option<&crate::model::MessageId>,
+        ) -> Result<crate::model::Message, ChatError> {
+            panic!("the startup probe must never post");
+        }
+    }
+
+    /// What a rate-limited read returns once the client has waited out its own budget: the
+    /// provider's `retry_after` when it named one, a bare 429 when it did not.
+    fn limited(retry_after: Option<Duration>) -> ChatError {
+        match retry_after {
+            Some(retry_after) => ChatError::RateLimited(crate::chat::RateLimitExhausted {
+                provider: "slack",
+                route: "conversations.history".to_owned(),
+                attempts: 1,
+                waited: Duration::ZERO,
+                budget: Duration::from_secs(30),
+                retry_after,
+                global: false,
+            })
+            .with_provider("Slack"),
+            None => status(429, "{}"),
+        }
+    }
+
+    fn patient(seconds: u64) -> RateLimitPatience {
+        RateLimitPatience::within(Duration::from_secs(seconds))
+    }
+
+    async fn patiently(
+        chat: &dyn ChatClient,
+        channels: &[ChannelInfo],
+        patience: RateLimitPatience,
+        status: &StartupStatus,
+    ) -> StartupCheck {
+        startup_check_patiently(chat, channels, false, None, patience, status).await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_rate_limited_probe_waits_as_the_provider_asks_and_then_passes() {
+        let chat = Scripted::new(|_, before| {
+            if before < 3 {
+                Err(limited(Some(Duration::from_secs(7))))
+            } else {
+                Ok(Vec::new())
+            }
+        });
+        let status = StartupStatus::new(StartupPhase::Probing);
+        let started = tokio::time::Instant::now();
+        let checked = patiently(&chat, &[info("C1", "team", true)], patient(300), &status).await;
+        assert!(matches!(checked, StartupCheck::Passed(_)), "{checked:?}");
+        assert_eq!(chat.reads_of("C1"), 4);
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(21),
+            "three waits of exactly the 7 s the provider asked for"
+        );
+        assert_eq!(status.phase(), StartupPhase::Passed);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_probe_rate_limited_forever_gives_up_inside_its_budget() {
+        let chat = Scripted::new(|_, _| Err(limited(Some(Duration::from_secs(40)))));
+        let status = StartupStatus::new(StartupPhase::Probing);
+        let started = tokio::time::Instant::now();
+        let checked = patiently(&chat, &[info("C1", "team", true)], patient(100), &status).await;
+        let StartupCheck::RateLimited { report, waited } = checked else {
+            panic!("expected the probe to give up on the rate limit, got {checked:?}");
+        };
+        // 40 s, 40 s, and a third 40 s would pass the 100 s budget, so it is refused untaken.
+        assert_eq!(waited, Duration::from_secs(80));
+        assert_eq!(started.elapsed(), Duration::from_secs(80));
+        assert_eq!(chat.reads_of("C1"), 3);
+        assert_eq!(report.outcomes[0].diagnosis, Diagnosis::RateLimited);
+        assert!(report.render_for("Slack").contains("rate-limited"));
+        assert_eq!(status.phase(), StartupPhase::Failed);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn without_a_named_time_it_backs_off_and_still_stops_at_the_budget() {
+        let chat = Scripted::new(|_, _| Err(limited(None)));
+        let status = StartupStatus::default();
+        let started = tokio::time::Instant::now();
+        let checked = patiently(&chat, &[info("C1", "team", true)], patient(30), &status).await;
+        let StartupCheck::RateLimited { waited, .. } = checked else {
+            panic!("expected the probe to give up on the rate limit, got {checked:?}");
+        };
+        // Its own backoff is cut short to make one last read exactly at the end of the budget.
+        assert_eq!(waited, Duration::from_secs(30));
+        assert_eq!(started.elapsed(), Duration::from_secs(30));
+        assert!(chat.reads_of("C1") >= 3, "{}", chat.reads_of("C1"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_rejected_token_still_refuses_at_once() {
+        let chat = Scripted::new(|_, _| Err(status(401, r#"{"code":0}"#)));
+        let status = StartupStatus::new(StartupPhase::Probing);
+        let started = tokio::time::Instant::now();
+        let checked = patiently(
+            &chat,
+            &[info("C1", "a", false), info("C2", "b", false)],
+            patient(300),
+            &status,
+        )
+        .await;
+        let StartupCheck::Failed(report) = checked else {
+            panic!("a rejected token must refuse, got {checked:?}");
+        };
+        assert!(report.aborted);
+        assert_eq!(started.elapsed(), Duration::ZERO, "nothing is waited out");
+        assert_eq!(chat.reads_of("C1") + chat.reads_of("C2"), 1);
+        assert_eq!(status.phase(), StartupPhase::Failed);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_definite_failure_beside_a_rate_limit_refuses_at_once() {
+        let chat = Scripted::new(|channel, _| match channel.0.as_str() {
+            "C1" => Err(limited(Some(Duration::from_secs(5)))),
+            _ => Err(status(404, r#"{"code":10003}"#)),
+        });
+        let started = tokio::time::Instant::now();
+        let checked = patiently(
+            &chat,
+            &[info("C1", "limited", false), info("C2", "typo'd", false)],
+            patient(300),
+            &StartupStatus::default(),
+        )
+        .await;
+        assert!(matches!(checked, StartupCheck::Failed(_)), "{checked:?}");
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn only_the_rate_limited_channels_are_read_again() {
+        let chat = Scripted::new(|channel, before| match (channel.0.as_str(), before) {
+            ("C2", 0) => Err(limited(Some(Duration::from_secs(3)))),
+            _ => Ok(Vec::new()),
+        });
+        let checked = patiently(
+            &chat,
+            &[info("C1", "quiet", false), info("C2", "busy", false)],
+            patient(300),
+            &StartupStatus::default(),
+        )
+        .await;
+        let StartupCheck::Passed(report) = checked else {
+            panic!("expected a pass, got {checked:?}");
+        };
+        assert_eq!(report.outcomes.len(), 2);
+        assert_eq!(
+            chat.reads_of("C1"),
+            1,
+            "a readable channel is not read again"
+        );
+        assert_eq!(chat.reads_of("C2"), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_zero_budget_gives_up_at_the_first_rate_limit() {
+        let chat = Scripted::new(|_, _| Err(limited(Some(Duration::from_secs(1)))));
+        let checked = startup_check(&chat, &[info("C1", "team", true)], false, None).await;
+        assert!(
+            matches!(checked, StartupCheck::RateLimited { waited, .. } if waited.is_zero()),
+            "{checked:?}"
+        );
+        assert_eq!(chat.reads_of("C1"), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_status_says_when_the_next_read_is_due_while_it_waits() {
+        let chat = Arc::new(Scripted::new(|_, before| {
+            if before == 0 {
+                Err(limited(Some(Duration::from_secs(12))))
+            } else {
+                Ok(Vec::new())
+            }
+        }));
+        let status = Arc::new(StartupStatus::new(StartupPhase::Probing));
+        let task = {
+            let (chat, status) = (Arc::clone(&chat), Arc::clone(&status));
+            tokio::spawn(async move {
+                patiently(
+                    chat.as_ref(),
+                    &[info("C1", "team", true)],
+                    patient(300),
+                    &status,
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let phase = status.phase();
+        assert!(
+            matches!(phase, StartupPhase::RateLimited { .. }),
+            "{phase:?}"
+        );
+        assert!(!phase.is_ready() && !phase.is_settled());
+        assert_eq!(phase.status(), "starting");
+        assert_eq!(
+            phase.describe(),
+            "probe pending (rate limited, retry in 11s)",
+            "12 s asked, 1.5 s gone, rounded up"
+        );
+        let waiter = {
+            let status = Arc::clone(&status);
+            tokio::spawn(async move { status.settled().await })
+        };
+        assert!(matches!(
+            task.await.expect("probe"),
+            StartupCheck::Passed(_)
+        ));
+        waiter.await.expect("settled returns once the probe passes");
+        assert_eq!(status.phase().status(), "ok");
+        assert_eq!(status.phase().describe(), "passed");
+    }
+
+    #[test]
+    fn the_wait_honours_the_provider_and_otherwise_backs_off_with_bounded_jitter() {
+        let patience = patient(300);
+        assert_eq!(
+            patience.next_wait(Some(Duration::from_secs(9)), 5, 0.0),
+            Duration::from_secs(9),
+            "a time the provider names is waited exactly"
+        );
+        // A zero the provider names is no time at all: back off instead of spinning.
+        assert_eq!(
+            patience.next_wait(Some(Duration::ZERO), 0, 1.0),
+            Duration::from_secs(2)
+        );
+        assert_eq!(patience.next_wait(None, 0, 1.0), Duration::from_secs(2));
+        assert_eq!(patience.next_wait(None, 0, 0.0), Duration::from_secs(1));
+        assert_eq!(patience.next_wait(None, 3, 1.0), Duration::from_secs(16));
+        assert_eq!(patience.next_wait(None, 10, 1.0), Duration::from_secs(60));
+        assert_eq!(patience.next_wait(None, 40, 0.0), Duration::from_secs(30));
+        for _ in 0..100 {
+            let wait = patience.next_wait(None, 2, jitter());
+            assert!(
+                (Duration::from_secs(4)..=Duration::from_secs(8)).contains(&wait),
+                "{wait:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_wait_budget_comes_from_the_flag_then_the_environment_then_five_minutes() {
+        assert_eq!(wait_budget(None, None), Ok(Duration::from_secs(300)));
+        assert_eq!(wait_budget(None, Some("")), Ok(Duration::from_secs(300)));
+        assert_eq!(wait_budget(None, Some("45")), Ok(Duration::from_secs(45)));
+        assert_eq!(wait_budget(Some("0"), Some("45")), Ok(Duration::ZERO));
+        let refused = wait_budget(None, Some("5m")).expect_err("not seconds");
+        assert!(refused.contains(ENV_STARTUP_PROBE_WAIT), "{refused}");
+        let refused = wait_budget(Some("-1"), None).expect_err("not seconds");
+        assert!(refused.contains(WAIT_FLAG), "{refused}");
+        assert_eq!(wait_budget(Some("86400"), None), Ok(MAX_RATE_LIMIT_WAIT));
+        // A deadline this far out would not fit in a clock reading, and would panic the probe.
+        assert!(wait_budget(None, Some("18446744073709551615")).is_err());
+        assert!(wait_budget(Some("86401"), None).is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_patient_probe_asks_the_client_to_leave_the_waiting_to_it() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let chat = {
+            let seen = Arc::clone(&seen);
+            Scripted::new(move |_, before| {
+                seen.lock()
+                    .expect("seen")
+                    .push(crate::read_reason::hurried());
+                if before == 0 {
+                    Err(limited(Some(Duration::from_secs(2))))
+                } else {
+                    Ok(Vec::new())
+                }
+            })
+        };
+        let checked = patiently(
+            &chat,
+            &[info("C1", "team", true)],
+            patient(60),
+            &StartupStatus::default(),
+        )
+        .await;
+        assert!(matches!(checked, StartupCheck::Passed(_)), "{checked:?}");
+        assert_eq!(*seen.lock().expect("seen"), vec![true, true]);
+
+        // With no time to wait, the client keeps its own patience, as before the probe waited.
+        seen.lock().expect("seen").clear();
+        let _ = startup_check(&chat, &[info("C2", "team", true)], false, None).await;
+        assert_eq!(*seen.lock().expect("seen"), vec![false]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_zero_retry_after_is_no_time_named_so_the_last_backoff_is_cut_short() {
+        let chat = Scripted::new(|_, _| Err(limited(Some(Duration::ZERO))));
+        let started = tokio::time::Instant::now();
+        let checked = patiently(
+            &chat,
+            &[info("C1", "team", true)],
+            patient(10),
+            &StartupStatus::default(),
+        )
+        .await;
+        let StartupCheck::RateLimited { waited, .. } = checked else {
+            panic!("expected the probe to give up on the rate limit, got {checked:?}");
+        };
+        assert_eq!(waited, Duration::from_secs(10));
+        assert_eq!(started.elapsed(), Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn a_server_with_no_probe_is_ready_and_settled() {
+        let status = StartupStatus::default();
+        status.settled().await;
+        assert!(status.phase().is_ready());
+        assert_eq!(status.phase().status(), "ok");
     }
 }

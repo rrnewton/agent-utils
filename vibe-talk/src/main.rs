@@ -36,6 +36,7 @@ vibe-talk — a chat bridge for a voice agent
 
 USAGE:
     vibe-talk [--config PATH] [--config-overlay PATH]... [--fake-discord] [--skip-startup-probe]
+              [--startup-probe-wait SECONDS]
     vibe-talk pair-link [--config PATH] [--config-overlay PATH]... [--base-url URL] [--ttl SECONDS]
     vibe-talk recap [--config PATH] [--hours N | --since WHEN] [--channel NAME] [--json]
     vibe-talk cache-stats PATH
@@ -74,6 +75,14 @@ OPTIONS:
                           Also settable as VIBE_TALK_SKIP_STARTUP_PROBE=1. The skip is logged
                           loudly, because an unchecked channel surfaces later as an empty result
                           that looks like a bug in this server.
+    --startup-probe-wait SECONDS
+                          how long, in all, the startup channel probe may wait out the chat
+                          provider's rate limits before it gives up and the server exits
+                          (default 300; also VIBE_TALK_STARTUP_PROBE_WAIT_SECONDS; 0 gives up at
+                          the first rate limit). The server binds and serves first and probes
+                          in the background; meanwhile /healthz says `probe pending (rate
+                          limited, retry in Ns)` and /readyz answers 503. A rejected token, a
+                          missing channel or a missing permission still stops it at once
     --version             print the version and exit
     --help                print this message and exit
 
@@ -229,6 +238,7 @@ struct Args {
     overlays: Vec<PathBuf>,
     fake_discord: bool,
     skip_startup_probe: bool,
+    startup_probe_wait: Option<String>,
 }
 
 fn parse_args() -> anyhow::Result<Option<Args>> {
@@ -237,6 +247,7 @@ fn parse_args() -> anyhow::Result<Option<Args>> {
         overlays: Vec::new(),
         fake_discord: false,
         skip_startup_probe: false,
+        startup_probe_wait: None,
     };
     let mut argv = std::env::args().skip(1);
     while let Some(arg) = argv.next() {
@@ -259,6 +270,12 @@ fn parse_args() -> anyhow::Result<Option<Args>> {
             }
             "--fake-discord" => args.fake_discord = true,
             "--skip-startup-probe" => args.skip_startup_probe = true,
+            "--startup-probe-wait" => {
+                let value = argv
+                    .next()
+                    .context("--startup-probe-wait needs a number of seconds")?;
+                args.startup_probe_wait = Some(value);
+            }
             other => anyhow::bail!("unrecognized argument {other:?}\n\n{USAGE}"),
         }
     }
@@ -413,9 +430,9 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Open the store BEFORE the probe and before the listener: a storage path that cannot be
-    // created is a configuration error, and a server that came up and only discovered it on the
-    // first attempt to record a turn would lose that turn and say nothing useful about why.
+    // Open the store before the listener: a storage path that cannot be created is a
+    // configuration error, and a server that came up and only discovered it on the first attempt
+    // to record a turn would lose that turn and say nothing useful about why.
     let store: Arc<dyn StateStore> = match &config.storage.path {
         Some(path) => {
             let opened = SqliteStore::open(path, config.storage.retention).with_context(|| {
@@ -452,36 +469,19 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    run_startup_probe(chat.as_ref(), &config, args.skip_startup_probe).await?;
-    // remote-ops-audit W12 `#287 bulk-reads`. Beside the probe, never instead of it, and in the
-    // background, since a head read that does not work costs calls, not correctness: one call per
-    // provider that reads channel heads natively, none for any other.
-    let skip_env = std::env::var(ENV_SKIP_STARTUP_PROBE).ok();
-    if !args.skip_startup_probe && !probe::env_requests_skip(skip_env.as_deref()) {
-        let providers = Arc::clone(&providers);
-        let channels = config.channels.clone();
-        tokio::spawn(async move {
-            for check in
-                probe::check_heads(&providers, &channels, Some(Duration::from_secs(30))).await
-            {
-                if check.diagnosis.is_failure() {
-                    tracing::warn!(
-                        provider = check.key,
-                        problem = check.diagnosis.headline_for(&check.provider),
-                        detail = check.diagnosis.detail().unwrap_or_default(),
-                        "channel heads do not work for this provider; its channels are read one \
-                         by one as before, at the cost of a wasted head read each time"
-                    );
-                } else {
-                    tracing::info!(
-                        provider = check.key,
-                        detail = check.diagnosis.detail().unwrap_or_default(),
-                        "channel heads answer for this provider"
-                    );
-                }
-            }
-        });
-    }
+    // `#718 vt-startup-probe-restart`. The startup probe runs in the background once the
+    // listener is bound (below), so a provider that is rate-limiting it after a deploy keeps the
+    // front door down for none of the wait. Its budget is read here, so a bad value stops the
+    // server before it binds.
+    let startup_probe_patience = probe::RateLimitPatience::within(
+        probe::wait_budget(
+            args.startup_probe_wait.as_deref(),
+            std::env::var(probe::ENV_STARTUP_PROBE_WAIT).ok().as_deref(),
+        )
+        .map_err(anyhow::Error::msg)?,
+    );
+    let startup_probe = Arc::new(probe::StartupStatus::new(probe::StartupPhase::Probing));
+    let probe_channels = config.channels.clone();
 
     for channel in &config.channels {
         tracing::info!(
@@ -814,6 +814,7 @@ async fn main() -> anyhow::Result<()> {
         summary_version: summary_version.into(),
         summary_counters: Arc::new(vibe_talk::summarize::counters::SummaryCounters::new()),
         thread_names,
+        startup_probe: Arc::clone(&startup_probe),
     };
     // `#208 persistent-cache`. A cache installed behind the sink keeps the store's summaries in
     // step with what it learns: a summary of an edited or deleted message, or of an erased
@@ -913,6 +914,11 @@ async fn main() -> anyhow::Result<()> {
             let client = Arc::clone(&entry.client);
             let interval = std::time::Duration::from_secs(entry.live_poll_seconds);
             tokio::spawn(async move {
+                // `#718 vt-startup-probe-restart`: not while the probe is waiting out a rate
+                // limit, and not at all when it failed and the server is stopping.
+                if !state.startup_probe.ready().await {
+                    return;
+                }
                 state.message_cache.first_checks(FIRST_CHECKS_WAIT).await;
                 vibe_talk::live::poll_forever(state, key, client, live_limit, interval).await;
             });
@@ -928,6 +934,9 @@ async fn main() -> anyhow::Result<()> {
         );
         let state = state.clone();
         tokio::spawn(async move {
+            if !state.startup_probe.ready().await {
+                return;
+            }
             state.message_cache.first_checks(FIRST_CHECKS_WAIT).await;
             let interval = std::time::Duration::from_secs(state.config.ingest.relist_seconds);
             let threads = state.config.ingest.relist_threads;
@@ -942,10 +951,12 @@ async fn main() -> anyhow::Result<()> {
         .lifecycle()
         .is_some_and(|lifecycle| lifecycle.configured())
     {
-        tokio::spawn(vibe_talk::backfill::backfill_forever(
-            state.clone(),
-            live_limit,
-        ));
+        let state = state.clone();
+        tokio::spawn(async move {
+            if state.startup_probe.ready().await {
+                vibe_talk::backfill::backfill_forever(state, live_limit).await;
+            }
+        });
     }
     // `#549 own-read-stored`. The owner's own messages the live hub publishes are first seen
     // there, and their read state is decided in the background.
@@ -990,12 +1001,75 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("binding {bind}"))?;
-    tracing::info!(%bind, "vibe-talk listening");
+    // The address really bound, which says the port when the configuration asked for any.
+    let bound = listener.local_addr().unwrap_or(bind);
+    tracing::info!(bind = %bound, "vibe-talk listening");
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    tokio::spawn(async move {
-        shutdown_signal().await;
-        let _ = shutdown_tx.send(true);
-    });
+    let shutdown_tx = Arc::new(shutdown_tx);
+    {
+        let shutdown_tx = Arc::clone(&shutdown_tx);
+        tokio::spawn(async move {
+            shutdown_signal().await;
+            let _ = shutdown_tx.send(true);
+        });
+    }
+    // `#718 vt-startup-probe-restart`. The startup probe, now that the server answers: a failure
+    // records why and stops the server the way a signal does, and `main` returns it below.
+    let probe_failure: Arc<std::sync::Mutex<Option<anyhow::Error>>> = Arc::default();
+    let probe_task = {
+        let chat = Arc::clone(&chat);
+        let status = Arc::clone(&startup_probe);
+        let skip_flag = args.skip_startup_probe;
+        tokio::spawn(async move {
+            run_startup_probe(
+                chat.as_ref(),
+                &probe_channels,
+                skip_flag,
+                startup_probe_patience,
+                &status,
+            )
+            .await
+            .map(|passed| passed.then_some(probe_channels))
+        })
+    };
+    // A signal stops the probe at once: it would only spend the provider's budget during the
+    // shutdown, and a failure it recorded then would make a clean stop exit non-zero.
+    {
+        let probe = probe_task.abort_handle();
+        let mut shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            wait_for_shutdown(&mut shutdown).await;
+            probe.abort();
+        });
+    }
+    // Awaited apart from the probe, so that a probe that panics still stops the server rather
+    // than leaving it up and never ready, its background readers waiting forever.
+    {
+        let providers = Arc::clone(&providers);
+        let status = Arc::clone(&startup_probe);
+        let failure = Arc::clone(&probe_failure);
+        let shutdown_tx = Arc::clone(&shutdown_tx);
+        tokio::spawn(async move {
+            let error = match probe_task.await {
+                Ok(Ok(Some(channels))) => {
+                    check_heads_in_background(providers, channels);
+                    return;
+                }
+                Ok(Ok(None)) => return,
+                Ok(Err(error)) => error,
+                // Stopped by a signal, which is already stopping the server.
+                Err(stopped) if stopped.is_cancelled() => return,
+                Err(panicked) => {
+                    status.set(probe::StartupPhase::Failed);
+                    anyhow::anyhow!("the startup channel probe stopped unexpectedly: {panicked}")
+                }
+            };
+            *failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
+            let _ = shutdown_tx.send(true);
+        });
+    }
     // `#709 vt-live-tail-rust`. The in-server tail, when configured: it waits for a conversation
     // to tail inside its own loop, so spawning it never delays the listener.
     let tail_handle = if tail_state.config.ingest.tail_enabled() {
@@ -1040,7 +1114,43 @@ async fn main() -> anyhow::Result<()> {
             "graceful shutdown deadline reached; closing remaining streaming connections"
         ),
     }
-    Ok(())
+    let failed = probe_failure
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    match failed {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// remote-ops-audit W12 `#287 bulk-reads`. Beside the probe, never instead of it, and in the
+/// background, since a head read that does not work costs calls, not correctness: one call per
+/// provider that reads channel heads natively, none for any other.
+fn check_heads_in_background(
+    providers: Arc<ChatRouter>,
+    channels: Vec<vibe_talk::model::ChannelInfo>,
+) {
+    tokio::spawn(async move {
+        for check in probe::check_heads(&providers, &channels, Some(Duration::from_secs(30))).await
+        {
+            if check.diagnosis.is_failure() {
+                tracing::warn!(
+                    provider = check.key,
+                    problem = check.diagnosis.headline_for(&check.provider),
+                    detail = check.diagnosis.detail().unwrap_or_default(),
+                    "channel heads do not work for this provider; its channels are read one \
+                     by one as before, at the cost of a wasted head read each time"
+                );
+            } else {
+                tracing::info!(
+                    provider = check.key,
+                    detail = check.diagnosis.detail().unwrap_or_default(),
+                    "channel heads answer for this provider"
+                );
+            }
+        }
+    });
 }
 
 /// `vibe-talk cache-stats PATH`. `#595 cache-full-history`.
@@ -1122,21 +1232,36 @@ where
     }
 }
 
-/// Check at startup that every configured channel can actually be read, and refuse to start if
-/// one cannot.
+/// Check at startup that every configured channel can actually be read, and stop the server if
+/// one cannot. Returns whether the probe ran and passed.
 ///
 /// This is the same posture the configuration already takes toward equal or short tokens: a
 /// single-user tool that comes up in a state the operator did not mean is worse than one that
 /// refuses and says why. The failure it exists for — a bot that was created, tokened, and
 /// configured, but never added to the channel — is invisible at startup today and surfaces later
 /// as an empty digest, which reads like a bug in this code.
+///
+/// `#718 vt-startup-probe-restart`. It runs once the server is listening, and a rate limit is
+/// waited out within `patience` rather than treated as a failure: refusing on one made the
+/// supervisor restart the server, whose probe spent the provider's budget again.
 async fn run_startup_probe(
     chat: &dyn ChatClient,
-    config: &Config,
+    channels: &[vibe_talk::model::ChannelInfo],
     skip_flag: bool,
-) -> anyhow::Result<()> {
+    patience: probe::RateLimitPatience,
+    status: &probe::StartupStatus,
+) -> anyhow::Result<bool> {
     let skip_env = std::env::var(ENV_SKIP_STARTUP_PROBE).ok();
-    match probe::startup_check(chat, &config.channels, skip_flag, skip_env.as_deref()).await {
+    let checked = probe::startup_check_patiently(
+        chat,
+        channels,
+        skip_flag,
+        skip_env.as_deref(),
+        patience,
+        status,
+    )
+    .await;
+    match checked {
         // Loudly, and naming which switch did it: a skipped check that says nothing is the same
         // silent start this probe was added to remove.
         probe::StartupCheck::Skipped { source } => {
@@ -1150,6 +1275,7 @@ async fn run_startup_probe(
                 "WARNING: startup channel probe SKIPPED via {source}; channel reachability is \
                  unverified."
             );
+            Ok(false)
         }
         probe::StartupCheck::Passed(report) => {
             if report.warnings().is_empty() {
@@ -1157,6 +1283,7 @@ async fn run_startup_probe(
             } else {
                 tracing::warn!("{}", report.render_for(chat.provider_name()));
             }
+            Ok(true)
         }
         probe::StartupCheck::Failed(report) => {
             let failed = report.failures().len().max(usize::from(report.aborted));
@@ -1166,19 +1293,41 @@ async fn run_startup_probe(
             // exited without repeating the whole report twice.
             tracing::error!(
                 failed,
-                configured = config.channels.len(),
+                configured = channels.len(),
                 "startup channel probe FAILED; the per-channel diagnosis is on stderr"
             );
             eprintln!("{}", report.render_for(chat.provider_name()));
             anyhow::bail!(
                 "{failed} of {} configured channel(s) could not be read; refusing to start. Fix \
                  the configuration above, or re-run with {} if you know the check is wrong.",
-                config.channels.len(),
+                channels.len(),
                 probe::SKIP_FLAG
             );
         }
+        probe::StartupCheck::RateLimited { report, waited } => {
+            let limited = report.failures().len();
+            tracing::error!(
+                limited,
+                configured = channels.len(),
+                waited_seconds = waited.as_secs(),
+                budget_seconds = patience.budget.as_secs(),
+                "startup channel probe GAVE UP: the chat provider was still rate-limiting it when \
+                 its wait budget ran out; the per-channel diagnosis is on stderr"
+            );
+            eprintln!("{}", report.render_for(chat.provider_name()));
+            anyhow::bail!(
+                "{limited} of {} configured channel(s) were still rate-limited after the startup \
+                 probe waited {}s of its {}s budget; stopping. Readability was never established. \
+                 Raise {} (or {}) if the provider needs longer, or look for something else \
+                 spending this credential's rate limit.",
+                channels.len(),
+                waited.as_secs(),
+                patience.budget.as_secs(),
+                probe::ENV_STARTUP_PROBE_WAIT,
+                probe::WAIT_FLAG
+            );
+        }
     }
-    Ok(())
 }
 
 async fn shutdown_signal() {

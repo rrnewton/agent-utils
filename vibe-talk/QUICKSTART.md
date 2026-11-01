@@ -254,6 +254,11 @@ back with **empty content**, that is the Message Content Intent from step 1.3. I
 as fatal because a message can genuinely be attachment-only, but it is called out by name, because
 it is the one failure Discord reports as a success.
 
+A **rate limit** is not a refusal. The server is already listening while the probe runs, and a
+probe the provider rate-limits waits as the provider asks and tries again, for up to five minutes
+(`--startup-probe-wait SECONDS` or `VIBE_TALK_STARTUP_PROBE_WAIT_SECONDS`). Meanwhile `/healthz`
+says `probe pending (rate limited, retry in Ns)` and `/readyz` answers 503.
+
 To start without the check — offline development against `--fake-discord`, or if you are certain
 the check is wrong — use `--skip-startup-probe` or `VIBE_TALK_SKIP_STARTUP_PROBE=1`. The skip is
 logged loudly; you will not skip it by accident.

@@ -34,7 +34,7 @@ const UNDECODABLE: &str = "%FF";
 /// Who may call a route.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Auth {
-    /// The static web app and `/healthz`: no credential, by design.
+    /// The static web app, `/healthz` and `/readyz`: no credential, by design.
     Public,
     /// The read or the write bearer token.
     Read,
@@ -93,6 +93,7 @@ fn inventory() -> Vec<Route> {
     let limit = Query("?limit=5", "?limit=soon");
     vec![
         route("GET", "/healthz", Public, Nothing),
+        route("GET", "/readyz", Public, Nothing),
         route("GET", "/", Public, Nothing),
         // `#302 root-is-the-app`: the app's old address, forwarded to `/`.
         route("GET", "/voice", Public, Nothing),
