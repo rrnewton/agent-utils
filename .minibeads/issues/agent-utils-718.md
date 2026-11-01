@@ -1,10 +1,11 @@
 ---
 title: 'vt-startup-probe-restart: a rate-limited startup probe must not restart the server'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-01T05:08:35.441466389+00:00
-updated_at: 2026-11-01T05:08:35.441466389+00:00
+updated_at: 2026-11-01T05:46:31.424609839+00:00
+closed_at: 2026-11-01T05:46:31.424609688+00:00
 ---
 
 # Description
