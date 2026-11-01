@@ -27,7 +27,7 @@ import pytest
 
 AU_ROOT = Path(__file__).resolve().parents[2]
 PYTHON_WRKVIZ = AU_ROOT / "py" / "bin" / "wrkviz"
-RUST_WRKVIZ = AU_ROOT / "rs" / "target" / "release" / "wrkviz"
+RUST_WRKVIZ = AU_ROOT / "rs" / "target" / "release" / "wrkvizd"
 
 Request = tuple[str, str, dict[str, str]]
 Observed = tuple[int, int, str, tuple[tuple[str, str], ...], bytes]

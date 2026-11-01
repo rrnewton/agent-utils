@@ -21,7 +21,7 @@ import pytest
 
 AU_ROOT = Path(__file__).resolve().parents[2]
 PYTHON_WRKVIZ = AU_ROOT / "py" / "bin" / "wrkviz"
-RUST_WRKVIZ = AU_ROOT / "rs" / "target" / "release" / "wrkviz"
+RUST_WRKVIZ = AU_ROOT / "rs" / "target" / "release" / "wrkvizd"
 CODEX_ROOT = "root-thread"
 CLAUDE_ROOT = "11111111-2222-3333-4444-555555555555"
 CLAUDE_CHILD = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"

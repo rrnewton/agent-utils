@@ -24,7 +24,7 @@ import pytest
 
 AU_ROOT = Path(__file__).resolve().parents[2]
 PYTHON_WRKVIZ = AU_ROOT / "py" / "bin" / "wrkviz"
-RUST_WRKVIZ = AU_ROOT / "rs" / "target" / "release" / "wrkviz"
+RUST_WRKVIZ = AU_ROOT / "rs" / "target" / "release" / "wrkvizd"
 GUIDE = AU_ROOT / "common" / "docs" / "wrkviz" / "USER_GUIDE.md"
 
 

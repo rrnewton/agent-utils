@@ -24,7 +24,7 @@ from pathlib import Path
 import pytest
 
 AU_ROOT = Path(__file__).resolve().parents[2]
-RUST_WRKVIZ = AU_ROOT / "rs" / "target" / "release" / "wrkviz"
+RUST_WRKVIZ = AU_ROOT / "rs" / "target" / "release" / "wrkvizd"
 
 _spec = importlib.util.spec_from_file_location(
     "wrkviz_build_diff", AU_ROOT / "py" / "tests" / "test_wrkviz_build_rust.py"

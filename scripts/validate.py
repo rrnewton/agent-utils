@@ -168,6 +168,7 @@ PREFIX_RULES: tuple[tuple[str, frozenset[str]], ...] = (
     # tool, package smoke, and cross-runtime invocation, so treating it as one component would be
     # false precision; run the complete portable contract explicitly.
     ("rs/bin/wrkslotsd", frozenset({RUST, RUST_WORKSPACE_TESTS, RUST_PACKAGES})),
+    ("rs/bin/wrkvizd", frozenset({RUST, RUST_WORKSPACE_TESTS, RUST_PACKAGES})),
     ("rs/bin/cargo-runner", frozenset(GROUPS)),
     ("rustfmt.toml", frozenset({RUST, VIBE_TALK})),
     (

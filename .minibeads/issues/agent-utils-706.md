@@ -462,5 +462,59 @@ generated-schema collapse.
   pins both). Accepted gaps, shared with the earlier
   wrkviz slices: non-finite and oversized-integer JSON
   values, codec/repr wording on corrupt inputs.
+- Edition switch plan (opt-in first; the default does NOT
+  flip in this slice). Parity audit, 2026-11-01: all 25
+  top-level Python commands (`inspect`, `query`, `serve`,
+  `quickstart`, `extract-transcripts`, the six `ingest*`
+  commands, `summarize`, `build`, `export`, `gc`,
+  `migrate-build-state`, `migrate-snapshots`,
+  `github-metadata`, the three `refresh*` commands,
+  `audit-glossary`, `audit-losslessness`, `responsiveness`,
+  `discover-agents`) dispatch in `rs/wrkviz/src/cli.rs`, and
+  the `query` subcommands (`list`, `show`, `stats`,
+  `prompts`, `messages`, `search`) are ported. What still
+  refuses by name in Rust: unknown subcommands and unknown
+  `query` actions (the oracle rejects them too, with
+  argparse wording), and the schema-2 generation of
+  `extract-transcripts`. Accepted gaps carried from the
+  port slices: non-finite/oversized-integer JSON spellings,
+  lone surrogates, Python `re` features beyond the ported
+  subset, corrupt-input codec wording, and the unpinned
+  `--userguide` invalid-subcommand divergence. None of
+  these silently falls back.
+  Switch shape, following the wrkslots opt-in (`0d1f057a`):
+  `WRKVIZ_ENGINE=rust` in `common/bin/engine-resolver` wins
+  over the generic engine overrides for wrkviz only and
+  dispatches to the Rust edition; unset/empty/`python`
+  keeps the Python primary; a generic Rust request still
+  refuses (exit 127) because the editions model keeps the
+  Rust mirror non-parity until the flip; an invalid value
+  is a usage error (exit 2). The Rust edition ships as the
+  `wrkvizd` binary (the `rs/wrkviz` crate's `[[bin]]`
+  renamed, `rs/bin/wrkvizd` tracked launcher, a
+  `cargo-runner` case, and a `wrkvizd` editions entry at
+  primary rust with an absent Python mirror, exactly as
+  `wrkslotsd` serves wrkslots); the `wrkviz` editions
+  entry stays Python-primary and its note records the
+  opt-in. 22 differential files point at the renamed
+  release binary; six more (`inspect` and the `query`
+  files) run it through `cargo run -p wrkviz`, whose
+  single-bin selection now builds `wrkvizd`.
+  Effect on existing users and data: none by default.
+  Under the opt-in, covered commands run at the
+  differential parity above against the same on-disk
+  formats (no format changes in this slice); uncovered
+  inputs refuse by name. Rollback is unsetting
+  `WRKVIZ_ENGINE`. The coordinator trials the opt-in on
+  this harness before any default flip; the flip itself
+  is a later `validation/editions.json` change gated on
+  coordinator/owner approval, not part of this slice.
+  Tests: a sandbox resolver test mirroring
+  `test_engine_resolver_wrkslots_optin.py` (default,
+  rust/rs, python, wins-over-generic, generic-refuses,
+  invalid-refuses), the editions checker, dispatch-wiring
+  updates, and an end-to-end smoke of the real binary
+  through `common/bin/wrkviz` under the opt-in; then the
+  full gate.
 - Remaining: the wrkviz edition switch at parity, then the
   generated-schema collapse and parallel-experiment-runner.

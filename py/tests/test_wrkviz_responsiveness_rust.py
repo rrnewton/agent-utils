@@ -22,7 +22,7 @@ import pytest
 
 AU_ROOT = Path(__file__).resolve().parents[2]
 PYTHON_WRKVIZ = AU_ROOT / "py" / "bin" / "wrkviz"
-RUST_WRKVIZ = AU_ROOT / "rs" / "target" / "release" / "wrkviz"
+RUST_WRKVIZ = AU_ROOT / "rs" / "target" / "release" / "wrkvizd"
 
 T0 = datetime(2026, 1, 5, 12, 0, tzinfo=timezone.utc).timestamp()
 

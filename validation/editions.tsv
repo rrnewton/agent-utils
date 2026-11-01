@@ -11,6 +11,7 @@ tick-hub	rust	parity
 wrkslots	python	absent	
 wrkslotsd	rust	absent	
 wrkviz	python	absent	
+wrkvizd	rust	absent	
 agent-teams	rust	absent	
 agent-usage	rust	absent	
 gh-paced	rust	absent	

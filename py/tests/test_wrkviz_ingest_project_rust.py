@@ -26,7 +26,7 @@ import pytest
 
 AU_ROOT = Path(__file__).resolve().parents[2]
 PYTHON_WRKVIZ = AU_ROOT / "py" / "bin" / "wrkviz"
-RUST_WRKVIZ = AU_ROOT / "rs" / "target" / "release" / "wrkviz"
+RUST_WRKVIZ = AU_ROOT / "rs" / "target" / "release" / "wrkvizd"
 CODEX_ROOT = "root-thread"
 ORC_ROOT_ID = "11111111-2222-3333-4444-555555555555"
 T0 = 1767225600000  # 2026-01-01T00:00:00Z

@@ -59,6 +59,10 @@ case "$TOOL" in
     PACKAGE="wrkslotsd"
     PACKAGE_TOOLS=(wrkslotsd)
     ;;
+  wrkvizd)
+    PACKAGE="wrkviz"
+    PACKAGE_TOOLS=(wrkvizd)
+    ;;
   agentctl|herdr-agent)
     PACKAGE="agentctl"
     PACKAGE_TOOLS=(agentctl herdr-agent)
