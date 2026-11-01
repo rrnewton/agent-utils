@@ -17,3 +17,5 @@ export { mountServerCache } from "./cache.ts";
 export type { ServerCache, ServerCacheDependencies } from "./cache.ts";
 export { mountIdentityList } from "./identities.ts";
 export type { IdentityList, IdentityListDependencies } from "./identities.ts";
+export { mountPairing } from "./pairing.ts";
+export type { Pairing, PairingDependencies } from "./pairing.ts";

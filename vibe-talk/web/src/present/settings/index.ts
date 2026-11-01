@@ -58,3 +58,12 @@ export {
   identityPickerLabel,
 } from "./identities.ts";
 export type { SeenAccount } from "./identities.ts";
+export {
+  PAIRING_EXPIRED,
+  PAIRING_PARTIAL,
+  PAIRING_UNREACHED,
+  PAIRING_WRONG_LINK,
+  pairingCodeShaped,
+  pairingRefusedWords,
+  pairingTransferAddress,
+} from "./pairing.ts";

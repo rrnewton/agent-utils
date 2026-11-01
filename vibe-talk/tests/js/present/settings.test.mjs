@@ -172,3 +172,17 @@ test("`#402 who-is-who-channel-box`: the order and the words of the list of who 
   assert.equal(IDENTITY_PICK_ONE, "Pick one channel to see who is who.");
   assert.match(IDENTITY_SAVED, /^Saved\./);
 });
+
+test("`#369 pairing-link`: what the sign-in screen says about a pairing link", () => {
+  const { PAIRING_EXPIRED, pairingRefusedWords, pairingCodeShaped, pairingTransferAddress, PAIRING_UNREACHED, PAIRING_WRONG_LINK, PAIRING_PARTIAL } = SETTINGS;
+  assert.equal(pairingRefusedWords(410), PAIRING_EXPIRED, "every refusal reads the same");
+  assert.equal(pairingRefusedWords(404), PAIRING_EXPIRED);
+  assert.match(pairingRefusedWords(429), /^Too many pairing attempts from this network\./);
+  assert.equal(pairingCodeShaped("a".repeat(43)), true);
+  assert.equal(pairingCodeShaped("A-_9".repeat(10) + "abc"), true);
+  assert.equal(pairingCodeShaped("a".repeat(42)), false);
+  assert.equal(pairingCodeShaped("a".repeat(42) + "="), false);
+  assert.equal(pairingTransferAddress("https://talk.example", "a b"), "https://talk.example/#pair=a%20b");
+  assert.equal(pairingTransferAddress("https://talk.example", null), "https://talk.example/#pair=");
+  for (const line of [PAIRING_UNREACHED, PAIRING_WRONG_LINK, PAIRING_PARTIAL]) assert.match(line, /^[A-Z].*\.$/);
+});

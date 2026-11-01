@@ -119,6 +119,7 @@ export {
   mountDismissedSends,
   mountHelpFolds,
   mountIdentityList,
+  mountPairing,
   mountServerCache,
   mountSettingsFolds,
   mountUpstreamClear,

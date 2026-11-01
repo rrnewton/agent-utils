@@ -31,11 +31,33 @@
 // this page makes, and before anything could copy the address — with `replaceState`, which leaves
 // no history entry holding it. The fragment, never the query: a browser never sends a fragment to
 // any server, so the code reaches no log but the one request that redeems it, in its body. It is
-// redeemed only when the person taps Sign this device in (`pairFromLink`), never on load: a link
+// redeemed only when the person taps Sign this device in (`devicePairing.redeem`), never on load: a link
 // scanner that runs pages would otherwise spend it, and hold the token.
-let pairingCode = takePairingCode();
-/** Whether a redemption is waiting for the server's answer. */
-let pairingInFlight = false;
+//
+// The offer and its redemption are web/src/view/settings `mountPairing` (`#624 voice-page-modularity`),
+// made here, with the code, so it holds it from the page's first statement.
+const openedWithPairingCode = takePairingCode();
+/** @type {import("./src/view/settings/index.ts").Pairing} */
+const devicePairing = mountPairing({
+  code: openedWithPairingCode,
+  lookup: (id) => el(id),
+  redeem: (code) => fetch("/api/v1/pair/redeem", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ code }),
+    cache: "no-store",
+  }),
+  saveToken: () => saveToken(),
+  signIn: () => signIn(),
+  hasToken: () => Boolean(token()),
+  hydrateFromCache: () => hydrateFromCache(),
+  reopenSavedView: () => reopenSavedView(),
+  showScreen: (name) => showScreen(name),
+  showError: (text) => showError(text),
+  clearError: () => clearError(),
+  setStatus: (text) => setStatus(text),
+  guard: (run) => guardQuietly(run),
+});
 
 /** The code in `#pair=`, with the fragment already gone from the address; null when there is none. */
 function takePairingCode() {
@@ -39255,142 +39277,7 @@ async function saveToken() {
   if (await signIn()) el("api-token").value = "";
 }
 
-// `#369 pairing-link`. What the page says when a pairing link does not work. One sentence for every
-// refusal, because the server gives one answer for all of them: a link that ran out, one already
-// opened, and one mistyped are the same to it, and the remedy is the same too.
-// The second sentence because a link someone else opened first looks exactly like this from here,
-// and the person who sent it is the one who can tell and act on it.
-const PAIRING_EXPIRED =
-  "This pairing link has expired or was already used. Ask for a new one. If you had not opened it " +
-  "before, tell whoever sent it: someone else may have.";
-
-/**
- * Trade the code from a pairing link for the write token, then sign in with it exactly as Save
- * does. `#369 pairing-link`.
- *
- * The request carries NO bearer token, even on a browser that has one: the code is the credential.
- * A failure is said plainly and leaves whatever this browser already held alone, so a stale link
- * opened on a phone that was signed in leaves it signed in.
- */
-async function pairFromLink() {
-  const code = pairingCode;
-  if (code === null) return false;
-  clearError();
-  setStatus("Pairing this device…");
-  // Both, until the server answers: a second tap would be refused as used, and Not now would hide
-  // an offer whose answer is about to sign the browser in anyway.
-  el("pair-confirm").disabled = true;
-  el("pair-dismiss").disabled = true;
-  pairingInFlight = true;
-  let response = null;
-  try {
-    response = await fetch("/api/v1/pair/redeem", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ code }),
-      cache: "no-store",
-    });
-  } catch (_error) {
-    pairingInFlight = false;
-    // The code was not spent: the offer stays, to be tapped again once the connection is back.
-    el("pair-confirm").disabled = false;
-    el("pair-dismiss").disabled = false;
-    showError("Could not reach vibe-talk to pair this device. Check the connection and tap again.");
-    setStatus("pairing failed");
-    return false;
-  }
-  pairingInFlight = false;
-  // Answered: spent or refused, the code is done with either way. A newer link opened meanwhile
-  // (`hashchange`) is not: it is kept, and offered again if this one did not sign the browser in.
-  const newer = pairingCode !== code ? pairingCode : null;
-  pairingCode = null;
-  el("pair-offer").hidden = true;
-  el("pair-transfer").value = "";
-  let payload = null;
-  try {
-    payload = JSON.parse(await response.text());
-  } catch (_error) {
-    payload = null;
-  }
-  if (response.ok && payload && typeof payload.token === "string" && payload.token) {
-    el("api-token").value = payload.token;
-    await saveToken();
-    return true;
-  }
-  const failed = await pairingFailed(
-    response.status === 429
-      ? "Too many pairing attempts from this network. Wait a minute, then ask for a new link."
-      : PAIRING_EXPIRED
-  );
-  if (newer !== null) {
-    pairingCode = newer;
-    offerPairing();
-  }
-  return failed;
-}
-
-/** Redeem inside the installed app's own storage, without navigating back to Safari. */
-async function pairFromInput() {
-  if (pairingInFlight) return;
-  const value = el("pair-input").value.trim();
-  let code = value;
-  if (value.includes("://")) {
-    try {
-      const link = new URL(value);
-      if (link.origin !== window.location.origin) throw new Error("different server");
-      code = deepLinkParams(link.hash.slice(1)).get("pair") || "";
-    } catch (_error) {
-      showError("Paste a pairing link for this server, or its pairing code.");
-      return;
-    }
-  }
-  if (!/^[A-Za-z0-9_-]{43}$/.test(code)) {
-    showError("Paste the complete pairing link or code. Ask for a fresh link if it was already used.");
-    return;
-  }
-  el("pair-input").value = "";
-  pairingCode = code;
-  offerPairing();
-  await pairFromLink();
-}
-
-/** The sign-in screen, offering to redeem the pairing link this page was opened from. */
-function offerPairing() {
-  showScreen("signin");
-  el("pair-offer").hidden = false;
-  el("pair-transfer").value = `${window.location.origin}/#pair=${encodeURIComponent(pairingCode || "")}`;
-  el("pair-confirm").disabled = false;
-  el("pair-dismiss").disabled = false;
-  el("pair-confirm").focus();
-}
-
-/** Not now: the link is left unspent, and the page carries on as it would have without it. */
-function declinePairing() {
-  pairingCode = null;
-  el("pair-transfer").value = "";
-  el("pair-offer").hidden = true;
-  if (token()) {
-    if (hydrateFromCache()) {
-      showScreen("main");
-      reopenSavedView();
-    }
-    guardQuietly(signIn)();
-  }
-}
-
-/** Say why pairing failed, and carry on as this browser would have without the link. */
-async function pairingFailed(sentence) {
-  setStatus("pairing failed");
-  if (token()) {
-    // Signed in before: still signed in. The sentence goes up after, because signing in clears
-    // the error panel on its way to the main screen.
-    await signIn();
-  } else {
-    showScreen("signin");
-  }
-  showError(sentence);
-  return false;
-}
+// Pairing this device from a link (`#369 pairing-link`) is `devicePairing`'s, near the top of this file.
 
 function forgetToken() {
   // `#457 settings-server-side`. The next credential is unproven until `signIn` proves it,
@@ -39626,19 +39513,15 @@ function startSettingsSync() {
 el("signin-form").addEventListener("submit", (event) => event.preventDefault());
 el("save-token").addEventListener("click", guardQuietly(saveToken));
 el("forget-token").addEventListener("click", forgetToken);
-el("pair-submit").addEventListener("click", guardQuietly(pairFromInput));
-el("pair-confirm").addEventListener("click", guardQuietly(pairFromLink));
-el("pair-dismiss").addEventListener("click", declinePairing);
+el("pair-submit").addEventListener("click", guardQuietly(() => devicePairing.redeemInput()));
+el("pair-confirm").addEventListener("click", guardQuietly(() => devicePairing.redeem()));
+el("pair-dismiss").addEventListener("click", () => devicePairing.decline());
 // A second link opened in a tab already showing the app is a navigation within the page: the
 // script does not run again, so the fragment is taken here, as at load, and offered.
 window.addEventListener("hashchange", () => {
   const code = takePairingCode();
   if (code === null) return;
-  pairingCode = code;
-  // While a redemption is answering, the buttons stay as they are; its answer decides what next.
-  if (pairingInFlight) return;
-  clearError();
-  offerPairing();
+  devicePairing.opened(code);
 });
 
 // The checkboxes are the live truth `start()` reads, so they are what gets restored on load.
@@ -41456,7 +41339,7 @@ setTokenState(token() ? "token saved in this browser" : noTokenSentence());
 // With no token there is nothing to report YET, and firing a toast at page load to say so would
 // put a message over a screen whose entire subject is the thing it is asking for. The sign-in
 // screen says it in its own body; see `setTokenState`. `#63 status-line-placement`.
-if (token() && pairingCode === null) {
+if (token() && devicePairing.code() === null) {
   setStatus("Checking your token…");
 }
 // Before the first screen is shown, so the bar is in its home from the first frame rather than
@@ -41485,9 +41368,9 @@ voiceCall().renderControls();
 // ...and up where the reader left it: on the channel, in their view, at their message. The view's
 // one read waits for the proof, and for the live stream it starts (`payReopenRead`).
 // `#189 restore-ui-state`.
-if (pairingCode !== null) {
+if (devicePairing.code() !== null) {
   // `#369 pairing-link`. The person decides, with one tap: sign in with the link, or not now.
-  offerPairing();
+  devicePairing.offer();
 } else if (token()) {
   if (hydrateFromCache()) {
     showScreen("main");

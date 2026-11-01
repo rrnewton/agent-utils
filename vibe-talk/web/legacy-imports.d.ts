@@ -268,3 +268,4 @@ declare const mountChannelDirectory: LegacyImports["mountChannelDirectory"];
 declare const mountDismissedSends: LegacyImports["mountDismissedSends"];
 declare const mountServerCache: LegacyImports["mountServerCache"];
 declare const mountIdentityList: LegacyImports["mountIdentityList"];
+declare const mountPairing: LegacyImports["mountPairing"];
