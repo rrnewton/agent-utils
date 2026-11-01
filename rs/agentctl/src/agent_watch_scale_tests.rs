@@ -295,6 +295,7 @@ fn a_pass_over_sixty_records_and_a_hundred_panes_takes_seconds_and_asks_each_thi
     let team = Team::new("bench", &sixty(), 100, 1.5);
     let client = team.client();
     let mut probe = ManagedProbe::new(&client, &team.registry, "coordinator")
+        .with_teams_state(&team.registry.join("no-agent-teams"))
         .with_budget(Some(Duration::from_secs(60)), false);
     let mut state = WatchState::default();
     let begun = Instant::now();
@@ -388,7 +389,8 @@ fn an_idle_agents_screen_is_read_again_only_when_its_visible_rows_change() {
     ];
     let team = Team::new("reuse", &members, 4, 0.0);
     let client = team.client();
-    let mut probe = ManagedProbe::new(&client, &team.registry, "coordinator");
+    let mut probe = ManagedProbe::new(&client, &team.registry, "coordinator")
+        .with_teams_state(&team.registry.join("no-agent-teams"));
     let recent_reads = |team: &Team| -> Vec<String> {
         team.calls()
             .into_iter()
@@ -449,6 +451,7 @@ fn agents_the_pass_has_no_time_for_are_reported_unchecked_and_keep_their_memory(
     let team = Team::new("budget", &members, 4, 30.0);
     let client = team.client();
     let mut probe = ManagedProbe::new(&client, &team.registry, "coordinator")
+        .with_teams_state(&team.registry.join("no-agent-teams"))
         .with_budget(Some(Duration::from_secs(2)), false);
     let mut state = WatchState::default();
     state.agents.insert(
@@ -533,7 +536,8 @@ fn the_probe_reads_owner_requests_waiting_and_quarantines_from_the_queues() {
     let members = vec![member("coordinator", "running", Some("idle"), IDLE_SCREEN)];
     let team = Team::new("owner-waits", &members, 1, 0.0);
     let client = team.client();
-    let mut probe = ManagedProbe::new(&client, &team.registry, "coordinator");
+    let mut probe = ManagedProbe::new(&client, &team.registry, "coordinator")
+        .with_teams_state(&team.registry.join("no-agent-teams"));
     let queue = agent_queue::registry::directory(&team.registry, "coordinator")
         .unwrap()
         .join("queue");

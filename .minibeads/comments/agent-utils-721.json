@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-721-cccdfa10985",
+    "issue_id": "agent-utils-721",
+    "author": "cl-handfix",
+    "body": "[opus 5.5] Reopened: an independent review of 340b8d94 found a blocking bug (a live agent refused as undeliverable whenever an archive entry starts with its name) and four more (older senders never retry \"undeliverable\"; a handover leaves a pinned coordinator process so the new coordinator cannot send; watch-agents records the flag notice before delivery and sends it to the retired coordinator; a standing warning made watch-agents not-OK forever). Fixed forward on main; closes again with the fix.",
+    "created_at": "2026-11-01T12:44:26.493890187Z",
+    "updated_at": "2026-11-01T12:44:26.493890187Z"
+  }
+]

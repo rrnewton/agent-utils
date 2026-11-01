@@ -1159,15 +1159,25 @@ under the coordinator. Every control decision follows `managed_by`, never
 follows the designation, but only through declarations that name the
 registry; one pinned to the old coordinator's name keeps delivering into its
 unread queue. So: designate the successor first (`agentctl coordinator set
-NEW` — it fixes declarations pinned to the old name and reports any pinned
-elsewhere under `team_declarations`), get `agent-teams check` green, drain
-the old coordinator's queue, then retire it with `agentctl stop OLD
---handover-to NEW`. Stopping the designated coordinator without
-`--handover-to` is refused (an explicit `--force-coordinator` overrides with
-a warning). Sends to a target left missing or archived this way answer
-`undeliverable` and stay in the sender's outbox, and `watch-agents` reports
-the same declaration red flags (`team_declarations` in each pass report,
-plus one notice to the coordinator when the flag set changes).
+NEW` — it fixes declarations pinned to the old name, turns a pinned
+coordinator process that was the old coordinator's harness (or is gone) into
+the registry designation so NEW may send for the team, and reports any other
+pin under `team_declarations`), get `agent-teams check` green, drain the old
+coordinator's queue, then retire it with `agentctl stop OLD --handover-to
+NEW` (the designation moves first and is put back if the stop fails).
+Stopping the live designated coordinator without `--handover-to` is refused;
+an explicit `--force-coordinator` overrides with a warning, and a coordinator
+whose harness is gone, or the `--retire-dead-*` and
+`--recover-legacy-adoption` paths, go ahead with the same warning. Sends to a
+target left missing or archived this way answer `undeliverable` and stay in
+the sender's outbox as `deferred`. `watch-agents` reports the same
+declaration red flags (`team_declarations` in each pass report, with a
+`severity`; only errors make the pass not OK), tells the coordinator
+designated at that moment once per changed flag set and once per
+undeliverable notice the receiving host recorded (`team_notices`), and runs
+`agent-teams pump` at most every 10 minutes while this host's agent-teams
+outbox holds deferred messages (`team_pump`; the binary is `$AGENT_TEAMS_BIN`
+or `agent-teams` on `PATH`).
 
 ### Watch agents for finishes, prompts, stalls, and silence (Rust edition)
 

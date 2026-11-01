@@ -155,15 +155,10 @@ pub(crate) fn harness_repo_origins(harness_cwd: &Path) -> Vec<String> {
     origins
 }
 
-/// The team whose `agent-teams` declaration names `registry` as its
-/// queue deliverer, if any. Reads the agent-teams state layout
-/// (`teams.d/<team>/declaration.json` under `$AGENT_TEAMS_STATE_DIR`,
-/// `$XDG_STATE_HOME/agent-teams`, or `~/.local/state/agent-teams`)
-/// best-effort: a discovery hint, never an authority.
 /// The agent-teams state directory declarations live under
 /// (`$AGENT_TEAMS_STATE_DIR`, `$XDG_STATE_HOME/agent-teams`, or
 /// `~/.local/state/agent-teams`).
-fn agent_teams_state_dir() -> PathBuf {
+pub(crate) fn agent_teams_state_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("AGENT_TEAMS_STATE_DIR") {
         PathBuf::from(dir)
     } else if let Some(xdg) = std::env::var_os("XDG_STATE_HOME") {
@@ -174,88 +169,130 @@ fn agent_teams_state_dir() -> PathBuf {
     }
 }
 
+/// Whether a declaration's `deliverer.registry` text names `registry`: `~/` expanded, then both
+/// sides canonicalized (symlinks, `..`, a trailing `/`), so a differently spelled path to the
+/// same registry still matches. When either side does not resolve, the spelled paths are
+/// compared component by component.
+fn names_registry(declared: &str, registry: &Path) -> bool {
+    if declared.is_empty() {
+        return false;
+    }
+    let expanded = match (declared.strip_prefix("~/"), std::env::var_os("HOME")) {
+        (Some(rest), Some(home)) => PathBuf::from(home).join(rest),
+        _ => PathBuf::from(declared),
+    };
+    match (fs::canonicalize(&expanded), fs::canonicalize(registry)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => expanded.as_path() == registry,
+    }
+}
+
+/// Every agent-teams declaration under `teams_state` (`teams.d/<team>/declaration.json`) whose
+/// deliverer names `registry`, as `(declaration path, document)` sorted by path. Best-effort:
+/// an unreadable declaration is skipped.
+fn declarations_naming(teams_state: &Path, registry: &Path) -> Vec<(PathBuf, Value)> {
+    let Ok(entries) = fs::read_dir(teams_state.join("teams.d")) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path().join("declaration.json"))
+        .filter(|path| path.exists())
+        .collect();
+    paths.sort();
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let document: Value = serde_json::from_str(&fs::read_to_string(&path).ok()?).ok()?;
+            let declared = document
+                .get("deliverer")
+                .and_then(|deliverer| deliverer.get("registry"))
+                .and_then(Value::as_str)?;
+            names_registry(declared, registry).then_some((path, document))
+        })
+        .collect()
+}
+
+/// The team whose `agent-teams` declaration names `registry` as its
+/// queue deliverer, if any. Reads the agent-teams state layout
+/// (`teams.d/<team>/declaration.json` under [`agent_teams_state_dir`])
+/// best-effort: a discovery hint, never an authority.
 pub(crate) fn declared_team_for_registry(registry: &str) -> Option<String> {
-    let state = agent_teams_state_dir();
-    let teams = fs::read_dir(state.join("teams.d")).ok()?;
-    let home =
-        std::env::var_os("HOME").map_or_else(String::new, |h| h.to_string_lossy().into_owned());
-    for entry in teams.flatten() {
-        let Ok(text) = fs::read_to_string(entry.path().join("declaration.json")) else {
-            continue;
-        };
-        let Ok(document) = serde_json::from_str::<Value>(&text) else {
-            continue;
-        };
-        let declared = document
-            .get("deliverer")
-            .and_then(|deliverer| deliverer.get("registry"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let expanded = if let Some(rest) = declared.strip_prefix("~/") {
-            format!("{home}/{rest}")
-        } else {
-            declared.to_owned()
-        };
-        if expanded == registry {
-            return document
+    declarations_naming(&agent_teams_state_dir(), Path::new(registry))
+        .into_iter()
+        .find_map(|(_, document)| {
+            document
                 .get("team")
                 .and_then(Value::as_str)
-                .map(str::to_owned);
-        }
+                .map(str::to_owned)
+        })
+}
+
+/// A declaration's pinned coordinator process (`coordinator.designation: "pinned"`), when it
+/// pins one: `Some(None)` for a pin whose identity does not parse.
+fn pinned_designation(document: &Value) -> Option<Option<CustomProcessIdentity>> {
+    let coordinator = document.get("coordinator")?;
+    if coordinator.get("designation").and_then(Value::as_str) != Some("pinned") {
+        return None;
     }
-    None
+    Some(
+        coordinator
+            .get("harness_identity")
+            .cloned()
+            .and_then(|identity| serde_json::from_value(identity).ok()),
+    )
+}
+
+/// The designation a handover writes into a declaration in place of a pinned process.
+fn registry_designation() -> Value {
+    json!({"designation": "registry", "comment": "the registry's own coordinator designation; agentctl keeps it current"})
 }
 
 /// Red flags for every agent-teams declaration naming `registry`, in the
 /// same vocabulary as `agent-teams check` (#721): the delivery target a
 /// declaration resolves to (its pinned agent, else the designated
-/// coordinator) against this registry's records and control tree.
-/// `watch-agents` surfaces these each pass; each flag names its fix.
-pub(crate) fn team_declaration_flags(registry: &Path) -> Vec<Value> {
+/// coordinator) against this registry's records and control tree, and a
+/// pinned coordinator process. Each flag names its fix and a `severity`:
+/// `error` when messages to or from the team fail today, `warning` for a
+/// standing risk. `watch-agents` surfaces these each pass, reading
+/// declarations from `teams_state`.
+pub(crate) fn team_declaration_flags(registry: &Path, teams_state: &Path) -> Vec<Value> {
     let registry_text = registry.display().to_string();
     let designated = fs::read_to_string(registry.join(DESIGNATION_FILE))
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
         .and_then(|value| value.get("name").and_then(Value::as_str).map(str::to_owned));
-    // name -> (lifecycle, managed_by agent)
+    // Every listed agent directory (a queue made ahead of registration counts), and for those
+    // with a readable record: name -> (lifecycle, managed_by agent).
+    let listed = agent_queue::registry::names(registry).map_err(|error| error.to_string());
     let mut records: std::collections::BTreeMap<String, (String, Option<String>)> =
         std::collections::BTreeMap::new();
-    if let Ok(names) = agent_queue::registry::names(registry) {
-        for name in names {
-            let Ok(directory) = agent_queue::registry::directory(registry, &name) else {
-                continue;
-            };
-            let Ok(text) = fs::read_to_string(directory.join("agent.json")) else {
-                continue;
-            };
-            let Ok(document) = serde_json::from_str::<Value>(&text) else {
-                continue;
-            };
-            records.insert(
-                name,
-                (
-                    document
-                        .get("lifecycle")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned(),
-                    document
-                        .get(MANAGED_BY)
-                        .and_then(|edge| edge.get("agent"))
-                        .and_then(Value::as_str)
-                        .map(str::to_owned),
-                ),
-            );
-        }
+    for name in listed.as_deref().unwrap_or_default() {
+        let Ok(directory) = agent_queue::registry::directory(registry, name) else {
+            continue;
+        };
+        let Ok(text) = fs::read_to_string(directory.join("agent.json")) else {
+            continue;
+        };
+        let Ok(document) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        records.insert(
+            name.clone(),
+            (
+                document
+                    .get("lifecycle")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                document
+                    .get(MANAGED_BY)
+                    .and_then(|edge| edge.get("agent"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            ),
+        );
     }
-    let archived = |agent: &str| {
-        let prefix = format!("{agent}-");
-        fs::read_dir(registry.join("archive")).is_ok_and(|entries| {
-            entries
-                .flatten()
-                .any(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
-        })
-    };
     let root_of = |agent: &str| {
         let mut current = agent.to_owned();
         for _ in 0..MAX_DEPTH {
@@ -266,37 +303,42 @@ pub(crate) fn team_declaration_flags(registry: &Path) -> Vec<Value> {
         }
         current
     };
-    let home =
-        std::env::var_os("HOME").map_or_else(String::new, |h| h.to_string_lossy().into_owned());
     let mut flags = Vec::new();
-    let teams_dir = agent_teams_state_dir().join("teams.d");
-    let Ok(entries) = fs::read_dir(&teams_dir) else {
-        return flags;
-    };
-    let mut paths: Vec<PathBuf> = entries
-        .flatten()
-        .map(|entry| entry.path().join("declaration.json"))
-        .filter(|path| path.exists())
-        .collect();
-    paths.sort();
-    for path in paths {
-        let Ok(text) = fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(document) = serde_json::from_str::<Value>(&text) else {
-            continue;
-        };
-        let declared = document
-            .get("deliverer")
-            .and_then(|deliverer| deliverer.get("registry"))
+    for (_, document) in declarations_naming(teams_state, registry) {
+        let team = document
+            .get("team")
             .and_then(Value::as_str)
-            .unwrap_or_default();
-        let expanded = declared
-            .strip_prefix("~/")
-            .map(|rest| format!("{home}/{rest}"))
-            .unwrap_or_else(|| declared.to_owned());
-        if expanded != registry_text {
-            continue;
+            .unwrap_or("?")
+            .to_owned();
+        let mut push = |kind: &str, detail: String, fix: String| {
+            let severity = match kind {
+                "target-missing"
+                | "target-archived"
+                | "target-not-live"
+                | "designation-not-live" => "error",
+                _ => "warning",
+            };
+            flags.push(json!({"team": team, "kind": kind, "severity": severity, "detail": detail, "fix": fix}));
+        };
+        // A pinned coordinator process decides who may send for the team, whatever the
+        // deliverer; after a handover it names the old harness.
+        if let Some(identity) = pinned_designation(&document) {
+            let dead = identity.is_some_and(|identity| {
+                agent_queue::identity::liveness(&identity) == ProcessLiveness::Dead
+            });
+            if dead {
+                push(
+                    "designation-not-live",
+                    format!("team {team}: declaration pins a coordinator harness process that is not live; every send for the team is refused as sender-not-coordinator"),
+                    format!("run `agentctl coordinator set NEW` (it rewrites the pin), or re-run `agent-teams init {team} --registry {registry_text}`"),
+                );
+            } else {
+                push(
+                    "pinned-designation",
+                    format!("team {team}: declaration pins the coordinator's harness process; when that session is retired its successor cannot send for the team"),
+                    format!("re-run `agent-teams init {team} --registry {registry_text}` so sender standing follows the designated coordinator"),
+                );
+            }
         }
         if document
             .get("deliverer")
@@ -306,19 +348,11 @@ pub(crate) fn team_declaration_flags(registry: &Path) -> Vec<Value> {
         {
             continue;
         }
-        let team = document
-            .get("team")
-            .and_then(Value::as_str)
-            .unwrap_or("?")
-            .to_owned();
         let pinned = document
             .get("deliverer")
             .and_then(|deliverer| deliverer.get("agent"))
             .and_then(Value::as_str)
             .map(str::to_owned);
-        let mut push = |kind: &str, detail: String, fix: String| {
-            flags.push(json!({"team": team, "kind": kind, "detail": detail, "fix": fix}));
-        };
         if let Some(agent) = &pinned {
             push(
                 "pinned-agent",
@@ -344,25 +378,46 @@ pub(crate) fn team_declaration_flags(registry: &Path) -> Vec<Value> {
                 );
             }
         }
-        match records.get(&target) {
-            None if archived(&target) => push(
-                "target-archived",
-                format!("team {team}: delivery target {target:?} is archived in this registry"),
-                "run `agentctl coordinator set NEW` to designate a live coordinator".to_owned(),
+        // A listed directory wins over any archived generation of the same name; the archive is
+        // matched by recorded name, never a file-name prefix; a registry that cannot be read
+        // proves nothing.
+        let present = match &listed {
+            Ok(names) => Ok(names.contains(&target)),
+            Err(error) => Err(error.clone()),
+        };
+        match present {
+            Err(error) => push(
+                "target-unknown",
+                format!("team {team}: could not list this registry to find delivery target {target:?} ({error})"),
+                "make the registry readable to this user, then `agent-teams check`".to_owned(),
             ),
-            None => push(
-                "target-missing",
-                format!("team {team}: delivery target {target:?} has no agent record in this registry"),
-                "run `agentctl coordinator set NEW` to designate a live coordinator, then `agent-teams check`".to_owned(),
-            ),
-            Some((lifecycle, _)) if !matches!(lifecycle.as_str(), "running" | "starting") => {
-                push(
-                    "target-not-live",
-                    format!("team {team}: delivery target {target:?} is not live (lifecycle {lifecycle})"),
-                    format!("revive it (`agentctl revive {target}`) or designate its successor: `agentctl coordinator set NEW`"),
-                )
-            }
-            _ => {}
+            Ok(false) => match agent_queue::registry::archived(registry, &target) {
+                Ok(true) => push(
+                    "target-archived",
+                    format!("team {team}: delivery target {target:?} is archived in this registry"),
+                    "run `agentctl coordinator set NEW` to designate a live coordinator".to_owned(),
+                ),
+                Ok(false) => push(
+                    "target-missing",
+                    format!("team {team}: delivery target {target:?} has no agent record in this registry"),
+                    "run `agentctl coordinator set NEW` to designate a live coordinator, then `agent-teams check`".to_owned(),
+                ),
+                Err(error) => push(
+                    "target-unknown",
+                    format!("team {team}: could not read this registry's archive for delivery target {target:?} ({error})"),
+                    "make the registry readable to this user, then `agent-teams check`".to_owned(),
+                ),
+            },
+            Ok(true) => match records.get(&target) {
+                Some((lifecycle, _)) if !matches!(lifecycle.as_str(), "running" | "starting") => {
+                    push(
+                        "target-not-live",
+                        format!("team {team}: delivery target {target:?} is not live (lifecycle {lifecycle})"),
+                        format!("revive it (`agentctl revive {target}`) or designate its successor: `agentctl coordinator set NEW`"),
+                    );
+                }
+                _ => {}
+            },
         }
         if let Some(parent) = records.get(&target).and_then(|(_, parent)| parent.clone()) {
             push(
@@ -390,6 +445,53 @@ pub(crate) fn team_declaration_flags(registry: &Path) -> Vec<Value> {
         }
     }
     flags
+}
+
+/// The receiving-host notices agent-teams leaves when it refuses a message as undeliverable
+/// (`teams.d/<team>/notices/<id>.json`), for every team whose declaration names `registry`,
+/// as `(notice path, notice)` sorted by path.
+pub(crate) fn team_undeliverable_notices(
+    registry: &Path,
+    teams_state: &Path,
+) -> Vec<(PathBuf, Value)> {
+    let mut found = Vec::new();
+    for (path, _) in declarations_naming(teams_state, registry) {
+        let Some(team_dir) = path.parent() else {
+            continue;
+        };
+        let Ok(entries) = fs::read_dir(team_dir.join("notices")) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let notice_path = entry.path();
+            if notice_path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(notice) = fs::read_to_string(&notice_path)
+                .ok()
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            else {
+                continue;
+            };
+            found.push((notice_path, notice));
+        }
+    }
+    found.sort_by(|left, right| left.0.cmp(&right.0));
+    found
+}
+
+/// Move a notice the coordinator has been told about out of `notices/` into its sibling
+/// `notices-told/`, so it is told once and the record stays for a person to read.
+pub(crate) fn acknowledge_team_notice(path: &Path) -> std::io::Result<()> {
+    let (Some(notices), Some(file_name)) = (path.parent(), path.file_name()) else {
+        return Ok(());
+    };
+    let Some(team_dir) = notices.parent() else {
+        return Ok(());
+    };
+    let told = team_dir.join("notices-told");
+    fs::create_dir_all(&told)?;
+    fs::rename(path, told.join(file_name))
 }
 
 /// How `agentctl manage` changes an agent's controller.
@@ -784,89 +886,97 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         Ok(file)
     }
 
-    /// Check every agent-teams declaration naming this registry after a
-    /// coordinator handover (#721): one pinned to the old coordinator's name
-    /// is fixed by dropping the pin (delivery then resolves this registry's
-    /// designated coordinator at send time); one pinned to any other name is
-    /// flagged for a human. Returns the JSON report embedded in
-    /// `coordinator set`'s output.
-    fn team_declarations_handover(&self, old: Option<&str>, new: &str) -> Value {
+    /// Check every agent-teams declaration under `teams_state` naming this registry after a
+    /// coordinator handover (#721), and fix what the handover made stale:
+    ///
+    /// - a deliverer pinned to the old coordinator's name loses the pin, so delivery resolves
+    ///   this registry's designated coordinator at send time; a pin to any other name (not the
+    ///   new coordinator) is flagged for a human;
+    /// - a pinned coordinator process (`coordinator.designation: "pinned"`), which decides who
+    ///   may send for the team, becomes `{"designation": "registry"}` when it is the old
+    ///   coordinator's harness, a process that is gone, or unreadable; a pin to some other live
+    ///   process is flagged. Without this the new coordinator's sends are refused as
+    ///   sender-not-coordinator.
+    ///
+    /// Returns the JSON report embedded in `coordinator set`'s output.
+    fn team_declarations_handover(
+        &self,
+        teams_state: &Path,
+        old: Option<&str>,
+        new: &str,
+    ) -> Value {
         let registry = self.registry_text();
-        let home =
-            std::env::var_os("HOME").map_or_else(String::new, |h| h.to_string_lossy().into_owned());
-        let expand = |declared: &str| -> String {
-            if let Some(rest) = declared.strip_prefix("~/") {
-                format!("{home}/{rest}")
-            } else {
-                declared.to_owned()
-            }
-        };
+        let old_identity = old
+            .and_then(|name| self.load(name).ok())
+            .and_then(|record| record.acting_process().cloned());
         let mut fixed = Vec::new();
         let mut flagged = Vec::new();
         let mut checked = 0_usize;
-        let teams_dir = agent_teams_state_dir().join("teams.d");
-        let Ok(entries) = fs::read_dir(&teams_dir) else {
-            return json!({"checked": 0, "fixed": fixed, "flagged": flagged});
-        };
-        let mut paths: Vec<PathBuf> = entries
-            .flatten()
-            .map(|entry| entry.path().join("declaration.json"))
-            .filter(|path| path.exists())
-            .collect();
-        paths.sort();
-        for path in paths {
-            let Ok(text) = fs::read_to_string(&path) else {
-                continue;
-            };
-            let Ok(mut document) = serde_json::from_str::<Value>(&text) else {
-                continue;
-            };
-            let declared_registry = document
-                .get("deliverer")
-                .and_then(|deliverer| deliverer.get("registry"))
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if expand(declared_registry) != registry {
-                continue;
-            }
+        for (path, mut document) in declarations_naming(teams_state, &self.registry) {
             checked += 1;
             let team = document
                 .get("team")
                 .and_then(Value::as_str)
                 .unwrap_or("?")
                 .to_owned();
+            let mut unpinned_designation = false;
+            if let Some(identity) = pinned_designation(&document) {
+                let stale = match &identity {
+                    None => true,
+                    Some(identity) => {
+                        old_identity.as_ref() == Some(identity)
+                            || self.client.process_liveness(identity) == ProcessLiveness::Dead
+                    }
+                };
+                if stale {
+                    document["coordinator"] = registry_designation();
+                    unpinned_designation = true;
+                } else {
+                    flagged.push(json!({
+                        "team": team, "pinned_designation": true,
+                        "reason": "declaration pins a live coordinator process that is not the old coordinator's harness",
+                        "fix": format!("re-run `agent-teams init {team} --registry {registry}` so sender standing follows the designated coordinator"),
+                    }));
+                }
+            }
             let pinned = document
                 .get("deliverer")
                 .and_then(|deliverer| deliverer.get("agent"))
                 .and_then(Value::as_str)
                 .map(str::to_owned);
-            let Some(pinned) = pinned else { continue };
-            if Some(pinned.as_str()) == old && pinned != new {
-                // Fix: drop the pin so delivery resolves the designation.
-                if let Some(deliverer) =
-                    document.get_mut("deliverer").and_then(Value::as_object_mut)
-                {
-                    deliverer.remove("agent");
+            let mut was_pinned = None;
+            match &pinned {
+                Some(agent) if Some(agent.as_str()) == old && agent != new => {
+                    if let Some(deliverer) =
+                        document.get_mut("deliverer").and_then(Value::as_object_mut)
+                    {
+                        deliverer.remove("agent");
+                    }
+                    was_pinned = Some(agent.clone());
                 }
-                document["updated_at"] = json!(now_seconds());
-                document["updated_by"] = json!("agentctl coordinator set (handover)");
-                match agent::atomic_json(&path, &document) {
-                    Ok(()) => fixed.push(json!({
-                        "team": team, "was_pinned": pinned,
-                        "declaration": path.to_string_lossy(),
-                    })),
-                    Err(error) => flagged.push(json!({
-                        "team": team, "pinned": pinned,
-                        "reason": format!("could not rewrite the declaration: {error}"),
-                        "fix": format!("re-run `agent-teams init {team} --registry {registry}`"),
-                    })),
-                }
-            } else if pinned != new {
-                flagged.push(json!({
-                    "team": team, "pinned": pinned,
+                Some(agent) if agent != new => flagged.push(json!({
+                    "team": team, "pinned": agent,
                     "reason": "declaration pins an agent that is neither the old nor the new coordinator",
                     "fix": format!("re-run `agent-teams init {team} --registry {registry}` to drop the pin"),
-                }));
+                })),
+                _ => {}
+            }
+            if !unpinned_designation && was_pinned.is_none() {
+                continue;
+            }
+            document["updated_at"] = json!(now_seconds());
+            document["updated_by"] = json!("agentctl coordinator set (handover)");
+            match agent::atomic_json(&path, &document) {
+                Ok(()) => fixed.push(json!({
+                    "team": team, "was_pinned": was_pinned,
+                    "unpinned_designation": unpinned_designation,
+                    "declaration": path.to_string_lossy(),
+                })),
+                Err(error) => flagged.push(json!({
+                    "team": team, "pinned": was_pinned,
+                    "reason": format!("could not rewrite the declaration: {error}"),
+                    "fix": format!("re-run `agent-teams init {team} --registry {registry}`"),
+                })),
             }
         }
         json!({"checked": checked, "fixed": fixed, "flagged": flagged})
@@ -874,6 +984,11 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
 
     /// Designate the registered agent `agent_name` as this registry's coordinator.
     pub fn coordinator_set(&self, agent_name: &str) -> Result<Value> {
+        self.coordinator_set_in(agent_name, &agent_teams_state_dir())
+    }
+
+    /// [`Self::coordinator_set`], fixing the agent-teams declarations under `teams_state`.
+    pub(crate) fn coordinator_set_in(&self, agent_name: &str, teams_state: &Path) -> Result<Value> {
         let _lock = self.designation_lock()?;
         let old = self.designated_coordinator().ok().flatten();
         let record = self.load(agent_name)?;
@@ -889,12 +1004,57 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             &serde_json::to_value(&designation).map_err(|error| fail(error.to_string()))?,
         )?;
         let mut report = self.coordinator_show()?;
-        report["team_declarations"] = self.team_declarations_handover(old.as_deref(), &record.name);
+        report["team_declarations"] =
+            self.team_declarations_handover(teams_state, old.as_deref(), &record.name);
         report["host_index"] = match self.host_index_refresh() {
             Ok(path) => json!({"registered": true, "path": path.to_string_lossy()}),
             Err(error) => json!({"registered": false, "error": error.to_string()}),
         };
         Ok(report)
+    }
+
+    /// The designation file's current content, for [`Self::coordinator_restore`].
+    pub fn designation_snapshot(&self) -> Result<Option<Value>> {
+        read_designation(&self.registry)?
+            .map(|designation| {
+                serde_json::to_value(&designation).map_err(|error| fail(error.to_string()))
+            })
+            .transpose()
+    }
+
+    /// Put back a designation taken with [`Self::designation_snapshot`] (`None` removes it),
+    /// as `stop --handover-to` does when the stop fails after the designation moved.
+    pub fn coordinator_restore(&self, previous: Option<&Value>) -> Result<()> {
+        let _lock = self.designation_lock()?;
+        let path = self.registry.join(DESIGNATION_FILE);
+        match previous {
+            Some(value) => agent::atomic_json(&path, value)?,
+            None => match fs::remove_file(&path) {
+                Ok(()) => agent::sync_directory(&self.registry)?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(fail(format!("cannot remove {}: {error}", path.display())))
+                }
+            },
+        }
+        if previous.is_some() {
+            let _ = self.host_index_refresh();
+        } else {
+            self.host_index_remove();
+        }
+        Ok(())
+    }
+
+    /// Whether `agent_name`'s recorded harness process is positively gone (kernel evidence of a
+    /// changed generation or exit); a record without a pinned process, or a probe that cannot
+    /// tell, is not dead.
+    pub fn harness_dead(&self, agent_name: &str) -> bool {
+        self.load(agent_name)
+            .ok()
+            .and_then(|record| record.acting_process().cloned())
+            .is_some_and(|identity| {
+                self.client.process_liveness(&identity) == ProcessLiveness::Dead
+            })
     }
 
     /// Report the designation and the state of the agent it names.

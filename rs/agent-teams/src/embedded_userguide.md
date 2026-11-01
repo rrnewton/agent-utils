@@ -183,10 +183,25 @@ elsewhere), get `agent-teams check` green, drain the old coordinator's
 queue, then retire it (`agentctl stop OLD --handover-to NEW`). A send or
 accept whose delivery target is missing or archived answers
 `undeliverable` with the reason instead of `accepted`: nothing is claimed
-on the receiving host, the message stays in the sender's outbox, the
-receiving host records a notice under `teams.d/<team>/notices/`, and
-`pump` retries it after the fix. Senders see exit 75, never a silent
-`accepted` into a dead queue.
+on the receiving host, the message stays in the sender's outbox as
+`deferred` with the reason beside it (`deferred` is a state every build's
+`pump` retries, so an older sender retries it too), and the receiving host
+records a notice under `teams.d/<team>/notices/`, which `agentctl
+watch-agents` tells the designated coordinator and then moves to
+`notices-told/`. `pump` retries the message after the fix; `agentctl
+watch-agents` runs it every 10 minutes while the outbox holds deferred
+messages. Senders see exit 75, never a silent `accepted` into a dead
+queue.
+
+An agent with a directory in the registry is always a deliverable target,
+whatever its archive holds (a stop and restart under the same name leaves
+the predecessor there); the archive is matched by each entry's recorded
+name, never a name prefix, and a registry that cannot be read is treated as
+unknown (deliverable, with a `target-unknown` warning in `check`). `check`
+marks each flag `error` (messages fail today: missing, archived or dead
+target, dead pinned coordinator process) or `warning` (a pinned name or
+process that goes stale later, a tree shape); warnings fail `check` only
+with `--strict`.
 
 ### Receiving host (run by routes)
 

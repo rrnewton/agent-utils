@@ -229,11 +229,7 @@ fn coordinator_set_fixes_declarations_pinned_to_the_old_coordinator() {
     let pinned_old = write_declaration("tools", Some("coord-old"));
     let pinned_other = write_declaration("sim", Some("someone-else"));
     let _unpinned = write_declaration("plain", None);
-    // SAFETY: this test owns AGENT_TEAMS_STATE_DIR for its body; concurrent
-    // coordinator tests only ever match their own registry, never this one.
-    unsafe { std::env::set_var("AGENT_TEAMS_STATE_DIR", &state) };
-    let report = manager.coordinator_set("coord-new").unwrap();
-    unsafe { std::env::remove_var("AGENT_TEAMS_STATE_DIR") };
+    let report = manager.coordinator_set_in("coord-new", &state).unwrap();
     let handover = &report["team_declarations"];
     assert_eq!(handover["checked"], 3, "{report}");
     assert_eq!(handover["fixed"].as_array().unwrap().len(), 1, "{report}");
@@ -459,11 +455,7 @@ fn team_declaration_flags_name_the_pinned_retired_target() {
         "accepts_from": [], "limits": {},
     });
     agent::atomic_json(&dir.join("declaration.json"), &document).unwrap();
-    // SAFETY: as in the handover test above, concurrent tests only match
-    // their own registry against this state directory.
-    unsafe { std::env::set_var("AGENT_TEAMS_STATE_DIR", &state) };
-    let flags = team_declaration_flags(&registry(&fixture));
-    unsafe { std::env::remove_var("AGENT_TEAMS_STATE_DIR") };
+    let flags = team_declaration_flags(&registry(&fixture), &state);
     let kinds: Vec<&str> = flags
         .iter()
         .map(|flag| flag["kind"].as_str().unwrap_or("?"))
@@ -476,5 +468,166 @@ fn team_declaration_flags_name_the_pinned_retired_target() {
             .iter()
             .all(|flag| flag["fix"].as_str().is_some_and(|fix| !fix.is_empty())),
         "every flag names its fix: {flags:?}"
+    );
+}
+
+/// A declaration under `state` for `team`, delivering through `registry_text`.
+fn write_team_declaration(state: &Path, team: &str, registry_text: &str, extra: Value) -> PathBuf {
+    let dir = state.join("teams.d").join(team);
+    fs::create_dir_all(&dir).unwrap();
+    let mut document = json!({
+        "schema": "agent-teams-declaration/v1", "team": team,
+        "deliverer": {"kind": "agentctl-queue", "registry": registry_text},
+        "coordinator": {"designation": "registry"},
+        "accepts_from": [], "limits": {},
+    });
+    for (key, value) in extra.as_object().unwrap() {
+        document[key] = value.clone();
+    }
+    agent::atomic_json(&dir.join("declaration.json"), &document).unwrap();
+    dir.join("declaration.json")
+}
+
+/// Review finding 3: a handover also rewrites a declaration's pinned coordinator process (the
+/// old coordinator's harness) to the registry designation, so the new coordinator may send;
+/// a pin to some other live process is flagged, not rewritten. A differently spelled path to
+/// the registry (trailing slash, symlink) is still matched.
+#[test]
+fn coordinator_set_rewrites_a_pinned_designation_of_the_old_coordinator() {
+    let fixture = Fixture::new();
+    register(&fixture, "coord-old", 88);
+    register(&fixture, "coord-new", 89);
+    let manager = fixture.manager();
+    manager
+        .coordinator_set_in("coord-old", &fixture.root.join("none"))
+        .unwrap();
+    let state = fixture.root.join("teams-state-pinned");
+    let link = fixture.root.join("registry-link");
+    std::os::unix::fs::symlink(registry(&fixture), &link).unwrap();
+    let pinned_old = write_team_declaration(
+        &state,
+        "tools",
+        &format!("{}/", canonical_registry(&fixture)),
+        json!({"coordinator": {"designation": "pinned", "harness_identity": Fake::harness(88)}}),
+    );
+    let pinned_other = write_team_declaration(
+        &state,
+        "sim",
+        &link.display().to_string(),
+        json!({"coordinator": {"designation": "pinned", "harness_identity": Fake::harness(77)}}),
+    );
+    let report = manager.coordinator_set_in("coord-new", &state).unwrap();
+    let handover = &report["team_declarations"];
+    assert_eq!(handover["checked"], 2, "{report}");
+    assert_eq!(handover["fixed"][0]["team"], "tools", "{report}");
+    assert_eq!(
+        handover["fixed"][0]["unpinned_designation"], true,
+        "{report}"
+    );
+    assert_eq!(handover["flagged"][0]["team"], "sim", "{report}");
+    let fixed = agent::read_private_json(&pinned_old).unwrap();
+    assert_eq!(fixed["coordinator"]["designation"], "registry", "{fixed}");
+    let flagged = agent::read_private_json(&pinned_other).unwrap();
+    assert_eq!(flagged["coordinator"]["designation"], "pinned", "{flagged}");
+}
+
+/// Review finding 1, in watch-agents' copy of the checks: a live coordinator beside an archived
+/// predecessor of the same name and an archived agent its name prefixes raises no target flag;
+/// flags carry a severity, and a pinned name is only a warning.
+#[test]
+fn team_declaration_flags_match_the_archive_exactly_and_carry_severity() {
+    use crate::subagents::team_declaration_flags;
+    let fixture = Fixture::new();
+    register(&fixture, "coordinator", 89);
+    let manager = fixture.manager();
+    manager
+        .coordinator_set_in("coordinator", &fixture.root.join("none"))
+        .unwrap();
+    let archive = registry(&fixture).join("archive");
+    for (entry, name) in [
+        ("coordinator-1792931619150276422-1347278", "coordinator"),
+        (
+            "coordinator-tail-1792931619150276999-1347279",
+            "coordinator-tail",
+        ),
+    ] {
+        fs::create_dir_all(archive.join(entry)).unwrap();
+        fs::write(
+            archive.join(entry).join("agent.json"),
+            json!({"name": name}).to_string(),
+        )
+        .unwrap();
+    }
+    let state = fixture.root.join("teams-state-archive");
+    write_team_declaration(&state, "tools", &canonical_registry(&fixture), json!({}));
+    let flags = team_declaration_flags(&registry(&fixture), &state);
+    assert!(flags.is_empty(), "{flags:?}");
+    write_team_declaration(
+        &state,
+        "tools",
+        &canonical_registry(&fixture),
+        json!({"deliverer": {"kind": "agentctl-queue", "registry": canonical_registry(&fixture), "agent": "coordinator"}}),
+    );
+    let flags = team_declaration_flags(&registry(&fixture), &state);
+    assert_eq!(flags.len(), 1, "{flags:?}");
+    assert_eq!(flags[0]["kind"], "pinned-agent");
+    assert_eq!(flags[0]["severity"], "warning");
+}
+
+/// Review finding 2: watch-agents reads the receiving host's undeliverable notices for teams
+/// delivering through its registry, and sets each aside once told.
+#[test]
+fn team_undeliverable_notices_are_listed_and_set_aside() {
+    use crate::subagents::{acknowledge_team_notice, team_undeliverable_notices};
+    let fixture = Fixture::new();
+    register(&fixture, "coordinator", 89);
+    let state = fixture.root.join("teams-state-notices");
+    write_team_declaration(&state, "tools", &canonical_registry(&fixture), json!({}));
+    write_team_declaration(&state, "elsewhere", "/nonexistent/registry", json!({}));
+    for team in ["tools", "elsewhere"] {
+        let notices = state.join("teams.d").join(team).join("notices");
+        fs::create_dir_all(&notices).unwrap();
+        fs::write(
+            notices.join("tm-a.json"),
+            json!({"event": "undeliverable-notice", "team": team, "id": "tm-a"}).to_string(),
+        )
+        .unwrap();
+    }
+    let found = team_undeliverable_notices(&registry(&fixture), &state);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].1["team"], "tools");
+    acknowledge_team_notice(&found[0].0).unwrap();
+    assert!(team_undeliverable_notices(&registry(&fixture), &state).is_empty());
+    assert!(state.join("teams.d/tools/notices-told/tm-a.json").exists());
+}
+
+/// `stop --handover-to` moves the designation before the stop and puts it back when the stop
+/// fails: a snapshot restores exactly, and restoring "none" removes the designation.
+#[test]
+fn a_designation_snapshot_restores_after_a_failed_handover_stop() {
+    let fixture = Fixture::new();
+    register(&fixture, "coord-old", 88);
+    register(&fixture, "coord-new", 89);
+    let manager = fixture.manager();
+    let none = fixture.root.join("none");
+    assert_eq!(manager.designation_snapshot().unwrap(), None);
+    manager.coordinator_set_in("coord-old", &none).unwrap();
+    let previous = manager.designation_snapshot().unwrap();
+    manager.coordinator_set_in("coord-new", &none).unwrap();
+    assert_eq!(
+        manager.designated_coordinator().unwrap().as_deref(),
+        Some("coord-new")
+    );
+    manager.coordinator_restore(previous.as_ref()).unwrap();
+    assert_eq!(
+        manager.designated_coordinator().unwrap().as_deref(),
+        Some("coord-old")
+    );
+    assert_eq!(manager.designation_snapshot().unwrap(), previous);
+    manager.coordinator_restore(None).unwrap();
+    assert_eq!(manager.designated_coordinator().unwrap(), None);
+    assert!(
+        !manager.harness_dead("coord-old"),
+        "unknown liveness is not dead"
     );
 }

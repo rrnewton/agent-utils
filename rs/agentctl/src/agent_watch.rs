@@ -42,6 +42,8 @@ use crate::agent::{AgentError, DrainOptions, QueueMessageState};
 
 #[path = "agent_watch_recovery.rs"]
 mod recovery;
+#[path = "agent_watch_teams.rs"]
+mod teams;
 use crate::subagents::{controller_of, ManagedAgents, ManagedApi};
 use recovery::recover_due;
 
@@ -826,6 +828,9 @@ struct WatchState {
     /// the coordinator (#721), so a standing flag is told once, not per pass.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     team_flags_reported: String,
+    /// When the watcher last ran `agent-teams pump` for this host's outbox (#721).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    team_pump_at: Option<f64>,
 }
 
 /// An owner (chat-bridge) request waiting undelivered in a registered agent's queue.
@@ -897,6 +902,23 @@ pub trait Probe {
     fn team_declaration_flags(&mut self) -> Vec<Value> {
         Vec::new()
     }
+    /// The registry's designated coordinator as it stands now, which agent-teams notices go
+    /// to (#721): after a handover the watcher's configured coordinator is retired. The default
+    /// knows none, so notices go to the configured coordinator.
+    fn designated_coordinator(&mut self) -> Option<String> {
+        None
+    }
+    /// Notices agent-teams left on this host when it refused a message as undeliverable, for
+    /// teams delivering through this registry (#721), as `(path, notice)`. The default sees
+    /// none.
+    fn team_undeliverable_notices(&mut self) -> Vec<(PathBuf, Value)> {
+        Vec::new()
+    }
+    /// How many messages in this host's agent-teams outbox wait for a retry (#721). The
+    /// default sees none.
+    fn team_outbox_waiting(&mut self) -> usize {
+        0
+    }
 }
 
 /// Where notices go; the production sink queues one message for the coordinator.
@@ -928,6 +950,16 @@ pub trait Notifier {
     /// cannot.
     fn interrupt_and_deliver(&mut self, agent: &str, _expected: u64) -> Result<Interrupt> {
         Err(fail(format!("this watcher cannot interrupt {agent}")))
+    }
+    /// Set aside an agent-teams undeliverable notice the coordinator has been told about, so it
+    /// is told once (#721). The default does nothing.
+    fn acknowledge_team_notice(&mut self, _path: &Path) -> std::result::Result<(), String> {
+        Ok(())
+    }
+    /// Run `agent-teams pump` for this host's outbox and return what it printed (#721). The
+    /// default cannot.
+    fn run_team_pump(&mut self) -> std::result::Result<String, String> {
+        Err("this watcher cannot run agent-teams pump".to_owned())
     }
 }
 
@@ -2636,55 +2668,16 @@ fn watch_agents_once(
     let delivery_waits = report_delivery_jams(probe, notifier, state, now, options);
     let owner_waits = report_waiting_owner_prompts(probe, notifier, state, now, options);
     let quarantines = report_quarantines(probe, notifier, state, now, options);
-    // Agent-teams declaration health (#721): the same red flags
-    // `agent-teams check` prints, evaluated every pass for declarations
-    // delivering through this registry. A changed flag set is told to the
-    // coordinator once; a standing one is not repeated per pass.
-    let team_flags = if probe_error.is_null() {
-        probe.team_declaration_flags()
+    // Agent-teams health (#721): declaration red flags, undeliverable notices, and the
+    // outbox pump. A failed probe pass says nothing about declarations, so their state is
+    // left as it was.
+    let (team_flags, team_flags_notice) = if probe_error.is_null() {
+        teams::report_team_declarations(probe, notifier, state, now, options)
     } else {
-        Vec::new()
+        (Vec::new(), Value::Null)
     };
-    if !team_flags.is_empty() {
-        let fingerprint = team_flags
-            .iter()
-            .map(|flag| {
-                format!(
-                    "{}:{}",
-                    flag["team"].as_str().unwrap_or("?"),
-                    flag["kind"].as_str().unwrap_or("?")
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-        if fingerprint != state.team_flags_reported {
-            state.team_flags_reported = fingerprint;
-            if !options.check_only {
-                let lines: Vec<String> = team_flags
-                    .iter()
-                    .map(|flag| {
-                        format!(
-                            "- {} — fix: {}",
-                            flag["detail"].as_str().unwrap_or("?"),
-                            flag["fix"].as_str().unwrap_or("?")
-                        )
-                    })
-                    .collect();
-                let text = format!(
-                    "agent-teams declaration health: {} red flag(s) for teams delivering through this registry; inter-team messages may be undeliverable:\n{}",
-                    team_flags.len(),
-                    lines.join("\n")
-                );
-                let _ = notifier.notify(
-                    &options.coordinator,
-                    &text,
-                    &format!("team-declarations-{}", now as u64),
-                );
-            }
-        }
-    } else {
-        state.team_flags_reported.clear();
-    }
+    let team_notices = teams::report_team_notices(probe, notifier, now, options);
+    let team_pump = teams::drive_team_pump(probe, notifier, state, now, options);
     let child_done = flush_child_done(state, notifier, now, options);
     let notice = flush_notices(state, notifier, now, options);
     // The episode rows were made before this pass's sends: `reported` means delivered, so it is
@@ -2718,7 +2711,7 @@ fn watch_agents_once(
         "checked_at": now,
         "coordinator": options.coordinator,
         "ok": probe_error.is_null()
-            && team_flags.is_empty()
+            && team_flags.iter().all(|flag| flag["severity"] != "error")
             && scrolled.is_empty()
             && unchecked.is_empty()
             && owner_waits.iter().all(|row| row["stuck"] != true)
@@ -2739,6 +2732,9 @@ fn watch_agents_once(
         "owner_waits": owner_waits,
         "quarantines": quarantines,
         "team_declarations": team_flags,
+        "team_declarations_notice": team_flags_notice,
+        "team_notices": team_notices,
+        "team_pump": team_pump,
         "auto_interrupts": auto_interrupts,
         "activity": observations
             .iter()
@@ -3379,6 +3375,8 @@ pub struct ManagedProbe<'a, A: ManagedApi + ?Sized> {
     /// The agents whose screens the last pass read, for the quick check between passes, in the
     /// order the next quick check reads them.
     screened: Vec<String>,
+    /// The agent-teams state directory whose declarations, notices and outbox each pass reads.
+    teams_state: PathBuf,
 }
 
 impl<'a, A: ManagedApi + ?Sized> ManagedProbe<'a, A> {
@@ -3394,7 +3392,16 @@ impl<'a, A: ManagedApi + ?Sized> ManagedProbe<'a, A> {
             screens: BTreeMap::new(),
             transcripts: crate::harness::transcript::Cache::default(),
             screened: Vec::new(),
+            teams_state: crate::subagents::agent_teams_state_dir(),
         }
+    }
+
+    /// Read agent-teams declarations, notices and the outbox from `teams_state` instead of the
+    /// agent-teams default state directory.
+    #[must_use]
+    pub fn with_teams_state(mut self, teams_state: &Path) -> Self {
+        self.teams_state = teams_state.to_owned();
+        self
     }
 
     /// End each pass's checks after `budget` (`None`: no limit), and, when `verbose`, say on
@@ -3831,7 +3838,35 @@ impl<A: ManagedApi + ?Sized> Probe for ManagedProbe<'_, A> {
     }
 
     fn team_declaration_flags(&mut self) -> Vec<Value> {
-        crate::subagents::team_declaration_flags(&self.registry)
+        crate::subagents::team_declaration_flags(&self.registry, &self.teams_state)
+    }
+
+    fn designated_coordinator(&mut self) -> Option<String> {
+        ManagedAgents::new(self.client, &self.registry)
+            .ok()?
+            .designated_coordinator()
+            .ok()
+            .flatten()
+    }
+
+    fn team_undeliverable_notices(&mut self) -> Vec<(PathBuf, Value)> {
+        crate::subagents::team_undeliverable_notices(&self.registry, &self.teams_state)
+    }
+
+    /// Outbox entries `agent-teams pump` retries and that wait on this host: `deferred`, and
+    /// `undeliverable` as the first #721 build stored it.
+    fn team_outbox_waiting(&mut self) -> usize {
+        let outbox = self.teams_state.join("outbox");
+        let Ok(entries) = fs::read_dir(outbox) else {
+            return 0;
+        };
+        entries
+            .flatten()
+            .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
+            .filter_map(|entry| fs::read_to_string(entry.path()).ok())
+            .filter_map(|text| serde_json::from_str::<Value>(&text).ok())
+            .filter(|entry| matches!(entry["state"].as_str(), Some("deferred" | "undeliverable")))
+            .count()
     }
 
     /// Only an agent with a waiter record can have waiters, so the record directories name
@@ -4077,6 +4112,8 @@ impl<A: ManagedApi + ?Sized> Probe for ManagedProbe<'_, A> {
 pub struct ManagedNotifier<'a, A: ManagedApi + ?Sized> {
     client: &'a A,
     registry: PathBuf,
+    /// The agent-teams state directory `agent-teams pump` runs against.
+    teams_state: PathBuf,
 }
 
 impl<'a, A: ManagedApi + ?Sized> ManagedNotifier<'a, A> {
@@ -4085,9 +4122,13 @@ impl<'a, A: ManagedApi + ?Sized> ManagedNotifier<'a, A> {
         Self {
             client,
             registry: registry.to_owned(),
+            teams_state: crate::subagents::agent_teams_state_dir(),
         }
     }
 }
+
+/// The longest one `agent-teams pump` run may take inside a watch pass (#721).
+const TEAM_PUMP_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Attempts a batch is re-queued under a fresh ID after landing in the queue's
 /// failed set. A failed entry may have been typed, so agentctl never replays it
@@ -4132,6 +4173,38 @@ impl<A: ManagedApi + ?Sized> Notifier for ManagedNotifier<'_, A> {
             text,
             message_id,
         )
+    }
+
+    fn acknowledge_team_notice(&mut self, path: &Path) -> std::result::Result<(), String> {
+        crate::subagents::acknowledge_team_notice(path).map_err(|error| error.to_string())
+    }
+
+    /// `agent-teams --state-dir DIR pump`, the binary named by `$AGENT_TEAMS_BIN` or found on
+    /// `PATH`, bounded by [`TEAM_PUMP_TIMEOUT`].
+    fn run_team_pump(&mut self) -> std::result::Result<String, String> {
+        let binary = std::env::var_os("AGENT_TEAMS_BIN")
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "agent-teams".into());
+        let mut command = std::process::Command::new(&binary);
+        command
+            .arg("--state-dir")
+            .arg(&self.teams_state)
+            .arg("pump")
+            .stdin(std::process::Stdio::null());
+        let output = crate::client::bounded_output(command, TEAM_PUMP_TIMEOUT)
+            .map_err(|error| format!("cannot run {}: {error}", binary.to_string_lossy()))?;
+        let mut text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.trim().is_empty() {
+            text = format!("{text}\n{}", stderr.trim());
+        }
+        let text: String = text.chars().take(2_000).collect();
+        // Exit 75 and 76 mean some message is still unsettled, which pump reports; only a
+        // usage or data failure is an error here.
+        match output.status.code() {
+            Some(0 | 65 | 75 | 76) => Ok(text),
+            code => Err(format!("agent-teams pump exited {code:?}: {text}")),
+        }
     }
 
     fn interrupt_and_deliver(&mut self, agent: &str, expected: u64) -> Result<Interrupt> {

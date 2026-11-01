@@ -335,6 +335,56 @@ pub fn names(registry: &Path) -> Result<Vec<String>> {
     Ok(names)
 }
 
+/// Whether `REGISTRY/archive/` holds a retired generation of agent `name`.
+///
+/// Archive entries are named `NAME-TOKEN`, `NAME-TOKEN-adopt-failed` or
+/// `NAME-stale-SHA256`, and both names and tokens contain hyphens, so a file-name prefix
+/// cannot tell `coordinator`'s entries from `coordinator-tail`'s. The entry's own record
+/// decides: its `agent.json` (or the entry itself, when it is a file) names the agent. Only an
+/// entry with no readable record falls back to its file name, whose remainder after `NAME-`
+/// must then be one of the token shapes agentctl writes (`<digits>-<digits>`, optionally
+/// `-adopt-failed`, or `stale-` and 64 hex digits).
+///
+/// # Errors
+///
+/// `REGISTRY/archive` exists but cannot be listed.
+pub fn archived(registry: &Path, name: &str) -> Result<bool> {
+    let archive = registry.join("archive");
+    let prefix = format!("{name}-");
+    for entry in entry_names(&archive)? {
+        let Some(rest) = entry.strip_prefix(&prefix) else {
+            continue;
+        };
+        let path = archive.join(&entry);
+        let record = fs::read(path.join("agent.json"))
+            .or_else(|_| fs::read(&path))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|value| value.get("name").and_then(Value::as_str).map(str::to_owned));
+        let matched = match record {
+            Some(recorded) => recorded == name,
+            None => archive_token_shape(rest),
+        };
+        if matched {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether `rest` (an archive entry name after `NAME-`) is a token shape agentctl writes.
+fn archive_token_shape(rest: &str) -> bool {
+    if let Some(digest) = rest.strip_prefix("stale-") {
+        return digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit());
+    }
+    let token = rest.strip_suffix("-adopt-failed").unwrap_or(rest);
+    let mut parts = token.split('-');
+    let numeric = |part: Option<&str>| {
+        part.is_some_and(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+    };
+    numeric(parts.next()) && numeric(parts.next()) && parts.next().is_none()
+}
+
 /// The layout-1 lock files left in the registry's top level, as `(agent name, path)`, sorted by
 /// path: `.<name>.lock` and `.<name>.rank.lock`, except the [`FIXED_LOCK_STEMS`] (whose
 /// `.rank.lock` companions are agents' locks, and listed).
@@ -589,5 +639,56 @@ mod tests {
         let agents: Vec<&str> = found.iter().map(|(agent, _)| agent.as_str()).collect();
         assert_eq!(agents, ["a", "a", "b-2", "coordinator"]);
         fs::remove_dir_all(registry).unwrap();
+    }
+
+    /// #721 agent-teams-coordinator-handover: an archived predecessor of the same name, or an
+    /// archived agent whose name merely starts with this one, is matched exactly.
+    #[test]
+    fn archived_matches_the_recorded_name_never_a_prefix() {
+        let registry = scratch("archived");
+        assert!(
+            !archived(&registry, "coordinator").unwrap(),
+            "no archive yet"
+        );
+        let archive = registry.join("archive");
+        let entry = |name: &str, record: Option<&str>| {
+            let path = archive.join(name);
+            fs::create_dir_all(&path).unwrap();
+            if let Some(recorded) = record {
+                fs::write(
+                    path.join("agent.json"),
+                    format!("{{\"name\": \"{recorded}\"}}"),
+                )
+                .unwrap();
+            }
+        };
+        // A prefix-sharing agent, with and without a readable record.
+        entry(
+            "coordinator-tail-1792931619150276422-1347278",
+            Some("coordinator-tail"),
+        );
+        entry("coordinator-tail-1792931619150276999-1347279", None);
+        assert!(!archived(&registry, "coordinator").unwrap());
+        assert!(archived(&registry, "coordinator-tail").unwrap());
+        // The same name: by record, and by token shape when the record is unreadable.
+        entry(
+            "coordinator-1792931619150276422-1347278",
+            Some("coordinator"),
+        );
+        assert!(archived(&registry, "coordinator").unwrap());
+        assert!(!archived(&registry, "coord").unwrap());
+        let shapes = scratch("archived-shapes");
+        let entry = |name: &str| fs::create_dir_all(shapes.join("archive").join(name)).unwrap();
+        entry("old-17-42-adopt-failed");
+        entry(&format!("stale-{}", "a".repeat(64)));
+        entry(&format!("gone-stale-{}", "b".repeat(64)));
+        assert!(archived(&shapes, "old").unwrap());
+        assert!(archived(&shapes, "gone").unwrap());
+        assert!(
+            !archived(&shapes, "stale").unwrap(),
+            "stale-<digest> has no token"
+        );
+        fs::remove_dir_all(registry).unwrap();
+        fs::remove_dir_all(shapes).unwrap();
     }
 }

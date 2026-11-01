@@ -562,10 +562,15 @@ fn cmd_check(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
         {
             continue;
         }
+        // Errors lose messages today; warnings (a pin that goes stale
+        // later, a tree shape) are problems only under --strict, like
+        // every other warning here.
         let health = crate::health::evaluate(declaration);
         for flag in &health.flags {
-            problems.push(format!("{} — fix: {}", flag.detail, flag.fix));
-            lines.push(json!({"kind": flag.kind, "detail": flag.detail, "fix": flag.fix}));
+            if strict || flag.is_error() {
+                problems.push(format!("{} — fix: {}", flag.detail, flag.fix));
+            }
+            lines.push(json!({"kind": flag.kind, "severity": flag.severity, "detail": flag.detail, "fix": flag.fix}));
         }
     }
     // Team items land in the inbox.v2 lane; an agentctl predating lanes
@@ -1301,13 +1306,17 @@ fn cmd_send(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
             if let Some((_, _, declaration)) = declarations.iter().find(|(t, _, _)| t == &to_team) {
                 let health = crate::health::evaluate(declaration);
                 if let Some(flag) = health.undeliverable() {
-                    outbox_entry["state"] = json!("undeliverable");
+                    // Stored as `deferred` with the reason beside it, the
+                    // state every build's pump retries (#721).
+                    outbox_entry["state"] = json!("deferred");
+                    outbox_entry["undeliverable"] =
+                        json!(format!("{} — fix: {}", flag.detail, flag.fix));
                     write_json_atomic(
                         &crate::sender::outbox_path(&globals.state, &id),
                         &outbox_entry,
                     )?;
                     println!("{id}: undeliverable: {} — fix: {}", flag.detail, flag.fix);
-                    println!("kept in the outbox; fix the target, then `agent-teams pump`");
+                    println!("kept in the outbox as deferred; fix the target, then `agent-teams pump` (agentctl watch-agents pumps this host's outbox every 10 minutes)");
                     return Ok(75);
                 }
             }
@@ -1347,6 +1356,10 @@ fn cmd_send(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
             println!("  {} {} {}", step.contact, step.route, step.detail);
         }
         println!("{id}: {}", result.state);
+        if let Some(reason) = outbox_entry["undeliverable"].as_str() {
+            println!("undeliverable: {reason}");
+            println!("kept in the outbox as deferred; it is retried by `agent-teams pump` (agentctl watch-agents pumps this host's outbox every 10 minutes)");
+        }
     }
     Ok(result.exit_code)
 }
@@ -1532,11 +1545,15 @@ fn cmd_outbox(globals: &Globals) -> Result<i32, DataError> {
     }
     for row in &rows {
         println!(
-            "{} {} -> {} key={}",
+            "{} {} -> {} key={}{}",
             row["id"].as_str().unwrap_or("?"),
             row["state"].as_str().unwrap_or("?"),
             row["addressed_to"].as_str().unwrap_or("?"),
-            row["envelope"]["key"].as_str().unwrap_or("?")
+            row["envelope"]["key"].as_str().unwrap_or("?"),
+            row["undeliverable"]
+                .as_str()
+                .map(|reason| format!(" (undeliverable: {reason})"))
+                .unwrap_or_default()
         );
     }
     Ok(0)
@@ -1564,6 +1581,8 @@ fn cmd_pump(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
                 continue;
             };
             let state = entry["state"].as_str().unwrap_or("deferred").to_string();
+            // `undeliverable` is only what the first #721 build stored;
+            // current builds store `deferred` with the reason beside it.
             let retryable = matches!(
                 state.as_str(),
                 "deferred" | "ambiguous" | "accepted" | "claimed" | "undeliverable"

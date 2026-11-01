@@ -286,7 +286,10 @@ pub fn accept(
     // or archived can never read its queue, so answering `accepted` here
     // would silently lose the message. No ledger entry is written (the
     // sender keeps the message in its outbox and retries after the fix);
-    // the receiving host records a notice for its coordinator/owner.
+    // the receiving host records a notice under notices/, which agentctl
+    // watch-agents tells the coordinator. The answer carries state
+    // `deferred`: a sender predating this outcome records the state it is
+    // given, and `deferred` is one every build's pump retries.
     if let Some(reason) = deliverer.undeliverable_reason() {
         let notice = json!({
             "event": "undeliverable-notice", "team": team, "id": id,
@@ -299,7 +302,7 @@ pub fn accept(
         unlock(lock);
         return Ok(AcceptAnswer {
             outcome: "undeliverable".to_string(),
-            state: None,
+            state: Some("deferred".to_string()),
             detail: reason,
             findings: Vec::new(),
         });

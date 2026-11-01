@@ -1396,6 +1396,15 @@ fn accept_to_missing_target_is_undeliverable_and_claims_nothing() {
     let answer = accept(&ctx, &envelope, &deliverer).expect("accept");
     assert_eq!(answer.outcome, "undeliverable", "{answer:?}");
     assert!(answer.detail.contains("undeliverable"), "{answer:?}");
+    // Review finding 2: a sender predating the outcome records the answer's
+    // state when one is given (else the outcome), so the state must be one
+    // that every build's pump retries.
+    let wire = answer.to_json();
+    let old_sender_state = wire["state"]
+        .as_str()
+        .or_else(|| wire["outcome"].as_str())
+        .unwrap_or_default();
+    assert_eq!(old_sender_state, "deferred", "{wire}");
     // Nothing claimed: a retry after the fix must be able to deliver.
     assert!(read_entry(&state, "tools", "tm-sim-1212121212121212").is_none());
     // A notice waits for the receiving coordinator/owner.

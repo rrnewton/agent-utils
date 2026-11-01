@@ -19,10 +19,21 @@ use std::path::{Path, PathBuf};
 pub struct Flag {
     /// Stable flag kind, for example `target-missing`.
     pub kind: &'static str,
+    /// `error` when messages to or from the team fail until it is fixed;
+    /// `warning` for a standing risk (a pin that goes stale later, a tree
+    /// shape) that does not lose anything today.
+    pub severity: &'static str,
     /// What is wrong, in one line.
     pub detail: String,
     /// The command that fixes it.
     pub fix: String,
+}
+
+impl Flag {
+    /// Whether this flag is a present failure rather than a standing risk.
+    pub fn is_error(&self) -> bool {
+        self.severity == "error"
+    }
 }
 
 /// Health of one declaration's delivery target.
@@ -49,34 +60,74 @@ impl TargetHealth {
     }
 }
 
+/// What a registry says about one agent name.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Presence {
+    /// The agent has a directory in the registry (either layout): a live
+    /// record, or a queue created ahead of its registration.
+    Present,
+    /// No directory, and the archive holds a retired generation of exactly
+    /// this name.
+    Archived,
+    /// No directory and no archived generation.
+    Missing,
+    /// The registry could not be read; absence is not established.
+    Unknown(String),
+}
+
+/// Where `agent` stands in `registry`. A present directory wins over any
+/// archived generation of the same name (a stop and restart, or a
+/// re-adoption, leaves the predecessor in the archive), and the archive is
+/// matched by the entry's recorded name, never a file-name prefix.
+pub fn presence(registry: &Path, agent: &str) -> Presence {
+    match agent_queue::registry::names(registry) {
+        Ok(names) if names.iter().any(|name| name == agent) => return Presence::Present,
+        Ok(_) => {}
+        Err(error) => return Presence::Unknown(error.to_string()),
+    }
+    match agent_queue::registry::archived(registry, agent) {
+        Ok(true) => Presence::Archived,
+        Ok(false) => Presence::Missing,
+        Err(error) => Presence::Unknown(error.to_string()),
+    }
+}
+
+/// Whether `registry` is a real agentctl registry, where a missing agent is
+/// evidence of a dead target: it has a designation or at least one agent
+/// record. A scratch queue root (queue directories created ahead of
+/// registration, or an empty `agents/` tree) is not, and neither is a
+/// registry that cannot be read.
+fn populated(registry: &Path) -> bool {
+    if registry.join("coordinator.json").exists() {
+        return true;
+    }
+    agent_queue::registry::names(registry).is_ok_and(|names| {
+        names.iter().any(|name| {
+            agent_queue::registry::record_directories(registry, name)
+                .is_ok_and(|found| !found.is_empty())
+        })
+    })
+}
+
 /// Why handing a message to `agent` in `registry` can never reach anyone:
-/// the agent is archived, or it has no record in a registry that otherwise
-/// has agents or a designation. An empty registry is not refused: a queue
-/// directory is legitimately created ahead of the agent's registration.
-/// Shared by `accept`'s deliverer and the sender-side pre-flight (#721).
+/// the agent has no directory and either its name is archived, or the
+/// registry otherwise has agents or a designation. An agent with a
+/// directory is deliverable; so is any agent of an unreadable or scratch
+/// registry, where absence proves nothing. Shared by `accept`'s deliverer
+/// and the sender-side pre-flight (#721).
 pub fn undeliverable_reason(registry: &Path, agent: &str) -> Option<String> {
-    if agent_archived(registry, agent) {
-        return Some(format!(
+    match presence(registry, agent) {
+        Presence::Present | Presence::Unknown(_) => None,
+        Presence::Archived => Some(format!(
             "delivery target {agent:?} is archived in registry {}",
             registry.display()
-        ));
-    }
-    if agent_exists(registry, agent) {
-        return None;
-    }
-    // A real agentctl registry: it has a designation, an `agents/` tree, or
-    // an archive. Anything else is a scratch queue root created ahead of
-    // registration, where absence is not evidence of a dead target.
-    let populated = registry.join("coordinator.json").exists()
-        || agent_queue::registry::agents_directory(registry).is_dir()
-        || registry.join("archive").is_dir();
-    if populated {
-        return Some(format!(
+        )),
+        Presence::Missing if populated(registry) => Some(format!(
             "delivery target {agent:?} has no agent record in registry {}",
             registry.display()
-        ));
+        )),
+        Presence::Missing => None,
     }
-    None
 }
 
 /// The registry an `agentctl-queue` declaration delivers through.
@@ -96,24 +147,6 @@ pub fn pinned_agent(declaration: &Declaration) -> Option<String> {
         .and_then(Value::as_str)
         .filter(|name| !name.is_empty())
         .map(str::to_string)
-}
-
-/// Whether `agent` has a record in `registry` (either layout).
-pub fn agent_exists(registry: &Path, agent: &str) -> bool {
-    agent_queue::registry::names(registry)
-        .map(|names| names.iter().any(|name| name == agent))
-        .unwrap_or(false)
-}
-
-/// Whether a stopped record for `agent` sits in the registry archive
-/// (entries are named `NAME-TOKEN`, so the name is a prefix).
-pub fn agent_archived(registry: &Path, agent: &str) -> bool {
-    let prefix = format!("{agent}-");
-    std::fs::read_dir(registry.join("archive")).is_ok_and(|entries| {
-        entries
-            .flatten()
-            .any(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
-    })
 }
 
 /// The registry's designated coordinator name, read from the designation
@@ -148,7 +181,24 @@ pub fn managed_by_of(registry: &Path, agent: &str) -> Option<String> {
 }
 
 fn flag(kind: &'static str, detail: String, fix: String) -> Flag {
-    Flag { kind, detail, fix }
+    let severity = match kind {
+        "target-missing" | "target-archived" | "target-not-live" | "designation-not-live" => {
+            "error"
+        }
+        _ => "warning",
+    };
+    Flag {
+        kind,
+        severity,
+        detail,
+        fix,
+    }
+}
+
+/// Whether a pinned designation's harness process is live.
+fn pinned_designation_live(declaration: &Declaration, registry: Option<&Path>) -> bool {
+    crate::proof::coordinator_identity(&declaration.designation, registry)
+        .is_some_and(|identity| identity_alive(&identity))
 }
 
 /// Evaluate one declaration's delivery target against its registry's
@@ -160,10 +210,7 @@ pub fn evaluate(declaration: &Declaration) -> TargetHealth {
     if declaration.deliverer_kind != "agentctl-queue" {
         if let Designation::Pinned { .. } = declaration.designation {
             let registry = registry_of(declaration);
-            let live =
-                crate::proof::coordinator_identity(&declaration.designation, registry.as_deref())
-                    .is_some_and(|identity| identity_alive(&identity));
-            if !live {
+            if !pinned_designation_live(declaration, registry.as_deref()) {
                 flags.push(flag(
                     "target-not-live",
                     format!("team {team}: the pinned coordinator process is not live"),
@@ -191,6 +238,24 @@ pub fn evaluate(declaration: &Declaration) -> TargetHealth {
             undeliverable_reason: None,
         };
     };
+    // A pinned designation decides who may send for the team (sender
+    // standing), whatever the deliverer: after a handover it still names
+    // the old harness process, so the new coordinator's sends are refused.
+    if let Designation::Pinned { .. } = declaration.designation {
+        if pinned_designation_live(declaration, Some(&registry)) {
+            flags.push(flag(
+                "pinned-designation",
+                format!("team {team}: declaration pins the coordinator's harness process; when that session is retired its successor cannot send for the team"),
+                format!("re-run `agent-teams init {team} --registry {}` so sender standing follows the registry's designated coordinator", registry.display()),
+            ));
+        } else {
+            flags.push(flag(
+                "designation-not-live",
+                format!("team {team}: declaration pins a coordinator harness process that is not live; every send for the team is refused as sender-not-coordinator"),
+                format!("re-run `agent-teams init {team} --registry {}` (or `agentctl coordinator set NEW`, which rewrites it) so sender standing follows the registry's designated coordinator", registry.display()),
+            ));
+        }
+    }
     let designated = designated_name(&registry);
     let pinned = pinned_agent(declaration);
     if let Some(agent) = &pinned {
@@ -232,26 +297,32 @@ pub fn evaluate(declaration: &Declaration) -> TargetHealth {
         }
     }
     // Existence, archive, liveness.
-    let exists = agent_exists(&registry, &target_name);
-    if !exists && agent_archived(&registry, &target_name) {
-        flags.push(flag(
+    match presence(&registry, &target_name) {
+        Presence::Archived => flags.push(flag(
             "target-archived",
             format!("team {team}: delivery target {target_name:?} is archived (stopped and retired) in {}", registry.display()),
             format!("run `agentctl coordinator set NEW` to designate a live coordinator, then re-run `agent-teams init {team} --registry {}` if this declaration pinned the old name", registry.display()),
-        ));
-    } else if !exists {
-        flags.push(flag(
+        )),
+        Presence::Missing => flags.push(flag(
             "target-missing",
             format!("team {team}: delivery target {target_name:?} has no agent record in {}", registry.display()),
             "run `agentctl coordinator set NEW` to designate a live coordinator, then `agent-teams check`".to_string(),
-        ));
-    } else if let Some((identity, _)) = agent_record(&registry, &target_name) {
-        if !identity_alive(&identity) {
-            flags.push(flag(
-                "target-not-live",
-                format!("team {team}: delivery target {target_name:?} is not live (its pinned harness process is gone)"),
-                format!("revive {target_name} (`agentctl revive {target_name}`) or designate its successor: `agentctl coordinator set NEW`"),
-            ));
+        )),
+        Presence::Unknown(error) => flags.push(flag(
+            "target-unknown",
+            format!("team {team}: could not read registry {} to find delivery target {target_name:?} ({error}); delivery is attempted", registry.display()),
+            format!("make {} readable to this user, then `agent-teams check`", registry.display()),
+        )),
+        Presence::Present => {
+            if let Some((identity, _)) = agent_record(&registry, &target_name) {
+                if !identity_alive(&identity) {
+                    flags.push(flag(
+                        "target-not-live",
+                        format!("team {team}: delivery target {target_name:?} is not live (its pinned harness process is gone)"),
+                        format!("revive {target_name} (`agentctl revive {target_name}`) or designate its successor: `agentctl coordinator set NEW`"),
+                    ));
+                }
+            }
         }
     }
     // Control-tree shape: the target must be the root, and the tree's root
@@ -353,6 +424,16 @@ mod tests {
         .expect("declaration")
     }
 
+    /// An archive entry `entry`, with an `agent.json` naming `recorded`.
+    fn archive(dir: &Path, entry: &str, recorded: Option<&str>) {
+        let path = dir.join("archive").join(entry);
+        std::fs::create_dir_all(&path).expect("archive entry");
+        if let Some(name) = recorded {
+            std::fs::write(path.join("agent.json"), json!({"name": name}).to_string())
+                .expect("archived record");
+        }
+    }
+
     fn kinds(health: &TargetHealth) -> Vec<&'static str> {
         health.flags.iter().map(|flag| flag.kind).collect()
     }
@@ -397,9 +478,7 @@ mod tests {
     #[test]
     fn archived_target_is_undeliverable() {
         let dir = fixture(&[("coord", None, true)], Some("coord"));
-        let archive = dir.join("archive");
-        std::fs::create_dir_all(&archive).expect("archive");
-        std::fs::write(archive.join("old-tok123"), "{}").expect("archived record");
+        archive(&dir, "old-1792931619150276422-1347278", Some("old"));
         let health = evaluate(&declaration(&dir, Some("old")));
         assert!(
             kinds(&health).contains(&"target-archived"),
@@ -450,6 +529,113 @@ mod tests {
             health.flags
         );
         assert!(health.undeliverable().is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review finding 1: a live agent stays deliverable beside an archived
+    /// predecessor of the same name and an archived agent whose name it
+    /// prefixes, in both archive token formats.
+    #[test]
+    fn live_agent_beside_same_name_and_prefix_archives_is_deliverable() {
+        let dir = fixture(&[("coordinator", None, true)], Some("coordinator"));
+        archive(
+            &dir,
+            "coordinator-1792931619150276422-1347278",
+            Some("coordinator"),
+        );
+        archive(&dir, &format!("coordinator-stale-{}", "c".repeat(64)), None);
+        archive(
+            &dir,
+            "coordinator-tail-1792931619150276999-1347279",
+            Some("coordinator-tail"),
+        );
+        assert_eq!(presence(&dir, "coordinator"), Presence::Present);
+        assert_eq!(undeliverable_reason(&dir, "coordinator"), None);
+        let health = evaluate(&declaration(&dir, None));
+        assert!(health.undeliverable().is_none(), "{:?}", health.flags);
+        assert!(health.flags.is_empty(), "flags: {:?}", health.flags);
+        // A missing agent whose name only prefixes an archived one is
+        // missing, not archived.
+        let missing = fixture(&[("other", None, true)], Some("other"));
+        archive(
+            &missing,
+            "coordinator-tail-1792931619150276999-1347279",
+            Some("coordinator-tail"),
+        );
+        assert_eq!(presence(&missing, "coordinator"), Presence::Missing);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&missing);
+    }
+
+    /// An unreadable registry proves nothing: unknown, deliverable.
+    #[test]
+    fn unreadable_registry_is_unknown_and_deliverable() {
+        let dir = fixture(&[], None);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let not_a_directory = dir.join("registry-file");
+        std::fs::write(&not_a_directory, "x").expect("file");
+        assert!(matches!(
+            presence(&not_a_directory, "coord"),
+            Presence::Unknown(_)
+        ));
+        assert_eq!(undeliverable_reason(&not_a_directory, "coord"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A queue created before registration never causes a refusal: the
+    /// target's own queue directory makes it present, and other agents'
+    /// queues (or an empty prepared `agents/` tree) do not make a registry
+    /// populated.
+    #[test]
+    fn queue_directories_before_registration_are_deliverable() {
+        let dir = fixture(&[], None);
+        std::fs::create_dir_all(dir.join("agents/coord/queue")).expect("own queue");
+        assert_eq!(undeliverable_reason(&dir, "coord"), None);
+        std::fs::create_dir_all(dir.join("agents/other/queue")).expect("other queue");
+        std::fs::write(dir.join("agents/agent.json"), "\"tripwire\"").expect("tripwire");
+        assert_eq!(undeliverable_reason(&dir, "late"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Standing risks warn; only present failures are errors.
+    #[test]
+    fn pinned_agent_is_a_warning_and_missing_target_an_error() {
+        let dir = fixture(&[("coord", None, true)], Some("coord"));
+        let health = evaluate(&declaration(&dir, Some("coord")));
+        assert_eq!(kinds(&health), vec!["pinned-agent"]);
+        assert!(health.flags.iter().all(|flag| !flag.is_error()));
+        let health = evaluate(&declaration(&dir, Some("ghost")));
+        assert!(health
+            .flags
+            .iter()
+            .any(|flag| flag.kind == "target-missing" && flag.is_error()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review finding 3: a pinned designation is flagged for queue
+    /// deliverers too; a dead one is an error (every send is refused).
+    #[test]
+    fn pinned_designation_is_flagged_for_queue_deliverers() {
+        let dir = fixture(&[("coord", None, true)], Some("coord"));
+        let me = crate::proof::identity_of(u64::from(std::process::id())).expect("self");
+        let mut raw = declaration(&dir, None).raw;
+        raw["coordinator"] = json!({"designation": "pinned", "harness_identity": me});
+        let health = evaluate(&parse_declaration(raw.clone()).expect("declaration"));
+        assert_eq!(
+            kinds(&health),
+            vec!["pinned-designation"],
+            "{:?}",
+            health.flags
+        );
+        raw["coordinator"]["harness_identity"]["starttime_ticks"] =
+            json!(me.starttime_ticks + 999_999);
+        let health = evaluate(&parse_declaration(raw).expect("declaration"));
+        let dead = health
+            .flags
+            .iter()
+            .find(|flag| flag.kind == "designation-not-live")
+            .expect("dead pin flagged");
+        assert!(dead.is_error());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

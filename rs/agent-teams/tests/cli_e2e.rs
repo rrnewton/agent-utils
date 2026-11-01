@@ -13,6 +13,8 @@ struct World {
     config: PathBuf,
     state: PathBuf,
     index: Option<PathBuf>,
+    /// `AGENT_TEAMS_AGENTCTL` for child runs, when set.
+    agentctl: Option<PathBuf>,
 }
 
 impl World {
@@ -43,6 +45,7 @@ impl World {
             root,
             state,
             index: None,
+            agentctl: None,
         }
     }
 
@@ -55,6 +58,9 @@ impl World {
             .env("AGENT_TEAMS_HOST", "host-a");
         if let Some(index) = &self.index {
             command.env("AGENTCTL_COORDINATOR_INDEX_DIR", index);
+        }
+        if let Some(agentctl) = &self.agentctl {
+            command.env("AGENT_TEAMS_AGENTCTL", agentctl);
         }
         let output = command.output().expect("run agent-teams");
         (
@@ -426,4 +432,87 @@ fn pinned_retired_coordinator_flags_check_and_send_undeliverable() {
     let (code, out, _) = world.run(&["outbox"]);
     assert_eq!(code, 0);
     assert!(out.contains("undeliverable"), "{out}");
+}
+
+/// Review finding 3: a declaration whose pinned coordinator process is gone refuses every send
+/// as sender-not-coordinator (and `check` says so); once the pin becomes the registry
+/// designation, which `agentctl coordinator set NEW` writes, the designated coordinator (this
+/// test process, an ancestor of every child run) sends.
+#[test]
+fn registry_designation_lets_the_new_coordinator_send_after_a_stale_pin() {
+    let mut world = World::new();
+    // agentctl is never asked; designation and records are read from the files.
+    world.agentctl = Some(PathBuf::from("/bin/false"));
+    let registry = world.root.join("registry");
+    let coord_dir = registry.join("agents").join("coord-new");
+    std::fs::create_dir_all(&coord_dir).expect("registry");
+    let identity = agent_queue::identity::observe(u64::from(std::process::id()))
+        .expect("observe self")
+        .identity;
+    std::fs::write(
+        coord_dir.join("agent.json"),
+        serde_json::json!({"name": "coord-new", "harness_identity": identity}).to_string(),
+    )
+    .expect("record file");
+    std::fs::write(
+        registry.join("coordinator.json"),
+        "{\"name\": \"coord-new\"}",
+    )
+    .expect("designation");
+    // The receiving team, pinned to this process (ancestry proof as in init_both).
+    let pid = std::process::id().to_string();
+    let (code, out, err) = world.run(&[
+        "init",
+        "tools",
+        "--coordinator-self",
+        "--coordinator-pid",
+        &pid,
+        "--deliver",
+        "hook-inbox",
+        "--accepts-from",
+        "sim",
+    ]);
+    assert_eq!(code, 0, "init tools: {out} {err}");
+    // The sending team, delivering through the registry, still pinned to a retired harness.
+    let mut dead = serde_json::to_value(&identity).expect("identity");
+    dead["starttime_ticks"] = serde_json::json!(identity.starttime_ticks + 999_999);
+    let team_dir = world.state.join("teams.d/sim");
+    std::fs::create_dir_all(&team_dir).expect("team dir");
+    let mut declaration = serde_json::json!({
+        "schema": "agent-teams-declaration/v1",
+        "team": "sim",
+        "deliverer": {"kind": "agentctl-queue", "registry": registry.to_string_lossy()},
+        "coordinator": {"designation": "pinned", "harness_identity": dead},
+        "accepts_from": [{"sender": "tools", "kinds": ["info", "request", "hold", "resume", "reply"]}],
+        "limits": {"max_bytes": 8192, "per_sender_per_hour": 30, "max_ttl_seconds": 604800},
+        "default_ttl_seconds": 7200,
+    });
+    let path = team_dir.join("declaration.json");
+    std::fs::write(&path, serde_json::to_string_pretty(&declaration).unwrap()).expect("write");
+    let (code, out, _) = world.run(&["check", "sim"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("designation-not-live"), "{out}");
+    let send = |world: &World| {
+        world.run(&[
+            "send",
+            "tools",
+            "--from-team",
+            "sim",
+            "--text",
+            "handed over",
+        ])
+    };
+    let (code, out, err) = send(&world);
+    assert_ne!(code, 0, "{out} {err}");
+    assert!(
+        format!("{out}{err}").contains("sender-not-coordinator"),
+        "{out} {err}"
+    );
+    // What the handover writes.
+    declaration["coordinator"] = serde_json::json!({"designation": "registry"});
+    std::fs::write(&path, serde_json::to_string_pretty(&declaration).unwrap()).expect("write");
+    let (code, out, err) = send(&world);
+    assert_eq!(code, 75, "accepted from the new coordinator: {out} {err}");
+    assert!(out.contains("accepted"), "{out}");
+    assert_eq!(world.hook_inbox_count("tools"), 1);
 }

@@ -735,7 +735,7 @@ struct WatchAgents {
     /// Run one pass, print it as JSON, and exit
     #[arg(long)]
     once: bool,
-    /// Report only: send no notice to the coordinator
+    /// Report only: send no notice to the coordinator, and run no `agent-teams pump` (each pass otherwise pumps this host's agent-teams outbox at most every 10 minutes while it holds deferred messages)
     #[arg(long)]
     check_only: bool,
     /// Minutes an approval or permission prompt may hold before it is reported, from 0 to 1440 (default: 0, the pass or quick check that first sees it); a blocked agent's notice is never held by --min-notice-interval
@@ -977,10 +977,10 @@ struct Stop {
     /// the agentcloud session (use when the session no longer exists or was retired elsewhere)
     #[arg(long)]
     skip_cloud_halt: bool,
-    /// Hand this registry's coordinator designation over to NEW before stopping: required when stopping the designated coordinator, so team delivery keeps a live target (#721 agent-teams-coordinator-handover)
+    /// Hand this registry's coordinator designation over to NEW before stopping (put back if the stop fails): required when stopping the live designated coordinator, so team delivery keeps a live target (#721 agent-teams-coordinator-handover)
     #[arg(long, value_name = "NEW")]
     handover_to: Option<String>,
-    /// Stop the designated coordinator without handing over (prints a warning; inter-team delivery to this registry loses its target until a new coordinator is designated)
+    /// Stop the live designated coordinator without handing over (prints a warning; inter-team delivery to this registry loses its target until a new coordinator is designated). Not needed when its harness is gone or with --retire-dead-adoption, --retire-dead-native or --recover-legacy-adoption, which warn the same way
     #[arg(long)]
     force_coordinator: bool,
 }
@@ -3517,13 +3517,20 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
         Commands::Stop(value) => {
             // #721: stopping the designated coordinator without a handover
             // strands every agent-teams declaration delivering through this
-            // registry; refuse unless the designation moves first.
+            // registry; refuse unless the designation moves first. Retiring a
+            // dead record (the --retire-dead-* and --recover-legacy-adoption
+            // paths) or a coordinator whose harness is positively gone loses
+            // nothing more, so those go ahead with a warning.
             let is_coordinator = manager
                 .designated_coordinator()
                 .ok()
                 .flatten()
                 .is_some_and(|name| name == value.agent.name);
+            let mut restore_designation = None;
             if is_coordinator {
+                let dead_path = value.retire_dead_adoption
+                    || value.retire_dead_native
+                    || value.recover_legacy_adoption;
                 if let Some(new) = &value.handover_to {
                     if new == &value.agent.name {
                         return Err(Failure::Usage(
@@ -3531,19 +3538,26 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                                 .to_owned(),
                         ));
                     }
+                    // Designation first, so team delivery never resolves to the stopped
+                    // agent; put back if the stop fails.
+                    let previous = manager.designation_snapshot()?;
                     manager.coordinator_set(new)?;
+                    restore_designation = Some(previous);
                     eprintln!(
                         "agentctl stop: handed the coordinator designation over to {new} before stopping {}",
                         value.agent.name
                     );
-                } else if value.force_coordinator {
+                } else if value.force_coordinator
+                    || dead_path
+                    || manager.harness_dead(&value.agent.name)
+                {
                     eprintln!(
                         "agentctl stop: WARNING: stopping designated coordinator {} without a handover; inter-team delivery through this registry has no live target until `agentctl coordinator set NEW` runs",
                         value.agent.name
                     );
                 } else {
                     return Err(Failure::Usage(format!(
-                        "refused: {} is this registry's designated coordinator; stopping it strands agent-teams delivery through this registry. Hand over first (`agentctl stop {} --handover-to NEW`) or, if the loss is intended, `--force-coordinator`",
+                        "refused: {} is this registry's live designated coordinator; stopping it strands agent-teams delivery through this registry. Hand over first (`agentctl stop {} --handover-to NEW`) or, if the loss is intended, add `--force-coordinator`. (A coordinator whose harness is gone, and the --retire-dead-adoption, --retire-dead-native and --recover-legacy-adoption paths, are not refused.)",
                         value.agent.name, value.agent.name
                     )));
                 }
@@ -3569,7 +3583,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     "--expected-record-sha256 requires --recover-legacy-adoption, --retire-dead-adoption, or --retire-dead-native".to_owned(),
                 ));
             }
-            manager.advised_stop_with_options(
+            let stopped = manager.advised_stop_with_options(
                 &value.agent.name,
                 StopOptions {
                     expected_token: value.expected_token,
@@ -3579,7 +3593,24 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     expected_record_sha256: value.expected_record_sha256,
                     skip_cloud_halt: value.skip_cloud_halt,
                 },
-            )?
+            );
+            match (stopped, restore_designation) {
+                (Ok(report), _) => report,
+                (Err(error), Some(previous)) => {
+                    match manager.coordinator_restore(previous.as_ref()) {
+                        Ok(()) => eprintln!(
+                            "agentctl stop: the stop failed, so the coordinator designation was put back on {}",
+                            value.agent.name
+                        ),
+                        Err(restore) => eprintln!(
+                            "agentctl stop: the stop failed and the designation could not be put back ({restore}); run `agentctl coordinator set {}`",
+                            value.agent.name
+                        ),
+                    }
+                    return Err(error.into());
+                }
+                (Err(error), None) => return Err(error.into()),
+            }
         }
         Commands::Revive(value) => {
             let timeout = Duration::from_secs_f64(value.startup_timeout);

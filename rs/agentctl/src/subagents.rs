@@ -51,7 +51,10 @@ pub(crate) use cloud::{
     validate_create_arguments as validate_cloud_create_arguments, CLOUD_DRIVERS,
 };
 pub use cloud::{CloudLaunch, CloudTools};
-pub(crate) use control::{controller_of, team_declaration_flags, tree_order};
+pub(crate) use control::{
+    acknowledge_team_notice, agent_teams_state_dir, controller_of, team_declaration_flags,
+    team_undeliverable_notices, tree_order,
+};
 pub use control::{render_tree, ManageAction};
 pub use headless::{HeadlessApprovals, HeadlessStart, TakeoverOptions, TurnoverOptions};
 pub(crate) use stop_advice::{stop_reason, StopContext};

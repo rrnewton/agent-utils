@@ -166,6 +166,11 @@ pub fn walk(
             .any(|a| a.get("classification").and_then(Value::as_str) == Some("ambiguous"))
     });
     let pinned: Option<String> = entry_value["pinned_contact"].as_str().map(str::to_string);
+    // A reason from an earlier walk is stale once this walk runs; an
+    // `undeliverable` answer below records it again.
+    if let Some(entry) = entry_value.as_object_mut() {
+        entry.remove("undeliverable");
+    }
 
     'contacts: for contact in &team_entry.contacts {
         let label = match contact {
@@ -252,18 +257,22 @@ pub fn walk(
                     if answered_outcome == "undeliverable" {
                         // The receiving host's delivery target is missing or
                         // archived (#721): nothing was claimed there, so the
-                        // message stays in the outbox for retry after the fix.
+                        // message stays in the outbox as `deferred` (the
+                        // state every build's pump retries), with the reason
+                        // beside it, for retry after the fix.
+                        let reason = answer
+                            .get("detail")
+                            .and_then(Value::as_str)
+                            .unwrap_or("undeliverable")
+                            .to_string();
                         entry_value["pinned_contact"] = json!(label);
+                        entry_value["undeliverable"] = json!(reason);
                         steps.push(WalkStep {
                             contact: label.clone(),
                             route: route.name().to_string(),
-                            detail: answer
-                                .get("detail")
-                                .and_then(Value::as_str)
-                                .unwrap_or("undeliverable")
-                                .to_string(),
+                            detail: reason,
                         });
-                        contact_settled = Some("undeliverable".to_string());
+                        contact_settled = Some("deferred".to_string());
                         break;
                     }
                     if answered_outcome == "conflict" {
