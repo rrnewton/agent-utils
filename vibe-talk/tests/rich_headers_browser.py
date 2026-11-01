@@ -297,7 +297,9 @@ HEADERS_JS = """async (list) => {
         const time = row.querySelector(':scope > .meta > .msg-time');
         const stamp = time.getBoundingClientRect();
         if (time.tagName !== 'TIME' || !time.dateTime) problems.push(`${id}: the time is not a <time> with its instant`);
-        else if (!dayTitle.test(time.title) || !time.title.endsWith(`, ${time.textContent}`)) {
+        // `#729 vt-older-message-dates`: a time older than today says its weekday or date too, and the
+        // title says the time once, as the element keeps it (data-said).
+        else if (!dayTitle.test(time.title) || !time.title.endsWith(`, ${time.getAttribute('data-said') ?? time.textContent}`)) {
             problems.push(`${id}: the time's title does not say its day: ${JSON.stringify(time.title)}`);
         }
         const h = head.getBoundingClientRect();
@@ -497,7 +499,9 @@ def walk(chromium: BrowserType, args: argparse.Namespace, url: str, label: str, 
             page.evaluate("(selector) => { document.querySelector(selector).title = 'stale'; }", time)
             page.hover(time)
             title = page.get_attribute(time, "title") or ""
-            shown = page.text_content(time) or ""
+            # `#729 vt-older-message-dates`: the title says the time once, as the element keeps it
+            # (data-said), where the row's own text says a weekday or date before it.
+            shown = page.get_attribute(time, "data-said") or page.text_content(time) or ""
             check(DAY_TITLE.match(title) is not None and title.endswith(f", {shown}"),
                   f"{label}: hovering a row's time left its title {title!r}")
             page.mouse.move(1, 1)

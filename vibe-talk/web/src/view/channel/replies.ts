@@ -81,7 +81,12 @@ function quoteLabelFits(button: HTMLElement & { quoteWidth?: string }, plain: st
   button.textContent = full;
   // `#377 compact-collapsed-rows`. A collapsed row in a narrow list draws no Reply until words of it
   // are selected, and then draws it whole: there is no plain label in place to keep the line as it was.
-  if (!(plainWidth > 0)) return true;
+  // Unless whole it takes the header onto a second line, which a time that says its day leaves less
+  // room for (`#729 vt-older-message-dates`): then "Quote", at its own width.
+  if (!(plainWidth > 0)) {
+    button.quoteWidth = "";
+    return (headerLayout(meta)[0] ?? 0) <= (before[0] ?? 0) + 0.5;
+  }
   const after = headerLayout(meta);
   return before.length === after.length && before.every((value, at) => Math.abs(value - (after[at] as number)) <= 0.5);
 }

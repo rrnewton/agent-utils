@@ -6299,6 +6299,29 @@ function seamsFor(list) {
 /** The day each list's lines were last drawn on, as `dayKeyOf` says it (`seamsAfterMidnight`). */
 const seamsDrawnOn = new WeakMap();
 
+/** The day each list's row times were last worded on, as `dayKeyOf` says it (`rewordRowTimes`). */
+const timesWordedOn = new WeakMap();
+
+/**
+ * `#729 vt-older-message-dates`. Word every row time of `list` again once the day has turned since they
+ * were worded: a row is drawn once and kept (`#226 page-energy-profile`), and yesterday's "03:23 PM"
+ * must say "Sun 03:23 PM" the morning after, as the lines between the rows say Yesterday. Asked
+ * wherever the lines are, so a quiet channel's refresh past midnight does it too (`seamsAfterMidnight`).
+ *
+ * @param {Element} list
+ * @param {Element[]} rows
+ * @param {number} today
+ */
+function rewordRowTimes(list, rows, today) {
+  const was = timesWordedOn.get(list);
+  timesWordedOn.set(list, today);
+  if (was === undefined || was === today) return;
+  for (const row of rows) {
+    const node = rowTime(row);
+    if (node) setTextIfChanged(node, messageTimeLabel({ timestamp: node.getAttribute("datetime") }));
+  }
+}
+
 /**
  * Draw the lines between the rows of `list`, and take away every one no longer wanted. Under
  * `preservingScroll` for the list on screen, as the bookmark's line is, outside a filter change, which
@@ -6307,6 +6330,7 @@ const seamsDrawnOn = new WeakMap();
 function drawSeams(list) {
   const { rows, wanted, runDays, today } = seamsFor(list);
   seamsDrawnOn.set(list, today);
+  rewordRowTimes(list, rows, today);
   const none = { above: null, below: null };
   // `#250 date-separators`. A collapsed run's line says the days it brings, as its words go.
   const changed = rows.some((row) => {
@@ -20279,10 +20303,12 @@ function restatedMarked(box) {
 /**
  * How long a heading reads, as the stylesheet's length class: its characters of tag, title and time,
  * rounded up to a multiple of eight from 16 to 96, or `long` past that. Counted from the strings,
- * never measured on the screen; web/voice.css says how wide a list each class needs.
+ * never measured on the screen; web/voice.css says how wide a list each class needs. `extra` is the
+ * characters the row's time says beyond the hour and minute the classes were measured with: its
+ * weekday or date (`#729 vt-older-message-dates`), which take the same line.
  */
-function headingLength(heading) {
-  const characters = [...`${heading.tag}${heading.title}${heading.time ? `@${heading.time}` : ""}`].length;
+function headingLength(heading, extra = 0) {
+  const characters = [...`${heading.tag}${heading.title}${heading.time ? `@${heading.time}` : ""}`].length + extra;
   const bucket = Math.max(16, Math.ceil(characters / 8) * 8);
   return bucket <= 96 ? String(bucket) : "long";
 }
@@ -24085,7 +24111,10 @@ function channelRowFrame(messages) {
   author.textContent = message.author_is_bot ? `${message.author} (bot)` : String(message.author);
   // `#260 timestamp-hover`. The hour and minute on the row, and the day they were on in its tooltip.
   // Every list draws its rows here — Main, All, a thread, the right column, the cards, Pinned.
-  const stamp = timeNode("msg-time", messageDate(message), shortLocalTime(message));
+  // `#729 vt-older-message-dates`: "Fri 03:23 PM" for a day of the week before, "10/30 03:23 PM" before that.
+  const timeLabel = messageTimeLabel(message);
+  const timeSaid = shortLocalTime(message);
+  const stamp = timeNode("msg-time", messageDate(message), timeLabel, timeSaid);
   // THE MESSAGE ID IS NOT PRINTED ON THE ROW. It is a nineteen-digit number that no reader reads,
   // on every row, on a screen 393 pixels wide. It is still the thing that lets the operator say
   // "that message does not exist", so it moved to the details sheet a press-and-hold opens — see
@@ -24113,7 +24142,8 @@ function channelRowFrame(messages) {
   const firstBody = body.children[0];
   if (heading && firstBody && restatedMarked(firstBody)) {
     firstBody.setAttribute("data-rh", "");
-    li.setAttribute("data-rh-len", headingLength(heading));
+    // The header line holds the time as well: a day before it (`#729`) takes room the heading had.
+    li.setAttribute("data-rh-len", headingLength(heading, [...timeLabel].length - [...timeSaid].length));
     meta.append(headingPieces(heading));
   }
   li.append(meta, body);

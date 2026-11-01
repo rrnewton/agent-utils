@@ -1153,7 +1153,10 @@ def quote_layout_walk(walk: Walk) -> None:
                        f"layout {width}: Quote reply moved the words of {row['id']} ({row['author']!r}, {row['label']!r}): "
                        f"{before} -> {after}")
             walk.check(row["clipped"] is False, f"layout {width}: {row['label']!r} is cut off in its button: {row}")
-            if row["quote"] == "short":
+            # Quote takes Reply's width, where Reply was drawn; a collapsed row in a narrow list draws no
+            # Reply until words are selected (`#377`), and its Quote takes its own width, the header line
+            # unmoved (`#729 vt-older-message-dates` left a dated time less room for Quote reply).
+            if row["quote"] == "short" and before["width"] > 0:
                 walk.check(abs(after["width"] - before["width"]) <= 0.5,
                            f"layout {width}: Quote is not as wide as Reply was: {row}")
         counted_peer = [row for row in rows if row["author"] == long_peer and "(" in str(row["label"])]

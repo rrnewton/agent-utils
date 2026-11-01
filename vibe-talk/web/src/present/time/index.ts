@@ -2,7 +2,18 @@
 // a message's time. Presentation decisions with no DOM: the views draw what these say.
 
 export { briefAge } from "./ages.ts";
-export { editedTitle, fullLocalAt, fullLocalTime, messageDate, shortLocalTime, shortTimeFormat, stamp } from "./clock.ts";
+export {
+  WEEKDAY_TIME_DAYS,
+  calendarDaysBefore,
+  editedTitle,
+  fullLocalAt,
+  fullLocalTime,
+  messageDate,
+  messageTimeLabel,
+  shortLocalTime,
+  shortTimeFormat,
+  stamp,
+} from "./clock.ts";
 export type { Timed } from "./clock.ts";
 export {
   DAY_MONTHS,

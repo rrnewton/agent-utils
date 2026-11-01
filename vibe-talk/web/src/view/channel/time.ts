@@ -17,14 +17,19 @@ const EDITED_MARK = "edited-mark";
  * its press-and-hold opens the details sheet, which says the day in the same words. With no instant
  * to go on — a message whose timestamp would not parse, shown by its spoken time — a plain span with
  * no title, because there is no day to tell.
+ *
+ * `said` is the time as the title says it after the day, where `shown` says more than the time: a
+ * row's "Fri 03:23 PM" (`#729 vt-older-message-dates`) is titled "Oct 30, Fri, 03:23 PM", not with
+ * its weekday twice. Kept on the element (`data-said`) for the title worded again at hover.
  */
-function timeNode(className: string, at: Date | null, shown: string): HTMLElement {
+function timeNode(className: string, at: Date | null, shown: string, said: string = shown): HTMLElement {
   const node = document.createElement(at === null ? "span" : "time");
   node.className = className;
   node.textContent = shown;
   if (at !== null) {
     node.setAttribute("datetime", at.toISOString());
-    const title = dayTitle(at, shown);
+    if (said !== shown) node.setAttribute("data-said", said);
+    const title = dayTitle(at, said);
     node.setAttribute("title", title);
     // `#479 message-time-full-date`. The same words as its name, so a reader who cannot hover
     // hears the day a hover would have shown; and focusable without a Tab stop of its own —
@@ -70,7 +75,8 @@ function freshenDayTitle(event: Event | null | undefined): void {
   if (!DAY_TITLED.has(kind) && kind !== EDITED_MARK) return;
   const at = new Date(String(node.getAttribute("datetime") || ""));
   if (Number.isNaN(at.getTime())) return;
-  const title = kind === EDITED_MARK ? editedTitle(at) : dayTitle(at, String(node.textContent));
+  const said = node.getAttribute("data-said") ?? String(node.textContent);
+  const title = kind === EDITED_MARK ? editedTitle(at) : dayTitle(at, said);
   if (node.getAttribute("title") !== title) node.setAttribute("title", title);
   // `#479 message-time-full-date`. Its name is the same words, freshened with them.
   if (kind !== EDITED_MARK && node.getAttribute("aria-label") !== title) node.setAttribute("aria-label", title);

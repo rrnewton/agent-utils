@@ -2,7 +2,7 @@
 // script into present/time): the row's hour and minute, the details sheet's whole instant, and the
 // titles that add the day.
 
-import { dayLabel, dayTitle } from "./days.ts";
+import { DAY_WEEKDAYS, dayLabel, dayTitle } from "./days.ts";
 
 /** What a time is read from: a message's ISO timestamp, or failing that the words the server spoke it in. */
 interface Timed {
@@ -45,6 +45,39 @@ function shortLocalTime(message: Timed): string {
     return String(message.spoken_time || "");
   }
   return shortTimeFormat().format(at);
+}
+
+/**
+ * `#729 vt-older-message-dates`. The most calendar days back a row's time names by its weekday: six, so
+ * the weekday never stands for today's, nor last week's same day.
+ */
+const WEEKDAY_TIME_DAYS = 6;
+
+/**
+ * How many calendar days before `now` the instant `at` falls, on this device's calendar: 0 today, 1
+ * yesterday, negative for a day ahead. From the local date's own fields, so a day of 23 or 25 hours
+ * (a change of clocks) is still one day.
+ */
+function calendarDaysBefore(at: Date, now: Date): number {
+  const day = (when: Date): number => Date.UTC(when.getFullYear(), when.getMonth(), when.getDate());
+  return Math.round((day(now) - day(at)) / 86400000);
+}
+
+/**
+ * A row's time (`#729 vt-older-message-dates`). The owner, 2026-11-01: "I want "03:23 PM" to say "Fri
+ * 03:23 PM" if it's 6 days or less in the past (i.e. should not say today's day-of-week) and "10/30
+ * 03:23 PM" if it's older." So today's is the hour and minute alone (`shortLocalTime`), one to six
+ * days back the weekday before it, and any other day the month and day; all on the reader's own clock,
+ * as `now` says it. With no instant to go on, the words the server spoke it in, as ever.
+ */
+function messageTimeLabel(message: Timed, now: Date = new Date()): string {
+  const at = messageDate(message);
+  if (at === null) return String(message.spoken_time || "");
+  const time = shortTimeFormat().format(at);
+  const days = calendarDaysBefore(at, now);
+  if (days === 0) return time;
+  if (days >= 1 && days <= WEEKDAY_TIME_DAYS) return `${DAY_WEEKDAYS[at.getDay()]} ${time}`;
+  return `${at.getMonth() + 1}/${at.getDate()} ${time}`;
 }
 
 /**
@@ -91,5 +124,5 @@ function fullLocalAt(at: Date): string {
   return `${dayLabel(at)}, ${at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", timeZoneName: "short" })}`;
 }
 
-export { editedTitle, fullLocalAt, fullLocalTime, messageDate, shortLocalTime, shortTimeFormat, stamp };
+export { WEEKDAY_TIME_DAYS, calendarDaysBefore, editedTitle, fullLocalAt, fullLocalTime, messageDate, messageTimeLabel, shortLocalTime, shortTimeFormat, stamp };
 export type { Timed };

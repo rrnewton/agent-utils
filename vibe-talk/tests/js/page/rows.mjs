@@ -3691,6 +3691,51 @@ test("ONE DAY FORMATTER: today, yesterday, this year, another year, across New Y
   });
 });
 
+test("`#729 vt-older-message-dates`: a row's time says the time today, the weekday up to six days back and the date before that; its hover says the day once", async () => {
+  await inZone("America/New_York", async () => {
+    const page = newPage();
+    await signIn(page);
+    // The fixture's clock: Wednesday Aug 19 2026, 10:05 in New York.
+    const at = {
+      today: localAt(2026, 8, 19, 0, 1), yesterday: localAt(2026, 8, 18, 23, 59),
+      six: localAt(2026, 8, 13, 15, 23), seven: localAt(2026, 8, 12, 15, 23),
+    };
+    await showDiscord(page, Object.entries(at).map(([id, when], index) =>
+      message({ id: String(701 + index), content: `from ${id}`, timestamp: when.toISOString() })));
+    const time = (id) => rowWithId(page, id).descendants().find((node) => node.className === "msg-time");
+    assert.equal(time("701").textContent, shownTime(at.today), "today's says more than its time");
+    assert.equal(time("702").textContent, `Tue ${shownTime(at.yesterday)}`, "a minute before midnight is not yesterday's weekday");
+    assert.equal(time("703").textContent, `Thu ${shownTime(at.six)}`, "six days back is not its weekday");
+    assert.equal(time("704").textContent, `8/12 ${shownTime(at.seven)}`, "seven days back is not its date");
+    // The hover keeps the whole day, and says the time once, not "Thu" twice.
+    assert.equal(time("703").getAttribute("title"), `Aug 13, Thu, ${shownTime(at.six)}`);
+    await page.documentEvent("pointerover", { target: time("704") });
+    assert.equal(time("704").getAttribute("title"), `Aug 12, Wed, ${shownTime(at.seven)}`, "the hover worded the date into the title");
+  });
+});
+
+test("`#729 vt-older-message-dates`: past midnight a page left open words its kept rows' times again, as a refresh that brings nothing redraws the day lines", async () => {
+  const run = async (script) => inZone("America/New_York", async () => {
+    const page = newPage(new Map(), script);
+    await signIn(page);
+    const morning = localAt(2026, 8, 19, 9, 10);
+    await showDiscord(page, [message({ id: "711", content: "from this morning", timestamp: morning.toISOString() })]);
+    const time = () => rowWithId(page, "711").descendants().find((node) => node.className === "msg-time");
+    assert.equal(time().textContent, shownTime(morning));
+    const row = rowWithId(page, "711");
+    page.setClock(localAt(2026, 8, 20, 0, 5).getTime());
+    // What a refresh that brings nothing does, drawing no row again (`seamsAfterMidnight`).
+    page.pure("seamsAfterMidnight()");
+    assert.equal(rowWithId(page, "711"), row, "the premise: the row was not drawn again");
+    return { text: time().textContent, want: `Wed ${shownTime(morning)}` };
+  });
+  const { text, want } = await run(SCRIPT);
+  assert.equal(text, want, "a page left open past midnight still gave this morning's time alone");
+  // THE CONTROL: with the times never worded again, the row goes on saying the time alone.
+  const control = await run(brokenScript("  rewordRowTimes(list, rows, today);\n", ""));
+  assert.notEqual(control.text, control.want, "with the times never worded again the row changed anyway, so this test cannot see it");
+});
+
 test("A ROW'S TIME SAYS ITS DAY ON HOVER: yesterday's says Yesterday, and the words follow the clock past midnight", async () => {
   await inZone("America/New_York", async () => {
     const page = newPage();
@@ -3706,7 +3751,8 @@ test("A ROW'S TIME SAYS ITS DAY ON HOVER: yesterday's says Yesterday, and the wo
     const old = time("601");
     assert.equal(old.tagName, "time", "a row's time is not a <time>");
     assert.equal(old.getAttribute("datetime"), before.toISOString(), "the <time> does not say which instant it is");
-    assert.equal(old.textContent, shownTime(before), "the row's own time changed");
+    // `#729 vt-older-message-dates`: yesterday's says its weekday; the title says the time once.
+    assert.equal(old.textContent, `Tue ${shownTime(before)}`, "the row's own time changed");
     assert.equal(old.getAttribute("title"), `Yesterday, Aug 18, Tue, ${shownTime(before)}`);
     const recent = time("602");
     assert.equal(recent.getAttribute("title"), `Today, Aug 19, Wed, ${shownTime(morning)}`);
@@ -3718,7 +3764,7 @@ test("A ROW'S TIME SAYS ITS DAY ON HOVER: yesterday's says Yesterday, and the wo
       "a page left open past midnight still called this morning Today");
     await page.documentEvent("pointerover", { target: old });
     assert.equal(old.getAttribute("title"), `Aug 18, Tue, ${shownTime(before)}`);
-    assert.equal(old.textContent, shownTime(before), "the hover changed the row's own time");
+    assert.equal(old.textContent, `Tue ${shownTime(before)}`, "the hover changed the row's own time");
     // A pointer over anything else is passed over, and nothing is redrawn to say it.
     await page.documentEvent("pointerover", { target: rowWithId(page, "601") });
     await page.documentEvent("pointerover", { target: null });

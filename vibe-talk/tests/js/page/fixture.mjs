@@ -5208,6 +5208,9 @@ const TUNING_BANDS = {
   DEFAULT_CARD_MAX_LINES: [5, 5,
     "the lines a thread card shows of its first message until the owner says otherwise: his five, " +
     "and src/threads.rs DEFAULT_CARD_MAX_LINES (#522 thread-card-max-lines)"],
+  WEEKDAY_TIME_DAYS: [6, 6,
+    "the most calendar days back a row's time names by its weekday (#729 vt-older-message-dates): the " +
+    "owner's six, so the weekday never stands for today's, nor for last week's same day, which says its date"],
   QUICK_REPLY_GAP_PX: [4, 24,
     "how far under the selected words the quick reply stands (#727 vt-selection-quick-reply): closer and it " +
     "covers a phone's selection handles; further and the words it answers and the box read as apart"],
