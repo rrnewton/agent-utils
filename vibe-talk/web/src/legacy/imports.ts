@@ -156,7 +156,20 @@ export {
   createSettingsSync,
 } from "../core/settings/index.ts";
 export { createWebPorts } from "../platform/web/index.ts";
-export { childByClass, classWords, elementIn, focusMinimally, nodeWithin, setClassWord, shownNode } from "../view/dom/index.ts";
+export {
+  childByClass,
+  classWords,
+  elementIn,
+  focusMinimally,
+  nodeWithin,
+  setAttributeIfChanged,
+  setClassNameIfChanged,
+  setClassWord,
+  setHiddenIfChanged,
+  setTextIfChanged,
+  shownNode,
+  tagNameOf,
+} from "../view/dom/index.ts";
 export {
   COMPOSER_FIELDS,
   COMPOSER_GROW_BOXES,
@@ -277,14 +290,19 @@ export {
   anchorOfRow,
   anchorsAmong,
   authorLabel,
+  cardMarkTarget,
+  cardStubText,
+  cardUnits,
   doneButtonOf,
   findableParts,
   foldedTextLine,
   freshenDayTitle,
   idsOf,
   isMessageRow,
+  keepCardUnits,
   messageTop,
   notNoiseButtonOf,
+  renderedText,
   rowIn,
   rowMessages,
   rowNewestMs,

@@ -18271,128 +18271,6 @@ const SUMMARY_READ_STEPS_MS = [2000, 5000, 10000, 20000, 40000];
 /** Whether this server names threads (`thread_names_supported`): whether a summary may be on its way. */
 let threadNamesSupported = false;
 
-/** The block tags whose items, not themselves, are a card's units. */
-const CARD_LIST_TAGS = new Set(["ul", "ol"]);
-
-/**
- * The blocks a card never cuts into nor clamps (`#533 card-split-atomic-blocks`): one too tall to be on the
- * card is stood for there by one line (`cardStubText`) and drawn whole in the continuation.
- */
-const CARD_WHOLE_TAGS = new Set(["table", "pre", "blockquote"]);
-
-/** The blocks a card's "…" is written into, rather than after. */
-const CARD_TEXT_TAGS = new Set(["p", "h1", "h2", "h3", "h4", "li"]);
-
-/** Headings, which a card never ends on: each goes with the part it heads (`#551 headings-real-headings`). */
-const CARD_HEADING_TAGS = new Set(["h1", "h2", "h3", "h4"]);
-
-/** A node's tag, lower case, or "" for a text node. */
-const tagNameOf = (node) => String((node && node.tagName) || "").toLowerCase();
-
-/** `parent`'s child nodes that say something: its elements, and any text not white space. */
-const sayingNodes = (parent) => [...parent.childNodes].filter((node) =>
-  node.nodeType === 1 || (node.nodeType === 3 && String(node.textContent).trim() !== ""));
-
-/** What one node says, as `renderedText` reads an element. */
-const nodeWords = (node) => (node.nodeType === 3 ? String(node.textContent) : renderedText(node));
-
-/**
- * The units of drawn body `box` a card may stop after, in order: each block at its top; each item of
- * a list there, rather than the list; and each line of a paragraph, its line break included. Each
- * with its block, its place in that block (`index`), its nodes, the card lines its words take, and
- * `mark`, the line a "…" after it takes of its own (1 after a block with no line of words to end:
- * code, a quote, a table, an item ending in a list of its own), else 0. A table counts a line a row and
- * code a line a line, as they draw them (`#533 card-split-atomic-blocks`); `whole` marks either, or a
- * quote, as a block the card never cuts into (`CARD_WHOLE_TAGS`); `heading`, a heading, which a card
- * never ends on (`CARD_HEADING_TAGS`).
- *
- * @returns {Array<{block: any, index: number, nodes: any[], lines: number, mark: number, whole: boolean, heading: boolean}>}
- */
-function cardUnits(box) {
-  /** @type {Array<{block: any, index: number, nodes: any[], lines: number, mark: number, whole: boolean, heading: boolean}>} */
-  const units = [];
-  const unit = (block, index, nodes, width) => {
-    const words = nodes.map(nodeWords).join("");
-    const last = nodes.length === 1 ? nodes[0] : null;
-    const tag = tagNameOf(last);
-    const inner = last && tag === "li" ? sayingNodes(last).pop() : null;
-    const mark = last && (!CARD_TEXT_TAGS.has(tag) || (inner && CARD_LIST_TAGS.has(tagNameOf(inner)))) ? 1 : 0;
-    const lines = tag === "table" ? Math.max(1, tableShape(last).rows)
-      : tag === "pre" ? Math.max(1, (String(last.textContent || "") || renderedText(last)).replace(/\n+$/, "").split("\n").length)
-        : cardProxyLines(proxyLinesOf(words), width);
-    units.push({ block, index, nodes, lines, mark, whole: CARD_WHOLE_TAGS.has(tag), heading: CARD_HEADING_TAGS.has(tag) });
-  };
-  for (const block of sayingNodes(box)) {
-    const tag = tagNameOf(block);
-    if (CARD_LIST_TAGS.has(tag)) {
-      [...block.childNodes].filter((node) => node.nodeType === 1)
-        .forEach((item, index) => unit(block, index, [item], CARD_INDENTED_CHARS));
-    } else if (tag === "p") {
-      let line = [];
-      let index = 0;
-      for (const node of [...block.childNodes]) {
-        line.push(node);
-        if (tagNameOf(node) === "br") {
-          unit(block, index, line, CARD_LINE_CHARS);
-          line = [];
-          index += 1;
-        }
-      }
-      if (line.length) unit(block, index, line, CARD_LINE_CHARS);
-    } else {
-      unit(block, 0, [block], tag === "blockquote" ? CARD_INDENTED_CHARS : CARD_LINE_CHARS);
-    }
-  }
-  return units;
-}
-
-/**
- * Keep in body `box` only the units `keep` says, by their place among its units (`cardUnits`): the
- * rest taken out, a list or paragraph left with none taken out with them, a numbered list that lost
- * its first items numbered on from where they stopped, and a paragraph's last line break gone.
- *
- * @param {HTMLElement} box
- * @param {(at: number) => boolean} keep
- */
-function keepCardUnits(box, keep) {
-  /** @type {Map<any, number>} each block with units kept, and the place of its first kept one */
-  const kept = new Map();
-  cardUnits(box).forEach((unit, at) => {
-    if (keep(at)) {
-      if (!kept.has(unit.block)) kept.set(unit.block, unit.index);
-      return;
-    }
-    for (const node of unit.nodes) if (node.parentNode) node.parentNode.removeChild(node);
-  });
-  for (const block of sayingNodes(box)) {
-    const tag = tagNameOf(block);
-    if (!CARD_LIST_TAGS.has(tag) && tag !== "p") continue;
-    if (!kept.has(block)) {
-      box.removeChild(block);
-      continue;
-    }
-    const first = kept.get(block) || 0;
-    const start = Number.parseInt(String(block.getAttribute("start") || ""), 10);
-    if (tag === "ol" && first > 0) block.setAttribute("start", String((Number.isFinite(start) ? start : 1) + first));
-    const nodes = [...block.childNodes];
-    const last = nodes[nodes.length - 1];
-    if (tag === "p" && last && tagNameOf(last) === "br") block.removeChild(last);
-  }
-}
-
-/** Where a card's "…" goes at the `end` (or start) of `box`: the text block there, or null for none. */
-function cardMarkTarget(box, end) {
-  const pick = (nodes) => (end ? nodes[nodes.length - 1] : nodes[0]);
-  let at = pick(sayingNodes(box));
-  if (at && CARD_LIST_TAGS.has(tagNameOf(at))) at = pick([...at.childNodes].filter((node) => node.nodeType === 1));
-  // A loose list's item holds paragraphs: the mark goes in the paragraph, on its line.
-  if (at && tagNameOf(at) === "li") {
-    const inner = pick(sayingNodes(at));
-    if (inner && tagNameOf(inner) === "p") at = inner;
-  }
-  return at && CARD_TEXT_TAGS.has(tagNameOf(at)) ? at : null;
-}
-
 /** "…", marked so the stylesheet may draw it apart from the words. */
 const cardEllipsis = () => styled("span", "card-ellipsis", "…");
 
@@ -18500,40 +18378,6 @@ function cutForCard(lines, marks = [], wholes = [], headings = []) {
   if (head === 0) return wholes[0] ? { head: 0, whole: false, stub: true } : { head: 1, whole: true };
   if (total - used < 2) return null;
   return { head, whole: false };
-}
-
-/**
- * The rows and columns of table `table`: its rows, header included, and the most cells in one of them.
- *
- * @param {Element} table
- */
-function tableShape(table) {
-  const rows = [];
-  const walk = (node) => {
-    for (const kid of [...node.childNodes]) {
-      if (kid.nodeType !== 1) continue;
-      if (tagNameOf(kid) === "tr") rows.push(kid);
-      else if (tagNameOf(kid) !== "table") walk(kid);
-    }
-  };
-  walk(table);
-  const cells = (row) => [...row.childNodes].filter((kid) => ["td", "th"].includes(tagNameOf(kid))).length;
-  return { rows: rows.length, columns: Math.max(0, ...rows.map(cells)) };
-}
-
-/**
- * The one line a card says for block `block`, too tall to be on it (`#533 card-split-atomic-blocks`):
- * "Table (7 columns × 6 rows)", or the first line of a code block or a quote.
- *
- * @param {Element} block
- */
-function cardStubText(block) {
-  if (tagNameOf(block) === "table") {
-    const { rows, columns } = tableShape(block);
-    return `Table (${columns} column${columns === 1 ? "" : "s"} × ${rows} row${rows === 1 ? "" : "s"})`;
-  }
-  const first = renderedText(block).split("\n").map((line) => line.trim()).find(Boolean);
-  return first || (tagNameOf(block) === "pre" ? "Code" : "Quote");
 }
 
 /** The card's body for `root` cut at `cut`: its first units and "…", or the whole root where it fits. */
@@ -30050,35 +29894,6 @@ function textBody(text) {
   box.className = "md";
   plainParagraphs(box, text);
   return box;
-}
-
-/**
- * What a drawn body SAYS, as text: what the reader sees, with a line end at each line break and at
- * the edge of each block. What search matches and a thread is named by — not the Markdown source,
- * whose asterisks and link targets are not on the screen.
- */
-function renderedText(node) {
-  let out = "";
-  const walk = (at) => {
-    for (const kid of at.childNodes) {
-      if (kid.nodeType === 3) {
-        out += kid.textContent;
-        continue;
-      }
-      if (kid.nodeType !== 1) continue;
-      const tag = String(kid.tagName).toLowerCase();
-      if (tag === "br") {
-        out += "\n";
-        continue;
-      }
-      const block = TEXT_BLOCKS.has(tag);
-      if (block) out += "\n";
-      walk(kid);
-      if (block) out += "\n";
-    }
-  };
-  walk(node);
-  return out.replace(/[ \t]*\n\s*/g, "\n").trim();
 }
 
 /** Every link a drawn body holds, in order, as `{href, name}`: only the ones it really draws. */
@@ -46094,34 +45909,6 @@ function sideThreadChoice() {
 function nameSideRegion(name) {
   const region = leftEl("side-scroll");
   if (region.getAttribute("aria-label") !== name) region.setAttribute("aria-label", name);
-}
-
-/** Set `node`'s text, unless it already says that. */
-function setTextIfChanged(node, text) {
-  if (node.textContent !== text) node.textContent = text;
-}
-
-/**
- * Set `node`'s attribute `name` to `value`, unless it already holds that. `#532 shift-o-latency`: the
- * browser counts a write of the same value as a change, and the passes that dress every row again
- * (`dressChannelRow`) would otherwise have every row styled again for nothing.
- *
- * @param {Element} node
- * @param {string} name
- * @param {string} value
- */
-function setAttributeIfChanged(node, name, value) {
-  if (node.getAttribute(name) !== value) node.setAttribute(name, value);
-}
-
-/** Hide or show `node`, unless it already is (`setAttributeIfChanged`). */
-function setHiddenIfChanged(node, hidden) {
-  if (node.hidden !== hidden) node.hidden = hidden;
-}
-
-/** Set `node`'s classes to `name`, unless they already are (`setAttributeIfChanged`). */
-function setClassNameIfChanged(node, name) {
-  if (node.className !== name) node.className = name;
 }
 
 /**

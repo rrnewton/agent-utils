@@ -22,3 +22,17 @@ export {
   standingRow,
 } from "./rows.ts";
 export type { RowElement } from "./rows.ts";
+export { renderedText } from "./text.ts";
+export {
+  CARD_HEADING_TAGS,
+  CARD_LIST_TAGS,
+  CARD_TEXT_TAGS,
+  CARD_WHOLE_TAGS,
+  cardMarkTarget,
+  cardStubText,
+  cardUnits,
+  keepCardUnits,
+  nodeWords,
+  tableShape,
+} from "./cardtext.ts";
+export type { CardUnit } from "./cardtext.ts";

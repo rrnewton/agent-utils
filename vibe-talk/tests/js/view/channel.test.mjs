@@ -83,3 +83,19 @@ test("`#624 voice-page-modularity`: a drawn row read back, from the module alone
   head.hidden = true;
   assert.equal(standingRow(member), null);
 });
+
+test("`#624 voice-page-modularity`: a drawn body's text, and a card's body cut into units, from the module alone", () => {
+  const { renderedText, cardUnits, tableShape, cardStubText, cardMarkTarget } = CHANNEL_VIEW;
+  // Stand-in nodes as `node` makes them, with nodeType 1 children.
+  const body = node("div", [node("p", ["Plan ", node("strong", ["now"])]), node("ul", [node("li", ["one"]), node("li", ["two"])]),
+    node("table", [node("tr", [node("th", ["a"]), node("th", ["b"])]), node("tr", [node("td", ["1"]), node("td", ["2"])])])]);
+  // A line end at each block's edge and each row; a cell is not a block, so a row's cells run together.
+  assert.equal(renderedText(body), "Plan now\none\ntwo\nab\n12");
+  const units = cardUnits(body);
+  // The paragraph, each item of the list, and the table whole.
+  assert.deepStrictEqual(units.map(({ lines, mark, whole }) => [lines, mark, whole]), [[1, 0, false], [1, 0, false], [1, 0, false], [2, 1, true]]);
+  assert.deepStrictEqual(tableShape(body.childNodes[2]), { rows: 2, columns: 2 });
+  assert.equal(cardStubText(body.childNodes[2]), "Table (2 columns × 2 rows)");
+  assert.equal(cardMarkTarget(body, false).tagName, "P");
+  assert.equal(cardMarkTarget(body, true), null, "a mark went after a table, which has no line of words to end");
+});
