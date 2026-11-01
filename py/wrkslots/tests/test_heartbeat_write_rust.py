@@ -225,6 +225,11 @@ def _active(root: Path) -> dict[str, object]:
     doc: dict[str, object] = json.loads((root / "worktrees" / "ACTIVE.node-a.json").read_text())
     for record in doc["slots"]:  # type: ignore[attr-defined]
         record.pop("heartbeat_at")
+        # Each fixture pair has its own Git history, so commit ids differ
+        # whenever the two fixture commits land in different seconds.
+        for checkout in record.get("checkouts", []):
+            checkout["head"] = "HEAD"
+            checkout["start_point"] = "HEAD"
     return doc
 
 
