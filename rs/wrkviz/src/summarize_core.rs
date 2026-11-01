@@ -2094,6 +2094,7 @@ fn claude_failure_detail(root: Option<&Value>, stderr: &str) -> String {
 pub(crate) fn run_claude_json(
     command: &[String],
     prompt: &str,
+    schema: &Value,
     model: &str,
     reasoning_effort: Option<&str>,
     cwd: &Path,
@@ -2103,9 +2104,13 @@ pub(crate) fn run_claude_json(
             "claude command must not be empty".to_string(),
         ));
     }
-    let mut schema = match output_schema() {
-        Value::Object(map) => map,
-        _ => unreachable!(),
+    let mut schema = match schema {
+        Value::Object(map) => map.clone(),
+        _ => {
+            return Err(BatchFailure::plain(
+                "claude backend schema must be an object".to_string(),
+            ))
+        }
     };
     schema.remove("$schema");
     let mut args: Vec<String> = command.to_vec();
@@ -2226,7 +2231,14 @@ fn claude_batch(
     let temp = TempDir::new("wrkviz-summary-").map_err(BatchFailure::plain)?;
     let jobs: Vec<SummaryJob> = pending.iter().map(|item| item.job.clone()).collect();
     let prompt = build_summary_prompt(&jobs).map_err(BatchFailure::plain)?;
-    let result = run_claude_json(claude_command, &prompt, model, reasoning_effort, &temp.path)?;
+    let result = run_claude_json(
+        claude_command,
+        &prompt,
+        &output_schema(),
+        model,
+        reasoning_effort,
+        &temp.path,
+    )?;
     // Claude transport errors retain usage but no backend output audit.
     match parse_backend_output_with_repairs(&result.output, pending, model, &utc_now_iso()) {
         Ok(parsed) => Ok(CodexOutcome {
@@ -2888,4 +2900,61 @@ pub fn summarize_jobs(
             usage_run_path: Some(accounting.path),
         },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FAKE_CLAUDE: &str = r#"#!/usr/bin/env python3
+import json, sys
+args = sys.argv[1:]
+schema = json.loads(args[args.index("--json-schema") + 1])
+with open("captured-schema.json", "w") as handle:
+    json.dump(schema, handle)
+required = schema.get("required", [])
+structured = {name: [] for name in required}
+print(json.dumps({
+    "type": "result", "subtype": "success", "is_error": False,
+    "structured_output": structured,
+    "usage": {"input_tokens": 1, "cache_creation_input_tokens": 0,
+              "cache_read_input_tokens": 0, "output_tokens": 1}}))
+"#;
+
+    #[test]
+    fn claude_backend_receives_each_callers_own_schema() {
+        use std::os::unix::fs::PermissionsExt as _;
+        for (schema, expected) in [
+            (output_schema(), "summaries"),
+            (crate::naming::output_schema(), "names"),
+        ] {
+            let temp = TempDir::new("wrkviz-schema-test-").unwrap();
+            let script = temp.path.join("fake-claude");
+            std::fs::write(&script, FAKE_CLAUDE).unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let result = run_claude_json(
+                &[script.display().to_string()],
+                "prompt",
+                &schema,
+                "model",
+                None,
+                &temp.path,
+            )
+            .map_err(|error| error.message)
+            .unwrap();
+            let captured: Value = serde_json::from_str(
+                &std::fs::read_to_string(temp.path.join("captured-schema.json")).unwrap(),
+            )
+            .unwrap();
+            let properties = captured.get("properties").unwrap().as_object().unwrap();
+            assert!(properties.contains_key(expected), "schema sent: {captured}");
+            let other = if expected == "names" {
+                "summaries"
+            } else {
+                "names"
+            };
+            assert!(!properties.contains_key(other), "schema sent: {captured}");
+            assert!(result.output.contains(&format!("\"{expected}\"")));
+        }
+    }
 }

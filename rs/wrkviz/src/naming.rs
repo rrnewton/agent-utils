@@ -1214,6 +1214,7 @@ fn claude_batch(
     let result = crate::summarize_core::run_claude_json(
         claude_command,
         &prompt,
+        &output_schema(),
         model,
         reasoning_effort,
         &temp.path,

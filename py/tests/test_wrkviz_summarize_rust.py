@@ -141,7 +141,12 @@ print(json.dumps({"type": "turn.completed", "usage": {
 FAKE_CLAUDE = """#!/usr/bin/env python3
 import json, sys
 prompt = sys.stdin.read()
+schema = json.loads(sys.argv[sys.argv.index("--json-schema") + 1])
+properties = schema.get("properties", {})
 if "BEGIN_AGENT_NAME_JOBS_JSON" in prompt:
+    if "names" not in properties or "summaries" in properties:
+        print("naming call received the wrong schema", file=sys.stderr)
+        sys.exit(3)
     body = prompt.split("BEGIN_AGENT_NAME_JOBS_JSON\\n", 1)[1].split(
         "END_AGENT_NAME_JOBS_JSON", 1)[0]
     jobs = json.loads(body)
@@ -153,6 +158,9 @@ if "BEGIN_AGENT_NAME_JOBS_JSON" in prompt:
         "lifetime_summary": "Built the widget parser and verified it.",
     } for job in jobs]}
 else:
+    if "summaries" not in properties or "names" in properties:
+        print("summary call received the wrong schema", file=sys.stderr)
+        sys.exit(3)
     body = prompt.split("BEGIN_JOBS_JSON\\n", 1)[1].split(
         "END_JOBS_JSON", 1)[0]
     jobs = json.loads(body)
