@@ -344,3 +344,49 @@ slices (glossary/losslessness still pre-scan `--help`).
 Remaining composites: discover-agents, `--userguide`, multi-team
 export; then the edition switch at parity and the
 generated-schema collapse.
+
+## Slice 9f landed: Rust `responsiveness` (main bccfa0ad), after the 36027c35 fix-forward (ded8fa69, 8c4da42e)
+
+- `responsiveness` (above) landed as `bccfa0ad` after Gate 160
+  (`/tmp/gate160-responsiveness.log`): 208 steps passed; the only
+  failure, `python.wrkslots.shard-0`, was
+  `test_ownerless_worktree_plan_matches_python`, whose Python
+  oracle enumerates live user systemd units until the census
+  output bound trips (host drift, not either edition); passes
+  solo on the final commit (308 passed,
+  `/tmp/gate160-solo-shard0.log`). Rebased onto `5838e39c`
+  (vibe-talk only, no file overlap) and pushed ungated per the
+  landing rule.
+- Before it, the coordinator-directed fix-forward of upstream
+  `36027c35` landed (`ded8fa69`, heartbeat test fix `8c4da42e`).
+  Verified first-hand: the 31 removal cases fail at the
+  `clean-caches --only` assertion
+  (`test_lifecycle.py:30903`), not in `remove`, and 36027c35's
+  mixed fixture is structurally identical to the `malformed`
+  removal case, so both pins cannot hold under `--only`. A slot
+  named with `--only` is now cleaned to the removal standard
+  (nested Git metadata refuses the whole slot, rc 3, byte-for-byte
+  as before `36027c35`); skip-and-prune serves the bulk sweep
+  (`--yes` and report rows), and 36027c35's regression test
+  invokes `--yes` with every assertion unchanged. All 31 removal
+  cases pass unmodified; all 27 clean-caches tests pass; the
+  lifecycle inventory is 2116 -> 2117 (mapped 1779 -> 1780).
+  `wrkslotsd` has no clean-caches counterpart (search verified),
+  so no Rust mirror was needed. On the landed commit, agent
+  removal still refuses (rc 3) whenever a nested repository is
+  not provably disposable, and deletes nothing. Gate 159:
+  40/41 steps on `ded8fa69`; the heartbeat differential flake
+  (fixture commit ids coincide only within one wall-clock
+  second; `_active` now normalizes `head`/`start_point` like
+  `_events`) fixed in `8c4da42e`, with shard-0 and python-types
+  solos green on the final commit.
+- Also verified closed: the `33582924` heads-up. The Rust audit
+  already mirrors the live-lane rule (`44b85cc3` in
+  `rs/wrkslotsd/src/audit_state.rs`: owner-and-liveness
+  indeterminate, cache-failure-only, partial-only, and
+  occupancy/process-census reason classes), with differential
+  `test_audit_live_lane_exhausted_cache_not_unknown_matches_python`
+  passing (1 passed, 64.85s on `bccfa0ad`).
+- Remaining composites: discover-agents, `--userguide`,
+  multi-team export; then the edition switch at parity and the
+  generated-schema collapse.
