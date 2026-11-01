@@ -32191,21 +32191,6 @@ function measureReplyArrows() {
   });
 }
 
-/** Lift `row`'s circle up its side, or put it back on the corner, where that differs. `#228`. */
-function setMarkerLift(row, lift) {
-  if (lift !== row.hasAttribute("data-reply-lift")) {
-    if (lift) row.setAttribute("data-reply-lift", "true");
-    else row.removeAttribute("data-reply-lift");
-  }
-}
-
-/** Write one arrow's reach and its distance, and clear the other distance, where they differ. */
-function setArrowReach(arrow, reach, property, value, other) {
-  if (arrow.getAttribute("data-reply-reach") !== reach) arrow.setAttribute("data-reply-reach", reach);
-  if (arrow.style.getPropertyValue(property) !== value) arrow.style.setProperty(property, value);
-  if (arrow.style.getPropertyValue(other) !== "") arrow.style.removeProperty(other);
-}
-
 // How many redraws are under way that measure the arrows once, at their end. `#226`. Kept per column: `replyArrows().held` (`freshReplyArrows`, `#624 voice-page-modularity`).
 // Whether the arrows want measuring: asked inside a redraw, or of a hidden page. `#226`. Kept per column: `replyArrows().owed` (`freshReplyArrows`, `#624 voice-page-modularity`).
 
@@ -32360,9 +32345,6 @@ function gatheredThread() {
   if (gatheredParent() === null || !gatherState().gathered || !gatherState().gathered.thread) return null;
   return knownThreadChoice(String(gatherState().gathered.thread), null);
 }
-
-/** Whether `row` holds only replies a gathered thread put in this list, which are not the list's own. */
-const fromGatheredThread = (row) => row.hasAttribute("data-gathered-thread");
 
 /** The store's copies of this channel's messages by id, for a pass that asks after many of them. */
 function heldMessagesById() {
@@ -32627,9 +32609,6 @@ function gatherNow(parent, anchor, anchorTop) {
       : `Gathered ${countOf(report.gathered)} under it.`);
 }
 
-/** "1 reply", "3 replies". */
-const countOf = (n) => `${n} ${n === 1 ? "reply" : "replies"}`;
-
 /**
  * How many of `parent`'s replies, to any depth, are drawn to be gathered, how many Hide read leaves
  * out, and how many more the threads in the group — the parent's, and any a reply heads — hold by
@@ -32682,17 +32661,6 @@ function scatterReplies() {
 function putRepliesBack() {
   gatherState().gathered = null;
   if (listState().rowsGathered) renderChannelRows();
-}
-
-/**
- * What the row's speaker and shape put its left edge at, in the words web/voice.css keys a gathered
- * reply's inset on (`data-stack-under`): the stack hangs one gutter in from its parent's edge, so the
- * bridge's spine is under the parent and comes out of its foot whoever sent it.
- */
-function stackUnder(row) {
-  const who = row.getAttribute("data-who");
-  if (row.getAttribute("data-is-reply") === "true") return who === "me" ? "me-reply" : "reply";
-  return who === "me" || who === "coder" ? who : "third";
 }
 
 /**
@@ -32767,13 +32735,6 @@ function renderReplyLinks() {
   // `#228 reply-visible`. The other end of each arrow, from the arrows just decided.
   renderReplyCounts();
   measureReplyArrows();
-}
-
-/** Put `make()` at the head of `row` when `wanted` and it is not there, and take it away when not. */
-function gutterPiece(row, name, wanted, make) {
-  const held = [...row.children].find((child) => String(child.className).split(/\s+/).includes(name));
-  if (wanted && !held) row.replaceChildren(make(row), ...row.children);
-  else if (!wanted && held) row.removeChild(held);
 }
 
 /**
@@ -32958,10 +32919,6 @@ const replyMarkerTargets = new WeakMap();
 
 // Whether any Reply on the list says a count, or any row has a circle: a pass then has something to undo. Kept per column: `replyArrows().countsDrawn` (`freshReplyArrows`, `#624 voice-page-modularity`).
 
-/** The circle's accessible name, for the `at`th (from 1) of `of` replies. No channel data. */
-const replyMarkerName = (at, of) =>
-  of === 1 ? "Jump to the reply to this message" : `Jump to reply ${at} of ${of} to this message`;
-
 /**
  * The replies by pointer the page holds of the channel on screen, as `replies`: by the id of the
  * message each answers, each reply's id to its time in milliseconds (NaN when it has none). And as
@@ -33090,53 +33047,6 @@ function drawReplyLabel(button) {
     button.removeAttribute("aria-label");
   }
   if (button.getAttribute("title") !== lead) button.setAttribute("title", lead);
-}
-
-/**
- * Where everything on a row's header line stands: the line's height, the top of each thing on it
- * measured from the line's own top, and the author's width. Empty where the engine lays nothing out.
- */
-function headerLayout(meta) {
-  if (!meta || typeof meta.getBoundingClientRect !== "function") return [];
-  const line = meta.getBoundingClientRect();
-  const kids = meta.children || [];
-  const tops = [];
-  for (let at = 0; at < kids.length; at += 1) {
-    const kid = kids[at];
-    if (typeof kid.getBoundingClientRect !== "function") continue;
-    const box = kid.getBoundingClientRect();
-    tops.push(box.top - line.top);
-    // `#377 compact-collapsed-rows`. The name gives way on a full line, so a longer label can cut it
-    // without moving anything up or down: its width is part of where it stands.
-    if (String(kid.className || "").split(" ").includes("msg-author")) tops.push(box.width);
-  }
-  return [line.height, ...tops];
-}
-
-/**
- * `#267 quote-reply`. Whether `button` can read `full` without moving anything on its row's header
- * line from where it stands as `plain`: drawn both ways in one go, which the reader never sees, and
- * measured. Leaves the button as `full`, and its width as `plain` in `quoteWidth`, for
- * `drawReplyLabel` to finish.
- */
-function quoteLabelFits(button, plain, full) {
-  // The header line itself, not the row's controls that Reply is held among (`#377`).
-  const held = button.parentNode;
-  const meta = held && String(held.className || "") === "row-acts" ? held.parentNode : held;
-  if (!meta || typeof button.getBoundingClientRect !== "function") return true;
-  button.removeAttribute("data-quote");
-  button.style.width = "";
-  button.textContent = plain;
-  const before = headerLayout(meta);
-  const plainWidth = button.getBoundingClientRect().width;
-  button.quoteWidth = `${plainWidth}px`;
-  button.setAttribute("data-quote", "true");
-  button.textContent = full;
-  // `#377 compact-collapsed-rows`. A collapsed row in a narrow list draws no Reply until words of it
-  // are selected, and then draws it whole: there is no plain label in place to keep the line as it was.
-  if (!(plainWidth > 0)) return true;
-  const after = headerLayout(meta);
-  return before.length === after.length && before.every((value, at) => Math.abs(value - after[at]) <= 0.5);
 }
 
 /**

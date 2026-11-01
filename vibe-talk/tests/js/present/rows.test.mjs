@@ -147,3 +147,10 @@ test("`#624 voice-page-modularity`: a quoted stretch as the head of a reply, fro
   const said = long.slice(2, -2);
   assert.ok(said.length <= QUOTE_MAX_CHARS && said.endsWith("word…"), "a long quote was not cut at a word with an ellipsis");
 });
+
+test("`#624 voice-page-modularity`: what replies are called, from the module alone", () => {
+  const { countOf, replyMarkerName } = ROWS;
+  assert.deepStrictEqual([countOf(1), countOf(3)], ["1 reply", "3 replies"]);
+  assert.deepStrictEqual([replyMarkerName(1, 1), replyMarkerName(2, 5)],
+    ["Jump to the reply to this message", "Jump to reply 2 of 5 to this message"]);
+});

@@ -111,3 +111,19 @@ test("`#624 voice-page-modularity`: the links between Main's roots and their car
   assert.equal(pointerOn({ matches: () => { throw new Error("no :hover here"); } }), false);
   assert.equal(pointerOn(null), false);
 });
+
+test("`#624 voice-page-modularity`: where a gathered reply's stack hangs, and the circle's lift, from the module alone", () => {
+  const { stackUnder, setMarkerLift } = CHANNEL_VIEW;
+  const attrs = (map) => ({ getAttribute: (name) => map.get(name) ?? null, hasAttribute: (name) => map.has(name),
+    setAttribute: (name, value) => map.set(name, value), removeAttribute: (name) => map.delete(name), map });
+  assert.deepStrictEqual([
+    stackUnder(attrs(new Map([["data-who", "me"], ["data-is-reply", "true"]]))),
+    stackUnder(attrs(new Map([["data-who", "coder"]]))),
+    stackUnder(attrs(new Map([["data-who", "someone"]]))),
+  ], ["me-reply", "coder", "third"]);
+  const row = attrs(new Map());
+  setMarkerLift(row, true);
+  assert.equal(row.map.get("data-reply-lift"), "true");
+  setMarkerLift(row, false);
+  assert.equal(row.map.has("data-reply-lift"), false);
+});
