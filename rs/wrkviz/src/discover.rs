@@ -402,23 +402,31 @@ fn head_records(path: &Path, limit: usize) -> Vec<Map<String, Value>> {
         }
         return out;
     }
-    let Ok(bytes) = std::fs::read(&physical) else {
+    // Stream the head: the oracle iterates the open file and
+    // stops at `limit`, so a large log costs one line of memory,
+    // not the whole file.
+    use std::io::BufRead as _;
+    let Ok(file) = std::fs::File::open(&physical) else {
         return Vec::new();
     };
-    for (index, line) in bytes.split(|byte| *byte == b'\n').enumerate() {
+    let mut reader = std::io::BufReader::new(file);
+    let mut line: Vec<u8> = Vec::new();
+    let mut index = 0usize;
+    loop {
         if index >= limit {
             break;
         }
-        // A trailing split artifact after the final newline is
-        // not a file line in the oracle's binary iteration.
-        if line.is_empty() && index > 0 && bytes.ends_with(b"\n") {
-            continue;
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
         }
-        if let Ok(text) = std::str::from_utf8(line) {
+        if let Ok(text) = std::str::from_utf8(&line) {
             if let Some(map) = parse_map(text) {
                 out.push(map);
             }
         }
+        index += 1;
     }
     out
 }
@@ -1125,30 +1133,37 @@ fn record_time(line: &[u8]) -> Option<f64> {
         .map(|value| value / 1e6)
 }
 
-/// The logical lines of a log; empty for databases and
-/// unreadable logs.
-fn log_lines(path: &Path) -> Vec<Vec<u8>> {
+/// Visit the logical lines of a log one at a time; databases
+/// and unreadable logs have none. Plain files stream line by
+/// line (the oracle iterates the open file); only compressed
+/// sources are materialized, as in the oracle.
+fn for_each_log_line(path: &Path, visit: &mut dyn FnMut(&[u8])) {
     if path.extension().map(|ext| ext == "db").unwrap_or(false) {
-        return Vec::new();
+        return;
     }
     let Some(physical) = resolve_source(path) else {
-        return Vec::new();
+        return;
     };
     if is_compressed(&physical) {
-        return match read_source_bytes(path) {
-            Ok(bytes) => bytes
-                .split(|byte| *byte == b'\n')
-                .map(<[u8]>::to_vec)
-                .collect(),
-            Err(_) => Vec::new(),
-        };
+        if let Ok(bytes) = read_source_bytes(path) {
+            for line in bytes.split(|byte| *byte == b'\n') {
+                visit(line);
+            }
+        }
+        return;
     }
-    match std::fs::read(&physical) {
-        Ok(bytes) => bytes
-            .split_inclusive(|byte| *byte == b'\n')
-            .map(<[u8]>::to_vec)
-            .collect(),
-        Err(_) => Vec::new(),
+    use std::io::BufRead as _;
+    let Ok(file) = std::fs::File::open(&physical) else {
+        return;
+    };
+    let mut reader = std::io::BufReader::new(file);
+    let mut line: Vec<u8> = Vec::new();
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => visit(&line),
+        }
     }
 }
 
@@ -1158,28 +1173,28 @@ fn launches(path: &Path) -> Vec<(f64, String)> {
     let launch = launch_re();
     let variable = variable_launch_re();
     let mut found = Vec::new();
-    for line in log_lines(path) {
+    for_each_log_line(path, &mut |line: &[u8]| {
         if !line.windows(8).any(|window| window == b"agentctl")
             || !line.windows(5).any(|window| window == b"start")
         {
-            continue;
+            return;
         }
         let mut names: Vec<String> = Vec::new();
-        for capture in launch.captures_iter(&line) {
+        for capture in launch.captures_iter(line) {
             if let Some(name) = capture.get(1) {
                 names.push(String::from_utf8_lossy(name.as_bytes()).into_owned());
             }
         }
-        for capture in variable.captures_iter(&line) {
+        for capture in variable.captures_iter(line) {
             if let Some(name) = capture.get(1) {
                 names.push(String::from_utf8_lossy(name.as_bytes()).into_owned());
             }
         }
         if names.is_empty() {
-            continue;
+            return;
         }
-        let Some(when) = record_time(&line) else {
-            continue;
+        let Some(when) = record_time(line) else {
+            return;
         };
         let mut seen: HashSet<String> = HashSet::new();
         for name in names {
@@ -1187,7 +1202,7 @@ fn launches(path: &Path) -> Vec<(f64, String)> {
                 found.push((when, name));
             }
         }
-    }
+    });
     found
 }
 
@@ -1195,20 +1210,20 @@ fn launches(path: &Path) -> Vec<(f64, String)> {
 fn invocations(path: &Path) -> Vec<f64> {
     let exec = exec_re();
     let mut found = Vec::new();
-    for line in log_lines(path) {
+    for_each_log_line(path, &mut |line: &[u8]| {
         let mentions = line.windows(4).any(|window| window == b"exec")
             || line.windows(6).any(|window| window == b"claude")
             || line.windows(4).any(|window| window == b"muse");
         if !mentions {
-            continue;
+            return;
         }
-        if !exec.is_match(&line) {
-            continue;
+        if !exec.is_match(line) {
+            return;
         }
-        if let Some(when) = record_time(&line) {
+        if let Some(when) = record_time(line) {
             found.push(when);
         }
-    }
+    });
     found
 }
 
