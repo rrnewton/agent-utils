@@ -292,3 +292,110 @@ fn a_recovered_draft_whose_steer_fails_again_is_pressed_again_before_the_next_pa
     assert!(screen.contains("❯ [from tickhub-ops-2"), "{screen}");
     assert!(screen.contains("status?"), "{screen}");
 }
+
+/// The second 2026-11-01 incident: an agent-teams message typed into a Muse coordinator 2.5 s
+/// after Muse installed a context compaction showed at once as a user turn and counted as
+/// delivered; the compaction ran for 52 s, Muse then put the prompt back in its editor, and
+/// every later delivery was refused until a person pressed Enter. The in-delivery settle
+/// cannot see a return that late, so the next delivery submits the draft, with no human action,
+/// whether the draft shows as text or as Muse's paste placeholder and whether Muse is idle or
+/// running a turn by then.
+#[test]
+fn a_prompt_muse_returns_after_a_long_compaction_is_submitted_by_the_next_delivery() {
+    const TEAM: &str = "[from team-a@host-b via agent-teams · to: team-a@host-a · id: \
+                        tm-team-a-56f463016c7abe54]\n[team message: kind reply; expires \
+                        2026-11-01T12:21:43.239Z; sender proved on host-b (harness-ancestry)]";
+    for (collapse, busy_after) in [(None, false), (None, true), (Some(200), false)] {
+        let fixture = Fixture::new();
+        let manager = start_muse(&fixture, true);
+        let body = "host-b coordinator: understood. The image archive is being staged; I will \
+                    send its path and digest when it is verified.";
+        let team = if collapse.is_some() {
+            format!("{TEAM}\n{body}\n{body}")
+        } else {
+            format!("{TEAM}\n{body}")
+        };
+        editor(&fixture, |editor| {
+            if let Some(limit) = collapse {
+                *editor = MuseEditor::new("YOLO", false, Some(limit));
+                editor.busy = true;
+            }
+            // The steer lands mid-compaction: Muse draws the user turn and holds it far longer
+            // than the settle before the compaction ends.
+            editor.failing_steers = 1;
+            editor.steer_fails_after_reads = 100_000;
+        });
+        let result = manager
+            .send_identified_with_runtime("coord", &team, quick(), "team", &Clock::default())
+            .unwrap();
+        // The screen's proof held for the whole settle, so the delivery counts, as in the
+        // incident; the journal, which would have said otherwise, is not found here.
+        assert_eq!(result.delivered, ["team"], "collapse={collapse:?}");
+        assert_eq!(keys(&fixture), ["Enter"]);
+        editor(&fixture, |editor| {
+            editor.finish_compaction();
+            editor.busy = busy_after;
+            assert!(
+                editor.staged().is_some(),
+                "the prompt is back in the editor"
+            );
+            assert!(editor.screen().contains("! steer failed"));
+        });
+        *fixture.client.status.lock().unwrap() =
+            Some(if busy_after { "working" } else { "idle" }.to_owned());
+        if !busy_after {
+            assert_eq!(manager.status("coord").unwrap()["agent_status"], "staged");
+        }
+        fixture.client.keys_sent.lock().unwrap().clear();
+
+        let owner = format!("{OWNER}\nare the image bytes on their way?");
+        let result = manager
+            .send_identified_with_runtime("coord", &owner, quick(), "chat-1", &Clock::default())
+            .unwrap();
+        assert_eq!(
+            result.delivered,
+            ["chat-1"],
+            "collapse={collapse:?} busy={busy_after}"
+        );
+        assert_eq!(keys(&fixture), ["Enter", "Enter"]);
+        let screen = editor(&fixture, |editor| {
+            assert!(editor.staged().is_none());
+            editor.screen()
+        });
+        assert!(screen.contains("on their way?"), "{screen}");
+        let recovered = processed(&manager, "team");
+        assert!(
+            recovered["draft_recovered_evidence"]
+                .as_str()
+                .unwrap()
+                .contains("typed by agentctl for team-a@host-b"),
+            "{recovered}"
+        );
+    }
+}
+
+/// An extra Enter on an empty Muse editor, idle or running a turn, starts no turn and draws
+/// nothing: the steady state agentctl relies on when it presses Enter again for a draft that has
+/// just left the editor. (Modelled: unlike Claude Code and Codex, this was not observed on a
+/// live Muse.)
+#[test]
+fn an_extra_enter_on_an_empty_muse_editor_changes_nothing() {
+    for busy in [false, true] {
+        let fixture = Fixture::new();
+        let manager = start_muse(&fixture, busy);
+        manager
+            .send_identified_with_runtime(
+                "coord",
+                &format!("{LANE}\nstatus?"),
+                quick(),
+                "lane",
+                &Clock::default(),
+            )
+            .unwrap();
+        editor(&fixture, |editor| {
+            let before = editor.screen();
+            assert!(editor.enter().is_none(), "busy={busy}: nothing submitted");
+            assert_eq!(editor.screen(), before, "busy={busy}");
+        });
+    }
+}

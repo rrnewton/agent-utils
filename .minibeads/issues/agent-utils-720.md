@@ -1,11 +1,10 @@
 ---
 title: 'agentctl-muse-stale-draft: a draft agentctl typed but Muse never submitted holds every owner message'
-status: closed
+status: open
 priority: 0
 issue_type: bug
 created_at: 2026-11-01T08:07:37.884533520+00:00
-updated_at: 2026-11-01T10:36:15.366140113+00:00
-closed_at: 2026-11-01T10:36:15.366139932+00:00
+updated_at: 2026-11-01T13:32:14.512588529+00:00
 ---
 
 # Description
@@ -20,3 +19,13 @@ Wanted:
 3. Alarm on stuck owner messages: a chat request left undelivered past a threshold (default 5 min) is reported to the owner by the bridge and to the coordinator by watch-agents, with the concrete reason, and repeated until it clears.
 4. Owner priority: an agent message stuck in the editor blocks owner messages no longer than that recovery takes.
 5. Quarantine notices: a PROBABLE MISROUTE quarantine notifies the coordinator, and the owner for chat requests, with what was quarantined and how to send it again.
+
+## Follow-up (2026-11-01)
+
+[opus 5.5] Reopened for a second incident and the owner's generalization.
+
+A second Muse coordinator's editor held an unsent agent-teams message for about two and a half hours. agentctl typed it 2.5 s after Muse installed a context compaction, and counted it delivered 0.8 s later on the screen's proof alone; that build predated the 3 s settle. Muse's journal shows nothing from the compaction until its PostCompact hook 52 s later, and no accepted intent until a person pressed Enter. The prompt came back to the editor far beyond any settle, so the next delivery has to recover it.
+
+Wanted:
+6. A fake-Muse test where the submit lands mid-compaction and the prompt comes back after the settle; the next delivery recovers it with no human action.
+7. The same recovery for every harness agentctl drives (Claude Code, Codex, Muse): our own text, or a paste placeholder (`[Pasted Content N chars]`, `[Pasted text #K +M lines]`), left in the editor is pressed again. Show in each harness's fake that a spare Enter on an empty editor is harmless, find out whether any placeholder needs more than Enter, and keep every rule that a draft agentctl did not type is never submitted or cleared.

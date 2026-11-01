@@ -204,6 +204,13 @@
         "null"
       ]
     },
+    "paste_label": {
+      "description": "The numbered placeholder the harness drew for the paste, without its blanks.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "paste_started_at": {
       "description": "Unix seconds immediately before the first terminal input.",
       "format": "double",

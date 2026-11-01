@@ -662,6 +662,38 @@ and an idle pane is refused as `staged`, worded as in every edition. Either way
 therefore wait behind an agent's stuck message only as long as that recovery
 takes; the owner-first order of the queue and the bridge's lock priority cover
 prompts agentctl has not typed yet, and cannot reach one already in the editor.
+The same recovery covers Claude Code and Codex in the Rust edition, more
+narrowly, since in both Up on an empty composer recalls the newest prompt, which
+for a managed agent is the one agentctl last delivered, and a person who recalls
+it means to edit it. A delivery that finds their composer holding a draft
+submits it, with the key a prompt typed then would get, when it is one prompt
+agentctl quarantined rather than proved delivered (one still staged when its key
+was given up on, say), or a run of two or more of the latest prompts in the order
+they were typed, as Codex moves the inputs it held for a turn back into its
+composer when the turn is interrupted. A prompt quarantined as typed into the
+wrong program never counts, for any harness. The key is never pressed while a
+question, a menu or a picker shows, where it would choose an option. A turn the
+submitted draft starts in Claude Code makes the prompt being delivered wait for
+the next delivery unless the sender opted in to typing into a working Claude
+Code. An idle Codex reads `unknown` rather than `staged`, so its readiness wait
+looks at its composer once. A draft agentctl cannot submit is refused with the
+same wording as any other draft, so the chat bridge's
+`--stale-composer-clear-after` still sees it. A draft shown only as a paste
+placeholder matches by what the placeholder tells:
+`[Pasted Content N chars]` (Muse, Codex) the very last prompt of exactly N
+characters, and `[Pasted text #K +M lines]` (Claude Code) only the prompt whose
+queue record holds that very label as `paste_label`, recorded when agentctl saw
+the harness draw it, since the paste number names one paste and a person's paste
+of the same size gets another. A placeholder left in the composer counts as a
+draft even where a harness draws it faint (as some Codex builds do), so it is
+never typed after. agentctl never clears a draft: a placeholder stands for text
+the harness keeps (one Backspace deletes it whole in Claude Code and Codex), and
+deleting it would lose a prompt that Enter delivers. A spare Enter on an empty,
+idle composer redraws nothing and submits nothing in Claude Code and Codex
+(observed on both), and does nothing in the Muse model the tests use, so a press
+that meets a draft just as it leaves does no harm. An Enter is never sent blind,
+though: on a question, a menu or a picker it would choose the highlighted
+option.
 Each screen is read between two checks of the pinned process, which is what
 identifies it as Muse's once Muse 1.4 has scrolled its `Muse Code X.Y.Z` header
 away. A long paste that Muse collapses to `[Pasted Content N chars]` counts as

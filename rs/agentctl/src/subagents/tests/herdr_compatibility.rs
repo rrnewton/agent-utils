@@ -168,6 +168,15 @@ impl MuseEditor {
         }
     }
 
+    /// The context compaction a failing steer waits on finishes now, however many reads were
+    /// left: the steer fails and its prompt comes back to the editor.
+    pub(super) fn finish_compaction(&mut self) {
+        if let Some((_, reads)) = self.failing.as_mut() {
+            *reads = 1;
+        }
+        self.tick();
+    }
+
     pub(super) fn enter(&mut self) -> Option<String> {
         if self.ignore_enter || self.approval {
             return None;

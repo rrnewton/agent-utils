@@ -571,6 +571,10 @@ def submit_verified(
             )
         sleep(POLL_SECONDS)
     draft = before.composer_solid.strip()
+    # A harness that draws a paste placeholder faint (some Codex builds do) shows no solid text
+    # for a paste left unsent; a new paste would join it, and the key would submit both.
+    if not draft and _PASTE_PLACEHOLDER.search(before.composer):
+        draft = before.composer.strip()
     if draft:
         preview = " ".join(draft.split())[:120]
         raise PromptNotStaged(

@@ -343,6 +343,28 @@ pub trait AgentApi: Send + Sync {
 }
 
 impl AgentApi for HerdrClient {
+    fn recover_stale_draft_with_runtime(
+        &self,
+        pane_id: &str,
+        runtime: &dyn AgentRuntime,
+    ) -> crate::error::Result<Option<String>> {
+        let Some(queue) = runtime.typed_prompts_queue() else {
+            return Ok(None);
+        };
+        let harness =
+            HerdrClient::pane_info_with_cancellation(self, pane_id, &|| runtime.cancelled())?
+                .agent
+                .unwrap_or_default();
+        if !crate::submission::verified(&harness) {
+            return Ok(None);
+        }
+        let terminal = HerdrTerminal {
+            client: self,
+            runtime,
+        };
+        crate::submission::recover_typed_draft(&terminal, pane_id, &harness, &queue, runtime)
+    }
+
     fn verifies_muse_followups(&self) -> bool {
         // #697 send-muse-while-working: this record-free client is the direct-pane
         // transport (legacy send/drain and any queue drainer built on it). The
@@ -645,6 +667,63 @@ pub trait AgentRuntime {
     fn followup_key(&self) -> Option<&'static str> {
         None
     }
+    /// The queue whose records say which prompts agentctl typed into the pane, when a queue
+    /// drain is delivering: a draft it finds in the composer that matches one of them is
+    /// submitted rather than left to hold every later prompt (#720 agentctl-muse-stale-draft).
+    /// The default names none, and a draft is then only refused.
+    fn typed_prompts_queue(&self) -> Option<PathBuf> {
+        None
+    }
+    /// Note the numbered placeholder, without its blanks, that the harness drew in its composer
+    /// for the paste just typed, such as `[Pastedtext#3+12lines]`. A queue drain records it on
+    /// the prompt, since the paste's number tells that paste from any other of the same size if
+    /// the harness leaves it unsent (#720 agentctl-muse-stale-draft). The default ignores it.
+    fn paste_drawn_as(&self, label: &str) {
+        let _ = label;
+    }
+}
+
+/// A runtime that behaves as `inner` and names the queue a drain delivers from: see
+/// [`AgentRuntime::typed_prompts_queue`].
+struct QueueRuntime<'a> {
+    inner: &'a dyn AgentRuntime,
+    queue: PathBuf,
+}
+
+impl AgentRuntime for QueueRuntime<'_> {
+    fn paste_drawn_as(&self, label: &str) {
+        self.inner.paste_drawn_as(label);
+    }
+    fn monotonic(&self) -> Duration {
+        self.inner.monotonic()
+    }
+    fn sleep(&self, duration: Duration) {
+        self.inner.sleep(duration);
+    }
+    fn cancelled(&self) -> bool {
+        self.inner.cancelled()
+    }
+    fn delivery_wait_chunk(&self) -> Option<Duration> {
+        self.inner.delivery_wait_chunk()
+    }
+    fn prompt_printed(&self, message_id: &str) {
+        self.inner.prompt_printed(message_id);
+    }
+    fn input_started(&self) {
+        self.inner.input_started();
+    }
+    fn withdraw_unaccepted_prompt(&self) -> bool {
+        self.inner.withdraw_unaccepted_prompt()
+    }
+    fn withdraws_unaccepted(&self, message_id: &str) -> bool {
+        self.inner.withdraws_unaccepted(message_id)
+    }
+    fn followup_key(&self) -> Option<&'static str> {
+        self.inner.followup_key()
+    }
+    fn typed_prompts_queue(&self) -> Option<PathBuf> {
+        Some(self.queue.clone())
+    }
 }
 
 /// A runtime that behaves as `inner` and asks a verified submission to withdraw a prompt the
@@ -662,6 +741,12 @@ pub(crate) struct WithdrawUnacceptedRuntime<'a> {
 }
 
 impl AgentRuntime for WithdrawUnacceptedRuntime<'_> {
+    fn paste_drawn_as(&self, label: &str) {
+        self.inner.paste_drawn_as(label);
+    }
+    fn typed_prompts_queue(&self) -> Option<PathBuf> {
+        self.inner.typed_prompts_queue()
+    }
     fn followup_key(&self) -> Option<&'static str> {
         self.inner.followup_key()
     }
@@ -699,6 +784,12 @@ impl AgentRuntime for WithdrawUnacceptedRuntime<'_> {
 }
 
 impl AgentRuntime for WithdrawingRuntime<'_> {
+    fn paste_drawn_as(&self, label: &str) {
+        self.inner.paste_drawn_as(label);
+    }
+    fn typed_prompts_queue(&self) -> Option<PathBuf> {
+        self.inner.typed_prompts_queue()
+    }
     fn followup_key(&self) -> Option<&'static str> {
         self.followup_key.or_else(|| self.inner.followup_key())
     }
@@ -746,9 +837,17 @@ struct PasteTrackingRuntime<'a> {
     inner: &'a dyn AgentRuntime,
     inflight_path: PathBuf,
     document: std::cell::RefCell<Map<String, Value>>,
+    /// The placeholder the harness drew for the paste: see [`AgentRuntime::paste_drawn_as`].
+    paste_label: std::cell::RefCell<Option<String>>,
 }
 
 impl AgentRuntime for PasteTrackingRuntime<'_> {
+    fn paste_drawn_as(&self, label: &str) {
+        *self.paste_label.borrow_mut() = Some(label.to_owned());
+    }
+    fn typed_prompts_queue(&self) -> Option<PathBuf> {
+        self.inner.typed_prompts_queue()
+    }
     fn followup_key(&self) -> Option<&'static str> {
         self.inner.followup_key()
     }
@@ -795,9 +894,17 @@ impl AgentRuntime for PasteTrackingRuntime<'_> {
 struct BatchTrackingRuntime<'a> {
     inner: &'a dyn AgentRuntime,
     inflight_paths: Vec<PathBuf>,
+    /// The placeholder the harness drew for the paste: see [`AgentRuntime::paste_drawn_as`].
+    paste_label: std::cell::RefCell<Option<String>>,
 }
 
 impl AgentRuntime for BatchTrackingRuntime<'_> {
+    fn paste_drawn_as(&self, label: &str) {
+        *self.paste_label.borrow_mut() = Some(label.to_owned());
+    }
+    fn typed_prompts_queue(&self) -> Option<PathBuf> {
+        self.inner.typed_prompts_queue()
+    }
     fn followup_key(&self) -> Option<&'static str> {
         self.inner.followup_key()
     }
@@ -1169,6 +1276,13 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
     allow_legacy_workspace_binding: bool,
     priority_only: Option<String>,
 ) -> AgentResult<QueueResult> {
+    // Everything this drain types is recorded in this queue, which is how a draft it finds left
+    // in the composer is told to be one it typed (#720 agentctl-muse-stale-draft).
+    let queued = QueueRuntime {
+        inner: runtime,
+        queue: root.to_path_buf(),
+    };
+    let runtime: &dyn AgentRuntime = &queued;
     let started = runtime.monotonic();
     // Lock waits end at the lock timeout, and never later than the drain's deadline.
     let lock_bound = match (options.lock_timeout, options.deadline) {
@@ -1489,11 +1603,15 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                         }
                         let mut texts: Vec<String> = Vec::new();
                         let mut documents: Vec<Map<String, Value>> = Vec::new();
+                        // One time for every member: they are typed as one prompt, and a draft
+                        // left unsent is told for theirs by the time they share (#720
+                        // agentctl-muse-stale-draft).
+                        let batch_at = unix_seconds();
                         for (member, inflight) in &active {
                             let mut document = member.1.clone();
                             document.insert("possibly_submitted".to_owned(), Value::Bool(true));
                             document.insert("delivery_state".to_owned(), json!("inflight"));
-                            document.insert("inflight_at".to_owned(), json!(unix_seconds()));
+                            document.insert("inflight_at".to_owned(), json!(batch_at));
                             document.insert("paste_tracking".to_owned(), Value::Bool(true));
                             let lane = if member.0.starts_with(&directories.inbox_v2) {
                                 "inbox.v2"
@@ -1531,6 +1649,7 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                         let batch_tracking = BatchTrackingRuntime {
                             inner: &withdrawing,
                             inflight_paths: active.iter().map(|(_, p)| p.clone()).collect(),
+                            paste_label: std::cell::RefCell::new(None),
                         };
                         let batch_runtime: &dyn AgentRuntime = &batch_tracking;
                         let revert = |active: &[(BatchMember, PathBuf)],
@@ -1558,13 +1677,25 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                             }
                             Ok(())
                         };
-                        match deliver_one(
+                        let outcome = deliver_one(
                             client,
                             &info,
                             &combined,
                             options.working_timeout,
                             batch_runtime,
+                        );
+                        // A paste that may have been typed keeps the placeholder it was drawn as.
+                        if !matches!(
+                            outcome,
+                            Ok(Delivered::NotStaged(_) | Delivered::Misrouted(_))
                         ) {
+                            if let Some(label) = batch_tracking.paste_label.borrow_mut().take() {
+                                for document in &mut documents {
+                                    document.insert("paste_label".to_owned(), json!(label));
+                                }
+                            }
+                        }
+                        match outcome {
                             Ok(Delivered::Confirmed { verified, .. }) => {
                                 for (index, (member, inflight)) in active.iter().enumerate() {
                                     if verified {
@@ -1788,15 +1919,26 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                 inner: chosen_runtime,
                 inflight_path: inflight_path.clone(),
                 document: std::cell::RefCell::new(document.clone()),
+                paste_label: std::cell::RefCell::new(None),
             };
             let delivery_runtime: &dyn AgentRuntime = &tracking;
-            match deliver_one(
+            let outcome = deliver_one(
                 client,
                 &info,
                 &typed,
                 options.working_timeout,
                 delivery_runtime,
+            );
+            // A paste that may have been typed keeps the placeholder it was drawn as.
+            if !matches!(
+                outcome,
+                Ok(Delivered::NotStaged(_) | Delivered::Misrouted(_))
             ) {
+                if let Some(label) = tracking.paste_label.borrow_mut().take() {
+                    document.insert("paste_label".to_owned(), json!(label));
+                }
+            }
+            match outcome {
                 Ok(Delivered::NotStaged(detail)) => {
                     // Nothing reached the composer: undo the at-most-once barrier so the
                     // prompt stays pending. A crash before the rename still quarantines it.
@@ -2415,6 +2557,7 @@ fn wait_ready<A: AgentApi + ?Sized>(
     // agentctl-muse-stale-draft).
     let mut draft_refused: Option<String> = None;
     let mut recovered = 0;
+    let mut codex_draft_checked = false;
     loop {
         if runtime.cancelled() {
             return Err(AgentError::delivery(
@@ -2495,17 +2638,23 @@ fn wait_ready<A: AgentApi + ?Sized>(
                 info.pane_id
             )));
         }
-        // A Muse editor holding a draft reads `staged`, which never becomes ready by itself: a
-        // draft agentctl typed and Muse left unsent is submitted, and the pane looked at again;
+        // A Muse editor holding a draft reads `staged`, and a Codex composer holding one is not
+        // an idle Codex (which reads `unknown`); neither becomes ready by itself. A draft
+        // agentctl typed and the harness left unsent is submitted, and the pane looked at again;
         // any other draft is left alone and named in the refusal (#720
-        // agentctl-muse-stale-draft).
-        if info.status == "staged" && draft_refused.is_none() && recovered < MAX_DRAFT_RECOVERIES {
+        // agentctl-muse-stale-draft). An idle Codex's composer is looked at once per wait,
+        // unless a draft was submitted.
+        let codex_unready = info.status == "unknown" && info.agent.as_deref() == Some("codex");
+        if (info.status == "staged" || (codex_unready && !codex_draft_checked))
+            && draft_refused.is_none()
+            && recovered < MAX_DRAFT_RECOVERIES
+        {
             match client.recover_stale_draft_with_runtime(&info.pane_id, runtime) {
                 Ok(Some(_)) => {
                     recovered += 1;
                     continue;
                 }
-                Ok(None) => {}
+                Ok(None) => codex_draft_checked |= codex_unready,
                 Err(error) => draft_refused = Some(error.to_string()),
             }
         }
@@ -2518,7 +2667,7 @@ fn wait_ready<A: AgentApi + ?Sized>(
                 info.status,
                 draft_refused
                     .as_deref()
-                    .filter(|_| info.status == "staged")
+                    .filter(|_| info.status == "staged" || codex_unready)
                     .map_or(String::new(), |why| format!(": {why}"))
             )));
         }
@@ -3587,6 +3736,8 @@ mod tests {
         /// A receipt the submission returns after writing, instead of `Unconfirmed`.
         receipt: Option<crate::submission::SubmissionReceipt>,
         codex_ready: bool,
+        /// An `unknown` Codex is ready when the fake screen shows its empty idle composer.
+        codex_ready_from_screen: bool,
         readiness_checks: usize,
         misroute_submit: bool,
         verify_muse: bool,
@@ -3683,7 +3834,24 @@ mod tests {
         ) -> crate::error::Result<bool> {
             let mut state = self.state.lock().unwrap();
             state.readiness_checks += 1;
+            if state.codex_ready_from_screen {
+                let screen = self.screen.as_ref().expect("a fake screen").render();
+                return Ok(crate::harness::codex::idle_composer(&screen));
+            }
             Ok(state.codex_ready)
+        }
+
+        // As the production clients do: the composer the screen draws, and the drain's queue.
+        fn recover_stale_draft_with_runtime(
+            &self,
+            pane_id: &str,
+            runtime: &dyn AgentRuntime,
+        ) -> crate::error::Result<Option<String>> {
+            let (Some(screen), Some(queue)) = (&self.screen, runtime.typed_prompts_queue()) else {
+                return Ok(None);
+            };
+            let harness = screen.state().harness;
+            crate::submission::recover_typed_draft(screen, pane_id, harness, &queue, runtime)
         }
 
         fn panes(&self) -> crate::error::Result<Vec<Pane>> {
@@ -4369,6 +4537,131 @@ mod tests {
             fake.waits().is_empty(),
             "screen proof replaces the working wait"
         );
+    }
+
+    /// #720 agentctl-muse-stale-draft: a paste Claude Code never took, quarantined when its
+    /// deadline passed with it still in the composer, is submitted by the next delivery, which
+    /// tells it for agentctl's own by the numbered placeholder recorded when it was typed.
+    #[test]
+    fn a_paste_claude_left_unsent_past_its_deadline_is_submitted_by_the_next_delivery() {
+        let directory = TestDirectory::new("claude-stale-paste");
+        let fake =
+            FakeAgent::with_screen(crate::submission::fake::FakeScreen::new("claude", false));
+        {
+            let mut state = fake.state.lock().expect("fake state");
+            let info = state.infos.get_mut("w1:p1").expect("pane info");
+            info.agent = Some("claude".to_owned());
+            info.session_agent = Some("claude".to_owned());
+        }
+        let target = Target {
+            session_agent: Some("claude".to_owned()),
+            expected_agent: Some("claude".to_owned()),
+            ..target()
+        };
+        let screen = || fake.screen.as_ref().unwrap().state();
+        screen().drop_submit_keys = true;
+        let lane =
+            "[from lane-a via agentctl · reply: agentctl send lane-a]\none\ntwo\nthree\nfour";
+        let runtime = FakeRuntime::default();
+        let error = send_with_runtime(
+            &fake,
+            &target,
+            directory.path(),
+            lane,
+            DrainOptions::default(),
+            &runtime,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("NOT submitted"), "{error}");
+        let failed = json_paths(&directory.path().join("failed")).expect("failed records");
+        assert_eq!(failed.len(), 1);
+        let record = load_message(&failed[0]).unwrap();
+        assert_eq!(record["paste_label"], "[Pastedtext#1+4lines]");
+        assert!(screen().composer.contains("four"), "left in the composer");
+
+        screen().drop_submit_keys = false;
+        screen().keys.clear();
+        let owner = "[from Ada via slack #team · sent: 2026.11.01:06:21 EST · reply: <r3>]\nhi";
+        // The paste is submitted and starts a turn; this drain did not opt in to typing into a
+        // working Claude Code, so the owner's prompt waits, untyped.
+        let error = send_with_runtime(
+            &fake,
+            &target,
+            directory.path(),
+            owner,
+            DrainOptions::default(),
+            &runtime,
+        )
+        .unwrap_err();
+        assert!(matches!(error, AgentError::Pending(_)), "{error}");
+        assert!(error.to_string().contains("it started a turn"), "{error}");
+        assert_eq!(screen().keys, ["Enter"]);
+        assert_eq!(screen().submitted, [lane]);
+        let record = load_message(&failed[0]).unwrap();
+        assert!(record["draft_recovered_at"].is_number(), "{record:?}");
+        // Once the turn is over, the next drain types it.
+        screen().busy = false;
+        let result = drain_with_runtime(
+            &fake,
+            &target,
+            directory.path(),
+            DrainOptions::default(),
+            &runtime,
+        )
+        .unwrap();
+        assert_eq!(result.delivered.len(), 1);
+        assert_eq!(screen().submitted, [lane, owner]);
+    }
+
+    /// An idle Codex reads `unknown`, never `staged`, and a composer holding a draft is not an
+    /// idle Codex, so the readiness wait itself submits a draft agentctl typed.
+    #[test]
+    fn the_readiness_wait_submits_a_draft_agentctl_typed_that_an_idle_codex_holds() {
+        use std::os::unix::fs::DirBuilderExt;
+        let directory = TestDirectory::new("codex-stale-draft");
+        let fake = FakeAgent::with_screen(crate::submission::fake::FakeScreen::new("codex", false));
+        {
+            let mut state = fake.state.lock().expect("fake state");
+            state.states.clear();
+            state.last_state = "unknown".to_owned();
+            state.codex_ready_from_screen = true;
+        }
+        let lane = "[from lane-a via agentctl · reply: agentctl send lane-a]\nbuild is green";
+        // Quarantined when Codex never took its key; the prompt is still in the composer.
+        let failed = directory.path().join("failed");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(&failed)
+            .unwrap();
+        atomic_json(
+            &failed.join("lane.json"),
+            &json!({"id": "lane", "text": lane, "delivery_state": "failed",
+                    "possibly_submitted": true, "inflight_at": 1.0}),
+        )
+        .unwrap();
+        fake.screen.as_ref().unwrap().state().codex_instant_turns = true;
+        fake.screen.as_ref().unwrap().leave_draft(lane);
+        let owner = "[from Ada via slack #team · sent: 2026.11.01:06:21 EST · reply: <r3>]\nhi";
+        let result = send_with_runtime(
+            &fake,
+            &target(),
+            directory.path(),
+            owner,
+            DrainOptions {
+                ready_timeout: Duration::from_secs(1),
+                ..DrainOptions::default()
+            },
+            &FakeRuntime::default(),
+        )
+        .unwrap();
+        assert_eq!(result.delivered, [result.message_id]);
+        let screen = fake.screen.as_ref().unwrap().state();
+        assert_eq!(screen.submitted, [lane, owner]);
+        assert_eq!(screen.keys, ["Enter", "Enter"]);
+        drop(screen);
+        let record = load_message(&failed.join("lane.json")).unwrap();
+        assert!(record["draft_recovered_at"].is_number(), "{record:?}");
     }
 
     #[test]
@@ -5720,6 +6013,7 @@ mod tests {
             inner: &runtime,
             inflight_path: path.clone(),
             document: std::cell::RefCell::new(document),
+            paste_label: std::cell::RefCell::new(None),
         };
         tracking.input_started();
         let stamped = load_message(&path).unwrap();

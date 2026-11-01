@@ -112,6 +112,9 @@ pub struct QueueItem {
     /// The text actually typed, when it is not `text`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub typed_as: Option<String>,
+    /// The numbered placeholder the harness drew for the paste, without its blanks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paste_label: Option<String>,
     /// Unix seconds when an unsent draft was recovered.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub draft_recovered_at: Option<f64>,
@@ -168,6 +171,7 @@ impl QueueItem {
             misroutes: None,
             probable_misroute: None,
             typed_as: None,
+            paste_label: None,
             draft_recovered_at: None,
             draft_recovered_evidence: None,
             not_after: None,

@@ -22,7 +22,7 @@ use crate::agent::AgentRuntime;
 use crate::error::{AdapterError, Result};
 
 /// Whether this module can read `harness`'s composer layout.
-fn verified(harness: &str) -> bool {
+pub(crate) fn verified(harness: &str) -> bool {
     crate::harness::adapter(harness).is_some_and(|adapter| adapter.verified_submission())
 }
 /// Screen rows requested for every composer read.
@@ -647,6 +647,157 @@ fn printed(after: &ComposerView, after_screen: &str, shown: &ShownBefore) -> Opt
     None
 }
 
+/// Most unsent drafts agentctl typed that one submission submits before its own prompt (#720
+/// agentctl-muse-stale-draft).
+const MAX_DRAFT_RECOVERIES: u32 = 3;
+/// Most presses of the submission key for one unsent draft agentctl typed.
+const DRAFT_PRESSES: u32 = 3;
+/// Longest wait for such a draft to leave the composer for good after the first key.
+const DRAFT_SUBMIT_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long the composer must stay empty after such a draft left it before it counts as
+/// submitted: a harness can put a prompt it took back into the composer.
+const DRAFT_SETTLE: Duration = Duration::from_secs(3);
+
+/// The draft a composer holds: its solid text, or a paste placeholder, which some Codex builds
+/// draw faint. `None` when it is empty.
+pub(crate) fn composer_draft(view: &ComposerView) -> Option<crate::stale_draft::Draft> {
+    let solid = view.composer_solid.trim();
+    if !solid.is_empty() {
+        return Some(crate::stale_draft::Draft::from_composer(solid));
+    }
+    (paste_placeholders(&view.composer) > 0)
+        .then(|| crate::stale_draft::Draft::from_composer(&view.composer))
+}
+
+/// Whether `screen` shows a question, a menu or a picker in place of `harness`'s composer, where
+/// a submission key would choose an option instead of submitting text.
+fn blocked(harness: &str, screen: &str) -> bool {
+    crate::harness_tui::harness_tui(Some(harness)).is_some_and(|adapter| {
+        matches!(
+            adapter.classify(screen).state,
+            crate::harness_tui::State::BlockingQuestion | crate::harness_tui::State::MenuOrPicker
+        )
+    })
+}
+
+/// Submit a draft that agentctl itself typed and `harness` left unsent in its composer, so that
+/// it no longer holds every later prompt, the owner's included (#720 agentctl-muse-stale-draft).
+///
+/// A draft that [`crate::stale_draft::find`] matches, by [`crate::stale_draft::Vouching::Unproven`]
+/// (Up recalls the newest prompt in these harnesses), to prompts the queue at `queue` records as
+/// typed (their text as the composer draws it, or the paste placeholder the harness draws for
+/// the last of them) is submitted with the key a prompt typed now would get. The key is pressed
+/// again (at most [`DRAFT_PRESSES`] times in all) while the same draft is still there, and never
+/// while the screen shows a question, a menu or a picker, where it would choose an option; one
+/// that shows after a key counts as the draft having left. The
+/// draft counts as submitted once the composer has stayed empty for [`DRAFT_SETTLE`]; the queue
+/// records note the recovery. Any other draft may be a person typing: nothing is pressed.
+///
+/// `Ok(None)`: the composer is empty, not recognisable, or holds a draft agentctl did not type.
+/// `Ok(Some(evidence))`: a draft agentctl typed was submitted. An error: such a draft is still
+/// in the composer after [`DRAFT_SUBMIT_TIMEOUT`], or a read or key failed.
+pub(crate) fn recover_typed_draft(
+    terminal: &dyn PromptTerminal,
+    pane_id: &str,
+    harness: &str,
+    queue: &std::path::Path,
+    runtime: &dyn AgentRuntime,
+) -> Result<Option<String>> {
+    // The composer, or `Err(())` while a question, a menu or a picker shows.
+    let read = || -> Result<std::result::Result<Option<ComposerView>, ()>> {
+        let screen = terminal.read_screen(pane_id)?;
+        Ok(if blocked(harness, &screen) {
+            Err(())
+        } else {
+            Ok(composer_view(harness, &screen))
+        })
+    };
+    let Ok(Some(view)) = read()? else {
+        return Ok(None);
+    };
+    let Some(draft) = composer_draft(&view) else {
+        return Ok(None);
+    };
+    let Some(prompt) = crate::stale_draft::find(
+        queue,
+        &draft,
+        crate::stale_draft::Vouching::Unproven,
+        std::time::SystemTime::now(),
+    ) else {
+        return Ok(None);
+    };
+    let typed = prompt.describe();
+    let mut key = submit_key(harness, &view, runtime);
+    terminal.send_keys(pane_id, key)?;
+    let pressed = runtime.monotonic();
+    let mut presses: u32 = 1;
+    let mut wait = FIRST_RETRY;
+    let mut next_press = pressed.saturating_add(wait);
+    let mut empty_since: Option<Duration> = None;
+    loop {
+        runtime.sleep(POLL);
+        if runtime.cancelled() {
+            return Err(AdapterError::cancelled(format!(
+                "pane {pane_id}: delivery was cancelled while submitting an unsent draft {typed}"
+            )));
+        }
+        let Ok(view) = read()? else {
+            // The agent asked something once the draft left the composer, which it was in when
+            // the key was pressed; the caller refuses the blocked pane.
+            let evidence = format!(
+                "submitted an unsent draft {typed} that {harness} had left in its composer \
+                 ({presses} {key} key press(es)), after which it asked a question"
+            );
+            crate::stale_draft::note_recovered(&prompt, &evidence, unix_seconds());
+            return Ok(Some(evidence));
+        };
+        let now = runtime.monotonic();
+        let current = view.as_ref().map(composer_draft);
+        if let Some(None) = current {
+            let since = *empty_since.get_or_insert(now);
+            if now.saturating_sub(since) >= DRAFT_SETTLE {
+                let evidence = format!(
+                    "submitted an unsent draft {typed} that {harness} had left in its composer \
+                     ({presses} {key} key press(es))"
+                );
+                crate::stale_draft::note_recovered(&prompt, &evidence, unix_seconds());
+                return Ok(Some(evidence));
+            }
+            continue;
+        }
+        empty_since = None;
+        let same = current.flatten().as_ref() == Some(&draft);
+        if now.saturating_sub(pressed) >= DRAFT_SUBMIT_TIMEOUT {
+            return Err(AdapterError::unavailable(if same {
+                format!(
+                    "pane {pane_id}: the {harness} composer holds an unsent draft {typed}; it is \
+                     still there after {presses} {key} key press(es)"
+                )
+            } else {
+                format!(
+                    "pane {pane_id}: the {harness} composer held an unsent draft {typed}; after \
+                     {presses} {key} key press(es) the composer is neither empty nor that draft"
+                )
+            }));
+        }
+        if let Some(view) = view.as_ref().filter(|_| same) {
+            if presses < DRAFT_PRESSES && now >= next_press {
+                key = submit_key(harness, view, runtime);
+                terminal.send_keys(pane_id, key)?;
+                presses += 1;
+                wait = (wait * 2).min(MAX_RETRY);
+                next_press = now.saturating_add(wait);
+            }
+        }
+    }
+}
+
+fn unix_seconds() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |elapsed| elapsed.as_secs_f64())
+}
+
 fn submit_key(harness: &str, view: &ComposerView, runtime: &dyn AgentRuntime) -> &'static str {
     if let Some(key) = runtime.followup_key() {
         return key;
@@ -689,8 +840,11 @@ pub fn submit_verified(
             "pane {pane_id}: delivery was cancelled before typing"
         ));
     }
-    let composer_deadline = runtime.monotonic() + timeouts.composer;
-    let (screen, before) = loop {
+    let mut composer_deadline = runtime.monotonic() + timeouts.composer;
+    let mut recovered: u32 = 0;
+    // What the last recovery of a draft agentctl typed did: submitted it, or failed to.
+    let mut recovery: Option<std::result::Result<String, String>> = None;
+    let (screen, before) = 'baseline: loop {
         let screen = match terminal.read_screen(pane_id) {
             Ok(screen) => screen,
             Err(error) => {
@@ -713,6 +867,43 @@ pub fn submit_verified(
             }
         }
         if let Some(before) = composer_view(harness, &screen) {
+            // A draft agentctl typed that the harness left unsent is submitted first, and the
+            // composer looked at again (#720 agentctl-muse-stale-draft).
+            if composer_draft(&before).is_some() && recovered < MAX_DRAFT_RECOVERIES {
+                if let Some(queue) = runtime.typed_prompts_queue() {
+                    let outcome = recover_typed_draft(terminal, pane_id, harness, &queue, runtime);
+                    if !matches!(outcome, Ok(None)) {
+                        recovered = match outcome {
+                            Ok(_) => recovered + 1,
+                            // Pressed enough: the draft is refused like any other below.
+                            Err(_) => MAX_DRAFT_RECOVERIES,
+                        };
+                        recovery = Some(
+                            outcome
+                                .map(Option::unwrap_or_default)
+                                .map_err(|error| error.to_string()),
+                        );
+                        composer_deadline = runtime.monotonic() + timeouts.composer;
+                        continue 'baseline;
+                    }
+                }
+            }
+            // The draft submitted may have started a turn, and a harness that takes a prompt
+            // during a turn only when its sender opts in waits for the next delivery.
+            if let Some(Ok(evidence)) = &recovery {
+                let opt_in = crate::harness::adapter(harness).is_some_and(|adapter| {
+                    adapter.followup_policy() == crate::harness::FollowupPolicy::OptIn
+                });
+                if opt_in
+                    && runtime.followup_key().is_none()
+                    && running_turn(&screen) != Some(false)
+                {
+                    return refuse(format!(
+                        "pane {pane_id}: {evidence}; it started a turn, so this prompt waits for \
+                         the agent; nothing was typed"
+                    ));
+                }
+            }
             break (screen, before);
         }
         if runtime.monotonic() >= composer_deadline || runtime.cancelled() {
@@ -732,7 +923,12 @@ pub fn submit_verified(
         ..ShownBefore::new(text)
     };
     shown.note_before_paste(&before);
-    let draft = before.composer_solid.trim();
+    // A harness that draws a paste placeholder faint (some Codex builds do) shows no solid text
+    // for a paste left unsent; a new paste would join it, and the key would submit both.
+    let draft = match before.composer_solid.trim() {
+        "" if composer_draft(&before).is_some() => before.composer.trim(),
+        solid => solid,
+    };
     if !draft.is_empty() {
         let preview: String = draft
             .split_whitespace()
@@ -741,8 +937,12 @@ pub fn submit_verified(
             .chars()
             .take(120)
             .collect();
+        let failed = match &recovery {
+            Some(Err(error)) => format!("{error}; "),
+            _ => String::new(),
+        };
         return refuse(format!(
-            "pane {pane_id} composer already holds unsubmitted text {preview:?}; \
+            "{failed}pane {pane_id} composer already holds unsubmitted text {preview:?}; \
              refusing to append to it; nothing was typed"
         ));
     }
@@ -771,6 +971,9 @@ pub fn submit_verified(
         shown.note(&screen, view.as_ref());
         if let Some(view) = view {
             if staged(&view, text, placeholders_before) {
+                if let [(label, _)] = shown.labels.as_slice() {
+                    runtime.paste_drawn_as(label);
+                }
                 break view;
             }
         }
@@ -1131,6 +1334,11 @@ pub(crate) mod fake {
         pub ignore_clear_keys: bool,
         /// Every submission key, Enter or Tab, is dropped; editing keys still work.
         pub drop_submit_keys: bool,
+        /// Codex draws a paste longer than this many characters as a `[Pasted Content N chars]`
+        /// placeholder, faint as some builds draw it (a current build draws it in colour).
+        pub codex_collapse_over: Option<usize>,
+        /// An idle Codex answers a submitted prompt at once and is idle again.
+        pub codex_instant_turns: bool,
         stale_screen: Option<String>,
         pending_reads: u32,
         paste_counter: u32,
@@ -1158,6 +1366,52 @@ pub(crate) mod fake {
 
         pub(crate) fn render(&self) -> String {
             render(&self.state(), false)
+        }
+
+        /// The harness puts `text` back in its empty composer, unsent, drawn as a paste of it
+        /// would be: a prompt it took and then returned, or one whose key it missed.
+        pub(crate) fn leave_draft(&self, text: &str) {
+            let mut state = self.state();
+            assert!(state.composer.is_empty(), "the composer must be empty");
+            stage(&mut state, text);
+        }
+
+        /// Codex's Escape during a turn: the turn ends and every input it held for the turn
+        /// moves back into the composer, one after another, where Enter submits them.
+        pub(crate) fn interrupt(&self) {
+            let mut state = self.state();
+            assert_eq!(state.harness, "codex");
+            state.busy = false;
+            state.transcript.retain(|row| {
+                !row.contains("Working")
+                    && !row.contains("Queued follow-up")
+                    && !row.starts_with("  ↳")
+            });
+            state.transcript.push(
+                "■ Conversation interrupted - use /feedback if something went wrong".to_owned(),
+            );
+            let held = std::mem::take(&mut state.queued);
+            state.composer = held.join("\n");
+        }
+    }
+
+    /// Add a paste of `body` to the composer, drawn as the harness draws one.
+    fn stage(state: &mut State, body: &str) {
+        state.composer.push_str(body);
+        let newlines = body.matches('\n').count();
+        if state.harness == "claude" && newlines >= 3 {
+            state.paste_counter += 1;
+            state.placeholder = Some(format!(
+                "[Pasted text #{} +{newlines} lines]",
+                state.paste_counter
+            ));
+        }
+        if state.harness == "codex"
+            && state
+                .codex_collapse_over
+                .is_some_and(|limit| body.chars().count() > limit)
+        {
+            state.placeholder = Some(format!("[Pasted Content {} chars]", body.chars().count()));
         }
     }
 
@@ -1210,6 +1464,8 @@ pub(crate) mod fake {
                     state.codex_marker,
                     dim("Ask Codex to do anything")
                 ));
+            } else if let Some(placeholder) = &state.placeholder {
+                lines.push(format!("{} {}", state.codex_marker, dim(placeholder)));
             } else {
                 composer_lines(state.codex_marker, &mut lines);
             }
@@ -1253,15 +1509,7 @@ pub(crate) mod fake {
                 .expect("prompt text is sent as one bracketed paste");
             let mut state = self.state();
             state.pastes.push(body.to_owned());
-            state.composer.push_str(body);
-            let newlines = body.matches('\n').count();
-            if state.harness == "claude" && newlines >= 3 {
-                state.paste_counter += 1;
-                state.placeholder = Some(format!(
-                    "[Pasted text #{} +{newlines} lines]",
-                    state.paste_counter
-                ));
-            }
+            stage(&mut state, body);
             Ok(())
         }
 
@@ -1326,13 +1574,16 @@ pub(crate) mod fake {
                     state.transcript.push(format!("› {text}"));
                     if state.busy {
                         state.steered.push(text);
+                    } else if state.codex_instant_turns {
+                        state.submitted.push(text);
+                        state.transcript.push("• Done.".to_owned());
                     } else {
                         state.submitted.push(text);
                         state
                             .transcript
                             .push("• Working (0s • esc to interrupt)".to_owned());
                     }
-                    state.busy = true;
+                    state.busy |= !state.codex_instant_turns;
                 }
                 ("codex", "Tab") if state.busy => {
                     state.queued.push(text.clone());
@@ -1366,6 +1617,10 @@ mod tests {
         millis: AtomicU64,
         cancel: AtomicBool,
         withdraw: AtomicBool,
+        /// The queue a drain would name, recording the prompts it typed.
+        queue: Option<std::path::PathBuf>,
+        /// The follow-up key a drain passes when it types into a working pane.
+        followup: Option<&'static str>,
     }
 
     impl AgentRuntime for Clock {
@@ -1386,6 +1641,14 @@ mod tests {
 
         fn withdraw_unaccepted_prompt(&self) -> bool {
             self.withdraw.load(Ordering::SeqCst)
+        }
+
+        fn typed_prompts_queue(&self) -> Option<std::path::PathBuf> {
+            self.queue.clone()
+        }
+
+        fn followup_key(&self) -> Option<&'static str> {
+            self.followup
         }
     }
 
@@ -3522,5 +3785,358 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("possibly submitted"), "{error}");
         assert_eq!(screen.state().composer, "check the build");
+    }
+
+    // #720 agentctl-muse-stale-draft: a prompt agentctl typed that Claude Code or Codex left in
+    // the composer is submitted by the next delivery; any other draft is never touched.
+
+    const LANE: &str = "[from lane-a via agentctl · reply: agentctl send lane-a]";
+    const OWNER: &str = "[from Ada via slack #team · sent: 2026.11.01:06:21 EST · reply: <r3>]";
+
+    /// A queue holding the records of the prompts a drain typed, removed when dropped.
+    struct TypedQueue(std::path::PathBuf);
+
+    impl TypedQueue {
+        fn new(tag: &str) -> Self {
+            use std::os::unix::fs::DirBuilderExt;
+            let path = std::env::temp_dir().join(format!(
+                "agentctl-typed-queue-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ));
+            for phase in ["processed", "failed"] {
+                std::fs::DirBuilder::new()
+                    .mode(0o700)
+                    .recursive(true)
+                    .create(path.join(phase))
+                    .unwrap();
+            }
+            Self(path)
+        }
+
+        /// A prompt the drain typed and proved delivered.
+        fn typed(&self, id: &str, text: &str, at: f64) {
+            self.record_in("processed", id, text, at, None);
+        }
+
+        /// A prompt the drain typed and quarantined, not proved delivered (one still staged when
+        /// its key was given up on, say), drawn as `label` if the harness showed a placeholder.
+        fn quarantined(&self, id: &str, text: &str, at: f64, label: Option<&str>) {
+            self.record_in("failed", id, text, at, label);
+        }
+
+        fn record_in(&self, phase: &str, id: &str, text: &str, at: f64, label: Option<&str>) {
+            let mut record = serde_json::json!({"id": id, "text": text,
+                                                "delivery_state": phase, "inflight_at": at});
+            if let Some(label) = label {
+                record["paste_label"] = serde_json::json!(label);
+            }
+            crate::agent::atomic_json(&self.0.join(format!("{phase}/{id}.json")), &record).unwrap();
+        }
+
+        fn record(&self, id: &str) -> serde_json::Value {
+            ["processed", "failed"]
+                .iter()
+                .find_map(|phase| {
+                    crate::agent::read_private_json(&self.0.join(format!("{phase}/{id}.json"))).ok()
+                })
+                .unwrap()
+        }
+    }
+
+    impl Drop for TypedQueue {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn submit_from(screen: &FakeScreen, queue: &TypedQueue, text: &str) -> Result<Submission> {
+        submit_following(screen, queue, text, None)
+    }
+
+    /// As [`submit_from`], from a drain that passes `followup` as it types into a working pane.
+    fn submit_following(
+        screen: &FakeScreen,
+        queue: &TypedQueue,
+        text: &str,
+        followup: Option<&'static str>,
+    ) -> Result<Submission> {
+        let harness = screen.state().harness;
+        let clock = Clock {
+            queue: Some(queue.0.clone()),
+            followup,
+            ..Clock::default()
+        };
+        submit_verified(
+            screen,
+            "w1:p1",
+            harness,
+            text,
+            SubmitTimeouts::default(),
+            &clock,
+        )
+    }
+
+    /// Everything the fake pane took, in order: submitted, queued and steered prompts.
+    fn taken(screen: &FakeScreen) -> Vec<String> {
+        let state = screen.state();
+        [&state.submitted, &state.queued, &state.steered]
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn a_prompt_claude_or_codex_left_unsent_in_the_composer_is_submitted_by_the_next_one() {
+        let short = format!("{LANE}\nthe gate is green at 87daeb34");
+        // Long enough for Claude Code's `[Pasted text #N +4 lines]` and Codex's `[Pasted Content
+        // N chars]`, so only the placeholder shows.
+        let long = format!("{LANE}\nfirst finding\nsecond finding\nthird finding\nfourth finding");
+        for harness in ["claude", "codex"] {
+            for busy in [false, true] {
+                for lane in [&short, &long] {
+                    let label = format!("{harness} busy={busy} lines={}", lane.lines().count());
+                    let queue = TypedQueue::new(harness);
+                    // The placeholder Claude Code drew when the drain typed it, which it shows
+                    // again for the paste it left unsent.
+                    let drawn_as =
+                        (harness == "claude" && lane == &long).then_some("[Pastedtext#1+4lines]");
+                    queue.quarantined("lane", lane, 1.0, drawn_as);
+                    let screen = FakeScreen::new(harness, busy);
+                    screen.state().codex_collapse_over = Some(60);
+                    screen.leave_draft(lane);
+                    if lane == &long {
+                        let drawn = screen.render();
+                        assert!(drawn.contains("[Pasted "), "{label}: {drawn}");
+                        assert!(!drawn.contains("fourth finding"), "{label}: {drawn}");
+                    }
+                    let owner = format!("{OWNER}\nstatus?");
+                    // Claude Code takes a prompt during a turn only when the drain opted in, as
+                    // a drain typing into a working pane does.
+                    let followup = (harness == "claude").then_some("Enter");
+                    let receipt = receipt(submit_following(&screen, &queue, &owner, followup));
+                    assert_eq!(taken(&screen), [lane.clone(), owner], "{label}");
+                    // One key for the draft and one for the prompt, each the key a prompt typed
+                    // then gets: Codex holds a prompt for a running turn (Tab), and the draft
+                    // started one.
+                    let keys = if harness == "codex" {
+                        [if busy { "Tab" } else { "Enter" }, "Tab"]
+                    } else {
+                        ["Enter", "Enter"]
+                    };
+                    assert_eq!(screen.state().keys, keys, "{label}");
+                    assert_eq!(receipt.key_presses, 1, "{label}");
+                    let record = queue.record("lane");
+                    assert!(
+                        record["draft_recovered_evidence"]
+                            .as_str()
+                            .unwrap()
+                            .contains("typed by agentctl for lane-a"),
+                        "{label}: {record}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_draft_agentctl_did_not_type_is_left_untouched_in_claude_and_codex() {
+        let lane = format!("{LANE}\none\ntwo\nthree\nfour");
+        for harness in ["claude", "codex"] {
+            for draft in [
+                // A person typing, a person's paste of another size, and the text of a prompt
+                // agentctl typed with a person's word added.
+                "half-typed note".to_owned(),
+                "pasted\nlog\nlines\nhere\nand\nmore".to_owned(),
+                format!("{lane} please"),
+            ] {
+                let label = format!("{harness}: {draft:?}");
+                let queue = TypedQueue::new(harness);
+                // Drawn as paste #7 when it was typed; a person's paste now is a later one.
+                queue.quarantined("lane", &lane, 1.0, Some("[Pastedtext#7+4lines]"));
+                let screen = FakeScreen::new(harness, false);
+                screen.state().codex_collapse_over = Some(25);
+                screen.leave_draft(&draft);
+                let reason = refusal(submit_from(&screen, &queue, &format!("{OWNER}\nhi")));
+                assert!(reason.contains("already holds"), "{label}: {reason}");
+                assert!(reason.ends_with("nothing was typed"), "{label}: {reason}");
+                let state = screen.state();
+                assert!(state.keys.is_empty(), "{label}: {:?}", state.keys);
+                assert!(state.pastes.is_empty(), "{label}");
+                assert_eq!(state.composer, draft, "{label}");
+                assert!(queue.record("lane").get("draft_recovered_at").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn a_paste_placeholder_left_in_codex_is_never_pasted_over() {
+        // Drawn faint, as some Codex builds draw it, the placeholder shows no solid text; a paste
+        // joined to it would be submitted with it. Without a queue to vouch for it, it is refused.
+        let screen = FakeScreen::new("codex", false);
+        screen.state().codex_collapse_over = Some(10);
+        screen.leave_draft("someone else's long paste");
+        let reason = refusal(submit(&screen, "hello"));
+        assert!(
+            reason.contains(
+                "composer already holds unsubmitted text \"[Pasted Content 25 chars]\"; refusing"
+            ),
+            "{reason}"
+        );
+        assert!(screen.state().keys.is_empty());
+        assert!(screen.state().pastes.is_empty());
+    }
+
+    #[test]
+    fn the_paste_placeholders_live_harnesses_draw_are_read_as_drafts() {
+        use crate::stale_draft::Draft;
+        // Captured 2026-11-01 from an idle Codex and an idle Claude Code after a bracketed paste
+        // of 1500 characters and of 12 lines; the footers' model and path are rewritten.
+        let codex = "\u{1b}[1m›\u{1b}[0m \u{1b}[38;5;6m[Pasted Content 1500 chars]\u{1b}[39m\n\n  \
+                     model high · ~/project\n";
+        let claude = format!(
+            "{RULE}\n❯\u{a0}[Pasted text #1 +11 lines]\u{1b}[7m \u{1b}[0m\n{RULE}\n  paste again to \
+             expand\n",
+            RULE = "─".repeat(40)
+        );
+        let draft = |harness: &str, screen: &str| {
+            composer_draft(&composer_view(harness, screen).expect("a composer"))
+        };
+        assert_eq!(draft("codex", codex), Some(Draft::Placeholder(1500)));
+        assert_eq!(
+            draft("claude", &claude),
+            Some(Draft::PastedLines("[Pastedtext#1+11lines]".to_owned()))
+        );
+    }
+
+    #[test]
+    fn inputs_codex_moved_back_into_its_composer_on_an_interrupt_are_submitted_together() {
+        let queue = TypedQueue::new("interrupt");
+        let screen = FakeScreen::new("codex", true);
+        let first = format!("{LANE}\nfirst");
+        let second = format!("{OWNER}\nsecond");
+        for (index, (id, text)) in [("first", &first), ("second", &second)]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(receipt(submit_from(&screen, &queue, text)).key, "Tab");
+            queue.typed(id, text, 1.0 + index as f64);
+        }
+        screen.interrupt();
+        assert_eq!(screen.state().composer, format!("{first}\n{second}"));
+        let third = format!("{LANE}\nthird");
+        receipt(submit_from(&screen, &queue, &third));
+        // Submitted together as Codex joined them, and the new prompt held for the turn they
+        // started.
+        assert_eq!(screen.state().submitted, [format!("{first}\n{second}")]);
+        assert_eq!(screen.state().queued, [third]);
+        for id in ["first", "second"] {
+            assert!(queue.record(id)["draft_recovered_at"].is_number(), "{id}");
+        }
+    }
+
+    #[test]
+    fn a_delivered_prompt_a_person_recalled_into_claude_or_codex_is_left_alone() {
+        // Up on an empty composer recalls the newest prompt, which for a managed agent is the
+        // last one agentctl delivered: it is a person's to edit, not a prompt left unsent.
+        let lane = format!("{LANE}\nthe gate is green");
+        for harness in ["claude", "codex"] {
+            let queue = TypedQueue::new("recalled");
+            queue.typed("lane", &lane, 1.0);
+            let screen = FakeScreen::new(harness, false);
+            screen.leave_draft(&lane);
+            let reason = refusal(submit_from(&screen, &queue, &format!("{OWNER}\nhi")));
+            assert!(
+                reason.contains("already holds unsubmitted text"),
+                "{harness}: {reason}"
+            );
+            assert!(screen.state().keys.is_empty(), "{harness}");
+            assert_eq!(screen.state().composer, lane, "{harness}");
+        }
+    }
+
+    #[test]
+    fn a_turn_the_recovered_draft_started_makes_claudes_next_prompt_wait_unless_opted_in() {
+        let lane = format!("{LANE}\nthe gate is green");
+        let queue = TypedQueue::new("opt-in");
+        queue.quarantined("lane", &lane, 1.0, None);
+        let screen = FakeScreen::new("claude", false);
+        screen.leave_draft(&lane);
+        let reason = refusal(submit_from(&screen, &queue, &format!("{OWNER}\nhi")));
+        assert!(
+            reason.contains("it started a turn, so this prompt waits for the agent"),
+            "{reason}"
+        );
+        assert_eq!(screen.state().submitted, [lane]);
+        assert!(
+            screen.state().pastes.is_empty(),
+            "nothing of the new prompt was typed"
+        );
+    }
+
+    #[test]
+    fn a_draft_agentctl_typed_gets_no_key_while_a_dialog_shows_and_at_most_three_otherwise() {
+        let lane = format!("{LANE}\nready");
+        let queue = TypedQueue::new("dialog");
+        queue.quarantined("lane", &lane, 1.0, None);
+        let clock = Clock {
+            queue: Some(queue.0.clone()),
+            ..Clock::default()
+        };
+        // A question in the composer's place: Enter would choose an option.
+        let screen = FakeScreen::new("claude", false);
+        screen.leave_draft(&lane);
+        screen.state().dialog = true;
+        let outcome = recover_typed_draft(&screen, "w1:p1", "claude", &queue.0, &clock);
+        assert!(matches!(outcome, Ok(None)), "{outcome:?}");
+        assert!(screen.state().keys.is_empty());
+        // A harness that never takes the draft: three presses, then a report.
+        screen.state().dialog = false;
+        screen.state().drop_submit_keys = true;
+        let error = recover_typed_draft(&screen, "w1:p1", "claude", &queue.0, &clock).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("still there after 3 Enter key press(es)"),
+            "{error}"
+        );
+        assert_eq!(screen.state().keys, ["Enter", "Enter", "Enter"]);
+        assert_eq!(screen.state().composer, lane);
+        // Through a submission, nothing of the new prompt is typed.
+        screen.state().keys.clear();
+        // Through a submission, nothing of the new prompt is typed, and the refusal still reads
+        // as a draft in the composer, which the chat bridge's stale-composer guard looks for.
+        let reason = refusal(submit_from(&screen, &queue, "next"));
+        assert!(reason.contains("still there after 3 Enter"), "{reason}");
+        assert!(
+            reason.contains("composer already holds unsubmitted text \"[from lane-a"),
+            "{reason}"
+        );
+        assert!(screen.state().pastes.is_empty());
+    }
+
+    /// An extra Enter on an empty composer, idle or mid-turn, submits nothing and draws nothing
+    /// in Claude Code and Codex: the steady state a draft recovery's last press can meet. Both
+    /// harnesses, idle, left the screen byte for byte unchanged after two such presses
+    /// (2026-11-01); the busy case is modelled.
+    #[test]
+    fn an_extra_enter_on_an_empty_claude_or_codex_composer_changes_nothing() {
+        for harness in ["claude", "codex"] {
+            for busy in [false, true] {
+                let screen = FakeScreen::new(harness, busy);
+                receipt(submit(&screen, "status?"));
+                let before = (screen.render(), taken(&screen));
+                screen.send_keys("w1:p1", "Enter").unwrap();
+                assert_eq!(
+                    (screen.render(), taken(&screen)),
+                    before,
+                    "{harness} busy={busy}"
+                );
+            }
+        }
     }
 }

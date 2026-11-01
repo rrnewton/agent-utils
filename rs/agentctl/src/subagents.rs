@@ -2405,9 +2405,14 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         let Some(draft) = draft_on(&screen) else {
             return Ok(None);
         };
-        let found = self
-            .queue
-            .and_then(|queue| crate::stale_draft::find(queue, &draft, SystemTime::now()));
+        let found = self.queue.and_then(|queue| {
+            crate::stale_draft::find(
+                queue,
+                &draft,
+                crate::stale_draft::Vouching::Recent,
+                SystemTime::now(),
+            )
+        });
         let Some(prompt) = found else {
             return Err(AdapterError::unavailable(format!(
                 "pane {pane_id}: the Muse editor {FOREIGN_DRAFT} ({}); a person may be typing \
@@ -4789,7 +4794,25 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
         runtime: &dyn agent::AgentRuntime,
     ) -> crate::error::Result<Option<String>> {
         if !self.uses_muse_composer() {
-            return Ok(None);
+            // Claude Code and Codex: their composer as `submit_verified` reads it.
+            let Some(queue) = self
+                .queue
+                .map(Path::to_path_buf)
+                .or_else(|| runtime.typed_prompts_queue())
+            else {
+                return Ok(None);
+            };
+            if !crate::submission::verified(&self.record.harness) {
+                return Ok(None);
+            }
+            let guarded = self.guarded(runtime)?;
+            return crate::submission::recover_typed_draft(
+                &GuardedPrompt(&guarded),
+                pane_id,
+                &self.record.harness,
+                &queue,
+                runtime,
+            );
         }
         // A draft agentctl did not type is left for the readiness wait to refuse as `staged`,
         // as every edition words it.

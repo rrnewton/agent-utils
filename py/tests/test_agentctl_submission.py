@@ -314,6 +314,21 @@ def test_existing_draft_is_refused_before_typing() -> None:
     assert agent.pastes == [] and agent.keys == []
 
 
+def test_a_faint_paste_placeholder_left_in_codex_is_refused_before_typing() -> None:
+    # Drawn faint, as some Codex builds draw it, the placeholder shows no solid text; a paste
+    # joined to it would be submitted with it.
+    screen = "Codex\n› " + _dim("[Pasted Content 1500 chars]") + "\n\n  GPT default · /tmp/project\n"
+
+    class Placeholder(FakeAgent):
+        def read_screen(self, pane_id: str) -> str:
+            return screen
+
+    agent = Placeholder("codex")
+    with pytest.raises(PromptNotStaged, match=r"unsubmitted text '\[Pasted Content 1500 chars\]'"):
+        _submit(agent, "new prompt")
+    assert agent.pastes == [] and agent.keys == []
+
+
 def test_unrecognised_screen_is_refused_before_typing() -> None:
     agent = FakeAgent("codex")
     agent.dialog = True
