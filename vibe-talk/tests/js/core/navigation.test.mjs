@@ -29,3 +29,39 @@ test("`#624 voice-page-modularity`: the selection starts on no channel, and ever
   assert.throws(() => { "use strict"; snapshot.channelId = "400"; }, TypeError, "a snapshot could be written to");
   assert.equal(navigation.snapshot().channelId, "300");
 });
+
+// --- places and their addresses (`#423 back-key-consistency`, `#462 webapp-deep-links`) ----------
+
+test("`#624 voice-page-modularity`: a place's key ignores where a thread came from, and Settings, the list and a list's thread are over another", () => {
+  const { visitKey, placeIsOver } = NAVIGATION;
+  const place = (fields) => ({ screen: "main", channel: "C1", layout: "one", view: "main", thread: null, origin: null, side: null, ...fields });
+  assert.equal(visitKey(null), "");
+  assert.equal(visitKey(place({ view: "thread", thread: "T1", origin: "list" })), visitKey(place({ view: "thread", thread: "T1", origin: "main" })));
+  assert.equal(visitKey({ screen: "help", channel: "C1", under: place({}), from: "keys", entry: null }), "help:keys:one:main::");
+  assert.equal(placeIsOver(place({})), false);
+  assert.equal(placeIsOver(place({ layout: "list" })), true);
+  assert.equal(placeIsOver(place({ layout: "two", side: null })), false);
+  assert.equal(placeIsOver(place({ layout: "two", side: "T1" })), true);
+  assert.equal(placeIsOver(place({ view: "thread", thread: "T1", origin: "list" })), true);
+  assert.equal(placeIsOver({ screen: "settings", channel: "C1", under: null, from: null, entry: null }), true);
+});
+
+test("`#624 voice-page-modularity`: a place reads back from the query it writes, and a bad escape or an absurd value says nothing", () => {
+  const { deepLinkParams, deepLinkPart, deepLinkQuery, DEEP_LINK_VIEWS } = NAVIGATION;
+  const ref = { provider: "slack", channel: "C 1", message: "M1", thread: "T1" };
+  const query = deepLinkQuery({ screen: "main", channel: "C 1", layout: "one", view: "thread", thread: "T1", origin: null, side: null }, ref);
+  assert.equal(query, "c=C%201&v=thread&t=T1&m=slack%3AC%25201%3AM1%3AT1", "the ref's parts are escaped, then the whole value again");
+  const params = deepLinkParams(`?${query}`);
+  assert.equal(params.get("c"), "C 1");
+  assert.equal(params.get("v"), "thread");
+  assert.ok(DEEP_LINK_VIEWS.includes(params.get("v")));
+  assert.equal(deepLinkQuery({ screen: "main", channel: "C1", layout: "list", view: null, thread: null, origin: null, side: null }, ref), "c=C1&v=threads",
+    "a ref to another channel is not carried");
+  assert.equal(deepLinkQuery({ screen: "main", channel: "C1", layout: "one", view: "flat", thread: null, origin: null, side: null }), "c=C1&v=all");
+  const odd = deepLinkParams("a=%E0%A4%A&b=x+y&c&d=" + "z".repeat(600));
+  assert.equal(odd.has("a"), false);
+  assert.equal(odd.get("b"), "x y");
+  assert.equal(deepLinkPart(odd, "c"), null);
+  assert.equal(deepLinkPart(odd, "d"), null);
+  assert.equal(deepLinkPart(odd, "b"), "x y");
+});

@@ -97,7 +97,7 @@ export {
   viewOfKey,
 } from "../core/channels/index.ts";
 export { anchorOfMessage, createBookmarks, createPins, createReadLedger, isBookmarkState, sameAnchor } from "../core/annotations/index.ts";
-export { createNavigation } from "../core/navigation/index.ts";
+export { DEEP_LINK_VIEWS, createNavigation, deepLinkParams, deepLinkPart, deepLinkQuery, placeIsOver, visitKey } from "../core/navigation/index.ts";
 export {
   DISCORD_POLL_MS,
   LIVE_RETRY_MS,

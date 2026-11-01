@@ -718,7 +718,7 @@ test("`#462 webapp-deep-links`: a link opens its view and thread over the restor
   // The address still names it, so a reload or a copy of the address bar lands there again.
   // Read as the page computes it: this fixture's location does not move when the page
   // replaces the address, as a browser's does, so the written list lags the standing one.
-  assert.match(page.pure("deepLinkQuery(channelPlace(), deepLinkFocus)"), /&m=discord%3A/,
+  assert.match(page.preludeBinding("deepLinkQuery")(page.pure("channelPlace()"), page.pure("deepLinkFocus")), /&m=discord%3A/,
     "the address let go of its message");
   assert.ok(page.pure("deepLinkFocus !== null"), "the focus a link brought was dropped");
 });
@@ -777,7 +777,7 @@ test("`#462 webapp-deep-links`: each view round-trips, voice is refused politely
     await showDiscord(page, data.messages);
     await untilDeepLink(page, () => page.el("thread-select").value === picker);
     assert.equal(page.el("thread-select").value, picker, `v=${said} opened ${page.el("thread-select").value}`);
-    assert.match(page.pure("deepLinkQuery(channelPlace(), deepLinkFocus)"),
+    assert.match(page.preludeBinding("deepLinkQuery")(page.pure("channelPlace()"), page.pure("deepLinkFocus")),
       new RegExp(`(^|&)v=${said}(&|$)`), `the address does not say ${said} back`);
   }
   // A list opens with its cards. (Round-trip back out of it is ↓'s walk in the back tests.)

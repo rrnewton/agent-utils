@@ -1363,11 +1363,11 @@ let visitedAt = -1;
 let placeArriving = false;
 
 /**
- * @typedef {{screen: "main", channel: string, layout: "one" | "list" | "two", view: string | null,
- *   thread: string | null, origin: string | null, side: string | null}} ChannelPlace
- * @typedef {ChannelPlace | {screen: "settings" | "help", channel: string, under: ChannelPlace | null,
- *   from: string | null, entry: string | null}} Place
+ * @typedef {import("./src/core/navigation/index.ts").ChannelPlace} ChannelPlace
+ * @typedef {import("./src/core/navigation/index.ts").Place} Place
  */
+// What tells one place from another (visitKey) and which close onto another (placeIsOver) are in
+// web/src/core/navigation/ (`#624 voice-page-modularity`).
 
 /** The place on the channel now, read in the left column, whose state is the page's; null on the call's view. */
 function channelPlace() {
@@ -1405,13 +1405,6 @@ function currentPlace() {
   };
 }
 
-/** What tells one place from another. A thread's origin says where its own Back goes, not where it is. */
-function visitKey(place) {
-  if (!place) return "";
-  if (place.screen !== "main") return `${place.screen}:${place.from || ""}:${visitKey(place.under)}`;
-  return [place.layout, place.view || "", place.thread || "", place.side || ""].join(":");
-}
-
 /** Note the place the reader is at, as the one after the place they were at, unless it is that place. */
 function notePlace() {
   const place = currentPlace();
@@ -1440,16 +1433,6 @@ function notePlace() {
   visited.push(place);
   if (visited.length > PLACES_KEPT) visited = visited.slice(visited.length - PLACES_KEPT);
   visitedAt = visited.length - 1;
-}
-
-/**
- * Whether `place` is open over another, something Esc closes onto the place under it: Settings, Help, the
- * thread list, a thread opened from it, a thread on the right.
- */
-function placeIsOver(place) {
-  if (place.screen !== "main") return true;
-  return place.layout === "list" || (place.layout === "two" && place.side !== null) ||
-    (place.layout === "one" && place.view === "thread" && place.origin === "list");
 }
 
 /** Whether channel place `place` can be shown now. */
@@ -1609,10 +1592,10 @@ function placeFromKeyboard(step) {
 // landed on by the reply arrow's own walk. `v=voice` is read and refused politely: a link
 // never starts a call. Unknown values are ignored one by one; a link cannot break the open.
 
-/** The views a link may name (`voice` read only to refuse it: a link starts no call). */
-const DEEP_LINK_VIEWS = ["main", "all", "threads", "thread", "columns", "voice"];
 // DEEP_LINK_PART_MAX, the longest query value read from a link, is in web/src/foundation/ with the
-// link ref helpers deepLinkRefFrom, deepLinkRefText and messageLinkRef (`#624 voice-page-modularity`).
+// link ref helpers deepLinkRefFrom, deepLinkRefText and messageLinkRef; the views a link may name
+// (DEEP_LINK_VIEWS), reading a query (deepLinkParams, deepLinkPart) and writing one (deepLinkQuery)
+// are in web/src/core/navigation/ (`#624 voice-page-modularity`).
 /** How long opening from a link waits for sign-in and a first read, in `PULL_WAIT_MS` waits. */
 const DEEP_LINK_WAITS = 600;
 
@@ -1661,32 +1644,6 @@ function deepLinkReaderMoved() {
   return deepLinkStartMoves !== null && deepLinkReaderMoves !== deepLinkStartMoves;
 }
 
-/**
- * The address's query as a name-to-value map, read without `URLSearchParams`: the page runs in
- * hosts without it (its own test fixture is one), and a query this small wants no parser but
- * splitting on its two separators. A value that will not unescape is left out whole.
- */
-function deepLinkParams(search) {
-  const params = new Map();
-  for (const pair of String(search || "").replace(/^\?/, "").split("&")) {
-    if (!pair) continue;
-    const at = pair.indexOf("=");
-    const key = at < 0 ? pair : pair.slice(0, at);
-    try {
-      params.set(decodeURIComponent(key), decodeURIComponent((at < 0 ? "" : pair.slice(at + 1)).replace(/\+/g, " ")));
-    } catch (_error) {
-      // A malformed escape: that pair says nothing.
-    }
-  }
-  return params;
-}
-
-/** One query value from the address, bounded as an id is; null for an absent or absurd one. */
-function deepLinkPart(params, key) {
-  const value = params.get(key);
-  return typeof value === "string" && value !== "" && value.length <= DEEP_LINK_PART_MAX ? value : null;
-}
-
 /** A message's durable identity as a link names it: its service, channel, id, and thread. */
 function deepLinkRefOf(message) {
   const channel = String((message && message.channel_id) || selectedChannelId() || "");
@@ -1731,23 +1688,9 @@ function deepLinkFromAddress() {
   return deepLinkWanted;
 }
 
-/** The query for channel place `place` (and a focused message in it), each value escaped. */
-function deepLinkQuery(place, ref) {
-  const pairs = [["c", place.channel]];
-  if (place.layout === "list") pairs.push(["v", "threads"]);
-  else if (place.layout === "two") {
-    pairs.push(["v", "columns"]);
-    if (place.side) pairs.push(["t", place.side]);
-  } else if (place.view === "thread" && place.thread) {
-    pairs.push(["v", "thread"], ["t", place.thread]);
-  } else if (place.view === "flat") pairs.push(["v", "all"]);
-  else pairs.push(["v", "main"]);
-  if (ref && ref.channel === place.channel) pairs.push(["m", deepLinkRefText(ref)]);
-  return pairs.map(([key, value]) => `${key}=${encodeURIComponent(value)}`).join("&");
-}
-
 /** A whole link to `ref`'s message, opening where it stands: its thread, or Main for a root. */
 function deepLinkFor(ref) {
+  /** @type {ChannelPlace} */
   const place = {
     screen: "main", channel: ref.channel, layout: "one",
     view: ref.thread ? "thread" : "main", thread: ref.thread, origin: null, side: null,
