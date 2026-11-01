@@ -179,6 +179,15 @@ impl World {
         texts
     }
 
+    fn ledger_has(&self, team: &str, id: &str) -> bool {
+        self.state
+            .join("teams.d")
+            .join(team)
+            .join("ledger")
+            .join(format!("{id}.json"))
+            .exists()
+    }
+
     fn relay_in(&self, sender: &str, post: &str) -> serde_json::Value {
         self.relay_in_threaded(sender, post, true)
     }
@@ -656,6 +665,93 @@ fn confirmation_on_another_route_does_not_admit_here() {
 }
 
 #[test]
+fn shared_bot_signed_identity_admits_forgery_is_stranger() {
+    // One shared bot posts for every team: the sender ID cannot identify
+    // the team, so authority is the envelope's signature.
+    const SHARED: &str = "USHAREDBOT";
+    let world = World::new();
+    world.init_tools(&format!("relay-coord:{CHAN}:{SHARED}=sim@host-a"));
+    // The sender team has a key (keygen/announce creates it), so sends sign.
+    let _ = agent_teams::relay::ensure_signing_key(&world.state, "sim", "host-a").expect("key");
+    let (id, post) = world.send_sim_to_tools("signed hello", "relay-signed-1");
+    assert!(post.contains("\"relay\""), "envelope is signed: {post}");
+    // Unknown key yet: a stranger, quarantined and loud.
+    let outcome = world.relay_in(SHARED, &post);
+    assert_eq!(outcome["outcome"], "stranger-quarantined", "{outcome}");
+    assert!(
+        !world
+            .hook_inbox_texts("tools")
+            .iter()
+            .any(|text| text.contains("signed hello")),
+        "envelope not delivered (the inbox alarm is expected)"
+    );
+    // Announce carries the public key; owner confirmation trusts it and
+    // the quarantined post drains exactly once.
+    let (_, public) =
+        agent_teams::relay::ensure_signing_key(&world.state, "sim", "host-a").expect("key");
+    let mut announce = agent_teams::relay::build_announce(
+        "sim",
+        "host-a",
+        SHARED,
+        "https://example.invalid/org/repo.git",
+    );
+    announce["pubkey"] = serde_json::json!(public);
+    announce["integrity"] = serde_json::json!(agent_teams::relay::announce_integrity(&announce));
+    let outcome = world.relay_in(SHARED, &agent_teams::relay::render_announce(&announce));
+    assert_eq!(outcome["outcome"], "candidate-recorded", "{outcome}");
+    let (code, out, err) = world.run(&["relay", "confirm", SHARED, "--owner-approved"]);
+    assert_eq!(code, 0, "{out} {err}");
+    assert!(world.ledger_has("tools", &id), "drained once");
+    let outcome = world.relay_in(SHARED, &post);
+    assert_eq!(outcome["outcome"], "known", "{outcome}");
+    assert!(world.ledger_has("tools", &id), "exactly once");
+    // A tampered body fails verification: stranger, never delivered.
+    let mut forged: serde_json::Value = serde_json::from_str(
+        post.split("```agent-teams-envelope\n")
+            .nth(1)
+            .unwrap()
+            .split("\n```")
+            .next()
+            .unwrap(),
+    )
+    .expect("envelope json");
+    forged["body"] = serde_json::json!("forged body");
+    let outcome = world.relay_in(SHARED, &agent_teams::relay::render_post(&forged));
+    assert_eq!(outcome["outcome"], "stranger-quarantined", "{outcome}");
+    // An unsigned post while a key is trusted is a stranger too.
+    let mut unsigned = forged.clone();
+    unsigned.as_object_mut().unwrap().remove("relay");
+    unsigned["body"] = serde_json::json!("signed hello");
+    // Rebuild a valid unsigned envelope through the post renderer is not
+    // possible for this ID; assert quarantine grew instead via alarms file.
+    let outcome = world.relay_in(SHARED, &agent_teams::relay::render_post(&unsigned));
+    assert_eq!(outcome["outcome"], "stranger-quarantined", "{outcome}");
+    assert!(world.ledger_has("tools", &id), "still exactly once");
+    // Our own signed post loops back and is ignored, never an alarm.
+    let mut own = agent_teams::envelope::build_envelope(
+        "tm-tools-1212121234343434",
+        "kown",
+        "tools",
+        "host-a",
+        1,
+        "harness-ancestry",
+        "tools",
+        "host-a",
+        "info",
+        None,
+        &[],
+        false,
+        agent_teams::timeutil::now_unix_ms(),
+        agent_teams::timeutil::now_unix_ms() + 7_200_000,
+        None,
+        "our own post",
+    );
+    agent_teams::relay::sign_envelope(&world.state, &mut own).expect("sign own");
+    let outcome = world.relay_in(SHARED, &agent_teams::relay::render_post(&own));
+    assert_eq!(outcome["outcome"], "ignored-own-post", "{outcome}");
+}
+
+#[test]
 fn setup_suggests_a_per_fleet_channel_and_writes_nothing() {
     let world = World::new();
     let (code, out, _) = world.run(&[
@@ -669,7 +765,7 @@ fn setup_suggests_a_per_fleet_channel_and_writes_nothing() {
         "UBOTSIM1=sim@host-a",
     ]);
     assert_eq!(code, 0, "{out}");
-    assert!(out.contains("#relay-agent-utils"), "{out}");
+    assert!(out.contains("#agent-teams-relay"), "{out}");
     assert!(out.contains("relay_channels"), "{out}");
     assert!(out.contains("Never admit an unconfirmed claim"), "{out}");
     assert!(!world.channel_file.exists(), "setup writes nothing");

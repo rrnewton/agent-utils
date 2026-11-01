@@ -197,6 +197,244 @@ pub fn build_announce(team: &str, host: &str, sender_id: &str, repo: &str) -> Va
     announce
 }
 
+fn hex_bytes(text: &str) -> Option<Vec<u8>> {
+    if text.len() % 2 != 0 {
+        return None;
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).ok())
+        .collect()
+}
+
+fn bytes_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn key_path(state: &Path, team: &str, host: &str) -> PathBuf {
+    state
+        .join("relay")
+        .join("keys")
+        .join(format!("{team}@{host}.json"))
+}
+
+/// This host's signing key for one local team@host, creating it (mode
+/// 0600, never posted) on first use. Returns `(seed_hex, public_hex)`.
+pub fn ensure_signing_key(state: &Path, team: &str, host: &str) -> DataResult<(String, String)> {
+    let path = key_path(state, team, host);
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        if let Ok(value) = serde_json::from_str::<Value>(&text) {
+            let seed = value["seed"].as_str().unwrap_or("").to_string();
+            let public = value["public"].as_str().unwrap_or("").to_string();
+            if !seed.is_empty() && !public.is_empty() {
+                return Ok((seed, public));
+            }
+        }
+    }
+    let mut seed = [0u8; 32];
+    {
+        use std::io::Read as _;
+        let mut file = std::fs::File::open("/dev/urandom")
+            .map_err(|e| DataError::new("relay-key", e.to_string()))?;
+        file.read_exact(&mut seed)
+            .map_err(|e| DataError::new("relay-key", e.to_string()))?;
+    }
+    let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
+    let public = bytes_hex(signing.verifying_key().as_bytes());
+    let seed_hex = bytes_hex(&seed);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    write_json_atomic(
+        &path,
+        &json!({"team": team, "host": host, "seed": seed_hex, "public": public}),
+    )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok((seed_hex, public))
+}
+
+/// The local public key for a team@host, when a signing key exists.
+pub fn own_public_key(state: &Path, team: &str, host: &str) -> Option<String> {
+    let text = std::fs::read_to_string(key_path(state, team, host)).ok()?;
+    let value: Value = serde_json::from_str(&text).ok()?;
+    value["public"].as_str().map(str::to_string)
+}
+
+fn envelope_material(envelope: &Value) -> String {
+    let get = |path: &[&str]| -> String {
+        let mut value = envelope;
+        for key in path {
+            value = value.get(key).unwrap_or(&Value::Null);
+        }
+        value.as_str().unwrap_or("").to_string()
+    };
+    format!(
+        "{}\n{}@{}\n{}@{}\n{}\n{}\n{}",
+        get(&["id"]),
+        get(&["from", "team"]),
+        get(&["from", "host"]),
+        get(&["to", "team"]),
+        get(&["to", "host"]),
+        get(&["body_sha256"]),
+        get(&["created_at"]),
+        get(&["not_after"]),
+    )
+}
+
+/// Sign one envelope in place with its sender team@host's key.
+pub fn sign_envelope(state: &Path, envelope: &mut Value) -> DataResult<()> {
+    let team = envelope["from"]["team"].as_str().unwrap_or("").to_string();
+    let host = envelope["from"]["host"].as_str().unwrap_or("").to_string();
+    let (seed_hex, public) = ensure_signing_key(state, &team, &host)?;
+    let seed = hex_bytes(&seed_hex)
+        .ok_or_else(|| DataError::new("relay-key", "stored seed is not hex"))?;
+    let seed: [u8; 32] = seed
+        .try_into()
+        .map_err(|_| DataError::new("relay-key", "stored seed has a bad length"))?;
+    let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
+    use ed25519_dalek::Signer as _;
+    let signature = signing.sign(envelope_material(envelope).as_bytes());
+    envelope["relay"] = json!({"pubkey": public, "sig": bytes_hex(&signature.to_bytes())});
+    Ok(())
+}
+
+/// Verify an envelope's signature against its embedded public key.
+pub fn verify_envelope(envelope: &Value) -> bool {
+    let Some(public) = envelope["relay"]["pubkey"].as_str() else {
+        return false;
+    };
+    let Some(sig) = envelope["relay"]["sig"].as_str() else {
+        return false;
+    };
+    let (Some(public), Some(sig)) = (hex_bytes(public), hex_bytes(sig)) else {
+        return false;
+    };
+    let (Ok(public), Ok(sig)) = (
+        <[u8; 32]>::try_from(public.as_slice()),
+        <[u8; 64]>::try_from(sig.as_slice()),
+    ) else {
+        return false;
+    };
+    let Ok(key) = ed25519_dalek::VerifyingKey::from_bytes(&public) else {
+        return false;
+    };
+    let signature = ed25519_dalek::Signature::from_bytes(&sig);
+    use ed25519_dalek::Verifier as _;
+    key.verify(envelope_material(envelope).as_bytes(), &signature)
+        .is_ok()
+}
+
+fn receipt_material(id: &str, state_name: &str, team: &str, host: &str) -> String {
+    format!("{id}\n{state_name}\n{team}@{host}")
+}
+
+/// Sign one receipt in place with the receiving team@host's key.
+pub fn sign_receipt(state: &Path, receipt: &mut Value, team: &str, host: &str) -> DataResult<()> {
+    let (seed_hex, public) = ensure_signing_key(state, team, host)?;
+    let seed = hex_bytes(&seed_hex)
+        .ok_or_else(|| DataError::new("relay-key", "stored seed is not hex"))?;
+    let seed: [u8; 32] = seed
+        .try_into()
+        .map_err(|_| DataError::new("relay-key", "stored seed has a bad length"))?;
+    let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
+    use ed25519_dalek::Signer as _;
+    let signature = signing.sign(
+        receipt_material(
+            receipt["id"].as_str().unwrap_or(""),
+            receipt["state"].as_str().unwrap_or(""),
+            team,
+            host,
+        )
+        .as_bytes(),
+    );
+    receipt["relay"] = json!({"pubkey": public, "sig": bytes_hex(&signature.to_bytes())});
+    Ok(())
+}
+
+/// Verify a receipt's signature against its embedded public key.
+pub fn verify_receipt(receipt: &Value, team: &str, host: &str) -> bool {
+    let (Some(public), Some(sig)) = (
+        receipt["relay"]["pubkey"].as_str(),
+        receipt["relay"]["sig"].as_str(),
+    ) else {
+        return false;
+    };
+    let (Some(public), Some(sig)) = (hex_bytes(public), hex_bytes(sig)) else {
+        return false;
+    };
+    let (Ok(public), Ok(sig)) = (
+        <[u8; 32]>::try_from(public.as_slice()),
+        <[u8; 64]>::try_from(sig.as_slice()),
+    ) else {
+        return false;
+    };
+    let Ok(key) = ed25519_dalek::VerifyingKey::from_bytes(&public) else {
+        return false;
+    };
+    let signature = ed25519_dalek::Signature::from_bytes(&sig);
+    use ed25519_dalek::Verifier as _;
+    key.verify(
+        receipt_material(
+            receipt["id"].as_str().unwrap_or(""),
+            receipt["state"].as_str().unwrap_or(""),
+            team,
+            host,
+        )
+        .as_bytes(),
+        &signature,
+    )
+    .is_ok()
+}
+
+/// The trusted public key for one team@host, confirmed from its announce.
+pub fn trusted_key(state: &Path, team: &str, host: &str) -> Option<String> {
+    let store = load_store(state);
+    store_list(&store, "keys").iter().find_map(|entry| {
+        if entry.get("team").and_then(Value::as_str) == Some(team)
+            && entry.get("host").and_then(Value::as_str) == Some(host)
+        {
+            entry
+                .get("pubkey")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        } else {
+            None
+        }
+    })
+}
+
+/// Record a confirmed public key for one team@host.
+pub fn trust_key(
+    state: &Path,
+    team: &str,
+    host: &str,
+    pubkey: &str,
+    source: &str,
+) -> DataResult<()> {
+    let _lock = lock_store(state)?;
+    let mut store = load_store(state);
+    if store.get("keys").is_none() {
+        store["keys"] = json!([]);
+    }
+    let keys = store
+        .get_mut("keys")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| DataError::new("relay-store", "keys is not a list"))?;
+    keys.retain(|entry| {
+        !(entry.get("team").and_then(Value::as_str) == Some(team)
+            && entry.get("host").and_then(Value::as_str) == Some(host))
+    });
+    keys.push(json!({
+        "team": team, "host": host, "pubkey": pubkey, "source": source,
+        "confirmed_at": format_rfc3339_ms(now_unix_ms()),
+    }));
+    save_store(state, &store)
+}
+
 /// The relay discovery store: candidates learned from announcements and
 /// confirmed sender->team mappings. Confirmed mappings come only from a
 /// trusted-route check or the owner (`relay confirm`); a candidate is never
@@ -273,6 +511,7 @@ pub fn record_candidate(
     let entry = json!({
         "sender_id": sender, "team": team,
         "host": announce.get("host"), "repo_id": announce.get("repo_id"),
+        "pubkey": announce.get("pubkey"),
         "poster": poster, "route": route, "seen_at": format_rfc3339_ms(now_unix_ms()),
     });
     if !candidates.iter().any(|c| {
@@ -398,7 +637,7 @@ pub fn run_post_argv(
 /// The integrity hash of an announcement's canonical fields.
 pub fn announce_integrity(announce: &Value) -> String {
     let material = format!(
-        "{}\n{}\n{}\n{}\n{}",
+        "{}\n{}\n{}\n{}\n{}\n{}",
         announce.get("team").and_then(Value::as_str).unwrap_or(""),
         announce.get("host").and_then(Value::as_str).unwrap_or(""),
         announce
@@ -413,6 +652,7 @@ pub fn announce_integrity(announce: &Value) -> String {
             .get("created_at")
             .and_then(Value::as_str)
             .unwrap_or(""),
+        announce.get("pubkey").and_then(Value::as_str).unwrap_or(""),
     );
     sha256_hex(material.as_bytes())
 }
@@ -621,6 +861,39 @@ pub fn relay_in(
                 .as_str()
                 .unwrap_or("")
                 .to_string();
+            // Signed mode: a trusted key for the addressed team@host
+            // means only that key's signed receipt settles the entry.
+            if let Some(key) = trusted_key(state, &to_fleet, &to_host) {
+                let signed_ok = receipt["relay"]["pubkey"].as_str() == Some(key.as_str())
+                    && verify_receipt(&receipt, &to_fleet, &to_host);
+                if !signed_ok {
+                    log_event(
+                        state,
+                        &json!({"event": "relay-in", "outcome": "receipt-refused", "route": route, "peer_sender": peer_sender, "id": id, "detail": "receipt signature missing or invalid for the confirmed key"}),
+                    );
+                    return Ok(result(
+                        "receipt-refused",
+                        "receipt is not signed by the addressed team's confirmed key",
+                    ));
+                }
+                let current = entry["state"].as_str().unwrap_or("").to_string();
+                if crate::sender::is_terminal(&current) && current != receipt_state {
+                    return Ok(result(
+                        "receipt-ignored-terminal",
+                        format!("outbox already terminal ({current})"),
+                    ));
+                }
+                entry["state"] = json!(crate::sender::map_receiver_state(&receipt_state));
+                let _ = write_json_atomic(&crate::sender::outbox_path(state, &id), &entry);
+                log_event(
+                    state,
+                    &json!({"event": "relay-in", "outcome": "receipt-recorded", "route": route, "id": id, "state": receipt_state}),
+                );
+                return Ok(result(
+                    "receipt-recorded",
+                    format!("signed receipt {receipt_state} for {id}"),
+                ));
+            }
             let poster_ok =
                 confirmed_mapping_for(state, peer_sender, route).is_some_and(|(fleet, host)| {
                     fleet == to_fleet && host.as_deref() == Some(to_host.as_str())
@@ -782,7 +1055,9 @@ fn relay_in_envelope(
         .and_then(Value::as_str)
         .unwrap_or("");
     let receipt_for = |state_name: &str, detail: &str| -> RelayInResult {
-        let receipt = json!({"id": id, "state": state_name, "detail": detail, "at": format_rfc3339_ms(now_unix_ms())});
+        let mut receipt = json!({"id": id, "state": state_name, "detail": detail, "at": format_rfc3339_ms(now_unix_ms())});
+        // Receipts are signed with this (receiving) team@host's key.
+        let _ = sign_receipt(state, &mut receipt, &declaration.team, this_host);
         let mut out = result(state_name, detail.to_string());
         out.receipt_text = Some(render_receipt(envelope, &receipt));
         out
@@ -812,11 +1087,77 @@ fn relay_in_envelope(
             return Ok(post_receipt(state, entry, channel, thread, &id, out));
         }
     }
-    // Admission: the declaration's peer mapping, or a confirmed discovery
-    // mapping, must name this poster for the envelope's sender team
-    // (fleet and, when the mapping names one, host). Anything else
-    // addressed to this team is a STRANGER event: loud, quarantined,
-    // never delivered, never silently dropped.
+    // Signed identity (the default): authority comes from the envelope's
+    // signature by the sender team@host's confirmed key; the poster ID
+    // only gates "a listed relay bot". Our own signed posts are ignored.
+    let embedded_key = envelope["relay"]["pubkey"].as_str();
+    // Our own post loops back only when the sender is the receiving
+    // team itself on this host: another local team's signed post is a
+    // genuine peer delivery, not a loop.
+    if from_team == declaration.team && from_host == this_host {
+        if let Some(own) = own_public_key(state, &from_team, &from_host) {
+            if embedded_key == Some(own.as_str()) && verify_envelope(envelope) {
+                log_event(
+                    state,
+                    &json!({"event": "relay-in", "outcome": "ignored-own-post", "route": route, "id": id}),
+                );
+                return Ok(result("ignored-own-post", "signed by our own key"));
+            }
+        }
+    }
+    let trusted = trusted_key(state, &from_team, &from_host);
+    let signed_mode = trusted.is_some() || embedded_key.is_some();
+    if signed_mode {
+        let admitted_signed = trusted.is_some()
+            && embedded_key == trusted.as_deref()
+            && entry.peers.contains_key(peer_sender)
+            && verify_envelope(envelope);
+        if !admitted_signed {
+            let reason = if trusted.is_none() {
+                "unknown signing key: no confirmed key for the sender team"
+            } else if embedded_key != trusted.as_deref() {
+                "signing key does not match the confirmed key for the sender team"
+            } else if !entry.peers.contains_key(peer_sender) {
+                "poster is not a listed relay bot"
+            } else {
+                "envelope signature does not verify"
+            };
+            record_stranger(
+                state,
+                declaration,
+                entry,
+                peer_sender,
+                envelope,
+                text,
+                reason,
+            )?;
+            let mut out = receipt_for(
+                "quarantined",
+                "stranger: signed identity not confirmed; alarm raised to the coordinator",
+            );
+            out.outcome = "stranger-quarantined".to_string();
+            return Ok(post_receipt(state, entry, channel, thread, &id, out));
+        }
+        // Signed and admitted: fall through to the malformed checks and
+        // the ledger, skipping the weaker sender-mapping admission below.
+        return relay_deliver(
+            state,
+            this_host,
+            route,
+            peer_sender,
+            channel,
+            thread,
+            text,
+            envelope,
+            declaration,
+            entry,
+            &id,
+        );
+    }
+    // Legacy one-bot-per-team mode (weaker, documented): the declaration's
+    // peer mapping, or a confirmed discovery mapping, must name this poster
+    // for the envelope's sender team. Anything else addressed to this team
+    // is a STRANGER event: loud, quarantined, never delivered.
     let mapped = entry
         .peers
         .get(peer_sender)
@@ -861,6 +1202,48 @@ fn relay_in_envelope(
         out.outcome = "stranger-quarantined".to_string();
         return Ok(post_receipt(state, entry, channel, thread, &id, out));
     }
+    relay_deliver(
+        state,
+        this_host,
+        route,
+        peer_sender,
+        channel,
+        thread,
+        text,
+        envelope,
+        declaration,
+        entry,
+        &id,
+    )
+}
+
+/// Deliver one admitted envelope: malformed checks, then the ledger.
+#[allow(clippy::too_many_arguments)]
+fn relay_deliver(
+    state: &Path,
+    this_host: &str,
+    route: &str,
+    peer_sender: &str,
+    channel: &str,
+    thread: &str,
+    text: &str,
+    envelope: &Value,
+    declaration: &Declaration,
+    entry: &crate::model::RelayChannel,
+    id: &str,
+) -> DataResult<RelayInResult> {
+    let from_team = envelope
+        .get("from")
+        .and_then(|f| f.get("team"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let receipt_for = |state_name: &str, detail: &str| -> RelayInResult {
+        let mut receipt = json!({"id": id, "state": state_name, "detail": detail, "at": format_rfc3339_ms(now_unix_ms())});
+        let _ = sign_receipt(state, &mut receipt, &declaration.team, this_host);
+        let mut out = result(state_name, detail.to_string());
+        out.receipt_text = Some(render_receipt(envelope, &receipt));
+        out
+    };
     // Malformed posts from an admitted sender are stranger events too:
     // loud and quarantined, so a broken or forged post is never silent.
     if post_tag_line(text) != team_tag(envelope) {
@@ -875,7 +1258,7 @@ fn relay_in_envelope(
         )?;
         let mut out = receipt_for(NOT_RECORDED, "malformed: tag does not match envelope");
         out.outcome = "stranger-quarantined".to_string();
-        return Ok(post_receipt(state, entry, channel, thread, &id, out));
+        return Ok(post_receipt(state, entry, channel, thread, id, out));
     }
     if let Err(reason) = check_envelope(envelope) {
         record_stranger(
@@ -889,10 +1272,10 @@ fn relay_in_envelope(
         )?;
         let mut out = receipt_for(NOT_RECORDED, &format!("envelope refused: {reason}"));
         out.outcome = "stranger-quarantined".to_string();
-        return Ok(post_receipt(state, entry, channel, thread, &id, out));
+        return Ok(post_receipt(state, entry, channel, thread, id, out));
     }
     let team_dir = state.join("teams.d").join(&declaration.team);
-    let ledger_path = crate::ledger::entry_path(state, &declaration.team, &id);
+    let ledger_path = crate::ledger::entry_path(state, &declaration.team, id);
     let deliverer = deliverer_for(declaration, &team_dir, &ledger_path)?;
     let proof_note =
         format!("asserted by {from_team}'s bridge (sender {peer_sender}) in channel {channel}");
@@ -913,7 +1296,7 @@ fn relay_in_envelope(
         .unwrap_or_else(|| answer.outcome.clone());
     let mut out = receipt_for(&state_name, &answer.detail);
     out.outcome = answer.outcome.clone();
-    Ok(post_receipt(state, entry, channel, thread, &id, out))
+    Ok(post_receipt(state, entry, channel, thread, id, out))
 }
 
 /// Post the receipt in the envelope post's thread when the declaration

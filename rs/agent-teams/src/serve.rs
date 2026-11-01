@@ -127,6 +127,7 @@ pub fn probe(state: &Path, this_host: &str) -> Value {
                     "declaration": path.to_string_lossy(),
                     "deliverer": declaration.deliverer_kind,
                     "relay_peers": relay_peers,
+                    "relay_pubkey": crate::relay::own_public_key(state, team, this_host),
                     "relay_channels": relay_channels,
                     "coordinator_live": live,
                     "coordinator": coordinator.map(|c| json!({

@@ -1286,7 +1286,7 @@ fn cmd_send(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
     } else {
         now_ms + default_ttl * 1000
     };
-    let envelope = build_envelope(
+    let mut envelope = build_envelope(
         &id,
         &key,
         &from_team,
@@ -1304,6 +1304,14 @@ fn cmd_send(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
         flag_value(args, "--in-reply-to").as_deref(),
         &body,
     );
+    // Signed identity is the default once this team@host has a key
+    // (created by `relay keygen` or `relay announce`): envelopes then
+    // carry its signature, and the seed never leaves this host's state.
+    // A team with no key yet sends unsigned under the legacy
+    // one-bot-per-team mapping (the documented weaker mode).
+    if crate::relay::own_public_key(&globals.state, &from_team, &globals.host).is_some() {
+        let _ = crate::relay::sign_envelope(&globals.state, &mut envelope);
+    }
     let proof = json!({
         "sender": sender, "proof": proof_kind, "host": globals.host,
         "pid": std::process::id(), "at": format_rfc3339_ms(now_ms),
@@ -2069,11 +2077,31 @@ fn cmd_relay(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
         Some("ban") => cmd_relay_ban(globals, args),
         Some("unban") => cmd_relay_unban(globals, args),
         Some("alarms") => cmd_relay_alarms(globals, args),
+        Some("keygen") => cmd_relay_keygen(globals, args),
         _ => Err(err(
             "usage",
-            "relay subcommands: setup, status, announce, teams, confirm, ban, unban, alarms",
+            "relay subcommands: setup, status, announce, teams, confirm, ban, unban, alarms, keygen",
         )),
     }
+}
+
+fn cmd_relay_keygen(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
+    let team = flag_value(args, "--team").ok_or_else(|| {
+        err(
+            "usage",
+            "relay keygen needs --team T (the fleet whose key to create)",
+        )
+    })?;
+    let (_, public) = crate::relay::ensure_signing_key(&globals.state, &team, &globals.host)?;
+    println!("{team}@{} public key: {public}", globals.host);
+    println!(
+        "fingerprint: {}",
+        &crate::envelope::sha256_hex(public.as_bytes())[..16]
+    );
+    println!(
+        "the private seed stays in this host's agent-teams state (mode 0600) and is never posted"
+    );
+    Ok(0)
 }
 
 fn relay_route_defs(globals: &Globals) -> Result<Vec<crate::model::RouteDef>, DataError> {
@@ -2089,15 +2117,12 @@ fn relay_route_defs(globals: &Globals) -> Result<Vec<crate::model::RouteDef>, Da
 fn cmd_relay_setup(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
     let provider = flag_value(args, "--provider").unwrap_or_else(|| "generic".to_string());
     let team = flag_value(args, "--team").unwrap_or_else(|| "<your-fleet>".to_string());
-    // One relay channel per fleet is the default layout: #relay-<fleet>,
-    // with only that fleet's teams' bots as members. A channel shared by
-    // several fleets is also supported (leave the fleet scope unset).
-    let channel_name = flag_value(args, "--channel-name").unwrap_or_else(|| {
-        format!(
-            "relay-{}",
-            team.trim_start_matches('<').trim_end_matches('>')
-        )
-    });
+    // One shared relay channel for all fleets is the default layout
+    // (#agent-teams-relay): routing is by signed envelope metadata, not by
+    // channel. A per-fleet channel (#relay-<fleet>) stays an option with
+    // --channel-name relay-<fleet> plus fleet scoping in the declaration.
+    let channel_name =
+        flag_value(args, "--channel-name").unwrap_or_else(|| "agent-teams-relay".to_string());
     let channel = flag_value(args, "--channel").unwrap_or_else(|| "<channel-id>".to_string());
     let route = flag_value(args, "--route").unwrap_or_else(|| "relay-coord".to_string());
     let sender_id =
@@ -2317,12 +2342,16 @@ fn cmd_relay_announce(globals: &Globals, args: &[String]) -> Result<i32, DataErr
             .find(|entry| entry.team.as_deref() == Some(team.as_str()))
             .and_then(|entry| entry.repo_origins.into_iter().next())
     });
-    let announce = crate::relay::build_announce(
+    let mut announce = crate::relay::build_announce(
         &team,
         &globals.host,
         &sender_id,
         repo_url.as_deref().unwrap_or(""),
     );
+    // The announce carries this team@host's public key (never the seed).
+    let (_, public) = crate::relay::ensure_signing_key(&globals.state, &team, &globals.host)?;
+    announce["pubkey"] = json!(public);
+    announce["integrity"] = json!(crate::relay::announce_integrity(&announce));
     let text = crate::relay::render_announce(&announce);
     if has_flag(args, "--print") {
         print!("{text}");
@@ -2430,6 +2459,30 @@ fn cmd_relay_confirm(globals: &Globals, args: &[String]) -> Result<i32, DataErro
                             if let AttemptOutcome::Answered(probe) =
                                 route.run_verb("probe", &json!({}))
                             {
+                                // A key confirmed over a trusted route: the
+                                // host's own probe reports its public key.
+                                let claimed_key = candidate
+                                    .get("pubkey")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("");
+                                let key_match = !claimed_key.is_empty()
+                                    && probe
+                                        .get("teams")
+                                        .and_then(Value::as_array)
+                                        .into_iter()
+                                        .flatten()
+                                        .filter(|t| {
+                                            t.get("team").and_then(Value::as_str)
+                                                == Some(team.as_str())
+                                        })
+                                        .any(|t| {
+                                            t.get("relay_pubkey").and_then(Value::as_str)
+                                                == Some(claimed_key)
+                                        });
+                                if key_match {
+                                    trusted = true;
+                                    break;
+                                }
                                 let mapped = probe
                                     .get("teams")
                                     .and_then(Value::as_array)
@@ -2482,6 +2535,11 @@ fn cmd_relay_confirm(globals: &Globals, args: &[String]) -> Result<i32, DataErro
             "trusted-route",
             candidate.get("route").and_then(Value::as_str),
         )?;
+        if let Some(pubkey) = candidate.get("pubkey").and_then(Value::as_str) {
+            if !pubkey.is_empty() {
+                crate::relay::trust_key(&globals.state, &team, &host, pubkey, "trusted-route")?;
+            }
+        }
         crate::relay::close_alarm(&globals.state, &sender)?;
         let delivered = crate::relay::drain_quarantine(&globals.state, &globals.host)?;
         println!(
@@ -2506,6 +2564,11 @@ fn cmd_relay_confirm(globals: &Globals, args: &[String]) -> Result<i32, DataErro
             "owner",
             candidate.get("route").and_then(Value::as_str),
         )?;
+        if let Some(pubkey) = candidate.get("pubkey").and_then(Value::as_str) {
+            if !pubkey.is_empty() {
+                crate::relay::trust_key(&globals.state, &team, &host, pubkey, "owner")?;
+            }
+        }
         crate::relay::close_alarm(&globals.state, &sender)?;
         let delivered = crate::relay::drain_quarantine(&globals.state, &globals.host)?;
         println!(
