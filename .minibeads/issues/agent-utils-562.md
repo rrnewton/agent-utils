@@ -670,3 +670,16 @@ instructed.
 - The funded audit corners are now closed: journal-slot planning (57a/57b) and resume-state reuse (58) are Rust-owned. Remaining Python-owned by name: non-UTF-8 entry-name glob matching and generic JSON/OS error spellings. Next per the coordinator: M5 (`wrkviz`, then `parallel-experiment-runner`). Default not flipped; nothing published; slot kept.
 
 - Post-slice audit-shard hermeticity fix (main `316772f6`): the coordinator's full `validate --all` on main failed wrkslots shards 1-3 on `test_audit_state_rust.py` differentials. Reproduced under shard load: the Python oracle's settled user-systemd snapshot refuses after three unstable enumerations on a churning shared host (`validation-run evidence is unverifiable`), so validation rows read `BLOCKED`/`unverifiable`, while the Rust single listing still answers `dead`/`DELETABLE`; several tests also assert `DELETABLE`, so the pair can only agree in a calm window. Not a judgment divergence and not from the foreign retirement commits. Fix is test-side: `_check` and the census wall-timeout test retry the pair up to five times with fresh census state; judgment differences survive every retry. The 54-test file passes under shard-3 load, and all four shards pass solo on the final commit.
+
+Soak launcher: WRKSLOTS_ENGINE=rust-soak in common/bin/wrkslots-soak
+accepts the exact Python CLI, translates covered commands to
+wrkslotsd names (status->parse-status, doctor->parse-doctor,
+audit->parse-audit, same-name writers), falls back to Python with a
+stderr note for everything else (including human-format readers and
+flags the Rust command does not accept), and logs every invocation
+(cmd, edition, rc, duration) to WRKSLOTS_SOAK_LOG or
+~/.local/state/wrkslots-soak/soak.log. Wrapper for the harness:
+point worktrees/wrkslots at common/bin/wrkslots with
+WRKSLOTS_ENGINE=rust-soak in the environment; rollback is restoring
+the link. Rust writers still refuse live registries unless
+WRKSLOTSD_FIXTURE_WRITER is lifted for the soak.

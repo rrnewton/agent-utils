@@ -98,7 +98,13 @@ fi
 # Unset or empty keeps the Python primary. The default flips only by changing
 # validation/editions.json, never by this variable becoming common.
 WRKSLOTS_OPTIN=""
+WRKSLOTS_SOAK=""
 if [[ "$TOOL" == "wrkslots" && -n "${WRKSLOTS_ENGINE:-}" ]]; then
+    if [[ "$WRKSLOTS_ENGINE" == "rust-soak" ]]; then
+        # Soak mode (#562): dispatch through the soak launcher, which
+        # accepts the exact Python CLI and logs every invocation.
+        exec "$ROOT/common/bin/wrkslots-soak" "$@"
+    fi
     ENGINE="$WRKSLOTS_ENGINE"
     ENGINE_VAR="WRKSLOTS_ENGINE"
     WRKSLOTS_OPTIN="1"

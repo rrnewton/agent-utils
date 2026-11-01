@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# wrkslots soak dispatcher (#562 rust-primary-wrkslots): invoked by the
+# engine resolver only when WRKSLOTS_ENGINE=rust-soak for the wrkslots
+# tool. Accepts the exact Python CLI. Commands the Rust edition covers
+# run in Rust under their wrkslotsd names; every other command runs the
+# Python edition with a one-line stderr note. Nothing falls back
+# silently, and every invocation is appended to the soak log
+# (WRKSLOTS_SOAK_LOG, default ~/.local/state/wrkslots-soak/soak.log).
+# Note: the Rust writers refuse live registries unless
+# WRKSLOTSD_FIXTURE_WRITER=1 is set for the soak; a Rust refusal is
+# final (logged edition=rust), never a silent Python rerun.
+set -u
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+ROOT="$(cd "$(dirname "$SELF")/../.." && pwd)"
+SOAK_LOG="${WRKSLOTS_SOAK_LOG:-$HOME/.local/state/wrkslots-soak/soak.log}"
+
+log_invocation() {
+    local cmd="$1" edition="$2" rc="$3" duration="$4"
+    mkdir -p "$(dirname "$SOAK_LOG")" 2>/dev/null || return 0
+    local safe_cmd
+    safe_cmd="$(printf '%s' "$cmd" | tr -c 'a-zA-Z0-9-' '?')"
+    { printf '%s cmd=%s edition=%s rc=%s duration_s=%s\n' \
+        "$(date -Iseconds)" "$safe_cmd" "$edition" "$rc" "$duration" >>"$SOAK_LOG"; } 2>/dev/null || true
+}
+
+run_python() {
+    local cmd="$1"; shift || true
+    local start=$SECONDS
+    echo "[wrkslots] $cmd: python (not yet in Rust)" >&2
+    "${CI_HUB_PYTHON:-python3}" "$ROOT/py/bin/wrkslots" "$@"
+    local rc=$?
+    log_invocation "$cmd" python "$rc" "$((SECONDS - start))"
+    exit "$rc"
+}
+
+ORIGINAL=("$@")
+
+# Split the Python CLI's leading global options from the subcommand.
+PROJECT_ROOT=""
+MACHINE=""
+ARGS=("$@")
+while [[ ${#ARGS[@]} -gt 0 ]]; do
+    case "${ARGS[0]}" in
+        --project-root) PROJECT_ROOT="${ARGS[1]:-}"; ARGS=("${ARGS[@]:2}") ;;
+        --project-root=*) PROJECT_ROOT="${ARGS[0]#*=}"; ARGS=("${ARGS[@]:1}") ;;
+        --machine) MACHINE="${ARGS[1]:-}"; ARGS=("${ARGS[@]:2}") ;;
+        --machine=*) MACHINE="${ARGS[0]#*=}"; ARGS=("${ARGS[@]:1}") ;;
+        --wait-lock|--wait-lock=*|--allow-existing-unregistered-worktrees|--version|--userguide)
+            run_python "${ARGS[0]%%=*}" "${ORIGINAL[@]}" ;;
+        *) break ;;
+    esac
+done
+
+if [[ ${#ARGS[@]} -eq 0 ]]; then
+    run_python "(none)" "${ORIGINAL[@]}"
+fi
+
+CMD="${ARGS[0]}"
+REST=("${ARGS[@]:1}")
+
+# Python command -> wrkslotsd command. Anything unlisted stays Python.
+RUST_CMD=""
+case "$CMD" in
+    status) RUST_CMD="parse-status" ;;
+    doctor) RUST_CMD="parse-doctor" ;;
+    audit) RUST_CMD="parse-audit" ;;
+    unpushed|create|adopt|heartbeat|release|hold|unhold|finish|remove|write-handoff|read-handoff|transfer-owner|recover-unbound-owner|recover-absent-agent-row|recover-absent-agent-rows|recover-absent-validate-rows|recover-ownerless-agent-worktree|recover-ownerless-agent-clone|recover-ownerless-agent-cache|classify-ownerless-validate-batch|recover-ownerless-validate-batch|recover)
+        RUST_CMD="$CMD" ;;
+    *) run_python "$CMD" "${ORIGINAL[@]}" ;;
+esac
+
+# Commands whose Python form takes --format (default human) run in
+# Rust only for an explicit `--format json`, with the pair stripped:
+# the Rust editions print JSON only. A human or invalid value, and a
+# missing --format, stays with Python, noted like any fallback.
+FORMAT_COMMANDS=" status doctor audit create unpushed recover-absent-validate-rows recover-absent-agent-rows classify-ownerless-validate-batch recover-ownerless-validate-batch "
+case "$FORMAT_COMMANDS" in
+    *" $CMD "*)
+        HAS_JSON=0
+        FILTERED=()
+        INDEX=0
+        while [[ $INDEX -lt ${#REST[@]} ]]; do
+            ARG="${REST[$INDEX]}"
+            case "$ARG" in
+                --format)
+                    NEXT="${REST[$((INDEX + 1))]:-}"
+                    if [[ "$NEXT" == "json" ]]; then
+                        HAS_JSON=1
+                        INDEX=$((INDEX + 2))
+                    else
+                        run_python "$CMD" "${ORIGINAL[@]}"
+                    fi
+                    ;;
+                --format=json) HAS_JSON=1; INDEX=$((INDEX + 1)) ;;
+                --format=*) run_python "$CMD" "${ORIGINAL[@]}" ;;
+                *) FILTERED+=("$ARG"); INDEX=$((INDEX + 1)) ;;
+            esac
+        done
+        if [[ $HAS_JSON -eq 0 ]]; then
+            run_python "$CMD" "${ORIGINAL[@]}"
+        fi
+        REST=("${FILTERED[@]}")
+        ;;
+esac
+
+# Refuse (to Python) anything the Rust command does not accept: compare
+# the caller's flags with the Rust command's own --help.
+HELP_TEXT="$("$ROOT/rs/bin/wrkslotsd" "$RUST_CMD" --help 2>/dev/null)" || run_python "$CMD" "${ORIGINAL[@]}"
+for arg in "${REST[@]}"; do
+    case "$arg" in
+        --*)
+            FLAG="${arg%%=*}"
+            if ! grep -Eq "(^|[[:space:]])$FLAG([[:space:]=]|$)" <<<"$HELP_TEXT"; then
+                run_python "$CMD" "${ORIGINAL[@]}"
+            fi
+            ;;
+    esac
+done
+
+# Move the globals the Rust commands accept per-command.
+if [[ -n "$PROJECT_ROOT" ]]; then
+    if grep -q -- "--root" <<<"$HELP_TEXT"; then
+        REST+=("--root" "$PROJECT_ROOT")
+    else
+        run_python "$CMD" "${ORIGINAL[@]}"
+    fi
+fi
+if [[ -n "$MACHINE" ]]; then
+    if grep -q -- "--machine" <<<"$HELP_TEXT"; then
+        REST+=("--machine" "$MACHINE")
+    else
+        run_python "$CMD" "${ORIGINAL[@]}"
+    fi
+fi
+
+echo "[wrkslots] $CMD: rust (soak)" >&2
+START=$SECONDS
+"$ROOT/rs/bin/wrkslotsd" "$RUST_CMD" "${REST[@]}"
+RC=$?
+log_invocation "$CMD" rust "$RC" "$((SECONDS - START))"
+exit "$RC"

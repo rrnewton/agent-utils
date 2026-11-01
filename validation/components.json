@@ -348,6 +348,7 @@
       ],
       "reverse_dependencies": [],
       "test_files": [
+        "py/tests/test_wrkslots_soak.py",
         "py/tests/test_wrkslots_state_schema.py",
         "py/tests/test_wrkslotsd_source_contract.py",
         "py/wrkslots/tests/test_active_state_rust.py",
