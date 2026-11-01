@@ -26,3 +26,13 @@ test("`#624 voice-page-modularity`: the reader's writes run one after another, a
   assert.equal(await third, 3, "a failure stopped the task after it");
   assert.deepStrictEqual(order, ["first", "second", "third"]);
 });
+
+test("`#624 voice-page-modularity`: the links a message's text holds as written, from the module alone", () => {
+  const { linksIn, trimAddress } = GLYPHS;
+  assert.deepStrictEqual(linksIn("see [the log](https://ci.example/run/1) and <https://a.example|A> or https://b.example/x."),
+    [{ href: "https://ci.example/run/1", name: "the log" }, { href: "https://a.example", name: "A" }, { href: "https://b.example/x", name: "https://b.example/x" }]);
+  assert.deepStrictEqual(linksIn("xhttps://not.a.link [no](ftp://x) [](https://e.example)"),
+    [{ href: "https://e.example", name: "https://e.example" }]);
+  assert.equal(trimAddress("https://en.wikipedia.org/wiki/Mercury_(planet))."), "https://en.wikipedia.org/wiki/Mercury_(planet)");
+  assert.deepStrictEqual(linksIn(null), []);
+});

@@ -9,3 +9,20 @@ export { DEEP_LINK_PART_MAX, deepLinkRefFrom, deepLinkRefText, messageLinkRef } 
 export type { DeepLinkRef, MessageLinkRef } from "./refs.ts";
 export { createSerialQueue } from "./queue.ts";
 export type { SerialQueue } from "./queue.ts";
+export {
+  ANGLE_LINK,
+  BARE_ADDRESS,
+  HTTP_ADDRESS,
+  HTTP_ADDRESS_AT,
+  LINK_NAME_MAX,
+  LINK_TARGET_MAX,
+  TRAILING,
+  WORD_BEFORE,
+  addressStartsAt,
+  angleLinkAt,
+  bareLinkAt,
+  linksIn,
+  markdownLinkAt,
+  trimAddress,
+} from "./addresses.ts";
+export type { FoundLink } from "./addresses.ts";

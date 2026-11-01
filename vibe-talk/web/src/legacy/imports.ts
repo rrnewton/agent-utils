@@ -184,6 +184,7 @@ export {
 } from "../view/composer/index.ts";
 export {
   DEEP_LINK_PART_MAX,
+  HTTP_ADDRESS,
   SPACE_EM,
   WIDE_SCRIPT,
   createSerialQueue,
@@ -191,6 +192,7 @@ export {
   deepLinkRefText,
   glyphEm,
   linkKind,
+  linksIn,
   messageLinkRef,
   monoEm,
   sentenceStart,

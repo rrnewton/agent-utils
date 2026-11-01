@@ -313,3 +313,5 @@ declare const mainRunsAmong: LegacyImports["mainRunsAmong"];
 declare const markCardLayout: LegacyImports["markCardLayout"];
 declare const rowSeen: LegacyImports["rowSeen"];
 declare const threadCardId: LegacyImports["threadCardId"];
+declare const HTTP_ADDRESS: LegacyImports["HTTP_ADDRESS"];
+declare const linksIn: LegacyImports["linksIn"];
