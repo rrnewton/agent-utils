@@ -39,6 +39,7 @@ ORIGINAL=("$@")
 # Split the Python CLI's leading global options from the subcommand.
 PROJECT_ROOT=""
 MACHINE=""
+WAIT_LOCK=""
 ARGS=("$@")
 while [[ ${#ARGS[@]} -gt 0 ]]; do
     case "${ARGS[0]}" in
@@ -46,8 +47,10 @@ while [[ ${#ARGS[@]} -gt 0 ]]; do
         --project-root=*) PROJECT_ROOT="${ARGS[0]#*=}"; ARGS=("${ARGS[@]:1}") ;;
         --machine) MACHINE="${ARGS[1]:-}"; ARGS=("${ARGS[@]:2}") ;;
         --machine=*) MACHINE="${ARGS[0]#*=}"; ARGS=("${ARGS[@]:1}") ;;
-        --wait-lock|--wait-lock=*|--allow-existing-unregistered-worktrees|--version|--userguide)
-            run_python "${ARGS[0]%%=*}" "${ORIGINAL[@]}" ;;
+        --wait-lock) WAIT_LOCK="${ARGS[1]:-}"; ARGS=("${ARGS[@]:2}") ;;
+        --wait-lock=*) WAIT_LOCK="${ARGS[0]#*=}"; ARGS=("${ARGS[@]:1}") ;;
+        --allow-existing-unregistered-worktrees|--version|--userguide)
+            run_python "${ARGS[0]}" "${ORIGINAL[@]}" ;;
         *) break ;;
     esac
 done
@@ -135,6 +138,9 @@ if [[ -n "$MACHINE" ]]; then
 fi
 
 echo "[wrkslots] $CMD: rust (soak)" >&2
+if [[ -n "$WAIT_LOCK" ]]; then
+    export WRKSLOTS_WAIT_LOCK="$WAIT_LOCK"
+fi
 START=$SECONDS
 "$ROOT/rs/bin/wrkslotsd" "$RUST_CMD" "${REST[@]}"
 RC=$?

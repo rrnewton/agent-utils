@@ -139,3 +139,14 @@ def test_abbreviated_flag_falls_back_to_python(tmp_path: Path) -> None:
     root, log = _sandbox(tmp_path)
     result = _run(root, log, "heartbeat", "slot1", "--agen", "a")
     assert result.stdout.startswith("PY wrkslots heartbeat")
+
+
+def test_wait_lock_reaches_the_rust_path(tmp_path: Path) -> None:
+    root, log = _sandbox(tmp_path)
+    result = _run(
+        root, log, "--wait-lock", "5", "heartbeat", "slot1",
+        "--agent", "a", "--owner-pid", "1", "--expected-generation", "2",
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("RS heartbeat-run")
+    assert "cmd=heartbeat edition=rust" in log.read_text()

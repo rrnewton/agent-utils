@@ -683,3 +683,11 @@ point worktrees/wrkslots at common/bin/wrkslots with
 WRKSLOTS_ENGINE=rust-soak in the environment; rollback is restoring
 the link. Rust writers still refuse live registries unless
 WRKSLOTSD_FIXTURE_WRITER is lifted for the soak.
+
+Soak slice (wait-lock): --wait-lock now reaches the Rust path. The
+soak launcher strips the global and exports WRKSLOTS_WAIT_LOCK;
+wrkslotsd's two flock helpers retry until that deadline instead of
+refusing busy immediately. Direct wrkslotsd use without the
+variable keeps the non-blocking behaviour. Soak log so far:
+heartbeat rust rc=0; status and --wait-lock python (status human
+form is the next slice).

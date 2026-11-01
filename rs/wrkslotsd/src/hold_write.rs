@@ -167,7 +167,8 @@ pub(crate) fn acquire_config_lock(cfg: &Cfg) -> Result<ConfigLock> {
             cfg.root.display()
         )
     })?;
-    match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+    let deadline = std::time::Instant::now() + crate::ensure_states::lock_wait();
+    match crate::ensure_states::flock_wait(&file, deadline) {
         Ok(()) => Ok(ConfigLock { _file: file }),
         Err(_) => Err(format!(
             "configuration lock is busy for {}; retry after the other wrkslots mutation exits",

@@ -29,6 +29,37 @@ use crate::hold_state::parse_hold;
 
 type Result<T> = std::result::Result<T, String>;
 
+/// How long lock acquisition may wait, from `WRKSLOTS_WAIT_LOCK`
+/// (seconds; unset or invalid means do not wait). The soak launcher
+/// sets this from the Python CLI's `--wait-lock`; direct wrkslotsd
+/// use keeps the non-blocking behaviour.
+pub(crate) fn lock_wait() -> std::time::Duration {
+    std::env::var("WRKSLOTS_WAIT_LOCK")
+        .ok()
+        .and_then(|text| text.parse::<f64>().ok())
+        .filter(|seconds| *seconds > 0.0)
+        .map(std::time::Duration::from_secs_f64)
+        .unwrap_or_default()
+}
+
+/// Try a non-blocking flock until `deadline`, then report busy.
+pub(crate) fn flock_wait(
+    file: &std::fs::File,
+    deadline: std::time::Instant,
+) -> std::result::Result<(), rustix::io::Errno> {
+    loop {
+        match rustix::fs::flock(file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(error);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    }
+}
+
 pub(crate) struct Flock {
     _file: std::fs::File,
 }
@@ -60,7 +91,8 @@ pub(crate) fn acquire_lock(path: &Path, subject: &Path) -> Result<Flock> {
             path.display()
         ));
     }
-    match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+    let deadline = std::time::Instant::now() + lock_wait();
+    match flock_wait(&file, deadline) {
         Ok(()) => Ok(Flock { _file: file }),
         Err(_) => Err(format!(
             "state lock is busy for {}; retry after the current command exits",
@@ -554,4 +586,43 @@ pub(crate) fn ensure_states_locked(
     let (active, _) = parse_state_ordered(root, Some(selected))?;
     let archive = parse_archive(root, Some(selected))?;
     Ok(json!({"machine": selected, "active": active, "archive": archive}))
+}
+
+#[cfg(test)]
+mod lock_wait_tests {
+    use super::*;
+
+    #[test]
+    fn flock_wait_waits_for_the_holder() {
+        let dir = std::env::temp_dir().join(format!("wrkslots-lock-wait-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lock");
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
+        rustix::fs::flock(&holder, rustix::fs::FlockOperation::LockExclusive).unwrap();
+        let started = std::time::Instant::now();
+        let waiter_path = path.clone();
+        let waiter = std::thread::spawn(move || {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(waiter_path)
+                .unwrap();
+            flock_wait(
+                &file,
+                std::time::Instant::now() + std::time::Duration::from_secs(5),
+            )
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        drop(holder);
+        let result = waiter.join().unwrap();
+        assert!(result.is_ok());
+        assert!(started.elapsed() >= std::time::Duration::from_millis(250));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
