@@ -7487,51 +7487,88 @@ fn run_export(args: &[String]) -> u8 {
     let mut command: Vec<String> = vec!["wrkviz".to_string(), "export".to_string()];
     command.extend(args.iter().cloned());
 
-    if team_slugs.len() != 1 {
-        let error = "the Rust edition has not ported multi-team export ('build_combined_archive') yet; the Python edition remains the oracle for it".to_string();
-        eprintln!("wrkviz: {error}");
-        return 2;
-    }
+    let selection =
+        (|| -> Result<(Option<crate::window::DateWindow>, Vec<String>, String), String> {
+            let mut zones = std::collections::BTreeSet::new();
+            for slug in &team_slugs {
+                zones.insert(crate::pipeline::load_archived_team(&archive, slug)?.display_timezone);
+            }
+            let timezone_name = match get("--timezone") {
+                Some(name) => name,
+                None => {
+                    if zones.len() != 1 {
+                        return Err(
+                        "teams use different display timezones; pass --timezone for one shared axis"
+                            .to_string(),
+                    );
+                    }
+                    zones.into_iter().next().unwrap_or_default()
+                }
+            };
+            let window = crate::window::parse_date_window(
+                get("--start-date").as_deref(),
+                get("--end-date").as_deref(),
+                &timezone_name,
+                get("--start-time").as_deref(),
+                get("--end-time").as_deref(),
+            )?;
+            let kinds = if rollup_kinds.is_empty() {
+                ["daily", "weekly", "monthly", "quarterly"]
+                    .iter()
+                    .map(|item| item.to_string())
+                    .collect()
+            } else {
+                rollup_kinds.clone()
+            };
+            Ok((window, kinds, timezone_name))
+        })();
 
-    let selection = (|| -> Result<(Option<crate::window::DateWindow>, Vec<String>), String> {
-        let team = crate::pipeline::load_archived_team(&archive, &team_slug)?;
-        let timezone_name = match get("--timezone") {
-            Some(name) => name,
-            None => team.display_timezone.clone(),
-        };
-        let window = crate::window::parse_date_window(
-            get("--start-date").as_deref(),
-            get("--end-date").as_deref(),
-            &timezone_name,
-            get("--start-time").as_deref(),
-            get("--end-time").as_deref(),
-        )?;
-        let kinds = if rollup_kinds.is_empty() {
-            ["daily", "weekly", "monthly", "quarterly"]
-                .iter()
-                .map(|item| item.to_string())
-                .collect()
+    let outcome = selection.and_then(|(window, kinds, timezone_name)| {
+        if team_slugs.len() == 1 {
+            crate::build_pipeline::build_archive(
+                &archive,
+                &team_slug,
+                phase_minutes,
+                window.as_ref(),
+                &kinds,
+                Some(&target),
+                true,
+                true,
+            )
+            .map(|report| {
+                (
+                    report.to_json_obj(),
+                    1,
+                    report.agents,
+                    report.phases,
+                    report.rollups,
+                    report.files_changed,
+                )
+            })
         } else {
-            rollup_kinds.clone()
-        };
-        Ok((window, kinds))
-    })();
-
-    let outcome = selection.and_then(|(window, kinds)| {
-        crate::build_pipeline::build_archive(
-            &archive,
-            &team_slug,
-            phase_minutes,
-            window.as_ref(),
-            &kinds,
-            Some(&target),
-            true,
-            true,
-        )
+            crate::multi_team::build_combined_archive(
+                &archive,
+                &team_slugs,
+                &target,
+                &timezone_name,
+                phase_minutes,
+                window.as_ref(),
+                &kinds,
+            )
+            .map(|report| {
+                (
+                    report.to_json_obj(),
+                    report.teams,
+                    report.agents,
+                    report.phases,
+                    report.rollups,
+                    report.files_changed,
+                )
+            })
+        }
     });
     match outcome {
-        Ok(report) => {
-            let build_json = report.to_json_obj();
+        Ok((build_json, team_count, agents, phases, rollups, files_changed)) => {
             let mechanical = {
                 let mut website = serde_json::Map::new();
                 website.insert("schema_version".into(), 1.into());
@@ -7543,8 +7580,7 @@ fn run_export(args: &[String]) -> u8 {
                 serde_json::Value::Object(outer)
             };
             println!(
-                "export: 1 team(s), {} tracks, {} phases, {} rollups; {} files changed",
-                report.agents, report.phases, report.rollups, report.files_changed
+                "export: {team_count} team(s), {agents} tracks, {phases} phases, {rollups} rollups; {files_changed} files changed"
             );
             match crate::pipeline::record_run_build(
                 &target,
@@ -7572,6 +7608,16 @@ fn run_export(args: &[String]) -> u8 {
             }
         }
         Err(error) => {
+            let mechanical = {
+                let mut website = serde_json::Map::new();
+                website.insert("schema_version".into(), 1.into());
+                website.insert("model_calls".into(), 0.into());
+                website.insert("model_tokens".into(), 0.into());
+                website.insert("website_build_performed".into(), false.into());
+                let mut outer = serde_json::Map::new();
+                outer.insert("website_export".into(), serde_json::Value::Object(website));
+                serde_json::Value::Object(outer)
+            };
             if let Ok(run_path) = crate::pipeline::record_run_build(
                 &target,
                 &crate::pipeline::RunReceipt {
@@ -7581,7 +7627,7 @@ fn run_export(args: &[String]) -> u8 {
                     team_slug: &team_slug,
                     error: Some(&error),
                     team_slugs: &team_slugs,
-                    mechanical: None,
+                    mechanical: Some(mechanical),
                     ingest: None,
                 },
                 None,

@@ -56,6 +56,8 @@ pub mod json;
 /// Read-only losslessness audit of vendor snapshots against the
 /// archive.
 pub mod losslessness;
+/// Combined multi-team export composition.
+pub mod multi_team;
 /// Muse session lineage ingestion.
 pub mod muse;
 /// Hindsight agent naming.

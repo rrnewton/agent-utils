@@ -427,5 +427,40 @@ generated-schema collapse.
   parse error in the oracle but prints the guide in Rust;
   a well-formed subcommand is only parsed, never run, by
   both editions.
-- Remaining composite: multi-team export; then the edition
-  switch at parity and the generated-schema collapse.
+- Multi-team export ported: `rs/wrkviz/src/multi_team.rs`
+  composes independently summarized team sites into one
+  deterministic, zero-token archive (`build_combined_archive`):
+  per-team render through the existing locked builder,
+  `slug::` namespacing of agent/phase/edge/detail identities
+  with `artifact-<slug>-`/`term-<slug>-` remapping, one merged
+  schema-1 timeline and artifact catalog written gzip-only,
+  per-team search records on the shared window, schema-3
+  shards, and manifest-driven retirement of files from
+  earlier team sets. The combined branch replaces the
+  refusal in `run_export`; timezone selection now loads every
+  named team and refuses a mixed-axis set without
+  `--timezone`, as the oracle does. Differential:
+  `py/tests/test_wrkviz_export_multi_rust.py` (4 cases:
+  two-team export with idempotent rerun and a windowed
+  slice, team-set change retiring the dropped team,
+  three-team export in scrambled argument order, and the
+  duplicate/missing-team errors), stdout/stderr/exit and
+  full output+archive trees compared; all passing.
+  Adversarial review findings fixed before landing:
+  absolute or trailing-`/.` detail paths are refused
+  rather than joined outside the rendered tree; lock
+  aliases resolve with lexical `..` normalization so an
+  aliased output cannot self-deadlock; empty-string
+  optional IDs (`parent_id`, `producer_thread_id`,
+  `turn_id`) null out under CPython truthiness; a failed
+  export records `website_build_performed: false` in its
+  run metadata (the error differential now compares
+  target trees too); a prior manifest's `1.0`/`true`
+  schema version and trailing-slash generated paths
+  validate as the oracle's equality and PurePosixPath
+  normalization accept them (a fifth differential case
+  pins both). Accepted gaps, shared with the earlier
+  wrkviz slices: non-finite and oversized-integer JSON
+  values, codec/repr wording on corrupt inputs.
+- Remaining: the wrkviz edition switch at parity, then the
+  generated-schema collapse and parallel-experiment-runner.

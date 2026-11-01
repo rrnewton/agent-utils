@@ -916,7 +916,9 @@ fn schema_2_presentation_files(archive: &Path) -> BTreeSet<String> {
     found
 }
 
-fn retired_generation_files(archive: &Path, current: &BTreeSet<String>) -> BTreeSet<String> {
+/// Files from retired site generations that exist on disk but
+/// are not part of the current generation.
+pub fn retired_generation_files(archive: &Path, current: &BTreeSet<String>) -> BTreeSet<String> {
     let mut retired = BTreeSet::new();
     for relative in [SCHEMA_1_TIMELINE_PATH, "data/timeline.json.gz"] {
         if current.contains(relative) {
@@ -940,7 +942,9 @@ fn retired_generation_files(archive: &Path, current: &BTreeSet<String>) -> BTree
     retired
 }
 
-fn prune_retired_query_artifacts(archive: &Path, manifest_owned: bool) -> Result<i64, String> {
+/// Remove the retired standalone query launcher and its
+/// bytecode when the export manifest owned them.
+pub fn prune_retired_query_artifacts(archive: &Path, manifest_owned: bool) -> Result<i64, String> {
     let launcher = archive.join("query.py");
     let mut recognized = manifest_owned;
     let mut changed = 0i64;
