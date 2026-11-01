@@ -114,8 +114,19 @@ fn fenced_block(text: &str, fence: &str) -> Option<String> {
 /// body containing a literal `&lt;` would fail its hash — and the
 /// provider-escaped form is the fallback for providers that escape.
 pub fn parse_post(text: &str) -> Result<RelayPost, String> {
-    parse_post_clean(&strip_provider_notes(text))
-        .or_else(|_| parse_post_clean(&strip_provider_notes(&unescape_provider_text(text))))
+    let raw = parse_post_clean(&strip_provider_notes(text));
+    match raw {
+        // An envelope whose body hash fails raw was probably escaped by
+        // the provider; the escaped form is authoritative in that case.
+        Ok(RelayPost::Envelope(ref envelope)) if check_envelope(envelope).is_err() => {
+            match parse_post_clean(&strip_provider_notes(&unescape_provider_text(text))) {
+                Ok(unescaped) => Ok(unescaped),
+                Err(_) => raw,
+            }
+        }
+        other => other
+            .or_else(|_| parse_post_clean(&strip_provider_notes(&unescape_provider_text(text)))),
+    }
 }
 
 fn parse_post_clean(clean: &str) -> Result<RelayPost, String> {
