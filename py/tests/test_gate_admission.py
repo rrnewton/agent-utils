@@ -32,7 +32,7 @@ def _wait_for_runs(tmp_path: Path, count: int) -> None:
 
 
 def test_shared_gates_run_up_to_the_cap_and_queue_the_rest(tmp_path: Path) -> None:
-    sleepers = [_start(tmp_path, "--", PY, "-c", "import time; time.sleep(4)") for _ in range(3)]
+    sleepers = [_start(tmp_path, "--slots", "3", "--", PY, "-c", "import time; time.sleep(4)") for _ in range(3)]
     _wait_for_runs(tmp_path, 3)
     fourth = _start(tmp_path, "--", PY, "-c", "pass")
     out, _ = fourth.communicate(timeout=30)
@@ -43,7 +43,7 @@ def test_shared_gates_run_up_to_the_cap_and_queue_the_rest(tmp_path: Path) -> No
 
 
 def test_an_exclusive_run_waits_for_an_empty_box_and_blocks_new_gates(tmp_path: Path) -> None:
-    holder = _start(tmp_path, "--", PY, "-c", "import time; time.sleep(4)")
+    holder = _start(tmp_path, "--slots", "3", "--", PY, "-c", "import time; time.sleep(4)")
     _wait_for_runs(tmp_path, 1)
     exclusive = _start(tmp_path, "--exclusive", "--", PY, "-c", "pass")
     shared = _start(tmp_path, "--", PY, "-c", "pass")

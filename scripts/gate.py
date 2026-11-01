@@ -6,7 +6,7 @@ Drop-in replacement for the one-gate-at-a-time flock line:
     scripts/gate --base origin/main --keep-going
     scripts/gate --exclusive -- python3 vibe-talk/tests/read_aloud_blocks_browser.py
 
-Shared gates run up to --slots (default 3) concurrently; each gate is already
+Shared gates run up to --slots (default 2) concurrently; each gate is already
 boxed by the validation scheduler's own resource caps, so concurrency here is
 admission, not scheduling. An --exclusive run waits until nothing else is
 running and blocks new admissions until it finishes, so load-sensitive steps
@@ -229,8 +229,8 @@ def show_status(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(prog="gate", description="Gate admission: counting slots plus an exclusive class.")
-    parser.add_argument("--slots", type=int, default=int(os.environ.get("GATE_SLOTS", "3")),
-                        help="concurrent shared gates (default 3, or $GATE_SLOTS)")
+    parser.add_argument("--slots", type=int, default=int(os.environ.get("GATE_SLOTS", "2")),
+                        help="concurrent shared gates (default 2, or $GATE_SLOTS)")
     parser.add_argument("--exclusive", dest="cls", action="store_const", const="exclusive", default="shared",
                         help="run alone: wait for an empty box and block new admissions")
     parser.add_argument("--wait-timeout", type=float, default=0.0, help="give up queueing after N seconds (0 = wait forever)")
