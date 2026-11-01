@@ -51,3 +51,46 @@ test("`#602 history-settings-and-limits`: what the channel box says about the ch
   assert.equal(historyPrioritizedWords(view({ complete: true })), "Nothing older to read: every message is saved.");
   assert.equal(historyPrioritizedWords(view()), "Its older messages are read next, within the chat service's limits.");
 });
+
+test("`#253 upstream-clear-polish`, `#349 channel-settings-all`: what a waiting press came to, and what All channels says", () => {
+  const { upstreamClearAttemptKey, upstreamClearPressSettled, upstreamClearAllCommon, upstreamClearAllSentence,
+    upstreamClearAllSavedWords, upstreamClearPushingWords, upstreamClearUnansweredWords, upstreamClearReadFailure,
+    UPSTREAM_CLEAR_RECHECK_MS, UPSTREAM_CLEAR_RECHECK_LIMIT_MS } = SETTINGS;
+  const attempt = (fields = {}) => ({ at_ms: 10, message_id: "m1", message_at_ms: 5, result: "pushed", ...fields });
+  assert.equal(upstreamClearAttemptKey(null), "");
+  assert.equal(upstreamClearAttemptKey(attempt()), "10 m1 pushed");
+  const press = { mode: "on", messageAtMs: 5, before: upstreamClearAttemptKey(attempt()) };
+  const state = (fields = {}) => ({ mode: "on", last: attempt(), ...fields });
+  assert.equal(upstreamClearPressSettled(press, state()), null, "the attempt recorded at the answer answers nothing");
+  assert.equal(upstreamClearPressSettled(press, state({ mode: "off" })).outcome, "changed");
+  assert.equal(upstreamClearPressSettled(press, state({ last: attempt({ at_ms: 11 }) })).outcome, "pushed");
+  assert.equal(upstreamClearPressSettled(press, state({ last: attempt({ at_ms: 11, result: "skipped" }) })).outcome, "skipped");
+  assert.equal(upstreamClearPressSettled(press, state({ last: attempt({ at_ms: 11, message_at_ms: 4, result: "failed" }) })).outcome,
+    "retry_waiting", "a newer failure short of the message waits for the retry");
+  assert.equal(upstreamClearPressSettled(press, state({ unavailable: "gone" })).outcome, "unavailable");
+  assert.equal(upstreamClearPressSettled({ ...press, messageAtMs: null }, state({ last: attempt({ at_ms: 11, message_at_ms: 1 }) })).outcome, "pushed");
+  assert.equal(Math.floor(UPSTREAM_CLEAR_RECHECK_LIMIT_MS / UPSTREAM_CLEAR_RECHECK_MS) - 1, 6, "asked seven times, counting the first");
+  const held = (modes, failures = []) => ({ ids: Object.keys(modes), views: new Map(Object.entries(modes).filter(([, mode]) => mode).map(([id, mode]) => [id, { mode }])),
+    failures: new Map(failures) });
+  const nameOf = (id) => `#${id}`;
+  assert.equal(upstreamClearAllCommon(null), undefined);
+  assert.equal(upstreamClearAllCommon(held({ a: "on", b: null })), undefined);
+  assert.equal(upstreamClearAllCommon(held({ a: "on", b: "on" })), "on");
+  assert.equal(upstreamClearAllCommon(held({ a: "on", b: "off" })), null);
+  assert.equal(upstreamClearAllSentence(null, 2, nameOf), "");
+  assert.equal(upstreamClearAllSentence(held({ a: "on", b: "on" }), 2, nameOf), "On in all 2 channels.");
+  assert.equal(upstreamClearAllSentence(held({ a: "dry_run" }), 2, nameOf), "Dry run in #a. 1 other channel's chat service cannot clear unread.");
+  assert.equal(upstreamClearAllSentence(held({ a: "on", b: "off", c: "on" }), 5, nameOf),
+    "Mixed: On in 2, Off in 1. 2 other channels' chat services cannot clear unread.");
+  assert.equal(upstreamClearAllSentence(held({ a: "on", b: null }), 2, nameOf), "Checking with the server…");
+  assert.equal(upstreamClearAllSentence(held({ a: null, b: null }, [["a", "down"], ["b", "down"]]), 2, nameOf),
+    "Could not read this setting for #a (and 1 more): down");
+  let asked = 0;
+  assert.equal(upstreamClearAllSavedWords([], 2, () => { asked += 1; return "On in all 2 channels."; }), "Saved. On in all 2 channels.");
+  assert.equal(upstreamClearAllSavedWords(["#b (refused)"], 2, () => { asked += 1; return ""; }), "Saved in 1 of 2 channels; not in #b (refused).");
+  assert.equal(asked, 1, "the status line is worked out only when every channel took the mode");
+  assert.equal(upstreamClearPushingWords("dry_run", "Slack"), "Trying it on the newest message in Slack…");
+  assert.equal(upstreamClearPushingWords("on", "Slack"), "Marking the newest message read in Slack…");
+  assert.match(upstreamClearUnansweredWords("Slack"), /^Slack has not answered yet\./);
+  assert.equal(upstreamClearReadFailure("down"), "Could not read this setting: down");
+});

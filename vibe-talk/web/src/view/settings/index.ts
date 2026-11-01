@@ -7,3 +7,5 @@ export { mountHelpFolds } from "./help.ts";
 export type { HelpFolds, HelpFoldsDependencies } from "./help.ts";
 export { mountChannelHistory } from "./history.ts";
 export type { ChannelHistoryBox, ChannelHistoryDependencies } from "./history.ts";
+export { mountUpstreamClear } from "./upstream.ts";
+export type { UpstreamClearBox, UpstreamClearDependencies } from "./upstream.ts";

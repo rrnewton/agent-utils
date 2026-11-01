@@ -14,3 +14,17 @@ export {
   historyRecheckWait,
   historyWaitingWords,
 } from "./history.ts";
+export {
+  UPSTREAM_CLEAR_MODE_WORDS,
+  UPSTREAM_CLEAR_RECHECK_LIMIT_MS,
+  UPSTREAM_CLEAR_RECHECK_MS,
+  upstreamClearAllCommon,
+  upstreamClearAllSavedWords,
+  upstreamClearAllSentence,
+  upstreamClearAttemptKey,
+  upstreamClearPressSettled,
+  upstreamClearPushingWords,
+  upstreamClearReadFailure,
+  upstreamClearUnansweredWords,
+} from "./upstream.ts";
+export type { UpstreamClearAllHeld, UpstreamClearPress } from "./upstream.ts";

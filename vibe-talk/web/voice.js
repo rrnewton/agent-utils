@@ -2428,7 +2428,7 @@ function showScreen(name) {
   // the way back from Help, which is the same visit, where the reader's choice stands.
   if (name === "settings" && previous !== "settings" && previous !== "help") pointSettingsAtReading();
   // `#232 upstream-mark-read`. The server may have pushed since the box was last drawn.
-  if (name === "settings" && previous !== "settings") refreshUpstreamClear();
+  if (name === "settings" && previous !== "settings") upstreamClearBox.refresh();
   // `#602 history-settings-and-limits`. The walk has gone on since the box was last drawn.
   if (name === "settings" && previous !== "settings") channelHistoryBox.refresh();
   // `#303 voice-post-prefix`. Another device may have saved or reset the tag since sign-in.
@@ -51457,7 +51457,7 @@ async function removeChannel() {
  */
 function renderChannelBox() {
   renderAliasEditor();
-  renderUpstreamClear();
+  upstreamClearBox.render();
   channelHistoryBox.render();
   renderIdentityRows();
 }
@@ -51544,66 +51544,11 @@ function writeSourceSentence(channel) {
 
 // --- clearing unread in the chat service's own app ----------------------------------------------
 //
-// `#232 upstream-mark-read`. vibe-talk reads only some of the owner's channels, mostly coding agents
-// posting updates, and in the chat service's own app those updates bury the messages from people.
-// With this on for a channel, the SERVER marks every message it receives there read in that app too,
-// so the app's unread list keeps the people and vibe-talk keeps the agents.
-//
-// The choice is the server's, not this device's: the server does it with no page open, so the
-// control reads and writes /upstream-clear and keeps nothing locally. It is offered only where the
-// channel's own service can do it and only to a token that may change it, and the warning beside it
-// is always on screen, because what it does to the other app is the whole decision.
-
-/**
- * How often, after a "Mark read now" the server stopped waiting on, the box asks again what the
- * push came to. `#253 upstream-clear-polish`.
- */
-const UPSTREAM_CLEAR_RECHECK_MS = 4000;
-/**
- * How long the box keeps asking before it stops and says the push is still unanswered: asked every
- * UPSTREAM_CLEAR_RECHECK_MS, so seven times. `#253 upstream-clear-polish`.
- */
-const UPSTREAM_CLEAR_RECHECK_LIMIT_MS = 30000;
-
-/**
- * What the server last said about the channel the box is on: its id, its answer or null, and the
- * failure to show instead when there is no answer.
- *
- * @type {{channel: string, view: VibeTalk.UpstreamClearState | null, failure: string} | null}
- */
-let upstreamClear = null;
-/** Counts reads, so an answer for a channel the box has since left is dropped rather than drawn. */
-let upstreamClearReads = 0;
-/**
- * The channel a "Mark read now" press is waiting on the server for, or null. One press is one
- * push: the button stays disabled until the answer, so a second tap cannot send a second request.
- * `#253 upstream-clear-polish`.
- *
- * @type {string | null}
- */
-let upstreamClearPushing = null;
-/**
- * A press the server answered `waiting`, which the box is still asking about, or null. `mode` is
- * the mode it was pressed in, `messageAtMs` the instant of the message it asked to push, and
- * `before` the attempt the server had last recorded when it answered, so a newer one is
- * recognised. `#253 upstream-clear-polish`.
- *
- * @type {{channel: string, service: string, mode: VibeTalk.UpstreamClearMode,
- *   messageAtMs: number | null, before: string, asked: number, timer: number} | null}
- */
-let upstreamClearFollowing = null;
-
-/**
- * `#349 channel-settings-all`. What the server last said about each channel All channels reaches: the channels (`ids`), each
- * answer, each failure to read one, whether the owner has moved the choice since it was drawn
- * (`chose`), and whether a Save is under way.
- *
- * @type {{ids: string[], views: Map<string, VibeTalk.UpstreamClearState>, failures: Map<string, string>,
- *   chose: boolean, saving: boolean} | null}
- */
-let upstreamClearAll = null;
-/** Counts the box's reads of every channel, so an answer to an older one is dropped. */
-let upstreamClearAllReads = 0;
+// `#232 upstream-mark-read`. With this on for a channel, the SERVER marks every message it receives
+// there read in the chat service's own app too, so that app's unread list keeps the people and
+// vibe-talk keeps the agents; `#349 channel-settings-all` sets it for every channel at once. The box is
+// web/src/view/settings `mountUpstreamClear`, in the words of web/src/present/settings (`#624
+// voice-page-modularity`); which channels it is offered for is decided here, with the channel list.
 
 /** Whether the box offers the control for the channel `id`. */
 function upstreamClearOffered(id) {
@@ -51612,311 +51557,32 @@ function upstreamClearOffered(id) {
   return provider ? provider.upstream_clear_supported === true : deploymentCapabilities.upstreamClear;
 }
 
-/** One recorded attempt, as a key that changes when a newer attempt replaces it. */
-function upstreamClearAttemptKey(attempt) {
-  return attempt ? `${attempt.at_ms} ${attempt.message_id} ${attempt.result}` : "";
+/**
+ * The channels All channels reaches: those whose chat service can clear unread, for this token. With
+ * several services, only the chosen service's: `#355 provider-grouped-channels`.
+ */
+function upstreamClearAllChannels() {
+  return settingsChannels().map((channel) => String(channel.id)).filter((id) => upstreamClearOffered(id));
 }
 
 /**
- * What a press the server answered `waiting` has come to, read from the channel's state as the
- * server holds it now: the answer the server would have given had it waited this long, or null
- * while nothing has answered the press yet. The same rules as the server's own wait: an attempt
- * newer than the one recorded at the answer that reaches the pressed message answers it, whatever
- * it came to; a newer failure short of it means the message waits for the retry; a refusal or
- * another mode ends it. `#253 upstream-clear-polish`.
+ * Clear unread in the channel box, for the picker's channel or All channels: drawn, read again as
+ * Settings opens, its Save, and "Mark read now".
  *
- * @param {NonNullable<typeof upstreamClearFollowing>} press
- * @param {VibeTalk.UpstreamClearState} view
- * @returns {VibeTalk.UpstreamClearNowResponse | null}
+ * @type {import("./src/view/settings/index.ts").UpstreamClearBox}
  */
-function upstreamClearPressSettled(press, view) {
-  if (view.mode !== press.mode) return { outcome: "changed", state: view };
-  const last = view.last || null;
-  const fresh = Boolean(last) && upstreamClearAttemptKey(last) !== press.before;
-  if (last && fresh && (press.messageAtMs === null || last.message_at_ms >= press.messageAtMs)) {
-    /** @type {Record<string, VibeTalk.UpstreamClearNowOutcome>} */
-    const outcomes = { failed: "failed", skipped: "skipped", unavailable: "unavailable" };
-    return { outcome: outcomes[last.result] || "pushed", attempt: last, state: view };
-  }
-  if (view.unavailable) return { outcome: "unavailable", state: view };
-  if (last && fresh && last.result === "failed") return { outcome: "retry_waiting", state: view };
-  return null;
-}
-
-/** Stop asking about a press the server answered `waiting`. */
-function stopFollowingUpstreamClear() {
-  if (upstreamClearFollowing) clearTimeout(upstreamClearFollowing.timer);
-  upstreamClearFollowing = null;
-}
-
-/**
- * Ask again about a press the server answered `waiting`, every UPSTREAM_CLEAR_RECHECK_MS, until
- * something answers it or UPSTREAM_CLEAR_RECHECK_LIMIT_MS have passed, and say what it came to.
- * Only while Settings shows the press's channel. `#253 upstream-clear-polish`.
- *
- * @param {string} channel
- * @param {VibeTalk.UpstreamClearNowResponse} answer
- * @param {string} service
- */
-function followUpstreamClear(channel, answer, service) {
-  stopFollowingUpstreamClear();
-  const press = {
-    channel,
-    service,
-    mode: answer.state.mode,
-    messageAtMs: typeof answer.message_at_ms === "number" ? answer.message_at_ms : null,
-    before: upstreamClearAttemptKey(answer.state.last),
-    asked: 0,
-    timer: 0,
-  };
-  upstreamClearFollowing = press;
-  const here = () => upstreamClearFollowing === press && Boolean(upstreamClear) &&
-    upstreamClear.channel === channel && !el("screen-settings").hidden;
-  const ask = async () => {
-    if (!here()) {
-      if (upstreamClearFollowing === press) upstreamClearFollowing = null;
-      return;
-    }
-    press.asked += 1;
-    const read = ++upstreamClearReads;
-    /** @type {VibeTalk.UpstreamClearState | null} */
-    let view = null;
-    try {
-      view = await apiDecoded("UpstreamClearState", `/api/v1/channels/${encodeURIComponent(channel)}/upstream-clear`);
-    } catch (_error) {
-      // Unread this time; asked again at the next tick, as long as the bound allows.
-      view = null;
-    }
-    if (!here()) return;
-    if (view && read === upstreamClearReads) adoptUpstreamClear(channel, view);
-    const settled = view ? upstreamClearPressSettled(press, view) : null;
-    if (settled) {
-      upstreamClearFollowing = null;
-      el("upstream-clear-state").textContent = upstreamClearNowSentence(settled, service);
-      return;
-    }
-    if ((press.asked + 1) * UPSTREAM_CLEAR_RECHECK_MS > UPSTREAM_CLEAR_RECHECK_LIMIT_MS) {
-      upstreamClearFollowing = null;
-      el("upstream-clear-state").textContent = `${service} has not answered yet. The server carries on ` +
-        "without this page; open Settings again later to see what it came to.";
-      return;
-    }
-    el("upstream-clear-state").textContent =
-      upstreamClearNowSentence({ outcome: "waiting", state: view || answer.state }, service);
-    press.timer = setTimeout(ask, UPSTREAM_CLEAR_RECHECK_MS);
-  };
-  press.timer = setTimeout(ask, UPSTREAM_CLEAR_RECHECK_MS);
-}
-
-/** Whether Save would change anything: a mode other than the server's. */
-function upstreamClearChanged() {
-  const stored = upstreamClear && upstreamClear.view ? upstreamClear.view.mode : null;
-  return stored !== null && el("upstream-clear-mode").value !== stored;
-}
-
-/** Enable Save, and offer "Mark read now" or "Try it now", to match what is chosen and saved. */
-function renderUpstreamClearChoice() {
-  // `#349 channel-settings-all`. With All channels chosen the choice is about every channel at once.
-  if (allChannelsChosen()) {
-    if (upstreamClearAll) upstreamClearAll.chose = true;
-    renderUpstreamClearAllChoice();
-    return;
-  }
-  const view = upstreamClear ? upstreamClear.view : null;
-  const stored = view ? view.mode : "off";
-  el("upstream-clear-save").disabled = !upstreamClearChanged();
-  // The button acts on the SAVED mode, so it is offered only while the choice still matches it:
-  // "Mark read now" beside an unsaved Off would mark messages read in a channel being turned off.
-  const push = el("upstream-clear-push");
-  push.hidden = !view || stored === "off" || el("upstream-clear-mode").value !== stored || Boolean(view.unavailable);
-  push.textContent = stored === "dry_run" ? "Try it now" : "Mark read now";
-  push.disabled = upstreamClearPushing !== null;
-}
-
-/** Redraw the box for the channel its picker is on, reading the server's state when it changed. */
-function renderUpstreamClear() {
-  if (allChannelsChosen()) {
-    renderUpstreamClearAll();
-    return;
-  }
-  upstreamClearAll = null;
-  const id = el("settings-channel").value;
-  const offered = upstreamClearOffered(id);
-  el("upstream-clear").hidden = !offered;
-  if (!offered) return;
-  // What All channels changed in the box, put back for one channel.
-  el("upstream-clear-scope").textContent = "this channel";
-  el("upstream-clear-mixed").hidden = true;
-  el("upstream-clear-mode").disabled = false;
-  const service = chatServiceOf(id);
-  el("upstream-clear-provider").textContent = service;
-  el("upstream-clear-warning-provider").textContent = service;
-  el("upstream-clear-threads-provider").textContent = service;
-  if (!upstreamClear || upstreamClear.channel !== String(id)) {
-    upstreamClear = { channel: String(id), view: null, failure: "" };
-    el("upstream-clear-mode").value = "off";
-    el("upstream-clear-state").textContent = "Checking with the server…";
-    renderUpstreamClearChoice();
-    // Asked only while Settings is showing: a page that never opens it never spends the request,
-    // and opening it asks (`refreshUpstreamClear`).
-    if (!el("screen-settings").hidden) loadUpstreamClear(String(id));
-    return;
-  }
-  drawUpstreamClear();
-}
-
-/**
- * Draw what the server last said, or why there is nothing to draw.
- *
- * A mode the owner has chosen and not saved is not the server's to take back. `#253
- * upstream-clear-polish`: after a "Mark read now" the server answered `waiting`, the box reads the
- * channel every few seconds for up to thirty, and each read put the saved mode back in the select,
- * so a choice made meanwhile went back under the owner's hand and Save went grey. So the select
- * follows the server only while it still shows the mode saved before this answer, `savedBefore`; a
- * choice moved off it stays, with Save offered for it, until it is saved or put back.
- *
- * @param {VibeTalk.UpstreamClearMode | null} [savedBefore] The saved mode the box showed before this
- *   answer, or null when it showed none: the box's first answer for a channel sets the select.
- */
-function drawUpstreamClear(savedBefore = upstreamClear && upstreamClear.view ? upstreamClear.view.mode : null) {
-  if (!upstreamClear) return;
-  const view = upstreamClear.view;
-  if (!view) {
-    if (upstreamClear.failure) el("upstream-clear-state").textContent = upstreamClear.failure;
-    renderUpstreamClearChoice();
-    return;
-  }
-  const select = el("upstream-clear-mode");
-  if (savedBefore === null || select.value === savedBefore) select.value = view.mode;
-  el("upstream-clear-state").textContent = upstreamClearSentence(view, view.provider_name || chatServiceOf(upstreamClear.channel));
-  renderUpstreamClearChoice();
-}
-
-/** Take the server's answer for `channel` as the truth, unless the box has moved on. */
-function adoptUpstreamClear(channel, view) {
-  if (!upstreamClear || upstreamClear.channel !== channel) return;
-  const savedBefore = upstreamClear.view ? upstreamClear.view.mode : null;
-  upstreamClear = { channel, view, failure: "" };
-  drawUpstreamClear(savedBefore);
-}
-
-/** Ask the server what it does for `channel`. */
-async function loadUpstreamClear(channel) {
-  const read = ++upstreamClearReads;
-  try {
-    const view = await apiDecoded(
-      "UpstreamClearState",
-      `/api/v1/channels/${encodeURIComponent(channel)}/upstream-clear`
-    );
-    if (read === upstreamClearReads) adoptUpstreamClear(channel, view);
-  } catch (error) {
-    if (read !== upstreamClearReads || !upstreamClear || upstreamClear.channel !== channel) return;
-    upstreamClear = {
-      channel,
-      view: null,
-      failure: `Could not read this setting: ${error.detail || error.message}`,
-    };
-    drawUpstreamClear();
-  }
-}
-
-/** Read the box's channel again, as when Settings opens: the server may have pushed since. */
-function refreshUpstreamClear() {
-  if (allChannelsChosen()) {
-    if (upstreamClearAll) loadUpstreamClearAll();
-    else renderUpstreamClear();
-    return;
-  }
-  const id = el("settings-channel").value;
-  if (!upstreamClearOffered(id)) return;
-  if (upstreamClear && upstreamClear.channel === String(id)) {
-    loadUpstreamClear(String(id));
-  } else {
-    renderUpstreamClear();
-  }
-}
-
-/**
- * Save the chosen mode. Turning it on pushes nothing by itself: the next message that arrives is
- * marked, and everything before it, as the warning says; "Mark read now" does it at once.
- */
-async function saveUpstreamClear() {
-  if (allChannelsChosen()) {
-    await saveUpstreamClearAll();
-    return;
-  }
-  const channel = el("settings-channel").value;
-  if (!upstreamClearOffered(channel) || !upstreamClearChanged()) return;
-  const mode = el("upstream-clear-mode").value;
-  el("upstream-clear-save").disabled = true;
-  el("upstream-clear-state").textContent = "Saving…";
-  // A save is the owner's newest word on the channel: a press still being asked about is not.
-  stopFollowingUpstreamClear();
-  let view;
-  try {
-    view = await apiDecoded(
-      "UpstreamClearState",
-      `/api/v1/channels/${encodeURIComponent(channel)}/upstream-clear`,
-      { method: "PUT", body: { mode } }
-    );
-  } catch (error) {
-    el("upstream-clear-state").textContent = `Not saved: ${error.detail || error.message}`;
-    renderUpstreamClearChoice();
-    return;
-  }
-  upstreamClearReads += 1;
-  adoptUpstreamClear(String(channel), view);
-}
-
-/**
- * "Mark read now", or "Try it now" in a dry run: the server pushes the channel's newest message at
- * once, through its own loop, and answers what that came to, which goes in the status line.
- * `#253 upstream-clear-polish`.
- *
- * One press, one request: the button is disabled from the press until the answer. It never
- * changes the mode; the server refuses it for a channel another device has turned off.
- */
-async function pushUpstreamClearNow() {
-  const channel = String(el("settings-channel").value);
-  const view = upstreamClear && upstreamClear.channel === channel ? upstreamClear.view : null;
-  if (!view || view.mode === "off" || upstreamClearPushing !== null || !upstreamClearOffered(channel)) return;
-  const service = view.provider_name || chatServiceOf(channel);
-  stopFollowingUpstreamClear();
-  upstreamClearPushing = channel;
-  renderUpstreamClearChoice();
-  el("upstream-clear-state").textContent = view.mode === "dry_run"
-    ? `Trying it on the newest message in ${service}…`
-    : `Marking the newest message read in ${service}…`;
-  /** @type {VibeTalk.UpstreamClearNowResponse | null} */
-  let answer = null;
-  /** @type {string} */
-  let failure = "";
-  try {
-    answer = await apiDecoded(
-      "UpstreamClearNowResponse",
-      `/api/v1/channels/${encodeURIComponent(channel)}/upstream-clear/now`,
-      { method: "POST" }
-    );
-  } catch (error) {
-    failure = `Not done: ${error.detail || error.message}`;
-  }
-  upstreamClearPushing = null;
-  const here = Boolean(upstreamClear && upstreamClear.channel === channel);
-  if (!answer) {
-    if (here) el("upstream-clear-state").textContent = failure;
-    renderUpstreamClearChoice();
-    return;
-  }
-  upstreamClearReads += 1;
-  adoptUpstreamClear(channel, answer.state);
-  if (!here) {
-    renderUpstreamClearChoice();
-    return;
-  }
-  el("upstream-clear-state").textContent = upstreamClearNowSentence(answer, service);
-  // The server stopped waiting before the push landed; ask again until something answers it.
-  if (answer.outcome === "waiting") followUpstreamClear(channel, answer, service);
-}
+const upstreamClearBox = mountUpstreamClear({
+  lookup: (id) => el(id),
+  decoded: (type, path, options) => apiDecoded(type, path, options),
+  offered: (id) => upstreamClearOffered(id),
+  allChannels: () => upstreamClearAllChannels(),
+  allChannelsChosen: () => allChannelsChosen(),
+  serviceOf: (id) => chatServiceOf(id),
+  channelCount: () => settingsChannels().length,
+  nameOf: (id) => channelName(knownChannel(id)),
+  setTimeout: (run, ms) => setTimeout(run, ms),
+  clearTimeout: (timer) => clearTimeout(timer),
+});
 
 // --- how much of the channel's history the server keeps --------------------------------------------
 //
@@ -51941,165 +51607,6 @@ const channelHistoryBox = mountChannelHistory({
   setTimeout: (run, ms) => setTimeout(run, ms),
   clearTimeout: (timer) => clearTimeout(timer),
 });
-
-// --- clearing unread in every channel at once ----------------------------------------------------
-//
-// `#349 channel-settings-all`. The owner, 2026-10-18: the channel drop-down gains "All channels",
-// "Clear unread can be set for all at once", and it shows "Mixed" when the channels differ. With All
-// channels chosen the box reads every channel whose chat service can clear unread (`upstreamClearOffered`
-// answers that per channel, so a channel whose service cannot is left out and said to be), shows the
-// mode they share or Mixed, and Save puts the chosen mode on each, one PUT per channel, through the same
-// /upstream-clear the one-channel box writes. "Mark read now" is a push for one channel and is not
-// offered. The one-channel box's state (`upstreamClear`) is set aside while this is up, so nothing it
-// is still waiting on can draw over it.
-
-/** The modes, as the status line names them. */
-const UPSTREAM_CLEAR_MODE_WORDS = { on: "On", dry_run: "Dry run", off: "Off" };
-
-/**
- * The channels All channels reaches: those whose chat service can clear unread, for this token. With
- * several services, only the chosen service's: `#355 provider-grouped-channels`.
- */
-function upstreamClearAllChannels() {
-  return settingsChannels().map((channel) => String(channel.id)).filter((id) => upstreamClearOffered(id));
-}
-
-/**
- * The mode every channel All channels reaches has: the mode, null when they differ (Mixed), or
- * undefined while one of them has not been read.
- *
- * @returns {VibeTalk.UpstreamClearMode | null | undefined}
- */
-function upstreamClearAllCommon() {
-  const held = upstreamClearAll;
-  if (!held || held.ids.some((id) => !held.views.has(id))) return undefined;
-  const modes = [...new Set(held.ids.map((id) => /** @type {VibeTalk.UpstreamClearState} */ (held.views.get(id)).mode))];
-  return modes.length === 1 ? modes[0] : null;
-}
-
-/** The status line for All channels: what they are set to, or why that is not known yet. */
-function upstreamClearAllSentence() {
-  const held = upstreamClearAll;
-  if (!held) return "";
-  const others = settingsChannels().length - held.ids.length;
-  const tail = others === 0 ? ""
-    : others === 1 ? " 1 other channel's chat service cannot clear unread."
-      : ` ${others} other channels' chat services cannot clear unread.`;
-  if (held.failures.size > 0) {
-    const [id, why] = [...held.failures][0];
-    const more = held.failures.size > 1 ? ` (and ${held.failures.size - 1} more)` : "";
-    return `Could not read this setting for ${channelName(knownChannel(id))}${more}: ${why}`;
-  }
-  const common = upstreamClearAllCommon();
-  if (common === undefined) return "Checking with the server…";
-  if (common !== null) {
-    const where = held.ids.length === 1 ? channelName(knownChannel(held.ids[0])) : `all ${held.ids.length} channels`;
-    return `${UPSTREAM_CLEAR_MODE_WORDS[common]} in ${where}.${tail}`;
-  }
-  const counts = /** @type {Array<[VibeTalk.UpstreamClearMode, number]>} */ (
-    /** @type {VibeTalk.UpstreamClearMode[]} */ (["on", "dry_run", "off"])
-      .map((mode) => [mode, held.ids.filter((id) => /** @type {VibeTalk.UpstreamClearState} */ (held.views.get(id)).mode === mode).length])
-      .filter(([, count]) => Number(count) > 0));
-  return `Mixed: ${counts.map(([mode, count]) => `${UPSTREAM_CLEAR_MODE_WORDS[mode]} in ${count}`).join(", ")}.${tail}`;
-}
-
-/** Enable Save only for a mode that would change something, once every channel has been read. */
-function renderUpstreamClearAllChoice() {
-  const held = upstreamClearAll;
-  const common = upstreamClearAllCommon();
-  const chosen = el("upstream-clear-mode").value;
-  el("upstream-clear-mode").disabled = common === undefined;
-  el("upstream-clear-save").disabled = !held || held.saving || common === undefined || chosen === "mixed" ||
-    chosen === common;
-  el("upstream-clear-push").hidden = true;
-}
-
-/** Draw what the server said about every channel: their mode, or Mixed, and the status line. */
-function drawUpstreamClearAll() {
-  const held = upstreamClearAll;
-  if (!held) return;
-  const common = upstreamClearAllCommon();
-  el("upstream-clear-mixed").hidden = common !== null;
-  if (!held.chose) el("upstream-clear-mode").value = common === undefined ? "off" : common === null ? "mixed" : common;
-  el("upstream-clear-state").textContent = upstreamClearAllSentence();
-  renderUpstreamClearAllChoice();
-}
-
-/** Redraw the box for All channels, reading every channel's state when the set of them changed. */
-function renderUpstreamClearAll() {
-  // The one-channel box's own state is set aside: nothing it waits on draws over this.
-  stopFollowingUpstreamClear();
-  upstreamClear = null;
-  const ids = upstreamClearAllChannels();
-  el("upstream-clear").hidden = ids.length === 0;
-  if (ids.length === 0) {
-    upstreamClearAll = null;
-    return;
-  }
-  const services = [...new Set(ids.map((id) => chatServiceOf(id)))];
-  const service = services.length === 1 ? services[0] : "their chat services";
-  el("upstream-clear-provider").textContent = service;
-  el("upstream-clear-warning-provider").textContent = service;
-  el("upstream-clear-threads-provider").textContent = service;
-  el("upstream-clear-scope").textContent = "each of these channels";
-  if (!upstreamClearAll || upstreamClearAll.ids.join(" ") !== ids.join(" ")) {
-    upstreamClearAll = { ids, views: new Map(), failures: new Map(), chose: false, saving: false };
-    // Asked only while Settings is showing, as the one-channel box asks.
-    if (!el("screen-settings").hidden) loadUpstreamClearAll();
-  }
-  drawUpstreamClearAll();
-}
-
-/** Ask the server what it does for every channel All channels reaches, one channel after another. */
-async function loadUpstreamClearAll() {
-  const held = upstreamClearAll;
-  if (!held) return;
-  const read = ++upstreamClearAllReads;
-  held.failures.clear();
-  for (const id of held.ids) {
-    try {
-      const view = await apiDecoded("UpstreamClearState", `/api/v1/channels/${encodeURIComponent(id)}/upstream-clear`);
-      if (read !== upstreamClearAllReads || upstreamClearAll !== held) return;
-      held.views.set(id, view);
-    } catch (error) {
-      if (read !== upstreamClearAllReads || upstreamClearAll !== held) return;
-      held.failures.set(id, error.detail || error.message);
-    }
-  }
-  if (allChannelsChosen()) drawUpstreamClearAll();
-}
-
-/**
- * Save the chosen mode on every channel All channels reaches, and say how many it reached. A channel
- * that refuses keeps what it had, and is named.
- */
-async function saveUpstreamClearAll() {
-  const held = upstreamClearAll;
-  const mode = el("upstream-clear-mode").value;
-  if (!held || held.saving || !Object.prototype.hasOwnProperty.call(UPSTREAM_CLEAR_MODE_WORDS, mode) ||
-      upstreamClearAllCommon() === undefined) return;
-  held.saving = true;
-  renderUpstreamClearAllChoice();
-  el("upstream-clear-state").textContent = "Saving…";
-  /** @type {string[]} */
-  const refused = [];
-  for (const id of held.ids) {
-    try {
-      const view = await apiDecoded("UpstreamClearState", `/api/v1/channels/${encodeURIComponent(id)}/upstream-clear`,
-        { method: "PUT", body: { mode } });
-      held.views.set(id, view);
-    } catch (error) {
-      refused.push(`${channelName(knownChannel(id))} (${error.detail || error.message})`);
-    }
-  }
-  held.saving = false;
-  if (upstreamClearAll !== held || !allChannelsChosen()) return;
-  held.chose = false;
-  drawUpstreamClearAll();
-  el("upstream-clear-state").textContent = refused.length === 0
-    ? `Saved. ${upstreamClearAllSentence()}`
-    : `Saved in ${held.ids.length - refused.length} of ${held.ids.length} channels; not in ${refused.join(", ")}.`;
-}
 
 /**
  * Open one of the channel box's two panels, or neither.
@@ -52386,7 +51893,7 @@ function applyClientConfig(config) {
   applyChannelProvider();
   // The clear-unread control is offered only to a token that may change it (`tokenScope`, above), on
   // a channel whose provider can, which `applyChannelProvider` has just settled.
-  renderUpstreamClear();
+  upstreamClearBox.render();
   // `#46 conversation-replay`. What the SERVER permits, which is not the same as what the reader
   // has asked for — and the screen has to be able to say which of the two is stopping it.
   resumeAllowed = config.replay_enabled === true;
@@ -54158,12 +53665,12 @@ el("settings-channel").addEventListener("change", () => {
   renderChannelBox();
 });
 // `#232 upstream-mark-read`. Choosing a mode only shows what Save would do; Save is the decision.
-el("upstream-clear-mode").addEventListener("change", renderUpstreamClearChoice);
-el("upstream-clear-save").addEventListener("click", saveUpstreamClear);
+el("upstream-clear-mode").addEventListener("change", () => upstreamClearBox.renderChoice());
+el("upstream-clear-save").addEventListener("click", () => upstreamClearBox.save());
 el("channel-history-mode").addEventListener("change", () => channelHistoryBox.renderChoice());
 el("channel-history-save").addEventListener("click", () => channelHistoryBox.save());
 el("channel-history-prioritize").addEventListener("click", () => channelHistoryBox.prioritize());
-el("upstream-clear-push").addEventListener("click", pushUpstreamClearNow);
+el("upstream-clear-push").addEventListener("click", () => upstreamClearBox.push());
 el("rename-channel").addEventListener("click", () => {
   showChannelPanel("rename-fields");
   el("channel-alias").focus();

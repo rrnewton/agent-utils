@@ -2194,9 +2194,9 @@ test("`#349 channel-settings-all`: a channel whose service cannot clear unread i
 
 test("`#349 channel-settings-all`: the Save check is not satisfied by a page that sets only the first channel (negative control)", async () => {
   // Without this, the test above could pass on a Save that stopped after one channel.
-  const broken = newPage(new Map(), brokenScript(
-    "  for (const id of held.ids) {\n    try {\n      const view = await apiDecoded(\"UpstreamClearState\", `/api/v1/channels/${encodeURIComponent(id)}/upstream-clear`,\n        { method: \"PUT\"",
-    "  for (const id of held.ids.slice(0, 1)) {\n    try {\n      const view = await apiDecoded(\"UpstreamClearState\", `/api/v1/channels/${encodeURIComponent(id)}/upstream-clear`,\n        { method: \"PUT\""));
+  const broken = newPage(new Map(), await brokenModule([{ file: "src/view/settings/upstream.ts",
+    find: "    for (const id of held.ids) {\n      try {\n        const view = await deps.decoded(\"UpstreamClearState\", clearPath(id),\n          { method: \"PUT\"",
+    replace: "    for (const id of held.ids.slice(0, 1)) {\n      try {\n        const view = await deps.decoded(\"UpstreamClearState\", clearPath(id),\n          { method: \"PUT\"" }]));
   broken.chatProviderName = "Google Chat";
   broken.upstreamClearSupported = true;
   broken.channels = [{ ...CHANNEL }, { ...OTHER_CHANNEL }];
