@@ -264,6 +264,10 @@ export {
   undoLabel,
   undoName,
 } from "../present/rows/index.ts";
+export {
+  RESTATED_CLASS,
+  foldedTextLine,
+} from "../view/channel/index.ts";
 
 import { decode, decodeTagged, is, roots } from "../contract/index.ts";
 

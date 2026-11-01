@@ -245,3 +245,5 @@ declare const outcomeNotice: LegacyImports["outcomeNotice"];
 declare const shownSpoken: LegacyImports["shownSpoken"];
 declare const spokenText: LegacyImports["spokenText"];
 declare const spokenWords: LegacyImports["spokenWords"];
+declare const RESTATED_CLASS: LegacyImports["RESTATED_CLASS"];
+declare const foldedTextLine: LegacyImports["foldedTextLine"];

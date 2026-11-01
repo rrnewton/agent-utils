@@ -9,8 +9,8 @@ import { ACKNOWLEDGED, BASE_CSS, CHANNEL, CODER, COLLAPSE_OVER_CHARS, CSS, CSS_C
   CSS_UNCONDITIONAL, DISCORD_POLL_MS, FIXTURE_TREE, FakeElement, GATHERED, GLYPHS, HOVER_QUERY,
   HTML, INBOX, LINK_ATTRS, OWNERS_MESSAGE, PAGE_CODE, PAGE_ELEMENTS, PULL_ARM_PX, SANITIZED_TAGS,
   SCRIPT, SCRIPT_CODE, SCROLLERS, SHORT_MESSAGE, SPEECH_PIECES, TIMELINE_RECONCILE_MS,
-  TWO_COLUMN_QUERY, asksFor, assertMarkupContains, assistantSays, atBottomOf, bodyOf, bookmarkAt,
-  bookmarkRow, boxesOf, brokenModule, brokenScript, builtSince, cardPart, cardRow,
+  TWO_COLUMN_QUERY, VIEW_CHANNEL, asksFor, assertMarkupContains, assistantSays, atBottomOf, bodyOf,
+  bookmarkAt, bookmarkRow, boxesOf, brokenModule, brokenScript, builtSince, cardPart, cardRow,
   channelSummaryText, chipsOf, chooseReadMode, cssBlock, cssBlockIn, cssBlockOutside, cssRules,
   deliver, doneButton, elidedOf, errorResponse, excerptOf, focused, foldButton, forwardPage,
   forwardReadKinds, forwardTimeline, freshness, gate, gatherChip, headOf, headerCard, hitsIn, hold,
@@ -514,7 +514,7 @@ test("A LIST IS LINES, an item to each however short, and a list of short items 
 
 test("WHAT THE MODEL HAS NO RULE FOR GETS NO LABEL, and every element the server sends has a rule (#244)", () => {
   const page = newPage();
-  const known = new Set([...page.pure("FOLD_INLINE"), ...page.pure("FOLD_FLOW_BLOCKS"), "br", "pre", "table"]);
+  const known = new Set([...VIEW_CHANNEL.FOLD_INLINE, ...VIEW_CHANNEL.FOLD_FLOW_BLOCKS, "br", "pre", "table"]);
   // A table's own parts are only ever inside one, which is read whole.
   const inTables = new Set(["thead", "tbody", "tr", "th", "td"]);
   for (const tag of SANITIZED_TAGS) {
@@ -525,7 +525,7 @@ test("WHAT THE MODEL HAS NO RULE FOR GETS NO LABEL, and every element the server
   const odd = page.document.createElement("details");
   odd.append(page.document.createTextNode(wordsOfLength(200, 4)));
   body.append(odd);
-  assert.equal(page.pure("foldRuns")(body), null, "an element with no rule was laid out from a guess");
+  assert.equal(VIEW_CHANNEL.foldRuns(body), null, "an element with no rule was laid out from a guess");
   assert.deepStrictEqual([...page.preludeBinding("elisionLabels")(null, page.pure("collapsedLines"))], FOLD_WIDTHS_EM.map(() => ""));
 });
 

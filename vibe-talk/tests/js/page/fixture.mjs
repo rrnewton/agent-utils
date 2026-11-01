@@ -1852,6 +1852,8 @@ const SPEECH_PIECES = await moduleForTests("src/core/speech/index.ts");
 const CALL = await moduleForTests("src/core/call/index.ts");
 /** How the page words and arranges its rows of messages, and its thread cards (web/src/present/rows). */
 const PRESENT_ROWS = await moduleForTests("src/present/rows/index.ts");
+/** The channel's rows as the DOM draws them (web/src/view/channel): handed the page's own nodes. */
+const VIEW_CHANNEL = await moduleForTests("src/view/channel/index.ts");
 /**
  * The names the page takes from its modules: what the prelude declares for the legacy script
  * (web/src/legacy/imports.ts). `page.pure` refuses them: what moved into a module is tested through
@@ -9959,7 +9961,7 @@ export { ACKNOWLEDGED, ALIAS_NOTICE, ALICE, BASE_CSS, BIG, BIG_ROOT, BOTTOM_SLAC
   SERVER_API, SETTINGS, SHIPPED_SYSTEM_PROMPT, SHORT_MESSAGE, SLOW_SEND, SMALL, SPACE_A, SPACE_B,
   SPEECH, SPEECH_PIECES, SPOKEN_SETTLE_MS, TEAM_A, TEAM_B, THREADS_MAIN_STORAGE,
   TIMELINE_RECONCILE_MS, TOKEN_STORAGE_KEY, TRANSCRIPT_PAGE_LIMIT, TUNING_BANDS, TWO_COLUMN_QUERY,
-  UI_STATE_KEY, UNPACK_STORAGE, allLeavingOut, arrowStyle, asksFor, assertCurrent,
+  UI_STATE_KEY, UNPACK_STORAGE, VIEW_CHANNEL, allLeavingOut, arrowStyle, asksFor, assertCurrent,
   assertMarkupContains, assistantSays, atBottomOf, atTheHead, authorChannel, authorState, backFacts,
   backlog, barSlice, beforeOf, bid, bigCardData, bodyOf, bookmarkAt, bookmarkClearOf, bookmarkRow,
   boundaryLines, boundaryWords, boxesOf, bridgeReply, brokenModule, brokenScript, brokenScriptEach,

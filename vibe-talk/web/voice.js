@@ -4045,8 +4045,8 @@ const FOLD_LESS = "Less";
 // `#244 elision-word-count`. The owner: "when messages are collapsed I have no idea if they're big
 // huge messages or just barely over the limit". So a folded message says, under its last line, how
 // much the fold is keeping back: "(~240 more words)". The model that counts is web/src/present/rows
-// (`foldPieces`, `foldShows`, `elisionLabels`, `FOLD_WIDTHS_EM`); this file reads a drawn body for it
-// (`foldRuns`) and draws the labels it gives.
+// (`foldPieces`, `foldShows`, `elisionLabels`, `FOLD_WIDTHS_EM`); web/src/view/channel reads a drawn body
+// for it (`foldRuns`) and draws the labels it gives (`elisionLine`, `foldedTextLine`).
 //
 //   * NEVER MORE THAN IS HIDDEN. The fold is a CSS clamp of the reader's lines, so where the cut falls
 //     depends on how wide the row's lines are, the text size, and how the browser breaks them. This
@@ -4102,121 +4102,6 @@ let collapsedLines = DEFAULT_COLLAPSED_LINES;
 
 // The glyph widths the fold model counts lines by (`WIDE_SCRIPT`, `glyphEm`, `SPACE_EM`, `MONO_EM`,
 // `monoEm`) are a module now: web/src/foundation/ (`#624 voice-page-modularity`).
-
-/** Elements whose words flow on the line they are on: their text is the line's. */
-const FOLD_INLINE = new Set(["a", "code", "del", "em", "input", "s", "span", "strong"]);
-
-/** Elements that start a line and end one, whose own text flows in lines the clamp counts. */
-const FOLD_FLOW_BLOCKS = new Set(["blockquote", "div", "h1", "h2", "h3", "h4", "hr", "li", "ol", "p", "ul"]);
-
-/** The text of `node`'s text nodes, in order, joined with `between`: what a code block holds, as written. */
-function textNodesOf(node, between = "") {
-  const parts = [];
-  const walk = (at) => {
-    for (const kid of at.childNodes) {
-      if (kid.nodeType === 3) parts.push(kid.textContent);
-      else if (kid.nodeType === 1) walk(kid);
-    }
-  };
-  walk(node);
-  return parts.join(between);
-}
-
-/**
- * What a drawn body holds, as the fold's model reads it: RUNS, `[kind, text]`, in order. `t` is text
- * that flows, "\n" in it a line end the browser draws (a `<br>`, the edge of a block), any other
- * white space a space; `m` the same in code's face (inline code); `p` one code block's text, a line
- * of the block for each of its lines; `w` the words of a block drawn WHOLE, whose lines the clamp
- * does not count (a table). Null when the body holds an element there is no rule for here. With
- * `skipClass`, the elements of exactly that class are left out, as `renderedText` leaves them.
- */
-function foldRuns(node, skipClass = "") {
-  const runs = [];
-  const add = (kind, text) => {
-    const last = runs[runs.length - 1];
-    if (last && last[0] === kind) last[1] += text;
-    else runs.push([kind, text]);
-  };
-  let known = true;
-  const walk = (at, mono) => {
-    for (const kid of at.childNodes) {
-      if (!known) return;
-      if (kid.nodeType === 3) {
-        add(mono ? "m" : "t", String(kid.textContent).replace(/\s/g, " "));
-        continue;
-      }
-      if (kid.nodeType !== 1) continue;
-      if (skipClass && kid.className === skipClass) continue;
-      const tag = String(kid.tagName).toLowerCase();
-      if (tag === "br") {
-        add(mono ? "m" : "t", "\n");
-      } else if (FOLD_INLINE.has(tag)) {
-        walk(kid, mono || tag === "code");
-      } else if (FOLD_FLOW_BLOCKS.has(tag)) {
-        add("t", "\n");
-        walk(kid, mono);
-        add("t", "\n");
-      } else if (tag === "pre") {
-        runs.push(["p", textNodesOf(kid)]);
-      } else if (tag === "table") {
-        // Every word of it, a space between one cell's and the next.
-        runs.push(["w", textNodesOf(kid, " ")]);
-      } else {
-        known = false;
-      }
-    }
-  };
-  walk(node, false);
-  return known ? runs : null;
-}
-
-/**
- * The line under a folded message: one span per label, each saying the width classes it is for
- * (`data-w`, indexes into `FOLD_WIDTHS_EM`) and, on a rich header's row, whether it counts the text
- * with the header showing or without (`data-rh`). web/voice.css shows the one that applies. Null when
- * no width has anything to say.
- *
- * @param {Array<{runs: Array<[string, string]>|string|null, rh: string|null}>} versions what the row
- *   can show, as `elisionLabels` takes it
- */
-function elisionLine(versions) {
-  const spans = new Map();
-  for (const { runs, rh } of versions) {
-    elisionLabels(runs, collapsedLines).forEach((label, at) => {
-      if (!label) return;
-      const key = `${rh || ""}|${label}`;
-      if (!spans.has(key)) spans.set(key, { label, rh, at: [] });
-      spans.get(key).at.push(at);
-    });
-  }
-  if (spans.size === 0) return null;
-  const line = document.createElement("div");
-  line.className = "elided";
-  for (const { label, rh, at } of spans.values()) {
-    const span = document.createElement("span");
-    span.setAttribute("data-w", at.join(" "));
-    if (rh) span.setAttribute("data-rh", rh);
-    span.textContent = label;
-    line.append(span);
-  }
-  return line;
-}
-
-/**
- * `#244 elision-word-count`. The line under a folded row's text (`elisionLine`), from what `body`
- * draws: a channel row's body is drawn (`.md` boxes), and is read for its blocks as well as its
- * words (`foldRuns`); a spoken turn's is its text. A rich header's row (`#242 rich-headers`) shows
- * its text without the words the header restates while the header shows. Null when no width has
- * anything to say.
- */
-function foldedTextLine(body, text) {
-  const first = body.children[0];
-  const headed = Boolean(first && first.hasAttribute && first.hasAttribute("data-rh"));
-  const drawn = (skipClass) => (first ? foldRuns(body, skipClass) : String(text === null || text === undefined ? "" : text));
-  return elisionLine(headed
-    ? [{ runs: drawn(RESTATED_CLASS), rh: "on" }, { runs: drawn(""), rh: "off" }]
-    : [{ runs: drawn(""), rh: null }]);
-}
 
 // A message with a fold control carries its fold on its own row, `li.foldEntry` (`foldable`), and
 // whatever acts on the folds of a list reads them off the list's rows (`foldsOf`). NO LIST OF FOLDS
@@ -4373,7 +4258,7 @@ function foldable(li, meta, body, text, messageId, alsoIds = []) {
   // `#244 elision-word-count`. Counted once, here, from what the row shows; see `foldedTextLine`.
   // Straight after the text, ahead of the summary line below and of the reactions the channel row
   // moves under both, so it reads as the end of the folded message.
-  entry.elided = foldedTextLine(body, text);
+  entry.elided = foldedTextLine(body, text, collapsedLines);
   if (entry.elided) li.append(entry.elided);
   if (entry.id) {
     entry.note = document.createElement("div");
@@ -18398,7 +18283,7 @@ function refreshElisionLines() {
   // there is a label claiming words a raised count has put on the screen.
   for (const id of [...FOLD_LISTS, "side-cards"]) {
     for (const entry of foldsOf(document.getElementById(id))) {
-      const fresh = foldedTextLine(entry.body, entry.foldText);
+      const fresh = foldedTextLine(entry.body, entry.foldText, collapsedLines);
       const old = entry.elided;
       if (old && fresh) old.replaceWith(fresh);
       else if (old && !fresh) old.remove();
@@ -30521,9 +30406,6 @@ function renderBodyInto(parent, messages) {
 //     with an ellipsis, which would drop words.
 //   * ONLY THE ROW'S FIRST MESSAGE. A combined row (see `glom`) is headed by its first message; the
 //     later ones keep their first lines as written.
-
-/** The class on the words a heading restates. The server writes it too: `RESTATED_CLASS` in src/render.rs. */
-const RESTATED_CLASS = "rh-src";
 
 /**
  * Show headings in the header, or draw every first line as written, and remember which. The root's
