@@ -1171,8 +1171,9 @@ stays on NEW even if the stop then fails: a failed stop may already have
 closed OLD's pane, and NEW is live either way).
 Stopping the live designated coordinator without `--handover-to` is refused;
 an explicit `--force-coordinator` overrides with a warning, and a coordinator
-whose harness is gone, or the `--retire-dead-*` and
-`--recover-legacy-adoption` paths, go ahead with the same warning. Sends to a
+whose harness is gone, or the dead-record retirement and recovery paths
+(`--retire-dead-*` and the adoption-recovery flag), go ahead with the same
+warning. Sends to a
 target left missing or archived this way answer `undeliverable` and stay in
 the sender's outbox as `deferred`. `watch-agents` reports the same
 declaration red flags (`team_declarations` in each pass report, with a

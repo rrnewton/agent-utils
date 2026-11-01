@@ -342,7 +342,7 @@ pub fn names(registry: &Path) -> Result<Vec<String>> {
 /// cannot tell `coordinator`'s entries from `coordinator-tail`'s. The entry's own record
 /// decides: its `agent.json` (or the entry itself, when it is a file) names the agent. Only an
 /// entry with no readable record falls back to its file name, whose remainder after `NAME-`
-/// must then be one of the token shapes agentctl writes (`<digits>-<digits>`, optionally
+/// must then be one of the token shapes archived records use (`<digits>-<digits>`, optionally
 /// `-adopt-failed`, or `stale-` and 64 hex digits).
 ///
 /// # Errors
@@ -372,7 +372,7 @@ pub fn archived(registry: &Path, name: &str) -> Result<bool> {
     Ok(false)
 }
 
-/// Whether `rest` (an archive entry name after `NAME-`) is a token shape agentctl writes.
+/// Whether `rest` (an archive entry name after `NAME-`) is a token shape archived records use.
 fn archive_token_shape(rest: &str) -> bool {
     if let Some(digest) = rest.strip_prefix("stale-") {
         return digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit());
