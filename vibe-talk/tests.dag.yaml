@@ -1831,7 +1831,9 @@ steps:
     timeout: 240
     cpu_timeout: 120
     hint:
-      resources: {browser: 1}
+      # A latency budget measures the page, so it owns every browser slot,
+      # like timeline.browser.benchmark. Keep the 50 ms budget unchanged.
+      resources: {browser: 4}
       est_duration_s: 25
 
   # `#459 pack-keeps-card-still` and `#460 pack-gap-slide` in the browser engine, at 1280x800 with a mouse and

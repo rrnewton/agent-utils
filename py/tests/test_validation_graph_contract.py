@@ -966,6 +966,14 @@ def test_the_timeline_redraw_budget_holds_every_browser_slot() -> None:
     assert benchmark.hint.resources["browser"] == cfg.resource_caps["browser"]
 
 
+def test_the_fold_latency_budget_holds_every_browser_slot() -> None:
+    cfg = dag_from_path(REPO_ROOT / "validation.dag.yaml")
+    benchmark = cfg.by_tag()["vibe-talk.check.fold-latency-browser"]
+    assert benchmark.hint.resources["browser"] == cfg.resource_caps["browser"]
+    assert "--report-only" not in benchmark.cmd
+    assert "--budget-ms" not in benchmark.cmd
+
+
 # ---- `#361 python-minimum-timeout` --------------------------------------------------------------
 
 PY310_SHARDS = 6

@@ -540,7 +540,18 @@ def scroll_keys(walk: Walk, where: str) -> None:
 
     def moved(chord: str, sign: int) -> Json:
         before = walk.settled()
-        after = walk.key(chord)
+        press(walk.cdp, chord)
+        # The first visible row can belong to the previous view while its
+        # replacement read is still landing. Wait for this key's scroll to
+        # reach a page before judging whether the animation has stopped;
+        # four unchanged samples can otherwise mistake a delayed start for
+        # completion. Never press the key again or relax the distance check.
+        walk.page.wait_for_function(
+            "(state) => state.sign * (document.getElementById('scroll-area').scrollTop - state.top) >= state.minimum",
+            arg={"sign": sign, "top": number(before, "top"), "minimum": page_min},
+            timeout=4000,
+        )
+        after = walk.settled()
         delta = number(after, "top") - number(before, "top")
         check(after["screen"] == "main" and after["view"] == "discord",
               f"{where}: {chord!r} left the channel: {after}")
@@ -1612,8 +1623,11 @@ def main() -> int:
             # presses it again.
             page.click("#view-switch")
             page.wait_for_function("() => document.getElementById('view-switch').getAttribute('aria-checked') === 'false'")
-            page.click("#view-switch")
+            with page.expect_response(lambda response: "/timeline" in response.url) as read:
+                page.click("#view-switch")
+            read.value.finished()
             page.wait_for_selector(first_row, state="visible", timeout=10_000)
+            page.wait_for_function("() => document.getElementById('channel-loading').hidden")
             switched = walk.settled()
             check(on_list(switched), f"after a view switch the focus is on {switched['focus']!r}")
             scroll_keys(walk, "after a view switch")

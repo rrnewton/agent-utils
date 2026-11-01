@@ -329,7 +329,7 @@ def main() -> int:
                                                     [(file, part, instead) for part, instead in patches])
             failed = ""
             try:
-                walk(playwright.chromium, args, f"control-{at}", *CONTROL_SIZE[1:], rest_ms)
+                walk(playwright.chromium, args, f"control-{at}", *CONTROL_SIZE[1:], rest_ms, probe=tags)
             except AssertionError as error:
                 failed = str(error)
             finally:
@@ -344,7 +344,7 @@ def main() -> int:
 
 
 def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int, height: int,
-         thread_room: bool, rest_ms: float) -> str:
+         thread_room: bool, rest_ms: float, *, probe: tuple[str, ...] | None = None) -> str:
     """One reader at one desk, against a fresh fake API and a fresh browser profile."""
     api = OverscrollApi()
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler(api))
@@ -367,12 +367,15 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 context.add_init_script(UNSPLIT_CARDS_JS)
                 page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
                 open_columns(reader)
-                cards_walk(reader, rest_ms)
-                if thread_room:
-                    thread_walk(reader)
+                if probe is not None:
+                    control_probe(reader, rest_ms, probe)
                 else:
-                    thread_without_room(reader)
-                list_walk(reader)
+                    cards_walk(reader, rest_ms)
+                    if thread_room:
+                        thread_walk(reader)
+                    else:
+                        thread_without_room(reader)
+                    list_walk(reader)
                 reader.overflow()
                 reader.check(not errors, f"the page threw: {errors}")
             finally:
@@ -384,6 +387,29 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+def control_probe(reader: Reader, rest_ms: float, tags: tuple[str, ...]) -> None:
+    """Reach a control's original assertion without replaying unrelated positive checks.
+
+    Both unmodified sizes still run the entire walk. Controls prove specific
+    injected defects are detected, and main still requires their original
+    failure tags. Each probe uses the same wheel, key, and frame assertions.
+    An unknown control fails here rather than silently receiving less coverage.
+    """
+    if tags in (("JUMP", "FOLLOW"), ("STILL",)):
+        thread_walk(reader)
+    elif tags == ("DETENT",):
+        back_up(reader, "side-cards", "DETENT")
+        detent(reader, rest_ms)
+    elif tags == ("SEARCH",):
+        search_walk(reader)
+    elif tags in (("WHEEL",), ("HIGHLIGHT",)):
+        wheel_to_end(reader, "side-cards", "WHEEL")
+        if tags == ("HIGHLIGHT",):
+            highlight_walk(reader)
+    else:
+        raise AssertionError(f"no control probe for {tags}")
 
 
 def measure(reader: Reader, list_id: str) -> Room:
