@@ -47,7 +47,7 @@ pub struct ActivityBin {
 }
 
 fn round6(value: f64) -> f64 {
-    (value * 1_000_000.0).round_ties_even() / 1_000_000.0
+    crate::responsiveness::py_round(value, 6)
 }
 
 impl ActivityBin {

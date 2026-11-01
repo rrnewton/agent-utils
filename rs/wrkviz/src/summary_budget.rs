@@ -382,7 +382,7 @@ pub struct SummaryPlan {
 
 fn rounded(value: Option<f64>) -> Value {
     value.map_or(Value::Null, |item| {
-        let rounded = (item * 10_000.0).round() / 10_000.0;
+        let rounded = crate::responsiveness::py_round(item, 4);
         serde_json::Number::from_f64(rounded).map_or(Value::Null, Value::Number)
     })
 }
@@ -427,10 +427,12 @@ impl SummaryPlan {
     /// Estimated USD of the whole tree.
     pub fn estimated_usd(&self) -> Option<f64> {
         self.prices.map(|prices| {
-            self.stages
-                .iter()
-                .map(|stage| self.costs.usd(&stage.kind, stage.to_generate, &prices))
-                .sum()
+            // CPython `sum(...)` folds left-to-right from zero;
+            // Rust's float `sum` reassociates and can land one
+            // cent away when the total is formatted.
+            self.stages.iter().fold(0.0, |total, stage| {
+                total + self.costs.usd(&stage.kind, stage.to_generate, &prices)
+            })
         })
     }
 
