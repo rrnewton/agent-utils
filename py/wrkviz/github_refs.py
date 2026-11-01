@@ -161,6 +161,8 @@ def find_pull_request_references(
     references: list[PullRequestReference] = []
 
     for match in _EXPLICIT_URL.finditer(text):
+        if match.group("repository") in (".", ".."):
+            continue
         references.append(
             _reference(
                 match,
@@ -172,6 +174,8 @@ def find_pull_request_references(
         )
 
     for match in _QUALIFIED.finditer(text):
+        if match.group("repository") in (".", ".."):
+            continue
         references.append(
             _reference(
                 match,

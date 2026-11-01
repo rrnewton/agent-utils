@@ -323,6 +323,16 @@ _GITHUB_OWNER = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\Z")
 _GITHUB_REPOSITORY = re.compile(r"[A-Za-z0-9_.-]{1,100}\Z")
 
 
+def _is_repository_slug(slug: str) -> bool:
+    parts = slug.split("/")
+    return (
+        len(parts) == 2
+        and _GITHUB_OWNER.fullmatch(parts[0]) is not None
+        and _GITHUB_REPOSITORY.fullmatch(parts[1]) is not None
+        and parts[1] not in (".", "..")
+    )
+
+
 def _hash_id(prefix: str, material: str) -> str:
     return prefix + hashlib.sha256(material.encode("utf-8")).hexdigest()[:20]
 
@@ -937,9 +947,7 @@ def _source_repositories(source: _Source) -> tuple[_UrlIdentity, ...]:
                     slug = segment[index + 1]
                 elif token.startswith("--repo="):
                     slug = token.partition("=")[2]
-                if slug is not None and re.fullmatch(
-                    r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", slug
-                ):
+                if slug is not None and _is_repository_slug(slug):
                     identity = _repo_from_slug(slug)
                     found[identity.url] = identity
     return tuple(sorted(found.values(), key=lambda item: item.url))
@@ -1104,6 +1112,8 @@ def _contextual_references(
 ) -> tuple[_UrlIdentity, ...]:
     found: dict[str, _UrlIdentity] = {}
     for match in _QUALIFIED_PR.finditer(source.text):
+        if not _is_repository_slug(match.group("slug")):
+            continue
         repo = _repo_from_slug(match.group("slug"))
         number = match.group("number")
         identity = _UrlIdentity(

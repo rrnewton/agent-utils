@@ -125,3 +125,16 @@ def test_invalid_repository_context_is_rejected(context: str) -> None:
 )
 def test_malformed_or_embedded_references_are_not_linked(text: str) -> None:
     assert find_pull_request_references(text, "owner/context") == ()
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "see https://github.com/x/./pull/3 for details",
+        "see https://github.com/x/../pull/3 for details",
+        "the x/.#3 mention is prose, not a repository",
+        "the x/..#3 mention is prose, not a repository",
+    ],
+)
+def test_dot_repository_names_in_prose_are_not_linked(text: str) -> None:
+    assert find_pull_request_references(text) == ()

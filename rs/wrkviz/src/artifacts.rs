@@ -1745,6 +1745,7 @@ fn is_slug_pair(slug: &str) -> bool {
     };
     !owner.is_empty()
         && !repo.is_empty()
+        && !matches!(repo, "." | "..")
         && !repo.contains('/')
         && slug
             .chars()
@@ -2088,6 +2089,9 @@ fn contextual_references(source: &Source, repository_url: Option<&str>) -> Vec<U
             let after = &source.text[m.end()..];
             after.chars().next().is_some_and(|c| c.is_ascii_digit())
         }) {
+            continue;
+        }
+        if !is_slug_pair(&captured[1]) {
             continue;
         }
         let repo = repo_from_slug(&captured[1]);

@@ -425,6 +425,9 @@ fn find_references(
         }
         let owner = captures.name("owner").unwrap().as_str().to_string();
         let repository = captures.name("repository").unwrap().as_str().to_string();
+        if matches!(repository.as_str(), "." | "..") {
+            continue;
+        }
         let number: i64 = captures
             .name("number")
             .unwrap()
@@ -497,4 +500,22 @@ pub struct PullRequestMetadata {
     pub author: Option<String>,
     /// Updated at.
     pub updated_at: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dot_repository_names_in_prose_are_not_linked() {
+        for text in [
+            "see https://github.com/x/./pull/3 for details",
+            "see https://github.com/x/../pull/3 for details",
+            "the x/.#3 mention is prose, not a repository",
+            "the x/..#3 mention is prose, not a repository",
+        ] {
+            assert!(find_pull_request_references(text).is_empty(), "{text}");
+        }
+        assert_eq!(find_pull_request_references("owner/repo#3").len(), 1,);
+    }
 }
