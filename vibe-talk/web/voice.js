@@ -5495,22 +5495,6 @@ function searchable(row, ...parts) {
   row.setAttribute("data-search", parts.filter(Boolean).join(" ").toLowerCase());
 }
 
-/**
- * Add or remove ONE class word, leaving whatever else the element is wearing alone.
- *
- * The page's idiom everywhere else is to assign `className` outright, which is fine for an element
- * whose classes are all decided in one place. These rows are not that: a transcript row is `mine`
- * or `theirs`, a channel row carries `discord-message`, and the filter has an opinion about
- * neither.
- */
-function setClassWord(element, word, on) {
-  const words = element.className.split(/\s+/).filter((one) => one && one !== word);
-  if (on) {
-    words.push(word);
-  }
-  element.className = words.join(" ");
-}
-
 /** The lists the reader can actually see right now, which is what a count may speak for. */
 function searchScope() {
   return SEARCH_LISTS.filter(
@@ -5936,101 +5920,12 @@ const EXCERPT_CONTEXT = 30;
 /** How many places the line under a folded message shows before it says how many more there are. */
 const EXCERPT_PLACES = 3;
 
-/** An element's class words. */
-const classWords = (node) => String((node && node.className) || "").split(/\s+/);
-
-/**
- * Where each term is in `lower`, a lower-cased text, as `[start, end]` pairs in order: overlapping
- * and touching hits of different terms joined into one.
- */
-function hitRanges(lower, terms) {
-  const found = [];
-  for (const term of terms) {
-    for (let at = lower.indexOf(term); at >= 0; at = lower.indexOf(term, at + term.length)) {
-      found.push([at, at + term.length]);
-    }
-  }
-  found.sort((a, b) => a[0] - b[0]);
-  const joined = [];
-  for (const range of found) {
-    const last = joined[joined.length - 1];
-    if (last && range[0] <= last[1]) last[1] = Math.max(last[1], range[1]);
-    else joined.push([range[0], range[1]]);
-  }
-  return joined;
-}
-
-/**
- * The hits of `terms` in `text`, as `[start, end]` pairs in `text`'s own offsets. Matched in the
- * lower case the search matches in; where lower-casing changes a character's length, the offsets are
- * mapped back one character at a time.
- */
-function textHits(text, terms) {
-  const whole = text.toLowerCase();
-  if (whole.length === text.length) return hitRanges(whole, terms);
-  let lower = "";
-  const back = [];
-  for (let at = 0; at < text.length;) {
-    const character = String.fromCodePoint(/** @type {number} */ (text.codePointAt(at)));
-    const folded = character.toLowerCase();
-    for (let unit = 0; unit < folded.length; unit += 1) back.push(at);
-    lower += folded;
-    at += character.length;
-  }
-  back.push(text.length);
-  return hitRanges(lower, terms)
-    .map(([start, end]) => [back[start], back[end]])
-    .filter(([start, end]) => end > start);
-}
-
 /** A `<mark>` holding `text`, as a hit. */
 function hitMark(text) {
   const mark = document.createElement("mark");
   mark.className = SEARCH_HIT_CLASS;
   mark.textContent = text;
   return mark;
-}
-
-/**
- * The runs of text in `part`, each a list of the text nodes one block of it is drawn in, in order: a
- * block's edge, a line break or a control ends a run. An element holding its text without a text node
- * of its own stands for one (`own`); no browser builds one, but the page's test fixture does.
- *
- * @returns {Array<Array<{node: any, own: boolean}>>}
- */
-function textRunsOf(part) {
-  const runs = [];
-  let run = [];
-  const end = () => {
-    if (run.length) runs.push(run);
-    run = [];
-  };
-  const walk = (at) => {
-    const kids = at.childNodes;
-    if (kids.length === 0 && at.nodeType === 1 && at.textContent) {
-      run.push({ node: at, own: true });
-      return;
-    }
-    for (const kid of [...kids]) {
-      if (kid.nodeType === 3) {
-        if (kid.textContent) run.push({ node: kid, own: false });
-        continue;
-      }
-      if (kid.nodeType !== 1) continue;
-      const tag = String(kid.tagName).toLowerCase();
-      if (tag === "br" || tag === "button" || tag === "input") {
-        end();
-        continue;
-      }
-      const block = TEXT_BLOCKS.has(tag);
-      if (block) end();
-      walk(kid);
-      if (block) end();
-    }
-  };
-  walk(part);
-  end();
-  return runs;
 }
 
 /**
@@ -6119,44 +6014,6 @@ function unmarkHits(marks) {
       }
     }
   }
-}
-
-/**
- * The parts of `row` a hit is drawn in, and its author's name, which is lit whole. See the head of
- * this section for which and why.
- */
-function findableParts(row) {
-  const parts = [];
-  let author = null;
-  const fromMeta = (meta) => {
-    for (const piece of meta.children) {
-      const words = classWords(piece);
-      if (words.includes("msg-author") || words.includes("who")) author = piece;
-      // A rich header's pieces each on their own: `#242 rich-headers`.
-      else if (words.includes("rh-head")) parts.push(...piece.children);
-    }
-  };
-  for (const kid of row.children) {
-    const words = classWords(kid);
-    if (words.includes("meta")) fromMeta(kid);
-    else if (words.includes("body") || words.includes("msg-text") || words.includes("row-links")) parts.push(kid);
-    else if (words.includes("thread-open")) parts.push(...[...kid.children].filter((one) => String(one.tagName).toLowerCase() === "strong"));
-    else if (words.includes("side-card")) parts.push(...[...kid.children].filter((one) => classWords(one).includes("side-card-text")));
-  }
-  return { parts, author };
-}
-
-/** The anchors in `parts`, the drawn links among the row's words. */
-function anchorsAmong(parts) {
-  const found = [];
-  const walk = (at) => {
-    for (const kid of at.children) {
-      if (String(kid.tagName).toLowerCase() === "a") found.push(kid);
-      else walk(kid);
-    }
-  };
-  for (const part of parts) walk(part);
-  return found;
 }
 
 /** What the line under a folded message is read from: its messages' text, or a turn's. */
@@ -30227,11 +30084,6 @@ function textBody(text) {
   plainParagraphs(box, text);
   return box;
 }
-
-/** The elements whose edges are line ends when a body is read as text. */
-const TEXT_BLOCKS = new Set([
-  "blockquote", "div", "h1", "h2", "h3", "h4", "hr", "li", "ol", "p", "pre", "table", "tr", "ul",
-]);
 
 /**
  * What a drawn body SAYS, as text: what the reader sees, with a line end at each line break and at

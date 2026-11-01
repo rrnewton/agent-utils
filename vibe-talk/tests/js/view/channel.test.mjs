@@ -47,3 +47,20 @@ test("`#624 voice-page-modularity`: a time's title is worded again as the pointe
   assert.equal(other.attrs.get("title"), "stale");
   assert.equal(rowTime(null), null);
 });
+
+test("`#624 voice-page-modularity`: where a search's words are in a row, from the module alone", () => {
+  const { hitRanges, textHits, textRunsOf, findableParts, anchorsAmong } = CHANNEL_VIEW;
+  assert.deepStrictEqual(hitRanges("abcabc", ["bc", "ca"]), [[1, 6]], "overlapping hits were not joined");
+  // A character whose lower case is longer maps back to where it stands in the text.
+  assert.deepStrictEqual(textHits("İx", ["x"]), [[1, 2]]);
+  const body = node("div", [node("p", ["one ", node("em", ["two"])]), node("p", ["three"])]);
+  assert.deepStrictEqual(textRunsOf(body).map((run) => run.map(({ node: piece }) => piece.textContent)), [["one ", "two"], ["three"]]);
+  const row = { children: [
+    { className: "meta", children: [{ className: "msg-author", children: [] }] },
+    { className: "msg-text", children: [{ tagName: "A", children: [] }, { tagName: "P", children: [{ tagName: "A", children: [] }] }] },
+  ] };
+  const { parts, author } = findableParts(row);
+  assert.equal(parts.length, 1);
+  assert.equal(author.className, "msg-author");
+  assert.equal(anchorsAmong(parts).length, 2);
+});

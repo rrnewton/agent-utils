@@ -4,3 +4,4 @@
 
 export { FOLD_FLOW_BLOCKS, FOLD_INLINE, RESTATED_CLASS, elisionLine, foldRuns, foldedTextLine, textNodesOf } from "./fold.ts";
 export { DAY_TITLED, EDITED_MARK, freshenDayTitle, rowTime, rowTimeTabStop, timeNode } from "./time.ts";
+export { TEXT_BLOCKS, anchorsAmong, findableParts, hitRanges, textHits, textRunsOf } from "./hits.ts";

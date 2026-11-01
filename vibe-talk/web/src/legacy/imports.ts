@@ -156,7 +156,7 @@ export {
   createSettingsSync,
 } from "../core/settings/index.ts";
 export { createWebPorts } from "../platform/web/index.ts";
-export { childByClass, elementIn, focusMinimally, nodeWithin, shownNode } from "../view/dom/index.ts";
+export { childByClass, classWords, elementIn, focusMinimally, nodeWithin, setClassWord, shownNode } from "../view/dom/index.ts";
 export {
   COMPOSER_FIELDS,
   COMPOSER_GROW_BOXES,
@@ -268,9 +268,14 @@ export {
   DAY_TITLED,
   EDITED_MARK,
   RESTATED_CLASS,
+  TEXT_BLOCKS,
+  anchorsAmong,
+  findableParts,
   foldedTextLine,
   freshenDayTitle,
   rowTimeTabStop,
+  textHits,
+  textRunsOf,
   timeNode,
 } from "../view/channel/index.ts";
 
