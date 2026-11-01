@@ -465,6 +465,7 @@
         "py/tests/test_wrkviz_ingest_orc_rust.py",
         "py/tests/test_wrkviz_ingest_project_rust.py",
         "py/tests/test_wrkviz_inspect_rust.py",
+        "py/tests/test_wrkviz_losslessness_rust.py",
         "py/tests/test_wrkviz_migrate_rust.py",
         "py/tests/test_wrkviz_migrate_snapshots_rust.py",
         "py/tests/test_wrkviz_query_list_rust.py",

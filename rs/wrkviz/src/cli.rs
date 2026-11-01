@@ -381,6 +381,7 @@ pub fn run(args: &[String]) -> u8 {
         "refresh-claude" => run_refresh(&args[1..], RefreshKind::Claude),
         "refresh-orc" => run_refresh(&args[1..], RefreshKind::Orc),
         "audit-glossary" => run_audit_glossary(&args[1..]),
+        "audit-losslessness" => run_audit_losslessness(&args[1..]),
         other => {
             eprintln!(
                 "wrkviz: the Rust edition has not ported '{other}' yet; the Python edition remains the oracle for it"
@@ -5386,6 +5387,143 @@ fn run_audit_glossary(args: &[String]) -> u8 {
                 );
             }
             0
+        }
+        Err(error) => {
+            eprintln!("wrkviz: {error}");
+            2
+        }
+    }
+}
+
+const AUDIT_LOSSLESSNESS_HELP: &str = r##"usage: wrkviz audit-losslessness [-h] --output OUTPUT [--team TEAM]
+                                 [--format {text,json}] [--require-lossless]
+
+re-enumerate each team's vendor source snapshots and require every row to fall
+under a declared rule saying what became of it, then check the rule's claim
+against raw/team.json and the payload store. Exits 1 when a row matches no
+rule or a rule's claim is false; exits 0, and reports the remaining inventory,
+when the archive's account of itself holds. Run this before deleting source
+snapshots
+
+options:
+  -h, --help            show this help message and exit
+  --output OUTPUT       durable archive directory
+  --team TEAM           team slug to audit; repeat as needed (default: every
+                        archive team)
+  --format {text,json}  report format (default: text)
+  --require-lossless    also exit 1 while any vendor row's content is still
+                        absent from the archive; this is the check to gate an
+                        actual deletion on
+"##;
+
+const AUDIT_LOSSLESSNESS_USAGE: &str = "usage: wrkviz audit-losslessness [-h] --output OUTPUT [--team TEAM]\n                                 [--format {text,json}] [--require-lossless]";
+
+fn run_audit_losslessness(args: &[String]) -> u8 {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print!("{AUDIT_LOSSLESSNESS_HELP}");
+        return 0;
+    }
+    const VALUE_OPTIONS: &[&str] = &["--output", "--team", "--format"];
+    const FLAG_OPTIONS: &[&str] = &["--require-lossless"];
+    let mut values: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    let mut flags: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        let (head, explicit) = match arg.split_once('=') {
+            Some((head, value)) => (head, Some(value.to_string())),
+            None => (arg.as_str(), None),
+        };
+        let resolve = |set: &[&str]| -> Vec<String> {
+            set.iter()
+                .copied()
+                .filter(|name| {
+                    head == *name
+                        || (head.len() > 2 && head.starts_with("--") && name.starts_with(head))
+                })
+                .map(str::to_string)
+                .collect()
+        };
+        let value_candidates = resolve(VALUE_OPTIONS);
+        let flag_candidates = resolve(FLAG_OPTIONS);
+        if explicit.is_none() && flag_candidates.len() == 1 {
+            flags.insert(flag_candidates[0].clone());
+            index += 1;
+            continue;
+        }
+        if value_candidates.len() > 1 && !value_candidates.contains(&head.to_string()) {
+            return argparse_error(
+                AUDIT_LOSSLESSNESS_USAGE,
+                "wrkviz audit-losslessness",
+                &format!(
+                    "ambiguous option: {head} could match {}",
+                    value_candidates.join(", ")
+                ),
+            );
+        }
+        let Some(name) = value_candidates.first() else {
+            return argparse_error(
+                AUDIT_LOSSLESSNESS_USAGE,
+                "wrkviz audit-losslessness",
+                &format!("unrecognized arguments: {arg}"),
+            );
+        };
+        let name = name.clone();
+        let value = match explicit {
+            Some(value) => value,
+            None => {
+                index += 1;
+                match args.get(index) {
+                    Some(value) => value.clone(),
+                    None => {
+                        return argparse_error(
+                            AUDIT_LOSSLESSNESS_USAGE,
+                            "wrkviz audit-losslessness",
+                            &format!("argument {name}: expected one argument"),
+                        )
+                    }
+                }
+            }
+        };
+        values.entry(name).or_default().push(value);
+        index += 1;
+    }
+    let get = |name: &str| values.get(name).and_then(|items| items.last()).cloned();
+    if get("--output").is_none() {
+        return argparse_error(
+            AUDIT_LOSSLESSNESS_USAGE,
+            "wrkviz audit-losslessness",
+            "the following arguments are required: --output",
+        );
+    }
+    let format = get("--format").unwrap_or_else(|| "text".to_string());
+    if format != "text" && format != "json" {
+        return argparse_error(
+            AUDIT_LOSSLESSNESS_USAGE,
+            "wrkviz audit-losslessness",
+            &format!("argument --format: invalid choice: '{format}' (choose from 'text', 'json')"),
+        );
+    }
+    let teams: Vec<String> = values.get("--team").cloned().unwrap_or_default();
+    let archive = cli_path(&get("--output").unwrap());
+    match crate::losslessness::audit_archive_losslessness(&archive, &teams) {
+        Ok(report) => {
+            if format == "json" {
+                print!("{}", crate::json::dump_canonical(&report.to_json_obj()));
+            } else {
+                print!(
+                    "{}",
+                    crate::losslessness::format_losslessness_audit(&report)
+                );
+            }
+            // Exit 1, not 2: a finding about the archive, not a
+            // failure to run.
+            if !report.sound() || (flags.contains("--require-lossless") && !report.lossless()) {
+                1
+            } else {
+                0
+            }
         }
         Err(error) => {
             eprintln!("wrkviz: {error}");

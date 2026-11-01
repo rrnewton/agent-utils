@@ -7,9 +7,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value};
 use sha2::Digest as _;
 
-use crate::json::{
-    as_array, as_int, as_object, as_string, dump_canonical, dump_compact, read_json,
-};
+use crate::json::{as_int, as_object, as_string, dump_canonical, dump_compact, read_json};
 use crate::team_data::PayloadRef;
 use crate::transcript_io::write_text_if_changed;
 
@@ -240,13 +238,12 @@ pub fn load_payload_manifest(root: &Path) -> Result<Option<PayloadManifest>, Str
     if !crate::json::json_eq_one(object.get("schema_version")) || !tool_ok {
         return Err(format!("invalid payload manifest at {}", path.display()));
     }
-    let raw_shards = as_array(
-        object.get("shards").unwrap_or(&Value::Null),
-        &format!(
+    let Some(raw_shards) = object.get("shards").and_then(Value::as_array) else {
+        return Err(format!(
             "{}: payload manifest shards is not an array",
             path.display()
-        ),
-    )?;
+        ));
+    };
     let mut shards = Vec::new();
     for (index, item) in raw_shards.iter().enumerate() {
         let where_ = format!("{}: shards[{index}]", path.display());
@@ -448,4 +445,107 @@ pub fn merge_payloads(root: &Path, texts: &[String]) -> Result<PayloadWriteRepor
         pruned_shards: pruned,
         damaged_shards: damaged,
     })
+}
+
+/// CPython `Path.read_text` universal-newline translation.
+fn universal_newlines(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn read_shard_lines(path: &Path) -> Result<BTreeMap<String, String>, String> {
+    if path.is_symlink() || !path.is_file() {
+        return Ok(BTreeMap::new());
+    }
+    let text =
+        std::fs::read_to_string(path).map_err(|error| crate::json::os_error(&error, path))?;
+    index_shard_lines(&universal_newlines(&text), path)
+}
+
+/// Return the stored text for every reference that resolves,
+/// keyed by digest. Grouped by shard so resolving every
+/// reference in a team opens each shard once.
+pub fn resolve_payloads(
+    root: &Path,
+    refs: &[PayloadRef],
+) -> Result<BTreeMap<String, String>, String> {
+    let wanted: BTreeSet<&str> = refs.iter().map(|item| item.sha256.as_str()).collect();
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    for digest in &wanted {
+        names.insert(shard_name(digest)?);
+    }
+    let mut resolved: BTreeMap<String, String> = BTreeMap::new();
+    for name in names {
+        let path = root.join(&name);
+        for (digest, line) in read_shard_lines(&path)? {
+            if wanted.contains(digest.as_str()) {
+                let text = text_of_line(&line, &format!("{}#{digest}", path.display()))?;
+                resolved.insert(digest, text);
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+/// Recompute every digest from its own text and return the
+/// discrepancies found: the deliberate, occasional, whole-tree
+/// confirmation the merge path trusts the format to not need.
+pub fn verify_payload_store(root: &Path) -> Result<Vec<String>, String> {
+    let mut problems: Vec<String> = Vec::new();
+    let manifest = load_payload_manifest(root)?;
+    let recorded: BTreeMap<String, PayloadShardRecord> = manifest
+        .map(|item| {
+            item.shards
+                .iter()
+                .map(|shard| (shard.name.clone(), shard.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut present: BTreeMap<String, PathBuf> = BTreeMap::new();
+    for path in shard_paths(root) {
+        if let Some(name) = path
+            .file_name()
+            .map(|item| item.to_string_lossy().into_owned())
+        {
+            present.insert(name, path);
+        }
+    }
+    let names: BTreeSet<&String> = recorded.keys().chain(present.keys()).collect();
+    for name in names {
+        let Some(path) = present.get(name) else {
+            problems.push(format!(
+                "{name}: recorded in the manifest but absent from the tree"
+            ));
+            continue;
+        };
+        let text = universal_newlines(
+            &std::fs::read_to_string(path).map_err(|error| crate::json::os_error(&error, path))?,
+        );
+        match recorded.get(name) {
+            None => problems.push(format!(
+                "{name}: present in the tree but absent from the manifest"
+            )),
+            Some(shard) if sha256_hex(text.as_bytes()) != shard.sha256 => problems.push(format!(
+                "{name}: shard bytes do not match the digest recorded for them"
+            )),
+            _ => {}
+        }
+        for (index, line) in text.split('\n').enumerate() {
+            if line.is_empty() {
+                continue;
+            }
+            let where_ = format!("{name}:{}", index + 1);
+            let claimed = digest_of_line(line, &where_)?;
+            let actual = payload_digest(&text_of_line(line, &where_)?);
+            if actual != claimed {
+                problems.push(format!(
+                    "{where_}: text hashes to {actual}, stored under {claimed}"
+                ));
+            } else if shard_name(&claimed)? != *name {
+                problems.push(format!(
+                    "{where_}: digest {claimed} belongs in a different shard"
+                ));
+            }
+        }
+    }
+    Ok(problems)
 }

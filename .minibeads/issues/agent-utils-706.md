@@ -294,3 +294,27 @@ delegated-live-scope cross skips).
 Remaining composites: audit-losslessness, responsiveness,
 discover-agents, `--userguide`, multi-team export; then the edition
 switch at parity and the generated-schema collapse.
+
+`audit-losslessness` is ported: the Codex row-by-row differential
+over vendor snapshots in `rs/wrkviz/src/losslessness.rs` (all 32
+rules with verbatim reasons, positional prefix/superseded/unbounded
+classification, deferred corpus-id checks), plus
+`resolve_payloads`/`verify_payload_store` in
+`rs/wrkviz/src/payloads.rs` at oracle parity (including CPython
+universal-newline shard reads and negative `copied_bytes` manifest
+slices). Transcript parsing reuses `agent_harness::rollout` and the
+existing Rust codex canonical-record machinery; no second parser.
+Differential: `py/tests/test_wrkviz_losslessness_rust.py` (5 cases:
+full rule-table fixture over root/child/unbounded rollouts, text and
+JSON, `--require-lossless`, skipped teams, source/payload findings,
+refusals, help). Adversarial review found and fixed a negative-
+`copied_bytes` panic, CRLF shard handling, a DEL escape in
+`_textual`, and one manifest error wording. Accepted gaps, same
+classes as before: `NaN` vendor output text (serde rewrites the
+constant before `_textual` sees it), CPython `JSONDecodeError`
+wording on malformed payload lines, the shared `py_repr_str`
+nonprintable table, and Unicode-digit `int()` in continuation ids.
+
+Remaining composites: responsiveness, discover-agents,
+`--userguide`, multi-team export; then the edition switch at parity
+and the generated-schema collapse.

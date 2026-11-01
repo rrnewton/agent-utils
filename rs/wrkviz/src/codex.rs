@@ -60,7 +60,9 @@ fn ascii_dump(value: &Value) -> String {
     let compact = crate::json::dump_compact(value);
     let mut out = String::with_capacity(compact.len());
     for c in compact.chars() {
-        if (c as u32) < 0x80 {
+        if c == '\u{7f}' {
+            out.push_str("\\u007f");
+        } else if (c as u32) < 0x80 {
             out.push(c);
         } else if (c as u32) <= 0xffff {
             out.push_str(&format!("\\u{:04x}", c as u32));
@@ -83,7 +85,7 @@ fn int_of(value: Option<&Value>) -> Option<i64> {
     }
 }
 
-fn textual(value: Option<&Value>) -> Option<String> {
+pub(crate) fn textual(value: Option<&Value>) -> Option<String> {
     match value {
         None | Some(Value::Null) => None,
         Some(Value::String(text)) => Some(text.clone()),
@@ -279,7 +281,10 @@ fn parse_json_object(raw: &[u8], where_: &str) -> Result<Map<String, Value>, Str
     }
 }
 
-fn complete_records(complete: &[u8], where_: &str) -> Result<Vec<RolloutRecord>, String> {
+pub(crate) fn complete_records(
+    complete: &[u8],
+    where_: &str,
+) -> Result<Vec<RolloutRecord>, String> {
     parse_rollout_records(complete).map_err(|error| match error {
         RolloutError::InvalidJson(line) => {
             let lines: Vec<&[u8]> = complete.split(|byte| *byte == b'\n').collect();
@@ -1197,7 +1202,7 @@ struct AgentSeed {
     raw_agent_path: String,
 }
 
-fn canonical_records(
+pub(crate) fn canonical_records(
     records: &[RolloutRecord],
     metadata: &Map<String, Value>,
     root_thread_id: &str,

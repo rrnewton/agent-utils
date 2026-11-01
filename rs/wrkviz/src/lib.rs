@@ -51,6 +51,9 @@ pub mod inspect;
 /// The archive JSON value domain and the Python-shaped readers
 /// over it.
 pub mod json;
+/// Read-only losslessness audit of vendor snapshots against the
+/// archive.
+pub mod losslessness;
 /// Muse session lineage ingestion.
 pub mod muse;
 /// Hindsight agent naming.
