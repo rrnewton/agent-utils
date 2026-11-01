@@ -1,10 +1,11 @@
 ---
 title: 'agent-teams-slack-relay: chat relay route via Slack/Discord (provider-neutral relay_channels)'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 created_at: 2026-11-01T06:48:05.653855135+00:00
-updated_at: 2026-11-01T06:48:05.653855135+00:00
+updated_at: 2026-11-01T12:50:58.364862501+00:00
+closed_at: 2026-11-01T12:50:58.364862361+00:00
 ---
 
 # Description
