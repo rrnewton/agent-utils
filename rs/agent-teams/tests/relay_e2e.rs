@@ -799,6 +799,90 @@ fn slack_mangled_own_announce_is_ignored_not_stranger() {
 }
 
 #[test]
+fn quarantine_retry_recovers_prefix_posts_and_drop_discards() {
+    // Posts quarantined by the pre-fix parser (bare-fence announces that
+    // read as "no agent-teams fenced block") sit in quarantine with their
+    // raw text stored. `relay quarantine retry` replays them through the
+    // current parser; `drop` discards without delivering.
+    const SHARED: &str = "USHAREDBOT";
+    let world = World::new();
+    world.init_tools(&format!("relay-coord:{CHAN}:{SHARED}=sim@host-a"));
+    let (_, public) =
+        agent_teams::relay::ensure_signing_key(&world.state, "tools", "host-a").expect("key");
+    let mut own = agent_teams::relay::build_announce(
+        "tools",
+        "host-a",
+        SHARED,
+        "https://example.invalid/org/repo.git",
+    );
+    own["pubkey"] = serde_json::json!(public);
+    own["integrity"] = serde_json::json!(agent_teams::relay::announce_integrity(&own));
+    let own_post =
+        agent_teams::relay::render_announce(&own).replace("```agent-teams-announce", "```");
+    let mut peer = agent_teams::relay::build_announce(
+        "sim",
+        "host-a",
+        SHARED,
+        "https://example.invalid/org/repo.git",
+    );
+    peer["pubkey"] = serde_json::json!("00".repeat(32));
+    peer["integrity"] = serde_json::json!(agent_teams::relay::announce_integrity(&peer));
+    let peer_post =
+        agent_teams::relay::render_announce(&peer).replace("```agent-teams-announce", "```");
+    // Seed quarantine exactly as the pre-fix parser recorded it: a stub
+    // envelope plus the raw post text.
+    let relay_dir = world.state.join("relay");
+    std::fs::create_dir_all(&relay_dir).expect("relay dir");
+    let seed = serde_json::json!({"schema": "agent-teams-relay/v1", "posts": [
+        {"id": "unparseable-own1", "peer_sender": SHARED, "route": "relay-coord",
+         "channel": CHAN, "envelope": {"id": "unparseable-own1", "unparseable": true},
+         "post": own_post, "reason": "unparseable relay post: no agent-teams fenced block",
+         "quarantined_at": "2026-11-01T00:00:00Z"},
+        {"id": "unparseable-peer1", "peer_sender": SHARED, "route": "relay-coord",
+         "channel": CHAN, "envelope": {"id": "unparseable-peer1", "unparseable": true},
+         "post": peer_post, "reason": "unparseable relay post: no agent-teams fenced block",
+         "quarantined_at": "2026-11-01T00:00:00Z"},
+    ]});
+    std::fs::write(
+        relay_dir.join("quarantine.json"),
+        serde_json::to_string(&seed).unwrap(),
+    )
+    .expect("seed quarantine");
+    let (code, out, err) = world.run(&["relay", "quarantine", "retry"]);
+    assert_eq!(code, 0, "{out} {err}");
+    assert!(
+        out.contains("unparseable-own1: ignored-own-announce"),
+        "{out}"
+    );
+    assert!(
+        out.contains("unparseable-peer1: candidate-recorded"),
+        "{out}"
+    );
+    assert!(
+        agent_teams::relay::quarantined_posts(&world.state).is_empty(),
+        "both recovered posts leave quarantine"
+    );
+    // A post that still does not parse stays quarantined after retry,
+    // and drop removes it without delivery.
+    let outcome = world.relay_in(SHARED, "definitely not a relay post");
+    assert_eq!(outcome["outcome"], "not-recorded", "{outcome}");
+    let stuck = agent_teams::relay::quarantined_posts(&world.state);
+    assert_eq!(stuck.len(), 1, "{stuck:?}");
+    let stuck_id = stuck[0]["id"].as_str().expect("stuck id").to_string();
+    let (code, out, err) = world.run(&["relay", "quarantine", "retry", &stuck_id]);
+    assert_eq!(code, 0, "{out} {err}");
+    assert!(out.contains("not-recorded"), "{out}");
+    assert_eq!(agent_teams::relay::quarantined_posts(&world.state).len(), 1);
+    let (code, out, err) = world.run(&["relay", "quarantine", "drop", &stuck_id]);
+    assert_eq!(code, 0, "{out} {err}");
+    assert!(out.contains("dropped"), "{out}");
+    assert!(agent_teams::relay::quarantined_posts(&world.state).is_empty());
+    let (code, out, _) = world.run(&["relay", "quarantine", "list"]);
+    assert_eq!(code, 0);
+    assert!(out.contains("empty"), "{out}");
+}
+
+#[test]
 fn setup_suggests_a_per_fleet_channel_and_writes_nothing() {
     let world = World::new();
     let (code, out, _) = world.run(&[

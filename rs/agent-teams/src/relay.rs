@@ -2027,6 +2027,109 @@ pub fn drain_quarantine(state: &Path, this_host: &str) -> DataResult<DrainOutcom
     Ok(DrainOutcome { delivered, dropped })
 }
 
+/// Remove exactly one quarantined post (by quarantine ID) if present.
+fn remove_quarantined(state: &Path, id: &str, peer_sender: &str) -> DataResult<bool> {
+    let _lock = lock_store(state)?;
+    let mut quarantine = load_json_list(&quarantine_path(state), "posts");
+    let posts = quarantine
+        .get_mut("posts")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| DataError::new("relay-quarantine", "posts is not a list"))?;
+    let before = posts.len();
+    posts.retain(|post| {
+        !(post.get("id").and_then(Value::as_str) == Some(id)
+            && post.get("peer_sender").and_then(Value::as_str) == Some(peer_sender))
+    });
+    let removed = posts.len() != before;
+    if removed {
+        write_json_atomic(&quarantine_path(state), &quarantine)?;
+    }
+    Ok(removed)
+}
+
+/// Reprocess quarantined posts through `relay_in` with the current
+/// parser and trust state. This is how posts quarantined by a since-
+/// fixed parser (or before their sender was confirmed) are recovered:
+/// each stored raw post is replayed exactly as the bridge would deliver
+/// it now. A post whose new outcome is anything other than
+/// stranger-quarantined / not-recorded is consumed and removed from
+/// quarantine; one that still fails stays quarantined and loud.
+/// With `only_id`, only that quarantine ID is retried. Returns
+/// `(quarantine id, outcome)` for every post tried.
+pub fn retry_quarantine(
+    state: &Path,
+    this_host: &str,
+    only_id: Option<&str>,
+) -> DataResult<Vec<(String, String)>> {
+    let mut results = Vec::new();
+    for post in quarantined_posts(state) {
+        let id = post
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if only_id.is_some_and(|only| only != id) {
+            continue;
+        }
+        let peer_sender = post
+            .get("peer_sender")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let Some(raw) = post.get("post").and_then(Value::as_str) else {
+            results.push((id, "no-stored-post".to_string()));
+            continue;
+        };
+        let route = post.get("route").and_then(Value::as_str).unwrap_or("");
+        let channel = post.get("channel").and_then(Value::as_str).unwrap_or("");
+        let out = relay_in(
+            state,
+            this_host,
+            route,
+            &peer_sender,
+            channel,
+            "",
+            false,
+            raw,
+        )?;
+        let consumed = !matches!(out.outcome.as_str(), "stranger-quarantined" | NOT_RECORDED);
+        if consumed {
+            remove_quarantined(state, &id, &peer_sender)?;
+        }
+        log_event(
+            state,
+            &json!({"event": "relay-quarantine", "outcome": format!("retry:{}", out.outcome), "id": id, "peer_sender": peer_sender}),
+        );
+        results.push((id, out.outcome));
+    }
+    Ok(results)
+}
+
+/// Drop one quarantined post by quarantine ID, without delivering it:
+/// the owner's explicit discard for a post that will never be admitted.
+/// Returns whether an entry was removed.
+pub fn drop_quarantined(state: &Path, id: &str) -> DataResult<bool> {
+    let peer_sender = quarantined_posts(state)
+        .iter()
+        .find(|post| post.get("id").and_then(Value::as_str) == Some(id))
+        .and_then(|post| {
+            post.get("peer_sender")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+    let Some(peer_sender) = peer_sender else {
+        return Ok(false);
+    };
+    let removed = remove_quarantined(state, id, &peer_sender)?;
+    if removed {
+        log_event(
+            state,
+            &json!({"event": "relay-quarantine", "outcome": "dropped-by-owner", "id": id, "peer_sender": peer_sender}),
+        );
+    }
+    Ok(removed)
+}
+
 /// Teams known to the relay on this host, for `relay teams`: confirmed
 /// mappings and unconfirmed candidates, optionally filtered to one repo.
 pub fn known_teams(state: &Path, repo_filter: Option<&str>) -> Vec<Value> {

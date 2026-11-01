@@ -2078,9 +2078,66 @@ fn cmd_relay(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
         Some("unban") => cmd_relay_unban(globals, args),
         Some("alarms") => cmd_relay_alarms(globals, args),
         Some("keygen") => cmd_relay_keygen(globals, args),
+        Some("quarantine") => cmd_relay_quarantine(globals, args),
         _ => Err(err(
             "usage",
-            "relay subcommands: setup, status, announce, teams, confirm, ban, unban, alarms, keygen",
+            "relay subcommands: setup, status, announce, teams, confirm, ban, unban, alarms, keygen, quarantine",
+        )),
+    }
+}
+
+fn cmd_relay_quarantine(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
+    // args still carries the leading "quarantine" verb from cmd_relay.
+    let positional = positional(args);
+    let verb = positional.get(1).map(String::as_str);
+    let target = positional.get(2).map(String::as_str);
+    match verb {
+        Some("list") | None => {
+            let posts = crate::relay::quarantined_posts(&globals.state);
+            if globals.json {
+                println!("{}", serde_json::to_string_pretty(&json!(posts))?);
+                return Ok(0);
+            }
+            if posts.is_empty() {
+                println!("quarantine is empty");
+            }
+            for post in &posts {
+                println!(
+                    "{} from {} on {} ({}): {}",
+                    post["id"].as_str().unwrap_or("?"),
+                    post["peer_sender"].as_str().unwrap_or("?"),
+                    post["route"].as_str().unwrap_or("?"),
+                    post["quarantined_at"].as_str().unwrap_or("?"),
+                    post["reason"].as_str().unwrap_or("?"),
+                );
+            }
+            Ok(0)
+        }
+        Some("retry") => {
+            let results = crate::relay::retry_quarantine(&globals.state, &globals.host, target)?;
+            if results.is_empty() {
+                println!("no quarantined post matched");
+            }
+            for (id, outcome) in &results {
+                println!("{id}: {outcome}");
+            }
+            Ok(0)
+        }
+        Some("drop") => {
+            let Some(id) = target else {
+                return Err(err("usage", "relay quarantine drop needs a quarantine ID"));
+            };
+            if crate::relay::drop_quarantined(&globals.state, id)? {
+                println!("dropped quarantined post {id} (not delivered)");
+                Ok(0)
+            } else {
+                println!("no quarantined post with ID {id}");
+                Ok(1)
+            }
+        }
+        _ => Err(err(
+            "usage",
+            "relay quarantine subcommands: list, retry [<id>], drop <id>",
         )),
     }
 }

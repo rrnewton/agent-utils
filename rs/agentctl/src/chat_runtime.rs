@@ -7013,11 +7013,12 @@ impl BridgeState {
     /// again, and the receiver's ledger absorbs the duplicate (the
     /// exactly-once point is the receiving `agent-teams` ledger, never the
     /// bridge). This never creates a request and never types anything.
-    /// Record one failed relay dispatch. Failures below the retry bound
-    /// refuse admission, so the cursor never commits past a post whose
-    /// outcome is unknown; at the bound a durable alarm is written and the
-    /// batch may proceed, so a poison post cannot wedge owner traffic and
-    /// is never silently lost either way.
+    /// Record one failed relay dispatch. Every failure refuses
+    /// admission, so the cursor never commits past a post whose outcome
+    /// is unknown; at the third failure a durable alarm is also written
+    /// (one per message, refreshed on later failures, surfaced in bridge
+    /// status). A post that keeps failing stays loud and uncommitted
+    /// until an operator fixes the cause — never silently lost.
     fn relay_dispatch_failed(&self, message: &SavedMessage, detail: &str) -> Result<String> {
         let path = self.root.join("relay-failures.json");
         let mut doc: Value = fs::read_to_string(&path)
@@ -7044,6 +7045,10 @@ impl BridgeState {
                 message.message_id
             )));
         }
+        // Third and later failures: alarm durably, and still refuse
+        // admission. The cursor must never move past an undelivered
+        // relay post; the alarm (bridge status) is what makes the
+        // blockage loud instead of silent.
         let alarm_path = self.root.join("relay-alarms.json");
         let mut alarms: Value = fs::read_to_string(&alarm_path)
             .ok()
@@ -7061,7 +7066,11 @@ impl BridgeState {
             }));
         }
         write_document(&alarm_path, &alarms)?;
-        Ok("command-failed-alarmed".to_string())
+        Err(ChatRuntimeError::invalid(format!(
+            "relay dispatch for {} failed (attempt {count}/3): {detail}; \
+             cursor not committed; durable relay alarm written",
+            message.message_id
+        )))
     }
 
     fn relay_already_dispatched(&self, message_id: &str) -> bool {
@@ -7203,11 +7212,17 @@ impl BridgeState {
                         if !receipt_posted {
                             match self.outbound_transport() {
                                 Ok(Some(mut transport)) => {
+                                    let operation_id = relay_receipt_operation_id(
+                                        &message.channel_id,
+                                        &message.thread_id,
+                                        &message.message_id,
+                                        text,
+                                    );
                                     let submission = ReplySubmission {
                                         channel_id: &message.channel_id,
                                         thread_id: &message.thread_id,
                                         body: text,
-                                        request_id: &message.message_id,
+                                        request_id: &operation_id,
                                     };
                                     match transport.send(submission) {
                                         Ok(_) => receipt_posted = true,
@@ -17004,6 +17019,43 @@ fn random_reply_nonce() -> Result<String> {
     Ok(base64url_nonce(random_bytes()?))
 }
 
+/// The outbound operation ID for one bridge-posted relay receipt.
+///
+/// Provider message IDs (a Slack timestamp, say) are not UUIDs, and the
+/// outbound helper only accepts a lowercase RFC 4122 version-4 UUID as
+/// its operation ID — handing it the message ID makes every receipt
+/// post fail. This derives a deterministic version-4-shaped UUID from
+/// the relay post and the receipt body: retries of the same receipt
+/// reuse the same operation ID, so the helper's idempotency ledger
+/// absorbs them, while a different receipt gets a different ID.
+#[must_use]
+pub fn relay_receipt_operation_id(
+    channel_id: &str,
+    thread_id: &str,
+    message_id: &str,
+    receipt_body: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"agent-teams-relay-receipt\0");
+    hasher.update(channel_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(thread_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(message_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(receipt_body.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+    )
+}
+
 pub(crate) fn random_operation_uuid() -> Result<String> {
     let mut bytes = random_bytes()?;
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
@@ -19038,15 +19090,16 @@ mod tests {
         assert!(state.admit_batch(&batch(1)).is_err());
         assert_eq!(state.cursor().expect("cursor"), None);
         assert!(state.admit_batch(&batch(1)).is_err());
-        // Third failure writes a durable alarm and lets the batch proceed.
-        let admission = state.admit_batch(&batch(1)).expect("alarmed admission");
-        assert_eq!(admission.relay_dispatches.len(), 1);
-        assert_eq!(admission.relay_dispatches[0].peer_team, "unlisted");
-        assert_eq!(
-            admission.relay_dispatches[0].outcome,
-            "command-failed-alarmed"
-        );
+        // Third failure writes a durable alarm and still refuses: the
+        // cursor never commits past an undelivered relay post.
+        assert!(state.admit_batch(&batch(1)).is_err());
+        assert_eq!(state.cursor().expect("cursor"), None);
         assert!(root.join("relay-alarms.json").exists(), "durable alarm");
+        let status = state.status().expect("status");
+        assert_eq!(status["relay_alarms"].as_array().map(Vec::len), Some(1));
+        // Later failures keep refusing and never duplicate the alarm.
+        assert!(state.admit_batch(&batch(1)).is_err());
+        assert_eq!(state.cursor().expect("cursor"), None);
         let status = state.status().expect("status");
         assert_eq!(status["relay_alarms"].as_array().map(Vec::len), Some(1));
         fs::remove_dir_all(root).unwrap();
@@ -32654,6 +32707,34 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
             1
         );
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn relay_receipt_operation_id_is_a_deterministic_valid_uuid() {
+        // The exact live shape: a Slack channel/message/thread ID set,
+        // none of which is a UUID. The receipt post's operation ID must
+        // still pass the outbound helper's UUID validation.
+        let channel = "C1234567890";
+        let thread = "C1234567890/threads/1793562265.920569";
+        let message = "C1234567890/messages/1793562265.920569";
+        let body = "agent-teams receipt: accepted\n";
+        let id = relay_receipt_operation_id(channel, thread, message, body);
+        assert!(valid_operation_uuid(&id), "helper accepts it: {id}");
+        // Deterministic: a retry of the same receipt reuses the ID, so
+        // the helper's idempotency ledger absorbs the duplicate.
+        assert_eq!(
+            id,
+            relay_receipt_operation_id(channel, thread, message, body)
+        );
+        // A different post or a different receipt gets a different ID.
+        assert_ne!(
+            id,
+            relay_receipt_operation_id(channel, thread, "C1234567890/messages/1.5", body)
+        );
+        assert_ne!(
+            id,
+            relay_receipt_operation_id(channel, thread, message, "agent-teams receipt: deferred\n")
+        );
     }
 
     #[test]

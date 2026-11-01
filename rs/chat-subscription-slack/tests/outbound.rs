@@ -201,6 +201,44 @@ fn reply_goes_into_the_request_thread_as_the_app() {
 }
 
 #[test]
+fn relay_receipt_operation_id_passes_real_helper_validation() {
+    // The bridge posts relay receipts with an operation ID derived from
+    // the Slack post (whose own ID is a timestamp, not a UUID). Run that
+    // exact ID through the real helper's request handling: it must be
+    // accepted, and a retry with the same ID must not post twice.
+    let ledger = ledger("relay-receipt");
+    let config = config(&ledger, Some(APP));
+    let fake = FakeTransport::new();
+    let thread_ts = "1793562265.920569";
+    let operation_id = agentctl::chat_runtime::relay_receipt_operation_id(
+        CHANNEL,
+        &format!("{CHANNEL}/threads/{thread_ts}"),
+        &format!("{CHANNEL}/messages/{thread_ts}"),
+        "agent-teams receipt: accepted\n",
+    );
+    let request = send(
+        &operation_id,
+        Some(thread_ts),
+        "agent-teams receipt: accepted",
+    );
+    let first = run(&config, &fake, &request, 1_000);
+    assert_eq!(first["ok"], json!(true), "{first}");
+    let second = run(&config, &fake, &request, 2_000);
+    assert_eq!(second["ok"], json!(true), "{second}");
+    assert_eq!(fake.state().posts.len(), 1, "retry is idempotent");
+    // Negative control: the raw Slack message ID is refused, which is
+    // the exact failure this derivation fixes.
+    let refused = run(
+        &config,
+        &fake,
+        &send(thread_ts, Some(thread_ts), "agent-teams receipt: accepted"),
+        3_000,
+    );
+    assert_eq!(refused["ok"], json!(false), "{refused}");
+    assert_eq!(fake.state().posts.len(), 1, "refused request posts nothing");
+}
+
+#[test]
 fn ack_reaction_maps_the_emoji_and_is_idempotent() {
     let ledger = ledger("reaction");
     let config = config(&ledger, Some(APP));
