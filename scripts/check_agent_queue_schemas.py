@@ -75,19 +75,34 @@ def self_test() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         generated = root / "generated"
-        generate(generated)
+        # This tests the byte comparator, not the Rust generator (the freshness
+        # node runs that separately). A synthetic output makes its negative
+        # controls cheap and independent of Cargo and build-directory locking.
+        generated.mkdir()
+        for stem in STEMS:
+            (generated / f"{stem}.schema.json").write_bytes(b'{"type":"object"}\n')
+        if differences(generated, generated):
+            print("self-test FAILED: identical schemas were reported stale")
+            return 1
         stale = root / "stale"
         stale.mkdir()
         for stem in STEMS:
             (stale / f"{stem}.schema.json").write_bytes(
-                (generated / f"{stem}.schema.json").read_bytes() + b" "
+                (generated / f"{stem}.schema.json").read_bytes()
             )
-        if not differences(generated, stale):
-            print("self-test FAILED: a tampered schema was not detected")
-            return 1
-        if differences(generated, generated):
-            print("self-test FAILED: identical schemas were reported stale")
-            return 1
+        for stem in STEMS:
+            name = f"{stem}.schema.json"
+            current = stale / name
+            fresh = (generated / name).read_bytes()
+            current.write_bytes(fresh + b" ")
+            if not any(name in failure for failure in differences(generated, stale)):
+                print(f"self-test FAILED: tampered {name} was not detected")
+                return 1
+            current.unlink()
+            if not any(name in failure for failure in differences(generated, stale)):
+                print(f"self-test FAILED: missing {name} was not detected")
+                return 1
+            current.write_bytes(fresh)
     print("check_agent_queue_schemas self-test: ok")
     return 0
 
