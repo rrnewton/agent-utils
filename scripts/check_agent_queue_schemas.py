@@ -25,6 +25,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCHEMA_DIR = REPO_ROOT / "validation" / "schemas"
 STEMS = ("queue-item", "tombstone", "quarantine-sidecar")
+# Schemas owned by sibling checkers (#723 slices); not unexpected here.
+SIBLING_STEMS = ("wrkslots-active-state", "wrkslots-archived-state", "wrkslots-handoff-sidecar", "wrkslots-handoff-sidecar-v1")
 
 
 def generate(target: Path) -> None:
@@ -51,7 +53,7 @@ def generate(target: Path) -> None:
 def differences(generated: Path, checked_in: Path) -> list[str]:
     failures: list[str] = []
     if checked_in.is_dir():
-        expected = {f"{stem}.schema.json" for stem in STEMS}
+        expected = {f"{stem}.schema.json" for stem in STEMS + SIBLING_STEMS}
         for extra in sorted(checked_in.glob("*.schema.json")):
             if extra.name not in expected:
                 failures.append(f"agent-queue schema unexpected: validation/schemas/{extra.name}")
