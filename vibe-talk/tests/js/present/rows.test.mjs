@@ -154,3 +154,12 @@ test("`#624 voice-page-modularity`: what replies are called, from the module alo
   assert.deepStrictEqual([replyMarkerName(1, 1), replyMarkerName(2, 5)],
     ["Jump to the reply to this message", "Jump to reply 2 of 5 to this message"]);
 });
+
+test("`#624 voice-page-modularity`: Main's messages cut into the runs before each card, from the module alone", () => {
+  const { mainRunsAmong } = ROWS;
+  const at = (minute) => ({ id: String(minute), timestamp: new Date(Date.UTC(2026, 9, 12, 12, minute)).toISOString() });
+  const cards = [Date.UTC(2026, 9, 12, 12, 10), Date.UTC(2026, 9, 12, 12, 20)];
+  assert.deepStrictEqual(mainRunsAmong([at(1), at(10), at(15), at(30)], cards).map((run) => run.map(({ id }) => id)),
+    [["1"], ["10", "15"], ["30"]]);
+  assert.deepStrictEqual(mainRunsAmong([], []), [[]]);
+});

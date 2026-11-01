@@ -33921,16 +33921,6 @@ function listRows(id) {
   return list && list.children ? [...list.children] : [];
 }
 
-/**
- * Whether `row` is drawn where the reader can see it: not inside a list hidden by `hidden`, `display` or
- * `visibility` — the left column's behind the thread list is `visibility: hidden`. True where the
- * browser cannot say.
- */
-function rowSeen(row) {
-  const ask = /** @type {any} */ (row).checkVisibility;
-  return typeof ask === "function" ? Boolean(ask.call(row, { visibilityProperty: true })) : true;
-}
-
 /** Every message row drawn for the read whose first message is `id`, in every list. A card is none. */
 function readingRowsOf(id) {
   const wanted = String(id);
@@ -33950,12 +33940,6 @@ function readableMessage(id) {
     if (found) return found;
   }
   return heldMessage(wanted);
-}
-
-/** The thread's first message a card stands for, as last drawn; null while it is not loaded. */
-function cardRootOf(row) {
-  const choice = /** @type {any} */ (row).cardChoice;
-  return (choice && choice.root) || /** @type {any} */ (row).cardRoot || null;
 }
 
 /**
@@ -39972,9 +39956,6 @@ function channelReadPosition(area) {
     around: anchor && visibleList() === el("thread-list") ? threadListAround(area) : null,
   };
 }
-
-/** A thread card's id in the Threads list. */
-const threadCardId = (/** @type {Element} */ row) => String(row.getAttribute("data-context-id"));
 
 /**
  * The Threads list's cards on screen in `area`, fully shown first, with where each stands, and every card's
@@ -46494,33 +46475,6 @@ function openedCardGaps(create) {
 }
 
 /**
- * `list`'s children as the groups a gap counts: a card with the messages unpacked under it, or one
- * of Main's messages among the cards. Anything else ends a run and is left alone.
- *
- * @returns {Array<{head: any, card: boolean, other?: boolean}>}
- */
-function cardGapGroups(list) {
-  /** @type {Array<{head: any, card: boolean, other?: boolean}>} */
-  const groups = [];
-  for (const row of /** @type {any[]} */ ([...list.children])) {
-    if (row.hasAttribute("data-unpack-thread")) continue;
-    if (row.hasAttribute("data-card") || classWords(row).includes("thread-card")) groups.push({ head: row, card: true });
-    else if (row.hasAttribute("data-main-row")) groups.push({ head: row, card: false });
-    else groups.push({ head: row, card: false, other: true });
-  }
-  return groups;
-}
-
-/** What one hidden group adds to its gap: its messages, its thread if it is one, its exactness. */
-function cardGapTally(group) {
-  if (group.card) {
-    const messages = typeof group.head.cardMessages === "number" ? group.head.cardMessages : 1;
-    return { messages, threads: 1, exact: group.head.cardMessagesExact !== false, onlyCards: true };
-  }
-  return { messages: Math.max(1, idsOf(group.head).length), threads: 0, exact: true, onlyCards: false };
-}
-
-/**
  * The blocks of messages unpacked under the cards of `list`, each as its card and its rows in order.
  * `#606 server-side-search`.
  *
@@ -47568,27 +47522,6 @@ function cardTime(choice) {
   return Number.isFinite(choice.at) ? choice.at : Number.isFinite(choice.started) ? choice.started : 0;
 }
 
-/**
- * Main's messages `main`, oldest first, cut into the runs that go before each of the cards whose times
- * are `cards` (oldest first), and a last run after them all: `cards.length + 1` runs.
- *
- * @param {Array<any>} main
- * @param {number[]} cards
- * @returns {Array<Array<any>>}
- */
-function mainRunsAmong(main, cards) {
-  /** @type {Array<Array<any>>} */
-  const runs = cards.map(() => []);
-  runs.push([]);
-  let card = 0;
-  for (const message of main) {
-    const at = timeOf(message, "timestamp");
-    while (card < cards.length && Number.isFinite(at) && cards[card] <= at) card += 1;
-    runs[card].push(message);
-  }
-  return runs;
-}
-
 /** While Main's rows are built: they offer the way into a thread, as All's do, and point at nothing. */
 let drawingMainRows = false;
 
@@ -47654,9 +47587,6 @@ function placeMainCard() {
 
 /** The key the cards' opened runs are kept under, by channel (`readRuns`). */
 const cardRunKey = () => `cards:${String(selectedChannelId())}`;
-
-/** What an item of the cards stands for in a run: a card its thread, a Main row its messages. */
-const cardRunIds = (row) => (row.hasAttribute("data-card") ? [`card:${row.getAttribute("data-id")}`] : idsOf(row));
 
 /** Whether an item of the cards is read: a card by its thread (`threadIsRead`), a Main row by its messages. */
 const cardRunRead = (row) => (row.hasAttribute("data-card") ? row.hasAttribute("data-thread-read") : rowIsRead(row));
@@ -47812,41 +47742,6 @@ function countSideCard(row, { choice, age, replies, unread, read, size }) {
   if (was) was.replaceWith(cardOpener("side-card", replies, unread, () => guardQuietly(() => enterCard(choice.id, choice.summary, row))()));
   /** @type {any} */ (row).cardMessages = size ? size.messages : 1;
   /** @type {any} */ (row).cardMessagesExact = size ? size.exact : false;
-}
-
-/**
- * Mark card `row` for the stylesheet by its layout (`cardView`): split, clamped to K lines, or waiting
- * for its summary. `#528 thread-card-markdown-and-cap`. Written only where it changes.
- *
- * @param {HTMLElement} row
- * @param {string} mode
- */
-function markCardLayout(row, mode, cut = null) {
-  /** @type {Array<[string, boolean]>} */
-  const marks = [["data-split-card", mode === "split"],
-    ["data-card-clamp", mode === "clamped" || (mode === "pending" && Boolean(cut && cut.whole))],
-    ["data-summary-pending", mode === "pending"]];
-  for (const [attribute, on] of marks) {
-    if (row.hasAttribute(attribute) !== on) row.toggleAttribute(attribute, on);
-  }
-}
-
-/**
- * Put a card's words in `node`: its root's formatted body where the card says the root, else `text`.
- * `#528 thread-card-markdown-and-cap`.
- *
- * @param {HTMLElement} node
- * @param {ReturnType<typeof cardView>} view
- * @param {string} text
- */
-function fillCardText(node, view, text) {
-  const body = view.body();
-  if (body) {
-    node.replaceChildren(body);
-    return;
-  }
-  node.replaceChildren();
-  node.textContent = text;
 }
 
 // --- one card highlighted ------------------------------------------------------------------------

@@ -40,3 +40,5 @@ export { QUOTE_EDGE_NODES, drawnWordsBetween, quotableRow, replyRowOf, rowQuoted
 export { LINK_ROW_INSET_PX, drawLinkPath, laneOrder, linkAt, linkedRootThread, pointerOn, rowLinkY } from "./links.ts";
 export type { DrawnLink } from "./links.ts";
 export { fromGatheredThread, gutterPiece, headerLayout, quoteLabelFits, setArrowReach, setMarkerLift, stackUnder } from "./replies.ts";
+export { cardGapGroups, cardGapTally, cardRootOf, cardRunIds, fillCardText, markCardLayout, rowSeen, threadCardId } from "./cards.ts";
+export type { CardGapGroup, CardRow } from "./cards.ts";

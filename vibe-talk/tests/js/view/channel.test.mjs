@@ -127,3 +127,17 @@ test("`#624 voice-page-modularity`: where a gathered reply's stack hangs, and th
   setMarkerLift(row, false);
   assert.equal(row.map.has("data-reply-lift"), false);
 });
+
+test("`#624 voice-page-modularity`: a card's layout marks and what it stands for in a run, from the module alone", () => {
+  const { markCardLayout, cardRunIds, cardGapTally } = CHANNEL_VIEW;
+  const marks = new Set();
+  const row = { hasAttribute: (name) => marks.has(name), toggleAttribute: (name, on) => (on ? marks.add(name) : marks.delete(name)) };
+  markCardLayout(row, "pending", { whole: true });
+  assert.deepStrictEqual([...marks].sort(), ["data-card-clamp", "data-summary-pending"]);
+  markCardLayout(row, "split");
+  assert.deepStrictEqual([...marks], ["data-split-card"]);
+  const card = { hasAttribute: (name) => name === "data-card", getAttribute: () => "spaces/A/t" };
+  assert.deepStrictEqual(cardRunIds(card), ["card:spaces/A/t"]);
+  assert.deepStrictEqual(cardGapTally({ head: { cardMessages: 4, cardMessagesExact: false }, card: true }),
+    { messages: 4, threads: 1, exact: false, onlyCards: true });
+});
