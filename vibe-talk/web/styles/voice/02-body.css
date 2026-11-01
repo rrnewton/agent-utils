@@ -897,7 +897,7 @@
 }
 
 /* `#351 settings-polish`. What the pop-out makes inert beyond the box its shadow is drawn in (`dimBoxOf`
-   in web/voice.js), laid out beside that box: the top bar with its Back, and the dock (`inertAround`).
+   in web/src/view/settings), laid out beside that box: the top bar with its Back, and the dock (`inertAround`).
    The shadow's own depth, which leaves 0.55 of every colour under it, so the whole screen reads as one
    dim and no control a tap cannot reach is left looking as if it could be pressed. Not the status pill:
    it floats over the box, under the pop-out and its shadow, and the shadow dims it (`floatsOverDimBox`).

@@ -132,7 +132,7 @@ export function mountServerCache(deps: ServerCacheDependencies): ServerCache {
       );
     } catch (error) {
       serverCacheSending = null;
-      render(serverCacheUnconfirmed(String((error as RequestFailure).detail || (error as RequestFailure).message)));
+      render(serverCacheUnconfirmed((error as RequestFailure).detail || (error as RequestFailure).message));
       return;
     }
     serverCacheSending = null;

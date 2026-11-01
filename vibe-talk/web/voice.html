@@ -2038,7 +2038,7 @@
 
                     <!--
                       `#19 channel-browser`. The channels the bridge can see, searchable, one tap to add.
-                      Rows are built by `renderChannelDirectory` in web/voice.js; a channel this app
+                      Rows are built by the channel browser in web/src/view/settings; a channel this app
                       already reads is marked and has no Add button, so it cannot be added twice.
                     -->
                     <div id="browse-channel-fields" hidden>
@@ -2070,7 +2070,7 @@
                       choice is the server's own, read and written through /upstream-clear and never kept
                       on this device. Shown only when the channel's service can do it, and only to a
                       token that may change it. The warning is always on screen beside the choice, because
-                      what it does to the other app is the whole decision. Built by `renderUpstreamClear`
+                      what it does to the other app is the whole decision. Built by the Clear unread box in web/src/view/settings
                       in web/voice.js.
                     -->
                     <div id="upstream-clear" hidden>
@@ -2127,7 +2127,7 @@
                       "Read older messages next" puts the channel at the front of the server's queue
                       (what search's "Search further back" also asks for). Shown while the server's
                       cache is on and open, for one channel at a time; the choice and the button only
-                      to a token that may change them. Built by `renderChannelHistory` in
+                      to a token that may change them. Built by the history box in
                       web/voice.js.
                     -->
                     <div id="channel-history" hidden>
@@ -2159,7 +2159,7 @@
 
                       Still one channel's census, so a bot that only speaks somewhere else cannot spoil
                       the sole-other-bot guess. A CHOICE is about the ACCOUNT, in every channel it speaks
-                      in — see `renderIdentityRows` in web/voice.js.
+                      in — see the list of who is who in web/src/view/settings.
                     -->
                     <div id="identity-group">
                       <hr class="settings-rule" />
@@ -2167,7 +2167,7 @@
                         <h3 title="Everyone who has spoken in the channel chosen above. Italic means guessed. A choice follows the account into every channel.">Who is who</h3>
                         <button class="help-link" id="help-link-identities" type="button" data-help="identities" aria-label="About who is who in a channel" title="Everyone who has spoken in the channel chosen above. Italic means guessed. A choice follows the account into every channel.">?</button>
                       </div>
-                      <!-- Rows are built by `renderIdentityRows` in web/voice.js, under a line naming the
+                      <!-- Rows are built by the list of who is who in web/src/view/settings, under a line naming the
                            channel. Empty until that channel has been read, and it says so. -->
                       <div id="identity-list"></div>
                       <p id="identity-state" class="hint" aria-live="polite"></p>
@@ -2388,7 +2388,7 @@
 
                     Unticking turns saving off AND erases the file, and Erase empties it and carries
                     on, so both ask first, in `#message-cache-confirm`, and only its own button sends.
-                    Turning it on sends at once: it erases nothing. Written by `renderServerCache` in
+                    Turning it on sends at once: it erases nothing. Written by the message cache group in
                     web/voice.js; a failed request is said in `#message-cache-state`.
                   -->
                   <section class="settings-group" id="message-cache-group" hidden>
@@ -3485,7 +3485,7 @@
             </details>
 
             <!--
-              `#208 persistent-cache`. Hidden with its group, by `renderServerCache`, on a server
+              `#208 persistent-cache`. Hidden with its group, by the message cache group (web/src/view/settings), on a server
               that has no message cache. The limits are the server's, filled from the status it
               reports; the figures in the markup are only what a fresh deployment is turned on with.
               Deletions: a message deleted in Slack leaves the file when the server next reads that

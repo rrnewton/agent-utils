@@ -154,7 +154,7 @@ export function mountChannelHistory(deps: ChannelHistoryDependencies): ChannelHi
       if (read === channelHistoryReads) adopt(channel, view);
     } catch (error) {
       if (read !== channelHistoryReads || !channelHistory || channelHistory.channel !== channel) return;
-      channelHistory = { channel, view: null, failure: historyReadFailure(String(failureOf(error))) };
+      channelHistory = { channel, view: null, failure: historyReadFailure(failureOf(error)) };
       draw();
     }
   }

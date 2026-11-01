@@ -1968,7 +1968,7 @@ test("`#347 settings-prose`: how live updates arrive is still said, in Connectio
 // The owner, 2026-10-18 ("settings complaints"): the channel drop-down gains "All channels"; Clear
 // unread can be set for all at once; show "Mixed" when channels differ; drop the who-is-who part from
 // that pane. Who is who moved to Messages; `#402 who-is-who-channel-box` put it back in the box, which
-// the tests beside `renderIdentityRows` cover.
+// the tests of the list of who is who (web/src/view/settings) cover.
 
 /** Settings on a server with two channels whose chat service can clear unread, each in its `modes`. */
 async function allChannelsPage(modes = {}, arrange = (_page) => {}) {

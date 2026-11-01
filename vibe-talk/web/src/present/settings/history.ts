@@ -37,7 +37,7 @@ const historyRecheckWait = (view: ChannelHistoryState | null): number =>
 const historyWaitingWords = (failure: string): string => failure || "Checking with the server…";
 
 /** Why the box has no answer for its channel. */
-const historyReadFailure = (why: string): string => `Could not read this channel's history: ${why}`;
+const historyReadFailure = (why: string | undefined): string => `Could not read this channel's history: ${why}`;
 
 /** What "Read older messages next" came to, once the server answered. */
 const historyPrioritizedWords = (view: ChannelHistoryState): string => view.complete

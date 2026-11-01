@@ -47,7 +47,7 @@ const serverCacheKeepsWords = (status: MessageCacheStatus): string =>
   status.max_days === SERVER_CACHE_NO_AGE_LIMIT ? "their whole history" : nounCount(status.max_days, "day");
 
 /** Why the line says nothing changed: the server did not confirm the switch. */
-const serverCacheUnconfirmed = (why: string): string => `The server did not confirm that: ${why}`;
+const serverCacheUnconfirmed = (why: string | undefined): string => `The server did not confirm that: ${why}`;
 
 export { SERVER_CACHE_ASK, SERVER_CACHE_SENDING, serverCacheKeepsWords, serverCacheUnconfirmed, serverHoldsWholeHistory };
 export type { ServerCacheAct };

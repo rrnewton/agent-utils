@@ -2558,7 +2558,7 @@ function closeSettings() {
 
 /**
  * The folds on Settings: whether one is open, open or fold one, whether one is on the page, and the
- * button over them all redrawn, as a group shown or hidden must (`renderAgentLink`, `renderServerCache`).
+ * button over them all redrawn, as a group shown or hidden must (`renderAgentLink`, `serverCacheBox`).
  *
  * @type {import("./src/view/settings/index.ts").SettingsFolds}
  */
@@ -20101,7 +20101,7 @@ function loadDismissedSends() {
 // Tab went on past Close to the controls behind it, and a tap on the dim pressed whatever was under it.
 // So while it is up everything else on the page is inert (`inertAround`), which no tap, click or Tab
 // reaches and a screen reader does not list, and Tab and Shift+Tab go round its own four stops
-// (`trapDismissedTab`). It is marked `aria-modal` to say so. Close, Escape and Back are how it goes.
+// (`dismissedSendsView.trapTab`). It is marked `aria-modal` to say so. Close, Escape and Back are how it goes.
 //
 // And everything it makes inert is under the dim. The dim is the pop-out's shadow, which Settings'
 // scrolling box clips (`dimBoxOf`), so the top bar with its Back stood bright above it, and a tap on

@@ -74,7 +74,7 @@ const upstreamClearUnansweredWords = (service: string): string => `${service} ha
   "without this page; open Settings again later to see what it came to.";
 
 /** Why the box has no answer for its channel. */
-const upstreamClearReadFailure = (why: string): string => `Could not read this setting: ${why}`;
+const upstreamClearReadFailure = (why: string | undefined): string => `Could not read this setting: ${why}`;
 
 /**
  * The mode every channel All channels reaches has: the mode, null when they differ (Mixed), or

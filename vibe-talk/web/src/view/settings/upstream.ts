@@ -282,7 +282,7 @@ export function mountUpstreamClear(deps: UpstreamClearDependencies): UpstreamCle
       upstreamClear = {
         channel,
         view: null,
-        failure: upstreamClearReadFailure(String(failureOf(error))),
+        failure: upstreamClearReadFailure(failureOf(error)),
       };
       draw();
     }
