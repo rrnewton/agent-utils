@@ -33871,15 +33871,24 @@ def _cmd_clean_caches(args: argparse.Namespace) -> int:
                         try:
                             size = _allocated_cache_bytes(config, cache)
                         except Refusal as exc:
-                            # One cache directory holding nested Git
-                            # metadata (a tmp cargo-home checkout, say)
-                            # must not veto cleaning the slot's other
-                            # caches: skip that directory untouched and
-                            # keep going. Any other refusal still aborts.
                             if not str(exc).startswith(
                                 "cache directory contains nested Git metadata"
                             ):
                                 raise
+                            if slot in requested:
+                                # A slot named with --only is cleaned to
+                                # the removal standard: one cache holding
+                                # nested Git metadata refuses the whole
+                                # slot, so an explicit clean never prunes
+                                # around a repository that removal would
+                                # have to judge first.
+                                raise
+                            # In the bulk sweep one cache directory
+                            # holding nested Git metadata (a tmp
+                            # cargo-home checkout, say) must not veto
+                            # cleaning the slot's other caches: skip that
+                            # directory untouched and keep going. Any
+                            # other refusal still aborts.
                             skipped.append({"path": str(cache.path), "reason": str(exc)})
                             continue
                         measured_list.append((cache, size))

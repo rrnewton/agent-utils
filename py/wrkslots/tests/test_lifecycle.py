@@ -57581,7 +57581,7 @@ def test_clean_caches_skips_one_nested_git_cache_and_cleans_the_slot(
     plain.mkdir(parents=True)
     (plain / "index.js").write_text("x", encoding="utf-8")
 
-    cleaned = command(project, "clean-caches", "--only", "slot01", "--format", "json")
+    cleaned = command(project, "clean-caches", "--yes", "--format", "json")
 
     assert cleaned.returncode == 0, cleaned.stderr
     payload = json.loads(cleaned.stdout)
