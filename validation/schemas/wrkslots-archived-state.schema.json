@@ -1,0 +1,388 @@
+{
+  "$defs": {
+    "ArchiveActor": {
+      "description": "Who retired an archived record.",
+      "oneOf": [
+        {
+          "const": "coordinator",
+          "description": "The coordinator.",
+          "type": "string"
+        }
+      ]
+    },
+    "ArchiveMode": {
+      "description": "Retirement mode of an archived record.",
+      "oneOf": [
+        {
+          "const": "remove",
+          "description": "The slot was removed.",
+          "type": "string"
+        }
+      ]
+    },
+    "ArchiveRecord": {
+      "additionalProperties": false,
+      "description": "One archived slot record in `ARCHIVED.<machine>.json`.",
+      "properties": {
+        "actor": {
+          "$ref": "#/$defs/ArchiveActor",
+          "description": "Who retired it; currently `coordinator`."
+        },
+        "agent": {
+          "description": "Owning agent name.",
+          "type": "string"
+        },
+        "archive_id": {
+          "description": "Archive identifier binding machine, slot, generation and finish.",
+          "type": "string"
+        },
+        "checkouts": {
+          "description": "The slot's checkouts.",
+          "items": {
+            "$ref": "#/$defs/Checkout"
+          },
+          "type": "array"
+        },
+        "continuation": {
+          "description": "Continuation instructions.",
+          "type": "string"
+        },
+        "created_at": {
+          "description": "When the slot was created.",
+          "type": "string"
+        },
+        "finished_at": {
+          "description": "When the slot was retired.",
+          "type": "string"
+        },
+        "generation": {
+          "description": "Slot generation.",
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "import_source": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ImportSource"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Import provenance, when imported."
+        },
+        "layout": {
+          "$ref": "#/$defs/Layout",
+          "description": "Checkout layout, when recorded."
+        },
+        "limitations": {
+          "description": "Known limitations.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "machine": {
+          "description": "Machine the slot lived on.",
+          "type": "string"
+        },
+        "mode": {
+          "$ref": "#/$defs/ArchiveMode",
+          "description": "Retirement mode; currently `remove`."
+        },
+        "physical_storage": {
+          "$ref": "#/$defs/PhysicalStorage",
+          "description": "Physical storage state; currently `removed`."
+        },
+        "purpose": {
+          "description": "Purpose of the slot.",
+          "type": "string"
+        },
+        "salvage": {
+          "description": "Salvaged items, when any.",
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "slot": {
+          "description": "Slot name.",
+          "type": "string"
+        },
+        "slot_type": {
+          "$ref": "#/$defs/SlotType",
+          "description": "Slot kind; absent means `agent`."
+        },
+        "task": {
+          "description": "Task the slot served.",
+          "type": "string"
+        },
+        "validation": {
+          "description": "Validation evidence.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "archive_id",
+        "slot",
+        "agent",
+        "task",
+        "purpose",
+        "machine",
+        "generation",
+        "created_at",
+        "finished_at",
+        "mode",
+        "actor",
+        "physical_storage",
+        "validation",
+        "limitations",
+        "continuation",
+        "checkouts"
+      ],
+      "type": "object"
+    },
+    "Checkout": {
+      "additionalProperties": false,
+      "description": "One checkout of a slot.",
+      "properties": {
+        "branch": {
+          "description": "Branch checked out.",
+          "type": "string"
+        },
+        "containing_remote_refs": {
+          "description": "Remote refs containing the head.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "head": {
+          "description": "Head digest.",
+          "maxLength": 40,
+          "minLength": 40,
+          "type": "string"
+        },
+        "landed_ref": {
+          "description": "Ref the work is expected to land on.",
+          "type": "string"
+        },
+        "name": {
+          "description": "Checkout name.",
+          "type": "string"
+        },
+        "path": {
+          "description": "Path relative to the slot directory.",
+          "type": "string"
+        },
+        "remote": {
+          "description": "Remote name.",
+          "type": "string"
+        },
+        "remote_url_sha256": {
+          "description": "Digest of the remote URL.",
+          "maxLength": 64,
+          "minLength": 64,
+          "type": "string"
+        },
+        "repository": {
+          "description": "Repository the checkout came from.",
+          "type": "string"
+        },
+        "start_point": {
+          "description": "Start-point digest.",
+          "maxLength": 40,
+          "minLength": 40,
+          "type": "string"
+        },
+        "vcs": {
+          "$ref": "#/$defs/Vcs",
+          "description": "Version-control system; currently always `git`."
+        }
+      },
+      "required": [
+        "name",
+        "path",
+        "repository",
+        "branch",
+        "start_point",
+        "remote",
+        "remote_url_sha256",
+        "landed_ref",
+        "head",
+        "containing_remote_refs",
+        "vcs"
+      ],
+      "type": "object"
+    },
+    "ImportFormat": {
+      "description": "Import source format.",
+      "oneOf": [
+        {
+          "const": "worktree-state-v3",
+          "description": "The v3 worktree-state format.",
+          "type": "string"
+        }
+      ]
+    },
+    "ImportSource": {
+      "additionalProperties": false,
+      "description": "Where an imported record came from.",
+      "properties": {
+        "file_sha256": {
+          "description": "Digest of the source file.",
+          "maxLength": 64,
+          "minLength": 64,
+          "type": "string"
+        },
+        "format": {
+          "$ref": "#/$defs/ImportFormat",
+          "description": "Source format; currently `worktree-state-v3`."
+        },
+        "path": {
+          "description": "Source path relative to the registry.",
+          "type": "string"
+        },
+        "row": {
+          "additionalProperties": true,
+          "description": "The source row itself; its own format is historical.",
+          "type": "object"
+        },
+        "row_sha256": {
+          "description": "Digest of the source row.",
+          "maxLength": 64,
+          "minLength": 64,
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/ImportStatus",
+          "description": "Status of the source row."
+        }
+      },
+      "required": [
+        "format",
+        "path",
+        "file_sha256",
+        "row_sha256",
+        "status",
+        "row"
+      ],
+      "type": "object"
+    },
+    "ImportStatus": {
+      "description": "Status of an imported source row.",
+      "oneOf": [
+        {
+          "const": "active",
+          "description": "Live.",
+          "type": "string"
+        },
+        {
+          "const": "lease-quarantined",
+          "description": "Quarantined by its lease.",
+          "type": "string"
+        },
+        {
+          "const": "owner-lease-revoked",
+          "description": "Owner lease revoked.",
+          "type": "string"
+        },
+        {
+          "const": "release-requested",
+          "description": "Release requested.",
+          "type": "string"
+        }
+      ]
+    },
+    "Layout": {
+      "description": "Checkout layout of a slot.",
+      "oneOf": [
+        {
+          "const": "nested",
+          "description": "Checkouts nested under one slot directory.",
+          "type": "string"
+        },
+        {
+          "const": "flat",
+          "description": "One checkout at the slot directory.",
+          "type": "string"
+        }
+      ]
+    },
+    "PhysicalStorage": {
+      "description": "Physical storage state of an archived record.",
+      "oneOf": [
+        {
+          "const": "removed",
+          "description": "Storage was removed.",
+          "type": "string"
+        }
+      ]
+    },
+    "SlotType": {
+      "description": "Slot kind.",
+      "oneOf": [
+        {
+          "const": "agent",
+          "description": "A working agent slot.",
+          "type": "string"
+        },
+        {
+          "const": "validate",
+          "description": "A validation slot.",
+          "type": "string"
+        }
+      ]
+    },
+    "Vcs": {
+      "description": "Version-control system of a checkout.",
+      "oneOf": [
+        {
+          "const": "git",
+          "description": "Git.",
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "The `ARCHIVED.<machine>.json` envelope, schema 2.",
+  "properties": {
+    "machine": {
+      "description": "Machine this shard belongs to.",
+      "type": "string"
+    },
+    "records": {
+      "description": "Archived slot records.",
+      "items": {
+        "$ref": "#/$defs/ArchiveRecord"
+      },
+      "type": "array"
+    },
+    "revision": {
+      "description": "Monotonic revision of the shard.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "schema": {
+      "const": 2,
+      "description": "Format schema; always 2.",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schema",
+    "machine",
+    "revision",
+    "records"
+  ],
+  "title": "ArchivedState",
+  "type": "object"
+}

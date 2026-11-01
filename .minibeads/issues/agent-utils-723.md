@@ -22,3 +22,27 @@ Python validates in tests only via a minimal in-repo validator
 (jsonschema is not vendored). Target binding stays with its agentctl
 slice. No format version bump: schemas describe the current format,
 including open sender fields (additionalProperties: true).
+
+Slice 2 (wrkslots state and handoffs): ActiveState/ActiveRecord,
+ArchivedState/ArchiveRecord, HandoffSidecar (schema 2) and
+HandoffSidecarLegacy (schema 1) typed in rs/wrkslotsd/src/formats.rs;
+generated schemas validation/schemas/wrkslots-*.schema.json; checker
+scripts/check_wrkslots_schemas.py as repository.hygiene.wrkslots-schemas
+{,-self-test}, fail closed; Python test-only validation in
+py/tests/test_wrkslots_state_schema.py. Field-set comparison: the
+written field names and types agree in both editions (the differential
+corpus holds them at parity). The adversarial review then found, and
+this slice now reports rather than normalizes: (a) slot_type, layout,
+task_scope and salvage are absent-or-valued in both editions, never
+null -- the schemas now refuse explicit null for them; (b)
+coordinator_lease is non-null on every valid active record and is
+typed so; (c) SourceIdentity loaders in both editions accept extra
+keys while writers emit exactly three -- the schema allows extra
+keys there and says so; (d) integer width: Python ints are unbounded,
+schema.rs positive() accepts beyond i64::MAX, the state loaders'
+as_int refuse it -- pre-existing, reported here, not resolved by this
+slice; (e) TaskScope unit format controls: Python and
+evidence::ScopeIdentity refuse Unicode Cf, active_state's reader
+accepts them -- pre-existing Rust-internal disagreement, reported,
+not resolved. Digest/identity binding rules stay in the validators.
+No version bump; config/hold/journal formats are later slices.

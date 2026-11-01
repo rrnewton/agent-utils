@@ -1,0 +1,488 @@
+{
+  "$defs": {
+    "ActiveRecord": {
+      "additionalProperties": false,
+      "description": "One active slot record in `ACTIVE.<machine>.json`.",
+      "properties": {
+        "agent": {
+          "description": "Owning agent name.",
+          "type": "string"
+        },
+        "checkouts": {
+          "description": "The slot's checkouts.",
+          "items": {
+            "$ref": "#/$defs/Checkout"
+          },
+          "type": "array"
+        },
+        "coordinator_lease": {
+          "$ref": "#/$defs/ProcessIdentity",
+          "description": "Coordinator lease process; always present on a valid record\n(both editions refuse a record without one)."
+        },
+        "coordinator_recovery_note": {
+          "description": "Recovery note, or null.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "created_at": {
+          "description": "When the slot was created.",
+          "type": "string"
+        },
+        "generation": {
+          "description": "Slot generation.",
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "handoff": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HandoffSummary"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Latest handoff summary, or null."
+        },
+        "heartbeat_at": {
+          "description": "Last heartbeat time.",
+          "type": "string"
+        },
+        "heartbeat_ttl_seconds": {
+          "description": "Heartbeat time-to-live in seconds.",
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "import_source": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ImportSource"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Import provenance, when imported."
+        },
+        "layout": {
+          "$ref": "#/$defs/Layout",
+          "description": "Checkout layout, when recorded."
+        },
+        "machine": {
+          "description": "Machine the slot lives on.",
+          "type": "string"
+        },
+        "owner": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProcessIdentity"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Bound owner process, or null."
+        },
+        "purpose": {
+          "description": "Purpose of the slot.",
+          "type": "string"
+        },
+        "slot": {
+          "description": "Slot name.",
+          "type": "string"
+        },
+        "slot_type": {
+          "$ref": "#/$defs/SlotType",
+          "description": "Slot kind; absent means `agent`."
+        },
+        "task": {
+          "description": "Task the slot serves.",
+          "type": "string"
+        },
+        "task_scope": {
+          "$ref": "#/$defs/TaskScope",
+          "description": "Task scope identity, when recorded."
+        }
+      },
+      "required": [
+        "agent",
+        "checkouts",
+        "coordinator_lease",
+        "coordinator_recovery_note",
+        "created_at",
+        "generation",
+        "handoff",
+        "heartbeat_at",
+        "heartbeat_ttl_seconds",
+        "machine",
+        "owner",
+        "purpose",
+        "slot",
+        "task"
+      ],
+      "type": "object"
+    },
+    "Checkout": {
+      "additionalProperties": false,
+      "description": "One checkout of a slot.",
+      "properties": {
+        "branch": {
+          "description": "Branch checked out.",
+          "type": "string"
+        },
+        "containing_remote_refs": {
+          "description": "Remote refs containing the head.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "head": {
+          "description": "Head digest.",
+          "maxLength": 40,
+          "minLength": 40,
+          "type": "string"
+        },
+        "landed_ref": {
+          "description": "Ref the work is expected to land on.",
+          "type": "string"
+        },
+        "name": {
+          "description": "Checkout name.",
+          "type": "string"
+        },
+        "path": {
+          "description": "Path relative to the slot directory.",
+          "type": "string"
+        },
+        "remote": {
+          "description": "Remote name.",
+          "type": "string"
+        },
+        "remote_url_sha256": {
+          "description": "Digest of the remote URL.",
+          "maxLength": 64,
+          "minLength": 64,
+          "type": "string"
+        },
+        "repository": {
+          "description": "Repository the checkout came from.",
+          "type": "string"
+        },
+        "start_point": {
+          "description": "Start-point digest.",
+          "maxLength": 40,
+          "minLength": 40,
+          "type": "string"
+        },
+        "vcs": {
+          "$ref": "#/$defs/Vcs",
+          "description": "Version-control system; currently always `git`."
+        }
+      },
+      "required": [
+        "name",
+        "path",
+        "repository",
+        "branch",
+        "start_point",
+        "remote",
+        "remote_url_sha256",
+        "landed_ref",
+        "head",
+        "containing_remote_refs",
+        "vcs"
+      ],
+      "type": "object"
+    },
+    "HandoffSummary": {
+      "additionalProperties": false,
+      "description": "The handoff summary embedded in an active record.",
+      "properties": {
+        "continuation": {
+          "description": "Exact continuation instructions.",
+          "type": "string"
+        },
+        "limitations": {
+          "description": "Known limitations.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "recorded_at": {
+          "description": "When the handoff was recorded.",
+          "type": "string"
+        },
+        "validation": {
+          "description": "Validation evidence.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "recorded_at",
+        "validation",
+        "limitations",
+        "continuation"
+      ],
+      "type": "object"
+    },
+    "ImportFormat": {
+      "description": "Import source format.",
+      "oneOf": [
+        {
+          "const": "worktree-state-v3",
+          "description": "The v3 worktree-state format.",
+          "type": "string"
+        }
+      ]
+    },
+    "ImportSource": {
+      "additionalProperties": false,
+      "description": "Where an imported record came from.",
+      "properties": {
+        "file_sha256": {
+          "description": "Digest of the source file.",
+          "maxLength": 64,
+          "minLength": 64,
+          "type": "string"
+        },
+        "format": {
+          "$ref": "#/$defs/ImportFormat",
+          "description": "Source format; currently `worktree-state-v3`."
+        },
+        "path": {
+          "description": "Source path relative to the registry.",
+          "type": "string"
+        },
+        "row": {
+          "additionalProperties": true,
+          "description": "The source row itself; its own format is historical.",
+          "type": "object"
+        },
+        "row_sha256": {
+          "description": "Digest of the source row.",
+          "maxLength": 64,
+          "minLength": 64,
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/ImportStatus",
+          "description": "Status of the source row."
+        }
+      },
+      "required": [
+        "format",
+        "path",
+        "file_sha256",
+        "row_sha256",
+        "status",
+        "row"
+      ],
+      "type": "object"
+    },
+    "ImportStatus": {
+      "description": "Status of an imported source row.",
+      "oneOf": [
+        {
+          "const": "active",
+          "description": "Live.",
+          "type": "string"
+        },
+        {
+          "const": "lease-quarantined",
+          "description": "Quarantined by its lease.",
+          "type": "string"
+        },
+        {
+          "const": "owner-lease-revoked",
+          "description": "Owner lease revoked.",
+          "type": "string"
+        },
+        {
+          "const": "release-requested",
+          "description": "Release requested.",
+          "type": "string"
+        }
+      ]
+    },
+    "Layout": {
+      "description": "Checkout layout of a slot.",
+      "oneOf": [
+        {
+          "const": "nested",
+          "description": "Checkouts nested under one slot directory.",
+          "type": "string"
+        },
+        {
+          "const": "flat",
+          "description": "One checkout at the slot directory.",
+          "type": "string"
+        }
+      ]
+    },
+    "ProcessIdentity": {
+      "additionalProperties": false,
+      "description": "A process identity recorded in a state record.",
+      "properties": {
+        "boot_id": {
+          "description": "Boot identifier.",
+          "type": "string"
+        },
+        "cgroup_path": {
+          "description": "The process's cgroup path.",
+          "type": "string"
+        },
+        "host_id": {
+          "description": "Host identifier.",
+          "type": "string"
+        },
+        "pid": {
+          "description": "Process identifier.",
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "start_ticks": {
+          "description": "Process start time in clock ticks.",
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "pid",
+        "start_ticks",
+        "boot_id",
+        "host_id",
+        "cgroup_path"
+      ],
+      "type": "object"
+    },
+    "SlotType": {
+      "description": "Slot kind.",
+      "oneOf": [
+        {
+          "const": "agent",
+          "description": "A working agent slot.",
+          "type": "string"
+        },
+        {
+          "const": "validate",
+          "description": "A validation slot.",
+          "type": "string"
+        }
+      ]
+    },
+    "TaskScope": {
+      "additionalProperties": false,
+      "description": "The task scope identity recorded on an active record.",
+      "properties": {
+        "boot_id": {
+          "description": "Boot identifier.",
+          "type": "string"
+        },
+        "cgroup_path": {
+          "description": "Cgroup path of the task.",
+          "type": "string"
+        },
+        "invocation_id": {
+          "description": "Invocation identifier of the unit.",
+          "type": "string"
+        },
+        "leader_pid": {
+          "description": "Leader process identifier.",
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "leader_start_ticks": {
+          "description": "Leader start ticks.",
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "unit": {
+          "description": "The systemd unit of the task leader.",
+          "type": "string"
+        },
+        "verification": {
+          "$ref": "#/$defs/Verification",
+          "description": "How the scope was verified."
+        }
+      },
+      "required": [
+        "unit",
+        "invocation_id",
+        "cgroup_path",
+        "boot_id",
+        "leader_pid",
+        "leader_start_ticks",
+        "verification"
+      ],
+      "type": "object"
+    },
+    "Vcs": {
+      "description": "Version-control system of a checkout.",
+      "oneOf": [
+        {
+          "const": "git",
+          "description": "Git.",
+          "type": "string"
+        }
+      ]
+    },
+    "Verification": {
+      "description": "Task-scope verification method.",
+      "oneOf": [
+        {
+          "const": "systemd-runtime-invocation-symlink-v1",
+          "description": "The systemd runtime invocation symlink proof.",
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "The `ACTIVE.<machine>.json` envelope, schema 2.",
+  "properties": {
+    "machine": {
+      "description": "Machine this shard belongs to.",
+      "type": "string"
+    },
+    "revision": {
+      "description": "Monotonic revision of the shard.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "schema": {
+      "const": 2,
+      "description": "Format schema; always 2.",
+      "type": "integer"
+    },
+    "slots": {
+      "description": "Active slot records.",
+      "items": {
+        "$ref": "#/$defs/ActiveRecord"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema",
+    "machine",
+    "revision",
+    "slots"
+  ],
+  "title": "ActiveState",
+  "type": "object"
+}

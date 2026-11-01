@@ -385,9 +385,9 @@
       "schema_id": "integer schemas (config SCHEMA=2, ACTIVE/ARCHIVED state=2, handoff sidecar=2 with legacy=1, slot hold=1, recovery journals=2)",
       "rust_definition": "rs/wrkslotsd/src/yamlconfig.rs (config document), rs/wrkslotsd/src/config_validate.rs (config), rs/wrkslotsd/src/active_state.rs (ACTIVE shard), rs/wrkslotsd/src/archive_state.rs (ARCHIVED shard), rs/wrkslotsd/src/handoff_state.rs (sidecar), rs/wrkslotsd/src/hold_state.rs (hold), rs/wrkslotsd/src/journal_state.rs (recovery journals), plus the separate derived SQLite index in rs/wrkslotsd/src/index.rs",
       "python_definition": "py/wrkslots/cli.py SCHEMA and sidecar constants; the Python CLI is the only writer of most state",
-      "generated_schema": null,
-      "duplicate": "partial: each durable file format now has exactly one Rust validation definition in rs/wrkslotsd, held at differential parity with the Python loader by the py/wrkslots/tests/test_*_rust.py corpus, but Python hand-maintains the writer-side shapes and remains the only writer; the Rust SQLite observer index is a separate derived schema, not a second definition of these files",
-      "collapse": "Done for readers in milestone 4 slices 1-15 (#562 rust-primary-wrkslots): config, ACTIVE, ARCHIVED, handoff sidecar, hold, and every recovery-journal kind each have one Rust definition; at writer parity the Rust types become the source from which the schemas are generated and the Python writer validates."
+      "generated_schema": "validation/schemas/wrkslots-active-state.schema.json, validation/schemas/wrkslots-archived-state.schema.json, validation/schemas/wrkslots-handoff-sidecar.schema.json, validation/schemas/wrkslots-handoff-sidecar-v1.schema.json",
+      "duplicate": "partial: ACTIVE/ARCHIVED records and the handoff sidecar now have one typed Rust definition in rs/wrkslotsd/src/formats.rs with generated schemas checked in (the hand validators in schema.rs/active_state.rs/handoff_state.rs enforce the same field sets plus cross-field rules); the Python writers build the same shapes, held by the differential corpus and py/tests/test_wrkslots_state_schema.py; config, hold and journal formats remain as described in the collapse field",
+      "collapse": "State and handoffs done in #723 slice 2. Remaining for later slices: config document, slot hold, and recovery journals each get the same treatment (one Rust type, generated schema, Python test validation)."
     },
     {
       "name": "wrkviz timeline archive (schema 2 and schema 3)",

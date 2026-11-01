@@ -1,0 +1,119 @@
+{
+  "$defs": {
+    "HandoffSource": {
+      "description": "Handoff source kind.",
+      "oneOf": [
+        {
+          "const": "write-handoff",
+          "description": "Written by `write-handoff`.",
+          "type": "string"
+        },
+        {
+          "const": "legacy-slot-file",
+          "description": "Provenance-upgraded from a legacy slot file.",
+          "type": "string"
+        }
+      ]
+    },
+    "SourceIdentity": {
+      "description": "Identity of the handoff source file. Writers emit exactly these\nkeys; loaders accept (and ignore) extra keys, so the schema does.",
+      "properties": {
+        "identity": {
+          "description": "`[device, inode]` of the source file.",
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "maxItems": 2,
+          "minItems": 2,
+          "type": "array"
+        },
+        "sha256": {
+          "description": "SHA-256 of the source file, lowercase hex.",
+          "maxLength": 64,
+          "minLength": 64,
+          "type": "string"
+        },
+        "size": {
+          "description": "Size of the source file in bytes.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "identity",
+        "size",
+        "sha256"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "A generation-bound handoff sidecar, schema 1 (legacy, read-only).",
+  "properties": {
+    "contents_utf8": {
+      "description": "Handoff contents as UTF-8 text.",
+      "type": "string"
+    },
+    "generation": {
+      "description": "Slot generation the handoff belongs to.",
+      "format": "uint64",
+      "minimum": 1,
+      "type": "integer"
+    },
+    "machine": {
+      "description": "Machine the slot lives on.",
+      "type": "string"
+    },
+    "recorded_at": {
+      "description": "When the handoff was recorded.",
+      "type": "string"
+    },
+    "schema": {
+      "const": 1,
+      "description": "Format schema; always 1.",
+      "type": "integer"
+    },
+    "sha256": {
+      "description": "SHA-256 of the contents, lowercase hex.",
+      "maxLength": 64,
+      "minLength": 64,
+      "type": "string"
+    },
+    "slot": {
+      "description": "Slot name.",
+      "type": "string"
+    },
+    "source": {
+      "$ref": "#/$defs/HandoffSource",
+      "description": "How the handoff originated."
+    },
+    "source_identity": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SourceIdentity"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Identity of the source file, when recorded."
+    }
+  },
+  "required": [
+    "contents_utf8",
+    "generation",
+    "machine",
+    "recorded_at",
+    "schema",
+    "sha256",
+    "slot",
+    "source",
+    "source_identity"
+  ],
+  "title": "HandoffSidecarLegacy",
+  "type": "object"
+}
