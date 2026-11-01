@@ -32,7 +32,7 @@ checkout plus everything the coordinator needs. For a repository `foobar` checke
 
 ```text
 ~/work/foobar/                  harness root (H); the coordinator runs here
-  AGENTS.md, CLAUDE.md -> AGENTS.md
+  AGENTS.md                     read natively by Claude Code, Codex and Muse
   foobar/                       primary checkout, moved here unchanged
   worktrees/                    wrkslots: slots/<slot>/ checkouts, registry, wrkslots command
   agent-utils/                  agent-utils checkout: tools in bin/, skills in skills/
@@ -319,8 +319,9 @@ Add the skill of each optional tool the owner chose (`herdr-run`, `tick-hub`, `d
 `.claude/skills`. Muse manages skills through its own installer.
 
 **5.7 Harness `AGENTS.md`.** Copy `agent-utils/skills/agent-utils-setup/templates/AGENTS.md` to
-`$H/AGENTS.md`, replace every `{{PLACEHOLDER}}` from your record, and `ln -s AGENTS.md
-"$H/CLAUDE.md"`. For `{{SLOT_PROTOCOL}}`, use the block below that matches the sandbox choice. Fill
+`$H/AGENTS.md`, replace every `{{PLACEHOLDER}}` from your record. Write no `CLAUDE.md`: Claude Code
+reads `AGENTS.md` natively, and Muse warns when both files exist. (Only for truly Claude-only
+instructions, add a `CLAUDE.md` whose first line is `@AGENTS.md`.) For `{{SLOT_PROTOCOL}}`, use the block below that matches the sandbox choice. Fill
 `{{AGENT_UTILS_COMMIT}}` with `git -C "$H/agent-utils" rev-parse --short HEAD`. Leave the "Project
 rules" section for the owner.
 
@@ -377,7 +378,7 @@ ignores it, and tokens stay in an environment variable or a token command, never
 **5.9 Optional tools.** Follow "Add a tool later" for each one chosen.
 
 **5.10 Commit the harness**, if tracked. Stage the files you wrote by name
-(`git -C "$H" add .gitignore AGENTS.md CLAUDE.md .wrkslots.yml bin .agents .claude`, plus any
+(`git -C "$H" add .gitignore AGENTS.md .wrkslots.yml bin .agents .claude`, plus any
 optional tool's configuration), check `git -C "$H" status --short` shows nothing unexpected, and
 commit.
 

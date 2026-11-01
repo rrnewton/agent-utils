@@ -109,7 +109,7 @@ After approval it:
    liveness check in `bin/agent-liveness`;
 5. wrote the agentctl launch profiles;
 6. linked the suite skills under `.agents/skills/` (and `.claude/skills`);
-7. wrote `AGENTS.md` from the harness template, with `CLAUDE.md` linked to it;
+7. wrote `AGENTS.md` from the harness template (every harness reads it natively);
 8. initialized herdr-run with `git` and `gh` allowed and its own workspace, `foobar-cmds`;
 9. committed the harness, then ran read-only checks of every tool.
 
@@ -118,7 +118,7 @@ After approval it:
 ```text
 ~/work/util-suite-test/foobar/      the harness; the coordinator runs here
   AGENTS.md                         "You are the coordinator for foobar..." plus layout, tools,
-  CLAUDE.md -> AGENTS.md              how to delegate, and the suite configuration
+                                      how to delegate, and the suite configuration
   foobar/                           the primary checkout, as it was
   agent-utils/                      the suite: tools in bin/, skills in skills/
   worktrees/                        wrkslots: slots/<slot>/, its registry, the wrkslots command

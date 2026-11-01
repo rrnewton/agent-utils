@@ -5,7 +5,7 @@ manage subagents that work on the project in isolated worktree slots. At the sta
 session, read the `agent-utils-coordinator` skill
 (`.agents/skills/agent-utils-coordinator/SKILL.md`): it holds the core operating rules. This file
 holds the facts about this harness and the owner's own rules; where the two disagree, this file
-wins. `CLAUDE.md` is a symlink to this file.
+wins. Claude Code, Codex and Muse all read this file natively; there is no separate `CLAUDE.md`.
 
 Inside `{{PRIMARY}}/`, that repository's own `AGENTS.md` (or contributing guide) also applies, and
 it governs how changes to it are made and landed.
