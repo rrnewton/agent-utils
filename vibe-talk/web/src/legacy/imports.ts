@@ -265,8 +265,13 @@ export {
   undoName,
 } from "../present/rows/index.ts";
 export {
+  DAY_TITLED,
+  EDITED_MARK,
   RESTATED_CLASS,
   foldedTextLine,
+  freshenDayTitle,
+  rowTimeTabStop,
+  timeNode,
 } from "../view/channel/index.ts";
 
 import { decode, decodeTagged, is, roots } from "../contract/index.ts";

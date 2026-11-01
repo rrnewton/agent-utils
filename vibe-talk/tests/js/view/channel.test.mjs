@@ -25,3 +25,25 @@ test("`#624 voice-page-modularity`: a drawn body read into the fold model's runs
     [["t", "\nrest\n"]]);
   assert.equal(textNodesOf(node("pre", ["a", node("b", ["c"])]), "|"), "a|c");
 });
+
+test("`#624 voice-page-modularity`: a time's title is worded again as the pointer reaches it, from the module alone", () => {
+  const { freshenDayTitle, rowTime, EDITED_MARK } = CHANNEL_VIEW;
+  const timeEl = (className, at, text) => {
+    const attrs = new Map([["datetime", at.toISOString()], ["title", "stale"], ["aria-label", "stale"]]);
+    return { tagName: "TIME", className, textContent: text, getAttribute: (name) => attrs.get(name) ?? null,
+      setAttribute: (name, value) => attrs.set(name, String(value)), attrs };
+  };
+  const now = new Date();
+  const time = timeEl("msg-time", now, "9:10 AM");
+  freshenDayTitle({ target: time });
+  assert.match(time.attrs.get("title"), /^Today, .*, 9:10 AM$/);
+  assert.equal(time.attrs.get("aria-label"), time.attrs.get("title"));
+  const edited = timeEl(EDITED_MARK, now, "edited");
+  freshenDayTitle({ target: edited });
+  assert.match(edited.attrs.get("title"), /^Edited Today, /);
+  assert.equal(edited.attrs.get("aria-label"), "stale", "an edited mark's name was worded as a time's");
+  const other = timeEl("other", now, "x");
+  freshenDayTitle({ target: other });
+  assert.equal(other.attrs.get("title"), "stale");
+  assert.equal(rowTime(null), null);
+});

@@ -247,3 +247,8 @@ declare const spokenText: LegacyImports["spokenText"];
 declare const spokenWords: LegacyImports["spokenWords"];
 declare const RESTATED_CLASS: LegacyImports["RESTATED_CLASS"];
 declare const foldedTextLine: LegacyImports["foldedTextLine"];
+declare const DAY_TITLED: LegacyImports["DAY_TITLED"];
+declare const EDITED_MARK: LegacyImports["EDITED_MARK"];
+declare const freshenDayTitle: LegacyImports["freshenDayTitle"];
+declare const rowTimeTabStop: LegacyImports["rowTimeTabStop"];
+declare const timeNode: LegacyImports["timeNode"];
