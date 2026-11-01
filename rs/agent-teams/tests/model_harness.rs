@@ -1372,6 +1372,7 @@ fn accept_to_missing_target_is_undeliverable_and_claims_nothing() {
         proof_note: "proved",
         relayed_by: None,
         peer_host: "host-a",
+        via_chat_relay: false,
     };
     let now_ms = agent_teams::timeutil::now_unix_ms();
     let envelope = build_envelope(
