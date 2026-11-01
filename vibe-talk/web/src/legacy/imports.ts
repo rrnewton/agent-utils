@@ -336,7 +336,13 @@ export {
   timeNode,
 } from "../view/channel/index.ts";
 export { HELP_TOPICS } from "../present/settings/index.ts";
-export { mountChannelHistory, mountHelpFolds, mountSettingsFolds, mountUpstreamClear } from "../view/settings/index.ts";
+export {
+  mountChannelDirectory,
+  mountChannelHistory,
+  mountHelpFolds,
+  mountSettingsFolds,
+  mountUpstreamClear,
+} from "../view/settings/index.ts";
 
 import { decode, decodeTagged, is, roots } from "../contract/index.ts";
 

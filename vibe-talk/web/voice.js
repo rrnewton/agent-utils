@@ -50775,7 +50775,7 @@ function chooseSettingsService(key, channelId = null) {
   if (key !== settingsService) {
     settingsService = key;
     showChannelPanel(null);
-    resetChannelDirectory();
+    channelDirectoryBox.reset();
   }
   fillServiceSelect();
   fillChannelSelect("settings-channel");
@@ -50833,24 +50833,6 @@ function renderAddChannelForm() {
   if (byLink) el("new-channel-writable").checked = false;
 }
 
-/** Empty the browse list, and drop any answer still on its way: it was for the service that was showing. */
-function resetChannelDirectory() {
-  channelDirectory.generation += 1;
-  if (channelDirectory.searchTimer !== null) {
-    clearTimeout(channelDirectory.searchTimer);
-    channelDirectory.searchTimer = null;
-  }
-  channelDirectory.query = "";
-  channelDirectory.entries = [];
-  channelDirectory.nextCursor = null;
-  channelDirectory.truncated = false;
-  channelDirectory.loading = false;
-  channelDirectory.failed = false;
-  el("channel-directory-search").value = "";
-  el("channel-directory-state").textContent = "";
-  renderChannelDirectory();
-}
-
 /**
  * Act on the selected channel's own provider: its threads, its read cursor, its live delivery.
  *
@@ -50877,37 +50859,29 @@ function applyChannelProvider() {
 
 // `sentenceStart` is web/src/foundation's (`#624 voice-page-modularity`).
 
-/** How long typing pauses before a search is sent, so each keystroke is not its own request. */
-const DIRECTORY_SEARCH_DELAY_MS = 250;
-/** Entries asked for per page. */
-const DIRECTORY_PAGE_SIZE = 25;
-/** The longest label the add form accepts, which a browsed name is cut to. */
-const CHANNEL_LABEL_MAX = 60;
-
 /**
- * The browse panel's state. `#19 channel-browser`.
+ * Settings' channel browser (`#19 channel-browser`, `#371 channel-search-hash`): its search, its pages,
+ * the count of a slow read, and one tap to add. web/src/view/settings `mountChannelDirectory`, in the
+ * words of web/src/present/settings (`#624 voice-page-modularity`); see "browsing channels".
  *
- * `generation` is what keeps a slow answer from overwriting a newer one: every fresh search takes
- * a new number, and an answer for an older number is dropped when it arrives. Typing "rel", then
- * "release", must end showing the "release" results however the two requests race.
+ * @type {import("./src/view/settings/index.ts").ChannelDirectory}
  */
-const channelDirectory = {
-  query: "",
-  entries: [],
-  nextCursor: null,
-  truncated: false,
-  loading: false,
-  failed: false,
-  generation: 0,
-  searchTimer: null,
-  /** `#371 channel-search-hash`. The timer that says how long the read on its way has taken. */
-  ticker: null,
-  adding: new Set(),
-};
-
-/** How often the line under the search says how long a read has taken, and after how long it explains why. */
-const DIRECTORY_TICK_MS = 1000;
-const DIRECTORY_SLOW_MS = 3000;
+const channelDirectoryBox = mountChannelDirectory({
+  lookup: (id) => el(id),
+  request: (path, options) => api(path, options),
+  known: (id) => knownChannel(id) !== null,
+  showPanel: (which) => showChannelPanel(which),
+  serviceName: () => settingsServiceName(),
+  provider: () => (settingsServiceDescription() ? settingsService : null),
+  guard: (run) => guardQuietly(run),
+  adoptChannelList: (payload) => adoptChannelList(payload),
+  pointSettingsAt: (id) => pointSettingsAt(id),
+  renderChannelBox: () => renderChannelBox(),
+  channelName: (channel) => channelName(channel),
+  now: () => Date.now(),
+  setTimeout: (run, ms) => setTimeout(run, ms),
+  clearTimeout: (timer) => clearTimeout(timer),
+});
 
 /**
  * A channel's name in a picker: its name without a leading '#'. `#371 channel-search-hash`.
@@ -51164,246 +51138,8 @@ async function addChannel() {
 // one tap to add. Adding goes through exactly the same `POST /api/v1/channels` as the form above,
 // so a browsed channel is registered, probed and stored the same way a pasted one is.
 
-/** Whether this directory entry is already a channel in the picker. */
-function directoryEntryTracked(entry) {
-  return (
-    entry.tracked === true ||
-    (entry.channel_id !== null &&
-      entry.channel_id !== undefined &&
-      knownChannel(entry.channel_id) !== null)
-  );
-}
-
-/** Open the browse panel, and read the first page unless it is already showing one. */
-async function openChannelBrowser() {
-  showChannelPanel("browse-channel-fields");
-  el("channel-directory-search").focus();
-  if (channelDirectory.entries.length === 0 || channelDirectory.failed) {
-    await loadChannelDirectory(false);
-  } else {
-    renderChannelDirectory();
-  }
-}
-
-/** Search as the owner types, once the typing pauses. */
-function scheduleDirectorySearch() {
-  if (channelDirectory.searchTimer !== null) clearTimeout(channelDirectory.searchTimer);
-  channelDirectory.searchTimer = setTimeout(() => {
-    channelDirectory.searchTimer = null;
-    searchChannelDirectory();
-  }, DIRECTORY_SEARCH_DELAY_MS);
-}
-
-/** Search now, for the text in the box, unless that is already the search on screen. */
-async function searchChannelDirectory() {
-  if (channelDirectory.searchTimer !== null) {
-    clearTimeout(channelDirectory.searchTimer);
-    channelDirectory.searchTimer = null;
-  }
-  const query = el("channel-directory-search").value.trim();
-  const showing = !channelDirectory.failed && channelDirectory.entries.length > 0;
-  if (query === channelDirectory.query && showing) return;
-  channelDirectory.query = query;
-  await loadChannelDirectory(false);
-}
-
-/**
- * Read a page of the directory: the first page of the current search, or the next one.
- *
- * A failure while showing more keeps the rows already on screen. They are still true, and
- * throwing away a list the owner was scrolling through because page three failed would be worse
- * than saying page three failed.
- */
-async function loadChannelDirectory(more) {
-  const generation = more ? channelDirectory.generation : ++channelDirectory.generation;
-  const cursor = more ? channelDirectory.nextCursor : null;
-  if (more && !cursor) return;
-  channelDirectory.loading = true;
-  channelDirectory.failed = false;
-  if (!more) {
-    channelDirectory.entries = [];
-    channelDirectory.nextCursor = null;
-    channelDirectory.truncated = false;
-  }
-  renderChannelDirectory();
-  const said = el("channel-directory-state");
-  const asking = more
-    ? "Loading more channels…"
-    : channelDirectory.query
-      ? `Searching for "${channelDirectory.query}"…`
-      : "Loading channels…";
-  said.textContent = asking;
-  // `#371 channel-search-hash`. A service may take seconds to list its channels (Slack lists every
-  // conversation the app is in before it can answer one search), so the line says how long this read
-  // has taken, and once it is slow, why the next will not be. The server keeps the listing for two
-  // minutes, so the searches after it answer at once.
-  if (channelDirectory.ticker !== null) clearTimeout(channelDirectory.ticker);
-  const startedAt = Date.now();
-  const tick = () => {
-    channelDirectory.ticker = null;
-    if (generation !== channelDirectory.generation || !channelDirectory.loading) return;
-    const waited = Date.now() - startedAt;
-    const seconds = Math.max(1, Math.round(waited / 1000));
-    const why = waited >= DIRECTORY_SLOW_MS
-      ? ` ${sentenceStart(settingsServiceName())} can take a while to list its channels; the same search again within two minutes answers at once.`
-      : "";
-    said.textContent = `${asking} ${seconds} s so far.${why}`;
-    channelDirectory.ticker = setTimeout(tick, DIRECTORY_TICK_MS);
-  };
-  channelDirectory.ticker = setTimeout(tick, DIRECTORY_TICK_MS);
-  let path = `/api/v1/channel-directory?limit=${DIRECTORY_PAGE_SIZE}`;
-  if (channelDirectory.query) path += `&q=${encodeURIComponent(channelDirectory.query)}`;
-  if (cursor) path += `&cursor=${encodeURIComponent(cursor)}`;
-  // `#355 provider-grouped-channels`. With several services, only the one Settings is showing.
-  if (settingsServiceDescription()) path += `&provider=${encodeURIComponent(/** @type {string} */ (settingsService))}`;
-  let payload = null;
-  try {
-    payload = await api(path);
-  } catch (error) {
-    if (generation !== channelDirectory.generation) return;
-    stopDirectoryTicker();
-    channelDirectory.loading = false;
-    channelDirectory.failed = true;
-    renderChannelDirectory();
-    said.textContent = directoryFailureSentence(error);
-    // Retrying cannot change a refusal or a missing feature; it can change everything else.
-    el("channel-directory-retry").hidden = directoryFailureIsFinal(error);
-    return;
-  }
-  if (generation !== channelDirectory.generation) return;
-  stopDirectoryTicker();
-  channelDirectory.loading = false;
-  const entries = Array.isArray(payload && payload.entries) ? payload.entries : [];
-  channelDirectory.entries = more ? [...channelDirectory.entries, ...entries] : entries;
-  channelDirectory.nextCursor =
-    payload && typeof payload.next_cursor === "string" && payload.next_cursor
-      ? payload.next_cursor
-      : null;
-  channelDirectory.truncated = payload !== null && payload.truncated === true;
-  renderChannelDirectory();
-  said.textContent = directorySummary();
-}
-
-/** Stop saying how long the directory read has taken: it answered. */
-function stopDirectoryTicker() {
-  if (channelDirectory.ticker !== null) clearTimeout(channelDirectory.ticker);
-  channelDirectory.ticker = null;
-}
-
-/** Whether a failed read is one that trying again cannot fix. */
-function directoryFailureIsFinal(error) {
-  return error.status === 401 || error.status === 403 || error.status === 501;
-}
-
-/** What to say when the directory could not be read, by the kind of failure it was. */
-function directoryFailureSentence(error) {
-  if (error.code === "channel_directory_denied") {
-    return (
-      `${sentenceStart(settingsServiceName())} does not allow this app to list channels. ` +
-      "A channel can still be added by pasting its link under Add a channel."
-    );
-  }
-  if (error.status === 401 || error.status === 403) {
-    return "This sign-in cannot browse channels: browsing needs the token that can add channels.";
-  }
-  if (error.status === 501) {
-    return (
-      "This chat connector cannot list channels. " +
-      "A channel can still be added by pasting its link under Add a channel."
-    );
-  }
-  return `Could not load channels. ${error.detail || error.message}`;
-}
-
-/** The standing sentence under the search box once a page has arrived. */
-function directorySummary() {
-  const count = channelDirectory.entries.length;
-  if (count === 0) {
-    return channelDirectory.query
-      ? `No channels match "${channelDirectory.query}".`
-      : `No channels are available in ${settingsServiceName()} yet.`;
-  }
-  const shown = `${count} ${count === 1 ? "channel" : "channels"} shown`;
-  if (channelDirectory.nextCursor) return `${shown}. More are available.`;
-  if (channelDirectory.truncated) {
-    return `${shown}. The list stopped early, so search by name to find others.`;
-  }
-  return `${shown}.`;
-}
-
-/** Draw the rows. Every string is text; nothing from the bridge is ever parsed as markup. */
-function renderChannelDirectory() {
-  const rows = channelDirectory.entries.map((entry) => {
-    const row = document.createElement("li");
-    const name = document.createElement("span");
-    name.className = "directory-name";
-    name.textContent = entry.name;
-    row.append(name);
-    if (directoryEntryTracked(entry)) {
-      const tracked = document.createElement("span");
-      tracked.className = "directory-tracked";
-      tracked.textContent = "Already added";
-      row.append(tracked);
-    } else {
-      const add = document.createElement("button");
-      add.type = "button";
-      add.className = "secondary";
-      const adding = channelDirectory.adding.has(entry.source);
-      add.textContent = adding ? "Adding…" : "Add";
-      add.disabled = adding;
-      add.setAttribute("aria-label", `Add ${entry.name}`);
-      add.addEventListener("click", guardQuietly(() => addDirectoryChannel(entry)));
-      row.append(add);
-    }
-    return row;
-  });
-  el("channel-directory-list").replaceChildren(...rows);
-  el("channel-directory-more").hidden = channelDirectory.nextCursor === null;
-  el("channel-directory-more").disabled = channelDirectory.loading;
-  if (!channelDirectory.failed) el("channel-directory-retry").hidden = true;
-}
-
-/** Add one browsed channel through the ordinary add route, and mark it added. */
-async function addDirectoryChannel(entry) {
-  if (directoryEntryTracked(entry) || channelDirectory.adding.has(entry.source)) return;
-  const said = el("channel-directory-state");
-  const label = Array.from(entry.name).slice(0, CHANNEL_LABEL_MAX).join("").trim();
-  channelDirectory.adding.add(entry.source);
-  renderChannelDirectory();
-  said.textContent = `Adding "${entry.name}" and checking that it can be read…`;
-  let payload = null;
-  try {
-    /** @type {Record<string, unknown>} */
-    const body = { source: entry.source, label };
-    // `#355 provider-grouped-channels`. Added to the service it was listed for.
-    if (settingsServiceDescription()) body.provider = settingsService;
-    payload = await api("/api/v1/channels", {
-      method: "POST",
-      body,
-    });
-  } catch (error) {
-    channelDirectory.adding.delete(entry.source);
-    // A conflict means the source is already a channel here, which is the tracked state.
-    if (error.status === 409) entry.tracked = true;
-    renderChannelDirectory();
-    said.textContent =
-      error.status === 409 ? `"${entry.name}" is already in the channel list.` : error.message;
-    return;
-  }
-  channelDirectory.adding.delete(entry.source);
-  adoptChannelList(payload);
-  entry.tracked = true;
-  entry.channel_id = payload.channel && payload.channel.id ? String(payload.channel.id) : null;
-  if (entry.channel_id) pointSettingsAt(entry.channel_id);
-  // The box onto the channel just added, as `addChannel` does: with one chat service `pointSettingsAt`
-  // only sets the picker, which fires nothing, and who is who names its channel (`#402
-  // who-is-who-channel-box`), so a box left drawn for the last channel says so in words.
-  renderChannelBox();
-  renderChannelDirectory();
-  // Named from the answer, for the reason `addChannel` gives.
-  const added = channelName(payload.channel || { label });
-  said.textContent = `Added. "${added}" is now in the channel picker.`;
-}
+// The browser itself (opening, searching, pages, adding) is web/src/view/settings `mountChannelDirectory`
+// (`channelDirectoryBox`, `#624 voice-page-modularity`).
 
 /**
  * Take a channel off the list: forgotten when it was added here, hidden when it came from the
@@ -51430,13 +51166,8 @@ async function removeChannel() {
   // The directory is cached while Settings stays open. Put a removed source back into its real
   // state immediately; otherwise reopening Browse in the same page still said "Already added"
   // and offered no way to add it again.
-  for (const entry of channelDirectory.entries) {
-    if (String(entry.channel_id || "") === String(id)) {
-      entry.tracked = false;
-      entry.channel_id = null;
-    }
-  }
-  renderChannelDirectory();
+  channelDirectoryBox.forget(id);
+  channelDirectoryBox.render();
   renderChannelBox();
   said.textContent =
     channel.added === true
@@ -51628,11 +51359,7 @@ function showChannelPanel(which) {
   // `#371 channel-search-hash`. A directory read still on its way when the list is closed is given up
   // on: its count stops, and its answer is not drawn into a list nobody is looking at. Opening the list
   // again reads it again (the server answers from what it kept).
-  if (which !== "browse-channel-fields" && channelDirectory.loading) {
-    stopDirectoryTicker();
-    channelDirectory.generation += 1;
-    channelDirectory.loading = false;
-  }
+  if (which !== "browse-channel-fields") channelDirectoryBox.giveUp();
 }
 
 /**
@@ -53692,25 +53419,23 @@ el("cancel-add-channel").addEventListener("click", () => {
   showChannelPanel(null);
 });
 el("add-channel").addEventListener("click", guardQuietly(addChannel));
-el("open-browse-channels").addEventListener("click", guardQuietly(openChannelBrowser));
+el("open-browse-channels").addEventListener("click", guardQuietly(() => channelDirectoryBox.open()));
 el("close-browse-channels").addEventListener("click", () => showChannelPanel(null));
-el("channel-directory-search").addEventListener("input", scheduleDirectorySearch);
+el("channel-directory-search").addEventListener("input", () => channelDirectoryBox.scheduleSearch());
 el("channel-directory-search").addEventListener("keydown", (event) => {
   if (event && event.key === "Enter") {
     if (typeof event.preventDefault === "function") event.preventDefault();
-    guardQuietly(searchChannelDirectory)();
+    guardQuietly(() => channelDirectoryBox.search())();
   }
 });
 el("channel-directory-more").addEventListener(
   "click",
-  guardQuietly(() => loadChannelDirectory(true))
+  guardQuietly(() => channelDirectoryBox.load(true))
 );
 el("channel-directory-retry").addEventListener(
   "click",
-  guardQuietly(() =>
-    // Retry what failed: the next page when rows are already showing, otherwise the first.
-    loadChannelDirectory(channelDirectory.entries.length > 0 && channelDirectory.nextCursor !== null)
-  )
+  // Retry what failed: the next page when rows are already showing, otherwise the first.
+  guardQuietly(() => channelDirectoryBox.retry())
 );
 el("remove-channel").addEventListener("click", guardQuietly(removeChannel));
 el("save-alias").addEventListener("click", guardQuietly(saveAlias));

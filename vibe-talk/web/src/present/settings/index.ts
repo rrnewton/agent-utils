@@ -28,3 +28,19 @@ export {
   upstreamClearUnansweredWords,
 } from "./upstream.ts";
 export type { UpstreamClearAllHeld, UpstreamClearPress } from "./upstream.ts";
+export {
+  CHANNEL_LABEL_MAX,
+  DIRECTORY_PAGE_SIZE,
+  DIRECTORY_SEARCH_DELAY_MS,
+  DIRECTORY_SLOW_MS,
+  DIRECTORY_TICK_MS,
+  directoryAskingWords,
+  directoryEntryTracked,
+  directoryFailureIsFinal,
+  directoryFailureSentence,
+  directoryLabel,
+  directoryPath,
+  directorySummary,
+  directoryWaitWords,
+} from "./directory.ts";
+export type { DirectoryEntry, DirectoryFailure } from "./directory.ts";

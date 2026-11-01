@@ -1130,11 +1130,8 @@ test("`#402 who-is-who-channel-box`: a channel added from Browse moves the box, 
   assert.equal(String(page.el("settings-channel").value), String(page.registeredChannelId));
   assert.match(page.el("identity-list").text(), /^Nobody yet in Release Train\./, "who is who is still drawn for the last channel");
   // The negative control: the add without the box redrawn leaves who is who on the channel before.
-  const stale = await addFromBrowse(brokenScript("  if (entry.channel_id) pointSettingsAt(entry.channel_id);\n" +
-    "  // The box onto the channel just added, as `addChannel` does: with one chat service `pointSettingsAt`\n" +
-    "  // only sets the picker, which fires nothing, and who is who names its channel (`#402\n" +
-    "  // who-is-who-channel-box`), so a box left drawn for the last channel says so in words.\n" +
-    "  renderChannelBox();\n", "  if (entry.channel_id) pointSettingsAt(entry.channel_id);\n"));
+  const stale = await addFromBrowse(await brokenModule([{ file: "src/view/settings/directory.ts",
+    find: "    deps.renderChannelBox();\n    render();\n", replace: "    render();\n" }]));
   assert.doesNotMatch(stale.el("identity-list").text(), /Release Train/,
     "the negative control named the new channel anyway, so the check above proves nothing");
 });

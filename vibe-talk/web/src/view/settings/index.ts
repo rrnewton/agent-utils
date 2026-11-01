@@ -9,3 +9,5 @@ export { mountChannelHistory } from "./history.ts";
 export type { ChannelHistoryBox, ChannelHistoryDependencies } from "./history.ts";
 export { mountUpstreamClear } from "./upstream.ts";
 export type { UpstreamClearBox, UpstreamClearDependencies } from "./upstream.ts";
+export { mountChannelDirectory } from "./directory.ts";
+export type { ChannelDirectory, ChannelDirectoryDependencies } from "./directory.ts";

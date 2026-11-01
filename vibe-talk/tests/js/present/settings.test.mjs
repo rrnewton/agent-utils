@@ -94,3 +94,33 @@ test("`#253 upstream-clear-polish`, `#349 channel-settings-all`: what a waiting 
   assert.match(upstreamClearUnansweredWords("Slack"), /^Slack has not answered yet\./);
   assert.equal(upstreamClearReadFailure("down"), "Could not read this setting: down");
 });
+
+test("`#19 channel-browser`, `#371 channel-search-hash`: what the channel browser asks for and says", () => {
+  const { directoryEntryTracked, directoryPath, directoryAskingWords, directoryWaitWords, directoryFailureIsFinal,
+    directoryFailureSentence, directorySummary, directoryLabel, DIRECTORY_SLOW_MS, CHANNEL_LABEL_MAX } = SETTINGS;
+  const known = (id) => id === "42";
+  assert.equal(directoryEntryTracked({ tracked: true }, known), true);
+  assert.equal(directoryEntryTracked({ channel_id: "42" }, known), true);
+  assert.equal(directoryEntryTracked({ channel_id: "43" }, known), false);
+  assert.equal(directoryEntryTracked({ channel_id: null }, () => true), false, "no id is no channel, whatever the list says");
+  assert.equal(directoryPath("", null, null), "/api/v1/channel-directory?limit=25");
+  assert.equal(directoryPath("rel ease", "c/1", "slack"), "/api/v1/channel-directory?limit=25&q=rel%20ease&cursor=c%2F1&provider=slack");
+  assert.equal(directoryAskingWords(true, "x"), "Loading more channels…");
+  assert.equal(directoryAskingWords(false, "x"), 'Searching for "x"…');
+  assert.equal(directoryAskingWords(false, ""), "Loading channels…");
+  assert.equal(directoryWaitWords("Loading channels…", 400, "slack"), "Loading channels… 1 s so far.");
+  assert.equal(directoryWaitWords("Loading channels…", DIRECTORY_SLOW_MS, "slack"),
+    "Loading channels… 3 s so far. Slack can take a while to list its channels; the same search again within two minutes answers at once.");
+  assert.deepStrictEqual([401, 403, 501, 500, undefined].map((status) => directoryFailureIsFinal({ status })), [true, true, true, false, false]);
+  assert.match(directoryFailureSentence({ code: "channel_directory_denied" }, "slack"), /^Slack does not allow this app to list channels\./);
+  assert.match(directoryFailureSentence({ status: 403 }, "slack"), /^This sign-in cannot browse channels/);
+  assert.match(directoryFailureSentence({ status: 501 }, "slack"), /^This chat connector cannot list channels\./);
+  assert.equal(directoryFailureSentence({ status: 500, message: "boom" }, "slack"), "Could not load channels. boom");
+  const shown = (fields) => ({ query: "", entries: [], nextCursor: null, truncated: false, ...fields });
+  assert.equal(directorySummary(shown({ query: "x" }), "Slack"), 'No channels match "x".');
+  assert.equal(directorySummary(shown({}), "Slack"), "No channels are available in Slack yet.");
+  assert.equal(directorySummary(shown({ entries: [1] }), "Slack"), "1 channel shown.");
+  assert.equal(directorySummary(shown({ entries: [1, 2], nextCursor: "n" }), "Slack"), "2 channels shown. More are available.");
+  assert.equal(directorySummary(shown({ entries: [1, 2], truncated: true }), "Slack"), "2 channels shown. The list stopped early, so search by name to find others.");
+  assert.equal(directoryLabel(` ${"é".repeat(CHANNEL_LABEL_MAX + 5)}`).length, CHANNEL_LABEL_MAX - 1, "cut by characters, then trimmed");
+});

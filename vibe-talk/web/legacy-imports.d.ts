@@ -317,3 +317,4 @@ declare const mountHelpFolds: LegacyImports["mountHelpFolds"];
 declare const mountSettingsFolds: LegacyImports["mountSettingsFolds"];
 declare const mountChannelHistory: LegacyImports["mountChannelHistory"];
 declare const mountUpstreamClear: LegacyImports["mountUpstreamClear"];
+declare const mountChannelDirectory: LegacyImports["mountChannelDirectory"];
