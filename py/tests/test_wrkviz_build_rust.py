@@ -29,7 +29,7 @@ RUST_WRKVIZ = AU_ROOT / "rs" / "target" / "release" / "wrkvizd"
 CODEX_ROOT = "root-thread"
 
 TS_KEYS = {
-    "run_id", "started_at", "completed_at", "created_at", "last_run_at",
+    "edition", "run_id", "started_at", "completed_at", "created_at", "last_run_at",
     "last_run_id", "updated_at", "generated_at", "pid",
 }
 ID_KEYS = {"usage_receipt_id", "receipt_id", "batch_receipt_ids",

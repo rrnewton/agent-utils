@@ -154,7 +154,7 @@ def _scrub(value: object, root: Path) -> object:
     if isinstance(value, dict):
         out: dict[str, object] = {}
         for key, item in value.items():
-            if key in ("run_id", "started_at", "completed_at", "created_at",
+            if key in ("edition", "run_id", "started_at", "completed_at", "created_at",
                        "last_run_at", "last_run_id", "updated_at", "mtime_ns",
                        "upstream_retired_at"):
                 out[key] = "<ts>"

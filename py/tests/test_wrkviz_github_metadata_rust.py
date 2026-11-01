@@ -24,7 +24,7 @@ RUST_WRKVIZ = AU_ROOT / "rs" / "target" / "release" / "wrkvizd"
 CODEX_ROOT = "root-thread"
 
 TS_KEYS = {
-    "run_id", "started_at", "completed_at", "created_at", "last_run_at",
+    "edition", "run_id", "started_at", "completed_at", "created_at", "last_run_at",
     "last_run_id", "updated_at", "generated_at", "pid", "fetched_at",
 }
 GEN_KEYS = {"c_bytes", "c_size", "c_sha256", "c_off", "c_len",

@@ -170,7 +170,7 @@ def _tree(root: Path) -> dict[str, object]:
         rel = path.relative_to(root).as_posix()
         if rel.startswith("runs/"):
             record = json.loads(path.read_text())
-            for key in ("run_id", "started_at", "completed_at"):
+            for key in ("edition", "run_id", "started_at", "completed_at"):
                 record.pop(key, None)
             if isinstance(record.get("error"), str):
                 record["error"] = _syntax_normalized(

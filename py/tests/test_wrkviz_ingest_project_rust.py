@@ -33,7 +33,7 @@ T0 = 1767225600000  # 2026-01-01T00:00:00Z
 SHA_KEYS = {"sha256", "snapshot_path", "source_manifest_sha256",
             "source_digest", "team_sha256", "superseded_sha256",
             "superseded_snapshot_path", "config_sha256"}
-TS_KEYS = {"run_id", "started_at", "completed_at", "created_at",
+TS_KEYS = {"edition", "run_id", "started_at", "completed_at", "created_at",
            "last_run_at", "last_run_id", "updated_at", "mtime_ns",
            "captured_at", "upstream_retired_at", "accepted_at",
            "last_rewrite_at"}

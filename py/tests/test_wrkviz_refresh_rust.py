@@ -30,7 +30,7 @@ ORC_CHILD = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 T0 = 1767225600000
 
 TS_KEYS = {
-    "run_id", "started_at", "completed_at", "created_at", "last_run_at",
+    "edition", "run_id", "started_at", "completed_at", "created_at", "last_run_at",
     "last_run_id", "updated_at", "generated_at", "pid", "fetched_at",
     "mtime_ns", "upstream_retired_at",
 }
