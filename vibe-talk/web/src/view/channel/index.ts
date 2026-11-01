@@ -37,3 +37,5 @@ export {
 } from "./cardtext.ts";
 export type { CardUnit } from "./cardtext.ts";
 export { QUOTE_EDGE_NODES, drawnWordsBetween, quotableRow, replyRowOf, rowQuotedBy } from "./quotes.ts";
+export { LINK_ROW_INSET_PX, drawLinkPath, laneOrder, linkAt, linkedRootThread, pointerOn, rowLinkY } from "./links.ts";
+export type { DrawnLink } from "./links.ts";

@@ -99,3 +99,15 @@ test("`#624 voice-page-modularity`: a drawn body's text, and a card's body cut i
   assert.equal(cardMarkTarget(body, false).tagName, "P");
   assert.equal(cardMarkTarget(body, true), null, "a mark went after a table, which has no line of words to end");
 });
+
+test("`#624 voice-page-modularity`: the links between Main's roots and their cards, from the module alone", () => {
+  const { laneOrder, linkAt, rowLinkY, pointerOn, LINK_ROW_INSET_PX } = CHANNEL_VIEW;
+  const link = (name, from, to) => ({ name, from: { y: from }, to: { y: to } });
+  // Rising first, the higher root further left; then falling, the higher root further right.
+  assert.deepStrictEqual(laneOrder([link("f1", 10, 50), link("r1", 80, 20), link("f2", 30, 60), link("r2", 40, 5)]).map(({ name }) => name),
+    ["r2", "r1", "f2", "f1"]);
+  assert.deepStrictEqual([linkAt(10.3, 0), linkAt(10.8, 0.1)], [10.5, 10.5]);
+  assert.equal(rowLinkY({}, { top: 100, height: 60, bottom: 160 }), 100 + LINK_ROW_INSET_PX);
+  assert.equal(pointerOn({ matches: () => { throw new Error("no :hover here"); } }), false);
+  assert.equal(pointerOn(null), false);
+});
