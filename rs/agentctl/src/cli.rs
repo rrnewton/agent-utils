@@ -980,7 +980,7 @@ struct Stop {
     /// Hand this registry's coordinator designation over to NEW before stopping (it stays on NEW even if the stop then fails): required when stopping the live designated coordinator, so team delivery keeps a live target (#721 agent-teams-coordinator-handover)
     #[arg(long, value_name = "NEW")]
     handover_to: Option<String>,
-    /// Stop the live designated coordinator without handing over (prints a warning; inter-team delivery to this registry loses its target until a new coordinator is designated). Not needed when its harness is gone or with --retire-dead-adoption, --retire-dead-native or --recover-legacy-adoption, which warn the same way
+    /// Stop the live designated coordinator without handing over (prints a warning; inter-team delivery to this registry loses its target until a new coordinator is designated). Not needed when its harness is gone or on the dead-record retirement and recovery paths (--retire-dead-adoption, --retire-dead-native and the adoption-recovery flag), which warn the same way
     #[arg(long)]
     force_coordinator: bool,
 }
