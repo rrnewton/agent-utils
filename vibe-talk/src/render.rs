@@ -307,8 +307,8 @@ impl crate::cache::SearchTextSource for SearchText {
 }
 
 /// The elements whose edges are line ends when a body is read as text: the page's `TEXT_BLOCKS`
-/// (`renderedText` in `web/voice.js`), so that two blocks with nothing between them in the HTML
-/// are two words to the server as they are to the page. `#604 server-side-search`.
+/// (`renderedText` in `web/src/view/channel`), so that two blocks with nothing between them in the
+/// HTML are two words to the server as they are to the page. `#604 server-side-search`.
 const TEXT_BLOCKS: &[&str] = &[
     "blockquote",
     "div",

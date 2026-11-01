@@ -138,3 +138,12 @@ test("`#624 voice-page-modularity`: a row's text, last edit and reactions over t
   assert.deepStrictEqual(tallies, [{ emoji: "👍", custom: false, count: 3, own: true }, { emoji: "party", custom: true, count: 1, own: true }]);
   assert.deepStrictEqual(reactionsDrawn({ reactions: [{ emoji: "party", custom: true, count: 2 }] }), [[":party:", 2, false]]);
 });
+
+test("`#624 voice-page-modularity`: a quoted stretch as the head of a reply, from the module alone", () => {
+  const { quoteBlock, QUOTE_MAX_CHARS } = ROWS;
+  assert.equal(quoteBlock("  one  \r\n\n\n\ntwo\t three "), "> one\n>\n> two three\n\n");
+  assert.equal(quoteBlock(" \n "), "");
+  const long = quoteBlock(`${"word ".repeat(400)}`);
+  const said = long.slice(2, -2);
+  assert.ok(said.length <= QUOTE_MAX_CHARS && said.endsWith("word…"), "a long quote was not cut at a word with an ellipsis");
+});

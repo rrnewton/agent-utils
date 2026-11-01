@@ -36,3 +36,4 @@ export {
   tableShape,
 } from "./cardtext.ts";
 export type { CardUnit } from "./cardtext.ts";
+export { QUOTE_EDGE_NODES, drawnWordsBetween, quotableRow, replyRowOf, rowQuotedBy } from "./quotes.ts";

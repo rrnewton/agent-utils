@@ -288,3 +288,5 @@ declare const setClassNameIfChanged: LegacyImports["setClassNameIfChanged"];
 declare const setHiddenIfChanged: LegacyImports["setHiddenIfChanged"];
 declare const setTextIfChanged: LegacyImports["setTextIfChanged"];
 declare const tagNameOf: LegacyImports["tagNameOf"];
+declare const quoteBlock: LegacyImports["quoteBlock"];
+declare const rowQuotedBy: LegacyImports["rowQuotedBy"];

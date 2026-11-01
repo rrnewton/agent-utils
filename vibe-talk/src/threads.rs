@@ -252,7 +252,7 @@ pub fn thread_summary_min_messages(long_root: bool) -> u64 {
 /// 36); 42.5 average at 412x915, 84.5 at a 1280x800 desk's Threads view. At 40 the proxy's five
 /// lines drew as six on that phone. So K proxy lines are at most about K lines on a phone and
 /// fewer on a desk, erring toward the compact card the owner asked for. The page counts with
-/// the same rule (`wrapCardLine` in web/voice.js) and splits a card by it.
+/// the same rule (`wrapCardLine` in web/src/present/rows) and splits a card by it.
 pub const CARD_LINE_CHARS: usize = 36;
 
 /// The synced setting holding K, the most lines a thread card shows of its root.
