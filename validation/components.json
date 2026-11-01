@@ -457,6 +457,7 @@
         "py/tests/test_timeline_v3_website.py",
         "py/tests/test_timeline_window.py",
         "py/tests/test_transcript_export.py",
+        "py/tests/test_wrkviz_archive_schema.py",
         "py/tests/test_wrkviz_build_rust.py",
         "py/tests/test_wrkviz_discover_agents_rust.py",
         "py/tests/test_wrkviz_export_multi_rust.py",

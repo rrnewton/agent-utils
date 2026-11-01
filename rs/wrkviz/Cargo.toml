@@ -21,7 +21,9 @@ signal-hook = "0.4.4"
 base64 = "0.22"
 flate2 = { version = "1", default-features = false, features = ["zlib"] }
 rusqlite = { version = "0.37", features = ["bundled", "backup"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["arbitrary_precision", "float_roundtrip", "preserve_order"] }
+schemars = { version = "1", default-features = false, features = ["derive"] }
 sha2 = { version = "0.10", default-features = false }
 
 [[bin]]

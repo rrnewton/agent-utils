@@ -46,3 +46,26 @@ evidence::ScopeIdentity refuse Unicode Cf, active_state's reader
 accepts them -- pre-existing Rust-internal disagreement, reported,
 not resolved. Digest/identity binding rules stay in the validators.
 No version bump; config/hold/journal formats are later slices.
+
+Slice 3 (wrkviz archive records, schema-3): TimelineV3Bootstrap with
+Codec, Streams/StreamSection and ShardCatalogEntry typed in
+rs/wrkviz/src/formats.rs; generated schema
+validation/schemas/wrkviz-timeline-v3-bootstrap.schema.json; checker
+scripts/check_wrkviz_schemas.py as repository.hygiene.wrkviz-schemas
+{,-self-test}, fail closed; Python test-only validation in
+py/tests/test_wrkviz_archive_schema.py. Snapshot pointer (schema 1)
+and streamed record lines are separate formats, later slices.
+Per coordinator: after slice 3 lands, pause wrkviz work for the
+WRKVIZ_ENGINE=rust trial.
+
+Review findings for slice 3, fixed: teams must name at least one
+slug; search stream sections refuse explicit null (all-or-nothing
+stays a reader rule); line_ranges pairs are unsigned; the Python
+validator now enforces maxLength, item counts and map-value schemas.
+Reported, not normalized: readers accept documents the writer schema
+refuses (unknown keys, omitted writer-only fields) -- the schema is
+the writer contract; integers beyond i64 are accepted by the Python
+reader and refused by the Rust reader; NaN/Infinity literals are
+accepted by the Python JSON parser and refused by the Rust bootstrap
+reader; the Python writer passes target_chunk_bytes through
+unchecked where the Rust writer's u64 prevents a negative value.

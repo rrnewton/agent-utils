@@ -1,0 +1,336 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TimelineV3Bootstrap",
+  "description": "The schema-3 bootstrap: `data/timeline-v3.json` in an archive.",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "description": "Format schema; always 3.",
+      "type": "integer",
+      "const": 3
+    },
+    "kind": {
+      "description": "Document kind; always `timeline-v3-bootstrap`.",
+      "type": "string",
+      "const": "timeline-v3-bootstrap"
+    },
+    "generated_at": {
+      "description": "When the generation was built, when recorded."
+    },
+    "source_digest": {
+      "description": "Digest of the source timeline, when recorded."
+    },
+    "display_timezone": {
+      "description": "Display timezone, when recorded."
+    },
+    "display_timezone_source": {
+      "description": "Where the display timezone came from, when recorded."
+    },
+    "range": {
+      "description": "Covered time range, when recorded (shape owned by the timeline)."
+    },
+    "stats": {
+      "description": "Build statistics, when recorded (shape owned by the timeline)."
+    },
+    "artifact_catalog_path": {
+      "description": "Artifact catalogue path, when recorded."
+    },
+    "glossary_path": {
+      "description": "Glossary path, when recorded."
+    },
+    "codec": {
+      "description": "Codec block.",
+      "$ref": "#/$defs/Codec"
+    },
+    "teams": {
+      "description": "Team records copied from the source timeline.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/TeamEntry"
+      },
+      "minItems": 1
+    },
+    "streams": {
+      "description": "Stream sections.",
+      "$ref": "#/$defs/Streams"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "kind",
+    "codec",
+    "teams",
+    "streams"
+  ],
+  "$defs": {
+    "Codec": {
+      "description": "The codec block of the bootstrap; every value is fixed by the format.",
+      "type": "object",
+      "properties": {
+        "container": {
+          "description": "Container format; always `multi-member-gzip`.",
+          "type": "string",
+          "const": "multi-member-gzip"
+        },
+        "level": {
+          "description": "Compression level the writer used.",
+          "type": "integer",
+          "format": "int64"
+        },
+        "target_chunk_bytes": {
+          "description": "Target chunk size in bytes.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "timestamp_key": {
+          "description": "Record key carrying the timestamp; always `at_ms`.",
+          "type": "string",
+          "const": "at_ms"
+        },
+        "record_kind_key": {
+          "description": "Record key carrying the kind; always `record_kind`.",
+          "type": "string",
+          "const": "record_kind"
+        },
+        "index_suffix": {
+          "description": "Index file suffix; always `.index.jsonl`.",
+          "type": "string",
+          "const": ".index.jsonl"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "container",
+        "level",
+        "target_chunk_bytes",
+        "timestamp_key",
+        "record_kind_key",
+        "index_suffix"
+      ]
+    },
+    "TeamEntry": {
+      "description": "One team record in the bootstrap: a slug plus the fields the\nsource timeline recorded for the team.",
+      "type": "object",
+      "properties": {
+        "slug": {
+          "description": "Team slug.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "slug"
+      ],
+      "additionalProperties": true
+    },
+    "Streams": {
+      "description": "The stream sections of the bootstrap. The three base streams are\nalways present; the three search streams appear together or not at all.",
+      "type": "object",
+      "properties": {
+        "timeline": {
+          "description": "Timeline event shards.",
+          "$ref": "#/$defs/StreamSection"
+        },
+        "spine": {
+          "description": "Spine shards.",
+          "$ref": "#/$defs/StreamSection"
+        },
+        "bins": {
+          "description": "Activity bin shards.",
+          "$ref": "#/$defs/StreamSection"
+        },
+        "search": {
+          "description": "Search record shards, when the search corpus is published.",
+          "$ref": "#/$defs/StreamSection"
+        },
+        "search_bloom": {
+          "description": "Search bloom shards, with `search`.",
+          "$ref": "#/$defs/StreamSection"
+        },
+        "search_links": {
+          "description": "Search link shards, with `search`.",
+          "$ref": "#/$defs/StreamSection"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "timeline",
+        "spine",
+        "bins"
+      ]
+    },
+    "StreamSection": {
+      "description": "One stream section of the bootstrap.",
+      "type": "object",
+      "properties": {
+        "addressing": {
+          "description": "How shards are addressed (per team/day, time range, or line range).",
+          "type": "string"
+        },
+        "sort": {
+          "description": "Sort order description.",
+          "type": "string"
+        },
+        "record_kinds": {
+          "description": "Record kinds carried by the stream.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "shards": {
+          "description": "The stream's shards.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ShardCatalogEntry"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "addressing",
+        "sort",
+        "record_kinds",
+        "shards"
+      ]
+    },
+    "ShardCatalogEntry": {
+      "description": "One shard entry in a stream's catalogue.",
+      "type": "object",
+      "properties": {
+        "stream": {
+          "description": "Stream this shard belongs to.",
+          "type": "string"
+        },
+        "team": {
+          "description": "Team slug, or null for team-less streams.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "day": {
+          "description": "UTC day label, or null.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "description": "Archive-relative shard path.",
+          "type": "string"
+        },
+        "index_path": {
+          "description": "Archive-relative index path.",
+          "type": "string"
+        },
+        "records": {
+          "description": "Record count.",
+          "type": "integer",
+          "format": "int64",
+          "minimum": 0
+        },
+        "members": {
+          "description": "Gzip member count.",
+          "type": "integer",
+          "format": "int64",
+          "minimum": 0
+        },
+        "c_bytes": {
+          "description": "Compressed size in bytes.",
+          "type": "integer",
+          "format": "int64",
+          "minimum": 0
+        },
+        "u_bytes": {
+          "description": "Uncompressed size in bytes.",
+          "type": "integer",
+          "format": "int64",
+          "minimum": 0
+        },
+        "c_sha256": {
+          "description": "SHA-256 of the compressed bytes, lowercase hex.",
+          "type": "string",
+          "minLength": 64,
+          "maxLength": 64
+        },
+        "u_sha256": {
+          "description": "SHA-256 of the uncompressed bytes, lowercase hex.",
+          "type": "string",
+          "minLength": 64,
+          "maxLength": 64
+        },
+        "timestamps_sorted": {
+          "description": "Whether member timestamps are sorted.",
+          "type": "boolean"
+        },
+        "t0": {
+          "description": "Earliest timestamp in milliseconds, or null.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "t1": {
+          "description": "Latest timestamp in milliseconds, or null.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "t_end_exclusive": {
+          "description": "End of the shard's time range (exclusive), or null.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "line_ranges": {
+          "description": "Per-record-kind `[first_line, count]` ranges, when recorded.",
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "minItems": 2,
+            "maxItems": 2
+          }
+        },
+        "counts": {
+          "description": "Per-record-kind counts, when ranges are not recorded.",
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "stream",
+        "path",
+        "index_path",
+        "records",
+        "members",
+        "c_bytes",
+        "u_bytes",
+        "c_sha256",
+        "u_sha256",
+        "timestamps_sorted"
+      ]
+    }
+  }
+}

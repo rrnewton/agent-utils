@@ -26,7 +26,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SCHEMA_DIR = REPO_ROOT / "validation" / "schemas"
 STEMS = ("queue-item", "tombstone", "quarantine-sidecar")
 # Schemas owned by sibling checkers (#723 slices); not unexpected here.
-SIBLING_STEMS = ("wrkslots-active-state", "wrkslots-archived-state", "wrkslots-handoff-sidecar", "wrkslots-handoff-sidecar-v1")
+SIBLING_STEMS = ("wrkslots-active-state", "wrkslots-archived-state", "wrkslots-handoff-sidecar", "wrkslots-handoff-sidecar-v1", "wrkviz-timeline-v3-bootstrap")
 
 
 def generate(target: Path) -> None:

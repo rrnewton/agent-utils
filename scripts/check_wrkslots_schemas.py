@@ -26,6 +26,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SCHEMA_DIR = REPO_ROOT / "validation" / "schemas"
 STEMS = ("wrkslots-active-state", "wrkslots-archived-state", "wrkslots-handoff-sidecar", "wrkslots-handoff-sidecar-v1")
 OWNED_PREFIX = "wrkslots-"
+SIBLING_STEMS = ("wrkviz-timeline-v3-bootstrap",)
 
 
 def generate(target: Path) -> None:
@@ -52,7 +53,7 @@ def generate(target: Path) -> None:
 def differences(generated: Path, checked_in: Path) -> list[str]:
     failures: list[str] = []
     if checked_in.is_dir():
-        expected = {f"{stem}.schema.json" for stem in STEMS}
+        expected = {f"{stem}.schema.json" for stem in STEMS + SIBLING_STEMS}
         for extra in sorted(checked_in.glob("wrkslots-*.schema.json")):
             if extra.name not in expected:
                 failures.append(f"wrkslots schema unexpected: validation/schemas/{extra.name}")

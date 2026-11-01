@@ -36,6 +36,9 @@ pub mod codex;
 pub mod compressed;
 /// Agent-tree discovery from coordinator logs and registries.
 pub mod discover;
+/// The `inspect` subcommand and the schema-3 archive reader it
+/// is built on.
+pub mod formats;
 pub mod gc;
 pub mod github_enrich;
 pub mod github_metadata;
@@ -47,8 +50,6 @@ pub mod history;
 pub mod identity;
 /// The shared ingest writer and ingest commands.
 pub mod ingest;
-/// The `inspect` subcommand and the schema-3 archive reader it
-/// is built on.
 pub mod inspect;
 /// The archive JSON value domain and the Python-shaped readers
 /// over it.

@@ -394,9 +394,9 @@
       "schema_id": "archive schema 2 / schema 3 (integer generations)",
       "rust_definition": "rs/wrkviz/src/inspect.rs (schema-3 bootstrap and shard catalogue records), rs/wrkviz/src/snapshot_store.rs (snapshot pointer)",
       "python_definition": "py/wrkviz/archive.py, build_store.py, render and query.schema_3_completeness readers",
-      "generated_schema": null,
-      "duplicate": "being collapsed: the schema-3 acceptance rules now live once in Rust and once in Python, held at differential parity by py/tests/test_wrkviz_inspect_rust.py",
-      "collapse": "In progress (#706): define archive records once in Rust and generate the schema the Python mirror validates against, slice by slice with the subcommand ports."
+      "generated_schema": "validation/schemas/wrkviz-timeline-v3-bootstrap.schema.json",
+      "duplicate": "collapsed for the schema-3 bootstrap and shard catalogue: one typed Rust definition in rs/wrkviz/src/formats.rs with the generated schema checked in; the schema-3 reader in rs/wrkviz/src/inspect.rs and both editions' timeline_v3 writers enforce the same shapes, held by the differential corpus and py/tests/test_wrkviz_archive_schema.py. Schema-2 remains a legacy generation both editions only read.",
+      "collapse": "Done for schema 3 in #723 slice 3. The snapshot pointer (schema 1) and the streamed record lines remain as their own formats for later slices."
     },
     {
       "name": "validation components manifest",
