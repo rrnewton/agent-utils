@@ -626,6 +626,42 @@ automatically. Every refusal before the paste (a draft or menu in the editor, a
 prompt containing NUL or an escape character, a changed process) leaves the
 message pending, exit 75. A Muse pane that is running a turn takes ordinary
 follow-ups in the Rust edition, as described under `send`.
+In the Rust edition, a draft left in the Muse editor no longer holds every later
+prompt when agentctl typed it itself. Muse can put a prompt back in its editor
+after agentctl proved it delivered: a prompt steered into a running turn shows at
+once as a user turn, and when the steer fails later (around a context compaction,
+for one) Muse returns it to the editor unsent, where it would refuse every later
+delivery, the owner's chat requests included. So a steer proved only by the screen
+(a user turn, or Muse's `◆ Queued input`) counts only once it has held for 3
+seconds without the prompt coming back; one that comes back has Enter pressed
+again. Muse's journal recording the prompt as an accepted intent is proof at
+once, since Muse never records a steer it refuses. A prompt typed into an idle
+Muse whose Enter Muse missed, so that it is still the whole editor, has Enter
+pressed again, at most four times in all, with a doubling wait. And a delivery
+that finds the editor holding a draft (a working pane, or an idle one that reads
+`staged`) asks whether agentctl typed it: the draft must match, as Muse draws it
+(whitespace aside, and the `sent:` field of a chat prompt's header aside), the
+text of one of the last five prompts (a batch counts as one) this agent's queue
+records as typed (in `processed/` or `failed/`, within 48 hours), and that text
+must open with a sender header or be a batch of queued messages. A prompt Muse
+puts back comes back soon after it was typed, and every later delivery is
+refused while it is there, so it is among the last few; an older prompt a person
+recalled into the editor is not. A draft Muse shows only as its `[Pasted Content
+N chars]` placeholder, which a person's paste of the same length would also
+show, matches only the very last prompt typed, if that has exactly N characters
+and was typed within 6 hours. Such a draft is submitted with Enter (pressed
+again, at most three times, while the same draft stays) and counts as submitted
+once the editor has stayed empty for 3 seconds, since its steer can fail again;
+only then does the delivery carry on. The draft's queue record gains
+`draft_recovered_at` and `draft_recovered_evidence`. Any other draft may be a person typing: it is
+never submitted or cleared, and the delivery stays pending: a working pane's
+refusal names the draft by its length only (`the Muse editor holds a draft that
+agentctl did not type (41 characters on 1 row(s)); a person may be typing it`),
+and an idle pane is refused as `staged`, worded as in every edition. Either way
+`watch-agents` and the chat bridge's owner alarm report it. The owner's requests
+therefore wait behind an agent's stuck message only as long as that recovery
+takes; the owner-first order of the queue and the bridge's lock priority cover
+prompts agentctl has not typed yet, and cannot reach one already in the editor.
 Each screen is read between two checks of the pinned process, which is what
 identifies it as Muse's once Muse 1.4 has scrolled its `Muse Code X.Y.Z` header
 away. A long paste that Muse collapses to `[Pasted Content N chars]` counts as
@@ -1240,6 +1276,33 @@ Every line the watcher writes to standard error opens
 with the UTC time (`2026-10-28T17:26:00Z agentctl watch-agents: ...`), and a
 send that failed is logged with its reason and when it is next tried, so a
 redirected log shows how long notices went undelivered.
+
+#### The owner's requests held, and prompts quarantined as misroutes
+
+Two conditions are about delivery rather than about an agent's screen, and both
+are sent as priority notices, ahead of ordinary sends, to the coordinator:
+
+- An owner (chat-bridge) request waiting undelivered in any registered agent's
+  queue, the coordinator's included, past `--owner-stuck-minutes` (default 5;
+  0 turns the check off). A request that waits only because its agent is
+  working (its last attempt said `last status=working`, or none has been made)
+  is no fault and is not counted. The notice names the agent, how many of the
+  owner's requests wait and how long the oldest has, and the reason the last
+  attempt recorded, such as a draft agentctl did not type in the agent's
+  editor, with what to do about it. It is sent again every
+  `--owner-stuck-minutes` until the requests are delivered, since the agent can
+  look busy all the while (a Muse agent with scheduled tasks keeps starting
+  turns); about the coordinator's own queue, where the notice itself waits, it
+  is sent once per episode. The pass is not `ok` while
+  one is held, and its JSON lists every agent with an owner request waiting
+  under `owner_waits`.
+- A prompt a drain quarantined as a PROBABLE MISROUTE (it may have reached
+  another pane, so it is never typed again by itself), found in a queue's
+  `failed/` within the last 6 hours. Each is reported once, with the start of
+  its message, the delivery error, and how to send it again: for an agent's
+  message, `jq -r .text FAILED_RECORD > FILE && agentctl send AGENT --file
+  FILE`; for an owner's chat request, the chat bridge tells the owner, who can
+  send it again in chat. The pass JSON lists them under `quarantines`.
 
 #### Large registries
 

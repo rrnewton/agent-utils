@@ -562,6 +562,27 @@ pub(crate) fn muse_verified_process_editor_rows(screen: &str) -> Option<String> 
     )
 }
 
+/// The draft Muse's editor holds, after live-Muse process verification: its rows as drawn, or
+/// the length a long paste's placeholder shows. `None` when the screen shows no recognisable
+/// editor, or an empty one (#720 agentctl-muse-stale-draft).
+pub(crate) fn muse_verified_process_editor_draft(
+    screen: &str,
+) -> Option<crate::stale_draft::Draft> {
+    let (_, editor) = muse_composer_regions(screen, false)?;
+    let segments = muse_editor_segments(&editor)?;
+    if let [segment] = segments.as_slice() {
+        let placeholder = segment
+            .strip_prefix("[Pasted Content ")
+            .and_then(|rest| rest.strip_suffix(" chars]"))
+            .filter(|count| !count.is_empty() && count.bytes().all(|value| value.is_ascii_digit()))
+            .and_then(|count| count.parse::<usize>().ok());
+        if let Some(length) = placeholder {
+            return Some(crate::stale_draft::Draft::Placeholder(length));
+        }
+    }
+    (!segments.is_empty()).then(|| crate::stale_draft::Draft::Text(segments.join("\n")))
+}
+
 /// Whether `rows` from [`muse_verified_process_editor_rows`] hold nothing but the prompt marker.
 pub(crate) fn muse_editor_rows_empty(rows: &str) -> bool {
     muse_editor_segments(rows).is_some_and(|segments| segments.is_empty())

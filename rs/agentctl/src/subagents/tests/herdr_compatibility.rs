@@ -41,6 +41,16 @@ pub(super) struct MuseEditor {
     pub(super) question: Option<(String, String, u8)>,
     /// The new objective the question shows, when it shows something other than the command's.
     pub(super) question_shows: Option<String>,
+    /// Steers that Muse shows as a user turn and then refuses, as around a context compaction:
+    /// a few screen reads later the turn is gone, `! steer failed` shows, and the prompt is back
+    /// in the editor (#720 agentctl-muse-stale-draft).
+    pub(super) failing_steers: usize,
+    /// Screen reads between a failing steer and its return to the editor.
+    pub(super) steer_fails_after_reads: u32,
+    /// A failing steer on its way back to the editor: its prompt and the reads left.
+    failing: Option<(String, u32)>,
+    /// Presses of Enter that Muse misses entirely, leaving the prompt staged.
+    pub(super) missed_enters: usize,
 }
 
 impl Default for MuseEditor {
@@ -58,6 +68,10 @@ impl Default for MuseEditor {
             goal: None,
             question: None,
             question_shows: None,
+            failing_steers: 0,
+            steer_fails_after_reads: 3,
+            failing: None,
+            missed_enters: 0,
         }
     }
 }
@@ -134,8 +148,32 @@ impl MuseEditor {
         self.staged = Some(prompt.to_owned());
     }
 
+    /// One screen read passes: a failing steer comes closer to returning to the editor.
+    pub(super) fn tick(&mut self) {
+        let Some((prompt, reads)) = self.failing.take() else {
+            return;
+        };
+        if reads > 1 {
+            self.failing = Some((prompt, reads - 1));
+            return;
+        }
+        let turn = format!("❯ {prompt}");
+        if let Some(index) = self.history.iter().rposition(|row| *row == turn) {
+            self.history.remove(index);
+        }
+        self.history
+            .push("  ! steer failed: the context was compacted".to_owned());
+        if self.staged.is_none() {
+            self.staged = Some(prompt);
+        }
+    }
+
     pub(super) fn enter(&mut self) -> Option<String> {
         if self.ignore_enter || self.approval {
+            return None;
+        }
+        if self.missed_enters > 0 && self.staged.is_some() {
+            self.missed_enters -= 1;
             return None;
         }
         if let Some((command, new, selected)) = self.question.take() {
@@ -162,6 +200,10 @@ impl MuseEditor {
         }
         if self.busy {
             self.history.push(format!("❯ {prompt}"));
+            if self.failing_steers > 0 {
+                self.failing_steers -= 1;
+                self.failing = Some((prompt.clone(), self.steer_fails_after_reads));
+            }
         } else {
             self.history.push(format!("❯ {prompt}\n◆ response"));
         }

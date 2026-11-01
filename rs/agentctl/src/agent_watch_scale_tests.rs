@@ -524,3 +524,68 @@ fn a_snapshot_answers_each_read_once_and_never_keeps_input() {
     client.panes(None).unwrap();
     assert_eq!(team.calls(), vec!["pane list".to_owned()]);
 }
+
+/// #720 agentctl-muse-stale-draft: the production probe finds the owner's requests waiting in a
+/// registered agent's queue, with the reason recorded, and probable-misroute quarantines; an
+/// agent's own message waiting is not the owner's, and an old quarantine is not news.
+#[test]
+fn the_probe_reads_owner_requests_waiting_and_quarantines_from_the_queues() {
+    let members = vec![member("coordinator", "running", Some("idle"), IDLE_SCREEN)];
+    let team = Team::new("owner-waits", &members, 1, 0.0);
+    let client = team.client();
+    let mut probe = ManagedProbe::new(&client, &team.registry, "coordinator");
+    let queue = agent_queue::registry::directory(&team.registry, "coordinator")
+        .unwrap()
+        .join("queue");
+    let key = "ab".repeat(32);
+    for lane in ["inbox", "failed"] {
+        private_dir(&queue.join(lane));
+    }
+    let write = |path: PathBuf, document: Value| {
+        crate::agent::atomic_json(&path, &document).unwrap();
+    };
+    write(
+        queue.join(format!("inbox/chat-{key}.json")),
+        json!({"id": format!("chat-{key}"), "text": "[from Ada via slack #team]\nhi",
+               "queued_at": 1_000.0, "delivery_error": "a draft is in the editor"}),
+    );
+    write(
+        queue.join("inbox/lane.json"),
+        json!({"id": "lane", "text": "[from lane via agentctl]\nstatus", "queued_at": 900.0}),
+    );
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    write(
+        queue.join("failed/lost.json"),
+        json!({"id": "lost", "text": "[from lane via agentctl]\nrelease the lock\nmore",
+               "probable_misroute": true, "delivery_failed_at": now - 5.0,
+               "delivery_error": "PROBABLE MISROUTE, quarantined"}),
+    );
+    write(
+        queue.join("failed/plain.json"),
+        json!({"id": "plain", "text": "x", "possibly_submitted": true,
+               "delivery_failed_at": now - 5.0}),
+    );
+    write(
+        queue.join("failed/ancient.json"),
+        json!({"id": "ancient", "text": "x", "probable_misroute": true,
+               "delivery_failed_at": now - 2.0 * QUARANTINE_LOOKBACK_SECONDS}),
+    );
+    let waiting = probe.waiting_owner_prompts();
+    assert_eq!(waiting.len(), 1, "{waiting:?}");
+    assert_eq!(waiting[0].agent, "coordinator");
+    assert_eq!(waiting[0].id, format!("chat-{key}"));
+    assert_eq!(waiting[0].queued_at, 1_000.0);
+    assert_eq!(
+        waiting[0].reason.as_deref(),
+        Some("a draft is in the editor")
+    );
+    let quarantined = probe.quarantined_misroutes(now - QUARANTINE_LOOKBACK_SECONDS);
+    assert_eq!(quarantined.len(), 1, "{quarantined:?}");
+    assert_eq!(quarantined[0].id, "lost");
+    assert_eq!(quarantined[0].excerpt, "release the lock");
+    assert!(!quarantined[0].owner);
+    assert!(quarantined[0].path.ends_with("failed/lost.json"));
+}

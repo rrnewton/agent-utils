@@ -2835,11 +2835,27 @@ pub(crate) struct DeliveryEntry {
     /// composer draft removed as [`without_composer_preview`] removes it. `None` once the prompt
     /// is typed, and while no attempt has recorded a reason.
     pub(crate) reason: Option<String>,
+    /// The start of the owner's message, on one line, cut short, for a notice to the owner that
+    /// must say which message it means (#720 agentctl-muse-stale-draft).
+    pub(crate) excerpt: String,
 }
+
+/// Characters of an owner's message a [`DeliveryEntry`] keeps.
+const ENTRY_EXCERPT_CHARS: usize = 80;
 
 impl DeliveryEntry {
     fn new(record: &RequestRecord) -> Self {
         let typed = record.phase == RequestPhase::Delivered;
+        let words = record
+            .message
+            .text
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut excerpt: String = words.chars().take(ENTRY_EXCERPT_CHARS).collect();
+        if words.chars().count() > ENTRY_EXCERPT_CHARS {
+            excerpt.push('…');
+        }
         Self {
             key: record.key.clone(),
             phase: record.phase.clone(),
@@ -2850,6 +2866,7 @@ impl DeliveryEntry {
                 .as_deref()
                 .filter(|_| !typed)
                 .map(without_composer_preview),
+            excerpt,
         }
     }
 
@@ -11932,6 +11949,17 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
             read_document(&self.reply_path(key, ordinal), MAX_REPLY_RECORD_BYTES)?;
         reply.validate(key, ordinal)?;
         Ok(reply)
+    }
+
+    /// [`Self::set_delivery_phase`], for tests elsewhere in the crate.
+    #[cfg(test)]
+    pub(crate) fn put_delivery_phase(
+        &self,
+        key: &str,
+        phase: RequestPhase,
+        error: Option<&str>,
+    ) -> Result<()> {
+        self.set_delivery_phase(key, phase, error).map(|_| ())
     }
 
     fn set_delivery_phase(
@@ -37254,6 +37282,7 @@ If you have trouble, run: agentctl chat help 001"
             admitted_at_millis,
             delivered_at_millis: None,
             reason: Some(format!("{key} waits")),
+            excerpt: String::new(),
         };
         // The phase alone decides: a reply the agent stored does not take a request off the list,
         // as `status_says_how_far_each_prompt_got_and_lists_the_stalled_requests` shows.

@@ -156,7 +156,7 @@ enum Commands {
     Watch(Watch),
     /// Watch every registered agent and tell its manager, else the coordinator, when one finished its turn with a verdict or needs a human: at a harness approval or permission prompt, idle without a verdict, stalled, blocked or silent while working, inside a long turn with input queued behind it, without progress on a declared metric, looping, or dead. One notice per episode, queued durably for its recipient; never answers a prompt and types into another agent only to interrupt a stuck turn with input queued behind it (the auto-interrupt policy, --auto-deliver-after); opt-in --auto-recover retries verified transient capacity/rate-limit stops
     #[command(
-        after_help = "Examples:\n  agentctl --registry ~/project/.agentctl watch-agents --coordinator coordinator --once --check-only\n  agentctl --registry ~/project/.agentctl watch-agents --coordinator coordinator --approval-minutes 5 --idle-minutes 5 --stall-minutes 30\n\nEach pass lists the registry, reads every running or starting agent except the coordinator (paused, mid-move, and agentcloud\nagents are skipped; an unreadable record is watched as unreachable), and classifies it. A condition that holds past its\nthreshold is reported once, as one message queued through the same durable path as `agentctl send`, so a busy recipient\nloses nothing; it counts as reported only once queued, and a failed send is retried on its own doubling backoff without\nholding up any other notice. The recipient is the nearest reachable agent up the agent's managed_by chain that can act on\nit (not one itself reported at a prompt, dead, or with a stuck turn), else the coordinator (`agentctl tree` shows the\nchain). A blocked agent (an approval or permission prompt, or a guardrail refusal) is reported in the pass\nthat sees it, past --min-notice-interval, and between passes a quick look every --blocked-check-seconds reads only visible\nrows for one. Log lines on standard error open with the UTC time. A verdict is a prose line (not tool output) of the agent's last reply (from its first block after the last user turn\non screen) that starts with one of --done-marker once any reply bullet is stripped (--done-marker replaces the DONE:/BLOCKED:\ndefaults). An idle agent with a verdict is reported as child-done after --child-done-seconds (default 0: the pass that sees it),\nin a message of its own that names the verdict line, once per turn, never held by --min-notice-interval; when the registry's\nlanding queue (`agentctl hold`) has agents waiting on it, the same message says who is next. An agent that was never sent\nwork, or still has prompts queued, is never reported idle, and a Claude Code view scrolled up (`N new messages (ctrl+End) ↓`\nabove the input box) is never judged stalled, idle, or finished until it is back at the bottom. Episode memory lives in\n--state-dir (default $XDG_STATE_HOME/agentctl/agent-watch); a message's queue ID is derived from its notices, so a restart\nrecognises a message that is already queued instead of sending it twice, and one watcher runs per state directory. With\n--once, exit 0 only when the team could be probed, no episode other than child-done is reported or due, and no view is\nscrolled up, 1 otherwise.\n\n\"Working\" is classified too (#570). The harness's turn timer is masked before screens are compared, and the tool\ncommands and gate steps under the agent's pinned harness process are read from /proc each pass: one that used CPU or moved\nbytes is progressing; one that did not for --stall-minutes is tool-blocked, named with what it waits on (a file lock and\nits holder, terminal input, a network socket, a pipe, an idle child); no tool and no output or token movement is\nstream-silent. The harness's own transcript (#574: Claude Code's session JSONL, Codex's rollout, Muse's journal, found\nby the record's session id or the files the harness holds open) adds the last event, the last model output, an open model\nrequest, and the tool call in flight with its command and timeout: a call no process runs for (an MCP tool, a sub-agent)\nis tool-blocked once nothing moves; untimed-tool: a call with no timeout running past --untimed-tool-minutes. The report's\n`activity` lists what each transcript says. turn-queued: inside one turn past --turn-minutes with input queued behind it.\nauto-interrupt: a stuck turn with input queued is interrupted and the input delivered (--auto-deliver-after). no-progress: a metric declared with `agentctl progress` unchanged for its hours while working.\nover-expected: a gate step past the p95 of --step-history. looping: the same command or error --loop-repeats times, or a\nretry banner, for --loop-minutes. background-wait: idle on background shells that are gone or idle.\nWithout it the watch runs until stopped; see the sample user unit in `agentctl userguide`."
+        after_help = "Examples:\n  agentctl --registry ~/project/.agentctl watch-agents --coordinator coordinator --once --check-only\n  agentctl --registry ~/project/.agentctl watch-agents --coordinator coordinator --approval-minutes 5 --idle-minutes 5 --stall-minutes 30\n\nEach pass lists the registry, reads every running or starting agent except the coordinator (paused, mid-move, and agentcloud\nagents are skipped; an unreadable record is watched as unreachable), and classifies it. A condition that holds past its\nthreshold is reported once, as one message queued through the same durable path as `agentctl send`, so a busy recipient\nloses nothing; it counts as reported only once queued, and a failed send is retried on its own doubling backoff without\nholding up any other notice. The recipient is the nearest reachable agent up the agent's managed_by chain that can act on\nit (not one itself reported at a prompt, dead, or with a stuck turn), else the coordinator (`agentctl tree` shows the\nchain). A blocked agent (an approval or permission prompt, or a guardrail refusal) is reported in the pass\nthat sees it, past --min-notice-interval, and between passes a quick look every --blocked-check-seconds reads only visible\nrows for one. Log lines on standard error open with the UTC time. A verdict is a prose line (not tool output) of the agent's last reply (from its first block after the last user turn\non screen) that starts with one of --done-marker once any reply bullet is stripped (--done-marker replaces the DONE:/BLOCKED:\ndefaults). An idle agent with a verdict is reported as child-done after --child-done-seconds (default 0: the pass that sees it),\nin a message of its own that names the verdict line, once per turn, never held by --min-notice-interval; when the registry's\nlanding queue (`agentctl hold`) has agents waiting on it, the same message says who is next. An agent that was never sent\nwork, or still has prompts queued, is never reported idle, and a Claude Code view scrolled up (`N new messages (ctrl+End) ↓`\nabove the input box) is never judged stalled, idle, or finished until it is back at the bottom. Episode memory lives in\n--state-dir (default $XDG_STATE_HOME/agentctl/agent-watch); a message's queue ID is derived from its notices, so a restart\nrecognises a message that is already queued instead of sending it twice, and one watcher runs per state directory. With\n--once, exit 0 only when the team could be probed, no episode other than child-done is reported or due, and no view is\nscrolled up, 1 otherwise.\n\n\"Working\" is classified too (#570). The harness's turn timer is masked before screens are compared, and the tool\ncommands and gate steps under the agent's pinned harness process are read from /proc each pass: one that used CPU or moved\nbytes is progressing; one that did not for --stall-minutes is tool-blocked, named with what it waits on (a file lock and\nits holder, terminal input, a network socket, a pipe, an idle child); no tool and no output or token movement is\nstream-silent. The harness's own transcript (#574: Claude Code's session JSONL, Codex's rollout, Muse's journal, found\nby the record's session id or the files the harness holds open) adds the last event, the last model output, an open model\nrequest, and the tool call in flight with its command and timeout: a call no process runs for (an MCP tool, a sub-agent)\nis tool-blocked once nothing moves; untimed-tool: a call with no timeout running past --untimed-tool-minutes. The report's\n`activity` lists what each transcript says. turn-queued: inside one turn past --turn-minutes with input queued behind it.\nauto-interrupt: a stuck turn with input queued is interrupted and the input delivered (--auto-deliver-after). no-progress: a metric declared with `agentctl progress` unchanged for its hours while working.\nover-expected: a gate step past the p95 of --step-history. looping: the same command or error --loop-repeats times, or a\nretry banner, for --loop-minutes. background-wait: idle on background shells that are gone or idle.\n\nDelivery is watched too (#720): an owner (chat-bridge) request waiting undelivered in any agent's queue past\n--owner-stuck-minutes is reported with the reason its last attempt recorded, again every as many minutes until delivered,\nand each prompt quarantined as a PROBABLE MISROUTE in the last 6 hours is reported once with how to send it again; both\nare priority notices to the coordinator.\nWithout it the watch runs until stopped; see the sample user unit in `agentctl userguide`."
     )]
     WatchAgents(WatchAgents),
     /// Record that an agent lands after another (the landing queue), list the queue, or drop a hold. `watch-agents` reads it: when OTHER finishes its turn with a verdict that does not start with BLOCKED, OTHER's child-done notice to the coordinator says NAME is next, and once that notice is queued the hold is marked released. Nothing is ever sent to NAME
@@ -768,6 +768,9 @@ struct WatchAgents {
     /// Minutes a sender may wait for an agent's lifecycle lock before the coordinator is told, from 0 to 1440 (default: 10; 0 turns the check off). Every managed send holds that lock until its delivery is confirmed, so messages to a busy agent wait in turn; the notice names the holder and the waiters, is sent once per jam, and goes ahead of ordinary sends
     #[arg(long, default_value = "10", value_parser = clap::value_parser!(u64).range(0..=1440), value_name = "MINUTES")]
     delivery_wait_minutes: u64,
+    /// Minutes a chat-bridge (owner) request may wait undelivered in a registered agent's queue before the coordinator is told, from 0 to 1440 (default: 5; 0 turns the check off). The notice names the agent, how many of the owner's requests wait and for how long, and the reason the last attempt gave (such as a draft agentctl did not type in the agent's editor); a request that waits only because its agent is working does not count; it goes ahead of ordinary sends and is repeated every as many minutes until the requests are delivered (once per episode for the coordinator's own queue, where the notice itself waits)
+    #[arg(long, default_value = "5", value_parser = clap::value_parser!(u64).range(0..=1440), value_name = "MINUTES")]
+    owner_stuck_minutes: u64,
     /// Minutes a turn may run with input queued behind it (in the harness's own queue, such as Codex's queued follow-up inputs, which Codex submits only when the turn ends, or in agentctl's queue) before it is reported as turn-queued, from 1 to 10080 (default: 120). The turn's age is the harness's turn timer, else how long the watcher has seen the agent working
     #[arg(long, default_value = "120", value_parser = turn_minutes, value_name = "MINUTES")]
     turn_minutes: u64,
@@ -1873,6 +1876,9 @@ struct ChatRun {
     /// Clear text left unsubmitted in the coordinator's composer once it has blocked a request and stayed unchanged for DURATION, such as 30m (default: off). Units: s, m or h; a bare number is seconds; at least 1m. The text is first saved with mode 0600 under the state directory's composer-backups/, then deleted with editing keys and the composer proved empty, and then posted once to the first configured channel through the outbound helper with a "[chat-bridge WARNING]" notice; delivery then resumes. Any change to the text restarts the wait, nothing is cleared while the agent works, and a failed clear leaves the text and posts nothing. Requires an outbound helper; applies only to this run.
     #[arg(long, value_name = "DURATION", value_parser = stale_composer_duration)]
     stale_composer_clear_after: Option<Duration>,
+    /// Warn the owner in the chat once a request has waited undelivered for DURATION, such as 10m (default: 5m; off turns it off). Units: s, m or h; a bare number is seconds; at least 1m. A request that waits only because the agent is working (its last attempt said `last status=working`) does not count. The warning, posted to the first configured channel through the outbound helper as a "[chat-bridge WARNING]", says how many requests wait, how long the oldest has, and the reason the last attempt gave (such as text agentctl did not type in the coordinator's input box, which it never submits or clears), and is repeated every DURATION until they are delivered; then one line says delivery resumed. A request quarantined as a PROBABLE MISROUTE (never typed again by itself) is reported at once, with the start of the message and a request to send it again. Without an outbound helper the warnings are only logged; applies only to this run.
+    #[arg(long, value_name = "DURATION", default_value = "5m", hide_default_value = true, value_parser = owner_alarm_duration)]
+    owner_alarm_after: OwnerAlarmAfter,
     /// Remind a Claude Code coordinator, once, of each chat request whose prompt was typed and that it has not answered, once it has been idle for DURATION since that prompt was typed (default: 60s). Units: s, m or h; a bare number is seconds; at least 10s and at most 12h, and 0 turns reminders off. Idle means Herdr reports the pane idle or done, the pane shows no running turn, and `claude agents --json` reports the pane's session idle. Right before a reminder, the session's transcript (`<session>.jsonl` under the session's CLAUDE_CONFIG_DIR or ~/.claude `projects`) is read, and a request whose reply ID heads a complete reply block in the agent's ordinary text there is left out and never reminded, since that reply was printed though no read of the pane showed it. The reminder names the reply IDs it has received no reply for, says that a reply written only in thinking is not delivered, prints for each the `agentctl chat sent --request` command to check what the bridge holds before sending anything again, and mentions `agentctl chat reply`; it is recorded in reply-reminders.json before it is queued, is typed only into an idle pane and never behind another queued prompt, never through --deliver-while-working, and is taken back out of the queue if it is not typed within 10 seconds (or --ready-timeout if shorter). A reminder taken back holds off the next until the coordinator has been seen working and idle again, or for twice DURATION, doubling with each in a row, up to 60 minutes. Requests delivered before reminders first started for the state directory, or more than 24 hours ago, are never reminded, so DURATION plus the time the coordinator works after a prompt must stay under 24 hours. Needs outbound_enabled; applies only to this run.
     #[arg(long, value_name = "DURATION", default_value = "60s", hide_default_value = true, value_parser = reply_reminder_idle)]
     reply_reminder_idle: ReplyReminderIdle,
@@ -1918,6 +1924,8 @@ impl ChatOperate {
             reconciliation_interval: Duration::from_secs_f64(self.reconcile_interval),
             timing: crate::chat_service::DeliveryTiming::default(),
             idle_poll_interval: crate::chat_service::IDLE_SATURATED_POLL_INTERVAL,
+            // `chat run` sets this from its own flag.
+            owner_alarm_after: None,
         }
     }
 }
@@ -2058,6 +2066,17 @@ fn environment_value(value: &str) -> Result<String, String> {
 }
 fn stale_composer_duration(value: &str) -> Result<Duration, String> {
     crate::stale_composer::parse_duration(value)
+}
+/// `chat run --owner-alarm-after`: the wait, or `None` when the alarm is off.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OwnerAlarmAfter(Option<Duration>);
+fn owner_alarm_duration(value: &str) -> Result<OwnerAlarmAfter, String> {
+    if value.trim() == "off" {
+        return Ok(OwnerAlarmAfter(None));
+    }
+    crate::stale_composer::parse_duration(value)
+        .map(|duration| OwnerAlarmAfter(Some(duration)))
+        .map_err(|error| format!("{error}, or off"))
 }
 /// `chat run --reply-reminder-idle`: the idle time, or `None` when reminders are off.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2974,6 +2993,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 state_dir: value.state_dir,
                 landing_queue: Some(crate::landing_queue::path(&args.registry)),
                 delivery_wait: Duration::from_secs(value.delivery_wait_minutes * 60),
+                owner_stuck: Duration::from_secs(value.owner_stuck_minutes * 60),
                 turn: Duration::from_secs(value.turn_minutes * 60),
                 untimed_tool: Duration::from_secs(value.untimed_tool_minutes * 60),
                 auto_deliver: crate::agent_watch::AutoDeliver {
@@ -4360,6 +4380,7 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
         ChatCommand::Run(value) => {
             let mut options = value.operate.options();
             options.delivery.deliver_while_working = value.deliver_while_working;
+            options.owner_alarm_after = value.owner_alarm_after.0;
             let client =
                 HerdrClient::with_executable("direct", &herdr_bin).map_err(AgentError::from)?;
             // A person's messages go ahead of agent-to-agent sends (#556 chat-delivery-latency).
@@ -5642,9 +5663,28 @@ mod tests {
                 "{bad}"
             );
         }
+        // #720 agentctl-muse-stale-draft: the owner alarm is on by default.
+        assert_eq!(
+            defaults.owner_alarm_after,
+            OwnerAlarmAfter(Some(Duration::from_secs(300)))
+        );
+        assert_eq!(
+            run(&["--owner-alarm-after", "15m"])
+                .unwrap()
+                .owner_alarm_after,
+            OwnerAlarmAfter(Some(Duration::from_secs(900)))
+        );
+        assert_eq!(
+            run(&["--owner-alarm-after", "off"])
+                .unwrap()
+                .owner_alarm_after,
+            OwnerAlarmAfter(None)
+        );
+        assert!(run(&["--owner-alarm-after", "10s"]).is_err());
         for flag in [
             "--deliver-while-working",
             "--stale-composer-clear-after=30m",
+            "--owner-alarm-after=5m",
         ] {
             assert!(Cli::try_parse_from([
                 "agentctl",

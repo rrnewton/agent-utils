@@ -326,6 +326,20 @@ pub trait AgentApi: Send + Sync {
     fn working_wait_proves_printed(&self) -> bool {
         false
     }
+    /// Submit a draft that agentctl itself typed and the harness left unsent in the pane's
+    /// editor, so that it no longer holds every later prompt (#720 agentctl-muse-stale-draft).
+    /// `Ok(Some(evidence))` once one was submitted; `Ok(None)` when the editor holds no draft,
+    /// one agentctl did not type (left alone, since a person may be typing it, and refused by
+    /// the readiness wait as `staged`), or this client cannot tell whose a draft is; an error
+    /// saying why when a draft agentctl typed would not leave the editor. The default cannot
+    /// tell.
+    fn recover_stale_draft_with_runtime(
+        &self,
+        _pane_id: &str,
+        _runtime: &dyn AgentRuntime,
+    ) -> crate::error::Result<Option<String>> {
+        Ok(None)
+    }
 }
 
 impl AgentApi for HerdrClient {
@@ -1497,6 +1511,17 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                         } else {
                             format!("{} queued messages:\n\n{}", texts.len(), texts.join("\n\n"))
                         };
+                        // What is typed, on every member, so a draft Muse leaves unsent can be
+                        // told for agentctl's own (#720 agentctl-muse-stale-draft).
+                        for (index, (_, inflight)) in active.iter().enumerate() {
+                            let document = &mut documents[index];
+                            if document.get("text").and_then(Value::as_str)
+                                != Some(combined.as_str())
+                            {
+                                document.insert("typed_as".to_owned(), json!(combined));
+                                atomic_json(inflight, &Value::Object(document.clone()))?;
+                            }
+                        }
                         let followup_key = crate::harness_tui::followup_tui(info.agent.as_deref())
                             .map(|adapter| adapter.working_submit_key());
                         let withdrawing = WithdrawingRuntime {
@@ -1517,6 +1542,7 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                             for (index, (member, inflight)) in active.iter().enumerate() {
                                 let document = &mut documents[index];
                                 document.remove("possibly_submitted");
+                                document.remove("typed_as");
                                 document.remove("inflight_at");
                                 document.remove("paste_tracking");
                                 document.remove("inflight_from");
@@ -1627,6 +1653,7 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                                         batched.insert(member.0.clone());
                                     } else {
                                         document.remove("possibly_submitted");
+                                        document.remove("typed_as");
                                         document.remove("inflight_at");
                                         document.remove("paste_tracking");
                                         document.remove("inflight_from");
@@ -1727,6 +1754,15 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
             };
             document.insert("inflight_from".to_owned(), json!(origin_lane));
             document.remove("paste_started_at");
+            // What is typed, when that is not the queued text (a chat prompt's opening is
+            // retimed as it is typed), so a draft Muse leaves unsent can be told for agentctl's
+            // own (#720 agentctl-muse-stale-draft).
+            let typed = typed_text(&document)?;
+            if document.get("text").and_then(Value::as_str) == Some(typed.as_str()) {
+                document.remove("typed_as");
+            } else {
+                document.insert("typed_as".to_owned(), json!(typed));
+            }
             atomic_json(&inflight_path, &Value::Object(document.clone()))?;
 
             // Typing into a working pane relies on the agent to queue the prompt; one it never
@@ -1757,7 +1793,7 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
             match deliver_one(
                 client,
                 &info,
-                &typed_text(&document)?,
+                &typed,
                 options.working_timeout,
                 delivery_runtime,
             ) {
@@ -1765,6 +1801,7 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                     // Nothing reached the composer: undo the at-most-once barrier so the
                     // prompt stays pending. A crash before the rename still quarantines it.
                     document.remove("possibly_submitted");
+                    document.remove("typed_as");
                     document.remove("inflight_at");
                     document.remove("paste_tracking");
                     document.remove("inflight_from");
@@ -1807,6 +1844,7 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                         break 'retry;
                     }
                     document.remove("possibly_submitted");
+                    document.remove("typed_as");
                     document.remove("inflight_at");
                     document.remove("paste_tracking");
                     document.remove("inflight_from");
@@ -2373,6 +2411,10 @@ fn wait_ready<A: AgentApi + ?Sized>(
     (allow_followups, allow_working_claude): (bool, bool),
 ) -> AgentResult<AgentPaneInfo> {
     let deadline = runtime.monotonic().saturating_add(timeout);
+    // Why a `staged` pane's draft was left alone, once a recovery refused it (#720
+    // agentctl-muse-stale-draft).
+    let mut draft_refused: Option<String> = None;
+    let mut recovered = 0;
     loop {
         if runtime.cancelled() {
             return Err(AgentError::delivery(
@@ -2453,13 +2495,31 @@ fn wait_ready<A: AgentApi + ?Sized>(
                 info.pane_id
             )));
         }
+        // A Muse editor holding a draft reads `staged`, which never becomes ready by itself: a
+        // draft agentctl typed and Muse left unsent is submitted, and the pane looked at again;
+        // any other draft is left alone and named in the refusal (#720
+        // agentctl-muse-stale-draft).
+        if info.status == "staged" && draft_refused.is_none() && recovered < MAX_DRAFT_RECOVERIES {
+            match client.recover_stale_draft_with_runtime(&info.pane_id, runtime) {
+                Ok(Some(_)) => {
+                    recovered += 1;
+                    continue;
+                }
+                Ok(None) => {}
+                Err(error) => draft_refused = Some(error.to_string()),
+            }
+        }
         let now = runtime.monotonic();
         if now >= deadline {
             return Err(AgentError::delivery(format!(
-                "pane {} {NOT_READY} {}s; last status={}",
+                "pane {} {NOT_READY} {}s; last status={}{}",
                 info.pane_id,
                 timeout.as_secs_f64(),
-                info.status
+                info.status,
+                draft_refused
+                    .as_deref()
+                    .filter(|_| info.status == "staged")
+                    .map_or(String::new(), |why| format!(": {why}"))
             )));
         }
         runtime.sleep(POLL_INTERVAL.min(deadline.saturating_sub(runtime.monotonic())));
@@ -2481,6 +2541,10 @@ enum Delivered {
     /// The prompt reached the wrong program, which was told to ignore it; retry is safe.
     Misrouted(String),
 }
+
+/// Unsent drafts one readiness wait submits before it stops looking for more (#720
+/// agentctl-muse-stale-draft).
+const MAX_DRAFT_RECOVERIES: u32 = 3;
 
 /// Misroutes tolerated for one message before it is quarantined instead of retried.
 pub const MAX_MISROUTES: usize = 2;
@@ -3243,7 +3307,7 @@ fn typed_text(document: &Map<String, Value>) -> AgentResult<String> {
 /// owner's), or console input, whose sender header names `human@HOST`. The owner's prompts are
 /// typed first and each on its own, never in a batch, so the owner sees their own message in the
 /// pane and the bridge's delivered mark belongs to it.
-fn owner_prompt(identifier: &str, document: &Map<String, Value>) -> bool {
+pub(crate) fn owner_prompt(identifier: &str, document: &Map<String, Value>) -> bool {
     let request = |id: &str| crate::chat_runtime::request_key_of_message(id).is_some();
     request(identifier)
         || document

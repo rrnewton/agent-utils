@@ -2161,6 +2161,53 @@ is disabled, or the acknowledgement is the receipt emoji itself); `waiting`, the
 those failed at their last attempt or cannot be read; and the `lost`,
 `oldest_lost_key`, `refused`, `oldest_refused_key` and `last_refusal` above.
 
+### Warning the owner when messages do not arrive
+
+A request whose prompt cannot be typed waits, and every scan tries it again;
+the scan logs it and lists it in `delivery-alarm.json`, which nobody reads while
+it waits. So `chat run` also tells the owner in the chat. Once a request has
+waited undelivered (`pending` or `submitting`) for `--owner-alarm-after
+DURATION` (default `5m`; `off` turns it off; units as for
+`--stale-composer-clear-after`, at least `1m`), the next scan posts one root
+message to the first configured channel through the outbound helper:
+
+```text
+[chat-bridge WARNING] 2 of your messages to coord have not reached it, the oldest sent 6 min ago ("are you there?"). Why: request remains pending: pane w1:p2 did not become idle/done within 0s; last status=staged. Text that agentctl did not type is in coord's input box, so it is left alone; submit or clear it there, and delivery resumes. This warning repeats every 5 min until they are delivered.
+```
+
+The reason is the one the oldest waiting request's last attempt recorded (cut
+to 600 characters, with any quoted composer text removed, as `chat status`
+shows it). A request that waits only because the agent is working (its last
+attempt said `last status=working` or `coordinator is not ready`, or none has
+been made yet) is no fault and is not counted: a Claude Code coordinator run
+without `--deliver-while-working` takes no prompt during a turn. The warning is
+posted again every DURATION while any request still waits that long, and when
+none does any more, one line says `[chat-bridge] Your messages to coord are
+being delivered again.` The alarm's memory lasts for the whole `chat run`, so
+an owner loop restarted after a transient failure neither repeats it early nor
+forgets a quarantine it has not reported.
+
+A request whose prompt was quarantined as a PROBABLE MISROUTE (the pane failed
+its recipient check right after input was written, so the prompt may have
+reached another program, and it is never typed again by itself) is reported
+at once, in the scan that first sees it so:
+
+```text
+[chat-bridge WARNING] Your message to coord sent 1 min ago ("deploy the fix") was quarantined as a PROBABLE MISROUTE: it may have reached another pane, or no agent at all, and it will not be sent again by itself. Why: .... If coord does not act on it, send it again.
+```
+
+Requests already quarantined when the service starts are not reported again.
+Without an outbound helper or a channel, the warnings are only written to the
+service log. A warning that fails to post is logged and not tried again,
+though the alarm itself repeats. `agentctl watch-agents` reports the same
+held requests, and each quarantine, to the coordinator.
+
+A draft in a Muse coordinator's editor that agentctl typed itself (a prompt
+Muse put back there unsent, as it does with a steer that fails around a
+context compaction) does not hold requests at all: the next delivery submits
+it and carries on. Only a draft agentctl did not type holds them, since a
+person may be typing it; that is the case this warning names.
+
 ### Reminding the agent of a request it has not answered
 
 A Claude Code agent sometimes writes its reply only in its thinking. Claude

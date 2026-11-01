@@ -76,7 +76,10 @@
 //! `possibly_submitted`, `inflight_at`, `paste_tracking`, `inflight_from`, `paste_started_at`,
 //! `confirmed_at`, `delivery_failed_at`,
 //! `delivery_attempts` and its alias `tui_delivery_attempts`, `misroutes` (array of
-//! `{at, error}`) and `probable_misroute`. A sender may add fields of its own, such as the
+//! `{at, error}`) and `probable_misroute`; and, as the audit trail of a prompt typed into an
+//! editor that can hold it unsent, `typed_as` (the text typed, when it is not `text`: a batch,
+//! or a prompt whose opening was retimed), `draft_recovered_at` and `draft_recovered_evidence`
+//! (when and how a prompt found left unsent in the editor was submitted again). A sender may add fields of its own, such as the
 //! original send time of a chat request (`sent_at`, `opening`). Readers ignore fields they do not
 //! know, so a field cannot make an older reader refuse an item.
 //!

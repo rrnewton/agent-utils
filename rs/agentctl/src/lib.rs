@@ -40,6 +40,7 @@ pub mod sender_header;
 pub mod services;
 pub(crate) mod skill_install;
 pub mod stale_composer;
+pub(crate) mod stale_draft;
 pub mod stuck;
 pub mod subagents;
 pub mod submission;

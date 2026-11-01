@@ -133,6 +133,10 @@ pub struct WatchAgentsOptions {
     /// How long a sender may wait for an agent's lifecycle lock before the jam is reported;
     /// zero turns the check off.
     pub delivery_wait: Duration,
+    /// How long a chat-bridge (owner) request may wait undelivered in a registered agent's queue
+    /// before the coordinator is told why, and again every as long until it is delivered; zero
+    /// turns the check off (#720 agentctl-muse-stale-draft).
+    pub owner_stuck: Duration,
     /// How long a turn may run, with input queued behind it, before it is reported.
     pub turn: Duration,
     /// How long a tool call that set no timeout, and that its harness does not bound, may run
@@ -810,7 +814,52 @@ struct WatchState {
     /// reported, so one jam is reported once.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     jams_reported: BTreeMap<String, f64>,
+    /// For each agent whose owner requests wait undelivered and were reported, when they were
+    /// last reported, so the notice repeats every `owner_stuck` until they are delivered.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    owner_stuck_reported: BTreeMap<String, f64>,
+    /// Each probable-misroute quarantine reported, as `AGENT/ID`, with when it was quarantined,
+    /// so each is reported once; forgotten once older than [`QUARANTINE_LOOKBACK_SECONDS`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    quarantines_reported: BTreeMap<String, f64>,
 }
+
+/// An owner (chat-bridge) request waiting undelivered in a registered agent's queue.
+#[derive(Clone, Debug)]
+pub struct WaitingOwnerPrompt {
+    /// The agent whose queue holds it.
+    pub agent: String,
+    /// Its queue message ID.
+    pub id: String,
+    /// When it was queued, in Unix seconds.
+    pub queued_at: f64,
+    /// Why the last attempt left it waiting, as the queue recorded it.
+    pub reason: Option<String>,
+}
+
+/// A prompt a drain quarantined as a probable misroute: it may have reached another program, so
+/// it is never typed again by itself.
+#[derive(Clone, Debug)]
+pub struct QuarantinedPrompt {
+    /// The agent whose queue holds it.
+    pub agent: String,
+    /// Its queue message ID.
+    pub id: String,
+    /// When it was quarantined, in Unix seconds.
+    pub failed_at: f64,
+    /// Its record in the queue's `failed/`.
+    pub path: PathBuf,
+    /// The first line of its message after any sender header, cut short.
+    pub excerpt: String,
+    /// The delivery error that quarantined it.
+    pub error: String,
+    /// Whether it is one of the owner's chat requests.
+    pub owner: bool,
+}
+
+/// How far back a probable-misroute quarantine is reported: one older than this, found when the
+/// watcher starts, is history rather than news.
+const QUARANTINE_LOOKBACK_SECONDS: f64 = 6.0 * 3600.0;
 
 /// Where observations come from; the production source reads the registry through Herdr.
 pub trait Probe {
@@ -826,6 +875,16 @@ pub trait Probe {
     /// the quick check between passes. An agent whose rows cannot be read now is left out. The
     /// default reads none.
     fn visible_screens(&mut self) -> Vec<(String, String)> {
+        Vec::new()
+    }
+    /// Every owner (chat-bridge) request waiting undelivered in a registered agent's queue. The
+    /// default sees none.
+    fn waiting_owner_prompts(&mut self) -> Vec<WaitingOwnerPrompt> {
+        Vec::new()
+    }
+    /// Every prompt quarantined as a probable misroute at or after `since` (Unix seconds). The
+    /// default sees none.
+    fn quarantined_misroutes(&mut self, _since: f64) -> Vec<QuarantinedPrompt> {
         Vec::new()
     }
 }
@@ -2565,6 +2624,8 @@ fn watch_agents_once(
     // First, as a priority sender: the other notices wait for the coordinator's lock like any
     // ordinary sender, so behind a jam on the coordinator they would hold this one up.
     let delivery_waits = report_delivery_jams(probe, notifier, state, now, options);
+    let owner_waits = report_waiting_owner_prompts(probe, notifier, state, now, options);
+    let quarantines = report_quarantines(probe, notifier, state, now, options);
     let child_done = flush_child_done(state, notifier, now, options);
     let notice = flush_notices(state, notifier, now, options);
     // The episode rows were made before this pass's sends: `reported` means delivered, so it is
@@ -2600,6 +2661,7 @@ fn watch_agents_once(
         "ok": probe_error.is_null()
             && scrolled.is_empty()
             && unchecked.is_empty()
+            && owner_waits.iter().all(|row| row["stuck"] != true)
             && episodes.iter().all(|row| {
                 // A finished child is news for its coordinator, not a fault in the team.
                 row["kind"] == EpisodeKind::ChildDone.as_str()
@@ -2614,6 +2676,8 @@ fn watch_agents_once(
         "child_done": child_done,
         "waiting": state.pending.len(),
         "delivery_waits": delivery_waits,
+        "owner_waits": owner_waits,
+        "quarantines": quarantines,
         "auto_interrupts": auto_interrupts,
         "activity": observations
             .iter()
@@ -2775,6 +2839,187 @@ fn report_delivery_jams(
         rows.push(row);
     }
     state.jams_reported = still_jammed;
+    rows
+}
+
+/// Report each agent whose owner (chat-bridge) requests have waited undelivered in its queue
+/// longer than `--owner-stuck-minutes`, with how many, how long, and the reason the last attempt
+/// gave, and report it again every as many minutes until they are delivered (#720
+/// agentctl-muse-stale-draft); about the coordinator itself, whose own queue the notice would
+/// wait in, once per episode. A request that waits only because its agent is busy is no fault
+/// and is not counted. Behind a draft in the agent's editor, for one, every delivery is
+/// refused while the agent can look busy all the while, so nothing else would say so. The notice
+/// goes to the coordinator as a priority sender. Returns a row for every agent with an owner
+/// request waiting, for the pass report.
+fn report_waiting_owner_prompts(
+    probe: &mut dyn Probe,
+    notifier: &mut dyn Notifier,
+    state: &mut WatchState,
+    now: f64,
+    options: &WatchAgentsOptions,
+) -> Vec<Value> {
+    if options.owner_stuck.is_zero() {
+        state.owner_stuck_reported.clear();
+        return Vec::new();
+    }
+    let threshold = options.owner_stuck.as_secs_f64();
+    let mut by_agent: BTreeMap<String, Vec<WaitingOwnerPrompt>> = BTreeMap::new();
+    for prompt in probe.waiting_owner_prompts() {
+        by_agent
+            .entry(prompt.agent.clone())
+            .or_default()
+            .push(prompt);
+    }
+    let mut rows = Vec::new();
+    let mut still = BTreeMap::new();
+    for (agent, mut prompts) in by_agent {
+        prompts.sort_by(|left, right| left.queued_at.total_cmp(&right.queued_at));
+        let oldest = (now - prompts[0].queued_at).max(0.0);
+        let stuck: Vec<&WaitingOwnerPrompt> = prompts
+            .iter()
+            .filter(|prompt| now - prompt.queued_at >= threshold)
+            .filter(|prompt| {
+                !crate::chat_service::owner_alarm::waiting_on_busy_agent(prompt.reason.as_deref())
+            })
+            .collect();
+        let mut row = json!({"agent": agent, "waiting": prompts.len(),
+                             "oldest_seconds": oldest, "stuck": !stuck.is_empty()});
+        if stuck.is_empty() {
+            rows.push(row);
+            continue;
+        }
+        let reason = stuck
+            .iter()
+            .find_map(|prompt| prompt.reason.as_deref())
+            .unwrap_or("no attempt has recorded why");
+        row["reason"] = json!(reason);
+        let last = state.owner_stuck_reported.get(&agent).copied();
+        // A notice about the coordinator's own queue waits in that same queue, so it is sent
+        // once per episode: repeats would only pile up behind whatever holds the queue.
+        if last.is_some_and(|at| now - at < threshold || agent == options.coordinator) {
+            still.insert(agent.clone(), last.unwrap_or(now));
+            row["reported"] = json!(true);
+        } else if options.check_only {
+            row["due"] = json!(true);
+        } else {
+            let minutes = (oldest / 60.0).floor();
+            let text = format!(
+                "[agentctl watch-agents] the owner's chat messages to {agent} are not being \
+                 delivered: {} request(s) waiting, the oldest for {minutes:.0} min. Why: {reason}. \
+                 {}This notice repeats every {} min until they are delivered.",
+                stuck.len(),
+                owner_wait_hint(&agent, reason),
+                threshold as u64 / 60
+            );
+            let message_id = format!("agent-watch-owner-stuck-{agent}-{}", now as u64);
+            match notifier.notify_urgent(&options.coordinator, &text, &message_id) {
+                Ok(outcome) => {
+                    still.insert(agent.clone(), now);
+                    row["reported"] = json!(true);
+                    row["outcome"] = json!(outcome);
+                }
+                Err(error) => {
+                    if let Some(at) = last {
+                        still.insert(agent.clone(), at);
+                    }
+                    row["error"] = json!(error.to_string());
+                }
+            }
+        }
+        rows.push(row);
+    }
+    state.owner_stuck_reported = still;
+    rows
+}
+
+/// What to do about owner requests held for `reason`, as one sentence ending in a space.
+fn owner_wait_hint(agent: &str, reason: &str) -> String {
+    // An idle Muse whose editor holds a draft reads `staged`; agentctl submits a draft it typed
+    // itself before it gives up, so one still there is not its own.
+    if reason.contains("did not type") || reason.contains("last status=staged") {
+        format!(
+            "A person's draft (or one agentctl cannot recognise) is in {agent}'s editor; submit or \
+             clear it in the pane (`agentctl attach {agent}`), and delivery resumes. "
+        )
+    } else if reason.contains("unsent draft") {
+        format!(
+            "agentctl could not submit a draft it typed into {agent}'s editor; press Enter in the \
+             pane (`agentctl attach {agent}`), and delivery resumes. "
+        )
+    } else {
+        "`agentctl chat status --registry REGISTRY --bridge-state DIR` shows the requests. "
+            .to_owned()
+    }
+}
+
+/// Report, once each, every prompt a drain quarantined as a probable misroute within
+/// [`QUARANTINE_LOOKBACK_SECONDS`]: what it was, why, and how to send it again (#720
+/// agentctl-muse-stale-draft). Such a prompt is never typed again by itself, so without a notice
+/// it is simply lost. The notice goes to the coordinator as a priority sender. Returns a row for
+/// each such prompt, for the pass report.
+fn report_quarantines(
+    probe: &mut dyn Probe,
+    notifier: &mut dyn Notifier,
+    state: &mut WatchState,
+    now: f64,
+    options: &WatchAgentsOptions,
+) -> Vec<Value> {
+    let since = now - QUARANTINE_LOOKBACK_SECONDS;
+    state.quarantines_reported.retain(|_, at| *at >= since);
+    let mut rows = Vec::new();
+    for prompt in probe.quarantined_misroutes(since) {
+        let key = format!("{}/{}", prompt.agent, prompt.id);
+        let mut row = json!({"agent": prompt.agent, "id": prompt.id,
+                             "path": prompt.path, "owner": prompt.owner});
+        if state.quarantines_reported.contains_key(&key) {
+            row["reported"] = json!(true);
+            rows.push(row);
+            continue;
+        }
+        if options.check_only {
+            row["due"] = json!(true);
+            rows.push(row);
+            continue;
+        }
+        let QuarantinedPrompt {
+            agent,
+            id,
+            path,
+            excerpt,
+            error,
+            owner,
+            ..
+        } = &prompt;
+        let error: String = error.chars().take(400).collect();
+        let resend = if *owner {
+            "It is one of the owner's chat requests; the chat bridge tells the owner too. If the \
+             agent did not act on it, the owner can send it again in chat."
+                .to_owned()
+        } else {
+            format!(
+                "If {agent} did not act on it, send it again from its record: \
+                 `jq -r .text {} > FILE && agentctl send {agent} --file FILE`.",
+                path.display()
+            )
+        };
+        let text = format!(
+            "[agentctl watch-agents] a message to {agent} was quarantined as a PROBABLE \
+             MISROUTE and will not be retried: {id}, beginning \"{excerpt}\". Why: {error}. It \
+             may have reached another pane, or no agent at all. {resend}"
+        );
+        let message_id = format!("agent-watch-quarantine-{:016x}", stable_hash(&key));
+        match notifier.notify_urgent(&options.coordinator, &text, &message_id) {
+            Ok(outcome) => {
+                state
+                    .quarantines_reported
+                    .insert(key, prompt.failed_at.max(since));
+                row["reported"] = json!(true);
+                row["outcome"] = json!(outcome);
+            }
+            Err(error) => row["error"] = json!(error.to_string()),
+        }
+        rows.push(row);
+    }
     rows
 }
 
@@ -3394,7 +3639,136 @@ fn queue_has_entries(queue: &Path, child: &str) -> bool {
     fs::read_dir(queue.join(child)).is_ok_and(|mut entries| entries.next().is_some())
 }
 
+/// The queue directory of every registered agent, by name.
+fn agent_queues(registry: &Path) -> Vec<(String, PathBuf)> {
+    agent_queue::registry::names(registry)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|name| {
+            let directory = agent_queue::registry::directory(registry, &name).ok()?;
+            Some((name, directory.join("queue")))
+        })
+        .collect()
+}
+
+/// The JSON records directly in `directory`, with their modification times.
+fn queue_records(directory: &Path) -> Vec<(PathBuf, SystemTime)> {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().is_none_or(|extension| extension != "json") {
+                return None;
+            }
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            Some((path, modified))
+        })
+        .collect()
+}
+
+/// A queue record's ID: its `id` field, else its file name.
+fn record_id(path: &Path, document: &serde_json::Map<String, Value>) -> String {
+    document
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| path.file_stem()?.to_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
+/// The first line of a queued message after its sender header, cut to 120 characters.
+fn message_excerpt(text: &str) -> String {
+    let mut lines = text.lines().filter(|line| !line.trim().is_empty());
+    let first = lines.next().unwrap_or_default();
+    let line = if crate::sender_header::parse(first).is_some() {
+        lines.next().unwrap_or(first)
+    } else {
+        first
+    };
+    let mut excerpt: String = line.trim().chars().take(120).collect();
+    if line.trim().chars().count() > 120 {
+        excerpt.push('…');
+    }
+    excerpt
+}
+
 impl<A: ManagedApi + ?Sized> Probe for ManagedProbe<'_, A> {
+    fn waiting_owner_prompts(&mut self) -> Vec<WaitingOwnerPrompt> {
+        let mut found = Vec::new();
+        for (agent, queue) in agent_queues(&self.registry) {
+            for lane in ["inbox", "inbox.v2"] {
+                for (path, _) in queue_records(&queue.join(lane)) {
+                    let Ok(Value::Object(document)) = crate::agent::read_private_json(&path) else {
+                        continue;
+                    };
+                    let id = record_id(&path, &document);
+                    if !crate::agent::owner_prompt(&id, &document) {
+                        continue;
+                    }
+                    let Some(queued_at) = document.get("queued_at").and_then(Value::as_f64) else {
+                        continue;
+                    };
+                    found.push(WaitingOwnerPrompt {
+                        agent: agent.clone(),
+                        id,
+                        queued_at,
+                        reason: document
+                            .get("delivery_error")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                    });
+                }
+            }
+        }
+        found
+    }
+
+    fn quarantined_misroutes(&mut self, since: f64) -> Vec<QuarantinedPrompt> {
+        let cutoff = UNIX_EPOCH + Duration::from_secs_f64(since.max(0.0));
+        let mut found = Vec::new();
+        for (agent, queue) in agent_queues(&self.registry) {
+            for (path, modified) in queue_records(&queue.join("failed")) {
+                if modified < cutoff {
+                    continue;
+                }
+                let Ok(Value::Object(document)) = crate::agent::read_private_json(&path) else {
+                    continue;
+                };
+                if document.get("probable_misroute") != Some(&Value::Bool(true)) {
+                    continue;
+                }
+                let Some(failed_at) = document.get("delivery_failed_at").and_then(Value::as_f64)
+                else {
+                    continue;
+                };
+                if failed_at < since {
+                    continue;
+                }
+                let id = record_id(&path, &document);
+                found.push(QuarantinedPrompt {
+                    agent: agent.clone(),
+                    owner: crate::agent::owner_prompt(&id, &document),
+                    id,
+                    failed_at,
+                    excerpt: message_excerpt(
+                        document.get("text").and_then(Value::as_str).unwrap_or(""),
+                    ),
+                    error: document
+                        .get("delivery_error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("no error was recorded")
+                        .to_owned(),
+                    path,
+                });
+            }
+        }
+        found.sort_by(|left, right| left.failed_at.total_cmp(&right.failed_at));
+        found
+    }
+
     /// Only an agent with a waiter record can have waiters, so the record directories name
     /// every candidate, the coordinator included.
     fn delivery_waits(&mut self) -> Vec<(String, Value)> {
@@ -3789,6 +4163,7 @@ mod tests {
             state_dir: None,
             landing_queue: None,
             delivery_wait: Duration::from_secs(600),
+            owner_stuck: Duration::from_secs(300),
             turn: Duration::from_secs(7200),
             untimed_tool: Duration::from_secs(3600),
             auto_deliver: AutoDeliver::off(),
@@ -3890,6 +4265,206 @@ mod tests {
         assert!(state.jams_reported.is_empty());
         pass(1_600.0, &mut state, &mut notifier);
         assert_eq!(notifier.sent.len(), 2, "a new jam is reported again");
+    }
+
+    /// A probe whose only findings are scripted owner requests waiting and quarantines.
+    #[derive(Default)]
+    struct DeliveryProbe {
+        waiting: Vec<WaitingOwnerPrompt>,
+        quarantined: Vec<QuarantinedPrompt>,
+    }
+
+    impl Probe for DeliveryProbe {
+        fn observe(&mut self) -> Result<Vec<Observation>> {
+            Ok(Vec::new())
+        }
+        fn waiting_owner_prompts(&mut self) -> Vec<WaitingOwnerPrompt> {
+            self.waiting.clone()
+        }
+        fn quarantined_misroutes(&mut self, since: f64) -> Vec<QuarantinedPrompt> {
+            self.quarantined
+                .iter()
+                .filter(|prompt| prompt.failed_at >= since)
+                .cloned()
+                .collect()
+        }
+    }
+
+    fn waiting(agent: &str, id: &str, queued_at: f64, reason: &str) -> WaitingOwnerPrompt {
+        WaitingOwnerPrompt {
+            agent: agent.to_owned(),
+            id: id.to_owned(),
+            queued_at,
+            reason: Some(reason.to_owned()),
+        }
+    }
+
+    #[test]
+    fn owner_requests_held_past_the_threshold_are_reported_with_the_reason_until_delivered() {
+        let options = options();
+        let mut state = WatchState::default();
+        let mut notifier = RecordingNotifier::default();
+        let draft = "pane wJ:pGY did not become idle/done within 0s; last status=staged: pane \
+                     wJ:pGY: the Muse editor holds a draft that agentctl did not type (41 \
+                     characters on 1 row(s)); a person may be typing it";
+        let mut probe = DeliveryProbe {
+            waiting: vec![
+                waiting("coord5", "chat-a", 1_000.0, draft),
+                waiting("coord5", "chat-b", 1_100.0, draft),
+            ],
+            ..DeliveryProbe::default()
+        };
+        // Four minutes in: not yet.
+        let report = watch_agents_once(&mut probe, &mut notifier, &mut state, 1_240.0, &options);
+        assert_eq!(report["owner_waits"][0]["stuck"], false);
+        assert_eq!(report["ok"], true);
+        assert!(notifier.sent.is_empty());
+        // Five minutes: reported, as urgent, with the reason and what to do.
+        let report = watch_agents_once(&mut probe, &mut notifier, &mut state, 1_300.0, &options);
+        assert_eq!(report["owner_waits"][0]["reported"], true);
+        assert_eq!(report["ok"], false);
+        assert_eq!(notifier.sent.len(), 1);
+        let (to, text, id) = &notifier.sent[0];
+        assert_eq!(to, "coordinator");
+        assert!(
+            text.contains(
+                "the owner's chat messages to coord5 are not being delivered: 1 \
+                           request(s) waiting, the oldest for 5 min"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("a draft that agentctl did not type"),
+            "{text}"
+        );
+        assert!(text.contains("`agentctl attach coord5`"), "{text}");
+        assert!(text.contains("repeats every 5 min"), "{text}");
+        assert_eq!(notifier.urgent, vec![id.clone()]);
+        // Not again within the threshold; again once it has passed.
+        watch_agents_once(&mut probe, &mut notifier, &mut state, 1_500.0, &options);
+        assert_eq!(notifier.sent.len(), 1);
+        watch_agents_once(&mut probe, &mut notifier, &mut state, 1_600.0, &options);
+        assert_eq!(notifier.sent.len(), 2, "the alarm repeats until delivered");
+        assert!(notifier.sent[1]
+            .1
+            .contains("2 request(s) waiting, the oldest for 10 min"));
+        // Delivered: the episode ends, and a new one starts its own clock.
+        probe.waiting.clear();
+        let report = watch_agents_once(&mut probe, &mut notifier, &mut state, 1_660.0, &options);
+        assert!(state.owner_stuck_reported.is_empty());
+        assert_eq!(report["ok"], true);
+        probe.waiting = vec![waiting("coord5", "chat-c", 1_700.0, "other")];
+        watch_agents_once(&mut probe, &mut notifier, &mut state, 2_000.0, &options);
+        assert_eq!(notifier.sent.len(), 3);
+        assert!(
+            notifier.sent[2].1.contains("Why: other."),
+            "{}",
+            notifier.sent[2].1
+        );
+        // Zero turns the check off.
+        let off = WatchAgentsOptions {
+            owner_stuck: Duration::ZERO,
+            ..options.clone()
+        };
+        let report = watch_agents_once(&mut probe, &mut notifier, &mut state, 9_000.0, &off);
+        assert_eq!(report["owner_waits"], json!([]));
+        assert_eq!(notifier.sent.len(), 3);
+    }
+
+    #[test]
+    fn owner_requests_held_only_by_a_busy_agent_or_in_the_coordinators_queue_are_not_repeated() {
+        let options = options();
+        let mut notifier = RecordingNotifier::default();
+        // Waiting behind a long turn is no fault.
+        let mut state = WatchState::default();
+        let mut probe = DeliveryProbe {
+            waiting: vec![waiting(
+                "lead",
+                "chat-a",
+                0.0,
+                "pane w1:p2 did not become idle/done within 0s; last status=working",
+            )],
+            ..DeliveryProbe::default()
+        };
+        let report = watch_agents_once(&mut probe, &mut notifier, &mut state, 3_000.0, &options);
+        assert_eq!(report["owner_waits"][0]["stuck"], false);
+        assert!(notifier.sent.is_empty());
+        // The coordinator's own queue: told once per episode, since the notice waits there too.
+        probe.waiting = vec![waiting("coordinator", "chat-b", 0.0, "a draft is there")];
+        watch_agents_once(&mut probe, &mut notifier, &mut state, 3_000.0, &options);
+        watch_agents_once(&mut probe, &mut notifier, &mut state, 3_400.0, &options);
+        watch_agents_once(&mut probe, &mut notifier, &mut state, 9_000.0, &options);
+        assert_eq!(notifier.sent.len(), 1, "{:?}", notifier.sent);
+        probe.waiting.clear();
+        watch_agents_once(&mut probe, &mut notifier, &mut state, 9_100.0, &options);
+        probe.waiting = vec![waiting(
+            "coordinator",
+            "chat-c",
+            9_100.0,
+            "a draft is there",
+        )];
+        watch_agents_once(&mut probe, &mut notifier, &mut state, 9_500.0, &options);
+        assert_eq!(notifier.sent.len(), 2, "a new episode is told again");
+    }
+
+    #[test]
+    fn a_probable_misroute_quarantine_is_reported_once_with_how_to_send_it_again() {
+        let options = options();
+        let mut state = WatchState::default();
+        let mut notifier = RecordingNotifier::default();
+        let quarantined = |id: &str, failed_at: f64, owner: bool| QuarantinedPrompt {
+            agent: "coord5".to_owned(),
+            id: id.to_owned(),
+            failed_at,
+            path: PathBuf::from(format!("/r/agents/coord5/queue/failed/{id}.json")),
+            excerpt: "release the lock".to_owned(),
+            error: "pane wJ:pGY: PROBABLE MISROUTE, quarantined: target shows it".to_owned(),
+            owner,
+        };
+        let now = 100_000.0;
+        let mut probe = DeliveryProbe {
+            quarantined: vec![
+                quarantined("old", now - QUARANTINE_LOOKBACK_SECONDS - 60.0, false),
+                quarantined("lane-1", now - 60.0, false),
+                quarantined("chat-9", now - 30.0, true),
+            ],
+            ..DeliveryProbe::default()
+        };
+        let report = watch_agents_once(&mut probe, &mut notifier, &mut state, now, &options);
+        assert_eq!(report["quarantines"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            notifier.sent.len(),
+            2,
+            "history older than the lookback is not news"
+        );
+        let lane = &notifier.sent[0].1;
+        assert!(
+            lane.contains("quarantined as a PROBABLE MISROUTE"),
+            "{lane}"
+        );
+        assert!(
+            lane.contains("lane-1, beginning \"release the lock\""),
+            "{lane}"
+        );
+        assert!(
+            lane.contains("Why: pane wJ:pGY: PROBABLE MISROUTE"),
+            "{lane}"
+        );
+        assert!(
+            lane.contains(
+                "`jq -r .text /r/agents/coord5/queue/failed/lane-1.json > FILE && agentctl send \
+                 coord5 --file FILE`"
+            ),
+            "{lane}"
+        );
+        let chat = &notifier.sent[1].1;
+        assert!(
+            chat.contains("the owner can send it again in chat"),
+            "{chat}"
+        );
+        assert_eq!(notifier.urgent.len(), 2);
+        watch_agents_once(&mut probe, &mut notifier, &mut state, now + 60.0, &options);
+        assert_eq!(notifier.sent.len(), 2, "each quarantine is reported once");
     }
 
     #[derive(Default)]

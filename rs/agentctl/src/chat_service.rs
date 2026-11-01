@@ -45,6 +45,7 @@ pub mod channel_lock;
 mod grant_refresh_tests;
 pub mod health;
 pub mod latency;
+pub mod owner_alarm;
 #[cfg(test)]
 mod rejection_tests;
 mod reply_reminders;
@@ -226,6 +227,10 @@ pub struct ServiceOptions {
     /// but the agent is idle and every open request has stored a reply: normally
     /// [`IDLE_SATURATED_POLL_INTERVAL`].
     pub idle_poll_interval: Duration,
+    /// How long a request may wait undelivered before `chat run` warns the owner in the chat,
+    /// and again every as long until it is delivered; `None` never warns. See
+    /// [`owner_alarm`]. `chat run` defaults to [`owner_alarm::DEFAULT_AFTER`].
+    pub owner_alarm_after: Option<Duration>,
 }
 
 /// When `chat run` tries again to type the prompts of requests it has admitted, and when it
@@ -4556,6 +4561,9 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
         guard,
         last_held: None,
     });
+    // Kept across passes, so a pass restarted after a transient failure neither posts the
+    // alarm again at once nor forgets a quarantine it has not told (#720).
+    let mut owner_alarm = options.owner_alarm_after.map(owner_alarm::OwnerAlarm::new);
     let mut reminders = reminders;
     let mut health = ServiceHealth::new(manager.registry());
     let mut backoff = ProviderBackoff::new();
@@ -4608,6 +4616,7 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
                 reply_wakes,
                 transport,
                 &mut stale_composer,
+                &mut owner_alarm,
                 &mut reminders,
                 &mut health,
             ),
@@ -4885,6 +4894,9 @@ fn owner_loop<A: ManagedApi + ?Sized>(
         guard,
         last_held: None,
     });
+    // Kept across passes, so a pass restarted after a transient failure neither posts the
+    // alarm again at once nor forgets a quarantine it has not told (#720).
+    let mut owner_alarm = options.owner_alarm_after.map(owner_alarm::OwnerAlarm::new);
     let mut reminders = reminders;
     let mut health = ServiceHealth::new(manager.registry());
     owner_loop_pass(
@@ -4900,6 +4912,7 @@ fn owner_loop<A: ManagedApi + ?Sized>(
         reply_wakes,
         transport,
         &mut stale_composer,
+        &mut owner_alarm,
         &mut reminders,
         &mut health,
     )
@@ -4921,6 +4934,7 @@ fn owner_loop_pass<A: ManagedApi + ?Sized>(
     reply_wakes: &mpsc::Receiver<String>,
     transport: &mut Option<CommandOutboundTransport>,
     stale_composer: &mut Option<StaleComposerRun>,
+    owner_alarm: &mut Option<owner_alarm::OwnerAlarm>,
     reminders: &mut Option<ReplyReminders>,
     health: &mut ServiceHealth,
 ) -> Result<(), ChatServiceError> {
@@ -4995,6 +5009,12 @@ fn owner_loop_pass<A: ManagedApi + ?Sized>(
     // prompts that no pass has tried yet since the service started.
     let mut watch = DeliveryWatch::new(options.timing);
     watch.scan(state, &queue_reader, &mut routes);
+    owner_alarm_step(
+        owner_alarm.as_mut(),
+        &watch.entries,
+        state,
+        outbound(control.transport),
+    );
     // No output subscription works yet, so the first poll comes after the shorter interval.
     let mut poll_at = next_saturated_poll(
         &routes,
@@ -5188,6 +5208,14 @@ fn owner_loop_pass<A: ManagedApi + ?Sized>(
             }
             // Log the prompts the retry typed now rather than at the next scan.
             watch.scan(state, &queue_reader, &mut routes);
+        }
+        if scanned {
+            owner_alarm_step(
+                owner_alarm.as_mut(),
+                &watch.entries,
+                state,
+                outbound(control.transport),
+            );
         }
         if let Some(run) = stale_composer.as_mut().filter(|_| scanned) {
             if stale_composer_step(
@@ -6063,6 +6091,72 @@ fn headless_owner_loop_pass<A: ManagedApi + ?Sized>(
     Ok(())
 }
 
+/// Post the owner alarm's notices that the request records `entries`, as the last scan read
+/// them, make due, if the alarm is on: see [`owner_alarm`]. A notice that cannot be posted, for want of an outbound helper, a channel or
+/// a working post, is logged instead.
+fn owner_alarm_step(
+    alarm: Option<&mut owner_alarm::OwnerAlarm>,
+    entries: &[chat_runtime::DeliveryEntry],
+    state: &BridgeState,
+    transport: Option<&mut dyn RootMessageTransport>,
+) {
+    let Some(alarm) = alarm else {
+        return;
+    };
+    let configuration = state.config();
+    let notices = alarm.due(
+        entries,
+        &configuration.agent_label,
+        chat_runtime::unix_millis(),
+    );
+    if notices.is_empty() {
+        return;
+    }
+    let channel = configuration.channel_ids.first();
+    let (Some(transport), Some(channel), true) =
+        (transport, channel, configuration.outbound_enabled)
+    else {
+        for notice in &notices {
+            service_log(format_args!(
+                "agentctl: owner alarm not posted (the bridge has no outbound helper or channel): {notice}"
+            ));
+        }
+        return;
+    };
+    for notice in notices {
+        let request_id = match chat_runtime::random_operation_uuid() {
+            Ok(id) => id,
+            Err(error) => {
+                service_log(format_args!(
+                    "agentctl: owner alarm not posted: {error}: {notice}"
+                ));
+                continue;
+            }
+        };
+        let submission = RootMessageSubmission {
+            channel_id: channel,
+            body: &notice,
+            request_id: &request_id,
+        };
+        if let Err(error) = chat_runtime::validate_root_message_submission(&submission) {
+            service_log(format_args!(
+                "agentctl: owner alarm refused: {error}: {notice}"
+            ));
+            continue;
+        }
+        match transport.publish_root(submission) {
+            Ok(message) => service_log(format_args!(
+                "agentctl: owner alarm posted to {channel} as {message}: {notice}"
+            )),
+            Err(error) => {
+                service_log(format_args!(
+                    "agentctl: owner alarm not posted: {error}: {notice}"
+                ));
+            }
+        }
+    }
+}
+
 /// Build the stale-composer clear for `chat run --stale-composer-clear-after`. Its notice is
 /// the copy of the draft in the chat, so the option needs the outbound helper.
 fn stale_composer_guard(
@@ -6478,6 +6572,8 @@ struct DeliveryWatch {
     // Whether the last status lookup made for a retry failed, so only the first failure and the
     // recovery are logged.
     lookup_failing: bool,
+    // The request records as the last scan read them, for the owner alarm.
+    entries: Vec<chat_runtime::DeliveryEntry>,
     // Every line logged, so a test can read them.
     #[cfg(test)]
     said: Vec<String>,
@@ -6486,6 +6582,7 @@ struct DeliveryWatch {
 impl DeliveryWatch {
     fn new(timing: DeliveryTiming) -> Self {
         Self {
+            entries: Vec::new(),
             timing,
             next_scan: Instant::now(),
             retry_keys: Vec::new(),
@@ -6622,6 +6719,7 @@ impl DeliveryWatch {
         // handover decides for it, so it is neither logged as stalled, retried, nor alarmed.
         let retired = state.take_typed_retirements();
         entries.retain(|entry| !retired.contains_key(&entry.key));
+        self.entries.clone_from(&entries);
         let now_millis = chat_runtime::unix_millis();
         for line in self
             .log
@@ -12918,6 +13016,7 @@ esac
                     reconciliation_interval,
                     timing,
                     idle_poll_interval: TEST_IDLE_POLL_INTERVAL.with(Cell::get),
+                    owner_alarm_after: None,
                 },
                 &stop,
                 &cancellation,
@@ -14441,6 +14540,54 @@ esac
         }
     }
 
+    /// #720 agentctl-muse-stale-draft: a request left waiting raises the owner alarm in the
+    /// chat, with the reason its last attempt gave, and its end is announced.
+    #[test]
+    fn a_request_left_waiting_warns_the_owner_in_the_chat_until_it_is_delivered() {
+        let (state, key, root) = state_with_request();
+        let reason = "request remains pending: pane wJ:pGY did not become idle/done within 0s; \
+                      last status=staged: pane wJ:pGY: the Muse editor holds a draft that \
+                      agentctl did not type (12 characters on 1 row(s)); a person may be typing \
+                      it, so agentctl neither submits nor clears it";
+        state
+            .put_delivery_phase(&key, RequestPhase::Pending, Some(reason))
+            .expect("pending");
+        let mut watch = DeliveryWatch::new(DeliveryTiming {
+            retry_interval: Duration::from_secs(3_600),
+            stall_after: Duration::ZERO,
+            stall_repeat: Duration::from_secs(3_600),
+        });
+        let mut alarm = Some(owner_alarm::OwnerAlarm::new(Duration::ZERO));
+        let mut routes = RouteCache::new(Vec::new());
+        let mut roots = RecordingRoots::default();
+        watch.scan(&state, &RecordingDelivery::default(), &mut routes);
+        owner_alarm_step(alarm.as_mut(), &watch.entries, &state, Some(&mut roots));
+        assert_eq!(roots.posts.len(), 1, "{:?}", roots.posts);
+        let (channel, body) = &roots.posts[0];
+        assert_eq!(channel, "spaces/example");
+        assert!(
+            body.starts_with(
+                "[chat-bridge WARNING] 1 of your messages to coordinator has not reached it, the \
+                 oldest sent 0 min ago (\"request\"). Why: request remains pending:"
+            ),
+            "{body}"
+        );
+        assert!(body.contains("submit or clear it there"), "{body}");
+        state
+            .put_delivery_phase(&key, RequestPhase::Delivered, None)
+            .expect("delivered");
+        watch.scan(&state, &RecordingDelivery::default(), &mut routes);
+        owner_alarm_step(alarm.as_mut(), &watch.entries, &state, Some(&mut roots));
+        assert_eq!(
+            roots.posts[1].1,
+            "[chat-bridge] Your messages to coordinator are being delivered again."
+        );
+        // With the alarm off, nothing is posted.
+        owner_alarm_step(None, &watch.entries, &state, Some(&mut roots));
+        assert_eq!(roots.posts.len(), 2);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
     #[test]
     fn the_bridge_posts_a_headless_agents_approval_prompts_and_their_outcomes() {
         let fixture = crate::subagents::tests::Fixture::new();
@@ -15763,6 +15910,7 @@ esac
                     reconciliation_interval: Duration::from_secs(1),
                     timing: DeliveryTiming::default(),
                     idle_poll_interval: IDLE_SATURATED_POLL_INTERVAL,
+                    owner_alarm_after: None,
                 },
             )
             .expect("tick");
@@ -15786,6 +15934,7 @@ esac
             reconciliation_interval: Duration::from_secs(1),
             timing: DeliveryTiming::default(),
             idle_poll_interval: IDLE_SATURATED_POLL_INTERVAL,
+            owner_alarm_after: None,
         }
     }
 
@@ -16879,6 +17028,7 @@ printf '{"version":1,"id":"%s","action":"send","ok":true,"receipt":{"message_id"
             admitted_at_millis,
             delivered_at_millis: None,
             reason: Some(format!("{key} waits")),
+            excerpt: String::new(),
         }
     }
 

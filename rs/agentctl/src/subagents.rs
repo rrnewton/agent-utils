@@ -24,11 +24,11 @@ use sha2::{Digest, Sha256};
 use crate::agent::{self, AgentApi, AgentError, DrainOptions, QueueResult, Target};
 use crate::client::{
     muse_editor_rows_empty, muse_startup_metadata, muse_trust_prompt, muse_verified_pane_status,
-    muse_verified_process_editor_rows, muse_verified_process_idle_composer,
-    muse_verified_process_paste_in_composer, muse_verified_process_paste_is_exact_composer,
-    muse_verified_process_prompt_queued_count, muse_verified_process_prompt_transcript_count,
-    AgentIdentity, AgentPaneInfo, CustomProcessIdentity, HerdrClient, Pane, PaneShellProof,
-    ProcessLiveness,
+    muse_verified_process_editor_draft, muse_verified_process_editor_rows,
+    muse_verified_process_idle_composer, muse_verified_process_paste_in_composer,
+    muse_verified_process_paste_is_exact_composer, muse_verified_process_prompt_queued_count,
+    muse_verified_process_prompt_transcript_count, AgentIdentity, AgentPaneInfo,
+    CustomProcessIdentity, HerdrClient, Pane, PaneShellProof, ProcessLiveness,
 };
 use crate::error::{AdapterError, AdapterErrorKind};
 use crate::submission::{GuardedInput, GuardedPrompt, Submission, SubmitTimeouts};
@@ -2179,6 +2179,31 @@ struct CustomPaneSubmission {
     prior_queued_count: usize,
     /// Muse's journal, watched from before Enter (#678 muse-bridge-latency).
     journal: Option<Arc<Mutex<crate::harness::muse::JournalWatch>>>,
+    /// The presses of Enter so far, shared by every copy of this submission, so a wait made in
+    /// chunks presses again on schedule (#720 agentctl-muse-stale-draft).
+    enter: Arc<Mutex<EnterRetry>>,
+}
+
+/// Enter pressed again, with a doubling wait, while a prompt typed into an idle Muse is still
+/// the whole editor: one press that Muse missed would otherwise leave the prompt there unsent,
+/// holding every later prompt, while the queue counted it possibly submitted.
+#[derive(Debug)]
+struct EnterRetry {
+    presses: u32,
+    wait: Duration,
+    next: Instant,
+}
+
+impl EnterRetry {
+    /// The state right after the first press.
+    fn pressed() -> Arc<Mutex<Self>> {
+        let wait = crate::submission::FIRST_RETRY;
+        Arc::new(Mutex::new(Self {
+            presses: 1,
+            wait,
+            next: Instant::now() + wait,
+        }))
+    }
 }
 
 struct WorkspaceClient<'a, A: ManagedApi + ?Sized> {
@@ -2220,8 +2245,11 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
     /// and a write is not the one whose footer was read, so the process checks around every
     /// effect, not the footer, are the misroute defense (#395 muse-launch-overrides-input).
     ///
-    /// Nothing has been typed when this returns, so every refusal is `NotStaged`: the prompt
-    /// stays pending instead of being quarantined as possibly submitted.
+    /// A pane that shows a draft agentctl typed and Muse left unsent (`staged`) has it
+    /// submitted first ([`Self::recover_muse_draft`]); any other draft refuses.
+    ///
+    /// Nothing of this prompt has been typed when this returns, so every refusal is
+    /// `NotStaged`: the prompt stays pending instead of being quarantined as possibly submitted.
     fn muse_paste_baseline(
         &self,
         pane_id: &str,
@@ -2234,7 +2262,12 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                     "Muse pane prompts cannot contain NUL or terminal escape characters",
                 ));
             }
-            let info = self.pane_info_with_runtime(pane_id, runtime)?;
+            let mut info = self.pane_info_with_runtime(pane_id, runtime)?;
+            // A draft agentctl typed and Muse left unsent is submitted first (#720
+            // agentctl-muse-stale-draft); any other draft refuses, naming it.
+            if info.status == "staged" && self.recover_muse_draft(pane_id, runtime)?.is_some() {
+                info = self.pane_info_with_runtime(pane_id, runtime)?;
+            }
             if info.status != "idle" {
                 return Err(AdapterError::unavailable(format!(
                     "custom pane {pane_id} is not at a verified idle Muse composer (status {})",
@@ -2292,9 +2325,11 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
     ///
     /// As [`Self::muse_paste_baseline`], but the editor may sit below Muse's running-turn row:
     /// the pane must show Muse's empty editor above exactly one status footer, read between two
-    /// checks of the pinned process. A draft in the editor, an approval form or a panel in its
-    /// place, or any other screen refuses. Any recognized footer mode will do, adopted or not.
-    /// Nothing has been typed when this returns, so every refusal is `NotStaged`.
+    /// checks of the pinned process. A draft that agentctl typed and Muse left unsent is
+    /// submitted first ([`Self::recover_muse_draft`]); any other draft, an approval form or a
+    /// panel in the editor's place, or any other screen refuses. Any recognized footer mode will
+    /// do, adopted or not. Nothing of this prompt has been typed when this returns, so every
+    /// refusal is `NotStaged`.
     fn muse_followup_baseline(
         &self,
         pane_id: &str,
@@ -2314,7 +2349,12 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                     info.status
                 )));
             }
-            let before = self.verified_muse_screen(pane_id, runtime)?;
+            let mut before = self.verified_muse_screen(pane_id, runtime)?;
+            if !crate::harness_tui::muse::MuseTui::editor_empty(&before)
+                && self.recover_muse_draft(pane_id, runtime)?.is_some()
+            {
+                before = self.verified_muse_screen(pane_id, runtime)?;
+            }
             if !crate::harness_tui::muse::MuseTui::editor_empty(&before) {
                 return Err(AdapterError::unavailable(format!(
                     "pane {pane_id} does not show an empty Muse editor with one status footer \
@@ -2330,6 +2370,103 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                 AdapterError::not_staged(format!("{error}; nothing was typed"))
             }
         })
+    }
+
+    /// Submit a draft that agentctl itself typed and Muse left unsent in its editor, so that it
+    /// no longer holds every later prompt, the owner's included (#720
+    /// agentctl-muse-stale-draft).
+    ///
+    /// Muse can put a prompt back in its editor after agentctl proved it delivered: a steer
+    /// shows at once as a user turn, and a steer that fails later, as one does around a context
+    /// compaction, returns the prompt to the editor unsent. A draft that
+    /// [`crate::stale_draft::find`] matches to a prompt this agent's queue records as typed is
+    /// submitted with Enter, pressed again (at most [`DRAFT_PRESSES`] times in all) while the
+    /// same draft is still there, and is recovered once the editor has stayed empty for
+    /// [`MUSE_STEER_SETTLE`]; its queue record notes the recovery. Any other draft may be a
+    /// person typing: it is never submitted or cleared, and the error names it by its length
+    /// only.
+    ///
+    /// `Ok(None)`: the editor is empty or not recognisable. `Ok(Some(evidence))`: a draft
+    /// agentctl typed was submitted. An error: a draft agentctl did not type, or one that is
+    /// still in the editor after [`DRAFT_SUBMIT_TIMEOUT`]; nothing of the prompt being delivered
+    /// has been typed either way.
+    fn recover_muse_draft(
+        &self,
+        pane_id: &str,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<Option<String>> {
+        use crate::submission::{FIRST_RETRY, MAX_RETRY, POLL};
+        let draft_on =
+            |screen: &str| muse_verified_process_editor_draft(&crate::harness_tui::plain(screen));
+        let screen = self.verified_muse_screen(pane_id, runtime)?;
+        let Some(draft) = draft_on(&screen) else {
+            return Ok(None);
+        };
+        let found = self
+            .queue
+            .and_then(|queue| crate::stale_draft::find(queue, &draft, SystemTime::now()));
+        let Some(prompt) = found else {
+            return Err(AdapterError::unavailable(format!(
+                "pane {pane_id}: the Muse editor {FOREIGN_DRAFT} ({}); a person may be typing \
+                 it, so agentctl neither submits nor clears it: submit or clear it in the pane",
+                draft.describe()
+            )));
+        };
+        let typed = prompt.describe();
+        let guarded = self.guarded(runtime)?;
+        guarded.send_keys(pane_id, "Enter")?;
+        let pressed = runtime.monotonic();
+        let mut presses: u32 = 1;
+        let mut wait = FIRST_RETRY;
+        let mut next_press = pressed.saturating_add(wait);
+        // When the editor was first seen empty again: like a steer, the submitted draft counts
+        // only once it has stayed out of the editor for MUSE_STEER_SETTLE, since the steer can
+        // fail again and bring it back, where the next paste would meet it.
+        let mut empty_since: Option<Duration> = None;
+        loop {
+            runtime.sleep(POLL);
+            if runtime.cancelled() {
+                return Err(AdapterError::cancelled(format!(
+                    "pane {pane_id}: delivery was cancelled while submitting an unsent draft {typed}"
+                )));
+            }
+            let screen = self.verified_muse_screen(pane_id, runtime)?;
+            let now = runtime.monotonic();
+            let current = draft_on(&screen);
+            if current.is_none() && crate::harness_tui::muse::MuseTui::editor_empty(&screen) {
+                let since = *empty_since.get_or_insert(now);
+                if now.saturating_sub(since) >= MUSE_STEER_SETTLE {
+                    let evidence = format!(
+                        "submitted an unsent draft {typed} that Muse had left in its editor \
+                         ({presses} Enter key press(es))"
+                    );
+                    crate::stale_draft::note_recovered(&prompt, &evidence, unix_seconds());
+                    return Ok(Some(evidence));
+                }
+                continue;
+            }
+            empty_since = None;
+            let same = current.as_ref() == Some(&draft);
+            if now.saturating_sub(pressed) >= DRAFT_SUBMIT_TIMEOUT {
+                return Err(AdapterError::unavailable(if same {
+                    format!(
+                        "pane {pane_id}: the Muse editor holds an unsent draft {typed}; it is \
+                         still there after {presses} Enter key press(es)"
+                    )
+                } else {
+                    format!(
+                        "pane {pane_id}: the Muse editor held an unsent draft {typed}; after \
+                         {presses} Enter key press(es) the editor is neither empty nor that draft"
+                    )
+                }));
+            }
+            if same && presses < DRAFT_PRESSES && now >= next_press {
+                guarded.send_keys(pane_id, "Enter")?;
+                presses += 1;
+                wait = (wait * 2).min(MAX_RETRY);
+                next_press = now.saturating_add(wait);
+            }
+        }
     }
 
     /// Type an ordinary follow-up into a pinned Muse pane whose turn may be running, steer the
@@ -2398,6 +2535,10 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         let mut presses: u32 = 1;
         let mut wait = FIRST_RETRY;
         let mut next_press = pressed.saturating_add(wait);
+        // A proof only the screen gives, and when it was first seen: it must hold for
+        // MUSE_STEER_SETTLE without the prompt coming back to the editor (#720
+        // agentctl-muse-stale-draft).
+        let mut settling: Option<(Duration, &'static str)> = None;
         loop {
             runtime.sleep(POLL);
             if runtime.cancelled() {
@@ -2406,35 +2547,61 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
             let screen = self.verified_muse_screen(pane_id, runtime)?;
             let now = runtime.monotonic();
             let left_editor = !muse_verified_process_paste_in_composer(&screen, text);
-            let evidence = if screen != staged
-                && left_editor
-                && muse_verified_process_prompt_transcript_count(&screen, text) > prior
-            {
-                Some("prompt appeared above the Muse editor as a new user turn")
-            } else if left_editor && crate::harness_tui::muse::MuseTui::editor_empty(&screen) {
-                // Muse took the prompt but draws the turn only after the tool call in flight, or
-                // holds it in its input queue for its next step. Either counts only once the
-                // editor is empty again: a prompt still there (or put back there, as Muse does
-                // with a steer it refuses) is not delivered.
-                if muse_verified_process_prompt_queued_count(&screen, text) > prior_queued {
-                    Some("Muse queued the prompt for its next step (`◆ Queued input`)")
-                } else if journal.as_mut().is_some_and(|watch| watch.accepted(text)) {
-                    Some("Muse's journal records the prompt as an accepted user intent")
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            if let Some(evidence) = evidence {
-                return Ok(Submission::Verified(crate::submission::SubmissionReceipt {
+            let verified = |evidence: &str, presses: u32| {
+                Ok(Submission::Verified(crate::submission::SubmissionReceipt {
                     key: "Enter",
                     key_presses: presses,
                     elapsed: now.saturating_sub(started),
                     evidence: evidence.to_owned(),
                     printed: true,
                     settled: true,
-                }));
+                }))
+            };
+            // Muse writes the accepted intent the moment it takes a prompt, and never for a
+            // steer it refuses, so the journal's word is final.
+            if left_editor && journal.as_mut().is_some_and(|watch| watch.accepted(text)) {
+                return verified(
+                    "Muse's journal records the prompt as an accepted user intent",
+                    presses,
+                );
+            }
+            let evidence = if screen != staged
+                && left_editor
+                && muse_verified_process_prompt_transcript_count(&screen, text) > prior
+            {
+                Some("prompt appeared above the Muse editor as a new user turn")
+            } else if left_editor
+                && crate::harness_tui::muse::MuseTui::editor_empty(&screen)
+                // Muse took the prompt but draws the turn only after the tool call in flight, or
+                // holds it in its input queue for its next step. Either counts only once the
+                // editor is empty again: a prompt still there (or put back there, as Muse does
+                // with a steer it refuses) is not delivered.
+                && muse_verified_process_prompt_queued_count(&screen, text) > prior_queued
+            {
+                Some("Muse queued the prompt for its next step (`◆ Queued input`)")
+            } else {
+                None
+            };
+            if let Some(evidence) = evidence {
+                settling.get_or_insert((now, evidence));
+            }
+            let still_staged = muse_verified_process_paste_is_exact_composer(&screen, text);
+            // A steer shows as a user turn at once, and one that fails later (around a context
+            // compaction, say) comes back to the editor as the whole draft: it was not taken, so
+            // the screen's proof is void and Enter is pressed again.
+            if still_staged {
+                settling = None;
+            }
+            if let Some((since, evidence)) = settling {
+                if left_editor && now.saturating_sub(since) >= MUSE_STEER_SETTLE {
+                    return verified(evidence, presses);
+                }
+                // A proof first seen near the deadline still gets its whole settle.
+                if now.saturating_sub(pressed) < SUBMIT_TIMEOUT
+                    || now.saturating_sub(since) < MUSE_STEER_SETTLE
+                {
+                    continue;
+                }
             }
             let still_staged = muse_verified_process_paste_is_exact_composer(&screen, text);
             if now.saturating_sub(pressed) >= SUBMIT_TIMEOUT {
@@ -3248,6 +3415,20 @@ const GOAL_ANSWER_TIMEOUT: Duration = Duration::from_secs(20);
 const GOAL_SETTLE: Duration = Duration::from_secs(2);
 /// How long a withdrawn Muse paste is watched for drawing late before the editor counts as empty.
 const MUSE_LATE_PASTE: Duration = Duration::from_millis(500);
+/// How a refusal names a draft in the Muse editor that agentctl did not type.
+const FOREIGN_DRAFT: &str = "holds a draft that agentctl did not type";
+/// Most presses of Enter that submit an unsent draft agentctl typed (#720
+/// agentctl-muse-stale-draft).
+const DRAFT_PRESSES: u32 = 3;
+/// Longest wait for such a draft to leave the Muse editor for good after the first Enter.
+const DRAFT_SUBMIT_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long a steered prompt that only the screen shows taken (a user turn above the editor, or
+/// Muse's input queue) is watched before it counts as delivered: Muse puts a steer that fails
+/// back in its editor, and a failed steer writes no accepted intent to its journal (#720
+/// agentctl-muse-stale-draft).
+const MUSE_STEER_SETTLE: Duration = Duration::from_secs(3);
+/// Most presses of Enter for a prompt typed into an idle Muse that stays the whole editor.
+const MUSE_IDLE_PRESSES: u32 = 4;
 
 #[cfg(test)]
 thread_local! {
@@ -4537,6 +4718,17 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                         .expect("custom submission lock poisoned") = None;
                     return Ok(());
                 }
+                // The exact prompt is still the whole editor: Muse missed the Enter. Press it
+                // again, at most MUSE_IDLE_PRESSES times in all (#720 agentctl-muse-stale-draft).
+                if muse_verified_process_paste_is_exact_composer(&screen, &submission.text) {
+                    let mut retry = submission.enter.lock().expect("enter retry lock poisoned");
+                    if retry.presses < MUSE_IDLE_PRESSES && Instant::now() >= retry.next {
+                        self.guarded(runtime)?.send_keys(pane_id, "Enter")?;
+                        retry.presses += 1;
+                        retry.wait = (retry.wait * 2).min(crate::submission::MAX_RETRY);
+                        retry.next = Instant::now() + retry.wait;
+                    }
+                }
                 if Instant::now() >= deadline {
                     return Err(crate::error::AdapterError::unavailable(
                         "Muse did not show a verified post-Enter screen transition",
@@ -4587,6 +4779,21 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
 impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
     fn verifies_muse_followups(&self) -> bool {
         self.uses_muse_composer()
+    }
+    fn recover_stale_draft_with_runtime(
+        &self,
+        pane_id: &str,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<Option<String>> {
+        if !self.uses_muse_composer() {
+            return Ok(None);
+        }
+        // A draft agentctl did not type is left for the readiness wait to refuse as `staged`,
+        // as every edition words it.
+        match self.recover_muse_draft(pane_id, runtime) {
+            Err(error) if error.to_string().contains(FOREIGN_DRAFT) => Ok(None),
+            other => other,
+        }
     }
     fn working_wait_proves_printed(&self) -> bool {
         // The Muse `working` wait reads the screen for the submitted prompt (see
@@ -4766,6 +4973,7 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
             prior_transcript_count: muse_verified_process_prompt_transcript_count(&staged, text),
             prior_queued_count: muse_verified_process_prompt_queued_count(&staged, text),
             journal,
+            enter: EnterRetry::pressed(),
             staged_screen: staged,
             text: text.to_owned(),
         });
@@ -4985,6 +5193,7 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
             prior_transcript_count: muse_verified_process_prompt_transcript_count(&staged, text),
             prior_queued_count: muse_verified_process_prompt_queued_count(&staged, text),
             journal,
+            enter: EnterRetry::pressed(),
             staged_screen: staged,
             text: text.to_owned(),
         });
@@ -13225,6 +13434,7 @@ pub(crate) mod tests {
                 prior_transcript_count: 0,
                 prior_queued_count: 0,
                 journal: None,
+                enter: EnterRetry::pressed(),
             })),
             queue: None,
             registry: None,
@@ -13832,7 +14042,8 @@ pub(crate) mod tests {
             if let Some(text) = self.screens.lock().unwrap().pop_front() {
                 return Ok(text);
             }
-            if let Some(editor) = self.muse_editor.lock().unwrap().as_ref() {
+            if let Some(editor) = self.muse_editor.lock().unwrap().as_mut() {
+                editor.tick();
                 return Ok(editor.screen());
             }
             Ok(self
@@ -19641,6 +19852,8 @@ fi
     /// Resume recovery, immutable planning, exact publication and crash reconciliation.
     mod revive;
     mod session_follow;
+    /// Drafts Muse left unsent: agentctl's own submitted, anyone else's refused (#720).
+    mod stale_draft;
     /// Trusted stop refusals and generation-bound recovery advice.
     mod stop_advice;
     /// Retirement of headless turn-runner records whose runner is provably dead.
