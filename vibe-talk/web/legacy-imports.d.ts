@@ -221,3 +221,5 @@ declare const searchWalkProgress: LegacyImports["searchWalkProgress"];
 declare const serviceReadWords: LegacyImports["serviceReadWords"];
 declare const elisionLabels: LegacyImports["elisionLabels"];
 declare const forgetElisionCounts: LegacyImports["forgetElisionCounts"];
+declare const isNoise: LegacyImports["isNoise"];
+declare const joinsGroup: LegacyImports["joinsGroup"];

@@ -231,6 +231,8 @@ export {
   elisionLabels,
   forgetElisionCounts,
   gapWords,
+  isNoise,
+  joinsGroup,
   lineLabel,
   reactionKey,
   reactionText,

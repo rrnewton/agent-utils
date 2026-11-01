@@ -34538,21 +34538,6 @@ function noteStartsRead(messages) {
 }
 
 /**
- * Does the SERVER say this message is read automatically? `#196 auto-read-noise`.
- *
- * The flag and nothing else. The server decides it from the owner's noise rules against the
- * message's text as it reads NOW, on every read, and this page deliberately has no copy of the
- * matcher: two predicates would disagree the first time either one changed, and the one that
- * decides what the agent hears is the server's.
- *
- * Like `markOwnRead` and unlike the declared archive, it is implied: nothing is recorded per
- * message, there is no undo, and an edit or a removed rule brings the message straight back.
- */
-function isNoise(message) {
-  return Boolean(message) && message.noise === true;
-}
-
-/**
  * Does this message belong in the list behind Hide read?
  *
  * ONE definition, for both places the threaded view filters. Not archived, not read automatically,
@@ -37882,9 +37867,6 @@ function swipeable(li, messages) {
 //     the window are one post. A root joining the row above would bury its thread inside another
 //     message, and a reply in some other thread is never part of it (`#463 slack-text-fidelity`).
 
-/** How close two messages have to be to be shown as one. */
-const GLOM_WINDOW_MS = 5000;
-
 /** What goes between two combined messages, so the seam is a line break and not a run-on. */
 const GLOM_SEPARATOR = "\n";
 
@@ -37913,37 +37895,6 @@ function storedCombineMessages() {
 }
 
 /**
- * Does `message` belong with the one before it?
- *
- * A missing or unparseable timestamp is a NO. Guessing that two messages were sent together when
- * the page cannot tell when either was sent would be combining on no evidence at all.
- */
-function joinsGroup(previous, message) {
-  if (!combineMessages || !previous) {
-    return false;
-  }
-  if (threadOf(previous) !== threadOf(message) || (message.thread && message.thread.is_root)) {
-    return false;
-  }
-  if (String(previous.author_id || "") !== String(message.author_id || "")) {
-    return false;
-  }
-  // `#196 auto-read-noise`. A placeholder and the answer that follows it seconds later are two
-  // rows, not one: combined, the row would be neither read nor quiet, and the placeholder's text
-  // would sit at the head of the real message.
-  if (isNoise(previous) !== isNoise(message)) {
-    return false;
-  }
-  const before = messageDate(previous);
-  const after = messageDate(message);
-  if (before === null || after === null) {
-    return false;
-  }
-  const gap = after.getTime() - before.getTime();
-  return gap >= 0 && gap <= GLOM_WINDOW_MS;
-}
-
-/**
  * A list of messages, oldest first, as the list of ROWS to draw.
  *
  * Every message appears exactly once, in order, in exactly one group — so the row count changes
@@ -37955,7 +37906,7 @@ function glom(messages) {
   for (const message of messages) {
     if (hiddenEmpty(message)) continue;
     const last = groups[groups.length - 1];
-    if (last && joinsGroup(last[last.length - 1], message)) {
+    if (last && joinsGroup(last[last.length - 1], message, combineMessages)) {
       last.push(message);
     } else {
       groups.push([message]);
@@ -42130,7 +42081,7 @@ function appendChannelRow(arriving, live = false, folded = false) {
     const rows = [...list.children];
     const last = rows[rows.length - 1];
     const held = rowMessages(last);
-    if (held.length > 0 && joinsGroup(held[held.length - 1], message)) {
+    if (held.length > 0 && joinsGroup(held[held.length - 1], message, combineMessages)) {
       // The row is REBUILT rather than edited: one constructor for a row, wherever it came from.
       list.replaceChildren(...rows.slice(0, -1), discordNode([...held, message]));
     } else {

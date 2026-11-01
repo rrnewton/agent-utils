@@ -24,3 +24,4 @@ export {
 export type { ReactionFace } from "./labels.ts";
 export { ELISION_COUNTED_TEXTS, FOLD_WIDTHS_EM, NO_ELISION_LABELS, elisionLabels, foldPieces, foldShows, forgetElisionCounts } from "./fold.ts";
 export type { FoldLaid, FoldLine, FoldPiece, FoldRun } from "./fold.ts";
+export { GLOM_WINDOW_MS, isNoise, joinsGroup } from "./grouping.ts";

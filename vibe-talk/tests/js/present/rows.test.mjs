@@ -52,3 +52,18 @@ test("`#624 voice-page-modularity`: the fold model lays a text out and counts wh
   // A table's words are a block drawn whole: shown, all of them, when it starts inside the shown lines.
   assert.deepStrictEqual(foldShows(foldPieces([["w", "a b c"]]), 28.5, 3), { words: 3, chars: 3 });
 });
+
+test("`#624 voice-page-modularity`: which messages are drawn as one row, from the module alone", () => {
+  const { joinsGroup, isNoise, GLOM_WINDOW_MS } = ROWS;
+  const at = (ms) => new Date(Date.UTC(2026, 9, 12, 12, 0, 0) + ms).toISOString();
+  const first = { id: "1", author_id: "a", timestamp: at(0), content: "half" };
+  const second = { id: "2", author_id: "a", timestamp: at(GLOM_WINDOW_MS), content: "of it" };
+  assert.equal(joinsGroup(first, second, true), true);
+  assert.equal(joinsGroup(first, second, false), false, "joined with combining turned off");
+  assert.equal(joinsGroup(first, { ...second, timestamp: at(GLOM_WINDOW_MS + 1) }, true), false);
+  assert.equal(joinsGroup(first, { ...second, author_id: "b" }, true), false);
+  assert.equal(joinsGroup(first, { ...second, timestamp: "" }, true), false, "joined on no evidence of when");
+  assert.equal(joinsGroup({ ...first, noise: true }, second, true), false, "a placeholder joined its answer");
+  assert.equal(joinsGroup(null, second, true), false);
+  assert.deepStrictEqual([isNoise({ noise: true }), isNoise({}), isNoise(null)], [true, false, false]);
+});
