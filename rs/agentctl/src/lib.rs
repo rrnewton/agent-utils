@@ -49,6 +49,7 @@ pub mod tui_prompts;
 pub mod turn_state;
 pub mod units;
 pub mod work_state;
+pub(crate) mod worker_repair;
 pub(crate) mod worker_reset;
 
 /// Reference for the canonical command and its supported adapters.

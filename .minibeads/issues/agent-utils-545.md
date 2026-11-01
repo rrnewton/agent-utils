@@ -66,3 +66,12 @@ process-scan tests, the standalone wrkslots lifecycle, a
 real-host liveness test that then passed 3/3). Python-only
 agentctl surface now: migrate, repair (folded into the
 herdr-subagents port). Issue stays open for those.
+
+Repair ported to Rust (#545 remaining corners, slice 1 of 2):
+manager.repair -> worker_repair::recreate_window in the runtime home
+(registry lock, unknown/TUI/dead-runner refusals, already_present,
+tmux break-pane, transcript-view launch in tmux or Herdr).
+Differential py/tests/test_agentctl_repair_rust.py with fake tmux
+and a live sleeper runner. Removed from PYTHON_ONLY_COMMANDS and
+from the editions python-only subcommands. Migrate remains
+python-only, ported next. Fixture-only; no live workers touched.

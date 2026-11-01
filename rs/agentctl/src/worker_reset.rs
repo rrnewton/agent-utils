@@ -39,7 +39,7 @@ const ROW_FIELDS: [&str; 18] = [
     "runner_boot_id",
 ];
 
-fn valid_name(name: &str) -> bool {
+pub(crate) fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
         && name
@@ -52,7 +52,7 @@ fn valid_name(name: &str) -> bool {
 }
 
 /// One normalized registry row, in the field order the registry writes.
-fn normalize_row(raw: &Map<String, Value>) -> Map<String, Value> {
+pub(crate) fn normalize_row(raw: &Map<String, Value>) -> Map<String, Value> {
     let text = |key: &str| raw.get(key).and_then(Value::as_str).map(str::to_owned);
     let target = text("tmux_target").unwrap_or_default();
     let herdr_tab = {
@@ -254,6 +254,77 @@ pub fn reset_agent(home: &Path, name: &str) -> Result<Value> {
         },
         "record": record,
     }))
+}
+
+/// Load the runtime registry rows under the registry lock (shared with repair).
+pub(crate) fn load_rows(
+    home: &Path,
+) -> std::result::Result<(Vec<Map<String, Value>>, std::fs::File), String> {
+    std::fs::create_dir_all(home)
+        .map_err(|error| format!("cannot create runtime home {}: {error}", home.display()))?;
+    let lock_path = home.join(".registry.lock");
+    let lock_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|error| format!("cannot open runtime registry lock: {error}"))?;
+    FileExt::lock_exclusive(&lock_file)
+        .map_err(|error| format!("cannot lock runtime registry: {error}"))?;
+    let registry_path = home.join("registry.json");
+    let mut rows: Vec<Map<String, Value>> = Vec::new();
+    if registry_path.exists() {
+        let text = std::fs::read_to_string(&registry_path)
+            .map_err(|error| format!("cannot read runtime registry: {error}"))?;
+        let parsed: Value = serde_json::from_str(&text).map_err(|error| {
+            format!(
+                "registry.json is corrupt ({error}); inspect {} by hand",
+                registry_path.display()
+            )
+        })?;
+        let array = parsed
+            .as_array()
+            .ok_or_else(|| "registry.json must be a JSON array".to_owned())?;
+        for row in array {
+            let object = row
+                .as_object()
+                .ok_or_else(|| "registry.json rows must be JSON objects".to_owned())?;
+            rows.push(normalize_row(object));
+        }
+    }
+    Ok((rows, lock_file))
+}
+
+/// Save rows sorted by name, without the boot-id field (shared with repair).
+pub(crate) fn save_rows(
+    home: &Path,
+    rows: &[Map<String, Value>],
+) -> std::result::Result<(), String> {
+    let registry_path = home.join("registry.json");
+    let mut sorted = rows.to_vec();
+    sorted.sort_by(|a, b| {
+        a.get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .cmp(b.get("name").and_then(Value::as_str).unwrap_or_default())
+    });
+    let payload = Value::Array(
+        sorted
+            .into_iter()
+            .map(|mut row| {
+                row.remove("runner_boot_id");
+                Value::Object(row)
+            })
+            .collect::<Vec<_>>(),
+    );
+    let text = serde_json::to_string_pretty(&payload)
+        .map_err(|error| format!("cannot encode runtime registry: {error}"))?;
+    let temporary = home.join("registry.json.tmp");
+    std::fs::write(&temporary, format!("{text}\n"))
+        .map_err(|error| format!("cannot write runtime registry: {error}"))?;
+    std::fs::rename(&temporary, &registry_path)
+        .map_err(|error| format!("cannot replace runtime registry: {error}"))
 }
 
 #[cfg(test)]

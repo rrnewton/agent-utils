@@ -10721,6 +10721,57 @@ its drain would also type, so it was not queued",
         Ok(json!({"name": agent_name, "token": record.token, "paused": paused}))
     }
 
+    /// Recreate one live headless turn-runner worker's presentation,
+    /// under the same lifecycle lock as `reset`.
+    pub fn repair(&self, agent_name: &str) -> Result<Value> {
+        let _lock = self.lock(agent_name)?;
+        let mut record = self.load(agent_name)?;
+        if record.adapter != "turn-runner" {
+            return Err(fail("repair requires a persistent turn-runner session"));
+        }
+        if record.paused {
+            return Err(fail(format!(
+                "agent {agent_name:?} is paused for human input; resume it before automated submission"
+            )));
+        }
+        let home = record
+            .runtime_home
+            .clone()
+            .ok_or_else(|| fail("turn-runner session has no runtime directory"))?;
+        let response =
+            crate::worker_repair::recreate_window(std::path::Path::new(&home), agent_name)
+                .map_err(fail)?;
+        if let Some(row) = response.get("record").filter(|row| row.is_object()) {
+            record.mode = if row.get("mode").and_then(Value::as_str) == Some("tui") {
+                "interactive".to_owned()
+            } else {
+                "headless".to_owned()
+            };
+            if let Some(backend) = row.get("backend").and_then(Value::as_str) {
+                record.backend = backend.to_owned();
+            }
+            let session = row
+                .get("session_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if let Some(value) = &session {
+                if value.is_empty() || value.contains('\0') {
+                    return Err(fail("worker reported an invalid native session identity"));
+                }
+            }
+            record.session_value.clone_from(&session);
+            record.native_session = session
+                .as_ref()
+                .map(|value| NativeSession::new(&record.harness, value, "observed"));
+            record.pane_id = row
+                .get("presentation_pane")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            self.save(&record)?;
+        }
+        Ok(response)
+    }
+
     /// Reset one idle headless turn-runner worker under the lifecycle lock.
     pub fn reset(&self, agent_name: &str) -> Result<Value> {
         let _lock = self.lock(agent_name)?;

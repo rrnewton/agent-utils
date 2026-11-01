@@ -311,6 +311,9 @@ enum Commands {
     /// Reset an idle headless turn-runner worker's conversation context
     #[command(after_help = "Example: agentctl reset worker")]
     Reset(Named),
+    /// Recreate the terminal presentation of a live headless runner
+    #[command(after_help = "Example: agentctl repair worker")]
+    Repair(Named),
     /// Re-enable automation input; queued messages still require drain or send
     #[command(after_help = "Example: agentctl resume reviewer && agentctl drain reviewer")]
     Resume(Named),
@@ -2226,7 +2229,7 @@ pub(crate) fn main_with_environment<I: IntoIterator<Item = OsString>>(
 // Commands only the Python edition implements: the headless-worker operations.
 // This edition refuses them with exit status 2 and names the Python opt-in,
 // instead of Clap's unrecognised-subcommand error.
-const PYTHON_ONLY_COMMANDS: [&str; 2] = ["migrate", "repair"];
+const PYTHON_ONLY_COMMANDS: [&str; 1] = ["migrate"];
 const PYTHON_ONLY_CHAT_COMMANDS: [&str; 0] = [];
 // Global options whose value is the following argument.
 const GLOBAL_VALUE_OPTIONS: [&str; 7] = [
@@ -3887,6 +3890,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             result
         }
         Commands::Reset(value) => manager.reset(&value.name)?,
+        Commands::Repair(value) => manager.repair(&value.name)?,
         Commands::Progress(value) => {
             let result = manager.progress(
                 &value.name,
