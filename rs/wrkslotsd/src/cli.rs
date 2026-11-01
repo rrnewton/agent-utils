@@ -161,6 +161,24 @@ pub(crate) enum Command {
         #[arg(long, value_name = "DIR")]
         root: Option<PathBuf>,
     },
+    /// Print the Python `status` command's envelope (JSON) or human form
+    StatusText {
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+        /// Read every ACTIVE machine shard instead of only the selected machine
+        #[arg(long)]
+        all_machines: bool,
+        /// Limit output to this slot name
+        #[arg(long, value_name = "SLOT")]
+        slot: Option<String>,
+        /// Output format: json or human
+        #[arg(long, value_name = "FORMAT", default_value = "human", value_parser = ["human", "json"])]
+        format: String,
+    },
     /// Diagnose every active record (owner process, heartbeat, hold) and print one status object per record
     ParseStatus {
         /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
@@ -996,6 +1014,28 @@ pub fn run() -> u8 {
                 }
             }
         }
+        Command::StatusText {
+            root,
+            machine,
+            all_machines,
+            slot,
+            format,
+        } => match crate::status_state::status_cli(
+            root.as_deref(),
+            machine.as_deref(),
+            all_machines,
+            slot.as_deref(),
+            format == "human",
+        ) {
+            Ok(text) => {
+                print!("{text}");
+                return 0;
+            }
+            Err(error) => {
+                eprintln!("wrkslotsd: {error}");
+                return 1;
+            }
+        },
         Command::ParseStatus { root } => match crate::status_state::parse_status(root.as_deref()) {
             Ok(value) => {
                 println!(

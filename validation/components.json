@@ -407,6 +407,7 @@
         "py/wrkslots/tests/test_sandbox_cpu_quotas.py",
         "py/wrkslots/tests/test_scoped_journal_episodes.py",
         "py/wrkslots/tests/test_slot_images.py",
+        "py/wrkslots/tests/test_status_cli_rust.py",
         "py/wrkslots/tests/test_status_state_rust.py",
         "py/wrkslots/tests/test_storage_state_rust.py",
         "py/wrkslots/tests/test_tool_authority.py",

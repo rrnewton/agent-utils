@@ -691,3 +691,12 @@ refusing busy immediately. Direct wrkslotsd use without the
 variable keeps the non-blocking behaviour. Soak log so far:
 heartbeat rust rc=0; status and --wait-lock python (status human
 form is the next slice).
+
+Soak slice (status): wrkslotsd status-text prints the Python status
+envelope (schema/project/worktrees/control/layout/machines/active/
+journals/registry_storage_*) and the human form. Storage
+inconsistencies are the real filesystem+Git censuses; an unavailable
+source repository becomes a repository-evidence-unavailable finding
+per checkout, as Python status reports it. Soak maps status to
+status-text in both formats. Differential:
+py/wrkslots/tests/test_status_cli_rust.py.

@@ -29,6 +29,9 @@ case "$1" in
   parse-doctor)
     if [ "$2" = "--help" ]; then echo "Usage: --root --machine --all-machines"; exit 0; fi
     echo "RS parse-doctor $@" ;;
+  status-text)
+    if [ "$2" = "--help" ]; then echo "Usage: --root --machine --all-machines --slot --format"; exit 0; fi
+    echo "RS status-text $@" ;;
   heartbeat)
     if [ "$2" = "--help" ]; then echo "Usage: --agent --owner-pid --expected-generation --root --machine"; exit 0; fi
     echo "RS heartbeat-run $@" ;;
@@ -79,18 +82,25 @@ def test_covered_reader_runs_in_rust_with_translation(tmp_path: Path) -> None:
     root, log = _sandbox(tmp_path)
     result = _run(root, log, "status", "--format", "json")
     assert result.returncode == 0, result.stderr
-    assert result.stdout.startswith("RS parse-status")
-    assert "--format" not in result.stdout
+    assert result.stdout.startswith("RS status-text status-text --format json")
+    assert "cmd=status edition=rust rc=0" in log.read_text()
+
+
+def test_human_status_runs_in_rust(tmp_path: Path) -> None:
+    root, log = _sandbox(tmp_path)
+    result = _run(root, log, "status")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("RS status-text status-text")
     assert "cmd=status edition=rust rc=0" in log.read_text()
 
 
 def test_human_reader_stays_python_with_note(tmp_path: Path) -> None:
     root, log = _sandbox(tmp_path)
-    result = _run(root, log, "status")
+    result = _run(root, log, "doctor")
     assert result.returncode == 0, result.stderr
-    assert result.stdout.startswith("PY wrkslots status")
+    assert result.stdout.startswith("PY wrkslots doctor")
     assert "python (not yet in Rust)" in result.stderr
-    assert "cmd=status edition=python rc=0" in log.read_text()
+    assert "cmd=doctor edition=python rc=0" in log.read_text()
 
 
 def test_uncovered_command_stays_python_with_note(tmp_path: Path) -> None:
@@ -122,10 +132,10 @@ def test_unknown_flag_falls_back_to_python(tmp_path: Path) -> None:
 
 def test_format_value_is_checked_not_just_the_flag(tmp_path: Path) -> None:
     root, log = _sandbox(tmp_path)
-    human = _run(root, log, "status", "--format", "human")
-    assert human.stdout.startswith("PY wrkslots status")
-    bogus = _run(root, log, "status", "--format", "bogus")
-    assert bogus.stdout.startswith("PY wrkslots status")
+    human = _run(root, log, "doctor", "--format", "human")
+    assert human.stdout.startswith("PY wrkslots doctor")
+    bogus = _run(root, log, "doctor", "--format", "bogus")
+    assert bogus.stdout.startswith("PY wrkslots doctor")
 
 
 def test_format_default_commands_stay_python_without_json(tmp_path: Path) -> None:

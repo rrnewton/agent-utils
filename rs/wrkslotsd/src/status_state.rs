@@ -379,3 +379,304 @@ pub(crate) fn parse_status(root: Option<&Path>) -> Result<Value> {
         "records": records,
     }))
 }
+
+/// The Python `status` command's output, envelope and human form.
+///
+/// Records come from [`status_records`]; the envelope, journals list
+/// and human rendering mirror `_cmd_status`. Storage inconsistencies
+/// are the filesystem and Git censuses (`parse_storage`,
+/// `parse_storage_git`) merged and sorted the way the Python status
+/// sorts them, instead of the empty list `parse_status` reports.
+pub(crate) fn status_cli(
+    root: Option<&Path>,
+    machine_override: Option<&str>,
+    all_machines: bool,
+    slot_filter: Option<&str>,
+    human: bool,
+) -> Result<String> {
+    let (cfg, selected) = load_cfg(root, machine_override)?;
+    // Refuse a partial atomic update, like the Python status.
+    {
+        let mut leftovers: Vec<std::path::PathBuf> = Vec::new();
+        let patterns = [
+            "ACTIVE.",
+            "ARCHIVED.",
+            "CREATE.",
+            "FINISH.",
+            "HANDOFF.",
+            "VALIDATE-BATCH-SEAL.",
+        ];
+        if let Ok(entries) = std::fs::read_dir(&cfg.control) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.contains(".tmp.") && patterns.iter().any(|prefix| name.starts_with(prefix))
+                {
+                    leftovers.push(entry.path());
+                }
+                if name.starts_with("EVENTS.") && entry.path().is_dir() {
+                    if let Ok(inner) = std::fs::read_dir(entry.path()) {
+                        for item in inner.flatten() {
+                            let inner_name = item.file_name().to_string_lossy().into_owned();
+                            if inner_name.ends_with(".json.tmp")
+                                || inner_name.contains(".json.tmp.")
+                            {
+                                leftovers.push(item.path());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        leftovers.sort();
+        if let Some(first) = leftovers.first() {
+            return Err(format!(
+                "partial atomic update found: {}; preserve it and use 'wrkslots recover'",
+                first.display()
+            ));
+        }
+    }
+    let (all_machine_names, records_all) = status_records(root, false)?;
+    let machines: Vec<String> = if all_machines {
+        all_machine_names.clone()
+    } else {
+        all_machine_names
+            .iter()
+            .filter(|machine| *machine == &selected)
+            .cloned()
+            .collect()
+    };
+    // Journals: outstanding recovery journals plus seal journals, as
+    // file names, in the Python command's order.
+    let journals_value = crate::journals_state::parse_journals(root)?;
+    let mut journals: Vec<String> = journals_value
+        .get("journals")
+        .and_then(Value::as_array)
+        .map(|names| {
+            names
+                .iter()
+                .filter_map(|name| name.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    // Seal journals follow the ordinary journals, as in Python.
+    {
+        let mut seals: Vec<String> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&cfg.control) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with("VALIDATE-BATCH-SEAL.") && name.ends_with(".journal") {
+                    seals.push(name);
+                }
+            }
+        }
+        seals.sort();
+        journals.extend(seals);
+    }
+    // Storage census: filesystem then Git findings, sorted by the
+    // storage sort key, exactly as the Python status merges them.
+    let mut inconsistencies: Vec<Value> = Vec::new();
+    if let Some(findings) = crate::storage_state::parse_storage(root)?
+        .get("findings")
+        .and_then(Value::as_array)
+    {
+        inconsistencies.extend(findings.iter().cloned());
+    }
+    match crate::git_storage_state::parse_storage_git(root) {
+        Ok(census) => {
+            if let Some(findings) = census.get("findings").and_then(Value::as_array) {
+                inconsistencies.extend(findings.iter().cloned());
+            }
+        }
+        Err(error) if error.contains("does not exist or cannot be resolved") => {
+            // The Python status tolerates an unavailable source
+            // repository as a per-checkout finding instead of
+            // refusing the whole command.
+            for record in &records_all {
+                let text = |key: &str| {
+                    record
+                        .get(key)
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned()
+                };
+                if let Some(checkouts) = record.get("checkouts").and_then(Value::as_array) {
+                    for checkout in checkouts {
+                        let repository = checkout
+                            .get("repository")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        if !error.contains(&format!("'{repository}'"))
+                            && !error.contains(&format!("\"{repository}\""))
+                        {
+                            continue;
+                        }
+                        let name = checkout
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        inconsistencies.push(json!({
+                            "kind": "repository-evidence-unavailable",
+                            "scope": "row",
+                            "slot": text("slot"),
+                            "slot_type": text("slot_type"),
+                            "machine": text("machine"),
+                            "checkout": name,
+                            "detail": format!(
+                                "cannot inspect repository for checkout {name}: {error}"
+                            ),
+                            "remedy": "restore the recorded source repository, or record where it moved with 'wrkslots relocate-repository', then rerun 'wrkslots status'; no mutation may rely on unavailable Git evidence",
+                        }));
+                    }
+                }
+            }
+        }
+        Err(error) => return Err(error),
+    }
+    inconsistencies.sort_by_key(crate::storage_state::storage_sort_key);
+    let mut records: Vec<Value> = Vec::new();
+    for mut record in records_all {
+        if !machines
+            .iter()
+            .any(|machine| Some(machine.as_str()) == record.get("machine").and_then(Value::as_str))
+        {
+            continue;
+        }
+        if let Some(wanted) = slot_filter {
+            if record.get("slot").and_then(Value::as_str) != Some(wanted) {
+                continue;
+            }
+        }
+        let machine = record
+            .get("machine")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let slot = record
+            .get("slot")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let mine: Vec<Value> = inconsistencies
+            .iter()
+            .filter(|item| {
+                item.get("machine").and_then(Value::as_str) == Some(machine.as_str())
+                    && item.get("slot").and_then(Value::as_str) == Some(slot.as_str())
+            })
+            .cloned()
+            .collect();
+        if let Some(object) = record.as_object_mut() {
+            object.insert("storage_inconsistencies".to_string(), Value::Array(mine));
+        }
+        records.push(record);
+    }
+    if !human {
+        let envelope = json!({
+            "schema": 2,
+            "project_root": cfg.root.to_string_lossy(),
+            "worktrees_dir": cfg.worktrees.to_string_lossy(),
+            "control_dir": cfg.control.to_string_lossy(),
+            "layout": cfg.layout,
+            "machines": machines,
+            "active": records,
+            "journals": journals,
+            "registry_storage_state": if inconsistencies.is_empty() { "consistent" } else { "inconsistent" },
+            "registry_storage_inconsistencies": inconsistencies,
+        });
+        return Ok(format!(
+            "{}\n",
+            serde_json::to_string_pretty(&envelope)
+                .map_err(|error| format!("cannot encode status: {error}"))?
+        ));
+    }
+    let mut event_count = 0usize;
+    for machine in &machines {
+        let dir = cfg.control.join(format!("EVENTS.{machine}"));
+        if dir.is_dir() {
+            if let Ok(events) = crate::global_state::load_event_chain(&dir, machine) {
+                event_count += events.len();
+            }
+        }
+    }
+    let mut out = format!(
+        "project={} worktrees={} control={} layout={} active={} journals={} events={} registry_storage={} inconsistencies={}\n",
+        cfg.root.display(),
+        cfg.worktrees.display(),
+        cfg.control.display(),
+        cfg.layout,
+        records.len(),
+        journals.len(),
+        event_count,
+        if inconsistencies.is_empty() { "CONSISTENT" } else { "INCONSISTENT" },
+        inconsistencies.len(),
+    );
+    for journal in &journals {
+        out.push_str(&format!("RECOVERY REQUIRED: {journal}\n"));
+    }
+    for record in &records {
+        let text = |key: &str| {
+            record
+                .get(key)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let number = |key: &str| record.get(key).and_then(Value::as_i64).unwrap_or(0);
+        let flag = |key: &str| record.get(key).and_then(Value::as_bool).unwrap_or(false);
+        let row_inconsistencies = record
+            .get("storage_inconsistencies")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        out.push_str(&format!(
+            "{}/{}: type={} agent={} task={} generation={} owner={} heartbeat_age={}s expired={} held={} inconsistencies={}\n",
+            text("machine"),
+            text("slot"),
+            text("slot_type"),
+            text("agent"),
+            text("task"),
+            number("generation"),
+            text("owner_state"),
+            number("heartbeat_age_seconds"),
+            if flag("heartbeat_expired") { "yes" } else { "no" },
+            if flag("held") { "yes" } else { "no" },
+            row_inconsistencies,
+        ));
+        if let Some(release) = record.get("owner_release").filter(|value| !value.is_null()) {
+            out.push_str(&format!(
+                "  {} (event {})\n",
+                release
+                    .get("summary")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                release
+                    .get("event_sequence")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0),
+            ));
+        }
+    }
+    for item in &inconsistencies {
+        let text = |key: &str| item.get(key).and_then(Value::as_str);
+        let identity = [
+            text("machine"),
+            text("slot_type"),
+            text("slot"),
+            text("checkout"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("/");
+        out.push_str(&format!(
+            "INCONSISTENT kind={} target={}: {}\n  REMEDY: {}\n",
+            text("kind").unwrap_or_default(),
+            if identity.is_empty() {
+                "-".to_owned()
+            } else {
+                identity
+            },
+            text("detail").unwrap_or_default(),
+            text("remedy").unwrap_or_default(),
+        ));
+    }
+    Ok(out)
+}

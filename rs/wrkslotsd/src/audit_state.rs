@@ -47,7 +47,7 @@ use crate::journal_state::{validated_journals, ValidatedJournal};
 
 /// The latest owner release for one generation and why it is void,
 /// mirroring `_owner_release_state` / `_owner_release_void_reason`.
-fn release_state(
+pub(crate) fn release_state(
     cfg: &Cfg,
     record: &Value,
     events: &[Value],
@@ -187,7 +187,7 @@ fn release_void_reason(
     Ok(None)
 }
 
-fn release_obj(release: &Value, void_reason: Option<&str>) -> Value {
+pub(crate) fn release_obj(release: &Value, void_reason: Option<&str>) -> Value {
     let recorded_at = release
         .get("recorded_at")
         .and_then(Value::as_str)
