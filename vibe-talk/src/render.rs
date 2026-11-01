@@ -32,7 +32,9 @@
 //!    asterisk, an asterisk emphasis is bold, and a link whose text is its own address is drawn
 //!    with a short label made from it, `widgets#123` (`#227 github-link-abbrev`, see
 //!    [`crate::link_labels`]). A Slack app link to a message stays a link, which no other
-//!    `slack:` address does (`#543 in-app-message-links`).
+//!    `slack:` address does (`#543 in-app-message-links`). Last, a reference id written in the
+//!    words, outside code and links, becomes a link where `[render] reference_links` names one
+//!    ([`references`]).
 //! 4. comrak writes HTML with raw HTML in the SOURCE escaped: it is shown as the characters it is,
 //!    as every chat client shows it, so the only markup in the output is markup comrak made.
 //! 5. ammonia keeps exactly [`TAGS`] and the attributes listed in [`SANITIZER`], and drops the
@@ -104,6 +106,7 @@ use crate::heading::HeadingTags;
 use crate::model::{ChannelInfo, MentionName, Message};
 
 pub mod highlight;
+pub mod references;
 
 /// How one provider writes message text, where that differs from GitHub-flavoured Markdown.
 ///
@@ -240,7 +243,8 @@ pub struct SearchText {
 
 impl SearchText {
     /// The label of the rules this indexes by, under the soft single-newline rule; the hard rule
-    /// indexes under it with `+hard` after it. `render-2`: single newlines soft, `•` lines items,
+    /// indexes under it with `+hard` after it, and configured reference links add `+refs-` and a
+    /// hash of their rules ([`references::ReferenceLinks::fingerprint`]). `render-2`: single newlines soft, `•` lines items,
     /// glued tables repaired (`markdown-tables-render`). `render-3`: a line end at each block's
     /// edge and each `<br>`, and only web links' addresses, as the page reads a body (`#604
     /// server-side-search`). `render-4`: a README link labelled by its folder (`#620
@@ -289,9 +293,15 @@ impl SearchText {
 
 impl crate::cache::SearchTextSource for SearchText {
     fn version(&self) -> String {
-        match single_newline() {
+        let rules = match single_newline() {
             SingleNewline::Soft => Self::VERSION.to_owned(),
             SingleNewline::Hard => format!("{}+hard", Self::VERSION),
+        };
+        // The configured reference links draw links of their own, whose addresses the index
+        // holds: other rules, another index.
+        match references::reference_links().fingerprint() {
+            Some(fingerprint) => format!("{rules}+refs-{fingerprint}"),
+            None => rules,
         }
     }
 
@@ -918,13 +928,15 @@ fn render_visiting_as<T>(
             }
         }
     }
-    adjust(&arena, root, &source, &inserted, markup, mentions);
+    let linked = adjust(&arena, root, &source, &inserted, markup, mentions);
     // Measured again: nesting the lists the writer indented makes the tree deeper than it parsed.
     if deeper_than(root, MAX_DEPTH) {
         return (plain_html(text), None);
     }
     let visited = visit(root, &source);
-    let limit = text.len().saturating_mul(MAX_GROWTH) + GROWTH_ALLOWANCE;
+    // The links made of reference ids are allowed for as well: a body that names many is still
+    // drawn as written (`#730 reference-links`).
+    let limit = text.len().saturating_mul(MAX_GROWTH) + GROWTH_ALLOWANCE + linked;
     // Highlighting is what grows code most, a span for every token, so a body it takes past the
     // bound is written again without it before it is given up as plain paragraphs: its code is
     // still drawn as code, only in one colour.
@@ -2331,7 +2343,8 @@ static SANITIZER: LazyLock<ammonia::Builder<'static>> = LazyLock::new(|| {
 /// The changes made to the parsed tree before it is written. See the module note, step 3.
 ///
 /// Two walks, because the second reads what the first made: an image is a link by the time links
-/// are checked, and a block of raw HTML is text by the time mentions are looked for.
+/// are checked, and a block of raw HTML is text by the time mentions are looked for. Then reference
+/// ids become links, and what those links may add to the HTML is answered, for the growth bound.
 fn adjust<'a>(
     arena: &'a Arena<'a>,
     root: &'a AstNode<'a>,
@@ -2339,7 +2352,7 @@ fn adjust<'a>(
     inserted: &[usize],
     markup: Markup,
     mentions: &[MentionName],
-) {
+) -> usize {
     let lines = line_starts(source);
     nest_lists(
         arena,
@@ -2402,13 +2415,19 @@ fn adjust<'a>(
         }
     }
     merge_text(root);
+    // What is left of a link the page refused, its text and the address after it, is still that
+    // link's: no id in it is made a link of its own.
+    let mut refused: HashSet<*const AstNode<'a>> = HashSet::new();
     for node in root.descendants().collect::<Vec<_>>() {
         let ast = node.data.borrow();
         match &ast.value {
             NodeValue::Link(link) if !web_address(&link.url) && !slack_app_link(&link.url) => {
                 let url = link.url.clone();
                 drop(ast);
-                unwrap_link(arena, node, url);
+                refused.extend(node.descendants().skip(1).map(std::ptr::from_ref));
+                if let Some(note) = unwrap_link(arena, node, url) {
+                    refused.insert(std::ptr::from_ref(note));
+                }
             }
             NodeValue::Link(_) => {
                 drop(ast);
@@ -2424,6 +2443,75 @@ fn adjust<'a>(
             _ => {}
         }
     }
+    // Last, so every link the walks above made or kept is a link by now and its text is passed
+    // over, and a mention is a chip rather than text.
+    link_references(arena, root, &references::reference_links(), &refused)
+}
+
+/// Every reference id `links` finds in the words made a link to where it names. See
+/// [`references`]. Text inside a link is left as it is, and so is what `refused` holds, the text of
+/// a link the page refused; code is not text here: comrak holds a code span's and a code block's
+/// words in nodes of their own. An address a rule makes that a tap could not be trusted with
+/// ([`web_address`]) leaves the id as text. Answers what the links made may add to the HTML: each
+/// is its address twice, its text and its attributes, generously.
+fn link_references<'a>(
+    arena: &'a Arena<'a>,
+    root: &'a AstNode<'a>,
+    links: &references::ReferenceLinks,
+    refused: &HashSet<*const AstNode<'a>>,
+) -> usize {
+    /// What one link's markup costs beyond its address and text: `<a href="" target="_blank"
+    /// rel="noopener noreferrer nofollow"></a>` and what the page's own marking may add.
+    const LINK_MARKUP: usize = 160;
+    let mut added = 0;
+    if links.is_empty() {
+        return added;
+    }
+    for node in root.descendants().collect::<Vec<_>>() {
+        let pieces = match &node.data.borrow().value {
+            NodeValue::Text(text)
+                if !inside_link(node) && !refused.contains(&std::ptr::from_ref(node)) =>
+            {
+                links.pieces(text)
+            }
+            _ => None,
+        };
+        let Some(pieces) = pieces else {
+            continue;
+        };
+        for piece in pieces {
+            let made = match piece {
+                references::Piece::Link { text, url } if web_address(&url) => {
+                    added += LINK_MARKUP + 2 * url.len() + text.len();
+                    let link: &'a AstNode<'a> = arena.alloc(
+                        NodeValue::Link(Box::new(comrak::nodes::NodeLink {
+                            url,
+                            title: String::new(),
+                        }))
+                        .into(),
+                    );
+                    link.append(arena.alloc(NodeValue::Text(text.into()).into()));
+                    link
+                }
+                references::Piece::Link { text, .. } | references::Piece::Text(text) => {
+                    &*arena.alloc(NodeValue::Text(text.into()).into())
+                }
+            };
+            node.insert_before(made);
+        }
+        node.detach();
+    }
+    added
+}
+
+/// Whether `node` is inside a link: a link's text is never made a link again.
+fn inside_link<'a>(node: &'a AstNode<'a>) -> bool {
+    node.ancestors().skip(1).any(|above| {
+        matches!(
+            above.data.borrow().value,
+            NodeValue::Link(_) | NodeValue::Image(_)
+        )
+    })
 }
 
 /// Whether a link's address is one a tap can be trusted with. The sanitizer enforces the same
@@ -2459,7 +2547,12 @@ fn slack_app_link(url: &str) -> bool {
 /// not silently reduced to its label — the sanitizer would keep the label and drop the address,
 /// and the reader would never learn what the message really pointed at. An address that is
 /// already the whole of the visible text, as an autolinked e-mail address is, is not repeated.
-fn unwrap_link<'a>(arena: &'a Arena<'a>, node: &'a AstNode<'a>, url: String) {
+/// Answers the address written after the text, when one was.
+fn unwrap_link<'a>(
+    arena: &'a Arena<'a>,
+    node: &'a AstNode<'a>,
+    url: String,
+) -> Option<&'a AstNode<'a>> {
     let shown: String = node
         .descendants()
         .filter_map(|kid| match &kid.data.borrow().value {
@@ -2471,10 +2564,15 @@ fn unwrap_link<'a>(arena: &'a Arena<'a>, node: &'a AstNode<'a>, url: String) {
         node.insert_before(kid);
     }
     let repeated = url == shown || url.strip_prefix("mailto:") == Some(shown.as_str());
+    let mut note = None;
     if !url.is_empty() && !repeated {
-        node.insert_before(arena.alloc(NodeValue::Text(format!(" ({url})").into()).into()));
+        let written: &'a AstNode<'a> =
+            arena.alloc(NodeValue::Text(format!(" ({url})").into()).into());
+        node.insert_before(written);
+        note = Some(written);
     }
     node.detach();
+    note
 }
 
 /// Give a link whose visible text is its own address a short label, when

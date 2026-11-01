@@ -577,12 +577,33 @@ impl Default for SpeakableConfig {
 /// line break, chat's old rule). Soft by default since 2026-10-26, when the owner chose it for every
 /// message after agents' hard-wrapped Markdown drew as lines broken mid-sentence; to be revisited,
 /// perhaps per sender or per message. See [`crate::render::SingleNewline`].
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+///
+/// `reference_links` draws a reference id written in a message as a link (`#730 reference-links`):
+/// each entry a regular expression `pattern` and a `url` template naming its groups, `$1` or
+/// `${name}`, for example `{ pattern = '\bD([0-9]{6,})\b', url = 'https://review.example.invalid/D$1'
+/// }`. Empty by default; a rule that cannot be used refuses the configuration when it loads. See
+/// [`crate::render::references`].
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RenderConfig {
     /// What a single newline inside a paragraph is. Defaults to soft.
     #[serde(default)]
     pub single_newline: crate::render::SingleNewline,
+    /// Reference ids drawn as links, checked when the configuration loads. Defaults to none.
+    #[serde(default)]
+    pub reference_links: Vec<crate::render::references::ReferenceLinkRule>,
+}
+
+/// `[render]` as the file says it, once every reference link rule is one the renderer can use.
+/// `#730 reference-links`.
+fn render_checked(render: RenderConfig) -> Result<RenderConfig, ConfigError> {
+    crate::render::references::ReferenceLinks::compile(&render.reference_links).map_err(
+        |detail| ConfigError::Invalid {
+            field: "render.reference_links".to_owned(),
+            detail,
+        },
+    )?;
+    Ok(render)
 }
 
 /// `serde` needs a function, not a literal, for a field that defaults to on.
@@ -2218,7 +2239,7 @@ impl Config {
                 fallback: fallback_checked(file.read_aloud.fallback, read_aloud_backend)?,
             },
             speakable,
-            render: file.render,
+            render: render_checked(file.render)?,
             owner: owner_config(file.owner)?,
             elevenlabs: ElevenLabsConfig {
                 agent_id: get(ENV_ELEVENLABS_AGENT_ID)
@@ -5698,6 +5719,38 @@ provider = "slack"
         let text = format!("{FULL}\n[speakable]\n");
         let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid config");
         assert!(cfg.speakable.enabled);
+    }
+
+    #[test]
+    fn reference_links_are_read_and_a_rule_that_cannot_be_used_refuses_the_configuration() {
+        // `#730 reference-links`. None by default.
+        let cfg = Config::from_toml_and_env(FULL, &env(&[])).expect("valid config");
+        assert!(cfg.render.reference_links.is_empty());
+        let good = "reference_links = [{ pattern = '\\bD(\\d{6,})\\b', url = 'https://review.example.invalid/D$1' }]";
+        let text = format!("{FULL}\n[render]\n{good}\n");
+        let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid config");
+        assert_eq!(cfg.render.reference_links.len(), 1);
+        assert_eq!(
+            cfg.render.reference_links[0].url,
+            "https://review.example.invalid/D$1"
+        );
+        for bad in [
+            "reference_links = [{ pattern = '\\bD(\\d+', url = 'https://x.example.invalid/$1' }]",
+            "reference_links = [{ pattern = '\\bD\\d+', url = 'javascript:x' }]",
+            "reference_links = [{ pattern = '\\bD\\d+', url = 'https://x.example.invalid/', label = 'D' }]",
+        ] {
+            let text = format!("{FULL}\n[render]\n{bad}\n");
+            let refused = Config::from_toml_and_env(&text, &env(&[]));
+            assert!(refused.is_err(), "{bad} was accepted");
+        }
+        let text = format!("{FULL}\n[render]\nreference_links = [{{ pattern = '(', url = 'https://x.example.invalid/' }}]\n");
+        let message = Config::from_toml_and_env(&text, &env(&[]))
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            message.contains("render.reference_links") && message.contains("reference link 1"),
+            "{message}"
+        );
     }
 
     #[test]

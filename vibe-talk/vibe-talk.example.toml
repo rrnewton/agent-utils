@@ -347,6 +347,16 @@ backend = "elevenlabs"
 # prose). "hard": a line break, chat's old rule, so every line is drawn as the line it was written
 # on. A blank line starts a new paragraph either way, and lines typed as "•" bullets stay lines.
 # single_newline = "soft"
+# Reference ids written in a message, drawn as links (`#730 reference-links`): each rule a regular
+# expression and the address an id it matches links to, naming the pattern's groups as $1 or
+# ${name} (what they capture is percent-encoded). Applied to the words only, never in code, a
+# link's own text or an address (a host or file name, a path with a dot, an e-mail address). A rule
+# that does not compile, matches the empty string, names a group its pattern lacks, or whose url is
+# not http(s) with its host written in it, refuses to start. None by default.
+# reference_links = [
+#   { pattern = '\bD([0-9]{6,})\b', url = 'https://review.example.invalid/D$1' },
+#   { pattern = '\bT([0-9]{6,})\b', url = 'https://tasks.example.invalid/T$1' },
+# ]
 
 [speakable]
 # Rewrite message bodies before anything says them out loud. ON when this section is absent.

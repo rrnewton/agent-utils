@@ -380,6 +380,11 @@ async fn main() -> anyhow::Result<()> {
     // It is announced loudly either way; see `Config::discover`.
     let config = Config::discover(args.config, args.overlays)?;
     vibe_talk::render::set_single_newline(config.render.single_newline);
+    // `#730 reference-links`. The rules were checked when the configuration loaded.
+    vibe_talk::render::references::set_reference_links(
+        vibe_talk::render::references::ReferenceLinks::compile(&config.render.reference_links)
+            .expect("reference links are checked when the configuration loads"),
+    );
 
     let providers: Arc<ChatRouter> = if args.fake_discord {
         tracing::warn!(

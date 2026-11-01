@@ -2607,6 +2607,7 @@ model provider or a real gateway.
 | Read-aloud relay roots | `read_aloud.websocket_ca_file` | — | optional PEM file of certificates trusted, beside the bundled public roots, when dialing a `wss://` `read_aloud.websocket_url` |
 | Prepare bodies for speech | `speakable.enabled` | `VIBE_TALK_SPEAKABLE` | **on by default**; off relays exactly what was typed. Does not affect the time-zone conversion. A value that is neither `true` nor `false` refuses to start |
 | Single newlines in a message | `render.single_newline` | — | `"soft"` (default): a single newline inside a paragraph is a space and the screen wraps the lines; `"hard"`: every newline is a line break, chat's old rule. See "How message text is drawn" |
+| Reference ids as links | `render.reference_links` | — | none by default; a list of `{ pattern, url }`, a regular expression and the address an id it matches links to (`$1`, `${name}` name its groups, percent-encoded; the host is the template's). A rule that cannot be used refuses to start. See "How message text is drawn" |
 | ElevenLabs API key | `elevenlabs.api_key` | `VIBE_TALK_ELEVENLABS_API_KEY` | **secret**, needed to mint signed URLs and for the ElevenLabs read-aloud backend |
 | Your own Discord user id | `discord.owner_user_id` | `VIBE_TALK_DISCORD_OWNER_USER_ID` | public; **cannot be derived** — see below. Without it, messages you type into Discord yourself are drawn as a third party |
 | Your coding agents' accounts | `discord.coding_agent_user_ids` | — | public; a list of account ids, at most 32. The channel view draws each as the coding agent and no other bot; unset, the one bot in a channel besides this server is guessed to be it. See [Who the coding agent is](#who-the-coding-agent-is) |
@@ -7540,6 +7541,16 @@ live stream, a post's answer and the pins — and sends it beside the text as `c
    `src/link_labels.rs`, where another host can be added.
 7. **A fenced code block that names its language is highlighted** (`#531
    server-side-syntax-highlight`); see [Code blocks](#code-blocks) below.
+   **A reference id is a link** where the deployment says what its ids mean (`#730
+   reference-links`): `[render] reference_links` lists rules, each a regular expression and an
+   address template, such as `{ pattern = '\bD([0-9]{6,})\b', url =
+   'https://review.example.invalid/D$1' }`, so `D1234567` in a message links to that review. What a
+   group captures is percent-encoded into the address, whose host must be written in the template.
+   The words only: never in code, in a link's own text (nor what is left of a link the page
+   refused), or in an address (a URL that is not a link, a host or file name, a path with a dot in
+   it, an e-mail address; a slash alone is not one, so `D1234567/D1234568` is two ids). The rules
+   are checked when the configuration loads, and the search index is built again when they change.
+   `src/render/references.rs`.
 8. Raw HTML written in a message is shown as the characters it is, and
    [ammonia](https://github.com/rust-ammonia/ammonia) then keeps only a short allowlist of
    elements and attributes; see [Security](#security).

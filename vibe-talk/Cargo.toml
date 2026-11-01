@@ -71,6 +71,11 @@ bytes = "1"
 comrak = { version = "0.55", default-features = false }
 # Ticket minting only: 256 bits from the system CSPRNG. Already in the tree transitively.
 getrandom = "0.3"
+# `[render] reference_links`: the deployment's own patterns for reference ids in message text (a
+# diff, a task), drawn as links. Its engine runs in time linear in the text, whatever the pattern,
+# which an operator's pattern over anybody's message needs. Its parts (regex-automata,
+# regex-syntax) were already in the tree.
+regex = "1.12"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 # `tzdb-bundle-always` compiles the IANA database into the binary. The runtime image has no
 # `tzdata` package, and a server that fell back to UTC for want of one would silently reproduce
