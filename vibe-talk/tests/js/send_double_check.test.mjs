@@ -3,16 +3,20 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import vm from "node:vm";
 
+import { moduleForTests } from "../../web/build.mjs";
 import { readWeb } from "../../web/page_sources.mjs";
 
 const js = readWeb("voice.js");
 const css = readWeb("voice.css");
 
+/** How a duration is worded, which moved into web/src/present/notices (`#624 voice-page-modularity`). */
+const NOTICES = await moduleForTests("src/present/notices/index.ts");
+
 function loadHelpers() {
-  const start = js.indexOf("function fmtDuration");
+  const start = js.indexOf("function sendTimingText");
   const end = js.indexOf("/** Whether `error` means the server's answer was lost");
   assert.ok(start > 0 && end > start, "duration helpers present");
-  const ctx = { chatServiceOf: () => "Slack" };
+  const ctx = { chatServiceOf: () => "Slack", fmtDuration: NOTICES.fmtDuration };
   vm.createContext(ctx);
   vm.runInContext(js.slice(start, end), ctx);
   return ctx;

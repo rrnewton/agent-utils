@@ -782,25 +782,6 @@ function signedOutByRename() {
   return credentialStore().signedOutByRename();
 }
 
-/**
- * The sentence for a refusal, chosen by WHICH refusal it was.
- *
- * 403 is not a bad token — it is the right token with the wrong scope, and the two are fixed
- * differently: one is a typo, the other is a different string in the same config file. The
- * server's own taxonomy already separates them (`forbidden`, "this token may read but not post"),
- * and this is the one place the difference is expensive, because `/api/v1/client-config` accepts
- * a read-scope token just as it accepts a write-scope one. So a read token signs in cleanly and
- * fails only at the first thing that writes, which is minting a conversation. Calling that
- * "refused" sends the owner hunting for a typo in a token that is not wrong. (It does now say
- * which scope it saw — `tokenScope` — but only so the page stops asking for what a read token
- * cannot have; reading channels with one is supported.)
- */
-function refusalSentence(error) {
-  return error && error.status === 403
-    ? "that looks like a READ token — this page needs the write-scope one"
-    : "that token was refused — paste the write-scope token";
-}
-
 // --- the phone's back gesture, and the browser's Back -----------------------------------------
 //
 // `#304 back-gesture-in-app`. The owner, 2026-10-14: on the installed Android app the system back
@@ -19821,25 +19802,6 @@ const CALL_AUDIO_MAX_MS = 3600000;
 const SPEECH_HOLDS_MAX = 10000;
 
 /**
- * The words for a call the voice service's side ended while the reader did not hang up, the page
- * was in sight, and no error preceded the close.
- *
- * @param {string} span how long the call had been open, in words
- * @param {boolean} lost whether the close came without a closing handshake
- * @param {string} reason the reason the service gave with its close, if any
- */
-function serviceEndedSentence(span, lost, reason) {
-  const into = span ? ` ${span} in` : "";
-  if (lost) {
-    return `The call dropped${into}: the connection to the voice service was cut without a ` +
-      "goodbye — by the network, the phone or the service, not by Hang up. Start a new call to carry on.";
-  }
-  const given = String(reason || "").slice(0, 120).replace(/[\s.]+$/u, "");
-  const said = given ? ` It said: ${given}.` : "";
-  return `The voice service ended the call${into} — you did not hang up.${said} Start a new call to carry on.`;
-}
-
-/**
  * A start that never reached the voice service: refused, closed, or silent past the deadline.
  * `#209 voice-socket-open`.
  *
@@ -30075,13 +30037,6 @@ async function dispatchOutgoingMessage(entry, job) {
 //   * While a send is slow, the row says which part is going ("Posting part 2 of 3…"), asked of the
 //     same route every OUTGOING_PROGRESS_MS, so a send that takes seconds never looks stuck.
 
-/** One duration for the tap readout: `120 ms`, `1.9 s`. `#621 send-double-check`. */
-function fmtDuration(ms) {
-  if (ms === null || ms === undefined || !Number.isFinite(Number(ms))) return "—";
-  const value = Math.max(0, Math.round(Number(ms)));
-  return value < 1000 ? `${value} ms` : `${(value / 1000).toFixed(1)} s`;
-}
-
 /** Durations from the Send tap, never absolute times. `#621 send-double-check`. */
 function sendTimingText(entry) {
   const service = (typeof chatServiceOf === "function" && chatServiceOf(entry.channel)) || "upstream";
@@ -30328,32 +30283,6 @@ function resumeOutgoingRetries() {
 // full window — some harnesses build one by hand — has no `window.addEventListener`.
 if (typeof window.addEventListener === "function") {
   window.addEventListener("online", () => resumeOutgoingRetries());
-}
-
-/**
- * A 207's `refusal` — the chat service's 4xx answer to the part that failed — as a sentence for the
- * reader: "Google Chat refused this message: it contains @Ada, which would notify someone." The
- * server puts the reason in the reader's words (`explanation`); "" where there is no refusal, from
- * a failure that is not one or a server too old to say. `#444 send-refusal-reason`.
- */
-function refusalWords(refusal, service) {
-  const why = refusal && typeof refusal.explanation === "string" ? refusal.explanation.trim() : "";
-  if (!why) return "";
-  return `${sentenceStart(service)} refused this message: ${why.replace(/[.!?…]+$/, "")}.`;
-}
-
-/**
- * {@link readableFailure} for the cause a 207 carries, which is always the provider's: its answer
- * (`… returned HTTP 400: …`), or the server's failure to get one (`… request failed: …`).
- */
-function readableCause(detail, service) {
-  const text = String(detail || "");
-  const status = Number((/returned HTTP (\d{3})/.exec(text) || [])[1]) || 0;
-  if (status && status < 500 && status !== 408) return providerWords(text);
-  if (!status && /request failed/i.test(text) && !SLOW_WORDS.test(text)) {
-    return `${sentenceStart(service)} could not be reached right now.`;
-  }
-  return readableFailure(Object.assign(new Error(text), { status: status || 502, detail: text }), service);
 }
 
 function stopOutgoingSends() {
@@ -35197,19 +35126,6 @@ function browserSpeechChunks(text) {
   return chunks;
 }
 
-function browserSpeechFailure(error) {
-  if (error === "start-timeout" || error === "speech-timeout") {
-    return "The device voice stopped responding. Tap the message again to restart it.";
-  }
-  if (error === "not-allowed") {
-    return "Device speech was blocked. Tap the message again to allow playback.";
-  }
-  if (error === "voice-unavailable" || error === "language-unavailable") {
-    return "The device voice is unavailable. Download a voice in Android Text-to-speech settings, then tap again.";
-  }
-  return "The device voice could not read that message. Check your media volume and installed voices, then tap again.";
-}
-
 // --- where a read's message is drawn: `#540 read-aloud-desktop` ----------------------------------
 //
 // The owner, 2026-10-26, on a desk: in the thread list the device voice said the message "wasn't
@@ -39702,12 +39618,6 @@ function countSearchWalk(walk) {
 function searchWalkProgress(walk) {
   return walk.arrived > 0
     ? `Fetching… ${walk.arrived} older message${walk.arrived === 1 ? "" : "s"} · Stop` : "Fetching older messages… · Stop";
-}
-
-/** What a failed read of older messages said went wrong, for a sentence: the server's own words where it gave some. */
-function failureWords(error) {
-  const said = error && typeof error === "object" ? String(error.detail || error.message || "") : String(error || "");
-  return said.trim().replace(/[.\s]+$/, "") || "no reason was given";
 }
 
 /**
@@ -44732,17 +44642,6 @@ let serverCacheSending = null;
 /** The erasing act the owner is being asked about — "off" or "erase" — or null. */
 let serverCacheAsking = null;
 
-/** The server's codes for a cache that should be open and is not, in the reader's words. */
-const SERVER_CACHE_TROUBLE = {
-  switch_unreadable: "the switch it keeps beside its store could not be read",
-  switch_unwritable: "the switch it keeps beside its store could not be written",
-  sqlite_unsupported: "its SQLite lacks something the file needs",
-  foreign_file: "a file it did not make is where the file should be",
-  locked: "another process holds the file",
-  filesystem: "the file or its directory could not be made, or is not private",
-  sqlite: "SQLite could not open the file",
-};
-
 /** What the line says while a request is out. */
 const SERVER_CACHE_SENDING = {
   on: "Turning it on…",
@@ -44764,28 +44663,6 @@ const SERVER_CACHE_ASK = {
   },
 };
 
-/** The server's megabyte, as its limit counts one. */
-const MEBIBYTE = 1024 * 1024;
-
-/** A count with its thousands marked, in the page's fixed English: 1,200. */
-const groupedCount = (n) => String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
-
-/** `n` and its noun, singular for exactly one. */
-const nounCount = (n, noun) => `${groupedCount(n)} ${noun}${n === 1 ? "" : "s"}`;
-
-/**
- * Bytes in the unit the limit beside them uses: megabytes, or kilobytes below one.
- *
- * @param {number} bytes
- */
-function cacheSize(bytes) {
-  if (bytes >= MEBIBYTE) return `${(bytes / MEBIBYTE).toFixed(1)} MB`;
-  return `${bytes === 0 ? 0 : Math.max(1, Math.ceil(bytes / 1024))} KB`;
-}
-
-/** `max_days` when the server keeps every day: a full history with no age limit. `#595 cache-full-history`. */
-const SERVER_CACHE_NO_AGE_LIMIT = 65535;
-
 /**
  * Whether the server says it holds every message of every channel it caches back to its beginning,
  * so of the one on screen too. The status counts channels and never names one, so a server still
@@ -44795,70 +44672,6 @@ function serverHoldsWholeHistory() {
   const history = serverCache && serverCache.available ? serverCache.history : null;
   return Boolean(history && history.mode === "full" && history.channels > 0 &&
     history.complete === history.channels);
-}
-
-/**
- * What the line under the switch says of how much history the server gathers: with a full history,
- * how many channels it holds whole, how far back the walk still under way has reached, and that it
- * waits when the size limit is near. Empty for the recent days alone. `#595 cache-full-history`.
- *
- * @param {VibeTalk.MessageCacheStatus} status
- */
-function serverCacheHistory(status) {
-  const history = status.history;
-  if (!history || history.mode !== "full") return "";
-  const whole = history.channels > 0 && history.complete === history.channels
-    ? " Complete history of every channel."
-    : ` Complete history of ${history.complete} of ${nounCount(history.channels, "channel")}.`;
-  const reached = history.reached ? new Date(history.reached) : null;
-  const going = reached && !Number.isNaN(reached.getTime())
-    ? ` Gathering older messages, back to ${dayLabel(reached)} so far.`
-    : "";
-  const paused = history.paused === "storage" ? " Gathering waits: the size limit is nearly reached." : "";
-  return `${whole}${going}${paused}`;
-}
-
-/**
- * The one line under the switch: what the server holds, or why it holds nothing.
- *
- * @param {VibeTalk.MessageCacheStatus} status
- */
-function serverCacheLine(status) {
-  if (status.reason === "config_disabled") {
-    return "Off in this server's configuration; only its operator can turn it on.";
-  }
-  if (!status.enabled) {
-    return status.reason === "switched_off"
-      ? "Off: you turned it off, and its file was erased. Turn it on to start again with an empty file."
-      : "Off.";
-  }
-  if (!status.available) {
-    const why = SERVER_CACHE_TROUBLE[status.reason];
-    return `On, but no file is open, so nothing is being saved${why ? `: ${why}` : ""}.`;
-  }
-  const limits = status.max_days === SERVER_CACHE_NO_AGE_LIMIT
-    ? `It keeps every day, up to ${status.max_megabytes} MB.`
-    : `It keeps at most ${nounCount(status.max_days, "day")} and ${status.max_megabytes} MB.`;
-  if (status.messages === 0) return `On, and nothing is saved yet. ${limits}`;
-  const held =
-    `On: ${nounCount(status.messages, "message")} from ${nounCount(status.channels, "channel")}, ` +
-    `${cacheSize(status.bytes)}.`;
-  // Proven whole from there in at least one channel: not a claim that everything since is held.
-  const since = status.oldest_covered ? new Date(status.oldest_covered) : null;
-  const whole =
-    since && !Number.isNaN(since.getTime()) ? ` Complete in places back to ${dayLabel(since)}.` : "";
-  return `${held}${whole}${serverCacheHistory(status)} ${limits}`;
-}
-
-/**
- * What an erasing act would erase, as its question names it.
- *
- * @param {VibeTalk.MessageCacheStatus} status
- */
-function serverCacheErases(status) {
-  if (!status.available) return "any file it left";
-  if (status.messages === 0) return "its file";
-  return `the ${nounCount(status.messages, "saved message")} (${cacheSize(status.bytes)})`;
 }
 
 /**
@@ -54636,121 +54449,6 @@ function upstreamClearOffered(id) {
   return provider ? provider.upstream_clear_supported === true : deploymentCapabilities.upstreamClear;
 }
 
-/** A millisecond instant as the reader's short local time. */
-function upstreamClearClock(ms) {
-  return typeof ms === "number" && Number.isFinite(ms) ? shortTimeFormat().format(new Date(ms)) : "";
-}
-
-/** An instant the provider wrote, as the reader's short local time, or as written if unreadable. */
-function upstreamClearCursor(text) {
-  const at = Date.parse(String(text || ""));
-  return Number.isFinite(at) ? upstreamClearClock(at) : String(text || "");
-}
-
-/**
- * The status line: what the server last did for this channel, or what it will do next.
- *
- * @param {VibeTalk.UpstreamClearState} view
- * @param {string} service
- */
-function upstreamClearSentence(view, service) {
-  if (view.unavailable) {
-    return `Not available for this channel: ${view.unavailable}.`;
-  }
-  const last = view.last || null;
-  const pushed = view.pushed || null;
-  const undo = view.previous_cursor
-    ? ` Before vibe-talk first marked it, ${service}'s read marker was at ` +
-      `${upstreamClearCursor(view.previous_cursor)}.`
-    : "";
-  const through = pushed
-    ? `vibe-talk marked it read in ${service} through the message from ` +
-      `${upstreamClearClock(pushed.message_at_ms)}, at ${upstreamClearClock(pushed.at_ms)}.`
-    : "";
-  if (view.mode === "off") {
-    return pushed ? `Off. Earlier, ${through}${undo}` : `Off. Nothing here is marked read in ${service}.`;
-  }
-  if (last && last.result === "failed") {
-    const retry = view.retry_at_ms ? ` Trying again at ${upstreamClearClock(view.retry_at_ms)}.` : "";
-    return `Failing since ${upstreamClearClock(last.at_ms)}: ${last.error || "the chat service did not answer"}.${retry}`;
-  }
-  const waiting = view.pending ? " A newer message is waiting to be marked." : "";
-  if (view.mode === "dry_run") {
-    if (last && last.result === "dry_run") {
-      return `Dry run: would mark it read in ${service} through the message from ` +
-        `${upstreamClearClock(last.message_at_ms)}. Nothing was written.${waiting}`;
-    }
-    return `Dry run. The server logs what it would mark read in ${service} and writes nothing.${waiting}`;
-  }
-  if (last && last.result === "skipped" && !pushed) {
-    return `On. The newest message had already left the bridge's memory; the next one is marked.${waiting}`;
-  }
-  if (pushed) return `On. ${through}${waiting}${undo}`;
-  return view.pending
-    ? `On. The newest message, and everything before it, is marked read in ${service} shortly.`
-    : `On. When the next message arrives here, it and everything before it are marked read in ${service}.`;
-}
-
-/**
- * The status line after "Mark read now" (or "Try it now"): what the press came to.
- * `#253 upstream-clear-polish`.
- *
- * What the push did is said from `answer.attempt`, the attempt that answered THIS press, and never
- * from `state.last`, which a later push may already have replaced: "Done" only for a push the
- * service took, a failure as a failure, and a setting changed meanwhile as that.
- *
- * @param {VibeTalk.UpstreamClearNowResponse} answer
- * @param {string} service
- */
-function upstreamClearNowSentence(answer, service) {
-  const view = answer.state;
-  const attempt = answer.attempt || null;
-  const last = view.last || null;
-  const dryRun = view.mode === "dry_run";
-  switch (answer.outcome) {
-    case "pushed":
-      if (!attempt) break;
-      if (attempt.result === "advanced") {
-        return `Done: marked read in ${service} through the message from ${upstreamClearClock(attempt.message_at_ms)}.`;
-      }
-      if (attempt.result === "already_read") {
-        return `Done: ${service} already had it read through the message from ` +
-          `${upstreamClearClock(attempt.message_at_ms)}, so nothing needed moving.`;
-      }
-      if (attempt.result === "dry_run") {
-        return `Dry run: would mark it read in ${service} through the message from ` +
-          `${upstreamClearClock(attempt.message_at_ms)}. Nothing was written.`;
-      }
-      break;
-    case "failed": {
-      const why = attempt && attempt.error ? attempt.error : `${service} did not answer`;
-      const when = view.retry_at_ms ? ` It is tried again by itself at ${upstreamClearClock(view.retry_at_ms)}.` : "";
-      return `Not done: the push failed: ${why}.${when}`;
-    }
-    case "skipped":
-      return "Nothing was marked: the bridge no longer holds the newest message. The next message that arrives is marked.";
-    case "changed":
-      return `Not finished: this channel's setting changed while the push was on its way. ${upstreamClearSentence(view, service)}`;
-    case "covered":
-      return dryRun
-        ? "Nothing newer to try: the dry run already covered the newest message here. Nothing was written."
-        : `Nothing newer to mark: the newest message here is already marked read in ${service}.`;
-    case "no_message":
-      return dryRun ? "There is no message here to try it on yet." : "There is no message here to mark read yet.";
-    case "waiting":
-      return `Still waiting for ${service} to answer. The server carries on without this page, ` +
-        "and this line shows what it came to when it does.";
-    case "retry_waiting": {
-      const why = last && last.result === "failed" && last.error ? ` (${last.error})` : "";
-      const when = view.retry_at_ms ? `, at ${upstreamClearClock(view.retry_at_ms)}` : "";
-      return `Not sent yet: the last try failed${why}, so the newest message goes with the next one${when}.`;
-    }
-    default:
-      break;
-  }
-  return upstreamClearSentence(view, service);
-}
-
 /** One recorded attempt, as a key that changes when a newer attempt replaces it. */
 function upstreamClearAttemptKey(attempt) {
   return attempt ? `${attempt.at_ms} ${attempt.message_id} ${attempt.result}` : "";
@@ -55093,70 +54791,6 @@ function channelHistoryOffered(id) {
 
 /** The server's modes, as the default choice names them. */
 const CHANNEL_HISTORY_MODE_WORDS = { recent: "recent days", full: "whole history", off: "none" };
-
-/** Why the server's reads of a chat service are paused, in words. */
-const CHANNEL_HISTORY_HOLD_WORDS = {
-  rate_limited: "the chat service asked for fewer requests",
-  upstream_error: "the chat service failed a read",
-  provider_signal: "the chat service is limiting requests",
-  storage: "the saved copy is near its size limit",
-};
-
-/** A span of seconds as a reader says it: "a minute", "12 minutes", "about 3 hours", "about 2 days". */
-function channelHistoryDuration(seconds) {
-  if (!(seconds >= 90)) return "a minute";
-  const minutes = Math.round(seconds / 60);
-  if (minutes < 90) return nounCount(minutes, "minute");
-  const hours = Math.round(seconds / 3600);
-  if (hours < 48) return `about ${nounCount(hours, "hour")}`;
-  return `about ${nounCount(Math.round(hours / 24), "day")}`;
-}
-
-/** A server instant as a day, or "" when absent. */
-function channelHistoryDay(ms) {
-  return typeof ms === "number" && Number.isFinite(ms) ? dayLabel(new Date(ms)) : "";
-}
-
-/**
- * What the line under the choice says: what is saved, how complete it is, how the walk into older
- * messages is going and when it should end, the queue, and why it is paused.
- *
- * @param {VibeTalk.ChannelHistoryState} view
- */
-function channelHistorySentence(view) {
-  if (view.mode === "off") return "This server gathers no history in the background.";
-  const parts = [];
-  if (view.messages === 0) {
-    parts.push("Nothing of this channel is saved yet.");
-  } else {
-    const oldest = channelHistoryDay(view.oldest_ms);
-    parts.push(`${nounCount(view.messages, "message")} saved${oldest ? `, back to ${oldest}` : ""}.`);
-  }
-  if (view.complete) parts.push("Complete: every message back to the channel's beginning.");
-  if (view.walking) {
-    const reached = channelHistoryDay(view.reached_ms);
-    const pace = typeof view.pages_per_hour === "number" ? ` at ${view.pages_per_hour} pages an hour` : "";
-    const left = typeof view.eta_s === "number" ? channelHistoryDuration(view.eta_s) : "";
-    const eta = left
-      ? ` ${left.charAt(0).toUpperCase()}${left.slice(1)} to go.`
-      : view.complete ? "" : " How long it takes is known once a walk has reached the beginning.";
-    parts.push(`Reading older messages${reached ? `, back to ${reached} so far` : ""}${pace}.${eta}`);
-  } else if (view.mode === "full" && !view.complete) {
-    parts.push("Older messages are read a page at a time while nothing else is reading.");
-  }
-  if (view.queue_position === 0) parts.push("Asked for: it is read next.");
-  else if (typeof view.queue_position === "number") {
-    parts.push(`Asked for: ${nounCount(view.queue_position, "channel")} ahead of it.`);
-  }
-  if (view.held_reason) {
-    const why = CHANNEL_HISTORY_HOLD_WORDS[view.held_reason] || "it is holding off";
-    const left = typeof view.held_until_ms === "number"
-      ? ` for ${channelHistoryDuration(Math.max(0, (view.held_until_ms - view.now_ms) / 1000))}`
-      : "";
-    parts.push(`Paused${left}: ${why}.`);
-  }
-  return parts.join(" ");
-}
 
 /** Whether Save would change anything: a choice other than the server's. */
 function channelHistoryChanged() {

@@ -211,7 +211,7 @@ test("a position in the minified files maps back to the line of the source it ca
   const probes = [
     [SCRIPT_PATH, MANIFEST.assets.script.map, "voice.js", `const ${FIRST_CONST}=`],
     [SCRIPT_PATH, MANIFEST.assets.script.map, "voice.js", "const PAGE_BUILD="],
-    [SCRIPT_PATH, MANIFEST.assets.script.map, "voice.js", "function fmtDuration("],
+    [SCRIPT_PATH, MANIFEST.assets.script.map, "voice.js", "function sendTimingText("],
     [SCRIPT_PATH, MANIFEST.assets.script.map, "src/contract/validators.js", "function decodeTagged("],
     [STYLE_PATH, MANIFEST.assets.style.map, "voice.css", ".send-tick{"],
     [STYLE_PATH, MANIFEST.assets.style.map, "style.css", "body{"],

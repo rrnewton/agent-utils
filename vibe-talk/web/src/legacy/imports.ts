@@ -199,6 +199,22 @@ export {
   shortTimeFormat,
   stamp,
 } from "../present/time/index.ts";
+export {
+  SERVER_CACHE_NO_AGE_LIMIT,
+  browserSpeechFailure,
+  channelHistorySentence,
+  failureWords,
+  fmtDuration,
+  nounCount,
+  readableCause,
+  refusalSentence,
+  refusalWords,
+  serverCacheErases,
+  serverCacheLine,
+  serviceEndedSentence,
+  upstreamClearNowSentence,
+  upstreamClearSentence,
+} from "../present/notices/index.ts";
 
 import { decode, decodeTagged, is, roots } from "../contract/index.ts";
 
