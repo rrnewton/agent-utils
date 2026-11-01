@@ -303,8 +303,7 @@ pub fn group_window(
 /// An instant as ET wall time: `2026-10-30 09:41 ET`.
 #[must_use]
 pub fn et_label(ms: i64) -> String {
-    let zone =
-        jiff::tz::TimeZone::get("America/New_York").unwrap_or_else(|_| jiff::tz::TimeZone::UTC);
+    let zone = jiff::tz::TimeZone::get("America/New_York").unwrap_or(jiff::tz::TimeZone::UTC);
     jiff::Timestamp::from_millisecond(ms).map_or_else(
         |_| format!("{ms}"),
         |instant| format!("{} ET", instant.to_zoned(zone).strftime("%Y-%m-%d %H:%M")),
@@ -316,8 +315,8 @@ fn message_et(message: &Message) -> String {
     message.created_ms().map_or_else(
         || message.timestamp.clone(),
         |ms| {
-            let zone = jiff::tz::TimeZone::get("America/New_York")
-                .unwrap_or_else(|_| jiff::tz::TimeZone::UTC);
+            let zone =
+                jiff::tz::TimeZone::get("America/New_York").unwrap_or(jiff::tz::TimeZone::UTC);
             jiff::Timestamp::from_millisecond(ms).map_or_else(
                 |_| message.timestamp.clone(),
                 |instant| format!("{} ET", instant.to_zoned(zone).strftime("%Y-%m-%d %H:%M")),
@@ -877,6 +876,20 @@ async fn message_ms(
     )
 }
 
+/// Percent-encode one URL path segment.
+fn urlencoding(segment: &str) -> String {
+    let mut out = String::with_capacity(segment.len());
+    for byte in segment.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1056,18 +1069,4 @@ mod tests {
         assert_eq!(options.hours, Some(12));
         assert!(options.json);
     }
-}
-
-/// Percent-encode one URL path segment.
-fn urlencoding(segment: &str) -> String {
-    let mut out = String::with_capacity(segment.len());
-    for byte in segment.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(byte as char)
-            }
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
 }
