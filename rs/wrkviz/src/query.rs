@@ -453,6 +453,7 @@ pub struct Timeline {
     collections: RefCell<BTreeMap<&'static str, Vec<Map<String, Value>>>>,
     spine_groups: RefCell<BTreeMap<(String, String), Vec<Map<String, Value>>>>,
     stream_records: RefCell<BTreeMap<String, Vec<Map<String, Value>>>>,
+    ref_tables: RefCell<BTreeMap<(String, String), BTreeMap<String, Map<String, Value>>>>,
 }
 
 fn record_array(source: &Map<String, Value>, key: &str) -> Result<Vec<Map<String, Value>>, String> {
@@ -530,6 +531,7 @@ impl Timeline {
             collections: RefCell::new(BTreeMap::new()),
             spine_groups: RefCell::new(BTreeMap::new()),
             stream_records: RefCell::new(BTreeMap::new()),
+            ref_tables: RefCell::new(BTreeMap::new()),
         })
     }
 
@@ -2429,6 +2431,12 @@ impl Timeline {
                     "phase" => phase_ref,
                     _ => rollup_ref,
                 };
+                let table_key = (kind.to_string(), team.to_string());
+                if let Some(table) = self.ref_tables.borrow().get(&table_key) {
+                    return Ok(table
+                        .get(reference)
+                        .map(|record| (kind.to_string(), record.clone())));
+                }
                 let mut bounds = std::collections::BTreeMap::new();
                 for record in self.spine_group(three, "activity_bounds", team)? {
                     let where_ = format!("{team} activity bounds");
@@ -2449,26 +2457,26 @@ impl Timeline {
                 }
                 // Python's refs() builds the whole team table,
                 // so any duplicate reference in it refuses.
-                let mut seen = std::collections::BTreeSet::new();
-                let mut table_entry = None;
+                let mut table: BTreeMap<String, Map<String, Value>> = BTreeMap::new();
                 for record in self.spine_group(three, kind_name, team)? {
                     let found_ref = reference_of(&record, kind)?;
-                    if !seen.insert(found_ref.clone()) {
+                    let mut merged = record.clone();
+                    if let Some((start, end)) = bounds.get(&found_ref) {
+                        merged.insert("activity_start_ms".to_string(), Value::from(*start));
+                        merged.insert("activity_end_ms".to_string(), Value::from(*end));
+                    }
+                    if table.insert(found_ref.clone(), merged).is_some() {
                         return Err(format!(
                             "duplicate stable reference {}",
                             py_repr(&Value::String(found_ref))
                         ));
                     }
-                    if found_ref == reference {
-                        let mut merged = record.clone();
-                        if let Some((start, end)) = bounds.get(&found_ref) {
-                            merged.insert("activity_start_ms".to_string(), Value::from(*start));
-                            merged.insert("activity_end_ms".to_string(), Value::from(*end));
-                        }
-                        table_entry = Some((kind.to_string(), merged));
-                    }
                 }
-                Ok(table_entry)
+                let entry = table
+                    .get(reference)
+                    .map(|record| (kind.to_string(), record.clone()));
+                self.ref_tables.borrow_mut().insert(table_key, table);
+                Ok(entry)
             }
             Generation::One(_) => {
                 let mut entries: Vec<(String, String, Map<String, Value>)> = Vec::new();
