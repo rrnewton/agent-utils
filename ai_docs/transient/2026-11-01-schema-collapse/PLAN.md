@@ -43,3 +43,7 @@ mirror validates against it, differentials unchanged in behaviour.
 ## Non-goals for the first slice
 - No format version bumps; schemas describe current wire format.
 - No default flips, no publishing, no parallel-experiment-runner.
+
+## Status
+Slice 1 (agent-queue) implemented as above; slices 2-5 pending
+coordinator direction after slice 1 lands.

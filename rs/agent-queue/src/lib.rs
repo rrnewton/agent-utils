@@ -70,9 +70,9 @@
 //! come first, by name. A drain takes every `*.json` file in `inbox/`, whoever wrote it, so a
 //! file name outside the identifier rules can still reach `failed/`.
 //!
-//! **Item fields.** Required: `text` (nonempty string). Written at enqueue: `id`, `queued_at`
+//! **Item fields.** The item, tombstone and quarantine sidecar are defined once by the types in [`crate::schema`], from which the checked-in JSON Schemas are generated; other-language mirrors validate against those schemas in their tests. Required: `text` (nonempty string). Written at enqueue: `id`, `queued_at`
 //! (Unix seconds, fractional) and `delivery_attempts` (0). A drainer may add `delivery_state`
-//! (`pending`, `inflight`, `processed`), `delivery_error`, `delivery_blocked_at`,
+//! (`pending`, `inflight`, `processed`, `cancelled`), `delivery_error`, `delivery_blocked_at`,
 //! `possibly_submitted`, `inflight_at`, `paste_tracking`, `inflight_from`, `paste_started_at`,
 //! `confirmed_at`, `delivery_failed_at`,
 //! `delivery_attempts` and its alias `tui_delivery_attempts`, `misroutes` (array of
@@ -118,5 +118,6 @@ pub mod fsio;
 pub mod identity;
 pub mod queue;
 pub mod registry;
+pub mod schema;
 
 pub use error::{Error, ErrorKind, Result};

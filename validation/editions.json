@@ -238,12 +238,12 @@
   "formats": [
     {
       "name": "agent queue items and cancel tombstones",
-      "schema_id": "directory layout (no schema string)",
-      "rust_definition": "rs/agent-queue/src/queue.rs (MessageState, Lane, QueueDirectories)",
+      "schema_id": "agent-queue-item/v1 (generated JSON Schema, draft 2020-12)",
+      "rust_definition": "rs/agent-queue/src/schema.rs (QueueItem, Tombstone, QuarantineSidecar)",
       "python_definition": "py/agentctl/sessions.py and queue readers hand-build the same paths",
-      "generated_schema": null,
-      "duplicate": "yes: layout defined in Rust types and re-derived in Python",
-      "collapse": "Define queue item JSON in rs/agent-queue with schemars; generate JSON Schema under validation/schemas/; Python validates against it."
+      "generated_schema": "validation/schemas/queue-item.schema.json, validation/schemas/tombstone.schema.json, validation/schemas/quarantine-sidecar.schema.json",
+      "duplicate": "collapsed for the item, tombstone and quarantine sidecar: one Rust type each, generated schema checked in, Python validates in tests (py/tests/test_agent_queue_schema.py); the directory layout stays defined by rs/agent-queue/src/queue.rs constants",
+      "collapse": "Done in #723 slice 1: schemars types in rs/agent-queue generate the schemas; scripts/check_agent_queue_schemas.py regenerates and diffs in validation. Target binding (target.json) stays with its agentctl slice."
     },
     {
       "name": "registry record (agent.json / native session)",

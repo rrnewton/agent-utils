@@ -417,12 +417,8 @@ fn duplicate(identifier: &str) -> Error {
 /// The document of the most common item: `id`, `text`, `queued_at` and `delivery_attempts`.
 #[must_use]
 pub fn plain_item(identifier: &str, text: &str) -> Value {
-    json!({
-        "id": identifier,
-        "text": text,
-        "queued_at": unix_seconds(),
-        "delivery_attempts": 0,
-    })
+    serde_json::to_value(crate::schema::QueueItem::plain(identifier, text))
+        .expect("plain queue item serializes")
 }
 
 /// Locate one message identifier without scanning a queue directory.
@@ -579,12 +575,17 @@ pub fn failed_metadata(failed_path: &Path, outcome: &str, error: &str) -> Result
         .ok_or_else(|| Error::invalid("failed artifact name is not valid UTF-8"))?;
     atomic_json(
         &failed_path.with_file_name(format!("{filename}.error")),
-        &json!({
-            "artifact": filename,
-            "outcome": outcome,
-            "error": error,
-            "failed_at": unix_seconds(),
-        }),
+        &serde_json::to_value(crate::schema::QuarantineSidecar {
+            artifact: filename.to_owned(),
+            outcome: if outcome == "invalid_message" {
+                crate::schema::QuarantineOutcome::InvalidMessage
+            } else {
+                crate::schema::QuarantineOutcome::PossiblySubmitted
+            },
+            error: error.to_owned(),
+            failed_at: unix_seconds(),
+        })
+        .expect("quarantine sidecar serializes"),
     )
 }
 
@@ -813,7 +814,12 @@ pub fn cancel(root: &Path, message_id: &str, reason: &str) -> Result<CancelOutco
     }
     prepare_lane(root, &directories.cancel)?;
     let path = directories.cancel.join(format!("{message_id}.json"));
-    let tombstone = json!({"id": message_id, "reason": reason, "cancelled_at": unix_seconds()});
+    let tombstone = serde_json::to_value(crate::schema::Tombstone {
+        id: message_id.to_owned(),
+        reason: reason.to_owned(),
+        cancelled_at: unix_seconds(),
+    })
+    .expect("queue tombstone serializes");
     match atomic_json_create(&path, &tombstone) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}

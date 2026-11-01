@@ -1,0 +1,288 @@
+{
+  "$defs": {
+    "CancelReason": {
+      "description": "Why an item was set aside in `cancelled/`.",
+      "oneOf": [
+        {
+          "const": "cancelled",
+          "description": "A tombstone named the item.",
+          "type": "string"
+        },
+        {
+          "const": "expired",
+          "description": "Its `not_after` deadline passed.",
+          "type": "string"
+        }
+      ]
+    },
+    "DeliveryState": {
+      "description": "Delivery state recorded on an item as it moves through the queue.",
+      "oneOf": [
+        {
+          "const": "pending",
+          "description": "Written when an item returns to a pending lane.",
+          "type": "string"
+        },
+        {
+          "const": "inflight",
+          "description": "Past the at-most-once barrier.",
+          "type": "string"
+        },
+        {
+          "const": "processed",
+          "description": "Delivery confirmed.",
+          "type": "string"
+        },
+        {
+          "const": "cancelled",
+          "description": "Set aside untyped: cancelled or expired.",
+          "type": "string"
+        }
+      ]
+    },
+    "Misroute": {
+      "description": "One recorded delivery misroute.",
+      "properties": {
+        "at": {
+          "description": "Unix seconds of the misroute.",
+          "format": "double",
+          "type": "number"
+        },
+        "error": {
+          "description": "What went wrong.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "at",
+        "error"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "description": "A queue item: the JSON object in one phase file of a queue.\n\nOnly `text` is required. The writers in [`crate::queue`] add `id`,\n`queued_at` and `delivery_attempts` at enqueue; drainers add the\ndelivery fields. Sender fields not listed here are allowed and\nignored by readers, so the schema allows additional properties.",
+  "properties": {
+    "cancel_detail": {
+      "description": "Detail for the set-aside.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "cancel_reason": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/CancelReason"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Why the item was set aside, when it was."
+    },
+    "cancelled_at": {
+      "description": "Unix seconds when the item was set aside.",
+      "format": "double",
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "confirmed_at": {
+      "description": "Unix seconds when delivery was confirmed.",
+      "format": "double",
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "delivery_attempts": {
+      "description": "How many delivery attempts have been made.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "delivery_blocked_at": {
+      "description": "Unix seconds when delivery was found blocked.",
+      "format": "double",
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "delivery_error": {
+      "description": "The last delivery error, when one was recorded.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "delivery_failed_at": {
+      "description": "Unix seconds when delivery failed.",
+      "format": "double",
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "delivery_state": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/DeliveryState"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The item's delivery state, when a drainer has recorded one."
+    },
+    "draft_recovered_at": {
+      "description": "Unix seconds when an unsent draft was recovered.",
+      "format": "double",
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "draft_recovered_evidence": {
+      "description": "How a recovered draft was evidenced.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "id": {
+      "description": "The message identifier; equals the file name without `.json`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "inflight_at": {
+      "description": "Unix seconds when the item entered `inflight/`.",
+      "format": "double",
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "inflight_from": {
+      "description": "The lane the item entered `inflight/` from.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "misroutes": {
+      "description": "Recorded misroutes.",
+      "items": {
+        "$ref": "#/$defs/Misroute"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "not_after": {
+      "description": "Unix time in milliseconds after which no drainer types the\nitem; only an `inbox.v2` item may carry one. `null` is none.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "opening": {
+      "description": "Opening text recorded by a sender.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "paste_started_at": {
+      "description": "Unix seconds immediately before the first terminal input.",
+      "format": "double",
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "paste_tracking": {
+      "description": "Whether a tracking drainer stamped the item at the barrier.",
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "possibly_submitted": {
+      "description": "Whether the item may have been typed already.",
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "probable_misroute": {
+      "description": "Whether the item probably reached the wrong terminal.",
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "queued_at": {
+      "description": "Unix seconds, fractional, when the item was queued.",
+      "format": "double",
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "sent_at": {
+      "description": "Original send time recorded by a sender, in its own units."
+    },
+    "text": {
+      "description": "The prompt text; never empty.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "tui_delivery_attempts": {
+      "description": "Alias of `delivery_attempts` written by some drainers.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "tui_delivery_error": {
+      "description": "Last terminal-delivery error recorded by a drainer.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "tui_delivery_failed_at": {
+      "description": "When terminal delivery last failed, as an ISO timestamp.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "typed_as": {
+      "description": "The text actually typed, when it is not `text`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "text"
+  ],
+  "title": "QueueItem",
+  "type": "object"
+}

@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "A cancellation tombstone: `cancel/<id>.json`.",
+  "properties": {
+    "cancelled_at": {
+      "description": "Unix seconds when it was cancelled.",
+      "format": "double",
+      "type": "number"
+    },
+    "id": {
+      "description": "The message identifier not to type.",
+      "type": "string"
+    },
+    "reason": {
+      "description": "Why it was cancelled.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "id",
+    "reason",
+    "cancelled_at"
+  ],
+  "title": "Tombstone",
+  "type": "object"
+}

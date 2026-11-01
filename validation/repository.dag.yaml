@@ -66,6 +66,34 @@ steps:
       rss_baseline_bytes: 134217728
 
   - group: hygiene
+    job: agent-queue-schemas-self-test
+    desc: prove the agent-queue schema guard can fail
+    cmd: python3 scripts/check_agent_queue_schemas.py --self-test
+    jobs_flag: ""
+    labels: [validation-hygiene]
+    timeout: 600
+    cpu_timeout: 1200
+    hint:
+      resources: {cargo-target: 1}
+      est_duration_s: 60
+      classification: cpu-bound
+      rss_baseline_bytes: 1073741824
+
+  - group: hygiene
+    job: agent-queue-schemas
+    desc: generated agent-queue schemas match their Rust types
+    cmd: python3 scripts/check_agent_queue_schemas.py
+    jobs_flag: ""
+    labels: [validation-hygiene]
+    timeout: 600
+    cpu_timeout: 1200
+    hint:
+      resources: {cargo-target: 1}
+      est_duration_s: 60
+      classification: cpu-bound
+      rss_baseline_bytes: 1073741824
+
+  - group: hygiene
     job: case-timings
     desc: normalized per-case timing adapters and inventory verifier can fail
     cmd: python3 scripts/case_timings.py --self-test

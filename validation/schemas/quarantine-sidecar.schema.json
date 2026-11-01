@@ -1,0 +1,48 @@
+{
+  "$defs": {
+    "QuarantineOutcome": {
+      "description": "Outcome recorded in a quarantine sidecar.",
+      "oneOf": [
+        {
+          "const": "possibly_submitted",
+          "description": "The item may have been typed; never replay it.",
+          "type": "string"
+        },
+        {
+          "const": "invalid_message",
+          "description": "The item is not a valid queue item.",
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The quarantine sidecar `failed/<id>.json.error`.",
+  "properties": {
+    "artifact": {
+      "description": "The failed item's file name.",
+      "type": "string"
+    },
+    "error": {
+      "description": "What went wrong.",
+      "type": "string"
+    },
+    "failed_at": {
+      "description": "Unix seconds when it was quarantined.",
+      "format": "double",
+      "type": "number"
+    },
+    "outcome": {
+      "$ref": "#/$defs/QuarantineOutcome",
+      "description": "Why it was quarantined."
+    }
+  },
+  "required": [
+    "artifact",
+    "outcome",
+    "error",
+    "failed_at"
+  ],
+  "title": "QuarantineSidecar",
+  "type": "object"
+}

@@ -30,6 +30,11 @@ aside in `cancelled/` untyped. These directories exist only once something used
 them, so a drainer that knows only the first four can tell a queue it must not
 touch.
 
+The queue item, cancellation tombstone and quarantine sidecar formats are
+defined once by the types in `src/schema.rs`; the JSON Schemas generated
+from them are checked in under `validation/schemas/` in the source
+repository, and other languages validate against those schemas.
+
 Typing into a terminal, readiness checks and cross-queue typist locks belong to
 the program that drains the queue. The crate documentation describes the
 on-disk format in full.
