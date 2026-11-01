@@ -387,6 +387,29 @@ generated-schema collapse.
   occupancy/process-census reason classes), with differential
   `test_audit_live_lane_exhausted_cache_not_unknown_matches_python`
   passing (1 passed, 64.85s on `bccfa0ad`).
-- Remaining composites: discover-agents, `--userguide`,
-  multi-team export; then the edition switch at parity and the
+- `discover-agents` ported: `rs/wrkviz/src/discover.rs`
+  reconstructs the agent tree from coordinator logs and
+  agent-manager registries across the Claude, Codex, Muse, and
+  Orc sources, with the Markdown report and the JSON report
+  (file and stdout forms) at byte parity, including the
+  oracle's quirks kept rather than fixed: CPython truthiness
+  of recorded names and start instants (an Orc name of `0`,
+  `0.0`, `""`, or `b""` is replaced by a matched registry or
+  queue name), dict-key collapse of identical registry
+  records in `resolved`, non-string Orc names emitted raw in
+  JSON and as `str()` in Markdown, and argparse's top-level
+  reporting of unrecognized arguments. Differential:
+  `py/tests/test_wrkviz_discover_agents_rust.py` (7 cases:
+  tree report, `--json` file, `--since`, duplicate registry
+  records, source-selection flags, error surface, help and
+  argument errors), all passing; `cargo clippy -p wrkviz
+  --all-targets` clean. Adversarial review findings (launch
+  window scan width, invalid-choice wording, `--since`
+  registry requirement, duplicate-record resolution,
+  falsy-name replacement) were fixed before landing.
+  Accepted gaps, shared with the earlier wrkviz slices:
+  large-integer and NaN JSON spellings, lone surrogates, and
+  Python `re` features beyond the ported subset.
+- Remaining composites: `--userguide`, multi-team export;
+  then the edition switch at parity and the
   generated-schema collapse.

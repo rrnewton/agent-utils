@@ -34,6 +34,8 @@ pub mod cli;
 pub mod codex;
 /// Upstream sources compressed in place.
 pub mod compressed;
+/// Agent-tree discovery from coordinator logs and registries.
+pub mod discover;
 pub mod gc;
 pub mod github_enrich;
 pub mod github_metadata;

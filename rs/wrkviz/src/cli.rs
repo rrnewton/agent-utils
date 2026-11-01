@@ -383,6 +383,7 @@ pub fn run(args: &[String]) -> u8 {
         "audit-glossary" => run_audit_glossary(&args[1..]),
         "audit-losslessness" => run_audit_losslessness(&args[1..]),
         "responsiveness" => run_responsiveness(&args[1..]),
+        "discover-agents" => run_discover_agents(&args[1..]),
         other => {
             eprintln!(
                 "wrkviz: the Rust edition has not ported '{other}' yet; the Python edition remains the oracle for it"
@@ -5531,6 +5532,296 @@ fn run_audit_losslessness(args: &[String]) -> u8 {
             2
         }
     }
+}
+
+const DISCOVER_AGENTS_HELP: &str = r##"usage: wrkviz discover-agents [-h] [--home LABEL=DIR]
+                              [--claude-projects LABEL=DIR]
+                              [--codex-sessions LABEL=DIR]
+                              [--orc-root LABEL=DIR]
+                              [--muse-sessions LABEL=DIR]
+                              [--registry LABEL=DIR] --root PROVIDER:ID
+                              [--cwd-prefix PATH] [--since SINCE]
+                              [--format {markdown,json}] [--json FILE]
+
+Rebuild a project's agent tree from its coordinator sessions: native subagents (Claude Code subagent files, Codex spawned children, Orc child sessions) and lanes started with agentctl (an `agentctl ... start NAME` in a session's log, matched to the registry record and from there to the child's own log). Every session that ran under a --cwd-prefix and that no root reaches is listed as an orphan, so gaps in the links are visible. Reads only; calls no model.
+
+options:
+  -h, --help            show this help message and exit
+  --home LABEL=DIR      a host's home directory or its archived mirror;
+                        expands to whichever of .claude/projects,
+                        .codex/sessions, .orc and .local/share/muse/sessions
+                        exist under it, labelled LABEL; repeatable
+  --claude-projects LABEL=DIR
+                        a Claude Code projects directory on host LABEL;
+                        repeatable (default: none beyond --home)
+  --codex-sessions LABEL=DIR
+                        a Codex sessions directory on host LABEL; repeatable
+                        (default: none beyond --home)
+  --orc-root LABEL=DIR  a directory holding .orc/index.db on host LABEL;
+                        repeatable (default: none beyond --home)
+  --muse-sessions LABEL=DIR
+                        a Muse sessions directory on host LABEL; repeatable
+                        (default: none beyond --home)
+  --registry LABEL=DIR  an agentctl registry directory (agent records and
+                        archive/) on host LABEL; repeatable (default: none
+                        beyond --home)
+  --root PROVIDER:ID    a coordinator session, as claude:SESSION-UUID,
+                        codex:THREAD-ID, orc:SESSION-ID or muse:SESSION-ID;
+                        repeatable
+  --cwd-prefix PATH     working-directory prefix, as recorded on the host,
+                        whose sessions should all be in the tree; sessions
+                        under it that no root reaches are orphans; repeatable
+                        (default: none, so no orphans are reported)
+  --since SINCE         report only orphans started or written since this RFC
+                        3339 instant or date (default: all)
+  --format {markdown,json}
+                        report format on stdout (default: markdown)
+  --json FILE           also write the full JSON report (every tree node and
+                        orphan) to FILE (default: not written)
+
+example:
+  wrkviz discover-agents --home hostA=/archive/hostA --home hostB=/archive/hostB \
+    --registry hostA=~/project/.agentctl --cwd-prefix /home/me/project \
+    --root claude:SESSION-UUID --root codex:THREAD-ID --since 2026-10-01 \
+    --json tree.json
+"##;
+
+const DISCOVER_AGENTS_USAGE: &str = "usage: wrkviz discover-agents [-h] [--home LABEL=DIR]\n                              [--claude-projects LABEL=DIR]\n                              [--codex-sessions LABEL=DIR]\n                              [--orc-root LABEL=DIR]\n                              [--muse-sessions LABEL=DIR]\n                              [--registry LABEL=DIR] --root PROVIDER:ID\n                              [--cwd-prefix PATH] [--since SINCE]\n                              [--format {markdown,json}] [--json FILE]";
+
+fn run_discover_agents(args: &[String]) -> u8 {
+    // argparse adds -h/--help first, so it shares the
+    // abbreviation namespace with --home.
+    const OPTIONS: &[&str] = &[
+        "--help",
+        "--home",
+        "--claude-projects",
+        "--codex-sessions",
+        "--orc-root",
+        "--muse-sessions",
+        "--registry",
+        "--root",
+        "--cwd-prefix",
+        "--since",
+        "--format",
+        "--json",
+    ];
+    let mut values: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    let mut unrecognized: Vec<String> = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        // A bundled short flag whose first letter is h fires
+        // the help action, wherever it stands.
+        if !arg.starts_with("--") && arg.len() > 1 && arg[1..].starts_with('h') {
+            print!("{DISCOVER_AGENTS_HELP}");
+            return 0;
+        }
+        let (head, explicit) = match arg.split_once('=') {
+            Some((head, value)) => (head, Some(value.to_string())),
+            None => (arg.as_str(), None),
+        };
+        let candidates: Vec<String> = if head.starts_with("--") && head.len() > 2 {
+            OPTIONS
+                .iter()
+                .copied()
+                .filter(|name| *name == head || name.starts_with(head))
+                .map(str::to_string)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if head.starts_with("--") && candidates.len() > 1 && !candidates.contains(&head.to_string())
+        {
+            return argparse_error(
+                DISCOVER_AGENTS_USAGE,
+                "wrkviz discover-agents",
+                &format!(
+                    "ambiguous option: {head} could match {}",
+                    candidates.join(", ")
+                ),
+            );
+        }
+        let Some(name) = candidates.first() else {
+            unrecognized.push(arg.clone());
+            index += 1;
+            continue;
+        };
+        let name = name.clone();
+        if name == "--help" {
+            if let Some(value) = explicit {
+                return argparse_error(
+                    DISCOVER_AGENTS_USAGE,
+                    "wrkviz discover-agents",
+                    &format!("argument -h/--help: ignored explicit argument '{value}'"),
+                );
+            }
+            print!("{DISCOVER_AGENTS_HELP}");
+            return 0;
+        }
+        let value = match explicit {
+            Some(value) => value,
+            None => {
+                index += 1;
+                match args.get(index) {
+                    Some(value)
+                        if !(value.len() > 1
+                            && value.starts_with('-')
+                            && !value[1..].starts_with(|ch: char| ch.is_ascii_digit())) =>
+                    {
+                        value.clone()
+                    }
+                    _ => {
+                        return argparse_error(
+                            DISCOVER_AGENTS_USAGE,
+                            "wrkviz discover-agents",
+                            &format!("argument {name}: expected one argument"),
+                        )
+                    }
+                }
+            }
+        };
+        if name == "--format" && value != "markdown" && value != "json" {
+            return argparse_error(
+                DISCOVER_AGENTS_USAGE,
+                "wrkviz discover-agents",
+                &format!(
+                    "argument --format: invalid choice: '{value}' (choose from markdown, json)"
+                ),
+            );
+        }
+        values.entry(name).or_default().push(value);
+        index += 1;
+    }
+    let get = |name: &str| values.get(name).and_then(|items| items.last()).cloned();
+    let all = |name: &str| values.get(name).cloned().unwrap_or_default();
+    if all("--root").is_empty() {
+        return argparse_error(
+            DISCOVER_AGENTS_USAGE,
+            "wrkviz discover-agents",
+            "the following arguments are required: --root",
+        );
+    }
+    if !unrecognized.is_empty() {
+        // argparse reports unrecognized arguments from the
+        // top-level parser, not the subparser, after the
+        // required-argument check.
+        eprintln!(
+            "usage: wrkviz [-h] [--version] [--userguide]\n              {{quickstart,ingest-project,ingest,ingest-claude,ingest-claude-history,ingest-muse,ingest-orc,summarize,build,extract-transcripts,export,refresh,github-metadata,refresh-claude,refresh-orc,serve,inspect,gc,migrate-build-state,migrate-snapshots,audit-glossary,audit-losslessness,query,responsiveness,discover-agents}}\n              ...\nwrkviz: error: unrecognized arguments: {}",
+            unrecognized.join(" ")
+        );
+        return 2;
+    }
+    let labelled = |name: &str, flag: &str| crate::discover::parse_labelled(&all(name), flag);
+    let mut sources = crate::discover::Sources::default();
+    match labelled("--claude-projects", "--claude-projects") {
+        Ok(pairs) => sources.claude_projects = pairs,
+        Err(error) => {
+            eprintln!("wrkviz: {error}");
+            return 2;
+        }
+    }
+    match labelled("--codex-sessions", "--codex-sessions") {
+        Ok(pairs) => sources.codex_sessions = pairs,
+        Err(error) => {
+            eprintln!("wrkviz: {error}");
+            return 2;
+        }
+    }
+    match labelled("--orc-root", "--orc-root") {
+        Ok(pairs) => sources.orc_roots = pairs,
+        Err(error) => {
+            eprintln!("wrkviz: {error}");
+            return 2;
+        }
+    }
+    match labelled("--muse-sessions", "--muse-sessions") {
+        Ok(pairs) => sources.muse_sessions = pairs,
+        Err(error) => {
+            eprintln!("wrkviz: {error}");
+            return 2;
+        }
+    }
+    match labelled("--registry", "--registry") {
+        Ok(pairs) => sources.registries = pairs,
+        Err(error) => {
+            eprintln!("wrkviz: {error}");
+            return 2;
+        }
+    }
+    let homes = match crate::discover::parse_labelled(&all("--home"), "--home") {
+        Ok(pairs) => pairs,
+        Err(error) => {
+            eprintln!("wrkviz: {error}");
+            return 2;
+        }
+    };
+    for (label, home) in &homes {
+        for (slot, relative) in [
+            ("claude", ".claude/projects"),
+            ("codex", ".codex/sessions"),
+            ("muse", ".local/share/muse/sessions"),
+        ] {
+            let candidate = home.join(relative);
+            if candidate.is_dir() {
+                match slot {
+                    "claude" => sources.claude_projects.push((label.clone(), candidate)),
+                    "codex" => sources.codex_sessions.push((label.clone(), candidate)),
+                    _ => sources.muse_sessions.push((label.clone(), candidate)),
+                }
+            }
+        }
+        if home.join(".orc").join("index.db").is_file() {
+            sources.orc_roots.push((label.clone(), home.clone()));
+        }
+    }
+    let since = match get("--since") {
+        Some(raw) => {
+            let day_only = raw.len() == 10
+                && raw.as_bytes().get(4) == Some(&b'-')
+                && raw.as_bytes().get(7) == Some(&b'-')
+                && raw
+                    .chars()
+                    .enumerate()
+                    .all(|(at, ch)| at == 4 || at == 7 || ch.is_ascii_digit());
+            let normalized = if day_only {
+                format!("{raw}T00:00:00Z")
+            } else {
+                raw.clone()
+            };
+            match responsiveness_instant(&normalized, "--since") {
+                Ok(at) => Some(at),
+                Err(error) => {
+                    eprintln!("wrkviz: {error}");
+                    return 2;
+                }
+            }
+        }
+        None => None,
+    };
+    let discovery =
+        match crate::discover::discover(&sources, &all("--root"), &all("--cwd-prefix"), since) {
+            Ok(discovery) => discovery,
+            Err(error) => {
+                eprintln!("wrkviz: {error}");
+                return 2;
+            }
+        };
+    let report = discovery.to_json_obj();
+    if let Some(file) = get("--json") {
+        let path = crate::discover::expand_user(&file);
+        let text = format!("{}\n", crate::discover::py_dumps2(&report));
+        if let Err(error) = std::fs::write(&path, text) {
+            eprintln!("wrkviz: {}", crate::json::os_error(&error, &path));
+            return 2;
+        }
+    }
+    if get("--format").as_deref() == Some("json") {
+        println!("{}", crate::discover::py_dumps2(&report));
+    } else {
+        print!("{}", crate::discover::format_markdown(&discovery));
+    }
+    0
 }
 
 const RESPONSIVENESS_HELP: &str = r##"usage: wrkviz responsiveness [-h] --registry REGISTRY --coordinator-transcript
