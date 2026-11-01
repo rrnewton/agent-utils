@@ -3565,11 +3565,12 @@ mod tests {
             "web/voice.js relays the raw body again, so ids are read aloud digit by digit"
         );
         // `combinedContent` is the single place a channel row's text comes from, so it is the
-        // single place this half can be checked. It must read the raw field and nothing else.
-        let row = VOICE_JS
+        // single place this half can be checked. It must read the raw field and nothing else. It
+        // is web/src/present/rows' now (`#624 voice-page-modularity`), which the page runs as is.
+        let row = include_str!("../../web/src/present/rows/rowdata.ts")
             .split_once("const combinedContent =")
             .map(|(_, rest)| rest.split_once(";\n").map_or(rest, |(body, _)| body))
-            .expect("web/voice.js no longer defines `combinedContent`");
+            .expect("web/src/present/rows/rowdata.ts no longer defines `combinedContent`");
         assert!(
             row.contains("m.content"),
             "the channel row must render what was actually written"

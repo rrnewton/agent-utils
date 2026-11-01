@@ -259,3 +259,8 @@ declare const setClassWord: LegacyImports["setClassWord"];
 declare const TEXT_BLOCKS: LegacyImports["TEXT_BLOCKS"];
 declare const textHits: LegacyImports["textHits"];
 declare const textRunsOf: LegacyImports["textRunsOf"];
+declare const combinedContent: LegacyImports["combinedContent"];
+declare const editedDrawn: LegacyImports["editedDrawn"];
+declare const reactionsDrawn: LegacyImports["reactionsDrawn"];
+declare const rowEdited: LegacyImports["rowEdited"];
+declare const rowReactions: LegacyImports["rowReactions"];

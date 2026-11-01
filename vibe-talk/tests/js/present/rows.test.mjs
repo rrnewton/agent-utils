@@ -122,3 +122,19 @@ test("`#624 voice-page-modularity`: a new thread's colour stands clear of its ne
   assert.equal(messageLook({ id: 9, content: "abc", content_html: "<p>abc</p>" }), "9|3:10||null");
   assert.ok(BLANK_TEXT.test(" ​\n") && !BLANK_TEXT.test(" x "));
 });
+
+test("`#624 voice-page-modularity`: a row's text, last edit and reactions over the messages it stands for, from the module alone", () => {
+  const { combinedContent, rowEdited, editedDrawn, rowReactions, reactionsDrawn } = ROWS;
+  assert.equal(combinedContent([{ content: "one" }, { content: null }, { content: "three" }]), "one\n\nthree");
+  assert.equal(rowEdited([{}, {}]), null);
+  assert.deepStrictEqual(rowEdited([{ edited_timestamp: "garbage" }]), { at: null });
+  assert.equal(rowEdited([{ edited_timestamp: "2026-10-01T00:00:00Z" }, { edited_timestamp: "2026-10-03T00:00:00Z" }]).at.toISOString(),
+    "2026-10-03T00:00:00.000Z");
+  assert.deepStrictEqual([editedDrawn({}), editedDrawn({ edited_timestamp: "t" })], [null, "t"]);
+  const tallies = rowReactions([
+    { reactions: [{ emoji: "👍", count: 2 }, { emoji: "party", custom: true, custom_id: "9", count: 1, owner_reacted: true }] },
+    { reactions: [{ emoji: "👍", count: 1, owner_reacted: true }, { emoji: "", count: 3 }, { emoji: "x", count: 0 }] },
+  ]);
+  assert.deepStrictEqual(tallies, [{ emoji: "👍", custom: false, count: 3, own: true }, { emoji: "party", custom: true, count: 1, own: true }]);
+  assert.deepStrictEqual(reactionsDrawn({ reactions: [{ emoji: "party", custom: true, count: 2 }] }), [[":party:", 2, false]]);
+});

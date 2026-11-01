@@ -37212,9 +37212,6 @@ function swipeable(li, messages) {
 //     the window are one post. A root joining the row above would bury its thread inside another
 //     message, and a reply in some other thread is never part of it (`#463 slack-text-fidelity`).
 
-/** What goes between two combined messages, so the seam is a line break and not a run-on. */
-const GLOM_SEPARATOR = "\n";
-
 /**
  * Is the combining on? ON unless the reader has turned it off — see `storedCombineMessages`.
  *
@@ -37280,12 +37277,6 @@ const idsOf = (row) =>
   String((row && row.getAttribute("data-ids")) || "")
     .split(" ")
     .filter(Boolean);
-
-/** What a combined row DISPLAYS: the constituents, in order, separated by a line break. */
-const combinedContent = (messages) =>
-  messages
-    .map((m) => String(m.content === null || m.content === undefined ? "" : m.content))
-    .join(GLOM_SEPARATOR);
 
 /**
  * Redraw the channel list from the messages already on screen, under the current grouping.
@@ -37439,26 +37430,6 @@ function channelRowFrame(messages) {
 //     edited keeps the edit time the store held (`foldLiveMessage`), as it keeps the reactions.
 
 /**
- * When a row's messages were last edited: the latest edit among them, `at` null when none of the edits
- * says a time a Date can read; or null when none of them was edited.
- *
- * @param {Array<object>} messages
- * @returns {{at: Date | null} | null}
- */
-function rowEdited(messages) {
-  let edited = null;
-  for (const message of messages) {
-    const raw = message && message.edited_timestamp ? String(message.edited_timestamp) : "";
-    if (!raw) continue;
-    const at = new Date(raw);
-    const readable = Number.isNaN(at.getTime()) ? null : at;
-    if (edited === null) edited = { at: readable };
-    else if (readable && (edited.at === null || readable.getTime() > edited.at.getTime())) edited.at = readable;
-  }
-  return edited;
-}
-
-/**
  * The mark after a row's time, or null when none of its messages was edited: a `<time>` holding the
  * last edit, titled with it, or a plain span when no edit says a readable time. Text only.
  *
@@ -37478,9 +37449,6 @@ function editedMark(messages) {
   }
   return mark;
 }
-
-/** What the redraw keys hold of a message's edit, so a row that becomes edited is drawn again. */
-const editedDrawn = (message) => (message && message.edited_timestamp ? String(message.edited_timestamp) : null);
 
 // --- reactions ------------------------------------------------------------------------------------
 //
@@ -37503,33 +37471,6 @@ const editedDrawn = (message) => (message && message.edited_timestamp ? String(m
 //   * THE OWNER'S OWN IS MARKED. `#312 slack-reactions`. Where the provider says the owner is among
 //     those who reacted (`owner_reacted`, which Slack reports), the chip is drawn in the accent, as
 //     Slack draws your own, and says so to a screen reader. Still a label: nothing here reacts.
-
-/**
- * A row's reactions: one tally per emoji, in the order first seen, counted over every message the
- * row stands for, and the owner's when the owner reacted with it to any of them. Empty when none
- * has any, whether its source reported none or cannot see them.
- */
-function rowReactions(messages) {
-  const tallies = new Map();
-  for (const message of messages) {
-    for (const reaction of Array.isArray(message.reactions) ? message.reactions : []) {
-      const count = reaction ? Number(reaction.count) : 0;
-      if (!reaction || typeof reaction.emoji !== "string" || reaction.emoji === "" || !(count > 0)) continue;
-      const key = reactionKey(reaction);
-      const own = reaction.owner_reacted === true;
-      const held = tallies.get(key);
-      if (held) {
-        held.count += count;
-        held.own = held.own || own;
-      } else tallies.set(key, { emoji: reaction.emoji, custom: reaction.custom === true, count, own });
-    }
-  }
-  return [...tallies.values()];
-}
-
-/** A stable account of a message's reactions, for the lists that redraw only when a row changed. */
-const reactionsDrawn = (message) =>
-  rowReactions([message]).map((tally) => [reactionText(tally), tally.count, tally.own]);
 
 /**
  * The strip of chips under a row's text, or null when the row has no reactions. `textContent`

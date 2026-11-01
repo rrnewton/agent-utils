@@ -41,3 +41,5 @@ export {
 export type { ThreadChoice } from "./cards.ts";
 export { THREAD_HUE_APART, THREAD_HUE_BESIDE, hueApart, newestThreadHues, spreadThreadHue } from "./hues.ts";
 export { BLANK_TEXT, messageLook, rawTextOf, renderedHtmlOf } from "./message.ts";
+export { GLOM_SEPARATOR, combinedContent, editedDrawn, reactionsDrawn, rowEdited, rowReactions } from "./rowdata.ts";
+export type { ReactionTally } from "./rowdata.ts";
