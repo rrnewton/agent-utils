@@ -1,10 +1,11 @@
 ---
 title: 'vt-unread-recap: recap CLI showing unread window grouped by thread'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 created_at: 2026-11-01T00:49:01.619754387+00:00
-updated_at: 2026-11-01T00:49:01.619754387+00:00
+updated_at: 2026-11-01T02:19:07.747987769+00:00
+closed_at: 2026-11-01T02:19:07.747987448+00:00
 ---
 
 # Description
