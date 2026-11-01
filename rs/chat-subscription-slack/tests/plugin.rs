@@ -1227,3 +1227,44 @@ fn a_reply_whose_thread_root_the_stream_never_carried_is_delivered_and_the_root_
     assert!(!text.contains("thread 1792000850.000050"), "{text}");
     assert!(!text.contains("thread 1792000890.000020"), "{text}");
 }
+
+#[test]
+fn relay_peer_bot_posts_are_delivered_only_in_the_relay_channel() {
+    // A listed peer bot's bot_message post in the relay channel is delivered
+    // to the bridge (which classifies it as relay, never a request); the
+    // same bot elsewhere, and any unlisted bot there, are not delivered.
+    let peer = "U0PEERBOT01";
+    let fake = FakeTransport::new();
+    fake.push_script(vec![
+        event(201, json!({"channel_id": CHANNEL, "message_ts": "1792000801.000100", "slack_user_id": peer, "subtype": "bot_message", "bot_id": "B0BOT000001", "text": "relay post"})),
+        event(202, json!({"channel_id": CHANNEL, "message_ts": "1792000802.000100", "slack_user_id": "U0OTHERBOT1", "subtype": "bot_message", "bot_id": "B0BOT000002", "text": "unlisted bot"})),
+        owner_message(203, "1792000803.000100", None, "owner still works"),
+        FakeStep::Line(r#"{"type":"HEARTBEAT","ts":1.0}"#.to_owned()),
+    ]);
+    let mut backend = make_backend(&fake);
+    let relay_request = request(
+        None,
+        json!({"relay_channels": [{"channel": CHANNEL, "peer_senders": [peer]}]}),
+    )
+    .with_relay_senders(vec![SenderId::new(peer).unwrap()])
+    .unwrap();
+    let mut subscription = ChatSubscription::open(&mut backend, &relay_request).unwrap();
+    // The lineage checkpoint(s), then the peer's relay post.
+    let relay = loop {
+        let batch = commit_next(&mut subscription);
+        if matches!(batch.events(), [CommittableEvent::MessageCreated(_)]) {
+            break batch;
+        }
+    };
+    let message = single_message(&relay);
+    assert_eq!(message.sender_id().as_str(), peer);
+    assert_eq!(message.text(), "relay post");
+    // The unlisted bot produces no message batch; the next message is the owner's.
+    let owner = loop {
+        let batch = commit_next(&mut subscription);
+        if matches!(batch.events(), [CommittableEvent::MessageCreated(_)]) {
+            break batch;
+        }
+    };
+    assert_eq!(single_message(&owner).sender_id().as_str(), OWNER);
+}

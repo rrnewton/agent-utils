@@ -86,6 +86,64 @@ those exact bytes into a sealed in-memory executable, and retains that image for
 the generation. Reply and reaction operations neither reopen nor rehash the
 source path.
 
+### Relay channels (agent-teams chat relay)
+
+A bridge may carry a third, narrower admission class for inter-team relay
+traffic (see the `agent-teams` user guide, "Chat relay"). Add
+`relay_channels` to the configuration:
+
+```json
+{
+  "relay_channels": [
+    {
+      "channel": "C0RELAY000",
+      "peer_senders": {"U0PEERBOT1": "sim@host-b"},
+      "command": ["agent-teams", "relay-in", "--route", "relay-coord"]
+    }
+  ]
+}
+```
+
+The rules are strict, because `allowed_senders` means "the owner":
+
+- In a relay channel, only posts from the listed peer sender IDs are
+  admitted, and only to this class. An admitted relay post is **never typed
+  as a prompt** and never becomes a request. The bridge pipes its text on
+  stdin to the one configured `command`, appending `--peer-sender`,
+  `--channel` and `--thread`. Relay commands must be idempotent: a
+  replayed batch may dispatch a post again, and the receiver's
+  exactly-once point is the receiving `agent-teams` ledger, not the bridge.
+- A peer sender ID must never also appear in `allowed_senders`; the
+  configuration is refused when one does. A peer can never inject prompts:
+  its posts reach only the relay command, and what that command accepts is
+  checked again on the receiving host (envelope hash, team mapping,
+  ledger).
+- Owner posts in a relay channel are not requests: a relay channel is not
+  also an owner channel, and the bridge refuses them there. Put the relay
+  channel in `channel_ids` as well, or the bridge never subscribes to it.
+- `peer_senders` maps each sender ID to the one team it speaks for
+  (`FLEET@HOST`, or a bare fleet name). One bot per team is the normal
+  case; several IDs may map to the same team (for example a team's two
+  bots on Discord). The mapping in the bridge only admits the post to the
+  relay command; the receiving team's declaration and confirmed mappings
+  decide what is delivered, quarantined, or alarmed as a stranger (see
+  the `agent-teams` guide). The owner reads the channel to watch the
+  inter-team traffic; message bodies are visible to every channel member.
+
+Provider requirements: a provider carries a relay only when it can report
+each post's authenticated sender ID, deliver other bots' posts in the
+relay channel to the bridge, and post into the channel through an outbound
+helper. Relay peer IDs travel in the subscription as relay delivery
+authorities, separate from `allowed_senders`. The Slack provider admits a
+listed peer's `bot_message` posts in a relay channel only, when the same
+peers are also named in its backend configuration (`relay_channels` in
+`backend_configuration.data`); whether its live tail carries other bots'
+posts is provider- and client-dependent, and its history rescan (every
+90 seconds by default, over a 24-hour window) is the fallback path, so
+relay latency is bounded by that rescan when the stream does not carry a
+post. Discord bots qualify on the same terms: stable sender IDs, channel
+membership for each team's bot, and read-history permission.
+
 ### Permanent owners and temporary sender grants
 
 `allowed_senders` holds the permanent owners' authenticated provider IDs. To

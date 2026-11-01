@@ -82,6 +82,12 @@ directory sits under a config tree.
 - `join TEAM --registry R [--accepts-from SENDER]...` — one-step team
   setup on this host: writes the declaration like `init`, then adds this
   host's entry to teams.json when it is not there yet.
+- `relay setup|status|announce|teams|confirm|ban|alarms` and `relay-in` —
+  the chat relay: onboarding, discovery, stranger alarms, and the bridge's
+  inbound hand-off (see "Chat relay" below). A **team** is one host's
+  agents under one coordinator (`TEAM@HOST`); a **fleet** is all the teams
+  across hosts on the same repository (the name before the `@`). Relay
+  mappings name a fleet plus a team (`FLEET@HOST`).
 
 ### The host coordinator index
 
@@ -232,6 +238,114 @@ Drivers are built in (`local`, `ssh`, `command`); routes are data.
 Every attempt is `answered`, `not-delivered` (definite; for banner routes,
 no banner means the envelope was never sent) or `ambiguous`. After ambiguity
 the sender asks for a receipt; it never resends blind.
+
+- `command` (relay mode) — the chat relay: fields `channel`, `sender_id`
+  (the bot user this host posts as), `post_argv` and `list_argv` templates
+  (`{channel}`, `{thread}`, `{message_id}`, `{text_file}`), 
+  `max_envelope_bytes` (default 10000, one post per envelope, never split),
+  `limits.per_hour` (default 6), `visible_to_owner: true`. It posts the
+  envelope as one chat post and never reposts: ambiguity is settled by the
+  receipt in the post's thread, read back through `list_argv`, or by a
+  receipt over another route to the same contact. Bodies are visible to
+  every channel member, so `--private` messages never take a relay route,
+  and the walk's other rules (order, pinning, failover to ssh/node-exec)
+  apply unchanged: the relay is a route like any other, chosen last.
+
+## Chat relay
+
+The relay carries team messages through a shared chat channel, so each
+direction between hosts has a path that depends on neither ssh nor a
+node-exec runtime, and the owner can read the inter-team traffic there.
+It is provider-neutral: any chat-subscription provider that reports each
+post's authenticated sender ID, delivers other bots' posts in the channel
+to the bridge, and can post through an outbound helper qualifies (Slack
+and Discord included). Nothing provider-specific is in `agent-teams` or
+in the bridge's relay class; channel, bot IDs, and helper argv are data.
+
+**Layout.** One relay channel per fleet is the default: for example
+`#relay-agent-utils`, with only that fleet's teams' bots as members. The
+declaration's relay entry then carries `"fleet": "<fleet>"`, and a post
+whose envelope names a different fleet, in either direction, is refused
+there. A single channel shared by several fleets also works (leave
+`fleet` unset); posts addressed to other fleets or hosts are filtered by
+`relay-in` on the envelope's `to` without waking any agent — no model
+sees them, so they cost no tokens. One bot account per team is the normal
+case. Several sender IDs may map to the same team (a fleet's two bots on
+Discord, say); every ID is mapped explicitly.
+
+**The post.** One post per envelope: a short human-readable line (the
+team tag and the body, so the owner can read the channel), then the full
+envelope as compact JSON in a fenced `agent-teams-envelope` block. The
+envelope is authoritative — a provider may rewrite visible text, so the
+receiver re-derives the tag from the envelope and checks the body hash.
+Receipts go back in the post's thread (one line plus a fenced
+`agent-teams-receipt` block); a receipt never draws a receipt.
+Exactly-once comes from the envelope IDs and the receiving ledger, as on
+every route: duplicate posts (a helper repost, a rescan, a replayed
+stream) are absorbed by the ledger, never typed twice. Latency is that
+of two bridges; when a provider's live stream does not carry other bots'
+posts, its history rescan bounds it (Slack: 90 seconds by default, over a
+24-hour window — a post older than the window is never seen, so keep
+relayed messages' TTL inside it).
+
+**Admission, in three layers.** The provider admits a listed peer's post
+in the relay channel (Slack: that peer's `bot_message`, there only). The
+bridge's `relay_channels` class admits it only to one configured command
+(`agent-teams relay-in --route R`, with `--peer-sender`, `--channel` and
+`--thread` appended): never typed, never a prompt. `relay-in` then checks
+the envelope against this host's declaration: the poster's mapped fleet
+plus team (`FLEET@HOST`) must match the envelope's `from`, and any
+claimed sender that is not confirmed is a stranger (below). A peer can
+never inject prompts: its posts reach only the relay command, and the
+coordinator sees only what its own deliverer renders from a verified
+envelope.
+
+**Security model.** The platform authenticates a bot's sender ID; it
+cannot stop a bot in the channel from *claiming* any fleet or team in its
+envelope text. So: a forged post from an unlisted or mismatched sender is
+quarantined and alarmed, never delivered, and claims nothing in the
+ledger — it cannot fence, block, or duplicate a legitimate message with
+the same ID. A replayed post is absorbed by the ledger. A confirmed peer
+can send only as its own fleet's team, only within the receiving team's
+ordinary policy (sender rules, size, TTL, rate limits), and every body it
+sends is visible to all channel members — relay routes are public to the
+channel, which is why `--private` never takes one. Announcements
+(below) are candidates only: their integrity hash proves a block was not
+altered, never who sent it; identity comes from the poster ID matching
+the announced sender ID, plus confirmation.
+
+**Strangers are loud, never silent.** A post addressed to this team from
+an unconfirmed sender — unlisted, mapped to another fleet/team, or with
+an envelope that fails its tag, hash, or schema check — is a stranger
+event. `relay-in` records it, keeps the post quarantined (not delivered),
+and raises an alarm to the team's coordinator through its normal
+deliverer, flagged for escalation to the owner through that team's normal
+owner channel (the chat bridge). The alarm repeats on a timer
+(`alarm_interval_seconds` in the declaration's relay entry, default
+1800) whenever `relay-in`, `pump`, or `relay alarms` runs, until the
+sender is confirmed (`relay confirm`) or banned (`relay ban`). A banned
+sender's posts are dropped without new alarms. `relay status` shows open
+stranger alarms first. Quarantined posts addressed to us are delivered,
+in arrival order and exactly once, as soon as their sender is confirmed —
+nothing is silently lost. Posts for other fleets from confirmed senders
+are still dropped silently (above); only strangers and malformed posts
+are loud.
+
+**Discovery and trust.** Each team announces itself in the channel
+(`relay announce`): fleet, host, the sender ID it posts as, and a
+repository identity (SHA-256 of the normalized origin URL, so teams on
+one repository find each other without naming it). `relay-in` records
+announcements as candidates — never admitted. `relay teams [--repo ID]`
+lists confirmed mappings and candidates, optionally for one repository.
+`relay confirm SENDER` first asks the claimed team's own host over an
+already-trusted route (ssh or node-exec): when that host's probe reports
+the same sender-to-team mapping in its declaration, the mapping is
+confirmed automatically. Otherwise the owner approves with one line
+(`relay confirm SENDER --owner-approved`). Never admit an unconfirmed
+claim. Onboarding is `relay setup`: it suggests the per-fleet channel
+name (`#relay-<fleet>`), tells the owner exactly what to create and whom
+to invite on Slack or Discord, and prints the bridge, declaration, and
+route snippets to apply. Agents never create channels.
 
 **Topology.** Name hubs under `topology.hubs`: spokes dial one persistent
 link to the hub (n-1 links, not n²), pushing and pulling over it. Spoke to

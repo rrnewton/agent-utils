@@ -3,7 +3,7 @@
 //! Every host route ends at the receiving host's own `agent-teams serve`.
 
 use crate::jsonfile::DataResult;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -470,6 +470,215 @@ impl Route for CommandRoute {
     }
 }
 
+/// The chat relay route (design 10.6/10.7): a `command` route in `relay`
+/// mode. `accept` posts one post per envelope through the route's
+/// `post_argv`; it never retries a post (a second post in-process is
+/// refused as ambiguous), and ambiguity is settled by the receipt in the
+/// thread, read back through `list_argv`. Bodies are visible to every
+/// channel member, so this route exposes the body and `--private` skips it.
+pub struct ChatRelayRoute {
+    /// Route name.
+    pub name: String,
+    /// Provider channel/space identifier.
+    pub channel: String,
+    /// Argv template posting one post (`{channel}`, `{text_file}`, ...).
+    pub post_argv: Vec<String>,
+    /// Argv template listing recent channel/thread posts for receipts.
+    pub list_argv: Vec<String>,
+    /// Maximum envelope bytes in one post; larger is a definite skip.
+    pub max_envelope_bytes: Option<usize>,
+    /// Posts per hour over this route; over the limit is a definite skip.
+    pub per_hour: u64,
+    /// Rate-limit state file.
+    pub rate_file: PathBuf,
+    /// IDs already posted by this process (the relay never reposts).
+    pub posted: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+impl ChatRelayRoute {
+    fn recent_posts(&self) -> u64 {
+        let now = crate::timeutil::now_unix_ms();
+        let text = std::fs::read_to_string(&self.rate_file).unwrap_or_default();
+        text.lines()
+            .filter_map(|line| line.trim().parse::<i64>().ok())
+            .filter(|at| now - at < 3_600_000)
+            .count() as u64
+    }
+    fn note_post(&self) {
+        let now = crate::timeutil::now_unix_ms();
+        if let Some(parent) = self.rate_file.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let mut text = std::fs::read_to_string(&self.rate_file).unwrap_or_default();
+        text.push_str(&format!("{now}\n"));
+        let _ = std::fs::write(&self.rate_file, text);
+    }
+    /// Post arbitrary relay text (announcements) through this route.
+    pub fn post_text(&self, text: &str) -> Result<String, String> {
+        crate::relay::run_post_argv(&self.post_argv, &self.channel, "", "", text)
+    }
+}
+
+impl Route for ChatRelayRoute {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn exposes_body(&self) -> bool {
+        true
+    }
+    fn skip_reason(&self, envelope_bytes: usize) -> Option<String> {
+        if let Some(max) = self.max_envelope_bytes {
+            if envelope_bytes > max {
+                return Some(format!(
+                    "envelope of {envelope_bytes} bytes over relay limit {max} (one post per envelope)"
+                ));
+            }
+        }
+        if self.per_hour > 0 && self.recent_posts() >= self.per_hour {
+            return Some(format!(
+                "relay rate limit ({} posts/hour) reached",
+                self.per_hour
+            ));
+        }
+        None
+    }
+    fn run_verb(&self, verb: &str, payload: &Value) -> AttemptOutcome {
+        match verb {
+            "accept" => {
+                let id = payload
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                {
+                    let mut posted = self.posted.lock().unwrap_or_else(|p| p.into_inner());
+                    if !posted.insert(id.clone()) {
+                        return AttemptOutcome::Ambiguous(
+                            "relay route does not repost; settled by its receipt".to_string(),
+                        );
+                    }
+                }
+                let text = crate::relay::render_post(payload);
+                match crate::relay::run_post_argv(&self.post_argv, &self.channel, "", &id, &text) {
+                    Ok(_) => {
+                        self.note_post();
+                        AttemptOutcome::Answered(json!({
+                            "outcome": "posted", "state": "in-custody",
+                            "detail": "posted to the relay channel; receipt follows in its thread",
+                        }))
+                    }
+                    Err(reason) if reason.contains("failed to start") => {
+                        AttemptOutcome::NotDelivered(reason)
+                    }
+                    Err(reason) => AttemptOutcome::Ambiguous(reason),
+                }
+            }
+            "receipt" => {
+                if self.list_argv.is_empty() {
+                    return AttemptOutcome::NotDelivered(
+                        "relay route has no list_argv to read receipts with".to_string(),
+                    );
+                }
+                let id = payload
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let listing = match crate::relay::run_post_argv(
+                    &self.list_argv,
+                    &self.channel,
+                    "",
+                    &id,
+                    "",
+                ) {
+                    Ok(text) => text,
+                    Err(reason) => return AttemptOutcome::Ambiguous(reason),
+                };
+                // Thread listings arrive as post texts; scan for our receipt.
+                for chunk in listing.split("\n---post---\n") {
+                    if let Ok(crate::relay::RelayPost::Receipt(receipt)) =
+                        crate::relay::parse_post(chunk)
+                    {
+                        if receipt.get("id").and_then(Value::as_str) == Some(id.as_str()) {
+                            let state = receipt
+                                .get("state")
+                                .and_then(Value::as_str)
+                                .unwrap_or("unknown")
+                                .to_string();
+                            if state == crate::relay::NOT_RECORDED {
+                                return AttemptOutcome::Answered(json!({
+                                    "known": false, "id": id, "state": "unknown",
+                                    "detail": "receiver answered not-recorded",
+                                }));
+                            }
+                            return AttemptOutcome::Answered(json!({
+                                "known": true, "id": id, "state": state,
+                            }));
+                        }
+                    }
+                }
+                AttemptOutcome::Answered(json!({"known": false, "id": id, "state": "unknown"}))
+            }
+            other => AttemptOutcome::NotDelivered(format!(
+                "relay route carries accept/receipt only, not {other}"
+            )),
+        }
+    }
+}
+
+/// Build the chat relay route a `command`/`relay` definition names.
+pub fn relay_route_for(
+    def: &crate::model::RouteDef,
+    links_dir: &std::path::Path,
+) -> ChatRelayRoute {
+    let strings = |key: &str| -> Vec<String> {
+        def.raw
+            .get(key)
+            .and_then(Value::as_array)
+            .map(|list| {
+                list.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    ChatRelayRoute {
+        name: def.name.clone(),
+        channel: def
+            .raw
+            .get("channel")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        post_argv: strings("post_argv"),
+        list_argv: strings("list_argv"),
+        max_envelope_bytes: def
+            .raw
+            .get("max_envelope_bytes")
+            .and_then(Value::as_u64)
+            .map(|n| n as usize)
+            .or(Some(10_000)),
+        per_hour: def
+            .raw
+            .get("limits")
+            .and_then(|l| l.get("per_hour"))
+            .and_then(Value::as_u64)
+            .unwrap_or(6),
+        rate_file: links_dir
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| links_dir.to_path_buf())
+            .join(format!("relay-{}.log", def.name)),
+        posted: std::sync::Mutex::new(std::collections::HashSet::new()),
+    }
+}
+
+/// Whether a route definition is a chat relay route.
+pub fn is_relay_def(def: &crate::model::RouteDef) -> bool {
+    def.driver == "command" && def.raw.get("mode").and_then(Value::as_str) == Some("relay")
+}
+
 /// Build a route object from its definition.
 pub fn route_for(
     def: &crate::model::RouteDef,
@@ -531,6 +740,9 @@ pub fn route_for(
                         .to_string();
                     pre_exec_failures.push((exit, needle));
                 }
+            }
+            if def.raw.get("mode").and_then(Value::as_str) == Some("relay") {
+                return Ok(Box::new(relay_route_for(def, links_dir)));
             }
             Ok(Box::new(CommandRoute {
                 name: def.name.clone(),

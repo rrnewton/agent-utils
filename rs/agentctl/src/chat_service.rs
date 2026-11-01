@@ -7499,6 +7499,7 @@ mod tests {
                 reply_alias_range: None,
                 slack_format: Some(SlackFormat::Markdown),
                 slack_format_by_channel: std::collections::BTreeMap::new(),
+                relay_channels: Vec::new(),
                 labels: None,
             },
         )
@@ -8991,6 +8992,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 reply_alias_range: None,
                 slack_format: Some(SlackFormat::Markdown),
                 slack_format_by_channel: std::collections::BTreeMap::new(),
+                relay_channels: Vec::new(),
                 labels: None,
             },
         )
@@ -9644,6 +9646,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 reply_alias_range: None,
                 slack_format: Some(SlackFormat::Markdown),
                 slack_format_by_channel: std::collections::BTreeMap::new(),
+                relay_channels: Vec::new(),
                 labels: None,
             },
         )
@@ -9716,6 +9719,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 reply_alias_range: None,
                 slack_format: Some(SlackFormat::Markdown),
                 slack_format_by_channel: std::collections::BTreeMap::new(),
+                relay_channels: Vec::new(),
                 labels: None,
             },
         )
@@ -9780,6 +9784,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 reply_alias_range: None,
                 slack_format: None,
                 slack_format_by_channel: std::collections::BTreeMap::new(),
+                relay_channels: Vec::new(),
                 labels: None,
             },
         )
@@ -9876,6 +9881,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 reply_alias_range: None,
                 slack_format: None,
                 slack_format_by_channel: std::collections::BTreeMap::new(),
+                relay_channels: Vec::new(),
                 labels: None,
             },
         )
@@ -10272,6 +10278,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 reply_alias_range: None,
                 slack_format: Some(SlackFormat::Markdown),
                 slack_format_by_channel: std::collections::BTreeMap::new(),
+                relay_channels: Vec::new(),
                 labels: None,
             },
         )
@@ -12094,6 +12101,7 @@ esac
             reply_alias_range: None,
             slack_format: Some(SlackFormat::Markdown),
             slack_format_by_channel: std::collections::BTreeMap::new(),
+            relay_channels: Vec::new(),
             labels: None,
         };
         let outbound = configured_outbound_join_timeout(&configuration);
@@ -12554,6 +12562,7 @@ esac
                 reply_alias_range: None,
                 slack_format: Some(SlackFormat::Markdown),
                 slack_format_by_channel: std::collections::BTreeMap::new(),
+                relay_channels: Vec::new(),
                 labels: None,
             },
         )
@@ -14331,6 +14340,7 @@ esac
                 reply_alias_range: None,
                 slack_format: Some(SlackFormat::Markdown),
                 slack_format_by_channel: std::collections::BTreeMap::new(),
+                relay_channels: Vec::new(),
                 labels: None,
             },
         )

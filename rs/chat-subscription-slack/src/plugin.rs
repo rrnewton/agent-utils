@@ -186,6 +186,11 @@ pub struct PluginConfig {
     /// Keys this plugin does not know, sorted: ignored, and named in the diagnostics each time a
     /// subscription starts.
     pub ignored_keys: Vec<String>,
+    /// Chat relay channels: channel ID -> peer bot user IDs whose posts this
+    /// provider admits there (including `bot_message` posts) for the bridge's
+    /// relay class. This only widens delivery to the bridge; it grants no
+    /// owner authority, and the bridge never types these posts.
+    pub relay_peers: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 fn failure(code: &str, detail: impl Into<String>, retryable: bool) -> BackendFailure {
@@ -273,6 +278,7 @@ impl PluginConfig {
             "rescan_window_seconds",
             "rescan_calls_per_minute",
             "rescan_budget_key",
+            "relay_channels",
         ];
         let mut ignored_keys: Vec<String> = data
             .keys()
@@ -390,6 +396,47 @@ impl PluginConfig {
         };
         let rescan_window = optional_seconds(data, "rescan_window_seconds", 600..=604_800)?
             .map_or(rescan::DEFAULT_WINDOW, Duration::from_secs);
+        let mut relay_peers: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        match data.get("relay_channels") {
+            None | Some(Value::Null) => {}
+            Some(Value::Array(entries)) if entries.len() <= 32 => {
+                for entry in entries {
+                    let channel = entry
+                        .get("channel")
+                        .and_then(Value::as_str)
+                        .filter(|value| ids::valid_channel_id(value))
+                        .ok_or_else(|| {
+                            invalid("relay_channels entries need a valid Slack channel ID")
+                        })?;
+                    let peers = entry
+                        .get("peer_senders")
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| {
+                            invalid("relay_channels peer_senders must be a list of Slack user IDs")
+                        })?;
+                    let mut ids = Vec::new();
+                    for peer in peers {
+                        let peer = peer
+                            .as_str()
+                            .filter(|value| ids::valid_user_id(value))
+                            .ok_or_else(|| {
+                                invalid("relay_channels peer_senders must be Slack user IDs")
+                            })?;
+                        ids.push(peer.to_owned());
+                    }
+                    if ids.is_empty() {
+                        return Err(invalid("relay_channels peer_senders must not be empty"));
+                    }
+                    relay_peers.insert(channel.to_owned(), ids);
+                }
+            }
+            Some(_) => {
+                return Err(invalid(
+                    "relay_channels must be a list of at most 32 {channel, peer_senders} entries",
+                ))
+            }
+        }
         Ok(Self {
             transport,
             cli,
@@ -412,6 +459,7 @@ impl PluginConfig {
             rescan_budget_key: optional_string(data, "rescan_budget_key")?
                 .unwrap_or_else(|| "user".to_owned()),
             ignored_keys,
+            relay_peers,
         })
     }
 }
@@ -1165,11 +1213,20 @@ impl SlackDriver {
         if !self.channels.contains(&message.channel_id) {
             return Err("other channel");
         }
-        if message
-            .subtype
-            .as_deref()
-            .is_some_and(|subtype| !MESSAGE_SUBTYPES.contains(&subtype))
-        {
+        // The one narrow relay switch: in a configured relay channel, a
+        // listed peer bot's `bot_message` post is delivered to the bridge,
+        // which classifies it as relay (never a request, never typed).
+        // Everywhere else, and for every other sender, bot posts are
+        // refused exactly as before.
+        let relay_peer = message.user_id.as_deref().is_some_and(|user| {
+            self.config
+                .relay_peers
+                .get(&message.channel_id)
+                .is_some_and(|peers| peers.iter().any(|peer| peer == user))
+        });
+        if message.subtype.as_deref().is_some_and(|subtype| {
+            !MESSAGE_SUBTYPES.contains(&subtype) && !(subtype == "bot_message" && relay_peer)
+        }) {
             return Err("non-message subtype");
         }
         // The event stream's slack_message extension fills app_id with the
@@ -1188,7 +1245,7 @@ impl SlackDriver {
         let Some(user) = message
             .user_id
             .as_deref()
-            .filter(|user| self.senders.contains(*user))
+            .filter(|user| self.senders.contains(*user) || relay_peer)
         else {
             return Err("sender not allowed");
         };

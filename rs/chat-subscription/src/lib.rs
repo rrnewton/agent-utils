@@ -1054,8 +1054,10 @@ impl BackendCapabilities {
 pub struct SubscribeRequest {
     channel_ids: Vec<ChannelId>,
     allowed_senders: Vec<SenderId>,
+    relay_senders: Vec<SenderId>,
     channel_membership: HashSet<ChannelId>,
     sender_membership: HashSet<SenderId>,
+    relay_membership: HashSet<SenderId>,
     resume_from: Option<ProviderCursor>,
     backend_configuration: Option<BackendConfiguration>,
 }
@@ -1103,11 +1105,52 @@ impl SubscribeRequest {
         Ok(Self {
             channel_membership,
             sender_membership,
+            relay_membership: HashSet::new(),
             channel_ids,
             allowed_senders,
+            relay_senders: Vec::new(),
             resume_from,
             backend_configuration: None,
         })
+    }
+
+    /// Attach relay delivery authorities: senders whose posts a provider may
+    /// deliver to the host's relay class (for example `agent-teams relay-in`)
+    /// but who are never permitted to create tasks. Kept disjoint from the
+    /// allowed (owner) senders: an ID in both would hold owner authority.
+    pub fn with_relay_senders(
+        mut self,
+        relay_senders: Vec<SenderId>,
+    ) -> Result<Self, ValidationError> {
+        if relay_senders.len() > MAX_ALLOWED_SENDERS {
+            return Err(ValidationError::new(format!(
+                "subscription must contain at most {MAX_ALLOWED_SENDERS} relay senders; found {}",
+                relay_senders.len()
+            )));
+        }
+        let relay_membership: HashSet<SenderId> = relay_senders.iter().cloned().collect();
+        if relay_membership.len() != relay_senders.len() {
+            return Err(ValidationError::new(
+                "subscription relay senders must be unique".to_owned(),
+            ));
+        }
+        if relay_senders
+            .iter()
+            .any(|sender| self.sender_membership.contains(sender))
+        {
+            return Err(ValidationError::new(
+                "a relay sender must not also be an allowed sender".to_owned(),
+            ));
+        }
+        self.relay_membership = relay_membership;
+        self.relay_senders = relay_senders;
+        Ok(self)
+    }
+
+    /// Return the relay delivery authorities (never task authorities).
+    #[must_use]
+    pub fn relay_senders(&self) -> &[SenderId] {
+        &self.relay_senders
     }
 
     /// Attach explicit non-secret provider resource configuration from the host.
@@ -1288,6 +1331,7 @@ pub struct ChatSubscription {
     cancellation: Arc<dyn ChatSubscriptionCancellation>,
     channel_membership: HashSet<ChannelId>,
     sender_membership: HashSet<SenderId>,
+    relay_membership: HashSet<SenderId>,
     last_sequence: Option<EventSequence>,
     outstanding: Option<DeliveryBatch>,
     needs_initial_boundary: bool,
@@ -1324,6 +1368,7 @@ impl ChatSubscription {
             cancellation,
             channel_membership: request.channel_membership.clone(),
             sender_membership: request.sender_membership.clone(),
+            relay_membership: request.relay_membership.clone(),
             last_sequence: None,
             outstanding: None,
             needs_initial_boundary: request.resume_from().is_none(),
@@ -1430,7 +1475,13 @@ impl ChatSubscription {
                             self.poisoned = true;
                             return Err(SubscriptionError::MessageOutsideChannelAuthority);
                         }
-                        if !self.sender_membership.contains(message.sender_id()) {
+                        // Allowed (owner) senders and relay delivery
+                        // authorities may both be delivered; the host
+                        // classifies relay posts and never turns them into
+                        // tasks. Nobody else may be delivered at all.
+                        if !self.sender_membership.contains(message.sender_id())
+                            && !self.relay_membership.contains(message.sender_id())
+                        {
                             self.poisoned = true;
                             return Err(SubscriptionError::MessageOutsideSenderAuthority);
                         }

@@ -482,6 +482,31 @@ pub enum Designation {
     },
 }
 
+/// One chat relay channel in a declaration (design section 10.6, provider-neutral):
+/// the receiving bridge admits only `peers` in `channel`, and each peer sender ID
+/// speaks for exactly one team (a fleet on one host: `FLEET@HOST` in relay mappings). One bot per
+/// team is the normal case; several IDs may map to the same team (for example a
+/// team's two per-team bots on Discord). `fleet`, when set, scopes the channel
+/// to one fleet: posts naming another fleet are refused there.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RelayChannel {
+    /// Route name the envelopes arrive by (`relay-in --route`).
+    pub route: String,
+    /// Provider channel/space identifier.
+    pub channel: String,
+    /// Fleet this channel is scoped to, when it carries one fleet only.
+    pub fleet: Option<String>,
+    /// Peer sender ID -> the one team it may speak for (`TEAM@HOST`, or a bare
+    /// fleet name meaning that fleet on any host).
+    pub peers: std::collections::BTreeMap<String, String>,
+    /// Argv template that posts a receipt in the post's thread
+    /// (`{channel}`, `{thread}`, `{text_file}` placeholders); empty means
+    /// `relay-in` only prints the receipt for its caller to post.
+    pub receipt_argv: Vec<String>,
+    /// Seconds between stranger-alarm repeats for this channel (default 1800).
+    pub alarm_interval_seconds: u64,
+}
+
 /// One `accepts_from` entry of a declaration.
 #[derive(Debug, Clone)]
 pub struct AcceptRule {
@@ -520,6 +545,8 @@ pub struct Declaration {
     pub default_ttl_seconds: i64,
     /// Hubs whose relayed envelopes this host accepts (section 11.6).
     pub accepts_relay_from: Vec<String>,
+    /// Chat relay channels this team receives envelopes through (section 10.6).
+    pub relay_channels: Vec<RelayChannel>,
 }
 
 /// Load a declaration file.
@@ -595,6 +622,42 @@ pub fn parse_declaration(raw: Value) -> DataResult<Declaration> {
         }
     }
     let limits = raw.get("limits").cloned().unwrap_or(Value::Null);
+    let mut relay_channels = Vec::new();
+    if let Some(list) = raw.get("relay_channels").and_then(Value::as_array) {
+        for item in list {
+            let mut peers = std::collections::BTreeMap::new();
+            if let Some(obj) = item.get("peers").and_then(Value::as_object) {
+                for (sender, team) in obj {
+                    if let Some(team) = team.as_str() {
+                        peers.insert(sender.clone(), team.to_string());
+                    }
+                }
+            }
+            relay_channels.push(RelayChannel {
+                route: item
+                    .get("route")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                channel: item
+                    .get("channel")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                fleet: item
+                    .get("fleet")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                peers,
+                receipt_argv: string_list(item.get("receipt_argv")),
+                alarm_interval_seconds: item
+                    .get("alarm_interval_seconds")
+                    .and_then(Value::as_u64)
+                    .filter(|seconds| *seconds > 0)
+                    .unwrap_or(1800),
+            });
+        }
+    }
     Ok(Declaration {
         raw: raw.clone(),
         team,
@@ -620,6 +683,7 @@ pub fn parse_declaration(raw: Value) -> DataResult<Declaration> {
             .and_then(Value::as_i64)
             .unwrap_or(7200),
         accepts_relay_from: string_list(raw.get("accepts_relay_from")),
+        relay_channels,
     })
 }
 

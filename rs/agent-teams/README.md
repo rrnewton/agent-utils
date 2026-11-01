@@ -17,5 +17,11 @@ command) and transport through a `Route` trait (local, ssh, command), so the
 tool needs neither Herdr nor agentctl: a hook-inbox team works with this one
 binary per host.
 
+An optional third route, the chat relay (`agent-teams relay setup`), carries
+envelopes through a shared Slack/Discord channel as posts the owner can
+read, with discovery announcements, confirmed sender-to-team mappings, and
+loud stranger alarms for unconfirmed bots. See the "Chat relay" section of
+`agent-teams userguide`.
+
 Design: `ai_docs/transient/2026-10-24-agentctl-team-messaging.md`. Related
 work: [`RELATED_WORK.md`](RELATED_WORK.md).

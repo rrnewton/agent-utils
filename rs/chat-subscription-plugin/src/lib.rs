@@ -528,6 +528,8 @@ enum ClientFrame {
     Start {
         channel_ids: Vec<String>,
         allowed_senders: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        relay_senders: Vec<String>,
         max_uncommitted: u16,
         resume_from: Option<String>,
         backend_configuration: Option<WireBackendConfiguration>,
@@ -1112,6 +1114,11 @@ impl<R: Read + Send + 'static, W: Write + Send + 'static> PluginBackend<R, W> {
                 .iter()
                 .map(|sender| sender.as_str().to_owned())
                 .collect(),
+            relay_senders: request
+                .relay_senders()
+                .iter()
+                .map(|sender| sender.as_str().to_owned())
+                .collect(),
             max_uncommitted: request.max_uncommitted().get(),
             resume_from: request
                 .resume_from()
@@ -1330,6 +1337,7 @@ fn serve_with<R: Read, W: Write>(
         Some(ClientFrame::Start {
             channel_ids,
             allowed_senders,
+            relay_senders,
             max_uncommitted,
             resume_from,
             backend_configuration,
@@ -1350,6 +1358,11 @@ fn serve_with<R: Read, W: Write>(
                 .map(SenderId::new)
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| PluginError::new("invalid_start", error.to_string()))?;
+            let relay_senders = relay_senders
+                .into_iter()
+                .map(SenderId::new)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| PluginError::new("invalid_start", error.to_string()))?;
             let request = SubscribeRequest::new(
                 channel_ids,
                 allowed_senders,
@@ -1359,6 +1372,9 @@ fn serve_with<R: Read, W: Write>(
                     .map_err(|error| PluginError::new("invalid_start", error.to_string()))?,
             )
             .map_err(|error| PluginError::new("invalid_start", error.to_string()))?;
+            let request = request
+                .with_relay_senders(relay_senders)
+                .map_err(|error| PluginError::new("invalid_start", error.to_string()))?;
             match backend_configuration {
                 Some(configuration) => request.with_backend_configuration(
                     BackendConfiguration::new(configuration.schema, configuration.data)
@@ -2551,6 +2567,7 @@ mod tests {
             &ClientFrame::Start {
                 channel_ids: vec!["channels/one".to_owned()],
                 allowed_senders: vec!["users/owner".to_owned()],
+                relay_senders: Vec::new(),
                 max_uncommitted: 1,
                 resume_from: Some("cursor-zero".to_owned()),
                 backend_configuration: None,
@@ -2589,6 +2606,7 @@ mod tests {
             &ClientFrame::Start {
                 channel_ids: vec!["channels/one".to_owned()],
                 allowed_senders: vec!["users/owner".to_owned()],
+                relay_senders: Vec::new(),
                 max_uncommitted: 1,
                 resume_from: Some("cursor-zero".to_owned()),
                 backend_configuration: None,
@@ -2670,6 +2688,7 @@ mod tests {
             .send(&ClientFrame::Start {
                 channel_ids: vec!["channels/one".to_owned()],
                 allowed_senders: vec!["users/owner".to_owned()],
+                relay_senders: Vec::new(),
                 max_uncommitted: 1,
                 resume_from: Some("cursor-zero".to_owned()),
                 backend_configuration: None,
@@ -2731,6 +2750,7 @@ mod tests {
             .send(&ClientFrame::Start {
                 channel_ids: vec!["channels/one".to_owned()],
                 allowed_senders: vec!["users/owner".to_owned()],
+                relay_senders: Vec::new(),
                 max_uncommitted: 1,
                 resume_from: Some("cursor-zero".to_owned()),
                 backend_configuration: None,
@@ -2791,6 +2811,7 @@ mod tests {
             .send(&ClientFrame::Start {
                 channel_ids: vec!["channels/one".to_owned()],
                 allowed_senders: vec!["users/owner".to_owned()],
+                relay_senders: Vec::new(),
                 max_uncommitted: 1,
                 resume_from: Some("cursor-zero".to_owned()),
                 backend_configuration: None,
@@ -3029,6 +3050,7 @@ mod tests {
             .send(&ClientFrame::Start {
                 channel_ids: vec!["channels/one".to_owned()],
                 allowed_senders: vec!["users/owner".to_owned()],
+                relay_senders: Vec::new(),
                 max_uncommitted: 1,
                 resume_from: Some("cursor-zero".to_owned()),
                 backend_configuration: None,
@@ -3098,6 +3120,7 @@ mod tests {
             &ClientFrame::Start {
                 channel_ids: vec!["channels/one".to_owned()],
                 allowed_senders: vec!["users/owner".to_owned()],
+                relay_senders: Vec::new(),
                 max_uncommitted: 1,
                 resume_from: Some("cursor-zero".to_owned()),
                 backend_configuration: None,
@@ -3402,6 +3425,7 @@ mod tests {
             serde_json::to_value(ClientFrame::Start {
                 channel_ids: vec!["channels/one".to_owned()],
                 allowed_senders: vec!["users/owner".to_owned()],
+                relay_senders: Vec::new(),
                 max_uncommitted: 1,
                 resume_from: Some("cursor-before".to_owned()),
                 backend_configuration: Some(WireBackendConfiguration {

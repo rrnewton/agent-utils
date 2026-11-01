@@ -714,6 +714,10 @@ pub struct BridgeConfiguration {
     /// Per-channel Slack outbound format, overriding `slack_format`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub slack_format_by_channel: BTreeMap<String, SlackFormat>,
+    /// Chat relay channels: peer posts there are dispatched to a command,
+    /// never typed. See [`RelayChannelConfig`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relay_channels: Vec<RelayChannelConfig>,
     /// Names a request prompt's header line prints for senders and channels in place of their
     /// provider IDs: see [`PromptLabels`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -792,6 +796,44 @@ impl PromptLabels {
             }
         }
         Ok(())
+    }
+}
+
+/// One chat relay channel (agent-teams design 10.6, provider-neutral): posts
+/// from `peer_senders` in `channel` are admitted to the relay class only.
+/// They are never typed as prompts and never become requests; each goes, with
+/// the poster's sender ID, to the one configured `command` on stdin (normally
+/// `agent-teams relay-in`). A peer sender maps to one team (`TEAM@HOST` or a
+/// bare project); one bot per team is the normal case, and several sender IDs
+/// may map to the same team. Owner posts in a relay channel are not requests.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelayChannelConfig {
+    /// Provider channel or space identifier.
+    pub channel: String,
+    /// Peer sender ID -> the team it speaks for.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub peer_senders: BTreeMap<String, String>,
+    /// The one command relay posts are piped to (argv, never a shell).
+    pub command: Vec<String>,
+}
+
+impl BridgeConfiguration {
+    /// The relay channel admitting `sender_id` in `channel_id`, when any.
+    #[must_use]
+    pub fn relay_peer_team(&self, channel_id: &str, sender_id: &str) -> Option<&str> {
+        self.relay_channels
+            .iter()
+            .filter(|entry| entry.channel == channel_id)
+            .find_map(|entry| entry.peer_senders.get(sender_id).map(String::as_str))
+    }
+
+    /// Whether `channel_id` is configured as a relay channel at all.
+    #[must_use]
+    pub fn is_relay_channel(&self, channel_id: &str) -> bool {
+        self.relay_channels
+            .iter()
+            .any(|entry| entry.channel == channel_id)
     }
 }
 
@@ -906,6 +948,38 @@ impl BridgeConfiguration {
         if let Some(labels) = &self.labels {
             labels.validate()?;
         }
+        for entry in &self.relay_channels {
+            validate_single_line(&entry.channel, "relay channel", MAX_AGENT_LABEL_BYTES)?;
+            if !self
+                .channel_ids
+                .iter()
+                .any(|channel| channel == &entry.channel)
+            {
+                return Err(ChatRuntimeError::invalid(format!(
+                    "relay channel {:?} must also be one of channel_ids, or the bridge never subscribes to it",
+                    entry.channel
+                )));
+            }
+            if entry.peer_senders.is_empty() {
+                return Err(ChatRuntimeError::invalid(
+                    "a relay channel needs at least one peer sender",
+                ));
+            }
+            if entry.command.is_empty() || entry.command.iter().any(|word| word.is_empty()) {
+                return Err(ChatRuntimeError::invalid(
+                    "a relay channel needs a nonempty command argv",
+                ));
+            }
+            for (sender, team) in &entry.peer_senders {
+                validate_single_line(sender, "relay peer sender", MAX_AGENT_LABEL_BYTES)?;
+                validate_single_line(team, "relay peer team", MAX_AGENT_LABEL_BYTES)?;
+                if self.allowed_senders.iter().any(|owner| owner == sender) {
+                    return Err(ChatRuntimeError::invalid(format!(
+                        "relay peer sender {sender:?} is also in allowed_senders: a peer must never hold owner authority; remove it from one of the two"
+                    )));
+                }
+            }
+        }
         if let Some(range) = self.reply_alias_range {
             if range.first == 0 || range.first > range.last {
                 return Err(ChatRuntimeError::invalid(format!(
@@ -990,6 +1064,19 @@ impl BridgeConfiguration {
             .transpose()
             .map_err(|error| ChatRuntimeError::invalid(error.to_string()))?;
         let request = SubscribeRequest::new(channels, senders, cursor)
+            .map_err(|error| ChatRuntimeError::invalid(error.to_string()))?;
+        // Relay peers are delivery authorities only: the provider may
+        // deliver their posts so the bridge can classify them as relay,
+        // but they are never allowed (owner) senders.
+        let relay_senders = self
+            .relay_channels
+            .iter()
+            .flat_map(|entry| entry.peer_senders.keys().cloned())
+            .map(|value| SenderId::new(value).map_err(|error| error.to_string()))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(ChatRuntimeError::invalid)?;
+        let request = request
+            .with_relay_senders(relay_senders)
             .map_err(|error| ChatRuntimeError::invalid(error.to_string()))?;
         match self.backend_configuration.as_ref() {
             Some(document) => {
@@ -5030,11 +5117,29 @@ pub struct ReplyRouteEntry {
     pub answered: bool,
 }
 
+/// One relay post dispatched to its channel's configured command during
+/// admission. Relay posts create no request and are never typed; this record
+/// is the bridge's evidence of the hand-off (the command's own outcome).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RelayDispatch {
+    /// Provider channel the post arrived in.
+    pub channel_id: String,
+    /// Authenticated poster sender ID.
+    pub sender_id: String,
+    /// Team the sender is mapped to in this channel.
+    pub peer_team: String,
+    /// The command's reported outcome (`accepted`, `not-recorded`, ...),
+    /// or `command-failed` when it did not report one.
+    pub outcome: String,
+}
+
 /// One bounded result of durably admitting an upstream acknowledgement unit.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BatchAdmission {
     /// Newly created durable request keys; replayed duplicates are omitted.
     pub new_request_keys: Vec<String>,
+    /// Relay posts dispatched to their configured command (never requests).
+    pub relay_dispatches: Vec<RelayDispatch>,
     /// Independent, best-effort rejection feedback. Its errors never prevent cursor admission.
     pub rejection_saves: RejectionSaves,
     /// Whether any retained gap still requires request/response reconciliation.
@@ -6832,6 +6937,68 @@ impl BridgeState {
     }
 
     /// Persist every child event and the cursor without acknowledging the provider.
+    /// Dispatch one admitted relay post to its channel's configured command:
+    /// the post text on stdin, with `--peer-sender`, `--channel` and
+    /// `--thread` appended to the configured argv. The command's JSON
+    /// `outcome` is returned; anything else is `command-failed`. Relay
+    /// commands must be idempotent: a replayed batch may dispatch a post
+    /// again, and the receiver's ledger absorbs the duplicate (the
+    /// exactly-once point is the receiving `agent-teams` ledger, never the
+    /// bridge). This never creates a request and never types anything.
+    fn dispatch_relay_post(&self, message: &SavedMessage) -> String {
+        use std::io::Write as _;
+        let Some(entry) = self
+            .config
+            .relay_channels
+            .iter()
+            .find(|entry| entry.channel == message.channel_id)
+        else {
+            return "command-failed".to_string();
+        };
+        let mut argv: Vec<String> = entry.command.clone();
+        argv.extend([
+            "--peer-sender".to_string(),
+            message.sender_id.clone(),
+            "--channel".to_string(),
+            message.channel_id.clone(),
+            "--thread".to_string(),
+            message.thread_id.clone(),
+        ]);
+        let Some((program, args)) = argv.split_first() else {
+            return "command-failed".to_string();
+        };
+        let spawned = std::process::Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        let mut child = match spawned {
+            Ok(child) => child,
+            Err(_) => return "command-failed".to_string(),
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(message.text.as_bytes());
+        }
+        let output = match child.wait_with_output() {
+            Ok(output) => output,
+            Err(_) => return "command-failed".to_string(),
+        };
+        if !output.status.success() {
+            return "command-failed".to_string();
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            if let Ok(value) = serde_json::from_str::<Value>(line.trim()) {
+                if let Some(outcome) = value.get("outcome").and_then(Value::as_str) {
+                    return outcome.to_string();
+                }
+            }
+        }
+        "command-failed".to_string()
+    }
+
+    /// Admit one provider batch durably.
     pub fn admit_batch(&self, batch: &DeliveryBatch) -> Result<BatchAdmission> {
         self.admit_batch_scoped(batch, None)
     }
@@ -7023,6 +7190,7 @@ impl BridgeState {
         let mut candidate_records = Vec::new();
         let mut candidate_messages = BTreeMap::new();
         let mut rejection_candidates = Vec::new();
+        let mut relay_dispatches: Vec<RelayDispatch> = Vec::new();
         let mut request_bytes = 0_u64;
 
         for event in batch.events() {
@@ -7079,6 +7247,37 @@ impl BridgeState {
                         return Err(ChatRuntimeError::invalid(
                             "message is outside configured channel authority",
                         ));
+                    }
+                    // Relay class, before any owner check: a listed peer in
+                    // a relay channel is dispatched only to that channel's
+                    // command and never becomes a request, whoever else the
+                    // sender may be. A relay channel is not an owner channel:
+                    // anyone else posting there (the owner included) is
+                    // refused, never typed.
+                    if self.config.is_relay_channel(&source.channel_id) {
+                        match self
+                            .config
+                            .relay_peer_team(&source.channel_id, &source.sender_id)
+                        {
+                            Some(peer_team) => {
+                                let peer_team = peer_team.to_owned();
+                                let outcome = self.dispatch_relay_post(&source);
+                                relay_dispatches.push(RelayDispatch {
+                                    channel_id: source.channel_id.clone(),
+                                    sender_id: source.sender_id.clone(),
+                                    peer_team,
+                                    outcome,
+                                });
+                            }
+                            None => {
+                                rejection_candidates.push(rejections::RejectionCandidate::new(
+                                    &source.channel_id,
+                                    &source.message_id,
+                                    &source.sender_id,
+                                ));
+                            }
+                        }
+                        continue;
                     }
                     let admitted_at_millis = unix_millis();
                     let permanent_owner = self.config.allowed_senders.contains(&source.sender_id);
@@ -7314,6 +7513,7 @@ impl BridgeState {
         }
         Ok(BatchAdmission {
             new_request_keys: new_records,
+            relay_dispatches,
             rejection_saves,
             reconciliation_required: checkpoint.reconciliation_required,
             host_batch_sequence,
@@ -17894,6 +18094,7 @@ mod tests {
             reply_alias_range: None,
             slack_format: Some(SlackFormat::Markdown),
             slack_format_by_channel: std::collections::BTreeMap::new(),
+            relay_channels: Vec::new(),
             labels: None,
         }
     }
@@ -18404,6 +18605,106 @@ mod tests {
             .with_ignored_text_prefixes(vec!["x".to_owned(); 33])
             .is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn relay_posts_are_dispatched_never_typed_and_owner_posts_in_relay_channels_are_refused() {
+        // The relay command records its stdin and argv, then reports an outcome.
+        let script_root = temporary("relay-command");
+        fs::create_dir_all(&script_root).expect("script root");
+        let record = script_root.join("record.txt");
+        let script = format!(
+            "#!/bin/sh\ncat > {}\nprintf '%s\\n' \"$@\" >> {}\nprintf '{{\"outcome\":\"accepted\"}}\\n'\n",
+            record.display(),
+            record.display()
+        );
+        let script_path = script_root.join("relay.sh");
+        fs::write(&script_path, script).expect("relay script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))
+                .expect("script permissions");
+        }
+        let mut configuration = config();
+        configuration.channel_ids = vec!["spaces/example".to_owned(), "relay/channel".to_owned()];
+        configuration.relay_channels = vec![RelayChannelConfig {
+            channel: "relay/channel".to_owned(),
+            peer_senders: BTreeMap::from([("bots/peer".to_owned(), "sim@host-b".to_owned())]),
+            command: vec![script_path.to_string_lossy().into_owned()],
+        }];
+        // A peer may never also hold owner authority.
+        let mut bad = configuration.clone();
+        bad.allowed_senders.push("bots/peer".to_owned());
+        assert!(bad.validate().is_err(), "peer in allowed_senders refused");
+
+        let root = temporary("relay-admission");
+        let state = BridgeState::initialize(&root, configuration).expect("initialize state");
+        let relay_batch = |sequence: u64, channel: &str, sender: &str, text: &str| {
+            let message = InboundMessage::new(
+                ChannelId::new(channel).expect("channel"),
+                MessageId::new(format!("{channel}/messages/{sequence}")).expect("message"),
+                ThreadId::new(format!("{channel}/threads/{sequence}")).expect("thread"),
+                SenderId::new(sender).expect("sender"),
+                text,
+                "2026-09-21T12:00:00Z",
+                false,
+            )
+            .expect("normalized message");
+            DeliveryBatch::new(
+                EventSequence::new(sequence).expect("sequence"),
+                ProviderCursor::new(format!("cursor-{sequence}")).expect("cursor"),
+                DeliveryId::new(format!("delivery-{sequence}")).expect("delivery"),
+                vec![CommittableEvent::message_created(message)],
+            )
+            .expect("delivery")
+        };
+
+        // A peer post in the relay channel: dispatched, never a request.
+        let admission = state
+            .admit_batch(&relay_batch(
+                1,
+                "relay/channel",
+                "bots/peer",
+                "relay post body",
+            ))
+            .expect("admit relay post");
+        assert!(
+            admission.new_request_keys.is_empty(),
+            "relay post typed as a request"
+        );
+        assert_eq!(admission.relay_dispatches.len(), 1);
+        assert_eq!(admission.relay_dispatches[0].outcome, "accepted");
+        assert_eq!(admission.relay_dispatches[0].peer_team, "sim@host-b");
+        let recorded = fs::read_to_string(&record).expect("command record");
+        assert!(recorded.contains("relay post body"), "{recorded}");
+        assert!(recorded.contains("--peer-sender"), "{recorded}");
+        assert!(recorded.contains("bots/peer"), "{recorded}");
+
+        // The owner posting in a relay channel is not a request either.
+        let admission = state
+            .admit_batch(&relay_batch(
+                2,
+                "relay/channel",
+                "users/owner",
+                "owner words",
+            ))
+            .expect("admit owner relay post");
+        assert!(admission.new_request_keys.is_empty());
+        assert!(admission.relay_dispatches.is_empty());
+
+        // The owner in the normal channel still becomes a request (control).
+        let admission = state
+            .admit_batch(&relay_batch(
+                3,
+                "spaces/example",
+                "users/owner",
+                "run the tests",
+            ))
+            .expect("admit owner post");
+        assert_eq!(admission.new_request_keys.len(), 1);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(script_root).unwrap();
     }
 
     #[test]

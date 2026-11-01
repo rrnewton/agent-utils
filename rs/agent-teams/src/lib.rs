@@ -18,6 +18,7 @@ pub mod jsonfile;
 pub mod ledger;
 pub mod model;
 pub mod proof;
+pub mod relay;
 pub mod route;
 pub mod sender;
 pub mod serve;

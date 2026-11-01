@@ -65,3 +65,13 @@ and registered services send cross-team.
 
 See `agent-teams userguide` for routes (ssh, managed links, the star
 topology), exits, and the exactly-once rules.
+
+## Optional: the chat relay
+
+A third delivery route can run through a shared chat channel (Slack,
+Discord, or any provider that reports sender IDs), so hosts can reach each
+other with neither ssh nor a node-exec runtime, and the owner can read the
+traffic. Run `agent-teams relay setup` for the owner steps and config
+snippets; it creates no channel. Unconfirmed bots in the channel are loud
+strangers — quarantined and alarmed to the coordinator, never silently
+dropped — until confirmed (`relay confirm`) or banned (`relay ban`).

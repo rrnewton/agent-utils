@@ -57,6 +57,7 @@ MESSAGING
   init TEAM (--registry R | --coordinator-self [--coordinator-pid PID])
       [--deliver agentctl-queue|hook-inbox|command] [--argv CMD...]
       [--accepts-from SENDER]... [--accepts-relay-from HUB]...
+      [--relay ROUTE:CHANNEL:SENDER=TEAM[,SENDER=TEAM...]]...
   send TEAM[@HOST] (--file FILE | --text TEXT) [--key KEY | --again]
       [--topic SLUG] [--supersedes KEY]... [--ttl DUR | --expires TIME]
       [--kind info|request|hold|resume] [--private] [--from-service NAME]
@@ -83,6 +84,29 @@ SSH AND LINKS
   ssh enroll --peer HOST [--from ADDR] Make a key; print the authorized_keys line.
   link run ROUTE | up/down ROUTE | status [ROUTE]
                                        Managed persistent ssh links.
+
+CHAT RELAY (provider-neutral; Slack, Discord, or any bridge that reports
+the poster's sender ID and can post into a channel)
+  relay-in --route R --peer-sender ID [--channel C] [--thread T]
+                                       Run by a chat bridge for one admitted
+                                       relay post on stdin. Never typed as a
+                                       prompt; envelopes go to the ledger,
+                                       receipts update the outbox, posts for
+                                       other teams are filtered silently.
+  relay setup [--team T] [--provider slack|discord|generic]
+      [--channel-name NAME] [--channel ID] [--route R] [--sender-id ID]
+      [--peer ID=TEAM]... [--repo-url URL]
+                                       Print owner steps and config snippets.
+                                       Creates no channel; writes nothing.
+  relay status [--json]                Relay routes, channels, candidates.
+  relay announce --route R [--team T] [--sender-id ID] [--repo-url URL]
+      [--print]                        Post (or print) this team's announce.
+  relay teams [--repo ID | --repo-url URL] [--json]
+                                       Teams learned in the channel.
+  relay confirm SENDER [--team T] [--owner-approved] [--json]
+                                       Confirm a candidate mapping, by a
+                                       trusted-route check or owner approval.
+                                       Unconfirmed claims are never admitted.
 
 DOCS
   quickstart | userguide | help [CMD] | --help | --version
@@ -229,6 +253,8 @@ fn run_inner(args: &[String]) -> Result<i32, DataError> {
         "fence" => cmd_fence(&globals, cmd_args),
         "ssh" => cmd_ssh(&globals, cmd_args),
         "link" => cmd_link(&globals, cmd_args),
+        "relay-in" => cmd_relay_in(&globals, cmd_args),
+        "relay" => cmd_relay(&globals, cmd_args),
         other => Err(err(
             "usage",
             format!("unknown command {other:?}; see agent-teams help"),
@@ -302,6 +328,14 @@ fn positional(args: &[String]) -> Vec<String> {
         "--ready-timeout",
         "--id",
         "--agent",
+        "--channel",
+        "--thread",
+        "--channel-name",
+        "--sender-id",
+        "--repo",
+        "--repo-url",
+        "--provider",
+        "--relay",
     ];
     let mut out = Vec::new();
     let mut i = 0;
@@ -905,6 +939,30 @@ fn cmd_init(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
         .iter()
         .map(|sender| json!({"sender": sender, "kinds": ["info", "request", "hold", "resume", "reply"]}))
         .collect();
+    // Relay channels: --relay ROUTE:CHANNEL:SENDER=TEAM[,SENDER=TEAM...]
+    // Several sender IDs may map to the same team.
+    let mut relay_channels: Vec<Value> = Vec::new();
+    for spec in flag_values(args, "--relay") {
+        let mut parts = spec.splitn(3, ':');
+        let (Some(route), Some(channel), Some(peers)) = (parts.next(), parts.next(), parts.next())
+        else {
+            return Err(err(
+                "usage",
+                format!("--relay {spec:?} must be ROUTE:CHANNEL:SENDER=TEAM[,SENDER=TEAM...]"),
+            ));
+        };
+        let mut peer_map = serde_json::Map::new();
+        for pair in peers.split(',') {
+            let Some((sender, team)) = pair.split_once('=') else {
+                return Err(err(
+                    "usage",
+                    format!("--relay peer {pair:?} must be SENDER=TEAM"),
+                ));
+            };
+            peer_map.insert(sender.to_string(), json!(team));
+        }
+        relay_channels.push(json!({"route": route, "channel": channel, "peers": peer_map}));
+    }
     let mut declaration = json!({
         "schema": "agent-teams-declaration/v1",
         "team": team,
@@ -915,6 +973,7 @@ fn cmd_init(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
         "limits": {"max_bytes": 8192, "per_sender_per_hour": 30, "max_ttl_seconds": 604800},
         "default_ttl_seconds": 7200,
         "accepts_relay_from": flag_values(args, "--accepts-relay-from"),
+        "relay_channels": relay_channels,
         "updated_at": format_rfc3339_ms(now_unix_ms()),
         "updated_by": "agent-teams init",
     });
@@ -930,6 +989,14 @@ fn cmd_init(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
         for key in ["comment", "notes", "may_send_to"] {
             if existing.raw.get(key).is_some() && !existing.raw[key].is_null() {
                 declaration[key] = existing.raw[key].clone();
+            }
+        }
+        if declaration["relay_channels"]
+            .as_array()
+            .is_some_and(|a| a.is_empty())
+        {
+            if let Some(existing_channels) = existing.raw.get("relay_channels") {
+                declaration["relay_channels"] = existing_channels.clone();
             }
         }
     }
@@ -1476,6 +1543,9 @@ fn cmd_outbox(globals: &Globals) -> Result<i32, DataError> {
 }
 
 fn cmd_pump(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
+    // Stranger alarms repeat on their timer whenever pump runs.
+    let _ = crate::relay::raise_due_alarms(&globals.state, now_unix_ms());
+    let _ = crate::relay::drain_quarantine(&globals.state, &globals.host);
     let retry_refused = has_flag(args, "--retry-refused");
     let teams = globals.load_teams()?;
     let routes = globals.load_routes()?;
@@ -1845,6 +1915,546 @@ fn cmd_fence(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
     let value = fence(&globals.state, &team, &id, &not_after, None)?;
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(0)
+}
+
+/// `relay-in`: run by a chat bridge for one admitted relay post on stdin.
+/// Prints one JSON object; `receipt_text` is for the caller to post in the
+/// post's thread unless `receipt_posted` is true.
+fn cmd_relay_in(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
+    let route =
+        flag_value(args, "--route").ok_or_else(|| err("usage", "relay-in needs --route R"))?;
+    let peer_sender = flag_value(args, "--peer-sender")
+        .ok_or_else(|| err("usage", "relay-in needs --peer-sender ID"))?;
+    let channel = flag_value(args, "--channel").unwrap_or_default();
+    let thread = flag_value(args, "--thread").unwrap_or_default();
+    let mut text = String::new();
+    std::io::stdin()
+        .read_to_string(&mut text)
+        .map_err(|e| err("io", e.to_string()))?;
+    // Any relay activity re-raises overdue stranger alarms.
+    let _ = crate::relay::raise_due_alarms(&globals.state, now_unix_ms());
+    let out = crate::relay::relay_in(
+        &globals.state,
+        &globals.host,
+        &route,
+        &peer_sender,
+        &channel,
+        &thread,
+        &text,
+    )?;
+    // One compact JSON line: bridges parse the outcome from stdout.
+    println!(
+        "{}",
+        json!({
+            "outcome": out.outcome, "detail": out.detail,
+            "receipt_text": out.receipt_text, "receipt_posted": out.receipt_posted,
+        })
+    );
+    Ok(0)
+}
+
+fn cmd_relay(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
+    let verb = positional(args).into_iter().next();
+    match verb.as_deref() {
+        Some("setup") => cmd_relay_setup(globals, args),
+        Some("status") => cmd_relay_status(globals, args),
+        Some("announce") => cmd_relay_announce(globals, args),
+        Some("teams") => cmd_relay_teams(globals, args),
+        Some("confirm") => cmd_relay_confirm(globals, args),
+        Some("ban") => cmd_relay_ban(globals, args),
+        Some("alarms") => cmd_relay_alarms(globals, args),
+        _ => Err(err(
+            "usage",
+            "relay subcommands: setup, status, announce, teams, confirm, ban, alarms",
+        )),
+    }
+}
+
+fn relay_route_defs(globals: &Globals) -> Result<Vec<crate::model::RouteDef>, DataError> {
+    let routes = globals.load_routes()?;
+    Ok(routes
+        .routes
+        .values()
+        .filter(|def| crate::route::is_relay_def(def))
+        .cloned()
+        .collect())
+}
+
+fn cmd_relay_setup(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
+    let provider = flag_value(args, "--provider").unwrap_or_else(|| "generic".to_string());
+    let team = flag_value(args, "--team").unwrap_or_else(|| "<your-fleet>".to_string());
+    // One relay channel per fleet is the default layout: #relay-<fleet>,
+    // with only that fleet's teams' bots as members. A channel shared by
+    // several fleets is also supported (leave the fleet scope unset).
+    let channel_name = flag_value(args, "--channel-name").unwrap_or_else(|| {
+        format!(
+            "relay-{}",
+            team.trim_start_matches('<').trim_end_matches('>')
+        )
+    });
+    let channel = flag_value(args, "--channel").unwrap_or_else(|| "<channel-id>".to_string());
+    let route = flag_value(args, "--route").unwrap_or_else(|| "relay-coord".to_string());
+    let sender_id =
+        flag_value(args, "--sender-id").unwrap_or_else(|| "<your-bot-user-id>".to_string());
+    let mut peers = serde_json::Map::new();
+    for pair in flag_values(args, "--peer") {
+        if let Some((sender, peer_team)) = pair.split_once('=') {
+            peers.insert(sender.to_string(), json!(peer_team));
+        }
+    }
+    if peers.is_empty() {
+        peers.insert("<peer-bot-user-id>".to_string(), json!("<peer-team>"));
+    }
+    println!("# agent-teams chat relay setup (provider: {provider})");
+    println!("# Nothing was created or written. The owner does step 1 by hand.");
+    println!();
+    println!("## 1. Owner: create the channel (agents never create channels)");
+    match provider.as_str() {
+        "discord" => {
+            println!(
+                "- In Discord, create a text channel named #{channel_name} in the shared server."
+            );
+            println!("- Invite each team's bot account to the server and give every bot permission to view #{channel_name}, read its history, and send messages there. Each team may use a different bot account; a team with two vibing bots invites both.");
+        }
+        "slack" => {
+            println!("- In Slack, create a channel named #{channel_name} and note its channel ID.");
+            println!("- Invite each team's Slack app (bot user) to #{channel_name}. Each team should post as its own app/bot user.");
+        }
+        _ => {
+            println!("- Create one clearly named channel (suggested: #{channel_name}) on your chat provider and note its channel/space ID.");
+            println!("- Add every team's bot/app account to the channel with permission to read history and post. Each team posts as its own bot account; one team may use several bot accounts.");
+        }
+    }
+    println!();
+    println!("## 2. Each team: note every bot user ID visible in the channel");
+    println!("Run `agent-teams relay status` after configuring, announce with `agent-teams relay announce --route {route}`, and confirm peers with `agent-teams relay confirm` (see step 4). Proposed peer mapping for this host:");
+    println!("{}", serde_json::to_string_pretty(&json!(peers))?);
+    println!();
+    println!("## 3a. Bridge configuration (agentctl chat): add to bridge.json config");
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "relay_channels": [{
+                "channel": channel,
+                "peer_senders": peers,
+                "command": ["agent-teams", "relay-in", "--route", route],
+                "comment": "Relay posts are never typed as prompts; they go only to this command."
+            }]
+        }))?
+    );
+    println!("The bridge appends --peer-sender, --channel and --thread when it runs the command.");
+    if provider == "slack" {
+        println!("Slack only: also add the same peers to the Slack backend configuration so the provider admits bot posts in this channel:");
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "backend_configuration": {"data": {"relay_channels": [{"channel": channel, "peer_senders": peers.keys().collect::<Vec<_>>()}]}}
+            }))?
+        );
+    }
+    println!();
+    println!("## 3b. This team's declaration: agent-teams init {team} ... --relay {route}:{channel}:<SENDER=TEAM,...>");
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "relay_channels": [{
+                "route": route, "channel": channel, "fleet": team, "peers": peers,
+                "receipt_argv": ["<your-chat-outbound-helper>", "post", "--channel", "{channel}", "--thread", "{thread}", "--text-file", "{text_file}"],
+                "comment": "fleet scopes this channel to one fleet (posts naming another fleet are refused); omit fleet for a channel shared by several fleets. receipt_argv posts receipts in the post thread; omit it and relay-in prints the receipt for its caller."
+            }]
+        }))?
+    );
+    println!();
+    println!("## 3c. Sender route (routes.d): a command route in relay mode");
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "schema": "agent-teams-routes/v1",
+            "routes": { route.clone(): {
+                "driver": "command", "mode": "relay", "channel": channel,
+                "sender_id": sender_id,
+                "post_argv": ["<your-chat-outbound-helper>", "post", "--channel", "{channel}", "--text-file", "{text_file}"],
+                "list_argv": ["<your-chat-outbound-helper>", "list", "--channel", "{channel}", "--message-id", "{message_id}"],
+                "max_envelope_bytes": 10000, "limits": {"per_hour": 6},
+                "visible_to_owner": true,
+                "comment": "Bodies are visible to every channel member; --private messages never take this route."
+            }}
+        }))?
+    );
+    println!("Add {route:?} to the target host's routes list in teams.json (last: chat is the fallback route).");
+    println!();
+    println!("## 4. Confirm peers before trusting them");
+    println!("Announcements make candidates only. `agent-teams relay teams` lists them; `agent-teams relay confirm <sender-id>` verifies over a trusted route when possible, else asks for one-line owner approval (`--owner-approved`). Never admit an unconfirmed claim.");
+    let _ = globals;
+    Ok(0)
+}
+
+fn cmd_relay_status(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
+    let defs = relay_route_defs(globals)?;
+    let declarations = load_declarations(&globals.state).unwrap_or_default();
+    let store = crate::relay::load_store(&globals.state);
+    let mut channels: Vec<Value> = Vec::new();
+    for (_, _, declaration) in &declarations {
+        for entry in &declaration.relay_channels {
+            channels.push(json!({
+                "team": declaration.team, "route": entry.route, "channel": entry.channel,
+                "peers": entry.peers, "receipt_argv": entry.receipt_argv,
+            }));
+        }
+    }
+    let value = json!({
+        "host": globals.host,
+        "relay_routes": defs.iter().map(|def| json!({
+            "name": def.name, "channel": def.raw.get("channel"),
+            "sender_id": def.raw.get("sender_id"),
+        })).collect::<Vec<_>>(),
+        "declaration_channels": channels,
+        "candidates": store.get("candidates").cloned().unwrap_or(json!([])),
+        "confirmed": store.get("confirmed").cloned().unwrap_or(json!([])),
+        "notes": [
+            "A provider that cannot deliver other bots' posts cannot carry a relay on its live stream; the Slack rescan (90s by default, 24h window) is the fallback path and bounds latency.",
+            "Candidates are never admitted. Only declaration/bridge peer mappings and confirmed peers speak for a team.",
+        ],
+    });
+    if globals.json || has_flag(args, "--json") {
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(0);
+    }
+    for alarm in crate::relay::alarms(&globals.state)
+        .iter()
+        .filter(|alarm| alarm.get("state").and_then(Value::as_str) == Some("open"))
+    {
+        println!(
+            "STRANGER ALARM: sender {} claims {}@{} -> team {} ({}) - confirm: agent-teams relay confirm {} - ban: agent-teams relay ban {}",
+            alarm["sender_id"].as_str().unwrap_or("?"),
+            alarm["claimed_from"]["team"].as_str().unwrap_or("?"),
+            alarm["claimed_from"]["host"].as_str().unwrap_or("?"),
+            alarm["local_team"].as_str().unwrap_or("?"),
+            alarm["reason"].as_str().unwrap_or("?"),
+            alarm["sender_id"].as_str().unwrap_or("?"),
+            alarm["sender_id"].as_str().unwrap_or("?"),
+        );
+    }
+    println!(
+        "relay on {}: {} route(s), {} declaration channel(s)",
+        globals.host,
+        defs.len(),
+        value["declaration_channels"].as_array().map_or(0, Vec::len)
+    );
+    for route in value["relay_routes"].as_array().into_iter().flatten() {
+        println!(
+            "  route {} channel {} sender {}",
+            route["name"], route["channel"], route["sender_id"]
+        );
+    }
+    for row in crate::relay::known_teams(&globals.state, None) {
+        println!(
+            "  {} sender {} team {}@{} repo {}",
+            if row["confirmed"].as_bool() == Some(true) {
+                "confirmed"
+            } else {
+                "candidate"
+            },
+            row["sender_id"].as_str().unwrap_or("?"),
+            row["team"].as_str().unwrap_or("?"),
+            row["host"].as_str().unwrap_or("?"),
+            row["repo_id"].as_str().unwrap_or("?"),
+        );
+    }
+    println!("note: candidates are never admitted until confirmed (relay confirm).");
+    Ok(0)
+}
+
+fn cmd_relay_announce(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
+    let route_name = flag_value(args, "--route")
+        .ok_or_else(|| err("usage", "relay announce needs --route R"))?;
+    let routes = globals.load_routes()?;
+    let def = routes
+        .routes
+        .get(&route_name)
+        .filter(|def| crate::route::is_relay_def(def))
+        .ok_or_else(|| {
+            err(
+                "unknown-route",
+                format!("route {route_name:?} is not a relay route"),
+            )
+        })?;
+    let declarations = load_declarations(&globals.state)?;
+    let team = match flag_value(args, "--team") {
+        Some(team) => team,
+        None => declarations
+            .first()
+            .map(|(team, _, _)| team.clone())
+            .ok_or_else(|| {
+                err(
+                    "usage",
+                    "relay announce needs --team or a local declaration",
+                )
+            })?,
+    };
+    let sender_id = flag_value(args, "--sender-id")
+        .or_else(|| {
+            def.raw
+                .get("sender_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .ok_or_else(|| {
+            err(
+                "usage",
+                "relay announce needs --sender-id or sender_id in the route",
+            )
+        })?;
+    let repo_url = flag_value(args, "--repo-url").or_else(|| {
+        crate::hostindex::load()
+            .into_iter()
+            .find(|entry| entry.team.as_deref() == Some(team.as_str()))
+            .and_then(|entry| entry.repo_origins.into_iter().next())
+    });
+    let announce = crate::relay::build_announce(
+        &team,
+        &globals.host,
+        &sender_id,
+        repo_url.as_deref().unwrap_or(""),
+    );
+    let text = crate::relay::render_announce(&announce);
+    if has_flag(args, "--print") {
+        print!("{text}");
+        return Ok(0);
+    }
+    let route = crate::route::relay_route_for(def, &globals.links_dir());
+    route
+        .post_text(&text)
+        .map_err(|reason| err("relay-post", reason))?;
+    println!(
+        "announced {team}@{} as {sender_id} in channel {}",
+        globals.host, route.channel
+    );
+    Ok(0)
+}
+
+fn cmd_relay_teams(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
+    let repo_filter = match (flag_value(args, "--repo"), flag_value(args, "--repo-url")) {
+        (Some(repo), _) => Some(repo),
+        (None, Some(url)) => Some(crate::relay::repo_id(&url)),
+        (None, None) => None,
+    };
+    let rows = crate::relay::known_teams(&globals.state, repo_filter.as_deref());
+    if globals.json || has_flag(args, "--json") {
+        println!("{}", serde_json::to_string_pretty(&json!(rows))?);
+        return Ok(0);
+    }
+    if rows.is_empty() {
+        println!("no relay teams known here (no announcements seen yet)");
+    }
+    for row in &rows {
+        println!(
+            "{}: {}@{} sender {} repo {}{}",
+            if row["confirmed"].as_bool() == Some(true) {
+                "confirmed"
+            } else {
+                "candidate"
+            },
+            row["team"].as_str().unwrap_or("?"),
+            row["host"].as_str().unwrap_or("?"),
+            row["sender_id"].as_str().unwrap_or("?"),
+            row["repo_id"].as_str().unwrap_or("?"),
+            row.get("source")
+                .and_then(Value::as_str)
+                .map(|s| format!(" via {s}"))
+                .unwrap_or_default(),
+        );
+    }
+    Ok(0)
+}
+
+fn cmd_relay_confirm(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
+    let sender = positional(args)
+        .into_iter()
+        .nth(1)
+        .ok_or_else(|| err("usage", "relay confirm needs a SENDER id"))?;
+    let store = crate::relay::load_store(&globals.state);
+    let candidate = store
+        .get("candidates")
+        .and_then(Value::as_array)
+        .and_then(|list| {
+            list.iter()
+                .rev()
+                .find(|c| c.get("sender_id").and_then(Value::as_str) == Some(sender.as_str()))
+        })
+        .cloned();
+    let Some(candidate) = candidate else {
+        return Err(err(
+            "unknown-sender",
+            format!("no announcement candidate for sender {sender}; nothing to confirm"),
+        ));
+    };
+    let team = flag_value(args, "--team")
+        .unwrap_or_else(|| candidate["team"].as_str().unwrap_or_default().to_string());
+    let host = candidate["host"].as_str().unwrap_or_default().to_string();
+    let repo = candidate["repo_id"].as_str().map(str::to_string);
+    // First try an already-trusted (non-relay) route: ask that host's own
+    // agent-teams probe whether its declaration maps this sender to the
+    // claimed team. The claim is never trusted from the channel alone.
+    let mut trusted = false;
+    if let Ok(teams) = globals.load_teams() {
+        if let Ok(entry) = teams.pick_entry(&team, Some(&host), &globals.host) {
+            let entry = entry.clone();
+            if let Ok(all_routes) = globals.load_routes() {
+                if let Some(host_obj) = teams.hosts.get(&entry.host).cloned() {
+                    let _ = host_obj;
+                    if let Ok(route_objs) =
+                        routes_for_host(globals, &teams, &all_routes, &entry.host)
+                    {
+                        for (route, def) in
+                            route_objs
+                                .iter()
+                                .zip(host_obj_routes(&teams, &all_routes, &entry.host))
+                        {
+                            if def.map(|d| crate::route::is_relay_def(d)).unwrap_or(false) {
+                                continue;
+                            }
+                            if let AttemptOutcome::Answered(probe) =
+                                route.run_verb("probe", &json!({}))
+                            {
+                                let mapped = probe
+                                    .get("teams")
+                                    .and_then(Value::as_array)
+                                    .into_iter()
+                                    .flatten()
+                                    .filter(|t| {
+                                        t.get("team").and_then(Value::as_str) == Some(team.as_str())
+                                    })
+                                    .any(|t| {
+                                        t.get("relay_peers").and_then(Value::as_object).is_some_and(
+                                            |peers| {
+                                                peers
+                                                    .get(&sender)
+                                                    .and_then(Value::as_str)
+                                                    .is_some_and(|mapped| {
+                                                        mapped == team
+                                                            || mapped
+                                                                .starts_with(&format!("{team}@"))
+                                                    })
+                                            },
+                                        )
+                                    });
+                                if mapped {
+                                    trusted = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if trusted {
+        crate::relay::confirm_peer(
+            &globals.state,
+            &sender,
+            &team,
+            &host,
+            repo.as_deref(),
+            "trusted-route",
+        )?;
+        crate::relay::close_alarm(&globals.state, &sender)?;
+        let delivered = crate::relay::drain_quarantine(&globals.state, &globals.host)?;
+        println!(
+            "confirmed {sender} -> {team}@{host} (verified over a trusted route); delivered {} quarantined post(s): {}",
+            delivered.len(),
+            delivered.join(", ")
+        );
+        return Ok(0);
+    }
+    if has_flag(args, "--owner-approved") {
+        crate::relay::confirm_peer(
+            &globals.state,
+            &sender,
+            &team,
+            &host,
+            repo.as_deref(),
+            "owner",
+        )?;
+        crate::relay::close_alarm(&globals.state, &sender)?;
+        let delivered = crate::relay::drain_quarantine(&globals.state, &globals.host)?;
+        println!(
+            "confirmed {sender} -> {team}@{host} (owner approval); delivered {} quarantined post(s): {}",
+            delivered.len(),
+            delivered.join(", ")
+        );
+        return Ok(0);
+    }
+    println!("candidate {sender} claims {team}@{host}, but no trusted route confirms it.");
+    println!("Owner: if this mapping is right, approve it with one line:");
+    println!("  agent-teams relay confirm {sender} --owner-approved");
+    println!("Until then it is not admitted anywhere.");
+    Ok(1)
+}
+
+fn cmd_relay_ban(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
+    let sender = positional(args)
+        .into_iter()
+        .nth(1)
+        .ok_or_else(|| err("usage", "relay ban needs a SENDER id"))?;
+    crate::relay::ban_sender(&globals.state, &sender)?;
+    println!("banned {sender} in the relay: its alarm stops and its posts are dropped");
+    Ok(0)
+}
+
+fn cmd_relay_alarms(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
+    let raised = crate::relay::raise_due_alarms(&globals.state, now_unix_ms())?;
+    let all = crate::relay::alarms(&globals.state);
+    let open: Vec<&Value> = all
+        .iter()
+        .filter(|alarm| alarm.get("state").and_then(Value::as_str) == Some("open"))
+        .collect();
+    if globals.json || has_flag(args, "--json") {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({"raised_now": raised, "alarms": all}))?
+        );
+        return Ok(0);
+    }
+    if open.is_empty() {
+        println!("no open stranger alarms");
+    }
+    for alarm in &open {
+        println!(
+            "STRANGER ALARM: sender {} claims {}@{} -> team {} ({}; raised {}x, last {})",
+            alarm["sender_id"].as_str().unwrap_or("?"),
+            alarm["claimed_from"]["team"].as_str().unwrap_or("?"),
+            alarm["claimed_from"]["host"].as_str().unwrap_or("?"),
+            alarm["local_team"].as_str().unwrap_or("?"),
+            alarm["reason"].as_str().unwrap_or("?"),
+            alarm["raises"].as_u64().unwrap_or(0),
+            alarm["last_raised_at"].as_str().unwrap_or("never"),
+        );
+    }
+    println!(
+        "quarantined posts: {}",
+        crate::relay::quarantined_posts(&globals.state).len()
+    );
+    Ok(0)
+}
+
+/// Route definitions in host order for one host (companion to `routes_for_host`).
+fn host_obj_routes<'a>(
+    teams: &TeamsFile,
+    routes: &'a RoutesFile,
+    host_name: &str,
+) -> Vec<Option<&'a crate::model::RouteDef>> {
+    teams
+        .hosts
+        .get(host_name)
+        .map(|host| {
+            host.routes
+                .iter()
+                .map(|name| routes.routes.get(name))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn cmd_ssh(globals: &Globals, args: &[String]) -> Result<i32, DataError> {

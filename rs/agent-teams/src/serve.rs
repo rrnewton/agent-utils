@@ -110,10 +110,23 @@ pub fn probe(state: &Path, this_host: &str) -> Value {
                         "detail": "the designated coordinator process is not live with its recorded identity",
                     }));
                 }
+                let mut relay_peers = serde_json::Map::new();
+                let mut relay_channels = Vec::new();
+                for entry in &declaration.relay_channels {
+                    for (sender, peer_team) in &entry.peers {
+                        relay_peers.insert(sender.clone(), json!(peer_team));
+                    }
+                    relay_channels.push(json!({
+                        "route": entry.route, "channel": entry.channel,
+                        "fleet": entry.fleet, "peers": entry.peers,
+                    }));
+                }
                 teams.push(json!({
                     "team": team,
                     "declaration": path.to_string_lossy(),
                     "deliverer": declaration.deliverer_kind,
+                    "relay_peers": relay_peers,
+                    "relay_channels": relay_channels,
                     "coordinator_live": live,
                     "coordinator": coordinator.map(|c| json!({
                         "boot_id": c.boot_id, "pid": c.pid, "starttime_ticks": c.starttime_ticks,

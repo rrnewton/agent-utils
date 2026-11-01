@@ -1,0 +1,18 @@
+{
+  "schema": "agent-teams-routes/v1",
+  "comment": "Placeholders only: *.example.json files are never loaded as live routes. The chat relay route: one post per envelope in a shared channel, through your chat outbound helper (Slack, Discord, or any provider that reports sender IDs). Copy to routes.d/relay.json with a real channel and helper, and add relay-coord LAST in the target host's routes list (chat is the fallback; the owner reads it).",
+  "routes": {
+    "relay-coord": {
+      "driver": "command",
+      "mode": "relay",
+      "channel": "C0RELAY0000",
+      "sender_id": "U0YOURBOT01",
+      "comment": "sender_id is the bot user this host posts as. post_argv posts one post from {text_file}; list_argv lists channel/thread posts so receipts in the thread can be read back. Bodies are visible to every channel member; --private messages never take this route.",
+      "post_argv": ["/usr/local/bin/example-chat-helper", "post", "--channel", "{channel}", "--text-file", "{text_file}"],
+      "list_argv": ["/usr/local/bin/example-chat-helper", "list", "--channel", "{channel}", "--message-id", "{message_id}"],
+      "max_envelope_bytes": 10000,
+      "limits": {"per_hour": 6},
+      "visible_to_owner": true
+    }
+  }
+}
