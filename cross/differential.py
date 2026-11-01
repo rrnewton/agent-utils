@@ -12751,6 +12751,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="list the independently selectable differential tools and exit",
     )
+    parser.add_argument("--shard", default="0/1", help="interleaved group shard I/N (agentctl tool only)")
     parser.add_argument("--random", type=int, default=24, help="number of randomized fixtures")
     parser.add_argument("--seed", type=int, default=1234, help="RNG seed for randomized fixtures")
     parser.add_argument(
@@ -12802,7 +12803,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "herdr-agent": lambda: compare_herdr_agent(
             py_command_for("herdr-agent"), rs_command("herdr-agent")
         ),
-        "agentctl": lambda: compare_agentctl(py_command_for("agentctl"), rs_command("agentctl")),
+        "agentctl": lambda: compare_agentctl(
+            py_command_for("agentctl"), rs_command("agentctl"),
+            shard=int(ns.shard.split("/")[0]), shards=int(ns.shard.split("/")[1]),
+        ),
     }
     assert tuple(runners) == DIFFERENTIAL_TOOLS
 

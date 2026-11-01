@@ -154,9 +154,18 @@ def test_rust_and_cross_nodes_cover_their_registries_once() -> None:
     )
 
     assert rust_tests == Counter({name: 1 for name in _workspace_crates()})
-    assert cross_tools == Counter(
-        {name: 1 for name in _listed("cross/differential.py --list-tools")}
+    listed = _listed("cross/differential.py --list-tools")
+    # Every tool is covered; agentctl is sharded by group into three nodes
+    # whose --shard values together cover 0/3, 1/3, 2/3 exactly once.
+    assert {name for name, count in cross_tools.items() if count >= 1} == set(listed)
+    assert all(count == 1 for name, count in cross_tools.items() if name != "agentctl")
+    agentctl_shards = sorted(
+        shard
+        for step in config.steps
+        if step.tag.startswith("cross.") and "agentctl" in _flag_values(step.cmd, "--tool")
+        for shard in _flag_values(step.cmd, "--shard")
     )
+    assert agentctl_shards == ["0/3", "1/3", "2/3"]
 
 
 def test_wrkslots_component_selection_includes_every_lifecycle_shard() -> None:

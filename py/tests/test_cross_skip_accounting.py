@@ -1641,7 +1641,7 @@ def test_validate_expects_a_record_from_exactly_the_selected_cross_nodes() -> No
     by_tag = dag_from_path(REPO_ROOT / "validation.dag.yaml").by_tag()
     every_cross_node = [tag for tag, step in by_tag.items() if "cross/differential.py" in step.cmd]
 
-    assert len(every_cross_node) == 7
+    assert len(every_cross_node) == 9  # 7 tools, agentctl sharded into 3 nodes
     assert validate.selected_cross_nodes(frozenset(), frozenset(), all_contract=True) == (
         every_cross_node
     )

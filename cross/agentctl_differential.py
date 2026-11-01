@@ -3198,50 +3198,62 @@ def _registry_layout_migration(harness: Harness, report: Report) -> None:
     )
 
 
-def build_report(python_command: Sequence[str], rust_command: Sequence[str]) -> Report:
+def _groups() -> list[tuple[str, object]]:
+    # Imported here: the group's module imports this one's helpers.
+    from agentctl_nested_records import nested_records
+
+    return [
+        ("orientation", _orientation), ("lifecycle", _lifecycle),
+        ("conversations", _conversations), ("launch-specs", _launch_specs),
+        ("profiles", _profiles), ("profile-resume", _profile_resume),
+        ("workspace-policy", _workspace_policy), ("skill-install", _skill_install),
+        ("profile-refusals", _profile_refusals),
+        ("herdr-093", _herdr_093_compatibility), ("muse-adoption", _muse_adoption),
+        ("muse14-status", _muse14_status), ("muse-busy", _muse_busy_followup),
+        ("handoff", _handoff_and_pending), ("queue-lanes", _queue_lanes),
+        ("registry-interop", _registry_and_interop),
+        ("legacy-registry", _legacy_adopted_registry_and_queue),
+        ("registry-migration", _registry_layout_migration),
+        ("ownership", _ownership), ("dead-retirement", _dead_adopted_retirement),
+        ("dead-recovery", _managed_dead_recovery),
+        ("stop-recovery", _stop_recovery_quoted_globals),
+        ("revive", _revive_interop), ("adoption", _adoption),
+        ("identity", _identity_and_rename), ("nested-records", nested_records),
+        ("invalid-cli", _invalid_cli),
+    ]
+
+
+def shard_groups(shard: int, shards: int) -> list[tuple[str, object]]:
+    """Interleaved shard `shard` of `shards` over the group list (all if shards=1)."""
+    groups = _groups()
+    if not 0 <= shard < shards:
+        raise ValueError(f"shard {shard}/{shards} out of range")
+    return groups[shard::shards]
+
+
+def build_report(
+    python_command: Sequence[str], rust_command: Sequence[str],
+    *, shard: int = 0, shards: int = 1,
+) -> Report:
     """Compare the canonical interface through independent executable clients."""
     report = Report()
     with tempfile.TemporaryDirectory(prefix="agentctl-cross-") as temporary:
         harness = Harness(Path(temporary), python_command, rust_command)
         try:
-            _orientation(harness, report)
-            _lifecycle(harness, report)
-            _conversations(harness, report)
-            _launch_specs(harness, report)
-            _profiles(harness, report)
-            _profile_resume(harness, report)
-            _workspace_policy(harness, report)
-            _skill_install(harness, report)
-            _profile_refusals(harness, report)
-            _herdr_093_compatibility(harness, report)
-            _muse_adoption(harness, report)
-            _muse14_status(harness, report)
-            _muse_busy_followup(harness, report)
-            _handoff_and_pending(harness, report)
-            _queue_lanes(harness, report)
-            _registry_and_interop(harness, report)
-            _legacy_adopted_registry_and_queue(harness, report)
-            _registry_layout_migration(harness, report)
-            _ownership(harness, report)
-            _dead_adopted_retirement(harness, report)
-            _managed_dead_recovery(harness, report)
-            _stop_recovery_quoted_globals(harness, report)
-            _revive_interop(harness, report)
-            _adoption(harness, report)
-            _identity_and_rename(harness, report)
-            # Imported here: the group's module imports this one's helpers.
-            from agentctl_nested_records import nested_records
-            nested_records(harness, report)
-            _invalid_cli(harness, report)
+            for _name, run_group in shard_groups(shard, shards):
+                run_group(harness, report)  # type: ignore[operator]
             harness.require_no_host_cli(report)
         finally:
             harness.close()
     return report
 
 
-def compare_agentctl(python_command: Sequence[str], rust_command: Sequence[str]) -> int:
+def compare_agentctl(
+    python_command: Sequence[str], rust_command: Sequence[str],
+    *, shard: int = 0, shards: int = 1,
+) -> int:
     """Report semantic differences and return a conventional process exit code."""
-    report = build_report(python_command, rust_command)
+    report = build_report(python_command, rust_command, shard=shard, shards=shards)
     for failure in report.failures:
         print(f"DIVERGENCE [{failure}]")
     if report.failures:

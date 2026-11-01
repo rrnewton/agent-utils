@@ -74,6 +74,7 @@
         "py/tests/test_agentctl_chat_storage.py",
         "py/tests/test_agentctl_chat_tagged.py",
         "py/tests/test_agentctl_client_launch.py",
+        "py/tests/test_agentctl_differential_shards.py",
         "py/tests/test_agentctl_identity.py",
         "py/tests/test_agentctl_launch_spec.py",
         "py/tests/test_agentctl_lifecycle.py",
