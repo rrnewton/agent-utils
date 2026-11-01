@@ -1,10 +1,11 @@
 ---
 title: 'agentctl-muse-stale-draft: a draft agentctl typed but Muse never submitted holds every owner message'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 created_at: 2026-11-01T08:07:37.884533520+00:00
-updated_at: 2026-11-01T13:32:14.512588529+00:00
+updated_at: 2026-11-01T13:34:04.063820447+00:00
+closed_at: 2026-11-01T13:34:04.063819596+00:00
 ---
 
 # Description
