@@ -56,13 +56,13 @@ export const PACKAGES = Object.freeze({
   "present/call": BASE,
   "present/notices": [...BASE, "core/api", "present/time"],
   "present/rows": [...BASE, "core/channels", "present/time"],
-  "present/settings": [...BASE, "core/outbox", "present/notices", "present/time"],
+  "present/settings": [...BASE, "core/outbox", "core/settings", "present/notices", "present/time"],
   "present/time": BASE,
   "view/channel": [...BASE, "view/dom", "core/annotations", "core/channels", "present/rows", "present/time", "present/notices"],
   "view/composer": [...BASE, "view/dom"],
   "view/voice": [...BASE, "view/dom", "view/channel", "view/composer", "core/api", "core/call", "core/settings", "core/speech", "present/call", "present/notices", "present/rows", "present/time"],
   "view/dom": BASE,
-  "view/settings": [...BASE, "view/dom", "core/navigation", "core/outbox", "present/notices", "present/settings"],
+  "view/settings": [...BASE, "view/dom", "core/navigation", "core/outbox", "core/settings", "present/notices", "present/settings"],
   legacy: "*",
 });
 

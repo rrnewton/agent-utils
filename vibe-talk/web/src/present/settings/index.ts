@@ -67,3 +67,4 @@ export {
   pairingRefusedWords,
   pairingTransferAddress,
 } from "./pairing.ts";
+export { GRIP_KEYS, MSG_SCALE_STEP, msgScaleStepTarget, msgScaleWords, readingWidthWords } from "./screen.ts";

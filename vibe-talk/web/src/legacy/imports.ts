@@ -59,7 +59,7 @@ export {
   unsentText,
   waitingItsTurn as outboxWaitingItsTurn,
 } from "../core/outbox/index.ts";
-export { DEFAULT_CARD_MAX_LINES, DEFAULT_COLLAPSED_LINES, DEFAULT_READING_CH, DEVICE_SETTINGS, IDENTITY_KEY, MAX_CARD_MAX_LINES, MAX_COLLAPSED_LINES, MAX_MSG_SCALE, MAX_READING_CH, MIN_CARD_MAX_LINES, MIN_COLLAPSED_LINES, MIN_MSG_SCALE, MIN_READING_CH, clampCardMaxLines, clampCollapsedLines, clampMsgScale, clampReadingWidth, createCredentials, createDeviceSettings, createSettingsSync } from "../core/settings/index.ts";
+export { DEFAULT_CARD_MAX_LINES, DEFAULT_COLLAPSED_LINES, DEVICE_SETTINGS, IDENTITY_KEY, MAX_CARD_MAX_LINES, MAX_COLLAPSED_LINES, MIN_CARD_MAX_LINES, MIN_COLLAPSED_LINES, clampCardMaxLines, clampCollapsedLines, createCredentials, createDeviceSettings, createSettingsSync } from "../core/settings/index.ts";
 export { createWebPorts } from "../platform/web/index.ts";
 export {
   answersEnter,
@@ -120,7 +120,9 @@ export {
   mountHelpFolds,
   mountIdentityList,
   mountPairing,
+  mountReadingWidth,
   mountServerCache,
   mountSettingsFolds,
+  mountTextSize,
   mountUpstreamClear,
 } from "../view/settings/index.ts";

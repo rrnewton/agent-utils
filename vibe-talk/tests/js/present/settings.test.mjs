@@ -186,3 +186,21 @@ test("`#369 pairing-link`: what the sign-in screen says about a pairing link", (
   assert.equal(pairingTransferAddress("https://talk.example", null), "https://talk.example/#pair=");
   for (const line of [PAIRING_UNREACHED, PAIRING_WRONG_LINK, PAIRING_PARTIAL]) assert.match(line, /^[A-Z].*\.$/);
 });
+
+test("`#55 voice-desktop-app`, `#230 text-size-buttons`: the text size's steps, the reading width's keys, and what Settings says of each", () => {
+  const { MSG_SCALE_STEP, msgScaleStepTarget, msgScaleWords, readingWidthWords, GRIP_KEYS } = SETTINGS;
+  assert.equal(MSG_SCALE_STEP, 5);
+  // From a mark, the next mark; from between two (a hand-edited 83), the next mark that way.
+  assert.equal(msgScaleStepTarget(100, 1), 105);
+  assert.equal(msgScaleStepTarget(100, -1), 95);
+  assert.equal(msgScaleStepTarget(83, 1), 85);
+  assert.equal(msgScaleStepTarget(83, -1), 80);
+  assert.equal(msgScaleWords(110, true), "Saved — message text at 110% of its usual size.");
+  assert.match(msgScaleWords(110, false), /^This browser refused to store the text size.* Message text is at 110% until then\.$/);
+  assert.equal(readingWidthWords(72, true), "Saved — a column 72 characters wide.");
+  assert.match(readingWidthWords(72, false), /The column is 72 characters wide until then\.$/);
+  assert.deepStrictEqual(["ArrowLeft", "ArrowRight", "ArrowDown", "ArrowUp", "PageDown", "PageUp"].map((key) => GRIP_KEYS[key](70)),
+    [69, 71, 69, 71, 60, 80]);
+  assert.ok(GRIP_KEYS.Home(70) < GRIP_KEYS.End(70));
+  assert.equal(GRIP_KEYS.Enter, undefined, "a key the handle does not take is left to the page");
+});

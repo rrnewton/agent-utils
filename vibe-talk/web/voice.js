@@ -11790,68 +11790,17 @@ function renderControlBar() {
 // it, so that is what the reader is choosing and what gets stored.
 
 /**
- * The reader's own type size for message text, as a PERCENTAGE of the stylesheet's own.
+ * The reader's own type size for message text, and the − and + beside its slider (`#230
+ * text-size-buttons`): web/src/view/settings `mountTextSize`, in the words of web/src/present/settings
+ * (`#624 voice-page-modularity`). Kept on the device.
  *
- * Bounded rather than free: under about eighty per cent the text stops being readable at arm's
- * length on a phone, and over about a hundred and fifty the fold control and the row's own
- * controls no longer line up with the words they belong to.
+ * @type {import("./src/view/settings/index.ts").TextSize}
  */
-/** The slider's `step` in web/voice.html, and what one press of its − or + moves it by. */
-const MSG_SCALE_STEP = 5;
-
-/**
- * Put a type size on the page, and return the one actually applied, which is the clamped one.
- * The − and + beside the slider are disabled at the end each moves towards, here, so that they are
- * right after a drag and at load as well as after a press of one of them.
- */
-function applyMsgScale(value) {
-  const pct = clampMsgScale(value);
-  document.documentElement.style.setProperty("--msg-scale", String(pct / 100));
-  el("msg-scale").value = String(pct);
-  el("msg-scale-smaller").disabled = pct <= MIN_MSG_SCALE;
-  el("msg-scale-larger").disabled = pct >= MAX_MSG_SCALE;
-  return pct;
-}
-
-/** Store it, and READ IT BACK: private browsing accepts `setItem` and keeps nothing. */
-function persistMsgScale(pct) {
-  try {
-    deviceSettings().keep(DEVICE_SETTINGS.msgScale, pct);
-  } catch (_error) {
-    return false;
-  }
-  return deviceSettings().keptAs(DEVICE_SETTINGS.msgScale, pct);
-}
-
-/** Apply a new size and say, in Settings, whether it will survive a reload. */
-function msgScaleChanged(value) {
-  const pct = applyMsgScale(value);
-  el("msg-scale-state").textContent = persistMsgScale(pct)
-    ? `Saved — message text at ${pct}% of its usual size.`
-    : "This browser refused to store the text size, so it will be forgotten when you reload " +
-      `(private browsing does this). Message text is at ${pct}% until then.`;
-}
-
-/**
- * `#230 text-size-buttons`. One step of the slider, down (-1) or up (+1): what its − and + do.
- *
- * Through `msgScaleChanged`, the slider's own path, so a press is applied, kept and said exactly as
- * a drag to the same place is. It lands on one of the slider's marks: from a size between two (a
- * hand-edited 83 in storage), the next mark that way, as the slider's own `stepUp` and `stepDown`
- * would. A held button does not repeat: one press, one step, and the slider is there for a big move.
- *
- * @param {1 | -1} direction
- */
-function stepMsgScale(direction) {
-  const marks = (clampMsgScale(el("msg-scale").value) - MIN_MSG_SCALE) / MSG_SCALE_STEP;
-  const mark = direction > 0 ? Math.floor(marks) + 1 : Math.ceil(marks) - 1;
-  const button = el(direction > 0 ? "msg-scale-larger" : "msg-scale-smaller");
-  const held = document.activeElement === button;
-  msgScaleChanged(MIN_MSG_SCALE + mark * MSG_SCALE_STEP);
-  // A button disabled under the focus drops it, and the keyboard is left on nothing. The slider
-  // between the two takes it, which says the size it is at and moves on with the arrows.
-  if (held && button.disabled) el("msg-scale").focus();
-}
+const textSize = mountTextSize({
+  lookup: (id) => el(id),
+  keep: (pct) => deviceSettings().keep(DEVICE_SETTINGS.msgScale, pct),
+  keptAs: (pct) => deviceSettings().keptAs(DEVICE_SETTINGS.msgScale, pct),
+});
 
 /** What was stored, clamped. A missing or corrupt entry is the default, never an error. */
 function storedCollapsedLines() {
@@ -11944,7 +11893,7 @@ function collapsedLinesChanged(value) {
 
 /**
  * One line fewer (-1) or more (+1): what the slider's − and + do, through `collapsedLinesChanged`,
- * the slider's own path, as `stepMsgScale` steps the text size.
+ * the slider's own path, as `textSize.step` steps the text size.
  *
  * @param {1 | -1} direction
  */
@@ -12413,122 +12362,19 @@ function storedReadingWidth() {
   return deviceSettings().get(DEVICE_SETTINGS.readingWidth);
 }
 
-// The width currently in force, kept here rather than read back out of the DOM: reading a custom
-// property back gives you the string that was written, and a drag would then be parsing its own
-// output forty times a second.
-let readingWidth = DEFAULT_READING_CH;
-
 /**
- * Put a width on the page. Returns the width that was actually applied, which is the clamped one.
+ * The reading column's width, from Settings' slider or the handle on the column's edge, its drag and
+ * its keys: web/src/view/settings `mountReadingWidth`, in the words of web/src/present/settings (`#624
+ * voice-page-modularity`). Kept on the device; the stylesheet decides whether it means anything.
  *
- * The custom property goes on `document.documentElement` because the two things it has to reach —
- * the panes inside #screen-main and the control pane inside the dock — have no common ancestor
- * below the root.
+ * @type {import("./src/view/settings/index.ts").ReadingWidth}
  */
-function applyReadingWidth(value) {
-  readingWidth = clampReadingWidth(value);
-  document.documentElement.style.setProperty("--reading-width", `${readingWidth}ch`);
-  el("reading-width").value = String(readingWidth);
-  el("width-grip").setAttribute("aria-valuenow", String(readingWidth));
-  el("width-grip").setAttribute("aria-valuetext", `${readingWidth} characters`);
-  return readingWidth;
-}
+const readingWidthControl = mountReadingWidth({
+  lookup: (id) => el(id),
+  keep: (ch) => deviceSettings().keep(DEVICE_SETTINGS.readingWidth, ch),
+  keptAs: (ch) => deviceSettings().keptAs(DEVICE_SETTINGS.readingWidth, ch),
+});
 
-/**
- * Store it, and READ IT BACK rather than assuming — the same check `persistMicSettings` makes, for
- * the same reason: private browsing accepts setItem and stores nothing, so "saved" would be a lie
- * discovered only after a reload.
- */
-function persistReadingWidth(ch) {
-  try {
-    deviceSettings().keep(DEVICE_SETTINGS.readingWidth, ch);
-  } catch (_error) {
-    return false;
-  }
-  return deviceSettings().keptAs(DEVICE_SETTINGS.readingWidth, ch);
-}
-
-/** Apply a new width and say, in the settings screen, whether it will survive a reload. */
-function readingWidthChanged(value) {
-  const ch = applyReadingWidth(value);
-  el("reading-width-state").textContent = persistReadingWidth(ch)
-    ? `Saved — a column ${ch} characters wide.`
-    : "This browser refused to store the reading width, so it will be forgotten when you " +
-      `reload (private browsing does this). The column is ${ch} characters wide until then.`;
-}
-
-// A drag, in three events. Pointer events rather than mouse events so a trackpad, a pen and a
-// desktop touchscreen all work through one path; the regime that shows the handle at all is the
-// stylesheet's business, not this code's.
-let widthDrag = null;
-
-/**
- * How many pixels one character is, measured from the column that is actually on screen rather
- * than assumed. `1ch` is the width of a zero in the current font, which is neither a constant nor
- * knowable from here — but the pane IS `max-width: var(--reading-width)`, so its rendered width
- * divided by the width in force is the conversion factor, whatever the font turns out to be.
- */
-function pixelsPerCh() {
-  const measured = el("pane-voice").getBoundingClientRect().width;
-  if (measured > 0 && readingWidth > 0) {
-    return measured / readingWidth;
-  }
-  return 8; // nothing laid out yet; a plausible figure beats dividing by zero.
-}
-
-function onGripDown(event) {
-  const box = el("screen-main").getBoundingClientRect();
-  // The column is centred, so the handle's distance from the middle is HALF the width. Captured
-  // once at the start of the drag: re-measuring mid-drag would feed the drag its own output.
-  widthDrag = { centre: box.left + box.width / 2, perCh: pixelsPerCh() };
-  const grip = el("width-grip");
-  if (event && event.pointerId !== undefined && grip.setPointerCapture) {
-    // So the drag survives the pointer leaving the nine-pixel handle, which it does immediately.
-    grip.setPointerCapture(event.pointerId);
-  }
-}
-
-function onGripMove(event) {
-  if (!widthDrag || !event) {
-    return;
-  }
-  applyReadingWidth(((event.clientX - widthDrag.centre) * 2) / widthDrag.perCh);
-}
-
-function onGripUp() {
-  if (!widthDrag) {
-    return;
-  }
-  widthDrag = null;
-  // Stored at the END of the drag, not on every frame: forty writes a second to localStorage is a
-  // synchronous disk hit per frame, and only the width the reader stopped at is a decision.
-  readingWidthChanged(readingWidth);
-}
-
-// A separator with `tabindex` is only a control if the arrow keys move it. Shift for a bigger
-// step, Home/End for the ends, which is what a range input does and therefore what a reader who
-// has used one expects.
-const GRIP_KEYS = {
-  ArrowLeft: () => readingWidth - 1,
-  ArrowRight: () => readingWidth + 1,
-  ArrowDown: () => readingWidth - 1,
-  ArrowUp: () => readingWidth + 1,
-  PageDown: () => readingWidth - 10,
-  PageUp: () => readingWidth + 10,
-  Home: () => MIN_READING_CH,
-  End: () => MAX_READING_CH,
-};
-
-function onGripKey(event) {
-  const next = event && GRIP_KEYS[event.key];
-  if (!next) {
-    return;
-  }
-  if (event.preventDefault) {
-    event.preventDefault(); // PageUp and the arrows would otherwise scroll the list behind it.
-  }
-  readingWidthChanged(next());
-}
 // When the page was last hidden, or 0 while it is visible. `#203 incremental-refresh`.
 let hiddenAt = 0;
 
@@ -39598,8 +39444,8 @@ el("resume-toggle").addEventListener("change", () => {
 // The column the reader last chose, restored before anything is drawn into it. Applied
 // unconditionally: on a phone the stylesheet never consults the value, so there is nothing to
 // branch on here and no second definition of "is this a desktop" to drift.
-applyReadingWidth(storedReadingWidth());
-applyMsgScale(storedMsgScale());
+readingWidthControl.apply(storedReadingWidth());
+textSize.apply(storedMsgScale());
 // `#425 collapsed-lines`. Before anything is drawn, for the same reason: a first list folded at
 // three and refolded at the reader's count a moment later is a jump nobody asked for.
 applyCollapsedLines(storedCollapsedLines());
@@ -39635,10 +39481,10 @@ if (typeof window.ResizeObserver === "function") {
   });
   for (const id of COMPOSER_GROW_BOXES) growing.observe(leftEl(id));
 }
-el("reading-width").addEventListener("input", () => readingWidthChanged(el("reading-width").value));
-el("msg-scale").addEventListener("input", () => msgScaleChanged(el("msg-scale").value));
-el("msg-scale-smaller").addEventListener("click", () => stepMsgScale(-1));
-el("msg-scale-larger").addEventListener("click", () => stepMsgScale(1));
+el("reading-width").addEventListener("input", () => readingWidthControl.changed(el("reading-width").value));
+el("msg-scale").addEventListener("input", () => textSize.changed(el("msg-scale").value));
+el("msg-scale-smaller").addEventListener("click", () => textSize.step(-1));
+el("msg-scale-larger").addEventListener("click", () => textSize.step(1));
 el("collapsed-lines").addEventListener("input", () => collapsedLinesChanged(el("collapsed-lines").value));
 el("collapsed-lines-smaller").addEventListener("click", () => stepCollapsedLines(-1));
 el("collapsed-lines-larger").addEventListener("click", () => stepCollapsedLines(1));
@@ -39648,11 +39494,11 @@ el("page-update").addEventListener("click", () => window.location.reload());
 renderPageBuild();
 el("card-max-lines-smaller").addEventListener("click", () => stepCardMaxLines(-1));
 el("card-max-lines-larger").addEventListener("click", () => stepCardMaxLines(1));
-el("width-grip").addEventListener("pointerdown", onGripDown);
-el("width-grip").addEventListener("pointermove", onGripMove);
-el("width-grip").addEventListener("pointerup", onGripUp);
-el("width-grip").addEventListener("pointercancel", onGripUp);
-el("width-grip").addEventListener("keydown", onGripKey);
+el("width-grip").addEventListener("pointerdown", (event) => readingWidthControl.gripDown(event));
+el("width-grip").addEventListener("pointermove", (event) => readingWidthControl.gripMove(event));
+el("width-grip").addEventListener("pointerup", () => readingWidthControl.gripUp());
+el("width-grip").addEventListener("pointercancel", () => readingWidthControl.gripUp());
+el("width-grip").addEventListener("keydown", (event) => readingWidthControl.gripKey(event));
 
 // `#54 resume-recovery`. The one signal a browser gives for "this page went away": it is what
 // distinguishes a socket that died because the reader switched apps from one that died because

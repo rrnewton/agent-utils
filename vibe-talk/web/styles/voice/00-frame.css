@@ -83,7 +83,7 @@
      here, with the other tokens, rather than inside the media query, so that web/voice.js can set
      it on `document.documentElement` at load without knowing which regime is in force. `ch` and
      not `rem`: what makes a line hard to read is how many CHARACTERS are on it, and that is the
-     unit that says so. Overwritten per reader; see `applyReadingWidth`. */
+     unit that says so. Overwritten per reader; see web/src/view/settings `mountReadingWidth`. */
   --reading-width: 72ch;
   /* `#32 freshness-pill-overlap`. The saved-messages pill's box, in the tokens its reservation at
      the head of #pane-discord is computed from, so that the two cannot drift apart.
