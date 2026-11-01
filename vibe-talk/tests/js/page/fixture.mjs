@@ -462,6 +462,8 @@ const SCROLL_VIEWPORT_PX = 400;
  * model of a page that no longer exists.
  */
 const FIXTURE_TREE = {
+  // `#727 vt-selection-quick-reply`: a tap in the floating box is not a tap outside it.
+  "quick-reply": ["quick-reply-quote", "quick-reply-text", "quick-reply-state", "quick-reply-cancel", "quick-reply-send"],
   "scroll-area": ["pane-voice", "pane-discord"],
   // `#241 voice-composer`. The call's message box is the last thing in its pane, inside the
   // scrolling element, as the channel's box is in its own; its height is part of what "the reader is
@@ -5206,6 +5208,12 @@ const TUNING_BANDS = {
   DEFAULT_CARD_MAX_LINES: [5, 5,
     "the lines a thread card shows of its first message until the owner says otherwise: his five, " +
     "and src/threads.rs DEFAULT_CARD_MAX_LINES (#522 thread-card-max-lines)"],
+  QUICK_REPLY_GAP_PX: [4, 24,
+    "how far under the selected words the quick reply stands (#727 vt-selection-quick-reply): closer and it " +
+    "covers a phone's selection handles; further and the words it answers and the box read as apart"],
+  QUICK_REPLY_MAX_WIDTH_PX: [360, 720,
+    "the widest the quick reply is drawn (#727 vt-selection-quick-reply): narrower and a desk's box wraps a " +
+    "short answer onto many lines; wider and it covers most of the reading column it floats over"],
   SELECTION_CHIP_GAP_PX: [8, 24,
     "how far under a selection the Quoted reply chip stands (#726 vt-selection-chip): closer and a phone's " +
     "selection handles, which hang under the words, cover it; further and it reads as belonging to the next line"],

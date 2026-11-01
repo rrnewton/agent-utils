@@ -359,6 +359,12 @@ export interface ElementById {
   "prompts-open-label": HTMLSpanElement;
   "prompts-tray": HTMLDivElement;
   "pull-refresh": HTMLDivElement;
+  "quick-reply": HTMLDivElement;
+  "quick-reply-cancel": HTMLButtonElement;
+  "quick-reply-quote": HTMLElement;
+  "quick-reply-send": HTMLButtonElement;
+  "quick-reply-state": HTMLParagraphElement;
+  "quick-reply-text": HTMLTextAreaElement;
   "quote-read-percent": HTMLInputElement;
   "quote-read-percent-larger": HTMLButtonElement;
   "quote-read-percent-smaller": HTMLButtonElement;

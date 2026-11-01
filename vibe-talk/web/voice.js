@@ -6593,6 +6593,8 @@ function readerActed() {
  * message in place, which nothing but the reader moves. Every "follow the newest line" asks this.
  */
 function followsNewest(area) {
+  // `#727 vt-selection-quick-reply`. Never a list held still for a quick reply.
+  if (quickReplyHolds(area)) return false;
   return atBottom(area) && heldFilterRow() === null;
 }
 
@@ -30562,12 +30564,219 @@ function drawSelectionChip() {
   chip.style.top = `${Math.round(top)}px`;
 }
 
-/** A press of the chip: a press of the Reply it stands for, quoting what it would quote. */
+/**
+ * A press of the chip: the quick reply to the words it stands under (`openQuickReply`), floating where
+ * they are, so the reader's place in the list never moves.
+ */
 function pressSelectionChip() {
   const held = quoteHeld;
-  if (held && held.button && held.button.isConnected !== false) held.button.click();
+  if (held && held.button && held.button.isConnected !== false) openQuickReply(held);
   else drawSelectionChip();
 }
+
+// --- a quick reply floating under the words it quotes (#727 vt-selection-quick-reply) -----------
+//
+// `#727 vt-selection-quick-reply`. The owner, 2026-11-01: the chip opens a FLOATING box under the
+// selection, not the reply box in the stream. Several replies to different sentences of one long
+// message in a row is the use: select a sentence, tap Quoted reply, write, Send, and the next.
+//
+//   * NOTHING MOVES. The box floats over the list, under the words, kept inside what the window shows
+//     above an on-screen keyboard (the visual viewport). The list under it is not scrolled to open it,
+//     to send it, nor when the reply or anything answering it arrives: while the box is open, and
+//     after a send until the reader moves the list themselves, the list does not follow the newest
+//     message (`followsNewest`) nor keep its foot as the window resizes. The focus goes into the box
+//     with `preventScroll`.
+//   * WHAT IT SENDS is a quoted reply, the words as Quote reply quotes them (`quoteBlock`) and then
+//     what was written, in that message's thread: Reply's routing with the thread bound
+//     (`replyRoute(message, true)`), so it joins the thread the message heads or starts it, and on a
+//     provider with no threads answers by pointer. It goes through the same outbox as every send, and
+//     marks the message read as Reply does, unless its quote covers too little of it (`replyMarksRead`).
+//   * ESC OR A TAP OUTSIDE closes it, keeping what was written for the same words of the same message:
+//     the chip on that selection again brings it back. Send clears it.
+
+/** How far under the selection the box stands, in CSS pixels, as the chip did. */
+const QUICK_REPLY_GAP_PX = 10;
+
+/** The widest the box is drawn, in CSS pixels: a comfortable line at a desk, the window on a phone. */
+const QUICK_REPLY_MAX_WIDTH_PX = 560;
+
+/**
+ * The quick reply open now, or null: the row and message it answers, its channel, the words it quotes,
+ * the key its draft is kept under, and the selection's box it stands under.
+ *
+ * @type {{row: any, message: any, channel: string, quote: string, key: string,
+ *   box: {top: number, bottom: number, left: number, right: number} | null} | null}
+ */
+let quickReply = null;
+
+/** What was written in quick replies closed unsent, by message and quoted words (`quickReplyKey`). */
+const quickReplyDrafts = new Map();
+
+/**
+ * The list a quick reply holds still, and where it was: from the box's opening until the reader moves
+ * it, the list neither follows the newest message nor keeps its foot. `rows` is the list of rows kept
+ * from growing shorter meanwhile, or null. Null when nothing is held.
+ *
+ * @type {{area: HTMLElement, top: number, rows: HTMLElement | null} | null}
+ */
+let quickReplyHold = null;
+
+/**
+ * Hold `area` still for a quick reply. Its rows are kept from growing shorter than they are now
+ * (`min-height`): rows drawn again shorter under a reader at the list's foot — two replies of the
+ * reader's combined into one row, a long one folded — would otherwise take the foot up with them, and
+ * the browser's clamp to the new foot would drop every word on screen by what they lost.
+ *
+ * @param {HTMLElement} area
+ */
+function holdQuickReplyList(area) {
+  if (quickReplyHold && quickReplyHold.area === area) {
+    quickReplyHold.top = area.scrollTop;
+    return;
+  }
+  releaseQuickReplyHold();
+  const rows = area === leftEl("scroll-area") ? leftEl("discord-log") : null;
+  if (rows) rows.style.minHeight = `${Math.ceil(Number(rows.getBoundingClientRect().height) || 0)}px`;
+  quickReplyHold = { area, top: area.scrollTop, rows };
+}
+
+/** Let go of the list a quick reply held, and of the height its rows were kept at. */
+function releaseQuickReplyHold() {
+  if (quickReplyHold && quickReplyHold.rows) quickReplyHold.rows.style.minHeight = "";
+  quickReplyHold = null;
+}
+
+/** The key a quick reply's draft is kept under: its channel, the message, and the words it quotes. */
+const quickReplyKey = (channel, id, quote) => `${channel}\n${id}\n${quote}`;
+
+/** Whether `area` is held still for a quick reply (`quickReplyHold`). */
+const quickReplyHolds = (area) => quickReplyHold !== null && quickReplyHold.area === area;
+
+/**
+ * The held list moved, which only the reader does while it is held: an open box goes with the words it
+ * stands under, and once the box is closed the list is the reader's again.
+ *
+ * @param {unknown} target what scrolled
+ */
+function quickReplyListMoved(target) {
+  const hold = quickReplyHold;
+  if (hold === null || target !== hold.area || hold.area.scrollTop === hold.top) return;
+  if (!quickReply) {
+    releaseQuickReplyHold();
+    return;
+  }
+  const moved = hold.area.scrollTop - hold.top;
+  hold.top = hold.area.scrollTop;
+  const box = quickReply.box;
+  if (box) quickReply.box = { ...box, top: box.top - moved, bottom: box.bottom - moved };
+  placeQuickReply();
+}
+
+/**
+ * Open the quick reply to `held`, the selection the chip stands for: the words it quotes read now, the
+ * selection let go, and the box drawn under where it was, with any draft kept for the same words.
+ *
+ * @param {{row: any, button: any, text: string | null, timer: any}} held
+ */
+function openQuickReply(held) {
+  const box = selectionBox() || (quickReply ? quickReply.box : null) || chipBox();
+  const quote = takeQuote(held.button).trim();
+  const message = rowMessages(held.row)[0];
+  if (!message || quote === "") return;
+  if (quickReply) closeQuickReply();
+  const channel = String(selectedChannelId() || "");
+  const key = quickReplyKey(channel, String(message.id), quote);
+  quickReply = { row: held.row, message, channel, quote, key, box };
+  holdQuickReplyList(nodeWithin(leftEl("side-scroll"), held.row) ? leftEl("side-scroll") : leftEl("scroll-area"));
+  const form = el("quick-reply");
+  setTextIfChanged(el("quick-reply-quote"), quote);
+  el("quick-reply-text").value = quickReplyDrafts.get(key) || "";
+  setTextIfChanged(el("quick-reply-state"), "");
+  setHiddenIfChanged(form, false);
+  placeQuickReply();
+  const text = el("quick-reply-text");
+  text.focus({ preventScroll: true });
+  const end = text.value.length;
+  if (typeof text.setSelectionRange === "function") text.setSelectionRange(end, end);
+}
+
+/** The chip's own box, where a touch let the selection go before the press: the box opens under it. */
+function chipBox() {
+  const chip = leftEl("selection-chip");
+  if (chip.hidden) return null;
+  const rect = chip.getBoundingClientRect();
+  const top = rect.top - SELECTION_CHIP_GAP_PX;
+  return { top, bottom: top, left: rect.left, right: rect.right };
+}
+
+/**
+ * Place the open box under the words it quotes, as wide as the window allows up to
+ * `QUICK_REPLY_MAX_WIDTH_PX`, and inside what the window shows: above an on-screen keyboard, over the
+ * words rather than under the keyboard where there is no room below them.
+ */
+function placeQuickReply() {
+  if (!quickReply) return;
+  const form = el("quick-reply");
+  const viewWidth = (document.documentElement && document.documentElement.clientWidth) || 0;
+  const visual = window.visualViewport;
+  const shownTop = visual ? Number(visual.offsetTop) || 0 : 0;
+  const shownBottom = visual ? shownTop + (Number(visual.height) || 0) : window.innerHeight || 0;
+  const width = viewWidth > 0 ? Math.min(QUICK_REPLY_MAX_WIDTH_PX, viewWidth - 2 * SELECTION_CHIP_EDGE_PX) : QUICK_REPLY_MAX_WIDTH_PX;
+  form.style.width = `${Math.round(width)}px`;
+  const height = Number(form.getBoundingClientRect().height) || 0;
+  const box = quickReply.box || { top: shownTop, bottom: shownTop, left: 0, right: viewWidth };
+  const left = Math.max(SELECTION_CHIP_EDGE_PX,
+    Math.min((box.left + box.right) / 2 - width / 2, viewWidth - SELECTION_CHIP_EDGE_PX - width));
+  const top = Math.max(shownTop + SELECTION_CHIP_EDGE_PX,
+    Math.min(box.bottom + QUICK_REPLY_GAP_PX, shownBottom - SELECTION_CHIP_EDGE_PX - height));
+  form.style.left = `${Math.round(left)}px`;
+  form.style.top = `${Math.round(top)}px`;
+}
+
+/** Close the quick reply, keeping what was written for the same words (`quickReplyDrafts`). */
+function closeQuickReply() {
+  if (!quickReply) return;
+  const written = el("quick-reply-text").value;
+  if (written.trim()) quickReplyDrafts.set(quickReply.key, written);
+  else quickReplyDrafts.delete(quickReply.key);
+  quickReply = null;
+  setHiddenIfChanged(el("quick-reply"), true);
+  el("quick-reply-text").blur();
+}
+
+/** Send the quick reply: the quoted words and what was written, in the message's thread; then close it. */
+async function sendQuickReply() {
+  const open = quickReply;
+  if (!open) return;
+  const written = el("quick-reply-text").value;
+  if (!written.trim()) {
+    setTextIfChanged(el("quick-reply-state"), "Nothing to send yet — write something first.");
+    return;
+  }
+  if (knownChannel(open.channel)?.writable === false) {
+    setTextIfChanged(el("quick-reply-state"), "This channel is read-only.");
+    return;
+  }
+  const route = replyRoute(open.message, true);
+  if (route.removed) {
+    setTextIfChanged(el("quick-reply-state"), "Not sent: the message you are answering was removed from the channel.");
+    return;
+  }
+  const text = `${quoteBlock(open.quote)}${written.trim()}`;
+  // The list stays held from here until the reader moves it: the reply, and what answers it, land
+  // without moving the words they read (see the section note).
+  if (!quickReplyHold) holdQuickReplyList(nodeWithin(leftEl("side-scroll"), open.row) ? leftEl("side-scroll") : leftEl("scroll-area"));
+  const completion = queueOutgoingMessage({
+    channel: open.channel, threadId: route.branch || route.into || route.thread, replyTo: String(open.message.id), text,
+    marksRead: replyMarksRead(open.message, text),
+    ...(route.unknown ? { placement: "unknown" } : {}),
+  });
+  quickReplyDrafts.delete(open.key);
+  el("quick-reply-text").value = "";
+  closeQuickReply();
+  await completion;
+}
+
 
 /**
  * What the reply box was opened with when it was opened with a quote, and the draft that was there
@@ -39622,6 +39831,30 @@ document.addEventListener("selectionchange", noteQuoteSelection);
 // `#726 vt-selection-chip`. Pressed without taking the selection or the focus from the words it quotes.
 leftEl("selection-chip").addEventListener("mousedown", (event) => event.preventDefault());
 leftEl("selection-chip").addEventListener("click", pressSelectionChip);
+// `#727 vt-selection-quick-reply`. The floating box: its keys, Send and Cancel, a tap outside, and the list
+// the reader moves letting it go.
+el("quick-reply-send").addEventListener("click", () => guardQuietly(sendQuickReply)());
+el("quick-reply-cancel").addEventListener("click", () => closeQuickReply());
+el("quick-reply-text").addEventListener("keydown", (event) => {
+  if (event && event.key === "Escape") {
+    event.preventDefault();
+    event.stopPropagation();
+    closeQuickReply();
+    return undefined;
+  }
+  return onComposerKey(event, guardQuietly(sendQuickReply), el("quick-reply-text"));
+});
+watchBoxInsertions(el("quick-reply-text"));
+document.addEventListener("pointerdown", (event) => {
+  if (!quickReply) return;
+  const target = /** @type {any} */ (event && event.target);
+  if (target && (nodeWithin(el("quick-reply"), target) || nodeWithin(leftEl("selection-chip"), target))) return;
+  closeQuickReply();
+}, { capture: true });
+document.addEventListener("scroll", (event) => quickReplyListMoved(event && event.target), { capture: true, passive: true });
+if (window.visualViewport && typeof window.visualViewport.addEventListener === "function") {
+  window.visualViewport.addEventListener("resize", () => placeQuickReply());
+}
 // A list scrolled under the selection carries the words, and the chip goes with them.
 document.addEventListener("scroll", () => { if (quoteHeld) placeSelectionChip(); }, { capture: true, passive: true });
 // `#260 timestamp-hover`. A message's time says its day on hover, worded as the pointer arrives.
@@ -41011,6 +41244,12 @@ if (typeof window.ResizeObserver === "function") {
     const grew = seen !== null && seen.list > 0 && currentScreen === "main" ? now.dock - seen.dock : 0;
     const shrank = seen !== null && seen.list > 0 && now.list < seen.list;
     mainUnderLists = now;
+    // `#727 vt-selection-quick-reply`. A list held still for a quick reply is left where it is, as a
+    // phone's keyboard comes up for the box and goes again.
+    if (quickReplyHolds(area)) {
+      placeQuickReply();
+      return;
+    }
     // `#221 read-modes`. Except a reader just landed on a thread's first unread who has not moved
     // since: on a desk the entry itself wrapped the dock, by putting the thread's name in the picker,
     // and the message is kept at the head however near the end of the list it is.

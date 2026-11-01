@@ -254,3 +254,55 @@
 #selection-chip[hidden] {
   display: none;
 }
+
+/* `#727 vt-selection-quick-reply`. The quick reply, floating under the words it quotes: absolute against the
+   layout viewport like the chip, over the lists, its width and place set by web/voice.js. */
+#quick-reply {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 6;
+  box-sizing: border-box;
+  display: grid;
+  gap: 0.4rem;
+  padding: 0.55rem 0.6rem;
+  border: 1px solid var(--accent);
+  border-radius: 0.6rem;
+  background: var(--panel);
+  box-shadow: 0 4px 18px rgb(0 0 0 / 0.3);
+}
+
+#quick-reply[hidden] {
+  display: none;
+}
+
+#quick-reply-quote {
+  margin: 0;
+  padding-left: 0.5rem;
+  border-left: 3px solid var(--accent);
+  max-height: 4.2em;
+  overflow: hidden;
+  font-size: 0.85rem;
+  opacity: 0.85;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+#quick-reply-text {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 3rem;
+  resize: vertical;
+  font: inherit;
+}
+
+.quick-reply-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.quick-reply-actions .hint {
+  flex: 1;
+  margin: 0;
+}

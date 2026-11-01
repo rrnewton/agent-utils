@@ -4079,7 +4079,7 @@ test("`#726 vt-selection-chip`: words selected in one message put Quoted reply j
     "with the chip placed over the words it still read as under them, so this test cannot see where it stands");
 });
 
-test("`#726 vt-selection-chip`: a press of the chip is Quote reply, quoting the words; it never takes the selection first", async () => {
+test("`#726 vt-selection-chip`: a press of the chip quotes the words it stands under, and never takes the selection first", async () => {
   const page = await quotePage();
   const first = rowWithId(page, "1000000000000000001");
   await page.selectText(wordsIn(first), null, "about the runner");
@@ -4088,8 +4088,9 @@ test("`#726 vt-selection-chip`: a press of the chip is Quote reply, quoting the 
   assert.equal(press.defaultPrevented, true, "pressing the chip would take the selection away first");
   await page.el("selection-chip").click();
   await page.settle();
-  assert.equal(page.el("reply-text").value, "> about the runner\n\n", "the chip did not open Quote reply with the words");
-  assert.ok(replyInStream(page), "the chip's reply did not open under its message");
+  // `#727 vt-selection-quick-reply`: into the floating box, not the reply in the stream.
+  assert.equal(page.el("quick-reply").hidden, false, "the chip opened no quick reply");
+  assert.equal(page.el("quick-reply-quote").textContent, "about the runner", "the chip did not quote the words");
   assert.equal(chipAt(page), null, "the chip stayed after its press");
 });
 
@@ -4106,8 +4107,8 @@ test("`#726 vt-selection-chip`: after a touch the chip waits the held moment whe
   assert.deepStrictEqual(chipAt(page), stood, "the chip went, or moved, before the tap could arrive");
   await page.el("selection-chip").click();
   await page.settle();
-  assert.equal(page.el("reply-text").value, "> about the runner\n\n", "the tap that cleared the selection lost the quote");
-  await page.el("reply-cancel").click();
+  assert.equal(page.el("quick-reply-quote").textContent, "about the runner", "the tap that cleared the selection lost the quote");
+  await page.el("quick-reply-cancel").click();
   await page.settle();
   // Left alone, it goes when the moment is over.
   await page.selectText(wordsIn(first), null, "about the runner");
@@ -4134,6 +4135,171 @@ test("`#726 vt-selection-chip`: kept inside the window at its foot, and carried 
   page.viewport.layout = words + gap - 1;
   await page.selectText(wordsIn(first), null, "about the run");
   assert.ok(chipAt(page).top <= page.viewport.layout - edge, "the chip stood past the window's foot");
+});
+
+// --- a quick reply floating under the words it quotes (#727 vt-selection-quick-reply) -----------
+
+/** Twenty sentences of the agent's: a long message, each sentence about 5% of it. */
+const QUICK_SENTENCES = Array.from({ length: 20 }, (_, at) => `Point ${String(at + 1).padStart(2, "0")} is one thing the agent says here.`);
+const QUICK_LONG = "1000000000000000030";
+
+/**
+ * Thirty messages, the last a long one of the agent's, with the reader at the foot of the list, where it
+ * follows the newest message, which is the hardest place to keep still. `desk` makes the window a desk's.
+ */
+async function quickPage({ script = SCRIPT, desk = false } = {}) {
+  const page = newPage(new Map(), script);
+  await signIn(page);
+  const messages = Array.from({ length: 29 }, (_, at) => message({ id: String(1000000000000000001n + BigInt(at)), content: `note ${at + 1}` }));
+  messages.push(message({ id: QUICK_LONG, content: QUICK_SENTENCES.join(" ") }));
+  await showDiscord(page, messages);
+  if (desk) await page.setDesk(true);
+  const area = page.el("scroll-area");
+  area.scrollTop = area.scrollHeight;
+  await area.dispatch("scroll");
+  await page.settle();
+  return page;
+}
+
+/** Select sentence `at` of the long message, and press the chip under it. */
+async function quickReplyTo(page, at) {
+  await page.selectText(wordsIn(rowWithId(page, QUICK_LONG)), null, QUICK_SENTENCES[at]);
+  await page.el("selection-chip").click();
+  await page.settle();
+}
+
+/** A message arriving from the server at the next poll, as the reply itself and what answers it do. */
+async function arrives(page, ...arriving) {
+  page.messages = [...page.messages, ...arriving];
+  await pollOnce(page);
+}
+
+test("`#727 vt-selection-quick-reply`: the chip opens a box floating under the words, focused, and the list does not move", async () => {
+  for (const desk of [false, true]) {
+    const where = desk ? "at a desk" : "on a phone";
+    const page = await quickPage({ desk });
+    const area = page.el("scroll-area");
+    const top = area.scrollTop;
+    assert.ok(top > 0, `${where}: the premise is a list scrolled to its foot`);
+    await quickReplyTo(page, 2);
+    assert.equal(page.el("quick-reply").hidden, false, `${where}: the chip opened no quick reply`);
+    assert.equal(page.el("quick-reply-quote").textContent, QUICK_SENTENCES[2]);
+    assert.equal(page.document.activeElement, page.el("quick-reply-text"), `${where}: the box did not take the focus`);
+    assert.equal(replyInStream(page), false, `${where}: the reply in the stream opened as well`);
+    assert.equal(area.scrollTop, top, `${where}: opening the quick reply moved the list`);
+    const under = wordsIn(rowWithId(page, QUICK_LONG)).getBoundingClientRect().bottom;
+    const boxTop = parseFloat(page.el("quick-reply").style.top);
+    assert.ok(boxTop >= Math.min(under, page.viewport.visual - 200) - 1 || boxTop <= page.viewport.visual,
+      `${where}: the box is not under the words, nor inside the window: ${boxTop} under ${under}`);
+  }
+});
+
+test("`#727 vt-selection-quick-reply`: Send posts the quoted reply in the message's thread and closes the box; neither it nor what arrives moves the list", async () => {
+  const run = async (script = SCRIPT, desk = false) => {
+    const page = await quickPage({ script, desk });
+    const area = page.el("scroll-area");
+    const top = area.scrollTop;
+    // The owner: "I would like the rest of the screen to stay still so I can just keep reading". Where
+    // the message being read stands on the screen, as well as the list's offset.
+    const reading = () => rowWithId(page, QUICK_LONG).getBoundingClientRect().top;
+    const readingAt = reading();
+    await quickReplyTo(page, 4);
+    // Someone else writes while the box is open, to a reader at the list's foot.
+    await arrives(page, message({ id: "1000000000000000031", content: "meanwhile, elsewhere", ...ALICE }));
+    const openArrivedTop = area.scrollTop;
+    await page.el("quick-reply-text").setValue("which one?");
+    await page.el("quick-reply-send").click();
+    await page.settle();
+    const sentTop = area.scrollTop;
+    const posted = page.repliesPosted.at(-1).body;
+    await arrives(page,
+      message({ id: "1000000000000000032", content: `> ${QUICK_SENTENCES[4]}\n\nwhich one?`, reply_to: QUICK_LONG, ...OWNER }),
+      message({ id: "1000000000000000033", content: "the fifth one", reply_to: "1000000000000000032", ...ALICE }));
+    return { page, top, openArrivedTop, sentTop, posted, arrivedTop: area.scrollTop, readingMoved: reading() - readingAt };
+  };
+  for (const desk of [false, true]) {
+    const where = desk ? "at a desk" : "on a phone";
+    const { page, top, openArrivedTop, sentTop, posted, arrivedTop, readingMoved } = await run(SCRIPT, desk);
+    assert.equal(readingMoved, 0, `${where}: the message being read moved on the screen`);
+    assert.equal(openArrivedTop, top, `${where}: a message arriving while the box was open moved the list`);
+    assert.equal(posted.reply_to, QUICK_LONG, `${where}: the reply is not to the message quoted`);
+    assert.equal(posted.text, `> ${QUICK_SENTENCES[4]}\n\nwhich one?`, `${where}: the reply is not the quote and what was written`);
+    assert.equal(page.el("quick-reply").hidden, true, `${where}: Send did not close the box`);
+    assert.equal(sentTop, top, `${where}: sending the quick reply moved the list`);
+    assert.equal(arrivedTop, top, `${where}: the reply, or its answer, arriving moved the list`);
+    assert.deepStrictEqual(page.dismissCalls, [], `${where}: a quote of one point in twenty marked the long message Done`);
+  }
+  // THE CONTROL: a list not held for the quick reply follows the newest message down as it arrives.
+  const control = await run(brokenScript("  if (quickReplyHolds(area)) return false;\n", ""));
+  assert.notEqual(control.openArrivedTop, control.top, "with the list not held it stayed put anyway, so this test cannot see it");
+});
+
+test("`#727 vt-selection-quick-reply`: replies to several sentences in a row, each its own quote, the list never moving", async () => {
+  const page = await quickPage();
+  const area = page.el("scroll-area");
+  const top = area.scrollTop;
+  for (const [at, words] of [[1, "first"], [7, "second"], [15, "third"]]) {
+    await quickReplyTo(page, at);
+    await page.el("quick-reply-text").setValue(words);
+    await press(page, page.el("quick-reply-text"), "Enter", { ctrlKey: true });
+    assert.equal(page.repliesPosted.at(-1).body.text, `> ${QUICK_SENTENCES[at]}\n\n${words}`);
+    assert.equal(area.scrollTop, top, `the reply to sentence ${at + 1} moved the list`);
+  }
+  assert.equal(page.repliesPosted.length, 3);
+});
+
+test("`#727 vt-selection-quick-reply`: Esc or a tap outside closes the box, keeping what was written for the same words", async () => {
+  const page = await quickPage();
+  const area = page.el("scroll-area");
+  const top = area.scrollTop;
+  await quickReplyTo(page, 3);
+  await page.el("quick-reply-text").setValue("half a thought");
+  const esc = await press(page, page.el("quick-reply-text"), "Escape");
+  assert.equal(page.el("quick-reply").hidden, true, "Esc did not close the box");
+  assert.equal(esc.stopped, true, "Esc went on to the page's own keys");
+  assert.equal(page.repliesPosted.length, 0, "Esc sent the reply");
+  // The same words again: the draft is back. Other words: an empty box.
+  await quickReplyTo(page, 3);
+  assert.equal(page.el("quick-reply-text").value, "half a thought", "the draft for the same words was lost");
+  await page.documentEvent("pointerdown", { target: rowWithId(page, "1000000000000000002") });
+  assert.equal(page.el("quick-reply").hidden, true, "a tap outside did not close the box");
+  await quickReplyTo(page, 9);
+  assert.equal(page.el("quick-reply-text").value, "", "another sentence's box opened with a draft");
+  await page.el("quick-reply-cancel").click();
+  await quickReplyTo(page, 3);
+  assert.equal(page.el("quick-reply-text").value, "half a thought", "a tap outside lost the draft");
+  // A tap inside the box is not outside.
+  await page.documentEvent("pointerdown", { target: page.el("quick-reply-text") });
+  assert.equal(page.el("quick-reply").hidden, false, "a tap in the box closed it");
+  // Sent, the draft is gone.
+  await page.el("quick-reply-send").click();
+  await page.settle();
+  await quickReplyTo(page, 3);
+  assert.equal(page.el("quick-reply-text").value, "", "a sent reply's words came back as a draft");
+  assert.equal(area.scrollTop, top, "closing and reopening moved the list");
+  // Nothing written: Send says so and sends nothing.
+  const sent = page.repliesPosted.length;
+  await page.el("quick-reply-send").click();
+  await page.settle();
+  assert.equal(page.repliesPosted.length, sent);
+  assert.match(page.el("quick-reply-state").textContent, /Nothing to send yet/);
+});
+
+test("`#727 vt-selection-quick-reply`: on a phone the box stays above the keyboard, and the keyboard coming up moves no list", async () => {
+  const edge = sourceConstant("SELECTION_CHIP_EDGE_PX");
+  const page = await quickPage();
+  const area = page.el("scroll-area");
+  const top = area.scrollTop;
+  await quickReplyTo(page, 18);
+  // The keyboard takes 340px of the visual viewport.
+  await page.resizeViewport({ visual: 512 });
+  const box = page.el("quick-reply");
+  const boxTop = parseFloat(box.style.top);
+  assert.ok(boxTop + box.getBoundingClientRect().height <= 512 - edge + 0.5,
+    `the box stands under the keyboard: top ${boxTop}, height ${box.getBoundingClientRect().height}`);
+  assert.equal(area.scrollTop, top, "the keyboard coming up moved the list");
+  await page.resizeViewport({ visual: 852 });
+  assert.equal(area.scrollTop, top, "the keyboard going moved the list");
 });
 
 test("`#267 quote-reply`: Help says what Quote reply does, where it posts, and how long a quote may be", () => {

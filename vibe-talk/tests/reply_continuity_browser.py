@@ -83,6 +83,8 @@ CHANNEL = {"id": "1110000000000000002", "label": "lead team", "writable": True, 
 EPOCH = datetime(2026, 10, 12, 7, 0, tzinfo=timezone.utc)
 AGENT = {"author": "ci-bot", "author_id": "1000000000000000001", "author_is_bot": True}
 PEER = {"author": "alice", "author_id": "1000000000000000005", "author_is_bot": False}
+# `#727 vt-selection-quick-reply`: the reader, who writes the quick replies.
+OWNER = {"author": "owner", "author_id": "1000000000000000009", "author_is_bot": False}
 COUNT = 40
 # The message taller than a phone's screen, and the reply (to message 3).
 TALL = 20
@@ -134,6 +136,9 @@ class FakeApi:
     dismissed: set[str] = field(default_factory=set)
     # Every message heads a thread nobody has answered, as on Google Chat. `#185 reply-new-thread`.
     empty_threads: bool = False
+    # Who a posted reply is from, where a run says: otherwise the author its index gives, which the page
+    # then takes for the reader's own and draws every message of as theirs.
+    reply_author: Json | None = None
 
     def __post_init__(self) -> None:
         if self.empty_threads:
@@ -211,8 +216,8 @@ def handler_for(api: FakeApi, web_root: Path) -> type[BaseHTTPRequestHandler]:
             if path.endswith("/reply"):
                 with api.lock:
                     api.replies.append(body)
-                    posted = {**message(len(api.messages)), "content": str(body.get("text", "")),
-                              "reply_to": body.get("reply_to")}
+                    posted = {**message(len(api.messages)), **(api.reply_author or {}),
+                              "content": str(body.get("text", "")), "reply_to": body.get("reply_to")}
                     if body.get("thread_id"):
                         posted["thread"] = {"id": body.get("thread_id"), "root_message_id": body.get("reply_to"),
                                             "is_root": False, "reply_count": None, "reply_count_exact": False}
@@ -882,6 +887,145 @@ RANGE_END_JS = """() => {
 }"""
 
 
+# `#727 vt-selection-quick-reply`: the long last message the quick replies quote sentences of, and what
+# the page draws for them: the list's scroll, the chip and the box, and where the focus is.
+QUICK_TEXT = "Message 39, the long last one. " + FILLER * 12
+# How far the message being read may move on the screen while quick replies are made and arrive: none,
+# but for a subpixel of rounding.
+QUICK_STILL_PX = 2
+
+QUICK_JS = """(id) => {
+  const area = document.getElementById('scroll-area');
+  const box = (id) => {
+    const node = document.getElementById(id);
+    if (!node || node.hidden || !node.getClientRects().length) return null;
+    const r = node.getBoundingClientRect();
+    return {top: r.top, bottom: r.bottom, left: r.left, right: r.right, width: r.width, height: r.height};
+  };
+  return {
+    scrollTop: area.scrollTop, max: area.scrollHeight - area.clientHeight, chip: box('selection-chip'),
+    quick: box('quick-reply'), focused: document.activeElement === document.getElementById('quick-reply-text'),
+    inStream: !document.getElementById('column-reply').hidden,
+    rows: document.querySelectorAll('#discord-log > li[data-id]').length,
+    width: document.documentElement.clientWidth,
+    height: window.visualViewport ? window.visualViewport.height : window.innerHeight,
+    // Where the message being read stands on the screen: what the reader keeps their place by.
+    reading: (() => {
+      const row = [...document.querySelectorAll('#discord-log > li[data-id]')].find((li) => li.dataset.id === id);
+      return row ? row.getBoundingClientRect().top : null;
+    })(),
+  };
+}"""
+
+
+def quick_messages() -> list[Json]:
+    """The ordinary channel, its last message a long one of the agent's."""
+    messages = [message(index) for index in range(COUNT)]
+    messages[-1] = {**messages[-1], "content": QUICK_TEXT}
+    return messages
+
+
+def num(value: object) -> float:
+    """A number the page measured, read out of its JSON answer."""
+    assert isinstance(value, (int, float)), value
+    return float(value)
+
+
+def quick_reply_walk(walk: Walk) -> None:
+    """`#727 vt-selection-quick-reply`. From the foot of the list, where it follows the newest message,
+    three sentences of the long last message are selected one after another; each brings the Quoted
+    reply chip just under the words, the chip a box floating under them, focused, and Send a quoted
+    reply to the message. The owner: "I would like the rest of the screen to stay still so I can just
+    keep reading". So the message being read keeps its place on the screen, within `QUICK_STILL_PX`, at
+    every step: opening, sending, the reply arriving, and an answer arriving from the server after them;
+    and the list's scroll offset does not change either, as nothing above the reader changes height here
+    (where something did, the browser's scroll anchoring would change the offset to keep the words still,
+    which is right)."""
+    page = walk.page
+    row_id = message_id(COUNT - 1)
+
+    def state() -> Json:
+        found: object = page.evaluate(QUICK_JS, row_id)
+        assert isinstance(found, dict)
+        return {str(key): value for key, value in found.items()}
+
+    page.fill("#api-token", TOKEN)
+    page.click("#save-token")
+    page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
+    page.click("#view-switch")
+    walk.wait_for(f"() => document.querySelectorAll('#discord-log > li[data-id]').length === {COUNT}",
+                  "quick: the channel did not open")
+    walk.settled()
+    page.evaluate("() => { const area = document.getElementById('scroll-area'); area.scrollTop = area.scrollHeight; }")
+    walk.settled()
+    start = state()
+    top = num(start["scrollTop"])
+    walk.check(top >= num(start["max"]) - 2, f"quick: the list is not at its foot to begin with: {start}")
+    reading = num(start["reading"])
+
+    def still(now: Json, step: str) -> None:
+        moved = num(now["reading"]) - reading
+        walk.check(abs(moved) <= QUICK_STILL_PX, f"quick: {step} moved the message being read by {moved:.1f}px on the screen")
+        walk.check(num(now["scrollTop"]) == top, f"quick: {step} moved the list: {top} -> {now['scrollTop']}")
+    for turn, (begin, end) in enumerate(((31, 70), (160, 200), (300, 336))):
+        line: object = page.evaluate(SELECTION_JS, [row_id, begin, end, True])
+        assert isinstance(line, dict)
+        walk.wait_for("() => !document.getElementById('selection-chip').hidden", f"quick {turn}: no chip under the words")
+        walk.settled()
+        lit = state()
+        chip = lit["chip"]
+        assert isinstance(chip, dict)
+        gap = float(chip["top"]) - float(line["bottom"])
+        walk.check(0 <= gap <= 40 or float(chip["bottom"]) <= num(lit["height"]),
+                   f"quick {turn}: the chip is not just under the words: {gap:.1f}px, {chip} under {line}")
+        walk.check(float(chip["left"]) >= 0 and float(chip["right"]) <= num(lit["width"]) + 0.5,
+                   f"quick {turn}: the chip is out of the window: {chip}")
+        if turn == 0:
+            walk.shot("quick-chip")
+        walk.press("#selection-chip")
+        walk.wait_for("() => !document.getElementById('quick-reply').hidden", f"quick {turn}: the chip opened no box")
+        walk.settled()
+        opened = state()
+        quick = opened["quick"]
+        assert isinstance(quick, dict)
+        still(opened, f"turn {turn}, opening the box,")
+        walk.check(opened["focused"] is True, f"quick {turn}: the box did not take the focus: {opened}")
+        walk.check(opened["inStream"] is False, f"quick {turn}: the reply in the stream opened as well: {opened}")
+        walk.check(float(quick["top"]) >= -0.5 and float(quick["bottom"]) <= num(opened["height"]) + 0.5
+                   and float(quick["right"]) <= num(opened["width"]) + 0.5,
+                   f"quick {turn}: the box is out of the window: {quick} in {opened['width']}x{opened['height']}")
+        if turn == 0:
+            walk.shot("quick-reply")
+        words = f"quick answer {turn}"
+        page.fill("#quick-reply-text", words)
+        sent = len(walk.api.replies)
+        rows = int(num(opened["rows"]))
+        walk.press("#quick-reply-send")
+        walk.wait_for("() => document.getElementById('quick-reply').hidden", f"quick {turn}: Send did not close the box")
+        walk.wait_for(f"() => document.querySelectorAll('#discord-log > li[data-id]').length > {rows}",
+                      f"quick {turn}: the reply never reached the list")
+        walk.settled()
+        posted = walk.posted_since(sent, f"quick {turn}")
+        text = str(posted[0].get("text", "")) if posted else ""
+        walk.check(len(posted) == 1 and posted[0].get("reply_to") == row_id and text.startswith("> ")
+                   and text.endswith(f"\n\n{words}"), f"quick {turn}: what left the browser was {posted}")
+        landed = state()
+        still(landed, f"turn {turn}, sending or the reply arriving,")
+    # An answer from the server, read at the next poll, which the page is asked for now.
+    with walk.api.lock:
+        answer = {**message(len(walk.api.messages)), "content": "An answer to the quick replies.", **PEER}
+        walk.api.messages.append(answer)
+    rows = int(num(state()["rows"]))
+    page.evaluate("() => scheduleDiscordPoll(0)")
+    walk.wait_for(f"() => document.querySelectorAll('#discord-log > li[data-id]').length > {rows}",
+                  "quick: the answer never arrived")
+    walk.settled()
+    after = state()
+    still(after, "the answer arriving")
+    walk.notes.append("three quick replies from the foot of the list, each from the chip under its words, posted "
+                      "quoted with the list's scroll unchanged through opening, sending and two arrivals")
+
+
 def triple_click_case(walk: Walk, list_box: dict[str, float]) -> None:
     """A triple-click on a message of one paragraph, at a desk: Quote reply, and the paragraph quoted.
 
@@ -1096,11 +1240,15 @@ def main() -> int:
         ("412x915-new-thread", 412, 915, True, "dark"),
         # `#267 quote-reply`, on long names and reply counts, at 393 and then 360 wide.
         ("393x852-quote-layout", 393, 852, True, "dark"),
+        # `#727 vt-selection-quick-reply`, quoting sentences of a long last message from the list's foot.
+        ("1280x800-quick-reply", 1280, 800, False, "dark"),
+        ("412x915-quick-reply", 412, 915, True, "dark"),
     )
     report: list[str] = []
     with sync_playwright() as playwright:
         for label, width, height, phone, scheme in runs:
             api = (FakeApi(messages=layout_messages()) if label.endswith("quote-layout")
+                   else FakeApi(messages=quick_messages(), reply_author=OWNER) if label.endswith("quick-reply")
                    else FakeApi(empty_threads=label.endswith("new-thread")))
             server, thread, url = serve(api, web_root)
             try:
@@ -1125,6 +1273,8 @@ def main() -> int:
                     walk = Walk(page, api, phone, label, args.screenshots)
                     if label.endswith("quote-layout"):
                         quote_layout_walk(walk)
+                    elif label.endswith("quick-reply"):
+                        quick_reply_walk(walk)
                     elif api.empty_threads:
                         new_thread_walk(walk)
                     elif scheme == "dark":

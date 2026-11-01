@@ -3706,6 +3706,29 @@
     </main>
 
     <!--
+      `#726 vt-selection-chip`. "Quoted reply", under words selected in one message: the row's Quote
+      reply, offered where the selecting thumb is, and placed by `drawSelectionChip` in web/voice.js
+      under the selection's box. Hidden while nothing in a message is selected.
+    -->
+    <button id="selection-chip" class="selection-chip" type="button" title="Reply to this message, starting with the words you selected in it quoted" hidden>Quoted reply</button>
+
+    <!--
+      `#727 vt-selection-quick-reply`. The quick reply the Quoted reply chip opens: floating under the
+      words it quotes, over the list, which it never moves. Placed by `placeQuickReply` in web/voice.js;
+      Send posts the quoted words and what is written in the message's thread, Esc, Cancel or a tap
+      outside closes it and keeps what was written for the same words.
+    -->
+    <div id="quick-reply" class="quick-reply" role="group" aria-label="Quick reply" hidden>
+      <blockquote id="quick-reply-quote" class="quick-reply-quote"></blockquote>
+      <textarea id="quick-reply-text" data-lpignore="true" data-1p-ignore="true" data-form-type="other" rows="2" aria-label="Your reply to the quoted words" placeholder="Reply to these words"></textarea>
+      <div class="quick-reply-actions">
+        <p id="quick-reply-state" class="hint" aria-live="polite"></p>
+        <button id="quick-reply-cancel" class="secondary" type="button">Cancel</button>
+        <button id="quick-reply-send" type="button">Send</button>
+      </div>
+    </div>
+
+    <!--
       The dock: the third grid ROW, not a pinned or absolutely positioned overlay, which is why it
       cannot drift, overlap the transcript, or be scrolled off the bottom of the page.
 
@@ -4149,13 +4172,6 @@
       -->
       <p id="thread-select-note" hidden></p>
     </footer>
-
-    <!--
-      `#726 vt-selection-chip`. "Quoted reply", under words selected in one message: the row's Quote
-      reply, offered where the selecting thumb is, and placed by `drawSelectionChip` in web/voice.js
-      under the selection's box. Hidden while nothing in a message is selected.
-    -->
-    <button id="selection-chip" class="selection-chip" type="button" title="Reply to this message, starting with the words you selected in it quoted" hidden>Quoted reply</button>
 
     <!--
       `#610 mobile-keyboard-compose`. The numbers a phone's keyboard leaves the page with, drawn live over the top

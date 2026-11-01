@@ -1,10 +1,11 @@
 ---
 title: 'vt-selection-quick-reply: a floating quick-reply box under the selection that never moves the page'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 created_at: 2026-11-01T16:07:43.114840631+00:00
-updated_at: 2026-11-01T16:07:43.114840631+00:00
+updated_at: 2026-11-01T21:10:23.315250234+00:00
+closed_at: 2026-11-01T21:10:23.315250114+00:00
 ---
 
 # Description
