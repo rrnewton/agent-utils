@@ -549,6 +549,10 @@ every push receives the full selected green gate.** “Move” and “improve th
 interface” are separate commits whenever each intermediate state is valid.
 The extra gate column names evidence beyond that common requirement.
 
+> **SUPERSEDED (2026-11-01):** the per-commit gate rule above and the single sequence below were
+> replaced by an inner loop per move, the full gate per batch of 3-5 owner commits, and three parallel
+> lanes. See "Revision 2026-11-01: contact with reality" at the end of this plan.
+
 | Step | Change and behavior-neutral boundary | Additional green evidence | Effort |
 | --- | --- | --- | --- |
 | 1 | Finish admitted quick page fixes, freeze the page, pin baseline, inventory source readers and state writers. Reconcile implementation issue priority/dependencies with P0. Record behavior and suite counts; change no algorithms. | Baseline full gate; agreed freeze checklist. | 1 day |
@@ -565,8 +569,8 @@ The extra gate column names evidence beyond that common requirement.
 | 12 | Extract outbox/drafts/confirmation decisions in small state-machine slices. Capture destination and operation identity explicitly; keep current tick/outcome behavior. | Send/retry/undo/outcome/duplicate and reply-placement tests. | 2–3 days |
 | 13 | Extract speech queue/recovery and then voice-session decisions behind audio/socket ports, one lifecycle at a time. Move hardware objects to the web adapter without changing audio policy. | Speech fixtures, interruption/recovery, reconnect/recap/echo/control tests. | 3–5 days |
 | 14 | Extract sync scheduling and stream decoding, wiring domain commands explicitly. Preserve poll holds, request reason tags, freshness and generations. | Replay/reset/hidden-page/read-hold tests; stream chunking and disposal. | 2–3 days |
-| 15 | Replace column-field swapping with private records by field group. Then migrate async column chains to captured controllers by chain, removing ambient context from public APIs. Neither commit combines this with a layout change. | Two-column interleaving and overscroll walks; late reads on either column. | 4–6 days |
-| 16 | Move DOM primitives, composer, channel rows/cards/replies, voice and settings views in that dependency order. Each move takes its own narrow interfaces, mount/dispose and typing. Replace row expandos and model reads through DOM. | Existing feature tests and corresponding production-bundle walks after each slice. | 3–6 days |
+| 15 | Replace column-field swapping with private records by field group. Then migrate async column chains to captured controllers by chain, removing ambient context from public APIs. Neither commit combines this with a layout change. **SUPERSEDED (2026-11-01): the captured-controller half moved into step 16; see Revision.** | Two-column interleaving and overscroll walks; late reads on either column. | 4–6 days |
+| 16 | Move DOM primitives, composer, channel rows/cards/replies, voice and settings views in that dependency order. Each move takes its own narrow interfaces, mount/dispose and typing. Replace row expandos and model reads through DOM. **SUPERSEDED (2026-11-01): each view is now preceded by its present/* extraction, and the views are split across lanes; see Revision.** | Existing feature tests and corresponding production-bundle walks after each slice. | 3–6 days |
 | 17 | Finish shell/navigation/keyboard composition and ordered boot. Convert every remaining handwritten file to strict TS, remove legacy test accessors as callers migrate, and delete the bridge/manifest exceptions. | No legacy imports/globals, no cycles/deep imports, complete strict checks. | 1–3 days |
 | 18 | Split CSS in preserved order; finish generated ID parity and feature test-file moves. No HTML layout rewrite. This can use disjoint refactor-only work after step 4, but shares the same gate/landing order. | CSS byte-equivalence, unchanged DOM inventory, collected tests/controls unchanged, layout walks. | 1–2 days |
 | 19 | Audit completion, update operator/build docs, run exit validation and record measurements/unverified device checks. Remove temporary move tooling that has no remaining purpose. Release the page freeze only after the exit criteria below. | Full portable gate, clean build, package/scope/cache coverage and headless core. | 1–2 days |
@@ -686,3 +690,129 @@ Remaining choices to record with the implementation coordinator:
 
 No React Native rewrite, new framework, new sync protocol, new document view,
 service worker, or unrelated UI change is included in this refactor's delivery.
+
+## Revision 2026-11-01: contact with reality
+
+[opus 5.5, the step-16 implementer, at the coordinator's request.] Everything above this section is the
+plan as written on 2026-10-28. It is kept unchanged except for the inline "SUPERSEDED (2026-11-01)" notes that
+point here. This section records what changed once the work met the code, and why. It goes with the
+#624 voice-page-modularity issue and the implementer's handoff, which hold the per-slice evidence.
+
+### Where the sequence stands
+
+| Step | State on 2026-11-01 |
+| --- | --- |
+| 1-14 | Done as planned, each step behind its own adversarial review. Two scope moves, each recorded when made: the settings owned by a feature (prompts, microphone, link kinds, thread order, ...) join `DEVICE_SETTINGS` with their feature's owner, not in step 9. The bare transport and storage calls (read-aloud audio, the live stream, pairing, ~135 `localStorage` uses) move with their owners (settings, speech, sync), not through a port in step 8. |
+| 15 | The field-group half is done (`COLUMN_STATE` gone, two reviews clean). The captured-controller half is **folded into step 16**. Turning `resume()`/`pause()` into `inColumn` segments means restructuring loops whose post-wait code runs the next iteration's column-dependent work. That is high risk for little gain while the drawing code still reads the column implicitly, so each chain gets its explicit controller when `view/channel` gets a mount API with a column parameter. |
+| 16 | In progress, and reshaped by the `present/*` layer (below). Done so far: `view/dom`, `view/composer`, `present/time`, `present/notices`, `present/rows`, `present/call`, and the stateless half of `view/channel`. Remaining: the stateful half of `view/channel` (cards, columns, the thread list, with mount APIs and injected state), `view/voice` and `view/settings`. |
+| 17 | Partly done: strict TypeScript for every extracted package, tighter architecture checks, retired legacy test accessors, and the dead-prelude check (below). Shell/keyboard composition and the ordered boot wait for the views. |
+| 18 | Done (CSS split in preserved order, generated ID parity, feature test files moved). |
+| 19 | Not started; it runs at the exit gate. |
+
+### The present/* layer (owner, 2026-10-31)
+
+The owner chose "the more thoroughly factored version. I trust the inliner to optimize it and I prefer greater
+modularity." Before each view moves, its pure presentation decisions are extracted into `present/<area>`:
+grouping, folding, read runs, labels, time and age wording, notice wording, what a spoken answer says. These are
+no-DOM packages beside `core/*`, held to core's strict checks (no DOM, no window). Views import them, never the
+reverse. Then the DOM half moves into `view/<area>`. Section 2's package list gains this layer.
+`web/architecture.mjs` enforces the direction.
+
+### Three lanes (coordinator, 2026-11-01)
+
+Section 7 assumed one implementer working through the steps in order. From 2026-11-01 three lanes work in
+parallel, each on its own area of `web/voice.js`, rebasing over one another's list conflicts in
+`web/src/legacy/imports.ts` and `web/legacy-imports.d.ts`:
+
+* **cl-refactor**: the rest of `view/channel`, then step 17.
+* **cl-refactor2**: `view/settings` and Help.
+* **cx-astra**: the whole voice-call area as one chunk, as an experiment: session start and stop, transcript and
+  reconciliation, holds and reconnects, read-aloud transport. Other lanes keep any voice controls and settings
+  adapters they touch injectable, and move no call code until this lands.
+
+### How a slice is made and landed now
+
+SUPERSEDES section 7's "every commit must remain independently typechecked/buildable and behaviorally green;
+every push receives the full selected green gate".
+
+* **One owner per slice.** One slice moves one owner with its state, roughly 300-1500 lines. Moving a whole view
+  area per commit was weighed and rejected: each commit would retarget too many source-reading tests, reviews
+  lose precision, and a timing change like #719 hides in a large diff. The exception is cx-astra's one-chunk
+  experiment, which exists to test exactly that judgement.
+* **An inner loop after every move, in about a minute.** It runs:
+  * tsc over the page, the modules and the negative type examples, plus the architecture check;
+  * `page_build` (including the dead-prelude check) and the module suites;
+  * the whole page suite as parallel processes;
+  * `cargo test --lib`, which includes the Rust readers of `web/voice.js`;
+  * an AST diff of every moved declaration against its new copy;
+  * a grep of the text-reading Rust and Python tests for moved names, and of every test for names taken off the
+    prelude.
+
+  It is scripted once and shared between lanes.
+* **The full gate once per batch.** The gate (about 12 minutes here; since 2026-11-01 run through `scripts/gate.py`, which admits up to three at once and runs load-sensitive reruns alone with `--exclusive`) runs on the tip
+  of 3-5 owner commits (about 1.5-4k lines), and that tip gets one push line. If it fails, the batch is bisected
+  with the inner loop.
+* **An adversarial review per batch,** run while the gate runs. It does an AST comparison of every moved
+  declaration and asks what changes *when* things fetch, poll or redraw, not only what they draw.
+
+### Rules loosened by the owner (2026-11-01 10:53 ET)
+
+* Intermediate commits in a stack may break tests. Only the tip put up for push must pass the full gate, because
+  `main` stays green: the owner uses the page live, and other fleets build from `main`.
+* Tests that read `web/voice.js` source text (Python regex constants, Rust `.label` counts, function-body reads)
+  may be replaced with behaviour tests against the new modules. They may be deleted where an existing behaviour
+  test covers the same thing. Each commit body says which. Browser walks and real behaviour tests stay.
+* Bigger moves are preferred where the inner loop gives confidence.
+
+### Lessons
+
+* **#719 vt-thread-unpack-loop was a bug that predated the refactor.** A deploy of slices 16.21-16.23 was rolled
+  back for a thread view reading its newest page about 3.5 times a second. Bisecting with a new browser test
+  showed the loop on commits before the refactor touched that code. A gathered thread longer than one page
+  re-read its newest page whenever a read landed without a count. It was fixed as its own behaviour commit with
+  its own slug. Lesson: write the failing test before blaming the latest move, and ask every review whether a
+  slice changes when things are fetched.
+* **The dead-prelude check.** The import list's own rule ("a name the legacy script no longer needs comes off
+  this list") was held by nothing, and 33 names had stayed after their last caller moved. `page_build` now fails
+  on any prelude name that `web/voice.js`'s code does not use; comments and property names do not count as uses.
+* **preludedrops.** Taking a name off the prelude broke a Python browser walk that evaluated it in the page. The
+  page suites cannot see that. The inner loop now greps every test for names the change takes off the prelude.
+* Smaller ones, recorded in the handoff:
+  * a mid-run edit makes the gate's unit step recompile and run out of memory;
+  * a backgrounded gate's exit code is not its verdict;
+  * moved code is reached by mutation overlays on the module, not on the legacy wrapper.
+
+### Pace and what is left (measured on 2026-11-01)
+
+| | When #624 began (2026-10-28) | 2026-11-01 |
+| --- | --- | --- |
+| `web/voice.js` lines | 61,773 | about 55,200 (about 30,400 of them code) |
+| Top-level functions in `web/voice.js` | | 2,035 |
+| Top-level mutable variables (`let`) in `web/voice.js` | | 334 |
+| Handwritten TypeScript under `web/src` | | about 14,700 lines |
+
+About 89% of `web/voice.js`'s lines are still to move. In the 14 hours of step 16 up to 2026-11-01, 26 slices moved
+182 functions. All of them were stateless leaves, and none of the 334 variables moved. That is about 40 minutes per
+slice from gate to push, almost all of it gate and landing wait. What remains is stateful DOM code, which moves as
+owners with their state. At one owner per slice the estimate is about 80 more slices (60-120) across the lanes.
+The batch rhythm cuts the gates per slice about 3-5 times. Section 7's 37-59 working days remains the order of
+magnitude, but measured from 2026-10-28.
+
+### Which parts of section 7 and the exit criteria still hold
+
+* **Still hold:**
+  * the dependency order of section 7: primitives, composer, channel, voice, settings; then shell and boot;
+  * "move" and "improve the interface" as separate commits;
+  * no layout change mixed with a move;
+  * step 18 as done, and step 19 as written.
+* **Superseded:**
+  * Section 7's per-commit gate rule: replaced by the inner loop per move and the gate per batch (above).
+  * Its single sequence: replaced by the three lanes.
+  * Step 15's controller half: moved into step 16.
+  * Step 16's list of views: now preceded by `present/*` extraction for each view.
+* **The exit criteria hold unchanged.**
+  * There is no legacy script at the end: `web/voice.js` is emptied and deleted.
+  * Core runs headless with fake ports.
+  * There is no ambient cross-package state, and owners have mount and teardown paths.
+  * The asset, cache and validation requirements stay.
+  * One addition: the `present/*` packages are held to core's portability checks, as `core/*` is.
