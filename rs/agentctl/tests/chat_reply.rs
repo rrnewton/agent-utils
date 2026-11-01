@@ -73,6 +73,7 @@ impl Scratch {
                 reply_alias_range: None,
                 slack_format: None,
                 slack_format_by_channel: std::collections::BTreeMap::new(),
+                relay_channels: Vec::new(),
                 labels: None,
             },
         )

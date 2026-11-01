@@ -58,17 +58,15 @@ impl World {
         }
         let post = bin.join("post.sh");
         let list = bin.join("list.sh");
-        let teams = format!(
-            r#"{{
+        let teams = r#"{
   "schema": "agent-teams-teams/v1",
-  "hosts": {{"host-a": {{"routes": ["relay-coord"], "agent_teams": "agent-teams"}}}},
-  "teams": {{
-    "tools": {{"primary": "host-a", "entries": [{{"host": "host-a", "contacts": [{{"kind": "host"}}]}}]}},
-    "sim": {{"primary": "host-a", "entries": [{{"host": "host-a", "contacts": [{{"kind": "host"}}]}}]}}
-  }}
-}}
-"#
-        );
+  "hosts": {"host-a": {"routes": ["relay-coord"], "agent_teams": "agent-teams"}},
+  "teams": {
+    "tools": {"primary": "host-a", "entries": [{"host": "host-a", "contacts": [{"kind": "host"}]}]},
+    "sim": {"primary": "host-a", "entries": [{"host": "host-a", "contacts": [{"kind": "host"}]}]}
+  }
+}
+"#;
         std::fs::write(config.join("teams.json"), teams).expect("teams.json");
         let routes = format!(
             r#"{{

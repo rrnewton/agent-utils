@@ -2320,7 +2320,7 @@ fn cmd_relay_confirm(globals: &Globals, args: &[String]) -> Result<i32, DataErro
                                 .iter()
                                 .zip(host_obj_routes(&teams, &all_routes, &entry.host))
                         {
-                            if def.map(|d| crate::route::is_relay_def(d)).unwrap_or(false) {
+                            if def.is_some_and(crate::route::is_relay_def) {
                                 continue;
                             }
                             if let AttemptOutcome::Answered(probe) =
