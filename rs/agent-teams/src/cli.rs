@@ -2023,26 +2023,49 @@ fn cmd_relay_in(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
         .map_err(|e| err("io", e.to_string()))?;
     // Any relay activity re-raises overdue stranger alarms.
     let _ = crate::relay::raise_due_alarms(&globals.state, now_unix_ms());
-    // This bridge's own bot posts in the channel (its envelope posts and
-    // receipts echo back): an envelope from our own bot is a loop-back,
-    // never a peer delivery. One bot per team is a hard requirement, so a
-    // peer ID equal to our own bot ID is a setup error, not a peer.
+    // Loop-back guard for this bridge's own bot posts: LEGACY MODE ONLY.
+    // In signed mode the bot ID proves nothing (one bot may post for
+    // every team), so `relay_in` decides from the signature itself: a
+    // post signed by a confirmed peer key is delivered, a post signed
+    // by our own key is ignored there. This shortcut therefore applies
+    // only to unsigned envelopes, and never to one addressed to a local
+    // team@host: such a post goes through `relay_in`, where an
+    // inadmissible drop is a loud quarantined stranger, never silent.
     if let Ok(routes) = globals.load_routes() {
         let own_bot = routes.routes.values().any(|def| {
             crate::route::is_relay_def(def)
                 && def.raw.get("sender_id").and_then(Value::as_str) == Some(peer_sender.as_str())
         });
-        if own_bot
-            && matches!(
-                crate::relay::parse_post(&text),
-                Ok(crate::relay::RelayPost::Envelope(_))
-            )
-        {
-            println!(
-                "{}",
-                json!({"outcome": "ignored-own-bot", "detail": "envelope posted by this bridge's own bot; peer IDs must differ from the own bot ID (one bot per team)", "receipt_text": null, "receipt_posted": false})
-            );
-            return Ok(0);
+        if own_bot {
+            if let Ok(crate::relay::RelayPost::Envelope(envelope)) = crate::relay::parse_post(&text)
+            {
+                let signed = envelope
+                    .get("relay")
+                    .and_then(|relay| relay.get("pubkey"))
+                    .and_then(Value::as_str)
+                    .is_some();
+                let to_team = envelope
+                    .get("to")
+                    .and_then(|to| to.get("team"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let to_host = envelope
+                    .get("to")
+                    .and_then(|to| to.get("host"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let addressed_here = to_host == globals.host
+                    && load_declarations(&globals.state).is_ok_and(|declarations| {
+                        declarations.iter().any(|(team, _, _)| team == to_team)
+                    });
+                if !signed && !addressed_here {
+                    println!(
+                        "{}",
+                        json!({"outcome": "ignored-own-bot", "detail": "unsigned envelope posted by this bridge's own bot and addressed elsewhere; loop-back in legacy one-bot-per-team mode", "receipt_text": null, "receipt_posted": false})
+                    );
+                    return Ok(0);
+                }
+            }
         }
     }
     let out = crate::relay::relay_in(

@@ -530,8 +530,32 @@ fn receipt_from_wrong_host_is_refused_and_own_bot_envelope_ignored() {
         out.contains("in-custody"),
         "not settled by wrong host: {out}"
     );
-    // Our own bot's envelope post loops back and is ignored, not delivered.
+    // An unsigned envelope from our own bot ID addressed to THIS
+    // team@host is not silently ignored: it goes through relay-in and
+    // lands as a loud quarantined stranger (the shared-bot lesson).
     let outcome = world.relay_in("UBOTTOOLS", &post);
+    assert_eq!(outcome["outcome"], "stranger-quarantined", "{outcome}");
+    // The legacy loop-back guard still applies to an unsigned envelope
+    // from our own bot addressed elsewhere.
+    let elsewhere = agent_teams::envelope::build_envelope(
+        "tm-tools-3434343412121212",
+        "kelse",
+        "tools",
+        "host-a",
+        1,
+        "harness-ancestry",
+        "sim",
+        "host-b",
+        "info",
+        None,
+        &[],
+        false,
+        agent_teams::timeutil::now_unix_ms(),
+        agent_teams::timeutil::now_unix_ms() + 7_200_000,
+        None,
+        "our own post to another host",
+    );
+    let outcome = world.relay_in("UBOTTOOLS", &agent_teams::relay::render_post(&elsewhere));
     assert_eq!(outcome["outcome"], "ignored-own-bot", "{outcome}");
 }
 
@@ -796,6 +820,119 @@ fn slack_mangled_own_announce_is_ignored_not_stranger() {
         agent_teams::relay::render_announce(&peer).replace("```agent-teams-announce", "```");
     let outcome = world.relay_in(SHARED, &mangled_peer);
     assert_eq!(outcome["outcome"], "candidate-recorded", "{outcome}");
+}
+
+#[test]
+fn shared_bot_signed_both_ways_with_receipts() {
+    // THE live configuration: two teams post through ONE bot ID. The
+    // bridge's own-bot ID therefore proves nothing; relay-in must decide
+    // from the signature. Signed peer posts sharing our bot ID are
+    // delivered both ways, with receipts, and never dropped as
+    // "ignored-own-bot" (the silent-loss bug this regresses).
+    const SHARED: &str = "USHAREDBOT";
+    let world = World::new();
+    world.init_tools(&format!("relay-coord:{CHAN}:{SHARED}=sim@host-a"));
+    // Give sim a relay channel too (each host declares the shared bot
+    // as the other team), and make the route's own sender the shared
+    // bot, exactly as on the live bridges.
+    let pid = std::process::id().to_string();
+    let (code, out, err) = world.run(&[
+        "init",
+        "sim",
+        "--coordinator-self",
+        "--coordinator-pid",
+        &pid,
+        "--deliver",
+        "hook-inbox",
+        "--accepts-from",
+        "tools",
+        "--relay",
+        &format!("relay-coord:{CHAN}:{SHARED}=tools@host-a"),
+    ]);
+    assert_eq!(code, 0, "init sim relay: {out} {err}");
+    let routes_path = world.config.join("agent-teams/routes.d/relay.json");
+    let routes = std::fs::read_to_string(&routes_path)
+        .expect("routes")
+        .replace("UBOTTOOLS", SHARED);
+    std::fs::write(&routes_path, routes).expect("routes rewrite");
+    // Each team@host has its own key; each side trusts the other's
+    // (what announce + confirm records on a real host).
+    let (_, sim_public) =
+        agent_teams::relay::ensure_signing_key(&world.state, "sim", "host-a").expect("sim key");
+    let (_, tools_public) =
+        agent_teams::relay::ensure_signing_key(&world.state, "tools", "host-a").expect("tools key");
+    agent_teams::relay::trust_key(&world.state, "sim", "host-a", &sim_public, "test")
+        .expect("trust sim");
+    agent_teams::relay::trust_key(&world.state, "tools", "host-a", &tools_public, "test")
+        .expect("trust tools");
+    // sim -> tools through the shared bot: delivered, with a receipt.
+    let (id, post) = world.send_sim_to_tools("signed hello both ways", "relay-bothways-1");
+    let outcome = world.relay_in(SHARED, &post);
+    assert_eq!(outcome["outcome"], "accepted", "{outcome}");
+    let receipt = outcome["receipt_text"]
+        .as_str()
+        .expect("receipt")
+        .to_string();
+    let outcome = world.relay_in(SHARED, &receipt);
+    assert_eq!(outcome["outcome"], "receipt-recorded", "{outcome}");
+    let (_code, out, _) = world.run(&["status", &id, "--json"]);
+    let status: serde_json::Value = serde_json::from_str(&out).expect("status json");
+    assert_ne!(
+        status["outbox"]["state"], "in-custody",
+        "settled by receipt: {out}"
+    );
+    // tools -> sim through the same bot: also delivered, with a receipt.
+    let (code, out, err) = world.run(&[
+        "send",
+        "sim@host-a",
+        "--from-team",
+        "tools",
+        "--text",
+        "signed reply both ways",
+        "--key",
+        "relay-bothways-2",
+        "--json",
+    ]);
+    assert_eq!(code, 75, "tools send settles in-custody: {out} {err}");
+    let value: serde_json::Value = serde_json::from_str(&out).expect("send json");
+    let id2 = value["id"].as_str().expect("id").to_string();
+    let post = world
+        .channel_posts()
+        .into_iter()
+        .last()
+        .expect("tools relay post");
+    let outcome = world.relay_in(SHARED, &post);
+    assert_eq!(outcome["outcome"], "accepted", "{outcome}");
+    assert!(world.ledger_has("sim", &id2), "delivered to sim ledger");
+    let receipt = outcome["receipt_text"]
+        .as_str()
+        .expect("receipt")
+        .to_string();
+    let outcome = world.relay_in(SHARED, &receipt);
+    assert_eq!(outcome["outcome"], "receipt-recorded", "{outcome}");
+    // Our own signed post (from this host's receiving team, our key) is
+    // still ignored, and a tampered signed post is a loud stranger.
+    let mut own = agent_teams::envelope::build_envelope(
+        "tm-tools-5656565634343434",
+        "kown2",
+        "tools",
+        "host-a",
+        1,
+        "harness-ancestry",
+        "tools",
+        "host-a",
+        "info",
+        None,
+        &[],
+        false,
+        agent_teams::timeutil::now_unix_ms(),
+        agent_teams::timeutil::now_unix_ms() + 7_200_000,
+        None,
+        "our own post",
+    );
+    agent_teams::relay::sign_envelope(&world.state, &mut own).expect("sign own");
+    let outcome = world.relay_in(SHARED, &agent_teams::relay::render_post(&own));
+    assert_eq!(outcome["outcome"], "ignored-own-post", "{outcome}");
 }
 
 #[test]
