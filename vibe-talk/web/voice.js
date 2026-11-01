@@ -12005,6 +12005,75 @@ function stepCardMaxLines(direction) {
   if (held && button.disabled) el("card-max-lines").focus();
 }
 
+// --- how much a quote must cover to mark read (#728 vt-quote-read-threshold) ---------------------
+//
+// `#728 vt-quote-read-threshold`. The owner, 2026-11-01: a reply that quotes one sentence of a long
+// message is an answer to that sentence, not to the message, and marking the whole message read
+// (`#300 reply-marks-read`) loses the rest of it. So a reply whose quote covers less than a share of
+// the message's words, 5% until the owner says otherwise, leaves it unread: no Done, no read marker
+// moved in the chat service. A reply that quotes nothing, or more than that, marks it read as
+// before. The share is a setting under Messages, kept on the server for every device; 0 marks every
+// reply's message read, as the page always did. Decided when the reply is queued, like `marksRead`.
+
+/** The device's copy of the share, kept on the server for every device (`#457 settings-server-side`). */
+const QUOTE_READ_PERCENT_KEY = DEVICE_SETTINGS.quoteReadPercent.key;
+
+/** The share in force, a percentage; `applyQuoteReadPercent` is its only writer. */
+let quoteReadPercent = DEFAULT_QUOTE_READ_PERCENT;
+
+/** What was stored, clamped. A missing, corrupt or refused entry is the default. */
+function storedQuoteReadPercent() {
+  return deviceSettings().get(DEVICE_SETTINGS.quoteReadPercent);
+}
+
+/** Put the share on the page, and return the one applied: the slider says it. */
+function applyQuoteReadPercent(value) {
+  const n = clampQuoteReadPercent(value);
+  quoteReadPercent = n;
+  el("quote-read-percent").value = String(n);
+  el("quote-read-percent-smaller").disabled = n <= MIN_QUOTE_READ_PERCENT;
+  el("quote-read-percent-larger").disabled = n >= MAX_QUOTE_READ_PERCENT;
+  return n;
+}
+
+/** The slider, or − and +: the share applied, and kept, read back as private browsing keeps nothing. */
+function quoteReadPercentChanged(value) {
+  const n = applyQuoteReadPercent(value);
+  let kept = false;
+  try {
+    deviceSettings().keep(DEVICE_SETTINGS.quoteReadPercent, n);
+    kept = deviceSettings().keptAs(DEVICE_SETTINGS.quoteReadPercent, n);
+  } catch (_error) {
+    kept = false;
+  }
+  const rule = n === 0
+    ? "a reply marks the message it answers read, whatever it quotes."
+    : `a reply that quotes less than ${n}% of a message leaves it unread.`;
+  el("quote-read-percent-state").textContent = kept
+    ? `Saved — ${rule}`
+    : `This browser refused to store it, so it will be forgotten when you reload (private browsing does this). Until then ${rule}`;
+  return n;
+}
+
+/** One percent less (-1) or more (+1), as `stepCardMaxLines` steps its lines. */
+function stepQuoteReadPercent(direction) {
+  const button = el(direction > 0 ? "quote-read-percent-larger" : "quote-read-percent-smaller");
+  const held = document.activeElement === button;
+  quoteReadPercentChanged(clampQuoteReadPercent(el("quote-read-percent").value) + direction);
+  if (held && button.disabled) el("quote-read-percent").focus();
+}
+
+/**
+ * What a reply to `target` with text `text` marks read once sent (`#300 reply-marks-read`): the message
+ * itself, or null where its quote covers less of it than the share in force.
+ *
+ * @param {{id: unknown, content: string}} target
+ * @param {string} text
+ */
+function replyMarksRead(target, text) {
+  return quoteMarksRead(quoteShare(text, rawTextOf(target)), quoteReadPercent) ? String(target.id) : null;
+}
+
 /** Whether `root` is longer than a card shows: more than K card lines of its text, as the server counts. */
 function rootOverflowsCard(root) {
   return Boolean(root) && cardProxyLines(proxyLinesOf(rawTextOf(root))) > cardMaxLines;
@@ -30569,8 +30638,9 @@ async function sendReply() {
     // `#500 sent-receipts-pile-up`. And in which list: the Threads view's cards, where Main may draw the
     // same message on the left.
     ...(replyDocked && replyList === leftEl("side-cards") ? { inCards: true } : {}),
-    // `#300 reply-marks-read`. A targeted reply marks the message it answers, wherever it goes.
-    marksRead: String(target.id),
+    // `#300 reply-marks-read`. A targeted reply marks the message it answers, wherever it goes, unless
+    // its quote covers too little of it (`#728 vt-quote-read-threshold`).
+    marksRead: replyMarksRead(target, text),
     // Not where to post yet: the send reads the channel first. See `placeReplyTarget`.
     ...(route.unknown ? { placement: "unknown" } : {}),
   }, replyDocked ? replyColumn : null);
@@ -39158,6 +39228,7 @@ function applySyncedSetting(key) {
       case READ_SPEED_KEY: readAloudOwner().applyReadSpeed(readAloudOwner().storedReadSpeed()); break;
       case readAloudOwner().READ_AUDIO_SOURCE_KEY: readAloudOwner().setReadAudioSource(readAloudOwner().storedReadAudioSource(), false); break;
       case readAloudOwner().WIT_VOICE_KEY: readAloudOwner().setWitVoice(readAloudOwner().storedWitVoice(), false); break;
+      case QUOTE_READ_PERCENT_KEY: applyQuoteReadPercent(storedQuoteReadPercent()); break;
       case MIC_SETTINGS_KEY: {
         const held = storedMicSettings();
         for (const [id, name] of MIC_TOGGLES) {
@@ -39378,6 +39449,7 @@ textSize.apply(storedMsgScale());
 applyCollapsedLines(storedCollapsedLines());
 // Before the first card is drawn: nothing to draw again yet.
 applyCardMaxLines(storedCardMaxLines(), false);
+applyQuoteReadPercent(storedQuoteReadPercent());
 readAloudOwner().applyReadSpeed(readAloudOwner().storedReadSpeed());
 applyMarkOwnRead(storedMarkOwnRead());
 applyCombineMessages(storedCombineMessages());
@@ -39421,6 +39493,9 @@ el("page-update").addEventListener("click", () => window.location.reload());
 renderPageBuild();
 el("card-max-lines-smaller").addEventListener("click", () => stepCardMaxLines(-1));
 el("card-max-lines-larger").addEventListener("click", () => stepCardMaxLines(1));
+el("quote-read-percent").addEventListener("input", () => quoteReadPercentChanged(el("quote-read-percent").value));
+el("quote-read-percent-smaller").addEventListener("click", () => stepQuoteReadPercent(-1));
+el("quote-read-percent-larger").addEventListener("click", () => stepQuoteReadPercent(1));
 el("width-grip").addEventListener("pointerdown", (event) => readingWidthControl.gripDown(event));
 el("width-grip").addEventListener("pointermove", (event) => readingWidthControl.gripMove(event));
 el("width-grip").addEventListener("pointerup", () => readingWidthControl.gripUp());

@@ -127,6 +127,7 @@ test("`#624 voice-page-modularity`: each device setting reads, keeps and refuses
     ["readingWidth", "vibe-talk.voice.width", 72, [[90, "90"], [45, "45"]], THROWN],
     ["collapsedLines", "vibe-talk.voice.collapsed-lines", 3, [[0, "0"], [8, "8"]], THROWN],
     ["cardMaxLines", "vibe-talk.voice.thread-card-max-lines", 5, [[1, "1"], [12, "12"]], 5],
+    ["quoteReadPercent", "vibe-talk.voice.quote-read-percent", 5, [[0, "0"], [100, "100"]], 5],
     ["readSpeed", "vibe-talk.voice.read-speed", null, [[150, "150"], [null, null]], THROWN],
   ];
   const refused = () => { throw new Error("SecurityError"); };
@@ -161,4 +162,18 @@ test("`#624 voice-page-modularity`: each device setting reads, keeps and refuses
   [72, 100, 3, 5, null]);
   assert.deepStrictEqual([keptText("  ").get(DEVICE_SETTINGS.collapsedLines), keptText("").get(DEVICE_SETTINGS.readingWidth)], [3, 72]);
   assert.deepStrictEqual(Object.keys(DEVICE_SETTINGS).sort(), table.map(([name]) => name).sort(), "a setting with no row here");
+});
+
+test("`#728 vt-quote-read-threshold`: the share a quote must cover is whole percentages from 0 to 100, 5 for anything unusable, kept synced", () => {
+  const { clampQuoteReadPercent, DEFAULT_QUOTE_READ_PERCENT, DEVICE_SETTINGS, SYNCED_SETTING_KEYS } = SETTINGS;
+  assert.equal(DEFAULT_QUOTE_READ_PERCENT, 5);
+  for (const [given, want] of [[null, 5], ["", 5], ["x", 5], [" 12 ", 12], [2.4, 2], [-3, 0], [250, 100], [0, 0], ["100", 100]]) {
+    assert.equal(clampQuoteReadPercent(given), want, `${JSON.stringify(given)}`);
+  }
+  const setting = DEVICE_SETTINGS.quoteReadPercent;
+  assert.equal(setting.read(null), 5);
+  assert.equal(setting.read("40"), 40);
+  assert.equal(setting.write(7), "7");
+  assert.equal(setting.refused.value, 5);
+  assert.ok(SYNCED_SETTING_KEYS.includes(setting.key));
 });

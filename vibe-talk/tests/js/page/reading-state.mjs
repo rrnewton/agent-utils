@@ -5,7 +5,7 @@
 
 import assert from "node:assert/strict";
 
-import { ACKNOWLEDGED, ALICE, BOTTOM_SLACK_PX, BOUND_NOTICE, CHANNEL, CODER, COUNTS_ALL_READ_MS,
+import { SETTINGS, ACKNOWLEDGED, ALICE, BOTTOM_SLACK_PX, BOUND_NOTICE, CHANNEL, CODER, COUNTS_ALL_READ_MS,
   CSS, CSS_CODE, DISCORD_POLL_MS, GATHERED, HTML, HTML_CODE, INBOX, LINE_PX, MESSAGE_CACHE_KEY,
   MESSAGE_SPACING_MS, OTHER_CHANNEL, OWN, OWNERS_MESSAGE, PAGE_ELEMENTS, RUN_TAIL, RUN_THREAD,
   SCRIPT, SCRIPT_CODE, SCROLL_VIEWPORT_PX, UI_STATE_KEY, allLeavingOut, arrowStyle,
@@ -5358,6 +5358,84 @@ test("`#300 reply-marks-read`: Quote reply, and Reply docked in either column, m
   assert.deepStrictEqual(two.upstreamReadCalls,
     [{ message_id: "202", after_reply: true }, { message_id: "200", after_reply: true }],
     "a reply docked in a column was not marked at the provider as Reply is");
+});
+
+// --- a reply quoting little of a message leaves it unread (#728 vt-quote-read-threshold) ----------
+
+const QUOTE_READ_STORAGE = "vibe-talk.voice.quote-read-percent";
+/** Twenty sentences of about fifty characters: one of them is about 5% of the whole. */
+const LONG_SENTENCES = Array.from({ length: 20 }, (_, at) => `Sentence ${String(at + 1).padStart(2, "0")} says one thing about the runner.`);
+const LONG_ID = "1000000000000000071";
+
+/** A channel holding one long message, signed in, with the read marker at the provider supported. */
+async function longMessagePage(storage = new Map(), script = undefined) {
+  const page = newPage(storage, script, (p) => { p.upstreamReadMarkSupported = true; });
+  await signIn(page);
+  await showDiscord(page, [message({ id: LONG_ID, content: LONG_SENTENCES.join(" ") })]);
+  return page;
+}
+
+test("`#728 vt-quote-read-threshold`: a reply quoting under 5% of a message leaves it unread; one quoting more, or nothing, marks it read as before", async () => {
+  const one = `> ${LONG_SENTENCES[3]}\n\nwhich runner?`;
+  const page = await longMessagePage();
+  await replyAndSend(page, LONG_ID, one);
+  assert.equal(page.repliesPosted.at(-1).body.reply_to, LONG_ID, "the premise is a reply to the long message");
+  assert.match(page.repliesPosted.at(-1).body.text, /^> Sentence 04/, "the premise is a quoted reply");
+  assert.deepStrictEqual(page.dismissCalls, [], "a quote of one sentence in twenty marked the message Done");
+  assert.deepStrictEqual(page.upstreamReadCalls, [], "a quote of one sentence in twenty moved the service's read marker");
+
+  // Two sentences of twenty are 10%: the message is marked, as #300 always did.
+  const two = await longMessagePage();
+  await replyAndSend(two, LONG_ID, `> ${LONG_SENTENCES[3]}\n> ${LONG_SENTENCES[4]}\n\nboth of these`);
+  assert.deepStrictEqual(two.dismissCalls, [{ messages: [LONG_ID] }]);
+  assert.deepStrictEqual(two.upstreamReadCalls, [{ message_id: LONG_ID, after_reply: true }]);
+
+  // A reply that quotes nothing marks what it answers.
+  const plain = await longMessagePage();
+  await replyAndSend(plain, LONG_ID, "on it");
+  assert.deepStrictEqual(plain.dismissCalls, [{ messages: [LONG_ID] }]);
+
+  // A whole short message quoted is all of it.
+  const short = await quotePage();
+  await replyAndSend(short, "1000000000000000001", "> the first message, about the runner\n\nyes");
+  assert.deepStrictEqual(short.dismissCalls, [{ messages: ["1000000000000000001"] }]);
+
+  // THE CONTROL: every reply marking what it answers, the one-sentence quote marks the message.
+  const control = await longMessagePage(new Map(), brokenScript(
+    "  return quoteMarksRead(quoteShare(text, rawTextOf(target)), quoteReadPercent) ? String(target.id) : null;",
+    "  return String(target.id);"));
+  await replyAndSend(control, LONG_ID, one);
+  assert.deepStrictEqual(control.dismissCalls, [{ messages: [LONG_ID] }],
+    "with the share ignored the reply still left the message unread, so this test cannot see it");
+});
+
+test("`#728 vt-quote-read-threshold`: the share is Quoted replies in Settings, 0 to 100 and 5 by default, synced, and the next reply follows it", async () => {
+  assertMarkupContains("fold-quote-read-body", "quote-read-percent");
+  assert.match(/<input\s+id="quote-read-percent"[^>]*>/.exec(HTML_CODE.replace(/\n\s*/g, " "))[0], /min="0" max="100"/);
+  assert.ok(SETTINGS.SYNCED_SETTING_KEYS.includes(QUOTE_READ_STORAGE), "the share is not kept on the server");
+  const storage = new Map();
+  const page = await longMessagePage(storage);
+  assert.equal(page.el("quote-read-percent").value, "5", "the default is not 5%");
+  // 0: every reply marks what it answers, whatever it quotes.
+  await page.el("quote-read-percent").setValue("0");
+  await page.settle();
+  assert.equal(storage.get(QUOTE_READ_STORAGE), "0", "the choice was not kept");
+  assert.match(page.el("quote-read-percent-state").textContent, /^Saved — a reply marks the message it answers read, whatever it quotes\./);
+  assert.equal(page.el("quote-read-percent-smaller").disabled, true);
+  await replyAndSend(page, LONG_ID, `> ${LONG_SENTENCES[0]}\n\nthis one`);
+  assert.deepStrictEqual(page.dismissCalls, [{ messages: [LONG_ID] }], "at 0% a one-sentence quote left the message unread");
+  // Kept across a reload, and clamped: past 100 is 100.
+  const again = newPage(storage);
+  await signIn(again);
+  assert.equal(again.el("quote-read-percent").value, "0");
+  await again.el("quote-read-percent").setValue("250");
+  await again.settle();
+  assert.equal(again.el("quote-read-percent").value, "100");
+  assert.equal(again.el("quote-read-percent-larger").disabled, true);
+  await again.el("quote-read-percent-smaller").click();
+  await again.settle();
+  assert.equal(storage.get(QUOTE_READ_STORAGE), "99");
+  assert.match(again.el("quote-read-percent-state").textContent, /quotes less than 99% of a message leaves it unread/);
 });
 
 test("`#300 reply-marks-read`: an outbox entry saved by an earlier page marks what it answers once sent; one saved marking nothing marks nothing", async () => {

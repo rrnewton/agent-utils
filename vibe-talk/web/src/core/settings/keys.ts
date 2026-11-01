@@ -37,6 +37,8 @@ export const SYNCED_SETTING_KEYS: readonly string[] = [
   // `#522 thread-card-max-lines`. K, the most lines a thread card shows of its root; the server
   // reads it too, to name a thread whose root is longer from its first reply.
   "vibe-talk.voice.thread-card-max-lines",
+  // `#728 vt-quote-read-threshold`. How much of a message a reply's quote must cover to mark it read.
+  "vibe-talk.voice.quote-read-percent",
   // `#488 slack-app-agents`. Who is who: which account is the owner, the coding agent, a person or
   // another bot, chosen once for every device. The census of who spoke where stays local: a cache.
   "vibe-talk.voice.identities",

@@ -1574,6 +1574,48 @@
 
                   <section class="settings-group">
                     <div class="group-head">
+                      <h3 title="How much of a message a reply must quote to mark it read."><button class="fold-toggle" id="fold-quote-read" type="button" aria-expanded="false" aria-controls="fold-quote-read-body">Quoted replies</button></h3>
+                      <button class="help-link" id="help-link-quote-read" type="button" data-help="quote-read" aria-label="About quoted replies marking read" title="How much of a message a reply must quote to mark it read.">?</button>
+                    </div>
+                    <div class="fold-body" id="fold-quote-read-body" hidden="until-found">
+                      <!--
+                        `#728 vt-quote-read-threshold`. A reply marks the message it answers read (`#300
+                        reply-marks-read`) unless its quote covers less than this share of the message's
+                        words: 5% until the owner says otherwise, 0 to 100. Kept on the server for every
+                        device (`#457 settings-server-side`).
+                      -->
+                      <div class="msg-scale-row">
+                        <button
+                          id="quote-read-percent-smaller"
+                          class="secondary step-button"
+                          type="button"
+                          aria-label="A smaller share"
+                          aria-controls="quote-read-percent"
+                          title="A smaller share"
+                        >−</button>
+                        <input
+                          id="quote-read-percent"
+                          type="range"
+                          min="0"
+                          max="100"
+                          step="1"
+                          aria-label="percent of a message a reply's quote must cover to mark it read"
+                        />
+                        <button
+                          id="quote-read-percent-larger"
+                          class="secondary step-button"
+                          type="button"
+                          aria-label="A larger share"
+                          aria-controls="quote-read-percent"
+                          title="A larger share"
+                        >+</button>
+                      </div>
+                      <p id="quote-read-percent-state" class="hint" aria-live="polite"></p>
+                    </div>
+                  </section>
+
+                  <section class="settings-group">
+                    <div class="group-head">
                       <h3 title="A message whose whole text is one of these is marked read the moment it arrives."><button class="fold-toggle" id="fold-auto-read" type="button" aria-expanded="false" aria-controls="fold-auto-read-body">Mark-read automatically</button></h3>
                       <button class="help-link" id="help-link-auto-read" type="button" data-help="auto-read" aria-label="About marking messages read automatically" title="A message whose whole text is one of these is marked read the moment it arrives.">?</button>
                     </div>
@@ -3269,6 +3311,18 @@
                 <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>0</kbd>). The status line says the new
                 count, the message you are on stays where it is, and neither chord types anything
                 in a message box or zooms the page.
+              </p>
+            </details>
+
+            <details id="help-quote-read" class="help-entry">
+              <summary><h2>Quoted replies</h2></summary>
+              <p class="hint">
+                A reply marks the message it answers read, as though you had pressed Done on it. A
+                <strong>quoted reply</strong> that quotes only a little of the message answers that
+                part, not the whole, so the message stays unread for the rest: when the quote covers
+                less than <strong>5% of the message's words</strong> (the share you set in Settings
+                under Messages, kept on the server for every device), nothing is marked. 0 marks the
+                message read whatever the reply quotes; a reply that quotes nothing always marks it.
               </p>
             </details>
 

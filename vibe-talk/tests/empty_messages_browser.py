@@ -186,7 +186,8 @@ class Reader:
         page.wait_for_selector("#hide-empty-messages", state="visible", timeout=5_000)
         groups = page.evaluate("""() => [...document.querySelectorAll('#fold-settings-messages-body .settings-group h3')]
             .map((h) => h.textContent.trim())""")
-        self.check(groups[1:3] == ["Mark-read automatically", "Empty messages"],
+        # `#728 vt-quote-read-threshold` put Quoted replies under Your own messages, before these two.
+        self.check(groups[2:4] == ["Mark-read automatically", "Empty messages"],
                    f"Empty messages is not beside Mark-read automatically: {groups}")
         self.shot(f"settings-{'on' if page.is_checked('#hide-empty-messages') else 'off'}")
         page.set_checked("#hide-empty-messages", on)

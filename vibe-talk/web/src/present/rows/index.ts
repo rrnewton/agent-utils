@@ -43,6 +43,6 @@ export { THREAD_HUE_APART, THREAD_HUE_BESIDE, hueApart, newestThreadHues, spread
 export { BLANK_TEXT, messageLook, rawTextOf, renderedHtmlOf } from "./message.ts";
 export { GLOM_SEPARATOR, combinedContent, editedDrawn, reactionsDrawn, rowEdited, rowReactions } from "./rowdata.ts";
 export type { ReactionTally } from "./rowdata.ts";
-export { QUOTE_MAX_CHARS, quoteBlock } from "./quote.ts";
+export { QUOTE_MAX_CHARS, quoteBlock, quoteMarksRead, quoteShare, quotedHead } from "./quote.ts";
 export { countOf, replyMarkerName } from "./replies.ts";
 export { mainRunsAmong } from "./mainruns.ts";

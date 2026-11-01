@@ -1408,7 +1408,8 @@ test("`#271 settings-groups`: the Messages section holds the message options, an
   // it decides how much of a message is shown, so the server keeps it for every device,
   // and Screen and keys is the one per-device section. `#543 in-app-message-links` put Message links
   // after Rich headers: whether a link to a message opens it here is a choice about drawing messages.
-  assert.deepStrictEqual(messages, ["Your own messages", "Mark-read automatically", "Empty messages", "Combining messages",
+  // `#728 vt-quote-read-threshold` put Quoted replies under Your own messages: both say what marks read.
+  assert.deepStrictEqual(messages, ["Your own messages", "Quoted replies", "Mark-read automatically", "Empty messages", "Combining messages",
     "Rich headers", "Message links", "Summaries", "Collapsed message lines", "Thread card lines", "Recently dismissed"]);
   for (const agentGroup of ["Sending", "Instructions", "Resuming", "Arriving messages during a call",
     "Reading full messages in channel view"]) {
@@ -2721,8 +2722,9 @@ function foldProblems(html, css, script) {
 
 test("`#346 settings-collapsible`: every section but Server and every group in them folds, hidden until found", () => {
   assert.deepStrictEqual(foldProblems(HTML, CSS_CODE, PAGE_CODE), []);
-  // 31 since `#481 slack-app-deep-link` added Opening links, counted and checked above.
-  assert.equal(scriptFolds(PAGE_CODE).length, 34, "a fold went missing from the list, or one was added unchecked");
+  // 31 since `#481 slack-app-deep-link` added Opening links, 35 since `#728 vt-quote-read-threshold`
+  // added Quoted replies, counted and checked above.
+  assert.equal(scriptFolds(PAGE_CODE).length, 35, "a fold went missing from the list, or one was added unchecked");
 });
 
 test("`#346 settings-collapsible`: the check refuses a fold out of find's reach, an unfolding group, and a list that disagrees (negative controls)", () => {

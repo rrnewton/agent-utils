@@ -163,6 +163,8 @@ export interface ElementById {
   "fold-opening-links-body": HTMLDivElement;
   "fold-provider": HTMLButtonElement;
   "fold-provider-body": HTMLDivElement;
+  "fold-quote-read": HTMLButtonElement;
+  "fold-quote-read-body": HTMLDivElement;
   "fold-reading-full": HTMLButtonElement;
   "fold-reading-full-body": HTMLDivElement;
   "fold-reading-width": HTMLButtonElement;
@@ -231,6 +233,7 @@ export interface ElementById {
   "help-link-message-cache": HTMLButtonElement;
   "help-link-message-links": HTMLButtonElement;
   "help-link-microphone": HTMLButtonElement;
+  "help-link-quote-read": HTMLButtonElement;
   "help-link-reading-width": HTMLButtonElement;
   "help-link-resuming": HTMLButtonElement;
   "help-link-rich-headers": HTMLButtonElement;
@@ -244,6 +247,7 @@ export interface ElementById {
   "help-message-cache": HTMLDetailsElement;
   "help-message-links": HTMLDetailsElement;
   "help-microphone": HTMLDetailsElement;
+  "help-quote-read": HTMLDetailsElement;
   "help-reading-width": HTMLDetailsElement;
   "help-resuming": HTMLDetailsElement;
   "help-rich-headers": HTMLDetailsElement;
@@ -355,6 +359,10 @@ export interface ElementById {
   "prompts-open-label": HTMLSpanElement;
   "prompts-tray": HTMLDivElement;
   "pull-refresh": HTMLDivElement;
+  "quote-read-percent": HTMLInputElement;
+  "quote-read-percent-larger": HTMLButtonElement;
+  "quote-read-percent-smaller": HTMLButtonElement;
+  "quote-read-percent-state": HTMLParagraphElement;
   "read-aloud": HTMLButtonElement;
   "read-aloud-label": HTMLSpanElement;
   "read-aloud-stop": HTMLButtonElement;

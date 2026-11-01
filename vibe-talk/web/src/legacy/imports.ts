@@ -59,7 +59,7 @@ export {
   unsentText,
   waitingItsTurn as outboxWaitingItsTurn,
 } from "../core/outbox/index.ts";
-export { DEFAULT_CARD_MAX_LINES, DEFAULT_COLLAPSED_LINES, DEVICE_SETTINGS, IDENTITY_KEY, MAX_CARD_MAX_LINES, MAX_COLLAPSED_LINES, MIN_CARD_MAX_LINES, MIN_COLLAPSED_LINES, clampCardMaxLines, clampCollapsedLines, createCredentials, createDeviceSettings, createSettingsSync } from "../core/settings/index.ts";
+export { DEFAULT_CARD_MAX_LINES, DEFAULT_COLLAPSED_LINES, DEFAULT_QUOTE_READ_PERCENT, DEVICE_SETTINGS, IDENTITY_KEY, MAX_CARD_MAX_LINES, MAX_COLLAPSED_LINES, MAX_QUOTE_READ_PERCENT, MIN_CARD_MAX_LINES, MIN_COLLAPSED_LINES, MIN_QUOTE_READ_PERCENT, clampCardMaxLines, clampCollapsedLines, clampQuoteReadPercent, createCredentials, createDeviceSettings, createSettingsSync } from "../core/settings/index.ts";
 export { createWebPorts } from "../platform/web/index.ts";
 export {
   answersEnter,
@@ -98,7 +98,7 @@ export { HTTP_ADDRESS, createSerialQueue, deepLinkRefFrom, linkKind, linksIn, me
 export { briefAge, dayClock, dayKeyOf, dayRangeWords, editedTitle, fullLocalAt, fullLocalTime, messageDate, shortLocalTime, stamp } from "../present/time/index.ts";
 
 export { doneReadWords, failureWords, fmtDuration, messagesWords, reachBackWords, reachClause, readableCause, refusalSentence, refusalWords, searchMomentWords, searchWalkProgress, serviceReadWords, } from "../present/notices/index.ts";
-export { BLANK_TEXT, cardGapWords, cardMaxLinesWords, cardProxyLines, cardRunText, collapsedLinesWords, combinedContent, countOf, createReadRuns, editedDrawn, firstLineOf, foldedCardText, forgetElisionCounts, gapWords, isNoise, joinsGroup, lineLabel, mainRunsAmong, messageLook, newestThreadHues, proxyLinesOf, quoteBlock, rawTextOf, reactionText, reactionsDrawn, readRunText, renderedHtmlOf, replyMarkerName, rowEdited, rowReactions, spreadThreadHue, threadChoice, threadFacts, undoLabel, undoName } from "../present/rows/index.ts";
+export { BLANK_TEXT, cardGapWords, cardMaxLinesWords, cardProxyLines, cardRunText, collapsedLinesWords, combinedContent, countOf, createReadRuns, editedDrawn, firstLineOf, foldedCardText, forgetElisionCounts, gapWords, isNoise, joinsGroup, lineLabel, mainRunsAmong, messageLook, newestThreadHues, proxyLinesOf, quoteBlock, quoteMarksRead, quoteShare, rawTextOf, reactionText, reactionsDrawn, readRunText, renderedHtmlOf, replyMarkerName, rowEdited, rowReactions, spreadThreadHue, threadChoice, threadFacts, undoLabel, undoName } from "../present/rows/index.ts";
 export { DAY_TITLED, EDITED_MARK, RESTATED_CLASS, anchorOfRow, anchorsAmong, authorLabel, cardGapGroups, cardGapTally, cardMarkTarget, cardRunIds, cardStubText, cardUnits, doneButtonOf, drawLinkPath, fillCardText, findableParts, foldedTextLine, freshenDayTitle, fromGatheredThread, gutterPiece, idsOf, isMessageRow, keepCardUnits, laneOrder, linkAt, linkedRootThread, markCardLayout, messageTop, notNoiseButtonOf, pointerOn, quoteLabelFits, renderedText, rowIn, rowLinkY, rowMessages, rowNewestMs, rowQuotedBy, rowSentMs, rowShown, rowTimeTabStop, setArrowReach, setMarkerLift, shownRowFor, stackUnder, standingRow, textHits, textRunsOf, threadCardId, timeNode } from "../view/channel/index.ts";
 
 import { decode, decodeTagged, is, roots } from "../contract/index.ts";

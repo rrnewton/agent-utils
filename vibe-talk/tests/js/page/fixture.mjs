@@ -5198,6 +5198,16 @@ const TUNING_BANDS = {
   DEFAULT_CARD_MAX_LINES: [5, 5,
     "the lines a thread card shows of its first message until the owner says otherwise: his five, " +
     "and src/threads.rs DEFAULT_CARD_MAX_LINES (#522 thread-card-max-lines)"],
+  MIN_QUOTE_READ_PERCENT: [0, 0,
+    "the least share of a message a reply's quote must cover to mark it read (#728 vt-quote-read-threshold): " +
+    "0, which marks every reply's message read as #300 reply-marks-read always did"],
+  MAX_QUOTE_READ_PERCENT: [100, 100,
+    "the most that share can be (#728 vt-quote-read-threshold): all of the message, past which no quote " +
+    "could ever mark it read"],
+  DEFAULT_QUOTE_READ_PERCENT: [2, 15,
+    "the share until the owner says otherwise, his 5% (#728 vt-quote-read-threshold): lower and a quote of " +
+    "one sentence in a long message marks it all read again; higher and a quote of a short message's main " +
+    "point leaves it unread"],
   CARD_LINE_CHARS: [36, 36,
     "how many characters one card line is counted at, the same as src/threads.rs CARD_LINE_CHARS: " +
     "the server and the page must count a root's lines alike, or a thread is split that the " +

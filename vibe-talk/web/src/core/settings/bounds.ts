@@ -71,6 +71,24 @@ function clampCardMaxLines(value: unknown): number {
   return Math.min(MAX_CARD_MAX_LINES, Math.max(MIN_CARD_MAX_LINES, Math.round(n)));
 }
 
+/**
+ * `#728 vt-quote-read-threshold`. The least of a message, as a percentage of its words, a reply's
+ * quote must cover for the reply to mark the message read. 0 marks it read whatever is quoted, as
+ * `#300 reply-marks-read` always did; 100 only for a quote of the whole message.
+ */
+const MIN_QUOTE_READ_PERCENT = 0;
+const MAX_QUOTE_READ_PERCENT = 100;
+const DEFAULT_QUOTE_READ_PERCENT = 5;
+
+/** A percentage this page will apply: whole numbers from 0 to 100, the default for anything else. */
+function clampQuoteReadPercent(value: unknown): number {
+  const text = typeof value === "string" ? value.trim() : value;
+  if (text === "" || text === null || text === undefined) return DEFAULT_QUOTE_READ_PERCENT;
+  const n = Number(text);
+  if (!Number.isFinite(n)) return DEFAULT_QUOTE_READ_PERCENT;
+  return Math.min(MAX_QUOTE_READ_PERCENT, Math.max(MIN_QUOTE_READ_PERCENT, Math.round(n)));
+}
+
 /** The reading column's width, in characters. */
 const MIN_READING_CH = 45;
 const MAX_READING_CH = 120;
@@ -117,20 +135,24 @@ export {
   DEFAULT_CARD_MAX_LINES,
   DEFAULT_COLLAPSED_LINES,
   DEFAULT_MSG_SCALE,
+  DEFAULT_QUOTE_READ_PERCENT,
   DEFAULT_READING_CH,
   MAX_CARD_MAX_LINES,
   MAX_COLLAPSED_LINES,
   MAX_MSG_SCALE,
+  MAX_QUOTE_READ_PERCENT,
   MAX_READING_CH,
   MAX_READ_SPEED,
   MIN_CARD_MAX_LINES,
   MIN_COLLAPSED_LINES,
   MIN_MSG_SCALE,
+  MIN_QUOTE_READ_PERCENT,
   MIN_READING_CH,
   MIN_READ_SPEED,
   clampCardMaxLines,
   clampCollapsedLines,
   clampMsgScale,
+  clampQuoteReadPercent,
   clampReadSpeed,
   clampReadingWidth,
 };

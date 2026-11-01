@@ -101,6 +101,9 @@ pub const SYNCED_KEYS: &[&str] = &[
     // split or summarised (`#522 thread-card-max-lines`). The one value the server reads
     // itself ([`crate::threads::card_max_lines`]): it decides when a thread is named.
     "vibe-talk.voice.thread-card-max-lines",
+    // How much of a message a reply's quote must cover for the reply to mark it read
+    // (`#728 vt-quote-read-threshold`).
+    "vibe-talk.voice.quote-read-percent",
     // Channels: who is who, the owner's choice of which account is him, the coding agent,
     // a person or another bot. `#488 slack-app-agents`.
     "vibe-talk.voice.identities",

@@ -163,3 +163,22 @@ test("`#624 voice-page-modularity`: Main's messages cut into the runs before eac
     [["1"], ["10", "15"], ["30"]]);
   assert.deepStrictEqual(mainRunsAmong([], []), [[]]);
 });
+
+test("`#728 vt-quote-read-threshold`: how much of a message a reply's opening quote covers, and whether the reply marks it read", () => {
+  const { quotedHead, quoteShare, quoteMarksRead, quoteBlock } = ROWS;
+  assert.equal(quotedHead("> one line\n> two\n\nthe answer"), "one line two");
+  assert.equal(quotedHead(">\n> after a blank\nanswer"), "after a blank");
+  assert.equal(quotedHead("no quote\n> later"), "", "a quote further down is not the reply's opening quote");
+  assert.equal(quotedHead(`${quoteBlock(`${"word ".repeat(400)}`)}answer`).endsWith("…"), false, "a cut quote's … was counted");
+  const whole = "a".repeat(95) + " " + "b".repeat(4);
+  assert.equal(quoteShare("> bbbb\n\nok", whole), 0.04);
+  assert.equal(quoteShare("> anything\n\nok", "   "), null, "a message with no words was covered");
+  assert.equal(quoteShare("no quote", whole), null);
+  assert.equal(quoteShare(`> ${whole} and more\n\nok`, whole), 1, "a share past the whole is the whole");
+  assert.equal(quoteShare(">   spaced \n>  out\n\nok", "spaced out entirely"), "spaced out".length / "spaced out entirely".length,
+    "white space was counted as written rather than as words");
+  assert.equal(quoteMarksRead(null, 5), true, "a reply quoting nothing left its message unread");
+  assert.equal(quoteMarksRead(0.04, 5), false);
+  assert.equal(quoteMarksRead(0.05, 5), true, "a quote of exactly the share left its message unread");
+  assert.equal(quoteMarksRead(0, 0), true, "at 0% a reply left its message unread");
+});

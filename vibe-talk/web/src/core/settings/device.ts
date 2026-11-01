@@ -6,10 +6,12 @@
 import type { StoragePort } from "../../ports/index.ts";
 import {
   DEFAULT_CARD_MAX_LINES,
+  DEFAULT_QUOTE_READ_PERCENT,
   DEFAULT_COLLAPSED_LINES,
   DEFAULT_MSG_SCALE,
   DEFAULT_READING_CH,
   clampCardMaxLines,
+  clampQuoteReadPercent,
   clampCollapsedLines,
   clampMsgScale,
   clampReadSpeed,
@@ -163,6 +165,13 @@ export const DEVICE_SETTINGS = Object.freeze({
     read: (raw: string | null) => clampCardMaxLines(raw === null ? DEFAULT_CARD_MAX_LINES : raw),
     write: (n: number) => String(n),
     refused: { value: DEFAULT_CARD_MAX_LINES },
+  } satisfies DeviceSetting<number>,
+  /** `#728 vt-quote-read-threshold`. How much a reply's quote must cover to mark read, clamped. Synced. */
+  quoteReadPercent: {
+    key: "vibe-talk.voice.quote-read-percent",
+    read: (raw: string | null) => clampQuoteReadPercent(raw === null ? DEFAULT_QUOTE_READ_PERCENT : raw),
+    write: (pct: number) => String(pct),
+    refused: { value: DEFAULT_QUOTE_READ_PERCENT },
   } satisfies DeviceSetting<number>,
   /** The reading pace, a percentage, or null (nothing kept) for however the agent speaks. Synced. */
   readSpeed: {
