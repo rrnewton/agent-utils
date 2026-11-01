@@ -4039,6 +4039,103 @@ test("`#267 quote-reply`: dragging over a message's words neither folds it nor r
   assert.ok(heard() > 0, "a tap in Read read nothing aloud, so this test cannot see a drag doing it");
 });
 
+// --- the Quoted reply chip under a selection (#726 vt-selection-chip) ---------------------------
+
+/** The chip's place, as web/voice.js wrote it: its top and left in pixels, or null while it is hidden. */
+const chipAt = (page) => {
+  const chip = page.el("selection-chip");
+  return chip.hidden ? null : { top: parseFloat(chip.style.top), left: parseFloat(chip.style.left) };
+};
+
+test("`#726 vt-selection-chip`: words selected in one message put Quoted reply just under them, and nothing else does", async () => {
+  const gap = sourceConstant("SELECTION_CHIP_GAP_PX");
+  const page = await quotePage();
+  const first = rowWithId(page, "1000000000000000001");
+  const second = rowWithId(page, "1000000000000000002");
+  assert.equal(chipAt(page), null, "the chip stood with nothing selected");
+  assert.equal(page.el("selection-chip").textContent, "Quoted reply");
+  await page.selectText(wordsIn(first), null, "about the runner");
+  const under = wordsIn(first).getBoundingClientRect().bottom;
+  assert.deepStrictEqual(chipAt(page)?.top, under + gap, "the chip is not just under the selected words");
+  // It follows the selection to the next message, under its words.
+  await page.selectText(wordsIn(second), null, "the deploy");
+  assert.equal(chipAt(page).top, wordsIn(second).getBoundingClientRect().bottom + gap, "the chip stayed under the first message");
+  // A selection across two messages, or of nothing but spaces, offers no quote and no chip.
+  await page.selectText(wordsIn(first), wordsIn(second), "runner the second");
+  assert.equal(chipAt(page), null, "a selection across two messages showed the chip");
+  await page.selectText(wordsIn(first), null, "   ");
+  assert.equal(chipAt(page), null, "a selection of spaces showed the chip");
+  // Let go with the mouse: gone at once, as Quote reply is.
+  await page.selectText(wordsIn(first), null, "about the runner");
+  await page.clearSelection();
+  assert.equal(chipAt(page), null, "the chip outlived the selection");
+
+  // THE CONTROL: placed over the words, where a phone's own action bar stands, the chip is not under them.
+  const control = await quotePage(null, brokenScript("    Math.min(box.bottom + SELECTION_CHIP_GAP_PX, viewHeight - SELECTION_CHIP_EDGE_PX - height));",
+    "    Math.min(box.top - SELECTION_CHIP_GAP_PX - height, viewHeight - SELECTION_CHIP_EDGE_PX - height));"));
+  const words = wordsIn(rowWithId(control, "1000000000000000001"));
+  await control.selectText(words, null, "about the runner");
+  assert.notEqual(chipAt(control)?.top, words.getBoundingClientRect().bottom + gap,
+    "with the chip placed over the words it still read as under them, so this test cannot see where it stands");
+});
+
+test("`#726 vt-selection-chip`: a press of the chip is Quote reply, quoting the words; it never takes the selection first", async () => {
+  const page = await quotePage();
+  const first = rowWithId(page, "1000000000000000001");
+  await page.selectText(wordsIn(first), null, "about the runner");
+  const press = { defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } };
+  page.el("selection-chip").dispatch("mousedown", press);
+  assert.equal(press.defaultPrevented, true, "pressing the chip would take the selection away first");
+  await page.el("selection-chip").click();
+  await page.settle();
+  assert.equal(page.el("reply-text").value, "> about the runner\n\n", "the chip did not open Quote reply with the words");
+  assert.ok(replyInStream(page), "the chip's reply did not open under its message");
+  assert.equal(chipAt(page), null, "the chip stayed after its press");
+});
+
+test("`#726 vt-selection-chip`: after a touch the chip waits the held moment where it stood, and a press in it still quotes", async () => {
+  const hold = sourceConstant("QUOTE_HOLD_MS");
+  const page = await quotePage();
+  const first = rowWithId(page, "1000000000000000001");
+  await page.documentEvent("pointerdown", { pointerType: "touch", target: wordsIn(first) });
+  await page.selectText(wordsIn(first), null, "about the runner");
+  const stood = chipAt(page);
+  assert.ok(stood, "the premise: the chip is up");
+  // The phone clears the selection as the finger lands on the chip, before the click.
+  await page.clearSelection();
+  assert.deepStrictEqual(chipAt(page), stood, "the chip went, or moved, before the tap could arrive");
+  await page.el("selection-chip").click();
+  await page.settle();
+  assert.equal(page.el("reply-text").value, "> about the runner\n\n", "the tap that cleared the selection lost the quote");
+  await page.el("reply-cancel").click();
+  await page.settle();
+  // Left alone, it goes when the moment is over.
+  await page.selectText(wordsIn(first), null, "about the runner");
+  await page.clearSelection();
+  assert.equal(page.expireTimers(hold), 1);
+  assert.equal(chipAt(page), null, "the chip outlived the held moment");
+});
+
+test("`#726 vt-selection-chip`: kept inside the window at its foot, and carried with the words when the list scrolls", async () => {
+  const edge = sourceConstant("SELECTION_CHIP_EDGE_PX");
+  const gap = sourceConstant("SELECTION_CHIP_GAP_PX");
+  const page = await quotePage();
+  const first = rowWithId(page, "1000000000000000001");
+  await page.selectText(wordsIn(first), null, "about the runner");
+  const before = chipAt(page).top;
+  // Scrolled by 3 px: the words rise, and the chip with them.
+  const area = page.el("scroll-area");
+  area.scrollTop += 3;
+  await page.documentEvent("scroll", { target: area });
+  const words = wordsIn(first).getBoundingClientRect().bottom;
+  assert.equal(chipAt(page).top, Math.max(edge, words + gap), "the chip did not follow the words the list carried");
+  assert.ok(chipAt(page).top <= before, "the chip moved the wrong way");
+  // A window too short for the chip under the words: at the window's foot, never past it.
+  page.viewport.layout = words + gap - 1;
+  await page.selectText(wordsIn(first), null, "about the run");
+  assert.ok(chipAt(page).top <= page.viewport.layout - edge, "the chip stood past the window's foot");
+});
+
 test("`#267 quote-reply`: Help says what Quote reply does, where it posts, and how long a quote may be", () => {
   const entry = helpEntry("channel");
   assert.match(entry, /<strong>Quote reply<\/strong>/);

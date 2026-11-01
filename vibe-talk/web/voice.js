@@ -30449,6 +30449,7 @@ function holdQuote(next) {
   const button = next ? next.button : null;
   if (was && was.button !== button) drawReplyLabel(was.button);
   if (button && (!was || was.button !== button)) drawReplyLabel(button);
+  placeSelectionChip();
 }
 
 /** `selectionchange`, and every press of a Reply: what Quote reply would quote now. */
@@ -30465,6 +30466,7 @@ function noteQuoteSelection() {
   } else if (quoteHeld && quoteHeld.timer === null) {
     quoteHeld.timer = setTimeout(() => holdQuote(null), QUOTE_HOLD_MS);
   }
+  placeSelectionChip();
 }
 
 /**
@@ -30480,6 +30482,91 @@ function takeQuote(button) {
   holdQuote(null);
   if (selection && typeof selection.removeAllRanges === "function") selection.removeAllRanges();
   return text;
+}
+
+// --- the Quoted reply chip under a selection (#726 vt-selection-chip) ---------------------------
+//
+// `#726 vt-selection-chip`. The owner, 2026-11-01: words selected in a message offer the page's own
+// "Quoted reply" chip right under them, where the thumb that selected them already is, as well as the
+// row's Reply turned Quote reply (above). Under, because a phone's own action bar (Copy, Look Up, ...)
+// stands over a selection. The chip is the row's Quote reply: it reads the one record the label reads
+// (`quoteHeld`), so it shows exactly while that Reply would quote, a touch's held moment included, and
+// a press of it is a press of that Reply. Placed from the selection's own box
+// (`Range.getBoundingClientRect`), centred under it and kept inside the window, in the layout
+// viewport's coordinates, as the document never scrolls; a list scrolled under it moves it with the
+// words, and a selection a touch let go of leaves it where it was until the hold ends.
+
+/** How far under the selection the chip stands, in CSS pixels: clear of a phone's selection handles. */
+const SELECTION_CHIP_GAP_PX = 14;
+
+/** How close to the window's edges the chip may stand, in CSS pixels. */
+const SELECTION_CHIP_EDGE_PX = 8;
+
+/** The animation frame the chip's next placing waits for, or null. */
+let selectionChipFrame = null;
+
+/** The box of what is selected now, in the viewport's pixels, or null where nothing is or it has no box. */
+function selectionBox() {
+  const selection = typeof getSelection === "function" ? getSelection() : null;
+  if (!selection || selection.isCollapsed || !(selection.rangeCount > 0)) return null;
+  /** @type {{top: number, bottom: number, left: number, right: number} | null} */
+  let box = null;
+  for (let at = 0; at < selection.rangeCount; at += 1) {
+    const range = selection.getRangeAt(at);
+    if (!range || typeof range.getBoundingClientRect !== "function") continue;
+    const rect = range.getBoundingClientRect();
+    if (!(rect.width > 0 || rect.height > 0)) continue;
+    const was = box;
+    box = was === null ? { top: rect.top, bottom: rect.bottom, left: rect.left, right: rect.right } : {
+      top: Math.min(was.top, rect.top), bottom: Math.max(was.bottom, rect.bottom),
+      left: Math.min(was.left, rect.left), right: Math.max(was.right, rect.right),
+    };
+  }
+  return box;
+}
+
+/** Place the chip at the next frame: every `selectionchange` of a drag asks, and one placing a frame is enough. */
+function placeSelectionChip() {
+  if (typeof requestAnimationFrame !== "function") {
+    drawSelectionChip();
+    return;
+  }
+  if (selectionChipFrame !== null) return;
+  selectionChipFrame = requestAnimationFrame(() => {
+    selectionChipFrame = null;
+    drawSelectionChip();
+  });
+}
+
+/** Show the chip under the selection Quote reply would quote, or hide it where there is none. */
+function drawSelectionChip() {
+  const chip = leftEl("selection-chip");
+  const box = quoteHeld ? selectionBox() : null;
+  // A touch's held selection, gone from the page, keeps the chip where it was until the hold ends.
+  if (!quoteHeld || (box === null && chip.hidden)) {
+    setHiddenIfChanged(chip, true);
+    return;
+  }
+  setHiddenIfChanged(chip, false);
+  if (box === null) return;
+  const size = chip.getBoundingClientRect();
+  const width = Number(size.width) || 0;
+  const height = Number(size.height) || 0;
+  const viewWidth = (document.documentElement && document.documentElement.clientWidth) || 0;
+  const viewHeight = window.innerHeight || 0;
+  const left = Math.max(SELECTION_CHIP_EDGE_PX,
+    Math.min((box.left + box.right) / 2 - width / 2, viewWidth - SELECTION_CHIP_EDGE_PX - width));
+  const top = Math.max(SELECTION_CHIP_EDGE_PX,
+    Math.min(box.bottom + SELECTION_CHIP_GAP_PX, viewHeight - SELECTION_CHIP_EDGE_PX - height));
+  chip.style.left = `${Math.round(left)}px`;
+  chip.style.top = `${Math.round(top)}px`;
+}
+
+/** A press of the chip: a press of the Reply it stands for, quoting what it would quote. */
+function pressSelectionChip() {
+  const held = quoteHeld;
+  if (held && held.button && held.button.isConnected !== false) held.button.click();
+  else drawSelectionChip();
 }
 
 /**
@@ -39532,6 +39619,11 @@ document.addEventListener("pointerdown", onPointerDown);
 document.documentElement.addEventListener("pointerleave", onPointerLeavePage);
 // `#267 quote-reply`. Words selected in one message make its Reply a Quote reply.
 document.addEventListener("selectionchange", noteQuoteSelection);
+// `#726 vt-selection-chip`. Pressed without taking the selection or the focus from the words it quotes.
+leftEl("selection-chip").addEventListener("mousedown", (event) => event.preventDefault());
+leftEl("selection-chip").addEventListener("click", pressSelectionChip);
+// A list scrolled under the selection carries the words, and the chip goes with them.
+document.addEventListener("scroll", () => { if (quoteHeld) placeSelectionChip(); }, { capture: true, passive: true });
 // `#260 timestamp-hover`. A message's time says its day on hover, worded as the pointer arrives.
 document.addEventListener("pointerover", freshenDayTitle);
 // `#479 message-time-full-date`. The same wording as the focus reaches a time, and its day said

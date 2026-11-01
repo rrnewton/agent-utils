@@ -2798,7 +2798,9 @@
                 is not kept as a draft. Up to 1,000 characters are quoted: a longer selection is cut
                 there and ends with “…”. On a computer, <kbd>r</kbd> on the selected message quotes the
                 words selected in it; on a phone, select by pressing and holding, then tap
-                <strong>Quote reply</strong>.
+                <strong>Quote reply</strong>. Words selected in a message also show a
+                <strong>Quoted reply</strong> chip just under them, below your phone's own Copy bar,
+                which does the same.
               </p>
               <p class="hint">
                 <strong>N replies</strong> under a message gathers its replies, and the replies to
@@ -2831,7 +2833,8 @@
               <p class="hint">
                 <strong>A reply marks read what it answers</strong>, whichever way you started it.
                 <strong>Reply</strong> and <strong>Quote reply</strong> mark the message they answer,
-                on Main or in a thread. The first reply you write in a thread nobody has answered,
+                on Main or in a thread, unless the quote covers only a little of it (see
+                <strong>Quoted replies</strong>). The first reply you write in a thread nobody has answered,
                 opened from its grey <strong>Thread</strong>, marks the thread's first message, as
                 Reply on it would; later messages in a thread's box, and the main channel's box, mark
                 nothing. Marking read is the message's <strong>Done</strong>, with
@@ -4146,6 +4149,13 @@
       -->
       <p id="thread-select-note" hidden></p>
     </footer>
+
+    <!--
+      `#726 vt-selection-chip`. "Quoted reply", under words selected in one message: the row's Quote
+      reply, offered where the selecting thumb is, and placed by `drawSelectionChip` in web/voice.js
+      under the selection's box. Hidden while nothing in a message is selected.
+    -->
+    <button id="selection-chip" class="selection-chip" type="button" title="Reply to this message, starting with the words you selected in it quoted" hidden>Quoted reply</button>
 
     <!--
       `#610 mobile-keyboard-compose`. The numbers a phone's keyboard leaves the page with, drawn live over the top

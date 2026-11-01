@@ -433,6 +433,7 @@ export interface ElementById {
   "search-older-note": HTMLParagraphElement;
   "search-scope": HTMLParagraphElement;
   "search-toggle": HTMLButtonElement;
+  "selection-chip": HTMLButtonElement;
   "send-text": HTMLButtonElement;
   "server-hits": HTMLOListElement;
   "server-more": HTMLButtonElement;

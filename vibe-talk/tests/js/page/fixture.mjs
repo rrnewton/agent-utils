@@ -1389,6 +1389,14 @@ function fakeRange(from, to, text, { startOffset = 0, endOffset = null } = {}) {
     startContainer: from, startOffset, endContainer: last, endOffset: end,
     commonAncestorContainer: commonAncestor(from, last),
     toString: () => text,
+    // `#726 vt-selection-chip`. Its box: from the top of `from` to the foot of `to`, as wide as both.
+    getBoundingClientRect: () => {
+      const a = from.getBoundingClientRect();
+      const b = last.getBoundingClientRect();
+      const box = { top: Math.min(a.top, b.top), bottom: Math.max(a.bottom, b.bottom),
+        left: Math.min(a.left ?? 0, b.left ?? 0), right: Math.max(a.right ?? 0, b.right ?? 0) };
+      return { ...box, width: box.right - box.left, height: box.bottom - box.top };
+    },
   };
 }
 
@@ -5198,6 +5206,12 @@ const TUNING_BANDS = {
   DEFAULT_CARD_MAX_LINES: [5, 5,
     "the lines a thread card shows of its first message until the owner says otherwise: his five, " +
     "and src/threads.rs DEFAULT_CARD_MAX_LINES (#522 thread-card-max-lines)"],
+  SELECTION_CHIP_GAP_PX: [8, 24,
+    "how far under a selection the Quoted reply chip stands (#726 vt-selection-chip): closer and a phone's " +
+    "selection handles, which hang under the words, cover it; further and it reads as belonging to the next line"],
+  SELECTION_CHIP_EDGE_PX: [4, 16,
+    "how close to the window's edge the chip may stand (#726 vt-selection-chip): closer and a rounded phone " +
+    "screen cuts it; further and a selection near the edge has its chip pushed away from it"],
   MIN_QUOTE_READ_PERCENT: [0, 0,
     "the least share of a message a reply's quote must cover to mark it read (#728 vt-quote-read-threshold): " +
     "0, which marks every reply's message read as #300 reply-marks-read always did"],
@@ -9118,8 +9132,8 @@ const wordsIn = (li) => {
 };
 
 /** A channel of three plain messages, the second answered once, on a page signed in. */
-async function quotePage(arrange = null) {
-  const page = newPage(new Map(), SCRIPT, arrange);
+async function quotePage(arrange = null, script = SCRIPT) {
+  const page = newPage(new Map(), script, arrange);
   await signIn(page);
   await showDiscord(page, [
     message({ id: "1000000000000000001", content: "the first message, about the runner" }),

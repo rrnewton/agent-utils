@@ -1,10 +1,11 @@
 ---
 title: 'vt-selection-chip: our own Quoted reply chip just below a selection in a message'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 created_at: 2026-11-01T16:07:43.110764538+00:00
-updated_at: 2026-11-01T16:07:43.110764538+00:00
+updated_at: 2026-11-01T16:25:30.049585280+00:00
+closed_at: 2026-11-01T16:25:30.049585099+00:00
 ---
 
 # Description
