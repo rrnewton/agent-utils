@@ -60,8 +60,13 @@ directory sits under a config tree.
   past 7 days unreviewed).
 - `check [TEAM[@HOST]]... [--strict] [--json]` — verifies that local
   entries have a live declaration and coordinator, that route names exist,
-  and that a spoke has a route to the first hub (`no-hub-link`). Exit 0 when
-  every selected entry has at least one verified contact.
+  and that a spoke has a route to the first hub (`no-hub-link`). It also
+  health-checks every local declaration's delivery target against its
+  registry's control tree: `pinned-agent`, `target-not-designated`,
+  `target-missing`, `target-archived`, `target-not-live`,
+  `target-is-child`, `tree-root-mismatch` and `designated-not-root`. Every
+  flag prints the command that fixes it. Exit 0 when every selected entry
+  has at least one verified contact and no declaration is flagged.
 - `probe [--json]` — what this host's own tools say: declarations,
   coordinator liveness, findings. Peers run it through routes; it never
   reads another host's panes.
@@ -110,10 +115,14 @@ explicit rule.
 - `init TEAM (--registry R | --coordinator-self [--coordinator-pid PID])
   [--deliver agentctl-queue|hook-inbox|command] [--argv CMD...]
   [--accepts-from SENDER]... [--accepts-relay-from HUB]...` — declares this
-  host's team. Re-running `--coordinator-self` from a new session refreshes
-  a pinned identity; existing `comment`, `notes`, `may_send_to` and (when
-  `--accepts-from` is absent) policy are preserved. For a `command`
-  deliverer, everything after `--argv` is the command.
+  host's team. Prefer `--registry R`: the declaration then names only the
+  registry, and delivery resolves the registry's designated coordinator at
+  send time, so a coordinator handover needs no declaration edit.
+  `--coordinator-self` pins the current harness process and warns: when
+  that session is retired the pin goes stale. Re-running init preserves
+  existing `comment`, `notes`, `may_send_to` and (when `--accepts-from` is
+  absent) policy. For a `command` deliverer, everything after `--argv` is
+  the command.
 - `send TEAM[@HOST] (--file FILE | --text TEXT) [--key KEY | --again]
   [--topic SLUG] [--supersedes KEY]... [--ttl DUR | --expires TIME]
   [--kind info|request|hold|resume|reply] [--private]
@@ -158,6 +167,20 @@ item is enqueued, accept starts one bounded `agentctl drain
 more than one per queue, content-free entries in `team-log.jsonl`), so a
 message does not wait for some other drain. Turn it off per declaration
 with `"auto_drain": false` (and tune `"auto_drain_ready_timeout_seconds"`).
+
+### Coordinator handover
+
+Delivery resolves the registry's designated coordinator, so handing a
+team over is: designate the successor (`agentctl coordinator set NEW`,
+which fixes declarations pinned to the old name and flags any pinned
+elsewhere), get `agent-teams check` green, drain the old coordinator's
+queue, then retire it (`agentctl stop OLD --handover-to NEW`). A send or
+accept whose delivery target is missing or archived answers
+`undeliverable` with the reason instead of `accepted`: nothing is claimed
+on the receiving host, the message stays in the sender's outbox, the
+receiving host records a notice under `teams.d/<team>/notices/`, and
+`pump` retries it after the fix. Senders see exit 75, never a silent
+`accepted` into a dead queue.
 
 ### Receiving host (run by routes)
 

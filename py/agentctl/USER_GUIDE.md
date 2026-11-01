@@ -1155,6 +1155,20 @@ under the coordinator. Every control decision follows `managed_by`, never
 `created_by`: whom `watch-agents` tells about an agent, and the order in which
 `restore` revives agents.
 
+**Handing the coordinator role over.** Inter-team delivery (`agent-teams`)
+follows the designation, but only through declarations that name the
+registry; one pinned to the old coordinator's name keeps delivering into its
+unread queue. So: designate the successor first (`agentctl coordinator set
+NEW` — it fixes declarations pinned to the old name and reports any pinned
+elsewhere under `team_declarations`), get `agent-teams check` green, drain
+the old coordinator's queue, then retire it with `agentctl stop OLD
+--handover-to NEW`. Stopping the designated coordinator without
+`--handover-to` is refused (an explicit `--force-coordinator` overrides with
+a warning). Sends to a target left missing or archived this way answer
+`undeliverable` and stay in the sender's outbox, and `watch-agents` reports
+the same declaration red flags (`team_declarations` in each pass report,
+plus one notice to the coordinator when the flag set changes).
+
 ### Watch agents for finishes, prompts, stalls, and silence (Rust edition)
 
 `agentctl watch` keeps the coordinator's environment alive. `agentctl

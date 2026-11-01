@@ -65,6 +65,17 @@ When work crosses to a coordinator on another host or in another harness, use `a
 grammar and `reply`/`status` verbs that skill documents. Your workers never send cross-team;
 they ask you, and you decide what goes.
 
+## Coordinator handover
+
+When you (the coordinator) are being replaced, or you replace another coordinator on a host, inter-team messages follow the registry's designated coordinator only through declarations that name the registry. Hand over in this order, and do not skip ahead:
+
+1. **Designate the new coordinator** while the old one is still live: `agentctl coordinator set NEW`. It fixes agent-teams declarations pinned to the old name and flags any pinned elsewhere (`team_declarations` in its output).
+2. **Check team declarations**: `agent-teams check` green on every host of the fleet. Every red flag (pinned agent, target not live, missing or archived, not the designated coordinator, child tab, tree-root mismatch, designated not a root) names the command that fixes it.
+3. **Drain or forward the old inbox**: `agentctl drain OLD`; senders holding `undeliverable` messages retry with `agent-teams pump` after step 1.
+4. **Retire the old coordinator** last: `agentctl stop OLD --handover-to NEW`. Stopping the designated coordinator without a handover is refused for exactly this reason.
+
+A send answered `undeliverable` is never lost and never delivered: it stays in the sender's outbox until the target is fixed. Treat any `undeliverable` you receive as a handover that was done out of order.
+
 ## Supervise
 
 - `agentctl status NAME` and `agentctl read NAME` show progress; the agent's reply in

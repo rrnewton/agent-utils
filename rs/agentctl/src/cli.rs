@@ -977,6 +977,12 @@ struct Stop {
     /// the agentcloud session (use when the session no longer exists or was retired elsewhere)
     #[arg(long)]
     skip_cloud_halt: bool,
+    /// Hand this registry's coordinator designation over to NEW before stopping: required when stopping the designated coordinator, so team delivery keeps a live target (#721 agent-teams-coordinator-handover)
+    #[arg(long, value_name = "NEW")]
+    handover_to: Option<String>,
+    /// Stop the designated coordinator without handing over (prints a warning; inter-team delivery to this registry loses its target until a new coordinator is designated)
+    #[arg(long)]
+    force_coordinator: bool,
 }
 
 #[derive(Args)]
@@ -3509,6 +3515,39 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             },
         )?,
         Commands::Stop(value) => {
+            // #721: stopping the designated coordinator without a handover
+            // strands every agent-teams declaration delivering through this
+            // registry; refuse unless the designation moves first.
+            let is_coordinator = manager
+                .designated_coordinator()
+                .ok()
+                .flatten()
+                .is_some_and(|name| name == value.agent.name);
+            if is_coordinator {
+                if let Some(new) = &value.handover_to {
+                    if new == &value.agent.name {
+                        return Err(Failure::Usage(
+                            "--handover-to must name a different agent than the one being stopped"
+                                .to_owned(),
+                        ));
+                    }
+                    manager.coordinator_set(new)?;
+                    eprintln!(
+                        "agentctl stop: handed the coordinator designation over to {new} before stopping {}",
+                        value.agent.name
+                    );
+                } else if value.force_coordinator {
+                    eprintln!(
+                        "agentctl stop: WARNING: stopping designated coordinator {} without a handover; inter-team delivery through this registry has no live target until `agentctl coordinator set NEW` runs",
+                        value.agent.name
+                    );
+                } else {
+                    return Err(Failure::Usage(format!(
+                        "refused: {} is this registry's designated coordinator; stopping it strands agent-teams delivery through this registry. Hand over first (`agentctl stop {} --handover-to NEW`) or, if the loss is intended, `--force-coordinator`",
+                        value.agent.name, value.agent.name
+                    )));
+                }
+            }
             let recovery_selector = if value.retire_dead_adoption {
                 Some("--retire-dead-adoption")
             } else if value.retire_dead_native {
@@ -5879,6 +5918,32 @@ mod tests {
             stop.expected_record_sha256.as_deref(),
             Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
         );
+    }
+
+    /// #721: stopping the designated coordinator needs a handover or an
+    /// explicit forced stop; both spellings parse.
+    #[test]
+    fn stop_parser_accepts_coordinator_handover_flags() {
+        let parsed = Cli::try_parse_from([
+            "agentctl",
+            "stop",
+            "coord-old",
+            "--handover-to",
+            "coord-new",
+        ])
+        .unwrap();
+        let Some(Commands::Stop(stop)) = parsed.command else {
+            panic!("expected stop command");
+        };
+        assert_eq!(stop.handover_to.as_deref(), Some("coord-new"));
+        assert!(!stop.force_coordinator);
+        let parsed =
+            Cli::try_parse_from(["agentctl", "stop", "coord-old", "--force-coordinator"]).unwrap();
+        let Some(Commands::Stop(stop)) = parsed.command else {
+            panic!("expected stop command");
+        };
+        assert!(stop.force_coordinator);
+        assert_eq!(stop.handover_to, None);
     }
 
     #[test]

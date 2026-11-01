@@ -94,6 +94,17 @@ An agentcloud profile's `title`, `workspace`, and `node_id` may contain `{name}`
 and `{cwd}` (the agent's directory); `--cloud-title` sets the title on the
 command line. The session title defaults to the agent name.
 
+## Coordinator handover: retire a coordinator without losing team messages
+
+When the registry's designated coordinator changes (a session is retired and a successor takes over), inter-team delivery through `agent-teams` follows the designation — but only declarations that name the registry resolve it. A declaration pinned to the old coordinator's name keeps delivering into its unread queue while every listing shows the new coordinator as live. Hand over in this order:
+
+1. **Designate the new coordinator first**, while the old one is still live: `agentctl coordinator set NEW`. The command checks every agent-teams declaration naming this registry: one pinned to the old name is fixed in place (the pin is dropped, so delivery resolves the designation at send time); one pinned to any other name is reported under `team_declarations.flagged` — fix it by hand with `agent-teams init TEAM --registry <registry>`.
+2. **Check team declarations**: `agent-teams check` must be green. Every red flag names its fix (pinned agent, target not live, target missing or archived, target not the designated coordinator, target is a child tab, tree-root mismatch, designated coordinator not a root). Do not retire the old coordinator while any flag names it.
+3. **Drain or forward the old inbox**: `agentctl drain OLD` (or read its queue) so nothing already accepted waits in the old queue; messages a sender still holds as `undeliverable` retry with `agent-teams pump` once step 1 lands.
+4. **Retire the old one**: `agentctl stop OLD --handover-to NEW` (the handover is refused without `--handover-to` or an explicit `--force-coordinator`, which warns). Only then archive or remove it.
+
+Never stop or retire the designated coordinator first and designate the successor afterwards: sends in between answer `undeliverable` and sit in senders' outboxes until the designation exists.
+
 ## "Attach yourself to Herdr" (or "to agentctl")
 
 The owner wants to watch your session in Herdr, beside the agents you start.

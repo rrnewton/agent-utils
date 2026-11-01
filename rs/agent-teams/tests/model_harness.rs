@@ -1304,3 +1304,97 @@ fn same_host_designated_coordinators_are_accepted_by_default() {
     let _ = std::fs::remove_dir_all(&state);
     let _ = std::fs::remove_dir_all(&state2);
 }
+
+/// #721: accept to a missing delivery target in a populated registry
+/// answers `undeliverable`, claims nothing in the ledger, and leaves a
+/// notice for the receiving coordinator instead of queueing into a dead
+/// agent's queue.
+#[test]
+fn accept_to_missing_target_is_undeliverable_and_claims_nothing() {
+    use agent_teams::deliver::AgentctlQueueDeliverer;
+    let state = temp_state("undeliverable");
+    // A populated registry: a live designated coordinator exists, but the
+    // declaration pins a retired name that has no record.
+    let registry = state.join("registry");
+    let coord_dir = registry.join("agents").join("coord");
+    std::fs::create_dir_all(&coord_dir).expect("registry");
+    let identity = agent_queue::identity::observe(u64::from(std::process::id()))
+        .expect("observe self")
+        .identity;
+    std::fs::write(
+        coord_dir.join("agent.json"),
+        serde_json::to_string(&json!({
+            "name": "coord",
+            "harness_identity": serde_json::to_value(&identity).expect("identity"),
+        }))
+        .expect("record"),
+    )
+    .expect("record file");
+    std::fs::write(registry.join("coordinator.json"), "{\"name\": \"coord\"}")
+        .expect("designation");
+    let team_dir = state.join("teams.d/tools");
+    std::fs::create_dir_all(&team_dir).expect("team dir");
+    let declaration = json!({
+        "schema": "agent-teams-declaration/v1",
+        "team": "tools",
+        "deliverer": {"kind": "agentctl-queue", "registry": registry.to_string_lossy(), "agent": "old-coord"},
+        "coordinator": {"designation": "registry"},
+        "accepts_from": [{"sender": "sim", "kinds": ["info"]}],
+        "limits": {"max_bytes": 8192, "max_ttl_seconds": 604800},
+        "default_ttl_seconds": 7200,
+    });
+    agent_teams::jsonfile::write_json_atomic(&team_dir.join("declaration.json"), &declaration)
+        .expect("declaration");
+    let declarations = agent_teams::proof::load_declarations(&state).expect("decls");
+    let (_, _, declaration) = &declarations[0];
+    let deliverer = AgentctlQueueDeliverer {
+        team: "tools".into(),
+        queue_dir: coord_dir.join("queue"),
+        ledger_path: state.join("ledger.json"),
+        registry: registry.clone(),
+        agent: "old-coord".into(),
+        auto_drain: agent_teams::deliver::AutoDrain {
+            enabled: false,
+            ..Default::default()
+        },
+        drain_state_dir: None,
+    };
+    let ctx = AcceptContext {
+        state: &state,
+        this_host: "host-a",
+        declaration,
+        via: "test",
+        proof_note: "proved",
+        relayed_by: None,
+        peer_host: "host-a",
+    };
+    let now_ms = agent_teams::timeutil::now_unix_ms();
+    let envelope = build_envelope(
+        "tm-sim-1212121212121212",
+        "k",
+        "sim",
+        "host-a",
+        1,
+        "harness-ancestry",
+        "tools",
+        "host-a",
+        "info",
+        None,
+        &[],
+        false,
+        now_ms,
+        now_ms + 7_200_000,
+        None,
+        "body",
+    );
+    let answer = accept(&ctx, &envelope, &deliverer).expect("accept");
+    assert_eq!(answer.outcome, "undeliverable", "{answer:?}");
+    assert!(answer.detail.contains("undeliverable"), "{answer:?}");
+    // Nothing claimed: a retry after the fix must be able to deliver.
+    assert!(read_entry(&state, "tools", "tm-sim-1212121212121212").is_none());
+    // A notice waits for the receiving coordinator/owner.
+    assert!(state
+        .join("teams.d/tools/notices/tm-sim-1212121212121212.json")
+        .exists());
+    let _ = std::fs::remove_dir_all(&state);
+}

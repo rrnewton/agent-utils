@@ -118,7 +118,7 @@ pub fn exit_code_for(state: &str) -> i32 {
     match state {
         "delivered" | "journaled" => 0,
         "accepted" | "deferred" | "awaiting-pull" | "in-custody" | "claimed" | "typing"
-        | "presented" => 75,
+        | "presented" | "undeliverable" => 75,
         "ambiguous" | "ambiguous-expired" | "possibly_submitted" | "lost" => 76,
         "expired" | "superseded" | "retracted" | "refused" | "fenced" | "journaled-halted" => 65,
         _ => 75,
@@ -248,6 +248,23 @@ pub fn walk(
                     if answered_outcome == "route-refused" {
                         // Definite for this attempt only; try the next route.
                         continue;
+                    }
+                    if answered_outcome == "undeliverable" {
+                        // The receiving host's delivery target is missing or
+                        // archived (#721): nothing was claimed there, so the
+                        // message stays in the outbox for retry after the fix.
+                        entry_value["pinned_contact"] = json!(label);
+                        steps.push(WalkStep {
+                            contact: label.clone(),
+                            route: route.name().to_string(),
+                            detail: answer
+                                .get("detail")
+                                .and_then(Value::as_str)
+                                .unwrap_or("undeliverable")
+                                .to_string(),
+                        });
+                        contact_settled = Some("undeliverable".to_string());
+                        break;
                     }
                     if answered_outcome == "conflict" {
                         entry_value["pinned_contact"] = json!(label);

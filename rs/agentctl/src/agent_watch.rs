@@ -822,6 +822,10 @@ struct WatchState {
     /// so each is reported once; forgotten once older than [`QUARANTINE_LOOKBACK_SECONDS`].
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     quarantines_reported: BTreeMap<String, f64>,
+    /// Fingerprint of the agent-teams declaration flag set last notified to
+    /// the coordinator (#721), so a standing flag is told once, not per pass.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    team_flags_reported: String,
 }
 
 /// An owner (chat-bridge) request waiting undelivered in a registered agent's queue.
@@ -885,6 +889,12 @@ pub trait Probe {
     /// Every prompt quarantined as a probable misroute at or after `since` (Unix seconds). The
     /// default sees none.
     fn quarantined_misroutes(&mut self, _since: f64) -> Vec<QuarantinedPrompt> {
+        Vec::new()
+    }
+    /// Red flags for agent-teams declarations delivering through this
+    /// watch's registry (#721), in `agent-teams check` vocabulary. The
+    /// default sees none.
+    fn team_declaration_flags(&mut self) -> Vec<Value> {
         Vec::new()
     }
 }
@@ -2626,6 +2636,55 @@ fn watch_agents_once(
     let delivery_waits = report_delivery_jams(probe, notifier, state, now, options);
     let owner_waits = report_waiting_owner_prompts(probe, notifier, state, now, options);
     let quarantines = report_quarantines(probe, notifier, state, now, options);
+    // Agent-teams declaration health (#721): the same red flags
+    // `agent-teams check` prints, evaluated every pass for declarations
+    // delivering through this registry. A changed flag set is told to the
+    // coordinator once; a standing one is not repeated per pass.
+    let team_flags = if probe_error.is_null() {
+        probe.team_declaration_flags()
+    } else {
+        Vec::new()
+    };
+    if !team_flags.is_empty() {
+        let fingerprint = team_flags
+            .iter()
+            .map(|flag| {
+                format!(
+                    "{}:{}",
+                    flag["team"].as_str().unwrap_or("?"),
+                    flag["kind"].as_str().unwrap_or("?")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        if fingerprint != state.team_flags_reported {
+            state.team_flags_reported = fingerprint;
+            if !options.check_only {
+                let lines: Vec<String> = team_flags
+                    .iter()
+                    .map(|flag| {
+                        format!(
+                            "- {} — fix: {}",
+                            flag["detail"].as_str().unwrap_or("?"),
+                            flag["fix"].as_str().unwrap_or("?")
+                        )
+                    })
+                    .collect();
+                let text = format!(
+                    "agent-teams declaration health: {} red flag(s) for teams delivering through this registry; inter-team messages may be undeliverable:\n{}",
+                    team_flags.len(),
+                    lines.join("\n")
+                );
+                let _ = notifier.notify(
+                    &options.coordinator,
+                    &text,
+                    &format!("team-declarations-{}", now as u64),
+                );
+            }
+        }
+    } else {
+        state.team_flags_reported.clear();
+    }
     let child_done = flush_child_done(state, notifier, now, options);
     let notice = flush_notices(state, notifier, now, options);
     // The episode rows were made before this pass's sends: `reported` means delivered, so it is
@@ -2659,6 +2718,7 @@ fn watch_agents_once(
         "checked_at": now,
         "coordinator": options.coordinator,
         "ok": probe_error.is_null()
+            && team_flags.is_empty()
             && scrolled.is_empty()
             && unchecked.is_empty()
             && owner_waits.iter().all(|row| row["stuck"] != true)
@@ -2678,6 +2738,7 @@ fn watch_agents_once(
         "delivery_waits": delivery_waits,
         "owner_waits": owner_waits,
         "quarantines": quarantines,
+        "team_declarations": team_flags,
         "auto_interrupts": auto_interrupts,
         "activity": observations
             .iter()
@@ -3767,6 +3828,10 @@ impl<A: ManagedApi + ?Sized> Probe for ManagedProbe<'_, A> {
         }
         found.sort_by(|left, right| left.failed_at.total_cmp(&right.failed_at));
         found
+    }
+
+    fn team_declaration_flags(&mut self) -> Vec<Value> {
+        crate::subagents::team_declaration_flags(&self.registry)
     }
 
     /// Only an agent with a waiter record can have waiters, so the record directories name

@@ -278,6 +278,29 @@ pub fn accept(
         });
     }
 
+    // Undeliverable before any claim (#721): a target agent that is missing
+    // or archived can never read its queue, so answering `accepted` here
+    // would silently lose the message. No ledger entry is written (the
+    // sender keeps the message in its outbox and retries after the fix);
+    // the receiving host records a notice for its coordinator/owner.
+    if let Some(reason) = deliverer.undeliverable_reason() {
+        let notice = json!({
+            "event": "undeliverable-notice", "team": team, "id": id,
+            "sender": envelope_sender(envelope), "reason": reason,
+            "at": format_rfc3339_ms(now_unix_ms()),
+        });
+        crate::sender::log_event(ctx.state, &notice);
+        let notice_dir = ctx.state.join("teams.d").join(team).join("notices");
+        let _ = crate::jsonfile::write_json_atomic(&notice_dir.join(format!("{id}.json")), &notice);
+        unlock(lock);
+        return Ok(AcceptAnswer {
+            outcome: "undeliverable".to_string(),
+            state: None,
+            detail: reason,
+            findings: Vec::new(),
+        });
+    }
+
     // Policy and freshness refusals of the message are durable (section 9.4).
     let sender = envelope_sender(envelope);
     let kind = envelope["kind"].as_str().unwrap_or("info");

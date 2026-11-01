@@ -53,6 +53,12 @@ pub trait Deliverer {
     /// Nudge delivery of an already-accepted ID that may still be waiting
     /// (a retry's known-accepted answer, recovery). Default: nothing.
     fn nudge(&self, _id: &str) {}
+    /// Why a hand-over can never reach anyone (target missing or archived),
+    /// checked before any claim so `accept` can answer `undeliverable`
+    /// instead of queueing into a dead agent (#721). Default: deliverable.
+    fn undeliverable_reason(&self) -> Option<String> {
+        None
+    }
 }
 
 /// This binary's path for spawning our own helper processes
@@ -318,6 +324,15 @@ impl Deliverer for AgentctlQueueDeliverer {
         if self.queue_contains(id) == Some(true) {
             self.start_drain(id);
         }
+    }
+    fn undeliverable_reason(&self) -> Option<String> {
+        crate::health::undeliverable_reason(&self.registry, &self.agent).map(|reason| {
+            format!(
+                "undeliverable: {reason}; designate a live coordinator (`agentctl coordinator set NEW`), then re-run `agent-teams init {} --registry {}` if the declaration pinned the old name",
+                self.team,
+                self.registry.display()
+            )
+        })
     }
 }
 

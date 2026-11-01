@@ -12,6 +12,7 @@
 pub mod cli;
 pub mod deliver;
 pub mod envelope;
+pub mod health;
 pub mod hostindex;
 pub mod jsonfile;
 pub mod ledger;

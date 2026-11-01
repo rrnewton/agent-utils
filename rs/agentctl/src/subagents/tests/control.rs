@@ -199,6 +199,54 @@ fn the_designation_names_one_generation_and_reports_what_became_of_it() {
     assert!(!registry(&fixture).join("coordinator.json").exists());
 }
 
+/// #721: `coordinator set NEW` fixes agent-teams declarations pinned to
+/// the old coordinator (pin dropped) and flags any pinned elsewhere.
+#[test]
+fn coordinator_set_fixes_declarations_pinned_to_the_old_coordinator() {
+    let fixture = Fixture::new();
+    register(&fixture, "coord-old", 88);
+    register(&fixture, "coord-new", 89);
+    let manager = fixture.manager();
+    manager.coordinator_set("coord-old").unwrap();
+    // Declarations under a scratch agent-teams state dir naming this registry.
+    let state = fixture.root.join("teams-state");
+    let registry_text = canonical_registry(&fixture);
+    let write_declaration = |team: &str, pinned: Option<&str>| {
+        let dir = state.join("teams.d").join(team);
+        fs::create_dir_all(&dir).unwrap();
+        let mut deliverer = json!({"kind": "agentctl-queue", "registry": registry_text});
+        if let Some(agent) = pinned {
+            deliverer["agent"] = json!(agent);
+        }
+        let document = json!({
+            "schema": "agent-teams-declaration/v1", "team": team,
+            "deliverer": deliverer, "coordinator": {"designation": "registry"},
+            "accepts_from": [], "limits": {},
+        });
+        agent::atomic_json(&dir.join("declaration.json"), &document).unwrap();
+        dir.join("declaration.json")
+    };
+    let pinned_old = write_declaration("tools", Some("coord-old"));
+    let pinned_other = write_declaration("sim", Some("someone-else"));
+    let _unpinned = write_declaration("plain", None);
+    // SAFETY: this test owns AGENT_TEAMS_STATE_DIR for its body; concurrent
+    // coordinator tests only ever match their own registry, never this one.
+    unsafe { std::env::set_var("AGENT_TEAMS_STATE_DIR", &state) };
+    let report = manager.coordinator_set("coord-new").unwrap();
+    unsafe { std::env::remove_var("AGENT_TEAMS_STATE_DIR") };
+    let handover = &report["team_declarations"];
+    assert_eq!(handover["checked"], 3, "{report}");
+    assert_eq!(handover["fixed"].as_array().unwrap().len(), 1, "{report}");
+    assert_eq!(handover["fixed"][0]["team"], "tools");
+    assert_eq!(handover["flagged"].as_array().unwrap().len(), 1, "{report}");
+    assert_eq!(handover["flagged"][0]["team"], "sim");
+    let fixed_doc = agent::read_private_json(&pinned_old).unwrap();
+    assert!(fixed_doc["deliverer"].get("agent").is_none(), "{fixed_doc}");
+    assert_eq!(fixed_doc["deliverer"]["registry"], json!(registry_text));
+    let flagged_doc = agent::read_private_json(&pinned_other).unwrap();
+    assert_eq!(flagged_doc["deliverer"]["agent"], "someone-else");
+}
+
 #[test]
 fn the_designation_follows_a_revived_generation_through_its_former_tokens() {
     let fixture = Fixture::new();
@@ -390,4 +438,43 @@ fn harness_repo_origins_reads_dotgit_configs() {
         vec!["https://example.invalid/org/repo".to_string()]
     );
     let _ = fs::remove_dir_all(&root);
+}
+
+/// #721: watch-agents' declaration flags name the pinned, retired target
+/// and the fix, in `agent-teams check` vocabulary.
+#[test]
+fn team_declaration_flags_name_the_pinned_retired_target() {
+    use crate::subagents::team_declaration_flags;
+    let fixture = Fixture::new();
+    register(&fixture, "coord-new", 89);
+    let manager = fixture.manager();
+    manager.coordinator_set("coord-new").unwrap();
+    let state = fixture.root.join("teams-state-flags");
+    let dir = state.join("teams.d").join("tools");
+    fs::create_dir_all(&dir).unwrap();
+    let document = json!({
+        "schema": "agent-teams-declaration/v1", "team": "tools",
+        "deliverer": {"kind": "agentctl-queue", "registry": canonical_registry(&fixture), "agent": "coord-old"},
+        "coordinator": {"designation": "registry"},
+        "accepts_from": [], "limits": {},
+    });
+    agent::atomic_json(&dir.join("declaration.json"), &document).unwrap();
+    // SAFETY: as in the handover test above, concurrent tests only match
+    // their own registry against this state directory.
+    unsafe { std::env::set_var("AGENT_TEAMS_STATE_DIR", &state) };
+    let flags = team_declaration_flags(&registry(&fixture));
+    unsafe { std::env::remove_var("AGENT_TEAMS_STATE_DIR") };
+    let kinds: Vec<&str> = flags
+        .iter()
+        .map(|flag| flag["kind"].as_str().unwrap_or("?"))
+        .collect();
+    assert!(kinds.contains(&"pinned-agent"), "{flags:?}");
+    assert!(kinds.contains(&"target-not-designated"), "{flags:?}");
+    assert!(kinds.contains(&"target-missing"), "{flags:?}");
+    assert!(
+        flags
+            .iter()
+            .all(|flag| flag["fix"].as_str().is_some_and(|fix| !fix.is_empty())),
+        "every flag names its fix: {flags:?}"
+    );
 }

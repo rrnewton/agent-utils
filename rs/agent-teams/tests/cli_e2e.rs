@@ -350,3 +350,80 @@ fn send_by_team_name_through_the_host_index() {
     assert_eq!(world.hook_inbox_count("tools"), 1);
     let _ = world;
 }
+
+/// #721: a declaration pinned to a retired coordinator is a red flag in
+/// `check` (with the fix), and a local send to it answers `undeliverable`
+/// while keeping the message in the outbox for retry.
+#[test]
+fn pinned_retired_coordinator_flags_check_and_send_undeliverable() {
+    let world = World::new();
+    // Registry with one live designated coordinator (this process).
+    let registry = world.root.join("registry");
+    let coord_dir = registry.join("agents").join("coord");
+    std::fs::create_dir_all(&coord_dir).expect("registry");
+    let identity = agent_queue::identity::observe(u64::from(std::process::id()))
+        .expect("observe self")
+        .identity;
+    std::fs::write(
+        coord_dir.join("agent.json"),
+        serde_json::to_string(&serde_json::json!({
+            "name": "coord",
+            "harness_identity": serde_json::to_value(&identity).expect("identity"),
+        }))
+        .expect("record"),
+    )
+    .expect("record file");
+    std::fs::write(registry.join("coordinator.json"), "{\"name\": \"coord\"}")
+        .expect("designation");
+    // Sender team via pinned self (ancestry proof, as in init_both).
+    let pid = std::process::id().to_string();
+    let (code, out, err) = world.run(&[
+        "init",
+        "sim",
+        "--coordinator-self",
+        "--coordinator-pid",
+        &pid,
+        "--deliver",
+        "hook-inbox",
+        "--accepts-from",
+        "tools",
+    ]);
+    assert_eq!(code, 0, "init sim: {out} {err}");
+    // Receiver declaration pinned to the retired name.
+    let team_dir = world.state.join("teams.d/tools");
+    std::fs::create_dir_all(&team_dir).expect("team dir");
+    let declaration = serde_json::json!({
+        "schema": "agent-teams-declaration/v1",
+        "team": "tools",
+        "deliverer": {"kind": "agentctl-queue", "registry": registry.to_string_lossy(), "agent": "old-coord"},
+        "coordinator": {"designation": "registry"},
+        "accepts_from": [{"sender": "sim", "kinds": ["info", "request", "hold", "resume", "reply"]}],
+        "limits": {"max_bytes": 8192, "per_sender_per_hour": 30, "max_ttl_seconds": 604800},
+        "default_ttl_seconds": 7200,
+    });
+    std::fs::write(
+        team_dir.join("declaration.json"),
+        serde_json::to_string_pretty(&declaration).unwrap(),
+    )
+    .expect("declaration");
+
+    let (code, out, _) = world.run(&["check"]);
+    assert_eq!(code, 1, "check must fail: {out}");
+    assert!(out.contains("pinned-agent"), "{out}");
+    assert!(out.contains("fix:"), "{out}");
+
+    let (code, out, err) = world.run(&[
+        "send",
+        "tools",
+        "--from-team",
+        "sim",
+        "--text",
+        "are you there",
+    ]);
+    assert_eq!(code, 75, "send: {out} {err}");
+    assert!(out.contains("undeliverable"), "{out}");
+    // The message stays in the outbox, retryable after the fix.
+    let (code, out, _) = world.run(&["outbox"]);
+    assert_eq!(code, 0);
+    assert!(out.contains("undeliverable"), "{out}");
+}

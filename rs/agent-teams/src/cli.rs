@@ -42,7 +42,10 @@ USAGE
 READ-ONLY MODEL
   show [TEAM] [--json]                 Teams, hosts, routes and freshness.
   check [TEAM[@HOST]]... [--strict] [--json]
-                                       Verify declarations, contacts and routes.
+                                       Verify declarations, contacts and routes,
+                                       and flag unhealthy delivery targets
+                                       (pinned, missing, archived, not live,
+                                       child, wrong root) with their fixes.
   probe [--json]                       What this host's own tools say (for peers).
   import --coordinators-file FILE --team NAME [--json]
                                        Convert a per-host coordinators file; prints only.
@@ -514,6 +517,23 @@ fn cmd_check(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
             }
         }
     }
+    // Delivery-target health (#721): a declaration pinned to a retired
+    // coordinator, or resolving to a missing/archived/child agent, loses
+    // messages silently - flag every declaration, named or not.
+    for (team, _, declaration) in &declarations {
+        if !targets.is_empty()
+            && !targets
+                .iter()
+                .any(|t| t == team || t.starts_with(&format!("{team}@")))
+        {
+            continue;
+        }
+        let health = crate::health::evaluate(declaration);
+        for flag in &health.flags {
+            problems.push(format!("{} — fix: {}", flag.detail, flag.fix));
+            lines.push(json!({"kind": flag.kind, "detail": flag.detail, "fix": flag.fix}));
+        }
+    }
     // Team items land in the inbox.v2 lane; an agentctl predating lanes
     // would leave them untyped forever, so that is a hard problem here.
     let needs_lanes = declarations
@@ -919,6 +939,21 @@ fn cmd_init(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
         globals.host,
         path.display()
     );
+    if has_flag(args, "--coordinator-self") {
+        println!(
+            "warning: this declaration pins the current harness process; when that session is retired the pin goes stale and deliveries can be lost - prefer `agent-teams init {team} --registry <registry>`, which names only the registry and resolves its designated coordinator at send time (#721)"
+        );
+    }
+    if declaration["deliverer"]
+        .get("agent")
+        .and_then(Value::as_str)
+        .is_some()
+    {
+        println!(
+            "warning: this declaration pins deliverer agent {:?}; a pinned name goes stale when that agent is retired - name the registry instead (#721)",
+            declaration["deliverer"]["agent"].as_str().unwrap_or_default()
+        );
+    }
     if deliver == "hook-inbox" {
         println!("hook-inbox never wakes an idle agent. Add this harness hook:");
         println!("  command: agent-teams hook --team {team}   (UserPromptSubmit or Stop)");
@@ -1191,6 +1226,26 @@ fn cmd_send(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
         "pid": std::process::id(), "at": format_rfc3339_ms(now_ms),
     });
     let mut outbox_entry = write_outbox(&globals.state, &envelope, &addressed_to, &proof)?;
+    // Local undeliverable pre-flight (#721): never walk a route to a local
+    // declaration whose delivery target is missing or archived; say so
+    // loudly and keep the message in the outbox for retry after the fix.
+    if entry.host == globals.host {
+        if let Ok(declarations) = load_declarations(&globals.state) {
+            if let Some((_, _, declaration)) = declarations.iter().find(|(t, _, _)| t == &to_team) {
+                let health = crate::health::evaluate(declaration);
+                if let Some(flag) = health.undeliverable() {
+                    outbox_entry["state"] = json!("undeliverable");
+                    write_json_atomic(
+                        &crate::sender::outbox_path(&globals.state, &id),
+                        &outbox_entry,
+                    )?;
+                    println!("{id}: undeliverable: {} — fix: {}", flag.detail, flag.fix);
+                    println!("kept in the outbox; fix the target, then `agent-teams pump`");
+                    return Ok(75);
+                }
+            }
+        }
+    }
     let host_obj = teams
         .hosts
         .get(&to_host)
@@ -1441,7 +1496,7 @@ fn cmd_pump(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
             let state = entry["state"].as_str().unwrap_or("deferred").to_string();
             let retryable = matches!(
                 state.as_str(),
-                "deferred" | "ambiguous" | "accepted" | "claimed"
+                "deferred" | "ambiguous" | "accepted" | "claimed" | "undeliverable"
             ) || (retry_refused && state == "refused");
             if !retryable {
                 continue;
