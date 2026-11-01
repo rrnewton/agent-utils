@@ -46899,6 +46899,14 @@ function cardState(choice, read) {
 /** Threads an unpack read is owed, running, done or failed for, so each is read once. */
 const unpackReads = new Map();
 
+/**
+ * `vt-thread-unpack-loop`. The reply count each done unpack read's thread had when the read landed, by
+ * thread: a thread is read again only once its count has grown past that. A thread longer than one
+ * page never holds all its replies, so "fewer held than its count" alone asked for its newest page
+ * again every time its rows were drawn, and drawing them is what a landed read does.
+ */
+const unpackReadCounts = new Map();
+
 /** Reads under way for unpacked blocks: `UNPACK_READS_AT_ONCE` at most. */
 let unpackReadsRunning = 0;
 
@@ -47092,9 +47100,16 @@ function unpackNeedsRead(choice, held) {
   if (state === "queued" || state === "reading" || state === "failed") return false;
   const replies = held.filter((message) => !isThreadRoot(message, choice)).length;
   if (state === "done") {
-    // Read once, and again only when the thread has grown past what that read brought.
-    if (typeof choice.count === "number" && replies < choice.count) unpackReads.delete(choice.id);
-    else return false;
+    // Read once, and again only when the thread has grown past what that read brought: its count
+    // above the one it had when the read landed (`unpackReadCounts`), as well as above what is held.
+    if (!unpackReadCounts.has(choice.id)) unpackReadCounts.set(choice.id, choice.count);
+    const landed = unpackReadCounts.get(choice.id);
+    // A read that landed knowing no count leaves one learnt since to say what is owed.
+    if (typeof choice.count === "number" && replies < choice.count &&
+        (typeof landed !== "number" || choice.count > landed)) {
+      unpackReads.delete(choice.id);
+      unpackReadCounts.delete(choice.id);
+    } else return false;
   }
   const cover = channelStore.current().views.get(viewKey("thread", choice.id));
   if (cover && !cover.more) return false;
@@ -47324,6 +47339,7 @@ async function readUnpackThread(id) {
     const payload = await readTimeline(path, undefined);
     if (String(selectedChannelId()) !== channel) {
       unpackReads.delete(id);
+      unpackReadCounts.delete(id);
       return;
     }
     foldTimelinePage(payload, false, "thread", id, held);
@@ -48514,6 +48530,7 @@ function closeSideThread() {
 function resetSideColumn(reopen = false) {
   // `#404 threads-unpack-all`. Unpack reads were the last channel's.
   unpackReads.clear();
+  unpackReadCounts.clear();
   if (unpackObserver !== null) {
     unpackObserver.disconnect();
     unpackObserver = null;

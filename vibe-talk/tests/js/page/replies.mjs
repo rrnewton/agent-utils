@@ -12,22 +12,22 @@ import { ALICE, BASE_CSS, CHANNEL, CODER, CSS, CSS_CODE, DESKTOP_QUERY, DISCORD_
   bodyOf, bookmarkAt, bookmarkRow, bridgeReply, brokenModule, brokenScript, channelRow,
   chooseReadMode, conversation, cssBlock, cssBlockIn, cssRules, delayedReply, deliver,
   dismissedItems, dismissedOpenerOf, distinctReplies, doneButton, draftMarkerOf, enterRunThread,
-  errorResponse, failedSend, focusName, focused, forwardPage, freshMessagePage, freshness, gate,
-  gatherChip, gutterChild, helpEntry, holdCountsRead, inPlaceRows, inReadingMode, inTwoColumns,
-  inlineAnchors, json, keyboardPage, keyedChannel, keyless, longMessage, message, metaOf, mouseOnto,
-  newPage, nodeWithinFixture, offline, olderReads, openReplyOn, outgoingActions, outgoingDismiss,
-  outgoingEdit, outgoingRetry, outgoingRows, outgoingSpinner, pagedChannel, pagedTimeline,
-  parityPage, pickThread, pollOnce, posted, postedWhere, press, pressHere, providerDown, putBackOf,
-  questionFarAbove, quotePage, reReadChannel, readButton, readsSince, reloadPage, reloadWith,
-  reopenedChannel, replyArrowOf, replyBoxAt, replyButton, replyColumnsPage, replyInStream,
-  replyQuietly, retryWait, retryingFirst, row, rowOf, rowWithId, runId, runThread, savedDismissed,
-  savedOutgoing, savedScopes, savedUiState, scatteredPage, scatteredThread, scopeKey, search,
-  selectedId, sendBehind, sendChannel, sentOk, sentWithoutKey, settleSend, showDiscord, showPinned,
-  shownIds, sideIds, sideRow, signIn, sourceConstant, sourceString, splitPost, sseDelete,
-  sseMessage, stackPlaces, startTalking, statusText, storedPin, tagOf, takesASide, tallColumns,
-  tapArrow, test, threadBadge, threadButton, threadData, threadOptions, threadPage, timelineReads,
-  tokenValues, turnSummariesOn, turnTodoOn, twoColumnServer, twoColumns, unpackedRow,
-  withLiveChannel, wordsIn } from "./fixture.mjs";
+  errorResponse, failedSend, focusName, focused, forwardPage, forwardTimeline, freshMessagePage,
+  freshness, gate, gatherChip, gutterChild, helpEntry, holdCountsRead, inPlaceRows, inReadingMode,
+  inTwoColumns, inlineAnchors, json, keyboardPage, keyedChannel, keyless, liveReply, longMessage,
+  message, metaOf, mouseOnto, newPage, nodeWithinFixture, offline, olderReads, openReplyOn,
+  outgoingActions, outgoingDismiss, outgoingEdit, outgoingRetry, outgoingRows, outgoingSpinner,
+  pagedChannel, pagedTimeline, parityPage, passTime, pickThread, pollOnce, posted, postedWhere,
+  press, pressHere, providerDown, putBackOf, questionFarAbove, quotePage, reReadChannel, readButton,
+  readsSince, reloadPage, reloadWith, reopenedChannel, replyArrowOf, replyBoxAt, replyButton,
+  replyColumnsPage, replyInStream, replyQuietly, retryWait, retryingFirst, row, rowOf, rowWithId,
+  runId, runThread, savedDismissed, savedOutgoing, savedScopes, savedUiState, scatteredPage,
+  scatteredThread, scopeKey, search, selectedId, sendBehind, sendChannel, sentOk, sentWithoutKey,
+  settleSend, showDiscord, showPinned, shownIds, sideIds, sideRow, signIn, sourceConstant,
+  sourceString, splitPost, sseDelete, sseMessage, stackPlaces, startTalking, statusText, storedPin,
+  tagOf, takesASide, tallColumns, tapArrow, test, threadBadge, threadButton, threadData,
+  threadOptions, threadPage, timelineReads, tokenValues, turnSummariesOn, turnTodoOn,
+  twoColumnServer, twoColumns, unpackedRow, withLiveChannel, wordsIn } from "./fixture.mjs";
 
 const REPLY_LANDED_MS = sourceConstant("REPLY_LANDED_MS");
 
@@ -4679,6 +4679,45 @@ test("`#410 inline-reply-editor`: in All Reply gathers the message's replies und
   await replyButton(rowWithId(quiet, "605")).click();
   assert.deepStrictEqual(shownIds(quiet), SCATTERED, "a message with no replies moved rows");
   assert.deepStrictEqual(inlineAnchors(quiet), ["discord-log:605"]);
+});
+
+test("`vt-thread-unpack-loop`: a gathered thread longer than one page has its newest page read once, not again and again", async () => {
+  // The owner, 2026-11-01: a thread opened in Main read its newest page about three times a second for
+  // as long as it stood, every answer the same. The thread is longer than one page, so the replies held
+  // never reach its count, and a read that had landed was asked for again by the rows it redrew.
+  const data = scatteredThread(40);
+  const page = newPage();
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  page.messages = data.messages;
+  const server = forwardTimeline(page);
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await pickThread(page, "main");
+  await page.settle();
+  server.newestLimit = 2; // a thread's newest page holds two of its replies, and says there are more
+  const threadReads = () => page.requests.filter((r) => /\/timeline\?/.test(r) && /view=thread(&|$)/.test(r) && /reason=threads/.test(r));
+  // A loop would never settle: past a bound, the thread's reads fail, which ends one.
+  const timeline = page.timeline;
+  page.timeline = async (path, options) => (/view=thread(&|$)/.test(String(path)) && threadReads().length > 20
+    ? json(503, { error: "probe_bound", detail: "the test's bound on the thread's reads" }) : timeline(path, options));
+  await replyButton(rowWithId(page, "601")).click();
+  await page.settle();
+  for (let i = 0; i < 10; i += 1) {
+    await passTime(page, 1000);
+    await page.settle();
+  }
+  assert.equal(threadReads().length, 1, `the gathered thread's newest page was read ${threadReads().length} times`);
+  // ...and read again once the thread has grown past what that read brought: a reply arrives on the
+  // stream, and the thread's count goes up by it.
+  page.threads = page.threads.map((thread) => ({ ...thread, reply_count: 41 }));
+  await liveReply(page, server, data.messages.find((m) => m.id === "601"), "699");
+  assert.equal(threadReads().length, 2, "a thread grown past its read was not read again");
+  for (let i = 0; i < 10; i += 1) {
+    await passTime(page, 1000);
+    await page.settle();
+  }
+  assert.equal(threadReads().length, 2, "the grown thread was read again and again");
 });
 
 test("`#410 inline-reply-editor`: on a thread's root in Main, Reply draws its thread's replies under it as rows of the list, bridged, and Cancel takes them away again", async () => {
