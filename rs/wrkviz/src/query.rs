@@ -310,6 +310,8 @@ fn timestamp(ms: i64) -> String {
 
 type ReferenceOf = fn(&Map<String, Value>, &str) -> Result<String, String>;
 type LookupEntry = (String, Map<String, Value>);
+type RecordList = Vec<Map<String, Value>>;
+type RefTable = BTreeMap<String, Map<String, Value>>;
 
 fn local_identifier<'a>(team: &str, identifier: &'a str) -> &'a str {
     let prefix = format!("{team}::");
@@ -450,10 +452,10 @@ pub struct Timeline {
     teams: Vec<Map<String, Value>>,
     sole_team: Option<String>,
     generation: Generation,
-    collections: RefCell<BTreeMap<&'static str, Vec<Map<String, Value>>>>,
-    spine_groups: RefCell<BTreeMap<(String, String), Vec<Map<String, Value>>>>,
-    stream_records: RefCell<BTreeMap<String, Vec<Map<String, Value>>>>,
-    ref_tables: RefCell<BTreeMap<(String, String), BTreeMap<String, Map<String, Value>>>>,
+    collections: RefCell<BTreeMap<&'static str, RecordList>>,
+    spine_groups: RefCell<BTreeMap<(String, String), RecordList>>,
+    stream_records: RefCell<BTreeMap<String, RecordList>>,
+    ref_tables: RefCell<BTreeMap<(String, String), RefTable>>,
 }
 
 fn record_array(source: &Map<String, Value>, key: &str) -> Result<Vec<Map<String, Value>>, String> {
