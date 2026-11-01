@@ -803,28 +803,33 @@ async fn the_bridge_the_mock_was_pointed_at_is_the_one_it_calls() {
 // keeps these tests from sliding back into that: it pins that an unknown type is recorded under a
 // DIFFERENT kind and reaches no context, so renaming the frame here turns this file red.
 
-/// The page's own source, so the frame under test is the frame that ships.
-const VOICE_JS: &str = include_str!("../web/voice.js");
+mod page_source {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/support/page_source.rs"
+    ));
+}
 
-/// One string constant from `web/voice.js`, with its `+`-joined pieces put back together.
+/// One string constant from the call sources, with its `+`-joined pieces put back together.
 ///
 /// Reading the real sentence is the point. A test that invented its own wording would prove that
 /// the mock accepts *some* contextual update, which nobody was in doubt about; what is worth
 /// pinning is that the bytes the app actually puts on the socket are accepted. It is deliberately
 /// strict: a constant it cannot parse is a failure, never a quietly empty string.
 fn page_notice(name: &str) -> String {
+    let source = page_source::page_source(&["src/view/voice", "src/present/call"]);
     let anchor = format!("const {name} =");
-    let start = VOICE_JS.find(&anchor).unwrap_or_else(|| {
-        panic!("web/voice.js no longer defines `{name}`, so mute tells the agent nothing")
+    let start = source.find(&anchor).unwrap_or_else(|| {
+        panic!("the call sources no longer define `{name}`, so mute tells the agent nothing")
     });
-    let rest = &VOICE_JS[start + anchor.len()..];
+    let rest = &source[start + anchor.len()..];
     let end = rest
         .find(";\n")
-        .unwrap_or_else(|| panic!("`{name}` in web/voice.js is not a terminated declaration"));
+        .unwrap_or_else(|| panic!("`{name}` in the call sources is not a terminated declaration"));
     let text: String = rest[..end].split('"').skip(1).step_by(2).collect();
     assert!(
         !text.is_empty(),
-        "`{name}` in web/voice.js is not a plain string literal this test can read"
+        "`{name}` in the call sources is not a plain string literal this test can read"
     );
     text
 }

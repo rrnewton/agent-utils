@@ -12,7 +12,7 @@ import { WEB } from "../../../web/page_sources.mjs";
 import { BASE_CSS, CANNED, CONVAI_WRITE, CSS, CSS_CODE, CSS_UNCONDITIONAL, DESKTOP_QUERY, HTML,
   HTML_CODE, MODULE_CODE, PAGE_CODE, PAGE_ELEMENTS, PAGE_IDS, SCRIPT, SCRIPT_CODE,
   SEAM_DETAIL_MAX_WORDS, SEAM_DETAIL_MIN_WORDS, SEARCH_LANGUAGE, assertMarkupContains, barSlice,
-  bigCardData, brokenScript, channelSummaryText, compose, cssBlock, cssBlockIn, cssBlockOutside,
+  bigCardData, brokenModule, brokenScript, channelSummaryText, compose, cssBlock, cssBlockIn, cssBlockOutside,
   cssRules, cssRulesElsewhere, cssWithout, errorResponse, forwardTimeline, freshness, json,
   longMessage, markupHolds, markupPlace, mediaBody, message, newPage, pagedChannel, pickThread,
   reReadChannel, replyButton, replyInStream, seamDetail, searchLanguage, secondOfSpeech,
@@ -198,21 +198,21 @@ test("with no token the page IS the sign-in screen, not the interface behind a n
 test("a pending audio suspension honors the next read and a later stop", async () => {
   const page = newPage();
   page.enableStreamedAudio();
-  const audio = page.pure("readAloudAudioContext")();
+  const audio = page.pure("readAloudOwner().readAloudAudioContext")();
   const pending = [];
   audio.suspend = () => new Promise((resolve) => pending.push(() => {
     audio.state = "suspended";
     resolve();
   }));
-  page.pure("quietReadAloudContext")();
-  page.pure("readAloudAudioContext")();
+  page.pure("readAloudOwner().quietReadAloudContext")();
+  page.pure("readAloudOwner().readAloudAudioContext")();
   pending.shift()();
   await page.settle();
   assert.equal(audio.state, "running", "the preceding read's suspension silenced the next read");
 
-  page.pure("quietReadAloudContext")();
-  page.pure("readAloudAudioContext")();
-  page.pure("quietReadAloudContext")();
+  page.pure("readAloudOwner().quietReadAloudContext")();
+  page.pure("readAloudOwner().readAloudAudioContext")();
+  page.pure("readAloudOwner().quietReadAloudContext")();
   for (const finish of pending.splice(0)) finish();
   await page.settle();
   assert.equal(audio.state, "suspended", "an old suspension resumed audio after Stop");

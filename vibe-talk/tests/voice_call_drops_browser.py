@@ -404,8 +404,8 @@ YES_ROWS_SHOWN_JS = """() => [...document.querySelectorAll('#transcript li')].fi
 # The card at the moment of the tap: whether its hold after appearing is still running, whether a spoken
 # yes to it is settling, what its line says, and whether Don't send can be pressed.
 CARD_AT_TAP_JS = """() => ({
-  held: postWatch.hold !== null,
-  settling: spokenYes.settling !== null && postWatch.shown !== null && spokenYes.settling.handle === postWatch.shown.handle,
+  held: voiceTranscript().postWatch.hold !== null,
+  settling: voiceTranscript().spokenYes.settling !== null && voiceTranscript().postWatch.shown !== null && voiceTranscript().spokenYes.settling.handle === voiceTranscript().postWatch.shown.handle,
   line: document.getElementById('post-confirm-expiry').textContent,
   cancelDisabled: document.getElementById('post-confirm-cancel').disabled,
 })"""
@@ -419,9 +419,9 @@ def read_back_played(page: Page) -> None:
     """
     page.wait_for_function(
         """() => {
-            const end = spokenYes.completed.get(1);
+            const end = voiceTranscript().spokenYes.completed.get(1);
             return end && !end.interrupted && Date.now() >= end.playEnd
-                && session.audio.currentTime >= session.playAt;
+                && voiceCall().session.audio.currentTime >= voiceCall().session.playAt;
         }""",
         timeout=2_500,
     )

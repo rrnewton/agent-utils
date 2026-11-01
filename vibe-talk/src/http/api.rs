@@ -3524,6 +3524,23 @@ pub async fn stream_all(
 mod tests {
     use crate::http::assets::VOICE_JS;
 
+    mod page_source {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/page_source.rs"
+        ));
+    }
+
+    fn voice_source() -> String {
+        page_source::page_source(&["src/view/voice", "src/present/call", "src/core/speech"])
+    }
+
+    fn channel_name_source() -> String {
+        // Only the owners moved out of voice.js join its existing label rule. Presentation
+        // metadata (for example a call seam's label) is a different domain.
+        page_source::page_source(&["src/view/voice", "src/view/settings"])
+    }
+
     #[test]
     fn the_voice_page_pluralizes_and_prefers_the_operators_own_clock() {
         // Both defects were fixed first on the older page that used to be served at `/` and never
@@ -3552,6 +3569,7 @@ mod tests {
 
     #[test]
     fn the_relay_quotes_the_prepared_body_and_the_row_still_shows_the_raw_one() {
+        let source = voice_source();
         // Two claims, and a guard that only made the first would let the fix undo itself. The
         // relay must say the PREPARED body — quoting `content` there is how `read new` came to
         // spell nineteen-digit ids out loud, and it happened because that turn is the one built
@@ -3559,10 +3577,10 @@ mod tests {
         // a letter is only recoverable because the id it stands for is on the screen beside it,
         // so a page that showed the prepared text in both places would have made the
         // substitution lossy rather than merely quiet.
-        let relay = function_body(VOICE_JS, "function relayLine(");
+        let relay = function_body(&source, "function relayLine(");
         assert!(
             relay.contains("message.spoken_content ||"),
-            "web/voice.js relays the raw body again, so ids are read aloud digit by digit"
+            "the call relays the raw body again, so ids are read aloud digit by digit"
         );
         // `combinedContent` is the single place a channel row's text comes from, so it is the
         // single place this half can be checked. It must read the raw field and nothing else. It
@@ -3582,30 +3600,36 @@ mod tests {
         );
     }
 
-    /// The text of one top-level function in a served asset, up to the next one.
-    ///
-    /// Crude on purpose: it is enough to ask "does THIS function call that one", which is the
-    /// only question the guard below has, and it needs no parser to answer it.
-    ///
-    /// `async function` counts as the next one. It did not used to, and the consequence was that
-    /// a body ran on through every `async` declaration after it until the next synchronous one —
-    /// so an assertion about one function was quietly an assertion about three. The older page that
-    /// used to be served at `/` was mostly `async`, which is where that first mattered.
+    /// One function body in the page sources, including a function nested in a mounted owner.
+    /// Its closing brace is at the declaration's indentation. Stopping at the next column-zero
+    /// declaration would silently include sibling functions after an owner move.
     fn function_body<'a>(source: &'a str, signature: &str) -> &'a str {
         let start = source
             .find(signature)
-            .unwrap_or_else(|| panic!("the asset no longer defines `{signature}`"));
+            .unwrap_or_else(|| panic!("the page sources no longer define `{signature}`"));
+        let line = source[..start].rsplit('\n').next().unwrap_or("");
+        let indent: String = line
+            .chars()
+            .take_while(|character| character.is_whitespace())
+            .collect();
         let rest = &source[start + signature.len()..];
-        let end = ["\nfunction ", "\nasync function "]
-            .iter()
-            .filter_map(|marker| rest.find(marker))
-            .min()
-            .unwrap_or(rest.len());
+        let end = rest.find(&format!("\n{indent}}}")).unwrap_or_else(|| {
+            panic!("`{signature}` has no closing brace at its declaration's indentation")
+        });
         &rest[..end]
     }
 
     #[test]
+    fn function_body_does_not_borrow_a_nested_siblings_calls() {
+        let source = "export function mount() {\n  function first() {\n    keep();\n  }\n  async function second() {\n    foldable();\n  }\n}\n";
+        assert!(function_body(source, "function first(").contains("keep()"));
+        assert!(!function_body(source, "function first(").contains("foldable()"));
+        assert!(function_body(source, "function second(").contains("foldable()"));
+    }
+
+    #[test]
     fn both_message_lists_on_the_voice_page_fold_long_messages_the_same_way() {
+        let source = voice_source();
         // `#47 scrollback-stability`. The page renders two message lists — the voice transcript
         // and the channel view — and the whole point of the folding work is that they behave
         // IDENTICALLY, because they sit one switch apart and a reader moves between them without
@@ -3613,7 +3637,7 @@ mod tests {
         // of both call sites using it. A fix landed on one list and not the other is the exact
         // defect this file's other guard was written for, and it cost a round trip that time.
         assert!(
-            VOICE_JS.contains("function foldable("),
+            source.contains("function foldable("),
             "the folding idiom must be ONE function, not a behaviour each list implements"
         );
         // `function line(` used to be the transcript's entry here. `#128 transcript-history`
@@ -3630,8 +3654,8 @@ mod tests {
             "function sentCardNode(",
         ] {
             assert!(
-                function_body(VOICE_JS, renderer).contains("foldable("),
-                "`{renderer}` in web/voice.js no longer folds long messages, so the two message \
+                function_body(&source, renderer).contains("foldable("),
+                "`{renderer}` in the page sources no longer folds long messages, so the two message \
                  lists on the page disagree about what a long message looks like"
             );
         }
@@ -3640,15 +3664,15 @@ mod tests {
         // row builder is how the record ends up folding differently from the call.
         for placer in ["function line(", "function restoredRun("] {
             assert!(
-                function_body(VOICE_JS, placer).contains("turnNode("),
-                "`{placer}` in web/voice.js builds a transcript row of its own instead of the \
+                function_body(&source, placer).contains("turnNode("),
+                "`{placer}` in the page sources builds a transcript row of its own instead of the \
                  one that folds"
             );
         }
         // And the anchoring that goes with it: an arrival must be conditional, never the old
         // unconditional jump.
         assert!(
-            VOICE_JS.contains("function followIfPinned("),
+            source.contains("function followIfPinned("),
             "an arrival must follow the newest line only when the reader was already there"
         );
         // `function seam(` used to be in this list. `#63 status-line-placement` split BUILDING a
@@ -3667,26 +3691,27 @@ mod tests {
             "function showPostProposal(",
             "function placeInConversation(",
         ] {
-            let body = function_body(VOICE_JS, renderer);
+            let body = function_body(&source, renderer);
             assert!(
                 body.contains("followIfPinned("),
-                "`{renderer}` in web/voice.js appends without deciding whether to follow"
+                "`{renderer}` in the page sources appends without deciding whether to follow"
             );
             assert!(
                 !body.contains("scrollToNewest("),
-                "`{renderer}` in web/voice.js scrolls on every arrival again, which is the \
+                "`{renderer}` in the page sources scrolls on every arrival again, which is the \
                  defect: a reader looking at older messages gets thrown to the bottom"
             );
         }
         // And the function that moves the card between the lists never scrolls one.
         assert!(
-            !function_body(VOICE_JS, "function placePostCard(").contains("scrollToNewest("),
-            "`placePostCard` in web/voice.js scrolls the list it puts the card in"
+            !function_body(&source, "function placePostCard(").contains("scrollToNewest("),
+            "`placePostCard` in the page sources scrolls the list it puts the card in"
         );
     }
 
     #[test]
     fn typed_input_on_the_voice_page_has_exactly_one_send_path() {
+        let source = voice_source();
         // `#43 typed-input`. The same argument as the folding guard above, one issue later. Three
         // things now put a client event on the conversation socket — the composer's Send, the
         // Enter key, and the presence ping while somebody is typing — and `#59 text-entry-button`
@@ -3698,40 +3723,40 @@ mod tests {
         //
         // So: one writer, and the composer's callers go through it.
         assert!(
-            VOICE_JS.contains("function sendClientEvent("),
+            source.contains("function sendClientEvent("),
             "the one place a JSON client event reaches the conversation socket is gone"
         );
         for caller in ["function sendUserMessage(", "function noteComposing("] {
             assert!(
-                function_body(VOICE_JS, caller).contains("sendClientEvent("),
-                "`{caller}` in web/voice.js writes to the socket by some other route, so the \
+                function_body(&source, caller).contains("sendClientEvent("),
+                "`{caller}` in the page sources writes to the socket by some other route, so the \
                  readyState guard and the visible refusal are no longer on every send"
             );
         }
         // The audio path is the ONE deliberate exception, and it is documented as one in
-        // web/voice.js: it is called every 4096 samples, holds the socket in a closure and does
+        // the page sources: it is called every 4096 samples, holds the socket in a closure and does
         // its own readyState check. Pinned so that "the exception" cannot quietly become "the
         // rule" by a second hot-path send appearing beside it.
         assert!(
-            function_body(VOICE_JS, "function startCapture(").contains("user_audio_chunk"),
+            function_body(&source, "function startCapture(").contains("user_audio_chunk"),
             "the microphone frames no longer go out from startCapture"
         );
         assert_eq!(
-            VOICE_JS.matches("user_audio_chunk:").count(),
+            source.matches("user_audio_chunk:").count(),
             1,
-            "web/voice.js writes microphone frames from more than one place"
+            "the page writes microphone frames from more than one place"
         );
         // A typed turn is rendered locally because the vendor may never echo it back, which makes
         // suppressing the echo — if there is one — the other half of the same decision. Losing
         // either half puts the sentence on screen twice or not at all.
-        let typed = function_body(VOICE_JS, "function sendUserMessage(");
+        let typed = function_body(&source, "function sendUserMessage(");
         assert!(
             typed.contains("line(\"you\""),
             "a typed turn is no longer rendered when it is sent, so it exists only if the vendor \
              chooses to echo it"
         );
         assert!(
-            VOICE_JS.contains("function isEchoOfTyped("),
+            source.contains("function isEchoOfTyped("),
             "nothing suppresses the vendor's echo of a typed turn, so it can render twice"
         );
     }
@@ -3742,71 +3767,65 @@ mod tests {
     /// older page then served at `/` went on printing the configured label, so one deployment
     /// showed two names for one channel; a renderer added beside these and written against the
     /// label directly would do the same within one page.
-    const NAMES_A_CHANNEL: [(&str, &str, &[&str]); 1] = [(
-        "web/voice.js",
-        VOICE_JS,
-        // Both pickers, the head of the channel on each of its three writers, and the head of the
-        // to-do list. The older-page writer is `loadOlderPage`: `loadOlder` only hands out the
-        // step in flight since `#204 reply-arrow`. The newest page is drawn by `drawChannelPage`,
-        // for `loadDiscord` and for the late answer of a read it gave up on (`remote-ops-audit`
-        // W7).
-        &[
-            "function fillChannelSelect(",
-            "function drawChannelPage(",
-            "function loadOlderPage(",
-            "function restateChannelSeam(",
-            "function todoSummary(",
-        ],
-    )];
+    // Both pickers, the head of the channel on its three writers, and the to-do list.
+    // loadOlderPage writes older pages; drawChannelPage writes the newest page and late reads.
+    const NAMES_A_CHANNEL: &[&str] = &[
+        "function fillChannelSelect(",
+        "function drawChannelPage(",
+        "function loadOlderPage(",
+        "function restateChannelSeam(",
+        "function todoSummary(",
+    ];
 
     #[test]
     fn the_page_calls_a_channel_what_the_operator_called_it() {
         // `#39 channel-alias`. `ChannelInfo::display_name` is the rule on this side of the wire;
         // `channelName` is the same rule in the browser. The RULE is asserted over the bytes the
         // page is served, and so is every call site of it.
-        for (name, source, renderers) in NAMES_A_CHANNEL {
-            let rule = function_body(source, "function channelName(");
+        let source = channel_name_source();
+        let name = "the legacy page and its voice/settings owners";
+        let rule = function_body(&source, "function channelName(");
+        assert!(
+            rule.contains("channel.alias"),
+            "{name} defines channelName without consulting the operator's own name for the \
+             channel"
+        );
+        assert!(
+            rule.contains("channel.label"),
+            "{name} defines channelName without the configured label as its fallback, so \
+             clearing an alias would leave the channel with no name at all"
+        );
+        for renderer in NAMES_A_CHANNEL {
+            let body = function_body(&source, renderer);
             assert!(
-                rule.contains("channel.alias"),
-                "{name} defines channelName without consulting the operator's own name for the \
-                 channel"
+                body.contains("channelName("),
+                "`{renderer}` in {name} names a channel without going through channelName, \
+                 so this deployment can show two different names for one channel"
             );
             assert!(
-                rule.contains("channel.label"),
-                "{name} defines channelName without the configured label as its fallback, so \
-                 clearing an alias would leave the channel with no name at all"
+                !body.contains(".label"),
+                "`{renderer}` in {name} reads the configured label directly again, which is \
+                 the defect: the alias is ignored wherever that is done"
             );
-            for renderer in renderers {
-                let body = function_body(source, renderer);
-                assert!(
-                    body.contains("channelName("),
-                    "`{renderer}` in {name} names a channel without going through channelName, \
-                     so this deployment can show two different names for one channel"
-                );
-                assert!(
-                    !body.contains(".label"),
-                    "`{renderer}` in {name} reads the configured label directly again, which is \
-                     the defect: the alias is ignored wherever that is done"
-                );
-            }
         }
     }
 
     #[test]
     fn the_page_grows_no_second_opinion_about_a_channels_name() {
+        let source = channel_name_source();
         // The other half, and the half that keeps the list above honest: a call site added later
         // is not covered by a list written today. `.label` is the shape of the defect, so it is
         // allowed in exactly two places — the fallback inside `channelName`, and the alias editor
         // in Settings, which names the configured label deliberately so the owner can see what
         // clearing would go back to.
         assert_eq!(
-            channel_label_reads_in_voice_page(VOICE_JS),
+            channel_label_reads_in_voice_page(&source),
             3,
-            "web/voice.js reads a channel's configured label somewhere other than the fallback \
+            "the page reads a channel's configured label somewhere other than the fallback \
              inside channelName and the two sentences the alias editor shows"
         );
         assert_eq!(
-            function_body(VOICE_JS, "function renderAliasEditor(")
+            function_body(&source, "function renderAliasEditor(")
                 .matches(".label")
                 .count(),
             2,
@@ -3829,13 +3848,11 @@ mod tests {
 
     #[test]
     fn speech_metadata_exemption_does_not_hide_direct_channel_labels() {
-        let changed = VOICE_JS.replacen(
-            "function applyClientConfig(config) {",
-            "function applyClientConfig(config) {\n  heading = channel.label;",
-            1,
-        );
+        let source = channel_name_source();
+        let config = function_body(&source, "function applyClientConfig(");
+        let changed = source.replacen(config, &format!("{config}\n  heading = channel.label;"), 1);
         assert_eq!(channel_label_reads_in_voice_page(&changed), 4);
-        let changed = format!("{VOICE_JS}\nheading = speech.label;\n");
+        let changed = format!("{source}\nheading = speech.label;\n");
         assert_eq!(channel_label_reads_in_voice_page(&changed), 4);
     }
 }

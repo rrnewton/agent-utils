@@ -554,7 +554,9 @@ def open_target_page(
         dict[str, str | None],
         page.evaluate(
             """() => {
-              const voice = typeof browserSpeechVoice === 'function' ? browserSpeechVoice() : null;
+              const voice = typeof readAloudOwner === 'function'
+                ? readAloudOwner().browserSpeechVoice()
+                : typeof window.browserSpeechVoice === 'function' ? window.browserSpeechVoice() : null;
               return {
                 browserLanguage: String(navigator.language || ''),
                 voiceLanguage: voice ? String(voice.lang || '') : null,

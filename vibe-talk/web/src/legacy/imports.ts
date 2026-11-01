@@ -16,76 +16,10 @@ export {
   searchQueryTree,
   searchSubject,
 } from "../core/search/index.ts";
-export {
-  SPEECH_HOLD_CAP_MS_DEFAULT,
-  SPEECH_HOLD_DBFS_DEFAULT,
-  browserSpeechChunks,
-  bufferDbfs,
-  createPreparedSpeech,
-  downsampleTo,
-  floatToPcm16,
-  joinBytes,
-  readPieces,
-  recoveryWait,
-  sentenceEnds,
-  speechElapsedMs,
-  speechHoldFrom,
-  speechSegments,
-  ticketEnded,
-  ticketTooShortForBlocks,
-  wavLayout,
-} from "../core/speech/index.ts";
+export { speechHoldFrom } from "../core/speech/index.ts";
 export { createApi, isSlowFailure, readableFailure } from "../core/api/index.ts";
-export {
-  LOST_TURN,
-  RECONNECT_RECORDS_WAIT_MS,
-  STORED_SEAM_DETAIL,
-  boundaryFor,
-  callRecapLine as recapLine,
-  notSentDetail,
-  reconnectAsked as callReconnectAsked,
-  reconnectFreshWords,
-  reconnectSeamDetail,
-  reconnectVerdict,
-  seamDetailFor as callSeamDetailFor,
-  spokenOutcomeKind,
-  spokenYesSeam,
-} from "../core/call/index.ts";
-export {
-  allReachesThread,
-  answeredThread,
-  coverViewOf,
-  createChannelStore,
-  createCopyOrder,
-  createRemovals,
-  emptyTally,
-  exactReplyCount,
-  foldDeltaIn,
-  foldLiveIn,
-  foldPageIn,
-  heldNow,
-  inTimeOrder,
-  inViewOf,
-  markDoneIn,
-  namedRecord,
-  newerPage,
-  newerPageSpeaksFor,
-  noteReplyGapsIn,
-  pageFoldIn,
-  placeFromPageIn,
-  projectionOf,
-  refreshFailed,
-  replyTallyOf,
-  restoreCanon,
-  savedTimelineOf,
-  tallyRecord,
-  settleDoneIn,
-  threadOf,
-  timeOf,
-  unseenRepliesIn,
-  upsertThreadSummary,
-  viewOfKey,
-} from "../core/channels/index.ts";
+
+export { allReachesThread, answeredThread, coverViewOf, createChannelStore, createCopyOrder, createRemovals, emptyTally, exactReplyCount, foldDeltaIn, foldLiveIn, foldPageIn, heldNow, inTimeOrder, inViewOf, markDoneIn, namedRecord, newerPage, newerPageSpeaksFor, noteReplyGapsIn, pageFoldIn, placeFromPageIn, projectionOf, refreshFailed, replyTallyOf, restoreCanon, savedTimelineOf, tallyRecord, settleDoneIn, threadOf, timeOf, unseenRepliesIn, upsertThreadSummary, viewOfKey } from "../core/channels/index.ts";
 export { anchorOfMessage, createBookmarks, createPins, createReadLedger, isBookmarkState, sameAnchor } from "../core/annotations/index.ts";
 export { DEEP_LINK_VIEWS, createNavigation, deepLinkParams, deepLinkPart, deepLinkQuery, placeIsOver, visitKey } from "../core/navigation/index.ts";
 export {
@@ -126,31 +60,7 @@ export {
   unsentText,
   waitingItsTurn as outboxWaitingItsTurn,
 } from "../core/outbox/index.ts";
-export {
-  DEFAULT_CARD_MAX_LINES,
-  DEFAULT_COLLAPSED_LINES,
-  DEFAULT_READING_CH,
-  DEVICE_SETTINGS,
-  IDENTITY_KEY,
-  MAX_CARD_MAX_LINES,
-  MAX_COLLAPSED_LINES,
-  MAX_MSG_SCALE,
-  MAX_READING_CH,
-  MAX_READ_SPEED,
-  MIN_CARD_MAX_LINES,
-  MIN_COLLAPSED_LINES,
-  MIN_MSG_SCALE,
-  MIN_READING_CH,
-  MIN_READ_SPEED,
-  clampCardMaxLines,
-  clampCollapsedLines,
-  clampMsgScale,
-  clampReadSpeed,
-  clampReadingWidth,
-  createCredentials,
-  createDeviceSettings,
-  createSettingsSync,
-} from "../core/settings/index.ts";
+export { DEFAULT_CARD_MAX_LINES, DEFAULT_COLLAPSED_LINES, DEFAULT_READING_CH, DEVICE_SETTINGS, IDENTITY_KEY, MAX_CARD_MAX_LINES, MAX_COLLAPSED_LINES, MAX_MSG_SCALE, MAX_READING_CH, MIN_CARD_MAX_LINES, MIN_COLLAPSED_LINES, MIN_MSG_SCALE, MIN_READING_CH, clampCardMaxLines, clampCollapsedLines, clampMsgScale, clampReadingWidth, createCredentials, createDeviceSettings, createSettingsSync } from "../core/settings/index.ts";
 export { createWebPorts } from "../platform/web/index.ts";
 export {
   answersEnter,
@@ -184,165 +94,13 @@ export {
   watchBoxInsertions as watchInsertions,
   wireNewlineKey,
 } from "../view/composer/index.ts";
-export {
-  HTTP_ADDRESS,
-  createSerialQueue,
-  deepLinkRefFrom,
-  linkKind,
-  linksIn,
-  messageLinkRef,
-  sentenceStart,
-} from "../foundation/index.ts";
+export { HTTP_ADDRESS, createSerialQueue, deepLinkRefFrom, linkKind, linksIn, messageLinkRef, sentenceStart } from "../foundation/index.ts";
 
-export {
-  briefAge,
-  dayClock,
-  dayKeyOf,
-  dayRangeWords,
-  editedTitle,
-  fullLocalAt,
-  fullLocalTime,
-  messageDate,
-  shortLocalTime,
-  stamp,
-} from "../present/time/index.ts";
-export {
-  CUT_OFF_MARK,
-  agentDraft,
-  answerWords,
-  askedAboutSending,
-  classifySpokenAnswer,
-  closeReason,
-  couldBeSpokenYes,
-  isExactReadBack,
-  isSpokenYesAcknowledgement,
-  mayBeYes,
-  mergeHypothesis,
-  namesWhereToSend,
-  outcomeNotice,
-  readBackRefusal,
-  shownSpoken,
-  spokenText,
-  unsayableDraft,
-} from "../present/call/index.ts";
-export {
-  SERVER_CACHE_NO_AGE_LIMIT,
-  browserSpeechFailure,
-  doneReadWords,
-  failureWords,
-  fmtDuration,
-  messagesWords,
-  nounCount,
-  reachBackWords,
-  reachClause,
-  readableCause,
-  refusalSentence,
-  refusalWords,
-  searchMomentWords,
-  searchWalkProgress,
-  serverCacheErases,
-  serverCacheLine,
-  serviceEndedSentence,
-  serviceReadWords,
-} from "../present/notices/index.ts";
-export {
-  BLANK_TEXT,
-  cardGapWords,
-  cardMaxLinesWords,
-  cardProxyLines,
-  cardRunText,
-  collapsedLinesWords,
-  combinedContent,
-  countOf,
-  createReadRuns,
-  editedDrawn,
-  firstLineOf,
-  foldedCardText,
-  forgetElisionCounts,
-  gapWords,
-  isNoise,
-  joinsGroup,
-  lineLabel,
-  mainRunsAmong,
-  messageLook,
-  newestThreadHues,
-  proxyLinesOf,
-  quoteBlock,
-  rawTextOf,
-  reactionText,
-  reactionsDrawn,
-  readRunText,
-  renderedHtmlOf,
-  replyMarkerName,
-  rowEdited,
-  rowReactions,
-  spreadThreadHue,
-  threadChoice,
-  threadFacts,
-  undoLabel,
-  undoName,
-} from "../present/rows/index.ts";
-export {
-  DAY_TITLED,
-  EDITED_MARK,
-  RESTATED_CLASS,
-  anchorOfRow,
-  anchorsAmong,
-  authorLabel,
-  cardGapGroups,
-  cardGapTally,
-  cardMarkTarget,
-  cardRootOf,
-  cardRunIds,
-  cardStubText,
-  cardUnits,
-  doneButtonOf,
-  drawLinkPath,
-  fillCardText,
-  findableParts,
-  foldedTextLine,
-  freshenDayTitle,
-  fromGatheredThread,
-  gutterPiece,
-  idsOf,
-  isMessageRow,
-  keepCardUnits,
-  laneOrder,
-  linkAt,
-  linkedRootThread,
-  markCardLayout,
-  messageTop,
-  notNoiseButtonOf,
-  pointerOn,
-  quoteLabelFits,
-  renderedText,
-  rowIn,
-  rowLinkY,
-  rowMessages,
-  rowNewestMs,
-  rowQuotedBy,
-  rowSeen,
-  rowSentMs,
-  rowShown,
-  rowTimeTabStop,
-  setArrowReach,
-  setMarkerLift,
-  shownRowFor,
-  stackUnder,
-  standingRow,
-  textHits,
-  textRunsOf,
-  threadCardId,
-  timeNode,
-} from "../view/channel/index.ts";
-export { HELP_TOPICS } from "../present/settings/index.ts";
-export {
-  mountChannelDirectory,
-  mountChannelHistory,
-  mountHelpFolds,
-  mountSettingsFolds,
-  mountUpstreamClear,
-} from "../view/settings/index.ts";
+export { briefAge, dayClock, dayKeyOf, dayRangeWords, editedTitle, fullLocalAt, fullLocalTime, messageDate, shortLocalTime, stamp } from "../present/time/index.ts";
+
+export { SERVER_CACHE_NO_AGE_LIMIT, doneReadWords, failureWords, fmtDuration, messagesWords, nounCount, reachBackWords, reachClause, readableCause, refusalSentence, refusalWords, searchMomentWords, searchWalkProgress, serverCacheErases, serverCacheLine, serviceReadWords, } from "../present/notices/index.ts";
+export { BLANK_TEXT, cardGapWords, cardMaxLinesWords, cardProxyLines, cardRunText, collapsedLinesWords, combinedContent, countOf, createReadRuns, editedDrawn, firstLineOf, foldedCardText, forgetElisionCounts, gapWords, isNoise, joinsGroup, lineLabel, mainRunsAmong, messageLook, newestThreadHues, proxyLinesOf, quoteBlock, rawTextOf, reactionText, reactionsDrawn, readRunText, renderedHtmlOf, replyMarkerName, rowEdited, rowReactions, spreadThreadHue, threadChoice, threadFacts, undoLabel, undoName } from "../present/rows/index.ts";
+export { DAY_TITLED, EDITED_MARK, RESTATED_CLASS, anchorOfRow, anchorsAmong, authorLabel, cardGapGroups, cardGapTally, cardMarkTarget, cardRunIds, cardStubText, cardUnits, doneButtonOf, drawLinkPath, fillCardText, findableParts, foldedTextLine, freshenDayTitle, fromGatheredThread, gutterPiece, idsOf, isMessageRow, keepCardUnits, laneOrder, linkAt, linkedRootThread, markCardLayout, messageTop, notNoiseButtonOf, pointerOn, quoteLabelFits, renderedText, rowIn, rowLinkY, rowMessages, rowNewestMs, rowQuotedBy, rowSentMs, rowShown, rowTimeTabStop, setArrowReach, setMarkerLift, shownRowFor, stackUnder, standingRow, textHits, textRunsOf, threadCardId, timeNode } from "../view/channel/index.ts";
 
 import { decode, decodeTagged, is, roots } from "../contract/index.ts";
 
@@ -352,3 +110,8 @@ import { decode, decodeTagged, is, roots } from "../contract/index.ts";
  * The prelude's constant of this name is what voice.js reads; web/contract.d.ts types it.
  */
 export const VibeTalkContract = Object.freeze({ roots, is, decode, decodeTagged });
+
+export { createVoiceCall, createVoiceTranscript, createReadAloud } from "../view/voice/index.ts";
+
+export { HELP_TOPICS } from "../present/settings/index.ts";
+export { mountChannelDirectory, mountChannelHistory, mountHelpFolds, mountSettingsFolds, mountUpstreamClear } from "../view/settings/index.ts";

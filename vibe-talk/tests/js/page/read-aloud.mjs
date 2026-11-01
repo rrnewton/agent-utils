@@ -2088,8 +2088,7 @@ test("THE PAGE CUTS A BLOCK INTO THE PIECES THE SERVER READS IT IN, case by case
 });
 
 test("`read-chunk-balance`: no block of the timeline takes most of its width, and a block's pieces stand together", () => {
-  const page = newPage();
-  const weights = (chars) => JSON.parse(JSON.stringify(page.pure("readTimelineWeights")(chars)));
+  const weights = (chars) => SPEECH_PIECES.readTimelineWeights(chars);
   // The owner's read as it was: 53 words and 8, 325px and 45px of the line. By the square root it is
   // under three to one; and one block among many short ones is held to twice the mean.
   const [long, short] = weights([330, 45]);
@@ -2275,8 +2274,9 @@ test("`#290 speech-ticket-refresh`: a prepared URL is played until the last mill
   assert.match(at.url, new RegExp(`^/api/v1/speech/ticket-for-${ID}-again\\?selection=tap-`), `the URL whose ticket had ended was played: ${at.url}`);
   assert.equal(at.spoke, 0, "a refresh that worked fell back to the slower route");
   // The control: the deadline counted from the answer. Five seconds later than the ticket's, the dead URL is played.
-  const fromAnswer = await tap(brokenScript("    const until = { mono: requestedAt.mono + lifetimeMs, wall: requestedAt.wall + lifetimeMs };",
-    "    const answeredAt = speechDeadlineNow();\n    const until = { mono: answeredAt.mono + lifetimeMs, wall: answeredAt.wall + lifetimeMs };"), true);
+  const fromAnswer = await tap(await brokenModule([{ file: "src/view/voice/read-aloud.ts",
+    find: "    const until = { mono: requestedAt.mono + lifetimeMs, wall: requestedAt.wall + lifetimeMs };",
+    replace: "    const answeredAt = speechDeadlineNow();\n    const until = { mono: answeredAt.mono + lifetimeMs, wall: answeredAt.wall + lifetimeMs };" }]), true);
   assert.match(fromAnswer.url, new RegExp(`ticket-for-${ID}\\?selection=`),
     "the negative control, counting from the answer, did not play the dead URL, so the check above proves nothing");
 });

@@ -471,7 +471,7 @@ def main() -> int:
                 page.click("#view-switch")
                 page.wait_for_selector(f'#discord-log > li[data-id="{last}"]', timeout=10_000)
                 page.click("#read-aloud")
-                page.wait_for_function(f"() => preparedSpeech.size() === {len(MESSAGES)}", timeout=10_000)
+                page.wait_for_function(f"() => readAloudOwner().preparedSpeech.size() === {len(MESSAGES)}", timeout=10_000)
                 return context, page
 
             def tap(page: Page, message_id: str) -> None:
@@ -513,7 +513,7 @@ def main() -> int:
                 check(abs(first_speech_ms - first_ms) <= ONSET_TOLERANCE_MS,
                       f"A's speech was reported {first_speech_ms} ms after the tap and its first"
                       f" frame {first_ms} ms, though the tone starts at the first sample: {first}")
-                running = page.evaluate("() => readAloudContext && readAloudContext.state")
+                running = page.evaluate("() => readAloudOwner().readAloudContext && readAloudOwner().readAloudContext.state")
                 check(running == "running", f"the read-aloud audio context is {running!r}, not running")
                 shot("1-a-audible")
 
@@ -578,17 +578,17 @@ def main() -> int:
                 tap(page, "301")
                 reopened = wait_for(lambda: api.reads_of("301")[earlier:], 10,
                                     "the tap after a read that could not be played opened no read")[-1]
-                wait_for(lambda: page.evaluate("() => readAloudContext.state") == "running"
+                wait_for(lambda: page.evaluate("() => readAloudOwner().readAloudContext.state") == "running"
                          and page.text_content("#read-aloud-label") == "Pause", 10, "the read did not start playing")
                 page.click("#read-aloud")
-                wait_for(lambda: page.evaluate("() => readAloudContext.state") == "suspended", 2,
+                wait_for(lambda: page.evaluate("() => readAloudOwner().readAloudContext.state") == "suspended", 2,
                          "the Read button's Pause did not stop the audio clock")
                 check(page.text_content("#read-aloud-label") == "Resume",
                       f"a held read's button does not say Resume: {page.text_content('#read-aloud-label')!r}")
                 time.sleep(0.3)
                 check(reopened.closed is None, "pausing closed the response: the hold cut the read off")
                 page.click("#read-aloud")
-                wait_for(lambda: page.evaluate("() => readAloudContext.state") == "running", 2,
+                wait_for(lambda: page.evaluate("() => readAloudOwner().readAloudContext.state") == "running", 2,
                          "the Read button's Resume did not start the audio clock again")
                 left = time.monotonic()
                 tap(page, "301")
@@ -603,7 +603,7 @@ def main() -> int:
                 # 6. A read that opens with silence: the first frame is audible at once, speech
                 # only after the silence, and the page reports both. `#191 read-aloud-first-lag`.
                 page.click("#read-aloud")
-                page.wait_for_function("() => preparedSpeech.has('305')", timeout=10_000)
+                page.wait_for_function("() => readAloudOwner().preparedSpeech.has('305')", timeout=10_000)
                 tap(page, "305")
                 quiet_start = timing_of("ticket-305")
                 quiet_audible_ms = audible_ms(quiet_start)

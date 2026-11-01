@@ -15,7 +15,7 @@ import { BOTTOM_SLACK_PX, CHANNEL, CHARS_PER_LINE, CSS_CODE, CSS_UNCONDITIONAL, 
   markupPlace, message, newPage, outgoingRetry, outgoingRows, pagedChannel, parkMidway, passTime,
   press, pullDown, reReadChannel, readerOn, relayed, reopenedChannel, replyButton, replyInStream,
   rowWithId, savedOutgoing, scrollToGap, sentWithoutKey, setReadNew, settingsGroup, showDiscord,
-  shownIds, sideAtFoot, signIn, sourceConstant, speakRelay, sseMessage, sseUpdate, startTalking,
+  shownIds, sideAtFoot, signIn, sourceCalls, sourceConstant, speakRelay, sseMessage, sseUpdate, startTalking,
   tallChannel, test, threadPage, touchAt, upstreamReadButton, withLiveChannel, youSay } from "./fixture.mjs";
 
 test("a turn arriving FOLLOWS the newest line for a reader already at the bottom", async () => {
@@ -222,7 +222,7 @@ test("ONE COLLAPSING IDIOM: the transcript and the channel fold a long message i
   // row builder: a turn, a channel message, and (`#270 voice-transcript-markers`) a frozen send card,
   // which is a row of the transcript like any turn.
   assert.match(SCRIPT_CODE, /function foldable\(/, "the folding idiom is not a shared function");
-  const calls = (SCRIPT_CODE.match(/foldable\(/g) || []).length - 1;
+  const calls = sourceCalls("foldable");
   assert.equal(calls, 3, `foldable() is called from ${calls} places; each row builder needs it once`);
 });
 

@@ -31,3 +31,9 @@ export {
   unsayableDraft,
   yesPrefix,
 } from "./answers.ts";
+
+export { CLOUD_CAUSES, CLOUD_NO_AUDIO, CLOUD_SILENT, READ_NO_SPEECH_MS, cloudFailureText } from "./read-notices.ts";
+
+export { postKey, sentWhere, sentNotes, proposalFate, restoredSpeaker, oldestFirst } from "./records.ts";
+
+export { relayTask, relayTurn, relayCount } from "./relay.ts";

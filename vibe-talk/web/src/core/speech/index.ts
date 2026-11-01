@@ -18,3 +18,8 @@ export {
 } from "./audio.ts";
 export { SPEECH_HOLD_CAP_MS_DEFAULT, SPEECH_HOLD_DBFS_DEFAULT, bufferDbfs, speechHoldFrom } from "./hold.ts";
 export type { SpeechHold } from "./hold.ts";
+
+export { readClock, readSectionStarts, readTimelineWeights, silentBefore } from "./read-steering.ts";
+
+export { outputRateFrom } from "./format.ts";
+export { recoveryMayRetry } from "./restored-turns.ts";

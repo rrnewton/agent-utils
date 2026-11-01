@@ -5828,7 +5828,7 @@ test("`#277 reply-in-column` with `#269 approval-card-inline`: a reply open at t
 
   // THE CONTROL: the card not told when a reply opens in a column. The walk above sees it.
   const control = await draftInTwoColumns(brokenScript(
-    '  for (const id of ["channel-composer", "side-composer"]) leftEl(id).hidden = true;\n  renderReplyingMarks();\n  markCardBesideReply();\n',
+    '  for (const id of ["channel-composer", "side-composer"]) leftEl(id).hidden = true;\n  renderReplyingMarks();\n  voiceTranscript().markCardBesideReply();\n',
     '  for (const id of ["channel-composer", "side-composer"]) leftEl(id).hidden = true;\n  renderReplyingMarks();\n'));
   await replyButton(rowWithId(control, "200")).click();
   await control.settle();
@@ -5863,10 +5863,9 @@ test("`#277 reply-in-column` with `#269 approval-card-inline` and `#467 inline-s
 // thread's landing, which ends within the slack of the foot on purpose.
 
 /** The card's follow asking only whether the reader is at the foot. */
-const cardFollowsFootOnly = () => brokenScript(
-  '  return currentView === "discord" ? liveFollowers().main : atBottom(leftEl("scroll-area"));',
-  '  return atBottom(leftEl("scroll-area"));'
-);
+const cardFollowsFootOnly = () => brokenModule([{ file: "src/view/voice/transcript.ts",
+  find: '  return deps.currentView === "discord" ? deps.liveFollowers().main : deps.atBottom(deps.leftEl("scroll-area"));',
+  replace: '  return deps.atBottom(deps.leftEl("scroll-area"));' }]);
 
 test("`#269 approval-card-inline` x `#280 scroll-stability`: a draft arriving under a message a filter change holds at the newest line leaves it there, and held", async () => {
   const run = async (script) => {
@@ -5897,7 +5896,7 @@ test("`#269 approval-card-inline` x `#280 scroll-stability`: a draft arriving un
   keptAt(page, "40", y, "a read after the draft arrived");
 
   // THE CONTROL: the card followed by the foot alone lets the held message go, and the read moves it.
-  const control = await run(cardFollowsFootOnly());
+  const control = await run(await cardFollowsFootOnly());
   const before = yOf(control, "40");
   control.propose(proposal());
   await control.settle();
@@ -5941,7 +5940,7 @@ test("`#269 approval-card-inline` x `#280 scroll-stability`: a draft arriving un
   assert.equal(real.kept, true, "the draft arriving took the landed message up under the floating line");
   assert.equal(real.offered, true, "nothing says a draft waits below");
   // THE CONTROL: followed by the foot alone, the card undoes the landing.
-  const control = await run(cardFollowsFootOnly());
+  const control = await run(await cardFollowsFootOnly());
   assert.deepStrictEqual(control, { ...real, kept: false, offered: control.offered });
 });
 
@@ -6070,17 +6069,15 @@ test("`#269 approval-card-inline` x `#281 view-keys`: CMD-3 AND CMD-4 WHILE A SE
 
   // THE CONTROLS. The card placed as before the thread list: it stays at the foot of Main, behind the
   // cards, where nobody can see it.
-  const behind = await run(brokenScript(
-    "  if (screen === \"main\" && !(threadListShown && currentView === \"discord\")) {",
-    "  if (screen === \"main\") {"));
+  const behind = await run(await brokenModule([{ file: "src/view/voice/transcript.ts", find: "  if (screen === \"main\" && !(deps.threadListShown && deps.currentView === \"discord\")) {", replace: "  if (screen === \"main\") {" }]));
   assert.equal(behind.docked, false, "the control docked the card too, so this test cannot see it left behind");
   // Docked only once the cards have been opened: they open at the foot the card then covers. (The
   // dock-growth keeper takes them the rest of the way once the browser reports the sizes.)
   const late = SCRIPT.replace(
-    "  placePostCard();\n  leftColumnToMain();\n  if (from === \"two\"",
+    "  voiceTranscript().placePostCard();\n  leftColumnToMain();\n  if (from === \"two\"",
     "  leftColumnToMain();\n  if (from === \"two\"").replace(
     "  renderSearchInAll();\n  refreshSearchCount();\n}\n\n/**\n * Out of the thread list",
-    "  renderSearchInAll();\n  refreshSearchCount();\n  placePostCard();\n}\n\n/**\n * Out of the thread list");
+    "  renderSearchInAll();\n  refreshSearchCount();\n  voiceTranscript().placePostCard();\n}\n\n/**\n * Out of the thread list");
   assert.notEqual(late, SCRIPT, "the late-docking control changed nothing");
   const dockedLate = await run(late);
   assert.deepStrictEqual({ listFoot: dockedLate.listFoot, againDocked: dockedLate.againDocked },
@@ -6155,7 +6152,7 @@ test("`#269 approval-card-inline` x `#281 view-keys`: a draft arriving under the
   });
 
   // THE CONTROLS. The cards not kept as the card comes: off their foot until the browser reports the size.
-  const late = await run(brokenScript("  if (cardsFoot) keepCardsAtFoot();\n", ""));
+  const late = await run(await brokenModule([{ file: "src/view/voice/transcript.ts", find: "  if (cardsFoot) keepCardsAtFoot();\n", replace: "" }]));
   assert.deepStrictEqual(late, { ...real, footAtOnce: false });
   // The keepers told of the dock alone: the card growing leaves both readers above their foot.
   assert.ok(GROWTH > BOTTOM_SLACK_PX, "the premise: the growth is more than the slack");
@@ -6164,8 +6161,7 @@ test("`#269 approval-card-inline` x `#281 view-keys`: a draft arriving under the
     "  return el(\"dock\").offsetHeight || 0;"));
   assert.deepStrictEqual(dockOnly, { ...real, grewFoot: false });
   // The keys given to the box of the list behind the thread list, as on the channel.
-  const behind = await run(brokenScript(
-    "  if (threadListOnScreen()) {\n    focusList(sidePane);\n    return;\n  }\n", ""));
+  const behind = await run(await brokenModule([{ file: "src/view/voice/transcript.ts", find: "  if (deps.threadListOnScreen()) {\n    deps.focusList(deps.sidePane);\n    return;\n  }\n", replace: "" }]));
   assert.deepStrictEqual(behind, { ...real, keysOnCards: false });
 });
 
@@ -6240,9 +6236,11 @@ const BACK_IN_ALL = 'const backInAll = next === "one" &&';
 const NOT_BACK_IN_ALL = "const backInAll = false &&";
 
 /** `script`, already a broken copy, broken in one more place, which it must contain. */
-function brokenFurther(script, find, replace) {
+function brokenFurther(page, find, replace) {
+  const script = typeof page === "string" ? page : page.script;
   assert.ok(script.includes(find), `the negative control patches ${JSON.stringify(find)}, which the copy no longer contains`);
-  return script.replace(find, replace);
+  const changed = script.replace(find, replace);
+  return typeof page === "string" ? changed : { ...page, script: changed };
 }
 
 test("`#269 approval-card-inline` x `#281 view-keys` x `#280 scroll-stability`: LEAVING THE THREAD LIST FOR ALL with a send card up finds a reader who was at All's foot at its foot, Send on screen — by Esc, where the list was chosen from All, and by Cmd-2", async () => {
@@ -6342,13 +6340,13 @@ test("`#269 approval-card-inline` x `#281 view-keys` x `#280 scroll-stability`: 
   // THE CONTROLS. Main's keeper not told the card moved: the card's height going from under Main is taken
   // for the dock growing, and a reader within it of the foot is pulled to the foot behind the cards. The
   // place held from Cmd-3 still puts them back on the way out.
-  const unmoved = brokenScript("  if (moving) cardMovedUnderLists(heightUnderLists() - under);\n", "");
+  const unmoved = await brokenModule([{ file: "src/view/voice/transcript.ts", find: "  if (moving) deps.cardMovedUnderLists(deps.heightUnderLists() - under);\n", replace: "" }]);
   assert.deepStrictEqual(await run(unmoved), { ...real, keeperBehind: false });
   // No place held from Cmd-3: a reader the card's going moved is followed down to the foot as one on it.
   const held = "    if (holds && keepReaderPlace(held.place)) return held.place.pinned;\n";
   assert.deepStrictEqual(await run(brokenScript(held, "")), { ...real, movedOne: false, movedEscape: false, movedTwo: false });
   // Neither, as the card's docking first left it: every one of them found at the foot of Main on the way back.
-  assert.deepStrictEqual(await run(unmoved.replace(held, "")), {
+  assert.deepStrictEqual(await run(brokenFurther(unmoved, held, "")), {
     keeperOne: false, keeperEscape: false, keeperTwo: false, keeperBehind: false, movedOne: false, movedEscape: false,
     movedTwo: false, untouched: true,
   });
@@ -6365,7 +6363,7 @@ test("`#269 approval-card-inline` x `#281 view-keys` x `#280 scroll-stability`: 
 /** The parts of a broken copy that put the page back as it was before review's second round. */
 const CAME_UNDER = "  if (coming) cardCameUnderLists(gap);\n";
 const HELD_ALWAYS = '  listHeldPlace = inColumn(columns.main, () => (selection().view === "main" || selection().view === "flat"\n';
-const HELD_WITH_CARD = "  listHeldPlace = inColumn(columns.main, () => (postWatch.shown !== null && " +
+const HELD_WITH_CARD = "  listHeldPlace = inColumn(columns.main, () => (voiceTranscript().postWatch.shown !== null && " +
   'leftEl("post-confirm").getAttribute("data-place") === "channel" && (selection().view === "main" || selection().view === "flat")\n';
 
 test("`#269 approval-card-inline` x `#281 view-keys` x `#280 scroll-stability`: A DRAFT ARRIVING UNDER THE THREAD LIST leaves a Main reader up the list on their row, behind the cards and back by Cmd-1, Esc and Cmd-4, offered the jump — the box at Main's foot shrinking to one line in the same layout not taken for their being at the foot — and keeps one at Main's foot at it", async () => {
@@ -6434,7 +6432,7 @@ test("`#269 approval-card-inline` x `#281 view-keys` x `#280 scroll-stability`: 
   // THE CONTROLS. Main's keeper not told where its reader was before the card came: the box's room going
   // in the same layout leaves the near and up readers within the slack and the growth of the foot, and
   // they are pulled down to it behind the cards. The place held from Cmd-3 still puts them back.
-  const told = brokenScript(CAME_UNDER, "");
+  const told = await brokenModule([{ file: "src/view/voice/transcript.ts", find: "  if (coming) deps.cardCameUnderLists(gap);\n", replace: "" }]);
   assert.deepStrictEqual(await run(told), { ...real, behind: every((name) => name === "foot") });
   // As the page was before: no place held from Cmd-3 without a card either, and on the way back they
   // follow the card down from the foot they were pulled to.
@@ -6689,14 +6687,11 @@ test("`#280 scroll-stability` x `#269 approval-card-inline`: THE BOX TAKING BACK
 
   // THE CONTROLS. The room taken back with nothing holding the reader: the box grows under the one at the
   // foot, who is left its growth above it, past the slack, the jump up. The reader up the list is not moved.
-  const unheld = await run(brokenScript(
-    '      if (postWatch.shown === null) holdingReader(() => main.toggleAttribute("data-draft", false));\n',
-    '      if (postWatch.shown === null) main.toggleAttribute("data-draft", false);\n'));
+  const unheld = await run(await brokenModule([{ file: "src/view/voice/transcript.ts", find: "      if (postWatch.shown === null) deps.holdingReader(() => main.toggleAttribute(\"data-draft\", false));\n", replace: "      if (postWatch.shown === null) main.toggleAttribute(\"data-draft\", false);\n" }]));
   assert.deepStrictEqual(unheld, every((name) => name === "up"));
   // The focus handed to the box with nothing holding the reader: the one at the foot is left the box's
   // opening above it, past the slack, and is no longer on the newest line when the room comes back.
-  const unparked = await run(brokenScript(
-    "  holdingReader(() => target.focus({ preventScroll: true }));\n", "  target.focus({ preventScroll: true });\n"));
+  const unparked = await run(await brokenModule([{ file: "src/view/voice/transcript.ts", find: "  deps.holdingReader(() => target.focus({ preventScroll: true }));\n", replace: "  target.focus({ preventScroll: true });\n" }]));
   assert.deepStrictEqual(unparked, every((name, route) => name === "up" || !route.endsWith("More")));
 });
 
@@ -6957,14 +6952,14 @@ test("`#269 approval-card-inline` x `#280 scroll-stability`: A READER WHO SEES O
   // anchoring leaves each of them as far above the foot as they were, and the room coming back leaves them
   // further. The reader up the list is not moved.
   const SENT_AWAY = "    if (alone) inColumn(columns.main, scrollToNewest);\n";
-  const unplaced = brokenScript(SENT_AWAY, "");
+  const unplaced = await brokenModule([{ file: "src/view/voice/transcript.ts", find: "    if (alone) deps.inColumn(deps.columns.main, deps.scrollToNewest);\n", replace: "" }]);
   assert.deepStrictEqual(await run(unplaced), every((up) => up === "row"));
   // ...which a browser with no anchoring hides: its clamp takes each of them to the foot. The defect is the
   // anchoring's, and the test sees it only with the anchoring laid on.
   assert.deepStrictEqual(await run(unplaced, { anchoring: false }), every(true));
   // Every reader of a list the card ends taken to the newest line as it goes, whatever they could see: the
   // reader up the list is moved off their row.
-  const always = await run(brokenScript("  return box.top <= top + 0.5 && box.bottom > top;\n", "  return true;\n"));
+  const always = await run(await brokenModule([{ file: "src/view/voice/transcript.ts", find: "  return box.top <= top + 0.5 && box.bottom > top;\n", replace: "  return true;\n" }]));
   assert.deepStrictEqual(always, every((up) => up !== "row"));
 });
 
@@ -7051,7 +7046,7 @@ test("`#269 approval-card-inline` x `#280 scroll-stability`: A READER WHO SAW ON
   // the place; in Chromium Main stood up its list there, and point 18 of tests/approval_card_browser.py takes
   // a reader from All that way.
   const unplaced = await run(brokenScript(
-    '  if (typeof place.card === "number" && postWatch.shown === null) {\n', "  if (false) {\n"));
+    '  if (typeof place.card === "number" && voiceTranscript().postWatch.shown === null) {\n', "  if (false) {\n"));
   assert.deepStrictEqual(unplaced, every((view) => view === "All"));
 });
 
@@ -7349,7 +7344,7 @@ test("`#269 approval-card-inline` x `#280 scroll-stability`: BACK FROM SETTINGS,
   assert.deepStrictEqual(await run(SCRIPT, false), every(() => true));
   // The card put back only once the main screen is shown: every reader is moved, at the foot and seeing
   // only the card alike, on every way back.
-  const late = await run(brokenScript('  if (name === "main" && previous !== "main") postCardBackToMain();\n', ""));
+  const late = await run(brokenScript('  if (name === "main" && previous !== "main") voiceTranscript().postCardBackToMain();\n', ""));
   assert.deepStrictEqual(late, every(() => false));
 });
 

@@ -182,7 +182,7 @@ const MODULE_CODE = moduleSources().filter(({ generated }) => !generated).map(({
  */
 function withoutStrings(code) {
   const ts = loadTool("typescript");
-  const file = ts.createSourceFile("scan.js", code, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+  const file = ts.createSourceFile("scan.ts", code, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
   const blank = [];
   const visit = (node) => {
     if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) || node.kind === ts.SyntaxKind.TemplateHead ||
@@ -201,6 +201,21 @@ function withoutStrings(code) {
   return chars.join("");
 }
 const PAGE_CODE = `${SCRIPT_CODE}\n${MODULE_CODE}`;
+
+/** Real call sites across the page: declaration signatures and dependency types are not calls. */
+function sourceCalls(name) {
+  const ts = loadTool("typescript");
+  const source = ts.createSourceFile("page.ts", PAGE_CODE, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  let count = 0;
+  const visit = (node) => {
+    if (ts.isCallExpression(node) &&
+        ((ts.isIdentifier(node.expression) && node.expression.text === name) ||
+         (ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === name))) count += 1;
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  return count;
+}
 
 /**
  * Every id the served page defines, with the label and the initial `hidden` / `checked` state the
@@ -1850,6 +1865,8 @@ const GLYPHS = await moduleForTests("src/foundation/index.ts");
 const SPEECH_PIECES = await moduleForTests("src/core/speech/index.ts");
 /** A call's reconnects and the words its seams and recap say (web/src/core/call). */
 const CALL = await moduleForTests("src/core/call/index.ts");
+/** The portable wording and classifications used by the voice owner. */
+const PRESENT_CALL = await moduleForTests("src/present/call/index.ts");
 /** How the page words and arranges its rows of messages, and its thread cards (web/src/present/rows). */
 const PRESENT_ROWS = await moduleForTests("src/present/rows/index.ts");
 /** How the page words a day, a time and an age (web/src/present/time); `overlays` break it for a negative control. */
@@ -4878,7 +4895,7 @@ const youSay = (page, text) =>
  */
 const sourceConstant = (name) =>
   Number(
-    new RegExp(`^const ${name} = (\\d+);$`, "m").exec(PAGE_CODE)?.[1] ??
+    new RegExp(`^[ \t]*(?:export )?const ${name} = (\\d+);$`, "m").exec(PAGE_CODE)?.[1] ??
       assert.fail(`the page's code (web/voice.js, web/src/) no longer states a ${name}`)
   );
 
@@ -4892,7 +4909,7 @@ const sourceConstant = (name) =>
  * its constant with this says what it does when the constant is missing, and fails on its own.
  */
 const optionalSourceConstant = (name) => {
-  const found = new RegExp(`^const ${name} = (\\d+);$`, "m").exec(PAGE_CODE);
+  const found = new RegExp(`^[ \t]*(?:export )?const ${name} = (\\d+);$`, "m").exec(PAGE_CODE);
   return found ? Number(found[1]) : undefined;
 };
 
@@ -4904,7 +4921,7 @@ const optionalSourceConstant = (name) => {
  * tells a model where the quoted third-party text starts and stops.
  */
 const sourceString = (name) =>
-  new RegExp(`^const ${name} = "([^"]*)";$`, "m").exec(PAGE_CODE)?.[1] ??
+  new RegExp(`^[ \t]*(?:export )?const ${name} = "([^"]*)";$`, "m").exec(PAGE_CODE)?.[1] ??
   assert.fail(`the page's code (web/voice.js, web/src/) no longer states a ${name}`);
 
 const COLLAPSE_OVER_CHARS = sourceConstant("COLLAPSE_OVER_CHARS");
@@ -7104,7 +7121,7 @@ async function pressOn(page, node, kind = "mouse", scroller = "scroll-area") {
 
 /** The list the page is built around, read out of its own source rather than restated here. */
 const CANNED = (() => {
-  const block = /const CANNED_PROMPTS = \[([\s\S]*?)\n\];/.exec(SCRIPT_CODE);
+  const block = /const CANNED_PROMPTS = \[([\s\S]*?)\n\];/.exec(PAGE_CODE);
   assert.ok(block, "web/voice.js no longer declares CANNED_PROMPTS as a list");
   return [...block[1].matchAll(/button:\s*"([^"]+)",\s*\n?\s*field:\s*"([^"]+)"/g)].map((m) => ({
     button: m[1],
@@ -9956,7 +9973,8 @@ export { ACKNOWLEDGED, ALIAS_NOTICE, ALICE, BASE_CSS, BIG, BIG_ROOT, BOTTOM_SLAC
   FIXTURE_TREE, FakeElement, GATHERED, GLYPHS, HELP_SLUGS, HOLD_MS, HOVER_QUERY, HTML, HTML_CODE,
   INBOX, INBOX_NOTICE, LINE_PX, LINK_ATTRS, MESSAGE_CACHE_KEY, MESSAGE_DAY, MESSAGE_SPACING_MS,
   MIC_TOGGLE_IDS, MINTED, MODULE_CODE, NOISE_MATCHING, OTHER_CHANNEL, OWN, OWNER, OWNERS_MESSAGE,
-  PAGE_CODE, PAGE_ELEMENTS, PAGE_IDS, PAGE_READ_REASONS, PAGE_SCRIPTS, PRELUDE, PRESENT_ROWS, PRESENT_TIME, presentTime,
+  PAGE_CODE, PAGE_ELEMENTS, PAGE_IDS, PAGE_READ_REASONS, PAGE_SCRIPTS, PRELUDE, PRESENT_CALL,
+  PRESENT_ROWS, PRESENT_TIME,
   PULL_ARM_PX, PULL_WAIT_MS, RECORD_EPOCH, REDRAFT_WAIT_MS, RELAY_COALESCE_MS, RELAY_FENCE_OPEN,
   REPLAY_PREAMBLE, REPLY_DOUBLE_TAP_MS, REPLY_JUMP_PAGES, REPO, RETRY_FIRST_MS, RUN_TAIL,
   RUN_THREAD, SANITIZED_TAGS, SCATTERED, SCRIPT, SCRIPT_CODE, SCRIPT_FILE, SCROLLBACK_PX, SCROLLERS,
@@ -9990,7 +10008,7 @@ export { ACKNOWLEDGED, ALIAS_NOTICE, ALICE, BASE_CSS, BIG, BIG_ROOT, BOTTOM_SLAC
   optionalSourceConstant, outgoingActions, outgoingDismiss, outgoingEdit, outgoingRetry,
   outgoingRows, outgoingSpinner, pagedChannel, pagedThreads, pagedTimeline, parityData, parityPage,
   parkMidway, parseSanitizedHtml, passTime, passing, pcm, pickThread, pickerChoices, pinChip,
-  pinItem, pinnedIds, pinnedPlacePage, placeChannel, placeRow, pollOnce, posted, postedWhere, press,
+  pinItem, pinnedIds, pinnedPlacePage, placeChannel, placeRow, pollOnce, presentTime, posted, postedWhere, press,
   pressCopy, pressHere, pressOn, promptsSent, proposal, proposedDuringACall, providerDown, pullDown,
   putBackOf, questionFarAbove, quotePage, reReadChannel, reactionStripOf, readAloudMessages,
   readBackDuringACall, readButton, readChannel, readKinds, readModeSaid, readModeTo, readRunLineOf,
@@ -10007,7 +10025,7 @@ export { ACKNOWLEDGED, ALIAS_NOTICE, ALICE, BASE_CSS, BIG, BIG_ROOT, BOTTOM_SLAC
   serviceOf, servicesPage, session_lines, setReadNew, settingsChannel, settingsFoldState,
   settingsGroup, settingsHeading, settingsHeadings, settingsOptions, settingsSection,
   settleRedraftWait, settleSend, settleSpokenYes, showDiscord, showLinks, showPinned, shownIds,
-  sideAtFoot, sideIds, sideRow, signIn, sourceConstant, sourceString, sourceStringTable, speakRelay,
+  sideAtFoot, sideIds, sideRow, signIn, sourceCalls, sourceConstant, sourceString, sourceStringTable, speakRelay,
   speech, splitPost, spokenDraft, sseDelete, sseMessage, sseUpdate, stackPlaces, startChatting,
   startNeutralCall, startOf, startTalking, startTalkingNamed, startV1Call, state, statusText,
   storedPin, storedTexts, summaryText, tagOf, tagged, takesASide, tallChannel, tallColumns,

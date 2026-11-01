@@ -700,7 +700,7 @@ def main() -> int:
                 page.wait_for_selector(f'#discord-log > li[data-id="{SHORT}"]', timeout=10_000)
                 page.click("#read-aloud")
                 page.wait_for_function(
-                    f"() => preparedSpeech.has('{LONG}') && preparedSpeech.get('{LONG}').blocks", timeout=10_000)
+                    f"() => readAloudOwner().preparedSpeech.has('{LONG}') && readAloudOwner().preparedSpeech.get('{LONG}').blocks", timeout=10_000)
                 return context, page
 
             row = f'#discord-log > li[data-id="{LONG}"]'
@@ -927,11 +927,11 @@ def main() -> int:
                 page.evaluate("() => window.mediaProbe.handlers.previoustrack({action: 'previoustrack'})")
                 wait_position(page, "6 of 7")
                 page.evaluate("() => window.mediaProbe.handlers.pause({action: 'pause'})")
-                wait_for(lambda: page.evaluate("() => readAloudContext.state") == "suspended", 2,
+                wait_for(lambda: page.evaluate("() => readAloudOwner().readAloudContext.state") == "suspended", 2,
                          "pause did not stop the audio clock")
-                paused_at = page.evaluate("() => readAloudContext.currentTime")
+                paused_at = page.evaluate("() => readAloudOwner().readAloudContext.currentTime")
                 time.sleep(0.4)
-                check(page.evaluate("() => readAloudContext.currentTime") == paused_at,
+                check(page.evaluate("() => readAloudOwner().readAloudContext.currentTime") == paused_at,
                       "the audio clock ran on while paused")
                 check(position(page) == "6 of 7", f"pausing moved the read to {position(page)}")
                 # `#434 read-aloud-pause`: the one state, said by every control. The media pause
@@ -940,17 +940,17 @@ def main() -> int:
                       f"a media pause left the Read button saying {page.text_content('#read-aloud-label')!r}")
                 shot("5b-paused")
                 press(page, "#read-aloud", True)
-                wait_for(lambda: page.evaluate("() => readAloudContext.state") == "running", 2,
+                wait_for(lambda: page.evaluate("() => readAloudOwner().readAloudContext.state") == "running", 2,
                          "the Read button did not resume a media pause")
                 check(position(page) == "6 of 7", f"resuming moved the read to {position(page)}")
                 # And the Read button holds and resumes the same read, from the same block.
                 press(page, "#read-aloud", True)
-                wait_for(lambda: page.evaluate("() => readAloudContext.state") == "suspended", 2,
+                wait_for(lambda: page.evaluate("() => readAloudOwner().readAloudContext.state") == "suspended", 2,
                          "the Read button's Pause did not stop the audio clock")
                 check(page.text_content("#read-aloud-label") == "Resume",
                       "the Read button's pause left it saying Pause")
                 press(page, "#read-aloud", True)
-                wait_for(lambda: page.evaluate("() => readAloudContext.state") == "running", 2,
+                wait_for(lambda: page.evaluate("() => readAloudOwner().readAloudContext.state") == "running", 2,
                          "the Read button's Resume did not start the audio clock again")
                 page.evaluate("() => window.mediaProbe.handlers.play({action: 'play'})")
                 states: object = page.evaluate("() => window.mediaProbe.states")
@@ -1074,7 +1074,7 @@ def main() -> int:
                 press(page, "#read-section-prev", True)
                 wait_position(page, "2 of 7")
                 press(page, "#read-aloud", True)
-                wait_for(lambda: page.evaluate("() => readAloudContext.state") == "suspended", 2,
+                wait_for(lambda: page.evaluate("() => readAloudOwner().readAloudContext.state") == "suspended", 2,
                          "the Read button's Pause did not stop the audio clock at 393x852")
                 check(position(page) == "2 of 7", f"the pause moved the read to {position(page)}")
                 check(page.text_content("#read-aloud-label") == "Resume", "the held read does not offer Resume")
@@ -1089,7 +1089,7 @@ def main() -> int:
                 if args.screenshots:
                     page.screenshot(path=str(args.screenshots / "9-phone-393-paused.png"))
                 press(page, "#read-aloud", True)
-                wait_for(lambda: page.evaluate("() => readAloudContext.state") == "running", 2,
+                wait_for(lambda: page.evaluate("() => readAloudOwner().readAloudContext.state") == "running", 2,
                          "the Read button's Resume did not resume the read at 393x852")
                 check(position(page) == "2 of 7", f"the resume moved the read to {position(page)}")
                 # At the foot of the list the last message scrolls clear of the strip: the room
@@ -1156,7 +1156,7 @@ def main() -> int:
                 check(page.get_attribute("#read-aloud", "aria-pressed") == "false",
                       "the read started with s entered reading mode")
                 press(page, "#read-aloud", False)
-                wait_for(lambda: page.evaluate("() => readAloudContext.state") == "suspended", 2,
+                wait_for(lambda: page.evaluate("() => readAloudOwner().readAloudContext.state") == "suspended", 2,
                          "Read did not hold the read started with s")
                 check(page.text_content("#read-aloud-label") == "Resume",
                       "the held one-off read does not offer Resume")
@@ -1202,14 +1202,14 @@ def main() -> int:
                         press(page, "#read-next", True)
                         wait_position(page, "2 of 7")
                         press(page, "#read-aloud", True)
-                        wait_for(lambda: page.evaluate("() => readAloudContext.state") == "suspended", 2,
+                        wait_for(lambda: page.evaluate("() => readAloudOwner().readAloudContext.state") == "suspended", 2,
                                  f"the Read button's Pause did not hold the read at {where}")
                         time.sleep(0.3)
                         check_phone_layout(page, f"{where} held", "paused")
                         if args.screenshots:
                             page.screenshot(path=str(args.screenshots / f"{shot_name}-paused.png"))
                         press(page, "#read-aloud", True)
-                        wait_for(lambda: page.evaluate("() => readAloudContext.state") == "running", 2,
+                        wait_for(lambda: page.evaluate("() => readAloudOwner().readAloudContext.state") == "running", 2,
                                  f"the Read button's Resume did not resume the read at {where}")
                         check_phone_layout(page, f"{where} resumed", "playing")
                         press(page, "#read-aloud-stop", True)

@@ -7,9 +7,9 @@ import assert from "node:assert/strict";
 
 import { CALL, CAPTURE_RESUME_MS, CHANNEL, CLEAR_ARMED_MS, DEFAULT_POST_PREFIX, HTML, HTML_CODE,
   MINTED, OTHER_CHANNEL, PAGE_CODE, PAGE_ELEMENTS, RECORD_EPOCH, REDRAFT_WAIT_MS, REPLAY_PREAMBLE,
-  SCRIPT, SEAM_DETAIL_MAX_WORDS, SEAM_DETAIL_MIN_WORDS, SETTINGS, SHIPPED_SYSTEM_PROMPT,
+  PRESENT_CALL, SCRIPT, SEAM_DETAIL_MAX_WORDS, SEAM_DETAIL_MIN_WORDS, SETTINGS, SHIPPED_SYSTEM_PROMPT,
   SPOKEN_SETTLE_MS, TRANSCRIPT_PAGE_LIMIT, assistantSays, backFacts, boundaryLines, boundaryWords,
-  brokenScript, compose, cssBlock, cssBlockIn, deliver, fillTranscript, framesOfType, framesSent,
+  brokenModule, brokenScript, compose, cssBlock, cssBlockIn, deliver, fillTranscript, framesOfType, framesSent,
   helpEntry, hosted, hostedAudio, hostedHears, hostedSays, initiationFrame, json, longMessage,
   message, neutralReadBack, newPage, openReplyOn, optionalSourceConstant, promptsSent, proposal,
   proposedDuringACall, readBackDuringACall, recordingCall, relayed, reloadOf, resumeFrame,
@@ -380,7 +380,7 @@ test("`#269 approval-card-inline`: the status line is one line high whatever it 
   assert.doesNotMatch(line, /min-height/, "a minimum lets the status line grow");
   assert.match(cssBlock(".post-confirm-actions"), /flex-wrap:\s*nowrap/, "Send can wrap under Don't send");
   // Every sentence the line shows fits a 360px phone's call pane (measured in Chromium): short.
-  const card = /const POST_CARD_STATUS = \{([\s\S]*?)\n\};/.exec(SCRIPT);
+  const card = /const POST_CARD_STATUS = \{([\s\S]*?)\n\};/.exec(PAGE_CODE);
   assert.ok(card, "the card's status lines are no longer in one place");
   const said = [...card[1].matchAll(/["`]([^"`]+)["`]/g)].map((m) => m[1].replace(/\$\{seconds\}/, "118"));
   assert.ok(said.length >= 5, `found ${said.length} status lines`);
@@ -532,11 +532,10 @@ test("`#270 voice-transcript-markers`: a bug drawing the frozen card never turns
   // The card is drawn inside the commit's `try`, after the server has posted. Were a drawing bug to
   // reach the commit's `catch`, it would say the send posted nothing and tell the agent it was NOT
   // sent. It is thrown on its own instead, and the send memory still draws the card.
-  const drawingBug = () => brokenScript(
-    "function freezeSentCard(proposal, confirmedBy, outcome, answer) {\n",
-    "function freezeSentCard(proposal, confirmedBy, outcome, answer) {\n  throw new Error(\"a drawing bug\");\n",
-  );
-  const tapped = newPage(new Map(), drawingBug());
+  const drawingBug = () => brokenModule([{ file: "src/view/voice/transcript.ts",
+    find: "  const key = postKey(proposal.instance, proposal.serial);\n  const sendSeq = typeof answer.send_seq === \"number\" ? answer.send_seq : null;",
+    replace: "  throw new Error(\"a drawing bug\");\n  const key = postKey(proposal.instance, proposal.serial);\n  const sendSeq = typeof answer.send_seq === \"number\" ? answer.send_seq : null;" }]);
+  const tapped = newPage(new Map(), await drawingBug());
   await recordingCall(tapped);
   tapped.propose(proposal({ reply_to: null }));
   await tapped.settle();
@@ -553,7 +552,7 @@ test("`#270 voice-transcript-markers`: a bug drawing the frozen card never turns
   assert.match(wordsOf(sentCards(tapped)[0]), /approved by tap/);
 
   // A spoken yes: the agent is told the message was SENT.
-  const spoken = newPage(new Map(), drawingBug());
+  const spoken = newPage(new Map(), await drawingBug());
   const socket = await readBackDuringACall(spoken);
   hostedHears(socket, "yes");
   await settleSpokenYes(spoken);
@@ -1283,10 +1282,7 @@ test("`#269 approval-card-inline`: a call that drops keeps its card, tap only, a
 
   // THE CONTROL: the card taken down at every end of a call, as it was before. The drop then loses
   // the draft.
-  const control = newPage(new Map(), brokenScript(
-    "  if (postWatch.controller) postWatch.controller.abort();\n  postWatch.controller = null;\n",
-    "  if (postWatch.controller) postWatch.controller.abort();\n  postWatch.controller = null;\n  showPostProposal(null);\n"
-  ));
+  const control = newPage(new Map(), await brokenModule([{ file: "src/view/voice/transcript.ts", find: "  if (postWatch.controller) postWatch.controller.abort();\n  postWatch.controller = null;\n", replace: "  if (postWatch.controller) postWatch.controller.abort();\n  postWatch.controller = null;\n  showPostProposal(null);\n" }]));
   const socket = await recordingCall(control, "conv_dropped");
   await draftUp(control);
   socket.close();
@@ -1927,7 +1923,7 @@ test("`#264 voice-send-approval`: the box cannot be changed by a read token or o
 });
 
 test("`#264 voice-send-approval`: what counts as yes, as no, and as neither", () => {
-  const classify = newPage().preludeBinding("classifySpokenAnswer");
+  const classify = PRESENT_CALL.classifySpokenAnswer;
   for (const said of [
     "yes", "Yes.", "YES!", "yeah", "yep", "send it", "Send.", "do it", "go ahead", "sure",
     "please do", "yes please", "yes, send it", "send it please", "ok send it", "yeah go ahead",
@@ -2437,8 +2433,8 @@ test("`#264 voice-send-approval`: with echo cancellation off, or in a typed call
 
 test("`#264 voice-send-approval`: the read-back must be exactly 'To {channel}: {text}. Send it?' — a lead-in is allowed, nothing added is", () => {
   const page = newPage();
-  const exact = page.preludeBinding("isExactReadBack");
-  const words = page.preludeBinding("answerWords");
+  const exact = PRESENT_CALL.isExactReadBack;
+  const words = PRESENT_CALL.answerWords;
   const card = { channel_name: "lead team", text: "merge the PR" };
   for (const said of [
     "To lead team: merge the PR. Send it?",
@@ -2489,7 +2485,7 @@ test("`#264 voice-send-approval`: a yes to a different question, after a digress
 
 test("`#264 voice-send-approval`: what makes an answer one about sending", () => {
   const page = newPage();
-  const asked = page.preludeBinding("askedAboutSending");
+  const asked = PRESENT_CALL.askedAboutSending;
   const turns = (...texts) => texts.map((text) => ({ text }));
   for (const [said, answer] of [
     [["To lead team: on it. Send it?"], "yes"],
@@ -2713,7 +2709,7 @@ test("`#264 voice-send-approval`: a draft with a mention is never sent by voice,
 // is exactly what text-to-speech drops, so it could change what is posted while every word matched.
 
 test("`#264 voice-send-approval`: only plain words and sentence punctuation can be confirmed by voice", () => {
-  const unsayable = newPage().preludeBinding("unsayableDraft");
+  const unsayable = PRESENT_CALL.unsayableDraft;
   for (const text of [
     "on it, rebasing now",
     "Don\u2019t merge the PR yet. I'll re-run the tests first!",
@@ -2846,7 +2842,7 @@ test("`#264 voice-send-approval`: on the neutral protocol a yes after a paraphra
 });
 
 test("`#264 voice-send-approval`: the yeses an agent takes that the page does not act on are classified as like a yes", () => {
-  const classify = newPage().preludeBinding("classifySpokenAnswer");
+  const classify = PRESENT_CALL.classifySpokenAnswer;
   for (const said of [
     "sounds good", "Go for it.", "uh-huh", "Mm-hmm.", "mhm", "Perfect!", "alright", "That's right",
     "Affirmative.", "of course", "Ship it", "right", "great", "fine", "yup", "Absolutely.",
@@ -3141,7 +3137,7 @@ test("`#579 voice-send-confirm-timing`: on the bridge, a new request after an ea
   page.expireTimers(CAPTURE_RESUME_MS);
   turnDone(socket, 3);
   // Sent, or still queued for the next boundary: either is the agent being told.
-  const prompts = [...promptsSent(socket), ...page.pure("session.pendingPrompts").map((queued) => queued.text)];
+  const prompts = [...promptsSent(socket), ...page.pure("voiceCall().session.pendingPrompts").map((queued) => queued.text)];
   assert.equal(prompts.filter((text) => /no draft is waiting|NOT sent/.test(text)).length, 0, prompts.join("\n"));
 });
 
@@ -3719,10 +3715,7 @@ test("`#269 approval-card-inline`: a yes the page did not act on — an echo, on
   }
 
   // THE CONTROL: a judged turn the page did not take is left out of sight. It must stay hidden.
-  const control = newPage(new Map(), brokenScript(
-    '  if (hold && hold.state === "tentative" && spokenYes.answered === key) releaseYesHold(hold);',
-    "  void hold;"
-  ));
+  const control = newPage(new Map(), await brokenModule([{ file: "src/view/voice/transcript.ts", find: "  if (hold && hold.state === \"tentative\" && spokenYes.answered === key) releaseYesHold(hold);", replace: "  void hold;" }]));
   const controlSocket = await recordedReadBack(control, "conv_control");
   hosted(controlSocket, { type: "interruption", interruption_event: {} });
   hostedHears(controlSocket, "yes");
@@ -4548,14 +4541,14 @@ test("`#303 voice-post-prefix`: the card shows the tagged text exactly as it wil
 });
 
 test("`#303 voice-post-prefix`: the agent's words are judged for a spoken yes; the owner's tag in front of them is not", () => {
-  const draft = newPage().preludeBinding("agentDraft");
+  const draft = PRESENT_CALL.agentDraft;
   assert.equal(draft({ text: `${DEFAULT_POST_PREFIX}on it`, prefix: DEFAULT_POST_PREFIX }), "on it");
   // Tagging off, or an older server: the whole text is the agent's.
   assert.equal(draft({ text: "(aside) on it" }), "(aside) on it");
   assert.equal(draft({ text: "(aside) on it", prefix: "" }), "(aside) on it");
   // A prefix the text does not start with names nothing.
   assert.equal(draft({ text: "on it", prefix: DEFAULT_POST_PREFIX }), "on it");
-  const unsayable = newPage().preludeBinding("unsayableDraft");
+  const unsayable = PRESENT_CALL.unsayableDraft;
   assert.equal(unsayable(DEFAULT_POST_PREFIX), "symbols", "fixture: the default tag is not plain words");
 });
 

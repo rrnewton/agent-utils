@@ -23,7 +23,7 @@ uncovered and wholly on screen. This lays it out on three phones and measures:
      two short screens, a phone turned sideways (667x375) and one with the keyboard up (375x330).
   4. The box's own Send is not drawn while the box is empty, and once something is typed it looks
      different from the card's. Don't send and Send share one row, and writing each of the card's
-     status lines (`POST_CARD_STATUS`), a spoken yes settling among them, moves neither button and
+     status lines (`voiceTranscript().POST_CARD_STATUS`), a spoken yes settling among them, moves neither button and
      cuts none of them, on the call's view and on the channel.
   5. The card stands exactly where a turn of the owner's does: the same left and right edges as an
      `li.mine` of the transcript, within a pixel.
@@ -770,7 +770,7 @@ def propose(page: Page, api: FakeApi, serial: int, text: str) -> None:
 
 
 # Every status line the card can show, written in turn, and where the buttons are after each. A
-# spoken yes settling is also driven through the page's own `renderPostExpiry`, so the line it
+# spoken yes settling is also driven through the page's own `voiceTranscript().renderPostExpiry`, so the line it
 # writes is the one measured.
 STATUS_JS = """() => {
   const line = document.getElementById('post-confirm-expiry');
@@ -780,15 +780,15 @@ STATUS_JS = """() => {
     cut: line.scrollWidth > line.clientWidth + 1,
     cancel: cancel.getBoundingClientRect().top, send: send.getBoundingClientRect().top });
   const out = [];
-  for (const value of Object.values(POST_CARD_STATUS)) {
+  for (const value of Object.values(voiceTranscript().POST_CARD_STATUS)) {
     line.textContent = typeof value === 'function' ? value(118) : value;
     out.push(read(line.textContent));
   }
-  spokenYes.settling = { handle: postWatch.shown.handle, proposal: postWatch.shown, timer: null };
-  renderPostExpiry();
+  voiceTranscript().spokenYes.settling = { handle: voiceTranscript().postWatch.shown.handle, proposal: voiceTranscript().postWatch.shown, timer: null };
+  voiceTranscript().renderPostExpiry();
   out.push(read(line.textContent));
-  spokenYes.settling = null;
-  renderPostExpiry();
+  voiceTranscript().spokenYes.settling = null;
+  voiceTranscript().renderPostExpiry();
   out.push(read(line.textContent));
   return out;
 }"""
@@ -2671,7 +2671,7 @@ def help_key_trip_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, siz
                              "channel_id": CHANNEL["id"], "channel_name": "lead team",
                              "text": POST_PREFIX + SHORT_DRAFT, "prefix": POST_PREFIX, "reply_to": None,
                              "expires_in_ms": 120_000})
-                page.wait_for_function(f"() => postWatch.shown !== null && postWatch.shown.serial === {serial}",
+                page.wait_for_function(f"() => voiceTranscript().postWatch.shown !== null && voiceTranscript().postWatch.shown.serial === {serial}",
                                        timeout=10_000)
             page.wait_for_timeout(300)
             if back == "esc":

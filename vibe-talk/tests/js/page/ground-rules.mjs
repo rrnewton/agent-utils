@@ -65,7 +65,7 @@ test("every number this page is tuned by stays inside a band that says what woul
 test("...and the table covers EVERY constant, so a new one cannot escape by being new", () => {
   // This is the part that generalises. Pinning the constants that happened to be noticed leaves
   // the next one unpinned, and the next one is exactly where the same defect comes back.
-  const declared = [...PAGE_CODE.matchAll(/^const ([A-Z][A-Z0-9_]*) = (\d+);$/gm)].map(
+  const declared = [...PAGE_CODE.matchAll(/^[ \t]*(?:export )?const ([A-Z][A-Z0-9_]*) = (\d+);$/gm)].map(
     (m) => m[1]
   );
   assert.ok(declared.length >= 13, `only ${declared.length} constants found — the scan is broken`);
@@ -108,9 +108,8 @@ test("`#624 voice-page-modularity`: no top-level name of the legacy script or it
   }
   assert.ok(names.size > 1000 && DOM_GLOBALS.size > 500 && DOM_GLOBALS.has("navigation") && names.has("selectedChannelId"),
     "the scan found too few names to mean anything");
-  // `stop` (the call's teardown) has hidden `window.stop` for as long as the page has had calls, and
-  // nothing in the page means the browser's; it is the one name allowed, and only it.
-  const KNOWN = new Set(["stop"]);
+  // The call's `stop` now belongs to its owner and no longer hides window.stop.
+  const KNOWN = new Set();
   const hiding = [...names].filter((name) => DOM_GLOBALS.has(name) && !KNOWN.has(name));
   assert.deepStrictEqual(hiding, [], `these page names hide the browser's globals of the same name: ${hiding.join(", ")}`);
   for (const name of KNOWN) assert.ok(names.has(name), `${name} no longer needs its exception: take it off the list`);
@@ -138,9 +137,9 @@ test("`#624 voice-page-modularity`: the bar's picker shows the selection, and a 
 test("`#624 voice-page-modularity`: page.pure reaches only what is still the legacy script's own, and the prelude's names only as its bindings", () => {
   const page = newPage();
   assert.equal(page.pure("selectedChannelId()"), "", "a binding of the legacy script's own was refused");
-  assert.throws(() => page.pure("readPieces"), /reaches readPieces, which the page takes from web\/src/);
+  assert.throws(() => page.pure("searchQueryParse"), /reaches searchQueryParse, which the page takes from web\/src/);
   assert.throws(() => page.pure('JSON.stringify(messageLinkRef("slack:C1:2"))'), /reaches messageLinkRef/);
-  assert.equal(typeof page.preludeBinding("readPieces"), "function");
+  assert.equal(typeof page.preludeBinding("searchQueryParse"), "function");
   assert.throws(() => page.preludeBinding("selectedChannelId"), /not a name the page takes from its modules/);
 });
 

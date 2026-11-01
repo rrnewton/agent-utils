@@ -11,7 +11,7 @@ import { WEB } from "../../../web/page_sources.mjs";
 
 import { CANNED, CAPTURE_RESUME_MS, CHANNEL, CHARS_PER_LINE, COLLAPSE_OVER_CHARS, CSS, HTML,
   HTML_CODE, MIC_TOGGLE_IDS, MINTED, OTHER_CHANNEL, PAGE_CODE, PAGE_ELEMENTS, PAGE_IDS,
-  RECORD_EPOCH, RELAY_COALESCE_MS, RELAY_FENCE_OPEN, REPLAY_PREAMBLE, SCRIPT, SCRIPT_CODE,
+  RECORD_EPOCH, RELAY_COALESCE_MS, RELAY_FENCE_OPEN, REPLAY_PREAMBLE, SCRIPT,
   SEAM_DETAIL_MAX_WORDS, SEAM_DETAIL_MIN_WORDS, SHORT_MESSAGE, SPEECH, THREADS_MAIN_STORAGE,
   TRANSCRIPT_PAGE_LIMIT, TUNING_BANDS, assertMarkupContains, assistantSays, atBottomOf, backlog,
   barSlice, boundaryLines, boundaryWords, brokenModule, brokenScript, brokenScriptEach, compose,
@@ -22,7 +22,7 @@ import { CANNED, CAPTURE_RESUME_MS, CHANNEL, CHARS_PER_LINE, COLLAPSE_OVER_CHARS
   readBackDuringACall, recordingCall, relayed, reloadOf, replacedV1Call, resumeFrame, rowWithId,
   ruledRows, said, seamChip, seamDetail, seamLabel, seamRecapDetail, secondOfSpeech, sentCards,
   session_lines, setReadNew, settingsGroup, settleRedraftWait, settleSpokenYes, showDiscord,
-  shownIds, signIn, sourceConstant, sourceStringTable, speakRelay, speech, spokenDraft, sseMessage,
+  shownIds, signIn, sourceCalls, sourceConstant, sourceStringTable, speakRelay, speech, spokenDraft, sseMessage,
   startChatting, startNeutralCall, startTalking, startTalkingNamed, startV1Call, state, storedTexts,
   tapPin, test, threadBadge, turnDone, typedFrames, v1Minted, vendorAccepts, watchTurns,
   withEarlierConversation, words, youSay } from "./fixture.mjs";
@@ -545,9 +545,8 @@ test("EVERY seam is the same size, so the essay cannot come back through the oth
   // The invariant that survives that split: `seam()` is called by the two PLACERS and by nothing
   // else, `transcriptSeam()` is called exactly as many times as this test measures, and the
   // channel's placer is measured by "the channel says what it is showing INLINE" with the same
-  // word band. (Each name also appears once as its own definition.)
-  const drawn = (name) =>
-    (SCRIPT_CODE.match(new RegExp(`\\b${name}\\(`, "g")) || []).length - 1;
+  // word band. Declarations and dependency interfaces are not invocation sites.
+  const drawn = sourceCalls;
   assert.equal(
     drawn("seam"),
     2,
@@ -777,7 +776,7 @@ test("A CALL DROPPED IN THE BACKGROUND IS PAUSED, NOT FAILED", async () => {
   // errors at all, which is a strictly worse page than the one being fixed.
   const control = newPage(
     new Map(),
-    brokenScript("    hiddenDuringCall &&", "    false &&")
+    await brokenModule([{ file: "src/view/voice/call.ts", find: "    hiddenDuringCall &&", replace: "    false &&" }])
   );
   await startTalking(control);
   await suspendAndReturn(control);
@@ -812,7 +811,7 @@ test("a close that arrives on the way BACK is still the suspension; one long aft
   // The grace window is the whole heuristic, and it exists because iOS commonly delivers the close
   // when the page returns rather than while it is hidden. Both edges are asserted, because a
   // window wide enough to catch the first case must not be wide enough to excuse the second.
-  const grace = Number(/SUSPENSION_GRACE_MS = (\d+)/.exec(SCRIPT_CODE)[1]);
+  const grace = sourceConstant("SUSPENSION_GRACE_MS");
   // The two checks below are written against whatever the page says the window is, which makes
   // them silent about the window itself: widening it to ten minutes moves both boundaries with it
   // and they stay green. So the VALUE is pinned too. A band, not a number — the exact figure is a
@@ -1456,7 +1455,7 @@ test("`#619 voice-bluetooth-output`: output choice applies by setSinkId where su
   await chosen.pure("applyCallOutput")(context);
   assert.deepStrictEqual(sinks, ["desk"]);
   page.enableStreamedAudio();
-  assert.equal(typeof page.pure("readAloudAudioContext")().setSinkId, "undefined",
+  assert.equal(typeof page.pure("readAloudOwner().readAloudAudioContext")().setSinkId, "undefined",
     "read-aloud gained a sink: it must keep the music route");
 });
 
@@ -1656,7 +1655,7 @@ test("SILENCING THE AGENT DOES NOT RENEGOTIATE THE CONVERSATION", async () => {
   // And the reason is on the record, in the page's own source, where the next person to "tidy"
   // this will read it.
   assert.match(
-    SCRIPT,
+    readFileSync(join(WEB, "src/view/voice/call.ts"), "utf8"),
     /THIS PAGE KEEPS RECEIVING THE AGENT'S AUDIO AND THROWS IT AWAY/,
     "the decision the issue asks for is not written down beside the control that made it"
   );
@@ -1949,7 +1948,7 @@ test("`#431 voice-transcript-expand`: a tap on a long turn's card opens it, and 
   assert.ok(turnBody(li).hasClass("clamped"), "closed, but the text is not clamped");
 
   // The page before the fix: the card had no tap at all.
-  const control = await run(brokenScript("  if (fold) tapRow(li, fold, foldOnTap);\n  // Who said it", "  // Who said it"));
+  const control = await run(await brokenModule([{ file: "src/view/voice/transcript.ts", find: "  if (fold) deps.tapRow(li, fold, deps.foldOnTap);\n  // Who said it", replace: "  // Who said it" }]));
   assert.equal(control.opened, "true", "with the card's tap removed it still opened, so this test cannot see the tap");
 });
 
@@ -2008,7 +2007,7 @@ test("`#431 voice-transcript-expand`: a streamed reply that grows past the fold 
   assert.equal(li.getAttribute("data-collapsed"), "false");
   assert.ok(!turnBody(li).hasClass("clamped"), "the reply's end is clamped away");
 
-  const control = await run(brokenScript("    const onFold = keepTurnFold(entry.li, li);\n", "    const onFold = false;\n"));
+  const control = await run(await brokenModule([{ file: "src/view/voice/call.ts", find: "    const onFold = keepTurnFold(entry.li, li);\n", replace: "    const onFold = false;\n" }]));
   assert.ok(
     control.seen.some((frame) => frame.collapsed === "true"),
     "with the fold not carried across frames the reply still never folded, so this test cannot see it"
@@ -2051,7 +2050,7 @@ test("`#431 voice-transcript-expand`: a fold the reader set holds while the repl
   assert.ok(atBottomOf(area), "the view stopped following the newest line of the reply");
 
   // The control carries no open fold: the last state is the one the reader opened, and it must be lost.
-  const control = await run(brokenScript("  if (!before || !isFolded(before)) setFolded(entry, false);", "  if (!before) setFolded(entry, false);"));
+  const control = await run(await brokenModule([{ file: "src/view/voice/call.ts", find: "  if (!before || !deps.isFolded(before)) deps.setFolded(entry, false);", replace: "  if (!before) deps.setFolded(entry, false);" }]));
   assert.equal(control.states[2], "true", "with the reader's open fold not carried it still held, so this proves nothing");
 });
 
@@ -2117,7 +2116,7 @@ test("`#431 voice-transcript-expand`: a long frozen send card opens on a tap, an
   assert.ok(replaced, "the server's copy did not replace the card, so nothing here is tested");
   assert.equal(after, "false", "the card the reader opened folded again when the server's copy replaced it");
 
-  const control = await run(brokenScript("  const onFold = keepTurnFold(li, fresh);\n", "  const onFold = false;\n"));
+  const control = await run(await brokenModule([{ file: "src/view/voice/transcript.ts", find: "  const onFold = deps.keepTurnFold(li, fresh);\n", replace: "  const onFold = false;\n" }]));
   assert.equal(control.after, "true", "with the fold not carried the card still stayed open, so this proves nothing");
 });
 
@@ -3622,7 +3621,7 @@ test("THE CANNED BUTTONS ARE A LIST, SO A THIRD ONE IS AN ENTRY AND NOT A CODE P
   // is the special case this test exists to prevent.
   for (const entry of CANNED) {
     assert.equal(
-      SCRIPT_CODE.split(`"${entry.button}"`).length - 1,
+      PAGE_CODE.split(`"${entry.button}"`).length - 1,
       1,
       `#${entry.button} is named more than once in web/voice.js, so it has a code path of its own`
     );
@@ -3661,7 +3660,7 @@ test("THE SUMMARY BUTTON DOES NOT CLAIM A SCOPING THE DATA CANNOT SUPPORT", () =
   // anyone can set to anything. A button whose text claims that scoping produces confident, wrong
   // summaries. So the shipped default is weaker and TRUE, and this is what stops it drifting back.
   const summary = /text:\s*"([^"]+)"/.exec(
-    SCRIPT_CODE.slice(SCRIPT_CODE.indexOf('button: "canned-summary"'))
+    PAGE_CODE.slice(PAGE_CODE.indexOf('button: "canned-summary"'))
   )[1];
   assert.match(summary, /recent messages/i, "the default no longer says what it can actually get");
   for (const claim of [/unread/i, /since I last/i, /last messaged/i]) {
@@ -3749,11 +3748,11 @@ test("NEITHER canned button is drawn as a warning, because neither is reporting 
   assert.doesNotMatch(HTML, /class="(bar|tray)-button heavy"/, "something is still marked heavy");
   // What DOES still distinguish it: the sentence saying what it costs. That lives in the script
   // now, with the prompt text, because `renderCannedPrompts` swaps the title and back.
-  assert.match(SCRIPT_CODE, /CODING AGENT/, "nothing says what the heavier button spends");
+  assert.match(PAGE_CODE, /CODING AGENT/, "nothing says what the heavier button spends");
   // The issue does NOT ask for an arm-twice confirm like #clear-view, so there is deliberately not
   // one. Recorded here so that adding one later is a decision somebody makes rather than drifts
   // into — and so that its absence is not mistaken for an oversight.
-  assert.doesNotMatch(SCRIPT_CODE, /armCanned|cannedArmed/, "a confirm step appeared unannounced");
+  assert.doesNotMatch(PAGE_CODE, /armCanned|cannedArmed/, "a confirm step appeared unannounced");
 });
 
 test("with no call, the canned buttons are visibly dead and say why on hover", async () => {
@@ -4842,10 +4841,7 @@ test("`#268 voice-call-drops`: a yes whose final transcript arrives after the re
 
   // THE CONTROL: the reply held up as part of the read-back, as before this fix. The same frames
   // then send nothing, and the agent is told the read-back was interrupted.
-  const control = newPage(new Map(), brokenScript(
-    "  if (answer.turn === null || turn.turn === null || turn.turn < answer.turn) return false;",
-    "  return false;"
-  ));
+  const control = newPage(new Map(), await brokenModule([{ file: "src/view/voice/transcript.ts", find: "  if (answer.turn === null || turn.turn === null || turn.turn < answer.turn) return false;", replace: "  return false;" }]));
   const socket = await neutralReadBack(control);
   socket.onmessage({ data: control.pcmFrame(12000, SPEECH) });
   speech(socket, "assistant", 2, "One moment.", true);
@@ -5360,10 +5356,7 @@ test("`#268 voice-call-drops`: a socket's own close handler acts only for the ca
   assert.match(page.el("settings-detail").textContent, /closed with code 1006/);
 
   // THE CONTROL: without the check, the same close tears the new call down.
-  const control = newPage(new Map(), brokenScript(
-    "    if (session.socket !== socket) {\n      addDetail(`closed with code ${event.code}${event.reason ? `: ${event.reason}` : \"\"}`);\n      return;\n    }\n",
-    ""
-  ));
+  const control = newPage(new Map(), await brokenModule([{ file: "src/view/voice/call.ts", find: "    if (session.socket !== socket) {\n      deps.addDetail(`closed with code ${event.code}${event.reason ? `: ${event.reason}` : \"\"}`);\n      return;\n    }\n", replace: "" }]));
   const old = await startNeutralCall(control);
   const oldHandler = old.onclose;
   await control.el("hang-up").click();
@@ -5500,10 +5493,7 @@ test("`#268 voice-call-drops`: a finished call's socket cannot end the call that
   assert.equal(page.el("hang-up").hidden, false);
 
   // THE CONTROL: without the check, the old socket's error frame hangs up the new call.
-  const control = newPage(new Map(), brokenScript(
-    "    if (session.socket !== socket) return;\n    if (event.data instanceof ArrayBuffer) {",
-    "    if (event.data instanceof ArrayBuffer) {"
-  ));
+  const control = newPage(new Map(), await brokenModule([{ file: "src/view/voice/call.ts", find: "    if (session.socket !== socket) return;\n    if (event.data instanceof ArrayBuffer) {", replace: "    if (event.data instanceof ArrayBuffer) {" }]));
   const old = await startNeutralCall(control);
   await control.el("hang-up").click();
   await control.el("talk").click();
@@ -5557,10 +5547,7 @@ test("`#268 voice-call-drops`: every timer a healthy call arms, fired, never end
   assert.deepEqual(page.endPosts, []);
 
   // THE CONTROL: the capture hand-off's timer hangs up. The same walk sees it.
-  const control = newPage(new Map(), brokenScript(
-    "  session.captureResumeTimer = setTimeout(() => {\n    session.captureResumeTimer = null;\n",
-    "  session.captureResumeTimer = setTimeout(() => {\n    session.captureResumeTimer = null;\n    stop();\n"
-  ));
+  const control = newPage(new Map(), await brokenModule([{ file: "src/view/voice/call.ts", find: "  session.captureResumeTimer = setTimeout(() => {\n    session.captureResumeTimer = null;\n", replace: "  session.captureResumeTimer = setTimeout(() => {\n    session.captureResumeTimer = null;\n    stop();\n" }]));
   const controlSocket = await walk(control);
   assert.ok(controlFrames(controlSocket).includes("quit"), "the control's timer hung up unseen: this walk sees nothing");
 });
@@ -5628,9 +5615,7 @@ test("`#331 resume-on-websocket`: a session that does not list replay is sent no
   assert.deepEqual(replayFrames(await startV1Call(other, ["replays", "Replay"])), []);
 
   // The negative control: a page that sends the record whatever the session lists.
-  const careless = newPage(new Map(), brokenScript(
-    'const listed = Array.isArray(message.capabilities) && message.capabilities.includes("replay");',
-    "const listed = true;"));
+  const careless = newPage(new Map(), await brokenModule([{ file: "src/view/voice/transcript.ts", find: "const listed = Array.isArray(message.capabilities) && message.capabilities.includes(\"replay\");", replace: "const listed = true;" }]));
   await withEarlierConversation(careless, { resume: true });
   assert.equal(replayFrames(await startV1Call(careless, undefined)).length, 1,
     "the negative control sent nothing either, so the check above proves nothing");
@@ -5850,9 +5835,7 @@ test("`#331 resume-on-websocket`: a typed call files its first message in the ha
   }
 
   // The negative control: a page that files the marker with the first message, before the answer.
-  const careless = newPage(new Map(), brokenScript(
-    "  const wait = conversationId === session.conversationId ? replayAnswerWait : null;\n",
-    "  const wait = null;\n"));
+  const careless = newPage(new Map(), await brokenModule([{ file: "src/view/voice/transcript.ts", find: "  const wait = conversationId === deps.session.conversationId ? replayAnswerWait : null;\n", replace: "  const wait = null;\n" }]));
   const socket = await typedV1Call(careless);
   assert.equal(callFiled(careless).length, 2,
     "the negative control held the record as well, so the check above proves nothing");
@@ -5926,8 +5909,7 @@ test("`#331 resume-on-websocket`: a replacement session on the same socket was s
   assert.equal(filed[1][0].detail.recap.state, "sent");
 
   // The negative control: a page that treats a replacement as the session the call opened with.
-  const careless = newPage(new Map(), brokenScript(
-    "        noteReplacedV1Session();\n", "        offerReplayAtSessionStart(message);\n"));
+  const careless = newPage(new Map(), await brokenModule([{ file: "src/view/voice/call.ts", find: "        deps.noteReplacedV1Session();\n", replace: "        deps.offerReplayAtSessionStart(message);\n" }]));
   await replacedV1Call(careless);
   assert.equal(callRecap(careless), "Caught the agent up with 11 words from earlier",
     "the negative control changed the line too, so the check above proves nothing");
@@ -6209,12 +6191,23 @@ test("`#330 voice-long-turn-drop`: a channel message during an answer longer tha
 
 test("`#330 voice-long-turn-drop`: negative control — the page that held a relay only 30 s cuts the answer with audio_end", async () => {
   // Without the change: the relay goes straight into the queue and the cap lets it go mid-answer.
-  const page = newPage(new Map(), brokenScriptEach(
-    ["function relayWait() {\n", "function relayWait() {\n  return null;\n"],
-    ["  if (next && next.kind !== \"typed\" && (answerAudible() || (bound === \"cap\" && session.replyArriving))) {",
-      "  if (false) {"],
-    ["    if (next.kind !== \"typed\" && !answerHeardOut()) {", "    if (false) {"]
-  ));
+  const page = newPage(new Map(), await brokenModule([
+  {
+    "file": "src/view/voice/call.ts",
+    "find": "function relayWait() {\n",
+    "replace": "function relayWait() {\n  return null;\n"
+  },
+  {
+    "file": "src/view/voice/call.ts",
+    "find": "  if (next && next.kind !== \"typed\" && (answerAudible() || (bound === \"cap\" && session.replyArriving))) {",
+    "replace": "  if (false) {"
+  },
+  {
+    "file": "src/view/voice/call.ts",
+    "find": "    if (next.kind !== \"typed\" && !answerHeardOut()) {",
+    "replace": "    if (false) {"
+  }
+]));
   const { socket } = await longAnswerWithRelay(page, 45);
   assert.ok(controlFrames(socket).includes("audio_end"), "the control did not cut the answer, so the test above proves nothing");
 });
@@ -6655,7 +6648,7 @@ test("`#330 voice-long-turn-drop`: a copy a server with no store would refuse at
   assert.deepEqual(unsettledCopies(fresh), {}, "a copy no opening can file was kept, to be refused at every one");
   assert.match(fresh.el("settings-detail").textContent, /could not be filed: HTTP 503 storage_not_configured/);
   // The negative control: the page that put every failure back keeps the copy for ever.
-  const control = await run(brokenScript("  if (error.code === \"storage_not_configured\") return false;\n", ""));
+  const control = await run(await brokenModule([{ file: "src/core/speech/restored-turns.ts", find: "  if (error!.code === \"storage_not_configured\") return false;\n", replace: "" }]));
   assert.equal(Object.keys(unsettledCopies(control)).length, 1);
 });
 
@@ -6793,7 +6786,7 @@ test("`#337 voice-relay-silent`: a message in the open channel is read out once,
   assert.match(relayedPrompts(socket)[0], /word for word/, "read out in full is what the reader chose");
   assert.deepEqual(unreadSeams(page), []);
   // The negative control: without the ledger, each stream's copy is read out.
-  const control = await run(brokenScript("  if (relayLedger.has(key)) return false;\n", ""));
+  const control = await run(await brokenModule([{ file: "src/view/voice/call.ts", find: "  if (relayLedger.has(key)) return false;\n", replace: "" }]));
   assert.equal(timesRelayed(control.socket, "the deploy finished"), 2,
     "the control read it out once, so the test above proves nothing about the ledger");
 });
@@ -6844,12 +6837,23 @@ test("`#337 voice-relay-silent`: a message in another channel during an answer l
   assert.match(relayedPrompts(socket)[0], /in build noise/);
   assert.deepEqual(unreadSeams(page), []);
   // The negative control, as for the open channel's: the page that held a relay only 30 s.
-  const control = newPage(new Map(), brokenScriptEach(
-    ["function relayWait() {\n", "function relayWait() {\n  return null;\n"],
-    ["  if (next && next.kind !== \"typed\" && (answerAudible() || (bound === \"cap\" && session.replyArriving))) {",
-      "  if (false) {"],
-    ["    if (next.kind !== \"typed\" && !answerHeardOut()) {", "    if (false) {"]
-  ));
+  const control = newPage(new Map(), await brokenModule([
+  {
+    "file": "src/view/voice/call.ts",
+    "find": "function relayWait() {\n",
+    "replace": "function relayWait() {\n  return null;\n"
+  },
+  {
+    "file": "src/view/voice/call.ts",
+    "find": "  if (next && next.kind !== \"typed\" && (answerAudible() || (bound === \"cap\" && session.replyArriving))) {",
+    "replace": "  if (false) {"
+  },
+  {
+    "file": "src/view/voice/call.ts",
+    "find": "    if (next.kind !== \"typed\" && !answerHeardOut()) {",
+    "replace": "    if (false) {"
+  }
+]));
   control.channels = [CHANNEL, OTHER_CHANNEL];
   const cut = await longAnswerWithRelay(control, 45, "watch");
   assert.ok(controlFrames(cut.socket).includes("audio_end"), "the control did not cut the answer, so the test above proves nothing");
@@ -6880,7 +6884,7 @@ test("`#337 voice-relay-silent`: while the call is idle a message is read out at
   assert.deepEqual(unreadSeams(page), [], "a message that was read out was reported as not read out");
   // The negative control: a page that holds a relay however idle the call is never reads it out —
   // and, since `#337`, says so when the call ends rather than dropping it.
-  const control = await run(brokenScript("function relayWait() {\n", "function relayWait() {\n  return \"answer\";\n"));
+  const control = await run(await brokenModule([{ file: "src/view/voice/call.ts", find: "function relayWait() {\n", replace: "function relayWait() {\n  return \"answer\";\n" }]));
   assert.notEqual(control.closedAt, "audio_end");
   assert.equal(timesRelayed(control.socket, "the tag is cut"), 0);
   await control.page.el("hang-up").click();
@@ -6913,7 +6917,7 @@ test("`#337 voice-relay-silent`: a message still waiting when the call ends is s
   await releaseRelay(page, next, 1);
   assert.deepEqual(relayedPrompts(next), [], "a message from the last call was read out in this one");
   // The negative control: without the report, it is dropped in silence.
-  const control = await run(brokenScript("  if (relayCallOpenedAt && unsent.length) reportUnrelayed(unsent, \"ended\");\n", ""));
+  const control = await run(await brokenModule([{ file: "src/view/voice/call.ts", find: "  if (relayCallOpenedAt && unsent.length) reportUnrelayed(unsent, \"ended\");\n", replace: "" }]));
   assert.deepEqual(unreadSeams(control.page), []);
 });
 
@@ -6944,8 +6948,7 @@ test("`#337 voice-relay-silent`: after a drop the stream of every channel resume
   assert.equal(timesRelayed(socket, "missed while away"), 1, "what arrived while the stream was down was lost");
   assert.equal(timesRelayed(socket, "an hour old"), 0, "history replayed on resuming was read out as news");
   // The negative control: the page that never relays a replayed message loses it.
-  const control = await run(brokenScript("  if (!arrival.resumed || !arrival.fromTail || !relayCallOpenedAt) return false;\n",
-    "  return false;\n"));
+  const control = await run(await brokenModule([{ file: "src/view/voice/call.ts", find: "  if (!arrival.resumed || !arrival.fromTail || !relayCallOpenedAt) return false;\n", replace: "  return false;\n" }]));
   assert.equal(timesRelayed(control.socket, "missed while away"), 0);
 });
 
@@ -7169,8 +7172,7 @@ test("`#352 voice-reconnect-on-bridge-error`: a relayed turn the call ended befo
   await late.settle();
   assert.equal(unreadSeams(late).length, 1, "the late tail of the turn before was taken for the relayed turn's answer");
   // The negative control: the page that counted only what was still queued drops it in silence.
-  const control = newPage(new Map(), brokenScript(
-    "    ...(inFlight && inFlight.kind === \"relay\" && !inFlight.answered ? inFlight.relays : []),\n", ""));
+  const control = newPage(new Map(), await brokenModule([{ file: "src/view/voice/call.ts", find: "    ...(inFlight && inFlight.kind === \"relay\" && !inFlight.answered ? inFlight.relays : []),\n", replace: "" }]));
   await relayInFlight(control);
   await control.el("hang-up").click();
   await control.settle();
@@ -7323,7 +7325,7 @@ test("`#352 voice-reconnect-on-bridge-error`: the bridge losing a turn keeps the
   assert.deepEqual(page.endPosts.map((r) => [r.ended_by, r.reconnects]), [["reconnected", undefined], ["hang_up", 1]]);
 
   // The negative control: the page before this change ends the call at the error.
-  const control = await run(brokenScript("      if (reconnectAsked(said)) {\n", "      if (false) {\n"));
+  const control = await run(await brokenModule([{ file: "src/view/voice/call.ts", find: "      if (reconnectAsked(said)) {\n", replace: "      if (false) {\n" }]));
   assert.deepEqual(control.page.endPosts.map((r) => r.ended_by), ["error_frame"]);
   assert.equal(sessionsAsked(control.page), 1);
   assert.equal(control.page.el("error").hidden, false);
@@ -7400,7 +7402,7 @@ test("`#352 voice-reconnect-on-bridge-error`: a typed message the bridge lost go
   assert.equal(storedTexts(page).filter((t) => t === "you: what changed overnight?").length, 1, storedTexts(page).join("\n"));
   assert.equal(seamDetail(reconnectedSeams(page)[0]),
     "The voice service lost a turn, so the call moved to a new session that has seen nothing above this line, and your message went again.");
-  const control = await run(brokenScript("  if (next.resent && next.kind === \"typed\") noteTypedTurn(next.text);\n", ""));
+  const control = await run(await brokenModule([{ file: "src/view/voice/call.ts", find: "  if (next.resent && next.kind === \"typed\") noteTypedTurn(next.text);\n", replace: "" }]));
   assert.equal(youRowsSaying(control.page, "what changed overnight?").length, 2,
     "the control drew the echo once, so the test above proves nothing");
 });
@@ -7657,11 +7659,11 @@ test("`#352 voice-reconnect-on-bridge-error`: a turn sent again after a reconnec
 
   // The negative control: without the check, each turn goes to the third session as well, and the
   // relay is never said to be gone.
-  const relayControl = await relayLostTwice(brokenScript(RESENT_CHECK, ""));
+  const relayControl = await relayLostTwice(await brokenModule([{ file: "src/view/voice/call.ts", find: "  else if (inFlight.resent) why = \"it had been sent again once already\";\n", replace: "" }]));
   assert.deepEqual(promptCounts(relayControl.sockets, relayControl.prompt), [1, 1, 1],
     "the control did not send the relay a third time, so the test above proves nothing");
   assert.deepEqual(unreadSeams(relayControl.page), []);
-  const typedControl = await typedLostTwice(brokenScript(RESENT_CHECK, ""));
+  const typedControl = await typedLostTwice(await brokenModule([{ file: "src/view/voice/call.ts", find: "  else if (inFlight.resent) why = \"it had been sent again once already\";\n", replace: "" }]));
   assert.deepEqual(promptCounts(typedControl.sockets, "what changed overnight?"), [1, 1, 1],
     "the control did not send the typed message a third time, so the test above proves nothing");
 });
@@ -7718,12 +7720,18 @@ test("`#352 voice-reconnect-on-bridge-error`: a reconnect that cannot get a work
     assert.ok(!page.endPosts.some((r) => r.ended_by === "server_closed" || r.ended_by === "error_frame"), how);
   }
   // The negative control: the page that left the lost turn in flight as it queued it again counts it twice.
-  const control = await run(brokenScriptEach(
-    ["  const inFlight = session.turnInFlight;\n  session.turnInFlight = null;\n  if (!inFlight) return;\n",
-      "  const inFlight = session.turnInFlight;\n  if (!inFlight) return;\n"],
-    ["  session.turnInFlight = null;\n  if (session.playbackWaitTimer !== null) {\n",
-      "  if (session.playbackWaitTimer !== null) {\n"]
-  ), "the server refuses a second session");
+  const control = await run(await brokenModule([
+  {
+    "file": "src/view/voice/call.ts",
+    "find": "  const inFlight = session.turnInFlight;\n  session.turnInFlight = null;\n  if (!inFlight) return;\n",
+    "replace": "  const inFlight = session.turnInFlight;\n  if (!inFlight) return;\n"
+  },
+  {
+    "file": "src/view/voice/call.ts",
+    "find": "  session.turnInFlight = null;\n  if (session.playbackWaitTimer !== null) {\n",
+    "replace": "  if (session.playbackWaitTimer !== null) {\n"
+  }
+]), "the server refuses a second session");
   assert.equal(unreadSeams(control).length, 2, "the control reported the messages once, so the test above proves nothing");
 });
 
@@ -7758,8 +7766,7 @@ test("`#352 voice-reconnect-on-bridge-error`: the bridge closing the lost sessio
   assert.equal(page.el("error").hidden, true, page.el("error").textContent);
   assert.deepEqual(page.endPosts.map((r) => r.ended_by), ["reconnected"]);
   assert.equal(page.sockets.length, 2, "the reconnect did not go ahead");
-  const control = await run(brokenScript(
-    "    lost.onclose = (event) => {\n      addDetail(`closed with code ${event.code}${event.reason ? `: ${event.reason}` : \"\"}`);\n    };\n", ""));
+  const control = await run(await brokenModule([{ file: "src/view/voice/call.ts", find: "    lost.onclose = (event) => {\n      deps.addDetail(`closed with code ${event.code}${event.reason ? `: ${event.reason}` : \"\"}`);\n    };\n", replace: "" }]));
   assert.ok(control.endPosts.some((r) => r.ended_by === "server_closed"),
     `the control's call did not end at the close, so the test above proves nothing: ${control.endPosts.map((r) => r.ended_by)}`);
 });
@@ -7971,8 +7978,7 @@ test("`#352 voice-reconnect-on-bridge-error`: in a TYPED call, the lost relay wa
   assert.equal(out.youRows, 0, "the relay's echo was drawn as the reader's words");
   assert.equal(out.storedAsYou, 0, "the relay's echo was stored as the reader's words");
   assert.equal(out.unread, 0, "a relay read out after the greeting was said not read out");
-  const control = await run(brokenScript("        if (reconnected && message.greeting === true) {\n          session.waitingForGreeting = true;",
-    "        if (false) {\n          session.waitingForGreeting = true;"));
+  const control = await run(await brokenModule([{ file: "src/view/voice/call.ts", find: "        if (reconnected && message.greeting === true) {\n          session.waitingForGreeting = true;", replace: "        if (false) {\n          session.waitingForGreeting = true;" }]));
   assert.equal(control.beforeGreeting, 1,
     "the negative control did not send the relay into the greeting, so the checks above prove nothing");
   assert.equal(control.midGreeting, 0, "the negative control reported the relay, so the check above proves nothing");
@@ -8002,8 +8008,7 @@ test("`#352 voice-reconnect-on-bridge-error`: in a TYPED call, a reconnect's gre
   // The lost session's own record (`error_frame`) is there; nothing about the new session's greeting is.
   assert.ok(!out.health.includes("silent_greeting") && !out.health.includes("no_reply"),
     `a typed call's audio greeting posted a health record: ${out.health}`);
-  const control = await run(brokenScript("          session.waitingForGreeting = true;\n          armNoReply();",
-    "          session.waitingForGreeting = true;\n          if (session.health) session.health.greetingPending = true;\n          armNoReply();"));
+  const control = await run(await brokenModule([{ file: "src/view/voice/call.ts", find: "          session.waitingForGreeting = true;\n          armNoReply();", replace: "          session.waitingForGreeting = true;\n          if (session.health) session.health.greetingPending = true;\n          armNoReply();" }]));
   assert.ok(control.health.includes("silent_greeting"),
     `the negative control raised no alarm, so the check above proves nothing: ${control.health}`);
 });
@@ -8084,8 +8089,7 @@ test("`#353 relay-echo-as-owner`: the bridge's echo of a relayed prompt is no \"
   await owner.page.settle();
   assert.equal(youRowsSaying(owner.page, "the release is tagged").length, 1, "a second identical transcript was taken for the same echo");
   // The negative control: the page that knew only typed text draws the echo as the owner's.
-  const control = await run(brokenScript("    entry.echo = who === \"you\" && final && (pageEcho || isEchoOfTyped(said));",
-    "    entry.echo = who === \"you\" && final && isEchoOfTyped(said);"));
+  const control = await run(await brokenModule([{ file: "src/view/voice/call.ts", find: "    entry.echo = who === \"you\" && final && (pageEcho || isEchoOfTyped(said));", replace: "    entry.echo = who === \"you\" && final && isEchoOfTyped(said);" }]));
   assert.equal(youRowsSaying(control.page, "the release is tagged").length, 1,
     "the control did not draw the echo, so the test above proves nothing");
   assert.equal(socket.sent.length > 0, true);
@@ -8168,10 +8172,18 @@ test("`#511 voice-explicit-send-only`: the bridge's echo of a relayed prompt is 
   assert.ok(!page.heardPosts.some((post) => flatWords(post.text) === flatWords(prompt)),
     "the relayed prompt's echo was reported as the owner's words");
   // The negative control: a page that reported every user transcript reports the echo.
-  const control = newPage(new Map(), brokenScriptEach(
-    ["      if (who === \"you\" && owners) reportHeard(spoken.key, spokenText(spoken.entry));",
-      "      if (who === \"you\") reportHeard(spoken.key, spokenText(spoken.entry));"],
-    ["  if (!whole || pageTurnInFlight()) return;", "  if (!whole) return;"]));
+  const control = newPage(new Map(), await brokenModule([
+  {
+    "file": "src/view/voice/call.ts",
+    "find": "      if (who === \"you\" && owners) deps.reportHeard(spoken.key, spokenText(spoken.entry));",
+    "replace": "      if (who === \"you\") deps.reportHeard(spoken.key, spokenText(spoken.entry));"
+  },
+  {
+    "file": "src/view/voice/transcript.ts",
+    "find": "  if (!whole || pageTurnInFlight()) return;",
+    "replace": "  if (!whole) return;"
+  }
+]));
   const relayed = await relayInFlight(control);
   await control.settle();
   assert.ok(control.heardPosts.some((post) => flatWords(post.text) === flatWords(relayed.prompt)),
@@ -8291,8 +8303,7 @@ test("`#512 voice-recap-private-stack`: a recap no fetch took is drawn as a fres
   const started = [...page.storedTurns.entries()].find(([id]) => id !== "conv_earlier");
   assert.deepEqual(started[1][0].detail.recap, { state: "none", why: "not_taken", dropped: 0 });
 
-  const careless = await run(brokenScript(
-    "if (last) return finish(state === null || state === \"unknown\" ? null : false);", "if (last) return finish(true);"));
+  const careless = await run(await brokenModule([{ file: "src/view/voice/transcript.ts", find: "if (last) return finish(state === null || state === \"unknown\" ? null : false);", replace: "if (last) return finish(true);" }]));
   assert.equal(callRecap(careless.page), "Caught the agent up with 11 words from earlier",
     "the negative control drew it as not taken too, so the check above proves nothing");
 });
@@ -8409,8 +8420,7 @@ test("`#512 voice-recap-private-stack`: a relayed message waits while the microp
   assert.equal(end.speech_hold_capped, 0);
   assert.ok(end.speech_hold_max_ms >= 4000, `the record says it waited ${end.speech_hold_max_ms} ms`);
 
-  const control = await run(brokenScript(
-    "if (next.kind !== \"typed\" && !typedWaiting && holdForOwnerSpeech()) {", "if (false) {"));
+  const control = await run(await brokenModule([{ file: "src/view/voice/call.ts", find: "if (next.kind !== \"typed\" && !typedWaiting && holdForOwnerSpeech()) {", replace: "if (false) {" }]));
   assert.notEqual(control.during, null, "the negative control held the relay too, so the check above proves nothing");
 });
 
@@ -8462,7 +8472,7 @@ test("`#512 voice-recap-private-stack`: the level is the server's, a cap of 0 ho
   const went = await growing(SCRIPT);
   assert.ok(went !== null && went >= OWNER_WORDS_HOLD_MS && went <= OWNER_WORDS_HOLD_MS + 1000,
     `the relay went ${went} ms after his words last grew`);
-  const control = await growing(brokenScript("session.ownerWordsAt = final ? 0 : Date.now();", "session.ownerWordsAt = 0;"));
+  const control = await growing(await brokenModule([{ file: "src/view/voice/call.ts", find: "session.ownerWordsAt = final ? 0 : Date.now();", replace: "session.ownerWordsAt = 0;" }]));
   assert.ok(control !== null && control < OWNER_WORDS_HOLD_MS,
     `the negative control waited ${control} ms too, so the check above proves nothing`);
 });
@@ -8479,7 +8489,7 @@ test("`#512 voice-recap-private-stack`: a recap armed for a call that ends befor
     return page.recaps.get(1).state;
   };
   assert.equal(await run(SCRIPT), "withdrawn", "an armed recap outlived a call that never opened its socket");
-  assert.equal(await run(brokenScript("function withdrawArmedRecap() {\n", "function withdrawArmedRecap() {\n  return;\n")), "armed",
+  assert.equal(await run(await brokenModule([{ file: "src/view/voice/transcript.ts", find: "function withdrawArmedRecap() {\n", replace: "function withdrawArmedRecap() {\n  return;\n" }])), "armed",
     "the negative control took it back too, so the check above proves nothing");
 });
 
@@ -8517,9 +8527,7 @@ test("`#512 voice-recap-private-stack`: a hold for the owner's speech starts afr
   const { page, socket, during } = await run(SCRIPT);
   assert.equal(during, null, "the old hold's start ran the cap out at once, into his speech");
   assert.notEqual(await micFor(page, socket, 3000, null), null, "the message never went once he stopped");
-  const control = await run(brokenScript(
-    "  session.speechHold = null;\n  if (held.timer !== null) clearTimeout(held.timer);\n  const waited",
-    "  if (held.timer !== null) clearTimeout(held.timer);\n  const waited"));
+  const control = await run(await brokenModule([{ file: "src/view/voice/call.ts", find: "  session.speechHold = null;\n  if (held.timer !== null) clearTimeout(held.timer);\n  const waited", replace: "  if (held.timer !== null) clearTimeout(held.timer);\n  const waited" }]));
   assert.notEqual(control.during, null, "the negative control held it too, so the check above proves nothing");
 });
 
@@ -8675,7 +8683,13 @@ test("`#523 voice-self-hearing`: the microphone waits for a greeting to finish P
     speakInto(page);
     assert.equal(binaryFramesSent(socket).length, 2, `greeting ${greeting}: an answer after the greeting could not be talked over`);
 
-    const control = await run(brokenScriptEach(MIC_HELD_FOR_AGENT));
+    const control = await run(await brokenModule([
+  {
+    "file": "src/view/voice/call.ts",
+    "find": "    if (micHeldForAgent()) {\n",
+    "replace": "    if (false) {\n"
+  }
+]));
     assert.equal(control.during, 1, "the control held the microphone too: this test cannot see the defect");
   }
 });
@@ -8705,7 +8719,13 @@ test("`#523 voice-self-hearing`: an answer's words heard back are not the owner'
   assert.match(page.el("connection-detail").textContent, /picked up the assistant's own words \("Let's connect you to your chat\."\)/);
 
   // THE CONTROL: a page that never judges a turn for the agent's echo reports and draws the incident's words.
-  const control = await run(brokenScriptEach(ECHO_NOT_JUDGED));
+  const control = await run(await brokenModule([
+  {
+    "file": "src/view/voice/call.ts",
+    "find": "  if (entry.nearAgent) judgeAgentEcho(entry, final);\n",
+    "replace": ""
+  }
+]));
   assert.ok(control.page.heardPosts.some((post) => /connect you to your chat/i.test(post.text)),
     "the control did not report the echo: this test cannot see the defect");
   assert.equal(ownerRowsSaying(control.page, "connect you").length, 1, "the control did not draw the echo as the owner's");
@@ -8753,8 +8773,13 @@ test("`#523 voice-self-hearing`: a turn begun just after the agent fell silent r
   assert.equal(early, 0, "the echo's first two words were reported as heard before the turn could be judged");
   assert.ok(!page.heardPosts.some((post) => post.text.startsWith("send it")), page.heardPosts.map((post) => post.text).join(" | "));
   assert.deepEqual(ownerRowsSaying(page, "send it"), [], "the echo was drawn as the owner's");
-  const control = await run(brokenScriptEach(["    const owners = !spoken.entry.echo && !spoken.entry.undecided;\n",
-    "    const owners = !spoken.entry.echo;\n"]));
+  const control = await run(await brokenModule([
+  {
+    "file": "src/view/voice/call.ts",
+    "find": "    const owners = !spoken.entry.echo && !spoken.entry.undecided;\n",
+    "replace": "    const owners = !spoken.entry.echo;\n"
+  }
+]));
   assert.equal(control.early, 1, "the control did not report the opening words: this test cannot see the defect");
 });
 
@@ -8802,7 +8827,13 @@ test("`#523 voice-self-hearing`: on the hosted agent, the first message is not s
   await page.settle();
   assert.deepEqual([...heardNow(page).values()], ["Ask Claude whether the tests pass."]);
 
-  const control = await run(brokenScriptEach(MIC_HELD_FOR_AGENT));
+  const control = await run(await brokenModule([
+  {
+    "file": "src/view/voice/call.ts",
+    "find": "    if (micHeldForAgent()) {\n",
+    "replace": "    if (false) {\n"
+  }
+]));
   assert.equal(control.during, 1, "the control held the microphone too: this test cannot see the defect");
 });
 
