@@ -53,6 +53,7 @@ export const PACKAGES = Object.freeze({
   "core/speech": BASE,
   "core/sync": BASE,
   "platform/web": BASE,
+  "present/call": BASE,
   "present/notices": [...BASE, "core/api", "present/time"],
   "present/rows": [...BASE, "core/channels", "present/time"],
   "present/time": BASE,

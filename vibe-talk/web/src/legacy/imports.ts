@@ -200,6 +200,15 @@ export {
   stamp,
 } from "../present/time/index.ts";
 export {
+  CUT_OFF_MARK,
+  closeReason,
+  mergeHypothesis,
+  outcomeNotice,
+  shownSpoken,
+  spokenText,
+  spokenWords,
+} from "../present/call/index.ts";
+export {
   SERVER_CACHE_NO_AGE_LIMIT,
   browserSpeechFailure,
   channelHistorySentence,

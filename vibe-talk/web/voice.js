@@ -16848,55 +16848,6 @@ function absorbAnswerRow(conversationId, serial) {
 
 // The seam's label per outcome (`SPOKEN_YES_SEAM_LABELS`) is web/src/core/call's (`spokenYesSeam`).
 
-/**
- * The fixed sentence the agent is told about `outcome`, starting "Voice page:" — what its
- * instructions tell it to wait for — or null when it needs none. It is never told SENT for anything
- * this page did not see the server accept. `how` is "voice" for a spoken yes and "tap" for the card.
- *
- * @param {{kind: string, proposal?: VibeTalk.PendingPost | null, reason?: string}} outcome
- * @param {"voice" | "tap"} how
- */
-function outcomeNotice(outcome, how) {
-  const channel = (outcome.proposal && outcome.proposal.channel_name) || "the channel";
-  switch (outcome.kind) {
-    case "sent":
-      return how === "tap"
-        ? `Voice page: the user tapped Send, and the message was SENT to ${channel}. ` +
-            "Tell the user in a few words that it was sent. Then stop."
-        : `Voice page: the message you read back was SENT to ${channel}. ` +
-            "Tell the user in a few words that it was sent. Then stop.";
-    case "partial":
-      return `Voice page: only part of the message reached ${channel}; the rest was NOT sent. ` +
-        "Tell the user that in one short sentence, and that the screen has the rest. Then stop.";
-    case "unknown":
-    case "unconfirmed":
-      return "Voice page: I could not confirm whether the message was sent. Tell the user to " +
-        "check the channel before sending it again. Then stop.";
-    case "refused":
-      return `Voice page: the message was NOT sent (${outcome.reason || "the server refused it"}). ` +
-        "Tell the user in one short sentence that it was not sent. Then stop.";
-    case "withdrawn":
-      return "Voice page: the user tapped Don't send, so the draft was withdrawn and NOT sent. " +
-        "Say so in a few words. Then stop.";
-    case "lapsed":
-      return `Voice page: the draft to ${channel} lapsed: nobody tapped Send or said yes in time, ` +
-        "so it was NOT sent and the card is gone. Tell the user in one short sentence, and offer to " +
-        "draft it again. Then stop.";
-    case "declined":
-      // The agent heard the no itself, and will offer new words or drop it; telling it again would
-      // only make it speak twice.
-      return null;
-    case "gone":
-      return "Voice page: no draft is waiting to be sent; the last one lapsed or was already " +
-        "settled, so that answer sent nothing. If the user meant to send something, tell them in " +
-        "one short sentence, and offer to draft it again. Otherwise carry on.";
-    default:
-      return `Voice page: the message was NOT sent: ${outcome.reason || "it could not be confirmed by voice"}. ` +
-        "If the user meant to send it, tell them in one short sentence that it was not sent, and " +
-        "ask whether to read it back again. Otherwise carry on.";
-  }
-}
-
 /** Tell the agent `notice` on the call's text channel, if a call is open to hear it. */
 function tellAgent(notice) {
   if (notice === null || !canSendText()) return;
@@ -20092,24 +20043,6 @@ function wireCallSocket(socket, socketUrl, resume, chat, reconnect = null) {
   };
 }
 
-/**
- * A close code, in plain words.
- *
- * The owner's screen read "conversation closed (code 1005)". 1005 means the connection gave no
- * reason at all, so the page was reporting the ABSENCE of information as though it were
- * information, in a vocabulary only a WebSocket implementer has. Say what happened, or say
- * nothing; the number is still recorded in the connection details for whoever is debugging.
- */
-function closeReason(code) {
-  if (code === 1000) {
-    return "Call ended.";
-  }
-  if (code === 1001 || code === 1005 || code === 1006) {
-    return "The call ended — the connection dropped.";
-  }
-  return "The call ended unexpectedly. Settings has the details.";
-}
-
 function handle(socket, message) {
   switch (message.type) {
     case "conversation_initiation_metadata": {
@@ -20291,74 +20224,6 @@ function answerVendorApproval(socket, call) {
 // and stored ONCE when the turn ends. The same words said again in a LATER turn are a new key and
 // a new row: repeating yourself is a thing people really do, and the record must keep it.
 
-function tidySpeech(text) {
-  return String(text).replace(/\s+/g, " ").trim();
-}
-
-/** Lower-case words with punctuation removed: what "the same words" means for a hypothesis. */
-function spokenWords(text) {
-  return String(text)
-    .toLowerCase()
-    .replace(/[^\p{L}\p{N}\s\u0027]/gu, " ") // U+0027 keeps contractions whole.
-    .split(/\s+/)
-    .filter(Boolean);
-}
-
-/** Does `needle` occur as a contiguous run of whole words in `hay`? */
-function containsWords(hay, needle) {
-  for (let i = 0; i + needle.length <= hay.length; i += 1) {
-    if (needle.every((word, j) => hay[i + j] === word)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-/**
- * Word edit distance from all of `a` to the closest PREFIX of `b`. Zero when `b` merely extends
- * `a`; small when `b` is `a` with a word corrected, and then possibly extended.
- */
-function revisionDistance(a, b) {
-  let row = Array.from({ length: b.length + 1 }, (_, j) => j);
-  for (let i = 1; i <= a.length; i += 1) {
-    const next = [i];
-    for (let j = 1; j <= b.length; j += 1) {
-      next[j] = Math.min(row[j] + 1, next[j - 1] + 1, row[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
-    }
-    row = next;
-  }
-  return Math.min(...row);
-}
-
-/**
- * The best text for a turn, given what it held and a new frame for it.
- *
- * Four outcomes. The new frame CONTAINS what was held — a cumulative hypothesis — so it wins. It
- * is contained BY what was held — a late repeat — so nothing changes. It is a CORRECTION of what
- * was held, a word or so different over a sentence long enough for that to mean something, so it
- * replaces it. Otherwise it is the next fragment of the same turn and is appended. Three words is
- * the floor for a correction because "yes" and "no" differ by one word too.
- */
-function mergeHypothesis(held, frame) {
-  const before = tidySpeech(held);
-  const after = tidySpeech(frame);
-  if (!before || !after) {
-    return before || after;
-  }
-  const a = spokenWords(before);
-  const b = spokenWords(after);
-  if (containsWords(b, a)) {
-    return after;
-  }
-  if (containsWords(a, b)) {
-    return before;
-  }
-  if (a.length >= 3 && b.length >= 3 && revisionDistance(a, b) <= Math.max(1, Math.floor(a.length / 4))) {
-    return after;
-  }
-  return `${before} ${after}`;
-}
-
 /**
  * One frame of speech, into the row for its (turn, role).
  *
@@ -20506,23 +20371,6 @@ function keepTurnFold(was, li) {
   const before = was.foldEntry;
   if (!before || !isFolded(before)) setFolded(entry, false);
   return Boolean(before) && document.activeElement === before.fold;
-}
-
-function spokenText(entry) {
-  return entry.pending ? mergeHypothesis(entry.settled, entry.pending) : entry.settled;
-}
-
-/**
- * What marks an answer the page knows was cut short — by the reader's typed message, by an
- * interrupted `turn_complete`, or by the call ending under it. `#330 voice-long-turn-drop`. The
- * words that arrived are kept, on screen and in the record; this says they are not the whole answer.
- */
-const CUT_OFF_MARK = "(cut off)";
-
-/** A turn's words as its row shows them and its record keeps them: marked when it was cut off. */
-function shownSpoken(entry) {
-  const text = spokenText(entry);
-  return entry.cut ? `${text}${text ? " " : ""}${CUT_OFF_MARK}` : text;
 }
 
 /**
