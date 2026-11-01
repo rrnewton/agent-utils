@@ -5642,6 +5642,7 @@ def _record_run_locked(
         "schema_version": 1,
         "run_id": run_id,
         "tool_version": __version__,
+        "edition": "python",
         "started_at": started_at,
         "completed_at": completed_at,
         "status": status,

@@ -465,6 +465,7 @@ fn record_run_locked_full(
     run_obj.insert("schema_version".into(), 1.into());
     run_obj.insert("run_id".into(), Value::String(run_id.clone()));
     run_obj.insert("tool_version".into(), Value::String("0.1.0".into()));
+    run_obj.insert("edition".into(), Value::String("rust".into()));
     run_obj.insert("started_at".into(), Value::String(started_at.to_string()));
     run_obj.insert("completed_at".into(), Value::String(completed_at.clone()));
     run_obj.insert("status".into(), Value::String(status.to_string()));
