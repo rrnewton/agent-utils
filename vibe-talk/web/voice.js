@@ -18585,8 +18585,6 @@ function renderPageBuild() {
 
 /** The device's copy of K, kept on the server for every device (`#457 settings-server-side`). */
 const CARD_MAX_LINES_KEY = DEVICE_SETTINGS.cardMaxLines.key;
-/** The characters one card line is counted at: src/threads.rs `CARD_LINE_CHARS`, the same proxy. */
-const CARD_LINE_CHARS = 36;
 
 /** K in force; `applyCardMaxLines` is its only writer. */
 let cardMaxLines = DEFAULT_CARD_MAX_LINES;
@@ -18646,45 +18644,6 @@ function stepCardMaxLines(direction) {
   if (held && button.disabled) el("card-max-lines").focus();
 }
 
-/**
- * One line of a card's words wrapped as src/threads.rs `underCardlines` wraps it, word by word at
- * `CARD_LINE_CHARS` characters: a word that does not fit begins the next line, and one longer than a
- * whole line is broken across lines. The lines it fills, each with `cut` where it ends inside a word
- * broken so. Word by word because a browser breaks only between words, and a count that ignored that
- * would say fewer lines than the card draws.
- *
- * @returns {Array<{text: string, cut: boolean}>}
- */
-function wrapCardLine(line, width = CARD_LINE_CHARS) {
-  /** @type {Array<{text: string, cut: boolean}>} */
-  const lines = [];
-  let open = "";
-  for (const word of line.split(/\s+/).filter(Boolean)) {
-    let chars = [...word];
-    if (open && [...open].length + 1 + chars.length <= width) {
-      open += ` ${word}`;
-      continue;
-    }
-    if (open) lines.push({ text: open, cut: false });
-    while (chars.length > width) {
-      lines.push({ text: chars.slice(0, width).join(""), cut: true });
-      chars = chars.slice(width);
-    }
-    open = chars.join("");
-  }
-  if (open) lines.push({ text: open, cut: false });
-  return lines;
-}
-
-/** How many card lines `lines` take by the proxy, each wrapped by `wrapCardLine` at `width`. */
-function cardProxyLines(lines, width = CARD_LINE_CHARS) {
-  return lines.reduce((sum, line) => sum + wrapCardLine(line, width).length, 0);
-}
-
-/** `text`'s lines as src/threads.rs `underCardlines` counts them: blank ones dropped, white space closed up. */
-const proxyLinesOf = (text) =>
-  String(text).split(/\r?\n/).map((line) => line.replace(/\s+/g, " ").trim()).filter(Boolean);
-
 /** Whether `root` is longer than a card shows: more than K card lines of its text, as the server counts. */
 function rootOverflowsCard(root) {
   return Boolean(root) && cardProxyLines(proxyLinesOf(rawTextOf(root))) > cardMaxLines;
@@ -18719,9 +18678,6 @@ function rootOverflowsCard(root) {
 //     at short steps meanwhile (`watchPendingSummaries`), past its once-a-minute spacing, because that
 //     read is what both queues the thread for naming and brings the name. A summary that has not come
 //     within `SUMMARY_WAIT_MS` of the thread's last activity is not waited for: the card splits.
-
-/** The characters one card line of a list item or a quote is counted at: the card's 36, less its indent. */
-const CARD_INDENTED_CHARS = 32;
 
 /** How long after a thread's last activity a summary on its way is waited for in the summary's layout. */
 const SUMMARY_WAIT_MS = 60000;
@@ -18996,10 +18952,6 @@ function cardStubText(block) {
   const first = renderedText(block).split("\n").map((line) => line.trim()).find(Boolean);
   return first || (tagNameOf(block) === "pre" ? "Code" : "Quote");
 }
-
-/** A card's words as text: line by line, each line's white space closed up, blank lines dropped (`#489`). */
-const foldedCardText = (text) =>
-  String(text).split("\n").map((line) => line.replace(/\s+/g, " ").trim()).filter(Boolean).join("\n");
 
 /** The card's body for `root` cut at `cut`: its first units and "…", or the whole root where it fits. */
 function cardHead(root, cut) {
@@ -25729,33 +25681,6 @@ function noteThreadListLanded(channel) {
   threadListLandedAt.set(channel, Date.now());
 }
 
-/** The first line of `text` that says anything, cut to `chars` with an ellipsis; "" when none. */
-function firstLineOf(text, chars) {
-  const line = String(text || "").split("\n").map((part) => part.trim()).find((part) => part !== "") || "";
-  return line.length > chars ? `${line.slice(0, chars - 1)}…` : line;
-}
-
-/**
- * One thread as the page knows it: its summary and first message when the store holds them, when
- * it started and was last active, and its reply count. What every place that names a thread is
- * handed, so none of them can reach for a different field.
- */
-function threadChoice(id, summary = null, root = null) {
-  const first = (summary && summary.root) || root || null;
-  const record = root && root.thread ? root.thread : null;
-  return {
-    id: String(id),
-    summary,
-    // `#528 thread-card-markdown-and-cap`: the name and sentence a root's own record carries, served
-    // with every page that brings the root; `threadWords` reads them where the summary says none.
-    named: namedRecord(root) || namedRecord(first),
-    root: first,
-    count: summary ? summary.reply_count : record ? record.reply_count : null,
-    at: summary ? timeOf(summary, "updated_at") : timeOf(root, "timestamp"),
-    started: first ? timeOf(first, "timestamp") : NaN,
-  };
-}
-
 // `namedRecord` is web/src/core/channels's (`#624 voice-page-modularity`).
 
 /**
@@ -25817,19 +25742,6 @@ function threadName(choice, chars = THREAD_TITLE_CHARS) {
     if (name) return name;
   }
   return "Thread";
-}
-
-/**
- * "13h · 16": how long since the thread was last active, and how many replies it has.
- *
- * Last ACTIVITY rather than when it started, because that is the order every list of threads is in:
- * a start age put "38w" above "2h" in a list sorted newest-activity-first, which reads as unsorted.
- */
-function threadFacts(choice) {
-  const age = briefAge(Number.isFinite(choice.at) ? choice.at : choice.started);
-  // A count of 0 is never printed: "Thread 0" read as a thread numbered zero, not an empty one.
-  return [age, typeof choice.count === "number" && choice.count > 0 ? String(choice.count) : ""]
-    .filter((part) => part !== "").join(" · ");
 }
 
 /** Age, replies, name: the two short facts first, because a phone's picker cuts the end off. */

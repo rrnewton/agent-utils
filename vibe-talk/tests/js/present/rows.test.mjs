@@ -94,3 +94,17 @@ test("`#624 voice-page-modularity`: runs of read messages, and the ones the read
   runs.clear();
   assert.equal(runs.opened("k"), undefined);
 });
+
+test("`#624 voice-page-modularity`: a card's lines by the server's proxy, and a thread's facts, from the module alone", () => {
+  const { wrapCardLine, cardProxyLines, proxyLinesOf, foldedCardText, firstLineOf, threadChoice, threadFacts, CARD_LINE_CHARS } = ROWS;
+  assert.equal(CARD_LINE_CHARS, 36);
+  assert.deepStrictEqual(wrapCardLine("x".repeat(73)).map(({ text, cut }) => [text.length, cut]), [[36, true], [36, true], [1, false]]);
+  assert.equal(cardProxyLines(proxyLinesOf("one\n\n  two   words  \n")), 2);
+  assert.equal(foldedCardText(" a  b \n\n c "), "a b\nc");
+  assert.deepStrictEqual([firstLineOf("\n  first line \nsecond", 40), firstLineOf("abcdef", 4)], ["first line", "abc…"]);
+  const choice = threadChoice(7, { id: "7", reply_count: 3, updated_at: new Date(Date.now() - 5 * 60e3).toISOString(),
+    root: { id: "r", timestamp: new Date(Date.now() - 3600e3).toISOString() } });
+  assert.deepStrictEqual([choice.id, choice.count, choice.root.id], ["7", 3, "r"]);
+  assert.equal(threadFacts(choice), "5m · 3");
+  assert.equal(threadFacts({ ...choice, count: 0 }), "5m", "a count of nought was printed");
+});

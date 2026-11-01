@@ -1850,6 +1850,8 @@ const GLYPHS = await moduleForTests("src/foundation/index.ts");
 const SPEECH_PIECES = await moduleForTests("src/core/speech/index.ts");
 /** A call's reconnects and the words its seams and recap say (web/src/core/call). */
 const CALL = await moduleForTests("src/core/call/index.ts");
+/** How the page words and arranges its rows of messages, and its thread cards (web/src/present/rows). */
+const PRESENT_ROWS = await moduleForTests("src/present/rows/index.ts");
 /**
  * The names the page takes from its modules: what the prelude declares for the legacy script
  * (web/src/legacy/imports.ts). `page.pure` refuses them: what moved into a module is tested through
@@ -9949,25 +9951,25 @@ export { ACKNOWLEDGED, ALIAS_NOTICE, ALICE, BASE_CSS, BIG, BIG_ROOT, BOTTOM_SLAC
   FIXTURE_TREE, FakeElement, GATHERED, GLYPHS, HELP_SLUGS, HOLD_MS, HOVER_QUERY, HTML, HTML_CODE,
   INBOX, INBOX_NOTICE, LINE_PX, LINK_ATTRS, MESSAGE_CACHE_KEY, MESSAGE_DAY, MESSAGE_SPACING_MS,
   MIC_TOGGLE_IDS, MINTED, MODULE_CODE, NOISE_MATCHING, OTHER_CHANNEL, OWN, OWNER, OWNERS_MESSAGE,
-  PAGE_CODE, PAGE_ELEMENTS, PAGE_IDS, PAGE_READ_REASONS, PAGE_SCRIPTS, PRELUDE, PULL_ARM_PX,
-  PULL_WAIT_MS, RECORD_EPOCH, REDRAFT_WAIT_MS, RELAY_COALESCE_MS, RELAY_FENCE_OPEN, REPLAY_PREAMBLE,
-  REPLY_DOUBLE_TAP_MS, REPLY_JUMP_PAGES, REPO, RETRY_FIRST_MS, RUN_TAIL, RUN_THREAD, SANITIZED_TAGS,
-  SCATTERED, SCRIPT, SCRIPT_CODE, SCRIPT_FILE, SCROLLBACK_PX, SCROLLERS, SCROLL_VIEWPORT_PX,
-  SEAM_DETAIL_MAX_WORDS, SEAM_DETAIL_MIN_WORDS, SEARCH_LANGUAGE, SEND_UNDO_MS, SERVER_API, SETTINGS,
-  SHIPPED_SYSTEM_PROMPT, SHORT_MESSAGE, SLOW_SEND, SMALL, SPACE_A, SPACE_B, SPEECH, SPEECH_PIECES,
-  SPOKEN_SETTLE_MS, TEAM_A, TEAM_B, THREADS_MAIN_STORAGE, TIMELINE_RECONCILE_MS, TOKEN_STORAGE_KEY,
-  TRANSCRIPT_PAGE_LIMIT, TUNING_BANDS, TWO_COLUMN_QUERY, UI_STATE_KEY, UNPACK_STORAGE,
-  allLeavingOut, arrowStyle, asksFor, assertCurrent, assertMarkupContains, assistantSays,
-  atBottomOf, atTheHead, authorChannel, authorState, backFacts, backlog, barSlice, beforeOf, bid,
-  bigCardData, bodyOf, bookmarkAt, bookmarkClearOf, bookmarkRow, boundaryLines, boundaryWords,
-  boxesOf, bridgeReply, brokenModule, brokenScript, brokenScriptEach, browsingPage, builtSince,
-  cardIds, cardOf, cardPart, cardRow, cardsListed, cardsUp, changeChannelTo, channelBoxCode,
-  channelReads, channelRow, channelSummaryText, chipsOf, chooseAuthor, chooseReadMode,
-  chooseService, clampedAsShownLikeChromium, clearingPage, clickRow, collapsedRows, compose,
-  conversation, countingChannel, cssBlock, cssBlockIn, cssBlockOutside, cssRules, cssRulesElsewhere,
-  cssWithout, cssWithoutIn, delayedReply, deliver, dismissedItems, dismissedOpenerOf,
-  distinctReplies, doneButton, draftMarkerOf, drawnLines, drawnLinks, elidedOf, enterKey,
-  enterRunThread, errorResponse, excerptOf, failedSend, fillTranscript, firstCardInView,
+  PAGE_CODE, PAGE_ELEMENTS, PAGE_IDS, PAGE_READ_REASONS, PAGE_SCRIPTS, PRELUDE, PRESENT_ROWS,
+  PULL_ARM_PX, PULL_WAIT_MS, RECORD_EPOCH, REDRAFT_WAIT_MS, RELAY_COALESCE_MS, RELAY_FENCE_OPEN,
+  REPLAY_PREAMBLE, REPLY_DOUBLE_TAP_MS, REPLY_JUMP_PAGES, REPO, RETRY_FIRST_MS, RUN_TAIL,
+  RUN_THREAD, SANITIZED_TAGS, SCATTERED, SCRIPT, SCRIPT_CODE, SCRIPT_FILE, SCROLLBACK_PX, SCROLLERS,
+  SCROLL_VIEWPORT_PX, SEAM_DETAIL_MAX_WORDS, SEAM_DETAIL_MIN_WORDS, SEARCH_LANGUAGE, SEND_UNDO_MS,
+  SERVER_API, SETTINGS, SHIPPED_SYSTEM_PROMPT, SHORT_MESSAGE, SLOW_SEND, SMALL, SPACE_A, SPACE_B,
+  SPEECH, SPEECH_PIECES, SPOKEN_SETTLE_MS, TEAM_A, TEAM_B, THREADS_MAIN_STORAGE,
+  TIMELINE_RECONCILE_MS, TOKEN_STORAGE_KEY, TRANSCRIPT_PAGE_LIMIT, TUNING_BANDS, TWO_COLUMN_QUERY,
+  UI_STATE_KEY, UNPACK_STORAGE, allLeavingOut, arrowStyle, asksFor, assertCurrent,
+  assertMarkupContains, assistantSays, atBottomOf, atTheHead, authorChannel, authorState, backFacts,
+  backlog, barSlice, beforeOf, bid, bigCardData, bodyOf, bookmarkAt, bookmarkClearOf, bookmarkRow,
+  boundaryLines, boundaryWords, boxesOf, bridgeReply, brokenModule, brokenScript, brokenScriptEach,
+  browsingPage, builtSince, cardIds, cardOf, cardPart, cardRow, cardsListed, cardsUp,
+  changeChannelTo, channelBoxCode, channelReads, channelRow, channelSummaryText, chipsOf,
+  chooseAuthor, chooseReadMode, chooseService, clampedAsShownLikeChromium, clearingPage, clickRow,
+  collapsedRows, compose, conversation, countingChannel, cssBlock, cssBlockIn, cssBlockOutside,
+  cssRules, cssRulesElsewhere, cssWithout, cssWithoutIn, delayedReply, deliver, dismissedItems,
+  dismissedOpenerOf, distinctReplies, doneButton, draftMarkerOf, drawnLines, drawnLinks, elidedOf,
+  enterKey, enterRunThread, errorResponse, excerptOf, failedSend, fillTranscript, firstCardInView,
   floatingLine, focusName, focusOn, focused, foldButton, forwardPage, forwardReadKinds,
   forwardTimeline, framesOfType, framesSent, freshMessageData, freshMessagePage, freshness, gate,
   gatherChip, groupsIn, gutterChild, headOf, headerCard, heldRow, helpEntry, hitsIn, hold,

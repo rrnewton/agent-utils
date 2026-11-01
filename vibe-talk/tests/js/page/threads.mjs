@@ -11,24 +11,24 @@ import { WEB } from "../../../web/page_sources.mjs";
 
 import { BASE_CSS, BIG, BIG_ROOT, CHANNEL, CHARS_PER_LINE, CSS_CODE, CSS_UNCONDITIONAL,
   DESKTOP_QUERY, DISCORD_POLL_MS, FakeElement, HOLD_MS, HOVER_QUERY, HTML_CODE, LINE_PX,
-  MESSAGE_CACHE_KEY, OTHER_CHANNEL, SCRIPT, SCRIPT_CODE, SCROLLBACK_PX, SCROLL_VIEWPORT_PX,
-  SETTINGS, SMALL, THREADS_MAIN_STORAGE, TWO_COLUMN_QUERY, UNPACK_STORAGE, assertMarkupContains,
-  atBottomOf, bigCardData, bodyOf, brokenScript, cardIds, cardOf, cardPart, cardRow, cardsListed,
-  changeChannelTo, clampedAsShownLikeChromium, cssBlock, cssBlockIn, cssRules, cssRulesElsewhere,
-  deliver, distinctReplies, doneButton, draftMarkerOf, drawnLines, drawnLinks, fillTranscript,
-  focusName, focused, forwardTimeline, freshMessageData, freshMessagePage, gate, gatherChip,
-  gutterChild, headerCard, heldRow, holdCountsRead, inTwoColumns, inlineAnchors, json, jumpShown,
-  keyless, layColumnsOut, listCardSays, litCards, litRows, liveReply, longMessage, mainMessagesPage,
-  mainOnlyThreadPage, manyThreadColumns, markupPlace, mediaBody, mediaBodyOf, message, mouseOnto,
-  newPage, nodeWithinFixture, openerOf, optionLabel, outgoingRows, parityPage, passTime, pickThread,
-  pollOnce, press, pressHere, readButton, readChannel, readModeTo, readViewsSince, refreshDiscord,
-  reloadWith, reopenedChannel, replyBoxAt, replyButton, replyColumnsPage, replyInStream, rowOf,
-  rowOnScreen, rowWithId, savedOutgoing, scatteredPage, scrollToGap, search, sentWithoutKey,
-  showDiscord, shownIds, sideAtFoot, sideIds, sideRow, signIn, sourceConstant, sseMessage,
-  sseUpdate, stackPlaces, startTalking, statusText, tagOf, tallChannel, test, threadBadge,
-  threadButton, threadData, threadOptions, threadPage, threadedService, timelineAnswer,
-  twoColumnServer, twoColumns, unpackData, unpackPage, unpackRows, unpackedRow, untilDeepLink,
-  upstreamReadButton, viewOf, wideCard } from "./fixture.mjs";
+  MESSAGE_CACHE_KEY, OTHER_CHANNEL, PRESENT_ROWS, SCRIPT, SCRIPT_CODE, SCROLLBACK_PX,
+  SCROLL_VIEWPORT_PX, SETTINGS, SMALL, THREADS_MAIN_STORAGE, TWO_COLUMN_QUERY, UNPACK_STORAGE,
+  assertMarkupContains, atBottomOf, bigCardData, bodyOf, brokenScript, cardIds, cardOf, cardPart,
+  cardRow, cardsListed, changeChannelTo, clampedAsShownLikeChromium, cssBlock, cssBlockIn, cssRules,
+  cssRulesElsewhere, deliver, distinctReplies, doneButton, draftMarkerOf, drawnLines, drawnLinks,
+  fillTranscript, focusName, focused, forwardTimeline, freshMessageData, freshMessagePage, gate,
+  gatherChip, gutterChild, headerCard, heldRow, holdCountsRead, inTwoColumns, inlineAnchors, json,
+  jumpShown, keyless, layColumnsOut, listCardSays, litCards, litRows, liveReply, longMessage,
+  mainMessagesPage, mainOnlyThreadPage, manyThreadColumns, markupPlace, mediaBody, mediaBodyOf,
+  message, mouseOnto, newPage, nodeWithinFixture, openerOf, optionLabel, outgoingRows, parityPage,
+  passTime, pickThread, pollOnce, press, pressHere, readButton, readChannel, readModeTo,
+  readViewsSince, refreshDiscord, reloadWith, reopenedChannel, replyBoxAt, replyButton,
+  replyColumnsPage, replyInStream, rowOf, rowOnScreen, rowWithId, savedOutgoing, scatteredPage,
+  scrollToGap, search, sentWithoutKey, showDiscord, shownIds, sideAtFoot, sideIds, sideRow, signIn,
+  sourceConstant, sseMessage, sseUpdate, stackPlaces, startTalking, statusText, tagOf, tallChannel,
+  test, threadBadge, threadButton, threadData, threadOptions, threadPage, threadedService,
+  timelineAnswer, twoColumnServer, twoColumns, unpackData, unpackPage, unpackRows, unpackedRow,
+  untilDeepLink, upstreamReadButton, viewOf, wideCard } from "./fixture.mjs";
 
 // --- `#489 card-root-lines`: a card showing its first message keeps its lines ----------------------
 
@@ -3361,7 +3361,7 @@ test("`#522 thread-card-max-lines`: K is Thread card lines in Settings, 1 to 12 
 test("`#522 thread-card-max-lines`: lines are counted by the server's proxy, wrapped word by word at 36 characters, and the card stops only between units", async () => {
   // The wrap itself, as src/threads.rs `card_lines` wraps (its unit tests hold the same cases).
   const page0 = newPage(new Map());
-  const wrap = (line, width) => [...page0.pure("wrapCardLine")(line, width)].map((piece) => piece.text);
+  const wrap = (line, width) => PRESENT_ROWS.wrapCardLine(line, width).map((piece) => piece.text);
   assert.deepStrictEqual(wrap(`${"x".repeat(17)}   ${"y".repeat(18)}`), [`${"x".repeat(17)} ${"y".repeat(18)}`]);
   assert.deepStrictEqual(wrap(`${"x".repeat(18)} ${"y".repeat(18)}`), ["x".repeat(18), "y".repeat(18)]);
   assert.deepStrictEqual(wrap("x".repeat(73)), ["x".repeat(36), "x".repeat(36), "x"]);

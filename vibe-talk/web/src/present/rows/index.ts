@@ -27,3 +27,15 @@ export type { FoldLaid, FoldLine, FoldPiece, FoldRun } from "./fold.ts";
 export { GLOM_WINDOW_MS, isNoise, joinsGroup } from "./grouping.ts";
 export { READ_RUN_MIN_ROWS, createReadRuns } from "./runs.ts";
 export type { ReadRuns, RunPlace } from "./runs.ts";
+export {
+  CARD_INDENTED_CHARS,
+  CARD_LINE_CHARS,
+  cardProxyLines,
+  firstLineOf,
+  foldedCardText,
+  proxyLinesOf,
+  threadChoice,
+  threadFacts,
+  wrapCardLine,
+} from "./cards.ts";
+export type { ThreadChoice } from "./cards.ts";
