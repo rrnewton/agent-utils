@@ -475,6 +475,7 @@
         "py/tests/test_wrkviz_query_stats_rust.py",
         "py/tests/test_wrkviz_quickstart_rust.py",
         "py/tests/test_wrkviz_refresh_rust.py",
+        "py/tests/test_wrkviz_responsiveness_rust.py",
         "py/tests/test_wrkviz_serve_rust.py",
         "py/tests/test_wrkviz_summarize_rust.py"
       ]

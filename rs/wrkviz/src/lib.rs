@@ -70,6 +70,8 @@ pub mod project_config;
 /// The `query list` subcommand over schema-3 and schema-1
 /// timelines.
 pub mod query;
+/// Parent-child responsiveness from registry and harness logs.
+pub mod responsiveness;
 /// Trigram Bloom filters for search shards.
 pub mod search_bloom;
 /// Transcript search records.

@@ -318,3 +318,29 @@ nonprintable table, and Unicode-digit `int()` in continuation ids.
 Remaining composites: responsiveness, discover-agents,
 `--userguide`, multi-team export; then the edition switch at parity
 and the generated-schema collapse.
+
+`responsiveness` is ported (`rs/wrkviz/src/responsiveness.rs`):
+parent-child response latencies rebuilt from an agentctl registry,
+the coordinator's Claude transcript, and Claude/Muse child logs,
+with the shell-command scanner (for-loops, heredocs, `$VAR`
+expansion, wrkslots slot owners), idle-gap attribution, and the
+oracle's CPython-correct rounding and `json.dumps(indent=1)`
+rendering. Differential:
+`py/tests/test_wrkviz_responsiveness_rust.py` (6 cases, markdown,
+JSON and `--episodes` byte-for-byte, plus scanner and refusal
+fixtures). Adversarial review found and fixed: CPython
+`round()` ties (3-second latencies reported 0.0 instead of 0.1),
+`str.splitlines` boundaries in the command scanner,
+`fromisoformat` acceptance (basic dates, comma fractions,
+hour-only offsets; unpadded dates rejected), glob-pattern session
+ids and directory log hits, empty queue name/id fallbacks, empty
+Muse `cwd`, `[^...]` exclusion classes, `NaN`-constant records,
+unreadable-log errors, pre-year-1000 window stamps, and three CLI
+parser orderings. Accepted gaps: ISO week dates, `NaN` in a *used*
+numeric field (rewritten to null), `~user` expansion, and the
+hand-rolled argument-parser pattern shared with the already-landed
+slices (glossary/losslessness still pre-scan `--help`).
+
+Remaining composites: discover-agents, `--userguide`, multi-team
+export; then the edition switch at parity and the
+generated-schema collapse.

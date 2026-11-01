@@ -382,6 +382,7 @@ pub fn run(args: &[String]) -> u8 {
         "refresh-orc" => run_refresh(&args[1..], RefreshKind::Orc),
         "audit-glossary" => run_audit_glossary(&args[1..]),
         "audit-losslessness" => run_audit_losslessness(&args[1..]),
+        "responsiveness" => run_responsiveness(&args[1..]),
         other => {
             eprintln!(
                 "wrkviz: the Rust edition has not ported '{other}' yet; the Python edition remains the oracle for it"
@@ -5524,6 +5525,223 @@ fn run_audit_losslessness(args: &[String]) -> u8 {
             } else {
                 0
             }
+        }
+        Err(error) => {
+            eprintln!("wrkviz: {error}");
+            2
+        }
+    }
+}
+
+const RESPONSIVENESS_HELP: &str = r##"usage: wrkviz responsiveness [-h] --registry REGISTRY --coordinator-transcript
+                             COORDINATOR_TRANSCRIPT
+                             [--coordinator COORDINATOR]
+                             [--claude-projects CLAUDE_PROJECTS]
+                             [--muse-sessions MUSE_SESSIONS]
+                             [--sweep-marker SWEEP_MARKER] [--exclude PATTERN]
+                             [--since SINCE] [--until UNTIL]
+                             [--format {markdown,json}] [--episodes EPISODES]
+
+Rebuild a coordinator/child loop from an agentctl registry, the coordinator's Claude Code transcript, and the children's own Claude Code or Muse logs, then report how long children waited for the parent: when it was told that a child stopped, when it looked, and when it acted. Reads only; calls no model. Definitions are in `wrkviz --userguide`.
+
+options:
+  -h, --help            show this help message and exit
+  --registry REGISTRY   agentctl registry directory (the one holding agent
+                        records, archive/ and queues)
+  --coordinator-transcript COORDINATOR_TRANSCRIPT
+                        the coordinator's Claude Code session JSONL
+  --coordinator COORDINATOR
+                        the coordinator's registered agentctl name (default:
+                        coordinator)
+  --claude-projects CLAUDE_PROJECTS
+                        Claude Code projects directory searched for child
+                        transcripts by native session id (default:
+                        ~/.claude/projects)
+  --muse-sessions MUSE_SESSIONS
+                        Muse sessions directory searched for child logs by
+                        working directory (default: none, Muse children are
+                        skipped)
+  --sweep-marker SWEEP_MARKER
+                        text that marks the coordinator's periodic sweep
+                        prompt; scheduled-task fires and prompts containing it
+                        count as sweeps (default: every scheduled-task fire is
+                        a sweep)
+  --exclude PATTERN     leave out children whose name matches this shell-style
+                        pattern, such as a delivery test agent; repeatable
+                        (default: none)
+  --since SINCE         ignore child turn ends before this RFC 3339 instant
+                        (default: the transcript's first turn)
+  --until UNTIL         ignore child turn ends after this RFC 3339 instant
+                        (default: the transcript's last turn)
+  --format {markdown,json}
+                        report format (default: markdown)
+  --episodes EPISODES   also write one JSON row per episode to this file
+                        (default: not written)
+
+example:
+  wrkviz responsiveness --registry ~/project/.agentctl \
+    --coordinator-transcript ~/.claude/projects/-home-me-project/SESSION.jsonl \
+    --muse-sessions ~/.local/share/muse/sessions --sweep-marker '[coordinator sweep]' \
+    --format json --episodes /tmp/episodes.json
+"##;
+
+const RESPONSIVENESS_USAGE: &str = "usage: wrkviz responsiveness [-h] --registry REGISTRY --coordinator-transcript\n                             COORDINATOR_TRANSCRIPT\n                             [--coordinator COORDINATOR]\n                             [--claude-projects CLAUDE_PROJECTS]\n                             [--muse-sessions MUSE_SESSIONS]\n                             [--sweep-marker SWEEP_MARKER] [--exclude PATTERN]\n                             [--since SINCE] [--until UNTIL]\n                             [--format {markdown,json}] [--episodes EPISODES]";
+
+fn responsiveness_instant(raw: &str, label: &str) -> Result<f64, String> {
+    match crate::responsiveness::parse_iso_instant(raw) {
+        Some((at, true)) => Ok(at),
+        Some((_, false)) => Err(format!(
+            "{label} must carry a UTC offset, not {}",
+            crate::json::py_repr_str(raw)
+        )),
+        None => Err(format!(
+            "{label} must be an RFC 3339 instant, not {}",
+            crate::json::py_repr_str(raw)
+        )),
+    }
+}
+
+fn run_responsiveness(args: &[String]) -> u8 {
+    const VALUE_OPTIONS: &[&str] = &[
+        "--registry",
+        "--coordinator-transcript",
+        "--coordinator",
+        "--claude-projects",
+        "--muse-sessions",
+        "--sweep-marker",
+        "--exclude",
+        "--since",
+        "--until",
+        "--format",
+        "--episodes",
+    ];
+    let mut values: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        let (head, explicit) = match arg.split_once('=') {
+            Some((head, value)) => (head, Some(value.to_string())),
+            None => (arg.as_str(), None),
+        };
+        let candidates: Vec<String> = VALUE_OPTIONS
+            .iter()
+            .copied()
+            .filter(|name| {
+                head == *name
+                    || (head.len() > 2 && head.starts_with("--") && name.starts_with(head))
+            })
+            .map(str::to_string)
+            .collect();
+        if candidates.len() > 1 && !candidates.contains(&head.to_string()) {
+            return argparse_error(
+                RESPONSIVENESS_USAGE,
+                "wrkviz responsiveness",
+                &format!(
+                    "ambiguous option: {head} could match {}",
+                    candidates.join(", ")
+                ),
+            );
+        }
+        let Some(name) = candidates.first() else {
+            // argparse fires the help action when it reaches it.
+            if head == "-h" || (head.len() > 2 && "--help".starts_with(head)) {
+                print!("{RESPONSIVENESS_HELP}");
+                return 0;
+            }
+            return argparse_error(
+                RESPONSIVENESS_USAGE,
+                "wrkviz responsiveness",
+                &format!("unrecognized arguments: {arg}"),
+            );
+        };
+        let name = name.clone();
+        let value = match explicit {
+            Some(value) => value,
+            None => {
+                index += 1;
+                match args.get(index) {
+                    Some(value)
+                        if !(value.len() > 1
+                            && value.starts_with('-')
+                            && !value[1..].starts_with(|ch: char| ch.is_ascii_digit())) =>
+                    {
+                        value.clone()
+                    }
+                    _ => {
+                        return argparse_error(
+                            RESPONSIVENESS_USAGE,
+                            "wrkviz responsiveness",
+                            &format!("argument {name}: expected one argument"),
+                        )
+                    }
+                }
+            }
+        };
+        if name == "--format" && value != "markdown" && value != "json" {
+            return argparse_error(
+                RESPONSIVENESS_USAGE,
+                "wrkviz responsiveness",
+                &format!(
+                    "argument --format: invalid choice: '{value}' (choose from 'markdown', 'json')"
+                ),
+            );
+        }
+        values.entry(name).or_default().push(value);
+        index += 1;
+    }
+    let get = |name: &str| values.get(name).and_then(|items| items.last()).cloned();
+    let missing: Vec<&str> = ["--registry", "--coordinator-transcript"]
+        .into_iter()
+        .filter(|name| get(name).is_none())
+        .collect();
+    if !missing.is_empty() {
+        return argparse_error(
+            RESPONSIVENESS_USAGE,
+            "wrkviz responsiveness",
+            &format!(
+                "the following arguments are required: {}",
+                missing.join(", ")
+            ),
+        );
+    }
+    let format = get("--format").unwrap_or_else(|| "markdown".to_string());
+    let sources = crate::responsiveness::Sources {
+        registry: cli_path(&get("--registry").unwrap()),
+        coordinator_transcript: cli_path(&get("--coordinator-transcript").unwrap()),
+        coordinator: get("--coordinator").unwrap_or_else(|| "coordinator".to_string()),
+        claude_projects: Some(cli_path(
+            &get("--claude-projects").unwrap_or_else(|| "~/.claude/projects".to_string()),
+        )),
+        muse_sessions: get("--muse-sessions").map(|raw| cli_path(&raw)),
+        sweep_marker: get("--sweep-marker"),
+        exclude: values.get("--exclude").cloned().unwrap_or_default(),
+    };
+    let since = match get("--since") {
+        Some(raw) => match responsiveness_instant(&raw, "--since") {
+            Ok(at) => Some(at),
+            Err(error) => {
+                eprintln!("wrkviz: {error}");
+                return 2;
+            }
+        },
+        None => None,
+    };
+    let until = match get("--until") {
+        Some(raw) => match responsiveness_instant(&raw, "--until") {
+            Ok(at) => Some(at),
+            Err(error) => {
+                eprintln!("wrkviz: {error}");
+                return 2;
+            }
+        },
+        None => None,
+    };
+    let episodes = get("--episodes").map(|raw| cli_path(&raw));
+    match crate::responsiveness::run(&sources, since, until, &format, episodes.as_deref()) {
+        Ok(text) => {
+            print!("{text}");
+            0
         }
         Err(error) => {
             eprintln!("wrkviz: {error}");
