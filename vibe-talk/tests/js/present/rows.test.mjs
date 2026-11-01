@@ -32,3 +32,23 @@ test("`#624 voice-page-modularity`: the Undo chip's words and a reaction's face,
   assert.deepStrictEqual([reactionKey({ emoji: "👍" }), reactionKey({ emoji: "party", custom: true, custom_id: "9" })], ["u:👍", "c:9"]);
   assert.deepStrictEqual([reactionText({ emoji: "👍" }), reactionText({ emoji: "party", custom: true })], ["👍", ":party:"]);
 });
+
+test("`#624 voice-page-modularity`: the fold model lays a text out and counts what a fold hides at each width, from the module alone", () => {
+  const { foldPieces, foldShows, elisionLabels, FOLD_WIDTHS_EM, forgetElisionCounts } = ROWS;
+  const text = Array(200).fill("nnnnn").join(" ");
+  const laid = foldPieces(text);
+  assert.equal(laid.words, 200);
+  assert.equal(laid.chars, 1000);
+  // More lines shown, more words shown; a wider line, more words shown.
+  const at = (width, lines) => foldShows(laid, width, lines).words;
+  assert.ok(at(28.5, 3) < at(28.5, 8) && at(28.5, 3) < at(45, 3));
+  const labels = elisionLabels(text, 3);
+  assert.equal(labels.length, FOLD_WIDTHS_EM.length);
+  assert.match(labels[0], /^\(~\d+ more words\)$/);
+  assert.equal(elisionLabels(text, 3), labels, "a count held for the same text and lines was made again");
+  forgetElisionCounts();
+  assert.notEqual(elisionLabels(text, 3), labels, "a forgotten count was still held");
+  assert.deepStrictEqual([...elisionLabels(null, 3)], FOLD_WIDTHS_EM.map(() => ""));
+  // A table's words are a block drawn whole: shown, all of them, when it starts inside the shown lines.
+  assert.deepStrictEqual(foldShows(foldPieces([["w", "a b c"]]), 28.5, 3), { words: 3, chars: 3 });
+});

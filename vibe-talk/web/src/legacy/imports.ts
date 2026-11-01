@@ -228,6 +228,8 @@ export {
   cardRunText,
   collapsedLinesWords,
   elisionLabel,
+  elisionLabels,
+  forgetElisionCounts,
   gapWords,
   lineLabel,
   reactionKey,

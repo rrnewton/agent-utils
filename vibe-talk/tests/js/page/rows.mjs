@@ -200,8 +200,8 @@ test("clearing while idle just clears, with no claim about an agent that is not 
 const FOLD_LINES = sourceConstant("DEFAULT_COLLAPSED_LINES");
 const ELIDED_MIN_WORDS = sourceConstant("ELIDED_MIN_WORDS");
 const FOLD_WIDTHS_EM = JSON.parse(
-  /^const FOLD_WIDTHS_EM = (\[[\d.,\s]*\]);$/m.exec(SCRIPT_CODE)?.[1] ??
-    assert.fail("web/voice.js no longer states its FOLD_WIDTHS_EM"));
+  /^const FOLD_WIDTHS_EM = (\[[\d.,\s]*\]);$/m.exec(PAGE_CODE)?.[1] ??
+    assert.fail("the page's code (web/voice.js, web/src/) no longer states its FOLD_WIDTHS_EM"));
 /** The width class of a phone at the default text size, 393 to 412px: its widest line, in em. */
 const PHONE_CLASS = FOLD_WIDTHS_EM.indexOf(28.5);
 /** ...and of a desk's default 72ch column. */
@@ -405,7 +405,7 @@ test("a body the server rendered is counted by the words it shows, a link by its
   })]);
   assert.equal(rows[0].getAttribute("data-collapsed"), "true", "the rendered message did not fold");
   // Spread into this realm's arrays: the page's run in a context of their own.
-  const labels = (text) => [...page.pure("elisionLabels")(text)];
+  const labels = (text) => [...page.preludeBinding("elisionLabels")(text, page.pure("collapsedLines"))];
   const shown = labels(`${words} the run log`);
   assert.deepStrictEqual(FOLD_WIDTHS_EM.map((_width, at) => labelAt(rows[0], at)), shown,
     "the rendered body is not counted by the words on the screen");
@@ -425,7 +425,7 @@ test("A RICH HEADER'S ROW counts its text without the words the header restates,
     message({ id: "7440000000000000602", content: `${lead}${rest}` }),
   ]);
   assert.ok(textOfRow(rows[0]).children[0].hasAttribute("data-rh"), "the fixture's heading was not shown");
-  const labels = (text) => [...page.pure("elisionLabels")(text)];
+  const labels = (text) => [...page.preludeBinding("elisionLabels")(text, page.pure("collapsedLines"))];
   assert.deepStrictEqual(FOLD_WIDTHS_EM.map((_width, at) => labelAt(rows[0], at, "on")), labels(rest),
     "with the header showing, the row is not counted by the text under it");
   assert.deepStrictEqual(FOLD_WIDTHS_EM.map((_width, at) => labelAt(rows[0], at, "off")), labels(`${lead}${rest}`),
@@ -526,7 +526,7 @@ test("WHAT THE MODEL HAS NO RULE FOR GETS NO LABEL, and every element the server
   odd.append(page.document.createTextNode(wordsOfLength(200, 4)));
   body.append(odd);
   assert.equal(page.pure("foldRuns")(body), null, "an element with no rule was laid out from a guess");
-  assert.deepStrictEqual([...page.pure("elisionLabels")(null)], FOLD_WIDTHS_EM.map(() => ""));
+  assert.deepStrictEqual([...page.preludeBinding("elisionLabels")(null, page.pure("collapsedLines"))], FOLD_WIDTHS_EM.map(() => ""));
 });
 
 test("A CHARACTER OF A WIDE SCRIPT IS A PLACE A LINE BREAKS: Chinese after a word fills the line it starts on (#244)", async () => {
@@ -541,7 +541,8 @@ test("A CHARACTER OF A WIDE SCRIPT IS A PLACE A LINE BREAKS: Chinese after a wor
   };
   const shown = 5 + 13 + 15 + 15;
   assert.equal(await run(SCRIPT), saysHidden(305 - shown, "characters"), "Chinese after a word is not broken at its characters");
-  const control = await run(brokenScript("const wide = WIDE_SCRIPT.test(ch);", "const wide = false;"));
+  const control = await run(await brokenModule([{ file: "src/present/rows/fold.ts",
+    find: "const wide = WIDE_SCRIPT.test(ch);", replace: "const wide = false;" }]));
   assert.notEqual(control, saysHidden(305 - shown, "characters"), "the fixture cannot tell a split script from an unsplit one");
 });
 
