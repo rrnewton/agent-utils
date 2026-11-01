@@ -215,6 +215,20 @@ export {
   upstreamClearNowSentence,
   upstreamClearSentence,
 } from "../present/notices/index.ts";
+export {
+  cardGapWords,
+  cardMaxLinesWords,
+  cardRunText,
+  collapsedLinesWords,
+  elisionLabel,
+  gapWords,
+  lineLabel,
+  reactionKey,
+  reactionText,
+  readRunText,
+  undoLabel,
+  undoName,
+} from "../present/rows/index.ts";
 
 import { decode, decodeTagged, is, roots } from "../contract/index.ts";
 

@@ -260,7 +260,7 @@ test("A FOLDED MESSAGE ENDS WITH WHAT IT HIDES, counted at every width class, in
 
 test("EACH COUNT IS A FLOOR: fewer at a wider line, rounded down, and nothing under ten words (#244)", async () => {
   const page = newPage();
-  const says = (words, chars = words * 6) => page.pure("elisionLabel")({ words, chars });
+  const says = (words, chars = words * 6) => page.preludeBinding("elisionLabel")({ words, chars });
   assert.equal(says(ELIDED_MIN_WORDS - 1), "", "a floor of a few words claims that words are hidden");
   assert.equal(says(ELIDED_MIN_WORDS), `(~${ELIDED_MIN_WORDS} more words)`);
   assert.equal(says(19), "(~19 more words)", "under twenty the count is not exact");

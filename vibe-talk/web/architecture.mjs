@@ -54,6 +54,7 @@ export const PACKAGES = Object.freeze({
   "core/sync": BASE,
   "platform/web": BASE,
   "present/notices": [...BASE, "core/api", "present/time"],
+  "present/rows": BASE,
   "present/time": BASE,
   "view/composer": [...BASE, "view/dom"],
   "view/dom": BASE,

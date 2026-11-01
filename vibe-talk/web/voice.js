@@ -4108,15 +4108,6 @@ let collapsedLines = DEFAULT_COLLAPSED_LINES;
  */
 const FOLD_WIDTHS_EM = [14, 16, 18, 20, 22, 23.5, 25, 27, 28.5, 30, 33, 36, 40, 45, 50, 56, 63, 72, 84, 100];
 
-/** The fewest hidden words a label says: under that, a floor cannot say any are hidden. */
-const ELIDED_MIN_WORDS = 10;
-
-/** ...and the fewest characters, for text counted in characters: about as much as ten words. */
-const ELIDED_MIN_CHARS = 60;
-
-/** Characters to a hidden word past which the text is counted in characters rather than words. */
-const SPACE_POOR_CHARS = 12;
-
 // The glyph widths the fold model counts lines by (`WIDE_SCRIPT`, `glyphEm`, `SPACE_EM`, `MONO_EM`,
 // `monoEm`) are a module now: web/src/foundation/ (`#624 voice-page-modularity`).
 
@@ -4308,18 +4299,6 @@ function foldShows(laid, widthEm) {
     }
   }
   return { words, chars };
-}
-
-/**
- * The label for what a fold hides, `{words, chars}`: "(~240 more words)", "(~400 more characters)"
- * for text poor in spaces, or "" when it is too little to say anything is hidden.
- */
-function elisionLabel(hidden) {
-  const spacePoor = hidden.chars > SPACE_POOR_CHARS * Math.max(1, hidden.words);
-  const count = spacePoor ? hidden.chars : hidden.words;
-  if (count < (spacePoor ? ELIDED_MIN_CHARS : ELIDED_MIN_WORDS)) return "";
-  const step = count < 20 ? 1 : count < 100 ? 5 : count < 1000 ? 10 : 100;
-  return `(~${Math.floor(count / step) * step} more ${spacePoor ? "characters" : "words"})`;
 }
 
 /**
@@ -6687,27 +6666,6 @@ function markSearchHits(row, terms) {
 
 /** Whether a filter is choosing rows: the search text, Links, or whose messages. */
 const rowsChosen = () => readRunsSuspended();
-
-/**
- * A line's words: how many messages it stands for, and the days they reach when they reach any
- * (`#250 date-separators`) — "… 12 unmatched messages · Oct 3 – 5 …". With days, each side of the `·`
- * is held together, so a line too narrow for both — a phone 360px wide, the day said in full — wraps
- * between the count and the days and nowhere else: "… 2 unmatched messages ·" over "Today, Oct 12,
- * Mon …", never a lone "…" left on a line of its own. Held by no-break spaces, and a word joiner after
- * a range's dash, which the line breaking rules otherwise let a line end on even before a no-break
- * space: "Oct 9 –" over "Yesterday …".
- */
-function lineWords(count, days) {
-  if (!days) return `${count} …`;
-  const held = (words) => words.replace(/ /g, "\u00a0").replace(/–/g, "–\u2060");
-  return `${held(count)}\u00a0· ${held(days)}\u00a0…`;
-}
-
-/** What a screen reader is given of a line's words: no ellipses, and spaces where they are held together. */
-const lineLabel = (words) => words.replace(/…/g, "").replace(/\u2060/g, "").replace(/\u00a0/g, " ").trim();
-
-/** What a gap's line says, and the days it reaches when it reaches any (`#250 date-separators`). */
-const gapWords = (count, days = "") => lineWords(`… ${count} unmatched message${count === 1 ? "" : "s"}`, days);
 
 // `#439 search-unmatched-separators`. The unmatched runs the reader has opened, in each view, as the
 // ids of their messages: as a collapsed run's opened state is kept (`openedReadRuns`), because the
@@ -18643,10 +18601,6 @@ function persistCollapsedLines(n) {
   return deviceSettings().keptAs(DEVICE_SETTINGS.collapsedLines, n);
 }
 
-/** The count in words, as Settings and the status line say it. */
-const collapsedLinesWords = (n) =>
-  n === 0 ? "only their header" : `${n} line${n === 1 ? "" : "s"}`;
-
 /**
  * Work every drawn fold's hidden-word count out again under the count now in force. A label made
  * at three lines and left at eight would claim words the reader can see — the one thing the label
@@ -18841,9 +18795,6 @@ function persistCardMaxLines(n) {
   }
   return deviceSettings().keptAs(DEVICE_SETTINGS.cardMaxLines, n);
 }
-
-/** K in words, as Settings says it. */
-const cardMaxLinesWords = (n) => `${n} line${n === 1 ? "" : "s"}`;
 
 /** The slider, or − and +: K applied with the cards held where the reader is, and kept. */
 function cardMaxLinesChanged(value) {
@@ -38425,10 +38376,6 @@ const editedDrawn = (message) => (message && message.edited_timestamp ? String(m
 //     those who reacted (`owner_reacted`, which Slack reports), the chip is drawn in the accent, as
 //     Slack draws your own, and says so to a screen reader. Still a label: nothing here reacts.
 
-/** Two tallies of one emoji share this: a custom emoji is known by its id, a standard one by itself. */
-const reactionKey = (reaction) =>
-  reaction.custom ? `c:${reaction.custom_id || reaction.emoji}` : `u:${reaction.emoji}`;
-
 /**
  * A row's reactions: one tally per emoji, in the order first seen, counted over every message the
  * row stands for, and the owner's when the owner reacted with it to any of them. Empty when none
@@ -38451,9 +38398,6 @@ function rowReactions(messages) {
   }
   return [...tallies.values()];
 }
-
-/** What a chip shows of its emoji: the emoji itself, or a custom emoji's name between colons. */
-const reactionText = (tally) => (tally.custom ? `:${tally.emoji}:` : tally.emoji);
 
 /** A stable account of a message's reactions, for the lists that redraw only when a row changed. */
 const reactionsDrawn = (message) =>
@@ -41832,12 +41776,6 @@ function readRunWords(row) {
 /** The days a collapsed run's line says, kept on its first row by `drawSeams` (`#250 date-separators`). */
 const runDaysOf = (row) => String(row.runDays || "");
 
-/**
- * What a collapsed run's line says: how many, and the days it brings (`#250 date-separators`), held
- * together as a gap's line is (`lineWords`) so a narrow line breaks only between the two.
- */
-const readRunText = (count, days = "") => lineWords(`… ${count} read message${count === 1 ? "" : "s"}`, days);
-
 /** How many messages the collapsed run `row` heads stands for. */
 const readRunCount = (row) => readRunRows(row).reduce((sum, one) => sum + idsOf(one).length, 0);
 
@@ -42145,29 +42083,6 @@ function noteArchived(payload, replace) {
 let lastDismissal = null;
 
 /**
- * `#245 done-feedback`. What the Undo chip calls the message it would put back: the message's first
- * words, cut at a word to about this many characters — the whole of what its tooltip says. The chip
- * itself floats over the list beside the other chips and shows only what fits there, ending what it
- * cuts with an ellipsis of its own, and on a phone's narrow row only "Undo" (web/voice.css,
- * `#undo-dismiss .undo-name`).
- */
-const UNDO_NAME_CHARS = 80;
-
-/**
- * The opening words of `text`, to `UNDO_NAME_CHARS` and cut at a word with an ellipsis, for the
- * Undo chip. A first word longer than that is cut inside itself rather than dropped.
- */
-function undoName(text) {
-  let out = "";
-  for (const word of String(text === null || text === undefined ? "" : text).split(/\s+/).filter(Boolean)) {
-    const next = out ? `${out} ${word}` : word;
-    if (next.length > UNDO_NAME_CHARS) return `${out || word.slice(0, UNDO_NAME_CHARS)}…`;
-    out = next;
-  }
-  return out;
-}
-
-/**
  * The name a dismissal of `ids` gives its Undo: the message's opening words when the ids are ONE
  * row's (a Done, a swipe), or null when they span rows (Done through here, Clear the backlog), which
  * the chip then counts instead. Read off the row while it is still drawn: under Hide read it is gone
@@ -42179,16 +42094,6 @@ function dismissalName(ids) {
   if (!row || !ids.every((id) => idsOf(row).includes(id))) return null;
   const [first] = rowMessages(row);
   return first ? undoName(messageText(first)) || null : null;
-}
-
-/**
- * The Undo chip's words. Not a bare "Undo": after a Done the reader's eye is already on the next
- * message, and an Undo that does not say WHICH message it would put back is a guess.
- */
-function undoLabel(dismissal) {
-  if (dismissal === null) return "Undo";
-  if (dismissal.name) return `Undo “${dismissal.name}”`;
-  return `Undo Done (${dismissal.messages.length})`;
 }
 
 /**
@@ -48188,13 +48093,6 @@ function openedCardGaps(create) {
   return openedCardGapState;
 }
 
-/** What a gap among the cards says: its messages, and its threads when they are all it holds. */
-function cardGapWords(messages, threads, exact, onlyCards) {
-  const counted = `${exact ? "" : "at least "}${messages} unmatched message${messages === 1 ? "" : "s"}` +
-    (threads > 0 && onlyCards ? ` in ${threads} thread${threads === 1 ? "" : "s"}` : "");
-  return lineWords(`… ${counted}`, "");
-}
-
 /**
  * `list`'s children as the groups a gap counts: a card with the messages unpacked under it, or one
  * of Main's messages among the cards. Anything else ends a run and is left alone.
@@ -49358,14 +49256,6 @@ const cardRunIds = (row) => (row.hasAttribute("data-card") ? [`card:${row.getAtt
 
 /** Whether an item of the cards is read: a card by its thread (`threadIsRead`), a Main row by its messages. */
 const cardRunRead = (row) => (row.hasAttribute("data-card") ? row.hasAttribute("data-thread-read") : rowIsRead(row));
-
-/** What the line of a run over the cards says: how many read threads, and read messages of Main's. */
-function cardRunText(threads, messages) {
-  const parts = [];
-  if (threads > 0) parts.push(`${threads} read thread${threads === 1 ? "" : "s"}`);
-  if (messages > 0) parts.push(`${messages} read message${messages === 1 ? "" : "s"}`);
-  return `… ${parts.join(" and ")}`;
-}
 
 /** The items of the run whose line is on `head`, the line's item first: cards and Main rows, not unpacked rows. */
 function cardRunRows(head) {
