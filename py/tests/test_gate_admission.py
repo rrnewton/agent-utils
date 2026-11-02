@@ -42,10 +42,23 @@ def test_shared_gates_run_up_to_the_cap_and_queue_the_rest(tmp_path: Path) -> No
         proc.communicate(timeout=30)
 
 
+def _wait_for_queue(tmp_path: Path, count: int) -> None:
+    queue = tmp_path / "admission" / "queue"
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        if queue.exists() and len(list(queue.glob("*.json"))) >= count:
+            return
+        time.sleep(0.05)
+    raise AssertionError("gate ticket did not queue")
+
+
 def test_an_exclusive_run_waits_for_an_empty_box_and_blocks_new_gates(tmp_path: Path) -> None:
     holder = _start(tmp_path, "--slots", "3", "--", PY, "-c", "import time; time.sleep(4)")
     _wait_for_runs(tmp_path, 1)
     exclusive = _start(tmp_path, "--exclusive", "--", PY, "-c", "pass")
+    # Start the shared gate only once the exclusive ticket is durably queued
+    # ahead of it; starting both at once races their enqueue order.
+    _wait_for_queue(tmp_path, 1)
     shared = _start(tmp_path, "--", PY, "-c", "pass")
     shared_out, _ = shared.communicate(timeout=30)
     exclusive_out, _ = exclusive.communicate(timeout=30)
