@@ -6667,7 +6667,10 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         if !matches!(record.lifecycle.as_str(), "running" | "launch_failed")
             || record.mode != "interactive"
             || record.backend != "herdr"
-            || record.adapter != "herdr"
+            || !matches!(
+                record.adapter.as_str(),
+                "herdr" | "herdr-pane" | "herdr-relay"
+            )
         {
             return Err(fail(
                 "--retire-dead-native applies only to a running or launch-failed interactive herdr record",
@@ -12532,6 +12535,16 @@ its drain would also type, so it was not queued",
     fn require_dead_native(&self, record: &AgentRecord) -> Result<()> {
         Self::dead_native_anchor(record)?;
         match self.client.agent_pane(&record.name) {
+            // Herdr restored a custom pane as a plain shell after a reboot (#744): the
+            // shell occupying it is proof the harness exited, not that the agent lives.
+            Ok(_)
+                if record.adapter != "herdr"
+                    && record.pane_id.as_deref().is_some_and(|pane| {
+                        self.client.pane_is_idle_shell(pane).unwrap_or(false)
+                    }) =>
+            {
+                Ok(())
+            }
             Ok(_) => Err(fail("the recorded Herdr agent still exists")),
             Err(error)
                 if crate::client::herdr_error_code(&error.to_string()).as_deref()

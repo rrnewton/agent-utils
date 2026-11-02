@@ -1221,6 +1221,26 @@ fn dead_native_retirement_refuses_while_the_herdr_agent_still_exists() {
 }
 
 #[test]
+fn dead_native_retirement_archives_a_custom_record_whose_pane_is_a_plain_shell() {
+    // Herdr restored the Muse pane as /bin/bash after a reboot (#744).
+    let fixture = Fixture::new();
+    fixture.start(None);
+    let mut record = fixture.manager().load("worker").unwrap();
+    record.adapter = "herdr-pane".to_owned();
+    fixture.manager().save(&record).unwrap();
+    let record = fixture.manager().load("worker").unwrap();
+    let result = fixture
+        .manager()
+        .stop_with_options("worker", native_options(&fixture, &record))
+        .unwrap();
+    assert_eq!(result["retired_dead_native"], true);
+    assert!(!fixture
+        .root
+        .join("registry/agents/worker/agent.json")
+        .exists());
+}
+
+#[test]
 fn dead_native_retirement_refuses_a_wrong_record_digest() {
     let fixture = Fixture::new();
     fixture.start(None);
