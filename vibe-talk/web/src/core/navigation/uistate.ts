@@ -14,9 +14,12 @@ import type { StoragePort } from "../../ports/index.ts";
 const UI_STATE_KEY = "vibe-talk.voice.ui-state";
 /** The record's shape; a record of an older shape is brought forward (`fromUiStateV1`), any other dropped. */
 const UI_STATE_VERSION = 2;
-/** How many channels' chosen views the record keeps: the most recently on screen. */
+/** Channels whose chosen view is kept; the one least recently on screen is given up first. */
 const UI_STATE_CHANNELS = 50;
-/** The most characters the record may take: past it the oldest channels' choices go. */
+/**
+ * The whole record, in UTF-16 code units. A remembered thread carries its summary, root message and
+ * all, so this rather than the count is what stops a few long roots from growing it without end.
+ */
 const UI_STATE_CHARS = 60000;
 /** The views a channel reopens in. */
 const REOPENED_VIEWS: readonly string[] = Object.freeze(["main", "flat", "thread"]);
@@ -148,13 +151,13 @@ export interface UiState {
   heldPlace(): HeldPlace | null;
   /** Hold `place`. */
   holdPlace(place: HeldPlace): void;
-  /** Forget the record, here and in storage: signing out. */
+  /** Sign-out, another token, a refusal: the record goes, and the page stops reopening on it. */
   forget(): void;
   /** The views chosen under the credential now; a change of credential forgets them. */
   chosenViewsNow(): ChosenView[];
   /** The view chosen in `channel`, or undefined. */
   chosenView(channel: unknown): ChosenView | undefined;
-  /** `entry` chosen: first, and the channel's older choice gone. */
+  /** Keep `entry` as its channel's choice, first; past the bound, the channel least recently on screen goes. */
   remember(entry: ChosenView): void;
   /** Forget the choices of every channel `gone` says. */
   forgetChosen(gone: (channel: string) => boolean): void;
@@ -212,12 +215,34 @@ export function createUiState(deps: UiStateDependencies): UiState {
     return own;
   };
 
+  /**
+   * What the last page left, read once before anything is drawn. Later writes do not change it: it is
+   * what THIS page reopens on, not a mirror of the key.
+   */
   let savedUi = readUiState();
+  /**
+   * `#205 channel-view-memory`. The view the reader chose in each channel, the channel most recently
+   * on screen first: from that record, and then as they choose. Every place a channel's view is
+   * decided asks the page's `openingChannelView`, so a choice the saved shell could not honour yet — a
+   * thread, in a channel the shell thought had none — is honoured once `/client-config` says it can be.
+   */
   let chosenViews: ChosenView[] = savedUi ? savedUi.channels : [];
+  /** The credential `chosenViews` were chosen under. See `chosenViewsNow`. */
   let chosenViewsIdentity = savedUi ? savedUi.identity : "";
+  /**
+   * False until the page has reopened on `savedUi`, or the reader has done something of their own.
+   * Nothing is written before then: the call view the page puts up first is not where the reader was,
+   * and recording it would overwrite the record the reopen is about to use.
+   */
   let uiStateSettled = savedUi === null;
+  /** The last place measured in the channel list, under the channel and view it is a place in. */
   let heldPlace: HeldPlace | null = null;
 
+  /**
+   * The chosen views, for the token saved now. Another tab, or the main app, can replace the token
+   * under this page without a sign-out here, and what the last one chose — summaries of threads it
+   * read among them — must neither open the new one's channels nor be written down under its name.
+   */
   const chosenViewsNow = (): ChosenView[] => {
     const identity = deps.identity();
     if (chosenViewsIdentity !== identity) {
