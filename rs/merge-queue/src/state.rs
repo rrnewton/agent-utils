@@ -126,15 +126,16 @@ pub struct LandConfig {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RegenerateConfig {
-    /// Path patterns of generated files: an exact path, a directory ending in `/`, or a pattern
-    /// with `*` wildcards (matching any characters, `/` included).
+    /// Path patterns of generated files: an exact path, a directory (`dir/` or `dir`), or a
+    /// pattern with `*` wildcards (matching any characters, `/` included).
     pub paths: Vec<String>,
     /// Shell command, run at the repository root of a checkout, that rewrites every generated
     /// file from its sources. It must be deterministic and touch nothing else.
     pub command: String,
-    /// `conflict` (default): regenerate only when a change's conflicts are confined to generated
-    /// paths. `always`: also regenerate after every change, so combined changes never leave a
-    /// generated file stale.
+    /// `conflict` (default): regenerate when a change's conflicts are confined to generated
+    /// paths; a batch that touches generated files also has its final tip regenerated, because
+    /// a textual merge of generated files need not be the regenerated output. `always`: also
+    /// regenerate after every change, so combined changes never leave a generated file stale.
     pub when: String,
 }
 
@@ -144,9 +145,18 @@ impl RegenerateConfig {
         !self.paths.is_empty() && !self.command.trim().is_empty()
     }
 
-    /// Whether `path` is a generated file.
+    /// Whether `path` is a generated file. A pattern without wildcards names either
+    /// the file itself or the directory holding it (with or without a trailing
+    /// slash), so `generated` covers `generated/output.txt`: a file and a
+    /// directory of the same name cannot coexist in one tree, so this cannot
+    /// cover an unrelated path.
     pub fn covers(&self, path: &str) -> bool {
-        self.enabled() && self.paths.iter().any(|pattern| path_matches(pattern, path))
+        self.enabled()
+            && self.paths.iter().any(|pattern| {
+                path_matches(pattern, path)
+                    || (!pattern.contains('*')
+                        && path.starts_with(&format!("{}/", pattern.trim_end_matches('/'))))
+            })
     }
 
     /// Whether to regenerate after every change, not only after a generated-file conflict.
@@ -565,6 +575,31 @@ fn load_dir<T: DeserializeOwned>(dir: &Path) -> Result<Vec<T>, String> {
 mod unit {
     use super::*;
     use crate::tests::TestId;
+
+    #[test]
+    fn regenerate_covers_files_and_directories() {
+        let config = RegenerateConfig {
+            paths: vec![
+                "generated/output.txt".to_owned(),
+                "gen".to_owned(),
+                "docs/".to_owned(),
+                "assets/*.json".to_owned(),
+            ],
+            command: "regenerate".to_owned(),
+            when: String::new(),
+        };
+        assert!(config.covers("generated/output.txt"));
+        assert!(config.covers("gen/all.txt"));
+        assert!(config.covers("docs/guide/index.html"));
+        assert!(config.covers("assets/deep/data.json"));
+        assert!(!config.covers("genesis/all.txt"));
+        assert!(!config.covers("src/gen.rs"));
+        assert!(!config.covers("assets/data.xml"));
+        // No command or no paths: nothing is regenerable.
+        let mut disabled = config.clone();
+        disabled.command = String::new();
+        assert!(!disabled.covers("gen/all.txt"));
+    }
 
     #[test]
     fn classify_matches_ids_and_steps() {

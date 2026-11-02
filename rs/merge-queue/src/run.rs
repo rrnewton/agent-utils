@@ -246,14 +246,16 @@ pub struct WouldValidate {
 
 /// A candidate: `parent` plus `prs` combined in order.
 ///
-/// `prefixes` holds the commit after each change, aligned with `prs`. With
-/// `regenerate.when = always` only the final tip is regenerated eagerly in
-/// [`Runner::build`]; earlier prefixes keep the raw combined tree, whose
-/// generated files may be stale. A prefix is regenerated lazily, on first use,
-/// by [`Runner::regenerated_prefix`], because probe validation and the
-/// `validator.select` command both run in a checkout of the prefix and may read
-/// generated files, so a stale prefix must never be validated or selected from
-/// as-is.
+/// `prefixes` holds the commit after each change, aligned with `prs`. Only
+/// the final tip is regenerated eagerly in [`Runner::build`] (always under
+/// `regenerate.when = always`, and under `when = conflict` whenever the batch
+/// touched a generated file); earlier prefixes keep the raw combined tree,
+/// whose generated files may be stale. A prefix is regenerated lazily, on
+/// first use, by [`Runner::regenerated_prefix`] whenever the candidate's
+/// batch could have left one stale, because probe validation and the
+/// `validator.select` command both run in a checkout of the prefix and may
+/// read generated files, so a stale prefix must never be validated or
+/// selected from as-is.
 #[derive(Clone, Debug)]
 struct Candidate {
     prs: Vec<i64>,
@@ -264,6 +266,10 @@ struct Candidate {
     /// Lazily regenerated prefix commits, by 1-based prefix index, shared by
     /// every clone of this candidate so each prefix is regenerated at most once.
     regen_prefixes: Arc<Mutex<BTreeMap<usize, String>>>,
+    /// Whether an unregenerated prefix may hold stale generated files and must
+    /// be regenerated on first use: `regenerate.when = always`, or a batch
+    /// that touched generated files under `when = conflict`.
+    lazy_prefix_regen: bool,
 }
 
 impl Candidate {
@@ -735,6 +741,7 @@ impl<'a> Runner<'a> {
         let mut kept: Vec<i64> = Vec::new();
         let mut prefixes = Vec::new();
         let mut prefix_regenerated: Vec<bool> = Vec::new();
+        let mut prefix_touched: Vec<bool> = Vec::new();
         let mut conflicts = Vec::new();
         let mut held = Vec::new();
         let regen = self.config.regenerate.clone();
@@ -776,6 +783,19 @@ impl<'a> Runner<'a> {
                     continue;
                 }
             };
+            // Whether this combination involved a generated file: it
+            // conflicted in one, or its resulting tree changes one. A batch
+            // that touches generated files owes a regenerated final tip even
+            // when every combination merged textually cleanly, because a
+            // textual merge of generated files need not be the output the
+            // generator would produce from the combined sources.
+            let touched = regen.enabled()
+                && (!conflicted.is_empty()
+                    || self
+                        .git
+                        .diff_files(&tip, &next)?
+                        .iter()
+                        .any(|path| regen.covers(path)));
             // Conflict repair regenerates in-loop: the combined tree still holds
             // conflict markers in generated files, so nothing may build on it or
             // validate it until the generator has rewritten them. The `always`
@@ -801,17 +821,24 @@ impl<'a> Runner<'a> {
             kept.push(*pr);
             prefixes.push(tip.clone());
             prefix_regenerated.push(regenerated);
+            prefix_touched.push(touched);
         }
-        // Hoisted `always` regeneration: one generator run on the final tip, not
-        // one per change. The generator's contract (see `RegenerateConfig`) is
-        // that it rewrites every generated file from its sources
-        // deterministically and touches nothing else, so running it once on the
-        // combined sources yields the same final tree as running it after every
-        // change. If the last kept change already conflict-regenerated, the tip
-        // is current and no run is needed. A failed run is blamed on the last
-        // kept change, which is dropped, and the new tip is tried, mirroring
-        // the per-change ejection.
-        if regen.enabled() && regen.always() {
+        // Hoisted final-tip regeneration: one generator run on the final tip,
+        // not one per change. With `when = always` the tip is regenerated
+        // unconditionally; with `when = conflict` it is regenerated whenever
+        // the batch touched a generated file, because a combination that
+        // merged generated files textually (or took one side of them) can
+        // leave the tip different from the regenerated output, and only the
+        // regenerated tree may be validated. The generator's contract (see
+        // `RegenerateConfig`) is that it rewrites every generated file from
+        // its sources deterministically and touches nothing else, so running
+        // it once on the combined sources yields the same final tree as
+        // running it after every change. If the last kept change already
+        // conflict-regenerated, the tip is current and no run is needed. A
+        // failed run is blamed on the last kept change, which is dropped, and
+        // the new tip is tried, mirroring the per-change ejection.
+        let batch_touched = prefix_touched.iter().any(|touched| *touched);
+        if regen.enabled() && (regen.always() || batch_touched) {
             while !kept.is_empty() && !prefix_regenerated.last().copied().unwrap_or(false) {
                 let last = *kept.last().unwrap();
                 match self.regenerate(&tip, last, &[])? {
@@ -828,6 +855,7 @@ impl<'a> Runner<'a> {
                         let pr = kept.pop().unwrap();
                         prefixes.pop();
                         prefix_regenerated.pop();
+                        prefix_touched.pop();
                         conflicts.push((pr, "regeneration", why));
                         tip = prefixes
                             .last()
@@ -851,6 +879,7 @@ impl<'a> Runner<'a> {
                 tip,
                 prefixes,
                 regen_prefixes: Arc::new(Mutex::new(regen_prefixes)),
+                lazy_prefix_regen: regen.enabled() && (regen.always() || batch_touched),
             },
             conflicts,
         ))
@@ -1006,8 +1035,8 @@ impl<'a> Runner<'a> {
     /// change a selection or a probe verdict and blame the wrong change, so the
     /// specific prefix is regenerated when probed. Prefix `0` is the parent,
     /// which was itself validated before landing, and the final prefix is the
-    /// already-regenerated tip; neither is regenerated here. Outside `always`
-    /// mode every prefix that needed repair already got it in `build`, and the
+    /// already-regenerated tip; neither is regenerated here. When the batch
+    /// never touched a generated file (or regeneration is unconfigured) the
     /// raw prefix is returned unchanged.
     fn regenerated_prefix(&self, candidate: &Candidate, i: usize) -> Result<String, String> {
         if i == 0 {
@@ -1019,7 +1048,7 @@ impl<'a> Runner<'a> {
         if let Some(done) = lock(&candidate.regen_prefixes).get(&i).cloned() {
             return Ok(done);
         }
-        if !(self.config.regenerate.enabled() && self.config.regenerate.always()) {
+        if !(self.config.regenerate.enabled() && candidate.lazy_prefix_regen) {
             return Ok(candidate.prefix(i).to_owned());
         }
         let raw = candidate.prefix(i).to_owned();

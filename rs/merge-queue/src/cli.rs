@@ -76,7 +76,8 @@ enum Command {
         #[arg(long, value_name = "PATTERN")]
         union_path: Vec<String>,
         /// Generated-file path pattern the queue regenerates instead of treating its conflicts
-        /// as real (exact path, `dir/`, or `*` wildcards). Repeatable.
+        /// as real (exact path, directory with or without a trailing slash, or `*` wildcards).
+        /// Repeatable.
         #[arg(long, value_name = "PATTERN")]
         regen_path: Vec<String>,
         /// Shell command, run at a checkout's root, that rewrites every generated file.

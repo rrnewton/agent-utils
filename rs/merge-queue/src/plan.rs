@@ -175,12 +175,15 @@ pub fn probe_with_options(
     regenerable: Regenerable<'_>,
     options: ProbeOptions,
 ) -> Result<Probe, String> {
+    // A conflict is recorded with only its non-regenerable paths: a conflict
+    // confined to regenerable paths is not a conflict at all (the queue
+    // regenerates those files on the candidate), and a mixed conflict blocks
+    // only on its real paths.
     let real = |paths: Vec<String>| -> Vec<String> {
-        if paths.iter().all(|path| regenerable(path)) {
-            Vec::new()
-        } else {
-            paths
-        }
+        paths
+            .into_iter()
+            .filter(|path| !regenerable(path))
+            .collect()
     };
     let config_hash = options
         .config_hash
@@ -951,6 +954,108 @@ mod unit {
         use crate::git::testrepo::git;
         git(dir, &["add", "-A"]);
         git(dir, &["commit", "-q", "-m", "more"]);
+    }
+
+    fn regen_config(paths: &[&str]) -> crate::state::RegenerateConfig {
+        crate::state::RegenerateConfig {
+            paths: paths.iter().map(|path| (*path).to_owned()).collect(),
+            command: "regenerate".to_owned(),
+            when: String::new(),
+        }
+    }
+
+    #[test]
+    fn probe_conflicts_confined_to_regenerated_paths_are_not_conflicts() {
+        use crate::git::testrepo::*;
+        let tmp = TempDir::new("probe-regen-only");
+        let git = init(&tmp.0);
+        write(&tmp.0, "generated/output.txt", "1\n2\n3\n");
+        git_commit(&tmp.0);
+        let base = git.rev_parse("main").unwrap();
+        // Both changes touch ONLY the regenerated file, rewriting its first
+        // line differently: a textual conflict confined to that file.
+        let a = branch(
+            &tmp.0,
+            "a",
+            "main",
+            &[("generated/output.txt", "A\n2\n3\n")],
+        );
+        let b = branch(
+            &tmp.0,
+            "b",
+            "main",
+            &[("generated/output.txt", "B\n2\n3\n")],
+        );
+        let heads: BTreeMap<i64, Option<String>> = [(1, Some(a)), (2, Some(b))].into();
+
+        let strict = probe(&git, &base, &heads, &crate::git::nothing_regenerable).unwrap();
+        assert_eq!(strict.conflicts.len(), 1, "{strict:?}");
+
+        // An exact-path pattern and a directory pattern without its trailing
+        // slash both cover the file, so neither records a conflict.
+        for paths in [
+            vec!["generated/output.txt"],
+            vec!["generated"],
+            vec!["generated/"],
+        ] {
+            let config = regen_config(&paths);
+            let lenient = probe(&git, &base, &heads, &|path| config.covers(path)).unwrap();
+            assert!(lenient.conflicts.is_empty(), "{paths:?}: {lenient:?}");
+            assert!(lenient.base_conflicts.is_empty(), "{paths:?}: {lenient:?}");
+        }
+    }
+
+    #[test]
+    fn probe_base_conflicts_on_regenerated_paths_are_filtered() {
+        use crate::git::testrepo::*;
+        let tmp = TempDir::new("probe-regen-base");
+        let git = init(&tmp.0);
+        write(&tmp.0, "generated/output.txt", "1\n2\n3\n");
+        write(&tmp.0, "real.txt", "1\n2\n3\n");
+        git_commit(&tmp.0);
+        let old_base = git.rev_parse("main").unwrap();
+        let only = branch(
+            &tmp.0,
+            "only",
+            "main",
+            &[("generated/output.txt", "P\n2\n3\n")],
+        );
+        let mixed = branch(
+            &tmp.0,
+            "mixed",
+            "main",
+            &[
+                ("generated/output.txt", "P\n2\n3\n"),
+                ("real.txt", "P\n2\n3\n"),
+            ],
+        );
+        let _ = old_base;
+        // The base advances, rewriting the same lines of both files.
+        write(&tmp.0, "generated/output.txt", "Z\n2\n3\n");
+        write(&tmp.0, "real.txt", "Z\n2\n3\n");
+        git_commit(&tmp.0);
+        let base = git.rev_parse("main").unwrap();
+        let config = regen_config(&["generated/"]);
+
+        // Confined to the regenerated file: not a base conflict.
+        let heads: BTreeMap<i64, Option<String>> = [(1, Some(only))].into();
+        let probed = probe(&git, &base, &heads, &|path| config.covers(path)).unwrap();
+        assert!(probed.base_conflicts.is_empty(), "{probed:?}");
+        let raw = probe(&git, &base, &heads, &crate::git::nothing_regenerable).unwrap();
+        assert_eq!(
+            raw.base_conflicts[&1],
+            vec!["generated/output.txt".to_owned()]
+        );
+
+        // Mixed with a real path: still a base conflict, recorded with only
+        // its real paths.
+        let heads: BTreeMap<i64, Option<String>> = [(2, Some(mixed))].into();
+        let probed = probe(&git, &base, &heads, &|path| config.covers(path)).unwrap();
+        assert_eq!(
+            probed.base_conflicts[&2],
+            vec!["real.txt".to_owned()],
+            "{probed:?}"
+        );
     }
 
     /// A fixture queue: conflicting, clean and stacked branches over one base.

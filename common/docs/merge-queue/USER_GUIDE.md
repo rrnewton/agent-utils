@@ -91,9 +91,9 @@ This command creates the state directory and writes `config.json`.
 | `--depth N` | `2` | The initial window (batches validating at the same time) and the number of concurrent probes during a culprit search (at least 1). |
 | `--max-depth N` | `0` | The largest the adaptive window may grow: +1 per landed batch, halved per red batch, never below 1. `0` keeps the window fixed at `--depth`. |
 | `--union-path PATTERN` | none | A Git attribute pattern merged with Git's `union` driver, when probing conflicts and when combining changes. Repeatable. Only for line-oriented, append-only files (see "Union merges"). |
-| `--regen-path PATTERN` | none | A generated file (exact path, `dir/`, or `*` wildcards) whose conflicts the queue resolves by regenerating it instead of holding the change. Repeatable. See "Generated files". |
+| `--regen-path PATTERN` | none | A generated file (exact path, directory with or without a trailing slash, or `*` wildcards) whose conflicts the queue resolves by regenerating it instead of holding the change. Repeatable. See "Generated files". |
 | `--regen-command CMD` | empty | Shell command, run at a checkout's root, that rewrites every generated file from its sources. Required with `--regen-path`. |
-| `--regen-when WHEN` | `conflict` | `conflict`: regenerate only when a change's conflicts are confined to generated files. `always`: also after every change, so a combination never leaves a generated file stale. |
+| `--regen-when WHEN` | `conflict` | `conflict`: regenerate when a change's conflicts are confined to generated files; a batch that touches generated files also has its final tip regenerated, because a textual merge of generated files need not be the regenerated output. `always`: also after every change, so a combination never leaves a generated file stale. |
 | `--exact-sha` | off | Exact-commit rule: never carry a validation result to another commit. See "The exact-commit rule". |
 | `--trust-base` | off | Treat the base as green in culprit searches and skip probing it. Sound when only this queue lands on the base, always as exactly validated commits; a broken base would then be blamed on the first change of a red batch. |
 | `--classify PATTERN=CLASS` | none | Label failed tests whose ID, or whose step alone, matches `PATTERN` (exact or `*` wildcards) with `CLASS` in ejection records, reports and item history. One example is `--classify 'test.*_count=count pin drift'`. Repeatable. |
@@ -814,9 +814,11 @@ list them with `--regen-path` and give the command that rebuilds them with `--re
 - **Building.** When combining a change leaves conflicts only in generated files, the queue checks
   the combination out in a scratch worktree, runs the command there, and commits the rewritten
   files on top as `merge-queue: regenerate <paths> after #<pr>`, under `identity`. It does this
-  right after that change, so every prefix the culprit search might probe is consistent. With
-  `--regen-when always`, it also regenerates after every other change and commits only when a
-  generated file actually changed.
+  right after that change, so every prefix the culprit search might probe is consistent. A batch
+  that touches generated files also has its final tip regenerated before validation (under
+  `--regen-when always`, every batch does), because a textual merge of generated files need not
+  be the regenerated output. With `--regen-when always`, it also regenerates after every other
+  change and commits only when a generated file actually changed.
 - **Validation.** The candidate is then validated as usual. The commit that lands is the exact
   validated commit, regeneration included.
 - **Refusals.** A change is ejected with kind `regeneration` when the command fails, when it

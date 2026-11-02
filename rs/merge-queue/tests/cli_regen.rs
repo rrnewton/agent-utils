@@ -151,14 +151,26 @@ fn regeneration_that_touches_other_files_ejects_the_change() {
     fx.mq_ok(&["submit", "1", "--head", "b"]);
     fx.mq_ok(&["submit", "2", "--head", "c"]);
     let r = report(&fx.mq_ok(&["run", "--json"]));
-    assert_eq!(landed(&r), vec![vec![1]]);
-    assert_eq!(r["ejected"][0]["pr"], 2);
-    assert_eq!(r["ejected"][0]["kind"], "regeneration");
+    // #2's conflict repair runs the broken command and is ejected for it.
+    // #1 touched the generated file too, so its batch tip owes regeneration
+    // as well; with the generator broken nothing in the batch may land
+    // unregenerated, so #1 is ejected for the same reason.
+    assert!(landed(&r).is_empty(), "{r}");
+    let ejected: Vec<i64> = r["ejected"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["pr"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ejected, vec![2, 1], "{r}");
     assert!(
-        r["ejected"][0]["reason"]
-            .as_str()
-            .unwrap()
-            .contains("not generated: tests/t0"),
+        r["ejected"].as_array().unwrap().iter().all(|e| {
+            e["kind"] == "regeneration"
+                && e["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("not generated: tests/t0")
+        }),
         "{r}"
     );
 }
@@ -411,5 +423,287 @@ fn hoisted_always_tree_matches_per_change_regeneration() {
     assert_eq!(
         git(&batch.remote(), &["show", "main:gen/all.txt"]),
         "a\nb\nc"
+    );
+}
+
+const REGEN_ARGS: [&str; 4] = ["--regen-path", "gen/", "--regen-command", REGEN];
+
+/// Advance `main` on the remote with one commit writing `files` (as if another
+/// change landed directly), returning the new base commit.
+fn advance_main(fx: &Fixture, files: &[(&str, &str)]) -> String {
+    git(&fx.dev(), &["checkout", "-q", "main"]);
+    git(&fx.dev(), &["pull", "-q", "origin", "main"]);
+    for (path, text) in files {
+        fx.write(path, text);
+    }
+    fx.commit_all("advance main");
+    git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
+    git(&fx.dev(), &["rev-parse", "HEAD"])
+}
+
+#[test]
+fn only_generated_file_changes_batch_together_and_tip_is_regenerated() {
+    // (a) Two changes each touching ONLY the regenerated file conflict with
+    // each other on that file alone: no pairwise conflict is recorded, both
+    // land in one batch. (d) The landed tip's generated file is the
+    // regenerated output (from the unchanged sources), not either side's
+    // version: regeneration actually ran before validation.
+    let fx = setup("regen-only-pair", &REGEN_ARGS);
+    fx.branch("b", &[("gen/all.txt", "stale-b\n")]);
+    fx.branch("c", &[("gen/all.txt", "stale-c\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "b"]);
+    fx.mq_ok(&["submit", "2", "--head", "c"]);
+    let plan: Value = serde_json::from_str(&fx.mq_ok(&["plan", "--json"])).unwrap();
+    assert!(plan["held"].as_array().unwrap().is_empty(), "{plan}");
+    assert!(plan["conflicts"].as_array().unwrap().is_empty(), "{plan}");
+    assert_eq!(
+        plan["batches"][0]["prs"],
+        serde_json::json!([1, 2]),
+        "{plan}"
+    );
+
+    let r = report(&fx.mq_ok(&["run", "--json"]));
+    assert_eq!(landed(&r), vec![vec![1, 2]], "{r}");
+    assert_eq!(git(&fx.remote(), &["show", "main:gen/all.txt"]), "a", "{r}");
+}
+
+#[test]
+fn only_generated_file_changes_batch_together_in_merge_mode() {
+    // Same as above through the merge combine mode: the second merge
+    // conflicts only in the generated file, is repaired by regeneration,
+    // and the validated tip carries the regenerated output.
+    let fx = Fixture::new("regen-only-merge");
+    fx.write("src/a", "a\n");
+    fx.write("gen/all.txt", "a\n");
+    fx.write("tests/t0", "ok\n");
+    fx.commit_all("seed");
+    git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
+    fx.mq_ok(&[
+        "init",
+        "--remote",
+        "origin",
+        "--validator",
+        "command",
+        "--validator-run",
+        RUNNER,
+        "--max-batch",
+        "4",
+        "--combine",
+        "merge",
+        "--regen-path",
+        "gen/",
+        "--regen-command",
+        REGEN,
+    ]);
+    fx.branch("b", &[("gen/all.txt", "stale-b\n")]);
+    fx.branch("c", &[("gen/all.txt", "stale-c\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "b"]);
+    fx.mq_ok(&["submit", "2", "--head", "c"]);
+    let plan: Value = serde_json::from_str(&fx.mq_ok(&["plan", "--json"])).unwrap();
+    assert!(plan["held"].as_array().unwrap().is_empty(), "{plan}");
+    assert_eq!(
+        plan["batches"][0]["prs"],
+        serde_json::json!([1, 2]),
+        "{plan}"
+    );
+
+    let r = report(&fx.mq_ok(&["run", "--json"]));
+    assert_eq!(landed(&r), vec![vec![1, 2]], "{r}");
+    assert_eq!(git(&fx.remote(), &["show", "main:gen/all.txt"]), "a", "{r}");
+}
+
+#[test]
+fn base_conflict_only_in_generated_file_is_not_held() {
+    // (b) The base advanced after the change branched, rewriting the
+    // generated file (with its own new source). The change's conflict with
+    // the base is confined to the generated file: it is not held, and the
+    // landed tip's generated file covers both sources.
+    let fx = setup("regen-base", &REGEN_ARGS);
+    source_change(&fx, "b");
+    advance_main(&fx, &[("src/z", "z\n"), ("gen/all.txt", "a\nz\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "b"]);
+    let plan: Value = serde_json::from_str(&fx.mq_ok(&["plan", "--json"])).unwrap();
+    assert!(plan["held"].as_array().unwrap().is_empty(), "{plan}");
+    assert_eq!(plan["batches"][0]["prs"], serde_json::json!([1]), "{plan}");
+
+    let r = report(&fx.mq_ok(&["run", "--json"]));
+    assert_eq!(landed(&r), vec![vec![1]], "{r}");
+    assert_eq!(
+        git(&fx.remote(), &["show", "main:gen/all.txt"]),
+        "a\nb\nz",
+        "{r}"
+    );
+}
+
+#[test]
+fn mixed_generated_and_real_base_conflict_stays_held() {
+    // (c) A conflict spanning a generated path AND a real path is still a
+    // conflict: the change is held, not batched.
+    let fx = setup("regen-mixed", &REGEN_ARGS);
+    // Change branched from the seed: rewrites line 1 of the real shared file
+    // and the generated file (as its author saw it).
+    fx.branch(
+        "b",
+        &[
+            ("shared.txt", "B\n2\n3\n4\n5\n"),
+            ("gen/all.txt", "stale-b\n"),
+        ],
+    );
+    // The base then rewrote the same real line differently (and regenerated).
+    advance_main(
+        &fx,
+        &[("shared.txt", "Z\n2\n3\n4\n5\n"), ("gen/all.txt", "a\nz\n")],
+    );
+    fx.mq_ok(&["submit", "1", "--head", "b"]);
+    let plan: Value = serde_json::from_str(&fx.mq_ok(&["plan", "--json"])).unwrap();
+    assert!(plan["batches"].as_array().unwrap().is_empty(), "{plan}");
+    let held = plan["held"].as_array().unwrap();
+    assert_eq!(held.len(), 1, "{plan}");
+    assert_eq!(held[0]["kind"], "conflicts-with-base", "{plan}");
+    assert!(
+        held[0]["paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p == "shared.txt"),
+        "{plan}"
+    );
+}
+
+#[test]
+fn only_generated_changes_batch_with_directory_pattern_without_slash() {
+    // The regenerate pattern names the generated directory without a
+    // trailing slash: it still covers the files under it, so two changes
+    // touching only the generated file batch together and the landed tip
+    // is the regenerated output.
+    let fx = setup(
+        "regen-dir-noslash",
+        &["--regen-path", "gen", "--regen-command", REGEN],
+    );
+    fx.branch("b", &[("gen/all.txt", "stale-b\n")]);
+    fx.branch("c", &[("gen/all.txt", "stale-c\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "b"]);
+    fx.mq_ok(&["submit", "2", "--head", "c"]);
+    let plan: Value = serde_json::from_str(&fx.mq_ok(&["plan", "--json"])).unwrap();
+    assert!(plan["held"].as_array().unwrap().is_empty(), "{plan}");
+    assert_eq!(
+        plan["batches"][0]["prs"],
+        serde_json::json!([1, 2]),
+        "{plan}"
+    );
+
+    let r = report(&fx.mq_ok(&["run", "--json"]));
+    assert_eq!(landed(&r), vec![vec![1, 2]], "{r}");
+    assert_eq!(git(&fx.remote(), &["show", "main:gen/all.txt"]), "a", "{r}");
+}
+
+/// Regeneration whose output orders every source line at once (`sort -u`):
+/// a textual merge of two authors' generated files is not the regenerated
+/// output when their edits land in different regions.
+const REGEN_SORTED: &str = "cat src/* | sort -u > gen/all.txt";
+
+/// Like `RUNNER`, but the `gen` test compares against the sorted output.
+const RUNNER_SORTED: &str = r#"if [ "$MQ_SELECTION" = all ]; then set -- $(ls tests) gen; else set -- $MQ_TESTS; fi
+rc=0
+for t in "$@"; do
+  o=pass
+  if [ "$t" = gen ]; then
+    cat src/* | sort -u | cmp -s - gen/all.txt || o=fail
+  elif [ -f "tests/$t" ] && grep -q FAIL "tests/$t"; then o=fail; fi
+  [ $o = fail ] && rc=1
+  printf '{"id":"%s","outcome":"%s"}\n' "$t" "$o" >> "$MQ_RESULTS"
+done
+exit $rc"#;
+
+#[test]
+fn clean_generated_merge_still_regenerates_the_tip() {
+    // Neither change textually conflicts when combined (their generated
+    // edits are separated by an unchanged line), but the textually merged
+    // generated file is stale: it is not sorted. With `when = conflict`
+    // (the default) a batch that touches generated files must still have
+    // its final tip regenerated before validation, in rebase mode.
+    let fx = Fixture::new("regen-clean-merge");
+    fx.write("src/a", "x\n");
+    fx.write("src/b", "y\n");
+    fx.write("src/c", "z\n");
+    fx.write("gen/all.txt", "x\ny\nz\n");
+    fx.write("tests/t0", "ok\n");
+    fx.commit_all("seed");
+    git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
+    fx.mq_ok(&[
+        "init",
+        "--remote",
+        "origin",
+        "--validator",
+        "command",
+        "--validator-run",
+        RUNNER_SORTED,
+        "--max-batch",
+        "4",
+        "--regen-path",
+        "gen/",
+        "--regen-command",
+        REGEN_SORTED,
+    ]);
+    // #1 rewrites the first source and regenerates as its author saw it.
+    fx.branch("b", &[("src/a", "w\n"), ("gen/all.txt", "w\ny\nz\n")]);
+    // #2 rewrites the last source and regenerates likewise.
+    fx.branch("c", &[("src/c", "v\n"), ("gen/all.txt", "x\ny\nv\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "b"]);
+    fx.mq_ok(&["submit", "2", "--head", "c"]);
+    let plan: Value = serde_json::from_str(&fx.mq_ok(&["plan", "--json"])).unwrap();
+    assert!(plan["held"].as_array().unwrap().is_empty(), "{plan}");
+
+    let r = report(&fx.mq_ok(&["run", "--json"]));
+    assert_eq!(landed(&r), vec![vec![1, 2]], "{r}");
+    // The regenerated tip is the sorted union, not the textual merge
+    // ("w\ny\nv").
+    assert_eq!(
+        git(&fx.remote(), &["show", "main:gen/all.txt"]),
+        "v\nw\ny",
+        "{r}"
+    );
+}
+
+#[test]
+fn clean_generated_merge_still_regenerates_the_tip_in_merge_mode() {
+    // Same stale textual merge as `clean_generated_merge_still_regenerates_the_tip`,
+    // through the merge combine mode: the merge commit's tree is regenerated
+    // before validation.
+    let fx = Fixture::new("regen-clean-merge-mode");
+    fx.write("src/a", "x\n");
+    fx.write("src/b", "y\n");
+    fx.write("src/c", "z\n");
+    fx.write("gen/all.txt", "x\ny\nz\n");
+    fx.write("tests/t0", "ok\n");
+    fx.commit_all("seed");
+    git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
+    fx.mq_ok(&[
+        "init",
+        "--remote",
+        "origin",
+        "--validator",
+        "command",
+        "--validator-run",
+        RUNNER_SORTED,
+        "--max-batch",
+        "4",
+        "--combine",
+        "merge",
+        "--regen-path",
+        "gen/",
+        "--regen-command",
+        REGEN_SORTED,
+    ]);
+    fx.branch("b", &[("src/a", "w\n"), ("gen/all.txt", "w\ny\nz\n")]);
+    fx.branch("c", &[("src/c", "v\n"), ("gen/all.txt", "x\ny\nv\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "b"]);
+    fx.mq_ok(&["submit", "2", "--head", "c"]);
+    let r = report(&fx.mq_ok(&["run", "--json"]));
+    assert_eq!(landed(&r), vec![vec![1, 2]], "{r}");
+    assert_eq!(
+        git(&fx.remote(), &["show", "main:gen/all.txt"]),
+        "v\nw\ny",
+        "{r}"
     );
 }
