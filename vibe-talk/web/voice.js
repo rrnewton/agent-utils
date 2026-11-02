@@ -30962,230 +30962,53 @@ function renderSideCards() {
 // the place a layout had, the selected card through a sort the reader pressed — is found again by its card
 // wherever it now is, as before (`placeCardAnchor`'s `follow`).
 
-/**
- * Each of `rows`, by its id (`idOf`), with the ids of the rows before and after it, null at the ends: the cards
- * of a list, for whether one has moved since (`neighbourStayed`).
- *
- * @param {Element[]} rows
- * @param {(row: Element) => string} [idOf]
- * @returns {Map<string, {prev: string | null, next: string | null}>}
- */
-function rowNeighbours(rows, idOf = (row) => String(row.getAttribute("data-id"))) {
-  const id = (/** @type {Element | undefined} */ row) => (row ? idOf(row) : null);
-  return new Map(rows.map((row, at) => [idOf(row), { prev: id(rows[at - 1]), next: id(rows[at + 1]) }]));
-}
+// Where the reader is in the cards, and putting them back once the cards are drawn again — held by what kept
+// most of the screen still when the card held has moved — are web/src/view/channel's (`createCardPlaces`,
+// with `rowNeighbours`, `neighbourStayed` and `sameCardPlace`; `#624 voice-page-modularity`).
+
+/** The reader's place in the cards. */
+const cardPlaces = createCardPlaces({
+  lookup: (id) => leftEl(id),
+  readable: () => sideColumnUp() && columns.side.mode === "list" && !cardsOpening,
+  atBottom: (area) => atBottom(area),
+  followFoot: (area) => followFoot(area),
+  litCard: () => litCard(),
+  selectedCard: () => {
+    const mark = markOf(sidePane);
+    return mark && mark.card !== false ? mark.id : null;
+  },
+  finishSlide: () => finishPackSlide(),
+});
 
 /**
- * Whether the row `id` still stands beside a row it stood beside: in `now`, the rows' neighbours as drawn, and
- * `was`, as they were when the place was read (`rowNeighbours`). A row in neither place has moved, re-sorted
- * to the foot by a reply, and a row not drawn has gone; one whose neighbours were not noted is taken to stay.
+ * Where the reader is in the cards, or null with the cards not on screen, or being opened.
  *
- * @param {string} id
- * @param {Map<string, {prev: string | null, next: string | null}>} now
- * @param {Map<string, {prev: string | null, next: string | null} | undefined>} was
- */
-function neighbourStayed(id, now, was) {
-  const is = now.get(id);
-  const then = was.get(id);
-  return Boolean(is) && (!then || is.prev === then.prev || is.next === then.next);
-}
-
-/**
- * Where the reader is in the cards, to put them back after the cards change under them: a thread that
- * moved going to the foot, the cards filtered, the line over them coming or going. `#261
- * two-column-connectors`. As a list of messages keeps its reader (`keepingFilterPlace`, whose rules
- * these are): the reader on the foot follows it; else the highlighted card while it shows (`#277
- * thread-card-focus`), else the selected one, else the first card shown whole (`#612 view-stability`), else the
- * first card showing, stays at its height. With
- * every card off screen inside unpacked replies, keep the scroll offset. Null with the cards not on screen, and while they are being opened, which places the reader itself
- * (`placeOpenedCards`).
- *
- * `#612 view-stability`: and `rows`, every row on screen with its offset and its card, fully shown first, with
- * `cards`, the neighbours of each of those cards, for when the card held is the one that moved.
- *
- * @returns {CardPlace | null}
+ * @returns {import("./src/view/channel/index.ts").CardPlace | null}
  */
 function cardAnchor() {
-  if (!sideColumnUp() || columns.side.mode !== "list" || cardsOpening) return null;
-  const area = leftEl("side-scroll");
-  if (atBottom(area)) return { newest: true, id: null, offset: 0 };
-  const top = area.getBoundingClientRect().top;
-  const foot = top + (area.clientHeight || 0);
-  const list = /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children]);
-  const rows = list.filter((row) => row.hasAttribute("data-card") && rowShown(row));
-  const seen = (/** @type {HTMLElement} */ row) => {
-    const box = row.getBoundingClientRect();
-    return box.bottom > top && box.top < foot;
-  };
-  // `#612 view-stability`. Shown whole: a card half off the top that grows — its summary come, its root edited —
-  // grows over the cards under it, and they are what the reader is reading.
-  const whole = (/** @type {HTMLElement} */ row) => {
-    const box = row.getBoundingClientRect();
-    return box.top >= top - 1 && box.bottom <= foot + 1;
-  };
-  const mark = markOf(sidePane);
-  const card = (/** @type {string | null} */ id) => (id === null ? undefined : rows.find((one) => one.getAttribute("data-id") === id));
-  const row = [card(litCard()), card(mark && mark.card !== false ? mark.id : null)].find((one) => one && seen(one)) ||
-    rows.find((one) => seen(one) && whole(one)) || rows.find(seen);
-  // The rows on screen, in the list's order, read until the first below the foot: their boxes, and how much of
-  // each shows.
-  const around = [];
-  // The card each row is under: itself, or the card whose replies are unpacked after it.
-  let underCard = null;
-  for (const one of list) {
-    if (one.hasAttribute("data-card")) underCard = one;
-    if (!one.hasAttribute("data-id") || !rowShown(one)) continue;
-    const box = one.getBoundingClientRect();
-    if (box.height > 0 && box.top >= foot) break;
-    if (box.bottom <= top || box.top >= foot) continue;
-    const main = one.hasAttribute("data-main-row");
-    const owner = main ? null : underCard;
-    if (!main && !owner) continue;
-    around.push({ row: one, main, owner, offset: box.top - top, px: Math.min(box.bottom, foot) - Math.max(box.top, top),
-      whole: box.top >= top - 1 && box.bottom <= foot + 1 });
-  }
-  const near = rowNeighbours(list.filter((one) => one.hasAttribute("data-card")));
-  const cards = new Map();
-  const marks = [...around.filter((one) => one.whole), ...around.filter((one) => !one.whole)].map((one) => {
-    const owner = one.owner ? String(one.owner.getAttribute("data-id")) : null;
-    if (owner !== null) cards.set(owner, near.get(owner));
-    return { id: String(one.row.getAttribute("data-id")), card: owner, own: one.row.hasAttribute("data-card"),
-      offset: one.offset, px: one.px };
-  });
-  if (row) cards.set(String(row.getAttribute("data-id")), near.get(String(row.getAttribute("data-id"))));
-  // Deep inside an unpacked thread, every card can be above the viewport. Keep the scroll
-  // offset then: rebuilding those rows must still restore the reader after their nodes go.
-  if (!row) return { newest: false, id: null, offset: area.scrollTop, rows: marks, cards };
-  return { newest: false, id: String(row.getAttribute("data-id")), offset: row.getBoundingClientRect().top - top, rows: marks, cards };
+  return cardPlaces.anchor();
 }
 
 /**
- * A place in the cards, as `cardAnchor` reads it: the foot, or a card and how far below the top of the list's
- * window it stood, or with `id` null the scroll offset; and since `#612 view-stability` the rows on screen with
- * their cards' neighbours, which `placeCardAnchor` holds the reader by when that card has moved.
+ * Put the reader back on `anchor` in the cards; whether the reader was placed. With `follow`, a place the
+ * reader chose to come back to, the card wherever it now is.
  *
- * @typedef {{newest: boolean, id: string | null, offset: number,
- *   rows?: {id: string, card: string | null, own: boolean, offset: number, px: number}[],
- *   cards?: Map<string, {prev: string | null, next: string | null} | undefined>}} CardPlace
- */
-
-/**
- * The row of `place` to hold the reader by now that the cards are drawn again (`#612 view-stability`): when a card
- * whose rows showed more of the screen than every row that stayed has moved, its first row, wherever it now is;
- * else, when the card held has moved or gone, the first row on screen that stayed — Main's messages, or a row
- * whose card still stands beside a card it stood beside — and where that row stood. Null when the card held is
- * the one to hold, or when no row is drawn.
- *
- * @param {CardPlace} place
- * @returns {{row: HTMLElement, offset: number} | null}
- */
-function stayedCardRow(place) {
-  if (!place.rows || !place.cards) return null;
-  const list = /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children]);
-  const cards = list.filter((row) => row.hasAttribute("data-card"));
-  const byId = new Map(cards.map((card) => [card.getAttribute("data-id"), card]));
-  const now = rowNeighbours(cards);
-  const was = place.cards;
-  const stayed = (/** @type {{card: string | null}} */ mark) => mark.card === null || neighbourStayed(mark.card, now, was);
-  const found = (/** @type {{id: string, card: string | null, own: boolean}} */ mark) => {
-    if (mark.card === null) return list.find((one) => one.hasAttribute("data-main-row") && one.getAttribute("data-id") === mark.id);
-    const owner = byId.get(mark.card);
-    if (!owner || mark.own) return owner;
-    for (let at = list.indexOf(owner) + 1; at < list.length && !list[at].hasAttribute("data-card"); at += 1) {
-      if (list[at].getAttribute("data-id") === mark.id) return list[at];
-    }
-    return undefined;
-  };
-  const firstDrawn = (/** @type {typeof place.rows} */ marks) => {
-    for (const mark of marks) {
-      const row = /** @type {HTMLElement | undefined} */ (found(mark));
-      if (row && rowShown(row)) return { row, offset: mark.offset };
-    }
-    return null;
-  };
-  // Most of the screen moved together: follow it, and nothing the reader sees moves.
-  let still = 0;
-  const moved = new Map();
-  for (const mark of place.rows) {
-    if (stayed(mark)) still += mark.px;
-    else moved.set(mark.card, (moved.get(mark.card) || 0) + mark.px);
-  }
-  const [heaviest, px] = [...moved].reduce((best, entry) => (entry[1] > best[1] ? entry : best), [null, 0]);
-  if (heaviest !== null && px > still) {
-    const followed = firstDrawn(place.rows.filter((mark) => mark.card === heaviest));
-    if (followed) return followed;
-  }
-  if (place.id !== null && neighbourStayed(place.id, now, was)) return null;
-  return firstDrawn(place.rows.filter(stayed));
-}
-
-/**
- * Put the reader back on `anchor` in the cards: the foot, or that card at its height — or, where the
- * filters now hide it, the nearest card shown, in the list's order. Whether the reader was placed:
- * not for a card that has gone, nor where no card is shown.
- *
- * `#612 view-stability`: not after a card that has moved, re-sorted to the foot by a reply or gone, through a
- * change nobody asked for. The reader is held by what kept most of the screen still (`stayedCardRow`), and is
- * placed while one did. With `follow`, a place the reader chose to come back to, the card wherever it now is.
- *
- * @param {CardPlace | null} anchor
+ * @param {import("./src/view/channel/index.ts").CardPlace | null} anchor
  * @param {boolean} [follow]
  */
 function placeCardAnchor(anchor, follow = false) {
-  if (!anchor) return false;
-  const area = leftEl("side-scroll");
-  if (anchor.newest) {
-    followFoot(area);
-    return true;
-  }
-  const stayed = follow ? null : stayedCardRow(anchor);
-  if (stayed) {
-    area.scrollTop += stayed.row.getBoundingClientRect().top - area.getBoundingClientRect().top - stayed.offset;
-    return true;
-  }
-  if (anchor.id === null) {
-    area.scrollTop = anchor.offset;
-    return true;
-  }
-  const rows = /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children])
-    .filter((row) => row.hasAttribute("data-card"));
-  const at = rows.findIndex((row) => row.getAttribute("data-id") === anchor.id);
-  if (at < 0) return false;
-  let row = rowShown(rows[at]) ? rows[at] : null;
-  for (let step = 1; !row && step < rows.length; step += 1) {
-    row = [rows[at + step], rows[at - step]].find((one) => one && rowShown(one)) || null;
-  }
-  if (!row) return false;
-  area.scrollTop += row.getBoundingClientRect().top - area.getBoundingClientRect().top - anchor.offset;
-  return true;
+  return cardPlaces.place(anchor, follow);
 }
 
 /**
- * Whether two places in the cards, as `cardAnchor` reads them, are the same: both the foot, or the same
- * card within a pixel of the same height. `#280 scroll-stability`.
- *
- * @param {{newest: boolean, id: string | null, offset: number} | null} one
- * @param {{newest: boolean, id: string | null, offset: number} | null} other
- */
-function sameCardPlace(one, other) {
-  if (!one || !other || one.newest !== other.newest) return false;
-  return one.newest || (one.id === other.id && Math.abs(one.offset - other.offset) <= 1);
-}
-
-/**
- * Run `change` to the cards, keeping the reader's place in them. `#261 two-column-connectors`. With `follow`,
- * a change the reader asked for that re-sorts the cards: the card they are on is kept wherever it goes
- * (`#612 view-stability`).
+ * Run `change` to the cards, keeping the reader's place in them. With `follow`, a change the reader asked
+ * for that re-sorts the cards: the card they are on is kept wherever it goes.
  *
  * @param {() => void} change
  * @param {boolean} [follow]
  */
 function keepingCardPlace(change, follow = false) {
-  // `#460 pack-gap-slide`. A slide is ended first, so the place is read where the cards are laid out.
-  finishPackSlide();
-  const anchor = cardAnchor();
-  change();
-  placeCardAnchor(anchor, follow);
+  cardPlaces.keeping(change, follow);
 }
 
 /** True while the cards are being opened, which places the reader once they are drawn. */

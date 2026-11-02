@@ -245,3 +245,21 @@ test("`#624 voice-page-modularity`: the author filter's rows, button and chip, f
     globalThis.setTimeout = realTimeout;
   }
 });
+
+test("`#624 voice-page-modularity`: a card's neighbours, whether it stayed beside one, and two places compared, from the module alone", () => {
+  const { rowNeighbours, neighbourStayed, sameCardPlace } = CHANNEL_VIEW;
+  const card = (id) => ({ getAttribute: (name) => (name === "data-id" ? id : null) });
+  const was = rowNeighbours(["a", "b", "c", "d"].map(card));
+  assert.deepStrictEqual(was.get("a"), { prev: null, next: "b" });
+  assert.deepStrictEqual(was.get("c"), { prev: "b", next: "d" });
+  // "b" re-sorted to the foot: it stands beside neither neighbour; "c" keeps "d"; "e" was never noted.
+  const now = rowNeighbours(["a", "c", "d", "b", "e"].map(card));
+  assert.equal(neighbourStayed("b", now, was), false);
+  assert.equal(neighbourStayed("c", now, was), true);
+  assert.equal(neighbourStayed("e", now, was), true, "a card whose neighbours were not noted did not stay");
+  assert.equal(neighbourStayed("z", now, was), false, "a card not drawn stayed");
+  assert.equal(sameCardPlace({ newest: true, id: null, offset: 0 }, { newest: true, id: "x", offset: 9 }), true);
+  assert.equal(sameCardPlace({ newest: false, id: "a", offset: 10 }, { newest: false, id: "a", offset: 10.8 }), true);
+  assert.equal(sameCardPlace({ newest: false, id: "a", offset: 10 }, { newest: false, id: "a", offset: 12 }), false);
+  assert.equal(sameCardPlace(null, { newest: true, id: null, offset: 0 }), false);
+});

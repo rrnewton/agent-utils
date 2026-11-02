@@ -6580,7 +6580,9 @@ test("`#280 scroll-stability` x `#269 approval-card-inline` x `#281 view-keys`: 
     ...real, nearMain: false, nearTwo: false, midMain: false, midTwo: false, slackMain: false, slackTwo: false,
   });
   // The held place put back whether or not the reader moved the cards in two columns.
-  const always = await run(brokenScript("function sameCardPlace(one, other) {\n", "function sameCardPlace(one, other) {\n  return true;\n"));
+  const always = await run(await brokenModule([{ file: "src/view/channel/cardplace.ts",
+    find: "function sameCardPlace(one: CardPlace | null, other: CardPlace | null): boolean {\n",
+    replace: "function sameCardPlace(one: CardPlace | null, other: CardPlace | null): boolean {\n  return true;\n" }]));
   assert.deepStrictEqual(always, { ...real, moved: false });
 });
 

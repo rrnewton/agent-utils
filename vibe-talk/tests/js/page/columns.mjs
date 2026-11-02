@@ -1322,7 +1322,8 @@ test("`#261 two-column-connectors`: the cards have the newest thread at the foot
   assert.equal(moved, 0, `the card the reader was on moved ${moved}px when a thread above it went to the foot`);
   assert.equal(foot, false, "a reader up the list was taken to the foot");
   // The control: with the place not kept, the card moves up by the card that left above it.
-  const loose = await run(brokenScript("  change();\n  placeCardAnchor(anchor, follow);\n", "  change();\n"));
+  const loose = await run(await brokenModule([{ file: "src/view/channel/cardplace.ts",
+    find: "      change();\n      placeCardAnchor(anchor, follow);\n", replace: "      change();\n" }]));
   assert.ok(loose.moved < 0, "the negative control kept the card in place, so the check above proves nothing");
 });
 
@@ -1419,11 +1420,12 @@ test("`#612 view-stability`: a reply moving the card the reader is held by to th
   }
   // The controls. Held by the first card showing alone, as before, the cards on screen go with it to the foot;
   // held by the first card shown whole, but followed wherever it goes, they go with the highlighted card.
-  const FOLLOWED = ["  const stayed = follow ? null : stayedCardRow(anchor);\n", "  const stayed = null;\n"];
-  const first = await run(brokenScriptEach(FOLLOWED,
-    ["    rows.find((one) => seen(one) && whole(one)) || rows.find(seen);\n", "    rows.find(seen);\n"]), 1);
+  const FOLLOWED = { file: "src/view/channel/cardplace.ts",
+    find: "    const stayed = follow ? null : stayedCardRow(anchor);\n", replace: "    const stayed = null;\n" };
+  const first = await run(await brokenModule([FOLLOWED, { file: "src/view/channel/cardplace.ts",
+    find: "      rows.find((one) => seen(one) && whole(one)) || rows.find(seen);\n", replace: "      rows.find(seen);\n" }]), 1);
   assert.ok(first[0][1].length > 0, "the first negative control left the cards where they were, so the check above proves nothing");
-  const lit = await run(brokenScriptEach(FOLLOWED), 3);
+  const lit = await run(await brokenModule([FOLLOWED]), 3);
   assert.ok(lit[2][1].length > 0, "the second negative control left the cards where they were, so the check above proves nothing");
 });
 
@@ -1477,7 +1479,8 @@ test("`#612 view-stability`: a thread unpacked and being read, its replies filli
   const moved = await run(SCRIPT);
   assert.deepStrictEqual(moved, [], `the lines being read moved by (id, px): ${JSON.stringify(moved)}`);
   // The control: held by the cards that stayed, the thread being read goes to the foot from under the reader.
-  const loose = await run(brokenScript("  if (heaviest !== null && px > still) {\n", "  if (false) {\n"));
+  const loose = await run(await brokenModule([{ file: "src/view/channel/cardplace.ts",
+    find: "    if (heaviest !== null && px > still) {\n", replace: "    if (false) {\n" }]));
   assert.ok(loose.length > 0, "the negative control left the lines where they were, so the check above proves nothing");
 });
 

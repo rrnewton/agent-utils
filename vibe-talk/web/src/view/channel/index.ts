@@ -73,3 +73,5 @@ export {
 export type { ColumnLinks, ColumnLinksDependencies, LinkPair, LinkPane, MeasuredLinks, PlannedLink } from "./columnlinks.ts";
 export { AUTHOR_CHIP_MS, authorPasses, createAuthorFilter, rowIsMine } from "./authorfilter.ts";
 export type { AuthorFilter, AuthorFilterDependencies } from "./authorfilter.ts";
+export { createCardPlaces, neighbourStayed, rowNeighbours, sameCardPlace } from "./cardplace.ts";
+export type { CardPlace, CardPlaces, CardPlacesDependencies, Neighbours } from "./cardplace.ts";
