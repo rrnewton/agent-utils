@@ -10,6 +10,7 @@
 // the two lists equal.
 
 export {
+  createGathering,
   createServerSearch,
   searchPositiveTerms,
   searchQueryMatches,

@@ -21,3 +21,5 @@ export type {
 } from "./language.ts";
 export { SERVER_SEARCH_DELAY_MS, createServerSearch } from "./server.ts";
 export type { ServerSearch, ServerSearchDependencies, ServerSearchState } from "./server.ts";
+export { SEARCH_FURTHER_POLL_MS, createGathering } from "./gather.ts";
+export type { Gathering, GatheringDependencies, GatheringState } from "./gather.ts";

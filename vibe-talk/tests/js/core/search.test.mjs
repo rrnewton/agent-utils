@@ -81,3 +81,45 @@ test("`#624 voice-page-modularity`: the server search waits for the text to rest
   assert.equal(owner.state().failed, "");
   assert.equal(owner.state().key, "k3");
 });
+
+test("`#624 voice-page-modularity`: gathering older history asks, polls while the walk goes on, says why it failed, and stops", async () => {
+  const { createGathering, SEARCH_FURTHER_POLL_MS } = SEARCH;
+  const clock = testClock();
+  const said = [];
+  const states = [];
+  const gathering = createGathering({
+    clock,
+    prioritize: async (channel) => { said.push(["prioritize", channel]); return states.shift(); },
+    fetchState: async (channel) => { said.push(["state", channel]); return states.shift(); },
+    render: () => said.push(["render"]),
+    grew: () => said.push(["grew"]),
+    guard: (fn) => { fn(); },
+  });
+  states.push({ walking: true, oldest_ms: 100, complete: false });
+  await gathering.start("C1");
+  assert.equal(gathering.state().channel, "C1");
+  assert.equal(gathering.state().state.oldest_ms, 100);
+  assert.equal([...clock.timers.values()][0].ms, SEARCH_FURTHER_POLL_MS);
+  // The walk reached older messages: the search is asked again from the start, and the poll goes on.
+  states.push({ walking: true, oldest_ms: 50, complete: false });
+  clock.fire();
+  await new Promise((done) => setImmediate(done));
+  assert.deepStrictEqual(said.filter(([what]) => what === "grew").length, 1);
+  assert.equal(clock.timers.size, 1);
+  // Nothing new and the walk over: drawn, and no more polling.
+  states.push({ walking: false, oldest_ms: 50, complete: false });
+  clock.fire();
+  await new Promise((done) => setImmediate(done));
+  assert.equal(clock.timers.size, 0);
+  assert.equal(gathering.state().timer, null);
+  // A server that gathers nothing for the channel says so; stop forgets it all.
+  const refusing = createGathering({
+    clock, prioritize: async () => { throw { code: "history_not_cached" }; }, fetchState: async () => ({}),
+    render: () => {}, grew: () => {}, guard: (fn) => { fn(); },
+  });
+  await refusing.start("C2");
+  assert.equal(refusing.state().failed, "the server does not gather history for this channel");
+  assert.equal(clock.timers.size, 0, "a refused gathering polled");
+  refusing.stop();
+  assert.deepStrictEqual({ ...refusing.state() }, { channel: "", run: 0, state: null, timer: null, failed: "" });
+});

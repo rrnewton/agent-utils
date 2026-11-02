@@ -25169,7 +25169,7 @@ function scheduleServerSearch() {
   const key = serverSearchKeyNow();
   // A gathering asked for elsewhere, or with the search closed, is no longer watched here; the
   // server's own bump clears itself once the walk reaches the channel's beginning.
-  if (searchFurther.channel !== "" && (key === "" || !searchFurtherRunning())) stopSearchFurther();
+  if (gathering.state().channel !== "" && (key === "" || !searchFurtherRunning())) stopSearchFurther();
   serverSearchOwner.schedule(key, serverCopyOpen());
 }
 
@@ -25318,19 +25318,28 @@ function renderServerSearch() {
 // so on the line, and searches the server's copy again each time it holds older messages. Stop takes
 // the request back (DELETE). Never automatic: the owner chose a button over background scans.
 
-/** How often the page asks how the gathering of older history stands while it waits for it. */
-const SEARCH_FURTHER_POLL_MS = 5000;
-
-/** The gathering this page asked for: its channel, what the server last said of it, and its timer. */
-let searchFurther = { channel: "", run: 0, /** @type {VibeTalk.ChannelHistoryState | null} */ state: null,
-  timer: /** @type {any} */ (null), failed: "" };
-
-/** Each gathering this page asks for, numbered, so a look begun for one never acts for the next. */
-let searchFurtherRuns = 0;
-
 /** Whether a gathering this page asked for is under way in the channel on screen. */
-const searchFurtherRunning = () => searchFurther.channel !== "" &&
-  searchFurther.channel === String(selectedChannelId() || "");
+// Gathering the channel's older history — the ask, its run, the walk's state, why it failed and the
+// poll (SEARCH_FURTHER_POLL_MS) — is web/src/core/search's (`createGathering`, `#624
+// voice-page-modularity`); its requests and drawing it are here.
+const gathering = createGathering({
+  clock: browserPorts().clock,
+  prioritize: (channel) => apiDecoded("ChannelHistoryState",
+    `/api/v1/channels/${encodeURIComponent(channel)}/history/prioritize`, { method: "POST" }),
+  fetchState: (channel) => apiDecoded("ChannelHistoryState", `/api/v1/channels/${encodeURIComponent(channel)}/history`),
+  render: () => renderServerSearch(),
+  grew: () => {
+    serverSearchOwner.forget();
+    scheduleServerSearch();
+  },
+  guard: (fn) => guardQuietly(fn)(),
+});
+
+/** Stop gathering: the gathering and its poll forgotten, the search drawn again. */
+const stopSearchFurther = () => gathering.stop();
+
+const searchFurtherRunning = () => gathering.state().channel !== "" &&
+  gathering.state().channel === String(selectedChannelId() || "");
 
 /** Whether Search further back is offered: one channel, a copy the server keeps, not yet whole. */
 function searchFurtherOffered() {
@@ -25342,8 +25351,8 @@ function searchFurtherOffered() {
 /** The line's words for a gathering under way, or "". */
 function searchFurtherWords() {
   if (!searchFurtherRunning()) return "";
-  if (searchFurther.failed) return `gathering older history: ${searchFurther.failed}`;
-  const state = searchFurther.state;
+  if (gathering.state().failed) return `gathering older history: ${gathering.state().failed}`;
+  const state = gathering.state().state;
   if (!state) return "asking the server to gather older history…";
   const reached = typeof state.reached_ms === "number" ? state.reached_ms : state.oldest_ms;
   const back = typeof reached === "number" ? ` back to ${searchMomentWords(reached)}` : "";
@@ -25372,69 +25381,7 @@ async function searchFurtherPressed() {
       .catch(() => null);
     return;
   }
-  searchFurtherRuns += 1;
-  const run = searchFurtherRuns;
-  searchFurther = { channel, run, state: null, timer: null, failed: "" };
-  renderServerSearch();
-  try {
-    const state = await apiDecoded("ChannelHistoryState",
-      `/api/v1/channels/${encodeURIComponent(channel)}/history/prioritize`, { method: "POST" });
-    if (searchFurther.run !== run) return;
-    searchFurther.state = state;
-  } catch (error) {
-    if (searchFurther.run !== run) return;
-    searchFurther.failed = error && (error.code === "history_backfill_off" || error.code === "history_not_cached")
-      ? "the server does not gather history for this channel"
-      : String((error && (error.detail || error.message)) || "the server did not answer");
-  }
-  renderServerSearch();
-  if (!searchFurther.failed) pollSearchFurther(channel, run);
-}
-
-/**
- * Ask how the gathering stands, and search the server's copy again when it holds older messages.
- * Goes on while the walk runs, is queued, or is held back for a while (a rate limit, an error), and
- * through a look that fails, which the line says; ends when the walk is done, or with Stop.
- */
-function pollSearchFurther(channel, run) {
-  searchFurther.timer = setTimeout(() => guardQuietly(async () => {
-    if (searchFurther.run !== run) return;
-    const before = searchFurther.state;
-    /** @type {VibeTalk.ChannelHistoryState | null} */
-    let state = null;
-    try {
-      state = await apiDecoded("ChannelHistoryState", `/api/v1/channels/${encodeURIComponent(channel)}/history`);
-    } catch (error) {
-      if (searchFurther.run !== run) return;
-      searchFurther.failed = String((error && (error.detail || error.message)) || "the server did not answer");
-      renderServerSearch();
-      pollSearchFurther(channel, run);
-      return;
-    }
-    if (searchFurther.run !== run) return;
-    searchFurther.state = state;
-    searchFurther.failed = "";
-    const older = (/** @type {VibeTalk.ChannelHistoryState | null} */ held) =>
-      (held && typeof held.oldest_ms === "number" ? held.oldest_ms : null);
-    if (older(state) !== older(before) || state.complete !== Boolean(before && before.complete)) {
-      // The copy grew: the same search, asked again from the start.
-      serverSearchOwner.forget();
-      scheduleServerSearch();
-    } else {
-      renderServerSearch();
-    }
-    const going = state.walking || (state.queue_position !== null && state.queue_position !== undefined) ||
-      (typeof state.held_until_ms === "number");
-    if (!state.complete && going) pollSearchFurther(channel, run);
-    else searchFurther.timer = null;
-  })(), SEARCH_FURTHER_POLL_MS);
-}
-
-/** Stop asking how the gathering stands: Stop, another channel, or the search closed. */
-function stopSearchFurther() {
-  if (searchFurther.timer !== null) clearTimeout(searchFurther.timer);
-  searchFurther = { channel: "", run: 0, state: null, timer: null, failed: "" };
-  renderServerSearch();
+  await gathering.start(channel);
 }
 
 /** All channels ticked or unticked: the server is asked again over the channels it now names. */
