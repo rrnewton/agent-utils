@@ -382,6 +382,7 @@
         "py/wrkslots/tests/test_census_subject_progress.py",
         "py/wrkslots/tests/test_census_threads.py",
         "py/wrkslots/tests/test_census_traversal_deadline.py",
+        "py/wrkslots/tests/test_classify_journals_rust.py",
         "py/wrkslots/tests/test_cli.py",
         "py/wrkslots/tests/test_config_validate_rust.py",
         "py/wrkslots/tests/test_create_text_rust.py",

@@ -5034,6 +5034,7 @@ fn cli_surface_contains_no_executor_or_mutation_subcommand() {
             "classify-ownerless-validate-batch",
             "classify-ownerless-validate-batch-text",
             "freeze",
+            "classify-create-journals",
             "recover-ownerless-agent-cache",
             "recover-ownerless-agent-clone",
             "recover-ownerless-validate-batch",

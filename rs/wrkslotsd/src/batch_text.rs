@@ -23,6 +23,10 @@ pub(crate) fn sort_keys(value: &Value) -> Value {
 }
 
 /// Python `json.dumps(..., sort_keys=True)` spelling: `, ` and `: `.
+pub(crate) fn py_compact_pub(value: &Value) -> String {
+    py_compact(value)
+}
+
 fn py_compact(value: &Value) -> String {
     match value {
         Value::Null => "null".to_string(),

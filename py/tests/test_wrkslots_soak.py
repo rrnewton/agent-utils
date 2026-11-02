@@ -59,6 +59,9 @@ case "$1" in
   freeze)
     if [ "$2" = "--help" ]; then echo "Usage: --root --machine set clear status"; exit 0; fi
     echo "RS freeze $@" ;;
+  classify-create-journals)
+    if [ "$2" = "--help" ]; then echo "Usage: --root --machine --agent --slot-type --format"; exit 0; fi
+    echo "RS classify-create-journals $@" ;;
   classify-ownerless-validate-batch-text)
     if [ "$2" = "--help" ]; then echo "Usage: --root --machine --checkout --frozen-validate-checkout --completed-record --repository --validation-proof-manifest --format"; exit 0; fi
     echo "RS classify-ownerless-validate-batch-text $@" ;;
@@ -203,6 +206,13 @@ def test_freeze_runs_in_rust(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert result.stdout.startswith("RS freeze freeze status")
     assert "cmd=freeze edition=rust rc=0" in log.read_text()
+def test_classify_create_journals_runs_in_rust(tmp_path: Path) -> None:
+    root, log = _sandbox(tmp_path)
+    result = _run(root, log, "classify-create-journals", "slot01", "--agent", "a1")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("RS classify-create-journals classify-create-journals slot01")
+    assert "cmd=classify-create-journals edition=rust rc=0" in log.read_text()
+
 
 def test_recover_batch_both_formats_run_in_rust(tmp_path: Path) -> None:
     root, log = _sandbox(tmp_path)

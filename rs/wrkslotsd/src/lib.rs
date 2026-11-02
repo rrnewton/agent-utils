@@ -47,6 +47,7 @@ mod archive_state;
 mod audit_state;
 mod batch_text;
 mod canonical;
+mod classify_journals;
 pub mod cli;
 mod config;
 mod config_validate;

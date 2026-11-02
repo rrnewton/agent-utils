@@ -866,6 +866,26 @@ pub(crate) enum Command {
         #[arg(long, value_name = "NAME")]
         machine: Option<String>,
     },
+    /// Classify outstanding create journals without locks or writes, printing the Python output
+    ClassifyCreateJournals {
+        /// Requested slot name the journals must be unrelated to
+        slot: String,
+        /// Requested agent name the journals must be unrelated to
+        #[arg(long, value_name = "NAME")]
+        agent: String,
+        /// Slot type: agent or validate
+        #[arg(long, value_name = "TYPE", default_value = "agent")]
+        slot_type: String,
+        /// Output format: human prints the journal lines; json prints the payload
+        #[arg(long, value_name = "FORMAT", default_value = "human", value_parser = ["human", "json"])]
+        format: String,
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
     /// Resume a journal or start bounded ownerless validation cleanup (writer; fixture registries only until cutover)
     Recover {
         /// Live current coordinator PID recorded with recovery
@@ -2311,6 +2331,30 @@ pub fn run() -> u8 {
             machine.as_deref(),
             &action,
             &reason,
+        ) {
+            Ok(text) => {
+                print!("{text}");
+                return 0;
+            }
+            Err(error) => {
+                eprintln!("wrkslotsd: {error}");
+                return 1;
+            }
+        },
+        Command::ClassifyCreateJournals {
+            slot,
+            agent,
+            slot_type,
+            format,
+            root,
+            machine,
+        } => match crate::classify_journals::classify_create_journals(
+            root.as_deref(),
+            machine.as_deref(),
+            &slot,
+            &slot_type,
+            &agent,
+            format == "json",
         ) {
             Ok(text) => {
                 print!("{text}");
