@@ -30433,9 +30433,6 @@ function refilterSideCards() {
 // CARD_STATES, THREADS_UNPACKED_KEY, THREAD_CARD_STATES_KEY; `#624 voice-page-modularity`).
 const cardPacking = createCardPacking({ storage: () => deviceStorage() });
 
-/** How many threads unpacking may be reading at once: enough that scrolling never waits on one. */
-const UNPACK_READS_AT_ONCE = 3;
-
 /** How far below the cards on screen a block starts its read, in px: about one screenful ahead. */
 const UNPACK_NEAR_PX = 400;
 
@@ -30453,19 +30450,32 @@ function cardState(choice, read) {
   return cardPacking.mode() === "all" || (cardPacking.mode() === "unread" && !read) ? "unpacked" : "collapsed";
 }
 
-/** Threads an unpack read is owed, running, done or failed for, so each is read once. */
-const unpackReads = new Map();
-
 /**
- * `vt-thread-unpack-loop`. The reply count each done unpack read's thread had when the read landed, by
- * thread: a thread is read again only once its count has grown past that. A thread longer than one
- * page never holds all its replies, so "fewer held than its count" alone asked for its newest page
- * again every time its rows were drawn, and drawing them is what a landed read does.
+ * The reads unpacking owes the threads — each read once, again only once its thread has grown past what
+ * the read brought, `UNPACK_READS_AT_ONCE` at a time — are web/src/core/channels's (`createUnpackReads`,
+ * `#624 voice-page-modularity`); the read itself, and drawing what it brought, are here.
  */
-const unpackReadCounts = new Map();
-
-/** Reads under way for unpacked blocks: `UNPACK_READS_AT_ONCE` at most. */
-let unpackReadsRunning = 0;
+const unpackReadQueue = createUnpackReads({
+  read: async (id) => {
+    const channel = String(selectedChannelId());
+    if (channelStore.current().channel !== channel) loadCanon(channel);
+    const held = heldNow(channelStore.current());
+    const path = withThreadQuery(
+      `/api/v1/channels/${encodeURIComponent(channel)}/timeline?view=thread&limit=${DISCORD_PAGE_LIMIT}&reason=threads`, id);
+    const payload = await readTimeline(path, undefined);
+    if (String(selectedChannelId()) !== channel) return false;
+    foldTimelinePage(payload, false, "thread", id, held);
+    return true;
+  },
+  ended: (id) => {
+    sideCardsDrawn = "";
+    if (sideColumnUp()) renderSideColumn();
+    // `#410 inline-reply-editor`. A thread gathered under its root in Main draws what the read brought.
+    const wanting = gatherState().gathered && gatherState().gathered.thread === id ? gatherState().gathered.column : null;
+    if (wanting) inColumn(wanting, renderChannelRows);
+  },
+  guard: (run) => guardQuietly(run)(),
+});
 
 /** The observer that reads a thread as its block nears the screen, made when first wanted. */
 let unpackObserver = null;
@@ -30638,25 +30648,8 @@ function isThreadRoot(message, choice) {
 
 /** Whether thread `choice` still owes unpacking a read: held replies short of its count, uncovered. */
 function unpackNeedsRead(choice, held) {
-  const state = unpackReads.get(choice.id);
-  if (state === "queued" || state === "reading" || state === "failed") return false;
   const replies = held.filter((message) => !isThreadRoot(message, choice)).length;
-  if (state === "done") {
-    // Read once, and again only when the thread has grown past what that read brought: its count
-    // above the one it had when the read landed (`unpackReadCounts`), as well as above what is held.
-    if (!unpackReadCounts.has(choice.id)) unpackReadCounts.set(choice.id, choice.count);
-    const landed = unpackReadCounts.get(choice.id);
-    // A read that landed knowing no count leaves one learnt since to say what is owed.
-    if (typeof choice.count === "number" && replies < choice.count &&
-        (typeof landed !== "number" || choice.count > landed)) {
-      unpackReads.delete(choice.id);
-      unpackReadCounts.delete(choice.id);
-    } else return false;
-  }
-  const cover = channelStore.current().views.get(viewKey("thread", choice.id));
-  if (cover && !cover.more) return false;
-  if (typeof choice.count === "number") return replies < choice.count;
-  return !cover && replies === 0;
+  return unpackReadQueue.owed(choice, replies, channelStore.current().views.get(viewKey("thread", choice.id)));
 }
 
 /**
@@ -30708,7 +30701,7 @@ function unpackSignature(choice, held) {
   return JSON.stringify([choice.id, readModes.mode(), readRunsSuspended(), hideEmptyMessages, combineMessages,
     view.mode, view.cut ? view.cut.head : 0, view.cut && choice.root ? renderedHtmlOf(choice.root) || rawTextOf(choice.root) : "",
     held.map(messageLook), hidingRead() ? unpackReadSignature(held) : "",
-    opened ? [...opened].sort() : [], unpackReads.get(choice.id) || "", readAloudOwner().nowPlaying ? readAloudOwner().nowPlaying.id : "", readAloudOwner().pendingRead,
+    opened ? [...opened].sort() : [], unpackReadQueue.state(choice.id) || "", readAloudOwner().nowPlaying ? readAloudOwner().nowPlaying.id : "", readAloudOwner().pendingRead,
     // `#532 shift-o-latency`: what decides its loading or end line (`unpackNeedsRead`, the cover), which
     // a block kept from the last pass would otherwise never ask again.
     typeof choice.count === "number" ? choice.count : null, cover ? cover.more !== false : null]);
@@ -30794,7 +30787,7 @@ function unpackBlock(choice, tally) {
   });
   placeUnpackRuns(choice, rows);
   const cover = channelStore.current().views.get(viewKey("thread", choice.id));
-  if (unpackReads.get(choice.id) === "failed") {
+  if (unpackReadQueue.state(choice.id) === "failed") {
     const failed = document.createElement("li");
     failed.className = "unpack-row unpack-loading hint";
     failed.setAttribute("data-unpack-thread", choice.id);
@@ -30854,49 +30847,7 @@ function watchUnpackBlock(row, id) {
 
 /** Queue thread `id`'s newest page for its block, `UNPACK_READS_AT_ONCE` at a time. */
 function queueUnpackRead(id) {
-  if (!id || unpackReads.has(id)) return;
-  unpackReads.set(id, "queued");
-  pumpUnpackReads();
-}
-
-/** Start queued unpack reads while fewer than `UNPACK_READS_AT_ONCE` are on the wire. */
-function pumpUnpackReads() {
-  for (const [id, state] of unpackReads) {
-    if (unpackReadsRunning >= UNPACK_READS_AT_ONCE) return;
-    if (state !== "queued") continue;
-    unpackReads.set(id, "reading");
-    unpackReadsRunning += 1;
-    guardQuietly(() => readUnpackThread(id))();
-  }
-}
-
-/** One thread's newest page, folded into the store, its block drawn again from what it brought. */
-async function readUnpackThread(id) {
-  const channel = String(selectedChannelId());
-  try {
-    if (channelStore.current().channel !== channel) loadCanon(channel);
-    const held = heldNow(channelStore.current());
-    const path = withThreadQuery(
-      `/api/v1/channels/${encodeURIComponent(channel)}/timeline?view=thread&limit=${DISCORD_PAGE_LIMIT}&reason=threads`, id);
-    const payload = await readTimeline(path, undefined);
-    if (String(selectedChannelId()) !== channel) {
-      unpackReads.delete(id);
-      unpackReadCounts.delete(id);
-      return;
-    }
-    foldTimelinePage(payload, false, "thread", id, held);
-    unpackReads.set(id, "done");
-  } catch (_error) {
-    unpackReads.set(id, "failed");
-  } finally {
-    unpackReadsRunning -= 1;
-    sideCardsDrawn = "";
-    if (sideColumnUp()) renderSideColumn();
-    // `#410 inline-reply-editor`. A thread gathered under its root in Main draws what the read brought.
-    const wanting = gatherState().gathered && gatherState().gathered.thread === id ? gatherState().gathered.column : null;
-    if (wanting) inColumn(wanting, renderChannelRows);
-    pumpUnpackReads();
-  }
+  unpackReadQueue.queue(id);
 }
 
 // --- the main channel's messages among the cards (#419 threads-view-main-messages) -------------------
@@ -31965,8 +31916,7 @@ function closeSideThread() {
  */
 function resetSideColumn(reopen = false) {
   // `#404 threads-unpack-all`. Unpack reads were the last channel's.
-  unpackReads.clear();
-  unpackReadCounts.clear();
+  unpackReadQueue.forget();
   if (unpackObserver !== null) {
     unpackObserver.disconnect();
     unpackObserver = null;

@@ -54,3 +54,5 @@ export type { HeldSummary, Summaries, SummariesDependencies, SummaryAnswer, Summ
 export { createChannelDirectory } from "./directory.ts";
 export type { ChannelDirectory, DeploymentCapabilities } from "./directory.ts";
 export { answerUnplaced, heldAsSent, unplacedToAsk } from "./unplaced.ts";
+export { UNPACK_READS_AT_ONCE, createUnpackReads } from "./unpackreads.ts";
+export type { UnpackReads, UnpackReadsDependencies, UnpackedThread } from "./unpackreads.ts";

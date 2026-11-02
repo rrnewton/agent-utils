@@ -102,6 +102,7 @@ declare const foldLiveIn: LegacyImports["foldLiveIn"];
 declare const foldPageIn: LegacyImports["foldPageIn"];
 declare const emptyTally: LegacyImports["emptyTally"];
 declare const createChannelStore: LegacyImports["createChannelStore"];
+declare const createUnpackReads: LegacyImports["createUnpackReads"];
 declare const answerUnplaced: LegacyImports["answerUnplaced"];
 declare const heldAsSent: LegacyImports["heldAsSent"];
 declare const unplacedToAsk: LegacyImports["unplacedToAsk"];

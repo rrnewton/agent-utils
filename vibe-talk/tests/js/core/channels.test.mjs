@@ -691,3 +691,43 @@ test("`#624 voice-page-modularity`: the store's rules for messages the stream le
   canon.messages = [one];
   assert.equal(heldAsSent(canon, held), false, "a message taken out reads as held");
 });
+
+test("`#624 voice-page-modularity`: unpacking reads each thread once, three at a time, and again only once it has grown", async () => {
+  const { createUnpackReads, UNPACK_READS_AT_ONCE } = CHANNELS;
+  assert.equal(UNPACK_READS_AT_ONCE, 3);
+  const pending = new Map();
+  const ended = [];
+  let landed = true;
+  const reads = createUnpackReads({
+    read: (id) => new Promise((resolve, reject) => pending.set(id, { resolve, reject })),
+    ended: (id) => ended.push(id),
+    guard: (run) => { run(); },
+  });
+  const settle = () => new Promise((resolve) => setImmediate(resolve));
+  // Owed: replies short of the count, and no cover saying all is held.
+  assert.equal(reads.owed({ id: "t1", count: 5 }, 2, undefined), true);
+  assert.equal(reads.owed({ id: "t1", count: 5 }, 2, { more: false }), false, "a thread held whole is owed a read");
+  assert.equal(reads.owed({ id: "t1" }, 0, undefined), true, "a thread with no count and nothing held is not owed");
+  assert.equal(reads.owed({ id: "t1" }, 0, { more: true }), false);
+  for (const id of ["t1", "t2", "t3", "t4", "t1"]) reads.queue(id);
+  reads.queue("");
+  assert.deepStrictEqual([...pending.keys()], ["t1", "t2", "t3"], "more than three read at once, or one twice");
+  assert.equal(reads.state("t4"), "queued");
+  assert.equal(reads.owed({ id: "t1", count: 5 }, 2, undefined), false, "a thread being read is owed again");
+  pending.get("t1").resolve(true);
+  await settle();
+  assert.deepStrictEqual([reads.state("t1"), ended], ["done", ["t1"]]);
+  assert.ok(pending.has("t4"), "the queue did not move on");
+  pending.get("t2").reject(new Error("down"));
+  landed = false;
+  pending.get("t3").resolve(landed);
+  await settle();
+  assert.deepStrictEqual([reads.state("t2"), reads.state("t3")], ["failed", undefined]);
+  assert.equal(reads.owed({ id: "t2", count: 9 }, 0, undefined), false, "a failed read is asked again");
+  // Done: owed again only once its count has grown past the one it had when it landed.
+  assert.equal(reads.owed({ id: "t1", count: 5 }, 3, undefined), false);
+  assert.equal(reads.owed({ id: "t1", count: 6 }, 3, undefined), true);
+  assert.equal(reads.state("t1"), undefined, "a grown thread kept its done read");
+  reads.forget();
+  assert.equal(reads.state("t4"), undefined);
+});
