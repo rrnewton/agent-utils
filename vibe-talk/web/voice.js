@@ -12905,7 +12905,7 @@ function reconcileChannelSnapshot(before) {
 //
 // NOT THE SCREEN. A reopen lands on the main screen whatever was up: Settings and Help are a tap
 // away, and a reply keeps its draft without its screen
-// being reopened (`DRAFTS_KEY`). The selected channel already has its own key (`ACTIVE_CHANNEL_KEY`);
+// being reopened (`DRAFTS_KEY`, web/src/core/outbox). The selected channel already has its own key (`ACTIVE_CHANNEL_KEY`);
 // the record names it only so a place measured in one channel is never applied to another.
 //
 // A PLACE IS A MESSAGE, not a pixel offset — `captureScroll`'s anchor, put back by `restoreScroll`.
@@ -19051,11 +19051,11 @@ async function editOutgoingMessage(id) {
  */
 function editOutgoingReply(entry, text) {
   const id = String(entry.replyTo);
-  const before = drafts.get(id);
-  drafts.set(id, underDraft(before, text));
-  if (!persistDrafts()) {
-    if (before === undefined) drafts.delete(id);
-    else drafts.set(id, before);
+  const before = replyDrafts.get(id);
+  replyDrafts.set(id, underDraft(before, text));
+  if (!replyDrafts.save()) {
+    if (before === undefined) replyDrafts.delete(id);
+    else replyDrafts.set(id, before);
     setStatus(EDIT_DRAFT_REFUSED);
     return;
   }
@@ -19072,7 +19072,7 @@ function editOutgoingReply(entry, text) {
   // somebody has answered it since (`replyRoute`).
   const record = heldThreadRecord(messages[0]);
   if (entry.threadId && record && record.is_root === true && String(record.id) === String(entry.threadId)) {
-    draftStartsThread.add(id);
+    replyDrafts.setStartsThread(id, true);
   }
   openReply(messages, row);
   el("reply-state").textContent = before && before.trim()
@@ -28357,39 +28357,11 @@ const serverCacheBox = mountServerCache({
 // text move into the outgoing queue, freeing this screen for the next reply immediately. Only
 // provider message IDs reconcile a successful send with history; local IDs cannot be replied to.
 
-const DRAFTS_KEY = "vibe-talk.voice.drafts";
+// What was written in Reply to each message and not sent, kept on the device, and which of those were left
+// bound for a new thread, are web/src/core/outbox's (`createReplyDrafts`, `#624 voice-page-modularity`).
 
-/** message id -> the unsent text. Mirrored to storage so a reload does not lose it. */
-const drafts = new Map();
-
-function loadDrafts() {
-  let stored = null;
-  try {
-    stored = JSON.parse(deviceStorage().getItem(DRAFTS_KEY) || "null");
-  } catch (_error) {
-    stored = null;
-  }
-  if (!stored || typeof stored !== "object") {
-    return;
-  }
-  for (const [id, text] of Object.entries(stored)) {
-    if (typeof text === "string" && text) {
-      drafts.set(id, text);
-    }
-  }
-}
-
-/**
- * Written back with the same read-after-write check `persistMicSettings` makes, for the reason; and,
- * where the quota is full, given the saved channel rows' space, as the channel's drafts are: saved
- * messages can be fetched again, and what the reader typed cannot. `#193 compose-draft-loss`.
- */
-function persistDrafts() {
-  const encoded = JSON.stringify(Object.fromEntries(drafts));
-  if (storedExactly(DRAFTS_KEY, encoded)) return true;
-  dropMessageCache();
-  return storedExactly(DRAFTS_KEY, encoded);
-}
+/** The reply drafts, by message id. */
+const replyDrafts = createReplyDrafts({ storage: deviceStorageOnUse(), makeRoom: () => dropMessageCache() });
 
 let replyTarget = null;
 let replyChannelId = null;
@@ -28399,15 +28371,7 @@ let replyChannelId = null;
  * start. See `followReplyStore`.
  */
 let replyRouting = { thread: null, branch: null, into: null, unknown: false, removed: false, note: "" };
-/**
- * The messages whose kept draft was left with "Start a new thread" ticked, by id as a string, so
- * that the box comes back ticked with the words: a reader who put a reply down to look at something
- * else and picked it up again should not find it bound for the main channel because the box forgot.
- * Only with the draft — a reply sent or emptied takes its tick with it — and never for another
- * message. For this session: the words outlive a reload, and the tick beside them does not.
- * `#185 reply-new-thread`.
- */
-const draftStartsThread = new Set();
+// Which kept drafts were left with "Start a new thread" ticked is the reply drafts' (`startsThread`).
 /** The column the reply was opened from, whose list that place is in. `#229 desktop-two-column`. */
 let replyColumn = columns.main;
 /**
@@ -28450,17 +28414,16 @@ function rememberDraft() {
   }
   // By the id as a string, the key a reload reads them back under and `draftMarker` asks by.
   const id = String(replyTarget.id);
-  const had = drafts.has(id);
+  const had = replyDrafts.has(id);
   const text = el("reply-text").value;
   if (text.trim()) {
-    drafts.set(id, text);
+    replyDrafts.set(id, text);
   } else {
-    drafts.delete(id);
+    replyDrafts.delete(id);
   }
-  if (text.trim() && replyBoundForThread()) draftStartsThread.add(id);
-  else draftStartsThread.delete(id);
+  replyDrafts.setStartsThread(id, Boolean(text.trim()) && replyBoundForThread());
   // `#193 compose-draft-loss`. The row's Draft comes and goes with the draft.
-  if (drafts.has(id) !== had) renderDraftMarkers();
+  if (replyDrafts.has(id) !== had) renderDraftMarkers();
   // ...and SAY SO when the browser refuses. The read-back was here from the start and its answer
   // was thrown away, which made it a comment: a reader in private browsing was told a draft was
   // kept by the fact that nothing said otherwise, and lost it on reload. Same idiom as the reading
@@ -28468,7 +28431,7 @@ function rememberDraft() {
   //
   // On failure only. This line also carries "Not posted: …", and typing after a failed send is not
   // a reason to take the reason away.
-  if (!persistDrafts()) {
+  if (!replyDrafts.save()) {
     el("reply-state").textContent = REPLY_DRAFT_REFUSED;
   }
 }
@@ -28499,7 +28462,7 @@ function draftMarker(messages, li) {
   marker.setAttribute("aria-label", "Draft reply");
   marker.setAttribute("title", "You started a reply to this message and have not sent it. Open it in Reply.");
   marker.textContent = "Draft";
-  marker.hidden = !drafts.has(String(/** @type {any} */ (messages[0]).id));
+  marker.hidden = !replyDrafts.has(String(/** @type {any} */ (messages[0]).id));
   marker.addEventListener("click", inThisColumn(() => openReply(messages, li)));
   li.draftMarker = marker;
   return marker;
@@ -28517,7 +28480,7 @@ function renderDraftMarkers() {
   for (const row of rows) {
     const first = rowMessages(row)[0];
     if (!row.draftMarker || !first) continue;
-    const hidden = !drafts.has(String(first.id));
+    const hidden = !replyDrafts.has(String(first.id));
     if (row.draftMarker.hidden !== hidden) row.draftMarker.hidden = hidden;
   }
 }
@@ -28557,9 +28520,9 @@ const {
  */
 function quickReplyToStream(row, message, text) {
   const id = String(message.id);
-  const prior = drafts.get(id) || "";
-  drafts.set(id, prior.trim() ? `${text}\n\n${prior}` : text);
-  persistDrafts();
+  const prior = replyDrafts.get(id) || "";
+  replyDrafts.set(id, prior.trim() ? `${text}\n\n${prior}` : text);
+  replyDrafts.save();
   renderDraftMarkers();
   // The row the box was opened on, unless a redraw has replaced it since: then the one drawing the message.
   const drawn = row.parentNode && rowShown(row) ? row : paneRowFor(channelPane, id) || paneRowFor(sidePane, id);
@@ -28622,12 +28585,12 @@ function openReply(messages, from = null, quote = "", focus = true) {
   replyChannelId = selectedChannelId();
   // `#185 reply-new-thread`. Offered only where a new thread is possible, and never carried over
   // from the last reply: the default is to answer where the message is. Only this message's own kept
-  // draft brings its tick back (`draftStartsThread`) — or, where its thread has been answered since,
+  // draft brings its tick back (`replyDrafts.startsThread`) — or, where its thread has been answered since,
   // the thread it was bound for (`replyRoute`'s `into`).
   // `#419 threads-view-main-messages`. A main-channel message among the Threads view's cards is answered to
   // make it a thread: bound for its new thread where the service starts one on the reply's say-so.
   const starts = Boolean(from && from.hasAttribute("data-main-row"));
-  const bound = (drafts.has(String(message.id)) && draftStartsThread.has(String(message.id))) || starts;
+  const bound = (replyDrafts.has(String(message.id)) && replyDrafts.startsThread(String(message.id))) || starts;
   replyRouting = replyRoute(message, bound);
   el("reply-branch").checked = Boolean(replyRouting.branch) && bound;
   el("reply-branch-row").hidden = !replyRouting.branch;
@@ -28635,7 +28598,7 @@ function openReply(messages, from = null, quote = "", focus = true) {
   el("reply-target-meta").textContent = `to ${
     message.author_is_bot ? `${message.author} (bot)` : String(message.author)
   } · id ${message.id}`;
-  const draft = drafts.get(String(message.id)) || "";
+  const draft = replyDrafts.get(String(message.id)) || "";
   // The quote over the draft, once: a draft that already begins with this very quote keeps one.
   const block = quote ? quoteBlock(quote) : "";
   const opened = block && !draft.startsWith(block) ? `${block}${draft}` : draft;
@@ -28729,9 +28692,9 @@ async function sendReply() {
     // Not where to post yet: the send reads the channel first. See `placeReplyTarget`.
     ...(route.unknown ? { placement: "unknown" } : {}),
   }, replyDocked ? replyColumn : null);
-  drafts.delete(String(target.id));
-  draftStartsThread.delete(String(target.id));
-  if (outbox.storageOkay()) persistDrafts();
+  replyDrafts.delete(String(target.id));
+  replyDrafts.setStartsThread(String(target.id), false);
+  if (outbox.storageOkay()) replyDrafts.save();
   renderDraftMarkers();
   replyQuote = null;
   el("reply-text").value = "";
@@ -37187,7 +37150,7 @@ for (const topic of HELP_TOPICS) {
 }
 // `#51 reply-view`. Every way out of a reply goes through `closeReply`, so none can be the one that
 // forgets to put the reader back where they were reading.
-loadDrafts();
+replyDrafts.load();
 // `#500 sent-receipts-pile-up`. Before the outbox, whose confirmed sends are no longer saved.
 loadOwnPosts();
 loadOutgoingMessages();

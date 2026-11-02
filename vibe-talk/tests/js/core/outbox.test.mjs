@@ -295,3 +295,40 @@ test("`#624 voice-page-modularity`: the outbox's entries, order, changes and sav
   saved.set("vibe-talk.outgoing-messages", "{not json");
   assert.throws(() => outbox.saved());
 });
+
+test("`#624 voice-page-modularity`: the reply drafts are kept by message id, and a new thread's tick only for this session", () => {
+  const { createReplyDrafts, DRAFTS_KEY } = OUTBOX;
+  assert.equal(DRAFTS_KEY, "vibe-talk.voice.drafts");
+  const kept = new Map([[DRAFTS_KEY, JSON.stringify({ 101: "half a thought", 102: "", 103: 7 })]]);
+  let full = false;
+  let roomMade = 0;
+  const storage = {
+    getItem: (key) => kept.get(key) ?? null,
+    setItem: (key, value) => { if (full) throw new Error("quota"); kept.set(key, value); },
+    removeItem: (key) => kept.delete(key),
+  };
+  const drafts = createReplyDrafts({ storage, makeRoom: () => { roomMade += 1; full = false; } });
+  drafts.load();
+  assert.deepStrictEqual([drafts.has("101"), drafts.get("101"), drafts.has("102"), drafts.has("103")],
+    [true, "half a thought", false, false], "an empty or non-text draft was taken back");
+  drafts.set("104", "another");
+  drafts.delete("101");
+  assert.equal(drafts.save(), true);
+  assert.deepStrictEqual(JSON.parse(kept.get(DRAFTS_KEY)), { 104: "another" });
+  full = true;
+  assert.equal(drafts.save(), true, "the saved rows' room was not given up for the drafts");
+  assert.equal(roomMade, 1);
+  storage.setItem = () => { throw new Error("refused"); };
+  assert.equal(drafts.save(), false, "a refused write said the drafts were kept");
+  assert.equal(drafts.get("104"), "another", "a refused write lost the draft for this page");
+  // The tick goes with the draft, only for this session.
+  assert.equal(drafts.startsThread("104"), false);
+  drafts.setStartsThread("104", true);
+  assert.equal(drafts.startsThread("104"), true);
+  drafts.setStartsThread("104", false);
+  assert.equal(drafts.startsThread("104"), false);
+  // A record that does not parse leaves none.
+  const broken = createReplyDrafts({ storage: { getItem: () => "{not json", setItem() {}, removeItem() {} }, makeRoom() {} });
+  broken.load();
+  assert.equal(broken.has("101"), false);
+});

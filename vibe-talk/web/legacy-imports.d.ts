@@ -70,6 +70,7 @@ declare const underDraft: LegacyImports["underDraft"];
 declare const unsentText: LegacyImports["unsentText"];
 declare const DISMISSED_SENDS_DAYS: LegacyImports["DISMISSED_SENDS_DAYS"];
 declare const createChannelDrafts: LegacyImports["createChannelDrafts"];
+declare const createReplyDrafts: LegacyImports["createReplyDrafts"];
 declare const createDismissedSends: LegacyImports["createDismissedSends"];
 declare const createOutboxStore: LegacyImports["createOutboxStore"];
 declare const OWN_POST_GRACE_MS: LegacyImports["OWN_POST_GRACE_MS"];

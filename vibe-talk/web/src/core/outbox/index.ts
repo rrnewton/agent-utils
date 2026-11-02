@@ -24,3 +24,5 @@ export {
 export type { ReceiptView, SendState } from "./state.ts";
 export { createOutboxStore } from "./store.ts";
 export type { OutboxDependencies, OutboxEntry, OutboxStore } from "./store.ts";
+export { DRAFTS_KEY, createReplyDrafts } from "./replydrafts.ts";
+export type { ReplyDrafts, ReplyDraftsDependencies } from "./replydrafts.ts";
