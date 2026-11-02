@@ -1,13 +1,14 @@
 ---
 title: 'chat-bridge-relay-refeed: the bridge re-dispatches the same relay post to relay-in hundreds of times'
-status: open
+status: closed
 priority: 2
-assignee: mu-mirror@devbig014
 issue_type: bug
+assignee: mu-mirror@devbig014
 labels:
 - agentctl
 created_at: 2026-11-02T21:43:59.683284815+00:00
-updated_at: 2026-11-02T21:43:59.683284815+00:00
+updated_at: 2026-11-02T23:31:52.605419440+00:00
+closed_at: 2026-11-02T23:31:52.605419340+00:00
 ---
 
 # Description
