@@ -23540,6 +23540,14 @@ const rowGestures = createRowGestures({
   idsOf: (row) => idsOf(row),
   toggleDetails: (row, messages) => toggleMessageDetails(row, messages),
   swiped: (row, ids, dx) => {
+    // THE SAME ACT the Done button performs, not a second notion of "dealt with": one dismissal,
+    // recorded on the server, with `#50`'s undo behind it. That is what makes this gesture safe
+    // enough to be a gesture — a swipe that did something only this browser remembered, with no
+    // way back, would be the worst control on the page.
+    //
+    // A swipe on an ALREADY archived row puts it back, so the gesture is its own undo on the row
+    // the reader is looking at. Symmetric deliberately: a gesture that only ever went one way
+    // would make the greyed rows a trap.
     if (selection().view === "thread" && dx > 0) guardQuietly(closeThread)();
     else guardQuietly(() => toggleArchived(ids, row))();
   },
