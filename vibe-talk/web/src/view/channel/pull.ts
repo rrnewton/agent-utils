@@ -134,9 +134,6 @@ export function createPullToRefresh(deps: PullToRefreshDependencies): PullToRefr
    */
   let pull: Pull | null = null;
 
-  // A step back that `maybeLoadOlder` refused because a finger was down, and owes the reader: a
-  // column's `olderPages().deferred`.
-
   /** The timer that takes a pull up's result away again, or null. */
   let pullResultTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -146,9 +143,7 @@ export function createPullToRefresh(deps: PullToRefreshDependencies): PullToRefr
    * `edge` puts it at the end being pulled past, and `travel` is how far the finger has gone past
    * that end: the affordance moves with it, resisted, and its spinner winds up as the pull nears the
    * threshold. Every call replaces whatever the affordance was saying, a pull up's result included.
-   *
-   * @param {string|null} state a key of PULL_LABELS, "done", or null
-   * @param {{edge?: string, travel?: number, label?: string}} [how]
+   * `state` is a key of PULL_LABELS, "done", or null.
    */
   function renderPull(state: string | null, { edge = "top", travel = 0, label = "" }: { edge?: string; travel?: number; label?: string } = {}): void {
     const element = deps.byId("pull-refresh");
@@ -299,7 +294,7 @@ export function createPullToRefresh(deps: PullToRefreshDependencies): PullToRefr
     if (current.edge === null) {
       // Back past where the pull began, or no end under the finger at all. Re-anchor whichever end
       // the list is still at rather than refuse: the finger has not left, and the next millimetre
-      // past that end is the start of a current. This is what lets the reader change their mind
+      // past that end is the start of a pull. This is what lets the reader change their mind
       // without lifting.
       if (current.anchorY !== null) current.anchorY = y;
       if (current.endY !== null) current.endY = y;
