@@ -664,3 +664,30 @@ test("`#624 voice-page-modularity`: the channel directory holds what the server 
   assert.deepStrictEqual([directory.registrationSupported(), directory.discoverySupported(), directory.providerName()],
     [true, true, "Example Chat"]);
 });
+
+test("`#624 voice-page-modularity`: the store's rules for messages the stream left unplaced, from the module alone", () => {
+  const { emptyCanon, unplacedToAsk, answerUnplaced, heldAsSent, heldNow } = CHANNELS;
+  const canon = emptyCanon("c");
+  for (const id of ["a", "b", "c", "d"]) canon.unplaced.add(id);
+  canon.unplacedSince.set("a", 1);
+  canon.unplacedSince.set("b", 5);
+  canon.removed.set("d", 1);
+  assert.deepStrictEqual(unplacedToAsk(canon), ["a", "b", "c"], "a message removed upstream is asked for");
+  // A read sent at arrival 3 answers for "a" (arrived at 1) and "c" (saved before a reload), not "b".
+  answerUnplaced(canon, 3);
+  assert.deepStrictEqual([...canon.unplacedAnswered].sort(), ["a", "c", "d"]);
+  assert.deepStrictEqual(unplacedToAsk(canon), ["b"]);
+  // Placed since: forgotten by the next answer.
+  canon.unplaced.delete("a");
+  answerUnplaced(canon, 3);
+  assert.ok(!canon.unplacedAnswered.has("a") && !canon.unplacedSince.has("a"));
+  const one = { id: "1" };
+  const two = { id: "2" };
+  canon.messages = [one, two];
+  const held = heldNow(canon);
+  assert.equal(heldAsSent(canon, held), true);
+  canon.messages = [one, { ...two }];
+  assert.equal(heldAsSent(canon, held), false, "a replaced copy reads as held");
+  canon.messages = [one];
+  assert.equal(heldAsSent(canon, held), false, "a message taken out reads as held");
+});

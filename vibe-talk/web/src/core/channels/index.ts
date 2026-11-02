@@ -53,3 +53,4 @@ export { SUMMARY_IN_FLIGHT, createSummaries, summaryKey } from "./summaries.ts";
 export type { HeldSummary, Summaries, SummariesDependencies, SummaryAnswer, SummaryTarget } from "./summaries.ts";
 export { createChannelDirectory } from "./directory.ts";
 export type { ChannelDirectory, DeploymentCapabilities } from "./directory.ts";
+export { answerUnplaced, heldAsSent, unplacedToAsk } from "./unplaced.ts";

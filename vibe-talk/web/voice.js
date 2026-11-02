@@ -17724,30 +17724,9 @@ let unplacedArrivals = 0;
 /** The channel whose placing read is on the wire, or null. */
 let placingReadInFlight = null;
 
-/** The ids the selected channel's stream left unplaced that no read of All has answered for. */
-function unplacedToAsk() {
-  return [...channelStore.current().unplaced].filter((id) => !channelStore.current().unplacedAnswered.has(id) && !channelStore.current().removed.has(id));
-}
-
-/**
- * A read of All — its newest page, or its changes to the last of them — sent when `unplacedArrivals`
- * stood at `seen`, landed in store `canon`: it answers for every message left unplaced there that had
- * arrived by then, whether it carried it or not. What has been placed since is forgotten here.
- *
- * @param {any} canon
- * @param {number} seen
- */
-function answerUnplaced(canon, seen) {
-  for (const id of [...canon.unplacedSince.keys(), ...canon.unplacedAnswered]) {
-    if (!canon.unplaced.has(id)) {
-      canon.unplacedSince.delete(id);
-      canon.unplacedAnswered.delete(id);
-    }
-  }
-  for (const id of canon.unplaced) {
-    if ((canon.unplacedSince.get(id) || 0) <= seen) canon.unplacedAnswered.add(id);
-  }
-}
+// Which unplaced messages no read of All has answered for (`unplacedToAsk`), a read of All answering for
+// them (`answerUnplaced`), and whether the store holds what it held when a read was sent (`heldAsSent`) are
+// web/src/core/channels's (`#624 voice-page-modularity`).
 
 // `forgetUnplaced` is web/src/core/channels's (`#624 voice-page-modularity`).
 
@@ -17823,7 +17802,7 @@ async function placeUnplaced() {
   if (!threadingSupported || !channel || channelStore.current().channel !== channel || channelStore.current().scope ||
       placingReadInFlight !== null || discordFetchInFlight || document.visibilityState === "hidden" ||
       placeUnplacedWaits(channel)) return;
-  if (unplacedToAsk().length === 0) return;
+  if (unplacedToAsk(channelStore.current()).length === 0) return;
   placingReadInFlight = channel;
   const canon = channelStore.current();
   const all = canon.views.get(viewKey("flat"));
@@ -17947,21 +17926,6 @@ function placeFromAnswer(payload, read) {
   const placed = placeFromPage(payload, canon, read.number, read.held);
   if (!(read.sent && payload.delta && payload.delta.more)) answerUnplaced(canon, read.seen);
   if (placed) followPlacement();
-}
-
-/**
- * Whether store `canon` holds what it held when a read was sent, `held` being its copies then
- * (`heldNow`): no message added since, none taken out, and none replaced. A read that brings a copy
- * word for word keeps the store's (`mergeIntoCanon`, `foldTimelineDelta`); one that brings an edit, a
- * thread record or a count replaces it, and the read sent before is older than that copy, which it
- * would undo. `#308 live-reply-in-main`.
- *
- * @param {any} canon
- * @param {Map<string, any>} held
- */
-function heldAsSent(canon, held) {
-  return canon.messages.length === held.size &&
-    canon.messages.every((message) => held.get(String(message.id)) === message);
 }
 
 /**
