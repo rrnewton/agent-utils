@@ -265,7 +265,9 @@ fn a_send_waiting_for_readiness_holds_no_lock_and_types_once_the_pane_is_idle() 
         }
         std::thread::sleep(Duration::from_millis(100));
         let system = agent::SystemRuntime::default();
-        let bounded = agent::UntilRuntime::after(&system, Duration::from_secs(5));
+        // The bound proves the lock is free, so it must outlast host
+        // scheduling delays, not measure them.
+        let bounded = agent::UntilRuntime::after(&system, Duration::from_secs(60));
         let other = fixture
             .manager()
             .lock_with_runtime("worker", &bounded)

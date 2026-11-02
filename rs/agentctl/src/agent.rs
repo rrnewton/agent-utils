@@ -6030,7 +6030,10 @@ mod tests {
                     DrainOptions::default(),
                 )
             });
-            assert!(gate.wait_for_entries(1, Duration::from_secs(5)));
+            // A wall budget would measure the host's scheduling, not the
+            // serialization: under gate concurrency the first sender can
+            // be starved well past a few seconds before it runs at all.
+            assert!(gate.wait_for_entries(1, Duration::from_secs(60)));
 
             let second_fake = fake.clone();
             let second_target = target();

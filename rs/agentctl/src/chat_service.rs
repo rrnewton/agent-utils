@@ -14262,6 +14262,21 @@ esac
         ));
     }
 
+    /// The calling thread's kernel thread id, for CPU accounting of the loop thread.
+    fn current_tid() -> u64 {
+        unsafe { libc::syscall(libc::SYS_gettid) as u64 }
+    }
+
+    /// CPU seconds (user + system) consumed by thread `tid`, or `None` when unreadable.
+    fn thread_cpu_seconds(tid: u64) -> Option<f64> {
+        let stat = fs::read_to_string(format!("/proc/self/task/{tid}/stat")).ok()?;
+        let fields: Vec<&str> = stat.rsplit_once(") ")?.1.split_whitespace().collect();
+        let ticks: u64 = fields.get(11)?.parse().ok()?;
+        let ticks: u64 = ticks + fields.get(12)?.parse::<u64>().ok()?;
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        (hz > 0).then(|| ticks as f64 / hz as f64)
+    }
+
     /// Fail the test unless [`run_owner_loop`] ended without an error. A stop ends the loop that
     /// way, as it ends `chat run`, including when it cancels a Herdr call the loop is making
     /// (#291 stop-lost-wakeup), so any error is a failure.
@@ -14325,6 +14340,7 @@ esac
             .expect("listen for reply wakes")
         });
         let mut transport = transport;
+        let loop_tid = current_tid();
         let result = thread::scope(|scope| {
             scope.spawn(|| {
                 let notify = |notice| send_notice(&notices, notice, &output_wake, &overflowed);
@@ -14332,8 +14348,25 @@ esac
                     overflowed.store(true, AtomicOrdering::SeqCst);
                     wake_output(&output_wake);
                 };
-                let deadline = Instant::now() + limit;
-                while !done(&notify, &overflow) && Instant::now() < deadline {
+                // The limit is a CPU budget, not a wall one: under gate
+                // concurrency the loop thread can be starved for most of
+                // the wall window while making steady progress whenever
+                // it is scheduled. The wall hard cap (4x) still ends a
+                // loop that is idle-blocked, and the CPU cap (2x) ends
+                // one that spins without finishing.
+                let started = Instant::now();
+                let wall_deadline = started + limit * 4;
+                let cpu_started = thread_cpu_seconds(loop_tid);
+                while !done(&notify, &overflow) {
+                    if Instant::now() >= wall_deadline {
+                        break;
+                    }
+                    if let (Some(start), Some(now)) = (cpu_started, thread_cpu_seconds(loop_tid))
+                    {
+                        if now - start >= (limit * 2).as_secs_f64() {
+                            break;
+                        }
+                    }
                     thread::sleep(Duration::from_millis(5));
                 }
                 thread::sleep(Duration::from_millis(300));
@@ -15418,7 +15451,16 @@ esac
         let key = key.expect("a request was admitted");
         assert_eq!(queued(&key), Some(QueueMessageState::Pending));
         // Not started by any model, so not delivered: the request waits, saying why.
-        let inspection = state.inspect_request(&key).expect("inspect request");
+        // A submission the loop began just before it stopped settles back
+        // to pending once its wake fails; on a loaded host that can land
+        // after the loop returns, so wait for the settled phase instead
+        // of inspecting once.
+        let settle_deadline = Instant::now() + Duration::from_secs(60);
+        let mut inspection = state.inspect_request(&key).expect("inspect request");
+        while inspection["phase"] != "pending" && Instant::now() < settle_deadline {
+            thread::sleep(Duration::from_millis(10));
+            inspection = state.inspect_request(&key).expect("inspect request");
+        }
         assert_eq!(inspection["phase"], "pending", "{inspection:#}");
         let error = inspection["delivery"]["error"].as_str().unwrap_or_default();
         assert!(

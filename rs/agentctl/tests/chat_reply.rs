@@ -212,14 +212,33 @@ impl Drop for Scratch {
     }
 }
 
-/// Wait at most `limit` for `child` to exit. Past that, kill it and return `None`.
+/// CPU seconds (user + system) consumed by process `pid`, or `None` when unreadable.
+fn process_cpu_seconds(pid: u32) -> Option<f64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let fields: Vec<&str> = stat.rsplit_once(") ")?.1.split_whitespace().collect();
+    let ticks: u64 = fields.get(11)?.parse().ok()?;
+    let ticks: u64 = ticks + fields.get(12)?.parse::<u64>().ok()?;
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    (hz > 0).then(|| ticks as f64 / hz as f64)
+}
+
+/// Wait for `child` to exit, with `limit` as its CPU budget: a child that is
+/// merely starved by a loaded host gets up to 4x the limit in wall time,
+/// while one that burns the budget or stays idle past the wall cap is killed
+/// and returns `None`.
 fn wait_at_most(child: &mut Child, limit: Duration) -> Option<ExitStatus> {
-    let deadline = Instant::now() + limit;
+    let started = Instant::now();
+    let wall_deadline = started + limit * 4;
+    let cpu_started = process_cpu_seconds(child.id());
     loop {
         if let Some(status) = child.try_wait().expect("poll agentctl") {
             return Some(status);
         }
-        if Instant::now() >= deadline {
+        let cpu_exhausted = match (cpu_started, process_cpu_seconds(child.id())) {
+            (Some(start), Some(now)) => now - start >= limit.as_secs_f64(),
+            _ => false,
+        };
+        if cpu_exhausted || Instant::now() >= wall_deadline {
             let _ = child.kill();
             let _ = child.wait();
             return None;

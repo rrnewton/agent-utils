@@ -58,6 +58,15 @@ type FileSnapshot = BTreeMap<PathBuf, (u64, u64, u32, Option<Vec<u8>>)>;
 
 fn files(path: &Path) -> FileSnapshot {
     fn visit(root: &Path, path: &Path, result: &mut FileSnapshot) {
+        // The lock-waiter visibility directory is not registry content:
+        // `lock_wait::register` creates `.waiting/<agent>` whenever a
+        // lifecycle lock is contended, and only the record inside it is
+        // removed afterwards. Whether a given call contended depends on
+        // scheduling, so counting the directory makes this snapshot a
+        // timing test; its records are asserted through the lock tests.
+        if path.file_name().is_some_and(|name| name == ".waiting") && path != root {
+            return;
+        }
         let metadata = fs::symlink_metadata(path).unwrap();
         result.insert(
             path.strip_prefix(root).unwrap().to_owned(),
