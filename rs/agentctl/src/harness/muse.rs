@@ -71,6 +71,12 @@ impl HarnessAdapter for Muse {
         Some(vec!["--reasoning-effort".to_owned(), effort.to_owned()])
     }
 
+    /// Muse has no resume of a conversation agentctl names (#741): a fresh start is the
+    /// recorded arguments with no selector; Muse mints its own session, recorded at anchor.
+    fn fresh_arguments(&self, rest: Vec<String>, _conversation: &str) -> Option<Vec<String>> {
+        Some(rest)
+    }
+
     fn split_conversation(&self, argv: &[String]) -> Option<super::Conversations> {
         let mut values = Vec::new();
         let mut rest = argv;

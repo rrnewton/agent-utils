@@ -888,7 +888,14 @@ fn expected_arguments(record: &AgentRecord) -> Result<Vec<String>> {
         if let Some(argv) = spec_arguments(record) {
             return launch_spec::fresh_arguments(&record.harness, &argv, &session);
         }
-        let recorded = recorded_conversation(record)?;
+        // A fresh Muse with no recorded conversation has no selector to strip (#741).
+        let recorded = match recorded_conversation(record) {
+            Ok(native) => native,
+            Err(_error) if record.harness == "muse" => {
+                NativeSession::new("muse", &session, "asserted")
+            }
+            Err(error) => return Err(error),
+        };
         let policy = policy_arguments(record, &recorded)?;
         return fresh_selector(&record.harness, policy, &session);
     }
@@ -1050,9 +1057,26 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         if let Some(spec) = record.launch_spec.as_ref() {
             return self.spec_launch_plan(record, spec, cwd, startup_timeout);
         }
-        let recorded = conversation(record)?;
+        // Muse with no recorded conversation starts fresh with a handoff brief (#741).
+        let auto_fresh_muse = record.harness == "muse"
+            && fresh_revive(record).is_none()
+            && conversation(record).is_err();
+        let recorded = match conversation(record) {
+            Ok(native) => native,
+            Err(_error) if auto_fresh_muse => {
+                NativeSession::new("muse", &new_conversation_id()?, "asserted")
+            }
+            Err(error) => return Err(error),
+        };
         let policy = policy_arguments(record, &recorded)?;
-        let fresh = fresh_revive(record);
+        let fresh = fresh_revive(record).or_else(|| {
+            auto_fresh_muse.then(|| {
+                (
+                    recorded.value.clone(),
+                    "Muse conversation was not recorded; restarted fresh".to_owned(),
+                )
+            })
+        });
         let native = match &fresh {
             Some((session, _)) => NativeSession::new(&record.harness, session, "asserted"),
             None => recorded,
@@ -1061,10 +1085,24 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             harness: record.harness.clone(),
             profile: record.profile.clone(),
             model: record.model.clone(),
-            resume: Some(native.value.clone()),
+            resume: if auto_fresh_muse {
+                None
+            } else {
+                Some(native.value.clone())
+            },
             startup_timeout,
             ..StartOptions::default()
         };
+        if auto_fresh_muse {
+            options.brief = Some(format!(
+                "You are {name}, restarted fresh after an outage because Muse cannot resume \
+                 the previous conversation. Working directory: {cwd}. Check `agentctl status \
+                 {name}` and your queued messages (`agentctl prompts {name}`), then continue \
+                 your previous task from the repository state.",
+                name = record.name,
+                cwd = record.cwd
+            ));
+        }
         let base = harness_arguments(&record.harness, record.model.as_deref(), None, &[])?;
         if !policy.starts_with(&base) {
             return Err(fail("recorded harness policy arguments are inconsistent"));
@@ -2900,6 +2938,11 @@ mod discovery_tests {
             Some("11111111-1111-1111-1111-111111111111")
         );
         let _ = fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn muse_fresh_selector_adds_no_resume() {
+        let args = fresh_selector("muse", vec!["--model".into(), "m".into()], "sess-1").unwrap();
+        assert_eq!(args, vec!["--model".to_string(), "m".to_string()]);
     }
     #[test]
     fn newest_archive_picks_latest_for_name() {
