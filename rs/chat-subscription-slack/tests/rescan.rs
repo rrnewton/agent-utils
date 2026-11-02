@@ -1267,3 +1267,207 @@ fn a_rate_limited_listing_is_retried_in_the_pass_with_a_host_budget() {
     subscription.close().unwrap();
     fs::remove_dir_all(&directory).unwrap();
 }
+
+// --- #769 relay-rescan-settle-latency: relay-only fast poll ---
+
+clock!(relay_clock, RELAY_NOW);
+clock!(relay_budget_clock, RELAY_BUDGET_NOW);
+
+const RELAY_PEER: &str = "U0RELAYBOT1";
+
+fn relay_extra() -> Value {
+    json!({
+        "relay_channels": [{"channel": CHANNEL, "peer_senders": [RELAY_PEER]}],
+        "relay_poll_seconds": 5,
+    })
+}
+
+/// Like `next_batch_within` with more turns: under the gate's load an
+/// idle turn waits out a real heartbeat, so a poll can need several.
+fn next_batch_long(subscription: &mut ChatSubscription) -> Option<DeliveryBatch> {
+    next_batch_within(subscription, 12)
+}
+
+fn relay_request(directory: &Path, extra: Value) -> SubscribeRequest {
+    request(directory, None, extra)
+        .with_relay_senders(vec![SenderId::new(RELAY_PEER).unwrap()])
+        .unwrap()
+        .with_relay_channels(vec![ChannelId::new(CHANNEL).unwrap()])
+        .unwrap()
+}
+
+#[test]
+fn relay_post_is_admitted_within_one_poll_with_no_settle_and_no_grace() {
+    let directory = scratch("relay-poll");
+    let fake = FakeTransport::new();
+    // No heartbeats, no events: the stream never settles in this test, and
+    // the fake clock stays minutes short of the 10-minute settle fallback.
+    fake.push_script(vec![FakeStep::Idle; 8]);
+    let root = ts(T0 + 10_000);
+    let reply = ts(T0 + 11_000);
+    let mut envelope = listed(&root, None, RELAY_PEER, "relay envelope", &[]);
+    envelope.subtype = Some("bot_message".to_owned());
+    fake.push_history(envelope);
+    let mut receipt = listed(&reply, Some(&root), RELAY_PEER, "receipt: delivered", &[]);
+    receipt.subtype = Some("bot_message".to_owned());
+    fake.push_history(receipt);
+    let mut backend = backend(&fake, relay_clock);
+    let mut subscription =
+        ChatSubscription::open(&mut backend, &relay_request(&directory, relay_extra())).unwrap();
+    commit_next(&mut subscription);
+    // Two seconds after the post: inside the general rescan's 15 s grace,
+    // and with no settle, only the relay poll can admit it.
+    RELAY_NOW.store(T0 + 12_000, Ordering::SeqCst);
+    let batch = next_batch_long(&mut subscription).expect("relay batch within one poll");
+    assert_eq!(
+        single_message(&batch).message_id().as_str(),
+        format!("{CHANNEL}/messages/{root}")
+    );
+    subscription.commit_durable(&batch).unwrap();
+    // The receipt reply in its thread is listed and admitted by the same poll.
+    let batch = next_batch_long(&mut subscription).expect("receipt batch");
+    let message = single_message(&batch);
+    assert!(message.is_thread_reply());
+    assert_eq!(
+        message.message_id().as_str(),
+        format!("{CHANNEL}/messages/{reply}")
+    );
+    subscription.commit_durable(&batch).unwrap();
+    assert!(
+        fake.state()
+            .scans
+            .iter()
+            .any(|(_, thread, _, _)| thread.as_deref() == Some(root.as_str())),
+        "thread listed: {:?}",
+        fake.state().scans
+    );
+    // Dedup against the general rescan: after the settle fallback the
+    // general pass lists the same history and delivers nothing again.
+    RELAY_NOW.store(T0 + 700_000, Ordering::SeqCst);
+    assert!(next_batch_within(&mut subscription, 4).is_none());
+    let saved = ledger(&directory);
+    assert_eq!(saved["rescued"].as_array().unwrap().len(), 2, "{saved}");
+    subscription.close().unwrap();
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn relay_poll_budget_refusal_backs_off_without_listing() {
+    let directory = scratch("relay-budget");
+    let fake = FakeTransport::new();
+    fake.push_script(vec![FakeStep::Idle; 10]);
+    let root = ts(T0 + 10_000);
+    let mut envelope = listed(&root, None, RELAY_PEER, "relay envelope", &[]);
+    envelope.subtype = Some("bot_message".to_owned());
+    fake.push_history(envelope);
+    // Another bridge of this identity was told to back off.
+    let budget =
+        chat_subscription_slack::budget::CallBudget::at(&directory.join("budget.json"), 20);
+    budget.block(T0 + 60_000);
+    let mut extra = relay_extra();
+    extra["rescan_budget_key"] = json!(directory.to_str().unwrap());
+    let mut backend = backend(&fake, relay_budget_clock);
+    let mut subscription =
+        ChatSubscription::open(&mut backend, &relay_request(&directory, extra)).unwrap();
+    commit_next(&mut subscription);
+    RELAY_BUDGET_NOW.store(T0 + 12_000, Ordering::SeqCst);
+    assert!(
+        next_batch_within(&mut subscription, 3).is_none(),
+        "budget holds the poll back"
+    );
+    assert!(
+        fake.state().scans.is_empty(),
+        "no listing was made: {:?}",
+        fake.state().scans
+    );
+    assert!(
+        log(&directory).contains("relay poll"),
+        "{}",
+        log(&directory)
+    );
+    // After the back-off the poll lists and delivers.
+    RELAY_BUDGET_NOW.store(T0 + 125_000, Ordering::SeqCst);
+    let batch = next_batch_long(&mut subscription).expect("relay batch after back-off");
+    assert_eq!(
+        single_message(&batch).message_id().as_str(),
+        format!("{CHANNEL}/messages/{root}")
+    );
+    subscription.commit_durable(&batch).unwrap();
+    subscription.close().unwrap();
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+clock!(relay_human_clock, RELAY_HUMAN_NOW);
+clock!(relay_headroom_clock, RELAY_HEADROOM_NOW);
+
+#[test]
+fn relay_poll_leaves_human_posts_to_the_stream_and_general_rescan() {
+    // #769 review fix 1: only relay peers' posts (and their thread
+    // replies) are polled; a human post in the relay channel is not.
+    let directory = scratch("relay-human");
+    let fake = FakeTransport::new();
+    fake.push_script(vec![FakeStep::Idle; 10]);
+    let peer_ts = ts(T0 + 10_000);
+    let mut envelope = listed(&peer_ts, None, RELAY_PEER, "relay envelope", &[]);
+    envelope.subtype = Some("bot_message".to_owned());
+    fake.push_history(envelope);
+    let human = listed(
+        &ts(T0 + 10_500),
+        None,
+        OWNER,
+        "human note in relay channel",
+        &[],
+    );
+    fake.push_history(human);
+    let mut backend = backend(&fake, relay_human_clock);
+    let mut subscription =
+        ChatSubscription::open(&mut backend, &relay_request(&directory, relay_extra())).unwrap();
+    commit_next(&mut subscription);
+    RELAY_HUMAN_NOW.store(T0 + 12_000, Ordering::SeqCst);
+    let batch = next_batch_long(&mut subscription).expect("peer batch");
+    assert_eq!(
+        single_message(&batch).message_id().as_str(),
+        format!("{CHANNEL}/messages/{peer_ts}")
+    );
+    subscription.commit_durable(&batch).unwrap();
+    assert!(
+        next_batch_within(&mut subscription, 3).is_none(),
+        "human post is not admitted by the poll"
+    );
+    let saved = ledger(&directory);
+    assert_eq!(saved["rescued"].as_array().unwrap().len(), 1, "{saved}");
+    subscription.close().unwrap();
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn relay_poll_stops_at_half_the_shared_budget() {
+    // #769 review fix 2: once half the per-minute budget is used, the
+    // poll makes no listing, keeping headroom for the general rescan.
+    let directory = scratch("relay-headroom");
+    let fake = FakeTransport::new();
+    fake.push_script(vec![FakeStep::Idle; 10]);
+    let root = ts(T0 + 10_000);
+    let mut envelope = listed(&root, None, RELAY_PEER, "relay envelope", &[]);
+    envelope.subtype = Some("bot_message".to_owned());
+    fake.push_history(envelope);
+    let budget = chat_subscription_slack::budget::CallBudget::at(&directory.join("budget.json"), 2);
+    budget.take(T0).expect("pre-spend half the budget");
+    let mut extra = relay_extra();
+    extra["rescan_budget_key"] = json!(directory.to_str().unwrap());
+    extra["rescan_calls_per_minute"] = json!(2);
+    let mut backend = backend(&fake, relay_headroom_clock);
+    let mut subscription =
+        ChatSubscription::open(&mut backend, &relay_request(&directory, extra)).unwrap();
+    commit_next(&mut subscription);
+    RELAY_HEADROOM_NOW.store(T0 + 12_000, Ordering::SeqCst);
+    assert!(next_batch_within(&mut subscription, 3).is_none());
+    assert!(
+        fake.state().scans.is_empty(),
+        "no listing at headroom: {:?}",
+        fake.state().scans
+    );
+    assert!(log(&directory).contains("headroom"), "{}", log(&directory));
+    subscription.close().unwrap();
+    fs::remove_dir_all(&directory).unwrap();
+}

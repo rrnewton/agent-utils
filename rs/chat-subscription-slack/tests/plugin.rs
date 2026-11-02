@@ -1283,3 +1283,29 @@ fn relay_peer_and_stranger_bot_posts_are_delivered_in_the_relay_channel() {
     };
     assert_eq!(single_message(&owner).sender_id().as_str(), OWNER);
 }
+
+#[test]
+fn relay_poll_seconds_is_absent_by_default_and_validated() {
+    let absent =
+        chat_subscription_slack::plugin::PluginConfig::from_request(&request(None, json!({})))
+            .expect("config without relay_poll_seconds");
+    assert_eq!(absent.relay_poll, None);
+    let present = chat_subscription_slack::plugin::PluginConfig::from_request(&request(
+        None,
+        json!({"relay_poll_seconds": 30}),
+    ))
+    .expect("config with relay_poll_seconds");
+    assert_eq!(present.relay_poll, Some(std::time::Duration::from_secs(30)));
+    for bad in [
+        json!({"relay_poll_seconds": 4}),
+        json!({"relay_poll_seconds": 61}),
+        json!({"relay_poll_seconds": "30"}),
+    ] {
+        let Err(error) =
+            chat_subscription_slack::plugin::PluginConfig::from_request(&request(None, bad))
+        else {
+            panic!("configuration should be refused");
+        };
+        assert_eq!(error.code(), "slack_configuration_invalid");
+    }
+}

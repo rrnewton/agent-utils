@@ -141,7 +141,9 @@ peers are also named in its backend configuration (`relay_channels` in
 posts is provider- and client-dependent, and its history rescan (every
 90 seconds by default, over a 24-hour window) is the fallback path, so
 relay latency is bounded by that rescan when the stream does not carry a
-post. Discord bots qualify on the same terms: stable sender IDs, channel
+post — unless `relay_poll_seconds` is set, in which case the Slack
+provider's relay poll (above) lists the relay channels on that cadence
+instead, through the same admission, ledger and budget. Discord bots qualify on the same terms: stable sender IDs, channel
 membership for each team's bot, and read-history permission.
 
 ### Permanent owners and temporary sender grants
@@ -2799,6 +2801,7 @@ known key with an invalid value is refused.
 | `rescan_window_seconds` | 86400 | How far back a rescan lists, 600–604800. |
 | `rescan_calls_per_minute` | 20 | Listing calls a minute shared by every bridge on this host with the same `rescan_budget_key`, 0–600; 0 is unlimited. |
 | `rescan_budget_key` | `user` | Name of the shared listing budget; bridges that list as different people can use different keys. `off` gives this bridge no shared budget. |
+| `relay_poll_seconds` | unset | How often to poll only the `relay_channels` history (and threads with new replies) for relay posts the tail never carries: one history listing per relay channel per poll, independent of the rescan, with no settle wait and no grace. Only the relay peers' posts and their thread replies are polled — human posts in a relay channel wait for the stream and the general rescan. 5–60; unset never polls (relay posts wait for the rescan). Every listing spends the shared `rescan_calls_per_minute` budget, and the poll stops once half of it is used, keeping headroom for the general rescan — at 5 s one channel costs about 12 history calls a minute, so several bridges polling one channel want `rescan_calls_per_minute` raised. |
 
 The host clears the plugin environment except `HOME`, `USER`, `LOGNAME`, `PATH`,
 `LANG`, `LC_ALL`, `TMPDIR` and `XDG_RUNTIME_DIR`. If the client needs another

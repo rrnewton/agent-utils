@@ -387,7 +387,15 @@ stream) are absorbed by the ledger, never typed twice. Latency is that
 of two bridges; when a provider's live stream does not carry other bots'
 posts, its history rescan bounds it (Slack: 90 seconds by default, over a
 24-hour window — a post older than the window is never seen, so keep
-relayed messages' TTL inside it).
+relayed messages' TTL inside it). The Slack provider can instead poll
+just the relay channels: `relay_poll_seconds` (5-60) in the bridge's
+Slack backend configuration lists only those channels' history and
+threads with new replies on that cadence, with no settle wait and no
+grace, through the same admission, ledger and listing budget. Without
+it, a relay post after a quiet bridge restart can wait out the stream's
+settle (up to about 10 minutes) plus up to an interval; with it, the
+bound is one poll. Receipts ride the envelope post's thread, which the
+poll lists whenever it gains replies.
 
 **Mirror copies.** A relay route definition may carry `"mirror": true`.
 Then, whenever a message is *delivered over a direct route*, the sender

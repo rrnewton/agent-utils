@@ -10,6 +10,12 @@ This crate holds two executables for an `agentctl chat` bridge:
   rescan of the channel's history (`slack.message list`, every
   `rescan_interval_seconds`, 90 by default) delivers the messages the stream
   missed, once, with each file's ID and download command in the request text.
+  Relay channels may also be polled on their own faster cadence
+  (`relay_poll_seconds`, 5-60, unset = off): only those channels' history
+  and threads with new replies, no settle wait, no grace, through the same
+  ledger and listing budget — one history call per relay channel per poll.
+  Only the relay peers' posts are polled (human posts wait for the stream
+  and the general rescan), and the poll stops at half the shared budget.
   Its ledger, `slack-rescan-ledger.json`, lives beside the plugin's
   `diagnostics_log`; see `src/rescan.rs` and the userguide. Every bridge on a
   host lists as the same person, so their listings share a per-minute budget

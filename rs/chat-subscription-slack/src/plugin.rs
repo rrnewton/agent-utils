@@ -89,6 +89,47 @@
 //! next pass comes after the usual interval. Listing threads and honouring Slack's rate-limit
 //! waits once held live messages for up to a minute (#679 muse-bridge-study).
 //!
+//! # Relay poll: relay posts the stream never carries, without the settle
+//!
+//! In a configured relay channel, posts by other bots never arrive on the stream at all — the
+//! client emits no posts by other bots, and every host posts to the relay as the same bot — so
+//! a relay post's only path in was the general rescan: up to one interval (90 s) after the
+//! stream had caught up, which after a restart on a quiet tail can take the ten-minute settle
+//! fallback, plus the 15 s grace (#769 relay-rescan-settle-latency; measured 77-540 s against
+//! 2-3 s direct). `relay_poll_seconds` (5-60, absent = off) instead lists only the configured
+//! relay channels on its own cadence, independent of the general rescan: one history listing
+//! per relay channel per poll, plus a listing of each thread in it with replies newer than the
+//! last listing (receipts live in the envelope post's thread), through the same listings.
+//!
+//! The relay poll waits for no settle, and that is safe. The settle exists so a pass cannot
+//! offer a rescued batch ahead of the stream batch a rolled-back admission requires again:
+//! only the stream can replay a stream batch. A relay batch can never be that batch — its
+//! post, by construction, is one the stream does not carry. The two replay mechanisms stay
+//! ahead of any new relay batch regardless: an unacknowledged rescued batch is offered again
+//! first, identical, from its durable pending record, and the driver offers one batch at a
+//! time (a second `next_item` before acknowledgement is a backpressure violation), so a
+//! stream replay still happens in stream order from the same base cursor. A relay batch's
+//! own cursor is the cursor before it with the rescue suffix, exactly like a rescued one, so
+//! it consumes and alters no stream position. The poll considers only posts whose author
+//! is one of the channel's configured relay peers, and replies by those peers: a person's
+//! post in a relay channel is one the stream DOES carry, so it is left to the stream and
+//! the settle-gated general rescan, never raced by the poll.
+//!
+//! The relay poll also has no grace period, where the general rescan leaves a message to the
+//! stream for 15 s. That grace exists only to give the stream first chance at a message it
+//! normally carries within a second; a bot post is complete when it is posted, the listing
+//! returns it whole, and the stream will never carry it, so waiting would buy nothing.
+//!
+//! Admission, the ledger, and dedup are the rescan's own (`admit`, `consider`, the same
+//! queue and pending record), so a post the general rescan also finds is delivered once.
+//! Every listing spends the same host-wide budget ([`crate::budget`]), and a budget refusal
+//! or a rate limit backs the relay poll off exactly as it backs off a pass. The poll also
+//! stops for the minute once half the per-minute budget is used, so a burst cannot starve
+//! the owner-channel general rescan. At the fastest
+//! setting (5 s) one relay channel costs at most 12 history listings a minute plus one
+//! listing per active relay thread — against the shared default of 20 calls a minute, so
+//! several bridges polling one channel want `rescan_calls_per_minute` raised or a slower poll.
+//!
 //! A rescued batch's cursor is the cursor before it with `;rescued:<channel>/<ts>` appended, so a
 //! subscription resumed from it resumes the stream where the cursor before it did. Which messages
 //! the stream carried and the rescan delivered, and the one rescued batch not yet acknowledged,
@@ -191,6 +232,10 @@ pub struct PluginConfig {
     /// relay class. This only widens delivery to the bridge; it grants no
     /// owner authority, and the bridge never types these posts.
     pub relay_peers: std::collections::BTreeMap<String, Vec<String>>,
+    /// How often to poll only the relay channels' history, independently
+    /// of the general rescan and without its settle or grace (#769);
+    /// `None` never polls (the default, today's behaviour).
+    pub relay_poll: Option<Duration>,
 }
 
 fn failure(code: &str, detail: impl Into<String>, retryable: bool) -> BackendFailure {
@@ -279,6 +324,7 @@ impl PluginConfig {
             "rescan_calls_per_minute",
             "rescan_budget_key",
             "relay_channels",
+            "relay_poll_seconds",
         ];
         let mut ignored_keys: Vec<String> = data
             .keys()
@@ -460,6 +506,8 @@ impl PluginConfig {
                 .unwrap_or_else(|| "user".to_owned()),
             ignored_keys,
             relay_peers,
+            relay_poll: optional_seconds(data, "relay_poll_seconds", 5..=60)?
+                .map(Duration::from_secs),
         })
     }
 }
@@ -886,6 +934,22 @@ fn open_rescan(
             ledger.path().display()
         )),
     }
+    if let Some(interval) = config.relay_poll {
+        let channels: Vec<&String> = config.relay_peers.keys().collect();
+        diagnostics.log(&format!(
+            "relay poll: every {} s over {} relay channel(s) [{}], no settle wait, no grace; \
+             one history listing per relay channel per poll plus thread listings for threads \
+             with new replies (about {} history calls a minute per channel)",
+            interval.as_secs(),
+            channels.len(),
+            channels
+                .iter()
+                .map(|c| c.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            60 / interval.as_secs().max(1)
+        ));
+    }
     Some(Rescan {
         interval: config.rescan_interval,
         window: config.rescan_window,
@@ -906,6 +970,9 @@ fn open_rescan(
         replay,
         noted: BTreeSet::new(),
         truncation_noted: false,
+        relay_interval: config.relay_poll,
+        relay_next_due_millis: now_millis,
+        relay_failures: 0,
     })
 }
 
@@ -948,6 +1015,10 @@ struct Rescan {
     // Allowed senders' messages a pass did not admit, logged once each.
     noted: BTreeSet<String>,
     truncation_noted: bool,
+    // Relay poll (#769): its own cadence and failure count; `None` never polls.
+    relay_interval: Option<Duration>,
+    relay_next_due_millis: u64,
+    relay_failures: u32,
 }
 
 const MAX_NOTED: usize = 1_024;
@@ -1482,6 +1553,324 @@ impl SlackDriver {
         let item = self.next_rescued_from(&mut rescan);
         self.rescan = Some(rescan);
         item
+    }
+
+    /// Relay channels (configured relay channels this subscription carries).
+    fn relay_channels(&self) -> Vec<String> {
+        self.config
+            .relay_peers
+            .keys()
+            .filter(|channel| self.channels.iter().any(|c| c.as_str() == channel.as_str()))
+            .cloned()
+            .collect()
+    }
+
+    /// Offer the queue, running one relay poll first when it is due
+    /// (#769). No settle: the module documentation explains why stream
+    /// catch-up ordering cannot apply to relay posts.
+    fn relay_poll_if_due(&mut self) -> Result<Option<SubscriptionItem>, BackendFailure> {
+        let now = (self.now_millis)();
+        let Some(mut rescan) = self.rescan.take() else {
+            return Ok(None);
+        };
+        if let Some(interval) = rescan.relay_interval.filter(|_| !rescan.stopped) {
+            if now >= rescan.relay_next_due_millis {
+                self.relay_pass(&mut rescan, interval, now);
+            }
+        }
+        let item = self.next_rescued_from(&mut rescan);
+        self.rescan = Some(rescan);
+        item
+    }
+
+    /// One relay poll: the newest history page of each relay channel (one
+    /// history listing per channel), plus the threads in it with replies
+    /// newer than the last listing. No grace period (ripe = now): a bot
+    /// post is complete when posted, and the stream never carries it.
+    /// Admission and dedup are the rescan's own `consider` and ledger.
+    fn relay_pass(&mut self, rescan: &mut Rescan, interval: Duration, now: u64) {
+        let channels = self.relay_channels();
+        if channels.is_empty() {
+            rescan.relay_next_due_millis =
+                now.saturating_add(u64::try_from(interval.as_millis()).unwrap_or(u64::MAX));
+            return;
+        }
+        let now_micros = u128::from(now) * 1_000;
+        let listing_floor = self
+            .created_floor_micros
+            .max(now_micros.saturating_sub(rescan.window.as_micros()));
+        let floor = listing_floor.max(rescan.ledger.tracking_since_micros);
+        let ripe = now_micros;
+        let started = Instant::now();
+        let mut found = Vec::new();
+        let mut failure: Option<TransportError> = None;
+        let mut yielded = false;
+        let mut headroom = false;
+        let budget = rescan.budget.clone();
+        let mut spend = Spend {
+            budget: budget.as_ref(),
+            ..Spend::default()
+        };
+        // Headroom for the owner-channel general rescan: the poll stops
+        // once half this minute's shared budget is used (#769 review).
+        let over_headroom = |spend: &Spend<'_>| {
+            spend.budget.is_some_and(|budget| {
+                let usage = budget.usage(now);
+                usage.per_minute > 0 && usage.used >= usage.per_minute / 2
+            })
+        };
+        let channel_peers: Vec<(String, Vec<String>)> = channels
+            .iter()
+            .map(|channel| {
+                (
+                    channel.clone(),
+                    self.config
+                        .relay_peers
+                        .get(channel)
+                        .cloned()
+                        .unwrap_or_default(),
+                )
+            })
+            .collect();
+        let is_peer = |peers: &[String], message: &crate::transport::SlackMessage| {
+            message
+                .user_id
+                .as_deref()
+                .is_some_and(|author| peers.iter().any(|peer| peer == author))
+        };
+        'poll: for (channel, peers) in &channel_peers {
+            if over_headroom(&spend) {
+                headroom = true;
+                break 'poll;
+            }
+            let oldest = micros_ts(listing_floor);
+            let query = ScanQuery {
+                channel_id: channel,
+                thread_ts: None,
+                oldest: &oldest,
+                page_token: None,
+            };
+            let listed = match self.scan_listing(&query, &started, &mut yielded, &mut spend) {
+                Ok(listed) => listed,
+                Err(_) if spend.refused.is_some() => break 'poll,
+                Err(error) => {
+                    let limited = rescan::rate_limit_delay(&error).is_some();
+                    if failure.is_none()
+                        || (limited
+                            && failure
+                                .as_ref()
+                                .is_some_and(|f| rescan::rate_limit_delay(f).is_none()))
+                    {
+                        failure = Some(error);
+                    }
+                    if limited {
+                        break 'poll;
+                    }
+                    continue 'poll;
+                }
+            };
+            let mut due_threads: Vec<(u128, String)> = Vec::new();
+            for row in &listed.messages {
+                // Only relay peers' posts: a person's post in the relay
+                // channel belongs to the stream and the general rescan.
+                if !is_peer(peers, &row.message) {
+                    continue;
+                }
+                self.consider(rescan, &row.message, floor, ripe, &mut found);
+                if let Some(latest) = row
+                    .latest_reply
+                    .as_deref()
+                    .and_then(ids::ts_micros)
+                    .filter(|_| row.reply_count > 0)
+                {
+                    let key = message_key(channel, &row.message.message_ts);
+                    let through = rescan.threads.get(&key).copied().unwrap_or(0);
+                    if latest >= floor && latest > through {
+                        due_threads.push((latest, row.message.message_ts.clone()));
+                    }
+                }
+            }
+            due_threads.sort_by(|a, b| b.cmp(a));
+            due_threads.dedup_by(|a, b| a.1 == b.1);
+            due_threads.truncate(rescan::MAX_THREADS_PER_PASS);
+            for (latest, root) in due_threads {
+                let key = message_key(channel, &root);
+                let through = rescan.threads.get(&key).copied().unwrap_or(0);
+                let oldest = micros_ts(floor.max(through));
+                let mut listed_through = through;
+                let mut token: Option<String> = None;
+                let mut complete = false;
+                let mut overflowed = false;
+                let mut thread_failed = false;
+                for _ in 0..rescan::MAX_THREAD_PAGES {
+                    if over_headroom(&spend) {
+                        headroom = true;
+                        break 'poll;
+                    }
+                    if self.rescan_stop(&started, &mut yielded, true) {
+                        break 'poll;
+                    }
+                    let query = ScanQuery {
+                        channel_id: channel,
+                        thread_ts: Some(&root),
+                        oldest: &oldest,
+                        page_token: token.as_deref(),
+                    };
+                    let listed = match self.scan_listing(&query, &started, &mut yielded, &mut spend)
+                    {
+                        Ok(listed) => listed,
+                        Err(_) if spend.refused.is_some() => break 'poll,
+                        Err(error) => {
+                            let limited = rescan::rate_limit_delay(&error).is_some();
+                            if failure.is_none()
+                                || (limited
+                                    && failure
+                                        .as_ref()
+                                        .is_some_and(|f| rescan::rate_limit_delay(f).is_none()))
+                            {
+                                failure = Some(error);
+                            }
+                            if limited {
+                                break 'poll;
+                            }
+                            thread_failed = true;
+                            break;
+                        }
+                    };
+                    for row in &listed.messages {
+                        if row.message.message_ts == root {
+                            continue;
+                        }
+                        if !is_peer(peers, &row.message) {
+                            // Left for the stream/general rescan; do not
+                            // advance this thread's watermark past it.
+                            overflowed = true;
+                            continue;
+                        }
+                        overflowed |= !self.consider(rescan, &row.message, floor, ripe, &mut found);
+                        if let Some(at) = ids::ts_micros(&row.message.message_ts) {
+                            if at <= ripe {
+                                listed_through = listed_through.max(at);
+                            }
+                        }
+                    }
+                    token = listed.next_page_token;
+                    if token.is_none() {
+                        complete = true;
+                        break;
+                    }
+                }
+                if complete {
+                    listed_through = listed_through.max(latest);
+                }
+                if !overflowed && !thread_failed {
+                    rescan.threads.insert(key, listed_through);
+                }
+            }
+        }
+        rescan
+            .queue
+            .make_contiguous()
+            .sort_by_key(|message| ids::ts_micros(&message.message_ts).unwrap_or(0));
+        // Scheduling mirrors a pass: a budget refusal or a rate limit
+        // backs the poll off the same way, other failures exponentially.
+        let interval_millis = u64::try_from(interval.as_millis()).unwrap_or(u64::MAX);
+        if let Some(refusal) = spend.refused {
+            let cap = u64::try_from(rescan::MAX_RATE_LIMIT_BACKOFF.as_millis()).unwrap_or(u64::MAX);
+            let until = match refusal {
+                crate::budget::Refusal::Blocked(until) => until
+                    .max(now.saturating_add(interval_millis))
+                    .min(now.saturating_add(cap)),
+                crate::budget::Refusal::Spent(until) => until,
+            };
+            rescan.relay_next_due_millis = until.max(now.saturating_add(1_000));
+            self.diagnostics.log(&format!(
+                "relay poll: the host listing budget {} after {} listings; next poll in {} s",
+                match refusal {
+                    crate::budget::Refusal::Blocked(_) =>
+                        "holds every bridge back after a rate limit",
+                    crate::budget::Refusal::Spent(_) => "is spent for this minute",
+                },
+                spend.history_calls + spend.thread_calls,
+                rescan.relay_next_due_millis.saturating_sub(now) / 1_000
+            ));
+        } else if headroom {
+            rescan.relay_next_due_millis = now.saturating_add(interval_millis);
+            self.diagnostics.log(
+                "relay poll: stopped at half the shared per-minute budget, keeping headroom for the general rescan",
+            );
+        } else if yielded {
+            rescan.relay_next_due_millis = now.saturating_add(interval_millis);
+        } else {
+            match failure {
+                Some(error)
+                    if matches!(
+                        error.code.as_str(),
+                        "scan_unsupported" | "transport_unimplemented"
+                    ) =>
+                {
+                    rescan.stopped = true;
+                    self.diagnostics.log(&format!(
+                        "relay poll stopped: the transport cannot list history ({}: {})",
+                        error.code, error.detail
+                    ));
+                }
+                Some(error) if rescan::rate_limit_delay(&error).is_some() => {
+                    let delay = (interval + rescan::rate_limit_delay(&error).unwrap_or_default())
+                        .min(rescan::MAX_RATE_LIMIT_BACKOFF);
+                    rescan.relay_next_due_millis =
+                        now.saturating_add(u64::try_from(delay.as_millis()).unwrap_or(u64::MAX));
+                    self.diagnostics.log(&format!(
+                        "relay poll: a listing failed ({}: {}); next poll in {} s (rate-limited)",
+                        error.code,
+                        error.detail,
+                        delay.as_secs()
+                    ));
+                }
+                Some(error) => {
+                    rescan.relay_failures = rescan.relay_failures.saturating_add(1);
+                    let delay = interval
+                        .saturating_mul(1_u32 << rescan.relay_failures.min(16))
+                        .min(rescan::MAX_BACKOFF);
+                    rescan.relay_next_due_millis =
+                        now.saturating_add(u64::try_from(delay.as_millis()).unwrap_or(u64::MAX));
+                    self.diagnostics.log(&format!(
+                        "relay poll: a listing failed ({}: {}); next poll in {} s (failure {} in a row)",
+                        error.code,
+                        error.detail,
+                        delay.as_secs(),
+                        rescan.relay_failures
+                    ));
+                }
+                None => {
+                    rescan.relay_failures = 0;
+                    rescan.relay_next_due_millis = now.saturating_add(interval_millis);
+                }
+            }
+        }
+        self.diagnostics.log(&format!(
+            "relay poll: pass made {} history and {} thread listing calls; host budget {}",
+            spend.history_calls,
+            spend.thread_calls,
+            spend.usage.map_or_else(
+                || "not used".to_owned(),
+                |usage| if !usage.available {
+                    "unavailable (its file could not be used; nothing was counted)".to_owned()
+                } else if usage.per_minute == 0 {
+                    format!("{} calls this minute", usage.used)
+                } else {
+                    format!("{} of {} calls this minute", usage.used, usage.per_minute)
+                }
+            )
+        ));
+        if !found.is_empty() {
+            self.diagnostics.log(&format!(
+                "relay poll: found {} message{} the stream did not carry: {}",
+                found.len(),
+                if found.len() == 1 { "" } else { "s" },
+                found.join(", ")
+            ));
+        }
     }
 
     /// One bounded pass over every configured channel's history and the threads in it with
@@ -2097,6 +2486,9 @@ impl ChatSubscriptionDriver for SlackDriver {
                         ));
                     }
                     self.refresh_cursor()?;
+                    if let Some(item) = self.relay_poll_if_due()? {
+                        return Ok(Some(item));
+                    }
                     if let Some(item) = self.rescan_if_due()? {
                         return Ok(Some(item));
                     }
