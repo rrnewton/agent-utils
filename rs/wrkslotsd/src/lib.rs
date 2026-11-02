@@ -81,6 +81,7 @@ mod release_write;
 mod remove_write;
 mod replay;
 mod schema;
+mod shell_command_state;
 mod status_state;
 mod storage_state;
 mod transfer_write;

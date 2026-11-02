@@ -218,6 +218,49 @@ pub(crate) enum Command {
         #[arg(long, value_name = "FORMAT", default_value = "human", value_parser = ["human", "json"])]
         format: String,
     },
+    /// Print an exec-only shell command line that enters a slot's box (Python `shell-command`)
+    #[allow(clippy::enum_variant_names)]
+    ShellCommand {
+        /// Registered slot name (omitted with --box)
+        slot: Option<String>,
+        /// Slot type (default: agent)
+        #[arg(long, value_name = "TYPE", default_value = "agent", value_parser = ["agent", "validate"])]
+        slot_type: String,
+        /// Enter a coordinator box instead of a slot's box; no SLOT
+        #[arg(long = "box")]
+        box_mode: bool,
+        /// With --box: the box name (default: coordinator)
+        #[arg(long, value_name = "NAME", default_value = "coordinator")]
+        name: String,
+        /// With --box: worktrees or project (default: configuration sandbox scope)
+        #[arg(long, value_name = "SCOPE", value_parser = ["worktrees", "project"])]
+        writable: Option<String>,
+        /// With --box: the box's working directory (default: the project root)
+        #[arg(long, value_name = "PATH")]
+        cwd: Option<PathBuf>,
+        /// Passed to run (default: configuration sandbox isolation, else userns)
+        #[arg(long, value_name = "MODE", value_parser = ["userns", "cgroup", "root"])]
+        isolation: Option<String>,
+        /// Interactive shell (default: $SHELL, else /bin/bash)
+        #[arg(long, value_name = "PATH")]
+        shell: Option<String>,
+        /// Output format: text prints the command line; json prints {command, slot_path, isolation}
+        #[arg(long, value_name = "FORMAT", default_value = "text", value_parser = ["text", "json"])]
+        format: String,
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+        /// Program to run boxed instead of the interactive shell, after a literal --
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "COMMAND"
+        )]
+        command: Vec<String>,
+    },
     /// Diagnose every active record (owner process, heartbeat, hold) and print one status object per record
     ParseStatus {
         /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
@@ -869,6 +912,17 @@ impl<'a> From<&'a ReplaySummary> for CliSummary<'a> {
     }
 }
 
+/// Words after the first literal `--` in the process arguments, for
+/// handlers that must know which side of `--` a word was on (the
+/// Python CLI keeps the same raw arguments for this).
+fn after_separator() -> Vec<String> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.iter().position(|arg| arg == "--") {
+        Some(index) => args[index + 1..].to_vec(),
+        None => Vec::new(),
+    }
+}
+
 /// Parse process arguments, print one JSON summary, and return a process code.
 pub fn run() -> u8 {
     let command = Cli::parse().command;
@@ -1117,6 +1171,43 @@ pub fn run() -> u8 {
             Ok((text, code)) => {
                 print!("{text}");
                 return u8::try_from(code).unwrap_or(1);
+            }
+            Err(error) => {
+                eprintln!("wrkslotsd: {error}");
+                return 1;
+            }
+        },
+        Command::ShellCommand {
+            slot,
+            slot_type,
+            box_mode,
+            name,
+            writable,
+            cwd,
+            isolation,
+            shell,
+            format,
+            root,
+            machine,
+            command,
+        } => match crate::shell_command_state::shell_command_cli(
+            root.as_deref(),
+            machine.as_deref(),
+            slot.as_deref(),
+            &slot_type,
+            box_mode,
+            &name,
+            writable.as_deref(),
+            cwd.as_deref(),
+            isolation.as_deref(),
+            shell.as_deref(),
+            format == "json",
+            &command,
+            &after_separator(),
+        ) {
+            Ok(text) => {
+                print!("{text}");
+                return 0;
             }
             Err(error) => {
                 eprintln!("wrkslotsd: {error}");

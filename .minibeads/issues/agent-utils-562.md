@@ -714,3 +714,15 @@ Differential: py/wrkslots/tests/test_doctor_audit_cli_rust.py.
 Still Python-only in the soak: create human form, unpushed,
 shell-command, recover-batch human forms, and the other
 --format-default commands.
+
+Soak slice (shell-command): wrkslotsd shell-command prints the
+Python shell-command line and its {command, slot_path, isolation}
+JSON envelope, with the coordinator-box form and the refusals
+(unknown slot, --box with a SLOT, missing repository, no user
+D-Bus). The printed line still names the Python run/box entry in
+both editions; run and box are not ported yet, so the boxed step
+stays Python until they are. Soak maps shell-command to the Rust
+command in both formats. Differential:
+py/wrkslots/tests/test_shell_command_cli_rust.py. Still Python-only
+in the soak: create human form, unpushed, recover-batch human
+forms, and the other --format-default commands.

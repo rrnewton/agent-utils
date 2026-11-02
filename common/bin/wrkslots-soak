@@ -68,6 +68,7 @@ case "$CMD" in
     status) RUST_CMD="status-text" ;;
     doctor) RUST_CMD="doctor-text" ;;
     audit) RUST_CMD="audit-text" ;;
+    shell-command) RUST_CMD="shell-command" ;;
     unpushed|create|adopt|heartbeat|release|hold|unhold|finish|remove|write-handoff|read-handoff|transfer-owner|recover-unbound-owner|recover-absent-agent-row|recover-absent-agent-rows|recover-absent-validate-rows|recover-ownerless-agent-worktree|recover-ownerless-agent-clone|recover-ownerless-agent-cache|classify-ownerless-validate-batch|recover-ownerless-validate-batch|recover)
         RUST_CMD="$CMD" ;;
     *) run_python "$CMD" "${ORIGINAL[@]}" ;;

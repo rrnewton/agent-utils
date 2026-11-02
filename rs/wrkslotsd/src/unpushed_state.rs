@@ -391,7 +391,7 @@ pub(crate) fn unpushed(
 }
 
 /// `shlex.join` for the diagnostic command: quote only what needs it.
-fn shell_join(parts: &[String]) -> String {
+pub(crate) fn shell_join(parts: &[String]) -> String {
     parts
         .iter()
         .map(|part| {

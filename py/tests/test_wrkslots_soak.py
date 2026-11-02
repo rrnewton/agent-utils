@@ -38,6 +38,9 @@ case "$1" in
   status-text)
     if [ "$2" = "--help" ]; then echo "Usage: --root --machine --all-machines --slot --format"; exit 0; fi
     echo "RS status-text $@" ;;
+  shell-command)
+    if [ "$2" = "--help" ]; then echo "Usage: --root --machine --slot-type --box --name --writable --cwd --isolation --shell --format"; exit 0; fi
+    echo "RS shell-command $@" ;;
   heartbeat)
     if [ "$2" = "--help" ]; then echo "Usage: --agent --owner-pid --expected-generation --root --machine"; exit 0; fi
     echo "RS heartbeat-run $@" ;;
@@ -114,6 +117,14 @@ def test_human_audit_runs_in_rust(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert result.stdout.startswith("RS audit-text audit-text --gate")
     assert "cmd=audit edition=rust rc=0" in log.read_text()
+
+
+def test_shell_command_runs_in_rust(tmp_path: Path) -> None:
+    root, log = _sandbox(tmp_path)
+    result = _run(root, log, "shell-command", "slot01", "--format", "json")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("RS shell-command shell-command slot01 --format json")
+    assert "cmd=shell-command edition=rust rc=0" in log.read_text()
 
 
 def test_uncovered_command_stays_python_with_note(tmp_path: Path) -> None:

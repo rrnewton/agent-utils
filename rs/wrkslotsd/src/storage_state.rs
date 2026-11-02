@@ -560,7 +560,7 @@ fn still_attached_labels(image_file: &Path) -> Vec<String> {
 
 /// `os.path.normpath` for a POSIX path string, as the Python image
 /// reader applies it (a leading `//` is preserved, `///` is not).
-fn py_normpath(text: &str) -> String {
+pub(crate) fn py_normpath(text: &str) -> String {
     if text.is_empty() {
         return ".".to_string();
     }

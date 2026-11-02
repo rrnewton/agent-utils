@@ -5073,6 +5073,7 @@ fn cli_surface_contains_no_executor_or_mutation_subcommand() {
             "release",
             "audit-text",
             "doctor-text",
+            "shell-command",
             "status",
             "status-text",
             "validate-config"
