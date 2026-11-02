@@ -1789,7 +1789,7 @@ const summaryMark = (li) =>
  * Let the page report the summary failures it has been holding.
  *
  * Failures are deliberately NOT reported one at a time — twenty rows failing is one counted
- * sentence, not twenty racing writes of "one message" — so `summaryFailed` records and schedules,
+ * sentence, not twenty racing writes of "one message" — so `summaryFailed` (web/src/core/channels/summaries.ts) records and schedules,
  * and a zero-delay timer does the drawing and the saying. The fixture's timers are the test's to
  * fire, which is what makes the coalescing observable rather than merely hoped for.
  */

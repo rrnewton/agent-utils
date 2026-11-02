@@ -4089,8 +4089,9 @@ function foldable(li, meta, body, text, messageId, alsoIds = []) {
 //     `COLLAPSE_OVER_CHARS` in `foldable` above and nowhere else. The server has its own,
 //     stricter, threshold and answers `below_threshold` when a message clears ours and not its —
 //     which is not a failure and not a summary, so the row simply keeps its opening lines.
-//   * ONE REQUEST PER MESSAGE, EVER. `summariesAsked` is the record, and it is consulted before
-//     the fetch rather than after it, so a hundred scroll events over one row are one request.
+//   * ONE REQUEST PER MESSAGE, EVER. The owner's `summariesAsked` (web/src/core/channels/summaries.ts)
+//     is the record, and it is consulted before the fetch rather than after it, so a hundred scroll
+//     events over one row are one request.
 //   * ONLY WHAT YOU ARE LOOKING AT. Nothing is spent on rows the reader never reaches.
 //   * THE MODE IS THE OWNER'S SETTING, OFF UNLESS HE TURNS IT ON (`#564 message-summary-toggle`).
 //     It was once session-only, an act rather than a preference. The owner, 2026-10-26: "I'm
@@ -4106,7 +4107,7 @@ function foldable(li, meta, body, text, messageId, alsoIds = []) {
 //     Done (`#564 message-summary-toggle`: it used to turn red); the page never puts an apology
 //     where the content should be. The failures in one turn are counted and said once, and a
 //     server with no summariser at all is stated as a standing sentence rather than as fifty
-//     identical pills. See `summaryFailed`.
+//     identical pills. See `summaryFailed` in web/src/core/channels/summaries.ts.
 //
 // What is NOT here, and is the server's job rather than this file's: deciding whether an answer
 // came from the cache. The page asks the same way either way and is told which happened; acting
@@ -4123,7 +4124,7 @@ const SUMMARY_LOOKAHEAD_PX = 600;
  * words are web/src/present/rows's.
  */
 const summaryRows = createSummaries({
-  clock: browserPorts().clock,
+  clock: clockOnUse(),
   channel: () => selectedChannelId(),
   threadOf: (id) => threadForMessageId(id),
   // The rest of the glommed row, so the server summarises what the reader is actually looking at.
@@ -4182,8 +4183,8 @@ function summariesSettingLanded() {
  *
  * THIS function writes the failure mark, and the reason is the REBUILD, not this function's call
  * sites. The channel throws every `<li>` away and builds it again every DISCORD_POLL_MS, so a mark
- * written once where the failure is FIRST OBSERVED — in `summaryFailed`, the obvious place — lives
- * until the next poll and then quietly disappears. For a failure that is the worst behaviour
+ * written once where the failure is FIRST OBSERVED — in the owner's `summaryFailed`, the obvious
+ * place — lives until the next poll and then quietly disappears. For a failure that is the worst behaviour
  * available: the reader sees a red row, looks away, and finds an ordinary one when they look back.
  * So it has to be written by something the rebuild runs, from the map that outlives the row.
  *
@@ -10590,6 +10591,18 @@ function deviceStorageOnUse() {
     getItem: (key) => deviceStorage().getItem(key),
     setItem: (key, value) => deviceStorage().setItem(key, value),
     removeItem: (key) => deviceStorage().removeItem(key),
+  };
+}
+
+/**
+ * The page's clock for an owner made before the ports are, as {@link deviceStorageOnUse} is its storage.
+ *
+ * @returns {import("./src/ports/index.ts").ClockPort}
+ */
+function clockOnUse() {
+  return {
+    setTimeout: (run, ms) => browserPorts().clock.setTimeout(run, ms),
+    clearTimeout: (handle) => browserPorts().clock.clearTimeout(handle),
   };
 }
 
@@ -25572,8 +25585,8 @@ function drawChannelPage(payload, area, at) {
   saveChannelScope();
   renderScrollTools();
   // Every row here is new — `applyNewestPage` replaced the list — so the ones on screen have to
-  // be asked about again. `summariesAsked` is what stops that being a second request for a
-  // message already answered, which matters most here: this runs every DISCORD_POLL_MS.
+  // be asked about again. The summaries owner's `summariesAsked` is what stops that being a second
+  // request for a message already answered, which matters most here: this runs every DISCORD_POLL_MS.
   requestVisibleSummaries();
 }
 
@@ -38924,8 +38937,9 @@ el("scroll-area").addEventListener("scroll", () => {
   maybeLoadOlder();
   voiceTranscript().maybeLoadOlderTurns();
   // `#49 cached-summaries`. Summaries are produced as the reader scrolls, so this is where they
-  // are asked for. It is cheap on the ordinary event: `summariesAsked` answers for every row that
-  // has already been asked about, and a scroll that reveals nothing new issues nothing.
+  // are asked for. It is cheap on the ordinary event: the summaries owner's `summariesAsked` answers
+  // for every row that has already been asked about, and a scroll that reveals nothing new issues
+  // nothing.
   requestVisibleSummaries();
 });
 // `#207 scrollback-jump`. How far the list runs below the reader also changes WITHOUT a scroll, and
