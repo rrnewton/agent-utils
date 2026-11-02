@@ -4,7 +4,7 @@ status: open
 priority: 1
 issue_type: feature
 created_at: 2026-11-02T18:52:14+00:00
-updated_at: 2026-11-02T18:52:14+00:00
+updated_at: 2026-11-02T19:12:34+00:00
 ---
 
 # Description
@@ -15,3 +15,7 @@ updated_at: 2026-11-02T18:52:14+00:00
 2. **Time to first validation on a real queue.** Measured so far: the fixture's first batch (0.172 s) and a cold full plan on the consumer's ~85-change queue before the probe rewrite. Wanted: a plan on that queue at the current probe (the fixture went from 11 s / 265 CPU-s to 2.2 s / 6 CPU-s), and an end-to-end time to the first validation start.
 3. **Per-generator timing.** Per-change regeneration costs about 32 s per change on the consumer's repository, and that figure is not split by generator. Wanted: per-command timing in the regeneration record. Skipping a regeneration when nothing changed was dropped by decision, so the speed-up has to come from the generators.
 4. **Staged planning continuation is in memory only.** After a daemon restart mid-continuation, the planner re-probes everything; the persistent probe cache keeps that cheap. Low priority; listed so the gap is on record.
+
+# Notes
+
+[opus 5.5] (a) delivered in 88965b65. A stop is now never a verdict. SIGTERM or SIGINT cancels the validations, records them as cancelled, starts no batch, landing or ejection, and leaves undecided changes queued. A runner or generator killed by an outside signal stops the run with that reason instead of reading as red or `regen-failed`. The shipped unit sets `KillMode=mixed`. Five tests cover it, all failing on the previous code. Open: (b) and (c) need numbers from the consumer's real queue; (d) is low priority.
