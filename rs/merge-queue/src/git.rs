@@ -6,8 +6,9 @@
 //! one never touches a working tree; only validation needs a checkout.
 
 use std::collections::BTreeSet;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
 
 /// How a change is combined onto the candidate.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -229,6 +230,49 @@ impl Git {
             .map(str::to_owned)
             .collect();
         Ok(Err((tree, paths.into_iter().collect())))
+    }
+
+    /// A long-lived `git merge-tree --stdin` process: conflict queries without a process start
+    /// each.
+    pub fn merge_tree_batch(&self) -> Result<MergeTreeBatch, String> {
+        let mut command = self.command(&[
+            "merge-tree",
+            "--stdin",
+            "-z",
+            "--name-only",
+            "--no-messages",
+        ]);
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("could not start git merge-tree --stdin: {error}"))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or("merge-tree --stdin has no stdin")?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or("merge-tree --stdin has no stdout")?;
+        Ok(MergeTreeBatch {
+            child,
+            stdin: Some(stdin),
+            stdout: BufReader::new(stdout),
+        })
+    }
+
+    /// Commits reachable from `head` but not from `base`.
+    pub fn range(&self, base: &str, head: &str) -> Result<BTreeSet<String>, String> {
+        let range = format!("{base}..{head}");
+        Ok(self
+            .run(&["rev-list", &range])?
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect())
     }
 
     /// Files changed from the merge base of `base` and `head` through `head`.
@@ -487,6 +531,61 @@ impl Git {
     }
 }
 
+/// A running `git merge-tree --stdin -z --name-only --no-messages`.
+pub struct MergeTreeBatch {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    stdout: BufReader<ChildStdout>,
+}
+
+impl MergeTreeBatch {
+    fn token(&mut self) -> Result<String, String> {
+        let mut buffer = Vec::new();
+        let read = self
+            .stdout
+            .read_until(0, &mut buffer)
+            .map_err(|error| format!("merge-tree --stdin read failed: {error}"))?;
+        if read == 0 {
+            return Err("merge-tree --stdin ended early (bad commit?)".to_owned());
+        }
+        if buffer.last() == Some(&0) {
+            buffer.pop();
+        }
+        Ok(String::from_utf8_lossy(&buffer).into_owned())
+    }
+
+    /// Paths that conflict when merging `left` and `right`; empty means clean.
+    pub fn conflicts(&mut self, left: &str, right: &str) -> Result<Vec<String>, String> {
+        let stdin = self.stdin.as_mut().ok_or("merge-tree --stdin is closed")?;
+        writeln!(stdin, "{left} {right}")
+            .and_then(|()| stdin.flush())
+            .map_err(|error| format!("merge-tree --stdin write failed: {error}"))?;
+        // Each record: status NUL tree NUL (conflicted path NUL)* NUL.
+        let status = self.token()?;
+        let _tree = self.token()?;
+        let mut paths = BTreeSet::new();
+        loop {
+            let token = self.token()?;
+            if token.is_empty() {
+                break;
+            }
+            paths.insert(token);
+        }
+        match status.as_str() {
+            "1" => Ok(Vec::new()),
+            "0" => Ok(paths.into_iter().collect()),
+            other => Err(format!("merge-tree --stdin: unexpected status {other:?}")),
+        }
+    }
+}
+
+impl Drop for MergeTreeBatch {
+    fn drop(&mut self) {
+        drop(self.stdin.take());
+        let _ = self.child.wait();
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod testrepo {
     //! Throwaway repositories for unit tests.
@@ -714,6 +813,35 @@ mod unit {
             .settings_for(&["fetch", "origin"])
             .contains(&"credential.helper=".to_owned()));
         assert!(git.settings_for(&["push", "origin"]).is_empty());
+    }
+
+    #[test]
+    fn batch_merge_tree_agrees_with_single_calls() {
+        let tmp = TempDir::new("git-batch");
+        let git = init(&tmp.0);
+        write(&tmp.0, "shared.txt", "1\n2\n3\n");
+        git_add_commit(&tmp.0);
+        let a = branch(&tmp.0, "a", "main", &[("shared.txt", "A\n2\n3\n")]);
+        let b = branch(
+            &tmp.0,
+            "b",
+            "main",
+            &[("shared.txt", "B\n2\n3\n"), ("x", "x\n")],
+        );
+        let c = branch(&tmp.0, "c", "main", &[("c", "c\n")]);
+        let mut batch = git.merge_tree_batch().unwrap();
+        for (left, right) in [(&a, &b), (&a, &c), (&b, &c), (&b, &a)] {
+            assert_eq!(
+                batch.conflicts(left, right).unwrap(),
+                git.merge_conflicts(left, right).unwrap()
+            );
+        }
+        assert_eq!(
+            batch.conflicts(&a, &b).unwrap(),
+            vec!["shared.txt".to_owned()]
+        );
+        let base = git.rev_parse("main").unwrap();
+        assert_eq!(git.range(&base, &a).unwrap(), [a.clone()].into());
     }
 
     #[test]

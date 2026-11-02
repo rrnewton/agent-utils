@@ -86,6 +86,10 @@ enum Command {
         /// `MQ_REGEN_PATHS` and `MQ_CONFLICTED` set.
         #[arg(long, default_value = "")]
         regen_command: String,
+        /// Optional command run before --regen-command, such as building the generator; its
+        /// failure ejects the change as `regen-build-failed` with the error tail.
+        #[arg(long, default_value = "")]
+        regen_build: String,
         /// When to regenerate: `conflict` (only when conflicts are confined to generated files)
         /// or `always` (after every change).
         #[arg(long, default_value = "conflict")]
@@ -572,6 +576,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             union_path,
             regen_path,
             regen_command,
+            regen_build,
             regen_when,
             exact_sha,
             trust_base,
@@ -624,6 +629,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                 regenerate: RegenerateConfig {
                     paths: regen_path,
                     command: regen_command,
+                    build_command: regen_build,
                     when: regen_when,
                 },
                 exact_sha,

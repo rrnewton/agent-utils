@@ -326,13 +326,6 @@ struct Candidate {
     tip: String,
     /// Commit after each change, aligned with `prs`.
     prefixes: Vec<String>,
-    /// Lazily regenerated prefix commits, by 1-based prefix index, shared by
-    /// every clone of this candidate so each prefix is regenerated at most once.
-    regen_prefixes: Arc<Mutex<BTreeMap<usize, String>>>,
-    /// Whether an unregenerated prefix may hold stale generated files and must
-    /// be regenerated on first use: `regenerate.when = always`, or a batch
-    /// that touched generated files under `when = conflict`.
-    lazy_prefix_regen: bool,
 }
 
 impl Candidate {
@@ -811,8 +804,7 @@ impl<'a> Runner<'a> {
         let mut tip = parent.to_owned();
         let mut kept: Vec<i64> = Vec::new();
         let mut prefixes = Vec::new();
-        let mut prefix_regenerated: Vec<bool> = Vec::new();
-        let mut prefix_touched: Vec<bool> = Vec::new();
+        let mut generator_ok: BTreeSet<String> = BTreeSet::new();
         let mut conflicts = Vec::new();
         let mut held = Vec::new();
         let regen = self.config.regenerate.clone();
@@ -854,32 +846,41 @@ impl<'a> Runner<'a> {
                     continue;
                 }
             };
-            // Whether this combination involved a generated file: it
-            // conflicted in one, or its resulting tree changes one. A batch
-            // that touches generated files owes a regenerated final tip even
-            // when every combination merged textually cleanly, because a
-            // textual merge of generated files need not be the output the
-            // generator would produce from the combined sources.
+            // Regenerate right after this change whenever the combined tree may hold stale or
+            // conflict-marked generated files: the change conflicted in one, its combination
+            // changed one (a textual merge of generated files need not be the generator's
+            // output), or `when = always`. Doing it per change keeps every prefix a
+            // self-consistent tree for culprit probes, and the next change builds on the
+            // regenerated prefix, so the prefixes form a fast-forward chain for per-change
+            // landing drivers.
             let touched = regen.enabled()
                 && (!conflicted.is_empty()
+                    || regen.always()
                     || self
                         .git
                         .diff_files(&tip, &next)?
                         .iter()
                         .any(|path| regen.covers(path)));
-            // Conflict repair regenerates in-loop: the combined tree still holds
-            // conflict markers in generated files, so nothing may build on it or
-            // validate it until the generator has rewritten them. The `always`
-            // case is hoisted below: it regenerates once on the final tip instead
-            // of once per change.
-            let mut regenerated = false;
-            let next = if !conflicted.is_empty() {
+            let next = if touched {
                 match self.regenerate(&next, *pr, &conflicted)? {
-                    Ok(done) => {
-                        regenerated = true;
-                        done
-                    }
+                    Ok(done) => done,
                     Err((kind, why)) => {
+                        // Before blaming this change, check that the generator works on the
+                        // tree just before it: if that fails too, the base or the generator's
+                        // environment is broken, and every change would be ejected in turn.
+                        if !generator_ok.contains(&tip) {
+                            match self.regenerate(&tip, *pr, &[])? {
+                                Ok(_) => {
+                                    generator_ok.insert(tip.clone());
+                                }
+                                Err((_, parent_why)) => {
+                                    return Err(format!(
+                                        "regeneration fails on {} itself, before #{pr}: {parent_why}; fix the base or the generator (no change was ejected)",
+                                        short(&tip)
+                                    ));
+                                }
+                            }
+                        }
                         skipped.insert(*pr);
                         conflicts.push((*pr, kind, why));
                         continue;
@@ -891,66 +892,14 @@ impl<'a> Runner<'a> {
             tip = next;
             kept.push(*pr);
             prefixes.push(tip.clone());
-            prefix_regenerated.push(regenerated);
-            prefix_touched.push(touched);
-        }
-        // Hoisted final-tip regeneration: one generator run on the final tip,
-        // not one per change. With `when = always` the tip is regenerated
-        // unconditionally; with `when = conflict` it is regenerated whenever
-        // the batch touched a generated file, because a combination that
-        // merged generated files textually (or took one side of them) can
-        // leave the tip different from the regenerated output, and only the
-        // regenerated tree may be validated. The generator's contract (see
-        // `RegenerateConfig`) is that it rewrites every generated file from
-        // its sources deterministically and touches nothing else, so running
-        // it once on the combined sources yields the same final tree as
-        // running it after every change. If the last kept change already
-        // conflict-regenerated, the tip is current and no run is needed. A
-        // failed run is blamed on the last kept change, which is dropped, and
-        // the new tip is tried, mirroring the per-change ejection.
-        let batch_touched = prefix_touched.iter().any(|touched| *touched);
-        if regen.enabled() && (regen.always() || batch_touched) {
-            while !kept.is_empty() && !prefix_regenerated.last().copied().unwrap_or(false) {
-                let last = *kept.last().unwrap();
-                match self.regenerate(&tip, last, &[])? {
-                    Ok(done) => {
-                        tip = done;
-                        if let Some(last_prefix) = prefixes.last_mut() {
-                            *last_prefix = tip.clone();
-                        }
-                        if let Some(flag) = prefix_regenerated.last_mut() {
-                            *flag = true;
-                        }
-                    }
-                    Err((kind, why)) => {
-                        let pr = kept.pop().unwrap();
-                        prefixes.pop();
-                        prefix_regenerated.pop();
-                        prefix_touched.pop();
-                        conflicts.push((pr, kind, why));
-                        tip = prefixes
-                            .last()
-                            .cloned()
-                            .unwrap_or_else(|| parent.to_owned());
-                    }
-                }
-            }
         }
         self.requeue(&held, "a dependency did not combine");
-        let regen_prefixes: BTreeMap<usize, String> = prefix_regenerated
-            .iter()
-            .enumerate()
-            .filter(|(_, done)| **done)
-            .map(|(index, _)| (index + 1, prefixes[index].clone()))
-            .collect();
         Ok((
             Candidate {
                 prs: kept,
                 parent: parent.to_owned(),
                 tip,
                 prefixes,
-                regen_prefixes: Arc::new(Mutex::new(regen_prefixes)),
-                lazy_prefix_regen: regen.enabled() && (regen.always() || batch_touched),
             },
             conflicts,
         ))
@@ -958,10 +907,11 @@ impl<'a> Runner<'a> {
 
     /// Rewrite the generated files on `tip` (which just combined `pr`) with the configured
     /// command and commit the result. `Ok(Err((kind, why)))` means this change cannot be
-    /// regenerated: `kind` is `regeneration-build` when the generator command itself
-    /// failed (spawn error or non-zero exit) and `regeneration` when it ran but its
-    /// output was unacceptable (it touched files outside the generated set, or
-    /// conflict markers remain). `Err` means the run itself cannot continue.
+    /// regenerated: `regen-build-failed` (the optional build step failed: the combined tree
+    /// cannot build the generator), `regen-failed` (the generator command failed),
+    /// `regen-touched-other` or `regen-left-conflict`. `Err` (including a failure to start a
+    /// process) means the run itself cannot continue.
+    #[allow(clippy::type_complexity)]
     fn regenerate(
         &self,
         tip: &str,
@@ -971,40 +921,46 @@ impl<'a> Runner<'a> {
         let regen = &self.config.regenerate;
         if !regen.enabled() {
             return Ok(Err((
-                "regeneration",
+                "regen-failed",
                 "generated files conflict but no regeneration is configured".into(),
             )));
         }
         let slot = self.slots.take();
         let result = (|| -> Result<Result<String, (&'static str, String)>, String> {
             let checkout = self.slots.checkout(slot, tip)?;
-            let output = match Command::new("sh")
-                .arg("-c")
-                .arg(&regen.command)
-                .current_dir(&checkout)
-                .env("MQ_PR", pr.to_string())
-                .env("MQ_REGEN_PATHS", regen.paths.join(" "))
-                .env("MQ_CONFLICTED", conflicted.join(" "))
-                .stdin(std::process::Stdio::null())
-                .output()
-            {
-                Ok(output) => output,
-                Err(error) => {
-                    return Ok(Err((
-                        "regeneration-build",
-                        format!("cannot run regenerate.command: {error}"),
-                    )))
-                }
+            let run_script = |script: &str, what: &str| -> Result<std::process::Output, String> {
+                Command::new("sh")
+                    .arg("-c")
+                    .arg(script)
+                    .current_dir(&checkout)
+                    .env("MQ_PR", pr.to_string())
+                    .env("MQ_REGEN_PATHS", regen.paths.join(" "))
+                    .env("MQ_CONFLICTED", conflicted.join(" "))
+                    .stdin(std::process::Stdio::null())
+                    .output()
+                    .map_err(|error| format!("cannot run {what}: {error}"))
             };
+            if !regen.build_command.trim().is_empty() {
+                let built = run_script(&regen.build_command, "regenerate.build_command")?;
+                if !built.status.success() {
+                    return Ok(Err((
+                        "regen-build-failed",
+                        format!(
+                            "build exited {}: {}",
+                            built.status.code().unwrap_or(-1),
+                            output_tail(&built, 6)
+                        ),
+                    )));
+                }
+            }
+            let output = run_script(&regen.command, "regenerate.command")?;
             if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let tail: Vec<&str> = stderr.lines().rev().take(3).collect();
                 return Ok(Err((
-                    "regeneration-build",
+                    "regen-failed",
                     format!(
                         "regenerate.command failed (exit {}): {}",
                         output.status.code().unwrap_or(-1),
-                        tail.into_iter().rev().collect::<Vec<_>>().join(" | ")
+                        output_tail(&output, 6)
                     ),
                 )));
             }
@@ -1025,7 +981,7 @@ impl<'a> Runner<'a> {
             let stray: Vec<&String> = changed.iter().filter(|path| !regen.covers(path)).collect();
             if !stray.is_empty() {
                 return Ok(Err((
-                    "regeneration",
+                    "regen-touched-other",
                     format!(
                         "regenerate.command changed files that are not generated: {}",
                         stray
@@ -1043,7 +999,7 @@ impl<'a> Runner<'a> {
                     .any(|line| line.starts_with("<<<<<<< ") || line.starts_with(">>>>>>> "))
                 {
                     return Ok(Err((
-                        "regeneration",
+                        "regen-left-conflict",
                         format!("conflict markers remain in {path} after regeneration"),
                     )));
                 }
@@ -1130,31 +1086,7 @@ impl<'a> Runner<'a> {
     /// never touched a generated file (or regeneration is unconfigured) the
     /// raw prefix is returned unchanged.
     fn regenerated_prefix(&self, candidate: &Candidate, i: usize) -> Result<String, String> {
-        if i == 0 {
-            return Ok(candidate.parent.clone());
-        }
-        if i >= candidate.prs.len() {
-            return Ok(candidate.tip.clone());
-        }
-        if let Some(done) = lock(&candidate.regen_prefixes).get(&i).cloned() {
-            return Ok(done);
-        }
-        if !(self.config.regenerate.enabled() && candidate.lazy_prefix_regen) {
-            return Ok(candidate.prefix(i).to_owned());
-        }
-        let raw = candidate.prefix(i).to_owned();
-        let pr = candidate.prs[i - 1];
-        let done = match self.regenerate(&raw, pr, &[])? {
-            Ok(done) => done,
-            Err((_, why)) => {
-                return Err(format!(
-                    "cannot regenerate prefix {} for #{pr}: {why}",
-                    short(&raw)
-                ));
-            }
-        };
-        lock(&candidate.regen_prefixes).insert(i, done.clone());
-        Ok(done)
+        Ok(candidate.prefix(i).to_owned())
     }
 
     /// Whether green results recorded at exactly `commit` cover `selection`: every selected test
@@ -1228,12 +1160,16 @@ impl<'a> Runner<'a> {
                 "not-fast-forward" => format!(
                     "must land as its own commits (another repository requires its exact head), but it is not on top of {detail}{context}; rebase it and update what requires it"
                 ),
-                "regeneration-build" => format!(
-                    "regeneration command failed for generated files onto {}{context}: {detail}; fix the generator and resubmit",
+                "regen-build-failed" => format!(
+                    "the combined tree onto {}{context} does not build the generator, so its generated files cannot be regenerated (the change is stale against the base or breaks the generator's sources): {detail}",
+                    short(parent)
+                ),
+                "regen-touched-other" | "regen-left-conflict" => format!(
+                    "regeneration onto {}{context} is unsafe: {detail}",
                     short(parent)
                 ),
                 _ => format!(
-                    "generated files could not be regenerated onto {}{context}: {detail}",
+                    "the generator failed onto {}{context}: {detail}",
                     short(parent)
                 ),
             };
@@ -2567,6 +2503,21 @@ fn discard(
     while let Some(flight) = flights.pop_back() {
         pending.push_front(flight.candidate.prs);
     }
+}
+
+/// The last `lines` non-empty lines of a command's combined output, joined for a one-line reason.
+fn output_tail(output: &std::process::Output, lines: usize) -> String {
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let kept: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    kept[kept.len().saturating_sub(lines)..].join(" | ")
 }
 
 /// Tests a run did not see pass (skipped, errored, failed). No synthetic

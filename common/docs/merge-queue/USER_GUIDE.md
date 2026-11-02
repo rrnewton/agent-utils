@@ -93,7 +93,8 @@ This command creates the state directory and writes `config.json`.
 | `--union-path PATTERN` | none | A Git attribute pattern merged with Git's `union` driver, when probing conflicts and when combining changes. Repeatable. Only for line-oriented, append-only files (see "Union merges"). |
 | `--regen-path PATTERN` | none | A generated file (exact path, directory with or without a trailing slash, or `*` wildcards) whose conflicts the queue resolves by regenerating it instead of holding the change. Repeatable. See "Generated files". |
 | `--regen-command CMD` | empty | Shell command, run as `sh -c` at the root of the candidate checkout, that rewrites every generated file from its sources deterministically. Runs with `MQ_PR` (change number), `MQ_REGEN_PATHS` (space-separated generated patterns) and `MQ_CONFLICTED` (space-separated conflicted paths, empty for a non-conflict refresh) set. Required with `--regen-path`. |
-| `--regen-when WHEN` | `conflict` | `conflict`: regenerate when a change's conflicts are confined to generated files; a batch that touches generated files also has its final tip regenerated, because a textual merge of generated files need not be the regenerated output. `always`: also after every change, so a combination never leaves a generated file stale. |
+| `--regen-when WHEN` | `conflict` | `conflict`: regenerate after a change whose combination conflicted in, or changed, a generated file (a textual merge of generated files need not be the regenerated output). `always`: regenerate after every change. Either way regeneration happens per change, so every prefix is a self-consistent tree. |
+| `--regen-build CMD` | empty | Command run before `--regen-command`, such as building the generator. When it fails, the change is ejected as `regen-build-failed` with the error tail. |
 | `--exact-sha` | off | Exact-commit rule: never carry a validation result to another commit. See "The exact-commit rule". |
 | `--trust-base` | off | Treat the base as green in culprit searches and skip probing it. Sound when only this queue lands on the base, always as exactly validated commits; a broken base would then be blamed on the first change of a red batch. |
 | `--classify PATTERN=CLASS` | none | Label failed tests whose ID, or whose step alone, matches `PATTERN` (exact or `*` wildcards) with `CLASS` in ejection records, reports and item history. One example is `--classify 'test.*_count=count pin drift'`. Repeatable. |
@@ -117,7 +118,7 @@ This command creates the state directory and writes `config.json`.
 | `--dag FILE` | empty | For `dagrun`: the DAG file, relative to the candidate checkout. |
 | `--dagrun PATH` | empty | For `dagrun`: the dagrun executable, relative to the checkout or absolute (empty means `dagrun` on `PATH`). |
 | `--admission WORD` | none | A command prefix every validation runs under, such as a host admission wrapper. Repeat it for several words. |
-| `--refusal-max-retries N` | `3` | Extra attempts after an admission refusal (exit `75` or `COULD_NOT_RUN`) within one `run`, each after a backoff delay. A refusal is never a pass and never red: the change stays queued. |
+| `--refusal-max-retries N` | `3` | Extra attempts after an admission refusal (exit `75`, or a non-zero exit whose first output line starts with `COULD_NOT_RUN` and that attributed no failed test) within one `run`, each after a backoff delay. A refusal is never a pass and never red: the change stays queued. |
 | `--refusal-backoff-secs SECS` | `2` | Base backoff between refusal retries, doubled per attempt and capped at 60 seconds. `0` means no delay. The same backoff sets the deferred change's next retry time. |
 | `--timeout SECS` | `0` | Seconds before one validation is killed (its whole process group) and its selected tests count as errors. `0` means no limit. |
 | `--clean-ignored` | off | Also delete ignored files (build caches) from a reused checkout before each validation. By default they are kept, which makes validations fast but trusts the build to be hermetic with respect to them. |
@@ -442,8 +443,18 @@ on which files two changes share.
    after it. Explicit `--after` dependencies count too. A dependency that has landed is satisfied.
    A dependency that is neither queued nor landed holds the dependent as `waiting-on-dependency`.
    A dependent of a held change is held as `waiting-on-dependency` as well.
-4. **Pairwise conflicts.** Every pair of queued heads is merged with `git merge-tree`. Pairs that
-   touch no common file, and stacked pairs, are skipped because they cannot conflict.
+4. **Pairwise conflicts.** Pairs of queued heads are merged with `git merge-tree`. Two kinds of
+   pair are skipped because they cannot conflict: stacked pairs, found from one
+   `git rev-list BASE..HEAD` per head rather than a check per pair, and pairs that share no file
+   outside the generated files (sharing a file is a necessary condition for a textual conflict).
+   The merges run on long-lived `git merge-tree --stdin` processes, one per worker
+   (`probe_parallelism` in `config.json`). Answers are cached in `probe-cache.json`, keyed by exact commits and a
+   hash of everything else that can change a merge: the queue's union and regeneration settings,
+   the repository's and the global attributes files, `HEAD:.gitattributes`, merge configuration
+   and the Git version. The cache is pruned to the current base and queued heads on every plan.
+   On a fixture of 95 changes over 3,000 files, each also rewriting one generated file, planning
+   takes about 1.6 s cold (about 4 CPU-seconds) and 1.35 s warm, against 11 s cold and about
+   265 CPU-seconds with one merge process per pair.
 5. **A conflict-free subset.** The queue does no repair. Once one of two conflicting changes
    lands, the other conflicts with the base, so both cannot land in the same round. The queue
    walks the changes in dependency order and picks the best-ranked ready change each time. The
@@ -629,7 +640,8 @@ with `merge-queue init --validator command --validator-run 'sh run-selected.sh' 
 path-routing`.
 
 **Admission refusals (retry later).** A validation that admission refuses to run at all — the
-runner exits `75`, or its combined output contains `COULD_NOT_RUN` — did not run, so it is
+runner exits `75`, or it exits non-zero, its first non-empty output line starts with
+`COULD_NOT_RUN`, and it attributed no failed test — did not run, so it is
 neither a pass nor a failure. The queue records the validation as `refused` with no failed
 tests, retries it in the same run after a backoff (`refusal_backoff_secs` doubled per attempt,
 up to `refusal_max_retries` extra attempts), and if it is still refused, defers the batch: every
@@ -866,31 +878,40 @@ list them with `--regen-path` and give the command that rebuilds them with `--re
 - **Building.** When combining a change leaves conflicts only in generated files, the queue checks
   the combination out in a scratch worktree, runs the command there, and commits the rewritten
   files on top as `merge-queue: regenerate <paths> after #<pr>`, under `identity`. It does this
-  right after that change, so every prefix the culprit search might probe is consistent. A batch
-  that touches generated files also has its final tip regenerated before validation (under
-  `--regen-when always`, every batch does), because a textual merge of generated files need not
-  be the regenerated output. With `--regen-when always`, it also regenerates after every other
-  change and commits only when a generated file actually changed.
+  right after that change. It also regenerates after any change whose combination changed a
+  generated file (a textual merge of generated files need not be the regenerated output) and,
+  with `--regen-when always`, after every change; a regeneration commits only when a generated
+  file actually changed. Because this happens per change, every prefix the culprit search might
+  probe is a self-consistent tree, and the next change builds on the regenerated prefix, so the
+  prefixes form a fast-forward chain for per-change land drivers.
 - **Validation.** The candidate is then validated as usual. The commit that lands is the exact
   validated commit, regeneration included.
 - **The regenerate contract (`--regen-command`).** The queue runs the command as `sh -c` with
   the working directory at the root of a scratch checkout of the candidate tip (the exact tree
   being combined), stdin closed, and these variables set: `MQ_PR` (the change being combined),
   `MQ_REGEN_PATHS` (the configured generated patterns, space-separated) and `MQ_CONFLICTED` (the
-  generated paths that conflicted, space-separated; empty for a hoisted tip refresh). The
+  generated paths that conflicted, space-separated; empty when nothing conflicted). The
   command must rewrite every generated file deterministically from the checkout's sources and
   touch nothing else: for the same sources it must produce byte-identical output on every run,
   and the queue refuses any run that changes a file outside the generated set. A minimal correct
   example that rebuilds `gen/all.txt` from its sources is `mkdir -p gen && cat $(ls src/* | sort) > gen/all.txt`; a full example with paths and sources of your own follows the same shape — run in
   the candidate checkout, read `MQ_CONFLICTED` if you need to scope work, and never write outside
   the generated paths.
-- **Refusals.** A change is ejected with kind `regeneration-build` when the generator command
-  itself fails — it cannot be run, or it exits non-zero — so the author fixes the generator and
-  resubmits. It is ejected with kind `regeneration` when the command succeeds but its output is
-  unacceptable: it changed a file that is not generated, or conflict markers remain afterwards.
-  The ejection kind is recorded on the ejection record, in the run report's ejected list, in the
-  per-change ejection file, and in the notification report the daemon sends for an ejected change,
-  so build failures are triaged separately from output or conflict failures.
+- **Refusals.** A change that cannot be regenerated is ejected with a kind that says why:
+
+  | Kind | Meaning |
+  |---|---|
+  | `regen-build-failed` | `--regen-build` failed: the combined tree cannot even build the generator (stale against the base, or the combination broke the generator's sources). The reason carries the build error's last lines. |
+  | `regen-failed` | The regeneration command itself failed (a wrong argument, a generator crash). |
+  | `regen-touched-other` | The command changed a file that is not generated. |
+  | `regen-left-conflict` | Conflict markers remain in a generated file afterwards. |
+
+  Before blaming a change, the queue regenerates the tree just before it. If that fails too, the
+  base or the generator's environment is broken, and ejecting each change in turn would eject them
+  all; instead the run stops with the reason and nothing is ejected. A failure to start a
+  process at all is likewise a run-level error, not an ejection. The kind is recorded on the
+  ejection record, in the run report, in the per-change ejection file and in the notification the
+  daemon sends.
 
 This is deterministic, not repair. The command must give the same output for the same sources.
 The run report lists every regeneration under `regenerated`.

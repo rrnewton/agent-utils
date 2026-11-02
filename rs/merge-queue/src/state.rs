@@ -134,10 +134,15 @@ pub struct RegenerateConfig {
     /// (byte-identical output for the same sources) and touch nothing else. The queue runs
     /// it with `MQ_PR`, `MQ_REGEN_PATHS` and `MQ_CONFLICTED` set.
     pub command: String,
-    /// `conflict` (default): regenerate when a change's conflicts are confined to generated
-    /// paths; a batch that touches generated files also has its final tip regenerated, because
-    /// a textual merge of generated files need not be the regenerated output. `always`: also
-    /// regenerate after every change, so combined changes never leave a generated file stale.
+    /// Optional shell command run before `command`, such as building the generator. When it
+    /// fails, the combined tree cannot even build the generator (stale against the base, or the
+    /// combination broke the generator's sources), and the change is ejected as
+    /// `regen-build-failed` with the error tail rather than as a generator failure.
+    pub build_command: String,
+    /// `conflict` (default): regenerate after a change whose combination conflicted in, or
+    /// changed, a generated file (a textual merge of generated files need not be the
+    /// regenerated output). `always`: regenerate after every change. Regeneration happens per
+    /// change, so every prefix a culprit search probes is self-consistent.
     pub when: String,
 }
 
@@ -599,6 +604,7 @@ mod unit {
             ],
             command: "regenerate".to_owned(),
             when: String::new(),
+            build_command: String::new(),
         };
         assert!(config.covers("generated/output.txt"));
         assert!(config.covers("gen/all.txt"));

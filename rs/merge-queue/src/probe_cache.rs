@@ -24,7 +24,7 @@ use crate::git::Git;
 use crate::state::write_json;
 
 /// Schema identifier of the on-disk cache file.
-pub const PROBE_CACHE_SCHEMA: &str = "merge-queue-probe-cache/v1";
+pub const PROBE_CACHE_SCHEMA: &str = "merge-queue-probe-cache/v2";
 /// File name of the cache inside the queue state directory.
 pub const PROBE_CACHE_FILE: &str = "probe-cache.json";
 
@@ -36,6 +36,9 @@ pub struct BaseEntry {
     pub files: Vec<String>,
     /// Raw conflicting paths against the base, sorted (before regenerable filtering).
     pub conflicts: Vec<String>,
+    /// Commits `head` adds over `base` (`rev-list BASE..HEAD`): another queued head in this set
+    /// is an ancestor of this one, so pairwise ancestry needs no git call per pair.
+    pub range: Vec<String>,
 }
 
 /// Which of two heads is an ancestor of the other, relative to the sorted key `(lo, hi)`.
@@ -185,6 +188,27 @@ impl ProbeCache {
         }
     }
 
+    /// Drop entries that can no longer be asked for: another base, or a head that is not queued
+    /// now (under any merge configuration). Keeps the file proportional to the queue.
+    pub fn retain(&mut self, base: &str, heads: &std::collections::BTreeSet<&str>) {
+        let before = (self.file.base.len(), self.file.pairs.len());
+        self.file.base.retain(|key, _| {
+            let mut parts = key.rsplitn(3, ':');
+            let head = parts.next().unwrap_or_default();
+            let entry_base = parts.next().unwrap_or_default();
+            entry_base == base && heads.contains(head)
+        });
+        self.file.pairs.retain(|key, _| {
+            let mut parts = key.rsplitn(3, ':');
+            let hi = parts.next().unwrap_or_default();
+            let lo = parts.next().unwrap_or_default();
+            heads.contains(lo) && heads.contains(hi)
+        });
+        if (self.file.base.len(), self.file.pairs.len()) != before {
+            self.dirty = true;
+        }
+    }
+
     /// Write the cache back to disk when it changed; ephemeral caches do nothing.
     pub fn save(&mut self) -> Result<(), String> {
         if !self.dirty {
@@ -196,6 +220,49 @@ impl ProbeCache {
         self.dirty = false;
         Ok(())
     }
+}
+
+/// Everything outside the commits themselves that can change what `git merge-tree` answers in
+/// this repository: the repository's `info/attributes`, the effective global attributes file,
+/// the attributes file at `HEAD` (bare repositories read it there), merge and diff
+/// configuration (rename detection, custom drivers, renormalisation), and the Git version.
+pub fn merge_environment(git: &Git) -> String {
+    let read = |path: &str| -> String {
+        if path.is_empty() {
+            return String::new();
+        }
+        let expanded = match path.strip_prefix("~/") {
+            Some(rest) => std::env::var("HOME")
+                .map(|home| format!("{home}/{rest}"))
+                .unwrap_or_default(),
+            None => path.to_owned(),
+        };
+        let full = std::path::Path::new(&expanded);
+        let full = if full.is_absolute() {
+            full.to_path_buf()
+        } else {
+            git.dir.join(full)
+        };
+        std::fs::read_to_string(full).unwrap_or_default()
+    };
+    let info = git
+        .run(&["rev-parse", "--git-path", "info/attributes"])
+        .map(|path| read(&path))
+        .unwrap_or_default();
+    let global = git
+        .run(&["config", "--get", "core.attributesFile"])
+        .map(|path| read(&path))
+        .unwrap_or_default();
+    let head_attributes = git
+        .run(&["rev-parse", "--verify", "--quiet", "HEAD:.gitattributes"])
+        .unwrap_or_default();
+    let merge_config = git
+        .run(&["config", "--get-regexp", "^(merge|diff)\\."])
+        .unwrap_or_default();
+    let version = git.run(&["--version"]).unwrap_or_default();
+    format!(
+        "info-attributes={info}\0global-attributes={global}\0head-attributes={head_attributes}\0merge-config={merge_config}\0git={version}"
+    )
 }
 
 /// A stable hash of everything besides commit IDs that can change a probe result: the Git
@@ -224,10 +291,30 @@ mod unit {
     use super::*;
     use crate::git::testrepo::TempDir;
 
+    #[test]
+    fn merge_environment_changes_with_repository_attributes() {
+        let tmp = TempDir::new("probe-env");
+        let git = crate::git::testrepo::init(&tmp.0);
+        let before = merge_environment(&git);
+        std::fs::create_dir_all(tmp.0.join(".git/info")).unwrap();
+        std::fs::write(
+            tmp.0.join(".git/info/attributes"),
+            "shared.txt merge=union\n",
+        )
+        .unwrap();
+        let after = merge_environment(&git);
+        assert_ne!(before, after);
+        assert_ne!(
+            probe_config_hash(&git, &before),
+            probe_config_hash(&git, &after)
+        );
+    }
+
     fn base_entry() -> BaseEntry {
         BaseEntry {
             files: vec!["a.txt".to_owned()],
             conflicts: vec![],
+            range: vec!["H".to_owned()],
         }
     }
 

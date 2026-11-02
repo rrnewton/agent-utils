@@ -300,6 +300,12 @@ fn probe_options_for(state: &State, config: &Config, git: &Git) -> ProbeOptions 
         !config.regenerate.command.trim().is_empty(),
         config.combine.as_str()
     );
+    // Merge answers also depend on attributes and merge configuration outside the queue's own
+    // settings, and on the Git version; a change to any of them must not reuse old answers.
+    let config_material = format!(
+        "{config_material};{}",
+        crate::probe_cache::merge_environment(git)
+    );
     ProbeOptions {
         cache_dir: Some(state.root.clone()),
         parallelism: config.probe_parallelism(),

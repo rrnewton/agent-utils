@@ -37,8 +37,23 @@ pub const REFUSAL_MARKER: &str = "COULD_NOT_RUN";
 /// Whether an exit status and combined runner output describe an admission refusal rather
 /// than a validation result. A refusal means validation did not run: it must not be treated
 /// as green, must not be treated as red, and must not attribute any test failure.
-pub fn is_refusal(exit: Option<i32>, log_text: &str) -> bool {
-    exit == Some(REFUSAL_EXIT) || log_text.contains(REFUSAL_MARKER)
+///
+/// The marker counts only as the first non-empty output line of a run that exited non-zero
+/// and attributed no failed test: a genuinely red run whose output merely mentions the marker
+/// (a test printing it, say) is a failure, not a refusal, or the change would be deferred
+/// forever instead of ejected.
+pub fn is_refusal(exit: Option<i32>, log_text: &str, attributed_failures: bool) -> bool {
+    if exit == Some(REFUSAL_EXIT) {
+        return true;
+    }
+    if exit == Some(0) || attributed_failures {
+        return false;
+    }
+    log_text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .is_some_and(|first| first.starts_with(REFUSAL_MARKER))
 }
 
 /// One finished validation.
@@ -471,7 +486,8 @@ impl Validator for CommandValidator {
         }
         results.require(selection);
         let log_text = std::fs::read_to_string(&log).unwrap_or_default();
-        let refused = !cancelled && is_refusal(exit, &log_text);
+        let refused =
+            !cancelled && is_refusal(exit, &log_text, !results.attributed_failures().is_empty());
         if refused {
             // Validation did not run: keep no test verdict from this attempt.
             results = TestResults::default();
@@ -675,7 +691,8 @@ impl Validator for DagrunValidator {
             .map(|tests| Selection::of(tests.iter().map(TestId::whole_step)));
         results.require(whole_steps.as_ref().unwrap_or(selection));
         let log_text = std::fs::read_to_string(&log).unwrap_or_default();
-        let refused = !cancelled && is_refusal(exit, &log_text);
+        let refused =
+            !cancelled && is_refusal(exit, &log_text, !results.attributed_failures().is_empty());
         if refused {
             results = TestResults::default();
         }

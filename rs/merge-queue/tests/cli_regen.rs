@@ -105,11 +105,15 @@ fn conflicts_only_in_generated_files_are_regenerated_not_held() {
 
     let r = report(&fx.mq_ok(&["run", "--json"]));
     assert_eq!(landed(&r), vec![vec![1, 2]], "{r}");
+    // Regeneration runs after each change that touched the generated file: #1's own version is
+    // already current, #2's combination conflicted and is rewritten.
     let regenerated = r["regenerated"].as_array().unwrap();
-    assert_eq!(regenerated.len(), 1, "{r}");
-    assert_eq!(regenerated[0]["pr"], 2);
+    assert_eq!(regenerated.len(), 2, "{r}");
+    assert_eq!(regenerated[0]["pr"], 1);
+    assert_eq!(regenerated[0]["rewritten"], serde_json::json!([]));
+    assert_eq!(regenerated[1]["pr"], 2);
     assert_eq!(
-        regenerated[0]["rewritten"],
+        regenerated[1]["rewritten"],
         serde_json::json!(["gen/all.txt"])
     );
     let generated = git(&fx.remote(), &["show", "main:gen/all.txt"]);
@@ -140,8 +144,10 @@ fn without_regeneration_the_same_changes_conflict() {
 }
 
 #[test]
-fn regeneration_that_touches_other_files_ejects_the_change() {
-    let bad = "cat $(ls src/* | sort) > gen/all.txt && echo oops > tests/t0";
+fn regeneration_that_touches_other_files_ejects_only_that_change() {
+    // The generator misbehaves only on trees containing src/c.
+    let bad =
+        "cat $(ls src/* | sort) > gen/all.txt && if [ -e src/c ]; then echo oops > tests/t0; fi";
     let fx = setup(
         "regen-bad",
         &["--regen-path", "gen/", "--regen-command", bad],
@@ -151,73 +157,69 @@ fn regeneration_that_touches_other_files_ejects_the_change() {
     fx.mq_ok(&["submit", "1", "--head", "b"]);
     fx.mq_ok(&["submit", "2", "--head", "c"]);
     let r = report(&fx.mq_ok(&["run", "--json"]));
-    // #2's conflict repair runs the broken command and is ejected for it.
-    // #1 touched the generated file too, so its batch tip owes regeneration
-    // as well; with the generator broken nothing in the batch may land
-    // unregenerated, so #1 is ejected for the same reason.
-    assert!(landed(&r).is_empty(), "{r}");
-    let ejected: Vec<i64> = r["ejected"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|e| e["pr"].as_i64().unwrap())
-        .collect();
-    assert_eq!(ejected, vec![2, 1], "{r}");
+    assert_eq!(landed(&r), vec![vec![1]], "{r}");
+    assert_eq!(r["ejected"].as_array().unwrap().len(), 1, "{r}");
+    assert_eq!(r["ejected"][0]["pr"], 2);
+    assert_eq!(r["ejected"][0]["kind"], "regen-touched-other");
     assert!(
-        r["ejected"].as_array().unwrap().iter().all(|e| {
-            e["kind"] == "regeneration"
-                && e["reason"]
-                    .as_str()
-                    .unwrap()
-                    .contains("not generated: tests/t0")
-        }),
+        r["ejected"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("not generated: tests/t0"),
         "{r}"
     );
 }
 
 #[test]
-fn failing_generator_command_ejects_with_regeneration_build_kind() {
-    // A generator that exits non-zero is a build failure, not an output
-    // failure: it must eject under `regeneration-build`, distinct from the
-    // `regeneration` kind used when the generator runs but touches files
-    // outside the generated set (see the test above).
+fn a_change_that_breaks_the_generator_is_ejected_as_regen_failed() {
     let fx = setup(
-        "regen-build-fails",
-        &["--regen-path", "gen/", "--regen-command", "exit 3"],
+        "regen-gen-fails",
+        &[
+            "--regen-path",
+            "gen/",
+            "--regen-command",
+            "if [ -e src/c ]; then echo 'unknown argument' >&2; exit 3; fi; cat $(ls src/* | sort) > gen/all.txt",
+        ],
     );
     source_change(&fx, "b");
     source_change(&fx, "c");
     fx.mq_ok(&["submit", "1", "--head", "b"]);
     fx.mq_ok(&["submit", "2", "--head", "c"]);
     let r = report(&fx.mq_ok(&["run", "--json"]));
-    assert!(landed(&r).is_empty(), "{r}");
-    let ejected = r["ejected"].as_array().unwrap();
-    assert!(
-        !ejected.is_empty() && ejected.iter().all(|e| e["kind"] == "regeneration-build"),
-        "failing generator must eject as regeneration-build, got: {r}"
-    );
-    assert!(
-        ejected.iter().all(|e| e["reason"]
-            .as_str()
-            .unwrap()
-            .contains("regenerate.command failed")),
-        "build failure reason must name the command failure: {r}"
-    );
-    // The human report (same run data, rendered as text) carries the
-    // distinct kind as well: run a fresh queue and read its text report.
-    let fx2 = setup(
-        "regen-build-fails-text",
+    assert_eq!(landed(&r), vec![vec![1]], "{r}");
+    assert_eq!(r["ejected"][0]["pr"], 2);
+    assert_eq!(r["ejected"][0]["kind"], "regen-failed");
+    assert!(r["ejected"][0]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("unknown argument"));
+}
+
+#[test]
+fn a_generator_broken_on_the_base_stops_the_queue_without_ejecting() {
+    // Whatever the change, the generator fails: blaming each change in turn would eject them
+    // all. The queue checks the tree before the change, sees it fail too, and stops.
+    let fx = setup(
+        "regen-base-broken",
         &["--regen-path", "gen/", "--regen-command", "exit 3"],
     );
-    source_change(&fx2, "b");
-    source_change(&fx2, "c");
-    fx2.mq_ok(&["submit", "1", "--head", "b"]);
-    fx2.mq_ok(&["submit", "2", "--head", "c"]);
-    let text = fx2.mq_ok(&["run"]);
+    source_change(&fx, "b");
+    source_change(&fx, "c");
+    fx.mq_ok(&["submit", "1", "--head", "b"]);
+    fx.mq_ok(&["submit", "2", "--head", "c"]);
+    let out = fx.mq(&["run", "--json"]);
+    assert_eq!(out.status.code(), Some(3));
+    let r = report(&String::from_utf8_lossy(&out.stdout));
+    assert!(r["ejected"].as_array().unwrap().is_empty(), "{r}");
     assert!(
-        text.contains("regeneration-build"),
-        "report must render regeneration-build: {text}"
+        r["stopped"]
+            .as_str()
+            .unwrap()
+            .contains("regeneration fails on"),
+        "{r}"
     );
+    let items: Value = serde_json::from_str(&fx.mq_ok(&["list", "--json"])).unwrap();
+    assert_eq!(items.as_array().unwrap().len(), 2, "both still queued");
 }
 
 #[test]
@@ -297,7 +299,7 @@ fn regen_count(count: &std::path::Path) -> usize {
 }
 
 #[test]
-fn regenerate_always_runs_once_for_a_two_change_batch() {
+fn regenerate_always_runs_after_each_change_so_every_prefix_is_consistent() {
     let fx = Fixture::new("regen-hoist-count");
     fx.write("src/a", "a\n");
     fx.write("gen/all.txt", "a\n");
@@ -322,20 +324,17 @@ fn regenerate_always_runs_once_for_a_two_change_batch() {
         "--regen-when",
         "always",
     ]);
-    // Both changes add a source but forget the generated file: textually clean,
-    // but stale, so `always` must refresh the batch's final tip.
+    // Both changes add a source but forget the generated file: textually clean, but stale.
+    // `always` regenerates after each change, so the one-change prefix a culprit search might
+    // probe is as consistent as the tip.
     fx.branch("b", &[("src/b", "b\n"), ("tests/b", "ok\n")]);
     fx.branch("c", &[("src/c", "c\n"), ("tests/c", "ok\n")]);
     fx.mq_ok(&["submit", "1", "--head", "b"]);
     fx.mq_ok(&["submit", "2", "--head", "c"]);
     let r = report(&fx.mq_ok(&["run", "--json"]));
     assert_eq!(landed(&r), vec![vec![1, 2]], "{r}");
-    assert_eq!(
-        regen_count(&count),
-        1,
-        "generator must run once, not per change: {r}"
-    );
-    assert_eq!(r["regenerated"].as_array().unwrap().len(), 1, "{r}");
+    assert_eq!(regen_count(&count), 2, "once per change: {r}");
+    assert_eq!(r["regenerated"].as_array().unwrap().len(), 2, "{r}");
     assert_eq!(git(&fx.remote(), &["show", "main:gen/all.txt"]), "a\nb\nc");
 }
 
@@ -371,10 +370,10 @@ fn conflict_repair_still_regenerates_per_conflicted_change() {
     fx.mq_ok(&["submit", "3", "--head", "d"]);
     let r = report(&fx.mq_ok(&["run", "--json"]));
     assert_eq!(landed(&r), vec![vec![1, 2, 3]], "{r}");
-    // Combining `c` and combining `d` each conflict only in the generated file;
-    // each conflict is repaired in-loop, so the generator runs twice.
-    assert_eq!(regen_count(&count), 2, "{r}");
-    assert_eq!(r["regenerated"].as_array().unwrap().len(), 2, "{r}");
+    // Every change touched the generated file (`b` changed it; `c` and `d` conflicted in it),
+    // so the generator runs after each of the three.
+    assert_eq!(regen_count(&count), 3, "{r}");
+    assert_eq!(r["regenerated"].as_array().unwrap().len(), 3, "{r}");
     assert_eq!(
         git(&fx.remote(), &["show", "main:gen/all.txt"]),
         "a\nb\nc\nd"
