@@ -28772,6 +28772,9 @@ def _expired_unhanded_candidates(
             "generation": record.generation,
             "agent": record.agent,
         }
+        _age, expired = _heartbeat_diagnosis(record)
+        if not expired:
+            continue
         hold = holds.get(record.slot)
         # An unreadable hold ({} sentinel) still holds: _retirement_candidates
         # treats a present-but-unreadable hold the same way.
@@ -28784,9 +28787,6 @@ def _expired_unhanded_candidates(
             results.append(
                 _ExpiredRetirementCandidate(**base, classification="retained", reason=reason)
             )
-            continue
-        _age, expired = _heartbeat_diagnosis(record)
-        if not expired:
             continue
         owner_state, owner_detail = _process_state(record.owner)
         owner_absent = _owner_record_is_absent(record)
@@ -28849,15 +28849,15 @@ def _expired_unhanded_candidates(
                         **base,
                         classification="action",
                         reason=(
-                            f"slot {record.slot} contains an unread handoff artifact; "
-                            f"run 'wrkslots read-handoff {record.slot} "
-                            "--coordinator-authorized --coordinator-pid "
-                            "<current-coordinator-pid>' and read its output, "
-                            "then retry retire-pending"
+                            f"slot {record.slot}'s handoff was read but not queued "
+                            f"for retirement; retire it with 'wrkslots remove "
+                            f"{record.slot} --coordinator-pid "
+                            "<current-coordinator-pid> --expected-generation "
+                            f"{record.generation}'"
                         ),
                     )
                 )
-                continue
+            # A read that queued retirement is the ordinary queue's candidate.
             continue
         answer = _registered_liveness_answer(config, record)
         if answer.state == "dead":
@@ -29309,7 +29309,6 @@ def _cmd_retire_pending(args: argparse.Namespace) -> int:
     # delegate to ordinary remove without a retirement candidate, so remove
     # re-proves heartbeat, liveness, owner, handoff, hold, process-use and
     # salvage. They are never attested here.
-    expired_stopped = False
     if expired_attemptable:
         if stopped_at is not None:
             deferred.extend(
@@ -29370,7 +29369,6 @@ def _cmd_retire_pending(args: argparse.Namespace) -> int:
                             "recovery_required": True,
                         }
                     )
-                    expired_stopped = True
                     deferred.extend(
                         {
                             "machine": rest.machine,
@@ -29529,8 +29527,8 @@ class _CachePlanExhausted(Refusal):
 class _CachePlanBudget:
     """One audit subject's share of cache-glob expansion.
 
-    One work unit is one directory listing, and ``seconds`` bounds the time
-    spent walking directories. Planning precedes the cache census, so this
+    One work unit is one directory listing (a share of what earlier subjects
+    left), and ``seconds`` bounds this subject's own time walking directories. Planning precedes the cache census, so this
     allowance is separate from the census's own. Git observations are not
     charged: their cost follows each checkout's index, not its ignored trees.
     """
@@ -29543,9 +29541,9 @@ class _CachePlanBudget:
     def check(self, walking: float = 0.0) -> None:
         if self.spent + walking >= self.seconds:
             raise _CachePlanExhausted(
-                "cache planning exhausted this subject's share of the fixed wall "
-                f"allowance of {self.wall_seconds:g} seconds; no cache total can be "
-                "published within this allowance"
+                "cache planning exhausted this subject's fixed wall allowance of "
+                f"{self.wall_seconds:g} seconds; no cache total can be published "
+                "within this allowance"
             )
         if self.work.remaining <= 0:
             raise _CachePlanExhausted(
@@ -34941,7 +34939,7 @@ def _cmd_audit(args: argparse.Namespace) -> int:
         # peers exist, and only a walk that exceeds it reports
         # _CachePlanExhausted. Total planning wall time is bounded by
         # subjects * allowance, which the caller accepted by choosing the
-        # per-subject allowance.
+        # per-subject allowance; the shared state lock is held that long.
         plan_started = metrics.start()
         plan_work = _AuditWorkBudget(args.cache_work_limit)
         plan_exhausted = 0

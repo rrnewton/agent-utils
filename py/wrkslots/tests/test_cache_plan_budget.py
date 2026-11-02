@@ -271,8 +271,8 @@ def test_walk_that_outlasts_its_wall_share_stops_listing(
         with pytest.raises(cli._CachePlanExhausted) as refused:
             cli._expand_cache_globs(root, ("ignored/**/target",), budget)
     assert str(refused.value) == (
-        "cache planning exhausted this subject's share of the fixed wall allowance "
-        "of 8 seconds; no cache total can be published within this allowance"
+        "cache planning exhausted this subject's fixed wall allowance of 8 "
+        "seconds; no cache total can be published within this allowance"
     )
     # The walk starts at tick 0 and reads one tick per listing: the checks at
     # ticks 1 and 2 leave 1 + 1 and 1 + 2 of 4 seconds spent, tick 3 refuses.
@@ -292,8 +292,8 @@ def test_expired_wall_share_refuses_before_any_listing_or_git(
             raise AssertionError("Git ran after the planning allowance expired")
 
     expired = (
-        "cache planning exhausted this subject's share of the fixed wall allowance "
-        "of 2.5 seconds; no cache total can be published within this allowance"
+        "cache planning exhausted this subject's fixed wall allowance of 2.5 "
+        "seconds; no cache total can be published within this allowance"
     )
     with _counted_listings(monkeypatch) as listed:
         with pytest.raises(cli._CachePlanExhausted) as refused:

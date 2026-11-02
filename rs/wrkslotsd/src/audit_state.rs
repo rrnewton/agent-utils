@@ -542,10 +542,11 @@ mod fmt_g_tests {
     }
 }
 
-/// One audit subject's share of cache-glob planning, mirroring
+/// One audit subject's cache-glob planning budget, mirroring
 /// the oracle's `_CachePlanBudget`: one work unit per directory
-/// listing, a fair share of the remaining wall allowance, and
-/// the oracle's two exhaustion spellings.
+/// listing (a fair share of what earlier subjects left), the
+/// full wall allowance for this subject alone, and the oracle's
+/// two exhaustion spellings.
 struct PlanBudget {
     work_limit: i64,
     work_consumed: i64,
@@ -558,9 +559,8 @@ impl PlanBudget {
     fn check(&self, walking: f64) -> Result<()> {
         if self.spent + walking >= self.seconds {
             return Err(format!(
-                "cache planning exhausted this subject's share of the fixed wall \
-                 allowance of {} seconds; no cache total can be published within \
-                 this allowance",
+                "cache planning exhausted this subject's fixed wall allowance of {} \
+                 seconds; no cache total can be published within this allowance",
                 fmt_g(self.wall_total)
             ));
         }
@@ -5995,19 +5995,20 @@ pub(crate) fn parse_audit(
     let mut unregistered_subjects: BTreeMap<(String, String), usize> = BTreeMap::new();
     let mut journal_subjects: BTreeMap<String, usize> = BTreeMap::new();
     let mut plan_work_consumed: i64 = 0;
-    let mut plan_seconds = census.wall_seconds;
-    let make_budget = |position: usize, consumed: i64, seconds_left: f64| PlanBudget {
+    // Work divides what earlier subjects left; wall does not: each
+    // subject gets the full allowance, so a slow-but-completing walk
+    // is not starved by the number of subjects (as the oracle does).
+    let make_budget = |position: usize, consumed: i64| PlanBudget {
         work_limit: (census.work_limit - consumed) / (target_count - position) as i64,
         work_consumed: 0,
-        seconds: seconds_left / (target_count - position) as f64,
+        seconds: census.wall_seconds,
         wall_total: census.wall_seconds,
         spent: 0.0,
     };
     for (position, record) in records.iter().enumerate() {
-        let mut budget = make_budget(position, plan_work_consumed, plan_seconds);
+        let mut budget = make_budget(position, plan_work_consumed);
         let (roots, error) = cache_roots(&cfg, &config, record, &mut budget, &plan_mounts);
         plan_work_consumed += budget.work_consumed;
-        plan_seconds = (plan_seconds - budget.spent).max(0.0);
         let machine = record
             .get("machine")
             .and_then(Value::as_str)
@@ -6028,7 +6029,7 @@ pub(crate) fn parse_audit(
     }
     for (offset, action) in target_actions.iter().enumerate() {
         let position = records.len() + offset;
-        let mut budget = make_budget(position, plan_work_consumed, plan_seconds);
+        let mut budget = make_budget(position, plan_work_consumed);
         match action {
             TargetAction::Unregistered(slot_type, slot) => {
                 let subject_key = format!("unregistered:{slot_type}:{slot}");
@@ -6041,7 +6042,6 @@ pub(crate) fn parse_audit(
                     &plan_mounts,
                 );
                 plan_work_consumed += budget.work_consumed;
-                plan_seconds = (plan_seconds - budget.spent).max(0.0);
                 unregistered_subjects
                     .insert((slot_type.clone(), slot.clone()), census_subjects.len());
                 census_subjects.push(subject);
@@ -6058,7 +6058,6 @@ pub(crate) fn parse_audit(
                     &plan_mounts,
                 );
                 plan_work_consumed += budget.work_consumed;
-                plan_seconds = (plan_seconds - budget.spent).max(0.0);
                 journal_subjects.insert(slot.clone(), census_subjects.len());
                 census_subjects.push(subject);
             }
