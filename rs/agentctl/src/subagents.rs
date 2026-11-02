@@ -7242,6 +7242,23 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             "terminal_id": record.terminal_id,
             "harness_pid": record.harness_identity.as_ref().map(|identity| identity.pid),
         });
+        if changed {
+            // Record the re-anchor for wrkslots' owner classification (#744, #777).
+            record_reanchor(
+                &mut record,
+                (
+                    Some(pane.clone()),
+                    previous["terminal_id"].as_str().map(str::to_owned),
+                    previous["harness_pid"].as_u64(),
+                ),
+                (
+                    Some(pane.clone()),
+                    info.terminal_id.clone(),
+                    Some(harness.pid),
+                ),
+                "restart-same-pane",
+            );
+        }
         record.terminal_id = info.terminal_id;
         record.harness_identity = Some(harness.clone());
         record.anchor_rule = Some(ANCHOR_RULE);
@@ -13263,6 +13280,35 @@ its drain would also type, so it was not queued",
 /// only once `wait` has seen it busy. A delivery is confirmed when the prompt has left the composer,
 /// which can precede the harness visibly starting its turn.
 pub const DELIVERY_SETTLE_SECONDS: f64 = 10.0;
+
+/// Append a re-anchor entry to the record's `reanchors` list in agent.json (#744):
+/// `{previous:{pane_id,terminal_id,pid}, current:{...}, slot, slot_generation, at, reason}`,
+/// capped at the newest 8. wrkslots reads the last entry matching its slot (a null
+/// generation matches on slot name alone, only when newer than its last generation change).
+fn record_reanchor(
+    record: &mut AgentRecord,
+    previous: (Option<String>, Option<String>, Option<u64>),
+    current: (Option<String>, Option<String>, Option<u64>),
+    reason: &str,
+) {
+    let entry = json!({
+        "previous": {"pane_id": previous.0, "terminal_id": previous.1, "pid": previous.2},
+        "current": {"pane_id": current.0, "terminal_id": current.1, "pid": current.2},
+        "slot": record.slot,
+        "slot_generation": null,
+        "at": unix_seconds(),
+        "reason": reason,
+    });
+    let list = record
+        .extra
+        .entry("reanchors".to_owned())
+        .or_insert_with(|| json!([]));
+    if let Some(entries) = list.as_array_mut() {
+        entries.push(entry);
+        let excess = entries.len().saturating_sub(8);
+        entries.drain(..excess);
+    }
+}
 
 fn unix_seconds() -> f64 {
     SystemTime::now()

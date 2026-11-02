@@ -439,6 +439,13 @@ fn anchor_refuses_a_changed_harness_without_replace() {
     let result = fixture.manager().anchor("worker", true, None).unwrap();
     assert_eq!(result["replaced"], true);
     assert_eq!(result["harness_pid"], 999);
+    // The re-anchor is recorded in agent.json for wrkslots' classification (#744).
+    let record = fixture.manager().read_record("worker").unwrap();
+    let reanchors = record.extra["reanchors"].as_array().unwrap();
+    assert_eq!(reanchors.len(), 1);
+    assert_eq!(reanchors[0]["reason"], "restart-same-pane");
+    assert_eq!(reanchors[0]["current"]["pid"], 999);
+    assert_eq!(reanchors[0]["slot_generation"], serde_json::Value::Null);
     send(&fixture, "worker", "after explicit re-anchor").unwrap();
 }
 
