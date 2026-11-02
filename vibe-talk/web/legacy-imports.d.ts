@@ -99,6 +99,7 @@ declare const foldLiveIn: LegacyImports["foldLiveIn"];
 declare const foldPageIn: LegacyImports["foldPageIn"];
 declare const emptyTally: LegacyImports["emptyTally"];
 declare const createChannelStore: LegacyImports["createChannelStore"];
+declare const createIdentities: LegacyImports["createIdentities"];
 declare const exactReplyCount: LegacyImports["exactReplyCount"];
 declare const replyTallyOf: LegacyImports["replyTallyOf"];
 declare const tallyRecord: LegacyImports["tallyRecord"];

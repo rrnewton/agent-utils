@@ -21,7 +21,7 @@ export {
 export { speechHoldFrom } from "../core/speech/index.ts";
 export { createApi, isSlowFailure, readableFailure } from "../core/api/index.ts";
 
-export { allReachesThread, answeredThread, coverViewOf, createChannelStore, createCopyOrder, createRemovals, emptyTally, exactReplyCount, foldDeltaIn, foldLiveIn, foldPageIn, heldNow, inTimeOrder, inViewOf, markDoneIn, namedRecord, newerPage, newerPageSpeaksFor, noteReplyGapsIn, pageFoldIn, placeFromPageIn, projectionOf, refreshFailed, replyTallyOf, restoreCanon, savedTimelineOf, tallyRecord, settleDoneIn, threadOf, timeOf, unseenRepliesIn, upsertThreadSummary, viewOfKey } from "../core/channels/index.ts";
+export { allReachesThread, answeredThread, coverViewOf, createChannelStore, createCopyOrder, createIdentities, createRemovals, emptyTally, exactReplyCount, foldDeltaIn, foldLiveIn, foldPageIn, heldNow, inTimeOrder, inViewOf, markDoneIn, namedRecord, newerPage, newerPageSpeaksFor, noteReplyGapsIn, pageFoldIn, placeFromPageIn, projectionOf, refreshFailed, replyTallyOf, restoreCanon, savedTimelineOf, settleDoneIn, tallyRecord, threadOf, timeOf, unseenRepliesIn, upsertThreadSummary, viewOfKey } from "../core/channels/index.ts";
 export { anchorOfMessage, createBookmarks, createPins, createReadLedger, isBookmarkState, sameAnchor } from "../core/annotations/index.ts";
 export { DEEP_LINK_VIEWS, REOPENED_VIEWS, UI_STATE_CHARS, UI_STATE_KEY, UI_STATE_VERSION, createNavigation, createUiState, deepLinkParams, deepLinkPart, deepLinkQuery, placeIsOver, visitKey } from "../core/navigation/index.ts";
 export {

@@ -478,3 +478,65 @@ test("`#624 voice-page-modularity`: Done in the store at once, and taken back ex
   assert.deepStrictEqual([none.flipped, none.settled, none.unsettled, none.canon], [[], [], [], null]);
   settleDoneIn(none, false);
 });
+
+test("`#624 voice-page-modularity`: who is who has one owner: choices beat guesses, us is `me`, the sole other bot is the coder", () => {
+  const { createIdentities, AUTHORS_KEY, LEGACY_AUTHORS_KEY, SELF_ID_KEY, BUCKETS } = CHANNELS;
+  const kept = new Map([
+    ["choices", JSON.stringify({ 7: "human", 8: "nonsense" })],
+    [AUTHORS_KEY, JSON.stringify({ c1: { 5: { name: "agent", bot: true } }, broken: [1] })],
+    [LEGACY_AUTHORS_KEY, "{}"],
+    [SELF_ID_KEY, "9"],
+  ]);
+  const storage = { getItem: (key) => kept.get(key) ?? null, setItem: (key, value) => kept.set(key, value),
+    removeItem: (key) => kept.delete(key) };
+  const providers = new Map();
+  const who = createIdentities({ storage: () => storage, identityKey: "choices", providerOf: (id) => providers.get(id) ?? null });
+  assert.deepStrictEqual([...who.buckets()], ["me", "coder", "human", "bot"]);
+  assert.equal(who.buckets(), BUCKETS);
+  // Nothing known until load: the bridge's own account is not yet ours.
+  assert.equal(who.bucketFor("9", true, "c1"), "bot", "before load, the census is empty and nothing is ours");
+  who.load();
+  assert.ok(!kept.has(LEGACY_AUTHORS_KEY), "the flat census was not shed");
+  assert.deepStrictEqual(who.seenIn("broken"), {}, "a corrupt channel entry survived");
+  assert.equal(who.choiceOf("8"), undefined, "a bucket that is not ours survived");
+  assert.equal(who.choiceOf("7"), "human");
+  assert.ok(who.chosen("7") && !who.chosen("5"));
+  // 1. The reader said so; 2. us; 3. a person; 6. the only other bot in the channel.
+  assert.equal(who.bucketFor("7", true, "c1"), "human");
+  assert.equal(who.bucketFor("9", true, "c1"), "me");
+  assert.equal(who.bucketFor("3", false, "c1"), "human");
+  assert.equal(who.bucketFor("5", true, "c1"), "coder");
+  // A second bot in the channel makes it a coin toss; in another channel the first is alone again.
+  assert.ok(who.noteAuthor("c1", "6", "other", true));
+  assert.ok(!who.noteAuthor("c1", "6", "other", true), "the same author twice is news");
+  assert.equal(who.bucketFor("5", true, "c1"), "bot");
+  assert.ok(who.noteAuthor("c2", "5", "agent", true));
+  assert.equal(who.bucketFor("5", true, "c2"), "coder");
+  who.keepSeen();
+  assert.deepStrictEqual(Object.keys(JSON.parse(kept.get(AUTHORS_KEY))).sort(), ["c1", "c2"]);
+  // The owner's accounts, configured three ways.
+  who.setOwnerAuthorId("40");
+  who.learnOwnerIds(["41", "", 42]);
+  who.learnProviderAccounts([{ self_author_id: "50", owner_author_id: "43" }]);
+  assert.deepStrictEqual(["40", "41", "42", "43"].map((id) => who.isOwnerId(id)), [true, true, false, true]);
+  assert.ok(who.isSelfId("50") && who.isSelfId("9") && !who.isSelfId(""));
+  who.setOwnerAuthorId("");
+  assert.ok(!who.isOwnerId("40"));
+  // 4 and 5. A named coding agent, and where only named ones may be: the provider's, else the deployment's.
+  who.setDeploymentCodingAgents({ coding_agent_ids: ["6"], coding_agents_named_only: true });
+  assert.equal(who.bucketFor("6", true, "c1"), "coder");
+  assert.equal(who.bucketFor("5", true, "c2"), "bot");
+  providers.set("c2", { coding_agent_ids: [] });
+  assert.equal(who.bucketFor("5", true, "c2"), "coder", "a described provider did not carry its own");
+  assert.equal(who.codingAgentsOf("c2").namedOnly, false);
+  // A choice is kept; another device's replace them.
+  who.choose("5", "bot");
+  assert.deepStrictEqual(JSON.parse(kept.get("choices")), { 7: "human", 5: "bot" });
+  who.replaceChoices({ 9: "coder" });
+  assert.equal(who.bucketFor("9", true, "c1"), "coder");
+  assert.equal(who.choiceOf("7"), undefined);
+  // The account this bridge posts as: news once, and kept.
+  assert.ok(who.noteSelfAuthor("51"));
+  assert.ok(!who.noteSelfAuthor("51") && !who.noteSelfAuthor(""));
+  assert.equal(kept.get(SELF_ID_KEY), "51");
+});

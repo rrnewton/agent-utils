@@ -13137,10 +13137,10 @@ function hydrateFromCache() {
   deploymentCapabilities.threading = threadingSupported;
   knownChannels = shell.channels;
   learnProviders(shell.providers);
-  deploymentCodingAgents = codingAgentsFrom(shell);
+  whoIsWho.setDeploymentCodingAgents(shell);
   if (shell.self_author_id) noteSelfAuthor(shell.self_author_id);
-  ownerAuthorId = shell.owner_author_id || null;
-  learnOwnerIds(shell.owner_author_ids);
+  whoIsWho.setOwnerAuthorId(shell.owner_author_id);
+  whoIsWho.learnOwnerIds(shell.owner_author_ids);
   fillChannelSelect("discord-channel");
   // `#355 provider-grouped-channels`. Settings by service, from the saved shell as from client-config.
   fillServiceSelect();
@@ -20022,214 +20022,26 @@ function headingPieces(heading) {
 
 // --- who is speaking in the channel -------------------------------------------------------------
 //
-// The voice transcript tells its two speakers apart by side, colour and corner — three signals at
-// once — and the channel view told them apart by nothing at all: a wall of identical rows whose
-// only distinguishing mark was a display name anyone can set to anything. The owner asked for the
-// same treatment here, and for a way to say which account is which.
-//
-// FOUR BUCKETS, and the two that matter are drawn exactly as the transcript's two speakers:
-//
-//   me      the owner — INCLUDING the voice bot, which posts on his behalf through this bridge.
-//           Drawn as `mine`. That the words reached the channel through an intermediary does not
-//           make them somebody else's.
-//   coder   the coding agent. Drawn as `theirs`. These are the two halves of the conversation the
-//           reader is actually having, which is why they get the transcript's own idiom.
-//   human   another person.
-//   bot     another bot.
-//
-// KEYED ON THE AUTHOR SNOWFLAKE, never on the display name. `global_name` is chosen by whoever owns
-// the account and can be changed at any moment, and this whole page exists partly because an agent
-// once described messages that did not exist — a mapping that a rename silently redirects is the
-// same class of defect.
+// Who is who — the reader's choices, everyone seen in each channel, the accounts this server posts
+// as and the owner's own, and the bucket each author falls in — is web/src/core/channels's
+// (`createIdentities`, `#624 voice-page-modularity`), with why there are four buckets and why they
+// are keyed on the account. What is here is the page's: the redraw a newly learned account of ours
+// needs, which channel a message is from, and Settings' list, which reads the owner.
 
-// PER CHANNEL, and the key is new because the shape is. The census used to be one flat map of
-// every account seen anywhere, which made both halves of this section wrong about the word
-// "channel" that was already in its heading: Settings listed accounts from channels the reader was
-// not looking at, and the sole-other-bot guess below counted bots from them too — so a second bot
-// glimpsed once in another channel could stop the coding agent being recognised here. The old key
-// is not migrated and is deliberately removed: nothing in it says which channel anything was seen
-// in, so there is no honest way to split it, and the census costs one channel read to rebuild.
-// `IDENTITY_KEY` is web/src/core/settings's: its sync merges two devices' choices.
-const AUTHORS_KEY = "vibe-talk.voice.channel-authors";
-const LEGACY_AUTHORS_KEY = "vibe-talk.voice.authors";
-const SELF_ID_KEY = "vibe-talk.voice.self-id";
+/** Who is who. Nothing known until `load`, at start-up. */
+const whoIsWho = createIdentities({
+  storage: () => deviceStorage(),
+  identityKey: IDENTITY_KEY,
+  providerOf: (channelId) => providerOfChannel(channelId),
+});
 
-const BUCKETS = ["me", "coder", "human", "bot"];
-
-// What each bucket is called in Settings' list of who is who is web/src/present/settings's
-// (`BUCKET_LABELS`, `#624 voice-page-modularity`).
-
-/**
- * Explicit choices the reader has made, `{ [authorId]: bucket }`. Beats every guess below.
- *
- * KEYED ON THE ACCOUNT AND NOT ON THE CHANNEL, unlike the census beneath it, and the two are
- * deliberately different: what an account IS does not change because it spoke somewhere else, so
- * saying once that a bot is the coding agent must not have to be said again in the next channel
- * it appears in. The census is per channel because "who is in this conversation" genuinely is a
- * question about one conversation. The sentence under the list on the Settings screen says this
- * out loud, because a reader who has just changed channel is entitled to know which of the two
- * they are looking at.
- */
-let identities = {};
-
-/** Everyone seen in each channel, `{ [channelId]: { [authorId]: { name, bot } } }`, so Settings
- *  has rows to offer before the reader has opened that channel in this session. */
-let authorsSeen = {};
-
-/**
- * The snowflake THIS SERVER posts as.
- *
- * Learned rather than configured, and learned for free: every reply this page sends comes back as
- * the `Message` Discord recorded, and the live feed marks a message this server posted with
- * `self_posted`. Either one identifies the bridge's own account by construction — which is the one
- * account whose messages are the owner's own words. No `/users/@me` call, no configuration, and no
- * name matching.
- */
-let selfAuthorId = null;
-
-/**
- * The reader's OWN Discord account, when the deployment has been told what it is.
- *
- * Two accounts are the owner's words and both must be drawn as his: the one this bridge posts as,
- * and the one he types into Discord with himself. The first is free — it is readable out of the
- * bot token. The SECOND CANNOT BE DERIVED from anything the server holds, because a bot's account
- * has no relationship to the human reading the channel, so it is configuration
- * (`discord.owner_user_id`) or a per-account choice in Settings, and absent until one of those.
- *
- * Kept separate from `selfAuthorId` rather than folded into it: they are learned in different ways
- * and one of them can be wrong in a way the other cannot.
- */
-let ownerAuthorId = null;
-
-/**
- * The accounts this server posts as, and the owner's own accounts, at EVERY configured provider.
- *
- * A deployment can read several chat services at once, and each has its own account ids, so "me"
- * is a set rather than one id. Ids from different services cannot be confused for one another,
- * which is what makes one set safe for every channel. Filled from client-config's `providers`; an
- * older server sends none and only the two single ids above apply.
- */
-let providerSelfIds = new Set();
-let providerOwnerIds = new Set();
-
-/**
- * The accounts the configuration names as the coding agents (`coding_agent_user_ids`), and whether
- * only those — and the reader's own choices in Settings — may be drawn as the coding agent, for a
- * deployment that describes no providers one by one. `#323 slack-system-bots`. A provider that is
- * described carries its own (`codingAgentsOf`).
- */
-let deploymentCodingAgents = { ids: new Set(), namedOnly: false };
-
-/**
- * The coding agents a provider description, or client-config itself, names.
- *
- * @param {{ coding_agent_ids?: string[], coding_agents_named_only?: boolean } | null | undefined} described
- * @returns {{ ids: Set<string>, namedOnly: boolean }}
- */
-function codingAgentsFrom(described) {
-  const ids = described && Array.isArray(described.coding_agent_ids) ? described.coding_agent_ids : [];
-  return {
-    ids: new Set(ids.map(String)),
-    namedOnly: Boolean(described && described.coding_agents_named_only === true),
-  };
-}
-
-/** Who may be drawn as the coding agent in channel `channelId`: its provider's, else the deployment's. */
-function codingAgentsOf(channelId) {
-  const provider = providerOfChannel(channelId);
-  return provider ? codingAgentsFrom(provider) : deploymentCodingAgents;
-}
-
-/** Whether `id` is an account this server posts as. */
-function isSelfId(id) {
-  return Boolean(id) && ((selfAuthorId && id === selfAuthorId) || providerSelfIds.has(id));
-}
-
-/** Whether `id` is one of the owner's own accounts. */
-function isOwnerId(id) {
-  return Boolean(id) &&
-    ((ownerAuthorId && id === ownerAuthorId) || providerOwnerIds.has(id) || configuredOwnerIds.has(id));
-}
-
-/**
- * `#536 mark-own-messages-read`. Every account the server's configuration names as the owner's
- * (`owner_author_ids`: `[owner] user_ids` and each provider's `owner_user_id`). Before it was sent an
- * account only `[owner] user_ids` named was drawn as a person here while the server took it to be his.
- *
- * @type {Set<string>}
- */
-let configuredOwnerIds = new Set();
-
-/** Take down `owner_author_ids` from a client configuration, or none from an older server's. */
-function learnOwnerIds(list) {
-  configuredOwnerIds = new Set(
-    (Array.isArray(list) ? list : []).filter((id) => typeof id === "string" && id !== "").map(String));
-}
-
-function loadIdentities() {
-  const read = (key, fallback) => {
-    try {
-      const held = JSON.parse(deviceStorage().getItem(key) || "null");
-      return held && typeof held === "object" && !Array.isArray(held) ? held : fallback;
-    } catch (_error) {
-      return fallback;
-    }
-  };
-  identities = read(IDENTITY_KEY, {});
-  authorsSeen = read(AUTHORS_KEY, {});
-  // Shed the flat census rather than leaving it to rot in the reader's storage under a key nothing
-  // reads any more. Losing it costs one channel read; keeping it would cost an explanation.
-  try {
-    deviceStorage().removeItem(LEGACY_AUTHORS_KEY);
-  } catch (_error) {
-    // A browser that refuses to remove it is one that refused to store it. Nothing reads it.
-  }
-  // A channel whose entry is not an object is a corrupt entry, and it would otherwise surface as
-  // `Object.keys(undefined)` at the first render rather than as an empty list.
-  for (const [channel, seen] of Object.entries(authorsSeen)) {
-    if (!seen || typeof seen !== "object" || Array.isArray(seen)) {
-      delete authorsSeen[channel];
-    }
-  }
-  // A bucket that is not one of ours would otherwise become a `data-who` nobody styles, which reads
-  // as "this row is special" rather than as "this entry is corrupt".
-  for (const [id, bucket] of Object.entries(identities)) {
-    if (!BUCKETS.includes(bucket)) {
-      delete identities[id];
-    }
-  }
-  const held = deviceStorage().getItem(SELF_ID_KEY);
-  selfAuthorId = held || null;
-}
-
-function persistJson(key, value) {
-  try {
-    deviceStorage().setItem(key, JSON.stringify(value));
-  } catch (_error) {
-    // Shared origin storage, and this is a presentation preference: a browser that refuses it
-    // still gets the guesses below, which are what an unconfigured reader sees anyway.
-  }
-}
-
-/** Record that this id is the account this bridge posts as. */
+/** Record that this id is the account this bridge posts as, and redraw what that changes. */
 function noteSelfAuthor(id) {
-  const found = String(id || "");
-  if (!found || selfAuthorId === found) {
+  if (!whoIsWho.noteSelfAuthor(id)) {
     return;
-  }
-  selfAuthorId = found;
-  try {
-    deviceStorage().setItem(SELF_ID_KEY, found);
-  } catch (_error) {
-    // As above.
   }
   renderChannelRows();
   identityList.render();
-}
-
-/** Everyone seen in one channel, as a plain map, whether or not that channel has been read yet. */
-function seenIn(channelId) {
-  return authorsSeen[String(channelId || "")] || {};
 }
 
 /**
@@ -20245,71 +20057,10 @@ function messageChannel(message) {
 }
 
 /**
- * What bucket this author falls in, and why, in priority order.
- *
- * The guesses are exactly the ones the owner described, and they are GUESSES — every one of them
- * is overridden by an explicit choice, and Settings shows what was guessed so a wrong one is
- * visible rather than merely wrong.
- *
- * The coding agent is guessed only where the server allows it: an account the configuration names
- * is the coding agent, and where the configuration names any, or the channel is Slack's, no other
- * bot is guessed to be one (`#323 slack-system-bots`).
- *
- * WHICH CHANNEL is an argument because the last guess is a census, and a census is only meaningful
- * about one conversation. Callers pass the channel they are drawing: the message list passes the
- * one it is showing, Settings passes the one its picker is on. They can legitimately differ, and
- * when they do each is right about its own screen.
- */
-function bucketFor(authorId, isBot, channelId) {
-  const id = String(authorId || "");
-  // 1. The reader said so.
-  if (identities[id]) {
-    return identities[id];
-  }
-  // 2. It is us. Known by construction, not by name — either account the owner speaks through:
-  //    the bridge posting on his behalf, or the one he types into Discord with.
-  if (isSelfId(id)) {
-    return "me";
-  }
-  if (isOwnerId(id)) {
-    return "me";
-  }
-  if (!isBot) {
-    // 3. Not a bot, so a person. Which person is not something this page can know.
-    return "human";
-  }
-  // 4. A bot the configuration names as a coding agent at this channel's provider
-  //    (`coding_agent_user_ids`). `#323 slack-system-bots`.
-  const agents = codingAgentsOf(channelId);
-  if (agents.ids.has(id)) {
-    return "coder";
-  }
-  // 5. Where only a named account may be the coding agent — the configuration names some, or the
-  //    provider is Slack, whose channels carry system bots (a workspace's welcome bot, an
-  //    integration) — every other bot is another bot, drawn with its own name and "(bot)". A
-  //    lone system bot was drawn as the coding agent: nameless, unlabelled, in the agent's colours.
-  if (agents.namedOnly) {
-    return "bot";
-  }
-  // 6. A bot, and if it is the ONLY bot IN THIS CHANNEL that is not us then it is the coding agent
-  //    — the owner's own heuristic, and true of every channel this bridge is pointed at so far.
-  //    With two or more it is a coin toss, so it stays "another bot" and Settings is where it gets
-  //    decided. Scoped to the channel: a bot that has never spoken here says nothing about who the
-  //    reader is talking to here, and counting it was how the guess went quiet in a channel that
-  //    had exactly one candidate in it.
-  const otherBots = Object.entries(seenIn(channelId)).filter(
-    ([seen, who]) => who.bot && !isSelfId(seen)
-  );
-  if (otherBots.length === 1 && otherBots[0][0] === id) {
-    return "coder";
-  }
-  return "bot";
-}
-
-/**
  * `#402 who-is-who-channel-box`. Settings' list of who is who, one row per account seen in the channel
  * the channel box's picker is on, saying what it is and letting that be changed (web/src/view/settings
- * `mountIdentityList`, `#624 voice-page-modularity`). The census and the buckets it draws from are here.
+ * `mountIdentityList`, `#624 voice-page-modularity`). It reads the census and the buckets through the
+ * owner's `IdentityReader`.
  *
  * @type {import("./src/view/settings/index.ts").IdentityList}
  */
@@ -20318,33 +20069,10 @@ const identityList = mountIdentityList({
   allChannels: () => ALL_CHANNELS,
   known: (id) => Boolean(knownChannel(id)),
   nameOf: (id) => channelName(knownChannel(id)),
-  seenIn: (channelId) => seenIn(channelId),
-  isSelf: (id) => isSelfId(id),
-  buckets: () => BUCKETS,
-  bucketOf: (id, isBot, channelId) => bucketFor(id, isBot, channelId),
-  chosen: (id) => Boolean(identities[id]),
-  choose: (id, bucket) => {
-    identities[id] = bucket;
-    persistJson(IDENTITY_KEY, identities);
-  },
+  who: whoIsWho,
+  choose: (id, bucket) => whoIsWho.choose(id, bucket),
   renderChannelRows: () => renderChannelRows(),
 });
-
-/** Remember an author, in the channel they spoke in, so Settings can offer a row for them later. */
-function noteAuthor(channelId, id, name, isBot) {
-  const channel = String(channelId || "");
-  const key = String(id || "");
-  if (!channel || !key) {
-    return false;
-  }
-  const seen = authorsSeen[channel] || (authorsSeen[channel] = {});
-  const held = seen[key];
-  if (held && held.name === name && held.bot === isBot) {
-    return false;
-  }
-  seen[key] = { name: String(name || ""), bot: Boolean(isBot) };
-  return true;
-}
 
 // --- the inbox view -------------------------------------------------------------------------
 
@@ -20445,7 +20173,7 @@ function dressChannelRow(row, { tally, answered, viewing, inMain, inAll }) {
   // The speaker treatment, on the same pass and from the same census. `me` and `coder` are drawn
   // as the transcript's two speakers; see web/voice.css.
   setAttributeIfChanged(row, "data-who",
-    bucketFor(
+    whoIsWho.bucketFor(
       row.getAttribute("data-author-id"),
       row.getAttribute("data-author-bot") === "true",
       viewing
@@ -20566,7 +20294,7 @@ function renderChannelRows() {
   let learned = false;
   for (const row of rows) {
     learned =
-      noteAuthor(
+      whoIsWho.noteAuthor(
         viewing,
         row.getAttribute("data-author-id"),
         row.getAttribute("data-author"),
@@ -20574,7 +20302,7 @@ function renderChannelRows() {
       ) || learned;
   }
   if (learned) {
-    persistJson(AUTHORS_KEY, authorsSeen);
+    whoIsWho.keepSeen();
     // `#402 who-is-who-channel-box`. Only if Settings' box is on the channel that just learned
     // something. Otherwise the list is another channel's, and rebuilding it draws the same rows again.
     if (el("settings-channel").value === viewing) identityList.render();
@@ -23160,9 +22888,10 @@ function startsRead(message) {
   if (!markOwnRead || !message || isNoise(message)) return false;
   const id = String(message.author_id || "");
   if (!id) return false;
-  if (identities[id]) return identities[id] === "me";
-  if (isOwnerId(id)) return true;
-  return isSelfId(id) && !codingAgentsOf(messageChannel(message)).ids.has(id);
+  const chosen = whoIsWho.choiceOf(id);
+  if (chosen) return chosen === "me";
+  if (whoIsWho.isOwnerId(id)) return true;
+  return whoIsWho.isSelfId(id) && !whoIsWho.codingAgentsOf(messageChannel(message)).ids.has(id);
 }
 
 /**
@@ -36695,14 +36424,13 @@ let deploymentCapabilities = {
 /** Remember every provider's description, and the accounts each one speaks as. */
 function learnProviders(providers) {
   providerDescriptions = new Map();
-  providerSelfIds = new Set();
-  providerOwnerIds = new Set();
+  const described = [];
   for (const provider of Array.isArray(providers) ? providers : []) {
     if (!provider || typeof provider.key !== "string") continue;
     providerDescriptions.set(provider.key, provider);
-    if (provider.self_author_id) providerSelfIds.add(String(provider.self_author_id));
-    if (provider.owner_author_id) providerOwnerIds.add(String(provider.owner_author_id));
+    described.push(provider);
   }
+  whoIsWho.learnProviderAccounts(described);
 }
 
 /** The provider description for the channel `id`, or null when the server did not say. */
@@ -37612,7 +37340,7 @@ function applyClientConfig(config) {
   // `#528 thread-card-markdown-and-cap`: whether a long first message's summary may be on its way.
   threadNamesSupported = config.thread_names_supported === true;
   learnProviders(config.providers);
-  deploymentCodingAgents = codingAgentsFrom(config);
+  whoIsWho.setDeploymentCodingAgents(config);
   // The selected backend owns its display name. An older server leaves it unspecified, so the
   // page stays neutral instead of guessing a platform from channel IDs or deployment details.
   chatProviderName =
@@ -37641,9 +37369,9 @@ function applyClientConfig(config) {
     noteSelfAuthor(config.self_author_id);
   }
   // The reader's own Discord account, if the operator has said what it is. Not derivable; see
-  // `ownerAuthorId`.
-  ownerAuthorId = (config && config.owner_author_id) || null;
-  learnOwnerIds(config && config.owner_author_ids);
+  // `ownerAuthorId` in web/src/core/channels/identities.ts.
+  whoIsWho.setOwnerAuthorId(config && config.owner_author_id);
+  whoIsWho.learnOwnerIds(config && config.owner_author_ids);
   const describedVoice = config && config.conversational_voice;
   conversationalVoice = {
     name:
@@ -38051,6 +37779,7 @@ function applySyncedSetting(key) {
       case IDENTITY_KEY: {
         // `#488 slack-app-agents`. Another device said who an account is: every row it wrote is
         // drawn that way here too, and the list in Settings says so.
+        /** @type {Record<string, unknown>} */
         let held = {};
         try {
           const parsed = JSON.parse(settingsSync().local(key) || "null");
@@ -38058,7 +37787,7 @@ function applySyncedSetting(key) {
         } catch (_error) {
           // A value this page cannot read is no choice at all.
         }
-        identities = held;
+        whoIsWho.replaceChoices(held);
         eachColumn(renderChannelRows);
         identityList.render();
         break;
@@ -39210,7 +38939,7 @@ for (const type of ["focusin", "focusout"]) {
 noteKeyboard();
 // Before the first channel read, so the very first list of rows is already filtered rather
 // than appearing unfiltered for a frame and then rearranging under the reader.
-loadIdentities();
+whoIsWho.load();
 identityList.render();
 renderChannelRows();
 for (const [key, box] of NEWLINE_KEYS) wireNewlineKey(leftEl(key), leftEl(box));

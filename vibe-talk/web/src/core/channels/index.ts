@@ -47,3 +47,5 @@ export { emptyTally, exactReplyCount, replyTallyOf, tallyRecord, unseenRepliesIn
 export type { ReplyTally } from "./tally.ts";
 export { markDoneIn, settleDoneIn, settleUnknownReplies, unsettleReplies } from "./done.ts";
 export type { HeldDoneMark } from "./done.ts";
+export { AUTHORS_KEY, BUCKETS, LEGACY_AUTHORS_KEY, SELF_ID_KEY, codingAgentsFrom, createIdentities } from "./identities.ts";
+export type { CodingAgents, DescribedAccounts, Identities, IdentitiesDependencies, IdentityReader, SeenAuthor } from "./identities.ts";

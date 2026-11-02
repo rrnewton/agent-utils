@@ -730,6 +730,16 @@ parallel, each on its own area of `web/voice.js`, rebasing over one another's li
   reconciliation, holds and reconnects, read-aloud transport. Other lanes keep any voice controls and settings
   adapters they touch injectable, and move no call code until this lands.
 
+### Who is who crosses the channel/settings boundary (coordinator, 2026-11-01)
+
+The "who is speaking" state (the reader's choices, the per-channel census, the accounts this server posts as and
+the owner's own, the coding agents each provider names, and the bucket rule) has one owner in
+`core/channels/identities.ts` (`createIdentities`), moved by the `view/channel` lane. Settings' list of who is who
+reads it through the injected `IdentityReader` interface (census, self accounts, buckets, the bucket an account is
+in, whether the reader chose it), and chooses through the page's injected `choose`; it holds no page globals.
+`view/settings` may import `core/channels` for that type. A later settings batch reuses `IdentityReader` rather
+than reaching back into the page.
+
 ### How a slice is made and landed now
 
 SUPERSEDES section 7's "every commit must remain independently typechecked/buildable and behaviorally green;

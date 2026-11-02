@@ -22,7 +22,8 @@
 // did, and the choice was made in one channel's list: under another channel's it reads as a report about
 // rows nobody has touched. So it goes when the list's channel changes (`identityListChannel`).
 //
-// Which bucket an account is in, the census, and the reader's choices are the page's.
+// Which bucket an account is in, the census, and the reader's choices are web/src/core/channels's
+// (`createIdentities`); the list reads them through `IdentityReader` and chooses through the page.
 
 import {
   BUCKET_LABELS,
@@ -34,6 +35,7 @@ import {
   identityPickerLabel,
 } from "../../present/settings/index.ts";
 import type { SeenAccount } from "../../present/settings/index.ts";
+import type { IdentityReader } from "../../core/channels/index.ts";
 
 /** What the list asks of the page. */
 export interface IdentityListDependencies {
@@ -45,17 +47,9 @@ export interface IdentityListDependencies {
   known(id: string): boolean;
   /** What the page calls the channel with this id (`channelName`). */
   nameOf(id: string): string;
-  /** Who has spoken in a channel, by account id (`seenIn`). */
-  seenIn(channelId: string): { readonly [id: string]: SeenAccount };
-  /** Whether an account is this bridge's own (`isSelfId`). */
-  isSelf(id: string): boolean;
-  /** The buckets an account can be put in, in the picker's order (`BUCKETS`). */
-  buckets(): readonly string[];
-  /** Which bucket an account is in, chosen or guessed (`bucketFor`). */
-  bucketOf(id: string, isBot: boolean, channelId: string): string;
-  /** Whether the reader has chosen a bucket for this account (`identities`). */
-  chosen(id: string): boolean;
-  /** The reader chose a bucket for this account: kept on the device (`identities`, `persistJson`). */
+  /** Who is who: the census, the buckets, and which one each account is in (`whoIsWho`). */
+  readonly who: IdentityReader;
+  /** The reader chose a bucket for this account: kept on the device (`whoIsWho.choose`). */
   choose(id: string, bucket: string): void;
   /** Redraw the channel's rows, which a choice changes (`renderChannelRows`). */
   renderChannelRows(): void;
@@ -94,7 +88,7 @@ export function mountIdentityList(deps: IdentityListDependencies): IdentityList 
       host.replaceChildren(pick);
       return;
     }
-    const seen = deps.seenIn(channelId);
+    const seen: { readonly [id: string]: SeenAccount } = deps.who.seenIn(channelId);
     const ids = identityOrder(seen);
     if (ids.length === 0) {
       const empty = document.createElement("p");
@@ -132,7 +126,7 @@ export function mountIdentityList(deps: IdentityListDependencies): IdentityList 
         tag.textContent = "bot";
         label.append(tag);
       }
-      if (deps.isSelf(id)) {
+      if (deps.who.isSelfId(id)) {
         const tag = document.createElement("span");
         tag.className = "identity-tag";
         // Says WHY this one is you, so "me" on a bot account does not read as a mistake.
@@ -145,19 +139,19 @@ export function mountIdentityList(deps: IdentityListDependencies): IdentityList 
       select.setAttribute("aria-label", identityPickerLabel(who.name, id));
       // The snowflake, so a handler and the suite can both say WHICH row this is without an id.
       select.setAttribute("data-author-id", id);
-      for (const bucket of deps.buckets()) {
+      for (const bucket of deps.who.buckets()) {
         const option = document.createElement("option");
         option.value = bucket;
         option.textContent = BUCKET_LABELS[bucket] as string;
         select.append(option);
       }
-      select.value = deps.bucketOf(id, who.bot, channelId);
+      select.value = deps.who.bucketFor(id, who.bot, channelId);
       // Whether the value on screen is a CHOICE or a GUESS, which is the difference between "this is
       // wrong" and "nobody has said". Without it a wrong guess is indistinguishable from a decision.
       // Always set, both ways, rather than present-or-absent: "false" and "missing" are the same
       // thing to a stylesheet but not to anything reading the attribute back, and a reader asking
       // "was this a guess?" should get an answer rather than an absence.
-      select.setAttribute("data-guessed", deps.chosen(id) ? "false" : "true");
+      select.setAttribute("data-guessed", deps.who.chosen(id) ? "false" : "true");
       select.addEventListener("change", () => {
         deps.choose(id, select.value);
         select.setAttribute("data-guessed", "false");

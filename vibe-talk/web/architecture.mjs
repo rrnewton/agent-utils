@@ -62,7 +62,7 @@ export const PACKAGES = Object.freeze({
   "view/composer": [...BASE, "view/dom"],
   "view/voice": [...BASE, "view/dom", "view/channel", "view/composer", "core/api", "core/call", "core/settings", "core/speech", "present/call", "present/notices", "present/rows", "present/time"],
   "view/dom": BASE,
-  "view/settings": [...BASE, "view/dom", "core/navigation", "core/outbox", "core/settings", "present/notices", "present/settings"],
+  "view/settings": [...BASE, "view/dom", "core/channels", "core/navigation", "core/outbox", "core/settings", "present/notices", "present/settings"],
   legacy: "*",
 });
 
