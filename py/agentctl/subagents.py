@@ -1721,11 +1721,10 @@ class _WorkspaceClient:
                     workspace_id=info.workspace_id,
                     cwd=info.cwd,
                     agent=info.agent,
+                    # A paused Muse goal is a planning state, not a hold (#734
+                    # chat-status-disagreement): an empty editor reads idle.
                     status=(
-                        "paused"
-                        if (reported_status in ("idle", "done")
-                            and muse_verified_process_goal_paused(screen))
-                        else "idle"
+                        "idle"
                         if (
                             muse_idle_composer(screen)
                             or (

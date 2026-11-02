@@ -1602,7 +1602,7 @@ def test_busy_delivery_stays_pending_and_can_drain(tmp_path: Path, monkeypatch: 
     assert fake.submitted == ["next turn"]
 
 
-def test_verified_muse_yolo_composer_reports_idle_staged_and_paused(
+def test_verified_muse_yolo_composer_reports_idle_and_staged(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager, fake = setup(tmp_path, monkeypatch)
@@ -1620,12 +1620,13 @@ def test_verified_muse_yolo_composer_reports_idle_staged_and_paused(
     screen = screen.replace(
         "❯ queued owner prompt\n", "❯\n",
     ).replace(footer, f"Goal (paused)\n{footer}")
-    assert manager.status("worker")["agent_status"] == "paused"
+    assert manager.status("worker")["agent_status"] == "idle"
 
 
 def _owned_muse_editor(
     fake: FakeManagedClient, monkeypatch: pytest.MonkeyPatch, *, mode: str,
     header: bool = True, collapse_over: int | None = None,
+    goal_notice: str | None = None,
 ) -> list[str]:
     """Draw an owned Muse pane's editor as Muse 1.4 does, and record each literal paste.
 
@@ -1647,6 +1648,8 @@ def _owned_muse_editor(
         else:
             editor, notice = ("❯ " + draft if draft else "❯"), ""
         footer = f"kiki · xhigh · /work{f' · {mode}' if mode else ''}{notice}"
+        if goal_notice is not None and not notice:
+            footer += f"   {goal_notice}"
         return (("Muse Code 1.4.12\n" if header else "") + "\n".join(history)
                 + f"\n{divider}\n{editor}\n{divider}\n{footer}\n")
 
@@ -1698,6 +1701,25 @@ def test_owned_muse_delivers_at_every_footer_mode_and_through_a_collapsed_paste(
     result = manager.send("worker", prompt)
     assert len(result.delivered) == 1, result
     assert pastes == [f"\x1b[200~{prompt}\x1b[201~"]
+    assert fake.keys_sent == [("w1:p1", "Enter")]
+
+
+def test_a_paused_goal_with_an_empty_editor_takes_an_owner_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #734 chat-status-disagreement: `Goal (paused · 1d 17h 40m)` on the footer with an
+    # empty editor is idle for delivery; a paused goal is not `agentctl pause NAME`.
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="muse")
+    fake.infos["w1:p1"] = replace(fake.infos["w1:p1"], status="done")
+    pastes = _owned_muse_editor(
+        fake, monkeypatch, mode="YOLO",
+        goal_notice="Goal (paused · 1d 17h 40m) 97% █████████▊",
+    )
+    assert manager.status("worker")["agent_status"] == "idle"
+    result = manager.send("worker", "an owner request")
+    assert len(result.delivered) == 1, result
+    assert pastes == ["\x1b[200~an owner request\x1b[201~"]
     assert fake.keys_sent == [("w1:p1", "Enter")]
 
 

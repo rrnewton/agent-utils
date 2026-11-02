@@ -297,9 +297,17 @@ fn goal_paused_text(text: &str) -> bool {
 /// Recognize Muse's explicit paused-goal state in a verified UI frame.
 ///
 /// Only the footer region below the last rule counts, so a transcript line that merely quotes
-/// `Goal (paused)` never pauses delivery. Muse draws it on a line of its own; the same notice
-/// right-aligned on the footer line counts too, so tolerating goal notices on the footer never
-/// turns a paused goal into an idle editor.
+/// `Goal (paused)` never counts. Muse draws it on a line of its own; the same notice
+/// right-aligned on the footer line counts too. Detection only: since #734
+/// chat-status-disagreement a paused goal does not hold delivery (see
+/// [`muse_verified_pane_status`]), so nothing outside the tests calls this.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "only tests call it since a paused goal reads idle"
+    )
+)]
 pub(crate) fn muse_verified_process_goal_paused(screen: &str) -> bool {
     if muse_composer_regions(screen, false).is_none() {
         return false;
@@ -323,19 +331,21 @@ pub(crate) fn muse_screen_has_composer(screen: &str) -> bool {
     muse_composer_regions(screen, false).is_some()
 }
 
-/// The status a pinned Muse pane reports: paused, idle, staged or working, in that order.
+/// The status a pinned Muse pane reports: idle, staged or working, in that order.
 ///
 /// A frame whose transcript ends in Muse's progress line is working, never idle or staged.
-/// `reported_status` is Herdr's own report for the pane. A paused goal outranks an empty editor, and only `idle` admits input, so `paused` and
-/// `staged` leave queued input queued until the owner resumes the goal or clears the editor. A
-/// headerless (verified-process) frame counts only while Herdr itself reports the pane idle or
-/// done; a frame with the versioned header is idle on its own evidence.
+/// `reported_status` is Herdr's own report for the pane. A paused Muse **goal**
+/// (`Goal (paused …)` on the footer) is a Muse planning state, not a hold: Muse accepts
+/// and acts on typed input while its goal is paused, and the bridge delivered to such a
+/// pane all day in the incident, so a paused goal with an empty editor is `idle` and takes
+/// input like any idle pane (#734 chat-status-disagreement). Only an explicit
+/// `agentctl pause` (a record state, not this screen status), a staged draft, or a running
+/// turn holds input. A headerless (verified-process) frame counts only while Herdr itself
+/// reports the pane idle or done; a frame with the versioned header is idle on its own
+/// evidence.
 pub(crate) fn muse_verified_pane_status(reported_status: &str, screen: &str) -> &'static str {
     let reported_idle = matches!(reported_status, "idle" | "done");
-    if reported_idle && muse_verified_process_goal_paused(screen) {
-        "paused"
-    } else if muse_idle_composer(screen)
-        || (reported_idle && muse_verified_process_idle_composer(screen))
+    if muse_idle_composer(screen) || (reported_idle && muse_verified_process_idle_composer(screen))
     {
         "idle"
     } else if reported_idle
@@ -986,12 +996,12 @@ mod tests {
     }
 
     #[test]
-    fn a_paused_goal_on_the_footer_line_still_pauses() {
+    fn a_paused_goal_on_the_footer_line_reads_idle() {
         let divider = "─".repeat(40);
         let footer = "kiki · xhigh · /work/project · YOLO";
         let paused = format!("old\n{divider}\n❯\n{divider}\n{footer}   Goal (paused)\n");
         assert!(muse_verified_process_goal_paused(&paused));
-        assert_eq!(muse_verified_pane_status("idle", &paused), "paused");
+        assert_eq!(muse_verified_pane_status("idle", &paused), "idle");
         // An active goal's notice is not a pause.
         let active = paused.replace("Goal (paused)", "Goal (45m) 47% ████▊░░░░░");
         assert!(!muse_verified_process_goal_paused(&active));
@@ -999,9 +1009,9 @@ mod tests {
     }
 
     // #734 chat-status-disagreement: a pause long enough for Muse to draw its elapsed
-    // duration still pauses; the incident footer was `Goal (paused · 1d 17h 40m)`.
+    // duration is detected, and still reads idle; the incident footer was `Goal (paused · 1d 17h 40m)`.
     #[test]
-    fn a_paused_goal_with_an_elapsed_duration_still_pauses() {
+    fn a_paused_goal_with_an_elapsed_duration_reads_idle() {
         let divider = "─".repeat(40);
         let footer = "kiki · xhigh · /work/project · YOLO";
         for notice in [
@@ -1013,7 +1023,7 @@ mod tests {
             assert!(muse_verified_process_goal_paused(&paused), "{notice}");
             assert_eq!(
                 muse_verified_pane_status("done", &paused),
-                "paused",
+                "idle",
                 "{notice}"
             );
         }
@@ -1151,7 +1161,7 @@ mod tests {
     }
 
     #[test]
-    fn muse_status_order_is_paused_idle_staged_working() {
+    fn muse_status_order_is_idle_staged_working() {
         let divider = "─".repeat(40);
         let footer = "kiki · xhigh · /work · YOLO\n";
         let idle = format!("old transcript\n{divider}\n❯\n{divider}\n{footer}");
@@ -1163,15 +1173,13 @@ mod tests {
         for reported in ["idle", "done"] {
             assert_eq!(muse_verified_pane_status(reported, &idle), "idle");
             assert_eq!(muse_verified_pane_status(reported, &staged), "staged");
-            assert_eq!(muse_verified_pane_status(reported, &paused), "paused");
+            // A paused goal is no hold: an empty editor reads idle, a staged one staged.
+            assert_eq!(muse_verified_pane_status(reported, &paused), "idle");
             assert_eq!(
                 muse_verified_pane_status(reported, &paused_staged),
-                "paused"
+                "staged"
             );
-            assert_eq!(
-                muse_verified_pane_status(reported, &headed_paused),
-                "paused"
-            );
+            assert_eq!(muse_verified_pane_status(reported, &headed_paused), "idle");
         }
         for reported in ["working", "unknown", "blocked"] {
             // Headerless evidence counts only while Herdr agrees the pane is idle.

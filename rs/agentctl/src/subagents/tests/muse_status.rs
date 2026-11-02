@@ -39,9 +39,10 @@ fn no_input(fixture: &Fixture) {
 }
 
 // Ported from py/tests/test_herdr_subagents.py
-// test_verified_muse_yolo_composer_reports_idle_staged_and_paused.
+// test_verified_muse_yolo_composer_reports_idle_staged_and_paused. Since #734 a paused
+// Muse goal reads idle, not paused: it is a planning state, not a hold.
 #[test]
-fn verified_muse_yolo_composer_reports_idle_staged_and_paused() {
+fn verified_muse_yolo_composer_reports_idle_and_staged() {
     let fixture = Fixture::new();
     let manager = start_muse(&fixture);
     let footer = "kiki · xhigh · /work · YOLO\n";
@@ -57,7 +58,7 @@ fn verified_muse_yolo_composer_reports_idle_staged_and_paused() {
         .replace("❯ queued owner prompt\n", "❯\n")
         .replace(footer, &format!("Goal (paused)\n{footer}"));
     show(&fixture, "done", &screen);
-    assert_eq!(manager.status("worker").unwrap()["agent_status"], "paused");
+    assert_eq!(manager.status("worker").unwrap()["agent_status"], "idle");
 }
 
 // Ported from py/tests/test_herdr_subagents.py
@@ -215,33 +216,25 @@ fn foreign_muse_standard_mode_takes_input() {
     assert_eq!(manager.load("foreign").unwrap().adapter, "herdr-foreign");
 }
 
-// New: a paused goal outranks the idle Auto-review editor, and staged owner input is never
-// typed over; both keep the prompt queued until the editor is idle again.
+// #734 chat-status-disagreement: a staged editor holds input until it clears, but a
+// paused Muse goal does not: Muse accepts and acts on typed input while its goal is
+// paused, so an owner prompt typed then is delivered, not queued.
 #[test]
-fn paused_goal_and_staged_editor_hold_input_until_idle() {
+fn staged_editor_holds_input_until_idle_and_a_paused_goal_does_not() {
     let fixture = Fixture::new();
     let manager = start_muse(&fixture);
     let footer = "kiki · xhigh · /work · Auto-review\n";
     let idle = format!("Muse Code 1.4.0\n{DIVIDER}\n❯\n{DIVIDER}\n{footer}");
-    let paused = idle.replace(footer, &format!("Goal (paused)\n{footer}"));
     let staged = idle.replace("❯\n", "❯ owner draft\n");
-    assert!(crate::client::muse_auto_review_idle_composer(&paused));
-
-    for (state, screen, text) in [
-        ("paused", &paused, "held while paused"),
-        ("staged", &staged, "held while staged"),
-    ] {
-        show(&fixture, "done", screen);
-        assert_eq!(manager.status("worker").unwrap()["agent_status"], state);
-        let error = manager.send("worker", text, held()).unwrap_err();
-        assert!(matches!(error, AgentError::Pending(_)), "{state}: {error}");
-        assert_eq!(error.exit_code(), 75);
-        assert!(
-            error.to_string().contains(&format!("last status={state}")),
-            "{error}"
-        );
-        no_input(&fixture);
-    }
+    show(&fixture, "done", &staged);
+    assert_eq!(manager.status("worker").unwrap()["agent_status"], "staged");
+    let error = manager
+        .send("worker", "held while staged", held())
+        .unwrap_err();
+    assert!(matches!(error, AgentError::Pending(_)), "{error}");
+    assert_eq!(error.exit_code(), 75);
+    assert!(error.to_string().contains("last status=staged"), "{error}");
+    no_input(&fixture);
     assert!(manager
         .drain("worker", held())
         .unwrap()
@@ -249,11 +242,11 @@ fn paused_goal_and_staged_editor_hold_input_until_idle() {
         .is_empty());
     no_input(&fixture);
 
-    // The owner resumes the goal and clears the editor: both prompts are delivered once, in order.
+    // The editor clears: the prompt is delivered once.
     *fixture.client.muse_editor.lock().unwrap() = Some(MuseEditor::default());
     assert_eq!(manager.status("worker").unwrap()["agent_status"], "idle");
     let delivered = manager.drain("worker", held()).unwrap().delivered;
-    assert_eq!(delivered.len(), 2, "{delivered:?}");
+    assert_eq!(delivered.len(), 1, "{delivered:?}");
     let pastes = fixture
         .client
         .literal_pastes
@@ -264,10 +257,39 @@ fn paused_goal_and_staged_editor_hold_input_until_idle() {
         .collect::<Vec<_>>();
     assert_eq!(
         pastes,
-        [
-            format!("{BRACKETED_PASTE_START}held while paused{BRACKETED_PASTE_END}"),
-            format!("{BRACKETED_PASTE_START}held while staged{BRACKETED_PASTE_END}"),
-        ]
+        [format!(
+            "{BRACKETED_PASTE_START}held while staged{BRACKETED_PASTE_END}"
+        )]
+    );
+}
+
+// #734 chat-status-disagreement (coordinator-directed): a Muse pane whose footer shows
+// `Goal (paused · 1d 17h 40m)` with an empty editor takes an owner request at once. A
+// paused goal is a Muse planning state, not `agentctl pause NAME`.
+#[test]
+fn a_paused_goal_with_an_empty_editor_takes_an_owner_request() {
+    let fixture = Fixture::new();
+    let manager = start_muse(&fixture);
+    *fixture.client.status.lock().unwrap() = Some("done".to_owned());
+    let mut editor = MuseEditor::new("YOLO", true, None);
+    editor.goal_notice = Some("Goal (paused · 1d 17h 40m) 97% █████████▊".to_owned());
+    *fixture.client.muse_editor.lock().unwrap() = Some(editor);
+    let status = manager.status("worker").unwrap();
+    assert_eq!(status["agent_status"], "idle", "{status}");
+    let result = manager.send("worker", "an owner request", held()).unwrap();
+    assert_eq!(result.delivered.len(), 1, "{result:?}");
+    assert_eq!(
+        fixture
+            .client
+            .literal_pastes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, text)| text.clone())
+            .collect::<Vec<_>>(),
+        [format!(
+            "{BRACKETED_PASTE_START}an owner request{BRACKETED_PASTE_END}"
+        )]
     );
 }
 
@@ -311,25 +333,26 @@ fn a_scrolled_viewport_reads_status_and_delivery_from_the_pane_bottom() {
 }
 
 #[test]
-fn a_scrolled_viewport_still_holds_input_behind_a_paused_goal_with_a_duration() {
+fn a_scrolled_viewport_delivers_behind_a_paused_goal_with_a_duration() {
     let fixture = Fixture::new();
     let manager = start_muse(&fixture);
-    let footer = "kiki · xhigh · /work · YOLO";
-    let bottom = format!(
-        "old transcript\n{DIVIDER}\n❯\n{DIVIDER}\n{footer}   Goal (paused · 1d 17h 40m) 97% █████████▊\n"
-    );
     *fixture.client.status.lock().unwrap() = Some("done".to_owned());
+    let mut editor = MuseEditor::new("YOLO", true, None);
+    editor.goal_notice = Some("Goal (paused · 1d 17h 40m) 97% █████████▊".to_owned());
+    *fixture.client.muse_editor.lock().unwrap() = Some(editor);
     *fixture.client.screen.lock().unwrap() =
         Some("◆ Context compacted\n\n❯ [from an owner via a bridge]\n  an old prompt\n".to_owned());
-    *fixture.client.bottom_screen.lock().unwrap() = Some(bottom);
+    fixture
+        .client
+        .scrolled
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     let status = manager.status("worker").unwrap();
-    assert_eq!(status["agent_status"], "paused", "{status}");
+    assert_eq!(status["agent_status"], "idle", "{status}");
     assert_eq!(status["herdr_agent_status"], "done", "{status}");
-    let error = manager
-        .send("worker", "held while paused", held())
-        .unwrap_err();
-    assert!(matches!(error, AgentError::Pending(_)), "{error}");
-    no_input(&fixture);
+    let result = manager
+        .send("worker", "typed while paused", held())
+        .unwrap();
+    assert_eq!(result.delivered.len(), 1, "{result:?}");
 }
 
 // New: the process pin is checked again right after the screen read and before the screen is

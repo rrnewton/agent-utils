@@ -45,6 +45,8 @@ pub(super) struct MuseEditor {
     /// a few screen reads later the turn is gone, `! steer failed` shows, and the prompt is back
     /// in the editor (#720 agentctl-muse-stale-draft).
     pub(super) failing_steers: usize,
+    /// A goal notice drawn right-aligned on the footer, as `Goal (paused · 1d 17h 40m)`.
+    pub(super) goal_notice: Option<String>,
     /// Screen reads between a failing steer and its return to the editor.
     pub(super) steer_fails_after_reads: u32,
     /// A failing steer on its way back to the editor: its prompt and the reads left.
@@ -69,6 +71,7 @@ impl Default for MuseEditor {
             question: None,
             question_shows: None,
             failing_steers: 0,
+            goal_notice: None,
             steer_fails_after_reads: 3,
             failing: None,
             missed_enters: 0,
@@ -131,6 +134,11 @@ impl MuseEditor {
         };
         let notice = if collapsed.is_some() {
             "             Paste again to expand for editing"
+        } else if let Some(goal) = self.goal_notice.as_deref() {
+            return format!(
+                "{header}{}{progress}\n────────────\n{editor}\n────────────\nwatermelon-preview · xhigh · /work/project{mode}   {goal}\n",
+                self.history.join("\n")
+            );
         } else {
             ""
         };

@@ -1728,7 +1728,7 @@ def _muse_adoption(harness: Harness, report: Report) -> None:
 
 
 def _muse14_status(harness: Harness, report: Report) -> None:
-    """Muse 1.4 frames read as paused, idle, staged or working alike; only idle takes input."""
+    """Muse 1.4 frames read as idle, staged or working alike; a paused goal reads idle and takes input."""
     case = harness.case("primary-muse14-status", {
         "harness": "muse", "custom_reported": True, "report_custom_session": True,
         "foreground_argv_mode": "missing",
@@ -1751,9 +1751,9 @@ def _muse14_status(harness: Harness, report: Report) -> None:
     headed = "Muse Code 1.4.0\n" + paused.replace("YOLO", "Auto-review")
     headed_staged = "Muse Code 1.4.0\n" + staged.replace("YOLO", "Auto-review")
     frames = (("idle", "done", idle, "idle"), ("staged", "done", staged, "staged"),
-              ("paused", "done", paused, "paused"), ("echo", "done", "Goal (paused)\n" + idle, "idle"),
+              ("paused", "done", paused, "idle"), ("echo", "done", "Goal (paused)\n" + idle, "idle"),
               ("busy-headerless", "working", paused, "working"), ("busy-headed", "working", headed, "idle"),
-              ("headed-paused", "done", headed, "paused"), ("headed-staged", "idle", headed_staged, "staged"))
+              ("headed-paused", "done", headed, "idle"), ("headed-staged", "idle", headed_staged, "staged"))
     for label, status, screen, expected in frames:
         _change(case, {"status": status, "screen": screen})
         outcomes = _pair(harness, report, case, f"primary/muse14/{label}/status",
@@ -1761,28 +1761,26 @@ def _muse14_status(harness: Harness, report: Report) -> None:
         report.require(f"primary/muse14/{label}/agent-status", all(
             isinstance(value := _json(outcome), dict) and value.get("agent_status") == expected
             for outcome in outcomes), f"expected {expected}: {outcomes!r}")
-    for index, (label, screen) in enumerate((("paused", headed), ("staged", headed_staged))):
-        _change(case, {"status": "done", "screen": screen})
-        _pair(harness, report, case, f"primary/muse14/{label}/held", (
-            "send", "foreign", f"held while {label}", "--message-id", f"{1 - index}-muse14-{label}",
-            "--ready-timeout", "0", *_COMMON,
-        ), 75)
-        # Test the declared queue chronology, not whether two wall-clock reads
-        # happened to move forward. Names deliberately sort opposite to arrival.
-        for root in (case.python_root, case.rust_root):
-            path = root / "registry/agents/foreign/queue/inbox" / f"{1 - index}-muse14-{label}.json"
-            document = json.loads(path.read_text())
-            document["queued_at"] = 100.0 + index
-            path.write_text(json.dumps(document) + "\n")
+    # Only a staged editor is held here: a paused goal reads idle (above) and takes
+    # input, which the unit fakes that reflect typing prove (#734
+    # chat-status-disagreement); this fixture's static frame cannot show a paste.
+    _change(case, {"status": "done", "screen": headed_staged})
+    _pair(harness, report, case, "primary/muse14/staged/held", (
+        "send", "foreign", "held while staged", "--message-id", "0-muse14-staged",
+        "--ready-timeout", "0", *_COMMON,
+    ), 75)
+    for root in (case.python_root, case.rust_root):
+        path = root / "registry/agents/foreign/queue/inbox" / "0-muse14-staged.json"
+        document = json.loads(path.read_text())
+        document["queued_at"] = 101.0
+        path.write_text(json.dumps(document) + "\n")
     report.require("primary/muse14/held-without-input", all(
-        not any(call[:2] in (["agent", "prompt"], ["pane", "send-text"], ["pane", "send-keys"])
-                for call in _fixture_calls(root))
-        and len(list((root / "registry/agents/foreign/queue/inbox").glob("*.json"))) == 2
-        for root in (case.python_root, case.rust_root)), "a paused or staged Muse editor took input")
+        len(list((root / "registry/agents/foreign/queue/inbox").glob("*.json"))) == 1
+        for root in (case.python_root, case.rust_root)), "a staged Muse editor took input")
     _change(case, {"status": "idle", "screen": ""})
     _pair(harness, report, case, "primary/muse14/resumed-drain", ("drain", "foreign", *_COMMON))
     report.require("primary/muse14/delivered-once-in-order", all(
-        _submitted(root) == ["held while paused", "held while staged"]
+        _submitted(root) == ["held while staged"]
         for root in (case.python_root, case.rust_root)), "held Muse input was lost, repeated or reordered")
     _retire_fixture_processes(case)
 

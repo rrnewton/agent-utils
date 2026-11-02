@@ -98,6 +98,19 @@ paused-with-duration hold), the paused-duration footer, the owner alarm
 under a Herdr-idle disagreement, and a terminated runtime cancelling its
 waits.
 
+Correction (coordinator, 2026-11-02): a paused Muse **goal** must not
+hold deliveries. Muse accepts and acts on typed input while its goal is
+paused (the incident coordinator acted on a typed message at once with
+`Goal (paused · 1d 17h 40m)` on its footer, and the bridge delivered to it
+all day until the scroll bug). A paused goal is a Muse planning state,
+not `agentctl pause NAME`. So `muse_verified_pane_status` no longer
+returns `paused` at all: goal-paused + empty editor is `idle` for owner
+chat requests and agent messages alike. Only an explicit agentctl pause,
+a staged draft agentctl did not type, or a real working turn holds
+input. Tests: `a_paused_goal_with_an_empty_editor_takes_an_owner_request`
+(Rust and Python), the scrolled-viewport delivery behind a paused goal
+with a duration, and the differential's paused frame reading `idle`.
+
 Not done here (reported to the coordinator, read-only in the incident
 registry): the ~36 queued messages and the orphaned old-build processes
 in the incident registry are untouched; no process was killed and nothing
