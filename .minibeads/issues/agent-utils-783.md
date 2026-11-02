@@ -1,7 +1,7 @@
 ---
 title: 'chat-reply-capture-miss: a well-formed reply block from an agent with no session binding was never captured'
 status: open
-priority: 1
+priority: 0
 assignee: cl-start@devbig030
 issue_type: bug
 labels:
@@ -19,3 +19,5 @@ updated_at: 2026-11-02T18:07:43.775996897+00:00
 [opus 5.5] Same host and bridge build, 18:00:36Z: the bridge HUNG while submitting a request into a busy Claude pane. Its main loop stopped (no log after 17:54Z, no replies sent) while the process stayed alive, and chat health said only DEGRADED. A restart at 18:12Z fixed it. Asks: (3) every blocking step of the main loop has a bound (time out and continue), a stalled loop is detected by a watchdog heartbeat and reported as a distinct health state (not DEGRADED), and the service restarts itself on a stalled loop. Evidence to follow from the other host.
 
 [opus 5.5] Also (owner saw it): the same request got TWO posts 2 s apart after the bridge restart. Reply 1 came from `chat reply N --file` (text taken from the transcript; Markdown table correct); reply 2 was "captured from the coordinator's pane" and its table was mangled by screen rendering. Asks: (4) dedupe: a reply ID already answered with `chat reply` (or any reply with the same text) is never also posted from a capture; (5) pane capture is the last resort: never use it when the transcript is known (the same pass took the next request from the transcript), and prefer refusing with an alarm over posting mangled tables.
+
+[opus 5.5] Lead 2026-11-02: P0, right after #778 (ahead of #781). Slices, each landed alone so bridges can roll forward one at a time: (a) main-loop hang / head-of-line blocking with a stall watchdog; (b) capture-miss alarm plus session discovery; (c) dedupe; (d) last-resort pane fallback.
