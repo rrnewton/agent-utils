@@ -21,6 +21,8 @@ from tests.test_agentctl_sessions import setup
 
 AU_ROOT = Path(__file__).resolve().parents[2]
 
+from tests.rust_binary import rust_agentctl
+
 
 def _fixture(tmp_path: Path, monkeypatch: object) -> tuple[Path, Path]:
     sessions, _fake, _calls = setup(tmp_path, monkeypatch)  # type: ignore[arg-type]
@@ -71,7 +73,7 @@ def test_rust_reset_matches_python(tmp_path: Path, monkeypatch: object) -> None:
     rust_registry, rust_runtime = _copy_fixture(registry, runtime, tmp_path / "rs-copy")
 
     python_result = _run(AU_ROOT / "py" / "bin" / "agentctl", python_registry)
-    rust_result = _run(AU_ROOT / "rs" / "bin" / "agentctl", rust_registry)
+    rust_result = _run(rust_agentctl(), rust_registry)
     assert python_result.returncode == 0, python_result.stderr
     assert rust_result.returncode == 0, rust_result.stderr
     python_document = json.loads(python_result.stdout)

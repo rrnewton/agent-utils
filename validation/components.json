@@ -33,6 +33,7 @@
         "py/bin/herdr-agent",
         "py/bin/herdr-chat",
         "py/bin/herdr-subagents",
+        "py/tests/rust_binary.py",
         "rs/agent-harness/",
         "rs/agent-queue/",
         "rs/agentctl/",
@@ -93,7 +94,8 @@
         "py/tests/test_herdr_chat.py",
         "py/tests/test_herdr_chat_transport.py",
         "py/tests/test_herdr_codex_goal.py",
-        "py/tests/test_herdr_subagents.py"
+        "py/tests/test_herdr_subagents.py",
+        "py/tests/test_rust_binary.py"
       ]
     },
     "change-classifier": {

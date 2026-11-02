@@ -19,7 +19,7 @@ from tests.test_herdr_chat import setup
 
 
 AU_ROOT = Path(__file__).resolve().parents[2]
-RUST_LAUNCHER = AU_ROOT / "rs" / "bin" / "agentctl"
+from tests.rust_binary import rust_agentctl
 
 
 def _records(state: Path) -> dict[str, dict[str, object]]:
@@ -30,7 +30,7 @@ def _records(state: Path) -> dict[str, dict[str, object]]:
 
 def _rust_history(state: Path, request: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [str(RUST_LAUNCHER), "chat", "history", "--bridge-state", str(state),
+        [str(rust_agentctl()), "chat", "history", "--bridge-state", str(state),
          "--request", request],
         cwd=AU_ROOT,
         capture_output=True,

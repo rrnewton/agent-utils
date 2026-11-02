@@ -17,7 +17,7 @@ from tests.test_agentctl_chat_context_cli import _KEY, _saved
 
 AU_ROOT = Path(__file__).resolve().parents[2]
 PYTHON_LAUNCHER = AU_ROOT / "py" / "bin" / "agentctl"
-RUST_LAUNCHER = AU_ROOT / "rs" / "bin" / "agentctl"
+from tests.rust_binary import rust_agentctl
 
 
 def _run(launcher: Path, state_flag: str, state: Path, cursor: str | None) -> dict[str, object]:
@@ -40,8 +40,8 @@ def test_rust_context_matches_python_over_command_adapter(tmp_path: Path) -> Non
     python_calls = [json.loads(line) for line in transcript.read_text().splitlines()]
     transcript.write_text("")
 
-    first_rust = _run(RUST_LAUNCHER, "--bridge-state", state, None)
-    second_rust = _run(RUST_LAUNCHER, "--bridge-state", state, str(first_rust["cursor"]))
+    first_rust = _run(rust_agentctl(), "--bridge-state", state, None)
+    second_rust = _run(rust_agentctl(), "--bridge-state", state, str(first_rust["cursor"]))
     rust_calls = [json.loads(line) for line in transcript.read_text().splitlines()]
 
     assert first_rust == first
@@ -56,7 +56,7 @@ def test_rust_context_refuses_without_adapter(tmp_path: Path) -> None:
     bridge["config"]["transport_command"] = []
     (state / "bridge.json").write_text(json.dumps(bridge))
     result = subprocess.run(
-        [str(RUST_LAUNCHER), "chat", "context", "--bridge-state", str(state),
+        [str(rust_agentctl()), "chat", "context", "--bridge-state", str(state),
          "--request", _KEY[:12]],
         cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900,
     )

@@ -14,6 +14,8 @@ from pathlib import Path
 
 AU_ROOT = Path(__file__).resolve().parents[2]
 
+from tests.rust_binary import rust_agentctl
+
 REQUESTS = [
     {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05"}},
     {"jsonrpc": "2.0", "method": "notifications/initialized"},
@@ -41,5 +43,5 @@ def _serve(launcher: Path, registry: Path) -> list[dict[str, object]]:
 
 def test_rust_mcp_matches_python(tmp_path: Path) -> None:
     python_replies = _serve(AU_ROOT / "py" / "bin" / "agentctl", tmp_path / "py-registry")
-    rust_replies = _serve(AU_ROOT / "rs" / "bin" / "agentctl", tmp_path / "rs-registry")
+    rust_replies = _serve(rust_agentctl(), tmp_path / "rs-registry")
     assert rust_replies == python_replies

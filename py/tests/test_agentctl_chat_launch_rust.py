@@ -25,27 +25,8 @@ import pytest
 
 
 AU_ROOT = Path(__file__).resolve().parents[2]
-TARGET = "x86_64-unknown-linux-gnu"
 
-
-def _binaries() -> tuple[Path, Path]:
-    env = dict(os.environ)
-    env.update(
-        {
-            "CARGO_PROFILE_DEV_DEBUG": "line-tables-only",
-            "CARGO_PROFILE_TEST_DEBUG": "line-tables-only",
-            "CARGO_INCREMENTAL": "0",
-        }
-    )
-    subprocess.run(
-        [
-            "cargo", "build", "--release", "--manifest-path", "rs/Cargo.toml",
-            "--target", TARGET, "-p", "agentctl", "-p", "chat-subscription-fake",
-        ],
-        cwd=AU_ROOT, capture_output=True, text=True, check=True, timeout=1200, env=env,
-    )
-    release = AU_ROOT / "rs" / "target" / TARGET / "release"
-    return release / "agentctl", release / "chat-subscription-fake-plugin"
+from tests.rust_binary import rust_agentctl_with_fake as _binaries
 
 
 FAKE_HERDR = r"""

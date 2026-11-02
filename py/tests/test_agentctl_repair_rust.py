@@ -21,6 +21,8 @@ from tests.test_agentctl_sessions import setup
 
 AU_ROOT = Path(__file__).resolve().parents[2]
 
+from tests.rust_binary import rust_agentctl
+
 FAKE_TMUX = r"""#!/bin/sh
 # Fake tmux: windows are lines in $FAKE_TMUX_STATE, calls logged to $FAKE_TMUX_LOG.
 state="$FAKE_TMUX_STATE"
@@ -123,7 +125,7 @@ def test_rust_repair_matches_python(tmp_path: Path, monkeypatch: object) -> None
         rs_state = tmp_path / "rs-tmux-state"
 
         python_result = _run(AU_ROOT / "py" / "bin" / "agentctl", python_registry, fake_bin, py_state, tmp_path / "py.log")
-        rust_result = _run(AU_ROOT / "rs" / "bin" / "agentctl", rust_registry, fake_bin, rs_state, tmp_path / "rs.log")
+        rust_result = _run(rust_agentctl(), rust_registry, fake_bin, rs_state, tmp_path / "rs.log")
         assert python_result.returncode == 0, python_result.stderr
         assert rust_result.returncode == 0, rust_result.stderr
         python_document = json.loads(python_result.stdout)
@@ -166,7 +168,7 @@ def test_rust_repair_refuses_reused_pid_like_python(tmp_path: Path, monkeypatch:
             copy_rows[0]["runner_started_at"] = 1
             (copy_runtime / "registry.json").write_text(json.dumps(copy_rows))
         python_result = _run(AU_ROOT / "py" / "bin" / "agentctl", python_registry, fake_bin, tmp_path / "py2-state", tmp_path / "py2.log")
-        rust_result = _run(AU_ROOT / "rs" / "bin" / "agentctl", rust_registry, fake_bin, tmp_path / "rs2-state", tmp_path / "rs2.log")
+        rust_result = _run(rust_agentctl(), rust_registry, fake_bin, tmp_path / "rs2-state", tmp_path / "rs2.log")
         assert python_result.returncode != 0
         assert rust_result.returncode == python_result.returncode, rust_result.stderr
         assert "is not alive or was reused" in rust_result.stderr
