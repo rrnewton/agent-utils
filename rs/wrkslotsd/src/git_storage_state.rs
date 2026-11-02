@@ -235,6 +235,18 @@ fn stored_repository_path(cfg: &Cfg, raw: &str) -> Result<PathBuf> {
 /// Diagnose Git drift between the active rows and worktree
 /// registrations, printing the sorted findings.
 pub(crate) fn parse_storage_git(root: Option<&Path>) -> Result<Value> {
+    parse_storage_git_inner(root, false)
+}
+
+/// Like [`parse_storage_git`], but an unavailable source repository
+/// becomes a `repository-evidence-unavailable` finding per checkout
+/// and the census continues, as the Python status and doctor tolerate
+/// it.  Other resolution failures still refuse.
+pub(crate) fn parse_storage_git_tolerant(root: Option<&Path>) -> Result<Value> {
+    parse_storage_git_inner(root, true)
+}
+
+fn parse_storage_git_inner(root: Option<&Path>, tolerate_unavailable: bool) -> Result<Value> {
     let (cfg, _selected) = load_cfg(root, None)?;
     let machines = discover_machines(&cfg.control)?;
     let mut findings: Vec<Value> = Vec::new();
@@ -321,7 +333,28 @@ pub(crate) fn parse_storage_git(root: Option<&Path>) -> Result<Value> {
                 .get("repository")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            let repository = stored_repository_path(&cfg, raw_repository)?;
+            let repository = match stored_repository_path(&cfg, raw_repository) {
+                Ok(repository) => repository,
+                Err(error)
+                    if tolerate_unavailable
+                        && error.contains("does not exist or cannot be resolved") =>
+                {
+                    findings.push(json!({
+                        "kind": "repository-evidence-unavailable",
+                        "scope": "row",
+                        "slot": slot,
+                        "slot_type": slot_type,
+                        "machine": machine,
+                        "checkout": name,
+                        "detail": format!(
+                            "cannot inspect repository for checkout {name}: {error}"
+                        ),
+                        "remedy": "restore the recorded source repository, or record where it moved with 'wrkslots relocate-repository', then rerun 'wrkslots status'; no mutation may rely on unavailable Git evidence",
+                    }));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             if !listed_by_repository.contains_key(&repository) {
                 let common = git_common_directory(&repository)?;
                 let listed = git_listed_worktrees(&repository)?;

@@ -700,3 +700,17 @@ source repository becomes a repository-evidence-unavailable finding
 per checkout, as Python status reports it. Soak maps status to
 status-text in both formats. Differential:
 py/wrkslots/tests/test_status_cli_rust.py.
+
+Soak slice (doctor/audit human forms): wrkslotsd doctor-text prints
+the Python doctor envelope (schema/project/worktrees/control/layout/
+machines/event_counts/active/max_active_slots/findings) and human
+form, composing every finding: storage census first, per-record
+operational notes including event-derived owner releases,
+slot-image attachment findings, journals, partial updates, cap
+breach. wrkslotsd audit-text prints the Python audit payload or
+human form with the --gate exit codes (1 attention, 2 unknown).
+Soak maps doctor->doctor-text and audit->audit-text in both formats.
+Differential: py/wrkslots/tests/test_doctor_audit_cli_rust.py.
+Still Python-only in the soak: create human form, unpushed,
+shell-command, recover-batch human forms, and the other
+--format-default commands.

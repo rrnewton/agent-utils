@@ -5071,6 +5071,8 @@ fn cli_surface_contains_no_executor_or_mutation_subcommand() {
             "rebuild",
             "remove",
             "release",
+            "audit-text",
+            "doctor-text",
             "status",
             "status-text",
             "validate-config"

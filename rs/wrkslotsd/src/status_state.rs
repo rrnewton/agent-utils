@@ -380,6 +380,31 @@ pub(crate) fn parse_status(root: Option<&Path>) -> Result<Value> {
     }))
 }
 
+/// The registry storage census findings (filesystem then Git, merged
+/// and sorted the way the Python status merges them), shared by the
+/// Python-shaped `status` and `doctor` envelopes.
+pub(crate) fn storage_inconsistencies(
+    root: Option<&Path>,
+    _records_all: &[Value],
+) -> Result<Vec<Value>> {
+    let mut inconsistencies: Vec<Value> = Vec::new();
+    if let Some(findings) = crate::storage_state::parse_storage(root)?
+        .get("findings")
+        .and_then(Value::as_array)
+    {
+        inconsistencies.extend(findings.iter().cloned());
+    }
+    // The Python status tolerates an unavailable source repository as
+    // a per-checkout finding instead of refusing the whole command;
+    // the tolerant Git census emits those findings and continues.
+    let census = crate::git_storage_state::parse_storage_git_tolerant(root)?;
+    if let Some(findings) = census.get("findings").and_then(Value::as_array) {
+        inconsistencies.extend(findings.iter().cloned());
+    }
+    inconsistencies.sort_by_key(crate::storage_state::storage_sort_key);
+    Ok(inconsistencies)
+}
+
 /// The Python `status` command's output, envelope and human form.
 ///
 /// Records come from [`status_records`]; the envelope, journals list
@@ -474,65 +499,7 @@ pub(crate) fn status_cli(
     }
     // Storage census: filesystem then Git findings, sorted by the
     // storage sort key, exactly as the Python status merges them.
-    let mut inconsistencies: Vec<Value> = Vec::new();
-    if let Some(findings) = crate::storage_state::parse_storage(root)?
-        .get("findings")
-        .and_then(Value::as_array)
-    {
-        inconsistencies.extend(findings.iter().cloned());
-    }
-    match crate::git_storage_state::parse_storage_git(root) {
-        Ok(census) => {
-            if let Some(findings) = census.get("findings").and_then(Value::as_array) {
-                inconsistencies.extend(findings.iter().cloned());
-            }
-        }
-        Err(error) if error.contains("does not exist or cannot be resolved") => {
-            // The Python status tolerates an unavailable source
-            // repository as a per-checkout finding instead of
-            // refusing the whole command.
-            for record in &records_all {
-                let text = |key: &str| {
-                    record
-                        .get(key)
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned()
-                };
-                if let Some(checkouts) = record.get("checkouts").and_then(Value::as_array) {
-                    for checkout in checkouts {
-                        let repository = checkout
-                            .get("repository")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default();
-                        if !error.contains(&format!("'{repository}'"))
-                            && !error.contains(&format!("\"{repository}\""))
-                        {
-                            continue;
-                        }
-                        let name = checkout
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default();
-                        inconsistencies.push(json!({
-                            "kind": "repository-evidence-unavailable",
-                            "scope": "row",
-                            "slot": text("slot"),
-                            "slot_type": text("slot_type"),
-                            "machine": text("machine"),
-                            "checkout": name,
-                            "detail": format!(
-                                "cannot inspect repository for checkout {name}: {error}"
-                            ),
-                            "remedy": "restore the recorded source repository, or record where it moved with 'wrkslots relocate-repository', then rerun 'wrkslots status'; no mutation may rely on unavailable Git evidence",
-                        }));
-                    }
-                }
-            }
-        }
-        Err(error) => return Err(error),
-    }
-    inconsistencies.sort_by_key(crate::storage_state::storage_sort_key);
+    let inconsistencies = storage_inconsistencies(root, &records_all)?;
     let mut records: Vec<Value> = Vec::new();
     for mut record in records_all {
         if !machines

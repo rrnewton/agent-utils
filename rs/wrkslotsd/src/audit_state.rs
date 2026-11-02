@@ -6406,6 +6406,134 @@ pub(crate) fn parse_audit(
     }))
 }
 
+/// The Python `audit` command's output and exit code: the
+/// [`parse_audit`] payload in JSON, or its human rendering (header,
+/// one verdict line per slot, and the coordinator gate block with
+/// `--gate`).  Exit code is 0 without `--gate`; with it, 1 when any
+/// slot needs attention and 2 when any slot's state is unknown.
+pub(crate) fn audit_cli(
+    root: Option<&Path>,
+    machine_override: Option<&str>,
+    census: CensusRequest,
+    gate: bool,
+    human: bool,
+) -> Result<(String, i32)> {
+    let payload = parse_audit(root, machine_override, census)?;
+    let text = |key: &str| {
+        payload
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let names = |key: &str| -> Vec<String> {
+        payload
+            .get(key)
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let attention = names("attention_slots");
+    let unknown = names("unknown_slots");
+    let code = if !gate {
+        0
+    } else if !attention.is_empty() {
+        1
+    } else if !unknown.is_empty() {
+        2
+    } else {
+        0
+    };
+    if !human {
+        return Ok((
+            format!(
+                "{}\n",
+                serde_json::to_string_pretty(&payload)
+                    .map_err(|error| format!("cannot encode audit: {error}"))?
+            ),
+            code,
+        ));
+    }
+    let number = |key: &str| payload.get(key).and_then(Value::as_i64).unwrap_or(0);
+    let disk = payload.get("disk").cloned().unwrap_or(Value::Null);
+    let free = disk.get("free_bytes").and_then(Value::as_i64).unwrap_or(0);
+    let mut out = format!(
+        "worktrees={} running_agents={} leak={} disk={} free={:.1} GiB\n",
+        number("worktree_count"),
+        number("running_agent_count"),
+        if payload
+            .get("leak")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            "yes"
+        } else {
+            "no"
+        },
+        disk.get("state")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        free as f64 / 1_073_741_824.0,
+    );
+    if let Some(rows) = payload.get("slots").and_then(Value::as_array) {
+        for row in rows {
+            let field = |key: &str| row.get(key).and_then(Value::as_str).unwrap_or_default();
+            let reasons: Vec<String> = row
+                .get("reasons")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut detail = if reasons.is_empty() {
+                "all removal proofs pass".to_string()
+            } else {
+                reasons.join("; ")
+            };
+            if let Some(error) = row.get("cache_error").and_then(Value::as_str) {
+                detail.push_str(&format!("; cache inspection: {error}"));
+            }
+            if let Some(release) = row.get("owner_release").filter(|value| !value.is_null()) {
+                detail.push_str(&format!(
+                    "; {}",
+                    release
+                        .get("summary")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                ));
+            }
+            out.push_str(&format!(
+                "{}: {}: {}\n",
+                field("verdict"),
+                field("slot"),
+                detail
+            ));
+        }
+    }
+    if gate {
+        out.push_str(&format!("state={}\n", text("state")));
+        out.push_str(&format!("summary={}\n", text("summary")));
+        if !attention.is_empty() {
+            out.push_str(
+                "ACTION: run 'wrkslots audit --format json' for exact evidence; use 'wrkslots recover' for interrupted operations, import live unregistered slots, run 'wrkslots remove' only for a slot reported DELETABLE, and retire a slot reported RECOVERABLE with the recover-absent command its reason names\n",
+            );
+        } else if !unknown.is_empty() {
+            out.push_str(
+                "ACTION: restore the unavailable liveness or process evidence and rerun 'wrkslots audit --gate'; do not remove an UNKNOWN slot\n",
+            );
+        }
+    }
+    Ok((out, code))
+}
+
 fn first_seen_names(names: Vec<String>) -> Vec<String> {
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut ordered: Vec<String> = Vec::new();

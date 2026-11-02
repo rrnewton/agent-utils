@@ -558,6 +558,331 @@ fn still_attached_labels(image_file: &Path) -> Vec<String> {
         .collect()
 }
 
+/// `os.path.normpath` for a POSIX path string, as the Python image
+/// reader applies it (a leading `//` is preserved, `///` is not).
+fn py_normpath(text: &str) -> String {
+    if text.is_empty() {
+        return ".".to_string();
+    }
+    let prefix = if text.starts_with("///") && !text.starts_with("////") {
+        "/"
+    } else if text.starts_with("//") {
+        "//"
+    } else if text.starts_with('/') {
+        "/"
+    } else {
+        ""
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    for part in text.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if parts.last().is_some_and(|last| *last != "..") {
+                    parts.pop();
+                } else if prefix.is_empty() {
+                    parts.push("..");
+                }
+            }
+            other => parts.push(other),
+        }
+    }
+    let joined = parts.join("/");
+    if joined.is_empty() {
+        if prefix.is_empty() {
+            ".".to_string()
+        } else {
+            prefix.to_string()
+        }
+    } else {
+        format!("{prefix}{joined}")
+    }
+}
+
+fn image_finding(
+    kind: &str,
+    scope: &str,
+    slot: Option<&str>,
+    slot_type: Option<&str>,
+    machine: &str,
+    detail: String,
+    remedy: &str,
+) -> Value {
+    json!({
+        "kind": kind,
+        "scope": scope,
+        "slot": slot,
+        "slot_type": slot_type,
+        "machine": machine,
+        "checkout": Value::Null,
+        "detail": detail,
+        "remedy": remedy,
+    })
+}
+
+struct DoctorImage {
+    slot: String,
+    slot_type: String,
+    directory: PathBuf,
+    location: PathBuf,
+}
+
+/// Read one `IMAGE.json` the way `slotimage.read_record` does, with the
+/// Python edition's messages (the doctor reports them verbatim).
+fn read_doctor_image(directory: &Path, cfg: &Cfg) -> std::result::Result<DoctorImage, String> {
+    let path = directory.join("IMAGE.json");
+    let shown = path.display().to_string();
+    let raw: Value = (|| -> std::result::Result<Value, String> {
+        let text = std::fs::read_to_string(&path)
+            .map_err(|error| format!("cannot read slot image record {shown}: {error}"))?;
+        serde_json::from_str(&text)
+            .map_err(|error| format!("cannot read slot image record {shown}: {error}"))
+    })()?;
+    if !raw.is_object() {
+        return Err(format!("slot image record {shown} is not an object"));
+    }
+    if raw.get("schema").and_then(Value::as_str) != Some("wrkslots-slot-image/v1") {
+        let schema = raw.get("schema").cloned().unwrap_or(Value::Null);
+        let shown_schema = match &schema {
+            Value::String(text) => py_repr(text),
+            Value::Null => "None".to_string(),
+            other => other.to_string(),
+        };
+        return Err(format!(
+            "slot image record {shown} has unsupported schema {shown_schema}"
+        ));
+    }
+    let field = |key: &str| -> std::result::Result<String, String> {
+        raw.get(key)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| format!("slot image record {shown} has an invalid '{key}'"))
+    };
+    let int_field = |key: &str| -> std::result::Result<i64, String> {
+        raw.get(key)
+            .and_then(Value::as_i64)
+            .ok_or_else(|| format!("slot image record {shown} has an invalid '{key}'"))
+    };
+    // Validate in the Python reader's field order.
+    let location_text = field("location")?;
+    let location = PathBuf::from(&location_text);
+    if !location.is_absolute() {
+        return Err(format!("slot image record {shown} has a relative location"));
+    }
+    let slot_type = field("slot_type")?;
+    let slot = field("slot")?;
+    let dir_slot = directory
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let dir_type = directory
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if dir_slot != slot || dir_type != slot_type {
+        return Err(format!(
+            "slot image record {shown} names another slot ({slot_type}/{slot})"
+        ));
+    }
+    if py_normpath(&location_text) != location_text {
+        return Err(format!(
+            "slot image record {shown} has a non-canonical location {location_text}"
+        ));
+    }
+    let expected = slot_root(cfg, &slot_type).join(&slot);
+    if location != expected {
+        let name = location
+            .file_name()
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let parent = location.parent().map(Path::to_path_buf);
+        let sibling = name.starts_with(&format!(".{slot}."))
+            && name[slot.len() + 2..]
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+            && !name[slot.len() + 2..].is_empty()
+            && parent.as_deref() == expected.parent();
+        let staging_name = format!(".{slot}.convert-");
+        let staging = name.starts_with(&staging_name)
+            && name[staging_name.len()..].len() == 8
+            && name[staging_name.len()..]
+                .chars()
+                .all(|ch| ch.is_ascii_digit() || ('a'..='f').contains(&ch))
+            && parent.as_deref() == directory.parent();
+        if !sibling && !staging {
+            return Err(format!(
+                "slot image record {shown} places slot {slot_type}/{slot} at {location_text}, not at {}; refusing to mount or remove anything there",
+                expected.display()
+            ));
+        }
+    }
+    let _ = int_field("ceiling_bytes")?;
+    let _ = int_field("state_ceiling_bytes")?;
+    let _ = field("backend")?;
+    let _ = field("created_at")?;
+    let _ = field("phase")?;
+    Ok(DoctorImage {
+        slot,
+        slot_type,
+        directory: directory.to_path_buf(),
+        location,
+    })
+}
+
+/// The doctor's slot-image findings, mirroring
+/// `_image_attachment_findings`: an image held by more than one loop
+/// device, or a mount whose image cannot be verified.
+pub(crate) fn image_findings(cfg: &Cfg, machine: &str) -> Vec<Value> {
+    const ATTACHED_REMEDY: &str = "do not mount, unmount, grow or copy this image; a stale copy held by another mount namespace writes its old metadata back when it is released. To retire the slot, remove it with --coordinator-authorized --discard-stale-image-copy after checking nothing uses the stale copy (an interrupted removal of it: recover --coordinator-authorized --discard-stale-image-copy)";
+    const VERIFY_REMEDY: &str = "every command treats this mount as unknown and refuses to unmount, move or remove it; make udev or the mount itself readable, or unmount it by hand after checking what it is";
+    const IDENTITY_REMEDY: &str = "repair the named record; diagnosis alone authorizes no mutation";
+    let root = cfg.control.join("slot-images");
+    if !root.exists() {
+        return Vec::new();
+    }
+    let identity_error = |detail: String| {
+        vec![image_finding(
+            "image-identity-unverifiable",
+            "operational",
+            None,
+            None,
+            machine,
+            detail,
+            IDENTITY_REMEDY,
+        )]
+    };
+    let mut type_dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(read) = std::fs::read_dir(&root) {
+        for entry in read.flatten() {
+            let path = entry.path();
+            if path.is_dir()
+                && !path
+                    .symlink_metadata()
+                    .map(|meta| meta.file_type().is_symlink())
+                    .unwrap_or(false)
+            {
+                type_dirs.push(path);
+            }
+        }
+    }
+    type_dirs.sort();
+    let mut images: Vec<DoctorImage> = Vec::new();
+    for type_dir in &type_dirs {
+        let mut slot_dirs: Vec<PathBuf> = Vec::new();
+        if let Ok(read) = std::fs::read_dir(type_dir) {
+            for entry in read.flatten() {
+                let path = entry.path();
+                if path.is_dir() && path.join("IMAGE.json").exists() {
+                    slot_dirs.push(path);
+                }
+            }
+        }
+        slot_dirs.sort();
+        for directory in &slot_dirs {
+            match read_doctor_image(directory, cfg) {
+                Ok(image) => images.push(image),
+                Err(error) => {
+                    return identity_error(format!(
+                        "cannot read slot image records or the mount table: {error}"
+                    ));
+                }
+            }
+        }
+    }
+    let entries = match mount_entries() {
+        Ok(entries) => entries,
+        Err(error) => {
+            return identity_error(format!(
+                "cannot read slot image records or the mount table: {error}"
+            ));
+        }
+    };
+    let evidence = loop_evidence(&entries);
+    let mut findings: Vec<Value> = Vec::new();
+    for image in &images {
+        let slot_image = image.directory.join("slot.img");
+        let state_image = image.directory.join("state.img");
+        let state_mount = image.directory.join("state");
+        for (image_file, mount_point) in
+            [(&slot_image, &image.location), (&state_image, &state_mount)]
+        {
+            let identity = file_identity(image_file);
+            let uuid = image_uuid(image_file);
+            // Python orders carriers by sorted sysfs device name
+            // (`loop10` before `loop2`), not by device number.
+            let mut carriers: Vec<(&String, String)> = evidence
+                .iter()
+                .filter(|(_number, item)| carries(item, identity, uuid.as_ref()) == Some(true))
+                .map(|(number, item)| {
+                    (
+                        &item.name,
+                        format!(
+                            "{} ({}:{})",
+                            item.name,
+                            device_major(*number),
+                            device_minor(*number)
+                        ),
+                    )
+                })
+                .collect();
+            carriers.sort_by(|left, right| left.0.cmp(right.0));
+            let devices: Vec<String> = carriers.into_iter().map(|(_name, label)| label).collect();
+            // The host device is the loop device mounted at the mount
+            // point itself, when it is one of the carriers.
+            let target = normalize_absolute(mount_point);
+            let host_device = entries
+                .iter()
+                .rev()
+                .find(|entry| Path::new(&entry.mount_point) == target)
+                .filter(|top| top.fstype == "ext4" && top.root == "/")
+                .and_then(|top| parse_device(&top.device))
+                .and_then(|number| {
+                    let label = format!(
+                        "{} ({}:{})",
+                        evidence.get(&number)?.name,
+                        device_major(number),
+                        device_minor(number)
+                    );
+                    devices.iter().find(|item| *item == &label).map(|_| label)
+                });
+            if devices.len() > 1 {
+                let host = match &host_device {
+                    Some(label) => format!("; this host mounts {label}"),
+                    None => String::new(),
+                };
+                findings.push(image_finding(
+                    "image-attached-twice",
+                    "row",
+                    Some(&image.slot),
+                    Some(&image.slot_type),
+                    machine,
+                    format!(
+                        "{} is attached to {}: two independent file systems on one image file{}",
+                        image_file.display(),
+                        devices.join(", "),
+                        host
+                    ),
+                    ATTACHED_REMEDY,
+                ));
+            }
+            let (state, detail) = mount_state(image_file, mount_point);
+            if state == "unverifiable" {
+                findings.push(image_finding(
+                    "image-identity-unverifiable",
+                    "row",
+                    Some(&image.slot),
+                    Some(&image.slot_type),
+                    machine,
+                    format!("{}: {detail}", mount_point.display()),
+                    VERIFY_REMEDY,
+                ));
+            }
+        }
+    }
+    findings
+}
+
 /// What is mounted at `mount_point`, judged against `image_file`:
 /// (state, detail) with state absent|kernel|fuse|other|unverifiable,
 /// mirroring `slotimage.mount_state`.

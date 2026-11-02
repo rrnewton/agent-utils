@@ -179,6 +179,45 @@ pub(crate) enum Command {
         #[arg(long, value_name = "FORMAT", default_value = "human", value_parser = ["human", "json"])]
         format: String,
     },
+    /// Print the Python `doctor` command's envelope (JSON) or human form
+    DoctorText {
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+        /// Read every ACTIVE machine shard instead of only the selected machine
+        #[arg(long)]
+        all_machines: bool,
+        /// Output format: json or human
+        #[arg(long, value_name = "FORMAT", default_value = "human", value_parser = ["human", "json"])]
+        format: String,
+    },
+    /// Print the Python `audit` command's payload (JSON) or human form
+    AuditText {
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+        /// Resumable cache-accounting state path (default: a project-keyed file below XDG_CACHE_HOME or ~/.cache)
+        #[arg(long, value_name = "PATH")]
+        cache_census_state: Option<String>,
+        /// Maximum cache traversal work units for this invocation
+        #[arg(long, value_name = "ENTRIES", default_value_t = 100_000)]
+        cache_work_limit: i64,
+        /// Cache traversal wall budget in seconds for this invocation
+        #[arg(long, value_name = "SECONDS", default_value_t = 5.0)]
+        cache_wall_seconds: f64,
+        /// Exit non-zero on attention (1) or unknown (2) slots
+        #[arg(long)]
+        gate: bool,
+        /// Output format: json or human
+        #[arg(long, value_name = "FORMAT", default_value = "human", value_parser = ["human", "json"])]
+        format: String,
+    },
     /// Diagnose every active record (owner process, heartbeat, hold) and print one status object per record
     ParseStatus {
         /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
@@ -1030,6 +1069,54 @@ pub fn run() -> u8 {
             Ok(text) => {
                 print!("{text}");
                 return 0;
+            }
+            Err(error) => {
+                eprintln!("wrkslotsd: {error}");
+                return 1;
+            }
+        },
+        Command::DoctorText {
+            root,
+            machine,
+            all_machines,
+            format,
+        } => match crate::doctor_state::doctor_cli(
+            root.as_deref(),
+            machine.as_deref(),
+            all_machines,
+            format == "human",
+        ) {
+            Ok(text) => {
+                print!("{text}");
+                return 0;
+            }
+            Err(error) => {
+                eprintln!("wrkslotsd: {error}");
+                return 1;
+            }
+        },
+        Command::AuditText {
+            root,
+            machine,
+            cache_census_state,
+            cache_work_limit,
+            cache_wall_seconds,
+            gate,
+            format,
+        } => match crate::audit_state::audit_cli(
+            root.as_deref(),
+            machine.as_deref(),
+            crate::audit_state::CensusRequest {
+                state: cache_census_state,
+                work_limit: cache_work_limit,
+                wall_seconds: cache_wall_seconds,
+            },
+            gate,
+            format == "human",
+        ) {
+            Ok((text, code)) => {
+                print!("{text}");
+                return u8::try_from(code).unwrap_or(1);
             }
             Err(error) => {
                 eprintln!("wrkslotsd: {error}");

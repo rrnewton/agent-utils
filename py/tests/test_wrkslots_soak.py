@@ -29,6 +29,12 @@ case "$1" in
   parse-doctor)
     if [ "$2" = "--help" ]; then echo "Usage: --root --machine --all-machines"; exit 0; fi
     echo "RS parse-doctor $@" ;;
+  doctor-text)
+    if [ "$2" = "--help" ]; then echo "Usage: --root --machine --all-machines --format"; exit 0; fi
+    echo "RS doctor-text $@" ;;
+  audit-text)
+    if [ "$2" = "--help" ]; then echo "Usage: --root --machine --cache-census-state --cache-work-limit --cache-wall-seconds --gate --format"; exit 0; fi
+    echo "RS audit-text $@" ;;
   status-text)
     if [ "$2" = "--help" ]; then echo "Usage: --root --machine --all-machines --slot --format"; exit 0; fi
     echo "RS status-text $@" ;;
@@ -94,13 +100,20 @@ def test_human_status_runs_in_rust(tmp_path: Path) -> None:
     assert "cmd=status edition=rust rc=0" in log.read_text()
 
 
-def test_human_reader_stays_python_with_note(tmp_path: Path) -> None:
+def test_human_doctor_runs_in_rust(tmp_path: Path) -> None:
     root, log = _sandbox(tmp_path)
     result = _run(root, log, "doctor")
     assert result.returncode == 0, result.stderr
-    assert result.stdout.startswith("PY wrkslots doctor")
-    assert "python (not yet in Rust)" in result.stderr
-    assert "cmd=doctor edition=python rc=0" in log.read_text()
+    assert result.stdout.startswith("RS doctor-text doctor-text")
+    assert "cmd=doctor edition=rust rc=0" in log.read_text()
+
+
+def test_human_audit_runs_in_rust(tmp_path: Path) -> None:
+    root, log = _sandbox(tmp_path)
+    result = _run(root, log, "audit", "--gate")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("RS audit-text audit-text --gate")
+    assert "cmd=audit edition=rust rc=0" in log.read_text()
 
 
 def test_uncovered_command_stays_python_with_note(tmp_path: Path) -> None:
@@ -132,10 +145,10 @@ def test_unknown_flag_falls_back_to_python(tmp_path: Path) -> None:
 
 def test_format_value_is_checked_not_just_the_flag(tmp_path: Path) -> None:
     root, log = _sandbox(tmp_path)
-    human = _run(root, log, "doctor", "--format", "human")
-    assert human.stdout.startswith("PY wrkslots doctor")
-    bogus = _run(root, log, "doctor", "--format", "bogus")
-    assert bogus.stdout.startswith("PY wrkslots doctor")
+    human = _run(root, log, "create", "--format", "human")
+    assert human.stdout.startswith("PY wrkslots create")
+    bogus = _run(root, log, "create", "--format", "bogus")
+    assert bogus.stdout.startswith("PY wrkslots create")
 
 
 def test_format_default_commands_stay_python_without_json(tmp_path: Path) -> None:
