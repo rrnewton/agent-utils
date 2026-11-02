@@ -164,6 +164,33 @@ _VALIDATION_SERVICE_RESULT_FIELDS = {
         "passed_tests",
         "scorecard_writeback",
     ),
+    6: (
+        "schema_version",
+        "commit",
+        "profile",
+        "selection_mode",
+        "final_validate_status",
+        "detail",
+        "exit_code",
+        "executed_nodes",
+        "executed_tests",
+        "passed_tests",
+        "scorecard_writeback",
+    ),
+    7: (
+        "schema_version",
+        "commit",
+        "profile",
+        "selection_mode",
+        "final_validate_status",
+        "detail",
+        "exit_code",
+        "executed_nodes",
+        "executed_tests",
+        "passed_tests",
+        "diagnostic_failed_tests",
+        "scorecard_writeback",
+    ),
 }
 _VALIDATION_RESULT_OUTCOMES = {
     "PASSED": ("success", 0),
@@ -2637,7 +2664,7 @@ def _validation_removal_record_fields(
     if (
         not isinstance(schema, int)
         or isinstance(schema, bool)
-        or schema not in {1, 2, 3, 4, 5}
+        or schema not in {1, 2, 3, 4, 5, 6, 7}
     ):
         raise Refusal(
             "validation removal run-record has no supported service-result identity"
@@ -2747,6 +2774,24 @@ def _validation_service_result_schema(
             "result": "no-result",
         },
     }
+    if schema >= 7:
+        # Schema 7 producers also declare the GREEN_FLAKY outcome.
+        expected_outcomes["GREEN_FLAKY"] = {
+            outcome_exit_field: 0,
+            "state": "completed",
+            "result": "success",
+        }
+    expected_writeback = _VALIDATION_SCORECARD_WRITEBACK_SCHEMA
+    if schema >= 6:
+        # Schema 6 adds the delegated write-back variant.
+        expected_writeback = {
+            "nullable": True,
+            "variants": {
+                "completed": ["status"],
+                "delegated": ["status"],
+                "failed": ["status", "error"],
+            },
+        }
     if (
         set(producer_schema) != expected_schema_keys
         or type(producer_schema.get("schema_version")) is not int
@@ -2757,7 +2802,7 @@ def _validation_service_result_schema(
             schema >= 2
             and not _json_equal(
                 producer_schema.get("scorecard_writeback"),
-                _VALIDATION_SCORECARD_WRITEBACK_SCHEMA,
+                expected_writeback,
             )
         )
     ):
@@ -44244,7 +44289,7 @@ def _current_validation_result_is_terminal(
             return False
         if writeback == {"status": "completed"}:
             pass
-        elif schema == 6 and writeback == {"status": "delegated"}:
+        elif schema >= 6 and writeback == {"status": "delegated"}:
             # Schema 6 (consumer commit 25d2537a, 2026-10-05) names a write-back
             # the launcher owns; it means what null meant before it.
             pass
@@ -44290,7 +44335,7 @@ def _current_validation_result_is_terminal(
         passed_tests is None or passed_tests != executed_tests
     ):
         return False
-    if schema in {5, 6}:
+    if schema in {5, 6, 7}:
         if "detail" not in record:
             return False
         detail = record.get("detail")
@@ -44410,12 +44455,12 @@ def _validation_record_is_terminal(
     if schema is not None and (
         not isinstance(schema, int)
         or isinstance(schema, bool)
-        or schema not in {1, 2, 3, 4, 5, 6}
+        or schema not in {1, 2, 3, 4, 5, 6, 7}
     ):
         return False
     if schema in {1, 2}:
         expected_exit = None
-    elif schema in {4, 5, 6} and isinstance(status, str):
+    elif schema in {4, 5, 6, 7} and isinstance(status, str):
         return _current_validation_result_is_terminal(
             record, schema=schema, status=status
         )
@@ -44502,7 +44547,7 @@ def _current_frozen_service_result(record: Mapping[str, object]) -> bool:
     schema = record.get("service_result_schema")
     return bool(
         type(schema) is int
-        and schema in {4, 5, 6}
+        and schema in {4, 5, 6, 7}
         and record.get("result_source") == "validation-service-result"
         and record.get("state") == "completed"
         and _validation_record_is_terminal(record, target_kind="frozen-checkout")
@@ -44616,8 +44661,16 @@ def _durable_frozen_result(
 def _current_incomplete_frozen_result(record: Mapping[str, object]) -> bool:
     """Recognize a narrow retained no-result, without inferring execution phase."""
 
+    # Schema 5 introduced the detail fields this shape pins; schemas 6
+    # and 7 keep them. A terminal COULD_NOT_RUN record at any of those
+    # schemas executed nothing and holds no live storage, so it is
+    # determinate: pinning the check to schema 5 alone made one
+    # schema-6/7 no-result handle classify could-not-classify and
+    # block every launch host-wide (2026-11-02, vspeed dc85ec16).
+    schema = record.get("service_result_schema")
+    if type(schema) is not int or schema not in {5, 6, 7}:
+        return False
     expected: dict[str, object] = {
-        "service_result_schema": 5,
         "result_source": "validation-service-result",
         "state": "completed",
         "result": "no-result",
@@ -44813,9 +44866,12 @@ def _current_incomplete_frozen_retention(
             path, "current frozen validation evidence", _VALIDATION_REMOVAL_ARTIFACT_BYTES_LIMIT
         )
         evidence.append((path, contents, identity))
+    schema = record.get("service_result_schema")
+    if type(schema) is not int or isinstance(schema, bool) or schema not in {5, 6, 7}:
+        raise Refusal("current frozen validation has no supported service-result schema")
     projection = _validation_service_result_projection(
-        evidence[2][1], schema=5,
-        schema_fields=_validation_service_result_schema(evidence[1][1], 5),
+        evidence[2][1], schema=schema,
+        schema_fields=_validation_service_result_schema(evidence[1][1], schema),
         expected_commit=target,
     )
     for field, value in projection.items():

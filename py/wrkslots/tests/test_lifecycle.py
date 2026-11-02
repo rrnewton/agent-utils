@@ -2102,6 +2102,33 @@ def validation_service_result_schema(schema_version: int = 4) -> dict[str, objec
             "passed_tests",
             "scorecard_writeback",
         ],
+        6: [
+            "schema_version",
+            "commit",
+            "profile",
+            "selection_mode",
+            "final_validate_status",
+            "detail",
+            "exit_code",
+            "executed_nodes",
+            "executed_tests",
+            "passed_tests",
+            "scorecard_writeback",
+        ],
+        7: [
+            "schema_version",
+            "commit",
+            "profile",
+            "selection_mode",
+            "final_validate_status",
+            "detail",
+            "exit_code",
+            "executed_nodes",
+            "executed_tests",
+            "passed_tests",
+            "diagnostic_failed_tests",
+            "scorecard_writeback",
+        ],
     }[schema_version]
     exit_field = "exit_code" if schema_version == 1 else "validation_exit_code"
     result: dict[str, object] = {
@@ -2124,6 +2151,14 @@ def validation_service_result_schema(schema_version: int = 4) -> dict[str, objec
                 "completed": ["status"],
                 "failed": ["status", "error"],
             },
+        }
+    if schema_version >= 6:
+        result["scorecard_writeback"]["variants"]["delegated"] = ["status"]
+    if schema_version >= 7:
+        result["outcomes"]["GREEN_FLAKY"] = {
+            exit_field: 0,
+            "state": "completed",
+            "result": "success",
         }
     return result
 
@@ -51087,6 +51122,7 @@ def prepare_current_incomplete_frozen_checkout(
     monkeypatch: pytest.MonkeyPatch,
     *,
     nested: bool = False,
+    schema_version: int = 5,
 ) -> tuple[Path, Path, Path, Path, Path]:
     project, repository, _remote = make_project(tmp_path, cache_globs=("ignored",))
     (repository / ".gitignore").write_text("ignored/\n", encoding="utf-8")
@@ -51094,7 +51130,7 @@ def prepare_current_incomplete_frozen_checkout(
     git(repository, "commit", "-m", "declare ignored output")
     if nested:
         add_recursive_submodules(tmp_path, project, repository)
-    commit_validation_removal_schema(repository, schema_version=5)
+    commit_validation_removal_schema(repository, schema_version=schema_version)
     checkout, record, target = prepare_frozen_validation_checkout(
         project, repository, monkeypatch=monkeypatch, name="current-incomplete"
     )
@@ -51102,24 +51138,29 @@ def prepare_current_incomplete_frozen_checkout(
         git(checkout, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive")
     value = dict(wrkslots._strict_json_object(record.read_bytes(), "fixture record"))
     value.update({
-        "service_result_schema": 5, "materialized_target": False,
+        "service_result_schema": schema_version, "materialized_target": False,
         "state": "completed", "result": "no-result",
         "final_validate_status": "COULD_NOT_RUN", "exit_code": 75,
         "executed_nodes": 0, "executed_tests": None, "passed_tests": None,
         "selection_mode": None, "scorecard_writeback": None,
         "detail": "producer could not prepare validation",
     })
+    if schema_version >= 7:
+        value["diagnostic_failed_tests"] = None
     value.pop("scorecard_handoff")
     value.pop("scorecard_writeback_files")
     record.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
     sidecar = record.with_name(f"{record.stem}{wrkslots._VALIDATION_SERVICE_RESULT_SUFFIX}")
-    sidecar.write_text(json.dumps({
-        "schema_version": 5, "commit": target, "profile": "only-full",
+    sidecar_value: dict[str, object] = {
+        "schema_version": schema_version, "commit": target, "profile": "only-full",
         "final_validate_status": "COULD_NOT_RUN", "exit_code": 75,
         "executed_nodes": 0, "executed_tests": None, "passed_tests": None,
         "selection_mode": None, "scorecard_writeback": None,
         "detail": ["producer could not prepare validation"],
-    }, sort_keys=True) + "\n", encoding="utf-8")
+    }
+    if schema_version >= 7:
+        sidecar_value["diagnostic_failed_tests"] = None
+    sidecar.write_text(json.dumps(sidecar_value, sort_keys=True) + "\n", encoding="utf-8")
     stub_canonical_frozen_record_parser(monkeypatch, label="current incomplete fixture")
     stub_validate_batch_censuses(monkeypatch)
     return project, repository, checkout, record, sidecar
@@ -51189,6 +51230,26 @@ def test_current_incomplete_frozen_retains_evidence_and_allows_stable_source_wor
     assert not any(item["kind"] == "ownerless-validate-path-removed" for item in wrkslots._load_events(config))
     assert not (record.parent / "scorecard-handoffs").exists()
     assert json.loads(record.read_text())["result"] == "no-result"
+
+
+@pytest.mark.ordinary_environment
+@pytest.mark.parametrize("schema_version", (6, 7))
+def test_current_incomplete_frozen_accepts_later_service_result_schemas(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str], schema_version: int,
+) -> None:
+    # A terminal COULD_NOT_RUN at schema 6/7 executed nothing and holds
+    # no live storage; it must classify determinate (retained,
+    # non-blocking), not could-not-classify blocking every launch.
+    project, source, checkout, record, _sidecar = prepare_current_incomplete_frozen_checkout(
+        tmp_path, monkeypatch, schema_version=schema_version
+    )
+    rc = run_current_incomplete_batch(project, source, checkout, record, action="classify")
+    assert rc == 0
+    row = incomplete_batch_row(json.loads(capsys.readouterr().out), "classify")
+    assert row["blocks_entry"] is False, row
+    assert row["state"] == "current-incomplete-retained"
+    assert checkout.is_dir()
 
 
 @pytest.mark.ordinary_environment
