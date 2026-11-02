@@ -390,6 +390,72 @@ pub(crate) fn unpushed(
     Ok(json!({"schema": 2, "slots": rows}))
 }
 
+/// The Python `unpushed` output: the JSON payload, or the human rows
+/// (`{state}: {slot}/{checkout} HEAD={head}` plus, for an unpublished
+/// row, the same-named-ref reading or the publish advice).
+pub(crate) fn unpushed_text(
+    root: Option<&Path>,
+    machine_override: Option<&str>,
+    slot_filter: Option<&str>,
+    format_json: bool,
+) -> Result<String> {
+    let payload = unpushed(root, machine_override, slot_filter)?;
+    if format_json {
+        return Ok(format!(
+            "{}\n",
+            serde_json::to_string_pretty(&sort_keys(&payload)).unwrap_or_default()
+        ));
+    }
+    let mut out = String::new();
+    if let Some(rows) = payload.get("slots").and_then(Value::as_array) {
+        for row in rows {
+            let text = |key: &str| row.get(key).and_then(Value::as_str).unwrap_or_default();
+            out.push_str(&format!(
+                "{}: {}/{} HEAD={}\n",
+                text("state"),
+                text("slot"),
+                text("checkout"),
+                text("head")
+            ));
+            if text("state") != "PUBLISHED" {
+                match row.get("same_named_remote_ref") {
+                    None | Some(Value::Null) => {
+                        out.push_str("  no same-named remote ref exists; publish the branch\n");
+                    }
+                    Some(reference) => {
+                        out.push_str(&format!(
+                            "  same-named remote ref={}; two readings: genuinely unpushed or stale after remote rebase\n",
+                            reference.as_str().unwrap_or_default()
+                        ));
+                        out.push_str(&format!(
+                            "  compare={} (empty output means content present)\n",
+                            text("diagnostic_command")
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Recursively sort object keys, as `json.dumps(sort_keys=True)`.
+fn sort_keys(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            let mut sorted = serde_json::Map::new();
+            for (key, item) in entries {
+                sorted.insert(key.clone(), sort_keys(item));
+            }
+            Value::Object(sorted)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(sort_keys).collect()),
+        other => other.clone(),
+    }
+}
+
 /// `shlex.join` for the diagnostic command: quote only what needs it.
 pub(crate) fn shell_join(parts: &[String]) -> String {
     parts

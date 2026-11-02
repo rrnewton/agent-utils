@@ -5074,6 +5074,7 @@ fn cli_surface_contains_no_executor_or_mutation_subcommand() {
             "audit-text",
             "doctor-text",
             "shell-command",
+            "unpushed-text",
             "status",
             "status-text",
             "validate-config"

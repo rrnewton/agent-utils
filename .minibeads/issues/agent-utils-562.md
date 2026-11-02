@@ -726,3 +726,9 @@ command in both formats. Differential:
 py/wrkslots/tests/test_shell_command_cli_rust.py. Still Python-only
 in the soak: create human form, unpushed, recover-batch human
 forms, and the other --format-default commands.
+
+Soak slice (unpushed): wrkslotsd unpushed-text prints the Python
+unpushed human rows and the sorted-key JSON payload; soak maps
+unpushed to Rust in both formats. Differential cases added to
+py/wrkslots/tests/test_unpushed_state_rust.py. Still Python-only
+in the soak: create human form and the recover-batch human forms.

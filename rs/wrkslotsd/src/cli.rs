@@ -297,6 +297,21 @@ pub(crate) enum Command {
         #[arg(long, value_name = "SLOT")]
         slot: Option<String>,
     },
+    /// Diagnose unpublished or stale-after-rebase HEADs, printing the Python `unpushed` output
+    UnpushedText {
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+        /// Only diagnose this slot
+        #[arg(long, value_name = "SLOT")]
+        slot: Option<String>,
+        /// Output format: human prints one row per checkout; json prints the payload
+        #[arg(long, value_name = "FORMAT", default_value = "human", value_parser = ["human", "json"])]
+        format: String,
+    },
     /// Diagnose the registry (tolerant status records plus operational findings)
     ParseDoctor {
         /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
@@ -1270,6 +1285,26 @@ pub fn run() -> u8 {
                     "{}",
                     serde_json::to_string_pretty(&value).unwrap_or_default()
                 );
+                return 0;
+            }
+            Err(error) => {
+                eprintln!("wrkslotsd: {error}");
+                return 1;
+            }
+        },
+        Command::UnpushedText {
+            root,
+            machine,
+            slot,
+            format,
+        } => match crate::unpushed_state::unpushed_text(
+            root.as_deref(),
+            machine.as_deref(),
+            slot.as_deref(),
+            format == "json",
+        ) {
+            Ok(text) => {
+                print!("{text}");
                 return 0;
             }
             Err(error) => {

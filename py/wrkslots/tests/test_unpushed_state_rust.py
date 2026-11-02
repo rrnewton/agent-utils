@@ -154,6 +154,39 @@ def _rust(root: Path, slot: str | None = None) -> subprocess.CompletedProcess[st
     )
 
 
+def _python_text(root: Path, fmt: str) -> str:
+    args = argparse.Namespace(
+        project_root=str(root), machine=None, slot=None,
+        format=fmt, wait_lock=0.0,
+    )
+    stream = io.StringIO()
+    with contextlib.redirect_stdout(stream):
+        assert wrkslots_cli._cmd_unpushed(args) == 0
+    return stream.getvalue()
+
+
+def _rust_text(root: Path, fmt: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [str(rust_wrkslotsd()), "unpushed-text", "--root", str(root), "--format", fmt],
+        cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900,
+    )
+
+
+def test_unpushed_text_matches_python(tmp_path: Path) -> None:
+    root = _fixture(tmp_path)
+    checkout = root / "worktrees" / "slot-a" / "repo"
+    (checkout / "file.txt").write_text("two\n")
+    _git(checkout, "add", "file.txt")
+    _git(checkout, "commit", "-q", "-m", "two")
+    for fmt in ("human", "json"):
+        result = _rust_text(root, fmt)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == _python_text(root, fmt), fmt
+    human = _rust_text(root, "human").stdout
+    assert "same-named remote ref=refs/remotes/origin/suite/work; two readings:" in human
+    assert "compare=git --literal-pathspecs" in human
+
+
 def test_unpushed_published_matches_python(tmp_path: Path) -> None:
     root = _fixture(tmp_path)
     result = _rust(root)

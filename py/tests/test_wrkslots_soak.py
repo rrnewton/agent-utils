@@ -41,6 +41,9 @@ case "$1" in
   shell-command)
     if [ "$2" = "--help" ]; then echo "Usage: --root --machine --slot-type --box --name --writable --cwd --isolation --shell --format"; exit 0; fi
     echo "RS shell-command $@" ;;
+  unpushed-text)
+    if [ "$2" = "--help" ]; then echo "Usage: --root --machine --slot --format"; exit 0; fi
+    echo "RS unpushed-text $@" ;;
   heartbeat)
     if [ "$2" = "--help" ]; then echo "Usage: --agent --owner-pid --expected-generation --root --machine"; exit 0; fi
     echo "RS heartbeat-run $@" ;;
@@ -119,6 +122,17 @@ def test_human_audit_runs_in_rust(tmp_path: Path) -> None:
     assert "cmd=audit edition=rust rc=0" in log.read_text()
 
 
+def test_unpushed_both_formats_run_in_rust(tmp_path: Path) -> None:
+    root, log = _sandbox(tmp_path)
+    human = _run(root, log, "unpushed")
+    assert human.returncode == 0, human.stderr
+    assert human.stdout.startswith("RS unpushed-text unpushed-text")
+    payload = _run(root, log, "unpushed", "--format", "json")
+    assert payload.returncode == 0, payload.stderr
+    assert payload.stdout.startswith("RS unpushed-text unpushed-text --format json")
+    assert "cmd=unpushed edition=rust rc=0" in log.read_text()
+
+
 def test_shell_command_runs_in_rust(tmp_path: Path) -> None:
     root, log = _sandbox(tmp_path)
     result = _run(root, log, "shell-command", "slot01", "--format", "json")
@@ -164,8 +178,8 @@ def test_format_value_is_checked_not_just_the_flag(tmp_path: Path) -> None:
 
 def test_format_default_commands_stay_python_without_json(tmp_path: Path) -> None:
     root, log = _sandbox(tmp_path)
-    result = _run(root, log, "unpushed")
-    assert result.stdout.startswith("PY wrkslots unpushed")
+    result = _run(root, log, "create", "slot01")
+    assert result.stdout.startswith("PY wrkslots create")
     assert "python (not yet in Rust)" in result.stderr
 
 
