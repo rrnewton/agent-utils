@@ -2408,7 +2408,7 @@ def status(
         _validate_private_directory(path, "queue state directory")
         return sorted(name[:-5] for name in os.listdir(path) if name.endswith(".json"))
 
-    return {
+    result: dict[str, object] = {
         "pane_id": info.pane_id, "agent": info.agent, "agent_status": info.status,
         "session_agent": info.session_agent, "session_value": info.session_value,
         "workspace_id": info.workspace_id, "cwd": info.cwd,
@@ -2416,6 +2416,9 @@ def status(
         "inflight": identifiers(inflight),
         "failed": identifiers(failed),
     }
+    if info.reported_status is not None:
+        result["herdr_agent_status"] = info.reported_status
+    return result
 
 
 def read(client: HerdrClient, target: Target, *, lines: int = 500) -> str:

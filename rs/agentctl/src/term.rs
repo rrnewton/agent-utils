@@ -367,6 +367,7 @@ fn to_agent_pane_info(backend: &TmuxBackend, info: BackendPaneInfo) -> AgentPane
         scroll: None,
         terminal_id,
         tab_id: info.tab_id.map(|id| id.to_string()),
+        reported_status: None,
     }
 }
 

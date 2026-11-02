@@ -36249,6 +36249,7 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
             }),
             terminal_id: None,
             tab_id: None,
+            reported_status: None,
         };
         let captured = herdr_read(crate::subagents::chat_capture_source(&pane));
         let capture = state

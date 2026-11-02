@@ -284,6 +284,16 @@ pub(crate) fn muse_verified_process_composer(screen: &str) -> bool {
         .is_some_and(|(_, composer)| muse_editor_segments(&composer).is_some())
 }
 
+/// Whether one footer-region line or notice says the goal is paused: exactly `Goal (paused)`,
+/// or the same words with an elapsed duration, as Muse draws a long pause (`Goal (paused ·
+/// 1d 17h 40m) 97% █…`). An active goal's notice (`Goal (45m) 47% …`) never matches.
+fn goal_paused_text(text: &str) -> bool {
+    text == GOAL_PAUSED
+        || text
+            .strip_prefix("Goal (paused")
+            .is_some_and(|rest| rest.starts_with([')', ' ', '·']))
+}
+
 /// Recognize Muse's explicit paused-goal state in a verified UI frame.
 ///
 /// Only the footer region below the last rule counts, so a transcript line that merely quotes
@@ -300,12 +310,17 @@ pub(crate) fn muse_verified_process_goal_paused(screen: &str) -> bool {
     };
     lines[bottom + 1..].iter().any(|line| {
         let line = strip(line);
-        line == GOAL_PAUSED
+        goal_paused_text(line)
             || (muse_status_mode(line).is_some()
-                && split_notice(line)
-                    .1
-                    .is_some_and(|notice| notice == GOAL_PAUSED))
+                && split_notice(line).1.is_some_and(goal_paused_text))
     })
+}
+
+/// Whether `screen` holds a Muse composer frame at all (its ruled editor and one status
+/// footer), as [`muse_verified_pane_status`] reads one. A viewport scrolled away from the
+/// pane's bottom holds none, however idle the pane itself is (#734 chat-status-disagreement).
+pub(crate) fn muse_screen_has_composer(screen: &str) -> bool {
+    muse_composer_regions(screen, false).is_some()
 }
 
 /// The status a pinned Muse pane reports: paused, idle, staged or working, in that order.
@@ -981,6 +996,33 @@ mod tests {
         let active = paused.replace("Goal (paused)", "Goal (45m) 47% ████▊░░░░░");
         assert!(!muse_verified_process_goal_paused(&active));
         assert_eq!(muse_verified_pane_status("idle", &active), "idle");
+    }
+
+    // #734 chat-status-disagreement: a pause long enough for Muse to draw its elapsed
+    // duration still pauses; the incident footer was `Goal (paused · 1d 17h 40m)`.
+    #[test]
+    fn a_paused_goal_with_an_elapsed_duration_still_pauses() {
+        let divider = "─".repeat(40);
+        let footer = "kiki · xhigh · /work/project · YOLO";
+        for notice in [
+            "Goal (paused · 1d 17h 40m) 97% █████████▊",
+            "Goal (paused · 3m) 95% █████████▌",
+            "Goal (paused) 95% █████████▌",
+        ] {
+            let paused = format!("old\n{divider}\n❯\n{divider}\n{footer}   {notice}\n");
+            assert!(muse_verified_process_goal_paused(&paused), "{notice}");
+            assert_eq!(
+                muse_verified_pane_status("done", &paused),
+                "paused",
+                "{notice}"
+            );
+        }
+        let alone = format!("old\n{divider}\n❯\n{divider}\nGoal (paused · 1d 17h 40m)\n{footer}\n");
+        assert!(muse_verified_process_goal_paused(&alone));
+        assert!(!muse_screen_has_composer(
+            "scrolled transcript, no editor\n❯ an old prompt\n"
+        ));
+        assert!(muse_screen_has_composer(&alone));
     }
 
     #[test]

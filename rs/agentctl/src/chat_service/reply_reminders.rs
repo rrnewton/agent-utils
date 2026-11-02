@@ -1346,6 +1346,7 @@ mod tests {
             scroll: None,
             terminal_id: None,
             tab_id: None,
+            reported_status: None,
         }
     }
 

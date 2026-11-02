@@ -5009,11 +5009,16 @@ fn owner_loop_pass<A: ManagedApi + ?Sized>(
     // prompts that no pass has tried yet since the service started.
     let mut watch = DeliveryWatch::new(options.timing);
     watch.scan(state, &queue_reader, &mut routes);
+    // Herdr's own report for the pane, and the last status disagreement logged, for the
+    // owner alarm and the bridge log (#734 chat-status-disagreement).
+    let mut herdr_idle = false;
+    let mut logged_disagreement: Option<(String, String)> = None;
     owner_alarm_step(
         owner_alarm.as_mut(),
         &watch.entries,
         state,
         outbound(control.transport),
+        herdr_idle,
     );
     // No output subscription works yet, so the first poll comes after the shorter interval.
     let mut poll_at = next_saturated_poll(
@@ -5086,6 +5091,29 @@ fn owner_loop_pass<A: ManagedApi + ?Sized>(
                     Ok(info) => {
                         watch.lookup_worked();
                         turn.agent_status(&info.status, info.agent.as_deref());
+                        // Herdr's own report, before the screen-derived override, and the
+                        // disagreement between the two (#734 chat-status-disagreement):
+                        // the alarm treats a `working` screen status as busy only while
+                        // Herdr agrees, and the bridge log names the disagreement once
+                        // per change.
+                        let reported = info
+                            .reported_status
+                            .as_deref()
+                            .unwrap_or(info.status.as_str());
+                        herdr_idle = matches!(reported, "idle" | "done");
+                        if let Some(reported) = info.reported_status.as_deref() {
+                            let pair = (reported.to_owned(), info.status.clone());
+                            if logged_disagreement.as_ref() != Some(&pair) {
+                                service_log(format_args!(
+                                    "agentctl: chat status disagreement for {}: Herdr reports {reported}, agentctl reads {} from the pane screen; owner requests follow the screen proof",
+                                    state.config().agent_name,
+                                    info.status
+                                ));
+                                logged_disagreement = Some(pair);
+                            }
+                        } else {
+                            logged_disagreement = None;
+                        }
                     }
                     Err(error) if stop.is_stopped() => return Err(error.into()),
                     Err(error) => watch.lookup_failed(&error),
@@ -5215,6 +5243,7 @@ fn owner_loop_pass<A: ManagedApi + ?Sized>(
                 &watch.entries,
                 state,
                 outbound(control.transport),
+                herdr_idle,
             );
         }
         if let Some(run) = stale_composer.as_mut().filter(|_| scanned) {
@@ -6099,6 +6128,7 @@ fn owner_alarm_step(
     entries: &[chat_runtime::DeliveryEntry],
     state: &BridgeState,
     transport: Option<&mut dyn RootMessageTransport>,
+    herdr_idle: bool,
 ) {
     let Some(alarm) = alarm else {
         return;
@@ -6108,6 +6138,7 @@ fn owner_alarm_step(
         entries,
         &configuration.agent_label,
         chat_runtime::unix_millis(),
+        herdr_idle,
     );
     if notices.is_empty() {
         return;
@@ -14571,7 +14602,13 @@ esac
         let mut routes = RouteCache::new(Vec::new());
         let mut roots = RecordingRoots::default();
         watch.scan(&state, &RecordingDelivery::default(), &mut routes);
-        owner_alarm_step(alarm.as_mut(), &watch.entries, &state, Some(&mut roots));
+        owner_alarm_step(
+            alarm.as_mut(),
+            &watch.entries,
+            &state,
+            Some(&mut roots),
+            false,
+        );
         assert_eq!(roots.posts.len(), 1, "{:?}", roots.posts);
         let (channel, body) = &roots.posts[0];
         assert_eq!(channel, "spaces/example");
@@ -14587,13 +14624,19 @@ esac
             .put_delivery_phase(&key, RequestPhase::Delivered, None)
             .expect("delivered");
         watch.scan(&state, &RecordingDelivery::default(), &mut routes);
-        owner_alarm_step(alarm.as_mut(), &watch.entries, &state, Some(&mut roots));
+        owner_alarm_step(
+            alarm.as_mut(),
+            &watch.entries,
+            &state,
+            Some(&mut roots),
+            false,
+        );
         assert_eq!(
             roots.posts[1].1,
             "[chat-bridge] Your messages to coordinator are being delivered again."
         );
         // With the alarm off, nothing is posted.
-        owner_alarm_step(None, &watch.entries, &state, Some(&mut roots));
+        owner_alarm_step(None, &watch.entries, &state, Some(&mut roots), false);
         assert_eq!(roots.posts.len(), 2);
         fs::remove_dir_all(root).expect("cleanup");
     }

@@ -116,6 +116,10 @@ pub struct QueueStatus {
     pub agent: Option<String>,
     /// Native live Herdr agent state.
     pub agent_status: String,
+    /// Herdr's own agent state before agentctl's screen-derived override, when one overrode
+    /// it (#734 chat-status-disagreement); `agent_status` stays the derived state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub herdr_agent_status: Option<String>,
     /// Agent name from the stable session identity, when present.
     pub session_agent: Option<String>,
     /// Stable session value, when present.
@@ -959,17 +963,50 @@ fn strip_paste_stamps(document: &mut Map<String, Value>) {
     document.remove("paste_started_at");
 }
 
+/// Set once the process is asked to terminate (SIGTERM or SIGINT), so every wait that
+/// polls a [`SystemRuntime`] ends and its locks are released (#734 chat-status-disagreement:
+/// hung drains and sends ignored termination for hours). Installed by
+/// [`install_termination_handler`]; without it the flag is never set.
+fn terminated_flag() -> &'static std::sync::Arc<std::sync::atomic::AtomicBool> {
+    static FLAG: std::sync::OnceLock<std::sync::Arc<std::sync::atomic::AtomicBool>> =
+        std::sync::OnceLock::new();
+    FLAG.get_or_init(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
+}
+
+/// Ask every [`SystemRuntime`] wait in this process to end: SIGTERM and SIGINT set the
+/// termination flag instead of killing the process outright, so a drain or send waiting
+/// on a lifecycle lock or an idle state reports, leaves its prompt pending, and releases
+/// every lock it holds. Idempotent; a failure to register leaves default signal behaviour.
+pub fn install_termination_handler() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = signal_hook::flag::register(libc::SIGTERM, terminated_flag().clone());
+        let _ = signal_hook::flag::register(libc::SIGINT, terminated_flag().clone());
+    });
+}
+
 /// Production wall-clock runtime for readiness polling.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct SystemRuntime {
     origin: Instant,
+    terminated: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Default for SystemRuntime {
     fn default() -> Self {
         Self {
             origin: Instant::now(),
+            terminated: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+}
+
+impl SystemRuntime {
+    /// Mark this runtime terminated, as the termination handler marks every runtime:
+    /// its waits end at their next poll.
+    pub fn note_terminated(&self) {
+        self.terminated
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -980,6 +1017,11 @@ impl AgentRuntime for SystemRuntime {
 
     fn sleep(&self, duration: Duration) {
         thread::sleep(duration);
+    }
+
+    fn cancelled(&self) -> bool {
+        terminated_flag().load(std::sync::atomic::Ordering::Relaxed)
+            || self.terminated.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -2477,6 +2519,7 @@ fn status_with_binding_mode<A: AgentApi + ?Sized>(
         pane_id: info.pane_id,
         agent: info.agent,
         agent_status: info.status,
+        herdr_agent_status: info.reported_status,
         session_agent: info.session_agent,
         session_value: info.session_value,
         workspace_id: info.workspace_id,
@@ -4210,6 +4253,7 @@ mod tests {
             scroll: None,
             terminal_id: None,
             tab_id: None,
+            reported_status: None,
         }
     }
 
@@ -6312,6 +6356,24 @@ mod tests {
         assert!(fs::read_to_string(&pending[0])
             .unwrap()
             .contains("bound prompt"));
+    }
+
+    // #734 chat-status-disagreement: a terminated runtime ends every wait that polls it,
+    // so a drain or send waiting on a lock or an idle state reports and releases its locks.
+    #[test]
+    fn a_terminated_system_runtime_cancels_its_waits() {
+        let runtime = SystemRuntime::default();
+        assert!(!runtime.cancelled());
+        runtime.note_terminated();
+        assert!(runtime.cancelled());
+        let bounded = UntilRuntime::after(&runtime, Duration::from_secs(600));
+        assert!(bounded.cancelled());
+        // Another runtime is unaffected: termination is per-process only through the
+        // installed handler, never through a neighbour's flag.
+        assert!(
+            !SystemRuntime::default().cancelled()
+                || terminated_flag().load(std::sync::atomic::Ordering::Relaxed)
+        );
     }
 
     #[test]

@@ -823,6 +823,9 @@ pub struct AgentPaneInfo {
     pub terminal_id: Option<String>,
     /// Herdr tab that contains the pane, when `pane get` reported it.
     pub tab_id: Option<String>,
+    /// Herdr's own status before agentctl's screen-derived override, when a managed client
+    /// overrode it (#734 chat-status-disagreement). `None` when nobody did.
+    pub reported_status: Option<String>,
 }
 
 /// What `agent get NAME` reports about one named Herdr agent.
@@ -2930,6 +2933,7 @@ fn parse_pane_info(result: &Map<String, Value>, pane_id: &str) -> Result<AgentPa
         scroll,
         terminal_id: optional_string(pane, "terminal_id", "pane get")?,
         tab_id: optional_string(pane, "tab_id", "pane get")?,
+        reported_status: None,
     })
 }
 

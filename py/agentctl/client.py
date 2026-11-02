@@ -223,12 +223,28 @@ def muse_verified_process_goal_paused(screen: str) -> bool:
     )
     # Muse draws it on a line of its own; the same notice right-aligned on the footer line counts
     # too, so tolerating goal notices on the footer never turns a paused goal into an idle editor.
+    # A long pause carries its elapsed duration (`Goal (paused · 1d 17h 40m)`) (#734
+    # chat-status-disagreement); an active goal's notice (`Goal (45m) 47% …`) never matches.
+    def paused(text: str) -> bool:
+        return text == "Goal (paused)" or (
+            text.startswith("Goal (paused")
+            and text[len("Goal (paused"):][:1] in (")", " ", "·")
+        )
+
     return any(
-        line.strip() == "Goal (paused)"
+        paused(line.strip())
         or (_muse_status_mode(line.strip()) is not None
-            and _muse_split_notice(line.strip())[1] == "Goal (paused)")
+            and (notice := _muse_split_notice(line.strip())[1]) is not None
+            and paused(notice))
         for line in lines[bottom + 1:]
     )
+
+
+def muse_screen_has_composer(screen: str) -> bool:
+    """Whether `screen` holds a Muse composer frame at all (its ruled editor and one
+    status footer). A viewport scrolled away from the pane's bottom holds none, however
+    idle the pane itself is (#734 chat-status-disagreement)."""
+    return _muse_composer_regions(screen, require_header=False) is not None
 
 
 def _muse_composer_regions(
@@ -544,6 +560,9 @@ class AgentPaneInfo:
     #: Herdr's terminal and tab for the pane, when ``pane get`` reported them.
     terminal_id: str | None = None
     tab_id: str | None = None
+    #: Herdr's own status before agentctl's screen-derived override, when a managed
+    #: client overrode it (#734 chat-status-disagreement).
+    reported_status: str | None = None
 
 
 class GuardedInput(Protocol):

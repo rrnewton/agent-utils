@@ -2234,6 +2234,44 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
             )
     }
 
+    /// The screen a Muse status is read from (#734 chat-status-disagreement): the visible
+    /// rows, unless they hold no composer frame — a viewport scrolled away from the pane's
+    /// bottom shows neither editor nor footer, and reading status from it said `working`
+    /// for hours while Herdr said `done`. Then the pane's bottom (`recent-unwrapped`) is
+    /// read instead, and used when it does hold a frame. The caller still verifies the
+    /// pinned process around the read, as before.
+    fn muse_status_screen(&self, pane_id: &str) -> crate::error::Result<String> {
+        let visible = self.client.read(pane_id, "visible", Some(200))?;
+        if crate::client::muse_screen_has_composer(&visible) {
+            return Ok(visible);
+        }
+        match self.client.read(pane_id, "recent-unwrapped", Some(200)) {
+            Ok(bottom) if crate::client::muse_screen_has_composer(&bottom) => Ok(bottom),
+            _ => Ok(visible),
+        }
+    }
+
+    /// [`Self::muse_status_screen`] with a caller runtime.
+    fn muse_status_screen_with_runtime(
+        &self,
+        pane_id: &str,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<String> {
+        let visible = self
+            .client
+            .read_with_runtime(pane_id, "visible", Some(200), runtime)?;
+        if crate::client::muse_screen_has_composer(&visible) {
+            return Ok(visible);
+        }
+        match self
+            .client
+            .read_with_runtime(pane_id, "recent-unwrapped", Some(200), runtime)
+        {
+            Ok(bottom) if crate::client::muse_screen_has_composer(&bottom) => Ok(bottom),
+            _ => Ok(visible),
+        }
+    }
+
     /// Prove that a pinned Muse pane may take a literal paste now, and return the screen that
     /// the paste must change.
     ///
@@ -2278,9 +2316,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                 )));
             }
             self.verify_muse_process_with_runtime(pane_id, runtime)?;
-            let before = self
-                .client
-                .read_with_runtime(pane_id, "visible", Some(200), runtime)?;
+            let before = self.muse_status_screen_with_runtime(pane_id, runtime)?;
             self.verify_muse_process_with_runtime(pane_id, runtime)?;
             if !muse_verified_process_idle_composer(&before) {
                 return Err(AdapterError::unavailable(format!(
@@ -2309,16 +2345,16 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         crate::harness::muse::JournalWatch::start(u32::try_from(identity.pid).ok()?)
     }
 
-    /// Read the visible screen between two checks of the pinned Muse process.
+    /// Read the screen between two checks of the pinned Muse process: the visible rows, or
+    /// the pane's bottom when the viewport is scrolled away from it (#734
+    /// chat-status-disagreement), as [`Self::muse_status_screen`] describes.
     fn verified_muse_screen(
         &self,
         pane_id: &str,
         runtime: &dyn agent::AgentRuntime,
     ) -> crate::error::Result<String> {
         self.verify_muse_process_with_runtime(pane_id, runtime)?;
-        let screen = self
-            .client
-            .read_with_runtime(pane_id, "visible", Some(200), runtime)?;
+        let screen = self.muse_status_screen_with_runtime(pane_id, runtime)?;
         self.verify_muse_process_with_runtime(pane_id, runtime)?;
         Ok(screen)
     }
@@ -4599,7 +4635,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
             let deadline = Instant::now() + Duration::from_millis(timeout_ms);
             loop {
                 self.verify_muse_process(pane_id)?;
-                let screen = self.client.read(pane_id, "visible", Some(200))?;
+                let screen = self.muse_status_screen(pane_id)?;
                 self.verify_muse_process(pane_id)?;
                 let left_editor =
                     !muse_verified_process_paste_in_composer(&screen, &submission.text);
@@ -4696,9 +4732,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                     ));
                 }
                 self.verify_muse_process_with_runtime(pane_id, runtime)?;
-                let screen =
-                    self.client
-                        .read_with_runtime(pane_id, "visible", Some(200), runtime)?;
+                let screen = self.muse_status_screen_with_runtime(pane_id, runtime)?;
                 self.verify_muse_process_with_runtime(pane_id, runtime)?;
                 let left_editor =
                     !muse_verified_process_paste_in_composer(&screen, &submission.text);
@@ -4911,13 +4945,14 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
             }
             if self.uses_muse_composer() {
                 self.verify_muse_process(pane_id)?;
-                let screen = self.client.read(pane_id, "visible", Some(200))?;
+                let screen = self.muse_status_screen(pane_id)?;
                 self.verify_muse_process(pane_id)?;
                 if muse_trust_prompt(&screen) {
                     return Err(crate::error::AdapterError::unavailable(
                         "Muse workspace trust prompt requires human attention; no input was submitted",
                     ));
                 }
+                let reported = info.status.clone();
                 let status = muse_verified_pane_status(&info.status, &screen);
                 info.status = if status == "working"
                     && crate::harness_tui::muse::MuseTui::approval_form(&screen)
@@ -4927,6 +4962,9 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                     status
                 }
                 .to_owned();
+                if info.status != reported {
+                    info.reported_status = Some(reported);
+                }
             }
         }
         Ok(info)
@@ -4972,7 +5010,7 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
         let deadline = Instant::now() + Duration::from_secs(2);
         let staged = loop {
             self.verify_muse_process(pane_id)?;
-            let screen = self.client.read(pane_id, "visible", Some(200))?;
+            let screen = self.muse_status_screen(pane_id)?;
             self.verify_muse_process(pane_id)?;
             if screen != before && muse_verified_process_paste_is_exact_composer(&screen, text) {
                 break screen;
@@ -5106,15 +5144,14 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
             }
             if self.uses_muse_composer() {
                 self.verify_muse_process_with_runtime(pane_id, runtime)?;
-                let screen =
-                    self.client
-                        .read_with_runtime(pane_id, "visible", Some(200), runtime)?;
+                let screen = self.muse_status_screen_with_runtime(pane_id, runtime)?;
                 self.verify_muse_process_with_runtime(pane_id, runtime)?;
                 if muse_trust_prompt(&screen) {
                     return Err(crate::error::AdapterError::unavailable(
                         "Muse workspace trust prompt requires human attention; no input was submitted",
                     ));
                 }
+                let reported = info.status.clone();
                 let status = muse_verified_pane_status(&info.status, &screen);
                 info.status = if status == "working"
                     && crate::harness_tui::muse::MuseTui::approval_form(&screen)
@@ -5124,6 +5161,9 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                     status
                 }
                 .to_owned();
+                if info.status != reported {
+                    info.reported_status = Some(reported);
+                }
             }
         }
         Ok(info)
@@ -5190,9 +5230,7 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                 ));
             }
             self.verify_muse_process_with_runtime(pane_id, runtime)?;
-            let screen = self
-                .client
-                .read_with_runtime(pane_id, "visible", Some(200), runtime)?;
+            let screen = self.muse_status_screen_with_runtime(pane_id, runtime)?;
             self.verify_muse_process_with_runtime(pane_id, runtime)?;
             if screen != before && muse_verified_process_paste_is_exact_composer(&screen, text) {
                 break screen;
@@ -5918,10 +5956,20 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                     } else {
                         "nothing was queued or typed, so the send is safe to retry"
                     };
+                    // Name who holds the lock, so a stale holder from a dead or old
+                    // process is visible instead of a bare timeout (#734
+                    // chat-status-disagreement). A dead holder's flock is already
+                    // released by the system; a live one is named by PID and command.
+                    let holder = crate::lock_wait::describe(
+                        agent_name,
+                        &crate::lock_wait::contention(&self.registry, agent_name),
+                    )
+                    .map(|sentence| format!("; {sentence}"))
+                    .unwrap_or_default();
                     AgentError::Pending(agent::UndeliveredMessage {
                         message: format!(
                             "agent {agent_name:?} stayed locked by another operation until the \
-                             {:.1}s send deadline; {consequence}: {error}",
+                             {:.1}s send deadline; {consequence}{holder}: {error}",
                             deadline.as_secs_f64()
                         ),
                         message_id: message_id.unwrap_or_default().to_owned(),
@@ -5975,6 +6023,8 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         message_id: Option<&str>,
         priority: bool,
     ) -> Result<QueueResult> {
+        // As `drain`: termination ends the send's waits (#734 chat-status-disagreement).
+        agent::install_termination_handler();
         let started = Instant::now();
         let options = self.with_send_deadline(options);
         let (budget, bound) = Self::readiness_budget(&options);
@@ -9798,10 +9848,19 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         match probe {
             Ok(status) => {
                 let pane = status.pane_id.clone();
+                // Herdr's own report beside the derived status, when the two disagree
+                // (#734 chat-status-disagreement).
+                let disagreement = status
+                    .herdr_agent_status
+                    .as_deref()
+                    .is_some_and(|reported| reported != status.agent_status);
                 result
                     .as_object_mut()
                     .expect("record object")
                     .extend(json!(status).as_object().expect("status object").clone());
+                if disagreement {
+                    result["status_disagreement"] = json!(true);
+                }
                 result["probe_error"] = Value::Null;
                 if let Some(view) = turn.then(|| self.turn_view(record, &pane)).flatten() {
                     result["turn"] = view;
@@ -9825,6 +9884,27 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             .read(pane_id, "visible", Some(TURN_SCREEN_LINES))
             .ok()?;
         let turn = crate::turn_state::read_screen(&screen);
+        // A viewport scrolled away from the pane's bottom shows no running turn, however
+        // long the queue behind it (#734 chat-status-disagreement): read the bottom too,
+        // so `watch-agents` can see the backlog a scrolled pane hides.
+        let turn = if turn.running || turn.queued > 0 {
+            turn
+        } else {
+            match self
+                .client
+                .read(pane_id, "recent-unwrapped", Some(TURN_SCREEN_LINES))
+            {
+                Ok(bottom) if bottom != screen => {
+                    let bottom_turn = crate::turn_state::read_screen(&bottom);
+                    if bottom_turn.running || bottom_turn.queued > 0 {
+                        bottom_turn
+                    } else {
+                        turn
+                    }
+                }
+                _ => turn,
+            }
+        };
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0.0, |elapsed| elapsed.as_secs_f64());
@@ -10870,6 +10950,10 @@ its drain would also type, so it was not queued",
 
     /// Drain only prompts known not to have been injected.
     pub fn drain(&self, agent_name: &str, options: DrainOptions) -> Result<QueueResult> {
+        // A drain asked to terminate ends its waits and releases its locks (#734
+        // chat-status-disagreement); only send/drain install this, so other commands
+        // keep their own signal handling.
+        agent::install_termination_handler();
         // While the pane is not ready the drain holds no lock (#703 send-lock-free-wait): each
         // probe takes the locks, types what it can, and releases them before the next.
         let started = Instant::now();
@@ -13247,6 +13331,8 @@ pub(crate) mod tests {
                     read_sources: Mutex::new(Vec::new()),
                     screens: Mutex::new(std::collections::VecDeque::new()),
                     screen: Mutex::new(None),
+                    bottom_screen: Mutex::new(None),
+                    scrolled: AtomicBool::new(false),
                     unwrapped_empty: AtomicBool::new(false),
                     status: Mutex::new(None),
                     screen_after_run: Mutex::new(None),
@@ -13691,6 +13777,13 @@ pub(crate) mod tests {
         pub(crate) screens: Mutex<std::collections::VecDeque<String>>,
         /// The text a read returns, when set; `visible output` otherwise.
         pub(crate) screen: Mutex<Option<String>>,
+        /// The text a `recent-unwrapped` read returns, when set: the pane's bottom, which a
+        /// scrolled viewport's `visible` read never shows (#734 chat-status-disagreement).
+        pub(crate) bottom_screen: Mutex<Option<String>>,
+        /// The viewport is scrolled away from the pane's bottom: a `visible` read returns
+        /// `screen` (old transcript), a `recent-unwrapped` read returns the live bottom
+        /// (the Muse editor's screen, when one is set) (#734 chat-status-disagreement).
+        pub(crate) scrolled: AtomicBool,
         /// Whether a `recent-unwrapped` read returns no text, as herdr's does for a pane it
         /// cannot serve that source for.
         pub(crate) unwrapped_empty: AtomicBool,
@@ -14035,6 +14128,7 @@ pub(crate) mod tests {
                     .iter()
                     .find(|entry| entry.pane_id == pane)
                     .map(|entry| entry.tab_id.clone()),
+                reported_status: None,
             })
         }
         fn workspace_label(&self, workspace: &str) -> AdapterResult<String> {
@@ -14074,6 +14168,11 @@ pub(crate) mod tests {
             }
             if source == "recent-unwrapped" && self.unwrapped_empty.load(Ordering::Relaxed) {
                 return Ok(String::new());
+            }
+            if source == "recent-unwrapped" {
+                if let Some(bottom) = self.bottom_screen.lock().unwrap().clone() {
+                    return Ok(bottom);
+                }
             }
             if self.replace_harness_on_read.swap(false, Ordering::Relaxed) {
                 self.harness_pids
@@ -14153,6 +14252,22 @@ pub(crate) mod tests {
             }
             if let Some(text) = self.screens.lock().unwrap().pop_front() {
                 return Ok(text);
+            }
+            if self.scrolled.load(Ordering::Relaxed) {
+                if source == "recent-unwrapped" {
+                    if let Some(editor) = self.muse_editor.lock().unwrap().as_mut() {
+                        editor.tick();
+                        return Ok(editor.screen());
+                    }
+                }
+                if source == "visible" {
+                    return Ok(self
+                        .screen
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .unwrap_or_else(|| "visible output".to_owned()));
+                }
             }
             if let Some(editor) = self.muse_editor.lock().unwrap().as_mut() {
                 editor.tick();

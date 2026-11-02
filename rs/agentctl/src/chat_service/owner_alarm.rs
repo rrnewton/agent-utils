@@ -106,11 +106,18 @@ impl OwnerAlarm {
     /// The notices due at `now_millis` for the request records `entries`, as a scan read them,
     /// about the agent called `agent`, in the order to post them. Each is counted as posted: one
     /// that fails to post is logged by the caller and not posted again (an alarm still repeats).
+    ///
+    /// `herdr_idle` is Herdr's own report for the pane: when it says idle or done, a request
+    /// whose last attempt read `working` is not waiting on a busy agent but on a status
+    /// disagreement (#734 chat-status-disagreement), so the busy-agent exemption does not
+    /// apply and the notice says so. That disagreement is why the alarm never fired in the
+    /// incident: every held request's reason contained `last status=working`.
     pub(crate) fn due(
         &mut self,
         entries: &[DeliveryEntry],
         agent: &str,
         now_millis: u64,
+        herdr_idle: bool,
     ) -> Vec<String> {
         let mut notices = Vec::new();
         if !std::mem::replace(&mut self.seeded, true) {
@@ -146,7 +153,7 @@ impl OwnerAlarm {
                 )
             })
             .filter(|entry| now_millis.saturating_sub(entry.admitted_at_millis) >= after)
-            .filter(|entry| !waiting_on_busy_agent(entry.reason.as_deref()))
+            .filter(|entry| herdr_idle || !waiting_on_busy_agent(entry.reason.as_deref()))
             .collect();
         if held.is_empty() {
             if self.last_alarm_millis.take().is_some() {
@@ -172,6 +179,15 @@ impl OwnerAlarm {
             .iter()
             .find_map(|entry| entry.reason.as_deref())
             .unwrap_or_default();
+        let reason = if herdr_idle && waiting_on_busy_agent(Some(reason)) {
+            format!(
+                "{reason} (status disagreement: Herdr reports the agent idle/done, \
+                 agentctl's screen status says working)"
+            )
+        } else {
+            reason.to_owned()
+        };
+        let reason = reason.as_str();
         let (count, verb) = if held.len() == 1 {
             ("1 of your messages".to_owned(), "has")
         } else {
@@ -217,8 +233,8 @@ mod tests {
             entry("b", RequestPhase::Submitting, 102, DRAFT),
             entry("c", RequestPhase::Delivered, 90, ""),
         ];
-        assert!(alarm.due(&entries, "coord5", minute(104)).is_empty());
-        let notices = alarm.due(&entries, "coord5", minute(105));
+        assert!(alarm.due(&entries, "coord5", minute(104), false).is_empty());
+        let notices = alarm.due(&entries, "coord5", minute(105), false);
         assert_eq!(notices.len(), 1);
         assert_eq!(
             notices[0],
@@ -229,8 +245,8 @@ mod tests {
              so it is left alone; submit or clear it there, and delivery resumes. This warning \
              repeats every 5 min until they are delivered."
         );
-        assert!(alarm.due(&entries, "coord5", minute(109)).is_empty());
-        let again = alarm.due(&entries, "coord5", minute(110));
+        assert!(alarm.due(&entries, "coord5", minute(109), false).is_empty());
+        let again = alarm.due(&entries, "coord5", minute(110), false);
         assert_eq!(again.len(), 1, "the alarm repeats");
         assert!(again[0].contains(
             "2 of your messages to coord5 have not reached it, the oldest \
@@ -240,10 +256,10 @@ mod tests {
             entry.phase = RequestPhase::Delivered;
         }
         assert_eq!(
-            alarm.due(&entries, "coord5", minute(111)),
+            alarm.due(&entries, "coord5", minute(111), false),
             ["[chat-bridge] Your messages to coord5 are being delivered again."]
         );
-        assert!(alarm.due(&entries, "coord5", minute(130)).is_empty());
+        assert!(alarm.due(&entries, "coord5", minute(130), false).is_empty());
     }
 
     #[test]
@@ -266,11 +282,32 @@ mod tests {
             ),
             entry("c", RequestPhase::Submitting, 0, ""),
         ];
-        assert!(alarm.due(&entries, "coord", 40 * 60_000).is_empty());
+        assert!(alarm.due(&entries, "coord", 40 * 60_000, false).is_empty());
         assert!(waiting_on_busy_agent(None));
         let staged = "pane w1:p2 did not become idle/done within 0s; last status=staged";
         assert!(!waiting_on_busy_agent(Some(staged)));
         assert!(hint("coord", staged).contains("submit or clear it there"));
+    }
+
+    // #734 chat-status-disagreement: the incident's held requests all read `last
+    // status=working`, so the busy-agent exemption silenced the alarm for hours while
+    // Herdr said `done`. When Herdr reports idle/done, that reason alarms, naming the
+    // disagreement.
+    #[test]
+    fn a_working_reason_alarms_when_herdr_reports_idle_or_done() {
+        let mut alarm = OwnerAlarm::new(DEFAULT_AFTER);
+        let entries = [entry(
+            "a",
+            RequestPhase::Pending,
+            0,
+            "request remains pending: pane wJ:pGY did not become idle/done within 0s; \
+             last status=working",
+        )];
+        assert!(alarm.due(&entries, "coord", 40 * 60_000, false).is_empty());
+        let notices = alarm.due(&entries, "coord", 40 * 60_000, true);
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains("status disagreement"), "{notices:?}");
+        assert!(notices[0].contains("last status=working"), "{notices:?}");
     }
 
     #[test]
@@ -278,7 +315,7 @@ mod tests {
         let mut alarm = OwnerAlarm::new(DEFAULT_AFTER);
         let misroute = "pane wJ:pGY: PROBABLE MISROUTE, quarantined: target shows it";
         let mut entries = vec![entry("old", RequestPhase::DeliveryUncertain, 1, misroute)];
-        assert!(alarm.due(&entries, "coord5", 2 * 60_000).is_empty());
+        assert!(alarm.due(&entries, "coord5", 2 * 60_000, false).is_empty());
         entries.push(entry("new", RequestPhase::DeliveryUncertain, 10, misroute));
         entries.push(entry(
             "maybe",
@@ -286,7 +323,7 @@ mod tests {
             10,
             "possibly typed",
         ));
-        let notices = alarm.due(&entries, "coord5", 12 * 60_000);
+        let notices = alarm.due(&entries, "coord5", 12 * 60_000, false);
         assert_eq!(
             notices,
             ["[chat-bridge WARNING] Your message to coord5 sent 2 min ago (\"message new\") was \
@@ -295,6 +332,6 @@ mod tests {
               MISROUTE, quarantined: target shows it. If coord5 does not act on it, send it \
               again."]
         );
-        assert!(alarm.due(&entries, "coord5", 13 * 60_000).is_empty());
+        assert!(alarm.due(&entries, "coord5", 13 * 60_000, false).is_empty());
     }
 }

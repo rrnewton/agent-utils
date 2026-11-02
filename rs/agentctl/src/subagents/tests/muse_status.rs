@@ -271,6 +271,67 @@ fn paused_goal_and_staged_editor_hold_input_until_idle() {
     );
 }
 
+// #734 chat-status-disagreement: the incident pane's viewport was scrolled 1052 rows up, so
+// the visible read held no editor or footer and the status fell through to `working` for
+// hours while Herdr said `done`. The pane's bottom is read instead: an empty editor there
+// is idle and takes the queued prompt; a paused goal drawn with its elapsed duration
+// (`Goal (paused · 1d 17h 40m)`) still holds it.
+#[test]
+fn a_scrolled_viewport_reads_status_and_delivery_from_the_pane_bottom() {
+    let fixture = Fixture::new();
+    let manager = start_muse(&fixture);
+    *fixture.client.status.lock().unwrap() = Some("done".to_owned());
+    *fixture.client.muse_editor.lock().unwrap() = Some(MuseEditor::new("YOLO", true, None));
+    *fixture.client.screen.lock().unwrap() =
+        Some("◆ Context compacted\n\n❯ [from an owner via a bridge]\n  an old prompt\n".to_owned());
+    fixture
+        .client
+        .scrolled
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let status = manager.status("worker").unwrap();
+    assert_eq!(status["agent_status"], "idle", "{status}");
+    assert_eq!(status["herdr_agent_status"], "done", "{status}");
+    let result = manager
+        .send("worker", "typed at the bottom", held())
+        .unwrap();
+    assert_eq!(result.delivered.len(), 1, "{result:?}");
+    assert_eq!(
+        fixture
+            .client
+            .literal_pastes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, text)| text.clone())
+            .collect::<Vec<_>>(),
+        [format!(
+            "{BRACKETED_PASTE_START}typed at the bottom{BRACKETED_PASTE_END}"
+        )]
+    );
+}
+
+#[test]
+fn a_scrolled_viewport_still_holds_input_behind_a_paused_goal_with_a_duration() {
+    let fixture = Fixture::new();
+    let manager = start_muse(&fixture);
+    let footer = "kiki · xhigh · /work · YOLO";
+    let bottom = format!(
+        "old transcript\n{DIVIDER}\n❯\n{DIVIDER}\n{footer}   Goal (paused · 1d 17h 40m) 97% █████████▊\n"
+    );
+    *fixture.client.status.lock().unwrap() = Some("done".to_owned());
+    *fixture.client.screen.lock().unwrap() =
+        Some("◆ Context compacted\n\n❯ [from an owner via a bridge]\n  an old prompt\n".to_owned());
+    *fixture.client.bottom_screen.lock().unwrap() = Some(bottom);
+    let status = manager.status("worker").unwrap();
+    assert_eq!(status["agent_status"], "paused", "{status}");
+    assert_eq!(status["herdr_agent_status"], "done", "{status}");
+    let error = manager
+        .send("worker", "held while paused", held())
+        .unwrap_err();
+    assert!(matches!(error, AgentError::Pending(_)), "{error}");
+    no_input(&fixture);
+}
+
 // New: the process pin is checked again right after the screen read and before the screen is
 // interpreted, as py/agentctl/subagents.py does, so a screen read across a process change is
 // never reported as that screen's state, not even as a trust prompt.

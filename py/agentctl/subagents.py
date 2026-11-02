@@ -39,6 +39,7 @@ from agentctl.client import (
     herdr_error_code,
     muse_effort_word,
     muse_idle_composer,
+    muse_screen_has_composer,
     muse_startup_metadata,
     muse_trust_prompt,
     muse_verified_process_composer,
@@ -1709,7 +1710,7 @@ class _WorkspaceClient:
             if self._uses_muse_composer():
                 self._verify_muse_harness(pane_id)
                 reported_status = info.status
-                screen = self.client.read(pane_id, source="visible", lines=200)
+                screen = self._muse_status_screen(pane_id)
                 self._verify_muse_harness(pane_id)
                 if muse_trust_prompt(screen):
                     raise HerdrUnavailable(
@@ -1742,8 +1743,35 @@ class _WorkspaceClient:
                     session_value=info.session_value,
                     terminal_id=info.terminal_id,
                     tab_id=info.tab_id,
+                    reported_status=reported_status,
                 )
+                if info.status == reported_status:
+                    info = AgentPaneInfo(
+                        pane_id=info.pane_id,
+                        workspace_id=info.workspace_id,
+                        cwd=info.cwd,
+                        agent=info.agent,
+                        status=info.status,
+                        session_agent=info.session_agent,
+                        session_value=info.session_value,
+                        terminal_id=info.terminal_id,
+                        tab_id=info.tab_id,
+                    )
         return info
+
+    def _muse_status_screen(self, pane_id: str) -> str:
+        """The screen a Muse status is read from (#734 chat-status-disagreement): the
+        visible rows, unless they hold no composer frame — a viewport scrolled away
+        from the pane's bottom shows neither editor nor footer. Then the pane's bottom
+        (`recent-unwrapped`) is read instead, and used when it does hold a frame."""
+        visible = self.client.read(pane_id, source="visible", lines=200)
+        if muse_screen_has_composer(visible):
+            return visible
+        try:
+            bottom = self.client.read(pane_id, source="recent-unwrapped", lines=200)
+        except Exception:
+            return visible
+        return bottom if muse_screen_has_composer(bottom) else visible
 
     def _uses_muse_composer(self) -> bool:
         """Foreign Muse retains its ownership class and shares guarded editor input."""
@@ -1882,7 +1910,7 @@ class _WorkspaceClient:
         staged = ""
         while time.monotonic() < deadline:
             self._verify_muse_harness(pane_id)
-            staged = self.client.read(pane_id, source="visible", lines=200)
+            staged = self._muse_status_screen(pane_id)
             self._verify_muse_harness(pane_id)
             if staged != before and muse_verified_process_paste_is_exact_composer(staged, command):
                 break
@@ -1928,7 +1956,7 @@ class _WorkspaceClient:
                     f"(status {info.status})"
                 )
             self._verify_muse_harness(pane_id)
-            before = self.client.read(pane_id, source="visible", lines=200)
+            before = self._muse_status_screen(pane_id)
             self._verify_muse_harness(pane_id)
             if not muse_verified_process_idle_composer(before):
                 raise HerdrUnavailable(
@@ -1969,7 +1997,7 @@ class _WorkspaceClient:
             deadline = time.monotonic() + timeout_ms / 1000
             while time.monotonic() < deadline:
                 self._verify_muse_harness(pane_id)
-                screen = self.client.read(pane_id, source="visible", lines=200)
+                screen = self._muse_status_screen(pane_id)
                 self._verify_muse_harness(pane_id)
                 if (screen != staged
                         and muse_verified_process_prompt_transcript_count(screen, command)
@@ -3931,6 +3959,8 @@ class ManagedAgents:
                 client, self._target(record), self._queue(name),
                 allow_legacy_workspace_binding=True,
             ))
+            if result.get("herdr_agent_status") not in (None, result.get("agent_status")):
+                result["status_disagreement"] = True
             result["probe_error"] = None
         except HerdrRunError as exc:
             result["agent_status"], result["probe_error"] = "unknown", str(exc)
