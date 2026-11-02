@@ -699,6 +699,26 @@ pub fn run_post_argv(
     message_id: &str,
     text: &str,
 ) -> Result<String, String> {
+    run_post_argv_with_timeout(
+        argv_template,
+        channel,
+        thread,
+        message_id,
+        text,
+        POST_TIMEOUT_SECONDS,
+    )
+}
+
+/// [`run_post_argv`] with a caller-chosen timeout (a relay route's
+/// `post_timeout_seconds`).
+pub fn run_post_argv_with_timeout(
+    argv_template: &[String],
+    channel: &str,
+    thread: &str,
+    message_id: &str,
+    text: &str,
+    timeout_seconds: u64,
+) -> Result<String, String> {
     if argv_template.is_empty() {
         return Err("no post argv configured".to_string());
     }
@@ -710,11 +730,9 @@ pub fn run_post_argv(
     let (program, args) = argv
         .split_first()
         .ok_or_else(|| "no post argv configured".to_string())?;
-    let output = std::process::Command::new(program)
-        .args(args)
-        .output()
-        .map_err(|e| format!("post command failed to start: {e}"))?;
+    let output = run_with_timeout(program, args, timeout_seconds);
     let _ = std::fs::remove_file(&text_file);
+    let output = output?;
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     } else {
@@ -724,6 +742,107 @@ pub fn run_post_argv(
             String::from_utf8_lossy(&output.stderr).trim()
         ))
     }
+}
+
+/// Default for how long a post command may run. A chat post is one API
+/// call (live posts take about 2 s); anything slower is hung or waiting
+/// out a rate limit, and a hung post must not stall a `send` (or `pump`,
+/// holding `pump.lock`) behind it. A relay route may raise it with
+/// `post_timeout_seconds` when its helper waits out Slack `retry_after`.
+pub const POST_TIMEOUT_SECONDS: u64 = 10;
+
+/// Run a post command with a timeout, in its own process group. On
+/// timeout the whole GROUP is killed — the helper is normally a shell
+/// that execs another tool, and killing only the shell would leave the
+/// tool running to finish the post anyway. Output goes to temp files,
+/// never pipes: a child (or a grandchild holding the pipes) can then
+/// neither block on a full pipe nor keep the caller waiting for EOF
+/// after it exits. The error on timeout says so (never "failed to
+/// start", so callers classify it as an uncertain post, not a definite
+/// non-delivery).
+fn run_with_timeout(
+    program: &str,
+    args: &[String],
+    timeout_seconds: u64,
+) -> Result<std::process::Output, String> {
+    use std::os::unix::process::CommandExt;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let stamp = format!(
+        "agent-teams-post-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    );
+    // Temp files live in the per-process relay dir, created new with
+    // owner-only permissions: a failure to create one means the post
+    // never started, a definite non-delivery, and says so.
+    let dir = std::env::temp_dir().join(format!("agent-teams-relay-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("post command failed to start: {e}"))?;
+    let out_path = dir.join(format!("{stamp}.out"));
+    let err_path = dir.join(format!("{stamp}.err"));
+    let temp_file = |path: &std::path::Path| -> Result<std::fs::File, String> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options
+            .open(path)
+            .map_err(|e| format!("post command failed to start: {e}"))
+    };
+    let out_file = temp_file(&out_path)?;
+    let err_file = match temp_file(&err_path) {
+        Ok(file) => file,
+        Err(error) => {
+            let _ = std::fs::remove_file(&out_path);
+            return Err(error);
+        }
+    };
+    let spawned = std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(out_file)
+        .stderr(err_file)
+        .process_group(0)
+        .spawn();
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(e) => {
+            let _ = std::fs::remove_file(&out_path);
+            let _ = std::fs::remove_file(&err_path);
+            return Err(format!("post command failed to start: {e}"));
+        }
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Ok(None) => {
+                // Kill the process group (negative PID), not just the shell.
+                unsafe {
+                    libc::kill(-(child.id() as i32), libc::SIGKILL);
+                }
+                break child
+                    .wait()
+                    .map_err(|e| e.to_string())
+                    .and_then(|_| Err(format!("post command timed out after {timeout_seconds}s")));
+            }
+            Err(e) => break Err(e.to_string()),
+        }
+    };
+    let stdout = std::fs::read(&out_path).unwrap_or_default();
+    let stderr = std::fs::read(&err_path).unwrap_or_default();
+    let _ = std::fs::remove_file(&out_path);
+    let _ = std::fs::remove_file(&err_path);
+    Ok(std::process::Output {
+        status: status?,
+        stdout,
+        stderr,
+    })
 }
 
 /// The integrity hash of an announcement's canonical fields.
@@ -1417,7 +1536,21 @@ fn relay_deliver(
         .state
         .clone()
         .unwrap_or_else(|| answer.outcome.clone());
-    let mut out = receipt_for(&state_name, &answer.detail);
+    // A duplicate copy — a mirror post (#782) or a replay of a message
+    // already delivered directly — is absorbed quietly: the receipt
+    // keeps the recorded state (`delivered`, `accepted`, ...) and says
+    // `<state> already`, so the owner watching the thread sees one
+    // delivery, never a second one and never a stranger alarm.
+    let detail = if answer.outcome == "known" {
+        log_event(
+            state,
+            &json!({"event": "relay-in", "outcome": "duplicate-known", "route": route, "id": id, "state": state_name}),
+        );
+        format!("{state_name} already; duplicate copy not delivered again")
+    } else {
+        answer.detail.clone()
+    };
+    let mut out = receipt_for(&state_name, &detail);
     out.outcome = answer.outcome.clone();
     Ok(post_receipt(state, entry, channel, thread, id, out))
 }

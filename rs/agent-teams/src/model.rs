@@ -61,6 +61,11 @@ pub struct Entry {
     pub coordinator: Option<String>,
     /// Ordered contacts.
     pub contacts: Vec<Contact>,
+    /// This entry's own ordered route names, when it carries one (#770
+    /// agent-teams-relay-fallback-route). Overrides the team's and the
+    /// host's lists, so a relay route can be a fallback for one team on
+    /// one host without routing every team on that host over it.
+    pub routes: Option<Vec<String>>,
 }
 
 /// One team in `teams.json`.
@@ -74,6 +79,9 @@ pub struct Team {
     pub primary: Option<String>,
     /// Entries, in file order.
     pub entries: Vec<Entry>,
+    /// This team's own ordered route names, when it carries one (#770).
+    /// Applies to every entry of the team; an entry's list wins over it.
+    pub routes: Option<Vec<String>>,
     /// Last human or `discover --apply` confirmation (raw object).
     pub reviewed: Option<Value>,
 }
@@ -114,8 +122,9 @@ const TEAM_KNOWN: &[&str] = &[
     "entries",
     "policy_hint",
     "reviewed",
+    "routes",
 ];
-const ENTRY_KNOWN: &[&str] = &["host", "coordinator", "contacts"];
+const ENTRY_KNOWN: &[&str] = &["host", "coordinator", "contacts", "routes"];
 const CONTACT_KNOWN: &[&str] = &["kind", "route", "session"];
 
 /// Load and validate a `teams.json`.
@@ -229,6 +238,11 @@ pub fn parse_teams(raw: Value, path: &Path) -> DataResult<TeamsFile> {
                             .and_then(Value::as_str)
                             .map(str::to_string),
                         contacts,
+                        routes: routes_field(
+                            entry_obj.get("routes"),
+                            &mut warnings,
+                            &format!("team {name} entry"),
+                        ),
                     });
                 }
             }
@@ -245,6 +259,11 @@ pub fn parse_teams(raw: Value, path: &Path) -> DataResult<TeamsFile> {
                         .and_then(Value::as_str)
                         .map(str::to_string),
                     entries,
+                    routes: routes_field(
+                        team_obj.get("routes"),
+                        &mut warnings,
+                        &format!("team {name}"),
+                    ),
                     reviewed: team_obj.get("reviewed").cloned(),
                 },
             );
@@ -262,6 +281,36 @@ pub fn parse_teams(raw: Value, path: &Path) -> DataResult<TeamsFile> {
         hubs,
         warnings,
     })
+}
+
+/// A `routes` field: present-but-not-a-list warns instead of silently
+/// becoming an empty list (which would strand the team with no routes).
+fn routes_field(
+    value: Option<&Value>,
+    warnings: &mut Vec<String>,
+    what: &str,
+) -> Option<Vec<String>> {
+    match value {
+        None => None,
+        Some(Value::Array(_)) => Some(string_list(value)),
+        Some(_) => {
+            warnings.push(format!("{what}: \"routes\" is not a list; ignoring it"));
+            None
+        }
+    }
+}
+
+/// The ordered route names for one entry (#770): the entry's own list
+/// wins, then its team's, then the host's. Older files carry neither, so
+/// they keep today's host-wide behaviour unchanged.
+pub fn effective_route_names(host: &Host, team: Option<&Team>, entry: &Entry) -> Vec<String> {
+    if let Some(routes) = &entry.routes {
+        return routes.clone();
+    }
+    if let Some(routes) = team.and_then(|team| team.routes.as_ref()) {
+        return routes.clone();
+    }
+    host.routes.clone()
 }
 
 fn string_list(value: Option<&Value>) -> Vec<String> {
@@ -742,5 +791,37 @@ mod tests {
             .expect("pick primary");
         assert_eq!(entry.host, "host-b");
         assert_eq!(entry.contacts.len(), 2);
+    }
+
+    #[test]
+    fn per_team_and_per_entry_routes_override_the_host_list() {
+        let raw = json!({
+            "schema": "agent-teams-teams/v1",
+            "hosts": {"host-a": {"routes": ["local", "ssh-a"]}},
+            "teams": {
+                "tools": {"routes": ["local", "relay-coord"], "entries": [
+                    {"host": "host-a", "contacts": [{"kind": "host"}]},
+                    {"host": "host-a", "routes": ["ssh-a"], "contacts": [{"kind": "host"}]}
+                ]},
+                "sim": {"entries": [{"host": "host-a", "contacts": [{"kind": "host"}]}]}
+            }
+        });
+        let parsed = parse_teams(raw, Path::new("teams.json")).expect("parse");
+        let host = &parsed.hosts["host-a"];
+        let tools = &parsed.teams["tools"];
+        assert_eq!(
+            effective_route_names(host, Some(tools), &tools.entries[0]),
+            ["local", "relay-coord"]
+        );
+        assert_eq!(
+            effective_route_names(host, Some(tools), &tools.entries[1]),
+            ["ssh-a"]
+        );
+        let sim = &parsed.teams["sim"];
+        assert_eq!(
+            effective_route_names(host, Some(sim), &sim.entries[0]),
+            ["local", "ssh-a"]
+        );
+        assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
     }
 }

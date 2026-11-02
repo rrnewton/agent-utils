@@ -7,12 +7,13 @@
       "mode": "relay",
       "channel": "C0RELAY0000",
       "sender_id": "U0YOURBOT01",
-      "comment": "sender_id is the bot user this host posts as. post_argv posts one post from {text_file}; list_argv lists channel/thread posts so receipts in the thread can be read back. Bodies are visible to every channel member; --private messages never take this route.",
+      "comment": "sender_id is the bot user this host posts as. post_argv posts one post from {text_file}; list_argv lists channel/thread posts so receipts in the thread can be read back. Bodies are visible to every channel member; --private messages never take this route. Set mirror true to also post a copy of every message delivered over a direct route (same envelope, same ID) for relay-enabled teams; --private is never mirrored.",
       "post_argv": ["/usr/local/bin/example-chat-helper", "post", "--channel", "{channel}", "--text-file", "{text_file}"],
       "list_argv": ["/usr/local/bin/example-chat-helper", "list", "--channel", "{channel}", "--message-id", "{message_id}"],
       "max_envelope_bytes": 10000,
-      "limits": {"per_hour": 6},
-      "visible_to_owner": true
+      "limits": {"per_hour": 6, "mirror_per_hour": 60},
+      "visible_to_owner": true,
+      "mirror": false
     }
   }
 }

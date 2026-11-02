@@ -537,3 +537,68 @@ fn a_second_pump_on_the_same_state_does_nothing() {
     assert_eq!(code, 0, "{out}");
     assert!(out.contains("nothing to do"), "{out}");
 }
+
+/// #770: replies carry at least 24h by default (they were the messages
+/// expiring while a route was down); ordinary sends keep the 2h default.
+#[test]
+fn reply_envelope_gets_a_longer_default_ttl() {
+    let world = World::new();
+    world.init_both();
+    let (code, out, err) = world.run(&[
+        "send",
+        "tools",
+        "--from-team",
+        "sim",
+        "--text",
+        "Question?",
+        "--key",
+        "ttl-q",
+        "--json",
+    ]);
+    assert_eq!(code, 75, "{out} {err}");
+    let value: serde_json::Value = serde_json::from_str(&out).expect("send json");
+    let id = value["id"].as_str().expect("id").to_string();
+    let ttl_seconds = |world: &World, id: &str| -> i64 {
+        let text = std::fs::read_to_string(world.state.join("outbox").join(format!("{id}.json")))
+            .expect("outbox");
+        let entry: serde_json::Value = serde_json::from_str(&text).expect("outbox json");
+        let env = &entry["envelope"];
+        let created =
+            agent_teams::timeutil::parse_rfc3339_ms(env["created_at"].as_str().unwrap()).unwrap();
+        let not_after =
+            agent_teams::timeutil::parse_rfc3339_ms(env["not_after"].as_str().unwrap()).unwrap();
+        (not_after - created) / 1000
+    };
+    assert!(
+        ttl_seconds(&world, &id) <= 7200,
+        "ordinary send keeps short TTL"
+    );
+    let (code, out, err) = world.run(&[
+        "reply",
+        &id,
+        "--from-team",
+        "tools",
+        "--text",
+        "Answer.",
+        "--json",
+    ]);
+    assert!(code == 75 || code == 0, "reply: {code} {out} {err}");
+    // The reply's outbox entry is the one whose envelope kind is reply.
+    let mut reply_ttl = None;
+    for entry in std::fs::read_dir(world.state.join("outbox"))
+        .expect("outbox dir")
+        .flatten()
+    {
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(entry.path()).expect("read"))
+                .expect("json");
+        if value["envelope"]["kind"] == "reply" {
+            let rid = value["id"].as_str().unwrap().to_string();
+            reply_ttl = Some(ttl_seconds(&world, &rid));
+        }
+    }
+    assert!(
+        reply_ttl.is_some_and(|s| s >= 86_400),
+        "reply TTL >= 24h: {reply_ttl:?}"
+    );
+}

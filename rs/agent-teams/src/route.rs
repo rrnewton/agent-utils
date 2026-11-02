@@ -31,6 +31,29 @@ pub trait Route {
     fn exposes_body(&self) -> bool {
         false
     }
+    /// Whether this is a chat relay route (the fallback, never first).
+    fn is_relay(&self) -> bool {
+        false
+    }
+    /// Whether this relay route also mirrors direct deliveries (#782
+    /// agent-teams-relay-mirror): a copy of each envelope delivered over
+    /// a direct route is posted through it, under the same ID.
+    fn is_mirror(&self) -> bool {
+        false
+    }
+    /// Why a mirror post through this route would not be attempted, if it
+    /// would not. Mirror posts draw on their own allowance, never the
+    /// delivery allowance: mirroring must not starve a real fallback.
+    fn mirror_skip_reason(&self, envelope_bytes: usize) -> Option<String> {
+        self.skip_reason(envelope_bytes)
+    }
+    /// Post the mirror copy of an already-delivered envelope. The
+    /// default is an ordinary `accept`; relay routes keep mirror posts
+    /// in their own posted set and rate file, so a mirror can never make
+    /// a later fallback answer ambiguous.
+    fn run_mirror(&self, envelope: &Value) -> AttemptOutcome {
+        self.run_verb("accept", envelope)
+    }
     /// A definite skip reason known before attempting (link down, too large).
     fn skip_reason(&self, _envelope_bytes: usize) -> Option<String> {
         None
@@ -496,16 +519,64 @@ pub struct ChatRelayRoute {
     /// Durable posted-ID file, so a restart does not repost and draw a
     /// duplicate `accepted` receipt cycle.
     pub posted_file: PathBuf,
+    /// Mirror direct deliveries through this route (`"mirror": true` in
+    /// the route definition; #782 agent-teams-relay-mirror).
+    pub mirror: bool,
+    /// Seconds a post command may run (`post_timeout_seconds`,
+    /// default 10; raise it when the helper waits out rate limits).
+    pub post_timeout_seconds: u64,
+    /// Mirror posts an hour (`limits.mirror_per_hour`, default 60),
+    /// counted in `mirror_rate_file` only: a mirror never spends the
+    /// delivery allowance a fallback needs.
+    pub mirror_per_hour: u32,
+    /// Timestamps of this route's mirror posts, one per line.
+    pub mirror_rate_file: PathBuf,
+    /// Durable mirror-posted-ID file, kept apart from `posted_file`: a
+    /// mirror-posted ID must not make a later fallback post ambiguous.
+    pub mirror_posted_file: PathBuf,
+    mirror_posted: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl ChatRelayRoute {
     fn recent_posts(&self) -> u64 {
+        Self::recent_in(&self.rate_file)
+    }
+    fn recent_mirror_posts(&self) -> u64 {
+        Self::recent_in(&self.mirror_rate_file)
+    }
+    fn recent_in(file: &std::path::Path) -> u64 {
         let now = crate::timeutil::now_unix_ms();
-        let text = std::fs::read_to_string(&self.rate_file).unwrap_or_default();
+        let text = std::fs::read_to_string(file).unwrap_or_default();
         text.lines()
             .filter_map(|line| line.trim().parse::<i64>().ok())
             .filter(|at| now - at < 3_600_000)
             .count() as u64
+    }
+    fn note_mirror_posted_id(&self, id: &str) {
+        let mut posted = self.mirror_posted.lock().unwrap_or_else(|p| p.into_inner());
+        posted.insert(id.to_string());
+        if let Some(parent) = self.mirror_posted_file.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let mut ids: Vec<String> = posted.iter().cloned().collect();
+        ids.sort();
+        if ids.len() > 4096 {
+            let excess = ids.len() - 4096;
+            ids.drain(0..excess);
+        }
+        let temp = self.mirror_posted_file.with_extension("tmp");
+        if std::fs::write(&temp, ids.join("\n")).is_ok() {
+            let _ = std::fs::rename(&temp, &self.mirror_posted_file);
+        }
+    }
+    fn note_mirror_post(&self) {
+        let now = crate::timeutil::now_unix_ms();
+        if let Some(parent) = self.mirror_rate_file.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let mut text = std::fs::read_to_string(&self.mirror_rate_file).unwrap_or_default();
+        text.push_str(&format!("{now}\n"));
+        let _ = std::fs::write(&self.mirror_rate_file, text);
     }
     fn note_posted_id(&self, id: &str) {
         // Hold the mutex across the file update, and write through a
@@ -537,7 +608,14 @@ impl ChatRelayRoute {
     }
     /// Post arbitrary relay text (announcements) through this route.
     pub fn post_text(&self, text: &str) -> Result<String, String> {
-        crate::relay::run_post_argv(&self.post_argv, &self.channel, "", "", text)
+        crate::relay::run_post_argv_with_timeout(
+            &self.post_argv,
+            &self.channel,
+            "",
+            "",
+            text,
+            self.post_timeout_seconds,
+        )
     }
 }
 
@@ -547,6 +625,73 @@ impl Route for ChatRelayRoute {
     }
     fn exposes_body(&self) -> bool {
         true
+    }
+    fn is_relay(&self) -> bool {
+        true
+    }
+    fn is_mirror(&self) -> bool {
+        self.mirror
+    }
+    fn mirror_skip_reason(&self, envelope_bytes: usize) -> Option<String> {
+        if let Some(max) = self.max_envelope_bytes {
+            if envelope_bytes > max {
+                return Some(format!(
+                    "envelope of {envelope_bytes} bytes over relay limit {max} (one post per envelope)"
+                ));
+            }
+        }
+        if self.mirror_per_hour > 0 && self.recent_mirror_posts() >= u64::from(self.mirror_per_hour)
+        {
+            return Some(format!(
+                "mirror rate limit ({} posts/hour) reached",
+                self.mirror_per_hour
+            ));
+        }
+        None
+    }
+    fn run_mirror(&self, envelope: &Value) -> AttemptOutcome {
+        let id = envelope
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        {
+            let posted = self.mirror_posted.lock().unwrap_or_else(|p| p.into_inner());
+            if posted.contains(&id) {
+                return AttemptOutcome::Answered(json!({
+                    "outcome": "posted", "state": "already-mirror-posted",
+                    "detail": "mirror copy already posted for this ID",
+                }));
+            }
+        }
+        let text = crate::relay::render_post(envelope);
+        match crate::relay::run_post_argv_with_timeout(
+            &self.post_argv,
+            &self.channel,
+            "",
+            &id,
+            &text,
+            self.post_timeout_seconds,
+        ) {
+            Ok(_) => {
+                self.note_mirror_posted_id(&id);
+                self.note_mirror_post();
+                AttemptOutcome::Answered(json!({
+                    "outcome": "posted", "state": "in-custody",
+                    "detail": "mirror copy posted to the relay channel",
+                }))
+            }
+            Err(reason) if reason.contains("failed to start") => {
+                AttemptOutcome::NotDelivered(reason)
+            }
+            Err(reason) => {
+                // An uncertain mirror post is noted in the mirror set
+                // only: the delivery posted set stays clean, so a later
+                // fallback posts for real instead of going ambiguous.
+                self.note_mirror_posted_id(&id);
+                AttemptOutcome::Ambiguous(reason)
+            }
+        }
     }
     fn skip_reason(&self, envelope_bytes: usize) -> Option<String> {
         if let Some(max) = self.max_envelope_bytes {
@@ -581,7 +726,14 @@ impl Route for ChatRelayRoute {
                     }
                 }
                 let text = crate::relay::render_post(payload);
-                match crate::relay::run_post_argv(&self.post_argv, &self.channel, "", &id, &text) {
+                match crate::relay::run_post_argv_with_timeout(
+                    &self.post_argv,
+                    &self.channel,
+                    "",
+                    &id,
+                    &text,
+                    self.post_timeout_seconds,
+                ) {
                     Ok(_) => {
                         self.note_posted_id(&id);
                         self.note_post();
@@ -645,6 +797,16 @@ pub fn relay_route_for(
         .lines()
         .map(str::to_string)
         .collect();
+    let mirror_base = links_dir
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| links_dir.to_path_buf());
+    let mirror_persisted: std::collections::HashSet<String> =
+        std::fs::read_to_string(mirror_base.join(format!("relay-{}-mirror-posted.txt", def.name)))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect();
     ChatRelayRoute {
         name: def.name.clone(),
         channel: def
@@ -674,12 +836,40 @@ pub fn relay_route_for(
             .join(format!("relay-{}.log", def.name)),
         posted_file,
         posted: std::sync::Mutex::new(persisted),
+        mirror: def
+            .raw
+            .get("mirror")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        post_timeout_seconds: def
+            .raw
+            .get("post_timeout_seconds")
+            .and_then(Value::as_u64)
+            .filter(|seconds| *seconds > 0)
+            .unwrap_or(crate::relay::POST_TIMEOUT_SECONDS),
+        mirror_per_hour: def
+            .raw
+            .get("limits")
+            .and_then(|l| l.get("mirror_per_hour"))
+            .and_then(Value::as_u64)
+            .map(|n| n as u32)
+            .unwrap_or(60),
+        mirror_rate_file: mirror_base.join(format!("relay-{}-mirror.log", def.name)),
+        mirror_posted_file: mirror_base.join(format!("relay-{}-mirror-posted.txt", def.name)),
+        mirror_posted: std::sync::Mutex::new(mirror_persisted),
     }
 }
 
 /// Whether a route definition is a chat relay route.
 pub fn is_relay_def(def: &crate::model::RouteDef) -> bool {
     def.driver == "command" && def.raw.get("mode").and_then(Value::as_str) == Some("relay")
+}
+
+/// Whether a route definition mirrors direct deliveries (#782): a relay
+/// route definition carrying `"mirror": true`. Only relay routes mirror;
+/// the flag on any other driver is ignored.
+pub fn mirror_enabled(def: &crate::model::RouteDef) -> bool {
+    is_relay_def(def) && def.raw.get("mirror").and_then(Value::as_bool) == Some(true)
 }
 
 /// Build a route object from its definition.
@@ -788,6 +978,29 @@ mod tests {
         let data = b"accept\n99\n{\"short\"";
         let mut reader = BufReader::new(data.as_slice());
         assert!(read_frame(&mut reader).is_none());
+    }
+
+    #[test]
+    fn mirror_flag_only_on_relay_defs() {
+        let def = |raw: Value| crate::model::RouteDef {
+            name: "relay-coord".to_string(),
+            driver: "command".to_string(),
+            raw,
+            source: PathBuf::from("relay.json"),
+        };
+        assert!(mirror_enabled(&def(
+            json!({"mode": "relay", "mirror": true})
+        )));
+        assert!(!mirror_enabled(&def(json!({"mode": "relay"}))));
+        assert!(!mirror_enabled(&def(
+            json!({"mode": "host", "mirror": true})
+        )));
+        let route = relay_route_for(
+            &def(json!({"mode": "relay", "mirror": true, "post_argv": ["x"]})),
+            PathBuf::from("/tmp").as_path(),
+        );
+        assert!(route.is_relay());
+        assert!(route.is_mirror());
     }
 
     #[test]

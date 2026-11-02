@@ -200,6 +200,7 @@ fn run_seed(seed: u64) {
         host: "host-a".into(),
         coordinator: None,
         contacts: vec![Contact::Host],
+        routes: None,
     };
     let host = Host {
         name: "host-a".into(),
@@ -222,7 +223,7 @@ fn run_seed(seed: u64) {
     // Pump several times, as timers would; stop at a terminal state.
     let mut final_state = String::new();
     for _ in 0..6 {
-        let result = walk(&state, &mut entry, &team_entry, &host, &routes).expect("walk");
+        let result = walk(&state, &mut entry, &team_entry, &host, &routes, &[]).expect("walk");
         final_state = result.state.clone();
         // Invariant: at most one paste per ID, checked after every step.
         let pastes = paste_count(&state, "tools", &id);
@@ -317,6 +318,7 @@ fn lost_answer_then_retry_pastes_once() {
         host: "host-a".into(),
         coordinator: None,
         contacts: vec![Contact::Host],
+        routes: None,
     };
     let host = Host {
         name: "host-a".into(),
@@ -332,7 +334,7 @@ fn lost_answer_then_retry_pastes_once() {
         history: Mutex::new(Vec::new()),
         forced: Some(Fault::AnswerLost),
     })];
-    let result = walk(&state, &mut entry, &team_entry, &host, &routes).expect("walk");
+    let result = walk(&state, &mut entry, &team_entry, &host, &routes, &[]).expect("walk");
     assert_eq!(
         result.state, "accepted",
         "the receipt settles a lost answer"
@@ -711,6 +713,7 @@ fn local_route_is_skipped_for_another_host() {
         host: "host-a".into(),
         coordinator: None,
         contacts: vec![Contact::Host],
+        routes: None,
     };
     let host = Host {
         name: "host-a".into(),
@@ -736,7 +739,7 @@ fn local_route_is_skipped_for_another_host() {
             state: state.clone(),
         }),
     ];
-    let result = walk(&state, &mut entry, &team_entry, &host, &routes).expect("walk");
+    let result = walk(&state, &mut entry, &team_entry, &host, &routes, &[]).expect("walk");
     assert_eq!(result.state, "accepted", "{result:?}");
     assert_eq!(paste_count(&state, "tools", &id), 1);
     let attempts = entry["attempts"].as_array().expect("attempts");
@@ -825,6 +828,7 @@ fn receipt_ask_never_consults_skipped_routes() {
         host: "host-a".into(),
         coordinator: None,
         contacts: vec![Contact::Host],
+        routes: None,
     };
     let host = Host {
         name: "host-a".into(),
@@ -843,7 +847,7 @@ fn receipt_ask_never_consults_skipped_routes() {
             forced: Some(Fault::AnswerLost),
         }),
     ];
-    let result = walk(&state, &mut entry, &team_entry, &host, &routes).expect("walk");
+    let result = walk(&state, &mut entry, &team_entry, &host, &routes, &[]).expect("walk");
     assert_eq!(result.state, "accepted");
     assert_eq!(paste_count(&state, "tools", &id), 1);
     let attempts = entry["attempts"].as_array().expect("attempts");

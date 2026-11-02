@@ -63,7 +63,8 @@ impl World {
   "hosts": {"host-a": {"routes": ["relay-coord"], "agent_teams": "agent-teams"}},
   "teams": {
     "tools": {"primary": "host-a", "entries": [{"host": "host-a", "contacts": [{"kind": "host"}]}]},
-    "sim": {"primary": "host-a", "entries": [{"host": "host-a", "contacts": [{"kind": "host"}]}]}
+    "sim": {"primary": "host-a", "entries": [{"host": "host-a", "contacts": [{"kind": "host"}]}]},
+    "plain": {"primary": "host-a", "entries": [{"host": "host-a", "contacts": [{"kind": "host"}]}]}
   }
 }
 "#;
@@ -149,6 +150,8 @@ impl World {
             "hook-inbox",
             "--accepts-from",
             "tools",
+            "--relay",
+            "relay-coord:CCHAN123456:UBOTTOOLS=tools@host-a",
         ]);
         assert_eq!(code, 0, "init sim: {out} {err}");
     }
@@ -1130,4 +1133,688 @@ fn relay_undeliverable_target_answers_a_deferred_receipt_the_sender_records() {
             .is_some_and(|reason| reason.contains("archived")),
         "{out}"
     );
+}
+
+// --- #782 agent-teams-relay-mirror / #770 agent-teams-relay-fallback-route ---
+
+impl World {
+    fn write_teams(&self, teams: &str) {
+        std::fs::write(self.config.join("agent-teams/teams.json"), teams).expect("teams rewrite");
+    }
+    fn write_relay_route(&self, mirror: bool, post_program: &str) {
+        let list = self.root.join("bin/list.sh");
+        let routes = format!(
+            r#"{{"schema": "agent-teams-routes/v1", "routes": {{"relay-coord": {{"driver": "command", "mode": "relay", "channel": "{CHAN}", "sender_id": "UBOTTOOLS", "mirror": {mirror}, "post_argv": ["{post_program}", "post", "--channel", "{{channel}}", "--text-file", "{{text_file}}"], "list_argv": ["{}", "list", "--channel", "{{channel}}"], "max_envelope_bytes": 10000, "limits": {{"per_hour": 100}}}}}}}}"#,
+            list.display()
+        );
+        std::fs::write(self.config.join("agent-teams/routes.d/relay.json"), routes)
+            .expect("routes rewrite");
+    }
+    fn ensure_signing_key(&self, team: &str) -> String {
+        agent_teams::relay::ensure_signing_key(&self.state, team, "host-a")
+            .expect("signing key")
+            .1
+    }
+    fn outbox(&self, id: &str) -> serde_json::Value {
+        let text = std::fs::read_to_string(self.state.join("outbox").join(format!("{id}.json")))
+            .expect("outbox entry");
+        serde_json::from_str(&text).expect("outbox json")
+    }
+    fn mirror_attempts(&self, id: &str) -> Vec<serde_json::Value> {
+        self.outbox(id)["attempts"]
+            .as_array()
+            .expect("attempts")
+            .iter()
+            .filter(|a| a["verb"] == "mirror")
+            .cloned()
+            .collect()
+    }
+    fn copies_of(&self, team: &str, id: &str) -> usize {
+        let dir = self.state.join("teams.d").join(team).join("hook-inbox");
+        [dir.clone(), dir.join("claimed")]
+            .iter()
+            .filter(|d| d.join(format!("{id}.json")).exists())
+            .count()
+    }
+}
+
+const MIRROR_TEAMS_LOCAL: &str = r#"{
+  "schema": "agent-teams-teams/v1",
+  "hosts": {"host-a": {"routes": ["local"], "agent_teams": "agent-teams"}},
+  "teams": {
+    "tools": {"primary": "host-a", "entries": [{"host": "host-a", "contacts": [{"kind": "host"}]}]},
+    "sim": {"primary": "host-a", "entries": [{"host": "host-a", "contacts": [{"kind": "host"}]}]},
+    "plain": {"primary": "host-a", "entries": [{"host": "host-a", "contacts": [{"kind": "host"}]}]}
+  }
+}
+"#;
+
+#[test]
+fn mirror_after_direct_delivery_posts_copy_and_receiver_dedups_quietly() {
+    let world = World::new();
+    world.write_teams(MIRROR_TEAMS_LOCAL);
+    let post = world.root.join("bin/post.sh");
+    world.write_relay_route(true, &post.to_string_lossy());
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    let public = world.ensure_signing_key("sim");
+    agent_teams::relay::trust_key(&world.state, "sim", "host-a", &public, "test").expect("trust");
+    let (code, out, err) = world.run(&[
+        "send",
+        "tools@host-a",
+        "--from-team",
+        "sim",
+        "--text",
+        "Mirror me please.",
+        "--key",
+        "mirror-1",
+        "--json",
+    ]);
+    assert_eq!(code, 75, "direct accepted: {out} {err}");
+    let value: serde_json::Value = serde_json::from_str(&out).expect("send json");
+    assert_eq!(value["state"], "accepted", "{out}");
+    let id = value["id"].as_str().expect("id").to_string();
+    // One direct delivery, plus exactly one mirror post of the same envelope.
+    assert_eq!(world.hook_inbox_texts("tools").len(), 1);
+    let posts = world.channel_posts();
+    assert_eq!(posts.len(), 1, "one mirror post: {posts:?}");
+    assert!(posts[0].contains("Mirror me please."), "{}", posts[0]);
+    assert!(posts[0].contains(&id), "same ID: {}", posts[0]);
+    let attempts = world.mirror_attempts(&id);
+    assert_eq!(attempts.len(), 1, "{attempts:?}");
+    assert_eq!(
+        attempts[0]["classification"], "mirror-posted",
+        "{attempts:?}"
+    );
+    // Deliver locally (hook twice: presented, then delivered).
+    let _ = world.run(&["hook", "--team", "tools"]);
+    let _ = world.run(&["hook", "--team", "tools"]);
+    let (_, out, _) = world.run(&["seen", &id]);
+    assert!(out.contains("delivered"), "ledger delivered: {out}");
+    // The mirror copy now arrives through relay-in: exactly one delivery,
+    // no quarantine or stranger alarm, and a quiet delivered receipt.
+    let outcome = world.relay_in(BOT1, &posts[0]);
+    assert_eq!(outcome["outcome"], "known", "{outcome}");
+    let receipt = outcome["receipt_text"].as_str().expect("receipt");
+    assert!(receipt.contains("receipt: delivered"), "{receipt}");
+    assert!(receipt.contains("delivered already"), "{receipt}");
+    assert_eq!(world.copies_of("tools", &id), 1, "exactly once");
+    assert!(agent_teams::relay::quarantined_posts(&world.state).is_empty());
+    let (_, out, _) = world.run(&["relay", "alarms"]);
+    assert!(out.contains("no open stranger alarms"), "{out}");
+
+    // Replies are mirrored like sends (#782): give sim a relay channel,
+    // then tools' reply to sim is delivered directly and mirrored too.
+    let pid = std::process::id().to_string();
+    let (code, out, err) = world.run(&[
+        "init",
+        "sim",
+        "--coordinator-self",
+        "--coordinator-pid",
+        &pid,
+        "--deliver",
+        "hook-inbox",
+        "--accepts-from",
+        "tools",
+        "--relay",
+        &format!("relay-coord:{CHAN}:{BOT1}=tools@host-a"),
+    ]);
+    assert_eq!(code, 0, "init sim relay: {out} {err}");
+    world.ensure_signing_key("tools");
+    let (code, out, err) = world.run(&[
+        "reply",
+        &id,
+        "--from-team",
+        "tools",
+        "--text",
+        "Reply mirrored too.",
+    ]);
+    assert!(code == 75 || code == 0, "reply: {code} {out} {err}");
+    assert_eq!(
+        world.hook_inbox_texts("sim").len(),
+        1,
+        "reply delivered: {out}"
+    );
+    assert_eq!(
+        world.channel_posts().len(),
+        2,
+        "reply mirrored: {:?}",
+        world.channel_posts()
+    );
+    assert!(world.channel_posts()[1].contains("Reply mirrored too."));
+}
+
+#[test]
+fn mirror_skips_private_and_teams_without_relay_channels() {
+    let world = World::new();
+    world.write_teams(MIRROR_TEAMS_LOCAL);
+    let post = world.root.join("bin/post.sh");
+    world.write_relay_route(true, &post.to_string_lossy());
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    world.ensure_signing_key("sim");
+    world.ensure_signing_key("tools");
+    let pid = std::process::id().to_string();
+    let (code, out, err) = world.run(&[
+        "init",
+        "plain",
+        "--coordinator-self",
+        "--coordinator-pid",
+        &pid,
+        "--deliver",
+        "hook-inbox",
+        "--accepts-from",
+        "tools",
+    ]);
+    assert_eq!(code, 0, "init plain: {out} {err}");
+    // --private never mirrors (the relay exposes the body).
+    let (code, out, err) = world.run(&[
+        "send",
+        "tools@host-a",
+        "--from-team",
+        "sim",
+        "--text",
+        "secret mirror",
+        "--key",
+        "mirror-private",
+        "--private",
+        "--json",
+    ]);
+    assert_eq!(code, 75, "{out} {err}");
+    assert_eq!(world.hook_inbox_texts("tools").len(), 1);
+    assert!(world.channel_posts().is_empty(), "no mirror for --private");
+    // plain declares no relay_channels for relay-coord: no mirror to it.
+    let (code, out, err) = world.run(&[
+        "send",
+        "plain@host-a",
+        "--from-team",
+        "tools",
+        "--text",
+        "no relay team",
+        "--key",
+        "mirror-norelay",
+        "--json",
+    ]);
+    assert_eq!(code, 75, "{out} {err}");
+    assert_eq!(world.hook_inbox_texts("plain").len(), 1);
+    assert!(
+        world.channel_posts().is_empty(),
+        "no mirror without relay_channels"
+    );
+}
+
+#[test]
+fn mirror_failure_never_changes_delivery_and_pump_never_retries_it() {
+    let world = World::new();
+    world.write_teams(MIRROR_TEAMS_LOCAL);
+    world.write_relay_route(true, "/nonexistent/relay-post");
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    world.ensure_signing_key("sim");
+    let (code, out, err) = world.run(&[
+        "send",
+        "tools@host-a",
+        "--from-team",
+        "sim",
+        "--text",
+        "Mirror will fail.",
+        "--key",
+        "mirror-fail",
+        "--json",
+    ]);
+    assert_eq!(code, 75, "state unchanged by mirror failure: {out} {err}");
+    let value: serde_json::Value = serde_json::from_str(&out).expect("send json");
+    assert_eq!(value["state"], "accepted", "{out}");
+    let id = value["id"].as_str().expect("id").to_string();
+    assert_eq!(world.hook_inbox_texts("tools").len(), 1);
+    let attempts = world.mirror_attempts(&id);
+    assert_eq!(attempts.len(), 1, "{attempts:?}");
+    assert_eq!(
+        attempts[0]["classification"], "mirror-failed",
+        "{attempts:?}"
+    );
+    // pump re-walks the accepted message but never retries the mirror.
+    let _ = world.run(&["pump"]);
+    assert_eq!(
+        world.mirror_attempts(&id).len(),
+        1,
+        "mirror not retried by pump"
+    );
+    assert_eq!(world.outbox(&id)["state"], "accepted");
+}
+
+#[test]
+fn relay_fallback_only_for_the_relay_enabled_team() {
+    // Host-wide relay listing (the #770 hazard): the relay is kept only
+    // for a team whose declaration names relay_channels for it.
+    let world = World::new();
+    world.write_teams(r#"{
+      "schema": "agent-teams-teams/v1",
+      "hosts": {"host-a": {"routes": ["relay-coord"], "agent_teams": "agent-teams"}},
+      "teams": {
+        "tools": {"primary": "host-a", "entries": [{"host": "host-a", "contacts": [{"kind": "host"}]}]},
+        "sim": {"primary": "host-a", "entries": [{"host": "host-a", "contacts": [{"kind": "host"}]}]},
+        "plain": {"primary": "host-a", "entries": [{"host": "host-a", "contacts": [{"kind": "host"}]}]}
+      }
+    }"#);
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    let pid = std::process::id().to_string();
+    let (code, out, err) = world.run(&[
+        "init",
+        "plain",
+        "--coordinator-self",
+        "--coordinator-pid",
+        &pid,
+        "--deliver",
+        "hook-inbox",
+        "--accepts-from",
+        "tools",
+    ]);
+    assert_eq!(code, 0, "init plain: {out} {err}");
+    // tools is relay-enabled: the relay is its fallback and carries it.
+    let (id, _post) = world.send_sim_to_tools("fallback carries tools", "fallback-1");
+    assert!(!world.channel_posts().is_empty());
+    let _ = id;
+    // plain is not relay-enabled: no relay route, no post; kept deferred.
+    let (code, out, err) = world.run(&[
+        "send",
+        "plain@host-a",
+        "--from-team",
+        "tools",
+        "--text",
+        "never over relay",
+        "--key",
+        "fallback-2",
+        "--json",
+    ]);
+    let value: serde_json::Value = serde_json::from_str(&out).expect("send json");
+    assert_eq!(
+        value["state"], "deferred",
+        "no route for plain: {out} {err}"
+    );
+    assert_eq!(code, 75, "{out} {err}");
+    assert_eq!(world.channel_posts().len(), 1, "only the tools post");
+    assert!(world.hook_inbox_texts("plain").is_empty());
+}
+
+#[test]
+fn sender_that_is_not_relay_enabled_never_mirrors() {
+    // Finding 1: the DESTINATION being relay-enabled is not enough; a
+    // sender with no relay_channels for the route must not post bodies.
+    let world = World::new();
+    world.write_teams(MIRROR_TEAMS_LOCAL);
+    let post = world.root.join("bin/post.sh");
+    world.write_relay_route(true, &post.to_string_lossy());
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    world.ensure_signing_key("sim");
+    // Strip sim's relay_channels: it can sign, but never opted into relay.
+    let decl_path = world.state.join("teams.d/sim/declaration.json");
+    let mut decl: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&decl_path).expect("decl"))
+            .expect("decl json");
+    decl["relay_channels"] = serde_json::json!([]);
+    std::fs::write(&decl_path, serde_json::to_string(&decl).expect("decl")).expect("decl write");
+    let (code, out, err) = world.run(&[
+        "send",
+        "tools@host-a",
+        "--from-team",
+        "sim",
+        "--text",
+        "sender not on relay",
+        "--key",
+        "mirror-sender-norelay",
+        "--json",
+    ]);
+    assert_eq!(code, 75, "{out} {err}");
+    assert_eq!(world.hook_inbox_texts("tools").len(), 1);
+    assert!(
+        world.channel_posts().is_empty(),
+        "no mirror from a non-relay sender"
+    );
+}
+
+#[test]
+fn relay_carried_message_is_not_mirrored() {
+    let world = World::new();
+    let post = world.root.join("bin/post.sh");
+    world.write_relay_route(true, &post.to_string_lossy());
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    world.ensure_signing_key("sim");
+    let (id, _post) = world.send_sim_to_tools("carried by relay", "relay-carried-1");
+    assert_eq!(world.channel_posts().len(), 1, "only the carrying post");
+    assert!(world.mirror_attempts(&id).is_empty(), "no mirror attempts");
+}
+
+#[test]
+fn mirror_posts_spend_the_mirror_limit_never_the_delivery_limit() {
+    let world = World::new();
+    world.write_teams(MIRROR_TEAMS_LOCAL);
+    let post = world.root.join("bin/post.sh");
+    world.write_relay_route(true, &post.to_string_lossy());
+    // Cap mirror posts at one an hour; deliveries keep their own limit.
+    let routes_path = world.config.join("agent-teams/routes.d/relay.json");
+    let mut routes: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&routes_path).expect("routes"))
+            .expect("routes json");
+    routes["routes"]["relay-coord"]["limits"]["mirror_per_hour"] = serde_json::json!(1);
+    std::fs::write(
+        &routes_path,
+        serde_json::to_string(&routes).expect("routes"),
+    )
+    .expect("routes write");
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    world.ensure_signing_key("sim");
+    for key in ["mirror-limit-1", "mirror-limit-2"] {
+        let (code, out, err) = world.run(&[
+            "send",
+            "tools@host-a",
+            "--from-team",
+            "sim",
+            "--text",
+            "limited mirror",
+            "--key",
+            key,
+            "--json",
+        ]);
+        assert_eq!(code, 75, "{out} {err}");
+        let _ = key;
+    }
+    assert_eq!(
+        world.hook_inbox_texts("tools").len(),
+        2,
+        "both delivered directly"
+    );
+    assert_eq!(
+        world.channel_posts().len(),
+        1,
+        "second mirror skipped by its limit"
+    );
+    let ids: Vec<String> = {
+        let mut v = Vec::new();
+        for entry in std::fs::read_dir(world.state.join("outbox"))
+            .expect("outbox")
+            .flatten()
+        {
+            let value: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(entry.path()).expect("read"))
+                    .expect("json");
+            v.push(value["id"].as_str().unwrap().to_string());
+        }
+        v.sort();
+        v.dedup();
+        v
+    };
+    let skipped = ids
+        .iter()
+        .filter(|id| {
+            world
+                .mirror_attempts(id)
+                .iter()
+                .any(|a| a["classification"] == "mirror-skipped")
+        })
+        .count();
+    assert_eq!(
+        skipped,
+        1,
+        "one mirror-skipped attempt: {:?}",
+        ids.iter()
+            .map(|id| (id.clone(), world.mirror_attempts(id)))
+            .collect::<Vec<_>>()
+    );
+    // The delivery rate file was never spent by a mirror.
+    let delivery_log =
+        std::fs::read_to_string(world.state.join("relay-relay-coord.log")).unwrap_or_default();
+    assert!(
+        delivery_log.trim().is_empty(),
+        "delivery limit untouched: {delivery_log}"
+    );
+    let mirror_log = std::fs::read_to_string(world.state.join("relay-relay-coord-mirror.log"))
+        .unwrap_or_default();
+    assert_eq!(mirror_log.lines().count(), 1, "mirror limit spent once");
+}
+
+#[test]
+fn failed_mirror_post_does_not_poison_the_fallback() {
+    // A post helper that fails once, then works: the mirror fails, and a
+    // later pump over the relay must post for real, not answer ambiguous.
+    let world = World::new();
+    world.write_teams(MIRROR_TEAMS_LOCAL);
+    let marker = world.root.join("flaky-marker");
+    let flaky = world.root.join("bin/flaky.sh");
+    std::fs::write(
+        &flaky,
+        format!(
+            "#!/bin/sh\nif [ ! -f {} ]; then touch {}; exit 1; fi\nexec {} \"$@\"\n",
+            marker.display(),
+            marker.display(),
+            world.root.join("bin/post.sh").display()
+        ),
+    )
+    .expect("flaky");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&flaky, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    world.write_relay_route(true, &flaky.to_string_lossy());
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    world.ensure_signing_key("sim");
+    let (code, out, err) = world.run(&[
+        "send",
+        "tools@host-a",
+        "--from-team",
+        "sim",
+        "--text",
+        "mirror fails once",
+        "--key",
+        "mirror-flaky",
+        "--json",
+    ]);
+    assert_eq!(code, 75, "{out} {err}");
+    let value: serde_json::Value = serde_json::from_str(&out).expect("send json");
+    assert_eq!(value["state"], "accepted", "{out}");
+    let id = value["id"].as_str().expect("id").to_string();
+    assert_eq!(
+        world.mirror_attempts(&id)[0]["classification"],
+        "mirror-failed"
+    );
+    // Direct routes go away; pump with only the relay left.
+    world.write_teams(r#"{
+      "schema": "agent-teams-teams/v1",
+      "hosts": {"host-a": {"routes": ["relay-coord"], "agent_teams": "agent-teams"}},
+      "teams": {
+        "tools": {"primary": "host-a", "entries": [{"host": "host-a", "contacts": [{"kind": "host"}]}]},
+        "sim": {"primary": "host-a", "entries": [{"host": "host-a", "contacts": [{"kind": "host"}]}]},
+        "plain": {"primary": "host-a", "entries": [{"host": "host-a", "contacts": [{"kind": "host"}]}]}
+      }
+    }"#);
+    let _ = world.run(&["pump"]);
+    let state = world.outbox(&id)["state"].as_str().unwrap().to_string();
+    assert_eq!(
+        state,
+        "in-custody",
+        "fallback posted, not ambiguous: {}",
+        world.outbox(&id)
+    );
+    assert_eq!(world.channel_posts().len(), 1, "the fallback post");
+}
+
+#[test]
+fn hung_mirror_post_times_out_and_delivery_stands() {
+    let world = World::new();
+    world.write_teams(MIRROR_TEAMS_LOCAL);
+    let hang = world.root.join("bin/hang.sh");
+    let survived = world.root.join("grandchild-posted");
+    std::fs::write(
+        &hang,
+        format!(
+            "#!/bin/sh\n(sleep 12; touch {}) &\nsleep 60\n",
+            survived.display()
+        ),
+    )
+    .expect("hang");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hang, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    world.write_relay_route(true, &hang.to_string_lossy());
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    world.ensure_signing_key("sim");
+    let started = std::time::Instant::now();
+    let (code, out, err) = world.run(&[
+        "send",
+        "tools@host-a",
+        "--from-team",
+        "sim",
+        "--text",
+        "mirror hangs",
+        "--key",
+        "mirror-hang",
+        "--json",
+    ]);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(45),
+        "send returned despite the hang"
+    );
+    assert_eq!(code, 75, "{out} {err}");
+    let value: serde_json::Value = serde_json::from_str(&out).expect("send json");
+    assert_eq!(value["state"], "accepted", "delivery stands: {out}");
+    let id = value["id"].as_str().expect("id").to_string();
+    let attempts = world.mirror_attempts(&id);
+    assert_eq!(
+        attempts[0]["classification"], "mirror-failed",
+        "{attempts:?}"
+    );
+    assert!(
+        attempts[0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("timed out"),
+        "{attempts:?}"
+    );
+    // The timeout kills the whole process group: the grandchild that
+    // would have posted at 12 s must not survive to do it. Wait ~13 s
+    // (past the grandchild's firing time, from the send's start) so a
+    // survivor would have fired by now.
+    std::thread::sleep(std::time::Duration::from_secs(13));
+    assert!(!survived.exists(), "grandchild survived the timeout kill");
+}
+
+#[test]
+fn relay_then_direct_is_not_mirrored() {
+    let world = World::new();
+    let post = world.root.join("bin/post.sh");
+    world.write_relay_route(true, &post.to_string_lossy());
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    world.ensure_signing_key("sim");
+    let (id, _post) = world.send_sim_to_tools("relay first", "relay-then-direct-1");
+    assert_eq!(world.channel_posts().len(), 1);
+    // A direct route appears; age the custody so pump re-walks it there.
+    world.write_teams(MIRROR_TEAMS_LOCAL);
+    let outbox_path = world.state.join("outbox").join(format!("{id}.json"));
+    let mut entry: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&outbox_path).expect("outbox"))
+            .expect("json");
+    for attempt in entry["attempts"].as_array_mut().expect("attempts") {
+        attempt["at"] = serde_json::json!("2020-01-01T00:00:00.000Z");
+    }
+    std::fs::write(&outbox_path, serde_json::to_string(&entry).expect("json")).expect("write");
+    let _ = world.run(&["pump"]);
+    assert_eq!(
+        world.channel_posts().len(),
+        1,
+        "no mirror after relay carriage"
+    );
+    assert!(world.mirror_attempts(&id).is_empty(), "no mirror attempts");
+}
+
+#[test]
+fn explicit_entry_routes_opt_into_relay() {
+    // The destination names no relay_channels, but its entry's own list
+    // names the relay: that list is its explicit opt-in (#770).
+    let world = World::new();
+    world.write_teams(r#"{
+      "schema": "agent-teams-teams/v1",
+      "hosts": {"host-a": {"routes": ["local"], "agent_teams": "agent-teams"}},
+      "teams": {
+        "tools": {"primary": "host-a", "entries": [{"host": "host-a", "contacts": [{"kind": "host"}]}]},
+        "sim": {"primary": "host-a", "entries": [{"host": "host-a", "contacts": [{"kind": "host"}]}]},
+        "plain": {"primary": "host-a", "entries": [{"host": "host-a", "routes": ["relay-coord"], "contacts": [{"kind": "host"}]}]}
+      }
+    }"#);
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    let pid = std::process::id().to_string();
+    let (code, out, err) = world.run(&[
+        "init",
+        "plain",
+        "--coordinator-self",
+        "--coordinator-pid",
+        &pid,
+        "--deliver",
+        "hook-inbox",
+        "--accepts-from",
+        "sim",
+    ]);
+    assert_eq!(code, 0, "init plain: {out} {err}");
+    let (code, out, err) = world.run(&[
+        "send",
+        "plain@host-a",
+        "--from-team",
+        "sim",
+        "--text",
+        "explicit relay",
+        "--key",
+        "explicit-relay-1",
+        "--json",
+    ]);
+    let value: serde_json::Value = serde_json::from_str(&out).expect("send json");
+    assert_eq!(
+        value["state"], "in-custody",
+        "explicit list carries it: {out} {err}"
+    );
+    assert_eq!(code, 75, "{out} {err}");
+    assert_eq!(world.channel_posts().len(), 1);
+}
+
+#[test]
+fn refused_message_is_not_mirrored() {
+    // A direct route answering `refused` (here: the receiver's
+    // per-sender rate limit) settled nothing deliverable: no mirror.
+    let world = World::new();
+    world.write_teams(MIRROR_TEAMS_LOCAL);
+    let post = world.root.join("bin/post.sh");
+    world.write_relay_route(true, &post.to_string_lossy());
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    world.ensure_signing_key("sim");
+    // The receiver admits one message an hour from each sender.
+    let decl_path = world.state.join("teams.d/tools/declaration.json");
+    let mut decl: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&decl_path).expect("decl"))
+            .expect("decl json");
+    decl["limits"]["per_sender_per_hour"] = serde_json::json!(1);
+    std::fs::write(&decl_path, serde_json::to_string(&decl).expect("decl")).expect("decl write");
+    let (code, out, err) = world.run(&[
+        "send",
+        "tools@host-a",
+        "--from-team",
+        "sim",
+        "--text",
+        "first, delivered",
+        "--key",
+        "mirror-refused-1",
+        "--json",
+    ]);
+    assert_eq!(code, 75, "{out} {err}");
+    assert_eq!(world.channel_posts().len(), 1, "first message mirrored");
+    let (code, out, err) = world.run(&[
+        "send",
+        "tools@host-a",
+        "--from-team",
+        "sim",
+        "--text",
+        "second, refused",
+        "--key",
+        "mirror-refused-2",
+        "--json",
+    ]);
+    let value: serde_json::Value = serde_json::from_str(&out).expect("send json");
+    assert_eq!(value["state"], "refused", "{out} {err}");
+    assert_eq!(code, 65, "{out} {err}");
+    assert_eq!(world.channel_posts().len(), 1, "no mirror for a refusal");
 }

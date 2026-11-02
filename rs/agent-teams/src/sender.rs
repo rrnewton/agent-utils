@@ -142,12 +142,19 @@ pub fn is_terminal(state: &str) -> bool {
 
 /// Run the walk for one outbox entry against its entry's contacts.
 /// `routes_for` maps a host contact to its candidate routes in order.
+/// `mirrors` are mirror-enabled relay routes (#782): after a delivery
+/// over a direct (non-relay) route, the same envelope is also posted
+/// through each of them, under the same ID. A mirror attempt is recorded
+/// in the outbox (verb `mirror`) and the team log, is attempted at most
+/// once per route for a message, and never changes the delivery state,
+/// the exit code, or retry behaviour — `pump` never retries a mirror.
 pub fn walk(
     state: &Path,
     entry_value: &mut Value,
     team_entry: &Entry,
     host: &Host,
     routes_for: &[Box<dyn Route>],
+    mirrors: &[Box<dyn Route>],
 ) -> DataResult<WalkResult> {
     let envelope = entry_value["envelope"].clone();
     let id = envelope["id"].as_str().unwrap_or_default().to_string();
@@ -164,6 +171,26 @@ pub fn walk(
     let mut any_ambiguous = entry_value["attempts"].as_array().is_some_and(|list| {
         list.iter()
             .any(|a| a.get("classification").and_then(Value::as_str) == Some("ambiguous"))
+    });
+    // Whether a direct (non-relay) route settled this message in THIS
+    // walk: only that mirrors (#782). A re-walk that settles nothing new,
+    // and a message the relay already carried (in this walk or an
+    // earlier one), is not mirrored.
+    let mut direct_win_this_walk = false;
+    let relay_route_names: Vec<&str> = routes_for
+        .iter()
+        .filter(|route| route.is_relay())
+        .map(|route| route.name())
+        .chain(mirrors.iter().map(|route| route.name()))
+        .collect();
+    let previously_relayed = entry_value["attempts"].as_array().is_some_and(|list| {
+        list.iter().any(|a| {
+            a.get("verb").and_then(Value::as_str) == Some("accept")
+                && a.get("classification").and_then(Value::as_str) == Some("answered")
+                && a.get("route")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| relay_route_names.contains(&name))
+        })
     });
     let pinned: Option<String> = entry_value["pinned_contact"].as_str().map(str::to_string);
     // A reason from an earlier walk is stale once this walk runs; an
@@ -294,6 +321,7 @@ pub fn walk(
                         break;
                     }
                     entry_value["pinned_contact"] = json!(label);
+                    direct_win_this_walk = !route.is_relay();
                     contact_settled = Some(map_receiver_state(&answered_state));
                     break;
                 }
@@ -340,6 +368,7 @@ pub fn walk(
                             let known_state =
                                 known["state"].as_str().unwrap_or("accepted").to_string();
                             entry_value["pinned_contact"] = json!(label);
+                            direct_win_this_walk = !route.is_relay();
                             contact_settled = Some(map_receiver_state(&known_state));
                             steps.push(WalkStep {
                                 contact: label.clone(),
@@ -367,6 +396,7 @@ pub fn walk(
                                 AttemptOutcome::Answered(answer) => {
                                     let st = answer["state"].as_str().unwrap_or("accepted");
                                     entry_value["pinned_contact"] = json!(label);
+                                    direct_win_this_walk = !route.is_relay();
                                     contact_settled = Some(map_receiver_state(st));
                                 }
                                 _ => {
@@ -410,7 +440,86 @@ pub fn walk(
     }
     let _ = host;
     entry_value["state"] = json!(final_state);
+    // The delivery state is durable BEFORE any mirror post: a hung or
+    // killed mirror can never leave the outbox in its pre-delivery
+    // state or change the exit code this walk reports.
     write_json_atomic(&outbox_path(state, &id), entry_value)?;
+
+    // Mirror phase (#782): a copy for the owner to watch, posted only
+    // when a direct route settled this message in this walk and no
+    // earlier walk already carried it over the relay. It posts the same
+    // signed envelope and ID (so the receiver's ledger absorbs it as a
+    // duplicate), counts against the mirror route's own mirror limit,
+    // and is attempted at most once per route — the attempt is recorded
+    // (and written) before the post runs, so even a kill during the post
+    // is never retried by a later `pump`. Its outcome is recorded and
+    // logged, never folded into the state.
+    let delivered_state = matches!(
+        final_state.as_str(),
+        "delivered" | "accepted" | "claimed" | "typing" | "presented" | "journaled"
+    );
+    if direct_win_this_walk && delivered_state && !previously_relayed && !mirrors.is_empty() {
+        let label = format!("host@{}", team_entry.host);
+        let private = envelope["private"].as_bool() == Some(true);
+        for mirror in mirrors {
+            let already = entry_value["attempts"].as_array().is_some_and(|list| {
+                list.iter().any(|a| {
+                    a.get("verb").and_then(Value::as_str) == Some("mirror")
+                        && a.get("route").and_then(Value::as_str) == Some(mirror.name())
+                })
+            });
+            if already {
+                continue;
+            }
+            record_attempt(
+                entry_value,
+                &label,
+                mirror.name(),
+                "mirror",
+                "mirror-started",
+                "",
+            );
+            // The delivery is already durable; a failed write here must
+            // not fail the send or change its exit code.
+            let _ = write_json_atomic(&outbox_path(state, &id), entry_value);
+            let (class, detail) = if private {
+                (
+                    "mirror-skipped",
+                    "--private: route exposes the body".to_string(),
+                )
+            } else if let Some(reason) = mirror.mirror_skip_reason(envelope_bytes) {
+                ("mirror-skipped", reason)
+            } else {
+                match mirror.run_mirror(&envelope) {
+                    AttemptOutcome::Answered(answer) => (
+                        "mirror-posted",
+                        answer["state"].as_str().unwrap_or("posted").to_string(),
+                    ),
+                    AttemptOutcome::NotDelivered(reason) => ("mirror-failed", reason),
+                    AttemptOutcome::Ambiguous(reason) => ("mirror-failed", reason),
+                }
+            };
+            if let Some(attempt) = entry_value["attempts"].as_array_mut().and_then(|list| {
+                list.iter_mut().rev().find(|a| {
+                    a.get("verb").and_then(Value::as_str) == Some("mirror")
+                        && a.get("route").and_then(Value::as_str) == Some(mirror.name())
+                })
+            }) {
+                attempt["classification"] = json!(class);
+                attempt["detail"] = json!(detail);
+            }
+            log_event(
+                state,
+                &json!({"event": "mirror", "id": id, "route": mirror.name(), "outcome": class, "detail": detail}),
+            );
+            steps.push(WalkStep {
+                contact: label.clone(),
+                route: mirror.name().to_string(),
+                detail: format!("mirror: {class} ({detail})"),
+            });
+            let _ = write_json_atomic(&outbox_path(state, &id), entry_value);
+        }
+    }
     Ok(WalkResult {
         state: final_state.clone(),
         steps,

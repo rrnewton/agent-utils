@@ -427,15 +427,19 @@ fn cmd_show(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
         );
         for entry in &team.entries {
             let contacts: Vec<String> = entry.contacts.iter().map(|c| c.label()).collect();
+            let effective = Some(route_names_for(globals, &teams, &routes, name, entry, None));
             println!(
-                "  @{}{}: contacts [{}]",
+                "  @{}{}: contacts [{}]{}",
                 entry.host,
                 entry
                     .coordinator
                     .as_ref()
                     .map(|c| format!(" coordinator={c} (informational)"))
                     .unwrap_or_default(),
-                contacts.join(", ")
+                contacts.join(", "),
+                effective
+                    .map(|names| format!(" routes [{}]", names.join(", ")))
+                    .unwrap_or_default()
             );
         }
     }
@@ -497,6 +501,50 @@ fn cmd_check(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
             lines.push(json!({"kind": "warning", "detail": format!("host {name}: no agent_teams path; remote routes need one")}));
         }
     }
+    // Teams and entries must name routes that exist (#770 per-team routes).
+    for (name, team) in &teams.teams {
+        for route_name in team.routes.iter().flatten() {
+            if !routes.routes.contains_key(route_name) {
+                problems.push(format!("team {name}: route {route_name:?} is not defined"));
+            }
+        }
+        for entry in &team.entries {
+            for route_name in entry.routes.iter().flatten() {
+                if !routes.routes.contains_key(route_name) {
+                    problems.push(format!(
+                        "team {name}@{}: route {route_name:?} is not defined",
+                        entry.host
+                    ));
+                }
+            }
+        }
+        // An explicit relay in a team's or entry's list is an opt-in, but
+        // the sending side still needs the team's declaration to name it;
+        // warn when this host's declaration for the team does not.
+        let explicit_relays: Vec<&String> = team
+            .routes
+            .iter()
+            .flatten()
+            .chain(team.entries.iter().flat_map(|e| e.routes.iter().flatten()))
+            .filter(|route_name| {
+                routes
+                    .routes
+                    .get(route_name.as_str())
+                    .is_some_and(crate::route::is_relay_def)
+            })
+            .collect();
+        if !explicit_relays.is_empty()
+            && declarations.iter().any(|(t, _, _)| t == name)
+            && !explicit_relays
+                .iter()
+                .all(|route_name| relay_enabled_for_team(globals, name, route_name))
+        {
+            lines.push(json!({"kind": "warning", "detail": format!(
+                "team {name}: explicit routes name a relay ({}) but its declaration names no relay_channels for it; sends from {name} will not use it",
+                explicit_relays.iter().map(|r| r.as_str()).collect::<Vec<_>>().join(", ")
+            )}));
+        }
+    }
     // Star: every spoke needs a route toward the first hub.
     if let Some(hub) = teams.hubs.first() {
         if globals.host != *hub {
@@ -545,8 +593,12 @@ fn cmd_check(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
                 }
             } else {
                 match teams.hosts.get(&entry.host) {
-                    Some(host) if !host.routes.is_empty() => {
-                        lines.push(json!({"kind": "ok", "detail": format!("team {name}@{}: routes [{}] (not probed)", entry.host, host.routes.join(", "))}));
+                    Some(_host)
+                        if !route_names_for(globals, &teams, &routes, name, entry, None)
+                            .is_empty() =>
+                    {
+                        let names = route_names_for(globals, &teams, &routes, name, entry, None);
+                        lines.push(json!({"kind": "ok", "detail": format!("team {name}@{}: routes [{}] (not probed)", entry.host, names.join(", "))}));
                     }
                     _ => problems.push(format!("team {name}@{}: no-route", entry.host)),
                 }
@@ -637,6 +689,10 @@ fn cmd_coordinators(globals: &Globals, args: &[String]) -> Result<i32, DataError
             hubs: Vec::new(),
             warnings: Vec::new(),
         });
+    let routes_for_coords = globals.load_routes().unwrap_or_else(|_| RoutesFile {
+        routes: Default::default(),
+        warnings: Vec::new(),
+    });
     let local: Vec<Value> = crate::hostindex::load()
         .iter()
         .map(|entry| {
@@ -659,7 +715,7 @@ fn cmd_coordinators(globals: &Globals, args: &[String]) -> Result<i32, DataError
                     "team": name,
                     "coordinator": entry.coordinator,
                     "where": entry.host,
-                    "routes": teams.hosts.get(&entry.host).map(|host| host.routes.clone()).unwrap_or_default(),
+                    "routes": route_names_for(globals, &teams, &routes_for_coords, name, entry, None),
                 }));
             }
         }
@@ -1137,12 +1193,100 @@ fn read_body(args: &[String]) -> Result<String, DataError> {
     Err(err("usage", "needs --file FILE or --text TEXT"))
 }
 
-fn routes_for_host(
+/// Whether the destination team is relay-enabled for one route: a local
+/// declaration for that team names a `relay_channels` entry for the
+/// route (#770/#782). The sender proves it from the declaration it can
+/// read; a team it cannot prove relay-enabled gets no relay route and
+/// no mirror — fail-closed, because relay routes expose the body.
+fn relay_enabled_for_team(globals: &Globals, team: &str, route_name: &str) -> bool {
+    crate::proof::load_declarations(&globals.state).is_ok_and(|declarations| {
+        declarations.iter().any(|(name, _, declaration)| {
+            name == team
+                && declaration
+                    .relay_channels
+                    .iter()
+                    .any(|channel| channel.route == route_name)
+        })
+    })
+}
+
+/// Whether a relay route may carry a message from one team to another:
+/// BOTH teams must be relay-enabled for it. The destination check alone
+/// is not enough — a sender with no relay declaration (and, for a
+/// mirror, no signing key) would post bodies its own team never agreed
+/// to expose, and the receiver would meet them as unsigned strangers.
+fn relay_route_allowed(
+    globals: &Globals,
+    sender_decl_team: Option<&str>,
+    team_name: &str,
+    route_name: &str,
+    explicit: bool,
+) -> bool {
+    // A team's or entry's own list is the destination's explicit opt-in;
+    // otherwise the destination must declare the relay too.
+    if !explicit && !relay_enabled_for_team(globals, team_name, route_name) {
+        return false;
+    }
+    // The sender side has no explicit opt-in: its declaration must list
+    // the route. Checks without a known sender (display, `check`) use
+    // the destination side only.
+    match sender_decl_team {
+        Some(sender) => relay_enabled_for_team(globals, sender, route_name),
+        None => true,
+    }
+}
+
+/// The ordered route NAMES for one entry after the relay filter (#770):
+/// the entry's own `routes` win, then its team's, then the host's
+/// (older files: the host's, as today), with relay routes dropped unless
+/// [`relay_route_allowed`] keeps them. `send` builds routes from this;
+/// `check`, `show` and `coordinators` print it, so they agree.
+fn route_names_for(
     globals: &Globals,
     teams: &TeamsFile,
     routes: &RoutesFile,
-    host_name: &str,
+    team_name: &str,
+    entry: &crate::model::Entry,
+    sender_decl_team: Option<&str>,
+) -> Vec<String> {
+    let Some(host) = teams.hosts.get(&entry.host) else {
+        return Vec::new();
+    };
+    let names = crate::model::effective_route_names(host, teams.teams.get(team_name), entry);
+    let explicit: Vec<&String> = match (&entry.routes, teams.teams.get(team_name)) {
+        (Some(list), _) => list.iter().collect(),
+        (None, Some(team)) => team.routes.iter().flatten().collect(),
+        (None, None) => Vec::new(),
+    };
+    names
+        .into_iter()
+        .filter(|name| {
+            let is_relay = routes
+                .routes
+                .get(name.as_str())
+                .is_some_and(crate::route::is_relay_def);
+            !is_relay
+                || relay_route_allowed(
+                    globals,
+                    sender_decl_team,
+                    team_name,
+                    name,
+                    explicit.iter().any(|e| e.as_str() == name.as_str()),
+                )
+        })
+        .collect()
+}
+
+/// The ordered candidate routes for one destination entry (#770).
+fn routes_for_entry(
+    globals: &Globals,
+    teams: &TeamsFile,
+    routes: &RoutesFile,
+    team_name: &str,
+    entry: &crate::model::Entry,
+    sender_decl_team: Option<&str>,
 ) -> Result<Vec<Box<dyn Route>>, DataError> {
+    let host_name = &entry.host;
     let host = teams.hosts.get(host_name).ok_or_else(|| {
         err(
             "unknown-host",
@@ -1153,9 +1297,21 @@ fn routes_for_host(
         .agent_teams
         .clone()
         .unwrap_or_else(|| "agent-teams".to_string());
+    let names = route_names_for(globals, teams, routes, team_name, entry, sender_decl_team);
+    let kept: Vec<&String> = names.iter().collect();
+    build_routes(globals, routes, host_name, &remote_binary, &kept)
+}
+
+fn build_routes(
+    globals: &Globals,
+    routes: &RoutesFile,
+    host_name: &str,
+    remote_binary: &str,
+    names: &[&String],
+) -> Result<Vec<Box<dyn Route>>, DataError> {
     // The chat relay is always the fallback: it never precedes a direct
     // (ssh / node-exec / local) route, whatever order teams.json lists.
-    let mut ordered: Vec<&String> = host.routes.iter().collect();
+    let mut ordered: Vec<&String> = names.to_vec();
     ordered.sort_by_key(|name| {
         routes
             .routes
@@ -1172,11 +1328,50 @@ fn routes_for_host(
             def,
             &globals.host,
             host_name,
-            &remote_binary,
+            remote_binary,
             &globals.links_dir(),
         )?);
     }
     Ok(out)
+}
+
+/// Mirror routes for one message (#782 agent-teams-relay-mirror): every
+/// relay route definition carrying `"mirror": true` that BOTH teams are
+/// relay-enabled for and that the sender can sign for. Mirror routes are
+/// found in `routes.d` whether or not any host lists them — mirroring is
+/// a copy of a direct delivery, not a candidate route in the walk. The
+/// signing key is required, not optional: an unsigned mirror copy is
+/// indistinguishable from a stranger's post at the receiver.
+fn mirror_routes_for(
+    globals: &Globals,
+    routes: &RoutesFile,
+    team_name: &str,
+    entry: &crate::model::Entry,
+    sender_decl_team: &str,
+    sender_key_team: &str,
+) -> Vec<Box<dyn Route>> {
+    if crate::relay::own_public_key(&globals.state, sender_key_team, &globals.host).is_none() {
+        return Vec::new();
+    }
+    let remote_binary = "agent-teams".to_string();
+    routes
+        .routes
+        .values()
+        .filter(|def| crate::route::mirror_enabled(def))
+        .filter(|def| {
+            relay_route_allowed(globals, Some(sender_decl_team), team_name, &def.name, false)
+        })
+        .filter_map(|def| {
+            route_for(
+                def,
+                &globals.host,
+                &entry.host,
+                &remote_binary,
+                &globals.links_dir(),
+            )
+            .ok()
+        })
+        .collect()
 }
 
 fn cmd_send(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
@@ -1222,6 +1417,7 @@ fn cmd_send(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
                     host: globals.host.clone(),
                     coordinator: Some(found.name.clone()),
                     contacts: vec![crate::model::Contact::Host],
+                    routes: None,
                 },
                 None => return Err(error),
             }
@@ -1272,6 +1468,29 @@ fn cmd_send(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
         .and_then(|ds| ds.into_iter().find(|(t, _, _)| *t == sender))
         .map(|(_, _, d)| d.default_ttl_seconds)
         .unwrap_or(7200);
+    // Replies get at least 24 hours by default (#770): the messages that
+    // expired in the relay-fallback incident were mostly replies waiting
+    // out a down route, and a relayed reply must also survive the
+    // bridges' rescan window. An explicit --ttl/--expires always wins.
+    // The receiver does not clamp to max_ttl_seconds — it REFUSES an
+    // envelope whose not_after is beyond it — so where the destination's
+    // declaration is readable here, cap the default at its max; where it
+    // is not (a remote team), the destination must allow 24 h
+    // (max_ttl_seconds >= 86400; the declaration default is 7 days).
+    let default_ttl = if kind == "reply" {
+        let wanted = default_ttl.max(86_400);
+        let receiver_max = load_declarations(&globals.state)
+            .ok()
+            .and_then(|ds| ds.into_iter().find(|(t, _, _)| *t == to_team))
+            .map(|(_, _, d)| d.max_ttl_seconds)
+            .filter(|max| *max > 0);
+        match receiver_max {
+            Some(max) => wanted.min(max),
+            None => wanted,
+        }
+    } else {
+        default_ttl
+    };
     let not_after_ms = if let Some(expires) = flag_value(args, "--expires") {
         parse_rfc3339_ms(&expires).ok_or_else(|| {
             err(
@@ -1356,13 +1575,16 @@ fn cmd_send(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
         .get(&to_host)
         .ok_or_else(|| err("unknown-host", format!("no host {to_host:?} in teams.json")))?
         .clone();
-    let route_objs = routes_for_host(globals, &teams, &routes, &to_host)?;
+    let route_objs =
+        routes_for_entry(globals, &teams, &routes, &to_team, &entry, Some(&from_team))?;
+    let mirror_objs = mirror_routes_for(globals, &routes, &to_team, &entry, &from_team, &from_team);
     let result = crate::sender::walk(
         &globals.state,
         &mut outbox_entry,
         &entry,
         &host_obj,
         &route_objs,
+        &mirror_objs,
     )?;
     log_event(
         &globals.state,
@@ -1677,13 +1899,33 @@ fn cmd_pump(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
             let Some(host_obj) = teams.hosts.get(&team_entry.host).cloned() else {
                 continue;
             };
-            let route_objs = routes_for_host(globals, &teams, &routes, &team_entry.host)?;
+            let sender_decl = entry["envelope"]["from"]["team"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            let route_objs = routes_for_entry(
+                globals,
+                &teams,
+                &routes,
+                &to_team,
+                &team_entry,
+                Some(&sender_decl),
+            )?;
+            let mirror_objs = mirror_routes_for(
+                globals,
+                &routes,
+                &to_team,
+                &team_entry,
+                &sender_decl,
+                &sender_decl,
+            );
             let result = crate::sender::walk(
                 &globals.state,
                 &mut entry,
                 &team_entry,
                 &host_obj,
                 &route_objs,
+                &mirror_objs,
             )?;
             println!("{}: {}", entry["id"].as_str().unwrap_or("?"), result.state);
             worst = worst.max(result.exit_code);
@@ -2526,14 +2768,10 @@ fn cmd_relay_confirm(globals: &Globals, args: &[String]) -> Result<i32, DataErro
                 if let Some(host_obj) = teams.hosts.get(&entry.host).cloned() {
                     let _ = host_obj;
                     if let Ok(route_objs) =
-                        routes_for_host(globals, &teams, &all_routes, &entry.host)
+                        routes_for_entry(globals, &teams, &all_routes, &team, &entry, None)
                     {
-                        for (route, def) in
-                            route_objs
-                                .iter()
-                                .zip(host_obj_routes(&teams, &all_routes, &entry.host))
-                        {
-                            if def.is_some_and(crate::route::is_relay_def) {
+                        for route in route_objs.iter() {
+                            if route.is_relay() {
                                 continue;
                             }
                             if let AttemptOutcome::Answered(probe) =
@@ -2724,24 +2962,6 @@ fn cmd_relay_alarms(globals: &Globals, args: &[String]) -> Result<i32, DataError
         crate::relay::quarantined_posts(&globals.state).len()
     );
     Ok(0)
-}
-
-/// Route definitions in host order for one host (companion to `routes_for_host`).
-fn host_obj_routes<'a>(
-    teams: &TeamsFile,
-    routes: &'a RoutesFile,
-    host_name: &str,
-) -> Vec<Option<&'a crate::model::RouteDef>> {
-    teams
-        .hosts
-        .get(host_name)
-        .map(|host| {
-            host.routes
-                .iter()
-                .map(|name| routes.routes.get(name))
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 fn cmd_ssh(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
@@ -2988,5 +3208,88 @@ mod tests {
         assert!(
             synced_state_warning(Path::new("/home/u/.local/state/agent-teams"), config).is_none()
         );
+    }
+}
+
+#[cfg(test)]
+mod relay_gate_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn globals_with_declarations(teams: &[(&str, bool)]) -> (Globals, PathBuf) {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "agent-teams-relay-gate-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::SeqCst)
+        ));
+        for (team, relay) in teams {
+            let sub = dir.join("teams.d").join(team);
+            std::fs::create_dir_all(&sub).expect("mkdir");
+            let channels = if *relay {
+                json!([{"route": "relay-coord", "channel": "C1", "peers": {}}])
+            } else {
+                json!([])
+            };
+            std::fs::write(
+                sub.join("declaration.json"),
+                serde_json::to_string(&json!({
+                    "schema": "agent-teams-declaration/v1", "team": team, "deliverer": {"kind": "hook-inbox"},
+                    "relay_channels": channels,
+                }))
+                .expect("json"),
+            )
+            .expect("write");
+        }
+        (
+            Globals {
+                teams_path: None,
+                routes_extra: Vec::new(),
+                state: dir.clone(),
+                config: dir.clone(),
+                host: "host-a".to_string(),
+                json: false,
+            },
+            dir,
+        )
+    }
+
+    #[test]
+    fn relay_needs_both_teams_and_services_have_no_declaration() {
+        let (globals, dir) = globals_with_declarations(&[("tools", true), ("sim", true)]);
+        // Both relay-enabled: allowed.
+        assert!(relay_route_allowed(
+            &globals,
+            Some("sim"),
+            "tools",
+            "relay-coord",
+            false
+        ));
+        // A service sender (svc.<name>) has no declaration: denied, as in pump.
+        assert!(!relay_route_allowed(
+            &globals,
+            Some("svc.tick-hub"),
+            "tools",
+            "relay-coord",
+            false
+        ));
+        // Destination explicit opt-in still requires the sending side.
+        assert!(!relay_route_allowed(
+            &globals,
+            Some("svc.tick-hub"),
+            "tools",
+            "relay-coord",
+            true
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (globals, dir) = globals_with_declarations(&[("tools", true), ("sim", false)]);
+        assert!(!relay_route_allowed(
+            &globals,
+            Some("sim"),
+            "tools",
+            "relay-coord",
+            false
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

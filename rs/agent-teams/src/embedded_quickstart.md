@@ -75,3 +75,18 @@ traffic. Run `agent-teams relay setup` for the owner steps and config
 snippets; it creates no channel. Unconfirmed bots in the channel are loud
 strangers — quarantined and alarmed to the coordinator, never silently
 dropped — until confirmed (`relay confirm`) or banned (`relay ban`).
+
+Two relay options build on that. **Per-team routes:** a team or one of its
+entries in teams.json may carry its own `routes` list (the entry's wins,
+then the team's, then the host's), and a relay inherited from a host list
+is used only when both teams' declarations name `relay_channels` for it —
+so the relay is a fallback for relay-enabled teams when a direct route is
+down, and never carries a team with no relay. Upgrade every build sharing
+the config before adding a relay to any host list. **Mirror:** `"mirror": true`
+on the relay route definition also posts a copy of every message delivered
+over a direct route (same envelope, same ID) for relay-enabled teams, so
+the owner can watch all traffic; `--private` messages are never mirrored,
+a mirror failure never changes the delivery, and the receiving ledger
+absorbs the copy quietly (`receipt: delivered`, `delivered already`).
+Replies get at least 24 hours of TTL by default. See `agent-teams
+userguide` for the full rules.

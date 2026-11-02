@@ -22,7 +22,9 @@ by group or others are refused.
   `$AGENT_TEAMS_FILE`, or `--teams`). A sparse routing hint: hosts with
   ordered route names and registered services; teams with one entry per host
   and ordered contacts (`host`, or `session` for a runtime session); an
-  optional `topology` object naming star hubs. Stale data costs a warning,
+  optional `topology` object naming star hubs. A team, or one of its
+  entries, may also carry its own ordered `routes` list (see "Per-team
+  routes" under Routes). Stale data costs a warning,
   not a misdelivery: the receiving host re-checks everything.
 - **routes.d/*.json** — route definitions by name. Private definitions (for
   company-internal channels) go in git-ignored `*.private.json` files, found
@@ -127,7 +129,16 @@ explicit rule.
   - `--file -` reads the body from stdin. DUR is seconds or `s/m/h/d`;
     TIME is RFC 3339 UTC. Default TTL: the receiving team's
     `default_ttl_seconds`, else 2 hours; never beyond its `max_ttl_seconds`
-    (default 7 days). There is no `--ttl none`.
+    (default 7 days). There is no `--ttl none`. Replies (`reply`, or
+    `--kind reply`) get at least 24 hours by default instead: replies
+    were the messages that expired while a direct route was down, and a
+    relayed reply must survive the bridges' rescan window. An explicit
+    `--ttl` or `--expires` always wins. The receiver refuses (it does
+    not clamp) an envelope beyond its `max_ttl_seconds`, so the sender
+    caps the reply default at the destination's max when that
+    declaration is readable locally; a remote destination must allow
+    24 hours (`max_ttl_seconds` >= 86400 — the declaration default is
+    7 days, so only a team that lowered it is affected).
   - The ID is fixed at the outbox write and carried on every route. Without
     `--key` the key derives from (kind, topic, body), so re-running is a
     retry. Same key with a different body is refused as a conflict; a repeat
@@ -220,7 +231,11 @@ the sender asks for a receipt; it never resends blind.
   (the bot user this host posts as), `post_argv` and `list_argv` templates
   (`{channel}`, `{thread}`, `{message_id}`, `{text_file}`), 
   `max_envelope_bytes` (default 10000, one post per envelope, never split),
-  `limits.per_hour` (default 6), `visible_to_owner: true`. It posts the
+  `limits.per_hour` (default 6), `visible_to_owner: true`, and `mirror`
+  (default false; see "Mirror copies" in the Chat relay section), and
+  `post_timeout_seconds` (default 10; raise it when the helper waits out
+  rate limits — a timed-out post kills the helper's whole process group).
+  It posts the
   envelope as one chat post and never reposts: ambiguity is settled by the
   receipt in the post's thread, delivered back through the sender's bridge
   to `relay-in` (a channel listing has no authenticated poster, so the
@@ -230,6 +245,37 @@ the sender asks for a receipt; it never resends blind.
   every channel member, so `--private` messages never take a relay route,
   and the walk's other rules (order, pinning, failover to ssh/node-exec)
   apply unchanged: the relay is a route like any other, chosen last.
+
+### Per-team routes and relay fallback
+
+A host's `routes` list is only the default. A team may carry its own
+ordered `routes` in teams.json, and one entry may carry its own, winning
+over the team's: the entry's list wins, then the team's, then the host's,
+and the relay still sorts last within whichever list applies. A relay
+route named in a team's or entry's own list is the destination's
+explicit opt-in. Every other relay route is kept only when BOTH teams
+are **relay-enabled** for it — each one's declaration on the sending
+host names a `relay_channels` entry for that route — and the sending
+side is required even for an explicit list. A sender or destination
+the sender cannot prove relay-enabled gets no relay route at all:
+fail-closed, because relay routes expose the body. When every direct route is down,
+a relay-enabled team's message therefore falls back to the relay and
+waits in custody for its thread receipt instead of expiring unseen;
+a team with no relay simply stays `deferred` for `pump`.
+
+**Rolling this out takes an upgrade first.** Older builds ignore the
+new teams.json keys and read only host route lists, with no relay
+filter at all: adding a relay to a *host* list before every reader on
+every host sharing that teams.json is upgraded routes every team over
+the relay on those builds. Upgrade all builds on all hosts first; only
+then add relay routes (per-entry lists preferred) or `mirror`.
+
+**Rolling this out takes an upgrade first.** Older builds ignore the
+new teams.json keys and read only host route lists, with no relay
+filter at all: adding a relay to a *host* list before every reader on
+every host sharing that teams.json is upgraded routes every team over
+the relay on those builds. Upgrade all builds on all hosts first; only
+then add relay routes (per-entry lists preferred) or `mirror`.
 
 ## Chat relay
 
@@ -267,6 +313,42 @@ of two bridges; when a provider's live stream does not carry other bots'
 posts, its history rescan bounds it (Slack: 90 seconds by default, over a
 24-hour window — a post older than the window is never seen, so keep
 relayed messages' TTL inside it).
+
+**Mirror copies.** A relay route definition may carry `"mirror": true`.
+Then, whenever a message is *delivered over a direct route*, the sender
+also posts a copy through that relay route — the same signed envelope,
+the same ID — so the owner can watch all inter-team traffic in the relay
+channel, not only the messages the relay had to carry. Mirroring asks
+for nothing in any host's route list: mirror routes are found in
+`routes.d` directly. Only relay-enabled teams are mirrored, on BOTH
+sides (the sending team's and the destination team's declarations on
+the sending host must each name a `relay_channels` entry for that
+route, and the sender must hold a signing key the receiver's bridge has
+confirmed); `--private` messages are never mirrored; a message the
+relay itself carried is not mirrored again; and replies are mirrored
+exactly like sends. The attempt is recorded in the outbox before the
+post runs (attempts with verb `mirror`, classified `mirror-posted`,
+`mirror-skipped`, or `mirror-failed`) and as a `mirror` event in
+`team-log.jsonl` (never the body); the delivery state is already
+durable by then and the post command has a 10-second timeout. Mirror
+posts count against their own allowance, `limits.mirror_per_hour`
+(default 60), never the `limits.per_hour` a fallback needs, and land
+in their own posted-ID set, so a failed mirror can never make a later
+fallback ambiguous. A mirror failure or skip never changes the
+message's delivery state, exit code, or retry behaviour, and `pump`
+never retries a mirror.
+
+On the receiving side, the mirror copy is a duplicate by construction:
+the bridge feeds it to `relay-in`, the ledger has already claimed the ID
+through the direct delivery, and the copy is absorbed quietly. It
+delivers nothing a second time, raises no quarantine and no stranger
+alarm, and its receipt in the thread keeps the recorded state with a
+`<state> already` detail — for a delivered message, outcome `known` and
+receipt `receipt: delivered` saying `delivered already; duplicate copy
+not delivered again`. The copy must carry the real signed envelope,
+exactly as the relay route's `accept` posts it; a plain-text rendering
+of the message is not an envelope and would be quarantined as a
+stranger.
 
 **Admission, in three layers.** The provider admits a listed peer's post
 in the relay channel (Slack: that peer's `bot_message`, there only). The
