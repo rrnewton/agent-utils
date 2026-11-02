@@ -12,3 +12,5 @@ export { PLACES_KEPT, createVisits } from "./visits.ts";
 export type { Visits } from "./visits.ts";
 export { createDeepLinks } from "./deeplinks.ts";
 export type { DeepLinkWanted, DeepLinks, DeepLinksDependencies } from "./deeplinks.ts";
+export { createLinkJumps, ownLevel } from "./jumps.ts";
+export type { LinkJump, LinkJumps, LinkSpot } from "./jumps.ts";

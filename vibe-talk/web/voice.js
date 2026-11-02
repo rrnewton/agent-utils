@@ -2021,9 +2021,8 @@ function chooseOpenInView(view) {
 
 /**
  * @typedef {{service: string, channel: string, message: string | null, thread: string | null}} MessageLinkRef
- * @typedef {{place: ChannelPlace | null, column: "main" | "side", pinned: boolean, anchor: string | null,
- *   offset: number, focus: DeepLinkRef | null, call?: boolean}} LinkSpot
- * @typedef {{spot: LinkSpot, below: string[], landed: string[] | null}} LinkJump
+ * @typedef {import("./src/core/navigation/index.ts").LinkSpot} LinkSpot
+ * @typedef {import("./src/core/navigation/index.ts").LinkJump} LinkJump
  */
 
 /** Whether a link to `ref` is this app's now: the switch on, and its channel one this server reads. */
@@ -2081,12 +2080,10 @@ function onMessageLinkTap(ref, event) {
   void guardQuietly(jumpToMessageLink)(ref);
 }
 
-/** The jumps taken by links, the first first; the last is the one a Back undoes. */
-let linkJumps = /** @type {LinkJump[]} */ ([]);
-/** Each jump and each return takes a ticket: a later one ends one still under way. */
-let linkJumpTicket = 0;
-/** How many returns are putting a place back now (`returnToLinkSpot`). */
-let linkReturning = 0;
+// The jumps taken by links, the tickets each jump and return takes, how many returns are putting a place
+// back, and the levels a Back would close with the jumps among them: one owner in
+// web/src/core/navigation/jumps.ts (`#624 voice-page-modularity`).
+const linkJumps = createLinkJumps();
 
 /**
  * Where the reader is, to come back to: the place, the column, and the message their eye is on.
@@ -2108,35 +2105,19 @@ function linkJumpSpot() {
 }
 
 /**
- * The levels a Back would close, with the jumps taken by links among them: the levels open when the
- * last jump was taken, the jump, and what has been opened over it since it landed. While it is under
- * way, nothing it opens is a level of its own; and a level it opened that is closed is forgotten, so
- * a level opened again after it is one over the jump.
+ * The levels a Back would close, with the jumps taken by links among them (`LinkJumps.levels`).
  *
  * @param {string[]} levels what is open, as `backLevels` reads it without the jumps
  */
 function withLinkJumps(levels) {
-  const top = linkJumps[linkJumps.length - 1];
-  if (!top) return levels;
-  // Screens and menus the reader opens while the jump loads are theirs, never the jump's.
-  if (top.landed === null) return [...top.below, "jump", ...levels.filter(ownLevel)];
-  let common = 0;
-  while (common < top.landed.length && top.landed[common] === levels[common]) common += 1;
-  // Not while a return under it is putting a place back: what is open then is on its way.
-  if (common < top.landed.length && linkReturning === 0) top.landed = top.landed.slice(0, common);
-  return [...top.below, "jump", ...levels.slice(common)];
-}
-
-/** Whether level `tag` is one only the reader opens: a screen over the channel, or a menu. */
-function ownLevel(tag) {
-  return tag === "settings" || tag === "help" || tag.startsWith("menu:");
+  return linkJumps.levels(levels);
 }
 
 /** Wait for the channel on screen to have read the view it shows, or to be left; false when it was left. */
 async function linkJumpRead(channel, ticket) {
-  await waitForDeepLink(() => ticket !== linkJumpTicket || String(selectedChannelId()) !== channel ||
+  await waitForDeepLink(() => !linkJumps.current(ticket) || String(selectedChannelId()) !== channel ||
     (replayLedger.started() > 0 && channelStore.current().views.has(viewKey()) && !discordFetchInFlight));
-  return ticket === linkJumpTicket && String(selectedChannelId()) === channel;
+  return linkJumps.current(ticket) && String(selectedChannelId()) === channel;
 }
 
 /** Choose channel `channel` as a link's arrival, which is no choice of the reader's (`#462`). */
@@ -2211,18 +2192,17 @@ async function jumpFromSpot(ref, spot, options = {}) {
     setStatus("That link is to this channel.");
     return;
   }
-  const under = linkJumps[linkJumps.length - 1];
+  const under = linkJumps.top();
   // A jump still under way when another is taken: what it had opened by now is its own.
   if (under && under.landed === null) under.landed = screenLevelsNow();
   // From the call's view nothing is open under the jump: what the channel's view shows is the jump's.
   /** @type {LinkJump} */
   const jump = { spot, below: spot.call ? [] : backLevels(), landed: null };
-  linkJumps.push(jump);
-  const ticket = ++linkJumpTicket;
+  const ticket = linkJumps.take(jump);
   scheduleBackSync();
   try {
     if (options.enter) await options.enter();
-    if (ticket !== linkJumpTicket) return;
+    if (!linkJumps.current(ticket)) return;
     if (ref.channel !== here) {
       arriveOnChannel(ref.channel);
       if (!await linkJumpRead(ref.channel, ticket)) return;
@@ -2262,12 +2242,12 @@ async function jumpFromSpot(ref, spot, options = {}) {
     deepLinks.setFocus({ provider: String(name || ref.service).toLowerCase(), channel, message: ref.message, thread: ref.thread });
     const target = ref.message;
     // A Back while the walk looks further back ends it: nothing lands over the place put back.
-    await seekMessage(target, () => ticket === linkJumpTicket && landOnDeepLink(target, Boolean(options.center)),
-      () => ticket === linkJumpTicket && threadingSupported && selection().view !== "flat" && answeredElsewhere(target));
-    if (ticket === linkJumpTicket && !rowHolding(target)) deepLinks.setFocus(null);
+    await seekMessage(target, () => linkJumps.current(ticket) && landOnDeepLink(target, Boolean(options.center)),
+      () => linkJumps.current(ticket) && threadingSupported && selection().view !== "flat" && answeredElsewhere(target));
+    if (linkJumps.current(ticket) && !rowHolding(target)) deepLinks.setFocus(null);
   } finally {
     // Landed, or given up: what is open now is the jump's, and what opens after is over it.
-    if (jump.landed === null && linkJumps.includes(jump)) {
+    if (jump.landed === null && linkJumps.holds(jump)) {
       jump.landed = screenLevelsNow();
       scheduleBackSync();
     }
@@ -2276,13 +2256,13 @@ async function jumpFromSpot(ref, spot, options = {}) {
 
 /** Undo the last jump: its level goes at once, and the reader is put back where they were. */
 function returnFromLinkJump() {
-  const jump = linkJumps.pop();
+  const jump = linkJumps.undo();
   if (!jump) return;
   // A walk the jump's seek is still making is over: its next step finds another ticket.
   replyJumpTicket += 1;
-  linkReturning += 1;
+  linkJumps.returnStarted();
   void guardQuietly(returnToLinkSpot)(jump.spot).finally(() => {
-    linkReturning -= 1;
+    linkJumps.returnEnded();
     scheduleBackSync();
   });
 }
@@ -2294,7 +2274,7 @@ function returnFromLinkJump() {
  * @param {LinkSpot} spot
  */
 async function returnToLinkSpot(spot) {
-  const ticket = ++linkJumpTicket;
+  const ticket = linkJumps.nextTicket();
   // `#580 open-in-chat-jump`. A jump from the call's view goes back to it, where the reader was.
   if (spot.call) {
     if (currentScreen !== "main" || currentView === "voice") return;
@@ -2324,7 +2304,7 @@ async function returnToLinkSpot(spot) {
   }
   if (put()) return;
   const anchor = spot.anchor;
-  await inColumn(column, () => seekMessage(anchor, () => ticket === linkJumpTicket && putBackOnSpot(spot),
+  await inColumn(column, () => seekMessage(anchor, () => linkJumps.current(ticket) && putBackOnSpot(spot),
     () => threadingSupported && selection().view !== "flat" && answeredElsewhere(anchor)));
 }
 
@@ -34203,8 +34183,7 @@ function forgetToken() {
   // reload after it must not reopen the signed-out reader's place from the query alone.
   deepLinks.signOut();
   // `#543 in-app-message-links`: and the jumps taken by links, whose spots are the signed-out reader's.
-  linkJumps = [];
-  linkJumpTicket += 1;
+  linkJumps.forget();
   try {
     const history = backHistory();
     if (history && typeof window === "object" && window.location) {

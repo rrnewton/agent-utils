@@ -126,6 +126,35 @@ test("`#624 voice-page-modularity`: a plain open, or an address the host cannot 
   assert.equal(NAVIGATION.createDeepLinks({ search: () => "?v=nowhere", arriving: () => false }).wanted(), null, "an unknown view says nothing");
 });
 
+test("`#624 voice-page-modularity`: a jump is a level over what was open, a later ticket ends one under way, and signing out forgets them", () => {
+  const { createLinkJumps, ownLevel } = NAVIGATION;
+  const jumps = createLinkJumps();
+  const spot = { place: null, column: "main", pinned: false, anchor: null, offset: 0, focus: null };
+  assert.deepStrictEqual(jumps.levels(["list"]), ["list"], "no jump, no level");
+  const jump = { spot, below: ["list"], landed: null };
+  const ticket = jumps.take(jump);
+  assert.equal(jumps.current(ticket), true);
+  assert.deepStrictEqual(jumps.levels(["thread", "menu:row", "settings"]), ["list", "jump", "menu:row", "settings"],
+    "while under way only what the reader opens is a level");
+  jump.landed = ["thread"];
+  assert.deepStrictEqual(jumps.levels(["thread", "help"]), ["list", "jump", "help"]);
+  jumps.returnStarted();
+  assert.deepStrictEqual(jumps.levels([]), ["list", "jump"]);
+  assert.deepStrictEqual(jump.landed, ["thread"], "a return putting a place back forgets nothing it opened");
+  jumps.returnEnded();
+  jumps.levels([]);
+  assert.deepStrictEqual(jump.landed, [], "a level the jump opened that was closed is forgotten");
+  const back = jumps.nextTicket();
+  assert.equal(jumps.current(ticket), false, "a return ends the jump under way");
+  assert.equal(jumps.undo(), jump);
+  assert.equal(jumps.holds(jump), false);
+  jumps.take({ spot, below: [], landed: null });
+  jumps.forget();
+  assert.equal(jumps.top(), undefined);
+  assert.equal(jumps.current(back + 1), false, "forgetting ends the jump under way");
+  assert.equal(ownLevel("menu:x") && ownLevel("help") && !ownLevel("thread"), true);
+});
+
 test("`#624 voice-page-modularity`: a place reads back from the query it writes, and a bad escape or an absurd value says nothing", () => {
   const { deepLinkParams, deepLinkPart, deepLinkQuery, DEEP_LINK_VIEWS } = NAVIGATION;
   const ref = { provider: "slack", channel: "C 1", message: "M1", thread: "T1" };
