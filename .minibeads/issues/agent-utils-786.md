@@ -1,13 +1,14 @@
 ---
 title: 'agentctl-start-slot-bind-busy-lock: start drops the slot-owner bind when the wrkslots lock is busy and still returns 0'
-status: open
+status: closed
 priority: 1
-assignee: mu-restore@devbig030
 issue_type: bug
+assignee: mu-restore@devbig030
 labels:
 - agentctl
 created_at: 2026-11-02T18:47:10.938157572+00:00
-updated_at: 2026-11-02T18:47:10.938157572+00:00
+updated_at: 2026-11-02T21:37:21.229204465+00:00
+closed_at: 2026-11-02T21:37:21.229204345+00:00
 ---
 
 # Description
