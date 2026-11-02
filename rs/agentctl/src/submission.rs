@@ -3943,6 +3943,31 @@ mod tests {
         }
     }
 
+    /// #731 agentctl-paste-tail-flush: a split paste leaves only its last
+    /// line in the composer, header gone. It is still ours (a fragment of
+    /// the prompt the queue records as typed), so the next delivery
+    /// submits it first, in both Claude Code and Codex.
+    #[test]
+    fn a_paste_tail_left_by_claude_or_codex_is_submitted_by_the_next_prompt() {
+        let tail = "after. Needs your disposition (ledger-tree file). Details in the queue.";
+        let lane = format!("{LANE}\nfirst line of the message\nsecond line follows here\n{tail}");
+        for harness in ["claude", "codex"] {
+            let queue = TypedQueue::new(harness);
+            queue.typed("lane", &lane, 1.0);
+            let screen = FakeScreen::new(harness, false);
+            screen.leave_draft(tail);
+            let owner = format!("{OWNER}\nstatus?");
+            let followup = (harness == "claude").then_some("Enter");
+            let receipt = receipt(submit_following(&screen, &queue, &owner, followup));
+            assert_eq!(taken(&screen), [tail.to_owned(), owner], "{harness}");
+            assert_eq!(receipt.key_presses, 1, "{harness}");
+            assert!(
+                queue.record("lane")["draft_recovered_at"].is_number(),
+                "{harness}"
+            );
+        }
+    }
+
     #[test]
     fn a_draft_agentctl_did_not_type_is_left_untouched_in_claude_and_codex() {
         let lane = format!("{LANE}\none\ntwo\nthree\nfour");

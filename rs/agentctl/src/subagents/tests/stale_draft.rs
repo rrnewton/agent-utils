@@ -133,6 +133,47 @@ fn a_draft_agentctl_typed_is_submitted_by_the_next_delivery_with_no_human_action
     }
 }
 
+/// #731 agentctl-paste-tail-flush: a multi-line paste split on the way in
+/// and left only its last line in the editor, header gone. The next
+/// delivery recognises the tail as ours, presses Enter on it, and only
+/// then types its own message.
+#[test]
+fn a_paste_tail_left_in_muse_is_flushed_by_the_next_delivery() {
+    let fixture = Fixture::new();
+    let manager = start_muse(&fixture, false);
+    let lane = format!(
+        "{LANE}\nfirst line of the message\nsecond line follows here\nafter. Needs your disposition (ledger-tree file). Details in the queue."
+    );
+    manager
+        .send_identified_with_runtime("coord", &lane, quick(), "lane", &Clock::default())
+        .unwrap();
+    // The split: only the last line stayed in the editor, unsent.
+    editor(&fixture, |editor| {
+        editor.draft("after. Needs your disposition (ledger-tree file). Details in the queue.")
+    });
+    fixture.client.keys_sent.lock().unwrap().clear();
+
+    let owner = format!("{OWNER}\nare you there?");
+    let result = manager
+        .send_identified_with_runtime("coord", &owner, quick(), "chat-7", &Clock::default())
+        .unwrap();
+    assert_eq!(result.delivered, ["chat-7"]);
+    // One Enter submits the tail, one the owner's message.
+    assert_eq!(keys(&fixture), ["Enter", "Enter"]);
+    let screen = editor(&fixture, |editor| {
+        assert!(editor.staged().is_none(), "the editor is empty");
+        editor.screen()
+    });
+    assert!(
+        screen.contains("after. Needs your disposition"),
+        "tail was submitted as its own turn: {screen}"
+    );
+    assert!(screen.contains("are you there?"), "{screen}");
+    let recovered = processed(&manager, "lane");
+    assert!(recovered["draft_recovered_at"].is_number(), "{recovered}");
+    assert_eq!(processed(&manager, "chat-7")["delivery_state"], "processed");
+}
+
 #[test]
 fn a_draft_agentctl_did_not_type_is_refused_and_reported_never_submitted() {
     for busy in [true, false] {

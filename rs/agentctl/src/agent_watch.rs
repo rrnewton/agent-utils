@@ -831,6 +831,21 @@ struct WatchState {
     /// When the watcher last ran `agent-teams pump` for this host's outbox (#721).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     team_pump_at: Option<f64>,
+    /// Unsent drafts of ours under the idle sweep (#731
+    /// agentctl-paste-tail-flush), by agent.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    draft_sweeps: BTreeMap<String, DraftSweep>,
+}
+
+/// One agent's unsent draft of ours under the idle sweep (#731
+/// agentctl-paste-tail-flush): when this exact draft was first seen, how
+/// often flushing it failed, and whether the blockage was reported.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct DraftSweep {
+    first_seen: f64,
+    fingerprint: String,
+    failures: u32,
+    blocked_reported: bool,
 }
 
 /// An owner (chat-bridge) request waiting undelivered in a registered agent's queue.
@@ -886,6 +901,24 @@ pub trait Probe {
     fn visible_screens(&mut self) -> Vec<(String, String)> {
         Vec::new()
     }
+    /// Editor screens for the draft sweep (#731 agentctl-paste-tail-flush):
+    /// (agent, screen, harness). The default keeps only names and screens,
+    /// which the sweep cannot read a composer from, so it stays out.
+    fn editor_screens(&mut self) -> Vec<(String, String, String)> {
+        self.visible_screens()
+            .into_iter()
+            .map(|(agent, screen)| (agent, screen, String::new()))
+            .collect()
+    }
+    /// The queue directory holding one agent's typed-prompt records, which
+    /// is what proves an editor draft is agentctl's own.
+    fn agent_queue(&self, _agent: &str) -> Option<PathBuf> {
+        None
+    }
+    /// The harness one agent runs, for parsing its editor screen.
+    fn agent_harness(&self, _agent: &str) -> Option<String> {
+        None
+    }
     /// Every owner (chat-bridge) request waiting undelivered in a registered agent's queue. The
     /// default sees none.
     fn waiting_owner_prompts(&mut self) -> Vec<WaitingOwnerPrompt> {
@@ -930,6 +963,13 @@ pub trait Notifier {
     /// as a priority sender. The default sends it as any other.
     fn notify_urgent(&mut self, coordinator: &str, text: &str, message_id: &str) -> Result<String> {
         self.notify(coordinator, text, message_id)
+    }
+    /// Press Enter on a draft agentctl itself typed that sits unsent in
+    /// `agent`'s editor, verifying the editor cleared (#731
+    /// agentctl-paste-tail-flush). The default cannot act, only report.
+    fn flush_draft(&mut self, agent: &str) -> Result<String> {
+        let _ = agent;
+        Err(fail("this notifier cannot flush editor drafts"))
     }
     /// Refresh an observed session within a positively pinned native process lifetime.
     fn follow_observed_session(&mut self, _agent: &str) -> Result<bool> {
@@ -2668,6 +2708,28 @@ fn watch_agents_once(
     let delivery_waits = report_delivery_jams(probe, notifier, state, now, options);
     let owner_waits = report_waiting_owner_prompts(probe, notifier, state, now, options);
     let quarantines = report_quarantines(probe, notifier, state, now, options);
+    // Idle sweep (#731 agentctl-paste-tail-flush): submit a draft of ours
+    // that has sat unsent in an idle agent's editor, on this pass's own
+    // screens so no second read is needed.
+    let draft_sweeps = sweep_editor_drafts(
+        probe,
+        notifier,
+        state,
+        observations
+            .iter()
+            .filter_map(|row| {
+                row.screen.clone().map(|screen| {
+                    (
+                        row.name.clone(),
+                        screen,
+                        row.harness.clone().unwrap_or_default(),
+                    )
+                })
+            })
+            .collect(),
+        now,
+        options,
+    );
     // Agent-teams health (#721): declaration red flags, undeliverable notices, and the
     // outbox pump. A failed probe pass says nothing about declarations, so their state is
     // left as it was.
@@ -2731,6 +2793,7 @@ fn watch_agents_once(
         "delivery_waits": delivery_waits,
         "owner_waits": owner_waits,
         "quarantines": quarantines,
+        "draft_sweeps": draft_sweeps,
         "team_declarations": team_flags,
         "team_declarations_notice": team_flags_notice,
         "team_notices": team_notices,
@@ -2769,12 +2832,13 @@ fn check_blocked(
     options: &WatchAgentsOptions,
 ) -> Option<Value> {
     let mut found = Vec::new();
-    for (name, screen) in probe.visible_screens() {
-        let Some((kind, detail)) = blocked_finding(&screen).filter(|(kind, _)| kind.is_blocked())
+    let visible = probe.visible_screens();
+    for (name, screen) in &visible {
+        let Some((kind, detail)) = blocked_finding(screen).filter(|(kind, _)| kind.is_blocked())
         else {
             continue;
         };
-        let Some(memory) = state.agents.get(&name) else {
+        let Some(memory) = state.agents.get(name) else {
             continue;
         };
         let route = memory.route.clone();
@@ -2783,7 +2847,7 @@ fn check_blocked(
             // due since, and is neither sent nor owed, is new.
             Some(episode) if episode.kind == kind => {
                 if episode.notified
-                    || owes_notice(state, &name, kind)
+                    || owes_notice(state, name, kind)
                     || now - episode.since < episode_window(&episode, options)
                 {
                     continue;
@@ -2799,7 +2863,7 @@ fn check_blocked(
             }
             other => {
                 if let Some(cleared) = other {
-                    withdraw_pending(state, &name, &cleared);
+                    withdraw_pending(state, name, &cleared);
                 }
                 let episode = Episode {
                     kind,
@@ -2810,13 +2874,13 @@ fn check_blocked(
                     window: None,
                 };
                 let due = episode_window(&episode, options) <= 0.0;
-                if let Some(memory) = state.agents.get_mut(&name) {
+                if let Some(memory) = state.agents.get_mut(name) {
                     memory.episode = Some(episode);
                 }
                 (now, due)
             }
         };
-        if due && !owes_notice(state, &name, kind) {
+        if due && !owes_notice(state, name, kind) {
             state.pending.push(PendingNotice {
                 agent: name.clone(),
                 kind,
@@ -2831,12 +2895,26 @@ fn check_blocked(
         }
         found.push(json!({"agent": name, "kind": kind.as_str(), "detail": detail, "due": due}));
     }
+    // The draft sweep runs on the quick check too (#731
+    // agentctl-paste-tail-flush), on the screens just read.
+    let editor_screens: Vec<(String, String, String)> = visible
+        .iter()
+        .map(|(name, screen)| {
+            (
+                name.clone(),
+                screen.clone(),
+                probe.agent_harness(name).unwrap_or_default(),
+            )
+        })
+        .collect();
+    let draft_sweeps = sweep_editor_drafts(probe, notifier, state, editor_screens, now, options);
     let retry_due = state.batches.iter().any(|batch| !batch.retry.waiting(now));
-    if found.is_empty() && !retry_due {
+    if found.is_empty() && draft_sweeps.is_empty() && !retry_due {
         return None;
     }
     let notice = flush_notices(state, notifier, now, options);
-    Some(json!({"checked_at": now, "found": found, "notice": notice}))
+    Some(json!({"checked_at": now, "found": found, "notice": notice,
+                "draft_sweeps": draft_sweeps}))
 }
 
 /// Report, once per jam, each agent whose senders have waited for its lifecycle lock longer
@@ -3007,6 +3085,139 @@ fn owner_wait_hint(agent: &str, reason: &str) -> String {
         "`agentctl chat status --registry REGISTRY --bridge-state DIR` shows the requests. "
             .to_owned()
     }
+}
+
+/// How long a draft of ours may sit unsent in an idle agent's editor
+/// before the sweep submits it (#731 agentctl-paste-tail-flush).
+const DRAFT_SWEEP_AGE: Duration = Duration::from_secs(60);
+
+/// The idle sweep over editor drafts (#731 agentctl-paste-tail-flush):
+/// a draft the agent's own queue records prove agentctl typed — a whole
+/// prompt or a paste tail fragment of one — that has sat unsent for
+/// [`DRAFT_SWEEP_AGE`] gets Enter, with a notice to the coordinator.
+/// Text agentctl cannot recognise as its own is never submitted or
+/// cleared (the quarantines report already covers it as a staged pane).
+/// A flush that fails twice is reported blocked, once per draft.
+fn sweep_editor_drafts(
+    probe: &mut dyn Probe,
+    notifier: &mut dyn Notifier,
+    state: &mut WatchState,
+    screens: Vec<(String, String, String)>,
+    now: f64,
+    options: &WatchAgentsOptions,
+) -> Vec<Value> {
+    let mut rows = Vec::new();
+    let coordinator = options.coordinator.clone();
+    for (agent, screen, harness) in screens {
+        let Some(view) = crate::submission::composer_view(&harness, &screen) else {
+            continue;
+        };
+        let Some(draft) = crate::submission::composer_draft(&view) else {
+            state.draft_sweeps.remove(&agent);
+            continue;
+        };
+        let Some(queue) = probe.agent_queue(&agent) else {
+            continue;
+        };
+        let prompt = crate::stale_draft::find(
+            &queue,
+            &draft,
+            crate::stale_draft::Vouching::Recent,
+            UNIX_EPOCH + Duration::from_secs_f64(now.max(0.0)),
+        );
+        let Some(prompt) = prompt else {
+            state.draft_sweeps.remove(&agent);
+            continue;
+        };
+        let fingerprint = format!("{:016x}", stable_hash(&format!("{draft:?}")));
+        let entry = state
+            .draft_sweeps
+            .entry(agent.clone())
+            .or_insert_with(|| DraftSweep {
+                first_seen: now,
+                fingerprint: fingerprint.clone(),
+                failures: 0,
+                blocked_reported: false,
+            });
+        if entry.fingerprint != fingerprint {
+            *entry = DraftSweep {
+                first_seen: now,
+                fingerprint: fingerprint.clone(),
+                failures: 0,
+                blocked_reported: false,
+            };
+        }
+        let age = prompt
+            .typed_at
+            .filter(|typed_at| *typed_at > 0.0)
+            .map_or(now - entry.first_seen, |typed_at| now - typed_at);
+        if options.check_only {
+            rows.push(json!({"agent": agent, "id": prompt.id, "draft": "ours",
+                             "due": true, "age_seconds": age.max(0.0)}));
+            continue;
+        }
+        if age < DRAFT_SWEEP_AGE.as_secs_f64() {
+            rows.push(json!({"agent": agent, "id": prompt.id, "draft": "ours",
+                             "action": "waiting", "age_seconds": age.max(0.0)}));
+            continue;
+        }
+        match notifier.flush_draft(&agent) {
+            Ok(evidence) => {
+                state.draft_sweeps.remove(&agent);
+                let _ = notifier.notify_urgent(
+                    &coordinator,
+                    &format!(
+                        "agentctl watch flushed an unsent draft agentctl had typed into \
+                         {agent}'s editor (idle sweep): {evidence}"
+                    ),
+                    &format!("draft-swept:{agent}:{}", prompt.id),
+                );
+                rows.push(json!({"agent": agent, "id": prompt.id, "draft": "ours",
+                                 "action": "flushed", "detail": evidence}));
+            }
+            Err(error) => {
+                let failures = {
+                    let entry =
+                        state
+                            .draft_sweeps
+                            .entry(agent.clone())
+                            .or_insert_with(|| DraftSweep {
+                                first_seen: now,
+                                fingerprint: fingerprint.clone(),
+                                failures: 0,
+                                blocked_reported: false,
+                            });
+                    entry.failures += 1;
+                    entry.failures
+                };
+                let mut row = json!({"agent": agent, "id": prompt.id, "draft": "ours",
+                                     "action": "flush-failed", "failures": failures,
+                                     "detail": error.to_string()});
+                if failures >= 2
+                    && !state
+                        .draft_sweeps
+                        .get(&agent)
+                        .is_some_and(|entry| entry.blocked_reported)
+                {
+                    if let Some(entry) = state.draft_sweeps.get_mut(&agent) {
+                        entry.blocked_reported = true;
+                    }
+                    let _ = notifier.notify_urgent(
+                        &coordinator,
+                        &format!(
+                            "BLOCKED: agentctl watch could not flush an unsent draft it \
+                             typed into {agent}'s editor after {failures} tries: {error}. \
+                             Press Enter in {agent}'s pane, or clear it if it is yours."
+                        ),
+                        &format!("draft-sweep-blocked:{agent}:{}", prompt.id),
+                    );
+                    row["blocked"] = json!(true);
+                }
+                rows.push(row);
+            }
+        }
+    }
+    rows
 }
 
 /// Report, once each, every prompt a drain quarantined as a probable misroute within
@@ -3849,6 +4060,36 @@ impl<A: ManagedApi + ?Sized> Probe for ManagedProbe<'_, A> {
             .flatten()
     }
 
+    fn editor_screens(&mut self) -> Vec<(String, String, String)> {
+        let Ok(manager) = ManagedAgents::new(self.client, &self.registry) else {
+            return Vec::new();
+        };
+        let screened = std::mem::take(&mut self.screened);
+        let screens: Vec<(String, String, String)> = screened
+            .iter()
+            .filter_map(|name| {
+                let harness = manager.harness_name(name).ok()?;
+                let (_, screen) = manager.watch_visible(name, SCREEN_LINES).ok()?;
+                Some((name.clone(), screen, harness))
+            })
+            .collect();
+        self.screened = screened;
+        screens
+    }
+
+    fn agent_queue(&self, agent: &str) -> Option<PathBuf> {
+        agent_queues(&self.registry)
+            .into_iter()
+            .find_map(|(name, queue)| (name == agent).then_some(queue))
+    }
+
+    fn agent_harness(&self, agent: &str) -> Option<String> {
+        ManagedAgents::new(self.client, &self.registry)
+            .ok()?
+            .harness_name(agent)
+            .ok()
+    }
+
     fn team_undeliverable_notices(&mut self) -> Vec<(PathBuf, Value)> {
         crate::subagents::team_undeliverable_notices(&self.registry, &self.teams_state)
     }
@@ -4173,6 +4414,10 @@ impl<A: ManagedApi + ?Sized> Notifier for ManagedNotifier<'_, A> {
             text,
             message_id,
         )
+    }
+
+    fn flush_draft(&mut self, agent: &str) -> Result<String> {
+        ManagedAgents::new(self.client, &self.registry)?.flush_stale_draft(agent)
     }
 
     fn acknowledge_team_notice(&mut self, path: &Path) -> std::result::Result<(), String> {
@@ -4634,9 +4879,22 @@ mod tests {
         urgent: Vec<String>,
         interrupted: Vec<String>,
         press_nothing: bool,
+        /// Agents whose editor draft a flush was attempted for (#731).
+        flushes: Vec<String>,
+        /// Whether every flush attempt fails (#731).
+        flush_fails: bool,
     }
 
     impl Notifier for RecordingNotifier {
+        fn flush_draft(&mut self, agent: &str) -> Result<String> {
+            self.flushes.push(agent.to_owned());
+            if self.flush_fails {
+                Err(fail("the Enter did not clear the editor"))
+            } else {
+                Ok("submitted the draft agentctl typed".to_owned())
+            }
+        }
+
         fn interrupt_and_deliver(&mut self, agent: &str, _expected: u64) -> Result<Interrupt> {
             self.interrupted.push(agent.to_owned());
             Ok(Interrupt {
@@ -4691,6 +4949,159 @@ mod tests {
         options: &WatchAgentsOptions,
     ) -> Value {
         watch_agents_once(probe, notifier, state, now, options)
+    }
+
+    /// #731 agentctl-paste-tail-flush sweep fixture: one agent whose editor
+    /// holds a draft, and one queue proving what agentctl typed.
+    struct SweepProbe {
+        queue: PathBuf,
+        screens: Vec<(String, String, String)>,
+    }
+
+    impl Probe for SweepProbe {
+        fn observe(&mut self) -> Result<Vec<Observation>> {
+            Ok(Vec::new())
+        }
+        fn editor_screens(&mut self) -> Vec<(String, String, String)> {
+            self.screens.clone()
+        }
+        fn agent_queue(&self, _agent: &str) -> Option<PathBuf> {
+            Some(self.queue.clone())
+        }
+    }
+
+    fn sweep_queue(tag: &str, typed_at: f64) -> PathBuf {
+        use std::os::unix::fs::DirBuilderExt;
+        let queue =
+            std::env::temp_dir().join(format!("agentctl-sweep-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&queue);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(queue.join("processed"))
+            .unwrap();
+        let prompt = "[from lane-a via agentctl · reply: agentctl send lane-a]\nfirst line of the message\nsecond line follows here\nafter. Needs your disposition (ledger-tree file). Details in the queue.";
+        crate::agent::atomic_json(
+            &queue.join("processed/lane.json"),
+            &json!({"id": "lane", "text": prompt, "delivery_state": "processed",
+                    "inflight_at": typed_at}),
+        )
+        .unwrap();
+        queue
+    }
+
+    fn sweep_screen(draft: &str) -> String {
+        let screen = crate::submission::fake::FakeScreen::new("claude", false);
+        screen.leave_draft(draft);
+        screen.render()
+    }
+
+    const SWEEP_TAIL: &str =
+        "after. Needs your disposition (ledger-tree file). Details in the queue.";
+
+    #[test]
+    fn an_idle_sweep_flushes_our_old_tail_and_notices_the_coordinator() {
+        let queue = sweep_queue("old", 1_000.0);
+        let mut probe = SweepProbe {
+            queue: queue.clone(),
+            screens: vec![("worker".into(), sweep_screen(SWEEP_TAIL), "claude".into())],
+        };
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        let screens = probe.screens.clone();
+        let rows = sweep_editor_drafts(
+            &mut probe,
+            &mut notifier,
+            &mut state,
+            screens,
+            1_120.0,
+            &options(),
+        );
+        assert_eq!(rows[0]["action"], "flushed", "{rows:?}");
+        assert_eq!(notifier.flushes, ["worker"]);
+        assert!(
+            notifier
+                .urgent
+                .iter()
+                .any(|id| id == "draft-swept:worker:lane"),
+            "{:?}",
+            notifier.urgent
+        );
+        assert!(state.draft_sweeps.is_empty());
+        let _ = std::fs::remove_dir_all(&queue);
+    }
+
+    #[test]
+    fn an_idle_sweep_waits_for_a_fresh_tail_and_never_touches_foreign_text() {
+        let queue = sweep_queue("fresh", 1_100.0);
+        let mut probe = SweepProbe {
+            queue: queue.clone(),
+            screens: vec![("worker".into(), sweep_screen(SWEEP_TAIL), "claude".into())],
+        };
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        let screens = probe.screens.clone();
+        let rows = sweep_editor_drafts(
+            &mut probe,
+            &mut notifier,
+            &mut state,
+            screens,
+            1_120.0,
+            &options(),
+        );
+        assert_eq!(rows[0]["action"], "waiting", "{rows:?}");
+        assert!(notifier.flushes.is_empty());
+        // Foreign text: never flushed, never noticed.
+        probe.screens = vec![(
+            "worker".into(),
+            sweep_screen("a person's own half-written note"),
+            "claude".into(),
+        )];
+        let screens = probe.screens.clone();
+        let rows = sweep_editor_drafts(
+            &mut probe,
+            &mut notifier,
+            &mut state,
+            screens,
+            9_999.0,
+            &options(),
+        );
+        assert!(rows.is_empty(), "{rows:?}");
+        assert!(notifier.flushes.is_empty());
+        let _ = std::fs::remove_dir_all(&queue);
+    }
+
+    #[test]
+    fn a_flush_that_fails_twice_is_reported_blocked_once() {
+        let queue = sweep_queue("blocked", 1_000.0);
+        let mut probe = SweepProbe {
+            queue: queue.clone(),
+            screens: vec![("worker".into(), sweep_screen(SWEEP_TAIL), "claude".into())],
+        };
+        let mut notifier = RecordingNotifier {
+            flush_fails: true,
+            ..RecordingNotifier::default()
+        };
+        let mut state = WatchState::default();
+        for now in [1_120.0, 1_180.0, 1_240.0] {
+            let screens = probe.screens.clone();
+            sweep_editor_drafts(
+                &mut probe,
+                &mut notifier,
+                &mut state,
+                screens,
+                now,
+                &options(),
+            );
+        }
+        assert_eq!(notifier.flushes.len(), 3);
+        let blocked: Vec<&String> = notifier
+            .urgent
+            .iter()
+            .filter(|id| id.starts_with("draft-sweep-blocked:"))
+            .collect();
+        assert_eq!(blocked.len(), 1, "{:?}", notifier.urgent);
+        let _ = std::fs::remove_dir_all(&queue);
     }
 
     const PROMPT_SCREEN: &str = "◆ some earlier work\nWould you like to run the following command?\n  $ make validate\n❯ Yes\n  No\n";

@@ -9957,6 +9957,12 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     /// The agent's visible rows, bottom `lines` of them, read as plain text after the same
     /// checks as [`Self::watch_read`]: a cheap read that tells an observer whether the screen
     /// changed.
+    /// The harness one registered agent runs, for readers that must parse
+    /// its screen (the watcher's draft sweep, #731 agentctl-paste-tail-flush).
+    pub(crate) fn harness_name(&self, agent_name: &str) -> Result<String> {
+        Ok(self.load(agent_name)?.harness)
+    }
+
     pub(crate) fn watch_visible(&self, agent_name: &str, lines: usize) -> Result<(String, String)> {
         let record = self.load(agent_name)?;
         let info = self.checked_policy(&record, false)?;
@@ -10216,6 +10222,35 @@ its drain would also type, so it was not queued",
     /// screen shows neither a running turn nor queued input.
     pub fn interrupt_and_submit(&self, agent_name: &str) -> Result<Value> {
         self.interrupt_with(agent_name, true, None)
+    }
+
+    /// Flush a draft agentctl itself typed that is still sitting unsent in
+    /// the agent's editor (#731 agentctl-paste-tail-flush, the idle
+    /// sweep): press Enter on it and verify the editor cleared. A draft
+    /// agentctl cannot recognise as its own is never submitted; the
+    /// caller reports it instead.
+    pub fn flush_stale_draft(&self, agent_name: &str) -> Result<String> {
+        let _lock = self.lock(agent_name)?;
+        let record = self.load(agent_name)?;
+        record.input_allowed()?;
+        self.checked(&record)?;
+        let queue = self.queue(&record.name)?;
+        let mut client = self.workspace_client(&record);
+        client.queue = Some(&queue);
+        client.expected_workspace = self.project_workspace()?;
+        let pane_id = record
+            .pane_id
+            .clone()
+            .ok_or_else(|| fail(format!("agent {agent_name} has no pane")))?;
+        match client.recover_stale_draft_with_runtime(&pane_id, &agent::SystemRuntime::default()) {
+            Ok(Some(evidence)) => Ok(evidence),
+            Ok(None) => Err(fail(format!(
+                "agent {agent_name}'s editor holds no draft agentctl can submit"
+            ))),
+            Err(error) => Err(fail(format!(
+                "agent {agent_name}'s unsent draft could not be flushed: {error}"
+            ))),
+        }
     }
 
     /// Interrupt a stuck turn and deliver everything queued for the agent (the watcher's

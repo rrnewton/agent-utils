@@ -38,6 +38,13 @@ use crate::submission::{PromptTerminal, Submission, SubmitTimeouts};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
+/// #731 agentctl-paste-tail-flush: the minimum quiet gap between two
+/// deliveries of one burst to the same pane, and the bound on waiting for
+/// the harness to accept the previous one (editor empty) before typing
+/// the next. Bursts typed back-to-back are what split multi-line pastes.
+const BURST_MIN_GAP: Duration = Duration::from_millis(250);
+const BURST_ACCEPT_BOUND: Duration = Duration::from_secs(10);
+
 /// Identity assertions for one already-running interactive Herdr agent.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Target {
@@ -1338,6 +1345,10 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
     let mut cancelled = Vec::new();
     let mut typed = 0_usize;
     let mut blocked = None;
+    // Burst pacing (#731 agentctl-paste-tail-flush): deliveries the last
+    // pace already followed, and when the last one confirmed.
+    let mut burst_delivered_seen = 0usize;
+    let mut burst_last_confirmed: Option<Duration> = None;
     let mut target_lock: Option<TargetLock> = None;
     let mut locked_pane_id: Option<String> = None;
     let mut initial_info: Option<AgentPaneInfo> = None;
@@ -1358,6 +1369,36 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
         let path = path_ref.clone();
         if batched.contains(&path) {
             continue 'message;
+        }
+        // Burst pacing (#731 agentctl-paste-tail-flush): after a
+        // confirmed delivery, do not type the next message of the burst
+        // until the harness has taken the previous one (editor empty)
+        // and a minimum gap has passed. A tail of ours still sitting in
+        // the editor is flushed by the pace, never typed over.
+        if delivered.len() > burst_delivered_seen {
+            burst_last_confirmed = Some(runtime.monotonic());
+            burst_delivered_seen = delivered.len();
+        }
+        if let Some(last_confirmed) = burst_last_confirmed {
+            match pace_burst(
+                client,
+                locked_pane_id.as_deref().unwrap_or_default(),
+                initial_info.as_ref().and_then(|info| info.agent.as_deref()),
+                runtime,
+                last_confirmed,
+            ) {
+                Ok(Some(report)) => {
+                    blocked = Some(report);
+                    break 'message;
+                }
+                Ok(None) => burst_last_confirmed = None,
+                Err(error) => {
+                    blocked = Some(format!(
+                        "burst pacing failed before the next delivery: {error}"
+                    ));
+                    break 'message;
+                }
+            }
         }
         if options.max_items.is_some_and(|limit| typed >= limit) {
             blocked = Some(format!(
@@ -2716,6 +2757,62 @@ impl From<AgentError> for Undelivered {
             error,
             probable_misroute: false,
         }
+    }
+}
+
+/// Burst pacing between two deliveries of one drain to the same pane
+/// (#731 agentctl-paste-tail-flush): wait the minimum gap, then until the
+/// editor no longer holds a draft — the previous message was accepted —
+/// flushing a tail of ours left there. Returns `Some(report)` when the
+/// bound is hit or the draft is not ours to flush: the drain stops and
+/// reports it instead of typing over text. Where the composer cannot be
+/// read, the gap alone paces.
+fn pace_burst<A: AgentApi + ?Sized>(
+    client: &A,
+    pane_id: &str,
+    harness: Option<&str>,
+    runtime: &dyn AgentRuntime,
+    last_confirmed: Duration,
+) -> crate::error::Result<Option<String>> {
+    let elapsed = runtime.monotonic().saturating_sub(last_confirmed);
+    if elapsed < BURST_MIN_GAP {
+        runtime.sleep(BURST_MIN_GAP - elapsed);
+    }
+    let Some(harness) = harness else {
+        return Ok(None);
+    };
+    if pane_id.is_empty() {
+        return Ok(None);
+    }
+    let deadline = runtime.monotonic() + BURST_ACCEPT_BOUND;
+    loop {
+        // A tail of ours still in the editor is submitted here, never
+        // typed over; a failure to flush is reported, not retried forever.
+        match client.recover_stale_draft_with_runtime(pane_id, runtime) {
+            Ok(Some(_)) => {}
+            Ok(None) => {}
+            Err(error) => {
+                return Ok(Some(format!(
+                    "burst pacing: agentctl could not flush a draft it typed into pane {pane_id}: {error}"
+                )));
+            }
+        }
+        let Ok(screen) = client.read_with_runtime(pane_id, "visible", Some(200), runtime) else {
+            return Ok(None);
+        };
+        let Some(view) = crate::submission::composer_view(harness, &screen) else {
+            return Ok(None);
+        };
+        if crate::submission::composer_draft(&view).is_none() {
+            return Ok(None);
+        }
+        if runtime.monotonic() >= deadline {
+            return Ok(Some(format!(
+                "burst pacing bound hit: the editor of pane {pane_id} still holds a draft {}s after the previous delivery; the next message was not typed",
+                BURST_ACCEPT_BOUND.as_secs()
+            )));
+        }
+        runtime.sleep(Duration::from_millis(100));
     }
 }
 
@@ -4536,6 +4633,65 @@ mod tests {
         assert!(
             fake.waits().is_empty(),
             "screen proof replaces the working wait"
+        );
+    }
+
+    /// #731 agentctl-paste-tail-flush: a burst of five multi-line messages
+    /// to one pane arrives intact and in order, each typed once, with the
+    /// burst pace (editor taken + minimum gap) between deliveries.
+    #[test]
+    fn a_burst_of_five_multiline_messages_arrives_intact_in_order() {
+        let directory = TestDirectory::new("burst-five");
+        prepare(directory.path()).unwrap();
+        let fake =
+            FakeAgent::with_screen(crate::submission::fake::FakeScreen::new("claude", false));
+        {
+            let mut state = fake.state.lock().expect("fake state");
+            let info = state.infos.get_mut("w1:p1").expect("pane info");
+            info.agent = Some("claude".to_owned());
+            info.session_agent = Some("claude".to_owned());
+        }
+        let target = Target {
+            session_agent: Some("claude".to_owned()),
+            expected_agent: Some("claude".to_owned()),
+            ..target()
+        };
+        let mut texts = Vec::new();
+        for n in 1..=5 {
+            let text = format!(
+                "[from lane-{n} via agentctl · reply: agentctl send lane-{n}]\nmessage {n} first line\nmessage {n} second line needs disposition"
+            );
+            texts.push(text.clone());
+            let entry = json!({"id": format!("burst-{n}"), "text": text,
+                               "queued_at": n, "delivery_attempts": 0});
+            fs::write(
+                directory.path().join(format!("inbox/burst-{n}.json")),
+                serde_json::to_string(&entry).unwrap(),
+            )
+            .unwrap();
+        }
+        let runtime = FakeRuntime::default();
+        let result = drain_with_runtime(
+            &fake,
+            &target,
+            directory.path(),
+            DrainOptions::default(),
+            &runtime,
+        )
+        .unwrap();
+        assert_eq!(
+            result.delivered,
+            ["burst-1", "burst-2", "burst-3", "burst-4", "burst-5"]
+        );
+        let screen = fake.screen.as_ref().unwrap().state();
+        // The first starts a turn; the rest queue behind it, each intact.
+        assert_eq!(screen.submitted, texts[..1], "first intact");
+        assert_eq!(screen.queued, texts[1..], "rest intact and in order");
+        // The pace waited at least the minimum gap between deliveries.
+        assert!(
+            runtime.millis.load(AtomicOrdering::SeqCst) >= (4 * BURST_MIN_GAP.as_millis()) as u64,
+            "paced: {}ms",
+            runtime.millis.load(AtomicOrdering::SeqCst)
         );
     }
 

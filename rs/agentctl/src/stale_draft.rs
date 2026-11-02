@@ -232,6 +232,26 @@ pub(crate) fn text_matches(draft: &str, candidate: &str) -> bool {
     !draft.is_empty() && draft == without_sent_fields(&compact(candidate))
 }
 
+/// The shortest draft, in whitespace-free characters, that may count as a
+/// fragment of a typed prompt (#731 agentctl-paste-tail-flush): below this a
+/// person's own short text is too likely to coincide with words agentctl
+/// typed, so it is never submitted on this evidence alone.
+pub(crate) const MIN_FRAGMENT_CHARS: usize = 16;
+
+/// Whether a draft whose text shows is a fragment of `candidate`: a suffix
+/// or contiguous substring of it, wrapping and whitespace ignored, shorter
+/// than the whole prompt (the whole prompt is [`text_matches`]). This is
+/// what a split multi-line paste leaves behind: the last line or lines of a
+/// message, without its sender header (#731 agentctl-paste-tail-flush).
+pub(crate) fn fragment_matches(draft: &str, candidate: &str) -> bool {
+    let draft = without_sent_fields(&compact(draft));
+    if draft.chars().count() < MIN_FRAGMENT_CHARS {
+        return false;
+    }
+    let candidate = without_sent_fields(&compact(candidate));
+    draft.len() < candidate.len() && candidate.contains(&draft)
+}
+
 /// The character count Muse and Codex show for a paste of `text`: code points, CRLF as one.
 fn paste_length(text: &str) -> usize {
     text.chars().count() - text.matches("\r\n").count()
@@ -325,15 +345,27 @@ pub(crate) fn find(
             .parent()
             .and_then(Path::file_name)
             .is_some_and(|phase| phase == "failed");
-        if vouching == Vouching::Unproven && !quarantined {
-            continue;
-        }
         let matched = typed_texts(document).into_iter().any(|text| {
-            framed(text)
-                && match draft {
-                    Draft::Text(rows) => text_matches(rows, text),
-                    _ => placeholder_matches(draft, text, document),
+            if !framed(text) {
+                return false;
+            }
+            match draft {
+                // A whole prompt, or a fragment of one (the tail a split
+                // paste leaves, #731 agentctl-paste-tail-flush). A whole
+                // prompt under `Unproven` vouches only when quarantined:
+                // a person may have recalled it with the history keys. A
+                // fragment is not what recall produces (that is the whole
+                // prompt), so a fragment vouches either way.
+                Draft::Text(rows) => {
+                    fragment_matches(rows, text)
+                        || (text_matches(rows, text)
+                            && (vouching == Vouching::Recent || quarantined))
                 }
+                _ => {
+                    placeholder_matches(draft, text, document)
+                        && (vouching == Vouching::Recent || quarantined)
+                }
+            }
         });
         if matched {
             return Some(typed_prompt(path, document, Vec::new()));
@@ -567,6 +599,64 @@ message number {index:02}"
             &json!({"text": text(10), "inflight_at": 300.0}),
         );
         assert!(find(queue, &Draft::Text(text(10)), Vouching::Recent, now).is_none());
+    }
+
+    #[test]
+    fn a_paste_tail_fragment_is_ours_but_short_or_foreign_text_is_not() {
+        // #731 agentctl-paste-tail-flush: a split multi-line paste leaves
+        // its last line(s) in the editor, without the sender header.
+        let directory = Scratch::new("fragment");
+        let queue = directory.0.as_path();
+        let prompt = format!(
+            "{HEADER}\nfirst line of the message\nsecond line follows here\nafter. Needs your disposition (ledger-tree file). Details in the queue."
+        );
+        record(
+            queue,
+            "processed",
+            "m1",
+            &json!({"text": prompt, "inflight_at": 100.0}),
+        );
+        let now = SystemTime::now();
+        // The tail line alone (the live shape) is ours.
+        let tail = "after. Needs your disposition (ledger-tree file). Details in the queue.";
+        let found = find(queue, &Draft::Text(tail.to_owned()), Vouching::Recent, now)
+            .expect("tail fragment found");
+        assert_eq!(found.id, "m1");
+        // A fragment also vouches under Unproven (Claude Code / Codex):
+        // history recall produces a whole prompt, never a tail.
+        assert!(find(
+            queue,
+            &Draft::Text(tail.to_owned()),
+            Vouching::Unproven,
+            now
+        )
+        .is_some());
+        // A middle slice, wrapped differently, is ours too.
+        assert!(find(
+            queue,
+            &Draft::Text("second line follows\nhere after. Needs".to_owned()),
+            Vouching::Recent,
+            now
+        )
+        .is_some());
+        // A person's short text that merely shares words is not.
+        assert!(find(
+            queue,
+            &Draft::Text("in the queue.".to_owned()),
+            Vouching::Recent,
+            now
+        )
+        .is_none());
+        // Text agentctl never typed is not.
+        assert!(find(
+            queue,
+            &Draft::Text("an entirely different sentence the owner typed".to_owned()),
+            Vouching::Recent,
+            now
+        )
+        .is_none());
+        // The whole prompt still matches as before.
+        assert!(find(queue, &Draft::Text(prompt.clone()), Vouching::Recent, now).is_some());
     }
 
     #[test]
