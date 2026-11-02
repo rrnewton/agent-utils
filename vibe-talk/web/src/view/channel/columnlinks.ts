@@ -242,7 +242,7 @@ export interface ColumnLinksDependencies {
   cardRow(thread: string): HTMLElement | null;
   /** The thread's colour (`threadHue`). */
   hue(thread: string): number;
-  /** Where the mouse last moved (`mouseAt`), or null. */
+  /** Where the mouse last moved (`InputKinds.mouseAt`, ./input.ts), or null. */
   mouse(): Point | null;
   /** Where `row` is drawn from, its head and the date rule over it included (`drawnTop`). */
   drawnTop(row: HTMLElement): number;
