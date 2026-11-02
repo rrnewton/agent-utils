@@ -9892,6 +9892,16 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                     result["status_disagreement"] = json!(true);
                 }
                 result["probe_error"] = Value::Null;
+                // An open blank-working episode (`agentctl health
+                // --blank-working`), when the passes recorded one: when the
+                // blank stretch was first seen and how long they have seen
+                // it span. Absent while no episode is open, so its presence
+                // never claims a live blank grid this status did not read.
+                if let Some(blank_working) =
+                    crate::blank_working::current(&self.registry, agent_name)
+                {
+                    result["blank_working"] = blank_working;
+                }
                 if let Some(view) = turn.then(|| self.turn_view(record, &pane)).flatten() {
                     result["turn"] = view;
                 }

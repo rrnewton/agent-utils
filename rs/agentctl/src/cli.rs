@@ -159,6 +159,11 @@ enum Commands {
         after_help = "Examples:\n  agentctl --registry ~/project/.agentctl watch-agents --coordinator coordinator --once --check-only\n  agentctl --registry ~/project/.agentctl watch-agents --coordinator coordinator --approval-minutes 5 --idle-minutes 5 --stall-minutes 30\n\nEach pass lists the registry, reads every running or starting agent except the coordinator (paused, mid-move, and agentcloud\nagents are skipped; an unreadable record is watched as unreachable), and classifies it. A condition that holds past its\nthreshold is reported once, as one message queued through the same durable path as `agentctl send`, so a busy recipient\nloses nothing; it counts as reported only once queued, and a failed send is retried on its own doubling backoff without\nholding up any other notice. The recipient is the nearest reachable agent up the agent's managed_by chain that can act on\nit (not one itself reported at a prompt, dead, or with a stuck turn), else the coordinator (`agentctl tree` shows the\nchain). A blocked agent (an approval or permission prompt, or a guardrail refusal) is reported in the pass\nthat sees it, past --min-notice-interval, and between passes a quick look every --blocked-check-seconds reads only visible\nrows for one. Log lines on standard error open with the UTC time. A verdict is a prose line (not tool output) of the agent's last reply (from its first block after the last user turn\non screen) that starts with one of --done-marker once any reply bullet is stripped (--done-marker replaces the DONE:/BLOCKED:\ndefaults). An idle agent with a verdict is reported as child-done after --child-done-seconds (default 0: the pass that sees it),\nin a message of its own that names the verdict line, once per turn, never held by --min-notice-interval; when the registry's\nlanding queue (`agentctl hold`) has agents waiting on it, the same message says who is next. An agent that was never sent\nwork, or still has prompts queued, is never reported idle, and a Claude Code view scrolled up (`N new messages (ctrl+End) ↓`\nabove the input box) is never judged stalled, idle, or finished until it is back at the bottom. Episode memory lives in\n--state-dir (default $XDG_STATE_HOME/agentctl/agent-watch); a message's queue ID is derived from its notices, so a restart\nrecognises a message that is already queued instead of sending it twice, and one watcher runs per state directory. With\n--once, exit 0 only when the team could be probed, no episode other than child-done is reported or due, and no view is\nscrolled up, 1 otherwise.\n\n\"Working\" is classified too (#570). The harness's turn timer is masked before screens are compared, and the tool\ncommands and gate steps under the agent's pinned harness process are read from /proc each pass: one that used CPU or moved\nbytes is progressing; one that did not for --stall-minutes is tool-blocked, named with what it waits on (a file lock and\nits holder, terminal input, a network socket, a pipe, an idle child); no tool and no output or token movement is\nstream-silent. The harness's own transcript (#574: Claude Code's session JSONL, Codex's rollout, Muse's journal, found\nby the record's session id or the files the harness holds open) adds the last event, the last model output, an open model\nrequest, and the tool call in flight with its command and timeout: a call no process runs for (an MCP tool, a sub-agent)\nis tool-blocked once nothing moves; untimed-tool: a call with no timeout running past --untimed-tool-minutes. The report's\n`activity` lists what each transcript says. turn-queued: inside one turn past --turn-minutes with input queued behind it.\nauto-interrupt: a stuck turn with input queued is interrupted and the input delivered (--auto-deliver-after). no-progress: a metric declared with `agentctl progress` unchanged for its hours while working.\nover-expected: a gate step past the p95 of --step-history. looping: the same command or error --loop-repeats times, or a\nretry banner, for --loop-minutes. background-wait: idle on background shells that are gone or idle.\n\nDelivery is watched too (#720): an owner (chat-bridge) request waiting undelivered in any agent's queue past\n--owner-stuck-minutes is reported with the reason its last attempt recorded, again every as many minutes until delivered,\nand each prompt quarantined as a PROBABLE MISROUTE in the last 6 hours is reported once with how to send it again; both\nare priority notices to the coordinator.\nWithout it the watch runs until stopped; see the sample user unit in `agentctl userguide`."
     )]
     WatchAgents(WatchAgents),
+    /// Check every registered agent once for a health condition and exit: with --blank-working, an agent whose OSC title still reports it working while its terminal grid stays blank. One alert per episode goes to the coordinator; built for a tick or cron caller that runs one pass at a time
+    #[command(
+        after_help = "Examples:\n  agentctl --registry ~/project/.agentctl health --blank-working\n  agentctl --registry ~/project/.agentctl health --blank-working --blank-working-minutes 10 --check-only\n\nOne pass, then exit: the tick-friendly form of the per-agent health checks (a tick or cron caller runs it;\nthere is no loop and no interval). Every registered running interactive agent except the coordinator is probed\nonce: Herdr's `agent explain` must say working under a rule whose region is the OSC title (title-only working;\na state derived from the screen never counts), and its rendered visible grid must be blank in every cell (the\nsame test as the composer_unreadable classification). Agents with no recorded pane (headless, agentcloud,\nstopped, paused) are listed as skipped, and an agent that cannot be probed is listed with its probe_error;\nneither starts nor ends an episode.\n\nAn episode is REGISTRY/.blank-working/NAME.json (schema agentctl-blank-working/v1): the first blank pass\nrecords since, later passes extend it, so the duration accumulates across separate invocations. At\n--blank-working-minutes (default: 5) one alert is queued for the coordinator through the same durable path\nas `agentctl send` (message ID derived from the agent and since, so a retry queues nothing twice); a failed\nalert is logged on standard error, never fails the pass, and is retried by the next pass. Continued blank\nsends nothing more; a pass that sees the grid non-blank or the title no longer working ends the episode, and\nonly a later blank stretch may alert again. `agentctl status NAME` shows an open episode as blank_working\n{since, minutes, alerted}. With --check-only the pass reports what it would alert and sends nothing (episode\nstate still advances). Prints the report as JSON (schema agentctl-blank-working/v1). Exit 0 when no agent is\npast its threshold and no alert failed, 1 otherwise."
+    )]
+    Health(Health),
     /// Record that an agent lands after another (the landing queue), list the queue, or drop a hold. `watch-agents` reads it: when OTHER finishes its turn with a verdict that does not start with BLOCKED, OTHER's child-done notice to the coordinator says NAME is next, and once that notice is queued the hold is marked released. Nothing is ever sent to NAME
     #[command(
         after_help = "Examples:\n  agentctl --registry ~/project/.agentctl hold cl-ingest --after cl-dedupe --note \"gate green, ready to push\"\n  agentctl --registry ~/project/.agentctl hold --list\n  agentctl --registry ~/project/.agentctl hold cl-ingest --release\n\nThe queue is REGISTRY/landing-queue.json (schema agentctl-landing-queue/v1). One hold per NAME: a new hold replaces the old.\nA chain (B after A, C after B) advances one step per finish. A released hold stays listed, with released_by and\nreleased_at, for a day. Prints the queue as JSON; --release exits 1 when NAME had no hold."
@@ -197,7 +202,9 @@ enum Commands {
     #[command(after_help = "Example: agentctl list --registry .agentctl")]
     List,
     /// Show durable metadata, queue state, and the live runtime probe
-    #[command(after_help = "Example: agentctl status reviewer")]
+    #[command(
+        after_help = "Example: agentctl status reviewer\n\nWhile a blank-working episode is open for the agent (see `agentctl health --blank-working`), the report\ncarries blank_working {since, minutes, alerted}: when the blank stretch was first seen (Unix seconds), how\nmany minutes the health passes have seen it span, and whether the coordinator was told. The field is absent\nwhen no episode is open; this command records no episode of its own."
+    )]
     Status(Named),
     /// Persist and deliver a prompt when the agent is ready
     #[command(
@@ -813,6 +820,27 @@ struct WatchAgents {
     /// Say on standard error what each pass checks: every agent's status and how long its check took, and the pass's totals
     #[arg(long)]
     verbose: bool,
+}
+
+#[derive(Args)]
+struct Health {
+    /// Run the blank-working check: an agent whose OSC title reports it working while its terminal grid stays blank (see the long help)
+    #[arg(long)]
+    blank_working: bool,
+    /// Minutes an agent may stay blank while its OSC title reports it working before the coordinator is told, from 0 to 1440 (default: 5; 0 tells on the first blank pass)
+    #[arg(
+        long,
+        default_value_t = crate::blank_working::DEFAULT_MINUTES,
+        value_parser = clap::value_parser!(u64).range(0..=1440),
+        value_name = "MINUTES"
+    )]
+    blank_working_minutes: u64,
+    /// Registered name of the coordinator that receives the alert (default: the registry's designated coordinator, else coordinator); the coordinator itself is never checked
+    #[arg(long, value_name = "NAME")]
+    coordinator: Option<String>,
+    /// Report only: queue no alert (episode state still advances, so a later real pass alerts on the same episode)
+    #[arg(long)]
+    check_only: bool,
 }
 
 #[derive(Args)]
@@ -2780,6 +2808,36 @@ fn plugin_discovery_required(command: &Commands) -> bool {
     matches!(command, Commands::Capabilities)
 }
 
+/// The production [`crate::blank_working::CoordinatorAlert`]: queue the
+/// episode's one alert for the coordinator through the watcher's durable
+/// notice path, the same queue `agentctl send` delivers through. The
+/// message ID is derived from the agent and the episode's first sight, so
+/// a retry after a crash queues nothing twice.
+struct CoordinatorNotifier<'a> {
+    notifier: crate::agent_watch::ManagedNotifier<'a, HerdrClient>,
+}
+
+impl crate::blank_working::CoordinatorAlert for CoordinatorNotifier<'_> {
+    fn alert(
+        &mut self,
+        coordinator: &str,
+        agent: &str,
+        since: f64,
+        minutes: f64,
+    ) -> std::result::Result<String, String> {
+        use crate::agent_watch::Notifier as _;
+        let text = format!(
+            "blank-working: {agent} has shown a blank terminal grid for {minutes:.1} minutes \
+             (first seen at Unix {since:.0}) while its OSC title reports it working; its harness \
+             TUI may be hung. Inspect it with `agentctl status {agent}` and `agentctl read {agent}`."
+        );
+        let message_id = format!("blank-working-{agent}-{since:.0}");
+        self.notifier
+            .notify(coordinator, &text, &message_id)
+            .map_err(|error| error.to_string())
+    }
+}
+
 fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, Failure> {
     if args.userguide {
         print!("{}", crate::USER_GUIDE);
@@ -2800,6 +2858,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             | Commands::Restore(_)
             | Commands::Watch(_)
             | Commands::WatchAgents(_)
+            | Commands::Health(_)
             | Commands::InstallUnits(_)
     ) {
         // These remain Herdr services on the tmux backend too; refuse an
@@ -3035,6 +3094,89 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             )?;
             write_json(&report).map_err(Failure::Output)?;
             return Ok(if report["ok"] == true { 0 } else { 1 });
+        }
+        Commands::Health(value) => {
+            if !value.blank_working {
+                return Err(Failure::Usage(
+                    "health needs a check: pass --blank-working".to_owned(),
+                ));
+            }
+            let client = HerdrClient::with_executable("direct", &args.herdr_bin)
+                .map_err(AgentError::from)?;
+            let manager = ManagedAgents::new(&client, &args.registry)?;
+            let coordinator = match value.coordinator.clone() {
+                Some(coordinator) => coordinator,
+                None => manager
+                    .designated_coordinator()?
+                    .unwrap_or_else(|| "coordinator".to_owned()),
+            };
+            let registry = manager.registry().to_owned();
+            let mut observations = Vec::new();
+            let mut skipped = Vec::new();
+            for row in &manager.list()? {
+                let Some(name) = row["name"].as_str() else {
+                    continue;
+                };
+                if name == coordinator {
+                    skipped.push(json!({"name": name, "skipped": "coordinator"}));
+                    continue;
+                }
+                if row["paused"] == true {
+                    skipped.push(json!({"name": name, "skipped": "paused"}));
+                    continue;
+                }
+                let Some(pane) = row["pane_id"].as_str() else {
+                    skipped.push(json!({
+                        "name": name,
+                        "skipped": "no recorded pane (headless, agentcloud, or stopped)"
+                    }));
+                    continue;
+                };
+                let observation = match client.title_working(pane) {
+                    Err(error) => {
+                        crate::blank_working::Observation::unprobed(name, error.to_string())
+                    }
+                    Ok(title_working) => {
+                        match client.read_screen_with_cancellation(pane, &|| false) {
+                            Err(error) => {
+                                crate::blank_working::Observation::unprobed(name, error.to_string())
+                            }
+                            Ok(screen) => crate::blank_working::Observation::probed(
+                                name,
+                                title_working,
+                                crate::submission::is_ansi_blank(&screen),
+                            ),
+                        }
+                    }
+                };
+                observations.push(observation);
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0.0, |elapsed| elapsed.as_secs_f64());
+            let mut alerts = CoordinatorNotifier {
+                notifier: crate::agent_watch::ManagedNotifier::new(&client, &registry),
+            };
+            let report = crate::blank_working::check(
+                &registry,
+                &observations,
+                now,
+                &crate::blank_working::Options {
+                    coordinator,
+                    threshold: Duration::from_secs(value.blank_working_minutes * 60),
+                    check_only: value.check_only,
+                },
+                &mut alerts,
+                &mut |line| eprintln!("agentctl health: {line}"),
+            );
+            let ok = report.ok;
+            let mut document =
+                serde_json::to_value(&report).map_err(|error| Failure::Usage(error.to_string()))?;
+            if let Some(agents) = document["agents"].as_array_mut() {
+                agents.extend(skipped);
+            }
+            write_json(&document).map_err(Failure::Output)?;
+            return Ok(if ok { 0 } else { 1 });
         }
         Commands::Hold(value) => {
             let path = crate::landing_queue::path(&args.registry);
@@ -3919,6 +4061,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
         | Commands::Services(_)
         | Commands::Watch(_)
         | Commands::WatchAgents(_)
+        | Commands::Health(_)
         | Commands::Hold(_)
         | Commands::Tail(_)
         | Commands::History(_) => {

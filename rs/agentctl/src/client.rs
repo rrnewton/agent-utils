@@ -2046,6 +2046,26 @@ impl HerdrClient {
     /// Herdr keeps a reported pane state as reported; its bundled screen rules are evaluated
     /// live only by `agent explain`.
     pub fn explain_agent(&self, pane_id: &str) -> Result<(Option<String>, String)> {
+        let explained = self.explain_detailed(pane_id)?;
+        Ok((explained.agent, explained.state))
+    }
+
+    /// Whether Herdr's `agent explain` verdict for this pane is `working`
+    /// from the OSC title alone: the matching rule's region is `osc_title`.
+    ///
+    /// Screen-derived verdicts never count. Herdr's screen rules and every
+    /// screen override agentctl layers on top (a Muse composer's verified
+    /// status, a misdetected or relayed pane settled from its rows) can say
+    /// `working` because of what the grid shows; a blank grid cannot
+    /// corroborate them, and the blank-working health check
+    /// ([`crate::blank_working`]) is defined on the title signal a hung TUI
+    /// still emits. No matching rule, a fallback verdict, or a rule from
+    /// any other region is not title-working (fail closed).
+    pub fn title_working(&self, pane_id: &str) -> Result<bool> {
+        Ok(self.explain_detailed(pane_id)?.title_working)
+    }
+
+    fn explain_detailed(&self, pane_id: &str) -> Result<Explained> {
         let completed =
             self.invoke_with_timeout(&strings(&["agent", "explain", pane_id]), CONTROL_TIMEOUT)?;
         if completed.status != 0 {
@@ -2054,33 +2074,7 @@ impl HerdrClient {
                 detail(&completed)
             )));
         }
-        let mut agent = None;
-        let mut state = None;
-        let mut rule = None;
-        let mut fallback = false;
-        for line in completed.stdout.lines() {
-            if let Some((key, value)) = line.split_once(':') {
-                match key.trim() {
-                    "agent" if agent.is_none() => agent = Some(value.trim().to_owned()),
-                    "state" if state.is_none() => state = Some(value.trim().to_owned()),
-                    "rule" if rule.is_none() => rule = Some(value.trim().to_owned()),
-                    "fallback_reason" => fallback = true,
-                    _ => {}
-                }
-            }
-        }
-        // A default for a known agent with no matching rule is not screen evidence.
-        let matched = !fallback && rule.as_deref().is_some_and(|rule| rule != "none");
-        let state = state
-            .filter(|state| {
-                matched
-                    && matches!(
-                        state.as_str(),
-                        "idle" | "working" | "blocked" | "done" | "unknown"
-                    )
-            })
-            .unwrap_or_else(|| "unknown".to_owned());
-        Ok((agent.filter(|agent| !agent.is_empty()), state))
+        Ok(parse_explain(&completed.stdout))
     }
 
     /// Label one exact pane as a harness kind with a lifecycle state, without naming an agent.
@@ -3052,6 +3046,58 @@ fn append_environment_and_no_focus(arguments: &mut Vec<String>, environment: &[S
         arguments.extend(["--env".to_owned(), entry.clone()]);
     }
     arguments.push("--no-focus".to_owned());
+}
+
+/// Herdr's `agent explain` verdict for one pane, as [`parse_explain`] reads it.
+struct Explained {
+    /// Interactive agent implementation, when Herdr recognizes one.
+    agent: Option<String>,
+    /// The verdict state, or `"unknown"` when no rule matched.
+    state: String,
+    /// The state is `working` under a rule whose region is the OSC title.
+    title_working: bool,
+}
+
+/// Read `agent explain` output: the agent kind, its state, and whether a
+/// `working` state came from the OSC title. A default for a known agent
+/// with no matching rule is not screen evidence, and no verdict but a
+/// matched one survives.
+fn parse_explain(stdout: &str) -> Explained {
+    let mut agent = None;
+    let mut state = None;
+    let mut rule = None;
+    let mut fallback = false;
+    for line in stdout.lines() {
+        if let Some((key, value)) = line.split_once(':') {
+            match key.trim() {
+                "agent" if agent.is_none() => agent = Some(value.trim().to_owned()),
+                "state" if state.is_none() => state = Some(value.trim().to_owned()),
+                "rule" if rule.is_none() => rule = Some(value.trim().to_owned()),
+                "fallback_reason" => fallback = true,
+                _ => {}
+            }
+        }
+    }
+    // A default for a known agent with no matching rule is not screen evidence.
+    let matched = !fallback && rule.as_deref().is_some_and(|rule| rule != "none");
+    let state = state
+        .filter(|state| {
+            matched
+                && matches!(
+                    state.as_str(),
+                    "idle" | "working" | "blocked" | "done" | "unknown"
+                )
+        })
+        .unwrap_or_else(|| "unknown".to_owned());
+    let title_working = state == "working"
+        && rule
+            .as_deref()
+            .is_some_and(|rule| rule.contains("region=osc_title"));
+    Explained {
+        agent: agent.filter(|agent| !agent.is_empty()),
+        state,
+        title_working,
+    }
 }
 
 fn parse_pane_info(result: &Map<String, Value>, pane_id: &str) -> Result<AgentPaneInfo> {
@@ -4975,5 +5021,37 @@ mod tests {
             executable.client().explain_agent("w1:p1").unwrap().1,
             "working"
         );
+    }
+
+    #[test]
+    fn only_osc_title_working_counts_as_title_working() {
+        // The OSC title says working: the one verdict a blank grid cannot
+        // corroborate, and the one the blank-working check is defined on.
+        let title = parse_explain(
+            "agent: codex\nstate: working\n\
+             rule: osc_title_working (region=osc_title priority=1050)\n",
+        );
+        assert_eq!(title.state, "working");
+        assert!(title.title_working);
+        // The same state read off the screen is a different claim entirely.
+        let screen = parse_explain(
+            "agent: codex\nstate: working\n\
+             rule: screen_working (region=screen priority=900)\n",
+        );
+        assert_eq!(screen.state, "working");
+        assert!(!screen.title_working);
+        // A title rule that is not reporting work proves nothing either.
+        let idle_title = parse_explain(
+            "agent: codex\nstate: idle\n\
+             rule: osc_title_idle (region=osc_title priority=1040)\n",
+        );
+        assert!(!idle_title.title_working);
+        // No matching rule: the fallback verdict is unknown, never working.
+        let fallback = parse_explain(
+            "agent: codex\nstate: working\nrule: none\n\
+             fallback_reason: codex_state_ambiguous\n",
+        );
+        assert_eq!(fallback.state, "unknown");
+        assert!(!fallback.title_working);
     }
 }

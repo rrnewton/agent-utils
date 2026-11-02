@@ -5,6 +5,7 @@
 
 pub mod agent;
 pub mod agent_watch;
+pub mod blank_working;
 pub(crate) mod build_info;
 pub(crate) mod chat_context;
 pub mod chat_event_sink;
