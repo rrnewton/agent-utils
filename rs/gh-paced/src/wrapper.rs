@@ -357,6 +357,9 @@ impl Wrapper<'_> {
         r.cost = c.cost;
         r.command = c.command.clone();
         r.argv = summary.to_string();
+        if c.class == Class::GitCredential {
+            r.caller = audit::caller_identity();
+        }
         r
     }
 
