@@ -301,6 +301,9 @@ enum Commands {
     /// Bind an explicitly known native conversation ID to a verified agent pane
     #[command(after_help = "Example: agentctl bind-session reviewer THREAD_ID")]
     BindSession(BindSession),
+    /// Redo a slot launch's wrkslots owner bind from outside its box (#786)
+    #[command(after_help = "Example: agentctl rebind-slot reviewer")]
+    RebindSlot(Named),
     /// Read, set, or clear a native Codex goal through the app-server protocol, without resuming or prompting its thread
     #[command(after_help = crate::codex_goal::command::AFTER_HELP)]
     CodexGoal(crate::codex_goal::command::CodexGoalArgs),
@@ -2463,6 +2466,7 @@ fn lineage_action(command: &Commands) -> Option<crate::lineage::Action> {
         Commands::Takeover(value) => Action::Takeover(value.agent.name.clone()),
         Commands::Handback(value) => Action::Handback(value.agent.name.clone()),
         Commands::BindSession(value) => Action::Bind(value.agent.name.clone()),
+        Commands::RebindSlot(value) => Action::Bind(value.name.clone()),
         Commands::Anchor(value) => Action::Bind(value.agent.name.clone()),
         _ => return None,
     })
@@ -2804,6 +2808,7 @@ fn writes_registry(command: &Commands) -> bool {
         | Commands::Answer(_)
         | Commands::Goal(_)
         | Commands::BindSession(_)
+        | Commands::RebindSlot(_)
         | Commands::Pause(_)
         | Commands::Reset(_)
         | Commands::Resume(_)
@@ -4041,6 +4046,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 .as_ref()
                 .map(|command| command.0.as_slice()),
         )?,
+        Commands::RebindSlot(value) => manager.rebind_slot(&value.name)?,
         Commands::BindSession(value) => manager.bind_session(
             &value.agent.name,
             &value.session,

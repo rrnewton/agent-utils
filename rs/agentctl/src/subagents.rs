@@ -8606,12 +8606,41 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 "owner_pid": pid,
                 "generation": row["generation"],
             }),
-            Err(error) => json!({
-                "slot": slot,
-                "action": "refused",
-                "owner_pid": pid,
-                "reason": error.to_string(),
-            }),
+            Err(error) => {
+                // Loud, not just a status field a caller can miss (#786).
+                eprintln!(
+                    "agentctl: warning: slot {slot} owner bind refused for {}: {error}; \
+                     the launch keeps running unbound - redo it with `agentctl rebind-slot {}`",
+                    record.name, record.name
+                );
+                json!({
+                    "slot": slot,
+                    "action": "refused",
+                    "owner_pid": pid,
+                    "reason": error.to_string(),
+                })
+            }
+        }
+    }
+
+    /// Redo a slot launch's owner bind from outside its box (#786): bind the recorded
+    /// harness process as the wrkslots owner of the record's slot.
+    pub fn rebind_slot(&self, agent_name: &str) -> Result<Value> {
+        let record = self.read_record(agent_name)?;
+        let (Some(slot), Some(project)) = (record.slot.as_deref(), record.slot_project.as_deref())
+        else {
+            return Err(fail(format!("{agent_name} has no recorded slot to rebind")));
+        };
+        let wrkslots = project_wrkslots(&self.registry).ok_or_else(|| {
+            fail("no wrkslots found (PATH, AGENTCTL_WRKSLOTS_BIN, or profiles.json)")
+        })?;
+        let project = PathBuf::from(project);
+        match self.bind_launched_slot_owner(&record, &wrkslots, &project, slot) {
+            value if value["action"] == "transferred" => Ok(value),
+            value => Err(fail(format!(
+                "slot rebind refused: {}",
+                value["reason"].as_str().unwrap_or("unknown reason")
+            ))),
         }
     }
 
@@ -15346,7 +15375,7 @@ pub(crate) mod tests {
         assert_eq!(
             owner_calls(&fixture, "root"),
             [
-                format!("--project-root {project} status --slot s1 --format json"),
+                format!("--project-root {project} --wait-lock 30 status --slot s1 --format json"),
                 format!(
                     "--project-root {project} --wait-lock 30 transfer-owner s1 --agent slot-agent \
                      --owner-pid 4242 --expected-generation 3"

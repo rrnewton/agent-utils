@@ -958,22 +958,43 @@ fn wrkslots_argv(wrkslots: &Path, project: &Path, arguments: &[&str]) -> Vec<Str
 
 /// One slot's active row in `project`, read with `wrkslots status --slot SLOT --format json`.
 fn slot_row(host: &dyn Host, wrkslots: &Path, project: &Path, slot: &str) -> Result<Value> {
-    let outcome = host.run(
-        &wrkslots_argv(
-            wrkslots,
-            project,
-            &["status", "--slot", slot, "--format", "json"],
-        ),
-        Some(project),
-        Duration::from_secs(120),
-    );
-    if outcome.status != Some(0) {
-        return Err(fail(format!(
-            "wrkslots status failed: {}",
-            outcome.stderr.trim()
-        )));
+    // Wait on a busy state lock instead of dropping the bind (#786): `--wait-lock 30`
+    // plus two retries cover the separate config lock, which reports the same refusal.
+    let mut last_error = String::new();
+    for attempt in 0..3 {
+        if attempt > 0 {
+            host.sleep(Duration::from_secs(2));
+        }
+        let outcome = host.run(
+            &wrkslots_argv(
+                wrkslots,
+                project,
+                &[
+                    "--wait-lock",
+                    "30",
+                    "status",
+                    "--slot",
+                    slot,
+                    "--format",
+                    "json",
+                ],
+            ),
+            Some(project),
+            Duration::from_secs(120),
+        );
+        if outcome.status == Some(0) {
+            return slot_row_document(&outcome.stdout, slot);
+        }
+        last_error = outcome.stderr.trim().to_owned();
+        if !last_error.contains("lock is busy") {
+            break;
+        }
     }
-    let document: Value = serde_json::from_str(&outcome.stdout)
+    Err(fail(format!("wrkslots status failed: {last_error}")))
+}
+
+fn slot_row_document(stdout: &str, slot: &str) -> Result<Value> {
+    let document: Value = serde_json::from_str(stdout)
         .map_err(|error| fail(format!("wrkslots status printed no JSON: {error}")))?;
     document["active"]
         .as_array()
@@ -1006,33 +1027,38 @@ pub(crate) fn bind_slot_owner(
     // name; transfer-owner checks it against the row.
     let slot_agent = row["agent"].as_str().unwrap_or(agent).to_owned();
     let pid_text = pid.to_string();
-    let moved = host.run(
-        &wrkslots_argv(
-            wrkslots,
-            project,
-            &[
-                "--wait-lock",
-                "30",
-                "transfer-owner",
-                slot,
-                "--agent",
-                &slot_agent,
-                "--owner-pid",
-                &pid_text,
-                "--expected-generation",
-                &generation,
-            ],
-        ),
-        Some(project),
-        Duration::from_secs(120),
-    );
-    if moved.status != Some(0) {
-        return Err(fail(format!(
-            "transfer-owner refused: {}",
-            moved.stderr.trim()
-        )));
+    // Retry a busy config lock, which `--wait-lock` on the state lock does not cover (#786).
+    for attempt in 0..3 {
+        let moved = host.run(
+            &wrkslots_argv(
+                wrkslots,
+                project,
+                &[
+                    "--wait-lock",
+                    "30",
+                    "transfer-owner",
+                    slot,
+                    "--agent",
+                    &slot_agent,
+                    "--owner-pid",
+                    &pid_text,
+                    "--expected-generation",
+                    &generation,
+                ],
+            ),
+            Some(project),
+            Duration::from_secs(120),
+        );
+        if moved.status == Some(0) {
+            return Ok(row);
+        }
+        let reason = moved.stderr.trim().to_owned();
+        if attempt == 2 || !reason.contains("lock is busy") {
+            return Err(fail(format!("transfer-owner refused: {reason}")));
+        }
+        host.sleep(Duration::from_secs(2));
     }
-    Ok(row)
+    unreachable!()
 }
 
 /// Hold a dead agent's slot so that no cleanup can retire it before the agent is back.
@@ -2096,6 +2122,67 @@ pub fn watch<A: ManagedApi + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+
+    struct BusyOnceHost {
+        status_calls: RefCell<u32>,
+    }
+    impl Host for BusyOnceHost {
+        fn boot_id(&self) -> Result<String> {
+            Ok("boot".to_owned())
+        }
+        fn boot_time(&self) -> Option<u64> {
+            Some(0)
+        }
+        fn now(&self) -> f64 {
+            0.0
+        }
+        fn sleep(&self, _duration: Duration) {}
+        fn run(&self, argv: &[String], _cwd: Option<&Path>, _t: Duration) -> CommandOutcome {
+            let joined = argv.join(" ");
+            if joined.contains(" status ") {
+                let mut calls = self.status_calls.borrow_mut();
+                *calls += 1;
+                if *calls == 1 {
+                    return CommandOutcome {
+                        status: Some(3),
+                        stdout: String::new(),
+                        stderr: "REFUSED: state lock is busy".to_owned(),
+                    };
+                }
+                return CommandOutcome {
+                    status: Some(0),
+                    stdout:
+                        "{\"active\":[{\"slot\":\"s1\",\"generation\":3,\"agent\":\"slot-agent\"}]}"
+                            .to_owned(),
+                    stderr: String::new(),
+                };
+            }
+            CommandOutcome {
+                status: Some(0),
+                stdout: "transferred".to_owned(),
+                stderr: String::new(),
+            }
+        }
+    }
+
+    #[test]
+    fn bind_retries_a_busy_status_lock() {
+        let host = BusyOnceHost {
+            status_calls: RefCell::new(0),
+        };
+        let row = bind_slot_owner(
+            &host,
+            Path::new("/wrkslots"),
+            Path::new("/project"),
+            "s1",
+            "worker",
+            4242,
+        )
+        .unwrap();
+        assert_eq!(row["generation"], 3);
+        assert_eq!(*host.status_calls.borrow(), 2);
+    }
 
     #[test]
     fn unknown_top_level_keys_are_ignored_but_duplicates_and_nested_keys_are_refused() {
