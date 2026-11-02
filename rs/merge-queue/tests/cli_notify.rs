@@ -101,11 +101,12 @@ fn report_of(log: &std::path::Path) -> String {
     let lines = sent_lines(log);
     assert_eq!(lines.len(), 1, "expected one send, got {lines:?}");
     let line = &lines[0];
-    assert!(
-        line.starts_with("send lane-fictional --deliver-while-working --file "),
-        "unexpected argv: {line}"
-    );
-    let path = line.rsplit("--file ").next().unwrap().trim();
+    // Options first, then `--`, then the name (a name may start with `-`).
+    let path = line
+        .strip_prefix("send --deliver-while-working --file ")
+        .and_then(|rest| rest.strip_suffix(" -- lane-fictional"))
+        .unwrap_or_else(|| panic!("unexpected argv: {line}"))
+        .trim();
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("cannot read {path}: {e}"))
 }
 

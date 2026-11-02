@@ -356,6 +356,11 @@ enum Command {
         /// nor the configured command is set.
         #[arg(long, value_name = "WORD", allow_hyphen_values = true)]
         agentctl: Vec<String>,
+        /// Seconds one notification send may run; then its whole process group is
+        /// killed and the send counts as a failed attempt (retried on a later
+        /// cycle, at most 3 attempts per transition). Minimum 1.
+        #[arg(long, default_value_t = 30, value_name = "SECS")]
+        notify_timeout_secs: u64,
     },
     /// Show daemon liveness, the current window and slot occupancy.
     Status {
@@ -770,8 +775,8 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                 (_, _, Some(file)) => crate::sync::ReadySource::File(file),
                 _ => return Err("choose a ready source: --label, --all-open or --file".to_owned()),
             };
-            let _lock = if dry_run { None } else { Some(state.lock()?) };
-            let report = crate::sync::sync(&state, &config, &source, limit, dry_run)?;
+            let lock = if dry_run { None } else { Some(state.lock()?) };
+            let report = crate::sync::sync(&state, &config, &source, limit, lock.as_ref())?;
             if json {
                 let text = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
                 println!("{text}");
@@ -795,6 +800,11 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                         .map(|left| format!("; {left} API requests left this hour"))
                         .unwrap_or_default()
                 );
+                if !report.drafts.is_empty() {
+                    let drafts: Vec<String> =
+                        report.drafts.iter().map(|pr| format!("#{pr}")).collect();
+                    println!("  drafts, not ready: {}", drafts.join(", "));
+                }
                 for (pr, why) in &report.refused {
                     println!("  refused #{pr}: {why}");
                 }
@@ -896,6 +906,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             depth,
             max_batch,
             agentctl,
+            notify_timeout_secs,
         } => serve::serve(
             &state,
             &ServeOptions {
@@ -910,6 +921,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                 } else {
                     Some(agentctl)
                 },
+                notify_timeout: std::time::Duration::from_secs(notify_timeout_secs.max(1)),
             },
         ),
         Command::Status {
@@ -929,7 +941,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             } else {
                 print!("{}", serve::render_status(&report));
             }
-            Ok(if report.daemon.healthy() { 0 } else { 1 })
+            Ok(if report.healthy() { 0 } else { 1 })
         }
         Command::Widen { json } => {
             let _lock = state.lock()?;

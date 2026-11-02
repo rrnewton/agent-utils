@@ -9,7 +9,9 @@
 //! With `require_approval_at_head`, a GitHub source's one batched list call also carries each
 //! pull request's reviews: a change counts as ready only with an approving review at its current
 //! head. An unapproved change is not submitted, and a queued change whose head no longer carries
-//! an approval is withdrawn (notifying its submitter through the withdrawn path).
+//! an approval is withdrawn (notifying its submitter through the withdrawn path). The author
+//! becomes the notification target only when the change has no `--notify` subscription yet; an
+//! existing subscription is kept.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -20,7 +22,7 @@ use serde::Serialize;
 use crate::github::Hosting;
 use crate::model::ItemStatus;
 use crate::ops::{self, Submission};
-use crate::state::{Config, State, DEFAULT_PRIORITY};
+use crate::state::{Config, Lock, State, DEFAULT_PRIORITY};
 
 /// Where the ready set comes from.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -53,6 +55,9 @@ pub struct SyncReport {
     pub dry_run: bool,
     /// Ready changes the source listed.
     pub listed: usize,
+    /// Draft pull requests the source returned but that are never ready (named, not hidden).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub drafts: Vec<i64>,
     /// Changes submitted or resubmitted (new, or head or priority moved).
     pub submitted: Vec<i64>,
     /// Changes already queued at the listed head.
@@ -89,6 +94,9 @@ struct Entry {
     /// sources that carry no review data (ready files) and when the
     /// approval rule is off, so those paths are unchanged.
     approved_at_head: bool,
+    /// Whether `notify` is only a default (the author, under the approval
+    /// rule) that must not replace an existing subscription.
+    notify_is_default: bool,
 }
 
 /// One parsed ready-file line: the change number and its `key=value` fields.
@@ -148,6 +156,7 @@ fn entries_from_file(path: &PathBuf) -> Result<Vec<Entry>, String> {
                 by: String::new(),
                 notify: String::new(),
                 approved_at_head: true,
+                notify_is_default: false,
             };
             for (key, value) in fields {
                 match key.as_str() {
@@ -180,13 +189,18 @@ fn entries_from_file(path: &PathBuf) -> Result<Vec<Entry>, String> {
 }
 
 /// Reconcile the queue with `source`.
+///
+/// `lock` is the queue writer lock the caller holds; `None` is a dry run,
+/// which reports what would change and writes nothing. The notification
+/// sweep a withdrawal triggers runs under that same lock.
 pub fn sync(
     state: &State,
     config: &Config,
     source: &ReadySource,
     limit: u32,
-    dry_run: bool,
+    lock: Option<&Lock>,
 ) -> Result<SyncReport, String> {
+    let dry_run = lock.is_none();
     let tag = source.tag();
     let mut report = SyncReport {
         source: tag.clone(),
@@ -197,6 +211,7 @@ pub fn sync(
         ReadySource::File(_) if !config.land.close_prs => None,
         _ => Some(Hosting::new(&config.github, &state.root)?),
     };
+    let mut drafts = Vec::new();
     let entries = match source {
         ReadySource::File(path) => entries_from_file(path)?,
         ReadySource::Label(_) | ReadySource::AllOpen => {
@@ -207,8 +222,13 @@ pub fn sync(
             };
             let mut priorities = LabelPriority::new(DEFAULT_LABEL_PATTERN)?;
             let require_approval = config.require_approval_at_head;
-            hosting
-                .list_open(&config.base, label, limit, require_approval)?
+            let listed = hosting.list_open(&config.base, label, limit, require_approval)?;
+            drafts = listed
+                .iter()
+                .filter(|pr| pr.draft)
+                .map(|pr| pr.number)
+                .collect();
+            listed
                 .into_iter()
                 .filter(|pr| !pr.draft)
                 .map(|pr| {
@@ -239,12 +259,14 @@ pub fn sync(
                         } else {
                             String::new()
                         },
+                        notify_is_default: require_approval,
                     }
                 })
                 .collect()
         }
     };
     report.listed = entries.len();
+    report.drafts = drafts;
     let items: BTreeMap<i64, _> = state.items()?.into_iter().map(|i| (i.pr, i)).collect();
     let listed: std::collections::BTreeSet<i64> = entries.iter().map(|e| e.pr).collect();
     let mut submissions = Vec::new();
@@ -277,13 +299,21 @@ pub fn sync(
             report.unchanged.push(entry.pr);
             continue;
         }
+        // A default target never replaces an existing `--notify`
+        // subscription: an empty name makes the submission keep it.
+        let notify =
+            if entry.notify_is_default && current.is_some_and(|item| !item.notify.is_empty()) {
+                String::new()
+            } else {
+                entry.notify
+            };
         submissions.push(Submission {
             pr: entry.pr,
             head_ref: entry.head_ref,
             head: entry.head,
             priority: entry.priority,
             by: entry.by,
-            notify: entry.notify,
+            notify,
             title: entry.title,
             after: entry.after,
             solo: entry.solo,
@@ -304,10 +334,7 @@ pub fn sync(
         }
     }
     withdraw.sort_unstable();
-    if dry_run {
-        report.submitted = submissions.iter().map(|s| s.pr).collect();
-        report.withdrawn = withdraw;
-    } else {
+    if let Some(lock) = lock {
         let numbers: Vec<i64> = submissions.iter().map(|s| s.pr).collect();
         if !submissions.is_empty() {
             for (pr, result) in numbers
@@ -338,7 +365,7 @@ pub fn sync(
             // not resend. Best-effort, as in `serve`: a failed send is
             // recorded on the item and never fails the sync.
             let notifier = crate::notify::Notifier::resolve(None, config);
-            if let Err(error) = crate::notify::sweep(state, config, &notifier) {
+            if let Err(error) = crate::notify::sweep_locked(state, lock, config, &notifier) {
                 eprintln!("merge-queue sync: notification sweep failed: {error}");
             }
         }
@@ -360,6 +387,9 @@ pub fn sync(
                 }
             }
         }
+    } else {
+        report.submitted = submissions.iter().map(|s| s.pr).collect();
+        report.withdrawn = withdraw;
     }
     report.api_remaining = hosting.map(|h| h.budget.remaining());
     Ok(report)

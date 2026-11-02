@@ -19,6 +19,22 @@ use crate::state::GitHubConfig;
 /// Default requests per rolling hour when the configuration names none.
 pub const DEFAULT_MAX_PER_HOUR: u32 = 60;
 
+/// Budget charge multiplier for a list call that also carries reviews.
+///
+/// The list call stays one batched call, but `reviews` and `latestReviews`
+/// are two nested connections per pull request, and the hosting service
+/// prices a query by the nodes it may return: a page of 100 pull requests
+/// with two nested review connections costs about three times a plain page
+/// (the page itself plus one page-equivalent per nested connection). So the
+/// reviews query is charged 3 requests per hundred results instead of 1.
+pub const REVIEWS_COST_FACTOR: u32 = 3;
+
+/// Author associations whose reviews count for approval at head: people
+/// with write access to the repository, as the hosting service reports
+/// them. A review from anyone else (`CONTRIBUTOR`, `NONE`, ...) never
+/// approves and never blocks.
+pub const TRUSTED_ASSOCIATIONS: [&str; 3] = ["OWNER", "MEMBER", "COLLABORATOR"];
+
 /// Environment variable naming the real `gh` executable for fleet hosts.
 /// On those hosts `gh` on `PATH` may be a stub or pacing wrapper; the
 /// variable points at the real GitHub CLI. It is a fallback only: an
@@ -164,6 +180,11 @@ pub struct ListedPr {
     /// Latest review per reviewer (fallback; see [`Review`]).
     #[serde(default, rename = "latestReviews")]
     pub latest_reviews: Vec<Review>,
+    /// The hosting service's overall review verdict (`APPROVED`,
+    /// `CHANGES_REQUESTED`, `REVIEW_REQUIRED`, or empty when the base has no
+    /// review rule). Populated only when the list call asked for reviews.
+    #[serde(default, rename = "reviewDecision")]
+    pub review_decision: Option<String>,
 }
 
 /// Author of a pull request.
@@ -184,16 +205,28 @@ pub struct Label {
 /// One review of a pull request, as the batched list call reports it.
 ///
 /// The `gh` (GraphQL) shape is `{"state": "APPROVED", "commit": {"oid":
-/// "<sha>"}}`; the flat `commit_id` spelling (REST shape) is also accepted
-/// so fakes and other hosts can use either. `latestReviews` entries carry
-/// an empty commit oid through `gh`, so approval-at-head reads `reviews`
-/// (whose commit oid is populated), with `latestReviews` as a fallback for
-/// hosts that do populate it.
+/// "<sha>"}, "author": {"login": "..."}, "authorAssociation": "MEMBER",
+/// "submittedAt": "..."}`; the flat REST spellings (`commit_id`, `user`,
+/// `author_association`, `submitted_at`) are also accepted so fakes and other
+/// hosts can use either. `latestReviews` entries carry an empty commit oid
+/// through `gh`, so approval-at-head reads `reviews` (whose commit oid is
+/// populated), with `latestReviews` as a fallback for hosts that do populate
+/// it.
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct Review {
     /// Review state (`APPROVED`, `CHANGES_REQUESTED`, `COMMENTED`, ...).
     #[serde(default)]
     pub state: String,
+    /// Reviewer.
+    #[serde(default, alias = "user")]
+    pub author: Option<Author>,
+    /// The reviewer's association with the repository (`OWNER`, `MEMBER`,
+    /// `COLLABORATOR`, `CONTRIBUTOR`, `NONE`, ...).
+    #[serde(default, rename = "authorAssociation", alias = "author_association")]
+    pub author_association: String,
+    /// RFC 3339 submission time, used to order reviews when present.
+    #[serde(default, rename = "submittedAt", alias = "submitted_at")]
+    pub submitted_at: String,
     /// Commit the review was submitted on (GraphQL shape).
     #[serde(default)]
     pub commit: Option<ReviewCommit>,
@@ -221,25 +254,102 @@ impl Review {
         self.commit_id.as_deref().unwrap_or_default()
     }
 
-    /// Whether this is an approving review of exactly `head` (a prefix of
-    /// the head, as elsewhere in the queue, also counts).
+    /// Reviewer login, empty when the review names none.
+    pub fn reviewer(&self) -> &str {
+        self.author
+            .as_ref()
+            .map_or("", |author| author.login.as_str())
+    }
+
+    /// Whether the reviewer is named and has write access
+    /// ([`TRUSTED_ASSOCIATIONS`]).
+    pub fn trusted(&self) -> bool {
+        !self.reviewer().is_empty()
+            && TRUSTED_ASSOCIATIONS
+                .iter()
+                .any(|association| self.author_association.eq_ignore_ascii_case(association))
+    }
+
+    /// Whether this review requests changes.
+    pub fn requests_changes(&self) -> bool {
+        self.state.eq_ignore_ascii_case("CHANGES_REQUESTED")
+    }
+
+    /// Whether this review leaves the reviewer's verdict unchanged
+    /// (comments and unsubmitted drafts), as on the hosting service.
+    fn neutral(&self) -> bool {
+        self.state.eq_ignore_ascii_case("COMMENTED") || self.state.eq_ignore_ascii_case("PENDING")
+    }
+
+    /// Whether this is an approving review of exactly `head`: both must be
+    /// full 40-hex commit ids and equal (an abbreviation never counts).
     pub fn approves(&self, head: &str) -> bool {
         let reviewed = self.reviewed_commit();
         (self.state.eq_ignore_ascii_case("APPROVED")
             || self.state.eq_ignore_ascii_case("APPROVING"))
-            && !reviewed.is_empty()
-            && !head.is_empty()
-            && (reviewed == head || head.starts_with(reviewed))
+            && is_full_oid(reviewed)
+            && is_full_oid(head)
+            && reviewed.eq_ignore_ascii_case(head)
     }
 }
 
+/// Whether `text` is a full 40-hex commit id.
+fn is_full_oid(text: &str) -> bool {
+    text.len() == 40 && text.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 impl ListedPr {
-    /// Whether any reported review approves the current head commit.
+    /// Whether the current head is approved, failing closed.
+    ///
+    /// Only reviews from trusted reviewers ([`Review::trusted`]) count, and
+    /// only each reviewer's latest verdict (comments do not replace one):
+    /// approved means at least one such latest verdict approves exactly the
+    /// head commit and none requests changes. A `reviewDecision` of
+    /// `CHANGES_REQUESTED` or `REVIEW_REQUIRED` also blocks. Missing review
+    /// data, an abbreviated head, or reviews without a reviewer or an
+    /// association never approve.
     pub fn approved_at_head(&self) -> bool {
-        self.reviews
+        if !is_full_oid(&self.head) {
+            return false;
+        }
+        let decision = self.review_decision.as_deref().unwrap_or_default();
+        if decision.eq_ignore_ascii_case("CHANGES_REQUESTED")
+            || decision.eq_ignore_ascii_case("REVIEW_REQUIRED")
+        {
+            return false;
+        }
+        // `latestReviews` is already one verdict per reviewer: a trusted
+        // change request there blocks even if `reviews` was truncated.
+        if self
+            .latest_reviews
             .iter()
-            .chain(self.latest_reviews.iter())
-            .any(|review| review.approves(&self.head))
+            .any(|review| review.trusted() && review.requests_changes())
+        {
+            return false;
+        }
+        let source = if self.reviews.is_empty() {
+            &self.latest_reviews
+        } else {
+            &self.reviews
+        };
+        // Oldest first: by submission time when every review carries one,
+        // else in reported order (the hosting service lists oldest first).
+        let mut ordered: Vec<(usize, &Review)> = source.iter().enumerate().collect();
+        if ordered
+            .iter()
+            .all(|(_, review)| !review.submitted_at.is_empty())
+        {
+            ordered.sort_by(|a, b| a.1.submitted_at.cmp(&b.1.submitted_at).then(a.0.cmp(&b.0)));
+        }
+        let mut latest: std::collections::BTreeMap<&str, &Review> =
+            std::collections::BTreeMap::new();
+        for (_, review) in ordered {
+            if review.trusted() && !review.neutral() {
+                latest.insert(review.reviewer(), review);
+            }
+        }
+        !latest.values().any(|review| review.requests_changes())
+            && latest.values().any(|review| review.approves(&self.head))
     }
 }
 
@@ -290,9 +400,10 @@ impl Hosting {
     /// list call (charged one request per hundred results requested).
     ///
     /// With `include_reviews`, the same single list call also asks for
-    /// `reviews,latestReviews`: the request count and budget charge are
-    /// unchanged (still one charged request per hundred results), only the
-    /// payload grows. There is never a per-pull-request review call.
+    /// `reviews,latestReviews,reviewDecision`. It is still one call (there is
+    /// never a per-pull-request review call), but it is charged
+    /// [`REVIEWS_COST_FACTOR`] requests per hundred results, because the
+    /// nested review connections make it that much more expensive.
     pub fn list_open(
         &self,
         base: &str,
@@ -301,7 +412,7 @@ impl Hosting {
         include_reviews: bool,
     ) -> Result<Vec<ListedPr>, String> {
         let fields = if include_reviews {
-            "number,headRefOid,isDraft,title,author,labels,reviews,latestReviews"
+            "number,headRefOid,isDraft,title,author,labels,reviews,latestReviews,reviewDecision"
         } else {
             "number,headRefOid,isDraft,title,author,labels"
         };
@@ -326,7 +437,13 @@ impl Hosting {
             args.push("--label".to_owned());
             args.push(label.to_owned());
         }
-        let text = self.run(limit.div_ceil(100).max(1), &args)?;
+        let pages = limit.div_ceil(100).max(1);
+        let cost = if include_reviews {
+            pages.saturating_mul(REVIEWS_COST_FACTOR)
+        } else {
+            pages
+        };
+        let text = self.run(cost, &args)?;
         serde_json::from_str(&text).map_err(|error| format!("unexpected pr list output: {error}"))
     }
 
@@ -353,36 +470,177 @@ mod unit {
     use super::*;
     use crate::git::testrepo::TempDir;
 
+    fn parse(text: &str) -> ListedPr {
+        serde_json::from_str(text).unwrap()
+    }
+
+    /// A gh-shape review: `(state, commit, login, association)`.
+    fn review(state: &str, commit: &str, login: &str, association: &str) -> String {
+        format!(
+            r#"{{"state":"{state}","commit":{{"oid":"{commit}"}},"author":{{"login":"{login}"}},"authorAssociation":"{association}"}}"#
+        )
+    }
+
+    fn listed(head: &str, reviews: &[String]) -> ListedPr {
+        parse(&format!(
+            r#"{{"number":1,"headRefOid":"{head}","reviews":[{}]}}"#,
+            reviews.join(",")
+        ))
+    }
+
     #[test]
     fn approval_at_head_reads_reviews_in_gh_and_flat_shapes() {
         let head = "a".repeat(40);
         let old = "b".repeat(40);
-        let parse = |text: String| -> ListedPr { serde_json::from_str(&text).unwrap() };
         // gh shape: reviews[].commit.oid is populated at the head.
-        let pr = parse(format!(
-            r#"{{"number":1,"headRefOid":"{head}","reviews":[{{"state":"APPROVED","commit":{{"oid":"{head}"}},"author":{{"login":"reviewer-fictional"}}}}]}}"#
-        ));
+        let pr = listed(&head, &[review("APPROVED", &head, "reviewer-a", "MEMBER")]);
         assert!(pr.approved_at_head());
         // A stale approval (review on the old head) does not count.
-        let pr = parse(format!(
-            r#"{{"number":1,"headRefOid":"{head}","reviews":[{{"state":"APPROVED","commit":{{"oid":"{old}"}}}}]}}"#
-        ));
+        let pr = listed(&head, &[review("APPROVED", &old, "reviewer-a", "MEMBER")]);
         assert!(!pr.approved_at_head());
         // Non-approving states at the head do not count.
         for state in ["CHANGES_REQUESTED", "COMMENTED", "DISMISSED", "PENDING"] {
-            let pr = parse(format!(
-                r#"{{"number":1,"headRefOid":"{head}","reviews":[{{"state":"{state}","commit":{{"oid":"{head}"}}}}]}}"#
-            ));
+            let pr = listed(&head, &[review(state, &head, "reviewer-a", "MEMBER")]);
             assert!(!pr.approved_at_head(), "{state}");
         }
-        // Flat REST shape: commit_id, APPROVING spelling.
-        let pr = parse(format!(
-            r#"{{"number":1,"headRefOid":"{head}","reviews":[{{"state":"APPROVING","commit_id":"{head}"}}]}}"#
+        // Flat REST shape: commit_id, user, author_association, APPROVING.
+        let pr = parse(&format!(
+            r#"{{"number":1,"headRefOid":"{head}","reviews":[{{"state":"APPROVING","commit_id":"{head}","user":{{"login":"reviewer-a"}},"author_association":"COLLABORATOR"}}]}}"#
         ));
         assert!(pr.approved_at_head());
         // No reviews at all: not approved.
-        let pr = parse(format!(r#"{{"number":1,"headRefOid":"{head}"}}"#));
+        let pr = parse(&format!(r#"{{"number":1,"headRefOid":"{head}"}}"#));
         assert!(!pr.approved_at_head());
+    }
+
+    #[test]
+    fn approval_at_head_uses_each_reviewers_latest_verdict() {
+        let head = "a".repeat(40);
+        // Approved, then changes requested by the same reviewer: blocked.
+        let pr = listed(
+            &head,
+            &[
+                review("APPROVED", &head, "reviewer-a", "MEMBER"),
+                review("CHANGES_REQUESTED", &head, "reviewer-a", "MEMBER"),
+            ],
+        );
+        assert!(!pr.approved_at_head());
+        // Changes requested, then approved: approved.
+        let pr = listed(
+            &head,
+            &[
+                review("CHANGES_REQUESTED", &head, "reviewer-a", "MEMBER"),
+                review("APPROVED", &head, "reviewer-a", "MEMBER"),
+            ],
+        );
+        assert!(pr.approved_at_head());
+        // A later comment does not cancel an approval.
+        let pr = listed(
+            &head,
+            &[
+                review("APPROVED", &head, "reviewer-a", "MEMBER"),
+                review("COMMENTED", &head, "reviewer-a", "MEMBER"),
+            ],
+        );
+        assert!(pr.approved_at_head());
+        // A later dismissal does.
+        let pr = listed(
+            &head,
+            &[
+                review("APPROVED", &head, "reviewer-a", "MEMBER"),
+                review("DISMISSED", &head, "reviewer-a", "MEMBER"),
+            ],
+        );
+        assert!(!pr.approved_at_head());
+        // Submission times, when every review has one, order the verdicts.
+        let pr = parse(&format!(
+            r#"{{"number":1,"headRefOid":"{head}","reviews":[
+                {{"state":"CHANGES_REQUESTED","commit":{{"oid":"{head}"}},"author":{{"login":"reviewer-a"}},"authorAssociation":"MEMBER","submittedAt":"2026-01-02T00:00:00Z"}},
+                {{"state":"APPROVED","commit":{{"oid":"{head}"}},"author":{{"login":"reviewer-a"}},"authorAssociation":"MEMBER","submittedAt":"2026-01-01T00:00:00Z"}}]}}"#
+        ));
+        assert!(!pr.approved_at_head());
+    }
+
+    #[test]
+    fn approval_at_head_counts_only_trusted_reviewers_and_any_change_request_blocks() {
+        let head = "a".repeat(40);
+        for association in ["CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR", "NONE", ""] {
+            let pr = listed(
+                &head,
+                &[review("APPROVED", &head, "reviewer-a", association)],
+            );
+            assert!(!pr.approved_at_head(), "{association:?} must not approve");
+        }
+        for association in TRUSTED_ASSOCIATIONS {
+            let pr = listed(
+                &head,
+                &[review("APPROVED", &head, "reviewer-a", association)],
+            );
+            assert!(pr.approved_at_head(), "{association} approves");
+        }
+        // A review without a reviewer never counts.
+        let pr = parse(&format!(
+            r#"{{"number":1,"headRefOid":"{head}","reviews":[{{"state":"APPROVED","commit":{{"oid":"{head}"}},"authorAssociation":"MEMBER"}}]}}"#
+        ));
+        assert!(!pr.approved_at_head());
+        // One trusted reviewer's change request blocks another's approval.
+        let pr = listed(
+            &head,
+            &[
+                review("APPROVED", &head, "reviewer-a", "OWNER"),
+                review("CHANGES_REQUESTED", &head, "reviewer-b", "COLLABORATOR"),
+            ],
+        );
+        assert!(!pr.approved_at_head());
+        // An untrusted change request does not block.
+        let pr = listed(
+            &head,
+            &[
+                review("APPROVED", &head, "reviewer-a", "OWNER"),
+                review("CHANGES_REQUESTED", &head, "drive-by", "NONE"),
+            ],
+        );
+        assert!(pr.approved_at_head());
+        // A trusted change request in latestReviews blocks too.
+        let pr = parse(&format!(
+            r#"{{"number":1,"headRefOid":"{head}","reviews":[{}],"latestReviews":[{{"state":"CHANGES_REQUESTED","commit":{{"oid":""}},"author":{{"login":"reviewer-b"}},"authorAssociation":"MEMBER"}}]}}"#,
+            review("APPROVED", &head, "reviewer-a", "MEMBER")
+        ));
+        assert!(!pr.approved_at_head());
+    }
+
+    #[test]
+    fn approval_at_head_requires_full_oids_and_honours_review_decision() {
+        let head = "a".repeat(40);
+        // An abbreviated review commit never matches.
+        let pr = listed(
+            &head,
+            &[review("APPROVED", &head[..12], "reviewer-a", "MEMBER")],
+        );
+        assert!(!pr.approved_at_head());
+        // An abbreviated or malformed head never approves.
+        let short = &head[..12];
+        let pr = listed(short, &[review("APPROVED", short, "reviewer-a", "MEMBER")]);
+        assert!(!pr.approved_at_head());
+        // Case differences in hex are the same commit.
+        let pr = listed(
+            &"A".repeat(40),
+            &[review("APPROVED", &head, "reviewer-a", "MEMBER")],
+        );
+        assert!(pr.approved_at_head());
+        // The hosting service's own verdict can block.
+        for decision in ["CHANGES_REQUESTED", "REVIEW_REQUIRED"] {
+            let pr = parse(&format!(
+                r#"{{"number":1,"headRefOid":"{head}","reviewDecision":"{decision}","reviews":[{}]}}"#,
+                review("APPROVED", &head, "reviewer-a", "MEMBER")
+            ));
+            assert!(!pr.approved_at_head(), "{decision}");
+        }
+        let pr = parse(&format!(
+            r#"{{"number":1,"headRefOid":"{head}","reviewDecision":"APPROVED","reviews":[{}]}}"#,
+            review("APPROVED", &head, "reviewer-a", "MEMBER")
+        ));
+        assert!(pr.approved_at_head());
     }
 
     #[test]

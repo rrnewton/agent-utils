@@ -71,10 +71,12 @@ Exit status: `0` on success, `1` on an error before any work started (printed as
 `merge-queue: ...` on stderr), `2` on a usage error, `3` when `run` stopped early (broken base,
 landing failure, or an error during the run, which the report records as `stopped: "error: ..."`)
 or `widen` found the complete suite red. `status` exits `0` only when the daemon is running
-with a fresh heartbeat, and `1` when it is not running, dead, stale or malformed (the output
-names the verdict and the remedy). Exit codes 126 and 127 are never success. `status` exits `0` only when the daemon is running
-with a fresh heartbeat, and `1` when it is not running, dead, stale or malformed (the output
-names the verdict and the remedy). Exit codes 126 and 127 are never success.
+with a fresh heartbeat and every item record reads, and `1` when it is not running, dead,
+stale or malformed, or an item record is unreadable (the output names the verdict and the
+remedy). Exit codes 126 and 127 are never success. `status` exits `0` only when the daemon is running
+with a fresh heartbeat and every item record reads, and `1` when it is not running, dead,
+stale or malformed, or an item record is unreadable (the output names the verdict and the
+remedy). Exit codes 126 and 127 are never success.
 
 ## Commands
 
@@ -105,8 +107,8 @@ This command creates the state directory and writes `config.json`.
 | `--api-per-hour N` | `0` (= 60) | API requests this queue may make per rolling hour. See "Ready sources and the request budget". |
 | `--api-budget-file PATH` | state directory | Budget file to share with every other queue on the host, so they all draw on one hourly allowance. |
 | `--anonymous-fetch` | off | Fetch without credentials (public repositories). Credential helpers are disabled for fetches, so a fetch never spends a credential use. |
-| `--require-approval-at-head` | off | For `sync --label`/`sync --all-open`: a pull request counts as ready only with an approving review at its current head commit. Reviews are read in the same batched list call (no extra API requests). An unapproved change is not submitted; a queued change whose head moves without a fresh approval at the new head is withdrawn and its submitter (the author) notified. Resubmission with an approval at the new head re-queues it. Ready-file sources are unaffected. |
-| `--require-approval-at-head` | off | For `sync --label`/`sync --all-open`: a pull request counts as ready only with an approving review at its current head commit. Reviews are read in the same batched list call (no extra API requests). An unapproved change is not submitted; a queued change whose head moves without a fresh approval at the new head is withdrawn and its submitter (the author) notified. Resubmission with an approval at the new head re-queues it. Ready-file sources are unaffected. |
+| `--require-approval-at-head` | off | For `sync --label`/`sync --all-open`: a pull request counts as ready only when a reviewer with write access (author association `OWNER`, `MEMBER` or `COLLABORATOR`) has, as their latest verdict, approved exactly its current head commit (full commit id; comments do not replace a verdict), no such reviewer's latest verdict requests changes, and the hosting service's `reviewDecision` is not `CHANGES_REQUESTED` or `REVIEW_REQUIRED`. Missing review data never approves. Reviews are read in the same batched list call (no per-pull-request calls), charged 3 requests per hundred results instead of 1 because of the nested review connections. An unapproved change is not submitted; a queued change whose head moves without a fresh approval at the new head is withdrawn and its submitter notified (an existing `--notify` subscription is kept; the author is only the default). Resubmission with an approval at the new head re-queues it. Ready-file sources are unaffected. |
+| `--require-approval-at-head` | off | For `sync --label`/`sync --all-open`: a pull request counts as ready only when a reviewer with write access (author association `OWNER`, `MEMBER` or `COLLABORATOR`) has, as their latest verdict, approved exactly its current head commit (full commit id; comments do not replace a verdict), no such reviewer's latest verdict requests changes, and the hosting service's `reviewDecision` is not `CHANGES_REQUESTED` or `REVIEW_REQUIRED`. Missing review data never approves. Reviews are read in the same batched list call (no per-pull-request calls), charged 3 requests per hundred results instead of 1 because of the nested review connections. An unapproved change is not submitted; a queued change whose head moves without a fresh approval at the new head is withdrawn and its submitter notified (an existing `--notify` subscription is kept; the author is only the default). Resubmission with an approval at the new head re-queues it. Ready-file sources are unaffected. |
 | `--close-prs` | off | After landing, close each landed pull request with a comment naming the landed commit. Uses the budget; a close it cannot make now is retried by `sync`. |
 | `--agentctl WORD` | `agentctl` | Command (and leading arguments) the `serve` daemon runs instead of `agentctl` for state-change notifications. Repeatable. |
 | `--net-wrapper WORD` | none | A command prefix for network Git operations, for example `--net-wrapper with-proxy`. Repeat it for a prefix of several words. |
@@ -176,19 +178,27 @@ request per hundred listed), and the queue submits, resubmits on a moved head, o
 only within that set. Removing the label from a previously synced pull request withdraws only
 that label's own submission; a change submitted directly with `submit`, from another label, or
 from `--file` is untouched. Priorities still come from `pN` / `priority-N` labels (default 100).
+Draft pull requests are never ready, but the report names the drafts it skipped (`drafts`) so
+they are not silently invisible.
 For a shadow / soak kit — a `run --shadow` rehearsal or a `serve --shadow` daemon mirroring what
 people marked ready — drive the queue with `sync --label ready` (or your ready label), not
 `--all-open`, which deliberately lists every open pull request for measurements. Pair the label
 sync with `serve --shadow` (or `run --shadow`) so validations are real but the real base never
 moves; see the quickstart's shadow / soak kit.
-With `require_approval_at_head` (off by default), the batched list call also carries reviews:
-only a pull request with an approving review whose reviewed commit is its current head counts
-as ready. The report's `unapproved` field names the rest; a queued one is withdrawn (its
+With `require_approval_at_head` (off by default), the batched list call also carries reviews
+(and is charged 3 requests per hundred results): only a pull request whose current head commit
+is approved, by full commit id, in the latest verdict of a reviewer with write access (`OWNER`,
+`MEMBER`, `COLLABORATOR`), with no such reviewer's latest verdict requesting changes, counts as
+ready; missing review data never approves. Under the rule the author becomes the notification
+target only when the change has no `--notify` subscription yet. The report's `unapproved` field names the rest; a queued one is withdrawn (its
 submitter is notified through the withdrawn notification) instead of resubmitted, and a later
 sync listing it with an approval at its new head re-queues it.
-With `require_approval_at_head` (off by default), the batched list call also carries reviews:
-only a pull request with an approving review whose reviewed commit is its current head counts
-as ready. The report's `unapproved` field names the rest; a queued one is withdrawn (its
+With `require_approval_at_head` (off by default), the batched list call also carries reviews
+(and is charged 3 requests per hundred results): only a pull request whose current head commit
+is approved, by full commit id, in the latest verdict of a reviewer with write access (`OWNER`,
+`MEMBER`, `COLLABORATOR`), with no such reviewer's latest verdict requesting changes, counts as
+ready; missing review data never approves. Under the rule the author becomes the notification
+target only when the change has no `--notify` subscription yet. The report's `unapproved` field names the rest; a queued one is withdrawn (its
 submitter is notified through the withdrawn notification) instead of resubmitted, and a later
 sync listing it with an approval at its new head re-queues it.
 Priorities come from labels such as `p10` or `priority-10`, the landing planner's convention;
@@ -258,10 +268,19 @@ the `items/` directory fingerprint every `--poll-ms` (default `250`) and polls t
 with a cheap `git ls-remote` every `--base-poll-secs` (default `30`). A changed fingerprint (a
 new `submit`, `sync` or `withdraw`) or a moved base triggers one work cycle: the daemon takes the
 writer lock, plans, and runs the same `Runner` path as `run` (the logic is not forked), then
-releases the lock and goes back to idle polling. A cycle that finds the lock held, a refused
-validation, or a failed base poll is recorded in the heartbeat and retried on the next trigger;
-it never kills the daemon. Stop it with SIGINT or SIGTERM (Ctrl-C); a graceful stop removes the
-pid file, a crash leaves it behind for `status` to report.
+releases the lock and goes back to idle polling. Two triggers are time-based: a queued change
+whose refusal deferral (`next_retry_at`) has passed is retried without any new submit, and a
+failed cycle (an error, or a run that stopped early) is retried after 1 s, 2 s, 4 s, ... capped at
+5 min, with the error kept as the heartbeat's `last_error` and the next retry time as its
+`next_retry_at`. A cycle that finds the lock held or a failed base poll is recorded in the
+heartbeat; none of these kills the daemon. While a cycle runs, a helper thread refreshes the
+heartbeat every 0.5 s, so a long validation never reads as stale. An unreadable item record is
+surfaced as `last_error` (the daemon plans nothing until it reads) rather than read as an empty
+queue. One daemon per state directory is guaranteed by an exclusive `flock` on `serve.lock`,
+held for the daemon's lifetime; `serve.pid` is informational, and a daemon removes it only while
+it still holds its own pid. Stop it with SIGINT or SIGTERM (Ctrl-C), honoured between work
+cycles (a cycle in progress finishes first); a graceful stop removes the pid file, a crash
+leaves it behind (and frees the lock) for `status` to report.
 
 | Option | Default | Meaning |
 |---|---|---|
@@ -272,6 +291,7 @@ pid file, a crash leaves it behind for `status` to report.
 | `--depth N` | the configured `depth` | Override the initial window for work cycles. |
 | `--max-batch N` | the configured `max_batch` | Override the batch size for work cycles. |
 | `--agentctl WORD` | configured | Command (and leading arguments) to run instead of the configured agentctl for notifications. Repeatable. Supplement: `MERGE_QUEUE_AGENTCTL` (shell-style words) when neither flag nor config names one. |
+| `--notify-timeout-secs N` | `30` | Seconds one notification send may run; then its whole process group is killed and the send counts as a failed attempt (minimum 1). |
 
 With `--shadow` the daemon is a soak harness: it plans, validates and would land exactly as a
 live daemon would, but every landing advances only the in-memory simulated base. Run reports
@@ -287,19 +307,25 @@ refusals). A queue whose `land.driver` is `none` refuses live cycles with a reme
 A change submitted with `--notify NAME` (or a ready-file `notify=NAME`) gets exactly one push message per state change — `landed`, `ejected`, `refusal-deferred`, `withdrawn` — from the `serve` daemon:
 
 ```text
-agentctl send NAME --deliver-while-working --file <state>/notifications/<report>.md
+agentctl send --deliver-while-working --file <state>/notifications/<report>.md -- NAME
 ```
 
-The report names the change, the exact candidate (submitted head) SHA, the verdict, the landed base commit (or the failing tests / refusal detail and retry time), and the run-report path. Delivery state (transition key, attempts, delivered flag, last error) is persisted on the item record as `notify_delivery`, so daemon restarts and extra cycles never resend a delivered transition. A failed send — including a missing agentctl binary (126/127 are failures, never success) — is logged to the daemon's stderr and the item's history, retried on later cycles at most 3 times in total, and never blocks or fails the queue. The command is configured with `init --agentctl WORD...` (stored as `notify.agentctl`), overridden per daemon with `serve --agentctl WORD...`, and supplemented by `MERGE_QUEUE_AGENTCTL`.
+(`--` ends the options, so a name starting with `-` is never read as one.)
+
+The report names the change, the exact candidate (submitted head) SHA, the verdict, the landed base commit (or the failing tests / refusal detail and retry time), and the run-report path. Delivery state (transition key, attempts, delivered flag, last error) is persisted on the item record as `notify_delivery`, so daemon restarts and extra cycles never resend a delivered transition. A failed send — including a missing agentctl binary (126/127 are failures, never success) — is logged to the daemon's stderr and the item's history, retried on later cycles at most 3 times in total, and never blocks or fails the queue. Each send runs in its own process group with a deadline (30 s, `serve --notify-timeout-secs`); a send still running then is killed with its group and counts as a failed attempt. The sweep runs only under the writer lock (the daemon skips a cycle's sweep when the lock is busy; `sync` runs it under the lock it already holds), and records delivery on a fresh read of the item, changing only `notify_delivery` and the history, so it never overwrites another writer's change. The command is configured with `init --agentctl WORD...` (stored as `notify.agentctl`), overridden per daemon with `serve --agentctl WORD...`, and supplemented by `MERGE_QUEUE_AGENTCTL`.
 
 ### `merge-queue status`
 
 This command reports daemon liveness, the current window and slot occupancy without taking the
-writer lock. Liveness comes from `serve.pid` and `serve.heartbeat.json` in the state directory
-(the daemon rewrites the heartbeat every cycle): `running` (pid alive, heartbeat fresh), `not
-running` (no pid file), `dead` (pid file names a dead process), `stale` (pid alive but the
-heartbeat is older than `--stale-after-secs`), or `malformed` (pid file unreadable). Every
-non-running verdict names its remedy. The window is the daemon's active batches (or the newest
+writer lock. Liveness comes from `serve.lock`, `serve.pid` and `serve.heartbeat.json` in the
+state directory (the daemon rewrites the heartbeat every cycle, and every 0.5 s during a work
+cycle): `running` (pid alive, heartbeat fresh), `not running` (no pid file), `dead` (pid file
+names a dead process, or `serve.lock` is free so the pid now belongs to something else), `stale`
+(pid alive but the heartbeat is older than `--stale-after-secs`), or `malformed` (pid file
+unreadable). A daemon in a work cycle is reported as `working for N s` (JSON `working_secs`)
+separately from liveness; with a fresh heartbeat it is `running` and no kill is advised. An
+unreadable item record makes `status` unhealthy (JSON `items_error`, exit 1) instead of
+counting zero queued changes. Every unhealthy verdict names its remedy. The window is the daemon's active batches (or the newest
 run's plan when no daemon heartbeat exists); slots count the `scratch/slot-*` checkouts.
 
 | Option | Default | Meaning |
@@ -333,10 +359,19 @@ the `items/` directory fingerprint every `--poll-ms` (default `250`) and polls t
 with a cheap `git ls-remote` every `--base-poll-secs` (default `30`). A changed fingerprint (a
 new `submit`, `sync` or `withdraw`) or a moved base triggers one work cycle: the daemon takes the
 writer lock, plans, and runs the same `Runner` path as `run` (the logic is not forked), then
-releases the lock and goes back to idle polling. A cycle that finds the lock held, a refused
-validation, or a failed base poll is recorded in the heartbeat and retried on the next trigger;
-it never kills the daemon. Stop it with SIGINT or SIGTERM (Ctrl-C); a graceful stop removes the
-pid file, a crash leaves it behind for `status` to report.
+releases the lock and goes back to idle polling. Two triggers are time-based: a queued change
+whose refusal deferral (`next_retry_at`) has passed is retried without any new submit, and a
+failed cycle (an error, or a run that stopped early) is retried after 1 s, 2 s, 4 s, ... capped at
+5 min, with the error kept as the heartbeat's `last_error` and the next retry time as its
+`next_retry_at`. A cycle that finds the lock held or a failed base poll is recorded in the
+heartbeat; none of these kills the daemon. While a cycle runs, a helper thread refreshes the
+heartbeat every 0.5 s, so a long validation never reads as stale. An unreadable item record is
+surfaced as `last_error` (the daemon plans nothing until it reads) rather than read as an empty
+queue. One daemon per state directory is guaranteed by an exclusive `flock` on `serve.lock`,
+held for the daemon's lifetime; `serve.pid` is informational, and a daemon removes it only while
+it still holds its own pid. Stop it with SIGINT or SIGTERM (Ctrl-C), honoured between work
+cycles (a cycle in progress finishes first); a graceful stop removes the pid file, a crash
+leaves it behind (and frees the lock) for `status` to report.
 
 | Option | Default | Meaning |
 |---|---|---|
@@ -350,11 +385,15 @@ pid file, a crash leaves it behind for `status` to report.
 ### `merge-queue status`
 
 This command reports daemon liveness, the current window and slot occupancy without taking the
-writer lock. Liveness comes from `serve.pid` and `serve.heartbeat.json` in the state directory
-(the daemon rewrites the heartbeat every cycle): `running` (pid alive, heartbeat fresh), `not
-running` (no pid file), `dead` (pid file names a dead process), `stale` (pid alive but the
-heartbeat is older than `--stale-after-secs`), or `malformed` (pid file unreadable). Every
-non-running verdict names its remedy. The window is the daemon's active batches (or the newest
+writer lock. Liveness comes from `serve.lock`, `serve.pid` and `serve.heartbeat.json` in the
+state directory (the daemon rewrites the heartbeat every cycle, and every 0.5 s during a work
+cycle): `running` (pid alive, heartbeat fresh), `not running` (no pid file), `dead` (pid file
+names a dead process, or `serve.lock` is free so the pid now belongs to something else), `stale`
+(pid alive but the heartbeat is older than `--stale-after-secs`), or `malformed` (pid file
+unreadable). A daemon in a work cycle is reported as `working for N s` (JSON `working_secs`)
+separately from liveness; with a fresh heartbeat it is `running` and no kill is advised. An
+unreadable item record makes `status` unhealthy (JSON `items_error`, exit 1) instead of
+counting zero queued changes. Every unhealthy verdict names its remedy. The window is the daemon's active batches (or the newest
 run's plan when no daemon heartbeat exists); slots count the `scratch/slot-*` checkouts.
 
 | Option | Default | Meaning |
@@ -507,7 +546,8 @@ on which files two changes share.
 <state>/
   config.json            fixed: queue configuration
   lock                   fixed: writer lock (flock)
-  serve.pid              fixed: `serve` daemon pid (removed on a graceful stop)
+  serve.lock             fixed: single-daemon lock (flock held by a running `serve`)
+  serve.pid              fixed: `serve` daemon pid (informational; removed on a graceful stop)
   serve.heartbeat.json   fixed: `serve` heartbeat, rewritten every cycle
   serve.pid              fixed: `serve` daemon pid (removed on a graceful stop)
   serve.heartbeat.json   fixed: `serve` heartbeat, rewritten every cycle
@@ -838,7 +878,10 @@ only by `sync --label` and `sync --all-open`, one list call for the whole queue,
 
 Every API call is charged to a budget first: `--api-per-hour` requests per rolling hour, kept in
 `api-budget.json` or in a shared `--api-budget-file`. A call the budget cannot cover is refused
-before it is made, and the error says when room opens up.
+before it is made, and the error says when room opens up. A list call that carries reviews
+(`require_approval_at_head`) is charged 3 requests per hundred results instead of 1: it is still
+one call, but its two nested review connections make the hosting service price it at about
+three plain pages.
 
 **Which ready source to use.**
 - **`submit`.** When the agents that finish changes run on the same host as the queue, they should

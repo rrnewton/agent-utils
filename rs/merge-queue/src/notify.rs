@@ -5,8 +5,20 @@
 //! delivered as:
 //!
 //! ```text
-//! agentctl send <name> --deliver-while-working --file <report>
+//! agentctl send --deliver-while-working --file <report> -- <name>
 //! ```
+//!
+//! (`--` ends the options, so a name that starts with `-` is never read as
+//! one.) Each send runs in its own process group under a deadline
+//! ([`DEFAULT_SEND_TIMEOUT`], `serve --notify-timeout-secs`); on expiry the
+//! whole group is killed and the send counts as a failed attempt, so a hung
+//! sink can never stall the daemon or `sync`.
+//!
+//! The sweep runs only under the queue writer lock ([`sweep`] takes it,
+//! [`sweep_locked`] proves the caller holds it), and every write it makes
+//! reloads the item from disk and changes only the notification fields
+//! (`notify_delivery` plus one history event), so it never writes back a
+//! stale snapshot over another writer's change.
 //!
 //! Dedup and retry state live on the item record itself
 //! (`notify_delivery`): the transition key, the attempts made for it, and
@@ -25,14 +37,20 @@
 //! variable (shell-style words) is a documented supplement between the two.
 //! Tests inject a fake command through any of these seams.
 
+use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::model::{now, Item, ItemStatus, NotifyDelivery};
-use crate::state::{Config, State};
+use crate::state::{Config, Lock, State};
 
 /// Most send attempts for one transition, across all daemon cycles.
 pub const MAX_ATTEMPTS: u32 = 3;
+
+/// Default deadline for one notification send.
+pub const DEFAULT_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Environment supplement naming the agentctl command (shell-style words).
 pub const AGENTCTL_ENV: &str = "MERGE_QUEUE_AGENTCTL";
@@ -116,41 +134,111 @@ pub fn resolve_agentctl(
 pub struct Notifier {
     /// Command words; the first is the program.
     pub command: Vec<String>,
+    /// Deadline for one send; on expiry the send's process group is killed
+    /// and the send is a failed attempt.
+    pub timeout: Duration,
+}
+
+/// Kill a send's whole process group (it was spawned as a group leader),
+/// then the child itself, and reap it. `kill(1)` is used because this crate
+/// forbids `unsafe` and so cannot call `kill(2)` directly.
+fn kill_group(child: &mut std::process::Child) {
+    let group = format!("-{}", child.id());
+    let _ = Command::new("kill")
+        .args(["-KILL", "--", &group])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 impl Notifier {
-    /// Build from the flag override, the environment supplement, and config.
-    pub fn resolve(flag: Option<&[String]>, config: &Config) -> Self {
-        let env = std::env::var(AGENTCTL_ENV).ok();
+    /// A sender running `command` with the default deadline.
+    pub fn new(command: Vec<String>) -> Self {
         Self {
-            command: resolve_agentctl(flag, env.as_deref(), config),
+            command,
+            timeout: DEFAULT_SEND_TIMEOUT,
         }
     }
 
+    /// Build from the flag override, the environment supplement, and config.
+    pub fn resolve(flag: Option<&[String]>, config: &Config) -> Self {
+        let env = std::env::var(AGENTCTL_ENV).ok();
+        Self::new(resolve_agentctl(flag, env.as_deref(), config))
+    }
+
+    /// The same sender with a different per-send deadline.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
     /// Send `report` to `name`. Any non-zero exit — including 126 (cannot
-    /// execute) and 127 (no such command) — and any spawn failure (a missing
-    /// binary) is a failed send, never a success.
+    /// execute) and 127 (no such command) — any spawn failure (a missing
+    /// binary), and a send still running at [`Notifier::timeout`] (its
+    /// process group is killed) is a failed send, never a success.
     pub fn send(&self, name: &str, report: &std::path::Path) -> Result<(), String> {
         let mut command = Command::new(&self.command[0]);
         command
             .args(&self.command[1..])
             .arg("send")
-            .arg(name)
             .arg("--deliver-while-working")
             .arg("--file")
             .arg(report)
-            .stdin(std::process::Stdio::null());
-        let output = command
-            .output()
+            // Options end here: a name starting with `-` stays positional.
+            .arg("--")
+            .arg(name)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            // Own process group, so a timeout can kill everything it spawned.
+            .process_group(0);
+        let mut child = command
+            .spawn()
             .map_err(|error| format!("cannot run {}: {error}", self.command[0]))?;
-        if output.status.success() {
+        // Drain stderr on a helper thread so a chatty sender never blocks on
+        // a full pipe; a grandchild that keeps the pipe open cannot block us
+        // either, because the result is collected with a bounded wait.
+        let (sender, receiver) = std::sync::mpsc::channel::<Vec<u8>>();
+        if let Some(mut pipe) = child.stderr.take() {
+            std::thread::spawn(move || {
+                let mut buffer = Vec::new();
+                let _ = pipe.read_to_end(&mut buffer);
+                let _ = sender.send(buffer);
+            });
+        }
+        let deadline = Instant::now() + self.timeout;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() >= deadline => {
+                    kill_group(&mut child);
+                    return Err(format!(
+                        "{} send timed out after {}s (process group killed)",
+                        self.command[0],
+                        self.timeout.as_secs_f64()
+                    ));
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                Err(error) => {
+                    kill_group(&mut child);
+                    return Err(format!("cannot wait for {}: {error}", self.command[0]));
+                }
+            }
+        };
+        if status.success() {
             Ok(())
         } else {
-            let code = output
-                .status
+            let code = status
                 .code()
                 .map_or_else(|| "signal".to_owned(), |code| code.to_string());
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = receiver
+                .recv_timeout(Duration::from_millis(500))
+                .unwrap_or_default();
+            let stderr = String::from_utf8_lossy(&stderr);
             let tail = stderr.trim().lines().last().unwrap_or_default();
             Err(format!(
                 "{} send exited {code}{}",
@@ -274,47 +362,118 @@ fn report_path(state: &State, item: &Item, transition: &Transition) -> PathBuf {
     reports_dir(state).join(format!("{}-{safe}.md", item.pr))
 }
 
-/// Deliver every owed notification once. Returns how many were delivered.
+/// The transition `item` owes a send attempt for now, with that attempt's
+/// number, or `None` when nothing is owed (no subscription, nothing to
+/// report, already delivered, or out of attempts).
+fn owed(item: &Item) -> Option<(Transition, u32)> {
+    if item.notify.is_empty() {
+        return None;
+    }
+    let transition = desired_transition(item)?;
+    let prior = &item.notify_delivery;
+    if prior.key == transition.key && (prior.delivered || prior.attempts >= MAX_ATTEMPTS) {
+        return None;
+    }
+    let attempts = if prior.key == transition.key {
+        prior.attempts + 1
+    } else {
+        1
+    };
+    Some((transition, attempts))
+}
+
+/// How many items owe a send attempt now. A lock-free read, so the daemon
+/// can skip taking the writer lock when there is nothing to send.
+pub fn pending(state: &State) -> Result<usize, String> {
+    Ok(state
+        .items()?
+        .iter()
+        .filter(|item| owed(item).is_some())
+        .count())
+}
+
+/// Deliver every owed notification once, taking the queue writer lock for
+/// the duration. Fails (without sending anything) when another writer holds
+/// the lock; callers that already hold it use [`sweep_locked`]. Returns how
+/// many notifications were delivered.
+pub fn sweep(state: &State, config: &Config, notifier: &Notifier) -> Result<usize, String> {
+    let lock = state.lock()?;
+    sweep_locked(state, &lock, config, notifier)
+}
+
+/// Write the notification fields of item `pr` and nothing else.
+///
+/// The item is reloaded from disk (the caller holds the writer lock, so the
+/// reload-modify-save is not interleaved with another lock-respecting
+/// writer) and `update` sees the fresh record; it must only touch
+/// `notify_delivery` and append history. Returns `Ok(None)` when the record
+/// is gone or no longer owes `transition`, in which case nothing is written.
+fn update_delivery(
+    state: &State,
+    pr: i64,
+    transition: &Transition,
+    update: impl FnOnce(&mut Item),
+) -> Result<Option<Item>, String> {
+    let Some(mut fresh) = state.item(pr)? else {
+        return Ok(None);
+    };
+    if desired_transition(&fresh).as_ref() != Some(transition) {
+        return Ok(None);
+    }
+    update(&mut fresh);
+    state.save_item(&fresh)?;
+    Ok(Some(fresh))
+}
+
+/// [`sweep`] under a writer lock the caller already holds (the `&Lock`
+/// proves it).
 ///
 /// Each item is handled independently: a failure is persisted (attempt
 /// count and error), logged to stderr and the item's history, and never
 /// stops the queue or the other notifications. Attempts for a transition
-/// stop after [`MAX_ATTEMPTS`]; the give-up is logged the same way.
-pub fn sweep(state: &State, config: &Config, notifier: &Notifier) -> Result<usize, String> {
+/// stop after [`MAX_ATTEMPTS`]; the give-up is logged the same way. Every
+/// item is re-read from disk right before it is handled and again before
+/// each write, and only its notification fields are written.
+pub fn sweep_locked(
+    state: &State,
+    _lock: &Lock,
+    config: &Config,
+    notifier: &Notifier,
+) -> Result<usize, String> {
     let _ = config;
     let mut delivered = 0usize;
-    for item in state.items()? {
-        if item.notify.is_empty() {
-            continue;
-        }
-        let Some(transition) = desired_transition(&item) else {
-            continue;
+    let numbers: Vec<i64> = state.items()?.into_iter().map(|item| item.pr).collect();
+    for pr in numbers {
+        // Fresh read: an earlier send in this sweep may have taken a while.
+        let item = match state.item(pr) {
+            Ok(Some(item)) => item,
+            Ok(None) => continue,
+            Err(error) => {
+                eprintln!("merge-queue notify: cannot read #{pr}: {error}");
+                continue;
+            }
         };
-        let prior = &item.notify_delivery;
-        if prior.key == transition.key && (prior.delivered || prior.attempts >= MAX_ATTEMPTS) {
+        let Some((transition, attempts)) = owed(&item) else {
             continue;
-        }
-        let attempts = if prior.key == transition.key {
-            prior.attempts + 1
-        } else {
-            1
         };
         // Persist the attempt before sending: a daemon crash mid-send can
         // then only lose the delivery mark, never the retry bound.
-        let mut attempt_item = item.clone();
-        attempt_item.notify_delivery = NotifyDelivery {
-            key: transition.key.clone(),
-            attempts,
-            delivered: false,
-            last_error: String::new(),
+        let recorded = update_delivery(state, pr, &transition, |fresh| {
+            fresh.notify_delivery = NotifyDelivery {
+                key: transition.key.clone(),
+                attempts,
+                delivered: false,
+                last_error: String::new(),
+            };
+        });
+        let item = match recorded {
+            Ok(Some(item)) => item,
+            Ok(None) => continue,
+            Err(error) => {
+                eprintln!("merge-queue notify: cannot record attempt for #{pr}: {error}");
+                continue;
+            }
         };
-        if let Err(error) = state.save_item(&attempt_item) {
-            eprintln!(
-                "merge-queue notify: cannot record attempt for #{}: {error}",
-                item.pr
-            );
-            continue;
-        }
         let path = report_path(state, &item, &transition);
         let outcome = std::fs::create_dir_all(reports_dir(state))
             .map_err(|error| format!("cannot create notifications dir: {error}"))
@@ -323,61 +482,47 @@ pub fn sweep(state: &State, config: &Config, notifier: &Notifier) -> Result<usiz
                     .map_err(|error| format!("cannot write {}: {error}", path.display()))
             })
             .and_then(|()| notifier.send(&item.notify, &path));
-        // Reload before persisting the outcome: the item may have moved on
-        // (resubmitted, withdrawn) while agentctl ran. Only mark the key we
-        // actually attempted, and only if it is still the owed transition.
-        let mut current = match state.item(item.pr) {
-            Ok(Some(current)) => current,
-            Ok(None) => continue,
-            Err(error) => {
-                eprintln!("merge-queue notify: cannot reload #{}: {error}", item.pr);
-                continue;
-            }
-        };
-        if desired_transition(&current).as_ref() != Some(&transition) {
-            continue;
-        }
+        // Record the outcome on a fresh read: only mark the key we actually
+        // attempted, and only if it is still the owed transition.
         match outcome {
             Ok(()) => {
-                current.notify_delivery.delivered = true;
-                current.notify_delivery.last_error.clear();
-                current.log(
-                    "notified",
-                    format!(
-                        "{} sent to {} (report {})",
-                        transition.verdict,
-                        item.notify,
-                        path.display()
-                    ),
-                );
-                if let Err(error) = state.save_item(&current) {
-                    eprintln!(
-                        "merge-queue notify: cannot record delivery for #{}: {error}",
-                        item.pr
+                let marked = update_delivery(state, pr, &transition, |fresh| {
+                    fresh.notify_delivery.delivered = true;
+                    fresh.notify_delivery.last_error.clear();
+                    fresh.log(
+                        "notified",
+                        format!(
+                            "{} sent to {} (report {})",
+                            transition.verdict,
+                            item.notify,
+                            path.display()
+                        ),
                     );
-                    continue;
+                });
+                match marked {
+                    Ok(Some(_)) => delivered += 1,
+                    Ok(None) => {}
+                    Err(error) => {
+                        eprintln!("merge-queue notify: cannot record delivery for #{pr}: {error}");
+                    }
                 }
-                delivered += 1;
             }
             Err(error) => {
-                current.notify_delivery.last_error = error.clone();
                 let gave_up = attempts >= MAX_ATTEMPTS;
-                current.log(
-                    "notify-failed",
-                    format!(
-                        "{} to {} failed (attempt {attempts}/{MAX_ATTEMPTS}){}: {error}",
-                        transition.verdict,
-                        item.notify,
-                        if gave_up { "; giving up" } else { "" }
-                    ),
-                );
-                let _ = state.save_item(&current);
+                let suffix = if gave_up { "; giving up" } else { "" };
+                let _ = update_delivery(state, pr, &transition, |fresh| {
+                    fresh.notify_delivery.last_error = error.clone();
+                    fresh.log(
+                        "notify-failed",
+                        format!(
+                            "{} to {} failed (attempt {attempts}/{MAX_ATTEMPTS}){suffix}: {error}",
+                            transition.verdict, item.notify
+                        ),
+                    );
+                });
                 eprintln!(
-                    "merge-queue notify: #{} {} to {} failed (attempt {attempts}/{MAX_ATTEMPTS}){}: {error}",
-                    item.pr,
-                    transition.verdict,
-                    item.notify,
-                    if gave_up { "; giving up" } else { "" }
+                    "merge-queue notify: #{pr} {} to {} failed (attempt {attempts}/{MAX_ATTEMPTS}){suffix}: {error}",
+                    transition.verdict, item.notify
                 );
             }
         }
@@ -490,34 +635,87 @@ mod unit {
 
     #[test]
     fn missing_and_refused_sends_are_failures_never_success() {
-        let missing = Notifier {
-            command: vec!["/definitely/missing/agentctl".to_owned()],
-        };
+        let missing = Notifier::new(vec!["/definitely/missing/agentctl".to_owned()]);
         let report = std::env::temp_dir().join("merge-queue-notify-unit.md");
         std::fs::write(&report, "x\n").unwrap();
         assert!(missing.send("lane-fictional", &report).is_err());
         for code in [1, 75, 126, 127] {
-            let refused = Notifier {
-                command: vec![
-                    "sh".to_owned(),
-                    "-c".to_owned(),
-                    format!("exit {code}"),
-                    "sh".to_owned(),
-                ],
-            };
+            let refused = Notifier::new(vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                format!("exit {code}"),
+                "sh".to_owned(),
+            ]);
             assert!(
                 refused.send("lane-fictional", &report).is_err(),
                 "exit {code} must be a failed send"
             );
         }
-        let ok = Notifier {
-            command: vec![
-                "sh".to_owned(),
-                "-c".to_owned(),
-                "exit 0".to_owned(),
-                "sh".to_owned(),
-            ],
-        };
+        let ok = Notifier::new(vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "exit 0".to_owned(),
+            "sh".to_owned(),
+        ]);
         assert!(ok.send("lane-fictional", &report).is_ok());
+    }
+
+    #[test]
+    fn hung_send_times_out_and_kills_its_process_group() {
+        let report =
+            std::env::temp_dir().join(format!("merge-queue-notify-hang-{}.md", std::process::id()));
+        std::fs::write(&report, "x\n").unwrap();
+        // The shell's child `sleep` holds the stderr pipe too: only killing
+        // the whole group (and a bounded stderr wait) keeps this prompt.
+        let hung = Notifier::new(vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "sleep 30; exit 0".to_owned(),
+            "sh".to_owned(),
+        ])
+        .with_timeout(Duration::from_millis(300));
+        let start = Instant::now();
+        let error = hung.send("lane-fictional", &report).unwrap_err();
+        assert!(error.contains("timed out"), "{error}");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn name_follows_an_end_of_options_marker() {
+        let dir =
+            std::env::temp_dir().join(format!("merge-queue-notify-argv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let report = dir.join("r.md");
+        std::fs::write(&report, "x\n").unwrap();
+        let log = dir.join("argv");
+        let recorder = Notifier::new(vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            format!("printf '%s\\n' \"$@\" > {}", log.display()),
+            "sh".to_owned(),
+        ]);
+        recorder.send("-lane", &report).unwrap();
+        let argv: Vec<String> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let report_arg = report.display().to_string();
+        assert_eq!(
+            argv,
+            vec![
+                "send",
+                "--deliver-while-working",
+                "--file",
+                report_arg.as_str(),
+                "--",
+                "-lane"
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

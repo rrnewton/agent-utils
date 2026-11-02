@@ -83,7 +83,8 @@ fn listing_reviewed(entries: &[ReviewedEntry<'_>]) -> String {
                 "labels": [{"name": "ready"}],
                 "reviews": reviews.iter().map(|(state, commit)| {
                     serde_json::json!({"state": state, "commit": {"oid": commit},
-                        "author": {"login": "reviewer-fictional"}})
+                        "author": {"login": "reviewer-fictional"},
+                        "authorAssociation": "MEMBER"})
                 }).collect::<Vec<_>>()
             })
         })
@@ -178,6 +179,7 @@ fn label_sync_submits_withdraws_and_reads_priority_labels() {
     let r = sync_json(&fx, &gh, &["--label", "ready", "--limit", "100"]);
     assert_eq!(r["submitted"], serde_json::json!([1, 2]));
     assert_eq!(r["listed"], 2, "drafts are not ready");
+    assert_eq!(r["drafts"], serde_json::json!([3]), "but they are named");
     let all = items(&fx);
     assert_eq!(item(&all, 1)["priority"], 10);
     assert_eq!(item(&all, 1)["head_ref"], "refs/pull/1/head");
@@ -342,14 +344,15 @@ fn approval_at_head_queues_only_approved_and_counts_one_batched_call() {
         );
     }
     // Reviews rode the same single batched list call: exactly one gh call,
-    // charged one request (limit 100), no per-PR review calls.
+    // no per-PR review calls, charged REVIEWS_COST_FACTOR (3) requests for
+    // the one page (limit 100) because of the nested review connections.
     let log = std::fs::read_to_string(&gh.log).unwrap();
     assert_eq!(log.lines().count(), 1, "{log}");
     assert!(
         log.contains("reviews"),
         "reviews in the batched call: {log}"
     );
-    assert_eq!(r["api_remaining"], 59, "{r}");
+    assert_eq!(r["api_remaining"], 57, "{r}");
 }
 
 #[test]
@@ -417,17 +420,13 @@ fn head_move_without_fresh_approval_withdraws_and_notifies_with_approval_it_stay
         1,
         "notify must fire: {sent_text}"
     );
-    assert!(
-        sent_text.contains("send lane-fictional --deliver-while-working --file "),
-        "{sent_text}"
-    );
     let report_path = sent_text
         .lines()
         .next()
         .unwrap()
-        .rsplit("--file ")
-        .next()
-        .unwrap()
+        .strip_prefix("send --deliver-while-working --file ")
+        .and_then(|rest| rest.strip_suffix(" -- lane-fictional"))
+        .unwrap_or_else(|| panic!("unexpected argv: {sent_text}"))
         .trim();
     let report = std::fs::read_to_string(report_path).unwrap();
     assert!(report.contains("verdict: withdrawn"), "{report}");
@@ -474,4 +473,61 @@ fn head_move_without_fresh_approval_withdraws_and_notifies_with_approval_it_stay
     let log = std::fs::read_to_string(&gh.log).unwrap();
     assert_eq!(log.lines().count(), 4, "{log}");
     assert!(log.lines().all(|l| l.starts_with("pr list ")), "{log}");
+}
+
+#[test]
+fn approval_sync_keeps_an_existing_notify_subscription() {
+    let fx = Fixture::new("sync-approval-notify");
+    let gh = stub(&fx);
+    let (agentctl, _sent) = fake_agentctl(&fx);
+    fx.mq_ok(&[
+        "init",
+        "--github-repo",
+        "owner/name",
+        "--gh",
+        &gh.stub,
+        "--require-approval-at-head",
+        "--agentctl",
+        &agentctl,
+        "--validator",
+        "command",
+        "--validator-run",
+        "exit 0",
+    ]);
+    let h1 = pull_request(&fx, 1, &[("one", "1\n")]);
+    fx.mq_ok(&[
+        "submit",
+        "1",
+        "--head",
+        "refs/pull/1/head",
+        "--sha",
+        &h1,
+        "--notify",
+        "lane-subscriber",
+    ]);
+    // The head moves and is approved there: sync resubmits at the new head,
+    // and the author must not replace the existing subscription.
+    let h2 = move_pull_request(&fx, 1, &[("one-v2", "2\n")]);
+    std::fs::write(
+        &gh.list,
+        listing_reviewed(&[(1, &h2, "lane-author", &[("APPROVED", &h2)])]),
+    )
+    .unwrap();
+    let r = sync_json(&fx, &gh, &["--all-open", "--limit", "100"]);
+    assert_eq!(r["submitted"], serde_json::json!([1]), "{r}");
+    let all = items(&fx);
+    assert_eq!(item(&all, 1)["head"], h2);
+    assert_eq!(item(&all, 1)["notify"], "lane-subscriber", "{all}");
+    // Without a prior subscription, the author is the default target.
+    let h3 = pull_request(&fx, 3, &[("three", "3\n")]);
+    std::fs::write(
+        &gh.list,
+        listing_reviewed(&[
+            (1, &h2, "lane-author", &[("APPROVED", &h2)]),
+            (3, &h3, "lane-author", &[("APPROVED", &h3)]),
+        ]),
+    )
+    .unwrap();
+    sync_json(&fx, &gh, &["--all-open", "--limit", "100"]);
+    assert_eq!(item(&items(&fx), 3)["notify"], "lane-author");
 }
