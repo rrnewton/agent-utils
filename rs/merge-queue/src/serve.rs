@@ -107,10 +107,16 @@ pub struct Heartbeat {
     /// Most recent non-fatal error (base poll or work cycle), for `status`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub last_error: String,
+    /// Whether this daemon lands on a simulated base (`serve --shadow`):
+    /// validations are real, landings are recorded as shadow/simulated,
+    /// item statuses stay queued, and the real base ref is never pushed.
+    /// `false` for heartbeats written before shadow serve existed.
+    #[serde(default)]
+    pub shadow: bool,
 }
 
 impl Heartbeat {
-    fn new(pid: u32, window: usize) -> Self {
+    fn new(pid: u32, window: usize, shadow: bool) -> Self {
         let started = now();
         Self {
             pid,
@@ -129,6 +135,7 @@ impl Heartbeat {
             last_run: String::new(),
             last_run_at: String::new(),
             last_error: String::new(),
+            shadow,
         }
     }
 
@@ -261,6 +268,11 @@ pub struct ServeOptions {
     pub base_poll: Duration,
     /// Run at most one work cycle, then exit (scripts and tests).
     pub once: bool,
+    /// Land on a simulated base (same shadow path as `run --shadow`):
+    /// full plan/run/notify cycles execute and landings are recorded as
+    /// shadow/simulated, but the real base ref is never pushed and item
+    /// statuses stay queued. Daemon soak mode.
+    pub shadow: bool,
     /// Override the configured depth for work cycles.
     pub depth: Option<usize>,
     /// Override the configured maximum batch size for work cycles.
@@ -275,6 +287,7 @@ impl Default for ServeOptions {
             poll: Duration::from_millis(DEFAULT_POLL_MS),
             base_poll: Duration::from_secs(DEFAULT_BASE_POLL_SECS),
             once: false,
+            shadow: false,
             depth: None,
             max_batch: None,
             agentctl: None,
@@ -333,18 +346,23 @@ pub fn serve(state: &State, options: &ServeOptions) -> Result<i32, String> {
     write_pid(state)?;
     let git = ops::repo(state, &config)?;
     let window = options.depth.unwrap_or(config.depth).max(1);
-    let mut heartbeat = Heartbeat::new(std::process::id(), window);
+    let mut heartbeat = Heartbeat::new(std::process::id(), window, options.shadow);
     heartbeat.queued = queued_count(state);
     let (total, in_use) = slot_occupancy(state);
     heartbeat.slots_total = total;
     heartbeat.slots_in_use = in_use;
     write_heartbeat(state, &heartbeat)?;
     eprintln!(
-        "merge-queue serve: pid {} watching {} (poll {}ms, base poll {}s); Ctrl-C to stop",
+        "merge-queue serve: pid {} watching {} (poll {}ms, base poll {}s){}; Ctrl-C to stop",
         heartbeat.pid,
         state.root.display(),
         options.poll.as_millis(),
-        options.base_poll.as_secs()
+        options.base_poll.as_secs(),
+        if options.shadow {
+            " (shadow: landings simulated, real base unchanged)"
+        } else {
+            ""
+        }
     );
 
     let mut last_fingerprint = String::new();
@@ -419,6 +437,7 @@ pub fn serve(state: &State, options: &ServeOptions) -> Result<i32, String> {
                             let _ = write_heartbeat(state, &heartbeat);
                         }
                         let run_options = RunOptions {
+                            shadow: options.shadow,
                             depth: options.depth,
                             max_batch: options.max_batch,
                             quiet: true,
@@ -436,8 +455,14 @@ pub fn serve(state: &State, options: &ServeOptions) -> Result<i32, String> {
                                             format!("run stopped: {}", report.stopped);
                                     }
                                     eprintln!(
-                                        "merge-queue serve: run {} landed {} batch(es), ejected {}, stopped: {}",
+                                        "merge-queue serve: {} run {} {} {} batch(es), ejected {}, stopped: {}",
+                                        if options.shadow { "shadow" } else { "live" },
                                         report.run,
+                                        if options.shadow {
+                                            "simulated"
+                                        } else {
+                                            "landed"
+                                        },
                                         report.landed.len(),
                                         report.ejected.len(),
                                         if report.stopped.is_empty() {
@@ -589,6 +614,10 @@ pub struct StatusReport {
     pub slots_total: usize,
     /// Scratch slots holding a checkout.
     pub slots_in_use: usize,
+    /// Whether the daemon is in shadow mode (`serve --shadow`): landings
+    /// are simulated on a private base and the real base is never pushed.
+    /// Derived from the heartbeat; `false` when no daemon heartbeat exists.
+    pub shadow: bool,
     /// Human remedy when the daemon is not healthy.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub remedy: String,
@@ -660,6 +689,7 @@ pub fn collect_status(state: &State, stale_after_secs: u64) -> Result<StatusRepo
             state.serve_pid_path().display()
         ),
     };
+    let shadow = heartbeat.as_ref().is_some_and(|h| h.shadow);
     Ok(StatusReport {
         state_dir: state.root.clone(),
         daemon,
@@ -674,6 +704,7 @@ pub fn collect_status(state: &State, stale_after_secs: u64) -> Result<StatusRepo
         active_batches,
         slots_total,
         slots_in_use,
+        shadow,
         remedy,
     })
 }
@@ -736,6 +767,11 @@ pub fn render_status(report: &StatusReport) -> String {
                         h.last_run.as_str()
                     }
                 ));
+                out.push_str(if h.shadow {
+                    "  mode: shadow (landings simulated; real base unchanged)\n"
+                } else {
+                    "  mode: live\n"
+                });
                 if !h.last_error.is_empty() {
                     out.push_str(&format!("  last error: {}\n", h.last_error));
                 }
@@ -838,7 +874,7 @@ mod unit {
         // to be alive the assertion below still holds via the age path,
         // so use the heartbeat-age branch for stale instead.
         std::fs::write(state.serve_pid_path(), "999999999\n").unwrap();
-        let mut heartbeat = Heartbeat::new(999_999_999, 2);
+        let mut heartbeat = Heartbeat::new(999_999_999, 2, false);
         heartbeat.heartbeat_unix = unix_now().saturating_sub(3600);
         heartbeat.touch();
         heartbeat.heartbeat_unix = unix_now().saturating_sub(3600);
@@ -851,7 +887,7 @@ mod unit {
         );
         // Live pid (this process) with a fresh heartbeat: running.
         std::fs::write(state.serve_pid_path(), format!("{}\n", std::process::id())).unwrap();
-        let mut fresh = Heartbeat::new(std::process::id(), 2);
+        let mut fresh = Heartbeat::new(std::process::id(), 2, false);
         fresh.touch();
         write_heartbeat(&state, &fresh).unwrap();
         assert_eq!(liveness(&state, 10).0, Liveness::Running);
@@ -863,5 +899,37 @@ mod unit {
         std::fs::write(state.serve_pid_path(), "not-a-pid\n").unwrap();
         assert_eq!(liveness(&state, 10).0, Liveness::Malformed);
         let _ = std::fs::remove_dir_all(&state.root);
+    }
+
+    #[test]
+    fn heartbeat_and_status_report_shadow_truthfully() {
+        let state = temp_state("shadow");
+        std::fs::write(state.serve_pid_path(), format!("{}\n", std::process::id())).unwrap();
+        let mut heartbeat = Heartbeat::new(std::process::id(), 2, true);
+        heartbeat.touch();
+        write_heartbeat(&state, &heartbeat).unwrap();
+        let report = collect_status(&state, 10).unwrap();
+        assert!(report.shadow, "{report:?}");
+        assert_eq!(report.heartbeat.as_ref().map(|h| h.shadow), Some(true));
+        let text = render_status(&report);
+        assert!(text.contains("mode: shadow"), "{text}");
+        assert!(text.contains("simulated"), "{text}");
+        // A live (non-shadow) heartbeat renders as live, never shadow.
+        let mut live = Heartbeat::new(std::process::id(), 2, false);
+        live.touch();
+        write_heartbeat(&state, &live).unwrap();
+        let report = collect_status(&state, 10).unwrap();
+        assert!(!report.shadow);
+        assert!(render_status(&report).contains("mode: live"));
+        let _ = std::fs::remove_dir_all(&state.root);
+    }
+
+    #[test]
+    fn old_heartbeat_without_shadow_field_reads_as_live() {
+        // Heartbeats written before `serve --shadow` have no `shadow`
+        // field; they must deserialize as live (false), never shadow.
+        let json = r#"{"pid":1,"started_at":"2026-01-01T00:00:00Z","heartbeat_at":"2026-01-01T00:00:00Z","heartbeat_unix":1,"cycles":0,"state":"idle","last_trigger":"startup","last_base_sha":"","queued":0,"active_batches":[],"window":2,"slots_total":0,"slots_in_use":0}"#;
+        let heartbeat: Heartbeat = serde_json::from_str(json).unwrap();
+        assert!(!heartbeat.shadow);
     }
 }

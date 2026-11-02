@@ -243,9 +243,19 @@ pid file, a crash leaves it behind for `status` to report.
 | `--poll-ms N` | `250` | Idle poll interval in milliseconds: `items/` watch and heartbeat cadence (at least 10). |
 | `--base-poll-secs N` | `30` | Seconds between `git ls-remote` base polls. `0` polls the base every cycle. |
 | `--once` | off | Run at most one work cycle, then exit. For scripts and tests. |
+| `--shadow` | off | Validate for real, but land on a simulated base (the same shadow path as `run --shadow`): full plan/run/notify cycles execute, landings are recorded as shadow/simulated (`mode: shadow` in the run report, `mode: shadow` in `status`), item statuses stay queued, and the real base ref is never pushed. Daemon soak mode; also the remedy when `land.driver` is `none`. |
 | `--depth N` | the configured `depth` | Override the initial window for work cycles. |
 | `--max-batch N` | the configured `max_batch` | Override the batch size for work cycles. |
 | `--agentctl WORD` | configured | Command (and leading arguments) to run instead of the configured agentctl for notifications. Repeatable. Supplement: `MERGE_QUEUE_AGENTCTL` (shell-style words) when neither flag nor config names one. |
+
+With `--shadow` the daemon is a soak harness: it plans, validates and would land exactly as a
+live daemon would, but every landing advances only the in-memory simulated base. Run reports
+carry `mode: shadow`, the heartbeat carries `shadow: true`, and `merge-queue status` shows
+`mode: shadow (landings simulated; real base unchanged)` so a shadow daemon is never mistaken
+for a live one. Because no item really lands, no `landed` notification is owed in shadow mode;
+the notification sweep still runs each cycle for the transitions that are real (withdrawals,
+refusals). A queue whose `land.driver` is `none` refuses live cycles with a remedy naming
+`--shadow`; `serve --shadow` is that remedy.
 
 ## Notifications
 
@@ -308,6 +318,7 @@ pid file, a crash leaves it behind for `status` to report.
 | `--poll-ms N` | `250` | Idle poll interval in milliseconds: `items/` watch and heartbeat cadence (at least 10). |
 | `--base-poll-secs N` | `30` | Seconds between `git ls-remote` base polls. `0` polls the base every cycle. |
 | `--once` | off | Run at most one work cycle, then exit. For scripts and tests. |
+| `--shadow` | off | Validate for real, but land on a simulated base (same shadow path as `run --shadow`); real base never pushed, items stay queued. |
 | `--depth N` | the configured `depth` | Override the initial window for work cycles. |
 | `--max-batch N` | the configured `max_batch` | Override the batch size for work cycles. |
 

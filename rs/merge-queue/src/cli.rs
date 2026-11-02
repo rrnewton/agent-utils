@@ -29,6 +29,7 @@ Examples:
   merge-queue run --depth 2
   merge-queue widen
   merge-queue serve
+  merge-queue serve --shadow
   merge-queue status";
 
 /// Local merge queue: order, batch, validate and land ready changes while keeping the base green.
@@ -323,6 +324,12 @@ enum Command {
         /// Run at most one work cycle, then exit (scripts and tests).
         #[arg(long)]
         once: bool,
+        /// Validate for real, but land on a simulated base (same shadow path as
+        /// `run --shadow`): full plan/run/notify cycles execute, landings are
+        /// recorded as shadow/simulated, item statuses stay queued, and the real
+        /// base ref is never pushed. Daemon soak mode.
+        #[arg(long)]
+        shadow: bool,
         /// Override the configured depth for work cycles.
         #[arg(long)]
         depth: Option<usize>,
@@ -864,6 +871,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             poll_ms,
             base_poll_secs,
             once,
+            shadow,
             depth,
             max_batch,
             agentctl,
@@ -873,6 +881,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                 poll: std::time::Duration::from_millis(poll_ms.max(10)),
                 base_poll: std::time::Duration::from_secs(base_poll_secs),
                 once,
+                shadow,
                 depth,
                 max_batch,
                 agentctl: if agentctl.is_empty() {

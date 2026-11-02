@@ -61,6 +61,7 @@ merge-queue init --force --remote origin --base main \
 merge-queue run --dry-run   # build candidates and selections; validate and land nothing
 merge-queue run --shadow    # validate for real, land on a simulated base, change no status
 merge-queue run             # validate, land green batches, eject culprits
+merge-queue serve --shadow  # daemon soak: same shadow landing, forever; real base never moves
 merge-queue obligations     # focused landings still owed a complete run
 merge-queue widen           # run the complete suite once and discharge them
 ```

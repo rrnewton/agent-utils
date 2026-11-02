@@ -2631,6 +2631,12 @@ pub fn render_report(report: &RunReport) -> String {
         report.max_concurrent,
         report.prs_per_hour
     );
+    if report.mode == "shadow" {
+        out.push_str(
+            "\nShadow mode: landings below are simulated on a private base; \
+             the real base and item statuses are unchanged.\n",
+        );
+    }
     if !report.stopped.is_empty() {
         out.push_str(&format!("\n**Stopped:** {}\n", report.stopped));
     }
