@@ -32874,7 +32874,7 @@ function countSideCard(row, { choice, age, replies, unread, read, size }) {
 //   * WHILE ONE IS HIGHLIGHTED, EVERY OTHER CARD'S EDGE AND UNREAD COUNT GO GREY, and so does every
 //     other link between the columns, the highlighted card's drawn over them: the stylesheet greys the
 //     cards while the highlighted one shows (a card a filter hides greys nothing), and the links are
-//     greyed where they are drawn (`planColumnLinks`).
+//     greyed where they are drawn (`planColumnLinks`, web/src/view/channel/columnlinks.ts).
 //   * THE WAY IN is the card's "3 replies · 2 unread", a button of its own (`cardOpener`), or →: into
 //     the highlighted card's thread, or with none the card the keys are on — and on a card's own
 //     button, where Tab leaves the focus, that card's (`cardForArrow`). In two columns ← comes back out
@@ -33131,7 +33131,7 @@ function putOutLitCard() {
 //   * A PRESS FOLDS IT TO A BAR (`#388 thread-header-collapse`, below), and opens it again. Its button's
 //     name, and its tooltip, are the whole text whatever is drawn.
 //   * IT IS JOINED TO ITS ROOT. In two columns the line from the thread's first message on Main goes to
-//     it (`columnLinkPairs`), as it went to its card in the list.
+//     it (`columnLinkPairs`, web/src/view/channel/columnlinks.ts), as it went to its card in the list.
 
 /**
  * By the id of each card at the top of a thread, what it was last drawn from, so a pass that changes
@@ -35875,7 +35875,8 @@ function rememberActiveChannel(chosen = false) {
 }
 
 /**
- * Redraw one channel picker from `knownChannels`, keeping it on the channel it was showing.
+ * Redraw one channel picker from the directory's channels (`channelDirectory`), keeping it on the
+ * channel it was showing.
  *
  * A rename is a redraw, NOT a change of channel. Rebuilding the options moves a `select` to its
  * first entry unless the value is put back, and doing that to `#discord-channel` would silently
