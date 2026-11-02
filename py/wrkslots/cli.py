@@ -17870,8 +17870,83 @@ def _registered_liveness_state(config: Config, record: ActiveRecord) -> tuple[st
     return answer.state, answer.detail
 
 
+def _reanchor_liveness(record: ActiveRecord) -> _LivenessAnswer | None:
+    """Classify a re-registered pane from agentctl's re-anchor record (#777).
+
+    agentctl writes `agents/<name>/agent.json` with a capped `reanchors`
+    list. The LAST entry whose slot and slot_generation match this
+    record, with a live `current.pid`, binds the slot to that process:
+    the answer is alive and names the re-registration, never
+    unverifiable. A null slot_generation matches only when the entry
+    is newer than the slot's recorded creation.
+    """
+
+    override = os.environ.get("WRKSLOTS_AGENTCTL_AGENTS_DIR")
+    base = (
+        Path(override)
+        if override
+        else Path.home() / ".local" / "state" / "agentctl" / "agents"
+    )
+    try:
+        document = json.loads((base / record.agent / "agent.json").read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(document, dict):
+        return None
+    entries = document.get("reanchors")
+    if not isinstance(entries, list):
+        return None
+    match: dict[str, object] | None = None
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("slot") != record.slot:
+            continue
+        generation = entry.get("slot_generation")
+        if generation is not None:
+            if generation != record.generation:
+                continue
+        else:
+            at = entry.get("at")
+            if not isinstance(at, (int, float)) or isinstance(at, bool):
+                continue
+            try:
+                created = _parse_timestamp(record.created_at, "record.created_at")
+            except Exception:
+                continue
+            if float(at) <= created.timestamp():
+                continue
+        match = entry
+    if match is None:
+        return None
+    current = match.get("current")
+    if not isinstance(current, dict):
+        return None
+    pid = current.get("pid")
+    if not isinstance(pid, int) or isinstance(pid, bool):
+        return None
+    try:
+        _read_process_identity(pid)
+    except Exception:
+        return None
+    return _LivenessAnswer(
+        "alive",
+        "re-registered: agent re-anchored to pane "
+        f"{current.get('pane_id')} pid {pid} at {match.get('at')} "
+        f"({match.get('reason')}); bound to the re-anchored process",
+    )
+
+
 def _registered_liveness_answer(config: Config, record: ActiveRecord) -> _LivenessAnswer:
     """``_registered_liveness_state`` plus whether the answer is the bound no-record line."""
+
+    answer = _registered_liveness_answer_raw(config, record)
+    if answer.state == "unverifiable":
+        reanchored = _reanchor_liveness(record)
+        if reanchored is not None:
+            return reanchored
+    return answer
+
+
+def _registered_liveness_answer_raw(config: Config, record: ActiveRecord) -> _LivenessAnswer:
 
     env = _liveness_environment(config, record)
     what = "the registered liveness command"
@@ -29119,6 +29194,47 @@ def _retirement_failure_reason(exc: BaseException) -> str:
     return str(exc) if isinstance(exc, Refusal) else f"{type(exc).__name__}: {exc}"
 
 
+# Stable `could_not_determine` verdict codes (#776): a periodic caller
+# dedupes on (machine, slot, reason_code) and reports each verdict once.
+# `remedy` names the command or condition that resolves the verdict; it
+# is part of the verdict, not advice appended by the caller.
+COULD_NOT_DETERMINE_REMEDIES = {
+    "target-storage-drift": (
+        "resolve the slot's storage defect named in the reason (or run "
+        "'wrkslots recover' if it directs you to), then rerun retire-pending"
+    ),
+    "unchanged-confirmation-failed": (
+        "run 'wrkslots doctor', resolve the reported registry state, "
+        "then rerun retire-pending"
+    ),
+    "state-error": (
+        "run 'wrkslots doctor', resolve the reported state, "
+        "then rerun retire-pending"
+    ),
+    "refusal-classification-failed": (
+        "run 'wrkslots doctor', resolve the reported state, "
+        "then rerun retire-pending"
+    ),
+    "unknown-error": (
+        "inspect the failure named in the reason, run 'wrkslots doctor', "
+        "then rerun retire-pending"
+    ),
+}
+
+
+def _could_not_determine_row(
+    identity: dict[str, object], reason: str, reason_code: str
+) -> dict[str, object]:
+    return {
+        **identity,
+        "outcome": "could-not-determine",
+        "reason_code": reason_code,
+        "reason": reason,
+        "remedy": COULD_NOT_DETERMINE_REMEDIES[reason_code],
+        "recovery_required": True,
+    }
+
+
 def _cmd_retire_pending(args: argparse.Namespace) -> int:
     if args.limit <= 0 or args.limit > RETIRE_PENDING_LIMIT:
         raise Refusal(
@@ -29226,34 +29342,27 @@ def _cmd_retire_pending(args: argparse.Namespace) -> int:
                 # the configuration, leaves the attempt unconfirmed: the
                 # batch stops and still reports what it did.
                 could_not_determine.append(
-                    {
-                        **identity,
-                        "outcome": "could-not-determine",
-                        "reason": f"{reason}; {_retirement_failure_reason(state_error)}",
-                        "recovery_required": True,
-                    }
+                    _could_not_determine_row(
+                        identity,
+                        f"{reason}; {_retirement_failure_reason(state_error)}",
+                        "unchanged-confirmation-failed",
+                    )
                 )
                 stopped_at = index
                 break
             could_not_determine.append(
-                {
-                    **identity,
-                    "outcome": "could-not-determine",
-                    "reason": (
+                _could_not_determine_row(
+                    identity,
+                    (
                         f"{reason}; the slot is unchanged, so the batch "
                         "continued with its next candidate"
                     ),
-                    "recovery_required": True,
-                }
+                    "target-storage-drift",
+                )
             )
         except StateError as exc:
             could_not_determine.append(
-                {
-                    **identity,
-                    "outcome": "could-not-determine",
-                    "reason": str(exc),
-                    "recovery_required": True,
-                }
+                _could_not_determine_row(identity, str(exc), "state-error")
             )
             stopped_at = index
             break
@@ -29267,12 +29376,11 @@ def _cmd_retire_pending(args: argparse.Namespace) -> int:
                 # leaves it unclassified: the batch stops and still reports
                 # what it did.
                 could_not_determine.append(
-                    {
-                        **identity,
-                        "outcome": "could-not-determine",
-                        "reason": _retirement_failure_reason(state_error),
-                        "recovery_required": True,
-                    }
+                    _could_not_determine_row(
+                        identity,
+                        _retirement_failure_reason(state_error),
+                        "refusal-classification-failed",
+                    )
                 )
                 stopped_at = index
                 break
@@ -29292,12 +29400,9 @@ def _cmd_retire_pending(args: argparse.Namespace) -> int:
             # Path.resolve raises for a symlink loop before Python 3.13,
             # StopIteration and MemoryError.
             could_not_determine.append(
-                {
-                    **identity,
-                    "outcome": "could-not-determine",
-                    "reason": _retirement_failure_reason(exc),
-                    "recovery_required": True,
-                }
+                _could_not_determine_row(
+                    identity, _retirement_failure_reason(exc), "unknown-error"
+                )
             )
             stopped_at = index
             break
@@ -29415,6 +29520,17 @@ def _cmd_retire_pending(args: argparse.Namespace) -> int:
             for candidate in attemptable[args.limit :]
         ]
     )
+    # One verdict per (machine, slot, reason_code): a periodic caller
+    # dedupes on that key and reports each verdict once (#776).
+    seen_verdicts: set[tuple[object, object, object]] = set()
+    deduped_verdicts: list[dict[str, object]] = []
+    for item in could_not_determine:
+        key = (item["machine"], item["slot"], item["reason_code"])
+        if key in seen_verdicts:
+            continue
+        seen_verdicts.add(key)
+        deduped_verdicts.append(item)
+    could_not_determine = deduped_verdicts
     payload = {
         "schema": RETIREMENT_QUEUE_SCHEMA,
         "limit": args.limit,
@@ -29451,6 +29567,7 @@ def _cmd_retire_pending(args: argparse.Namespace) -> int:
             print(
                 f"COULD_NOT_DETERMINE: {item['machine']}/{item['slot']} "
                 f"generation={item['generation']} recovery_required=true "
+                f"code={item['reason_code']} remedy={item['remedy']} "
                 f"reason={item['reason']}"
             )
         for item in actions:
@@ -29521,6 +29638,159 @@ def _cmd_freeze(args: argparse.Namespace) -> int:
     else:
         print(f"frozen=true reason={frozen[0]} source={frozen[1]}")
     return 0
+def _stray_live_uses(path: Path) -> list[str]:
+    uses: list[str] = []
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return uses
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            found = _process_uses_slot(entry, path, unreadable_is_no_evidence=True)
+        except Exception:
+            continue
+        if found:
+            uses.append(f"pid {entry.name}: {found[0]}")
+    return uses
+
+
+def _cmd_reap_stray_worktrees(args: argparse.Namespace) -> int:
+    """Report (or with --apply, reap) stray Git worktree registrations (#775).
+
+    A registration is stray when it belongs to no slot checkout, no
+    slot directory, and no live process. Reaping preserves a rescue
+    ref first and refuses live or unpushed work. Dry-run by default.
+    """
+
+    config = _load_config(args.project_root, args.machine)
+    states = _load_all_active(config)
+    archives = _load_all_archives(config)
+    owned: set[Path] = set()
+    repositories: set[Path] = set()
+    for state in states:
+        for record in state.slots:
+            owned.add(_slot_directory(config, record.slot, record.slot_type))
+            for checkout in record.checkouts:
+                owned.add(_stored_path(config, checkout.path, "checkout path"))
+                repositories.add(_stored_repository_path(config, checkout.repository)[1])
+    for archive in archives:
+        for raw_record in archive.records:
+            record = _record_from_obj(raw_record, "archived record")
+            for checkout in record.checkouts:
+                repositories.add(_stored_repository_path(config, checkout.repository)[1])
+    for raw in args.repository or ():
+        candidate = Path(raw)
+        repositories.add(candidate if candidate.is_absolute() else config.root / candidate)
+    if not repositories:
+        raise Refusal("no source repository is known; pass --repository PATH")
+    vcs = _GitVcs()
+    reaped: list[dict[str, object]] = []
+    retained: list[dict[str, object]] = []
+    planned: list[dict[str, object]] = []
+    for repository in sorted(repositories, key=str):
+        listed = vcs._run(
+            repository, ["worktree", "list", "--porcelain", "-z"], check=False
+        )
+        if listed.returncode != 0:
+            raise Refusal(f"cannot list worktrees of {repository}: {listed.stderr.strip()}")
+        entries: list[dict[str, object]] = []
+        current: dict[str, object] = {}
+        for field in listed.stdout.split("\0"):
+            if not field:
+                if current:
+                    entries.append(current)
+                    current = {}
+                continue
+            key, _, value = field.partition(" ")
+            current[key] = value if value else True
+        if current:
+            entries.append(current)
+        for entry in sorted(entries, key=lambda item: str(item.get("worktree", ""))):
+            raw_path = entry.get("worktree")
+            if not isinstance(raw_path, str) or entry.get("bare"):
+                continue
+            path = Path(raw_path).absolute()
+            if path == repository.absolute() or path in owned:
+                continue
+            if any(_path_is_within(path, owned_path) or _path_is_within(owned_path, path) for owned_path in owned):
+                continue
+            head = str(entry.get("HEAD", ""))
+            row: dict[str, object] = {
+                "repository": str(repository),
+                "path": str(path),
+                "head": head,
+                "branch": str(entry.get("branch", "")),
+            }
+            live = _stray_live_uses(path)
+            if live:
+                retained.append({**row, "outcome": "retained-live", "reason": live[0]})
+                continue
+            contained = False
+            if re.fullmatch(r"[0-9a-f]{40}", head):
+                probe = vcs._run(
+                    repository, ["branch", "-r", "--contains", head], check=False
+                )
+                contained = probe.returncode == 0 and bool(probe.stdout.strip())
+            if not contained and not entry.get("prunable"):
+                retained.append(
+                    {**row, "outcome": "retained-unpushed", "reason": "HEAD is not contained in any remote branch"}
+                )
+                continue
+            if not args.apply:
+                planned.append({**row, "outcome": "would-reap", "reason": "no slot, live process, or unpushed work owns it"})
+                continue
+            # Recheck immediately before the destructive step.
+            if _stray_live_uses(path):
+                retained.append({**row, "outcome": "retained-live", "reason": "a live process began using it"})
+                continue
+            rescue_ref = ""
+            if re.fullmatch(r"[0-9a-f]{40}", head):
+                label = re.sub(r"[^A-Za-z0-9_.-]+", "-", path.name).strip("-") or "worktree"
+                rescue_ref = f"refs/rescue/wrkslots/stray-{label}-{head[:12]}"
+                made = vcs._run(
+                    repository, ["update-ref", rescue_ref, head], check=False
+                )
+                if made.returncode != 0:
+                    retained.append({**row, "outcome": "retained-rescue-failed", "reason": made.stderr.strip()})
+                    continue
+                verified = vcs._run(
+                    repository, ["rev-parse", "--verify", rescue_ref], check=False
+                )
+                if verified.stdout.strip() != head:
+                    retained.append({**row, "outcome": "retained-rescue-failed", "reason": "rescue ref did not read back"})
+                    continue
+            if path.exists():
+                removed = vcs._run(
+                    repository, ["worktree", "remove", "--force", str(path)], check=False
+                )
+            else:
+                removed = vcs._run(
+                    repository, ["worktree", "prune", "--expire", "now"], check=False
+                )
+            if removed.returncode != 0:
+                retained.append({**row, "outcome": "retained-remove-failed", "reason": removed.stderr.strip()})
+                continue
+            reaped.append({**row, "outcome": "reaped", "rescue_ref": rescue_ref})
+    rows = planned if not args.apply else reaped
+    payload = {
+        "schema": 1,
+        "applied": bool(args.apply),
+        "repositories": [str(item) for item in sorted(repositories, key=str)],
+        "stray": rows,
+        "retained": retained,
+    }
+    if args.format == "json":
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print(
+            f"applied={str(bool(args.apply)).lower()} stray={len(rows)} retained={len(retained)}"
+        )
+        for item in rows:
+            print(f"STRAY: {item['path']} head={item['head']}")
+        for item in retained:
+            print(f"RETAINED: {item['path']} outcome={item['outcome']} reason={item['reason']}")
+    return 1 if args.apply and retained else 0
 
 
 class _CachePlanExhausted(Refusal):
@@ -62596,6 +62866,34 @@ usage or audit gate unknown, 3 fail-closed refusal.
         help="freeze reason words (required for set)",
     )
     freeze.set_defaults(handler=_cmd_freeze)
+    reap_stray = subparsers.add_parser(
+        "reap-stray-worktrees",
+        description=(
+            "Report stray Git worktree registrations that belong to no slot and no live "
+            "process. With --apply, preserve a rescue ref (refs/rescue/wrkslots/stray-*) "
+            "and remove each reapable registration; live or unpushed work is retained."
+        ),
+        help="report or reap stray git worktree registrations",
+        formatter_class=_HelpFormatter,
+    )
+    reap_stray.add_argument(
+        "--repository",
+        action="append",
+        metavar="PATH",
+        help="additional source repository to census (repeatable)",
+    )
+    reap_stray.add_argument(
+        "--apply",
+        action="store_true",
+        help="preserve a rescue ref and remove each reapable registration (default: report only)",
+    )
+    reap_stray.add_argument(
+        "--format",
+        choices=("human", "json"),
+        default="human",
+        help="result format (default: human)",
+    )
+    reap_stray.set_defaults(handler=_cmd_reap_stray_worktrees)
 
     clean_caches = subparsers.add_parser(
         "clean-caches",

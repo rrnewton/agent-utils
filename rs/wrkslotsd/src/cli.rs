@@ -886,6 +886,24 @@ pub(crate) enum Command {
         #[arg(long, value_name = "NAME")]
         machine: Option<String>,
     },
+    /// Report or reap stray Git worktree registrations (#775)
+    ReapStrayWorktrees {
+        /// Additional source repository to census (repeatable)
+        #[arg(long, value_name = "PATH")]
+        repository: Vec<String>,
+        /// Preserve a rescue ref and remove each reapable registration
+        #[arg(long = "apply")]
+        apply_mode: bool,
+        /// Output format: human prints the stray lines; json prints the payload
+        #[arg(long, value_name = "FORMAT", default_value = "human", value_parser = ["human", "json"])]
+        format: String,
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
     /// Resume a journal or start bounded ownerless validation cleanup (writer; fixture registries only until cutover)
     Recover {
         /// Live current coordinator PID recorded with recovery
@@ -2359,6 +2377,28 @@ pub fn run() -> u8 {
             Ok(text) => {
                 print!("{text}");
                 return 0;
+            }
+            Err(error) => {
+                eprintln!("wrkslotsd: {error}");
+                return 1;
+            }
+        },
+        Command::ReapStrayWorktrees {
+            repository,
+            apply_mode,
+            format,
+            root,
+            machine,
+        } => match crate::reap_strays::reap_stray_worktrees(
+            root.as_deref(),
+            machine.as_deref(),
+            &repository,
+            apply_mode,
+            format == "json",
+        ) {
+            Ok((text, retained_any)) => {
+                print!("{text}");
+                return if apply_mode && retained_any { 1 } else { 0 };
             }
             Err(error) => {
                 eprintln!("wrkslotsd: {error}");

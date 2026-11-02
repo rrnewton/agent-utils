@@ -59,6 +59,9 @@ case "$1" in
   freeze)
     if [ "$2" = "--help" ]; then echo "Usage: --root --machine set clear status"; exit 0; fi
     echo "RS freeze $@" ;;
+  reap-stray-worktrees)
+    if [ "$2" = "--help" ]; then echo "Usage: --root --machine --repository --apply --format"; exit 0; fi
+    echo "RS reap-stray-worktrees $@" ;;
   classify-create-journals)
     if [ "$2" = "--help" ]; then echo "Usage: --root --machine --agent --slot-type --format"; exit 0; fi
     echo "RS classify-create-journals $@" ;;
@@ -206,6 +209,14 @@ def test_freeze_runs_in_rust(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert result.stdout.startswith("RS freeze freeze status")
     assert "cmd=freeze edition=rust rc=0" in log.read_text()
+def test_reap_stray_worktrees_runs_in_rust(tmp_path: Path) -> None:
+    root, log = _sandbox(tmp_path)
+    result = _run(root, log, "reap-stray-worktrees", "--repository", "repo1")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("RS reap-stray-worktrees reap-stray-worktrees --repository repo1")
+    assert "cmd=reap-stray-worktrees edition=rust rc=0" in log.read_text()
+
+
 def test_classify_create_journals_runs_in_rust(tmp_path: Path) -> None:
     root, log = _sandbox(tmp_path)
     result = _run(root, log, "classify-create-journals", "slot01", "--agent", "a1")

@@ -23977,6 +23977,8 @@ def test_retire_pending_json_preserves_success_before_partial_state(
             "machine": "testhost",
             "outcome": "could-not-determine",
             "reason": f"partial state update exists: {config.control / 'ACTIVE.testhost.json.tmp.injected'}",
+            "reason_code": "state-error",
+            "remedy": "run 'wrkslots doctor', resolve the reported state, then rerun retire-pending",
             "recovery_required": True,
             "sha256": hashlib.sha256(b"retire slot02\n").hexdigest(),
             "slot": "slot02",

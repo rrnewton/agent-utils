@@ -316,9 +316,73 @@ pub(crate) fn liveness_answer(cfg: &Cfg, config: &Value, record: &Value) -> Resu
             ),
         ),
     };
+    if state == "unverifiable" {
+        if let Some(reanchored) = reanchor_liveness(record) {
+            return Ok(reanchored);
+        }
+    }
     Ok(Liveness {
         state: state.to_string(),
         detail,
+    })
+}
+
+/// Classify a re-registered pane from agentctl's re-anchor record (#777):
+/// the LAST `reanchors` entry in `agents/<name>/agent.json` whose slot
+/// and slot_generation match, with a live `current.pid`, is alive.
+fn reanchor_liveness(record: &Value) -> Option<Liveness> {
+    let agent = record.get("agent").and_then(Value::as_str)?;
+    let slot = record.get("slot").and_then(Value::as_str)?;
+    let generation = record.get("generation").and_then(Value::as_i64)?;
+    let base = match std::env::var_os("WRKSLOTS_AGENTCTL_AGENTS_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => PathBuf::from(std::env::var_os("HOME")?).join(".local/state/agentctl/agents"),
+    };
+    let document: Value =
+        serde_json::from_str(&std::fs::read_to_string(base.join(agent).join("agent.json")).ok()?)
+            .ok()?;
+    let entries = document.get("reanchors").and_then(Value::as_array)?;
+    let created_epoch = record
+        .get("created_at")
+        .and_then(Value::as_str)
+        .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
+        .map(|moment| moment.timestamp());
+    let mut matched: Option<&Value> = None;
+    for entry in entries {
+        if entry.get("slot").and_then(Value::as_str) != Some(slot) {
+            continue;
+        }
+        match entry.get("slot_generation") {
+            Some(Value::Number(number)) => {
+                if number.as_i64() != Some(generation) {
+                    continue;
+                }
+            }
+            Some(Value::Null) | None => {
+                let Some(at) = entry.get("at").and_then(Value::as_f64) else {
+                    continue;
+                };
+                if Some(at as i64) <= created_epoch {
+                    continue;
+                }
+            }
+            _ => continue,
+        }
+        matched = Some(entry);
+    }
+    let entry = matched?;
+    let current = entry.get("current")?;
+    let pid = current.get("pid").and_then(Value::as_i64)?;
+    crate::status_state::read_process_identity(pid).ok()?;
+    Some(Liveness {
+        state: "alive".to_string(),
+        detail: format!(
+            "re-registered: agent re-anchored to pane {} pid {} at {} ({}); bound to the re-anchored process",
+            current.get("pane_id").and_then(Value::as_str).unwrap_or_default(),
+            pid,
+            entry.get("at").cloned().unwrap_or(Value::Null),
+            entry.get("reason").and_then(Value::as_str).unwrap_or_default()
+        ),
     })
 }
 
