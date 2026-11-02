@@ -5,7 +5,7 @@
 
 import assert from "node:assert/strict";
 
-import { ALIAS_NOTICE, CHANNEL, CSS_CODE, DISCORD_POLL_MS, HTML, HTML_CODE, MESSAGE_CACHE_KEY,
+import { brokenModule, ALIAS_NOTICE, CHANNEL, CSS_CODE, DISCORD_POLL_MS, HTML, HTML_CODE, MESSAGE_CACHE_KEY,
   OTHER_CHANNEL, PAGE_CODE, SCRIPT, SCRIPT_CODE, SPACE_A, SPACE_B, TEAM_A, TEAM_B, TOKEN_STORAGE_KEY,
   UI_STATE_KEY, assertCurrent, assistantSays, atBottomOf, backFacts, backlog, beforeOf,
   brokenScript, browsingPage, cardsUp, changeChannelTo, channelBoxCode, channelReads, channelRow,
@@ -2500,7 +2500,7 @@ test("a channel reopens in the view chosen in it, one nobody chose a view in ope
     "a channel nobody chose a view in was recorded as choosing one");
 
   // THE CONTROL: with the choice not kept, coming back opens in All, and this fails.
-  const control = await run(brokenScript("  if (chosen) rememberChosenView(chosen);", "  if (chosen) void chosen;", 2));
+  const control = await run(brokenScript("  if (chosen) uiState.remember(chosen);", "  if (chosen) void chosen;", 2));
   assert.equal(control.page.el("thread-select").value, "flat", "the test cannot tell a kept choice from none");
 
   // The Threads list is not a view a channel opens in: picked, it leaves the channel to its default.
@@ -2853,7 +2853,8 @@ test("two windows on one channel each reopen in their own view, with the device'
   assert.equal(oneAgain.el("thread-select").value, "main", "the view chosen in another window was not honoured");
 
   // THE CONTROL: with the window's own record passed over, the first window reopens in the second's thread.
-  const control = await run(brokenScript("  const own = readUiRecord(windowStore);", "  const own = null;"));
+  const control = await run(await brokenModule([{ file: "src/core/navigation/uistate.ts",
+    find: "    const own = readUiRecord(deps.windowStorage);", replace: "    const own = null;" }]));
   assert.equal(control.oneAgain.el("thread-select").value, `thread:${control.id}`,
     "the test cannot tell a window's own view from the device's");
 });

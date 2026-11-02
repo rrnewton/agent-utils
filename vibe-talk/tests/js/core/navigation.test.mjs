@@ -65,3 +65,64 @@ test("`#624 voice-page-modularity`: a place reads back from the query it writes,
   assert.equal(deepLinkPart(odd, "d"), null);
   assert.equal(deepLinkPart(odd, "b"), "x y");
 });
+
+test("`#624 voice-page-modularity`: the UI-state record read back, checked, brought forward and merged, and the views chosen per channel", () => {
+  const { createUiState, UI_STATE_KEY, UI_STATE_CHANNELS } = NAVIGATION;
+  const store = (entries = {}) => {
+    const kept = new Map(Object.entries(entries));
+    return { kept, getItem: (key) => (kept.has(key) ? kept.get(key) : null), setItem: (key, value) => kept.set(key, value), removeItem: (key) => kept.delete(key) };
+  };
+  const record = (fields) => JSON.stringify({ v: 2, identity: "me", view: "discord", todo: false, channel: "C1", place: null, channels: [], ...fields });
+  let identity = "me";
+  const owner = (device, window) => createUiState({
+    deviceStorage: () => device, windowStorage: () => window, identity: () => identity,
+    viewKey: (view, thread) => (thread ? `${view}:${thread}` : view),
+  });
+  // Nothing kept: nothing to reopen on, and settled at once.
+  const empty = owner(store(), store());
+  assert.equal(empty.saved(), null);
+  assert.equal(empty.settled(), true);
+  // The window's own record first, the device's choices behind its own, the device's read mode.
+  const device = store({ [UI_STATE_KEY]: record({ todo: true, read: "hide", channels: [{ channel: "C2", channelView: "main", thread: null }] }) });
+  const window = store({ [UI_STATE_KEY]: record({ channels: [{ channel: "C1", channelView: "flat", thread: null }, { channel: "", channelView: "main", thread: null }] }) });
+  const merged = owner(device, window);
+  assert.equal(merged.settled(), false);
+  assert.equal(merged.saved().todo, true);
+  assert.equal(merged.saved().read, "hide");
+  assert.deepStrictEqual(merged.saved().channels.map((one) => one.channel), ["C1", "C2"], "a damaged choice was kept, or the device's were lost");
+  // Another credential's record, or one that does not parse, is dropped from its store.
+  const theirs = store({ [UI_STATE_KEY]: record({ identity: "them" }) });
+  assert.equal(owner(theirs, store()).saved(), null);
+  assert.equal(theirs.kept.has(UI_STATE_KEY), false);
+  const broken = store({ [UI_STATE_KEY]: "{" });
+  owner(broken, store());
+  assert.equal(broken.kept.has(UI_STATE_KEY), false);
+  // A version 1 record is brought forward: the channel's view kept where chosen, the place under its view key.
+  const old = store({ [UI_STATE_KEY]: JSON.stringify({ v: 1, identity: "me", view: "discord", todo: false, channel: "C3",
+    channelView: "thread", chosen: true, thread: { id: "T1", origin: "flat", summary: null }, place: { atNewest: false, anchor: "9", offset: 4 } }) });
+  const forward = owner(old, store()).saved();
+  assert.equal(forward.v, 2);
+  assert.equal(forward.place.view, "thread:T1");
+  assert.deepStrictEqual(forward.channels.map((one) => one.channel), ["C3"]);
+  // The views chosen: the newest first, one per channel, a change of credential forgetting them.
+  const choices = owner(store(), store());
+  for (let at = 0; at < UI_STATE_CHANNELS + 3; at += 1) choices.remember({ channel: `C${at}`, channelView: "main", thread: null });
+  choices.remember({ channel: "C5", channelView: "flat", thread: null });
+  assert.equal(choices.chosenViewsNow().length, UI_STATE_CHANNELS);
+  assert.equal(choices.chosenView("C5").channelView, "flat");
+  assert.equal(choices.chosenViewsNow()[0].channel, "C5");
+  choices.forgetChosen((channel) => channel === "C5");
+  assert.equal(choices.chosenView("C5"), undefined);
+  identity = "someone else";
+  assert.deepStrictEqual(choices.chosenViewsNow(), []);
+  // Forgotten on signing out, in both stores.
+  identity = "me";
+  const kept = store({ [UI_STATE_KEY]: record({}) });
+  const signedOut = owner(kept, store());
+  signedOut.holdPlace({ key: "k", place: { view: "main", atNewest: true, anchor: null, offset: 0 } });
+  signedOut.forget();
+  assert.equal(signedOut.saved(), null);
+  assert.equal(signedOut.heldPlace(), null);
+  assert.equal(signedOut.settled(), true);
+  assert.equal(kept.kept.has(UI_STATE_KEY), false);
+});
