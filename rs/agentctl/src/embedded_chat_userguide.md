@@ -355,7 +355,13 @@ confirms it.
 
 Configure sinks in `event-sinks.json` in the bridge's state directory, mode
 0600. It chooses the executable that delivers records, so a file that another
-user owns, or that others can write, is refused and no sinks run. If the file is absent, no sinks run. The file is read when the bridge
+user owns, or that others can write, is refused and no sinks run. If the file is absent, no sinks run. When a bridge is re-initialised after its state was moved aside, pass
+`chat init --from OLD-DIR`: the old state's `event-sinks.json` and each sink's
+token file are copied into the new state (never replacing a configuration it
+already has), and the init report lists what was copied and any missing token.
+Without it the new bridge silently pushes nothing, and `chat health` warns
+(degraded) while an older sibling state (`NAME.old-*`) configures sinks the
+live state lacks. The file is read when the bridge
 opens its outbound helper, so a change takes effect at the bridge's next start
 and at the next `chat` command run beside it.
 

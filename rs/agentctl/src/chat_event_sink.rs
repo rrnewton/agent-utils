@@ -644,6 +644,65 @@ fn record_age(path: &Path) -> Option<Duration> {
     ))
 }
 
+/// What [`carry_over`] brought from a previous state directory.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CarriedSinks {
+    /// State-relative files copied, `event-sinks.json` first.
+    pub copied: Vec<String>,
+    /// Sink names whose token file the previous state did not hold.
+    pub missing_tokens: Vec<String>,
+}
+
+/// Copy `from`'s sink configuration into the fresh state `to`, tokens included.
+///
+/// A bridge re-initialised after its state was moved aside (an outage gap, a
+/// corrupted record) keeps its bridge configuration, which is an init argument,
+/// but its sinks were configured in the state itself: without this the new
+/// bridge silently stops telling its sinks while everything else looks
+/// restored. The previous configuration is validated exactly as a running
+/// bridge validates it, an existing configuration in `to` is never replaced,
+/// and every copied file is private (mode 0600). A token the previous state
+/// names but does not hold is reported, not invented.
+pub fn carry_over(from: &Path, to: &Path) -> Result<CarriedSinks, String> {
+    let mut carried = CarriedSinks::default();
+    let Some(config) = read_config(&from.join(SINKS_FILE))? else {
+        return Ok(carried);
+    };
+    let destination = to.join(SINKS_FILE);
+    if destination.exists() {
+        return Err(format!(
+            "{} already configures event sinks; refusing to replace it",
+            destination.display()
+        ));
+    }
+    copy_private(&from.join(SINKS_FILE), &destination)?;
+    carried.copied.push(SINKS_FILE.to_owned());
+    for sink in &config.sinks {
+        let source = from.join(&sink.token_file);
+        if source.is_file() {
+            copy_private(&source, &to.join(&sink.token_file))?;
+            carried.copied.push(sink.token_file.display().to_string());
+        } else {
+            carried.missing_tokens.push(sink.name.clone());
+        }
+    }
+    Ok(carried)
+}
+
+fn copy_private(source: &Path, destination: &Path) -> Result<(), String> {
+    let bytes =
+        fs::read(source).map_err(|error| format!("cannot read {}: {error}", source.display()))?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode_private()
+        .open(destination)
+        .map_err(|error| format!("cannot write {}: {error}", destination.display()))?;
+    file.write_all(&bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| format!("cannot write {}: {error}", destination.display()))
+}
+
 fn read_config(path: &Path) -> Result<Option<SinksFile>, String> {
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
@@ -968,6 +1027,45 @@ mod tests {
         let ninth = unique_suffix(&counter);
         let tenth = unique_suffix(&counter);
         assert!(ninth < tenth, "{ninth} sorts before {tenth}");
+    }
+
+    #[test]
+    fn carry_over_brings_the_sinks_and_tokens_into_a_fresh_state() {
+        let old = temp_dir("carry-old");
+        let curl = fake_curl(&old, 202);
+        configure(&old, &curl, "");
+        let fresh = temp_dir("carry-fresh");
+        let carried = carry_over(&old, &fresh).expect("carry");
+        assert_eq!(carried.copied, [SINKS_FILE, "sink.token"]);
+        assert!(carried.missing_tokens.is_empty(), "{carried:?}");
+        assert!(EventSink::load(&fresh, "coordinator").is_some());
+        for file in [SINKS_FILE, "sink.token"] {
+            let mode = fs::metadata(fresh.join(file))
+                .expect("copied")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o077, 0, "{file} stays private");
+        }
+        // A state that already configures sinks is never overwritten.
+        assert!(carry_over(&old, &fresh).is_err());
+        // A missing token is reported under its sink's name, not invented.
+        let partial = temp_dir("carry-partial");
+        fs::remove_file(partial.join("sink.token")).ok();
+        configure(&partial, &curl, "");
+        fs::remove_file(partial.join("sink.token")).expect("token removed");
+        let fresh2 = temp_dir("carry-fresh2");
+        let carried = carry_over(&partial, &fresh2).expect("carry");
+        assert_eq!(carried.copied, [SINKS_FILE]);
+        assert_eq!(carried.missing_tokens, ["reader"]);
+        // No sinks configured: nothing carried, no error.
+        let empty = temp_dir("carry-empty");
+        assert_eq!(
+            carry_over(&empty, &temp_dir("carry-fresh3")).expect("carry"),
+            CarriedSinks::default()
+        );
+        for dir in [old, fresh, partial, fresh2, empty] {
+            let _ = fs::remove_dir_all(dir);
+        }
     }
 
     #[test]

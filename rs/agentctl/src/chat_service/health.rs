@@ -3,7 +3,7 @@
 //! agent's pane; it writes nothing and never contacts the chat provider.
 
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -162,6 +162,32 @@ fn channel_holders(configuration: &chat_runtime::BridgeConfiguration) -> Vec<Val
         .collect()
 }
 
+/// The `event-sinks.json` of an older sibling state (`NAME.old-*`, the shape a
+/// moved-aside state takes) when the live state configures no sinks: the sinks
+/// were left behind by a re-initialisation, and the bridge pushes nothing.
+fn stranded_sink_config(state_root: &Path) -> Option<PathBuf> {
+    if state_root.join(crate::chat_event_sink::SINKS_FILE).exists() {
+        return None;
+    }
+    let parent = state_root.parent()?;
+    let live = state_root.file_name()?.to_str()?;
+    let prefix = format!("{live}.old");
+    let mut candidates: Vec<PathBuf> = std::fs::read_dir(parent)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(&prefix))
+        })
+        .map(|path| path.join(crate::chat_event_sink::SINKS_FILE))
+        .filter(|path| path.is_file())
+        .collect();
+    candidates.sort();
+    candidates.into_iter().next()
+}
+
 /// What `chat health` read, before it judges it.
 struct Observed {
     configuration: chat_runtime::BridgeConfiguration,
@@ -179,6 +205,8 @@ struct Observed {
     target: (Value, Option<String>),
     times: Vec<RequestTimes>,
     unsent: Vec<UnsentReply>,
+    /// [`stranded_sink_config`], as text.
+    stranded_sinks: Option<String>,
     now: u64,
 }
 
@@ -202,6 +230,7 @@ pub fn health<A: ManagedApi + ?Sized>(
         target: probe_target(manager, &state.config().agent_name),
         times: state.request_times()?,
         unsent: state.unsent_replies()?,
+        stranded_sinks: stranded_sink_config(state_root).map(|path| path.display().to_string()),
         configuration: state.config().clone(),
         now,
     };
@@ -222,6 +251,7 @@ fn assess(observed: Observed, options: HealthOptions) -> Health {
         target: (target, target_problem),
         times,
         unsent,
+        stranded_sinks,
         now,
     } = observed;
     let configuration = &configuration;
@@ -289,6 +319,13 @@ fn assess(observed: Observed, options: HealthOptions) -> Health {
 
     if let Some(problem) = target_problem {
         problems.down.push(problem);
+    }
+    if let Some(old) = &stranded_sinks {
+        problems.degraded.push(format!(
+            "event sinks are configured in the older state {old} but not in this state, so \
+             posts are not pushed to them; carry them over with `chat init --from` on the old \
+             state directory, or copy its event-sinks.json and token files here"
+        ));
     }
 
     let last = |pick: fn(&RequestTimes) -> Option<u64>| times.iter().filter_map(pick).max();
@@ -605,6 +642,7 @@ fn assess(observed: Observed, options: HealthOptions) -> Health {
             })).collect::<Vec<_>>(),
         },
         "unsent_replies": unsent,
+        "event_sinks": {"stranded_config": stranded_sinks},
         "retry_loop_attempts": RETRY_LOOP_ATTEMPTS,
         "reply_breaker": status["reply_breaker"],
         "service_health": status["service_health"],
@@ -666,6 +704,7 @@ mod tests {
             ),
             times: vec![request("a", "delivered", 1)],
             unsent: Vec::new(),
+            stranded_sinks: None,
             now: NOW,
         }
     }
@@ -691,6 +730,26 @@ mod tests {
         HealthOptions {
             stale_after: Duration::from_secs(300),
         }
+    }
+
+    #[test]
+    fn sinks_left_in_an_older_state_are_a_degraded_warning() {
+        let mut observed = healthy();
+        observed.stranded_sinks = Some("/state/coord.old-gap-20261102/event-sinks.json".to_owned());
+        let health = assess(observed, options());
+        assert_eq!(health.verdict, "degraded", "{}", health.text);
+        assert_eq!(health.exit_code(), EXIT_DEGRADED);
+        assert!(
+            health
+                .text
+                .contains("event sinks are configured in the older state"),
+            "{}",
+            health.text
+        );
+        assert_eq!(
+            health.document["event_sinks"]["stranded_config"],
+            "/state/coord.old-gap-20261102/event-sinks.json"
+        );
     }
 
     #[test]

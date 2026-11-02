@@ -1403,6 +1403,9 @@ enum ChatCommand {
     /// Print the chat bridge configuration and operations guide
     Userguide,
     /// Validate plugin, target, helper, and config authority, then create state
+    #[command(
+        after_help = "Example: agentctl chat init --bridge-state DIR --config bridge.json --from OLD-DIR\n\n--from OLD-DIR carries the previous state's event sinks (event-sinks.json and each sink's token file) into the new state, so a bridge re-initialised after its state was moved aside keeps pushing to its sinks; the report lists what was copied and any token the old state did not hold. Without --from nothing is carried."
+    )]
     Init(ChatInit),
     /// Inspect durable bridge state without contacting Herdr or a provider
     #[command(
@@ -1679,6 +1682,12 @@ struct ChatInit {
     /// Private owner-only JSON bridge configuration (maximum 1 MiB)
     #[arg(long, value_name = "FILE")]
     config: PathBuf,
+    /// Previous bridge state directory to carry the event sinks from: its
+    /// event-sinks.json and each sink's token file are copied into the new state
+    /// (never replacing a configuration the new state already has), so a bridge
+    /// re-initialised after its state was moved aside keeps pushing to its sinks
+    #[arg(long, value_name = "DIR")]
+    from: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -4627,10 +4636,11 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
             let client =
                 HerdrClient::with_executable("direct", &herdr_bin).map_err(AgentError::from)?;
             let manager = ManagedAgents::new(&client, &registry)?;
-            let result = crate::chat_service::initialize(
+            let result = crate::chat_service::initialize_from(
                 &value.state.dir(&registry),
                 &value.config,
                 &manager,
+                value.from.as_deref(),
             )
             .map_err(Failure::Chat)?;
             write_json(&result).map_err(Failure::Output)?;

@@ -365,8 +365,31 @@ pub fn initialize<A: ManagedApi + ?Sized>(
     configuration_path: &Path,
     manager: &ManagedAgents<'_, A>,
 ) -> Result<Value, ChatServiceError> {
+    initialize_from(state_root, configuration_path, manager, None)
+}
+
+/// Create bridge state, carrying the event sinks of the previous state at
+/// `previous` into it when one is named (see [`crate::chat_event_sink::carry_over`]).
+pub fn initialize_from<A: ManagedApi + ?Sized>(
+    state_root: &Path,
+    configuration_path: &Path,
+    manager: &ManagedAgents<'_, A>,
+    previous: Option<&Path>,
+) -> Result<Value, ChatServiceError> {
     let configuration = BridgeConfiguration::load_private(configuration_path)?;
-    initialize_configuration(state_root, configuration, manager)
+    let mut report = initialize_configuration(state_root, configuration, manager)?;
+    if let Some(previous) = previous {
+        let carried =
+            crate::chat_event_sink::carry_over(previous, state_root).map_err(|detail| {
+                ChatServiceError::Runtime(chat_runtime::ChatRuntimeError::Invalid(detail))
+            })?;
+        report["event_sinks_carried"] = json!({
+            "from": previous.display().to_string(),
+            "copied": carried.copied,
+            "missing_tokens": carried.missing_tokens,
+        });
+    }
+    Ok(report)
 }
 
 /// Create bridge state from an already-loaded configuration (for example
