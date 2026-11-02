@@ -14361,8 +14361,7 @@ esac
                     if Instant::now() >= wall_deadline {
                         break;
                     }
-                    if let (Some(start), Some(now)) = (cpu_started, thread_cpu_seconds(loop_tid))
-                    {
+                    if let (Some(start), Some(now)) = (cpu_started, thread_cpu_seconds(loop_tid)) {
                         if now - start >= (limit * 2).as_secs_f64() {
                             break;
                         }
