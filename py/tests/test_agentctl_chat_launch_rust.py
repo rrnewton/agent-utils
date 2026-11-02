@@ -202,10 +202,11 @@ class Fixture:
             if not entry.name.isdigit():
                 continue
             try:
-                cmdline = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode()
+                # Compare as bytes: any host process may carry non-UTF-8 argv.
+                cmdline = (entry / "cmdline").read_bytes().replace(b"\0", b" ")
             except OSError:
                 continue
-            if needle in cmdline and "chat_launch_rust" not in cmdline:
+            if needle.encode() in cmdline and b"chat_launch_rust" not in cmdline:
                 found.append(int(entry.name))
         return found
 
@@ -218,10 +219,11 @@ class Fixture:
             if not entry.name.isdigit():
                 continue
             try:
-                cmdline = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode()
+                # Compare as bytes: any host process may carry non-UTF-8 argv.
+                cmdline = (entry / "cmdline").read_bytes().replace(b"\0", b" ")
             except OSError:
                 continue
-            if needle in cmdline and "--chat-launch-gate" not in cmdline:
+            if needle.encode() in cmdline and b"--chat-launch-gate" not in cmdline:
                 found.append(int(entry.name))
         return found
 
