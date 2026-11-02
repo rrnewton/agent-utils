@@ -7186,6 +7186,10 @@ impl BridgeState {
             .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(message_id)))
     }
 
+    // Read-modify-write of the dispatched set needs no lock of its own:
+    // dispatch runs only from admit_batch_scoped, which holds the
+    // exclusive state lock for the whole admission, and the runner lease
+    // allows one bridge process per state root (#793 concurrency check).
     fn relay_note_dispatched(&self, message_id: &str) -> Result<()> {
         let path = self.root.join("relay-dispatched.json");
         let mut doc: Value = fs::read_to_string(&path)
@@ -7212,6 +7216,18 @@ impl BridgeState {
         use std::io::Write as _;
         if self.relay_already_dispatched(&message.message_id) {
             return Ok(("duplicate-skipped".to_string(), None, true));
+        }
+        // A relay receipt is relay-in's own output: dispatching it back
+        // into relay-in makes the two sides post receipts forever, each
+        // as a new provider message the per-id dedupe cannot recognise
+        // (#793). It is noted as dispatched and never dispatched.
+        if message
+            .text
+            .trim_start()
+            .starts_with("agent-teams receipt:")
+        {
+            self.relay_note_dispatched(&message.message_id)?;
+            return Ok(("ignored-relay-receipt".to_string(), None, true));
         }
         let failed = |detail: &str| self.relay_dispatch_failed(message, detail);
         let Some(entry) = self
@@ -19131,6 +19147,100 @@ mod tests {
             ))
             .expect("admit owner post");
         assert_eq!(admission.new_request_keys.len(), 1);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(script_root).unwrap();
+    }
+
+    #[test]
+    fn relay_dispatch_is_at_most_once_per_message_id_and_receipts_are_not_refed() {
+        // #793: the same provider message offered again (live path, then
+        // rescan path) must not run the relay command twice; and the
+        // plain-text relay receipt must never be fed back into relay-in,
+        // while a real fenced receipt post still reaches it.
+        let script_root = temporary("relay-once-command");
+        fs::create_dir_all(&script_root).expect("script root");
+        let record = script_root.join("record.txt");
+        let script = format!(
+            "#!/bin/sh\ncat >> {}\nprintf '{{\"outcome\":\"accepted\"}}\\n'\n",
+            record.display()
+        );
+        let script_path = script_root.join("relay.sh");
+        fs::write(&script_path, script).expect("relay script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))
+                .expect("script permissions");
+        }
+        let mut configuration = config();
+        configuration.channel_ids = vec!["spaces/example".to_owned(), "relay/channel".to_owned()];
+        configuration.relay_channels = vec![RelayChannelConfig {
+            channel: "relay/channel".to_owned(),
+            peer_senders: BTreeMap::from([("bots/peer".to_owned(), "sim@host-b".to_owned())]),
+            command: vec![script_path.to_string_lossy().into_owned()],
+        }];
+        let root = temporary("relay-once-admission");
+        let state = BridgeState::initialize(&root, configuration).expect("initialize state");
+        let batch = |sequence: u64, message_id: &str, text: &str| {
+            let message = InboundMessage::new(
+                ChannelId::new("relay/channel").expect("channel"),
+                MessageId::new(message_id).expect("message"),
+                ThreadId::new("relay/channel/threads/1").expect("thread"),
+                SenderId::new("bots/peer").expect("sender"),
+                text,
+                "2026-09-21T12:00:00Z",
+                true,
+            )
+            .expect("normalized message");
+            DeliveryBatch::new(
+                EventSequence::new(sequence).expect("sequence"),
+                ProviderCursor::new(format!("cursor-{sequence}")).expect("cursor"),
+                DeliveryId::new(format!("delivery-{sequence}")).expect("delivery"),
+                vec![CommittableEvent::message_created(message)],
+            )
+            .expect("delivery")
+        };
+        let first = state
+            .admit_batch(&batch(1, "relay/channel/messages/42", "relay post body"))
+            .expect("first offer");
+        assert_eq!(first.relay_dispatches[0].outcome, "accepted");
+        // Same provider message id, new batch (the rescan path): skipped.
+        let second = state
+            .admit_batch(&batch(2, "relay/channel/messages/42", "relay post body"))
+            .expect("second offer");
+        assert_eq!(second.relay_dispatches[0].outcome, "duplicate-skipped");
+        let recorded = fs::read_to_string(&record).expect("command record");
+        assert_eq!(recorded.matches("relay post body").count(), 1, "{recorded}");
+        // A relay receipt is never dispatched back into relay-in.
+        let receipt = state
+            .admit_batch(&batch(
+                3,
+                "relay/channel/messages/43",
+                "agent-teams receipt: not-recorded (unparseable relay post)",
+            ))
+            .expect("receipt offer");
+        assert_eq!(receipt.relay_dispatches[0].outcome, "ignored-relay-receipt");
+        // Same, with the bridge's rescan note appended (the live shape).
+        let receipt = state
+            .admit_batch(&batch(
+                4,
+                "relay/channel/messages/44",
+                "agent-teams receipt: not-recorded (unparseable relay post)\n\n[agentctl] This message reached the bridge through the periodic rescan; the live event stream did not carry it.",
+            ))
+            .expect("receipt with rescan note");
+        assert_eq!(receipt.relay_dispatches[0].outcome, "ignored-relay-receipt");
+        let recorded = fs::read_to_string(&record).expect("command record");
+        assert_eq!(recorded.matches("relay post body").count(), 1, "{recorded}");
+        assert!(!recorded.contains("agent-teams receipt:"), "{recorded}");
+        // A real fenced receipt post (tag line first) still reaches
+        // relay-in: it is how receipts settle senders (#793 guard).
+        let fenced = "[from sim@host-b via agent-teams] receipt: delivered\n```agent-teams-receipt\n{\"schema\":\"agent-teams-receipt/v1\",\"id\":\"tm-1\",\"state\":\"accepted\"}\n```\n";
+        let fenced_receipt = state
+            .admit_batch(&batch(5, "relay/channel/messages/45", fenced))
+            .expect("fenced receipt offer");
+        assert_eq!(fenced_receipt.relay_dispatches[0].outcome, "accepted");
+        let recorded = fs::read_to_string(&record).expect("command record");
+        assert!(recorded.contains("receipt: delivered"), "{recorded}");
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(script_root).unwrap();
     }
