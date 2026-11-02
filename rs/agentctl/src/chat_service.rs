@@ -1092,6 +1092,20 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
 ) -> Result<Value, ChatServiceError> {
     let offer_reply_command = settings.offer_reply_command;
     let state = BridgeState::open(state_root)?;
+    // An outage's gap approves its own retry before the runner lease is taken (the approval
+    // requires a stopped runner); the subscription below then replays from the kept cursor,
+    // which is what delivers the messages sent while the bridge was down (#745).
+    match state.auto_resolve_outage_gap(crate::chat_runtime::unix_millis()) {
+        Ok(Some(report)) => service_log(format!(
+            "agentctl: chat bridge: outage gap auto-resolved, replaying from the kept \
+             cursor; audit evidence in the gap-retries record: {report}"
+        )),
+        Ok(None) => {}
+        Err(error) => service_log(format!(
+            "agentctl: chat bridge: outage gap auto-resolve refused, keeping the operator \
+             retry path: {error}"
+        )),
+    }
     // A repoint request waiting since before this start is applied first, so that a bridge whose
     // agent is gone starts on the agent named to replace it (#677 chat-bridge-repoint). Applying
     // it needs the runner lease, which this service holds from here until it exits.
@@ -9074,7 +9088,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
             *lines.lock().expect("lines"),
             [
                 "agentctl: chat provider credential: credential file missing: \
-                 AGENTCTL_TEST_CERT_PATH"
+                 environment variable AGENTCTL_TEST_CERT_PATH"
                     .to_owned(),
                 format!(
                     "agentctl: chat provider credential: AGENTCTL_TEST_CERT_PATH is present, \

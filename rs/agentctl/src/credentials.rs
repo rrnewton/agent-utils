@@ -98,27 +98,32 @@ impl CredentialFile {
     }
 
     /// One line naming the problem at `now_millis`, such as `credential file missing:
-    /// SOME_TLS_CERT_PATH` or `credential expired 12 h ago: SOME_TLS_CERT_PATH`.
+    /// environment variable SOME_TLS_CERT_PATH`. The variable is named as a variable, never
+    /// as a path: a bare `PATH` here was read as the filesystem path that was missing.
     pub(crate) fn describe(&self, now_millis: u64) -> Option<String> {
         let now = signed(now_millis);
         let not_after = i128::from(self.not_after_millis.unwrap_or_default());
         let hours = |millis: i128| millis / 3_600_000;
         let variable = &self.variable;
         Some(match self.problem(now_millis)? {
-            CredentialProblemKind::Missing => format!("credential file missing: {variable}"),
-            CredentialProblemKind::Unreadable => format!("credential file unreadable: {variable}"),
+            CredentialProblemKind::Missing => {
+                format!("credential file missing: environment variable {variable}")
+            }
+            CredentialProblemKind::Unreadable => {
+                format!("credential file unreadable: environment variable {variable}")
+            }
             CredentialProblemKind::Inaccessible => {
-                format!("credential path cannot be examined: {variable}")
+                format!("credential path cannot be examined: environment variable {variable}")
             }
             CredentialProblemKind::Expired => {
                 format!(
-                    "credential expired {} h ago: {variable}",
+                    "credential expired {} h ago: environment variable {variable}",
                     hours(now - not_after)
                 )
             }
             CredentialProblemKind::Expiring => {
                 format!(
-                    "credential expires in {} h: {variable}",
+                    "credential expires in {} h: environment variable {variable}",
                     hours(not_after - now)
                 )
             }
@@ -181,6 +186,11 @@ pub(crate) fn inspect<'a>(
         let Some(value) = lookup(name) else { continue };
         let path = Path::new(&value);
         if !path.is_absolute() {
+            continue;
+        }
+        // A search-path list (PATH and its kin) names directories to search, never one
+        // credential file; its joined text is not a file that could be missing.
+        if value.to_string_lossy().contains(':') {
             continue;
         }
         let (state, not_after_millis) = match read_bounded(path) {
@@ -595,6 +605,18 @@ mod tests {
     }
 
     #[test]
+    fn a_search_path_list_is_not_a_missing_credential_file() {
+        // The bridge logs this at start; a PATH-style list was reported as a missing
+        // credential file named PATH though the bridge worked (#745 bridge-gap-backfill).
+        let names = ["PATH".to_owned()];
+        let files = inspect(&names, |_| {
+            Some(OsString::from("/home/owner/bin:/usr/local/bin:/usr/bin"))
+        });
+        assert!(files.is_empty(), "{files:?}");
+        assert_eq!(failure_explanation(&files, 0), None);
+    }
+
+    #[test]
     fn problems_and_their_descriptions_follow_the_clock() {
         let not_after = UTC_TIME_NOT_AFTER as u64 * 1_000;
         let file = CredentialFile {
@@ -610,7 +632,7 @@ mod tests {
         );
         assert_eq!(
             file.describe(not_after - 3 * hour).as_deref(),
-            Some("credential expires in 3 h: SOME_TLS_CERT_PATH")
+            Some("credential expires in 3 h: environment variable SOME_TLS_CERT_PATH")
         );
         assert_eq!(
             file.problem(not_after),
@@ -618,7 +640,7 @@ mod tests {
         );
         assert_eq!(
             file.describe(not_after + 12 * hour).as_deref(),
-            Some("credential expired 12 h ago: SOME_TLS_CERT_PATH")
+            Some("credential expired 12 h ago: environment variable SOME_TLS_CERT_PATH")
         );
         // Only a problem that stops the credential working explains a failure.
         assert_eq!(
@@ -632,7 +654,7 @@ mod tests {
         };
         assert_eq!(
             failure_explanation(&[file, missing], 0).as_deref(),
-            Some("credential file missing: SOME_TLS_CERT_PATH")
+            Some("credential file missing: environment variable SOME_TLS_CERT_PATH")
         );
     }
 
@@ -652,7 +674,7 @@ mod tests {
         assert_eq!(files[0].problem(0), Some(CredentialProblemKind::Expired));
         assert_eq!(
             files[0].describe(0).as_deref(),
-            Some("credential expired 8760 h ago: OLD_CERT")
+            Some("credential expired 8760 h ago: environment variable OLD_CERT")
         );
     }
 
@@ -700,7 +722,7 @@ mod tests {
         );
         assert_eq!(
             files[0].describe(0).as_deref(),
-            Some("credential path cannot be examined: HIDDEN")
+            Some("credential path cannot be examined: environment variable HIDDEN")
         );
         // Not known to be a credential file, so it does not stand in for a provider error.
         assert_eq!(failure_explanation(&files, 0), None);
@@ -722,7 +744,7 @@ mod tests {
         assert_eq!(files[0].state, "unreadable");
         assert_eq!(
             failure_explanation(&files, 0).as_deref(),
-            Some("credential file unreadable: LOCKED")
+            Some("credential file unreadable: environment variable LOCKED")
         );
     }
 

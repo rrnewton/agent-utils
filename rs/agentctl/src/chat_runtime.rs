@@ -150,6 +150,9 @@ const MAX_GAP_DIAGNOSTIC_BYTES: usize = 64 * 1_024;
 const MAX_GAP_RETRY_EVIDENCE_BYTES: usize = 64 * 1_024;
 const MAX_GAP_RETRY_BYTES: usize = 512 * 1_024;
 const MAX_GAP_RETRIES: usize = 64;
+/// A gap this old is an outage's, not a live provider's stumble: the bridge may approve its
+/// own retry then (see `BridgeState::auto_resolve_outage_gap`).
+pub(crate) const OUTAGE_GAP_AUTO_RESOLVE_AFTER_MILLIS: u64 = 10 * 60 * 1_000;
 // A provider offered different content at the current inclusive cursor: see `BoundaryMismatch`.
 const BOUNDARY_MISMATCH_FILE: &str = "boundary-mismatch.json";
 const MAX_BOUNDARY_MISMATCH_BYTES: usize = 16 * 1_024;
@@ -6719,16 +6722,120 @@ impl BridgeState {
         self.approve_gap_retry(request, GapRetryBoundary::ExactCommitted)
     }
 
+    /// Approve the retry itself when the gap is an outage's: the bridge has been down.
+    ///
+    /// The operator path above attests with hand-computed pins that the provider can replay
+    /// the retained boundary. After a host outage that attestation is the only thing between
+    /// a dead bridge and recovery, and it needs a human with a calculator while every safety
+    /// check underneath it is mechanical: the boundary is unchanged and committed, the
+    /// configuration still matches, and admission will still verify the replay event by
+    /// event. When the gap has stood for at least
+    /// [`OUTAGE_GAP_AUTO_RESOLVE_AFTER_MILLIS`], this writes that evidence itself — the gap's
+    /// age, the downtime, and which boundary kind validated — into the same audit record an
+    /// operator approval writes, with the pins computed from the current files. It selects
+    /// no new cursor and accepts no loss: a boundary that does not validate, a fresh gap, or
+    /// a changed file leaves the state untouched and the manual path in charge. The kept
+    /// cursor is what backfills the outage: the provider replays from it, so the owner's
+    /// messages from the down window arrive as stored requests instead of being skipped.
+    pub fn auto_resolve_outage_gap(&self, now_millis: u64) -> Result<Option<Value>> {
+        let Some(gap) = self.gap_diagnostic()? else {
+            return Ok(None);
+        };
+        if gap.phase != GapPhase::Unresolved {
+            return Ok(None);
+        }
+        let downtime_millis = now_millis.saturating_sub(gap.observed_at_millis);
+        if downtime_millis < OUTAGE_GAP_AUTO_RESOLVE_AFTER_MILLIS {
+            return Ok(None);
+        }
+        let checkpoint = self.read_checkpoint()?;
+        let Some(receipt) = self.current_commit_receipt(&checkpoint)? else {
+            return Ok(None);
+        };
+        let boundary = if validate_checkpoint_only_boundary(&checkpoint, &receipt).is_ok() {
+            GapRetryBoundary::CheckpointOnly
+        } else if GapRetryBoundary::ExactCommitted
+            .validate(&checkpoint, &receipt)
+            .is_ok()
+        {
+            GapRetryBoundary::ExactCommitted
+        } else {
+            return Ok(None);
+        };
+        let Some(cursor) = checkpoint.cursor.clone() else {
+            return Ok(None);
+        };
+        let evidence = serde_json::to_vec(&json!({
+            "kind": "outage-auto-resolve/v1",
+            "boundary": match boundary {
+                GapRetryBoundary::CheckpointOnly => "checkpoint_only",
+                GapRetryBoundary::ExactCommitted => "exact_committed",
+            },
+            "gap_observed_at_millis": gap.observed_at_millis,
+            "auto_resolved_at_millis": now_millis,
+            "downtime_millis": downtime_millis,
+        }))?;
+        let gap_sha256 = bytes_sha256(&read_artifact_bytes(
+            &self.root.join("gap.json"),
+            MAX_GAP_DIAGNOSTIC_BYTES,
+        )?);
+        let checkpoint_sha256 = bytes_sha256(&read_artifact_bytes(
+            &self.root.join("checkpoint.json"),
+            1 << 20,
+        )?);
+        let configuration_sha256 = bytes_sha256(&read_artifact_bytes(
+            &self.root.join("bridge.json"),
+            1 << 20,
+        )?);
+        let evidence_sha256 = bytes_sha256(&evidence);
+        let mut report = self.approve_gap_retry_inner(
+            &gap_sha256,
+            &checkpoint_sha256,
+            &configuration_sha256,
+            &evidence_sha256,
+            &cursor,
+            &evidence,
+            boundary,
+        )?;
+        report["auto_resolved"] = json!(true);
+        report["downtime_millis"] = json!(downtime_millis);
+        Ok(Some(report))
+    }
+
     fn approve_gap_retry(
         &self,
         request: &GapRetryApproval<'_>,
         boundary: GapRetryBoundary,
     ) -> Result<Value> {
-        for digest in [
+        let evidence_bytes =
+            read_artifact_bytes(request.evidence_path, MAX_GAP_RETRY_EVIDENCE_BYTES)?;
+        self.approve_gap_retry_inner(
             request.expected_gap_sha256,
             request.expected_checkpoint_sha256,
             request.expected_configuration_sha256,
             request.evidence_sha256,
+            request.keep_cursor,
+            &evidence_bytes,
+            boundary,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn approve_gap_retry_inner(
+        &self,
+        expected_gap_sha256: &str,
+        expected_checkpoint_sha256: &str,
+        expected_configuration_sha256: &str,
+        evidence_sha256: &str,
+        keep_cursor: &str,
+        evidence_bytes: &[u8],
+        boundary: GapRetryBoundary,
+    ) -> Result<Value> {
+        for digest in [
+            expected_gap_sha256,
+            expected_checkpoint_sha256,
+            expected_configuration_sha256,
+            evidence_sha256,
         ] {
             if !valid_key(digest) {
                 return Err(ChatRuntimeError::invalid(
@@ -6758,12 +6865,10 @@ impl BridgeState {
         let gap_bytes = read_artifact_bytes(&self.root.join("gap.json"), MAX_GAP_DIAGNOSTIC_BYTES)?;
         let checkpoint_bytes = read_artifact_bytes(&self.root.join("checkpoint.json"), 1 << 20)?;
         let configuration_bytes = read_artifact_bytes(&self.root.join("bridge.json"), 1 << 20)?;
-        let evidence_bytes =
-            read_artifact_bytes(request.evidence_path, MAX_GAP_RETRY_EVIDENCE_BYTES)?;
-        if bytes_sha256(&gap_bytes) != request.expected_gap_sha256
-            || bytes_sha256(&checkpoint_bytes) != request.expected_checkpoint_sha256
-            || bytes_sha256(&configuration_bytes) != request.expected_configuration_sha256
-            || bytes_sha256(&evidence_bytes) != request.evidence_sha256
+        if bytes_sha256(&gap_bytes) != expected_gap_sha256
+            || bytes_sha256(&checkpoint_bytes) != expected_checkpoint_sha256
+            || bytes_sha256(&configuration_bytes) != expected_configuration_sha256
+            || bytes_sha256(evidence_bytes) != evidence_sha256
         {
             return Err(ChatRuntimeError::invalid(
                 "gap retry inputs differ from the reviewed SHA256 pins",
@@ -6776,7 +6881,7 @@ impl BridgeState {
             ));
         }
         let checkpoint: Checkpoint = decode_document(&checkpoint_bytes)?;
-        if checkpoint.cursor.as_deref() != Some(request.keep_cursor) {
+        if checkpoint.cursor.as_deref() != Some(keep_cursor) {
             return Err(ChatRuntimeError::invalid(
                 "gap retry must keep the existing cursor",
             ));
@@ -6793,13 +6898,13 @@ impl BridgeState {
             version: STATE_VERSION,
             boundary,
             gap_json: as_text(gap_bytes)?,
-            gap_sha256: request.expected_gap_sha256.to_owned(),
+            gap_sha256: expected_gap_sha256.to_owned(),
             checkpoint_json: as_text(checkpoint_bytes)?,
-            checkpoint_sha256: request.expected_checkpoint_sha256.to_owned(),
+            checkpoint_sha256: expected_checkpoint_sha256.to_owned(),
             committed_receipt_json: as_text(receipt_bytes)?,
-            configuration_sha256: request.expected_configuration_sha256.to_owned(),
-            evidence_json: as_text(evidence_bytes)?,
-            evidence_sha256: request.evidence_sha256.to_owned(),
+            configuration_sha256: expected_configuration_sha256.to_owned(),
+            evidence_json: as_text(evidence_bytes.to_vec())?,
+            evidence_sha256: evidence_sha256.to_owned(),
             approved_at_millis: unix_millis(),
             superseded_by: None,
         };
@@ -6822,7 +6927,7 @@ impl BridgeState {
                 ));
             }
             return Ok(
-                json!({"retry_approved": true, "resolved": false, "cursor": request.keep_cursor,
+                json!({"retry_approved": true, "resolved": false, "cursor": keep_cursor,
                 "evidence_sha256": existing.evidence_sha256, "audit": path}),
             );
         }
@@ -6845,7 +6950,7 @@ impl BridgeState {
         write_document(&path, &record)?;
         self.confirm_boundary()?;
         Ok(
-            json!({"retry_approved": true, "resolved": false, "cursor": request.keep_cursor,
+            json!({"retry_approved": true, "resolved": false, "cursor": keep_cursor,
             "evidence_sha256": record.evidence_sha256, "audit": path}),
         )
     }
@@ -20030,6 +20135,79 @@ mod tests {
         {
             assert_eq!(&fs::read(path).expect("request and UUID bytes"), bytes);
         }
+        fs::remove_dir_all(&state.root).expect("cleanup");
+    }
+
+    #[test]
+    fn outage_gap_auto_resolves_only_after_the_downtime_threshold() {
+        let state = checkpoint_gap_fixture("gap-auto-outage");
+        let observed = state
+            .gap_diagnostic()
+            .expect("gap")
+            .expect("incident")
+            .observed_at_millis;
+        // A fresh gap is a live provider's problem: nothing is written, the operator
+        // path stays in charge, and the subscription still refuses.
+        let before = fixture_files(&state.root);
+        assert_eq!(
+            state
+                .auto_resolve_outage_gap(observed + OUTAGE_GAP_AUTO_RESOLVE_AFTER_MILLIS - 1)
+                .expect("fresh gap check"),
+            None
+        );
+        assert_eq!(fixture_files(&state.root), before);
+        assert!(matches!(
+            state.subscribe_request(),
+            Err(ChatRuntimeError::UnresolvedGap(_))
+        ));
+        // An outage-aged gap approves its own retry with the evidence recorded in the
+        // same audit an operator approval writes, keeping the cursor so the provider
+        // replay backfills the down window.
+        let report = state
+            .auto_resolve_outage_gap(observed + OUTAGE_GAP_AUTO_RESOLVE_AFTER_MILLIS)
+            .expect("outage gap check")
+            .expect("auto resolution");
+        assert_eq!(report["auto_resolved"], true);
+        assert_eq!(
+            report["downtime_millis"],
+            OUTAGE_GAP_AUTO_RESOLVE_AFTER_MILLIS
+        );
+        assert_eq!(
+            state
+                .subscribe_request()
+                .expect("retry subscription")
+                .resume_from()
+                .map(ProviderCursor::as_str),
+            Some("cursor-safe")
+        );
+        let audits: Vec<_> = fs::read_dir(state.root.join("gap-retries"))
+            .expect("audit directory")
+            .collect();
+        assert_eq!(audits.len(), 1);
+        let audit: Value = serde_json::from_slice(
+            &fs::read(audits[0].as_ref().expect("audit entry").path()).expect("audit bytes"),
+        )
+        .expect("audit json");
+        let evidence: Value =
+            serde_json::from_str(audit["evidence_json"].as_str().expect("evidence"))
+                .expect("evidence json");
+        assert_eq!(evidence["kind"], "outage-auto-resolve/v1");
+        assert_eq!(evidence["boundary"], "checkpoint_only");
+        // The approved replay resolves the gap exactly as an operator's does.
+        let admission = state
+            .admit_batch(&checkpoint_delivery(4, "cursor-safe"))
+            .expect("exact replay");
+        state
+            .confirm_batch_commit(&admission)
+            .expect("committed replay");
+        assert_eq!(
+            state
+                .gap_diagnostic()
+                .expect("gap")
+                .expect("incident")
+                .phase,
+            GapPhase::Resolved
+        );
         fs::remove_dir_all(&state.root).expect("cleanup");
     }
 
@@ -34445,7 +34623,7 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
             .expect("the subscription is reported down");
         assert_eq!(
             reported.last_error_class,
-            "credential file missing: AGENTCTL_TEST_CERT_PATH"
+            "credential file missing: environment variable AGENTCTL_TEST_CERT_PATH"
         );
         assert!(reported
             .last_error
@@ -34453,7 +34631,7 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
         assert_eq!(status["credentials"]["files"][0]["state"], "missing");
         assert_eq!(
             status["credentials"]["files"][0]["problem"],
-            "credential file missing: AGENTCTL_TEST_CERT_PATH"
+            "credential file missing: environment variable AGENTCTL_TEST_CERT_PATH"
         );
         // The variable's value, the path, stays out of the status like every plugin
         // environment value.
@@ -34498,7 +34676,7 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
             reported.last_error_class.starts_with("credential expired ")
                 && reported
                     .last_error_class
-                    .ends_with(" h ago: AGENTCTL_TEST_CERT_PATH"),
+                    .ends_with(" h ago: environment variable AGENTCTL_TEST_CERT_PATH"),
             "{}",
             reported.last_error_class
         );

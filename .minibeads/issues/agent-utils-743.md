@@ -2,14 +2,14 @@
 title: 'restore-installed-units: persistent user units instead of transients, installed from the spec'
 status: open
 priority: 1
-assignee: mu-restore@devbig030
 issue_type: feature
+assignee: mu-restore2@devbig030
 labels:
 - agentctl
 depends_on:
   agent-utils-740: parent-child
 created_at: 2026-11-02T16:13:53.501647376+00:00
-updated_at: 2026-11-02T16:13:53.501647376+00:00
+updated_at: 2026-11-02T16:49:46.887139309+00:00
 ---
 
 # Description
