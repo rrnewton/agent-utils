@@ -105,9 +105,17 @@ impl Fixture {
 
     /// Run the merge-queue binary against the queue clone.
     pub fn mq(&self, args: &[&str]) -> Output {
+        self.mq_env(args, &[])
+    }
+
+    /// Run the merge-queue binary with extra environment variables.
+    pub fn mq_env(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_merge-queue"));
         command.args(args).current_dir(self.queue());
         for (key, value) in IDENTITY {
+            command.env(key, value);
+        }
+        for (key, value) in env {
             command.env(key, value);
         }
         command.env_remove("MERGE_QUEUE_STATE");

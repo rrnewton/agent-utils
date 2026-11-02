@@ -4,6 +4,7 @@
 //! <state>/
 //!   config.json            fixed: queue configuration
 //!   lock                   fixed: writer lock (flock)
+//!   union.attributes       fixed: generated from `union_paths`, when set
 //!   items/<pr>.json        one record per submitted change
 //!   runs/<run-id>/         one directory per `run`: plan, events, validations, report
 //!   obligations/<id>.json  one record per focused landing still owed a complete run
@@ -56,6 +57,10 @@ pub struct ValidatorConfig {
     pub admission: Vec<String>,
     /// Seconds before one validation is killed and reported as errors (0 = no limit).
     pub timeout_secs: u64,
+    /// Also delete ignored files (build caches) from a reused checkout before each validation.
+    /// Off by default: caches make validations fast, at the cost of trusting the build to be
+    /// hermetic with respect to them.
+    pub clean_ignored: bool,
 }
 
 /// How a validated candidate reaches the base branch.
@@ -66,6 +71,10 @@ pub struct LandConfig {
     pub driver: String,
     /// For `command`: shell template run once per change, in order. See the user guide.
     pub command: String,
+    /// For `command`: allow batches of more than one change. The base then passes through each
+    /// change's intermediate tree, which was not validated on its own; off by default, which
+    /// makes every batch a single change.
+    pub allow_batches: bool,
 }
 
 /// Queue configuration stored in `config.json`.
@@ -87,7 +96,15 @@ pub struct Config {
     /// Maximum changes per batch.
     pub max_batch: usize,
     /// Speculative depth: how many batches validate concurrently, each on top of the previous.
+    /// Also the number of concurrent culprit-search probes.
     pub depth: usize,
+    /// Largest window the adaptive (AIMD) window may grow to: +1 per landed batch, halved per
+    /// red batch, never below 1. 0 (the default) means `depth`, a fixed window.
+    pub max_depth: usize,
+    /// Paths (Git attribute patterns) merged with Git's `union` driver when combining changes and
+    /// probing conflicts. Only for line-oriented, append-only files; validation still checks the
+    /// result.
+    pub union_paths: Vec<String>,
     /// Validation configuration.
     pub validator: ValidatorConfig,
     /// Landing configuration.
@@ -105,6 +122,8 @@ impl Default for Config {
             combine: CombineMode::Rebase,
             max_batch: DEFAULT_MAX_BATCH,
             depth: DEFAULT_DEPTH,
+            max_depth: 0,
+            union_paths: Vec::new(),
             validator: ValidatorConfig::default(),
             land: LandConfig::default(),
         }

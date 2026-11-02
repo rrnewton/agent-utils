@@ -8,13 +8,16 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bench;
 pub mod cli;
 pub mod git;
 pub mod model;
 pub mod ops;
 pub mod plan;
+pub mod run;
 pub mod state;
 pub mod tests;
+pub mod validate;
 
 /// The complete user guide, also printed by `merge-queue userguide`.
 pub const USER_GUIDE: &str = include_str!("embedded_userguide.md");

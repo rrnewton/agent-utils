@@ -106,8 +106,11 @@ pub struct Obligation {
     pub prs: Vec<i64>,
     /// What actually ran before landing.
     pub validated: ValidationClaim,
-    /// Open until a complete run covers `landed` (that commit or a descendant of it).
+    /// Set when a green complete run covered `landed` (that commit or a descendant of it).
     pub discharged: Option<Discharge>,
+    /// Complete runs that covered `landed` and were red; the obligation stays open.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed_runs: Vec<Discharge>,
 }
 
 /// How an obligation was discharged.

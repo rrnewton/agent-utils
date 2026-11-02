@@ -16,11 +16,29 @@ pub fn head_ref(pr: i64) -> String {
     format!("refs/merge-queue/heads/{pr}")
 }
 
-/// The repository named by a configuration, with its network wrapper.
-pub fn repo(config: &Config) -> Git {
+/// The repository named by a configuration, with its network wrapper and, when `union_paths`
+/// is set, an attributes file (kept in the state directory) selecting Git's union merge driver
+/// for those paths.
+pub fn repo(state: &State, config: &Config) -> Result<Git, String> {
     let mut git = Git::new(&config.repo);
     git.net_wrapper = config.net_wrapper.clone();
-    git
+    if !config.union_paths.is_empty() {
+        let path = state.root.join("union.attributes");
+        let text: String = config
+            .union_paths
+            .iter()
+            .map(|pattern| format!("{pattern} merge=union\n"))
+            .collect();
+        if std::fs::read_to_string(&path).ok().as_deref() != Some(text.as_str()) {
+            std::fs::create_dir_all(&state.root)
+                .map_err(|error| format!("cannot create {}: {error}", state.root.display()))?;
+            std::fs::write(&path, text)
+                .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+        }
+        git.settings
+            .push(format!("core.attributesFile={}", path.display()));
+    }
+    Ok(git)
 }
 
 fn source_ref(head: &str) -> String {
@@ -120,7 +138,7 @@ pub fn submit(state: &State, config: &Config, submission: Submission) -> Result<
     if submission.head_ref.is_empty() {
         return Err("a head branch or ref is required".to_owned());
     }
-    let git = repo(config);
+    let git = repo(state, config)?;
     let (_, heads) = refresh(
         &git,
         config,
@@ -191,7 +209,7 @@ pub fn plan(state: &State, config: &Config, max_batch: usize) -> Result<Plan, St
         .filter(|item| item.status == ItemStatus::Queued)
         .map(|item| (item.pr, item.head_ref.clone()))
         .collect();
-    let git = repo(config);
+    let git = repo(state, config)?;
     let (base_sha, current) = refresh(&git, config, &heads)?;
     let probe = probe(&git, &base_sha, &current)?;
     Ok(make_plan(

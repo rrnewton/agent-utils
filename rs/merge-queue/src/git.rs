@@ -46,6 +46,9 @@ pub struct Git {
     pub dir: PathBuf,
     /// Command prefix for network operations, such as a proxy wrapper.
     pub net_wrapper: Vec<String>,
+    /// `-c key=value` settings applied to every invocation (for example a union-merge
+    /// attributes file).
+    pub settings: Vec<String>,
 }
 
 impl Git {
@@ -54,12 +57,17 @@ impl Git {
         Self {
             dir: dir.into(),
             net_wrapper: Vec::new(),
+            settings: Vec::new(),
         }
     }
 
     fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new("git");
-        command.arg("-C").arg(&self.dir).args(args);
+        command.arg("-C").arg(&self.dir);
+        for setting in &self.settings {
+            command.arg("-c").arg(setting);
+        }
+        command.args(args);
         command
     }
 
@@ -202,11 +210,41 @@ impl Git {
 
     /// Non-merge commits reachable from `head` but from none of `exclude`, oldest first.
     pub fn own_commits(&self, head: &str, exclude: &[&str]) -> Result<Vec<String>, String> {
-        let negated: Vec<String> = exclude.iter().map(|rev| format!("^{rev}")).collect();
-        let mut args = vec!["rev-list", "--reverse", "--topo-order", "--no-merges", head];
-        args.extend(negated.iter().map(String::as_str));
-        Ok(self
-            .run(&args)?
+        use std::io::Write;
+        // Revisions go on stdin, so any number of excluded heads fits.
+        let mut input = format!("{head}\n");
+        for rev in exclude {
+            input.push_str(&format!("^{rev}\n"));
+        }
+        let mut command = self.command(&[
+            "rev-list",
+            "--reverse",
+            "--topo-order",
+            "--no-merges",
+            "--stdin",
+        ]);
+        command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("could not run git rev-list: {error}"))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(input.as_bytes())
+                .map_err(|error| format!("could not feed git rev-list: {error}"))?;
+        }
+        let output = child
+            .wait_with_output()
+            .map_err(|error| format!("could not run git rev-list: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "git rev-list failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout)
             .lines()
             .filter(|line| !line.is_empty())
             .map(str::to_owned)
@@ -250,6 +288,10 @@ impl Git {
         match self.merge_tree(onto, commit, Some(&parent))? {
             Err(paths) => Ok(Combined::Conflict(paths)),
             Ok(tree) => {
+                // Like `git rebase`, drop a commit whose change the target already has.
+                if tree == self.tree_of(onto)? {
+                    return Ok(Combined::Clean(onto.to_owned()));
+                }
                 let (name, email, date, message) = self.commit_meta(commit)?;
                 let message = message.trim_end();
                 let new =
@@ -448,6 +490,44 @@ mod unit {
             vec!["a.txt".to_owned()]
         );
         assert!(git.merge_conflicts(&a, &b).unwrap().is_empty());
+    }
+
+    #[test]
+    fn union_attributes_resolve_append_only_conflicts() {
+        let tmp = TempDir::new("git-union");
+        let mut git = init(&tmp.0);
+        write(&tmp.0, "list.txt", "a\n");
+        git_add_commit(&tmp.0);
+        let base = git.rev_parse("main").unwrap();
+        let x = branch(&tmp.0, "x", "main", &[("list.txt", "a\nx\n")]);
+        let y = branch(&tmp.0, "y", "main", &[("list.txt", "a\ny\n")]);
+        assert_eq!(
+            git.merge_conflicts(&x, &y).unwrap(),
+            vec!["list.txt".to_owned()]
+        );
+        let attributes = tmp.0.join("union.attributes");
+        std::fs::write(&attributes, "list.txt merge=union\n").unwrap();
+        git.settings = vec![format!("core.attributesFile={}", attributes.display())];
+        assert!(git.merge_conflicts(&x, &y).unwrap().is_empty());
+        let Combined::Clean(tip) = git
+            .combine(CombineMode::Rebase, &base, &x, &[], "")
+            .unwrap()
+        else {
+            panic!("x applies");
+        };
+        let Combined::Clean(tip) = git.combine(CombineMode::Rebase, &tip, &y, &[], "").unwrap()
+        else {
+            panic!("y applies with union");
+        };
+        assert_eq!(
+            git.run(&["show", &format!("{tip}:list.txt")]).unwrap(),
+            "a\nx\ny"
+        );
+    }
+
+    fn git_add_commit(dir: &std::path::Path) {
+        super::testrepo::git(dir, &["add", "-A"]);
+        super::testrepo::git(dir, &["commit", "-q", "-m", "more"]);
     }
 
     #[test]

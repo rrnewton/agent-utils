@@ -8,12 +8,13 @@ fail together.
 **What merge-queue does.** You submit changes as ready to land. The queue reads the exact
 conflict graph from Git, picks a set of changes that can land together this round, orders them
 by priority and age, and splits them into batches. Every change it cannot land gets a stated
-reason and the action that unblocks it. Later commands validate each batch's exact combined tree
-and land it only when it is green.
+reason and the action that unblocks it. `run` then validates each batch's exact combined tree,
+several at once, and lands it only when it is green.
 
 Validation is a **set of tests**, not one pass/fail answer. A submission records which tests you
 ran on it. A focused run leaves a tracked obligation to run the complete suite. When a batch
-fails, the search for the culprit reruns only the failed tests.
+fails, the search for the culprit reruns only the failed tests, and the culprit is ejected with a
+report while the rest lands.
 
 Everything runs locally against a Git clone. There is no service, no webhook and no inbound
 connection. The only requirement is `git` 2.40 or newer.
@@ -47,6 +48,35 @@ Conflict clusters:
   #41, #42
 ```
 
+## Validate and land
+
+Tell the queue how to run a selection of tests and how to land, then run it:
+
+```bash
+merge-queue init --force --remote origin --base main \
+  --validator command --validator-run 'sh run-selected.sh' \
+  --select 'git diff --name-only "$MQ_BASE" HEAD -- tests' --policy path-routing \
+  --land push
+
+merge-queue run --dry-run   # build candidates and selections; validate and land nothing
+merge-queue run --shadow    # validate for real, land on a simulated base, change no status
+merge-queue run             # validate, land green batches, eject culprits
+merge-queue obligations     # focused landings still owed a complete run
+merge-queue widen           # run the complete suite once and discharge them
+```
+
+The runner reads the selected test IDs from `$MQ_TESTS` and writes one JSON line per test to
+`$MQ_RESULTS` (`{"id":"t1","outcome":"pass"}`); the user guide has a complete ten-line runner.
+With `--depth 2` (the default), two batches validate at once, the second on top of the first;
+`init --max-depth 4` lets that window grow on success and halve on a red batch. Each run leaves
+`report.md` under `.git/merge-queue/runs/<run-id>/`.
+
+To see what batching and speculation buy before trying it on a real repository:
+
+```bash
+merge-queue bench --prs 16 --test-secs 1   # serial lander vs the queue on a synthetic repository
+```
+
 ## What to know next
 
 - A plan is bound to the exact base commit and to the exact head of each change. If a branch moves
@@ -55,5 +85,5 @@ Conflict clusters:
   fewer conflicts is preferred, then the one submitted first.
 - `merge-queue withdraw 41` takes a change out of the queue. Submitting it again puts it back with
   its history.
-- `merge-queue userguide` documents every command, the state layout, the configuration and the
-  plan schema.
+- `merge-queue userguide` documents every command, the state layout, the configuration, the
+  validator and land-driver contracts, the plan schema, and how the base stays green.
