@@ -26,7 +26,7 @@
 //! is dead or the heartbeat is stale.
 
 use std::fs::{File, OpenOptions};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -371,6 +371,326 @@ pub fn remote_base_sha(git: &Git, config: &Config) -> Result<Option<String>, Str
     Ok(sha)
 }
 
+/// The shipped systemd user-unit template. `install-serve-unit` renders it
+/// by replacing its three placeholders; it is never copied verbatim.
+pub const SERVE_UNIT_TEMPLATE: &str = include_str!("../merge-queue-serve.service");
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// Resolve `name` against `path_env` (a `PATH` value). A name containing
+/// `/` is checked as a path, relative to `base` when not absolute.
+pub fn find_executable(
+    name: &str,
+    path_env: Option<&std::ffi::OsStr>,
+    base: &Path,
+) -> Option<PathBuf> {
+    if name.contains('/') {
+        let candidate = if Path::new(name).is_absolute() {
+            PathBuf::from(name)
+        } else {
+            base.join(name)
+        };
+        return is_executable_file(&candidate).then_some(candidate);
+    }
+    let path_env = path_env?;
+    for dir in std::env::split_paths(path_env) {
+        let dir = if dir.as_os_str().is_empty() {
+            PathBuf::from(".")
+        } else {
+            dir
+        };
+        let candidate = dir.join(name);
+        if is_executable_file(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// First program a `sh -c` template runs: skips `VAR=value` prefixes and a
+/// leading `exec`. `None` for an empty template.
+pub fn leading_executable(command: &str) -> Option<String> {
+    let words = shell_words::split(command).ok()?;
+    for word in words {
+        if word == "exec" {
+            continue;
+        }
+        let is_assignment = word.split_once('=').is_some_and(|(name, _)| {
+            !name.is_empty()
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && !name.chars().next().is_some_and(|c| c.is_ascii_digit())
+        });
+        if !is_assignment {
+            return Some(word);
+        }
+    }
+    None
+}
+
+fn configured_executables(
+    config: &Config,
+    agentctl_override: Option<&[String]>,
+) -> Vec<(&'static str, String)> {
+    let mut out: Vec<(&'static str, String)> = Vec::new();
+    fn shell(out: &mut Vec<(&'static str, String)>, label: &'static str, command: &str) {
+        if let Some(tool) = leading_executable(command) {
+            out.push((label, tool));
+        }
+    }
+    shell(
+        &mut out,
+        "regenerate.build_command",
+        &config.regenerate.build_command,
+    );
+    shell(&mut out, "regenerate.command", &config.regenerate.command);
+    shell(&mut out, "validator.list", &config.validator.list);
+    shell(&mut out, "validator.select", &config.validator.select);
+    if config.validator.kind == "dagrun" {
+        let dagrun = if config.validator.dagrun.is_empty() {
+            "dagrun"
+        } else {
+            &config.validator.dagrun
+        };
+        out.push(("validator.dagrun", dagrun.to_owned()));
+    } else {
+        shell(&mut out, "validator.run", &config.validator.run);
+    }
+    if config.land.driver == "command" {
+        shell(&mut out, "land.command", &config.land.command);
+    }
+    if let Some(tool) = config.github.gh.first() {
+        out.push(("github.gh", tool.clone()));
+    }
+    if let Some(tool) = config.net_wrapper.first() {
+        out.push(("net_wrapper", tool.clone()));
+    }
+    // Deliberately not checked: `notify.agentctl`. A missing sender is a
+    // failed send, never a daemon failure (see cli_notify tests).
+    let _ = agentctl_override;
+    for tool in config.validator.admission.iter().take(1) {
+        out.push(("validator.admission", tool.clone()));
+    }
+    out.push(("git", "git".to_owned()));
+    out.push(("sh", "sh".to_owned()));
+    out
+}
+
+/// Startup preflight: every executable the daemon's configured
+/// regenerate/validator/land commands name must resolve on the current
+/// `PATH` (relative paths resolve against the queue's repository). Returns
+/// an error naming each missing tool, e.g. `cargo not found`.
+pub fn preflight(config: &Config, agentctl_override: Option<&[String]>) -> Result<(), String> {
+    preflight_with_path(
+        config,
+        agentctl_override,
+        std::env::var_os("PATH").as_deref(),
+    )
+}
+
+/// [`preflight`] against an explicit `PATH` value (tests).
+pub fn preflight_with_path(
+    config: &Config,
+    agentctl_override: Option<&[String]>,
+    path_env: Option<&std::ffi::OsStr>,
+) -> Result<(), String> {
+    // Shell builtins (`exit`, `cd`, ...) need no file on PATH.
+    const BUILTINS: &[&str] = &[
+        ":", ".", "[", "alias", "bg", "break", "builtin", "cd", "command", "continue", "echo",
+        "eval", "exec", "exit", "export", "false", "fg", "hash", "jobs", "kill", "local", "printf",
+        "pwd", "read", "readonly", "return", "set", "shift", "test", "times", "trap", "true",
+        "type", "umask", "unalias", "unset", "wait",
+        // Shell control keywords: a template starting with one is composite;
+        // its leading word names no file (inner tools are covered by PATH).
+        "if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac",
+        "{", "}", "!", "time", "function", "select", "[[", "]]",
+    ];
+    let missing: Vec<String> = configured_executables(config, agentctl_override)
+        .into_iter()
+        .filter(|(_, tool)| !BUILTINS.contains(&tool.as_str()))
+        .filter(|(_, tool)| find_executable(tool, path_env, &config.repo).is_none())
+        .map(|(label, tool)| format!("{tool} not found (needed by {label})"))
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "serve preflight failed: {}; remedy: install the named tool(s) or add their \
+             directory to the service PATH (see `merge-queue install-serve-unit`)",
+            missing.join("; ")
+        ))
+    }
+}
+
+fn require_absolute(label: &str, path: &Path) -> Result<(), String> {
+    if path.is_absolute() && !path.to_string_lossy().contains('\n') {
+        Ok(())
+    } else {
+        Err(format!(
+            "{label} must be an absolute path without a newline, got {}",
+            path.display()
+        ))
+    }
+}
+
+/// Render the serve unit for `binary` running in `repo`, with
+/// `toolchain_bin` (the directory containing `cargo`, resolved at install
+/// time) first on the service `PATH`. All three paths must be absolute:
+/// a systemd user service inherits no login-shell `PATH`.
+pub fn render_serve_unit(
+    binary: &Path,
+    repo: &Path,
+    toolchain_bin: &Path,
+) -> Result<String, String> {
+    require_absolute("merge-queue binary", binary)?;
+    require_absolute("repository", repo)?;
+    require_absolute("toolchain directory", toolchain_bin)?;
+    let rendered = SERVE_UNIT_TEMPLATE
+        .replace("__TOOLCHAIN_BIN__", &toolchain_bin.to_string_lossy())
+        .replace("__MERGE_QUEUE_BIN__", &binary.to_string_lossy())
+        .replace("__REPO__", &repo.to_string_lossy());
+    if rendered.contains("__TOOLCHAIN_BIN__")
+        || rendered.contains("__MERGE_QUEUE_BIN__")
+        || rendered.contains("__REPO__")
+    {
+        return Err("serve unit template has an unreplaced placeholder".to_owned());
+    }
+    Ok(rendered)
+}
+
+/// Resolve the directory containing `cargo` without relying on a login
+/// shell: `rustup which cargo` first, then `cargo` on `PATH`, then
+/// `$CARGO_HOME/bin` or `~/.cargo/bin`. Errors name `cargo`.
+pub fn resolve_toolchain_bin() -> Result<PathBuf, String> {
+    resolve_toolchain_bin_with(
+        std::env::var_os("PATH").as_deref(),
+        std::env::var_os("CARGO_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+fn resolve_toolchain_bin_with(
+    path_env: Option<&std::ffi::OsStr>,
+    cargo_home: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf, String> {
+    if let Some(rustup) = find_executable("rustup", path_env, Path::new(".")) {
+        if let Ok(output) = std::process::Command::new(&rustup)
+            .args(["which", "cargo"])
+            .stdin(std::process::Stdio::null())
+            .output()
+        {
+            if output.status.success() {
+                let text = String::from_utf8_lossy(&output.stdout);
+                let cargo = PathBuf::from(text.trim());
+                if is_executable_file(&cargo) {
+                    if let Some(parent) = cargo.parent() {
+                        return Ok(parent.to_path_buf());
+                    }
+                }
+            }
+        }
+    }
+    if let Some(cargo) = find_executable("cargo", path_env, Path::new(".")) {
+        if let Some(parent) = cargo.parent() {
+            if !parent.as_os_str().is_empty() {
+                return Ok(parent.to_path_buf());
+            }
+        }
+    }
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(cargo_home) = cargo_home.filter(|v| !v.is_empty()) {
+        candidates.push(PathBuf::from(cargo_home).join("bin"));
+    }
+    if let Some(home) = home.filter(|v| !v.is_empty()) {
+        candidates.push(PathBuf::from(home).join(".cargo").join("bin"));
+    }
+    for dir in candidates {
+        if is_executable_file(&dir.join("cargo")) {
+            return Ok(dir);
+        }
+    }
+    Err(
+        "cargo not found: no rustup, no cargo on PATH, and no cargo in \
+         $CARGO_HOME/bin or ~/.cargo/bin; remedy: install Rust with rustup, \
+         then re-run `merge-queue install-serve-unit`"
+            .to_owned(),
+    )
+}
+
+/// Default systemd user-unit directory (`$XDG_CONFIG_HOME/systemd/user`,
+/// else `~/.config/systemd/user`).
+pub fn default_unit_dir() -> Result<PathBuf, String> {
+    if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(dir).join("systemd").join("user"));
+    }
+    let home = std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| {
+            "HOME is not set; remedy: pass --output with the unit file path".to_owned()
+        })?;
+    Ok(PathBuf::from(home)
+        .join(".config")
+        .join("systemd")
+        .join("user"))
+}
+
+/// Render and write `merge-queue-serve.service` to `output`, resolving the
+/// toolchain directory explicitly (or using `toolchain_bin` when given,
+/// which must contain an executable `cargo`). Returns the written path.
+/// The toolchain directory to write into the unit: `given` when passed
+/// (it must contain an executable `cargo`), else [`resolve_toolchain_bin`].
+pub fn checked_toolchain_bin(given: Option<&Path>) -> Result<PathBuf, String> {
+    match given {
+        Some(dir) => {
+            require_absolute("toolchain directory", dir)?;
+            if !is_executable_file(&dir.join("cargo")) {
+                return Err(format!(
+                    "cargo not found in {} (passed as the toolchain directory); \
+                     remedy: pass the directory containing cargo, e.g. from `rustup which cargo`",
+                    dir.display()
+                ));
+            }
+            Ok(dir.to_path_buf())
+        }
+        None => resolve_toolchain_bin(),
+    }
+}
+
+/// Render and write `merge-queue-serve.service` to `output`, resolving the
+/// toolchain directory explicitly. Returns the written path.
+pub fn install_serve_unit(
+    binary: &Path,
+    repo: &Path,
+    toolchain_bin: Option<&Path>,
+    output: &Path,
+) -> Result<PathBuf, String> {
+    let toolchain_bin = checked_toolchain_bin(toolchain_bin)?;
+    let rendered = render_serve_unit(binary, repo, &toolchain_bin)?;
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    }
+    std::fs::write(output, rendered)
+        .map_err(|e| format!("cannot write {}: {e}", output.display()))?;
+    Ok(output.to_path_buf())
+}
+
 /// Options for one `serve` invocation.
 #[derive(Clone, Debug)]
 pub struct ServeOptions {
@@ -643,6 +963,9 @@ pub fn serve(state: &State, options: &ServeOptions) -> Result<i32, String> {
             "{e}; remedy: run `merge-queue init` for this repository before `merge-queue serve`"
         )
     })?;
+    // Fail loudly before the first cycle when a configured tool is missing
+    // (e.g. `cargo` under a systemd unit with no toolchain on PATH).
+    preflight(&config, options.agentctl.as_deref())?;
     // Held (and so the single-daemon guarantee kept) until this returns.
     let _serve_lock = acquire_serve_lock(state)?;
     reset_shutdown();
@@ -1296,6 +1619,92 @@ mod unit {
         assert!(!report.shadow);
         assert!(render_status(&report).contains("mode: live"));
         let _ = std::fs::remove_dir_all(&state.root);
+    }
+
+    #[test]
+    fn rendered_unit_names_an_explicit_toolchain_path() {
+        let rendered = render_serve_unit(
+            Path::new("/opt/bin/merge-queue"),
+            Path::new("/srv/clone"),
+            Path::new("/home/dev/.rustup/toolchains/stable/bin"),
+        )
+        .unwrap();
+        // Explicit absolute toolchain dir on the service PATH, never a bare
+        // reliance on whatever PATH systemd happens to give the unit.
+        assert!(
+            rendered.contains(
+                "Environment=PATH=/home/dev/.rustup/toolchains/stable/bin:/usr/local/bin:/usr/bin:/bin"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("WorkingDirectory=/srv/clone"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("ExecStart=/opt/bin/merge-queue --repo /srv/clone serve"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("__TOOLCHAIN_BIN__"), "{rendered}");
+        // The shipped template itself must not be a bare-PATH unit.
+        assert!(
+            SERVE_UNIT_TEMPLATE.contains("Environment=PATH=__TOOLCHAIN_BIN__:"),
+            "{SERVE_UNIT_TEMPLATE}"
+        );
+        // Relative paths are refused: systemd would resolve them arbitrarily.
+        assert!(render_serve_unit(
+            Path::new("merge-queue"),
+            Path::new("/srv/clone"),
+            Path::new("/opt/bin"),
+        )
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preflight_names_a_missing_configured_tool() {
+        let state = temp_state("preflight");
+        let mut config = Config {
+            repo: state.root.clone(),
+            regenerate: crate::state::RegenerateConfig {
+                paths: vec!["generated/".to_owned()],
+                command: "cargo run --release -- gen".to_owned(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // Fake PATH with the always-needed tools but no cargo.
+        let fake_bin = state.root.join("fake-bin");
+        std::fs::create_dir_all(&fake_bin).unwrap();
+        for tool in ["git", "sh"] {
+            let real = find_executable(tool, std::env::var_os("PATH").as_deref(), Path::new("."))
+                .unwrap_or_else(|| panic!("{tool} on test PATH"));
+            std::os::unix::fs::symlink(&real, fake_bin.join(tool)).unwrap();
+        }
+        let fake_path = std::ffi::OsString::from(&fake_bin);
+        let error = preflight_with_path(&config, None, Some(&fake_path)).unwrap_err();
+        assert!(error.contains("cargo not found"), "{error}");
+        assert!(error.contains("regenerate.command"), "{error}");
+        // With an empty command there is nothing to refuse.
+        config.regenerate.command = String::new();
+        // git/sh are still named when PATH has nothing at all.
+        let empty = std::ffi::OsString::new();
+        let error = preflight_with_path(&config, None, Some(&empty)).unwrap_err();
+        assert!(error.contains("git not found"), "{error}");
+        let _ = std::fs::remove_dir_all(&state.root);
+    }
+
+    #[test]
+    fn leading_executable_skips_assignments_and_exec() {
+        assert_eq!(
+            leading_executable("FOO=1 exec cargo test").as_deref(),
+            Some("cargo")
+        );
+        assert_eq!(
+            leading_executable("  ./scripts/gen.sh x").as_deref(),
+            Some("./scripts/gen.sh")
+        );
+        assert_eq!(leading_executable(""), None);
     }
 
     #[test]

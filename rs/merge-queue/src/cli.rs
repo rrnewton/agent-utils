@@ -362,6 +362,24 @@ enum Command {
         #[arg(long, default_value_t = 30, value_name = "SECS")]
         notify_timeout_secs: u64,
     },
+    /// Render and install the systemd user unit for `serve`, with the
+    /// toolchain directory (containing `cargo`) resolved explicitly at
+    /// install time and written as an absolute service `PATH`.
+    InstallServeUnit {
+        /// Directory containing `cargo` (default: resolved from
+        /// `rustup which cargo`, then `cargo` on PATH, then
+        /// `$CARGO_HOME/bin` or `~/.cargo/bin`).
+        #[arg(long, value_name = "DIR")]
+        toolchain_bin: Option<PathBuf>,
+        /// Unit file to write (default:
+        /// `$XDG_CONFIG_HOME/systemd/user/merge-queue-serve.service`, else
+        /// `~/.config/systemd/user/merge-queue-serve.service`).
+        #[arg(long, value_name = "FILE")]
+        output: Option<PathBuf>,
+        /// Print the rendered unit instead of writing it.
+        #[arg(long)]
+        print: bool,
+    },
     /// Show daemon liveness, the current window and slot occupancy.
     Status {
         /// Print the status report as JSON.
@@ -924,6 +942,38 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                 notify_timeout: std::time::Duration::from_secs(notify_timeout_secs.max(1)),
             },
         ),
+        Command::InstallServeUnit {
+            toolchain_bin,
+            output,
+            print,
+        } => {
+            let binary = std::env::current_exe()
+                .map_err(|e| format!("cannot find this merge-queue binary: {e}"))?;
+            let queue_repo = state
+                .config()
+                .ok()
+                .filter(|c| !c.repo.as_os_str().is_empty())
+                .map_or_else(|| repo.clone(), |c| c.repo);
+            if print {
+                let toolchain = serve::checked_toolchain_bin(toolchain_bin.as_deref())?;
+                print!(
+                    "{}",
+                    serve::render_serve_unit(&binary, &queue_repo, &toolchain)?
+                );
+                return Ok(0);
+            }
+            let output = match output {
+                Some(path) => path,
+                None => serve::default_unit_dir()?.join("merge-queue-serve.service"),
+            };
+            let written =
+                serve::install_serve_unit(&binary, &queue_repo, toolchain_bin.as_deref(), &output)?;
+            println!("wrote {}", written.display());
+            println!(
+                "next: systemctl --user daemon-reload && systemctl --user enable --now merge-queue-serve"
+            );
+            Ok(0)
+        }
         Command::Status {
             json,
             stale_after_secs,

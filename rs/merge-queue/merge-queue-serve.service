@@ -1,12 +1,21 @@
 [Unit]
-Description=merge-queue serve daemon (edit WorkingDirectory and ExecStart first)
+Description=merge-queue serve daemon
 After=network-online.target
 
 [Service]
 Type=simple
-# Edit these two lines: the clone the queue operates on, and the built binary.
-WorkingDirectory=/path/to/clone
-ExecStart=/path/to/merge-queue --repo /path/to/clone serve --poll-ms 250 --base-poll-secs 30
+# This unit is rendered by `merge-queue install-serve-unit`, which replaces
+# the three placeholders below at install time. Do not copy this file by
+# hand without replacing them: a systemd user service does not inherit a
+# login shell's PATH, so a bare `cargo` (or any other tool the queue's
+# regenerate/validator commands name) is not found unless its directory is
+# named explicitly here. The installer resolves the toolchain directory
+# from `rustup which cargo` (falling back to `cargo` on PATH, then
+# $CARGO_HOME/bin or ~/.cargo/bin) and writes it as an absolute path.
+# __TOOLCHAIN_BIN__ is that directory; it must contain `cargo`.
+Environment=PATH=__TOOLCHAIN_BIN__:/usr/local/bin:/usr/bin:/bin
+WorkingDirectory=__REPO__
+ExecStart=__MERGE_QUEUE_BIN__ --repo __REPO__ serve --poll-ms 250 --base-poll-secs 30
 Restart=on-failure
 RestartSec=5s
 

@@ -335,12 +335,18 @@ run's plan when no daemon heartbeat exists); slots count the `scratch/slot-*` ch
 
 ### Running `serve` as a service
 
-A systemd user unit ships at `rs/merge-queue/merge-queue-serve.service` (`Restart=on-failure`,
-`ExecStart` pointing at `serve`). Edit its `WorkingDirectory` and `ExecStart` paths, then:
+A systemd user unit template ships at `rs/merge-queue/merge-queue-serve.service`
+(`Restart=on-failure`, `ExecStart` pointing at `serve`). Install it with
+`merge-queue install-serve-unit`, not by copying the template by hand: a systemd user
+service does not inherit a login shell's `PATH`, so the installer resolves the toolchain
+directory at install time (from `rustup which cargo`, then `cargo` on `PATH`, then
+`$CARGO_HOME/bin` or `~/.cargo/bin`; override with `--toolchain-bin DIR`) and writes it
+as an absolute `Environment=PATH=...` in the rendered unit. At startup `serve` also
+refuses, naming the missing tool (for example `cargo not found`), when any executable
+its configured regenerate/validator commands name does not resolve.
 
 ```bash
-mkdir -p ~/.config/systemd/user
-cp rs/merge-queue/merge-queue-serve.service ~/.config/systemd/user/
+merge-queue install-serve-unit   # or: --print to preview, --output FILE to relocate
 systemctl --user daemon-reload
 systemctl --user enable --now merge-queue-serve
 merge-queue status   # daemon: running ...
@@ -403,12 +409,18 @@ run's plan when no daemon heartbeat exists); slots count the `scratch/slot-*` ch
 
 ### Running `serve` as a service
 
-A systemd user unit ships at `rs/merge-queue/merge-queue-serve.service` (`Restart=on-failure`,
-`ExecStart` pointing at `serve`). Edit its `WorkingDirectory` and `ExecStart` paths, then:
+A systemd user unit template ships at `rs/merge-queue/merge-queue-serve.service`
+(`Restart=on-failure`, `ExecStart` pointing at `serve`). Install it with
+`merge-queue install-serve-unit`, not by copying the template by hand: a systemd user
+service does not inherit a login shell's `PATH`, so the installer resolves the toolchain
+directory at install time (from `rustup which cargo`, then `cargo` on `PATH`, then
+`$CARGO_HOME/bin` or `~/.cargo/bin`; override with `--toolchain-bin DIR`) and writes it
+as an absolute `Environment=PATH=...` in the rendered unit. At startup `serve` also
+refuses, naming the missing tool (for example `cargo not found`), when any executable
+its configured regenerate/validator commands name does not resolve.
 
 ```bash
-mkdir -p ~/.config/systemd/user
-cp rs/merge-queue/merge-queue-serve.service ~/.config/systemd/user/
+merge-queue install-serve-unit   # or: --print to preview, --output FILE to relocate
 systemctl --user daemon-reload
 systemctl --user enable --now merge-queue-serve
 merge-queue status   # daemon: running ...

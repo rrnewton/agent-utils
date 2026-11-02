@@ -436,6 +436,114 @@ fn serve_shadow_is_the_remedy_when_land_driver_is_none() {
 }
 
 #[test]
+fn serve_preflight_refuses_when_regen_tool_is_missing_from_path() {
+    let fx = Fixture::new("serve-preflight");
+    fx.write("tests/t0", "ok\n");
+    fx.commit_all("seed tests");
+    git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
+    fx.mq_ok(&[
+        "init",
+        "--remote",
+        "origin",
+        "--validator",
+        "command",
+        "--validator-run",
+        "exit 0",
+        "--regen-path",
+        "generated/",
+        "--regen-command",
+        "cargo run --release -- gen",
+    ]);
+    // Fake PATH containing only the always-needed tools, not cargo.
+    let fake_bin = fx.root.join("fake-bin");
+    std::fs::create_dir_all(&fake_bin).unwrap();
+    for tool in ["git", "sh"] {
+        let real = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .map(|dir| dir.join(tool))
+            .find(|candidate| candidate.is_file())
+            .unwrap_or_else(|| panic!("{tool} on test PATH"));
+        std::os::unix::fs::symlink(real, fake_bin.join(tool)).unwrap();
+    }
+    let fake_path = fake_bin.to_string_lossy().into_owned();
+    let out = fx.mq_env(
+        &["serve", "--once", "--poll-ms", "50"],
+        &[("PATH", &fake_path)],
+    );
+    assert!(
+        !out.status.success(),
+        "serve must refuse before its first cycle:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(text.contains("cargo not found"), "{text}");
+    assert!(text.contains("preflight"), "{text}");
+    // Refused at startup: no daemon pid was ever written.
+    assert!(!state_dir(&fx).join("serve.pid").exists());
+}
+
+#[test]
+fn install_serve_unit_renders_an_explicit_toolchain_path() {
+    let fx = setup("install-unit");
+    let toolchain = fx.root.join("toolchain-bin");
+    std::fs::create_dir_all(&toolchain).unwrap();
+    let cargo = toolchain.join("cargo");
+    std::fs::write(&cargo, "#!/bin/sh\nexit 0\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let toolchain_text = toolchain.to_string_lossy().into_owned();
+    let out = fx.mq_ok(&[
+        "install-serve-unit",
+        "--print",
+        "--toolchain-bin",
+        &toolchain_text,
+    ]);
+    assert!(
+        out.contains(&format!(
+            "Environment=PATH={toolchain_text}:/usr/local/bin:/usr/bin:/bin"
+        )),
+        "{out}"
+    );
+    assert!(out.contains("ExecStart="), "{out}");
+    assert!(out.contains(" serve --poll-ms 250"), "{out}");
+    assert!(!out.contains("__TOOLCHAIN_BIN__"), "{out}");
+    // Writing installs exactly what --print renders.
+    let output = fx.root.join("units").join("merge-queue-serve.service");
+    let output_text = output.to_string_lossy().into_owned();
+    let written = fx.mq_ok(&[
+        "install-serve-unit",
+        "--toolchain-bin",
+        &toolchain_text,
+        "--output",
+        &output_text,
+    ]);
+    assert!(written.contains("wrote"), "{written}");
+    let file = std::fs::read_to_string(&output).unwrap();
+    assert!(
+        file.contains(&format!("Environment=PATH={toolchain_text}:")),
+        "{file}"
+    );
+    // A toolchain directory without cargo is refused, naming cargo.
+    let empty = fx.root.join("empty-bin");
+    std::fs::create_dir_all(&empty).unwrap();
+    let empty_text = empty.to_string_lossy().into_owned();
+    let out = fx.mq(&[
+        "install-serve-unit",
+        "--print",
+        "--toolchain-bin",
+        &empty_text,
+    ]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("cargo not found"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn one_shot_shadow_behavior_unchanged_by_serve_shadow() {
     // Guard: adding `serve --shadow` must not change `run --shadow`.
     let fx = setup("serve-shadow-oneshot");
