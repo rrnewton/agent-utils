@@ -1,10 +1,11 @@
 ---
 title: 'local-merge-queue: consumer fit (generated files, exact commits, ready sources, request budget, cross-repo order)'
-status: in_progress
+status: closed
 priority: 1
 issue_type: feature
 created_at: 2026-11-02T04:00:00+00:00
-updated_at: 2026-11-02T04:00:00+00:00
+updated_at: 2026-11-02T05:30:00+00:00
+closed_at: 2026-11-02T05:30:00+00:00
 ---
 
 # Description
@@ -19,3 +20,19 @@ Wanted, generic in this repository:
 4. A request budget for the hosting service's API with batched calls, and fetches without credentials for public repositories.
 5. Failed-tests-only reruns and flaky-pass semantics mapped onto a runner that can rerun only the failed nodes of an earlier run at the same commit.
 6. An updated shadow kit whose plan and dry-run stages stay free of side effects.
+
+# Resolution
+
+[opus 5.5] Delivered on main:
+
+- a3ac9ddb: generated-file regeneration (`--regen-path`, `--regen-command`, `--regen-when`), the exact-commit rule (`--exact-sha`), fast-forward-preserving rebase (a change already on the base lands with its own commit ID), and the queue's commit identity.
+- 19b02e08:
+  - ready sources (`sync --label | --all-open | --file`, one batched list call);
+  - an API request budget with a shareable budget file, `--anonymous-fetch`, and `--close-prs` with postponed closes retried;
+  - cross-repository order (`--peer`, `submit --requires PEER#PR`, `run --with-peers`, exact landing of the required commit, re-checked before landing);
+  - same-commit reruns through `$MQ_HANDLE_FILE` / `$MQ_RERUN_FROM` (a green rerun is a flaky pass), per-step attribution from printed verdict lines, and `--trust-base`.
+- Fix: unreported tests are `missing`, so a change adding a new failing test is blamed on itself, not on the base.
+- Recommended ready source for an agent fleet on one host: direct `submit` (no API request, binds the exact head, records the tests run). Use `sync --label` where people mark changes on the hosting service.
+- The coordinator has an updated shadow kit.
+
+Unverified: no run against the consumer's real pull requests yet (the shadow kit's stages are for that). The consumer's own flags are still to confirm: `--checkout` outside its slots, the rerun syntax, and ledger receipts.
