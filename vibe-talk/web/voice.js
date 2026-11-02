@@ -21091,74 +21091,13 @@ function todoWindowHolds(at) {
 function bookmarkTarget() {
   const anchor = bookmarkAnchor();
   if (!anchor || bookmarkListRefusal(anchor) !== "") return null;
-  // Not a thread's replies a reply gathered into Main (`#410 inline-reply-editor`): the line is Main's.
   const rows = /** @type {HTMLElement[]} */ ([...el("discord-log").children])
     .filter((row) => row.hasAttribute("data-id") && !row.hasAttribute("data-card") && !fromGatheredThread(row));
-  if (rows.length === 0) return null;
-  const id = String(anchor.message_id);
-  let start = rows.findIndex((row) => idsOf(row).includes(id));
-  if (start >= 0) {
-    // Below its message, after that message's row only when the message ends it. A message that has
-    // joined the row since (a combined row) is newer and may be to read, and the line cannot go
-    // inside a row: it goes above it, where it passes over nothing still to read.
-    const held = idsOf(rows[start]);
-    if (anchor.place === "below" && held[held.length - 1] === id) start += 1;
-  } else {
-    const at = Date.parse(String(anchor.timestamp));
-    if (!Number.isFinite(at)) return null;
-    const first = rowSentMs(rows[0]);
-    // Older than every row is older than what is loaded, unless Hide read's list says its window
-    // reaches that far: then the message is read, and the line goes above the first row.
-    if (Number.isFinite(first) && at < first && !todoWindowHolds(at)) return null;
-    // By each row's newest message, so a combined row that only begins before the anchor is not passed.
-    start = rows.findIndex((row) => (anchor.place === "below" ? rowNewestMs(row) > at : rowNewestMs(row) >= at));
-    if (start < 0) start = rows.length;
-  }
-  const shown = rows.slice(start).find(rowShown);
-  if (shown) return { row: shown, place: "above" };
-  const last = rows.filter(rowShown).pop();
-  return last ? { row: last, place: "below" } : null;
-}
-
-/**
- * The line on `row`, made once and kept on it, as a collapsed run's is (`readRunLine`): the word, a
- * separator to a screen reader, and the X at the line's end that takes the bookmark away (`#420
- * bookmark-clear`). The X is a sibling of the word, never inside a separator, whose children a
- * screen reader does not reach. It acts in the column the row was drawn in.
- */
-function bookmarkLineOf(row) {
-  if (row.bookmarkLine) return row.bookmarkLine;
-  const line = document.createElement("div");
-  line.className = "bookmark-line";
-  const word = document.createElement("span");
-  word.className = "bookmark-word";
-  word.setAttribute("role", "separator");
-  word.setAttribute("aria-label", "Bookmark");
-  word.textContent = "Bookmark";
-  const clear = document.createElement("button");
-  clear.className = "bookmark-clear";
-  clear.setAttribute("type", "button");
-  clear.setAttribute("aria-label", BOOKMARK_CLEAR_NAME);
-  clear.setAttribute("title", BOOKMARK_CLEAR_NAME);
-  const mark = document.createElement("span");
-  mark.className = "bookmark-clear-mark";
-  mark.setAttribute("aria-hidden", "true");
-  clear.append(mark);
-  clear.addEventListener("click", inThisColumn((event) => {
-    // The row's own tap would fold the message or read it aloud; this tap is the X's.
-    if (event) event.stopPropagation();
-    const focused = document.activeElement === clear;
-    removeBookmark(currentChannelId());
-    // The X goes with the line, and the focus would fall to the page's top: it goes to the message the
-    // line was above, ringed, as a key or the mouse selects. Not after a tap, which selects silently
-    // (`drawnBy`) and leaves no ring.
-    if (focused && drawnBy() && row.parentNode === el("discord-log") && rowShown(row)) {
-      takeRow(sideActive ? sidePane : channelPane, row, true);
-    }
-  }));
-  line.append(word, clear);
-  row.bookmarkLine = line;
-  return line;
+  // Which row, is web/src/present/rows' `bookmarkSpot`, from what each row holds and when.
+  const spot = bookmarkSpot(rows.map((row) => ({
+    ids: idsOf(row), sentMs: rowSentMs(row), newestMs: rowNewestMs(row), shown: rowShown(row),
+  })), anchor, todoWindowHolds);
+  return spot ? { row: rows[spot.index], place: spot.place } : null;
 }
 
 /**
@@ -21179,32 +21118,7 @@ function placeBookmarkLine() {
   if (!sideActive) adoptLegacyMarker();
   if (settled || (!target && drawn.length === 0)) return;
   // The row's ⋯ item says what it will do: take the line away on the row right under it.
-  const word = (row, above) => {
-    const item = childByClass(row, "row-bookmark-button");
-    const said = above ? "Remove bookmark" : "Bookmark above";
-    if (item && item.textContent !== said) item.textContent = said;
-  };
-  const apply = () => {
-    for (const row of drawn) {
-      if (target && row === target.row) continue;
-      row.removeAttribute("data-bookmark");
-      if (row.bookmarkLine && row.bookmarkLine.parentNode === row) row.removeChild(row.bookmarkLine);
-      word(row, false);
-    }
-    if (!target) return;
-    target.row.setAttribute("data-bookmark", target.place);
-    word(target.row, target.place === "above");
-    const line = bookmarkLineOf(target.row);
-    if (line.parentNode !== target.row) {
-      // After a line between rows drawn above it (`#250 date-separators`): the bookmark is the nearer.
-      // Put in, not the row's children written again, which would take them all out of the document
-      // and back and lose the focus or the selection in any of them (see `placeSeam`).
-      const row = /** @type {any} */ (target.row);
-      const first = row.firstChild;
-      row.insertBefore(line, first !== null && first === row.seamLine ? first.nextSibling : first);
-    }
-  };
-  // The reader does not move: a line drawn or taken away above them changes the height above them.
+  const apply = () => drawBookmarkLine(drawn, target);
   if (!sideActive && currentScreen === "main" && currentView === "discord") preservingScroll(apply);
   else apply();
 }
@@ -21397,6 +21311,20 @@ function toggleBookmarkAt(row) {
 
 /** The X's name, its tooltip too. */
 const BOOKMARK_CLEAR_NAME = "Remove bookmark";
+
+// The line itself, made once on its row and kept, is web/src/view/channel's (`createBookmarkLines`,
+// `#624 voice-page-modularity`); its X takes the bookmark away here.
+const { bookmarkLineOf, drawBookmarkLine } = createBookmarkLines({
+  clearName: BOOKMARK_CLEAR_NAME,
+  clearListener: (row, clear) => inThisColumn((event) => {
+    if (event) event.stopPropagation();
+    const focused = document.activeElement === clear;
+    removeBookmark(currentChannelId());
+    if (focused && drawnBy() && row.parentNode === el("discord-log") && rowShown(row)) {
+      takeRow(sideActive ? sidePane : channelPane, row, true);
+    }
+  }),
+});
 /** How long the Undo chip offers to put a removed bookmark back. */
 const BOOKMARK_UNDO_MS = 10000;
 /**

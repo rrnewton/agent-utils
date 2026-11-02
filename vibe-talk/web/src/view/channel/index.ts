@@ -46,3 +46,5 @@ export { createSeamLines } from "./seams.ts";
 export type { GapLine, PlacedSeam, SeamLines, SeamLinesDependencies, SeamedRow } from "./seams.ts";
 export { HOLD_MS, SWIPE_COMMIT_PX, SWIPE_START_PX, createRowGestures } from "./gestures.ts";
 export type { GestureRow, PlayingReading, RowGestures, RowGesturesDependencies, Tapped, TappedBlock } from "./gestures.ts";
+export { createBookmarkLines } from "./bookmark.ts";
+export type { BookmarkLines, BookmarkLinesDependencies, BookmarkPlace, BookmarkedRow } from "./bookmark.ts";

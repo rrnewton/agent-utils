@@ -5379,9 +5379,9 @@ test("`#249 search-highlight` x `#250 date-separators`: a line drawn above a row
     "      for (const made of pieces) parent.insertBefore(made, piece.node);\n      parent.removeChild(piece.node);",
     "      parent.replaceChildren(...[...parent.childNodes].flatMap((kid) => (kid === piece.node ? pieces : [kid])));"));
   assert.equal(marks.kept.marks, false, "the control marked the hits and kept the focus, so the check proves nothing");
-  const bookmark = await focusAcross(brokenScript(
-    "      row.insertBefore(line, first !== null && first === row.seamLine ? first.nextSibling : first);",
-    "      row.replaceChildren(...(first === row.seamLine ? [first] : []), line, ...row.children.filter((kid) => kid !== row.seamLine));"));
+  const bookmark = await focusAcross(await brokenModule([{ file: "src/view/channel/bookmark.ts",
+    find: "      row.insertBefore(line, first !== null && first === row.seamLine ? first.nextSibling : first);",
+    replace: "      row.replaceChildren(...(first === row.seamLine ? [first] : []), line, ...[...row.children].filter((kid) => kid !== row.seamLine));" }]));
   assert.equal(bookmark.kept.bookmark, false, "the control drew the bookmark and kept the focus, so the check proves nothing");
 });
 

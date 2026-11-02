@@ -242,3 +242,23 @@ test("`#624 voice-page-modularity`: Unpack's state and each thread's own choice,
   for (let at = 0; at < THREAD_CARD_STATES_KEPT + 5; at += 1) packing.choose("C4", `T${at}`, "expanded");
   assert.equal(JSON.parse(kept.get(THREAD_CARD_STATES_KEY)).length, THREAD_CARD_STATES_KEPT);
 });
+
+test("`#624 voice-page-modularity`: where the bookmark's line stands among the rows, from the module alone", () => {
+  const { bookmarkSpot } = ROWS;
+  const row = (ids, sentMs, fields = {}) => ({ ids, sentMs, newestMs: sentMs, shown: true, ...fields });
+  const rows = [row(["1"], 1000), row(["2", "3"], 2000, { newestMs: 2500 }), row(["4"], 3000, { shown: false }), row(["5"], 4000)];
+  const never = () => false;
+  // On the row holding its message; below a row's last message, the next row shown.
+  assert.deepStrictEqual(bookmarkSpot(rows, { message_id: "2", place: "above" }, never), { index: 1, place: "above" });
+  assert.deepStrictEqual(bookmarkSpot(rows, { message_id: "3", place: "below" }, never), { index: 3, place: "above" }, "a hidden row took the line");
+  // A message not loaded: by its time, the first row at or past it.
+  assert.deepStrictEqual(bookmarkSpot(rows, { message_id: "9", place: "above", timestamp: new Date(2400).toISOString() }, never), { index: 1, place: "above" });
+  assert.deepStrictEqual(bookmarkSpot(rows, { message_id: "9", place: "below", timestamp: new Date(2500).toISOString() }, never), { index: 3, place: "above" });
+  // Older than everything loaded: no line, unless the to-do window holds that time.
+  assert.equal(bookmarkSpot(rows, { message_id: "9", place: "above", timestamp: new Date(10).toISOString() }, never), null);
+  assert.deepStrictEqual(bookmarkSpot(rows, { message_id: "9", place: "above", timestamp: new Date(10).toISOString() }, () => true), { index: 0, place: "above" });
+  // Past every row shown: below the last one shown.
+  assert.deepStrictEqual(bookmarkSpot(rows, { message_id: "5", place: "below" }, never), { index: 3, place: "below" });
+  assert.equal(bookmarkSpot(rows, { message_id: "9", place: "above", timestamp: "never" }, never), null);
+  assert.equal(bookmarkSpot([], { message_id: "1" }, never), null);
+});

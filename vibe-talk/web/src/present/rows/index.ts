@@ -59,3 +59,5 @@ export {
   createCardPacking,
 } from "./packing.ts";
 export type { CardPacking, CardPackingDependencies } from "./packing.ts";
+export { bookmarkSpot } from "./bookmark.ts";
+export type { BookmarkAnchorFacts, BookmarkRow } from "./bookmark.ts";
