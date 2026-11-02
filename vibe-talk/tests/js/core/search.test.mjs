@@ -123,3 +123,36 @@ test("`#624 voice-page-modularity`: gathering older history asks, polls while th
   refusing.stop();
   assert.deepStrictEqual({ ...refusing.state() }, { channel: "", run: 0, state: null, timer: null, failed: "" });
 });
+
+test("`#624 voice-page-modularity`: the search field's state, and its hits marked once the typing pauses", () => {
+  const { createSearchField, SEARCH_MARK_DELAY_MS } = SEARCH;
+  assert.equal(SEARCH_MARK_DELAY_MS, 120);
+  const timers = new Map();
+  let next = 0;
+  let redraws = 0;
+  const field = createSearchField({
+    clock: { setTimeout: (run, ms) => { next += 1; timers.set(next, { run, ms }); return next; }, clearTimeout: (h) => timers.delete(h) },
+    redraw: (apply) => { redraws += 1; apply(); },
+  });
+  assert.deepStrictEqual([field.open(), field.query(), field.marked()], [false, "", ""]);
+  field.setOpen(true);
+  field.setQuery("ru");
+  field.markSoon();
+  field.setQuery("run");
+  field.markSoon();
+  assert.equal(timers.size, 1, "each key did not put the marking off");
+  assert.equal([...timers.values()][0].ms, SEARCH_MARK_DELAY_MS);
+  [...timers.values()][0].run();
+  assert.deepStrictEqual([field.marked(), redraws], ["run", 1]);
+  // Marked already: nothing armed, nothing redrawn.
+  field.markSoon();
+  field.markNow();
+  assert.deepStrictEqual([timers.size, redraws], [0, 1]);
+  // Enter: at once, and the pending wait goes.
+  field.setQuery("runner");
+  field.markSoon();
+  field.markNow();
+  assert.deepStrictEqual([field.marked(), redraws, timers.size], ["runner", 2, 0], "Enter left the wait armed");
+  field.setMarked("");
+  assert.equal(field.marked(), "");
+});

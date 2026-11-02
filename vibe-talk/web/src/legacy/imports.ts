@@ -11,6 +11,7 @@
 
 export {
   createGathering,
+  createSearchField,
   createServerSearch,
   searchPositiveTerms,
   searchQueryMatches,

@@ -4300,7 +4300,7 @@ function renderSummaries() {
 function summaryTargets() {
   // `#211 link-filter`. A summary stands in for a row's text, and under the Links filter that text
   // is not on screen: a summary asked for there is one paid for and never seen.
-  if (!summaryRows.mode() || currentView !== "discord" || (searchOpen && linksOnly)) {
+  if (!summaryRows.mode() || currentView !== "discord" || (searchField.open() && linksOnly)) {
     return [];
   }
   // A server that has said it has no summariser will say it again for every row, and each of
@@ -4513,7 +4513,7 @@ function renderJumpNewest() {
  * (`#211 link-filter`): Expand all and Collapse all would change only what cannot be seen.
  */
 function visibleFolds() {
-  if (searchOpen && linksOnly) return [];
+  if (searchField.open() && linksOnly) return [];
   // In the right column while it shows the cards, not its thread's rows, which are not on screen, but
   // the cards' list: the messages unpacked under them, which are folded as a thread's are (`#407
   // unpack-row-parity`), and none where nothing is unpacked, a card being no fold. `#301
@@ -4855,51 +4855,34 @@ function foldStepFromKeyboard(way, event, target = null) {
 // regular expressions from the field and no fuzzy matching — a reader who types `read new` is
 // looking for a row with both words in it, and anything smarter is a second thing to learn.
 
-/** Whether the field is open. Closing it takes the filter off; it is not a separate switch. */
-let searchOpen = false;
-
-/** What is in the field. Read from here rather than from the input, so the filter has one source. */
-let searchQuery = "";
-
 /**
- * The text whose hits are drawn (`#249 search-highlight`): `searchQuery` once the typing pauses.
- *
- * The rows follow the field at every keystroke, as they always have; marking where each hit is
- * splits text in every row shown, and done at every keystroke a word typed at speed is marked and
- * unmarked letter by letter in every match. So the marks follow `SEARCH_MARK_DELAY_MS` after the last
- * key — at once on Enter, and at once when the field is cleared, so no mark outlives its words.
+ * Whether the field is open, what is in it, the text whose hits are drawn once the typing pauses, and that
+ * pause (`SEARCH_MARK_DELAY_MS`) are web/src/core/search's (`createSearchField`, `#624
+ * voice-page-modularity`); filtering the rows and drawing the marks are here.
  */
-let markedQuery = "";
-
-/** How long after the last keystroke the hits are marked. */
-const SEARCH_MARK_DELAY_MS = 120;
-
-/** The marking a keystroke put off, or null. */
-let searchMarkTimer = null;
+const searchField = createSearchField({
+  clock: clockOnUse(),
+  // The reader stays on what they were reading — the message the keystroke's own change held, while it
+  // holds (`captureScroll`) — because the line a folded match grows under it (`searchExcerpt`) is height.
+  redraw: (apply) => {
+    const mark = () => {
+      apply();
+      eachColumn(renderScrollTools);
+      if (sideColumnUp()) filterSideCards();
+    };
+    if (currentScreen === "main") preservingScroll(mark);
+    else mark();
+  },
+});
 
 /** Mark the hits of what is typed once the typing pauses: each key puts it off again. */
 function markSearchSoon() {
-  if (searchMarkTimer !== null) clearTimeout(searchMarkTimer);
-  searchMarkTimer = markedQuery === searchQuery ? null : setTimeout(markSearchNow, SEARCH_MARK_DELAY_MS);
+  searchField.markSoon();
 }
 
-/**
- * Mark the hits of what is typed now: a redraw of both columns' lists that chooses the same rows, so
- * not a filter change. The reader stays on what they were reading — the message the keystroke's own
- * change held, while it holds (`captureScroll`) — because the line a folded match grows under it
- * (`searchExcerpt`) is height.
- */
+/** Mark the hits of what is typed now (`#249 search-highlight`): at once on Enter. */
 function markSearchNow() {
-  if (searchMarkTimer !== null) clearTimeout(searchMarkTimer);
-  searchMarkTimer = null;
-  if (markedQuery === searchQuery) return;
-  const mark = () => {
-    markedQuery = searchQuery;
-    eachColumn(renderScrollTools);
-    if (sideColumnUp()) filterSideCards();
-  };
-  if (currentScreen === "main") preservingScroll(mark);
-  else mark();
+  searchField.markNow();
 }
 
 /**
@@ -5056,15 +5039,15 @@ function applySearch() {
   // hidden behind a line, and closing it collapses them again.
   applyReadRuns();
   // `#606 server-side-search`. The query in the shared language, matched message by message.
-  const node = searchOpen ? searchParsed(searchQuery).node : null;
+  const node = searchField.open() ? searchParsed(searchField.query()).node : null;
   const typed = node !== null;
   // `#249 search-highlight`. Where the hits are drawn: what was typed when the typing paused.
-  const marking = searchOpen ? searchParsed(markedQuery).terms : [];
+  const marking = searchField.open() ? searchParsed(searchField.marked()).terms : [];
   // In Main a root stands for its thread, and among the Threads list's cards a thread with any hit is
   // chosen: the threads whose held replies match.
   const replyHits = typed && threadingSupported && (selection().view === "main" || selection().view === "threads")
     ? threadsWithHits(node) : null;
-  const links = searchOpen && linksOnly;
+  const links = searchField.open() && linksOnly;
   // `#251 author-filter`. Whose messages, ANDed with the rest.
   const author = authorChoosing();
   // `#215 reply-coalesce`. A filter that takes rows away shows a subset of the channel in time order,
@@ -5208,8 +5191,8 @@ function applySearch() {
  * @param {SearchCount | null} searched
  */
 function searchInAllOffered(searched) {
-  return searched !== null && !searched.pinned && searched.matched === 0 && searched.loaded > 0 && searchOpen &&
-    !linksOnly && authorChoosing() === "everyone" && searchTyped(searchQuery) &&
+  return searched !== null && !searched.pinned && searched.matched === 0 && searched.loaded > 0 && searchField.open() &&
+    !linksOnly && authorChoosing() === "everyone" && searchTyped(searchField.query()) &&
     currentView === "discord" && threadingSupported && !sideColumnUp() && selection().view === "main";
 }
 
@@ -5314,7 +5297,7 @@ function renderSearchCount(typed, links, author = false) {
 
 /** The count in the bar again, from what each column last counted: for a change of layout that redrew no row. */
 function refreshSearchCount() {
-  renderSearchCount(searchOpen && searchTyped(searchQuery), searchOpen && linksOnly,
+  renderSearchCount(searchField.open() && searchTyped(searchField.query()), searchField.open() && linksOnly,
     authorChoosing() !== "everyone");
 }
 
@@ -5327,7 +5310,7 @@ let sideCardCount = { cards: 0, shown: 0 };
  * hold neither.
  */
 function sayCardCount() {
-  const typed = searchOpen && searchTyped(searchQuery);
+  const typed = searchField.open() && searchTyped(searchField.query());
   const { cards, shown } = sideCardCount;
   setTextIfChanged(el("search-count"), typed ? `${shown} of ${cards} thread${cards === 1 ? "" : "s"}` : "");
 }
@@ -5392,7 +5375,7 @@ function linksEmptySentence(loaded, tally, matched, author = "everyone") {
   if (matched > 0) return "";
   // `#251 author-filter`. With nothing typed, a link is still shown and none is left: whose messages
   // took them away.
-  if (author !== "everyone" && !searchTyped(searchQuery)) {
+  if (author !== "everyone" && !searchTyped(searchField.query())) {
     return author === "mine" ? "None of your messages loaded so far has a link." :
       "None of the messages from anyone else loaded so far has a link.";
   }
@@ -6480,11 +6463,11 @@ function setSearchOpen(open) {
 function showSearchOpen(open) {
   // `#262 search-load-older`. Closed over a filter choosing rows, Hide read comes back (`hidingRead`).
   const wasHidingRead = hidingRead();
-  searchOpen = open;
+  searchField.setOpen(open);
   if (!open) {
-    searchQuery = "";
+    searchField.setQuery("");
     // `#249 search-highlight`. And its marks, at once.
-    markedQuery = "";
+    searchField.setMarked("");
     markSearchSoon();
     el("search-field").value = "";
     // `#206 pin-message`. The Pinned filter lives in this bar, and goes with it for the reason the
@@ -6758,7 +6741,7 @@ function setLinksOnly(on) {
 /** Whose messages the list shows, its button and its chip. */
 const authorFilters = createAuthorFilter({
   lookup: (id) => el(id),
-  searchOpen: () => searchOpen,
+  searchOpen: () => searchField.open(),
 });
 
 /** The author filter in force: "everyone" while the bar is shut, whatever was last chosen. */
@@ -9046,7 +9029,7 @@ function filterFromKeyboard(which) {
   if (sideActive) return inColumn(columns.main, () => filterFromKeyboard(which));
   // Over the thread list on its own they would filter the column behind it. `#281 view-keys`.
   if (!channelOnScreen() || threadListOnScreen()) return false;
-  if (!searchOpen) setSearchOpen(true);
+  if (!searchField.open()) setSearchOpen(true);
   if (which === "pinned") setPinnedOnly(!pinsView().only);
   else if (which === "author") cycleAuthorFilter();
   else setLinksOnly(!linksOnly);
@@ -9265,7 +9248,7 @@ function channelPicked() {
 function searchFromKeyboard() {
   if (currentScreen === "settings" || currentScreen === "help") closeSettings();
   if (currentScreen !== "main") return false;
-  if (!searchOpen) setSearchOpen(true);
+  if (!searchField.open()) setSearchOpen(true);
   const field = el("search-field");
   field.focus();
   if (typeof field.select === "function") field.select();
@@ -9387,7 +9370,7 @@ function onEscape(event, target) {
   // `#348 settings-dynamic-lists`. The pop-out over Recently dismissed, before Settings itself.
   if (closeOpenMenu("menu:dismissed")) return true;
   if (closeDetailsOn(target)) return true;
-  if (searchOpen && currentScreen === "main") {
+  if (searchField.open() && currentScreen === "main") {
     setSearchOpen(false);
     settleFocus();
     return true;
@@ -10846,7 +10829,7 @@ function renderControlBar() {
   // the glass and its field float over the top of the LIST, so they never compete with the bar
   // for width — in the dock or in the header.
   el("search-toggle").hidden = currentScreen !== "main";
-  el("search-field").hidden = el("search-toggle").hidden || !searchOpen;
+  el("search-field").hidden = el("search-toggle").hidden || !searchField.open();
   el("search-count").hidden = el("search-field").hidden;
   // `#206 pin-message`. Beside the glass while the bar is open, and over the channel only: a pin is
   // a channel message, and the call's transcript has none to filter to.
@@ -12479,7 +12462,7 @@ function renderChannelFreshness() {
   // floating-search` put the search glass on the same line — to the open search bar, which grows
   // along that line across the top of the list.
   pill.hidden = text === "" || currentView !== "discord" ||
-    (!gesture.hidden && gesture.getAttribute("data-edge") !== "end") || searchOpen;
+    (!gesture.hidden && gesture.getAttribute("data-edge") !== "end") || searchField.open();
   reserveFreshnessRoom(text !== "");
 }
 
@@ -21221,7 +21204,7 @@ async function gatherReplies(parent, from, headOf = (id) => (rowHolding(id) ? id
   // A filter that takes rows away would hide replies from the stack the reader just asked for, and
   // putting the replies back is what turning one on does: it is closed, as the jump closes a search
   // that hides the message it is for.
-  if (searchOpen) setSearchOpen(false);
+  if (searchField.open()) setSearchOpen(false);
   await seekMessage(parent, () => {
     const head = gatheringView() ? headOf(parent) : null;
     if (head === null) return false;
@@ -23242,7 +23225,7 @@ const SEARCH_OLDER_HITS = 3;
 const SEARCH_OLDER_TAP_MS = 500;
 
 /** Everything a walk for the search depends on: a change in any of them ends it, and clears its note. */
-const searchKey = () => JSON.stringify([filterKey(), searchOpen ? searchIdentity(searchQuery) : null, searchOpen && linksOnly,
+const searchKey = () => JSON.stringify([filterKey(), searchField.open() ? searchIdentity(searchField.query()) : null, searchField.open() && linksOnly,
   [...linkKinds.hidden()], authorChoosing(), readModes.mode()]);
 
 /**
@@ -23692,7 +23675,7 @@ const serverSearchOwner = createServerSearch({
     const channel = String(selectedChannelId() || "");
     const zone = readerZone();
     const below = more ? resume : searchAllChannels ? null : oldestLoadedMs();
-    const params = [`q=${encodeURIComponent(searchQuery)}`, ...(zone ? [`tz=${encodeURIComponent(zone)}`] : []),
+    const params = [`q=${encodeURIComponent(searchField.query())}`, ...(zone ? [`tz=${encodeURIComponent(zone)}`] : []),
       ...(below !== null && below !== undefined ? [`below=${below}`] : [])].join("&");
     return searchAllChannels ? `/api/v1/search?${params}`
       : `/api/v1/channels/${encodeURIComponent(channel)}/search?${params}`;
@@ -23710,10 +23693,10 @@ const serverCopyOpen = () => serverCacheBox.open() && tokenScope !== "read";
 
 /** What identifies the server's search wanted now, or "" for none. */
 function serverSearchKeyNow() {
-  if (!searchOpen || currentScreen !== "main" || currentView !== "discord" || !searchTyped(searchQuery)) return "";
+  if (!searchField.open() || currentScreen !== "main" || currentView !== "discord" || !searchTyped(searchField.query())) return "";
   const channel = String(selectedChannelId() || "");
   if (!channel) return "";
-  return JSON.stringify([searchAllChannels ? "*" : channel, searchIdentity(searchQuery)]);
+  return JSON.stringify([searchAllChannels ? "*" : channel, searchIdentity(searchField.query())]);
 }
 
 /**
@@ -23839,7 +23822,7 @@ function serverHitNode(hit) {
   body.className = "body";
   body.append(messageBody(hit));
   li.append(meta, body, show);
-  markSearchHits(li, searchParsed(searchQuery).terms);
+  markSearchHits(li, searchParsed(searchField.query()).terms);
   return li;
 }
 
@@ -23987,7 +23970,7 @@ let repliesWalk = null;
 let repliesNote = /** @type {{key: string, text: string} | null} */ (null);
 
 /** Everything the cards' walk depends on: a change in either ends it, and clears its note. */
-const repliesKey = () => JSON.stringify([String(selectedChannelId()), searchOpen ? searchIdentity(searchQuery) : null]);
+const repliesKey = () => JSON.stringify([String(selectedChannelId()), searchField.open() ? searchIdentity(searchField.query()) : null]);
 
 /** All's cover in the selected channel's store, or null where no page of All has covered it. */
 function allCover() {
@@ -24006,7 +23989,7 @@ const sideCardsShown = () => cardsOnScreen() === leftEl("side-cards");
 
 /** Whether the cards offer to search their threads' older replies: see the head of this section. */
 function repliesSearchOffered() {
-  return threadingSupported && sideCardsShown() && searchOpen && searchTyped(searchQuery) &&
+  return threadingSupported && sideCardsShown() && searchField.open() && searchTyped(searchField.query()) &&
     channelStore.current().channel === String(selectedChannelId()) && !channelStore.current().scope && !allLoaded();
 }
 
@@ -24211,7 +24194,7 @@ function searchReplies() {
   const count = () => {
     walk.found = cardsFound().filter((id) => !walk.held.has(id) && walk.brought.has(id)).length;
   };
-  const node = searchParsed(searchQuery).node;
+  const node = searchParsed(searchField.query()).node;
   /** @param {VibeTalk.TimelineResponse} payload */
   const note = (payload) => {
     for (const message of payload.messages || []) {
@@ -25119,7 +25102,7 @@ function openThreadRootId() {
 
 /** Whether a filter is choosing rows: then every match is shown, and no run hides one behind a line. */
 function readRunsSuspended() {
-  return searchOpen && (linksOnly || authorFilters.chosen() !== "everyone" || searchTyped(searchQuery));
+  return searchField.open() && (linksOnly || authorFilters.chosen() !== "everyone" || searchTyped(searchField.query()));
 }
 
 /**
@@ -30025,9 +30008,9 @@ function filterSideCards() {
   unpackSuspendedDrawn = readRunsSuspended();
   // `#606 server-side-search`. The shared language, message by message: a thread with any hit is
   // chosen, by its card's own words or by a reply the page holds.
-  const node = searchOpen ? searchParsed(searchQuery).node : null;
+  const node = searchField.open() ? searchParsed(searchField.query()).node : null;
   const typed = node !== null;
-  const marking = searchOpen ? searchParsed(markedQuery).terms : [];
+  const marking = searchField.open() ? searchParsed(searchField.marked()).terms : [];
   const allRows = /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children]);
   const rows = allRows.filter((row) => row.hasAttribute("data-card"));
   const replyHits = typed ? threadsWithHits(node) : null;
@@ -30262,7 +30245,7 @@ function openUnpackGap(row, below) {
  */
 function drawCardGaps(list) {
   if (!list) return;
-  const searching = searchOpen && searchTyped(searchQuery);
+  const searching = searchField.open() && searchTyped(searchField.query());
   if (!searching) {
     // No grouping to do: only lines a closed search left behind come down, and on most passes
     // there are none — an attribute each, asked on the way past.
@@ -34508,7 +34491,7 @@ function settingsSyncView() {
       keepingFilterPlace(() => {
         linkKinds.reloadRaw();
         renderLinkKinds();
-        if (searchOpen && linksOnly) eachColumn(renderScrollTools);
+        if (searchField.open() && linksOnly) eachColumn(renderScrollTools);
       });
     },
     threadsUnpacked: () => {
@@ -35863,7 +35846,7 @@ el("summarise").addEventListener("click", () => applySummarizeCollapsed(!storedS
 el("jump-newest").addEventListener("click", jumpToNewest);
 // `#129 message-search`. The glass is a toggle, and the second tap is the way out: a control that
 // only ever opens leaves the reader looking for a close button that is not on a phone keyboard.
-el("search-toggle").addEventListener("click", () => setSearchOpen(!searchOpen));
+el("search-toggle").addEventListener("click", () => setSearchOpen(!searchField.open()));
 // `#206 pin-message`. A toggle, like the glass beside it.
 el("pinned-filter").addEventListener("click", () => setPinnedOnly(!pinsView().only));
 // `#211 link-filter`. The same, for links.
@@ -35891,10 +35874,10 @@ el("search-field").addEventListener("input", () => {
   // `#262 search-load-older`. The first term typed, or the last taken away, may make Hide read step
   // aside or come back (`liftingHideRead`).
   keepingFilterPlace(() => liftingHideRead(() => {
-    searchQuery = el("search-field").value;
+    searchField.setQuery(el("search-field").value);
     // `#249 search-highlight`. Cleared — no word left to find — the marks go with the words, in this
     // one redraw; otherwise they follow once the typing pauses (`markedQuery`).
-    if (!searchTyped(searchQuery)) markedQuery = searchQuery;
+    if (!searchTyped(searchField.query())) searchField.setMarked(searchField.query());
     eachColumn(renderScrollTools);
     if (sideColumnUp()) refilterSideCards();
   }));

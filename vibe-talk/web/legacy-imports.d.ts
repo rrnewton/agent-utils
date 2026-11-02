@@ -10,6 +10,7 @@ declare const searchQueryParse: LegacyImports["searchQueryParse"];
 declare const searchQueryTree: LegacyImports["searchQueryTree"];
 declare const searchSubject: LegacyImports["searchSubject"];
 declare const createGathering: LegacyImports["createGathering"];
+declare const createSearchField: LegacyImports["createSearchField"];
 declare const createServerSearch: LegacyImports["createServerSearch"];
 declare const createApi: LegacyImports["createApi"];
 declare const createWebPorts: LegacyImports["createWebPorts"];
