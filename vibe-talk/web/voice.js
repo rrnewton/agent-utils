@@ -25124,29 +25124,31 @@ function searchOlderFromField() {
 // open, and it asks once per search, a moment after the typing pauses; a change of search, channel or
 // the box asks again, and an answer to an older question is dropped.
 
-/** How long after the typing pauses the server is asked. */
-const SERVER_SEARCH_DELAY_MS = 400;
-
 /** Whether the server's search covers every channel (`#search-all-channels`), for this page's life. */
 let searchAllChannels = false;
 
-/** Where the server's search stands for the search typed now. */
-let serverSearch = {
-  key: "",
-  ticket: 0,
-  loading: false,
-  failed: "",
-  /** @type {VibeTalk.Message[]} */
-  hits: [],
-  /** @type {VibeTalk.SearchScope[]} */
-  scopes: [],
-  examined: 0,
-  /** @type {number | null} */
-  resume: null,
-};
+// The search sent to the server — its key, ticket, hits, scopes, how much it examined and where it
+// resumes, and the rest it waits for (SERVER_SEARCH_DELAY_MS) — is web/src/core/search's
+// (`createServerSearch`, `#624 voice-page-modularity`); which search is on screen, its request and
+// drawing what came back are here.
+const serverSearchOwner = createServerSearch({
+  clock: browserPorts().clock,
+  pathFor: (more, resume) => {
+    const channel = String(selectedChannelId() || "");
+    const zone = readerZone();
+    const below = more ? resume : searchAllChannels ? null : oldestLoadedMs();
+    const params = [`q=${encodeURIComponent(searchQuery)}`, ...(zone ? [`tz=${encodeURIComponent(zone)}`] : []),
+      ...(below !== null && below !== undefined ? [`below=${below}`] : [])].join("&");
+    return searchAllChannels ? `/api/v1/search?${params}`
+      : `/api/v1/channels/${encodeURIComponent(channel)}/search?${params}`;
+  },
+  fetchAnswer: (path) => apiDecoded("SearchResponse", path),
+  render: () => renderServerSearch(),
+  guard: (fn) => guardQuietly(fn)(),
+});
 
-/** The timer that asks the server once the typing pauses, or null. */
-let serverSearchTimer = null;
+/** The search sent to the server, as it stands. */
+const serverSearchNow = () => serverSearchOwner.state();
 
 /** Whether the server keeps a copy this page may search: an open cache, and not the read-only token. */
 const serverCopyOpen = () => serverCacheBox.open() && tokenScope !== "read";
@@ -25168,22 +25170,7 @@ function scheduleServerSearch() {
   // A gathering asked for elsewhere, or with the search closed, is no longer watched here; the
   // server's own bump clears itself once the walk reaches the channel's beginning.
   if (searchFurther.channel !== "" && (key === "" || !searchFurtherRunning())) stopSearchFurther();
-  // The same search: drawn again all the same, so the line follows what the page has loaded since
-  // and a hit the page now holds goes.
-  if (key === serverSearch.key) {
-    renderServerSearch();
-    return;
-  }
-  if (serverSearchTimer !== null) clearTimeout(serverSearchTimer);
-  serverSearchTimer = null;
-  serverSearch = { key, ticket: serverSearch.ticket + 1, loading: key !== "" && serverCopyOpen(), failed: "",
-    hits: [], scopes: [], examined: 0, resume: null };
-  renderServerSearch();
-  if (key === "" || !serverCopyOpen()) return;
-  serverSearchTimer = setTimeout(() => {
-    serverSearchTimer = null;
-    guardQuietly(() => runServerSearch(false))();
-  }, SERVER_SEARCH_DELAY_MS);
+  serverSearchOwner.schedule(key, serverCopyOpen());
 }
 
 /** This browser's time zone, which the server resolves `before:` and `after:` in. */
@@ -25195,41 +25182,6 @@ function readerZone() {
   }
 }
 
-/**
- * Ask the server: the hits older than this page's oldest loaded message in this channel, or every
- * channel's newest, and with `more` the next stretch below where the last answer stopped.
- */
-async function runServerSearch(more) {
-  const state = serverSearch;
-  const ticket = state.ticket;
-  const channel = String(selectedChannelId() || "");
-  const zone = readerZone();
-  const below = more ? state.resume : searchAllChannels ? null : oldestLoadedMs();
-  const params = [`q=${encodeURIComponent(searchQuery)}`, ...(zone ? [`tz=${encodeURIComponent(zone)}`] : []),
-    ...(below !== null && below !== undefined ? [`below=${below}`] : [])].join("&");
-  const path = searchAllChannels ? `/api/v1/search?${params}`
-    : `/api/v1/channels/${encodeURIComponent(channel)}/search?${params}`;
-  state.loading = true;
-  renderServerSearch();
-  try {
-    const answer = await apiDecoded("SearchResponse", path);
-    if (serverSearch.ticket !== ticket) return;
-    const known = new Set(state.hits.map((hit) => `${hit.channel_id} ${hit.id}`));
-    state.hits = [...state.hits, ...answer.hits.filter((hit) => !known.has(`${hit.channel_id} ${hit.id}`))];
-    state.scopes = answer.scopes;
-    state.examined += answer.scopes.reduce((sum, scope) => sum + scope.examined, 0);
-    state.resume = typeof answer.resume_below_ms === "number" ? answer.resume_below_ms : null;
-    state.failed = "";
-  } catch (error) {
-    if (serverSearch.ticket !== ticket) return;
-    state.failed = String((error && (error.detail || error.message)) || "the server did not answer");
-  } finally {
-    if (serverSearch.ticket === ticket) {
-      state.loading = false;
-      renderServerSearch();
-    }
-  }
-}
 
 /** Why the server's copy of a channel was not searched, in the owner's words. */
 const SERVER_SEARCH_REASONS = {
@@ -25246,12 +25198,12 @@ const SERVER_SEARCH_REASONS = {
 function serverScopeWords() {
   if (tokenScope === "read") return `server: not searched (${SERVER_SEARCH_REASONS.read_scope})`;
   if (!serverCopyOpen()) return "server: keeps no copy";
-  if (serverSearch.failed) return `server: could not be searched (${serverSearch.failed})`;
-  if (serverSearch.loading && serverSearch.scopes.length === 0) return "server: searching…";
-  const scopes = serverSearch.scopes;
+  if (serverSearchNow().failed) return `server: could not be searched (${serverSearchNow().failed})`;
+  if (serverSearchNow().loading && serverSearchNow().scopes.length === 0) return "server: searching…";
+  const scopes = serverSearchNow().scopes;
   if (scopes.length === 0) return "server: not searched yet";
   const searched = scopes.filter((scope) => scope.state === "searched");
-  const more = serverSearch.resume !== null;
+  const more = serverSearchNow().resume !== null;
   if (searchAllChannels) {
     const whole = searched.filter((scope) => scope.whole).length;
     // Every channel searched reaches back at least as far as the NEWEST of their reaches, and only
@@ -25283,7 +25235,7 @@ function searchScopeLine() {
   const page = historyReadToStart() && historyReach().whole ? "this page: back to the first message"
     : from === null ? "this page: nothing loaded" : `this page: back to ${searchMomentWords(from)}`;
   // Over every channel the server searched this channel's newest too: counted once.
-  const total = (searchAllChannels && serverSearch.scopes.length > 0 ? 0 : loaded) + serverSearch.examined;
+  const total = (searchAllChannels && serverSearchNow().scopes.length > 0 ? 0 : loaded) + serverSearchNow().examined;
   return ["No upstream search", page, serverScopeWords(), searchFurtherWords(),
     `${total} message${total === 1 ? "" : "s"} searched`].filter((part) => part !== "").join(" · ");
 }
@@ -25302,7 +25254,7 @@ function serverHitNode(hit) {
   meta.append(who);
   if (searchAllChannels) {
     // The answer names every channel it searched, the one the page knows by the owner's name.
-    const scope = serverSearch.scopes.find((one) => String(one.channel.id) === String(hit.channel_id));
+    const scope = serverSearchNow().scopes.find((one) => String(one.channel.id) === String(hit.channel_id));
     const where = document.createElement("span");
     where.textContent = `#${channelName(knownChannels.find((one) => String(one.id) === String(hit.channel_id)) ||
       (scope ? scope.channel : { id: hit.channel_id }))}`;
@@ -25339,7 +25291,7 @@ function serverHitNode(hit) {
 /** Draw the server's search as it stands: the line, the hits this page does not already hold, More. */
 function renderServerSearch() {
   const section = el("server-search");
-  const wanted = serverSearch.key !== "";
+  const wanted = serverSearchNow().key !== "";
   if (section.hidden === wanted) section.hidden = !wanted;
   if (!wanted) {
     if (el("server-hits").children.length > 0) el("server-hits").replaceChildren();
@@ -25350,20 +25302,15 @@ function renderServerSearch() {
   if (checkbox.checked !== searchAllChannels) checkbox.checked = searchAllChannels;
   const channel = String(selectedChannelId() || "");
   const held = heldMessagesById();
-  const fresh = serverSearch.hits.filter((hit) => !(String(hit.channel_id) === channel && held.has(String(hit.id))));
+  const fresh = serverSearchNow().hits.filter((hit) => !(String(hit.channel_id) === channel && held.has(String(hit.id))));
   const drawn = [...el("server-hits").children].map((li) => `${li.getAttribute("data-channel")} ${li.getAttribute("data-id")}`);
   const want = fresh.map((hit) => `${hit.channel_id} ${hit.id}`);
   if (drawn.join("\n") !== want.join("\n")) el("server-hits").replaceChildren(...fresh.map(serverHitNode));
-  const more = serverSearch.resume !== null && !serverSearch.loading && !serverSearch.failed;
+  const more = serverSearchNow().resume !== null && !serverSearchNow().loading && !serverSearchNow().failed;
   if (el("server-more").hidden === more) el("server-more").hidden = !more;
   renderSearchFurther();
 }
 
-/** The press of More from the server: the next stretch below where its last answer stopped. */
-function serverSearchMore() {
-  if (serverSearch.resume === null || serverSearch.loading) return Promise.resolve();
-  return runServerSearch(true);
-}
 
 // `#608 server-side-search`. "Search further back": the server is asked to gather this channel's older
 // history next (`#602 history-settings-and-limits`' prioritize, POST .../history/prioritize), at its
@@ -25387,8 +25334,8 @@ const searchFurtherRunning = () => searchFurther.channel !== "" &&
 
 /** Whether Search further back is offered: one channel, a copy the server keeps, not yet whole. */
 function searchFurtherOffered() {
-  if (serverSearch.key === "" || searchAllChannels || !serverCopyOpen() || tokenScope === "read") return false;
-  const scope = serverSearch.scopes[0];
+  if (serverSearchNow().key === "" || searchAllChannels || !serverCopyOpen() || tokenScope === "read") return false;
+  const scope = serverSearchNow().scopes[0];
   return Boolean(scope) && scope.state === "searched" && !scope.whole;
 }
 
@@ -25471,7 +25418,7 @@ function pollSearchFurther(channel, run) {
       (held && typeof held.oldest_ms === "number" ? held.oldest_ms : null);
     if (older(state) !== older(before) || state.complete !== Boolean(before && before.complete)) {
       // The copy grew: the same search, asked again from the start.
-      serverSearch.key = "";
+      serverSearchOwner.forget();
       scheduleServerSearch();
     } else {
       renderServerSearch();
@@ -40097,7 +40044,7 @@ el("load-older").addEventListener("click", guardQuietly(olderControlPressed));
 // `#262 search-load-older`. One column on Main, a search nothing loaded matches: All has the replies.
 leftEl("search-in-all").addEventListener("click", guardQuietly(searchInAll));
 // `#605`-`#608 server-side-search`.
-el("server-more").addEventListener("click", guardQuietly(serverSearchMore));
+el("server-more").addEventListener("click", guardQuietly(() => serverSearchOwner.more()));
 el("search-all-channels").addEventListener("change", () =>
   chooseSearchAllChannels(/** @type {HTMLInputElement} */ (el("search-all-channels")).checked));
 el("search-further").addEventListener("click", guardQuietly(searchFurtherPressed));

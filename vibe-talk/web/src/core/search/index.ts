@@ -19,3 +19,5 @@ export type {
   SearchTree,
   SearchUpstreamPlan,
 } from "./language.ts";
+export { SERVER_SEARCH_DELAY_MS, createServerSearch } from "./server.ts";
+export type { ServerSearch, ServerSearchDependencies, ServerSearchState } from "./server.ts";
