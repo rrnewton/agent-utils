@@ -18,4 +18,4 @@ updated_at: 2026-11-02T19:12:34+00:00
 
 # Notes
 
-[opus 5.5] (a) delivered in 88965b65. A stop is now never a verdict. SIGTERM or SIGINT cancels the validations, records them as cancelled, starts no batch, landing or ejection, and leaves undecided changes queued. A runner or generator killed by an outside signal stops the run with that reason instead of reading as red or `regen-failed`. The shipped unit sets `KillMode=mixed`. Five tests cover it, all failing on the previous code. Open: (b) and (c) need numbers from the consumer's real queue; (d) is low priority.
+[opus 5.5] (a) delivered in d2ccf9a7. A stop is now never a verdict. SIGTERM or SIGINT cancels the validations, records them as cancelled, starts no batch, landing or ejection, and leaves undecided changes queued. A runner or generator killed by an outside signal stops the run with that reason instead of reading as red or `regen-failed`. The shipped unit sets `KillMode=mixed`. Five tests cover it, all failing on the previous code. Open: (b) and (c) need numbers from the consumer's real queue; (d) is low priority.
