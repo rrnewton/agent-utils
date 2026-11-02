@@ -182,3 +182,26 @@ test("`#728 vt-quote-read-threshold`: how much of a message a reply's opening qu
   assert.equal(quoteMarksRead(0.05, 5), true, "a quote of exactly the share left its message unread");
   assert.equal(quoteMarksRead(0, 0), true, "at 0% a reply left its message unread");
 });
+
+test("`#624 voice-page-modularity`: the lines between rows — a day rule, a run's days, an unmatched gap and one after the last row — from the module alone", () => {
+  const { seamPlan } = ROWS;
+  const clock = { now: new Date(2026, 9, 12, 15), today: 20261012, yesterday: 20261011, year: 2026 };
+  const row = (day, fields = {}) => ({ role: null, shown: true, day, count: 1, ...fields });
+  // Each day said once, above the first row of it.
+  const days = seamPlan([row(20261010), row(20261010), row(20261012)], false, clock);
+  assert.deepStrictEqual([...days.wanted.entries()].map(([at, lines]) => [at, lines.above && lines.above.kind, lines.above && lines.above.words]),
+    [[0, "day", "Oct 10, Sat"], [1, null, null], [2, "day", "Today, Oct 12, Mon"]]);
+  // A collapsed run's head says the days it brings; its members are said by it and want nothing.
+  const run = seamPlan([row(20261010, { role: "head" }), row(20261011, { role: "member", shown: false }), row(20261012)], false, clock);
+  assert.equal(run.runDays.get(0), "Oct 10 – Yesterday");
+  assert.equal(run.wanted.has(1), false);
+  // While a filter chooses rows, the hidden messages are a gap above the next row shown, with their days;
+  // after the last row shown, a gap below it.
+  const gaps = seamPlan([row(20261010), row(20261011, { shown: false, count: 3 }), row(20261012), row(20261012, { shown: false, count: 2 })], true, clock);
+  assert.equal(gaps.wanted.get(2).above.kind, "gap");
+  assert.match(gaps.wanted.get(2).above.words, /3\sunmatched\smessages/);
+  assert.equal(gaps.wanted.get(2).below.kind, "gap");
+  assert.match(gaps.wanted.get(2).below.words, /2\sunmatched\smessages/);
+  // Without the filter the same hidden rows are no gap: only the days.
+  assert.equal(seamPlan([row(20261010), row(20261011, { shown: false, count: 3 }), row(20261012)], false, clock).wanted.get(2).above.kind, "day");
+});

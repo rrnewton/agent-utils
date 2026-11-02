@@ -5204,7 +5204,7 @@ test("`#250 date-separators`: one day is said in the owner's words by `dayLabel`
 
 test("`#250 date-separators`: a range stays compact — across a year, within a month of a past year, and ending Today or Yesterday", async () => {
   const page = newPage();
-  const range = page.preludeBinding("dayRangeWords");
+  const range = PRESENT_TIME.dayRangeWords;
   const clockNow = page.preludeBinding("dayClock");
   clockAt(page, 10, 12);
   const now = clockNow();
@@ -5372,7 +5372,8 @@ test("`#249 search-highlight` x `#250 date-separators`: a line drawn above a row
   assert.equal(lost, 0, "a pass over the rows took something with the focus out of the document");
   // The controls: each line put in by writing the row's children again, as before. The fixture loses
   // the focus as a browser does, so the checks above can fail.
-  const seam = await focusAcross(brokenScript("    else row.insertBefore(line, row.firstChild);", "    else row.replaceChildren(line, ...row.children);"));
+  const seam = await focusAcross(await brokenModule([{ file: "src/view/channel/seams.ts",
+    find: "      else row.insertBefore(line, row.firstChild);", replace: "      else row.replaceChildren(line, ...row.children);" }]));
   assert.equal(seam.kept.seam, false, "the control drew the line above the row and kept the focus, so the check proves nothing");
   const marks = await focusAcross(brokenScript(
     "      for (const made of pieces) parent.insertBefore(made, piece.node);\n      parent.removeChild(piece.node);",

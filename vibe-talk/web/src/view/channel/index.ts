@@ -42,3 +42,5 @@ export type { DrawnLink } from "./links.ts";
 export { fromGatheredThread, gutterPiece, headerLayout, quoteLabelFits, setArrowReach, setMarkerLift, stackUnder } from "./replies.ts";
 export { cardGapGroups, cardGapTally, cardRootOf, cardRunIds, fillCardText, markCardLayout, rowSeen, threadCardId } from "./cards.ts";
 export type { CardGapGroup, CardRow } from "./cards.ts";
+export { createSeamLines } from "./seams.ts";
+export type { GapLine, PlacedSeam, SeamLines, SeamLinesDependencies, SeamedRow } from "./seams.ts";

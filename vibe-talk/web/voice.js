@@ -6051,6 +6051,22 @@ function openedGapIds(create) {
   return made;
 }
 
+// The lines themselves, made once on their row and kept, are web/src/view/channel's (`createSeamLines`,
+// `#624 voice-page-modularity`); what a press of a gap's line opens is here.
+const { seamLineOf, seamDrawn, placeSeam } = createSeamLines({
+  gapListener: (row, below, line) => inThisColumn((event) => {
+    // The row's own tap would select or open it; this tap is the line's alone, as a run's is.
+    if (event) event.stopPropagation();
+    const focused = document.activeElement === line && line.matches(":focus-visible");
+    const first = line.gapUnpack ? openUnpackGap(row, below)
+      : line.gapCards ? openCardGap(row, below) : openSearchGap(row, below);
+    if (focused && first) {
+      first.setAttribute("tabindex", "-1");
+      first.focus({ preventScroll: true });
+    }
+  }),
+});
+
 /** Whether `row` stands in an opened run: every message it holds was in one the reader opened. */
 function inOpenedGap(row, opened) {
   if (!opened || opened.size === 0) return false;
@@ -6087,104 +6103,6 @@ function openSearchGap(row, below) {
   if (currentScreen === "main" && currentView === "discord") preservingScroll(applySearch);
   else applySearch();
   return first;
-}
-
-/**
- * The line on `row` above it (`below` false) or below it, made once and kept on it. A gap's line is
- * a button (`#439 search-unmatched-separators`), as a collapsed run's is; a day's stays a separator.
- * A row whose line changed kind — a filter closed over the same boundary — gets the other element.
- */
-function seamLineOf(row, below, seam) {
-  const control = seam !== null && seam.kind === "gap";
-  let held = below ? row.seamBelowLine : row.seamLine;
-  if (held && (String(held.tagName).toLowerCase() === "button") !== control) {
-    // A keyboard tabbed onto the line going is left on its row by `placeSeam`, not on nothing.
-    if (document.activeElement === held) row.seamRefocus = true;
-    if (held.parentNode === row) row.removeChild(held);
-    held = null;
-    if (below) row.seamBelowLine = null;
-    else row.seamLine = null;
-  }
-  if (held) {
-    /** @type {any} */ (held).gapCards = Boolean(seam && seam.cards);
-    /** @type {any} */ (held).gapUnpack = Boolean(seam && seam.unpack);
-    const classes = (below ? "row-seam row-seam-below" : "row-seam") + (seam && seam.cards ? " card-seam" : "");
-    if (held.className !== classes) held.className = classes;
-    return held;
-  }
-  const line = document.createElement(control ? "button" : "div");
-  line.className = (below ? "row-seam row-seam-below" : "row-seam") + (seam && seam.cards ? " card-seam" : "");
-  /** @type {any} */ (line).gapCards = Boolean(seam && seam.cards);
-  /** @type {any} */ (line).gapUnpack = Boolean(seam && seam.unpack);
-  if (control) {
-    line.setAttribute("type", "button");
-    line.addEventListener("click", inThisColumn((event) => {
-      // The row's own tap would select or open it; this tap is the line's alone, as a run's is.
-      if (event) event.stopPropagation();
-      const focused = document.activeElement === line && line.matches(":focus-visible");
-      const first = /** @type {any} */ (line).gapUnpack ? openUnpackGap(row, below)
-        : /** @type {any} */ (line).gapCards ? openCardGap(row, below) : openSearchGap(row, below);
-      if (focused && first) {
-        first.setAttribute("tabindex", "-1");
-        first.focus({ preventScroll: true });
-      }
-    }));
-  } else {
-    line.setAttribute("role", "separator");
-  }
-  if (below) row.seamBelowLine = line;
-  else row.seamLine = line;
-  return line;
-}
-
-/** Whether `row` has, above it (`below` false) or below it, exactly the line `seam` says — or none, for null. */
-function seamDrawn(row, seam, below) {
-  const held = below ? row.seamBelowLine : row.seamLine;
-  const drawn = Boolean(held && held.parentNode === row);
-  if (!seam) return !drawn;
-  return drawn && held.textContent === seam.words && row.getAttribute(below ? "data-seam-below" : "data-seam") === seam.kind &&
-    (String(held.tagName).toLowerCase() === "button") === (seam.kind === "gap") &&
-    Boolean(held.gapCards) === Boolean(seam.cards) && Boolean(held.gapUnpack) === Boolean(seam.unpack);
-}
-
-/** Put `row`'s line above it, or below it, as `seam` says: `{kind, words}`, or null for none. */
-function placeSeam(row, seam, below) {
-  if (seamDrawn(row, seam, below)) return;
-  const attribute = below ? "data-seam-below" : "data-seam";
-  if (!seam) {
-    const held = below ? row.seamBelowLine : row.seamLine;
-    const focused = held && document.activeElement === held;
-    if (held && held.parentNode === row) row.removeChild(held);
-    row.removeAttribute(attribute);
-    if (focused) {
-      row.setAttribute("tabindex", "-1");
-      row.focus({ preventScroll: true });
-    }
-    return;
-  }
-  const line = seamLineOf(row, below, seam);
-  if (line.textContent !== seam.words) {
-    line.textContent = seam.words;
-    // A gap's line is pressed, so its name says the act, as a collapsed run's title does.
-    const label = seam.kind === "gap" ? `Show ${lineLabel(seam.words)}` : lineLabel(seam.words);
-    line.setAttribute("aria-label", label);
-    if (seam.kind === "gap") line.setAttribute("title", label);
-  }
-  row.setAttribute(attribute, seam.kind);
-  if (line.parentNode !== row) {
-    // Above: first, ahead of the bookmark's line, which sits nearer the row. Below: last. Put in, not
-    // the row's children written again: that would take every one of them out of the document and
-    // back, and the browser drops the focus and the selection of whatever it takes out — a reader
-    // tabbed onto a row's Reply when midnight draws its day's rule would be left on nothing.
-    if (below) row.append(line);
-    else row.insertBefore(line, row.firstChild);
-  }
-  if (row.seamRefocus) {
-    row.seamRefocus = false;
-    const target = seam.kind === "gap" ? line : row;
-    target.setAttribute("tabindex", "-1");
-    target.focus({ preventScroll: true });
-  }
 }
 
 // `#250 date-separators`. The owner: "It would also be good to have temporal markers, intelligently.
@@ -6240,59 +6158,16 @@ function seamsFor(list) {
   const rows = /** @type {any[]} */ ([...list.children]).filter((row) => isMessageRow(row) && !row.hasAttribute("data-card"));
   const gaps = rowsChosen();
   const clock = dayClock();
+  // What the lines say is web/src/present/rows' `seamPlan`, from what each row is.
+  const plan = seamPlan(rows.map((row) => ({
+    role: row.getAttribute("data-read-run"), shown: rowShown(row), day: rowDay(row), count: idsOf(row).length,
+  })), gaps, clock);
   /** @type {Map<any, {above: Seam | null, below: Seam | null}>} */
   const wanted = new Map();
+  for (const [at, lines] of plan.wanted) wanted.set(rows[at], lines);
   /** @type {Map<any, string>} */
   const runDays = new Map();
-  // The latest day already said, and the stretch since the last row shown: its messages, its days.
-  let said = null;
-  let hidden = 0;
-  let hiddenDays = [];
-  let last = null;
-  // The days among `days` later than the last said, as `{from, to}`, or null.
-  const fresh = (days) => {
-    const later = days.filter((day) => day !== null && (said === null || day > said));
-    return later.length ? { from: Math.min(...later), to: Math.max(...later) } : null;
-  };
-  for (let at = 0; at < rows.length; at += 1) {
-    const row = rows[at];
-    const role = row.getAttribute("data-read-run");
-    // A row hidden in a collapsed run is said by its run's line.
-    if (role === "member") continue;
-    if (!rowShown(row)) {
-      hidden += idsOf(row).length;
-      hiddenDays.push(rowDay(row));
-      continue;
-    }
-    if (role === "head") {
-      // The run's line says the days the run brings, from the first of them to its last.
-      const days = [rowDay(row)];
-      for (let next = at + 1; next < rows.length && rows[next].getAttribute("data-read-run") === "member"; next += 1) {
-        days.push(rowDay(rows[next]));
-      }
-      const span = fresh([...hiddenDays, ...days]);
-      runDays.set(row, span ? dayRangeWords(span.from, span.to, clock) : "");
-      if (span) said = span.to;
-      wanted.set(row, { above: null, below: null });
-    } else {
-      const own = rowDay(row);
-      const span = fresh([...hiddenDays, own]);
-      // Up to the row's own day, which the line stands right above.
-      const days = span ? dayRangeWords(span.from, own === null ? span.to : own, clock) : "";
-      let above = null;
-      if (gaps && hidden > 0) above = { kind: "gap", words: gapWords(hidden, days) };
-      else if (days) above = { kind: "day", words: days };
-      wanted.set(row, { above, below: null });
-      if (span) said = Math.max(span.to, own === null ? span.to : own);
-    }
-    hidden = 0;
-    hiddenDays = [];
-    last = row;
-  }
-  if (last && gaps && hidden > 0) {
-    const span = fresh(hiddenDays);
-    wanted.get(last).below = { kind: "gap", words: gapWords(hidden, span ? dayRangeWords(span.from, span.to, clock) : "") };
-  }
+  for (const [at, days] of plan.runDays) runDays.set(rows[at], days);
   return { rows, wanted, runDays, today: clock.today };
 }
 

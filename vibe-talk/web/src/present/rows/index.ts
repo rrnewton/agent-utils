@@ -46,3 +46,5 @@ export type { ReactionTally } from "./rowdata.ts";
 export { QUOTE_MAX_CHARS, quoteBlock, quoteMarksRead, quoteShare, quotedHead } from "./quote.ts";
 export { countOf, replyMarkerName } from "./replies.ts";
 export { mainRunsAmong } from "./mainruns.ts";
+export { seamPlan } from "./seams.ts";
+export type { Seam, SeamPlan, SeamRow } from "./seams.ts";
