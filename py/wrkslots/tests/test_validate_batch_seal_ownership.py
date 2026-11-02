@@ -271,7 +271,7 @@ def test_failed_seal_rewrite_still_retires_the_invocations_seal(
     ]
 
 
-@pytest.mark.parametrize("sealer", ("dead", "live", "live-with-wrkslots-operator"))
+@pytest.mark.parametrize("sealer", ("dead", "live", "live-with-wrkslots-operator", "live-with-unrelated-wrkslots-operator"))
 def test_seal_whose_target_was_reaped_does_not_deadlock_absent_row_recovery(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -328,15 +328,18 @@ def test_seal_whose_target_was_reaped_does_not_deadlock_absent_row_recovery(
     sealed = seal.read_bytes()
 
     operator = None
-    if sealer == "live-with-wrkslots-operator":
+    if sealer in ("live-with-wrkslots-operator", "live-with-unrelated-wrkslots-operator"):
         # A process whose command line runs wrkslots, standing in for the
-        # removal that wrote the seal.
+        # removal that wrote the seal. A real removal names its slot: an
+        # operator on the sealed slot holds the seal open, while one on an
+        # unrelated slot (2026-11-02 live-coordinator deadlock) does not.
         # sys.executable, not a "python3" launcher that could leave the real
         # interpreter behind as an orphan when only the launcher is killed.
         operator = subprocess.Popen(
             [
                 sys.executable, "-c", "import time; time.sleep(120)",
                 "-m", "wrkslots", "--project-root", str(project), "remove",
+                "target" if sealer == "live-with-wrkslots-operator" else "other-slot",
             ]
         )
     try:
@@ -605,3 +608,8 @@ def test_only_wrkslots_processes_of_this_project_can_hold_a_seal_open(tmp_path: 
     process(14, ["bash", "/x/ci-hub/bin/wrkslots", "remove-validate-batch"], project / ".")
     process(15, ["python3", "/a/py/wrkslots/__main__.py", f"--project-root={project}", "retire-pending"], tmp_path)
     assert sorted(wrkslots._other_live_wrkslots_processes(project, proc)) == [13, 14, 15]
+    # With sealed targets named, only a process acting on one of them
+    # counts; unrelated removals and creates do not hold the seal open.
+    process(18, ["python3", "-m", "wrkslots", "--project-root", str(project), "remove", "sealed-slot"], tmp_path)
+    assert wrkslots._other_live_wrkslots_processes(project, proc, targets=("sealed-slot",)) == [18]
+    assert wrkslots._other_live_wrkslots_processes(project, proc, targets=("never-mentioned",)) == []

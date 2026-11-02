@@ -18761,7 +18761,9 @@ def _wrkslots_project_of(argv: Sequence[str], cwd: Path | None) -> Path | None:
 
 
 def _other_live_wrkslots_processes(
-    project_root: Path, proc_root: Path = Path("/proc")
+    project_root: Path,
+    proc_root: Path = Path("/proc"),
+    targets: Sequence[str] = (),
 ) -> list[int]:
     """PIDs of every live wrkslots removal process for this project except this one.
 
@@ -18771,6 +18773,13 @@ def _other_live_wrkslots_processes(
     cannot be told (its working directory is unreadable) counts, and so does a
     process whose command line cannot be read for any reason other than its
     exit, so an unreadable host never proves that none is running.
+
+    When ``targets`` names sealed slots or paths, only a process whose
+    command line mentions one of them can be acting on those targets and
+    counts: an unrelated validate create or removal on a busy host must
+    not hold another slot's seal open forever (2026-11-02: a live
+    coordinator's absent-target seal could never be recovered while any
+    wrkslots process existed on the host).
     """
 
     def same_project(candidate: Path | None) -> bool:
@@ -18807,6 +18816,14 @@ def _other_live_wrkslots_processes(
             continue
         argv = [part.decode(errors="surrogateescape") for part in raw.split(b"\0") if part]
         if not _is_wrkslots_command(argv):
+            continue
+        if targets and not any(
+            part == target
+            or f"/{target}/" in part
+            or part.endswith(f"/{target}")
+            for target in targets
+            for part in argv
+        ):
             continue
         try:
             cwd: Path | None = Path(os.readlink(entry / "cwd"))
@@ -36759,7 +36776,13 @@ def _recover_validate_batch_seal_journal(
     # a seal for an absent target while the lane lived on, and every
     # validate-run on the host refused for nine hours.
     no_wrkslots_operator = actor_state != "dead" and not _other_live_wrkslots_processes(
-        config.root
+        config.root,
+        targets=tuple(
+            dict.fromkeys(
+                [slot for slot, _generation, _target in targets]
+                + [str(target.path) for _slot, _generation, target in targets]
+            )
+        ),
     )
     for slot, generation, target in targets:
         current = records.get(slot)
