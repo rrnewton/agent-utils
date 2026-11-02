@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::git::Git;
 use crate::model::{now, ItemStatus};
+use crate::notify;
 use crate::ops;
 use crate::run::{RunOptions, Runner};
 use crate::state::{write_json, Config, State};
@@ -264,6 +265,8 @@ pub struct ServeOptions {
     pub depth: Option<usize>,
     /// Override the configured maximum batch size for work cycles.
     pub max_batch: Option<usize>,
+    /// Override the configured agentctl command for push notifications.
+    pub agentctl: Option<Vec<String>>,
 }
 
 impl Default for ServeOptions {
@@ -274,6 +277,7 @@ impl Default for ServeOptions {
             once: false,
             depth: None,
             max_batch: None,
+            agentctl: None,
         }
     }
 }
@@ -468,6 +472,20 @@ pub fn serve(state: &State, options: &ServeOptions) -> Result<i32, String> {
             }
         } else {
             heartbeat.state = "idle".to_owned();
+        }
+
+        // Push notifications for whatever this cycle (or a CLI command
+        // since the last cycle) changed. Best-effort by design: a failed
+        // send is logged and retried on a later cycle, never fatal here.
+        let notifier = notify::Notifier::resolve(options.agentctl.as_deref(), &config);
+        match notify::sweep(state, &config, &notifier) {
+            Ok(sent) if sent > 0 => {
+                eprintln!("merge-queue serve: sent {sent} notification(s)");
+            }
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("merge-queue serve: notification sweep failed: {error}");
+            }
         }
 
         heartbeat.touch();

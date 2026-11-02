@@ -13,6 +13,7 @@ pub mod cli;
 pub mod git;
 pub mod github;
 pub mod model;
+pub mod notify;
 pub mod ops;
 pub mod plan;
 pub mod probe_cache;

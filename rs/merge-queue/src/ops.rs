@@ -122,6 +122,9 @@ pub struct Submission {
     pub priority: i64,
     /// Submitter.
     pub by: String,
+    /// agentctl session name to notify on state changes; empty keeps any
+    /// name a previous submission recorded.
+    pub notify: String,
     /// One-line description.
     pub title: String,
     /// Changes that must land first.
@@ -193,6 +196,18 @@ fn submit_resolved(
         ));
     }
     let existing = state.item(submission.pr)?;
+    // A notification name is a subscription: a resubmission that does not
+    // name one keeps the recorded name and its delivery record.
+    let notify = if submission.notify.is_empty() {
+        existing
+            .as_ref()
+            .map_or_else(String::new, |old| old.notify.clone())
+    } else {
+        submission.notify.clone()
+    };
+    let notify_delivery = existing
+        .as_ref()
+        .map_or_else(Default::default, |old| old.notify_delivery.clone());
     // A resubmission at a new head is a new validation attempt: clear any refusal deferral.
     // A resubmission at the same head keeps the count so backoff is not reset by resubmitting.
     let same_head = existing.as_ref().is_some_and(|old| old.head == current);
@@ -203,6 +218,8 @@ fn submit_resolved(
         priority: submission.priority,
         submitted_at: now(),
         submitted_by: submission.by,
+        notify,
+        notify_delivery,
         title: submission.title,
         after: submission.after,
         solo: submission.solo,

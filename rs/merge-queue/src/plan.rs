@@ -768,6 +768,8 @@ mod unit {
             priority,
             submitted_at: at.to_owned(),
             submitted_by: String::new(),
+            notify: String::new(),
+            notify_delivery: crate::model::NotifyDelivery::default(),
             title: String::new(),
             after: vec![],
             solo: false,

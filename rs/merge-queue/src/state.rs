@@ -10,6 +10,7 @@
 //!   union.attributes       fixed: generated from `union_paths`, when set
 //!   api-budget.json        fixed: API requests charged in the last hour (bounded)
 //!   items/<pr>.json        one record per submitted change
+//!   notifications/         notification reports sent by the daemon (`notify`)
 //!   runs/<run-id>/         one directory per `run`: plan, events, validations, report
 //!   obligations/<id>.json  one record per focused landing still owed a complete run
 //!   scratch/<name>/        candidate worktrees, removed after use
@@ -231,6 +232,17 @@ pub fn classify(rules: &[ClassRule], failed: &[crate::tests::TestId]) -> Vec<Str
     classes
 }
 
+/// Push notifications on item state changes, sent by the `serve` daemon
+/// through an agentctl-compatible command.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NotifyConfig {
+    /// Command (and leading arguments) to run instead of `agentctl`, e.g. a
+    /// test fake or a wrapper. Empty means `agentctl` on `PATH`. The daemon
+    /// runs `<command> send <name> --deliver-while-working --file <report>`.
+    pub agentctl: Vec<String>,
+}
+
 /// Identity for commits the queue creates.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -298,6 +310,8 @@ pub struct Config {
     pub validator: ValidatorConfig,
     /// Landing configuration.
     pub land: LandConfig,
+    /// Push-notification configuration (state-change messages via agentctl).
+    pub notify: NotifyConfig,
 }
 
 impl Default for Config {
@@ -323,6 +337,7 @@ impl Default for Config {
             peers: std::collections::BTreeMap::new(),
             validator: ValidatorConfig::default(),
             land: LandConfig::default(),
+            notify: NotifyConfig::default(),
         }
     }
 }

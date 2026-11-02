@@ -105,6 +105,7 @@ This command creates the state directory and writes `config.json`.
 | `--api-budget-file PATH` | state directory | Budget file to share with every other queue on the host, so they all draw on one hourly allowance. |
 | `--anonymous-fetch` | off | Fetch without credentials (public repositories). Credential helpers are disabled for fetches, so a fetch never spends a credential use. |
 | `--close-prs` | off | After landing, close each landed pull request with a comment naming the landed commit. Uses the budget; a close it cannot make now is retried by `sync`. |
+| `--agentctl WORD` | `agentctl` | Command (and leading arguments) the `serve` daemon runs instead of `agentctl` for state-change notifications. Repeatable. |
 | `--net-wrapper WORD` | none | A command prefix for network Git operations, for example `--net-wrapper with-proxy`. Repeat it for a prefix of several words. |
 | `--validator KIND` | empty | `command` or `dagrun` (see "Validators"). `run` refuses to start without one. |
 | `--validator-run CMD` | empty | For `command`: the shell template that runs a selection. |
@@ -139,6 +140,8 @@ and sets its status back to `queued`.
 | `--after PR` | none | A change that must land first. Repeatable. |
 | `--solo` | off | Validate and land this change in a batch of its own. Use it for risky changes. |
 | `--by NAME` | empty | Who is submitting (an agent or a person). |
+| `--notify NAME` | empty | agentctl session name the `serve` daemon notifies exactly once per state change (landed, ejected, refusal-deferred, withdrawn). Stored on the item next to `submitted_by`; resubmitting without it keeps the recorded name. Ready files set it per line with `notify=NAME`. |
+| `--notify NAME` | empty | agentctl session name the `serve` daemon notifies exactly once per state change (landed, ejected, refusal-deferred, withdrawn). Stored on the item next to `submitted_by`; resubmitting without it keeps the recorded name. Ready files set it per line with `notify=NAME`. |
 | `--title TEXT` | empty | A one-line description. |
 | `--tested-with SELECTION` | none | The tests you ran on this head: `all`, a comma- or space-separated list of test IDs, or `@FILE` with one ID per line (`#` starts a comment). This becomes the change's validation claim. Without it, the change has no claim. |
 | `--policy NAME` | `manual` | The name of the policy that chose `--tested-with`, for example `path-routing`. |
@@ -167,7 +170,7 @@ Priorities come from labels such as `p10` or `priority-10`, the landing planner'
 lower lands first, and the default is 100. When `--close-prs` is set, `sync` also retries closes
 that were postponed. Exit status is 1 if any submission was refused.
 
-Ready-file lines look like `PR [SHA] [head=REF] [priority=N] [after=N,N] [solo] [by=NAME]`, and
+Ready-file lines look like `PR [SHA] [head=REF] [priority=N] [after=N,N] [solo] [by=NAME] [notify=NAME]`, and
 `#` starts a comment. Without `head=`, the head is `refs/pull/PR/head`.
 
 ### `merge-queue withdraw PR`
@@ -242,6 +245,17 @@ pid file, a crash leaves it behind for `status` to report.
 | `--once` | off | Run at most one work cycle, then exit. For scripts and tests. |
 | `--depth N` | the configured `depth` | Override the initial window for work cycles. |
 | `--max-batch N` | the configured `max_batch` | Override the batch size for work cycles. |
+| `--agentctl WORD` | configured | Command (and leading arguments) to run instead of the configured agentctl for notifications. Repeatable. Supplement: `MERGE_QUEUE_AGENTCTL` (shell-style words) when neither flag nor config names one. |
+
+## Notifications
+
+A change submitted with `--notify NAME` (or a ready-file `notify=NAME`) gets exactly one push message per state change — `landed`, `ejected`, `refusal-deferred`, `withdrawn` — from the `serve` daemon:
+
+```text
+agentctl send NAME --deliver-while-working --file <state>/notifications/<report>.md
+```
+
+The report names the change, the exact candidate (submitted head) SHA, the verdict, the landed base commit (or the failing tests / refusal detail and retry time), and the run-report path. Delivery state (transition key, attempts, delivered flag, last error) is persisted on the item record as `notify_delivery`, so daemon restarts and extra cycles never resend a delivered transition. A failed send — including a missing agentctl binary (126/127 are failures, never success) — is logged to the daemon's stderr and the item's history, retried on later cycles at most 3 times in total, and never blocks or fails the queue. The command is configured with `init --agentctl WORD...` (stored as `notify.agentctl`), overridden per daemon with `serve --agentctl WORD...`, and supplemented by `MERGE_QUEUE_AGENTCTL`.
 
 ### `merge-queue status`
 
@@ -453,6 +467,8 @@ on which files two changes share.
   serve.heartbeat.json   fixed: `serve` heartbeat, rewritten every cycle
   union.attributes       fixed: generated from union_paths, when set
   items/<pr>.json        one record per submitted change
+  notifications/        notification report files the daemon sends with `--file`
+  notifications/        notification report files the daemon sends with `--file`
   runs/<run-id>/         one directory per run (layout below)
   obligations/<id>.json  one record per focused landing still owed a complete run
   scratch/slot-<n>/      one reused worktree per concurrent validation
@@ -472,7 +488,7 @@ another writer holds it.
 
 An **item record** (`items/<pr>.json`) has these fields:
 
-- `pr`, `head_ref`, `head`, `priority`, `submitted_at`, `submitted_by`, `title`, `after`, `solo`.
+- `pr`, `head_ref`, `head`, `priority`, `submitted_at`, `submitted_by`, `notify`, `notify_delivery`, `title`, `after`, `solo`.
 - `claim`: `{selection, policy, scope, commit}`. `selection` is `{"kind":"all"}` or
   `{"kind":"tests","tests":["step","step::case"]}`.
 - `status`: `queued`, `landed`, `ejected` or `withdrawn`.
@@ -506,6 +522,7 @@ An **item record** (`items/<pr>.json`) has these fields:
 | `github` | empty | `{repo, gh, max_per_hour, budget_file, anonymous_fetch}`; see "Ready sources and the request budget". |
 | `validator` | empty | How validation runs; see below. |
 | `land` | `push` from `init` | How a validated candidate reaches the base; see below. |
+| `notify` | empty | `{agentctl}` command words for state-change notifications (see "Notifications"). |
 
 **`validator`** fields (the `init` flags of the same names set them):
 

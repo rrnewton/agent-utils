@@ -12,8 +12,8 @@ use crate::plan::{render, short};
 use crate::run::{self, RunOptions, RunReport, Runner};
 use crate::serve::{self, ServeOptions};
 use crate::state::{
-    ClassRule, Config, GitHubConfig, IdentityConfig, LandConfig, RegenerateConfig, State,
-    ValidatorConfig, DEFAULT_DEPTH, DEFAULT_MAX_BATCH, DEFAULT_PRIORITY,
+    ClassRule, Config, GitHubConfig, IdentityConfig, LandConfig, NotifyConfig, RegenerateConfig,
+    State, ValidatorConfig, DEFAULT_DEPTH, DEFAULT_MAX_BATCH, DEFAULT_PRIORITY,
 };
 use crate::tests::{parse_selection, ValidationClaim};
 
@@ -182,6 +182,11 @@ enum Command {
         /// reach the base without being validated on their own).
         #[arg(long)]
         allow_batches: bool,
+        /// Command (and leading arguments) the `serve` daemon runs instead of `agentctl`
+        /// to push state-change notifications, e.g. a wrapper or a test fake. Repeatable.
+        /// The daemon runs `<command> send <name> --deliver-while-working --file <report>`.
+        #[arg(long, value_name = "WORD", allow_hyphen_values = true)]
+        agentctl: Vec<String>,
         /// Overwrite an existing config.json (items and history are kept).
         #[arg(long)]
         force: bool,
@@ -222,6 +227,11 @@ enum Command {
         /// Name of the policy that chose --tested-with (e.g. `path-routing`, `manual`).
         #[arg(long, default_value = "manual")]
         policy: String,
+        /// agentctl session name the `serve` daemon notifies exactly once per state
+        /// change (landed, ejected, refusal-deferred, withdrawn). Stored on the item
+        /// next to --by; resubmitting without it keeps the recorded name.
+        #[arg(long, value_name = "NAME", default_value = "")]
+        notify: String,
     },
     /// Reconcile the queue with a ready source: a label, every open pull request, or a file.
     Sync {
@@ -318,6 +328,12 @@ enum Command {
         /// Override the configured maximum batch size for work cycles.
         #[arg(long)]
         max_batch: Option<usize>,
+        /// Command (and leading arguments) to run instead of the configured agentctl
+        /// when pushing state-change notifications. Repeatable. Supplement:
+        /// MERGE_QUEUE_AGENTCTL (shell-style words) is used when neither this flag
+        /// nor the configured command is set.
+        #[arg(long, value_name = "WORD", allow_hyphen_values = true)]
+        agentctl: Vec<String>,
     },
     /// Show daemon liveness, the current window and slot occupancy.
     Status {
@@ -567,6 +583,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             land,
             land_command,
             allow_batches,
+            agentctl,
             force,
         } => {
             if state.exists() && !force {
@@ -644,6 +661,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     allow_batches,
                     close_prs,
                 },
+                notify: NotifyConfig { agentctl },
                 ..Config::default()
             };
             state.init(&config)?;
@@ -662,6 +680,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             tested_with,
             requires,
             policy,
+            notify,
         } => {
             let config = state.config()?;
             let _lock = state.lock()?;
@@ -682,6 +701,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     head: sha,
                     priority,
                     by,
+                    notify,
                     title,
                     after,
                     solo,
@@ -845,6 +865,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             once,
             depth,
             max_batch,
+            agentctl,
         } => serve::serve(
             &state,
             &ServeOptions {
@@ -853,6 +874,11 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                 once,
                 depth,
                 max_batch,
+                agentctl: if agentctl.is_empty() {
+                    None
+                } else {
+                    Some(agentctl)
+                },
             },
         ),
         Command::Status {

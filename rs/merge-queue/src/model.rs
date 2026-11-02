@@ -31,6 +31,32 @@ impl ItemStatus {
     }
 }
 
+/// Delivery record for the one notification owed for an item's current
+/// terminal or deferred transition. Persisted on the item so daemon restarts
+/// never resend a transition that was already delivered (or already gave up).
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NotifyDelivery {
+    /// Transition key already attempted (`verdict:head:discriminator`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub key: String,
+    /// Send attempts made for `key` (bounded; see `notify::MAX_ATTEMPTS`).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub attempts: u32,
+    /// Whether `key` was delivered successfully.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub delivered: bool,
+    /// Most recent send failure for `key`, for the operator.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub last_error: String,
+}
+
+impl NotifyDelivery {
+    /// Whether nothing has ever been attempted.
+    pub fn is_empty(&self) -> bool {
+        self.key.is_empty() && self.attempts == 0 && !self.delivered && self.last_error.is_empty()
+    }
+}
+
 /// One entry in an item's history.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Event {
@@ -72,6 +98,14 @@ pub struct Item {
     /// Who submitted it (agent or person).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub submitted_by: String,
+    /// agentctl session name to notify on a state change (landed, ejected,
+    /// refusal-deferred, withdrawn); empty means no notification. Stored next
+    /// to `submitted_by`; a resubmission without a name keeps the old one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub notify: String,
+    /// Notification delivery for the current transition (dedup + retry bound).
+    #[serde(default, skip_serializing_if = "NotifyDelivery::is_empty")]
+    pub notify_delivery: NotifyDelivery,
     /// One-line description.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub title: String,

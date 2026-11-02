@@ -74,13 +74,15 @@ struct Entry {
     solo: bool,
     title: String,
     by: String,
+    notify: String,
 }
 
 /// One parsed ready-file line: the change number and its `key=value` fields.
 pub type ReadyLine = (i64, Vec<(String, String)>);
 
 /// Parse a ready-list file. Each line: `PR [SHA] [head=REF] [priority=N] [after=N,N] [solo]
-/// [by=NAME]`; `#` starts a comment. Without `head=`, the head is `refs/pull/PR/head`.
+/// [by=NAME] [notify=NAME]`; `#` starts a comment. Without `head=`, the head is
+/// `refs/pull/PR/head`.
 pub fn parse_ready_file(text: &str) -> Result<Vec<ReadyLine>, String> {
     let mut entries = Vec::new();
     for (number, line) in text.lines().enumerate() {
@@ -130,6 +132,7 @@ fn entries_from_file(path: &PathBuf) -> Result<Vec<Entry>, String> {
                 solo: false,
                 title: String::new(),
                 by: String::new(),
+                notify: String::new(),
             };
             for (key, value) in fields {
                 match key.as_str() {
@@ -151,6 +154,7 @@ fn entries_from_file(path: &PathBuf) -> Result<Vec<Entry>, String> {
                     }
                     "solo" => entry.solo = true,
                     "by" => entry.by = value,
+                    "notify" => entry.notify = value,
                     "title" => entry.title = value.replace('_', " "),
                     other => return Err(format!("#{pr}: unknown field {other:?}")),
                 }
@@ -202,6 +206,7 @@ pub fn sync(
                         solo: false,
                         title: pr.title,
                         by: pr.author.map(|a| a.login).unwrap_or_default(),
+                        notify: String::new(),
                     }
                 })
                 .collect()
@@ -233,6 +238,7 @@ pub fn sync(
             head: entry.head,
             priority: entry.priority,
             by: entry.by,
+            notify: entry.notify,
             title: entry.title,
             after: entry.after,
             solo: entry.solo,
