@@ -1430,25 +1430,75 @@ impl<'a> Runner<'a> {
     }
 
     /// Plan, then drain. Returns the reason the run stopped early, or an empty string.
+    ///
+    /// Planning is pipelined with execution: the first batch comes from
+    /// base probes plus cached pairwise results and starts validating at
+    /// once, while a background thread probes the remaining pairs. The
+    /// completed plan (identical to a one-shot plan) supplies every later
+    /// batch. A dry run validates nothing, so it simply finishes the plan
+    /// first and reports what it would do.
     fn drive(&self) -> Result<String, String> {
         let mut max_batch = self.options.max_batch.unwrap_or(self.config.max_batch);
         if self.config.land.driver == "command" && !self.config.land.allow_batches {
             max_batch = 1;
         }
-        let plan = ops::plan(self.state, &self.config, max_batch)?;
+        if self.options.dry_run {
+            let plan = ops::plan(self.state, &self.config, max_batch)?;
+            self.adopt_plan(&plan, false)?;
+            let mut pending: VecDeque<Vec<i64>> =
+                plan.batches.iter().map(|batch| batch.prs.clone()).collect();
+            return self.dry_run(&mut pending);
+        }
+        let (partial, continuation) = ops::plan_staged(self.state, &self.config, max_batch)?;
+        self.adopt_plan(&partial, false)?;
+        self.event(
+            "plan-first",
+            &match partial.batches.first() {
+                Some(batch) => format!(
+                    "first batch {} ready from base and cached probes; planning continues in the background",
+                    list(&batch.prs)
+                ),
+                None => "no first batch from base and cached probes; planning continues in the background".to_owned(),
+            },
+        );
+        // Only the first batch is handed over now; the pipeline asks the
+        // continuation for the rest once this batch is under way.
+        let mut pending: VecDeque<Vec<i64>> = partial
+            .batches
+            .first()
+            .map(|batch| vec![batch.prs.clone()])
+            .unwrap_or_default()
+            .into();
+        self.pipeline(&mut pending, continuation)
+    }
+
+    /// Record a plan as the run's current plan: dependencies, base,
+    /// `plan.json`, the `plan` event and the report's plan. With
+    /// `completed` the plan is the finished one, so dependencies are
+    /// replaced (the first-stage plan may not know every ancestry edge
+    /// yet) and the event is `plan-complete` instead.
+    fn adopt_plan(&self, plan: &Plan, completed: bool) -> Result<(), String> {
         {
             let mut deps = lock(&self.deps);
+            if completed {
+                deps.clear();
+            }
             for (before, after) in &plan.dependencies {
                 deps.entry(*after).or_default().insert(*before);
             }
         }
-        *lock(&self.base) = plan.base_sha.clone();
-        if self.simulating() {
-            *lock(&self.simulated) = Some(plan.base_sha.clone());
+        // The completed plan binds to the same base the run started on;
+        // the live base (or its simulation) may already have advanced
+        // past it with the first batch, so only the first adoption moves it.
+        if !completed {
+            *lock(&self.base) = plan.base_sha.clone();
+            if self.simulating() {
+                *lock(&self.simulated) = Some(plan.base_sha.clone());
+            }
         }
-        write_json(&self.run_dir.join("plan.json"), &plan)?;
+        write_json(&self.run_dir.join("plan.json"), plan)?;
         self.event(
-            "plan",
+            if completed { "plan-complete" } else { "plan" },
             &format!(
                 "{} batch(es), {} held, base {}",
                 plan.batches.len(),
@@ -1456,17 +1506,41 @@ impl<'a> Runner<'a> {
                 short(&plan.base_sha)
             ),
         );
-        {
-            let mut report = lock(&self.report);
+        let mut report = lock(&self.report);
+        if report.base_start.is_empty() {
             report.base_start = plan.base_sha.clone();
-            report.plan = plan.clone();
         }
-        let mut pending: VecDeque<Vec<i64>> =
-            plan.batches.iter().map(|batch| batch.prs.clone()).collect();
-        if self.options.dry_run {
-            return self.dry_run(&mut pending);
-        }
-        self.pipeline(&mut pending)
+        report.plan = plan.clone();
+        Ok(())
+    }
+
+    /// Adopt the completed staged plan and replace `pending` (empty at
+    /// this point) with its batches minus the changes already started, in
+    /// plan order. A change the optimistic first batch already started is
+    /// never handed out again; its fate is decided by that batch's own
+    /// build and validation, exactly as a one-shot run would decide it.
+    fn adopt_completed(
+        &self,
+        full: &Plan,
+        started_prs: &BTreeSet<i64>,
+        pending: &mut VecDeque<Vec<i64>>,
+    ) -> Result<(), String> {
+        self.adopt_plan(full, true)?;
+        let remaining: VecDeque<Vec<i64>> = full
+            .batches
+            .iter()
+            .map(|batch| {
+                batch
+                    .prs
+                    .iter()
+                    .copied()
+                    .filter(|pr| !started_prs.contains(pr))
+                    .collect::<Vec<_>>()
+            })
+            .filter(|prs: &Vec<i64>| !prs.is_empty())
+            .collect();
+        *pending = remaining;
+        Ok(())
     }
 
     fn dry_run(&self, pending: &mut VecDeque<Vec<i64>>) -> Result<String, String> {
@@ -1504,16 +1578,44 @@ impl<'a> Runner<'a> {
         Ok(String::new())
     }
 
-    /// The rolling speculative window.
-    fn pipeline(&self, pending: &mut VecDeque<Vec<i64>>) -> Result<String, String> {
+    /// The rolling speculative window. `pending` holds only the first
+    /// batch at entry; `continuation` finishes the plan on a background
+    /// thread in this scope, and the loop joins it the first time it
+    /// needs a later batch, so the first validation never waits for the
+    /// full pairwise probe.
+    fn pipeline(
+        &self,
+        pending: &mut VecDeque<Vec<i64>>,
+        continuation: ops::PlanContinuation,
+    ) -> Result<String, String> {
         let mut window = self.width.min(self.max_window);
         let mut flights: VecDeque<Flight> = VecDeque::new();
         std::thread::scope(|scope| {
+            let mut plan_join = Some(scope.spawn(move || continuation.finish()));
             let (tx, rx) = mpsc::channel::<(u64, JobResult)>();
             let mut next_id = 0u64;
             let mut started = 0usize;
+            let mut started_prs: BTreeSet<i64> = BTreeSet::new();
+            let mut full_loaded = false;
             let result = (|| -> Result<String, String> {
                 loop {
+                    // Need the completed plan before a later batch can be
+                    // built. Joining here is where planning overlaps
+                    // execution: any batch already in flight keeps
+                    // validating on its own thread while this thread
+                    // waits for the remaining pairwise probes.
+                    let want_more =
+                        self.options.max_batches == 0 || started < self.options.max_batches;
+                    if pending.is_empty() && !full_loaded && want_more {
+                        let handle = plan_join
+                            .take()
+                            .ok_or_else(|| "planning thread already joined".to_owned())?;
+                        let full = handle
+                            .join()
+                            .map_err(|_| "planning thread panicked".to_owned())??;
+                        self.adopt_completed(&full, &started_prs, pending)?;
+                        full_loaded = true;
+                    }
                     // Fill the window, each new batch on top of the last one in flight.
                     while flights.len() < window
                         && !pending.is_empty()
@@ -1528,6 +1630,7 @@ impl<'a> Runner<'a> {
                             }
                         };
                         let prs = pending.pop_front().unwrap_or_default();
+                        started_prs.extend(prs.iter().copied());
                         let candidate = self.build_and_eject(&parent, &prs, pending, "")?;
                         if candidate.prs.is_empty() {
                             continue;
@@ -1557,6 +1660,24 @@ impl<'a> Runner<'a> {
                         });
                         started += 1;
                         lock(&self.report).windows.push(window);
+                    }
+                    // The window still has room but only the first batch
+                    // was at hand: finish the plan now (the batches in
+                    // flight keep validating meanwhile) and fill the
+                    // window from it before waiting for any result. This
+                    // is what keeps speculation concurrent.
+                    let want_more =
+                        self.options.max_batches == 0 || started < self.options.max_batches;
+                    if flights.len() < window && pending.is_empty() && !full_loaded && want_more {
+                        let handle = plan_join
+                            .take()
+                            .ok_or_else(|| "planning thread already joined".to_owned())?;
+                        let full = handle
+                            .join()
+                            .map_err(|_| "planning thread panicked".to_owned())??;
+                        self.adopt_completed(&full, &started_prs, pending)?;
+                        full_loaded = true;
+                        continue;
                     }
                     if flights.is_empty() {
                         return Ok(String::new());

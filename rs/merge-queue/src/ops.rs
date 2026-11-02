@@ -4,8 +4,9 @@ use std::collections::BTreeMap;
 
 use crate::git::Git;
 use crate::model::{now, Held, Item, ItemStatus, Plan, Requirement};
-use crate::plan::{make_plan, probe_with_options, PlanOptions, ProbeOptions};
+use crate::plan::{make_plan, probe_first_stage, probe_with_options, PlanOptions, ProbeOptions};
 use crate::probe_cache::probe_config_hash;
+use crate::state::RegenerateConfig;
 use crate::state::{Config, State};
 use crate::tests::ValidationClaim;
 
@@ -285,6 +286,27 @@ pub fn withdraw(state: &State, pr: i64, why: &str) -> Result<Item, String> {
     Ok(item)
 }
 
+/// Probe options for one queue: the persistent cache in the state
+/// directory, the configured concurrency bound, and a hash of everything
+/// besides commit IDs that can change a probe result.
+fn probe_options_for(state: &State, config: &Config, git: &Git) -> ProbeOptions {
+    // Probe results depend only on commit IDs and the merge configuration, so they are
+    // cached in the state directory across runs; misses run under the configured bound.
+    let config_material = format!(
+        "union={:?};regen-paths={:?};regen-when={:?};regen-set={};combine={}",
+        config.union_paths,
+        config.regenerate.paths,
+        config.regenerate.when,
+        !config.regenerate.command.trim().is_empty(),
+        config.combine.as_str()
+    );
+    ProbeOptions {
+        cache_dir: Some(state.root.clone()),
+        parallelism: config.probe_parallelism(),
+        config_hash: Some(probe_config_hash(git, &config_material)),
+    }
+}
+
 /// Refresh the base and every queued head, probe them, and build a plan.
 pub fn plan(state: &State, config: &Config, max_batch: usize) -> Result<Plan, String> {
     let items = state.items()?;
@@ -296,27 +318,12 @@ pub fn plan(state: &State, config: &Config, max_batch: usize) -> Result<Plan, St
     let git = repo(state, config)?;
     let (base_sha, current) = refresh(&git, config, &heads)?;
     let regenerate = config.regenerate.clone();
-    // Probe results depend only on commit IDs and the merge configuration, so they are
-    // cached in the state directory across runs; misses run under the configured bound.
-    let config_material = format!(
-        "union={:?};regen-paths={:?};regen-when={:?};regen-set={};combine={}",
-        config.union_paths,
-        config.regenerate.paths,
-        config.regenerate.when,
-        !config.regenerate.command.trim().is_empty(),
-        config.combine.as_str()
-    );
-    let probe_options = ProbeOptions {
-        cache_dir: Some(state.root.clone()),
-        parallelism: config.probe_parallelism(),
-        config_hash: Some(probe_config_hash(&git, &config_material)),
-    };
     let mut probe = probe_with_options(
         &git,
         &base_sha,
         &current,
         &|path| regenerate.covers(path),
-        probe_options,
+        probe_options_for(state, config, &git),
     )?;
     probe.external = peer_holds(config, &items)?;
     Ok(make_plan(
@@ -326,6 +333,119 @@ pub fn plan(state: &State, config: &Config, max_batch: usize) -> Result<Plan, St
         &probe,
         PlanOptions { max_batch },
     ))
+}
+
+/// The unfinished half of a staged plan (see [`plan_staged`]): everything
+/// needed to probe the pairs the first stage left unknown and build the
+/// completed plan, bound to the same base and heads. It owns its inputs so
+/// a caller can finish it on a background thread while the first batch
+/// already validates. Finishing is deterministic and needs no further
+/// refresh: a base move in the meantime is handled by the caller's
+/// existing base-moved flow, not by quietly rebasing this plan.
+pub struct PlanContinuation {
+    git: Git,
+    items: Vec<Item>,
+    base: String,
+    base_sha: String,
+    heads: BTreeMap<i64, Option<String>>,
+    regenerate: RegenerateConfig,
+    probe_options: ProbeOptions,
+    max_batch: usize,
+    external: BTreeMap<i64, Held>,
+}
+
+impl PlanContinuation {
+    /// Exact base commit both the first-stage and the completed plan bind to.
+    pub fn base_sha(&self) -> &str {
+        &self.base_sha
+    }
+
+    /// Probe the remaining pairs and build the completed plan.
+    ///
+    /// The result equals [`plan`]'s plan for the same items, base and heads:
+    /// it is the same full probe and the same [`make_plan`] over it. Pairs
+    /// the first stage already cached are hits here, and base entries are
+    /// hits too, so finishing re-runs only the pairs the first stage left
+    /// unknown. Because pairwise cache keys do not name the base, a base
+    /// move before finishing (or before the next plan) re-probes only the
+    /// per-head base entries and no pair at all on a warm cache.
+    pub fn finish(self) -> Result<Plan, String> {
+        let regenerate = self.regenerate.clone();
+        let mut probe = probe_with_options(
+            &self.git,
+            &self.base_sha,
+            &self.heads,
+            &|path| regenerate.covers(path),
+            self.probe_options.clone(),
+        )?;
+        probe.external = self.external.clone();
+        Ok(make_plan(
+            &self.items,
+            &self.base,
+            &self.base_sha,
+            &probe,
+            PlanOptions {
+                max_batch: self.max_batch,
+            },
+        ))
+    }
+}
+
+/// Staged planning for `run`: a first-stage plan now, the rest on demand.
+///
+/// The returned plan is built from base probes plus whatever pairwise
+/// results the cache already holds, so its first batch (if any) is ready
+/// as soon as the per-head base probes return; no pairwise git subprocess
+/// has run for it. Pairs the cache cannot decide are treated as clean
+/// with no ancestry in this plan, which makes it optimistic: the batch is
+/// still safe to validate, because building it re-checks combination and
+/// validation tests its exact tree, but only the completed plan is
+/// authoritative for the remaining batches. [`PlanContinuation::finish`]
+/// produces that plan, identical to [`plan`]'s, and is meant to run
+/// concurrently with validation of the first batch.
+pub fn plan_staged(
+    state: &State,
+    config: &Config,
+    max_batch: usize,
+) -> Result<(Plan, PlanContinuation), String> {
+    let items = state.items()?;
+    let heads: Vec<(i64, String)> = items
+        .iter()
+        .filter(|item| item.status == ItemStatus::Queued)
+        .map(|item| (item.pr, item.head_ref.clone()))
+        .collect();
+    let git = repo(state, config)?;
+    let (base_sha, current) = refresh(&git, config, &heads)?;
+    let regenerate = config.regenerate.clone();
+    let probe_options = probe_options_for(state, config, &git);
+    let mut probe = probe_first_stage(
+        &git,
+        &base_sha,
+        &current,
+        &|path| regenerate.covers(path),
+        probe_options.clone(),
+    )?;
+    let external = peer_holds(config, &items)?;
+    probe.external = external.clone();
+    let partial = make_plan(
+        &items,
+        &config.base,
+        &base_sha,
+        &probe,
+        PlanOptions { max_batch },
+    );
+    let continuation = PlanContinuation {
+        git,
+        items,
+        base: config.base.clone(),
+        base_sha,
+        heads: current,
+        regenerate,
+        probe_options,
+        max_batch,
+        external,
+    };
+    Ok((partial, continuation))
 }
 
 /// A peer queue: its state, configuration and repository.

@@ -33,6 +33,18 @@ pub struct ProbeStats {
     pub cache_hits: usize,
     /// Lookups that ran at least one git subprocess.
     pub cache_misses: usize,
+    /// Base-probe cache hits (one per live head at most).
+    pub base_hits: usize,
+    /// Base-probe cache misses: base probes that ran git subprocesses.
+    pub base_misses: usize,
+    /// Pairwise-probe cache hits (ancestry or conflicts known without git).
+    pub pair_hits: usize,
+    /// Pairwise-probe cache misses: pairs that ran git subprocesses.
+    pub pair_misses: usize,
+    /// Pairs left unknown by a first-stage probe (see [`probe_first_stage`]):
+    /// treated as clean with no ancestry so a first batch can be formed at
+    /// once. A full probe always leaves this at zero.
+    pub pairs_unknown: usize,
     /// Highest number of probe jobs observed running at once; never above the bound.
     pub peak_concurrency: usize,
 }
@@ -175,6 +187,38 @@ pub fn probe_with_options(
     regenerable: Regenerable<'_>,
     options: ProbeOptions,
 ) -> Result<Probe, String> {
+    probe_impl(git, base_sha, heads, regenerable, options, false)
+}
+
+/// First-stage probe for pipelined planning: base probes run in full, but
+/// pairwise probes are answered only from the cache and never spawn git.
+///
+/// A pair the cache cannot decide is left unknown and treated as clean with
+/// no ancestry (counted in [`ProbeStats::pairs_unknown`]). A plan built from
+/// this probe can therefore emit its first batch at once, in priority order
+/// over what is already known, while a concurrent full probe (a later
+/// [`probe_with_options`] over the same cache, which then only misses the
+/// pairs this stage left unknown) decides the rest. The completed plan is
+/// exactly [`probe_with_options`] plus [`make_plan`]; see
+/// `staged_first_batch_uses_no_pairwise_git_and_finish_equals_one_shot`.
+pub fn probe_first_stage(
+    git: &Git,
+    base_sha: &str,
+    heads: &BTreeMap<i64, Option<String>>,
+    regenerable: Regenerable<'_>,
+    options: ProbeOptions,
+) -> Result<Probe, String> {
+    probe_impl(git, base_sha, heads, regenerable, options, true)
+}
+
+fn probe_impl(
+    git: &Git,
+    base_sha: &str,
+    heads: &BTreeMap<i64, Option<String>>,
+    regenerable: Regenerable<'_>,
+    options: ProbeOptions,
+    pairwise_cached_only: bool,
+) -> Result<Probe, String> {
     // A conflict is recorded with only its non-regenerable paths: a conflict
     // confined to regenerable paths is not a conflict at all (the queue
     // regenerates those files on the candidate), and a mixed conflict blocks
@@ -193,8 +237,11 @@ pub fn probe_with_options(
         Some(dir) => ProbeCache::load(dir),
         None => ProbeCache::ephemeral(),
     });
-    let hits = AtomicUsize::new(0);
-    let misses = AtomicUsize::new(0);
+    let base_hits = AtomicUsize::new(0);
+    let base_misses = AtomicUsize::new(0);
+    let pair_hits = AtomicUsize::new(0);
+    let pair_misses = AtomicUsize::new(0);
+    let pairs_unknown = AtomicUsize::new(0);
     let mut probe = Probe {
         heads: heads.clone(),
         ..Probe::default()
@@ -209,11 +256,11 @@ pub fn probe_with_options(
         let head = live[index].1;
         let key = ProbeCache::base_key(&config_hash, base_sha, head);
         if let Some(entry) = cache.lock().unwrap().base(&key).cloned() {
-            hits.fetch_add(1, Ordering::SeqCst);
+            base_hits.fetch_add(1, Ordering::SeqCst);
             let files: BTreeSet<String> = entry.files.into_iter().collect();
             return Ok((files, entry.conflicts));
         }
-        misses.fetch_add(1, Ordering::SeqCst);
+        base_misses.fetch_add(1, Ordering::SeqCst);
         let files = git.changed_files(base_sha, head)?;
         let conflicts = git.merge_conflicts(base_sha, head)?;
         cache.lock().unwrap().put_base(
@@ -254,7 +301,7 @@ pub fn probe_with_options(
         if let Some(entry) = &entry {
             match entry.ancestry {
                 PairAncestry::LoFirst => {
-                    hits.fetch_add(1, Ordering::SeqCst);
+                    pair_hits.fetch_add(1, Ordering::SeqCst);
                     return Ok(if lo_is_a {
                         PairOutcome::Ancestor(a, b)
                     } else {
@@ -262,7 +309,7 @@ pub fn probe_with_options(
                     });
                 }
                 PairAncestry::HiFirst => {
-                    hits.fetch_add(1, Ordering::SeqCst);
+                    pair_hits.fetch_add(1, Ordering::SeqCst);
                     return Ok(if lo_is_a {
                         PairOutcome::Ancestor(b, a)
                     } else {
@@ -271,7 +318,7 @@ pub fn probe_with_options(
                 }
                 PairAncestry::None => {
                     if let Some(conflicts) = &entry.conflicts {
-                        hits.fetch_add(1, Ordering::SeqCst);
+                        pair_hits.fetch_add(1, Ordering::SeqCst);
                         return Ok(if conflicts.is_empty() {
                             PairOutcome::Clean
                         } else {
@@ -281,13 +328,20 @@ pub fn probe_with_options(
                     // Ancestry is known (neither); only conflicts may be missing, and
                     // only a non-disjoint pair needs them.
                     if *disjoint {
-                        hits.fetch_add(1, Ordering::SeqCst);
+                        pair_hits.fetch_add(1, Ordering::SeqCst);
                         return Ok(PairOutcome::Clean);
                     }
                 }
             }
         }
-        misses.fetch_add(1, Ordering::SeqCst);
+        if pairwise_cached_only {
+            // The cache cannot decide this pair without git. Leave it
+            // unknown (clean, no ancestry) for the first-stage plan; the
+            // concurrent full probe decides it for the completed plan.
+            pairs_unknown.fetch_add(1, Ordering::SeqCst);
+            return Ok(PairOutcome::Clean);
+        }
+        pair_misses.fetch_add(1, Ordering::SeqCst);
         if entry.is_none() {
             if git.is_ancestor(head_a, head_b)? {
                 cache.lock().unwrap().put_pair(
@@ -362,10 +416,25 @@ pub fn probe_with_options(
         .conflicts
         .sort_by_key(|conflict| (conflict.a, conflict.b));
     probe.ancestry.sort();
+    let base_hits = base_hits.load(Ordering::SeqCst);
+    let base_misses = base_misses.load(Ordering::SeqCst);
+    let pair_hits = pair_hits.load(Ordering::SeqCst);
+    let pair_misses = pair_misses.load(Ordering::SeqCst);
     probe.stats = ProbeStats {
-        cache_hits: hits.load(Ordering::SeqCst),
-        cache_misses: misses.load(Ordering::SeqCst),
-        peak_concurrency: base_peak.max(pair_peak),
+        cache_hits: base_hits + pair_hits,
+        cache_misses: base_misses + pair_misses,
+        base_hits,
+        base_misses,
+        pair_hits,
+        pair_misses,
+        pairs_unknown: pairs_unknown.load(Ordering::SeqCst),
+        // A cached-only pairwise phase spawns no git, so it adds no
+        // concurrency; the base phase peak is the run's peak.
+        peak_concurrency: if pairwise_cached_only {
+            base_peak
+        } else {
+            base_peak.max(pair_peak)
+        },
     };
     // The cache is an optimisation: a failed write must not fail planning.
     if let Ok(mut cache) = cache.into_inner() {
@@ -1280,6 +1349,129 @@ mod unit {
         }
     }
 
+    #[test]
+    fn staged_first_batch_uses_no_pairwise_git_and_finish_equals_one_shot() {
+        use crate::git::testrepo::TempDir;
+        let tmp = TempDir::new("probe-staged-repo");
+        let cache_tmp = TempDir::new("probe-staged-cache");
+        let (git, base, heads) = fixture_queue(&tmp, 8);
+        let map = heads_map(&heads);
+        let options = ProbeOptions {
+            cache_dir: Some(cache_tmp.0.clone()),
+            parallelism: 8,
+            config_hash: None,
+        };
+        // Counting probe: on a cold cache the first stage runs every base
+        // probe and no pairwise git at all, yet a first batch is ready.
+        // This is the unit-level form of "validation starts before all
+        // pairs are probed": `run` validates exactly this batch while the
+        // remaining pairs (here every pair) are still unprobed.
+        let first = probe_first_stage(
+            &git,
+            &base,
+            &map,
+            &crate::git::nothing_regenerable,
+            options.clone(),
+        )
+        .unwrap();
+        assert_eq!(first.stats.pair_misses, 0, "{:?}", first.stats);
+        assert_eq!(first.stats.base_misses, heads.len(), "{:?}", first.stats);
+        assert!(first.stats.pairs_unknown > 0, "{:?}", first.stats);
+        let items: Vec<Item> = heads
+            .iter()
+            .map(|(pr, sha)| {
+                let mut entry = item(*pr, 100, "t1");
+                entry.head = sha.clone();
+                entry
+            })
+            .collect();
+        let partial_plan = make_plan(&items, "main", &base, &first, opts(4));
+        assert!(!partial_plan.batches.is_empty(), "{partial_plan:?}");
+
+        // Finishing probes only what the first stage left unknown (base
+        // entries are hits now) and lands on the one-shot plan.
+        let full = probe_with_options(
+            &git,
+            &base,
+            &map,
+            &crate::git::nothing_regenerable,
+            options.clone(),
+        )
+        .unwrap();
+        assert_eq!(full.stats.pairs_unknown, 0, "{:?}", full.stats);
+        assert_eq!(full.stats.base_misses, 0, "{:?}", full.stats);
+        assert!(full.stats.pair_misses > 0, "{:?}", full.stats);
+        let sequential = probe_with_options(
+            &git,
+            &base,
+            &map,
+            &crate::git::nothing_regenerable,
+            ProbeOptions::sequential_uncached(),
+        )
+        .unwrap();
+        assert_same_probe(&full, &sequential);
+        let mut staged_plan = make_plan(&items, "main", &base, &full, opts(4));
+        let one_shot_plan = make_plan(&items, "main", &base, &sequential, opts(4));
+        staged_plan.created_at = one_shot_plan.created_at.clone();
+        assert_eq!(staged_plan, one_shot_plan);
+
+        // On a warm cache the first stage knows every pair, so its first
+        // batch is already the completed plan's first batch.
+        let warm = probe_first_stage(&git, &base, &map, &crate::git::nothing_regenerable, options)
+            .unwrap();
+        assert_eq!(warm.stats.pairs_unknown, 0, "{:?}", warm.stats);
+        assert_eq!(warm.stats.pair_misses, 0, "{:?}", warm.stats);
+        let warm_plan = make_plan(&items, "main", &base, &warm, opts(4));
+        assert_eq!(warm_plan.batches.first(), staged_plan.batches.first());
+    }
+
+    #[test]
+    fn base_move_reprobes_only_base_entries() {
+        use crate::git::testrepo::{git as tgit, write, TempDir};
+        let tmp = TempDir::new("probe-basemove-repo");
+        let cache_tmp = TempDir::new("probe-basemove-cache");
+        let (git, base, heads) = fixture_queue(&tmp, 6);
+        let map = heads_map(&heads);
+        let options = ProbeOptions {
+            cache_dir: Some(cache_tmp.0.clone()),
+            parallelism: 4,
+            config_hash: None,
+        };
+        let warm = probe_with_options(
+            &git,
+            &base,
+            &map,
+            &crate::git::nothing_regenerable,
+            options.clone(),
+        )
+        .unwrap();
+        assert!(warm.stats.cache_misses > 0, "{:?}", warm.stats);
+
+        // Move the base by one unrelated commit; every head stays put.
+        tgit(&tmp.0, &["checkout", "-q", "main"]);
+        write(&tmp.0, "base2.txt", "new base\n");
+        tgit(&tmp.0, &["add", "-A"]);
+        tgit(&tmp.0, &["commit", "-q", "-m", "move base"]);
+        let new_base = git.rev_parse("main").unwrap();
+        assert_ne!(new_base, base);
+
+        // Incremental re-plan: pairwise keys do not name the base, so all
+        // pairs hit; only the per-head base entries re-probe.
+        let moved = probe_with_options(
+            &git,
+            &new_base,
+            &map,
+            &crate::git::nothing_regenerable,
+            options,
+        )
+        .unwrap();
+        assert_eq!(moved.stats.base_misses, heads.len(), "{:?}", moved.stats);
+        assert_eq!(moved.stats.base_hits, 0, "{:?}", moved.stats);
+        assert_eq!(moved.stats.pair_misses, 0, "{:?}", moved.stats);
+        assert!(moved.stats.pair_hits > 0, "{:?}", moved.stats);
+        assert_eq!(moved.stats.pairs_unknown, 0, "{:?}", moved.stats);
+    }
+
     /// Wall-clock comparison on a wide fixture; run explicitly with `--ignored --nocapture`.
     #[test]
     #[ignore = "timing evidence, not a gate"]
@@ -1337,6 +1529,111 @@ mod unit {
             pairs,
             parallel.stats.peak_concurrency,
             cached.stats.cache_hits
+        );
+    }
+
+    /// Before/after for pipelined planning on one fixture: the one-shot
+    /// probe (today's `run`, which validates nothing until it returns)
+    /// against first-stage plus finish. Run explicitly with
+    /// `--ignored --nocapture`; the harness reports medians, the test only
+    /// checks the two paths agree and the first stage is sooner.
+    #[test]
+    #[ignore = "timing evidence, not a gate"]
+    fn staged_pipeline_timing_evidence() {
+        use crate::git::testrepo::TempDir;
+        fn cpu_ticks() -> u64 {
+            // utime + stime from /proc/self/stat (fields after the comm).
+            let text = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+            let after = text.rsplit(')').next().unwrap_or_default();
+            let fields: Vec<&str> = after.split_whitespace().collect();
+            // fields[0] is state (overall field 3), so utime/stime are at 11/12.
+            let at = |index: usize| {
+                fields
+                    .get(index)
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or_default()
+            };
+            at(11) + at(12)
+        }
+        fn median(mut values: Vec<std::time::Duration>) -> std::time::Duration {
+            values.sort();
+            values[values.len() / 2]
+        }
+        let tmp = TempDir::new("probe-stage-time-repo");
+        let (git, base, heads) = fixture_queue(&tmp, 32);
+        let map = heads_map(&heads);
+        let pairs = heads.len() * (heads.len() - 1) / 2;
+        let mut before_full = Vec::new();
+        let mut before_cpu = Vec::new();
+        let mut after_first = Vec::new();
+        let mut after_total = Vec::new();
+        let mut after_cpu = Vec::new();
+        for rep in 0..3 {
+            let before_cache = TempDir::new(&format!("stage-before-{rep}"));
+            let cpu0 = cpu_ticks();
+            let start = std::time::Instant::now();
+            let before = probe_with_options(
+                &git,
+                &base,
+                &map,
+                &crate::git::nothing_regenerable,
+                ProbeOptions {
+                    cache_dir: Some(before_cache.0.clone()),
+                    parallelism: 32,
+                    config_hash: None,
+                },
+            )
+            .unwrap();
+            before_full.push(start.elapsed());
+            before_cpu.push(cpu_ticks().saturating_sub(cpu0));
+
+            let after_cache = TempDir::new(&format!("stage-after-{rep}"));
+            let options = ProbeOptions {
+                cache_dir: Some(after_cache.0.clone()),
+                parallelism: 32,
+                config_hash: None,
+            };
+            let cpu0 = cpu_ticks();
+            let start = std::time::Instant::now();
+            let first = probe_first_stage(
+                &git,
+                &base,
+                &map,
+                &crate::git::nothing_regenerable,
+                options.clone(),
+            )
+            .unwrap();
+            after_first.push(start.elapsed());
+            assert_eq!(first.stats.pair_misses, 0, "{:?}", first.stats);
+            let full =
+                probe_with_options(&git, &base, &map, &crate::git::nothing_regenerable, options)
+                    .unwrap();
+            after_total.push(start.elapsed());
+            after_cpu.push(cpu_ticks().saturating_sub(cpu0));
+            assert_same_probe(&before, &full);
+        }
+        println!(
+            "staged timing: heads={} pairs={} before_full_wall={:?} before_cpu_ticks={:?} \
+             after_first_wall={:?} after_full_wall={:?} after_cpu_ticks={:?} (median of 3, cold cache each rep)",
+            heads.len(),
+            pairs,
+            median(before_full.clone()),
+            {
+                let mut values = before_cpu.clone();
+                values.sort_unstable();
+                values[values.len() / 2]
+            },
+            median(after_first.clone()),
+            median(after_total),
+            {
+                let mut values = after_cpu.clone();
+                values.sort_unstable();
+                values[values.len() / 2]
+            },
+        );
+        assert!(
+            median(after_first) < median(before_full.clone()),
+            "first stage must beat the one-shot probe to first batch"
         );
     }
 }
