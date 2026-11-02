@@ -3938,7 +3938,7 @@ function setFolded(entry, folded) {
   // to break rendering across the whole view and then never finish. A row with nothing to show
   // yet is a row that has nothing to show, and it keeps its own rendered opening lines until the
   // moment it does.
-  const summarised = folded && summaryMode && entry.note !== null && entry.summaryState === "ready";
+  const summarised = folded && summaryRows.mode() && entry.note !== null && entry.summaryState === "ready";
   entry.body.hidden = summarised;
   // What the STYLING keys off. A summary is not the message: it is a machine's reading of it, in
   // plain text where the message was markdown, and the row has to say so on its own — without it,
@@ -3968,7 +3968,7 @@ function setFolded(entry, folded) {
   // Written HERE for visibility only. Which rows are failed, and the mark itself, are decided in
   // `applySummaryState`; see the reason there.
   if (entry.note) {
-    entry.note.hidden = !(summarised || (summaryMode && entry.summaryState === "failed"));
+    entry.note.hidden = !(summarised || (summaryRows.mode() && entry.summaryState === "failed"));
   }
   entry.fold.textContent = folded ? FOLD_MORE : FOLD_LESS;
   entry.fold.setAttribute("aria-expanded", folded ? "false" : "true");
@@ -4116,19 +4116,30 @@ function foldable(li, meta, body, text, messageId, alsoIds = []) {
 // there when the reader arrives at it rather than appearing under their eye.
 const SUMMARY_LOOKAHEAD_PX = 600;
 
-/** What a summarised row shows before its answer arrives, and what marks it as not the message. */
-const SUMMARY_MARK = "summary";
-const SUMMARY_WAITING = "summarising…";
 /**
- * ...and what a row says when the summary did not come.
- *
- * IN WORDS, and since `#564 message-summary-toggle` ONLY in words: small and muted, the row's own
- * surface, read state and controls untouched (web/voice.css).
+ * What the server has said about each row's summary, which rows have been asked about, the requests
+ * waiting and on the wire, and whether this server can summarise at all: web/src/core/channels's
+ * (`createSummaries`, `#624 voice-page-modularity`). The marks, the chip's labels and the note's
+ * words are web/src/present/rows's.
  */
-const SUMMARY_FAILED_MARK = "summary failed";
-
-/** Is the reader in summary mode? The owner's synced setting, unless the server cannot summarise. */
-let summaryMode = false;
+const summaryRows = createSummaries({
+  clock: browserPorts().clock,
+  channel: () => selectedChannelId(),
+  threadOf: (id) => threadForMessageId(id),
+  // The rest of the glommed row, so the server summarises what the reader is actually looking at.
+  // Absent entirely for an ordinary single-message row, which keeps that URL exactly as it was.
+  fetch: (channel, id, alsoIds, thread) => {
+    const also = alsoIds.length
+      ? `?with=${encodeURIComponent(alsoIds.join(","))}`
+      : "";
+    return api(
+      withThreadQuery(`/api/v1/channels/${encodeURIComponent(channel)}/messages/${encodeURIComponent(id)}/summary${also}`, thread)
+    );
+  },
+  render: () => renderSummaries(),
+  failuresReported: (count, why) => setStatus(summaryFailureWords(count, why)),
+  askAgain: () => requestVisibleSummaries(),
+});
 
 /**
  * Turn "Summarize collapsed messages" on or off, keep it, and put the mode in step. The chip over
@@ -4142,7 +4153,7 @@ function applySummarizeCollapsed(on) {
   } catch (_error) {
     // A browser that refuses storage still honours the choice for this session.
   }
-  if (wanted !== summaryMode) setSummaryMode(wanted);
+  if (wanted !== summaryRows.mode()) setSummaryMode(wanted);
 }
 
 /** What was stored. ABSENT MEANS OFF: every summary is a paid model call, and the owner asked. */
@@ -4152,91 +4163,19 @@ function storedSummarizeCollapsed() {
 }
 
 /**
- * Rows the server refused because the owner's setting, as IT holds it, is off: this page turned it
- * on and the write has not landed yet, or the two have not converged, or this token may only read
- * and cannot write it. Not a failure and not shown: the rows keep their opening lines. They STAY
- * asked — a refusal un-asked would be asked again on every scroll and every redraw, forever, on a
- * page whose "on" can never reach the server — and are asked again only once the server is seen to
- * hold the setting on (`summariesSettingLanded`). `#564 message-summary-toggle`.
- */
-const summariesRefusedOff = new Set();
-
-/**
  * The server's settings were read or written: if it now holds summaries on, the rows it refused
  * while it held them off are asked again. Called by the settings sync (`landed`), after every read,
  * write and stream frame.
  */
 function summariesSettingLanded() {
-  if (summariesRefusedOff.size === 0) return;
-  const held = settingsSync().agreed(SUMMARIZE_COLLAPSED_KEY);
-  if (!held || held.value !== "1" || !summaryMode) return;
-  for (const key of summariesRefusedOff) summariesAsked.delete(key);
-  summariesRefusedOff.clear();
+  const heldOn = () => {
+    const held = settingsSync().agreed(SUMMARIZE_COLLAPSED_KEY);
+    return Boolean(held) && held.value === "1";
+  };
+  if (!summaryRows.settingLanded(heldOn)) return;
   requestVisibleSummaries();
   inOtherColumn(requestVisibleSummaries);
 }
-
-/**
- * What the server has said about each message, by id.
- *
- * `{ text }` with a string is a summary. `{ text: null }` is a settled "there is no summary for
- * this" — the server's own threshold, which is allowed to be stricter than the page's. `failed`
- * marks the third case, which is NOT settled: see `setSummaryMode`. A failed entry also carries
- * `why` (the server's own sentence, shown on the row's `title`) and `code` (the machine-readable
- * one, which is what tells a broken DEPLOYMENT apart from a broken attempt).
- */
-const summaries = new Map();
-
-/** Every row a request has gone out for, by `summaryKey`. Consulted before asking, so one row is one ask. */
-const summariesAsked = new Set();
-
-/**
- * The key a row's summary is held under: every id the row stands for, in order. Not its first id
- * alone, because the same first message heads different rows in different views — a thread's root
- * is a row of its own on Main and the head of its long post's parts in the thread (`#463
- * slack-text-fidelity`) — and each row's summary is of the text that row draws.
- */
-const summaryKey = (entry) => [entry.id, ...(entry.also || [])].join(" ");
-
-/**
- * What the server says produced the summaries, quoted from its own answer.
- *
- * Empty until something has answered, and the note says less while it is. Every summary is a
- * MODEL'S reading of somebody else's message, produced by a vendor this deployment pays, so a page
- * that showed those short lines without naming their author would be presenting a paraphrase as if
- * it were the message. The name is quoted from the server rather than written here, so it cannot
- * go on describing a summariser this deployment stopped running.
- */
-let summaryBackend = "";
-
-/**
- * Why this SERVER cannot summarise anything at all, or "" while it can.
- *
- * Set from `summarizer_not_configured`, which is not a fact about one message: it says the
- * deployment has no ElevenLabs credentials, so every request after it would buy the same refusal.
- * Two things follow, and they are deliberately different from the per-row failure above:
- *
- *   * NOTHING MORE IS ASKED. `summaryTargets` returns nothing while this is set, so scrolling
- *     through a thousand-message channel costs the one request that found out, not one per row.
- *   * IT IS SAID IN THE STANDING NOTE, not only in the transient pill. A permanent fact about the
- *     deployment has to be readable after the six seconds are up.
- *
- * The rows that WERE asked still say so. "A summary was attempted here and did not arrive" is true
- * of them whatever the reason, and the deployment-level explanation is what the note is for.
- */
-let summariesUnavailable = "";
-
-/** True while ONE request is deciding whether an unavailable server can summarise again. */
-let summaryRecheck = false;
-
-/**
- * Why the SERVER says it cannot summarise at all, from client-config, or "" when it may.
- *
- * Known before anything is asked, so the control is disabled up front with this as its reason:
- * switching summaries on and watching every long row fail after several seconds is the
- * experience this replaces.
- */
-let summariesDisabledByServer = "";
 
 /**
  * Put one row into the state the map says it is in.
@@ -4259,7 +4198,7 @@ function applySummaryState(entry) {
   if (!entry.note) {
     return;
   }
-  const held = summaries.get(summaryKey(entry));
+  const held = summaryRows.held(summaryKey(entry));
   const failed = held !== undefined && held.failed === true;
   if (held === undefined) {
     // Nothing has come back yet. The text is staged so the row is ready the instant it does, but
@@ -4288,63 +4227,10 @@ function applySummaryState(entry) {
   // Written on EVERY path, in both directions, so a row that failed and was then answered stops
   // being red — a state that can only be entered is not a state, it is a stain.
   entry.mark.textContent = entry.summaryState === "failed" ? SUMMARY_FAILED_MARK : SUMMARY_MARK;
-  entry.li.setAttribute("data-summary-failed", failed && summaryMode ? "true" : "false");
+  entry.li.setAttribute("data-summary-failed", failed && summaryRows.mode() ? "true" : "false");
   // The REASON, which the two-word mark deliberately does not carry: one row's failure and the
   // whole server being unconfigured look identical on the surface and are not the same problem.
-  entry.li.setAttribute("title", failed && summaryMode ? String(held.why || "") : "");
-}
-
-/** The standing sentence at the head of the channel view while the mode is on. */
-/**
- * How long the summaries actually took, in the order they were measured.
- *
- * The owner asked for this as an EXPERIMENT: a round trip to the ElevenLabs agent is expected to
- * beat a full-size model with a harness, and the way to find out is to measure it rather than to
- * reason about it. The server times each generation and reports `generated_in_ms`; without this
- * the number existed and nobody could see it.
- *
- * Only GENERATED summaries are recorded. A cache hit and a below-threshold answer both report no
- * time at all, and averaging a zero into them would report a backend as faster than it is —
- * precisely the wrong direction for a measurement meant to inform a choice.
- */
-const summaryTimes = [];
-
-/** The median, which is what a reader wants: one slow first call must not describe the rest. */
-function typicalSummaryMs() {
-  if (summaryTimes.length === 0) {
-    return null;
-  }
-  const sorted = [...summaryTimes].sort((a, b) => a - b);
-  return sorted[Math.floor(sorted.length / 2)];
-}
-
-function summaryNoteText() {
-  // THE DEPLOYMENT-LEVEL VERDICT, and it replaces the ordinary sentence rather than trailing it.
-  // "Collapsed messages show a summary" is simply untrue on a server that cannot make one, and a
-  // note that says both things reads as a page that has not noticed. The pill that announced this
-  // is gone within six seconds; this is what is still on screen a minute later.
-  if (summariesUnavailable) {
-    // The server's sentence, punctuated if it did not punctuate itself, so the two statements do
-    // not run into one another as a single unreadable line.
-    const said = /[.!?]$/.test(summariesUnavailable)
-      ? summariesUnavailable
-      : `${summariesUnavailable}.`;
-    return `Summaries are unavailable on this server: ${said} ` +
-      "Collapsed messages keep their opening lines.";
-  }
-  const base = "Collapsed messages show a summary instead of their opening lines. Tap More for " +
-    "the message itself.";
-  const parts = [base];
-  if (summaryBackend) {
-    parts.push(`Summaries by ${summaryBackend}.`);
-  }
-  const typical = typicalSummaryMs();
-  if (typical !== null) {
-    const seconds = (typical / 1000).toFixed(1);
-    // The COUNT as well as the time, because a median over two samples is not a median.
-    parts.push(`Typically ${seconds}s (${summaryTimes.length} measured).`);
-  }
-  return parts.join(" ");
+  entry.li.setAttribute("title", failed && summaryRows.mode() ? String(held.why || "") : "");
 }
 
 /** Every row's summary line brought back into agreement with what the server has said. */
@@ -4355,12 +4241,13 @@ function renderSummaries() {
       setFolded(entry, isFolded(entry));
     }
     const note = el("summary-note");
-    note.hidden = !summaryMode;
-    note.textContent = summaryMode ? summaryNoteText() : "";
+    const on = summaryRows.mode();
+    note.hidden = !on;
+    note.textContent = on ? summaryNoteWords(summaryRows.unavailable(), summaryRows.backend(), summaryRows.times()) : "";
     // ...and it is DRAWN as a problem, not as a hint. The owner's report on the sentence this
     // replaces is that they had been reading it for weeks without noticing what it said, because
     // a quiet grey line at the head of a view is exactly what the eye is trained to skip.
-    note.setAttribute("data-unavailable", summaryMode && summariesUnavailable ? "true" : "false");
+    note.setAttribute("data-unavailable", on && summaryRows.unavailable() ? "true" : "false");
   });
   renderScrollTools();
 }
@@ -4375,13 +4262,13 @@ function renderSummaries() {
 function summaryTargets() {
   // `#211 link-filter`. A summary stands in for a row's text, and under the Links filter that text
   // is not on screen: a summary asked for there is one paid for and never seen.
-  if (!summaryMode || currentView !== "discord" || (searchOpen && linksOnly)) {
+  if (!summaryRows.mode() || currentView !== "discord" || (searchOpen && linksOnly)) {
     return [];
   }
   // A server that has said it has no summariser will say it again for every row, and each of
   // those refusals costs this server a full Discord window fetch to arrive at. One request found
   // out; the note says so; scrolling through the rest of the channel buys nothing.
-  if (summariesUnavailable) {
+  if (summaryRows.unavailable()) {
     return [];
   }
   const area = el("scroll-area");
@@ -4405,263 +4292,19 @@ function summaryTargets() {
  * pressed a button, and answering them costs one request rather than one per visible row.
  */
 function requestVisibleSummaries(limit = Infinity) {
-  let issued = 0;
-  for (const entry of summaryTargets()) {
-    if (issued >= limit) {
-      return;
-    }
-    const key = summaryKey(entry);
-    if (summariesAsked.has(key)) {
-      continue;
-    }
-    // Marked BEFORE the await, not in the handler: the scroll listener fires again long before a
-    // response lands, and a record written on completion would let one row issue a request per
-    // scroll event — the exact thing the issue names.
-    summariesAsked.add(key);
-    issued += 1;
-    queueSummary(entry.id, entry.also, key);
-  }
-}
-
-/**
- * How many summary requests may be on the wire at once. `#564 message-summary-toggle`.
- *
- * Every row on screen used to be asked about at once, a dozen or more, and the server paces its
- * model calls (15 a minute after a burst of 3 by default, `summaries.llm`) and turns away AT ONCE
- * a caller whose turn would come after its patience runs out. On the live instance that was 27 of
- * 95 summary requests answered 503 with no model call made, every one drawn as "summary failed".
- * Two at a time never queue long enough there to be turned away, and the rows still fill in order.
- */
-const SUMMARY_IN_FLIGHT = 2;
-
-/** Summary requests on the wire now. */
-let summariesInFlight = 0;
-
-/** Rows asked about and not yet sent, oldest first: `{id, also, key, channel, thread}`. */
-const summaryQueue = [];
-
-/**
- * Queue one row. Its channel and thread are read NOW, in the column that asked: a queued request is
- * sent later, from whichever column is current then, and on a two-column desk the other column's
- * thread would be the wrong one (`threadForMessageId` reads the current column).
- */
-function queueSummary(id, also, key) {
-  summaryQueue.push({ id, also, key, channel: selectedChannelId(), thread: threadForMessageId(id) });
-  pumpSummaries();
-}
-
-/** Send queued requests while there is room. One the mode or the channel has left behind is forgotten. */
-function pumpSummaries() {
-  while (summariesInFlight < SUMMARY_IN_FLIGHT && summaryQueue.length > 0) {
-    const next = summaryQueue.shift();
-    if (!summaryMode || next.channel !== selectedChannelId()) {
-      summariesAsked.delete(next.key);
-      continue;
-    }
-    summariesInFlight += 1;
-    fetchSummary(next.id, next.also, next.key, next.channel, next.thread).finally(() => {
-      summariesInFlight -= 1;
-      pumpSummaries();
-    });
-  }
-}
-
-/**
- * The server answered something other than "I have no summariser".
- *
- * Only interesting while a re-check is in flight: it means the deployment can summarise again, so
- * the rest of what the reader is looking at — which the single-request re-check deliberately did
- * not ask about — is asked about now rather than waiting for them to scroll.
- *
- * A re-check that FAILS deliberately does not clear the flag here, and does not need to: the
- * reader's next press recomputes it, and until then the flag can only be spent by an answer that
- * says this server is working, which is exactly the condition it is waiting for.
- */
-function summaryRecheckAnswered() {
-  if (!summaryRecheck) {
-    return;
-  }
-  summaryRecheck = false;
-  requestVisibleSummaries();
-}
-
-async function fetchSummary(id, alsoIds, key, channel, thread) {
-  if (!channel) {
-    // Never asked, so not left asked: the row is asked about when a channel is there.
-    summariesAsked.delete(key);
-    return;
-  }
-  // The rest of the glommed row, so the server summarises what the reader is actually looking at.
-  // Absent entirely for an ordinary single-message row, which keeps that URL exactly as it was.
-  const also = alsoIds.length
-    ? `?with=${encodeURIComponent(alsoIds.join(","))}`
-    : "";
-  let payload = null;
-  try {
-    payload = await api(
-      withThreadQuery(`/api/v1/channels/${encodeURIComponent(channel)}/messages/${encodeURIComponent(id)}/summary${also}`, thread)
-    );
-  } catch (error) {
-    // `#564 message-summary-toggle`. The server holds the owner's setting off: not a failure, and
-    // asked again once this page's write of it lands.
-    if (error.code === "summaries_off") {
-      summariesRefusedOff.add(key);
-      return;
-    }
-    // The CODE, not the sentence. `summarizer_not_configured` is a fact about the deployment and
-    // `summarizer_error` is a fact about this attempt; the two are told apart on the machine
-    // string the server sends for exactly that purpose, never on the prose beside it.
-    summaryFailed(key, error.message, error.code, error.detail);
-    return;
-  }
-  summaryRecheckAnswered();
-  if (payload && payload.backend) {
-    summaryBackend = payload.backend;
-  }
-  // Absent on a cache hit and on a below-threshold answer, and absent is not zero: neither of
-  // those asked the vendor anything, so neither is evidence about how fast the vendor is.
-  if (payload && typeof payload.generated_in_ms === "number") {
-    summaryTimes.push(payload.generated_in_ms);
-  }
-  // `below_threshold` is an ANSWER, not an omission: the server considers the message short
-  // enough to read as it is, and a shortened copy of something already short would be a claim
-  // that work was done. It is SETTLED — the row keeps its own opening lines and is never asked
-  // about again — which is the whole reason the STATE decides rather than the presence of text.
-  if (payload && payload.state === "below_threshold") {
-    summaries.set(key, { text: null });
-    renderSummaries();
-    return;
-  }
-  // Anything else without usable text is a server this page cannot understand. That is a
-  // FAILURE, not a verdict that the message is short: it is worth retrying, and reading it as
-  // "below threshold" would quietly file every malformed answer as a decision nobody made.
-  const said = payload ? payload.summary : null;
-  if (typeof said !== "string" || !said) {
-    summaryFailed(key, "the server answered without a summary");
-    return;
-  }
-  summaries.set(key, { text: said });
-  renderSummaries();
-}
-
-/**
- * The rows that have failed since the last report, and the one timer that will report them.
- *
- * Twenty rows on screen is twenty requests, and a server that is down fails all twenty. Reported
- * one at a time that is twenty status writes racing each other through a six-second pill, of which
- * the reader sees the last — and the last one says "one message", which is the wrong number by
- * nineteen. Held here and flushed once, at the end of the turn, so the sentence can count.
- */
-const pendingSummaryFailures = new Set();
-let summaryFailureTimer = null;
-
-/**
- * One message could not be summarised.
- *
- * Deliberately NOT `guardQuietly`, and deliberately not the sticky `#error` panel: taking the
- * channel away because one row out of fifty could not be condensed is a worse answer than the row
- * the reader would have had with the mode off, and that row is exactly what they keep. The body is
- * never replaced.
- *
- * What CHANGED, at the owner's asking: the failure is no longer only a sentence that disappears.
- * The row itself says "summary failed" until it is answered: small and muted since `#564
- * message-summary-toggle`, never a surface that hides its read state. The earlier reading —
- * that a failure should be quiet because the fallback is acceptable — confused "the reader is not
- * blocked" with "the reader need not be told", and the standing complaint about this view is that
- * nothing in it is noticeable enough. A per-row mark plus one counted pill is loud where the
- * failure is and quiet everywhere else; the full-width panel would still be the wrong answer.
- *
- * `failed` also marks the entry as retryable — see `setSummaryMode`.
- */
-function summaryFailed(key, why, code, detail) {
-  summaries.set(key, { text: null, failed: true, why, code });
-  // A DEPLOYMENT-LEVEL refusal, not a row-level one: this server has no summariser configured, so
-  // every other row would buy the same answer. The rows already asked about still say so — a
-  // summary really was attempted for them and really did not arrive — but nothing further is
-  // asked, and the reason is stated where it will still be readable in a minute.
-  //
-  // The server's PROSE, not the whole `HTTP 503 summarizer_not_configured: …` line: this one goes
-  // into a standing sentence a reader has to parse, rather than onto a status line where the code
-  // is the useful half.
-  if (code === "summarizer_not_configured") {
-    summariesUnavailable = detail || why || "this server has no summariser configured.";
-  }
-  pendingSummaryFailures.add(key);
-  if (summaryFailureTimer === null) {
-    summaryFailureTimer = setTimeout(reportSummaryFailures, 0);
-  }
-}
-
-/** Draw every row that failed, and say it ONCE. */
-function reportSummaryFailures() {
-  summaryFailureTimer = null;
-  // Only the ones still failed. Re-entering the mode between the failure and this flush forgets
-  // them on purpose (see `setSummaryMode`), and reporting a row that is being retried would be
-  // reporting the past.
-  const failed = [...pendingSummaryFailures].filter((id) => {
-    const held = summaries.get(id);
-    return held !== undefined && held.failed === true;
-  });
-  pendingSummaryFailures.clear();
-  if (failed.length === 0) {
-    return;
-  }
-  // ONE redraw for the whole batch, and it is what puts the words on the rows: see
-  // `applySummaryState`. Inside `preservingScroll`, because a failed row grows by the height of
-  // its mark and rows above the viewport are exactly the case the browser cannot anchor.
-  renderSummaries();
-  if (summariesUnavailable) {
-    // Said in the standing note `renderSummaries` has just written, and deliberately not ALSO in
-    // the pill. A permanent fact about the deployment stated in a message that erases itself is a
-    // fact the reader is invited to miss, and stating it twice trains them to dismiss both.
-    return;
-  }
-  // The most recent reason, and the rows carry their own on `title`. A burst almost always shares
-  // one cause; naming that one beats concatenating twenty copies of it into the status line.
-  const why = summaries.get(failed[failed.length - 1]).why;
-  const many = failed.length === 1 ? "one message" : `${failed.length} messages`;
-  setStatus(`${many} could not be summarised: ${why}`);
+  summaryRows.ask(summaryTargets(), limit);
 }
 
 function setSummaryMode(on) {
-  if (on && summariesDisabledByServer) return;
-  summaryMode = on;
-  if (!on) {
-    // Nothing still waiting to be sent is sent: off costs nothing from the moment it is off. Rows
-    // the server refused are forgotten too, so turning it on again asks about them.
-    for (const queued of summaryQueue.splice(0)) summariesAsked.delete(queued.key);
-    for (const key of summariesRefusedOff) summariesAsked.delete(key);
-    summariesRefusedOff.clear();
-  }
+  const { entered, recheck } = summaryRows.setMode(on);
+  if (!entered) return;
   el("summarise").setAttribute("aria-pressed", on ? "true" : "false");
   el("summarise-label").textContent = on ? SUMMARY_MODE_ON : SUMMARY_MODE_OFF;
-  // A DEPLOYMENT-LEVEL refusal is re-checked with ONE request, never with one per visible row.
-  // The credentials may have been fixed since — that is the whole reason to re-check at all — but
-  // the overwhelmingly likely answer is the same refusal, and twenty of those cost this server
-  // twenty Discord window fetches to arrive at. If the one comes back healthy,
-  // `summaryRecheckAnswered` asks about the rest immediately, so the reader is not made to scroll.
-  const recheck = on && summariesUnavailable !== "";
-  summaryRecheck = recheck;
-  if (on) {
-    summariesUnavailable = "";
-    // A failure is not a verdict. Re-entering the mode is the reader asking again, and without
-    // this one flaky response would leave that row plain until the page is reloaded — while a
-    // below-threshold answer, which is settled, stays settled and is never re-asked.
-    for (const [id, held] of [...summaries]) {
-      if (held.failed) {
-        summaries.delete(id);
-        summariesAsked.delete(id);
-      }
-    }
-  }
   // Both columns' rows. `#229 desktop-two-column`. A re-check is one request, wherever it is asked.
   eachColumn(renderSummaries);
   requestVisibleSummaries(recheck ? 1 : Infinity);
   if (!recheck) inOtherColumn(requestVisibleSummaries);
 }
-
-const SUMMARY_MODE_OFF = "Summaries";
-const SUMMARY_MODE_ON = "Summaries on";
 
 // --- the chips over the list ----------------------------------------------------------------
 //
@@ -4903,9 +4546,9 @@ function renderScrollTools() {
   // a mode that changes nothing, since a voice turn has no message id to key a summary under.
   el("summarise").hidden =
     currentView !== "discord" || !folds.some((entry) => entry.id !== null);
-  el("summarise").disabled = summariesDisabledByServer !== "";
-  el("summarise").title = summariesDisabledByServer
-    ? `Summaries are unavailable on this server: ${summariesDisabledByServer}`
+  el("summarise").disabled = summaryRows.disabledByServer() !== "";
+  el("summarise").title = summaryRows.disabledByServer()
+    ? `Summaries are unavailable on this server: ${summaryRows.disabledByServer()}`
     : "Show a one-line summary in place of each long message.";
   // `#204 reply-arrow`. The other way back: to the reply a jump left, while it is off screen.
   el("back-to-reply").hidden = currentView !== "discord" || replyReturnRow() === null;
@@ -37431,11 +37074,11 @@ function applyClientConfig(config) {
   deploymentCapabilities.idempotentPosts = config.idempotent_posts_supported === true;
   // `#252 thread-button-state`. Read per channel, by `channelRepliesInThread`, for a reply's route.
   deploymentCapabilities.repliesInThread = config.replies_in_thread === true;
-  summariesDisabledByServer =
-    typeof config.summaries_unavailable === "string" ? config.summaries_unavailable.trim() : "";
-  if (summariesDisabledByServer && summaryMode) setSummaryMode(false);
+  summaryRows.setDisabledByServer(
+    typeof config.summaries_unavailable === "string" ? config.summaries_unavailable.trim() : "");
+  if (summaryRows.disabledByServer() && summaryRows.mode()) setSummaryMode(false);
   // ...and back on when the server can summarise again and the owner's setting still says so.
-  else if (!summariesDisabledByServer && !summaryMode && storedSummarizeCollapsed()) setSummaryMode(true);
+  else if (!summaryRows.disabledByServer() && !summaryRows.mode() && storedSummarizeCollapsed()) setSummaryMode(true);
   renderScrollTools();
   deploymentCapabilities.liveDelivery = liveDelivery;
   deploymentCapabilities.livePollSeconds = livePollSeconds;

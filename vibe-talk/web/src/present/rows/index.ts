@@ -73,3 +73,13 @@ export {
   savedReadMode,
 } from "./readmode.ts";
 export type { ReadMode, ReadModeDependencies } from "./readmode.ts";
+export {
+  SUMMARY_FAILED_MARK,
+  SUMMARY_MARK,
+  SUMMARY_MODE_OFF,
+  SUMMARY_MODE_ON,
+  SUMMARY_WAITING,
+  summaryFailureWords,
+  summaryNoteWords,
+  typicalSummaryMs,
+} from "./summaries.ts";

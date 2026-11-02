@@ -286,3 +286,20 @@ test("`#624 voice-page-modularity`: the read mode, what an old record means, the
   assert.doesNotThrow(() => refusing.keep(), "a device refusing storage threw out of keep()");
   assert.equal(refusing.mode(), "show", "a refused write changed the mode");
 });
+
+test("`#624 voice-page-modularity`: what the summaries say, from the module alone", () => {
+  const { summaryNoteWords, summaryFailureWords, typicalSummaryMs } = ROWS;
+  assert.equal(typicalSummaryMs([]), null);
+  assert.equal(typicalSummaryMs([900, 100, 400]), 400, "not the median");
+  assert.equal(summaryNoteWords("no key", "", []),
+    "Summaries are unavailable on this server: no key. Collapsed messages keep their opening lines.");
+  assert.equal(summaryNoteWords("no key!", "x", [1]),
+    "Summaries are unavailable on this server: no key! Collapsed messages keep their opening lines.");
+  assert.equal(summaryNoteWords("", "", []),
+    "Collapsed messages show a summary instead of their opening lines. Tap More for the message itself.");
+  assert.equal(summaryNoteWords("", "a model", [1500, 2500]),
+    "Collapsed messages show a summary instead of their opening lines. Tap More for the message itself. " +
+    "Summaries by a model. Typically 2.5s (2 measured).");
+  assert.deepStrictEqual([summaryFailureWords(1, "down"), summaryFailureWords(3, "down")],
+    ["one message could not be summarised: down", "3 messages could not be summarised: down"]);
+});

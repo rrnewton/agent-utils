@@ -540,3 +540,92 @@ test("`#624 voice-page-modularity`: who is who has one owner: choices beat guess
   assert.ok(!who.noteSelfAuthor("51") && !who.noteSelfAuthor(""));
   assert.equal(kept.get(SELF_ID_KEY), "51");
 });
+
+test("`#624 voice-page-modularity`: summaries are asked once per row, two at a time, and their failures said once", async () => {
+  const { createSummaries, summaryKey, SUMMARY_IN_FLIGHT } = CHANNELS;
+  assert.equal(SUMMARY_IN_FLIGHT, 2);
+  assert.equal(summaryKey({ id: "a", also: ["b", "c"] }), "a b c");
+  const timers = [];
+  const answers = new Map();
+  const asked = [];
+  const said = [];
+  let renders = 0;
+  let askedAgain = 0;
+  let channel = "c1";
+  const rows = createSummaries({
+    clock: { setTimeout: (run) => timers.push(run), clearTimeout: () => {} },
+    channel: () => channel,
+    threadOf: () => null,
+    fetch: (where, id, also) => {
+      asked.push([where, id, ...also].join(" "));
+      return new Promise((resolve, reject) => answers.set(id, { resolve, reject }));
+    },
+    render: () => { renders += 1; },
+    failuresReported: (count, why) => said.push(`${count} ${why}`),
+    askAgain: () => { askedAgain += 1; },
+  });
+  const settle = () => new Promise((resolve) => setImmediate(resolve));
+  // Off, nothing is asked.
+  rows.ask([{ id: "1" }]);
+  assert.deepStrictEqual(asked, []);
+  assert.deepStrictEqual(rows.setMode(true), { entered: true, recheck: false });
+  // The row asked about while off was queued, then left behind by the mode: asked again now.
+  rows.ask([{ id: "1", also: ["1b"] }, { id: "2" }, { id: "3" }, { id: "2" }]);
+  assert.deepStrictEqual(asked, ["c1 1 1b", "c1 2"], "more than two on the wire, or a row asked twice");
+  rows.ask([{ id: "2" }]);
+  assert.equal(asked.length, 2);
+  answers.get("1").resolve({ summary: "short", backend: "model", generated_in_ms: 1200 });
+  await settle();
+  assert.deepStrictEqual(rows.held("1 1b"), { text: "short" });
+  assert.equal(rows.backend(), "model");
+  assert.deepStrictEqual(rows.times(), [1200]);
+  assert.deepStrictEqual(asked, ["c1 1 1b", "c1 2", "c1 3"], "the queue did not move on");
+  answers.get("2").resolve({ state: "below_threshold" });
+  answers.get("3").reject({ code: "summarizer_error", message: "vendor down" });
+  await settle();
+  assert.deepStrictEqual(rows.held("2"), { text: null });
+  assert.equal(rows.held("3").failed, true);
+  assert.deepStrictEqual(said, [], "a failure said before the turn ended");
+  timers.shift()();
+  assert.deepStrictEqual(said, ["1 vendor down"]);
+  // Re-entering forgets failures, not settled answers.
+  rows.setMode(false);
+  rows.setMode(true);
+  assert.equal(rows.held("3"), undefined);
+  assert.deepStrictEqual(rows.held("2"), { text: null });
+  rows.ask([{ id: "2" }, { id: "3" }]);
+  assert.deepStrictEqual(asked.slice(3), ["c1 3"]);
+  // A server with no summariser: the note's reason, no pill, and a re-check is one request.
+  answers.get("3").reject({ code: "summarizer_not_configured", message: "HTTP 503 ...", detail: "no key" });
+  await settle();
+  timers.shift()();
+  assert.equal(rows.unavailable(), "no key");
+  assert.deepStrictEqual(said, ["1 vendor down"], "a deployment-level refusal went to the pill");
+  assert.deepStrictEqual(rows.setMode(true), { entered: true, recheck: true });
+  assert.equal(rows.unavailable(), "");
+  rows.ask([{ id: "3" }, { id: "4" }], 1);
+  assert.deepStrictEqual(asked.slice(4), ["c1 3"]);
+  answers.get("3").resolve({ summary: "back" });
+  await settle();
+  assert.equal(askedAgain, 1, "a healthy re-check did not ask about the rest");
+  // The owner's setting off at the server: asked again only once it holds it on.
+  rows.ask([{ id: "5" }]);
+  answers.get("5").reject({ code: "summaries_off" });
+  await settle();
+  assert.equal(rows.settingLanded(() => false), false);
+  assert.equal(rows.settingLanded(() => true), true);
+  assert.equal(rows.settingLanded(() => assert.fail("read the server's setting with nothing refused")), false);
+  rows.ask([{ id: "5" }]);
+  assert.equal(asked.filter((one) => one === "c1 5").length, 2);
+  // A row queued for another channel is forgotten, not sent.
+  answers.get("5").resolve({ summary: "x" });
+  rows.ask([{ id: "6" }, { id: "7" }, { id: "8" }]);
+  channel = "c2";
+  answers.get("6").resolve({ summary: "x" });
+  await settle();
+  assert.ok(!asked.includes("c1 8") && !asked.includes("c2 8"), "a request left behind by its channel was sent");
+  // The server disabled it: not entered.
+  rows.setDisabledByServer("off here");
+  assert.deepStrictEqual(rows.setMode(true), { entered: false, recheck: false });
+  assert.ok(renders > 0);
+});

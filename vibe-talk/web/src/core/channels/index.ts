@@ -49,3 +49,5 @@ export { markDoneIn, settleDoneIn, settleUnknownReplies, unsettleReplies } from 
 export type { HeldDoneMark } from "./done.ts";
 export { AUTHORS_KEY, BUCKETS, LEGACY_AUTHORS_KEY, SELF_ID_KEY, codingAgentsFrom, createIdentities } from "./identities.ts";
 export type { CodingAgents, DescribedAccounts, Identities, IdentitiesDependencies, IdentityReader, SeenAuthor } from "./identities.ts";
+export { SUMMARY_IN_FLIGHT, createSummaries, summaryKey } from "./summaries.ts";
+export type { HeldSummary, Summaries, SummariesDependencies, SummaryAnswer, SummaryTarget } from "./summaries.ts";
