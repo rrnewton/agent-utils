@@ -131,8 +131,102 @@ fn sanitize_preview(body: &str) -> String {
     linked.trim_end().to_string()
 }
 
+/// Serialize an envelope for the fence with the characters Slack acts
+/// on inside string values JSON-escaped (`.`, `:`, `@`, `<`, `>`, `&`
+/// become `\uXXXX`). Slack auto-links bare domain-like tokens (a file
+/// named `cli.rs`, a URL, an email) even inside a code block, rewriting
+/// the body so its hash fails; the escaped form parses to the identical
+/// envelope, so hash and signature still verify, and Slack sees nothing
+/// to link (#794). Costs 5 extra bytes per escaped character, which the
+/// post-size measurement includes because it measures this fence.
+pub fn fence_json(envelope: &Value) -> String {
+    let raw = envelope.to_string();
+    let mut out = String::with_capacity(raw.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    for ch in raw.chars() {
+        if in_string && !escaped {
+            match ch {
+                '"' => {
+                    in_string = false;
+                    out.push(ch);
+                }
+                '\\' => {
+                    escaped = true;
+                    out.push(ch);
+                }
+                '.' => out.push_str("\\u002e"),
+                ':' => out.push_str("\\u003a"),
+                '@' => out.push_str("\\u0040"),
+                '<' => out.push_str("\\u003c"),
+                '>' => out.push_str("\\u003e"),
+                '&' => out.push_str("\\u0026"),
+                _ => out.push(ch),
+            }
+            continue;
+        }
+        if escaped {
+            escaped = false;
+            out.push(ch);
+            continue;
+        }
+        if ch == '"' {
+            in_string = true;
+        }
+        out.push(ch);
+    }
+    out
+}
+
 fn envelope_fence(envelope: &Value) -> String {
-    format!("```{ENVELOPE_FENCE}\n{envelope}\n```\n")
+    format!("```{ENVELOPE_FENCE}\n{}\n```\n", fence_json(envelope))
+}
+
+/// Undo Slack link markup in a received body: `<http://LABEL|LABEL>`
+/// (and https/mailto forms) becomes LABEL, `<URL>` becomes URL. Only
+/// used to rescue a body whose hash then verifies (#794).
+pub fn undo_slack_link_markup(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find('<') {
+        out.push_str(&rest[..open]);
+        let Some(close) = rest[open..].find('>') else {
+            out.push_str(&rest[open..]);
+            return out;
+        };
+        let inner = &rest[open + 1..open + close];
+        let replacement: Option<String> = if let Some((url, label)) = inner.split_once('|') {
+            if url == format!("http://{label}")
+                || url == format!("https://{label}")
+                || url == format!("mailto:{label}")
+                || url == label
+            {
+                Some(label.to_string())
+            } else {
+                None
+            }
+        } else if inner.starts_with("http://") || inner.starts_with("https://") {
+            Some(inner.to_string())
+        } else {
+            inner.strip_prefix("mailto:").map(str::to_string)
+        };
+        match replacement {
+            Some(text) => out.push_str(&text),
+            None => out.push_str(&rest[open..=open + close]),
+        }
+        rest = &rest[open + close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The size a rendered post occupies after the publisher's escaping:
+/// visible part escaped, fence raw.
+pub fn measured_post_bytes(text: &str) -> usize {
+    match text.find("```agent-teams-envelope") {
+        Some(at) => escaped_len(&text[..at]) + text[at..].len(),
+        None => escaped_len(text),
+    }
 }
 
 /// Bytes the fence adds around a serialized envelope.
@@ -210,7 +304,7 @@ pub fn render_receipt(envelope: &Value, receipt: &Value) -> String {
         "{} receipt: {}\n```{RECEIPT_FENCE}\n{}\n```\n",
         team_tag(&header_envelope),
         state,
-        receipt
+        fence_json(receipt)
     )
 }
 
@@ -222,7 +316,7 @@ pub fn render_announce(announce: &Value) -> String {
         "[agent-teams relay announce: {team}@{host} posts as {} for repo {}]\n```{ANNOUNCE_FENCE}\n{}\n```\n",
         announce.get("sender_id").and_then(Value::as_str).unwrap_or("?"),
         announce.get("repo_id").and_then(Value::as_str).unwrap_or("?"),
-        announce
+        fence_json(announce)
     )
 }
 
@@ -1620,6 +1714,36 @@ fn relay_deliver(
     id: &str,
     signed_verified: bool,
 ) -> DataResult<RelayInResult> {
+    // Slack link markup rescue (#794b): if the body hash fails, undo
+    // Slack's auto-link rewriting inside the body and accept only if
+    // the hash (and thus the signature over it) then verifies.
+    let restored: Value;
+    let envelope = if crate::envelope::check_envelope(envelope)
+        == Err("body-hash-mismatch".to_string())
+    {
+        let body = envelope.get("body").and_then(Value::as_str).unwrap_or("");
+        let fixed = undo_slack_link_markup(body);
+        if fixed != body {
+            let mut candidate = envelope.clone();
+            candidate["body"] = json!(fixed);
+            if crate::envelope::check_envelope(&candidate).is_ok()
+                && (envelope.get("relay").is_none() || verify_envelope(&candidate))
+            {
+                log_event(
+                    state,
+                    &json!({"event": "relay-in", "outcome": "link-markup-restored", "route": route, "peer_sender": peer_sender, "id": id}),
+                );
+                restored = candidate;
+                &restored
+            } else {
+                envelope
+            }
+        } else {
+            envelope
+        }
+    } else {
+        envelope
+    };
     let from_team = envelope
         .get("from")
         .and_then(|f| f.get("team"))
@@ -1665,6 +1789,29 @@ fn relay_deliver(
         }
     }
     if let Err(reason) = check_envelope(envelope) {
+        if reason == "body-hash-mismatch" {
+            // From an admitted sender this is its own integrity kind:
+            // the body differs from what was hashed/signed, so it can
+            // never deliver and the post is evidence (#794 review).
+            let signed = envelope.get("relay").is_some();
+            let qid = record_integrity_confirmed(
+                state,
+                route,
+                peer_sender,
+                channel,
+                text,
+                envelope,
+                id,
+                signed,
+            )?;
+            return Ok(result(
+                NOT_RECORDED,
+                format!(
+                    "body does not match its hash; quarantined as {qid} — dismiss with: \
+                     agent-teams relay quarantine dismiss {qid}"
+                ),
+            ));
+        }
         record_stranger(
             state,
             declaration,
@@ -2038,6 +2185,122 @@ fn record_unparseable_confirmed(
     Ok(id)
 }
 
+/// Record a body-hash mismatch from an admitted sender under the
+/// `integrity` alarm kind (#794): the body differs from what its sender
+/// hashed (and, when signed, signed), so it can never deliver and the
+/// quarantined raw post is the evidence. Kept apart from the routine
+/// unparseable alarm so one dismiss cannot close both. Returns the
+/// quarantine ID (the envelope's message ID).
+#[allow(clippy::too_many_arguments)]
+fn record_integrity_confirmed(
+    state: &Path,
+    route: &str,
+    peer_sender: &str,
+    channel: &str,
+    text: &str,
+    envelope: &Value,
+    id: &str,
+    signed: bool,
+) -> DataResult<String> {
+    let reason = format!(
+        "body does not match its {} hash (after undoing Slack link markup): \
+         possible tampering or an unrecognised provider rewrite; not delivered",
+        if signed { "signed" } else { "declared" }
+    );
+    let declarations = load_declarations(state).unwrap_or_default();
+    let Some((_, _, declaration)) = declarations.iter().find(|(_, _, declaration)| {
+        declaration.relay_channels.iter().any(|entry| {
+            entry.route == route && (entry.channel.is_empty() || entry.channel == channel)
+        })
+    }) else {
+        return Ok(id.to_string());
+    };
+    let entry = declaration
+        .relay_channels
+        .iter()
+        .find(|entry| entry.route == route);
+    let _lock = lock_store(state)?;
+    {
+        let mut quarantine = load_json_list(&quarantine_path(state), "posts");
+        let posts = quarantine
+            .get_mut("posts")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| DataError::new("relay-quarantine", "posts is not a list"))?;
+        if !posts.iter().any(|post| {
+            post.get("id").and_then(Value::as_str) == Some(id)
+                && post.get("peer_sender").and_then(Value::as_str) == Some(peer_sender)
+        }) {
+            posts.push(json!({
+                "id": id, "peer_sender": peer_sender, "route": route,
+                "channel": channel, "envelope": envelope, "post": text,
+                "reason": reason, "quarantined_at": format_rfc3339_ms(now_unix_ms()),
+            }));
+            if posts.len() > 512 {
+                let excess = posts.len() - 512;
+                posts.drain(0..excess);
+            }
+        }
+        write_json_atomic(&quarantine_path(state), &quarantine)?;
+    }
+    let now_ms = now_unix_ms();
+    let mut alarm_index: Option<usize> = None;
+    {
+        let mut doc = load_json_list(&alarms_path(state), "alarms");
+        let list = doc
+            .get_mut("alarms")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| DataError::new("relay-alarms", "alarms is not a list"))?;
+        for (index, alarm) in list.iter().enumerate() {
+            if alarm.get("sender_id").and_then(Value::as_str) == Some(peer_sender)
+                && alarm.get("local_team").and_then(Value::as_str)
+                    == Some(declaration.team.as_str())
+                && alarm.get("kind").and_then(Value::as_str) == Some("integrity")
+                && alarm.get("state").and_then(Value::as_str) == Some("open")
+            {
+                alarm_index = Some(index);
+                break;
+            }
+        }
+        if let Some(index) = alarm_index {
+            list[index]["reason"] = json!(reason);
+            list[index]["quarantine_id"] = json!(id);
+            let mut ids: Vec<String> = list[index]
+                .get("quarantine_ids")
+                .and_then(Value::as_array)
+                .map(|list| {
+                    list.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !ids.iter().any(|existing| existing == id) {
+                ids.push(id.to_string());
+            }
+            list[index]["quarantine_ids"] = json!(ids);
+        } else {
+            list.push(json!({
+                "sender_id": peer_sender, "local_team": declaration.team,
+                "kind": "integrity", "quarantine_id": id, "quarantine_ids": [id],
+                "claimed_from": envelope.get("from"), "reason": reason,
+                "state": "open", "first_at": format_rfc3339_ms(now_ms),
+                "last_raised_at": Value::Null, "raises": 0,
+                "interval_seconds": entry.map_or(1800, |entry| entry.alarm_interval_seconds),
+            }));
+            alarm_index = Some(list.len() - 1);
+        }
+        write_json_atomic(&alarms_path(state), &doc)?;
+    }
+    log_event(
+        state,
+        &json!({"event": "integrity", "sender_id": peer_sender, "local_team": declaration.team, "id": id, "reason": reason}),
+    );
+    if let Some(index) = alarm_index {
+        let _ = raise_alarm_at(state, index, now_ms);
+    }
+    Ok(id.to_string())
+}
+
 /// Record an unparseable post as a STRANGER event. No envelope survived
 /// parsing, so quarantine is keyed by a hash of the raw post and the alarm
 /// carries no claimed team or host.
@@ -2275,7 +2538,29 @@ fn raise_alarm_at(state: &Path, index: usize, now_ms: i64) -> DataResult<bool> {
         "<invalid>".to_string()
     };
     let sender = clean(Some(&sender));
-    let rendered = if alarm.get("kind").and_then(Value::as_str) == Some("unparseable") {
+    let rendered = if alarm.get("kind").and_then(Value::as_str) == Some("integrity") {
+        format!(
+            "[relay alarm: body does not match its signed hash from confirmed sender {sender}]\n\
+             [team message: kind alarm; ESCALATE TO OWNER via this team's normal owner channel; reason: {}; post quarantined as evidence, not delivered]\n\
+             A confirmed sender's envelope body differs from the hash it carries, after undoing Slack link markup: possible tampering or an unrecognised provider rewrite. It can never be delivered, and this alarm repeats until it is dismissed.\n\
+             Quarantined: {}\n\
+             Dismiss: agent-teams relay quarantine dismiss {}   Status: agent-teams relay status\n",
+            clean(alarm.get("reason").and_then(Value::as_str)),
+            alarm
+                .get("quarantine_ids")
+                .and_then(Value::as_array)
+                .map(|ids| {
+                    ids.iter()
+                        .filter_map(Value::as_str)
+                        .map(|id| clean(Some(id)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .filter(|joined| !joined.is_empty())
+                .unwrap_or_else(|| clean(alarm.get("quarantine_id").and_then(Value::as_str))),
+            clean(alarm.get("quarantine_id").and_then(Value::as_str)),
+        )
+    } else if alarm.get("kind").and_then(Value::as_str) == Some("unparseable") {
         format!(
             "[relay alarm: unparseable post from confirmed sender {sender}]\n\
              [team message: kind alarm; ESCALATE TO OWNER via this team's normal owner channel; reason: {}; post quarantined, not delivered]\n\
@@ -2663,7 +2948,10 @@ pub fn drop_quarantined(state: &Path, id: &str) -> DataResult<bool> {
         let mut doc = load_json_list(&alarms_path(state), "alarms");
         if let Some(list) = doc.get_mut("alarms").and_then(Value::as_array_mut) {
             for alarm in list.iter_mut() {
-                if alarm.get("kind").and_then(Value::as_str) != Some("unparseable") {
+                if !matches!(
+                    alarm.get("kind").and_then(Value::as_str),
+                    Some("unparseable") | Some("integrity")
+                ) {
                     continue;
                 }
                 let names_id = alarm.get("quarantine_id").and_then(Value::as_str) == Some(id)
@@ -2825,7 +3113,7 @@ mod tests {
             0,
             7_200_000,
             None,
-            &"&".repeat(2_000),
+            &"&".repeat(400),
         );
         let post = render_post(&envelope);
         let fence_at = post.find("```").expect("fence");
@@ -2840,6 +3128,54 @@ mod tests {
             parse_post(&post).expect("parse"),
             RelayPost::Envelope(envelope),
             "the envelope survives whole"
+        );
+    }
+
+    #[test]
+    fn fence_escapes_slack_linked_chars_and_undo_restores_bodies() {
+        // #794: a body naming files, a URL and an email round-trips.
+        let envelope = crate::envelope::build_envelope(
+            "tm-link",
+            "k",
+            "sim",
+            "host-b",
+            1,
+            "harness-ancestry",
+            "tools",
+            "host-a",
+            "info",
+            None,
+            &[],
+            false,
+            0,
+            7_200_000,
+            None,
+            "touch cli.rs, see https://example.com/a.b and mail a@b.co & <x>",
+        );
+        let post = render_post(&envelope);
+        let fence = post.split("```agent-teams-envelope").nth(1).expect("fence");
+        assert!(!fence.contains("cli.rs"), "escaped fence: {fence}");
+        assert!(!fence.contains("https://"), "escaped fence: {fence}");
+        assert_eq!(
+            parse_post(&post).expect("parse"),
+            RelayPost::Envelope(envelope),
+            "escaped fence parses to the identical envelope"
+        );
+        // Receiver undo of Slack's markup restores the original body.
+        assert_eq!(
+            undo_slack_link_markup(
+                "touch <http://cli.rs|cli.rs>, see <https://example.com/a.b|https://example.com/a.b> and mail <mailto:a@b.co|a@b.co>"
+            ),
+            "touch cli.rs, see https://example.com/a.b and mail a@b.co"
+        );
+        assert_eq!(
+            undo_slack_link_markup("bare <https://example.com/x> stays"),
+            "bare https://example.com/x stays"
+        );
+        assert_eq!(
+            undo_slack_link_markup("keep <https://other|label> apart"),
+            "keep <https://other|label> apart",
+            "non-matching markup is not rewritten"
         );
     }
 

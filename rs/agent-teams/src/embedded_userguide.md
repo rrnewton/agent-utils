@@ -368,9 +368,15 @@ full body. An envelope whose fenced block alone exceeds the
 cap skips the route instead: a fallback stays deferred (its outbox
 entry names the reason as `too large for relay route ...`) and a mirror
 records `mirror-skipped`. `check` warns when `max_envelope_bytes` exceeds
-`max_post_bytes`. A signed envelope whose tag line was lost (the
-fence-only piece of a split) is still delivered: the signature, not the
-tag, is the authority. The envelope is authoritative — a provider may rewrite
+`max_post_bytes`. Inside the fence the envelope JSON escapes the
+characters Slack auto-links (`.`, `:`, `@`, `<`, `>`, `&`), so a body
+naming a file like `cli.rs`, a URL or an email survives Slack intact;
+a receiver also undoes Slack link markup from older posts and accepts
+only when the body hash then verifies. A body-hash mismatch that
+survives that undo, from a confirmed sender, is quarantined under its
+own integrity alarm kind (dismissable, kept as evidence). A
+signed envelope whose tag line was lost (the fence-only piece of a
+split) is still delivered: the signature, not the tag, is the authority. The envelope is authoritative — a provider may rewrite
 visible text, so the receiver re-derives the tag from the envelope and
 checks the body hash.
 Receipts go back in the post's thread (one line plus a fenced

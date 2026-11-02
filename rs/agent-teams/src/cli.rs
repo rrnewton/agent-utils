@@ -2979,6 +2979,18 @@ fn cmd_relay_alarms(globals: &Globals, args: &[String]) -> Result<i32, DataError
         println!("no open stranger alarms");
     }
     for alarm in &open {
+        if alarm.get("kind").and_then(Value::as_str) == Some("integrity") {
+            println!(
+                "RELAY ALARM (integrity): confirmed sender {} -> team {} ({}; raised {}x, last {}) — dismiss: agent-teams relay quarantine dismiss {}",
+                alarm["sender_id"].as_str().unwrap_or("?"),
+                alarm["local_team"].as_str().unwrap_or("?"),
+                alarm["reason"].as_str().unwrap_or("?"),
+                alarm["raises"].as_u64().unwrap_or(0),
+                alarm["last_raised_at"].as_str().unwrap_or("never"),
+                alarm["quarantine_id"].as_str().unwrap_or("?"),
+            );
+            continue;
+        }
         if alarm.get("kind").and_then(Value::as_str) == Some("unparseable") {
             println!(
                 "RELAY ALARM (unparseable): confirmed sender {} -> team {} ({}; raised {}x, last {}) — dismiss: agent-teams relay quarantine dismiss {}",

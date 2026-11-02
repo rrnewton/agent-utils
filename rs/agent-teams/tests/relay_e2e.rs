@@ -732,7 +732,8 @@ fn shared_bot_signed_identity_admits_forgery_is_stranger() {
     let outcome = world.relay_in(SHARED, &post);
     assert_eq!(outcome["outcome"], "known", "{outcome}");
     assert!(world.ledger_has("tools", &id), "exactly once");
-    // A tampered body fails verification: stranger, never delivered.
+    // A tampered body fails the hash check: from this confirmed sender
+    // it is filed under the integrity kind, never delivered (#794).
     let mut forged: serde_json::Value = serde_json::from_str(
         post.split("```agent-teams-envelope\n")
             .nth(1)
@@ -744,7 +745,14 @@ fn shared_bot_signed_identity_admits_forgery_is_stranger() {
     .expect("envelope json");
     forged["body"] = serde_json::json!("forged body");
     let outcome = world.relay_in(SHARED, &agent_teams::relay::render_post(&forged));
-    assert_eq!(outcome["outcome"], "stranger-quarantined", "{outcome}");
+    assert_eq!(outcome["outcome"], "not-recorded", "{outcome}");
+    assert!(
+        agent_teams::relay::alarms(&world.state)
+            .iter()
+            .any(|a| a["kind"] == "integrity" && a["state"] == "open"),
+        "integrity alarm: {:?}",
+        agent_teams::relay::alarms(&world.state)
+    );
     // An unsigned post while a key is trusted is a stranger too.
     let mut unsigned = forged.clone();
     unsigned.as_object_mut().unwrap().remove("relay");
@@ -2029,6 +2037,132 @@ fn envelope_alone_over_post_cap_skips_mirror_not_delivery() {
             .any(|a| a["classification"] == "mirror-skipped"),
         "{attempts:?}"
     );
+}
+
+#[test]
+fn slack_link_markup_is_rescued_and_hash_mismatch_is_integrity_not_stranger() {
+    // #794: an old sender's post whose body Slack auto-linked inside the
+    // fence is restored and delivered; a hash mismatch that cannot be
+    // restored is filed under integrity (dismissable), never stranger.
+    let world = World::new();
+    world.write_teams(MIRROR_TEAMS_LOCAL);
+    let post = world.root.join("bin/post.sh");
+    world.write_relay_route(true, &post.to_string_lossy());
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    let public = world.ensure_signing_key("sim");
+    agent_teams::relay::trust_key(&world.state, "sim", "host-a", &public, "test").expect("trust");
+    let (code, out, err) = world.run(&[
+        "send",
+        "tools@host-a",
+        "--from-team",
+        "sim",
+        "--text",
+        "touch cli.rs, see https://example.com/a.b and mail a@b.co",
+        "--key",
+        "link-markup-1",
+        "--json",
+    ]);
+    assert_eq!(code, 75, "{out} {err}");
+    let posts = world.channel_posts();
+    assert_eq!(posts.len(), 1);
+    // Old-sender form: unescape the fence, then let Slack link it.
+    let old = posts[0]
+        .replace("\\u002e", ".")
+        .replace("\\u003a", ":")
+        .replace("\\u0040", "@");
+    let mangled = old
+        .replace("cli.rs", "<http://cli.rs|cli.rs>")
+        .replace(
+            "https://example.com/a.b",
+            "<https://example.com/a.b|https://example.com/a.b>",
+        )
+        .replace("a@b.co", "<mailto:a@b.co|a@b.co>");
+    let outcome = world.relay_in(BOT1, &mangled);
+    assert!(
+        matches!(outcome["outcome"].as_str(), Some("accepted" | "known")),
+        "{outcome}"
+    );
+    assert_eq!(world.hook_inbox_texts("tools").len(), 1);
+    assert!(
+        world.hook_inbox_texts("tools")[0].contains("cli.rs"),
+        "original body delivered"
+    );
+
+    // A fresh message whose fence body is tampered so no markup undo
+    // can restore the hash.
+    let (code, out, err) = world.run(&[
+        "send",
+        "tools@host-a",
+        "--from-team",
+        "sim",
+        "--text",
+        "touch cli.rs again",
+        "--key",
+        "link-markup-2",
+        "--json",
+    ]);
+    assert_eq!(code, 75, "{out} {err}");
+    let posts = world.channel_posts();
+    let fresh = posts.last().expect("fresh post").clone();
+    let (head, tail) = fresh.split_at(fresh.find("```").expect("fence"));
+    let tampered = format!("{head}{}", tail.replace("again", "agaim"));
+    let outcome = world.relay_in(BOT1, &tampered);
+    assert_eq!(outcome["outcome"], "not-recorded", "{outcome}");
+    let alarms = agent_teams::relay::alarms(&world.state);
+    let alarm = alarms
+        .iter()
+        .find(|a| a["kind"] == "integrity" && a["state"] == "open")
+        .expect("integrity alarm for hash mismatch");
+    let qid = alarm["quarantine_id"].as_str().expect("qid").to_string();
+    let (code, out, err) = world.run(&["relay", "quarantine", "dismiss", &qid]);
+    assert_eq!(code, 0, "dismiss: {out} {err}");
+    assert!(
+        agent_teams::relay::alarms(&world.state)
+            .iter()
+            .all(|a| a["kind"] != "integrity" || a["state"] != "open"),
+        "dismiss closed the integrity alarm"
+    );
+}
+
+#[test]
+fn unsigned_legacy_post_is_rescued_from_slack_link_markup() {
+    // #794: an unsigned (legacy, mapping-admitted) old post whose body
+    // Slack auto-linked is restored by hash alone and delivered.
+    let world = World::new();
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    let envelope = agent_teams::envelope::build_envelope(
+        "tm-sim-1234567890abcdef",
+        "k",
+        "sim",
+        "host-a",
+        3,
+        "harness-ancestry",
+        "tools",
+        "host-a",
+        "info",
+        None,
+        &[],
+        false,
+        agent_teams::timeutil::now_unix_ms(),
+        agent_teams::timeutil::now_unix_ms() + 7_200_000,
+        None,
+        "legacy touch cli.rs and https://example.com/a.b",
+    );
+    let post = agent_teams::relay::render_post(&envelope);
+    let old = post
+        .replace("\\u002e", ".")
+        .replace("\\u003a", ":")
+        .replace("\\u0040", "@");
+    let mangled = old.replace("cli.rs", "<http://cli.rs|cli.rs>").replace(
+        "https://example.com/a.b",
+        "<https://example.com/a.b|https://example.com/a.b>",
+    );
+    let outcome = world.relay_in(BOT1, &mangled);
+    assert!(
+        matches!(outcome["outcome"].as_str(), Some("accepted" | "known")),
+        "{outcome}"
+    );
+    assert!(world.hook_inbox_texts("tools")[0].contains("cli.rs"));
 }
 
 #[test]

@@ -158,7 +158,6 @@ pub fn walk(
 ) -> DataResult<WalkResult> {
     let envelope = entry_value["envelope"].clone();
     let id = envelope["id"].as_str().unwrap_or_default().to_string();
-    let envelope_bytes = envelope.to_string().len();
     let not_after_ms = envelope["not_after"]
         .as_str()
         .and_then(parse_rfc3339_ms)
@@ -225,7 +224,7 @@ pub fn walk(
         let mut contact_released = false;
         let mut contact_settled: Option<String> = None;
         for route in routes_for {
-            if let Some(reason) = route.skip_reason(envelope_bytes) {
+            if let Some(reason) = route.skip_reason(route.size_for_skip(&envelope)) {
                 if reason.contains("max_post_bytes") {
                     too_large_skip = Some((route.name().to_string(), reason.clone()));
                 }
@@ -330,6 +329,26 @@ pub fn walk(
                     direct_win_this_walk = !route.is_relay();
                     contact_settled = Some(map_receiver_state(&answered_state));
                     break;
+                }
+                AttemptOutcome::Skipped(reason) => {
+                    // Typed definite skip (e.g. too large after escaping):
+                    // surface it like a skip_reason and try the next route.
+                    if reason.contains("max_post_bytes") {
+                        too_large_skip = Some((route.name().to_string(), reason.clone()));
+                    }
+                    record_attempt(
+                        entry_value,
+                        &label,
+                        route.name(),
+                        "accept",
+                        "not-delivered",
+                        &reason,
+                    );
+                    steps.push(WalkStep {
+                        contact: label.clone(),
+                        route: route.name().to_string(),
+                        detail: format!("skipped ({reason})"),
+                    });
                 }
                 AttemptOutcome::NotDelivered(reason) => {
                     record_attempt(
@@ -502,7 +521,8 @@ pub fn walk(
                     "mirror-skipped",
                     "--private: route exposes the body".to_string(),
                 )
-            } else if let Some(reason) = mirror.mirror_skip_reason(envelope_bytes) {
+            } else if let Some(reason) = mirror.mirror_skip_reason(mirror.size_for_skip(&envelope))
+            {
                 ("mirror-skipped", reason)
             } else {
                 match mirror.run_mirror(&envelope) {
@@ -510,6 +530,7 @@ pub fn walk(
                         "mirror-posted",
                         answer["state"].as_str().unwrap_or("posted").to_string(),
                     ),
+                    AttemptOutcome::Skipped(reason) => ("mirror-skipped", reason),
                     AttemptOutcome::NotDelivered(reason) => ("mirror-failed", reason),
                     AttemptOutcome::Ambiguous(reason) => ("mirror-failed", reason),
                 }
@@ -598,6 +619,16 @@ fn ask_receipt(
                     route.name(),
                     "receipt",
                     "ambiguous",
+                    &reason,
+                );
+            }
+            AttemptOutcome::Skipped(reason) => {
+                record_attempt(
+                    entry_value,
+                    label,
+                    route.name(),
+                    "receipt",
+                    "not-delivered",
                     &reason,
                 );
             }

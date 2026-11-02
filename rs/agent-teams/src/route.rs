@@ -17,6 +17,9 @@ pub enum AttemptOutcome {
     NotDelivered(String),
     /// Anything else; resolved by asking, never by resending blind.
     Ambiguous(String),
+    /// Definite skip decided before posting (e.g. too large for the
+    /// route): typed, so callers classify it without matching text.
+    Skipped(String),
 }
 
 /// A route: a way to run `agent-teams serve VERB` on a target host.
@@ -57,6 +60,11 @@ pub trait Route {
     /// A definite skip reason known before attempting (link down, too large).
     fn skip_reason(&self, _envelope_bytes: usize) -> Option<String> {
         None
+    }
+    /// The size this route should judge an envelope by: relay routes
+    /// judge the escaped fence serialization, not the raw envelope.
+    fn size_for_skip(&self, envelope: &Value) -> usize {
+        envelope.to_string().len()
     }
 }
 
@@ -545,8 +553,19 @@ pub struct ChatRelayRoute {
 impl ChatRelayRoute {
     /// Whether the fenced envelope alone exceeds this route's post cap.
     fn envelope_alone_too_big(&self, envelope_bytes: usize) -> bool {
+        // Estimate only (the rendered fence JSON-escapes characters at
+        // 5 extra bytes each, #794): the exact rendered size is checked
+        // again before anything is posted.
         envelope_bytes + crate::relay::fence_overhead() + crate::relay::TAG_AND_JOINS_MARGIN_BYTES
             > self.max_post_bytes
+    }
+    fn rendered_too_big(&self, text: &str) -> Option<String> {
+        (crate::relay::measured_post_bytes(text) > self.max_post_bytes).then(|| {
+            format!(
+                "rendered post exceeds max_post_bytes {} (one post per envelope)",
+                self.max_post_bytes
+            )
+        })
     }
     fn envelope_too_big_reason(&self, envelope_bytes: usize) -> String {
         format!(
@@ -636,6 +655,9 @@ impl ChatRelayRoute {
 }
 
 impl Route for ChatRelayRoute {
+    fn size_for_skip(&self, envelope: &Value) -> usize {
+        crate::relay::fence_json(envelope).len()
+    }
     fn name(&self) -> &str {
         &self.name
     }
@@ -684,6 +706,9 @@ impl Route for ChatRelayRoute {
             }
         }
         let text = crate::relay::render_post_with_limit(envelope, self.max_post_bytes);
+        if let Some(reason) = self.rendered_too_big(&text) {
+            return AttemptOutcome::Skipped(reason);
+        }
         match crate::relay::run_post_argv_with_timeout(
             &self.post_argv,
             &self.channel,
@@ -748,6 +773,9 @@ impl Route for ChatRelayRoute {
                     }
                 }
                 let text = crate::relay::render_post_with_limit(payload, self.max_post_bytes);
+                if let Some(reason) = self.rendered_too_big(&text) {
+                    return AttemptOutcome::Skipped(reason);
+                }
                 match crate::relay::run_post_argv_with_timeout(
                     &self.post_argv,
                     &self.channel,
