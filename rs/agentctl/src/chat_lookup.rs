@@ -153,6 +153,23 @@ fn register_in(directory: &Path, state: &Path, registry: &Path) -> io::Result<Pa
     Ok(path)
 }
 
+/// The registry the index records for the bridge whose state directory is `state`, if any
+/// (#791 chat-health-wrong-registry).
+#[must_use]
+pub fn registry_for_state(state: &Path) -> Option<PathBuf> {
+    let directory = index_directory()?;
+    registry_for_state_in(&directory, state)
+}
+
+/// [`registry_for_state`] in the index directory `directory`.
+fn registry_for_state_in(directory: &Path, state: &Path) -> Option<PathBuf> {
+    let state = fs::canonicalize(state).ok()?;
+    index_entries_in(directory)
+        .into_iter()
+        .find(|(_, entry)| entry.state == state)
+        .map(|(_, entry)| entry.registry)
+}
+
 /// Remove index entries whose state directory no longer holds a `bridge.json`.
 fn prune(directory: &Path) {
     for (path, entry) in index_entries_in(directory) {
@@ -801,6 +818,26 @@ pub fn migrate_state(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_index_names_the_registry_a_bridge_state_runs_with() {
+        // #791: `chat health` takes the bridge's registry from here when no service runs.
+        let root = std::env::temp_dir().join(format!("agentctl-lookup-791-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let index = root.join("index");
+        let state = root.join("state");
+        fs::create_dir_all(&state).unwrap();
+        fs::write(state.join("bridge.json"), "{}").unwrap();
+        fs::create_dir_all(root.join("team/.agentctl")).unwrap();
+        assert_eq!(registry_for_state_in(&index, &state), None);
+        register_in(&index, &state, &root.join("team/.agentctl")).unwrap();
+        assert_eq!(
+            registry_for_state_in(&index, &state),
+            Some(fs::canonicalize(root.join("team/.agentctl")).unwrap())
+        );
+        assert_eq!(registry_for_state_in(&index, &root.join("other")), None);
+        let _ = fs::remove_dir_all(&root);
+    }
     use super::*;
 
     #[test]

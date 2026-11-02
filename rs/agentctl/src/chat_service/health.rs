@@ -3,6 +3,7 @@
 //! agent's pane; it writes nothing and never contacts the chat provider.
 
 use std::fmt::Write as _;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -188,6 +189,133 @@ fn stranded_sink_config(state_root: &Path) -> Option<PathBuf> {
     candidates.into_iter().next()
 }
 
+/// The registry a bridge runs with, and how `chat health` learned it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BridgeRegistry {
+    /// The registry directory.
+    pub path: PathBuf,
+    /// `service command line` or `bridge index`.
+    pub source: &'static str,
+}
+
+/// The registry the bridge whose state is `state_root` runs with: the `--registry` argument of
+/// its running `chat run` (resolved against that process's working directory), else the
+/// registry that `chat run` recorded for the state in the bridge index; `None` when neither is
+/// known (#791 chat-health-wrong-registry).
+#[must_use]
+pub fn bridge_registry(state_root: &Path) -> Option<BridgeRegistry> {
+    let runner = BridgeState::inspect(state_root)
+        .ok()
+        .and_then(|state| state.runner_pid());
+    if let Some(path) = runner.and_then(service_registry_argument) {
+        return Some(BridgeRegistry {
+            path,
+            source: "service command line",
+        });
+    }
+    crate::chat_lookup::registry_for_state(state_root).map(|path| BridgeRegistry {
+        path,
+        source: "bridge index",
+    })
+}
+
+/// The `--registry` value of process `pid`'s command line, made absolute against its working
+/// directory.
+fn service_registry_argument(pid: u64) -> Option<PathBuf> {
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let argv: Vec<&[u8]> = cmdline.split(|byte| *byte == 0).collect();
+    let value = argv.windows(2).find_map(|pair| {
+        if pair[0] == b"--registry" {
+            Some(pair[1])
+        } else {
+            pair[0].strip_prefix(b"--registry=")
+        }
+    })?;
+    let value = PathBuf::from(std::ffi::OsStr::from_bytes(value));
+    if value.as_os_str().is_empty() {
+        return None;
+    }
+    if value.is_absolute() {
+        return Some(value);
+    }
+    let cwd = std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
+    Some(cwd.join(value))
+}
+
+/// Which registry `chat health` probes the target in, and what it says about that.
+#[derive(Clone, Debug)]
+pub struct RegistryChoice {
+    /// The registry to probe the target in.
+    pub probe: PathBuf,
+    /// The `registry` section of the report.
+    pub document: Value,
+    /// The report line, when the bridge's registry is not the one the command was given.
+    pub line: Option<String>,
+    /// Set when the bridge's registry differs and cannot be used: a target the given registry
+    /// does not know is then reported as this mismatch, not as down.
+    pub mismatch: Option<String>,
+}
+
+fn same_directory(left: &Path, right: &Path) -> bool {
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+/// Probe the target in the bridge's own registry when it is known and differs from `given`, the
+/// registry this command was given, so a caller in another project does not see a working
+/// bridge as down; `given` otherwise.
+#[must_use]
+pub fn choose_registry(given: &Path, bridge: Option<BridgeRegistry>) -> RegistryChoice {
+    let document = |probe: &Path| {
+        json!({
+            "given": given,
+            "bridge": bridge.as_ref().map(|found| &found.path),
+            "bridge_source": bridge.as_ref().map(|found| found.source),
+            "probed": probe,
+        })
+    };
+    match bridge.as_ref() {
+        Some(found) if !same_directory(&found.path, given) => {
+            if found.path.is_dir() {
+                RegistryChoice {
+                    probe: found.path.clone(),
+                    document: document(&found.path),
+                    line: Some(format!(
+                        "registry: the bridge runs with {} (from its {}), not {}, which this \
+                         command was given; the target was looked up in the bridge's",
+                        found.path.display(),
+                        found.source,
+                        given.display()
+                    )),
+                    mismatch: None,
+                }
+            } else {
+                let mismatch = format!(
+                    "registry mismatch: the bridge runs with {} (from its {}), which cannot be \
+                     read here; the target was looked up in {}, which this command was given",
+                    found.path.display(),
+                    found.source,
+                    given.display()
+                );
+                RegistryChoice {
+                    probe: given.to_path_buf(),
+                    document: document(given),
+                    line: Some(mismatch.clone()),
+                    mismatch: Some(mismatch),
+                }
+            }
+        }
+        _ => RegistryChoice {
+            probe: given.to_path_buf(),
+            document: document(given),
+            line: None,
+            mismatch: None,
+        },
+    }
+}
+
 /// What `chat health` read, before it judges it.
 struct Observed {
     configuration: chat_runtime::BridgeConfiguration,
@@ -207,14 +335,18 @@ struct Observed {
     unsent: Vec<UnsentReply>,
     /// [`stranded_sink_config`], as text.
     stranded_sinks: Option<String>,
+    /// [`choose_registry`].
+    registry: RegistryChoice,
     now: u64,
 }
 
-/// Build the `chat health` report for the bridge state at `state_root`.
+/// Build the `chat health` report for the bridge state at `state_root`, with `manager` on the
+/// registry `registry` chose ([`choose_registry`]).
 pub fn health<A: ManagedApi + ?Sized>(
     state_root: &Path,
     manager: &ManagedAgents<'_, A>,
     options: HealthOptions,
+    registry: RegistryChoice,
 ) -> Result<Health, ChatServiceError> {
     let state = BridgeState::inspect(state_root)?;
     let now = chat_runtime::unix_millis();
@@ -232,6 +364,7 @@ pub fn health<A: ManagedApi + ?Sized>(
         unsent: state.unsent_replies()?,
         stranded_sinks: stranded_sink_config(state_root).map(|path| path.display().to_string()),
         configuration: state.config().clone(),
+        registry,
         now,
     };
     Ok(assess(observed, options))
@@ -252,6 +385,7 @@ fn assess(observed: Observed, options: HealthOptions) -> Health {
         times,
         unsent,
         stranded_sinks,
+        registry,
         now,
     } = observed;
     let configuration = &configuration;
@@ -318,7 +452,12 @@ fn assess(observed: Observed, options: HealthOptions) -> Health {
     }
 
     if let Some(problem) = target_problem {
-        problems.down.push(problem);
+        // Looked up in a registry the bridge does not use, an unknown or dead target says
+        // nothing about the bridge: report the mismatch, not down (#791).
+        match registry.mismatch.as_ref() {
+            Some(mismatch) => problems.degraded.push(format!("{mismatch} ({problem})")),
+            None => problems.down.push(problem),
+        }
     }
     if let Some(old) = &stranded_sinks {
         problems.degraded.push(format!(
@@ -490,6 +629,9 @@ fn assess(observed: Observed, options: HealthOptions) -> Health {
 
     let mut text = headline;
     text.push('\n');
+    if let Some(line) = registry.line.as_ref() {
+        let _ = writeln!(text, "{line}");
+    }
     let _ = writeln!(
         text,
         "service: {}",
@@ -647,6 +789,7 @@ fn assess(observed: Observed, options: HealthOptions) -> Health {
         "reply_breaker": status["reply_breaker"],
         "service_health": status["service_health"],
         "repoint": status["repoint"],
+        "registry": registry.document,
     });
     Health {
         verdict,
@@ -705,6 +848,7 @@ mod tests {
             times: vec![request("a", "delivered", 1)],
             unsent: Vec::new(),
             stranded_sinks: None,
+            registry: choose_registry(Path::new("/registry"), None),
             now: NOW,
         }
     }
@@ -807,6 +951,125 @@ mod tests {
         observed.runner = None;
         observed.owner_loop = Some((12 * 60_000, Some(Duration::from_secs(300))));
         assert_eq!(assess(observed, options()).verdict, "down");
+    }
+
+    #[test]
+    fn the_target_is_looked_up_in_the_bridges_registry_and_a_mismatch_is_not_down() {
+        // #791: run from another project, chat health looked the target up in that project's
+        // registry and called a working bridge down.
+        let root = std::env::temp_dir().join(format!("agentctl-791-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let given = root.join("caller/.agentctl");
+        let bridge = root.join("team/.agentctl");
+        std::fs::create_dir_all(&given).unwrap();
+        std::fs::create_dir_all(&bridge).unwrap();
+
+        let same = choose_registry(
+            &given,
+            Some(BridgeRegistry {
+                path: given.clone(),
+                source: "bridge index",
+            }),
+        );
+        assert_eq!(same.probe, given);
+        assert!(same.line.is_none() && same.mismatch.is_none());
+        let unknown = choose_registry(&given, None);
+        assert_eq!(unknown.probe, given);
+        assert!(unknown.line.is_none());
+
+        let other = choose_registry(
+            &given,
+            Some(BridgeRegistry {
+                path: bridge.clone(),
+                source: "service command line",
+            }),
+        );
+        assert_eq!(other.probe, bridge);
+        assert!(other.mismatch.is_none());
+        let line = other.line.clone().unwrap();
+        assert!(line.contains("from its service command line"), "{line}");
+        let mut observed = healthy();
+        observed.registry = other;
+        let health = assess(observed, options());
+        assert_eq!(health.verdict, "ok", "{}", health.text);
+        assert!(
+            health.text.contains("registry: the bridge runs with"),
+            "{}",
+            health.text
+        );
+        assert_eq!(
+            health.document["registry"]["bridge_source"],
+            "service command line"
+        );
+
+        // A bridge registry that cannot be read here: the target problem found in the given
+        // registry is a registry mismatch, degraded, never down.
+        let missing = choose_registry(
+            &given,
+            Some(BridgeRegistry {
+                path: root.join("gone/.agentctl"),
+                source: "bridge index",
+            }),
+        );
+        assert_eq!(missing.probe, given);
+        let mut observed = healthy();
+        observed.registry = missing;
+        observed.target = (
+            json!({"agent": "coord", "alive": false}),
+            Some("target coord is not a usable registered agent: unknown agent".to_owned()),
+        );
+        let health = assess(observed, options());
+        assert_eq!(health.verdict, "degraded", "{}", health.text);
+        assert!(health.text.contains("registry mismatch"), "{}", health.text);
+        assert!(health.document["problems"]["down"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_services_own_registry_argument_is_read_from_its_command_line() {
+        let root = std::env::temp_dir().join(format!("agentctl-791-cmd-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        for (arguments, expected) in [
+            (
+                vec!["--registry", "team/.agentctl"],
+                root.join("team/.agentctl"),
+            ),
+            (
+                vec!["--registry=/abs/.agentctl"],
+                PathBuf::from("/abs/.agentctl"),
+            ),
+        ] {
+            let mut child = std::process::Command::new("sh")
+                .args(["-c", "sleep 30; :", "agentctl"])
+                .args(&arguments)
+                .args(["chat", "run"])
+                .current_dir(&root)
+                .spawn()
+                .unwrap();
+            let pid = u64::from(child.id());
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut found = None;
+            while found.is_none() && std::time::Instant::now() < deadline {
+                found = service_registry_argument(pid);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            let canonical = |path: &Path| {
+                std::fs::canonicalize(path.parent().unwrap()).map_or(path.to_path_buf(), |parent| {
+                    parent.join(path.file_name().unwrap())
+                })
+            };
+            assert_eq!(
+                found.as_deref().map(canonical),
+                Some(canonical(&expected)),
+                "{arguments:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

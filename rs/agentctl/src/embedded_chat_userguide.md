@@ -3086,6 +3086,13 @@ with exit status 70 so that its unit starts it again; every blocking step of
 a round is bounded well below the bound (a delivery waits at most 5 seconds
 for the coordinator's locks and ends `--ready-timeout` plus 30 seconds after
 it starts, leaving the request pending for the next pass).
+The target is looked up in the registry the bridge itself runs with: the
+running service's `--registry`, else the registry `chat run` recorded for the
+state in the bridge index, else the command's own `--registry`. A registry that
+differs from the command's is named on a line of its own, so running `chat
+health` from another project no longer reports a working bridge as down; when
+the bridge's registry cannot be read there, a target the command's registry
+does not know is reported as a DEGRADED registry mismatch, not DOWN.
 `--json` prints the whole report (schema `agentctl-chat-health/v1`). The
 command writes nothing and never contacts the chat provider. Exit status: 0 OK,
 3 DEGRADED, 1 DOWN or STALLED, so a timer or another agent can act on it; when

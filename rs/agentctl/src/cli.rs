@@ -1455,7 +1455,7 @@ enum ChatCommand {
     /// Say in one line whether a bridge works, then why: service, channels, event stream, target
     /// agent, last activity, stuck or uncertain requests and reply retry loops
     #[command(
-        after_help = "Examples:\n  agentctl --registry ~/project/.agentctl chat health --bridge-state ~/.local/state/agentctl/chat\n  agentctl --registry ~/project/.agentctl chat health --bridge-state DIR --json\n\nThe first line is the verdict: `chat health: OK: ...`, or DEGRADED or DOWN followed by every\nproblem found. DOWN: no chat run holds the state (its runner lock, read from /proc/locks), another\nbridge holds one of its channels, the event stream stopped on a gap or boundary mismatch, or the\ntarget agent is not registered, its pane is not alive, or Herdr detects no harness there.\nDEGRADED: the event stream delivered nothing (no batch, no heartbeat) for --stale-after, the subscription or send path is down,\nthe owner loop is failing, requests are stalled untyped or have uncertain delivery, a reply was\nretried 20 or more times or will never be sent, a captured reply is unsent after 10 minutes, the\nreply breaker holds a thread, or a repoint is not applied yet. STALLED: the service runs but its owner loop has not turned\nfor its --stall-restart-after bound (from owner-loop-alive in the state directory); chat run then stops itself to be restarted. The lines after it give the service\nprocess, each channel's lock holder, the event stream's last item and checkpoint write, the target's pane, harness and\nstatus, the last admitted, delivered and replied times (UTC and age), request counts, each\nuncertain request's reason, each retry loop, and the last repoint. --json prints the whole report\n(schema agentctl-chat-health/v1). It reads the state, /proc/locks, the registry and Herdr; it\nwrites nothing and never contacts the chat provider. Exit status: 0 OK, 3 DEGRADED, 1 DOWN or STALLED."
+        after_help = "Examples:\n  agentctl --registry ~/project/.agentctl chat health --bridge-state ~/.local/state/agentctl/chat\n  agentctl --registry ~/project/.agentctl chat health --bridge-state DIR --json\n\nThe first line is the verdict: `chat health: OK: ...`, or DEGRADED or DOWN followed by every\nproblem found. DOWN: no chat run holds the state (its runner lock, read from /proc/locks), another\nbridge holds one of its channels, the event stream stopped on a gap or boundary mismatch, or the\ntarget agent is not registered, its pane is not alive, or Herdr detects no harness there.\nDEGRADED: the event stream delivered nothing (no batch, no heartbeat) for --stale-after, the subscription or send path is down,\nthe owner loop is failing, requests are stalled untyped or have uncertain delivery, a reply was\nretried 20 or more times or will never be sent, a captured reply is unsent after 10 minutes, the\nreply breaker holds a thread, or a repoint is not applied yet. STALLED: the service runs but its owner loop has not turned\nfor its --stall-restart-after bound (from owner-loop-alive in the state directory); chat run then stops itself to be restarted. The lines after it give the service\nprocess, each channel's lock holder, the event stream's last item and checkpoint write, the target's pane, harness and\nstatus, the last admitted, delivered and replied times (UTC and age), request counts, each\nuncertain request's reason, each retry loop, and the last repoint. --json prints the whole report\n(schema agentctl-chat-health/v1). The target is looked up in the registry the bridge runs with: its running\nservice's --registry, else the one `chat run` recorded in the bridge index, else --registry; a differing\nregistry is named on its own line, and one that cannot be read turns a missing target into a DEGRADED\nregistry mismatch, never DOWN. It reads the state, /proc/locks, the registry and Herdr; it\nwrites nothing and never contacts the chat provider. Exit status: 0 OK, 3 DEGRADED, 1 DOWN or STALLED."
     )]
     Health(ChatHealth),
     /// Report each request's time from posted to admitted, acknowledged, delivered and first reply,
@@ -4389,13 +4389,20 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
         ChatCommand::Health(value) => {
             let client =
                 HerdrClient::with_executable("direct", &herdr_bin).map_err(AgentError::from)?;
-            let manager = ManagedAgents::new(&client, &registry)?;
+            let state_dir = value.state.dir(&registry);
+            // The target is looked up in the registry the bridge itself runs with (#791).
+            let choice = crate::chat_service::health::choose_registry(
+                &registry,
+                crate::chat_service::health::bridge_registry(&state_dir),
+            );
+            let manager = ManagedAgents::new(&client, &choice.probe)?;
             let report = crate::chat_service::health::health(
-                &value.state.dir(&registry),
+                &state_dir,
                 &manager,
                 crate::chat_service::health::HealthOptions {
                     stale_after: value.stale_after,
                 },
+                choice,
             )
             .map_err(Failure::Chat)?;
             if value.json {
