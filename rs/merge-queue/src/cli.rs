@@ -10,6 +10,7 @@ use crate::model::ItemStatus;
 use crate::ops::{self, Submission};
 use crate::plan::{render, short};
 use crate::run::{self, RunOptions, RunReport, Runner};
+use crate::serve::{self, ServeOptions};
 use crate::state::{
     ClassRule, Config, GitHubConfig, IdentityConfig, LandConfig, RegenerateConfig, State,
     ValidatorConfig, DEFAULT_DEPTH, DEFAULT_MAX_BATCH, DEFAULT_PRIORITY,
@@ -26,7 +27,9 @@ Examples:
   merge-queue plan --json > plan.json
   merge-queue run --dry-run
   merge-queue run --depth 2
-  merge-queue widen";
+  merge-queue widen
+  merge-queue serve
+  merge-queue status";
 
 /// Local merge queue: order, batch, validate and land ready changes while keeping the base green.
 #[derive(Debug, Parser)]
@@ -297,6 +300,33 @@ enum Command {
         /// Print the run report as JSON instead of Markdown.
         #[arg(long)]
         json: bool,
+    },
+    /// Run the queue forever: watch for submitted changes and a moving base, land batches.
+    Serve {
+        /// Idle poll interval in milliseconds (items watch + heartbeat cadence).
+        #[arg(long, default_value_t = serve::DEFAULT_POLL_MS)]
+        poll_ms: u64,
+        /// Seconds between `git ls-remote` base polls.
+        #[arg(long, default_value_t = serve::DEFAULT_BASE_POLL_SECS)]
+        base_poll_secs: u64,
+        /// Run at most one work cycle, then exit (scripts and tests).
+        #[arg(long)]
+        once: bool,
+        /// Override the configured depth for work cycles.
+        #[arg(long)]
+        depth: Option<usize>,
+        /// Override the configured maximum batch size for work cycles.
+        #[arg(long)]
+        max_batch: Option<usize>,
+    },
+    /// Show daemon liveness, the current window and slot occupancy.
+    Status {
+        /// Print the status report as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Heartbeat age in seconds after which a live daemon counts as stale.
+        #[arg(long, default_value_t = serve::DEFAULT_STALE_AFTER_SECS)]
+        stale_after_secs: u64,
     },
     /// Run the complete suite on the base and discharge the obligations it covers.
     Widen {
@@ -808,6 +838,41 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             let report = runner.run()?;
             print_report(&report, json)?;
             Ok(if report.stopped.is_empty() { 0 } else { 3 })
+        }
+        Command::Serve {
+            poll_ms,
+            base_poll_secs,
+            once,
+            depth,
+            max_batch,
+        } => serve::serve(
+            &state,
+            &ServeOptions {
+                poll: std::time::Duration::from_millis(poll_ms.max(10)),
+                base_poll: std::time::Duration::from_secs(base_poll_secs),
+                once,
+                depth,
+                max_batch,
+            },
+        ),
+        Command::Status {
+            json,
+            stale_after_secs,
+        } => {
+            if !state.exists() {
+                return Err(format!(
+                    "no merge queue at {} (daemon cannot be running); remedy: run `merge-queue init` first, then `merge-queue serve`",
+                    state.root.display()
+                ));
+            }
+            let report = serve::collect_status(&state, stale_after_secs)?;
+            if json {
+                let text = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
+                println!("{text}");
+            } else {
+                print!("{}", serve::render_status(&report));
+            }
+            Ok(if report.daemon.healthy() { 0 } else { 1 })
         }
         Command::Widen { json } => {
             let _lock = state.lock()?;

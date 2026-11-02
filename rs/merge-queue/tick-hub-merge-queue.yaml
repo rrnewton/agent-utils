@@ -1,0 +1,25 @@
+# tick-hub launcher alternative to the systemd unit: one tick checks that
+# the serve daemon is alive and asks for a restart when it is not. Edit the
+# clone path and binary path, then run one tick with:
+#   tick-hub tick --config rs/merge-queue/tick-hub-merge-queue.yaml
+description: |-
+  Keep merge-queue serve running without an agent driving the queue loop.
+
+reminders:
+  - name: merge_queue_serve_alive
+    cadence_secs: 0
+    gate:
+      # `status` exits 0 only when the daemon is running with a fresh
+      # heartbeat; `when: failure` fires this ACTION on any other verdict.
+      cmd: "cd /path/to/clone && /path/to/merge-queue status >/dev/null 2>&1"
+      when: failure
+    emit:
+      kind: action
+      skill: merge-queue-serve
+      title: "merge-queue serve is not healthy: run `merge-queue status` in /path/to/clone, then start it with `merge-queue serve` (or `systemctl --user start merge-queue-serve`)"
+
+health_checks:
+  - name: merge_queue_heartbeat
+    glob: /path/to/clone/.git/merge-queue/serve.heartbeat.json
+    threshold_secs: 120
+    detail: merge-queue serve heartbeat

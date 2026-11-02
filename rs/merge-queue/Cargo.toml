@@ -13,6 +13,7 @@ authors.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4.5", features = ["derive"] }
 fs2 = "0.4"
+signal-hook = "0.3"
 pr-landing-planner = { path = "../pr-landing-planner" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

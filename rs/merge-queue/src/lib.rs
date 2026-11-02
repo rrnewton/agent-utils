@@ -17,6 +17,7 @@ pub mod ops;
 pub mod plan;
 pub mod probe_cache;
 pub mod run;
+pub mod serve;
 pub mod state;
 pub mod sync;
 pub mod tests;

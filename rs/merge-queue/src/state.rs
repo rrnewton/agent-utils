@@ -5,6 +5,8 @@
 //!   config.json            fixed: queue configuration
 //!   probe-cache.json       fixed: cached planning probes (see `probe_cache`)
 //!   lock                   fixed: writer lock (flock)
+//!   serve.pid              fixed: `serve` daemon pid (removed on a graceful stop)
+//!   serve.heartbeat.json   fixed: `serve` heartbeat, rewritten every cycle
 //!   union.attributes       fixed: generated from `union_paths`, when set
 //!   api-budget.json        fixed: API requests charged in the last hour (bounded)
 //!   items/<pr>.json        one record per submitted change
@@ -383,6 +385,16 @@ impl State {
     /// Path of the configuration file.
     pub fn config_path(&self) -> PathBuf {
         self.root.join("config.json")
+    }
+
+    /// Path of the `serve` daemon pid file.
+    pub fn serve_pid_path(&self) -> PathBuf {
+        self.root.join("serve.pid")
+    }
+
+    /// Path of the `serve` daemon heartbeat file.
+    pub fn serve_heartbeat_path(&self) -> PathBuf {
+        self.root.join("serve.heartbeat.json")
     }
 
     /// Directory of item records.

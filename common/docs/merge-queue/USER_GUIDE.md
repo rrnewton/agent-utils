@@ -6,8 +6,10 @@ exact combined tree, and lands only trees that passed. It runs where your clone 
 hosted service, no webhook and no inbound connection.
 
 Commands: `init`, `submit`, `withdraw`, `list` and `plan` decide what can land; `run` builds,
-validates and lands it; `widen` and `obligations` track focused landings until the complete suite
-has run; `bench` measures the landing rate against a serial lander on a synthetic repository.
+validates and lands it; `serve` runs that loop forever so nobody has to drive it by hand, and
+`status` reports whether the daemon is alive; `widen` and `obligations` track focused landings
+until the complete suite has run; `bench` measures the landing rate against a serial lander on
+a synthetic repository.
 
 **Requirements.** `git` 2.40 or newer, for `merge-tree --write-tree --merge-base`. The repository
 can be a working clone or a bare repository.
@@ -68,7 +70,11 @@ individual tests, and the queue tracks exactly which of them ran.
 Exit status: `0` on success, `1` on an error before any work started (printed as
 `merge-queue: ...` on stderr), `2` on a usage error, `3` when `run` stopped early (broken base,
 landing failure, or an error during the run, which the report records as `stopped: "error: ..."`)
-or `widen` found the complete suite red.
+or `widen` found the complete suite red. `status` exits `0` only when the daemon is running
+with a fresh heartbeat, and `1` when it is not running, dead, stale or malformed (the output
+names the verdict and the remedy). Exit codes 126 and 127 are never success. `status` exits `0` only when the daemon is running
+with a fresh heartbeat, and `1` when it is not running, dead, stale or malformed (the output
+names the verdict and the remedy). Exit codes 126 and 127 are never success.
 
 ## Commands
 
@@ -216,6 +222,114 @@ The exit status is `3` when the run stopped early; the report's `stopped` field 
 error in the middle of a run (a Git or validator failure) stops it the same way, and the report is
 still written.
 
+### `merge-queue serve`
+
+This command runs the queue forever: deterministic code that is always running, so agents submit
+changes and never drive the queue loop by hand. While idle it holds **no** writer lock. It polls
+the `items/` directory fingerprint every `--poll-ms` (default `250`) and polls the remote base
+with a cheap `git ls-remote` every `--base-poll-secs` (default `30`). A changed fingerprint (a
+new `submit`, `sync` or `withdraw`) or a moved base triggers one work cycle: the daemon takes the
+writer lock, plans, and runs the same `Runner` path as `run` (the logic is not forked), then
+releases the lock and goes back to idle polling. A cycle that finds the lock held, a refused
+validation, or a failed base poll is recorded in the heartbeat and retried on the next trigger;
+it never kills the daemon. Stop it with SIGINT or SIGTERM (Ctrl-C); a graceful stop removes the
+pid file, a crash leaves it behind for `status` to report.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--poll-ms N` | `250` | Idle poll interval in milliseconds: `items/` watch and heartbeat cadence (at least 10). |
+| `--base-poll-secs N` | `30` | Seconds between `git ls-remote` base polls. `0` polls the base every cycle. |
+| `--once` | off | Run at most one work cycle, then exit. For scripts and tests. |
+| `--depth N` | the configured `depth` | Override the initial window for work cycles. |
+| `--max-batch N` | the configured `max_batch` | Override the batch size for work cycles. |
+
+### `merge-queue status`
+
+This command reports daemon liveness, the current window and slot occupancy without taking the
+writer lock. Liveness comes from `serve.pid` and `serve.heartbeat.json` in the state directory
+(the daemon rewrites the heartbeat every cycle): `running` (pid alive, heartbeat fresh), `not
+running` (no pid file), `dead` (pid file names a dead process), `stale` (pid alive but the
+heartbeat is older than `--stale-after-secs`), or `malformed` (pid file unreadable). Every
+non-running verdict names its remedy. The window is the daemon's active batches (or the newest
+run's plan when no daemon heartbeat exists); slots count the `scratch/slot-*` checkouts.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--json` | off | Print the status report as JSON (`daemon`, `pid`, `heartbeat`, queue counts, `active_batches`, slots, `remedy`). |
+| `--stale-after-secs N` | `10` | Heartbeat age in seconds after which a live daemon counts as stale. |
+
+### Running `serve` as a service
+
+A systemd user unit ships at `rs/merge-queue/merge-queue-serve.service` (`Restart=on-failure`,
+`ExecStart` pointing at `serve`). Edit its `WorkingDirectory` and `ExecStart` paths, then:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp rs/merge-queue/merge-queue-serve.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now merge-queue-serve
+merge-queue status   # daemon: running ...
+```
+
+The tick-hub launcher alternative ships at `rs/merge-queue/tick-hub-merge-queue.yaml`: each tick
+runs `merge-queue status` as a gate and emits an action asking for a restart when the daemon is
+not healthy, plus a heartbeat-freshness health check. Edit its paths, then
+`tick-hub tick --config rs/merge-queue/tick-hub-merge-queue.yaml`.
+
+### `merge-queue serve`
+
+This command runs the queue forever: deterministic code that is always running, so agents submit
+changes and never drive the queue loop by hand. While idle it holds **no** writer lock. It polls
+the `items/` directory fingerprint every `--poll-ms` (default `250`) and polls the remote base
+with a cheap `git ls-remote` every `--base-poll-secs` (default `30`). A changed fingerprint (a
+new `submit`, `sync` or `withdraw`) or a moved base triggers one work cycle: the daemon takes the
+writer lock, plans, and runs the same `Runner` path as `run` (the logic is not forked), then
+releases the lock and goes back to idle polling. A cycle that finds the lock held, a refused
+validation, or a failed base poll is recorded in the heartbeat and retried on the next trigger;
+it never kills the daemon. Stop it with SIGINT or SIGTERM (Ctrl-C); a graceful stop removes the
+pid file, a crash leaves it behind for `status` to report.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--poll-ms N` | `250` | Idle poll interval in milliseconds: `items/` watch and heartbeat cadence (at least 10). |
+| `--base-poll-secs N` | `30` | Seconds between `git ls-remote` base polls. `0` polls the base every cycle. |
+| `--once` | off | Run at most one work cycle, then exit. For scripts and tests. |
+| `--depth N` | the configured `depth` | Override the initial window for work cycles. |
+| `--max-batch N` | the configured `max_batch` | Override the batch size for work cycles. |
+
+### `merge-queue status`
+
+This command reports daemon liveness, the current window and slot occupancy without taking the
+writer lock. Liveness comes from `serve.pid` and `serve.heartbeat.json` in the state directory
+(the daemon rewrites the heartbeat every cycle): `running` (pid alive, heartbeat fresh), `not
+running` (no pid file), `dead` (pid file names a dead process), `stale` (pid alive but the
+heartbeat is older than `--stale-after-secs`), or `malformed` (pid file unreadable). Every
+non-running verdict names its remedy. The window is the daemon's active batches (or the newest
+run's plan when no daemon heartbeat exists); slots count the `scratch/slot-*` checkouts.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--json` | off | Print the status report as JSON (`daemon`, `pid`, `heartbeat`, queue counts, `active_batches`, slots, `remedy`). |
+| `--stale-after-secs N` | `10` | Heartbeat age in seconds after which a live daemon counts as stale. |
+
+### Running `serve` as a service
+
+A systemd user unit ships at `rs/merge-queue/merge-queue-serve.service` (`Restart=on-failure`,
+`ExecStart` pointing at `serve`). Edit its `WorkingDirectory` and `ExecStart` paths, then:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp rs/merge-queue/merge-queue-serve.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now merge-queue-serve
+merge-queue status   # daemon: running ...
+```
+
+The tick-hub launcher alternative ships at `rs/merge-queue/tick-hub-merge-queue.yaml`: each tick
+runs `merge-queue status` as a gate and emits an action asking for a restart when the daemon is
+not healthy, plus a heartbeat-freshness health check. Edit its paths, then
+`tick-hub tick --config rs/merge-queue/tick-hub-merge-queue.yaml`.
+
 ### `merge-queue widen`
 
 This command runs the complete suite (`all`) on the current base. It needs a validator but no
@@ -333,6 +447,10 @@ on which files two changes share.
 <state>/
   config.json            fixed: queue configuration
   lock                   fixed: writer lock (flock)
+  serve.pid              fixed: `serve` daemon pid (removed on a graceful stop)
+  serve.heartbeat.json   fixed: `serve` heartbeat, rewritten every cycle
+  serve.pid              fixed: `serve` daemon pid (removed on a graceful stop)
+  serve.heartbeat.json   fixed: `serve` heartbeat, rewritten every cycle
   union.attributes       fixed: generated from union_paths, when set
   items/<pr>.json        one record per submitted change
   runs/<run-id>/         one directory per run (layout below)

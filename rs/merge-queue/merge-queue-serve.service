@@ -1,0 +1,14 @@
+[Unit]
+Description=merge-queue serve daemon (edit WorkingDirectory and ExecStart first)
+After=network-online.target
+
+[Service]
+Type=simple
+# Edit these two lines: the clone the queue operates on, and the built binary.
+WorkingDirectory=/path/to/clone
+ExecStart=/path/to/merge-queue --repo /path/to/clone serve --poll-ms 250 --base-poll-secs 30
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=default.target
