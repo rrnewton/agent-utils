@@ -193,6 +193,8 @@ declare const EDITED_MARK: LegacyImports["EDITED_MARK"];
 declare const freshenDayTitle: LegacyImports["freshenDayTitle"];
 declare const rowTimeTabStop: LegacyImports["rowTimeTabStop"];
 declare const timeNode: LegacyImports["timeNode"];
+declare const PULL_WAIT_MS: LegacyImports["PULL_WAIT_MS"];
+declare const createPullToRefresh: LegacyImports["createPullToRefresh"];
 declare const QUOTE_REPLY_TITLE: LegacyImports["QUOTE_REPLY_TITLE"];
 declare const createQuoting: LegacyImports["createQuoting"];
 declare const createBookmarkLines: LegacyImports["createBookmarkLines"];

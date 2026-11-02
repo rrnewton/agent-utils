@@ -168,3 +168,35 @@ test("`#624 voice-page-modularity`: a row's tap folds it, or reads it aloud or j
   assert.equal(gestures.takeClaimedClick(), true);
   assert.equal(gestures.takeClaimedClick(), false, "a claim was let go twice");
 });
+
+test("`#624 voice-page-modularity`: a pull past the top arms after PULL_ARM_PX and refreshes on release; a sideways drag never does", async () => {
+  const { createPullToRefresh, PULL_ARM_PX, PULL_LABELS } = CHANNEL_VIEW;
+  const affordance = { hidden: true, attrs: {}, style: { setProperty() {} }, textContent: "",
+    setAttribute(name, value) { this.attrs[name] = value; }, getAttribute(name) { return this.attrs[name] ?? null; } };
+  const area = { scrollTop: 0 };
+  const read = [];
+  const pull = createPullToRefresh({
+    byId: () => affordance, scrollArea: () => area, onChannelList: () => true, inChannelView: () => true,
+    atBottom: () => false, fetchInFlight: () => false, olderInFlight: () => false, takeDeferredOlder: () => read.push("older"),
+    undeferOlder: () => {}, loadDiscord: async (options) => { read.push(options.reason); }, newestId: () => null,
+    setStatus: (text) => read.push(text), channelContextKey: () => "C", freshness: () => ({ freshness: "fresh", freshAt: 0 }),
+    renderFreshness: () => {},
+  });
+  const touch = (x, y) => ({ touches: [{ clientX: x, clientY: y }], target: null });
+  pull.pullStart(touch(10, 100));
+  assert.equal(pull.fingerDown(), true);
+  pull.pullMove(touch(10, 100 + PULL_ARM_PX - 1));
+  assert.equal(affordance.textContent, PULL_LABELS.pull);
+  pull.pullMove(touch(10, 100 + PULL_ARM_PX));
+  assert.equal(affordance.textContent, PULL_LABELS.armed);
+  await pull.pullEnd();
+  assert.equal(pull.fingerDown(), false);
+  assert.deepStrictEqual(read, ["pull", "refreshed — nothing new since the last read."]);
+  // Mostly sideways: refused for the rest of the touch, and letting go reads nothing.
+  read.length = 0;
+  pull.pullStart(touch(10, 100));
+  pull.pullMove(touch(200, 130));
+  pull.pullMove(touch(200, 100 + PULL_ARM_PX * 2));
+  await pull.pullEnd();
+  assert.deepStrictEqual(read, ["older"], "a sideways drag refreshed");
+});
