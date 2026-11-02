@@ -822,5 +822,31 @@ def test_slot_never_had_owner_reads_imported_state(tmp_path: Path) -> None:
     assert w._slot_never_had_owner(record, [other_generation, *events]) is True
 
 
+def test_retire_pending_expired_reports_attestable_slot_as_action_not_attempt(
+    tmp_path: Path,
+) -> None:
+    project = _project(tmp_path)
+
+    result = t.command(
+        project,
+        "retire-pending",
+        "--limit",
+        "1",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--include-expired-unhanded",
+        "--format",
+        "json",
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["removed"] == []
+    assert len(payload["actions"]) == 1
+    assert payload["actions"][0]["slot"] == "slot01"
+    assert "--attest-agent-stopped" in payload["actions"][0]["reason"]
+    _retained(project)
+
+
 #: What test_lifecycle.py collects from this module.
 COLLECTED: tuple[str, ...] = tuple(name for name in sorted(globals()) if name.startswith("test_"))

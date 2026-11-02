@@ -1506,6 +1506,24 @@ class _RetirementCandidate:
 
 
 @dataclasses.dataclass(frozen=True)
+class _ExpiredRetirementCandidate:
+    """One past-TTL agent slot derived without a prior handoff read.
+
+    ``classification`` is ``attemptable`` (delegate to ordinary remove),
+    ``retained`` (a gate audit also treats as blocking), or ``action``
+    (a coordinator must act first: read an unread handoff, or attest an
+    unregistered agent stopped in a single-slot remove).
+    """
+
+    machine: str
+    slot: str
+    generation: int
+    agent: str
+    classification: str
+    reason: str
+
+
+@dataclasses.dataclass(frozen=True)
 class _ValidationRemovalArtifact:
     """One required artifact named by a validation-removal proof."""
 
@@ -28693,6 +28711,188 @@ def _current_retirement_candidates(
     )
 
 
+def _expired_unhanded_candidates(
+    config: Config,
+    wait_seconds: float,
+    *,
+    exclude: AbstractSet[tuple[str, str, int]] = frozenset(),
+) -> tuple[_ExpiredRetirementCandidate, ...]:
+    """Derive past-TTL agent slots that never had a coordinator read-handoff.
+
+    Uses the same predicates audit uses: heartbeat expired, recorded owner
+    proven dead or absent, and no hold. An unread handoff artifact is never
+    read here; it yields an ``action`` naming the read-handoff command. A
+    liveness answer of dead (rc 0) is attemptable through ordinary remove;
+    alive (rc 1) and unverifiable-other (rc 2) are retained; the bound
+    no-agentctl-record answer with a proven-dead owner generation is
+    attestable only in a single-slot remove, so it yields an ``action``
+    here and is never attempted (and never attested) by a batch.
+    """
+
+    with _locked(config.control / "ACTIVE", exclusive=False, wait_seconds=wait_seconds):
+        _refuse_partial_state(config, allow_validate_batch_seals=True)
+        state = _load_active(config, require_repository=False)
+        events = _load_events(config, state.machine)
+    agent_slots = {
+        record.slot for record in state.slots if record.slot_type == "agent"
+    }
+    if events:
+        holds = _holds_from_events(events, state.machine, agent_slots)
+    else:
+        holds = {}
+        for slot in agent_slots:
+            try:
+                snapshot = _load_hold_snapshot(config, slot, state.machine)
+            except Refusal:
+                holds[slot] = {}
+            else:
+                if snapshot is not None:
+                    holds[slot] = snapshot
+    results: list[_ExpiredRetirementCandidate] = []
+    for record in state.slots:
+        if record.slot_type != "agent":
+            continue
+        key = (record.machine, record.slot, record.generation)
+        if key in exclude:
+            continue
+        base = {
+            "machine": record.machine,
+            "slot": record.slot,
+            "generation": record.generation,
+            "agent": record.agent,
+        }
+        hold = holds.get(record.slot)
+        # An unreadable hold ({} sentinel) still holds: _retirement_candidates
+        # treats a present-but-unreadable hold the same way.
+        if record.slot in holds:
+            reason = (
+                f"slot is held: {hold.get('reason')}"
+                if isinstance(hold.get("reason"), str) and str(hold.get("reason")).strip()
+                else "slot is held: hold record is unreadable"
+            )
+            results.append(
+                _ExpiredRetirementCandidate(**base, classification="retained", reason=reason)
+            )
+            continue
+        _age, expired = _heartbeat_diagnosis(record)
+        if not expired:
+            continue
+        owner_state, owner_detail = _process_state(record.owner)
+        owner_absent = _owner_record_is_absent(record)
+        if owner_state == "live":
+            results.append(
+                _ExpiredRetirementCandidate(
+                    **base,
+                    classification="retained",
+                    reason=f"recorded owner is live: {owner_detail}",
+                )
+            )
+            continue
+        if owner_state != "dead" and not owner_absent:
+            results.append(
+                _ExpiredRetirementCandidate(
+                    **base,
+                    classification="retained",
+                    reason=f"recorded owner is {owner_state}: {owner_detail}",
+                )
+            )
+            continue
+        try:
+            artifact = _resolve_handoff_artifact(
+                config,
+                record,
+                _slot_directory(config, record.slot, record.slot_type),
+                events=events,
+            )
+        except StateError:
+            raise
+        except Refusal as exc:
+            results.append(
+                _ExpiredRetirementCandidate(
+                    **base, classification="retained", reason=str(exc)
+                )
+            )
+            continue
+        if artifact is not None:
+            latest = _latest_handoff_read(record, events)
+            if latest is None or not _handoff_read_matches_artifact(latest, artifact):
+                results.append(
+                    _ExpiredRetirementCandidate(
+                        **base,
+                        classification="action",
+                        reason=(
+                            f"slot {record.slot} contains an unread handoff artifact; "
+                            f"run 'wrkslots read-handoff {record.slot} "
+                            "--coordinator-authorized --coordinator-pid "
+                            "<current-coordinator-pid>' and read its output, "
+                            "then retry retire-pending"
+                        ),
+                    )
+                )
+                continue
+            # A matching read that was not enqueued is not this path's
+            # candidate either; ordinary remove still re-proves it.
+            if not latest.retirement_enqueued:
+                results.append(
+                    _ExpiredRetirementCandidate(
+                        **base,
+                        classification="action",
+                        reason=(
+                            f"slot {record.slot} contains an unread handoff artifact; "
+                            f"run 'wrkslots read-handoff {record.slot} "
+                            "--coordinator-authorized --coordinator-pid "
+                            "<current-coordinator-pid>' and read its output, "
+                            "then retry retire-pending"
+                        ),
+                    )
+                )
+                continue
+            continue
+        answer = _registered_liveness_answer(config, record)
+        if answer.state == "dead":
+            results.append(
+                _ExpiredRetirementCandidate(
+                    **base,
+                    classification="attemptable",
+                    reason="heartbeat expired, owner proven dead or absent, "
+                    "registered liveness reports dead, and no handoff artifact",
+                )
+            )
+        elif answer.state == "alive":
+            results.append(
+                _ExpiredRetirementCandidate(
+                    **base,
+                    classification="retained",
+                    reason=f"liveness is alive: {answer.detail}",
+                )
+            )
+        elif answer.unregistered and owner_state == "dead" and not owner_absent:
+            results.append(
+                _ExpiredRetirementCandidate(
+                    **base,
+                    classification="action",
+                    reason=(
+                        f"agent {record.agent} has no registered liveness record "
+                        "and its recorded owner generation is proven dead; retire "
+                        f"with a single-slot 'wrkslots remove {record.slot} "
+                        f"--coordinator-pid <current-coordinator-pid> "
+                        f"--expected-generation {record.generation} "
+                        f"--coordinator-authorized --attest-agent-stopped "
+                        f"{record.agent} --attest-note TEXT' (a batch never attests)"
+                    ),
+                )
+            )
+        else:
+            results.append(
+                _ExpiredRetirementCandidate(
+                    **base,
+                    classification="retained",
+                    reason=f"liveness is unverifiable: {answer.detail}",
+                )
+            )
+    return tuple(results)
+
+
 def _emit_retirement_queue(
     candidates: Sequence[_RetirementCandidate], output_format: str
 ) -> None:
@@ -28921,11 +29121,40 @@ def _cmd_retire_pending(args: argparse.Namespace) -> int:
         deadline=deadline,
         consented_live_owners=bool(args.include_owner_consented),
     )
+    include_expired = bool(getattr(args, "include_expired_unhanded", False))
+    expired_attemptable: list[_ExpiredRetirementCandidate] = []
+    actions: list[dict[str, object]] = []
     removed: list[dict[str, object]] = []
     retained: list[dict[str, object]] = []
     deferred: list[dict[str, object]] = []
     could_not_determine: list[dict[str, object]] = []
     stopped_at: int | None = None
+    if include_expired:
+        expired = _expired_unhanded_candidates(
+            config,
+            _remaining_lock_wait(deadline),
+            exclude={
+                (candidate.machine, candidate.slot, candidate.generation)
+                for candidate in pending
+            },
+        )
+        for candidate in expired:
+            entry = {
+                "machine": candidate.machine,
+                "slot": candidate.slot,
+                "generation": candidate.generation,
+                "agent": candidate.agent,
+            }
+            if candidate.classification == "attemptable":
+                expired_attemptable.append(candidate)
+            elif candidate.classification == "action":
+                actions.append(
+                    {**entry, "outcome": "action", "reason": candidate.reason}
+                )
+            else:
+                retained.append(
+                    {**entry, "outcome": "retained", "reason": candidate.reason}
+                )
     # A blocked candidate (a hold, a live recorded owner, a missing or
     # drifted handoff artifact) is never attempted: it is reported retained
     # with its named reason, writes no attempt history, and does not
@@ -29064,6 +29293,92 @@ def _cmd_retire_pending(args: argparse.Namespace) -> int:
                     "reason": "ordinary remove completed",
                 }
             )
+    # Expired-unhanded attemptable slots share the same bounded batch and
+    # delegate to ordinary remove without a retirement candidate, so remove
+    # re-proves heartbeat, liveness, owner, handoff, hold, process-use and
+    # salvage. They are never attested here.
+    expired_stopped = False
+    if expired_attemptable:
+        if stopped_at is not None:
+            deferred.extend(
+                {
+                    "machine": candidate.machine,
+                    "slot": candidate.slot,
+                    "generation": candidate.generation,
+                    "agent": candidate.agent,
+                    "outcome": "deferred",
+                    "reason": "batch stopped after an indeterminate retirement outcome",
+                }
+                for candidate in expired_attemptable
+            )
+        else:
+            remaining_limit = max(0, args.limit - len(selected))
+            expired_selected = expired_attemptable[:remaining_limit]
+            deferred.extend(
+                {
+                    "machine": candidate.machine,
+                    "slot": candidate.slot,
+                    "generation": candidate.generation,
+                    "agent": candidate.agent,
+                    "outcome": "deferred",
+                    "reason": "batch limit",
+                }
+                for candidate in expired_attemptable[remaining_limit:]
+            )
+            for expired_index, candidate in enumerate(expired_selected):
+                identity = {
+                    "machine": candidate.machine,
+                    "slot": candidate.slot,
+                    "generation": candidate.generation,
+                    "agent": candidate.agent,
+                }
+                remove_values = dict(vars(args))
+                remove_values.update(
+                    wait_lock=_remaining_lock_wait(deadline),
+                    slot=candidate.slot,
+                    expected_generation=candidate.generation,
+                    validate_complete=False,
+                    validation_proof_manifest=None,
+                    completed_record=None,
+                    _wait_deadline=deadline,
+                    _retirement_candidate=None,
+                )
+                try:
+                    _cmd_remove(argparse.Namespace(**remove_values), emit=False)
+                except Refusal as exc:
+                    retained.append(
+                        {**identity, "outcome": "retained", "reason": str(exc)}
+                    )
+                except Exception as exc:
+                    could_not_determine.append(
+                        {
+                            **identity,
+                            "outcome": "could-not-determine",
+                            "reason": _retirement_failure_reason(exc),
+                            "recovery_required": True,
+                        }
+                    )
+                    expired_stopped = True
+                    deferred.extend(
+                        {
+                            "machine": rest.machine,
+                            "slot": rest.slot,
+                            "generation": rest.generation,
+                            "agent": rest.agent,
+                            "outcome": "deferred",
+                            "reason": "batch stopped after an indeterminate retirement outcome",
+                        }
+                        for rest in expired_selected[expired_index + 1 :]
+                    )
+                    break
+                else:
+                    removed.append(
+                        {
+                            **identity,
+                            "outcome": "removed",
+                            "reason": "ordinary remove completed",
+                        }
+                    )
     if stopped_at is not None:
         deferred.extend(
             {
@@ -29094,6 +29409,7 @@ def _cmd_retire_pending(args: argparse.Namespace) -> int:
         "deferred": deferred,
         "could_not_determine": could_not_determine,
         "recovery_required": bool(could_not_determine),
+        **({"actions": actions} if include_expired else {}),
     }
     if args.format == "json":
         print(json.dumps(payload, indent=2, sort_keys=True))
@@ -29122,6 +29438,11 @@ def _cmd_retire_pending(args: argparse.Namespace) -> int:
                 f"COULD_NOT_DETERMINE: {item['machine']}/{item['slot']} "
                 f"generation={item['generation']} recovery_required=true "
                 f"reason={item['reason']}"
+            )
+        for item in actions:
+            print(
+                f"ACTION: {item['machine']}/{item['slot']} "
+                f"generation={item['generation']} reason={item['reason']}"
             )
     return 3 if could_not_determine else 0
 
@@ -34532,18 +34853,28 @@ def _cmd_audit(args: argparse.Namespace) -> int:
                     else CacheSlot(slot, config.machine, (), "unregistered"),
                 )
             )
-        # Recursive cache globs can reach arbitrarily large ignored trees. Each
-        # subject may use an equal share of what earlier subjects left, so an
-        # expensive subject exhausts only its own planning, never a cheap peer's.
+        # Recursive cache globs can reach arbitrarily large ignored trees. Work
+        # (directory listings) is a shared, finite resource: each subject may
+        # use an equal share of what earlier subjects left, so an expensive
+        # subject exhausts only its own work share, never a cheap peer's.
+        # Wall time is not divided the same way: dividing the fixed wall
+        # allowance by the subject count gave a large fleet (26 subjects, a
+        # 5-second allowance) under 0.2s each, so every slow-but-completing
+        # walk failed planning and alone forced BLOCKED. Each subject
+        # therefore gets the full --cache-wall-seconds as its own planning
+        # allowance; a walk that fits that allowance completes however many
+        # peers exist, and only a walk that exceeds it reports
+        # _CachePlanExhausted. Total planning wall time is bounded by
+        # subjects * allowance, which the caller accepted by choosing the
+        # per-subject allowance.
         plan_started = metrics.start()
-        plan_seconds = args.cache_wall_seconds
         plan_work = _AuditWorkBudget(args.cache_work_limit)
         plan_exhausted = 0
         for position, (subject, target) in enumerate(plan_targets):
             remaining_subjects = len(plan_targets) - position
             share = _CachePlanBudget(
                 _AuditWorkBudget(plan_work.remaining // remaining_subjects),
-                plan_seconds / remaining_subjects,
+                args.cache_wall_seconds,
                 args.cache_wall_seconds,
             )
             try:
@@ -34562,7 +34893,6 @@ def _cmd_audit(args: argparse.Namespace) -> int:
                     for cache in cache_planned[subject]
                 )
             plan_work.consumed += share.work.consumed
-            plan_seconds = max(0.0, plan_seconds - share.spent)
         metrics.finish(
             "cache-planning",
             plan_started,
@@ -61325,9 +61655,10 @@ usage or audit gate unknown, 3 fail-closed refusal.
         default=_AUDIT_CACHE_WALL_SECONDS,
         metavar="SECONDS",
         help=(
-            "cache binding/traversal wall budget in seconds, and separately the budget for "
-            "walking directories to expand cache globs, excluding Git observations and "
-            "state I/O; unfinished work is null/partial, "
+            "cache binding/traversal wall budget in seconds, and separately the per-subject "
+            "budget for walking directories to expand cache globs (each subject gets the "
+            "full allowance, not a share divided by the subject count), excluding Git "
+            "observations and state I/O; unfinished work is null/partial, "
             "a planning or full finalization timeout is null/error "
             f"(default: {_AUDIT_CACHE_WALL_SECONDS:g})"
         ),
@@ -62049,6 +62380,19 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "retirement candidate and is never attempted. "
             "A handoff is also how an owner leaves resumption notes, so pass this only when "
             "every queued live-owner handoff is known to be a release"
+        ),
+    )
+    retire_pending.add_argument(
+        "--include-expired-unhanded",
+        action="store_true",
+        help=(
+            "also derive candidates from agent slots whose heartbeat has expired, whose "
+            "recorded owner is proven dead or absent, and which were never enqueued by a "
+            "coordinator read-handoff; each attemptable target still runs ordinary remove. "
+            "A slot with an unread handoff artifact is skipped with an ACTION line naming "
+            "the read-handoff command (it is never read automatically), and a slot whose "
+            "agent has no registered liveness record is reported as an ACTION for a "
+            "single-slot attested remove (a batch never uses --attest-agent-stopped)"
         ),
     )
     retire_pending.add_argument(
