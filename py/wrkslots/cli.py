@@ -54246,6 +54246,46 @@ def _process_is_exiting_namespace_init(pid_dir: Path) -> bool:
     return True
 
 
+def _process_context_released(pid_dir: Path, generation: _ProcessStat) -> bool:
+    """Is this task in exit teardown, its whole context already released?
+
+    do_exit releases a task's files, filesystem context and namespaces
+    before exit_notify makes it a zombie, so a census can meet a task
+    whose stat still reads R, S or D while its cwd, root and ns/mnt
+    already read as ENOENT. Such a task holds no checkout. Required,
+    each from /proc: Threads is 1 (a surviving thread could still hold
+    the shared context); cwd, root and ns/mnt each read as ENOENT, not
+    as a permission error; the descriptor table reads back empty (a
+    live task that merely closed its descriptors still has a working
+    directory, so this only corroborates the released context); and
+    the generation is unchanged on re-read. Anything else is not
+    exempt.
+    """
+    try:
+        status = _read_process_status(pid_dir, generation=generation)
+    except (OSError, UnicodeError, Refusal):
+        return False
+    threads = [line.split()[1:] for line in status.split("\n") if line.startswith("Threads:")]
+    if threads != [["1"]]:
+        return False
+    try:
+        with os.scandir(pid_dir / "fd") as entries:
+            if any(True for _ in entries):
+                return False
+    except OSError:
+        return False
+    for released in ("cwd", "root", "ns/mnt"):
+        try:
+            os.readlink(pid_dir / released)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return False
+        return False
+    current = _read_process_stat(pid_dir)
+    return current is None or current.start_ticks == generation.start_ticks
+
+
 def _process_is_zombie(
     pid_dir: Path, *, generation: _ProcessStat | None = None,
 ) -> bool:
@@ -54465,6 +54505,8 @@ def _absent_validate_process_snapshot(
             if _process_start_ticks(pid_dir) is None:
                 continue
             if _process_is_exiting_namespace_init(pid_dir):
+                continue
+            if _process_context_released(pid_dir, generation):
                 continue
             raise Refusal(f"mount namespace is indeterminate for live PID {pid_dir.name}")
         current_generation = _read_process_stat(pid_dir)
@@ -55830,6 +55872,8 @@ def _same_uid_process_observations(
             if _process_start_ticks(pid_dir) is None:
                 continue
             if _process_is_exiting_namespace_init(pid_dir):
+                continue
+            if _process_context_released(pid_dir, generation):
                 continue
             raise Refusal(f"mount namespace is indeterminate for live PID {pid_dir.name}")
         current_generation = _read_process_stat(pid_dir)

@@ -1291,6 +1291,63 @@ def test_a_near_miss_of_an_exiting_namespace_init_is_still_refused(
 
 
 
+def exiting_proc(
+    proc_root: Path, pid: int = 2991803, *, threads: int = 1,
+    cwd: str | None = None,
+) -> Path:
+    """One single-threaded task met inside do_exit on a loaded host.
+
+    Its stat still reads S and its wait channel is unremarkable, but
+    cwd, root and ns/mnt are already gone (ENOENT): the kernel
+    released its files, filesystem context and namespaces before
+    exit_notify made it a zombie.
+    """
+    pid_dir = proc_root / str(pid)
+    (pid_dir / "ns").mkdir(parents=True)
+    (pid_dir / "fd").mkdir(parents=True)
+    (pid_dir / "stat").write_bytes(opaque_stat(pid, 1, flags=0, start_ticks=99))
+    uid = os.getuid()
+    (pid_dir / "status").write_text(
+        f"Name:\texiting_recheck\nState:\tS (sleeping)\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n"
+        f"NSpid:\t{pid}\nThreads:\t{threads}\n", encoding="ascii")
+    (pid_dir / "cgroup").write_text("0::/fixture\n", encoding="ascii")
+    (pid_dir / "wchan").write_text("0", encoding="ascii")
+    if cwd is not None:
+        (pid_dir / "cwd").symlink_to(cwd)
+    return pid_dir
+
+
+def test_an_exiting_process_with_released_context_holds_no_checkout(
+        tmp_path: Path) -> None:
+    # 2026-11-02: the audit census on a busy host met such a task
+    # (a short-lived `timeout` wrapper in exit teardown) and refused
+    # "mount namespace is indeterminate for live PID N", flipping
+    # every audit row to UNKNOWN while the Rust edition, which walks
+    # cwd/exe/fd links only, reported the rows BLOCKED.
+    proc_root = tmp_path / "proc"
+    exiting_proc(proc_root)
+    assert cli._absent_validate_process_snapshot(proc_root) == ()
+    budget = cli._ReadOnlyCommandBudget.start(timeout_seconds=30, stdout_limit=1 << 20,
+                                              stderr_limit=1 << 20)
+    assert cli._same_uid_process_observations(budget, proc_root) == ()
+
+
+@pytest.mark.parametrize("near_miss", [
+    {"threads": 2},                        # another thread may still hold files
+    {"cwd": "/home/somewhere/checkout"},   # still holds a working directory
+], ids=["two-threads", "cwd-still-held"])
+def test_a_near_miss_of_an_exiting_process_is_still_refused(
+        tmp_path: Path, near_miss: dict[str, object]) -> None:
+    proc_root = tmp_path / "proc"
+    exiting_proc(proc_root, **near_miss)  # type: ignore[arg-type]
+    with pytest.raises(cli.Refusal, match="mount namespace is indeterminate for live PID 2991803"):
+        cli._absent_validate_process_snapshot(proc_root)
+    budget = cli._ReadOnlyCommandBudget.start(timeout_seconds=30, stdout_limit=1 << 20,
+                                              stderr_limit=1 << 20)
+    with pytest.raises(cli.Refusal, match="mount namespace is indeterminate for live PID 2991803"):
+        cli._same_uid_process_observations(budget, proc_root)
+
+
 def test_a_link_that_is_unreadable_rather_than_released_is_still_refused(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # Only ENOENT means released; a permission error on cwd says nothing.
