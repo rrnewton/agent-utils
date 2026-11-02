@@ -51,3 +51,25 @@ test("`#624 voice-page-modularity`: a search's reach and a message marked read, 
     "Marked read here, not in Slack, and collapsed: no scope");
   assert.equal(doneReadWords({ service: "Slack", marked: true, already: true, why: "" }), "Already read here and in Slack.");
 });
+
+test("`#624 voice-page-modularity`: what a walk further back says when it ends, from the module alone", () => {
+  const { searchWalkWords } = NOTICES;
+  let asked = [];
+  const facts = (oldest = null) => ({ service: "Slack", budgetSeconds: 20, oldest,
+    viewWords: () => { asked.push("view"); return "this channel"; },
+    failure: () => { asked.push("failure"); return "the network is down"; } });
+  const walk = (arrived, found, read = 1) => ({ arrived, found, read });
+  assert.equal(searchWalkWords(walk(0, 0), "failed", facts()),
+    "Could not fetch older messages from Slack: the network is down. Nothing older was searched. Press the button again to retry.");
+  assert.deepStrictEqual(asked, ["failure"], "the view's words were asked for a failure");
+  asked = [];
+  assert.equal(searchWalkWords(walk(0, 0), "nowhere", facts()), "Nothing older can be fetched: Slack gave no way further back.");
+  assert.equal(searchWalkWords(walk(0, 0, 0), "stopped", facts()), "Stopped before any older messages arrived.");
+  assert.equal(searchWalkWords(walk(0, 0), "start", facts()), "Reached the start of this channel.");
+  assert.deepStrictEqual(asked, ["view"]);
+  assert.equal(searchWalkWords(walk(3, 1), "start", facts()), "Reached the start of this channel. Found 1 more match among 3 older messages fetched from Slack.");
+  assert.equal(searchWalkWords(walk(0, 0), "budget", facts()),
+    "Slack sent nothing older this time, though it says older messages exist. Press the button again to keep going.");
+  assert.equal(searchWalkWords(walk(50, 2), "budget", facts()), "Found 2 more matches among 50 older messages fetched from Slack in 20 s.");
+  assert.equal(searchWalkWords(walk(1, 0), "stopped", facts()), "Stopped. None of the 1 older message fetched from Slack match.");
+});

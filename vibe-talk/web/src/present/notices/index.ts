@@ -16,5 +16,5 @@ export { browserSpeechFailure, failureWords, readableCause, refusalSentence, ref
 export { upstreamClearClock, upstreamClearCursor, upstreamClearNowSentence, upstreamClearSentence } from "./upstream.ts";
 export { doneReadWords, serviceReadWords } from "./marks.ts";
 export type { ServiceReadMark } from "./marks.ts";
-export { messagesWords, reachBackWords, reachClause, searchMomentWords, searchWalkProgress } from "./search.ts";
-export type { HistoryReach } from "./search.ts";
+export { messagesWords, reachBackWords, reachClause, searchMomentWords, searchWalkProgress, searchWalkWords } from "./search.ts";
+export type { EndedWalk, HistoryReach, WalkFacts } from "./search.ts";

@@ -23841,46 +23841,21 @@ function countSearchWalk(walk) {
 }
 
 /**
- * What a walk that has ended says under its control: see the head of this section. Always something,
- * `#578 search-status-clarity`: a press that said nothing over a list the search had emptied — the
- * sentence there saying how far back, and not that anything had happened — was the owner's "I press it
- * and it does nothing for a while and then shows THE SAME button".
+ * What a walk that has ended says under its control (web/src/present/notices `searchWalkWords`, which
+ * says why it always says something), from this page's service name, budget and oldest row.
  *
  * @param {any} walk
  * @param {string} reason
  * @param {unknown} [failure] what the read that failed threw, with `reason` "failed"
  */
 function searchWalkNote(walk, reason, failure = null) {
-  const service = serviceWords();
-  const fetched = `${walk.arrived} older message${walk.arrived === 1 ? "" : "s"} fetched from ${service}` +
-    `${reason === "budget" ? ` in ${Math.round(SEARCH_OLDER_MS / 1000)} s` : ""}`;
-  const at = oldestLoadedMs();
-  const back = reachBackWords(at);
-  const matches = `${walk.found} more match${walk.found === 1 ? "" : "es"}`;
-  if (reason === "failed") {
-    const before = walk.arrived > 0 ? ` Before that, ${fetched}${back}.` : " Nothing older was searched.";
-    return `Could not fetch older messages from ${service}: ${failureWords(failure)}.${before} Press the button ` +
-      "again to retry.";
-  }
-  // A list saying older history exists, with no place to go on from: nothing could be read.
-  if (reason === "nowhere") return `Nothing older can be fetched: ${service} gave no way further back.`;
-  if (reason === "stopped" && walk.arrived === 0 && walk.found === 0 && walk.read === 0) {
-    return "Stopped before any older messages arrived.";
-  }
-  const lead = reason === "stopped" ? "Stopped. " : "";
-  if (reason === "start") {
-    const first = `${lead}Reached the start of ${channelViewWords()}${at === null ? "" : ` (${searchMomentWords(at)})`}`;
-    if (walk.arrived === 0) return `${first}.`;
-    return walk.found > 0 ? `${first}. Found ${matches} among ${fetched}.` : `${first}; none of the ${fetched} match.`;
-  }
-  // The chat service sent nothing older, and still says there is more: said, so the press is not taken
-  // for one that did nothing.
-  if (walk.arrived === 0) {
-    return `${lead}${sentenceStart(service)} sent nothing older this time, though it says older messages exist. ` +
-      "Press the button again to keep going.";
-  }
-  if (walk.found > 0) return `${lead}Found ${matches} among ${fetched}${back}.`;
-  return `${lead}None of the ${fetched}${back}${back ? "," : ""} match.`;
+  return searchWalkWords(walk, reason, {
+    service: serviceWords(),
+    budgetSeconds: Math.round(SEARCH_OLDER_MS / 1000),
+    oldest: oldestLoadedMs(),
+    viewWords: () => channelViewWords(),
+    failure: () => failureWords(failure),
+  });
 }
 
 /**
