@@ -466,13 +466,31 @@ def test_planning_shares_divide_what_earlier_subjects_left(
     (_, _, deep_spent, deep_used) = shares[1]
     (cheap, cheap_seconds, cheap_before, cheap_limit) = shares[2]
     assert (deep, cheap) == ("a-deep", "b-cheap")
-    # Half of each allowance for the first of two subjects; everything that is
-    # left for the last. Only walking is charged, and it was charged.
-    assert (deep_seconds, deep_limit) == (500.0, 500)
-    assert (cheap_seconds, cheap_limit) == (1000.0 - deep_spent, 1000 - deep_used)
+    # Work still divides what earlier subjects left; wall does not: each
+    # subject gets the full wall allowance, so a slow-but-completing walk is
+    # not starved by the subject count. Only walking is charged.
+    assert (deep_seconds, deep_limit) == (1000.0, 500)
+    assert (cheap_seconds, cheap_limit) == (1000.0, 1000 - deep_used)
     assert deep_before == cheap_before == 0.0
-    assert 0.0 < deep_spent < 500.0
+    assert 0.0 < deep_spent < 1000.0
     assert deep_used == 203
+
+
+def test_slow_planning_walk_gets_full_wall_allowance_not_a_divided_share(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A walk needing more than wall/subjects but less than wall completes.
+
+    With 26 subjects and a 5s allowance the divided share was under 0.2s;
+    this unit pins that planning now gives each subject the full allowance.
+    """
+    root = tmp_path / "checkout"
+    _chain(root, 30)
+    budget = cli._CachePlanBudget(cli._AuditWorkBudget(1_000), 5.0, 5.0)
+    expanded = cli._expand_cache_globs(root, ("ignored/**/target",), budget)
+    ((pattern, found),) = expanded
+    assert pattern == "ignored/**/target"
+    assert len(found) == 1
 
 
 def test_registered_record_planning_uses_its_share(tmp_path: Path) -> None:

@@ -22774,6 +22774,106 @@ def test_retire_pending_uses_remove_and_cleans_sidecar(
     assert not sidecar.exists()
 
 
+def _retire_pending_expired(project: Path) -> subprocess.CompletedProcess[str]:
+    return command(
+        project,
+        "retire-pending",
+        "--limit",
+        "1",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--include-expired-unhanded",
+        "--format",
+        "json",
+    )
+
+
+def test_retire_pending_expired_unhanded_retires_dead_owner_without_handoff(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    commit_task(repository, checkout(project), "codex/task")
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+
+    result = _retire_pending_expired(project)
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert [item["slot"] for item in payload["removed"]] == ["slot01"]
+    assert payload["actions"] == []
+    assert not checkout(project).exists()
+    assert active_slots(project) == []
+
+
+def test_retire_pending_expired_unhanded_skips_unread_handoff_with_action(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    commit_task(repository, checkout(project), "codex/task")
+    handoff = checkout(project).parent / "HANDOFF.md"
+    handoff.write_text("notes\n", encoding="utf-8")
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+
+    result = _retire_pending_expired(project)
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["removed"] == []
+    assert len(payload["actions"]) == 1
+    assert payload["actions"][0]["slot"] == "slot01"
+    assert "read-handoff slot01" in payload["actions"][0]["reason"]
+    assert checkout(project).is_dir()
+    assert handoff.is_file()
+    config = wrkslots._load_config(str(project), "testhost")
+    assert not any(
+        event["kind"] == "handoff-read"
+        for event in wrkslots._load_events(config)
+    )
+
+
+def test_retire_pending_expired_unhanded_retains_live_and_unverifiable(
+    tmp_path: Path,
+) -> None:
+    for state in ("alive", "unverifiable"):
+        (tmp_path / state).mkdir()
+        project, repository, _remote = make_project(tmp_path / state)
+        assert create(project).returncode == 0
+        commit_task(repository, checkout(project), "codex/task")
+        mark_owner_dead(project)
+        set_liveness(project, state)
+
+        result = _retire_pending_expired(project)
+
+        assert result.returncode == 0, result.stderr
+        payload = json.loads(result.stdout)
+        assert payload["removed"] == [], state
+        assert payload["actions"] == [], state
+        assert [item["slot"] for item in payload["retained"]] == ["slot01"], state
+        assert checkout(project).is_dir(), state
+
+
+def test_retire_pending_expired_unhanded_retains_held_slot(tmp_path: Path) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    commit_task(repository, checkout(project), "codex/task")
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    assert command(project, "hold", "slot01", "--reason", "keep").returncode == 0
+
+    result = _retire_pending_expired(project)
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["removed"] == []
+    assert [item["slot"] for item in payload["retained"]] == ["slot01"]
+    assert "held" in payload["retained"][0]["reason"]
+    assert checkout(project).is_dir()
+
+
 def test_recover_completes_legacy_handoff_quarantine_event(
     tmp_path: Path,
 ) -> None:
