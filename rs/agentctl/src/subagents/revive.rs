@@ -66,6 +66,126 @@ pub(super) fn claude_transcript_verdict(
     looked.then_some(false)
 }
 
+/// Discover a Claude session for `record` from transcripts on disk (#741 restore-native-sessions):
+/// the newest `<session>.jsonl` in the encoded project directory for the record's cwd whose
+/// head mentions that cwd. Returns `None` when nothing confirms, so the caller keeps refusing.
+pub(super) fn discover_claude_session(
+    roots: &[PathBuf],
+    record: &AgentRecord,
+) -> Option<NativeSession> {
+    if record.harness != "claude" {
+        return None;
+    }
+    let encoded: String = record
+        .cwd
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let mut best: Option<(std::time::SystemTime, String)> = None;
+    for root in roots {
+        let dir = root.join("projects").join(&encoded);
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if !valid_metadata_text(stem) {
+                continue;
+            }
+            let Ok(head) = fs::read(&path)
+                .map(|b| String::from_utf8_lossy(&b[..b.len().min(65536)]).into_owned())
+            else {
+                continue;
+            };
+            if !head.contains(&record.cwd) {
+                continue;
+            }
+            let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) else {
+                continue;
+            };
+            if best.as_ref().is_none_or(|(t, _)| mtime > *t) {
+                best = Some((mtime, stem.to_owned()));
+            }
+        }
+    }
+    best.map(|(_, value)| NativeSession::new("claude", &value, "observed"))
+}
+
+/// Discover a Codex session for `record` (#741): newest `rollout-*-<thread>.jsonl` under
+/// `$CODEX_HOME/sessions` (default `~/.codex/sessions`) whose head mentions the record's cwd.
+pub(super) fn discover_codex_session(record: &AgentRecord) -> Option<NativeSession> {
+    if record.harness != "codex" {
+        return None;
+    }
+    // Tests never scan the host's own Codex home.
+    #[cfg(test)]
+    {
+        None
+    }
+    #[cfg(not(test))]
+    {
+        let home = std::env::var_os("CODEX_HOME")
+            .map(PathBuf::from)
+            .or_else(|| crate::harness::home().map(|h| h.join(".codex")))?;
+        discover_codex_in(&home.join("sessions"), record)
+    }
+}
+
+#[cfg(not(test))]
+fn discover_codex_in(sessions: &Path, record: &AgentRecord) -> Option<NativeSession> {
+    let mut best: Option<(std::time::SystemTime, String)> = None;
+    let mut stack = vec![sessions.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !(name.starts_with("rollout-") && name.ends_with(".jsonl")) {
+                continue;
+            }
+            let Ok(bytes) = fs::read(&path) else { continue };
+            let head = String::from_utf8_lossy(&bytes[..bytes.len().min(65536)]);
+            if !head.contains(&record.cwd) {
+                continue;
+            }
+            let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) else {
+                continue;
+            };
+            // The session id comes from the first entry's session_meta; no id, no bind.
+            let Some(value) = head
+                .lines()
+                .next()
+                .and_then(|line| serde_json::from_str::<Value>(line).ok())
+                .and_then(|v| {
+                    v.pointer("/payload/id")
+                        .or_else(|| v.pointer("/id"))
+                        .and_then(|i| i.as_str().map(str::to_owned))
+                })
+            else {
+                continue;
+            };
+            if best.as_ref().is_none_or(|(t, _)| mtime > *t) {
+                best = Some((mtime, value));
+            }
+        }
+    }
+    best.map(|(_, value)| NativeSession::new("codex", &value, "observed"))
+}
+
 #[cfg(test)]
 pub(super) fn fail_once(point: &'static str) {
     FAILURE_POINT.set(Some(point));
@@ -623,6 +743,8 @@ fn conversation(record: &AgentRecord) -> Result<NativeSession> {
                 )
             })
         })
+        .or_else(|| discover_claude_session(&claude_config_roots(), record))
+        .or_else(|| discover_codex_session(record))
         .ok_or_else(|| fail("record has no native conversation ID"))?;
     if !native.valid_for(record) {
         return Err(fail("record has contradictory native conversation IDs"));
@@ -2641,5 +2763,98 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         );
         self.save(&record)?;
         Ok(session)
+    }
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+    fn rec(cwd: &str) -> AgentRecord {
+        AgentRecord {
+            storage_directory: None,
+            nested: None,
+            adapter: "herdr".into(),
+            mode: "interactive".into(),
+            backend: "herdr".into(),
+            paused: false,
+            runtime_home: None,
+            pane_reported_by_agentctl: false,
+            custom_process_identity: None,
+            foreign_shell_identity: None,
+            terminal_id: None,
+            harness_identity: None,
+            name_history: vec![],
+            anchor_rule: None,
+            former_names: vec![],
+            native_session: None,
+            profile: None,
+            slot: None,
+            slot_project: None,
+            slot_isolation: None,
+            reasoning_effort: None,
+            environment_names: vec![],
+            agentcloud: None,
+            launch_spec: None,
+            extra: BTreeMap::new(),
+            name: "lane".into(),
+            token: "t".into(),
+            harness: "claude".into(),
+            cwd: cwd.into(),
+            created_at: 0.0,
+            schema: 1,
+            lifecycle: "stopped".into(),
+            workspace_id: None,
+            tab_id: None,
+            pane_id: None,
+            session_agent: None,
+            session_value: None,
+            model: None,
+            resume: None,
+            arguments: vec![],
+            startup_warning: None,
+            effective_reasoning_effort: None,
+            error: None,
+            goal: None,
+            goal_delivery: None,
+            goal_session_id: None,
+            goal_command: None,
+            goal_messages: BTreeMap::new(),
+            goal_message_id: None,
+        }
+    }
+    #[test]
+    fn discovers_newest_confirmed_claude_session() {
+        let root = std::env::temp_dir().join(format!("disc-{}", std::process::id()));
+        let dir = root.join("projects").join("-tmp-proj");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("11111111-1111-1111-1111-111111111111.jsonl"),
+            "{\"cwd\":\"/tmp/proj\"}\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("22222222-2222-2222-2222-222222222222.jsonl"),
+            "{\"cwd\":\"/other\"}\n",
+        )
+        .unwrap();
+        let got = discover_claude_session(std::slice::from_ref(&root), &rec("/tmp/proj"));
+        assert_eq!(
+            got.map(|s| s.value).as_deref(),
+            Some("11111111-1111-1111-1111-111111111111")
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn refuses_without_content_confirmation() {
+        let root = std::env::temp_dir().join(format!("disc2-{}", std::process::id()));
+        let dir = root.join("projects").join("-tmp-proj");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("11111111-1111-1111-1111-111111111111.jsonl"),
+            "{\"cwd\":\"/other\"}\n",
+        )
+        .unwrap();
+        assert!(discover_claude_session(std::slice::from_ref(&root), &rec("/tmp/proj")).is_none());
+        let _ = fs::remove_dir_all(&root);
     }
 }
