@@ -2153,9 +2153,15 @@ def validation_service_result_schema(schema_version: int = 4) -> dict[str, objec
             },
         }
     if schema_version >= 6:
-        result["scorecard_writeback"]["variants"]["delegated"] = ["status"]
+        writeback = result["scorecard_writeback"]
+        assert isinstance(writeback, dict)
+        variants = writeback["variants"]
+        assert isinstance(variants, dict)
+        variants["delegated"] = ["status"]
     if schema_version >= 7:
-        result["outcomes"]["GREEN_FLAKY"] = {
+        outcomes = result["outcomes"]
+        assert isinstance(outcomes, dict)
+        outcomes["GREEN_FLAKY"] = {
             exit_field: 0,
             "state": "completed",
             "result": "success",

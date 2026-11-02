@@ -164,8 +164,10 @@ def test_row_ref_mismatched_evidence_refuses_sticky(tmp_path: Path) -> None:
     assert json.loads(out.stdout)["verdict"] != "qualified"
     # Sticky: a refused row-ref for a run is not revived by a later inline PASS for the same run.
     refused = _row_ref_event(evidence, _full_row(sha, "r1"), event_id="e3")
-    refused["legacy_row_codec"] = dict(refused["legacy_row_codec"], compressed_sha256="0" * 64)  # type: ignore[arg-type]
-    inline_pass = {"schema": "validate-ledger/v1", "event_type": "run.result", "event_id": "e4",
+    codec = refused["legacy_row_codec"]
+    assert isinstance(codec, dict)
+    refused["legacy_row_codec"] = {**codec, "compressed_sha256": "0" * 64}
+    inline_pass: dict[str, object] = {"schema": "validate-ledger/v1", "event_type": "run.result", "event_id": "e4",
                    "run_id": "r1", "commit": sha, "outcome": "pass", "legacy_row": _full_row(sha, "r1")}
     _write_ledger(repo, [refused, inline_pass])
     out = run_cli(repo, "--json", "receipt", "show", "HEAD")

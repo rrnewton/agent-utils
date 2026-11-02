@@ -978,8 +978,10 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # populated submodule is still listed) is mapped.
     # The fenced linked-worktree enumeration case (a populated submodule
     # whose gitdir still names the pre-rename worktree) is mapped.
-    assert len(all_tests) == 2119
-    assert len(ordinary) == 337
+    # The two later-schema frozen COULD_NOT_RUN cases of 47aa56e7 (service-result
+    # schemas 6 and 7) are ordinary.
+    assert len(all_tests) == 2121
+    assert len(ordinary) == 339
     assert len(mapped) == 1782
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
@@ -996,6 +998,7 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
         "test_bounded_lsof_reports_installed_binary_file_and_alias_matches",
         "test_create_binds_owner_running_beside_its_assigned_coordinator",
         "test_current_frozen_result_without_removal_proof_blocks_entry",
+        "test_current_incomplete_frozen_accepts_later_service_result_schemas",
         "test_current_incomplete_frozen_binds_checkout_and_gitlink_identity",
         "test_current_incomplete_frozen_binds_initial_facts_to_recursive_snapshot",
         "test_current_incomplete_frozen_rechecks_after_fresh_census",
