@@ -3069,10 +3069,19 @@ and each retry loop with its attempt count and last failure code. The running
 service touches `provider-alive` in the state directory, at most every 5
 seconds, whenever its provider subscription delivers anything; a service built
 before this record shows the last item as unknown and is never called stale.
+It is `STALLED` when the service runs but its owner loop has not turned for
+its `--stall-restart-after` bound (default 5 minutes): the loop rewrites
+`owner-loop-alive` in the state directory as it turns, and a service built
+before this record is never called stalled. A stalled `chat run` stops itself
+with exit status 70 so that its unit starts it again; every blocking step of
+a round is bounded well below the bound (a delivery waits at most 5 seconds
+for the coordinator's locks and ends `--ready-timeout` plus 30 seconds after
+it starts, leaving the request pending for the next pass).
 `--json` prints the whole report (schema `agentctl-chat-health/v1`). The
 command writes nothing and never contacts the chat provider. Exit status: 0 OK,
-3 DEGRADED, 1 DOWN, so a timer or another agent can act on it; when a bridge is
-up but typing into a dead pane, `chat repoint` fixes it without a restart.
+3 DEGRADED, 1 DOWN or STALLED, so a timer or another agent can act on it; when
+a bridge is up but typing into a dead pane, `chat repoint` fixes it without a
+restart.
 
 `chat latency` reports how long each request took to reach each stage, from
 the bridge's own records, since chat providers such as Slack record no time on

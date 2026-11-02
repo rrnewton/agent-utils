@@ -656,10 +656,14 @@ fn probe(
                 .as_str()
                 .unwrap_or("?")
                 .to_ascii_uppercase();
-            if code == 1 || verdict == "DOWN" {
+            if code == 1 || verdict == "DOWN" || verdict == "STALLED" {
                 return Err(Pending(format!(
-                    "chat health says DOWN: {}",
-                    report["problems"]["down"]
+                    "chat health says {verdict}: {}",
+                    if verdict == "STALLED" {
+                        &report["problems"]["stalled"]
+                    } else {
+                        &report["problems"]["down"]
+                    }
                 )));
             }
             if report["service"]["pid"].as_u64() != Some(u64::from(pid)) {

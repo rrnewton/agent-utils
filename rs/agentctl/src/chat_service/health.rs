@@ -23,6 +23,9 @@ const MAX_LISTED: usize = 10;
 pub const EXIT_DOWN: i32 = 1;
 /// Exit status of `chat health` when the bridge works with problems.
 pub const EXIT_DEGRADED: i32 = 3;
+/// Exit status of `chat health` when the service runs but its owner loop has stalled: the same
+/// as down, since nothing is delivered or sent (#783 chat-reply-capture-miss).
+pub const EXIT_STALLED: i32 = EXIT_DOWN;
 
 /// `chat health` settings.
 #[derive(Clone, Copy, Debug)]
@@ -34,7 +37,7 @@ pub struct HealthOptions {
 /// One `chat health` report.
 #[derive(Debug)]
 pub struct Health {
-    /// `ok`, `degraded` or `down`.
+    /// `ok`, `degraded`, `stalled` or `down`.
     pub verdict: &'static str,
     /// The whole report, as `--json` prints it.
     pub document: Value,
@@ -43,12 +46,14 @@ pub struct Health {
 }
 
 impl Health {
-    /// The command's exit status: 0 when ok, [`EXIT_DEGRADED`] or [`EXIT_DOWN`].
+    /// The command's exit status: 0 when ok, [`EXIT_DEGRADED`], [`EXIT_STALLED`] or
+    /// [`EXIT_DOWN`].
     #[must_use]
     pub fn exit_code(&self) -> i32 {
         match self.verdict {
             "ok" => 0,
             "degraded" => EXIT_DEGRADED,
+            "stalled" => EXIT_STALLED,
             _ => EXIT_DOWN,
         }
     }
@@ -57,6 +62,7 @@ impl Health {
 #[derive(Default)]
 struct Problems {
     down: Vec<String>,
+    stalled: Vec<String>,
     degraded: Vec<String>,
 }
 
@@ -167,6 +173,8 @@ struct Observed {
     channels: Vec<Value>,
     checkpoint_age: Option<u64>,
     alive_age: Option<u64>,
+    /// How long ago the owner loop last turned, with the stall bound it runs with.
+    owner_loop: Option<(u64, Option<Duration>)>,
     /// [`probe_target`].
     target: (Value, Option<String>),
     times: Vec<RequestTimes>,
@@ -190,6 +198,7 @@ pub fn health<A: ManagedApi + ?Sized>(
         channels: channel_holders(state.config()),
         checkpoint_age: state.checkpoint_age_millis(now),
         alive_age: state.provider_alive_age_millis(now),
+        owner_loop: state.owner_loop_alive(now),
         target: probe_target(manager, &state.config().agent_name),
         times: state.request_times()?,
         unsent: state.unsent_replies()?,
@@ -209,6 +218,7 @@ fn assess(observed: Observed, options: HealthOptions) -> Health {
         channels,
         checkpoint_age,
         alive_age,
+        owner_loop,
         target: (target, target_problem),
         times,
         unsent,
@@ -392,8 +402,22 @@ fn assess(observed: Observed, options: HealthOptions) -> Health {
         ));
     }
 
+    // A running service whose owner loop has not turned for its stall bound delivers and sends
+    // nothing, whatever its saved records say.
+    if let (Some(pid), Some((age, Some(bound)))) = (runner, owner_loop) {
+        if u128::from(age) > bound.as_millis() {
+            problems.stalled.push(format!(
+                "the owner loop of service process {pid} has not turned for {} (bound {}); \
+                 chat run stops and its unit starts it again",
+                age_text(age),
+                age_text(u64::try_from(bound.as_millis()).unwrap_or(u64::MAX))
+            ));
+        }
+    }
     let verdict = if !problems.down.is_empty() {
         "down"
+    } else if !problems.stalled.is_empty() {
+        "stalled"
     } else if !problems.degraded.is_empty() {
         "degraded"
     } else {
@@ -419,6 +443,7 @@ fn assess(observed: Observed, options: HealthOptions) -> Health {
             problems
                 .down
                 .iter()
+                .chain(&problems.stalled)
                 .chain(&problems.degraded)
                 .cloned()
                 .collect::<Vec<_>>()
@@ -544,7 +569,15 @@ fn assess(observed: Observed, options: HealthOptions) -> Health {
     let document = json!({
         "schema": "agentctl-chat-health/v1",
         "verdict": verdict,
-        "problems": {"down": problems.down, "degraded": problems.degraded},
+        "problems": {
+            "down": problems.down,
+            "stalled": problems.stalled,
+            "degraded": problems.degraded,
+        },
+        "owner_loop": {
+            "last_turn_age_seconds": owner_loop.map(|(age, _)| age / 1_000),
+            "stall_after_seconds": owner_loop.and_then(|(_, bound)| bound).map(|bound| bound.as_secs()),
+        },
         "service": process,
         "channels": channels,
         "event_stream": {
@@ -626,6 +659,7 @@ mod tests {
             ],
             checkpoint_age: Some(5_000),
             alive_age: Some(10_000),
+            owner_loop: Some((2_000, Some(Duration::from_secs(300)))),
             target: (
                 json!({"agent": "coord", "headless": false, "pane_id": "w1:p2", "harness": "claude", "status": "idle", "alive": true}),
                 None,
@@ -674,6 +708,46 @@ mod tests {
             .text
             .contains("target: coord in pane w1:p2 (claude, idle)"));
         assert_eq!(health.document["schema"], "agentctl-chat-health/v1");
+    }
+
+    #[test]
+    fn a_running_service_whose_owner_loop_stopped_turning_is_stalled_not_degraded() {
+        // #783: a loop hung on one delivery for 12 minutes read only as DEGRADED.
+        let mut observed = healthy();
+        observed.owner_loop = Some((12 * 60_000, Some(Duration::from_secs(300))));
+        let health = assess(observed, options());
+        assert_eq!(health.verdict, "stalled", "{}", health.text);
+        assert_eq!(health.exit_code(), EXIT_STALLED);
+        assert_eq!(health.exit_code(), EXIT_DOWN);
+        let first = health.text.lines().next().expect("verdict line");
+        assert!(
+            first.starts_with("chat health: STALLED: the owner loop of service process 42 has not turned for 12.0 min"),
+            "{first}"
+        );
+        assert_eq!(
+            health.document["problems"]["stalled"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(health.document["owner_loop"]["last_turn_age_seconds"], 720);
+        assert_eq!(health.document["owner_loop"]["stall_after_seconds"], 300);
+
+        // Within its bound, without a bound, or with no service at all, it is not stalled.
+        let mut observed = healthy();
+        observed.owner_loop = Some((299_000, Some(Duration::from_secs(300))));
+        assert_eq!(assess(observed, options()).verdict, "ok");
+        let mut observed = healthy();
+        observed.owner_loop = Some((12 * 60_000, None));
+        assert_eq!(assess(observed, options()).verdict, "ok");
+        let mut observed = healthy();
+        observed.owner_loop = None;
+        assert_eq!(assess(observed, options()).verdict, "ok");
+        let mut observed = healthy();
+        observed.runner = None;
+        observed.owner_loop = Some((12 * 60_000, Some(Duration::from_secs(300))));
+        assert_eq!(assess(observed, options()).verdict, "down");
     }
 
     #[test]

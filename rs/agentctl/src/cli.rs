@@ -1449,7 +1449,7 @@ enum ChatCommand {
     /// Say in one line whether a bridge works, then why: service, channels, event stream, target
     /// agent, last activity, stuck or uncertain requests and reply retry loops
     #[command(
-        after_help = "Examples:\n  agentctl --registry ~/project/.agentctl chat health --bridge-state ~/.local/state/agentctl/chat\n  agentctl --registry ~/project/.agentctl chat health --bridge-state DIR --json\n\nThe first line is the verdict: `chat health: OK: ...`, or DEGRADED or DOWN followed by every\nproblem found. DOWN: no chat run holds the state (its runner lock, read from /proc/locks), another\nbridge holds one of its channels, the event stream stopped on a gap or boundary mismatch, or the\ntarget agent is not registered, its pane is not alive, or Herdr detects no harness there.\nDEGRADED: the event stream delivered nothing (no batch, no heartbeat) for --stale-after, the subscription or send path is down,\nthe owner loop is failing, requests are stalled untyped or have uncertain delivery, a reply was\nretried 20 or more times or will never be sent, a captured reply is unsent after 10 minutes, the\nreply breaker holds a thread, or a repoint is not applied yet. The lines after it give the service\nprocess, each channel's lock holder, the event stream's last item and checkpoint write, the target's pane, harness and\nstatus, the last admitted, delivered and replied times (UTC and age), request counts, each\nuncertain request's reason, each retry loop, and the last repoint. --json prints the whole report\n(schema agentctl-chat-health/v1). It reads the state, /proc/locks, the registry and Herdr; it\nwrites nothing and never contacts the chat provider. Exit status: 0 OK, 3 DEGRADED, 1 DOWN."
+        after_help = "Examples:\n  agentctl --registry ~/project/.agentctl chat health --bridge-state ~/.local/state/agentctl/chat\n  agentctl --registry ~/project/.agentctl chat health --bridge-state DIR --json\n\nThe first line is the verdict: `chat health: OK: ...`, or DEGRADED or DOWN followed by every\nproblem found. DOWN: no chat run holds the state (its runner lock, read from /proc/locks), another\nbridge holds one of its channels, the event stream stopped on a gap or boundary mismatch, or the\ntarget agent is not registered, its pane is not alive, or Herdr detects no harness there.\nDEGRADED: the event stream delivered nothing (no batch, no heartbeat) for --stale-after, the subscription or send path is down,\nthe owner loop is failing, requests are stalled untyped or have uncertain delivery, a reply was\nretried 20 or more times or will never be sent, a captured reply is unsent after 10 minutes, the\nreply breaker holds a thread, or a repoint is not applied yet. STALLED: the service runs but its owner loop has not turned\nfor its --stall-restart-after bound (from owner-loop-alive in the state directory); chat run then stops itself to be restarted. The lines after it give the service\nprocess, each channel's lock holder, the event stream's last item and checkpoint write, the target's pane, harness and\nstatus, the last admitted, delivered and replied times (UTC and age), request counts, each\nuncertain request's reason, each retry loop, and the last repoint. --json prints the whole report\n(schema agentctl-chat-health/v1). It reads the state, /proc/locks, the registry and Herdr; it\nwrites nothing and never contacts the chat provider. Exit status: 0 OK, 3 DEGRADED, 1 DOWN or STALLED."
     )]
     Health(ChatHealth),
     /// Report each request's time from posted to admitted, acknowledged, delivered and first reply,
@@ -1938,6 +1938,9 @@ struct ChatRun {
         hide_default_value = true
     )]
     claude_bin: PathBuf,
+    /// Stop chat run with exit status 70 when its owner loop makes no round for DURATION, so that a unit with Restart=on-failure starts it again (default: 5m). Units: s, m or h; a bare number is seconds; at least 60s and at most 1h, and 0 runs no watchdog. Every blocking step of a round is bounded well below it: a delivery waits at most 5 s for the coordinator's queue and target locks and ends --ready-timeout plus 30 s after it starts, leaving the request pending for the next pass. The loop rewrites owner-loop-alive in the state directory as it turns; `chat health` reports a running service whose loop has not turned for DURATION as STALLED. The watchdog records the stall as the owner loop's failure, stops the service (cancelling the Herdr call the loop waits on), and ends the process itself if the loop has not ended 30 s later.
+    #[arg(long, value_name = "DURATION", default_value = "5m", hide_default_value = true, value_parser = stall_restart_after)]
+    stall_restart_after: StallRestartAfter,
 }
 
 #[derive(Args)]
@@ -1967,6 +1970,13 @@ impl ChatOperate {
                 max_attempts: self.max_attempts,
                 // `chat run` sets this from its own flag.
                 deliver_while_working: false,
+                // One delivery never holds the loop: a lock another sender holds, or a deadline
+                // reached, leaves the request pending for the next pass (#783).
+                lock_timeout: Some(crate::chat_service::BRIDGE_LOCK_TIMEOUT),
+                deadline: Some(
+                    Duration::from_secs_f64(self.ready_timeout)
+                        + crate::chat_service::BRIDGE_DELIVERY_DEADLINE,
+                ),
                 ..DrainOptions::default()
             },
             reconciliation_interval: Duration::from_secs_f64(self.reconcile_interval),
@@ -2125,6 +2135,12 @@ fn owner_alarm_duration(value: &str) -> Result<OwnerAlarmAfter, String> {
     crate::stale_composer::parse_duration(value)
         .map(|duration| OwnerAlarmAfter(Some(duration)))
         .map_err(|error| format!("{error}, or off"))
+}
+/// `chat run --stall-restart-after`: the stall bound, or `None` when no watchdog runs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StallRestartAfter(Option<Duration>);
+fn stall_restart_after(value: &str) -> Result<StallRestartAfter, String> {
+    crate::chat_service::parse_stall_restart_after(value).map(StallRestartAfter)
 }
 /// `chat run --reply-reminder-idle`: the idle time, or `None` when reminders are off.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4649,6 +4665,7 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
                     ignored_text_prefixes: value.ignored_text_prefixes,
                     offer_reply_command: value.offer_reply_command,
                     stale_composer_clear_after: value.stale_composer_clear_after,
+                    stall_restart_after: value.stall_restart_after.0,
                     reply_reminders: value.reply_reminder_idle.0.map(|idle| {
                         crate::chat_service::ReplyReminderSettings {
                             idle,
@@ -5700,6 +5717,58 @@ mod tests {
         ]));
         assert!(!writes_service_log(&["list"]));
         assert!(!writes_service_log(&[]));
+    }
+
+    #[test]
+    fn chat_run_bounds_every_delivery_and_runs_a_stall_watchdog_by_default() {
+        // #783: a delivery took the registry's 10-minute send deadline and stopped the loop.
+        let parse = |extra: &[&str]| {
+            let mut words = vec![
+                "agentctl",
+                "chat",
+                "run",
+                "--bridge-state",
+                "/tmp/chat-state",
+            ];
+            words.extend_from_slice(extra);
+            let Some(Commands::Chat(Chat {
+                command: ChatCommand::Run(run),
+            })) = Cli::try_parse_from(words).unwrap().command
+            else {
+                panic!("expected chat run");
+            };
+            run
+        };
+        let run = parse(&[]);
+        let delivery = run.operate.options().delivery;
+        assert_eq!(
+            delivery.lock_timeout,
+            Some(crate::chat_service::BRIDGE_LOCK_TIMEOUT)
+        );
+        assert_eq!(
+            delivery.deadline,
+            Some(crate::chat_service::BRIDGE_DELIVERY_DEADLINE)
+        );
+        assert_eq!(
+            run.stall_restart_after.0,
+            Some(crate::chat_service::DEFAULT_STALL_RESTART_AFTER)
+        );
+        let run = parse(&["--ready-timeout", "20", "--stall-restart-after", "0"]);
+        assert_eq!(
+            run.operate.options().delivery.deadline,
+            Some(Duration::from_secs(20) + crate::chat_service::BRIDGE_DELIVERY_DEADLINE)
+        );
+        assert_eq!(run.stall_restart_after.0, None);
+        assert!(Cli::try_parse_from([
+            "agentctl",
+            "chat",
+            "run",
+            "--bridge-state",
+            "/tmp/chat-state",
+            "--stall-restart-after",
+            "10s",
+        ])
+        .is_err());
     }
 
     #[test]

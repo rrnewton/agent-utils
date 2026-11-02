@@ -7,7 +7,7 @@ issue_type: bug
 labels:
 - agentctl
 created_at: 2026-11-02T18:07:43.775996897+00:00
-updated_at: 2026-11-02T18:07:43.775996897+00:00
+updated_at: 2026-11-02T20:31:06.383913247+00:00
 ---
 
 # Description
@@ -21,3 +21,12 @@ updated_at: 2026-11-02T18:07:43.775996897+00:00
 [opus 5.5] Also (owner saw it): the same request got TWO posts 2 s apart after the bridge restart. Reply 1 came from `chat reply N --file` (text taken from the transcript; Markdown table correct); reply 2 was "captured from the coordinator's pane" and its table was mangled by screen rendering. Asks: (4) dedupe: a reply ID already answered with `chat reply` (or any reply with the same text) is never also posted from a capture; (5) pane capture is the last resort: never use it when the transcript is known (the same pass took the next request from the transcript), and prefer refusing with an alarm over posting mangled tables.
 
 [opus 5.5] Lead 2026-11-02: P0, right after #778 (ahead of #781). Slices, each landed alone so bridges can roll forward one at a time: (a) main-loop hang / head-of-line blocking with a stall watchdog; (b) capture-miss alarm plus session discovery; (c) dedupe; (d) last-resort pane fallback.
+
+[opus 5.5] Slice (a) delivered (main-loop hang): the bridge passed no delivery deadline, so each delivery took the registry's hard send deadline (#702), 10 minutes by default. While another sender held the coordinator's queue delivery lock or the host-wide target lock, one request held the whole owner loop that long, which fits the ~12 min hang. The host had a pile of stuck `agentctl send coordinator` processes that day. Now:
+- Every bridge delivery waits at most 5 s for those locks and ends `--ready-timeout` + 30 s after it starts. A busy lock leaves the request pending for the next pass.
+- The owner loop's longest single wait is 30 s.
+- The loop beats a heartbeat each round and rewrites `owner-loop-alive` in the state directory.
+- A watchdog thread (`chat run --stall-restart-after`, default 5m, 0 off) treats a loop with no round for the bound as stalled. It logs the stall, records it as the owner loop's failure (class `stalled`), and stops the service, which cancels the Herdr call the loop waits on. If the loop has not ended 30 s later, it exits 70 itself; either way `chat run` exits nonzero, so `Restart=on-failure` starts it again.
+- `chat health` reports a running service whose loop has not turned for its bound as STALLED (exit 1, as DOWN), not DEGRADED. `services refresh` treats STALLED as not up.
+- Tests: the stalled health verdict and its boundaries, the stall verdict, the watchdog stopping a stalled service and recording it, a turning loop left alone with its alive record, and `chat run`'s bounded delivery options and flag. Slices (b)-(d) remain open.
+

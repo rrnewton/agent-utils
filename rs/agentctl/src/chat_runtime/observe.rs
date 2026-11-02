@@ -58,6 +58,9 @@ pub struct UnsentReply {
 
 /// The marker file whose modification time is the provider worker's last item.
 const PROVIDER_ALIVE_FILE: &str = "provider-alive";
+/// The marker file whose modification time is the owner loop's last round, and whose text is the
+/// stall bound it runs with, in whole seconds (`0`: no bound).
+const OWNER_LOOP_ALIVE_FILE: &str = "owner-loop-alive";
 
 fn modified_age(path: &Path, now_millis: u64) -> Option<u64> {
     let modified = fs::metadata(path)
@@ -224,6 +227,38 @@ impl BridgeState {
     #[must_use]
     pub fn provider_alive_age_millis(&self, now_millis: u64) -> Option<u64> {
         modified_age(&self.root.join(PROVIDER_ALIVE_FILE), now_millis)
+    }
+
+    /// Rewrite `owner-loop-alive` in the state directory: the owner loop does at each round, at
+    /// most every few seconds, so its modification time says the loop is turning, and its text
+    /// records `stall_after`, the bound past which `chat health` calls a quiet loop stalled.
+    /// Nothing is synced; a failure is ignored.
+    pub(crate) fn note_owner_loop_alive(&self, stall_after: Option<Duration>) {
+        let seconds = stall_after.map_or(0, |bound| bound.as_secs());
+        let _ = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(self.root.join(OWNER_LOOP_ALIVE_FILE))
+            .and_then(|mut file| {
+                use std::io::Write;
+                writeln!(file, "{seconds}")
+            });
+    }
+
+    /// How long ago the owner loop last turned, in milliseconds, with the stall bound it ran with
+    /// (`None`: no bound); `None` when no service built with this record has run on the state.
+    #[must_use]
+    pub fn owner_loop_alive(&self, now_millis: u64) -> Option<(u64, Option<Duration>)> {
+        let path = self.root.join(OWNER_LOOP_ALIVE_FILE);
+        let age = modified_age(&path, now_millis)?;
+        let bound = fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| text.trim().parse::<u64>().ok())
+            .filter(|seconds| *seconds > 0)
+            .map(Duration::from_secs);
+        Some((age, bound))
     }
 
     /// The process holding this state's runner lease, that is the running `chat run`, if any.

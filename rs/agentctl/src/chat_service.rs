@@ -10,7 +10,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -1047,6 +1047,10 @@ pub struct RunSettings {
     /// print those short commands; see [`crate::chat_lookup`]. `None` registers nothing and
     /// prints the explicit commands.
     pub registry: Option<PathBuf>,
+    /// Stop `chat run`, nonzero, when its owner loop makes no round for this long, so its unit
+    /// starts it again; `chat health` reports such a loop as stalled. `None`, the default here,
+    /// runs no watchdog; `chat run` uses [`DEFAULT_STALL_RESTART_AFTER`] unless told otherwise.
+    pub stall_restart_after: Option<Duration>,
 }
 
 /// Record this bridge in the per-user bridge index, and say how its prompts print commands: the
@@ -1382,7 +1386,30 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
         None
     };
 
-    let result = run_owner_loop(
+    let heartbeat = Arc::new(LoopHeartbeat::new());
+    let stalled = Arc::new(AtomicBool::new(false));
+    let loop_finished = Arc::new(AtomicBool::new(false));
+    let watchdog = match settings.stall_restart_after {
+        Some(stall_after) => match spawn_stall_watchdog(
+            state.clone(),
+            Arc::clone(&heartbeat),
+            stall_after,
+            Arc::clone(&stop),
+            Arc::clone(&stalled),
+            Arc::clone(&loop_finished),
+        ) {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                service_log(format_args!(
+                    "agentctl: warning: the chat stall watchdog could not start: {error}; chat run \
+                     keeps running without it"
+                ));
+                None
+            }
+        },
+        None => None,
+    };
+    let result = run_owner_loop_with_health(
         &state,
         client,
         manager,
@@ -1396,7 +1423,20 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
         &mut outbound,
         stale_composer,
         reminders,
+        ServiceHealth::new(manager.registry())
+            .with_heartbeat(heartbeat, settings.stall_restart_after),
     );
+    loop_finished.store(true, Ordering::SeqCst);
+    // A stall stopped the service: `chat run` exits nonzero so that its unit starts it again.
+    let result = if stalled.load(Ordering::SeqCst) {
+        Err(ChatServiceError::Worker(format!(
+            "the chat owner loop stalled for longer than {}s; chat run stopped so that its unit \
+             starts it again",
+            settings.stall_restart_after.unwrap_or_default().as_secs()
+        )))
+    } else {
+        result
+    };
 
     begin_service_stop(
         &stop,
@@ -1429,6 +1469,9 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
         if let Err(error) = listener.stop(shutdown_deadline) {
             stop.record_cleanup_error(error.to_string());
         }
+    }
+    if let Some(watchdog) = watchdog {
+        let _ = watchdog.join();
     }
     service_outcome(result, stop.take_cleanup_errors())
 }
@@ -4555,6 +4598,7 @@ impl TurnEvidence {
 
 /// Run the owner loop, as `chat run` does, and take a Herdr call that a stop cancelled for the
 /// stop: see [`owner_loop_end`].
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn run_owner_loop<A: ManagedApi + ?Sized>(
     state: &BridgeState,
@@ -4571,6 +4615,42 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
     stale_composer: Option<StaleComposer>,
     reminders: Option<ReplyReminders>,
 ) -> Result<(), ChatServiceError> {
+    run_owner_loop_with_health(
+        state,
+        client,
+        manager,
+        options,
+        stop,
+        cancellation,
+        output_wake,
+        overflowed,
+        notices,
+        reply_wakes,
+        transport,
+        stale_composer,
+        reminders,
+        ServiceHealth::new(manager.registry()),
+    )
+}
+
+/// [`run_owner_loop`] keeping `health`, whose heartbeat the stall watchdog reads.
+#[allow(clippy::too_many_arguments)]
+fn run_owner_loop_with_health<A: ManagedApi + ?Sized>(
+    state: &BridgeState,
+    client: &HerdrClient,
+    manager: &ManagedAgents<'_, A>,
+    options: ServiceOptions,
+    stop: &StopState,
+    cancellation: &SharedCancellation,
+    output_wake: &SharedWake,
+    overflowed: &AtomicBool,
+    notices: &mpsc::Receiver<ProviderNotice>,
+    reply_wakes: &mpsc::Receiver<String>,
+    transport: &mut Option<CommandOutboundTransport>,
+    stale_composer: Option<StaleComposer>,
+    reminders: Option<ReplyReminders>,
+    health: ServiceHealth,
+) -> Result<(), ChatServiceError> {
     let mut stale_composer = stale_composer.map(|guard| StaleComposerRun {
         guard,
         last_held: None,
@@ -4579,7 +4659,7 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
     // alarm again at once nor forgets a quarantine it has not told (#720).
     let mut owner_alarm = options.owner_alarm_after.map(owner_alarm::OwnerAlarm::new);
     let mut reminders = reminders;
-    let mut health = ServiceHealth::new(manager.registry());
+    let mut health = health;
     let mut backoff = ProviderBackoff::new();
     // The state of the agent the bridge serves now: a repoint replaces it between passes.
     let mut state = state.clone();
@@ -4761,6 +4841,7 @@ fn backoff_wait(
         if !keys.is_empty() {
             overflowed.store(true, Ordering::SeqCst);
         }
+        health.beat(state);
         health.sync_profile_policy(state);
         let remaining = deadline.saturating_duration_since(Instant::now());
         // A repoint request does not wait out the backoff: the failure may be the old agent's.
@@ -4774,6 +4855,164 @@ fn backoff_wait(
 /// How often [`backoff_wait`] takes the provider's notices.
 const BACKOFF_NOTICE_POLL: Duration = Duration::from_millis(250);
 
+/// How often the owner loop rewrites `owner-loop-alive` at most.
+const OWNER_LOOP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
+/// Longest single wait of the owner loop, so a quiet loop still turns and beats its heartbeat.
+const OWNER_LOOP_WAIT_MAX: Duration = Duration::from_secs(30);
+/// How long a stalled owner loop gets to end after the watchdog stops the service, before the
+/// watchdog ends the process itself.
+const STALL_EXIT_GRACE: Duration = Duration::from_secs(30);
+/// How often the stall watchdog looks at the heartbeat.
+const STALL_WATCHDOG_POLL: Duration = Duration::from_secs(5);
+/// The exit status of a `chat run` the stall watchdog ended (EX_SOFTWARE): nonzero, so a unit
+/// with `Restart=on-failure` starts it again.
+pub const EXIT_STALLED: i32 = 70;
+/// Default `--stall-restart-after`: a loop with no round for this long is stalled. Every
+/// blocking step of a round is bounded well below it ([`BRIDGE_LOCK_TIMEOUT`],
+/// [`BRIDGE_DELIVERY_DEADLINE`], Herdr's call timeout, [`OWNER_LOOP_WAIT_MAX`]).
+pub const DEFAULT_STALL_RESTART_AFTER: Duration = Duration::from_secs(300);
+/// Longest wait of one bridge delivery for the coordinator queue's delivery lock and the
+/// host-wide target lock: a lock another sender holds leaves the request pending for the next
+/// pass instead of holding the loop (#783 chat-reply-capture-miss).
+pub const BRIDGE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+/// Hard deadline of one bridge delivery beyond its `--ready-timeout`: it starts no prompt after
+/// it, and its lifecycle-lock and readiness waits end by it. Without one a delivery took the
+/// registry's send deadline, 10 minutes by default, and a lock held by a stuck sender stopped
+/// the whole loop that long.
+pub const BRIDGE_DELIVERY_DEADLINE: Duration = Duration::from_secs(30);
+
+/// `chat run --stall-restart-after`: the bound, or `None` for `0`, which runs no watchdog.
+///
+/// # Errors
+///
+/// A value that is not a whole number with unit s, m or h, or that is outside 60s to 1h.
+pub fn parse_stall_restart_after(value: &str) -> Result<Option<Duration>, String> {
+    let value = value.trim();
+    let (number, unit) = match value.char_indices().find(|(_, c)| !c.is_ascii_digit()) {
+        Some((index, _)) => value.split_at(index),
+        None => (value, "s"),
+    };
+    let multiplier = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3_600,
+        _ => return Err("expected a whole number with unit s, m or h, such as 5m".to_owned()),
+    };
+    let count: u64 = number
+        .parse()
+        .map_err(|_| "expected a whole number with unit s, m or h, such as 5m".to_owned())?;
+    let bound = Duration::from_secs(count.saturating_mul(multiplier));
+    if bound.is_zero() {
+        return Ok(None);
+    }
+    if bound < Duration::from_secs(60) || bound > Duration::from_secs(3_600) {
+        return Err(
+            "the stall bound must be 0, which runs no watchdog, or at least 60s and at most 1h"
+                .to_owned(),
+        );
+    }
+    Ok(Some(bound))
+}
+
+/// The owner loop's last round, in Unix milliseconds, shared with the stall watchdog.
+#[derive(Debug)]
+pub(crate) struct LoopHeartbeat {
+    last: AtomicU64,
+}
+
+impl LoopHeartbeat {
+    fn new() -> Self {
+        Self {
+            last: AtomicU64::new(chat_runtime::unix_millis()),
+        }
+    }
+
+    fn beat(&self) {
+        self.last
+            .store(chat_runtime::unix_millis(), Ordering::SeqCst);
+    }
+
+    /// Milliseconds since the last round at Unix time `now`.
+    fn age_millis(&self, now: u64) -> u64 {
+        now.saturating_sub(self.last.load(Ordering::SeqCst))
+    }
+}
+
+/// What the stall watchdog decides at one look.
+#[derive(Debug, Eq, PartialEq)]
+enum StallVerdict {
+    /// The loop turned within the bound.
+    Turning,
+    /// No round for longer than the bound: the age in milliseconds.
+    Stalled(u64),
+}
+
+fn stall_verdict(heartbeat: &LoopHeartbeat, stall_after: Duration, now: u64) -> StallVerdict {
+    let age = heartbeat.age_millis(now);
+    if u128::from(age) > stall_after.as_millis() {
+        StallVerdict::Stalled(age)
+    } else {
+        StallVerdict::Turning
+    }
+}
+
+/// Watch the owner loop's heartbeat: a loop with no round for `stall_after` is stalled. The
+/// watchdog logs it, records it as the owner loop's failure in `service-health.json`, marks the
+/// run `stalled`, and stops the service, which cancels every Herdr call the loop may be waiting
+/// on. When the loop has not ended [`STALL_EXIT_GRACE`] later, the watchdog ends the process with
+/// [`EXIT_STALLED`]. Either way `chat run` exits nonzero, so its unit starts it again.
+fn spawn_stall_watchdog(
+    state: BridgeState,
+    heartbeat: Arc<LoopHeartbeat>,
+    stall_after: Duration,
+    stop: Arc<StopState>,
+    stalled: Arc<AtomicBool>,
+    finished: Arc<AtomicBool>,
+) -> io::Result<thread::JoinHandle<()>> {
+    thread::Builder::new()
+        .name("agentctl-chat-stall-watchdog".to_owned())
+        .spawn(move || {
+            while !stop.is_stopped() {
+                stop.wait(STALL_WATCHDOG_POLL);
+                if stop.is_stopped() || finished.load(Ordering::SeqCst) {
+                    return;
+                }
+                let StallVerdict::Stalled(age) =
+                    stall_verdict(&heartbeat, stall_after, chat_runtime::unix_millis())
+                else {
+                    continue;
+                };
+                let detail = format!(
+                    "the chat owner loop made no progress for {}s (bound {}s); stopping chat run so \
+                     that its unit starts it again",
+                    age / 1_000,
+                    stall_after.as_secs()
+                );
+                service_log(format_args!("agentctl: {detail}"));
+                if let Err(error) = state.note_owner_loop_down("stalled", &detail) {
+                    service_log(format_args!(
+                        "agentctl: the service health record could not be saved: {error}"
+                    ));
+                }
+                stalled.store(true, Ordering::SeqCst);
+                stop.stop_with_timeout(STALL_EXIT_GRACE);
+                let deadline = Instant::now() + STALL_EXIT_GRACE;
+                while Instant::now() < deadline {
+                    if finished.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(200));
+                }
+                service_log(format_args!(
+                    "agentctl: the stalled chat owner loop did not end within {}s of the stop; \
+                     exiting {EXIT_STALLED}",
+                    STALL_EXIT_GRACE.as_secs()
+                ));
+                std::process::exit(EXIT_STALLED);
+            }
+        })
+}
+
 /// Keeps `service-health.json` current from the owner loop: the registry's profile-config check,
 /// as [`crate::profiles::ignore_check_failure`] reports it, and the end of an owner loop failure
 /// once a restarted loop has run for `PROVIDER_RETRY_MAX` (#581 bridge-git-timeout-fatal).
@@ -4786,6 +5025,12 @@ struct ServiceHealth {
     owner_loop_synced: bool,
     pass_started: Instant,
     save_failed: bool,
+    /// The owner loop's heartbeat, read by the stall watchdog ([`spawn_stall_watchdog`]).
+    heartbeat: Arc<LoopHeartbeat>,
+    /// The stall bound recorded with each `owner-loop-alive` write, for `chat health`.
+    stall_after: Option<Duration>,
+    /// When `owner-loop-alive` was last written.
+    alive_written: Option<Instant>,
 }
 
 impl ServiceHealth {
@@ -4797,6 +5042,33 @@ impl ServiceHealth {
             owner_loop_synced: false,
             pass_started: Instant::now(),
             save_failed: false,
+            heartbeat: Arc::new(LoopHeartbeat::new()),
+            stall_after: None,
+            alive_written: None,
+        }
+    }
+
+    /// Beat `heartbeat`, and record `stall_after` for `chat health`, from now on.
+    fn with_heartbeat(
+        mut self,
+        heartbeat: Arc<LoopHeartbeat>,
+        stall_after: Option<Duration>,
+    ) -> Self {
+        self.heartbeat = heartbeat;
+        self.stall_after = stall_after;
+        self
+    }
+
+    /// The owner loop is turning: beat the heartbeat, and touch `owner-loop-alive` at most every
+    /// [`OWNER_LOOP_ALIVE_INTERVAL`].
+    fn beat(&mut self, state: &BridgeState) {
+        self.heartbeat.beat();
+        if self
+            .alive_written
+            .is_none_or(|written| written.elapsed() >= OWNER_LOOP_ALIVE_INTERVAL)
+        {
+            state.note_owner_loop_alive(self.stall_after);
+            self.alive_written = Some(Instant::now());
         }
     }
 
@@ -4850,6 +5122,7 @@ impl ServiceHealth {
     /// Save what changed since the last call. A failed save is logged once and tried again at
     /// the next call; it never stops the loop.
     fn tick(&mut self, state: &BridgeState) {
+        self.beat(state);
         let mut saved = self.save_profile_policy(state);
         let recovered = self.owner_loop_down && self.pass_started.elapsed() >= PROVIDER_RETRY_MAX;
         if saved.is_ok() && (recovered || !self.owner_loop_synced) {
@@ -5403,6 +5676,8 @@ fn owner_loop_pass<A: ManagedApi + ?Sized>(
                     .flatten()
                     .fold(next_reconciliation, Instant::min)
                     .saturating_duration_since(Instant::now())
+                    // A quiet loop still turns, so its heartbeat says it is alive.
+                    .min(OWNER_LOOP_WAIT_MAX)
             } else {
                 Duration::ZERO
             };
@@ -8913,6 +9188,125 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
         );
         assert_eq!(after["receipt_reactions_refused"]["count"], 1);
         assert!(after.get("unreadable_records").is_none());
+    }
+
+    #[test]
+    fn the_stall_bound_takes_units_zero_for_off_and_stays_between_a_minute_and_an_hour() {
+        assert_eq!(
+            parse_stall_restart_after("5m"),
+            Ok(Some(Duration::from_secs(300)))
+        );
+        assert_eq!(
+            parse_stall_restart_after("90"),
+            Ok(Some(Duration::from_secs(90)))
+        );
+        assert_eq!(
+            parse_stall_restart_after("1h"),
+            Ok(Some(Duration::from_secs(3_600)))
+        );
+        assert_eq!(parse_stall_restart_after("0"), Ok(None));
+        for refused in ["59s", "61m", "5x", "", "m"] {
+            assert!(parse_stall_restart_after(refused).is_err(), "{refused}");
+        }
+    }
+
+    #[test]
+    fn a_heartbeat_older_than_its_bound_is_a_stall() {
+        let heartbeat = LoopHeartbeat::new();
+        let now = chat_runtime::unix_millis();
+        assert_eq!(
+            stall_verdict(&heartbeat, Duration::from_secs(300), now),
+            StallVerdict::Turning
+        );
+        heartbeat.last.store(now - 301_000, Ordering::SeqCst);
+        assert_eq!(
+            stall_verdict(&heartbeat, Duration::from_secs(300), now),
+            StallVerdict::Stalled(301_000)
+        );
+        heartbeat.beat();
+        assert_eq!(
+            stall_verdict(
+                &heartbeat,
+                Duration::from_secs(300),
+                chat_runtime::unix_millis()
+            ),
+            StallVerdict::Turning
+        );
+    }
+
+    #[test]
+    fn the_watchdog_records_a_stalled_loop_and_stops_the_service() {
+        // #783: the owner loop hung inside one delivery while the process lived on; the watchdog
+        // must see that and stop `chat run` so that its unit starts it again.
+        let (state, _, root) = state_with_request();
+        let heartbeat = Arc::new(LoopHeartbeat::new());
+        heartbeat
+            .last
+            .store(chat_runtime::unix_millis() - 120_000, Ordering::SeqCst);
+        let stop = Arc::new(StopState::default());
+        let stalled = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let watchdog = spawn_stall_watchdog(
+            state.clone(),
+            Arc::clone(&heartbeat),
+            Duration::from_secs(60),
+            Arc::clone(&stop),
+            Arc::clone(&stalled),
+            Arc::clone(&finished),
+        )
+        .unwrap();
+        let deadline = Instant::now() + STALL_WATCHDOG_POLL * 3;
+        while !stalled.load(Ordering::SeqCst) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            stalled.load(Ordering::SeqCst),
+            "the watchdog never saw the stall"
+        );
+        assert!(stop.is_stopped(), "a stall stops the service");
+        // The loop ends after the stop, as a cancelled Herdr call ends it; the watchdog then
+        // leaves the process to exit nonzero by itself.
+        finished.store(true, Ordering::SeqCst);
+        watchdog.join().unwrap();
+        let status = state.status().unwrap();
+        assert_eq!(
+            status["service_health"]["owner_loop"]["last_error_class"], "stalled",
+            "{status}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_turning_loop_is_left_alone_and_writes_its_alive_record() {
+        let (state, _, root) = state_with_request();
+        let mut health = ServiceHealth::new(Path::new("/nonexistent-registry")).with_heartbeat(
+            Arc::new(LoopHeartbeat::new()),
+            Some(Duration::from_secs(300)),
+        );
+        health.beat(&state);
+        let (age, bound) = state
+            .owner_loop_alive(chat_runtime::unix_millis())
+            .expect("owner-loop-alive written");
+        assert!(age < 60_000, "{age}");
+        assert_eq!(bound, Some(Duration::from_secs(300)));
+        let stop = Arc::new(StopState::default());
+        let stalled = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let watchdog = spawn_stall_watchdog(
+            state.clone(),
+            Arc::clone(&health.heartbeat),
+            Duration::from_secs(60),
+            Arc::clone(&stop),
+            Arc::clone(&stalled),
+            Arc::clone(&finished),
+        )
+        .unwrap();
+        thread::sleep(STALL_WATCHDOG_POLL + Duration::from_millis(500));
+        assert!(!stalled.load(Ordering::SeqCst));
+        assert!(!stop.is_stopped());
+        stop.stop();
+        watchdog.join().unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
