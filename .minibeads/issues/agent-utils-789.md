@@ -1,8 +1,7 @@
 ---
 title: 'chat-reply-off-turn-guard: hold a coordinator''s reply to an old owner request when it is answering lane chatter'
 status: open
-priority: 1
-assignee: cl-start@devbig030
+priority: 3
 issue_type: feature
 labels:
 - agentctl
@@ -17,3 +16,5 @@ updated_at: 2026-11-02T19:35:24.789822325+00:00
 # Notes
 
 [opus 5.5] Owner correction (2026-11-02): several status updates per thread ARE wanted, so drop ask (2) (no warning after N replies). Keep only the off-turn part, and do not block outright (a lane result can legitimately answer the owner's thread): when the coordinator writes a reply block for an owner request while answering a lane or agent-teams prompt, flag it (or hold it briefly for confirmation) and remind the coordinator that the reply must be relevant to that thread; relevant replies still go out.
+
+[opus 5.5] Owner (2026-11-02): do not overreact; the cure could be worse than the disease. P3 MONITOR ONLY, unassigned, no code for now. The devbig030 coordinator reports coord5's owner replies hourly (count, any off-topic for their thread); revisit if the pattern returns after the product lead's rule to its coordinator.
