@@ -98,10 +98,10 @@ def _row_ref_repo(tmp_path: Path) -> tuple[Path, Path]:
     evidence.mkdir()
     (repo / "local-ci-hub.toml").write_text(
         '[project]\nname="toy"\n[validate]\ncommand=["/bin/true"]\n'
-        'admission_slots=2\n[ledger]\nteam="toy"\npublish="none"\ncounted_repos=["primary"]\n'
+        'admission_slots=2\n[ledger]\nteam="toy"\npublish="none"\ncounted_repos=["primary","owner/primary"]\n'
         f'evidence_root="{evidence}"\nlocation={{path="ci-ledger"}}\n'
         '[remote]\nprovider="none"\n[receipt]\nqualifying=["local-ledger-pass"]\nrequire_full_evidence=true\n'
-        'release_payload={path="target/validate/app", profile="validate", debug_assertions=true, overflow_checks=true}\n'
+        '[receipt.release_payload]\npath="target/validate/primary"\nprofile="validate"\ndebug_assertions=true\noverflow_checks=true\n'
         '[land]\nstate_dir="ignored/local-ci-hub"\n')
     subprocess.run(["git", "add", "-A"], cwd=repo, timeout=15)
     subprocess.run(["git", "commit", "-qm", "toy: init"], cwd=repo, timeout=15)
@@ -213,37 +213,55 @@ def test_row_ref_missing_evidence_refuses(tmp_path: Path) -> None:
 
 
 def test_superseded_release_builder_does_not_qualify(tmp_path: Path) -> None:
-    # A PASS carrying a superseded release identity must not qualify:
-    # only the configured current identity names a builder.
+    # A PASS carrying a superseded payload must not qualify: only the
+    # configured current payload names a builder.
     repo, evidence = _row_ref_repo(tmp_path)
     sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
     superseded = dict(_full_row(sha, "r1", finished_at="2026-09-30T00:00:00Z"),
-                      release_builder="cargo",
-                      e2e_payload={"path": "target/debug/app", "profile": "debug",
+                      release_builder="builder-a",
+                      e2e_payload={"path": "target/debug/primary", "profile": "debug",
                                    "debug_assertions": True, "overflow_checks": True})
     _write_ledger(repo, [_row_ref_event(evidence, superseded, event_id="e1")])
     out = run_cli(repo, "--json", "receipt", "show", "HEAD")
     assert json.loads(out.stdout)["verdict"] != "qualified"
-    # The configured current identity still qualifies (the refusal is the superseded payload, not the fields).
+    # The configured current payload still qualifies (the refusal is the superseded payload, not the fields).
     current = dict(superseded, run_id="r2",
-                   e2e_payload={"path": "target/validate/app", "profile": "validate",
+                   e2e_payload={"path": "target/validate/primary", "profile": "validate",
                                 "debug_assertions": True, "overflow_checks": True})
     _write_ledger(repo, [_row_ref_event(evidence, current, event_id="e2")])
     out = run_cli(repo, "--json", "receipt", "show", "HEAD")
     assert json.loads(out.stdout)["verdict"] == "qualified"
 
 
-def test_peer_row_in_primary_shard_does_not_count(tmp_path: Path) -> None:
-    # A row naming a different repository is foreign evidence, even
-    # when physically inside this ledger's shard: only the configured
-    # counted repositories (and rows with no repo) count.
+def test_identity_claim_without_a_configured_payload_does_not_qualify(tmp_path: Path) -> None:
+    # With no current payload configured, a builder claim cannot be checked, so it is not
+    # honoured; a row that makes no identity claim still qualifies.
     repo, evidence = _row_ref_repo(tmp_path)
+    config = repo / "local-ci-hub.toml"
+    text = config.read_text()
+    config.write_text(text[:text.index("[receipt.release_payload]")] + text[text.index("[land]"):])
     sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
-    peer = dict(_full_row(sha, "r1"), repo="peer", schema_version=3)
-    _write_ledger(repo, [_row_ref_event(evidence, peer, event_id="e1")])
+    claim = dict(_full_row(sha, "r1"), release_builder="builder-a",
+                 e2e_payload={"path": "target/validate/primary", "profile": "validate",
+                              "debug_assertions": True, "overflow_checks": True})
+    _write_ledger(repo, [_row_ref_event(evidence, claim, event_id="e1")])
     out = run_cli(repo, "--json", "receipt", "show", "HEAD")
     assert json.loads(out.stdout)["verdict"] != "qualified"
-    primary = dict(peer, run_id="r2", repo="primary")
+    _write_ledger(repo, [_row_ref_event(evidence, _full_row(sha, "r2"), event_id="e2")])
+    out = run_cli(repo, "--json", "receipt", "show", "HEAD")
+    assert json.loads(out.stdout)["verdict"] == "qualified"
+
+
+def test_unlisted_repo_row_does_not_count(tmp_path: Path) -> None:
+    # A row whose repo is not one of the counted repos is not counted even
+    # when it sits in the same ledger; a counted repo row is.
+    repo, evidence = _row_ref_repo(tmp_path)
+    sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
+    other = dict(_full_row(sha, "r1"), repo="other", schema_version=3)
+    _write_ledger(repo, [_row_ref_event(evidence, other, event_id="e1")])
+    out = run_cli(repo, "--json", "receipt", "show", "HEAD")
+    assert json.loads(out.stdout)["verdict"] != "qualified"
+    primary = dict(other, run_id="r2", repo="primary")
     _write_ledger(repo, [_row_ref_event(evidence, primary, event_id="e2")])
     out = run_cli(repo, "--json", "receipt", "show", "HEAD")
     assert json.loads(out.stdout)["verdict"] == "qualified"

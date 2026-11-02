@@ -123,8 +123,7 @@ class Ledger:
 
     def _resolve_ref(self, codec: dict[str, object], host: str | None = None) -> tuple[dict[str, object], bool]:
         """Dereference one row-ref/v1 evidence object; (row, ok). Refuses on any mismatch."""
-        # Mirror ci-hub ledger_evidence.validate_ref: the locator is the
-        # immutable host/content address of the row, not an arbitrary path.
+        # The locator is the immutable host/content address of the row, not an arbitrary path.
         if set(codec) != _ROW_REF_FIELDS:
             return {}, False
         for name, limit in (("bytes", _MAX_ROW_BYTES), ("compressed_bytes", _MAX_COMPRESSED_BYTES)):
