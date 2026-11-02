@@ -18,6 +18,7 @@ const AGENT_RESTORE: &str = include_str!("systemd/agent-restore.service");
 const AGENT_WATCH: &str = include_str!("systemd/agent-watch.service");
 const BRIDGE_AFTER_HERDR: &str = include_str!("systemd/bridge-after-herdr.conf");
 const HEADLESS: &str = include_str!("systemd/agentctl-headless.service");
+const BRIDGE: &str = include_str!("systemd/agentctl-bridge.service");
 
 type Result<T> = std::result::Result<T, AgentError>;
 
@@ -185,6 +186,57 @@ pub fn rendered_headless(
     ))
 }
 
+/// A bridge name and unit name take the same shape as an agent name.
+fn bridge_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > 32
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err(fail(format!(
+            "--bridge takes a bridge name (1-32 lowercase letters, digits, and hyphens), not {name:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// The persistent unit that runs the chat bridge `name`, rendered, as `(file name,
+/// contents)`. Its state directory is `REGISTRY/bridges/NAME`, where `chat run` keeps it.
+pub fn rendered_bridge(options: &InstallOptions, name: &str) -> Result<(PathBuf, String)> {
+    bridge_name(name)?;
+    let agentctl = unit_path("agentctl", &options.agentctl)?;
+    let registry = unit_path("registry", &options.registry)?;
+    let state = options.registry.join("bridges").join(name);
+    let state = unit_path("bridge state", &state)?;
+    Ok((
+        PathBuf::from(format!("agentctl-bridge-{name}.service")),
+        BRIDGE
+            .replace("@AGENTCTL@", &agentctl)
+            .replace("@REGISTRY@", &registry)
+            .replace("@BRIDGE_STATE@", &state)
+            .replace("@NAME@", name),
+    ))
+}
+
+/// Write only the unit of the chat bridge `name`; refuse to replace a different existing
+/// file without `force`. Enables and starts nothing.
+pub fn install_bridge(options: &InstallOptions, name: &str) -> Result<Value> {
+    let file = rendered_bridge(options, name)?;
+    let unit = file.0.display().to_string();
+    let (written, unchanged) = write_files(options, &[file])?;
+    Ok(json!({
+        "dry_run": options.dry_run,
+        "written": written,
+        "unchanged": unchanged,
+        "next_steps": [
+            "review the file",
+            "systemctl --user daemon-reload",
+            format!("systemctl --user enable --now {unit}"),
+        ],
+    }))
+}
+
 /// Write only the unit of the headless agent `name`; refuse to replace a different existing
 /// file without `force`. Enables and starts nothing.
 pub fn install_headless(
@@ -330,6 +382,33 @@ mod tests {
         assert!(rendered_headless(&options(&dest), "../x", &unit).is_err());
         let report = install_headless(&options(&dest), "coordinator", &unit).unwrap();
         assert_eq!(report["written"].as_array().unwrap().len(), 1);
+        assert!(!dest.join("agent-watch.service").exists());
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn bridge_unit_is_persistent_and_written_alone() {
+        let dest = scratch("bridge");
+        let (name, contents) = rendered_bridge(&options(&dest), "coordinator").unwrap();
+        assert_eq!(name, PathBuf::from("agentctl-bridge-coordinator.service"));
+        assert!(
+            contents.contains(
+                "ExecStart=/opt/agentctl/bin/agentctl --registry /home/owner/project/.agentctl \
+             chat run --bridge-state /home/owner/project/.agentctl/bridges/coordinator\n"
+            ),
+            "{contents}"
+        );
+        assert!(
+            contents.contains("After=herdr-server.service"),
+            "{contents}"
+        );
+        assert!(contents.contains("Restart=on-failure"), "{contents}");
+        assert!(contents.contains("WantedBy=default.target"), "{contents}");
+        assert!(!contents.contains('@'), "{contents}");
+        assert!(rendered_bridge(&options(&dest), "../x").is_err());
+        let report = install_bridge(&options(&dest), "coordinator").unwrap();
+        assert_eq!(report["written"].as_array().unwrap().len(), 1);
+        assert!(dest.join("agentctl-bridge-coordinator.service").is_file());
         assert!(!dest.join("agent-watch.service").exists());
         let _ = fs::remove_dir_all(&dest);
     }

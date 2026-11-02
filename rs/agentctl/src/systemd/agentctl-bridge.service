@@ -1,0 +1,21 @@
+# Installed by `agentctl install-units --bridge @NAME@`. Runs the chat bridge @NAME@ as a
+# persistent user unit instead of a `systemd-run` transient, which a reboot deletes: the
+# bridge is back with the boot, and `agentctl services refresh` updates it in place like
+# any other unit file. The bridge needs the Herdr server, so it is ordered after it and
+# pulls it in. A crash-looping bridge must not re-send replies, so the restart burst
+# stays small; the bridge's own state directory is the @BRIDGE_STATE@ under the registry.
+[Unit]
+Description=agentctl chat bridge @NAME@
+Wants=herdr-server.service
+After=herdr-server.service
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=@AGENTCTL@ --registry @REGISTRY@ chat run --bridge-state @BRIDGE_STATE@
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

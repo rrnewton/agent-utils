@@ -1071,7 +1071,13 @@ bridge after the server (`After=`, `Wants=`) and restarts it on failure every 10
 seconds, named `zz-agentctl-after-herdr.conf` so it sorts after numbered drop-ins.
 It sets no start limit: a low burst in the bridge's own policy keeps a
 crash-looping bridge from re-sending replies, and ordering after the server is
-what fixes the boot race. It refuses to replace a file that
+what fixes the boot race. With `--bridge NAME` (repeatable) it writes only
+`agentctl-bridge-NAME.service`, a persistent unit that runs
+`chat run --bridge-state REGISTRY/bridges/NAME` after the server, so a bridge
+installed this way survives a reboot instead of vanishing with the
+`systemd-run` transient it replaces, and `agentctl services refresh` then
+updates it in place like any other unit file; the bridge's old transient must
+be stopped before the unit is enabled, so the two never serve one channel. It refuses to replace a file that
 differs unless `--force`, supports `--dry-run`, and never enables, starts, or
 reloads anything; its output lists the `systemctl --user` commands to run after
 review. Keep `resume_agents_on_restore = false` in Herdr's configuration: Herdr
