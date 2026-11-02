@@ -510,6 +510,11 @@ pub struct ChatRelayRoute {
     pub list_argv: Vec<String>,
     /// Maximum envelope bytes in one post; larger is a definite skip.
     pub max_envelope_bytes: Option<usize>,
+    /// Maximum whole post in bytes, measured after escaping the visible
+    /// text (`max_post_bytes` in the route definition, default
+    /// [`crate::relay::DEFAULT_MAX_POST_BYTES`]). An envelope whose fence
+    /// alone exceeds it skips the route rather than splitting the post.
+    pub max_post_bytes: usize,
     /// Posts per hour over this route; over the limit is a definite skip.
     pub per_hour: u64,
     /// Rate-limit state file.
@@ -538,6 +543,17 @@ pub struct ChatRelayRoute {
 }
 
 impl ChatRelayRoute {
+    /// Whether the fenced envelope alone exceeds this route's post cap.
+    fn envelope_alone_too_big(&self, envelope_bytes: usize) -> bool {
+        envelope_bytes + crate::relay::fence_overhead() + crate::relay::TAG_AND_JOINS_MARGIN_BYTES
+            > self.max_post_bytes
+    }
+    fn envelope_too_big_reason(&self, envelope_bytes: usize) -> String {
+        format!(
+            "envelope of {envelope_bytes} bytes plus its fence exceeds max_post_bytes {} (one post per envelope)",
+            self.max_post_bytes
+        )
+    }
     fn recent_posts(&self) -> u64 {
         Self::recent_in(&self.rate_file)
     }
@@ -633,6 +649,9 @@ impl Route for ChatRelayRoute {
         self.mirror
     }
     fn mirror_skip_reason(&self, envelope_bytes: usize) -> Option<String> {
+        if self.envelope_alone_too_big(envelope_bytes) {
+            return Some(self.envelope_too_big_reason(envelope_bytes));
+        }
         if let Some(max) = self.max_envelope_bytes {
             if envelope_bytes > max {
                 return Some(format!(
@@ -664,7 +683,7 @@ impl Route for ChatRelayRoute {
                 }));
             }
         }
-        let text = crate::relay::render_post(envelope);
+        let text = crate::relay::render_post_with_limit(envelope, self.max_post_bytes);
         match crate::relay::run_post_argv_with_timeout(
             &self.post_argv,
             &self.channel,
@@ -694,6 +713,9 @@ impl Route for ChatRelayRoute {
         }
     }
     fn skip_reason(&self, envelope_bytes: usize) -> Option<String> {
+        if self.envelope_alone_too_big(envelope_bytes) {
+            return Some(self.envelope_too_big_reason(envelope_bytes));
+        }
         if let Some(max) = self.max_envelope_bytes {
             if envelope_bytes > max {
                 return Some(format!(
@@ -725,7 +747,7 @@ impl Route for ChatRelayRoute {
                         );
                     }
                 }
-                let text = crate::relay::render_post(payload);
+                let text = crate::relay::render_post_with_limit(payload, self.max_post_bytes);
                 match crate::relay::run_post_argv_with_timeout(
                     &self.post_argv,
                     &self.channel,
@@ -823,6 +845,13 @@ pub fn relay_route_for(
             .and_then(Value::as_u64)
             .map(|n| n as usize)
             .or(Some(10_000)),
+        max_post_bytes: def
+            .raw
+            .get("max_post_bytes")
+            .and_then(Value::as_u64)
+            .filter(|n| *n > 0)
+            .map(|n| n as usize)
+            .unwrap_or(crate::relay::DEFAULT_MAX_POST_BYTES),
         per_hour: def
             .raw
             .get("limits")

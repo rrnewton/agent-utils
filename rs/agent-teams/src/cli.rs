@@ -545,6 +545,29 @@ fn cmd_check(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
             )}));
         }
     }
+    // A relay route whose envelope limit exceeds its post cap can never
+    // post the envelopes it admits: warn, do not refuse (#763).
+    for def in routes.routes.values() {
+        if crate::route::is_relay_def(def) {
+            let max_post = def
+                .raw
+                .get("max_post_bytes")
+                .and_then(Value::as_u64)
+                .filter(|n| *n > 0)
+                .unwrap_or(crate::relay::DEFAULT_MAX_POST_BYTES as u64);
+            let max_envelope = def
+                .raw
+                .get("max_envelope_bytes")
+                .and_then(Value::as_u64)
+                .unwrap_or(10_000);
+            if max_envelope > max_post {
+                lines.push(json!({"kind": "warning", "detail": format!(
+                    "route {}: max_envelope_bytes {max_envelope} exceeds max_post_bytes {max_post}; envelopes over the post cap skip this route",
+                    def.name
+                )}));
+            }
+        }
+    }
     // Star: every spoke needs a route toward the first hub.
     if let Some(hub) = teams.hubs.first() {
         if globals.host != *hub {
@@ -2388,12 +2411,22 @@ fn cmd_relay_quarantine(globals: &Globals, args: &[String]) -> Result<i32, DataE
             }
             Ok(0)
         }
-        Some("drop") => {
+        Some(verb @ ("drop" | "dismiss")) => {
             let Some(id) = target else {
-                return Err(err("usage", "relay quarantine drop needs a quarantine ID"));
+                return Err(err(
+                    "usage",
+                    "relay quarantine dismiss needs a quarantine ID",
+                ));
             };
             if crate::relay::drop_quarantined(&globals.state, id)? {
-                println!("dropped quarantined post {id} (not delivered)");
+                println!(
+                    "{} quarantined post {id} (not delivered)",
+                    if verb == "drop" {
+                        "dropped"
+                    } else {
+                        "dismissed"
+                    }
+                );
                 Ok(0)
             } else {
                 println!("no quarantined post with ID {id}");
@@ -2402,7 +2435,7 @@ fn cmd_relay_quarantine(globals: &Globals, args: &[String]) -> Result<i32, DataE
         }
         _ => Err(err(
             "usage",
-            "relay quarantine subcommands: list, retry [<id>], drop <id>",
+            "relay quarantine subcommands: list, retry [<id>], dismiss <id> (alias: drop)",
         )),
     }
 }
@@ -2946,6 +2979,18 @@ fn cmd_relay_alarms(globals: &Globals, args: &[String]) -> Result<i32, DataError
         println!("no open stranger alarms");
     }
     for alarm in &open {
+        if alarm.get("kind").and_then(Value::as_str) == Some("unparseable") {
+            println!(
+                "RELAY ALARM (unparseable): confirmed sender {} -> team {} ({}; raised {}x, last {}) — dismiss: agent-teams relay quarantine dismiss {}",
+                alarm["sender_id"].as_str().unwrap_or("?"),
+                alarm["local_team"].as_str().unwrap_or("?"),
+                alarm["reason"].as_str().unwrap_or("?"),
+                alarm["raises"].as_u64().unwrap_or(0),
+                alarm["last_raised_at"].as_str().unwrap_or("never"),
+                alarm["quarantine_id"].as_str().unwrap_or("?"),
+            );
+            continue;
+        }
         println!(
             "STRANGER ALARM: sender {} claims {}@{} -> team {} ({}; raised {}x, last {})",
             alarm["sender_id"].as_str().unwrap_or("?"),

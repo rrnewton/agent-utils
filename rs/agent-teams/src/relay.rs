@@ -57,16 +57,143 @@ pub fn strip_provider_notes(text: &str) -> String {
     }
 }
 
-/// Render one envelope as a chat post: tag line, the body for the owner to
-/// read, then the authoritative envelope in a fenced block.
+/// Default per-route cap on one relay post, in bytes. The owner's chat
+/// publisher splits a post at 4,000 bytes *after* mrkdwn conversion
+/// (`slack_format: converted`), and a split relay post is worse than a
+/// truncated one: the first chunk has no fence and reads as an
+/// unparseable stranger. A relay post is therefore never split — the
+/// visible copy is truncated to keep the whole post under the route's
+/// `max_post_bytes` (this default when unset), measured after escaping,
+/// with the full body always in the fenced envelope.
+pub const DEFAULT_MAX_POST_BYTES: usize = 3_500;
+
+/// Length of `text` after the mrkdwn escaping the publisher applies to
+/// visible text (`&` becomes `&amp;`, `<`/`>` become entities).
+pub fn escaped_len(text: &str) -> usize {
+    text.chars()
+        .map(|ch| match ch {
+            '&' => 5,
+            '<' | '>' => 4,
+            _ => ch.len_utf8(),
+        })
+        .sum()
+}
+
+/// Margin the sender-side skip test reserves for the escaped tag line
+/// and its joins, which it cannot measure from the envelope bytes alone.
+pub const TAG_AND_JOINS_MARGIN_BYTES: usize = 160;
+
+/// Make body text safe as a visible preview: strip Markdown structure
+/// (headings, bullets, quotes, tables, links, fences) so mrkdwn
+/// conversion cannot grow it past the measured size, and so a cut can
+/// never leave an unclosed fence around the envelope.
+fn sanitize_preview(body: &str) -> String {
+    let mut out = String::new();
+    for line in body.lines() {
+        let mut text = line.trim_start();
+        while let Some(rest) = text.strip_prefix('#') {
+            text = rest.trim_start();
+        }
+        if let Some(rest) = text.strip_prefix("> ") {
+            text = rest;
+        }
+        for marker in ["- ", "* ", "+ "] {
+            if let Some(rest) = text.strip_prefix(marker) {
+                text = rest;
+                break;
+            }
+        }
+        let digits = text.len() - text.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        if digits > 0 {
+            if let Some(rest) = text[digits..].strip_prefix(". ") {
+                text = rest;
+            }
+        }
+        out.push_str(&text.replace('|', "/").replace("```", ""));
+        out.push('\n');
+    }
+    // Links: keep only the label, never the URL the converter expands.
+    let mut linked = String::new();
+    let mut rest = out.as_str();
+    while let Some(open) = rest.find('[') {
+        let Some(close_rel) = rest[open..].find("](") else {
+            break;
+        };
+        let close = open + close_rel;
+        let Some(end_rel) = rest[close..].find(')') else {
+            break;
+        };
+        linked.push_str(&rest[..open]);
+        linked.push_str(&rest[open + 1..close]);
+        rest = &rest[close + end_rel + 1..];
+    }
+    linked.push_str(rest);
+    linked.trim_end().to_string()
+}
+
+fn envelope_fence(envelope: &Value) -> String {
+    format!("```{ENVELOPE_FENCE}\n{envelope}\n```\n")
+}
+
+/// Bytes the fence adds around a serialized envelope.
+pub fn fence_overhead() -> usize {
+    "```agent-teams-envelope\n".len() + "\n```\n".len()
+}
+
+/// Render one envelope as a chat post: tag line, the body for the owner
+/// to read, then the authoritative envelope in a fenced block. The
+/// visible body is truncated when it would push the post past
+/// `max_post_bytes` measured after escaping; the envelope is never
+/// touched. Callers skip the route when the envelope alone does not fit.
+pub fn render_post_with_limit(envelope: &Value, max_post_bytes: usize) -> String {
+    let raw_body = envelope.get("body").and_then(Value::as_str).unwrap_or("");
+    let body = sanitize_preview(raw_body);
+    let body = body.as_str();
+    let tag = team_tag(envelope);
+    let fence = envelope_fence(envelope);
+    // Tag and visible text are escaped by the publisher; the fence is not.
+    // The two `\n` joins become blank-line joins after conversion, so
+    // count 2 extra bytes of join margin.
+    let fits = |visible: &str| {
+        escaped_len(&tag) + 1 + escaped_len(visible) + 1 + fence.len() + 2 <= max_post_bytes
+    };
+    const NOTE: &str = "\n[relay copy truncated: full text in the envelope below]";
+    // The visible copy is only a preview for the owner: the envelope
+    // already carries the full body, so a long body shows its first
+    // ~500 chars and a post stays ~1x the body, not ~2x.
+    const PREVIEW_CHARS: usize = 500;
+    if body.chars().count() > PREVIEW_CHARS {
+        let preview: String = body.chars().take(PREVIEW_CHARS).collect();
+        let visible = format!("{preview}{NOTE}");
+        if fits(&visible) {
+            return format!("{tag}\n{visible}\n{fence}");
+        }
+    } else if fits(body) {
+        return format!("{tag}\n{body}\n{fence}");
+    }
+    if !fits("") {
+        return format!("{tag}\n\n{fence}");
+    }
+    let mut kept = String::new();
+    'lines: for line in body.split_inclusive('\n') {
+        if fits(&format!("{kept}{line}{NOTE}")) {
+            kept.push_str(line);
+            continue;
+        }
+        for ch in line.chars() {
+            if !fits(&format!("{kept}{ch}{NOTE}")) {
+                break 'lines;
+            }
+            kept.push(ch);
+        }
+        break;
+    }
+    format!("{tag}\n{kept}{NOTE}\n{fence}")
+}
+
+/// Render one envelope as a chat post at the default cap.
 pub fn render_post(envelope: &Value) -> String {
-    let body = envelope.get("body").and_then(Value::as_str).unwrap_or("");
-    format!(
-        "{}\n{}\n```{ENVELOPE_FENCE}\n{}\n```\n",
-        team_tag(envelope),
-        body,
-        envelope
-    )
+    render_post_with_limit(envelope, DEFAULT_MAX_POST_BYTES)
 }
 
 /// Render one receipt as a thread post: tag line, `receipt: <state>`, then
@@ -908,33 +1035,49 @@ pub fn relay_in(
     in_thread: bool,
     text: &str,
 ) -> DataResult<RelayInResult> {
+    // Our own plain-text unparseable receipt is itself unparseable: never
+    // quarantine it, or the two sides ping-pong receipts forever (#763).
+    if strip_provider_notes(text).trim()
+        == "agent-teams receipt: not-recorded (unparseable relay post)"
+    {
+        return Ok(result(
+            "ignored-unparseable-receipt",
+            "plain-text unparseable receipt; ignored without a reply",
+        ));
+    }
     let parsed = match parse_post(text) {
         Ok(parsed) => parsed,
         Err(reason) => {
-            // Unparseable posts from a listed peer are stranger events:
+            // A post from a CONFIRMED sender that does not parse (a split
+            // or truncated relay post is the usual cause) is not a
+            // stranger: it is quarantined under its own alarm kind.
+            // Never reply to an unparseable post (its receipt would itself
+            // be unparseable), so no receipt_text is set on either branch.
+            if is_confirmed_sender(state, peer_sender, route, channel) {
+                let detail = format!("unparseable relay post from confirmed sender: {reason}");
+                let id = record_unparseable_confirmed(
+                    state,
+                    route,
+                    peer_sender,
+                    channel,
+                    text,
+                    &detail,
+                )?;
+                return Ok(result(
+                    NOT_RECORDED,
+                    format!(
+                        "{detail}; quarantined as {id} — dismiss with: \
+                         agent-teams relay quarantine dismiss {id}"
+                    ),
+                ));
+            }
+            // Unparseable posts from anyone else are stranger events:
             // quarantine and alarm, never silently dropped. Provider
             // formatting, splitting or truncation lands here. A recording
             // failure is an admission failure, never a silent drop.
             let detail = format!("unparseable relay post: {reason}");
             record_unparseable_stranger(state, route, peer_sender, channel, text, &detail)?;
-            let mut out = result(NOT_RECORDED, detail);
-            // Only a listed peer earns a thread receipt; an unlisted
-            // stranger's mangled post is quarantined and alarmed without
-            // a bot reply in the channel.
-            let listed = load_declarations(state).is_ok_and(|declarations| {
-                declarations.iter().any(|(_, _, declaration)| {
-                    declaration
-                        .relay_channels
-                        .iter()
-                        .any(|entry| entry.route == route && entry.peers.contains_key(peer_sender))
-                })
-            }) || confirmed_mapping_for(state, peer_sender, route).is_some();
-            if listed {
-                out.receipt_text = Some(format!(
-                    "agent-teams receipt: {NOT_RECORDED} (unparseable relay post)\n"
-                ));
-            }
-            return Ok(out);
+            return Ok(result(NOT_RECORDED, detail));
         }
     };
     match parsed {
@@ -1394,6 +1537,7 @@ fn relay_in_envelope(
             declaration,
             entry,
             &id,
+            true,
         );
     }
     // Legacy one-bot-per-team mode (weaker, documented): the declaration's
@@ -1456,6 +1600,7 @@ fn relay_in_envelope(
         declaration,
         entry,
         &id,
+        false,
     )
 }
 
@@ -1473,6 +1618,7 @@ fn relay_deliver(
     declaration: &Declaration,
     entry: &crate::model::RelayChannel,
     id: &str,
+    signed_verified: bool,
 ) -> DataResult<RelayInResult> {
     let from_team = envelope
         .get("from")
@@ -1486,21 +1632,37 @@ fn relay_deliver(
         out.receipt_text = Some(render_receipt(envelope, &receipt));
         out
     };
-    // Malformed posts from an admitted sender are stranger events too:
-    // loud and quarantined, so a broken or forged post is never silent.
     if !tag_matches(text, envelope) {
-        record_stranger(
-            state,
-            declaration,
-            entry,
-            peer_sender,
-            envelope,
-            text,
-            "malformed: tag does not match envelope",
-        )?;
-        let mut out = receipt_for(NOT_RECORDED, "malformed: tag does not match envelope");
-        out.outcome = "stranger-quarantined".to_string();
-        return Ok(post_receipt(state, entry, channel, thread, id, out));
+        // The signed bypass applies only when the tag line is absent
+        // (the fence-only piece of a split post): a present-but-wrong tag
+        // means the visible header disagrees with the envelope, which is
+        // filed as unparseable, never silently delivered.
+        let tag_absent = !text
+            .lines()
+            .next()
+            .is_some_and(|line| line.trim_start().starts_with('['));
+        if signed_verified && tag_absent {
+            // A signed, verified envelope is the authority: a missing tag
+            // line must not become a stranger. Deliver as usual (#763).
+            log_event(
+                state,
+                &json!({"event": "relay-in", "outcome": "tag-missing-signed", "route": route, "peer_sender": peer_sender, "id": id}),
+            );
+        } else {
+            // Legacy admission has no signature to trust, so a missing tag
+            // is filed under the unparseable kind, never as a stranger,
+            // and never replied to.
+            let detail = "malformed: tag does not match envelope".to_string();
+            let qid =
+                record_unparseable_confirmed(state, route, peer_sender, channel, text, &detail)?;
+            return Ok(result(
+                NOT_RECORDED,
+                format!(
+                    "{detail}; quarantined as {qid} — dismiss with: \
+                     agent-teams relay quarantine dismiss {qid}"
+                ),
+            ));
+        }
     }
     if let Err(reason) = check_envelope(envelope) {
         record_stranger(
@@ -1609,6 +1771,24 @@ pub fn confirmed_mapping_for(
     })
 }
 
+/// Whether a sender counts as confirmed for unparseable-post handling:
+/// a confirmed discovery mapping, or a peer listed in a local
+/// declaration's `relay_channels[].peers` for this route/channel.
+fn is_confirmed_sender(state: &Path, peer_sender: &str, route: &str, channel: &str) -> bool {
+    if confirmed_mapping_for(state, peer_sender, route).is_some() {
+        return true;
+    }
+    load_declarations(state).is_ok_and(|declarations| {
+        declarations.iter().any(|(_, _, declaration)| {
+            declaration.relay_channels.iter().any(|entry| {
+                entry.route == route
+                    && (entry.channel.is_empty() || entry.channel == channel)
+                    && entry.peers.contains_key(peer_sender)
+            })
+        })
+    })
+}
+
 /// The confirmed discovery mapping for one sender, as `(fleet, host)`.
 pub fn confirmed_mapping(state: &Path, sender_id: &str) -> Option<(String, Option<String>)> {
     let store = load_store(state);
@@ -1697,6 +1877,167 @@ pub fn ban_sender(state: &Path, sender_id: &str) -> DataResult<()> {
     write_json_atomic(&alarms_path(state), &doc)
 }
 
+/// Record an unparseable post from a CONFIRMED sender: quarantine it and
+/// open an alarm of kind `unparseable` for the receiving team — never a
+/// stranger alarm, since the sender is confirmed and the usual cause is
+/// a relay post the provider split or truncated. Returns the quarantine
+/// ID, which `relay quarantine dismiss` removes.
+fn record_unparseable_confirmed(
+    state: &Path,
+    route: &str,
+    peer_sender: &str,
+    channel: &str,
+    text: &str,
+    reason: &str,
+) -> DataResult<String> {
+    let id = format!(
+        "unparseable-{}",
+        &sha256_hex(strip_provider_notes(text).as_bytes())[..12]
+    );
+    // A bridge rescan can re-offer the same Slack post indefinitely: a
+    // given post is recorded at most once, so it cannot generate an
+    // unbounded stream of events for one message (#763 item 6).
+    if quarantined_posts(state).iter().any(|post| {
+        post.get("id").and_then(Value::as_str) == Some(id.as_str())
+            && post.get("peer_sender").and_then(Value::as_str) == Some(peer_sender)
+    }) {
+        return Ok(id);
+    }
+    let envelope = json!({"id": id, "from": Value::Null, "unparseable": true});
+    let declarations = load_declarations(state).unwrap_or_default();
+    let Some((_, _, declaration)) = declarations.iter().find(|(_, _, declaration)| {
+        declaration.relay_channels.iter().any(|entry| {
+            entry.route == route && (entry.channel.is_empty() || entry.channel == channel)
+        })
+    }) else {
+        // No local team receives this route: quarantine without an alarm.
+        let _lock = lock_store(state)?;
+        let mut quarantine = load_json_list(&quarantine_path(state), "posts");
+        let posts = quarantine
+            .get_mut("posts")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| DataError::new("relay-quarantine", "posts is not a list"))?;
+        if !posts.iter().any(|post| {
+            post.get("id").and_then(Value::as_str) == Some(id.as_str())
+                && post.get("peer_sender").and_then(Value::as_str) == Some(peer_sender)
+        }) {
+            posts.push(json!({
+                "id": id, "peer_sender": peer_sender, "route": route,
+                "channel": channel, "envelope": envelope, "post": text,
+                "reason": reason, "quarantined_at": format_rfc3339_ms(now_unix_ms()),
+            }));
+        }
+        write_json_atomic(&quarantine_path(state), &quarantine)?;
+        return Ok(id);
+    };
+    let entry = declaration
+        .relay_channels
+        .iter()
+        .find(|entry| entry.route == route);
+    let _lock = lock_store(state)?;
+    {
+        let mut quarantine = load_json_list(&quarantine_path(state), "posts");
+        let posts = quarantine
+            .get_mut("posts")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| DataError::new("relay-quarantine", "posts is not a list"))?;
+        if !posts.iter().any(|post| {
+            post.get("id").and_then(Value::as_str) == Some(id.as_str())
+                && post.get("peer_sender").and_then(Value::as_str) == Some(peer_sender)
+        }) {
+            posts.push(json!({
+                "id": id, "peer_sender": peer_sender, "route": route,
+                "channel": channel, "envelope": envelope, "post": text,
+                "reason": reason, "quarantined_at": format_rfc3339_ms(now_unix_ms()),
+            }));
+            if posts.len() > 512 {
+                let excess = posts.len() - 512;
+                posts.drain(0..excess);
+            }
+        }
+        write_json_atomic(&quarantine_path(state), &quarantine)?;
+    }
+    let now_ms = now_unix_ms();
+    let mut alarm_index: Option<usize> = None;
+    {
+        let mut doc = load_json_list(&alarms_path(state), "alarms");
+        let list = doc
+            .get_mut("alarms")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| DataError::new("relay-alarms", "alarms is not a list"))?;
+        for (index, alarm) in list.iter().enumerate() {
+            if alarm.get("sender_id").and_then(Value::as_str) == Some(peer_sender)
+                && alarm.get("local_team").and_then(Value::as_str)
+                    == Some(declaration.team.as_str())
+                && alarm.get("kind").and_then(Value::as_str) == Some("unparseable")
+                && alarm.get("state").and_then(Value::as_str) == Some("open")
+            {
+                alarm_index = Some(index);
+                break;
+            }
+        }
+        if let Some(index) = alarm_index {
+            list[index]["reason"] = json!(reason);
+            list[index]["quarantine_id"] = json!(id);
+            let mut ids: Vec<String> = list[index]
+                .get("quarantine_ids")
+                .and_then(Value::as_array)
+                .map(|list| {
+                    list.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !ids.iter().any(|existing| existing == &id) {
+                ids.push(id.clone());
+            }
+            list[index]["quarantine_ids"] = json!(ids);
+            list[index]["interval_seconds"] =
+                json!(entry.map_or(1800, |entry| entry.alarm_interval_seconds));
+        } else {
+            list.push(json!({
+                "sender_id": peer_sender, "local_team": declaration.team,
+                "kind": "unparseable", "quarantine_id": id, "quarantine_ids": [id],
+                "claimed_from": Value::Null, "reason": reason,
+                "state": "open", "first_at": format_rfc3339_ms(now_ms),
+                "last_raised_at": Value::Null, "raises": 0,
+                "interval_seconds": entry.map_or(1800, |entry| entry.alarm_interval_seconds),
+            }));
+            alarm_index = Some(list.len() - 1);
+        }
+        write_json_atomic(&alarms_path(state), &doc)?;
+    }
+    log_event(
+        state,
+        &json!({"event": "unparseable", "sender_id": peer_sender, "local_team": declaration.team, "id": id, "reason": reason}),
+    );
+    if let Some(index) = alarm_index {
+        let doc = load_json_list(&alarms_path(state), "alarms");
+        let due = doc
+            .get("alarms")
+            .and_then(Value::as_array)
+            .and_then(|list| list.get(index))
+            .is_none_or(|alarm| {
+                let interval_ms = alarm
+                    .get("interval_seconds")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(1800) as i64
+                    * 1000;
+                let last_ms = alarm
+                    .get("last_raised_at")
+                    .and_then(Value::as_str)
+                    .and_then(crate::timeutil::parse_rfc3339_ms)
+                    .unwrap_or(0);
+                last_ms == 0 || now_ms - last_ms >= interval_ms
+            });
+        if due {
+            let _ = raise_alarm_at(state, index, now_ms);
+        }
+    }
+    Ok(id)
+}
+
 /// Record an unparseable post as a STRANGER event. No envelope survived
 /// parsing, so quarantine is keyed by a hash of the raw post and the alarm
 /// carries no claimed team or host.
@@ -1708,7 +2049,10 @@ fn record_unparseable_stranger(
     text: &str,
     reason: &str,
 ) -> DataResult<()> {
-    let id = format!("unparseable-{}", &sha256_hex(text.as_bytes())[..12]);
+    let id = format!(
+        "unparseable-{}",
+        &sha256_hex(strip_provider_notes(text).as_bytes())[..12]
+    );
     let envelope = json!({"id": id, "from": Value::Null, "unparseable": true});
     let declarations = load_declarations(state).unwrap_or_default();
     for (_, _, declaration) in &declarations {
@@ -1766,6 +2110,14 @@ fn record_stranger(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
+    // Already quarantined for this sender: a rescan re-offering the same
+    // post must not log or re-alarm again (#763 item 6).
+    if quarantined_posts(state).iter().any(|post| {
+        post.get("id").and_then(Value::as_str) == Some(id.as_str())
+            && post.get("peer_sender").and_then(Value::as_str) == Some(peer_sender)
+    }) {
+        return Ok(());
+    }
     // Quarantine (dedup by ID + sender: a replayed stranger post is one item).
     let mut quarantine = load_json_list(&quarantine_path(state), "posts");
     {
@@ -1923,15 +2275,41 @@ fn raise_alarm_at(state: &Path, index: usize, now_ms: i64) -> DataResult<bool> {
         "<invalid>".to_string()
     };
     let sender = clean(Some(&sender));
-    let rendered = format!(
-        "[stranger alarm: unconfirmed sender {sender} in the chat relay]\n\
-         [team message: kind alarm; ESCALATE TO OWNER via this team's normal owner channel; sender {sender} claims {}@{}; reason: {}; posts quarantined, not delivered]\n\
-         A bot the relay does not confirm posted to team {local_team} in the relay channel. It is quarantined, not delivered, and this alarm repeats until the sender is confirmed or banned.\n\
-         Confirm: agent-teams relay confirm {sender}   Ban: agent-teams relay ban {sender}   Status: agent-teams relay status\n",
-        claimed_team,
-        claimed_host,
-        clean(alarm.get("reason").and_then(Value::as_str)),
-    );
+    let rendered = if alarm.get("kind").and_then(Value::as_str) == Some("unparseable") {
+        format!(
+            "[relay alarm: unparseable post from confirmed sender {sender}]\n\
+             [team message: kind alarm; ESCALATE TO OWNER via this team's normal owner channel; reason: {}; post quarantined, not delivered]\n\
+             The confirmed relay bot posted something agent-teams could not parse (a relay post the provider split or truncated is the usual cause). It is quarantined, not delivered, and this alarm repeats until it is dismissed.\n\
+             Quarantined: {}\n\
+             Dismiss: agent-teams relay quarantine dismiss {}   Status: agent-teams relay status\n",
+            clean(alarm.get("reason").and_then(Value::as_str)),
+            alarm
+                .get("quarantine_ids")
+                .and_then(Value::as_array)
+                .map(|ids| {
+                    ids.iter()
+                        .filter_map(Value::as_str)
+                        .map(|id| clean(Some(id)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .filter(|joined| !joined.is_empty())
+                .unwrap_or_else(|| {
+                    clean(alarm.get("quarantine_id").and_then(Value::as_str))
+                }),
+            clean(alarm.get("quarantine_id").and_then(Value::as_str)),
+        )
+    } else {
+        format!(
+            "[stranger alarm: unconfirmed sender {sender} in the chat relay]\n\
+             [team message: kind alarm; ESCALATE TO OWNER via this team's normal owner channel; sender {sender} claims {}@{}; reason: {}; posts quarantined, not delivered]\n\
+             A bot the relay does not confirm posted to team {local_team} in the relay channel. It is quarantined, not delivered, and this alarm repeats until the sender is confirmed or banned.\n\
+             Confirm: agent-teams relay confirm {sender}   Ban: agent-teams relay ban {sender}   Status: agent-teams relay status\n",
+            claimed_team,
+            claimed_host,
+            clean(alarm.get("reason").and_then(Value::as_str)),
+        )
+    };
     let notice_envelope = json!({
         "id": format!("alarm-{sender}"),
         "not_after": format_rfc3339_ms(now_ms + 86_400_000),
@@ -2279,6 +2657,46 @@ pub fn drop_quarantined(state: &Path, id: &str) -> DataResult<bool> {
     };
     let removed = remove_quarantined(state, id, &peer_sender)?;
     if removed {
+        // Dismissing closes the unparseable alarm that named this post:
+        // otherwise raise_due_alarms re-raises it every interval forever.
+        let _lock = lock_store(state)?;
+        let mut doc = load_json_list(&alarms_path(state), "alarms");
+        if let Some(list) = doc.get_mut("alarms").and_then(Value::as_array_mut) {
+            for alarm in list.iter_mut() {
+                if alarm.get("kind").and_then(Value::as_str) != Some("unparseable") {
+                    continue;
+                }
+                let names_id = alarm.get("quarantine_id").and_then(Value::as_str) == Some(id)
+                    || alarm
+                        .get("quarantine_ids")
+                        .and_then(Value::as_array)
+                        .is_some_and(|ids| ids.iter().any(|v| v.as_str() == Some(id)));
+                if names_id && alarm.get("state").and_then(Value::as_str) == Some("open") {
+                    // Remove only this post from the alarm; it closes
+                    // only when no quarantined post remains under it.
+                    let remaining: Vec<String> = alarm
+                        .get("quarantine_ids")
+                        .and_then(Value::as_array)
+                        .map(|ids| {
+                            ids.iter()
+                                .filter_map(Value::as_str)
+                                .filter(|existing| *existing != id)
+                                .map(str::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if remaining.is_empty() {
+                        alarm["quarantine_ids"] = json!([]);
+                        alarm["state"] = json!("closed");
+                        alarm["closed_at"] = json!(format_rfc3339_ms(now_unix_ms()));
+                    } else {
+                        alarm["quarantine_id"] = json!(remaining.last());
+                        alarm["quarantine_ids"] = json!(remaining);
+                    }
+                }
+            }
+        }
+        write_json_atomic(&alarms_path(state), &doc)?;
         log_event(
             state,
             &json!({"event": "relay-quarantine", "outcome": "dropped-by-owner", "id": id, "peer_sender": peer_sender}),
@@ -2342,6 +2760,131 @@ mod tests {
         let parsed = parse_post(&escaped).expect("parse escaped post");
         assert_eq!(parsed, RelayPost::Envelope(envelope.clone()));
         assert_eq!(post_tag_line(&post), team_tag(&envelope));
+    }
+
+    #[test]
+    fn long_body_truncates_the_visible_copy_never_the_envelope() {
+        // #763: a long body must not produce a post the outbound helper
+        // would split (its first chunk would have no fence).
+        let envelope = crate::envelope::build_envelope(
+            "tm-1",
+            "k",
+            "sim",
+            "host-b",
+            1,
+            "harness-ancestry",
+            "tools",
+            "host-a",
+            "info",
+            None,
+            &[],
+            false,
+            0,
+            7_200_000,
+            None,
+            &"x".repeat(2400),
+        );
+        let post = render_post(&envelope);
+        assert!(
+            post.len() <= DEFAULT_MAX_POST_BYTES,
+            "post is {} bytes",
+            post.len()
+        );
+        assert!(post.contains("relay copy truncated"));
+        // Visible copy is a ~500-char preview: the post is ~1x the body.
+        let visible = post.split("```").next().unwrap_or("");
+        assert!(
+            visible.len() < 700,
+            "visible preview: {} bytes",
+            visible.len()
+        );
+        assert_eq!(
+            parse_post(&post).expect("parse"),
+            RelayPost::Envelope(envelope),
+            "the envelope survives whole"
+        );
+    }
+
+    #[test]
+    fn post_size_is_measured_after_escaping() {
+        // #763 review: the live converted-mode split limit is 4_000 bytes
+        // after mrkdwn escaping, so `&` counts as 5 bytes, not 1.
+        let envelope = crate::envelope::build_envelope(
+            "tm-esc",
+            "k",
+            "sim",
+            "host-b",
+            1,
+            "harness-ancestry",
+            "tools",
+            "host-a",
+            "info",
+            None,
+            &[],
+            false,
+            0,
+            7_200_000,
+            None,
+            &"&".repeat(2_000),
+        );
+        let post = render_post(&envelope);
+        let fence_at = post.find("```").expect("fence");
+        let (visible, fence) = post.split_at(fence_at);
+        let measured = escaped_len(visible.trim_end_matches('\n')) + 1 + fence.len();
+        assert!(
+            measured <= DEFAULT_MAX_POST_BYTES,
+            "escaped post is {measured} bytes"
+        );
+        assert!(post.contains("truncated"));
+        assert_eq!(
+            parse_post(&post).expect("parse"),
+            RelayPost::Envelope(envelope),
+            "the envelope survives whole"
+        );
+    }
+
+    #[test]
+    fn preview_cut_inside_a_fence_leaves_no_unclosed_fence() {
+        // #763 review fix 5/4: a preview cut inside a code block must not
+        // leave an unclosed fence swallowing the envelope, and Markdown
+        // structure is stripped so conversion cannot grow the preview.
+        let body = format!(
+            "# Heading\n- bullet with [label](https://example.invalid/very/long/url)\n```\n{}\n```\n",
+            "code line\n".repeat(200)
+        );
+        let envelope = crate::envelope::build_envelope(
+            "tm-fence",
+            "k",
+            "sim",
+            "host-b",
+            1,
+            "harness-ancestry",
+            "tools",
+            "host-a",
+            "info",
+            None,
+            &[],
+            false,
+            0,
+            7_200_000,
+            None,
+            &body,
+        );
+        let post = render_post(&envelope);
+        let visible = post.split("```agent-teams-envelope").next().unwrap_or("");
+        assert!(!visible.contains("```"), "no fence in preview: {visible}");
+        assert!(
+            !visible.contains("example.invalid"),
+            "link URL stripped: {visible}"
+        );
+        assert!(
+            !visible.contains("# Heading"),
+            "heading stripped: {visible}"
+        );
+        assert_eq!(
+            parse_post(&post).expect("parse"),
+            RelayPost::Envelope(envelope)
+        );
     }
 
     #[test]

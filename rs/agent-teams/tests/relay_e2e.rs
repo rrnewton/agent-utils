@@ -943,8 +943,8 @@ fn slack_one_line_tag_and_body_delivers() {
     // Exact live shape: Slack stores the header tag and the body on ONE
     // line (the newline after the bracketed tag became a space, middle
     // dots intact). The tag cross-check compares only the bracketed
-    // prefix, so this delivers; a bracket that really disagrees stays a
-    // loud stranger.
+    // prefix, so this delivers; a bracket that really disagrees is
+    // filed as unparseable, not delivered.
     let world = World::new();
     world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
     let (id, post) = world.send_sim_to_tools("relay live test one-line", "relay-oneline-1");
@@ -957,7 +957,9 @@ fn slack_one_line_tag_and_body_delivers() {
     assert_eq!(outcome["outcome"], "accepted", "{outcome}");
     assert!(world.ledger_has("tools", &id), "delivered");
     // Bracket really disagrees (wrong id in the tag only; the envelope
-    // JSON is untouched): loud stranger, not delivered.
+    // JSON is untouched): not delivered. Legacy admission has no
+    // signature to trust, so it is filed under the unparseable kind,
+    // never as a stranger (#763 review fix 2).
     let (id2, post2) = world.send_sim_to_tools("relay live test tampered", "relay-oneline-2");
     let one_line2 = post2.replacen("]\n", "] ", 1);
     let bracket_end = one_line2.find(']').unwrap();
@@ -967,10 +969,17 @@ fn slack_one_line_tag_and_body_delivers() {
         &one_line2[bracket_end..]
     );
     let outcome = world.relay_in(BOT1, &tampered);
-    assert_eq!(outcome["outcome"], "stranger-quarantined", "{outcome}");
+    assert_eq!(outcome["outcome"], "not-recorded", "{outcome}");
     assert!(
         !world.ledger_has("tools", &id2),
         "tampered post not delivered"
+    );
+    assert!(
+        agent_teams::relay::alarms(&world.state)
+            .iter()
+            .any(|a| a["kind"] == "unparseable"),
+        "filed as unparseable: {:?}",
+        agent_teams::relay::alarms(&world.state)
     );
 }
 
@@ -1817,4 +1826,246 @@ fn refused_message_is_not_mirrored() {
     assert_eq!(value["state"], "refused", "{out} {err}");
     assert_eq!(code, 65, "{out} {err}");
     assert_eq!(world.channel_posts().len(), 1, "no mirror for a refusal");
+}
+#[test]
+fn long_mirror_post_is_never_split_and_dismiss_clears_unparseable() {
+    // #763: a long body used to make a relay post the outbound helper
+    // split at 4,000 bytes after conversion; the first chunk had no fence
+    // and alarmed as a stranger. This body fits in one envelope (~2.9 KB)
+    // but its visible copy must be truncated to stay under the cap.
+    let world = World::new();
+    world.write_teams(MIRROR_TEAMS_LOCAL);
+    let post = world.root.join("bin/post.sh");
+    world.write_relay_route(true, &post.to_string_lossy());
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    let public = world.ensure_signing_key("sim");
+    agent_teams::relay::trust_key(&world.state, "sim", "host-a", &public, "test").expect("trust");
+    let body = "x".repeat(2400);
+    let (code, out, err) = world.run(&[
+        "send",
+        "tools@host-a",
+        "--from-team",
+        "sim",
+        "--text",
+        &body,
+        "--key",
+        "mirror-long-1",
+        "--json",
+    ]);
+    assert_eq!(code, 75, "{out} {err}");
+    let posts = world.channel_posts();
+    assert_eq!(posts.len(), 1, "one unsplit post: {} posts", posts.len());
+    assert!(
+        posts[0].len() <= agent_teams::relay::DEFAULT_MAX_POST_BYTES,
+        "post is {} bytes",
+        posts[0].len()
+    );
+    assert!(posts[0].contains("truncated"), "visible copy truncated");
+    // The whole envelope survives in the single post and delivers once.
+    let outcome = world.relay_in(BOT1, &posts[0]);
+    assert!(
+        matches!(outcome["outcome"].as_str(), Some("accepted" | "known")),
+        "{outcome}"
+    );
+    assert_eq!(world.hook_inbox_texts("tools").len(), 1);
+    // The fence-only second piece a split would have produced: the signed
+    // envelope is the authority, so it must not raise a stranger alarm.
+    let fence_at = posts[0].find("```").expect("fence");
+    let outcome = world.relay_in(BOT1, &posts[0][fence_at..]);
+    assert!(
+        matches!(outcome["outcome"].as_str(), Some("accepted" | "known")),
+        "fence-only piece: {outcome}"
+    );
+    assert_eq!(
+        world.hook_inbox_texts("tools").len(),
+        1,
+        "still delivered once"
+    );
+    assert!(
+        agent_teams::relay::alarms(&world.state).is_empty(),
+        "no alarm for the fence-only piece: {:?}",
+        agent_teams::relay::alarms(&world.state)
+    );
+    // A present-but-wrong tag on a signed envelope is NOT bypassed: the
+    // visible header would disagree with what was delivered.
+    let wrong_tag = format!(
+        "[from someone-else via agent-teams]\n{}",
+        &posts[0][fence_at..]
+    );
+    let outcome = world.relay_in(BOT1, &wrong_tag);
+    assert_eq!(outcome["outcome"], "not-recorded", "{outcome}");
+    assert_eq!(
+        world
+            .hook_inbox_texts("tools")
+            .iter()
+            .filter(|t| t.contains(&"x".repeat(100)))
+            .count(),
+        1,
+        "message not delivered again (an alarm notice is fine)"
+    );
+    // Remove that quarantine entry so the counts below stay simple.
+    let wrong_id = agent_teams::relay::quarantined_posts(&world.state)
+        .last()
+        .expect("quarantined")
+        .get("id")
+        .and_then(|v| v.as_str())
+        .expect("id")
+        .to_string();
+    let (code, out, err) = world.run(&["relay", "quarantine", "dismiss", &wrong_id]);
+    assert_eq!(code, 0, "dismiss wrong-tag: {out} {err}");
+
+    // An unparseable post from the CONFIRMED bot is not a stranger: it is
+    // quarantined under its own alarm kind and dismissed by ID.
+    let announce = agent_teams::relay::build_announce(
+        "tools",
+        "host-a",
+        BOT1,
+        "https://example.invalid/org/repo.git",
+    );
+    let outcome = world.relay_in(BOT1, &agent_teams::relay::render_announce(&announce));
+    assert_eq!(outcome["outcome"], "candidate-recorded", "{outcome}");
+    let (code, out, err) = world.run(&["relay", "confirm", BOT1, "--owner-approved"]);
+    assert_eq!(code, 0, "confirm: {out} {err}");
+    let outcome = world.relay_in(BOT1, "visible text with no fence at all");
+    assert_eq!(outcome["outcome"], "not-recorded", "{outcome}");
+    assert!(
+        outcome["detail"].as_str().unwrap().contains("dismiss"),
+        "{outcome}"
+    );
+    // Never reply to an unparseable post: its plain-text receipt is itself
+    // unparseable and would ping-pong between the two sides.
+    assert!(outcome["receipt_text"].is_null(), "{outcome}");
+    // The same post re-offered (bridge rescan) is recorded at most once.
+    let outcome = world.relay_in(BOT1, "visible text with no fence at all");
+    assert_eq!(outcome["outcome"], "not-recorded", "{outcome}");
+    assert_eq!(agent_teams::relay::quarantined_posts(&world.state).len(), 1);
+    // A second distinct broken post joins the same alarm, which names both.
+    let outcome = world.relay_in(BOT1, "a second broken post, still no fence");
+    assert_eq!(outcome["outcome"], "not-recorded", "{outcome}");
+    assert_eq!(agent_teams::relay::quarantined_posts(&world.state).len(), 2);
+    let alarms = agent_teams::relay::alarms(&world.state);
+    let alarm = alarms
+        .iter()
+        .find(|a| a["kind"] == "unparseable" && a["state"] == "open")
+        .expect("unparseable alarm");
+    assert_eq!(alarm["sender_id"], BOT1, "{alarm}");
+    let ids: Vec<String> = alarm["quarantine_ids"]
+        .as_array()
+        .expect("quarantine_ids")
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    assert_eq!(ids.len(), 2, "{alarm}");
+    // The exact unparseable-receipt line is ignored, never quarantined,
+    // even with the bridge's rescan note appended (the live shape).
+    let before = agent_teams::relay::quarantined_posts(&world.state).len();
+    for text in [
+        "agent-teams receipt: not-recorded (unparseable relay post)",
+        "agent-teams receipt: not-recorded (unparseable relay post)\n\n[agentctl] This message reached the bridge through the periodic rescan (the live stream missed it or is still catching up).",
+    ] {
+        let outcome = world.relay_in(BOT1, text);
+        assert_eq!(outcome["outcome"], "ignored-unparseable-receipt", "{outcome}");
+    }
+    assert_eq!(
+        agent_teams::relay::quarantined_posts(&world.state).len(),
+        before
+    );
+    // Dismissing one of two posts keeps the alarm open and naming the rest.
+    let (code, out, err) = world.run(&["relay", "quarantine", "dismiss", &ids[1]]);
+    assert_eq!(code, 0, "dismiss: {out} {err}");
+    let alarms = agent_teams::relay::alarms(&world.state);
+    let alarm = alarms
+        .iter()
+        .find(|a| a["kind"] == "unparseable" && a["state"] == "open")
+        .expect("alarm still open");
+    assert_eq!(
+        alarm["quarantine_ids"].as_array().map(Vec::len),
+        Some(1),
+        "{alarm}"
+    );
+    // Dismissing the last one closes it: it must not re-raise forever.
+    let (code, out, err) = world.run(&["relay", "quarantine", "dismiss", &ids[0]]);
+    assert_eq!(code, 0, "dismiss: {out} {err}");
+    assert!(
+        agent_teams::relay::alarms(&world.state)
+            .iter()
+            .all(|a| a["kind"] != "unparseable" || a["state"] != "open"),
+        "no open unparseable alarm remains"
+    );
+}
+
+#[test]
+fn envelope_alone_over_post_cap_skips_mirror_not_delivery() {
+    // #763 review fix 1: an envelope whose fence alone exceeds the route's
+    // max_post_bytes skips the mirror (mirror-skipped); the direct
+    // delivery itself is unaffected.
+    let world = World::new();
+    world.write_teams(MIRROR_TEAMS_LOCAL);
+    let post = world.root.join("bin/post.sh");
+    world.write_relay_route(true, &post.to_string_lossy());
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    let public = world.ensure_signing_key("sim");
+    agent_teams::relay::trust_key(&world.state, "sim", "host-a", &public, "test").expect("trust");
+    let body = "x".repeat(5600);
+    let (code, out, err) = world.run(&[
+        "send",
+        "tools@host-a",
+        "--from-team",
+        "sim",
+        "--text",
+        &body,
+        "--key",
+        "mirror-oversize-1",
+        "--json",
+    ]);
+    assert_eq!(code, 75, "{out} {err}");
+    assert_eq!(world.channel_posts().len(), 0, "no oversize mirror post");
+    let value: serde_json::Value = serde_json::from_str(&out).expect("send json");
+    let id = value["id"].as_str().expect("id").to_string();
+    let attempts = world.mirror_attempts(&id);
+    assert!(
+        attempts
+            .iter()
+            .any(|a| a["classification"] == "mirror-skipped"),
+        "{attempts:?}"
+    );
+}
+
+#[test]
+fn oversize_fallback_stays_deferred_with_a_visible_reason() {
+    // #763 review fix 7: an envelope too large for the only (relay) route
+    // is never posted; it stays deferred with a visible outbox reason.
+    let world = World::new();
+    world.write_teams(r#"{
+      "schema": "agent-teams-teams/v1",
+      "hosts": {"host-a": {"routes": ["relay-coord"], "agent_teams": "agent-teams"}},
+      "teams": {
+        "tools": {"primary": "host-a", "entries": [{"host": "host-a", "contacts": [{"kind": "host"}]}]},
+        "sim": {"primary": "host-a", "entries": [{"host": "host-a", "contacts": [{"kind": "host"}]}]}
+      }
+    }"#);
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    let body = "x".repeat(5600);
+    let (code, out, err) = world.run(&[
+        "send",
+        "tools@host-a",
+        "--from-team",
+        "sim",
+        "--text",
+        &body,
+        "--key",
+        "fallback-oversize-1",
+        "--json",
+    ]);
+    assert_eq!(code, 75, "{out} {err}");
+    let value: serde_json::Value = serde_json::from_str(&out).expect("send json");
+    assert_eq!(value["state"], "deferred", "{out}");
+    assert_eq!(world.channel_posts().len(), 0, "never posted");
+    let id = value["id"].as_str().expect("id").to_string();
+    let entry = world.outbox(&id);
+    let reason = entry["undeliverable"].as_str().expect("visible reason");
+    assert!(
+        reason.contains("too large for relay route relay-coord"),
+        "{reason}"
+    );
 }

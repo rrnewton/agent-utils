@@ -280,6 +280,8 @@ the sender asks for a receipt; it never resends blind.
   (the bot user this host posts as), `post_argv` and `list_argv` templates
   (`{channel}`, `{thread}`, `{message_id}`, `{text_file}`), 
   `max_envelope_bytes` (default 10000, one post per envelope, never split),
+  `max_post_bytes` (default 3500; the whole post measured after escaping the
+  visible text — an envelope whose fence alone exceeds it skips this route),
   `limits.per_hour` (default 6), `visible_to_owner: true`, and `mirror`
   (default false; see "Mirror copies" in the Chat relay section), and
   `post_timeout_seconds` (default 10; raise it when the helper waits out
@@ -355,8 +357,22 @@ Discord, say); every ID is mapped explicitly.
 **The post.** One post per envelope: a short human-readable line (the
 team tag and the body, so the owner can read the channel), then the full
 envelope as compact JSON in a fenced `agent-teams-envelope` block. The
-envelope is authoritative — a provider may rewrite visible text, so the
-receiver re-derives the tag from the envelope and checks the body hash.
+whole post is capped at the route's `max_post_bytes` (default 3500),
+measured after escaping the visible text, so the outbound helper never
+splits it in converted mode (its limit there is 4,000 bytes after
+conversion; a split post's first chunk carries no fence): for a long body
+the visible copy is truncated and says so (a long body shows only its
+first ~500 chars, since the envelope already carries the full text, so a
+post stays ~1x the body, not ~2x), while the envelope always carries the
+full body. An envelope whose fenced block alone exceeds the
+cap skips the route instead: a fallback stays deferred (its outbox
+entry names the reason as `too large for relay route ...`) and a mirror
+records `mirror-skipped`. `check` warns when `max_envelope_bytes` exceeds
+`max_post_bytes`. A signed envelope whose tag line was lost (the
+fence-only piece of a split) is still delivered: the signature, not the
+tag, is the authority. The envelope is authoritative — a provider may rewrite
+visible text, so the receiver re-derives the tag from the envelope and
+checks the body hash.
 Receipts go back in the post's thread (one line plus a fenced
 `agent-teams-receipt` block); a receipt never draws a receipt.
 Exactly-once comes from the envelope IDs and the receiving ledger, as on
@@ -451,7 +467,14 @@ stranger alarms first. Quarantined posts addressed to us are delivered,
 in arrival order and exactly once, as soon as their sender is confirmed —
 nothing is silently lost. Posts for other fleets from confirmed senders
 are still dropped silently (above); only strangers and malformed posts
-are loud.
+are loud. A malformed post from a CONFIRMED sender (a split or truncated
+relay post is the usual cause; a sender listed in a declaration's
+`relay_channels[].peers` counts as confirmed) is not a stranger: it
+raises a relay alarm of its own kind naming every quarantined post from
+that sender, and is dismissed with `relay quarantine dismiss <id>`,
+which also closes the alarm. An unparseable post never draws a reply
+(its plain-text receipt would itself be unparseable), and a given post
+is recorded at most once however often a rescan re-offers it.
 
 **Discovery and trust.** Each team announces itself in the channel
 (`relay announce`): fleet, host, the sender ID it posts as, and a

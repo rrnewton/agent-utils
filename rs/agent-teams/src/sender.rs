@@ -192,6 +192,9 @@ pub fn walk(
                     .is_some_and(|name| relay_route_names.contains(&name))
         })
     });
+    // A route skipped because the envelope alone exceeds its post cap:
+    // surfaced as a visible outbox reason if nothing delivers (#763).
+    let mut too_large_skip: Option<(String, String)> = None;
     let pinned: Option<String> = entry_value["pinned_contact"].as_str().map(str::to_string);
     // A reason from an earlier walk is stale once this walk runs; an
     // `undeliverable` answer below records it again.
@@ -223,6 +226,9 @@ pub fn walk(
         let mut contact_settled: Option<String> = None;
         for route in routes_for {
             if let Some(reason) = route.skip_reason(envelope_bytes) {
+                if reason.contains("max_post_bytes") {
+                    too_large_skip = Some((route.name().to_string(), reason.clone()));
+                }
                 steps.push(WalkStep {
                     contact: label.clone(),
                     route: route.name().to_string(),
@@ -439,6 +445,15 @@ pub fn walk(
         };
     }
     let _ = host;
+    if !matches!(
+        final_state.as_str(),
+        "delivered" | "accepted" | "claimed" | "typing" | "presented" | "journaled"
+    ) {
+        if let Some((route, reason)) = &too_large_skip {
+            entry_value["undeliverable"] =
+                json!(format!("too large for relay route {route}: {reason}"));
+        }
+    }
     entry_value["state"] = json!(final_state);
     // The delivery state is durable BEFORE any mirror post: a hung or
     // killed mirror can never leave the outbox in its pre-delivery
