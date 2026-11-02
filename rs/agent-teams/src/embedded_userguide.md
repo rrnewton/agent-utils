@@ -501,7 +501,18 @@ already-trusted route (ssh or node-exec): when that host's probe reports
 the same sender-to-team mapping in its declaration, the mapping is
 confirmed automatically. Otherwise the owner approves with one line
 (`relay confirm SENDER --owner-approved`). Never admit an unconfirmed
-claim. Onboarding is `relay setup`: it suggests the per-fleet channel
+claim. When several teams share one relay bot,
+`confirm` rightly refuses to remap the bot to a second team; trust that
+team's signing key on its own with `relay trust-key TEAM@HOST`, which
+reads the team's `relay_pubkey` from its host's probe over an
+already-trusted route (routes that cannot reach that host are never
+probed, and the probe's own host must match) and records only the key.
+`relay keys` lists trusted keys and `relay untrust-key TEAM@HOST`
+removes one; re-keying needs `--replace`. trust-key also releases
+quarantined posts claiming that team@host and closes their alarms.
+Signed admission
+consults the trusted key and the declaration's peer list, never the
+sender mapping, so key-only trust is exactly what a shared bot needs. Onboarding is `relay setup`: it suggests the per-fleet channel
 name (`#relay-<fleet>`), tells the owner exactly what to create and whom
 to invite on Slack or Discord, and prints the bridge, declaration, and
 route snippets to apply. Agents never create channels.

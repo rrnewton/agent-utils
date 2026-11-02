@@ -109,6 +109,15 @@ the poster's sender ID and can post into a channel)
                                        Confirm a candidate mapping, by a
                                        trusted-route check or owner approval.
                                        Unconfirmed claims are never admitted.
+  relay trust-key TEAM@HOST [--replace] [--json]
+                                       Trust only that team's signing key,
+                                       read from its host's verified probe
+                                       over a trusted route; maps no sender,
+                                       so it works with a shared relay bot.
+                                       Re-keying needs --replace. Releases
+                                       quarantined posts claiming TEAM@HOST.
+  relay keys [--json]                  List trusted signing keys.
+  relay untrust-key TEAM@HOST          Remove a trusted signing key.
 
 DOCS
   quickstart | userguide | help [CMD] | --help | --version
@@ -2362,6 +2371,9 @@ fn cmd_relay(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
         Some("announce") => cmd_relay_announce(globals, args),
         Some("teams") => cmd_relay_teams(globals, args),
         Some("confirm") => cmd_relay_confirm(globals, args),
+        Some("trust-key") => cmd_relay_trust_key(globals, args),
+        Some("keys") => cmd_relay_keys(globals, args),
+        Some("untrust-key") => cmd_relay_untrust_key(globals, args),
         Some("ban") => cmd_relay_ban(globals, args),
         Some("unban") => cmd_relay_unban(globals, args),
         Some("alarms") => cmd_relay_alarms(globals, args),
@@ -2369,7 +2381,7 @@ fn cmd_relay(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
         Some("quarantine") => cmd_relay_quarantine(globals, args),
         _ => Err(err(
             "usage",
-            "relay subcommands: setup, status, announce, teams, confirm, ban, unban, alarms, keygen, quarantine",
+            "relay subcommands: setup, status, announce, teams, confirm, trust-key, keys, untrust-key, ban, unban, alarms, keygen, quarantine",
         )),
     }
 }
@@ -2939,6 +2951,164 @@ fn cmd_relay_confirm(globals: &Globals, args: &[String]) -> Result<i32, DataErro
     println!("  agent-teams relay confirm {sender} --owner-approved");
     println!("Until then it is not admitted anywhere.");
     Ok(1)
+}
+
+/// `relay trust-key TEAM@HOST`: trust ONLY a team's signing key, learned
+/// from that host's own `probe` over an already-trusted (non-relay)
+/// route. Unlike `relay confirm` it records no sender mapping, so it
+/// works when several teams share one relay bot (where `confirm` must
+/// refuse to remap the bot). Signed admission consults the trusted key
+/// and the declaration's peer list, never the sender mapping.
+fn cmd_relay_trust_key(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
+    let target = positional(args)
+        .into_iter()
+        .nth(1)
+        .ok_or_else(|| err("usage", "relay trust-key needs TEAM@HOST"))?;
+    let (team, host) = target
+        .split_once('@')
+        .filter(|(team, host)| !team.is_empty() && !host.is_empty())
+        .ok_or_else(|| {
+            err(
+                "usage",
+                format!("relay trust-key needs TEAM@HOST, not {target:?}"),
+            )
+        })?;
+    let (team, host) = (team.to_string(), host.to_string());
+    let teams = globals.load_teams()?;
+    let entry = teams
+        .pick_entry(&team, Some(&host), &globals.host)
+        .map_err(|e| err("unknown-target", e.to_string()))?
+        .clone();
+    let routes = globals.load_routes()?;
+    let route_objs = routes_for_entry(globals, &teams, &routes, &team, &entry, None)?;
+    let mut probed_key: Option<String> = None;
+    for route in route_objs.iter() {
+        if route.is_relay() {
+            continue;
+        }
+        // A route that cannot reach the target host (a local route to
+        // another host) must not be probed: it would answer with THIS
+        // host's probe and bind this host's key as the target's (#790).
+        if route.skip_reason(0).is_some() {
+            continue;
+        }
+        if let AttemptOutcome::Answered(probe) = route.run_verb("probe", &json!({})) {
+            if probe.get("host").and_then(Value::as_str) != Some(host.as_str()) {
+                continue;
+            }
+            probed_key = probe
+                .get("teams")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|t| t.get("team").and_then(Value::as_str) == Some(team.as_str()))
+                .find_map(|t| t.get("relay_pubkey").and_then(Value::as_str))
+                .map(str::to_string);
+            if probed_key.is_some() {
+                break;
+            }
+        }
+    }
+    let Some(pubkey) = probed_key.filter(|key| !key.is_empty()) else {
+        println!(
+            "no trusted route reports a relay signing key for {team}@{host}; nothing trusted. \
+             Have that host run `agent-teams relay keygen --team {team}` and announce, or check \
+             that a direct route to {host} works."
+        );
+        return Ok(1);
+    };
+    // Re-keying is explicit: a different key already trusted refuses
+    // without --replace, and the change is printed either way.
+    let replace = has_flag(args, "--replace");
+    if let Some(old) = crate::relay::trusted_key(&globals.state, &team, &host) {
+        if old != pubkey && !replace {
+            println!(
+                "{team}@{host} already trusts a different key:\n  old: {old}\n  new: {pubkey}\n\
+                 Nothing changed. Re-run with --replace to re-key."
+            );
+            return Ok(1);
+        }
+        if old != pubkey {
+            println!("replacing the trusted key for {team}@{host}:\n  old: {old}\n  new: {pubkey}");
+        }
+    }
+    crate::relay::trust_key(&globals.state, &team, &host, &pubkey, "trusted-route")?;
+    // Release quarantined posts claiming this team@host through signed
+    // admission now that its key is trusted, and close their alarms.
+    let released = crate::relay::retry_quarantine(&globals.state, &globals.host, None)?;
+    let released_ids: Vec<&str> = released
+        .iter()
+        .filter(|(_, outcome)| matches!(outcome.as_str(), "accepted" | "known"))
+        .map(|(id, _)| id.as_str())
+        .collect();
+    crate::relay::close_alarms_claiming(&globals.state, &team, &host)?;
+    if globals.json || has_flag(args, "--json") {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(
+                &json!({"team": team, "host": host, "pubkey": pubkey, "source": "trusted-route", "released": released_ids})
+            )?
+        );
+    } else {
+        println!(
+            "trusted the signing key for {team}@{host} (from its host's probe over a trusted \
+             route): {pubkey}\nNo sender was mapped: sender-to-team confirmation is unchanged, \
+             so a shared relay bot keeps its existing mapping."
+        );
+        if !released_ids.is_empty() {
+            println!(
+                "released {} quarantined post(s) claiming {team}@{host}: {}",
+                released_ids.len(),
+                released_ids.join(", ")
+            );
+        }
+    }
+    Ok(0)
+}
+
+fn cmd_relay_keys(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
+    let keys = crate::relay::trusted_keys(&globals.state);
+    if globals.json || has_flag(args, "--json") {
+        println!("{}", serde_json::to_string_pretty(&json!({"keys": keys}))?);
+        return Ok(0);
+    }
+    if keys.is_empty() {
+        println!("no trusted relay signing keys");
+    }
+    for key in &keys {
+        println!(
+            "{}@{}: {} (source {}, confirmed {})",
+            key["team"].as_str().unwrap_or("?"),
+            key["host"].as_str().unwrap_or("?"),
+            key["pubkey"].as_str().unwrap_or("?"),
+            key["source"].as_str().unwrap_or("?"),
+            key["confirmed_at"].as_str().unwrap_or("?"),
+        );
+    }
+    Ok(0)
+}
+
+fn cmd_relay_untrust_key(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
+    let target = positional(args)
+        .into_iter()
+        .nth(1)
+        .ok_or_else(|| err("usage", "relay untrust-key needs TEAM@HOST"))?;
+    let (team, host) = target
+        .split_once('@')
+        .filter(|(team, host)| !team.is_empty() && !host.is_empty())
+        .ok_or_else(|| {
+            err(
+                "usage",
+                format!("relay untrust-key needs TEAM@HOST, not {target:?}"),
+            )
+        })?;
+    if crate::relay::untrust_key(&globals.state, team, host)? {
+        println!("removed the trusted signing key for {team}@{host}");
+        Ok(0)
+    } else {
+        println!("no trusted signing key recorded for {team}@{host}");
+        Ok(1)
+    }
 }
 
 fn cmd_relay_ban(globals: &Globals, args: &[String]) -> Result<i32, DataError> {

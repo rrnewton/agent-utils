@@ -720,6 +720,51 @@ pub fn trusted_key(state: &Path, team: &str, host: &str) -> Option<String> {
     })
 }
 
+/// Every trusted key record (team, host, pubkey, source, time).
+pub fn trusted_keys(state: &Path) -> Vec<Value> {
+    let store = load_store(state);
+    store_list(&store, "keys").to_vec()
+}
+
+/// Remove the trusted key for one team@host. Returns whether one existed.
+pub fn untrust_key(state: &Path, team: &str, host: &str) -> DataResult<bool> {
+    let _lock = lock_store(state)?;
+    let mut store = load_store(state);
+    let Some(keys) = store.get_mut("keys").and_then(Value::as_array_mut) else {
+        return Ok(false);
+    };
+    let before = keys.len();
+    keys.retain(|entry| {
+        !(entry.get("team").and_then(Value::as_str) == Some(team)
+            && entry.get("host").and_then(Value::as_str) == Some(host))
+    });
+    let removed = keys.len() != before;
+    if removed {
+        save_store(state, &store)?;
+    }
+    Ok(removed)
+}
+
+/// Close open alarms whose claimed_from is one team@host (after that
+/// team@host's key is trusted): keyed by the claim, not the sender, so
+/// a shared bot's other teams keep their alarms.
+pub fn close_alarms_claiming(state: &Path, team: &str, host: &str) -> DataResult<()> {
+    let _lock = lock_store(state)?;
+    let mut doc = load_json_list(&alarms_path(state), "alarms");
+    if let Some(list) = doc.get_mut("alarms").and_then(Value::as_array_mut) {
+        for alarm in list.iter_mut() {
+            let claimed = alarm.get("claimed_from");
+            if claimed.and_then(|c| c.get("team")).and_then(Value::as_str) == Some(team)
+                && claimed.and_then(|c| c.get("host")).and_then(Value::as_str) == Some(host)
+                && alarm.get("state").and_then(Value::as_str) == Some("open")
+            {
+                alarm["state"] = json!("confirmed");
+            }
+        }
+    }
+    write_json_atomic(&alarms_path(state), &doc)
+}
+
 /// Record a confirmed public key for one team@host.
 pub fn trust_key(
     state: &Path,

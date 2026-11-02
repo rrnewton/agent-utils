@@ -2203,3 +2203,191 @@ fn oversize_fallback_stays_deferred_with_a_visible_reason() {
         "{reason}"
     );
 }
+
+#[test]
+fn trust_key_records_only_the_key_with_a_shared_bot() {
+    // A shared relay bot is already confirmed for one team; confirming it
+    // for a second must refuse (one bot per team), yet the second team's
+    // signing key can still be trusted on its own.
+    let world = World::new();
+    world.write_teams(MIRROR_TEAMS_LOCAL);
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    let _tools_public = world.ensure_signing_key("tools");
+    let sim_public = world.ensure_signing_key("sim");
+    // BOT1 announces for tools and is confirmed over the local route.
+    let announce = agent_teams::relay::build_announce(
+        "tools",
+        "host-a",
+        BOT1,
+        "https://example.invalid/org/repo.git",
+    );
+    let outcome = world.relay_in(BOT1, &agent_teams::relay::render_announce(&announce));
+    assert_eq!(outcome["outcome"], "candidate-recorded", "{outcome}");
+    let (code, out, err) = world.run(&["relay", "confirm", BOT1, "--owner-approved"]);
+    assert_eq!(code, 0, "confirm tools: {out} {err}");
+    // trust-key for sim: reads sim's relay_pubkey from the host probe and
+    // records ONLY the key; no sender mapping appears for it.
+    let (code, out, err) = world.run(&["relay", "trust-key", "sim@host-a", "--json"]);
+    assert_eq!(code, 0, "trust-key: {out} {err}");
+    let value: serde_json::Value = serde_json::from_str(&out).expect("trust-key json");
+    assert_eq!(value["pubkey"], sim_public, "{out}");
+    assert_eq!(
+        agent_teams::relay::trusted_key(&world.state, "sim", "host-a").as_deref(),
+        Some(sim_public.as_str())
+    );
+    let store = agent_teams::relay::load_store(&world.state);
+    let confirmed: Vec<&serde_json::Value> = store["confirmed"]
+        .as_array()
+        .expect("confirmed")
+        .iter()
+        .filter(|c| c["team"] == "sim")
+        .collect();
+    assert!(
+        confirmed.is_empty(),
+        "no sender mapping for sim: {confirmed:?}"
+    );
+    // A team with no key on the probe is refused and trusts nothing.
+    let (code, out, err) = world.run(&["relay", "trust-key", "plain@host-a"]);
+    assert_eq!(code, 1, "no key reported: {out} {err}");
+    assert!(agent_teams::relay::trusted_key(&world.state, "plain", "host-a").is_none());
+}
+
+fn signed_post(world: &World, id: &str, body: &str) -> String {
+    let mut envelope = agent_teams::envelope::build_envelope(
+        id,
+        "k",
+        "sim",
+        "host-a",
+        1,
+        "harness-ancestry",
+        "tools",
+        "host-a",
+        "info",
+        None,
+        &[],
+        false,
+        agent_teams::timeutil::now_unix_ms(),
+        agent_teams::timeutil::now_unix_ms() + 7_200_000,
+        None,
+        body,
+    );
+    agent_teams::relay::sign_envelope(&world.state, &mut envelope).expect("sign");
+    agent_teams::relay::render_post(&envelope)
+}
+
+#[test]
+fn trust_key_admits_signed_posts_releases_quarantine_and_rekeys_explicitly() {
+    // #790 review: admission before/after trust-key, quarantine release,
+    // cross-team key refusal, and explicit re-keying.
+    let world = World::new();
+    world.write_teams(MIRROR_TEAMS_LOCAL);
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    let tools_public = world.ensure_signing_key("tools");
+    let sim_public = world.ensure_signing_key("sim");
+    agent_teams::relay::trust_key(&world.state, "tools", "host-a", &tools_public, "test")
+        .expect("trust tools");
+    // Before trust-key: a sim-signed post through the shared bot is refused.
+    let post = signed_post(&world, "tm-sim-79000000000000a1", "release me after trust");
+    let outcome = world.relay_in(BOT1, &post);
+    assert!(
+        !matches!(outcome["outcome"].as_str(), Some("accepted" | "known")),
+        "refused before trust: {outcome}"
+    );
+    assert_eq!(agent_teams::relay::quarantined_posts(&world.state).len(), 1);
+    // trust-key releases it through signed admission and closes its alarm.
+    let (code, out, err) = world.run(&["relay", "trust-key", "sim@host-a", "--json"]);
+    assert_eq!(code, 0, "trust-key: {out} {err}");
+    assert!(
+        out.contains("tm-sim-79000000000000a1"),
+        "released named: {out}"
+    );
+    assert!(agent_teams::relay::quarantined_posts(&world.state).is_empty());
+    assert!(
+        world
+            .hook_inbox_texts("tools")
+            .iter()
+            .any(|t| t.contains("release me after trust")),
+        "released post delivered"
+    );
+    assert!(
+        agent_teams::relay::alarms(&world.state)
+            .iter()
+            .all(|a| a["state"] != "open"),
+        "stranger alarm for sim@host-a closed"
+    );
+    // A post claiming tools but signed by sim's key is refused even with
+    // both keys trusted: the signed material binds the from team.
+    let mut forged = {
+        let post = signed_post(&world, "tm-sim-79000000000000a2", "claiming tools");
+        let parsed = agent_teams::relay::parse_post(&post).expect("parse");
+        let agent_teams::relay::RelayPost::Envelope(mut envelope) = parsed else {
+            panic!("envelope");
+        };
+        envelope["from"]["team"] = serde_json::json!("tools");
+        envelope
+    };
+    let forged_post = agent_teams::relay::render_post(&forged);
+    let _ = &mut forged;
+    let outcome = world.relay_in(BOT1, &forged_post);
+    assert!(
+        !matches!(outcome["outcome"].as_str(), Some("accepted" | "known")),
+        "cross-team signature refused: {outcome}"
+    );
+    // keys lists and untrust-key removes.
+    let (code, out, err) = world.run(&["relay", "keys", "--json"]);
+    assert_eq!(code, 0, "keys: {out} {err}");
+    assert!(out.contains("sim"), "{out}");
+    let (code, out, err) = world.run(&["relay", "untrust-key", "sim@host-a"]);
+    assert_eq!(code, 0, "untrust: {out} {err}");
+    assert!(agent_teams::relay::trusted_key(&world.state, "sim", "host-a").is_none());
+    let (code, _, _) = world.run(&["relay", "trust-key", "sim@host-a"]);
+    assert_eq!(code, 0);
+    assert_eq!(
+        agent_teams::relay::trusted_key(&world.state, "sim", "host-a").as_deref(),
+        Some(sim_public.as_str())
+    );
+    // Re-key: rotate sim's key; trust-key refuses without --replace.
+    std::fs::remove_file(world.state.join("relay/keys/sim@host-a.json")).expect("remove key");
+    let new_public = world.ensure_signing_key("sim");
+    assert_ne!(new_public, sim_public);
+    let (code, out, err) = world.run(&["relay", "trust-key", "sim@host-a"]);
+    assert_eq!(code, 1, "re-key without --replace refused: {out} {err}");
+    assert!(out.contains("old:"), "{out}");
+    assert_eq!(
+        agent_teams::relay::trusted_key(&world.state, "sim", "host-a").as_deref(),
+        Some(sim_public.as_str()),
+        "old key still trusted"
+    );
+    let (code, out, err) = world.run(&["relay", "trust-key", "sim@host-a", "--replace"]);
+    assert_eq!(code, 0, "re-key with --replace: {out} {err}");
+    assert_eq!(
+        agent_teams::relay::trusted_key(&world.state, "sim", "host-a").as_deref(),
+        Some(new_public.as_str())
+    );
+}
+
+#[test]
+fn trust_key_never_binds_a_key_from_the_local_probe_for_another_host() {
+    // #790 review fix 1: routes start with "local", which always answers
+    // with THIS host's probe; for sim@host-b that must bind nothing.
+    let world = World::new();
+    world.write_teams(r#"{
+      "schema": "agent-teams-teams/v1",
+      "hosts": {
+        "host-a": {"routes": ["local"], "agent_teams": "agent-teams"},
+        "host-b": {"routes": ["local"], "agent_teams": "agent-teams"}
+      },
+      "teams": {
+        "tools": {"primary": "host-a", "entries": [{"host": "host-a", "contacts": [{"kind": "host"}]}]},
+        "sim": {"primary": "host-b", "entries": [{"host": "host-b", "contacts": [{"kind": "host"}]}]}
+      }
+    }"#);
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    let _sim_public = world.ensure_signing_key("sim");
+    let (code, out, err) = world.run(&["relay", "trust-key", "sim@host-b"]);
+    assert_eq!(code, 1, "refused for host-b: {out} {err}");
+    assert!(
+        agent_teams::relay::trusted_key(&world.state, "sim", "host-b").is_none(),
+        "local probe must not bind host-a's key as host-b's"
+    );
+}
