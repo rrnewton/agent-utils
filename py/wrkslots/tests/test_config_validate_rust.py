@@ -61,6 +61,7 @@ def _expected(root: Path) -> dict[str, object]:
         "max_active_slots": config.max_active_slots,
         "post_provision_hooks": list(config.post_provision_hooks),
         "repo_cache_globs": [[name, list(globs)] for name, globs in config.repo_cache_globs],
+        "retire_freeze": config.retire_freeze,
         "root": str(config.root),
         "salvage_push_remotes": list(config.salvage_push_remotes),
         "sandbox": sandbox_module.settings_to_obj(config.sandbox_settings),

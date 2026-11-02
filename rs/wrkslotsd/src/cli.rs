@@ -846,6 +846,20 @@ pub(crate) enum Command {
         #[arg(long, value_name = "NAME")]
         machine: Option<String>,
     },
+    /// Set, clear, or show the per-host retire freeze (#780)
+    Freeze {
+        /// Action: set, clear, or status
+        #[arg(value_parser = ["set", "clear", "status"])]
+        action: String,
+        /// Freeze reason words (required for set)
+        reason: Vec<String>,
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
     /// Resume a journal or start bounded ownerless validation cleanup (writer; fixture registries only until cutover)
     Recover {
         /// Live current coordinator PID recorded with recovery
@@ -2270,6 +2284,26 @@ pub fn run() -> u8 {
                     "{}",
                     crate::batch_text::ownerless_classify(&value, format == "json")
                 );
+                return 0;
+            }
+            Err(error) => {
+                eprintln!("wrkslotsd: {error}");
+                return 1;
+            }
+        },
+        Command::Freeze {
+            action,
+            reason,
+            root,
+            machine,
+        } => match crate::freeze::freeze_command(
+            root.as_deref(),
+            machine.as_deref(),
+            &action,
+            &reason,
+        ) {
+            Ok(text) => {
+                print!("{text}");
                 return 0;
             }
             Err(error) => {

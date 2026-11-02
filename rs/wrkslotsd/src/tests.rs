@@ -5033,6 +5033,7 @@ fn cli_surface_contains_no_executor_or_mutation_subcommand() {
             "adopt",
             "classify-ownerless-validate-batch",
             "classify-ownerless-validate-batch-text",
+            "freeze",
             "recover-ownerless-agent-cache",
             "recover-ownerless-agent-clone",
             "recover-ownerless-validate-batch",

@@ -1334,6 +1334,7 @@ pub(crate) fn remove_slot(
     }
     let (cfg, selected) = load_cfg(root, machine_override)?;
     let config = load_config(root, machine_override)?;
+    crate::freeze::assert_not_frozen(&cfg, &config, "remove")?;
     validate_name(&selected, "machine")?;
     validate_name(slot, "slot")?;
     let coordinator = read_process_identity(coordinator_pid)?;

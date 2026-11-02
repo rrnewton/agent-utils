@@ -27,7 +27,7 @@ const REQUIRED: [&str; 7] = [
     "heartbeat_ttl_seconds",
     "liveness_command",
 ];
-const OPTIONAL: [&str; 13] = [
+const OPTIONAL: [&str; 14] = [
     "liveness_batch_command",
     "max_active_slots",
     "layout",
@@ -39,6 +39,7 @@ const OPTIONAL: [&str; 13] = [
     "disk_provisioning_floor_bytes",
     "disk_emergency_bytes",
     "slot_representation",
+    "retire_freeze",
     "image",
     "sandbox",
 ];
@@ -1051,6 +1052,7 @@ pub(crate) fn load_config(root: Option<&Path>, machine_override: Option<&str>) -
         "max_active_slots": cap,
         "post_provision_hooks": hooks,
         "repo_cache_globs": repo_cache_globs.iter().map(|(name, globs)| json!([name, globs])).collect::<Vec<_>>(),
+        "retire_freeze": raw.get("retire_freeze").cloned().unwrap_or(Value::Null),
         "root": root.to_string_lossy(),
         "salvage_push_remotes": salvage,
         "sandbox": sandbox_settings(raw)?,

@@ -75,6 +75,7 @@ case "$CMD" in
     recover-absent-validate-rows) RUST_CMD="recover-absent-validate-rows-text" ;;
     recover-ownerless-validate-batch) RUST_CMD="recover-ownerless-validate-batch-text" ;;
     classify-ownerless-validate-batch) RUST_CMD="classify-ownerless-validate-batch-text" ;;
+    freeze) RUST_CMD="freeze" ;;
     unpushed|adopt|heartbeat|release|hold|unhold|finish|remove|write-handoff|read-handoff|transfer-owner|recover-unbound-owner|recover-absent-agent-row|recover-ownerless-agent-worktree|recover-ownerless-agent-clone|recover-ownerless-agent-cache|recover)
         RUST_CMD="$CMD" ;;
     *) run_python "$CMD" "${ORIGINAL[@]}" ;;

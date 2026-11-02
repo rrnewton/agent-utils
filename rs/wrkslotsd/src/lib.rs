@@ -57,6 +57,7 @@ mod ensure_states;
 mod evidence;
 mod finish_write;
 pub mod formats;
+mod freeze;
 mod git_storage_state;
 mod global_state;
 mod handoff_state;

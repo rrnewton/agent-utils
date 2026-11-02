@@ -56,6 +56,9 @@ case "$1" in
   recover-ownerless-validate-batch-text)
     if [ "$2" = "--help" ]; then echo "Usage: --root --machine --checkout --frozen-validate-checkout --completed-record --repository --validation-proof-manifest --coordinator-authorized --coordinator-pid --format"; exit 0; fi
     echo "RS recover-ownerless-validate-batch-text $@" ;;
+  freeze)
+    if [ "$2" = "--help" ]; then echo "Usage: --root --machine set clear status"; exit 0; fi
+    echo "RS freeze $@" ;;
   classify-ownerless-validate-batch-text)
     if [ "$2" = "--help" ]; then echo "Usage: --root --machine --checkout --frozen-validate-checkout --completed-record --repository --validation-proof-manifest --format"; exit 0; fi
     echo "RS classify-ownerless-validate-batch-text $@" ;;
@@ -193,6 +196,13 @@ def test_create_both_formats_run_in_rust(tmp_path: Path) -> None:
     assert payload.stdout.startswith("RS create-text create-text slot01 --format json")
     assert "cmd=create edition=rust rc=0" in log.read_text()
 
+
+def test_freeze_runs_in_rust(tmp_path: Path) -> None:
+    root, log = _sandbox(tmp_path)
+    result = _run(root, log, "freeze", "status")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("RS freeze freeze status")
+    assert "cmd=freeze edition=rust rc=0" in log.read_text()
 
 def test_recover_batch_both_formats_run_in_rust(tmp_path: Path) -> None:
     root, log = _sandbox(tmp_path)

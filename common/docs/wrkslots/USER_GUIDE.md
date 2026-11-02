@@ -729,6 +729,20 @@ update, no mutation journal, and the item's row exactly as that check read it; a
 does so, including a registry file it cannot read or decode, stops the batch, which still reports
 what it did. The same defect found at a later step of removal, after it has written the registry,
 stops the batch.
+
+A host can be frozen against every retirement and removal with `wrkslots freeze set <reason>`
+(or the `retire_freeze: <reason>` config key). While frozen, `retire-pending`, `remove`, the
+remove batches, and `clean-caches` refuse with code
+`retire-freeze` and the freeze reason for every caller, including `--coordinator-authorized`;
+read-only commands keep working. `wrkslots freeze status` reports the state and source, and
+`wrkslots freeze clear` removes the marker (a config-key freeze remains until the key is removed).
+
+Every `could_not_determine` row is a stable verdict, not a fresh failure on each run. It carries
+`reason_code` (one of `target-storage-drift`, `unchanged-confirmation-failed`, `state-error`,
+`refusal-classification-failed`, or `unknown-error`), the human `reason`, and a `remedy` naming
+the command or condition that resolves it. `retire-pending` emits at most one row per
+(machine, slot, reason_code); a periodic caller should dedupe on that same key and report each
+verdict once, acting on its `remedy` instead of re-reporting it as a new failure.
 Sidecar cleanup atomically renames the exact inode into content-addressed retired control
 storage and never unlinks that retired pathname, so a same-UID replacement cannot be mistaken for
 the acknowledged artifact. A direct-child checkout handoff is likewise moved by no-replace into an

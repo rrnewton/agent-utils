@@ -522,6 +522,7 @@ OPTIONAL_CONFIG_KEYS = frozenset(
         "disk_provisioning_floor_bytes",
         "disk_emergency_bytes",
         "slot_representation",
+        "retire_freeze",
         "image",
         "sandbox",
     }
@@ -577,6 +578,10 @@ CONFIG_KEY_DOCS: dict[str, str] = {
     "cache_globs": "Slot-relative globs of regenerable caches that `clean-caches` may delete.",
     "repo_cache_globs": "Per-repository cache globs: repository name to a list of globs.",
     "post_provision_hooks": "Shell commands run, in order, in every new checkout.",
+    "retire_freeze": (
+        "When set, every retirement and removal on this host refuses with code retire-freeze "
+        "and this reason. Managed by `wrkslots freeze`; absent means unfrozen."
+    ),
     "salvage_push_remotes": (
         "Remote URLs that removal may push salvage commits to. Absent or empty allows none: "
         "uncommitted work on any other remote is kept in a verified local bundle instead."
@@ -985,6 +990,7 @@ class Config:
     #: default when the key is absent) or "image" (one sparse disk image per
     #: slot). Existing slots keep whatever representation they were created
     #: with; see slotimage.py.
+    retire_freeze: str | None = None
     slot_representation: str = "worktree"
     image_settings: slotimage.ImageSettings = slotimage.ImageSettings()
     sandbox_settings: sandbox.SandboxSettings = sandbox.SandboxSettings()
@@ -3897,6 +3903,11 @@ def _load_config(explicit_root: str | None, machine_override: str | None) -> Con
         disk_advisory_bytes=disk_values[0],
         disk_provisioning_floor_bytes=disk_values[1],
         disk_emergency_bytes=disk_values[2],
+        retire_freeze=(
+            None
+            if raw.get("retire_freeze") is None
+            else _as_str(raw["retire_freeze"], "configuration.retire_freeze")
+        ),
         slot_representation=_parse_slot_representation(raw),
         image_settings=_parse_image_settings(raw),
         sandbox_settings=_parse_sandbox_settings(raw),
@@ -28915,6 +28926,7 @@ def _cmd_retire_pending(args: argparse.Namespace) -> int:
     )
     deadline = time.monotonic() + wait_seconds
     config = _load_config(args.project_root, args.machine)
+    _assert_not_retire_frozen(config, "retire-pending")
     pending = _current_retirement_candidates(
         config,
         wait_seconds,
@@ -29124,6 +29136,68 @@ def _cmd_retire_pending(args: argparse.Namespace) -> int:
                 f"reason={item['reason']}"
             )
     return 3 if could_not_determine else 0
+
+
+RETIRE_FREEZE_MARKER = "RETIRE_FREEZE"
+RETIRE_FREEZE_CODE = "retire-freeze"
+
+
+def _retire_freeze(config: Config) -> tuple[str, str] | None:
+    """(reason, source) when retirements are frozen on this host (#780)."""
+
+    if config.retire_freeze:
+        return config.retire_freeze, "config"
+    marker = config.control / RETIRE_FREEZE_MARKER
+    try:
+        reason = marker.read_text().strip()
+    except OSError:
+        return None
+    return (reason or "frozen by marker file", "marker")
+
+
+def _assert_not_retire_frozen(config: Config, action: str) -> None:
+    frozen = _retire_freeze(config)
+    if frozen is not None:
+        reason, source = frozen
+        raise Refusal(
+            f"{RETIRE_FREEZE_CODE}: {action} refused on this host "
+            f"(freeze source: {source}): {reason}"
+        )
+
+
+def _cmd_freeze(args: argparse.Namespace) -> int:
+    config = _load_config(args.project_root, args.machine)
+    marker = config.control / RETIRE_FREEZE_MARKER
+    if args.freeze_action == "set":
+        reason = " ".join(args.reason or ()).strip()
+        if not reason:
+            raise Refusal("freeze set requires a non-empty reason")
+        config.control.mkdir(parents=True, exist_ok=True)
+        temporary = marker.with_suffix(".tmp")
+        temporary.write_text(reason + "\n")
+        temporary.replace(marker)
+        print(f"frozen=true reason={reason} source=marker")
+        return 0
+    if args.freeze_action == "clear":
+        try:
+            marker.unlink()
+        except FileNotFoundError:
+            pass
+        frozen = _retire_freeze(config)
+        if frozen is not None:
+            print(
+                f"frozen=true reason={frozen[0]} source={frozen[1]} "
+                "(marker cleared; the remaining source still freezes this host)"
+            )
+        else:
+            print("frozen=false")
+        return 0
+    frozen = _retire_freeze(config)
+    if frozen is None:
+        print("frozen=false")
+    else:
+        print(f"frozen=true reason={frozen[0]} source={frozen[1]}")
+    return 0
 
 
 class _CachePlanExhausted(Refusal):
@@ -33855,6 +33929,7 @@ def _clean_caches_skip_reason(config: Config, cache: CacheDirectory) -> str | No
 
 def _cmd_clean_caches(args: argparse.Namespace) -> int:
     config = _load_config(args.project_root, args.machine)
+    _assert_not_retire_frozen(config, "clean-caches")
     if not config.cache_globs and not config.repo_cache_globs:
         raise Refusal("no cache globs are configured")
     only = tuple(args.only or ())
@@ -38256,6 +38331,7 @@ def _cmd_remove_in_scope(
     agent_batch: _AgentRemoveBatchContext | None,
 ) -> int:
     config = _load_config(args.project_root, args.machine)
+    _assert_not_retire_frozen(config, "remove")
     _validate_name(args.slot, "slot")
     if agent_batch is not None and (
         private_cleanup is not None
@@ -39510,6 +39586,7 @@ def _remove_validate_batch(
     if len({slot for slot, _generation in requested}) != len(requested):
         raise Refusal("remove-validate-batch received the same slot more than once")
     config = _load_config(args.project_root, args.machine)
+    _assert_not_retire_frozen(config, "remove-validate-batch")
     raw_proofs = tuple(getattr(args, "validation_proof_manifests", ()) or ())
     raw_records = tuple(getattr(args, "completed_records", ()) or ())
     if bool(raw_proofs) != bool(raw_records):
@@ -41087,6 +41164,7 @@ def _read_agent_batch_items(args: argparse.Namespace) -> tuple[tuple[str, int], 
 def _remove_agent_batch(args: argparse.Namespace) -> dict[str, object]:
     requested = _read_agent_batch_items(args)
     config = _load_config(args.project_root, args.machine)
+    _assert_not_retire_frozen(config, "remove-agent-batch")
     if getattr(args, "salvage_archive_root", None) is not None:
         _local_salvage_archive_root(config, args.salvage_archive_root)
     started = time.monotonic()
@@ -62112,6 +62190,29 @@ usage or audit gate unknown, 3 fail-closed refusal.
         help="batch result format (default: human); json includes typed per-target outcomes",
     )
     retire_pending.set_defaults(handler=_cmd_retire_pending)
+
+
+    freeze = subparsers.add_parser(
+        "freeze",
+        description=(
+            "Manage the per-host retire freeze (#780). While frozen, retire-pending, "
+            "remove, remove batches, and clean-caches "
+            "refuse with code retire-freeze for every caller; read-only commands keep working."
+        ),
+        help="set, clear, or show the per-host retire freeze",
+        formatter_class=_HelpFormatter,
+    )
+    freeze.add_argument(
+        "freeze_action",
+        choices=("set", "clear", "status"),
+        help="set <reason> writes the freeze marker, clear removes it, status reports it",
+    )
+    freeze.add_argument(
+        "reason",
+        nargs="*",
+        help="freeze reason words (required for set)",
+    )
+    freeze.set_defaults(handler=_cmd_freeze)
 
     clean_caches = subparsers.add_parser(
         "clean-caches",
