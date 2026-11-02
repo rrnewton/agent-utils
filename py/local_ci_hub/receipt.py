@@ -8,21 +8,6 @@ from pathlib import Path
 from .config import Config
 from .ledger import Ledger
 
-# Canonical current release identity, mirrored from ci-hub
-# `validate/qualifying-receipt.json` (`release_payloads.cargo`, read through
-# `release_builder_of` in ci-hub `qualifying_receipt.py`). That reader ignores
-# the `release_payloads_superseded` map, so a superseded identity (for example
-# the pre-2026-10-01 `target/debug/hermit` cargo payload) never names a builder
-# for landing. Mirror that here: an identity claim is honoured only when it is
-# exactly the current cargo identity (or the configured `release_payload`).
-_CANONICAL_CARGO_PAYLOAD: dict[str, object] = {
-    "path": "target/validate/hermit",
-    "profile": "validate",
-    "debug_assertions": True,
-    "overflow_checks": True,
-}
-
-
 def _canonical_json(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
@@ -30,11 +15,11 @@ def _canonical_json(value: object) -> str:
 def _release_identity_ok(cfg: Config, r: dict[str, object]) -> bool:
     """Whether a row's release_builder/e2e_payload claim may qualify.
 
-    Mirrors ci-hub `qualifying_receipt.release_builder_of`: the two fields are
-    read together, a lone field names no builder, and a payload that is not
-    exactly the current identity for its builder (including every superseded
-    identity, which that reader ignores) names no builder. A row carrying
-    neither field makes no identity claim and is judged by the other clauses.
+    The two fields are read together: a lone field names no builder. A row
+    carrying neither field makes no identity claim and is judged by the other
+    clauses. When both fields are present, the claim is honoured only when a
+    current payload is configured and the row payload is exactly that payload;
+    with no configured payload an identity claim cannot be honoured.
     """
     has_builder = "release_builder" in r
     has_payload = "e2e_payload" in r
@@ -42,11 +27,10 @@ def _release_identity_ok(cfg: Config, r: dict[str, object]) -> bool:
         return True
     if not (has_builder and has_payload):
         return False
-    expected = cfg.release_payload if cfg.release_payload is not None else _CANONICAL_CARGO_PAYLOAD
-    if cfg.release_payload is None and r.get("release_builder") != "cargo":
+    if cfg.release_payload is None:
         return False
     try:
-        return _canonical_json(r.get("e2e_payload")) == _canonical_json(expected)
+        return _canonical_json(r.get("e2e_payload")) == _canonical_json(cfg.release_payload)
     except (TypeError, ValueError):
         return False
 
@@ -111,10 +95,10 @@ def show(cfg: Config, commit: str, remote: dict[str, object] | None = None) -> d
             return False
         return True
     def _is_genuine_fail(r: dict[str, object]) -> bool:
-        # Mirror ci-hub failure_disposition: only a clean full-coverage FAIL
-        # (anchored, full profile/selection, clean tree, verified evidence)
-        # is a durable failure. A partial-profile FAIL (e.g. only-portable)
-        # is a withheld non-verdict and must not veto a qualifying PASS.
+        # Only a clean full-coverage FAIL (anchored, full profile/selection,
+        # clean tree, verified evidence) is a durable failure. A partial-profile
+        # FAIL (e.g. only-portable) is a withheld non-verdict and must not veto
+        # a qualifying PASS.
         return (
             r.get("result") == "FAIL"
             and r.get("_evidence_ok") is not False
@@ -127,9 +111,8 @@ def show(cfg: Config, commit: str, remote: dict[str, object] | None = None) -> d
     strict_passes = [r for r in rows if _strict_pass(r)]
     local_pass = bool(strict_passes)
     genuine_fails = [r for r in rows if _is_genuine_fail(r)]
-    # Newest terminal record decides, as in ci-hub assess_canonical_receipts:
-    # a genuine FAIL vetoes only when it is at least as new as the newest
-    # qualifying PASS.
+    # Newest terminal record decides: a genuine FAIL vetoes only when it is
+    # at least as new as the newest qualifying PASS.
     fail_veto = False
     if genuine_fails and strict_passes:
         newest_pass = max(str(r.get("finished_at") or "") for r in strict_passes)
