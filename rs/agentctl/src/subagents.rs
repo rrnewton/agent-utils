@@ -3414,6 +3414,36 @@ impl<A: ManagedApi + ?Sized> GuardedTerminal<'_, '_, A> {
 }
 
 impl<A: ManagedApi + ?Sized> GuardedInput for GuardedTerminal<'_, '_, A> {
+    fn composer_probe(
+        &self,
+        pane_id: &str,
+        harness: &str,
+    ) -> Option<crate::submission::ComposerProbe> {
+        // Read-only: Herdr's status and scroll, plus the foreground pid against
+        // the record's pinned harness identity when it has one.
+        let client = self.workspace.client;
+        let info = client.pane_info(pane_id).ok()?;
+        let foreground_matches = match self.workspace.record.harness_anchor() {
+            Some(identity) => client
+                .verify_harness_identity(pane_id, identity)
+                .ok()
+                .is_some_and(|matches| matches),
+            None => client
+                .harness_identity(pane_id, harness)
+                .ok()
+                .flatten()
+                .is_some(),
+        };
+        Some(crate::submission::ComposerProbe {
+            working: info.status == "working",
+            interactive_ready: info
+                .terminal_id
+                .as_deref()
+                .is_some_and(|value| !value.is_empty()),
+            foreground_matches,
+            scroll_offset_from_bottom: info.scroll.map(|scroll| scroll.offset_from_bottom),
+        })
+    }
     fn read_screen(&self, pane_id: &str) -> crate::error::Result<String> {
         self.workspace
             .client

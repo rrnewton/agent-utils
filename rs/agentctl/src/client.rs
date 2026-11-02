@@ -2389,6 +2389,42 @@ impl HerdrClient {
         }
         Ok(completed.stdout)
     }
+    /// Probe the facts [`crate::submission::composer_unreadable_reason`] needs,
+    /// without typing anything: Herdr's agent status, whether the pane still
+    /// holds an interactive terminal, whether its foreground process is still
+    /// the harness, and its scroll offset. `expected`, when given, is the
+    /// pinned harness identity the foreground pid must still match; without a
+    /// pin the live foreground harness stands in for it. Any doubt is `None`,
+    /// so the caller keeps its generic refusal.
+    pub(crate) fn composer_probe(
+        &self,
+        pane_id: &str,
+        harness: &str,
+        expected: Option<&CustomProcessIdentity>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Option<crate::submission::ComposerProbe> {
+        let info = self.pane_info_with_cancellation(pane_id, cancelled).ok()?;
+        let foreground_matches = match expected {
+            Some(identity) => self
+                .verify_harness_identity_with_cancellation(pane_id, identity, cancelled)
+                .ok()
+                .is_some_and(|matches| matches),
+            None => self
+                .harness_identity_with_cancellation(pane_id, harness, cancelled)
+                .ok()
+                .flatten()
+                .is_some(),
+        };
+        Some(crate::submission::ComposerProbe {
+            working: info.status == "working",
+            interactive_ready: info
+                .terminal_id
+                .as_deref()
+                .is_some_and(|value| !value.is_empty()),
+            foreground_matches,
+            scroll_offset_from_bottom: info.scroll.map(|scroll| scroll.offset_from_bottom),
+        })
+    }
     /// Invoke and validate the corresponding Herdr agent-control operation.
     pub fn prompt_agent(&self, pane_id: &str, text: &str) -> Result<()> {
         self.prompt_agent_with_cancellation(pane_id, text, &|| false)

@@ -130,10 +130,23 @@ pub struct QueueStatus {
     pub cwd: String,
     /// Prompt identifiers waiting safely before injection.
     pub pending: Vec<String>,
+    /// Pending prompts whose last refusal was `composer_unreadable`, with the
+    /// recorded `delivery_error` detail. Empty for every other session.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub composer_unreadable: Vec<ComposerUnreadablePending>,
     /// Prompt identifiers behind the durable injection-intent barrier.
     pub inflight: Vec<String>,
     /// Prompt identifiers retained after malformed or ambiguous delivery.
     pub failed: Vec<String>,
+}
+
+/// One pending prompt held by an unreadable composer.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ComposerUnreadablePending {
+    /// Stable prompt identifier, also in `pending`.
+    pub message_id: String,
+    /// The recorded `delivery_error` detail (kind `composer_unreadable`).
+    pub delivery_error: String,
 }
 
 /// One durable prompt that was not confirmed delivered.
@@ -523,6 +536,14 @@ struct HerdrTerminal<'a> {
 }
 
 impl PromptTerminal for HerdrTerminal<'_> {
+    fn composer_probe(
+        &self,
+        pane_id: &str,
+        harness: &str,
+    ) -> Option<crate::submission::ComposerProbe> {
+        self.client
+            .composer_probe(pane_id, harness, None, &|| self.runtime.cancelled())
+    }
     fn read_screen(&self, pane_id: &str) -> crate::error::Result<String> {
         self.client
             .read_screen_with_cancellation(pane_id, &|| self.runtime.cancelled())
@@ -544,7 +565,9 @@ pub struct DrainOptions {
     pub ready_timeout: Duration,
     /// Maximum post-injection wait for the native working transition.
     pub working_timeout: Duration,
-    /// Maximum recorded delivery-attempt count accepted for a prompt.
+    /// Maximum recorded delivery-attempt count accepted for a prompt. Also
+    /// bounds composer-unreadable re-probes within one drain: see
+    /// [`COMPOSER_RETRY_DELAYS`].
     pub max_attempts: u64,
     /// Also type into a Claude Code pane that Herdr reports `working`, and let Claude Code
     /// queue the prompt behind its current turn. The submission must still be verified against
@@ -572,6 +595,20 @@ pub struct DrainOptions {
     /// requests and console input) are never batched either way; see [`owner_prompt`].
     pub batch_working_backlog: bool,
 }
+
+/// Bounded backoff between composer-unreadable re-probes within one drain.
+///
+/// A `composer_unreadable` refusal typed nothing, so the drain waits this long
+/// and probes the composer again instead of giving up: 15 s, then 60 s, then
+/// 5 min. How many delays run is bounded by `max_attempts` (the default of 3
+/// runs the first two), the drain deadline, and cancellation; a prompt that is
+/// still unreadable afterwards stays pending for a later drain. Delivery stays
+/// exactly-once through the usual inbox -> inflight -> processed flow.
+pub const COMPOSER_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(15),
+    Duration::from_secs(60),
+    Duration::from_secs(300),
+];
 
 impl Default for DrainOptions {
     fn default() -> Self {
@@ -1458,6 +1495,8 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
         // One prompt counts once against --max-items, however many times it is retried.
         let mut counted = false;
         let mut first_try = true;
+        // Composer-unreadable re-probes already waited out for this prompt.
+        let mut unreadable_retries: usize = 0;
         'retry: loop {
             // A retry starts no new attempt once the deadline has passed.
             if !std::mem::take(&mut first_try)
@@ -2032,10 +2071,34 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                     document.remove("inflight_from");
                     document.remove("paste_started_at");
                     document.insert("delivery_state".to_owned(), json!("pending"));
-                    document.insert("delivery_error".to_owned(), json!(detail));
+                    document.insert("delivery_error".to_owned(), json!(detail.clone()));
                     document.insert("delivery_blocked_at".to_owned(), json!(unix_seconds()));
                     atomic_json(&inflight_path, &Value::Object(document))?;
                     transition(&inflight_path, &path)?;
+                    // An unreadable composer typed nothing, so probe it again
+                    // after a bounded backoff within this drain (see
+                    // COMPOSER_RETRY_DELAYS) instead of waiting for a later
+                    // drain. The prompt is back in its inbox lane, so the
+                    // retry re-runs the whole readiness + inflight flow and
+                    // still delivers exactly once. Anything else, a cancelled
+                    // runtime, an elapsed deadline, or the attempt budget
+                    // keeps the prompt pending as before.
+                    if crate::submission::is_composer_unreadable(&detail)
+                        && unreadable_retries < COMPOSER_RETRY_DELAYS.len()
+                        && u64::try_from(unreadable_retries + 1).unwrap_or(u64::MAX)
+                            < options.max_attempts
+                        && !runtime.cancelled()
+                    {
+                        let delay = COMPOSER_RETRY_DELAYS[unreadable_retries];
+                        let fits_deadline = deadline.is_none_or(|deadline| {
+                            runtime.monotonic().saturating_add(delay) < deadline
+                        });
+                        if fits_deadline {
+                            unreadable_retries += 1;
+                            runtime.sleep(delay);
+                            continue 'retry;
+                        }
+                    }
                     blocked = Some(detail);
                     break 'message;
                 }
@@ -2515,6 +2578,33 @@ fn status_with_binding_mode<A: AgentApi + ?Sized>(
     validate_existing_binding(root, target, allow_legacy_workspace_binding)?;
     let info = resolve_target(client, target)?;
     let directories = QueueDirectories::new(root);
+    // Surface why an unreadable composer holds its prompts: the recorded
+    // `delivery_error` of each pending prompt that carries the kind.
+    let mut composer_unreadable = Vec::new();
+    if let Ok(paths) = pending_in_queue_order(&directories) {
+        for path in paths {
+            let Ok(document) = load_message(&path) else {
+                continue;
+            };
+            let Some(detail) = document.get("delivery_error").and_then(Value::as_str) else {
+                continue;
+            };
+            if !crate::submission::is_composer_unreadable(detail) {
+                continue;
+            }
+            let Ok(filename_id) = message_id_from_path(&path) else {
+                continue;
+            };
+            let message_id = document
+                .get("id")
+                .and_then(Value::as_str)
+                .map_or(filename_id, str::to_owned);
+            composer_unreadable.push(ComposerUnreadablePending {
+                message_id,
+                delivery_error: detail.to_owned(),
+            });
+        }
+    }
     Ok(QueueStatus {
         pane_id: info.pane_id,
         agent: info.agent,
@@ -2525,6 +2615,7 @@ fn status_with_binding_mode<A: AgentApi + ?Sized>(
         workspace_id: info.workspace_id,
         cwd: info.cwd,
         pending: identifiers_if_directory(&directories.inbox)?,
+        composer_unreadable,
         inflight: identifiers_if_directory(&directories.inflight)?,
         failed: identifiers_if_directory(&directories.failed)?,
     })
@@ -4317,6 +4408,174 @@ mod tests {
                 assert_eq!(document["delivery_state"], "pending");
             }
         }
+    }
+
+    /// Fake whose composer is unreadable on the first probe and recovered on
+    /// the second: the drain must deliver exactly once, through the queue.
+    struct RecoveringAgent {
+        inner: FakeAgent,
+        submit_calls: AtomicU64,
+    }
+
+    impl AgentApi for RecoveringAgent {
+        fn panes(&self) -> crate::error::Result<Vec<Pane>> {
+            self.inner.panes()
+        }
+        fn pane_info(&self, pane_id: &str) -> crate::error::Result<AgentPaneInfo> {
+            self.inner.pane_info(pane_id)
+        }
+        fn workspace_label(&self, workspace_id: &str) -> crate::error::Result<String> {
+            self.inner.workspace_label(workspace_id)
+        }
+        fn run(&self, pane_id: &str, text: &str) -> crate::error::Result<()> {
+            self.inner.run(pane_id, text)
+        }
+        fn wait_agent_status(
+            &self,
+            pane_id: &str,
+            status: &str,
+            timeout_ms: u64,
+        ) -> crate::error::Result<()> {
+            self.inner.wait_agent_status(pane_id, status, timeout_ms)
+        }
+        fn read(
+            &self,
+            pane_id: &str,
+            source: &str,
+            lines: Option<usize>,
+        ) -> crate::error::Result<String> {
+            self.inner.read(pane_id, source, lines)
+        }
+        fn submit_with_runtime(
+            &self,
+            _pane_id: &str,
+            _text: &str,
+            _runtime: &dyn AgentRuntime,
+        ) -> crate::error::Result<Submission> {
+            if self.submit_calls.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                let reason = crate::submission::composer_unreadable_reason(
+                    "w1:p1",
+                    "codex",
+                    "   \n\n",
+                    Some(crate::submission::ComposerProbe {
+                        working: true,
+                        interactive_ready: true,
+                        foreground_matches: true,
+                        scroll_offset_from_bottom: Some(0),
+                    }),
+                    Duration::from_secs(15),
+                )
+                .expect("blank working probe is unreadable");
+                return Ok(Submission::NotStaged(reason));
+            }
+            Ok(Submission::Verified(crate::submission::SubmissionReceipt {
+                key: "Enter",
+                key_presses: 1,
+                elapsed: Duration::ZERO,
+                evidence: "prompt text appeared above the composer".to_owned(),
+                printed: true,
+                settled: true,
+            }))
+        }
+    }
+
+    #[test]
+    fn composer_unreadable_stays_pending_with_its_reason_recorded() {
+        let directory = TestDirectory::new("unreadable-pending");
+        let screen = crate::submission::fake::FakeScreen::new("codex", true);
+        {
+            let mut state = screen.state();
+            state.screen_override = Some("\u{1b}[0m   \n\n  \t \n".to_owned());
+            state.probe = Some(crate::submission::ComposerProbe {
+                working: true,
+                interactive_ready: true,
+                foreground_matches: true,
+                scroll_offset_from_bottom: Some(0),
+            });
+        }
+        let fake = FakeAgent::with_screen(screen);
+        enqueue(directory.path(), "one prompt", Some("once")).unwrap();
+        // max_attempts 1 leaves no re-probe budget in this drain.
+        let result = drain_with_runtime(
+            &fake,
+            &target(),
+            directory.path(),
+            DrainOptions {
+                ready_timeout: Duration::ZERO,
+                max_attempts: 1,
+                ..DrainOptions::default()
+            },
+            &FakeRuntime::default(),
+        )
+        .unwrap();
+        // Pending is the exit-75 outcome: safe to retry, never quarantined.
+        assert_eq!(result.outcome, QueueOutcome::Pending);
+        assert_eq!(result.pending, ["once"]);
+        assert!(result.delivered.is_empty());
+        assert!(result.quarantined.is_empty(), "never possibly_submitted");
+        let blocked = result.blocked.expect("a blocked reason");
+        assert!(
+            crate::submission::is_composer_unreadable(&blocked),
+            "{blocked}"
+        );
+        let document = read_private_json(&directory.path().join("inbox/once.json")).unwrap();
+        assert_eq!(document["delivery_state"], "pending");
+        let detail = document["delivery_error"].as_str().unwrap();
+        assert!(
+            crate::submission::is_composer_unreadable(detail),
+            "{detail}"
+        );
+        assert!(detail.contains("ansi_blank=true"), "{detail}");
+        assert!(detail.contains("scroll_offset_from_bottom=0"), "{detail}");
+        assert!(document.get("possibly_submitted").is_none(), "{document}");
+        // Status shows the pending count and the unreadable reason.
+        let status = status(&fake, &target(), directory.path()).unwrap();
+        assert_eq!(status.pending, ["once"]);
+        assert_eq!(status.composer_unreadable.len(), 1);
+        assert_eq!(status.composer_unreadable[0].message_id, "once");
+        assert!(
+            status.composer_unreadable[0]
+                .delivery_error
+                .contains("composer_unreadable"),
+            "{}",
+            status.composer_unreadable[0].delivery_error
+        );
+        // Nothing was typed into the blank grid.
+        let screen = fake.screen.as_ref().expect("fake screen");
+        assert!(screen.state().pastes.is_empty());
+        assert!(screen.state().keys.is_empty());
+    }
+
+    #[test]
+    fn drain_reprobes_an_unreadable_composer_and_delivers_once_it_recovers() {
+        let directory = TestDirectory::new("unreadable-recovers");
+        let agent = RecoveringAgent {
+            inner: FakeAgent::new(&["idle"]),
+            submit_calls: AtomicU64::new(0),
+        };
+        enqueue(directory.path(), "one prompt", Some("once")).unwrap();
+        let runtime = FakeRuntime::default();
+        let result = drain_with_runtime(
+            &agent,
+            &target(),
+            directory.path(),
+            DrainOptions {
+                ready_timeout: Duration::ZERO,
+                ..DrainOptions::default()
+            },
+            &runtime,
+        )
+        .unwrap();
+        assert_eq!(result.outcome, QueueOutcome::Delivered);
+        assert_eq!(result.delivered, ["once"]);
+        assert!(result.quarantined.is_empty());
+        assert_eq!(agent.submit_calls.load(AtomicOrdering::SeqCst), 2);
+        // The first bounded backoff (15 s) ran before the recovering probe.
+        assert!(runtime.monotonic() >= COMPOSER_RETRY_DELAYS[0]);
+        // Exactly once: processed once, gone from the inbox, never failed.
+        assert!(directory.path().join("processed/once.json").exists());
+        assert!(!directory.path().join("inbox/once.json").exists());
+        assert!(!directory.path().join("failed/once.json").exists());
     }
 
     #[test]

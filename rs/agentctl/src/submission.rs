@@ -109,6 +109,80 @@ pub enum Submission {
     NotStaged(String),
 }
 
+/// Distinct refusal kind for a pane whose terminal grid stays blank while the
+/// harness keeps working: the composer exists but cannot be read, so nothing
+/// may be typed. Recorded at the start of the `delivery_error` detail and
+/// classified by [`is_composer_unreadable`]. The prompt stays pending (exit 75);
+/// it is never a `possibly_submitted` outcome (exit 76).
+pub const COMPOSER_UNREADABLE_KIND: &str = "composer_unreadable";
+
+/// Herdr facts about one pane, probed without typing anything.
+///
+/// `working` is Herdr's agent status (for example from the OSC title) rather
+/// than anything the blank grid shows. `interactive_ready` means the pane
+/// still holds an interactive terminal. `foreground_matches` means the pane's
+/// foreground process group leader is still the pinned harness process.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ComposerProbe {
+    /// Herdr reports the agent `working`.
+    pub working: bool,
+    /// The pane still holds an interactive terminal.
+    pub interactive_ready: bool,
+    /// The foreground pid still matches the pinned harness identity.
+    pub foreground_matches: bool,
+    /// `scroll.offset_from_bottom` when Herdr reports geometry.
+    pub scroll_offset_from_bottom: Option<u64>,
+}
+
+/// Whether `screen`, once rendered, is blank: every cell whitespace.
+///
+/// Escape sequences, faint/placeholder styling and the reverse-video cursor
+/// do not count as content, matching how [`render_screen`] reads a composer.
+#[must_use]
+pub fn is_ansi_blank(screen: &str) -> bool {
+    render_screen(screen)
+        .iter()
+        .all(|(plain, _)| plain.iter().all(|c| c.is_whitespace()))
+}
+
+/// Whether `detail` is a [`COMPOSER_UNREADABLE_KIND`] refusal.
+#[must_use]
+pub fn is_composer_unreadable(detail: &str) -> bool {
+    detail.starts_with(COMPOSER_UNREADABLE_KIND)
+}
+
+/// The `composer_unreadable` refusal for `pane_id`, or `None`.
+///
+/// Some only when the rendered screen is ansi-blank and `probe` proves the
+/// harness is still there and working (`working`, `interactive_ready` and a
+/// matching foreground pid). Every other blank or unreadable screen keeps the
+/// generic refusal, so a genuinely absent composer is never misclassified.
+/// The detail carries the blank and scroll facts for `delivery_error`.
+pub fn composer_unreadable_reason(
+    pane_id: &str,
+    harness: &str,
+    screen: &str,
+    probe: Option<ComposerProbe>,
+    waited: Duration,
+) -> Option<String> {
+    let probe = probe?;
+    if !(probe.working && probe.interactive_ready && probe.foreground_matches) {
+        return None;
+    }
+    if !is_ansi_blank(screen) {
+        return None;
+    }
+    let scroll = probe
+        .scroll_offset_from_bottom
+        .map_or_else(|| "unknown".to_owned(), |offset| offset.to_string());
+    Some(format!(
+        "{COMPOSER_UNREADABLE_KIND}: pane {pane_id} does not show a recognisable {harness} \
+         composer after {:.1}s; ansi_blank=true scroll_offset_from_bottom={scroll} \
+         working=true interactive_ready=true foreground_match=true; nothing was typed",
+        waited.as_secs_f64()
+    ))
+}
+
 /// Terminal operations used by [`submit_verified`].
 pub trait PromptTerminal {
     /// Return visible rows with SGR styling retained.
@@ -117,6 +191,12 @@ pub trait PromptTerminal {
     fn send_text(&self, pane_id: &str, text: &str) -> Result<()>;
     /// Send one named key.
     fn send_keys(&self, pane_id: &str, keys: &str) -> Result<()>;
+    /// Probe Herdr facts for the composer-unreadable classification, or `None`
+    /// when this terminal cannot prove them (the generic refusal then stands).
+    /// Implementations must not type anything.
+    fn composer_probe(&self, _pane_id: &str, _harness: &str) -> Option<ComposerProbe> {
+        None
+    }
 }
 
 /// A prompt terminal that runs each input effect between recipient checks.
@@ -133,6 +213,11 @@ pub trait GuardedInput {
     fn send_keys(&self, pane_id: &str, keys: &str) -> Result<()>;
     /// Submit text plus Enter through Herdr's native prompt primitive.
     fn native_prompt(&self, pane_id: &str, text: &str) -> Result<()>;
+    /// Probe Herdr facts for the composer-unreadable classification, or `None`
+    /// when this input path cannot prove them. Must not type anything.
+    fn composer_probe(&self, _pane_id: &str, _harness: &str) -> Option<ComposerProbe> {
+        None
+    }
 }
 
 /// The [`PromptTerminal`] view of a [`GuardedInput`], for [`submit_verified`].
@@ -147,6 +232,9 @@ impl PromptTerminal for GuardedPrompt<'_> {
     }
     fn send_keys(&self, pane_id: &str, keys: &str) -> Result<()> {
         self.0.send_keys(pane_id, keys)
+    }
+    fn composer_probe(&self, pane_id: &str, harness: &str) -> Option<ComposerProbe> {
+        self.0.composer_probe(pane_id, harness)
     }
 }
 
@@ -907,6 +995,19 @@ pub fn submit_verified(
             break (screen, before);
         }
         if runtime.monotonic() >= composer_deadline || runtime.cancelled() {
+            // A grid that stayed ansi-blank while Herdr still proves the harness
+            // working in its pinned foreground process is unreadable, not absent:
+            // the distinct refusal lets a drain retry it instead of guessing.
+            // Nothing has been typed on either path.
+            if let Some(reason) = composer_unreadable_reason(
+                pane_id,
+                harness,
+                &screen,
+                terminal.composer_probe(pane_id, harness),
+                timeouts.composer,
+            ) {
+                return refuse(reason);
+            }
             return refuse(format!(
                 "pane {pane_id} does not show a recognisable {harness} composer after {}s \
                  (a dialog or menu may be open); nothing was typed",
@@ -1343,6 +1444,11 @@ pub(crate) mod fake {
         pending_reads: u32,
         paste_counter: u32,
         placeholder: Option<String>,
+        /// When set, every screen read returns this verbatim (for example an
+        /// ansi-blank grid) instead of the rendered composer.
+        pub screen_override: Option<String>,
+        /// Herdr facts `composer_probe` reports for this pane.
+        pub probe: Option<super::ComposerProbe>,
     }
 
     /// A terminal agent composer with a controllable key drop and redraw lag.
@@ -1480,8 +1586,15 @@ pub(crate) mod fake {
     }
 
     impl PromptTerminal for FakeScreen {
+        fn composer_probe(&self, _pane_id: &str, _harness: &str) -> Option<super::ComposerProbe> {
+            self.state().probe
+        }
+
         fn read_screen(&self, _pane_id: &str) -> Result<String> {
             let mut state = self.state();
+            if let Some(override_screen) = state.screen_override.clone() {
+                return Ok(override_screen);
+            }
             if state.dialog_reads > 0 {
                 state.dialog_reads -= 1;
                 state.dialog = state.dialog_reads > 0;
@@ -1712,6 +1825,82 @@ mod tests {
         let rows = render_screen("\u{1b}[38;2;2;7;2mA\u{1b}[48;5;2mB\u{1b}[2mC\u{1b}[0mD");
         assert_eq!(text_of(&rows[0].0), "ABCD");
         assert_eq!(text_of(&rows[0].1), "AB D");
+    }
+
+    #[test]
+    fn ansi_blank_means_whitespace_only_once_rendered() {
+        assert!(is_ansi_blank(""));
+        assert!(is_ansi_blank("   \n\n  \t \n"));
+        assert!(is_ansi_blank(
+            "\u{1b}[2m   \u{1b}[0m\n\u{1b}[7m \u{1b}[0m\n"
+        ));
+        assert!(!is_ansi_blank("  x  \n"));
+        assert!(!is_ansi_blank(
+            FakeScreen::new("codex", false).render().as_str()
+        ));
+    }
+
+    #[test]
+    fn blank_screen_while_working_is_composer_unreadable_and_types_nothing() {
+        // The proven defect: Herdr reads 0 bytes of grid while the agent works
+        // (OSC title) with its pinned harness in the foreground.
+        let screen = FakeScreen::new("codex", true);
+        {
+            let mut state = screen.state();
+            state.screen_override = Some("\u{1b}[0m   \n\n  \t \n".to_owned());
+            state.probe = Some(ComposerProbe {
+                working: true,
+                interactive_ready: true,
+                foreground_matches: true,
+                scroll_offset_from_bottom: Some(2),
+            });
+        }
+        let timeouts = SubmitTimeouts {
+            composer: Duration::from_millis(300),
+            ..SubmitTimeouts::default()
+        };
+        let reason = refusal(submit_with(&screen, "run the tests", timeouts).0);
+        assert!(is_composer_unreadable(&reason), "{reason}");
+        assert!(reason.contains("ansi_blank=true"), "{reason}");
+        assert!(reason.contains("scroll_offset_from_bottom=2"), "{reason}");
+        assert!(reason.contains("nothing was typed"), "{reason}");
+        let state = screen.state();
+        assert!(state.pastes.is_empty(), "nothing may be typed: {state:?}");
+        assert!(state.keys.is_empty(), "no key may be sent: {state:?}");
+    }
+
+    #[test]
+    fn blank_screen_without_working_proof_keeps_the_generic_refusal() {
+        for probe in [
+            None,
+            Some(ComposerProbe {
+                working: false,
+                interactive_ready: true,
+                foreground_matches: true,
+                scroll_offset_from_bottom: None,
+            }),
+            Some(ComposerProbe {
+                working: true,
+                interactive_ready: true,
+                foreground_matches: false,
+                scroll_offset_from_bottom: None,
+            }),
+        ] {
+            let screen = FakeScreen::new("codex", false);
+            {
+                let mut state = screen.state();
+                state.screen_override = Some("   \n\n".to_owned());
+                state.probe = probe;
+            }
+            let timeouts = SubmitTimeouts {
+                composer: Duration::from_millis(300),
+                ..SubmitTimeouts::default()
+            };
+            let reason = refusal(submit_with(&screen, "run the tests", timeouts).0);
+            assert!(!is_composer_unreadable(&reason), "{reason}");
+            assert!(reason.contains("does not show a recognisable"), "{reason}");
+            assert!(screen.state().pastes.is_empty());
+        }
     }
 
     #[test]
