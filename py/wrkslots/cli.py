@@ -46123,6 +46123,7 @@ def _ownerless_validation_inputs(
             assert repository is not None
             if active == fenced and authorization.target_kind == "checkout":
                 _GitVcs().repair_worktree(repository, fenced)
+                _repair_nested_repositories(fenced, _GitVcs())
             _validation_checkout_facts(
                 config,
                 active,
@@ -46187,6 +46188,7 @@ def _rollback_validation_fence(
     if authorization.target_kind == "checkout":
         assert repository is not None
         _GitVcs().repair_worktree(repository, target)
+        _repair_nested_repositories(target, _GitVcs())
     _clear_journal(config, rollback_journal)
 
 
@@ -47409,6 +47411,7 @@ def _recover_ownerless_validation(
             if authorization.target_kind == "checkout":
                 assert repository is not None
                 _GitVcs().repair_worktree(repository, fenced)
+                _repair_nested_repositories(fenced, _GitVcs())
             journal["phase"] = "fenced"
             _write_journal(config, journal)
             _interrupt_for_test("after-ownerless-validate-path-fence")
