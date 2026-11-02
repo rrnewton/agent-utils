@@ -1,15 +1,16 @@
 ---
 title: 'restore-native-sessions: record and discover every harness''s native session id'
-status: open
+status: closed
 priority: 1
-assignee: mu-restore@devbig030
 issue_type: feature
+assignee: mu-restore@devbig030
 labels:
 - agentctl
 depends_on:
   agent-utils-740: parent-child
 created_at: 2026-11-02T16:13:53.493499578+00:00
-updated_at: 2026-11-02T16:13:53.493499578+00:00
+updated_at: 2026-11-02T19:31:58.329874483+00:00
+closed_at: 2026-11-02T19:31:58.329874333+00:00
 ---
 
 # Description
