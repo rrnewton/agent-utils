@@ -162,6 +162,36 @@ pub struct GitHubConfig {
     pub anonymous_fetch: bool,
 }
 
+/// A failure class: failed tests matching `pattern` are reported as `class`.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClassRule {
+    /// Test-ID pattern (exact, or with `*` wildcards), matched against the whole ID and against
+    /// its step alone, so `test.cli` also classifies `test.cli::case`.
+    pub pattern: String,
+    /// Label shown in reports and ejection records, e.g. `count pin drift`.
+    pub class: String,
+}
+
+/// Class labels for `failed` under `rules`, sorted and without duplicates.
+pub fn classify(rules: &[ClassRule], failed: &[crate::tests::TestId]) -> Vec<String> {
+    let mut classes: Vec<String> = failed
+        .iter()
+        .flat_map(|test| {
+            let id = test.to_string();
+            rules
+                .iter()
+                .filter(move |rule| {
+                    path_matches(&rule.pattern, &id) || path_matches(&rule.pattern, &test.step)
+                })
+                .map(|rule| rule.class.clone())
+        })
+        .collect();
+    classes.sort();
+    classes.dedup();
+    classes
+}
+
 /// Identity for commits the queue creates.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -212,6 +242,9 @@ pub struct Config {
     pub trust_base: bool,
     /// Identity for commits the queue creates.
     pub identity: IdentityConfig,
+    /// Failure classes: failed tests matching a rule's pattern are labelled with its class in
+    /// ejection records and reports (first-class names for known failure kinds).
+    pub classify: Vec<ClassRule>,
     /// The hosting service, for ready sources and closing landed pull requests.
     pub github: GitHubConfig,
     /// Peer queues by name: other repositories' merge-queue state directories. A change may
@@ -240,6 +273,7 @@ impl Default for Config {
             exact_sha: false,
             trust_base: false,
             identity: IdentityConfig::default(),
+            classify: Vec::new(),
             github: GitHubConfig::default(),
             peers: std::collections::BTreeMap::new(),
             validator: ValidatorConfig::default(),
@@ -444,4 +478,45 @@ fn load_dir<T: DeserializeOwned>(dir: &Path) -> Result<Vec<T>, String> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod unit {
+    use super::*;
+    use crate::tests::TestId;
+
+    #[test]
+    fn classify_matches_ids_and_steps() {
+        let rules = vec![
+            ClassRule {
+                pattern: "test.crate_count".into(),
+                class: "count pin drift".into(),
+            },
+            ClassRule {
+                pattern: "*_unit".into(),
+                class: "count pin drift".into(),
+            },
+            ClassRule {
+                pattern: "lint.*".into(),
+                class: "lint".into(),
+            },
+        ];
+        let failed = [
+            TestId::parse("test.crate_count::count").unwrap(),
+            TestId::step("suite_unit"),
+            TestId::step("build"),
+        ];
+        assert_eq!(
+            classify(&rules, &failed),
+            vec!["count pin drift".to_owned()]
+        );
+        assert_eq!(
+            classify(
+                &rules,
+                &[TestId::step("lint.fmt"), TestId::step("suite_unit")]
+            ),
+            vec!["count pin drift".to_owned(), "lint".to_owned()]
+        );
+        assert!(classify(&rules, &[TestId::step("other")]).is_empty());
+    }
 }

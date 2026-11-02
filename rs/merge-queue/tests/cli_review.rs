@@ -268,3 +268,62 @@ fn a_new_failing_test_is_blamed_on_its_change_not_on_the_base() {
     assert_eq!(r["ejected"][0]["pr"], 1);
     assert_eq!(r["ejected"][0]["failed"], serde_json::json!(["brand-new"]));
 }
+
+/// `count.tests` checks the pinned test count in tests.count against the files under tests/.
+const COUNTING_RUNNER: &str = r#"rc=0
+pinned=$(cat tests.count); actual=$(ls tests | wc -l | tr -d ' ')
+o=pass; [ "$pinned" = "$actual" ] || { o=fail; rc=1; }
+printf '{"id":"count.tests","outcome":"%s"}\n' "$o" >> "$MQ_RESULTS"
+for t in $(ls tests); do printf '{"id":"%s","outcome":"pass"}\n' "$t" >> "$MQ_RESULTS"; done
+exit $rc"#;
+
+#[test]
+fn count_pin_drift_is_classified_on_the_ejection() {
+    let fx = Fixture::new("rv-classify");
+    fx.write("tests/t0", "ok\n");
+    fx.write("tests.count", "1\n");
+    fx.commit_all("seed");
+    git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
+    fx.mq_ok(&[
+        "init",
+        "--validator",
+        "command",
+        "--validator-run",
+        COUNTING_RUNNER,
+        "--max-batch",
+        "2",
+        "--classify",
+        "count.*=count pin drift",
+    ]);
+    // Each change adds a test and pins the count it saw (2); together there are 3 tests, and the
+    // identical pin edits merge cleanly, so only the count check notices.
+    fx.branch("adds-a", &[("tests/a", "ok\n"), ("tests.count", "2\n")]);
+    fx.branch("adds-b", &[("tests/b", "ok\n"), ("tests.count", "2\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "adds-a"]);
+    fx.mq_ok(&["submit", "2", "--head", "adds-b"]);
+    let r = report(&fx.mq_ok(&["run", "--json"]));
+    assert_eq!(r["landed"][0]["prs"], serde_json::json!([1]), "{r}");
+    let ejection = &r["ejected"][0];
+    assert_eq!(ejection["pr"], 2);
+    assert_eq!(ejection["failed"], serde_json::json!(["count.tests"]));
+    assert_eq!(ejection["classes"], serde_json::json!(["count pin drift"]));
+    let record = std::fs::read_to_string(ejection["report"].as_str().unwrap()).unwrap();
+    assert!(
+        record.contains("Failure class: count pin drift"),
+        "{record}"
+    );
+    let markdown = fx.mq_ok(&["run", "--dry-run"]);
+    assert!(
+        !markdown.contains("count pin drift"),
+        "a dry run has nothing to classify"
+    );
+    let items: Value = serde_json::from_str(&fx.mq_ok(&["list", "--all", "--json"])).unwrap();
+    let history = items
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["pr"] == 2)
+        .unwrap()["history"]
+        .to_string();
+    assert!(history.contains("[count pin drift]"), "{history}");
+}

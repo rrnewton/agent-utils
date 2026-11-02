@@ -90,6 +90,7 @@ This command creates the state directory and writes `config.json`.
 | `--regen-when WHEN` | `conflict` | `conflict`: regenerate only when a change's conflicts are confined to generated files. `always`: also after every change, so a combination never leaves a generated file stale. |
 | `--exact-sha` | off | Exact-commit rule: never carry a validation result to another commit. See "The exact-commit rule". |
 | `--trust-base` | off | Treat the base as green in culprit searches and skip probing it. Sound when only this queue lands on the base, always as exactly validated commits; a broken base would then be blamed on the first change of a red batch. |
+| `--classify PATTERN=CLASS` | none | Label failed tests whose ID, or whose step alone, matches `PATTERN` (exact or `*` wildcards) with `CLASS` in ejection records, reports and item history. One example is `--classify 'test.*_count=count pin drift'`. Repeatable. |
 | `--peer NAME=DIR` | none | A peer queue: another repository's merge-queue state directory. Repeatable. See "Changes across repositories". |
 | `--identity-name NAME`, `--identity-email EMAIL` | Git's configuration | Identity for commits the queue creates: committer of replayed commits, author and committer of merge and regeneration commits. |
 | `--github-repo OWNER/NAME` | empty | Hosting repository for `sync --label`, `sync --all-open` and `--close-prs`. |
@@ -376,6 +377,7 @@ An **item record** (`items/<pr>.json`) has these fields:
 | `regenerate` | empty | `{paths, command, when}`; see "Generated files". |
 | `exact_sha` | `false` | The exact-commit rule. |
 | `trust_base` | `false` | Skip probing the base in culprit searches. |
+| `classify` | `[]` | `[{pattern, class}]` failure classes; see `--classify`. |
 | `peers` | `{}` | Peer queue name to state directory. |
 | `identity` | empty | `{name, email}` for commits the queue creates. |
 | `github` | empty | `{repo, gh, max_per_hour, budget_file, anonymous_fetch}`; see "Ready sources and the request budget". |
@@ -607,6 +609,21 @@ merge-queue run --with-peers
   it.
 - **A shadow run drains its peers in shadow too.** Their changes do not really land, so dependents
   stay held, and the shadow report says why.
+
+## Failure classes
+
+Some failures are of a known kind, and naming the kind tells the author what to do. With
+`--classify PATTERN=CLASS`, every failed test whose ID (or step) matches a pattern is labelled
+with that class. The label appears in three places:
+- the ejection record (`classes`);
+- the ejection report file (`Failure class: ...`), the run report and the item's history;
+- the validations table, next to red results.
+
+Classification changes nothing about the outcome. An ejected change is still ejected. A typical
+use is a pinned count, such as the number of tests in a suite. Two changes that each add a test
+and pin the count they saw merge cleanly, but together they break the pin. The search finds the
+second change; it is ejected as `count pin drift` (its pin must be recomputed on the new base),
+and the rest of the batch lands.
 
 ## Ready sources and the request budget
 

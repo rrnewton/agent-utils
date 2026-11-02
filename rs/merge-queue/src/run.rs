@@ -111,6 +111,9 @@ pub struct Ejection {
     /// Failed tests, for `failed-tests`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub failed: Vec<TestId>,
+    /// Failure classes of the failed tests (from `classify`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub classes: Vec<String>,
     /// Report file.
     pub report: PathBuf,
 }
@@ -137,6 +140,9 @@ pub struct ValidationRecord {
     pub cancelled: bool,
     /// Failed tests.
     pub failed: Vec<TestId>,
+    /// Failure classes of the failed tests (from `classify`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub classes: Vec<String>,
     /// Start time in milliseconds after the run began.
     pub start_ms: u64,
     /// Wall time in milliseconds.
@@ -914,6 +920,12 @@ impl<'a> Runner<'a> {
         if let Some(handle) = &ran.handle {
             lock(&self.handles).insert(job.commit.clone(), (handle.clone(), dir.clone()));
         }
+        let failed: Vec<TestId> = if ran.cancelled {
+            Vec::new()
+        } else {
+            ran.failed().into_iter().collect()
+        };
+        let classes = crate::state::classify(&self.config.classify, &failed);
         let record = ValidationRecord {
             id,
             purpose: job.purpose.to_owned(),
@@ -923,11 +935,8 @@ impl<'a> Runner<'a> {
             policy: job.policy,
             green: ran.green(),
             cancelled: ran.cancelled,
-            failed: if ran.cancelled {
-                Vec::new()
-            } else {
-                ran.failed().into_iter().collect()
-            },
+            failed,
+            classes,
             start_ms,
             elapsed_ms: ran.elapsed.as_millis() as u64,
             dir: dir.clone(),
@@ -1244,11 +1253,20 @@ impl<'a> Runner<'a> {
 
     fn eject(&self, pr: i64, kind: &str, reason: &str, failed: &[TestId]) -> Result<(), String> {
         lock(&self.excluded).insert(pr);
+        let classes = crate::state::classify(&self.config.classify, failed);
+        let class_note = if classes.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", classes.join(", "))
+        };
         let dir = self.run_dir.join("ejections");
         std::fs::create_dir_all(&dir)
             .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
         let report = dir.join(format!("{pr}.md"));
-        let mut text = format!("# #{pr} ejected ({kind})\n\n{reason}\n");
+        let mut text = format!("# #{pr} ejected ({kind}){class_note}\n\n{reason}\n");
+        if !classes.is_empty() {
+            text.push_str(&format!("\nFailure class: {}\n", classes.join(", ")));
+        }
         if !failed.is_empty() {
             text.push_str("\nFailed tests:\n");
             for test in failed {
@@ -1260,14 +1278,14 @@ impl<'a> Runner<'a> {
         );
         std::fs::write(&report, text)
             .map_err(|error| format!("cannot write {}: {error}", report.display()))?;
-        self.event("eject", &format!("#{pr} ({kind}): {reason}"));
+        self.event("eject", &format!("#{pr} ({kind}){class_note}: {reason}"));
         if !self.simulating() {
             let mut items = lock(&self.items);
             if let Some(item) = items.get_mut(&pr) {
                 item.status = ItemStatus::Ejected;
                 item.log(
                     "ejected",
-                    format!("{kind}: {reason} (report {})", report.display()),
+                    format!("{kind}{class_note}: {reason} (report {})", report.display()),
                 );
                 self.state.save_item(item)?;
             }
@@ -1277,6 +1295,7 @@ impl<'a> Runner<'a> {
             kind: kind.to_owned(),
             reason: reason.to_owned(),
             failed: failed.to_vec(),
+            classes,
             report,
         });
         Ok(())
@@ -2037,8 +2056,13 @@ pub fn render_report(report: &RunReport) -> String {
     if !report.ejected.is_empty() {
         out.push_str("\n## Ejected\n\n");
         for ejection in &report.ejected {
+            let classes = if ejection.classes.is_empty() {
+                String::new()
+            } else {
+                format!("; {}", ejection.classes.join(", "))
+            };
             out.push_str(&format!(
-                "- #{} ({}): {}\n",
+                "- #{} ({}{classes}): {}\n",
                 ejection.pr, ejection.kind, ejection.reason
             ));
         }
@@ -2062,8 +2086,10 @@ pub fn render_report(report: &RunReport) -> String {
             "cancelled".to_owned()
         } else if v.green {
             "green".to_owned()
-        } else {
+        } else if v.classes.is_empty() {
             format!("red: {}", ids(&v.failed))
+        } else {
+            format!("red: {} ({})", ids(&v.failed), v.classes.join(", "))
         };
         out.push_str(&format!(
             "| {} | {} | {} | `{}` | {} ({}) | {} | {:.1} | {:.1} |\n",

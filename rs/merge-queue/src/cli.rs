@@ -11,8 +11,8 @@ use crate::ops::{self, Submission};
 use crate::plan::{render, short};
 use crate::run::{self, RunOptions, RunReport, Runner};
 use crate::state::{
-    Config, GitHubConfig, IdentityConfig, LandConfig, RegenerateConfig, State, ValidatorConfig,
-    DEFAULT_DEPTH, DEFAULT_MAX_BATCH, DEFAULT_PRIORITY,
+    ClassRule, Config, GitHubConfig, IdentityConfig, LandConfig, RegenerateConfig, State,
+    ValidatorConfig, DEFAULT_DEPTH, DEFAULT_MAX_BATCH, DEFAULT_PRIORITY,
 };
 use crate::tests::{parse_selection, ValidationClaim};
 
@@ -91,6 +91,10 @@ enum Command {
         /// queue lands, always exactly validated commits.
         #[arg(long)]
         trust_base: bool,
+        /// Failure class PATTERN=CLASS: failed tests whose ID (or step) matches PATTERN (exact or
+        /// `*` wildcards) are labelled CLASS in ejections and reports. Repeatable.
+        #[arg(long, value_name = "PATTERN=CLASS")]
+        classify: Vec<String>,
         /// Name for commits the queue creates (default: Git's configuration).
         #[arg(long, default_value = "")]
         identity_name: String,
@@ -498,6 +502,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             regen_when,
             exact_sha,
             trust_base,
+            classify,
             identity_name,
             identity_email,
             peer,
@@ -550,6 +555,18 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     name: identity_name,
                     email: identity_email,
                 },
+                classify: classify
+                    .iter()
+                    .map(|spec| {
+                        spec.split_once('=')
+                            .filter(|(pattern, class)| !pattern.is_empty() && !class.is_empty())
+                            .map(|(pattern, class)| ClassRule {
+                                pattern: pattern.to_owned(),
+                                class: class.to_owned(),
+                            })
+                            .ok_or_else(|| format!("--classify {spec:?}: expected PATTERN=CLASS"))
+                    })
+                    .collect::<Result<_, _>>()?,
                 peers: peer
                     .iter()
                     .map(|spec| {
