@@ -5,7 +5,7 @@
 
 import assert from "node:assert/strict";
 
-import { SETTINGS, ACKNOWLEDGED, ALICE, BOTTOM_SLACK_PX, BOUND_NOTICE, CHANNEL, CODER, COUNTS_ALL_READ_MS,
+import { PAGE_CODE, SETTINGS, ACKNOWLEDGED, ALICE, BOTTOM_SLACK_PX, BOUND_NOTICE, CHANNEL, CODER, COUNTS_ALL_READ_MS,
   CSS, CSS_CODE, DISCORD_POLL_MS, GATHERED, HTML, HTML_CODE, INBOX, LINE_PX, MESSAGE_CACHE_KEY,
   MESSAGE_SPACING_MS, OTHER_CHANNEL, OWN, OWNERS_MESSAGE, PAGE_ELEMENTS, RUN_TAIL, RUN_THREAD,
   SCRIPT, SCRIPT_CODE, SCROLL_VIEWPORT_PX, UI_STATE_KEY, allLeavingOut, arrowStyle,
@@ -1513,7 +1513,7 @@ test("a collapsed run's line is the row's only face, a thumb tall, and not somet
   assert.match(selected, /color:\s*var\(--ink\)/);
   assert.match(selected, /outline:\s*2px solid var\(--accent\)/, "a selected run's line has no ring");
   // A finger on the line presses the line: it is neither a swipe to Done nor a hold for details.
-  assert.match(SCRIPT_CODE, /if \(li\.getAttribute\("data-read-run"\) === "head"\) \{\s*return;\s*\}/);
+  assert.match(PAGE_CODE, /if \(li\.getAttribute\("data-read-run"\) === "head"\) \{\s*return;\s*\}/);
 });
 
 test("...and the message the reader is on, marked Done, is held where it was by the line it joins", async () => {

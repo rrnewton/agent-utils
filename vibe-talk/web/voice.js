@@ -22830,10 +22830,7 @@ function bridgePiece(row) {
     if (event) event.stopPropagation();
     // ...unless it is the click behind a gesture on the row that already acted, a hold or a
     // swipe, whose claim the row's own tap would honour (`tapRow`): one act per finger.
-    if (suppressNextRowClick) {
-      suppressNextRowClick = false;
-      return;
-    }
+    if (rowGestures.takeClaimedClick()) return;
     // ...or the end of the taps on an arrow that put the bridge here, as with the X.
     if (replyArrows().settling !== null) return;
     const holder = bridge.parentNode || row;
@@ -23529,287 +23526,25 @@ function hiddenEmpty(message) {
 readAloudOwner().initializeReadSteerOffset();
 
 
-/**
- * What a tap on the message itself means.
- *
- * The owner's report: the fold control was a small target on a line already carrying four other
- * things, and the message beside it is enormous. So the message IS the control.
- *
- * It drives the fold BUTTON rather than the fold state, so there is exactly one path that folds a
- * row — the button keeps its scroll anchoring and its `aria-expanded`, and a keyboard user who
- * tabs to it gets the same act the tap performs.
- *
- * `act` is what the tap does once it is known to be meant for the row: a channel row's is
- * `actOnRow`, which reads aloud in reading mode; a transcript row's (`#431 voice-transcript-expand`)
- * is `foldOnTap` alone, since reading mode reads the CHANNEL's messages and a voice turn is not one.
- */
-function tapRow(li, fold, act = actOnRow) {
-  // A NEW PRESS ENDS ANY OLD GESTURE'S CLAIM on the click. A swipe that commits, or a hold, sets
-  // `suppressNextRowClick` for the click a browser sends after it, and a touch that ends in either
-  // often sends none: the flag then waited for the next tap on any row, and swallowed it — since
-  // `#431 voice-transcript-expand`, a first tap on a transcript card, after a swipe in the channel.
-  // A gesture on this press sets it again after this, as its pointerdown starts it.
-  li.addEventListener("pointerdown", () => {
-    suppressNextRowClick = false;
-  });
-  li.addEventListener("click", inThisColumn((event) => {
-    if (suppressNextRowClick) {
-      suppressNextRowClick = false;
-      return;
-    }
-    // Never steal a tap meant for a control, a link, or a selection the reader is making.
-    const target = event && event.target;
-    if (target && typeof target.closest === "function" && target.closest("button, a, input")) {
-      return;
-    }
-    // `#211 link-filter`. Nor one on the Links view's links, or between them: that is where the
-    // reader opens a link, and a tap there that also folded the row or started reading it aloud
-    // would be two acts for one touch. Walked by hand, as the reply arrow is, so it holds for any
-    // element rather than only for one that has `closest`.
-    const links = showingLinks(li) ? childByClass(li, "row-links") : null;
-    if (links && target && nodeWithin(links, target)) {
-      return;
-    }
-    const selection = typeof getSelection === "function" ? getSelection() : null;
-    if (selection && String(selection) !== "") {
-      return;
-    }
-    act(li, fold, target ? blockTapped(li, target) : null);
-  }));
-}
-
-/**
- * `#376 read-aloud-blocks`. Which block of which message in `li` the tap at `target` landed in, as
- * `{part, block}`; `block` is null where the message was not prepared in blocks, and the answer is
- * null outside every message's body.
- */
-function blockTapped(li, target) {
-  const body = childByClass(li, "body");
-  const boxes = body && body.children ? [...body.children] : [];
-  const part = boxes.findIndex((box) => nodeWithin(box, target));
-  if (part < 0) return null;
-  const drawn = readAloudOwner().preparedBlocksOf(li, part);
-  let block = null;
-  // The innermost: an item nested in another comes after it. `#486 read-aloud-pieces`: and a block
-  // read in pieces from its first piece.
-  (drawn || []).forEach((found, index) => {
-    if (nodeWithin(found.element, target) && (block === null || drawn[block].element !== found.element)) block = index;
-  });
-  return { part, block };
-}
-
-/**
- * What a tap that is meant for the row does to it. `#224 keyboard-shortcuts`: and Enter, or o, on the
- * selected message: the same act, so the key and the tap cannot become two opinions about a row.
- */
-function actOnRow(li, fold, tapped = null) {
-  // IN READING MODE A TAP IS A REQUEST TO HEAR IT, not to fold it. One gesture, two meanings,
-  // decided by a mode the reader turned on deliberately and can see in the control bar.
-  if (readAloudOwner().readingMode) {
-    // `#376 read-aloud-blocks`. A tap on ANOTHER block of the message being read moves the read
-    // there. A tap on the block being read stops it, as a tap on the row always has.
-    const playing = readAloudOwner().nowPlaying;
-    if (tapped && tapped.block !== null && playing !== null && playing.segments &&
-        playing.id === li.getAttribute("data-id")) {
-      const index = playing.segments.findIndex((segment) =>
-        segment.part === tapped.part && segment.block === tapped.block);
-      if (index >= 0 && index !== playing.segment) {
-        readAloudOwner().jumpReading(index);
-        return;
-      }
-    }
-    // EVERY message the row is showing, so a combined row is heard whole rather than half.
-    guardQuietly(() => readAloudOwner().readAloud(idsOf(li)))();
-    return;
-  }
-  // A SHORT message has no fold control, and that is fine: it is already whole. The handler is
-  // still attached to every row, because reading mode has to reach a short message too — gating
-  // this on foldability made the shortest messages the only ones that could not be read aloud.
-  foldOnTap(li, fold);
-}
-
-/**
- * The fold half of a tap on a row: the fold button pressed for it, so the tap and the button are one
- * act. Shared by the channel's rows (`actOnRow`) and the transcript's (`#431 voice-transcript-expand`).
- * Not while the row shows its links in place of its text (`#211 link-filter`): the text is not on
- * screen to be folded, and a fold changed out of sight would surprise the reader later.
- */
-function foldOnTap(li, fold) {
-  if (fold && !showingLinks(li)) {
-    fold.click();
-  }
-}
-
-const SWIPE_START_PX = 12;
-const SWIPE_COMMIT_PX = 90;
-/** How long a finger has to rest before the row offers its details. */
-const HOLD_MS = 450;
-
-/**
- * A gesture that ENDED in an act must not also be read as a tap.
- *
- * A swipe and a press-and-hold both finish with a `pointerup`, and a browser follows that with a
- * `click` — which the row also listens for, to fold. One flag rather than one per row: only one
- * gesture is in flight at a time, and a per-row flag would have to be cleaned up on a list the
- * poll rebuilds underneath it.
- */
-let suppressNextRowClick = false;
-
-function swipeable(li, messages) {
-  const ids = messages.map((m) => String(m.id));
-  let startX = 0;
-  let startY = 0;
-  let dragging = false;
-  let active = false;
-
-  let holdTimer = null;
-  const cancelHold = () => {
-    if (holdTimer !== null) {
-      clearTimeout(holdTimer);
-      holdTimer = null;
-    }
-  };
-
-  const reset = () => {
-    cancelHold();
-    li.style.transform = "";
-    li.style.transition = "";
-    dragging = false;
-    active = false;
-  };
-
-  li.addEventListener("pointerdown", inThisColumn((event) => {
-    // `#221 read-modes`. While the row is the line of a collapsed run it IS that line, and a finger
-    // on it is pressing the line: neither archiving the message under it nor opening its details.
-    if (li.getAttribute("data-read-run") === "head") {
-      return;
-    }
-    if (!event || event.pointerType === "mouse") {
-      return;
-    }
-    // `#204 reply-arrow`. A finger on a reply's arrow is pressing the arrow, not the row: the row
-    // neither follows it sideways nor opens its details under it. A hold there would also leave
-    // `suppressNextRowClick` set behind a click the arrow keeps to itself, and the next tap on any
-    // row would be swallowed by it.
-    const arrow = childByClass(li, "reply-jump");
-    if (arrow && nodeWithin(arrow, event.target)) {
-      return;
-    }
-    // `#215 reply-coalesce`. Nor on the X beside the bridge of gathered replies, for the same reason.
-    const ungather = childByClass(li, "reply-ungather");
-    if (ungather && nodeWithin(ungather, event.target)) {
-      return;
-    }
-    // `#501 thread-bridge-gutter`. Nor on the bridge itself, whose tap glides back to what the
-    // stack hangs from: a finger resting on the line, or sliding off it, is pressing that, not
-    // archiving the reply or opening its details — one act per finger, as with the X.
-    const bridge = childByClass(li, "reply-bridge");
-    if (bridge && nodeWithin(bridge, event.target)) {
-      return;
-    }
-    // `#420 bookmark-clear`. Nor on the bookmark line's X; the line itself takes no taps.
-    if (li.bookmarkLine && nodeWithin(li.bookmarkLine, event.target)) {
-      return;
-    }
-    // `#228 reply-visible`. Nor on the circle at the row's corner, the way down to a reply.
-    if (li.replyMarker && nodeWithin(li.replyMarker, event.target)) {
-      return;
-    }
-    // `#299 all-thread-strip`. Nor on the strip at its left edge, which selects its thread: a finger
-    // resting there, or sliding off it, neither archives the message nor opens its details.
-    if (li.threadStrip && nodeWithin(li.threadStrip, event.target)) {
-      return;
-    }
-    // `#439 search-unmatched-separators`. Nor on a gap's line above or below the row, which shows
-    // its run: a finger there neither archives this message nor opens its details, and a hold
-    // there would leave `suppressNextRowClick` behind a click the line keeps to itself.
-    if ((li.seamLine && nodeWithin(li.seamLine, event.target)) ||
-      (li.seamBelowLine && nodeWithin(li.seamBelowLine, event.target))) {
-      return;
-    }
-    active = true;
-    startX = event.clientX;
-    startY = event.clientY;
-    li.style.transition = "none";
-    // PRESS AND HOLD, on the same pointer stream as the swipe so the two cannot both fire. The
-    // row prints neither the author nor the message id any more; this is where they went.
-    cancelHold();
-    // `#211 link-filter`. Not on a link in the Links view, where a long press is the phone's own:
-    // it shows the address and offers to open or copy it, and the details sheet opening under that
-    // as well would be two answers to one finger. A swipe that starts there is still a swipe.
-    const links = showingLinks(li) ? childByClass(li, "row-links") : null;
-    if (links && nodeWithin(links, event.target)) {
-      return;
-    }
-    // `#409 open-upstream-link`. Nor on the ⋯ menu's own link, for the same reason: a long press
-    // there is how a phone copies its address, which is what the link replaced a Copy item for.
-    const open = childByClass(li, "row-open-link-button");
-    if (open && nodeWithin(open, event.target)) {
-      return;
-    }
-    holdTimer = setTimeout(() => {
-      holdTimer = null;
-      reset();
-      suppressNextRowClick = true;
-      toggleMessageDetails(li, messages);
-    }, HOLD_MS);
-  }));
-
-  li.addEventListener("pointermove", inThisColumn((event) => {
-    if (!active) {
-      return;
-    }
-    const dx = event.clientX - startX;
-    const dy = event.clientY - startY;
-    // Any real travel means this is a swipe or a scroll, not a hold.
-    if (Math.abs(dx) >= SWIPE_START_PX || Math.abs(dy) >= SWIPE_START_PX) {
-      cancelHold();
-    }
-    // The axis is decided ONCE, on the first movement that is big enough to have a direction, and
-    // then held. Re-deciding per event turns a diagonal flick into a row that judders sideways
-    // while the list scrolls under it.
-    if (!dragging) {
-      if (Math.abs(dx) < SWIPE_START_PX && Math.abs(dy) < SWIPE_START_PX) {
-        return;
-      }
-      if (Math.abs(dy) >= Math.abs(dx)) {
-        active = false; // a scroll, not a swipe. Leave it entirely alone.
-        return;
-      }
-      dragging = true;
-    }
-    li.style.transform = `translateX(${dx}px)`;
-  }));
-
-  const finish = (event) => {
-    if (!active) {
-      return;
-    }
-    const dx = dragging ? event.clientX - startX : 0;
-    li.style.transition = "";
-    li.style.transform = "";
-    const committed = Math.abs(dx) >= SWIPE_COMMIT_PX;
-    reset();
-    if (committed) {
-      suppressNextRowClick = true;
-    }
-    if (committed) {
-      // THE SAME ACT the Done button performs, not a second notion of "dealt with": one dismissal,
-      // recorded on the server, with `#50`'s undo behind it. That is what makes this gesture safe
-      // enough to be a gesture — a swipe that did something only this browser remembered, with no
-      // way back, would be the worst control on the page.
-      //
-      // A swipe on an ALREADY archived row puts it back, so the gesture is its own undo on the row
-      // the reader is looking at. Symmetric deliberately: a gesture that only ever went one way
-      // would make the greyed rows a trap.
-      if (selection().view === "thread" && dx > 0) guardQuietly(closeThread)();
-      else guardQuietly(() => toggleArchived(ids, li))();
-    }
-  };
-
-  li.addEventListener("pointerup", inThisColumn(finish));
-  li.addEventListener("pointercancel", inThisColumn(reset));
-}
+// What a finger or the mouse does on a row — a tap, a hold, a swipe — and the one claim a gesture puts on
+// the click behind it are web/src/view/channel's (`createRowGestures`: SWIPE_START_PX, SWIPE_COMMIT_PX,
+// HOLD_MS; `#624 voice-page-modularity`); what each act does is here.
+const rowGestures = createRowGestures({
+  inThisColumn: (fn) => inThisColumn(fn),
+  showingLinks: (row) => showingLinks(row),
+  preparedBlocksOf: (row, part) => readAloudOwner().preparedBlocksOf(row, part),
+  readingMode: () => readAloudOwner().readingMode,
+  nowPlaying: () => readAloudOwner().nowPlaying,
+  jumpReading: (index) => readAloudOwner().jumpReading(index),
+  readAloud: (ids) => guardQuietly(() => readAloudOwner().readAloud(ids))(),
+  idsOf: (row) => idsOf(row),
+  toggleDetails: (row, messages) => toggleMessageDetails(row, messages),
+  swiped: (row, ids, dx) => {
+    if (selection().view === "thread" && dx > 0) guardQuietly(closeThread)();
+    else guardQuietly(() => toggleArchived(ids, row))();
+  },
+});
+const { tapRow, actOnRow, foldOnTap, swipeable } = rowGestures;
 
 // --- two messages that are really one -----------------------------------------------------------
 //
@@ -40066,7 +39801,7 @@ el("scroll-area").addEventListener("pointerup", (event) => {
   const dx = event.clientX - start.x;
   const dy = event.clientY - start.y;
   if (dx >= SWIPE_COMMIT_PX && dx > Math.abs(dy)) {
-    suppressNextRowClick = true;
+    rowGestures.claimClick();
     guardQuietly(closeThread)();
   }
 });

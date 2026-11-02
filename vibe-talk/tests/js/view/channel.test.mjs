@@ -141,3 +141,30 @@ test("`#624 voice-page-modularity`: a card's layout marks and what it stands for
   assert.deepStrictEqual(cardGapTally({ head: { cardMessages: 4, cardMessagesExact: false }, card: true }),
     { messages: 4, threads: 1, exact: false, onlyCards: true });
 });
+
+test("`#624 voice-page-modularity`: a row's tap folds it, or reads it aloud or jumps the reading in reading mode, and a gesture's claim on the click is let go once", () => {
+  const { createRowGestures, HOLD_MS, SWIPE_COMMIT_PX, SWIPE_START_PX } = CHANNEL_VIEW;
+  assert.deepStrictEqual([SWIPE_START_PX, SWIPE_COMMIT_PX, HOLD_MS], [12, 90, 450]);
+  const did = [];
+  let reading = false;
+  let playing = null;
+  const gestures = createRowGestures({
+    inThisColumn: (fn) => fn, showingLinks: () => false, preparedBlocksOf: () => null,
+    readingMode: () => reading, nowPlaying: () => playing, jumpReading: (index) => did.push(["jump", index]),
+    readAloud: (ids) => did.push(["read", ids]), idsOf: () => ["7"], toggleDetails: () => did.push(["details"]),
+    swiped: () => did.push(["swiped"]),
+  });
+  const row = { getAttribute: (name) => (name === "data-id" ? "7" : null) };
+  const fold = { click: () => did.push(["fold"]) };
+  gestures.actOnRow(row, fold);
+  reading = true;
+  gestures.actOnRow(row, fold);
+  playing = { id: "7", segments: [{ part: 0, block: 0 }, { part: 0, block: 1 }], segment: 0 };
+  gestures.actOnRow(row, fold, { part: 0, block: 1 });
+  gestures.actOnRow(row, fold, { part: 0, block: 0 });
+  assert.deepStrictEqual(did, [["fold"], ["read", ["7"]], ["jump", 1], ["read", ["7"]]]);
+  assert.equal(gestures.takeClaimedClick(), false);
+  gestures.claimClick();
+  assert.equal(gestures.takeClaimedClick(), true);
+  assert.equal(gestures.takeClaimedClick(), false, "a claim was let go twice");
+});

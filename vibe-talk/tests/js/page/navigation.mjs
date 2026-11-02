@@ -175,9 +175,11 @@ test("THE SWIPE DRIVES THE SAME DISMISSAL THE DONE BUTTON DOES, NOT A SECOND ONE
   // this browser knew, with no undo, would be the worst control on the page.
   //
   // So there is exactly one notion of "dealt with", it is the server's, and the swipe posts to it.
+  // The swipe's mechanics are web/src/view/channel's (`createRowGestures`); what a swipe that went
+  // far enough does is the page's `swiped`, and it is the row's own Done (`toggleArchived`).
   assert.match(
-    SCRIPT_CODE,
-    /function swipeable\([\s\S]*?toggleArchived\(/,
+    PAGE_CODE,
+    /swiped: \(row, ids, dx\) => \{[\s\S]*?toggleArchived\(ids, row\)/,
     "the swipe does not go through the same act the row's button uses"
   );
   // ...and that shared act is the SERVER's, both ways. The swipe archives an ordinary row and puts

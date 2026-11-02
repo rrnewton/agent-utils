@@ -190,6 +190,8 @@ declare const EDITED_MARK: LegacyImports["EDITED_MARK"];
 declare const freshenDayTitle: LegacyImports["freshenDayTitle"];
 declare const rowTimeTabStop: LegacyImports["rowTimeTabStop"];
 declare const timeNode: LegacyImports["timeNode"];
+declare const SWIPE_COMMIT_PX: LegacyImports["SWIPE_COMMIT_PX"];
+declare const createRowGestures: LegacyImports["createRowGestures"];
 declare const createSeamLines: LegacyImports["createSeamLines"];
 declare const rowTime: LegacyImports["rowTime"];
 declare const anchorsAmong: LegacyImports["anchorsAmong"];

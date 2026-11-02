@@ -9,7 +9,7 @@ import { join } from "node:path";
 
 import { WEB } from "../../../web/page_sources.mjs";
 
-import { BASE_CSS, BIG, BIG_ROOT, CHANNEL, CHARS_PER_LINE, CSS_CODE, CSS_UNCONDITIONAL,
+import { brokenModule, BASE_CSS, BIG, BIG_ROOT, CHANNEL, CHARS_PER_LINE, CSS_CODE, CSS_UNCONDITIONAL,
   DESKTOP_QUERY, DISCORD_POLL_MS, FakeElement, HOLD_MS, HOVER_QUERY, HTML_CODE, LINE_PX,
   MESSAGE_CACHE_KEY, OTHER_CHANNEL, PRESENT_ROWS, SCRIPT, SCRIPT_CODE, SCROLLBACK_PX,
   SCROLL_VIEWPORT_PX, SETTINGS, SMALL, THREADS_MAIN_STORAGE, TWO_COLUMN_QUERY, UNPACK_STORAGE,
@@ -1912,7 +1912,8 @@ test("`#299 all-thread-strip`: neither selecting nor letting go reads, marks or 
   assert.equal(page.timelineCalls.length, reads, "selecting a thread read the channel");
   assert.equal(page.dismissCalls.length, dismissed, "selecting a thread marked something read");
   // A finger on the strip: no swipe follows it and no hold opens the details.
-  for (const run of [SCRIPT, brokenScript("    if (li.threadStrip && nodeWithin(li.threadStrip, event.target)) {\n      return;\n    }\n", "")]) {
+  const passOver = await brokenModule([{ file: "src/view/channel/gestures.ts", find: "      if (within(li.threadStrip, event.target)) return;\n", replace: "" }]);
+  for (const run of [SCRIPT, passOver]) {
     const probe = newPage(new Map(), run);
     const data = threadData();
     probe.threadingSupported = true;
