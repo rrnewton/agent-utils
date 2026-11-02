@@ -30034,7 +30034,7 @@ function filterSideCards() {
     if (row.hidden === kept) row.hidden = !kept;
     setClassWord(row, "search-hidden", !said);
     markReplyMatch(row, inReplies);
-    // `#249 search-highlight`. And where, once the typing pauses (`markedQuery`): the card's own
+    // `#249 search-highlight`. And where, once the typing pauses (`searchField.marked()`): the card's own
     // words, whatever its replies matched.
     markSearchHits(row, own || inReplies ? marking : []);
     if (fresh) unread += 1;
@@ -35875,7 +35875,7 @@ el("search-field").addEventListener("input", () => {
   keepingFilterPlace(() => liftingHideRead(() => {
     searchField.setQuery(el("search-field").value);
     // `#249 search-highlight`. Cleared — no word left to find — the marks go with the words, in this
-    // one redraw; otherwise they follow once the typing pauses (`markedQuery`).
+    // one redraw; otherwise they follow once the typing pauses (`searchField.marked()`).
     if (!searchTyped(searchField.query())) searchField.setMarked(searchField.query());
     eachColumn(renderScrollTools);
     if (sideColumnUp()) refilterSideCards();
