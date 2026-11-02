@@ -819,29 +819,34 @@ def run(
     inherit_runner_authority: bool = False,
 ) -> Outcome:
     started = time.monotonic()
+    proc = subprocess.Popen(
+        [*cmd, *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=_env(
+            extra_env,
+            inherit_runner_authority=inherit_runner_authority,
+        ),
+        start_new_session=True,
+    )
     try:
-        proc = subprocess.run(
-            [*cmd, *args],
-            capture_output=True,
-            text=True,
-            env=_env(
-                extra_env,
-                inherit_runner_authority=inherit_runner_authority,
-            ),
-            start_new_session=True,
-            check=False,
-            timeout=timeout_s,
-        )
-    except subprocess.TimeoutExpired as exc:
-        stdout = exc.stdout if isinstance(exc.stdout, str) else ""
-        stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+        stdout, stderr = proc.communicate(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        # Kill the whole session group: killing only the direct child leaks
+        # grandchildren that keep fixture locks and cascade timeouts.
+        try:
+            os.killpg(proc.pid, 9)
+        except (ProcessLookupError, PermissionError):
+            proc.kill()
+        stdout, stderr = proc.communicate()
         return Outcome(
             124,
-            stdout,
-            stderr + f"\nTIMEOUT after {timeout_s:g} seconds",
+            stdout or "",
+            (stderr or "") + f"\nTIMEOUT after {timeout_s:g} seconds",
             time.monotonic() - started,
         )
-    return Outcome(proc.returncode, proc.stdout, proc.stderr, time.monotonic() - started)
+    return Outcome(proc.returncode, stdout, stderr, time.monotonic() - started)
 
 
 def run_until_stdout_contains(

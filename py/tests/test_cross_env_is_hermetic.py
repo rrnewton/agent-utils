@@ -1886,24 +1886,24 @@ def test_no_edition_inherits_the_callers_standard_input(
     edition, _ = _recording_edition(tmp_path)
     harness = herdr_agent.Harness(tmp_path / "cross", edition, edition)
     inputs: list[object] = []
-    real_run = subprocess.run
+    real_popen = subprocess.Popen
 
-    def recording_run(*args: object, **kwargs: object) -> object:
+    def recording_popen(*args: object, **kwargs: object) -> object:
         inputs.append(kwargs.get("stdin", "inherited"))
-        return real_run(*args, **kwargs)  # type: ignore[call-overload]
+        return real_popen(*args, **kwargs)  # type: ignore[call-overload]
 
     class _Launched(Exception):
         pass
 
-    def recording_popen(*_: object, **kwargs: object) -> object:
+    def launching_popen(*_: object, **kwargs: object) -> object:
         inputs.append(kwargs.get("stdin", "inherited"))
         raise _Launched
 
     try:
         case = harness.case("standard-input")
-        monkeypatch.setattr(subprocess, "run", recording_run)
-        harness.invoke(case, ("mcp", *herdr_agent.FIXTURE_HERDR))
         monkeypatch.setattr(subprocess, "Popen", recording_popen)
+        harness.invoke(case, ("mcp", *herdr_agent.FIXTURE_HERDR))
+        monkeypatch.setattr(subprocess, "Popen", launching_popen)
         with pytest.raises(_Launched):
             herdr_agent._cross_process_serialization(harness, herdr_agent.Report())
     finally:

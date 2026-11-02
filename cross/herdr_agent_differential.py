@@ -27,6 +27,101 @@ from typing import cast
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TIMEOUT_SECONDS = 30
+
+
+def _tree_cpu_seconds(pid: int) -> float | None:
+    """User+system CPU seconds of `pid` and its live descendants, or None if gone.
+
+    The direct child often waits on its own children (a fixture shell, git),
+    so only the whole tree's CPU shows whether the call is making progress.
+    """
+    ticks_per_second = os.sysconf("SC_CLK_TCK")
+    parents: dict[int, int] = {}
+    cpu_ticks: dict[int, int] = {}
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / "stat").read_text(encoding="utf-8")
+        except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError):
+            continue
+        close = stat.rfind(")")
+        if close < 0:
+            continue
+        fields = stat[close + 2:].split()
+        try:
+            child_pid = int(entry.name)
+            parents[child_pid] = int(fields[1])  # ppid after comm/state
+            cpu_ticks[child_pid] = int(fields[11]) + int(fields[12])  # utime + stime
+        except (IndexError, ValueError):
+            continue
+    if pid not in cpu_ticks:
+        return None
+    children: dict[int, list[int]] = {}
+    for child_pid, parent_pid in parents.items():
+        children.setdefault(parent_pid, []).append(child_pid)
+    total = 0
+    stack = [pid]
+    while stack:
+        current = stack.pop()
+        total += cpu_ticks.get(current, 0)
+        stack.extend(children.get(current, ()))
+    return total / ticks_per_second
+
+
+def run_tolerant(
+    command: Sequence[str],
+    *,
+    timeout_s: float,
+    cwd: Path | None = None,
+    env: Mapping[str, str] | None = None,
+    stdin: int | None = None,
+    encoding: str | None = None,
+    errors: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run a child with a CPU-starvation-tolerant budget and group cleanup.
+
+    The budget is spent as CPU/idle time, not raw wall: a child that keeps
+    burning CPU gets up to four times the wall budget, a child that makes no
+    CPU progress for `timeout_s` is hung, and either way the whole process
+    group is killed so grandchildren cannot leak and hold fixture locks
+    (the old timeout path killed only the direct child and cascaded).
+    """
+    stdout_file = tempfile.TemporaryFile(mode="w+")
+    stderr_file = tempfile.TemporaryFile(mode="w+")
+    proc = subprocess.Popen(  # noqa: S603 - differential harness command
+        list(command), stdout=stdout_file, stderr=stderr_file,
+        start_new_session=True, text=True, cwd=cwd,
+        env=dict(env) if env is not None else None, stdin=stdin,
+        encoding=encoding, errors=errors,
+    )
+    started = time.monotonic()
+    last_progress = started
+    last_cpu = 0.0
+    timed_out = False
+    while proc.poll() is None:
+        now = time.monotonic()
+        cpu = _tree_cpu_seconds(proc.pid)
+        if cpu is not None and cpu > last_cpu + 0.05:
+            last_cpu = cpu
+            last_progress = now
+        idle = now - last_progress
+        if idle > timeout_s or last_cpu > 2 * timeout_s or now - started > 4 * timeout_s:
+            timed_out = True
+            try:
+                os.killpg(proc.pid, 9)
+            except (ProcessLookupError, PermissionError):
+                proc.kill()
+            break
+        time.sleep(0.1)
+    proc.wait()
+    stdout_file.seek(0)
+    stderr_file.seek(0)
+    stdout = stdout_file.read()
+    stderr = stderr_file.read()
+    if timed_out:
+        raise subprocess.TimeoutExpired(list(command), timeout_s, output=stdout, stderr=stderr)
+    return subprocess.CompletedProcess(list(command), proc.returncode, stdout, stderr)
 _MESSAGE_ID = re.compile(r"\b\d{20,}-\d+\b")
 
 
@@ -1292,19 +1387,16 @@ class Harness:
         for variable in empty_environment:
             environment[variable] = ""
         try:
-            completed = subprocess.run(
+            completed = run_tolerant(
                 [*command, *expanded],
+                timeout_s=TIMEOUT_SECONDS,
                 cwd=root,
                 env=environment,
                 # Not the caller's: the `agentctl mcp` server would read requests from it, and a
                 # request can name a goal command after the guard has checked the command line.
                 stdin=subprocess.DEVNULL,
-                capture_output=True,
-                text=True,
                 encoding="utf-8",
                 errors="replace",
-                check=False,
-                timeout=TIMEOUT_SECONDS,
             )
             outcome = Outcome(completed.returncode, completed.stdout, completed.stderr)
         except subprocess.TimeoutExpired as error:
