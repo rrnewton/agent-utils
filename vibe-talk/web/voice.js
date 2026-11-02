@@ -28537,11 +28537,34 @@ const quoteOwner = createQuoting({
   readOnly: (channel) => knownChannel(channel)?.writable === false,
   replyMarksRead: (message, text) => replyMarksRead(message, text),
   queueOutgoingMessage: (send) => queueOutgoingMessage(send),
+  toStream: (row, message, text) => quickReplyToStream(row, message, text),
 });
 const {
   noteQuoteSelection, takeQuote, placeSelectionChip, pressSelectionChip, quickReplyHolds,
-  quickReplyListMoved, placeQuickReply, closeQuickReply, sendQuickReply,
+  quickReplyListMoved, placeQuickReply, closeQuickReply, putDownQuickReply, sendQuickReply,
 } = quoteOwner;
+
+/**
+ * `#727 vt-selection-quick-reply`. A quick reply put down by a tap outside it with words in it: they, under
+ * their quote, become the message's reply draft, ahead of any draft it had (a blank line between), and its
+ * reply opens in the stream under it, shown and open, as Reply opens it, in the column drawing it. Without
+ * taking the focus: the tap was going somewhere, and the reader sees the box without being put in it.
+ *
+ * @param {HTMLElement} row the row the box was opened on
+ * @param {any} message
+ * @param {string} text the quote and what was written
+ */
+function quickReplyToStream(row, message, text) {
+  const id = String(message.id);
+  const prior = drafts.get(id) || "";
+  drafts.set(id, prior.trim() ? `${text}\n\n${prior}` : text);
+  persistDrafts();
+  renderDraftMarkers();
+  // The row the box was opened on, unless a redraw has replaced it since: then the one drawing the message.
+  const drawn = row.parentNode && rowShown(row) ? row : paneRowFor(channelPane, id) || paneRowFor(sidePane, id);
+  const column = drawn && listPane(drawn) === sidePane ? columns.side : columns.main;
+  inColumn(column, () => openReply(drawn ? rowMessages(drawn) : [message], drawn, "", false));
+}
 
 /**
  * What the reply box was opened with when it was opened with a quote, and the draft that was there
@@ -36795,8 +36818,8 @@ document.addEventListener("selectionchange", noteQuoteSelection);
 // `#726 vt-selection-chip`. Pressed without taking the selection or the focus from the words it quotes.
 leftEl("selection-chip").addEventListener("mousedown", (event) => event.preventDefault());
 leftEl("selection-chip").addEventListener("click", pressSelectionChip);
-// `#727 vt-selection-quick-reply`. The floating box: its keys, Send and Cancel, a tap outside, and the list
-// the reader moves letting it go.
+// `#727 vt-selection-quick-reply`. The floating box: its keys, Send and Cancel, a tap outside (which puts
+// what was written back under its message: `putDownQuickReply`), and the list the reader moves letting it go.
 el("quick-reply-send").addEventListener("click", () => guardQuietly(sendQuickReply)());
 el("quick-reply-cancel").addEventListener("click", () => closeQuickReply());
 el("quick-reply-text").addEventListener("keydown", (event) => {
@@ -36813,7 +36836,7 @@ document.addEventListener("pointerdown", (event) => {
   if (!quoteOwner.quickReplyOpen()) return;
   const target = /** @type {any} */ (event && event.target);
   if (target && (nodeWithin(el("quick-reply"), target) || nodeWithin(leftEl("selection-chip"), target))) return;
-  closeQuickReply();
+  putDownQuickReply();
 }, { capture: true });
 document.addEventListener("scroll", (event) => quickReplyListMoved(event && event.target), { capture: true, passive: true });
 if (window.visualViewport && typeof window.visualViewport.addEventListener === "function") {

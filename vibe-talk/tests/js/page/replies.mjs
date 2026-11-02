@@ -4235,6 +4235,55 @@ test("`#727 vt-selection-quick-reply`: Send posts the quoted reply in the messag
   assert.notEqual(control.openArrivedTop, control.top, "with the list not held it stayed put anyway, so this test cannot see it");
 });
 
+test("`#727 vt-selection-quick-reply`: a tap outside puts what was written back under its message, open and shown; with nothing written it just closes", async () => {
+  // The owner, 2026-11-02: "if I click anywhere else in the screen my drafted reply should go back to the
+  // normal position under the current message and should be open and visible. It shouldn't just disappear."
+  for (const desk of [false, true]) {
+    const where = desk ? "at a desk" : "on a phone";
+    const page = await quickPage({ desk });
+    // Nothing written: the box closes, and nothing opens in its place.
+    await quickReplyTo(page, 9);
+    await page.documentEvent("pointerdown", { target: rowWithId(page, "1000000000000000002") });
+    await page.settle();
+    assert.equal(page.el("quick-reply").hidden, true, `${where}: a tap outside left an empty box up`);
+    assert.equal(page.el("column-reply").hidden, true, `${where}: an empty box opened a reply in the stream`);
+    // Words written: the box goes, and they are the message's reply, open under it with their quote.
+    await quickReplyTo(page, 3);
+    await page.el("quick-reply-text").setValue("half a thought");
+    await page.documentEvent("pointerdown", { target: rowWithId(page, "1000000000000000002") });
+    await page.settle();
+    assert.equal(page.el("quick-reply").hidden, true, `${where}: a tap outside left the box up`);
+    assert.equal(page.el("column-reply").hidden, false, `${where}: a tap outside hid the draft: no reply open under the message`);
+    assert.equal(page.el("reply-text").value, `> ${QUICK_SENTENCES[3]}\n\nhalf a thought`,
+      `${where}: the reply under the message is not the quote and what was written`);
+    assert.match(page.el("reply-target-meta").textContent, new RegExp(`id ${QUICK_LONG}$`),
+      `${where}: the draft went under another message`);
+    assert.notEqual(page.document.activeElement, page.el("reply-text"), `${where}: the tap's focus was taken into the reply`);
+    assert.equal(page.repliesPosted.length, 0, `${where}: a tap outside sent the reply`);
+    // The box holds nothing for those words now: the draft is the reply's, where it can be seen.
+    await quickReplyTo(page, 3);
+    assert.equal(page.el("quick-reply-text").value, "", `${where}: the draft was kept in the box as well`);
+    await page.el("quick-reply-cancel").click();
+    // Put down, the reply keeps it as the message's draft, and Reply brings it back.
+    await page.el("reply-cancel").click();
+    await page.settle();
+    assert.equal(page.el("column-reply").hidden, true);
+    await page.documentEvent("pointerdown", { target: rowWithId(page, "1000000000000000002") });
+    await replyButton(rowWithId(page, QUICK_LONG)).click();
+    await page.settle();
+    assert.equal(page.el("reply-text").value, `> ${QUICK_SENTENCES[3]}\n\nhalf a thought`, `${where}: the draft was not kept`);
+    await page.el("reply-cancel").click();
+    // A draft the message had already stays, after the one put down.
+    await quickReplyTo(page, 5);
+    await page.el("quick-reply-text").setValue("and another");
+    await page.documentEvent("pointerdown", { target: rowWithId(page, "1000000000000000002") });
+    await page.settle();
+    assert.equal(page.el("reply-text").value,
+      `> ${QUICK_SENTENCES[5]}\n\nand another\n\n> ${QUICK_SENTENCES[3]}\n\nhalf a thought`,
+      `${where}: the message's earlier draft was lost`);
+  }
+});
+
 test("`#727 vt-selection-quick-reply`: replies to several sentences in a row, each its own quote, the list never moving", async () => {
   const page = await quickPage();
   const area = page.el("scroll-area");
@@ -4249,7 +4298,7 @@ test("`#727 vt-selection-quick-reply`: replies to several sentences in a row, ea
   assert.equal(page.repliesPosted.length, 3);
 });
 
-test("`#727 vt-selection-quick-reply`: Esc or a tap outside closes the box, keeping what was written for the same words", async () => {
+test("`#727 vt-selection-quick-reply`: Esc or Cancel closes the box, keeping what was written for the same words", async () => {
   const page = await quickPage();
   const area = page.el("scroll-area");
   const top = area.scrollTop;
@@ -4262,13 +4311,13 @@ test("`#727 vt-selection-quick-reply`: Esc or a tap outside closes the box, keep
   // The same words again: the draft is back. Other words: an empty box.
   await quickReplyTo(page, 3);
   assert.equal(page.el("quick-reply-text").value, "half a thought", "the draft for the same words was lost");
-  await page.documentEvent("pointerdown", { target: rowWithId(page, "1000000000000000002") });
-  assert.equal(page.el("quick-reply").hidden, true, "a tap outside did not close the box");
+  await page.el("quick-reply-cancel").click();
+  assert.equal(page.el("quick-reply").hidden, true, "Cancel did not close the box");
   await quickReplyTo(page, 9);
   assert.equal(page.el("quick-reply-text").value, "", "another sentence's box opened with a draft");
   await page.el("quick-reply-cancel").click();
   await quickReplyTo(page, 3);
-  assert.equal(page.el("quick-reply-text").value, "half a thought", "a tap outside lost the draft");
+  assert.equal(page.el("quick-reply-text").value, "half a thought", "Cancel lost the draft");
   // A tap inside the box is not outside.
   await page.documentEvent("pointerdown", { target: page.el("quick-reply-text") });
   assert.equal(page.el("quick-reply").hidden, false, "a tap in the box closed it");

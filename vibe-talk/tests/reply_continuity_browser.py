@@ -918,6 +918,38 @@ QUICK_JS = """(id) => {
 }"""
 
 
+# Where to tap outside the open box: in the message being read, on the screen, clear of the box.
+OUTSIDE_JS = """(id) => {
+  const area = document.getElementById('scroll-area').getBoundingClientRect();
+  const row = [...document.querySelectorAll('#discord-log > li[data-id]')].find((li) => li.dataset.id === id);
+  const r = row.getBoundingClientRect();
+  const quick = document.getElementById('quick-reply');
+  const top = Math.max(r.top, area.top) + 8;
+  const bottom = Math.min(r.bottom, area.bottom) - 8;
+  for (let y = top; y <= bottom; y += 12) {
+    const x = r.left + 12;
+    const at = document.elementFromPoint(x, y);
+    if (at && !quick.contains(at) && row.contains(at)) return {x, y};
+  }
+  return {x: r.left + 12, y: top};
+}"""
+
+# The reply a tap outside left open: what it holds, the message it answers, and where its box stands.
+PUT_DOWN_JS = """(id) => {
+  const area = document.getElementById('scroll-area').getBoundingClientRect();
+  const row = [...document.querySelectorAll('#discord-log > li[data-id]')].find((li) => li.dataset.id === id);
+  const compose = document.getElementById('reply-compose');
+  const r = compose.getBoundingClientRect();
+  const meta = document.getElementById('reply-target-meta').textContent || '';
+  return {
+    text: document.getElementById('reply-text').value,
+    target: (meta.match(/id (\\S+)$/) || [])[1] || null,
+    box: compose.getClientRects().length ? {top: r.top, bottom: r.bottom} : null,
+    areaTop: area.top, areaBottom: area.bottom, rowTop: row ? row.getBoundingClientRect().top : null,
+  };
+}"""
+
+
 def quick_messages() -> list[Json]:
     """The ordinary channel, its last message a long one of the agent's."""
     messages = [message(index) for index in range(COUNT)]
@@ -1022,8 +1054,39 @@ def quick_reply_walk(walk: Walk) -> None:
     walk.settled()
     after = state()
     still(after, "the answer arriving")
+    # The owner, 2026-11-02: a tap anywhere else must never hide what was written. With words in the box,
+    # a tap outside it puts them, under their quote, in the message's reply, open and shown under it.
+    page.evaluate(SELECTION_JS, [row_id, 31, 70, True])
+    walk.wait_for("() => !document.getElementById('selection-chip').hidden", "quick, put down: no chip under the words")
+    walk.press("#selection-chip")
+    walk.wait_for("() => !document.getElementById('quick-reply').hidden", "quick, put down: the chip opened no box")
+    walk.settled()
+    page.fill("#quick-reply-text", "half a thought")
+    before = len(walk.api.replies)
+    point: object = page.evaluate(OUTSIDE_JS, row_id)
+    assert isinstance(point, dict)
+    page.mouse.click(num(point["x"]), num(point["y"]))
+    walk.wait_for("() => document.getElementById('quick-reply').hidden", "quick, put down: a tap outside left the box up")
+    walk.wait_for("() => !document.getElementById('column-reply').hidden",
+                  "quick, put down: a tap outside hid the draft: no reply open under the message")
+    walk.settled()
+    put: object = page.evaluate(PUT_DOWN_JS, row_id)
+    assert isinstance(put, dict)
+    written = str(put.get("text", ""))
+    walk.check(written.startswith("> ") and written.endswith("\n\nhalf a thought"),
+               f"quick, put down: the reply under the message holds {written!r}")
+    walk.check(put.get("target") == row_id, f"quick, put down: the reply is under another message: {put}")
+    box = put.get("box")
+    walk.check(isinstance(box, dict) and float(box["top"]) >= num(put["areaTop"]) - 0.5
+               and float(box["bottom"]) <= num(put["areaBottom"]) + 0.5,
+               f"quick, put down: the reply's box is not on the screen: {put}")
+    walk.check(isinstance(box, dict) and float(box["top"]) >= num(put["rowTop"]),
+               f"quick, put down: the reply's box is not under its message: {put}")
+    walk.check(len(walk.api.replies) == before, "quick, put down: the tap sent something")
+    walk.shot("quick-put-down")
     walk.notes.append("three quick replies from the foot of the list, each from the chip under its words, posted "
-                      "quoted with the list's scroll unchanged through opening, sending and two arrivals")
+                      "quoted with the list's scroll unchanged through opening, sending and two arrivals; a "
+                      "fourth, written and tapped away from, open with its quote under the message")
 
 
 def triple_click_case(walk: Walk, list_box: dict[str, float]) -> None:

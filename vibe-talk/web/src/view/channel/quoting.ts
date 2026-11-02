@@ -63,8 +63,14 @@
 //     (`replyRoute(message, true)`), so it joins the thread the message heads or starts it, and on a
 //     provider with no threads answers by pointer. It goes through the same outbox as every send, and
 //     marks the message read as Reply does, unless its quote covers too little of it (`replyMarksRead`).
-//   * ESC OR A TAP OUTSIDE closes it, keeping what was written for the same words of the same message:
-//     the chip on that selection again brings it back. Send clears it.
+//   * ESC closes it, keeping what was written for the same words of the same message: the chip on that
+//     selection again brings it back. Send clears it.
+//   * A TAP OUTSIDE NEVER HIDES WHAT WAS WRITTEN. The owner, 2026-11-02: "if I accidentally click anywhere
+//     else on the screen, my draft is lost. ... if it's hidden from the UI, I have no way to discover it.
+//     So I think if I click anywhere else in the screen my drafted reply should go back to the normal
+//     position under the current message and should be open and visible." With words in it, the box's
+//     quote and words become the message's reply draft and its reply opens in the stream under it, as
+//     Reply opens it (`putDownQuickReply`); with none, the box just closes.
 
 import type { Message } from "../../contract/index.ts";
 import { quoteBlock } from "../../present/rows/index.ts";
@@ -151,6 +157,12 @@ export interface QuotingDependencies {
   replyMarksRead(message: Message, text: string): string | null;
   /** Hand a send to the outbox; resolves when it is done with. */
   queueOutgoingMessage(send: QuickReplySend): Promise<unknown>;
+  /**
+   * Put a quick reply's words back under the message they answer: `text`, the quote and what was written,
+   * as `message`'s reply draft, its reply open and shown in the stream under `row`, the row the box was
+   * opened on (or the row drawing that message now).
+   */
+  toStream(row: QuotedRow, message: Message, text: string): void;
 }
 
 /** The quoting owner's commands. */
@@ -177,6 +189,8 @@ export interface Quoting {
   placeQuickReply(): void;
   /** Close the quick reply, keeping what was written for the same words. */
   closeQuickReply(): void;
+  /** A tap outside the box: what was written goes back under its message, open and shown; nothing written, it closes. */
+  putDownQuickReply(): void;
   /** Send the quick reply, then close it. */
   sendQuickReply(): Promise<void>;
 }
@@ -452,6 +466,24 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
     deps.byId("quick-reply-text").blur();
   }
 
+  /**
+   * A tap outside the open box. Nothing written: it closes. Words written: they go under their quote into
+   * the message's reply in the stream, open and shown under it (`toStream`), and the box closes holding
+   * nothing for those words, the draft being the stream reply's now, where it can be seen.
+   */
+  function putDownQuickReply(): void {
+    const open = quickReply;
+    if (!open) return;
+    const written = deps.byId("quick-reply-text").value;
+    if (!written.trim()) {
+      closeQuickReply();
+      return;
+    }
+    deps.byId("quick-reply-text").value = "";
+    closeQuickReply();
+    deps.toStream(open.row, open.message, `${quoteBlock(open.quote)}${written}`);
+  }
+
   /** Send the quick reply: the quoted words and what was written, in the message's thread; then close it. */
   async function sendQuickReply(): Promise<void> {
     const open = quickReply;
@@ -488,7 +520,7 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
   return {
     held: () => quoteHeld, holdQuote, noteQuoteSelection, takeQuote, placeSelectionChip, pressSelectionChip,
     quickReplyHolds, quickReplyListMoved, quickReplyOpen: () => quickReply !== null, placeQuickReply,
-    closeQuickReply, sendQuickReply,
+    closeQuickReply, putDownQuickReply, sendQuickReply,
   };
 }
 
