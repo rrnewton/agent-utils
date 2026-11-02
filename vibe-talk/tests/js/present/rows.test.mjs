@@ -357,3 +357,29 @@ test("`#624 voice-page-modularity`: the kinds of link under Links and URL, kept 
   kinds.reloadRaw();
   assert.equal(kinds.raw(), true);
 });
+
+test("`#624 voice-page-modularity`: the order of the Threads view's cards, kept on the device, from the module alone", () => {
+  const { THREAD_ORDERS, THREAD_ORDER_KEY, THREAD_ORDER_NAMES, cardTime, createThreadOrder, inThreadOrder, threadOrderAfter } = ROWS;
+  assert.deepStrictEqual([...THREAD_ORDER_NAMES], ["updated", "created"]);
+  assert.deepStrictEqual(THREAD_ORDER_NAMES.map(threadOrderAfter), ["created", "updated"]);
+  assert.deepStrictEqual([cardTime({ at: 5, started: 2 }), cardTime({ started: 2 }), cardTime({})], [5, 2, 0]);
+  assert.equal(THREAD_ORDERS.created.time({ at: 9, started: 3 }), 3);
+  assert.equal(THREAD_ORDERS.created.time({ at: 9 }), 9);
+  // The read keeps the newest first; the default reverses it, any other sorts stably by its time.
+  const read = [{ id: "c", at: 30, started: 1 }, { id: "b", at: 20, started: 5 }, { id: "a", at: 10, started: 5 }];
+  assert.deepStrictEqual(inThreadOrder(read, "updated").map((one) => one.id), ["a", "b", "c"]);
+  assert.deepStrictEqual(inThreadOrder(read, "created").map((one) => one.id), ["c", "a", "b"]);
+  const kept = new Map([[THREAD_ORDER_KEY, "retired"]]);
+  let refuse = false;
+  const storage = { getItem: (key) => kept.get(key) ?? null,
+    setItem: (key, value) => { if (refuse) throw new Error("refused"); kept.set(key, value); } };
+  const order = createThreadOrder({ storage: () => storage });
+  assert.equal(order.current(), "updated", "an order this page does not know was kept");
+  order.set("created");
+  assert.deepStrictEqual([order.current(), kept.get(THREAD_ORDER_KEY), order.stored()], ["created", "created", "created"]);
+  order.set("nonsense");
+  assert.equal(order.current(), "updated");
+  refuse = true;
+  order.set("created");
+  assert.equal(order.current(), "created", "a refused write lost the choice for this session");
+});

@@ -32323,65 +32323,24 @@ function mainRowsFromKeyboard() {
 // among the cards by when they were posted, against each card's time in the order chosen. Only over the
 // Threads view's cards, as its neighbours are; two columns' cards stay by latest update.
 
-/** The device's choice of order for the Threads view's cards: a key of `THREAD_ORDERS`. */
-const THREAD_ORDER_KEY = "vibe-talk.voice.thread-order";
-
-/**
- * The orders the Threads view's cards can be in, the first the default, in the order a press goes round
- * them: what the chip says (whole, and on a phone), what its tooltip says a press does, and the time a
- * card stands at, oldest first, the newest at the foot.
- *
- * @type {Record<string, {name: string, short: string, says: string, time: (choice: any) => number}>}
- */
-const THREAD_ORDERS = {
-  updated: {
-    name: "Latest update", short: "Latest", says: "the threads by when each last moved",
-    time: (choice) => cardTime(choice),
-  },
-  created: {
-    name: "Thread created", short: "Created", says: "the threads by when each was started",
-    time: (choice) => (Number.isFinite(choice.started) ? choice.started : cardTime(choice)),
-  },
-};
-
-/** The orders' names, in the order a press goes round them. */
-const THREAD_ORDER_NAMES = Object.keys(THREAD_ORDERS);
-
-/** The order as kept, or the default where none is, or one this page no longer knows. */
-function storedThreadOrder() {
-  try {
-    const kept = deviceStorage().getItem(THREAD_ORDER_KEY);
-    return kept && Object.prototype.hasOwnProperty.call(THREAD_ORDERS, kept) ? kept : THREAD_ORDER_NAMES[0];
-  } catch (_error) {
-    return THREAD_ORDER_NAMES[0];
-  }
-}
+// The orders, their words and times, the cards put in one, and the order chosen, kept on this device,
+// are web/src/present/rows's (`createThreadOrder`, `#624 voice-page-modularity`).
 
 /** The order the Threads view's cards are in. */
-let threadOrder = storedThreadOrder();
+const threadOrders = createThreadOrder({ storage: () => deviceStorage() });
 
 /** The order the cards on screen are drawn in: the one chosen over the Threads view's cards, else the default. */
-const cardOrderOnScreen = () => (threadListOnScreen() && columns.side.mode === "list" ? threadOrder : THREAD_ORDER_NAMES[0]);
-
-/** `choices` in order `order`, oldest first: the default as the thread list's read keeps them, any other by its time. */
-function inThreadOrder(choices, order) {
-  const oldest = [...choices].reverse();
-  if (order === THREAD_ORDER_NAMES[0]) return oldest;
-  const time = THREAD_ORDERS[order].time;
-  // Stable, so threads at the same time keep the default's order among them.
-  return oldest.map((choice, at) => ({ choice, at, when: time(choice) }))
-    .sort((a, b) => a.when - b.when || a.at - b.at).map((one) => one.choice);
-}
+const cardOrderOnScreen = () => (threadListOnScreen() && columns.side.mode === "list" ? threadOrders.current() : THREAD_ORDER_NAMES[0]);
 
 /** The order chip: offered over the Threads view's cards, as Main channel is, saying the order they are in. */
 function renderOrderToggle() {
   const button = leftEl("side-order");
   const offered = columns.side.mode === "list" && threadListShown;
   if (button.hidden === offered) button.hidden = !offered;
-  const order = THREAD_ORDERS[threadOrder];
-  const next = THREAD_ORDERS[THREAD_ORDER_NAMES[(THREAD_ORDER_NAMES.indexOf(threadOrder) + 1) % THREAD_ORDER_NAMES.length]];
+  const order = THREAD_ORDERS[threadOrders.current()];
+  const next = THREAD_ORDERS[threadOrderAfter(threadOrders.current())];
   // Pressed in any order but the default, as the other chips are pressed when they change the list.
-  const pressed = threadOrder === THREAD_ORDER_NAMES[0] ? "false" : "true";
+  const pressed = threadOrders.current() === THREAD_ORDER_NAMES[0] ? "false" : "true";
   if (button.getAttribute("aria-pressed") !== pressed) button.setAttribute("aria-pressed", pressed);
   const label = `Order: ${order.name}`;
   if (button.getAttribute("aria-label") !== label) button.setAttribute("aria-label", label);
@@ -32398,12 +32357,7 @@ function renderOrderToggle() {
  * it is brought into view).
  */
 function setThreadOrder(order) {
-  threadOrder = Object.prototype.hasOwnProperty.call(THREAD_ORDERS, order) ? order : THREAD_ORDER_NAMES[0];
-  try {
-    deviceStorage().setItem(THREAD_ORDER_KEY, threadOrder);
-  } catch (_error) {
-    // A browser that refuses storage still honours the choice for this session.
-  }
+  threadOrders.set(order);
   renderOrderToggle();
   sideCardsDrawn = "";
   if (!sideColumnUp()) return;
@@ -32420,13 +32374,13 @@ function setThreadOrder(order) {
 }
 
 /** The next order after the one the cards are in. */
-const nextThreadOrder = () => THREAD_ORDER_NAMES[(THREAD_ORDER_NAMES.indexOf(threadOrder) + 1) % THREAD_ORDER_NAMES.length];
+const nextThreadOrder = () => threadOrderAfter(threadOrders.current());
 
 /** d, over the Threads view: the cards in the next order. Elsewhere, nothing. */
 function orderFromKeyboard() {
   if (!threadListOnScreen() || columns.side.mode !== "list") return false;
   setThreadOrder(nextThreadOrder());
-  setStatus(`Threads in order of ${THREAD_ORDERS[threadOrder].name.toLowerCase()}.`);
+  setStatus(`Threads in order of ${THREAD_ORDERS[threadOrders.current()].name.toLowerCase()}.`);
   return true;
 }
 
@@ -32446,11 +32400,6 @@ function mainRowMessages(carded) {
     return !hidingRead() || stillToDo(message, channelStore.current().dismissed) || sentFromThisPage(message);
   });
   return inTimeOrder(messages, "timestamp");
-}
-
-/** When a card's thread last moved, for its place among Main's messages: its newest activity, or its start. */
-function cardTime(choice) {
-  return Number.isFinite(choice.at) ? choice.at : Number.isFinite(choice.started) ? choice.started : 0;
 }
 
 /** While Main's rows are built: they offer the way into a thread, as All's do, and point at nothing. */
@@ -36593,7 +36542,7 @@ function applySyncedSetting(key) {
         break;
       }
       case THREADS_MAIN_KEY: setMainRowsShown(storedMainRows()); break;
-      case THREAD_ORDER_KEY: setThreadOrder(storedThreadOrder()); break;
+      case THREAD_ORDER_KEY: setThreadOrder(threadOrders.stored()); break;
       case THREAD_CARD_FOLD_KEY: setThreadCardFolded(storedThreadCardFolded()); break;
       case IDENTITY_KEY: {
         // `#488 slack-app-agents`. Another device said who an account is: every row it wrote is
