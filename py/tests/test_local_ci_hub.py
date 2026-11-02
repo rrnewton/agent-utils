@@ -98,9 +98,11 @@ def _row_ref_repo(tmp_path: Path) -> tuple[Path, Path]:
     evidence.mkdir()
     (repo / "local-ci-hub.toml").write_text(
         '[project]\nname="toy"\n[validate]\ncommand=["/bin/true"]\n'
-        'admission_slots=2\n[ledger]\nteam="toy"\npublish="none"\n'
+        'admission_slots=2\n[ledger]\nteam="toy"\npublish="none"\ncounted_repos=["primary"]\n'
         f'evidence_root="{evidence}"\nlocation={{path="ci-ledger"}}\n'
-        '[remote]\nprovider="none"\n[receipt]\nqualifying=["local-ledger-pass"]\nrequire_full_evidence=true\n[land]\nstate_dir="ignored/local-ci-hub"\n')
+        '[remote]\nprovider="none"\n[receipt]\nqualifying=["local-ledger-pass"]\nrequire_full_evidence=true\n'
+        'release_payload={path="target/validate/app", profile="validate", debug_assertions=true, overflow_checks=true}\n'
+        '[land]\nstate_dir="ignored/local-ci-hub"\n')
     subprocess.run(["git", "add", "-A"], cwd=repo, timeout=15)
     subprocess.run(["git", "commit", "-qm", "toy: init"], cwd=repo, timeout=15)
     return repo, evidence
@@ -211,38 +213,38 @@ def test_row_ref_missing_evidence_refuses(tmp_path: Path) -> None:
 
 
 def test_superseded_release_builder_does_not_qualify(tmp_path: Path) -> None:
-    # Mirrors ci-hub release_builder_of ignoring release_payloads_superseded:
-    # a PASS carrying the superseded target/debug/hermit identity must not
-    # qualify even though this config sets no release_payload.
+    # A PASS carrying a superseded release identity must not qualify:
+    # only the configured current identity names a builder.
     repo, evidence = _row_ref_repo(tmp_path)
     sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
     superseded = dict(_full_row(sha, "r1", finished_at="2026-09-30T00:00:00Z"),
                       release_builder="cargo",
-                      e2e_payload={"path": "target/debug/hermit", "profile": "debug",
+                      e2e_payload={"path": "target/debug/app", "profile": "debug",
                                    "debug_assertions": True, "overflow_checks": True})
     _write_ledger(repo, [_row_ref_event(evidence, superseded, event_id="e1")])
     out = run_cli(repo, "--json", "receipt", "show", "HEAD")
     assert json.loads(out.stdout)["verdict"] != "qualified"
-    # The current cargo identity still qualifies (the refusal is the superseded payload, not the fields).
+    # The configured current identity still qualifies (the refusal is the superseded payload, not the fields).
     current = dict(superseded, run_id="r2",
-                   e2e_payload={"path": "target/validate/hermit", "profile": "validate",
+                   e2e_payload={"path": "target/validate/app", "profile": "validate",
                                 "debug_assertions": True, "overflow_checks": True})
     _write_ledger(repo, [_row_ref_event(evidence, current, event_id="e2")])
     out = run_cli(repo, "--json", "receipt", "show", "HEAD")
     assert json.loads(out.stdout)["verdict"] == "qualified"
 
 
-def test_reverie_row_in_hermit_shard_does_not_count(tmp_path: Path) -> None:
-    # Mirrors ci-hub _HERMIT_REPOS filtering: a schema-3 repo=reverie row
-    # physically inside the Hermit shard is not Hermit evidence.
+def test_peer_row_in_primary_shard_does_not_count(tmp_path: Path) -> None:
+    # A row naming a different repository is foreign evidence, even
+    # when physically inside this ledger's shard: only the configured
+    # counted repositories (and rows with no repo) count.
     repo, evidence = _row_ref_repo(tmp_path)
     sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
-    reverie = dict(_full_row(sha, "r1"), repo="reverie", schema_version=3)
-    _write_ledger(repo, [_row_ref_event(evidence, reverie, event_id="e1")])
+    peer = dict(_full_row(sha, "r1"), repo="peer", schema_version=3)
+    _write_ledger(repo, [_row_ref_event(evidence, peer, event_id="e1")])
     out = run_cli(repo, "--json", "receipt", "show", "HEAD")
     assert json.loads(out.stdout)["verdict"] != "qualified"
-    hermit = dict(reverie, run_id="r2", repo="hermit")
-    _write_ledger(repo, [_row_ref_event(evidence, hermit, event_id="e2")])
+    primary = dict(peer, run_id="r2", repo="primary")
+    _write_ledger(repo, [_row_ref_event(evidence, primary, event_id="e2")])
     out = run_cli(repo, "--json", "receipt", "show", "HEAD")
     assert json.loads(out.stdout)["verdict"] == "qualified"
 

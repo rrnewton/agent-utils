@@ -8,19 +8,12 @@ from pathlib import Path
 from .config import Config
 from .ledger import Ledger
 
-# Canonical current release identity, mirrored from ci-hub
-# `validate/qualifying-receipt.json` (`release_payloads.cargo`, read through
-# `release_builder_of` in ci-hub `qualifying_receipt.py`). That reader ignores
-# the `release_payloads_superseded` map, so a superseded identity (for example
-# the pre-2026-10-01 `target/debug/hermit` cargo payload) never names a builder
-# for landing. Mirror that here: an identity claim is honoured only when it is
-# exactly the current cargo identity (or the configured `release_payload`).
-_CANONICAL_CARGO_PAYLOAD: dict[str, object] = {
-    "path": "target/validate/hermit",
-    "profile": "validate",
-    "debug_assertions": True,
-    "overflow_checks": True,
-}
+# The canonical current release identity is configured via
+# `[receipt.release_payload]` in local-ci-hub.toml. A superseded
+# identity never names a builder for landing: an identity claim is
+# honoured only when it is exactly the configured payload. When no
+# payload is configured there is no canonical identity to compare
+# against, so a well-formed pair makes no failing claim.
 
 
 def _canonical_json(value: object) -> str:
@@ -30,11 +23,13 @@ def _canonical_json(value: object) -> str:
 def _release_identity_ok(cfg: Config, r: dict[str, object]) -> bool:
     """Whether a row's release_builder/e2e_payload claim may qualify.
 
-    Mirrors ci-hub `qualifying_receipt.release_builder_of`: the two fields are
-    read together, a lone field names no builder, and a payload that is not
-    exactly the current identity for its builder (including every superseded
-    identity, which that reader ignores) names no builder. A row carrying
-    neither field makes no identity claim and is judged by the other clauses.
+    The two fields are read together: a lone field names no builder,
+    and a payload that is not exactly the configured identity
+    (including every superseded identity) names no builder. A row
+    carrying neither field makes no identity claim and is judged by
+    the other clauses. When no release_payload is configured there
+    is no canonical identity, so a well-formed pair is not refused
+    on identity grounds.
     """
     has_builder = "release_builder" in r
     has_payload = "e2e_payload" in r
@@ -42,11 +37,10 @@ def _release_identity_ok(cfg: Config, r: dict[str, object]) -> bool:
         return True
     if not (has_builder and has_payload):
         return False
-    expected = cfg.release_payload if cfg.release_payload is not None else _CANONICAL_CARGO_PAYLOAD
-    if cfg.release_payload is None and r.get("release_builder") != "cargo":
-        return False
+    if cfg.release_payload is None:
+        return True
     try:
-        return _canonical_json(r.get("e2e_payload")) == _canonical_json(expected)
+        return _canonical_json(r.get("e2e_payload")) == _canonical_json(cfg.release_payload)
     except (TypeError, ValueError):
         return False
 
