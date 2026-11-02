@@ -1773,6 +1773,12 @@ empty-composer and at-most-once checks still apply. A blocking question is not a
 working composer, even when Herdr's status has not caught up with the screen.
 Slash commands still wait for idle or done.
 
+A message that must never block its sender on a busy agent — a coordinator's
+notice, a restore's catch-up — goes with `send --queue-only`: the prompt is
+durable in the target's queue and the command returns at once with outcome
+`pending` and the prompt's ID; the next drain types it. It refuses a duplicate
+`--message-id`, exactly as a draining send does.
+
 The Rust edition also delivers ordinary follow-ups to a working Muse pane by
 default. Muse keeps its editor typeable while a turn runs: Enter there steers the
 running turn, and Muse prints the prompt at once as a new user turn above the

@@ -236,6 +236,8 @@ class Sessions(ManagedAgents):
             warning = agent.prompt_size_check(text)
             if warning is not None:
                 print(f"agentctl send: {warning}", file=sys.stderr)
+            if options.pop("queue_only", False):
+                return asdict(super().queue_only(name, text, message_id=message_id, expected_token=record.token))
             return asdict(super().send(name, text, message_id=message_id, expected_token=record.token, **options))
         if message_id is not None:
             raise AgentDeliveryError("headless requests use monotonically numbered turns; message-id is interactive-only")

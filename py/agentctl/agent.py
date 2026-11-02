@@ -1186,6 +1186,31 @@ def enqueue(
         )
 
 
+def queue_only(
+    root: str, target: Target, text: str, *, message_id: str | None = None,
+    max_artifact_bytes: int | None = None, atomic_policy: AtomicWritePolicy | None = None,
+) -> QueueResult:
+    """Queue one prompt and return at once, without draining it (#746 restore-im-back).
+
+    A coordinator message must never sit inside a send for minutes while its
+    target is mid-turn: the prompt is durable in the queue the moment this
+    returns, and the next drain types it. The outcome is always ``pending``.
+    """
+    with atomic_write_policy(atomic_policy):
+        _bind_queue(
+            root, target, max_artifact_bytes=max_artifact_bytes,
+            allow_legacy_workspace_binding=True,
+        )
+        identifier = _enqueue(
+            root, text, message_id=message_id, serialize=message_id is not None,
+            max_artifact_bytes=max_artifact_bytes,
+        )
+        return QueueResult(
+            message_id=identifier, delivered=(), quarantined=(),
+            pending=(identifier,), blocked=None, outcome="pending",
+        )
+
+
 def _enqueue(
     root: str,
     text: str,

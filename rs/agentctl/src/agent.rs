@@ -2327,6 +2327,40 @@ pub(crate) fn send_priority_managed<A: AgentApi + ?Sized>(
     )
 }
 
+/// Queue one prompt and return at once, without draining it (#746 restore-im-back).
+///
+/// A coordinator message must never sit inside a send for minutes while its target is
+/// mid-turn: the prompt is durable in the queue the moment this returns, and the next
+/// drain (the target's own service, a later send, `agentctl drain`) types it. The
+/// outcome is always `pending` with the prompt's identifier in `pending`.
+pub(crate) fn queue_identified_managed(
+    target: &Target,
+    root: &Path,
+    text: &str,
+    not_after: Option<u64>,
+    message_id: Option<&str>,
+) -> AgentResult<QueueResult> {
+    let runtime = SystemRuntime::default();
+    bind_queue_with_runtime(root, target, &runtime, true)?;
+    let identifier = enqueue_internal(
+        root,
+        text,
+        message_id,
+        message_id.is_some(),
+        not_after,
+        &runtime,
+    )?;
+    Ok(QueueResult {
+        message_id: identifier.clone(),
+        delivered: Vec::new(),
+        quarantined: Vec::new(),
+        pending: vec![identifier],
+        cancelled: Vec::new(),
+        blocked: None,
+        outcome: QueueOutcome::Pending,
+    })
+}
+
 pub(crate) fn send_identified_managed<A: AgentApi + ?Sized>(
     client: &A,
     target: &Target,
@@ -4357,6 +4391,36 @@ mod tests {
             expected_workspace: Some("acme".to_owned()),
             expected_cwd: Some(PathBuf::from("/work/mtg")),
         }
+    }
+
+    #[test]
+    fn queue_only_persists_the_prompt_and_returns_pending_without_typing() {
+        let directory = TestDirectory::new("queue-only");
+        let fake = FakeAgent::new(&["idle"]);
+        let result = queue_identified_managed(
+            &target(),
+            directory.path(),
+            "queued for later",
+            None,
+            Some("queue-only-1"),
+        )
+        .expect("queue");
+        assert_eq!(result.outcome, QueueOutcome::Pending);
+        assert_eq!(result.message_id, "queue-only-1");
+        assert_eq!(result.pending, ["queue-only-1"]);
+        // Nothing was typed or run: the prompt sits durable in the inbox, and a
+        // duplicate explicit ID is refused, as a send's is.
+        let inbox = directory.path().join("inbox").join("queue-only-1.json");
+        assert!(inbox.is_file(), "prompt is durable in the queue");
+        assert!(fake.state.lock().expect("fake state").runs.is_empty());
+        assert!(queue_identified_managed(
+            &target(),
+            directory.path(),
+            "queued for later",
+            None,
+            Some("queue-only-1"),
+        )
+        .is_err());
     }
 
     #[test]

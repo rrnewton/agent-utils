@@ -10158,6 +10158,30 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         self.send_holding_no_lock_while_waiting(agent_name, text, options, message_id, false)
     }
 
+    /// Queue a prompt for an interactive agent and return at once, without waiting
+    /// for its pane (#746): the prompt is durable in its queue and typed by the next
+    /// drain. Headless and cloud agents already return once journaled, so callers
+    /// that must not block use their ordinary send for those.
+    pub fn queue_identified(
+        &self,
+        agent_name: &str,
+        text: &str,
+        not_after: Option<u64>,
+        message_id: Option<&str>,
+    ) -> Result<QueueResult> {
+        let (_lock, _probe) =
+            self.delivery_lock(agent_name, DrainOptions::default(), message_id, false)?;
+        let record = self.load(agent_name)?;
+        if record.is_headless() || record.is_cloud() {
+            return Err(fail(
+                "queue-only applies to interactive agents; headless and cloud sends return once journaled",
+            ));
+        }
+        record.input_allowed()?;
+        let queue = self.queue(&record.name)?;
+        agent::queue_identified_managed(&self.target(&record)?, &queue, text, not_after, message_id)
+    }
+
     /// Submit through an injected runtime that can interrupt bounded readiness waits.
     pub(crate) fn send_identified_with_runtime(
         &self,

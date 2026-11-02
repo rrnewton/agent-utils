@@ -1314,6 +1314,9 @@ struct Send {
     /// Hard wall-clock limit in seconds for the whole send, counted from its start: waits for the agent's lock, the queue and pane locks, and readiness all end by then, and a send that has not typed its prompt gives up with exit 75, leaving the prompt pending (safe to retry) and every lock released. A prompt being typed is finished first (bounded by --working-timeout). Interactive agents only (default: send_deadline_seconds in the registry's settings.json, else 600)
     #[arg(long, value_name = "SECONDS", value_parser = positive_seconds)]
     deadline: Option<f64>,
+    /// Queue the prompt and return at once with outcome pending, without waiting for the agent's pane: for messages that must never block on a mid-turn agent, such as a coordinator's or a restore's. The prompt is durable in the queue and typed by the next drain. Interactive agents only (headless and cloud sends already return once journaled)
+    #[arg(long, conflicts_with_all = ["urgent", "deadline"])]
+    queue_only: bool,
     #[command(flatten)]
     delivery: Delivery,
 }
@@ -3911,6 +3914,16 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 manager.send_cloud(&value.agent.name, &text, value.message_id.as_deref())?
             } else if let Some(refusal) = interactive_prompt_size(&text) {
                 return Err(refusal);
+            } else if value.queue_only {
+                let not_after = value.ttl.map(|ttl| {
+                    crate::agent::now_millis().saturating_add((ttl * 1000.0).ceil() as u64)
+                });
+                json!(manager.queue_identified(
+                    &value.agent.name,
+                    &text,
+                    not_after,
+                    value.message_id.as_deref(),
+                )?)
             } else if value.urgent {
                 manager.send_urgent(
                     &value.agent.name,

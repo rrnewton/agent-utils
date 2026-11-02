@@ -26,6 +26,21 @@ from .test_agentctl_adopt import prepare_legacy_dead, setup_foreign
 from .test_herdr_subagents import FakeManagedClient, setup
 
 
+def test_send_queue_only_persists_pending_without_typing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), brief="first task")
+    submitted_before = list(fake.submitted)
+    result = manager.queue_only("worker", "queued for later", message_id="queue-only-1")
+    assert result.outcome == "pending"
+    assert result.message_id == "queue-only-1"
+    assert result.pending == ("queue-only-1",)
+    assert fake.submitted == submitted_before
+    queue = Path(manager._queue("worker"))
+    assert (queue / "inbox" / "queue-only-1.json").is_file()
+    with pytest.raises(AgentDeliveryError):
+        manager.queue_only("worker", "queued for later", message_id="queue-only-1")
+
+
 def test_start_holds_its_generation_lock_through_brief_and_returned_status(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     manager, fake = setup(tmp_path, monkeypatch)
     original_info = fake.pane_info
