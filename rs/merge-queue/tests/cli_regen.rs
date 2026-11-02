@@ -176,6 +176,51 @@ fn regeneration_that_touches_other_files_ejects_the_change() {
 }
 
 #[test]
+fn failing_generator_command_ejects_with_regeneration_build_kind() {
+    // A generator that exits non-zero is a build failure, not an output
+    // failure: it must eject under `regeneration-build`, distinct from the
+    // `regeneration` kind used when the generator runs but touches files
+    // outside the generated set (see the test above).
+    let fx = setup(
+        "regen-build-fails",
+        &["--regen-path", "gen/", "--regen-command", "exit 3"],
+    );
+    source_change(&fx, "b");
+    source_change(&fx, "c");
+    fx.mq_ok(&["submit", "1", "--head", "b"]);
+    fx.mq_ok(&["submit", "2", "--head", "c"]);
+    let r = report(&fx.mq_ok(&["run", "--json"]));
+    assert!(landed(&r).is_empty(), "{r}");
+    let ejected = r["ejected"].as_array().unwrap();
+    assert!(
+        !ejected.is_empty() && ejected.iter().all(|e| e["kind"] == "regeneration-build"),
+        "failing generator must eject as regeneration-build, got: {r}"
+    );
+    assert!(
+        ejected.iter().all(|e| e["reason"]
+            .as_str()
+            .unwrap()
+            .contains("regenerate.command failed")),
+        "build failure reason must name the command failure: {r}"
+    );
+    // The human report (same run data, rendered as text) carries the
+    // distinct kind as well: run a fresh queue and read its text report.
+    let fx2 = setup(
+        "regen-build-fails-text",
+        &["--regen-path", "gen/", "--regen-command", "exit 3"],
+    );
+    source_change(&fx2, "b");
+    source_change(&fx2, "c");
+    fx2.mq_ok(&["submit", "1", "--head", "b"]);
+    fx2.mq_ok(&["submit", "2", "--head", "c"]);
+    let text = fx2.mq_ok(&["run"]);
+    assert!(
+        text.contains("regeneration-build"),
+        "report must render regeneration-build: {text}"
+    );
+}
+
+#[test]
 fn regenerate_always_refreshes_stale_generated_files() {
     let fx = setup(
         "regen-always",

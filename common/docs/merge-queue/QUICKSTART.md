@@ -66,6 +66,24 @@ merge-queue obligations     # focused landings still owed a complete run
 merge-queue widen           # run the complete suite once and discharge them
 ```
 
+**Shadow / soak kit.** Rehearse beside the live process without moving the real base. Point the
+queue at the hosting service once, then keep it in sync with only the labelled ready set, and run
+the daemon in shadow mode:
+
+```bash
+merge-queue init --remote origin --base main --github-repo OWNER/NAME --land push
+merge-queue sync --label ready   # only open PRs with the `ready` label are the ready set
+merge-queue serve --shadow       # plans, validates and would land; real base never moves
+```
+
+`sync --label ready` syncs only the labelled ready set: in one batched API call it lists open,
+non-draft pull requests carrying `ready`, submits new ones and heads that moved, and withdraws
+only what this same label source added when the label is removed. Direct `submit` entries are
+never withdrawn by a label sync, drafts are never ready, and with `require_approval_at_head` a
+labelled pull request also needs an approving review at its current head. Use `--all-open` only
+for measurements that deliberately want every open pull request; a shadow soak that should mirror
+what people marked ready uses `--label`.
+
 The runner reads the selected test IDs from `$MQ_TESTS` and writes one JSON line per test to
 `$MQ_RESULTS` (`{"id":"t1","outcome":"pass"}`); the user guide has a complete ten-line runner.
 With `--depth 2` (the default), two batches validate at once, the second on top of the first;

@@ -129,8 +129,10 @@ pub struct RegenerateConfig {
     /// Path patterns of generated files: an exact path, a directory (`dir/` or `dir`), or a
     /// pattern with `*` wildcards (matching any characters, `/` included).
     pub paths: Vec<String>,
-    /// Shell command, run at the repository root of a checkout, that rewrites every generated
-    /// file from its sources. It must be deterministic and touch nothing else.
+    /// Shell command, run as `sh -c` at the root of a scratch checkout of the candidate
+    /// tip, that rewrites every generated file from its sources. It must be deterministic
+    /// (byte-identical output for the same sources) and touch nothing else. The queue runs
+    /// it with `MQ_PR`, `MQ_REGEN_PATHS` and `MQ_CONFLICTED` set.
     pub command: String,
     /// `conflict` (default): regenerate when a change's conflicts are confined to generated
     /// paths; a batch that touches generated files also has its final tip regenerated, because
@@ -201,6 +203,8 @@ pub struct GitHubConfig {
     /// `owner/name`.
     pub repo: String,
     /// Command (and leading arguments) to run instead of `gh`, e.g. a pacing wrapper.
+    /// When empty, the `FLEET_REAL_GH` environment variable is honoured as a fallback
+    /// (see `github::resolve_gh_command`); an explicit value always wins.
     pub gh: Vec<String>,
     /// Requests allowed per rolling hour (0 = 60).
     pub max_per_hour: u32,

@@ -104,7 +104,9 @@ pub struct Landed {
 pub struct Ejection {
     /// Change number.
     pub pr: i64,
-    /// Stable kind: `failed-tests` or `conflict`.
+    /// Stable kind: `failed-tests`, `conflict`, `regeneration` (generator
+    /// ran but its output was unacceptable) or `regeneration-build`
+    /// (the generator command itself failed to run or exited non-zero).
     pub kind: String,
     /// Human explanation.
     pub reason: String,
@@ -344,8 +346,8 @@ impl Candidate {
     }
 }
 
-/// Changes that did not combine onto a candidate: number, kind (`conflict` or
-/// `regeneration`), and detail.
+/// Changes that did not combine onto a candidate: number, kind (`conflict`,
+/// `regeneration`, `regeneration-build` or `not-fast-forward`), and detail.
 type Uncombined = Vec<(i64, &'static str, String)>;
 
 /// Outcome of handling one batch.
@@ -877,9 +879,9 @@ impl<'a> Runner<'a> {
                         regenerated = true;
                         done
                     }
-                    Err(why) => {
+                    Err((kind, why)) => {
                         skipped.insert(*pr);
-                        conflicts.push((*pr, "regeneration", why));
+                        conflicts.push((*pr, kind, why));
                         continue;
                     }
                 }
@@ -920,12 +922,12 @@ impl<'a> Runner<'a> {
                             *flag = true;
                         }
                     }
-                    Err(why) => {
+                    Err((kind, why)) => {
                         let pr = kept.pop().unwrap();
                         prefixes.pop();
                         prefix_regenerated.pop();
                         prefix_touched.pop();
-                        conflicts.push((pr, "regeneration", why));
+                        conflicts.push((pr, kind, why));
                         tip = prefixes
                             .last()
                             .cloned()
@@ -955,23 +957,28 @@ impl<'a> Runner<'a> {
     }
 
     /// Rewrite the generated files on `tip` (which just combined `pr`) with the configured
-    /// command and commit the result. `Ok(Err(why))` means this change cannot be regenerated.
+    /// command and commit the result. `Ok(Err((kind, why)))` means this change cannot be
+    /// regenerated: `kind` is `regeneration-build` when the generator command itself
+    /// failed (spawn error or non-zero exit) and `regeneration` when it ran but its
+    /// output was unacceptable (it touched files outside the generated set, or
+    /// conflict markers remain). `Err` means the run itself cannot continue.
     fn regenerate(
         &self,
         tip: &str,
         pr: i64,
         conflicted: &[String],
-    ) -> Result<Result<String, String>, String> {
+    ) -> Result<Result<String, (&'static str, String)>, String> {
         let regen = &self.config.regenerate;
         if !regen.enabled() {
-            return Ok(Err(
+            return Ok(Err((
+                "regeneration",
                 "generated files conflict but no regeneration is configured".into(),
-            ));
+            )));
         }
         let slot = self.slots.take();
-        let result = (|| -> Result<Result<String, String>, String> {
+        let result = (|| -> Result<Result<String, (&'static str, String)>, String> {
             let checkout = self.slots.checkout(slot, tip)?;
-            let output = Command::new("sh")
+            let output = match Command::new("sh")
                 .arg("-c")
                 .arg(&regen.command)
                 .current_dir(&checkout)
@@ -980,14 +987,25 @@ impl<'a> Runner<'a> {
                 .env("MQ_CONFLICTED", conflicted.join(" "))
                 .stdin(std::process::Stdio::null())
                 .output()
-                .map_err(|error| format!("cannot run regenerate.command: {error}"))?;
+            {
+                Ok(output) => output,
+                Err(error) => {
+                    return Ok(Err((
+                        "regeneration-build",
+                        format!("cannot run regenerate.command: {error}"),
+                    )))
+                }
+            };
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let tail: Vec<&str> = stderr.lines().rev().take(3).collect();
-                return Ok(Err(format!(
-                    "regenerate.command failed (exit {}): {}",
-                    output.status.code().unwrap_or(-1),
-                    tail.into_iter().rev().collect::<Vec<_>>().join(" | ")
+                return Ok(Err((
+                    "regeneration-build",
+                    format!(
+                        "regenerate.command failed (exit {}): {}",
+                        output.status.code().unwrap_or(-1),
+                        tail.into_iter().rev().collect::<Vec<_>>().join(" | ")
+                    ),
                 )));
             }
             let mut wt = Git::new(&checkout);
@@ -1006,13 +1024,16 @@ impl<'a> Runner<'a> {
             changed.dedup();
             let stray: Vec<&String> = changed.iter().filter(|path| !regen.covers(path)).collect();
             if !stray.is_empty() {
-                return Ok(Err(format!(
-                    "regenerate.command changed files that are not generated: {}",
-                    stray
-                        .iter()
-                        .map(|p| p.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                return Ok(Err((
+                    "regeneration",
+                    format!(
+                        "regenerate.command changed files that are not generated: {}",
+                        stray
+                            .iter()
+                            .map(|p| p.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
                 )));
             }
             for path in conflicted.iter().chain(&changed) {
@@ -1021,8 +1042,9 @@ impl<'a> Runner<'a> {
                     .lines()
                     .any(|line| line.starts_with("<<<<<<< ") || line.starts_with(">>>>>>> "))
                 {
-                    return Ok(Err(format!(
-                        "conflict markers remain in {path} after regeneration"
+                    return Ok(Err((
+                        "regeneration",
+                        format!("conflict markers remain in {path} after regeneration"),
                     )));
                 }
             }
@@ -1124,7 +1146,7 @@ impl<'a> Runner<'a> {
         let pr = candidate.prs[i - 1];
         let done = match self.regenerate(&raw, pr, &[])? {
             Ok(done) => done,
-            Err(why) => {
+            Err((_, why)) => {
                 return Err(format!(
                     "cannot regenerate prefix {} for #{pr}: {why}",
                     short(&raw)
@@ -1205,6 +1227,10 @@ impl<'a> Runner<'a> {
                 ),
                 "not-fast-forward" => format!(
                     "must land as its own commits (another repository requires its exact head), but it is not on top of {detail}{context}; rebase it and update what requires it"
+                ),
+                "regeneration-build" => format!(
+                    "regeneration command failed for generated files onto {}{context}: {detail}; fix the generator and resubmit",
+                    short(parent)
                 ),
                 _ => format!(
                     "generated files could not be regenerated onto {}{context}: {detail}",

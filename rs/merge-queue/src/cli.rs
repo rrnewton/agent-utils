@@ -81,7 +81,9 @@ enum Command {
         /// Repeatable.
         #[arg(long, value_name = "PATTERN")]
         regen_path: Vec<String>,
-        /// Shell command, run at a checkout's root, that rewrites every generated file.
+        /// Shell command, run as `sh -c` at the root of the candidate checkout, that
+        /// rewrites every generated file deterministically. Runs with `MQ_PR`,
+        /// `MQ_REGEN_PATHS` and `MQ_CONFLICTED` set.
         #[arg(long, default_value = "")]
         regen_command: String,
         /// When to regenerate: `conflict` (only when conflicts are confined to generated files)
@@ -114,7 +116,8 @@ enum Command {
         #[arg(long, default_value = "")]
         github_repo: String,
         /// Command (and leading arguments) to run instead of `gh`, e.g. a pacing wrapper.
-        /// Repeatable.
+        /// Repeatable. When unset, `FLEET_REAL_GH` (shell-style words) is used as a
+        /// fallback on fleet hosts; an explicit `--gh` always wins.
         #[arg(long, value_name = "WORD", allow_hyphen_values = true)]
         gh: Vec<String>,
         /// API requests allowed per rolling hour across this queue's calls (0 = 60).

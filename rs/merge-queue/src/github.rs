@@ -19,6 +19,30 @@ use crate::state::GitHubConfig;
 /// Default requests per rolling hour when the configuration names none.
 pub const DEFAULT_MAX_PER_HOUR: u32 = 60;
 
+/// Environment variable naming the real `gh` executable for fleet hosts.
+/// On those hosts `gh` on `PATH` may be a stub or pacing wrapper; the
+/// variable points at the real GitHub CLI. It is a fallback only: an
+/// explicitly configured `github.gh` (via `init --gh`) always wins.
+pub const FLEET_REAL_GH_ENV: &str = "FLEET_REAL_GH";
+
+/// Resolve the `gh` command words: a non-empty configured command wins,
+/// then the `FLEET_REAL_GH` environment supplement (shell-style words),
+/// then plain `gh` on `PATH`. This mirrors `MERGE_QUEUE_AGENTCTL` for
+/// notifications.
+pub fn resolve_gh_command(config_gh: &[String], fleet_env: Option<&str>) -> Vec<String> {
+    if !config_gh.is_empty() {
+        return config_gh.to_vec();
+    }
+    if let Some(env) = fleet_env.filter(|env| !env.trim().is_empty()) {
+        if let Ok(words) = shell_words::split(env) {
+            if !words.is_empty() {
+                return words;
+            }
+        }
+    }
+    vec!["gh".to_owned()]
+}
+
 /// Requests recorded in the rolling hour.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Ledger {
@@ -244,11 +268,8 @@ impl Hosting {
 
     fn run(&self, cost: u32, args: &[String]) -> Result<String, String> {
         self.budget.charge(cost)?;
-        let program: Vec<String> = if self.config.gh.is_empty() {
-            vec!["gh".to_owned()]
-        } else {
-            self.config.gh.clone()
-        };
+        let fleet_env = std::env::var(FLEET_REAL_GH_ENV).ok();
+        let program: Vec<String> = resolve_gh_command(&self.config.gh, fleet_env.as_deref());
         let output = Command::new(&program[0])
             .args(&program[1..])
             .args(args)
@@ -362,6 +383,30 @@ mod unit {
         // No reviews at all: not approved.
         let pr = parse(format!(r#"{{"number":1,"headRefOid":"{head}"}}"#));
         assert!(!pr.approved_at_head());
+    }
+
+    #[test]
+    fn gh_command_prefers_config_then_fleet_env_then_plain_gh() {
+        let config = vec!["configured".to_owned(), "--fast".to_owned()];
+        assert_eq!(
+            resolve_gh_command(&config, Some("/real/gh")),
+            config,
+            "configured gh must win over the fleet supplement"
+        );
+        assert_eq!(
+            resolve_gh_command(&[], Some("/real/gh")),
+            vec!["/real/gh".to_owned()]
+        );
+        assert_eq!(
+            resolve_gh_command(&[], Some("/real/gh --pager off")),
+            vec![
+                "/real/gh".to_owned(),
+                "--pager".to_owned(),
+                "off".to_owned()
+            ]
+        );
+        assert_eq!(resolve_gh_command(&[], None), vec!["gh".to_owned()]);
+        assert_eq!(resolve_gh_command(&[], Some("  ")), vec!["gh".to_owned()]);
     }
 
     #[test]

@@ -92,7 +92,7 @@ This command creates the state directory and writes `config.json`.
 | `--max-depth N` | `0` | The largest the adaptive window may grow: +1 per landed batch, halved per red batch, never below 1. `0` keeps the window fixed at `--depth`. |
 | `--union-path PATTERN` | none | A Git attribute pattern merged with Git's `union` driver, when probing conflicts and when combining changes. Repeatable. Only for line-oriented, append-only files (see "Union merges"). |
 | `--regen-path PATTERN` | none | A generated file (exact path, directory with or without a trailing slash, or `*` wildcards) whose conflicts the queue resolves by regenerating it instead of holding the change. Repeatable. See "Generated files". |
-| `--regen-command CMD` | empty | Shell command, run at a checkout's root, that rewrites every generated file from its sources. Required with `--regen-path`. |
+| `--regen-command CMD` | empty | Shell command, run as `sh -c` at the root of the candidate checkout, that rewrites every generated file from its sources deterministically. Runs with `MQ_PR` (change number), `MQ_REGEN_PATHS` (space-separated generated patterns) and `MQ_CONFLICTED` (space-separated conflicted paths, empty for a non-conflict refresh) set. Required with `--regen-path`. |
 | `--regen-when WHEN` | `conflict` | `conflict`: regenerate when a change's conflicts are confined to generated files; a batch that touches generated files also has its final tip regenerated, because a textual merge of generated files need not be the regenerated output. `always`: also after every change, so a combination never leaves a generated file stale. |
 | `--exact-sha` | off | Exact-commit rule: never carry a validation result to another commit. See "The exact-commit rule". |
 | `--trust-base` | off | Treat the base as green in culprit searches and skip probing it. Sound when only this queue lands on the base, always as exactly validated commits; a broken base would then be blamed on the first change of a red batch. |
@@ -100,7 +100,7 @@ This command creates the state directory and writes `config.json`.
 | `--peer NAME=DIR` | none | A peer queue: another repository's merge-queue state directory. Repeatable. See "Changes across repositories". |
 | `--identity-name NAME`, `--identity-email EMAIL` | Git's configuration | Identity for commits the queue creates: committer of replayed commits, author and committer of merge and regeneration commits. |
 | `--github-repo OWNER/NAME` | empty | Hosting repository for `sync --label`, `sync --all-open` and `--close-prs`. |
-| `--gh WORD` | `gh` | Command (and leading arguments) to run instead of `gh`, for example a pacing wrapper. Repeatable. |
+| `--gh WORD` | `gh` (or `$FLEET_REAL_GH`) | Command (and leading arguments) to run instead of `gh`, for example a pacing wrapper. Repeatable. When no `--gh` is configured, the `FLEET_REAL_GH` environment variable (shell-style words naming the real `gh` on fleet hosts where `gh` on `PATH` may be a stub) is used as a fallback; an explicit `--gh` always wins. |
 | `--api-per-hour N` | `0` (= 60) | API requests this queue may make per rolling hour. See "Ready sources and the request budget". |
 | `--api-budget-file PATH` | state directory | Budget file to share with every other queue on the host, so they all draw on one hourly allowance. |
 | `--anonymous-fetch` | off | Fetch without credentials (public repositories). Credential helpers are disabled for fetches, so a fetch never spends a credential use. |
@@ -168,6 +168,18 @@ Reconcile the queue with a ready source. Exactly one of these is required:
 `sync` submits new changes and changes whose head or priority moved, with one fetch for all of
 them. It withdraws only changes that this same source added and no longer lists. A change you
 submitted directly is never withdrawn by a source. Draft pull requests are never ready.
+
+**Label scope (`sync --label`).** The labelled ready set is the only set a label sync touches:
+one batched list call returns open, non-draft pull requests carrying the label (charged one
+request per hundred listed), and the queue submits, resubmits on a moved head, or withdraws
+only within that set. Removing the label from a previously synced pull request withdraws only
+that label's own submission; a change submitted directly with `submit`, from another label, or
+from `--file` is untouched. Priorities still come from `pN` / `priority-N` labels (default 100).
+For a shadow / soak kit — a `run --shadow` rehearsal or a `serve --shadow` daemon mirroring what
+people marked ready — drive the queue with `sync --label ready` (or your ready label), not
+`--all-open`, which deliberately lists every open pull request for measurements. Pair the label
+sync with `serve --shadow` (or `run --shadow`) so validations are real but the real base never
+moves; see the quickstart's shadow / soak kit.
 With `require_approval_at_head` (off by default), the batched list call also carries reviews:
 only a pull request with an approving review whose reviewed commit is its current head counts
 as ready. The report's `unapproved` field names the rest; a queued one is withdrawn (its
@@ -821,9 +833,24 @@ before it is made, and the error says when room opens up.
   call `merge-queue submit` directly. It costs no API request, binds the exact head, and records
   which tests the agent ran.
 - **`sync --label`.** Use it when people mark changes ready on the hosting service, or when you
-  want the ready set visible there. It costs one request per sync, plus one per label edit.
+  want the ready set visible there. It is also the ready source for a shadow / soak kit
+  (`run --shadow` / `serve --shadow`) that should mirror the labelled ready set only: it costs
+  one batched request per sync (plus one per label edit) and never widens to unlabelled pull
+  requests.
 - **`sync --file`.** Use it for a ready list kept by other tools. It costs no API requests.
-- **`sync --all-open`.** For shadow runs and measurements.
+- **`sync --all-open`.** For measurements that deliberately want every open, non-draft pull
+  request; it is not the shadow-soak default, because it widens the queue beyond the labelled
+  ready set.
+
+On fleet hosts, `sync` and `--close-prs` reach the real GitHub CLI through the configured
+`--gh` command. When no `--gh` is configured, the `FLEET_REAL_GH` environment variable is
+honoured as a fallback (shell-style words), so a host that already exports the real `gh` path
+there needs no extra flag; an explicit `init --gh` always wins. Git fetches themselves use the
+clone's normal Git transport (only `github.*` API calls go through `gh`); pass
+`--anonymous-fetch` for public repositories to keep fetches from spending credential uses. A
+full portable validation run (`make validate-all`, i.e. `python3 scripts/validate.py --all`) is
+separate from the queue's own validation: it checks this repository's contract and the queue
+binary, while the queue's per-batch validation uses the validator you configured at `init`.
 
 For public repositories, `--anonymous-fetch` keeps fetches from spending credential uses at all.
 
@@ -846,8 +873,24 @@ list them with `--regen-path` and give the command that rebuilds them with `--re
   change and commits only when a generated file actually changed.
 - **Validation.** The candidate is then validated as usual. The commit that lands is the exact
   validated commit, regeneration included.
-- **Refusals.** A change is ejected with kind `regeneration` when the command fails, when it
-  changes any file that is not generated, or when conflict markers remain afterwards.
+- **The regenerate contract (`--regen-command`).** The queue runs the command as `sh -c` with
+  the working directory at the root of a scratch checkout of the candidate tip (the exact tree
+  being combined), stdin closed, and these variables set: `MQ_PR` (the change being combined),
+  `MQ_REGEN_PATHS` (the configured generated patterns, space-separated) and `MQ_CONFLICTED` (the
+  generated paths that conflicted, space-separated; empty for a hoisted tip refresh). The
+  command must rewrite every generated file deterministically from the checkout's sources and
+  touch nothing else: for the same sources it must produce byte-identical output on every run,
+  and the queue refuses any run that changes a file outside the generated set. A minimal correct
+  example that rebuilds `gen/all.txt` from its sources is `mkdir -p gen && cat $(ls src/* | sort) > gen/all.txt`; a full example with paths and sources of your own follows the same shape — run in
+  the candidate checkout, read `MQ_CONFLICTED` if you need to scope work, and never write outside
+  the generated paths.
+- **Refusals.** A change is ejected with kind `regeneration-build` when the generator command
+  itself fails — it cannot be run, or it exits non-zero — so the author fixes the generator and
+  resubmits. It is ejected with kind `regeneration` when the command succeeds but its output is
+  unacceptable: it changed a file that is not generated, or conflict markers remain afterwards.
+  The ejection kind is recorded on the ejection record, in the run report's ejected list, in the
+  per-change ejection file, and in the notification report the daemon sends for an ejected change,
+  so build failures are triaged separately from output or conflict failures.
 
 This is deterministic, not repair. The command must give the same output for the same sources.
 The run report lists every regeneration under `regenerated`.
