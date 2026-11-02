@@ -29,7 +29,7 @@ export interface ReplyDrafts {
   /** Message `id` has no draft now, here. */
   delete(id: string): void;
   /**
-   * Written back with a read-after-write check, as the microphone settings are; and, where the quota is
+   * Written back with the same read-after-write check the page's `persistMicSettings` makes; and, where the quota is
    * full, given the saved channel rows' space, as the channel's drafts are: saved messages can be
    * fetched again, and what the reader typed cannot. Answers whether the device kept them.
    */

@@ -95,7 +95,7 @@ export function createOutboxStore<Entry extends OutboxEntry>(deps: OutboxDepende
     },
     storageOkay: () => outgoingStorageOkay,
     save() {
-      // `#466 reply-promotes-thread`: what `pendingByThread` worked out is stale.
+      // `#466 reply-promotes-thread`: what the pending threads worked out (`pendingByThread`, ./pending.ts) is stale.
       outboxVersion += 1;
       try {
         // `#500 sent-receipts-pile-up`. Never a confirmed send where the store keeps the page's own
