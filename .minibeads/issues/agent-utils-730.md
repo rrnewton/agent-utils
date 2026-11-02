@@ -1,10 +1,11 @@
 ---
 title: 'reference-links: draw configured reference ids in message text as links'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 created_at: 2026-11-01T21:37:23.635560244+00:00
-updated_at: 2026-11-01T21:37:23.635560244+00:00
+updated_at: 2026-11-02T04:37:23.003835702+00:00
+closed_at: 2026-11-02T04:37:23.003835552+00:00
 ---
 
 # Description
