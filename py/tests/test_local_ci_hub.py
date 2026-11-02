@@ -87,6 +87,114 @@ def test_goalpost_prefix_and_enrich_cannot_qualify(tmp_path: Path) -> None:
     assert json.loads(out.stdout)["verdict"] != "qualified"
 
 
+def _row_ref_repo(tmp_path: Path) -> tuple[Path, Path]:
+    repo = tmp_path / "toy"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", "."], cwd=repo, timeout=15)
+    subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=repo, timeout=15)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=repo, timeout=15)
+    (repo / "README.md").write_text("# toy\n")
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    (repo / "local-ci-hub.toml").write_text(
+        '[project]\nname="toy"\n[validate]\ncommand=["/bin/true"]\n'
+        'admission_slots=2\n[ledger]\nteam="toy"\npublish="none"\n'
+        f'evidence_root="{evidence}"\nlocation={{path="ci-ledger"}}\n'
+        '[remote]\nprovider="none"\n[receipt]\nqualifying=["local-ledger-pass"]\nrequire_full_evidence=true\n[land]\nstate_dir="ignored/local-ci-hub"\n')
+    subprocess.run(["git", "add", "-A"], cwd=repo, timeout=15)
+    subprocess.run(["git", "commit", "-qm", "toy: init"], cwd=repo, timeout=15)
+    return repo, evidence
+
+
+def _full_row(sha: str, run_id: str, *, result: str = "pass", profile: str = "full",
+              finished_at: str = "2026-10-30T17:37:20Z") -> dict[str, object]:
+    return {"commit": sha, "run_id": run_id, "result": result, "commit_anchored": True,
+            "executed_tests": 10, "passed_tests": 10 if result == "pass" else 9,
+            "profile": profile, "selection_mode": "full" if profile == "full" else "only",
+            "tree_dirty": False, "failures": 0 if result == "pass" else 1,
+            "gates_run": 1, "gates_expected": 1, "finished_at": finished_at,
+            "coverage": {"planned_test_nodes": 1, "zero_executed_nodes": [], "absent_nodes": []}}
+
+
+def _row_ref_event(evidence: Path, row: dict[str, object], *, event_id: str,
+                   outcome: str | None = None, host: str = "testhost") -> dict[str, object]:
+    import hashlib
+    raw = json.dumps(row, sort_keys=True).encode()
+    sha256 = hashlib.sha256(raw).hexdigest()
+    locator = f"run-evidence/{host}/{sha256}.json.zst"
+    dest = evidence / locator
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["zstd", "-q", "-f", "-o", str(dest)], input=raw, check=True, timeout=30)
+    blob = dest.read_bytes()
+    codec = {"codec": "row-ref/v1", "locator": locator, "sha256": sha256, "bytes": len(raw),
+             "compressed_sha256": hashlib.sha256(blob).hexdigest(), "compressed_bytes": len(blob)}
+    return {"schema": "validate-ledger/v1", "event_type": "run.result", "event_id": event_id,
+            "run_id": str(row["run_id"]), "commit": str(row["commit"]), "host": host,
+            "outcome": outcome or str(row["result"]), "legacy_row_codec": codec}
+
+
+def _write_ledger(repo: Path, events: list[dict[str, object]]) -> None:
+    led = repo / "ci-ledger"
+    led.mkdir(exist_ok=True)
+    (led / "ledger.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
+
+
+def test_row_ref_valid_evidence_qualifies(tmp_path: Path) -> None:
+    repo, evidence = _row_ref_repo(tmp_path)
+    sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
+    _write_ledger(repo, [_row_ref_event(evidence, _full_row(sha, "r1"), event_id="e1")])
+    out = run_cli(repo, "--json", "receipt", "show", "HEAD")
+    assert json.loads(out.stdout)["verdict"] == "qualified"
+
+
+def test_row_ref_mismatched_evidence_refuses_sticky(tmp_path: Path) -> None:
+    repo, evidence = _row_ref_repo(tmp_path)
+    sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
+    good = _row_ref_event(evidence, _full_row(sha, "r1"), event_id="e1")
+    # Tamper: locator no longer names the row hash.
+    bad = json.loads(json.dumps(good))
+    bad["legacy_row_codec"] = dict(bad["legacy_row_codec"], locator="run-evidence/testhost/" + "0" * 64 + ".json.zst")
+    _write_ledger(repo, [bad])
+    out = run_cli(repo, "--json", "receipt", "show", "HEAD")
+    assert json.loads(out.stdout)["verdict"] != "qualified"
+    # Commit mismatch in the referenced row also refuses.
+    other = _full_row("0" * 40, "r1")
+    _write_ledger(repo, [_row_ref_event(evidence, other, event_id="e2")])
+    out = run_cli(repo, "--json", "receipt", "show", "HEAD")
+    assert json.loads(out.stdout)["verdict"] != "qualified"
+    # Sticky: a refused row-ref for a run is not revived by a later inline PASS for the same run.
+    refused = _row_ref_event(evidence, _full_row(sha, "r1"), event_id="e3")
+    refused["legacy_row_codec"] = dict(refused["legacy_row_codec"], compressed_sha256="0" * 64)  # type: ignore[arg-type]
+    inline_pass = {"schema": "validate-ledger/v1", "event_type": "run.result", "event_id": "e4",
+                   "run_id": "r1", "commit": sha, "outcome": "pass", "legacy_row": _full_row(sha, "r1")}
+    _write_ledger(repo, [refused, inline_pass])
+    out = run_cli(repo, "--json", "receipt", "show", "HEAD")
+    assert json.loads(out.stdout)["verdict"] != "qualified"
+
+
+def test_row_ref_partial_fail_does_not_veto_full_pass(tmp_path: Path) -> None:
+    # Fixture of the real e3120d83 shape: a full PASS plus a later
+    # only-portable FAIL (and only-portable PASS) at the same commit.
+    repo, evidence = _row_ref_repo(tmp_path)
+    sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
+    events = [
+        _row_ref_event(evidence, _full_row(sha, "r-full", finished_at="2026-10-30T17:37:20Z"), event_id="e1"),
+        _row_ref_event(evidence, _full_row(sha, "r-partial-fail", result="fail", profile="only-portable",
+                                           finished_at="2026-11-01T13:01:45Z"), event_id="e2", outcome="fail"),
+        _row_ref_event(evidence, _full_row(sha, "r-partial-pass", profile="only-portable",
+                                           finished_at="2026-11-01T14:02:16Z"), event_id="e3"),
+    ]
+    _write_ledger(repo, events)
+    out = run_cli(repo, "--json", "receipt", "show", "HEAD")
+    assert json.loads(out.stdout)["verdict"] == "qualified"
+    # A genuine clean-full FAIL at least as new as the PASS still vetoes.
+    events.append(_row_ref_event(evidence, _full_row(sha, "r-full-fail", result="fail",
+                                                     finished_at="2026-11-02T00:00:00Z"), event_id="e4", outcome="fail"))
+    _write_ledger(repo, events)
+    out = run_cli(repo, "--json", "receipt", "show", "HEAD")
+    assert json.loads(out.stdout)["verdict"] != "qualified"
+
+
 def test_row_ref_missing_evidence_refuses(tmp_path: Path) -> None:
     repo = toy_repo(tmp_path)
     sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()

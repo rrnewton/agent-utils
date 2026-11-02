@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import subprocess
 import uuid
 from datetime import datetime, timezone
@@ -12,6 +13,11 @@ from pathlib import Path
 from .config import Config, short_host
 
 SCHEMA = "validate-ledger/v1"
+_ROW_REF_LOCATOR = re.compile(r"run-evidence/([A-Za-z0-9_-]+)/([0-9a-f]{64})\.json\.zst")
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+_MAX_ROW_BYTES = 48 * 1024 * 1024
+_MAX_COMPRESSED_BYTES = _MAX_ROW_BYTES + 1024 * 1024
+_ROW_REF_FIELDS = frozenset({"codec", "sha256", "bytes", "locator", "compressed_sha256", "compressed_bytes"})
 
 
 def _now() -> str:
@@ -89,7 +95,8 @@ class Ledger:
             codec_raw = ev.get("legacy_row_codec")
             codec: dict[str, object] = codec_raw if isinstance(codec_raw, dict) else {}
             if codec.get("codec") == "row-ref/v1":
-                src, evidence_ok = self._resolve_ref(codec)
+                host_raw = ev.get("host")
+                src, evidence_ok = self._resolve_ref(codec, host=host_raw if isinstance(host_raw, str) else None)
                 if evidence_ok and (src.get("commit") not in (None, ev.get("commit")) or src.get("run_id") not in (None, rid)):
                     src, evidence_ok = {}, False  # referenced evidence must name the same commit and run
             merged = dict(rows[rid])
@@ -108,10 +115,29 @@ class Ledger:
             rows[rid] = merged
         return [rows[r] for r in order]
 
-    def _resolve_ref(self, codec: dict[str, object]) -> tuple[dict[str, object], bool]:
+    def _resolve_ref(self, codec: dict[str, object], host: str | None = None) -> tuple[dict[str, object], bool]:
         """Dereference one row-ref/v1 evidence object; (row, ok). Refuses on any mismatch."""
+        # Mirror ci-hub ledger_evidence.validate_ref: the locator is the
+        # immutable host/content address of the row, not an arbitrary path.
+        if set(codec) != _ROW_REF_FIELDS:
+            return {}, False
+        for name, limit in (("bytes", _MAX_ROW_BYTES), ("compressed_bytes", _MAX_COMPRESSED_BYTES)):
+            value = codec.get(name)
+            if not isinstance(value, int) or isinstance(value, bool) or not 0 < value <= limit:
+                return {}, False
+        for name in ("sha256", "compressed_sha256"):
+            value = codec.get(name)
+            if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
+                return {}, False
+        loc = codec.get("locator")
+        if not isinstance(loc, str):
+            return {}, False
+        named = _ROW_REF_LOCATOR.fullmatch(loc)
+        if named is None or named.group(2) != codec.get("sha256"):
+            return {}, False
+        if host is not None and named.group(1) != host:
+            return {}, False
         root = self.cfg.evidence_root
-        loc = str(codec.get("locator", ""))
         if root is None or not loc or Path(loc).is_absolute() or ".." in Path(loc).parts:
             return {}, False
         path = root / loc

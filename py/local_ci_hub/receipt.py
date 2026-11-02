@@ -66,11 +66,36 @@ def show(cfg: Config, commit: str, remote: dict[str, object] | None = None) -> d
         if tests is not None and not (isinstance(tests, (int, float)) and not isinstance(tests, bool) and tests > 0):
             return False
         return True
-    local_pass = any(_strict_pass(r) for r in rows)
-    local_fail = any(r.get("result") == "FAIL" for r in rows)
+    def _is_genuine_fail(r: dict[str, object]) -> bool:
+        # Mirror ci-hub failure_disposition: only a clean full-coverage FAIL
+        # (anchored, full profile/selection, clean tree, verified evidence)
+        # is a durable failure. A partial-profile FAIL (e.g. only-portable)
+        # is a withheld non-verdict and must not veto a qualifying PASS.
+        return (
+            r.get("result") == "FAIL"
+            and r.get("_evidence_ok") is not False
+            and r.get("_digest_ok") is not False
+            and r.get("commit_anchored") is True
+            and r.get("profile") == "full"
+            and r.get("selection_mode") == "full"
+            and r.get("tree_dirty") is False
+        )
+    strict_passes = [r for r in rows if _strict_pass(r)]
+    local_pass = bool(strict_passes)
+    genuine_fails = [r for r in rows if _is_genuine_fail(r)]
+    # Newest terminal record decides, as in ci-hub assess_canonical_receipts:
+    # a genuine FAIL vetoes only when it is at least as new as the newest
+    # qualifying PASS.
+    fail_veto = False
+    if genuine_fails and strict_passes:
+        newest_pass = max(str(r.get("finished_at") or "") for r in strict_passes)
+        newest_fail = max(str(r.get("finished_at") or "") for r in genuine_fails)
+        fail_veto = newest_fail >= newest_pass
+    elif genuine_fails:
+        fail_veto = True
     remote = remote if remote is not None else remote_for_commit(cfg, commit)
     checks = {
-        "local-ledger-pass": local_pass and not local_fail,
+        "local-ledger-pass": local_pass and not fail_veto,
         "remote-pass": remote.get("status") in ("pass", "success", "passed"),
     }
     qualified = all(checks.get(rule, False) for rule in cfg.qualifying) if cfg.qualifying else False
