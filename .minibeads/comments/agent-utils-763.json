@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-763-c01e0397092",
+    "issue_id": "agent-utils-763",
+    "author": "devbig014",
+    "body": "[muse watermelon-full-preview] Never-split slice landed on main 36a671d31c129051b7138e18605116d00ca42015: per-route max_post_bytes measured after escaping, sanitized ~500-char preview, signed fence-only delivery, unparseable alarm kind with dismiss, record-at-most-once. Remaining in this issue: per-provider large handling (attached signed envelope file / numbered part-posts) and the JSON-only mode with a viewer utility.",
+    "created_at": "2026-11-02T21:54:06.265398802Z",
+    "updated_at": "2026-11-02T21:54:06.265398802Z"
+  }
+]
