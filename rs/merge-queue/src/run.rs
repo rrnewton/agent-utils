@@ -729,9 +729,7 @@ impl<'a> Runner<'a> {
                     delay.as_secs()
                 ),
             );
-            if !delay.is_zero() {
-                std::thread::sleep(delay);
-            }
+            sleep_unless_stopped(delay);
             let (next_vid, next_ran) = self
                 .validate_all(vec![Job {
                     purpose: "batch",
@@ -928,8 +926,10 @@ impl<'a> Runner<'a> {
         let slot = self.slots.take();
         let result = (|| -> Result<Result<String, (&'static str, String)>, String> {
             let checkout = self.slots.checkout(slot, tip)?;
+            // A generator killed by an outside signal (a service stop, the OOM killer) says
+            // nothing about the change: stop the run instead of ejecting it.
             let run_script = |script: &str, what: &str| -> Result<std::process::Output, String> {
-                Command::new("sh")
+                let output = Command::new("sh")
                     .arg("-c")
                     .arg(script)
                     .current_dir(&checkout)
@@ -938,7 +938,14 @@ impl<'a> Runner<'a> {
                     .env("MQ_CONFLICTED", conflicted.join(" "))
                     .stdin(std::process::Stdio::null())
                     .output()
-                    .map_err(|error| format!("cannot run {what}: {error}"))
+                    .map_err(|error| format!("cannot run {what}: {error}"))?;
+                if let Some(signal) = crate::interrupt::outside_kill(&output.status) {
+                    return Err(crate::interrupt::killed(what, signal));
+                }
+                if !output.status.success() {
+                    crate::interrupt::check(&format!("reading the {what} failure"))?;
+                }
+                Ok(output)
             };
             if !regen.build_command.trim().is_empty() {
                 let built = run_script(&regen.build_command, "regenerate.build_command")?;
@@ -1202,6 +1209,7 @@ impl<'a> Runner<'a> {
     }
 
     fn validate_one(&self, job: Job, cancel: &AtomicBool) -> JobResult {
+        crate::interrupt::check(&format!("validating {}", list(&job.prs)))?;
         let id = {
             let mut next = lock(&self.next_validation);
             *next += 1;
@@ -1274,7 +1282,9 @@ impl<'a> Runner<'a> {
             "result",
             &format!(
                 "v{id} {} in {:.1}s{}{}",
-                if record.cancelled {
+                if ran.interrupted.is_some() {
+                    "interrupted"
+                } else if record.cancelled {
                     "cancelled"
                 } else if record.refused {
                     "refused"
@@ -1296,9 +1306,16 @@ impl<'a> Runner<'a> {
                 }
             ),
         );
-        let mut report = lock(&self.report);
-        report.validation_s += ran.elapsed.as_secs_f64();
-        report.validations.push(record);
+        {
+            let mut report = lock(&self.report);
+            report.validation_s += ran.elapsed.as_secs_f64();
+            report.validations.push(record);
+        }
+        // An interrupted validation is recorded (cancelled) but is no result at all: every
+        // caller propagates the error, so it can never become a landing or a culprit search.
+        if let Some(why) = &ran.interrupted {
+            return Err(format!("v{id}: {why}"));
+        }
         Ok((id, ran))
     }
 
@@ -1583,6 +1600,7 @@ impl<'a> Runner<'a> {
                         && !pending.is_empty()
                         && (self.options.max_batches == 0 || started < self.options.max_batches)
                     {
+                        crate::interrupt::check("building the next batch")?;
                         let parent = match flights.back() {
                             Some(flight) => flight.candidate.tip.clone(),
                             None => {
@@ -1650,6 +1668,9 @@ impl<'a> Runner<'a> {
                     if let Some(flight) = flights.iter_mut().find(|flight| flight.id == id) {
                         flight.result = Some(result);
                     }
+                    // Only after the result is stored, so `discard` waits for no message
+                    // this loop already took.
+                    crate::interrupt::check("acting on a finished validation")?;
                     // Land (or search) heads that have finished, in order.
                     while flights
                         .front()
@@ -1734,6 +1755,8 @@ impl<'a> Runner<'a> {
     }
 
     fn eject(&self, pr: i64, kind: &str, reason: &str, failed: &[TestId]) -> Result<(), String> {
+        // Whatever led here may rest on a process the stop killed: never eject after a stop.
+        crate::interrupt::check(&format!("ejecting #{pr} ({kind})"))?;
         lock(&self.excluded).insert(pr);
         let classes = crate::state::classify(&self.config.classify, failed);
         let class_note = if classes.is_empty() {
@@ -1913,6 +1936,7 @@ impl<'a> Runner<'a> {
         validations: Vec<usize>,
         flaky: BTreeSet<TestId>,
     ) -> Result<BatchOutcome, String> {
+        crate::interrupt::check(&format!("landing {}", list(&candidate.prs)))?;
         let requiring: Vec<Item> = {
             let items = lock(&self.items);
             candidate
@@ -2502,6 +2526,18 @@ fn discard(
     }
     while let Some(flight) = flights.pop_back() {
         pending.push_front(flight.candidate.prs);
+    }
+}
+
+/// Sleep for `delay`, returning early when a stop is requested.
+fn sleep_unless_stopped(delay: Duration) {
+    let until = Instant::now() + delay;
+    while !crate::interrupt::requested() {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        std::thread::sleep(left.min(Duration::from_millis(100)));
     }
 }
 

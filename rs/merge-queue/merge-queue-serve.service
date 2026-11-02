@@ -18,6 +18,14 @@ WorkingDirectory=__REPO__
 ExecStart=__MERGE_QUEUE_BIN__ --repo __REPO__ serve --poll-ms 250 --base-poll-secs 30
 Restart=on-failure
 RestartSec=5s
+# A stop signals only the daemon, which cancels its own validations, records
+# them as cancelled, lands and ejects nothing more, and exits with every
+# undecided change still queued. (The default control-group mode signals the
+# validations too; the daemon reads that death as no verdict, but the
+# validation is then not recorded as cancelled.) Whatever is left when the
+# stop timeout runs out is killed.
+KillMode=mixed
+TimeoutStopSec=90s
 
 [Install]
 WantedBy=default.target

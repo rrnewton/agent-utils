@@ -196,6 +196,39 @@ fn a_change_that_breaks_the_generator_is_ejected_as_regen_failed() {
 }
 
 #[test]
+fn a_generator_killed_by_an_outside_signal_ejects_nothing() {
+    // A service stop or the OOM killer can kill the generator while it works on a change. That
+    // says nothing about the change: the run stops with no verdict instead of reading the kill
+    // as `regen-failed` and ejecting it.
+    let fx = setup(
+        "regen-killed",
+        &[
+            "--regen-path",
+            "gen/",
+            "--regen-command",
+            "if [ -e src/c ]; then kill -TERM $$; fi; cat $(ls src/* | sort) > gen/all.txt",
+        ],
+    );
+    source_change(&fx, "b");
+    source_change(&fx, "c");
+    fx.mq_ok(&["submit", "1", "--head", "b"]);
+    fx.mq_ok(&["submit", "2", "--head", "c"]);
+    let out = fx.mq(&["run", "--json"]);
+    assert_eq!(out.status.code(), Some(3));
+    let r = report(&String::from_utf8_lossy(&out.stdout));
+    assert!(r["ejected"].as_array().unwrap().is_empty(), "{r}");
+    let stopped = r["stopped"].as_str().unwrap();
+    assert!(
+        stopped.contains("regenerate.command was killed by signal 15"),
+        "{stopped}"
+    );
+    let items: Value = serde_json::from_str(&fx.mq_ok(&["list", "--all", "--json"])).unwrap();
+    for item in items.as_array().unwrap() {
+        assert_ne!(item["status"], "ejected", "{items}");
+    }
+}
+
+#[test]
 fn a_generator_broken_on_the_base_stops_the_queue_without_ejecting() {
     // Whatever the change, the generator fails: blaming each change in turn would eject them
     // all. The queue checks the tree before the change, sees it fail too, and stops.

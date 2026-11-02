@@ -75,32 +75,14 @@ fn is_zero_u32(value: &u32) -> bool {
     *value == 0
 }
 
-fn shutdown_flag() -> &'static std::sync::Arc<AtomicBool> {
-    static FLAG: std::sync::OnceLock<std::sync::Arc<AtomicBool>> = std::sync::OnceLock::new();
-    FLAG.get_or_init(|| std::sync::Arc::new(AtomicBool::new(false)))
-}
-
-fn install_signal_handlers() {
-    // `signal-hook` registers the handlers behind a safe API, so this
-    // crate keeps `#![forbid(unsafe_code)]`. Both signals set one flag.
-    let _ = signal_hook::flag::register(
-        signal_hook::consts::SIGINT,
-        std::sync::Arc::clone(shutdown_flag()),
-    );
-    let _ = signal_hook::flag::register(
-        signal_hook::consts::SIGTERM,
-        std::sync::Arc::clone(shutdown_flag()),
-    );
-}
-
 /// Whether shutdown has been requested (also used by tests).
 pub fn shutdown_requested() -> bool {
-    shutdown_flag().load(Ordering::SeqCst)
+    crate::interrupt::requested()
 }
 
 /// Reset the shutdown flag (test support; a fresh daemon starts clear).
 pub fn reset_shutdown() {
-    shutdown_flag().store(false, Ordering::SeqCst);
+    crate::interrupt::reset();
 }
 
 /// Daemon heartbeat, rewritten every serve cycle to `serve.heartbeat.json`.
@@ -959,8 +941,10 @@ fn items_error_message(error: &str) -> String {
 /// directory's `serve.lock`). Work-cycle errors are recorded in the
 /// heartbeat and retried with backoff; they never kill the daemon.
 ///
-/// SIGINT/SIGTERM are honoured between cycles: a work cycle in progress
-/// runs to completion first (the Runner has no cancellation hook).
+/// SIGINT/SIGTERM stop the daemon mid-cycle too: the run cancels its
+/// validations, lands and ejects nothing more, and leaves every change it
+/// had not decided queued (see [`crate::interrupt`]). A second signal exits
+/// at once.
 pub fn serve(state: &State, options: &ServeOptions) -> Result<i32, String> {
     let config = state.config().map_err(|e| {
         format!(
@@ -973,7 +957,7 @@ pub fn serve(state: &State, options: &ServeOptions) -> Result<i32, String> {
     // Held (and so the single-daemon guarantee kept) until this returns.
     let _serve_lock = acquire_serve_lock(state)?;
     reset_shutdown();
-    install_signal_handlers();
+    crate::interrupt::install();
     write_pid(state)?;
     let pid_file = PidFile(state);
     let git = ops::repo(state, &config)?;
@@ -1112,8 +1096,12 @@ pub fn serve(state: &State, options: &ServeOptions) -> Result<i32, String> {
                                     );
                                 }
                                 // Notifications under the same lock, before
-                                // the new baseline is taken.
-                                sweep_notifications(state, &lock, &config, &notifier);
+                                // the new baseline is taken. A stop skips
+                                // them: they stay owed and go out on the
+                                // next start, not inside a stop timeout.
+                                if !shutdown_requested() {
+                                    sweep_notifications(state, &lock, &config, &notifier);
+                                }
                                 swept = true;
                                 // Whatever the cycle did, the resulting items
                                 // state is the new baseline: never spin on the
@@ -1655,6 +1643,8 @@ mod unit {
             SERVE_UNIT_TEMPLATE.contains("Environment=PATH=__TOOLCHAIN_BIN__:"),
             "{SERVE_UNIT_TEMPLATE}"
         );
+        // A stop reaches the daemon first, so it can cancel its validations itself.
+        assert!(rendered.contains("\nKillMode=mixed\n"), "{rendered}");
         // Relative paths are refused: systemd would resolve them arbitrarily.
         assert!(render_serve_unit(
             Path::new("merge-queue"),

@@ -558,3 +558,163 @@ fn one_shot_shadow_behavior_unchanged_by_serve_shadow() {
     let text = fx.mq_ok(&["run", "--shadow"]);
     assert!(text.contains("Shadow mode"), "{text}");
 }
+
+/// A queue whose validator records its process id (also its process group: the queue starts
+/// each runner in a group of its own), then sleeps far longer than any test waits and would
+/// end red. A stop that read the kill as a result would eject the change.
+fn setup_slow(tag: &str) -> (Fixture, PathBuf) {
+    let fx = Fixture::new(tag);
+    fx.write("tests/t0", "ok\n");
+    fx.commit_all("seed tests");
+    git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
+    let pid_file = fx.root.join("validator.pid");
+    let run = format!("echo $$ > {}; sleep 60; exit 1", pid_file.display());
+    fx.mq_ok(&[
+        "init",
+        "--remote",
+        "origin",
+        "--validator",
+        "command",
+        "--validator-run",
+        &run,
+    ]);
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    (fx, pid_file)
+}
+
+fn validator_pid(pid_file: &std::path::Path) -> u32 {
+    wait_for("the validation to start", Duration::from_secs(30), || {
+        std::fs::read_to_string(pid_file).is_ok_and(|text| text.trim().parse::<u32>().is_ok())
+    });
+    std::fs::read_to_string(pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+fn signal(target: &str) {
+    let sent = Command::new("kill")
+        .args(["-TERM", "--", target])
+        .status()
+        .expect("run kill");
+    assert!(sent.success(), "kill -TERM {target}");
+}
+
+fn alive(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn newest_report(fx: &Fixture) -> Value {
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(state_dir(fx).join("runs"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.join("report.json").is_file())
+        .collect();
+    dirs.sort();
+    let text = std::fs::read_to_string(dirs.last().expect("a run report").join("report.json"));
+    serde_json::from_str(&text.unwrap()).unwrap()
+}
+
+/// After a stop: the change is still queued, nothing was ejected, and the run says why.
+fn assert_stopped_without_verdict(fx: &Fixture, why: &str) {
+    assert_eq!(item_status(fx, 1), "queued");
+    let report = newest_report(fx);
+    assert!(report["ejected"].as_array().unwrap().is_empty(), "{report}");
+    assert!(report["landed"].as_array().unwrap().is_empty(), "{report}");
+    let stopped = report["stopped"].as_str().unwrap();
+    assert!(stopped.contains(why), "{stopped}");
+    assert!(stopped.contains("the changes stay queued"), "{stopped}");
+}
+
+#[test]
+fn sigterm_mid_validation_cancels_it_and_ejects_nothing() {
+    // A service manager that signals only the daemon (KillMode=mixed): the daemon itself
+    // cancels the validation's process group and exits promptly, with no verdict.
+    let (fx, pid_file) = setup_slow("serve-sigterm-mid-cycle");
+    let mut daemon = Daemon::start(&fx);
+    let validator = validator_pid(&pid_file);
+    signal(&daemon.0.id().to_string());
+    wait_for("daemon exit", Duration::from_secs(15), || {
+        daemon.0.try_wait().is_ok_and(|s| s.is_some())
+    });
+    assert_eq!(daemon.0.wait().unwrap().code(), Some(0));
+    wait_for(
+        "the validation to be cancelled",
+        Duration::from_secs(5),
+        || !alive(validator),
+    );
+    assert_stopped_without_verdict(&fx, "stop request");
+}
+
+#[test]
+fn a_control_group_stop_ejects_nothing() {
+    // A service manager that signals every process in the unit (systemd's default
+    // KillMode=control-group): the validation dies of the signal at the same moment the daemon
+    // is told to stop. Its death is not a red result.
+    let (fx, pid_file) = setup_slow("serve-cgroup-stop");
+    let mut daemon = Daemon::start(&fx);
+    let validator = validator_pid(&pid_file);
+    signal(&format!("-{validator}"));
+    signal(&daemon.0.id().to_string());
+    wait_for("daemon exit", Duration::from_secs(15), || {
+        daemon.0.try_wait().is_ok_and(|s| s.is_some())
+    });
+    assert_eq!(daemon.0.wait().unwrap().code(), Some(0));
+    assert_eq!(item_status(&fx, 1), "queued");
+    assert!(
+        newest_report(&fx)["ejected"].as_array().unwrap().is_empty(),
+        "{}",
+        newest_report(&fx)
+    );
+}
+
+#[test]
+fn a_validation_killed_from_outside_stops_the_run_without_a_verdict() {
+    // The validation alone is killed (an operator, the OOM killer): the daemon keeps running,
+    // the run stops with no verdict and says why, and the change stays queued for a retry.
+    let (fx, pid_file) = setup_slow("serve-validation-killed");
+    let daemon = Daemon::start(&fx);
+    let validator = validator_pid(&pid_file);
+    signal(&format!("-{validator}"));
+    wait_for("the failed cycle", Duration::from_secs(15), || {
+        heartbeat(&fx)["last_error"]
+            .as_str()
+            .is_some_and(|error| error.contains("killed by signal 15"))
+    });
+    assert_stopped_without_verdict(&fx, "the validation runner was killed by signal 15");
+    daemon.stop();
+}
+
+#[test]
+fn run_stops_on_sigterm_mid_validation_without_a_verdict() {
+    // A one-shot `run` honours the same stop: Ctrl-C or a service stop cancels its
+    // validations instead of orphaning them, and ejects nothing.
+    let (fx, pid_file) = setup_slow("run-sigterm-mid-validation");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_merge-queue"));
+    command
+        .args(["run", "--json"])
+        .current_dir(fx.queue())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    for (key, value) in IDENTITY {
+        command.env(key, value);
+    }
+    command.env_remove("MERGE_QUEUE_STATE");
+    let mut run = command.spawn().expect("spawn run");
+    let validator = validator_pid(&pid_file);
+    signal(&run.id().to_string());
+    wait_for("run exit", Duration::from_secs(15), || {
+        run.try_wait().is_ok_and(|s| s.is_some())
+    });
+    let out = run.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    assert!(!alive(validator), "validation left running");
+    assert_stopped_without_verdict(&fx, "stop request");
+}

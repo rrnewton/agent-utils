@@ -898,6 +898,9 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             json,
         } => {
             let _lock = state.lock()?;
+            // Ctrl-C or a service stop cancels the validations and stops with no verdict
+            // instead of orphaning them in their own process groups.
+            crate::interrupt::install();
             let runner = Runner::new(
                 &state,
                 RunOptions {

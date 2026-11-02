@@ -69,6 +69,10 @@ pub struct Ran {
     pub log: PathBuf,
     /// The queue cancelled the run (its candidate was discarded); its results mean nothing.
     pub cancelled: bool,
+    /// Why the run says nothing about the change because the queue is stopping or an outside
+    /// signal killed the runner (see [`crate::interrupt`]). Always also `cancelled`; the caller
+    /// must stop with no verdict rather than read it as red.
+    pub interrupted: Option<String>,
     /// Opaque handle the runner wrote to `$MQ_HANDLE_FILE`, if any; passed back as
     /// `$MQ_RERUN_FROM` to a later validation of the same commit.
     pub handle: Option<String>,
@@ -280,7 +284,21 @@ fn shared_select(
     Ok(Chosen { selection, policy })
 }
 
+/// How a runner process ended.
+struct Finished {
+    exit: Option<i32>,
+    elapsed: Duration,
+    /// The queue cancelled it, or it was interrupted.
+    cancelled: bool,
+    /// Set when a stop request or an outside kill signal ended it (see [`Ran::interrupted`]).
+    interrupted: Option<String>,
+}
+
 /// Run a shell command under the admission prefix with a timeout; output goes to `log`.
+///
+/// A stop request cancels the runner like a discarded candidate does; a runner that died of
+/// an outside kill signal, or that finished while a stop was under way, is interrupted rather
+/// than red.
 fn run_logged(
     config: &ValidatorConfig,
     argv: &[String],
@@ -288,7 +306,7 @@ fn run_logged(
     env: &[(&str, String)],
     log: &Path,
     cancel: &AtomicBool,
-) -> Result<(Option<i32>, Duration, bool), String> {
+) -> Result<Finished, String> {
     let file = std::fs::File::create(log)
         .map_err(|error| format!("cannot create {}: {error}", log.display()))?;
     let err = file
@@ -325,9 +343,18 @@ fn run_logged(
             .try_wait()
             .map_err(|error| format!("cannot wait for validation: {error}"))?
         {
-            return Ok((status.code(), started.elapsed(), false));
+            let interrupted = crate::interrupt::outside_kill(&status)
+                .map(|signal| crate::interrupt::killed("the validation runner", signal))
+                .or_else(|| crate::interrupt::check("this validation's result was read").err());
+            return Ok(Finished {
+                exit: status.code(),
+                elapsed: started.elapsed(),
+                cancelled: interrupted.is_some(),
+                interrupted,
+            });
         }
-        let cancelled = cancel.load(Ordering::Relaxed);
+        let stopping = crate::interrupt::requested();
+        let cancelled = cancel.load(Ordering::Relaxed) || stopping;
         let timed_out = limit.is_some_and(|limit| started.elapsed() > limit);
         if cancelled || timed_out {
             let _ = Command::new("kill")
@@ -346,14 +373,22 @@ fn run_logged(
             let _ = child.kill();
             let _ = child.wait();
             if let Ok(mut log) = std::fs::OpenOptions::new().append(true).open(log) {
-                let why = if cancelled {
+                let why = if stopping {
+                    "cancelled: the queue is stopping".to_owned()
+                } else if cancelled {
                     "cancelled by the queue".to_owned()
                 } else {
                     format!("killed after {}s", config.timeout_secs)
                 };
                 let _ = writeln!(log, "merge-queue: validation {why}");
             }
-            return Ok((None, started.elapsed(), cancelled));
+            return Ok(Finished {
+                exit: None,
+                elapsed: started.elapsed(),
+                cancelled,
+                interrupted: stopping
+                    .then(|| crate::interrupt::check("this validation finished").unwrap_err()),
+            });
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -438,7 +473,12 @@ impl Validator for CommandValidator {
         );
         let log = out.join("run.log");
         let argv = vec!["sh".to_owned(), "-c".to_owned(), self.0.run.clone()];
-        let (exit, elapsed, cancelled) = run_logged(&self.0, &argv, checkout, &env, &log, cancel)?;
+        let Finished {
+            exit,
+            elapsed,
+            cancelled,
+            interrupted,
+        } = run_logged(&self.0, &argv, checkout, &env, &log, cancel)?;
         let mut results = TestResults::default();
         if let Ok(text) = std::fs::read_to_string(&results_path) {
             for line in text.lines().filter(|line| !line.trim().is_empty()) {
@@ -498,6 +538,7 @@ impl Validator for CommandValidator {
             elapsed,
             log,
             cancelled,
+            interrupted,
             handle: read_handle(out),
             refused,
             effective_selection: None,
@@ -665,6 +706,7 @@ impl Validator for DagrunValidator {
                     elapsed: Duration::ZERO,
                     log: out.join("run.log"),
                     cancelled: false,
+                    interrupted: None,
                     handle: None,
                     refused: false,
                     effective_selection: Some(Selection::default()),
@@ -675,7 +717,12 @@ impl Validator for DagrunValidator {
         }
         let env = [("DAGRUN_LOG_DIR", journal_dir.display().to_string())];
         let log = out.join("run.log");
-        let (exit, elapsed, cancelled) = run_logged(&self.0, &argv, checkout, &env, &log, cancel)?;
+        let Finished {
+            exit,
+            elapsed,
+            cancelled,
+            interrupted,
+        } = run_logged(&self.0, &argv, checkout, &env, &log, cancel)?;
         let journal =
             std::fs::read_to_string(journal_dir.join("journal.jsonl")).unwrap_or_default();
         let mut results = parse_journal(&journal);
@@ -702,6 +749,7 @@ impl Validator for DagrunValidator {
             elapsed,
             log,
             cancelled,
+            interrupted,
             handle: read_handle(out),
             refused,
             effective_selection: whole_steps,
@@ -894,6 +942,7 @@ dagrun: PASS - 1 passed";
                 elapsed: Duration::ZERO,
                 log: PathBuf::new(),
                 cancelled: false,
+                interrupted: None,
                 handle: None,
                 refused: false,
                 effective_selection: None,

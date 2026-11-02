@@ -278,9 +278,19 @@ heartbeat every 0.5 s, so a long validation never reads as stale. An unreadable 
 surfaced as `last_error` (the daemon plans nothing until it reads) rather than read as an empty
 queue. One daemon per state directory is guaranteed by an exclusive `flock` on `serve.lock`,
 held for the daemon's lifetime; `serve.pid` is informational, and a daemon removes it only while
-it still holds its own pid. Stop it with SIGINT or SIGTERM (Ctrl-C), honoured between work
-cycles (a cycle in progress finishes first); a graceful stop removes the pid file, a crash
-leaves it behind (and frees the lock) for `status` to report.
+it still holds its own pid. A graceful stop removes the pid file, a crash leaves it behind (and
+frees the lock) for `status` to report.
+
+**Stopping.** SIGINT or SIGTERM (Ctrl-C) stops the daemon at once, even mid-cycle, and a stop
+is never a verdict. The run cancels its validations, which are recorded as cancelled. It starts
+no new validation, landing or ejection, and exits with every change it had not decided still
+queued (the run report's `stopped` names the stop). A regeneration or a landing already under
+way finishes first; these take seconds. The same holds for a process the queue started that
+dies of an outside kill signal (SIGTERM, SIGINT, SIGHUP or SIGKILL, from a service manager, the
+OOM killer or an operator) while the daemon keeps running. A killed validation is no red
+result and a killed generator is no `regen-failed`: the run stops with that reason, and the
+next cycle retries. A crash signal such as SIGSEGV is still the process's own failure. A second
+SIGINT or SIGTERM during a stop exits immediately. `merge-queue run` stops the same way.
 
 | Option | Default | Meaning |
 |---|---|---|
@@ -343,81 +353,16 @@ directory at install time (from `rustup which cargo`, then `cargo` on `PATH`, th
 `$CARGO_HOME/bin` or `~/.cargo/bin`; override with `--toolchain-bin DIR`) and writes it
 as an absolute `Environment=PATH=...` in the rendered unit. At startup `serve` also
 refuses, naming the missing tool (for example `cargo not found`), when any executable
-its configured regenerate/validator commands name does not resolve.
+its configured regenerate/validator commands name does not resolve. Relative paths such as
+`common/bin/dagrun` name files inside the candidate checkout, which exist only at run time,
+so they are not checked.
 
-```bash
-merge-queue install-serve-unit   # or: --print to preview, --output FILE to relocate
-systemctl --user daemon-reload
-systemctl --user enable --now merge-queue-serve
-merge-queue status   # daemon: running ...
-```
-
-The tick-hub launcher alternative ships at `rs/merge-queue/tick-hub-merge-queue.yaml`: each tick
-runs `merge-queue status` as a gate and emits an action asking for a restart when the daemon is
-not healthy, plus a heartbeat-freshness health check. Edit its paths, then
-`tick-hub tick --config rs/merge-queue/tick-hub-merge-queue.yaml`.
-
-### `merge-queue serve`
-
-This command runs the queue forever: deterministic code that is always running, so agents submit
-changes and never drive the queue loop by hand. While idle it holds **no** writer lock. It polls
-the `items/` directory fingerprint every `--poll-ms` (default `250`) and polls the remote base
-with a cheap `git ls-remote` every `--base-poll-secs` (default `30`). A changed fingerprint (a
-new `submit`, `sync` or `withdraw`) or a moved base triggers one work cycle: the daemon takes the
-writer lock, plans, and runs the same `Runner` path as `run` (the logic is not forked), then
-releases the lock and goes back to idle polling. Two triggers are time-based: a queued change
-whose refusal deferral (`next_retry_at`) has passed is retried without any new submit, and a
-failed cycle (an error, or a run that stopped early) is retried after 1 s, 2 s, 4 s, ... capped at
-5 min, with the error kept as the heartbeat's `last_error` and the next retry time as its
-`next_retry_at`. A cycle that finds the lock held or a failed base poll is recorded in the
-heartbeat; none of these kills the daemon. While a cycle runs, a helper thread refreshes the
-heartbeat every 0.5 s, so a long validation never reads as stale. An unreadable item record is
-surfaced as `last_error` (the daemon plans nothing until it reads) rather than read as an empty
-queue. One daemon per state directory is guaranteed by an exclusive `flock` on `serve.lock`,
-held for the daemon's lifetime; `serve.pid` is informational, and a daemon removes it only while
-it still holds its own pid. Stop it with SIGINT or SIGTERM (Ctrl-C), honoured between work
-cycles (a cycle in progress finishes first); a graceful stop removes the pid file, a crash
-leaves it behind (and frees the lock) for `status` to report.
-
-| Option | Default | Meaning |
-|---|---|---|
-| `--poll-ms N` | `250` | Idle poll interval in milliseconds: `items/` watch and heartbeat cadence (at least 10). |
-| `--base-poll-secs N` | `30` | Seconds between `git ls-remote` base polls. `0` polls the base every cycle. |
-| `--once` | off | Run at most one work cycle, then exit. For scripts and tests. |
-| `--shadow` | off | Validate for real, but land on a simulated base (same shadow path as `run --shadow`); real base never pushed, items stay queued. |
-| `--depth N` | the configured `depth` | Override the initial window for work cycles. |
-| `--max-batch N` | the configured `max_batch` | Override the batch size for work cycles. |
-
-### `merge-queue status`
-
-This command reports daemon liveness, the current window and slot occupancy without taking the
-writer lock. Liveness comes from `serve.lock`, `serve.pid` and `serve.heartbeat.json` in the
-state directory (the daemon rewrites the heartbeat every cycle, and every 0.5 s during a work
-cycle): `running` (pid alive, heartbeat fresh), `not running` (no pid file), `dead` (pid file
-names a dead process, or `serve.lock` is free so the pid now belongs to something else), `stale`
-(pid alive but the heartbeat is older than `--stale-after-secs`), or `malformed` (pid file
-unreadable). A daemon in a work cycle is reported as `working for N s` (JSON `working_secs`)
-separately from liveness; with a fresh heartbeat it is `running` and no kill is advised. An
-unreadable item record makes `status` unhealthy (JSON `items_error`, exit 1) instead of
-counting zero queued changes. Every unhealthy verdict names its remedy. The window is the daemon's active batches (or the newest
-run's plan when no daemon heartbeat exists); slots count the `scratch/slot-*` checkouts.
-
-| Option | Default | Meaning |
-|---|---|---|
-| `--json` | off | Print the status report as JSON (`daemon`, `pid`, `heartbeat`, queue counts, `active_batches`, slots, `remedy`). |
-| `--stale-after-secs N` | `10` | Heartbeat age in seconds after which a live daemon counts as stale. |
-
-### Running `serve` as a service
-
-A systemd user unit template ships at `rs/merge-queue/merge-queue-serve.service`
-(`Restart=on-failure`, `ExecStart` pointing at `serve`). Install it with
-`merge-queue install-serve-unit`, not by copying the template by hand: a systemd user
-service does not inherit a login shell's `PATH`, so the installer resolves the toolchain
-directory at install time (from `rustup which cargo`, then `cargo` on `PATH`, then
-`$CARGO_HOME/bin` or `~/.cargo/bin`; override with `--toolchain-bin DIR`) and writes it
-as an absolute `Environment=PATH=...` in the rendered unit. At startup `serve` also
-refuses, naming the missing tool (for example `cargo not found`), when any executable
-its configured regenerate/validator commands name does not resolve.
+The unit sets `KillMode=mixed`, so `systemctl stop` (or a restart) signals only the daemon. The
+daemon then cancels its own validations and records them as cancelled before it exits (see
+**Stopping** above). Whatever is still running when `TimeoutStopSec` runs out is killed. Keep
+`KillMode=mixed` in a unit you write yourself. Under the default control-group mode every
+validation is signalled with the daemon. The queue reads that death as no verdict too, so
+nothing is ejected, but the validation is not recorded as cancelled.
 
 ```bash
 merge-queue install-serve-unit   # or: --print to preview, --output FILE to relocate
