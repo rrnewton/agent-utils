@@ -6788,7 +6788,8 @@ function authorEmptySentence(author, searching, pinned) {
 
 // The six kinds, their words, how a count is printed, and the kinds turned off and URL, kept on this
 // device, are web/src/present/rows's (`createLinkKinds`, `#624 voice-page-modularity`); the buttons and
-// keeping the reader's place are here.
+// keeping the reader's place are here. `linkKind`, the kind of link an address is, and the GitHub address
+// patterns it reads are web/src/foundation's.
 
 /** The kinds the reader turned off, and whether links are written as their addresses. */
 const linkKinds = createLinkKinds({
