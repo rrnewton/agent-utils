@@ -638,6 +638,166 @@ pub struct TestResults {
     pub filtered_tests: u64,
     /// Per-test terminal results. `None` is retained schema 1, not an empty run.
     pub results: Option<Vec<TestResult>>,
+    /// The run's selection, recorded once (schema 5 only).
+    ///
+    /// Omitted tests are implied by this record and are never enumerated per
+    /// test: a test with no row was omitted for this run. `None` on every
+    /// pre-schema-5 document and on schema-5 documents that do not record it.
+    pub selection: Option<TestSelection>,
+}
+
+/// One run's selection: what was asked for, recorded once at run level.
+///
+/// Results stay sparse: only tests that started get per-test rows. A focused
+/// rerun of one test makes every other test omitted for that run without
+/// listing them; they are implied by `focused_tests` (or by `expression`
+/// plus the `disabled_in_config` sets, whose source is hashed so the
+/// omission set is reproducible from the run record alone).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TestSelection {
+    /// The selection or label expression, when the run used one.
+    pub expression: Option<String>,
+    /// Explicitly focused test ids, when the run listed tests by name.
+    pub focused_tests: Vec<String>,
+    /// Suites or label sets disabled in configuration for this run.
+    pub disabled_in_config: Vec<String>,
+    /// Where `disabled_in_config` came from (config path + content hash).
+    pub disabled_in_config_source: Option<TestSelectionSource>,
+}
+
+/// Provenance of a selection's disabled-in-config sets.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TestSelectionSource {
+    /// Config file the disabled sets were read from.
+    pub path: String,
+    /// SHA-256 of that file's content at run time (64 lowercase hex).
+    pub sha256: String,
+}
+
+fn validate_selection(selection: &TestSelection) -> Result<(), String> {
+    if let Some(expression) = selection.expression.as_deref() {
+        if expression.is_empty() || expression.trim() != expression {
+            return Err(
+                "structured-test-results selection.expression must be nonempty and trimmed".into(),
+            );
+        }
+    }
+    for (field, entries) in [
+        ("focused_tests", &selection.focused_tests),
+        ("disabled_in_config", &selection.disabled_in_config),
+    ] {
+        let mut seen = std::collections::BTreeSet::new();
+        for entry in entries {
+            if entry.is_empty() || entry.trim() != entry {
+                return Err(format!(
+                    "structured-test-results selection.{field} entries must be nonempty and trimmed"
+                ));
+            }
+            if !seen.insert(entry) {
+                return Err(format!(
+                    "structured-test-results selection.{field} duplicates {entry:?}"
+                ));
+            }
+        }
+    }
+    if let Some(source) = selection.disabled_in_config_source.as_ref() {
+        if source.path.is_empty() || source.path.trim() != source.path {
+            return Err("structured-test-results selection.disabled_in_config_source.path must be nonempty and trimmed".into());
+        }
+        let digest_ok = source.sha256.len() == 64
+            && source
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        if !digest_ok {
+            return Err("structured-test-results selection.disabled_in_config_source.sha256 must be 64 lowercase hex".into());
+        }
+    }
+    Ok(())
+}
+
+fn selection_to_json(selection: &TestSelection) -> Value {
+    serde_json::json!({
+        "expression": selection.expression,
+        "focused_tests": selection.focused_tests,
+        "disabled_in_config": selection.disabled_in_config,
+        "disabled_in_config_source": selection.disabled_in_config_source.as_ref().map(|source| serde_json::json!({
+            "path": source.path,
+            "sha256": source.sha256,
+        })),
+    })
+}
+
+fn parse_selection(value: &Value) -> Result<TestSelection, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "structured-test-results-selection must be an object".to_string())?;
+    exact_fields(
+        object,
+        &[
+            "expression",
+            "focused_tests",
+            "disabled_in_config",
+            "disabled_in_config_source",
+        ],
+    )?;
+    let strings = |field: &str| -> Result<Vec<String>, String> {
+        let entries = object
+            .get(field)
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("structured-test-results-selection.{field} must be an array"))?;
+        entries
+            .iter()
+            .map(|entry| {
+                entry.as_str().map(str::to_string).ok_or_else(|| {
+                    format!("structured-test-results-selection.{field} must be strings")
+                })
+            })
+            .collect()
+    };
+    let expression = match object.get("expression") {
+        Some(Value::Null) => None,
+        Some(Value::String(expression)) => Some(expression.clone()),
+        _ => {
+            return Err(
+                "structured-test-results-selection.expression must be a string or null".into(),
+            )
+        }
+    };
+    let disabled_in_config_source = match object.get("disabled_in_config_source") {
+        Some(Value::Null) => None,
+        Some(source) => {
+            let source = source
+                .as_object()
+                .ok_or_else(|| "structured-test-results-selection.disabled_in_config_source must be an object or null".to_string())?;
+            exact_fields(source, &["path", "sha256"])?;
+            Some(TestSelectionSource {
+                path: source
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "structured-test-results-selection.disabled_in_config_source.path must be a string".to_string())?
+                    .to_string(),
+                sha256: source
+                    .get("sha256")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "structured-test-results-selection.disabled_in_config_source.sha256 must be a string".to_string())?
+                    .to_string(),
+            })
+        }
+        None => {
+            return Err(
+                "structured-test-results-selection.disabled_in_config_source is required".into(),
+            )
+        }
+    };
+    let selection = TestSelection {
+        expression,
+        focused_tests: strings("focused_tests")?,
+        disabled_in_config: strings("disabled_in_config")?,
+        disabled_in_config_source,
+    };
+    validate_selection(&selection)?;
+    Ok(selection)
 }
 
 impl TestResults {
@@ -655,6 +815,7 @@ impl TestResults {
             executed_tests,
             filtered_tests,
             results: Some(results),
+            selection: None,
         })
     }
 
@@ -673,6 +834,7 @@ impl TestResults {
             executed_tests,
             filtered_tests,
             results: Some(results),
+            selection: None,
         })
     }
 
@@ -691,6 +853,7 @@ impl TestResults {
             executed_tests,
             filtered_tests,
             results: Some(results),
+            selection: None,
         })
     }
 
@@ -708,7 +871,15 @@ impl TestResults {
             executed_tests,
             filtered_tests,
             results: Some(results),
+            selection: None,
         })
+    }
+
+    /// Attach the run's selection record (schema 5 only).
+    pub fn with_selection(mut self, selection: TestSelection) -> Result<Self, String> {
+        validate_selection(&selection)?;
+        self.selection = Some(selection);
+        Ok(self)
     }
 
     /// Read count-only schema 1, default schema 2, classified schema 3, diagnostic
@@ -728,16 +899,30 @@ impl TestResults {
                     executed_tests,
                     filtered_tests,
                     results: None,
+                    selection: None,
                 })
             }
             CURRENT_SCHEMA
             | CLASSIFIED_RESULTS_SCHEMA
             | DIAGNOSTIC_RESULTS_SCHEMA
             | SKIPPED_RESULTS_SCHEMA => {
-                exact_fields(
-                    object,
-                    &["schema", "executed_tests", "filtered_tests", "results"],
-                )?;
+                if schema == SKIPPED_RESULTS_SCHEMA {
+                    // `selection` is optional run-level metadata; every
+                    // other key must be exactly the schema-5 set.
+                    let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+                    keys.retain(|key| *key != "selection");
+                    keys.sort_unstable();
+                    if keys != ["executed_tests", "filtered_tests", "results", "schema"] {
+                        return Err(format!(
+                            "structured-test-results has unsupported fields {keys:?}"
+                        ));
+                    }
+                } else {
+                    exact_fields(
+                        object,
+                        &["schema", "executed_tests", "filtered_tests", "results"],
+                    )?;
+                }
                 let rows = object
                     .get("results")
                     .and_then(Value::as_array)
@@ -754,10 +939,20 @@ impl TestResults {
                     })?);
                 }
                 validate_results(executed_tests, &results)?;
+                let selection = if schema == SKIPPED_RESULTS_SCHEMA {
+                    match object.get("selection") {
+                        Some(Value::Null) => None,
+                        Some(value) => Some(parse_selection(value)?),
+                        None => None,
+                    }
+                } else {
+                    None
+                };
                 Ok(Self {
                     executed_tests,
                     filtered_tests,
                     results: Some(results),
+                    selection,
                 })
             }
             other => Err(format!(
@@ -795,6 +990,7 @@ impl TestResults {
 
     /// Serialize the current shape, refusing retained count-only evidence.
     pub fn to_current_json(&self) -> Result<Vec<u8>, String> {
+        require_no_selection(self)?;
         let results = self.results.as_ref().ok_or_else(|| {
             "structured-test-results-schema: retained schema 1 has no current write path"
                 .to_string()
@@ -824,6 +1020,7 @@ impl TestResults {
 
     /// Serialize complete opt-in schema-3 evidence without inventing causes.
     pub fn to_classified_json(&self) -> Result<Vec<u8>, String> {
+        require_no_selection(self)?;
         let results = self.results.as_ref().ok_or_else(|| {
             "structured-test-results-schema: retained schema 1 has no current write path"
                 .to_string()
@@ -858,6 +1055,7 @@ impl TestResults {
 
     /// Serialize complete opt-in schema-4 evidence, diagnostic reasons included.
     pub fn to_diagnostic_json(&self) -> Result<Vec<u8>, String> {
+        require_no_selection(self)?;
         let results = self.results.as_ref().ok_or_else(|| {
             "structured-test-results-schema: retained schema 1 has no current write path"
                 .to_string()
@@ -917,11 +1115,15 @@ impl TestResults {
                 }))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        if let Some(selection) = self.selection.as_ref() {
+            validate_selection(selection)?;
+        }
         serde_json::to_vec(&serde_json::json!({
             "schema": SKIPPED_RESULTS_SCHEMA,
             "executed_tests": self.executed_tests,
             "filtered_tests": self.filtered_tests,
             "results": rows,
+            "selection": self.selection.as_ref().map(selection_to_json),
         }))
         .map_err(|error| format!("structured-test-results-json: {error}"))
     }
@@ -1058,6 +1260,15 @@ fn require_blocking_result(result: &TestResult) -> Result<(), String> {
 
 /// Schemas before 5 cannot say a test skipped. Writing a skip as a plain `fail` (or
 /// dropping the reason) would silently change its meaning, so those writers refuse instead.
+fn require_no_selection(results: &TestResults) -> Result<(), String> {
+    if results.selection.is_some() {
+        return Err(format!(
+            "structured-test-results writer refuses to discard the run selection; write schema {SKIPPED_RESULTS_SCHEMA}"
+        ));
+    }
+    Ok(())
+}
+
 fn require_no_skip_result(result: &TestResult) -> Result<(), String> {
     if result.skip_reason.is_some() {
         return Err(format!(
@@ -1520,6 +1731,7 @@ mod classified_tests {
             executed_tests: 1,
             filtered_tests: 0,
             results: Some(vec![retained]),
+            selection: None,
         };
         assert!(report
             .to_classified_json()
@@ -1817,6 +2029,64 @@ mod diagnostic_tests {
             wire["results"][3]["attempt_results"][0]["outcome"],
             "skipped"
         );
+    }
+
+    #[test]
+    fn selection_round_trips_only_in_schema_5() {
+        let selection = TestSelection {
+            expression: Some("test(kvm_)".into()),
+            focused_tests: vec!["suite$skip".into()],
+            disabled_in_config: vec!["gpu-suite".into()],
+            disabled_in_config_source: Some(TestSelectionSource {
+                path: "ci/test-selection.md".into(),
+                sha256: "a".repeat(64),
+            }),
+        };
+        let report = skipped_report().with_selection(selection.clone()).unwrap();
+        let bytes = report.to_skipped_json().unwrap();
+        let parsed =
+            TestResults::from_declared_schema_json_slice(&bytes, SKIPPED_RESULTS_SCHEMA).unwrap();
+        assert_eq!(parsed, report);
+        assert_eq!(parsed.selection, Some(selection));
+        let wire: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(wire["selection"]["expression"], "test(kvm_)");
+        assert_eq!(
+            wire["selection"]["disabled_in_config_source"]["sha256"],
+            "a".repeat(64)
+        );
+        for error in [
+            report.to_current_json().unwrap_err(),
+            report.to_classified_json().unwrap_err(),
+            report.to_diagnostic_json().unwrap_err(),
+        ] {
+            assert!(
+                error.contains("refuses to discard the run selection"),
+                "{error}"
+            );
+        }
+        // Schema 4 cannot carry a selection at all.
+        let schema_four =
+            br#"{"schema":4,"executed_tests":1,"filtered_tests":0,"results":[],"selection":null}"#;
+        assert!(TestResults::from_json_slice(schema_four).is_err());
+    }
+
+    #[test]
+    fn malformed_selections_are_refused() {
+        let mut duplicate = skipped_report();
+        duplicate.selection = Some(TestSelection {
+            expression: None,
+            focused_tests: vec!["a".into(), "a".into()],
+            disabled_in_config: vec![],
+            disabled_in_config_source: None,
+        });
+        assert!(duplicate
+            .to_skipped_json()
+            .unwrap_err()
+            .contains("duplicates"));
+        let bad_digest = br#"{"schema":5,"executed_tests":0,"filtered_tests":0,"results":[],"selection":{"expression":null,"focused_tests":[],"disabled_in_config":[],"disabled_in_config_source":{"path":"ci/x.md","sha256":"short"}}}"#;
+        assert!(TestResults::from_json_slice(bad_digest)
+            .unwrap_err()
+            .contains("64 lowercase hex"));
     }
 
     #[test]
