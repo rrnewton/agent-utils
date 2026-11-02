@@ -5042,6 +5042,7 @@ fn cli_surface_contains_no_executor_or_mutation_subcommand() {
             "recover-unbound-owner",
             "transfer-owner",
             "create",
+            "create-text",
             "ensure-states",
             "explain",
             "finish",

@@ -249,6 +249,53 @@ fn assert_target_clear(
     Ok(())
 }
 
+/// Retained registry/storage findings as the Python `create`
+/// reports them: the filesystem and Git censuses merged and sorted
+/// by (machine, slot_type, slot, checkout, kind).
+pub(crate) fn retained_findings(root: Option<&Path>) -> Result<Vec<Value>> {
+    let mut findings: Vec<Value> = Vec::new();
+    for doc in [
+        crate::storage_state::parse_storage(root)?,
+        crate::git_storage_state::parse_storage_git(root)?,
+    ] {
+        if let Some(items) = doc.get("findings").and_then(Value::as_array) {
+            findings.extend(items.iter().cloned());
+        }
+    }
+    findings.sort_by_key(crate::storage_state::storage_sort_key);
+    Ok(findings)
+}
+
+fn warn_retained(findings: &[Value]) {
+    if findings.is_empty() {
+        return;
+    }
+    eprintln!(
+        "WARNING: registry/storage state remains INCONSISTENT ({} finding(s)); this create target is distinct and none of the reported state was changed",
+        findings.len()
+    );
+    for item in findings {
+        let text = |key: &str| item.get(key).and_then(Value::as_str);
+        let identity = [
+            text("machine"),
+            text("slot_type"),
+            text("slot"),
+            text("checkout"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("/");
+        eprintln!(
+            "INCONSISTENT kind={} target={}: {}",
+            text("kind").unwrap_or_default(),
+            if identity.is_empty() { "-" } else { &identity },
+            text("detail").unwrap_or_default()
+        );
+        eprintln!("  REMEDY: {}", text("remedy").unwrap_or_default());
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn create_slot(
     root: Option<&Path>,
@@ -270,6 +317,102 @@ pub(crate) fn create_slot(
     representation: &str,
     task_scope_unit: Option<&str>,
     task_scope_invocation_id: Option<&str>,
+) -> Result<Value> {
+    create_slot_inner(
+        root,
+        machine_override,
+        slot,
+        slot_type,
+        coordinator_authorized,
+        agent,
+        task,
+        purpose,
+        owner_pid,
+        coordinator_pid,
+        repos,
+        remotes_in,
+        remote_urls,
+        branches_in,
+        starts_in,
+        override_disk_floor,
+        representation,
+        task_scope_unit,
+        task_scope_invocation_id,
+        false,
+    )
+}
+
+/// Like [`create_slot`], but the returned value also carries the
+/// retained registry/storage findings the Python `create` reports,
+/// warned about on stderr before the mutation, as the oracle does.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn create_slot_text(
+    root: Option<&Path>,
+    machine_override: Option<&str>,
+    slot: &str,
+    slot_type: &str,
+    coordinator_authorized: bool,
+    agent: &str,
+    task: &str,
+    purpose: &str,
+    owner_pid: Option<i64>,
+    coordinator_pid: i64,
+    repos: &[String],
+    remotes_in: &[String],
+    remote_urls: &[String],
+    branches_in: &[String],
+    starts_in: &[String],
+    override_disk_floor: bool,
+    representation: &str,
+    task_scope_unit: Option<&str>,
+    task_scope_invocation_id: Option<&str>,
+) -> Result<Value> {
+    create_slot_inner(
+        root,
+        machine_override,
+        slot,
+        slot_type,
+        coordinator_authorized,
+        agent,
+        task,
+        purpose,
+        owner_pid,
+        coordinator_pid,
+        repos,
+        remotes_in,
+        remote_urls,
+        branches_in,
+        starts_in,
+        override_disk_floor,
+        representation,
+        task_scope_unit,
+        task_scope_invocation_id,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_slot_inner(
+    root: Option<&Path>,
+    machine_override: Option<&str>,
+    slot: &str,
+    slot_type: &str,
+    coordinator_authorized: bool,
+    agent: &str,
+    task: &str,
+    purpose: &str,
+    owner_pid: Option<i64>,
+    coordinator_pid: i64,
+    repos: &[String],
+    remotes_in: &[String],
+    remote_urls: &[String],
+    branches_in: &[String],
+    starts_in: &[String],
+    override_disk_floor: bool,
+    representation: &str,
+    task_scope_unit: Option<&str>,
+    task_scope_invocation_id: Option<&str>,
+    collect_text: bool,
 ) -> Result<Value> {
     require_fixture()?;
     if !coordinator_authorized {
@@ -641,6 +784,13 @@ pub(crate) fn create_slot(
     }
     plan.sort_by(|left, right| left.name.cmp(&right.name));
     assert_target_clear(root, &cfg, &selected, &plan)?;
+    let retained = if collect_text {
+        let findings = retained_findings(root)?;
+        warn_retained(&findings);
+        findings
+    } else {
+        Vec::new()
+    };
     // Journal + worktrees.
     if let Some(parent) = slot_path.parent() {
         std::fs::create_dir_all(parent)
@@ -977,7 +1127,7 @@ pub(crate) fn create_slot(
             format!("cannot remove journal {}: {error}", journal_path.display())
         })?;
     }
-    Ok(json!({
+    let mut result = json!({
         "machine": selected,
         "slot": slot,
         "slot_type": slot_type,
@@ -985,7 +1135,16 @@ pub(crate) fn create_slot(
         "generation": 1,
         "owner_process": if owner.is_some() { "bound" } else { "unbound" },
         "checkouts": record.get("checkouts").cloned().unwrap_or(json!([])),
-    }))
+    });
+    if collect_text {
+        if let Some(object) = result.as_object_mut() {
+            object.insert(
+                "retained_storage_inconsistencies".to_string(),
+                Value::Array(retained),
+            );
+        }
+    }
+    Ok(result)
 }
 
 fn free_bytes(path: &Path) -> Result<i64> {

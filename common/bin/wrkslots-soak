@@ -70,7 +70,8 @@ case "$CMD" in
     audit) RUST_CMD="audit-text" ;;
     shell-command) RUST_CMD="shell-command" ;;
     unpushed) RUST_CMD="unpushed-text" ;;
-    unpushed|create|adopt|heartbeat|release|hold|unhold|finish|remove|write-handoff|read-handoff|transfer-owner|recover-unbound-owner|recover-absent-agent-row|recover-absent-agent-rows|recover-absent-validate-rows|recover-ownerless-agent-worktree|recover-ownerless-agent-clone|recover-ownerless-agent-cache|classify-ownerless-validate-batch|recover-ownerless-validate-batch|recover)
+    create) RUST_CMD="create-text" ;;
+    unpushed|adopt|heartbeat|release|hold|unhold|finish|remove|write-handoff|read-handoff|transfer-owner|recover-unbound-owner|recover-absent-agent-row|recover-absent-agent-rows|recover-absent-validate-rows|recover-ownerless-agent-worktree|recover-ownerless-agent-clone|recover-ownerless-agent-cache|classify-ownerless-validate-batch|recover-ownerless-validate-batch|recover)
         RUST_CMD="$CMD" ;;
     *) run_python "$CMD" "${ORIGINAL[@]}" ;;
 esac
@@ -79,7 +80,7 @@ esac
 # Rust only for an explicit `--format json`, with the pair stripped:
 # the Rust editions print JSON only. A human or invalid value, and a
 # missing --format, stays with Python, noted like any fallback.
-FORMAT_COMMANDS=" create recover-absent-validate-rows recover-absent-agent-rows classify-ownerless-validate-batch recover-ownerless-validate-batch "
+FORMAT_COMMANDS=" recover-absent-validate-rows recover-absent-agent-rows classify-ownerless-validate-batch recover-ownerless-validate-batch "
 case "$FORMAT_COMMANDS" in
     *" $CMD "*)
         HAS_JSON=0

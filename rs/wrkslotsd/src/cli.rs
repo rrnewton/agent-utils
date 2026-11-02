@@ -845,6 +845,68 @@ pub(crate) enum Command {
         #[arg(long, value_name = "NAME")]
         machine: Option<String>,
     },
+    /// Create linked worktrees and register a slot, printing the Python `create` output (writer; fixture registries only until cutover)
+    CreateText {
+        /// New slot name
+        slot: String,
+        /// Slot type: agent or validate
+        #[arg(long, value_name = "TYPE")]
+        slot_type: String,
+        /// Confirm the coordinator assigned this slot
+        #[arg(long)]
+        coordinator_authorized: bool,
+        /// Registered agent name
+        #[arg(long, value_name = "NAME")]
+        agent: String,
+        /// Task or work-item identifier
+        #[arg(long, value_name = "TASK")]
+        task: String,
+        /// Short human-readable reason for the slot
+        #[arg(long, value_name = "TEXT")]
+        purpose: String,
+        /// Live owner PID to bind (omit only when the owner will adopt)
+        #[arg(long, value_name = "PID")]
+        owner_pid: Option<i64>,
+        /// Live assigned coordinator PID
+        #[arg(long, value_name = "PID")]
+        coordinator_pid: i64,
+        /// Source repository as NAME=PATH (repeat once per checkout)
+        #[arg(long, value_name = "NAME=PATH")]
+        repo: Vec<String>,
+        /// Configured Git remote as NAME=REMOTE
+        #[arg(long, value_name = "NAME=REMOTE")]
+        remote: Vec<String>,
+        /// Expected fetch URL as NAME=URL
+        #[arg(long, value_name = "NAME=URL")]
+        remote_url: Vec<String>,
+        /// New local branch as NAME=BRANCH (once per repo)
+        #[arg(long, value_name = "NAME=BRANCH")]
+        branch: Vec<String>,
+        /// Start ref as NAME=REF
+        #[arg(long, value_name = "NAME=REF")]
+        start: Vec<String>,
+        /// Allow create below the provisioning floor, never below emergency
+        #[arg(long)]
+        override_disk_floor: bool,
+        /// Transient systemd scope containing --owner-pid (both scope options together)
+        #[arg(long, value_name = "UNIT.scope")]
+        task_scope_unit: Option<String>,
+        /// Lowercase 32-hex systemd InvocationID for --task-scope-unit
+        #[arg(long, value_name = "HEX32")]
+        task_scope_invocation_id: Option<String>,
+        /// Storage representation: config, worktree, or image
+        #[arg(long, value_name = "KIND", default_value = "config")]
+        representation: String,
+        /// Output format: human prints the created lines; json prints the payload
+        #[arg(long, value_name = "FORMAT", default_value = "human", value_parser = ["human", "json"])]
+        format: String,
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
     /// Record a slot's finish handoff in its active record (writer; fixture registries only until cutover)
     Finish {
         /// Active slot whose work is finished
@@ -2078,6 +2140,58 @@ pub fn run() -> u8 {
                 }
             }
         }
+        Command::CreateText {
+            slot,
+            slot_type,
+            coordinator_authorized,
+            agent,
+            task,
+            purpose,
+            owner_pid,
+            coordinator_pid,
+            repo,
+            remote,
+            remote_url,
+            branch,
+            start,
+            override_disk_floor,
+            task_scope_unit,
+            task_scope_invocation_id,
+            representation,
+            format,
+            root,
+            machine,
+        } => match crate::create_text::create_text(
+            root.as_deref(),
+            machine.as_deref(),
+            &slot,
+            &slot_type,
+            coordinator_authorized,
+            &agent,
+            &task,
+            &purpose,
+            owner_pid,
+            coordinator_pid,
+            &repo,
+            &remote,
+            &remote_url,
+            &branch,
+            &start,
+            override_disk_floor,
+            &representation,
+            task_scope_unit.as_deref(),
+            task_scope_invocation_id.as_deref(),
+            format == "json",
+        ) {
+            Ok(text) => {
+                print!("{text}");
+                return 0;
+            }
+            Err(error) => {
+                eprintln!("wrkslotsd: {error}");
+                return 1;
+            }
+        },
         Command::Finish {
             slot,
             agent,

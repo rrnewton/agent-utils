@@ -44,6 +44,9 @@ case "$1" in
   unpushed-text)
     if [ "$2" = "--help" ]; then echo "Usage: --root --machine --slot --format"; exit 0; fi
     echo "RS unpushed-text $@" ;;
+  create-text)
+    if [ "$2" = "--help" ]; then echo "Usage: --root --machine --slot-type --coordinator-authorized --agent --task --purpose --owner-pid --coordinator-pid --repo --remote --remote-url --branch --start --override-disk-floor --task-scope-unit --task-scope-invocation-id --representation --format"; exit 0; fi
+    echo "RS create-text $@" ;;
   heartbeat)
     if [ "$2" = "--help" ]; then echo "Usage: --agent --owner-pid --expected-generation --root --machine"; exit 0; fi
     echo "RS heartbeat-run $@" ;;
@@ -168,18 +171,29 @@ def test_unknown_flag_falls_back_to_python(tmp_path: Path) -> None:
     assert "python (not yet in Rust)" in result.stderr
 
 
+def test_create_both_formats_run_in_rust(tmp_path: Path) -> None:
+    root, log = _sandbox(tmp_path)
+    human = _run(root, log, "create", "slot01")
+    assert human.returncode == 0, human.stderr
+    assert human.stdout.startswith("RS create-text create-text slot01")
+    payload = _run(root, log, "create", "slot01", "--format", "json")
+    assert payload.returncode == 0, payload.stderr
+    assert payload.stdout.startswith("RS create-text create-text slot01 --format json")
+    assert "cmd=create edition=rust rc=0" in log.read_text()
+
+
 def test_format_value_is_checked_not_just_the_flag(tmp_path: Path) -> None:
     root, log = _sandbox(tmp_path)
-    human = _run(root, log, "create", "--format", "human")
-    assert human.stdout.startswith("PY wrkslots create")
-    bogus = _run(root, log, "create", "--format", "bogus")
-    assert bogus.stdout.startswith("PY wrkslots create")
+    human = _run(root, log, "recover-absent-validate-rows", "--format", "human")
+    assert human.stdout.startswith("PY wrkslots recover-absent-validate-rows")
+    bogus = _run(root, log, "recover-absent-validate-rows", "--format", "bogus")
+    assert bogus.stdout.startswith("PY wrkslots recover-absent-validate-rows")
 
 
 def test_format_default_commands_stay_python_without_json(tmp_path: Path) -> None:
     root, log = _sandbox(tmp_path)
-    result = _run(root, log, "create", "slot01")
-    assert result.stdout.startswith("PY wrkslots create")
+    result = _run(root, log, "recover-absent-validate-rows", "slot01")
+    assert result.stdout.startswith("PY wrkslots recover-absent-validate-rows")
     assert "python (not yet in Rust)" in result.stderr
 
 
