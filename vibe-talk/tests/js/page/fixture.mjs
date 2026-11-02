@@ -1884,6 +1884,9 @@ const presentTime = (overlays = []) => moduleForTests("src/present/time/index.ts
 const PRESENT_TIME = await presentTime();
 /** The channel's rows as the DOM draws them (web/src/view/channel): handed the page's own nodes. */
 const VIEW_CHANNEL = await moduleForTests("src/view/channel/index.ts");
+/** The canned prompt list and the existing-message confirmation window, from their Settings owners. */
+const { CANNED_PROMPTS } = await moduleForTests("src/view/settings/canned.ts");
+const { OWN_READ_APPLY_ARM_MS } = await moduleForTests("src/view/settings/ownread.ts");
 /**
  * The names the page takes from its modules: what the prelude declares for the legacy script
  * (web/src/legacy/imports.ts). `page.pure` refuses them: what moved into a module is tested through
@@ -7154,15 +7157,8 @@ async function pressOn(page, node, kind = "mouse", scroller = "scroll-area") {
 
 // --- the canned prompts (#60 canned-prompt-buttons) -----------------------------------------------
 
-/** The list the page is built around, read out of its own source rather than restated here. */
-const CANNED = (() => {
-  const block = /const CANNED_PROMPTS = \[([\s\S]*?)\n\];/.exec(PAGE_CODE);
-  assert.ok(block, "web/voice.js no longer declares CANNED_PROMPTS as a list");
-  return [...block[1].matchAll(/button:\s*"([^"]+)",\s*\n?\s*field:\s*"([^"]+)"/g)].map((m) => ({
-    button: m[1],
-    field: m[2],
-  }));
-})();
+/** The list the page is built around, read from its owner rather than restated here. */
+const CANNED = CANNED_PROMPTS.map(({ button, field }) => ({ button, field }));
 
 // --- the jump to the newest message, wherever the reader is up the history ---------------------
 //
@@ -10007,7 +10003,7 @@ export { ACKNOWLEDGED, ALIAS_NOTICE, ALICE, BASE_CSS, BIG, BIG_ROOT, BOTTOM_SLAC
   DEFAULT_POST_PREFIX, DESKTOP_QUERY, DISCORD_POLL_MS, DONE_FLASH_FADE_MS, DONE_FLASH_HOLD_MS,
   FIXTURE_TREE, FakeElement, GATHERED, GLYPHS, HELP_SLUGS, HOLD_MS, HOVER_QUERY, HTML, HTML_CODE,
   INBOX, INBOX_NOTICE, LINE_PX, LINK_ATTRS, MESSAGE_CACHE_KEY, MESSAGE_DAY, MESSAGE_SPACING_MS,
-  MIC_TOGGLE_IDS, MINTED, MODULE_CODE, NOISE_MATCHING, OTHER_CHANNEL, OWN, OWNER, OWNERS_MESSAGE,
+  MIC_TOGGLE_IDS, MINTED, MODULE_CODE, NOISE_MATCHING, OTHER_CHANNEL, OWN, OWNER, OWNERS_MESSAGE, OWN_READ_APPLY_ARM_MS,
   PAGE_CODE, PAGE_ELEMENTS, PAGE_IDS, PAGE_READ_REASONS, PAGE_SCRIPTS, PRELUDE, PRESENT_CALL,
   PRESENT_ROWS, PRESENT_TIME,
   PULL_ARM_PX, PULL_WAIT_MS, RECORD_EPOCH, REDRAFT_WAIT_MS, RELAY_COALESCE_MS, RELAY_FENCE_OPEN,

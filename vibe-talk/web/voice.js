@@ -83,7 +83,6 @@ function takePairingCode() {
 // option and is deliberately not taken: a token that was revoked in the meantime would produce a
 // refusal loop nobody could see the cause of, and silently reusing a credential the owner cannot
 // see is worse than asking for it once.
-const MIC_SETTINGS_KEY = "vibe-talk.voice.mic";
 const COLLAPSED_LINES_KEY = DEVICE_SETTINGS.collapsedLines.key;
 const READ_SPEED_KEY = DEVICE_SETTINGS.readSpeed.key;
 const MARK_OWN_KEY = DEVICE_SETTINGS.markOwnRead.key;
@@ -291,27 +290,18 @@ function deploymentHost() {
   return origin.split("/")[0] || deploymentOrigin();
 }
 
-/**
- * `#372 settings-header-layout`. The host on one line, whole in its tooltip, and in two parts: the name,
- * cut with an ellipsis where the line is too short for it, and the port, never cut, since the port is
- * what tells two instances on one host apart (`#342 settings-server-hostname`) and a phone has no
- * tooltip to show it in. `[::1]:8443` splits at its last colon; `[::1]` has no port.
- */
-function renderServerHost() {
-  const host = deploymentHost();
-  const [, name, port] = /^(.+?)(:\d+)?$/.exec(host) || ["", host, ""];
-  const namePart = document.createElement("span");
-  namePart.className = "settings-server-name";
-  namePart.textContent = name;
-  const portPart = document.createElement("span");
-  portPart.className = "settings-server-port";
-  portPart.textContent = port || "";
-  el("settings-server-host").replaceChildren(namePart, portPart);
-  el("settings-server-host").style.setProperty("--port-width", `${(port || "").length}ch`);
-  el("settings-server-host").title = host;
-}
+const settingsReadouts = mountSettingsReadouts({
+  lookup: (id) => el(id),
+  deploymentHost: () => deploymentHost(),
+  pageOutOfDate: () => pageOutOfDate(),
+  get pageBuild() { return PAGE_BUILD; },
+  get serverPageBuild() { return serverPageBuild; },
+  get voice() { return conversationalVoice; },
+  renderFolds: () => settingsFolds.renderAll(),
+  deviceSettings: () => deviceSettings(),
+});
 
-renderServerHost();
+settingsReadouts.serverHost();
 
 // ONE status line. It used to be two — a word under the header and a sentence at the foot — which
 // is how the closed state managed to announce itself three times in three vocabularies. The
@@ -619,7 +609,7 @@ function voiceCall() {
     get keepBoxInView() { return keepBoxInView; },
     get currentScreen() { return currentScreen; },
     get currentView() { return currentView; },
-    get CANNED_PROMPTS() { return CANNED_PROMPTS; },
+    get CANNED_PROMPTS() { return /** @type {import("./src/view/settings/index.ts").CannedPrompt[]} */ (CANNED_PROMPTS); },
     get token() { return token; },
     get apiDecoded() { return apiDecoded; },
     get readingMode() { return readAloudOwner().readingMode; },
@@ -641,13 +631,13 @@ function voiceCall() {
     set startAwaitingAnswer(value) { voiceTranscript().startAwaitingAnswer = value; },
     get fetchResume() { return fetchResume; },
     get showDetail() { return showDetail; },
-    get micSettings() { return micSettings; },
+    get micSettings() { return microphoneSettings.read; },
     get openCallMicrophone() { return openCallMicrophone; },
     get echoCancellationRefused() { return voiceTranscript().echoCancellationRefused; },
     get browserPorts() { return browserPorts; },
     get applyCallOutput() { return applyCallOutput; },
-    get refreshAudioDeviceSelects() { return refreshAudioDeviceSelects; },
-    get renderAudioRouteReadout() { return renderAudioRouteReadout; },
+    get refreshAudioDeviceSelects() { return audioDevices.refresh; },
+    get renderAudioRouteReadout() { return audioDevices.renderRoute; },
     get resumeViaProfile() { return voiceTranscript().resumeViaProfile; },
     get armRecapForCall() { return voiceTranscript().armRecapForCall; },
     get dismissBanner() { return dismissBanner; },
@@ -659,8 +649,8 @@ function voiceCall() {
     get recapFor() { return voiceTranscript().recapFor; },
     get expectStartMarker() { return voiceTranscript().expectStartMarker; },
     get lastEndCause() { return voiceTranscript().lastEndCause; },
-    get handOverAgentPrompt() { return handOverAgentPrompt; },
-    get renderAfterHandOver() { return renderAfterHandOver; },
+    get handOverAgentPrompt() { return agentSettings.handOverPrompt; },
+    get renderAfterHandOver() { return agentSettings.renderAfterHandOver; },
     get noteConversationEnded() { return voiceTranscript().noteConversationEnded; },
     get noteSessionStartedForSpokenYes() { return voiceTranscript().noteSessionStartedForSpokenYes; },
     get heardEpoch() { return voiceTranscript().heardEpoch; },
@@ -743,7 +733,7 @@ function voiceTranscript() {
     get cardsOpening() { return cardsOpening; },
     get threadListShown() { return threadListShown; },
     get tokenScope() { return tokenScope; },
-    get voiceSendSetting() { return voiceSendSetting; },
+    get voiceSendSetting() { return agentSettings.sendSetting(); },
     get hasEnded() { return voiceCall().hasEnded; },
     set hasEnded(value) { voiceCall().hasEnded = value; },
     get hasSuspended() { return voiceCall().hasSuspended; },
@@ -2018,9 +2008,46 @@ async function copyDeepLink(message) {
 /** Whether a link to a message opens it here. ON unless the reader has turned it off. */
 let inAppLinks = true;
 
+/** Settings presents message preferences; each feature still owns and applies its value. */
+const messagePreferences = mountMessagePreferences({
+  lookup: (id) => el(id),
+  deviceSettings: () => deviceSettings(),
+  status: (text) => setStatus(text),
+  persistCollapsedLines: (n) => persistCollapsedLines(n),
+  changeCollapsedLines: (value) => collapsedLinesChanged(value),
+  persistCardMaxLines: (n) => persistCardMaxLines(n),
+  changeCardMaxLines: (value) => cardMaxLinesChanged(value),
+  applyQuoteReadPercent: (value) => applyQuoteReadPercent(value),
+  applyInAppLinks: (on) => applyInAppLinks(on),
+  redrawMessageLinks: () => redrawMessageLinks(),
+  applySummarizeCollapsed: (on) => applySummarizeCollapsed(on),
+  applyRichHeaders: (on) => applyRichHeaders(on),
+  applyMarkOwnRead: (on) => applyMarkOwnRead(on),
+  applyHideEmptyMessages: (on) => applyHideEmptyMessages(on),
+  redrawHiddenEmptyMessages: () => {
+    if (threadingSupported) {
+        eachColumn(renderCachedTimeline);
+        // ...and the thread cards, whose unread counts it changes: the Threads list's, which that redraw
+        // leaves alone, and the right column's.
+        eachColumn(() => {
+          if (selection().view === "threads") el("thread-list").replaceChildren(...threadCards(timelineRows().threads));
+        });
+        renderSideColumn();
+      } else if (hideEmptyMessages && !readModes.hiding()) {
+        regroupChannelRows();
+      } else {
+        guardQuietly(() => (readModes.hiding() ? loadTodo : loadDiscord)({ keepPosition: true, ownAct: true, readAs: "mutation" }))();
+      }
+  },
+  applyCombineMessages: (on) => applyCombineMessages(on),
+  regroupChannelRows: () => eachColumn(regroupChannelRows),
+  chooseOpenInView: (view) => chooseOpenInView(view),
+  storedOpenInView: () => storedOpenInView(),
+});
+
 function applyInAppLinks(on) {
   inAppLinks = Boolean(on);
-  el("in-app-links").checked = inAppLinks;
+  messagePreferences.inAppLinks.render(inAppLinks);
   try {
     deviceSettings().keep(DEVICE_SETTINGS.inAppLinks, inAppLinks);
   } catch (_error) {
@@ -2062,7 +2089,7 @@ function storedOpenInView() {
 
 /** Draw the choice as stored. Never writes it: an absent choice stays absent, so it syncs nothing. */
 function renderOpenInView() {
-  el("open-in-view").value = storedOpenInView();
+  messagePreferences.openInView.render();
 }
 
 /** Keep the reader's choice, `view`, and draw it. */
@@ -2519,13 +2546,13 @@ function showScreen(name) {
   if (main) renderJumpNewest();
   // `#355 provider-grouped-channels`. Settings opens on the service of the channel being read; not on
   // the way back from Help, which is the same visit, where the reader's choice stands.
-  if (name === "settings" && previous !== "settings" && previous !== "help") pointSettingsAtReading();
+  if (name === "settings" && previous !== "settings" && previous !== "help") channelSettings.pointSettingsAtReading();
   // `#232 upstream-mark-read`. The server may have pushed since the box was last drawn.
   if (name === "settings" && previous !== "settings") upstreamClearBox.refresh();
   // `#602 history-settings-and-limits`. The walk has gone on since the box was last drawn.
   if (name === "settings" && previous !== "settings") channelHistoryBox.refresh();
   // `#303 voice-post-prefix`. Another device may have saved or reset the tag since sign-in.
-  if (name === "settings" && previous !== "settings") refreshVoicePostPrefix();
+  if (name === "settings" && previous !== "settings") agentPrefix.refresh();
   // `#193 compose-draft-loss`. Its ages and channel names as they are now, and none past its days.
   if (name === "settings" && previous !== "settings") dismissedSendsView.render();
   // `#402 who-is-who-channel-box`. Who is who in the box's channel, as the census stands now.
@@ -2558,7 +2585,7 @@ function closeSettings() {
 
 /**
  * The folds on Settings: whether one is open, open or fold one, whether one is on the page, and the
- * button over them all redrawn, as a group shown or hidden must (`renderAgentLink`, `serverCacheBox`).
+ * button over them all redrawn, as a group shown or hidden must (`settingsReadouts.agentLink`, `serverCacheBox`).
  *
  * @type {import("./src/view/settings/index.ts").SettingsFolds}
  */
@@ -2907,12 +2934,22 @@ const BANNER_DISMISS_MS = 8000;
 let connectionDetail = "";
 let bannerTimer = null;
 
+/** The permanent connection readouts; their live values stay with the channel's owner. */
+const connectionReadouts = mountConnectionReadouts({
+  lookup: (id) => el(id),
+  live: {
+    get delivery() { return liveDelivery; },
+    get pollSeconds() { return livePollSeconds; },
+    attached: () => liveFollow.attached(),
+  },
+});
+
 function renderDetail() {
   const text = redact(connectionDetail);
   el("connection-detail").textContent = text;
   // `#348 settings-dynamic-lists`. Settings draws it as a readout, one part to a line; the banner
   // keeps the one line it has room for.
-  el("settings-detail").textContent = text.split(" · ").join("\n");
+  connectionReadouts.detail(text);
 }
 
 function showDetail(text) {
@@ -4148,7 +4185,7 @@ const summaryRows = createSummaries({
  */
 function applySummarizeCollapsed(on) {
   const wanted = Boolean(on);
-  el("summarize-collapsed").checked = wanted;
+  messagePreferences.summaries.render(wanted);
   try {
     deviceSettings().keep(DEVICE_SETTINGS.summarizeCollapsed, wanted);
   } catch (_error) {
@@ -10250,98 +10287,10 @@ function viewKeysNote() {
 // third button is one entry here plus one pair of elements in web/voice.html — never a new code
 // path. Every loop below iterates this.
 
-const PROMPTS_KEY = "vibe-talk.voice.prompts";
-
-const CANNED_PROMPTS = [
-  {
-    key: "summary",
-    button: "canned-summary",
-    field: "prompt-summary",
-    // The resting tooltip, HERE rather than in web/voice.html, for the same reason the default
-    // prompt text is here: `renderCannedPrompts` swaps the title for "Start a call first" and back,
-    // so a copy in the markup would be a second answer to "what does this button say" that goes
-    // stale the first time the swap runs.
-    title:
-      "Ask the agent to summarize the recent messages from the coding agent in this channel. " +
-      "Editable in Settings.",
-    // WEAKER THAN THE ISSUE FILED, ON PURPOSE. The wording asked for was "Summarize my unread
-    // messages from the coding agent since I last messaged them", and `#61 unread-status` reported
-    // that both halves of that scoping are impossible here: Discord gives a bot no read state, and
-    // the fallback is not computable either — the owner has no identity in this server, his own
-    // replies are posted AS the bot, and the only author signal is `global_name`, which anyone can
-    // set to anything. A button whose text claims a scoping the data cannot support produces
-    // confident, wrong summaries, which is a failure this project has already paid for once. So
-    // this asks for what the digest genuinely provides. The full argument, with code anchors, is
-    // in ai_docs/UNREAD_STATUS_20260819.md; building the capability is a separate feature.
-    text: "Summarize the recent messages from the coding agent in this channel.",
-    said: "Asked for a summary of the recent messages in the channel.",
-  },
-  {
-    key: "blockers",
-    button: "canned-blockers",
-    field: "prompt-blockers",
-    title:
-      "Ask the agent to make the CODING AGENT report its progress and anything waiting on you. " +
-      "This spends coding-agent work. Editable in Settings.",
-    // Unaffected by the above: it makes no claim about read state, it asks the coding agent to
-    // report on itself.
-    text:
-      "Tell the coding agent to summarize what it has accomplished since last interacting with " +
-      "the user, not assuming the user has read any updates in the intervening time, and list " +
-      "out any blockers or items that are waiting on the human user.",
-    said: "Asked the coding agent for progress and blockers.",
-  },
-];
-
-/** What was stored, defaulted PER KEY, so a corrupt or partial entry cannot empty a button. */
-function storedPrompts() {
-  let stored = null;
-  try {
-    stored = JSON.parse(deviceStorage().getItem(PROMPTS_KEY) || "null");
-  } catch (_error) {
-    stored = null;
-  }
-  const prompts = {};
-  for (const entry of CANNED_PROMPTS) {
-    const held = stored && typeof stored === "object" ? stored[entry.key] : null;
-    prompts[entry.key] = typeof held === "string" && held.trim() !== "" ? held : entry.text;
-  }
-  return prompts;
-}
-
-function persistPrompts() {
-  const prompts = {};
-  for (const entry of CANNED_PROMPTS) {
-    prompts[entry.key] = promptFor(entry);
-  }
-  const encoded = JSON.stringify(prompts);
-  try {
-    deviceStorage().setItem(PROMPTS_KEY, encoded);
-  } catch (_error) {
-    return false;
-  }
-  // Read back rather than assume, for the third time in this file and for the same reason: private
-  // browsing accepts setItem and stores nothing.
-  return deviceStorage().getItem(PROMPTS_KEY) === encoded;
-}
-
-/**
- * What this button will actually send.
- *
- * An emptied field falls back to the default rather than sending nothing. A canned button that has
- * been cleared out is otherwise a control that is present, looks live, and does nothing — the
- * exact failure this page keeps removing.
- */
-function promptFor(entry) {
-  return el(entry.field).value.trim() || entry.text;
-}
-
-function promptsChanged() {
-  el("prompt-state").textContent = persistPrompts()
-    ? "Saved. The buttons send this from now on."
-    : "This browser refused to store the prompts, so they will be back to the defaults when you " +
-      "reload (private browsing does this). The buttons send what is in the boxes for now.";
-}
+const cannedPrompts = mountCannedPrompts({
+  lookup: (id) => el(id),
+  storage: deviceStorageOnUse(),
+});
 
 /**
  * Whether the tray of canned prompts is open.
@@ -10563,45 +10512,11 @@ voiceTranscript().initializeHeardPage(Math.random().toString(36).slice(2, 10));
 // answering its own voice on speakerphone, background noise reaching the transcriber, and — the
 // awkward one — automatic gain amplifying a silent room until a phone being set down crosses the
 // speech threshold and gets transcribed as a word.
-const MIC_TOGGLES = [
-  ["mic-echo-cancellation", "echoCancellation"],
-  ["mic-noise-suppression", "noiseSuppression"],
-  ["mic-auto-gain", "autoGainControl"],
-];
-
-const DEFAULT_MIC_SETTINGS = {
-  echoCancellation: true, // stated explicitly today.
-  noiseSuppression: true, // stated explicitly today.
-  autoGainControl: true, // NOT stated today; see `audioConstraints`.
-};
-
-/** What the checkboxes say right now. The DOM is the live truth; storage only carries it across reloads. */
-function micSettings() {
-  const settings = {};
-  for (const [id, key] of MIC_TOGGLES) {
-    settings[key] = /** @type {HTMLInputElement} */ (el(id)).checked === true;
-  }
-  return settings;
-}
-
-/** What was stored, defaulted per key. A corrupt or partial entry falls back to today's behaviour. */
-function storedMicSettings() {
-  const settings = { ...DEFAULT_MIC_SETTINGS };
-  let stored = null;
-  try {
-    stored = JSON.parse(deviceStorage().getItem(MIC_SETTINGS_KEY) || "null");
-  } catch (_error) {
-    stored = null;
-  }
-  if (stored && typeof stored === "object") {
-    for (const key of Object.keys(settings)) {
-      if (typeof stored[key] === "boolean") {
-        settings[key] = stored[key];
-      }
-    }
-  }
-  return settings;
-}
+const microphoneSettings = mountMicrophoneSettings({
+  lookup: (id) => el(id),
+  storage: deviceStorageOnUse(),
+  streamOpen: () => Boolean(voiceCall().session.stream),
+});
 
 // The constraint object handed to getUserMedia.
 //
@@ -10625,33 +10540,6 @@ function audioConstraints(settings) {
     audio.autoGainControl = false;
   }
   return { audio };
-}
-
-function persistMicSettings(settings) {
-  const encoded = JSON.stringify(settings);
-  try {
-    deviceStorage().setItem(MIC_SETTINGS_KEY, encoded);
-  } catch (_error) {
-    return false;
-  }
-  // Read it back rather than assuming, exactly as saving the token does: private browsing accepts
-  // setItem and stores nothing, and "saved" would then be a lie found out only after a reload.
-  return deviceStorage().getItem(MIC_SETTINGS_KEY) === encoded;
-}
-
-// A toggle flipped mid-call does NOT reach the open microphone — the constraints were read when
-// the stream opened. Saying "saved" and stopping there would leave a control that looks like it
-// did something; so the line under the toggles states which call the change lands on.
-function micSettingsChanged() {
-  const saved = persistMicSettings(micSettings());
-  const when = voiceCall().session.stream
-    ? "The microphone is already open, so this does NOT change the call in progress — hang up " +
-      "and start again to apply it."
-    : "It applies the next time you start talking.";
-  el("mic-settings-state").textContent = saved
-    ? `Saved. ${when}`
-    : "This browser refused to store the setting, so it will be forgotten when you reload " +
-      `(private browsing does this). ${when}`;
 }
 
 // --- audio devices: `#619 voice-bluetooth-output` -------------------------------------------------
@@ -10680,49 +10568,22 @@ function micSettingsChanged() {
 // mode. Echo cancellation stays ON by default (`#264 voice-send-approval`): it is part of why
 // Chromium treats this capture as a call, and the speakerphone/car cases keep it.
 
-const AUDIO_DEVICES_KEY = "vibe-talk.voice.audio-devices";
 
 /** The route of the call in progress, for the readout and the call-end record; null between calls. */
 // eslint-disable-next-line prefer-const -- reassigned at every call start and end.
 let callAudioRoute = null;
 
-/** What was stored: `{inputId, outputId}`, each "" for System default. Anything else is ignored. */
-function storedAudioDevicePrefs() {
-  let stored = null;
-  try {
-    stored = JSON.parse(deviceStorage().getItem(AUDIO_DEVICES_KEY) || "null");
-  } catch (_error) {
-    stored = null;
-  }
-  const prefs = { inputId: "", outputId: "" };
-  if (stored && typeof stored === "object") {
-    if (typeof stored.inputId === "string") prefs.inputId = stored.inputId;
-    if (typeof stored.outputId === "string") prefs.outputId = stored.outputId;
-  }
-  return prefs;
-}
-
-function persistAudioDevicePrefs(prefs) {
-  const encoded = JSON.stringify(prefs);
-  try {
-    deviceStorage().setItem(AUDIO_DEVICES_KEY, encoded);
-  } catch (_error) {
-    return false;
-  }
-  return deviceStorage().getItem(AUDIO_DEVICES_KEY) === encoded;
-}
-
-/** The Settings selects' word, falling back to storage before they exist. */
-function audioDevicePrefs() {
-  const prefs = storedAudioDevicePrefs();
-  const input = /** @type {HTMLSelectElement | null} */ (document.getElementById("audio-input-device"));
-  const output = /** @type {HTMLSelectElement | null} */ (document.getElementById("audio-output-device"));
-  // A select still showing System default may only not have been filled yet (its refresh is
-  // asynchronous): storage, which the change handler keeps current, is the safer word then.
-  if (input && input.value) prefs.inputId = input.value;
-  if (output && output.value) prefs.outputId = output.value;
-  return prefs;
-}
+const audioDevices = mountAudioDevices({
+  lookup: (id) => el(id),
+  storage: deviceStorageOnUse(),
+  mediaDevices: () => navigator.mediaDevices,
+  outputSinkSupported: () => outputSinkSupported(),
+  deviceLabel: (device) => deviceLabel(device),
+  classifyAudioDevice: (label) => classifyAudioDevice(label),
+  stream: () => voiceCall().session.stream,
+  audio: () => voiceCall().session.audio,
+  route: () => callAudioRoute,
+});
 
 /**
  * The one read of a media device's, track's or track-settings' label in this section: the
@@ -10807,7 +10668,7 @@ async function openCallMicrophone(mic) {
   } catch (_error) {
     return stream;
   }
-  const chosen = pickCallInput(devices, audioDevicePrefs());
+  const chosen = pickCallInput(devices, audioDevices.preferences());
   const current = trackOf(stream);
   let currentId;
   let currentLabel = "";
@@ -10845,7 +10706,7 @@ async function openCallMicrophone(mic) {
  */
 async function applyCallOutput(context) {
   if (!context || typeof context.setSinkId !== "function") return;
-  const prefs = audioDevicePrefs();
+  const prefs = audioDevices.preferences();
   if (!prefs.outputId) return;
   try {
     await context.setSinkId(prefs.outputId);
@@ -10867,107 +10728,6 @@ async function applyCallOutput(context) {
   } catch (_error) {
     // No list, no kind: the readout says the sink id instead.
   }
-}
-
-/** Fill the Settings device selects from what the browser can name right now. */
-async function refreshAudioDeviceSelects() {
-  const input = document.getElementById("audio-input-device");
-  const output = document.getElementById("audio-output-device");
-  const outputField = document.getElementById("audio-output-field");
-  if (outputField) outputField.hidden = !outputSinkSupported();
-  if (!input && !output) return;
-  const prefs = storedAudioDevicePrefs();
-  let devices = [];
-  if (navigator.mediaDevices && typeof navigator.mediaDevices.enumerateDevices === "function") {
-    try {
-      devices = await navigator.mediaDevices.enumerateDevices();
-    } catch (_error) {
-      devices = [];
-    }
-  }
-  const fill = (select, kind, chosenId) => {
-    if (!select) return;
-    const listed = devices.filter((d) => d && d.kind === kind);
-    select.replaceChildren();
-    const system = document.createElement("option");
-    system.value = "";
-    system.textContent = "System default";
-    select.append(system);
-    listed.forEach((device, at) => {
-      const option = document.createElement("option");
-      option.value = device.deviceId;
-      option.textContent = deviceLabel(device) || `${kind === "audioinput" ? "Microphone" : "Output"} ${at + 1}`;
-      select.append(option);
-    });
-    if (chosenId && !listed.some((d) => d.deviceId === chosenId)) {
-      const gone = document.createElement("option");
-      gone.value = chosenId;
-      gone.textContent = "Chosen device (not connected now)";
-      select.append(gone);
-    }
-    select.value = chosenId;
-  };
-  fill(input, "audioinput", prefs.inputId);
-  fill(output, "audiooutput", prefs.outputId);
-}
-
-function audioDevicesChanged() {
-  const saved = persistAudioDevicePrefs(audioDevicePrefs());
-  const when = voiceCall().session.stream
-    ? "The call in progress keeps the devices it opened with — hang up and start again to apply it."
-    : "It applies the next time you start talking.";
-  el("audio-devices-state").textContent = saved
-    ? `Saved. ${when}`
-    : `This browser refused to store the choice, so it will be forgotten when you reload. ${when}`;
-  renderAudioRouteReadout();
-}
-
-/**
- * The opt-in readout (`#619`): the chosen devices, and the route the browser REPORTS — the
- * open track's own settings and the context's sink — so one screenshot shows whether Chrome
- * took the call to the headset or left it on the speaker. Labels live here only; the server
- * record carries kinds, never names.
- */
-async function renderAudioRouteReadout() {
-  const box = document.getElementById("audio-route-readout");
-  const toggle = /** @type {HTMLInputElement | null} */ (document.getElementById("audio-route-toggle"));
-  if (!box || !toggle) return;
-  box.hidden = !toggle.checked;
-  if (!toggle.checked) return;
-  const prefs = audioDevicePrefs();
-  const lines = [];
-  let devices = [];
-  if (navigator.mediaDevices && typeof navigator.mediaDevices.enumerateDevices === "function") {
-    try {
-      devices = await navigator.mediaDevices.enumerateDevices();
-    } catch (_error) {
-      devices = [];
-    }
-  }
-  const nameOf = (id, kind) => {
-    if (!id) return "System default";
-    const found = devices.find((d) => d.deviceId === id && d.kind === kind);
-    return found ? (deviceLabel(found) || found.deviceId) : `${id} (not connected now)`;
-  };
-  lines.push(`Microphone choice: ${nameOf(prefs.inputId, "audioinput")}`);
-  lines.push(outputSinkSupported()
-    ? `Speaker choice: ${nameOf(prefs.outputId, "audiooutput")}`
-    : "Speaker choice: this browser cannot choose an output (on Android the call follows the microphone's route)");
-  const inputs = devices.filter((d) => d.kind === "audioinput");
-  lines.push(`Microphones the browser lists: ${inputs.length
-    ? inputs.map((d) => `${deviceLabel(d) || d.deviceId} [${classifyAudioDevice(deviceLabel(d))}]`).join("; ")
-    : "none yet — start a call once so the browser may name them"}`);
-  if (voiceCall().session.stream) {
-    const track = voiceCall().session.stream.getTracks()[0];
-    const settings = track && typeof track.getSettings === "function" ? track.getSettings() : {};
-    lines.push(`This call's microphone: ${deviceLabel(settings) || deviceLabel(track) || settings.deviceId || "browser did not say"} [${callAudioRoute ? callAudioRoute.inputKind : "other"}]`);
-  } else {
-    lines.push("This call's microphone: no call is open");
-  }
-  if (voiceCall().session.audio) {
-    lines.push(`This call's speaker: ${voiceCall().session.audio.sinkId ? `sink ${voiceCall().session.audio.sinkId}` : "the route the microphone chose (browser does not report a speaker)"}`);
-  }
-  box.textContent = lines.join("\n");
 }
 
 // --- the control bar ------------------------------------------------------------------------
@@ -11161,11 +10921,7 @@ function storedCollapsedLines() {
  */
 function applyCollapsedLines(value) {
   collapsedLines = clampCollapsedLines(value);
-  document.documentElement.style.setProperty("--collapsed-lines", String(collapsedLines));
-  document.documentElement.setAttribute("data-collapsed-lines", String(collapsedLines));
-  el("collapsed-lines").value = String(collapsedLines);
-  el("collapsed-lines-smaller").disabled = collapsedLines <= MIN_COLLAPSED_LINES;
-  el("collapsed-lines-larger").disabled = collapsedLines >= MAX_COLLAPSED_LINES;
+  messagePreferences.collapsedLines.render(collapsedLines);
   return collapsedLines;
 }
 
@@ -11221,10 +10977,7 @@ function collapsedLinesChanged(value) {
   const apply = () => {
     const n = applyCollapsedLines(value);
     refreshElisionLines();
-    el("collapsed-lines-state").textContent = persistCollapsedLines(n)
-      ? `Saved — collapsed messages show ${collapsedLinesWords(n)}.`
-      : "This browser refused to store the collapsed lines, so it will be forgotten when you " +
-        `reload (private browsing does this). Collapsed messages show ${collapsedLinesWords(n)} until then.`;
+    messagePreferences.collapsedLines.saved(n);
     return n;
   };
   if (currentScreen !== "main") return apply();
@@ -11244,10 +10997,7 @@ function collapsedLinesChanged(value) {
  * @param {1 | -1} direction
  */
 function stepCollapsedLines(direction) {
-  const button = el(direction > 0 ? "collapsed-lines-larger" : "collapsed-lines-smaller");
-  const held = document.activeElement === button;
-  collapsedLinesChanged(clampCollapsedLines(el("collapsed-lines").value) + direction);
-  if (held && button.disabled) el("collapsed-lines").focus();
+  messagePreferences.collapsedLines.step(direction);
 }
 
 // --- thread card lines (#522 thread-card-max-lines) -----------------------------------------------
@@ -11313,22 +11063,11 @@ function noteServerPageBuild(payload) {
   const build = payload && typeof payload.page_build === "string" ? payload.page_build : "";
   if (!build || build === serverPageBuild) return;
   serverPageBuild = build;
-  renderPageBuild();
+  settingsReadouts.pageBuild();
 }
 
 /** Whether the server serves a newer page than this one runs: both builds known, and different. */
 const pageOutOfDate = () => PAGE_BUILD !== "" && serverPageBuild !== "" && serverPageBuild !== PAGE_BUILD;
-
-/** The reload chip shown exactly while this page is out of date, and Settings saying which build it is. */
-function renderPageBuild() {
-  const stale = pageOutOfDate();
-  const chip = el("page-update");
-  if (chip.hidden === stale) chip.hidden = !stale;
-  const short = (build) => build.slice(0, 8);
-  setTextIfChanged(el("settings-page-build"), PAGE_BUILD === "" ? "" : stale
-    ? `This page is build ${short(PAGE_BUILD)}; the server now serves ${short(serverPageBuild)}. Reload to run it.`
-    : `This page is build ${short(PAGE_BUILD)}.`);
-}
 
 /** The device's copy of K, kept on the server for every device (`#457 settings-server-side`). */
 const CARD_MAX_LINES_KEY = DEVICE_SETTINGS.cardMaxLines.key;
@@ -11348,10 +11087,7 @@ function applyCardMaxLines(value, redraw = true) {
   const changed = redraw && n !== cardMaxLines;
   cardMaxLines = n;
   // `#528 thread-card-markdown-and-cap`: what a card clamped to K lines is clamped to (web/voice.css).
-  document.documentElement.style.setProperty("--card-max-lines", String(n));
-  el("card-max-lines").value = String(n);
-  el("card-max-lines-smaller").disabled = n <= MIN_CARD_MAX_LINES;
-  el("card-max-lines-larger").disabled = n >= MAX_CARD_MAX_LINES;
+  messagePreferences.cardMaxLines.render(n);
   if (changed) {
     sideCardsDrawn = "";
     threadCardsDrawn.clear();
@@ -11376,19 +11112,13 @@ function persistCardMaxLines(n) {
 function cardMaxLinesChanged(value) {
   let n = DEFAULT_CARD_MAX_LINES;
   keepingCardPlace(() => { n = applyCardMaxLines(value); });
-  el("card-max-lines-state").textContent = persistCardMaxLines(n)
-    ? `Saved — thread cards show at most ${cardMaxLinesWords(n)} of a first message.`
-    : "This browser refused to store the thread card lines, so they will be forgotten when you " +
-      `reload (private browsing does this). Thread cards show at most ${cardMaxLinesWords(n)} until then.`;
+  messagePreferences.cardMaxLines.saved(n);
   return n;
 }
 
 /** One line fewer (-1) or more (+1), as `stepCollapsedLines` steps its count. */
 function stepCardMaxLines(direction) {
-  const button = el(direction > 0 ? "card-max-lines-larger" : "card-max-lines-smaller");
-  const held = document.activeElement === button;
-  cardMaxLinesChanged(clampCardMaxLines(el("card-max-lines").value) + direction);
-  if (held && button.disabled) el("card-max-lines").focus();
+  messagePreferences.cardMaxLines.step(direction);
 }
 
 // --- how much a quote must cover to mark read (#728 vt-quote-read-threshold) ---------------------
@@ -11416,37 +11146,18 @@ function storedQuoteReadPercent() {
 function applyQuoteReadPercent(value) {
   const n = clampQuoteReadPercent(value);
   quoteReadPercent = n;
-  el("quote-read-percent").value = String(n);
-  el("quote-read-percent-smaller").disabled = n <= MIN_QUOTE_READ_PERCENT;
-  el("quote-read-percent-larger").disabled = n >= MAX_QUOTE_READ_PERCENT;
+  messagePreferences.quoteReadPercent.render(n);
   return n;
 }
 
 /** The slider, or − and +: the share applied, and kept, read back as private browsing keeps nothing. */
 function quoteReadPercentChanged(value) {
-  const n = applyQuoteReadPercent(value);
-  let kept = false;
-  try {
-    deviceSettings().keep(DEVICE_SETTINGS.quoteReadPercent, n);
-    kept = deviceSettings().keptAs(DEVICE_SETTINGS.quoteReadPercent, n);
-  } catch (_error) {
-    kept = false;
-  }
-  const rule = n === 0
-    ? "a reply marks the message it answers read, whatever it quotes."
-    : `a reply that quotes less than ${n}% of a message leaves it unread.`;
-  el("quote-read-percent-state").textContent = kept
-    ? `Saved — ${rule}`
-    : `This browser refused to store it, so it will be forgotten when you reload (private browsing does this). Until then ${rule}`;
-  return n;
+  return messagePreferences.quoteReadPercent.changed(value);
 }
 
 /** One percent less (-1) or more (+1), as `stepCardMaxLines` steps its lines. */
 function stepQuoteReadPercent(direction) {
-  const button = el(direction > 0 ? "quote-read-percent-larger" : "quote-read-percent-smaller");
-  const held = document.activeElement === button;
-  quoteReadPercentChanged(clampQuoteReadPercent(el("quote-read-percent").value) + direction);
-  if (held && button.disabled) el("quote-read-percent").focus();
+  messagePreferences.quoteReadPercent.step(direction);
 }
 
 /**
@@ -12628,11 +12339,11 @@ function hydrateFromCache() {
   whoIsWho.learnOwnerIds(shell.owner_author_ids);
   fillChannelSelect("discord-channel");
   // `#355 provider-grouped-channels`. Settings by service, from the saved shell as from client-config.
-  fillServiceSelect();
+  channelSettings.fillServiceSelect();
   fillChannelSelect("settings-channel");
   const provider = providerOfChannel(selectedChannelId());
   if (provider) threadingSupported = provider.threading_supported === true;
-  renderChannelBox();
+  channelSettings.renderChannelBox();
   // Before the composer and the rows: both are the view's. `#189 restore-ui-state`.
   openChannelView();
   restoreChannelComposer();
@@ -19367,8 +19078,7 @@ function renderBodyInto(parent, messages) {
  */
 function applyRichHeaders(on) {
   const shown = Boolean(on);
-  el("rich-headers").checked = shown;
-  document.documentElement.setAttribute("data-rich-headers", shown ? "on" : "off");
+  messagePreferences.richHeaders.render(shown);
   try {
     deviceSettings().keep(DEVICE_SETTINGS.richHeaders, shown);
   } catch (_error) {
@@ -19741,7 +19451,7 @@ function renderChannelRows() {
   renderReplyLinks();
   renderOutgoingMessages();
   // Settings counts what is loaded, and this is where what is loaded changes.
-  renderNoiseCount();
+  noiseSettings.renderCount();
   // `#221 read-modes`. LAST, from the read state every row has just been given: under Fold
   // read a message dealt with on this pass joins its run, and a run that grew says so.
   applyReadRuns();
@@ -22179,7 +21889,7 @@ function toggleMessageDetails(li, messages) {
  * sight of each message of his (`src/own_read.rs`), and records it as the one read bit, Done; from
  * then on the row is drawn from that bit like any other, with Done or Unarchive, and every count here
  * asks it. Turning the setting off or on changes only messages first seen afterwards; "Apply to
- * existing messages" beside it reaches the rest (`applyOwnReadToExisting`). What this page does with
+ * existing messages" beside it reaches the rest (`ownReadApply.apply`). What this page does with
  * the flag itself is draw a message of his read before the server's answer for it arrives
  * (`noteStartsRead`).
  */
@@ -22187,7 +21897,7 @@ let markOwnRead = true;
 
 function applyMarkOwnRead(on) {
   markOwnRead = Boolean(on);
-  el("mark-own-read").checked = markOwnRead;
+  messagePreferences.markOwnRead.render(markOwnRead);
   try {
     deviceSettings().keep(DEVICE_SETTINGS.markOwnRead, markOwnRead);
   } catch (_error) {
@@ -22200,100 +21910,17 @@ function storedMarkOwnRead() {
   return deviceSettings().get(DEVICE_SETTINGS.markOwnRead);
 }
 
-/** How long a first press of "Apply to existing messages" waits for the second, in milliseconds. */
-const OWN_READ_APPLY_ARM_MS = 10000;
-
-/** The timer of a first press of "Apply to existing messages" waiting for the second, or null. */
-let ownReadApplyArmed = null;
-
-/**
- * What the last "Apply to existing messages" marked, by channel, for its Undo; null when there is
- * nothing to put back. `#549 own-read-stored`.
- *
- * @type {{channel: string, messages: string[]}[] | null}
- */
-let ownReadApplied = null;
-
-/** Put "Apply to existing messages" back to waiting for a first press. */
-function disarmOwnReadApply() {
-  if (ownReadApplyArmed !== null) clearTimeout(ownReadApplyArmed);
-  ownReadApplyArmed = null;
-  el("own-read-apply").textContent = "Apply to existing messages";
-}
-
-/**
- * "Apply to existing messages": every message of the reader's this server has decided and that is not
- * Done is marked read, in every channel. Pressed twice, the first press saying what the second does,
- * because it reaches messages the reader may have put back on purpose. `#549 own-read-stored`.
- */
-async function applyOwnReadToExisting() {
-  if (ownReadApplyArmed === null) {
-    ownReadApplyArmed = setTimeout(disarmOwnReadApply, OWN_READ_APPLY_ARM_MS);
-    el("own-read-apply").textContent = "Mark them read";
-    el("own-read-state").textContent = "This marks read every message of yours this server has seen " +
-      "that is not Done, in every channel, including any you put back. Press Mark them read to go ahead.";
-    return;
-  }
-  disarmOwnReadApply();
-  let payload;
-  try {
-    payload = await api("/api/v1/own-read/apply", { method: "POST" });
-  } catch (error) {
-    el("own-read-state").textContent = "Nothing was marked read: the server did not take it. Try again.";
-    throw error;
-  }
-  const changes = payload && Array.isArray(payload.changes) ? payload.changes : [];
-  const held = changes
-    .map((change) => ({
-      channel: String(change && change.channel && change.channel.id),
-      messages: (change && Array.isArray(change.messages) ? change.messages : []).map(String),
-    }))
-    .filter((change) => change.messages.length > 0);
-  const count = held.reduce((sum, change) => sum + change.messages.length, 0);
-  ownReadApplied = count > 0 ? held : null;
-  el("own-read-undo").hidden = ownReadApplied === null;
-  const said = count === 0
-    ? "None of your messages was waiting."
-    : `Marked ${count} of your message${count === 1 ? "" : "s"} read. Undo puts ${count === 1 ? "it" : "them"} back.`;
-  el("own-read-state").textContent = said;
-  setStatus(said);
-  if (count > 0 && selectedChannelId()) {
-    guardQuietly(() => loadDiscord({ keepPosition: true, readAs: "mutation" }))();
-  }
-}
-
-/** Put back exactly what the last "Apply to existing messages" marked. `#549 own-read-stored`. */
-async function undoOwnReadApply() {
-  const held = ownReadApplied;
-  if (held === null) return;
-  el("own-read-undo").hidden = true;
-  let count = 0;
-  // Each batch leaves the held set as it lands, so an Undo that fails part way keeps the rest for the
-  // next press, and says how far it got.
-  while (ownReadApplied !== null && ownReadApplied.length > 0) {
-    const change = ownReadApplied[0];
-    // As one restore may carry: the server's `MAX_DISMISS_BATCH`.
-    const messages = change.messages.slice(0, 1000);
-    try {
-      await api(`/api/v1/channels/${encodeURIComponent(change.channel)}/restore`, { method: "POST", body: { messages } });
-    } catch (error) {
-      el("own-read-undo").hidden = false;
-      el("own-read-state").textContent =
-        `Put ${count} back; the rest could not be put back yet. Press Undo to try again.`;
-      throw error;
-    }
-    count += messages.length;
-    change.messages = change.messages.slice(messages.length);
-    if (change.messages.length === 0) ownReadApplied.shift();
-  }
-  ownReadApplied = null;
-  const said = `Put ${count} of your message${count === 1 ? "" : "s"} back.`;
-  el("own-read-state").textContent = said;
-  setStatus(said);
-  if (selectedChannelId()) {
-    guardQuietly(() => loadDiscord({ keepPosition: true, readAs: "mutation" }))();
-  }
-}
+/** Settings' apply-to-existing command owns its confirmation and Undo receipt. */
+const ownReadApply = mountOwnReadApply({
+  lookup: (id) => el(id),
+  request: (path, options) => api(path, options),
+  setStatus: (text) => setStatus(text),
+  selectedChannel: () => selectedChannelId(),
+  reloadChannel: (options) => loadDiscord(options),
+  guard: (run) => guardQuietly(run),
+  setTimeout: (run, ms) => setTimeout(run, ms),
+  clearTimeout: (timer) => clearTimeout(timer),
+});
 
 /**
  * Whether `message` is one of the reader's own whose read state starts read: "Mark my own messages as
@@ -22407,7 +22034,7 @@ let hideEmptyMessages = true;
 
 function applyHideEmptyMessages(on) {
   hideEmptyMessages = Boolean(on);
-  el("hide-empty-messages").checked = hideEmptyMessages;
+  messagePreferences.hideEmpty.render(hideEmptyMessages);
   try {
     deviceSettings().keep(DEVICE_SETTINGS.hideEmptyMessages, hideEmptyMessages);
   } catch (_error) {
@@ -22507,7 +22134,7 @@ let combineMessages = true;
 
 function applyCombineMessages(on) {
   combineMessages = Boolean(on);
-  el("combine-messages").checked = combineMessages;
+  messagePreferences.combine.render(combineMessages);
   try {
     deviceSettings().keep(DEVICE_SETTINGS.combineMessages, combineMessages);
   } catch (_error) {
@@ -23264,21 +22891,7 @@ function storedSlackOpen() {
   return deviceSettings().get(DEVICE_SETTINGS.slackOpen);
 }
 
-function slackOpenChanged() {
-  const chosen = el("slack-open-in").value === "app" ? "app" : "browser";
-  let saved = false;
-  try {
-    deviceSettings().keep(DEVICE_SETTINGS.slackOpen, chosen);
-    saved = deviceSettings().keptAs(DEVICE_SETTINGS.slackOpen, chosen);
-  } catch (_error) {
-    saved = false;
-  }
-  el("slack-open-state").textContent = saved
-    ? chosen === "app"
-      ? "Saved. Open in Slack goes to the app from here; copied links are web addresses either way."
-      : "Saved. Open in Slack opens the message in a browser tab."
-    : "This browser refused to store the setting, so links will open in the browser after a reload.";
-}
+
 
 /**
  * A message's address in its service's own app, as the server formed it (`slack://` for Slack;
@@ -25991,7 +25604,7 @@ function noteTodoRead(payload) {
     // line saying what the channel used to be called.
     channelId: payload.channel ? payload.channel.id : null,
   };
-  renderNoiseCount();
+  noiseSettings.renderCount();
 }
 
 /**
@@ -26056,7 +25669,7 @@ function appendChannelRow(arriving, live = false, folded = false) {
   // held with the rest of the channel, and the list — and its count — are not told about it.
   if (hidingRead() && isNoise(message)) {
     save();
-    renderNoiseCount();
+    noiseSettings.renderCount();
     return;
   }
   // `#386 hide-empty-messages`. An empty message is held with the rest and drawn nowhere.
@@ -27467,69 +27080,16 @@ async function togglePin(messages) {
 // applied by re-reading the channel rather than by matching text here. Two predicates would agree
 // until the day one of them changed.
 
-/** The rules as the server last reported them, or null when it does not say. */
-let noiseRules = null;
-
-/** The server's own sentence about how a rule matches, quoted beside the list. */
-let noiseMatching = "";
-
-/** Take down what the server said the rules are — from client-config, or from a save. */
-function applyNoiseRules(view) {
-  if (view && Array.isArray(view.rules)) {
-    noiseRules = view.rules.map(String);
-    noiseMatching = typeof view.matching === "string" ? view.matching : "";
-  } else {
-    noiseRules = null;
-    noiseMatching = "";
-  }
-  renderNoiseRules();
-}
-
-/** Draw the editor from `noiseRules`: the sentence, one row per rule, and the count. */
-function renderNoiseRules() {
-  el("noise-editor").hidden = noiseRules === null;
-  if (noiseRules === null) {
-    // Said rather than left blank: an older server, or a store that is not answering, and the
-    // owner looking for the list should learn which side of that he is on.
-    el("noise-state").textContent =
-      "This server does not say which messages it reads automatically, so there is nothing to edit here.";
-    return;
-  }
-  el("noise-matching").textContent = noiseMatching;
-  el("noise-rule-list").replaceChildren(...noiseRules.map(noiseRuleRow));
-  renderNoiseCount();
-}
-
-/**
- * One rule and its Remove.
- *
- * The rule is the OWNER's own text, shown as he typed it, through `textContent` like everything
- * else this page draws. Removing sends the whole list without it, which is how the server takes
- * every change: one list, replaced, so two devices cannot leave half an edit each.
- */
-function noiseRuleRow(rule, index) {
-  const li = document.createElement("li");
-  li.className = "noise-rule";
-  const text = document.createElement("span");
-  text.className = "noise-rule-text";
-  text.textContent = rule;
-  const remove = document.createElement("button");
-  remove.className = "secondary noise-rule-remove";
-  remove.setAttribute("type", "button");
-  remove.setAttribute("title", "Stop reading messages like this automatically");
-  remove.textContent = "Remove";
-  remove.addEventListener(
-    "click",
-    guardQuietly(() =>
-      saveNoiseRules(
-        (noiseRules || []).filter((_held, at) => at !== index),
-        `Removed. Messages reading "${rule}" count as unread again.`
-      )
-    )
-  );
-  li.append(text, remove);
-  return li;
-}
+/** Settings' rule editor reads the channel's tally and asks it to refresh after a save. */
+const noiseSettings = mountNoiseRules({
+  lookup: (id) => el(id),
+  request: (path, options) => api(path, options),
+  guard: (run) => guardQuietly(run),
+  status: (text) => setStatus(text),
+  tally: () => noiseTally(),
+  selectedChannel: () => selectedChannelId(),
+  reloadChannel: () => loadDiscord({ keepPosition: true, readAs: "mutation" }),
+});
 
 /**
  * How many of the LOADED messages the server calls noise, and out of how many.
@@ -27545,53 +27105,6 @@ function noiseTally() {
     ? timelineRows().messages
     : [...el("discord-log").children].flatMap(rowMessages);
   return { matched: loaded.filter(isNoise).length, total: loaded.length };
-}
-
-/**
- * The live count under the list: "Matches 9 of the 50 loaded messages."
- *
- * Recounted wherever the loaded messages change — `renderChannelRows`, a to-do read, an arrival —
- * so it moves when the owner adds a rule and the channel is re-read under it.
- */
-function renderNoiseCount() {
-  if (noiseRules === null) {
-    return;
-  }
-  const { matched, total } = noiseTally();
-  el("noise-count").textContent =
-    total === 0
-      ? "No messages are loaded yet, so there is nothing to count."
-      : `Matches ${matched} of the ${total} loaded message${total === 1 ? "" : "s"}.`;
-}
-
-/**
- * Replace the server's list, take back what it STORED, and re-read the channel under it.
- *
- * The re-read is the point of the third step. Every loaded message was judged under the old list,
- * and the page has no matcher of its own to re-judge them with — so the server is asked again.
- */
-async function saveNoiseRules(rules, said) {
-  const payload = await api("/api/v1/noise-rules", { method: "PUT", body: { rules } });
-  applyNoiseRules(payload);
-  el("noise-state").textContent = said;
-  setStatus(said);
-  if (selectedChannelId()) {
-    guardQuietly(() => loadDiscord({ keepPosition: true, readAs: "mutation" }))();
-  }
-}
-
-/** Add what is in the field as a rule. The server trims it and drops a duplicate. */
-async function addNoiseRule() {
-  const typed = el("noise-rule-new").value.trim();
-  if (!typed) {
-    el("noise-state").textContent = "Type the message to read automatically, then Add.";
-    return;
-  }
-  await saveNoiseRules(
-    [...(noiseRules || []), typed],
-    `Added. A message reading "${typed}" counts as read from now on.`
-  );
-  el("noise-rule-new").value = "";
 }
 
 /**
@@ -27626,605 +27139,29 @@ async function markNotNoise(ids) {
   );
 }
 
-// --- asking before the voice agent sends -----------------------------------------------------------
-//
-// `#264 voice-send-approval`. The SERVER's switch over what the voice agent's `post_reply` does: on
-// (the shipped default) it proposes a draft this page shows on the card and the owner confirms; off,
-// it posts at once. It is drawn from client-config and redrawn from what the PUT answered — never
-// from the click — because the server is what the agent obeys, for every device and every voice
-// provider, and a box that showed a value the server did not hold would be a lie about the agent.
-
-/** The setting as the server last reported it, or null when it does not say (an older server). */
-let voiceSendSetting = null;
-
-/** True while a change is on its way to the server, so a second click cannot race it. */
-let voiceSendSaving = false;
-
-/** One honest line per state: what the agent does, and for off, what that exposes. */
-const VOICE_SEND_STATE = {
-  on: "The agent reads the message back and asks 'Send it?'; say yes or tap Send.",
-  off: "The agent sends as soon as you ask. A message it reads could also talk it into sending.",
-};
-
-/** Take down what the server said — from client-config, or from a save. */
-function applyVoiceSendSetting(view) {
-  voiceSendSetting =
-    view && typeof view.ask_before_send === "boolean"
-      ? { ask_before_send: view.ask_before_send, changeable: view.changeable === true }
-      : null;
-  renderVoiceSendSetting();
-}
-
-/** Draw the checkbox and its line from `voiceSendSetting` and the token's scope. */
-function renderVoiceSendSetting() {
-  const box = el("voice-ask-before-send");
-  const state = el("voice-ask-before-send-state");
-  el("voice-send-editor").hidden = voiceSendSetting === null;
-  if (voiceSendSetting === null) {
-    state.textContent =
-      "This server does not report this setting, so its voice agent always asks before it sends.";
-    return;
-  }
-  box.checked = voiceSendSetting.ask_before_send;
-  // The way to send without asking, said only while asking is on: unticked, it would describe the
-  // state the box is not in.
-  el("voice-send-untick").hidden = !voiceSendSetting.ask_before_send;
-  renderVoiceSendHosted();
-  const line = voiceSendSetting.ask_before_send ? VOICE_SEND_STATE.on : VOICE_SEND_STATE.off;
-  if (tokenScope !== "write") {
-    box.disabled = true;
-    state.textContent = `${line} Only the write token can change this.`;
-  } else if (!voiceSendSetting.changeable) {
-    box.disabled = true;
-    state.textContent = `${line} This server keeps no settings, so this cannot be changed here.`;
-  } else {
-    box.disabled = voiceSendSaving;
-    state.textContent = line;
-  }
-}
-
-/** Send the box's new position, then draw what the server STORED; on failure, put it back. */
-async function saveVoiceSendSetting() {
-  const wanted = el("voice-ask-before-send").checked;
-  voiceSendSaving = true;
-  renderVoiceSendSettingWhileSaving(wanted);
-  let stored = null;
-  try {
-    stored = await apiDecoded("VoiceSettings", "/api/v1/voice-settings", {
-      method: "PUT",
-      body: { ask_before_send: wanted },
-    });
-  } catch (error) {
-    voiceSendSaving = false;
-    // Back to what the server holds: the click did not change the agent, so the box must not say so.
-    renderVoiceSendSetting();
-    showError(`The voice send setting was not changed: ${error.detail || error.message}`);
-    return;
-  }
-  voiceSendSaving = false;
-  applyVoiceSendSetting(stored);
-  // The server obeys the new setting at once. The agent's instructions follow only where something
-  // hands them over, which the clause says.
-  setStatus(
-    stored.ask_before_send
-      ? `Saved. The server now holds what the voice agent sends for your yes; ${voiceSendSavedClause()}`
-      : `Saved. The server now posts as soon as the voice agent sends; ${voiceSendSavedClause()}`
-  );
-}
-
-/**
- * Whether the agent's own instructions follow the switch, as far as this page knows. `#272
- * voice-agent-instructions`. "bridge": a bridge fetches its prompt as each call opens. "replaced":
- * the last call's hosted agent was handed this server's prompt. "kept": the last call's hosted
- * agent does not let its prompt be replaced, so it keeps the one pasted into its console.
- * "unknown": a hosted agent, and no call yet that said which — or an older server that does not say
- * how the prompt is delivered.
- */
-function agentPromptFollowsSwitch() {
-  if (voicePromptSettings !== null && voicePromptSettings.delivery === "profile") return "bridge";
-  const last = voicePromptLastCall;
-  if (last !== null && last.transport === "prompt_override") return "replaced";
-  if (last !== null && last.override_allowed === false) return "kept";
-  return "unknown";
-}
-
-/**
- * Beside the switch, what it does not reach on a hosted agent. The server obeys the switch at once,
- * but the agent's send rules are in its prompt, and its approval for post_reply is in its
- * provider's console: the prompt follows only when this page may replace it, and the approval
- * never does. Without this, an owner who unticked the box would hear the agent go on reading back
- * messages the server had already posted.
- */
-const VOICE_SEND_HOSTED = {
-  unknown:
-    "The server changes at once. The agent's own instructions follow at its next call only if its provider lets this page replace its prompt; if not, paste the new prompt into the provider's console by hand. Change post_reply's approval there to match, either way.",
-  kept:
-    "The server changes at once, but the last call's agent does not let this page replace its prompt: paste the new prompt into its provider's console by hand, and change post_reply's approval there to match.",
-  replaced:
-    "The server changes at once, and the last call's agent was given this server's prompt, so its instructions follow from its next call. Change post_reply's approval in its provider's console to match.",
-};
-
-/** Show the hosted-agent line beside the switch, worded from what is known; hidden for a bridge. */
-function renderVoiceSendHosted() {
-  const follows = agentPromptFollowsSwitch();
-  const hosted = el("voice-send-hosted");
-  hosted.hidden = follows === "bridge";
-  if (follows !== "bridge") hosted.textContent = VOICE_SEND_HOSTED[follows];
-}
-
-/** The end of the sentence a saved switch reports: when, and whether, the agent's instructions follow. */
-function voiceSendSavedClause() {
-  switch (agentPromptFollowsSwitch()) {
-    case "bridge":
-      return "its instructions change from its next call.";
-    case "replaced":
-      return "its instructions follow from its next call; change post_reply's approval in its provider's console to match.";
-    case "kept":
-      return "this agent keeps the prompt pasted into its provider's console, so paste the new one there by hand.";
-    default:
-      return "its instructions follow at its next call only if its provider lets this page replace its prompt; otherwise paste the new one into its console by hand.";
-  }
-}
-
-/** The box as clicked, held still until the server answers. */
-function renderVoiceSendSettingWhileSaving(wanted) {
-  el("voice-ask-before-send").checked = wanted;
-  el("voice-ask-before-send").disabled = true;
-}
-
-// --- the prefix on the voice agent's posts ---------------------------------------------------------
-//
-// `#303 voice-post-prefix`. The tag the SERVER puts before every message the voice agent posts, so
-// the channel can tell a relayed message from one the owner typed. Like the send switch above it is
-// the server's — kept in its store, the same for every device and every call — so the box is filled
-// from client-config and refilled from what the PUT or DELETE answered. Save is its own, because a
-// half-typed tag must not go out on the agent's next post. An empty box saved is the owner's choice
-// of no tag, which the server keeps apart from never having chosen; Reset to default is the way back
-// to the shipped one.
-//
-// client-config is read once, at sign-in, and another device may save or reset the tag after that.
-// So opening Settings reads the tag again (`refreshVoicePostPrefix`): the box shows what is in force
-// now, and Reset takes the path the server's state calls for, not the one this page last heard of.
-
-/** The tag as the server last reported it, or null when it does not say (an older server). */
-let voicePostPrefix = null;
-
-/** True while a save or a reset is on its way, so a second click cannot race it. */
-let voicePostPrefixSaving = false;
-
-/**
- * Counts the reads and writes of the tag this page has sent, so a read that answers after a newer
- * one, or after a save or reset began, is not drawn over it.
- */
-let voicePostPrefixReads = 0;
-
-/**
- * A tag as the server keeps it (`post_prefix::clean`): one line, any control character a space, no
- * space in front, and nothing at all when it is nothing but space. Trailing space stays: it is what
- * keeps the tag off the first word.
- */
-function cleanPostPrefix(text) {
-  const oneLine = String(text).replace(/[\u0000-\u001f\u007f-\u009f]/gu, " ").replace(/^\s+/u, "");
-  return oneLine.trim() === "" ? "" : oneLine;
-}
-
-/** Take down what the server said — from client-config, or from a save — and fill the box from it. */
-function applyVoicePostPrefix(view) {
-  voicePostPrefix =
-    view && typeof view.prefix === "string" && typeof view.default_prefix === "string" ? view : null;
-  if (voicePostPrefix !== null) el("voice-post-prefix").value = voicePostPrefix.prefix;
-  renderVoicePostPrefix();
-}
-
-/** Whether the box holds a tag the server does not. */
-function voicePostPrefixDirty() {
-  return voicePostPrefix !== null && cleanPostPrefix(el("voice-post-prefix").value) !== voicePostPrefix.prefix;
-}
-
-/** The line under the box: what is in force, or why the box cannot be saved. */
-function voicePostPrefixLine(dirty, length) {
-  const settings = /** @type {VibeTalk.VoicePostPrefix} */ (voicePostPrefix);
-  if (length > settings.max_chars) {
-    return `${length} characters; at most ${settings.max_chars} are kept. Shorten it to save.`;
-  }
-  if (dirty) return "Not saved yet.";
-  if (!settings.custom) return "The default.";
-  return settings.prefix ? "Saved. Every message the agent posts starts with it." : "Off: the agent's messages carry no prefix.";
-}
-
-/** Draw the box, its two buttons and its line from `voicePostPrefix` and the token's scope. */
-function renderVoicePostPrefix() {
-  el("voice-post-prefix-editor").hidden = voicePostPrefix === null;
-  if (voicePostPrefix === null) return;
-  const lock = tokenScope !== "write"
-    ? "Only the write token can change this."
-    : voicePostPrefix.changeable ? "" : "This server keeps no settings, so this cannot be changed here.";
-  const box = el("voice-post-prefix");
-  const dirty = voicePostPrefixDirty();
-  const length = [...cleanPostPrefix(box.value)].length;
-  const held = Boolean(lock) || voicePostPrefixSaving;
-  box.disabled = Boolean(lock);
-  el("save-voice-post-prefix").disabled = held || !dirty || length > voicePostPrefix.max_chars;
-  // Nothing to reset when the default is in force and in the box.
-  el("reset-voice-post-prefix").disabled = held || (!voicePostPrefix.custom && !dirty);
-  el("voice-post-prefix-state").textContent = [lock, voicePostPrefixLine(dirty, length)].filter(Boolean).join(" ");
-}
-
-/**
- * Save the box (`reset` false) or go back to the default (`reset` true), then draw what the server
- * STORED. On failure the typed tag stays in the box, and the error says it was not saved.
- */
-async function saveVoicePostPrefix(reset) {
-  if (voicePostPrefix === null) return;
-  if (reset && !voicePostPrefix.custom) {
-    // Nothing of his is saved: put the default back in the box and write nothing.
-    el("voice-post-prefix").value = voicePostPrefix.default_prefix;
-    renderVoicePostPrefix();
-    return;
-  }
-  voicePostPrefixSaving = true;
-  // A read still on its way is older than what this write will answer.
-  voicePostPrefixReads += 1;
-  renderVoicePostPrefix();
-  let stored = null;
-  try {
-    stored = await apiDecoded(
-      "VoicePostPrefix",
-      "/api/v1/voice-post-prefix",
-      reset ? { method: "DELETE" } : { method: "PUT", body: { prefix: el("voice-post-prefix").value } }
-    );
-  } catch (error) {
-    voicePostPrefixSaving = false;
-    renderVoicePostPrefix();
-    showError(`The prefix was not ${reset ? "reset" : "saved"}: ${error.detail || error.message}`);
-    return;
-  }
-  voicePostPrefixSaving = false;
-  applyVoicePostPrefix(stored);
-  setStatus(
-    !stored.custom
-      ? "Reset. The voice agent's messages start with the default prefix again."
-      : stored.prefix
-        ? "Saved. Every message the voice agent posts starts with this prefix."
-        : "Saved. The voice agent's messages carry no prefix."
-  );
-}
-
-/**
- * Read the tag again, as Settings opens: another device may have saved or reset it since this page
- * read client-config. What the server answers is taken as the truth — the line, the buttons, and the
- * path Reset takes — but a tag typed here and not yet saved stays in the box, still marked unsaved.
- * Not for an older server that reports no tag, nor while a save or reset is on its way; a read that
- * fails leaves what is shown, and the next save or reset answers with the truth anyway.
- */
-async function refreshVoicePostPrefix() {
-  if (voicePostPrefix === null || voicePostPrefixSaving) return;
-  const read = ++voicePostPrefixReads;
-  let view;
-  try {
-    view = await apiDecoded("VoicePostPrefix", "/api/v1/voice-post-prefix");
-  } catch (_error) {
-    return;
-  }
-  if (read !== voicePostPrefixReads || voicePostPrefixSaving) return;
-  const typed = voicePostPrefixDirty() ? el("voice-post-prefix").value : null;
-  applyVoicePostPrefix(view);
-  if (typed !== null && voicePostPrefix !== null) {
-    el("voice-post-prefix").value = typed;
-    renderVoicePostPrefix();
-  }
-}
-
-// --- the voice agent's instructions ----------------------------------------------------------------
-//
-// `#272 voice-agent-instructions`. The owner's own words for the agent — additional instructions,
-// and his edited copy of the base system prompt — are the SERVER's, like the send switch above: it
-// puts them into the prompt when a call opens, for every device. So both boxes are filled from
-// client-config and refilled from what the PUT stored, and each has its own Save, because a
-// half-typed instruction must not reach the agent.
-//
-// How the words reach the agent is the server's to say (`delivery`). A bridge fetches the prompt as
-// each call opens. A hosted agent is handed them by THIS page as its socket opens, in the form the
-// voice session names (`handOverAgentPrompt`) — the whole prompt only when the agent allows it to be
-// replaced. What the last call was actually given is kept, so the line under the boxes can say it:
-// an edited prompt a hosted agent would not take is exactly what the owner needs to be told.
-
-/** The owner's words as the server last reported them, or null when it does not say (an older server). */
-let voicePromptSettings = null;
-
-/** True while a save is on its way, so a second click cannot race it. */
-let voicePromptSaving = false;
+// Voice Settings own the approval switch, prefix and prompt editors (#624 voice-page-modularity).
+// The session's pending prompt remains call composition; handing it over records the last call in Settings.
+const agentSettings = mountAgentSettings({
+  lookup: (id) => el(id),
+  decoded: (type, path, options) => apiDecoded(type, path, options),
+  writable: () => tokenScope === "write",
+  showError: (text) => showError(text),
+  setStatus: (text) => setStatus(text),
+  addDetail: (text) => addDetail(text),
+  setTimeout: (run, ms) => setTimeout(run, ms),
+  clearTimeout: (timer) => clearTimeout(timer),
+  clearArmedMs: () => voiceTranscript().CLEAR_ARMED_MS,
+});
+const agentPrefix = mountAgentPrefix({
+  lookup: (id) => el(id),
+  decoded: (type, path, options) => apiDecoded(type, path, options),
+  writable: () => tokenScope === "write",
+  showError: (text) => showError(text),
+  setStatus: (text) => setStatus(text),
+});
 
 /** What the voice session asked this page to hand the agent of the call being opened, or null. */
 let voicePromptForCall = null;
-
-/**
- * What the last call this page opened on a hosted agent was handed, or null before one, with
- * whether the owner's own copy of the prompt was saved as it opened (`editedWhenOpened`; null when
- * this server did not say). The line under Instructions says why such a call got nothing from
- * that, so a save after the call cannot rewrite what the call was given.
- *
- * @type {(VibeTalk.SessionPrompt & {editedWhenOpened: boolean | null}) | null}
- */
-let voicePromptLastCall = null;
-
-/**
- * While Restore is armed, the timer that disarms it; null when a tap would only arm it.
- *
- * Restore deletes the owner's own copy of the prompt — perhaps hours of his wording — so it asks
- * twice, in the armed idiom Clear and the backlog's Clear use, with their window: the first tap
- * changes its word and colour, and only a second tap within that window acts.
- */
-let restoreArmedTimer = null;
-
-/** The characters in a box, counted as the server counts them: by code point, after trimming. */
-const promptChars = (text) => [...String(text).trim()].length;
-
-/** Which box holds text the server does not. */
-function voicePromptDirty() {
-  if (voicePromptSettings === null) return { instructions: false, system_prompt: false };
-  return {
-    instructions: el("voice-instructions").value.trim() !== voicePromptSettings.instructions,
-    system_prompt: el("voice-system-prompt").value.trim() !== voicePromptSettings.system_prompt.trim(),
-  };
-}
-
-/**
- * Take down what the server said — from client-config, or from a save — and fill the boxes from it.
- * A box named in `keep` keeps text the reader typed and has not saved: saving one box must not
- * throw away an edit in the other.
- */
-function applyVoicePrompt(view, keep = []) {
-  const dirty = voicePromptDirty();
-  const typed = { instructions: el("voice-instructions").value, system_prompt: el("voice-system-prompt").value };
-  voicePromptSettings =
-    view && typeof view.instructions === "string" && typeof view.system_prompt === "string" ? view : null;
-  if (voicePromptSettings !== null) {
-    for (const field of ["instructions", "system_prompt"]) {
-      const box = el(field === "instructions" ? "voice-instructions" : "voice-system-prompt");
-      box.value = keep.includes(field) && dirty[field] ? typed[field] : voicePromptSettings[field];
-    }
-  }
-  renderVoicePrompt();
-}
-
-/** Why the boxes cannot be changed here, or "" when they can. */
-function voicePromptLock() {
-  if (tokenScope !== "write") return "Only the write token can change these.";
-  if (!voicePromptSettings.changeable) return "This server keeps no settings, so these cannot be changed here.";
-  return "";
-}
-
-/** The line under the instructions box. */
-function voiceInstructionsLine(dirty) {
-  const length = promptChars(el("voice-instructions").value);
-  const limit = voicePromptSettings.max_instructions_chars;
-  if (length > limit) return `${length} characters; at most ${limit} are kept. Shorten them to save.`;
-  if (dirty) return "Not saved yet.";
-  return voicePromptSettings.instructions ? "Saved. Added to every call." : "None.";
-}
-
-/** The line under the system prompt, which says whose prompt it is and how old. */
-function voiceSystemPromptLine(dirty) {
-  const length = promptChars(el("voice-system-prompt").value);
-  const limit = voicePromptSettings.max_system_prompt_chars;
-  const version = voicePromptSettings.prompt_version;
-  if (length > limit) return `${length} characters; at most ${limit} are kept. Shorten it to save.`;
-  if (dirty) return "Not saved yet. Saving an empty box restores the shipped prompt.";
-  if (!voicePromptSettings.system_prompt_edited) return `The shipped prompt, version ${version}.`;
-  const from = voicePromptSettings.edited_from_version;
-  if (typeof from === "number" && from < version) {
-    return (
-      `Your copy, saved when the shipped prompt was version ${from}. It is now version ${version}; ` +
-      "restore it to see what changed."
-    );
-  }
-  return "Your copy, in place of the shipped prompt.";
-}
-
-/** How the words reach this deployment's agent. */
-function voicePromptDeliveryLine() {
-  if (voicePromptSettings.delivery === "profile") return "Both reach the agent at its next call.";
-  // `#272`: the replaced prompt is always the write token's, because this server cannot see the
-  // token the agent was given in its provider's console.
-  return (
-    "This page hands them to the agent as each call starts; the prompt only if its provider lets it be replaced. " +
-    "A replaced prompt tells the agent it may send, so that agent needs the write token."
-  );
-}
-
-/** What the last call was given, said plainly — above all an edited prompt that did not reach it. */
-function voicePromptLastCallLine() {
-  const last = voicePromptLastCall;
-  if (last === null) return "";
-  const refused =
-    last.override_allowed === false
-      ? "The last call's agent does not let its prompt be replaced"
-      : "Whether the last call's agent lets its prompt be replaced could not be checked";
-  if (last.transport === "prompt_override") {
-    if (last.system_prompt_applied) {
-      return last.instructions_applied
-        ? "The last call was given your prompt and instructions."
-        : "The last call was given your prompt.";
-    }
-    // The whole prompt was replaced all the same: with no copy of his, by the shipped one, and the
-    // prompt pasted into the provider's console did not reach the agent.
-    return last.instructions_applied
-      ? "The last call was given the shipped prompt with your instructions, in place of the prompt in its provider's console."
-      : "The last call was given the shipped prompt, in place of the prompt in its provider's console.";
-  }
-  if (last.transport === "contextual_update") {
-    return `${refused}, so only your instructions went, as a note at the start.`;
-  }
-  // Nothing went: an edited prompt the agent would not take, or nothing of the owner's at all —
-  // as saved when the call opened, not as saved since. Either way the agent used the prompt in its
-  // provider's console.
-  const edited = last.editedWhenOpened ?? voicePromptSettings.system_prompt_edited;
-  return edited
-    ? `${refused}, so your edited prompt did not reach it.`
-    : `${refused}, so it kept the prompt in its provider's console.`;
-}
-
-/** Draw both boxes, their Saves and the lines under them from `voicePromptSettings`. */
-function renderVoicePrompt() {
-  // The line beside the send switch is worded from the same knowledge: how the prompt is delivered,
-  // and what the last call was given.
-  renderVoiceSendHosted();
-  const state = el("voice-prompt-state");
-  el("voice-prompt-editor").hidden = voicePromptSettings === null;
-  if (voicePromptSettings === null) {
-    state.textContent = "This server does not take instructions for its voice agent.";
-    return;
-  }
-  const lock = voicePromptLock();
-  const dirty = voicePromptDirty();
-  const held = Boolean(lock) || voicePromptSaving;
-  el("voice-instructions").disabled = Boolean(lock);
-  el("voice-system-prompt").disabled = Boolean(lock);
-  el("save-voice-instructions").disabled =
-    held || !dirty.instructions ||
-    promptChars(el("voice-instructions").value) > voicePromptSettings.max_instructions_chars;
-  el("save-voice-system-prompt").disabled =
-    held || !dirty.system_prompt ||
-    promptChars(el("voice-system-prompt").value) > voicePromptSettings.max_system_prompt_chars;
-  const restore = el("restore-voice-system-prompt");
-  restore.disabled = held || (!voicePromptSettings.system_prompt_edited && !dirty.system_prompt);
-  if (restore.disabled && restoreArmedTimer !== null) {
-    clearTimeout(restoreArmedTimer);
-    restoreArmedTimer = null;
-  }
-  const armed = restoreArmedTimer !== null;
-  restore.className = armed ? "secondary armed" : "secondary";
-  restore.textContent = !armed
-    ? "Restore the shipped prompt"
-    : voicePromptSettings.system_prompt_edited
-      ? "Delete your copy?"
-      : "Discard your edit?";
-  el("voice-instructions-state").textContent = voiceInstructionsLine(dirty.instructions);
-  el("voice-system-prompt-state").textContent = voiceSystemPromptLine(dirty.system_prompt);
-  state.textContent = [lock, voicePromptDeliveryLine(), voicePromptLastCallLine()].filter(Boolean).join(" ");
-}
-
-/** Save one box, then draw what the server STORED; on failure, keep the typed text and say so. */
-async function saveVoicePrompt(field, text) {
-  voicePromptSaving = true;
-  renderVoicePrompt();
-  let stored = null;
-  try {
-    stored = await apiDecoded("VoicePromptSettings", "/api/v1/voice-prompt", {
-      method: "PUT",
-      body: { [field]: text },
-    });
-  } catch (error) {
-    voicePromptSaving = false;
-    renderVoicePrompt();
-    const what = field === "instructions" ? "The instructions were" : "The system prompt was";
-    showError(`${what} not saved: ${error.detail || error.message}`);
-    return;
-  }
-  voicePromptSaving = false;
-  applyVoicePrompt(stored, [field === "instructions" ? "system_prompt" : "instructions"]);
-  if (field === "instructions") {
-    setStatus(
-      stored.instructions
-        ? "Saved. The voice agent gets these instructions from its next call."
-        : "Saved. The voice agent has no additional instructions from its next call."
-    );
-  } else {
-    // His copy — or after Restore, the shipped prompt — reaches a hosted agent only if the agent
-    // lets this page replace its prompt; one that does not keeps the prompt in its console.
-    const which = stored.system_prompt_edited ? "your prompt" : "the shipped prompt";
-    const follows = agentPromptFollowsSwitch();
-    setStatus(
-      follows === "kept"
-        ? `Saved, but the last call's agent does not let this page replace its prompt, so ${which} will not reach it; ` +
-            (stored.system_prompt_edited ? "your instructions still do." : "it keeps the one in its provider's console.")
-        : follows === "unknown"
-          ? `Saved. The voice agent gets ${which} from its next call if its provider lets this page replace its prompt.`
-          : `Saved. The voice agent gets ${which} from its next call.`
-    );
-  }
-}
-
-function disarmRestore() {
-  restoreArmedTimer = null;
-  renderVoicePrompt();
-}
-
-/** Back to the shipped prompt: a save of an empty box, or just the box put back when nothing was saved. */
-async function restoreVoiceSystemPrompt() {
-  if (voicePromptSettings === null) return;
-  if (restoreArmedTimer === null) {
-    restoreArmedTimer = setTimeout(disarmRestore, voiceTranscript().CLEAR_ARMED_MS);
-    renderVoicePrompt();
-    setStatus(
-      voicePromptSettings.system_prompt_edited
-        ? "Tap again to delete your copy of the prompt and go back to the shipped one."
-        : "Tap again to throw away your edit and put the shipped prompt back."
-    );
-    return;
-  }
-  clearTimeout(restoreArmedTimer);
-  restoreArmedTimer = null;
-  if (!voicePromptSettings.system_prompt_edited) {
-    el("voice-system-prompt").value = voicePromptSettings.system_prompt;
-    renderVoicePrompt();
-    return;
-  }
-  await saveVoicePrompt("system_prompt", "");
-}
-
-/**
- * Put the owner's words on a hosted agent's opening frames, in the form the server chose, and
- * remember what this call was given. Answers `note`, the frame to send right after the initiation
- * or null, and `replaced`, whether the initiation now replaces the agent's own prompt.
- *
- * `prompt_override` rides on the initiation itself, beside a typed call's text-only request; the
- * server names it only when the agent's own configuration allows it, because one it does not allow
- * is believed to end the conversation. `contextual_update` is a note sent straight after, as
- * resuming's record is. Anything else sends nothing, and an absent `handed` leaves the frame exactly
- * as it always was.
- *
- * It draws nothing. It runs inside the socket's open handler before the initiation is sent, and
- * Settings is redrawn only after the frames are (`renderAfterHandOver`), so drawing Settings can
- * never stand between the owner and his call.
- */
-function handOverAgentPrompt(initiation, handed) {
-  voicePromptLastCall =
-    handed && typeof handed.transport === "string"
-      ? {
-          ...handed,
-          editedWhenOpened: voicePromptSettings === null ? null : voicePromptSettings.system_prompt_edited === true,
-        }
-      : null;
-  const nothing = { note: null, replaced: false };
-  if (voicePromptLastCall === null || typeof handed.text !== "string" || handed.text === "") return nothing;
-  if (handed.transport === "prompt_override") {
-    const override = initiation.conversation_config_override || {};
-    initiation.conversation_config_override = {
-      ...override,
-      agent: { ...(override.agent || {}), prompt: { prompt: handed.text } },
-    };
-    return { note: null, replaced: true };
-  }
-  if (handed.transport === "contextual_update") {
-    return { note: { type: "contextual_update", text: handed.text }, replaced: false };
-  }
-  return nothing;
-}
-
-/**
- * Redraw Settings' lines about what the call was given, once its opening frames are sent. A
- * failure here is caught and noted rather than allowed out: the rest of the open handler — the
- * call going live, the microphone starting — must not depend on a settings screen drawing.
- */
-function renderAfterHandOver() {
-  try {
-    renderVoicePrompt();
-  } catch (error) {
-    addDetail(`Settings could not show what this call was given: ${String((error && error.message) || error)}`);
-  }
-}
 
 // --- saved messages on this server -----------------------------------------------------------------
 //
@@ -33816,119 +32753,21 @@ function resumeNote() {
  * every line here to a budget, so the paragraphs cannot creep back one clause at a time. Shortened,
  * not merged: the six states are still six different sentences, for the reasons above.
  */
+/** Settings reads the voice owner's recap state without taking ownership of its outcome. */
+const resumePreference = mountResumePreference({
+  lookup: (id) => el(id),
+  read: {
+    get allowed() { return resumeAllowed; },
+    get last() { return resumeLast; },
+    get conversationId() { return resumeConversationId; },
+    get replayUnavailable() { return voiceTranscript().replayUnavailable; },
+    wanted: () => resumeWanted(),
+  },
+  renderControls: () => voiceCall().renderControls(),
+});
+
 function renderResumeState() {
-  const state = el("resume-state");
-  if (!state) {
-    return;
-  }
-  renderResumeSwitch();
-  const lines = (count) => (count === 1 ? "1 earlier line" : `${count} earlier lines`);
-  // `#331 resume-on-websocket`. How much the last call was given, in the server's own count.
-  const words = typeof resumeLast.words === "number" && resumeLast.words > 0
-    ? `${resumeLast.words.toLocaleString("en-US")} word${resumeLast.words === 1 ? "" : "s"}`
-    : null;
-  if (!resumeAllowed && voiceTranscript().replayUnavailable) {
-    // `#331 resume-on-websocket`. Turned on by the operator, and not possible here: the reason is
-    // beside the switch.
-    state.textContent = "Resuming is unavailable on this server: every call starts fresh.";
-  } else if (!resumeAllowed) {
-    state.textContent = "Resuming is OFF on this server: every call starts fresh.";
-  } else if (!resumeWanted()) {
-    state.textContent = "Resuming is off: a new call starts fresh.";
-  } else if (resumeLast.failed) {
-    state.textContent = "The last call could NOT be resumed: the record would not load.";
-  } else if (resumeLast.refused) {
-    state.textContent = "The last call was NOT resumed: the voice service refused the recap.";
-  } else if (resumeLast.unsupported) {
-    state.textContent = "The last call was NOT resumed: its voice session took no recap.";
-  } else if (resumeLast.unsent) {
-    state.textContent = "The last call ended before it could be told what was already said.";
-  } else if (resumeLast.replaced) {
-    state.textContent = "The last call's voice session was replaced; the new one was sent no recap.";
-  } else if (resumeLast.armed && resumeLast.dropped > 0) {
-    state.textContent = `The last call was resumed IN PART: ${words ? `${words}; ` : ""}` +
-      `${lines(resumeLast.dropped)} did not fit.`;
-  } else if (resumeLast.armed && words) {
-    state.textContent = resumeLast.acked
-      ? `The last call was resumed: the agent took ${words} from earlier.`
-      : `The last call was resumed: it was sent ${words} from earlier.`;
-  } else if (resumeLast.armed) {
-    state.textContent = "The last call was resumed.";
-  } else if (resumeLast.attempted && resumeLast.dropped > 0) {
-    // Not "there was nothing to replay". There was; none of it fitted. Reporting that as an empty
-    // conversation would tell the reader something false about a call they remember having.
-    state.textContent =
-      `The last call started fresh: ${resumeLast.dropped === 1 ? "the" : "all"} ` +
-      `${lines(resumeLast.dropped)} ${resumeLast.dropped === 1 ? "was" : "were"} over the budget.`;
-  } else if (resumeLast.attempted) {
-    state.textContent = "The last call started fresh: there was nothing to replay.";
-  } else if (!resumeConversationId) {
-    state.textContent = "Resuming is on. Nothing to resume from yet.";
-  } else {
-    state.textContent = "Resuming is on: the next call will be told what was already said.";
-  }
-  voiceCall().renderControls();
-}
-
-/**
- * Resuming's switch: live only where this server can resume, and otherwise disabled, unticked, with
- * its reason beside it. `#331 resume-on-websocket`: the owner found it a live checkbox on a server
- * that could not resume — a control that did nothing — with only the line above to say so.
- *
- * Unticked while disabled, so it never shows a choice that is not in force; the choice itself is
- * kept, and comes back where the server can act on it.
- */
-function renderResumeSwitch() {
-  const toggle = el("resume-toggle");
-  const why = el("resume-unavailable");
-  toggle.disabled = !resumeAllowed;
-  toggle.checked = resumeAllowed && resumeWanted();
-  why.hidden = resumeAllowed;
-  why.textContent = resumeAllowed ? "" : resumeUnavailableReason();
-}
-
-/** Why this server cannot resume, as the line beside the disabled switch says it. */
-function resumeUnavailableReason() {
-  switch (voiceTranscript().replayUnavailable) {
-    case null:
-      return "Unavailable: resuming is turned off in this server's configuration.";
-    case "bridge_declined":
-      return "Unavailable: this server's voice service does not take a recap.";
-    case "bridge_unconfirmed":
-      return "Unavailable: this server's voice service has not said it takes a recap.";
-    default:
-      return "Unavailable: this server's voice service cannot take a recap.";
-  }
-}
-
-/**
- * Say which arm this deployment is in for the rewrite-for-speech pass.
- *
- * Reported, never controlled: the rewrite happens on the server before a message reaches this page
- * at all, and the voice agent's own tool calls never pass through this browser. A switch here
- * could only govern one of the three paths that read a message out.
- *
- * `#332 settings-voice-agent-section`. The line opens Help's How messages are said, rather than
- * standing on Settings as a group with no control in it; the paragraphs under it say what the
- * rewrite does, so the line only says which arm. `#347 settings-prose` renamed the entry "How
- * messages are pre-processed for speech", the words of the link under Reading full messages in
- * channel view that opens it.
- *
- * A server too old to send the field is NOT reported as off. Older servers prepared bodies
- * unconditionally, so "off" would be a false statement about a deployment that is in fact doing
- * the rewriting — and the reader is looking at this line precisely to find out which arm they are
- * in. Only an explicit `false` says off.
- */
-function renderSpeechPrepState(enabled) {
-  const state = el("speech-prep-state");
-  if (!state) {
-    return;
-  }
-  state.textContent =
-    enabled === false
-      ? "Off on this server: messages are read out exactly as they were typed."
-      : "On for this server: messages are rewritten for the ear, and the channel view still " +
-        "shows what was typed.";
+  resumePreference.render();
 }
 
 /**
@@ -34219,23 +33058,7 @@ function chooseReadNew(mode) {
 function renderLiveState() {
   // "Live · updated" in the channel pill depends on the stream being attached.
   renderChannelFreshness();
-  const state = el("live-state");
-  if (!state) {
-    return;
-  }
-  if (liveDelivery === "off") {
-    state.textContent = "Live updates are OFF on this server.";
-    return;
-  }
-  if (liveDelivery === "push") {
-    state.textContent = liveFollow.attached()
-      ? "Live by adapter push: listening, but the adapter's health is not checked."
-      : "Live by adapter push, but not connected right now; it keeps trying.";
-    return;
-  }
-  state.textContent = liveFollow.attached()
-    ? `Live: this server re-reads the channel every ${livePollSeconds} seconds.`
-    : `Live every ${livePollSeconds} seconds, but not connected to the stream; it keeps trying.`;
+  connectionReadouts.live();
 }
 
 /** Stop following whatever is being followed. Idempotent. */
@@ -34902,13 +33725,6 @@ function channelName(channel) {
  */
 const channelDirectory = createChannelDirectory();
 
-/**
- * What the page says where a channel would be when the list is empty: in Settings, which holds both
- * ways out, and on the status line of a read that has nothing to read. Not "this server has no
- * channels", which stopped being the only way to get here once a configured one could be hidden.
- */
-const EMPTY_CHANNEL_LIST =
-  "Your channel list is empty. Add a channel, or show a hidden one again below.";
 const NO_CHANNEL_TO_READ =
   "no channel to read — your channel list is empty. " +
   "Add one, or show a hidden one again, in Settings.";
@@ -34986,181 +33802,33 @@ function channelsInPickerOrder() {
   return channelsGrouped() ? channelGroups().flatMap((group) => group.channels) : channelDirectory.channels();
 }
 
-// --- Settings, one service at a time -------------------------------------------------------------
-//
-// `#355 provider-grouped-channels`. The owner: "under the Channels setting ... drop-down for
-// Service=Slack/etc and then within that a list of subscribed channels". With two or more services,
-// Settings > Channels starts with a Service picker; the channel picker lists that service's channels,
-// a line says what the service does here, and Add, Browse and the hidden channels act on it. Settings
-// opens on the service of the channel being read. With one service none of this shows, and every
-// request is what it was.
-
-/** The service Settings is showing, by key, or null with one service. */
-let settingsService = null;
-
-/**
- * The Service picker's entry for the channels of no service the server describes (an added channel
- * whose bridge is no longer configured), shown only while there are some: every channel on the bar
- * can be reached from Settings, to be renamed or looked at.
- */
-const NO_SERVICE = "";
-
-/** The channels of no service the server describes: the bar's "Not connected" group. */
-function strayChannels() {
-  return channelDirectory.channels().filter(
-    (channel) => typeof channel.provider !== "string" || !channelDirectory.providers().has(channel.provider)
-  );
-}
-
-/** Whether `key` is an entry of the Service picker now: a described service, or "Not connected" while it holds channels. */
-function settingsServiceOffered(key) {
-  return channelDirectory.providers().has(key) || (key === NO_SERVICE && strayChannels().length > 0);
-}
-
-/** Whether Settings chooses a service first: the server describes two or more. */
-function servicesInSettings() {
-  return channelDirectory.providers().size >= 2;
-}
-
-/** The description of the service Settings is showing, or null with one service. */
-function settingsServiceDescription() {
-  return servicesInSettings() && settingsService !== null ? channelDirectory.providers().get(settingsService) || null : null;
-}
-
-/** The service Settings is showing, as a noun phrase: its name, or the one service's. */
-function settingsServiceName() {
-  return settingsServiceDescription() ? serviceLabel(/** @type {string} */ (settingsService)) : chatServiceName();
-}
-
-/** The channels Settings' picker lists: the chosen service's, or every one with one service. */
-function settingsChannels() {
-  if (!servicesInSettings() || settingsService === null) return channelDirectory.channels();
-  if (settingsService === NO_SERVICE) return strayChannels();
-  return channelDirectory.channels().filter((channel) => channel.provider === settingsService);
-}
-
-/** The service Settings opens on with none chosen yet: the channel being read's, else the first with channels. */
-function defaultSettingsService() {
-  const reading = knownChannel(selectedChannelId());
-  if (reading) return channelDirectory.providers().has(reading.provider) ? reading.provider : NO_SERVICE;
-  const keys = [...channelDirectory.providers().keys()];
-  return keys.find((key) => channelDirectory.channels().some((channel) => channel.provider === key)) || keys[0] || null;
-}
-
-/** Whether the service Settings is showing takes a link or reference to add a channel, rather than an id. */
-function addsByLink() {
-  const chosen = settingsServiceDescription();
-  return chosen ? chosen.channel_registration_supported === true : channelDirectory.registrationSupported();
-}
-
-/** Whether Browse is offered: the service can list its channels and add one by reference. */
-function browseOffered() {
-  const chosen = settingsServiceDescription();
-  return chosen
-    ? chosen.channel_registration_supported === true && chosen.channel_discovery_supported === true
-    : channelDirectory.discoverySupported();
-}
-
-// What the chosen service does here, the line under the Service picker, is web/src/present/settings's
-// (`serviceFacts`, `#624 voice-page-modularity`).
-
-/**
- * Draw the Service picker: one entry per service, in the server's order, shown with two or more,
- * when it takes the place of the "Chat service" line.
- */
-function fillServiceSelect() {
-  const shown = servicesInSettings();
-  el("settings-service-row").hidden = !shown;
-  el("chat-provider-line").hidden = shown;
-  const select = el("settings-service");
-  if (!shown) {
-    settingsService = null;
-    select.replaceChildren();
-    return;
-  }
-  if (settingsService === null || !settingsServiceOffered(settingsService)) settingsService = defaultSettingsService();
-  const keys = [...channelDirectory.providers().keys()];
-  if (strayChannels().length > 0) keys.push(NO_SERVICE);
-  select.replaceChildren(...keys.map((key) => {
-    const option = document.createElement("option");
-    option.value = key;
-    option.textContent = key === NO_SERVICE ? UNDESCRIBED_SERVICE : serviceLabel(key);
-    return option;
-  }));
-  select.value = settingsService;
-  const chosen = settingsServiceDescription();
-  el("service-facts").textContent = chosen
-    ? serviceFacts(chosen, serviceLabel(chosen.key))
-    : STRAY_SERVICE_FACTS;
-}
-
-/**
- * Show the service `key` in Settings, and the channel `channelId` in it when it is one of its own.
- * Another service than the one showing closes any open panel and empties the browse list: both
- * belonged to the service they were opened for.
- */
-function chooseSettingsService(key, channelId = null) {
-  if (!servicesInSettings() || !settingsServiceOffered(key)) return;
-  if (key !== settingsService) {
-    settingsService = key;
-    showChannelPanel(null);
-    channelDirectoryBox.reset();
-  }
-  fillServiceSelect();
-  fillChannelSelect("settings-channel");
-  if (channelId !== null && settingsChannels().some((channel) => String(channel.id) === String(channelId))) {
-    el("settings-channel").value = String(channelId);
-  }
-  renderAddChannelForm();
-  renderHiddenChannels();
-  renderChannelBox();
-}
-
-/** Point Settings at the channel `channelId`: its service, then it. */
-function pointSettingsAt(channelId) {
-  const listed = knownChannel(channelId) || channelDirectory.hidden().find((channel) => String(channel.id) === String(channelId));
-  if (listed && servicesInSettings()) {
-    chooseSettingsService(channelDirectory.providers().has(listed.provider) ? listed.provider : NO_SERVICE, channelId);
-  } else {
-    el("settings-channel").value = String(channelId);
-  }
-}
-
-/**
- * Settings, opened, shows the service of the channel being read, and that channel when it is
- * another service than the one showing. Not on the way back from Help, which is the same visit.
- */
-function pointSettingsAtReading() {
-  if (!servicesInSettings()) return;
-  const reading = knownChannel(selectedChannelId());
-  if (!reading) return;
-  const service = channelDirectory.providers().has(reading.provider) ? reading.provider : NO_SERVICE;
-  if (service !== settingsService) chooseSettingsService(service, reading.id);
-}
-
-/**
- * The add form as the service Settings shows takes a channel: a link or reference, or an id. With
- * several services an id is not always a snowflake (a Slack that does not register channels takes
- * its own ids), so the field asks for "the channel's ID" there.
- */
-function renderAddChannelForm() {
-  const byLink = addsByLink();
-  const service = settingsServiceName();
-  const anyId = !byLink && settingsServiceDescription() !== null;
-  // Nothing can be added to "Not connected": it is the channels of no service this server reads.
-  const stray = servicesInSettings() && settingsService === NO_SERVICE;
-  el("open-add-channel").hidden = stray;
-  el("open-browse-channels").hidden = stray || !browseOffered();
-  // The words and the field's shape are web/src/present/settings's (`#624 voice-page-modularity`).
-  const { help, label: fieldName, inputMode, maxLength, placeholder } = addChannelForm(byLink, anyId, service);
-  el("new-channel-help").textContent = help;
-  el("new-channel-id-label").textContent = fieldName;
-  el("new-channel-id").inputMode = inputMode;
-  el("new-channel-id").maxLength = maxLength;
-  el("new-channel-id").placeholder = placeholder;
-  el("new-channel-writable-row").hidden = byLink;
-  if (byLink) el("new-channel-writable").checked = false;
-}
+/** Settings' channel box owns its service choice, editor and hidden list (#624 voice-page-modularity). */
+const channelSettings = mountChannelSettings({
+  lookup: (id) => el(id),
+  directory: channelDirectory,
+  allChannels: ALL_CHANNELS,
+  undescribedService: UNDESCRIBED_SERVICE,
+  tokenScope: () => tokenScope,
+  selectedChannelId: () => selectedChannelId(),
+  serviceLabel: (key) => serviceLabel(key),
+  chatServiceName: () => chatServiceName(),
+  channelName: (channel) => channelName(channel),
+  pickerName: (name) => pickerName(name),
+  browser: () => channelDirectoryBox,
+  upstream: () => upstreamClearBox,
+  history: () => channelHistoryBox,
+  identities: () => identityList,
+  folds: () => settingsFolds,
+  request: (path, options) => api(path, options),
+  guard: (run) => guardQuietly(run),
+  adoptChannelList: (payload) => adoptChannelList(payload),
+  changeSelectedChannel: () => changeSelectedChannel(),
+  forgetChannelScopes: (matches) => forgetChannelScopes(matches),
+  saveCacheChannels: () => saveCacheChannels(),
+  fillReadingSelect: () => fillChannelSelect("discord-channel"),
+  restateChannelSeam: () => restateChannelSeam(),
+  setStatus: (text) => setStatus(text),
+});
 
 /**
  * Act on the selected channel's own provider: its threads, its read cursor, its live delivery.
@@ -35199,13 +33867,13 @@ const channelDirectoryBox = mountChannelDirectory({
   lookup: (id) => el(id),
   request: (path, options) => api(path, options),
   known: (id) => knownChannel(id) !== null,
-  showPanel: (which) => showChannelPanel(which),
-  serviceName: () => settingsServiceName(),
-  provider: () => (settingsServiceDescription() ? settingsService : null),
+  showPanel: (which) => channelSettings.showChannelPanel(which),
+  serviceName: () => channelSettings.settingsServiceName(),
+  provider: () => (channelSettings.settingsServiceDescription() ? channelSettings.service() : null),
   guard: (run) => guardQuietly(run),
   adoptChannelList: (payload) => adoptChannelList(payload),
-  pointSettingsAt: (id) => pointSettingsAt(id),
-  renderChannelBox: () => renderChannelBox(),
+  pointSettingsAt: (id) => channelSettings.pointSettingsAt(id),
+  renderChannelBox: () => channelSettings.renderChannelBox(),
   channelName: (channel) => channelName(channel),
   now: () => Date.now(),
   setTimeout: (run, ms) => setTimeout(run, ms),
@@ -35270,26 +33938,13 @@ function rememberActiveChannel(chosen = false) {
  * move the Discord view to a different channel because a name changed somewhere else.
  */
 function fillChannelSelect(id) {
+  if (id === "settings-channel") return channelSettings.fillSettingsSelect();
   const select = el(id);
   // Restore only an ID still present in the server's current channel list. Settings has its own
   // picker and must not change the remembered reading destination merely by editing a channel.
   // The bar's picker shows the selection (`navigation`), so its channel is the selection's.
-  const chosen = id === "discord-channel" ? selectedChannelId() || storedActiveChannel() : select.value || "";
+  const chosen = selectedChannelId() || storedActiveChannel();
   select.replaceChildren();
-  // `#349 channel-settings-all`. Settings' picker opens with All channels where there is more than
-  // one: Clear unread set for every channel at once. Never the reading picker's: a view reads one.
-  // `#351 settings-polish`: and only where one of them, at least, can take Clear unread with this
-  // token. All channels is for that one setting, and Rename and Remove step aside for it, so with none
-  // that can (no chat service that clears unread, or a read token) it was a choice that left nothing to do.
-  // `#355 provider-grouped-channels`: with several services, all of the chosen service's channels,
-  // "All Slack channels", offered on the same terms within that service.
-  const all = id === "settings-channel" && settingsChannels().length >= 2 && upstreamClearAllChannels().length > 0;
-  if (all) {
-    const option = document.createElement("option");
-    option.value = ALL_CHANNELS;
-    option.textContent = settingsServiceDescription() ? `All ${settingsServiceName()} channels` : "All channels";
-    select.append(option);
-  }
   const optionFor = (channel) => {
     const option = document.createElement("option");
     option.value = channel.id;
@@ -35298,7 +33953,7 @@ function fillChannelSelect(id) {
   };
   // `#355 provider-grouped-channels`. The bar's picker groups its channels by service once two or
   // more have channels; each group is an <optgroup>, so the open list has a header per service.
-  const grouped = id === "discord-channel" && channelsGrouped();
+  const grouped = channelsGrouped();
   if (grouped) {
     for (const group of channelGroups()) {
       const header = document.createElement("optgroup");
@@ -35309,75 +33964,18 @@ function fillChannelSelect(id) {
       select.append(header);
     }
   } else {
-    // `#355 provider-grouped-channels`. Settings' picker lists the chosen service's channels only.
-    for (const channel of id === "settings-channel" ? settingsChannels() : channelDirectory.channels()) select.append(optionFor(channel));
+    for (const channel of channelDirectory.channels()) select.append(optionFor(channel));
   }
-  const order = grouped ? channelsInPickerOrder() : id === "settings-channel" ? settingsChannels() : channelDirectory.channels();
-  const showing = all && chosen === ALL_CHANNELS
-    ? ALL_CHANNELS
-    : order.some((channel) => String(channel.id) === String(chosen))
+  const order = grouped ? channelsInPickerOrder() : channelDirectory.channels();
+  const showing = order.some((channel) => String(channel.id) === String(chosen))
       ? chosen
       : order.length > 0
         ? order[0].id
         : "";
   // The bar's picker is redrawn onto the selection, which this keeps on its channel or moves to the
   // first: through its owner, whose picker then shows it.
-  if (id === "discord-channel") selectionOwner().selectChannel(String(showing));
-  else select.value = showing;
-  if (id === "discord-channel") rememberActiveChannel();
-  // `#351 settings-polish`, `#402 who-is-who-channel-box`. Settings' picker redrawn onto another
-  // channel than the one it showed (the box's channel removed from under it) moves who is who with it.
-  if (id === "settings-channel" && String(select.value) !== String(chosen)) identityList.render();
-}
-
-/**
- * Remove is offered for every channel on the list. `#199 removable-config-channels`.
- *
- * It used to be offered only for a channel added here, because the server refused the others: a
- * configured channel comes from a file it never writes. The server now HIDES one of those instead,
- * durably, so the owner's one verb works on whatever he is looking at, and what it did is said
- * after he presses it rather than as a reason the button is missing.
- */
-function renderRemoveChannel(channel) {
-  el("remove-channel").hidden = channel === null || channel === undefined;
-  el("remove-channel-state").textContent = "";
-}
-
-/**
- * Draw the hidden configured channels, each with Show again, or take the list away when there
- * are none. Names go through `channelName` like every picker, so a channel he renamed is offered
- * back under his name for it.
- *
- * `#401 hidden-channels-fold`. The list is a fold at the foot of the Channels section, and its
- * heading says how many it holds, so a folded list still says whether there is anything in it.
- * Whether it is open is the reader's (`settingsFolds.set`), never this redraw's. The group shown or hidden
- * brings a fold into sight or takes it out, which Expand all counts (`settingsFolds.renderAll`).
- */
-function renderHiddenChannels() {
-  // `#355 provider-grouped-channels`. With several services, the chosen service's hidden channels.
-  const shown = !servicesInSettings() || settingsService === null
-    ? channelDirectory.hidden()
-    : settingsService === NO_SERVICE
-      ? channelDirectory.hidden().filter((channel) => typeof channel.provider !== "string" || !channelDirectory.providers().has(channel.provider))
-      : channelDirectory.hidden().filter((channel) => channel.provider === settingsService);
-  const rows = shown.map((channel) => {
-    const row = document.createElement("li");
-    const name = document.createElement("span");
-    name.className = "directory-name";
-    name.textContent = channelName(channel);
-    const show = document.createElement("button");
-    show.type = "button";
-    show.className = "secondary";
-    show.textContent = "Show again";
-    show.setAttribute("aria-label", `Show ${channelName(channel)} again`);
-    show.addEventListener("click", guardQuietly(() => showChannelAgain(channel)));
-    row.append(name, show);
-    return row;
-  });
-  el("hidden-channel-list").replaceChildren(...rows);
-  el("fold-hidden-channels").textContent = `Hidden channels (${rows.length})`;
-  el("hidden-channels").hidden = rows.length === 0;
-  settingsFolds.renderAll();
+  selectionOwner().selectChannel(String(showing));
+  rememberActiveChannel();
 }
 
 /** Take the server's whole answer about the list: both pickers, the hidden list, the cache. */
@@ -35385,80 +33983,10 @@ function adoptChannelList(payload) {
   if (payload && Array.isArray(payload.channels)) channelDirectory.setChannels(payload.channels);
   if (payload && Array.isArray(payload.hidden_channels)) channelDirectory.setHidden(payload.hidden_channels);
   saveCacheChannels();
-  fillServiceSelect();
+  channelSettings.fillServiceSelect();
   fillChannelSelect("discord-channel");
   fillChannelSelect("settings-channel");
-  renderHiddenChannels();
-}
-
-/** Put a hidden configured channel back on the list, and point the channel box at it. */
-async function showChannelAgain(channel) {
-  const said = el("remove-channel-state");
-  let payload = null;
-  try {
-    payload = await api(`/api/v1/channels/${encodeURIComponent(channel.id)}/hidden`, {
-      method: "DELETE",
-    });
-  } catch (error) {
-    said.textContent = error.message;
-    return;
-  }
-  const previousChannel = selectedChannelId();
-  adoptChannelList(payload);
-  pointSettingsAt(channel.id);
-  renderChannelBox();
-  said.textContent = `Shown again. "${channelName(channel)}" is back in the picker.`;
-  if (selectedChannelId() !== previousChannel) await changeSelectedChannel();
-}
-
-/** Add the channel named in the form, and put the answer where it can be read. */
-async function addChannel() {
-  const id = el("new-channel-id").value.trim();
-  const label = el("new-channel-label").value.trim();
-  const said = el("add-channel-state");
-  const byLink = addsByLink();
-  if (!id || !label) {
-    said.textContent = byLink
-      ? "Both the channel reference and a name are needed."
-      : "Both the id and a name are needed.";
-    return;
-  }
-  said.textContent = byLink
-    ? "Registering and checking that it can be read…"
-    : "Checking that the bot can read it…";
-  let payload = null;
-  /** @type {Record<string, unknown>} */
-  const body = byLink
-    ? { source: id, label }
-    : { id, label, writable: el("new-channel-writable").checked };
-  // `#355 provider-grouped-channels`. With several services, the one Settings is showing.
-  if (settingsServiceDescription()) body.provider = settingsService;
-  try {
-    payload = await api("/api/v1/channels", {
-      method: "POST",
-      body,
-    });
-  } catch (error) {
-    // THE SERVER'S OWN SENTENCE, not a rewrite of it. It is the one that knows whether this was a
-    // typo, a channel the bot was never added to, or a token that has stopped working, and it says
-    // which — a second explanation written here could only be vaguer.
-    said.textContent = error.message;
-    return;
-  }
-  // Redrawn from the answer rather than from a re-read: the server hands back the whole list
-  // precisely so the two pickers and the editor cannot disagree about what exists.
-  adoptChannelList(payload);
-  const addedId = String((payload.channel && payload.channel.id) || id);
-  pointSettingsAt(addedId);
-  renderChannelBox();
-  el("new-channel-id").value = "";
-  el("new-channel-label").value = "";
-  el("new-channel-writable").checked = false;
-  showChannelPanel(null);
-  // Named from the answer: adding a configured channel the owner hid shows it again under the
-  // file's label or his alias for it, not the name typed here. `#199 removable-config-channels`.
-  const added = channelName(payload.channel || { label });
-  said.textContent = `Added. "${added}" is now in the channel picker.`;
+  channelSettings.renderHiddenChannels();
 }
 
 // --- browsing channels ---------------------------------------------------------------------
@@ -35472,144 +34000,6 @@ async function addChannel() {
 // (`channelDirectoryBox`, `#624 voice-page-modularity`).
 
 /**
- * Take a channel off the list: forgotten when it was added here, hidden when it came from the
- * configuration file. The server decides which from the channel itself; the page only says which
- * one happened.
- */
-async function removeChannel() {
-  const id = el("settings-channel").value;
-  const channel = knownChannel(id);
-  if (!channel) {
-    return;
-  }
-  const said = el("remove-channel-state");
-  let payload = null;
-  try {
-    payload = await api(`/api/v1/channels/${encodeURIComponent(id)}`, { method: "DELETE" });
-  } catch (error) {
-    said.textContent = error.message;
-    return;
-  }
-  const previousChannel = selectedChannelId();
-  forgetChannelScopes((channel) => channel === String(id));
-  adoptChannelList(payload);
-  // The directory is cached while Settings stays open. Put a removed source back into its real
-  // state immediately; otherwise reopening Browse in the same page still said "Already added"
-  // and offered no way to add it again.
-  channelDirectoryBox.forget(id);
-  channelDirectoryBox.render();
-  renderChannelBox();
-  said.textContent =
-    channel.added === true
-      ? "Removed. It is no longer in the picker."
-      : `Removed from your list. "${channelName(channel)}" is still in this server's ` +
-        "configuration file, so it can be shown again below.";
-  if (selectedChannelId() !== previousChannel) await changeSelectedChannel();
-}
-
-/**
- * Redraw everything in the channel box for the channel its picker is on, or for all of them.
- *
- * ONE CALL, because the box holds several things scoped by that picker — what this channel is called
- * and what it offers, whether its unread is cleared upstream, and who is in it — and every caller
- * needs all of them. `#349 channel-settings-all` took the list of who is who out of the box and
- * `#402 who-is-who-channel-box` put it back, so it is redrawn here again. The hidden channels under
- * the box are the service's, not the channel's (`renderHiddenChannels`), and are not redrawn here.
- */
-function renderChannelBox() {
-  renderAliasEditor();
-  upstreamClearBox.render();
-  channelHistoryBox.render();
-  identityList.render();
-}
-
-/** Whether Settings' channel box is on All channels. `#349 channel-settings-all`. */
-const allChannelsChosen = () => el("settings-channel").value === ALL_CHANNELS;
-
-/** `#355 provider-grouped-channels`. What Settings says for a service with no channel on the list. */
-function emptyServiceSentence() {
-  // Worded by web/src/present/settings (`emptyServiceWords`, `#624 voice-page-modularity`).
-  return emptyServiceWords(browseOffered(), channelDirectory.hidden().some((channel) => channel.provider === settingsService),
-    settingsServiceName());
-}
-
-/** What the editor says about the channel it is pointed at, including the label underneath. */
-function renderAliasEditor() {
-  // `#349 channel-settings-all`. Rename names one channel, so it steps aside for All channels, as
-  // Remove does below; Add and Browse are not about the channel chosen, and stay.
-  const all = allChannelsChosen();
-  el("rename-channel").hidden = all;
-  if (all) {
-    el("channel-alias").value = "";
-    // `#355 provider-grouped-channels`: the chosen service's, with several.
-    const count = settingsChannels().length;
-    el("channel-facts").textContent = allChannelsFacts(count, settingsServiceDescription() ? settingsServiceName() : null);
-    el("alias-state").textContent = "";
-    renderRemoveChannel(null);
-    return;
-  }
-  const channel = knownChannel(el("settings-channel").value);
-  if (!channel) {
-    el("channel-alias").value = "";
-    el("channel-facts").textContent = settingsServiceDescription() ? emptyServiceSentence() : EMPTY_CHANNEL_LIST;
-    el("alias-state").textContent = "";
-    renderRemoveChannel(null);
-    return;
-  }
-  el("channel-alias").value = channel.alias || "";
-  renderRemoveChannel(channel);
-  // ONE LINE, ALWAYS VISIBLE, saying what this channel is. The configured label is named either
-  // way: it is what clearing a name goes back to, and without it on screen the owner cannot tell
-  // what he would be returning to. Where the channel CAME FROM is here too, because it is what
-  // decides whether Remove is offered, and a missing button explains itself badly.
-  const named = channel.alias
-    ? `Called "${channel.alias}" here. The configured label is "${channel.label}".`
-    : `No name of your own yet. The configured label is "${channel.label}".`;
-  const origin = channel.added
-    ? "Added in this app."
-    : "From the server's configuration file.";
-  const posting = writeSourceSentence(channel);
-  el("channel-facts").textContent = posting ? `${named} ${origin} ${posting}` : `${named} ${origin}`;
-  // The same sentence inside the rename panel, where it is what the input is described by.
-  el("alias-state").textContent = named;
-}
-
-/**
- * Why a channel may not be posted to, or that posting follows a service's policy, by whose setting
- * `writable` is. `#374 registered-writable-follows-policy`. An older server sends no `write_source`,
- * and then nothing is said beyond what was said before.
- */
-function writeSourceSentence(channel) {
-  const described = providerOfChannel(channel.id);
-  const service = (described && typeof described.name === "string" && described.name.trim()) || channelDirectory.providerName() || "the chat service";
-  // Worded by web/src/present/settings (`writeSourceWords`, `#624 voice-page-modularity`).
-  return writeSourceWords(channel, service);
-}
-
-// --- clearing unread in the chat service's own app ----------------------------------------------
-//
-// `#232 upstream-mark-read`. With this on for a channel, the SERVER marks every message it receives
-// there read in the chat service's own app too, so that app's unread list keeps the people and
-// vibe-talk keeps the agents; `#349 channel-settings-all` sets it for every channel at once. The box is
-// web/src/view/settings `mountUpstreamClear`, in the words of web/src/present/settings (`#624
-// voice-page-modularity`); which channels it is offered for is decided here, with the channel list.
-
-/** Whether the box offers the control for the channel `id`. */
-function upstreamClearOffered(id) {
-  if (tokenScope !== "write" || !knownChannel(id)) return false;
-  const provider = providerOfChannel(id);
-  return provider ? provider.upstream_clear_supported === true : channelDirectory.capabilities().upstreamClear;
-}
-
-/**
- * The channels All channels reaches: those whose chat service can clear unread, for this token. With
- * several services, only the chosen service's: `#355 provider-grouped-channels`.
- */
-function upstreamClearAllChannels() {
-  return settingsChannels().map((channel) => String(channel.id)).filter((id) => upstreamClearOffered(id));
-}
-
-/**
  * Clear unread in the channel box, for the picker's channel or All channels: drawn, read again as
  * Settings opens, its Save, and "Mark read now".
  *
@@ -35618,11 +34008,11 @@ function upstreamClearAllChannels() {
 const upstreamClearBox = mountUpstreamClear({
   lookup: (id) => el(id),
   decoded: (type, path, options) => apiDecoded(type, path, options),
-  offered: (id) => upstreamClearOffered(id),
-  allChannels: () => upstreamClearAllChannels(),
-  allChannelsChosen: () => allChannelsChosen(),
+  offered: (id) => channelSettings.upstreamClearOffered(id),
+  allChannels: () => channelSettings.upstreamClearAllChannels(),
+  allChannelsChosen: () => channelSettings.allChannelsChosen(),
   serviceOf: (id) => chatServiceOf(id),
-  channelCount: () => settingsChannels().length,
+  channelCount: () => channelSettings.settingsChannels().length,
   nameOf: (id) => channelName(knownChannel(id)),
   setTimeout: (run, ms) => setTimeout(run, ms),
   clearTimeout: (timer) => clearTimeout(timer),
@@ -35644,36 +34034,13 @@ const upstreamClearBox = mountUpstreamClear({
 const channelHistoryBox = mountChannelHistory({
   lookup: (id) => el(id),
   decoded: (type, path, options) => apiDecoded(type, path, options),
-  allChannelsChosen: () => allChannelsChosen(),
+  allChannelsChosen: () => channelSettings.allChannelsChosen(),
   knownChannel: (id) => knownChannel(id),
   cacheOpen: () => serverCacheBox.open(),
   writable: () => tokenScope === "write",
   setTimeout: (run, ms) => setTimeout(run, ms),
   clearTimeout: (timer) => clearTimeout(timer),
 });
-
-/**
- * Open one of the channel box's two panels, or neither.
- *
- * ONE AT A TIME. Both are text entry and the box lives on a phone; two open at once is the
- * full-height form this replaced. Passing `null` closes both, which is what changing channel does —
- * a half-typed name for the channel you just navigated away from is not a draft worth keeping.
- */
-function showChannelPanel(which) {
-  for (const [panel, opener] of [
-    ["rename-fields", "rename-channel"],
-    ["add-channel-fields", "open-add-channel"],
-    ["browse-channel-fields", "open-browse-channels"],
-  ]) {
-    const open = panel === which;
-    el(panel).hidden = !open;
-    el(opener).setAttribute("aria-expanded", open ? "true" : "false");
-  }
-  // `#371 channel-search-hash`. A directory read still on its way when the list is closed is given up
-  // on: its count stops, and its answer is not drawn into a list nobody is looking at. Opening the list
-  // again reads it again (the server answers from what it kept).
-  if (which !== "browse-channel-fields") channelDirectoryBox.giveUp();
-}
 
 /**
  * Rewrite the line at the head of the channel, which is already on screen saying the old name.
@@ -35697,51 +34064,6 @@ function restateChannelSeam() {
       channelName(knownChannel(selectedChannelId()))
     )
   );
-}
-
-/**
- * Take the server's answer as the truth about the name, and carry its notice through unchanged.
- *
- * The server is what decides what got stored — it trims, and it refuses what it will not keep —
- * so the field is refilled from the answer rather than from what was typed.
- */
-function adoptChannel(payload) {
-  const updated = payload && payload.channel;
-  if (updated) {
-    channelDirectory.replaceChannel(updated);
-    saveCacheChannels();
-  }
-  el("alias-note").textContent = (payload && payload.alias_notice) || "";
-  fillChannelSelect("discord-channel");
-  fillChannelSelect("settings-channel");
-  renderChannelBox();
-  restateChannelSeam();
-}
-
-function aliasPath() {
-  const channel = el("settings-channel").value;
-  return `/api/v1/channels/${encodeURIComponent(channel)}/alias`;
-}
-
-async function saveAlias() {
-  if (!knownChannel(el("settings-channel").value)) {
-    return;
-  }
-  const payload = await api(aliasPath(), {
-    method: "PUT",
-    body: { alias: el("channel-alias").value },
-  });
-  adoptChannel(payload);
-  setStatus("Saved. This app calls it that from now on.");
-}
-
-async function clearChannelAlias() {
-  if (!knownChannel(el("settings-channel").value)) {
-    return;
-  }
-  const payload = await api(aliasPath(), { method: "DELETE" });
-  adoptChannel(payload);
-  setStatus("Cleared. The configured label is back.");
 }
 
 // --- sign-in ---------------------------------------------------------------------------------
@@ -35777,27 +34099,6 @@ let conversationalVoice = {
   settings_url: null,
   instance_id: null,
 };
-
-/**
- * Show the link when there is an agent to link to, and hide the whole group when there is not.
- *
- * Hidden rather than greyed: an older server does not report the id at all, and a dead link
- * labelled "open this agent's configuration" is worse than no link — it is a control that is
- * present, looks live, and goes somewhere wrong.
- */
-function renderAgentLink() {
-  const url = conversationalVoice.settings_url;
-  const id = conversationalVoice.instance_id;
-  el("agent-settings").hidden = !url;
-  // `#351 settings-polish`. A fold shown or hidden with it changes what Expand all is about.
-  settingsFolds.renderAll();
-  if (!url) {
-    return;
-  }
-  el("agent-id").textContent = id || conversationalVoice.name;
-  el("agent-console-link").textContent = `Open ${conversationalVoice.name} configuration`;
-  el("agent-console-link").setAttribute("href", url);
-}
 
 function applyClientConfig(config) {
   const speech = config.read_aloud;
@@ -35875,12 +34176,12 @@ function applyClientConfig(config) {
         : null,
   };
   voiceCall().session.providerName = conversationalVoice.name;
-  renderAgentLink();
+  settingsReadouts.agentLink();
   // `#39 channel-alias`. Both pickers are drawn from the same list and through the same naming
   // rule, so the name in the bar and the name in Settings are one answer rather than two.
   channelDirectory.setChannels(config.channels || []);
   channelDirectory.setHidden(Array.isArray(config.hidden_channels) ? config.hidden_channels : []);
-  renderHiddenChannels();
+  channelSettings.renderHiddenChannels();
   channelDirectory.setRegistrationSupported(config.channel_registration_supported === true);
   channelDirectory.setDiscoverySupported(
     channelDirectory.registrationSupported() && config.channel_discovery_supported === true);
@@ -35895,13 +34196,13 @@ function applyClientConfig(config) {
   fillChannelSelect("discord-channel");
   // `#355 provider-grouped-channels`. The Service picker before Settings' channel picker, which lists
   // that service's channels; the hidden list and the add form are that service's too.
-  fillServiceSelect();
+  channelSettings.fillServiceSelect();
   fillChannelSelect("settings-channel");
-  renderHiddenChannels();
-  renderAddChannelForm();
+  channelSettings.renderHiddenChannels();
+  channelSettings.renderAddChannelForm();
   // The picker has only just been given a value, and both halves of the box are scoped by it —
   // the render at load ran against an empty picker and listed nothing whatever was stored.
-  renderChannelBox();
+  channelSettings.renderChannelBox();
   restoreChannelComposer();
   // `#44 live-push`. The server says whether it is watching the channel at all, and how often.
   // Without it the page would have to infer "live" from a stream that is attached and silent —
@@ -35947,14 +34248,14 @@ function applyClientConfig(config) {
   voiceTranscript().resumeViaProfile = config.replay_via_profile === true;
   voiceCall().speechHold = speechHoldFrom(config.speech_hold);
   renderResumeState();
-  renderSpeechPrepState(config.speech_prep_enabled);
-  applyNoiseRules(config.noise_rules);
+  settingsReadouts.speechPrep(config.speech_prep_enabled);
+  noiseSettings.apply(config.noise_rules);
   // `#264 voice-send-approval`. After `tokenScope`, which decides whether the box may be changed.
-  applyVoiceSendSetting(config.voice_settings);
+  agentSettings.applySendSetting(config.voice_settings);
   // `#272 voice-agent-instructions`. After `tokenScope` too, for the same reason.
-  applyVoicePrompt(config.voice_prompt);
+  agentSettings.applyPrompt(config.voice_prompt);
   // `#303 voice-post-prefix`. After `tokenScope` too, for the same reason.
-  applyVoicePostPrefix(config.voice_post_prefix);
+  agentPrefix.apply(config.voice_post_prefix);
   // `#208 persistent-cache`. After `tokenScope` as well: only a write token is shown the group.
   serverCacheBox.apply(config.message_cache);
   // `#427 server-thread-hues`: this browser's remembered colours for the channel up are offered
@@ -36181,118 +34482,129 @@ function settingsSync() {
  * control ends in, so a change from another device lands exactly as one made here would. Called
  * only after `localStorage` holds the new value. One key failing must not stop the rest.
  */
-function applySyncedSetting(key) {
-  try {
-    switch (key) {
-      case READ_MODE_KEY: {
-        // None kept is the shipped default's turn, as everywhere: Show read.
-        setReadMode(settingsSync().local(key) || "show");
-        break;
-      }
-      // `#549 own-read-stored`. Only the switch: nothing drawn depends on it.
-      case MARK_OWN_KEY: applyMarkOwnRead(storedMarkOwnRead()); break;
-      case HIDE_EMPTY_KEY: applyHideEmptyMessages(storedHideEmptyMessages()); break;
-      case COMBINE_KEY: applyCombineMessages(storedCombineMessages()); break;
-      case RICH_HEADERS_KEY: applyRichHeaders(storedRichHeaders()); break;
-      case SUMMARIZE_COLLAPSED_KEY: applySummarizeCollapsed(storedSummarizeCollapsed()); break;
-      case IN_APP_LINKS_KEY:
-        applyInAppLinks(storedInAppLinks());
-        redrawMessageLinks();
-        break;
-      case OPEN_IN_VIEW_KEY: renderOpenInView(); break;
-      case COLLAPSED_LINES_KEY:
-        applyCollapsedLines(storedCollapsedLines());
-        refreshElisionLines();
-        break;
-      case CARD_MAX_LINES_KEY: keepingCardPlace(() => applyCardMaxLines(storedCardMaxLines())); break;
-      case READ_SPEED_KEY: readAloudOwner().applyReadSpeed(readAloudOwner().storedReadSpeed()); break;
-      case readAloudOwner().READ_AUDIO_SOURCE_KEY: readAloudOwner().setReadAudioSource(readAloudOwner().storedReadAudioSource(), false); break;
-      case readAloudOwner().WIT_VOICE_KEY: readAloudOwner().setWitVoice(readAloudOwner().storedWitVoice(), false); break;
-      case QUOTE_READ_PERCENT_KEY: applyQuoteReadPercent(storedQuoteReadPercent()); break;
-      case MIC_SETTINGS_KEY: {
-        const held = storedMicSettings();
-        for (const [id, name] of MIC_TOGGLES) {
-          /** @type {HTMLInputElement} */ (el(id)).checked = held[name];
-        }
-        break;
-      }
-      case PROMPTS_KEY: {
-        const held = storedPrompts();
-        for (const entry of CANNED_PROMPTS) {
-          const field = el(entry.field);
-          // A field being typed in is its typist's replica: the next keystroke writes it back
-          // and pushes it, which is last-writer-wins with the writer still writing.
-          if (document.activeElement !== field) {
-            /** @type {HTMLTextAreaElement} */ (field).value = held[entry.key];
-          }
-        }
-        break;
-      }
-      case RESUME_KEY:
-        /** @type {HTMLInputElement} */ (el("resume-toggle")).checked = resumeWanted();
-        break;
-      case RELAY_KEY: renderReadNew(); break;
-      case LINK_KINDS_KEY:
-        linkKinds.reload();
+/** The Settings adapter is constructed on first use, without reading feature owners early. */
+/** @type {import("./src/view/settings/index.ts").SettingsSyncView | undefined} */
+var pageSettingsSyncView;
+function settingsSyncView() {
+  if (!pageSettingsSyncView) pageSettingsSyncView = mountSettingsSyncView({
+    lookup: (id) => el(id),
+    sync: () => settingsSync(),
+    guard: (run) => guardQuietly(run),
+    keys: {
+      get READ_MODE_KEY() { return READ_MODE_KEY; },
+      get MARK_OWN_KEY() { return MARK_OWN_KEY; },
+      get HIDE_EMPTY_KEY() { return HIDE_EMPTY_KEY; },
+      get COMBINE_KEY() { return COMBINE_KEY; },
+      get RICH_HEADERS_KEY() { return RICH_HEADERS_KEY; },
+      get SUMMARIZE_COLLAPSED_KEY() { return SUMMARIZE_COLLAPSED_KEY; },
+      get IN_APP_LINKS_KEY() { return IN_APP_LINKS_KEY; },
+      get OPEN_IN_VIEW_KEY() { return OPEN_IN_VIEW_KEY; },
+      get COLLAPSED_LINES_KEY() { return COLLAPSED_LINES_KEY; },
+      get CARD_MAX_LINES_KEY() { return CARD_MAX_LINES_KEY; },
+      get READ_SPEED_KEY() { return READ_SPEED_KEY; },
+      get READ_AUDIO_SOURCE_KEY() { return readAloudOwner().READ_AUDIO_SOURCE_KEY; },
+      get WIT_VOICE_KEY() { return readAloudOwner().WIT_VOICE_KEY; },
+      get QUOTE_READ_PERCENT_KEY() { return QUOTE_READ_PERCENT_KEY; },
+      get RELAY_KEY() { return RELAY_KEY; },
+      get LINK_KINDS_KEY() { return LINK_KINDS_KEY; },
+      get LINK_RAW_KEY() { return LINK_RAW_KEY; },
+      get THREADS_UNPACKED_KEY() { return THREADS_UNPACKED_KEY; },
+      get THREAD_CARD_STATES_KEY() { return THREAD_CARD_STATES_KEY; },
+      get THREADS_MAIN_KEY() { return THREADS_MAIN_KEY; },
+      get THREAD_ORDER_KEY() { return THREAD_ORDER_KEY; },
+      get THREAD_CARD_FOLD_KEY() { return THREAD_CARD_FOLD_KEY; },
+      get RESUME_KEY() { return RESUME_KEY; },
+    },
+    get microphone() { return microphoneSettings; },
+    get prompts() { return cannedPrompts; },
+    resumeWanted: () => resumeWanted(),
+    replaceIdentityChoices: (choices) => whoIsWho.replaceChoices(choices),
+    renderChannelRows: () => eachColumn(renderChannelRows),
+    renderIdentities: () => identityList.render(),
+    readMode: (value) => setReadMode(value),
+    markOwnRead: () => {
+      applyMarkOwnRead(storedMarkOwnRead());
+    },
+    hideEmptyMessages: () => {
+      applyHideEmptyMessages(storedHideEmptyMessages());
+    },
+    combineMessages: () => {
+      applyCombineMessages(storedCombineMessages());
+    },
+    richHeaders: () => {
+      applyRichHeaders(storedRichHeaders());
+    },
+    summarizeCollapsed: () => {
+      applySummarizeCollapsed(storedSummarizeCollapsed());
+    },
+    inAppLinks: () => {
+      applyInAppLinks(storedInAppLinks());
+      redrawMessageLinks();
+    },
+    openInView: () => {
+      renderOpenInView();
+    },
+    collapsedLines: () => {
+      applyCollapsedLines(storedCollapsedLines());
+      refreshElisionLines();
+    },
+    cardMaxLines: () => {
+      keepingCardPlace(() => applyCardMaxLines(storedCardMaxLines()));
+    },
+    readSpeed: () => {
+      readAloudOwner().applyReadSpeed(readAloudOwner().storedReadSpeed());
+    },
+    readAudioSource: () => {
+      readAloudOwner().setReadAudioSource(readAloudOwner().storedReadAudioSource(), false);
+    },
+    witVoice: () => {
+      readAloudOwner().setWitVoice(readAloudOwner().storedWitVoice(), false);
+    },
+    quoteReadPercent: () => {
+      applyQuoteReadPercent(storedQuoteReadPercent());
+    },
+    relay: () => {
+      renderReadNew();
+    },
+    linkKinds: () => {
+      linkKinds.reload();
+      renderLinkKinds();
+    },
+    linkRaw: () => {
+      keepingFilterPlace(() => {
+        linkKinds.reloadRaw();
         renderLinkKinds();
-        break;
-      case LINK_RAW_KEY:
-        // As a press here does: the reader's message kept where it is while every link's height
-        // changes under it.
-        keepingFilterPlace(() => {
-          linkKinds.reloadRaw();
-          renderLinkKinds();
-          if (searchOpen && linksOnly) eachColumn(renderScrollTools);
-        });
-        break;
-      case THREADS_UNPACKED_KEY:
-        // Not `setUnpackMode`: that is the reader's press, which also gives every thread of the
-        // channel back to Unpack — a remote change of the default must not throw away the
-        // per-thread choices that sync beside it.
-        cardPacking.reloadMode();
-        renderUnpackToggle();
-        sideCardsDrawn = "";
-        if (sideColumnUp()) renderSideColumn();
-        break;
-      case THREAD_CARD_STATES_KEY: {
-        cardPacking.reloadChoices();
-        sideCardsDrawn = "";
-        if (sideColumnUp()) renderSideColumn();
-        break;
-      }
-      case THREADS_MAIN_KEY: setMainRowsShown(storedMainRows()); break;
-      case THREAD_ORDER_KEY: setThreadOrder(threadOrders.stored()); break;
-      case THREAD_CARD_FOLD_KEY: setThreadCardFolded(storedThreadCardFolded()); break;
-      case IDENTITY_KEY: {
-        // `#488 slack-app-agents`. Another device said who an account is: every row it wrote is
-        // drawn that way here too, and the list in Settings says so.
-        /** @type {Record<string, unknown>} */
-        let held = {};
-        try {
-          const parsed = JSON.parse(settingsSync().local(key) || "null");
-          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) held = parsed;
-        } catch (_error) {
-          // A value this page cannot read is no choice at all.
-        }
-        whoIsWho.replaceChoices(held);
-        eachColumn(renderChannelRows);
-        identityList.render();
-        break;
-      }
-      default: break;
-    }
-  } catch (_error) {
-    // The value is kept regardless; the next load applies it through the ordinary restore.
-  }
+        if (searchOpen && linksOnly) eachColumn(renderScrollTools);
+      });
+    },
+    threadsUnpacked: () => {
+      cardPacking.reloadMode();
+      renderUnpackToggle();
+      sideCardsDrawn = "";
+      if (sideColumnUp()) renderSideColumn();
+    },
+    threadCardStates: () => {
+      cardPacking.reloadChoices();
+      sideCardsDrawn = "";
+      if (sideColumnUp()) renderSideColumn();
+    },
+    threadsMain: () => {
+      setMainRowsShown(storedMainRows());
+    },
+    threadOrder: () => {
+      setThreadOrder(threadOrders.stored());
+    },
+    threadCardFold: () => {
+      setThreadCardFolded(storedThreadCardFolded());
+    },
+  });
+  return pageSettingsSyncView;
 }
 
+function applySyncedSetting(key) { settingsSyncView().apply(key); }
+
 /** Settings' quiet word about the sync: silent while it is keeping up. */
-function renderSettingsSyncState(text) {
-  const line = el("settings-sync-state");
-  if (!line) return;
-  line.hidden = !text;
-  if (text && line.textContent !== text) line.textContent = text;
-}
+function renderSettingsSyncState(text) { settingsSyncView().status(text); }
 
 /** Re-read the document, for the moments a missed stream frame could hide in: refocus, reconnect. */
 function refreshServerSettings() {
@@ -36311,20 +34623,7 @@ function onSettingsFrame(frame) {
 /** Start keeping this device's replica and the server's document in agreement. Called from
  * `signIn` once the token is proven, never before: settings are read with the same credential
  * as everything else, and an unproven one reads nothing. */
-function startSettingsSync() {
-  if (!settingsSync().start()) return;
-  guardQuietly(() => settingsSync().syncOnce())();
-  settingsSync().keepPassing();
-  document.addEventListener("visibilitychange", () => {
-    if (!document.hidden) refreshServerSettings().catch(() => {});
-  });
-  window.addEventListener("focus", () => {
-    refreshServerSettings().catch(() => {});
-  });
-  window.addEventListener("online", () => {
-    settingsSync().syncOnce().catch(() => {});
-  });
-}
+function startSettingsSync() { settingsSyncView().start(); }
 
 // --- wiring ------------------------------------------------------------------------------------
 
@@ -36348,21 +34647,21 @@ window.addEventListener("hashchange", () => {
 });
 
 // The checkboxes are the live truth `start()` reads, so they are what gets restored on load.
-const restoredMicSettings = storedMicSettings();
+const restoredMicSettings = microphoneSettings.stored();
 for (const [id, key] of MIC_TOGGLES) {
   /** @type {HTMLInputElement} */ (el(id)).checked = restoredMicSettings[key];
-  el(id).addEventListener("change", micSettingsChanged);
+  el(id).addEventListener("change", microphoneSettings.changed);
 }
 
 // `#619 voice-bluetooth-output`. The device selects carry the live truth, as the toggles do.
-refreshAudioDeviceSelects();
-el("audio-input-device").addEventListener("change", audioDevicesChanged);
-el("audio-output-device").addEventListener("change", audioDevicesChanged);
-el("audio-route-toggle").addEventListener("change", renderAudioRouteReadout);
+audioDevices.refresh();
+el("audio-input-device").addEventListener("change", audioDevices.changed);
+el("audio-output-device").addEventListener("change", audioDevices.changed);
+el("audio-route-toggle").addEventListener("change", audioDevices.renderRoute);
 if (navigator.mediaDevices && typeof navigator.mediaDevices.addEventListener === "function") {
   navigator.mediaDevices.addEventListener("devicechange", () => {
-    refreshAudioDeviceSelects();
-    renderAudioRouteReadout();
+    audioDevices.refresh();
+    audioDevices.renderRoute();
   });
 }
 
@@ -36373,7 +34672,7 @@ el("bar-placement").addEventListener("change", () => barPlacement.changed());
 
 // `#481 slack-app-deep-link`. Where this device opens Slack links, as the bar's placement is.
 el("slack-open-in").value = storedSlackOpen();
-el("slack-open-in").addEventListener("change", slackOpenChanged);
+el("slack-open-in").addEventListener("change", settingsReadouts.slackOpenChanged);
 
 // `#44 live-push`, extended by `#126 read-new-selector`. TWO controls over one value: the button
 // on the bar, where the reader is when a message arrives, and the select in Settings, where there
@@ -36469,7 +34768,7 @@ el("collapsed-lines-larger").addEventListener("click", () => stepCollapsedLines(
 el("card-max-lines").addEventListener("input", () => cardMaxLinesChanged(el("card-max-lines").value));
 // `#529 page-build-stale-notice`. Only on the reader's press.
 el("page-update").addEventListener("click", () => window.location.reload());
-renderPageBuild();
+settingsReadouts.pageBuild();
 el("card-max-lines-smaller").addEventListener("click", () => stepCardMaxLines(-1));
 el("card-max-lines-larger").addEventListener("click", () => stepCardMaxLines(1));
 el("quote-read-percent").addEventListener("input", () => quoteReadPercentChanged(el("quote-read-percent").value));
@@ -36581,89 +34880,31 @@ el("read-speed").addEventListener("click", () => {
   scheduleBackSync();
 });
 
-el("own-read-apply").addEventListener("click", guardQuietly(applyOwnReadToExisting));
-el("own-read-undo").addEventListener("click", guardQuietly(undoOwnReadApply));
+el("own-read-apply").addEventListener("click", guardQuietly(ownReadApply.apply));
+el("own-read-undo").addEventListener("click", guardQuietly(ownReadApply.undo));
 
-el("mark-own-read").addEventListener("change", () => {
-  // `#549 own-read-stored`. Nothing on screen changes: the setting decides where messages first seen
-  // from now on start, and "Apply to existing messages" is the act that reaches the rest.
-  applyMarkOwnRead(el("mark-own-read").checked);
-});
+el("mark-own-read").addEventListener("change", messagePreferences.markOwnRead.changed);
 
 // `#386 hide-empty-messages`. Each column drawn again from what it holds, as for Your own messages: an
 // empty message comes back, or goes, with no read. The page without threads holds no store to draw
 // from: turned on, its rows are regrouped, which leaves the empty ones out; turned off, its newest page
 // is read again in place, and an empty message further back comes back when that history is re-read.
-el("hide-empty-messages").addEventListener("change", () => {
-  applyHideEmptyMessages(el("hide-empty-messages").checked);
-  if (threadingSupported) {
-    eachColumn(renderCachedTimeline);
-    // ...and the thread cards, whose unread counts it changes: the Threads list's, which that redraw
-    // leaves alone, and the right column's.
-    eachColumn(() => {
-      if (selection().view === "threads") el("thread-list").replaceChildren(...threadCards(timelineRows().threads));
-    });
-    renderSideColumn();
-  } else if (hideEmptyMessages && !readModes.hiding()) {
-    regroupChannelRows();
-  } else {
-    guardQuietly(() => (readModes.hiding() ? loadTodo : loadDiscord)({ keepPosition: true, ownAct: true, readAs: "mutation" }))();
-  }
-  setStatus(el("hide-empty-messages").checked
-    ? "messages with nothing in them are hidden."
-    : "messages with nothing in them are shown.");
-});
+el("hide-empty-messages").addEventListener("change", messagePreferences.hideEmpty.changed);
 
-el("combine-messages").addEventListener("change", () => {
-  applyCombineMessages(el("combine-messages").checked);
-  // REDRAWN FROM WHAT IS ALREADY HERE, not re-read: the rows carry their own messages, so the
-  // setting costs no round trip and cannot lose a walk back through the channel. `renderChannelRows`
-  // alone would not do — the grouping decides how many ROWS there are, which is a rebuild.
-  eachColumn(regroupChannelRows);
-  setStatus(
-    el("combine-messages").checked
-      ? "messages sent seconds apart are shown as one."
-      : "every source message is shown as its own row."
-  );
-});
+el("combine-messages").addEventListener("change", messagePreferences.combine.changed);
 
 // `#242 rich-headers`. Nothing to redraw: the root's attribute moves every heading between the header
 // and the words it came from at once, in both columns.
-el("rich-headers").addEventListener("change", () => {
-  applyRichHeaders(el("rich-headers").checked);
-  setStatus(
-    el("rich-headers").checked
-      ? "an agent's tag, title and time are shown in the message header."
-      : "every message's first line is shown as it was written."
-  );
-});
+el("rich-headers").addEventListener("change", messagePreferences.richHeaders.changed);
 
 // `#543 in-app-message-links`. Each column drawn again from what it holds, its links decided anew.
-el("in-app-links").addEventListener("change", () => {
-  applyInAppLinks(el("in-app-links").checked);
-  redrawMessageLinks();
-  setStatus(el("in-app-links").checked
-    ? "links to messages open here."
-    : "links to messages open the chat service.");
-});
+el("in-app-links").addEventListener("change", messagePreferences.inAppLinks.changed);
 
 // `#580 open-in-chat-jump`.
-el("open-in-view").addEventListener("change", () => {
-  chooseOpenInView(el("open-in-view").value);
-  setStatus(storedOpenInView() === "main"
-    ? "Open in channel lands in Main."
-    : "Open in channel lands in All, every message in order.");
-});
+el("open-in-view").addEventListener("change", messagePreferences.openInView.changed);
 
 // `#564 message-summary-toggle`. The chip over the list follows it (`setSummaryMode`).
-el("summarize-collapsed").addEventListener("change", () => {
-  applySummarizeCollapsed(el("summarize-collapsed").checked);
-  setStatus(
-    el("summarize-collapsed").checked
-      ? "collapsed messages show a summary when one arrives."
-      : "collapsed messages show their opening lines; nothing is summarised."
-  );
-});
+el("summarize-collapsed").addEventListener("change", messagePreferences.summaries.changed);
 
 // `#225 enter-to-send`. Nothing to redraw and nothing to say on the status line: the hint under the
 // switch changes in place, and the next Enter in any box follows it.
@@ -36807,17 +35048,17 @@ el("compose-text").addEventListener("input", () => {
 // `#api-token` is: text inside a <textarea> in the markup is its child text, and `.value` and the
 // markup would then be two different answers to "what does this button send".
 for (const entry of CANNED_PROMPTS) {
-  /** @type {HTMLTextAreaElement} */ (el(entry.field)).value = storedPrompts()[entry.key];
+  /** @type {HTMLTextAreaElement} */ (el(entry.field)).value = cannedPrompts.stored()[entry.key];
   // `input` as well as `change`: `change` waits for the field to lose focus, and a phone that kills
   // the app while the field still has it never gets one. `#193 compose-draft-loss`.
-  el(entry.field).addEventListener("input", promptsChanged);
-  el(entry.field).addEventListener("change", promptsChanged);
+  el(entry.field).addEventListener("input", cannedPrompts.changed);
+  el(entry.field).addEventListener("change", cannedPrompts.changed);
   el(entry.button).addEventListener("click", () => {
     // Shut FIRST, and whether or not the send goes. Choosing from a menu closes it — and when the
     // send is refused the reason appears on the status line at the far end of the screen, which an
     // open tray would be standing in front of.
     setPromptsOpen(false);
-    if (voiceCall().sendUserMessage(promptFor(entry))) {
+    if (voiceCall().sendUserMessage(cannedPrompts.promptFor(entry))) {
       // AFTER the send, and only if it went: `sendUserMessage` says "Sent.", which is true of any
       // message. This says WHICH question was asked, because the button carries five letters.
       setStatus(entry.said);
@@ -37589,12 +35830,12 @@ el("discord-channel").addEventListener("change", channelPicked);
 // when they were opened, and carrying a half-typed name across to a different one is worse than
 // losing it.
 // `#355 provider-grouped-channels`. Another service: its channels, its facts, its Add, Browse and hidden list.
-el("settings-service").addEventListener("change", () => chooseSettingsService(el("settings-service").value));
+el("settings-service").addEventListener("change", () => channelSettings.chooseSettingsService(el("settings-service").value));
 el("settings-channel").addEventListener("change", () => {
-  showChannelPanel(null);
+  channelSettings.showChannelPanel(null);
   // Everything in this box is about the channel the picker is on, or about all of them
   // (`#349 channel-settings-all`).
-  renderChannelBox();
+  channelSettings.renderChannelBox();
 });
 // `#232 upstream-mark-read`. Choosing a mode only shows what Save would do; Save is the decision.
 el("upstream-clear-mode").addEventListener("change", () => upstreamClearBox.renderChoice());
@@ -37604,16 +35845,16 @@ el("channel-history-save").addEventListener("click", () => channelHistoryBox.sav
 el("channel-history-prioritize").addEventListener("click", () => channelHistoryBox.prioritize());
 el("upstream-clear-push").addEventListener("click", () => upstreamClearBox.push());
 el("rename-channel").addEventListener("click", () => {
-  showChannelPanel("rename-fields");
+  channelSettings.showChannelPanel("rename-fields");
   el("channel-alias").focus();
 });
 el("cancel-rename").addEventListener("click", () => {
   // Back to what the server says, not to what was typed. Cancel means the typing did not happen.
-  renderAliasEditor();
-  showChannelPanel(null);
+  channelSettings.renderAliasEditor();
+  channelSettings.showChannelPanel(null);
 });
 el("open-add-channel").addEventListener("click", () => {
-  showChannelPanel("add-channel-fields");
+  channelSettings.showChannelPanel("add-channel-fields");
   el("new-channel-id").focus();
 });
 el("cancel-add-channel").addEventListener("click", () => {
@@ -37621,11 +35862,11 @@ el("cancel-add-channel").addEventListener("click", () => {
   el("new-channel-label").value = "";
   el("new-channel-writable").checked = false;
   el("add-channel-state").textContent = "";
-  showChannelPanel(null);
+  channelSettings.showChannelPanel(null);
 });
-el("add-channel").addEventListener("click", guardQuietly(addChannel));
+el("add-channel").addEventListener("click", guardQuietly(channelSettings.addChannel));
 el("open-browse-channels").addEventListener("click", guardQuietly(() => channelDirectoryBox.open()));
-el("close-browse-channels").addEventListener("click", () => showChannelPanel(null));
+el("close-browse-channels").addEventListener("click", () => channelSettings.showChannelPanel(null));
 el("channel-directory-search").addEventListener("input", () => channelDirectoryBox.scheduleSearch());
 el("channel-directory-search").addEventListener("keydown", (event) => {
   if (event && event.key === "Enter") {
@@ -37642,33 +35883,33 @@ el("channel-directory-retry").addEventListener(
   // Retry what failed: the next page when rows are already showing, otherwise the first.
   guardQuietly(() => channelDirectoryBox.retry())
 );
-el("remove-channel").addEventListener("click", guardQuietly(removeChannel));
-el("save-alias").addEventListener("click", guardQuietly(saveAlias));
-el("add-noise-rule").addEventListener("click", guardQuietly(addNoiseRule));
-el("voice-ask-before-send").addEventListener("change", guardQuietly(saveVoiceSendSetting));
-el("voice-instructions").addEventListener("input", renderVoicePrompt);
-el("voice-system-prompt").addEventListener("input", renderVoicePrompt);
+el("remove-channel").addEventListener("click", guardQuietly(channelSettings.removeChannel));
+el("save-alias").addEventListener("click", guardQuietly(channelSettings.saveAlias));
+el("add-noise-rule").addEventListener("click", guardQuietly(noiseSettings.add));
+el("voice-ask-before-send").addEventListener("change", guardQuietly(agentSettings.saveSendSetting));
+el("voice-instructions").addEventListener("input", agentSettings.renderPrompt);
+el("voice-system-prompt").addEventListener("input", agentSettings.renderPrompt);
 el("save-voice-instructions").addEventListener(
   "click",
-  guardQuietly(() => saveVoicePrompt("instructions", el("voice-instructions").value))
+  guardQuietly(() => agentSettings.savePrompt("instructions", el("voice-instructions").value))
 );
 el("save-voice-system-prompt").addEventListener(
   "click",
-  guardQuietly(() => saveVoicePrompt("system_prompt", el("voice-system-prompt").value))
+  guardQuietly(() => agentSettings.savePrompt("system_prompt", el("voice-system-prompt").value))
 );
-el("restore-voice-system-prompt").addEventListener("click", guardQuietly(restoreVoiceSystemPrompt));
-el("voice-post-prefix").addEventListener("input", renderVoicePostPrefix);
-el("save-voice-post-prefix").addEventListener("click", guardQuietly(() => saveVoicePostPrefix(false)));
-el("reset-voice-post-prefix").addEventListener("click", guardQuietly(() => saveVoicePostPrefix(true)));
+el("restore-voice-system-prompt").addEventListener("click", guardQuietly(agentSettings.restoreSystemPrompt));
+el("voice-post-prefix").addEventListener("input", agentPrefix.render);
+el("save-voice-post-prefix").addEventListener("click", guardQuietly(() => agentPrefix.save(false)));
+el("reset-voice-post-prefix").addEventListener("click", guardQuietly(() => agentPrefix.save(true)));
 // `#208 persistent-cache`. Off and Erase only ask; the question's own button is what sends.
 el("message-cache-enabled").addEventListener("change", guardQuietly(() => serverCacheBox.switched()));
 el("message-cache-erase").addEventListener("click", () => serverCacheBox.ask("erase"));
 el("message-cache-confirm-yes").addEventListener("click", guardQuietly(() => serverCacheBox.answer(true)));
 el("message-cache-confirm-no").addEventListener("click", guardQuietly(() => serverCacheBox.answer(false)));
 el("noise-rule-new").addEventListener("keydown", (event) => {
-  if (event.key === "Enter") guardQuietly(addNoiseRule)();
+  if (event.key === "Enter") guardQuietly(noiseSettings.add)();
 });
-el("clear-alias").addEventListener("click", guardQuietly(clearChannelAlias));
+el("clear-alias").addEventListener("click", guardQuietly(channelSettings.clearChannelAlias));
 el("load-older").addEventListener("click", guardQuietly(olderControlPressed));
 // `#262 search-load-older`. One column on Main, a search nothing loaded matches: All has the replies.
 leftEl("search-in-all").addEventListener("click", guardQuietly(searchInAll));

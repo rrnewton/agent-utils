@@ -71,3 +71,7 @@ export { MSG_SCALE_STEP, gripKeysFor, msgScaleStepTarget, msgScaleWords, reading
 export { STRAY_SERVICE_FACTS, addChannelForm, allChannelsFacts, emptyServiceWords, serviceFacts, writeSourceWords } from "./channels.ts";
 export type { ServiceDescription, WriteSource } from "./channels.ts";
 export { DEFAULT_PLACEMENT, PLACEMENTS, placementOf, placementWords } from "./placement.ts";
+export { VOICE_SEND_HOSTED, VOICE_SEND_STATE, agentPromptFollowsSwitch, cleanPostPrefix, promptChars, voiceInstructionsLine, voicePostPrefixLine, voicePromptDeliveryLine, voicePromptLastCallLine, voicePromptLock, voiceSendSavedClause, voiceSystemPromptLine } from "./agent.ts";
+export type { AgentPromptFollowing, AgentPromptLastCall } from "./agent.ts";
+export { MESSAGE_PREFERENCE_WORDS, cardMaxLinesSavedWords, collapsedLinesSavedWords, connectionDetailWords, liveStateWords, quoteReadPercentSavedWords, resumeStateWords, resumeUnavailableWords } from "./preferences.ts";
+export type { LiveReadout, ResumeOutcome, ResumeReadout } from "./preferences.ts";

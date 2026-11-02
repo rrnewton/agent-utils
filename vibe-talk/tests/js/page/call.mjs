@@ -1375,7 +1375,7 @@ test("`#619 voice-bluetooth-output`: with a Bluetooth microphone listed, the cal
 test("`#619 voice-bluetooth-output`: a device change re-lists the devices, so a headset connected later can be chosen", async () => {
   const page = newPage();
   page.audioDevices = [{ kind: "audioinput", deviceId: "builtin", label: "Built-in microphone" }];
-  await page.pure("refreshAudioDeviceSelects")();
+  await page.pure("audioDevices.refresh")();
   assert.equal(page.el("audio-input-device").children.length, 2);
   page.audioDevices = [
     { kind: "audioinput", deviceId: "builtin", label: "Built-in microphone" },
@@ -1408,7 +1408,7 @@ test("`#619 voice-bluetooth-output`: a stored microphone choice wins, and surviv
     { kind: "audioinput", deviceId: "builtin", label: "Built-in microphone" },
     { kind: "audioinput", deviceId: "usb", label: "USB headset microphone" },
   ];
-  await first.pure("refreshAudioDeviceSelects")();
+  await first.pure("audioDevices.refresh")();
   first.el("audio-input-device").value = "usb";
   await first.el("audio-input-device").dispatch("change");
   const second = newPage(first.storage);
@@ -1424,7 +1424,7 @@ test("`#619 voice-bluetooth-output`: a chosen device that is gone falls back, an
   await startTalking(page);
   assert.equal(page.micRequests.length, 1, "a missing choice reopened the microphone anyway");
   page.el("audio-route-toggle").checked = true;
-  await page.pure("renderAudioRouteReadout")();
+  await page.pure("audioDevices.renderRoute")();
   assert.match(page.el("audio-route-readout").textContent, /not connected now/);
   assert.match(page.el("audio-route-readout").textContent, /Built-in microphone/);
 });
@@ -1451,7 +1451,7 @@ test("`#619 voice-bluetooth-output`: output choice applies by setSinkId where su
   const store = new Map([["vibe-talk.voice.audio-devices", JSON.stringify({ inputId: "", outputId: "desk" })]]);
   const chosen = newPage(store);
   chosen.audioDevices = [{ kind: "audiooutput", deviceId: "desk", label: "USB speaker" }];
-  await chosen.pure("refreshAudioDeviceSelects")();
+  await chosen.pure("audioDevices.refresh")();
   await chosen.pure("applyCallOutput")(context);
   assert.deepStrictEqual(sinks, ["desk"]);
   page.enableStreamedAudio();
@@ -3602,7 +3602,7 @@ test("THE CANNED BUTTONS ARE A LIST, SO A THIRD ONE IS AN ENTRY AND NOT A CODE P
   // The issue says more of these are expected, and this is what makes that true rather than
   // merely intended: every button is declared in one list, every one has a settings field, and
   // both really exist in the markup. A button added as a special case fails here.
-  assert.ok(CANNED.length >= 2, `only ${CANNED.length} canned prompts found — the scan is broken`);
+  assert.ok(CANNED.length >= 2, `only ${CANNED.length} canned prompts declared`);
   for (const entry of CANNED) {
     assert.ok(PAGE_IDS.has(entry.button), `#${entry.button} is in the list but not in the page`);
     assert.ok(PAGE_IDS.has(entry.field), `#${entry.button} has no field to edit its prompt in`);
@@ -3623,7 +3623,7 @@ test("THE CANNED BUTTONS ARE A LIST, SO A THIRD ONE IS AN ENTRY AND NOT A CODE P
     assert.equal(
       PAGE_CODE.split(`"${entry.button}"`).length - 1,
       1,
-      `#${entry.button} is named more than once in web/voice.js, so it has a code path of its own`
+      `#${entry.button} is named more than once in the page code, so it has a code path of its own`
     );
   }
 });
@@ -6049,7 +6049,7 @@ test("`#331 resume-on-websocket`: where the server cannot resume, the switch is 
   assert.equal(live.el("resume-unavailable").hidden, true);
 
   // The negative control: a page that never disables it.
-  const careless = newPage(new Map(), brokenScript("toggle.disabled = !resumeAllowed;", "toggle.disabled = false;"));
+  const careless = newPage(new Map(), await brokenModule([{ file: "src/view/settings/preferences.ts", find: "toggle.disabled = !deps.read.allowed;", replace: "toggle.disabled = false;" }]));
   careless.replayEnabled = false;
   await signIn(careless);
   await careless.settle();

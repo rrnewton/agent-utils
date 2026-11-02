@@ -826,3 +826,7 @@ magnitude, but measured from 2026-10-28.
   * There is no ambient cross-package state, and owners have mount and teardown paths.
   * The asset, cache and validation requirements stay.
   * One addition: the `present/*` packages are held to core's portability checks, as `core/*` is.
+
+### Settings and Help owner batch (2026-11-02)
+
+* [codex gpt-6-astra] #624 voice-page-modularity: `view/settings` now owns the service/channel box, hidden channels, aliases, voice approval/prefix/prompt editors, canned prompts, microphone/audio preference editors, automatic-read rules, apply-to-existing/Undo receipt, message preference presentation, resume/live readouts and Settings sync application. Portable wording joins `present/settings`, with the architecture rule allowing its shared wording dependency on `present/rows`; the existing Help folds and `IdentityReader` boundary are reused. Feature owners still apply message/link/thread choices, and shell/keyboard composition and boot order stay in the legacy composition for step 17. Source readers and negative controls follow their modules; independent-instance, stale-read, timer-disposal and partial-Undo tests exercise the new owners. This is a behaviour-preserving move.

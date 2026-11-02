@@ -64,7 +64,7 @@ export {
   unsentText,
   waitingItsTurn as outboxWaitingItsTurn,
 } from "../core/outbox/index.ts";
-export { DEFAULT_CARD_MAX_LINES, DEFAULT_COLLAPSED_LINES, DEFAULT_QUOTE_READ_PERCENT, DEVICE_SETTINGS, IDENTITY_KEY, MAX_CARD_MAX_LINES, MAX_COLLAPSED_LINES, MAX_QUOTE_READ_PERCENT, MIN_CARD_MAX_LINES, MIN_COLLAPSED_LINES, MIN_QUOTE_READ_PERCENT, clampCardMaxLines, clampCollapsedLines, clampQuoteReadPercent, createCredentials, createDeviceSettings, createSettingsSync } from "../core/settings/index.ts";
+export { DEFAULT_CARD_MAX_LINES, DEFAULT_COLLAPSED_LINES, DEFAULT_QUOTE_READ_PERCENT, DEVICE_SETTINGS, IDENTITY_KEY, MAX_COLLAPSED_LINES, MIN_COLLAPSED_LINES, clampCardMaxLines, clampCollapsedLines, clampQuoteReadPercent, createCredentials, createDeviceSettings, createSettingsSync } from "../core/settings/index.ts";
 export { createWebPorts } from "../platform/web/index.ts";
 export {
   answersEnter,
@@ -103,7 +103,7 @@ export { HTTP_ADDRESS, createSerialQueue, deepLinkRefFrom, linkKind, linksIn, me
 export { briefAge, dayClock, dayKeyOf, editedTitle, fullLocalAt, fullLocalTime, messageDate, messageTimeLabel, shortLocalTime, stamp } from "../present/time/index.ts";
 
 export { doneReadWords, failureWords, fmtDuration, messagesWords, reachBackWords, reachClause, readableCause, refusalSentence, refusalWords, searchMomentWords, searchWalkProgress, searchWalkWords, serviceReadWords } from "../present/notices/index.ts";
-export { AUTHOR_FILTERS, BLANK_TEXT, CARD_STATES, LINK_KINDS, LINK_KINDS_KEY, READ_MODES, READ_MODE_KEY, READ_MODE_LABELS, READ_MODE_SAID, READ_MODE_TITLES, READ_MODE_VERBS, SUMMARY_FAILED_MARK, SUMMARY_MARK, SUMMARY_MODE_OFF, SUMMARY_MODE_ON, SUMMARY_WAITING, THREADS_UNPACKED_KEY, THREAD_CARD_STATES_KEY, THREAD_ORDERS, THREAD_ORDER_KEY, THREAD_ORDER_NAMES, UNPACK_MODE_NAMES, UNPACK_MODE_SAID, authorEmptyWords, bookmarkSpot, cardGapWords, cardMaxLinesWords, cardProxyLines, cardRunText, collapsedLinesWords, combinedContent, countOf, createCardPacking, createLinkKinds, createReadMode, createReadRuns, createThreadOrder, editedDrawn, firstLineOf, foldedCardText, forgetElisionCounts, gapWords, hiddenKindWords, inThreadOrder, isNoise, joinsGroup, linkKindCountText, mainRunsAmong, messageLook, newestThreadHues, nextAuthorFilter, nextReadMode, proxyLinesOf, quoteBlock, quoteMarksRead, quoteShare, rawTextOf, reactionText, reactionsDrawn, readRunText, renderedHtmlOf, replyMarkerName, rowEdited, rowReactions, savedReadMode, seamPlan, spreadThreadHue, summaryFailureWords, summaryNoteWords, threadChoice, threadFacts, threadOrderAfter, undoLabel, undoName } from "../present/rows/index.ts";
+export { AUTHOR_FILTERS, BLANK_TEXT, CARD_STATES, LINK_KINDS, LINK_KINDS_KEY, READ_MODES, READ_MODE_KEY, READ_MODE_LABELS, READ_MODE_SAID, READ_MODE_TITLES, READ_MODE_VERBS, SUMMARY_FAILED_MARK, SUMMARY_MARK, SUMMARY_MODE_OFF, SUMMARY_MODE_ON, SUMMARY_WAITING, THREADS_UNPACKED_KEY, THREAD_CARD_STATES_KEY, THREAD_ORDERS, THREAD_ORDER_KEY, THREAD_ORDER_NAMES, UNPACK_MODE_NAMES, UNPACK_MODE_SAID, authorEmptyWords, bookmarkSpot, cardGapWords, cardProxyLines, cardRunText, collapsedLinesWords, combinedContent, countOf, createCardPacking, createLinkKinds, createReadMode, createReadRuns, createThreadOrder, editedDrawn, firstLineOf, foldedCardText, forgetElisionCounts, gapWords, hiddenKindWords, inThreadOrder, isNoise, joinsGroup, linkKindCountText, mainRunsAmong, messageLook, newestThreadHues, nextAuthorFilter, nextReadMode, proxyLinesOf, quoteBlock, quoteMarksRead, quoteShare, rawTextOf, reactionText, reactionsDrawn, readRunText, renderedHtmlOf, replyMarkerName, rowEdited, rowReactions, savedReadMode, seamPlan, spreadThreadHue, summaryFailureWords, summaryNoteWords, threadChoice, threadFacts, threadOrderAfter, undoLabel, undoName } from "../present/rows/index.ts";
 export { DAY_TITLED, EDITED_MARK, PULL_WAIT_MS, QUOTE_REPLY_TITLE, RESTATED_CLASS, SWIPE_COMMIT_PX, anchorOfRow, anchorsAmong, authorLabel, authorPasses, cardGapGroups, cardGapTally, cardMarkTarget, cardRunIds, cardStubText, cardUnits, createAuthorFilter, createBookmarkLines, createCardPlaces, createColumnLinks, createPullToRefresh, createQuoting, createRowGestures, createSeamLines, doneButtonOf, fillCardText, findableParts, foldedTextLine, freshenDayTitle, fromGatheredThread, gutterPiece, idsOf, isMessageRow, keepCardUnits, markCardLayout, messageTop, neighbourStayed, notNoiseButtonOf, pointerOn, quoteLabelFits, renderedText, rowIn, rowMessages, rowNeighbours, rowNewestMs, rowSentMs, rowShown, rowTime, rowTimeTabStop, sameCardPlace, setArrowReach, setMarkerLift, shownRowFor, stackUnder, standingRow, textHits, textRunsOf, threadCardId, timeNode } from "../view/channel/index.ts";
 
 import { decode, decodeTagged, is, roots } from "../contract/index.ts";
@@ -117,26 +117,5 @@ export const VibeTalkContract = Object.freeze({ roots, is, decode, decodeTagged 
 
 export { createVoiceCall, createVoiceTranscript, createReadAloud } from "../view/voice/index.ts";
 
-export {
-  HELP_TOPICS,
-  STRAY_SERVICE_FACTS,
-  addChannelForm,
-  allChannelsFacts,
-  emptyServiceWords,
-  serviceFacts,
-  writeSourceWords,
-} from "../present/settings/index.ts";
-export {
-  mountBarPlacement,
-  mountChannelDirectory,
-  mountChannelHistory,
-  mountDismissedSends,
-  mountHelpFolds,
-  mountIdentityList,
-  mountPairing,
-  mountReadingWidth,
-  mountServerCache,
-  mountSettingsFolds,
-  mountTextSize,
-  mountUpstreamClear,
-} from "../view/settings/index.ts";
+export { HELP_TOPICS } from "../present/settings/index.ts";
+export { CANNED_PROMPTS, MIC_TOGGLES, mountAgentPrefix, mountAgentSettings, mountAudioDevices, mountBarPlacement, mountCannedPrompts, mountChannelDirectory, mountChannelHistory, mountChannelSettings, mountConnectionReadouts, mountDismissedSends, mountHelpFolds, mountIdentityList, mountMessagePreferences, mountMicrophoneSettings, mountNoiseRules, mountOwnReadApply, mountPairing, mountReadingWidth, mountResumePreference, mountServerCache, mountSettingsFolds, mountSettingsReadouts, mountSettingsSyncView, mountTextSize, mountUpstreamClear } from "../view/settings/index.ts";

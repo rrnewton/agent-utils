@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { WEB } from "../../../web/page_sources.mjs";
 
 import { BASE_CSS, BOTTOM_SLACK_PX, CHANNEL, CODER, COLLAPSE_OVER_CHARS, CSS_CODE, DESKTOP_QUERY,
-  DISCORD_POLL_MS, HTML_CODE, MODULE_CODE, NOISE_MATCHING, OWN, PAGE_ELEMENTS, PULL_ARM_PX,
+  DISCORD_POLL_MS, HTML_CODE, MODULE_CODE, NOISE_MATCHING, OWN, OWN_READ_APPLY_ARM_MS, PAGE_ELEMENTS, PULL_ARM_PX,
   RUN_THREAD, SCRIPT, SCRIPT_CODE, SPEECH_PIECES, assertMarkupContains, atBottomOf, bookmarkAt,
   brokenModule, brokenScript, channelRow, cssBlock, cssBlockIn, cssBlockOutside, cssRules,
   delayedReply, deliver, doneButton, errorResponse, focusOn, foldButton, helpEntry, hold,
@@ -2632,7 +2632,7 @@ test("`#549 own-read-stored`: Apply to existing messages asks twice, marks his u
   // A first press left alone is forgotten: the next press asks again.
   await page.el("own-read-apply").click();
   assert.equal(page.el("own-read-apply").textContent, "Mark them read");
-  page.expireTimers(sourceConstant("OWN_READ_APPLY_ARM_MS"));
+  page.expireTimers(OWN_READ_APPLY_ARM_MS);
   await page.settle();
   assert.equal(page.el("own-read-apply").textContent, "Apply to existing messages");
 });

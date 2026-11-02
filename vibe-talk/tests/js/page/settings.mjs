@@ -1745,8 +1745,9 @@ test("`#332 settings-voice-agent-section`: every state line under the three is o
 });
 
 test("`#332 settings-voice-agent-section`: the budget refuses a state line written as the old paragraph (negative control)", async () => {
-  const long = brokenScript('"Resuming is OFF on this server: every call starts fresh."',
-    '"Resuming is OFF on this server. Every new call starts the agent from nothing, whatever this switch says."');
+  const long = await brokenModule([{ file: "src/present/settings/preferences.ts",
+    find: '"Resuming is OFF on this server: every call starts fresh."',
+    replace: '"Resuming is OFF on this server. Every new call starts the agent from nothing, whatever this switch says."' }]);
   const line = await stateLine(STATE_LINES[0], long);
   assert.ok(line.length > STATE_LINE_BUDGET,
     `the negative control's paragraph is ${line.length} characters, inside the budget, so the check above proves nothing`);
@@ -2036,7 +2037,8 @@ test("`#351 settings-polish`: All channels is offered only where a channel can t
   assert.equal(writer.el("rename-channel").hidden, false, "the box stayed on All channels' acts");
   assert.match(writer.el("channel-facts").textContent, /"lead team"/);
   // The negative control: a picker that offers it wherever there are two channels.
-  const blind = newPage(new Map(), brokenScript(" && upstreamClearAllChannels().length > 0;", ";"));
+  const blind = newPage(new Map(), await brokenModule([{ file: "src/view/settings/channels.ts",
+    find: " && upstreamClearAllChannels().length > 0;", replace: ";" }]));
   blind.channels = [{ ...CHANNEL }, { ...OTHER_CHANNEL }];
   await signIn(blind);
   await blind.el("open-settings").click();

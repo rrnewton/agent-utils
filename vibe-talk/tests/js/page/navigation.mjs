@@ -625,7 +625,8 @@ test("`#401 hidden-channels-fold`: folded on every load, its heading counting wh
   }
   assert.equal(none.el("fold-settings-all").textContent, "Fold all", "the empty fold is counted by Expand all");
   // The negative control: a heading that does not count.
-  const mute = newPage(new Map(), brokenScript('  el("fold-hidden-channels").textContent = `Hidden channels (${rows.length})`;\n', ""));
+  const mute = newPage(new Map(), await brokenModule([{ file: "src/view/settings/channels.ts",
+    find: '    el("fold-hidden-channels").textContent = `Hidden channels (${rows.length})`;\n', replace: "" }]));
   mute.hiddenChannels = HIDDEN_THREE.map((channel) => ({ ...channel }));
   await signIn(mute);
   await mute.el("open-settings").click();
@@ -667,11 +668,13 @@ test("`#401 hidden-channels-fold`: a picker change leaves the fold as the reader
   await open.page.el("open-settings").click();
   assert.equal(settingsFoldState(open.page, "hidden-channels"), true, "the fold closed itself behind the reader's back");
   // The negative controls: a box redraw that decides the fold, either way.
-  const opens = await hiddenFoldAcrossPicker(false, brokenScript("function renderChannelBox() {\n",
-    'function renderChannelBox() {\n  settingsFolds.set("hidden-channels", true);\n'));
+  const opens = await hiddenFoldAcrossPicker(false, await brokenModule([{ file: "src/view/settings/channels.ts",
+    find: "  function renderChannelBox() {\n",
+    replace: '  function renderChannelBox() {\n    deps.folds().set("hidden-channels", true);\n' }]));
   assert.deepStrictEqual(opens.states, [true, true], "the negative control left the fold closed, so the check above proves nothing");
-  const folds = await hiddenFoldAcrossPicker(true, brokenScript("function renderChannelBox() {\n",
-    'function renderChannelBox() {\n  settingsFolds.set("hidden-channels", false);\n'));
+  const folds = await hiddenFoldAcrossPicker(true, await brokenModule([{ file: "src/view/settings/channels.ts",
+    find: "  function renderChannelBox() {\n",
+    replace: '  function renderChannelBox() {\n    deps.folds().set("hidden-channels", false);\n' }]));
   assert.deepStrictEqual(folds.states, [false, false], "the negative control left the fold open, so the check above proves nothing");
 });
 
@@ -723,7 +726,8 @@ test("`#401 hidden-channels-fold`: Show again works from inside the fold, recoun
   assert.deepEqual(page.showChannelCalls, [HIDDEN_THREE[0].id, HIDDEN_THREE[1].id]);
   assert.equal(page.el("hidden-channels").hidden, true, "an empty fold is still offered");
   // The negative control: a Show again that is not wired does nothing, and is caught.
-  const dead = await showFromFold(brokenScript("    show.addEventListener(\"click\", guardQuietly(() => showChannelAgain(channel)));\n", ""));
+  const dead = await showFromFold(await brokenModule([{ file: "src/view/settings/channels.ts",
+    find: '      show.addEventListener("click", deps.guard(() => showChannelAgain(channel)));\n', replace: "" }]));
   assert.deepEqual(dead.showChannelCalls, [], "the negative control reached the server anyway, so the check above proves nothing");
 });
 
