@@ -596,3 +596,203 @@ fn native_codex_group_leader_remains_pinned_with_foreground_helpers() {
             .unwrap());
     }
 }
+
+/// A Herdr stand-in for `agent start` refused while a new pane's login shell starts.
+///
+/// `agent start` answers `agent_pane_busy` for the first `busy_starts` calls. `pane
+/// process-info` walks `processes` one report per call and then repeats the last one; a `null`
+/// entry fails that report, and every report takes `report_delay` seconds. Every call is logged.
+fn configure_busy_start(herdr: &FakeExecutable, busy_starts: u32, processes: Value, delay: f64) {
+    let frame = serde_json::json!({
+        "busy_starts": busy_starts,
+        "processes": processes,
+        "report_delay": delay,
+        "terminal": "terminal-1",
+        "replace_terminal_after_report": null,
+        "starts": 0,
+        "reports": 0,
+        "calls": [],
+        "panes": {
+            "pane": {"tab_id": "tab-new", "label": "worker"},
+            "old": {"tab_id": "tab-old", "label": "worker"}
+        }
+    });
+    fs::write(herdr.root.join("frame.json"), frame.to_string()).unwrap();
+    fs::write(
+        herdr.root.join("herdr"),
+        r#"#!/usr/bin/python3
+import json, pathlib, sys, time
+path = pathlib.Path(__file__).with_name('frame.json')
+state = json.loads(path.read_text())
+args = sys.argv[1:]
+state['calls'].append(args)
+def finish(status=0):
+    path.write_text(json.dumps(state))
+    raise SystemExit(status)
+if args[:2] == ['agent', 'start']:
+    state['starts'] += 1
+    if state['starts'] <= state['busy_starts']:
+        pane = args[args.index('--pane') + 1]
+        print(json.dumps({'id': 'cli:agent:start', 'error': {'code': 'agent_pane_busy',
+              'message': 'agent target pane %s is not an available shell' % pane}}),
+              file=sys.stderr)
+        finish(1)
+    print(json.dumps({'id': 'cli:agent:start', 'result': {'agent': {'name': args[2]}}}))
+elif args[:2] == ['pane', 'get']:
+    pane = state['panes'][args[2]]
+    print(json.dumps({'result': {'pane': {
+        'pane_id': args[2], 'workspace_id': 'workspace', 'cwd': '/work/project',
+        'tab_id': pane['tab_id'], 'terminal_id': state['terminal'], 'agent': None,
+        'agent_status': 'unknown', 'agent_session': None}}}))
+elif args[:2] == ['pane', 'process-info']:
+    time.sleep(state['report_delay'])
+    index = min(state['reports'], len(state['processes']) - 1)
+    state['reports'] += 1
+    if state['replace_terminal_after_report'] == state['reports']:
+        state['terminal'] = 'terminal-2'
+    report = state['processes'][index]
+    if report is None:
+        print('process-info is not ready', file=sys.stderr)
+        finish(1)
+    print(json.dumps({'result': {'process_info': dict(report, pane_id=args[3])}}))
+else:
+    print('unexpected test command %r' % args, file=sys.stderr)
+    finish(2)
+finish()
+"#,
+    )
+    .unwrap();
+}
+
+fn busy_frame(herdr: &FakeExecutable) -> Value {
+    serde_json::from_slice(&fs::read(herdr.root.join("frame.json")).unwrap()).unwrap()
+}
+
+/// The pane's own shell with `others` (pid, argv0) in its foreground process group `group`.
+fn shell_report(group: u32, others: &[(u32, &str)]) -> Value {
+    let mut processes = vec![serde_json::json!({"pid": 4242, "name": "bash", "argv": ["-bash"]})];
+    processes.extend(
+        others
+            .iter()
+            .map(|(pid, argv0)| serde_json::json!({"pid": pid, "name": argv0, "argv": [argv0]})),
+    );
+    serde_json::json!({
+        "shell_pid": 4242,
+        "foreground_process_group_id": group,
+        "foreground_processes": processes
+    })
+}
+
+/// Every call that names a pane names `pane`, the one the launch was offered.
+fn assert_only_pane_targeted(frame: &Value) {
+    for call in frame["calls"].as_array().unwrap() {
+        let call: Vec<&str> = call
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|word| word.as_str().unwrap())
+            .collect();
+        let target = match call[..2] {
+            ["pane", "get"] => call[2],
+            ["pane", "process-info"] | ["agent", "start"] => {
+                call[call.iter().position(|word| *word == "--pane").unwrap() + 1]
+            }
+            _ => panic!("unexpected call {call:?}"),
+        };
+        assert_eq!(target, "pane", "{call:?} must target only the created pane");
+    }
+}
+
+#[test]
+fn start_waits_out_a_noisy_login_shell_and_launches_in_the_same_pane() {
+    // The login shell prints errors from its startup files and runs their command
+    // substitutions in its own process group, so Herdr refuses until it is alone there.
+    let herdr = FakeExecutable::new("{}");
+    let startup = serde_json::json!([
+        shell_report(4242, &[(4300, "grep")]),
+        shell_report(4242, &[(4301, "uuidgen")]),
+        shell_report(4400, &[(4400, "tput")]),
+        shell_report(4242, &[]),
+    ]);
+    configure_busy_start(&herdr, 1, startup, 0.0);
+    let result =
+        herdr
+            .client()
+            .start_agent("worker", "claude", "pane", &[], Duration::from_secs(10));
+    assert!(result.is_ok(), "{result:?}");
+    let frame = busy_frame(&herdr);
+    assert_eq!(
+        frame["starts"], 2,
+        "one refused launch, then one in the same pane"
+    );
+    assert!(frame["reports"].as_u64().unwrap() >= 5, "{frame}");
+    assert_only_pane_targeted(&frame);
+}
+
+#[test]
+fn start_survives_a_slow_and_failing_foreground_process_report() {
+    let herdr = FakeExecutable::new("{}");
+    let reports = serde_json::json!([Value::Null, shell_report(4242, &[])]);
+    configure_busy_start(&herdr, 2, reports, 0.3);
+    let result =
+        herdr
+            .client()
+            .start_agent("worker", "claude", "pane", &[], Duration::from_secs(20));
+    assert!(result.is_ok(), "{result:?}");
+    let frame = busy_frame(&herdr);
+    assert_eq!(frame["starts"], 3);
+    assert_only_pane_targeted(&frame);
+}
+
+#[test]
+fn start_never_moves_to_a_same_label_pane_and_reports_what_kept_its_own_busy() {
+    // Another tab carries the same label; the launch still waits only on its own pane and
+    // gives up at the deadline with what it saw there.
+    let herdr = FakeExecutable::new("{}");
+    let busy = serde_json::json!([shell_report(5000, &[(5000, "vim")])]);
+    configure_busy_start(&herdr, u32::MAX, busy, 0.0);
+    let error = herdr
+        .client()
+        .start_agent("worker", "claude", "pane", &[], Duration::from_secs(1))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("agent_pane_busy"), "{error}");
+    assert!(
+        error.contains("pane pane did not become an available shell within 1s"),
+        "{error}"
+    );
+    assert!(
+        error.contains("group 5000 holds [4242 -bash, 5000 vim]"),
+        "{error}"
+    );
+    let frame = busy_frame(&herdr);
+    assert_eq!(
+        frame["starts"], 1,
+        "a pane that never frees is never offered again"
+    );
+    assert_only_pane_targeted(&frame);
+}
+
+#[test]
+fn start_stops_when_its_pane_holds_another_terminal() {
+    let herdr = FakeExecutable::new("{}");
+    configure_busy_start(
+        &herdr,
+        u32::MAX,
+        serde_json::json!([shell_report(4242, &[])]),
+        0.0,
+    );
+    let mut frame = busy_frame(&herdr);
+    frame["replace_terminal_after_report"] = Value::from(1);
+    fs::write(herdr.root.join("frame.json"), frame.to_string()).unwrap();
+    // The shell looks available once, then the pane holds a different terminal.
+    let error = herdr
+        .client()
+        .start_agent("worker", "claude", "pane", &[], Duration::from_secs(10))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("not the Some(\"terminal-1\")"), "{error}");
+    let frame = busy_frame(&herdr);
+    assert_eq!(frame["starts"], 1, "{frame}");
+    assert_only_pane_targeted(&frame);
+}

@@ -1128,7 +1128,7 @@ struct Start {
     /// Record no created_by or managed_by edge naming the calling agent (default: record them when the caller is a registered agent of this registry; a profile's "record_edges": false does the same)
     #[arg(long)]
     no_edges: bool,
-    /// Seconds to wait for harness startup, greater than zero and at most 300
+    /// Seconds to wait for harness startup, greater than zero and at most 300; also bounds the wait for the new tab's shell when Herdr refuses the launch as agent_pane_busy
     #[arg(long, default_value = "30", value_parser = startup_seconds)]
     startup_timeout: f64,
     /// With --mode headless: register the agent without starting its wrapper, for a supervisor

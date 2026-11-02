@@ -897,6 +897,30 @@ fn codex_startup_timeout(output: &CommandOutput) -> bool {
         })
 }
 
+/// Herdr refused `agent start` because the pane was not an available shell. Herdr decides
+/// that before it types anything into the pane.
+fn agent_pane_busy(output: &CommandOutput) -> bool {
+    output.status != 0 && herdr_error_code(&output.stderr).as_deref() == Some("agent_pane_busy")
+}
+
+/// Herdr positively reported the pane as not found.
+fn missing_pane(error: &AdapterError) -> bool {
+    herdr_error_code(&error.to_string()).as_deref() == Some("pane_not_found")
+}
+
+/// How often a refused launch looks at its pane again.
+const SHELL_READINESS_POLL: Duration = Duration::from_millis(250);
+
+/// One look at a pane that Herdr refused as busy.
+enum ShellObservation {
+    /// No agent, and the pane's shell alone in the foreground.
+    Available,
+    /// Not available yet, with what was seen.
+    Busy(String),
+    /// No longer the pane the launch was offered: closed, or holding another terminal.
+    Replaced(String),
+}
+
 /// Direct Herdr CLI adapter; executable availability is checked when used.
 #[derive(Clone, Debug)]
 pub struct HerdrClient {
@@ -1222,7 +1246,27 @@ impl HerdrClient {
         ]);
         args.extend([timeout.as_millis().max(1).to_string(), "--".to_owned()]);
         args.extend_from_slice(arguments);
-        let result = self.invoke_with_timeout(&args, timeout + CONTROL_TIMEOUT)?;
+        // A fresh pane's login shell can still hold its terminal for longer than Herdr's own
+        // short readiness retry, so `agent start` is refused with `agent_pane_busy`. Herdr
+        // refuses before typing anything, so the launch is offered again, in this pane only,
+        // once it is an available shell, until the startup deadline.
+        let deadline = Instant::now() + timeout;
+        let mut pinned_terminal = None;
+        let result = loop {
+            let result = self.invoke_with_timeout(&args, timeout + CONTROL_TIMEOUT)?;
+            if !agent_pane_busy(&result) {
+                break result;
+            }
+            if let Err(observed) =
+                self.await_available_shell(pane_id, &mut pinned_terminal, deadline)
+            {
+                return Err(AdapterError::unavailable(format!(
+                    "agent start {name:?}: {}; pane {pane_id} did not become an available shell within {}s: {observed}",
+                    stderr_detail(&result),
+                    timeout.as_secs_f64()
+                )));
+            }
+        };
         if result.status != 0 {
             let resumed = (arguments.len() >= 2
                 && arguments[0] == "resume"
@@ -1242,6 +1286,92 @@ impl HerdrClient {
             )));
         }
         Ok(())
+    }
+
+    /// Wait until `pane_id` is an available shell as Herdr's `agent start` defines it: no agent
+    /// in the pane and the pane's own shell alone in its foreground process group, seen twice
+    /// in a row. The pane must keep the terminal it had at the first look (`pinned_terminal`),
+    /// so a replaced terminal or a closed pane ends the wait at once. On failure, returns what
+    /// was last observed.
+    fn await_available_shell(
+        &self,
+        pane_id: &str,
+        pinned_terminal: &mut Option<Option<String>>,
+        deadline: Instant,
+    ) -> std::result::Result<(), String> {
+        let mut last = "it looked like an available shell, but Herdr kept refusing it".to_owned();
+        let mut consecutive = 0;
+        loop {
+            match self.available_shell_observation(pane_id, pinned_terminal) {
+                ShellObservation::Available => {
+                    consecutive += 1;
+                    if consecutive >= 2 {
+                        return Ok(());
+                    }
+                }
+                ShellObservation::Busy(observed) => {
+                    consecutive = 0;
+                    last = observed;
+                }
+                ShellObservation::Replaced(observed) => return Err(observed),
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(last);
+            }
+            thread::sleep(SHELL_READINESS_POLL.min(remaining));
+        }
+    }
+
+    fn available_shell_observation(
+        &self,
+        pane_id: &str,
+        pinned_terminal: &mut Option<Option<String>>,
+    ) -> ShellObservation {
+        let info = match self.pane_info(pane_id) {
+            Ok(info) => info,
+            Err(error) if missing_pane(&error) => {
+                return ShellObservation::Replaced(format!("the pane is gone: {error}"))
+            }
+            Err(error) => return ShellObservation::Busy(error.to_string()),
+        };
+        let pinned = pinned_terminal.get_or_insert_with(|| info.terminal_id.clone());
+        if info.pane_id != pane_id || info.terminal_id != *pinned {
+            return ShellObservation::Replaced(format!(
+                "the pane now holds terminal {:?}, not the {:?} it was created with",
+                info.terminal_id, pinned
+            ));
+        }
+        if let Some(agent) = info.agent {
+            return ShellObservation::Busy(format!("Herdr reports agent {agent:?} in the pane"));
+        }
+        let state = match self.pane_process_state(pane_id, &|| false) {
+            Ok(state) => state,
+            Err(error) => return ShellObservation::Busy(error.to_string()),
+        };
+        if state.foreground_process_group_id == state.shell_pid && shell_alone_in_foreground(&state)
+        {
+            return ShellObservation::Available;
+        }
+        let processes = state
+            .processes
+            .iter()
+            .map(|process| {
+                let pid = process.get("pid").and_then(Value::as_u64).unwrap_or(0);
+                let command = foreground_argv0(process)
+                    .ok()
+                    .flatten()
+                    .or_else(|| process.get("name").and_then(Value::as_str))
+                    .unwrap_or("?");
+                format!("{pid} {command}")
+            })
+            .collect::<Vec<_>>();
+        ShellObservation::Busy(format!(
+            "shell {} is not alone in the foreground: group {} holds [{}]",
+            state.shell_pid,
+            state.foreground_process_group_id,
+            processes.join(", ")
+        ))
     }
 
     /// Prove a Codex launch ready after Herdr's exact startup timeout.

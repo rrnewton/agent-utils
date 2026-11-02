@@ -15090,6 +15090,27 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn start_launches_only_in_the_pane_its_tab_create_returned() {
+        // A busy pane in another tab already carries the new agent's label.
+        let fixture = Fixture::new();
+        fixture.client.panes.lock().unwrap().push(Pane {
+            pane_id: "busy-same-label".to_owned(),
+            tab_id: "tab-busy".to_owned(),
+            workspace_id: "workspace".to_owned(),
+        });
+        fixture
+            .client
+            .labels
+            .lock()
+            .unwrap()
+            .insert("tab-busy".to_owned(), "worker".to_owned());
+        let status = fixture.start(None);
+        let launches = fixture.client.launches.lock().unwrap();
+        assert_eq!(launches.keys().collect::<Vec<_>>(), ["owned"]);
+        assert_eq!(status["pane_id"], "owned", "{status}");
+    }
+
+    #[test]
     fn invalid_environment_is_refused_before_registry_or_tab_creation() {
         let fixture = Fixture::new();
         let error = fixture
