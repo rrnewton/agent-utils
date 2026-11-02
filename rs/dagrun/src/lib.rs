@@ -134,7 +134,7 @@ pub use sweep::{
 pub use test_results::{
     structured_test_results_recovery_path, TestAttemptOutcome, TestAttemptResult, TestResult,
     TestResults, TestResultsErrorKind, TestResultsWriteError, CLASSIFIED_RESULTS_SCHEMA,
-    CURRENT_SCHEMA, DIAGNOSTIC_RESULTS_SCHEMA, RETAINED_RESULTS_SCHEMA,
+    CURRENT_SCHEMA, DIAGNOSTIC_RESULTS_SCHEMA, RETAINED_RESULTS_SCHEMA, SKIPPED_RESULTS_SCHEMA,
     TEST_RESULTS_RECOVERY_SUFFIX,
 };
 pub use viz::{to_ascii, to_ascii_groups, to_dot, to_dot_groups};

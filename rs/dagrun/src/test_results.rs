@@ -136,6 +136,15 @@ pub const RETAINED_RESULTS_SCHEMA: u64 = 2;
 /// and counts such a row separately and does not fail the step on it. Every other non-pass is
 /// still a blocking `fail`.
 pub const DIAGNOSTIC_RESULTS_SCHEMA: u64 = 4;
+/// Explicit opt-in schema: schema 4 plus first-class runtime skips.
+///
+/// A row may be a `skip`: the test started, reported that it could not run (for example a
+/// required device is absent), and returned normally. The reason travels with the row. A skip
+/// is neither a pass nor a failure: it counts in `executed_tests`, never in passed or failed,
+/// and it never fails its step by itself. A step that must not skip declares that policy
+/// outside this record. Only this schema may carry a skip; earlier writers refuse one rather
+/// than fold it into a pass or a failure.
+pub const SKIPPED_RESULTS_SCHEMA: u64 = 5;
 
 /// Why the scheduler could not import a required structured result.
 ///
@@ -237,6 +246,8 @@ pub enum TestAttemptOutcome {
     /// Attempt produced an explicit no-result classification that is neither a
     /// timeout nor an infrastructure/accounting failure.
     NoResult,
+    /// The test started and reported that it could not run; it returned normally.
+    Skipped,
 }
 
 impl TestAttemptOutcome {
@@ -250,6 +261,7 @@ impl TestAttemptOutcome {
             Self::Cancelled => "cancelled",
             Self::InfrastructureError => "infrastructure_error",
             Self::NoResult => "no_result",
+            Self::Skipped => "skipped",
         }
     }
 
@@ -262,6 +274,7 @@ impl TestAttemptOutcome {
             "cancelled" => Some(Self::Cancelled),
             "infrastructure_error" => Some(Self::InfrastructureError),
             "no_result" => Some(Self::NoResult),
+            "skipped" => Some(Self::Skipped),
             _ => None,
         }
     }
@@ -326,6 +339,12 @@ pub struct TestResult {
     /// counts it as a diagnostic failure instead of failing the step. `None` on every pass and on
     /// every blocking failure.
     pub diagnostic: Option<String>,
+    /// Why this test reported at runtime that it could not run (schema 5 only).
+    ///
+    /// `Some` only on a `skip` row with classified attempts; the scheduler reports and
+    /// counts it as a skip instead of a pass or a failure. `None` on every other row.
+    /// Mutually exclusive with `diagnostic`.
+    pub skip_reason: Option<String>,
 }
 
 impl TestResult {
@@ -345,6 +364,7 @@ impl TestResult {
             attempts,
             attempt_results: None,
             diagnostic: None,
+            skip_reason: None,
         })
     }
 
@@ -362,6 +382,7 @@ impl TestResult {
             attempts: attempt_count,
             attempt_results: Some(attempts),
             diagnostic: None,
+            skip_reason: None,
         };
         validate_result(&result, true)?;
         Ok(result)
@@ -385,14 +406,40 @@ impl TestResult {
             attempts: attempt_count,
             attempt_results: Some(attempts),
             diagnostic: Some(reason),
+            skip_reason: None,
         };
         validate_result(&result, true)?;
         Ok(result)
     }
 
-    /// A failure that fails the step: every non-pass that is not a declared diagnostic.
+    /// A test that started and reported it could not run, for opt-in schema 5.
+    ///
+    /// `reason` is what the test itself reported (for example the absent resource).
+    /// The terminal attempt must be `skipped`: a test that ran to a pass or a failure
+    /// is an ordinary row whatever it printed along the way.
+    pub fn skipped(
+        id: String,
+        attempts: Vec<TestAttemptResult>,
+        reason: String,
+    ) -> Result<Self, String> {
+        let attempt_count = u64::try_from(attempts.len())
+            .map_err(|_| "structured-test-results attempt count does not fit u64".to_string())?;
+        let result = Self {
+            id,
+            passed: false,
+            attempts: attempt_count,
+            attempt_results: Some(attempts),
+            diagnostic: None,
+            skip_reason: Some(reason),
+        };
+        validate_result(&result, true)?;
+        Ok(result)
+    }
+
+    /// A failure that fails the step: every non-pass that is neither a declared
+    /// diagnostic nor a runtime skip.
     pub fn is_blocking_failure(&self) -> bool {
-        !self.passed && self.diagnostic.is_none()
+        !self.passed && self.diagnostic.is_none() && self.skip_reason.is_none()
     }
 
     /// A failure the producer declared non-blocking; reported and counted, never ignored.
@@ -400,11 +447,21 @@ impl TestResult {
         !self.passed && self.diagnostic.is_some()
     }
 
+    /// A runtime skip; reported and counted, never folded into pass or fail.
+    pub fn is_skipped(&self) -> bool {
+        self.skip_reason.is_some()
+    }
+
     fn wire_result(&self) -> &'static str {
-        match (self.passed, self.diagnostic.is_some()) {
-            (true, _) => "pass",
-            (false, false) => "fail",
-            (false, true) => "diagnostic_fail",
+        match (
+            self.passed,
+            self.diagnostic.is_some(),
+            self.skip_reason.is_some(),
+        ) {
+            (true, _, _) => "pass",
+            (false, false, false) => "fail",
+            (false, true, _) => "diagnostic_fail",
+            (false, false, true) => "skip",
         }
     }
 }
@@ -416,7 +473,17 @@ fn parse_result_row(
 ) -> Result<TestResult, String> {
     let classified = schema >= CLASSIFIED_RESULTS_SCHEMA;
     let diagnostic_schema = schema == DIAGNOSTIC_RESULTS_SCHEMA;
-    let expected = if diagnostic_schema {
+    let skipped_schema = schema == SKIPPED_RESULTS_SCHEMA;
+    let expected = if skipped_schema {
+        &[
+            "id",
+            "result",
+            "attempts",
+            "attempt_results",
+            "diagnostic_reason",
+            "skip_reason",
+        ][..]
+    } else if diagnostic_schema {
         &[
             "id",
             "result",
@@ -435,11 +502,13 @@ fn parse_result_row(
         .and_then(Value::as_str)
         .ok_or_else(|| format!("structured-test-results-results[{index}].id must be a string"))?
         .to_string();
-    let (passed, diagnostic_result) = match row.get("result").and_then(Value::as_str) {
-        Some("pass") => (true, false),
-        Some("fail") => (false, false),
+    let (passed, diagnostic_result, skip_result) = match row.get("result").and_then(Value::as_str) {
+        Some("pass") => (true, false, false),
+        Some("fail") => (false, false, false),
         // Only the schema that carries a reason may say a failure is non-blocking.
-        Some("diagnostic_fail") if diagnostic_schema => (false, true),
+        Some("diagnostic_fail") if diagnostic_schema || skipped_schema => (false, true, false),
+        // Only the schema that carries a skip reason may say a test skipped.
+        Some("skip") if skipped_schema => (false, false, true),
         Some(value) => {
             return Err(format!(
                 "structured-test-results-results[{index}].result has unknown value {value:?}"
@@ -509,7 +578,7 @@ fn parse_result_row(
             })?,
         );
     }
-    let diagnostic = if diagnostic_schema {
+    let diagnostic = if diagnostic_schema || skipped_schema {
         match (row.get("diagnostic_reason"), diagnostic_result) {
             (Some(Value::Null), false) => None,
             (Some(Value::String(reason)), true) => Some(reason.clone()),
@@ -527,12 +596,31 @@ fn parse_result_row(
     } else {
         None
     };
+    let skip_reason = if skipped_schema {
+        match (row.get("skip_reason"), skip_result) {
+            (Some(Value::Null), false) => None,
+            (Some(Value::String(reason)), true) => Some(reason.clone()),
+            (_, true) => {
+                return Err(format!(
+                    "structured-test-results-results[{index}].skip_reason must be a string on a skip row"
+                ));
+            }
+            (_, false) => {
+                return Err(format!(
+                    "structured-test-results-results[{index}].skip_reason must be null unless result is skip"
+                ));
+            }
+        }
+    } else {
+        None
+    };
     let result = TestResult {
         id,
         passed,
         attempts,
         attempt_results: Some(attempt_results),
         diagnostic,
+        skip_reason,
     };
     validate_result(&result, false)?;
     Ok(result)
@@ -597,6 +685,7 @@ impl TestResults {
         validate_results(executed_tests, &results)?;
         for result in &results {
             validate_result(result, true)?;
+            require_no_skip_result(result)?;
         }
         Ok(Self {
             executed_tests,
@@ -605,7 +694,25 @@ impl TestResults {
         })
     }
 
-    /// Read count-only schema 1, default schema 2, classified schema 3, or diagnostic schema 4.
+    /// Construct opt-in schema-5 results: schema 4 plus first-class runtime skips.
+    pub fn skipped(
+        executed_tests: u64,
+        filtered_tests: u64,
+        results: Vec<TestResult>,
+    ) -> Result<Self, String> {
+        validate_results(executed_tests, &results)?;
+        for result in &results {
+            validate_result(result, true)?;
+        }
+        Ok(Self {
+            executed_tests,
+            filtered_tests,
+            results: Some(results),
+        })
+    }
+
+    /// Read count-only schema 1, default schema 2, classified schema 3, diagnostic
+    /// schema 4, or skipped schema 5.
     pub fn from_json_slice(bytes: &[u8]) -> Result<Self, String> {
         let value = parse_unique_json_value(bytes)?;
         let object = value
@@ -623,7 +730,10 @@ impl TestResults {
                     results: None,
                 })
             }
-            CURRENT_SCHEMA | CLASSIFIED_RESULTS_SCHEMA | DIAGNOSTIC_RESULTS_SCHEMA => {
+            CURRENT_SCHEMA
+            | CLASSIFIED_RESULTS_SCHEMA
+            | DIAGNOSTIC_RESULTS_SCHEMA
+            | SKIPPED_RESULTS_SCHEMA => {
                 exact_fields(
                     object,
                     &["schema", "executed_tests", "filtered_tests", "results"],
@@ -664,9 +774,10 @@ impl TestResults {
         if declared_schema != CURRENT_SCHEMA
             && declared_schema != CLASSIFIED_RESULTS_SCHEMA
             && declared_schema != DIAGNOSTIC_RESULTS_SCHEMA
+            && declared_schema != SKIPPED_RESULTS_SCHEMA
         {
             return Err(format!(
-                "structured-test-results declaration has unsupported schema {declared_schema}; expected default schema {CURRENT_SCHEMA}, classified schema {CLASSIFIED_RESULTS_SCHEMA} or diagnostic schema {DIAGNOSTIC_RESULTS_SCHEMA}"
+                "structured-test-results declaration has unsupported schema {declared_schema}; expected default schema {CURRENT_SCHEMA}, classified schema {CLASSIFIED_RESULTS_SCHEMA}, diagnostic schema {DIAGNOSTIC_RESULTS_SCHEMA} or skipped schema {SKIPPED_RESULTS_SCHEMA}"
             ));
         }
         let value = parse_unique_json_value(bytes)?;
@@ -756,6 +867,7 @@ impl TestResults {
             .iter()
             .map(|result| -> Result<Value, String> {
                 validate_result(result, true)?;
+                require_no_skip_result(result)?;
                 let attempts = result.attempt_results.as_ref();
                 Ok(serde_json::json!({
                     "id": result.id,
@@ -772,6 +884,41 @@ impl TestResults {
             .collect::<Result<Vec<_>, _>>()?;
         serde_json::to_vec(&serde_json::json!({
             "schema": DIAGNOSTIC_RESULTS_SCHEMA,
+            "executed_tests": self.executed_tests,
+            "filtered_tests": self.filtered_tests,
+            "results": rows,
+        }))
+        .map_err(|error| format!("structured-test-results-json: {error}"))
+    }
+
+    /// Serialize complete opt-in schema-5 evidence, skip reasons included.
+    pub fn to_skipped_json(&self) -> Result<Vec<u8>, String> {
+        let results = self.results.as_ref().ok_or_else(|| {
+            "structured-test-results-schema: retained schema 1 has no current write path"
+                .to_string()
+        })?;
+        validate_results(self.executed_tests, results)?;
+        let rows = results
+            .iter()
+            .map(|result| -> Result<Value, String> {
+                validate_result(result, true)?;
+                let attempts = result.attempt_results.as_ref();
+                Ok(serde_json::json!({
+                    "id": result.id,
+                    "result": result.wire_result(),
+                    "attempts": result.attempts,
+                    "attempt_results": attempts.map(|attempts| attempts.iter().map(|attempt| serde_json::json!({
+                        "attempt": attempt.attempt,
+                        "outcome": attempt.outcome.value(),
+                        "detail": attempt.detail,
+                    })).collect::<Vec<_>>()),
+                    "diagnostic_reason": result.diagnostic,
+                    "skip_reason": result.skip_reason,
+                }))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        serde_json::to_vec(&serde_json::json!({
+            "schema": SKIPPED_RESULTS_SCHEMA,
             "executed_tests": self.executed_tests,
             "filtered_tests": self.filtered_tests,
             "results": rows,
@@ -811,6 +958,14 @@ impl TestResults {
     pub fn write_diagnostic_typed(&self, path: &Path) -> Result<(), TestResultsWriteError> {
         let bytes = self
             .to_diagnostic_json()
+            .map_err(TestResultsWriteError::Invalid)?;
+        self.write_bytes(path, bytes)
+    }
+
+    /// Atomically publish schema 5, retaining validation versus filesystem failure.
+    pub fn write_skipped_typed(&self, path: &Path) -> Result<(), TestResultsWriteError> {
+        let bytes = self
+            .to_skipped_json()
             .map_err(TestResultsWriteError::Invalid)?;
         self.write_bytes(path, bytes)
     }
@@ -898,6 +1053,18 @@ fn require_blocking_result(result: &TestResult) -> Result<(), String> {
             result.id
         ));
     }
+    require_no_skip_result(result)
+}
+
+/// Schemas before 5 cannot say a test skipped. Writing a skip as a plain `fail` (or
+/// dropping the reason) would silently change its meaning, so those writers refuse instead.
+fn require_no_skip_result(result: &TestResult) -> Result<(), String> {
+    if result.skip_reason.is_some() {
+        return Err(format!(
+            "structured-test-results writer refuses to discard the skip designation of {:?}; write schema {SKIPPED_RESULTS_SCHEMA}",
+            result.id
+        ));
+    }
     Ok(())
 }
 
@@ -939,12 +1106,53 @@ fn validate_result(result: &TestResult, require_attempt_results: bool) -> Result
             ));
         }
     }
+    if result.diagnostic.is_some() && result.skip_reason.is_some() {
+        return Err(format!(
+            "structured-test-results test {:?} is both a diagnostic failure and a skip; a row has exactly one terminal classification",
+            result.id
+        ));
+    }
+    if let Some(reason) = result.skip_reason.as_deref() {
+        if result.passed {
+            return Err(format!(
+                "structured-test-results skip designation on passing test {:?}; a pass is an ordinary pass row",
+                result.id
+            ));
+        }
+        if reason.is_empty() || reason.trim() != reason {
+            return Err(format!(
+                "structured-test-results skip {:?} requires a nonempty trimmed reason",
+                result.id
+            ));
+        }
+        let Some(attempts) = result.attempt_results.as_ref() else {
+            return Err(format!(
+                "structured-test-results skip {:?} lacks classified attempt_results",
+                result.id
+            ));
+        };
+        let terminal = attempts.last().map(|attempt| attempt.outcome);
+        if terminal != Some(TestAttemptOutcome::Skipped) {
+            return Err(format!(
+                "structured-test-results skip {:?} must end in a skipped attempt, not {:?}",
+                result.id, terminal
+            ));
+        }
+    }
     let Some(attempts) = result.attempt_results.as_ref() else {
         if require_attempt_results {
             return Err("structured-test-results classified row lacks attempt_results".into());
         }
         return Ok(());
     };
+    if result.skip_reason.is_none()
+        && attempts.last().map(|attempt| attempt.outcome) == Some(TestAttemptOutcome::Skipped)
+    {
+        return Err(format!(
+            "structured-test-results test {:?} ends in a skipped attempt without a skip designation; a skip must carry its reason",
+            result.id
+        ));
+    }
     let attempt_count = u64::try_from(attempts.len())
         .map_err(|_| "structured-test-results attempt count does not fit u64".to_string())?;
     if attempt_count != result.attempts {
@@ -1567,6 +1775,117 @@ mod diagnostic_tests {
             ],
         )
         .unwrap()
+    }
+
+    fn skipped_report() -> TestResults {
+        let mut rows = report().results.unwrap();
+        rows.push(
+            TestResult::skipped(
+                "suite$skip".into(),
+                vec![TestAttemptResult::new(
+                    1,
+                    TestAttemptOutcome::Skipped,
+                    Some("/dev/kvm unavailable".into()),
+                )
+                .unwrap()],
+                "/dev/kvm unavailable".into(),
+            )
+            .unwrap(),
+        );
+        TestResults::skipped(4, 2, rows).unwrap()
+    }
+
+    #[test]
+    fn skipped_schema_round_trips_and_classifies_each_row() {
+        let report = skipped_report();
+        let bytes = report.to_skipped_json().unwrap();
+        let parsed =
+            TestResults::from_declared_schema_json_slice(&bytes, SKIPPED_RESULTS_SCHEMA).unwrap();
+        assert_eq!(parsed, report);
+        let rows = parsed.results.unwrap();
+        let skip = &rows[3];
+        assert!(skip.is_skipped());
+        assert!(!skip.is_blocking_failure(), "a skip never fails its step");
+        assert!(!skip.is_diagnostic_failure());
+        assert!(!skip.passed, "a skip is not a pass");
+        assert_eq!(skip.skip_reason.as_deref(), Some("/dev/kvm unavailable"));
+        let wire: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(wire["schema"], 5);
+        assert_eq!(wire["results"][3]["result"], "skip");
+        assert_eq!(wire["results"][3]["skip_reason"], "/dev/kvm unavailable");
+        assert_eq!(
+            wire["results"][3]["attempt_results"][0]["outcome"],
+            "skipped"
+        );
+    }
+
+    #[test]
+    fn older_schemas_refuse_to_write_or_read_a_skip() {
+        let report = skipped_report();
+        assert!(report.to_current_json().is_err());
+        for error in [
+            report.to_classified_json().unwrap_err(),
+            report.to_diagnostic_json().unwrap_err(),
+            TestResults::diagnostic(4, 2, report.results.clone().unwrap()).unwrap_err(),
+        ] {
+            assert!(error.contains("refuses to discard"), "{error}");
+        }
+        // The schema-4 writer specifically refuses the skip designation.
+        let only_skip = TestResults::skipped(
+            1,
+            0,
+            vec![TestResult::skipped(
+                "suite$only".into(),
+                vec![TestAttemptResult::new(
+                    1,
+                    TestAttemptOutcome::Skipped,
+                    Some("no device".into()),
+                )
+                .unwrap()],
+                "no device".into(),
+            )
+            .unwrap()],
+        )
+        .unwrap();
+        assert!(only_skip
+            .to_diagnostic_json()
+            .unwrap_err()
+            .contains("refuses to discard the skip designation"));
+        // A schema-4 document cannot spell skip at all.
+        let bytes = br#"{"schema":4,"executed_tests":1,"filtered_tests":0,"results":[{"id":"a","result":"skip","attempts":1,"attempt_results":[{"attempt":1,"outcome":"skipped","detail":"no device"}],"diagnostic_reason":null}]}"#;
+        assert!(TestResults::from_json_slice(bytes)
+            .unwrap_err()
+            .contains("unknown value \"skip\""));
+        let declared_four = report.to_skipped_json().unwrap();
+        assert!(TestResults::from_declared_schema_json_slice(&declared_four, 4).is_err());
+    }
+
+    #[test]
+    fn inconsistent_skip_rows_are_refused() {
+        // A skip whose terminal attempt actually failed.
+        assert!(
+            TestResult::skipped("suite$x".into(), failed_attempt(), "no device".into(),).is_err()
+        );
+        // A skip with an empty reason.
+        assert!(TestResult::skipped(
+            "suite$x".into(),
+            vec![
+                TestAttemptResult::new(1, TestAttemptOutcome::Skipped, Some("no device".into()),)
+                    .unwrap()
+            ],
+            " ".into(),
+        )
+        .is_err());
+        // A skipped attempt without the row designation, and a skip row whose
+        // reason field disagrees with its result, both refuse on read.
+        let missing_reason = br#"{"schema":5,"executed_tests":1,"filtered_tests":0,"results":[{"id":"a","result":"fail","attempts":1,"attempt_results":[{"attempt":1,"outcome":"skipped","detail":"no device"}],"diagnostic_reason":null,"skip_reason":null}]}"#;
+        assert!(TestResults::from_json_slice(missing_reason)
+            .unwrap_err()
+            .contains("without a skip designation"));
+        let stray_reason = br#"{"schema":5,"executed_tests":1,"filtered_tests":0,"results":[{"id":"a","result":"pass","attempts":1,"attempt_results":[{"attempt":1,"outcome":"passed","detail":null}],"diagnostic_reason":null,"skip_reason":"no device"}]}"#;
+        assert!(TestResults::from_json_slice(stray_reason)
+            .unwrap_err()
+            .contains("must be null unless result is skip"));
     }
 
     #[test]

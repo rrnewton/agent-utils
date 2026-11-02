@@ -366,6 +366,15 @@ impl StructuredTestResultsManifest {
         }
     }
 
+    /// Require classified per-attempt results that may carry non-blocking diagnostic
+    /// failures and first-class runtime skips (schema 5).
+    pub fn skipped(owner: impl Into<String>) -> Self {
+        Self {
+            schema: crate::test_results::SKIPPED_RESULTS_SCHEMA,
+            owner: owner.into(),
+        }
+    }
+
     /// Require classified per-attempt results that may carry non-blocking diagnostic failures
     /// (schema 4).
     pub fn diagnostic(owner: impl Into<String>) -> Self {
@@ -555,10 +564,11 @@ impl Step {
                 && manifest.schema != crate::test_results::CURRENT_SCHEMA
                 && manifest.schema != crate::test_results::CLASSIFIED_RESULTS_SCHEMA
                 && manifest.schema != crate::test_results::DIAGNOSTIC_RESULTS_SCHEMA
+                && manifest.schema != crate::test_results::SKIPPED_RESULTS_SCHEMA
             {
                 return Err(format!(
-                    "step {}: structured test-result schema {} is unsupported; expected default schema {}, classified schema {} or diagnostic schema {}",
-                    self.tag(), manifest.schema, crate::test_results::CURRENT_SCHEMA, crate::test_results::CLASSIFIED_RESULTS_SCHEMA, crate::test_results::DIAGNOSTIC_RESULTS_SCHEMA
+                    "step {}: structured test-result schema {} is unsupported; expected default schema {}, classified schema {}, diagnostic schema {} or skipped schema {}",
+                    self.tag(), manifest.schema, crate::test_results::CURRENT_SCHEMA, crate::test_results::CLASSIFIED_RESULTS_SCHEMA, crate::test_results::DIAGNOSTIC_RESULTS_SCHEMA, crate::test_results::SKIPPED_RESULTS_SCHEMA
                 ));
             }
             if manifest.owner != self.tag() {

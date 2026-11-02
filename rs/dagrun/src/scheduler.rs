@@ -2952,6 +2952,39 @@ fn diagnostic_failure_lines(tag: &str, results: Option<&[TestResult]>) -> Vec<St
     lines
 }
 
+/// Human-readable lines for a step's runtime-skipped tests, empty when there are none.
+///
+/// A skip does not fail its step, so without these lines a passing run would show no trace
+/// of work that never ran. Bounded like the diagnostic lines.
+fn skipped_test_lines(tag: &str, results: Option<&[TestResult]>) -> Vec<String> {
+    let skipped: Vec<&TestResult> = results
+        .unwrap_or_default()
+        .iter()
+        .filter(|result| result.is_skipped())
+        .collect();
+    if skipped.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![format!(
+        "[{tag}] \u{21aa} SKIP {} test(s) reported they could not run:",
+        skipped.len()
+    )];
+    for result in skipped.iter().take(DIAGNOSTIC_FAILURE_LINES) {
+        lines.push(format!(
+            "[{tag}]   {} (skipped: {})",
+            result.id,
+            result.skip_reason.as_deref().unwrap_or_default()
+        ));
+    }
+    if skipped.len() > DIAGNOSTIC_FAILURE_LINES {
+        lines.push(format!(
+            "[{tag}]   ... and {} more skipped test(s) not named here",
+            skipped.len() - DIAGNOSTIC_FAILURE_LINES
+        ));
+    }
+    lines
+}
+
 fn structured_test_failure_reason(
     counts: &CapturedTestResults,
     returncode: Option<i64>,
@@ -4311,6 +4344,10 @@ fn run_step(ctx: StepCtx) {
     }
 
     let diagnostic_lines = diagnostic_failure_lines(&tag, test_counts.results.as_deref());
+    let skipped_lines = skipped_test_lines(&tag, test_counts.results.as_deref());
+    let skipped_tests = test_counts.results.as_ref().map_or(0, |results| {
+        results.iter().filter(|result| result.is_skipped()).count()
+    });
     let diagnostic_failures = test_counts.results.as_ref().map_or(0, |results| {
         results
             .iter()
@@ -4496,6 +4533,9 @@ fn run_step(ctx: StepCtx) {
     for line in &diagnostic_lines {
         emit(line);
     }
+    for line in &skipped_lines {
+        emit(line);
+    }
 
     // Terminal record. Written for EVERY step, pass or fail, so the journal alone answers "what
     // was this run doing" without needing the end-of-run profile rows that a hard kill destroys.
@@ -4538,6 +4578,12 @@ fn run_step(ctx: StepCtx) {
             fields.push((
                 "diagnostic_test_failures",
                 JournalValue::Text(diagnostic_failures.to_string()),
+            ));
+        }
+        if skipped_tests > 0 {
+            fields.push((
+                "skipped_tests",
+                JournalValue::Text(skipped_tests.to_string()),
             ));
         }
         // The two ceilings this step ran under, each named for the quantity it bounds. Recorded

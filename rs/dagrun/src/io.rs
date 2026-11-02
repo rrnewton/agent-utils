@@ -34,7 +34,9 @@ use crate::model::{
     StepClass, StructuredTestResultsManifest, WriteDomainGuarantee, WriteDomainPolicy,
     DEFAULT_JOBS_FLAG, STRUCTURED_TEST_RESULTS_KIND,
 };
-use crate::test_results::{CLASSIFIED_RESULTS_SCHEMA, CURRENT_SCHEMA, DIAGNOSTIC_RESULTS_SCHEMA};
+use crate::test_results::{
+    CLASSIFIED_RESULTS_SCHEMA, CURRENT_SCHEMA, DIAGNOSTIC_RESULTS_SCHEMA, SKIPPED_RESULTS_SCHEMA,
+};
 
 const DEFAULT_MEM_CAP_FLOOR: i64 = 8 * 1024 * 1024 * 1024;
 
@@ -409,9 +411,10 @@ fn result_manifest_value_from(value: &Value, where_: &str) -> Result<ResultManif
     if schema != CURRENT_SCHEMA as i64
         && schema != CLASSIFIED_RESULTS_SCHEMA as i64
         && schema != DIAGNOSTIC_RESULTS_SCHEMA as i64
+        && schema != SKIPPED_RESULTS_SCHEMA as i64
     {
         return Err(err(format!(
-            "{where_}.schema: structured test results require default schema {CURRENT_SCHEMA}, classified schema {CLASSIFIED_RESULTS_SCHEMA} or diagnostic schema {DIAGNOSTIC_RESULTS_SCHEMA}, got {schema}"
+            "{where_}.schema: structured test results require default schema {CURRENT_SCHEMA}, classified schema {CLASSIFIED_RESULTS_SCHEMA}, diagnostic schema {DIAGNOSTIC_RESULTS_SCHEMA} or skipped schema {SKIPPED_RESULTS_SCHEMA}, got {schema}"
         )));
     }
     let path_env = req_str(object, "path_env", where_)?;
@@ -426,6 +429,8 @@ fn result_manifest_value_from(value: &Value, where_: &str) -> Result<ResultManif
     }
     let manifest = if schema == CURRENT_SCHEMA as i64 {
         StructuredTestResultsManifest::current(owner)
+    } else if schema == SKIPPED_RESULTS_SCHEMA as i64 {
+        StructuredTestResultsManifest::skipped(owner)
     } else if schema == DIAGNOSTIC_RESULTS_SCHEMA as i64 {
         StructuredTestResultsManifest::diagnostic(owner)
     } else {
@@ -2423,6 +2428,26 @@ steps:
     }
 
     #[test]
+    fn skipped_result_manifest_is_explicit_and_roundtrips() {
+        let doc = r#"{"steps":[{"group":"test","job":"counts","cmd":"true","result_manifests":[{"kind":"structured-test-results","schema":5,"path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"test.counts"}]}]}"#;
+        let cfg = dag_from_json(doc).unwrap();
+        assert_eq!(
+            cfg.steps[0]
+                .structured_test_results_manifest()
+                .unwrap()
+                .unwrap(),
+            &StructuredTestResultsManifest::skipped("test.counts")
+        );
+        let encoded = dag_to_json(&cfg);
+        assert_eq!(
+            serde_json::from_str::<Value>(&encoded).unwrap()["steps"][0]["result_manifests"][0]
+                ["schema"],
+            5
+        );
+        assert_eq!(dag_to_json(&dag_from_json(&encoded).unwrap()), encoded);
+    }
+
+    #[test]
     fn result_manifests_refuse_malformed_and_duplicate_selectors() {
         for (value, expected) in [
             (
@@ -2467,8 +2492,8 @@ steps:
                 "schema: must be an integer",
             ),
             (
-                r#"{"kind":"structured-test-results","schema":5,"path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"test.counts"}"#,
-                "got 5",
+                r#"{"kind":"structured-test-results","schema":6,"path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"test.counts"}"#,
+                "got 6",
             ),
             (
                 r#"{"kind":"structured-test-results","schema":2,"path_env":"OTHER","owner":"test.counts"}"#,

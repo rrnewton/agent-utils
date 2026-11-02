@@ -4962,6 +4962,9 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
     if !result.not_launched.is_empty() {
         eprintln!("{PROG}: not launched: {}", result.not_launched.join(", "));
     }
+    if let Some(line) = skipped_test_summary(&result.outcomes) {
+        eprintln!("{PROG}: {line}");
+    }
     if let Some(line) = diagnostic_failure_summary(&result.outcomes) {
         eprintln!("{PROG}: {line}");
     }
@@ -5798,6 +5801,37 @@ fn parse_simple_dag(rest: &[String]) -> Result<Option<String>, String> {
 ///
 /// A diagnostic failure does not fail its step, so without this line a passing run would show no
 /// trace of it at the bottom of the transcript. `None` when no step reported one.
+/// One end-of-run line naming every step that reported runtime-skipped tests.
+///
+/// A skip does not fail its step, so without this line a passing run would show no trace
+/// of it at the bottom of the transcript. `None` when no step reported one.
+fn skipped_test_summary(outcomes: &[StepOutcome]) -> Option<String> {
+    let per_step: Vec<(String, usize)> = outcomes
+        .iter()
+        .filter_map(|outcome| {
+            let count = outcome
+                .test_results
+                .as_ref()?
+                .iter()
+                .filter(|result| result.is_skipped())
+                .count();
+            (count > 0).then(|| (outcome.tag.clone(), count))
+        })
+        .collect();
+    if per_step.is_empty() {
+        return None;
+    }
+    let total: usize = per_step.iter().map(|(_, count)| count).sum();
+    Some(format!(
+        "{total} skipped test(s) in {}",
+        per_step
+            .iter()
+            .map(|(tag, count)| format!("{tag} ({count})"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
+
 fn diagnostic_failure_summary(outcomes: &[StepOutcome]) -> Option<String> {
     let per_step: Vec<(String, usize)> = outcomes
         .iter()
