@@ -48,3 +48,13 @@ export { HOLD_MS, SWIPE_COMMIT_PX, SWIPE_START_PX, createRowGestures } from "./g
 export type { GestureRow, PlayingReading, RowGestures, RowGesturesDependencies, Tapped, TappedBlock } from "./gestures.ts";
 export { createBookmarkLines } from "./bookmark.ts";
 export type { BookmarkLines, BookmarkLinesDependencies, BookmarkPlace, BookmarkedRow } from "./bookmark.ts";
+export {
+  QUICK_REPLY_GAP_PX,
+  QUICK_REPLY_MAX_WIDTH_PX,
+  QUOTE_HOLD_MS,
+  QUOTE_REPLY_TITLE,
+  SELECTION_CHIP_EDGE_PX,
+  SELECTION_CHIP_GAP_PX,
+  createQuoting,
+} from "./quoting.ts";
+export type { HeldQuote, QuickReplySend, QuoteRoute, QuotedRow, Quoting, QuotingDependencies } from "./quoting.ts";

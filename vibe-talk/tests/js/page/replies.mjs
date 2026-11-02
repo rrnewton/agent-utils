@@ -4071,8 +4071,9 @@ test("`#726 vt-selection-chip`: words selected in one message put Quoted reply j
   assert.equal(chipAt(page), null, "the chip outlived the selection");
 
   // THE CONTROL: placed over the words, where a phone's own action bar stands, the chip is not under them.
-  const control = await quotePage(null, brokenScript("    Math.min(box.bottom + SELECTION_CHIP_GAP_PX, viewHeight - SELECTION_CHIP_EDGE_PX - height));",
-    "    Math.min(box.top - SELECTION_CHIP_GAP_PX - height, viewHeight - SELECTION_CHIP_EDGE_PX - height));"));
+  const control = await quotePage(null, await brokenModule([{ file: "src/view/channel/quoting.ts",
+    find: "      Math.min(box.bottom + SELECTION_CHIP_GAP_PX, viewHeight - SELECTION_CHIP_EDGE_PX - height));",
+    replace: "      Math.min(box.top - SELECTION_CHIP_GAP_PX - height, viewHeight - SELECTION_CHIP_EDGE_PX - height));" }]));
   const words = wordsIn(rowWithId(control, "1000000000000000001"));
   await control.selectText(words, null, "about the runner");
   assert.notEqual(chipAt(control)?.top, words.getBoundingClientRect().bottom + gap,
