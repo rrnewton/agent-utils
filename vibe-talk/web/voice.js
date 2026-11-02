@@ -25182,7 +25182,6 @@ function readerZone() {
   }
 }
 
-
 /** Why the server's copy of a channel was not searched, in the owner's words. */
 const SERVER_SEARCH_REASONS = {
   no_cache: "it keeps no copy",
@@ -25196,14 +25195,15 @@ const SERVER_SEARCH_REASONS = {
 
 /** The server's part of the line, for the scopes it answered with. Never more than they say. */
 function serverScopeWords() {
+  const serverSearch = serverSearchNow();
   if (tokenScope === "read") return `server: not searched (${SERVER_SEARCH_REASONS.read_scope})`;
   if (!serverCopyOpen()) return "server: keeps no copy";
-  if (serverSearchNow().failed) return `server: could not be searched (${serverSearchNow().failed})`;
-  if (serverSearchNow().loading && serverSearchNow().scopes.length === 0) return "server: searching…";
-  const scopes = serverSearchNow().scopes;
+  if (serverSearch.failed) return `server: could not be searched (${serverSearch.failed})`;
+  if (serverSearch.loading && serverSearch.scopes.length === 0) return "server: searching…";
+  const scopes = serverSearch.scopes;
   if (scopes.length === 0) return "server: not searched yet";
   const searched = scopes.filter((scope) => scope.state === "searched");
-  const more = serverSearchNow().resume !== null;
+  const more = serverSearch.resume !== null;
   if (searchAllChannels) {
     const whole = searched.filter((scope) => scope.whole).length;
     // Every channel searched reaches back at least as far as the NEWEST of their reaches, and only
@@ -25290,8 +25290,9 @@ function serverHitNode(hit) {
 
 /** Draw the server's search as it stands: the line, the hits this page does not already hold, More. */
 function renderServerSearch() {
+  const serverSearch = serverSearchNow();
   const section = el("server-search");
-  const wanted = serverSearchNow().key !== "";
+  const wanted = serverSearch.key !== "";
   if (section.hidden === wanted) section.hidden = !wanted;
   if (!wanted) {
     if (el("server-hits").children.length > 0) el("server-hits").replaceChildren();
@@ -25302,15 +25303,14 @@ function renderServerSearch() {
   if (checkbox.checked !== searchAllChannels) checkbox.checked = searchAllChannels;
   const channel = String(selectedChannelId() || "");
   const held = heldMessagesById();
-  const fresh = serverSearchNow().hits.filter((hit) => !(String(hit.channel_id) === channel && held.has(String(hit.id))));
+  const fresh = serverSearch.hits.filter((hit) => !(String(hit.channel_id) === channel && held.has(String(hit.id))));
   const drawn = [...el("server-hits").children].map((li) => `${li.getAttribute("data-channel")} ${li.getAttribute("data-id")}`);
   const want = fresh.map((hit) => `${hit.channel_id} ${hit.id}`);
   if (drawn.join("\n") !== want.join("\n")) el("server-hits").replaceChildren(...fresh.map(serverHitNode));
-  const more = serverSearchNow().resume !== null && !serverSearchNow().loading && !serverSearchNow().failed;
+  const more = serverSearch.resume !== null && !serverSearch.loading && !serverSearch.failed;
   if (el("server-more").hidden === more) el("server-more").hidden = !more;
   renderSearchFurther();
 }
-
 
 // `#608 server-side-search`. "Search further back": the server is asked to gather this channel's older
 // history next (`#602 history-settings-and-limits`' prioritize, POST .../history/prioritize), at its
@@ -25318,7 +25318,6 @@ function renderServerSearch() {
 // so on the line, and searches the server's copy again each time it holds older messages. Stop takes
 // the request back (DELETE). Never automatic: the owner chose a button over background scans.
 
-/** Whether a gathering this page asked for is under way in the channel on screen. */
 // Gathering the channel's older history — the ask, its run, the walk's state, why it failed and the
 // poll (SEARCH_FURTHER_POLL_MS) — is web/src/core/search's (`createGathering`, `#624
 // voice-page-modularity`); its requests and drawing it are here.
@@ -25338,6 +25337,7 @@ const gathering = createGathering({
 /** Stop gathering: the gathering and its poll forgotten, the search drawn again. */
 const stopSearchFurther = () => gathering.stop();
 
+/** Whether a gathering this page asked for is under way in the channel on screen. */
 const searchFurtherRunning = () => gathering.state().channel !== "" &&
   gathering.state().channel === String(selectedChannelId() || "");
 
