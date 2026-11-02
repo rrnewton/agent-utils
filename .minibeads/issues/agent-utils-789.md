@@ -2,6 +2,7 @@
 title: 'chat-reply-off-turn-guard: hold a coordinator''s reply to an old owner request when it is answering lane chatter'
 status: open
 priority: 1
+assignee: cl-start@devbig030
 issue_type: feature
 labels:
 - agentctl
