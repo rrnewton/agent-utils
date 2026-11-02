@@ -134,6 +134,12 @@ pub struct ListedPr {
     /// Labels.
     #[serde(default)]
     pub labels: Vec<Label>,
+    /// Reviews (populated only when the list call asked for them).
+    #[serde(default)]
+    pub reviews: Vec<Review>,
+    /// Latest review per reviewer (fallback; see [`Review`]).
+    #[serde(default, rename = "latestReviews")]
+    pub latest_reviews: Vec<Review>,
 }
 
 /// Author of a pull request.
@@ -149,6 +155,68 @@ pub struct Author {
 pub struct Label {
     /// Name.
     pub name: String,
+}
+
+/// One review of a pull request, as the batched list call reports it.
+///
+/// The `gh` (GraphQL) shape is `{"state": "APPROVED", "commit": {"oid":
+/// "<sha>"}}`; the flat `commit_id` spelling (REST shape) is also accepted
+/// so fakes and other hosts can use either. `latestReviews` entries carry
+/// an empty commit oid through `gh`, so approval-at-head reads `reviews`
+/// (whose commit oid is populated), with `latestReviews` as a fallback for
+/// hosts that do populate it.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct Review {
+    /// Review state (`APPROVED`, `CHANGES_REQUESTED`, `COMMENTED`, ...).
+    #[serde(default)]
+    pub state: String,
+    /// Commit the review was submitted on (GraphQL shape).
+    #[serde(default)]
+    pub commit: Option<ReviewCommit>,
+    /// Commit the review was submitted on (flat REST shape).
+    #[serde(default, alias = "commitId")]
+    pub commit_id: Option<String>,
+}
+
+/// The commit a review was submitted on.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct ReviewCommit {
+    /// Commit OID.
+    #[serde(default, alias = "commit_id", alias = "commitId")]
+    pub oid: String,
+}
+
+impl Review {
+    /// Commit this review was submitted on, in either reported shape.
+    pub fn reviewed_commit(&self) -> &str {
+        if let Some(commit) = &self.commit {
+            if !commit.oid.is_empty() {
+                return &commit.oid;
+            }
+        }
+        self.commit_id.as_deref().unwrap_or_default()
+    }
+
+    /// Whether this is an approving review of exactly `head` (a prefix of
+    /// the head, as elsewhere in the queue, also counts).
+    pub fn approves(&self, head: &str) -> bool {
+        let reviewed = self.reviewed_commit();
+        (self.state.eq_ignore_ascii_case("APPROVED")
+            || self.state.eq_ignore_ascii_case("APPROVING"))
+            && !reviewed.is_empty()
+            && !head.is_empty()
+            && (reviewed == head || head.starts_with(reviewed))
+    }
+}
+
+impl ListedPr {
+    /// Whether any reported review approves the current head commit.
+    pub fn approved_at_head(&self) -> bool {
+        self.reviews
+            .iter()
+            .chain(self.latest_reviews.iter())
+            .any(|review| review.approves(&self.head))
+    }
 }
 
 impl Hosting {
@@ -199,12 +267,23 @@ impl Hosting {
 
     /// Open pull requests targeting `base`, optionally only those with `label`, in one batched
     /// list call (charged one request per hundred results requested).
+    ///
+    /// With `include_reviews`, the same single list call also asks for
+    /// `reviews,latestReviews`: the request count and budget charge are
+    /// unchanged (still one charged request per hundred results), only the
+    /// payload grows. There is never a per-pull-request review call.
     pub fn list_open(
         &self,
         base: &str,
         label: Option<&str>,
         limit: u32,
+        include_reviews: bool,
     ) -> Result<Vec<ListedPr>, String> {
+        let fields = if include_reviews {
+            "number,headRefOid,isDraft,title,author,labels,reviews,latestReviews"
+        } else {
+            "number,headRefOid,isDraft,title,author,labels"
+        };
         let mut args: Vec<String> = [
             "pr",
             "list",
@@ -217,7 +296,7 @@ impl Hosting {
             "--limit",
             &limit.to_string(),
             "--json",
-            "number,headRefOid,isDraft,title,author,labels",
+            fields,
         ]
         .iter()
         .map(|s| (*s).to_owned())
@@ -252,6 +331,38 @@ impl Hosting {
 mod unit {
     use super::*;
     use crate::git::testrepo::TempDir;
+
+    #[test]
+    fn approval_at_head_reads_reviews_in_gh_and_flat_shapes() {
+        let head = "a".repeat(40);
+        let old = "b".repeat(40);
+        let parse = |text: String| -> ListedPr { serde_json::from_str(&text).unwrap() };
+        // gh shape: reviews[].commit.oid is populated at the head.
+        let pr = parse(format!(
+            r#"{{"number":1,"headRefOid":"{head}","reviews":[{{"state":"APPROVED","commit":{{"oid":"{head}"}},"author":{{"login":"reviewer-fictional"}}}}]}}"#
+        ));
+        assert!(pr.approved_at_head());
+        // A stale approval (review on the old head) does not count.
+        let pr = parse(format!(
+            r#"{{"number":1,"headRefOid":"{head}","reviews":[{{"state":"APPROVED","commit":{{"oid":"{old}"}}}}]}}"#
+        ));
+        assert!(!pr.approved_at_head());
+        // Non-approving states at the head do not count.
+        for state in ["CHANGES_REQUESTED", "COMMENTED", "DISMISSED", "PENDING"] {
+            let pr = parse(format!(
+                r#"{{"number":1,"headRefOid":"{head}","reviews":[{{"state":"{state}","commit":{{"oid":"{head}"}}}}]}}"#
+            ));
+            assert!(!pr.approved_at_head(), "{state}");
+        }
+        // Flat REST shape: commit_id, APPROVING spelling.
+        let pr = parse(format!(
+            r#"{{"number":1,"headRefOid":"{head}","reviews":[{{"state":"APPROVING","commit_id":"{head}"}}]}}"#
+        ));
+        assert!(pr.approved_at_head());
+        // No reviews at all: not approved.
+        let pr = parse(format!(r#"{{"number":1,"headRefOid":"{head}"}}"#));
+        assert!(!pr.approved_at_head());
+    }
 
     #[test]
     fn budget_refuses_past_the_hourly_limit_and_recovers() {

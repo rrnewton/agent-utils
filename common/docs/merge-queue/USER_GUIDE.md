@@ -104,6 +104,8 @@ This command creates the state directory and writes `config.json`.
 | `--api-per-hour N` | `0` (= 60) | API requests this queue may make per rolling hour. See "Ready sources and the request budget". |
 | `--api-budget-file PATH` | state directory | Budget file to share with every other queue on the host, so they all draw on one hourly allowance. |
 | `--anonymous-fetch` | off | Fetch without credentials (public repositories). Credential helpers are disabled for fetches, so a fetch never spends a credential use. |
+| `--require-approval-at-head` | off | For `sync --label`/`sync --all-open`: a pull request counts as ready only with an approving review at its current head commit. Reviews are read in the same batched list call (no extra API requests). An unapproved change is not submitted; a queued change whose head moves without a fresh approval at the new head is withdrawn and its submitter (the author) notified. Resubmission with an approval at the new head re-queues it. Ready-file sources are unaffected. |
+| `--require-approval-at-head` | off | For `sync --label`/`sync --all-open`: a pull request counts as ready only with an approving review at its current head commit. Reviews are read in the same batched list call (no extra API requests). An unapproved change is not submitted; a queued change whose head moves without a fresh approval at the new head is withdrawn and its submitter (the author) notified. Resubmission with an approval at the new head re-queues it. Ready-file sources are unaffected. |
 | `--close-prs` | off | After landing, close each landed pull request with a comment naming the landed commit. Uses the budget; a close it cannot make now is retried by `sync`. |
 | `--agentctl WORD` | `agentctl` | Command (and leading arguments) the `serve` daemon runs instead of `agentctl` for state-change notifications. Repeatable. |
 | `--net-wrapper WORD` | none | A command prefix for network Git operations, for example `--net-wrapper with-proxy`. Repeat it for a prefix of several words. |
@@ -166,6 +168,16 @@ Reconcile the queue with a ready source. Exactly one of these is required:
 `sync` submits new changes and changes whose head or priority moved, with one fetch for all of
 them. It withdraws only changes that this same source added and no longer lists. A change you
 submitted directly is never withdrawn by a source. Draft pull requests are never ready.
+With `require_approval_at_head` (off by default), the batched list call also carries reviews:
+only a pull request with an approving review whose reviewed commit is its current head counts
+as ready. The report's `unapproved` field names the rest; a queued one is withdrawn (its
+submitter is notified through the withdrawn notification) instead of resubmitted, and a later
+sync listing it with an approval at its new head re-queues it.
+With `require_approval_at_head` (off by default), the batched list call also carries reviews:
+only a pull request with an approving review whose reviewed commit is its current head counts
+as ready. The report's `unapproved` field names the rest; a queued one is withdrawn (its
+submitter is notified through the withdrawn notification) instead of resubmitted, and a later
+sync listing it with an approval at its new head re-queues it.
 Priorities come from labels such as `p10` or `priority-10`, the landing planner's convention;
 lower lands first, and the default is 100. When `--close-prs` is set, `sync` also retries closes
 that were postponed. Exit status is 1 if any submission was refused.
@@ -527,6 +539,8 @@ An **item record** (`items/<pr>.json`) has these fields:
 | `regenerate` | empty | `{paths, command, when}`; see "Generated files". |
 | `exact_sha` | `false` | The exact-commit rule. |
 | `trust_base` | `false` | Skip probing the base in culprit searches. |
+| `require_approval_at_head` | `false` | Approval-at-head rule for GitHub ready sources; see `--require-approval-at-head`. |
+| `require_approval_at_head` | `false` | Approval-at-head rule for GitHub ready sources; see `--require-approval-at-head`. |
 | `classify` | `[]` | `[{pattern, class}]` failure classes; see `--classify`. |
 | `peers` | `{}` | Peer queue name to state directory. |
 | `identity` | empty | `{name, email}` for commits the queue creates. |

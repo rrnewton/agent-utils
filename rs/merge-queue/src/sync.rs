@@ -5,6 +5,11 @@
 //! batched fetch for all of them), withdraws the changes this same source added that it no longer
 //! lists, and retries closing landed pull requests whose close the request budget postponed.
 //! Changes submitted directly with `submit` are never withdrawn by a source.
+//!
+//! With `require_approval_at_head`, a GitHub source's one batched list call also carries each
+//! pull request's reviews: a change counts as ready only with an approving review at its current
+//! head. An unapproved change is not submitted, and a queued change whose head no longer carries
+//! an approval is withdrawn (notifying its submitter through the withdrawn path).
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -54,6 +59,11 @@ pub struct SyncReport {
     pub unchanged: Vec<i64>,
     /// Changes withdrawn because this source no longer lists them.
     pub withdrawn: Vec<i64>,
+    /// Listed changes that are not ready under `require_approval_at_head`
+    /// (no approving review at the current head). They are not submitted;
+    /// a queued one is also withdrawn (and so appears in `withdrawn`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unapproved: Vec<i64>,
     /// Submissions refused, with the reason.
     pub refused: Vec<(i64, String)>,
     /// Landed pull requests closed now (postponed closes retried).
@@ -75,6 +85,10 @@ struct Entry {
     title: String,
     by: String,
     notify: String,
+    /// Whether an approving review at `head` was seen. Always true for
+    /// sources that carry no review data (ready files) and when the
+    /// approval rule is off, so those paths are unchanged.
+    approved_at_head: bool,
 }
 
 /// One parsed ready-file line: the change number and its `key=value` fields.
@@ -133,6 +147,7 @@ fn entries_from_file(path: &PathBuf) -> Result<Vec<Entry>, String> {
                 title: String::new(),
                 by: String::new(),
                 notify: String::new(),
+                approved_at_head: true,
             };
             for (key, value) in fields {
                 match key.as_str() {
@@ -191,22 +206,39 @@ pub fn sync(
                 _ => None,
             };
             let mut priorities = LabelPriority::new(DEFAULT_LABEL_PATTERN)?;
+            let require_approval = config.require_approval_at_head;
             hosting
-                .list_open(&config.base, label, limit)?
+                .list_open(&config.base, label, limit, require_approval)?
                 .into_iter()
                 .filter(|pr| !pr.draft)
                 .map(|pr| {
                     let labels: Vec<String> = pr.labels.iter().map(|l| l.name.clone()).collect();
+                    let author = pr
+                        .author
+                        .as_ref()
+                        .map(|a| a.login.clone())
+                        .unwrap_or_default();
+                    let approved_at_head = !require_approval || pr.approved_at_head();
                     Entry {
                         pr: pr.number,
                         head_ref: format!("refs/pull/{}/head", pr.number),
                         priority: priorities.priority(pr.number, &labels),
+                        // Reviews arrived in the same batched list call
+                        // above; no per-pull-request call is made here.
+                        approved_at_head,
                         head: pr.head,
                         after: Vec::new(),
                         solo: false,
                         title: pr.title,
-                        by: pr.author.map(|a| a.login).unwrap_or_default(),
-                        notify: String::new(),
+                        by: author.clone(),
+                        // Under the approval rule the author is the
+                        // submitter a withdrawal must notify, through the
+                        // existing withdrawn-notification path.
+                        notify: if require_approval {
+                            author
+                        } else {
+                            String::new()
+                        },
                     }
                 })
                 .collect()
@@ -216,8 +248,21 @@ pub fn sync(
     let items: BTreeMap<i64, _> = state.items()?.into_iter().map(|i| (i.pr, i)).collect();
     let listed: std::collections::BTreeSet<i64> = entries.iter().map(|e| e.pr).collect();
     let mut submissions = Vec::new();
+    let mut approval_withdraw: Vec<i64> = Vec::new();
     for entry in entries {
         let current = items.get(&entry.pr);
+        if config.require_approval_at_head && !entry.approved_at_head {
+            // Not ready: never submitted. A queued change whose head no
+            // longer carries an approval at its current head is withdrawn
+            // (through the existing withdrawn path, so its submitter is
+            // notified); resubmission with an approval at the new head
+            // re-queues it through the ordinary path below.
+            report.unapproved.push(entry.pr);
+            if current.is_some_and(|item| item.status == ItemStatus::Queued) {
+                approval_withdraw.push(entry.pr);
+            }
+            continue;
+        }
         let same = current.is_some_and(|item| {
             item.status == ItemStatus::Queued
                 && !entry.head.is_empty()
@@ -247,12 +292,18 @@ pub fn sync(
             requires: Vec::new(),
         });
     }
-    let withdraw: Vec<i64> = items
+    let mut withdraw: Vec<i64> = items
         .values()
         .filter(|item| item.status == ItemStatus::Queued && item.source == tag)
         .filter(|item| !listed.contains(&item.pr))
         .map(|item| item.pr)
         .collect();
+    for pr in &approval_withdraw {
+        if !withdraw.contains(pr) {
+            withdraw.push(*pr);
+        }
+    }
+    withdraw.sort_unstable();
     if dry_run {
         report.submitted = submissions.iter().map(|s| s.pr).collect();
         report.withdrawn = withdraw;
@@ -269,9 +320,27 @@ pub fn sync(
                 }
             }
         }
+        let approval_withdrawn = !approval_withdraw.is_empty();
         for pr in withdraw {
-            ops::withdraw(state, pr, &format!("{tag} no longer lists it"))?;
+            let why = if approval_withdraw.contains(&pr) {
+                format!("{tag}: no approving review at current head (require_approval_at_head)")
+            } else {
+                format!("{tag} no longer lists it")
+            };
+            ops::withdraw(state, pr, &why)?;
             report.withdrawn.push(pr);
+        }
+        if approval_withdrawn {
+            // Fire the existing withdrawn notification now rather than
+            // waiting for the daemon: `ops::withdraw` above set the
+            // withdrawn status the notify sweep derives its transition
+            // from, and the sweep dedups, so a later daemon cycle will
+            // not resend. Best-effort, as in `serve`: a failed send is
+            // recorded on the item and never fails the sync.
+            let notifier = crate::notify::Notifier::resolve(None, config);
+            if let Err(error) = crate::notify::sweep(state, config, &notifier) {
+                eprintln!("merge-queue sync: notification sweep failed: {error}");
+            }
         }
         if config.land.close_prs {
             if let Some(hosting) = &hosting {

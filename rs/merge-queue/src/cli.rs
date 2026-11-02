@@ -126,6 +126,13 @@ enum Command {
         /// Fetch without credentials (public repositories): no credential use per fetch.
         #[arg(long)]
         anonymous_fetch: bool,
+        /// Require an approving review at the current head for `sync --label` /
+        /// `sync --all-open` (reviews read in the same batched list call): an
+        /// unapproved change is not submitted, and a queued change whose head
+        /// moves without a fresh approval is withdrawn and its submitter
+        /// notified. Off by default.
+        #[arg(long)]
+        require_approval_at_head: bool,
         /// After landing, close each landed pull request with a pointer to the landed commit
         /// (budgeted; postponed closes are retried by `sync`).
         #[arg(long)]
@@ -574,6 +581,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             api_per_hour,
             api_budget_file,
             anonymous_fetch,
+            require_approval_at_head,
             close_prs,
             net_wrapper,
             validator,
@@ -617,6 +625,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                 },
                 exact_sha,
                 trust_base,
+                require_approval_at_head,
                 identity: IdentityConfig {
                     name: identity_name,
                     email: identity_email,
@@ -779,6 +788,9 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                 );
                 for (pr, why) in &report.refused {
                     println!("  refused #{pr}: {why}");
+                }
+                for pr in &report.unapproved {
+                    println!("  not ready #{pr}: no approving review at current head");
                 }
                 if !report.closed.is_empty() {
                     println!("  closed landed: {}", list(&report.closed));

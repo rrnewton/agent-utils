@@ -306,6 +306,13 @@ pub struct Config {
     /// queue lands on the base, always as exactly validated commits; a broken base would then
     /// be blamed on the first change of a red batch.
     pub trust_base: bool,
+    /// Approval-at-head rule for GitHub ready sources (`sync --label` /
+    /// `sync --all-open`): a pull request counts as ready only with an
+    /// approving review on its current head commit, read in the same batched
+    /// list call. Off by default; ready-file sources are unaffected (they
+    /// make no API call and carry no review data).
+    #[serde(default)]
+    pub require_approval_at_head: bool,
     /// Identity for commits the queue creates.
     pub identity: IdentityConfig,
     /// Failure classes: failed tests matching a rule's pattern are labelled with its class in
@@ -341,6 +348,7 @@ impl Default for Config {
             regenerate: RegenerateConfig::default(),
             exact_sha: false,
             trust_base: false,
+            require_approval_at_head: false,
             identity: IdentityConfig::default(),
             classify: Vec::new(),
             github: GitHubConfig::default(),
