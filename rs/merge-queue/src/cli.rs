@@ -11,7 +11,8 @@ use crate::ops::{self, Submission};
 use crate::plan::{render, short};
 use crate::run::{self, RunOptions, RunReport, Runner};
 use crate::state::{
-    Config, LandConfig, State, ValidatorConfig, DEFAULT_DEPTH, DEFAULT_MAX_BATCH, DEFAULT_PRIORITY,
+    Config, IdentityConfig, LandConfig, RegenerateConfig, State, ValidatorConfig, DEFAULT_DEPTH,
+    DEFAULT_MAX_BATCH, DEFAULT_PRIORITY,
 };
 use crate::tests::{parse_selection, ValidationClaim};
 
@@ -42,6 +43,8 @@ struct Cli {
     command: Command,
 }
 
+// `init` carries many flags; the enum is parsed once per process, so its size is irrelevant.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Create the state directory and write its config.json.
@@ -69,6 +72,27 @@ enum Command {
         /// Repeatable.
         #[arg(long, value_name = "PATTERN")]
         union_path: Vec<String>,
+        /// Generated-file path pattern the queue regenerates instead of treating its conflicts
+        /// as real (exact path, `dir/`, or `*` wildcards). Repeatable.
+        #[arg(long, value_name = "PATTERN")]
+        regen_path: Vec<String>,
+        /// Shell command, run at a checkout's root, that rewrites every generated file.
+        #[arg(long, default_value = "")]
+        regen_command: String,
+        /// When to regenerate: `conflict` (only when conflicts are confined to generated files)
+        /// or `always` (after every change).
+        #[arg(long, default_value = "conflict")]
+        regen_when: String,
+        /// Exact-commit rule: never carry a result to another commit; a tree lands only with
+        /// green coverage recorded at that exact commit.
+        #[arg(long)]
+        exact_sha: bool,
+        /// Name for commits the queue creates (default: Git's configuration).
+        #[arg(long, default_value = "")]
+        identity_name: String,
+        /// Email for commits the queue creates (default: Git's configuration).
+        #[arg(long, default_value = "")]
+        identity_email: String,
         /// Command prefix for network Git operations, e.g. `--net-wrapper with-proxy`.
         /// Repeat for multiple words.
         #[arg(long, value_name = "WORD", allow_hyphen_values = true)]
@@ -413,6 +437,12 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             depth,
             max_depth,
             union_path,
+            regen_path,
+            regen_command,
+            regen_when,
+            exact_sha,
+            identity_name,
+            identity_email,
             net_wrapper,
             validator,
             validator_run,
@@ -445,6 +475,16 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                 depth: depth.max(1),
                 max_depth,
                 union_paths: union_path,
+                regenerate: RegenerateConfig {
+                    paths: regen_path,
+                    command: regen_command,
+                    when: regen_when,
+                },
+                exact_sha,
+                identity: IdentityConfig {
+                    name: identity_name,
+                    email: identity_email,
+                },
                 validator: ValidatorConfig {
                     kind: validator,
                     list: String::new(),

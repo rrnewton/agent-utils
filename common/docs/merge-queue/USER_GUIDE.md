@@ -82,6 +82,11 @@ This command creates the state directory and writes `config.json`.
 | `--depth N` | `2` | The initial window (batches validating at the same time) and the number of concurrent probes during a culprit search (at least 1). |
 | `--max-depth N` | `0` | The largest the adaptive window may grow: +1 per landed batch, halved per red batch, never below 1. `0` keeps the window fixed at `--depth`. |
 | `--union-path PATTERN` | none | A Git attribute pattern merged with Git's `union` driver, when probing conflicts and when combining changes. Repeatable. Only for line-oriented, append-only files (see "Union merges"). |
+| `--regen-path PATTERN` | none | A generated file (exact path, `dir/`, or `*` wildcards) whose conflicts the queue resolves by regenerating it instead of holding the change. Repeatable. See "Generated files". |
+| `--regen-command CMD` | empty | Shell command, run at a checkout's root, that rewrites every generated file from its sources. Required with `--regen-path`. |
+| `--regen-when WHEN` | `conflict` | `conflict`: regenerate only when a change's conflicts are confined to generated files. `always`: also after every change, so a combination never leaves a generated file stale. |
+| `--exact-sha` | off | Exact-commit rule: never carry a validation result to another commit. See "The exact-commit rule". |
+| `--identity-name NAME`, `--identity-email EMAIL` | Git's configuration | Identity for commits the queue creates: committer of replayed commits, author and committer of merge and regeneration commits. |
 | `--net-wrapper WORD` | none | A command prefix for network Git operations, for example `--net-wrapper with-proxy`. Repeat it for a prefix of several words. |
 | `--validator KIND` | empty | `command` or `dagrun` (see "Validators"). `run` refuses to start without one. |
 | `--validator-run CMD` | empty | For `command`: the shell template that runs a selection. |
@@ -332,6 +337,9 @@ An **item record** (`items/<pr>.json`) has these fields:
 | `depth` | `2` | The initial window and the culprit-search probe width. |
 | `max_depth` | `0` | The largest adaptive window; `0` means fixed at `depth`. |
 | `union_paths` | `[]` | Attribute patterns merged with Git's union driver (see "Union merges"). |
+| `regenerate` | empty | `{paths, command, when}`; see "Generated files". |
+| `exact_sha` | `false` | The exact-commit rule. |
+| `identity` | empty | `{name, email}` for commits the queue creates. |
 | `validator` | empty | How validation runs; see below. |
 | `land` | `push` from `init` | How a validated candidate reaches the base; see below. |
 
@@ -511,6 +519,44 @@ The base moves only to a commit whose exact tree passed validation (the bors rul
    ejections) and everything behind it is rebuilt on the new base and validated again.
 9. **Obligations.** Every focused landing leaves an obligation until a green complete run
    (`widen`, or `run --widen`) covers that commit or a later one. A red complete run leaves it open.
+
+## Generated files
+
+Some repositories commit files generated from sources, such as a validation graph compiled to
+JSON or a static table compiled to code. Two changes that each regenerated such a file conflict
+on it, even when their sources combine cleanly. If those files cause most of a backlog's rebases,
+list them with `--regen-path` and give the command that rebuilds them with `--regen-command`.
+
+- **Planning.** A conflict confined to generated files is not a conflict. The plan batches those
+  changes together instead of holding all but one.
+- **Building.** When combining a change leaves conflicts only in generated files, the queue checks
+  the combination out in a scratch worktree, runs the command there, and commits the rewritten
+  files on top as `merge-queue: regenerate <paths> after #<pr>`, under `identity`. It does this
+  right after that change, so every prefix the culprit search might probe is consistent. With
+  `--regen-when always`, it also regenerates after every other change and commits only when a
+  generated file actually changed.
+- **Validation.** The candidate is then validated as usual. The commit that lands is the exact
+  validated commit, regeneration included.
+- **Refusals.** A change is ejected with kind `regeneration` when the command fails, when it
+  changes any file that is not generated, or when conflict markers remain afterwards.
+
+This is deterministic, not repair. The command must give the same output for the same sources.
+The run report lists every regeneration under `regenerated`.
+
+## The exact-commit rule
+
+With `--exact-sha`, no validation result is ever carried to a different commit:
+
+- A remainder left after an ejection reruns the batch's whole selection, not a delta.
+- Before any landing, the queue checks that it recorded green coverage of the claimed selection
+  at exactly the commit being landed. A rerun of failed tests at the same commit counts, which is
+  how flaky passes work. If it finds no such coverage, it refuses to land and stops.
+- A batch rebuilt because the base moved is validated again in full. It always was; the rule
+  makes that explicit.
+
+In rebase mode, a change whose head already sits on the base with linear history lands with its
+own commits, exactly as `git rebase` would leave it. So a change rebased onto the current base
+by its author lands with its own commit ID.
 
 ## Union merges
 

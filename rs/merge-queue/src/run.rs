@@ -146,6 +146,9 @@ pub struct RunReport {
     pub ejected: Vec<Ejection>,
     /// Changes returned to the queue for a later run (dependents of ejected changes).
     pub requeued: Vec<i64>,
+    /// Generated files regenerated on candidates.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub regenerated: Vec<Regeneration>,
     /// Batches that would have been validated (dry runs only).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub would_validate: Vec<WouldValidate>,
@@ -166,6 +169,19 @@ pub struct RunReport {
     pub windows: Vec<usize>,
     /// Changes landed per hour of wall time.
     pub prs_per_hour: f64,
+}
+
+/// One regeneration of generated files on a candidate.
+#[derive(Clone, Debug, Serialize)]
+pub struct Regeneration {
+    /// The change whose combination needed it.
+    pub pr: i64,
+    /// Generated paths that conflicted (empty when `regenerate.when` is `always`).
+    pub conflicted: Vec<String>,
+    /// Generated paths the command rewrote.
+    pub rewritten: Vec<String>,
+    /// The regeneration commit, or the unchanged tip when nothing was rewritten.
+    pub commit: String,
 }
 
 /// A batch a dry run would validate.
@@ -202,8 +218,9 @@ impl Candidate {
     }
 }
 
-/// Changes that did not combine onto a candidate, with their conflicting paths.
-type Uncombined = Vec<(i64, Vec<String>)>;
+/// Changes that did not combine onto a candidate: number, kind (`conflict` or
+/// `regeneration`), and detail.
+type Uncombined = Vec<(i64, &'static str, String)>;
 
 /// Outcome of handling one batch.
 enum BatchOutcome {
@@ -519,6 +536,7 @@ impl<'a> Runner<'a> {
         let mut prefixes = Vec::new();
         let mut conflicts = Vec::new();
         let mut held = Vec::new();
+        let regen = self.config.regenerate.clone();
         for pr in prs {
             if skipped.contains(pr) {
                 continue;
@@ -535,20 +553,38 @@ impl<'a> Runner<'a> {
             let mut exclude: Vec<&str> = kept.iter().map(|p| items[p].head.as_str()).collect();
             exclude.extend(exclude_heads.iter().map(String::as_str));
             let message = format!("Merge #{pr} ({})", item.head_ref);
-            match self
-                .git
-                .combine(self.config.combine, &tip, &item.head, &exclude, &message)?
-            {
-                Combined::Clean(next) => {
-                    tip = next;
-                    kept.push(*pr);
-                    prefixes.push(tip.clone());
-                }
+            let combined = self.git.combine_with(
+                self.config.combine,
+                &tip,
+                &item.head,
+                &exclude,
+                &message,
+                &|path| regen.covers(path),
+            )?;
+            let (next, conflicted) = match combined {
+                Combined::Clean(next) => (next, Vec::new()),
+                Combined::NeedsRegen(next, paths) => (next, paths),
                 Combined::Conflict(paths) => {
                     skipped.insert(*pr);
-                    conflicts.push((*pr, paths));
+                    conflicts.push((*pr, "conflict", paths.join(", ")));
+                    continue;
                 }
-            }
+            };
+            let next = if !conflicted.is_empty() || (regen.enabled() && regen.always()) {
+                match self.regenerate(&next, *pr, &conflicted)? {
+                    Ok(regenerated) => regenerated,
+                    Err(why) => {
+                        skipped.insert(*pr);
+                        conflicts.push((*pr, "regeneration", why));
+                        continue;
+                    }
+                }
+            } else {
+                next
+            };
+            tip = next;
+            kept.push(*pr);
+            prefixes.push(tip.clone());
         }
         self.requeue(&held, "a dependency did not combine");
         Ok((
@@ -562,6 +598,187 @@ impl<'a> Runner<'a> {
         ))
     }
 
+    /// Rewrite the generated files on `tip` (which just combined `pr`) with the configured
+    /// command and commit the result. `Ok(Err(why))` means this change cannot be regenerated.
+    fn regenerate(
+        &self,
+        tip: &str,
+        pr: i64,
+        conflicted: &[String],
+    ) -> Result<Result<String, String>, String> {
+        let regen = &self.config.regenerate;
+        if !regen.enabled() {
+            return Ok(Err(
+                "generated files conflict but no regeneration is configured".into(),
+            ));
+        }
+        let slot = self.slots.take();
+        let result = (|| -> Result<Result<String, String>, String> {
+            let checkout = self.slots.checkout(slot, tip)?;
+            let output = Command::new("sh")
+                .arg("-c")
+                .arg(&regen.command)
+                .current_dir(&checkout)
+                .env("MQ_PR", pr.to_string())
+                .env("MQ_REGEN_PATHS", regen.paths.join(" "))
+                .env("MQ_CONFLICTED", conflicted.join(" "))
+                .stdin(std::process::Stdio::null())
+                .output()
+                .map_err(|error| format!("cannot run regenerate.command: {error}"))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let tail: Vec<&str> = stderr.lines().rev().take(3).collect();
+                return Ok(Err(format!(
+                    "regenerate.command failed (exit {}): {}",
+                    output.status.code().unwrap_or(-1),
+                    tail.into_iter().rev().collect::<Vec<_>>().join(" | ")
+                )));
+            }
+            let mut wt = Git::new(&checkout);
+            wt.identity = self.git.identity.clone();
+            let mut changed: Vec<String> = wt
+                .run(&["diff", "--name-only", "--no-renames", "HEAD"])?
+                .lines()
+                .chain(
+                    wt.run(&["ls-files", "--others", "--exclude-standard"])?
+                        .lines(),
+                )
+                .filter(|line| !line.is_empty())
+                .map(str::to_owned)
+                .collect();
+            changed.sort();
+            changed.dedup();
+            let stray: Vec<&String> = changed.iter().filter(|path| !regen.covers(path)).collect();
+            if !stray.is_empty() {
+                return Ok(Err(format!(
+                    "regenerate.command changed files that are not generated: {}",
+                    stray
+                        .iter()
+                        .map(|p| p.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+            for path in conflicted.iter().chain(&changed) {
+                let text = std::fs::read_to_string(checkout.join(path)).unwrap_or_default();
+                if text
+                    .lines()
+                    .any(|line| line.starts_with("<<<<<<< ") || line.starts_with(">>>>>>> "))
+                {
+                    return Ok(Err(format!(
+                        "conflict markers remain in {path} after regeneration"
+                    )));
+                }
+            }
+            let commit = if changed.is_empty() {
+                tip.to_owned()
+            } else {
+                let mut add = vec!["add", "-A", "--"];
+                add.extend(changed.iter().map(String::as_str));
+                wt.run(&add)?;
+                let message = format!("merge-queue: regenerate {} after #{pr}", changed.join(", "));
+                let mut command = Command::new("git");
+                command.arg("-C").arg(&checkout).args([
+                    "commit",
+                    "-q",
+                    "--no-verify",
+                    "-m",
+                    &message,
+                ]);
+                if let Some((name, email)) = &self.git.identity {
+                    command
+                        .env("GIT_AUTHOR_NAME", name)
+                        .env("GIT_AUTHOR_EMAIL", email)
+                        .env("GIT_COMMITTER_NAME", name)
+                        .env("GIT_COMMITTER_EMAIL", email);
+                }
+                let committed = command
+                    .output()
+                    .map_err(|error| format!("cannot commit regenerated files: {error}"))?;
+                if !committed.status.success() {
+                    return Err(format!(
+                        "cannot commit regenerated files: {}",
+                        String::from_utf8_lossy(&committed.stderr).trim()
+                    ));
+                }
+                wt.rev_parse("HEAD")?
+            };
+            self.event(
+                "regenerate",
+                &format!(
+                    "#{pr}: {} at {}{}",
+                    if changed.is_empty() {
+                        "generated files already current".to_owned()
+                    } else {
+                        format!("rewrote {}", changed.join(", "))
+                    },
+                    short(&commit),
+                    if conflicted.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (conflicted: {})", conflicted.join(", "))
+                    }
+                ),
+            );
+            lock(&self.report).regenerated.push(Regeneration {
+                pr,
+                conflicted: conflicted.to_vec(),
+                rewritten: changed,
+                commit: commit.clone(),
+            });
+            Ok(Ok(commit))
+        })();
+        self.slots.give(slot);
+        result
+    }
+
+    /// Whether green results recorded at exactly `commit` cover `selection`: every selected test
+    /// passed in the latest run at that commit that selected it, and an `all` selection needs a
+    /// complete run there whose failures were all rerun green there.
+    fn covered(&self, commit: &str, selection: &Selection) -> bool {
+        let report = lock(&self.report);
+        let runs = report
+            .validations
+            .iter()
+            .filter(|v| v.commit == commit && !v.cancelled);
+        let mut complete = false;
+        let mut failing: BTreeSet<TestId> = BTreeSet::new();
+        let mut passed: BTreeSet<TestId> = BTreeSet::new();
+        for run in runs {
+            let unattributed = run.failed.iter().any(|t| t.step == UNATTRIBUTED);
+            if run.selection.is_all() {
+                complete = true;
+                failing = run.failed.iter().cloned().collect();
+                passed.clear();
+                continue;
+            }
+            for test in run.selection.tests().into_iter().flatten() {
+                if unattributed
+                    || run
+                        .failed
+                        .iter()
+                        .any(|f| f == test || f.step == test.step && test.case.is_none())
+                {
+                    failing.insert(test.clone());
+                    passed.remove(test);
+                } else {
+                    failing
+                        .retain(|f| !(f == test || (test.case.is_none() && f.step == test.step)));
+                    passed.insert(test.clone());
+                }
+            }
+        }
+        match selection {
+            Selection::All => complete && failing.is_empty(),
+            Selection::Tests(tests) => tests.iter().all(|test| {
+                passed
+                    .iter()
+                    .any(|p| p == test || (p.case.is_none() && p.step == test.step))
+                    || (complete && !failing.iter().any(|f| f.step == test.step))
+            }),
+        }
+    }
+
     /// Build, then eject whatever did not combine (and set its dependents aside).
     fn build_and_eject(
         &self,
@@ -570,14 +787,19 @@ impl<'a> Runner<'a> {
         pending: &mut VecDeque<Vec<i64>>,
         context: &str,
     ) -> Result<Candidate, String> {
-        let (candidate, conflicts) = self.build(parent, prs)?;
-        for (pr, paths) in conflicts {
-            let reason = format!(
-                "does not combine onto {}{context}: conflicts on {}; rebase and resubmit",
-                short(parent),
-                paths.join(", ")
-            );
-            self.eject(pr, "conflict", &reason, &[])?;
+        let (candidate, rejected) = self.build(parent, prs)?;
+        for (pr, kind, detail) in rejected {
+            let reason = match kind {
+                "conflict" => format!(
+                    "does not combine onto {}{context}: conflicts on {detail}; rebase and resubmit",
+                    short(parent)
+                ),
+                _ => format!(
+                    "generated files could not be regenerated onto {}{context}: {detail}",
+                    short(parent)
+                ),
+            };
+            self.eject(pr, kind, &reason, &[])?;
             self.drop_dependents(pr, pending);
         }
         Ok(candidate)
@@ -1064,6 +1286,16 @@ impl<'a> Runner<'a> {
         validations: Vec<usize>,
         flaky: BTreeSet<TestId>,
     ) -> Result<BatchOutcome, String> {
+        if self.config.exact_sha && !self.covered(&candidate.tip, &claim.selection) {
+            return Ok(BatchOutcome::Stop(
+                format!(
+                    "exact-commit rule: {} has no green coverage of {} recorded at that exact commit; refusing to land",
+                    short(&candidate.tip),
+                    claim.selection.summary()
+                ),
+                candidate.prs.clone(),
+            ));
+        }
         if self.simulating() {
             {
                 let mut simulated = lock(&self.simulated);
@@ -1300,31 +1532,49 @@ impl<'a> Runner<'a> {
                         return Ok(BatchOutcome::Done);
                     }
                     // Delta revalidation: the failed tests, the tests not yet seen passing, and
-                    // whatever the removed change touched, within what the batch selected.
-                    let delta = focus
-                        .union(&affected)
-                        .intersect(&chosen.selection)
-                        .union(&focus)
-                        .union(&Selection::of(unproven.iter().cloned()));
+                    // whatever the removed change touched, within what the batch selected. Under
+                    // the exact-commit rule nothing carries over: the remainder reruns it all.
+                    let exact = self.config.exact_sha;
+                    let delta = if exact {
+                        chosen.selection.clone()
+                    } else {
+                        focus
+                            .union(&affected)
+                            .intersect(&chosen.selection)
+                            .union(&focus)
+                            .union(&Selection::of(unproven.iter().cloned()))
+                    };
                     let (rid, rran) = self
                         .validate_all(vec![Job {
                             purpose: "remainder",
                             prs: rebuilt.prs.clone(),
                             commit: rebuilt.tip.clone(),
                             selection: delta.clone(),
-                            policy: format!("delta-after-eject({})", chosen.policy),
+                            policy: if exact {
+                                chosen.policy.clone()
+                            } else {
+                                format!("delta-after-eject({})", chosen.policy)
+                            },
                         }])
                         .pop()
                         .ok_or("no remainder result")??;
                     validations.push(rid);
                     if rran.green() {
-                        // The tree differs from the batch's validated tree only by the removed
-                        // change; tests outside the delta are carried forward under the policy.
-                        let claim = ValidationClaim {
-                            selection: chosen.selection.clone(),
-                            policy: format!("carried-forward+delta({})", chosen.policy),
-                            scope: Scope::Focused,
-                            commit: rebuilt.tip.clone(),
+                        let claim = if exact {
+                            ValidationClaim::new(
+                                chosen.selection.clone(),
+                                chosen.policy.clone(),
+                                rebuilt.tip.clone(),
+                            )
+                        } else {
+                            // The tree differs from the batch's validated tree only by the
+                            // removed change; tests outside the delta are carried forward.
+                            ValidationClaim {
+                                selection: chosen.selection.clone(),
+                                policy: format!("carried-forward+delta({})", chosen.policy),
+                                scope: Scope::Focused,
+                                commit: rebuilt.tip.clone(),
+                            }
                         };
                         return self.land(&rebuilt, claim, validations, flaky);
                     }
@@ -1347,7 +1597,7 @@ impl<'a> Runner<'a> {
                         Selection::of(seen_failed.iter().cloned())
                     };
                     current = rebuilt;
-                    carried = true;
+                    carried = !self.config.exact_sha;
                 }
             }
         }
@@ -1632,6 +1882,26 @@ pub fn render_report(report: &RunReport) -> String {
             out.push_str(&format!("; {}", landed.note));
         }
         out.push('\n');
+    }
+    if !report.regenerated.is_empty() {
+        out.push_str("\n## Regenerated\n\n");
+        for regen in &report.regenerated {
+            out.push_str(&format!(
+                "- #{}: {} at `{}`{}\n",
+                regen.pr,
+                if regen.rewritten.is_empty() {
+                    "already current".to_owned()
+                } else {
+                    regen.rewritten.join(", ")
+                },
+                short(&regen.commit),
+                if regen.conflicted.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (conflicted: {})", regen.conflicted.join(", "))
+                }
+            ));
+        }
     }
     if !report.ejected.is_empty() {
         out.push_str("\n## Ejected\n\n");

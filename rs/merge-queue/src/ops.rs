@@ -22,6 +22,9 @@ pub fn head_ref(pr: i64) -> String {
 pub fn repo(state: &State, config: &Config) -> Result<Git, String> {
     let mut git = Git::new(&config.repo);
     git.net_wrapper = config.net_wrapper.clone();
+    if !config.identity.name.is_empty() && !config.identity.email.is_empty() {
+        git.identity = Some((config.identity.name.clone(), config.identity.email.clone()));
+    }
     if !config.union_paths.is_empty() {
         let path = state.root.join("union.attributes");
         let text: String = config
@@ -211,7 +214,8 @@ pub fn plan(state: &State, config: &Config, max_batch: usize) -> Result<Plan, St
         .collect();
     let git = repo(state, config)?;
     let (base_sha, current) = refresh(&git, config, &heads)?;
-    let probe = probe(&git, &base_sha, &current)?;
+    let regenerate = config.regenerate.clone();
+    let probe = probe(&git, &base_sha, &current, &|path| regenerate.covers(path))?;
     Ok(make_plan(
         &items,
         &config.base,

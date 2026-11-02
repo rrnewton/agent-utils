@@ -37,6 +37,17 @@ pub enum Combined {
     Clean(String),
     /// Textual conflict on these paths.
     Conflict(Vec<String>),
+    /// Combined, but these regenerable paths still hold conflict markers: the tip must be
+    /// regenerated before anything validates it.
+    NeedsRegen(String, Vec<String>),
+}
+
+/// Paths the caller can regenerate, so conflicts in them do not block a combination.
+pub type Regenerable<'a> = &'a dyn Fn(&str) -> bool;
+
+/// Nothing is regenerable.
+pub fn nothing_regenerable(_: &str) -> bool {
+    false
 }
 
 /// A Git repository driven through the `git` executable.
@@ -49,6 +60,9 @@ pub struct Git {
     /// `-c key=value` settings applied to every invocation (for example a union-merge
     /// attributes file).
     pub settings: Vec<String>,
+    /// Name and email for commits the queue creates (committer of replayed commits, author and
+    /// committer of merge and regeneration commits). `None` uses Git's own configuration.
+    pub identity: Option<(String, String)>,
 }
 
 impl Git {
@@ -58,6 +72,7 @@ impl Git {
             dir: dir.into(),
             net_wrapper: Vec::new(),
             settings: Vec::new(),
+            identity: None,
         }
     }
 
@@ -68,6 +83,11 @@ impl Git {
             command.arg("-c").arg(setting);
         }
         command.args(args);
+        if let Some((name, email)) = &self.identity {
+            command
+                .env("GIT_COMMITTER_NAME", name)
+                .env("GIT_COMMITTER_EMAIL", email);
+        }
         command
     }
 
@@ -155,17 +175,19 @@ impl Git {
     pub fn merge_conflicts(&self, left: &str, right: &str) -> Result<Vec<String>, String> {
         match self.merge_tree(left, right, None)? {
             Ok(_) => Ok(Vec::new()),
-            Err(paths) => Ok(paths),
+            Err((_, paths)) => Ok(paths),
         }
     }
 
-    /// `git merge-tree --write-tree`: `Ok(tree)` when clean, `Err(paths)` on conflict.
+    /// `git merge-tree --write-tree`: `Ok(tree)` when clean, `Err((tree, paths))` on conflict,
+    /// where `tree` holds the conflicted files with conflict markers.
+    #[allow(clippy::type_complexity)]
     fn merge_tree(
         &self,
         left: &str,
         right: &str,
         merge_base: Option<&str>,
-    ) -> Result<Result<String, Vec<String>>, String> {
+    ) -> Result<Result<String, (String, Vec<String>)>, String> {
         let base_arg = merge_base.map(|base| format!("--merge-base={base}"));
         let mut args = vec!["merge-tree", "--write-tree", "--name-only", "--no-messages"];
         if let Some(arg) = &base_arg {
@@ -184,7 +206,7 @@ impl Git {
             .filter(|line| !line.is_empty())
             .map(str::to_owned)
             .collect();
-        Ok(Err(paths.into_iter().collect()))
+        Ok(Err((tree, paths.into_iter().collect())))
     }
 
     /// Files changed from the merge base of `base` and `head` through `head`.
@@ -277,6 +299,10 @@ impl Git {
                 .env("GIT_AUTHOR_NAME", name)
                 .env("GIT_AUTHOR_EMAIL", email)
                 .env("GIT_AUTHOR_DATE", date);
+        } else if let Some((name, email)) = &self.identity {
+            command
+                .env("GIT_AUTHOR_NAME", name)
+                .env("GIT_AUTHOR_EMAIL", email);
         }
         let output = self.output(command, "git commit-tree", &[0])?;
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
@@ -284,9 +310,30 @@ impl Git {
 
     /// Replay `commit` onto `onto` without a working tree (a plumbing cherry-pick).
     pub fn cherry_pick(&self, onto: &str, commit: &str) -> Result<Combined, String> {
+        self.cherry_pick_with(onto, commit, &nothing_regenerable)
+    }
+
+    /// Replay `commit` onto `onto`; conflicts confined to regenerable paths are committed with
+    /// their markers and reported as [`Combined::NeedsRegen`].
+    pub fn cherry_pick_with(
+        &self,
+        onto: &str,
+        commit: &str,
+        regenerable: Regenerable<'_>,
+    ) -> Result<Combined, String> {
         let parent = format!("{commit}^");
         match self.merge_tree(onto, commit, Some(&parent))? {
-            Err(paths) => Ok(Combined::Conflict(paths)),
+            Err((tree, paths)) if paths.iter().all(|path| regenerable(path)) => {
+                let (name, email, date, message) = self.commit_meta(commit)?;
+                let new = self.commit_tree(
+                    &tree,
+                    &[onto],
+                    message.trim_end(),
+                    Some((&name, &email, &date)),
+                )?;
+                Ok(Combined::NeedsRegen(new, paths))
+            }
+            Err((_, paths)) => Ok(Combined::Conflict(paths)),
             Ok(tree) => {
                 // Like `git rebase`, drop a commit whose change the target already has.
                 if tree == self.tree_of(onto)? {
@@ -310,9 +357,47 @@ impl Git {
         exclude: &[&str],
         merge_message: &str,
     ) -> Result<Combined, String> {
+        self.combine_with(
+            mode,
+            onto,
+            head,
+            exclude,
+            merge_message,
+            &nothing_regenerable,
+        )
+    }
+
+    /// Whether `head` already sits on `onto` with linear history, so a rebase would change
+    /// nothing and the change can land with its own commit IDs (a fast-forward).
+    pub fn fast_forwards(&self, onto: &str, head: &str) -> Result<bool, String> {
+        if !self.is_ancestor(onto, head)? {
+            return Ok(false);
+        }
+        let range = format!("{onto}..{head}");
+        Ok(self.run(&["rev-list", "--merges", &range])?.is_empty())
+    }
+
+    /// [`Git::combine`], letting conflicts confined to regenerable paths through as
+    /// [`Combined::NeedsRegen`]. In rebase mode a change already on `onto` with linear history
+    /// keeps its own commits, as `git rebase` would.
+    pub fn combine_with(
+        &self,
+        mode: CombineMode,
+        onto: &str,
+        head: &str,
+        exclude: &[&str],
+        merge_message: &str,
+        regenerable: Regenerable<'_>,
+    ) -> Result<Combined, String> {
         match mode {
             CombineMode::Merge => match self.merge_tree(onto, head, None)? {
-                Err(paths) => Ok(Combined::Conflict(paths)),
+                Err((tree, paths)) if paths.iter().all(|path| regenerable(path)) => {
+                    Ok(Combined::NeedsRegen(
+                        self.commit_tree(&tree, &[onto, head], merge_message, None)?,
+                        paths,
+                    ))
+                }
+                Err((_, paths)) => Ok(Combined::Conflict(paths)),
                 Ok(tree) => Ok(Combined::Clean(self.commit_tree(
                     &tree,
                     &[onto, head],
@@ -321,16 +406,28 @@ impl Git {
                 )?)),
             },
             CombineMode::Rebase => {
+                if self.fast_forwards(onto, head)? {
+                    return Ok(Combined::Clean(head.to_owned()));
+                }
                 let mut excluded: Vec<&str> = exclude.to_vec();
                 excluded.push(onto);
                 let mut tip = onto.to_owned();
+                let mut stale: BTreeSet<String> = BTreeSet::new();
                 for commit in self.own_commits(head, &excluded)? {
-                    match self.cherry_pick(&tip, &commit)? {
+                    match self.cherry_pick_with(&tip, &commit, regenerable)? {
                         Combined::Clean(next) => tip = next,
+                        Combined::NeedsRegen(next, paths) => {
+                            tip = next;
+                            stale.extend(paths);
+                        }
                         conflict @ Combined::Conflict(_) => return Ok(conflict),
                     }
                 }
-                Ok(Combined::Clean(tip))
+                if stale.is_empty() {
+                    Ok(Combined::Clean(tip))
+                } else {
+                    Ok(Combined::NeedsRegen(tip, stale.into_iter().collect()))
+                }
             }
         }
     }
@@ -528,6 +625,63 @@ mod unit {
     fn git_add_commit(dir: &std::path::Path) {
         super::testrepo::git(dir, &["add", "-A"]);
         super::testrepo::git(dir, &["commit", "-q", "-m", "more"]);
+    }
+
+    #[test]
+    fn rebase_keeps_a_change_already_on_the_base() {
+        let tmp = TempDir::new("git-ff");
+        let git = init(&tmp.0);
+        let base = git.rev_parse("main").unwrap();
+        let a = branch(&tmp.0, "a", "main", &[("a.txt", "a\n")]);
+        assert_eq!(
+            git.combine(CombineMode::Rebase, &base, &a, &[], "")
+                .unwrap(),
+            Combined::Clean(a.clone())
+        );
+        // On top of another change it must be replayed (new commit IDs).
+        let b = branch(&tmp.0, "b", "main", &[("b.txt", "b\n")]);
+        let Combined::Clean(tip) = git.combine(CombineMode::Rebase, &a, &b, &[], "").unwrap()
+        else {
+            panic!("b applies onto a");
+        };
+        assert_ne!(tip, b);
+        assert!(git.is_ancestor(&a, &tip).unwrap());
+    }
+
+    #[test]
+    fn conflicts_in_regenerable_paths_pass_through_with_markers() {
+        let tmp = TempDir::new("git-regen");
+        let git = init(&tmp.0);
+        write(&tmp.0, "gen.json", "v0\n");
+        git_add_commit(&tmp.0);
+        let a = branch(
+            &tmp.0,
+            "a",
+            "main",
+            &[("gen.json", "va\n"), ("a.src", "a\n")],
+        );
+        let b = branch(
+            &tmp.0,
+            "b",
+            "main",
+            &[("gen.json", "vb\n"), ("b.src", "b\n")],
+        );
+        let regen = |path: &str| path == "gen.json";
+        let Combined::NeedsRegen(tip, paths) = git
+            .combine_with(CombineMode::Rebase, &a, &b, &[], "", &regen)
+            .unwrap()
+        else {
+            panic!("conflict confined to gen.json should pass through");
+        };
+        assert_eq!(paths, vec!["gen.json".to_owned()]);
+        let text = git.run(&["show", &format!("{tip}:gen.json")]).unwrap();
+        assert!(text.contains("<<<<<<<"), "{text}");
+        assert!(git.run(&["show", &format!("{tip}:b.src")]).is_ok());
+        // Without the regenerable list it is an ordinary conflict.
+        assert_eq!(
+            git.combine(CombineMode::Rebase, &a, &b, &[], "").unwrap(),
+            Combined::Conflict(vec!["gen.json".to_owned()])
+        );
     }
 
     #[test]

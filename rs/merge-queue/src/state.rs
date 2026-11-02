@@ -77,6 +77,77 @@ pub struct LandConfig {
     pub allow_batches: bool,
 }
 
+/// Generated files the queue regenerates instead of treating their conflicts as real.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RegenerateConfig {
+    /// Path patterns of generated files: an exact path, a directory ending in `/`, or a pattern
+    /// with `*` wildcards (matching any characters, `/` included).
+    pub paths: Vec<String>,
+    /// Shell command, run at the repository root of a checkout, that rewrites every generated
+    /// file from its sources. It must be deterministic and touch nothing else.
+    pub command: String,
+    /// `conflict` (default): regenerate only when a change's conflicts are confined to generated
+    /// paths. `always`: also regenerate after every change, so combined changes never leave a
+    /// generated file stale.
+    pub when: String,
+}
+
+impl RegenerateConfig {
+    /// Whether regeneration is configured.
+    pub fn enabled(&self) -> bool {
+        !self.paths.is_empty() && !self.command.trim().is_empty()
+    }
+
+    /// Whether `path` is a generated file.
+    pub fn covers(&self, path: &str) -> bool {
+        self.enabled() && self.paths.iter().any(|pattern| path_matches(pattern, path))
+    }
+
+    /// Whether to regenerate after every change, not only after a generated-file conflict.
+    pub fn always(&self) -> bool {
+        self.when == "always"
+    }
+}
+
+/// Match a path against a pattern: exact, directory prefix (`dir/`), or `*` wildcards.
+pub fn path_matches(pattern: &str, path: &str) -> bool {
+    if let Some(dir) = pattern.strip_suffix('/') {
+        return path.starts_with(&format!("{dir}/"));
+    }
+    if !pattern.contains('*') {
+        return pattern == path;
+    }
+    let parts: Vec<&str> = pattern.split('*').collect();
+    let mut rest = path;
+    for (i, part) in parts.iter().enumerate() {
+        if i == 0 {
+            match rest.strip_prefix(part) {
+                Some(after) => rest = after,
+                None => return false,
+            }
+        } else if i == parts.len() - 1 {
+            return rest.ends_with(part);
+        } else {
+            match rest.find(part) {
+                Some(at) => rest = &rest[at + part.len()..],
+                None => return false,
+            }
+        }
+    }
+    rest.is_empty()
+}
+
+/// Identity for commits the queue creates.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct IdentityConfig {
+    /// Name; empty uses Git's own configuration.
+    pub name: String,
+    /// Email; empty uses Git's own configuration.
+    pub email: String,
+}
+
 /// Queue configuration stored in `config.json`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -105,6 +176,14 @@ pub struct Config {
     /// probing conflicts. Only for line-oriented, append-only files; validation still checks the
     /// result.
     pub union_paths: Vec<String>,
+    /// Generated files regenerated on the candidate instead of blocking it.
+    pub regenerate: RegenerateConfig,
+    /// Exact-commit rule: never carry a validation result to a different commit. A remainder
+    /// after an ejection reruns the batch's whole selection, and a tree lands only with green
+    /// coverage of its selection recorded at that exact commit.
+    pub exact_sha: bool,
+    /// Identity for commits the queue creates.
+    pub identity: IdentityConfig,
     /// Validation configuration.
     pub validator: ValidatorConfig,
     /// Landing configuration.
@@ -124,6 +203,9 @@ impl Default for Config {
             depth: DEFAULT_DEPTH,
             max_depth: 0,
             union_paths: Vec::new(),
+            regenerate: RegenerateConfig::default(),
+            exact_sha: false,
+            identity: IdentityConfig::default(),
             validator: ValidatorConfig::default(),
             land: LandConfig::default(),
         }

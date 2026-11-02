@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use pr_landing_planner::graph::connected_components;
 use pr_landing_planner::model::ConflictEdge;
 
-use crate::git::Git;
+use crate::git::{Git, Regenerable};
 use crate::model::{
     now, Conflict, Held, Item, ItemStatus, Plan, PlannedBatch, PlannedItem, PLAN_SCHEMA,
 };
@@ -37,11 +37,20 @@ pub struct Probe {
 }
 
 /// Probe the base and queued heads. `heads` maps each queued change to its current head.
+/// Conflicts confined to `regenerable` paths are not conflicts: the queue regenerates them.
 pub fn probe(
     git: &Git,
     base_sha: &str,
     heads: &BTreeMap<i64, Option<String>>,
+    regenerable: Regenerable<'_>,
 ) -> Result<Probe, String> {
+    let real = |paths: Vec<String>| -> Vec<String> {
+        if paths.iter().all(|path| regenerable(path)) {
+            Vec::new()
+        } else {
+            paths
+        }
+    };
     let mut probe = Probe {
         heads: heads.clone(),
         ..Probe::default()
@@ -52,7 +61,7 @@ pub fn probe(
         .collect();
     for (pr, head) in &live {
         probe.files.insert(*pr, git.changed_files(base_sha, head)?);
-        let paths = git.merge_conflicts(base_sha, head)?;
+        let paths = real(git.merge_conflicts(base_sha, head)?);
         if !paths.is_empty() {
             probe.base_conflicts.insert(*pr, paths);
         }
@@ -73,7 +82,7 @@ pub fn probe(
             // Disjoint file sets cannot conflict textually; skip the probe.
             let disjoint = probe.files[a].is_disjoint(&probe.files[b]);
             if !disjoint {
-                let paths = git.merge_conflicts(head_a, head_b)?;
+                let paths = real(git.merge_conflicts(head_a, head_b)?);
                 if !paths.is_empty() {
                     probe.conflicts.push(Conflict {
                         a: (*a).min(*b),
@@ -585,7 +594,10 @@ mod unit {
         let c = branch(&tmp.0, "c", "main", &[("shared.txt", "1\n2\nC\n")]);
         let d = branch(&tmp.0, "d", "a", &[("d.txt", "d\n")]);
         let heads = [(1, Some(a)), (2, Some(b)), (3, Some(c)), (4, Some(d))].into();
-        let probe = probe(&git, &base, &heads).unwrap();
+        let probe = probe(&git, &base, &heads, &crate::git::nothing_regenerable).unwrap();
+        let regen = |path: &str| path == "shared.txt";
+        let lenient = super::probe(&git, &base, &heads, &regen).unwrap();
+        assert!(lenient.conflicts.is_empty());
         // a/b conflict on the same line; c touches another hunk of the same file (clean);
         // d is stacked on a, and so conflicts with b too.
         let pairs: Vec<_> = probe.conflicts.iter().map(|c| (c.a, c.b)).collect();
