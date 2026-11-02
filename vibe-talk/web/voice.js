@@ -35122,7 +35122,7 @@ function channelLabel(channelId) {
 // server that predates it answers 404, and the connection details say that only the channel on
 // screen is read out.
 
-/** Bumped on every start and stop of the stream of every channel, as `liveGeneration` is. */
+/** Bumped on every start and stop of the stream of every channel, as the channel stream's is (`liveFollow`). */
 const watchAllGeneration = createStreamGeneration();
 /** The cursor of the last event it delivered, sent back as `Last-Event-ID` on a reconnect. */
 let watchAllLastEventId = null;
@@ -35165,7 +35165,10 @@ function stopWatchAll() {
   watchAllLastEventId = null;
 }
 
-/** Read the stream of every channel, and keep reading it, as `followChannel` does one channel's. */
+/**
+ * Read the stream of every channel, and keep reading it, as `liveFollow` does one channel's
+ * (web/src/core/sync/follow.ts `followChannel`).
+ */
 async function followWatchAll(generation) {
   while (generation === watchAllGeneration.current()) {
     let ended = "dropped";
