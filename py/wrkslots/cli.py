@@ -897,6 +897,9 @@ _AUDIT_CACHE_KEY_BYTES = 32
 _AUDIT_CACHE_STATE_BYTES_LIMIT = 64 * 1024 * 1024
 _AUDIT_CACHE_WORK_LIMIT = 100_000
 _AUDIT_CACHE_WALL_SECONDS = 5.0
+# Total cache-glob planning time per audit, across every subject (audit plans under the shared
+# state lock, and writers default to not waiting for it).
+_AUDIT_CACHE_PLAN_TOTAL_SECONDS = 30.0
 
 
 class Refusal(RuntimeError):
@@ -28766,45 +28769,51 @@ def _expired_unhanded_candidates(
         key = (record.machine, record.slot, record.generation)
         if key in exclude:
             continue
-        base = {
-            "machine": record.machine,
-            "slot": record.slot,
-            "generation": record.generation,
-            "agent": record.agent,
-        }
+        def classified(
+            classification: str, reason: str, record: ActiveRecord = record
+        ) -> _ExpiredRetirementCandidate:
+            return _ExpiredRetirementCandidate(
+                machine=record.machine,
+                slot=record.slot,
+                generation=record.generation,
+                agent=record.agent,
+                classification=classification,
+                reason=reason,
+            )
+
         _age, expired = _heartbeat_diagnosis(record)
         if not expired:
             continue
         hold = holds.get(record.slot)
         # An unreadable hold ({} sentinel) still holds: _retirement_candidates
         # treats a present-but-unreadable hold the same way.
-        if record.slot in holds:
+        if hold is not None:
             reason = (
                 f"slot is held: {hold.get('reason')}"
                 if isinstance(hold.get("reason"), str) and str(hold.get("reason")).strip()
                 else "slot is held: hold record is unreadable"
             )
             results.append(
-                _ExpiredRetirementCandidate(**base, classification="retained", reason=reason)
+                classified(
+                        "retained",
+                        reason)
             )
             continue
         owner_state, owner_detail = _process_state(record.owner)
         owner_absent = _owner_record_is_absent(record)
         if owner_state == "live":
             results.append(
-                _ExpiredRetirementCandidate(
-                    **base,
-                    classification="retained",
-                    reason=f"recorded owner is live: {owner_detail}",
+                classified(
+                        "retained",
+                        f"recorded owner is live: {owner_detail}",
                 )
             )
             continue
         if owner_state != "dead" and not owner_absent:
             results.append(
-                _ExpiredRetirementCandidate(
-                    **base,
-                    classification="retained",
-                    reason=f"recorded owner is {owner_state}: {owner_detail}",
+                classified(
+                        "retained",
+                        f"recorded owner is {owner_state}: {owner_detail}",
                 )
             )
             continue
@@ -28819,8 +28828,9 @@ def _expired_unhanded_candidates(
             raise
         except Refusal as exc:
             results.append(
-                _ExpiredRetirementCandidate(
-                    **base, classification="retained", reason=str(exc)
+                classified(
+                        "retained",
+                        str(exc)
                 )
             )
             continue
@@ -28828,10 +28838,9 @@ def _expired_unhanded_candidates(
             latest = _latest_handoff_read(record, events)
             if latest is None or not _handoff_read_matches_artifact(latest, artifact):
                 results.append(
-                    _ExpiredRetirementCandidate(
-                        **base,
-                        classification="action",
-                        reason=(
+                    classified(
+                        "action",
+                        (
                             f"slot {record.slot} contains an unread handoff artifact; "
                             f"run 'wrkslots read-handoff {record.slot} "
                             "--coordinator-authorized --coordinator-pid "
@@ -28845,10 +28854,9 @@ def _expired_unhanded_candidates(
             # candidate either; ordinary remove still re-proves it.
             if not latest.retirement_enqueued:
                 results.append(
-                    _ExpiredRetirementCandidate(
-                        **base,
-                        classification="action",
-                        reason=(
+                    classified(
+                        "action",
+                        (
                             f"slot {record.slot}'s handoff was read but not queued "
                             f"for retirement; retire it with 'wrkslots remove "
                             f"{record.slot} --coordinator-pid "
@@ -28862,27 +28870,24 @@ def _expired_unhanded_candidates(
         answer = _registered_liveness_answer(config, record)
         if answer.state == "dead":
             results.append(
-                _ExpiredRetirementCandidate(
-                    **base,
-                    classification="attemptable",
-                    reason="heartbeat expired, owner proven dead or absent, "
+                classified(
+                        "attemptable",
+                        "heartbeat expired, owner proven dead or absent, "
                     "registered liveness reports dead, and no handoff artifact",
                 )
             )
         elif answer.state == "alive":
             results.append(
-                _ExpiredRetirementCandidate(
-                    **base,
-                    classification="retained",
-                    reason=f"liveness is alive: {answer.detail}",
+                classified(
+                        "retained",
+                        f"liveness is alive: {answer.detail}",
                 )
             )
         elif answer.unregistered and owner_state == "dead" and not owner_absent:
             results.append(
-                _ExpiredRetirementCandidate(
-                    **base,
-                    classification="action",
-                    reason=(
+                classified(
+                        "action",
+                        (
                         f"agent {record.agent} has no registered liveness record "
                         "and its recorded owner generation is proven dead; retire "
                         f"with a single-slot 'wrkslots remove {record.slot} "
@@ -28895,10 +28900,9 @@ def _expired_unhanded_candidates(
             )
         else:
             results.append(
-                _ExpiredRetirementCandidate(
-                    **base,
-                    classification="retained",
-                    reason=f"liveness is unverifiable: {answer.detail}",
+                classified(
+                        "retained",
+                        f"liveness is unverifiable: {answer.detail}",
                 )
             )
     return tuple(results)
@@ -29150,22 +29154,22 @@ def _cmd_retire_pending(args: argparse.Namespace) -> int:
                 for candidate in pending
             },
         )
-        for candidate in expired:
-            entry = {
-                "machine": candidate.machine,
-                "slot": candidate.slot,
-                "generation": candidate.generation,
-                "agent": candidate.agent,
+        for derived in expired:
+            entry: dict[str, object] = {
+                "machine": derived.machine,
+                "slot": derived.slot,
+                "generation": derived.generation,
+                "agent": derived.agent,
             }
-            if candidate.classification == "attemptable":
-                expired_attemptable.append(candidate)
-            elif candidate.classification == "action":
+            if derived.classification == "attemptable":
+                expired_attemptable.append(derived)
+            elif derived.classification == "action":
                 actions.append(
-                    {**entry, "outcome": "action", "reason": candidate.reason}
+                    {**entry, "outcome": "action", "reason": derived.reason}
                 )
             else:
                 retained.append(
-                    {**entry, "outcome": "retained", "reason": candidate.reason}
+                    {**entry, "outcome": "retained", "reason": derived.reason}
                 )
     # A blocked candidate (a hold, a live recorded owner, a missing or
     # drifted handoff artifact) is never attempted: it is reported retained
@@ -29336,18 +29340,18 @@ def _cmd_retire_pending(args: argparse.Namespace) -> int:
                 }
                 for candidate in expired_attemptable[remaining_limit:]
             )
-            for expired_index, candidate in enumerate(expired_selected):
+            for expired_index, derived in enumerate(expired_selected):
                 identity = {
-                    "machine": candidate.machine,
-                    "slot": candidate.slot,
-                    "generation": candidate.generation,
-                    "agent": candidate.agent,
+                    "machine": derived.machine,
+                    "slot": derived.slot,
+                    "generation": derived.generation,
+                    "agent": derived.agent,
                 }
                 remove_values = dict(vars(args))
                 remove_values.update(
                     wait_lock=_remaining_lock_wait(deadline),
-                    slot=candidate.slot,
-                    expected_generation=candidate.generation,
+                    slot=derived.slot,
+                    expected_generation=derived.generation,
                     validate_complete=False,
                     validation_proof_manifest=None,
                     completed_record=None,
@@ -29537,9 +29541,19 @@ class _CachePlanBudget:
     seconds: float
     wall_seconds: float
     spent: float = 0.0
+    #: The audit's total planning allowance, when it, not this subject's own
+    #: wall allowance, set ``seconds``.
+    total_seconds: float = math.inf
 
     def check(self, walking: float = 0.0) -> None:
         if self.spent + walking >= self.seconds:
+            if self.seconds < self.wall_seconds and math.isfinite(self.total_seconds):
+                raise _CachePlanExhausted(
+                    "cache planning exhausted the audit's total planning allowance of "
+                    f"{self.total_seconds:g} seconds before this subject's fixed wall "
+                    f"allowance of {self.wall_seconds:g} seconds; no cache total can be "
+                    "published within this allowance"
+                )
             raise _CachePlanExhausted(
                 "cache planning exhausted this subject's fixed wall allowance of "
                 f"{self.wall_seconds:g} seconds; no cache total can be published "
@@ -34783,6 +34797,11 @@ def _cmd_audit(args: argparse.Namespace) -> int:
         raise Refusal("--cache-work-limit must be positive")
     if not (math.isfinite(args.cache_wall_seconds) and args.cache_wall_seconds > 0):
         raise Refusal("--cache-wall-seconds must be finite and positive")
+    plan_total_seconds = float(
+        getattr(args, "cache_plan_total_seconds", _AUDIT_CACHE_PLAN_TOTAL_SECONDS)
+    )
+    if not (math.isfinite(plan_total_seconds) and plan_total_seconds > 0):
+        raise Refusal("--cache-plan-total-seconds must be finite and positive")
     config = _load_config(args.project_root, args.machine)
     metrics = _AuditMetrics()
     with _locked(config.control / "ACTIVE", exclusive=False, wait_seconds=args.wait_lock):
@@ -34939,16 +34958,21 @@ def _cmd_audit(args: argparse.Namespace) -> int:
         # peers exist, and only a walk that exceeds it reports
         # _CachePlanExhausted. Total planning wall time is bounded by
         # subjects * allowance, which the caller accepted by choosing the
-        # per-subject allowance; the shared state lock is held that long.
+        # per-subject allowance -- and by --cache-plan-total-seconds across
+        # every subject, because the shared state lock is held while planning
+        # and writers default to not waiting for it. A subject that starts
+        # after the total is spent gets only what is left, and reports that.
         plan_started = metrics.start()
         plan_work = _AuditWorkBudget(args.cache_work_limit)
+        plan_total_left = plan_total_seconds
         plan_exhausted = 0
         for position, (subject, target) in enumerate(plan_targets):
             remaining_subjects = len(plan_targets) - position
             share = _CachePlanBudget(
                 _AuditWorkBudget(plan_work.remaining // remaining_subjects),
+                min(args.cache_wall_seconds, plan_total_left),
                 args.cache_wall_seconds,
-                args.cache_wall_seconds,
+                total_seconds=plan_total_seconds,
             )
             try:
                 cache_planned[subject] = (
@@ -34966,6 +34990,7 @@ def _cmd_audit(args: argparse.Namespace) -> int:
                     for cache in cache_planned[subject]
                 )
             plan_work.consumed += share.work.consumed
+            plan_total_left = max(0.0, plan_total_left - share.spent)
         metrics.finish(
             "cache-planning",
             plan_started,
@@ -61784,6 +61809,19 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "observations and state I/O; unfinished work is null/partial, "
             "a planning or full finalization timeout is null/error "
             f"(default: {_AUDIT_CACHE_WALL_SECONDS:g})"
+        ),
+    )
+    audit.add_argument(
+        "--cache-plan-total-seconds",
+        type=float,
+        default=_AUDIT_CACHE_PLAN_TOTAL_SECONDS,
+        metavar="SECONDS",
+        help=(
+            "total time cache-glob planning may spend walking directories across every "
+            "subject; a subject that starts after it is spent gets only what is left and "
+            "reports a cache error naming this allowance. Audit plans under the shared "
+            "state lock, so this bounds how long planning holds it "
+            f"(default: {_AUDIT_CACHE_PLAN_TOTAL_SECONDS:g})"
         ),
     )
     audit.add_argument(

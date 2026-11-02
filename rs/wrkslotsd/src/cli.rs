@@ -211,6 +211,9 @@ pub(crate) enum Command {
         /// Cache traversal wall budget in seconds for this invocation
         #[arg(long, value_name = "SECONDS", default_value_t = 5.0)]
         cache_wall_seconds: f64,
+        /// Total cache-glob planning time in seconds across every subject (audit plans under the shared state lock)
+        #[arg(long, value_name = "SECONDS", default_value_t = 30.0)]
+        cache_plan_total_seconds: f64,
         /// Exit non-zero on attention (1) or unknown (2) slots
         #[arg(long)]
         gate: bool,
@@ -284,6 +287,9 @@ pub(crate) enum Command {
         /// Cache traversal wall budget in seconds for this invocation
         #[arg(long, value_name = "SECONDS", default_value_t = 5.0)]
         cache_wall_seconds: f64,
+        /// Total cache-glob planning time in seconds across every subject (audit plans under the shared state lock)
+        #[arg(long, value_name = "SECONDS", default_value_t = 30.0)]
+        cache_plan_total_seconds: f64,
     },
     /// Diagnose unpublished or stale-after-rebase HEADs for every checkout on the selected machine
     Unpushed {
@@ -1357,6 +1363,7 @@ pub fn run() -> u8 {
             cache_census_state,
             cache_work_limit,
             cache_wall_seconds,
+            cache_plan_total_seconds,
             gate,
             format,
         } => match crate::audit_state::audit_cli(
@@ -1366,6 +1373,7 @@ pub fn run() -> u8 {
                 state: cache_census_state,
                 work_limit: cache_work_limit,
                 wall_seconds: cache_wall_seconds,
+                plan_total_seconds: cache_plan_total_seconds,
             },
             gate,
             format == "human",
@@ -1435,6 +1443,7 @@ pub fn run() -> u8 {
             cache_census_state,
             cache_work_limit,
             cache_wall_seconds,
+            cache_plan_total_seconds,
         } => {
             match crate::audit_state::parse_audit(
                 root.as_deref(),
@@ -1443,6 +1452,7 @@ pub fn run() -> u8 {
                     state: cache_census_state,
                     work_limit: cache_work_limit,
                     wall_seconds: cache_wall_seconds,
+                    plan_total_seconds: cache_plan_total_seconds,
                 },
             ) {
                 Ok(value) => {

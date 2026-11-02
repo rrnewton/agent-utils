@@ -458,7 +458,8 @@ def test_planning_shares_divide_what_earlier_subjects_left(
 
     monkeypatch.setattr(cli, "_cache_slot_directories", spy)
     result = _run_audit(
-        config, tmp_path, "--cache-work-limit", "1000", "--cache-wall-seconds", "1000"
+        config, tmp_path, "--cache-work-limit", "1000", "--cache-wall-seconds", "1000",
+        "--cache-plan-total-seconds", "5000",
     )
 
     assert result == 0, capsys.readouterr().err
@@ -474,6 +475,45 @@ def test_planning_shares_divide_what_earlier_subjects_left(
     assert deep_before == cheap_before == 0.0
     assert 0.0 < deep_spent < 1000.0
     assert deep_used == 203
+
+
+def test_planning_total_bounds_every_subject_and_says_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Audit plans under the shared state lock, so total planning time is capped
+    # across subjects; once it is spent a subject gets only what is left, and
+    # its error names the total rather than its own allowance.
+    config, _deep_cache, _cheap_cache = _planning_audit(tmp_path, monkeypatch)
+
+    result = _run_audit(
+        config, tmp_path, "--cache-wall-seconds", "1000",
+        "--cache-plan-total-seconds", "0.000001",
+    )
+
+    output = capsys.readouterr()
+    assert result == 0, output.err
+    rows = {row["slot"]: row for row in json.loads(output.out)["slots"]}
+    for slot in ("a-deep", "b-cheap"):
+        assert rows[slot]["cache_status"] == "error", rows[slot]
+        assert rows[slot]["cache_error"] == (
+            "cache planning exhausted the audit's total planning allowance of 1e-06 "
+            "seconds before this subject's fixed wall allowance of 1000 seconds; no "
+            "cache total can be published within this allowance"
+        )
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "inf", "nan"])
+def test_planning_total_must_be_finite_and_positive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str], value: str,
+) -> None:
+    config, _deep_cache, _cheap_cache = _planning_audit(tmp_path, monkeypatch)
+
+    result = _run_audit(config, tmp_path, "--cache-plan-total-seconds", value)
+
+    assert result != 0
+    assert "--cache-plan-total-seconds must be finite and positive" in capsys.readouterr().err
 
 
 def test_slow_planning_walk_gets_full_wall_allowance_not_a_divided_share(

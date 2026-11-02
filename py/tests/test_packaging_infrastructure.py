@@ -849,6 +849,10 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # two cases of the stubbed one are mapped and the real-process one is
     # ordinary.
     # The retained-handle size test is mapped.
+    # The five retire-pending --include-expired-unhanded tests (a dead owner
+    # retired without a handoff, an unread handoff skipped with an action, live
+    # and unverifiable liveness retained, a held slot retained, and an
+    # attestable unregistered agent reported as an action) are mapped.
     # Of the eight batch-of-one remove tests, the image-backed one is ordinary
     # and the other seven are mapped.
     # The two image-backed remove-agent-batch use-check tests are ordinary.
@@ -980,9 +984,9 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # whose gitdir still names the pre-rename worktree) is mapped.
     # The two later-schema frozen COULD_NOT_RUN cases of 47aa56e7 (service-result
     # schemas 6 and 7) are ordinary.
-    assert len(all_tests) == 2121
+    assert len(all_tests) == 2126
     assert len(ordinary) == 339
-    assert len(mapped) == 1782
+    assert len(mapped) == 1787
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {

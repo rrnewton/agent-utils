@@ -170,11 +170,13 @@ def _python(
     work_limit: int = 100000,
     state_name: str = "census-state.json",
     wall_seconds: float = 60.0,
+    plan_total_seconds: float = 30.0,
 ) -> dict[str, object]:
     args = argparse.Namespace(
         project_root=str(root), machine=None, format="json", gate=False,
         cache_census_state=str(tmp_path / state_name),
         cache_work_limit=work_limit, cache_wall_seconds=wall_seconds,
+        cache_plan_total_seconds=plan_total_seconds,
         wait_lock=0.0,
     )
     stream = io.StringIO()
@@ -190,6 +192,7 @@ def _rust(
     census_state: Path | None = None,
     work_limit: int | None = None,
     wall_seconds: float = 60.0,
+    plan_total_seconds: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
     command = [str(rust_wrkslotsd()), "parse-audit", "--root", str(root)]
     if census_state is not None:
@@ -199,6 +202,8 @@ def _rust(
             "--cache-work-limit", str(work_limit),
             "--cache-wall-seconds", str(wall_seconds),
         ]
+    if plan_total_seconds is not None:
+        command += ["--cache-plan-total-seconds", str(plan_total_seconds)]
     return subprocess.run(
         command,
         cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900,
@@ -680,6 +685,33 @@ def test_audit_census_wall_timeout_matches_python(tmp_path: Path) -> None:
     row = _rows(python_payload)[0]
     assert row["cache_status"] == "error"
     assert "fixed wall allowance" in str(row["cache_error"])
+
+
+def test_audit_planning_total_matches_python(tmp_path: Path) -> None:
+    # The audit-wide planning total, not the subject's own wall allowance, runs
+    # out: both editions spell that exhaustion the same way.
+    root = _cache_fixture(tmp_path)
+    python_payload: dict[str, object] = {}
+    rust_payload: dict[str, object] = {}
+    for attempt in range(5):
+        python_payload = _python(
+            root, tmp_path, plan_total_seconds=0.000001,
+            state_name=f"census-state-{attempt}.json",
+        )
+        rust_result = _rust(
+            root, census_state=tmp_path / f"rust-census-{attempt}.json",
+            work_limit=100000, plan_total_seconds=0.000001,
+        )
+        assert rust_result.returncode == 0, rust_result.stderr
+        rust_payload = json.loads(rust_result.stdout)
+        if _scrub(rust_payload) == _scrub(python_payload):
+            break
+        time.sleep(1.0)
+    assert _scrub(rust_payload) == _scrub(python_payload)
+    row = _rows(python_payload)[0]
+    assert row["cache_status"] == "error"
+    assert "total planning allowance of 1e-06 seconds before this subject's fixed wall " \
+        "allowance of 60 seconds" in str(row["cache_error"])
 
 
 def test_audit_census_flat_cache_small_limit_matches_python(tmp_path: Path) -> None:

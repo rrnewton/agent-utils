@@ -307,6 +307,9 @@ pub struct CensusRequest {
     pub state: Option<String>,
     pub work_limit: i64,
     pub wall_seconds: f64,
+    /// Total cache-glob planning time across every subject
+    /// (`--cache-plan-total-seconds`).
+    pub plan_total_seconds: f64,
 }
 
 /// One planned cache directory, mirroring the Python
@@ -552,12 +555,22 @@ struct PlanBudget {
     work_consumed: i64,
     seconds: f64,
     wall_total: f64,
+    plan_total: f64,
     spent: f64,
 }
 
 impl PlanBudget {
     fn check(&self, walking: f64) -> Result<()> {
         if self.spent + walking >= self.seconds {
+            if self.seconds < self.wall_total && self.plan_total.is_finite() {
+                return Err(format!(
+                    "cache planning exhausted the audit's total planning allowance of {} \
+                     seconds before this subject's fixed wall allowance of {} seconds; \
+                     no cache total can be published within this allowance",
+                    fmt_g(self.plan_total),
+                    fmt_g(self.wall_total)
+                ));
+            }
             return Err(format!(
                 "cache planning exhausted this subject's fixed wall allowance of {} \
                  seconds; no cache total can be published within this allowance",
@@ -5994,21 +6007,28 @@ pub(crate) fn parse_audit(
     let mut census_subjects: Vec<CensusSubject> = Vec::new();
     let mut unregistered_subjects: BTreeMap<(String, String), usize> = BTreeMap::new();
     let mut journal_subjects: BTreeMap<String, usize> = BTreeMap::new();
+    if !census.plan_total_seconds.is_finite() || census.plan_total_seconds <= 0.0 {
+        return Err("--cache-plan-total-seconds must be finite and positive".to_string());
+    }
     let mut plan_work_consumed: i64 = 0;
     // Work divides what earlier subjects left; wall does not: each
     // subject gets the full allowance, so a slow-but-completing walk
-    // is not starved by the number of subjects (as the oracle does).
-    let make_budget = |position: usize, consumed: i64| PlanBudget {
+    // is not starved by the number of subjects, but no subject gets
+    // more than the audit's planning total has left (as the oracle).
+    let mut plan_total_left = census.plan_total_seconds;
+    let make_budget = |position: usize, consumed: i64, total_left: f64| PlanBudget {
         work_limit: (census.work_limit - consumed) / (target_count - position) as i64,
         work_consumed: 0,
-        seconds: census.wall_seconds,
+        seconds: census.wall_seconds.min(total_left),
+        plan_total: census.plan_total_seconds,
         wall_total: census.wall_seconds,
         spent: 0.0,
     };
     for (position, record) in records.iter().enumerate() {
-        let mut budget = make_budget(position, plan_work_consumed);
+        let mut budget = make_budget(position, plan_work_consumed, plan_total_left);
         let (roots, error) = cache_roots(&cfg, &config, record, &mut budget, &plan_mounts);
         plan_work_consumed += budget.work_consumed;
+        plan_total_left = (plan_total_left - budget.spent).max(0.0);
         let machine = record
             .get("machine")
             .and_then(Value::as_str)
@@ -6029,7 +6049,7 @@ pub(crate) fn parse_audit(
     }
     for (offset, action) in target_actions.iter().enumerate() {
         let position = records.len() + offset;
-        let mut budget = make_budget(position, plan_work_consumed);
+        let mut budget = make_budget(position, plan_work_consumed, plan_total_left);
         match action {
             TargetAction::Unregistered(slot_type, slot) => {
                 let subject_key = format!("unregistered:{slot_type}:{slot}");
@@ -6042,6 +6062,7 @@ pub(crate) fn parse_audit(
                     &plan_mounts,
                 );
                 plan_work_consumed += budget.work_consumed;
+                plan_total_left = (plan_total_left - budget.spent).max(0.0);
                 unregistered_subjects
                     .insert((slot_type.clone(), slot.clone()), census_subjects.len());
                 census_subjects.push(subject);
@@ -6058,6 +6079,7 @@ pub(crate) fn parse_audit(
                     &plan_mounts,
                 );
                 plan_work_consumed += budget.work_consumed;
+                plan_total_left = (plan_total_left - budget.spent).max(0.0);
                 journal_subjects.insert(slot.clone(), census_subjects.len());
                 census_subjects.push(subject);
             }

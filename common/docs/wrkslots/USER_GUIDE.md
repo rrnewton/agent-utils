@@ -260,11 +260,15 @@ cache binding and traversal phase, not the end-to-end audit: registry reading, b
 state decoding/authentication, and persistence occur outside that allowance.
 The same two values separately bound cache-glob planning, which expands each subject's
 cache globs before the census: every directory listing is one work unit, and the time
-spent walking is charged. Each subject may use an equal share of what earlier subjects
-left, so with many subjects a share can be small. Git observations made while planning
+spent walking is charged. Each subject may use an equal share of the work units earlier
+subjects left, and the full `--cache-wall-seconds` of walking time for itself, so a large
+fleet does not starve a slow-but-completing walk. `--cache-plan-total-seconds` (default 30
+seconds) bounds planning time across all subjects, because audit plans while holding the
+shared state lock and writers do not wait for it by default; a subject that starts after
+that total is spent gets only what is left. Git observations made while planning
 are not charged. The planning time bound is checked between directory listings, not
 enforced by a worker, so a listing that blocks is not interrupted. A subject whose
-planning exhausts its share reports `cache_status: "error"` with null bytes; its
+planning exhausts its allowance reports `cache_status: "error"` with null bytes; its
 retained census progress is not carried forward. A checkout whose ignored tree needs
 more listings than its share reports that error on every audit at the same limits.
 Root binding and traversal run in isolated workers with the remaining deadline
