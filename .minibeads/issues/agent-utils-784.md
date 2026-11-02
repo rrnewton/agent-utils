@@ -2,6 +2,7 @@
 title: 'chat-settle-uncertain: an operator command to settle a delivery_uncertain chat request'
 status: open
 priority: 2
+assignee: mu-restore2@devbig030
 issue_type: feature
 labels:
 - agentctl

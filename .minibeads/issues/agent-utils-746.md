@@ -2,7 +2,7 @@
 title: 'restore-im-back: deterministic I''m-back summary and catch-up prompts after a restore'
 status: open
 priority: 1
-assignee: mu-restore@devbig030
+assignee: mu-restore2@devbig030
 issue_type: feature
 labels:
 - agentctl
