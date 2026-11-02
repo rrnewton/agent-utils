@@ -46,6 +46,47 @@ test("`#624 voice-page-modularity`: a place's key ignores where a thread came fr
   assert.equal(placeIsOver({ screen: "settings", channel: "C1", under: null, from: null, entry: null }), true);
 });
 
+test("`#624 voice-page-modularity`: the visits note a new place after the one the reader is at, drop what was ahead, and start afresh on another channel", () => {
+  const visits = NAVIGATION.createVisits();
+  const place = (fields) => ({ screen: "main", channel: "C1", layout: "one", view: "main", thread: null, origin: null, side: null, ...fields });
+  assert.deepStrictEqual(visits.position(), { at: -1, length: 0 });
+  visits.note(null);
+  assert.deepStrictEqual(visits.position(), { at: -1, length: 0 }, "no place (the call's view) is noted as none");
+  visits.note(place({}));
+  visits.note(place({ view: "flat" }));
+  visits.note(place({ view: "flat" }));
+  assert.deepStrictEqual(visits.position(), { at: 1, length: 2 }, "the same place twice is noted once");
+  const shown = [];
+  const go = (to) => { shown.push(to.view); visits.note(to); };
+  assert.equal(visits.walk(-1, NAVIGATION.visitKey(place({ view: "flat" })), () => true, go), true);
+  assert.deepStrictEqual(shown, ["main"]);
+  assert.equal(visits.arriving(), false, "arriving holds only while the walk shows the place");
+  assert.deepStrictEqual(visits.position(), { at: 0, length: 2 }, "a place landed on by a walk is noted as none");
+  visits.note(place({ layout: "list", view: null }));
+  assert.deepStrictEqual(visits.position(), { at: 1, length: 2 }, "a new place drops the places ahead");
+  visits.note(place({ channel: "C2" }));
+  assert.deepStrictEqual(visits.position(), { at: 0, length: 1 }, "another channel starts afresh");
+});
+
+test("`#624 voice-page-modularity`: a close onto the place before is a step back, a walk passes what cannot be shown and where the reader is, and the visits keep PLACES_KEPT", () => {
+  const { createVisits, visitKey, PLACES_KEPT } = NAVIGATION;
+  const place = (fields) => ({ screen: "main", channel: "C1", layout: "one", view: "main", thread: null, origin: null, side: null, ...fields });
+  const visits = createVisits();
+  visits.note(place({}));
+  visits.note(place({ layout: "list", view: null }));
+  visits.note(place({}));
+  assert.deepStrictEqual(visits.position(), { at: 0, length: 2 }, "the list closing onto Main is a step back, the list kept ahead");
+  const arrivals = [];
+  const go = (to) => { arrivals.push([to.layout, visits.arriving()]); visits.note(to); };
+  assert.equal(visits.walk(1, visitKey(place({})), (to) => to.layout !== "list", go), false, "nothing showable ahead");
+  assert.equal(visits.walk(-1, visitKey(place({})), () => true, go), false, "nothing behind");
+  assert.equal(visits.walk(1, visitKey(place({})), () => true, go), true);
+  assert.deepStrictEqual(arrivals, [["list", true]]);
+  const long = createVisits();
+  for (let at = 0; at < PLACES_KEPT + 5; at += 1) long.note(place({ view: "thread", thread: `T${at}`, origin: "main" }));
+  assert.deepStrictEqual(long.position(), { at: PLACES_KEPT - 1, length: PLACES_KEPT });
+});
+
 test("`#624 voice-page-modularity`: a place reads back from the query it writes, and a bad escape or an absurd value says nothing", () => {
   const { deepLinkParams, deepLinkPart, deepLinkQuery, DEEP_LINK_VIEWS } = NAVIGATION;
   const ref = { provider: "slack", channel: "C 1", message: "M1", thread: "T1" };

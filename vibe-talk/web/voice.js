@@ -1436,21 +1436,17 @@ function startBackStack() {
 // heard first at the window as Ctrl+S is (`onEverywhereKey`); the bare [ and ] still move between two
 // columns (`#229`).
 
-/** The most places kept: far more than a reader walks back through, and a bound on what is held. */
-const PLACES_KEPT = 100;
-/** The places visited on this channel, the first first. */
-let visited = /** @type {Place[]} */ ([]);
-/** Which of `visited` the reader is at. */
-let visitedAt = -1;
-/** A Back or Forward is arriving: what it lands on stands for the place it went to, and is noted as none. */
-let placeArriving = false;
+// The places visited on this channel, which one the reader is at, and whether a Back or Forward is
+// arriving: one owner in web/src/core/navigation/visits.ts (`#624 voice-page-modularity`), which keeps at
+// most `PLACES_KEPT`.
+const visits = createVisits();
 
 /**
  * @typedef {import("./src/core/navigation/index.ts").ChannelPlace} ChannelPlace
  * @typedef {import("./src/core/navigation/index.ts").Place} Place
  */
-// What tells one place from another (visitKey) and which close onto another (placeIsOver) are in
-// web/src/core/navigation/ (`#624 voice-page-modularity`).
+// What tells one place from another (visitKey) is in web/src/core/navigation/, and which close onto
+// another (placeIsOver) is the visits owner's (`#624 voice-page-modularity`).
 
 /** The place on the channel now, read in the left column, whose state is the page's; null on the call's view. */
 function channelPlace() {
@@ -1490,32 +1486,7 @@ function currentPlace() {
 
 /** Note the place the reader is at, as the one after the place they were at, unless it is that place. */
 function notePlace() {
-  const place = currentPlace();
-  if (!place) return;
-  if (visited.length > 0 && visited[0].channel !== place.channel) {
-    visited = [];
-    visitedAt = -1;
-  }
-  if (visitedAt >= 0 && visitKey(visited[visitedAt]) === visitKey(place)) {
-    // The same place: what it says of itself kept fresh (a thread's way back, Help's open entry).
-    visited[visitedAt] = place;
-    return;
-  }
-  if (placeArriving && visitedAt >= 0) {
-    visited[visitedAt] = place;
-    return;
-  }
-  // What was open over the place before closed onto it (Esc, the X, the browser's Back, a Back button):
-  // a step back along the history, as Ctrl/Cmd+[ would have been, the place left kept ahead for Forward.
-  if (visitedAt > 0 && placeIsOver(visited[visitedAt]) && visitKey(visited[visitedAt - 1]) === visitKey(place)) {
-    visitedAt -= 1;
-    visited[visitedAt] = place;
-    return;
-  }
-  visited = visited.slice(0, visitedAt + 1);
-  visited.push(place);
-  if (visited.length > PLACES_KEPT) visited = visited.slice(visited.length - PLACES_KEPT);
-  visitedAt = visited.length - 1;
+  visits.note(currentPlace());
 }
 
 /** Whether channel place `place` can be shown now. */
@@ -1618,19 +1589,11 @@ function placeFromKeyboard(step) {
   }
   notePlace();
   const here = visitKey(currentPlace());
-  for (let at = visitedAt + step; at >= 0 && at < visited.length; at += step) {
-    const place = visited[at];
-    // Passed over: what cannot be shown now, and the place the reader is at, noted twice where a window
-    // narrowed and widened again took two columns away and back.
-    if (!placeShowable(place) || visitKey(place) === here) continue;
-    placeArriving = true;
-    try {
-      visitedAt = at;
-      showPlace(place);
-      notePlace();
-    } finally {
-      placeArriving = false;
-    }
+  // Passed over: what cannot be shown now, and the place the reader is at (`Visits.walk`).
+  if (visits.walk(step, here, placeShowable, (place) => {
+    showPlace(place);
+    notePlace();
+  })) {
     if (currentScreen === "main") settleFocus();
     return true;
   }
@@ -1719,7 +1682,7 @@ let deepLinkEpoch = 0;
  * the page itself restores (`columnsRestoring` — a turned or resized window) is no choice.
  */
 function noteDeepLinkReaderMove() {
-  if (!placeArriving && !deepLinkShowing && !columnsRestoring) deepLinkReaderMoves += 1;
+  if (!visits.arriving() && !deepLinkShowing && !columnsRestoring) deepLinkReaderMoves += 1;
 }
 
 /** Whether the reader has chosen anywhere of their own since the link was first read. */
@@ -1896,7 +1859,7 @@ async function applyDeepLink() {
   if (currentView !== "discord") showView("discord");
   const channel = String(selectedChannelId());
   const startPlace = channelPlace();
-  const startVisit = { at: visitedAt, length: visited.length };
+  const startVisit = visits.position();
   // The channel's own first read decides its opening view as it lands; a place put on before
   // it would be decided over. Wait for that read, then put the link's place on — unless the
   // reader has navigated for themselves meanwhile: a link opened the page, it does not chase
@@ -1923,7 +1886,7 @@ async function applyDeepLink() {
   // back has still chosen since the link opened.
   const stood = channelPlace();
   const moved = deepLinkReaderMoved() ||
-    visitedAt !== startVisit.at || visited.length !== startVisit.length ||
+    visits.position().at !== startVisit.at || visits.position().length !== startVisit.length ||
     (startPlace && stood && visitKey(stood) !== visitKey(startPlace));
   if (moved && !(place && stood && visitKey(stood) === visitKey(place))) return;
   // Already there — the opening decision (or the reader) put this place on: showing it again
