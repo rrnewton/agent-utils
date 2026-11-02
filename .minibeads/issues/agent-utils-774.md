@@ -1,13 +1,14 @@
 ---
 title: 'registry-layout-marker-refused: agentctl refuses the layout-2 guard marker in .renames instead of skipping it'
-status: open
+status: closed
 priority: 1
-assignee: cl-start@devbig030
 issue_type: bug
+assignee: cl-start@devbig030
 labels:
 - agentctl
 created_at: 2026-11-02T16:44:58.645310944+00:00
-updated_at: 2026-11-02T16:44:58.645310944+00:00
+updated_at: 2026-11-02T17:20:48.865873896+00:00
+closed_at: 2026-11-02T17:20:48.865873796+00:00
 ---
 
 # Description
