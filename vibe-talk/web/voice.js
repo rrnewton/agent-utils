@@ -2824,7 +2824,7 @@ const dismissedSendsView = mountDismissedSends({
  * `#443 undo-key-general`. The order undoable acts were done in, for the one undo key to take the
  * newest back first. Every offer an Undo chip makes is stamped from this as it is made — a Done
  * (`lastDismissal`), a send dismissed from the outbox (`sendUndo`), a bookmark taken away
- * (`bookmarkUndo`) — and a stamp is never reused, so two offers up at once always have an order.
+ * (`bookmarkUndos`) — and a stamp is never reused, so two offers up at once always have an order.
  */
 let undoSeq = 0;
 
@@ -9057,8 +9057,9 @@ function liveUndos() {
   if (sendUndo && dismissedSends.find(sendUndo.id)) {
     held.push({ at: sendUndo.at || 0, run: () => { if (sendUndo) putBackDismissedSend(sendUndo.id); } });
   }
-  if (bookmarkUndo && bookmarkUndo.channel === currentChannelId()) {
-    held.push({ at: bookmarkUndo.at || 0, run: undoBookmarkRemoval });
+  const bookmarkOffer = bookmarkUndos.current();
+  if (bookmarkOffer && bookmarkOffer.channel === currentChannelId()) {
+    held.push({ at: bookmarkOffer.at || 0, run: undoBookmarkRemoval });
   }
   return held.sort((a, b) => b.at - a.at).map(({ run }) => run);
 }
@@ -19957,7 +19958,8 @@ function toggleBookmarkAt(row) {
   if (!anchor) return;
   const move = stageBookmark(channel, anchor);
   // A bookmark set since a removal is the one kept: Undo has nothing left to put back.
-  if (bookmarkUndo && bookmarkUndo.channel === channel) endBookmarkUndo();
+  const undo = bookmarkUndos.current();
+  if (undo && undo.channel === channel) endBookmarkUndo();
   redrawBookmark();
   setStatus("Bookmarked. b comes back here.");
   guardQuietly(() => sendBookmark(move))();
@@ -19989,15 +19991,12 @@ const { drawBookmarkLine } = createBookmarkLines({
     }
   }),
 });
-/** How long the Undo chip offers to put a removed bookmark back. */
-const BOOKMARK_UNDO_MS = 10000;
 /**
- * The removal the Undo chip takes back while it is up: the channel, where the line was, the removal's
- * own staged change (`stageBookmark`), and the chip's timer.
- *
- * @type {{channel: string, anchor: VibeTalk.BookmarkAnchor, token: object, at: number, timer: any} | null}
+ * The removal the Undo chip takes back while it is up — the channel, where the line was, the removal's own
+ * staged change (`stageBookmark`) — and the chip's timer (`BOOKMARK_UNDO_MS`): web/src/core/annotations's
+ * (`createBookmarkUndo`, `#624 voice-page-modularity`).
  */
-let bookmarkUndo = null;
+const bookmarkUndos = createBookmarkUndo({ clock: clockOnUse(), ended: () => renderBookmarkUndo() });
 
 /**
  * Take this channel's bookmark away, here at once and then on the server, with Undo offered: the X on
@@ -20008,28 +20007,28 @@ function removeBookmark(channel) {
   const before = bookmarkAnchor(channel);
   if (!channel || !before) return;
   const move = stageBookmark(channel, null);
-  if (bookmarkUndo) clearTimeout(bookmarkUndo.timer);
-  bookmarkUndo = { channel, anchor: before, token: move.token, at: nextUndoAt(), timer: setTimeout(endBookmarkUndo, BOOKMARK_UNDO_MS) };
+  bookmarkUndos.offer({ channel, anchor: before, token: move.token, at: nextUndoAt() });
   redrawBookmark();
   renderBookmarkUndo();
   setStatus("Bookmark removed. Undo puts it back.");
   guardQuietly(async () => {
     // Not saved, and so taken back already (`sendBookmark`): there is nothing to undo.
     const outcome = await sendBookmark(move);
-    if (outcome !== "saved" && bookmarkUndo && bookmarkUndo.token === move.token) endBookmarkUndo();
+    const undo = bookmarkUndos.current();
+    if (outcome !== "saved" && undo && undo.token === move.token) endBookmarkUndo();
   })();
 }
 
+/** End the Undo offer, if one is up, and draw the chip again. */
 function endBookmarkUndo() {
-  if (bookmarkUndo) clearTimeout(bookmarkUndo.timer);
-  bookmarkUndo = null;
-  renderBookmarkUndo();
+  bookmarkUndos.end();
 }
 
 /** The Undo chip for a removed bookmark: up while it can be put back, in the channel it was in. */
 function renderBookmarkUndo() {
   const chip = leftEl("undo-bookmark");
-  const shown = bookmarkUndo !== null && currentView === "discord" && bookmarkUndo.channel === currentChannelId();
+  const undo = bookmarkUndos.current();
+  const shown = undo !== null && currentView === "discord" && undo.channel === currentChannelId();
   if (chip.hidden === shown) chip.hidden = !shown;
 }
 
@@ -20038,7 +20037,7 @@ function renderBookmarkUndo() {
  * a bookmark another device set meanwhile; that one is kept, and said (`sendBookmark`).
  */
 function undoBookmarkRemoval() {
-  const undo = bookmarkUndo;
+  const undo = bookmarkUndos.current();
   if (!undo) return;
   endBookmarkUndo();
   if (bookmarkAnchor(undo.channel)) {

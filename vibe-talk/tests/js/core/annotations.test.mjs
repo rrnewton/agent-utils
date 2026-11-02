@@ -101,3 +101,27 @@ test("`#624 voice-page-modularity`: the pinned messages' owner, from the module 
   pins.forget("d");
   assert.deepStrictEqual([pins.channel(), pins.problem(), pins.inFlight(), pins.size()], ["d", "", null, 0]);
 });
+
+test("`#624 voice-page-modularity`: a removed bookmark's Undo is offered for BOOKMARK_UNDO_MS, one at a time", () => {
+  const { createBookmarkUndo, BOOKMARK_UNDO_MS } = ANNOTATIONS;
+  assert.equal(BOOKMARK_UNDO_MS, 10000);
+  const timers = new Map();
+  let next = 0;
+  let drawn = 0;
+  const undo = createBookmarkUndo({
+    clock: { setTimeout: (run, ms) => { next += 1; timers.set(next, { run, ms }); return next; }, clearTimeout: (h) => timers.delete(h) },
+    ended: () => { drawn += 1; },
+  });
+  assert.equal(undo.current(), null);
+  const token = {};
+  undo.offer({ channel: "c", anchor: { message_id: "1" }, token, at: 3 });
+  assert.equal(undo.current().token, token);
+  assert.equal([...timers.values()][0].ms, BOOKMARK_UNDO_MS);
+  undo.offer({ channel: "c", anchor: { message_id: "2" }, token: {}, at: 4 });
+  assert.equal(timers.size, 1, "a second offer left the first one's timer armed");
+  [...timers.values()][0].run();
+  assert.deepStrictEqual([undo.current(), drawn], [null, 1]);
+  undo.offer({ channel: "d", anchor: { message_id: "3" }, token: {}, at: 5 });
+  undo.end();
+  assert.deepStrictEqual([undo.current(), drawn, timers.size], [null, 2, 0]);
+});

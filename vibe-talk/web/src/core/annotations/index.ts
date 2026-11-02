@@ -7,3 +7,5 @@ export { createReadLedger } from "./reads.ts";
 export type { ReadLedger } from "./reads.ts";
 export { createPins } from "./pins.ts";
 export type { Pins, PinsRead } from "./pins.ts";
+export { BOOKMARK_UNDO_MS, createBookmarkUndo } from "./undo.ts";
+export type { BookmarkRemoval, BookmarkUndo, BookmarkUndoDependencies } from "./undo.ts";
