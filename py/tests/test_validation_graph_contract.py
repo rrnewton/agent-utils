@@ -168,6 +168,13 @@ def test_rust_and_cross_nodes_cover_their_registries_once() -> None:
     assert agentctl_shards == ["0/3", "1/3", "2/3"]
 
 
+def test_timing_browser_steps_hold_every_browser_slot() -> None:
+    config = dag_from_path(REPO_ROOT / "validation.dag.yaml")
+    by_tag = config.by_tag()
+    for tag in ("vibe-talk.shots.screenshots", "vibe-talk.check.read-aloud-blocks-browser"):
+        assert by_tag[tag].hint.resources.get("browser") == 4, tag
+
+
 def test_wrkslots_shards_cover_eight_way_partition() -> None:
     config = dag_from_path(REPO_ROOT / "validation.dag.yaml")
     shards = sorted(

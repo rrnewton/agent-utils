@@ -488,7 +488,10 @@ steps:
     timeout: 150
     cpu_timeout: 60
     hint:
-      resources: {browser: 1}
+      # Holds every browser slot in its gate (the fold-latency pattern):
+      # its boundary gaps are measured on the audio clock and sibling
+      # browser steps starve them under multi-gate load.
+      resources: {browser: 4}
       est_duration_s: 40
       classification: latency-bound
       rss_baseline_bytes: 1073741824
@@ -2322,7 +2325,10 @@ steps:
     timeout: 900
     cpu_timeout: 600
     hint:
-      resources: {browser: 1}
+      # Holds every browser slot in its gate (the fold-latency pattern):
+      # its per-scene expectation windows are timing budgets that sibling
+      # browser steps starve under multi-gate load.
+      resources: {browser: 4}
       # MEASURED, not guessed. Everything in this block used to be an estimate for a step that had
       # never once started -- the `cmd` above did not parse, so the job failed in milliseconds and
       # no profile of it could exist. The first run that got through put the walk at 284s wall,
