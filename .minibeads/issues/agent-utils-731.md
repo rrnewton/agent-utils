@@ -1,9 +1,11 @@
 ---
 title: 'agentctl-paste-tail-flush: flush unsent paste tails at delivery, in bursts, and in idle sweeps'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-01T19:39:00.000000000+00:00
+updated_at: 2026-11-02T01:53:02.400490783+00:00
+closed_at: 2026-11-02T01:53:02.400490783+00:00
 ---
 
 # Description
@@ -34,3 +36,17 @@ Wanted:
    paste and leave a tail; show the tail flushed at the next delivery AND by
    the idle sweep, and that a burst of 5 multi-line messages arrives intact
    and in order. Show a spare Enter on an empty editor is harmless.
+
+# Resolution
+
+Landed on main as 15c61659fc28dee57b3bf358053f3f233805084c.
+
+- Fragment ownership in `stale_draft`: a suffix/contiguous substring of a
+  framed, recently typed prompt now counts as agentctl's draft.
+- Delivery recovery and drain burst pacing flush a recognised tail before
+  typing more, with a minimum gap and bounded acceptance wait.
+- `watch-agents` sweeps idle editors on full passes and quick checks; a
+  recognised draft older than 60 seconds is submitted and noticed to the
+  coordinator, and repeated flush failure is reported blocked.
+- Focused fake-harness tests cover Claude Code, Codex, Muse, idle sweep,
+  foreign drafts, blocked flushes, and a five-message burst.
