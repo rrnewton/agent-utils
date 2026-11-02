@@ -26,3 +26,5 @@ export { SERVER_READ_BOUND_MS, createReadHolds } from "./holds.ts";
 export type { ReadHold, ReadHolds, ReadHoldsDependencies } from "./holds.ts";
 export { createLiveEvents } from "./live.ts";
 export type { LiveEvents } from "./live.ts";
+export { LIVE_ATTACH_WAIT_MS, createChannelFollow } from "./follow.ts";
+export type { ChannelFollow, ChannelFollowDependencies, StreamResponse } from "./follow.ts";

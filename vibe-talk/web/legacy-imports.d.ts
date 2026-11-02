@@ -52,6 +52,7 @@ declare const createReplayLedger: LegacyImports["createReplayLedger"];
 declare const createStandInRetries: LegacyImports["createStandInRetries"];
 declare const LIVE_RETRY_MS: LegacyImports["LIVE_RETRY_MS"];
 declare const createStreamGeneration: LegacyImports["createStreamGeneration"];
+declare const createChannelFollow: LegacyImports["createChannelFollow"];
 declare const joinQueuedReads: LegacyImports["joinQueuedReads"];
 declare const deltaCursor: LegacyImports["deltaCursor"];
 declare const isCursorRefusal: LegacyImports["isCursorRefusal"];

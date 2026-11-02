@@ -12928,7 +12928,7 @@ function renderChannelFreshness() {
   // CURRENT IS SAID TOO, not left blank: a blank pill reads the same as a page that never managed
   // to refresh, which is what a reader opening the app in the car could not tell apart.
   const current = loadState().freshAt
-    ? `${liveAttached && liveDelivery !== "off" ? "Live · updated" : "Updated"} ${at}` +
+    ? `${liveFollow.attached() && liveDelivery !== "off" ? "Live · updated" : "Updated"} ${at}` +
       (refreshing ? " · refreshing…" : "")
     : "";
   const text = staleWords(loadState().freshness, loadState().freshAt, refreshing) || current;
@@ -34126,7 +34126,7 @@ function pauseWhileHidden() {
     stopDiscordPolling();
     discordPollPaused = true;
   }
-  if (liveHiddenTimer === null && liveChannel !== null) {
+  if (liveHiddenTimer === null && liveFollow.channel() !== null) {
     liveHiddenTimer = setTimeout(letStreamGoWhileHidden, LIVE_HIDDEN_CLOSE_MS);
   }
 }
@@ -34134,15 +34134,15 @@ function pauseWhileHidden() {
 /** Still hidden, and no call is listening: close the stream, keeping where it was up to. */
 function letStreamGoWhileHidden() {
   liveHiddenTimer = null;
-  if (!document.hidden || liveChannel === null || voiceCall().session.socket) return;
-  const resume = { channel: String(liveChannel), from: liveLastEventId };
+  if (!document.hidden || liveFollow.channel() === null || voiceCall().session.socket) return;
+  const resume = { channel: String(liveFollow.channel()), from: liveFollow.lastEventId() };
   stopChannelStream();
-  liveResumeAfterHidden = { ...resume, generation: liveGeneration.current() };
+  liveResumeAfterHidden = { ...resume, generation: liveFollow.generation() };
 }
 
 /** Follow the stream let go while hidden again, from its last event, unless something else has since. */
 function resumeLiveStream(resume) {
-  if (resume === null || resume.generation !== liveGeneration.current() || liveChannel !== null) return;
+  if (resume === null || resume.generation !== liveFollow.generation() || liveFollow.channel() !== null) return;
   if (String(selectedChannelId()) !== resume.channel || !token()) return;
   startChannelStream(resume.channel, resume.from);
 }
@@ -34507,14 +34507,8 @@ async function fetchResume() {
 // URL is logged by every proxy it passes and lands in the browser's own history. So: `fetch`, a
 // reader over the response body, and about thirty lines of SSE parsing.
 
-// Where the reconnect delay lives (`LIVE_RETRY_MS`), so the suite can walk the page past it, is
-// web/src/core/sync's.
-/**
- * The longest a read waits for the stream to attach (`whenLiveAttached`). The server answers a
- * stream as soon as it has subscribed it, so on an ordinary connection this is one round trip; a
- * proxy that holds a streaming response back costs the reader this much of saved rows, no more.
- */
-const LIVE_ATTACH_WAIT_MS = 3000;
+// Where the reconnect delay lives (`LIVE_RETRY_MS`), so the suite can walk the page past it, and how
+// long a read waits for the stream to attach (`LIVE_ATTACH_WAIT_MS`), are web/src/core/sync's.
 
 /** How much of a message's text is worth spending conversation time on. */
 const RELAY_MAX_CHARS = 400;
@@ -34593,21 +34587,30 @@ let upstreamReadMarkSupported = false;
  * does not say, which keeps the old behaviour of asking and reading the refusal.
  */
 let tokenScope = null;
-/** The channel the stream is following, or null when nothing is attached. */
-let liveChannel = null;
 /**
- * Bumped on every start and stop.
- *
- * The read loop and its retry both check it before doing anything, which is what stops a stream
- * belonging to the previous channel — or to a signed-out session — from appending a row after the
- * page has moved on. An AbortController would be the other way; this one needs nothing of the
- * browser that a `fetch` polyfill might not have.
+ * The stream the page follows — which channel, its generation, the last event id it saw, whether it is
+ * attached and whether that attach resumed, the reads waiting for it, and the loop that reads it and
+ * retries: web/src/core/sync's (`createChannelFollow`, `#624 voice-page-modularity`). The request and
+ * what each frame means are the page's.
  */
-const liveGeneration = createStreamGeneration();
-/** The last `id:` this page saw, sent back as `Last-Event-ID` so a reconnect does not duplicate. */
-let liveLastEventId = null;
-/** Whether the response body is currently open. */
-let liveAttached = false;
+const liveFollow = createChannelFollow({
+  clock: clockOnUse(),
+  token: () => token(),
+  delivery: () => liveDelivery,
+  // NOT `EventSource`: see the head of this section.
+  open: (path, headers) => fetch(path, { headers }),
+  decoder: () => new TextDecoder(),
+  frame: (frame) => onStreamFrame(frame),
+  attached: () => {
+    // The server subscribed this stream before it answered, so its replay tail is everything a read
+    // begun from here on will see.
+    replayLedger.noteAttached();
+    renderLiveState();
+  },
+  changed: () => renderLiveState(),
+  dropped: (why) => addDetail(`live stream dropped: ${why}`),
+  guard: (run) => guardQuietly(run)(),
+});
 
 /**
  * Which of the three the reader is on.
@@ -34729,27 +34732,20 @@ function renderLiveState() {
     return;
   }
   if (liveDelivery === "push") {
-    state.textContent = liveAttached
+    state.textContent = liveFollow.attached()
       ? "Live by adapter push: listening, but the adapter's health is not checked."
       : "Live by adapter push, but not connected right now; it keeps trying.";
     return;
   }
-  state.textContent = liveAttached
+  state.textContent = liveFollow.attached()
     ? `Live: this server re-reads the channel every ${livePollSeconds} seconds.`
     : `Live every ${livePollSeconds} seconds, but not connected to the stream; it keeps trying.`;
 }
 
 /** Stop following whatever is being followed. Idempotent. */
 function stopChannelStream() {
-  liveGeneration.bump();
-  liveChannel = null;
-  liveAttached = false;
-  liveLastEventId = null;
-  renderLiveState();
+  liveFollow.stop();
 }
-
-/** Reads waiting for the stream to attach, each to be run once. */
-const liveAttachWaiters = new Set();
 
 /**
  * Run `then` once the stream being followed has attached — or failed, or ended, or not answered in
@@ -34758,22 +34754,7 @@ const liveAttachWaiters = new Set();
  * `#189 restore-ui-state`, for the read a reopen owes.
  */
 function whenLiveAttached(then) {
-  if (liveChannel === null || liveAttached) {
-    then();
-    return;
-  }
-  const waiter = () => {
-    liveAttachWaiters.delete(waiter);
-    clearTimeout(timer);
-    then();
-  };
-  const timer = setTimeout(waiter, LIVE_ATTACH_WAIT_MS);
-  liveAttachWaiters.add(waiter);
-}
-
-/** The stream attached, or will not for now: nothing waits on it any longer. */
-function releaseLiveAttachWaiters() {
-  for (const waiter of [...liveAttachWaiters]) waiter();
+  liveFollow.whenAttached(then);
 }
 
 /**
@@ -34781,98 +34762,8 @@ function releaseLiveAttachWaiters() {
  * stream a hidden page let go (`#226 page-energy-profile`), and otherwise from the server's tail.
  */
 function startChannelStream(channelId, resumeFrom = null) {
-  stopChannelStream();
-  liveLastEventId = resumeFrom;
-  if (!channelId || !token()) {
-    return;
-  }
-  if (liveDelivery === "off") {
-    // Nothing publishes, so this would be a held-open connection that can never deliver anything.
-    // Not attaching is also what makes the OFF state observable: the page says the server is not
-    // watching AND is not pretending to listen. Turning ingestion on is a server restart, and the
-    // page learns about it the next time it reads `/api/v1/client-config`.
-    renderLiveState();
-    return;
-  }
-  liveChannel = channelId;
-  const generation = liveGeneration.current();
-  guardQuietly(() => followChannel(channelId, generation))();
+  liveFollow.start(channelId, resumeFrom);
 }
-
-/**
- * Read, and keep reading.
- *
- * A dropped stream RETRIES rather than dying quietly. That is the whole reason this is a loop: the
- * failure this page was written against is a connection that goes away and takes the interface's
- * honesty with it, leaving a list that looks current and is not.
- */
-async function followChannel(channelId, generation) {
-  while (generation === liveGeneration.current()) {
-    try {
-      await readChannelStream(channelId, generation);
-    } catch (error) {
-      if (generation !== liveGeneration.current()) {
-        return;
-      }
-      // Not `showError`: a live feed that dropped is not a reason to put a red panel over a call
-      // in progress. It is recorded where connection facts belong.
-      addDetail(`live stream dropped: ${error.message}`);
-    }
-    if (generation !== liveGeneration.current()) {
-      return;
-    }
-    liveAttached = false;
-    renderLiveState();
-    // Refused, or gone: a read held for the attach is not held through the retry delay as well.
-    releaseLiveAttachWaiters();
-    const resumed = await liveRetryDelay(generation);
-    if (!resumed) {
-      return;
-    }
-  }
-}
-
-/** Wait out the reconnect delay. Answers false if the stream was stopped while waiting. */
-function liveRetryDelay(generation) {
-  return new Promise((resolve) => {
-    setTimeout(() => resolve(generation === liveGeneration.current()), LIVE_RETRY_MS);
-  });
-}
-
-async function readChannelStream(channelId, generation) {
-  const headers = { Authorization: `Bearer ${token()}` };
-  if (liveLastEventId) {
-    // The one thing that makes a reconnect neither duplicate nor drop: the server replays what
-    // came after this id out of its own bounded tail, and anything it cannot replay arrives as an
-    // `event: reset` instead of as a silent gap.
-    headers["Last-Event-ID"] = liveLastEventId;
-  }
-  const response = await fetch(
-    `/api/v1/channels/${encodeURIComponent(channelId)}/stream`,
-    { headers }
-  );
-  if (!response.ok) {
-    throw new Error(`the live stream was refused (HTTP ${response.status})`);
-  }
-  const body = response.body;
-  if (!body || typeof body.getReader !== "function") {
-    throw new Error("this browser cannot read a streaming response");
-  }
-  const reader = body.getReader();
-  // The server subscribed this stream before it answered, so its replay tail is everything a read
-  // begun from here on will see.
-  replayLedger.noteAttached();
-  liveAttached = true;
-  // `#337 voice-relay-silent`. What a resumed attach replays is what it missed, which a call may
-  // not have heard: `relayToAgent` tells that apart from a fresh attach's history.
-  liveAttachResumed = Boolean(headers["Last-Event-ID"]);
-  renderLiveState();
-  releaseLiveAttachWaiters();
-  await readEventStream(reader, () => generation === liveGeneration.current(), onStreamFrame);
-}
-
-/** Whether the channel stream's attach now open resumed from a cursor. `#337 voice-relay-silent`. */
-let liveAttachResumed = false;
 
 /**
  * Hand each Server-Sent Event of `reader` to `onFrame` until the response ends, or `current()` says
@@ -34892,17 +34783,14 @@ function readEventStream(reader, current, onFrame) {
 // One SSE frame, as fields (`parseEventFrame`), is web/src/core/sync's, with the reading
 // (`readEventStream`, `#624 voice-page-modularity`).
 
+/** One frame of the channel's stream, its cursor already taken down by `liveFollow`. */
 function onStreamFrame(frame) {
-  if (frame.id) {
-    liveLastEventId = frame.id;
-  }
   if (frame.event === "reset") {
     // The server is saying this subscriber fell further behind than its replay tail, so there IS a
     // gap and it cannot be filled from the stream. Re-read the channel rather than carrying on
     // short: a missing message the page does not know about is the one failure mode a live feed
-    // must not have. The cursor is dropped with it — resuming from an id on the far side of a gap
-    // would ask the server to replay what it has already said it cannot.
-    liveLastEventId = null;
+    // must not have. The cursor is dropped with it (`liveFollow`) — resuming from an id on the far
+    // side of a gap would ask the server to replay what it has already said it cannot.
     // `#337 voice-relay-silent`. The re-read puts the channel right; whether a call heard what fell
     // into the gap cannot be known, so it is said — unless the stream of every channel, which
     // carries this channel too, is what the call is hearing from.
@@ -35029,7 +34917,7 @@ function refreshAfterLiveMutation() {
  */
 function receiveLiveMessage(message, selfPosted, replayed, fromTail) {
   // `#337 voice-relay-silent`. How it came, for whether a call that may have missed it hears it.
-  const arrival = { fromTail: fromTail === true, resumed: liveAttachResumed };
+  const arrival = { fromTail: fromTail === true, resumed: liveFollow.resumed() };
   // `#466 reply-promotes-thread`. Not a read's observation, which retires a sent receipt at once: the
   // read the stream's copy asks for may be answered from older state. The copy goes into the store,
   // which keeps the page's own post against such a read (`ownPostStands`), and the receipt goes after

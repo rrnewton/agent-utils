@@ -198,3 +198,114 @@ test("`#624 voice-page-modularity`: which read a refresh makes, and how fresh it
   assert.equal(staleAsOf({ as_of: at(now + 5000) }, true, clock), now, "a stand-in copy dated ahead claimed to be newer than now");
   assert.equal(staleAsOf(null, true, clock), now);
 });
+
+test("`#624 voice-page-modularity`: following a channel's stream attaches, keeps its cursor, retries, and stops", async () => {
+  const { createChannelFollow, LIVE_ATTACH_WAIT_MS, LIVE_RETRY_MS } = SYNC;
+  assert.equal(LIVE_ATTACH_WAIT_MS, 3000);
+  const timers = new Map();
+  let next = 0;
+  const clock = {
+    setTimeout: (run, ms) => { next += 1; timers.set(next, { run, ms }); return next; },
+    clearTimeout: (handle) => timers.delete(handle),
+  };
+  const fire = (ms) => {
+    for (const [handle, timer] of [...timers]) if (timer.ms === ms) { timers.delete(handle); timer.run(); }
+  };
+  const opened = [];
+  const said = [];
+  const frames = [];
+  let token = "t0k";
+  let delivery = "push";
+  let chunks = [];
+  let respond = null;
+  const encode = (text) => text;
+  const follow = createChannelFollow({
+    clock,
+    token: () => token,
+    delivery: () => delivery,
+    open: (path, headers) => {
+      opened.push([path, { ...headers }]);
+      return new Promise((resolve) => { respond = resolve; });
+    },
+    decoder: () => ({ decode: (bytes) => (bytes === undefined ? "" : String(bytes)) }),
+    frame: (frame) => { frames.push(frame); },
+    attached: () => said.push("attached"),
+    changed: () => said.push("changed"),
+    dropped: (why) => said.push(`dropped: ${why}`),
+    guard: (run) => { run().catch((error) => said.push(`threw: ${error.message}`)); },
+  });
+  const settle = () => new Promise((resolve) => setImmediate(resolve));
+  const body = () => {
+    const queue = chunks;
+    let release;
+    const ended = new Promise((resolve) => { release = resolve; });
+    return {
+      release,
+      response: { ok: true, status: 200, body: { getReader: () => ({
+        read: async () => (queue.length ? { done: false, value: encode(queue.shift()) } : (await ended, { done: true })),
+      }) } },
+    };
+  };
+  // Nothing followed: a wait runs at once.
+  let ran = 0;
+  follow.whenAttached(() => { ran += 1; });
+  assert.equal(ran, 1);
+  // Off on the server: nothing attaches, and Settings is told.
+  delivery = "off";
+  follow.start("42");
+  assert.deepStrictEqual([follow.channel(), opened.length, said.slice(-1)[0]], [null, 0, "changed"]);
+  delivery = "push";
+  // Attaching: a wait holds until it does.
+  follow.start("4 2");
+  assert.equal(follow.channel(), "4 2");
+  follow.whenAttached(() => { ran += 1; });
+  assert.equal(ran, 1, "a wait ran before the stream attached");
+  assert.deepStrictEqual(opened[0], ["/api/v1/channels/4%202/stream", { Authorization: "Bearer t0k" }]);
+  chunks = ["id: 7\nevent: message\ndata: {}\n\n"];
+  const first = body();
+  respond(first.response);
+  await settle();
+  assert.equal(follow.attached(), true);
+  assert.equal(follow.resumed(), false);
+  assert.equal(ran, 2, "the wait did not run on the attach");
+  assert.equal(follow.lastEventId(), "7");
+  assert.deepStrictEqual(frames.map((frame) => frame.event), ["message"]);
+  // The response ends: not attached, and a retry after LIVE_RETRY_MS resumes from the cursor.
+  first.release();
+  await settle();
+  assert.equal(follow.attached(), false);
+  fire(LIVE_RETRY_MS);
+  await settle();
+  assert.deepStrictEqual(opened[1][1], { Authorization: "Bearer t0k", "Last-Event-ID": "7" });
+  chunks = ["event: reset\ndata:\n\n"];
+  const second = body();
+  respond(second.response);
+  await settle();
+  assert.equal(follow.resumed(), true);
+  assert.equal(follow.lastEventId(), null, "a reset kept the cursor");
+  // A wait that is not answered in time runs anyway.
+  const generation = follow.generation();
+  follow.stop();
+  assert.ok(follow.generation() > generation);
+  assert.deepStrictEqual([follow.channel(), follow.attached(), follow.lastEventId()], [null, false, null]);
+  second.release();
+  await settle();
+  follow.start("9", "41");
+  follow.whenAttached(() => { ran += 1; });
+  assert.deepStrictEqual(opened[2][1], { Authorization: "Bearer t0k", "Last-Event-ID": "41" });
+  fire(LIVE_ATTACH_WAIT_MS);
+  assert.equal(ran, 3, "a wait outlived LIVE_ATTACH_WAIT_MS");
+  // A refusal is recorded and retried, and releases nothing twice.
+  respond({ ok: false, status: 503, body: null });
+  await settle();
+  assert.ok(said.includes("dropped: the live stream was refused (HTTP 503)"));
+  // Stopped while waiting to retry: the retry does not reopen.
+  follow.stop();
+  fire(LIVE_RETRY_MS);
+  await settle();
+  assert.equal(opened.length, 3, "a stopped stream retried");
+  // No credential: nothing is followed.
+  token = "";
+  follow.start("9");
+  assert.equal(follow.channel(), null);
+});
