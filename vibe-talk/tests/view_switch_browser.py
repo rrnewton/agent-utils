@@ -153,6 +153,26 @@ VISIBLE_JS = """() => {
 }"""
 
 
+# `thread-select-icon`: the bar's two pickers as the browser draws them on a phone.
+BAR_JS = """() => {
+  const box = (id) => {
+    const node = document.getElementById(id);
+    const r = node.getBoundingClientRect();
+    const style = getComputedStyle(node);
+    return {width: r.width, height: r.height, right: r.right, color: style.color, image: style.backgroundImage};
+  };
+  const pack = document.getElementById('bar-pack');
+  return {views: box('thread-select'), channel: box('discord-channel'), window: window.innerWidth,
+          sideways: pack.scrollWidth - pack.clientWidth};
+}"""
+
+
+def num(value: object) -> float:
+    """A number the page measured."""
+    assert isinstance(value, (int, float)), value
+    return float(value)
+
+
 def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
@@ -291,6 +311,22 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             wait_rows(api.ids("flat"), "the channel did not open in All")
             settled()
             check(reads == ["flat"], f"{label}: opening the channel read {reads}")
+            # `thread-select-icon`. The owner, 2026-11-02: on a phone the view picker is a small
+            # button, a thumb's width, with a threads glyph, so the channel's name beside it gets the room; it is still
+            # the bar's real picker, which the walk below goes on picking views with.
+            bar = page.evaluate(BAR_JS)
+            assert isinstance(bar, dict)
+            views = bar["views"]
+            channel = bar["channel"]
+            assert isinstance(views, dict) and isinstance(channel, dict)
+            check(43 <= float(views["width"]) <= 48 and float(views["height"]) <= 48,
+                  f"{label}: the view picker is not a small button a thumb's width: {views}")
+            check(views["color"] == "rgba(0, 0, 0, 0)" and "svg" in str(views["image"]),
+                  f"{label}: the view picker shows its words, or no glyph: {views}")
+            check(float(channel["width"]) > float(views["width"]) * 2 and float(channel["right"]) <= num(bar["window"]) + 0.5,
+                  f"{label}: the channel's name did not get the room, or ran off the window: {channel} beside {views}")
+            check(num(bar["sideways"]) <= 0, f"{label}: the bar scrolls sideways: {bar}")
+            shot("0-bar")
 
             # 1. All, read: Main and back, twice, from the middle of the channel.
             page.evaluate(WATCH_JS)
