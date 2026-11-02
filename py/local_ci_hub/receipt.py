@@ -8,14 +8,6 @@ from pathlib import Path
 from .config import Config
 from .ledger import Ledger
 
-# The canonical current release identity is configured via
-# `[receipt.release_payload]` in local-ci-hub.toml. A superseded
-# identity never names a builder for landing: an identity claim is
-# honoured only when it is exactly the configured payload. When no
-# payload is configured there is no canonical identity to compare
-# against, so a well-formed pair makes no failing claim.
-
-
 def _canonical_json(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
@@ -23,13 +15,11 @@ def _canonical_json(value: object) -> str:
 def _release_identity_ok(cfg: Config, r: dict[str, object]) -> bool:
     """Whether a row's release_builder/e2e_payload claim may qualify.
 
-    The two fields are read together: a lone field names no builder,
-    and a payload that is not exactly the configured identity
-    (including every superseded identity) names no builder. A row
-    carrying neither field makes no identity claim and is judged by
-    the other clauses. When no release_payload is configured there
-    is no canonical identity, so a well-formed pair is not refused
-    on identity grounds.
+    The two fields are read together: a lone field names no builder. A row
+    carrying neither field makes no identity claim and is judged by the other
+    clauses. When both fields are present, the claim is honoured only when a
+    current payload is configured and the row payload is exactly that payload;
+    with no configured payload an identity claim cannot be honoured.
     """
     has_builder = "release_builder" in r
     has_payload = "e2e_payload" in r
@@ -38,7 +28,7 @@ def _release_identity_ok(cfg: Config, r: dict[str, object]) -> bool:
     if not (has_builder and has_payload):
         return False
     if cfg.release_payload is None:
-        return True
+        return False
     try:
         return _canonical_json(r.get("e2e_payload")) == _canonical_json(cfg.release_payload)
     except (TypeError, ValueError):
@@ -105,10 +95,10 @@ def show(cfg: Config, commit: str, remote: dict[str, object] | None = None) -> d
             return False
         return True
     def _is_genuine_fail(r: dict[str, object]) -> bool:
-        # Mirror ci-hub failure_disposition: only a clean full-coverage FAIL
-        # (anchored, full profile/selection, clean tree, verified evidence)
-        # is a durable failure. A partial-profile FAIL (e.g. only-portable)
-        # is a withheld non-verdict and must not veto a qualifying PASS.
+        # Only a clean full-coverage FAIL (anchored, full profile/selection,
+        # clean tree, verified evidence) is a durable failure. A partial-profile
+        # FAIL (e.g. only-portable) is a withheld non-verdict and must not veto
+        # a qualifying PASS.
         return (
             r.get("result") == "FAIL"
             and r.get("_evidence_ok") is not False
@@ -121,9 +111,8 @@ def show(cfg: Config, commit: str, remote: dict[str, object] | None = None) -> d
     strict_passes = [r for r in rows if _strict_pass(r)]
     local_pass = bool(strict_passes)
     genuine_fails = [r for r in rows if _is_genuine_fail(r)]
-    # Newest terminal record decides, as in ci-hub assess_canonical_receipts:
-    # a genuine FAIL vetoes only when it is at least as new as the newest
-    # qualifying PASS.
+    # Newest terminal record decides: a genuine FAIL vetoes only when it is
+    # at least as new as the newest qualifying PASS.
     fail_veto = False
     if genuine_fails and strict_passes:
         newest_pass = max(str(r.get("finished_at") or "") for r in strict_passes)

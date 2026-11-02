@@ -47,7 +47,7 @@ class Config:
     release_payload: dict[str, object] | None = None
     digest_command: list[str] | None = None
     repos: list[dict[str, object]] = field(default_factory=list)
-    counted_repos: list[str] = field(default_factory=list)
+    counted_repos: list[str] | None = None
 
     @property
     def ledger_file(self) -> Path:
@@ -112,7 +112,7 @@ def load(path: Path | None, root: Path | None = None) -> Config:
         require_full_evidence=bool(rec.get("require_full_evidence", True)),
         release_payload=dict(rec["release_payload"]) if rec.get("release_payload") else None,
         digest_command=list(rec["digest_command"]) if rec.get("digest_command") else None,
-        counted_repos=[str(v) for v in led.get("counted_repos", [])],
+        counted_repos=[str(v) for v in led["counted_repos"]] if led.get("counted_repos") is not None else None,
     )
     unknown = set(cfg.qualifying) - {"local-ledger-pass", "remote-pass"}
     if unknown:

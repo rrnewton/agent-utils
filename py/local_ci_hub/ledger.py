@@ -18,11 +18,6 @@ _SHA256 = re.compile(r"[0-9a-f]{64}")
 _MAX_ROW_BYTES = 48 * 1024 * 1024
 _MAX_COMPRESSED_BYTES = _MAX_ROW_BYTES + 1024 * 1024
 _ROW_REF_FIELDS = frozenset({"codec", "sha256", "bytes", "locator", "compressed_sha256", "compressed_bytes"})
-# Repository identities this ledger counts are configured via
-# `[ledger] counted_repos` in local-ci-hub.toml. An absent `repo` is
-# always counted; any other value counts only when listed there.
-# Rows naming a different repository are foreign evidence and are
-# dropped, even when physically present in this ledger's shards.
 
 
 def _now() -> str:
@@ -118,13 +113,32 @@ class Ledger:
                 merged["_digest_ok"] = (expect == ev["digest"])
             merged["_evidence_ok"] = bool(evidence_ok and rows[rid].get("_evidence_ok", True))  # once refused, always refused
             rows[rid] = merged
-        counted = set(self.cfg.counted_repos)
-        return [rows[r] for r in order if rows[r].get("repo") is None or rows[r].get("repo") in counted]
+        # A row counts when its repo is absent, or when its repo is one of
+        # the counted repos. When counted repos are configured they are the
+        # allowlist; otherwise the project repos are. Any other repo string
+        # does not count.
+        if self.cfg.counted_repos is not None:
+            counted: set[object] = {None} | set(self.cfg.counted_repos)
+        else:
+            counted = {None}
+            for entry in self.cfg.repos:
+                if isinstance(entry, str):
+                    counted.add(entry)
+                elif isinstance(entry, dict):
+                    for key in ("name", "repo", "id", "slug"):
+                        value = entry.get(key)
+                        if isinstance(value, str) and value:
+                            counted.add(value)
+                            break
+                    else:
+                        counted.add(str(entry))
+                else:
+                    counted.add(str(entry))
+        return [rows[r] for r in order if rows[r].get("repo") in counted]
 
     def _resolve_ref(self, codec: dict[str, object], host: str | None = None) -> tuple[dict[str, object], bool]:
         """Dereference one row-ref/v1 evidence object; (row, ok). Refuses on any mismatch."""
-        # Mirror ci-hub ledger_evidence.validate_ref: the locator is the
-        # immutable host/content address of the row, not an arbitrary path.
+        # The locator is the immutable host/content address of the row, not an arbitrary path.
         if set(codec) != _ROW_REF_FIELDS:
             return {}, False
         for name, limit in (("bytes", _MAX_ROW_BYTES), ("compressed_bytes", _MAX_COMPRESSED_BYTES)):
