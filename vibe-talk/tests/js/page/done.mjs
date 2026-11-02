@@ -718,9 +718,9 @@ test("`#462 webapp-deep-links`: a link opens its view and thread over the restor
   // The address still names it, so a reload or a copy of the address bar lands there again.
   // Read as the page computes it: this fixture's location does not move when the page
   // replaces the address, as a browser's does, so the written list lags the standing one.
-  assert.match(page.preludeBinding("deepLinkQuery")(page.pure("channelPlace()"), page.pure("deepLinkFocus")), /&m=discord%3A/,
+  assert.match(page.preludeBinding("deepLinkQuery")(page.pure("channelPlace()"), page.pure("deepLinks.focus()")), /&m=discord%3A/,
     "the address let go of its message");
-  assert.ok(page.pure("deepLinkFocus !== null"), "the focus a link brought was dropped");
+  assert.ok(page.pure("deepLinks.focus() !== null"), "the focus a link brought was dropped");
 });
 
 test("`#462 webapp-deep-links`: a reader who chooses a view while the link is still landing is not chased by it", async () => {
@@ -736,7 +736,7 @@ test("`#462 webapp-deep-links`: a reader who chooses a view while the link is st
   // The reader picks All before the link's waits have run out: their choice stands.
   page.el("thread-select").value = "flat";
   await page.el("thread-select").dispatch("change");
-  await untilDeepLink(page, () => page.pure("deepLinkApplied") === true);
+  await untilDeepLink(page, () => page.pure("deepLinks.applied()") === true);
   assert.equal(page.el("thread-select").value, "flat", "the link overrode the reader's own choice");
   assert.equal(page.el("thread-heading").hidden, true, "the link opened its thread over the reader");
 });
@@ -755,7 +755,7 @@ test("`#462 webapp-deep-links`: a reader who chooses another channel while the l
   await showDiscord(page, data.messages);
   page.el("discord-channel").value = second.id;
   await page.el("discord-channel").dispatch("change");
-  await untilDeepLink(page, () => page.pure("deepLinkApplied") === true);
+  await untilDeepLink(page, () => page.pure("deepLinks.applied()") === true);
   assert.equal(page.el("discord-channel").value, second.id,
     "the link moved the reader back to its own channel");
   assert.equal(page.el("thread-heading").hidden, true, "the link opened its thread over the reader");
@@ -777,7 +777,7 @@ test("`#462 webapp-deep-links`: each view round-trips, voice is refused politely
     await showDiscord(page, data.messages);
     await untilDeepLink(page, () => page.el("thread-select").value === picker);
     assert.equal(page.el("thread-select").value, picker, `v=${said} opened ${page.el("thread-select").value}`);
-    assert.match(page.preludeBinding("deepLinkQuery")(page.pure("channelPlace()"), page.pure("deepLinkFocus")),
+    assert.match(page.preludeBinding("deepLinkQuery")(page.pure("channelPlace()"), page.pure("deepLinks.focus()")),
       new RegExp(`(^|&)v=${said}(&|$)`), `the address does not say ${said} back`);
   }
   // A list opens with its cards. (Round-trip back out of it is ↓'s walk in the back tests.)

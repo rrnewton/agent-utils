@@ -87,6 +87,45 @@ test("`#624 voice-page-modularity`: a close onto the place before is a step back
   assert.deepStrictEqual(long.position(), { at: PLACES_KEPT - 1, length: PLACES_KEPT });
 });
 
+test("`#624 voice-page-modularity`: a link is read from the address once, counts the reader's choices from then, and signing out forgets it", () => {
+  let search = "?c=C1&v=Thread&t=T1&m=discord%3AC1%3AM1";
+  let arriving = false;
+  let reads = 0;
+  const links = NAVIGATION.createDeepLinks({ search: () => { reads += 1; return search; }, arriving: () => arriving });
+  links.noteReaderMove();
+  assert.equal(links.readerMoved(), false, "choices before the link was read are not counted against it");
+  const wanted = links.wanted();
+  assert.deepStrictEqual({ ...wanted, message: { ...wanted.message } },
+    { channel: "C1", view: "thread", thread: "T1", message: { provider: "discord", channel: "C1", message: "M1", thread: null } });
+  search = "?c=C2";
+  assert.equal(links.wanted(), wanted, "the address is read once a load");
+  assert.equal(reads, 1);
+  arriving = true;
+  links.noteReaderMove();
+  arriving = false;
+  links.arrive(() => links.noteReaderMove());
+  assert.equal(links.showing(), false, "an arrival ends with its run");
+  assert.equal(links.readerMoved(), false, "an arrival, or Back and Forward, is no choice");
+  links.noteReaderMove();
+  assert.equal(links.readerMoved(), true);
+  assert.equal(links.readerMoves(), 2);
+  links.setFocus(wanted.message);
+  links.setApplying(true);
+  const epoch = links.epoch();
+  links.signOut();
+  assert.equal(links.wanted(), null);
+  assert.equal(links.focus(), null);
+  assert.equal(links.applied(), true, "no apply runs after signing out");
+  assert.equal(links.readerMoved(), false);
+  assert.notEqual(links.epoch(), epoch, "an apply waiting from before signing out sees another epoch");
+});
+
+test("`#624 voice-page-modularity`: a plain open, or an address the host cannot give, is no link", () => {
+  assert.equal(NAVIGATION.createDeepLinks({ search: () => "", arriving: () => false }).wanted(), null);
+  assert.equal(NAVIGATION.createDeepLinks({ search: () => { throw new Error("no window"); }, arriving: () => false }).wanted(), null);
+  assert.equal(NAVIGATION.createDeepLinks({ search: () => "?v=nowhere", arriving: () => false }).wanted(), null, "an unknown view says nothing");
+});
+
 test("`#624 voice-page-modularity`: a place reads back from the query it writes, and a bad escape or an absurd value says nothing", () => {
   const { deepLinkParams, deepLinkPart, deepLinkQuery, DEEP_LINK_VIEWS } = NAVIGATION;
   const ref = { provider: "slack", channel: "C 1", message: "M1", thread: "T1" };

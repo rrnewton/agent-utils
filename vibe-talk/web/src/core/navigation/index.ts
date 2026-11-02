@@ -10,3 +10,5 @@ export { REOPENED_VIEWS, UI_STATE_CHANNELS, UI_STATE_CHARS, UI_STATE_KEY, UI_STA
 export type { ChosenView, HeldPlace, SavedPlace, SavedThread, UiRecord, UiState, UiStateDependencies } from "./uistate.ts";
 export { PLACES_KEPT, createVisits } from "./visits.ts";
 export type { Visits } from "./visits.ts";
+export { createDeepLinks } from "./deeplinks.ts";
+export type { DeepLinkWanted, DeepLinks, DeepLinksDependencies } from "./deeplinks.ts";

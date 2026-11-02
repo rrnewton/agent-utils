@@ -24,7 +24,7 @@ export { createApi, isSlowFailure, readableFailure } from "../core/api/index.ts"
 
 export { allReachesThread, answerUnplaced, answeredThread, coverViewOf, createChannelDirectory, createChannelStore, createCopyOrder, createIdentities, createRemovals, createSummaries, createUnpackReads, emptyTally, exactReplyCount, foldDeltaIn, foldLiveIn, foldPageIn, heldAsSent, heldNow, inTimeOrder, inViewOf, markDoneIn, namedRecord, newerPage, newerPageSpeaksFor, noteReplyGapsIn, pageFoldIn, placeFromPageIn, projectionOf, refreshFailed, replyTallyOf, restoreCanon, savedTimelineOf, settleDoneIn, summaryKey, tallyRecord, threadOf, timeOf, unplacedToAsk, unseenRepliesIn, upsertThreadSummary, viewOfKey } from "../core/channels/index.ts";
 export { anchorOfMessage, createBookmarkUndo, createBookmarks, createPins, createReadLedger, isBookmarkState, sameAnchor } from "../core/annotations/index.ts";
-export { DEEP_LINK_VIEWS, REOPENED_VIEWS, UI_STATE_CHARS, UI_STATE_KEY, UI_STATE_VERSION, createNavigation, createUiState, createVisits, deepLinkParams, deepLinkPart, deepLinkQuery, visitKey } from "../core/navigation/index.ts";
+export { REOPENED_VIEWS, UI_STATE_CHARS, UI_STATE_KEY, UI_STATE_VERSION, createDeepLinks, createNavigation, createUiState, createVisits, deepLinkQuery, visitKey } from "../core/navigation/index.ts";
 export {
   DISCORD_POLL_MS,
   LIVE_RETRY_MS,
@@ -100,7 +100,7 @@ export {
   watchBoxInsertions as watchInsertions,
   wireNewlineKey,
 } from "../view/composer/index.ts";
-export { HTTP_ADDRESS, createSerialQueue, deepLinkRefFrom, linkKind, linksIn, messageLinkRef, sentenceStart } from "../foundation/index.ts";
+export { HTTP_ADDRESS, createSerialQueue, linkKind, linksIn, messageLinkRef, sentenceStart } from "../foundation/index.ts";
 
 export { briefAge, dayClock, dayKeyOf, editedTitle, fullLocalAt, fullLocalTime, messageDate, messageTimeLabel, shortLocalTime, stamp } from "../present/time/index.ts";
 
