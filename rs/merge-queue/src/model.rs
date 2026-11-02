@@ -1,0 +1,214 @@
+//! Queue vocabulary: submitted changes, plans, and widening obligations.
+
+use serde::{Deserialize, Serialize};
+
+use crate::tests::{Selection, ValidationClaim};
+
+/// Lifecycle of a submitted change.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ItemStatus {
+    /// Waiting to be planned and landed.
+    #[default]
+    Queued,
+    /// Landed on the base branch.
+    Landed,
+    /// Removed from the queue by the queue, with a report saying why.
+    Ejected,
+    /// Withdrawn by its submitter.
+    Withdrawn,
+}
+
+impl ItemStatus {
+    /// Stable machine-facing value.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Landed => "landed",
+            Self::Ejected => "ejected",
+            Self::Withdrawn => "withdrawn",
+        }
+    }
+}
+
+/// One entry in an item's history.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Event {
+    /// RFC 3339 UTC time.
+    pub at: String,
+    /// Short kind such as `submitted`, `ejected`, `landed`.
+    pub kind: String,
+    /// Human detail.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detail: String,
+}
+
+/// A change submitted to the queue (one pull request or branch).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Item {
+    /// Change number (pull-request number); the item's identity.
+    pub pr: i64,
+    /// Head source: a branch name on the remote, or a full ref such as `refs/pull/7/head`.
+    pub head_ref: String,
+    /// Exact head commit submitted. The queue refuses to land any other head.
+    pub head: String,
+    /// Lower lands first.
+    pub priority: i64,
+    /// RFC 3339 UTC submission time; earlier lands first among equal priorities.
+    pub submitted_at: String,
+    /// Who submitted it (agent or person).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub submitted_by: String,
+    /// One-line description.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    /// Changes that must land first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub after: Vec<i64>,
+    /// Validate and land this change in a batch of its own (a risky change).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub solo: bool,
+    /// The submitter's own validation claim: which tests they ran, and how they chose them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim: Option<ValidationClaim>,
+    /// Lifecycle state.
+    #[serde(default)]
+    pub status: ItemStatus,
+    /// Base-branch commit that contains this change, once landed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub landed_as: String,
+    /// History, oldest first.
+    #[serde(default)]
+    pub history: Vec<Event>,
+}
+
+impl Item {
+    /// Append a history event stamped now.
+    pub fn log(&mut self, kind: &str, detail: impl Into<String>) {
+        self.history.push(Event {
+            at: now(),
+            kind: kind.to_owned(),
+            detail: detail.into(),
+        });
+    }
+}
+
+/// A landing whose validation was focused, so the complete suite is still owed on it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Obligation {
+    /// Stable identifier (the run ID and batch index).
+    pub id: String,
+    /// RFC 3339 UTC creation time.
+    pub created_at: String,
+    /// Base-branch commit the focused validation landed.
+    pub landed: String,
+    /// Changes in that landing.
+    pub prs: Vec<i64>,
+    /// What actually ran before landing.
+    pub validated: ValidationClaim,
+    /// Open until a complete run covers `landed` (that commit or a descendant of it).
+    pub discharged: Option<Discharge>,
+}
+
+/// How an obligation was discharged.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Discharge {
+    /// RFC 3339 UTC time.
+    pub at: String,
+    /// Commit the complete run validated (`landed` or a descendant).
+    pub commit: String,
+    /// Whether that complete run was green.
+    pub green: bool,
+    /// Failing tests, when it was not.
+    #[serde(default, skip_serializing_if = "Selection::is_empty")]
+    pub failed: Selection,
+}
+
+/// One planned batch: changes validated and landed together, in order.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PlannedBatch {
+    /// Zero-based position in landing order.
+    pub index: usize,
+    /// Changes in combine order.
+    pub prs: Vec<i64>,
+    /// Why this batch boundary exists (`max-batch`, `solo`, `dependency`, ...).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub note: String,
+}
+
+/// Disposition of a queued change the plan cannot land this round.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Held {
+    /// Change number.
+    pub pr: i64,
+    /// Stable kind: `conflicts-with-base`, `conflicts-with-queued`, `head-moved`,
+    /// `head-missing`, `waiting-on-dependency`.
+    pub kind: String,
+    /// Human explanation and the action that unblocks it.
+    pub reason: String,
+    /// Other changes involved, when any.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub with: Vec<i64>,
+    /// Paths involved, when any.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+}
+
+/// One change as the plan saw it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PlannedItem {
+    /// Change number.
+    pub pr: i64,
+    /// Head commit at plan time.
+    pub head: String,
+    /// Priority.
+    pub priority: i64,
+    /// Submission time.
+    pub submitted_at: String,
+    /// Files changed relative to the base.
+    pub files: usize,
+    /// Number of queued changes it textually conflicts with.
+    pub conflict_degree: usize,
+}
+
+/// Pairwise textual conflict between two queued heads (from `git merge-tree`).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Conflict {
+    /// Lower change number.
+    pub a: i64,
+    /// Higher change number.
+    pub b: i64,
+    /// Conflicting paths.
+    pub paths: Vec<String>,
+}
+
+/// A reviewable landing plan.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Plan {
+    /// Schema identifier.
+    pub schema: String,
+    /// RFC 3339 UTC time the plan was made.
+    pub created_at: String,
+    /// Base branch.
+    pub base: String,
+    /// Exact base commit the plan is bound to.
+    pub base_sha: String,
+    /// Every queued change considered, by number.
+    pub items: Vec<PlannedItem>,
+    /// Batches in landing order.
+    pub batches: Vec<PlannedBatch>,
+    /// Changes not landable this round, with the reason and the unblocking action.
+    pub held: Vec<Held>,
+    /// Pairwise conflicts among queued heads.
+    pub conflicts: Vec<Conflict>,
+    /// Directed dependencies `(before, after)` the plan respected.
+    pub dependencies: Vec<(i64, i64)>,
+}
+
+/// Plan schema identifier.
+pub const PLAN_SCHEMA: &str = "merge-queue-plan/v1";
+
+/// Current time as RFC 3339 UTC with second precision.
+pub fn now() -> String {
+    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}

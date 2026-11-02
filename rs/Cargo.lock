@@ -780,6 +780,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "merge-queue"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "fs2",
+ "pr-landing-planner",
+ "serde",
+ "serde_json",
+ "shell-words",
+]
+
+[[package]]
 name = "nix"
 version = "0.31.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

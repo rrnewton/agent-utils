@@ -37,6 +37,7 @@ NON_PUBLISHED_RUST_BINARIES = (
     "agentctl-slack-plugin",
     "chat-subscription-fake-plugin",
     "gh-paced",
+    "merge-queue",
     "wrkslotsd",
     "wrkvizd",
 )

@@ -79,6 +79,7 @@ EXPECTED_COMPONENTS = frozenset(
         "gh-paced",
         "herdr-run",
         "local-ci-hub",
+        "merge-queue",
         "planner",
         "repository-infrastructure",
         "tick-hub",
@@ -87,7 +88,7 @@ EXPECTED_COMPONENTS = frozenset(
     }
 )
 
-RUST_ONLY_COMPONENTS = frozenset({"agent-teams", "agent-usage", "gh-paced"})
+RUST_ONLY_COMPONENTS = frozenset({"agent-teams", "agent-usage", "gh-paced", "merge-queue"})
 
 
 class ManifestError(ValueError):

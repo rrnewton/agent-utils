@@ -264,3 +264,16 @@ steps:
     timeout: 600
     cpu_timeout: 1200
     hint: *rust_test_hint
+
+  - group: merge-queue
+    job: test
+    desc: merge-queue Rust tests (local bare-repository fixtures)
+    cmd: >-
+      host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
+      RUST_TEST_THREADS=4 python3 scripts/case_timings.py run-cargo -- cargo test --release --no-fail-fast --manifest-path rs/Cargo.toml
+      --target "$host_target" --target-dir rs/target/validation-tests -p merge-queue ${DAGRUN_EXTRA_ARGS}
+    cmdtype: cargo-test
+    labels: [validation-workspace, validation-rust-workspace-tests, component-merge-queue]
+    timeout: 600
+    cpu_timeout: 1200
+    hint: *rust_test_hint

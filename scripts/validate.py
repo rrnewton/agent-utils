@@ -202,6 +202,8 @@ PREFIX_RULES: tuple[tuple[str, frozenset[str]], ...] = (
     ("common/docs/agent-usage/", frozenset({DOCS, RUST})),
     ("rs/agent-teams/", frozenset({RUST})),
     ("common/docs/agent-teams/", frozenset({DOCS, RUST})),
+    ("rs/merge-queue/", frozenset({RUST})),
+    ("common/docs/merge-queue/", frozenset({DOCS, RUST})),
     ("cross/", frozenset({CROSS})),
     ("common/docs/", frozenset({DOCS})),
     ("common/README.md", frozenset()),
@@ -971,8 +973,20 @@ def self_test() -> int:
     expect(
         ["skills/pr-landing-planner/SKILL.md", "skills/pr-landing-operations/SKILL.md"],
         set(),
-        "bundled landing skills select their owning component",
-        {"planner"},
+        "bundled landing skills select their owning component; the merge queue builds on the planner",
+        {"planner", "merge-queue"},
+    )
+    expect(
+        ["rs/merge-queue/src/plan.rs"],
+        {RUST},
+        "the Rust-only merge-queue tool selects the Rust gate and the crate tests, not everything",
+        {"merge-queue"},
+    )
+    expect(
+        ["common/docs/merge-queue/USER_GUIDE.md"],
+        {DOCS, RUST},
+        "merge-queue compiles its guides into the binary, so a guide edit re-tests the crate",
+        {"merge-queue"},
     )
     expect(
         ["skills/tick-hub/SKILL.md", "skills/wrkslots/SKILL.md", "skills/wrkviz/SKILL.md"],

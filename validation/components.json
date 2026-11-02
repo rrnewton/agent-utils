@@ -230,6 +230,14 @@
         "py/tests/test_local_ci_hub.py"
       ]
     },
+    "merge-queue": {
+      "source_prefixes": [
+        "common/docs/merge-queue/",
+        "rs/merge-queue/"
+      ],
+      "reverse_dependencies": [],
+      "test_files": []
+    },
     "planner": {
       "source_prefixes": [
         "common/docs/pr-landing-planner/",
@@ -240,7 +248,9 @@
         "skills/pr-landing-operations/",
         "skills/pr-landing-planner/"
       ],
-      "reverse_dependencies": [],
+      "reverse_dependencies": [
+        "merge-queue"
+      ],
       "test_files": [
         "py/tests/test_githubhost_rollup.py",
         "py/tests/test_planner_check_outcome.py",
