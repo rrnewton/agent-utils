@@ -122,7 +122,7 @@ FLAT_PAGE = 60
 # How far a row may move and still be said to have stood still: sub-pixel layout, never a jump.
 STILL_PX = 1.0
 # How long a step that could start the page's glide between the columns (`#261 two-column-connectors`,
-# COLUMN_GLIDE_MS = 1500 in web/voice.js) is held before it is judged: longer than that wait, with room.
+# COLUMN_GLIDE_MS = 1500 in web/src/view/channel/columnlinks.ts) is held before it is judged: longer than that wait, with room.
 GLIDE_HOLD_MS = 2500
 
 # The first row of a list whose foot is below the top of its scroller: the row the reader is on.

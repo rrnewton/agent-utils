@@ -653,7 +653,7 @@ LINKS_JS = """() => {
 # The root each thread's card should link to.
 ROOTS = {RUNNER: "202", REPLICA: "209", CANARY: "215"}
 
-# How long the page waits on a selection before gliding to its other end (web/voice.js `COLUMN_GLIDE_MS`).
+# How long the page waits on a selection before gliding to its other end (web/src/view/channel/columnlinks.ts `COLUMN_GLIDE_MS`).
 GLIDE_MS = 1500
 
 

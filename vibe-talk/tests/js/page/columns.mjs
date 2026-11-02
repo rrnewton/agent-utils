@@ -1944,7 +1944,8 @@ test("`#261 two-column-connectors`: a root on Main and its thread's card are joi
     const lanes = snapshots[3].drawn.map((link) => link.line[2]);
     assert.equal(new Set(lanes).size, lanes.length, "two links share a lane");
     // The control: drawn whatever is on screen, the links are more than the pairs on screen.
-    const loose = await run(brokenScript("    if (end.fromSeen && end.toSeen) {", "    if (true) {"));
+    const loose = await run(await brokenModule([{ file: "src/view/channel/columnlinks.ts",
+      find: "    if (end.fromSeen && end.toSeen) {", replace: "    if (true) {" }]));
     assert.notDeepStrictEqual(loose.snapshots[1].drawn.map((link) => link.thread), [],
       "the negative control drew nothing either, so the check above proves nothing");
   } finally {
@@ -2203,7 +2204,8 @@ test("`#280 scroll-stability` x `#261`: the mouse crossing a card on its way els
       "the mouse resting where it chose a card that then moved did not glide Main");
 
     // THE CONTROL: with a mouse that moved on still counted as staying, the crossing glides.
-    const loose = await crossing(brokenScript("  if (pointerOn(followed ? followed.row : null)) return true;", "  return true;"));
+    const loose = await crossing(await brokenModule([{ file: "src/view/channel/columnlinks.ts",
+      find: "    if (pointerOn(followed ? followed.row : null)) return true;", replace: "    return true;" }]));
     await mouseTo(loose.page, threadCard(loose.page, 15), 900, 300);
     await mouseTo(loose.page, dock(loose.page), 1100, 795);
     loose.page.expireTimers(COLUMN_GLIDE_MS);

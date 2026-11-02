@@ -111,7 +111,7 @@ SIZES = (
 # The root of the summarised thread's card on Main.
 RUNNER_ROOT = "202"
 
-# How long the page waits on the mouse resting on what the glide follows (web/voice.js `COLUMN_GLIDE_MS`).
+# How long the page waits on the mouse resting on what the glide follows (web/src/view/channel/columnlinks.ts `COLUMN_GLIDE_MS`).
 GLIDE_MS = 1500
 
 # The card at the top of the right column's thread, the line between the columns, and the boxes they
