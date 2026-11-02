@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-745-c314343a994",
+    "issue_id": "agent-utils-745",
+    "author": "devbig030",
+    "body": "[muse watermelon-full-preview] Delivered on main (45a038f7 stack): a chat bridge whose provider gap stood at least 10 minutes approves its own checkpoint-only or exact-committed retry at startup, writing downtime evidence into the same gap-retries audit an operator approval writes; cursor kept so provider replay backfills the outage window. Fresh gaps and changed boundaries/configurations still refuse to the operator path. Misleading start message fixed: search-path lists are no longer reported as missing credential files, and credential lines name the environment variable as a variable. Tests: outage_gap_auto_resolves_only_after_the_downtime_threshold, a_search_path_list_is_not_a_missing_credential_file; full agentctl Rust suite (1929) and cross differential passed in gate.",
+    "created_at": "2026-11-02T18:48:30.230836579Z",
+    "updated_at": "2026-11-02T18:48:30.230836579Z"
+  }
+]

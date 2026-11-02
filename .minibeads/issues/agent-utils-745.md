@@ -1,6 +1,6 @@
 ---
 title: 'bridge-gap-backfill: chat bridges resolve an outage stream gap themselves and backfill'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 assignee: mu-restore2@devbig030
@@ -9,7 +9,8 @@ labels:
 depends_on:
   agent-utils-740: parent-child
 created_at: 2026-11-02T16:13:53.510234959+00:00
-updated_at: 2026-11-02T16:49:46.888965599+00:00
+updated_at: 2026-11-02T18:48:22.581799871+00:00
+closed_at: 2026-11-02T18:48:22.581799711+00:00
 ---
 
 # Description

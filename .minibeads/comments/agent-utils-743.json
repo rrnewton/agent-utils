@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-743-ca7d18a60e2",
+    "issue_id": "agent-utils-743",
+    "author": "devbig030",
+    "body": "[muse watermelon-full-preview] Partially delivered on main: install-units --bridge NAME (repeatable) writes persistent agentctl-bridge-NAME.service (chat run --bridge-state REGISTRY/bridges/NAME, ordered after herdr-server), replacing the systemd-run transient; services refresh then updates it in place as a unit file, and restore already starts configured units that are missing. Herdr server, boot restore and watch units were already persistent. Remaining: a rendered .timer unit still needs the team spec schedule/command (#742 restore-team-spec, other lane), and the certificate wait lives in restore --boot (#742). Left open for the timer slice once the spec lands.",
+    "created_at": "2026-11-02T18:48:30.234707739Z",
+    "updated_at": "2026-11-02T18:48:30.234707739Z"
+  }
+]
