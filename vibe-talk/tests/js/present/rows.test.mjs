@@ -283,5 +283,6 @@ test("`#624 voice-page-modularity`: the read mode, what an old record means, the
   modes.set("fold");
   assert.equal(modes.hiding(), false);
   const refusing = createReadMode({ storage: () => ({ getItem: () => null, setItem: () => { throw new Error("full"); }, removeItem() {} }) });
-  refusing.keep();
+  assert.doesNotThrow(() => refusing.keep(), "a device refusing storage threw out of keep()");
+  assert.equal(refusing.mode(), "show", "a refused write changed the mode");
 });

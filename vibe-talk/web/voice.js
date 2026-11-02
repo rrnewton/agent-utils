@@ -26413,14 +26413,12 @@ function drawChannelPage(payload, area, at) {
 // Both are follow-ups, and until the second one lands "dealt with" here is always DECLARED — which
 // is why nothing in this file has to decide what happens when derived and declared disagree.
 
-/**
- * Is the reader looking at the to-do list rather than the whole channel? Kept across a reload with
- * the rest of what was on screen, in `UI_STATE_KEY`. `#189 restore-ui-state`.
- *
- * Since `#221 read-modes` this is Hide read, the third of the read modes: the mode being "hide", set
- * only with it. It keeps a question of its own (`readModes.hiding()`) because every read path already
- * asks it the one question it answers, which is whether read messages are left out of the list.
- */
+// Is the reader looking at the to-do list rather than the whole channel? Kept across a reload with
+// the rest of what was on screen, in `UI_STATE_KEY`. `#189 restore-ui-state`. Since `#221 read-modes`
+// this is Hide read, the third of the read modes: the mode being "hide", set only with it. It keeps a
+// question of its own (`readModes.hiding()`) because every read path already asks it the one question
+// it answers, which is whether read messages are left out of the list.
+//
 // The mode itself, its names (READ_MODES, READ_MODE_LABELS, READ_MODE_VERBS, READ_MODE_SAID,
 // READ_MODE_TITLES), its kept copy (READ_MODE_KEY), what an old record means (`savedReadMode`) and the
 // cycle (`nextReadMode`) are web/src/present/rows' (`createReadMode`, `#624 voice-page-modularity`):
