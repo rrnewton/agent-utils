@@ -8,6 +8,48 @@ from pathlib import Path
 from .config import Config
 from .ledger import Ledger
 
+# Canonical current release identity, mirrored from ci-hub
+# `validate/qualifying-receipt.json` (`release_payloads.cargo`, read through
+# `release_builder_of` in ci-hub `qualifying_receipt.py`). That reader ignores
+# the `release_payloads_superseded` map, so a superseded identity (for example
+# the pre-2026-10-01 `target/debug/hermit` cargo payload) never names a builder
+# for landing. Mirror that here: an identity claim is honoured only when it is
+# exactly the current cargo identity (or the configured `release_payload`).
+_CANONICAL_CARGO_PAYLOAD: dict[str, object] = {
+    "path": "target/validate/hermit",
+    "profile": "validate",
+    "debug_assertions": True,
+    "overflow_checks": True,
+}
+
+
+def _canonical_json(value: object) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def _release_identity_ok(cfg: Config, r: dict[str, object]) -> bool:
+    """Whether a row's release_builder/e2e_payload claim may qualify.
+
+    Mirrors ci-hub `qualifying_receipt.release_builder_of`: the two fields are
+    read together, a lone field names no builder, and a payload that is not
+    exactly the current identity for its builder (including every superseded
+    identity, which that reader ignores) names no builder. A row carrying
+    neither field makes no identity claim and is judged by the other clauses.
+    """
+    has_builder = "release_builder" in r
+    has_payload = "e2e_payload" in r
+    if not has_builder and not has_payload:
+        return True
+    if not (has_builder and has_payload):
+        return False
+    expected = cfg.release_payload if cfg.release_payload is not None else _CANONICAL_CARGO_PAYLOAD
+    if cfg.release_payload is None and r.get("release_builder") != "cargo":
+        return False
+    try:
+        return _canonical_json(r.get("e2e_payload")) == _canonical_json(expected)
+    except (TypeError, ValueError):
+        return False
+
 
 def remote_for_commit(cfg: Config, commit: str) -> dict[str, object]:
     """Return cached remote evidence for one exact commit, or unknown."""
@@ -39,6 +81,8 @@ def show(cfg: Config, commit: str, remote: dict[str, object] | None = None) -> d
             return False
         if r.get("commit_anchored") is False:
             return False
+        if not _release_identity_ok(cfg, r):
+            return False  # superseded/mismatched release identity never qualifies (see _release_identity_ok)
         if cfg.require_full_evidence:
             # Ported from the canonical qualifying predicate: full profile and
             # selection, clean tree, no failures, no filtered tests, passed ==

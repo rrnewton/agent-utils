@@ -18,6 +18,11 @@ _SHA256 = re.compile(r"[0-9a-f]{64}")
 _MAX_ROW_BYTES = 48 * 1024 * 1024
 _MAX_COMPRESSED_BYTES = _MAX_ROW_BYTES + 1024 * 1024
 _ROW_REF_FIELDS = frozenset({"codec", "sha256", "bytes", "locator", "compressed_sha256", "compressed_bytes"})
+# Repository identities this (Hermit) ledger counts, mirrored from ci-hub
+# `qualifying_receipt.py` `_HERMIT_REPOS`: an absent `repo` is a Hermit row.
+# Schema-3 `repo=reverie` rows physically inside Hermit shards are Reverie
+# evidence and must not count here.
+_HERMIT_REPOS = (None, "hermit", "rrnewton/hermit")
 
 
 def _now() -> str:
@@ -113,7 +118,7 @@ class Ledger:
                 merged["_digest_ok"] = (expect == ev["digest"])
             merged["_evidence_ok"] = bool(evidence_ok and rows[rid].get("_evidence_ok", True))  # once refused, always refused
             rows[rid] = merged
-        return [rows[r] for r in order]
+        return [rows[r] for r in order if rows[r].get("repo") in _HERMIT_REPOS]
 
     def _resolve_ref(self, codec: dict[str, object], host: str | None = None) -> tuple[dict[str, object], bool]:
         """Dereference one row-ref/v1 evidence object; (row, ok). Refuses on any mismatch."""

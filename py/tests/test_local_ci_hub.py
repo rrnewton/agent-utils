@@ -208,6 +208,43 @@ def test_row_ref_missing_evidence_refuses(tmp_path: Path) -> None:
     assert json.loads(out.stdout)["verdict"] != "qualified"  # missing evidence refuses, never qualifies
 
 
+def test_superseded_release_builder_does_not_qualify(tmp_path: Path) -> None:
+    # Mirrors ci-hub release_builder_of ignoring release_payloads_superseded:
+    # a PASS carrying the superseded target/debug/hermit identity must not
+    # qualify even though this config sets no release_payload.
+    repo, evidence = _row_ref_repo(tmp_path)
+    sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
+    superseded = dict(_full_row(sha, "r1", finished_at="2026-09-30T00:00:00Z"),
+                      release_builder="cargo",
+                      e2e_payload={"path": "target/debug/hermit", "profile": "debug",
+                                   "debug_assertions": True, "overflow_checks": True})
+    _write_ledger(repo, [_row_ref_event(evidence, superseded, event_id="e1")])
+    out = run_cli(repo, "--json", "receipt", "show", "HEAD")
+    assert json.loads(out.stdout)["verdict"] != "qualified"
+    # The current cargo identity still qualifies (the refusal is the superseded payload, not the fields).
+    current = dict(superseded, run_id="r2",
+                   e2e_payload={"path": "target/validate/hermit", "profile": "validate",
+                                "debug_assertions": True, "overflow_checks": True})
+    _write_ledger(repo, [_row_ref_event(evidence, current, event_id="e2")])
+    out = run_cli(repo, "--json", "receipt", "show", "HEAD")
+    assert json.loads(out.stdout)["verdict"] == "qualified"
+
+
+def test_reverie_row_in_hermit_shard_does_not_count(tmp_path: Path) -> None:
+    # Mirrors ci-hub _HERMIT_REPOS filtering: a schema-3 repo=reverie row
+    # physically inside the Hermit shard is not Hermit evidence.
+    repo, evidence = _row_ref_repo(tmp_path)
+    sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
+    reverie = dict(_full_row(sha, "r1"), repo="reverie", schema_version=3)
+    _write_ledger(repo, [_row_ref_event(evidence, reverie, event_id="e1")])
+    out = run_cli(repo, "--json", "receipt", "show", "HEAD")
+    assert json.loads(out.stdout)["verdict"] != "qualified"
+    hermit = dict(reverie, run_id="r2", repo="hermit")
+    _write_ledger(repo, [_row_ref_event(evidence, hermit, event_id="e2")])
+    out = run_cli(repo, "--json", "receipt", "show", "HEAD")
+    assert json.loads(out.stdout)["verdict"] == "qualified"
+
+
 def test_canonical_bytes_deterministic() -> None:
     from local_ci_hub.ledger import canonical_bytes, digest
     a = {"b": 1, "a": {"y": [1, 2], "x": "é"}}
