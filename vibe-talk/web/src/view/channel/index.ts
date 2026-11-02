@@ -75,3 +75,5 @@ export { AUTHOR_CHIP_MS, authorPasses, createAuthorFilter, rowIsMine } from "./a
 export type { AuthorFilter, AuthorFilterDependencies } from "./authorfilter.ts";
 export { createCardPlaces, neighbourStayed, rowNeighbours, sameCardPlace } from "./cardplace.ts";
 export type { CardPlace, CardPlaces, CardPlacesDependencies, Neighbours } from "./cardplace.ts";
+export { createInputKinds } from "./input.ts";
+export type { InputKind, InputKinds, InputKindsDependencies } from "./input.ts";

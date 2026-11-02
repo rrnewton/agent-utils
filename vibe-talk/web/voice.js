@@ -7738,63 +7738,33 @@ function keepSelection() {
 // --- the mouse and the keys move one selection (`#239 single-selection`)
 
 /**
- * What the reader used last: "keys", "mouse", or "touch" for a finger or a pen; "" before any of
- * them. A selection made by a click, a jump or the focus arriving on a row is drawn after the keys
- * or the mouse, and silent after a touch or anything unknown (`drawnBy`).
+ * What the reader used last — keys, mouse, or a finger or a pen — said on the root element for
+ * web/voice.css, and where the mouse last moved, telling a mouse really moving from a list scrolled under
+ * a still pointer: web/src/view/channel's (`createInputKinds`, `#624 voice-page-modularity`).
  */
-let inputKind = "";
+const inputKinds = createInputKinds({ root: () => document.documentElement });
 
 /** Whether a selection made now is drawn, with a ring and the focus: after the keys or the mouse. */
-const drawnBy = () => inputKind === "keys" || inputKind === "mouse";
+const drawnBy = () => inputKinds.drawnBy();
 
-/**
- * The keys are in use: noted, and said on the root element as `data-input="keys"` until the mouse
- * really moves. web/voice.css holds back what a pointer resting over a list would light while it is
- * there, so a key that scrolls the list under a still pointer lights nothing it did not select.
- */
+/** The keys are in use: noted, and said on the root element as `data-input="keys"`. */
 function keysInUse() {
-  inputKind = "keys";
-  const root = document.documentElement;
-  if (root.getAttribute("data-input") !== "keys") root.setAttribute("data-input", "keys");
+  inputKinds.keys();
 }
 
 /** The mouse is in use: noted, and the keys' `data-input` taken off the root element. */
 function mouseInUse() {
-  inputKind = "mouse";
-  const root = document.documentElement;
-  if (root.hasAttribute("data-input")) root.removeAttribute("data-input");
+  inputKinds.mouse();
 }
 
-/**
- * A finger or a pen is in use: noted, and said on the root as `data-input="touch"` until the mouse
- * moves or a key is pressed. A touch laptop has a mouse too, and answers the pointer media queries as
- * a desk does, so its finger would lose the focus tint a touch screen keeps; web/voice.css gives the
- * tint to the attribute as well.
- */
+/** A finger or a pen is in use: noted, and said on the root as `data-input="touch"`. */
 function touchInUse() {
-  inputKind = "touch";
-  const root = document.documentElement;
-  if (root.getAttribute("data-input") !== "touch") root.setAttribute("data-input", "touch");
+  inputKinds.touch();
 }
 
-/** Where the mouse was at its last move, in the viewport, or null before the first. */
-let mouseAt = null;
-
-/**
- * Whether a `pointermove` is a mouse really moving: a mouse's, somewhere other than the last one
- * was. A list scrolled under a pointer standing still (by a key, or by a message arriving) makes some
- * browsers report a move to put `:hover` right, and it reports the same place; a finger or a pen is
- * not a mouse. With no move before it to compare, the first counts, unless the keys are in use and it
- * says it did not move: that is the one a key's scroll can make before the mouse has moved at all.
- */
+/** Whether a `pointermove` is a mouse really moving (`InputKinds.mouseMoved`, which says how it is told). */
 function mouseMoved(event) {
-  if (!event || event.pointerType !== "mouse") return false;
-  const x = Number(event.clientX);
-  const y = Number(event.clientY);
-  const was = mouseAt;
-  mouseAt = { x, y };
-  if (was === null) return inputKind !== "keys" || Boolean(event.movementX || event.movementY);
-  return was.x !== x || was.y !== y;
+  return inputKinds.mouseMoved(event);
 }
 
 /**
@@ -27323,7 +27293,7 @@ function renderDraftMarkers() {
 // the outbox and the row's Reply label are here, handed to it.
 const quoteOwner = createQuoting({
   byId: (id) => /** @type {any} */ (leftEl(id)),
-  inputKind: () => inputKind,
+  inputKind: () => inputKinds.kind(),
   drawReplyLabel: (button) => drawReplyLabel(button),
   selectedChannelId: () => String(selectedChannelId() || ""),
   replyRoute: (message, bound) => replyRoute(message, bound),
@@ -31319,7 +31289,7 @@ function toggleLitCard(id, row) {
   // `#280 scroll-stability`. A card highlighted by a click, the mouse resting on it, waits to glide Main
   // to its root, as the mouse resting on a selection does; Enter on it, as every selection the keys make,
   // glides nothing.
-  if (litCards.get(channel) === id && inputKind === "mouse" && pointerOn(row)) dwellColumnGlide(pane, row);
+  if (litCards.get(channel) === id && inputKinds.kind() === "mouse" && pointerOn(row)) dwellColumnGlide(pane, row);
   if (before === null || !row.parentNode) return;
   // `#338 column-overscroll`. In the room past the right column's foot, the room is fitted to the card as it
   // now is before the card is put back: the last card put out would otherwise be held by the end of the list
@@ -32040,7 +32010,7 @@ const columnLinks = createColumnLinks({
   litCard: () => litCardOnRight(),
   cardRow: (thread) => cardRowOnRight(thread),
   hue: (thread) => threadHue(thread),
-  mouse: () => mouseAt,
+  mouse: () => inputKinds.mouseAt(),
   drawnTop: (row) => drawnTop(row),
   landingGap: () => REPLY_LANDING_GAP_PX,
 });

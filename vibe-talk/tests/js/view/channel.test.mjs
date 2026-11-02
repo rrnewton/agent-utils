@@ -263,3 +263,26 @@ test("`#624 voice-page-modularity`: a card's neighbours, whether it stayed besid
   assert.equal(sameCardPlace({ newest: false, id: "a", offset: 10 }, { newest: false, id: "a", offset: 12 }), false);
   assert.equal(sameCardPlace(null, { newest: true, id: null, offset: 0 }), false);
 });
+
+test("`#624 voice-page-modularity`: what the reader used last, said on the root, and a mouse really moving, from the module alone", () => {
+  const { createInputKinds } = CHANNEL_VIEW;
+  const attrs = new Map();
+  const root = { getAttribute: (n) => attrs.get(n) ?? null, setAttribute: (n, v) => attrs.set(n, v),
+    hasAttribute: (n) => attrs.has(n), removeAttribute: (n) => attrs.delete(n) };
+  const input = createInputKinds({ root: () => root });
+  assert.deepStrictEqual([input.kind(), input.drawnBy(), input.mouseAt()], ["", false, null]);
+  input.keys();
+  assert.deepStrictEqual([input.kind(), input.drawnBy(), attrs.get("data-input")], ["keys", true, "keys"]);
+  // The first pointermove while the keys are in use counts only if it says it moved.
+  assert.equal(input.mouseMoved({ pointerType: "mouse", clientX: 5, clientY: 5, movementX: 0, movementY: 0 }), false);
+  assert.equal(input.mouseMoved({ pointerType: "mouse", clientX: 5, clientY: 5 }), false, "the same place counted as a move");
+  assert.equal(input.mouseMoved({ pointerType: "mouse", clientX: 6, clientY: 5 }), true);
+  assert.equal(input.mouseMoved({ pointerType: "pen", clientX: 9, clientY: 9 }), false, "a pen counted as a mouse");
+  assert.deepStrictEqual(input.mouseAt(), { x: 6, y: 5 });
+  input.mouse();
+  assert.deepStrictEqual([input.kind(), attrs.has("data-input")], ["mouse", false]);
+  input.touch();
+  assert.deepStrictEqual([input.kind(), input.drawnBy(), attrs.get("data-input")], ["touch", false, "touch"]);
+  const fresh = createInputKinds({ root: () => root });
+  assert.equal(fresh.mouseMoved({ pointerType: "mouse", clientX: 1, clientY: 1 }), true, "the first move before the keys did not count");
+});

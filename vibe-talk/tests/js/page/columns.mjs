@@ -2716,7 +2716,7 @@ test("`#280 scroll-stability` x `#277 thread-card-focus`: a card highlighted by 
 
     // THE CONTROL: a highlight that arms whoever made it glides on Enter, so the test can tell.
     const loose = await cardsAtFoot(brokenScript(
-      "if (litCards.get(channel) === id && inputKind === \"mouse\" && pointerOn(row)) dwellColumnGlide(pane, row);",
+      "if (litCards.get(channel) === id && inputKinds.kind() === \"mouse\" && pointerOn(row)) dwellColumnGlide(pane, row);",
       "if (litCards.get(channel) === id) dwellColumnGlide(pane, row);"));
     await enterCard(loose.page, 15);
     loose.page.expireTimers(COLUMN_GLIDE_MS);

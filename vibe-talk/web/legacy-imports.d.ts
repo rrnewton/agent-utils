@@ -246,6 +246,7 @@ declare const createBookmarkLines: LegacyImports["createBookmarkLines"];
 declare const SWIPE_COMMIT_PX: LegacyImports["SWIPE_COMMIT_PX"];
 declare const createRowGestures: LegacyImports["createRowGestures"];
 declare const createSeamLines: LegacyImports["createSeamLines"];
+declare const createInputKinds: LegacyImports["createInputKinds"];
 declare const createCardPlaces: LegacyImports["createCardPlaces"];
 declare const neighbourStayed: LegacyImports["neighbourStayed"];
 declare const rowNeighbours: LegacyImports["rowNeighbours"];

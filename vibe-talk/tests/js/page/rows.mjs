@@ -3123,7 +3123,7 @@ test("a touch screen keeps its focus tint, and a desk draws the focused row only
       assert.match(part, /^:root\[data-input="touch"\] /, `${part} lights the focus on a desk, beside the selection`);
     }
   }
-  assert.match(SCRIPT_CODE, /setAttribute\("data-input", "touch"\)/, "nothing says a finger is in use");
+  assert.match(PAGE_CODE, /setAttribute\("data-input", "touch"\)/, "nothing says a finger is in use");
 });
 
 // --- two messages that are really one -----------------------------------------------------------
