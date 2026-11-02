@@ -15,7 +15,9 @@ closed_at: 2026-11-02T17:37:52.817656898+00:00
 
 [opus 5.5] 2026-11-02 16:17:10Z on one host: a coordinator running as a Claude TUI, resumed from a headless coordinator's session (session lineage rebound from the headless record's session to its own), ran 'agentctl --registry <registry> stop coordinator --handover-to <itself>' with the services snapshot built at 2e454a81. The call returned 137 and the CALLER's own Claude process was then terminated (SIGTERM); the headless unit did stop. Likely cause: stop's process matching (native session id, cmdline, ancestor walk) resolved to the caller because it shares the session lineage with the record being stopped. Requirements: (1) confirm the matching path in the stop code; (2) stop refuses to signal its own caller or any ancestor of it, and refuses to signal a process that belongs to a different live record; (3) regression test: a fake record whose recorded session or cmdline matches the caller's own process tree; stop must not signal the caller; (4) land under the usual gate. Also decide and document whether stop of a headless record should signal anything beyond its systemd unit. (Gap 27 in a consumer team's restore plan.)
 
-# Resolution
+# Notes
+
+## Resolution
 
 [opus 5.5] Matching path confirmed. `stop` of a headless record signals nothing itself: it sends the wrapper `{"op": "stop"}` over its control socket. When the harness exits, the wrapper's `harness_exited` ends the harness's process group. It then called `session_processes(session)`, which scans all of `/proc` for any non-agentctl process whose argv names the session (`--resume S` / `--session-id S`), and SIGTERMs those, then SIGKILLs any left after 5 s. The caller's Claude Code had been resumed with `--resume S` on the headless session, so it counted as a "leftover writer" and was terminated. The `agentctl stop` beneath it died with it (137).
 
