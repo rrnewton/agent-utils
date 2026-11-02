@@ -79,6 +79,25 @@ fn remote_files(fx: &Fixture) -> String {
     git(&fx.remote(), &["ls-tree", "-r", "--name-only", "main"])
 }
 
+fn setup_validator(tag: &str, validator_run: &str, extra: &[&str]) -> Fixture {
+    let fx = Fixture::new(tag);
+    fx.write("tests/t0", "ok\n");
+    fx.commit_all("seed tests");
+    git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
+    let mut args = vec![
+        "init",
+        "--remote",
+        "origin",
+        "--validator",
+        "command",
+        "--validator-run",
+        validator_run,
+    ];
+    args.extend_from_slice(extra);
+    fx.mq_ok(&args);
+    fx
+}
+
 fn status(fx: &Fixture, pr: i64) -> String {
     let items: Value = serde_json::from_str(&fx.mq_ok(&["list", "--all", "--json"])).unwrap();
     items
@@ -88,6 +107,111 @@ fn status(fx: &Fixture, pr: i64) -> String {
         .find(|i| i["pr"] == pr)
         .map(|i| i["status"].as_str().unwrap().to_owned())
         .unwrap()
+}
+
+#[test]
+fn refusal_exit75_keeps_change_queued_and_is_neither_red_nor_pass() {
+    // Admission refuses every validation: exit 75 with the COULD_NOT_RUN marker.
+    // No within-run retries, long cross-run backoff, so the deferral is observable.
+    let fx = setup_validator(
+        "run-refusal",
+        "echo COULD_NOT_RUN; exit 75",
+        &["--refusal-max-retries", "0", "--refusal-backoff-secs", "60"],
+    );
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    let before = fx.remote_main();
+    let out = fx.mq(&["run", "--json"]);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "refused run must not report success"
+    );
+    let r = report(&String::from_utf8_lossy(&out.stdout));
+    // Never a pass: nothing landed. Never red: nothing ejected, no culprit search.
+    assert!(r["landed"].as_array().unwrap().is_empty(), "{r}");
+    assert!(r["ejected"].as_array().unwrap().is_empty(), "{r}");
+    assert_eq!(r["deferred"][0]["prs"], serde_json::json!([1]), "{r}");
+    assert!(
+        r["stopped"]
+            .as_str()
+            .unwrap()
+            .contains("validation refused"),
+        "{}",
+        r["stopped"]
+    );
+    // Every validation is refused, not green and not red.
+    assert!(!r["validations"].as_array().unwrap().is_empty());
+    for v in r["validations"].as_array().unwrap() {
+        assert_eq!(v["refused"], true, "{v}");
+        assert_eq!(v["green"], false, "{v}");
+        assert_eq!(v["failed"], serde_json::json!([]), "{v}");
+    }
+    assert_eq!(fx.remote_main(), before);
+    // The distinct non-terminal state: still queued, with refusal bookkeeping.
+    assert_eq!(status(&fx, 1), "queued");
+    let items: Value = serde_json::from_str(&fx.mq_ok(&["list", "--all", "--json"])).unwrap();
+    let item = &items.as_array().unwrap()[0];
+    assert_eq!(item["validation_refusals"], 1, "{item}");
+    assert!(
+        !item["next_retry_at"].as_str().unwrap().is_empty(),
+        "{item}"
+    );
+    assert!(
+        item["last_refusal"].as_str().unwrap().contains("75"),
+        "{item}"
+    );
+    let history_kinds: Vec<&str> = item["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap())
+        .collect();
+    assert!(
+        history_kinds.contains(&"validation-refused"),
+        "{history_kinds:?}"
+    );
+    assert!(!history_kinds.contains(&"ejected"), "{history_kinds:?}");
+    // While the backoff runs, the plan holds the change as validation-refused.
+    let plan: Value = serde_json::from_str(&fx.mq_ok(&["plan", "--json"])).unwrap();
+    assert!(plan["batches"].as_array().unwrap().is_empty(), "{plan}");
+    assert_eq!(plan["held"][0]["kind"], "validation-refused", "{plan}");
+}
+
+#[test]
+fn refusal_is_retried_with_backoff_and_then_lands() {
+    // Refuse twice (exit 75), then pass: the same run retries and lands.
+    let counter = "refusal-counter";
+    let script = "c=$(cat \"$REFUSAL_COUNTER\" 2>/dev/null || echo 0); c=$((c+1)); echo $c > \"$REFUSAL_COUNTER\"; if [ $c -le 2 ]; then echo COULD_NOT_RUN; exit 75; fi; exit 0";
+    let fx = setup_validator(
+        "run-refusal-retry",
+        script,
+        &["--refusal-max-retries", "3", "--refusal-backoff-secs", "0"],
+    );
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    let counter_path = fx.root.join(counter);
+    let out = fx.mq_env(
+        &["run", "--json"],
+        &[("REFUSAL_COUNTER", counter_path.to_str().unwrap())],
+    );
+    assert!(
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let r = report(&String::from_utf8_lossy(&out.stdout));
+    assert_eq!(landed_prs(&r), vec![vec![1]], "{r}");
+    assert!(r["ejected"].as_array().unwrap().is_empty(), "{r}");
+    assert!(r["deferred"].as_array().is_none_or(|d| d.is_empty()), "{r}");
+    // Two refused attempts, then the green attempt: refusals visible, not red.
+    let validations = r["validations"].as_array().unwrap();
+    assert_eq!(validations.len(), 3, "{r}");
+    assert_eq!(validations[0]["refused"], true);
+    assert_eq!(validations[1]["refused"], true);
+    assert_eq!(validations[2]["green"], true);
+    assert_eq!(status(&fx, 1), "landed");
 }
 
 #[test]

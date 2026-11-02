@@ -28,6 +28,20 @@ use crate::tests::{Outcome, Selection, TestId, TestResult, TestResults};
 /// Test ID used when a runner failed without attributing the failure to any test.
 pub const UNATTRIBUTED: &str = "(unattributed)";
 
+/// Exit status signalling a temporary admission refusal: retry later, never a pass and never a
+/// failure of the change under validation (`EX_TEMPFAIL`).
+pub const REFUSAL_EXIT: i32 = 75;
+
+/// Marker printed by an admission wrapper when it refuses to run validation at all.
+pub const REFUSAL_MARKER: &str = "COULD_NOT_RUN";
+
+/// Whether an exit status and combined runner output describe an admission refusal rather
+/// than a validation result. A refusal means validation did not run: it must not be treated
+/// as green, must not be treated as red, and must not attribute any test failure.
+pub fn is_refusal(exit: Option<i32>, log_text: &str) -> bool {
+    exit == Some(REFUSAL_EXIT) || log_text.contains(REFUSAL_MARKER)
+}
+
 /// One finished validation.
 #[derive(Clone, Debug)]
 pub struct Ran {
@@ -44,19 +58,31 @@ pub struct Ran {
     /// Opaque handle the runner wrote to `$MQ_HANDLE_FILE`, if any; passed back as
     /// `$MQ_RERUN_FROM` to a later validation of the same commit.
     pub handle: Option<String>,
+    /// Admission refused to run validation at all (exit 75 or `COULD_NOT_RUN`): validation
+    /// did not run, so this is neither green nor red.
+    pub refused: bool,
 }
 
 impl Ran {
+    /// Whether admission refused to run validation at all. A refusal is neither a pass nor
+    /// a failure: the change stays queued and validation is retried later.
+    pub fn refused(&self) -> bool {
+        self.refused
+    }
+
     /// Whether the run is green: every result non-blocking and the runner exited zero.
+    /// A refusal is never green.
     pub fn green(&self) -> bool {
-        !self.cancelled && self.exit == Some(0) && self.results.green()
+        !self.cancelled && !self.refused && self.exit == Some(0) && self.results.green()
     }
 
     /// Whether this run reproduces a failure, for a culprit search: some test actually failed
     /// or errored, or the runner exited non-zero. Tests that were merely unreported do not
-    /// count (they may not exist at that commit).
+    /// count (they may not exist at that commit). A refusal never reproduces a failure.
     pub fn reproduces(&self) -> bool {
-        !self.cancelled && (!self.results.attributed_failures().is_empty() || self.exit != Some(0))
+        !self.cancelled
+            && !self.refused
+            && (!self.results.attributed_failures().is_empty() || self.exit != Some(0))
     }
 
     /// The failures a culprit search attributes to this run.
@@ -69,7 +95,11 @@ impl Ran {
     }
 
     /// Failed tests. A red run with no attributed failure reports [`UNATTRIBUTED`].
+    /// A refusal or a cancelled run reports no failed tests.
     pub fn failed(&self) -> BTreeSet<TestId> {
+        if self.refused || self.cancelled {
+            return BTreeSet::new();
+        }
         let failed = self.results.failed();
         if failed.is_empty() && !self.green() {
             return [TestId::step(UNATTRIBUTED)].into();
@@ -400,6 +430,12 @@ impl Validator for CommandValidator {
             }
         }
         results.require(selection);
+        let log_text = std::fs::read_to_string(&log).unwrap_or_default();
+        let refused = !cancelled && is_refusal(exit, &log_text);
+        if refused {
+            // Validation did not run: keep no test verdict from this attempt.
+            results = TestResults::default();
+        }
         Ok(Ran {
             results,
             exit,
@@ -407,6 +443,7 @@ impl Validator for CommandValidator {
             log,
             cancelled,
             handle: read_handle(out),
+            refused,
         })
     }
 }
@@ -547,6 +584,7 @@ impl Validator for DagrunValidator {
                     log: out.join("run.log"),
                     cancelled: false,
                     handle: None,
+                    refused: false,
                 });
             }
             argv.push("--selected".to_owned());
@@ -567,6 +605,11 @@ impl Validator for DagrunValidator {
             .tests()
             .map(|tests| Selection::of(tests.iter().map(TestId::whole_step)));
         results.require(whole_steps.as_ref().unwrap_or(selection));
+        let log_text = std::fs::read_to_string(&log).unwrap_or_default();
+        let refused = !cancelled && is_refusal(exit, &log_text);
+        if refused {
+            results = TestResults::default();
+        }
         Ok(Ran {
             results,
             exit,
@@ -574,6 +617,7 @@ impl Validator for DagrunValidator {
             log,
             cancelled,
             handle: read_handle(out),
+            refused,
         })
     }
 }
@@ -751,6 +795,65 @@ dagrun: PASS - 1 passed";
             let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o700);
         }
+    }
+
+    #[test]
+    fn refusal_exit_75_is_neither_green_nor_red() {
+        let tmp = TempDir::new("validate-refusal");
+        let v = from_config(&config("echo COULD_NOT_RUN; exit 75")).unwrap();
+        let ran = v
+            .run(
+                &tmp.0,
+                &Selection::of([TestId::step("a")]),
+                &tmp.0.join("o"),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert!(ran.refused());
+        assert!(!ran.green(), "a refusal must never be a pass");
+        assert!(
+            !ran.reproduces(),
+            "a refusal must never reproduce a failure"
+        );
+        assert!(
+            ran.failed().is_empty(),
+            "a refusal attributes no test failure"
+        );
+        assert_eq!(ran.exit, Some(REFUSAL_EXIT));
+    }
+
+    #[test]
+    fn refusal_marker_without_exit_75_is_still_a_refusal() {
+        let tmp = TempDir::new("validate-refusal-marker");
+        let v = from_config(&config("echo COULD_NOT_RUN; exit 4")).unwrap();
+        let ran = v
+            .run(
+                &tmp.0,
+                &Selection::All,
+                &tmp.0.join("o"),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert!(ran.refused());
+        assert!(!ran.green());
+        assert!(ran.failed().is_empty());
+    }
+
+    #[test]
+    fn ordinary_failure_is_not_a_refusal() {
+        let tmp = TempDir::new("validate-not-refusal");
+        let v = from_config(&config("exit 1")).unwrap();
+        let ran = v
+            .run(
+                &tmp.0,
+                &Selection::All,
+                &tmp.0.join("o"),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert!(!ran.refused());
+        assert!(!ran.green());
+        assert!(ran.reproduces());
     }
 
     #[test]

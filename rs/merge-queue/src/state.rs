@@ -62,7 +62,40 @@ pub struct ValidatorConfig {
     /// Off by default: caches make validations fast, at the cost of trusting the build to be
     /// hermetic with respect to them.
     pub clean_ignored: bool,
+    /// Extra attempts after an admission refusal (exit 75 / `COULD_NOT_RUN`) within one run,
+    /// each after a backoff delay.
+    #[serde(default = "default_refusal_max_retries")]
+    pub refusal_max_retries: usize,
+    /// Base backoff in seconds between refusal retries; doubled per attempt, capped at 60.
+    /// 0 means no delay between retries (used by tests).
+    #[serde(default = "default_refusal_backoff_secs")]
+    pub refusal_backoff_secs: u64,
 }
+
+fn default_refusal_max_retries() -> usize {
+    DEFAULT_REFUSAL_MAX_RETRIES
+}
+
+fn default_refusal_backoff_secs() -> u64 {
+    DEFAULT_REFUSAL_BACKOFF_SECS
+}
+
+impl ValidatorConfig {
+    /// Resolved refusal retries (stored verbatim; missing in an old config means default).
+    pub fn refusal_retries(&self) -> usize {
+        self.refusal_max_retries
+    }
+
+    /// Resolved base backoff in seconds (stored verbatim; 0 = no delay).
+    pub fn refusal_backoff(&self) -> u64 {
+        self.refusal_backoff_secs
+    }
+}
+
+/// Default extra refusal retries within one run when the config does not set one.
+pub const DEFAULT_REFUSAL_MAX_RETRIES: usize = 3;
+/// Default base refusal backoff in seconds for a newly initialised queue.
+pub const DEFAULT_REFUSAL_BACKOFF_SECS: u64 = 2;
 
 /// How a validated candidate reaches the base branch.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

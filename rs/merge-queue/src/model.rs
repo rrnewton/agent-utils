@@ -98,6 +98,17 @@ pub struct Item {
     /// Landed, but closing the pull request is still owed (the request budget ran out).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub close_pending: bool,
+    /// How many times validation admission refused to run this change (retry-later). The
+    /// change stays `queued` across refusals; this count drives the backoff.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub validation_refusals: u32,
+    /// RFC 3339 UTC time before which validation should not be retried after a refusal
+    /// (empty when not deferred).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub next_retry_at: String,
+    /// Detail of the most recent refusal (exit status and marker), for the operator.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub last_refusal: String,
     /// Lifecycle state.
     #[serde(default)]
     pub status: ItemStatus,
@@ -109,7 +120,19 @@ pub struct Item {
     pub history: Vec<Event>,
 }
 
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
 impl Item {
+    /// Whether this queued change is deferred until `at` (RFC 3339, second precision, so a
+    /// lexicographic comparison is a time comparison) after a validation refusal.
+    pub fn is_deferred_at(&self, at: &str) -> bool {
+        self.status == ItemStatus::Queued
+            && !self.next_retry_at.is_empty()
+            && self.next_retry_at.as_str() > at
+    }
+
     /// Append a history event stamped now.
     pub fn log(&mut self, kind: &str, detail: impl Into<String>) {
         self.history.push(Event {

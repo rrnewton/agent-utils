@@ -157,6 +157,15 @@ enum Command {
         /// Seconds before one validation is killed and counted as errors (0 = no limit).
         #[arg(long, default_value_t = 0)]
         timeout: u64,
+        /// Extra attempts after an admission refusal (exit 75 / COULD_NOT_RUN) within one
+        /// run, each after a backoff delay. A refusal is never a pass and never red: the
+        /// change stays queued.
+        #[arg(long, default_value_t = crate::state::DEFAULT_REFUSAL_MAX_RETRIES)]
+        refusal_max_retries: usize,
+        /// Base backoff in seconds between refusal retries (doubled per attempt, capped
+        /// at 60). 0 = no delay.
+        #[arg(long, default_value_t = crate::state::DEFAULT_REFUSAL_BACKOFF_SECS)]
+        refusal_backoff_secs: u64,
         /// Delete ignored files (build caches) from reused checkouts before each validation.
         #[arg(long)]
         clean_ignored: bool,
@@ -522,6 +531,8 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             dagrun,
             admission,
             timeout,
+            refusal_max_retries,
+            refusal_backoff_secs,
             clean_ignored,
             land,
             land_command,
@@ -594,6 +605,8 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     admission,
                     timeout_secs: timeout,
                     clean_ignored,
+                    refusal_max_retries,
+                    refusal_backoff_secs,
                 },
                 land: LandConfig {
                     driver: land,
@@ -800,8 +813,14 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             let _lock = state.lock()?;
             let report = run::widen(&state)?;
             print_report(&report, json)?;
-            let red = report.validations.iter().any(|v| !v.green);
-            Ok(if red { 3 } else { 0 })
+            // A refusal is not red, but it also discharged nothing: exit 3 (retry later),
+            // never 0-as-pass on a refused complete run.
+            let refused = report.validations.iter().any(|v| v.refused);
+            let red = report
+                .validations
+                .iter()
+                .any(|v| !v.green && !v.refused && !v.cancelled);
+            Ok(if red || refused { 3 } else { 0 })
         }
         Command::Obligations { all, json } => {
             let obligations: Vec<_> = state

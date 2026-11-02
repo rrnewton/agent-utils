@@ -177,6 +177,34 @@ pub fn make_plan(
         }
     }
 
+    // Deferred after a validation refusal: not landable until the backoff expires. This is
+    // a non-terminal queued state, distinct from every failure hold: it is not red, the
+    // change is not ejected, and no test is blamed.
+    let at = now();
+    for item in &queued {
+        if item.is_deferred_at(&at) {
+            hold(
+                &mut held,
+                Held {
+                    pr: item.pr,
+                    kind: "validation-refused".into(),
+                    reason: format!(
+                        "validation admission refused to run ({}); stays queued, retry after {} (refusal {})",
+                        if item.last_refusal.is_empty() {
+                            "retry later".to_owned()
+                        } else {
+                            item.last_refusal.clone()
+                        },
+                        item.next_retry_at,
+                        item.validation_refusals
+                    ),
+                    with: vec![],
+                    paths: vec![],
+                },
+            );
+        }
+    }
+
     for item in &queued {
         if let Some(external) = probe.external.get(&item.pr) {
             hold(&mut held, external.clone());
@@ -475,6 +503,9 @@ mod unit {
             requires: vec![],
             source: String::new(),
             close_pending: false,
+            validation_refusals: 0,
+            next_retry_at: String::new(),
+            last_refusal: String::new(),
             status: ItemStatus::Queued,
             landed_as: String::new(),
             history: vec![],
@@ -557,6 +588,25 @@ mod unit {
         assert!(plan.batches.is_empty());
         let kinds: Vec<_> = plan.held.iter().map(|h| h.kind.as_str()).collect();
         assert_eq!(kinds, ["head-moved", "head-missing", "conflicts-with-base"]);
+    }
+
+    #[test]
+    fn deferred_after_refusal_is_held_not_batched() {
+        let mut items = vec![item(1, 100, "t1"), item(2, 100, "t2")];
+        items[0].validation_refusals = 2;
+        items[0].next_retry_at = "9999-01-01T00:00:00Z".into();
+        items[0].last_refusal = "exit 75 COULD_NOT_RUN".into();
+        let plan = make_plan(&items, "main", "B", &probe_for(&items), opts(4));
+        assert_eq!(plan.batches.len(), 1);
+        assert_eq!(plan.batches[0].prs, vec![2]);
+        assert_eq!(plan.held.len(), 1);
+        assert_eq!(plan.held[0].pr, 1);
+        assert_eq!(plan.held[0].kind, "validation-refused");
+        // Once the retry time has passed the change is planned again.
+        items[0].next_retry_at = "2000-01-01T00:00:00Z".into();
+        let plan = make_plan(&items, "main", "B", &probe_for(&items), opts(4));
+        assert!(plan.held.is_empty());
+        assert_eq!(plan.batches[0].prs, vec![1, 2]);
     }
 
     #[test]

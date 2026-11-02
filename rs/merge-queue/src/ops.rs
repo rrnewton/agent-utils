@@ -192,6 +192,9 @@ fn submit_resolved(
         ));
     }
     let existing = state.item(submission.pr)?;
+    // A resubmission at a new head is a new validation attempt: clear any refusal deferral.
+    // A resubmission at the same head keeps the count so backoff is not reset by resubmitting.
+    let same_head = existing.as_ref().is_some_and(|old| old.head == current);
     let mut item = Item {
         pr: submission.pr,
         head_ref: submission.head_ref,
@@ -207,6 +210,25 @@ fn submit_resolved(
         requires: submission.requires,
         source: submission.source,
         close_pending: false,
+        validation_refusals: if same_head {
+            existing.as_ref().map_or(0, |old| old.validation_refusals)
+        } else {
+            0
+        },
+        next_retry_at: if same_head {
+            existing
+                .as_ref()
+                .map_or_else(String::new, |old| old.next_retry_at.clone())
+        } else {
+            String::new()
+        },
+        last_refusal: if same_head {
+            existing
+                .as_ref()
+                .map_or_else(String::new, |old| old.last_refusal.clone())
+        } else {
+            String::new()
+        },
         status: ItemStatus::Queued,
         landed_as: String::new(),
         history: existing.map(|old| old.history).unwrap_or_default(),

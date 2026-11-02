@@ -118,6 +118,19 @@ pub struct Ejection {
     pub report: PathBuf,
 }
 
+/// One batch deferred after a validation refusal: still queued, retry after backoff.
+#[derive(Clone, Debug, Serialize)]
+pub struct Deferred {
+    /// Changes deferred, in order.
+    pub prs: Vec<i64>,
+    /// Why validation was refused (exit status / marker).
+    pub reason: String,
+    /// RFC 3339 UTC time before which validation should not be retried.
+    pub retry_after: String,
+    /// Refusal count recorded on the changes after this deferral.
+    pub refusals: u32,
+}
+
 /// One validation the run performed.
 #[derive(Clone, Debug, Serialize)]
 pub struct ValidationRecord {
@@ -133,8 +146,12 @@ pub struct ValidationRecord {
     pub selection: Selection,
     /// Policy that chose it.
     pub policy: String,
-    /// Whether it was green.
+    /// Whether it was green. A refusal is never green.
     pub green: bool,
+    /// Whether admission refused to run it (exit 75 / `COULD_NOT_RUN`). A refusal is
+    /// neither green nor red and attributes no failed test.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub refused: bool,
     /// Whether the queue cancelled it (its candidate was discarded).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub cancelled: bool,
@@ -170,6 +187,9 @@ pub struct RunReport {
     pub ejected: Vec<Ejection>,
     /// Changes returned to the queue for a later run (dependents of ejected changes).
     pub requeued: Vec<i64>,
+    /// Batches deferred after a validation refusal (still queued, retry after backoff).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub deferred: Vec<Deferred>,
     /// Generated files regenerated on candidates.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub regenerated: Vec<Regeneration>,
@@ -257,6 +277,9 @@ enum BatchOutcome {
     BaseMoved(Vec<i64>),
     /// Stop the queue; these changes go back to the front of the queue.
     Stop(String, Vec<i64>),
+    /// Validation admission refused: the batch stays queued and is retried after backoff.
+    /// Never an ejection and never a landing.
+    Deferred(String, Vec<i64>),
 }
 
 /// Worktree slots for concurrent validations, reused between candidates.
@@ -369,6 +392,8 @@ enum Culprit {
     BaseRed(BTreeSet<TestId>),
     /// The full candidate passed the focus on rerun.
     Flaky(BTreeSet<TestId>),
+    /// A probe was refused by admission: no culprit can be named; defer the batch.
+    Refused(String),
     /// The change at `index` makes the focus fail (seen twice) and the prefix before it passes.
     Found {
         index: usize,
@@ -381,6 +406,30 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Backoff before refusal retry `attempt` (0-based): base doubled per attempt, capped at 60s.
+/// A base of 0 means no delay.
+pub fn refusal_backoff(attempt: u32, base_secs: u64) -> Duration {
+    if base_secs == 0 {
+        return Duration::ZERO;
+    }
+    let factor = 1u64.checked_shl(attempt.min(6)).unwrap_or(64);
+    Duration::from_secs((base_secs.saturating_mul(factor)).min(60))
+}
+
+/// RFC 3339 time `delay` from now, for a deferred change's `next_retry_at`.
+fn retry_after_time(delay: Duration) -> String {
+    let at = chrono::Utc::now() + chrono::Duration::from_std(delay).unwrap_or_default();
+    at.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+/// Human detail for a refused validation.
+fn refusal_detail(ran: &Ran) -> String {
+    match ran.exit {
+        Some(code) => format!("exit {code} ({})", crate::validate::REFUSAL_MARKER),
+        None => format!("no exit status ({})", crate::validate::REFUSAL_MARKER),
+    }
 }
 
 /// A queue run in progress. All state is behind locks, so validation threads and the landing
@@ -516,6 +565,105 @@ impl<'a> Runner<'a> {
         }
         let (base, _) = ops::refresh(&self.git, &self.config, &[])?;
         Ok(base)
+    }
+
+    /// Record a refusal deferral for `prs`: each change stays `queued`, its refusal count
+    /// grows, and `next_retry_at` is set from the backoff for that count. Returns the
+    /// retry-after time and the new refusal count (from the first change).
+    fn defer_refusal(&self, prs: &[i64], detail: &str) -> Result<(String, u32), String> {
+        let base = self.config.validator.refusal_backoff();
+        let mut retry_after = String::new();
+        let mut refusals = 0u32;
+        if !self.simulating() {
+            let mut items = lock(&self.items);
+            for pr in prs {
+                if let Some(item) = items.get_mut(pr) {
+                    item.validation_refusals = item.validation_refusals.saturating_add(1);
+                    refusals = item.validation_refusals;
+                    let delay = refusal_backoff(item.validation_refusals.saturating_sub(1), base);
+                    retry_after = retry_after_time(delay);
+                    item.next_retry_at = retry_after.clone();
+                    item.last_refusal = detail.to_owned();
+                    item.log(
+                        "validation-refused",
+                        format!(
+                            "{detail}; stays queued, retry after {} (refusal {})",
+                            item.next_retry_at, item.validation_refusals
+                        ),
+                    );
+                    self.state.save_item(item)?;
+                }
+            }
+        } else {
+            // Simulated runs record the deferral in the report only; the backoff is the
+            // base delay for a first refusal.
+            retry_after = retry_after_time(refusal_backoff(0, base));
+            refusals = 1;
+        }
+        if retry_after.is_empty() {
+            retry_after = retry_after_time(refusal_backoff(0, base));
+            refusals = refusals.max(1);
+        }
+        lock(&self.report).deferred.push(Deferred {
+            prs: prs.to_vec(),
+            reason: detail.to_owned(),
+            retry_after: retry_after.clone(),
+            refusals,
+        });
+        self.event(
+            "validation-refused",
+            &format!(
+                "{}: {detail}; stays queued, retry after {retry_after}",
+                list(prs)
+            ),
+        );
+        Ok((retry_after, refusals))
+    }
+
+    /// Retry a refused batch validation with backoff. Returns the final `(id, ran)`.
+    /// Each attempt is its own validation record (refused attempts are visible, never
+    /// counted as green or red).
+    fn retry_refused(
+        &self,
+        candidate: &Candidate,
+        chosen: &Chosen,
+        first: (usize, Ran),
+    ) -> Result<(usize, Ran), String> {
+        let retries = self.config.validator.refusal_retries();
+        let base = self.config.validator.refusal_backoff();
+        let (mut vid, mut ran) = first;
+        for attempt in 0..retries {
+            if !ran.refused() {
+                break;
+            }
+            let delay = refusal_backoff(attempt as u32, base);
+            self.event(
+                "validation-refused",
+                &format!(
+                    "{} refused ({}); retry {} of {retries} after {}s",
+                    list(&candidate.prs),
+                    refusal_detail(&ran),
+                    attempt + 1,
+                    delay.as_secs()
+                ),
+            );
+            if !delay.is_zero() {
+                std::thread::sleep(delay);
+            }
+            let (next_vid, next_ran) = self
+                .validate_all(vec![Job {
+                    purpose: "batch",
+                    prs: candidate.prs.clone(),
+                    commit: candidate.tip.clone(),
+                    selection: chosen.selection.clone(),
+                    policy: chosen.policy.clone(),
+                }])
+                .pop()
+                .ok_or("no retry result")??;
+            vid = next_vid;
+            ran = next_ran;
+        }
+        Ok((vid, ran))
     }
 
     fn requeue(&self, prs: &[i64], why: &str) {
@@ -785,7 +933,7 @@ impl<'a> Runner<'a> {
         let runs = report
             .validations
             .iter()
-            .filter(|v| v.commit == commit && !v.cancelled);
+            .filter(|v| v.commit == commit && !v.cancelled && !v.refused);
         let mut complete = false;
         let mut failing: BTreeSet<TestId> = BTreeSet::new();
         let mut passed: BTreeSet<TestId> = BTreeSet::new();
@@ -934,6 +1082,7 @@ impl<'a> Runner<'a> {
             selection: job.selection,
             policy: job.policy,
             green: ran.green(),
+            refused: ran.refused(),
             cancelled: ran.cancelled,
             failed,
             classes,
@@ -948,6 +1097,8 @@ impl<'a> Runner<'a> {
                 "v{id} {} in {:.1}s{}",
                 if record.cancelled {
                     "cancelled"
+                } else if record.refused {
+                    "refused"
                 } else if record.green {
                     "green"
                 } else {
@@ -1205,7 +1356,26 @@ impl<'a> Runner<'a> {
                         let (vid, ran) = head
                             .result
                             .unwrap_or_else(|| Err("missing result".to_owned()))?;
-                        let outcome = if ran.green() {
+                        // Admission refusal: retry with backoff, then defer. Never land,
+                        // never search for a culprit, never eject.
+                        let (vid, ran) = if ran.refused() {
+                            self.retry_refused(&head.candidate, &head.chosen, (vid, ran))?
+                        } else {
+                            (vid, ran)
+                        };
+                        let outcome = if ran.refused() {
+                            let detail = refusal_detail(&ran);
+                            discard(&mut flights, &rx, pending);
+                            let (retry_after, _) =
+                                self.defer_refusal(&head.candidate.prs, &detail)?;
+                            BatchOutcome::Deferred(
+                                format!(
+                                    "validation refused for {} ({detail}); stays queued, retry after {retry_after}",
+                                    list(&head.candidate.prs)
+                                ),
+                                head.candidate.prs.clone(),
+                            )
+                        } else if ran.green() {
                             let claim = ValidationClaim::new(
                                 head.chosen.selection.clone(),
                                 head.chosen.policy.clone(),
@@ -1238,6 +1408,13 @@ impl<'a> Runner<'a> {
                                 if !prs.is_empty() {
                                     pending.push_front(prs);
                                 }
+                                return Ok(reason);
+                            }
+                            BatchOutcome::Deferred(reason, _prs) => {
+                                // Already recorded as deferred; the changes stay queued
+                                // (not requeued into this run, which would spin without
+                                // backoff). Later batches were discarded above and stay
+                                // in `pending` for the next run.
                                 return Ok(reason);
                             }
                         }
@@ -1348,6 +1525,8 @@ impl<'a> Runner<'a> {
                     if let Some(item) = items.get_mut(pr) {
                         item.status = ItemStatus::Landed;
                         item.landed_as = tip.to_owned();
+                        item.next_retry_at.clear();
+                        item.last_refusal.clear();
                         if let Some(hosting) = &self.hosting {
                             match hosting.close(*pr, &crate::sync::close_comment(tip)) {
                                 Ok(()) => item.log("closed", "pull request closed after landing"),
@@ -1605,6 +1784,16 @@ impl<'a> Runner<'a> {
         let mut carried = false;
         loop {
             match self.find_culprit(&current, &focus, &seen_failed)? {
+                Culprit::Refused(detail) => {
+                    let (retry_after, _) = self.defer_refusal(&current.prs, &detail)?;
+                    return Ok(BatchOutcome::Deferred(
+                        format!(
+                            "validation refused for {} ({detail}); stays queued, retry after {retry_after}",
+                            list(&current.prs)
+                        ),
+                        current.prs.clone(),
+                    ));
+                }
                 Culprit::BaseRed(tests) => {
                     return Ok(BatchOutcome::Stop(
                         format!(
@@ -1700,6 +1889,17 @@ impl<'a> Runner<'a> {
                         .pop()
                         .ok_or("no remainder result")??;
                     validations.push(rid);
+                    if rran.refused() {
+                        let detail = refusal_detail(&rran);
+                        let (retry_after, _) = self.defer_refusal(&rebuilt.prs, &detail)?;
+                        return Ok(BatchOutcome::Deferred(
+                            format!(
+                                "validation refused for {} ({detail}); stays queued, retry after {retry_after}",
+                                list(&rebuilt.prs)
+                            ),
+                            rebuilt.prs.clone(),
+                        ));
+                    }
                     if rran.green() {
                         let claim = if exact {
                             ValidationClaim::new(
@@ -1832,6 +2032,9 @@ impl<'a> Runner<'a> {
                 .collect();
             for (i, result) in probes.iter().zip(self.validate_all(jobs)) {
                 let (_, ran) = result?;
+                if ran.refused() {
+                    return Ok(Culprit::Refused(refusal_detail(&ran)));
+                }
                 let entry = obs.entry(*i).or_default();
                 if ran.reproduces() {
                     entry.fails += 1;
@@ -1868,6 +2071,18 @@ impl<'a> Runner<'a> {
             }])
             .pop()
             .ok_or("no widen result")??;
+        if ran.refused() {
+            // Not green, not red: discharge nothing, record no failed run, retry later.
+            self.event(
+                "widen",
+                &format!(
+                    "complete run refused on {} ({}); obligation(s) stay open, retry later",
+                    short(&base),
+                    refusal_detail(&ran)
+                ),
+            );
+            return Ok(());
+        }
         let failed = ran.failed();
         let mut covered = 0;
         for mut obligation in open {
@@ -2067,6 +2282,17 @@ pub fn render_report(report: &RunReport) -> String {
             ));
         }
     }
+    if !report.deferred.is_empty() {
+        out.push_str("\n## Deferred (validation refused, still queued)\n\n");
+        for deferred in &report.deferred {
+            out.push_str(&format!(
+                "- {}: {}; retry after {}\n",
+                list(&deferred.prs),
+                deferred.reason,
+                deferred.retry_after
+            ));
+        }
+    }
     if !report.requeued.is_empty() {
         out.push_str(&format!(
             "\nReturned to the queue: {}\n",
@@ -2084,6 +2310,8 @@ pub fn render_report(report: &RunReport) -> String {
     for v in &report.validations {
         let result = if v.cancelled {
             "cancelled".to_owned()
+        } else if v.refused {
+            "refused (retry later)".to_owned()
         } else if v.green {
             "green".to_owned()
         } else if v.classes.is_empty() {
@@ -2127,4 +2355,19 @@ pub fn widen(state: &State) -> Result<RunReport, String> {
         Err(error) => format!("error: {error}"),
     })?;
     result.map(|()| report)
+}
+
+#[cfg(test)]
+mod unit {
+    use super::*;
+
+    #[test]
+    fn refusal_backoff_doubles_and_caps() {
+        assert_eq!(refusal_backoff(0, 2), Duration::from_secs(2));
+        assert_eq!(refusal_backoff(1, 2), Duration::from_secs(4));
+        assert_eq!(refusal_backoff(2, 2), Duration::from_secs(8));
+        assert_eq!(refusal_backoff(10, 2), Duration::from_secs(60));
+        assert_eq!(refusal_backoff(0, 0), Duration::ZERO);
+        assert_eq!(refusal_backoff(3, 0), Duration::ZERO);
+    }
 }

@@ -108,6 +108,8 @@ This command creates the state directory and writes `config.json`.
 | `--dag FILE` | empty | For `dagrun`: the DAG file, relative to the candidate checkout. |
 | `--dagrun PATH` | empty | For `dagrun`: the dagrun executable, relative to the checkout or absolute (empty means `dagrun` on `PATH`). |
 | `--admission WORD` | none | A command prefix every validation runs under, such as a host admission wrapper. Repeat it for several words. |
+| `--refusal-max-retries N` | `3` | Extra attempts after an admission refusal (exit `75` or `COULD_NOT_RUN`) within one `run`, each after a backoff delay. A refusal is never a pass and never red: the change stays queued. |
+| `--refusal-backoff-secs SECS` | `2` | Base backoff between refusal retries, doubled per attempt and capped at 60 seconds. `0` means no delay. The same backoff sets the deferred change's next retry time. |
 | `--timeout SECS` | `0` | Seconds before one validation is killed (its whole process group) and its selected tests count as errors. `0` means no limit. |
 | `--clean-ignored` | off | Also delete ignored files (build caches) from a reused checkout before each validation. By default they are kept, which makes validations fast but trusts the build to be hermetic with respect to them. |
 | `--land DRIVER` | `push` | `push` or `command` (see "Land drivers"). |
@@ -298,6 +300,7 @@ on which files two changes share.
 | `conflicts-with-base` | Rebase onto the base and resubmit. |
 | `conflicts-with-queued` | Rebase after the named changes land, then resubmit. |
 | `waiting-on-dependency` | Submit or unblock the named dependency, or drop `--after`. |
+| `validation-refused` | None: validation admission refused to run. The change stays queued and is retried after its backoff (`next_retry_at`). |
 
 ## Plan schema `merge-queue-plan/v1`
 
@@ -356,7 +359,9 @@ An **item record** (`items/<pr>.json`) has these fields:
   `{"kind":"tests","tests":["step","step::case"]}`.
 - `status`: `queued`, `landed`, `ejected` or `withdrawn`.
 - `landed_as`: the base commit that contains the change, once it has landed.
-- `history`: a list of `{at, kind, detail}` events.
+- `validation_refusals`, `next_retry_at`, `last_refusal`: present only after a validation
+  refusal. The status stays `queued`; `next_retry_at` is when validation may be retried.
+- `history`: a list of `{at, kind, detail}` events. A refusal adds a `validation-refused` event.
 
 ## Configuration (`config.json`)
 
@@ -396,6 +401,9 @@ An **item record** (`items/<pr>.json`) has these fields:
 - `dagrun`, `dag`: the executable and the DAG file, for the `dagrun` kind.
 - `admission`: a command prefix that every validation runs under, for example a host admission
   wrapper that limits concurrent validations.
+- `refusal_max_retries`: extra attempts after an admission refusal within one run (default `3`).
+- `refusal_backoff_secs`: base backoff between refusal retries, doubled per attempt and capped
+  at 60 seconds (default `2`; `0` means no delay).
 - `timeout_secs`: `0` means no limit.
 - `clean_ignored`: also delete ignored files from reused checkouts (default `false`).
 
@@ -447,6 +455,18 @@ exit $rc
 with `merge-queue init --validator command --validator-run 'sh run-selected.sh' --select
 'git diff --name-only "$MQ_BASE" HEAD -- tests | sed -n "s|^tests/\(.*\)\.sh$|\1|p"' --policy
 path-routing`.
+
+**Admission refusals (retry later).** A validation that admission refuses to run at all — the
+runner exits `75`, or its combined output contains `COULD_NOT_RUN` — did not run, so it is
+neither a pass nor a failure. The queue records the validation as `refused` with no failed
+tests, retries it in the same run after a backoff (`refusal_backoff_secs` doubled per attempt,
+up to `refusal_max_retries` extra attempts), and if it is still refused, defers the batch: every
+change in it stays `queued`, its `validation_refusals` count grows, `next_retry_at` is set from
+the backoff, the run report lists it under `deferred`, and the run stops with exit `3`. No
+culprit search runs and nothing is ejected for a refusal. While `next_retry_at` is in the
+future, `plan` holds the change as `validation-refused`; after it passes, the next `run`
+validates it again. A refusal in a culprit-search probe or a widening run defers the same way
+(no culprit is named, no obligation is discharged or marked red).
 
 **Verdict lines.** A `command` runner that writes no results file but prints dagrun-style verdict
 lines (`[step] ✓ PASS ...`, `[step] ✗ FAIL ...`, `[step] SKIPPED ...`) is still attributed per
