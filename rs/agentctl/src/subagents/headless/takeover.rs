@@ -16,7 +16,9 @@
 //!   everything left of it (its process group, then any writer of the session) before it
 //!   records `lifecycle.released` and releases the lock.
 //! - **The wrapper** refuses to start beside a writer of the session, and when its own harness
-//!   exits it ends the rest of that harness's process group and any writer left.
+//!   exits it ends the rest of that harness's process group and any writer left in its own
+//!   Linux session ([`wrapper::own_session_writers`]); a writer in another session, or one
+//!   another live record pins, is never signalled (`#778 agentctl-stop-kills-caller`).
 //! - **`handback`** refuses while a takeover is still stopping the wrapper or a wrapper answers,
 //!   ends the interactive session's writers (SIGTERM, then SIGKILL after half its wait), and
 //!   starts the wrapper only once no writer is left and the lock is free.

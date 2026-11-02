@@ -973,6 +973,7 @@ impl Wrapper {
                 "stopping": self.stopping,
                 "held": self.held,
                 "approvals_pending": self.approvals.len(),
+                "writer_sweep": WRITER_SWEEP,
             }),
             "approvals" => json!({
                 "ok": true,
@@ -1434,7 +1435,11 @@ impl Wrapper {
         let group = harness.child.id();
         drop(harness);
         end_process_group(group, Duration::from_secs(5));
-        let leftovers = session_processes(&self.config.session);
+        let leftovers = own_session_writers(
+            &self.config.session,
+            &self.config.agent_directory,
+            &self.config.agent,
+        );
         if !leftovers.is_empty() {
             end_processes(&leftovers, Duration::from_secs(5));
         }
@@ -1709,29 +1714,139 @@ pub fn session_processes(session: &str) -> Vec<u32> {
         else {
             continue;
         };
-        if pid == own {
-            continue;
-        }
-        let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
-            continue;
-        };
-        // A zombie has an empty command line and writes nothing.
-        let argv: Vec<&str> = cmdline
-            .split(|byte| *byte == 0)
-            .filter_map(|part| std::str::from_utf8(part).ok())
-            .collect();
-        // agentctl's own commands can name a session (`start --resume`) without running it.
-        let agentctl = argv.first().is_some_and(|program| {
-            Path::new(program)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("agentctl"))
-        });
-        if !agentctl && argv_names_session(&argv, session) {
+        if pid != own && process_runs_session(pid, session) {
             found.push(pid);
         }
     }
     found
+}
+
+/// Whether process `pid` runs Claude Code on `session` ([`argv_names_session`]).
+#[must_use]
+pub fn process_runs_session(pid: u32, session: &str) -> bool {
+    let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    // A zombie has an empty command line and writes nothing.
+    let argv: Vec<&str> = cmdline
+        .split(|byte| *byte == 0)
+        .filter_map(|part| std::str::from_utf8(part).ok())
+        .collect();
+    // agentctl's own commands can name a session (`start --resume`) without running it.
+    let agentctl = argv.first().is_some_and(|program| {
+        Path::new(program)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("agentctl"))
+    });
+    !agentctl && argv_names_session(&argv, session)
+}
+
+/// What `status` reports about the leftover writers this wrapper ends when its harness exits:
+/// only those in its own Linux session ([`own_session_writers`]). A wrapper that does not report
+/// it ends every writer of the session on the host, wherever it runs.
+pub const WRITER_SWEEP: &str = "own-session";
+
+/// The Linux session of `pid`, when it is alive.
+#[must_use]
+pub fn linux_session(pid: u32) -> Option<u32> {
+    // SAFETY: getsid only reads the kernel's process table.
+    let session = unsafe { libc::getsid(pid as libc::pid_t) };
+    u32::try_from(session).ok().filter(|session| *session > 0)
+}
+
+/// `pid` and every ancestor of it, nearest first, from `/proc/PID/stat` parent links.
+#[must_use]
+pub fn process_chain(pid: u32) -> Vec<u32> {
+    let mut chain = vec![pid];
+    let mut current = u64::from(pid);
+    while chain.len() < 256 {
+        let Ok(stat) = agent_queue::identity::read_process_stat(current) else {
+            break;
+        };
+        let Ok(parent) = u32::try_from(stat.parent_pid) else {
+            break;
+        };
+        if parent == 0 || chain.contains(&parent) {
+            break;
+        }
+        chain.push(parent);
+        current = stat.parent_pid;
+    }
+    chain
+}
+
+/// The processes other live records of this agent's registry pin as their harness
+/// (`harness_identity`, `custom_process_identity`), with the start time they were pinned at.
+fn pinned_by_other_records(agent_directory: &Path, own: &str) -> Vec<(u32, u64)> {
+    let Some(parent) = agent_directory.parent() else {
+        return Vec::new();
+    };
+    let registry = if parent.file_name().and_then(|name| name.to_str())
+        == Some(agent_queue::registry::AGENTS)
+    {
+        parent.parent().unwrap_or(parent)
+    } else {
+        parent
+    };
+    let mut pinned = Vec::new();
+    for name in agent_queue::registry::names(registry).unwrap_or_default() {
+        if name == own {
+            continue;
+        }
+        let Ok(directory) = agent_queue::registry::directory(registry, &name) else {
+            continue;
+        };
+        let Ok(bytes) = std::fs::read(directory.join("agent.json")) else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        if record["lifecycle"] != "running" {
+            continue;
+        }
+        for field in ["harness_identity", "custom_process_identity"] {
+            let identity = &record[field];
+            if let (Some(pid), Some(ticks)) = (
+                identity["pid"]
+                    .as_u64()
+                    .and_then(|pid| u32::try_from(pid).ok()),
+                identity["starttime_ticks"].as_u64(),
+            ) {
+                pinned.push((pid, ticks));
+            }
+        }
+    }
+    pinned
+}
+
+/// The writers of `session` ([`session_processes`]) this wrapper may end once its harness has
+/// exited: those in its own Linux session, which its harness and anything the harness started
+/// share. Never this wrapper or any ancestor of it, and never a process another live record of
+/// the registry pins as its harness. A writer elsewhere, such as an interactive Claude Code
+/// resumed on the same session in a terminal, belongs to someone else: it is left alone (the
+/// next wrapper still refuses to start beside it).
+#[must_use]
+pub fn own_session_writers(session: &str, agent_directory: &Path, own: &str) -> Vec<u32> {
+    let wrapper = std::process::id();
+    let Some(own_session) = linux_session(wrapper) else {
+        return Vec::new();
+    };
+    let ancestry = process_chain(wrapper);
+    let pinned = pinned_by_other_records(agent_directory, own);
+    session_processes(session)
+        .into_iter()
+        .filter(|pid| linux_session(*pid) == Some(own_session))
+        .filter(|pid| !ancestry.contains(pid))
+        .filter(|pid| {
+            !pinned.iter().any(|(pinned, ticks)| {
+                pinned == pid
+                    && agent_queue::identity::read_process_stat(u64::from(*pid))
+                        .is_ok_and(|stat| stat.starttime_ticks == *ticks)
+            })
+        })
+        .collect()
 }
 
 /// Record `pid` as the harness of the session in `agent_directory`'s `harness.json`, so no

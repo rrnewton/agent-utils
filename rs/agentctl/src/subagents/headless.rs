@@ -924,7 +924,9 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
     }
 
     /// Stop a headless agent's wrapper cleanly, wait for it to exit, and archive the record
-    /// with its queue and event log.
+    /// with its queue and event log. Nothing is signalled here: the wrapper ends its own harness
+    /// and the leftover writers of its own Linux session, and a stop that would end the process
+    /// running it is refused ([`stop_would_end_caller`]).
     pub(super) fn retire_headless(
         &self,
         record: AgentRecord,
@@ -962,6 +964,17 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         }
         let directory = self.directory(&name)?;
         let socket = hcontrol::socket_path(&directory);
+        // The wrapper ends leftover writers of its session when it stops; never let that reach
+        // the process running this command (#778 agentctl-stop-kills-caller).
+        if let Ok(status) = hcontrol::request(&socket, &json!({"op": "status"}), CONTROL_TIMEOUT) {
+            let session = record.headless_session()?;
+            let caller = wrapper::process_chain(std::process::id());
+            if let Some(reason) = stop_would_end_caller(&status, &session, &caller) {
+                return Err(fail(format!(
+                    "refusing to stop {name:?}: {reason}. The record is unchanged"
+                )));
+            }
+        }
         let asked = hcontrol::request(&socket, &json!({"op": "stop"}), CONTROL_TIMEOUT).is_ok();
         let deadline = Instant::now() + STOP_WAIT;
         let lock = loop {
@@ -1004,4 +1017,50 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             "note": format!("if a systemd unit ran the wrapper, disable it so it does not start a wrapper for a missing record: systemctl --user disable {unit}"),
         }))
     }
+}
+
+/// Why stopping the wrapper that answered `status` would end a process of `caller` (the
+/// stopping command and its ancestors), when it would.
+///
+/// A caller inside the wrapper's own Linux session is its harness or something the harness
+/// started, and the wrapper ends those. A wrapper that does not report
+/// [`wrapper::WRITER_SWEEP`] ends every process on the host that runs its session, so there a
+/// caller that runs the session itself (a Claude Code resumed on it) would end too.
+pub(super) fn stop_would_end_caller(
+    status: &Value,
+    session: &str,
+    caller: &[u32],
+) -> Option<String> {
+    let pid_of = |field: &str| {
+        status[field]
+            .as_u64()
+            .and_then(|pid| u32::try_from(pid).ok())
+    };
+    let wrapper_pid = pid_of("wrapper_pid");
+    let harness_pid = pid_of("harness_pid");
+    let wrapper_session = wrapper_pid.and_then(wrapper::linux_session);
+    for pid in caller {
+        if Some(*pid) == wrapper_pid || Some(*pid) == harness_pid {
+            return Some(format!(
+                "process {pid}, which runs this command, is the agent's own wrapper or harness"
+            ));
+        }
+        if wrapper_session.is_some() && wrapper::linux_session(*pid) == wrapper_session {
+            return Some(format!(
+                "process {pid}, which runs this command, is in the wrapper's own session, whose writers the wrapper ends when it stops; run stop from outside it"
+            ));
+        }
+    }
+    if status["writer_sweep"] == wrapper::WRITER_SWEEP {
+        return None;
+    }
+    let wrapper = wrapper_pid.map_or_else(|| "?".to_owned(), |pid| pid.to_string());
+    caller
+        .iter()
+        .find(|pid| wrapper::process_runs_session(**pid, session))
+        .map(|pid| {
+            format!(
+                "the running wrapper (pid {wrapper}) is an older build that, when it stops, ends every process on this host that runs session {session}, and process {pid}, which runs this command, runs it. End that process first, or end the wrapper without its cleanup (kill -KILL {wrapper}; its harness exits when its input closes) and run stop again"
+            )
+        })
 }

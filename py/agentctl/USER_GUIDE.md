@@ -2755,7 +2755,13 @@ checked directly in `/proc` because a launcher can exit while the real harness
 it started keeps the session open. While the record is marked taken over a
 wrapper exits 0 at once and `stop` refuses; a wrapper never starts beside a
 writer, and when its own harness exits it ends the rest of that harness's
-process group and any writer left. The tab's holder process keeps
+process group and any writer left in its own Linux session. A writer elsewhere
+(a Claude Code resumed on the session in another terminal) or a process another
+live record pins as its harness is never signalled. `stop` of a headless agent
+signals nothing itself: it asks the wrapper to stop and waits, and refuses when
+that would end the process running the command, such as the agent's own
+harness, or a caller that runs the session while an older wrapper still sweeps
+the whole host. The tab's holder process keeps
 `headless.lock`, runs the interactive harness in its own process group with the
 terminal, and when it exits ends whatever is left of that session before it
 records `lifecycle.released` and releases the lock. Handback refuses while a

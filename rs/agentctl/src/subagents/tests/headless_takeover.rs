@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::headless::{events, wrapper};
+use crate::subagents::headless::stop_would_end_caller;
 
 fn headless_agent(fixture: &Fixture) -> ManagedAgents<'_, Fake> {
     let manager = fixture.manager();
@@ -161,4 +162,158 @@ fn argv_names_session_needs_the_flag_and_the_exact_id() {
         &["claude", "--resume", &id[..30]],
         id
     ));
+}
+
+/// A process whose command line runs Claude Code on `session`, in a Linux session of its own
+/// when `own_session` (as an interactive Claude in another terminal is), else in this one.
+fn session_writer(session: &str, own_session: bool) -> std::process::Child {
+    let mut command = std::process::Command::new("sh");
+    command.args(["-c", "sleep 30; :", "claude", "--resume", session]);
+    if own_session {
+        // SAFETY: setsid is async-signal-safe and touches no memory of this process.
+        unsafe {
+            std::os::unix::process::CommandExt::pre_exec(&mut command, || {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+    let child = command.spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !wrapper::process_runs_session(child.id(), session) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(wrapper::process_runs_session(child.id(), session));
+    child
+}
+
+fn reap(mut children: Vec<std::process::Child>) {
+    for child in &mut children {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+#[test]
+fn a_stopping_wrapper_ends_only_writers_of_its_own_session_that_no_other_record_pins() {
+    // #778 agentctl-stop-kills-caller: an interactive Claude resumed on the headless session
+    // in another terminal is not the wrapper's to end, nor is another live record's harness.
+    let session = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c40";
+    let registry = std::env::temp_dir().join(format!("agentctl-778-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&registry);
+    let own = registry.join("agents").join("lead");
+    std::fs::create_dir_all(&own).unwrap();
+    let elsewhere = session_writer(session, true);
+    let leftover = session_writer(session, false);
+    let pinned = session_writer(session, false);
+    let other = registry.join("agents").join("coordinator");
+    std::fs::create_dir_all(&other).unwrap();
+    let ticks = agent_queue::identity::read_process_stat(u64::from(pinned.id()))
+        .unwrap()
+        .starttime_ticks;
+    std::fs::write(
+        other.join("agent.json"),
+        json!({"name": "coordinator", "lifecycle": "running",
+               "harness_identity": {"pid": pinned.id(), "starttime_ticks": ticks}})
+        .to_string(),
+    )
+    .unwrap();
+    let writers = wrapper::own_session_writers(session, &own, "lead");
+    assert_eq!(
+        writers,
+        vec![leftover.id()],
+        "elsewhere {} pinned {}",
+        elsewhere.id(),
+        pinned.id()
+    );
+    // A pin from an earlier process generation does not protect a different process.
+    std::fs::write(
+        other.join("agent.json"),
+        json!({"name": "coordinator", "lifecycle": "running",
+               "harness_identity": {"pid": pinned.id(), "starttime_ticks": ticks + 1}})
+        .to_string(),
+    )
+    .unwrap();
+    let mut writers = wrapper::own_session_writers(session, &own, "lead");
+    writers.sort_unstable();
+    let mut expected = vec![leftover.id(), pinned.id()];
+    expected.sort_unstable();
+    assert_eq!(writers, expected);
+    reap(vec![elsewhere, leftover, pinned]);
+    let _ = std::fs::remove_dir_all(&registry);
+}
+
+#[test]
+fn stop_refuses_when_the_wrapper_would_end_a_process_running_the_command() {
+    let session = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c41";
+    // The caller is a Claude Code resumed on the headless session in another terminal, as in
+    // the incident; the stop command runs below it.
+    let caller = session_writer(session, true);
+    let chain = wrapper::process_chain(caller.id());
+    let fixed = json!({"ok": true, "writer_sweep": wrapper::WRITER_SWEEP});
+    assert_eq!(stop_would_end_caller(&fixed, session, &chain), None);
+    // A wrapper built before #778 ends every writer of the session on the host.
+    let old = json!({"ok": true});
+    let reason = stop_would_end_caller(&old, session, &chain).unwrap();
+    assert!(reason.contains("older build"), "{reason}");
+    assert!(reason.contains(&caller.id().to_string()), "{reason}");
+    // Not running the session itself: nothing of the caller is a writer.
+    assert_eq!(
+        stop_would_end_caller(&old, "0a1b2c3d-4e5f-4a6b-8c7d-000000000000", &chain),
+        None
+    );
+    // A caller in the wrapper's own session (the harness stopping its own agent), or the
+    // harness itself, is refused whatever the wrapper's build.
+    let sibling = session_writer("0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c42", false);
+    let own_chain = wrapper::process_chain(std::process::id());
+    let same =
+        json!({"ok": true, "wrapper_pid": sibling.id(), "writer_sweep": wrapper::WRITER_SWEEP});
+    let reason = stop_would_end_caller(&same, session, &own_chain).unwrap();
+    assert!(reason.contains("wrapper's own session"), "{reason}");
+    let harness =
+        json!({"ok": true, "harness_pid": caller.id(), "writer_sweep": wrapper::WRITER_SWEEP});
+    let reason = stop_would_end_caller(&harness, session, &chain).unwrap();
+    assert!(reason.contains("own wrapper or harness"), "{reason}");
+    reap(vec![caller, sibling]);
+}
+
+#[test]
+fn stop_of_a_headless_agent_never_asks_the_wrapper_to_stop_when_that_would_end_the_caller() {
+    use std::io::{BufRead, Write};
+    let fixture = Fixture::new();
+    let manager = headless_agent(&fixture);
+    let directory = manager.directory("lead").unwrap();
+    // A wrapper stand-in in this test's own session: stopping it would end this process.
+    let sibling = session_writer("0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c43", false);
+    let listener =
+        std::os::unix::net::UnixListener::bind(crate::headless::control::socket_path(&directory))
+            .unwrap();
+    let wrapper_pid = sibling.id();
+    let server = std::thread::spawn(move || {
+        let mut ops = Vec::new();
+        listener.set_nonblocking(false).unwrap();
+        for stream in listener.incoming().take(1) {
+            let mut stream = stream.unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(&stream)
+                .read_line(&mut line)
+                .unwrap();
+            let body: Value = serde_json::from_str(line.trim()).unwrap();
+            ops.push(body["op"].as_str().unwrap().to_owned());
+            let answer = json!({"ok": true, "wrapper_pid": wrapper_pid,
+                                "writer_sweep": wrapper::WRITER_SWEEP});
+            writeln!(stream, "{answer}").unwrap();
+        }
+        ops
+    });
+    let error = manager.stop("lead").unwrap_err().to_string();
+    assert!(error.contains("refusing to stop \"lead\""), "{error}");
+    assert!(error.contains("wrapper's own session"), "{error}");
+    assert_eq!(
+        server.join().unwrap(),
+        vec!["status".to_owned()],
+        "stop must not be sent"
+    );
+    assert_eq!(manager.load("lead").unwrap().lifecycle, "running");
+    reap(vec![sibling]);
 }
