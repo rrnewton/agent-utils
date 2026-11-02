@@ -26,3 +26,5 @@ export { createOutboxStore } from "./store.ts";
 export type { OutboxDependencies, OutboxEntry, OutboxStore } from "./store.ts";
 export { DRAFTS_KEY, createReplyDrafts } from "./replydrafts.ts";
 export type { ReplyDrafts, ReplyDraftsDependencies } from "./replydrafts.ts";
+export { createPendingThreads } from "./pending.ts";
+export type { PendingSend, PendingThreads, PendingThreadsDependencies } from "./pending.ts";

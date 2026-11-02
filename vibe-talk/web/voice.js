@@ -17530,73 +17530,43 @@ function renderOutgoingEverywhere() {
 let drawnPendingThreads = "";
 
 /**
- * The thread `entry` posts into in the channel on screen: where the rest of a cut post continues, the
- * thread it was written in, or — where a reply is a thread reply (`channelRepliesInThread`, Slack) —
- * the thread of the message it answers, by that message's own thread record. Null for the main channel,
- * or a message whose thread is not known.
+ * Which thread each send in the outbox posts into, and how many sends count in each thread of the channel
+ * on screen and when the newest was written, worked out once for each change: web/src/core/outbox's
+ * (`createPendingThreads`, `#624 voice-page-modularity`).
  */
+const pendingThreads = createPendingThreads({
+  channel: () => String(selectedChannelId()),
+  outboxVersion: () => outbox.version(),
+  sends: () => outbox.values(),
+  store: () => channelStore.current(),
+  repliesInThread: (channel) => channelRepliesInThread(channel),
+  threadRecordOf: (message) => heldThreadRecord(message),
+  idOf: (message) => message.id,
+});
+
+/** The thread `entry` posts into in the channel on screen, or null for the main channel or one not known. */
 function outgoingThreadOf(entry) {
-  if (entry.continueIn) return String(entry.continueIn);
-  if (entry.threadId) return String(entry.threadId);
-  const viewing = String(selectedChannelId());
-  if (!entry.replyTo || entry.channel !== viewing || channelStore.current().channel !== viewing ||
-      !channelRepliesInThread(entry.channel)) return null;
-  // The store as it stands, never loaded from here: this runs in the passes that draw it.
-  const answered = channelStore.current().messages.find((held) => String(held.id) === String(entry.replyTo));
-  const record = answered ? heldThreadRecord(answered) : null;
-  return record ? String(record.id) : null;
+  return pendingThreads.threadOf(entry);
 }
-
-/**
- * By thread of the channel on screen, the sends in the outbox counting in it — not yet sent, and not yet
- * seen on the stream (`noteOutgoingEcho`), whose copy the store then holds and counts — and when the
- * newest was written. Worked out once for each change of the outbox, the store's messages or the
- * channel, and not for every row of every pass that asks (`pendingInto`).
- *
- * @returns {Map<string, {count: number, at: number}>}
- */
-function pendingByThread() {
-  const viewing = String(selectedChannelId());
-  const key = `${viewing} ${outbox.version()} ${channelStore.current().channel} ${channelStore.current().messages.length}`;
-  if (pendingCache.key === key) return pendingCache.threads;
-  /** @type {Map<string, {count: number, at: number}>} */
-  const threads = new Map();
-  for (const entry of outbox.values()) {
-    if (entry.channel !== viewing || entry.state === "sent" || !entry.remaining || entry.echoed) continue;
-    const thread = outgoingThreadOf(entry);
-    if (thread === null) continue;
-    const held = threads.get(thread) || { count: 0, at: 0 };
-    threads.set(thread, { count: held.count + 1, at: Math.max(held.at, Number(entry.createdAt) || 0) });
-  }
-  pendingCache = { key, threads };
-  return threads;
-}
-
-/** `pendingByThread`'s last answer, and what it was worked out for. */
-let pendingCache = { key: "", threads: /** @type {Map<string, {count: number, at: number}>} */ (new Map()) };
-
-// How often the outbox has changed, for `pendingByThread`, is the outbox's (`outbox.version`).
 
 /** The sends in the outbox for the channel on screen that count in thread `thread`. */
 function pendingInto(thread) {
-  const held = pendingByThread().get(String(thread));
-  return held ? held.count : 0;
+  return pendingThreads.into(thread);
 }
 
 /** The threads of the channel on screen sends in the outbox go into, each with when its newest was written. */
 function pendingThreadTimes() {
-  return new Map([...pendingByThread()].map(([thread, { at }]) => [thread, at]));
+  return pendingThreads.times();
 }
 
 /** Which threads of the channel on screen have sends counting in them, and how many: for redraws. */
 function pendingThreadsKey() {
-  const viewing = String(selectedChannelId());
-  return [viewing, ...[...pendingByThread()].sort().map(([thread, { count }]) => `${thread}=${count}`)].join(" ");
+  return pendingThreads.key();
 }
 
 /**
  * The stream has shown this server's copy of a post made for entry `id` (its `client_key`): the store
- * holds it now and counts it in its thread, so the entry no longer does (`pendingByThread`). Not saved:
+ * holds it now and counts it in its thread, so the entry no longer does (`pendingThreads`). Not saved:
  * a reload asks the server instead (`settleUnconfirmedSends`).
  */
 function noteOutgoingEcho(id) {

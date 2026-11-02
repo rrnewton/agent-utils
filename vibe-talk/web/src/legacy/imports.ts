@@ -52,6 +52,7 @@ export {
   createDismissedSends,
   createOutboxStore,
   createOwnPosts,
+  createPendingThreads,
   createReplyDrafts,
   editableSend as outboxEditable,
   nextRetryAt,

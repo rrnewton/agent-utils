@@ -332,3 +332,45 @@ test("`#624 voice-page-modularity`: the reply drafts are kept by message id, and
   broken.load();
   assert.equal(broken.has("101"), false);
 });
+
+test("`#624 voice-page-modularity`: the threads sends in the outbox go into, counted once for each change", () => {
+  const { createPendingThreads } = OUTBOX;
+  let version = 1;
+  let channel = "c";
+  let threadReplies = true;
+  let worked = 0;
+  const sends = [
+    { channel: "c", threadId: "t1", remaining: 1, createdAt: 10 },
+    { channel: "c", continueIn: "t2", remaining: 1, createdAt: 30 },
+    { channel: "c", replyTo: "m1", remaining: 1, createdAt: 20 },
+    { channel: "c", threadId: "t1", remaining: 1, createdAt: 40, state: "sent" },
+    { channel: "c", threadId: "t1", remaining: 0, createdAt: 50 },
+    { channel: "c", threadId: "t1", remaining: 1, createdAt: 60, echoed: true },
+    { channel: "d", threadId: "t1", remaining: 1, createdAt: 70 },
+    { channel: "c", replyTo: "m2", remaining: 1, createdAt: 80 },
+  ];
+  const store = { channel: "c", messages: [{ id: "m1", thread: { id: "t1" } }, { id: "m2" }] };
+  const pending = createPendingThreads({
+    channel: () => channel,
+    outboxVersion: () => version,
+    sends: () => { worked += 1; return sends; },
+    store: () => store,
+    repliesInThread: () => threadReplies,
+    threadRecordOf: (message) => message.thread || null,
+    idOf: (message) => message.id,
+  });
+  assert.equal(pending.threadOf(sends[2]), "t1", "a thread reply did not go into its message's thread");
+  assert.equal(pending.threadOf(sends[7]), null, "a message with no thread record was given one");
+  assert.deepStrictEqual([pending.into("t1"), pending.into("t2"), pending.into("t9")], [2, 1, 0]);
+  assert.deepStrictEqual([...pending.times()], [["t1", 20], ["t2", 30]]);
+  assert.equal(pending.key(), "c t1=2 t2=1");
+  pending.into("t1");
+  assert.equal(worked, 1, "the counts were worked out again with nothing changed");
+  version = 2;
+  threadReplies = false;
+  assert.equal(pending.into("t1"), 1, "a reply on a service without thread replies counted in a thread");
+  assert.equal(worked, 2);
+  channel = "d";
+  assert.equal(pending.into("t1"), 1);
+  assert.equal(pending.key(), "d t1=1");
+});
