@@ -48,3 +48,14 @@ export { countOf, replyMarkerName } from "./replies.ts";
 export { mainRunsAmong } from "./mainruns.ts";
 export { seamPlan } from "./seams.ts";
 export type { Seam, SeamPlan, SeamRow } from "./seams.ts";
+export {
+  CARD_STATES,
+  THREADS_UNPACKED_KEY,
+  THREAD_CARD_STATES_KEPT,
+  THREAD_CARD_STATES_KEY,
+  UNPACK_MODES,
+  UNPACK_MODE_NAMES,
+  UNPACK_MODE_SAID,
+  createCardPacking,
+} from "./packing.ts";
+export type { CardPacking, CardPackingDependencies } from "./packing.ts";

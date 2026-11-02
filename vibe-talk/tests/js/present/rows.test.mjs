@@ -205,3 +205,40 @@ test("`#624 voice-page-modularity`: the lines between rows — a day rule, a run
   // Without the filter the same hidden rows are no gap: only the days.
   assert.equal(seamPlan([row(20261010), row(20261011, { shown: false, count: 3 }), row(20261012)], false, clock).wanted.get(2).above.kind, "day");
 });
+
+test("`#624 voice-page-modularity`: Unpack's state and each thread's own choice, kept and read back, from the module alone", () => {
+  const { createCardPacking, THREADS_UNPACKED_KEY, THREAD_CARD_STATES_KEY, THREAD_CARD_STATES_KEPT } = ROWS;
+  const kept = new Map();
+  const storage = { getItem: (key) => (kept.has(key) ? kept.get(key) : null), setItem: (key, value) => kept.set(key, String(value)), removeItem: (key) => kept.delete(key) };
+  // An older page's "on" is Unpack all; nothing kept, or nonsense, is Pack all.
+  kept.set(THREADS_UNPACKED_KEY, "on");
+  assert.equal(createCardPacking({ storage: () => storage }).mode(), "all");
+  kept.set(THREADS_UNPACKED_KEY, "sideways");
+  const packing = createCardPacking({ storage: () => storage });
+  assert.equal(packing.mode(), "packed");
+  assert.equal(packing.nextMode(), "unread");
+  // A thread's own choice, per channel, kept with the most recent last.
+  packing.choose("C1", "T1", "unpacked");
+  packing.choose("C2", "T9", "expanded");
+  assert.equal(packing.choiceOf("C1", "T1"), "unpacked");
+  assert.equal(packing.unpackedIn("C1"), true);
+  assert.equal(packing.unpackedIn("C2"), false);
+  assert.deepStrictEqual(JSON.parse(kept.get(THREAD_CARD_STATES_KEY)), [["C1\nT1", "unpacked"], ["C2\nT9", "expanded"]]);
+  // Unpack pressed gives every thread of that channel back to it, and no other channel's.
+  packing.setMode("all", "C1");
+  assert.equal(kept.get(THREADS_UNPACKED_KEY), "all");
+  assert.equal(packing.choiceOf("C1", "T1"), undefined);
+  assert.equal(packing.choiceOf("C2", "T9"), "expanded");
+  // A change from another device read again.
+  kept.set(THREAD_CARD_STATES_KEY, JSON.stringify([["C3\nT3", "collapsed"], ["C3\nT4", "bogus"]]));
+  kept.set(THREADS_UNPACKED_KEY, "unread");
+  packing.reloadChoices();
+  packing.reloadMode();
+  assert.equal(packing.mode(), "unread");
+  assert.equal(packing.choiceOf("C3", "T3"), "collapsed");
+  assert.equal(packing.choiceOf("C3", "T4"), undefined, "a state that is none of the three was kept");
+  assert.equal(packing.choiceOf("C2", "T9"), undefined, "a choice not read back survived the reload");
+  // Only the most recent are kept.
+  for (let at = 0; at < THREAD_CARD_STATES_KEPT + 5; at += 1) packing.choose("C4", `T${at}`, "expanded");
+  assert.equal(JSON.parse(kept.get(THREAD_CARD_STATES_KEY)).length, THREAD_CARD_STATES_KEPT);
+});
