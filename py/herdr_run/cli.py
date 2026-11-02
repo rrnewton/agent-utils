@@ -1079,6 +1079,10 @@ def _cmd_config(config: Config, agent: str) -> int:
         "allow_subcommand": {
             key: list(value) for key, value in config.allow_subcommand.items()
         },
+        "allow_global_option": {
+            program: {subcommand: list(options) for subcommand, options in entries.items()}
+            for program, entries in config.allow_global_option.items()
+        },
         "value_options": {
             key: list(value) for key, value in config.value_options.items()
         },

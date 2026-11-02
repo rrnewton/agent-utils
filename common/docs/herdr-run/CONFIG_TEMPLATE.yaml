@@ -57,6 +57,16 @@ prefixes:
 allow_subcommand:
   cargo: [fetch, update, generate-lockfile, vendor, metadata, tree, search]
 
+# Exact global-option sequences exempted from `deny_global` for one subcommand only:
+# program -> subcommand -> sequences, each matched token for token (single-space joined)
+# against the options before the subcommand, and only as the sole occurrence of the denied
+# option it starts with. Empty by default, so nothing is exempt. Example, uncredentialed fetch:
+#
+#     allow_global_option:
+#       git:
+#         fetch: ["-c credential.helper="]
+allow_global_option: {}
+
 # Defence in depth, NOT the boundary: these remove the best-known ways an allowlisted program can
 # be talked into running something else. Do not mistake a full deny list for containment.
 #

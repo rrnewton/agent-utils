@@ -1093,6 +1093,7 @@ fn command_status(config: &Config, agent: &str, json_output: bool) -> Result<i32
 fn command_config(config: &Config, agent: &str) -> Result<i32> {
     let document = json!({
         "allow": config.allow,
+        "allow_global_option": config.allow_global_option,
         "allow_subcommand": config.allow_subcommand,
         "broker": config.broker,
         "cwd": config.cwd,

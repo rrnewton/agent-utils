@@ -139,6 +139,22 @@ def test_parses_every_supported_key() -> None:
     assert config.timeout_seconds == 30.0
 
 
+def test_allow_global_option_defaults_empty_and_parses() -> None:
+    assert Config().allow_global_option == {}
+    config = parse_config(
+        {"allow_global_option": {"git": {"fetch": ["-c credential.helper="]}}},
+        source_path="/tmp/x.yaml",
+        project_root="/tmp",
+    )
+    assert config.allow_global_option == {"git": {"fetch": ("-c credential.helper=",)}}
+    with pytest.raises(ConfigError, match="expected an object"):
+        parse_config(
+            {"allow_global_option": ["git"]},
+            source_path="/tmp/x.yaml",
+            project_root="/tmp",
+        )
+
+
 def test_empty_document_is_defaults() -> None:
     config = parse_config(None, source_path="/tmp/x.yaml", project_root="/tmp")
     assert config.allow == ("git", "gh")

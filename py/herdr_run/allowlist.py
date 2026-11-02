@@ -267,6 +267,42 @@ def _opens_with_sender_header(text: str) -> bool:
     return True
 
 
+def _is_exempt_global_option(
+    args: list[str],
+    index: int,
+    subcommand_index: int,
+    global_option_indices: list[int],
+    denied: str,
+    allowed_sequences: tuple[str, ...],
+) -> bool:
+    """Whether the denied global option at ``args[index]`` is exempted for this subcommand.
+
+    An exemption names an exact token sequence (``"-c credential.helper="`` is the tokens
+    ``-c`` then ``credential.helper=``). It applies only when every token matches byte for
+    byte, the sequence lies wholly before the subcommand, and the denied option it starts
+    with occurs exactly once among the global options: an attached (``-ccredential...``),
+    clustered (``-qc``), repeated, or differently valued spelling is never exempt, and a
+    second denied option beside an exempt one is still refused on its own token.
+    """
+    if not allowed_sequences:
+        return False
+    occurrences = sum(
+        1
+        for other in global_option_indices
+        if _matches_denied_option(args[other], denied)
+    )
+    if occurrences != 1:
+        return False
+    for entry in allowed_sequences:
+        wanted = entry.split(" ")
+        if any(token == "" for token in wanted):
+            continue
+        end = index + len(wanted)
+        if end <= subcommand_index and args[index:end] == wanted:
+            return True
+    return False
+
+
 def admit(command: str, config: Config, *, home: object = _FROM_ENVIRONMENT) -> Admission:
     """Admit ``command`` under ``config``, or raise :class:`Refused` explaining exactly why.
 
@@ -355,31 +391,48 @@ def admit(command: str, config: Config, *, home: object = _FROM_ENVIRONMENT) -> 
                     "arbitrary code"
                 )
 
+    # First pass: find the subcommand without enforcing ``deny_global``, so an
+    # ``allow_global_option`` exemption scoped to that subcommand can be judged in the
+    # second pass. Option VALUES are skipped exactly as the subcommand search requires:
+    # without this, `git -C /tmp/repo log` would read `/tmp/repo` as the subcommand and
+    # every subcommand-level rule would be looking at the wrong token.
     subcommand: str | None = None
     subcommand_index = len(args)
+    global_option_indices: list[int] = []
     expect_value = False
     for index, token in enumerate(args):
         if expect_value:
-            # This token is the VALUE of the preceding option (`git -C <path>`), not the
-            # subcommand. Without this, `git -C /tmp/repo log` would read `/tmp/repo` as the
-            # subcommand and every subcommand-level rule would be looking at the wrong token.
             expect_value = False
             continue
         if not token.startswith("-"):
             subcommand = token
             subcommand_index = index
             break
+        global_option_indices.append(index)
         base = token.split("=", 1)[0]
+        if base in value_options and "=" not in token:
+            expect_value = True
+
+    # Second pass: enforce ``deny_global`` over the global options, exempting only an
+    # exact ``allow_global_option`` sequence for this subcommand.
+    allowed_sequences: tuple[str, ...] = ()
+    if subcommand is not None:
+        allowed_sequences = config.allow_global_option.get(program, {}).get(subcommand, ())
+    for index in global_option_indices:
+        token = args[index]
         denied = next(
             (option for option in deny_global if _matches_denied_option(token, option)), None
         )
-        if denied is not None:
-            raise Refused(
-                f"global option {quote(denied)} is denied for {program}: it can make {program} execute "
-                "arbitrary code"
-            )
-        if base in value_options and "=" not in token:
-            expect_value = True
+        if denied is None:
+            continue
+        if _is_exempt_global_option(
+            args, index, subcommand_index, global_option_indices, denied, allowed_sequences
+        ):
+            continue
+        raise Refused(
+            f"global option {quote(denied)} is denied for {program}: it can make {program} execute "
+            "arbitrary code"
+        )
 
     # A per-program subcommand ALLOWLIST, when present, is fail-closed: it is checked before the
     # deny-list and refuses anything not named, including a bare program with no subcommand. This

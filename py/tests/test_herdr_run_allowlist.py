@@ -178,6 +178,67 @@ def test_refuses_git_global_code_execution_options(config: Config, command: str)
         admit(command, config)
 
 
+@pytest.fixture()
+def fetch_config() -> Config:
+    """The uncredentialed-fetch exemption: `git -c credential.helper= fetch` only."""
+    return Config(
+        allow_global_option={"git": {"fetch": ("-c credential.helper=",)}}
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git -c credential.helper= fetch",
+        "git -c credential.helper= fetch origin",
+        "git -C /tmp/repo -c credential.helper= fetch",
+        "git -c credential.helper= -C /tmp/repo fetch",
+        "with-proxy git -c credential.helper= fetch",
+        "with-proxy git -C /tmp/repo -c credential.helper= fetch origin main",
+    ],
+)
+def test_admits_the_exact_uncredentialed_fetch_form(fetch_config: Config, command: str) -> None:
+    admission = admit(command, fetch_config)
+    assert admission.program == "git"
+    assert admission.subcommand == "fetch"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # A credential helper value is not the empty (uncredentialed) one.
+        "git -c credential.helper=evil fetch",
+        "git -c credential.helper= fetch origin --upload-pack=evil",
+        # The exemption is scoped to fetch only.
+        "git -c credential.helper= status",
+        "git -c credential.helper= push origin main",
+        "git -c credential.helper= clone https://example.invalid/repo",
+        # Attached, equals-attached, and clustered spellings are not the exact form.
+        "git -ccredential.helper= fetch",
+        "git -c=credential.helper= fetch",
+        "git -vc credential.helper= fetch",
+        # Repeated, or beside another -c, is not the sole -c.
+        "git -c credential.helper= -c credential.helper= fetch",
+        "git -c credential.helper= -c core.pager=evil fetch",
+        "git -c core.pager=evil -c credential.helper= fetch",
+        # Another denied global beside the exempt one still refuses.
+        "git --exec-path=/tmp/evil -c credential.helper= fetch",
+        "git -c credential.helper= --exec-path=/tmp/evil fetch",
+        # No subcommand, so no scoped exemption applies.
+        "git -c credential.helper=",
+    ],
+)
+def test_refuses_every_other_dash_c_spelling(fetch_config: Config, command: str) -> None:
+    with pytest.raises(Refused, match="denied"):
+        admit(command, fetch_config)
+
+
+def test_the_exemption_needs_its_configuration(config: Config) -> None:
+    """Without `allow_global_option`, the exact form stays refused like any `-c`."""
+    with pytest.raises(Refused, match="denied"):
+        admit("git -c credential.helper= fetch", config)
+
+
 def test_allows_c_flag_that_is_not_a_global_option(config: Config) -> None:
     """`-c` AFTER the subcommand is not git's global config switch and must stay usable.
 

@@ -1139,6 +1139,117 @@
       "expect": {
         "refused": "option \"--evil\" is denied: it names a program for git to execute"
       }
+    },
+    {
+      "name": "uncredentialed fetch is admitted when configured",
+      "config": "allow_global_option:\n  git:\n    fetch: [\"-c credential.helper=\"]\n",
+      "home": null,
+      "command": "git -c credential.helper= fetch",
+      "expect": {
+        "allowed": {
+          "program": "git",
+          "subcommand": "fetch",
+          "rendered": "git -c credential.helper= fetch"
+        }
+      }
+    },
+    {
+      "name": "uncredentialed fetch behind -C is admitted",
+      "config": "allow_global_option:\n  git:\n    fetch: [\"-c credential.helper=\"]\n",
+      "home": null,
+      "command": "git -C /tmp/repo -c credential.helper= fetch origin",
+      "expect": {
+        "allowed": {
+          "program": "git",
+          "subcommand": "fetch",
+          "rendered": "git -C /tmp/repo -c credential.helper= fetch origin"
+        }
+      }
+    },
+    {
+      "name": "uncredentialed fetch behind with-proxy is admitted",
+      "config": "allow_global_option:\n  git:\n    fetch: [\"-c credential.helper=\"]\n",
+      "home": null,
+      "command": "with-proxy git -c credential.helper= fetch",
+      "expect": {
+        "allowed": {
+          "program": "git",
+          "subcommand": "fetch",
+          "rendered": "with-proxy git -c credential.helper= fetch"
+        }
+      }
+    },
+    {
+      "name": "credentialed fetch value is refused",
+      "config": "allow_global_option:\n  git:\n    fetch: [\"-c credential.helper=\"]\n",
+      "home": null,
+      "command": "git -c credential.helper=evil fetch",
+      "expect": {
+        "refused": "global option \"-c\" is denied for git: it can make git execute arbitrary code"
+      }
+    },
+    {
+      "name": "uncredentialed global for another subcommand is refused",
+      "config": "allow_global_option:\n  git:\n    fetch: [\"-c credential.helper=\"]\n",
+      "home": null,
+      "command": "git -c credential.helper= status",
+      "expect": {
+        "refused": "global option \"-c\" is denied for git: it can make git execute arbitrary code"
+      }
+    },
+    {
+      "name": "attached uncredentialed fetch is refused",
+      "config": "allow_global_option:\n  git:\n    fetch: [\"-c credential.helper=\"]\n",
+      "home": null,
+      "command": "git -ccredential.helper= fetch",
+      "expect": {
+        "refused": "global option \"-c\" is denied for git: it can make git execute arbitrary code"
+      }
+    },
+    {
+      "name": "equals-attached uncredentialed fetch is refused",
+      "config": "allow_global_option:\n  git:\n    fetch: [\"-c credential.helper=\"]\n",
+      "home": null,
+      "command": "git -c=credential.helper= fetch",
+      "expect": {
+        "refused": "global option \"-c\" is denied for git: it can make git execute arbitrary code"
+      }
+    },
+    {
+      "name": "clustered uncredentialed fetch is refused",
+      "config": "allow_global_option:\n  git:\n    fetch: [\"-c credential.helper=\"]\n",
+      "home": null,
+      "command": "git -vc credential.helper= fetch",
+      "expect": {
+        "refused": "global option \"-c\" is denied for git: it can make git execute arbitrary code"
+      }
+    },
+    {
+      "name": "repeated uncredentialed fetch is refused",
+      "config": "allow_global_option:\n  git:\n    fetch: [\"-c credential.helper=\"]\n",
+      "home": null,
+      "command": "git -c credential.helper= -c credential.helper= fetch",
+      "expect": {
+        "refused": "global option \"-c\" is denied for git: it can make git execute arbitrary code"
+      }
+    },
+    {
+      "name": "uncredentialed fetch beside another -c is refused",
+      "config": "allow_global_option:\n  git:\n    fetch: [\"-c credential.helper=\"]\n",
+      "home": null,
+      "command": "git -c credential.helper= -c core.pager=evil fetch",
+      "expect": {
+        "refused": "global option \"-c\" is denied for git: it can make git execute arbitrary code"
+      }
+    },
+    {
+      "name": "uncredentialed fetch is refused without the exemption",
+      "config": null,
+      "home": null,
+      "command": "git -c credential.helper= fetch",
+      "expect": {
+        "refused": "global option \"-c\" is denied for git: it can make git execute arbitrary code"
+      }
     }
   ],
   "upgrades": [

@@ -260,6 +260,12 @@ class Config:
     allow_subcommand: dict[str, tuple[str, ...]] = field(
         default_factory=lambda: dict(_DEFAULT_ALLOW_SUBCOMMAND)
     )
+    #: Exact global-option sequences exempted from :attr:`deny_global` for one subcommand:
+    #: program -> subcommand -> sequences such as ``"-c credential.helper="``. Each entry is
+    #: matched token for token (single-space joined) against the global options preceding the
+    #: subcommand, after ``~`` expansion, and exempts only a sole occurrence of the denied
+    #: option it starts with. Empty by default, so every denied global option stays denied.
+    allow_global_option: dict[str, dict[str, tuple[str, ...]]] = field(default_factory=dict)
     #: The built-in table plus whatever the configuration adds; see :data:`_DEFAULT_VALUE_OPTIONS`.
     value_options: dict[str, tuple[str, ...]] = field(
         default_factory=lambda: dict(_DEFAULT_VALUE_OPTIONS)
@@ -343,6 +349,7 @@ KNOWN_KEYS: tuple[str, ...] = (
     "deny_anywhere",
     "deny_subcommand_option",
     "allow_subcommand",
+    "allow_global_option",
     "value_options",
     "spool_dir",
     "timeout_seconds",
@@ -667,6 +674,8 @@ def _parse_config(
             config = replace(config, deny_subcommand_option=_str_tuple_map_map(raw, where))
         elif key == "allow_subcommand":
             config = replace(config, allow_subcommand=_str_tuple_map(raw, where))
+        elif key == "allow_global_option":
+            config = replace(config, allow_global_option=_str_tuple_map_map(raw, where))
         elif key == "value_options":
             config = replace(
                 config, value_options=_with_builtin_value_options(_str_tuple_map(raw, where))

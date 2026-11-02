@@ -255,8 +255,12 @@ pub fn admit_with_home(command: &str, config: &Config, home: Option<&OsStr>) -> 
         }
     }
 
+    // First pass: find the subcommand without enforcing `deny_global`, so an
+    // `allow_global_option` exemption scoped to that subcommand can be judged in the
+    // second pass. Option VALUES are skipped exactly as the subcommand search requires.
     let mut subcommand = None;
     let mut subcommand_index = args.len();
+    let mut global_option_indices: Vec<usize> = Vec::new();
     let mut expect_value = false;
     for (index, token) in args.iter().enumerate() {
         if expect_value {
@@ -268,21 +272,46 @@ pub fn admit_with_home(command: &str, config: &Config, home: Option<&OsStr>) -> 
             subcommand_index = index;
             break;
         }
+        global_option_indices.push(index);
         let (base, has_inline_value) = token
             .split_once('=')
             .map_or((token.as_str(), false), |(name, _)| (name, true));
-        if let Some(denied) = deny_global
-            .iter()
-            .find(|denied| matches_denied_option(token, denied))
-        {
-            return Err(HerdrRunError::refused(format!(
-                "global option {} is denied for {program}: it can make {program} execute arbitrary code",
-                quote(denied)
-            )));
-        }
         if !has_inline_value && value_options.iter().any(|option| option == base) {
             expect_value = true;
         }
+    }
+    // Second pass: enforce `deny_global` over the global options, exempting only an
+    // exact `allow_global_option` sequence for this subcommand.
+    let allowed_sequences: &[String] = match subcommand.as_deref() {
+        Some(candidate) => config
+            .allow_global_option
+            .get(&program)
+            .and_then(|entries| entries.get(candidate))
+            .map_or(&[][..], Vec::as_slice),
+        None => &[][..],
+    };
+    for &index in &global_option_indices {
+        let token = &args[index];
+        let Some(denied) = deny_global
+            .iter()
+            .find(|denied| matches_denied_option(token, denied))
+        else {
+            continue;
+        };
+        if is_exempt_global_option(
+            args,
+            index,
+            subcommand_index,
+            &global_option_indices,
+            denied,
+            allowed_sequences,
+        ) {
+            continue;
+        }
+        return Err(HerdrRunError::refused(format!(
+            "global option {} is denied for {program}: it can make {program} execute arbitrary code",
+            quote(denied)
+        )));
     }
     let allowed_subcommands = config.allow_subcommand.get(&program);
     if program == "cargo" && allowed_subcommands.is_none() {
@@ -430,6 +459,46 @@ fn opens_with_sender_header(text: &str) -> bool {
                     && !value.contains('·')
             })
         })
+}
+
+/// Whether the denied global option at `args[index]` is exempted for this subcommand.
+///
+/// An exemption names an exact token sequence (`"-c credential.helper="` is the tokens
+/// `-c` then `credential.helper=`). It applies only when every token matches byte for
+/// byte, the sequence lies wholly before the subcommand, and the denied option it starts
+/// with occurs exactly once among the global options: an attached (`-ccredential...`),
+/// clustered (`-qc`), repeated, or differently valued spelling is never exempt, and a
+/// second denied option beside an exempt one is still refused on its own token.
+fn is_exempt_global_option(
+    args: &[String],
+    index: usize,
+    subcommand_index: usize,
+    global_option_indices: &[usize],
+    denied: &str,
+    allowed_sequences: &[String],
+) -> bool {
+    if allowed_sequences.is_empty() {
+        return false;
+    }
+    let occurrences = global_option_indices
+        .iter()
+        .filter(|&&other| matches_denied_option(&args[other], denied))
+        .count();
+    if occurrences != 1 {
+        return false;
+    }
+    allowed_sequences.iter().any(|entry| {
+        let wanted: Vec<&str> = entry.split(' ').collect();
+        if wanted.iter().any(|token| token.is_empty()) {
+            return false;
+        }
+        let end = index + wanted.len();
+        end <= subcommand_index
+            && args[index..end]
+                .iter()
+                .map(String::as_str)
+                .eq(wanted.iter().copied())
+    })
 }
 
 /// Whether `token` spells the denied option `denied`. Every `deny_*` option rule uses this.
@@ -1107,6 +1176,48 @@ pub(crate) mod tests {
             };
             assert_eq!(outcome, case["expect"], "{name}");
         }
+    }
+
+    #[test]
+    fn uncredentialed_fetch_needs_the_exact_configured_form() {
+        let mut config = Config::default();
+        config.allow_global_option.insert(
+            "git".to_owned(),
+            std::collections::BTreeMap::from([(
+                "fetch".to_owned(),
+                vec!["-c credential.helper=".to_owned()],
+            )]),
+        );
+        for command in [
+            "git -c credential.helper= fetch",
+            "git -c credential.helper= fetch origin",
+            "git -C /tmp/repo -c credential.helper= fetch",
+            "git -c credential.helper= -C /tmp/repo fetch",
+            "with-proxy git -c credential.helper= fetch",
+            "with-proxy git -C /tmp/repo -c credential.helper= fetch origin main",
+        ] {
+            let admission = admit(command, &config).expect(command);
+            assert_eq!(admission.program, "git", "{command}");
+            assert_eq!(admission.subcommand.as_deref(), Some("fetch"), "{command}");
+        }
+        for command in [
+            "git -c credential.helper=evil fetch",
+            "git -c credential.helper= status",
+            "git -c credential.helper= push origin main",
+            "git -ccredential.helper= fetch",
+            "git -c=credential.helper= fetch",
+            "git -vc credential.helper= fetch",
+            "git -c credential.helper= -c credential.helper= fetch",
+            "git -c credential.helper= -c core.pager=evil fetch",
+            "git -c core.pager=evil -c credential.helper= fetch",
+            "git --exec-path=/tmp/evil -c credential.helper= fetch",
+            "git -c credential.helper=",
+        ] {
+            let error = admit(command, &config).expect_err(command);
+            assert!(error.to_string().contains("denied"), "{command}: {error}");
+        }
+        // Without the exemption the exact form stays refused like any `-c`.
+        assert!(admit("git -c credential.helper= fetch", &Config::default()).is_err());
     }
 
     /// The admission, refusal, or configuration error one command meets, as the corpus writes it.

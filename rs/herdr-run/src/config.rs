@@ -104,6 +104,12 @@ pub struct Config {
     pub deny_subcommand_option: BTreeMap<String, BTreeMap<String, Vec<String>>>,
     /// Programs whose subcommand must appear in the corresponding positive list.
     pub allow_subcommand: BTreeMap<String, Vec<String>>,
+    /// Exact global-option sequences exempted from `deny_global` for one subcommand:
+    /// program -> subcommand -> sequences such as `"-c credential.helper="`. Each entry is
+    /// matched token for token (single-space joined) against the global options preceding the
+    /// subcommand, after `~` expansion, and exempts only a sole occurrence of the denied
+    /// option it starts with. Empty by default, so every denied global option stays denied.
+    pub allow_global_option: BTreeMap<String, BTreeMap<String, Vec<String>>>,
     /// Global options whose value occupies the following token: the built-in table plus whatever
     /// the configuration adds.
     ///
@@ -207,6 +213,7 @@ impl Default for Config {
                     "search",
                 ],
             )]),
+            allow_global_option: BTreeMap::new(),
             // Git's own list: the top-level options `handle_options` in git.c gives the next
             // argument to. `--super-prefix` was removed in Git 2.41 and is still read by older
             // Gits; `--exec-path` takes a value only as `--exec-path=PATH` and is denied anyway.
@@ -262,7 +269,7 @@ impl Default for Config {
 /// Public because it is also the definition of "every knob", which the generated
 /// `.herdr-run.yaml` has to cover for the user guide to be able to point at that file instead of
 /// restating it.
-pub const KNOWN_KEYS: [&str; 23] = [
+pub const KNOWN_KEYS: [&str; 24] = [
     "workspace",
     "tab_name",
     "cwd",
@@ -273,6 +280,7 @@ pub const KNOWN_KEYS: [&str; 23] = [
     "deny_anywhere",
     "deny_subcommand_option",
     "allow_subcommand",
+    "allow_global_option",
     "value_options",
     "spool_dir",
     "timeout_seconds",
@@ -934,6 +942,9 @@ pub fn parse_config(
                 config.deny_subcommand_option = require_policy_map_map(value, &where_)?;
             }
             "allow_subcommand" => config.allow_subcommand = require_policy_map(value, &where_)?,
+            "allow_global_option" => {
+                config.allow_global_option = require_policy_map_map(value, &where_)?;
+            }
             "value_options" => {
                 config.value_options =
                     with_builtin_value_options(require_policy_map(value, &where_)?);
@@ -1150,6 +1161,21 @@ mod tests {
         assert_eq!(config.timeout_seconds, 30.0);
         assert_eq!(config.retention_days, 7);
         assert_eq!(config.prompt_tail.as_deref(), Some("% "));
+    }
+
+    #[test]
+    fn allow_global_option_defaults_empty_and_parses() {
+        assert!(Config::default().allow_global_option.is_empty());
+        let config =
+            parse_text("allow_global_option:\n  git:\n    fetch: [\"-c credential.helper=\"]\n")
+                .unwrap();
+        assert_eq!(
+            config.allow_global_option["git"]["fetch"],
+            strings(&["-c credential.helper="])
+        );
+        let error = parse_text("allow_global_option: [git]\n").expect_err("a list is not a map");
+        assert_eq!(error.exit_code(), crate::error::EXIT_CONFIG);
+        assert!(error.message().contains("expected an object"), "{error}");
     }
 
     #[test]
