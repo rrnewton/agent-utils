@@ -1,13 +1,14 @@
 ---
 title: 'agent-teams-relay-slack-link-markup: Slack rewrites domain-like tokens inside the relay envelope, breaking the body hash'
-status: open
+status: closed
 priority: 1
-assignee: mu-mirror@devbig014
 issue_type: bug
+assignee: mu-mirror@devbig014
 labels:
 - agent-teams
 created_at: 2026-11-02T22:54:03.979871738+00:00
-updated_at: 2026-11-02T22:54:03.979871738+00:00
+updated_at: 2026-11-02T23:56:01.375892782+00:00
+closed_at: 2026-11-02T23:56:01.375892682+00:00
 ---
 
 # Description
