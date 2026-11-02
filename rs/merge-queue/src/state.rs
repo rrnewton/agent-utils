@@ -5,6 +5,7 @@
 //!   config.json            fixed: queue configuration
 //!   lock                   fixed: writer lock (flock)
 //!   union.attributes       fixed: generated from `union_paths`, when set
+//!   api-budget.json        fixed: API requests charged in the last hour (bounded)
 //!   items/<pr>.json        one record per submitted change
 //!   runs/<run-id>/         one directory per `run`: plan, events, validations, report
 //!   obligations/<id>.json  one record per focused landing still owed a complete run
@@ -75,6 +76,10 @@ pub struct LandConfig {
     /// change's intermediate tree, which was not validated on its own; off by default, which
     /// makes every batch a single change.
     pub allow_batches: bool,
+    /// After landing, close each landed pull request through the hosting service (budgeted),
+    /// with a comment naming the commit that contains it. Closes the budget cannot afford yet
+    /// are retried by `sync`.
+    pub close_prs: bool,
 }
 
 /// Generated files the queue regenerates instead of treating their conflicts as real.
@@ -138,6 +143,25 @@ pub fn path_matches(pattern: &str, path: &str) -> bool {
     rest.is_empty()
 }
 
+/// The hosting service (GitHub through its `gh` command), used only for ready sources and
+/// closing landed pull requests, behind a request budget.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GitHubConfig {
+    /// `owner/name`.
+    pub repo: String,
+    /// Command (and leading arguments) to run instead of `gh`, e.g. a pacing wrapper.
+    pub gh: Vec<String>,
+    /// Requests allowed per rolling hour (0 = 60).
+    pub max_per_hour: u32,
+    /// Budget file shared by every queue on the host; empty = `api-budget.json` in the state
+    /// directory.
+    pub budget_file: String,
+    /// Fetch without credentials (public repositories): Git credential helpers are disabled for
+    /// fetches, so fetching never spends a credential use.
+    pub anonymous_fetch: bool,
+}
+
 /// Identity for commits the queue creates.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -182,8 +206,17 @@ pub struct Config {
     /// after an ejection reruns the batch's whole selection, and a tree lands only with green
     /// coverage of its selection recorded at that exact commit.
     pub exact_sha: bool,
+    /// Treat the base as green for culprit searches (skip probing it). Sound when only this
+    /// queue lands on the base, always as exactly validated commits; a broken base would then
+    /// be blamed on the first change of a red batch.
+    pub trust_base: bool,
     /// Identity for commits the queue creates.
     pub identity: IdentityConfig,
+    /// The hosting service, for ready sources and closing landed pull requests.
+    pub github: GitHubConfig,
+    /// Peer queues by name: other repositories' merge-queue state directories. A change may
+    /// require a commit on a peer's base; `run --with-peers` drains those peers first.
+    pub peers: std::collections::BTreeMap<String, PathBuf>,
     /// Validation configuration.
     pub validator: ValidatorConfig,
     /// Landing configuration.
@@ -205,7 +238,10 @@ impl Default for Config {
             union_paths: Vec::new(),
             regenerate: RegenerateConfig::default(),
             exact_sha: false,
+            trust_base: false,
             identity: IdentityConfig::default(),
+            github: GitHubConfig::default(),
+            peers: std::collections::BTreeMap::new(),
             validator: ValidatorConfig::default(),
             land: LandConfig::default(),
         }

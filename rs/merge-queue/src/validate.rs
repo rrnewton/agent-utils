@@ -41,12 +41,31 @@ pub struct Ran {
     pub log: PathBuf,
     /// The queue cancelled the run (its candidate was discarded); its results mean nothing.
     pub cancelled: bool,
+    /// Opaque handle the runner wrote to `$MQ_HANDLE_FILE`, if any; passed back as
+    /// `$MQ_RERUN_FROM` to a later validation of the same commit.
+    pub handle: Option<String>,
 }
 
 impl Ran {
     /// Whether the run is green: every result non-blocking and the runner exited zero.
     pub fn green(&self) -> bool {
         !self.cancelled && self.exit == Some(0) && self.results.green()
+    }
+
+    /// Whether this run reproduces a failure, for a culprit search: some test actually failed
+    /// or errored, or the runner exited non-zero. Tests that were merely unreported do not
+    /// count (they may not exist at that commit).
+    pub fn reproduces(&self) -> bool {
+        !self.cancelled && (!self.results.attributed_failures().is_empty() || self.exit != Some(0))
+    }
+
+    /// The failures a culprit search attributes to this run.
+    pub fn reproduced(&self) -> BTreeSet<TestId> {
+        let failures = self.results.attributed_failures();
+        if failures.is_empty() && self.exit != Some(0) {
+            return [TestId::step(UNATTRIBUTED)].into();
+        }
+        failures
     }
 
     /// Failed tests. A red run with no attributed failure reports [`UNATTRIBUTED`].
@@ -81,6 +100,30 @@ pub trait Validator: Sync {
         out: &Path,
         cancel: &AtomicBool,
     ) -> Result<Ran, String>;
+
+    /// [`Validator::run`] with extra environment variables for the runner (for example
+    /// `MQ_RERUN_FROM`). Runners that take no extra context ignore them.
+    fn run_with(
+        &self,
+        checkout: &Path,
+        selection: &Selection,
+        out: &Path,
+        cancel: &AtomicBool,
+        extra: &[(String, String)],
+    ) -> Result<Ran, String> {
+        let _ = extra;
+        self.run(checkout, selection, out, cancel)
+    }
+}
+
+/// File, inside a validation's directory, where a runner may write an opaque handle for its run.
+pub const HANDLE_FILE: &str = "handle.txt";
+
+fn read_handle(out: &Path) -> Option<String> {
+    std::fs::read_to_string(out.join(HANDLE_FILE))
+        .ok()
+        .map(|text| text.trim().to_owned())
+        .filter(|text| !text.is_empty())
 }
 
 /// Build the validator a configuration names.
@@ -263,6 +306,17 @@ impl Validator for CommandValidator {
         out: &Path,
         cancel: &AtomicBool,
     ) -> Result<Ran, String> {
+        self.run_with(checkout, selection, out, cancel, &[])
+    }
+
+    fn run_with(
+        &self,
+        checkout: &Path,
+        selection: &Selection,
+        out: &Path,
+        cancel: &AtomicBool,
+        extra: &[(String, String)],
+    ) -> Result<Ran, String> {
         std::fs::create_dir_all(out)
             .map_err(|error| format!("cannot create {}: {error}", out.display()))?;
         let results_path = out.join("results.jsonl");
@@ -280,7 +334,8 @@ impl Validator for CommandValidator {
                 .collect::<String>(),
         )
         .map_err(|error| format!("cannot write {}: {error}", tests_path.display()))?;
-        let env = [
+        let _ = std::fs::remove_file(out.join(HANDLE_FILE));
+        let mut env: Vec<(&str, String)> = vec![
             (
                 "MQ_SELECTION",
                 if selection.is_all() { "all" } else { "tests" }.to_owned(),
@@ -288,7 +343,16 @@ impl Validator for CommandValidator {
             ("MQ_TESTS", listed.join(" ")),
             ("MQ_TESTS_FILE", tests_path.display().to_string()),
             ("MQ_RESULTS", results_path.display().to_string()),
+            (
+                "MQ_HANDLE_FILE",
+                out.join(HANDLE_FILE).display().to_string(),
+            ),
         ];
+        env.extend(
+            extra
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.clone())),
+        );
         let log = out.join("run.log");
         let argv = vec!["sh".to_owned(), "-c".to_owned(), self.0.run.clone()];
         let (exit, elapsed, cancelled) = run_logged(&self.0, &argv, checkout, &env, &log, cancel)?;
@@ -311,6 +375,10 @@ impl Validator for CommandValidator {
                     duration_ms: parsed.duration_ms,
                 });
             }
+        }
+        if results.results.is_empty() {
+            // No results file: a runner that prints dagrun-style verdict lines still attributes.
+            results = parse_step_lines(&std::fs::read_to_string(&log).unwrap_or_default());
         }
         if results.results.is_empty() {
             results.unattributed = true;
@@ -338,6 +406,7 @@ impl Validator for CommandValidator {
             elapsed,
             log,
             cancelled,
+            handle: read_handle(out),
         })
     }
 }
@@ -477,6 +546,7 @@ impl Validator for DagrunValidator {
                     elapsed: Duration::ZERO,
                     log: out.join("run.log"),
                     cancelled: false,
+                    handle: None,
                 });
             }
             argv.push("--selected".to_owned());
@@ -503,6 +573,7 @@ impl Validator for DagrunValidator {
             elapsed,
             log,
             cancelled,
+            handle: read_handle(out),
         })
     }
 }
@@ -628,6 +699,30 @@ mod unit {
                 .selection,
             Selection::All
         );
+    }
+
+    #[test]
+    fn command_runner_printing_verdict_lines_is_attributed_and_handles_round_trip() {
+        let tmp = TempDir::new("validate-lines");
+        let v = from_config(&config(
+            r#"echo "[unit.a] ✓ PASS   a (1s)"; echo "[unit.b] ✗ FAIL   b (2s, exit 1)"; echo "run-42" > "$MQ_HANDLE_FILE"; echo "from=$MQ_RERUN_FROM"; exit 1"#,
+        ))
+        .unwrap();
+        let extra = vec![("MQ_RERUN_FROM".to_owned(), "run-41".to_owned())];
+        let ran = v
+            .run_with(
+                &tmp.0,
+                &Selection::All,
+                &tmp.0.join("o"),
+                &AtomicBool::new(false),
+                &extra,
+            )
+            .unwrap();
+        assert!(!ran.results.unattributed);
+        assert_eq!(ran.failed(), [TestId::step("unit.b")].into());
+        assert_eq!(ran.handle.as_deref(), Some("run-42"));
+        let log = std::fs::read_to_string(tmp.0.join("o/run.log")).unwrap();
+        assert!(log.contains("from=run-41"), "{log}");
     }
 
     #[test]

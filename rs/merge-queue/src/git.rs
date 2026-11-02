@@ -63,6 +63,9 @@ pub struct Git {
     /// Name and email for commits the queue creates (committer of replayed commits, author and
     /// committer of merge and regeneration commits). `None` uses Git's own configuration.
     pub identity: Option<(String, String)>,
+    /// Fetch without credentials: credential helpers are disabled and prompting is off for
+    /// `fetch`, so a public repository costs no credential use.
+    pub anonymous_fetch: bool,
 }
 
 impl Git {
@@ -73,14 +76,18 @@ impl Git {
             net_wrapper: Vec::new(),
             settings: Vec::new(),
             identity: None,
+            anonymous_fetch: false,
         }
     }
 
     fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new("git");
         command.arg("-C").arg(&self.dir);
-        for setting in &self.settings {
+        for setting in self.settings_for(args) {
             command.arg("-c").arg(setting);
+        }
+        if self.anonymous_fetch && args.first() == Some(&"fetch") {
+            command.env("GIT_TERMINAL_PROMPT", "0");
         }
         command.args(args);
         if let Some((name, email)) = &self.identity {
@@ -112,6 +119,15 @@ impl Git {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
     }
 
+    /// `-c` settings for one invocation.
+    fn settings_for(&self, args: &[&str]) -> Vec<String> {
+        let mut settings = self.settings.clone();
+        if self.anonymous_fetch && args.first() == Some(&"fetch") {
+            settings.push("credential.helper=".to_owned());
+        }
+        settings
+    }
+
     /// Run a network git command through the configured wrapper.
     pub fn run_net(&self, args: &[&str]) -> Result<String, String> {
         if self.net_wrapper.is_empty() {
@@ -122,8 +138,14 @@ impl Git {
             .args(&self.net_wrapper[1..])
             .arg("git")
             .arg("-C")
-            .arg(&self.dir)
-            .args(args);
+            .arg(&self.dir);
+        for setting in self.settings_for(args) {
+            command.arg("-c").arg(setting);
+        }
+        if self.anonymous_fetch && args.first() == Some(&"fetch") {
+            command.env("GIT_TERMINAL_PROMPT", "0");
+        }
+        command.args(args);
         let what = format!("{} git {}", self.net_wrapper.join(" "), args.join(" "));
         let output = self.output(command, &what, &[0])?;
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
@@ -682,6 +704,16 @@ mod unit {
             git.combine(CombineMode::Rebase, &a, &b, &[], "").unwrap(),
             Combined::Conflict(vec!["gen.json".to_owned()])
         );
+    }
+
+    #[test]
+    fn anonymous_fetch_disables_credential_helpers_for_fetch_only() {
+        let mut git = Git::new("/nonexistent");
+        git.anonymous_fetch = true;
+        assert!(git
+            .settings_for(&["fetch", "origin"])
+            .contains(&"credential.helper=".to_owned()));
+        assert!(git.settings_for(&["push", "origin"]).is_empty());
     }
 
     #[test]

@@ -201,14 +201,18 @@ pub enum Outcome {
     Fail,
     /// The runner reported the test skipped; it proves nothing either way.
     Skip,
-    /// The test could not run or report (timeout, crash, missing result).
+    /// The test could not run or report (timeout, crash).
     Error,
+    /// The test was selected but the runner never reported it. Blocks landing (silence is not
+    /// success), but does not reproduce a failure in a culprit search: a test that does not
+    /// exist yet at an earlier commit cannot fail there.
+    Missing,
 }
 
 impl Outcome {
     /// Whether this outcome blocks landing.
     pub const fn is_bad(self) -> bool {
-        matches!(self, Self::Fail | Self::Error)
+        matches!(self, Self::Fail | Self::Error | Self::Missing)
     }
 
     /// Parse a runner-reported outcome. Accepts common synonyms.
@@ -264,6 +268,15 @@ impl TestResults {
         }
     }
 
+    /// Tests that actually failed or errored (not merely unreported).
+    pub fn attributed_failures(&self) -> BTreeSet<TestId> {
+        self.results
+            .iter()
+            .filter(|(_, outcome)| matches!(outcome, Outcome::Fail | Outcome::Error))
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
     /// Tests whose outcome blocks landing.
     pub fn failed(&self) -> BTreeSet<TestId> {
         self.results
@@ -287,7 +300,7 @@ impl TestResults {
         counts
     }
 
-    /// Mark selected tests that the runner never reported as errors, so silence never passes.
+    /// Mark selected tests that the runner never reported as missing, so silence never passes.
     pub fn require(&mut self, selection: &Selection) {
         let Some(tests) = selection.tests() else {
             return;
@@ -299,7 +312,7 @@ impl TestResults {
                     .keys()
                     .any(|seen| seen.step == test.step && test.case.is_none());
             if !reported {
-                self.results.insert(test.clone(), Outcome::Error);
+                self.results.insert(test.clone(), Outcome::Missing);
             }
         }
     }

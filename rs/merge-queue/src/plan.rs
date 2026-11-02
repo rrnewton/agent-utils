@@ -34,6 +34,8 @@ pub struct Probe {
     pub conflicts: Vec<Conflict>,
     /// `(before, after)`: `before`'s head is an ancestor of `after`'s head.
     pub ancestry: Vec<(i64, i64)>,
+    /// Holds decided outside this repository (unmet peer requirements).
+    pub external: BTreeMap<i64, Held>,
 }
 
 /// Probe the base and queued heads. `heads` maps each queued change to its current head.
@@ -172,6 +174,12 @@ pub fn make_plan(
                     );
                 }
             }
+        }
+    }
+
+    for item in &queued {
+        if let Some(external) = probe.external.get(&item.pr) {
+            hold(&mut held, external.clone());
         }
     }
 
@@ -320,10 +328,14 @@ pub fn make_plan(
         }
     };
     for pr in &selected {
-        if by_pr[pr].solo {
+        if by_pr[pr].solo || by_pr[pr].exact {
             close(&mut current, &mut batches, "");
             current.push(*pr);
-            close(&mut current, &mut batches, "solo");
+            close(
+                &mut current,
+                &mut batches,
+                if by_pr[pr].exact { "exact" } else { "solo" },
+            );
             continue;
         }
         current.push(*pr);
@@ -459,6 +471,10 @@ mod unit {
             after: vec![],
             solo: false,
             claim: None,
+            exact: false,
+            requires: vec![],
+            source: String::new(),
+            close_pending: false,
             status: ItemStatus::Queued,
             landed_as: String::new(),
             history: vec![],

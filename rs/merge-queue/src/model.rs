@@ -43,6 +43,19 @@ pub struct Event {
     pub detail: String,
 }
 
+/// A commit in a peer repository that must be on that repository's base before the requiring
+/// change may be validated or land.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Requirement {
+    /// Peer name (a key of `peers` in the configuration).
+    pub peer: String,
+    /// Exact commit required on the peer's base.
+    pub commit: String,
+    /// The peer change that carries it, when given as `PEER#PR`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr: Option<i64>,
+}
+
 /// A change submitted to the queue (one pull request or branch).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Item {
@@ -68,9 +81,23 @@ pub struct Item {
     /// Validate and land this change in a batch of its own (a risky change).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub solo: bool,
+    /// Land this change as its own commits (a fast-forward), never replayed, because another
+    /// repository pins one of them. Implies a batch of its own.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub exact: bool,
+    /// Peer commits that must be on their repositories' bases first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires: Vec<Requirement>,
     /// The submitter's own validation claim: which tests they ran, and how they chose them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim: Option<ValidationClaim>,
+    /// Where the submission came from: empty for `submit`, or the `sync` source that added it
+    /// (only that source withdraws it).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source: String,
+    /// Landed, but closing the pull request is still owed (the request budget ran out).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub close_pending: bool,
     /// Lifecycle state.
     #[serde(default)]
     pub status: ItemStatus,

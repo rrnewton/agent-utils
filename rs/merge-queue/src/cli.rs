@@ -11,8 +11,8 @@ use crate::ops::{self, Submission};
 use crate::plan::{render, short};
 use crate::run::{self, RunOptions, RunReport, Runner};
 use crate::state::{
-    Config, IdentityConfig, LandConfig, RegenerateConfig, State, ValidatorConfig, DEFAULT_DEPTH,
-    DEFAULT_MAX_BATCH, DEFAULT_PRIORITY,
+    Config, GitHubConfig, IdentityConfig, LandConfig, RegenerateConfig, State, ValidatorConfig,
+    DEFAULT_DEPTH, DEFAULT_MAX_BATCH, DEFAULT_PRIORITY,
 };
 use crate::tests::{parse_selection, ValidationClaim};
 
@@ -87,12 +87,40 @@ enum Command {
         /// green coverage recorded at that exact commit.
         #[arg(long)]
         exact_sha: bool,
+        /// Treat the base as green in culprit searches (skip probing it). Sound when only this
+        /// queue lands, always exactly validated commits.
+        #[arg(long)]
+        trust_base: bool,
         /// Name for commits the queue creates (default: Git's configuration).
         #[arg(long, default_value = "")]
         identity_name: String,
         /// Email for commits the queue creates (default: Git's configuration).
         #[arg(long, default_value = "")]
         identity_email: String,
+        /// Peer queue NAME=DIR: another repository's merge-queue state directory, whose changes
+        /// this queue's changes may require. Repeatable.
+        #[arg(long, value_name = "NAME=DIR")]
+        peer: Vec<String>,
+        /// Hosting repository `owner/name`, for `sync --label/--all-open` and `--close-prs`.
+        #[arg(long, default_value = "")]
+        github_repo: String,
+        /// Command (and leading arguments) to run instead of `gh`, e.g. a pacing wrapper.
+        /// Repeatable.
+        #[arg(long, value_name = "WORD", allow_hyphen_values = true)]
+        gh: Vec<String>,
+        /// API requests allowed per rolling hour across this queue's calls (0 = 60).
+        #[arg(long, default_value_t = 0)]
+        api_per_hour: u32,
+        /// Budget file shared by every queue on the host (default: in the state directory).
+        #[arg(long, default_value = "")]
+        api_budget_file: String,
+        /// Fetch without credentials (public repositories): no credential use per fetch.
+        #[arg(long)]
+        anonymous_fetch: bool,
+        /// After landing, close each landed pull request with a pointer to the landed commit
+        /// (budgeted; postponed closes are retried by `sync`).
+        #[arg(long)]
+        close_prs: bool,
         /// Command prefix for network Git operations, e.g. `--net-wrapper with-proxy`.
         /// Repeat for multiple words.
         #[arg(long, value_name = "WORD", allow_hyphen_values = true)]
@@ -171,9 +199,34 @@ enum Command {
         /// `step::case`), or `@FILE` with one ID per line. Recorded; focused claims are visible.
         #[arg(long, value_name = "SELECTION")]
         tested_with: Option<String>,
+        /// A peer commit that must land first: `PEER#PR` (that peer change, which then lands as
+        /// its own commits) or `PEER@SHA`. Repeatable.
+        #[arg(long, value_name = "SPEC")]
+        requires: Vec<String>,
         /// Name of the policy that chose --tested-with (e.g. `path-routing`, `manual`).
         #[arg(long, default_value = "manual")]
         policy: String,
+    },
+    /// Reconcile the queue with a ready source: a label, every open pull request, or a file.
+    Sync {
+        /// Ready = open pull requests with this label (one batched API call).
+        #[arg(long, conflicts_with_all = ["all_open", "file"])]
+        label: Option<String>,
+        /// Ready = every open, non-draft pull request targeting the base (one batched API call).
+        #[arg(long, conflicts_with = "file")]
+        all_open: bool,
+        /// Ready = the changes listed in FILE, one per line (no API call); see the user guide.
+        #[arg(long, value_name = "FILE")]
+        file: Option<PathBuf>,
+        /// Most pull requests to list (each 100 costs one API request).
+        #[arg(long, default_value_t = 300)]
+        limit: u32,
+        /// Report what would change without submitting or withdrawing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Withdraw a queued change.
     Withdraw {
@@ -225,6 +278,9 @@ enum Command {
         /// After draining, run the complete suite once to discharge widening obligations.
         #[arg(long)]
         widen: bool,
+        /// First drain the peer queues holding changes this queue's changes require.
+        #[arg(long)]
+        with_peers: bool,
         /// Print the run report as JSON instead of Markdown.
         #[arg(long)]
         json: bool,
@@ -441,8 +497,16 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             regen_command,
             regen_when,
             exact_sha,
+            trust_base,
             identity_name,
             identity_email,
+            peer,
+            github_repo,
+            gh,
+            api_per_hour,
+            api_budget_file,
+            anonymous_fetch,
+            close_prs,
             net_wrapper,
             validator,
             validator_run,
@@ -481,9 +545,25 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     when: regen_when,
                 },
                 exact_sha,
+                trust_base,
                 identity: IdentityConfig {
                     name: identity_name,
                     email: identity_email,
+                },
+                peers: peer
+                    .iter()
+                    .map(|spec| {
+                        spec.split_once('=')
+                            .map(|(name, dir)| (name.to_owned(), PathBuf::from(dir)))
+                            .ok_or_else(|| format!("--peer {spec:?}: expected NAME=DIR"))
+                    })
+                    .collect::<Result<_, _>>()?,
+                github: GitHubConfig {
+                    repo: github_repo,
+                    gh,
+                    max_per_hour: api_per_hour,
+                    budget_file: api_budget_file,
+                    anonymous_fetch,
                 },
                 validator: ValidatorConfig {
                     kind: validator,
@@ -502,6 +582,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     driver: land,
                     command: land_command,
                     allow_batches,
+                    close_prs,
                 },
                 ..Config::default()
             };
@@ -519,6 +600,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             by,
             title,
             tested_with,
+            requires,
             policy,
         } => {
             let config = state.config()?;
@@ -544,6 +626,11 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     after,
                     solo,
                     claim,
+                    source: String::new(),
+                    requires: requires
+                        .iter()
+                        .map(|spec| ops::resolve_requirement(&config, spec))
+                        .collect::<Result<_, _>>()?,
                 },
             )?;
             let claim = match &item.claim {
@@ -561,6 +648,55 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                 item.priority
             );
             Ok(0)
+        }
+        Command::Sync {
+            label,
+            all_open,
+            file,
+            limit,
+            dry_run,
+            json,
+        } => {
+            let config = state.config()?;
+            let source = match (label, all_open, file) {
+                (Some(label), _, _) => crate::sync::ReadySource::Label(label),
+                (_, true, _) => crate::sync::ReadySource::AllOpen,
+                (_, _, Some(file)) => crate::sync::ReadySource::File(file),
+                _ => return Err("choose a ready source: --label, --all-open or --file".to_owned()),
+            };
+            let _lock = if dry_run { None } else { Some(state.lock()?) };
+            let report = crate::sync::sync(&state, &config, &source, limit, dry_run)?;
+            if json {
+                let text = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
+                println!("{text}");
+            } else {
+                let list = |prs: &[i64]| {
+                    prs.iter()
+                        .map(|pr| format!("#{pr}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                println!(
+                    "{}{}: {} ready; submitted [{}], unchanged {}, withdrawn [{}]{}",
+                    report.source,
+                    if report.dry_run { " (dry run)" } else { "" },
+                    report.listed,
+                    list(&report.submitted),
+                    report.unchanged.len(),
+                    list(&report.withdrawn),
+                    report
+                        .api_remaining
+                        .map(|left| format!("; {left} API requests left this hour"))
+                        .unwrap_or_default()
+                );
+                for (pr, why) in &report.refused {
+                    println!("  refused #{pr}: {why}");
+                }
+                if !report.closed.is_empty() {
+                    println!("  closed landed: {}", list(&report.closed));
+                }
+            }
+            Ok(if report.refused.is_empty() { 0 } else { 1 })
         }
         Command::Withdraw { pr, reason } => {
             let _lock = state.lock()?;
@@ -621,6 +757,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             max_batch,
             max_batches,
             widen,
+            with_peers,
             json,
         } => {
             let _lock = state.lock()?;
@@ -635,6 +772,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     max_batches,
                     widen,
                     quiet: false,
+                    with_peers,
                 },
             )?;
             let report = runner.run()?;

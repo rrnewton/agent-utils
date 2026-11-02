@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use crate::git::Git;
-use crate::model::{now, Item, ItemStatus, Plan};
+use crate::model::{now, Held, Item, ItemStatus, Plan, Requirement};
 use crate::plan::{make_plan, probe, PlanOptions};
 use crate::state::{Config, State};
 use crate::tests::ValidationClaim;
@@ -22,6 +22,7 @@ pub fn head_ref(pr: i64) -> String {
 pub fn repo(state: &State, config: &Config) -> Result<Git, String> {
     let mut git = Git::new(&config.repo);
     git.net_wrapper = config.net_wrapper.clone();
+    git.anonymous_fetch = config.github.anonymous_fetch;
     if !config.identity.name.is_empty() && !config.identity.email.is_empty() {
         git.identity = Some((config.identity.name.clone(), config.identity.email.clone()));
     }
@@ -128,10 +129,47 @@ pub struct Submission {
     pub solo: bool,
     /// Submitter's validation claim.
     pub claim: Option<ValidationClaim>,
+    /// `sync` source that produced this submission; empty for a direct `submit`.
+    pub source: String,
+    /// Peer commits that must land first.
+    pub requires: Vec<Requirement>,
 }
 
 /// Submit (or resubmit) a change. Returns the stored item.
 pub fn submit(state: &State, config: &Config, submission: Submission) -> Result<Item, String> {
+    submit_many(state, config, vec![submission])?
+        .pop()
+        .ok_or_else(|| "nothing submitted".to_owned())?
+}
+
+/// Submit several changes with one fetch for all their heads. Each result is the stored item or
+/// why that one submission was refused.
+pub fn submit_many(
+    state: &State,
+    config: &Config,
+    submissions: Vec<Submission>,
+) -> Result<Vec<Result<Item, String>>, String> {
+    let git = repo(state, config)?;
+    let wanted: Vec<(i64, String)> = submissions
+        .iter()
+        .filter(|s| s.pr > 0 && !s.head_ref.is_empty())
+        .map(|s| (s.pr, s.head_ref.clone()))
+        .collect();
+    let (_, heads) = refresh(&git, config, &wanted)?;
+    Ok(submissions
+        .into_iter()
+        .map(|submission| {
+            let current = heads.get(&submission.pr).cloned().flatten();
+            submit_resolved(state, submission, current)
+        })
+        .collect())
+}
+
+fn submit_resolved(
+    state: &State,
+    submission: Submission,
+    current: Option<String>,
+) -> Result<Item, String> {
     if submission.pr <= 0 {
         return Err(format!(
             "change number must be positive, got {}",
@@ -141,22 +179,12 @@ pub fn submit(state: &State, config: &Config, submission: Submission) -> Result<
     if submission.head_ref.is_empty() {
         return Err("a head branch or ref is required".to_owned());
     }
-    let git = repo(state, config)?;
-    let (_, heads) = refresh(
-        &git,
-        config,
-        &[(submission.pr, submission.head_ref.clone())],
-    )?;
-    let current = heads
-        .get(&submission.pr)
-        .cloned()
-        .flatten()
-        .ok_or_else(|| {
-            format!(
-                "head {:?} of #{} does not resolve",
-                submission.head_ref, submission.pr
-            )
-        })?;
+    let current = current.ok_or_else(|| {
+        format!(
+            "head {:?} of #{} does not resolve",
+            submission.head_ref, submission.pr
+        )
+    })?;
     if !submission.head.is_empty() && !current.starts_with(&submission.head) {
         return Err(format!(
             "#{}: {:?} is at {current}, not the submitted {}",
@@ -175,6 +203,10 @@ pub fn submit(state: &State, config: &Config, submission: Submission) -> Result<
         after: submission.after,
         solo: submission.solo,
         claim: submission.claim,
+        exact: existing.as_ref().is_some_and(|old| old.exact),
+        requires: submission.requires,
+        source: submission.source,
+        close_pending: false,
         status: ItemStatus::Queued,
         landed_as: String::new(),
         history: existing.map(|old| old.history).unwrap_or_default(),
@@ -215,7 +247,8 @@ pub fn plan(state: &State, config: &Config, max_batch: usize) -> Result<Plan, St
     let git = repo(state, config)?;
     let (base_sha, current) = refresh(&git, config, &heads)?;
     let regenerate = config.regenerate.clone();
-    let probe = probe(&git, &base_sha, &current, &|path| regenerate.covers(path))?;
+    let mut probe = probe(&git, &base_sha, &current, &|path| regenerate.covers(path))?;
+    probe.external = peer_holds(config, &items)?;
     Ok(make_plan(
         &items,
         &config.base,
@@ -223,4 +256,134 @@ pub fn plan(state: &State, config: &Config, max_batch: usize) -> Result<Plan, St
         &probe,
         PlanOptions { max_batch },
     ))
+}
+
+/// A peer queue: its state, configuration and repository.
+pub struct Peer {
+    /// Peer name.
+    pub name: String,
+    /// Peer state directory.
+    pub state: State,
+    /// Peer configuration.
+    pub config: Config,
+    /// Peer repository.
+    pub git: Git,
+}
+
+/// Open the peer named `name`.
+pub fn peer(config: &Config, name: &str) -> Result<Peer, String> {
+    let dir = config.peers.get(name).ok_or_else(|| {
+        format!("no peer named {name:?} (configure it with `init --peer {name}=DIR`)")
+    })?;
+    let state = State::at(dir.clone());
+    let peer_config = state.config()?;
+    let git = repo(&state, &peer_config)?;
+    Ok(Peer {
+        name: name.to_owned(),
+        state,
+        config: peer_config,
+        git,
+    })
+}
+
+/// Resolve `PEER#PR` (the head of a change queued in the peer, which is then marked exact so it
+/// lands as its own commits) or `PEER@SHA` into a requirement.
+pub fn resolve_requirement(config: &Config, spec: &str) -> Result<Requirement, String> {
+    if let Some((name, number)) = spec.split_once('#') {
+        let pr: i64 = number
+            .parse()
+            .map_err(|_| format!("bad requirement {spec:?}: expected PEER#PR or PEER@SHA"))?;
+        let peer = peer(config, name)?;
+        let _lock = peer.state.lock()?;
+        let mut item = peer
+            .state
+            .item(pr)?
+            .ok_or_else(|| format!("{name} has no change #{pr} in its queue"))?;
+        if !item.exact {
+            item.exact = true;
+            item.log("exact", "another repository requires its exact head");
+            peer.state.save_item(&item)?;
+        }
+        return Ok(Requirement {
+            peer: name.to_owned(),
+            commit: item.head,
+            pr: Some(pr),
+        });
+    }
+    if let Some((name, sha)) = spec.split_once('@') {
+        let peer = peer(config, name)?;
+        let commit = peer
+            .git
+            .try_rev_parse(sha)
+            .unwrap_or_else(|| sha.to_owned());
+        if commit.len() != 40 || !commit.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(format!(
+                "{sha:?} is not a commit {name}'s repository knows; give the full 40-hex commit"
+            ));
+        }
+        return Ok(Requirement {
+            peer: name.to_owned(),
+            commit,
+            pr: None,
+        });
+    }
+    Err(format!(
+        "bad requirement {spec:?}: expected PEER#PR or PEER@SHA"
+    ))
+}
+
+/// Holds for queued items whose peer requirements are not yet on the peers' bases.
+pub fn peer_holds(config: &Config, items: &[Item]) -> Result<BTreeMap<i64, Held>, String> {
+    let mut holds = BTreeMap::new();
+    let mut peers: BTreeMap<String, (Peer, String, Vec<Item>)> = BTreeMap::new();
+    for item in items
+        .iter()
+        .filter(|item| item.status == ItemStatus::Queued && !item.requires.is_empty())
+    {
+        for requirement in &item.requires {
+            if !peers.contains_key(&requirement.peer) {
+                let opened = peer(config, &requirement.peer)?;
+                let (base, _) = refresh(&opened.git, &opened.config, &[])?;
+                let peer_items = opened.state.items()?;
+                peers.insert(requirement.peer.clone(), (opened, base, peer_items));
+            }
+            let (opened, base, peer_items) = &peers[&requirement.peer];
+            if opened
+                .git
+                .is_ancestor(&requirement.commit, base)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let carrier = peer_items
+                .iter()
+                .find(|peer_item| peer_item.head == requirement.commit);
+            let short = &requirement.commit[..requirement.commit.len().min(10)];
+            let reason = match carrier {
+                Some(peer_item) if peer_item.status == ItemStatus::Queued => format!(
+                    "requires {}@{short} ({} #{} is queued; `run --with-peers` lands it first)",
+                    opened.name, opened.name, peer_item.pr
+                ),
+                Some(peer_item) => format!(
+                    "requires {}@{short}, but {} #{} is {}: it will not land at that commit",
+                    opened.name,
+                    opened.name,
+                    peer_item.pr,
+                    peer_item.status.as_str()
+                ),
+                None => format!(
+                    "requires {}@{short}, which is neither on {}'s base nor in its queue",
+                    opened.name, opened.name
+                ),
+            };
+            holds.entry(item.pr).or_insert(Held {
+                pr: item.pr,
+                kind: "waiting-on-peer".into(),
+                reason,
+                with: vec![],
+                paths: vec![],
+            });
+        }
+    }
+    Ok(holds)
 }

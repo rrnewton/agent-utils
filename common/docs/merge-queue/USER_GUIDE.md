@@ -51,9 +51,12 @@ individual tests, and the queue tracks exactly which of them ran.
   at a subset. A change is blamed only when its failure was seen twice. The culprit is ejected with
   a report, and the queue continues with the rest. There is no automatic repair. See "Keeping the
   base green".
-- **Silence is not success.** A test that was selected but never reported counts as an error. If
-  a runner reports only an exit status, every selected test inherits that status, and the result
-  is marked `unattributed`.
+- **Silence is not success.** A test that was selected but never reported has outcome `missing`,
+  and it blocks landing. In a culprit search, though, only tests that actually failed or errored
+  (or a non-zero exit) count as reproducing the failure. A test that a change adds does not exist
+  at earlier commits and cannot fail there, so the search never blames the base for it. If a
+  runner reports only an exit status, every selected test inherits that status, and the result is
+  marked `unattributed`.
 
 ## Global options
 
@@ -86,7 +89,15 @@ This command creates the state directory and writes `config.json`.
 | `--regen-command CMD` | empty | Shell command, run at a checkout's root, that rewrites every generated file from its sources. Required with `--regen-path`. |
 | `--regen-when WHEN` | `conflict` | `conflict`: regenerate only when a change's conflicts are confined to generated files. `always`: also after every change, so a combination never leaves a generated file stale. |
 | `--exact-sha` | off | Exact-commit rule: never carry a validation result to another commit. See "The exact-commit rule". |
+| `--trust-base` | off | Treat the base as green in culprit searches and skip probing it. Sound when only this queue lands on the base, always as exactly validated commits; a broken base would then be blamed on the first change of a red batch. |
+| `--peer NAME=DIR` | none | A peer queue: another repository's merge-queue state directory. Repeatable. See "Changes across repositories". |
 | `--identity-name NAME`, `--identity-email EMAIL` | Git's configuration | Identity for commits the queue creates: committer of replayed commits, author and committer of merge and regeneration commits. |
+| `--github-repo OWNER/NAME` | empty | Hosting repository for `sync --label`, `sync --all-open` and `--close-prs`. |
+| `--gh WORD` | `gh` | Command (and leading arguments) to run instead of `gh`, for example a pacing wrapper. Repeatable. |
+| `--api-per-hour N` | `0` (= 60) | API requests this queue may make per rolling hour. See "Ready sources and the request budget". |
+| `--api-budget-file PATH` | state directory | Budget file to share with every other queue on the host, so they all draw on one hourly allowance. |
+| `--anonymous-fetch` | off | Fetch without credentials (public repositories). Credential helpers are disabled for fetches, so a fetch never spends a credential use. |
+| `--close-prs` | off | After landing, close each landed pull request with a comment naming the landed commit. Uses the budget; a close it cannot make now is retried by `sync`. |
 | `--net-wrapper WORD` | none | A command prefix for network Git operations, for example `--net-wrapper with-proxy`. Repeat it for a prefix of several words. |
 | `--validator KIND` | empty | `command` or `dagrun` (see "Validators"). `run` refuses to start without one. |
 | `--validator-run CMD` | empty | For `command`: the shell template that runs a selection. |
@@ -122,9 +133,33 @@ and sets its status back to `queued`.
 | `--title TEXT` | empty | A one-line description. |
 | `--tested-with SELECTION` | none | The tests you ran on this head: `all`, a comma- or space-separated list of test IDs, or `@FILE` with one ID per line (`#` starts a comment). This becomes the change's validation claim. Without it, the change has no claim. |
 | `--policy NAME` | `manual` | The name of the policy that chose `--tested-with`, for example `path-routing`. |
+| `--requires SPEC` | none | A commit in a peer repository that must be on that repository's base first: `PEER#PR`, the head of that peer change (which is then marked to land as its own commits), or `PEER@SHA`. Repeatable. See "Changes across repositories". |
 
 The output names the head and, when there is a claim, says whether it was focused or complete:
 `queued #42 at 9b1c0e77aa (priority 50); validated with 2 tests (focused)`.
+
+### `merge-queue sync`
+
+Reconcile the queue with a ready source. Exactly one of these is required:
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--label LABEL` | none | Ready = open pull requests carrying `LABEL`, in one batched API call. |
+| `--all-open` | off | Ready = every open, non-draft pull request targeting the base, in one batched API call. |
+| `--file FILE` | none | Ready = the changes listed in `FILE`, one per line. Makes no API call. |
+| `--limit N` | `300` | Most pull requests to list. Each 100 costs one API request. |
+| `--dry-run` | off | Report what would change without submitting or withdrawing anything. The list call is still made. |
+| `--json` | off | Print the report as JSON. |
+
+`sync` submits new changes and changes whose head or priority moved, with one fetch for all of
+them. It withdraws only changes that this same source added and no longer lists. A change you
+submitted directly is never withdrawn by a source. Draft pull requests are never ready.
+Priorities come from labels such as `p10` or `priority-10`, the landing planner's convention;
+lower lands first, and the default is 100. When `--close-prs` is set, `sync` also retries closes
+that were postponed. Exit status is 1 if any submission was refused.
+
+Ready-file lines look like `PR [SHA] [head=REF] [priority=N] [after=N,N] [solo] [by=NAME]`, and
+`#` starts a comment. Without `head=`, the head is `refs/pull/PR/head`.
 
 ### `merge-queue withdraw PR`
 
@@ -171,6 +206,7 @@ ejects them. It writes everything to `runs/<run-id>/` and prints the run report.
 | `--max-batch N` | the configured `max_batch` | Override the batch size for this run's plan. |
 | `--max-batches N` | `0` | Stop after this many batches. `0` drains the plan. |
 | `--widen` | off | After draining, run the complete suite once to discharge open obligations. Skipped in `--shadow` and `--dry-run` runs, because obligations are real state. |
+| `--with-peers` | off | First drain each peer queue that holds a change some queued change here requires; the report lists those runs under `peer_runs`. |
 | `--json` | off | Print the report as JSON instead of Markdown. |
 
 The exit status is `3` when the run stopped early; the report's `stopped` field says why. An
@@ -339,7 +375,10 @@ An **item record** (`items/<pr>.json`) has these fields:
 | `union_paths` | `[]` | Attribute patterns merged with Git's union driver (see "Union merges"). |
 | `regenerate` | empty | `{paths, command, when}`; see "Generated files". |
 | `exact_sha` | `false` | The exact-commit rule. |
+| `trust_base` | `false` | Skip probing the base in culprit searches. |
+| `peers` | `{}` | Peer queue name to state directory. |
 | `identity` | empty | `{name, email}` for commits the queue creates. |
+| `github` | empty | `{repo, gh, max_per_hour, budget_file, anonymous_fetch}`; see "Ready sources and the request budget". |
 | `validator` | empty | How validation runs; see below. |
 | `land` | `push` from `init` | How a validated candidate reaches the base; see below. |
 
@@ -406,6 +445,28 @@ exit $rc
 with `merge-queue init --validator command --validator-run 'sh run-selected.sh' --select
 'git diff --name-only "$MQ_BASE" HEAD -- tests | sed -n "s|^tests/\(.*\)\.sh$|\1|p"' --policy
 path-routing`.
+
+**Verdict lines.** A `command` runner that writes no results file but prints dagrun-style verdict
+lines (`[step] ✓ PASS ...`, `[step] ✗ FAIL ...`, `[step] SKIPPED ...`) is still attributed per
+step from its output.
+
+**Same-commit reruns.** A runner may write an opaque handle for its run (a run ID, a log path)
+to `$MQ_HANDLE_FILE`. When the queue later validates the same commit again, to rerun failed tests
+in a culprit search, it passes the latest handle as `$MQ_RERUN_FROM` and that run's directory
+as `$MQ_RERUN_OF`. A runner that can rerun only the failed parts of an earlier run at the same
+commit uses them for a cheap targeted rerun. If that rerun is green, the failure was flaky: the
+batch lands with the test recorded under `flaky`, and the exact-commit rule counts the same-commit
+rerun as coverage. For example:
+
+```sh
+if [ -n "$MQ_RERUN_FROM" ]; then my-runner --rerun-failed-from "$MQ_RERUN_FROM"
+else my-runner --target "$(git rev-parse HEAD)" full; fi | tee /dev/stderr |
+  grep -o 'run-[0-9a-f]*' | head -1 > "$MQ_HANDLE_FILE"
+```
+
+A runner that can only run everything at a new commit still works. Culprit-search probes at other
+commits then cost full runs, so keep batches small (`--max-batch 1` or `2`). With `--trust-base`,
+a red single-change batch costs exactly one targeted rerun.
 
 **`dagrun`.** Test IDs are DAG step names. A selection becomes `dagrun run --dag DAG --keep-going
 --selected a,b`, which also runs each selected step's dependencies; `all` omits `--selected`. The
@@ -519,6 +580,55 @@ The base moves only to a commit whose exact tree passed validation (the bors rul
    ejections) and everything behind it is rebuilt on the new base and validated again.
 9. **Obligations.** Every focused landing leaves an obligation until a green complete run
    (`widen`, or `run --widen`) covers that commit or a later one. A red complete run leaves it open.
+
+## Changes across repositories
+
+When a change in one repository needs a change in another to land first, configure the other
+repository's queue as a peer. One example is an application whose validation requires its pinned
+library commit to be on the library's main branch. Then declare the requirement when submitting:
+
+```sh
+merge-queue --state lib/.git/merge-queue submit 7 --head refs/pull/7/head     # in the library's queue
+merge-queue init --peer lib=/path/to/lib/.git/merge-queue ...                 # in the application's
+merge-queue submit 41 --head refs/pull/41/head --requires lib#7
+merge-queue run --with-peers
+```
+
+- **`--requires lib#7`** records the exact head of the library's change #7. It also marks that
+  change exact: it lands only as its own commits (a fast-forward, in a batch of its own), so the
+  pinned commit appears on the library's base. If the library's base has moved on, the exact
+  change is ejected (kind `not-fast-forward`) rather than replayed under a new commit ID.
+- **Until the required commit is on the peer's base,** the plan holds the dependent change
+  (`waiting-on-peer`). The hold says whether the peer change is queued (and `--with-peers` will
+  land it first), ejected or withdrawn (so it will not land at that commit), or unknown.
+- **`run --with-peers`** drains each peer queue that holds a needed change, then plans and runs
+  this queue. Dependents whose requirement landed proceed; the others stay queued.
+- **The requirement is checked again right before landing,** so a dependent never lands without
+  it.
+- **A shadow run drains its peers in shadow too.** Their changes do not really land, so dependents
+  stay held, and the shadow report says why.
+
+## Ready sources and the request budget
+
+Planning, validating and landing make no API calls. Heads arrive in one batched `git fetch` of
+`refs/pull/N/head` (or of branches), and landing is a push. The hosting service's API is used
+only by `sync --label` and `sync --all-open`, one list call for the whole queue, and by
+`--close-prs`, one call per landed pull request.
+
+Every API call is charged to a budget first: `--api-per-hour` requests per rolling hour, kept in
+`api-budget.json` or in a shared `--api-budget-file`. A call the budget cannot cover is refused
+before it is made, and the error says when room opens up.
+
+**Which ready source to use.**
+- **`submit`.** When the agents that finish changes run on the same host as the queue, they should
+  call `merge-queue submit` directly. It costs no API request, binds the exact head, and records
+  which tests the agent ran.
+- **`sync --label`.** Use it when people mark changes ready on the hosting service, or when you
+  want the ready set visible there. It costs one request per sync, plus one per label edit.
+- **`sync --file`.** Use it for a ready list kept by other tools. It costs no API requests.
+- **`sync --all-open`.** For shadow runs and measurements.
+
+For public repositories, `--anonymous-fetch` keeps fetches from spending credential uses at all.
 
 ## Generated files
 

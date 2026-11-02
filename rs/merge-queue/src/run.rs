@@ -60,6 +60,24 @@ pub struct RunOptions {
     pub widen: bool,
     /// Do not echo events to stderr.
     pub quiet: bool,
+    /// First drain the peer queues whose changes this queue's changes require.
+    pub with_peers: bool,
+}
+
+/// What a peer queue's run did, when `--with-peers` drained it first.
+#[derive(Clone, Debug, Serialize)]
+pub struct PeerRun {
+    /// Peer name.
+    pub peer: String,
+    /// The peer's run ID (its report is in the peer's state directory).
+    pub run: String,
+    /// Changes the peer landed.
+    pub landed: Vec<i64>,
+    /// Changes the peer ejected.
+    pub ejected: Vec<i64>,
+    /// Why the peer's run stopped early, if it did.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub stopped: String,
 }
 
 /// One validated-and-landed (or simulated) batch.
@@ -149,6 +167,9 @@ pub struct RunReport {
     /// Generated files regenerated on candidates.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub regenerated: Vec<Regeneration>,
+    /// Peer queues drained first (`--with-peers`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub peer_runs: Vec<PeerRun>,
     /// Batches that would have been validated (dry runs only).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub would_validate: Vec<WouldValidate>,
@@ -381,6 +402,11 @@ pub struct Runner<'a> {
     started: Instant,
     report: Mutex<RunReport>,
     events: Mutex<std::fs::File>,
+    /// Latest runner handle and validation directory per validated commit, for same-commit
+    /// reruns (`MQ_RERUN_FROM`, `MQ_RERUN_OF`).
+    handles: Mutex<BTreeMap<String, (String, PathBuf)>>,
+    /// Budgeted hosting client, when landed pull requests are to be closed.
+    hosting: Option<crate::github::Hosting>,
 }
 
 impl<'a> Runner<'a> {
@@ -403,6 +429,8 @@ impl<'a> Runner<'a> {
             configured_max.max(width)
         };
         let git = repo(state, &config)?;
+        let config_close_prs = config.land.close_prs && !simulate;
+        let config_github = config.github.clone();
         let (run_id, run_dir) = state.new_run()?;
         let events = std::fs::File::create(run_dir.join("events.jsonl"))
             .map_err(|error| format!("cannot create events log: {error}"))?;
@@ -448,6 +476,12 @@ impl<'a> Runner<'a> {
                 ..RunReport::default()
             }),
             events: Mutex::new(events),
+            handles: Mutex::new(BTreeMap::new()),
+            hosting: if config_close_prs {
+                Some(crate::github::Hosting::new(&config_github, &state.root)?)
+            } else {
+                None
+            },
             options,
         })
     }
@@ -550,6 +584,11 @@ impl<'a> Runner<'a> {
                 continue;
             }
             let item = &items[pr];
+            if item.exact && !self.git.fast_forwards(&tip, &item.head)? {
+                skipped.insert(*pr);
+                conflicts.push((*pr, "not-fast-forward", short(&tip).to_owned()));
+                continue;
+            }
             let mut exclude: Vec<&str> = kept.iter().map(|p| items[p].head.as_str()).collect();
             exclude.extend(exclude_heads.iter().map(String::as_str));
             let message = format!("Merge #{pr} ({})", item.head_ref);
@@ -794,6 +833,9 @@ impl<'a> Runner<'a> {
                     "does not combine onto {}{context}: conflicts on {detail}; rebase and resubmit",
                     short(parent)
                 ),
+                "not-fast-forward" => format!(
+                    "must land as its own commits (another repository requires its exact head), but it is not on top of {detail}{context}; rebase it and update what requires it"
+                ),
                 _ => format!(
                     "generated files could not be regenerated onto {}{context}: {detail}",
                     short(parent)
@@ -850,14 +892,28 @@ impl<'a> Runner<'a> {
                 job.policy
             ),
         );
+        // A rerun at a commit already validated gets that run's handle, so a runner that can
+        // rerun only the failed parts of an earlier run (at the same commit) can do so.
+        let extra: Vec<(String, String)> = lock(&self.handles)
+            .get(&job.commit)
+            .map(|(handle, previous)| {
+                vec![
+                    ("MQ_RERUN_FROM".to_owned(), handle.clone()),
+                    ("MQ_RERUN_OF".to_owned(), previous.display().to_string()),
+                ]
+            })
+            .unwrap_or_default();
         let slot = self.slots.take();
         let start_ms = self.started.elapsed().as_millis() as u64;
-        let result = self
-            .slots
-            .checkout(slot, &job.commit)
-            .and_then(|checkout| self.validator.run(&checkout, &job.selection, &dir, cancel));
+        let result = self.slots.checkout(slot, &job.commit).and_then(|checkout| {
+            self.validator
+                .run_with(&checkout, &job.selection, &dir, cancel, &extra)
+        });
         self.slots.give(slot);
         let ran = result?;
+        if let Some(handle) = &ran.handle {
+            lock(&self.handles).insert(job.commit.clone(), (handle.clone(), dir.clone()));
+        }
         let record = ValidationRecord {
             id,
             purpose: job.purpose.to_owned(),
@@ -915,6 +971,11 @@ impl<'a> Runner<'a> {
 
     /// Execute the run. Errors after the run started stop it and are recorded in the report.
     pub fn run(self) -> Result<RunReport, String> {
+        if self.options.with_peers {
+            if let Err(error) = self.run_peers() {
+                self.event("peers", &format!("could not drain peers: {error}"));
+            }
+        }
         let mut stop = match self.drive() {
             Ok(stop) => stop,
             Err(error) => format!("error: {error}"),
@@ -933,6 +994,36 @@ impl<'a> Runner<'a> {
             }
         }
         self.finish(stop)
+    }
+
+    /// Drain every peer queue that holds a change some queued change here requires.
+    fn run_peers(&self) -> Result<(), String> {
+        let items: Vec<Item> = lock(&self.items).values().cloned().collect();
+        let holds = ops::peer_holds(&self.config, &items)?;
+        let needed: BTreeSet<String> = items
+            .iter()
+            .filter(|item| holds.contains_key(&item.pr))
+            .flat_map(|item| item.requires.iter().map(|r| r.peer.clone()))
+            .collect();
+        for name in needed {
+            let peer = ops::peer(&self.config, &name)?;
+            let _lock = peer.state.lock()?;
+            self.event("peers", &format!("draining {name} first"));
+            let options = RunOptions {
+                widen: false,
+                with_peers: false,
+                ..self.options.clone()
+            };
+            let report = Runner::new(&peer.state, options)?.run()?;
+            lock(&self.report).peer_runs.push(PeerRun {
+                peer: name.clone(),
+                run: report.run.clone(),
+                landed: report.landed.iter().flat_map(|l| l.prs.clone()).collect(),
+                ejected: report.ejected.iter().map(|e| e.pr).collect(),
+                stopped: report.stopped.clone(),
+            });
+        }
+        Ok(())
     }
 
     fn finish(&self, stop: String) -> Result<RunReport, String> {
@@ -1238,6 +1329,15 @@ impl<'a> Runner<'a> {
                     if let Some(item) = items.get_mut(pr) {
                         item.status = ItemStatus::Landed;
                         item.landed_as = tip.to_owned();
+                        if let Some(hosting) = &self.hosting {
+                            match hosting.close(*pr, &crate::sync::close_comment(tip)) {
+                                Ok(()) => item.log("closed", "pull request closed after landing"),
+                                Err(error) => {
+                                    item.close_pending = true;
+                                    item.log("close-postponed", error);
+                                }
+                            }
+                        }
                         item.log(
                             "landed",
                             format!(
@@ -1286,6 +1386,28 @@ impl<'a> Runner<'a> {
         validations: Vec<usize>,
         flaky: BTreeSet<TestId>,
     ) -> Result<BatchOutcome, String> {
+        let requiring: Vec<Item> = {
+            let items = lock(&self.items);
+            candidate
+                .prs
+                .iter()
+                .filter_map(|pr| items.get(pr))
+                .filter(|item| !item.requires.is_empty())
+                .cloned()
+                .collect()
+        };
+        if !requiring.is_empty() {
+            let unmet = ops::peer_holds(&self.config, &requiring)?;
+            if let Some(held) = unmet.values().next() {
+                return Ok(BatchOutcome::Stop(
+                    format!(
+                        "#{}: {} (checked again before landing)",
+                        held.pr, held.reason
+                    ),
+                    candidate.prs.clone(),
+                ));
+            }
+        }
         if self.config.exact_sha && !self.covered(&candidate.tip, &claim.selection) {
             return Ok(BatchOutcome::Stop(
                 format!(
@@ -1623,6 +1745,15 @@ impl<'a> Runner<'a> {
                 failed: first_failed.clone(),
             },
         );
+        if self.config.trust_base && n > 0 {
+            obs.insert(
+                0,
+                Obs {
+                    passes: 1,
+                    ..Obs::default()
+                },
+            );
+        }
         let seen =
             |obs: &BTreeMap<usize, Obs>, i: usize| obs.get(&i).map_or(Seen::Unknown, Obs::seen);
         let confirmed =
@@ -1683,11 +1814,11 @@ impl<'a> Runner<'a> {
             for (i, result) in probes.iter().zip(self.validate_all(jobs)) {
                 let (_, ran) = result?;
                 let entry = obs.entry(*i).or_default();
-                if ran.green() {
-                    entry.passes += 1;
-                } else {
+                if ran.reproduces() {
                     entry.fails += 1;
-                    entry.failed.extend(ran.failed());
+                    entry.failed.extend(ran.reproduced());
+                } else {
+                    entry.passes += 1;
                 }
             }
         }

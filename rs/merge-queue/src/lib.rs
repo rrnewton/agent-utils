@@ -11,11 +11,13 @@
 pub mod bench;
 pub mod cli;
 pub mod git;
+pub mod github;
 pub mod model;
 pub mod ops;
 pub mod plan;
 pub mod run;
 pub mod state;
+pub mod sync;
 pub mod tests;
 pub mod validate;
 

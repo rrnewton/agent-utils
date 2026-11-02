@@ -243,3 +243,28 @@ fn a_red_complete_run_keeps_obligations_open() {
     assert_eq!(open.len(), 1);
     assert_eq!(open[0]["failed_runs"][0]["green"], false);
 }
+
+/// Reports only the test files that exist, ignoring the selection, as many runners do.
+const EXISTING_ONLY_RUNNER: &str = r#"rc=0; for t in $(ls tests); do o=pass; grep -q FAIL "tests/$t" && { o=fail; rc=1; }; printf '{"id":"%s","outcome":"%s"}\n' "$t" "$o" >> "$MQ_RESULTS"; done; exit $rc"#;
+
+#[test]
+fn a_new_failing_test_is_blamed_on_its_change_not_on_the_base() {
+    let fx = Fixture::new("rv-new-test");
+    fx.write("tests/t0", "ok\n");
+    fx.commit_all("seed");
+    git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
+    fx.mq_ok(&[
+        "init",
+        "--validator",
+        "command",
+        "--validator-run",
+        EXISTING_ONLY_RUNNER,
+    ]);
+    // The change adds a test that fails; at the base that test does not exist at all.
+    fx.branch("adds-test", &[("tests/brand-new", "FAIL\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "adds-test"]);
+    let r = report(&fx.mq_ok(&["run", "--json"]));
+    assert!(r.get("stopped").is_none(), "{r}");
+    assert_eq!(r["ejected"][0]["pr"], 1);
+    assert_eq!(r["ejected"][0]["failed"], serde_json::json!(["brand-new"]));
+}
