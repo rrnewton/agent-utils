@@ -71,3 +71,5 @@ export {
   planColumnLinks,
 } from "./columnlinks.ts";
 export type { ColumnLinks, ColumnLinksDependencies, LinkPair, LinkPane, MeasuredLinks, PlannedLink } from "./columnlinks.ts";
+export { AUTHOR_CHIP_MS, authorPasses, createAuthorFilter, rowIsMine } from "./authorfilter.ts";
+export type { AuthorFilter, AuthorFilterDependencies } from "./authorfilter.ts";

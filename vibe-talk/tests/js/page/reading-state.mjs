@@ -5757,8 +5757,8 @@ test("`#251 author-filter`: every change keeps the selected message where it is,
   keptAt(page, "24", y, "Mine on");
   assert.deepStrictEqual(litIds(page), ["24"]);
   // THE CONTROL: the same change, not placed, moves the message.
-  const unplaced = await run(brokenScript("  keepingFilterPlace(() => liftingHideRead(() => {\n    authorFilter = next;",
-    "  ((change) => change())(() => liftingHideRead(() => {\n    authorFilter = next;"));
+  const unplaced = await run(brokenScript("  keepingFilterPlace(() => liftingHideRead(() => {\n    authorFilters.set(next);",
+    "  ((change) => change())(() => liftingHideRead(() => {\n    authorFilters.set(next);"));
   assert.ok(Math.abs(yOf(unplaced.page, "24") - unplaced.y) > 1, "the test cannot see the message jump");
   // Theirs hides it: the nearest message shown stands where it stood, and the status line says so.
   await page.el("author-filter").click();

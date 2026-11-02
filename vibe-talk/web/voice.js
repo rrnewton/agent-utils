@@ -6715,110 +6715,17 @@ function setLinksOnly(on) {
 // bookmark is not drawn, and gathered replies go back to their places. It goes when the bar closes,
 // as the other filters in it do.
 
-/** The author filter's states, in the order a press cycles them. */
-const AUTHOR_FILTERS = ["everyone", "mine", "theirs"];
+// The states and their words are web/src/present/rows's; which rows are his, the filter chosen, its
+// button and its chip are web/src/view/channel's (`createAuthorFilter`, `#624 voice-page-modularity`).
 
-/** What the button says in each state: the state it is in, and where a press goes next. */
-const AUTHOR_FILTER_LABELS = {
-  everyone: "Everyone's messages. Press for only yours",
-  mine: "Only your messages. Press for only everyone else's",
-  theirs: "Only everyone else's messages. Press for everyone's",
-};
-
-const AUTHOR_FILTER_TITLES = {
-  everyone: "Whose messages: Both (everyone's). Press to show only yours.",
-  mine: "Whose messages: My messages (only yours). Press to show only everyone else's.",
-  theirs: "Whose messages: Their messages (only everyone else's). Press to show everyone's.",
-};
-
-/** `#520 search-whose-toggle-hint`. The chip's words for each state: what a press landed on. */
-const AUTHOR_FILTER_CHIP_LABELS = {
-  everyone: "Both",
-  mine: "My messages",
-  theirs: "Their messages",
-};
-
-/** How long the chip stays up before it fades, in ms. Its fade is web/voice.css's. */
-const AUTHOR_CHIP_MS = 1500;
-
-/** The chip's fade timer and its hide timer; a fresh press restarts both. */
-let authorChipFadeTimer = null;
-let authorChipHideTimer = null;
-
-/** Whose messages the list shows: one of `AUTHOR_FILTERS`. Only while the search bar is open. */
-let authorFilter = "everyone";
+/** Whose messages the list shows, its button and its chip. */
+const authorFilters = createAuthorFilter({
+  lookup: (id) => el(id),
+  searchOpen: () => searchOpen,
+});
 
 /** The author filter in force: "everyone" while the bar is shut, whatever was last chosen. */
-const authorChoosing = () => (searchOpen ? authorFilter : "everyone");
-
-/**
- * Whether `row` is a message the owner wrote, by what the page draws: a channel row in the `me` bucket
- * (or one still being sent, which is his), and the call's "you".
- */
-function rowIsMine(row) {
-  if (row.getAttribute("data-who") === "me") return true;
-  return String(row.className).split(/\s+/).includes("mine");
-}
-
-/**
- * Whether `row` passes the author filter `author`. Only a message passes Mine or Theirs: a row that is
- * not one (a notice, a seam, a card of the Threads list, which is a thread and not a message anybody
- * wrote) goes, as it does under Links.
- */
-function authorPasses(row, author) {
-  if (author === "everyone") return true;
-  if (row.getAttribute("data-search") === null || String(row.className).split(/\s+/).includes("thread-card")) {
-    return false;
-  }
-  return rowIsMine(row) === (author === "mine");
-}
-
-/** The button, saying the state: its icon (drawn by web/voice.css off `data-author`), pressed, and named. */
-function renderAuthorFilter() {
-  const button = el("author-filter");
-  const said = {
-    "data-author": authorFilter,
-    "aria-pressed": authorFilter === "everyone" ? "false" : "true",
-    "aria-label": AUTHOR_FILTER_LABELS[authorFilter],
-    "aria-describedby": "author-filter-tip",
-    title: AUTHOR_FILTER_TITLES[authorFilter],
-  };
-  for (const [name, value] of Object.entries(said)) {
-    if (button.getAttribute(name) !== value) button.setAttribute(name, value);
-  }
-  // `#520 search-whose-toggle-hint`. The hover/focus tooltip says the same as the title.
-  const tip = el("author-filter-tip");
-  if (tip.textContent !== AUTHOR_FILTER_TITLES[authorFilter]) {
-    tip.textContent = AUTHOR_FILTER_TITLES[authorFilter];
-  }
-}
-
-/**
- * `#520 search-whose-toggle-hint`. Leave the chip under the button naming the state a press landed
- * on, for `AUTHOR_CHIP_MS`, then fade it (web/voice.css; no fade under reduced motion). It floats,
- * so the bar and the list do not move. A fresh press restarts the wait.
- */
-function showAuthorChip() {
-  const chip = el("author-filter-chip");
-  const fading = (on) => {
-    const names = String(chip.className).split(/\s+/).filter((name) => name && name !== "author-chip-out");
-    chip.className = on ? [...names, "author-chip-out"].join(" ") : names.join(" ");
-  };
-  chip.textContent = AUTHOR_FILTER_CHIP_LABELS[authorFilter];
-  fading(false);
-  chip.hidden = false;
-  if (authorChipFadeTimer !== null) clearTimeout(authorChipFadeTimer);
-  if (authorChipHideTimer !== null) clearTimeout(authorChipHideTimer);
-  authorChipFadeTimer = setTimeout(() => {
-    authorChipFadeTimer = null;
-    fading(true);
-    authorChipHideTimer = setTimeout(() => {
-      authorChipHideTimer = null;
-      chip.hidden = true;
-      fading(false);
-    }, 400);
-  }, AUTHOR_CHIP_MS);
-}
+const authorChoosing = () => authorFilters.inForce();
 
 /**
  * Choose whose messages the list shows, the reader's message kept where it is on the screen — or,
@@ -6827,10 +6734,9 @@ function showAuthorChip() {
  */
 function setAuthorFilter(mode) {
   const next = AUTHOR_FILTERS.includes(mode) ? mode : "everyone";
-  if (next === authorFilter) return;
+  if (next === authorFilters.chosen()) return;
   keepingFilterPlace(() => liftingHideRead(() => {
-    authorFilter = next;
-    renderAuthorFilter();
+    authorFilters.set(next);
     renderScrollTools();
     inOtherColumn(renderScrollTools);
   }));
@@ -6839,30 +6745,17 @@ function setAuthorFilter(mode) {
 
 /** The button's press: the next state round the cycle, and the chip naming where it landed. */
 function cycleAuthorFilter() {
-  setAuthorFilter(AUTHOR_FILTERS[(AUTHOR_FILTERS.indexOf(authorFilter) + 1) % AUTHOR_FILTERS.length]);
-  showAuthorChip();
+  setAuthorFilter(nextAuthorFilter(authorFilters.chosen()));
+  authorFilters.showChip();
 }
 
 /**
  * What the list says where its rows would be when the author filter has left none of the messages
- * loaded, or "" when it has not. `searching` is whether text is typed too, and `pinned` whether the
- * list is the Pinned filter's. With "Mark my own messages as read" on, the owner's messages start read,
- * so Hide read leaves them out and Mine under it is empty unless he put one back, and the sentence says
- * how to see them.
+ * loaded, or "" when it has not (`authorEmptyWords`): with "Mark my own messages as read" on, Hide read
+ * in the channel's view leaves his own out, and the sentence says how to see them.
  */
 function authorEmptySentence(author, searching, pinned) {
-  if (author === "mine" && !pinned && currentView === "discord" && hidingRead() && markOwnRead) {
-    return "Your own messages start read, so Hide read leaves them out — press h for Show read.";
-  }
-  const whose = author === "mine" ? "yours" : "from anyone else";
-  if (pinned) {
-    return searching
-      ? `None of this channel's pinned messages ${author === "mine" ? "of yours" : "from anyone else"} match that search.`
-      : `None of this channel's pinned messages are ${whose}.`;
-  }
-  return searching
-    ? `None of the messages ${author === "mine" ? "of yours" : "from anyone else"} loaded so far match that search.`
-    : `None of the messages loaded so far are ${whose}.`;
+  return authorEmptyWords(author, searching, pinned, () => currentView === "discord" && hidingRead() && markOwnRead);
 }
 
 // --- the kinds of link under Links ----------------------------------------------------------------
@@ -25767,7 +25660,7 @@ function openThreadRootId() {
 
 /** Whether a filter is choosing rows: then every match is shown, and no run hides one behind a line. */
 function readRunsSuspended() {
-  return searchOpen && (linksOnly || authorFilter !== "everyone" || searchTyped(searchQuery));
+  return searchOpen && (linksOnly || authorFilters.chosen() !== "everyone" || searchTyped(searchQuery));
 }
 
 /**

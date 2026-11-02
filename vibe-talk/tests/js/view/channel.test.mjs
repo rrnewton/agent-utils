@@ -200,3 +200,48 @@ test("`#624 voice-page-modularity`: a pull past the top arms after PULL_ARM_PX a
   await pull.pullEnd();
   assert.deepStrictEqual(read, ["older"], "a sideways drag refreshed");
 });
+
+test("`#624 voice-page-modularity`: the author filter's rows, button and chip, from the module alone", () => {
+  const { authorPasses, rowIsMine, createAuthorFilter, AUTHOR_CHIP_MS } = CHANNEL_VIEW;
+  const row = (attrs, className = "") => ({ className, getAttribute: (name) => attrs[name] ?? null });
+  const mine = row({ "data-who": "me", "data-search": "" });
+  const sending = row({ "data-search": "" }, "msg mine");
+  const theirs = row({ "data-who": "coder", "data-search": "" });
+  const notice = row({});
+  const card = row({ "data-search": "", "data-who": "me" }, "thread-card");
+  assert.deepStrictEqual([mine, sending, theirs].map(rowIsMine), [true, true, false]);
+  assert.deepStrictEqual([mine, theirs, notice, card].map((one) => authorPasses(one, "everyone")), [true, true, true, true]);
+  assert.deepStrictEqual([mine, sending, theirs, notice, card].map((one) => authorPasses(one, "mine")), [true, true, false, false, false]);
+  assert.deepStrictEqual([mine, theirs, notice, card].map((one) => authorPasses(one, "theirs")), [false, true, false, false]);
+  const element = () => {
+    const attrs = new Map();
+    return { attrs, hidden: true, className: "author-chip", textContent: "",
+      getAttribute: (name) => attrs.get(name) ?? null, setAttribute: (name, value) => attrs.set(name, String(value)) };
+  };
+  const elements = { "author-filter": element(), "author-filter-tip": element(), "author-filter-chip": element() };
+  let open = false;
+  const filter = createAuthorFilter({ lookup: (id) => elements[id], searchOpen: () => open });
+  assert.deepStrictEqual([filter.chosen(), filter.inForce()], ["everyone", "everyone"]);
+  filter.set("mine");
+  assert.equal(filter.inForce(), "everyone", "a filter in force with the bar shut");
+  open = true;
+  assert.equal(filter.inForce(), "mine");
+  const button = elements["author-filter"].attrs;
+  assert.deepStrictEqual([button.get("data-author"), button.get("aria-pressed"), button.get("aria-describedby")],
+    ["mine", "true", "author-filter-tip"]);
+  assert.equal(elements["author-filter-tip"].textContent, button.get("title"));
+  const realTimeout = globalThis.setTimeout;
+  const timers = [];
+  globalThis.setTimeout = (run, ms) => { timers.push({ run, ms }); return timers.length; };
+  try {
+    filter.showChip();
+    const chip = elements["author-filter-chip"];
+    assert.deepStrictEqual([chip.hidden, chip.textContent, timers[0].ms], [false, "My messages", AUTHOR_CHIP_MS]);
+    timers[0].run();
+    assert.equal(chip.className, "author-chip author-chip-out");
+    timers[1].run();
+    assert.deepStrictEqual([chip.hidden, chip.className], [true, "author-chip"]);
+  } finally {
+    globalThis.setTimeout = realTimeout;
+  }
+});

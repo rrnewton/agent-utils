@@ -303,3 +303,22 @@ test("`#624 voice-page-modularity`: what the summaries say, from the module alon
   assert.deepStrictEqual([summaryFailureWords(1, "down"), summaryFailureWords(3, "down")],
     ["one message could not be summarised: down", "3 messages could not be summarised: down"]);
 });
+
+test("`#624 voice-page-modularity`: what the author filter says, from the module alone", () => {
+  const { AUTHOR_FILTERS, nextAuthorFilter, authorEmptyWords, AUTHOR_FILTER_LABELS, AUTHOR_FILTER_TITLES, AUTHOR_FILTER_CHIP_LABELS } = ROWS;
+  assert.deepStrictEqual([...AUTHOR_FILTERS], ["everyone", "mine", "theirs"]);
+  assert.deepStrictEqual(AUTHOR_FILTERS.map(nextAuthorFilter), ["mine", "theirs", "everyone"]);
+  for (const table of [AUTHOR_FILTER_LABELS, AUTHOR_FILTER_TITLES, AUTHOR_FILTER_CHIP_LABELS]) {
+    assert.deepStrictEqual(Object.keys(table), [...AUTHOR_FILTERS]);
+  }
+  let asked = 0;
+  const hidden = () => { asked += 1; return true; };
+  assert.equal(authorEmptyWords("theirs", false, false, hidden), "None of the messages loaded so far are from anyone else.");
+  assert.equal(asked, 0, "asked about Hide read for Theirs");
+  assert.equal(authorEmptyWords("mine", false, false, hidden),
+    "Your own messages start read, so Hide read leaves them out — press h for Show read.");
+  assert.equal(authorEmptyWords("mine", true, false, () => false), "None of the messages of yours loaded so far match that search.");
+  assert.equal(authorEmptyWords("mine", false, true, hidden), "None of this channel's pinned messages are yours.");
+  assert.equal(authorEmptyWords("theirs", true, true, hidden),
+    "None of this channel's pinned messages from anyone else match that search.");
+});

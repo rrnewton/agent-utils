@@ -83,3 +83,11 @@ export {
   summaryNoteWords,
   typicalSummaryMs,
 } from "./summaries.ts";
+export {
+  AUTHOR_FILTERS,
+  AUTHOR_FILTER_CHIP_LABELS,
+  AUTHOR_FILTER_LABELS,
+  AUTHOR_FILTER_TITLES,
+  authorEmptyWords,
+  nextAuthorFilter,
+} from "./authorfilter.ts";
