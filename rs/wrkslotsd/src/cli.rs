@@ -735,6 +735,117 @@ pub(crate) enum Command {
         #[arg(long, value_name = "NAME")]
         machine: Option<String>,
     },
+    /// Recover an explicit bounded batch of absent agent rows, printing the Python output (writer; fixture registries only until cutover)
+    RecoverAbsentAgentRowsText {
+        /// One SLOT=GENERATION=SHA256 row (repeatable)
+        #[arg(long, value_name = "ROW")]
+        row: Vec<String>,
+        /// UTF-8 file with one row per line
+        #[arg(long, value_name = "FILE")]
+        input: Option<PathBuf>,
+        /// Apply instead of planning each plan
+        #[arg(long = "apply")]
+        apply_mode: bool,
+        /// The caller asserts it is the recorded coordinator
+        #[arg(long)]
+        coordinator_authorized: bool,
+        /// Stable coordinator process PID (required with --apply)
+        #[arg(long, value_name = "PID")]
+        coordinator_pid: Option<i64>,
+        /// Output format: human prints the outcome lines; json prints the payload
+        #[arg(long, value_name = "FORMAT", default_value = "human", value_parser = ["human", "json"])]
+        format: String,
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
+    /// Recover absent validation rows named by a JSON input file, printing the Python output (writer; fixture registries only until cutover)
+    RecoverAbsentValidateRowsText {
+        /// JSON input file with the exact rows to recover
+        #[arg(long, value_name = "FILE")]
+        input: PathBuf,
+        /// Apply instead of planning
+        #[arg(long = "apply")]
+        apply_mode: bool,
+        /// The caller asserts it is the recorded coordinator
+        #[arg(long)]
+        coordinator_authorized: bool,
+        /// Stable coordinator process PID (required with --apply)
+        #[arg(long, value_name = "PID")]
+        coordinator_pid: Option<i64>,
+        /// Output format: human prints the ROW lines; json prints the payload
+        #[arg(long, value_name = "FORMAT", default_value = "human", value_parser = ["human", "json"])]
+        format: String,
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
+    /// Recover one bounded batch of private ownerless validation checkouts, printing the Python output (writer; fixture registries only until cutover)
+    RecoverOwnerlessValidateBatchText {
+        /// Project-relative private ownerless validation checkout (repeatable)
+        #[arg(long = "checkout", value_name = "PATH")]
+        checkouts: Vec<String>,
+        /// Absolute frozen validation checkout (repeatable)
+        #[arg(long = "frozen-validate-checkout", value_name = "PATH")]
+        frozen_validate_checkouts: Vec<String>,
+        /// Aligned terminal validation record (repeatable)
+        #[arg(long = "completed-record", value_name = "PATH")]
+        completed_records: Vec<String>,
+        /// Aligned source repository (repeatable)
+        #[arg(long = "repository", value_name = "PATH")]
+        repositories: Vec<String>,
+        /// Proof manifest aligned with each checkout (repeatable)
+        #[arg(long = "validation-proof-manifest", value_name = "PATH")]
+        validation_proof_manifests: Vec<String>,
+        /// The caller asserts it is the recorded coordinator
+        #[arg(long)]
+        coordinator_authorized: bool,
+        /// Stable coordinator process PID
+        #[arg(long, value_name = "PID")]
+        coordinator_pid: Option<i64>,
+        /// Output format: human prints the retained lines; json prints the payload
+        #[arg(long, value_name = "FORMAT", default_value = "human", value_parser = ["human", "json"])]
+        format: String,
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
+    /// Classify retained validation checkouts without removing them, printing the Python output (writer; fixture registries only until cutover)
+    ClassifyOwnerlessValidateBatchText {
+        /// Project-relative private ownerless validation checkout (repeatable)
+        #[arg(long = "checkout", value_name = "PATH")]
+        checkouts: Vec<String>,
+        /// Absolute frozen validation checkout (repeatable)
+        #[arg(long = "frozen-validate-checkout", value_name = "PATH")]
+        frozen_validate_checkouts: Vec<String>,
+        /// Aligned terminal validation record (repeatable)
+        #[arg(long = "completed-record", value_name = "PATH")]
+        completed_records: Vec<String>,
+        /// Aligned source repository (repeatable)
+        #[arg(long = "repository", value_name = "PATH")]
+        repositories: Vec<String>,
+        /// Proof manifest aligned with each checkout (repeatable)
+        #[arg(long = "validation-proof-manifest", value_name = "PATH")]
+        validation_proof_manifests: Vec<String>,
+        /// Output format: human prints the state lines; json prints the payload
+        #[arg(long, value_name = "FORMAT", default_value = "human", value_parser = ["human", "json"])]
+        format: String,
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
     /// Resume a journal or start bounded ownerless validation cleanup (writer; fixture registries only until cutover)
     Recover {
         /// Live current coordinator PID recorded with recovery
@@ -2036,6 +2147,136 @@ pub fn run() -> u8 {
                 }
             }
         }
+        Command::RecoverAbsentAgentRowsText {
+            row,
+            input,
+            apply_mode,
+            coordinator_authorized,
+            coordinator_pid,
+            format,
+            root,
+            machine,
+        } => match crate::recover_absent_write::recover_absent_agent_rows(
+            root.as_deref(),
+            machine.as_deref(),
+            &row,
+            input.as_deref(),
+            apply_mode,
+            coordinator_authorized,
+            coordinator_pid,
+        ) {
+            Ok(value) => {
+                let (text, refused) = crate::batch_text::agent_rows(&value, format == "json");
+                print!("{text}");
+                return if refused { 1 } else { 0 };
+            }
+            Err(error) => {
+                eprintln!("wrkslotsd: {error}");
+                return 1;
+            }
+        },
+        Command::RecoverAbsentValidateRowsText {
+            input,
+            apply_mode,
+            coordinator_authorized,
+            coordinator_pid,
+            format,
+            root,
+            machine,
+        } => {
+            let (refusal, result) =
+                crate::recover_validate_write::recover_absent_validate_rows_wrapped(
+                    root.as_deref(),
+                    machine.as_deref(),
+                    &input,
+                    apply_mode,
+                    coordinator_authorized,
+                    coordinator_pid,
+                );
+            match result {
+                Ok(value) => {
+                    print!(
+                        "{}",
+                        crate::batch_text::validate_rows(&value, format == "json")
+                    );
+                    return 0;
+                }
+                Err(error) => {
+                    if let Some(value) = refusal {
+                        print!(
+                            "{}",
+                            crate::batch_text::validate_rows(&value, format == "json")
+                        );
+                    }
+                    eprintln!("wrkslotsd: {error}");
+                    return 1;
+                }
+            }
+        }
+        Command::RecoverOwnerlessValidateBatchText {
+            checkouts,
+            frozen_validate_checkouts,
+            completed_records,
+            repositories,
+            validation_proof_manifests,
+            coordinator_authorized,
+            coordinator_pid,
+            format,
+            root,
+            machine,
+        } => match crate::recover_cache_write::recover_ownerless_validate_batch(
+            root.as_deref(),
+            machine.as_deref(),
+            &checkouts,
+            &frozen_validate_checkouts,
+            &completed_records,
+            &repositories,
+            &validation_proof_manifests,
+            coordinator_authorized,
+            coordinator_pid,
+        ) {
+            Ok(value) => {
+                print!(
+                    "{}",
+                    crate::batch_text::ownerless_recover(&value, format == "json")
+                );
+                return 0;
+            }
+            Err(error) => {
+                eprintln!("wrkslotsd: {error}");
+                return 1;
+            }
+        },
+        Command::ClassifyOwnerlessValidateBatchText {
+            checkouts,
+            frozen_validate_checkouts,
+            completed_records,
+            repositories,
+            validation_proof_manifests,
+            format,
+            root,
+            machine,
+        } => match crate::recover_cache_write::classify_ownerless_validate_batch(
+            root.as_deref(),
+            machine.as_deref(),
+            &checkouts,
+            &frozen_validate_checkouts,
+            &completed_records,
+            &repositories,
+            &validation_proof_manifests,
+        ) {
+            Ok(value) => {
+                print!(
+                    "{}",
+                    crate::batch_text::ownerless_classify(&value, format == "json")
+                );
+                return 0;
+            }
+            Err(error) => {
+                eprintln!("wrkslotsd: {error}");
+                return 1;
+            }
+        },
         Command::Recover {
             coordinator_pid,
             slot,

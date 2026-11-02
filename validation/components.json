@@ -409,6 +409,7 @@
         "py/wrkslots/tests/test_read_handoff_write_rust.py",
         "py/wrkslots/tests/test_record_holds_rust.py",
         "py/wrkslots/tests/test_recover_absent_write_rust.py",
+        "py/wrkslots/tests/test_recover_batch_text_rust.py",
         "py/wrkslots/tests/test_recover_cache_write_rust.py",
         "py/wrkslots/tests/test_recover_clone_write_rust.py",
         "py/wrkslots/tests/test_recover_main_write_rust.py",

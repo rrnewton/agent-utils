@@ -45,6 +45,7 @@ mod active_state;
 mod adopt_write;
 mod archive_state;
 mod audit_state;
+mod batch_text;
 mod canonical;
 pub mod cli;
 mod config;

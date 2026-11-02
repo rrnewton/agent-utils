@@ -47,6 +47,18 @@ case "$1" in
   create-text)
     if [ "$2" = "--help" ]; then echo "Usage: --root --machine --slot-type --coordinator-authorized --agent --task --purpose --owner-pid --coordinator-pid --repo --remote --remote-url --branch --start --override-disk-floor --task-scope-unit --task-scope-invocation-id --representation --format"; exit 0; fi
     echo "RS create-text $@" ;;
+  recover-absent-agent-rows-text)
+    if [ "$2" = "--help" ]; then echo "Usage: --root --machine --row --input --apply --coordinator-authorized --coordinator-pid --format"; exit 0; fi
+    echo "RS recover-absent-agent-rows-text $@" ;;
+  recover-absent-validate-rows-text)
+    if [ "$2" = "--help" ]; then echo "Usage: --root --machine --input --apply --coordinator-authorized --coordinator-pid --format"; exit 0; fi
+    echo "RS recover-absent-validate-rows-text $@" ;;
+  recover-ownerless-validate-batch-text)
+    if [ "$2" = "--help" ]; then echo "Usage: --root --machine --checkout --frozen-validate-checkout --completed-record --repository --validation-proof-manifest --coordinator-authorized --coordinator-pid --format"; exit 0; fi
+    echo "RS recover-ownerless-validate-batch-text $@" ;;
+  classify-ownerless-validate-batch-text)
+    if [ "$2" = "--help" ]; then echo "Usage: --root --machine --checkout --frozen-validate-checkout --completed-record --repository --validation-proof-manifest --format"; exit 0; fi
+    echo "RS classify-ownerless-validate-batch-text $@" ;;
   heartbeat)
     if [ "$2" = "--help" ]; then echo "Usage: --agent --owner-pid --expected-generation --root --machine"; exit 0; fi
     echo "RS heartbeat-run $@" ;;
@@ -182,19 +194,22 @@ def test_create_both_formats_run_in_rust(tmp_path: Path) -> None:
     assert "cmd=create edition=rust rc=0" in log.read_text()
 
 
-def test_format_value_is_checked_not_just_the_flag(tmp_path: Path) -> None:
+def test_recover_batch_both_formats_run_in_rust(tmp_path: Path) -> None:
     root, log = _sandbox(tmp_path)
-    human = _run(root, log, "recover-absent-validate-rows", "--format", "human")
-    assert human.stdout.startswith("PY wrkslots recover-absent-validate-rows")
-    bogus = _run(root, log, "recover-absent-validate-rows", "--format", "bogus")
-    assert bogus.stdout.startswith("PY wrkslots recover-absent-validate-rows")
-
-
-def test_format_default_commands_stay_python_without_json(tmp_path: Path) -> None:
-    root, log = _sandbox(tmp_path)
-    result = _run(root, log, "recover-absent-validate-rows", "slot01")
-    assert result.stdout.startswith("PY wrkslots recover-absent-validate-rows")
-    assert "python (not yet in Rust)" in result.stderr
+    human = _run(root, log, "recover-absent-validate-rows", "--input", "rows.json")
+    assert human.returncode == 0, human.stderr
+    assert human.stdout.startswith(
+        "RS recover-absent-validate-rows-text recover-absent-validate-rows-text --input rows.json"
+    )
+    payload = _run(
+        root, log, "classify-ownerless-validate-batch",
+        "--checkout", "c1", "--format", "json",
+    )
+    assert payload.returncode == 0, payload.stderr
+    assert payload.stdout.startswith(
+        "RS classify-ownerless-validate-batch-text classify-ownerless-validate-batch-text"
+    )
+    assert "cmd=classify-ownerless-validate-batch edition=rust rc=0" in log.read_text()
 
 
 def test_abbreviated_flag_falls_back_to_python(tmp_path: Path) -> None:
