@@ -247,6 +247,12 @@ fn submit_resolved(
         } else {
             String::new()
         },
+        deciding_report: existing
+            .as_ref()
+            .map_or_else(String::new, |old| old.deciding_report.clone()),
+        deciding_failed: existing
+            .as_ref()
+            .map_or_else(Vec::new, |old| old.deciding_failed.clone()),
         status: ItemStatus::Queued,
         landed_as: String::new(),
         history: existing.map(|old| old.history).unwrap_or_default(),
@@ -271,6 +277,9 @@ pub fn withdraw(state: &State, pr: i64, why: &str) -> Result<Item, String> {
         .item(pr)?
         .ok_or_else(|| format!("#{pr} is not in the queue"))?;
     item.status = ItemStatus::Withdrawn;
+    // Withdrawal is not decided by a run; drop any stale deciding record.
+    item.deciding_report.clear();
+    item.deciding_failed.clear();
     item.log("withdrawn", why);
     state.save_item(&item)?;
     Ok(item)

@@ -170,6 +170,18 @@ fn ejected_sends_exactly_once_with_failing_tests() {
     let report = report_of(&log);
     assert!(report.contains("verdict: ejected"), "{report}");
     assert!(report.contains("ejection_report: "), "{report}");
+    // Failed test IDs are inline, and the linked run report is the deciding
+    // run's (recorded on the item), which is under the queue's runs/.
+    assert!(report.contains("failed: a"), "{report}");
+    assert!(report.contains("run_report: "), "{report}");
+    assert!(
+        item(&fx, 1)["deciding_report"]
+            .as_str()
+            .unwrap()
+            .contains("report.md"),
+        "{}",
+        item(&fx, 1)
+    );
     serve_once(&fx, &log, "0");
     assert_eq!(sent_lines(&log).len(), 1);
 }

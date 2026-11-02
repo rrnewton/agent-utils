@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::tests::{Selection, ValidationClaim};
+use crate::tests::{TestResult, TestResults, ValidationClaim};
 
 /// Lifecycle of a submitted change.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -143,6 +143,15 @@ pub struct Item {
     /// Detail of the most recent refusal (exit status and marker), for the operator.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub last_refusal: String,
+    /// Run report (`runs/<id>/report.md`) of the run that decided the
+    /// current transition, recorded at the transition itself. Notifications
+    /// link this, not whatever run happens to be newest.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub deciding_report: String,
+    /// Failed tests of the deciding run (with outcome/duration/log where
+    /// known), recorded at the transition; empty for landed/withdrawn.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deciding_failed: Vec<TestResult>,
     /// Lifecycle state.
     #[serde(default)]
     pub status: ItemStatus,
@@ -197,18 +206,58 @@ pub struct Obligation {
     pub failed_runs: Vec<Discharge>,
 }
 
-/// How an obligation was discharged.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// How an obligation was discharged (or attempted): the widen run's full
+/// sparse results, not a bare green flag.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 pub struct Discharge {
     /// RFC 3339 UTC time.
     pub at: String,
     /// Commit the complete run validated (`landed` or a descendant).
     pub commit: String,
-    /// Whether that complete run was green.
-    pub green: bool,
-    /// Failing tests, when it was not.
-    #[serde(default, skip_serializing_if = "Selection::is_empty")]
-    pub failed: Selection,
+    /// Runner exit status of the complete run (`None` when killed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit: Option<i32>,
+    /// Full per-test results of the complete run.
+    #[serde(default)]
+    pub results: TestResults,
+    /// Validation record ID of the widen run within its run, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation_id: Option<usize>,
+}
+
+impl Discharge {
+    /// Whether that complete run was green (derived, not stored).
+    pub fn green(&self) -> bool {
+        self.exit == Some(0) && self.results.green()
+    }
+
+    /// Failing tests with outcome/duration/log, when it was not green.
+    pub fn failed_results(&self) -> Vec<TestResult> {
+        self.results.failed_results()
+    }
+
+    /// IDs of the failing tests, in order.
+    pub fn failed_ids(&self) -> Vec<crate::tests::TestId> {
+        self.results.failed().into_iter().collect()
+    }
+}
+
+// Serialized form embeds the full sparse `results` and the failed tests
+// with their outcomes, plus `green` computed from them (derived, never
+// stored), for obligation readers.
+impl Serialize for Discharge {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("Discharge", 7)?;
+        state.serialize_field("at", &self.at)?;
+        state.serialize_field("commit", &self.commit)?;
+        state.serialize_field("exit", &self.exit)?;
+        state.serialize_field("results", &self.results)?;
+        state.serialize_field("failed", &self.failed_results())?;
+        state.serialize_field("green", &self.green())?;
+        state.serialize_field("validation_id", &self.validation_id)?;
+        state.end()
+    }
 }
 
 /// One planned batch: changes validated and landed together, in order.

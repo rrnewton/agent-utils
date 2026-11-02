@@ -29,15 +29,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::git::{Combined, Git};
 use crate::model::{now, Discharge, Item, ItemStatus, Obligation, Plan};
 use crate::ops::{self, repo};
 use crate::plan::short;
 use crate::state::{write_json, Config, State};
-use crate::tests::{Outcome, Scope, Selection, TestId, ValidationClaim};
-use crate::validate::{from_config, Chosen, Ran, Validator, UNATTRIBUTED};
+use crate::tests::{Outcome, Scope, Selection, TestId, TestResult, TestResults, ValidationClaim};
+use crate::validate::{from_config, Chosen, ProbeObservation, Ran, Validator};
 
 /// How a run behaves.
 #[derive(Clone, Debug, Default)]
@@ -132,7 +132,7 @@ pub struct Deferred {
 }
 
 /// One validation the run performed.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct ValidationRecord {
     /// Sequence number within the run.
     pub id: usize,
@@ -146,19 +146,23 @@ pub struct ValidationRecord {
     pub selection: Selection,
     /// Policy that chose it.
     pub policy: String,
-    /// Whether it was green. A refusal is never green.
-    pub green: bool,
+    /// Full sparse per-test results (outcome map, durations, log pointers
+    /// and the unattributed flag). This is the stored truth; `green` and
+    /// `failed` below are derived from it, never stored.
+    pub results: TestResults,
+    /// Runner exit status (`None` when killed by the timeout).
+    pub exit: Option<i32>,
+    /// Runner log file.
+    pub log: PathBuf,
     /// Whether admission refused to run it (exit 75 / `COULD_NOT_RUN`). A refusal is
     /// neither green nor red and attributes no failed test.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub refused: bool,
     /// Whether the queue cancelled it (its candidate was discarded).
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub cancelled: bool,
-    /// Failed tests.
-    pub failed: Vec<TestId>,
     /// Failure classes of the failed tests (from `classify`).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub classes: Vec<String>,
     /// Start time in milliseconds after the run began.
     pub start_ms: u64,
@@ -166,6 +170,63 @@ pub struct ValidationRecord {
     pub elapsed_ms: u64,
     /// Directory with the log and results.
     pub dir: PathBuf,
+}
+
+impl ValidationRecord {
+    /// Whether it was green (derived). A refusal/cancel is never green.
+    pub fn green(&self) -> bool {
+        !self.cancelled && !self.refused && self.exit == Some(0) && self.results.green()
+    }
+
+    /// Failed test IDs (derived). Unattributed runs report none; their
+    /// `results.unattributed` flag carries that fact.
+    pub fn failed(&self) -> Vec<TestId> {
+        if self.cancelled || self.refused {
+            return Vec::new();
+        }
+        self.results.failed().into_iter().collect()
+    }
+
+    /// Full failed results (outcome/duration/log) in ID order.
+    pub fn failed_results(&self) -> Vec<crate::tests::TestResult> {
+        if self.cancelled || self.refused {
+            return Vec::new();
+        }
+        self.results.failed_results()
+    }
+}
+
+// Serialized form carries the persisted sparse `results` plus `green` /
+// `failed` computed from it (derived, never stored), for report readers.
+impl Serialize for ValidationRecord {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("ValidationRecord", 15)?;
+        state.serialize_field("id", &self.id)?;
+        state.serialize_field("purpose", &self.purpose)?;
+        state.serialize_field("prs", &self.prs)?;
+        state.serialize_field("commit", &self.commit)?;
+        state.serialize_field("selection", &self.selection)?;
+        state.serialize_field("policy", &self.policy)?;
+        state.serialize_field("results", &self.results)?;
+        state.serialize_field("exit", &self.exit)?;
+        state.serialize_field("log", &self.log)?;
+        state.serialize_field("green", &self.green())?;
+        state.serialize_field("failed", &self.failed())?;
+        if self.refused {
+            state.serialize_field("refused", &self.refused)?;
+        }
+        if self.cancelled {
+            state.serialize_field("cancelled", &self.cancelled)?;
+        }
+        if !self.classes.is_empty() {
+            state.serialize_field("classes", &self.classes)?;
+        }
+        state.serialize_field("start_ms", &self.start_ms)?;
+        state.serialize_field("elapsed_ms", &self.elapsed_ms)?;
+        state.serialize_field("dir", &self.dir)?;
+        state.end()
+    }
 }
 
 /// Summary of one run.
@@ -379,6 +440,9 @@ struct Flight {
 struct Obs {
     fails: usize,
     passes: usize,
+    /// Probes that observed nothing conclusive (`Missing`/`Skip`-only):
+    /// counted separately so they never read as a pass.
+    unknowns: usize,
     failed: BTreeSet<TestId>,
 }
 
@@ -412,6 +476,9 @@ enum Culprit {
     Flaky(BTreeSet<TestId>),
     /// A probe was refused by admission: no culprit can be named; defer the batch.
     Refused(String),
+    /// A probe observed nothing conclusive (`Missing`/`Skip`-only): no
+    /// culprit can be named; the batch stops rather than guessing.
+    Inconclusive(String),
     /// The change at `index` makes the focus fail (seen twice) and the prefix before it passes.
     Found {
         index: usize,
@@ -602,6 +669,8 @@ impl<'a> Runner<'a> {
                     retry_after = retry_after_time(delay);
                     item.next_retry_at = retry_after.clone();
                     item.last_refusal = detail.to_owned();
+                    item.deciding_report = self.run_dir.join("report.md").display().to_string();
+                    item.deciding_failed.clear();
                     item.log(
                         "validation-refused",
                         format!(
@@ -1076,20 +1145,24 @@ impl<'a> Runner<'a> {
             .iter()
             .filter(|v| v.commit == commit && !v.cancelled && !v.refused);
         let mut complete = false;
+        let mut complete_blocked = false;
         let mut failing: BTreeSet<TestId> = BTreeSet::new();
         let mut passed: BTreeSet<TestId> = BTreeSet::new();
         for run in runs {
-            let unattributed = run.failed.iter().any(|t| t.step == UNATTRIBUTED);
+            let unattributed = run.results.unattributed;
+            let failed = run.failed();
             if run.selection.is_all() {
                 complete = true;
-                failing = run.failed.iter().cloned().collect();
+                // An unattributed complete run proves only its exit status:
+                // green covers everything, red covers nothing.
+                complete_blocked = unattributed && !run.green();
+                failing = failed.iter().cloned().collect();
                 passed.clear();
                 continue;
             }
             for test in run.selection.tests().into_iter().flatten() {
-                if unattributed
-                    || run
-                        .failed
+                if (unattributed && !run.green())
+                    || failed
                         .iter()
                         .any(|f| f == test || f.step == test.step && test.case.is_none())
                 {
@@ -1103,12 +1176,14 @@ impl<'a> Runner<'a> {
             }
         }
         match selection {
-            Selection::All => complete && failing.is_empty(),
+            Selection::All => complete && !complete_blocked && failing.is_empty(),
             Selection::Tests(tests) => tests.iter().all(|test| {
                 passed
                     .iter()
                     .any(|p| p == test || (p.case.is_none() && p.step == test.step))
-                    || (complete && !failing.iter().any(|f| f.step == test.step))
+                    || (complete
+                        && !complete_blocked
+                        && !failing.iter().any(|f| f.step == test.step))
             }),
         }
     }
@@ -1220,12 +1295,13 @@ impl<'a> Runner<'a> {
             purpose: job.purpose.to_owned(),
             prs: job.prs,
             commit: job.commit,
-            selection: job.selection,
+            selection: ran.effective_selection.clone().unwrap_or(job.selection),
             policy: job.policy,
-            green: ran.green(),
+            results: ran.results.clone(),
+            exit: ran.exit,
+            log: ran.log.clone(),
             refused: ran.refused(),
             cancelled: ran.cancelled,
-            failed,
             classes,
             start_ms,
             elapsed_ms: ran.elapsed.as_millis() as u64,
@@ -1235,21 +1311,26 @@ impl<'a> Runner<'a> {
         self.event(
             "result",
             &format!(
-                "v{id} {} in {:.1}s{}",
+                "v{id} {} in {:.1}s{}{}",
                 if record.cancelled {
                     "cancelled"
                 } else if record.refused {
                     "refused"
-                } else if record.green {
+                } else if record.green() {
                     "green"
                 } else {
                     "red"
                 },
                 ran.elapsed.as_secs_f64(),
-                if record.failed.is_empty() {
+                if record.results.unattributed {
+                    " (unattributed)"
+                } else {
+                    ""
+                },
+                if record.failed().is_empty() {
                     String::new()
                 } else {
-                    format!(", failed: {}", ids(&record.failed))
+                    format!(", failed: {}", ids(&record.failed()))
                 }
             ),
         );
@@ -1597,10 +1678,32 @@ impl<'a> Runner<'a> {
         std::fs::write(&report, text)
             .map_err(|error| format!("cannot write {}: {error}", report.display()))?;
         self.event("eject", &format!("#{pr} ({kind}){class_note}: {reason}"));
+        // Failed results from the deciding validations, where recorded.
+        let deciding_failed: Vec<TestResult> = {
+            let report = lock(&self.report);
+            failed
+                .iter()
+                .map(|id| {
+                    report
+                        .validations
+                        .iter()
+                        .rev()
+                        .find_map(|v| v.results.result(id))
+                        .unwrap_or(TestResult {
+                            id: id.clone(),
+                            outcome: Outcome::Fail,
+                            duration_ms: None,
+                            log: None,
+                        })
+                })
+                .collect()
+        };
         if !self.simulating() {
             let mut items = lock(&self.items);
             if let Some(item) = items.get_mut(&pr) {
                 item.status = ItemStatus::Ejected;
+                item.deciding_report = self.run_dir.join("report.md").display().to_string();
+                item.deciding_failed = deciding_failed;
                 item.log(
                     "ejected",
                     format!("{kind}{class_note}: {reason} (report {})", report.display()),
@@ -1668,6 +1771,8 @@ impl<'a> Runner<'a> {
                         item.landed_as = tip.to_owned();
                         item.next_retry_at.clear();
                         item.last_refusal.clear();
+                        item.deciding_report = self.run_dir.join("report.md").display().to_string();
+                        item.deciding_failed.clear();
                         if let Some(hosting) = &self.hosting {
                             match hosting.close(*pr, &crate::sync::close_comment(tip)) {
                                 Ok(()) => item.log("closed", "pull request closed after landing"),
@@ -1912,7 +2017,7 @@ impl<'a> Runner<'a> {
     ) -> Result<BatchOutcome, String> {
         let mut seen_failed = ran.failed();
         // Without per-test attribution the only focus available is the batch's own selection.
-        let mut focus = if seen_failed.contains(&TestId::step(UNATTRIBUTED)) {
+        let mut focus = if ran.results.unattributed {
             chosen.selection.clone()
         } else {
             Selection::of(seen_failed.iter().cloned())
@@ -1930,6 +2035,15 @@ impl<'a> Runner<'a> {
                     return Ok(BatchOutcome::Deferred(
                         format!(
                             "validation refused for {} ({detail}); stays queued, retry after {retry_after}",
+                            list(&current.prs)
+                        ),
+                        current.prs.clone(),
+                    ));
+                }
+                Culprit::Inconclusive(detail) => {
+                    return Ok(BatchOutcome::Stop(
+                        format!(
+                            "culprit search inconclusive for {}: {detail}; no culprit named, nothing ejected",
                             list(&current.prs)
                         ),
                         current.prs.clone(),
@@ -2077,7 +2191,7 @@ impl<'a> Runner<'a> {
                         .chain(not_passed(&rran))
                         .collect();
                     seen_failed = rran.failed();
-                    focus = if seen_failed.contains(&TestId::step(UNATTRIBUTED)) {
+                    focus = if rran.results.unattributed {
                         delta
                     } else {
                         Selection::of(seen_failed.iter().cloned())
@@ -2106,6 +2220,7 @@ impl<'a> Runner<'a> {
             Obs {
                 fails: 1,
                 passes: 0,
+                unknowns: 0,
                 failed: first_failed.clone(),
             },
         );
@@ -2184,11 +2299,19 @@ impl<'a> Runner<'a> {
                     return Ok(Culprit::Refused(refusal_detail(&ran)));
                 }
                 let entry = obs.entry(*i).or_default();
-                if ran.reproduces() {
-                    entry.fails += 1;
-                    entry.failed.extend(ran.reproduced());
-                } else {
-                    entry.passes += 1;
+                match ran.probe_observation() {
+                    ProbeObservation::Fail => {
+                        entry.fails += 1;
+                        entry.failed.extend(ran.reproduced());
+                    }
+                    ProbeObservation::Pass => entry.passes += 1,
+                    ProbeObservation::Unknown => {
+                        entry.unknowns += 1;
+                        return Ok(Culprit::Inconclusive(format!(
+                            "probe at prefix {i} of {} observed only missing/skipped tests (no pass, no reproduced failure)",
+                            candidate.prs.len()
+                        )));
+                    }
                 }
             }
         }
@@ -2209,7 +2332,7 @@ impl<'a> Runner<'a> {
         }
         let base = self.current_base()?;
         *lock(&self.base) = base.clone();
-        let (_, ran) = self
+        let (validation_id, ran) = self
             .validate_all(vec![Job {
                 purpose: "widen",
                 prs: open.iter().flat_map(|o| o.prs.clone()).collect(),
@@ -2241,8 +2364,9 @@ impl<'a> Runner<'a> {
             let record = Discharge {
                 at: now(),
                 commit: base.clone(),
-                green: ran.green(),
-                failed: Selection::of(failed.iter().cloned()),
+                exit: ran.exit,
+                results: ran.results.clone(),
+                validation_id: Some(validation_id),
             };
             if ran.green() {
                 obligation.discharged = Some(record);
@@ -2298,12 +2422,13 @@ fn discard(
     }
 }
 
-/// Tests a run did not see pass (skipped, errored, failed).
+/// Tests a run did not see pass (skipped, errored, failed). No synthetic
+/// IDs exist to filter out: unattributed `all` runs record no per-test IDs.
 fn not_passed(ran: &Ran) -> BTreeSet<TestId> {
     ran.results
         .results
         .iter()
-        .filter(|(id, outcome)| **outcome != Outcome::Pass && id.step != UNATTRIBUTED)
+        .filter(|(_, outcome)| **outcome != Outcome::Pass)
         .map(|(id, _)| id.clone())
         .collect()
 }
@@ -2339,6 +2464,34 @@ fn ids(tests: &[TestId]) -> String {
     tests
         .iter()
         .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Failed results as `id (outcome, 42ms[, log])`, in ID order.
+pub fn format_failed_results(results: &[TestResult]) -> String {
+    results
+        .iter()
+        .map(|r| {
+            let mut text = match r.duration_ms {
+                Some(ms) => format!("{} ({}, {}ms)", r.id, r.outcome.as_str(), ms),
+                None => format!("{} ({})", r.id, r.outcome.as_str()),
+            };
+            if let Some(log) = &r.log {
+                text.push_str(&format!(" log:{log}"));
+            }
+            text
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Outcome counts as `pass=2, fail=1`, in outcome order.
+pub fn format_outcome_counts(results: &TestResults) -> String {
+    results
+        .counts()
+        .iter()
+        .map(|(outcome, count)| format!("{}={count}", outcome.as_str()))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -2428,6 +2581,28 @@ pub fn render_report(report: &RunReport) -> String {
                 "- #{} ({}{classes}): {}\n",
                 ejection.pr, ejection.kind, ejection.reason
             ));
+            if !ejection.failed.is_empty() {
+                // Prefer persisted outcomes/durations from the deciding
+                // validations over the bare IDs on the ejection.
+                let enriched: Vec<TestResult> = ejection
+                    .failed
+                    .iter()
+                    .map(|id| {
+                        report
+                            .validations
+                            .iter()
+                            .rev()
+                            .find_map(|v| v.results.result(id))
+                            .unwrap_or(TestResult {
+                                id: id.clone(),
+                                outcome: Outcome::Fail,
+                                duration_ms: None,
+                                log: None,
+                            })
+                    })
+                    .collect();
+                out.push_str(&format!("  failed: {}\n", format_failed_results(&enriched)));
+            }
         }
     }
     if !report.deferred.is_empty() {
@@ -2456,16 +2631,34 @@ pub fn render_report(report: &RunReport) -> String {
     }
     out.push_str("\n## Validations\n\n| # | purpose | changes | commit | selection | result | start s | seconds |\n|---|---|---|---|---|---|---|---|\n");
     for v in &report.validations {
-        let result = if v.cancelled {
-            "cancelled".to_owned()
-        } else if v.refused {
-            "refused (retry later)".to_owned()
-        } else if v.green {
-            "green".to_owned()
-        } else if v.classes.is_empty() {
-            format!("red: {}", ids(&v.failed))
+        let counts = format_outcome_counts(&v.results);
+        let counts = if counts.is_empty() {
+            String::new()
         } else {
-            format!("red: {} ({})", ids(&v.failed), v.classes.join(", "))
+            format!(" [{counts}]")
+        };
+        let unattributed = if v.results.unattributed {
+            " (unattributed)"
+        } else {
+            ""
+        };
+        let result = if v.cancelled {
+            format!("cancelled{counts}{unattributed}")
+        } else if v.refused {
+            format!("refused (retry later){counts}{unattributed}")
+        } else if v.green() {
+            format!("green{counts}{unattributed}")
+        } else if v.classes.is_empty() {
+            format!(
+                "red{counts}{unattributed}: {}",
+                format_failed_results(&v.failed_results())
+            )
+        } else {
+            format!(
+                "red{counts}{unattributed}: {} ({})",
+                format_failed_results(&v.failed_results()),
+                v.classes.join(", ")
+            )
         };
         out.push_str(&format!(
             "| {} | {} | {} | `{}` | {} ({}) | {} | {:.1} | {:.1} |\n",
@@ -2508,6 +2701,135 @@ pub fn widen(state: &State) -> Result<RunReport, String> {
 #[cfg(test)]
 mod unit {
     use super::*;
+
+    fn record(results: TestResults, exit: Option<i32>) -> ValidationRecord {
+        ValidationRecord {
+            id: 1,
+            purpose: "batch".to_owned(),
+            prs: vec![7],
+            commit: "c".repeat(40),
+            selection: Selection::All,
+            policy: "all".to_owned(),
+            results,
+            exit,
+            log: PathBuf::from("validations/0001-batch/run.log"),
+            refused: false,
+            cancelled: false,
+            classes: vec![],
+            start_ms: 0,
+            elapsed_ms: 10,
+            dir: PathBuf::from("validations/0001-batch"),
+        }
+    }
+
+    #[test]
+    fn validation_record_round_trip_keeps_sparse_results() {
+        let mut results = TestResults::default();
+        results.record(TestResult {
+            id: TestId::step("a"),
+            outcome: Outcome::Fail,
+            duration_ms: Some(42),
+            log: Some("logs/a.log".to_owned()),
+        });
+        results.record(TestResult {
+            id: TestId::step("b"),
+            outcome: Outcome::Pass,
+            duration_ms: Some(3),
+            log: None,
+        });
+        let rec = record(results, Some(1));
+        assert!(!rec.green());
+        assert_eq!(rec.failed(), vec![TestId::step("a")]);
+        let json = serde_json::to_string(&rec).unwrap();
+        // `results` is the persisted truth; serialized `green` is derived.
+        assert!(json.contains("\"results\""), "{json}");
+        let back: ValidationRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.results, rec.results);
+        assert_eq!(back.exit, Some(1));
+        assert_eq!(back.log, rec.log);
+        assert_eq!(back.failed_results()[0].duration_ms, Some(42));
+        assert_eq!(back.failed_results()[0].log.as_deref(), Some("logs/a.log"));
+    }
+
+    #[test]
+    fn unattributed_record_has_empty_failed_set_and_flag() {
+        let results = TestResults {
+            unattributed: true,
+            ..TestResults::default()
+        };
+        let rec = record(results, Some(1));
+        assert!(rec.failed().is_empty());
+        assert!(rec.results.unattributed);
+        let text = render_report(&RunReport {
+            validations: vec![rec],
+            ..RunReport::default()
+        });
+        assert!(text.contains("(unattributed)"), "{text}");
+    }
+
+    #[test]
+    fn report_renders_counts_failed_details_and_ejected_failed() {
+        let mut results = TestResults::default();
+        results.record(TestResult {
+            id: TestId::step("a"),
+            outcome: Outcome::Fail,
+            duration_ms: Some(42),
+            log: None,
+        });
+        results.record(TestResult {
+            id: TestId::step("b"),
+            outcome: Outcome::Pass,
+            duration_ms: None,
+            log: None,
+        });
+        let rec = record(results, Some(1));
+        let report = RunReport {
+            validations: vec![rec],
+            ejected: vec![Ejection {
+                pr: 7,
+                kind: "failed-tests".to_owned(),
+                reason: "a fail".to_owned(),
+                failed: vec![TestId::step("a")],
+                classes: vec![],
+                report: PathBuf::from("ejections/7.md"),
+            }],
+            ..RunReport::default()
+        };
+        let text = render_report(&report);
+        assert!(text.contains("pass=1"), "{text}");
+        assert!(text.contains("fail=1"), "{text}");
+        assert!(text.contains("a (fail, 42ms)"), "{text}");
+        // Ejected section lists the failed tests, not only the reason.
+        let ejected = text.split("## Ejected").nth(1).unwrap();
+        assert!(ejected.contains("failed: a (fail, 42ms)"), "{ejected}");
+    }
+
+    #[test]
+    fn discharge_green_is_derived_not_stored() {
+        let discharge = Discharge {
+            at: "2026-01-01T00:00:00Z".to_owned(),
+            commit: "c".repeat(40),
+            exit: Some(1),
+            results: {
+                let mut r = TestResults::default();
+                r.record(TestResult {
+                    id: TestId::step("a"),
+                    outcome: Outcome::Fail,
+                    duration_ms: Some(9),
+                    log: None,
+                });
+                r
+            },
+            validation_id: Some(3),
+        };
+        assert!(!discharge.green());
+        assert_eq!(discharge.failed_ids(), vec![TestId::step("a")]);
+        let json = serde_json::to_string(&discharge).unwrap();
+        // Failed tests are embedded with outcomes, and the widen record is
+        // referenced; `green` in the JSON is derived from `results`.
+        assert!(json.contains("\"outcome\":\"fail\""), "{json}");
+        assert!(json.contains("\"validation_id\":3"), "{json}");
+    }
 
     #[test]
     fn refusal_backoff_doubles_and_caps() {

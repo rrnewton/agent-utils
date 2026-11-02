@@ -220,6 +220,18 @@ pub fn render_report(state: &State, item: &Item, transition: &Transition) -> Str
         }
         _ => {}
     }
+    if !item.deciding_failed.is_empty() {
+        text.push_str(&format!(
+            "failed_tests: {}\n",
+            crate::run::format_failed_results(&item.deciding_failed)
+        ));
+        let failed_ids: Vec<String> = item
+            .deciding_failed
+            .iter()
+            .map(|r| r.id.to_string())
+            .collect();
+        text.push_str(&format!("failed: {}\n", failed_ids.join(", ")));
+    }
     if let Some(event) = item
         .history
         .iter()
@@ -238,9 +250,15 @@ pub fn render_report(state: &State, item: &Item, transition: &Transition) -> Str
             }
         }
     }
-    match latest_run_report(state) {
-        Some(path) => text.push_str(&format!("run_report: {}\n", path.display())),
-        None => text.push_str("run_report: none\n"),
+    // The deciding run's report, recorded on the item at its transition,
+    // wins over whatever run is newest now.
+    if !item.deciding_report.is_empty() {
+        text.push_str(&format!("run_report: {}\n", item.deciding_report));
+    } else {
+        match latest_run_report(state) {
+            Some(path) => text.push_str(&format!("run_report: {}\n", path.display())),
+            None => text.push_str("run_report: none\n"),
+        }
     }
     text.push_str(&format!("at: {}\n", now()));
     text
@@ -392,6 +410,8 @@ mod unit {
             validation_refusals: 0,
             next_retry_at: String::new(),
             last_refusal: String::new(),
+            deciding_report: String::new(),
+            deciding_failed: vec![],
             notify_delivery: NotifyDelivery::default(),
             status,
             landed_as: "b".repeat(40),
@@ -421,6 +441,28 @@ mod unit {
         // A later refusal is a new transition; the landed key differs too.
         deferred.validation_refusals = 3;
         assert_ne!(desired_transition(&deferred).unwrap().key, transition.key);
+    }
+
+    #[test]
+    fn notify_body_lists_failed_ids_and_links_deciding_run() {
+        let mut ejected = item(Status::Ejected);
+        ejected.deciding_report = "/state/runs/run-deciding/report.md".to_owned();
+        ejected.deciding_failed = vec![crate::tests::TestResult {
+            id: crate::tests::TestId::step("tests/a"),
+            outcome: crate::tests::Outcome::Fail,
+            duration_ms: Some(12),
+            log: None,
+        }];
+        ejected.log("ejected", "failed-tests: boom");
+        let transition = desired_transition(&ejected).unwrap();
+        let state = crate::state::State::at("/nonexistent-notify-unit");
+        let text = render_report(&state, &ejected, &transition);
+        assert!(text.contains("failed: tests/a"), "{text}");
+        assert!(text.contains("tests/a (fail, 12ms)"), "{text}");
+        assert!(
+            text.contains("run_report: /state/runs/run-deciding/report.md"),
+            "{text}"
+        );
     }
 
     #[test]

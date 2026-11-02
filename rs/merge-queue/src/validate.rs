@@ -5,8 +5,10 @@
 //! * `command`: a shell template. It reads the selection from `$MQ_TESTS` (space separated) or
 //!   `$MQ_TESTS_FILE` (one per line; `$MQ_SELECTION` is `all` or `tests`) and writes one JSON object
 //!   per line to `$MQ_RESULTS`: `{"id": "step::case", "outcome": "pass|fail|skip|error",
-//!   "duration_ms": 12}`. A command that writes no results still works, but its exit status is
-//!   then the only signal: every selected test inherits it and the run is marked unattributed.
+//!   "duration_ms": 12, "log": "path/to/log"}` (`duration_ms` and `log` are optional; a missing
+//!   duration means duration unavailable, not zero). A command that writes no results still
+//!   works, but its exit status is then the only signal: every selected test inherits it and
+//!   the run is marked unattributed.
 //! * `dagrun`: a dagrun DAG. Test IDs are step names; the selection becomes `--selected`, which
 //!   also runs each step's dependencies, and per-step verdicts come from the run journal.
 //!
@@ -24,9 +26,6 @@ use serde::Deserialize;
 
 use crate::state::ValidatorConfig;
 use crate::tests::{Outcome, Selection, TestId, TestResult, TestResults};
-
-/// Test ID used when a runner failed without attributing the failure to any test.
-pub const UNATTRIBUTED: &str = "(unattributed)";
 
 /// Exit status signalling a temporary admission refusal: retry later, never a pass and never a
 /// failure of the change under validation (`EX_TEMPFAIL`).
@@ -61,6 +60,22 @@ pub struct Ran {
     /// Admission refused to run validation at all (exit 75 or `COULD_NOT_RUN`): validation
     /// did not run, so this is neither green nor red.
     pub refused: bool,
+    /// Effective selection actually run, when the runner collapses the
+    /// requested one (dagrun runs whole steps, so case IDs collapse to
+    /// their steps). `None` means the requested selection ran as-is.
+    pub effective_selection: Option<Selection>,
+}
+
+/// What one culprit-search probe actually observed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProbeObservation {
+    /// At least one test passed and nothing reproduced a failure.
+    Pass,
+    /// A failure reproduced (attributed, or a non-zero exit).
+    Fail,
+    /// Nothing conclusive was observed: only `Missing`/`Skip` outcomes, no
+    /// results, a refusal, or a cancellation. Never counted as a pass.
+    Unknown,
 }
 
 impl Ran {
@@ -85,26 +100,42 @@ impl Ran {
             && (!self.results.attributed_failures().is_empty() || self.exit != Some(0))
     }
 
-    /// The failures a culprit search attributes to this run.
+    /// The failures a culprit search attributes to this run. An unattributed
+    /// red run attributes nothing (its `results.unattributed` flag, not a
+    /// synthetic test ID, carries that fact).
     pub fn reproduced(&self) -> BTreeSet<TestId> {
-        let failures = self.results.attributed_failures();
-        if failures.is_empty() && self.exit != Some(0) {
-            return [TestId::step(UNATTRIBUTED)].into();
-        }
-        failures
+        self.results.attributed_failures()
     }
 
-    /// Failed tests. A red run with no attributed failure reports [`UNATTRIBUTED`].
+    /// Failed tests. A red run with no attributed failure reports none;
+    /// unattributed runs are identified by `results.unattributed`.
     /// A refusal or a cancelled run reports no failed tests.
     pub fn failed(&self) -> BTreeSet<TestId> {
         if self.refused || self.cancelled {
             return BTreeSet::new();
         }
-        let failed = self.results.failed();
-        if failed.is_empty() && !self.green() {
-            return [TestId::step(UNATTRIBUTED)].into();
+        self.results.failed()
+    }
+
+    /// Honest probe observation: `Missing`/`Skip`-only (or empty) results
+    /// are `Unknown`, never a pass.
+    pub fn probe_observation(&self) -> ProbeObservation {
+        if self.cancelled || self.refused {
+            return ProbeObservation::Unknown;
         }
-        failed
+        if self.reproduces() {
+            return ProbeObservation::Fail;
+        }
+        if self
+            .results
+            .results
+            .values()
+            .any(|outcome| *outcome == Outcome::Pass)
+        {
+            ProbeObservation::Pass
+        } else {
+            ProbeObservation::Unknown
+        }
     }
 }
 
@@ -316,12 +347,19 @@ fn run_logged(
 /// A shell-template runner with a JSON-lines results contract.
 pub struct CommandValidator(pub ValidatorConfig);
 
+/// One `$MQ_RESULTS` line: `(id, outcome, duration_ms, log)`.
+///
+/// Contract: `id` is `step` or `step::case` with no whitespace or `#` in
+/// either part (see [`TestId::parse`]); `duration_ms` and `log` are
+/// optional, and a missing duration means unavailable, not zero.
 #[derive(Deserialize)]
 struct ResultLine {
     id: String,
     outcome: String,
     #[serde(default)]
     duration_ms: Option<u64>,
+    #[serde(default)]
+    log: Option<String>,
 }
 
 impl Validator for CommandValidator {
@@ -403,6 +441,7 @@ impl Validator for CommandValidator {
                     id: TestId::parse(&parsed.id)?,
                     outcome,
                     duration_ms: parsed.duration_ms,
+                    log: parsed.log,
                 });
             }
         }
@@ -417,16 +456,17 @@ impl Validator for CommandValidator {
             } else {
                 Outcome::Error
             };
-            let ids: Vec<TestId> = match selection.tests() {
-                Some(tests) => tests.iter().cloned().collect(),
-                None => vec![TestId::step(UNATTRIBUTED)],
-            };
-            for id in ids {
-                results.record(TestResult {
-                    id,
-                    outcome,
-                    duration_ms: None,
-                });
+            // No synthetic test ID for an `all` selection: the unattributed
+            // flag carries the fact and the failed set stays empty.
+            if let Some(tests) = selection.tests() {
+                for id in tests.iter().cloned() {
+                    results.record(TestResult {
+                        id,
+                        outcome,
+                        duration_ms: None,
+                        log: None,
+                    });
+                }
             }
         }
         results.require(selection);
@@ -444,6 +484,7 @@ impl Validator for CommandValidator {
             cancelled,
             handle: read_handle(out),
             refused,
+            effective_selection: None,
         })
     }
 }
@@ -461,6 +502,8 @@ struct JournalLine {
     ok: Option<bool>,
     #[serde(default)]
     wall_elapsed_s: Option<String>,
+    #[serde(default)]
+    log: Option<String>,
 }
 
 /// Create `dir` readable only by its owner; dagrun writes its journal only into a private,
@@ -485,8 +528,29 @@ fn private_dir(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Duration in a dagrun verdict's trailing `(...)` group, e.g. `(1s)`,
+/// `(3s, exit 1)` or `(250ms)`. `None` when the verdict carries no duration
+/// (duration unavailable, not zero).
+fn verdict_duration_ms(verdict: &str) -> Option<u64> {
+    let group = verdict.rsplit('(').next()?.split(')').next()?;
+    let first = group.split(',').next()?.trim();
+    if let Some(ms) = first.strip_suffix("ms") {
+        ms.trim().parse::<u64>().ok()
+    } else if let Some(secs) = first.strip_suffix('s') {
+        secs.trim()
+            .parse::<f64>()
+            .ok()
+            .map(|s| (s * 1000.0).round() as u64)
+    } else {
+        None
+    }
+}
+
 /// Per-step results from dagrun's printed verdict lines: `[step] ✓ PASS ...`,
 /// `[step] ✗ FAIL ...`, `[step] SKIPPED ...`.
+///
+/// Step names go through [`TestId::parse`]; lines whose step is not a valid
+/// ID are skipped. Verdict-line durations are recorded where present.
 pub fn parse_step_lines(text: &str) -> TestResults {
     let mut results = TestResults::default();
     for line in text.lines() {
@@ -496,9 +560,9 @@ pub fn parse_step_lines(text: &str) -> TestResults {
         let Some((step, verdict)) = rest.split_once("] ") else {
             continue;
         };
-        if step.is_empty() || step.contains(' ') {
+        let Ok(id) = TestId::parse(step) else {
             continue;
-        }
+        };
         let outcome = if verdict.starts_with("✓ PASS") {
             Outcome::Pass
         } else if verdict.starts_with("✗ FAIL") {
@@ -509,9 +573,10 @@ pub fn parse_step_lines(text: &str) -> TestResults {
             continue;
         };
         results.record(TestResult {
-            id: TestId::step(step),
+            id,
             outcome,
-            duration_ms: None,
+            duration_ms: verdict_duration_ms(verdict),
+            log: None,
         });
     }
     results
@@ -524,9 +589,9 @@ pub fn parse_journal(text: &str) -> TestResults {
         let Ok(record) = serde_json::from_str::<JournalLine>(line) else {
             continue;
         };
-        if record.step.is_empty() {
+        let Ok(id) = TestId::parse(&record.step) else {
             continue;
-        }
+        };
         let outcome = match (record.event.as_str(), record.ok) {
             ("step_end", Some(true)) => Outcome::Pass,
             ("step_end", _) => Outcome::Fail,
@@ -538,9 +603,10 @@ pub fn parse_journal(text: &str) -> TestResults {
             .and_then(|secs| secs.parse::<f64>().ok())
             .map(|secs| (secs * 1000.0).round() as u64);
         results.record(TestResult {
-            id: TestId::step(record.step),
+            id,
             outcome,
             duration_ms,
+            log: record.log,
         });
     }
     results
@@ -585,6 +651,7 @@ impl Validator for DagrunValidator {
                     cancelled: false,
                     handle: None,
                     refused: false,
+                    effective_selection: Some(Selection::default()),
                 });
             }
             argv.push("--selected".to_owned());
@@ -601,6 +668,8 @@ impl Validator for DagrunValidator {
             // lines it prints instead.
             results = parse_step_lines(&std::fs::read_to_string(&log).unwrap_or_default());
         }
+        // The effective selection dagrun ran (and a record must name) is
+        // the requested one collapsed to whole steps.
         let whole_steps = selection
             .tests()
             .map(|tests| Selection::of(tests.iter().map(TestId::whole_step)));
@@ -618,6 +687,7 @@ impl Validator for DagrunValidator {
             cancelled,
             handle: read_handle(out),
             refused,
+            effective_selection: whole_steps,
         })
     }
 }
@@ -672,7 +742,10 @@ mod unit {
             )
             .unwrap();
         assert!(ran.results.unattributed);
-        assert_eq!(ran.failed(), [TestId::step(UNATTRIBUTED)].into());
+        assert!(
+            ran.failed().is_empty(),
+            "an unattributed run has an empty failed set; the flag carries it"
+        );
         let ok = from_config(&config("true")).unwrap();
         assert!(ok
             .run(
@@ -782,6 +855,54 @@ dagrun: PASS - 1 passed";
         assert_eq!(results.results[&TestId::step("a.b")], Outcome::Pass);
         assert_eq!(results.failed(), [TestId::step("c.d")].into());
         assert_eq!(results.results[&TestId::step("e.f")], Outcome::Skip);
+        // Verdict-line durations are recorded where present.
+        assert_eq!(results.durations_ms[&TestId::step("a.b")], 0);
+        assert_eq!(results.durations_ms[&TestId::step("c.d")], 3000);
+        assert!(!results.durations_ms.contains_key(&TestId::step("e.f")));
+    }
+
+    #[test]
+    fn missing_and_skip_only_probes_are_unknown_not_pass() {
+        for outcome in [Outcome::Missing, Outcome::Skip] {
+            let mut results = TestResults::default();
+            results.record(TestResult {
+                id: TestId::step("a"),
+                outcome,
+                duration_ms: None,
+                log: None,
+            });
+            let ran = Ran {
+                results,
+                exit: Some(0),
+                elapsed: Duration::ZERO,
+                log: PathBuf::new(),
+                cancelled: false,
+                handle: None,
+                refused: false,
+                effective_selection: None,
+            };
+            assert_eq!(ran.probe_observation(), ProbeObservation::Unknown);
+            assert_ne!(ran.probe_observation(), ProbeObservation::Pass);
+        }
+    }
+
+    #[test]
+    fn result_line_log_pointer_is_recorded() {
+        let tmp = TempDir::new("validate-logptr");
+        let v = from_config(&config(
+            r#"echo '{"id":"a","outcome":"fail","duration_ms":7,"log":"logs/a.log"}' >> "$MQ_RESULTS"; exit 1"#,
+        ))
+        .unwrap();
+        let ran = v
+            .run(
+                &tmp.0,
+                &Selection::of([TestId::step("a")]),
+                &tmp.0.join("o"),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert_eq!(ran.results.logs[&TestId::step("a")], "logs/a.log");
+        assert_eq!(ran.results.durations_ms[&TestId::step("a")], 7);
     }
 
     #[test]
@@ -854,6 +975,41 @@ dagrun: PASS - 1 passed";
         assert!(!ran.refused());
         assert!(!ran.green());
         assert!(ran.reproduces());
+    }
+
+    #[test]
+    fn dagrun_records_step_collapsed_effective_selection() {
+        let tmp = TempDir::new("validate-dagrun-effective");
+        let script = tmp.0.join("fake-dagrun");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho '[a] ✓ PASS x (1s)'\necho '[b] ✗ FAIL y (2s, exit 1)'\nexit 1\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let cfg = ValidatorConfig {
+            kind: "dagrun".into(),
+            dag: "dag.toml".into(),
+            dagrun: script.display().to_string(),
+            ..ValidatorConfig::default()
+        };
+        let v = from_config(&cfg).unwrap();
+        let sel = Selection::of([
+            TestId::parse("a::case1").unwrap(),
+            TestId::parse("b::case2").unwrap(),
+        ]);
+        let ran = v
+            .run(&tmp.0, &sel, &tmp.0.join("o"), &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(
+            ran.effective_selection,
+            Some(Selection::of([TestId::step("a"), TestId::step("b")]))
+        );
+        assert_eq!(ran.results.durations_ms[&TestId::step("a")], 1000);
     }
 
     #[test]

@@ -784,6 +784,8 @@ mod unit {
             validation_refusals: 0,
             next_retry_at: String::new(),
             last_refusal: String::new(),
+            deciding_report: String::new(),
+            deciding_failed: vec![],
             status: ItemStatus::Queued,
             landed_as: String::new(),
             history: vec![],

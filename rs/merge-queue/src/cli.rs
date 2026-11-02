@@ -911,7 +911,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             let red = report
                 .validations
                 .iter()
-                .any(|v| !v.green && !v.refused && !v.cancelled);
+                .any(|v| !v.green() && !v.refused && !v.cancelled);
             Ok(if red || refused { 3 } else { 0 })
         }
         Command::Obligations { all, json } => {
@@ -929,11 +929,13 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                 for o in obligations {
                     let status = match &o.discharged {
                         None => "open".to_owned(),
-                        Some(d) if d.green => format!("discharged green at {}", short(&d.commit)),
+                        Some(d) if d.green() => {
+                            format!("discharged green at {}", short(&d.commit))
+                        }
                         Some(d) => format!(
                             "complete run RED at {}: {}",
                             short(&d.commit),
-                            d.failed.summary()
+                            crate::run::format_failed_results(&d.failed_results())
                         ),
                     };
                     println!(

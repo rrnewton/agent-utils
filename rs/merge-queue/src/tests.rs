@@ -31,6 +31,11 @@ impl TestId {
     }
 
     /// Parse `step` or `step::case`. Empty input and an empty step are rejected.
+    ///
+    /// ID contract: neither `step` nor `case` may contain whitespace or `#`
+    /// (those are selection/comment delimiters), and the first `::` is the
+    /// single step/case separator (a case may itself contain `::`, as in a
+    /// Rust path). See the `ResultLine` contract in `validate`.
     pub fn parse(text: &str) -> Result<Self, String> {
         let text = text.trim();
         let (step, case) = match text.split_once(CASE_SEPARATOR) {
@@ -42,6 +47,13 @@ impl TestId {
         }
         if case.is_some_and(str::is_empty) {
             return Err(format!("invalid test id {text:?}: empty case"));
+        }
+        if step.chars().any(|c| c.is_whitespace() || c == '#')
+            || case.is_some_and(|c| c.chars().any(|c| c.is_whitespace() || c == '#'))
+        {
+            return Err(format!(
+                "invalid test id {text:?}: step and case must not contain whitespace or '#' (form is `step` or `step::case`)"
+            ));
         }
         Ok(Self {
             step: step.to_owned(),
@@ -215,6 +227,17 @@ impl Outcome {
         matches!(self, Self::Fail | Self::Error | Self::Missing)
     }
 
+    /// Stable machine-facing value.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Fail => "fail",
+            Self::Skip => "skip",
+            Self::Error => "error",
+            Self::Missing => "missing",
+        }
+    }
+
     /// Parse a runner-reported outcome. Accepts common synonyms.
     pub fn parse(text: &str) -> Option<Self> {
         match text.trim().to_ascii_lowercase().as_str() {
@@ -227,16 +250,21 @@ impl Outcome {
     }
 }
 
-/// One reported test result.
+/// One reported test result: `(id, outcome, duration_ms, log)`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TestResult {
     /// Test identifier.
     pub id: TestId,
     /// Outcome.
     pub outcome: Outcome,
-    /// Wall time in milliseconds, when the runner reported it.
+    /// Wall time in milliseconds, when the runner reported it. `None` means
+    /// the runner did not report a duration (duration unavailable), not zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
+    /// Optional pointer to this test's log (a path or runner-specific
+    /// locator), when the runner reported one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log: Option<String>,
 }
 
 /// Per-test results of one validation run over one exact commit.
@@ -247,6 +275,9 @@ pub struct TestResults {
     /// Durations where known.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub durations_ms: BTreeMap<TestId, u64>,
+    /// Per-test log pointers where the runner reported them.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub logs: BTreeMap<TestId, String>,
     /// True when the runner gave no per-test attribution, so every selected test inherited the
     /// command's exit status. Bisection over such a result reruns the whole selection.
     #[serde(default)]
@@ -264,8 +295,29 @@ impl TestResults {
             *slot = result.outcome;
         }
         if let Some(ms) = result.duration_ms {
-            self.durations_ms.insert(result.id, ms);
+            self.durations_ms.insert(result.id.clone(), ms);
         }
+        if let Some(log) = result.log {
+            self.logs.insert(result.id, log);
+        }
+    }
+
+    /// One full result (outcome, duration and log pointer where known) for `id`.
+    pub fn result(&self, id: &TestId) -> Option<TestResult> {
+        self.results.get(id).map(|outcome| TestResult {
+            id: id.clone(),
+            outcome: *outcome,
+            duration_ms: self.durations_ms.get(id).copied(),
+            log: self.logs.get(id).cloned(),
+        })
+    }
+
+    /// Full results for the tests whose outcome blocks landing, in ID order.
+    pub fn failed_results(&self) -> Vec<TestResult> {
+        self.failed()
+            .iter()
+            .filter_map(|id| self.result(id))
+            .collect()
     }
 
     /// Tests that actually failed or errored (not merely unreported).
@@ -347,6 +399,9 @@ impl ValidationClaim {
 
 /// Parse a selection argument: `all`, a comma/space/newline separated list of test IDs, or
 /// `@FILE` naming a file with one test ID per line (`#` starts a comment).
+///
+/// Test IDs are `step` or `step::case`; because space and `#` are delimiters
+/// here, neither may appear inside an ID (see [`TestId::parse`]).
 pub fn parse_selection(text: &str) -> Result<Selection, String> {
     let body = if let Some(path) = text.strip_prefix('@') {
         std::fs::read_to_string(path).map_err(|error| format!("cannot read {path}: {error}"))?
@@ -410,10 +465,50 @@ mod unit {
             id: TestId::step("a"),
             outcome: Outcome::Pass,
             duration_ms: Some(5),
+            log: Some("logs/a.log".to_owned()),
         });
         results.require(&ids(&["a", "b"]));
         assert_eq!(results.failed(), [TestId::step("b")].into());
         assert!(!results.green());
+    }
+
+    #[test]
+    fn results_round_trip_keeps_outcomes_durations_and_logs() {
+        let mut results = TestResults::default();
+        results.record(TestResult {
+            id: TestId::parse("a::x").unwrap(),
+            outcome: Outcome::Fail,
+            duration_ms: Some(42),
+            log: Some("logs/a-x.log".to_owned()),
+        });
+        results.record(TestResult {
+            id: TestId::step("b"),
+            outcome: Outcome::Pass,
+            duration_ms: None,
+            log: None,
+        });
+        results.unattributed = true;
+        let json = serde_json::to_string(&results).unwrap();
+        let back: TestResults = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, results);
+        assert_eq!(
+            back.failed_results(),
+            vec![TestResult {
+                id: TestId::parse("a::x").unwrap(),
+                outcome: Outcome::Fail,
+                duration_ms: Some(42),
+                log: Some("logs/a-x.log".to_owned()),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_id_rejects_space_and_hash() {
+        assert!(TestId::parse("a b").is_err());
+        assert!(TestId::parse("a#b").is_err());
+        assert!(TestId::parse("a::b c").is_err());
+        let err = parse_selection("a::").unwrap_err();
+        assert!(err.contains("empty case"), "{err}");
     }
 
     #[test]
