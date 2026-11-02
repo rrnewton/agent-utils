@@ -21091,6 +21091,7 @@ function todoWindowHolds(at) {
 function bookmarkTarget() {
   const anchor = bookmarkAnchor();
   if (!anchor || bookmarkListRefusal(anchor) !== "") return null;
+  // Not a thread's replies a reply gathered into Main (`#410 inline-reply-editor`): the line is Main's.
   const rows = /** @type {HTMLElement[]} */ ([...el("discord-log").children])
     .filter((row) => row.hasAttribute("data-id") && !row.hasAttribute("data-card") && !fromGatheredThread(row));
   // Which row, is web/src/present/rows' `bookmarkSpot`, from what each row holds and when.
@@ -21117,8 +21118,9 @@ function placeBookmarkLine() {
   bookmarkDrawn[activeColumn.name] = target;
   if (!sideActive) adoptLegacyMarker();
   if (settled || (!target && drawn.length === 0)) return;
-  // The row's ⋯ item says what it will do: take the line away on the row right under it.
+  // The line moved, and each row's ⋯ item saying what it will do, by web/src/view/channel.
   const apply = () => drawBookmarkLine(drawn, target);
+  // The reader does not move: a line drawn or taken away above them changes the height above them.
   if (!sideActive && currentScreen === "main" && currentView === "discord") preservingScroll(apply);
   else apply();
 }
@@ -21314,12 +21316,16 @@ const BOOKMARK_CLEAR_NAME = "Remove bookmark";
 
 // The line itself, made once on its row and kept, is web/src/view/channel's (`createBookmarkLines`,
 // `#624 voice-page-modularity`); its X takes the bookmark away here.
-const { bookmarkLineOf, drawBookmarkLine } = createBookmarkLines({
+const { drawBookmarkLine } = createBookmarkLines({
   clearName: BOOKMARK_CLEAR_NAME,
   clearListener: (row, clear) => inThisColumn((event) => {
+    // The row's own tap would fold the message or read it aloud; this tap is the X's.
     if (event) event.stopPropagation();
     const focused = document.activeElement === clear;
     removeBookmark(currentChannelId());
+    // The X goes with the line, and the focus would fall to the page's top: it goes to the message the
+    // line was above, ringed, as a key or the mouse selects. Not after a tap, which selects silently
+    // (`drawnBy`) and leaves no ring.
     if (focused && drawnBy() && row.parentNode === el("discord-log") && rowShown(row)) {
       takeRow(sideActive ? sidePane : channelPane, row, true);
     }
@@ -29960,7 +29966,7 @@ const quoteOwner = createQuoting({
   queueOutgoingMessage: (send) => queueOutgoingMessage(send),
 });
 const {
-  holdQuote, noteQuoteSelection, takeQuote, placeSelectionChip, pressSelectionChip, quickReplyHolds,
+  noteQuoteSelection, takeQuote, placeSelectionChip, pressSelectionChip, quickReplyHolds,
   quickReplyListMoved, placeQuickReply, closeQuickReply, sendQuickReply,
 } = quoteOwner;
 

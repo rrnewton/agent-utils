@@ -45,7 +45,7 @@ interface HTMLLIElement {
 interface HTMLElement {
   /**
    * `#240 reading-bookmark`. The bookmark's line on the row it is drawn above, made once and kept on
-   * the row, as a collapsed run's line is. Set by voice.js (`bookmarkLineOf`).
+   * the row, as a collapsed run's line is. Set by web/src/view/channel/bookmark.ts (`bookmarkLineOf`).
    */
   bookmarkLine?: HTMLElement;
 }

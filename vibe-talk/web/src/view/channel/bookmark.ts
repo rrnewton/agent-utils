@@ -65,7 +65,7 @@ export function createBookmarkLines(deps: BookmarkLinesDependencies): BookmarkLi
     return line;
   };
 
-  /** The row's ⋯ menu item, saying what it would do there. */
+  /** The row's ⋯ item says what it will do: take the line away on the row right under it. */
   const word = (row: BookmarkedRow, above: boolean): void => {
     const item = childByClass(row, "row-bookmark-button");
     const said = above ? "Remove bookmark" : "Bookmark above";
@@ -86,7 +86,9 @@ export function createBookmarkLines(deps: BookmarkLinesDependencies): BookmarkLi
     if (line.parentNode !== target.row) {
       const row = target.row;
       const first = row.firstChild;
-      // Under a day's or a gap's line, which stands above the bookmark's.
+      // After a line between rows drawn above it (`#250 date-separators`): the bookmark is the nearer.
+      // Put in, not the row's children written again, which would take them all out of the document
+      // and back and lose the focus or the selection in any of them (see `placeSeam`).
       row.insertBefore(line, first !== null && first === row.seamLine ? first.nextSibling : first);
     }
   };

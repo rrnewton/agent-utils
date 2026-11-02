@@ -34,13 +34,19 @@ function bookmarkSpot(rows: readonly BookmarkRow[], anchor: BookmarkAnchorFacts,
   const id = String(anchor.message_id);
   let start = rows.findIndex((row) => row.ids.includes(id));
   if (start >= 0) {
+    // Below its message, after that message's row only when the message ends it. A message that has
+    // joined the row since (a combined row) is newer and may be to read, and the line cannot go
+    // inside a row: it goes above it, where it passes over nothing still to read.
     const held = (rows[start] as BookmarkRow).ids;
     if (anchor.place === "below" && held[held.length - 1] === id) start += 1;
   } else {
     const at = Date.parse(String(anchor.timestamp));
     if (!Number.isFinite(at)) return null;
+    // Older than every row is older than what is loaded, unless Hide read's list says its window
+    // reaches that far (`holdsTime`): then the message is read, and the line goes above the first row.
     const first = (rows[0] as BookmarkRow).sentMs;
     if (Number.isFinite(first) && at < first && !holdsTime(at)) return null;
+    // By each row's newest message, so a combined row that only begins before the anchor is not passed.
     start = rows.findIndex((row) => (anchor.place === "below" ? row.newestMs > at : row.newestMs >= at));
     if (start < 0) start = rows.length;
   }
