@@ -322,3 +322,38 @@ test("`#624 voice-page-modularity`: what the author filter says, from the module
   assert.equal(authorEmptyWords("theirs", true, true, hidden),
     "None of this channel's pinned messages from anyone else match that search.");
 });
+
+test("`#624 voice-page-modularity`: the kinds of link under Links and URL, kept on the device, from the module alone", () => {
+  const { LINK_KINDS, LINK_KINDS_KEY, LINK_KIND_COUNT_MAX, createLinkKinds, hiddenKindWords, linkKindCountText } = ROWS;
+  assert.deepStrictEqual(LINK_KINDS.map(({ kind }) => kind), ["pr", "commit", "action", "issue", "file", "other"]);
+  assert.deepStrictEqual([0, 7, LINK_KIND_COUNT_MAX, LINK_KIND_COUNT_MAX + 1].map(linkKindCountText), ["", "7", "99", "99+"]);
+  const counts = new Map([["pr", 2], ["commit", 0], ["action", 1], ["other", 3]]);
+  assert.equal(hiddenKindWords(new Set(), counts), "");
+  assert.equal(hiddenKindWords(new Set(["pr", "commit"]), counts), "PRs", "a kind that took nothing away was named");
+  assert.equal(hiddenKindWords(new Set(["pr", "action"]), counts), "PRs and Actions");
+  assert.equal(hiddenKindWords(new Set(["pr", "action", "other"]), counts), "PRs, Actions and Other links");
+  const kept = new Map([[LINK_KINDS_KEY, JSON.stringify(["commit", "retired", 3])]]);
+  const storage = { getItem: (key) => kept.get(key) ?? null, setItem: (key, value) => kept.set(key, value) };
+  let raw = true;
+  let refuse = false;
+  const kinds = createLinkKinds({ storage: () => storage, rawStored: () => raw,
+    keepRaw: (on) => { if (refuse) throw new Error("refused"); raw = on; } });
+  assert.deepStrictEqual([...kinds.hidden()], ["commit"], "an unknown kind was kept");
+  assert.equal(kinds.raw(), true);
+  const before = kinds.hidden();
+  kinds.setShown("other", false);
+  kinds.setShown("pr", false);
+  assert.notEqual(kinds.hidden(), before, "the set was changed in place");
+  assert.equal(kept.get(LINK_KINDS_KEY), JSON.stringify(["pr", "commit", "other"]), "not kept in the buttons' order");
+  kinds.setShown("commit", true);
+  assert.deepStrictEqual([...kinds.hidden()].sort(), ["other", "pr"]);
+  kept.set(LINK_KINDS_KEY, "not json");
+  kinds.reload();
+  assert.equal(kinds.hidden().size, 0, "a record that does not parse hid something");
+  refuse = true;
+  kinds.setRaw(false);
+  assert.equal(kinds.raw(), false, "a refused write lost the choice for this page");
+  raw = true;
+  kinds.reloadRaw();
+  assert.equal(kinds.raw(), true);
+});

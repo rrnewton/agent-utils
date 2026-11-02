@@ -91,3 +91,5 @@ export {
   authorEmptyWords,
   nextAuthorFilter,
 } from "./authorfilter.ts";
+export { LINK_KINDS, LINK_KINDS_KEY, LINK_KIND_COUNT_MAX, createLinkKinds, hiddenKindWords, linkKindCountText } from "./linkkinds.ts";
+export type { LinkKind, LinkKinds, LinkKindsDependencies } from "./linkkinds.ts";

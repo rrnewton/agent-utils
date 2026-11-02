@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 
 import { moduleForTests } from "../../../web/build.mjs";
 
-import { CHANNEL, CSS, GLYPHS, HOLD_MS, HTML_CODE, REPO, SCRIPT, SCRIPT_CODE, SETTINGS,
+import { CHANNEL, CSS, GLYPHS, HOLD_MS, HTML_CODE, PRESENT_ROWS, REPO, SCRIPT, SCRIPT_CODE, SETTINGS,
   assertMarkupContains, assistantSays, atBottomOf, backFacts, backlog, brokenModule, brokenScript,
   cssBlock, cssRules, doneButton, inReadingMode, linkPairs, linksOf, longMessage, message, newPage,
   pagedTimeline, passTime, reReadChannel, readAloudMessages, reloadWith, reopenedChannel, rowMore,
@@ -834,7 +834,7 @@ test("a link's kind is read from its address alone, and every address is of exac
       "", "not an address",
     ],
   };
-  const kinds = Array.from(newPage().pure("LINK_KINDS"), ({ kind }) => kind);
+  const kinds = Array.from(PRESENT_ROWS.LINK_KINDS, ({ kind }) => kind);
   assert.deepStrictEqual(kinds, KINDS, "the kinds are not the six, in the order the owner named them");
   assert.deepStrictEqual(Object.keys(cases), KINDS);
   // Each address is listed once, so none is expected of two kinds...
@@ -1042,7 +1042,7 @@ test("a kind turned off takes its links out of each row, and a row with none lef
 
   // THE CONTROL: a list drawn without asking which kinds are hidden fails the first step above.
   const control = await run(brokenScript(
-    "    const shown = drawn.links.filter((link) => !hiddenLinkKinds.has(link.kind));", "    const shown = drawn.links;"));
+    "    const shown = drawn.links.filter((link) => !linkKinds.hidden().has(link.kind));", "    const shown = drawn.links;"));
   await tapKind(control, "pr");
   assert.deepStrictEqual(shownHrefs(control)["860000000000000000"], [`${REPO}/pull/41`, "https://example.com/docs/design.html"],
     "the test cannot tell a hidden pull request from a shown one");
@@ -1306,7 +1306,8 @@ test("the kinds turned off are kept on this device, and with nothing kept every 
   }
 
   // THE CONTROL: with nothing written, there is nothing for the reload above to find.
-  const forgetful = newPage(new Map(), brokenScript("    deviceStorage().setItem(LINK_KINDS_KEY,", "    void (LINK_KINDS_KEY,"));
+  const forgetful = newPage(new Map(), await brokenModule([{ file: "src/present/rows/linkkinds.ts",
+    find: "        deps.storage().setItem(LINK_KINDS_KEY,", replace: "        void (LINK_KINDS_KEY," }]));
   await signIn(forgetful);
   await showDiscord(forgetful, [message({ content: `${REPO}/pull/41` })]);
   await showLinks(forgetful);

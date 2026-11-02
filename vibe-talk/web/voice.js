@@ -6637,13 +6637,13 @@ function showRowLinks(row) {
   }
   // The set itself, not its contents: `setLinkKindShown` replaces it whole on every change. And
   // `#620 link-url-chip`, drawn again when URL turns the addresses on or off.
-  if (drawn.hidden !== hiddenLinkKinds || drawn.raw !== linksRaw) {
+  if (drawn.hidden !== linkKinds.hidden() || drawn.raw !== linkKinds.raw()) {
     if (drawn.node && drawn.node.parentNode === row) row.removeChild(drawn.node);
-    const shown = drawn.links.filter((link) => !hiddenLinkKinds.has(link.kind));
-    drawn.hidden = hiddenLinkKinds;
-    drawn.raw = linksRaw;
+    const shown = drawn.links.filter((link) => !linkKinds.hidden().has(link.kind));
+    drawn.hidden = linkKinds.hidden();
+    drawn.raw = linkKinds.raw();
     drawn.count = shown.length;
-    drawn.node = shown.length > 0 ? linkList(shown, linksRaw) : null;
+    drawn.node = shown.length > 0 ? linkList(shown, linkKinds.raw()) : null;
   }
   if (drawn.node && drawn.node.parentNode !== row) placeAfterBody(row, drawn.node);
   if (drawn.count > 0) row.setAttribute("data-links-view", "true");
@@ -6786,54 +6786,17 @@ function authorEmptySentence(author, searching, pinned) {
 // always turns them off should not have to every time. With nothing kept, every kind is on; a choice
 // kept before Issues, Files and Other existed still holds, and those three start on.
 
-const LINK_KINDS_KEY = "vibe-talk.voice.hidden-link-kinds";
+// The six kinds, their words, how a count is printed, and the kinds turned off and URL, kept on this
+// device, are web/src/present/rows's (`createLinkKinds`, `#624 voice-page-modularity`); the buttons and
+// keeping the reader's place are here.
 
-/**
- * The kinds, in the order their buttons stand under Links, each with its button's id and the word
- * on it. The number of links of that kind in view is in `<chip>-count`, inside the button. `said` is
- * how a sentence names a kind whose word is not a plural of its own: "once Other links are hidden".
- * Other is last, and is what `linkKind` answers for every address no kind before it claims.
- */
-const LINK_KINDS = [
-  { kind: "pr", chip: "link-kind-pr", name: "PRs" },
-  { kind: "commit", chip: "link-kind-commit", name: "Commits" },
-  { kind: "action", chip: "link-kind-action", name: "Actions" },
-  { kind: "issue", chip: "link-kind-issue", name: "Issues" },
-  { kind: "file", chip: "link-kind-file", name: "Files" },
-  { kind: "other", chip: "link-kind-other", name: "Other", said: "Other links" },
-];
-
-/**
- * The largest number a kind's button prints; past it, the number and a plus. It keeps each button
- * short: six of them are wider than a phone once their numbers are up, and the row scrolls sideways
- * there (web/voice.css), but no one button grows past what a phone shows of it at once.
- */
-const LINK_KIND_COUNT_MAX = 99;
-
-// `linkKind`, the kind of link an address is, and the GitHub address patterns it reads are a module
-// now: web/src/foundation/ (`#624 voice-page-modularity`).
-
-/**
- * The kinds the reader has turned off. Empty, every link shows. REPLACED, never changed in place,
- * so a row's drawn list can tell it is out of date by asking whether this is the set it was drawn
- * under (`showRowLinks`).
- */
-let hiddenLinkKinds = storedHiddenLinkKinds();
-
-/**
- * What this device kept. Nothing kept is every kind on, and so is a record that does not parse;
- * a kind this page does not know is dropped, so one retired later cannot hide anything.
- */
-function storedHiddenLinkKinds() {
-  let stored = null;
-  try {
-    stored = JSON.parse(deviceStorage().getItem(LINK_KINDS_KEY) || "[]");
-  } catch (_error) {
-    stored = null;
-  }
-  const known = LINK_KINDS.map(({ kind }) => kind);
-  return new Set(Array.isArray(stored) ? stored.filter((kind) => known.includes(kind)) : []);
-}
+/** The kinds the reader turned off, and whether links are written as their addresses. */
+const linkKinds = createLinkKinds({
+  storage: () => deviceStorage(),
+  // A browser refusing storage reads as off (`DEVICE_SETTINGS.linksRaw.refused`).
+  rawStored: () => deviceSettings().get(DEVICE_SETTINGS.linksRaw),
+  keepRaw: (on) => deviceSettings().keep(DEVICE_SETTINGS.linksRaw, on),
+});
 
 /**
  * Show or hide one kind, keep the choice, and redraw what is left. A reader at the newest line is
@@ -6843,17 +6806,7 @@ function storedHiddenLinkKinds() {
  */
 function setLinkKindShown(kind, shown) {
   keepingFilterPlace(() => {
-    const hidden = new Set(hiddenLinkKinds);
-    if (shown) hidden.delete(kind);
-    else hidden.add(kind);
-    hiddenLinkKinds = hidden;
-    // In the order the buttons stand, so the same choice is always written the same way.
-    const kept = LINK_KINDS.map((entry) => entry.kind).filter((one) => hidden.has(one));
-    try {
-      deviceStorage().setItem(LINK_KINDS_KEY, JSON.stringify(kept));
-    } catch (_error) {
-      // A browser that refuses storage still honours the choice for this page.
-    }
+    linkKinds.setShown(kind, shown);
     renderLinkKinds();
     renderScrollTools();
     inOtherColumn(renderScrollTools);
@@ -6874,24 +6827,10 @@ function setLinkKindShown(kind, shown) {
 
 const LINK_RAW_KEY = DEVICE_SETTINGS.linksRaw.key;
 
-/** Whether the Links view writes each link as its address. */
-let linksRaw = storedLinksRaw();
-
-/** What this device kept: on only for the word this page writes, so anything else is off. */
-function storedLinksRaw() {
-  // A browser refusing storage reads as off (`DEVICE_SETTINGS.linksRaw.refused`).
-  return deviceSettings().get(DEVICE_SETTINGS.linksRaw);
-}
-
 /** Write the links as their addresses, or as their names, keep the choice, and redraw them. */
 function setLinksRaw(on) {
   keepingFilterPlace(() => {
-    linksRaw = on;
-    try {
-      deviceSettings().keep(DEVICE_SETTINGS.linksRaw, on);
-    } catch (_error) {
-      // A browser that refuses storage still honours the choice for this page.
-    }
+    linkKinds.setRaw(on);
     renderLinkKinds();
     renderScrollTools();
     inOtherColumn(renderScrollTools);
@@ -6910,9 +6849,9 @@ function renderLinkKinds() {
   if (up) el("screen-main").setAttribute("data-link-kinds", "");
   else el("screen-main").removeAttribute("data-link-kinds");
   for (const { kind, chip } of LINK_KINDS) {
-    el(chip).setAttribute("aria-pressed", hiddenLinkKinds.has(kind) ? "false" : "true");
+    el(chip).setAttribute("aria-pressed", linkKinds.hidden().has(kind) ? "false" : "true");
   }
-  el("link-raw").setAttribute("aria-pressed", linksRaw ? "true" : "false");
+  el("link-raw").setAttribute("aria-pressed", linkKinds.raw() ? "true" : "false");
 }
 
 /**
@@ -6923,9 +6862,7 @@ function renderLinkKinds() {
  */
 function renderLinkKindCounts(kinds) {
   for (const { kind, chip } of LINK_KINDS) {
-    const count = kinds.get(kind) || 0;
-    el(`${chip}-count`).textContent =
-      count === 0 ? "" : count > LINK_KIND_COUNT_MAX ? `${LINK_KIND_COUNT_MAX}+` : String(count);
+    el(`${chip}-count`).textContent = linkKindCountText(kinds.get(kind) || 0);
   }
 }
 
@@ -6937,9 +6874,7 @@ function renderLinkKindCounts(kinds) {
  * plural — Other is said as "Other links" — so "are" and "them" fit whichever it is.
  */
 function hiddenKindNames(counts) {
-  const names = LINK_KINDS.filter(({ kind }) => hiddenLinkKinds.has(kind) && counts.get(kind) > 0)
-    .map(({ name, said }) => said || name);
-  return names.length < 2 ? names.join("") : `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+  return hiddenKindWords(linkKinds.hidden(), counts);
 }
 
 /**
@@ -23760,7 +23695,7 @@ const SEARCH_OLDER_TAP_MS = 500;
 
 /** Everything a walk for the search depends on: a change in any of them ends it, and clears its note. */
 const searchKey = () => JSON.stringify([filterKey(), searchOpen ? searchIdentity(searchQuery) : null, searchOpen && linksOnly,
-  [...hiddenLinkKinds], authorChoosing(), readModes.mode()]);
+  [...linkKinds.hidden()], authorChoosing(), readModes.mode()]);
 
 /**
  * Whether the step back of the column being worked on offers to search further back: a filter choosing
@@ -36630,14 +36565,14 @@ function applySyncedSetting(key) {
         break;
       case RELAY_KEY: renderReadNew(); break;
       case LINK_KINDS_KEY:
-        hiddenLinkKinds = storedHiddenLinkKinds();
+        linkKinds.reload();
         renderLinkKinds();
         break;
       case LINK_RAW_KEY:
         // As a press here does: the reader's message kept where it is while every link's height
         // changes under it.
         keepingFilterPlace(() => {
-          linksRaw = storedLinksRaw();
+          linkKinds.reloadRaw();
           renderLinkKinds();
           if (searchOpen && linksOnly) eachColumn(renderScrollTools);
         });
@@ -38094,10 +38029,10 @@ el("links-filter").addEventListener("click", () => setLinksOnly(!linksOnly));
 el("author-filter").addEventListener("click", cycleAuthorFilter);
 // `#212 link-filter`. And each kind of link under it, a toggle of its own.
 for (const { kind, chip } of LINK_KINDS) {
-  el(chip).addEventListener("click", () => setLinkKindShown(kind, hiddenLinkKinds.has(kind)));
+  el(chip).addEventListener("click", () => setLinkKindShown(kind, linkKinds.hidden().has(kind)));
 }
 // `#620 link-url-chip`. URL, first in that row: addresses or names.
-el("link-raw").addEventListener("click", () => setLinksRaw(!linksRaw));
+el("link-raw").addEventListener("click", () => setLinksRaw(!linkKinds.raw()));
 // `#266 link-filter-kinds`. The row of six scrolls sideways on a phone, and a browser scrolls it to a
 // button taking the focus only when none of that button shows: one cut off at the row's end stayed cut
 // off under Tab. So the button the focus reaches is brought wholly into the row, by Tab or by a tap.
