@@ -2,6 +2,7 @@
 title: 'chat-health-wrong-registry: chat health resolves the bridge''s target in the caller''s registry and reports a false DOWN'
 status: open
 priority: 2
+assignee: cl-start@devbig030
 issue_type: bug
 labels:
 - agentctl
