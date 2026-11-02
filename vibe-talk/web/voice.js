@@ -23454,8 +23454,9 @@ function countSearchWalk(walk) {
 }
 
 /**
- * What a walk that has ended says under its control (web/src/present/notices `searchWalkWords`, which
- * says why it always says something), from this page's service name, budget and oldest row.
+ * What a walk that has ended says under its control: see the head of this section, and
+ * web/src/present/notices `searchWalkWords`, which says why it always says something; from this page's
+ * service name, budget and oldest row.
  *
  * @param {any} walk
  * @param {string} reason
