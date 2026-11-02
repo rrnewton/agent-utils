@@ -918,6 +918,9 @@ struct Revive {
     /// Start a fresh conversation instead of resuming the recorded one (Claude Code only: agentctl chooses the new session ID); for an agent whose conversation is lost or no longer wanted. Applies only to a named revive
     #[arg(long, requires = "name", conflicts_with = "dry_run")]
     fresh: bool,
+    /// Revive a record that `stop` archived: restore the newest archived generation, then revive it. Applies only to a named revive
+    #[arg(long, requires = "name")]
+    archived: bool,
     /// Startup-readiness deadline in seconds, greater than 0 and at most 300 (default: 30)
     #[arg(long, default_value = "30", value_parser = startup_seconds, value_name = "SECONDS")]
     startup_timeout: f64,
@@ -3758,6 +3761,16 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             let timeout = Duration::from_secs_f64(value.startup_timeout);
             let mut result = if value.all {
                 manager.revive_all(value.dry_run, timeout)?
+            } else if value.archived {
+                manager.revive_archived(
+                    value
+                        .name
+                        .as_deref()
+                        .expect("clap requires NAME with --archived"),
+                    value.dry_run,
+                    value.expected_token.as_deref(),
+                    timeout,
+                )?
             } else if value.fresh {
                 let name = value
                     .name

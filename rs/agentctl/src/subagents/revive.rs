@@ -186,6 +186,31 @@ fn discover_codex_in(sessions: &Path, record: &AgentRecord) -> Option<NativeSess
     best.map(|(_, value)| NativeSession::new("codex", &value, "observed"))
 }
 
+/// Newest `archive/<name>-<token>` directory for `name`, by modification time (#741).
+pub(super) fn newest_archive(archive: &Path, name: &str) -> Option<PathBuf> {
+    let prefix = format!("{name}-");
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in fs::read_dir(archive).ok()?.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !file_name.starts_with(&prefix) {
+            continue;
+        }
+        let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(t, _)| mtime > *t) {
+            best = Some((mtime, path));
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
 #[cfg(test)]
 pub(super) fn fail_once(point: &'static str) {
     FAILURE_POINT.set(Some(point));
@@ -1878,6 +1903,38 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         Ok(())
     }
 
+    /// Revive a record `stop` archived (#741): restore the newest `archive/<name>-<token>`
+    /// directory as the live record, mark it running, then revive it. A live record wins.
+    pub fn revive_archived(
+        &self,
+        agent_name: &str,
+        dry_run: bool,
+        expected_token: Option<&str>,
+        startup_timeout: Duration,
+    ) -> Result<Value> {
+        if self.read_record(agent_name).is_ok() {
+            return self.revive(agent_name, dry_run, expected_token, startup_timeout);
+        }
+        let archive = self.registry.join("archive");
+        let archived = newest_archive(&archive, agent_name).ok_or_else(|| {
+            fail(format!(
+                "unknown agent {agent_name:?}; no archived record either"
+            ))
+        })?;
+        if dry_run {
+            return Ok(
+                json!({"name": agent_name, "archived": archived, "action": "revive",
+                "detail": "archived record would be restored and revived"}),
+            );
+        }
+        let destination = self.directory(agent_name)?;
+        fs::rename(&archived, &destination).map_err(|e| fail(e.to_string()))?;
+        let mut record = self.read_record(agent_name)?;
+        record.lifecycle = "running".to_owned();
+        self.save(&record)?;
+        self.revive(agent_name, dry_run, expected_token, startup_timeout)
+    }
+
     /// Plan or recover one dead, owned interactive generation without replaying its queue.
     pub fn revive(
         &self,
@@ -2842,6 +2899,22 @@ mod discovery_tests {
             got.map(|s| s.value).as_deref(),
             Some("11111111-1111-1111-1111-111111111111")
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn newest_archive_picks_latest_for_name() {
+        let root = std::env::temp_dir().join(format!("arch-{}", std::process::id()));
+        fs::create_dir_all(root.join("lane-tok1")).unwrap();
+        fs::create_dir_all(root.join("lane-tok2")).unwrap();
+        fs::create_dir_all(root.join("other-tok")).unwrap();
+        let got = newest_archive(&root, "lane");
+        assert!(got.is_some_and(|p| p
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("lane-tok")));
+        assert!(newest_archive(&root, "missing").is_none());
         let _ = fs::remove_dir_all(&root);
     }
     #[test]
