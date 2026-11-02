@@ -110,6 +110,115 @@ pub fn complete_blocks(text: &str) -> Vec<ReplyBlock> {
     blocks
 }
 
+/// Stateful removal of complete reply blocks across successive text
+/// chunks (#714): a block split over several assistant text events, a
+/// closing marker inside a code fence, or a quoted marker all follow the
+/// same rules as [`complete_blocks`]. Text outside complete blocks is
+/// returned; an unclosed block's text is held until [`finish`](Self::finish).
+#[derive(Debug, Default)]
+pub struct OutsideBlocks {
+    outside_fence: Option<(char, usize)>,
+    open: Option<Open>,
+}
+
+/// A reply block being read across chunks: its ID, its lines, its open fence.
+#[derive(Debug)]
+struct Open {
+    identifier: String,
+    lines: Vec<String>,
+    fence: Option<(char, usize)>,
+}
+
+impl OutsideBlocks {
+    /// A fresh stripper with no block open.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed one chunk; returns its text outside complete reply blocks.
+    /// Fence state outside a block resets at each chunk, matching
+    /// [`complete_blocks`] per chunk; only an open block carries over.
+    pub fn feed(&mut self, text: &str) -> String {
+        if self.open.is_none() {
+            self.outside_fence = None;
+        }
+        let mut out: Vec<&str> = Vec::new();
+        for line in text.split('\n') {
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            if let Some(open) = self.open.as_mut() {
+                if let Some(run) = open.fence {
+                    if closes(line, run) {
+                        open.fence = None;
+                    }
+                    open.lines.push(line.to_owned());
+                    continue;
+                }
+                if marker(line, true) == Some(open.identifier.as_str()) {
+                    self.open = None;
+                    continue;
+                }
+                if let Some(next) = marker(line, false) {
+                    self.open = Some(Open {
+                        identifier: next.to_owned(),
+                        lines: Vec::new(),
+                        fence: None,
+                    });
+                    continue;
+                }
+                open.fence = fence(line);
+                open.lines.push(line.to_owned());
+                continue;
+            }
+            if let Some(run) = self.outside_fence {
+                out.push(line);
+                if closes(line, run) {
+                    self.outside_fence = None;
+                }
+                continue;
+            }
+            // A closing marker with no open block: the block began in an
+            // earlier chunk the reply path holds, so drop this chunk's
+            // text up to and including the marker.
+            if marker(line, true).is_some() {
+                out.clear();
+                continue;
+            }
+            // A line merely containing a tag (inline or orphan) is not a
+            // proper marker line; the screen path treats it as a reply to
+            // resend, so it must not be traced as well.
+            if (line.contains("<CHAT_REPLY_") || line.contains("</CHAT_REPLY_"))
+                && marker(line, false).is_none()
+            {
+                continue;
+            }
+            if let Some(identifier) = marker(line, false) {
+                self.open = Some(Open {
+                    identifier: identifier.to_owned(),
+                    lines: Vec::new(),
+                    fence: None,
+                });
+            } else {
+                out.push(line);
+                if let Some(run) = fence(line) {
+                    self.outside_fence = Some(run);
+                }
+            }
+        }
+        out.join("\n")
+    }
+
+    /// End of input: an unclosed block is not complete; its held text is
+    /// dropped (returned here only so the caller can count the drop),
+    /// because the block may still be completed and posted as a reply.
+    pub fn finish(&mut self) -> String {
+        match self.open.take() {
+            Some(open) => open.lines.join("\n"),
+            None => String::new(),
+        }
+    }
+}
+
 /// `lines` without the blank lines at either end and without their shared indentation.
 fn dedent(lines: &[&str]) -> String {
     let first = lines.iter().position(|line| !line.trim().is_empty());
@@ -423,5 +532,42 @@ mod tests {
         );
         assert_eq!(without_link_targets("a](b"), "a](b");
         assert_eq!(without_link_targets("[x](y)\n[z](w\n)"), "[x]\n[z](w\n)");
+    }
+}
+
+#[cfg(test)]
+mod outside_tests {
+    use super::*;
+
+    #[test]
+    fn outside_blocks_matches_complete_blocks_and_drops_unclosed() {
+        let mut stripper = OutsideBlocks::new();
+        // Split across chunks, quoted marker in a fence, unclosed at end.
+        assert_eq!(stripper.feed("before\n<CHAT_REPLY_1>\npost"), "before");
+        assert_eq!(stripper.feed("ed\n</CHAT_REPLY_1>\nafter"), "after");
+        assert_eq!(
+            stripper.feed("```\n<CHAT_REPLY_2>\n```\nplain"),
+            "```\n<CHAT_REPLY_2>\n```\nplain"
+        );
+        stripper.feed("<CHAT_REPLY_3>\nheld");
+        assert_eq!(stripper.finish(), "held");
+        // A new chunk after an unbalanced fence still sees real blocks,
+        // because outside fence state resets per chunk.
+        let mut stripper = OutsideBlocks::new();
+        stripper.feed("```\nunclosed fence");
+        assert_eq!(stripper.feed("<CHAT_REPLY_4>\nx\n</CHAT_REPLY_4>"), "");
+        // Inline tags are dropped, not traced: the lines between an
+        // inline opener and its closing marker are the reply, not trace.
+        let mut stripper = OutsideBlocks::new();
+        assert_eq!(
+            stripper.feed("note <CHAT_REPLY_5>Done, merged.\nmore\n</CHAT_REPLY_5>"),
+            ""
+        );
+        // An orphan closing marker drops the chunk text before it.
+        let mut stripper = OutsideBlocks::new();
+        assert_eq!(
+            stripper.feed("tail of a reply\n</CHAT_REPLY_6>\nkept"),
+            "kept"
+        );
     }
 }

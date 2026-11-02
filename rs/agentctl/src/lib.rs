@@ -15,6 +15,7 @@ pub(crate) mod chat_launch;
 pub mod chat_lookup;
 pub mod chat_runtime;
 pub mod chat_service;
+pub mod chat_trace;
 mod chat_transcript;
 pub mod cli;
 pub mod client;

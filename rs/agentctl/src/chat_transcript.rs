@@ -110,6 +110,10 @@ pub(crate) struct CoordinatorTranscript {
     blocks: VecDeque<TranscriptBlock>,
     bytes: usize,
     waited: VecDeque<String>,
+    events: VecDeque<Event>,
+    collect_events: bool,
+    trace: bool,
+    ever_opened: bool,
 }
 
 impl fmt::Debug for CoordinatorTranscript {
@@ -136,6 +140,10 @@ impl CoordinatorTranscript {
             blocks: VecDeque::new(),
             bytes: 0,
             waited: VecDeque::new(),
+            events: VecDeque::new(),
+            collect_events: false,
+            trace: false,
+            ever_opened: false,
         }
     }
 
@@ -183,6 +191,15 @@ impl CoordinatorTranscript {
         }
     }
 
+    /// Follow a transcript for the trace (#714): collect every event, and
+    /// start at the end of the file so old text is never replayed.
+    pub(crate) fn for_agent_trace(registry: PathBuf, name: String, log: Log) -> Self {
+        let mut source = Self::new(Box::new(move || record_hints(&registry, &name)), log);
+        source.collect_events = true;
+        source.trace = true;
+        source
+    }
+
     fn report(&mut self, line: String) {
         if self.reported.as_deref() != Some(line.as_str()) {
             (self.log)(line.clone());
@@ -218,8 +235,12 @@ impl CoordinatorTranscript {
             });
         let Some((reader, found, discovered, bind)) = found else {
             self.follower = None;
-            let line = "agentctl: no transcript of the coordinator was found; replies keep the \
-                        text read from its screen";
+            let line = if self.trace {
+                "agentctl: no transcript of the coordinator was found; the trace is idle"
+            } else {
+                "agentctl: no transcript of the coordinator was found; replies keep the \
+                        text read from its screen"
+            };
             self.share(ReplySource {
                 evidence: "no transcript of the coordinator was found: its record names no \
                            conversation or process that finds one, and none was discovered"
@@ -242,11 +263,16 @@ impl CoordinatorTranscript {
         {
             return;
         }
-        self.follower = Some(Follower::open(
-            &found.path,
-            reader.decoder(),
-            FIRST_READ_BYTES,
-        ));
+        // Only the trace's first open starts at EOF; later opens (a new
+        // session file, a reopen after an error) reread the tail, and the
+        // trace's high-water mark filters what it has already posted.
+        let tail = if self.trace && !self.ever_opened {
+            0
+        } else {
+            FIRST_READ_BYTES
+        };
+        self.ever_opened = true;
+        self.follower = Some(Follower::open(&found.path, reader.decoder(), tail));
         self.report(format!(
             "agentctl: reply text comes from the coordinator's {} transcript {} ({}{})",
             reader.name(),
@@ -272,13 +298,23 @@ impl CoordinatorTranscript {
                 let path = follower.path().display().to_string();
                 self.follower = None;
                 self.report(format!(
-                    "agentctl: the coordinator's transcript {path} cannot be read ({error}); \
-                     replies keep the text read from its screen"
+                    "agentctl: the coordinator's transcript {path} cannot be read ({error}); {}",
+                    if self.trace {
+                        "the trace is idle"
+                    } else {
+                        "replies keep the text read from its screen"
+                    }
                 ));
                 return;
             }
         };
         for event in events {
+            if self.collect_events {
+                self.events.push_back(event.clone());
+                while self.events.len() > 1024 {
+                    self.events.pop_front();
+                }
+            }
             let Event::Text { at, text } = event else {
                 continue;
             };
@@ -302,6 +338,12 @@ impl CoordinatorTranscript {
             };
             self.bytes = self.bytes.saturating_sub(oldest.body.len());
         }
+    }
+
+    /// Drain the transcript events read since the last call (#714).
+    pub(crate) fn events(&mut self) -> Vec<Event> {
+        self.poll();
+        self.events.drain(..).collect()
     }
 
     fn holds(&self, identifier: &str) -> bool {
@@ -613,6 +655,35 @@ mod tests {
         let logged = logs.lock().unwrap().clone();
         assert_eq!(logged.len(), 2, "{logged:?}");
         assert!(logged[1].contains("cannot be read"), "{logged:?}");
+        fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn events_are_collected_only_for_the_trace() {
+        let home = scratch("events");
+        let project = home.join(".claude/projects/-work");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(
+            project.join("s-1.jsonl"),
+            entry("hello", "2026-10-30T12:00:00Z"),
+        )
+        .unwrap();
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        // The reply path collects no events (flag off is unchanged).
+        let mut reply_source = source_for(home.clone(), Arc::clone(&logs));
+        assert!(reply_source.events().is_empty());
+        // The trace source collects them, starting at EOF on first read is
+        // covered by the follower tail; here the file predates the open.
+        let mut trace_source = source_for(home.clone(), Arc::clone(&logs));
+        trace_source.collect_events = true;
+        trace_source.trace = true;
+        // Tail 0: nothing that predates the open is replayed.
+        assert!(trace_source.events().is_empty());
+        let path = project.join("s-1.jsonl");
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(entry("later", "2026-10-30T12:00:01Z").as_bytes())
+            .unwrap();
+        assert!(!trace_source.events().is_empty());
         fs::remove_dir_all(home).ok();
     }
 

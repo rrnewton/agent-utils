@@ -232,6 +232,10 @@ pub struct ServiceOptions {
     /// and again every as long until it is delivered; `None` never warns. See
     /// [`owner_alarm`]. `chat run` defaults to [`owner_alarm::DEFAULT_AFTER`].
     pub owner_alarm_after: Option<Duration>,
+    /// Post non-reply transcript text to a trace thread (#714 chat-transcript-primary).
+    pub trace_thread: bool,
+    /// Coalescing window for trace text.
+    pub trace_window: Duration,
 }
 
 /// When `chat run` tries again to type the prompts of requests it has admitted, and when it
@@ -657,6 +661,288 @@ pub fn publish(
         receipt["thread_id"] = json!(thread);
     }
     Ok(receipt)
+}
+
+/// The trace driver (#714 chat-transcript-primary): read the agent's
+/// transcript, and post its non-reply text to one trace thread per ET day.
+/// The root's thread id lives in `<state>/trace/trace-thread.json`, and
+/// per-turn metrics in `<state>/trace/metrics.jsonl`. Text is held (never
+/// spilled to the channel) while no trace thread exists, posts are rate
+/// capped, and only events newer than the persisted high-water mark and
+/// the process start are posted, so a restart never replays old text.
+#[allow(clippy::too_many_arguments)]
+fn spawn_trace_driver(
+    state_root: &Path,
+    registry: PathBuf,
+    agent: String,
+    channel: String,
+    window: Duration,
+    stop: Arc<StopState>,
+) {
+    let root_dir = state_root.to_path_buf();
+    std::thread::spawn(move || {
+        let dir = root_dir.join("trace");
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            service_log(format!("agentctl: trace state dir failed: {e}"));
+            return;
+        }
+        let started = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0.0, |d| d.as_secs_f64());
+        let mut high_water: f64 = std::fs::read(dir.join("trace-thread.json"))
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok())
+            .and_then(|v| v["high_water"].as_f64())
+            .unwrap_or(0.0);
+        let mut source = crate::chat_transcript::CoordinatorTranscript::for_agent_trace(
+            registry,
+            agent.clone(),
+            Box::new(service_log),
+        );
+        let mut collector = crate::chat_trace::Collector::new(window);
+        let mut budget = crate::chat_trace::RateBudget::new(8);
+        let mut held: Vec<(crate::chat_trace::TracePost, Option<String>)> = Vec::new();
+        let mut next_post_try = 0.0f64;
+        let mut thread: Option<String> = None;
+        let mut thread_date = String::new();
+        let mut next_root_try = 0.0f64;
+        let mut thread_gone_roots: Vec<f64> = Vec::new();
+        let mut roots_day = String::new();
+        let mut trace_stopped = false;
+        let mut logged_kinds: std::collections::BTreeSet<String> = Default::default();
+        let mut replacement_root = false;
+        while !stop.is_stopped() {
+            let mut posts = Vec::new();
+            // Compare against the mark from before this poll, and advance
+            // it only on Text, so same-timestamp blocks are not dropped.
+            let poll_mark = high_water;
+            for event in source.events() {
+                if matches!(event, agent_harness::Event::Text { .. }) {
+                    if !crate::chat_trace::is_new(event.at(), poll_mark, started) {
+                        continue;
+                    }
+                    if let Some(at) = event.at() {
+                        high_water = high_water.max(at);
+                    }
+                }
+                posts.extend(collector.feed(&event));
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0.0, |d| d.as_secs_f64());
+            posts.extend(collector.tick(now));
+            for m in collector.take_metrics() {
+                let line = serde_json::json!({"posts": m.posts, "bytes": m.bytes, "drops": m.drops, "first_post_latency_secs": m.first_post_latency_secs});
+                let _ = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(dir.join("metrics.jsonl"))
+                    .and_then(|mut f| {
+                        std::io::Write::write_all(&mut f, format!("{line}\n").as_bytes())
+                    });
+            }
+            held.extend(posts.into_iter().map(|post| (post, None)));
+            {
+                let dropped = crate::chat_trace::cap_held(&mut held, 64);
+                if dropped > 0 {
+                    service_log(format!(
+                        "agentctl: trace held cap reached; dropped {dropped} oldest post(s)"
+                    ));
+                    // The note goes on a post with no UUID yet (or on its
+                    // own), never changing text a UUID already names, and
+                    // replaces any earlier note on that post.
+                    match held.iter_mut().find(|(_, uuid)| uuid.is_none()) {
+                        Some((first, _)) => {
+                            first.text = crate::chat_trace::note_omission(&first.text, dropped);
+                        }
+                        None => held.insert(
+                            0,
+                            (
+                                crate::chat_trace::TracePost {
+                                    text: format!("[{dropped} trace posts omitted]"),
+                                },
+                                None,
+                            ),
+                        ),
+                    }
+                }
+            }
+            let today = crate::chat_trace::et_date(now);
+            if thread_date != today {
+                thread = None;
+                thread_date = today.clone();
+                if let Ok(raw) = std::fs::read(dir.join("trace-thread.json")) {
+                    if let Ok(saved) = serde_json::from_slice::<serde_json::Value>(&raw) {
+                        if saved["date"].as_str() == Some(today.as_str()) {
+                            thread = saved["thread_id"].as_str().map(str::to_owned);
+                        }
+                    }
+                }
+            }
+            let write_state = |dir: &Path, today: &str, tid: &str, high_water: f64| {
+                let saved =
+                    serde_json::json!({"date": today, "thread_id": tid, "high_water": high_water});
+                let tmp = dir.join("trace-thread.json.tmp");
+                std::fs::write(&tmp, saved.to_string())
+                    .and_then(|()| std::fs::rename(&tmp, dir.join("trace-thread.json")))
+            };
+            if trace_stopped {
+                held.clear();
+            }
+            let want_root =
+                thread.is_none() && !held.is_empty() && now >= next_root_try && !trace_stopped;
+            let root_allowed = if !want_root {
+                false
+            } else if replacement_root {
+                if roots_day != today {
+                    roots_day = today.clone();
+                    thread_gone_roots.clear();
+                }
+                let recent = thread_gone_roots
+                    .iter()
+                    .filter(|t| now - **t < 600.0)
+                    .count();
+                if recent >= 1 || thread_gone_roots.len() >= 3 {
+                    service_log(
+                        "agentctl: trace stopped: too many replacement roots after thread loss"
+                            .to_owned(),
+                    );
+                    trace_stopped = true;
+                    false
+                } else if budget.take(now) {
+                    thread_gone_roots.push(now);
+                    true
+                } else {
+                    next_root_try = now + 10.0;
+                    false
+                }
+            } else {
+                budget.take(now)
+            };
+            if root_allowed {
+                let uuid = crate::chat_runtime::random_operation_uuid()
+                    .unwrap_or_else(|_| "trace-root".to_owned());
+                match publish(
+                    &root_dir,
+                    &channel,
+                    None,
+                    &uuid,
+                    &format!("{agent} main session trace, {today} ET"),
+                    None,
+                ) {
+                    Ok(receipt) => {
+                        let mid = receipt["receipt"]["message_id"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_owned();
+                        let tid = crate::chat_trace::trace_thread_id(&channel, &mid);
+                        match write_state(&dir, &today, &tid, high_water) {
+                            Ok(()) => {
+                                thread = Some(tid);
+                                replacement_root = false;
+                            }
+                            Err(e) => {
+                                service_log(format!("agentctl: trace state write failed: {e}"));
+                                next_root_try = now + 30.0;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        service_log(format!("agentctl: trace root failed (holding text): {e}"));
+                        next_root_try = now + 30.0;
+                    }
+                }
+            }
+            if thread.is_some() && now >= next_post_try {
+                let pending = std::mem::take(&mut held);
+                let mut rest = Vec::new();
+                let mut failed = false;
+                for (post, uuid) in pending {
+                    if failed || !budget.take(now) {
+                        rest.push((post, uuid));
+                        continue;
+                    }
+                    // One UUID per post across retries: publish is
+                    // idempotent per request id, so a timed-out post that
+                    // actually landed is never duplicated.
+                    let uuid = uuid.unwrap_or_else(|| {
+                        crate::chat_runtime::random_operation_uuid()
+                            .unwrap_or_else(|_| "trace-post".to_owned())
+                    });
+                    match publish(
+                        &root_dir,
+                        &channel,
+                        thread.as_deref(),
+                        &uuid,
+                        &post.text,
+                        None,
+                    ) {
+                        Ok(_) => {
+                            if let Some(tid) = thread.as_deref() {
+                                let _ = write_state(&dir, &thread_date.clone(), tid, high_water);
+                            }
+                        }
+                        Err(e) => {
+                            let action = match &e {
+                                ChatServiceError::Outbound(f) => {
+                                    crate::chat_trace::classify_failure(
+                                        &f.code,
+                                        &f.detail,
+                                        f.outcome
+                                            == crate::chat_runtime::OutboundOutcome::NotApplied,
+                                        f.retryable,
+                                    )
+                                }
+                                _ => crate::chat_trace::PostFailure::Retry,
+                            };
+                            match action {
+                                crate::chat_trace::PostFailure::Drop => {
+                                    service_log(format!(
+                                        "agentctl: trace post dropped (cannot succeed): {e}"
+                                    ));
+                                }
+                                crate::chat_trace::PostFailure::ThreadGone => {
+                                    service_log(format!(
+                                        "agentctl: trace thread is gone ({e}); clearing it for a fresh root"
+                                    ));
+                                    let _ = std::fs::remove_file(dir.join("trace-thread.json"));
+                                    thread = None;
+                                    thread_date = String::new();
+                                    next_root_try = 0.0;
+                                    replacement_root = true;
+                                    // thread_not_found is provably not
+                                    // applied, and the old UUID is tied to
+                                    // the old thread in the helper ledger,
+                                    // so this post gets a fresh UUID.
+                                    rest.push((post, None));
+                                    failed = true;
+                                }
+                                crate::chat_trace::PostFailure::Retry => {
+                                    if let ChatServiceError::Outbound(f) = &e {
+                                        if logged_kinds.insert(f.code.clone()) {
+                                            service_log(format!(
+                                                "agentctl: trace posts failing with {} (holding, retrying): {e}",
+                                                f.code
+                                            ));
+                                        }
+                                    } else {
+                                        service_log(format!(
+                                            "agentctl: trace post failed (holding rest): {e}"
+                                        ));
+                                    }
+                                    rest.push((post, Some(uuid)));
+                                    failed = true;
+                                    next_post_try = now + 10.0;
+                                }
+                            }
+                        }
+                    }
+                }
+                held = rest;
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    });
 }
 
 /// Close capture for one exact request and durably retire it when terminal and replay-safe.
@@ -1166,6 +1452,8 @@ pub struct RunSettings {
     /// as [`BridgeState::with_reply_command_offered`] describes. The service listens on the state
     /// directory's wake socket either way: see [`listens_for_reply_wakes`].
     pub offer_reply_command: bool,
+    /// Channel for the trace thread root; required with --trace-thread.
+    pub trace_channel: Option<String>,
     /// Clear a draft left in the coordinator's composer once it has held a request and stayed
     /// unchanged this long, as [`crate::stale_composer`] describes; `None`, the default, never
     /// clears one.
@@ -1453,6 +1741,29 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
         ack_queue: ack_queue.clone(),
         ..StopState::default()
     });
+    if options.trace_thread {
+        let channel = settings.trace_channel.clone().ok_or_else(|| {
+            ChatServiceError::Generation("--trace-thread requires --trace-channel".to_owned())
+        })?;
+        if state.config().is_relay_channel(&channel) {
+            return Err(ChatServiceError::Generation(
+                "--trace-channel names a relay channel; refusing to trace there".to_owned(),
+            ));
+        }
+        if !state.config().channel_ids.iter().any(|c| c == &channel) {
+            return Err(ChatServiceError::Generation(
+                "--trace-channel is outside the configured channel_ids".to_owned(),
+            ));
+        }
+        spawn_trace_driver(
+            state_root,
+            manager.registry().to_path_buf(),
+            state.config().agent_name.clone(),
+            channel,
+            options.trace_window,
+            Arc::clone(&stop),
+        );
+    }
     let cancellation: SharedCancellation =
         Arc::new(Mutex::new(ProviderCancellationRegistry::default()));
     let _ = state.fold_latency_summaries_public();
@@ -13686,6 +13997,8 @@ esac
                     timing,
                     idle_poll_interval: TEST_IDLE_POLL_INTERVAL.with(Cell::get),
                     owner_alarm_after: None,
+                    trace_thread: false,
+                    trace_window: Duration::from_secs(45),
                 },
                 &stop,
                 &cancellation,
@@ -16779,6 +17092,8 @@ esac
                     timing: DeliveryTiming::default(),
                     idle_poll_interval: IDLE_SATURATED_POLL_INTERVAL,
                     owner_alarm_after: None,
+                    trace_thread: false,
+                    trace_window: Duration::from_secs(45),
                 },
             )
             .expect("tick");
@@ -16803,6 +17118,8 @@ esac
             timing: DeliveryTiming::default(),
             idle_poll_interval: IDLE_SATURATED_POLL_INTERVAL,
             owner_alarm_after: None,
+            trace_thread: false,
+            trace_window: Duration::from_secs(45),
         }
     }
 

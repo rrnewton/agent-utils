@@ -2025,6 +2025,15 @@ struct ChatRun {
     /// Print an `agentctl chat reply` command in each request prompt that gives the two reply marker lines, as a way to send a reply at once (default: off). A prompt leaves the command out when no file is left at this executable's path or a word of the command cannot be printed safely. With or without this option, a service with outbound replies enabled listens for that command's wakes on the state directory's .wake.sock, unless the socket's absolute path exceeds 107 bytes. The agent must be able to run this executable and write the state directory; applies only to this run.
     #[arg(long)]
     offer_reply_command: bool,
+    /// Post the agent's non-reply transcript text to one trace thread (#714 chat-transcript-primary): one root per day in the bridge channel, trace text as replies in it (default: off). Fenced replies are unchanged.
+    #[arg(long, requires = "trace_channel")]
+    trace_thread: bool,
+    /// Channel for the --trace-thread root post. Required with --trace-thread; a relay channel is refused.
+    #[arg(long, value_name = "CHANNEL", requires = "trace_thread")]
+    trace_channel: Option<String>,
+    /// Seconds trace text coalesces before posting with --trace-thread (default: 45).
+    #[arg(long, value_name = "SECONDS", default_value = "45")]
+    trace_window: u64,
     /// Also type a request into the coordinator's pane while Herdr reports it `working`, whichever of Claude Code, Codex or Muse runs there, and retry a request left waiting every 10 seconds while it works (default: off, which leaves Claude Code waiting for `idle` or `done` and holds every retry until then). Claude Code queues the prompt behind the current turn. Codex and Muse take a new request's prompt during a turn even without this option, as a steer of the running turn (Muse: pasted into its empty editor, where Enter steers the turn, proved by the new user turn). In every harness the composer must be empty first, and the submission must be verified: the prompt leaves the composer, with Claude Code's queued-message hint, the new user turn or the prompt shown, and an Enter the harness drops is pressed again with a doubling wait. A prompt it never accepts is taken back out of the composer and stays pending. Slash commands and unsupported harnesses still wait; applies only to this run.
     #[arg(long)]
     deliver_while_working: bool,
@@ -2094,6 +2103,9 @@ impl ChatOperate {
             idle_poll_interval: crate::chat_service::IDLE_SATURATED_POLL_INTERVAL,
             // `chat run` sets this from its own flag.
             owner_alarm_after: None,
+            // `chat run` sets these from its own flags.
+            trace_thread: false,
+            trace_window: Duration::from_secs(45),
         }
     }
 }
@@ -4966,6 +4978,9 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
             let mut options = value.operate.options();
             options.delivery.deliver_while_working = value.deliver_while_working;
             options.owner_alarm_after = value.owner_alarm_after.0;
+            options.trace_thread = value.trace_thread;
+
+            options.trace_window = Duration::from_secs(value.trace_window);
             let client =
                 HerdrClient::with_executable("direct", &herdr_bin).map_err(AgentError::from)?;
             // A person's messages go ahead of agent-to-agent sends (#556 chat-delivery-latency).
@@ -4978,6 +4993,7 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
                 crate::chat_service::RunSettings {
                     ignored_text_prefixes: value.ignored_text_prefixes,
                     offer_reply_command: value.offer_reply_command,
+                    trace_channel: value.trace_channel,
                     stale_composer_clear_after: value.stale_composer_clear_after,
                     stall_restart_after: value.stall_restart_after.0,
                     hold_replies_older_than: value.hold_replies_older_than.0,
