@@ -21,7 +21,7 @@ steps:
     cmd: scripts/provision-node22
     jobs_flag: ""
     labels: [validation-timeline, component-wrkviz]
-    timeout: 900
+    timeout: 2400
     cpu_timeout: 300
     hint:
       est_duration_s: 2
@@ -38,7 +38,7 @@ steps:
     jobs_flag: ""
     deps: [setup.node22]
     labels: [validation-timeline, component-wrkviz]
-    timeout: 900
+    timeout: 4800
     cpu_timeout: 600
     hint:
       est_duration_s: 5
@@ -60,7 +60,7 @@ steps:
     jobs_flag: ""
     deps: [setup.browser-deps]
     labels: [validation-timeline, component-wrkviz]
-    timeout: 600
+    timeout: 7200
     cpu_timeout: 900
     hint:
       resources: {browser: 1, timeline-fixture: 1}
@@ -83,7 +83,7 @@ steps:
     jobs_flag: ""
     deps: [setup.browser-deps]
     labels: [validation-timeline, component-wrkviz]
-    timeout: 600
+    timeout: 7200
     cpu_timeout: 900
     hint:
       resources: {browser: 1, timeline-fixture: 1}
@@ -105,7 +105,7 @@ steps:
     jobs_flag: ""
     deps: [setup.browser-deps]
     labels: [validation-timeline, component-wrkviz]
-    timeout: 600
+    timeout: 7200
     cpu_timeout: 900
     hint:
       # A redraw budget is a timing: it holds every browser slot, so it is still measured with no

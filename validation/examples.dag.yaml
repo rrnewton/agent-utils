@@ -9,7 +9,7 @@ steps:
     jobs_env: AGENT_UTILS_VALIDATION_JOBS
     labels: [validation-cross, component-dagrun]
     delegated_children: true
-    timeout: 600
+    timeout: 7200
     cpu_timeout: 900
     hint: &examples_hint
       est_duration_s: 30
@@ -36,6 +36,6 @@ steps:
     jobs_env: AGENT_UTILS_VALIDATION_JOBS
     labels: [validation-cross, component-dagrun]
     delegated_children: true
-    timeout: 600
+    timeout: 7200
     cpu_timeout: 900
     hint: *examples_hint

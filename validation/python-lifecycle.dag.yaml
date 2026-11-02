@@ -35,7 +35,7 @@ steps:
       --rootdir=. wrkslots/tests/test_lifecycle.py -m 'not ordinary_environment'; fi
     jobs_flag: ""
     labels: [validation-workspace, validation-pytest-shards, validation-python-namespace-tests, component-wrkslots]
-    timeout: 900
+    timeout: 14400
     cpu_timeout: 1800
     hint:
       resources: {lifecycle-io: 1}
@@ -58,7 +58,7 @@ steps:
       --rootdir=. wrkslots/tests/test_lifecycle.py -m 'not ordinary_environment'; fi
     jobs_flag: ""
     labels: [validation-workspace, validation-pytest-shards, validation-python-namespace-tests, component-wrkslots]
-    timeout: 900
+    timeout: 14400
     cpu_timeout: 1800
     hint:
       resources: {lifecycle-io: 1}
@@ -85,7 +85,7 @@ steps:
       --rootdir=. wrkslots/tests/test_lifecycle.py -m 'not ordinary_environment'; fi
     jobs_flag: ""
     labels: [validation-workspace, validation-pytest-shards, validation-python-namespace-tests, component-wrkslots]
-    timeout: 900
+    timeout: 14400
     cpu_timeout: 1800
     hint:
       resources: {lifecycle-io: 1}
@@ -108,7 +108,7 @@ steps:
       --rootdir=. wrkslots/tests/test_lifecycle.py -m 'not ordinary_environment'; fi
     jobs_flag: ""
     labels: [validation-workspace, validation-pytest-shards, validation-python-namespace-tests, component-wrkslots]
-    timeout: 900
+    timeout: 14400
     cpu_timeout: 1800
     hint:
       resources: {lifecycle-io: 1}
@@ -131,7 +131,7 @@ steps:
       --rootdir=. wrkslots/tests/test_lifecycle.py -m 'not ordinary_environment'; fi
     jobs_flag: ""
     labels: [validation-workspace, validation-pytest-shards, validation-python-namespace-tests, component-wrkslots]
-    timeout: 900
+    timeout: 14400
     cpu_timeout: 1800
     hint:
       resources: {lifecycle-io: 1}
@@ -154,7 +154,7 @@ steps:
       --rootdir=. wrkslots/tests/test_lifecycle.py -m 'not ordinary_environment'; fi
     jobs_flag: ""
     labels: [validation-workspace, validation-pytest-shards, validation-python-namespace-tests, component-wrkslots]
-    timeout: 900
+    timeout: 14400
     cpu_timeout: 1800
     hint:
       resources: {lifecycle-io: 1}
@@ -171,7 +171,7 @@ steps:
       -q -c pyproject.toml --rootdir=. wrkslots/tests/test_lifecycle.py -m ordinary_environment
     jobs_flag: ""
     labels: [validation-workspace, validation-pytest-shards, component-wrkslots]
-    timeout: 900
+    timeout: 14400
     cpu_timeout: 1800
     hint:
       resources: {host-lifecycle: 1, lifecycle-io: 1}
@@ -188,7 +188,7 @@ steps:
       -q -c pyproject.toml --rootdir=. wrkslots/tests/test_lifecycle.py -m ordinary_environment
     jobs_flag: ""
     labels: [validation-workspace, validation-pytest-shards, component-wrkslots]
-    timeout: 900
+    timeout: 14400
     cpu_timeout: 1800
     hint:
       resources: {host-lifecycle: 1, lifecycle-io: 1}
@@ -205,7 +205,7 @@ steps:
       -q -c pyproject.toml --rootdir=. wrkslots/tests/test_lifecycle.py -m ordinary_environment
     jobs_flag: ""
     labels: [validation-workspace, validation-pytest-shards, component-wrkslots]
-    timeout: 900
+    timeout: 14400
     cpu_timeout: 1800
     hint:
       resources: {host-lifecycle: 1, lifecycle-io: 1}

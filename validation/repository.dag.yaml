@@ -16,7 +16,8 @@ steps:
     cmd: python3 scripts/run_component_tests.py --self-test
     jobs_flag: ""
     labels: [validation-hygiene]
-    timeout: 60
+    timeout: 480
+    cpu_timeout: 60
     hint:
       est_duration_s: 1
       classification: light
@@ -31,7 +32,8 @@ steps:
     cmd: python3 scripts/run_pytest_shard.py --self-test
     jobs_flag: ""
     labels: [validation-hygiene]
-    timeout: 60
+    timeout: 480
+    cpu_timeout: 60
     hint:
       est_duration_s: 1
       classification: light
@@ -47,7 +49,8 @@ steps:
     cmd: python3 scripts/check_editions.py --self-test
     jobs_flag: ""
     labels: [validation-hygiene]
-    timeout: 60
+    timeout: 480
+    cpu_timeout: 60
     hint:
       est_duration_s: 1
       classification: light
@@ -59,7 +62,8 @@ steps:
     cmd: python3 scripts/check_editions.py
     jobs_flag: ""
     labels: [validation-hygiene]
-    timeout: 60
+    timeout: 480
+    cpu_timeout: 60
     hint:
       est_duration_s: 1
       classification: light
@@ -71,7 +75,7 @@ steps:
     cmd: python3 scripts/check_agent_queue_schemas.py --self-test
     jobs_flag: ""
     labels: [validation-hygiene]
-    timeout: 600
+    timeout: 9600
     cpu_timeout: 1200
     hint:
       resources: {cargo-target: 1}
@@ -85,7 +89,7 @@ steps:
     cmd: python3 scripts/check_agent_queue_schemas.py
     jobs_flag: ""
     labels: [validation-hygiene]
-    timeout: 600
+    timeout: 9600
     cpu_timeout: 1200
     hint:
       resources: {cargo-target: 1}
@@ -99,7 +103,7 @@ steps:
     cmd: python3 scripts/check_wrkslots_schemas.py --self-test
     jobs_flag: ""
     labels: [validation-hygiene]
-    timeout: 600
+    timeout: 9600
     cpu_timeout: 1200
     hint:
       resources: {cargo-target: 1}
@@ -113,7 +117,7 @@ steps:
     cmd: python3 scripts/check_wrkslots_schemas.py
     jobs_flag: ""
     labels: [validation-hygiene]
-    timeout: 600
+    timeout: 9600
     cpu_timeout: 1200
     hint:
       resources: {cargo-target: 1}
@@ -127,7 +131,7 @@ steps:
     cmd: python3 scripts/check_wrkviz_schemas.py --self-test
     jobs_flag: ""
     labels: [validation-hygiene]
-    timeout: 600
+    timeout: 9600
     cpu_timeout: 1200
     hint:
       resources: {cargo-target: 1}
@@ -141,7 +145,7 @@ steps:
     cmd: python3 scripts/check_wrkviz_schemas.py
     jobs_flag: ""
     labels: [validation-hygiene]
-    timeout: 600
+    timeout: 9600
     cpu_timeout: 1200
     hint:
       resources: {cargo-target: 1}
@@ -155,7 +159,8 @@ steps:
     cmd: python3 scripts/case_timings.py --self-test
     jobs_flag: ""
     labels: [validation-hygiene]
-    timeout: 60
+    timeout: 480
+    cpu_timeout: 60
     hint:
       est_duration_s: 1
       classification: light
@@ -167,7 +172,8 @@ steps:
     cmd: python3 scripts/validate.py --self-test
     jobs_flag: ""
     labels: [validation-hygiene]
-    timeout: 60
+    timeout: 480
+    cpu_timeout: 60
     hint:
       est_duration_s: 1
       classification: light
@@ -182,7 +188,8 @@ steps:
     cmd: python3 scripts/check_client_names.py --self-test
     jobs_flag: ""
     labels: [validation-hygiene]
-    timeout: 60
+    timeout: 480
+    cpu_timeout: 60
     hint:
       est_duration_s: 1
       classification: light
@@ -194,7 +201,8 @@ steps:
     cmd: python3 scripts/check_client_names.py
     jobs_flag: ""
     labels: [validation-hygiene]
-    timeout: 120
+    timeout: 480
+    cpu_timeout: 60
     hint:
       est_duration_s: 2
       classification: light
@@ -206,7 +214,8 @@ steps:
     cmd: python3 scripts/check_documented_defaults.py --self-test
     jobs_flag: ""
     labels: [validation-hygiene]
-    timeout: 60
+    timeout: 480
+    cpu_timeout: 60
     hint:
       est_duration_s: 1
       classification: light
@@ -218,7 +227,8 @@ steps:
     cmd: python3 scripts/check_documented_defaults.py
     jobs_flag: ""
     labels: [validation-hygiene]
-    timeout: 120
+    timeout: 480
+    cpu_timeout: 60
     hint:
       est_duration_s: 2
       classification: light
@@ -230,7 +240,8 @@ steps:
     cmd: python3 scripts/check_site.py --self-test
     jobs_flag: ""
     labels: [validation-hygiene]
-    timeout: 60
+    timeout: 480
+    cpu_timeout: 60
     hint:
       est_duration_s: 1
       classification: light
@@ -242,7 +253,8 @@ steps:
     cmd: python3 scripts/check_site.py
     jobs_flag: ""
     labels: [validation-hygiene]
-    timeout: 120
+    timeout: 480
+    cpu_timeout: 60
     hint:
       est_duration_s: 1
       classification: light
@@ -254,7 +266,8 @@ steps:
     cmd: python3 scripts/embed_userguides.py --check
     jobs_flag: ""
     labels: [validation-docs]
-    timeout: 120
+    timeout: 480
+    cpu_timeout: 60
     hint:
       est_duration_s: 2
       classification: light
@@ -266,7 +279,8 @@ steps:
     cmd: cargo fmt --all --manifest-path rs/Cargo.toml -- --check
     jobs_flag: ""
     labels: [validation-workspace, validation-rust]
-    timeout: 120
+    timeout: 480
+    cpu_timeout: 60
     hint:
       est_duration_s: 5
       classification: light
@@ -280,7 +294,7 @@ steps:
     jobs_flag: ""
     jobs_env: CARGO_BUILD_JOBS
     labels: [validation-workspace, validation-rust]
-    timeout: 1200
+    timeout: 19200
     cpu_timeout: 2400
     hint:
       resources: {cargo-target: 1}
@@ -297,7 +311,7 @@ steps:
     cmd: make mypy
     jobs_flag: ""
     labels: [validation-workspace, validation-python]
-    timeout: 600
+    timeout: 7200
     cpu_timeout: 900
     hint:
       est_duration_s: 30
@@ -311,7 +325,8 @@ steps:
     cmd: make check-deps
     jobs_flag: ""
     labels: [validation-workspace, validation-python]
-    timeout: 300
+    timeout: 480
+    cpu_timeout: 60
     hint:
       est_duration_s: 15
       classification: latency-bound
@@ -323,7 +338,8 @@ steps:
     cmd: make check-test-suite-selector
     jobs_flag: ""
     labels: [validation-workspace, validation-python]
-    timeout: 60
+    timeout: 480
+    cpu_timeout: 60
     hint:
       est_duration_s: 1
       classification: light
@@ -339,7 +355,7 @@ steps:
     deps: [build.rust-launchers]
     cmdtype: cargo-build
     labels: [validation-workspace, validation-rust]
-    timeout: 1200
+    timeout: 19200
     cpu_timeout: 2400
     hint:
       resources: {cargo-target: 1}

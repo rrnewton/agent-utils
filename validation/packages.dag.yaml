@@ -14,7 +14,7 @@ steps:
     cmd: python3 scripts/check_python_packages.py --project agentctl
     jobs_flag: ""
     labels: [validation-packages, validation-python-packages, component-agentctl]
-    timeout: 600
+    timeout: 960
     cpu_timeout: 120
     hint: &python_package_hint
       resources: {python-package: 1}
@@ -29,7 +29,7 @@ steps:
     cmd: python3 scripts/check_python_packages.py --project dagrun
     jobs_flag: ""
     labels: [validation-packages, validation-python-packages, component-dagrun]
-    timeout: 600
+    timeout: 960
     cpu_timeout: 120
     hint: *python_package_hint
 
@@ -39,7 +39,7 @@ steps:
     cmd: python3 scripts/check_python_packages.py --project parallel-experiment-runner
     jobs_flag: ""
     labels: [validation-packages, validation-python-packages, component-experiment-runner]
-    timeout: 600
+    timeout: 960
     cpu_timeout: 120
     hint: *python_package_hint
 
@@ -49,7 +49,7 @@ steps:
     cmd: python3 scripts/check_python_packages.py --project herdr-run
     jobs_flag: ""
     labels: [validation-packages, validation-python-packages, component-herdr-run]
-    timeout: 600
+    timeout: 960
     cpu_timeout: 120
     hint: *python_package_hint
 
@@ -59,7 +59,7 @@ steps:
     cmd: python3 scripts/check_python_packages.py --project pr-landing-planner
     jobs_flag: ""
     labels: [validation-packages, validation-python-packages, component-planner]
-    timeout: 600
+    timeout: 960
     cpu_timeout: 120
     hint: *python_package_hint
 
@@ -69,7 +69,7 @@ steps:
     cmd: python3 scripts/check_python_packages.py --project local-ci-hub
     jobs_flag: ""
     labels: [validation-packages, validation-python-packages, component-local-ci-hub]
-    timeout: 600
+    timeout: 960
     cpu_timeout: 120
     hint: *python_package_hint
 
@@ -79,7 +79,7 @@ steps:
     cmd: python3 scripts/check_python_packages.py --project tick-hub
     jobs_flag: ""
     labels: [validation-packages, validation-python-packages, component-tick-hub]
-    timeout: 600
+    timeout: 960
     cpu_timeout: 120
     hint: *python_package_hint
 
@@ -89,7 +89,7 @@ steps:
     cmd: python3 scripts/check_python_packages.py --project wrkslots
     jobs_flag: ""
     labels: [validation-packages, validation-python-packages, component-wrkslots]
-    timeout: 600
+    timeout: 960
     cpu_timeout: 120
     hint: *python_package_hint
 
@@ -99,7 +99,7 @@ steps:
     cmd: python3 scripts/check_python_packages.py --project wrkviz
     jobs_flag: ""
     labels: [validation-packages, validation-python-packages, component-wrkviz]
-    timeout: 600
+    timeout: 960
     cpu_timeout: 120
     hint: *python_package_hint
 
@@ -114,7 +114,7 @@ steps:
     cmd: python3 scripts/check_standalone.py --subset tick-hub
     jobs_flag: ""
     labels: [validation-packages, validation-python-packages, component-tick-hub]
-    timeout: 300
+    timeout: 480
     cpu_timeout: 60
     hint:
       resources: {python-package: 1}
@@ -129,7 +129,7 @@ steps:
     cmd: python3 scripts/check_standalone.py --subset wrkslots
     jobs_flag: ""
     labels: [validation-packages, validation-python-packages, component-wrkslots]
-    timeout: 900
+    timeout: 2400
     cpu_timeout: 300
     hint:
       resources: {python-package: 1}

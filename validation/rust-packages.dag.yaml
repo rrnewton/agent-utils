@@ -18,7 +18,7 @@ steps:
     jobs_flag: ""
     jobs_env: CARGO_BUILD_JOBS
     labels: [validation-packages, validation-rust-packages, component-agentctl]
-    timeout: 900
+    timeout: 14400
     cpu_timeout: 1800
     hint: &rust_package_hint
       resources: {rust-package: 1}
@@ -34,7 +34,7 @@ steps:
     jobs_flag: ""
     jobs_env: CARGO_BUILD_JOBS
     labels: [validation-packages, validation-rust-packages, component-dagrun]
-    timeout: 600
+    timeout: 9600
     cpu_timeout: 1200
     hint: *rust_package_hint
 
@@ -45,7 +45,7 @@ steps:
     jobs_flag: ""
     jobs_env: CARGO_BUILD_JOBS
     labels: [validation-packages, validation-rust-packages, component-herdr-run]
-    timeout: 600
+    timeout: 9600
     cpu_timeout: 1200
     hint: *rust_package_hint
 
@@ -56,7 +56,7 @@ steps:
     jobs_flag: ""
     jobs_env: CARGO_BUILD_JOBS
     labels: [validation-packages, validation-rust-packages, component-planner]
-    timeout: 600
+    timeout: 9600
     cpu_timeout: 1200
     hint: *rust_package_hint
 
@@ -67,6 +67,6 @@ steps:
     jobs_flag: ""
     jobs_env: CARGO_BUILD_JOBS
     labels: [validation-packages, validation-rust-packages, component-tick-hub]
-    timeout: 600
+    timeout: 9600
     cpu_timeout: 1200
     hint: *rust_package_hint

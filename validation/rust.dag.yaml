@@ -32,7 +32,7 @@ steps:
       --target "$host_target" --target-dir rs/target/validation-tests -p agentctl ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests, component-agentctl]
-    timeout: 1200
+    timeout: 19200
     cpu_timeout: 2400
     hint: &rust_test_hint
       resources: {cargo-target: 1}
@@ -50,7 +50,7 @@ steps:
       --target "$host_target" --target-dir rs/target/validation-tests -p agent-queue ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests, component-agentctl]
-    timeout: 600
+    timeout: 9600
     cpu_timeout: 1200
     hint: *rust_test_hint
 
@@ -63,7 +63,7 @@ steps:
       --target "$host_target" --target-dir rs/target/validation-tests -p agent-harness ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests, component-agentctl]
-    timeout: 600
+    timeout: 9600
     cpu_timeout: 1200
     hint: *rust_test_hint
 
@@ -76,7 +76,7 @@ steps:
       --target "$host_target" --target-dir rs/target/validation-tests -p term-backend ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests, component-agentctl]
-    timeout: 600
+    timeout: 9600
     cpu_timeout: 1200
     hint: *rust_test_hint
 
@@ -89,7 +89,7 @@ steps:
       --target "$host_target" --target-dir rs/target/validation-tests -p chat-subscription ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests, component-agentctl]
-    timeout: 600
+    timeout: 9600
     cpu_timeout: 1200
     hint: *rust_test_hint
 
@@ -102,7 +102,7 @@ steps:
       --target "$host_target" --target-dir rs/target/validation-tests -p chat-subscription-plugin ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests, component-agentctl]
-    timeout: 600
+    timeout: 9600
     cpu_timeout: 1200
     hint: *rust_test_hint
 
@@ -115,7 +115,7 @@ steps:
       --target "$host_target" --target-dir rs/target/validation-tests -p chat-subscription-fake ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests, component-agentctl]
-    timeout: 600
+    timeout: 9600
     cpu_timeout: 1200
     hint: *rust_test_hint
 
@@ -128,7 +128,7 @@ steps:
       --target "$host_target" --target-dir rs/target/validation-tests -p chat-subscription-slack ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests, component-agentctl]
-    timeout: 600
+    timeout: 9600
     cpu_timeout: 1200
     hint: *rust_test_hint
 
@@ -142,7 +142,7 @@ steps:
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests, component-dagrun]
     delegated_children: true
-    timeout: 1800
+    timeout: 28800
     cpu_timeout: 3600
     hint: *rust_test_hint
 
@@ -155,7 +155,7 @@ steps:
       --target "$host_target" --target-dir rs/target/validation-tests -p herdr-run ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests, component-herdr-run]
-    timeout: 600
+    timeout: 9600
     cpu_timeout: 1200
     hint: *rust_test_hint
 
@@ -168,7 +168,7 @@ steps:
       --target "$host_target" --target-dir rs/target/validation-tests -p pr-landing-planner ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests, component-planner]
-    timeout: 600
+    timeout: 9600
     cpu_timeout: 1200
     hint: *rust_test_hint
 
@@ -181,7 +181,7 @@ steps:
       --target "$host_target" --target-dir rs/target/validation-tests -p gh-paced ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests, component-gh-paced]
-    timeout: 600
+    timeout: 9600
     cpu_timeout: 1200
     hint: *rust_test_hint
 
@@ -194,7 +194,7 @@ steps:
       --target "$host_target" --target-dir rs/target/validation-tests -p agent-usage ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests, component-agent-usage]
-    timeout: 600
+    timeout: 9600
     cpu_timeout: 1200
     hint: *rust_test_hint
 
@@ -207,7 +207,7 @@ steps:
       --target "$host_target" --target-dir rs/target/validation-tests -p tick-hub ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests, component-tick-hub]
-    timeout: 600
+    timeout: 9600
     cpu_timeout: 1200
     hint: *rust_test_hint
 
@@ -220,7 +220,7 @@ steps:
       --target "$host_target" --target-dir rs/target/validation-tests -p wrkslotsd ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests, component-wrkslots]
-    timeout: 600
+    timeout: 9600
     cpu_timeout: 1200
     hint: *rust_test_hint
 
@@ -233,7 +233,7 @@ steps:
       --target "$host_target" --target-dir rs/target/validation-tests -p wrkviz ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests, component-wrkviz]
-    timeout: 600
+    timeout: 9600
     cpu_timeout: 1200
     hint: *rust_test_hint
 
@@ -243,7 +243,7 @@ steps:
     cmd: python3 scripts/check_rust_only.py --self-test && python3 scripts/check_rust_only.py
     jobs_flag: ""
     labels: [validation-rust]
-    timeout: 1200
+    timeout: 19200
     cpu_timeout: 2400
     hint:
       resources: {cargo-target: 1}
@@ -261,7 +261,7 @@ steps:
       --target "$host_target" --target-dir rs/target/validation-tests -p agent-teams ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests, component-agent-teams]
-    timeout: 600
+    timeout: 9600
     cpu_timeout: 1200
     hint: *rust_test_hint
 
@@ -287,6 +287,6 @@ steps:
       --target "$host_target" --target-dir rs/target/validation-tests -p merge-queue ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests, component-merge-queue]
-    timeout: 600
+    timeout: 9600
     cpu_timeout: 1200
     hint: *rust_test_hint

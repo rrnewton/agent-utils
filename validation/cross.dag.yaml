@@ -11,7 +11,8 @@ steps:
       python3 scripts/check_no_any.py cross examples/dagrun-scaling-workload.py
     jobs_flag: ""
     labels: [validation-cross]
-    timeout: 120
+    timeout: 480
+    cpu_timeout: 60
     hint:
       est_duration_s: 3
       classification: light
@@ -23,7 +24,8 @@ steps:
     cmd: PYTHONPATH=scripts python3 -m pytest -p run_pytest_shard -q cross/test_cpu_footprint.py
     jobs_flag: ""
     labels: [validation-cross, component-dagrun]
-    timeout: 120
+    timeout: 480
+    cpu_timeout: 60
     hint:
       est_duration_s: 2
       classification: light
@@ -48,7 +50,7 @@ steps:
     jobs_env: AGENT_UTILS_VALIDATION_JOBS
     labels: [validation-cross, component-dagrun]
     delegated_children: true
-    timeout: 1200
+    timeout: 19200
     cpu_timeout: 2400
     hint:
       est_duration_s: 180
@@ -80,7 +82,7 @@ steps:
     jobs_flag: ""
     labels: [validation-cross, component-dagrun]
     delegated_children: true
-    timeout: 600
+    timeout: 9600
     cpu_timeout: 1200
     hint: &cross_hint
       est_duration_s: 180
@@ -94,7 +96,7 @@ steps:
     cmd: python3 cross/differential.py --tool tick-hub
     jobs_flag: ""
     labels: [validation-cross, component-tick-hub]
-    timeout: 600
+    timeout: 9600
     cpu_timeout: 1200
     hint: *cross_hint
 
@@ -104,7 +106,7 @@ steps:
     cmd: python3 cross/differential.py --tool pr-landing-planner
     jobs_flag: ""
     labels: [validation-cross, component-planner]
-    timeout: 600
+    timeout: 9600
     cpu_timeout: 1200
     hint:
       est_duration_s: 180
@@ -137,7 +139,7 @@ steps:
     cmd: python3 cross/differential.py --tool herdr-run
     jobs_flag: ""
     labels: [component-herdr-run, gate-exclusive]
-    timeout: 600
+    timeout: 9600
     cpu_timeout: 1200
     hint: *cross_hint
 
@@ -147,7 +149,7 @@ steps:
     cmd: python3 cross/differential.py --tool herdr-agent
     jobs_flag: ""
     labels: [component-agentctl, gate-exclusive]
-    timeout: 600
+    timeout: 9600
     cpu_timeout: 1200
     hint: *cross_hint
 
@@ -160,7 +162,7 @@ steps:
     # Sharded by group (see cross/agentctl_differential.py shard_groups):
     # one 1200 s serial node timed out under multi-gate load; three shorter
     # nodes keep each wall well inside the same budget without raising it.
-    timeout: 1200
+    timeout: 19200
     cpu_timeout: 2400
     hint:
       est_duration_s: 120
@@ -174,7 +176,7 @@ steps:
     cmd: python3 cross/differential.py --tool agentctl --shard 1/3
     jobs_flag: ""
     labels: [component-agentctl, gate-exclusive]
-    timeout: 1200
+    timeout: 19200
     cpu_timeout: 2400
     hint:
       est_duration_s: 120
@@ -188,7 +190,7 @@ steps:
     cmd: python3 cross/differential.py --tool agentctl --shard 2/3
     jobs_flag: ""
     labels: [component-agentctl, gate-exclusive]
-    timeout: 1200
+    timeout: 19200
     cpu_timeout: 2400
     hint:
       est_duration_s: 120

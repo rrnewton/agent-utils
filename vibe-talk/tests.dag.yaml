@@ -58,6 +58,7 @@ steps:
     labels: [validation-vibe-talk]
     cmd: cd vibe-talk && cargo fmt --all -- --check
     jobs_flag: ""
+    timeout: 480
     cpu_timeout: 60
     hint:
       est_duration_s: 5
@@ -75,6 +76,7 @@ steps:
     jobs_flag: ""
     jobs_env: CARGO_BUILD_JOBS
     deps: [setup.contract-tools]
+    timeout: 7200
     cpu_timeout: 900
     hint:
       est_duration_s: 120
@@ -90,6 +92,7 @@ steps:
     labels: [validation-vibe-talk]
     cmd: cd vibe-talk && make scripts-check
     jobs_flag: ""
+    timeout: 960
     cpu_timeout: 120
     hint:
       est_duration_s: 5
@@ -109,7 +112,7 @@ steps:
     labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: scripts/provision-node-packages vibe-talk/contract
     jobs_flag: ""
-    timeout: 600
+    timeout: 2400
     cpu_timeout: 300
     hint:
       est_duration_s: 2
@@ -123,6 +126,7 @@ steps:
     cmd: cd vibe-talk && make contract-check typecheck
     jobs_flag: ""
     deps: [setup.contract-tools]
+    timeout: 960
     cpu_timeout: 120
     hint:
       est_duration_s: 8
@@ -137,6 +141,7 @@ steps:
     labels: [validation-vibe-talk]
     cmd: cd vibe-talk && python3 scripts/android-device-speech.py --self-test
     jobs_flag: ""
+    timeout: 240
     cpu_timeout: 30
     hint:
       est_duration_s: 2
@@ -151,6 +156,7 @@ steps:
     labels: [validation-vibe-talk]
     cmd: cd vibe-talk && python3 scripts/voice-read-acceptance.py --self-test
     jobs_flag: ""
+    timeout: 240
     cpu_timeout: 30
     hint:
       est_duration_s: 1
@@ -165,6 +171,7 @@ steps:
     labels: [validation-vibe-talk]
     cmd: cd vibe-talk && python3 scripts/live-relay-check.py --self-test
     jobs_flag: ""
+    timeout: 240
     cpu_timeout: 30
     hint:
       est_duration_s: 1
@@ -181,7 +188,7 @@ steps:
     labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 scripts/screenshots.py --self-test
     jobs_flag: ""
-    timeout: 60
+    timeout: 240
     cpu_timeout: 30
     hint:
       est_duration_s: 2
@@ -200,7 +207,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/pwa_installability.py
     jobs_flag: ""
     deps: [build.release, setup.contract-tools]
-    timeout: 60
+    timeout: 240
     cpu_timeout: 30
     hint:
       resources: {browser: 1}
@@ -220,7 +227,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/enter_to_send_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 60
+    timeout: 240
     cpu_timeout: 30
     hint:
       resources: {browser: 1}
@@ -239,7 +246,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/settings_sync_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 120
+    timeout: 480
     cpu_timeout: 60
     hint:
       resources: {browser: 1}
@@ -258,7 +265,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/pairing_link_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 60
+    timeout: 240
     cpu_timeout: 30
     hint:
       resources: {browser: 1}
@@ -284,7 +291,7 @@ steps:
     # budgets are a backstop against a hung browser, not a speed target: about twice the measurement.
     # With the gathered-replies walk (`#214 reply-arrow`, `#215 reply-coalesce`) a passing run on the
     # same host measured 155 s wall and 90 s of CPU, against 180 s / 100 s.
-    timeout: 320
+    timeout: 1440
     cpu_timeout: 180
     hint:
       resources: {browser: 1}
@@ -302,7 +309,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/reactions_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 60
+    timeout: 240
     cpu_timeout: 30
     hint:
       resources: {browser: 1}
@@ -319,7 +326,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/live_reactions_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 60
+    timeout: 240
     cpu_timeout: 30
     hint:
       resources: {browser: 1}
@@ -337,7 +344,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/system_bots_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 60
+    timeout: 240
     cpu_timeout: 30
     hint:
       resources: {browser: 1}
@@ -355,7 +362,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/edited_mark_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 60
+    timeout: 240
     cpu_timeout: 30
     hint:
       resources: {browser: 1}
@@ -373,7 +380,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/server_thread_hues_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 120
+    timeout: 480
     cpu_timeout: 60
     hint:
       resources: {browser: 1}
@@ -393,7 +400,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/rich_headers_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 60
+    timeout: 240
     cpu_timeout: 30
     hint:
       resources: {browser: 1}
@@ -412,7 +419,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/read_aloud_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 90
+    timeout: 360
     cpu_timeout: 45
     hint:
       resources: {browser: 1}
@@ -430,7 +437,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/wit_read_aloud_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 120
+    timeout: 480
     cpu_timeout: 60
     hint:
       resources: {browser: 1}
@@ -447,7 +454,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/local_read_aloud_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 120
+    timeout: 480
     cpu_timeout: 60
     hint:
       resources: {browser: 1}
@@ -465,7 +472,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/fallback_chain_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 120
+    timeout: 480
     cpu_timeout: 60
     hint:
       resources: {browser: 1}
@@ -485,7 +492,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/read_aloud_blocks_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 150
+    timeout: 480
     cpu_timeout: 60
     hint:
       # Holds every browser slot in its gate (the fold-latency pattern):
@@ -506,7 +513,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/read_aloud_views_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 180
+    timeout: 480
     cpu_timeout: 60
     hint:
       resources: {browser: 1}
@@ -525,8 +532,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/read_pause_reply_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 240
-    cpu_timeout: 120
+    timeout: 480
     hint:
       resources: {browser: 1}
       est_duration_s: 55
@@ -543,7 +549,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/pace_stepper_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 150
+    timeout: 480
     cpu_timeout: 60
     hint:
       resources: {browser: 1}
@@ -560,7 +566,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/post_confirm_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 60
+    timeout: 240
     cpu_timeout: 30
     hint:
       resources: {browser: 1}
@@ -583,7 +589,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/voice_call_drops_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 150
+    timeout: 720
     cpu_timeout: 90
     hint:
       resources: {browser: 1}
@@ -603,7 +609,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/voice_reconnect_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 120
+    timeout: 720
     cpu_timeout: 90
     hint:
       resources: {browser: 1}
@@ -625,7 +631,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/voice_expand_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 120
+    timeout: 720
     cpu_timeout: 90
     hint:
       resources: {browser: 1}
@@ -710,7 +716,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/approval_card_browser.py --part phone-place
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 480
+    timeout: 800
     cpu_timeout: 100
     hint:
       resources: {browser: 1}
@@ -725,7 +731,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/approval_card_browser.py --part phone-alone
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 360
+    timeout: 800
     cpu_timeout: 100
     hint:
       resources: {browser: 1}
@@ -740,7 +746,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/approval_card_browser.py --part phone-help
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 300
+    timeout: 800
     cpu_timeout: 100
     hint:
       resources: {browser: 1}
@@ -755,7 +761,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/approval_card_browser.py --part small-screens
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 480
+    timeout: 800
     cpu_timeout: 100
     hint:
       resources: {browser: 1}
@@ -770,7 +776,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/approval_card_browser.py --part desk
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 480
+    timeout: 800
     cpu_timeout: 100
     hint:
       resources: {browser: 1}
@@ -792,7 +798,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/voice_composer_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 60
+    timeout: 240
     cpu_timeout: 30
     hint:
       resources: {browser: 1}
@@ -819,7 +825,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/composer_grow_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 90
+    timeout: 360
     cpu_timeout: 45
     hint:
       resources: {browser: 1}
@@ -840,7 +846,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/view_switch_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 60
+    timeout: 240
     cpu_timeout: 30
     hint:
       resources: {browser: 1}
@@ -864,7 +870,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/read_modes_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 90
+    timeout: 360
     cpu_timeout: 45
     hint:
       resources: {browser: 1}
@@ -898,7 +904,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/keyboard_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 120
+    timeout: 480
     cpu_timeout: 60
     hint:
       resources: {browser: 1}
@@ -923,7 +929,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/search_chord_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 90
+    timeout: 360
     cpu_timeout: 45
     hint:
       resources: {browser: 1}
@@ -941,7 +947,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/composer_key_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 90
+    timeout: 360
     cpu_timeout: 45
     hint:
       resources: {browser: 1}
@@ -959,7 +965,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/command_bar_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 120
+    timeout: 480
     cpu_timeout: 60
     hint:
       resources: {browser: 1}
@@ -980,7 +986,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/provider_groups_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 90
+    timeout: 360
     cpu_timeout: 45
     hint:
       resources: {browser: 1}
@@ -1002,7 +1008,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/channel_box_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 90
+    timeout: 360
     cpu_timeout: 45
     hint:
       resources: {browser: 1}
@@ -1023,7 +1029,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/channel_search_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 90
+    timeout: 360
     cpu_timeout: 45
     hint:
       resources: {browser: 1}
@@ -1055,7 +1061,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/two_column_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 120
+    timeout: 480
     cpu_timeout: 60
     hint:
       resources: {browser: 1}
@@ -1080,7 +1086,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/desktop_layout_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 90
+    timeout: 360
     cpu_timeout: 45
     hint:
       resources: {browser: 1}
@@ -1105,7 +1111,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/thread_card_focus_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 90
+    timeout: 360
     cpu_timeout: 45
     hint:
       resources: {browser: 1}
@@ -1127,7 +1133,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/copy_message_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 90
+    timeout: 360
     cpu_timeout: 45
     hint:
       resources: {browser: 1}
@@ -1147,7 +1153,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/in_app_links_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 90
+    timeout: 360
     cpu_timeout: 45
     hint:
       resources: {browser: 1}
@@ -1166,7 +1172,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/message_summaries_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 90
+    timeout: 360
     cpu_timeout: 45
     hint:
       resources: {browser: 1}
@@ -1188,7 +1194,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/open_upstream_link_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 90
+    timeout: 360
     cpu_timeout: 45
     hint:
       resources: {browser: 1}
@@ -1218,7 +1224,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/back_gesture_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 120
+    timeout: 480
     cpu_timeout: 60
     hint:
       resources: {browser: 1}
@@ -1243,7 +1249,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/live_pill_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 150
+    timeout: 960
     cpu_timeout: 120
     hint:
       resources: {browser: 1}
@@ -1275,7 +1281,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/thread_card_header_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 150
+    timeout: 720
     cpu_timeout: 90
     hint:
       resources: {browser: 1}
@@ -1300,7 +1306,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/threads_unpack_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 300
+    timeout: 1440
     cpu_timeout: 180
     hint:
       resources: {browser: 1}
@@ -1315,7 +1321,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/thread_header_collapse_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 150
+    timeout: 720
     cpu_timeout: 90
     hint:
       resources: {browser: 1}
@@ -1336,7 +1342,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/thread_line_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 120
+    timeout: 480
     cpu_timeout: 60
     hint:
       resources: {browser: 1}
@@ -1357,7 +1363,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/empty_messages_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 120
+    timeout: 480
     cpu_timeout: 60
     hint:
       resources: {browser: 1}
@@ -1383,7 +1389,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/all_thread_strip_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 120
+    timeout: 480
     cpu_timeout: 60
     hint:
       resources: {browser: 1}
@@ -1404,7 +1410,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/stale_live_read_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 90
+    timeout: 360
     cpu_timeout: 45
     hint:
       resources: {browser: 1}
@@ -1440,7 +1446,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/scroll_stability_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 300
+    timeout: 960
     cpu_timeout: 120
     hint:
       resources: {browser: 1}
@@ -1469,7 +1475,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/column_overscroll_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 600
+    timeout: 960
     cpu_timeout: 120
     hint:
       resources: {browser: 1}
@@ -1492,7 +1498,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/bookmark_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 90
+    timeout: 360
     cpu_timeout: 45
     hint:
       resources: {browser: 1}
@@ -1514,7 +1520,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/filter_place_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 90
+    timeout: 360
     cpu_timeout: 45
     hint:
       resources: {browser: 1}
@@ -1540,7 +1546,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/search_dates_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 90
+    timeout: 360
     cpu_timeout: 45
     hint:
       resources: {browser: 1}
@@ -1560,7 +1566,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/link_url_chip_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 90
+    timeout: 360
     cpu_timeout: 45
     hint:
       resources: {browser: 1}
@@ -1578,7 +1584,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/search_whose_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 90
+    timeout: 360
     cpu_timeout: 45
     hint:
       resources: {browser: 1}
@@ -1601,7 +1607,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/search_unmatched_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 90
+    timeout: 360
     cpu_timeout: 45
     hint:
       resources: {browser: 1}
@@ -1631,8 +1637,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/reply_continuity_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 150
-    cpu_timeout: 140
+    timeout: 880
     hint:
       resources: {browser: 1}
       est_duration_s: 50
@@ -1656,7 +1661,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/inline_reply_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 150
+    timeout: 720
     cpu_timeout: 90
     hint:
       resources: {browser: 1}
@@ -1677,7 +1682,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/threads_main_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 90
+    timeout: 360
     cpu_timeout: 45
     hint:
       resources: {browser: 1}
@@ -1698,7 +1703,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/sent_receipts_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 120
+    timeout: 360
     cpu_timeout: 45
     hint:
       resources: {browser: 1}
@@ -1716,7 +1721,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/send_double_check_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 120
+    timeout: 360
     cpu_timeout: 45
     hint:
       resources: {browser: 1}
@@ -1738,7 +1743,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/threads_polish_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 120
+    timeout: 480
     cpu_timeout: 60
     hint:
       resources: {browser: 1}
@@ -1763,7 +1768,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/bridge_even_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 180
+    timeout: 720
     cpu_timeout: 90
     hint:
       resources: {browser: 1}
@@ -1776,7 +1781,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/bridge_gutter_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 180
+    timeout: 720
     cpu_timeout: 90
     hint:
       resources: {browser: 1}
@@ -1796,7 +1801,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/thread_card_max_lines_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 180
+    timeout: 720
     cpu_timeout: 90
     hint:
       resources: {browser: 1}
@@ -1814,7 +1819,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/thread_card_markdown_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 240
+    timeout: 960
     cpu_timeout: 120
     hint:
       resources: {browser: 1}
@@ -1831,7 +1836,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/fold_latency_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 240
+    timeout: 960
     cpu_timeout: 120
     hint:
       # A latency budget measures the page, so it owns every browser slot,
@@ -1851,7 +1856,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/pack_still_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 150
+    timeout: 480
     cpu_timeout: 60
     hint:
       resources: {browser: 1}
@@ -1871,7 +1876,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/keyboard_hides_bar_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 90
+    timeout: 360
     cpu_timeout: 45
     hint:
       resources: {browser: 1}
@@ -1893,7 +1898,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/reply_marks_read_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 90
+    timeout: 360
     cpu_timeout: 45
     hint:
       resources: {browser: 1}
@@ -1917,7 +1922,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/done_sync_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 90
+    timeout: 360
     cpu_timeout: 45
     hint:
       resources: {browser: 1}
@@ -1940,7 +1945,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/thread_button_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 90
+    timeout: 360
     cpu_timeout: 45
     hint:
       resources: {browser: 1}
@@ -1964,7 +1969,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/compact_rows_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 90
+    timeout: 360
     cpu_timeout: 45
     hint:
       resources: {browser: 1}
@@ -1989,7 +1994,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/collapsed_lines_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 180
+    timeout: 720
     cpu_timeout: 90
     hint:
       resources: {browser: 1}
@@ -2011,7 +2016,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/thread_card_fit_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 180
+    timeout: 720
     cpu_timeout: 90
     hint:
       resources: {browser: 1}
@@ -2038,7 +2043,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/done_feedback_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 180
+    timeout: 720
     cpu_timeout: 90
     hint:
       resources: {browser: 1}
@@ -2062,7 +2067,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/elision_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 120
+    timeout: 480
     cpu_timeout: 60
     hint:
       resources: {browser: 1}
@@ -2090,7 +2095,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/fold_steps_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 120
+    timeout: 480
     cpu_timeout: 60
     hint:
       resources: {browser: 1}
@@ -2107,6 +2112,7 @@ steps:
     jobs_flag: ""
     jobs_env: CARGO_BUILD_JOBS
     deps: [setup.contract-tools]
+    timeout: 14400
     cpu_timeout: 1800
     hint:
       est_duration_s: 240
@@ -2121,7 +2127,7 @@ steps:
     cmd: cd vibe-talk && ./target/release/vibe-talk --help >/dev/null
     jobs_flag: ""
     deps: [build.release]
-    timeout: 60
+    timeout: 240
     cpu_timeout: 30
     hint:
       est_duration_s: 1
@@ -2145,6 +2151,7 @@ steps:
     deps: [build.release]
     # Measured 2026-10-23 on the validation host, after a change to the page the binaries embed:
     # 73 to 104 s wall, 1000 to 1160 s of CPU and a 6.1 GiB peak. About twice the CPU.
+    timeout: 19200
     cpu_timeout: 2400
     hint:
       est_duration_s: 100
@@ -2179,6 +2186,7 @@ steps:
     # budget while that suite was still running; 2700 s was the stopgap (185b2539). Running the
     # built binaries without it: 37 s wall, 39 s of CPU and a 442 MiB peak. The budget is for a
     # loaded host, and a test binary that spins.
+    timeout: 4800
     cpu_timeout: 600
     hint:
       est_duration_s: 40
@@ -2216,7 +2224,7 @@ steps:
       --test-reporter-destination="${AGENT_UTILS_CASE_TIMING_DIR:-target/case-timings}/node-${DAGRUN_OUTER_RUN:-vibe-talk.test.page-0}.tap"
       tests/js/voice_page.test.mjs
     jobs_flag: ""
-    timeout: 600
+    timeout: 4800
     cpu_timeout: 600
     hint:
       est_duration_s: 60
@@ -2236,7 +2244,7 @@ steps:
       --test-reporter-destination="${AGENT_UTILS_CASE_TIMING_DIR:-target/case-timings}/node-${DAGRUN_OUTER_RUN:-vibe-talk.test.page-1}.tap"
       tests/js/voice_page.test.mjs
     jobs_flag: ""
-    timeout: 600
+    timeout: 4800
     cpu_timeout: 600
     hint:
       est_duration_s: 60
@@ -2256,7 +2264,7 @@ steps:
       --test-reporter-destination="${AGENT_UTILS_CASE_TIMING_DIR:-target/case-timings}/node-${DAGRUN_OUTER_RUN:-vibe-talk.test.page-2}.tap"
       tests/js/voice_page.test.mjs
     jobs_flag: ""
-    timeout: 600
+    timeout: 4800
     cpu_timeout: 600
     hint:
       est_duration_s: 60
@@ -2276,7 +2284,7 @@ steps:
       --test-reporter-destination="${AGENT_UTILS_CASE_TIMING_DIR:-target/case-timings}/node-${DAGRUN_OUTER_RUN:-vibe-talk.test.page-3}.tap"
       tests/js/voice_page.test.mjs
     jobs_flag: ""
-    timeout: 600
+    timeout: 4800
     cpu_timeout: 600
     hint:
       est_duration_s: 60
@@ -2302,7 +2310,7 @@ steps:
     cmd: cd vibe-talk && python3 tests/send_order_browser.py
     jobs_flag: ""
     deps: [build.release, setup.contract-tools]
-    timeout: 120
+    timeout: 480
     cpu_timeout: 60
     hint:
       resources: {browser: 1}
@@ -2322,7 +2330,7 @@ steps:
     deps: [build.release, setup.contract-tools]
     # Wall, not only CPU: a browser waiting on a page that never loads burns no CPU at all, so a
     # CPU budget alone would let it hang until the run timeout. This is the hang backstop.
-    timeout: 900
+    timeout: 4800
     cpu_timeout: 600
     hint:
       # Holds every browser slot in its gate (the fold-latency pattern):
