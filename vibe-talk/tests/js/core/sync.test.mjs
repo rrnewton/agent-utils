@@ -309,3 +309,57 @@ test("`#624 voice-page-modularity`: following a channel's stream attaches, keeps
   follow.start("9");
   assert.equal(follow.channel(), null);
 });
+
+test("`#624 voice-page-modularity`: the channel's poll is armed, held while the page is hidden, and taken up again", () => {
+  const { createChannelPoll, DISCORD_POLL_MS } = SYNC;
+  const timers = new Map();
+  let next = 0;
+  let now = 1000;
+  let hidden = false;
+  let onChannel = true;
+  let polls = 0;
+  const poll = createChannelPoll({
+    clock: { setTimeout: (run, ms) => { next += 1; timers.set(next, { run, ms }); return next; }, clearTimeout: (h) => timers.delete(h) },
+    now: () => now,
+    hidden: () => hidden,
+    onChannel: () => onChannel,
+    take: (delay) => delay,
+    poll: () => { polls += 1; },
+  });
+  const fire = () => { for (const [h, t] of [...timers]) { timers.delete(h); t.run(); } };
+  poll.schedule();
+  assert.deepStrictEqual([poll.armed(), poll.dueAt(), [...timers.values()][0].ms], [true, 1000 + DISCORD_POLL_MS, DISCORD_POLL_MS]);
+  fire();
+  assert.equal(polls, 1);
+  // Hidden when armed: held, nothing on the clock.
+  hidden = true;
+  poll.schedule(5000);
+  assert.deepStrictEqual([poll.armed(), poll.paused(), timers.size], [false, true, 0]);
+  // Shown again: the rest of the wait.
+  hidden = false;
+  now = 3000;
+  poll.resume("rest");
+  assert.deepStrictEqual([poll.paused(), [...timers.values()][0].ms], [false, 3000]);
+  // Hidden while armed: the poll stops and waits.
+  poll.pause();
+  assert.deepStrictEqual([poll.armed(), poll.paused()], [false, true]);
+  poll.resume("now");
+  assert.equal(polls, 2);
+  // Come due while hidden: held when it fires.
+  poll.schedule(10);
+  hidden = true;
+  fire();
+  assert.deepStrictEqual([polls, poll.paused()], [2, true]);
+  hidden = false;
+  poll.resume("fresh");
+  assert.equal([...timers.values()][0].ms, DISCORD_POLL_MS);
+  // Another view: the poll that fires does nothing, and resuming arms nothing.
+  onChannel = false;
+  fire();
+  assert.equal(polls, 2);
+  poll.pause();
+  poll.stop();
+  assert.equal(poll.paused(), false, "stopping kept a held wait");
+  poll.resume("now");
+  assert.equal(polls, 2);
+});

@@ -11531,7 +11531,7 @@ function onVisibility() {
   });
   const resume = liveResumeAfterHidden;
   liveResumeAfterHidden = null;
-  const pollDue = discordPollPaused && discordPollDueAt <= voiceCall().visibleAt;
+  const pollDue = channelPoll.paused() && channelPoll.dueAt() <= voiceCall().visibleAt;
   // `#203 incremental-refresh`. Coming back to the channel after a while is the moment a reader
   // most wants it current, and a phone held the poll's timer the whole time it was away. Only what
   // changed is asked for, so this costs one small read rather than the next poll's wait. `#226`:
@@ -16215,8 +16215,8 @@ function noteFreshRead(payload) {
   const failed = refreshFailed(payload);
   const retryWanted = standInRetries.noteRead(failed);
   // A poll already armed comes forward; one armed after this read takes it up as it is armed.
-  if (failed && retryWanted && discordPollTimer !== null) {
-    scheduleDiscordPoll(Math.max(0, discordPollDueAt - Date.now()));
+  if (failed && retryWanted && channelPoll.armed()) {
+    scheduleDiscordPoll(Math.max(0, channelPoll.dueAt() - Date.now()));
   }
   const old = Date.now() - loadState().freshAt > STALE_AS_OF_MS;
   setChannelFreshness(failed ? (old ? "failed" : "fresh") : asOf === null ? "fresh" : "slow");
@@ -32318,7 +32318,19 @@ function landAbandonedTimelineRead(payload, read) {
   });
 }
 
-let discordPollTimer = null;
+/**
+ * The poll's timer — armed after each poll, held while the page is hidden and taken up when it is shown,
+ * its wait shortened for a stand-in read's quick retry — is web/src/core/sync's (`createChannelPoll`,
+ * `#624 voice-page-modularity`); the poll itself (`pollDiscord`) is here.
+ */
+const channelPoll = createChannelPoll({
+  clock: clockOnUse(),
+  now: () => Date.now(),
+  hidden: () => document.hidden,
+  onChannel: () => currentView === "discord",
+  take: (delay) => standInRetries.take(delay),
+  poll: () => pollDiscord(),
+});
 let discordFetchInFlight = false;
 // The view a timeline read on the wire is for (`channelContextKey`), or null: a switch back to a
 // view whose read is still out lets that read land rather than queueing another. `#220
@@ -32405,39 +32417,19 @@ function currentDiscordLoad(generation, channel, readingTodo) {
   );
 }
 
+/** Stop the poll, and forget a wait held for the page to be shown. */
 function stopDiscordPolling() {
-  discordPollPaused = false;
-  if (discordPollTimer !== null) {
-    clearTimeout(discordPollTimer);
-    discordPollTimer = null;
-  }
+  channelPoll.stop();
 }
 
 /**
- * Self-rescheduling rather than setInterval, for two reasons: a slow fetch can never stack a
- * second one up behind it, and the next delay is armed only once the previous poll has actually
- * finished. Polling stops the moment the channel stops being the visible view, so a voice call
- * is never sharing its network with a background refresh nobody is looking at — and, `#226
- * page-energy-profile`, while the page is hidden: a poll armed or come due then waits for the
- * page to be shown (`resumePolling`). `delay` is the rest of a wait a glance away interrupted.
+ * Arm the next poll of the channel on screen after `delay`, held while the page is hidden
+ * (web/src/core/sync `ChannelPoll.schedule`, which says why it reschedules itself).
+ *
+ * @param {number} [delay]
  */
 function scheduleDiscordPoll(delay = DISCORD_POLL_MS) {
-  stopDiscordPolling();
-  delay = standInRetries.take(delay);
-  discordPollDueAt = Date.now() + delay;
-  if (document.hidden) {
-    discordPollPaused = true;
-    return;
-  }
-  discordPollTimer = setTimeout(() => {
-    discordPollTimer = null;
-    if (currentView !== "discord") return;
-    if (document.hidden) {
-      discordPollPaused = true;
-      return;
-    }
-    pollDiscord();
-  }, delay);
+  channelPoll.schedule(delay);
 }
 
 /** One poll of the channel on screen, which arms the next. */
@@ -32491,10 +32483,6 @@ function pollDiscord() {
 
 /** How long a hidden page with no call keeps its live stream: two minutes. */
 const LIVE_HIDDEN_CLOSE_MS = 120000;
-/** Whether a poll was armed, or came due, while the page was hidden, and waits for it to be shown. */
-let discordPollPaused = false;
-/** When the poll last armed was due, by the clock. */
-let discordPollDueAt = 0;
 /** Whether the stream delivered a message for this channel while the page was hidden. */
 let liveArrivedHidden = false;
 /** Whether it delivered an edit or a removal then, which a read answers. */
@@ -32506,10 +32494,7 @@ let liveResumeAfterHidden = null;
 
 /** The page went out of sight: stop what can wait for it to come back. */
 function pauseWhileHidden() {
-  if (discordPollTimer !== null) {
-    stopDiscordPolling();
-    discordPollPaused = true;
-  }
+  channelPoll.pause();
   if (liveHiddenTimer === null && liveFollow.channel() !== null) {
     liveHiddenTimer = setTimeout(letStreamGoWhileHidden, LIVE_HIDDEN_CLOSE_MS);
   }
@@ -32532,18 +32517,13 @@ function resumeLiveStream(resume) {
 }
 
 /**
- * Take up the poll a hidden page paused: `"now"`, when it came due meanwhile; `"fresh"`, a whole
- * wait, behind a read coming back has just made; otherwise the rest of the wait it was in, so that
- * glancing away again and again does not put the poll off for good.
+ * Take up the poll a hidden page paused: now, a whole wait, or the rest of the one it was in
+ * (web/src/core/sync `ChannelPoll.resume`).
  *
  * @param {"now" | "fresh" | "rest"} how
  */
 function resumePolling(how) {
-  if (!discordPollPaused) return;
-  discordPollPaused = false;
-  if (currentView !== "discord") return;
-  if (how === "now") pollDiscord();
-  else scheduleDiscordPoll(how === "fresh" ? DISCORD_POLL_MS : Math.max(0, discordPollDueAt - Date.now()));
+  channelPoll.resume(how);
 }
 
 /**

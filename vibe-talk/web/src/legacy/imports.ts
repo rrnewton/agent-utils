@@ -32,6 +32,7 @@ export {
   TIMELINE_RECONCILE_MS,
   VISIBLE_REFRESH_MS,
   createChannelFollow,
+  createChannelPoll,
   createLiveEvents,
   createReadHolds,
   createReadOrder,
