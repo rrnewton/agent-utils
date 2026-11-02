@@ -523,6 +523,10 @@ pub fn preflight_with_path(
     let missing: Vec<String> = configured_executables(config, agentctl_override)
         .into_iter()
         .filter(|(_, tool)| !BUILTINS.contains(&tool.as_str()))
+        // A relative path (`common/bin/dagrun`, `./scripts/run.sh`) names a file inside the
+        // candidate checkout the command runs in, which exists only at run time; the queue's
+        // own repository is often bare, so resolving it there would refuse a working setup.
+        .filter(|(_, tool)| !(tool.contains('/') && !Path::new(tool).is_absolute()))
         .filter(|(_, tool)| find_executable(tool, path_env, &config.repo).is_none())
         .map(|(label, tool)| format!("{tool} not found (needed by {label})"))
         .collect();
@@ -1691,6 +1695,31 @@ mod unit {
         let empty = std::ffi::OsString::new();
         let error = preflight_with_path(&config, None, Some(&empty)).unwrap_err();
         assert!(error.contains("git not found"), "{error}");
+        let _ = std::fs::remove_dir_all(&state.root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preflight_does_not_resolve_tools_inside_the_candidate_checkout() {
+        // The documented dagrun setup names the repository's own launcher relative to the
+        // candidate checkout; the queue's repository (here a bare-like empty dir) lacks it.
+        let state = temp_state("preflight-relative");
+        let config = Config {
+            repo: state.root.clone(),
+            validator: crate::state::ValidatorConfig {
+                kind: "dagrun".to_owned(),
+                dagrun: "common/bin/dagrun".to_owned(),
+                dag: "validation.dag.yaml".to_owned(),
+                run: String::new(),
+                select: "./scripts/select.sh --base \"$MQ_BASE\"".to_owned(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(
+            preflight_with_path(&config, None, std::env::var_os("PATH").as_deref()).is_ok(),
+            "relative in-checkout tools must not fail preflight"
+        );
         let _ = std::fs::remove_dir_all(&state.root);
     }
 

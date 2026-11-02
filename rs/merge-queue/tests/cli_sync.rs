@@ -531,3 +531,99 @@ fn approval_sync_keeps_an_existing_notify_subscription() {
     sync_json(&fx, &gh, &["--all-open", "--limit", "100"]);
     assert_eq!(item(&items(&fx), 3)["notify"], "lane-author");
 }
+
+/// Approval at head must fail closed when review data cannot be had: a failed or garbled list
+/// call changes nothing (no new submission, no withdrawal), and missing or null review fields
+/// never approve.
+#[test]
+fn a_failed_review_fetch_fails_closed() {
+    let fx = Fixture::new("sync-approval-fetch-fails");
+    let gh = stub(&fx);
+    let (agentctl, _sent) = fake_agentctl(&fx);
+    fx.mq_ok(&[
+        "init",
+        "--github-repo",
+        "owner/name",
+        "--gh",
+        &gh.stub,
+        "--require-approval-at-head",
+        "--agentctl",
+        &agentctl,
+        "--validator",
+        "command",
+        "--validator-run",
+        "exit 0",
+    ]);
+    let h1 = pull_request(&fx, 1, &[("one", "1\n")]);
+    let h2 = pull_request(&fx, 2, &[("two", "2\n")]);
+    std::fs::write(
+        &gh.list,
+        listing_reviewed(&[(1, &h1, "lane-fictional", &[("APPROVED", &h1)])]),
+    )
+    .unwrap();
+    let r = sync_json(&fx, &gh, &["--all-open", "--limit", "100"]);
+    assert_eq!(r["submitted"], serde_json::json!([1]), "{r}");
+
+    // The hosting service errors: the sync fails, #1 stays queued, nothing else is submitted.
+    std::fs::write(
+        &gh.stub,
+        "#!/bin/sh\necho 'HTTP 502: bad gateway' >&2\nexit 1\n",
+    )
+    .unwrap();
+    let out = fx.mq_env(&["sync", "--all-open", "--limit", "100"], &env(&gh));
+    assert!(!out.status.success(), "a failed fetch must fail the sync");
+    // Garbled output (truncated JSON) fails the same way.
+    std::fs::write(
+        &gh.stub,
+        "#!/bin/sh\necho '[{\"number\": 2, \"headRefOid\"'\n",
+    )
+    .unwrap();
+    let out = fx.mq_env(&["sync", "--all-open", "--limit", "100"], &env(&gh));
+    assert!(!out.status.success(), "garbled output must fail the sync");
+    let all = items(&fx);
+    assert_eq!(item(&all, 1)["status"], "queued", "{all}");
+    assert!(
+        all.as_array().unwrap().iter().all(|i| i["pr"] != 2),
+        "{all}"
+    );
+
+    // The API answers but carries no review data for #2 (fields omitted), or null reviews:
+    // neither approves.
+    std::fs::write(&gh.stub, STUB_GH).unwrap();
+    let omitted = serde_json::json!([{
+        "number": 2, "headRefOid": h2, "isDraft": false, "title": "change 2",
+        "author": {"login": "lane-fictional"}, "labels": []
+    }]);
+    std::fs::write(&gh.list, omitted.to_string()).unwrap();
+    let out = fx.mq_env(
+        &["sync", "--all-open", "--limit", "100", "--json"],
+        &env(&gh),
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    if out.status.success() {
+        let r: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(r["submitted"], serde_json::json!([]), "{r}");
+    }
+    let nulls = serde_json::json!([{
+        "number": 2, "headRefOid": h2, "isDraft": false, "title": "change 2",
+        "author": {"login": "lane-fictional"}, "labels": [],
+        "reviews": null, "latestReviews": null, "reviewDecision": null
+    }]);
+    std::fs::write(&gh.list, nulls.to_string()).unwrap();
+    let out = fx.mq_env(
+        &["sync", "--all-open", "--limit", "100", "--json"],
+        &env(&gh),
+    );
+    if out.status.success() {
+        let r: Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+        assert_eq!(r["submitted"], serde_json::json!([]), "{r}");
+    }
+    let all = items(&fx);
+    assert!(
+        all.as_array()
+            .unwrap()
+            .iter()
+            .all(|i| i["pr"] != 2 || i["status"] != "queued"),
+        "#2 was never approved: {all}"
+    );
+}
