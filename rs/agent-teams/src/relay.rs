@@ -70,12 +70,18 @@ pub fn render_post(envelope: &Value) -> String {
 }
 
 /// Render one receipt as a thread post: tag line, `receipt: <state>`, then
-/// the authoritative receipt JSON in a fenced block.
+/// the authoritative receipt JSON in a fenced block. The header names
+/// the receipt's real direction: from the receiving side, to the
+/// original sender, keeping the original message ID so it threads and
+/// the bracketed-prefix tag check on inbound receipts still matches.
 pub fn render_receipt(envelope: &Value, receipt: &Value) -> String {
     let state = receipt.get("state").and_then(Value::as_str).unwrap_or("?");
+    let mut header_envelope = envelope.clone();
+    header_envelope["from"] = envelope.get("to").cloned().unwrap_or(Value::Null);
+    header_envelope["to"] = envelope.get("from").cloned().unwrap_or(Value::Null);
     format!(
         "{} receipt: {}\n```{RECEIPT_FENCE}\n{}\n```\n",
-        team_tag(envelope),
+        team_tag(&header_envelope),
         state,
         receipt
     )
@@ -2263,6 +2269,43 @@ mod tests {
         assert_eq!(a, repo_id("git@github.com:example/repo"));
         assert_eq!(a, repo_id("https://github.com/example/repo/"));
         assert_ne!(a, repo_id("https://github.com/example/other"));
+    }
+
+    #[test]
+    fn receipt_header_names_the_receipts_real_direction() {
+        let envelope = crate::envelope::build_envelope(
+            "tm-sim-0123456789abcdef",
+            "k",
+            "sim",
+            "host-b",
+            1,
+            "harness-ancestry",
+            "tools",
+            "host-a",
+            "info",
+            None,
+            &[],
+            false,
+            0,
+            7_200_000,
+            None,
+            "hello",
+        );
+        let receipt = json!({"schema": "agent-teams-receipt/v1", "id": "tm-sim-0123456789abcdef", "state": "accepted", "detail": "ok", "at": "2026-01-01T00:00:00Z"});
+        let text = render_receipt(&envelope, &receipt);
+        // From the receiving side (tools@host-a), to the original sender
+        // (sim@host-b), same ID, then `receipt: accepted`.
+        assert!(
+            text.starts_with(
+                "[from tools@host-a via agent-teams · to: sim@host-b · id: tm-sim-0123456789abcdef] receipt: accepted\n"
+            ),
+            "{text}"
+        );
+        // The inbound parser still accepts it as this message's receipt.
+        assert_eq!(
+            parse_post(&text).expect("parse receipt post"),
+            RelayPost::Receipt(receipt)
+        );
     }
 
     #[test]
