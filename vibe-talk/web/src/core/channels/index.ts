@@ -51,3 +51,5 @@ export { AUTHORS_KEY, BUCKETS, LEGACY_AUTHORS_KEY, SELF_ID_KEY, codingAgentsFrom
 export type { CodingAgents, DescribedAccounts, Identities, IdentitiesDependencies, IdentityReader, SeenAuthor } from "./identities.ts";
 export { SUMMARY_IN_FLIGHT, createSummaries, summaryKey } from "./summaries.ts";
 export type { HeldSummary, Summaries, SummariesDependencies, SummaryAnswer, SummaryTarget } from "./summaries.ts";
+export { createChannelDirectory } from "./directory.ts";
+export type { ChannelDirectory, DeploymentCapabilities } from "./directory.ts";

@@ -254,7 +254,7 @@ function selectedChannelId() {
  * @param {string} id
  */
 function chooseChannel(id) {
-  selectionOwner().selectChannel(knownChannels.some((channel) => String(channel.id) === String(id)) ? String(id) : "");
+  selectionOwner().selectChannel(channelDirectory.channels().some((channel) => String(channel.id) === String(id)) ? String(id) : "");
 }
 
 /**
@@ -754,8 +754,8 @@ function voiceTranscript() {
     get resumeLast() { return resumeLast; },
     set resumeLast(value) { resumeLast = value; },
     get relayAnswerAwaited() { return voiceCall().relayAnswerAwaited; },
-    get knownChannels() { return knownChannels; },
-    get chatProviderName() { return chatProviderName; },
+    get knownChannels() { return channelDirectory.channels(); },
+    get chatProviderName() { return channelDirectory.providerName(); },
     get sidePane() { return sidePane; },
     get COLLAPSE_OVER_CHARS() { return COLLAPSE_OVER_CHARS; },
     get FOLD_LESS() { return FOLD_LESS; },
@@ -1742,7 +1742,7 @@ function deepLinkRefOf(message) {
   const channel = String((message && message.channel_id) || selectedChannelId() || "");
   const described = providerOfChannel(channel);
   const name = described && typeof described.name === "string" && described.name.trim()
-    ? described.name.trim() : chatProviderName;
+    ? described.name.trim() : channelDirectory.providerName();
   const thread = threadOf(message);
   const record = message && message.thread;
   const root = !record || record.is_root === true || String(record.root_message_id || "") === String(message.id);
@@ -1878,7 +1878,7 @@ async function applyDeepLink() {
   // Until the channel itself is on screen: applied over sign-in or the call view, the page's
   // own open would simply overwrite it. Giving up here is not final — the next place noted
   // kicks this again (`scheduleBackSync`); applied is only ever set past this wait.
-  if (!await waitForDeepLink(() => Boolean(token()) && knownChannels.length > 0 &&
+  if (!await waitForDeepLink(() => Boolean(token()) && channelDirectory.channels().length > 0 &&
       Boolean(selectedChannelId()) && currentScreen === "main" && currentView === "discord")) return;
   deepLinkApplied = true;
   // A reader who chose a channel or a view while that wait ran is not moved at all — least
@@ -1886,7 +1886,7 @@ async function applyDeepLink() {
   if (epoch !== deepLinkEpoch || deepLinkReaderMoved()) return;
   const wantedChannel = (wanted.message && wanted.message.channel) || wanted.channel;
   if (wantedChannel) {
-    if (!knownChannels.some((channel) => String(channel.id) === wantedChannel)) {
+    if (!channelDirectory.channels().some((channel) => String(channel.id) === wantedChannel)) {
       setStatus("That link names a channel this server does not read.");
       syncDeepLinkAddress();
       return;
@@ -2084,7 +2084,7 @@ function chooseOpenInView(view) {
 
 /** Whether a link to `ref` is this app's now: the switch on, and its channel one this server reads. */
 function keepsInApp(ref) {
-  return inAppLinks && Boolean(ref) && knownChannels.some((channel) => String(channel.id) === ref.channel);
+  return inAppLinks && Boolean(ref) && channelDirectory.channels().some((channel) => String(channel.id) === ref.channel);
 }
 
 /** The words for a link to `ref` whose text was only its address: where it goes, in this app's names. */
@@ -2326,7 +2326,7 @@ async function jumpFromSpot(ref, spot, options = {}) {
       return;
     }
     const provider = providerOfChannel(channel);
-    const name = provider && typeof provider.name === "string" && provider.name.trim() ? provider.name.trim() : chatProviderName;
+    const name = provider && typeof provider.name === "string" && provider.name.trim() ? provider.name.trim() : channelDirectory.providerName();
     deepLinkFocus = { provider: String(name || ref.service).toLowerCase(), channel, message: ref.message, thread: ref.thread };
     const target = ref.message;
     // A Back while the walk looks further back ends it: nothing lands over the place put back.
@@ -2374,7 +2374,7 @@ async function returnToLinkSpot(spot) {
   }
   const place = spot.place;
   if (!place || currentScreen !== "main" || currentView !== "discord") return;
-  if (!knownChannels.some((channel) => String(channel.id) === place.channel)) return;
+  if (!channelDirectory.channels().some((channel) => String(channel.id) === place.channel)) return;
   if (String(selectedChannelId()) !== place.channel) {
     arriveOnChannel(place.channel);
     if (!await linkJumpRead(place.channel, ticket)) return;
@@ -9956,7 +9956,7 @@ const KEYMAP = [
     // now (`#409 open-upstream-link`), which a pointer can copy from; this key stays the
     // keyboard's way to the same copy.
     group: KEYS_MESSAGE, chords: [{ key: "l" }],
-    does: () => `Copy its link in ${providerDescriptions.size > 1 ? "its chat service" : chatServiceName()}: the message's own address there, where the server could form one`,
+    does: () => `Copy its link in ${channelDirectory.providers().size > 1 ? "its chat service" : chatServiceName()}: the message's own address there, where the server could form one`,
     rowControls: ["row-copy-link-button"],
     run: (event, target) => copyLinkFromKeyboard(target),
   },
@@ -9974,7 +9974,7 @@ const KEYMAP = [
     // exactly as a tap on it — and the browser's own Open File does not come up over it. On a
     // row with no address the link is not there to press and the key is left alone, as l is.
     group: KEYS_MESSAGE, chords: [{ key: "o", mod: true }],
-    does: () => `Open it in ${providerDescriptions.size > 1 ? "its chat service" : chatServiceName()}, in a new tab: the same address Copy its link copies, where the server could form one`,
+    does: () => `Open it in ${channelDirectory.providers().size > 1 ? "its chat service" : chatServiceName()}, in a new tab: the same address Copy its link copies, where the server could form one`,
     rowControls: ["row-open-link-button"],
     // `pressRowButton` answers "took" where it took the row's selection but found no link:
     // that is this key not acted on, not an opening, so it is left to the browser like any
@@ -12343,7 +12343,7 @@ function saveCacheShell(config) {
 function saveCacheChannels() {
   const cache = readMessageCache();
   if (!cache || !cache.shell) return;
-  cache.shell.channels = knownChannels;
+  cache.shell.channels = channelDirectory.channels();
   writeMessageCache(cache);
 }
 
@@ -12790,8 +12790,8 @@ function hydrateFromCache() {
   if (!cache || !cache.shell) return false;
   const shell = cache.shell;
   threadingSupported = shell.threading_supported === true;
-  deploymentCapabilities.threading = threadingSupported;
-  knownChannels = shell.channels;
+  channelDirectory.setCapability("threading", threadingSupported);
+  channelDirectory.setChannels(shell.channels);
   learnProviders(shell.providers);
   whoIsWho.setDeploymentCodingAgents(shell);
   if (shell.self_author_id) noteSelfAuthor(shell.self_author_id);
@@ -13509,11 +13509,11 @@ function replyRoute(message, bound = false) {
  * answers for its own, as in `channelPostsOnce`.
  */
 function channelRepliesInThread(channel) {
-  if (providerDescriptions.size) {
+  if (channelDirectory.providers().size) {
     const provider = providerOfChannel(channel);
     return Boolean(provider && provider.replies_in_thread === true);
   }
-  return deploymentCapabilities.repliesInThread;
+  return channelDirectory.capabilities().repliesInThread;
 }
 
 /** How many replies a thread has, from its summary or the message's own thread record. */
@@ -13576,7 +13576,7 @@ let threadHuesSaveOwed = false;
 
 /** Where a channel's colours are kept: by provider as well, since two services may share an id. */
 function threadHueScope(channel) {
-  const known = knownChannels.find((candidate) => String(candidate.id) === String(channel));
+  const known = channelDirectory.channels().find((candidate) => String(candidate.id) === String(channel));
   return JSON.stringify([known && typeof known.provider === "string" ? known.provider : "", String(channel)]);
 }
 
@@ -18994,11 +18994,11 @@ const IDEMPOTENCY_KEY = /^[A-Za-z0-9_-]{1,64}$/;
 function channelPostsOnce(channel) {
   // With several providers each channel answers for its own; a channel the server described no
   // provider for is not given another provider's guarantee.
-  if (providerDescriptions.size) {
+  if (channelDirectory.providers().size) {
     const provider = providerOfChannel(channel);
     return Boolean(provider && provider.idempotent_posts_supported === true);
   }
-  return deploymentCapabilities.idempotentPosts;
+  return channelDirectory.capabilities().idempotentPosts;
 }
 
 /**
@@ -23096,7 +23096,7 @@ function discordNode(messages) {
   // NAMED FOR WHAT IT CHANGES. It moves the chat service's OWN read marker — visible in that
   // service's app — and only for the whole conversation: Google Chat lets a thread's read state be
   // read but not set. The owner took it for this app's own read tracking, which is Done.
-  const service = chatProviderName || "the chat service";
+  const service = channelDirectory.providerName() || "the chat service";
   upstreamRead.setAttribute(
     "title",
     `Move ${service}'s own read marker for the whole space to this message, so ${service} shows ` +
@@ -23447,7 +23447,7 @@ async function markReadThroughHere(row, upstreamId) {
     }
   }
   let upstream = false;
-  const service = chatProviderName || "the chat service";
+  const service = channelDirectory.providerName() || "the chat service";
   const count = `${ids.length} message${ids.length === 1 ? "" : "s"}`;
   if (upstreamReadMarkSupported && upstreamId) {
     // `#327 done-races-remaining`. The chat service's marker, which cannot be moved back, is moved only
@@ -23543,18 +23543,18 @@ function upstreamAppUrlOf(message) {
 function upstreamServiceName(message) {
   for (const id of [message && message.channel_id, currentChannelId()]) {
     if (!id) continue;
-    const channel = knownChannels.find((candidate) => String(candidate.id) === String(id));
+    const channel = channelDirectory.channels().find((candidate) => String(candidate.id) === String(id));
     const key = channel && typeof channel.provider === "string" ? channel.provider : null;
     // The channel picker's own words for the service (`serviceLabel`), which tell two services
     // of one name apart by their key: two workspaces both called Slack must not offer the same
     // label over different links.
-    if (key && providerDescriptions.has(key)) return serviceLabel(key);
+    if (key && channelDirectory.providers().has(key)) return serviceLabel(key);
     const provider = providerOfChannel(id);
     if (provider && typeof provider.name === "string" && provider.name.trim()) return provider.name.trim();
   }
   // No described provider for the channel: with several services the deployment's joined name
   // ("Slack and Google Chat") names neither, so the item stays generic rather than wrong.
-  return providerDescriptions.size > 1 ? "the chat service" : chatServiceName();
+  return channelDirectory.providers().size > 1 ? "the chat service" : chatServiceName();
 }
 
 /**
@@ -24009,7 +24009,7 @@ function historyReach() {
 function serviceWords() {
   const provider = providerOfChannel(selectedChannelId());
   const name = provider && typeof provider.name === "string" ? provider.name.trim() : "";
-  return name || chatProviderName || "the chat service";
+  return name || channelDirectory.providerName() || "the chat service";
 }
 
 /** What the last walk in the column being worked on found, under its control, until the search changes. */
@@ -24459,7 +24459,7 @@ function serverHitNode(hit) {
     // The answer names every channel it searched, the one the page knows by the owner's name.
     const scope = serverSearchNow().scopes.find((one) => String(one.channel.id) === String(hit.channel_id));
     const where = document.createElement("span");
-    where.textContent = `#${channelName(knownChannels.find((one) => String(one.id) === String(hit.channel_id)) ||
+    where.textContent = `#${channelName(channelDirectory.channels().find((one) => String(one.id) === String(hit.channel_id)) ||
       (scope ? scope.channel : { id: hit.channel_id }))}`;
     meta.append(where);
   }
@@ -24477,7 +24477,7 @@ function serverHitNode(hit) {
   show.setAttribute("type", "button");
   show.textContent = "Show in channel";
   show.addEventListener("click", () => guardQuietly(() => jumpToMessageLink({
-    service: String(chatProviderName || ""),
+    service: String(channelDirectory.providerName() || ""),
     channel: String(hit.channel_id),
     message: String(hit.id),
     thread: hit.thread && hit.thread.is_root === false ? String(hit.thread.id) : null,
@@ -27710,7 +27710,7 @@ async function togglePin(messages) {
   renderPins();
   // The list's revision has moved; read it again unless this change is all that moved it.
   notePinsRevision(revision);
-  const service = chatProviderName || "the chat service";
+  const service = channelDirectory.providerName() || "the chat service";
   if (!pinning) setStatus("Unpinned.");
   else if (unpinned.length > 0) {
     setStatus(`Pinned. The oldest pin here was unpinned to stay at ${pinStore.limit() || "the limit of"} pins.`);
@@ -29581,11 +29581,11 @@ async function markAnsweredDone(channel, id) {
  * own, as in `channelPostsOnce`. `#300 reply-marks-read`.
  */
 function channelMarksUpstream(channel) {
-  if (providerDescriptions.size) {
+  if (channelDirectory.providers().size) {
     const provider = providerOfChannel(channel);
     return Boolean(provider && provider.upstream_read_mark_supported === true);
   }
-  return deploymentCapabilities.upstreamReadMark;
+  return channelDirectory.capabilities().upstreamReadMark;
 }
 
 /**
@@ -36020,15 +36020,13 @@ function channelName(channel) {
   return alias || String(channel.label || channel.id || "this channel");
 }
 
-/** What the server last said the channels were, including the names the owner gave them. */
-let knownChannels = [];
-
 /**
- * Configured channels the owner took off his list, as the server last reported them. `#199
- * removable-config-channels`. Only Settings reads this, to offer each one back; a server that
- * cannot hide one, or a sign-in it was not sent to, leaves it empty.
+ * What the server last said the channels and their services were — the channels on the list, the
+ * configured ones taken off it, each provider's description, the deployment-wide capabilities, whether
+ * the bridge registers and lists channels, and the chat service's own name: web/src/core/channels's
+ * (`createChannelDirectory`, `#624 voice-page-modularity`), with why each is kept.
  */
-let hiddenChannels = [];
+const channelDirectory = createChannelDirectory();
 
 /**
  * What the page says where a channel would be when the list is empty: in Settings, which holds both
@@ -36041,59 +36039,19 @@ const NO_CHANNEL_TO_READ =
   "no channel to read — your channel list is empty. " +
   "Add one, or show a hidden one again, in Settings.";
 
-/** Whether the provider bridge resolves channel links or references into stable channel ids. */
-let channelRegistrationSupported = false;
-
-/** Whether the bridge can list the channels its account sees. `#19 channel-browser`. */
-let channelDiscoverySupported = false;
-/**
- * The chat backend's own display name from client-config, or "" from an older server. Visible
- * copy names the service the reader recognises, never the connector that implements it.
- */
-let chatProviderName = "";
-
 /** The chat service as a noun phrase: its configured name, or a generic one. */
 function chatServiceName() {
-  return chatProviderName || "the chat service";
+  return channelDirectory.providerName() || "the chat service";
 }
-
-/**
- * Each configured chat provider, by key, from client-config's `providers`.
- *
- * A deployment may read several services, and they differ in what they can do: one has threads,
- * another does not; one is polled, another pushed. The page shows ONE channel at a time, so the
- * capability flags it acts on are that channel's provider's, applied whenever the channel changes
- * by `applyChannelProvider`. An older server sends no providers, and the deployment-wide flags it
- * does send are then the one provider's, exactly as before.
- */
-let providerDescriptions = new Map();
-let deploymentCapabilities = {
-  threading: false,
-  upstreamReadMark: false,
-  upstreamClear: false,
-  idempotentPosts: false,
-  repliesInThread: false,
-  liveDelivery: "off",
-  livePollSeconds: 0,
-};
 
 /** Remember every provider's description, and the accounts each one speaks as. */
 function learnProviders(providers) {
-  providerDescriptions = new Map();
-  const described = [];
-  for (const provider of Array.isArray(providers) ? providers : []) {
-    if (!provider || typeof provider.key !== "string") continue;
-    providerDescriptions.set(provider.key, provider);
-    described.push(provider);
-  }
-  whoIsWho.learnProviderAccounts(described);
+  whoIsWho.learnProviderAccounts(channelDirectory.learnProviders(providers));
 }
 
 /** The provider description for the channel `id`, or null when the server did not say. */
 function providerOfChannel(id) {
-  const channel = knownChannels.find((candidate) => String(candidate.id) === String(id));
-  const key = channel && typeof channel.provider === "string" ? channel.provider : null;
-  return (key && providerDescriptions.get(key)) || null;
+  return channelDirectory.providerOf(id);
 }
 
 // --- channels grouped by service -----------------------------------------------------------------
@@ -36107,11 +36065,11 @@ function providerOfChannel(id) {
 
 /** The header a group shows: the service's name, with its key where two services share it. */
 function serviceLabel(key) {
-  const described = providerDescriptions.get(key);
+  const described = channelDirectory.providers().get(key);
   const name = described && typeof described.name === "string" && described.name.trim()
     ? described.name.trim()
     : String(key);
-  const shared = [...providerDescriptions.values()].filter(
+  const shared = [...channelDirectory.providers().values()].filter(
     (other) => other !== described && typeof other.name === "string" && other.name.trim() === name
   ).length > 0;
   return shared ? `${name} (${key})` : name;
@@ -36127,14 +36085,14 @@ const UNDESCRIBED_SERVICE = "Not connected";
  *
  * @returns {{provider: string | null, heading: string, channels: any[]}[]}
  */
-function channelGroups(channels = knownChannels) {
-  const groups = [...providerDescriptions.keys()].map((key) => ({
+function channelGroups(channels = channelDirectory.channels()) {
+  const groups = [...channelDirectory.providers().keys()].map((key) => ({
     provider: /** @type {string | null} */ (key),
     heading: serviceLabel(key),
     channels: channels.filter((channel) => channel.provider === key),
   }));
   const rest = channels.filter(
-    (channel) => typeof channel.provider !== "string" || !providerDescriptions.has(channel.provider)
+    (channel) => typeof channel.provider !== "string" || !channelDirectory.providers().has(channel.provider)
   );
   groups.push({ provider: null, heading: UNDESCRIBED_SERVICE, channels: rest });
   return groups.filter((group) => group.channels.length > 0);
@@ -36151,7 +36109,7 @@ function channelsGrouped() {
  * opens on its first.
  */
 function channelsInPickerOrder() {
-  return channelsGrouped() ? channelGroups().flatMap((group) => group.channels) : knownChannels;
+  return channelsGrouped() ? channelGroups().flatMap((group) => group.channels) : channelDirectory.channels();
 }
 
 // --- Settings, one service at a time -------------------------------------------------------------
@@ -36175,24 +36133,24 @@ const NO_SERVICE = "";
 
 /** The channels of no service the server describes: the bar's "Not connected" group. */
 function strayChannels() {
-  return knownChannels.filter(
-    (channel) => typeof channel.provider !== "string" || !providerDescriptions.has(channel.provider)
+  return channelDirectory.channels().filter(
+    (channel) => typeof channel.provider !== "string" || !channelDirectory.providers().has(channel.provider)
   );
 }
 
 /** Whether `key` is an entry of the Service picker now: a described service, or "Not connected" while it holds channels. */
 function settingsServiceOffered(key) {
-  return providerDescriptions.has(key) || (key === NO_SERVICE && strayChannels().length > 0);
+  return channelDirectory.providers().has(key) || (key === NO_SERVICE && strayChannels().length > 0);
 }
 
 /** Whether Settings chooses a service first: the server describes two or more. */
 function servicesInSettings() {
-  return providerDescriptions.size >= 2;
+  return channelDirectory.providers().size >= 2;
 }
 
 /** The description of the service Settings is showing, or null with one service. */
 function settingsServiceDescription() {
-  return servicesInSettings() && settingsService !== null ? providerDescriptions.get(settingsService) || null : null;
+  return servicesInSettings() && settingsService !== null ? channelDirectory.providers().get(settingsService) || null : null;
 }
 
 /** The service Settings is showing, as a noun phrase: its name, or the one service's. */
@@ -36202,23 +36160,23 @@ function settingsServiceName() {
 
 /** The channels Settings' picker lists: the chosen service's, or every one with one service. */
 function settingsChannels() {
-  if (!servicesInSettings() || settingsService === null) return knownChannels;
+  if (!servicesInSettings() || settingsService === null) return channelDirectory.channels();
   if (settingsService === NO_SERVICE) return strayChannels();
-  return knownChannels.filter((channel) => channel.provider === settingsService);
+  return channelDirectory.channels().filter((channel) => channel.provider === settingsService);
 }
 
 /** The service Settings opens on with none chosen yet: the channel being read's, else the first with channels. */
 function defaultSettingsService() {
   const reading = knownChannel(selectedChannelId());
-  if (reading) return providerDescriptions.has(reading.provider) ? reading.provider : NO_SERVICE;
-  const keys = [...providerDescriptions.keys()];
-  return keys.find((key) => knownChannels.some((channel) => channel.provider === key)) || keys[0] || null;
+  if (reading) return channelDirectory.providers().has(reading.provider) ? reading.provider : NO_SERVICE;
+  const keys = [...channelDirectory.providers().keys()];
+  return keys.find((key) => channelDirectory.channels().some((channel) => channel.provider === key)) || keys[0] || null;
 }
 
 /** Whether the service Settings is showing takes a link or reference to add a channel, rather than an id. */
 function addsByLink() {
   const chosen = settingsServiceDescription();
-  return chosen ? chosen.channel_registration_supported === true : channelRegistrationSupported;
+  return chosen ? chosen.channel_registration_supported === true : channelDirectory.registrationSupported();
 }
 
 /** Whether Browse is offered: the service can list its channels and add one by reference. */
@@ -36226,7 +36184,7 @@ function browseOffered() {
   const chosen = settingsServiceDescription();
   return chosen
     ? chosen.channel_registration_supported === true && chosen.channel_discovery_supported === true
-    : channelDiscoverySupported;
+    : channelDirectory.discoverySupported();
 }
 
 // What the chosen service does here, the line under the Service picker, is web/src/present/settings's
@@ -36247,7 +36205,7 @@ function fillServiceSelect() {
     return;
   }
   if (settingsService === null || !settingsServiceOffered(settingsService)) settingsService = defaultSettingsService();
-  const keys = [...providerDescriptions.keys()];
+  const keys = [...channelDirectory.providers().keys()];
   if (strayChannels().length > 0) keys.push(NO_SERVICE);
   select.replaceChildren(...keys.map((key) => {
     const option = document.createElement("option");
@@ -36286,9 +36244,9 @@ function chooseSettingsService(key, channelId = null) {
 
 /** Point Settings at the channel `channelId`: its service, then it. */
 function pointSettingsAt(channelId) {
-  const listed = knownChannel(channelId) || hiddenChannels.find((channel) => String(channel.id) === String(channelId));
+  const listed = knownChannel(channelId) || channelDirectory.hidden().find((channel) => String(channel.id) === String(channelId));
   if (listed && servicesInSettings()) {
-    chooseSettingsService(providerDescriptions.has(listed.provider) ? listed.provider : NO_SERVICE, channelId);
+    chooseSettingsService(channelDirectory.providers().has(listed.provider) ? listed.provider : NO_SERVICE, channelId);
   } else {
     el("settings-channel").value = String(channelId);
   }
@@ -36302,7 +36260,7 @@ function pointSettingsAtReading() {
   if (!servicesInSettings()) return;
   const reading = knownChannel(selectedChannelId());
   if (!reading) return;
-  const service = providerDescriptions.has(reading.provider) ? reading.provider : NO_SERVICE;
+  const service = channelDirectory.providers().has(reading.provider) ? reading.provider : NO_SERVICE;
   if (service !== settingsService) chooseSettingsService(service, reading.id);
 }
 
@@ -36340,17 +36298,17 @@ function applyChannelProvider() {
   const provider = providerOfChannel(selectedChannelId());
   threadingSupported = provider
     ? provider.threading_supported === true
-    : deploymentCapabilities.threading;
+    : channelDirectory.capabilities().threading;
   upstreamReadMarkSupported = provider
     ? provider.upstream_read_mark_supported === true
-    : deploymentCapabilities.upstreamReadMark;
+    : channelDirectory.capabilities().upstreamReadMark;
   liveDelivery =
     provider && ["off", "poll", "push"].includes(provider.live_delivery)
       ? provider.live_delivery
-      : deploymentCapabilities.liveDelivery;
+      : channelDirectory.capabilities().liveDelivery;
   livePollSeconds = provider
     ? Number(provider.live_poll_seconds) || 0
-    : deploymentCapabilities.livePollSeconds;
+    : channelDirectory.capabilities().livePollSeconds;
   renderLiveState();
 }
 
@@ -36393,7 +36351,7 @@ function pickerName(name) {
 }
 
 function knownChannel(id) {
-  return knownChannels.find((channel) => String(channel.id) === String(id)) || null;
+  return channelDirectory.known(id);
 }
 
 /**
@@ -36477,9 +36435,9 @@ function fillChannelSelect(id) {
     }
   } else {
     // `#355 provider-grouped-channels`. Settings' picker lists the chosen service's channels only.
-    for (const channel of id === "settings-channel" ? settingsChannels() : knownChannels) select.append(optionFor(channel));
+    for (const channel of id === "settings-channel" ? settingsChannels() : channelDirectory.channels()) select.append(optionFor(channel));
   }
-  const order = grouped ? channelsInPickerOrder() : id === "settings-channel" ? settingsChannels() : knownChannels;
+  const order = grouped ? channelsInPickerOrder() : id === "settings-channel" ? settingsChannels() : channelDirectory.channels();
   const showing = all && chosen === ALL_CHANNELS
     ? ALL_CHANNELS
     : order.some((channel) => String(channel.id) === String(chosen))
@@ -36523,10 +36481,10 @@ function renderRemoveChannel(channel) {
 function renderHiddenChannels() {
   // `#355 provider-grouped-channels`. With several services, the chosen service's hidden channels.
   const shown = !servicesInSettings() || settingsService === null
-    ? hiddenChannels
+    ? channelDirectory.hidden()
     : settingsService === NO_SERVICE
-      ? hiddenChannels.filter((channel) => typeof channel.provider !== "string" || !providerDescriptions.has(channel.provider))
-      : hiddenChannels.filter((channel) => channel.provider === settingsService);
+      ? channelDirectory.hidden().filter((channel) => typeof channel.provider !== "string" || !channelDirectory.providers().has(channel.provider))
+      : channelDirectory.hidden().filter((channel) => channel.provider === settingsService);
   const rows = shown.map((channel) => {
     const row = document.createElement("li");
     const name = document.createElement("span");
@@ -36549,8 +36507,8 @@ function renderHiddenChannels() {
 
 /** Take the server's whole answer about the list: both pickers, the hidden list, the cache. */
 function adoptChannelList(payload) {
-  if (payload && Array.isArray(payload.channels)) knownChannels = payload.channels;
-  if (payload && Array.isArray(payload.hidden_channels)) hiddenChannels = payload.hidden_channels;
+  if (payload && Array.isArray(payload.channels)) channelDirectory.setChannels(payload.channels);
+  if (payload && Array.isArray(payload.hidden_channels)) channelDirectory.setHidden(payload.hidden_channels);
   saveCacheChannels();
   fillServiceSelect();
   fillChannelSelect("discord-channel");
@@ -36696,7 +36654,7 @@ const allChannelsChosen = () => el("settings-channel").value === ALL_CHANNELS;
 /** `#355 provider-grouped-channels`. What Settings says for a service with no channel on the list. */
 function emptyServiceSentence() {
   // Worded by web/src/present/settings (`emptyServiceWords`, `#624 voice-page-modularity`).
-  return emptyServiceWords(browseOffered(), hiddenChannels.some((channel) => channel.provider === settingsService),
+  return emptyServiceWords(browseOffered(), channelDirectory.hidden().some((channel) => channel.provider === settingsService),
     settingsServiceName());
 }
 
@@ -36748,7 +36706,7 @@ function renderAliasEditor() {
  */
 function writeSourceSentence(channel) {
   const described = providerOfChannel(channel.id);
-  const service = (described && typeof described.name === "string" && described.name.trim()) || chatProviderName || "the chat service";
+  const service = (described && typeof described.name === "string" && described.name.trim()) || channelDirectory.providerName() || "the chat service";
   // Worded by web/src/present/settings (`writeSourceWords`, `#624 voice-page-modularity`).
   return writeSourceWords(channel, service);
 }
@@ -36765,7 +36723,7 @@ function writeSourceSentence(channel) {
 function upstreamClearOffered(id) {
   if (tokenScope !== "write" || !knownChannel(id)) return false;
   const provider = providerOfChannel(id);
-  return provider ? provider.upstream_clear_supported === true : deploymentCapabilities.upstreamClear;
+  return provider ? provider.upstream_clear_supported === true : channelDirectory.capabilities().upstreamClear;
 }
 
 /**
@@ -36875,9 +36833,7 @@ function restateChannelSeam() {
 function adoptChannel(payload) {
   const updated = payload && payload.channel;
   if (updated) {
-    knownChannels = knownChannels.map((channel) =>
-      String(channel.id) === String(updated.id) ? updated : channel
-    );
+    channelDirectory.replaceChannel(updated);
     saveCacheChannels();
   }
   el("alias-note").textContent = (payload && payload.alias_notice) || "";
@@ -36992,17 +36948,17 @@ function applyClientConfig(config) {
   if (readAloudOwner().witReadAloud) void readAloudOwner().loadWitVoices();
   readAloudOwner().applyReadSpeed(readAloudOwner().readSpeed);
   threadingSupported = config.threading_supported === true;
-  deploymentCapabilities.threading = threadingSupported;
+  channelDirectory.setCapability("threading", threadingSupported);
   // `#528 thread-card-markdown-and-cap`: whether a long first message's summary may be on its way.
   threadNamesSupported = config.thread_names_supported === true;
   learnProviders(config.providers);
   whoIsWho.setDeploymentCodingAgents(config);
   // The selected backend owns its display name. An older server leaves it unspecified, so the
   // page stays neutral instead of guessing a platform from channel IDs or deployment details.
-  chatProviderName =
-    typeof config.chat_provider_name === "string" ? config.chat_provider_name.trim() : "";
+  channelDirectory.setProviderName(
+    typeof config.chat_provider_name === "string" ? config.chat_provider_name.trim() : "");
   for (const id of ["chat-provider-settings", "chat-provider-help"]) {
-    el(id).textContent = chatProviderName || "Chat";
+    el(id).textContent = channelDirectory.providerName() || "Chat";
   }
   // `#408 copy-upstream-link`: the list of keys was said at first load, before any service was
   // named; say it again now the names are known, so the link's keys name their service.
@@ -37047,16 +37003,16 @@ function applyClientConfig(config) {
   renderAgentLink();
   // `#39 channel-alias`. Both pickers are drawn from the same list and through the same naming
   // rule, so the name in the bar and the name in Settings are one answer rather than two.
-  knownChannels = config.channels || [];
-  hiddenChannels = Array.isArray(config.hidden_channels) ? config.hidden_channels : [];
+  channelDirectory.setChannels(config.channels || []);
+  channelDirectory.setHidden(Array.isArray(config.hidden_channels) ? config.hidden_channels : []);
   renderHiddenChannels();
-  channelRegistrationSupported = config.channel_registration_supported === true;
-  channelDiscoverySupported =
-    channelRegistrationSupported && config.channel_discovery_supported === true;
+  channelDirectory.setRegistrationSupported(config.channel_registration_supported === true);
+  channelDirectory.setDiscoverySupported(
+    channelDirectory.registrationSupported() && config.channel_discovery_supported === true);
   // `#232 upstream-mark-read`. Read per channel, by `upstreamClearOffered`, in the channel box —
   // and, with the token's scope, by Settings' picker as it is filled, which offers All channels only
   // where one channel can take Clear unread (`#351 settings-polish`). So both before the pickers.
-  deploymentCapabilities.upstreamClear = config.upstream_clear_supported === true;
+  channelDirectory.setCapability("upstreamClear", config.upstream_clear_supported === true);
   tokenScope = ["read", "write"].includes(config.token_scope) ? config.token_scope : null;
   // `#457 settings-server-side`. Only a server that says it keeps settings is asked for
   // them: an older one is never probed for a route it has not got.
@@ -37082,19 +37038,19 @@ function applyClientConfig(config) {
       ? "poll"
       : "off";
   upstreamReadMarkSupported = config.upstream_read_mark_supported === true;
-  deploymentCapabilities.upstreamReadMark = upstreamReadMarkSupported;
+  channelDirectory.setCapability("upstreamReadMark", upstreamReadMarkSupported);
   // `#195 send-resilience`. Read per channel, by `channelPostsOnce`, when a send fails.
-  deploymentCapabilities.idempotentPosts = config.idempotent_posts_supported === true;
+  channelDirectory.setCapability("idempotentPosts", config.idempotent_posts_supported === true);
   // `#252 thread-button-state`. Read per channel, by `channelRepliesInThread`, for a reply's route.
-  deploymentCapabilities.repliesInThread = config.replies_in_thread === true;
+  channelDirectory.setCapability("repliesInThread", config.replies_in_thread === true);
   summaryRows.setDisabledByServer(
     typeof config.summaries_unavailable === "string" ? config.summaries_unavailable.trim() : "");
   if (summaryRows.disabledByServer() && summaryRows.mode()) setSummaryMode(false);
   // ...and back on when the server can summarise again and the owner's setting still says so.
   else if (!summaryRows.disabledByServer() && !summaryRows.mode() && storedSummarizeCollapsed()) setSummaryMode(true);
   renderScrollTools();
-  deploymentCapabilities.liveDelivery = liveDelivery;
-  deploymentCapabilities.livePollSeconds = livePollSeconds;
+  channelDirectory.setCapability("liveDelivery", liveDelivery);
+  channelDirectory.setCapability("livePollSeconds", livePollSeconds);
   // The picker already holds a channel; the flags above are the deployment's, and that channel's
   // own provider may answer differently.
   applyChannelProvider();
@@ -37140,7 +37096,7 @@ function applyClientConfig(config) {
   saveCacheShell(config);
   // ...and the views chosen in channels it no longer lists, as their saved rows went: a thread's
   // summary is the credential's reading too. `#205 channel-view-memory`.
-  const listed = new Set(knownChannels.map((channel) => String(channel.id)));
+  const listed = new Set(channelDirectory.channels().map((channel) => String(channel.id)));
   if (uiState.chosenViewsNow().some((entry) => !listed.has(entry.channel))) {
     uiState.forgetChosen((channel) => !listed.has(channel));
     saveUiState();

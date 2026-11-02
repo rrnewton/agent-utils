@@ -99,6 +99,7 @@ declare const foldLiveIn: LegacyImports["foldLiveIn"];
 declare const foldPageIn: LegacyImports["foldPageIn"];
 declare const emptyTally: LegacyImports["emptyTally"];
 declare const createChannelStore: LegacyImports["createChannelStore"];
+declare const createChannelDirectory: LegacyImports["createChannelDirectory"];
 declare const createSummaries: LegacyImports["createSummaries"];
 declare const summaryKey: LegacyImports["summaryKey"];
 declare const createIdentities: LegacyImports["createIdentities"];

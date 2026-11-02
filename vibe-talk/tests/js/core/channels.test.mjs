@@ -629,3 +629,38 @@ test("`#624 voice-page-modularity`: summaries are asked once per row, two at a t
   assert.deepStrictEqual(rows.setMode(true), { entered: false, recheck: false });
   assert.ok(renders > 0);
 });
+
+test("`#624 voice-page-modularity`: the channel directory holds what the server said the channels and services are", () => {
+  const { createChannelDirectory } = CHANNELS;
+  const directory = createChannelDirectory();
+  assert.deepStrictEqual([directory.channels(), directory.hidden(), directory.known("1"), directory.providerOf("1")],
+    [[], [], null, null]);
+  assert.deepStrictEqual(directory.capabilities(), { threading: false, upstreamReadMark: false, upstreamClear: false,
+    idempotentPosts: false, repliesInThread: false, liveDelivery: "off", livePollSeconds: 0 });
+  const kept = directory.learnProviders([{ key: "slack" }, null, { key: 3 }, { key: "discord" }, { key: "slack", name: "again" }]);
+  assert.deepStrictEqual(kept.map((one) => one.key), ["slack", "discord", "slack"], "every provider that passes is kept");
+  assert.deepStrictEqual([...directory.providers().keys()], ["slack", "discord"]);
+  assert.equal(directory.providers().get("slack").name, "again", "the later description of a key did not win");
+  assert.deepStrictEqual(directory.learnProviders("not a list"), []);
+  assert.equal(directory.providers().size, 0, "learning replaces what was known");
+  directory.learnProviders([{ key: "slack" }]);
+  const list = [{ id: 1, label: "one", provider: "slack" }, { id: "2", label: "two" }];
+  directory.setChannels(list);
+  assert.equal(directory.channels(), list);
+  assert.equal(directory.known("1"), list[0], "ids are compared as strings");
+  assert.equal(directory.providerOf(1).key, "slack");
+  assert.equal(directory.providerOf("2"), null);
+  directory.replaceChannel({ id: "1", label: "renamed", provider: "slack" });
+  assert.deepStrictEqual(directory.channels().map((one) => one.label), ["renamed", "two"]);
+  assert.notEqual(directory.channels(), list, "a replacement changed the server's list in place");
+  directory.setHidden([{ id: "9" }]);
+  assert.deepStrictEqual(directory.hidden(), [{ id: "9" }]);
+  directory.setCapability("threading", true);
+  directory.setCapability("liveDelivery", "push");
+  assert.equal(directory.capabilities().threading && directory.capabilities().liveDelivery === "push", true);
+  directory.setRegistrationSupported(true);
+  directory.setDiscoverySupported(true);
+  directory.setProviderName("Example Chat");
+  assert.deepStrictEqual([directory.registrationSupported(), directory.discoverySupported(), directory.providerName()],
+    [true, true, "Example Chat"]);
+});
