@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-782-c14e0ba64cc",
+    "issue_id": "agent-utils-782",
+    "author": "devbig014",
+    "body": "[muse watermelon-full-preview] Landed on agent-utils main ba0d8c8bb8053e22aa96d2cbef5b9ed11f31fd6c (#770 agent-teams-relay-fallback-route + #782 agent-teams-relay-mirror, gate 27/27).\n\nNote for later (not code now): receipt posts run receipt_argv with the fixed 10s post timeout (relay::POST_TIMEOUT_SECONDS); no route's post_timeout_seconds covers receipt_argv. If a receipt helper ever needs to wait out Slack retry_after longer than 10s, receipts will time out while accept/mirror posts (which do honour post_timeout_seconds) succeed.",
+    "created_at": "2026-11-02T19:39:11.282494422Z",
+    "updated_at": "2026-11-02T19:39:11.282494422Z"
+  }
+]

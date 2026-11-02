@@ -1,13 +1,14 @@
 ---
 title: 'agent-teams-relay-fallback-route: fall back to the relay instead of expiring messages when a route is down'
-status: open
+status: closed
 priority: 3
-assignee: mu-mirror@devbig014
 issue_type: task
+assignee: mu-mirror@devbig014
 labels:
 - agent-teams
 created_at: 2026-11-02T16:26:35.790042720+00:00
-updated_at: 2026-11-02T16:26:35.790042720+00:00
+updated_at: 2026-11-02T19:39:07.596674467+00:00
+closed_at: 2026-11-02T19:39:07.596674327+00:00
 ---
 
 # Description

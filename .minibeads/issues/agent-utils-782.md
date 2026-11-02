@@ -1,15 +1,16 @@
 ---
 title: 'agent-teams-relay-mirror: mirror every inter-team message to the relay channel while delivering directly'
-status: open
+status: closed
 priority: 2
-assignee: mu-mirror@devbig014
 issue_type: feature
+assignee: mu-mirror@devbig014
 labels:
 - agent-teams
 depends_on:
   agent-utils-770: blocks
 created_at: 2026-11-02T17:42:56.458057350+00:00
-updated_at: 2026-11-02T17:42:56.458057350+00:00
+updated_at: 2026-11-02T19:39:07.596839945+00:00
+closed_at: 2026-11-02T19:39:07.596839885+00:00
 ---
 
 # Description
