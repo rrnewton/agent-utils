@@ -28,6 +28,7 @@ from dagrun.model import (
     STRUCTURED_TEST_RESULTS_CURRENT_SCHEMA,
     STRUCTURED_TEST_RESULTS_CLASSIFIED_SCHEMA,
     STRUCTURED_TEST_RESULTS_DIAGNOSTIC_SCHEMA,
+    STRUCTURED_TEST_RESULTS_SKIPPED_SCHEMA,
     CmdType,
     DagConfig,
     DagManifest,
@@ -1013,12 +1014,14 @@ def _result_manifest_value_from(value: object, where: str) -> ResultManifest:
         STRUCTURED_TEST_RESULTS_CURRENT_SCHEMA,
         STRUCTURED_TEST_RESULTS_CLASSIFIED_SCHEMA,
         STRUCTURED_TEST_RESULTS_DIAGNOSTIC_SCHEMA,
+        STRUCTURED_TEST_RESULTS_SKIPPED_SCHEMA,
     }:
         raise DagJsonError(
             f"{where}.schema: structured test results require default schema "
             f"{STRUCTURED_TEST_RESULTS_CURRENT_SCHEMA}, classified schema "
-            f"{STRUCTURED_TEST_RESULTS_CLASSIFIED_SCHEMA} or diagnostic schema "
-            f"{STRUCTURED_TEST_RESULTS_DIAGNOSTIC_SCHEMA}, got {schema}"
+            f"{STRUCTURED_TEST_RESULTS_CLASSIFIED_SCHEMA}, diagnostic schema "
+            f"{STRUCTURED_TEST_RESULTS_DIAGNOSTIC_SCHEMA} or skipped schema "
+            f"{STRUCTURED_TEST_RESULTS_SKIPPED_SCHEMA}, got {schema}"
         )
     path_env = _req_str(obj, "path_env", where)
     if path_env != STRUCTURED_TEST_RESULTS_PATH_ENV:
@@ -1033,6 +1036,8 @@ def _result_manifest_value_from(value: object, where: str) -> ResultManifest:
         return StructuredTestResultsManifest.current(owner)
     if schema == STRUCTURED_TEST_RESULTS_DIAGNOSTIC_SCHEMA:
         return StructuredTestResultsManifest.diagnostic(owner)
+    if schema == STRUCTURED_TEST_RESULTS_SKIPPED_SCHEMA:
+        return StructuredTestResultsManifest.skipped(owner)
     return StructuredTestResultsManifest.classified(owner)
 
 

@@ -2148,10 +2148,10 @@ LOADER_REFUSALS: tuple[tuple[str, str, str], ...] = (
     (
         "wrong-structured-result-schema",
         '{"steps":[{"group":"test","job":"counts","cmd":"true",'
-        '"result_manifests":[{"kind":"structured-test-results","schema":5,'
+        '"result_manifests":[{"kind":"structured-test-results","schema":6,'
         '"path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"test.counts"}]}]}',
         "steps[0].result_manifests[0].schema: structured test results require default schema 2, "
-        "classified schema 3 or diagnostic schema 4, got 5",
+        "classified schema 3, diagnostic schema 4 or skipped schema 5, got 6",
     ),
     (
         "wrong-structured-result-path",
@@ -2248,6 +2248,12 @@ LOADER_ACCEPTANCES: tuple[tuple[str, str], ...] = (
         "diagnostic-result-schema-is-explicit",
         '{"steps":[{"group":"test","job":"counts","cmd":"true",'
         '"result_manifests":[{"kind":"structured-test-results","schema":4,'
+        '"path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"test.counts"}]}]}',
+    ),
+    (
+        "skipped-result-schema-is-explicit",
+        '{"steps":[{"group":"test","job":"counts","cmd":"true",'
+        '"result_manifests":[{"kind":"structured-test-results","schema":5,'
         '"path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"test.counts"}]}]}',
     ),
     (
