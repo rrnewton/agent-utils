@@ -168,6 +168,17 @@ def test_rust_and_cross_nodes_cover_their_registries_once() -> None:
     assert agentctl_shards == ["0/3", "1/3", "2/3"]
 
 
+def test_wrkslots_shards_cover_eight_way_partition() -> None:
+    config = dag_from_path(REPO_ROOT / "validation.dag.yaml")
+    shards = sorted(
+        shard
+        for step in config.steps
+        if step.tag.startswith("python.wrkslots.")
+        for shard in _flag_values(step.cmd, "--shard")
+    )
+    assert shards == [f"{index}/8" for index in range(8)]
+
+
 def test_wrkslots_component_selection_includes_every_lifecycle_shard() -> None:
     config = dag_from_path(REPO_ROOT / "validation.dag.yaml")
     lifecycle = [
