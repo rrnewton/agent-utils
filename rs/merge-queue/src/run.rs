@@ -245,6 +245,15 @@ pub struct WouldValidate {
 }
 
 /// A candidate: `parent` plus `prs` combined in order.
+///
+/// `prefixes` holds the commit after each change, aligned with `prs`. With
+/// `regenerate.when = always` only the final tip is regenerated eagerly in
+/// [`Runner::build`]; earlier prefixes keep the raw combined tree, whose
+/// generated files may be stale. A prefix is regenerated lazily, on first use,
+/// by [`Runner::regenerated_prefix`], because probe validation and the
+/// `validator.select` command both run in a checkout of the prefix and may read
+/// generated files, so a stale prefix must never be validated or selected from
+/// as-is.
 #[derive(Clone, Debug)]
 struct Candidate {
     prs: Vec<i64>,
@@ -252,6 +261,9 @@ struct Candidate {
     tip: String,
     /// Commit after each change, aligned with `prs`.
     prefixes: Vec<String>,
+    /// Lazily regenerated prefix commits, by 1-based prefix index, shared by
+    /// every clone of this candidate so each prefix is regenerated at most once.
+    regen_prefixes: Arc<Mutex<BTreeMap<usize, String>>>,
 }
 
 impl Candidate {
@@ -722,6 +734,7 @@ impl<'a> Runner<'a> {
         let mut tip = parent.to_owned();
         let mut kept: Vec<i64> = Vec::new();
         let mut prefixes = Vec::new();
+        let mut prefix_regenerated: Vec<bool> = Vec::new();
         let mut conflicts = Vec::new();
         let mut held = Vec::new();
         let regen = self.config.regenerate.clone();
@@ -763,9 +776,18 @@ impl<'a> Runner<'a> {
                     continue;
                 }
             };
-            let next = if !conflicted.is_empty() || (regen.enabled() && regen.always()) {
+            // Conflict repair regenerates in-loop: the combined tree still holds
+            // conflict markers in generated files, so nothing may build on it or
+            // validate it until the generator has rewritten them. The `always`
+            // case is hoisted below: it regenerates once on the final tip instead
+            // of once per change.
+            let mut regenerated = false;
+            let next = if !conflicted.is_empty() {
                 match self.regenerate(&next, *pr, &conflicted)? {
-                    Ok(regenerated) => regenerated,
+                    Ok(done) => {
+                        regenerated = true;
+                        done
+                    }
                     Err(why) => {
                         skipped.insert(*pr);
                         conflicts.push((*pr, "regeneration", why));
@@ -778,14 +800,57 @@ impl<'a> Runner<'a> {
             tip = next;
             kept.push(*pr);
             prefixes.push(tip.clone());
+            prefix_regenerated.push(regenerated);
+        }
+        // Hoisted `always` regeneration: one generator run on the final tip, not
+        // one per change. The generator's contract (see `RegenerateConfig`) is
+        // that it rewrites every generated file from its sources
+        // deterministically and touches nothing else, so running it once on the
+        // combined sources yields the same final tree as running it after every
+        // change. If the last kept change already conflict-regenerated, the tip
+        // is current and no run is needed. A failed run is blamed on the last
+        // kept change, which is dropped, and the new tip is tried, mirroring
+        // the per-change ejection.
+        if regen.enabled() && regen.always() {
+            while !kept.is_empty() && !prefix_regenerated.last().copied().unwrap_or(false) {
+                let last = *kept.last().unwrap();
+                match self.regenerate(&tip, last, &[])? {
+                    Ok(done) => {
+                        tip = done;
+                        if let Some(last_prefix) = prefixes.last_mut() {
+                            *last_prefix = tip.clone();
+                        }
+                        if let Some(flag) = prefix_regenerated.last_mut() {
+                            *flag = true;
+                        }
+                    }
+                    Err(why) => {
+                        let pr = kept.pop().unwrap();
+                        prefixes.pop();
+                        prefix_regenerated.pop();
+                        conflicts.push((pr, "regeneration", why));
+                        tip = prefixes
+                            .last()
+                            .cloned()
+                            .unwrap_or_else(|| parent.to_owned());
+                    }
+                }
+            }
         }
         self.requeue(&held, "a dependency did not combine");
+        let regen_prefixes: BTreeMap<usize, String> = prefix_regenerated
+            .iter()
+            .enumerate()
+            .filter(|(_, done)| **done)
+            .map(|(index, _)| (index + 1, prefixes[index].clone()))
+            .collect();
         Ok((
             Candidate {
                 prs: kept,
                 parent: parent.to_owned(),
                 tip,
                 prefixes,
+                regen_prefixes: Arc::new(Mutex::new(regen_prefixes)),
             },
             conflicts,
         ))
@@ -923,6 +988,53 @@ impl<'a> Runner<'a> {
         })();
         self.slots.give(slot);
         result
+    }
+
+    /// The commit for prefix `i` of `candidate` with generated files refreshed,
+    /// regenerating that specific prefix on first use and caching the result on
+    /// the candidate so each prefix is regenerated at most once.
+    ///
+    /// Prefix decision: stale prefixes are not accepted. Validation selection
+    /// can depend on generated paths: `shared_select` in `validate.rs` runs the
+    /// configured `validator.select` shell command inside a checkout of the
+    /// prefix commit with `MQ_BASE`/`MQ_HEAD` set, so a select script may map
+    /// generated files to tests; `Runner::handle_red` uses exactly that to
+    /// compute the tests a culprit affected. Probe validation can depend on
+    /// them too: `find_culprit` runs the validator in a prefix checkout, and a
+    /// test may compare a generated file against its sources (the `gen` test in
+    /// `tests/cli_regen.rs` does). A stale generated file could therefore
+    /// change a selection or a probe verdict and blame the wrong change, so the
+    /// specific prefix is regenerated when probed. Prefix `0` is the parent,
+    /// which was itself validated before landing, and the final prefix is the
+    /// already-regenerated tip; neither is regenerated here. Outside `always`
+    /// mode every prefix that needed repair already got it in `build`, and the
+    /// raw prefix is returned unchanged.
+    fn regenerated_prefix(&self, candidate: &Candidate, i: usize) -> Result<String, String> {
+        if i == 0 {
+            return Ok(candidate.parent.clone());
+        }
+        if i >= candidate.prs.len() {
+            return Ok(candidate.tip.clone());
+        }
+        if let Some(done) = lock(&candidate.regen_prefixes).get(&i).cloned() {
+            return Ok(done);
+        }
+        if !(self.config.regenerate.enabled() && self.config.regenerate.always()) {
+            return Ok(candidate.prefix(i).to_owned());
+        }
+        let raw = candidate.prefix(i).to_owned();
+        let pr = candidate.prs[i - 1];
+        let done = match self.regenerate(&raw, pr, &[])? {
+            Ok(done) => done,
+            Err(why) => {
+                return Err(format!(
+                    "cannot regenerate prefix {} for #{pr}: {why}",
+                    short(&raw)
+                ));
+            }
+        };
+        lock(&candidate.regen_prefixes).insert(i, done.clone());
+        Ok(done)
     }
 
     /// Whether green results recorded at exactly `commit` cover `selection`: every selected test
@@ -1696,8 +1808,8 @@ impl<'a> Runner<'a> {
         let partial_note = "partial batch: the driver stopped before the rest; this intermediate tree was not validated on its own";
         for (i, pr) in candidate.prs.iter().enumerate() {
             let item = &items[pr];
-            let prefix = &candidate.prefixes[i];
-            let expected_tree = self.git.tree_of(prefix)?;
+            let prefix = self.regenerated_prefix(candidate, i + 1)?;
+            let expected_tree = self.git.tree_of(&prefix)?;
             let status = Command::new("sh")
                 .arg("-c")
                 .arg(&self.config.land.command)
@@ -1705,7 +1817,7 @@ impl<'a> Runner<'a> {
                 .env("MQ_PR", pr.to_string())
                 .env("MQ_HEAD_REF", &item.head_ref)
                 .env("MQ_HEAD", &item.head)
-                .env("MQ_PREFIX", prefix)
+                .env("MQ_PREFIX", &prefix)
                 .env("MQ_EXPECTED_TREE", &expected_tree)
                 .env("MQ_PARENT", &tip)
                 .env("MQ_BASE", &self.config.base)
@@ -1841,8 +1953,12 @@ impl<'a> Runner<'a> {
                         }
                     );
                     // Before removing it, learn what else the culprit's change affects.
+                    // Both prefixes are regenerated on demand: `select` runs in a
+                    // checkout of the first and may read generated files.
+                    let after = self.regenerated_prefix(&current, index + 1)?;
+                    let before = self.regenerated_prefix(&current, index)?;
                     let affected = self
-                        .select(current.prefix(index + 1), current.prefix(index))
+                        .select(&after, &before)
                         .map(|chosen| chosen.selection)
                         .unwrap_or(Selection::All);
                     self.eject(
@@ -2020,16 +2136,19 @@ impl<'a> Runner<'a> {
                     probes.push(hi);
                 }
             }
-            let jobs = probes
-                .iter()
-                .map(|i| Job {
+            // Probe commits are regenerated on demand: the validator runs in a
+            // checkout of the prefix and may read generated files, so a stale
+            // prefix could blame the wrong change.
+            let mut jobs = Vec::with_capacity(probes.len());
+            for i in &probes {
+                jobs.push(Job {
                     purpose: "probe",
                     prs: candidate.prs[..*i].to_vec(),
-                    commit: candidate.prefix(*i).to_owned(),
+                    commit: self.regenerated_prefix(candidate, *i)?,
                     selection: focus.clone(),
                     policy: "failed-tests".to_owned(),
-                })
-                .collect();
+                });
+            }
             for (i, result) in probes.iter().zip(self.validate_all(jobs)) {
                 let (_, ran) = result?;
                 if ran.refused() {
