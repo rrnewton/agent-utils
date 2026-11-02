@@ -37,7 +37,9 @@ Wanted:
    the idle sweep, and that a burst of 5 multi-line messages arrives intact
    and in order. Show a spare Enter on an empty editor is harmless.
 
-# Resolution
+# Notes
+
+## Resolution
 
 Landed on main as 15c61659fc28dee57b3bf358053f3f233805084c.
 

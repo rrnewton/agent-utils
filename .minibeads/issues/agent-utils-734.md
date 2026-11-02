@@ -66,7 +66,9 @@ Wanted:
    not block new deliveries.
 5. Tests for each.
 
-# Resolution
+# Notes
+
+## Resolution
 
 Fixed in this change (#734 chat-status-disagreement):
 

@@ -21,7 +21,9 @@ Wanted, generic in this repository:
 5. Failed-tests-only reruns and flaky-pass semantics mapped onto a runner that can rerun only the failed nodes of an earlier run at the same commit.
 6. An updated shadow kit whose plan and dry-run stages stay free of side effects.
 
-# Resolution
+# Notes
+
+## Resolution
 
 [opus 5.5] Delivered on main:
 

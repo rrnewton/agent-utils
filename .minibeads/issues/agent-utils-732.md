@@ -22,7 +22,9 @@ Validation is a set of individual tests, never one boolean (owner, 2026-11-01): 
 
 No repair for now: a culprit is ejected with a report. Later: merge-conflict and repair agents, and multiple machines.
 
-# Resolution
+# Notes
+
+## Resolution
 
 [opus 5.5] Delivered on main:
 
