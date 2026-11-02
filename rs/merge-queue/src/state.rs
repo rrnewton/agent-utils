@@ -3,6 +3,7 @@
 //! ```text
 //! <state>/
 //!   config.json            fixed: queue configuration
+//!   probe-cache.json       fixed: cached planning probes (see `probe_cache`)
 //!   lock                   fixed: writer lock (flock)
 //!   union.attributes       fixed: generated from `union_paths`, when set
 //!   api-budget.json        fixed: API requests charged in the last hour (bounded)
@@ -30,6 +31,9 @@ pub const CONFIG_SCHEMA: &str = "merge-queue-config/v1";
 pub const DEFAULT_MAX_BATCH: usize = 4;
 /// Default speculative depth and validation width.
 pub const DEFAULT_DEPTH: usize = 2;
+/// Default number of git probes planning runs concurrently; also the resolved value of a
+/// configured `probe_parallelism` of 0.
+pub const DEFAULT_PROBE_PARALLELISM: usize = 32;
 /// Default priority for a submitted change; lower lands first.
 pub const DEFAULT_PRIORITY: i64 = pr_landing_planner::priority::DEFAULT_PRIORITY;
 
@@ -259,6 +263,11 @@ pub struct Config {
     /// Largest window the adaptive (AIMD) window may grow to: +1 per landed batch, halved per
     /// red batch, never below 1. 0 (the default) means `depth`, a fixed window.
     pub max_depth: usize,
+    /// Concurrent git probes while planning (base and pairwise conflict checks, each a git
+    /// subprocess). 0 means [`DEFAULT_PROBE_PARALLELISM`]. Probe results are cached across
+    /// runs in `probe-cache.json`, so this bounds only cache misses.
+    #[serde(default)]
+    pub probe_parallelism: usize,
     /// Paths (Git attribute patterns) merged with Git's `union` driver when combining changes and
     /// probing conflicts. Only for line-oriented, append-only files; validation still checks the
     /// result.
@@ -301,6 +310,7 @@ impl Default for Config {
             max_batch: DEFAULT_MAX_BATCH,
             depth: DEFAULT_DEPTH,
             max_depth: 0,
+            probe_parallelism: 0,
             union_paths: Vec::new(),
             regenerate: RegenerateConfig::default(),
             exact_sha: false,
@@ -311,6 +321,17 @@ impl Default for Config {
             peers: std::collections::BTreeMap::new(),
             validator: ValidatorConfig::default(),
             land: LandConfig::default(),
+        }
+    }
+}
+
+impl Config {
+    /// Resolved planning-probe concurrency (a configured 0 means the default).
+    pub fn probe_parallelism(&self) -> usize {
+        if self.probe_parallelism == 0 {
+            DEFAULT_PROBE_PARALLELISM
+        } else {
+            self.probe_parallelism
         }
     }
 }

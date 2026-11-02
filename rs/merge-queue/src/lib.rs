@@ -15,6 +15,7 @@ pub mod github;
 pub mod model;
 pub mod ops;
 pub mod plan;
+pub mod probe_cache;
 pub mod run;
 pub mod state;
 pub mod sync;

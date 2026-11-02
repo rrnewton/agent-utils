@@ -4,7 +4,8 @@ use std::collections::BTreeMap;
 
 use crate::git::Git;
 use crate::model::{now, Held, Item, ItemStatus, Plan, Requirement};
-use crate::plan::{make_plan, probe, PlanOptions};
+use crate::plan::{make_plan, probe_with_options, PlanOptions, ProbeOptions};
+use crate::probe_cache::probe_config_hash;
 use crate::state::{Config, State};
 use crate::tests::ValidationClaim;
 
@@ -269,7 +270,28 @@ pub fn plan(state: &State, config: &Config, max_batch: usize) -> Result<Plan, St
     let git = repo(state, config)?;
     let (base_sha, current) = refresh(&git, config, &heads)?;
     let regenerate = config.regenerate.clone();
-    let mut probe = probe(&git, &base_sha, &current, &|path| regenerate.covers(path))?;
+    // Probe results depend only on commit IDs and the merge configuration, so they are
+    // cached in the state directory across runs; misses run under the configured bound.
+    let config_material = format!(
+        "union={:?};regen-paths={:?};regen-when={:?};regen-set={};combine={}",
+        config.union_paths,
+        config.regenerate.paths,
+        config.regenerate.when,
+        !config.regenerate.command.trim().is_empty(),
+        config.combine.as_str()
+    );
+    let probe_options = ProbeOptions {
+        cache_dir: Some(state.root.clone()),
+        parallelism: config.probe_parallelism(),
+        config_hash: Some(probe_config_hash(&git, &config_material)),
+    };
+    let mut probe = probe_with_options(
+        &git,
+        &base_sha,
+        &current,
+        &|path| regenerate.covers(path),
+        probe_options,
+    )?;
     probe.external = peer_holds(config, &items)?;
     Ok(make_plan(
         &items,

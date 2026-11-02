@@ -12,6 +12,9 @@
 //! than first-come-first-served when one change conflicts with many), then submission time.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use pr_landing_planner::graph::connected_components;
 use pr_landing_planner::model::ConflictEdge;
@@ -20,6 +23,19 @@ use crate::git::{Git, Regenerable};
 use crate::model::{
     now, Conflict, Held, Item, ItemStatus, Plan, PlannedBatch, PlannedItem, PLAN_SCHEMA,
 };
+use crate::probe_cache::{probe_config_hash, BaseEntry, PairAncestry, PairEntry, ProbeCache};
+use crate::state::DEFAULT_PROBE_PARALLELISM;
+
+/// How one probing run used its cache and its concurrency bound.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ProbeStats {
+    /// Lookups answered wholly from the probe cache (no git subprocess ran for them).
+    pub cache_hits: usize,
+    /// Lookups that ran at least one git subprocess.
+    pub cache_misses: usize,
+    /// Highest number of probe jobs observed running at once; never above the bound.
+    pub peak_concurrency: usize,
+}
 
 /// Locally probed relationships between the base and the queued heads.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -36,15 +52,128 @@ pub struct Probe {
     pub ancestry: Vec<(i64, i64)>,
     /// Holds decided outside this repository (unmet peer requirements).
     pub external: BTreeMap<i64, Held>,
+    /// Cache and concurrency accounting for the run that produced this probe. Planning
+    /// ignores it; it exists so callers can report what probing actually cost.
+    pub stats: ProbeStats,
+}
+
+/// Knobs for [`probe_with_options`].
+#[derive(Clone, Debug)]
+pub struct ProbeOptions {
+    /// State directory holding the persistent probe cache (`probe-cache.json` in it);
+    /// `None` keeps the cache in memory for this call only.
+    pub cache_dir: Option<PathBuf>,
+    /// Maximum probe jobs (git subprocesses) running at once; at least 1.
+    pub parallelism: usize,
+    /// Hash of the merge configuration, from `probe_cache::probe_config_hash`. `None`
+    /// derives it from the repository's Git settings alone.
+    pub config_hash: Option<String>,
+}
+
+impl Default for ProbeOptions {
+    fn default() -> Self {
+        Self {
+            cache_dir: None,
+            parallelism: DEFAULT_PROBE_PARALLELISM,
+            config_hash: None,
+        }
+    }
+}
+
+impl ProbeOptions {
+    /// One job at a time and no persistent cache: the pre-cache probing behaviour, kept
+    /// as the reference the cached parallel path is checked against.
+    pub fn sequential_uncached() -> Self {
+        Self {
+            cache_dir: None,
+            parallelism: 1,
+            config_hash: None,
+        }
+    }
 }
 
 /// Probe the base and queued heads. `heads` maps each queued change to its current head.
 /// Conflicts confined to `regenerable` paths are not conflicts: the queue regenerates them.
+///
+/// This is [`probe_with_options`] with bounded parallelism and an in-memory cache.
 pub fn probe(
     git: &Git,
     base_sha: &str,
     heads: &BTreeMap<i64, Option<String>>,
     regenerable: Regenerable<'_>,
+) -> Result<Probe, String> {
+    probe_with_options(git, base_sha, heads, regenerable, ProbeOptions::default())
+}
+
+/// One pairwise job's raw outcome, before regenerable filtering and ordering.
+enum PairOutcome {
+    /// `(before, after)` change numbers.
+    Ancestor(i64, i64),
+    /// Raw conflicting paths between the two heads.
+    Conflicts(Vec<String>),
+    /// No ancestry and no conflict.
+    Clean,
+}
+
+/// Run `count` independent jobs, at most `limit` at once, collecting results by job index
+/// and the peak number running at once. This is the dagrun shape in miniature: the jobs
+/// have no dependencies, so a flat bound is the whole schedule, and assembly afterwards in
+/// index order keeps the result independent of completion order.
+fn run_bounded<T, F>(count: usize, limit: usize, job: F) -> (Vec<Result<T, String>>, usize)
+where
+    T: Send,
+    F: Fn(usize) -> Result<T, String> + Sync,
+{
+    if count == 0 {
+        return (Vec::new(), 0);
+    }
+    let limit = limit.max(1).min(count);
+    if limit == 1 {
+        return ((0..count).map(&job).collect(), 1);
+    }
+    let results: Mutex<Vec<Option<Result<T, String>>>> =
+        Mutex::new((0..count).map(|_| None).collect());
+    let next = AtomicUsize::new(0);
+    let active = AtomicUsize::new(0);
+    let peak = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..limit {
+            scope.spawn(|| loop {
+                let index = next.fetch_add(1, Ordering::SeqCst);
+                if index >= count {
+                    break;
+                }
+                let running = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(running, Ordering::SeqCst);
+                let result = job(index);
+                active.fetch_sub(1, Ordering::SeqCst);
+                results.lock().unwrap()[index] = Some(result);
+            });
+        }
+    });
+    let results = results
+        .into_inner()
+        .unwrap()
+        .into_iter()
+        .map(|result| result.expect("every bounded job ran"))
+        .collect();
+    (results, peak.load(Ordering::SeqCst))
+}
+
+/// [`probe`] with an explicit cache, concurrency bound and config hash.
+///
+/// Base probes run first (the pairwise file-disjointness skip needs their file sets),
+/// then pairwise probes. Both phases run cache misses under the bound and assemble in
+/// deterministic index order, so the resulting [`Probe`] equals the sequential uncached
+/// one for the same inputs. Cache hits run no git subprocess at all. Cached conflict
+/// paths are stored raw; `regenerable` filtering happens during assembly, on hits and
+/// misses alike.
+pub fn probe_with_options(
+    git: &Git,
+    base_sha: &str,
+    heads: &BTreeMap<i64, Option<String>>,
+    regenerable: Regenerable<'_>,
+    options: ProbeOptions,
 ) -> Result<Probe, String> {
     let real = |paths: Vec<String>| -> Vec<String> {
         if paths.iter().all(|path| regenerable(path)) {
@@ -53,6 +182,16 @@ pub fn probe(
             paths
         }
     };
+    let config_hash = options
+        .config_hash
+        .clone()
+        .unwrap_or_else(|| probe_config_hash(git, ""));
+    let cache = Mutex::new(match &options.cache_dir {
+        Some(dir) => ProbeCache::load(dir),
+        None => ProbeCache::ephemeral(),
+    });
+    let hits = AtomicUsize::new(0);
+    let misses = AtomicUsize::new(0);
     let mut probe = Probe {
         heads: heads.clone(),
         ..Probe::default()
@@ -61,30 +200,150 @@ pub fn probe(
         .iter()
         .filter_map(|(pr, head)| head.as_deref().map(|head| (*pr, head)))
         .collect();
-    for (pr, head) in &live {
-        probe.files.insert(*pr, git.changed_files(base_sha, head)?);
-        let paths = real(git.merge_conflicts(base_sha, head)?);
+
+    // Phase 1: one base probe per live head. Jobs are independent.
+    let (base_results, base_peak) = run_bounded(live.len(), options.parallelism, |index| {
+        let head = live[index].1;
+        let key = ProbeCache::base_key(&config_hash, base_sha, head);
+        if let Some(entry) = cache.lock().unwrap().base(&key).cloned() {
+            hits.fetch_add(1, Ordering::SeqCst);
+            let files: BTreeSet<String> = entry.files.into_iter().collect();
+            return Ok((files, entry.conflicts));
+        }
+        misses.fetch_add(1, Ordering::SeqCst);
+        let files = git.changed_files(base_sha, head)?;
+        let conflicts = git.merge_conflicts(base_sha, head)?;
+        cache.lock().unwrap().put_base(
+            key,
+            BaseEntry {
+                files: files.iter().cloned().collect(),
+                conflicts: conflicts.clone(),
+            },
+        );
+        Ok((files, conflicts))
+    });
+    for ((pr, _), result) in live.iter().zip(base_results) {
+        let (files, raw) = result?;
+        probe.files.insert(*pr, files);
+        let paths = real(raw);
         if !paths.is_empty() {
             probe.base_conflicts.insert(*pr, paths);
         }
     }
+
+    // Phase 2: one job per pair of distinct heads.
+    let mut pairs: Vec<(i64, i64, String, String, bool)> = Vec::new();
     for (i, (a, head_a)) in live.iter().enumerate() {
         for (b, head_b) in &live[i + 1..] {
             if head_a == head_b {
                 continue;
             }
+            let disjoint = probe.files[a].is_disjoint(&probe.files[b]);
+            pairs.push((*a, *b, (*head_a).to_owned(), (*head_b).to_owned(), disjoint));
+        }
+    }
+    let (pair_results, pair_peak) = run_bounded(pairs.len(), options.parallelism, |index| {
+        let (a, b, head_a, head_b, disjoint) = &pairs[index];
+        let (a, b) = (*a, *b);
+        let (key, lo, _) = ProbeCache::pair_key(&config_hash, head_a, head_b);
+        let lo_is_a = lo == *head_a;
+        let entry = cache.lock().unwrap().pair(&key).cloned();
+        if let Some(entry) = &entry {
+            match entry.ancestry {
+                PairAncestry::LoFirst => {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    return Ok(if lo_is_a {
+                        PairOutcome::Ancestor(a, b)
+                    } else {
+                        PairOutcome::Ancestor(b, a)
+                    });
+                }
+                PairAncestry::HiFirst => {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    return Ok(if lo_is_a {
+                        PairOutcome::Ancestor(b, a)
+                    } else {
+                        PairOutcome::Ancestor(a, b)
+                    });
+                }
+                PairAncestry::None => {
+                    if let Some(conflicts) = &entry.conflicts {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        return Ok(if conflicts.is_empty() {
+                            PairOutcome::Clean
+                        } else {
+                            PairOutcome::Conflicts(conflicts.clone())
+                        });
+                    }
+                    // Ancestry is known (neither); only conflicts may be missing, and
+                    // only a non-disjoint pair needs them.
+                    if *disjoint {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        return Ok(PairOutcome::Clean);
+                    }
+                }
+            }
+        }
+        misses.fetch_add(1, Ordering::SeqCst);
+        if entry.is_none() {
             if git.is_ancestor(head_a, head_b)? {
-                probe.ancestry.push((*a, *b));
-                continue;
+                cache.lock().unwrap().put_pair(
+                    key,
+                    PairEntry {
+                        ancestry: if lo_is_a {
+                            PairAncestry::LoFirst
+                        } else {
+                            PairAncestry::HiFirst
+                        },
+                        conflicts: None,
+                    },
+                );
+                return Ok(PairOutcome::Ancestor(a, b));
             }
             if git.is_ancestor(head_b, head_a)? {
-                probe.ancestry.push((*b, *a));
-                continue;
+                cache.lock().unwrap().put_pair(
+                    key,
+                    PairEntry {
+                        ancestry: if lo_is_a {
+                            PairAncestry::HiFirst
+                        } else {
+                            PairAncestry::LoFirst
+                        },
+                        conflicts: None,
+                    },
+                );
+                return Ok(PairOutcome::Ancestor(b, a));
             }
-            // Disjoint file sets cannot conflict textually; skip the probe.
-            let disjoint = probe.files[a].is_disjoint(&probe.files[b]);
-            if !disjoint {
-                let paths = real(git.merge_conflicts(head_a, head_b)?);
+            if *disjoint {
+                cache.lock().unwrap().put_pair(
+                    key,
+                    PairEntry {
+                        ancestry: PairAncestry::None,
+                        conflicts: None,
+                    },
+                );
+                return Ok(PairOutcome::Clean);
+            }
+        }
+        let conflicts = git.merge_conflicts(head_a, head_b)?;
+        cache.lock().unwrap().put_pair(
+            key,
+            PairEntry {
+                ancestry: PairAncestry::None,
+                conflicts: Some(conflicts.clone()),
+            },
+        );
+        Ok(if conflicts.is_empty() {
+            PairOutcome::Clean
+        } else {
+            PairOutcome::Conflicts(conflicts)
+        })
+    });
+    for ((a, b, _, _, _), result) in pairs.iter().zip(pair_results) {
+        match result? {
+            PairOutcome::Ancestor(before, after) => probe.ancestry.push((before, after)),
+            PairOutcome::Conflicts(raw) => {
+                let paths = real(raw);
                 if !paths.is_empty() {
                     probe.conflicts.push(Conflict {
                         a: (*a).min(*b),
@@ -93,7 +352,21 @@ pub fn probe(
                     });
                 }
             }
+            PairOutcome::Clean => {}
         }
+    }
+    probe
+        .conflicts
+        .sort_by_key(|conflict| (conflict.a, conflict.b));
+    probe.ancestry.sort();
+    probe.stats = ProbeStats {
+        cache_hits: hits.load(Ordering::SeqCst),
+        cache_misses: misses.load(Ordering::SeqCst),
+        peak_concurrency: base_peak.max(pair_peak),
+    };
+    // The cache is an optimisation: a failed write must not fail planning.
+    if let Ok(mut cache) = cache.into_inner() {
+        let _ = cache.save();
     }
     Ok(probe)
 }
@@ -676,5 +949,285 @@ mod unit {
         use crate::git::testrepo::git;
         git(dir, &["add", "-A"]);
         git(dir, &["commit", "-q", "-m", "more"]);
+    }
+
+    /// A fixture queue: conflicting, clean and stacked branches over one base.
+    /// Returns the repository, its git handle, the base and `(pr, head)` pairs.
+    fn fixture_queue(
+        tmp: &crate::git::testrepo::TempDir,
+        count: i64,
+    ) -> (crate::git::Git, String, Vec<(i64, String)>) {
+        use crate::git::testrepo::*;
+        let git = init(&tmp.0);
+        write(&tmp.0, "shared.txt", "1\n2\n3\n");
+        git_commit(&tmp.0);
+        let base = git.rev_parse("main").unwrap();
+        let mut heads = Vec::new();
+        for pr in 1..=count {
+            // Every branch rewrites line 1 of shared.txt differently (mutual conflicts)
+            // and adds its own file.
+            let sha = branch(
+                &tmp.0,
+                &format!("b{pr}"),
+                "main",
+                &[
+                    ("shared.txt", &format!("v{pr}\n2\n3\n")),
+                    (&format!("own{pr}.txt"), "x\n"),
+                ],
+            );
+            heads.push((pr, sha));
+        }
+        // One stacked branch on the first head.
+        let stacked = branch(&tmp.0, "stacked", "b1", &[("stacked.txt", "s\n")]);
+        heads.push((count + 1, stacked));
+        (git, base, heads)
+    }
+
+    fn heads_map(heads: &[(i64, String)]) -> BTreeMap<i64, Option<String>> {
+        heads
+            .iter()
+            .map(|(pr, sha)| (*pr, Some(sha.clone())))
+            .collect()
+    }
+
+    fn assert_same_probe(a: &Probe, b: &Probe) {
+        assert_eq!(a.heads, b.heads);
+        assert_eq!(a.files, b.files);
+        assert_eq!(a.base_conflicts, b.base_conflicts);
+        assert_eq!(a.conflicts, b.conflicts);
+        assert_eq!(a.ancestry, b.ancestry);
+    }
+
+    #[test]
+    fn cached_parallel_plan_equals_sequential_uncached() {
+        use crate::git::testrepo::TempDir;
+        let tmp = TempDir::new("probe-equiv-repo");
+        let cache_tmp = TempDir::new("probe-equiv-cache");
+        let (git, base, heads) = fixture_queue(&tmp, 8);
+        let map = heads_map(&heads);
+        let sequential = probe_with_options(
+            &git,
+            &base,
+            &map,
+            &crate::git::nothing_regenerable,
+            ProbeOptions::sequential_uncached(),
+        )
+        .unwrap();
+        let parallel_cached = probe_with_options(
+            &git,
+            &base,
+            &map,
+            &crate::git::nothing_regenerable,
+            ProbeOptions {
+                cache_dir: Some(cache_tmp.0.clone()),
+                parallelism: 8,
+                config_hash: None,
+            },
+        )
+        .unwrap();
+        assert_same_probe(&sequential, &parallel_cached);
+        assert!(parallel_cached.stats.cache_misses > 0);
+        assert!(parallel_cached.stats.peak_concurrency > 1);
+        assert!(parallel_cached.stats.peak_concurrency <= 8);
+
+        // Same probes, same plans (created_at is the only run-dependent field).
+        let items: Vec<Item> = heads
+            .iter()
+            .map(|(pr, sha)| {
+                let mut entry = item(*pr, 100, "t1");
+                entry.head = sha.clone();
+                entry
+            })
+            .collect();
+        let mut plan_a = make_plan(&items, "main", &base, &sequential, opts(4));
+        let plan_b = make_plan(&items, "main", &base, &parallel_cached, opts(4));
+        plan_a.created_at = plan_b.created_at.clone();
+        assert_eq!(plan_a, plan_b);
+    }
+
+    #[test]
+    fn cache_hit_skips_git_and_persists_across_loads() {
+        use crate::git::testrepo::TempDir;
+        let tmp = TempDir::new("probe-hit-repo");
+        let cache_tmp = TempDir::new("probe-hit-cache");
+        let (git, base, heads) = fixture_queue(&tmp, 6);
+        let map = heads_map(&heads);
+        let options = ProbeOptions {
+            cache_dir: Some(cache_tmp.0.clone()),
+            parallelism: 8,
+            config_hash: None,
+        };
+        let first = probe_with_options(
+            &git,
+            &base,
+            &map,
+            &crate::git::nothing_regenerable,
+            options.clone(),
+        )
+        .unwrap();
+        assert!(first.stats.cache_misses > 0, "{:?}", first.stats);
+
+        // A fresh probe loads the cache from disk (a new process would do the same) and
+        // needs no repository at all: a git handle pointing nowhere proves hits ran no
+        // subprocess.
+        let nowhere = crate::git::Git::new("/nonexistent/probe-cache-test");
+        let second = probe_with_options(
+            &nowhere,
+            &base,
+            &map,
+            &crate::git::nothing_regenerable,
+            options,
+        )
+        .unwrap();
+        assert_same_probe(&first, &second);
+        assert_eq!(second.stats.cache_misses, 0, "{:?}", second.stats);
+        assert!(second.stats.cache_hits > 0);
+    }
+
+    #[test]
+    fn cache_misses_on_head_and_config_change() {
+        use crate::git::testrepo::{branch, TempDir};
+        let tmp = TempDir::new("probe-inval-repo");
+        let cache_tmp = TempDir::new("probe-inval-cache");
+        let (git, base, heads) = fixture_queue(&tmp, 5);
+        let map = heads_map(&heads);
+        let cached = ProbeOptions {
+            cache_dir: Some(cache_tmp.0.clone()),
+            parallelism: 4,
+            config_hash: Some("cfg-a".to_owned()),
+        };
+        let first = probe_with_options(
+            &git,
+            &base,
+            &map,
+            &crate::git::nothing_regenerable,
+            cached.clone(),
+        )
+        .unwrap();
+        assert!(first.stats.cache_misses > 0);
+
+        // Same heads, different merge configuration: everything misses again.
+        let changed_config = probe_with_options(
+            &git,
+            &base,
+            &map,
+            &crate::git::nothing_regenerable,
+            ProbeOptions {
+                config_hash: Some("cfg-b".to_owned()),
+                ..cached.clone()
+            },
+        )
+        .unwrap();
+        assert_same_probe(&first, &changed_config);
+        assert!(changed_config.stats.cache_misses > 0);
+        assert_eq!(changed_config.stats.cache_hits, 0);
+
+        // A moved head is a new key: its base and pair probes miss, the rest still hit.
+        let moved = branch(&tmp.0, "moved", "main", &[("moved.txt", "m\n")]);
+        let mut moved_map = map.clone();
+        moved_map.insert(1, Some(moved));
+        let after_move = probe_with_options(
+            &git,
+            &base,
+            &moved_map,
+            &crate::git::nothing_regenerable,
+            cached,
+        )
+        .unwrap();
+        assert!(after_move.stats.cache_misses > 0, "{:?}", after_move.stats);
+        assert!(after_move.stats.cache_hits > 0, "{:?}", after_move.stats);
+    }
+
+    #[test]
+    fn parallel_probe_is_deterministic() {
+        use crate::git::testrepo::TempDir;
+        let tmp = TempDir::new("probe-det-repo");
+        let (git, base, heads) = fixture_queue(&tmp, 10);
+        let map = heads_map(&heads);
+        let reference = probe_with_options(
+            &git,
+            &base,
+            &map,
+            &crate::git::nothing_regenerable,
+            ProbeOptions::sequential_uncached(),
+        )
+        .unwrap();
+        assert!(!reference.conflicts.is_empty());
+        for _ in 0..5 {
+            let parallel = probe_with_options(
+                &git,
+                &base,
+                &map,
+                &crate::git::nothing_regenerable,
+                ProbeOptions {
+                    cache_dir: None,
+                    parallelism: 8,
+                    config_hash: None,
+                },
+            )
+            .unwrap();
+            assert_same_probe(&reference, &parallel);
+            assert!(parallel.stats.peak_concurrency <= 8);
+        }
+    }
+
+    /// Wall-clock comparison on a wide fixture; run explicitly with `--ignored --nocapture`.
+    #[test]
+    #[ignore = "timing evidence, not a gate"]
+    fn probe_speedup_evidence() {
+        use crate::git::testrepo::TempDir;
+        let tmp = TempDir::new("probe-speed-repo");
+        let cache_tmp = TempDir::new("probe-speed-cache");
+        let (git, base, heads) = fixture_queue(&tmp, 24);
+        let map = heads_map(&heads);
+        let pairs = heads.len() * (heads.len() - 1) / 2;
+        let start = std::time::Instant::now();
+        let sequential = probe_with_options(
+            &git,
+            &base,
+            &map,
+            &crate::git::nothing_regenerable,
+            ProbeOptions::sequential_uncached(),
+        )
+        .unwrap();
+        let sequential_wall = start.elapsed();
+        let start = std::time::Instant::now();
+        let parallel = probe_with_options(
+            &git,
+            &base,
+            &map,
+            &crate::git::nothing_regenerable,
+            ProbeOptions {
+                cache_dir: Some(cache_tmp.0.clone()),
+                parallelism: 32,
+                config_hash: None,
+            },
+        )
+        .unwrap();
+        let parallel_wall = start.elapsed();
+        let start = std::time::Instant::now();
+        let cached = probe_with_options(
+            &git,
+            &base,
+            &map,
+            &crate::git::nothing_regenerable,
+            ProbeOptions {
+                cache_dir: Some(cache_tmp.0.clone()),
+                parallelism: 32,
+                config_hash: None,
+            },
+        )
+        .unwrap();
+        let cached_wall = start.elapsed();
+        assert_same_probe(&sequential, &parallel);
+        assert_same_probe(&sequential, &cached);
+        println!(
+            "probe speedup: heads={} pairs={} sequential={sequential_wall:?} \
+             parallel32={parallel_wall:?} (peak {}) cached={cached_wall:?} (hits {})",
+            heads.len(),
+            pairs,
+            parallel.stats.peak_concurrency,
+            cached.stats.cache_hits
+        );
     }
 }
