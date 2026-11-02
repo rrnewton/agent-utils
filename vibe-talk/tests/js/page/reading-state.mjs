@@ -951,8 +951,8 @@ test("...but not a landing made on an earlier visit, when the thread comes back 
   // Negative control: the landing left standing when the view changes, and the thread's rows come back
   // as they were left, the very row the landing was made on among them.
   const control = brokenScriptEach(["  entryState().landing = null;\n  if (view === \"thread\")", "  if (view === \"thread\")"],
-    ["if (!caughtUp && (held.readMode !== readMode || rowsMissDone())) renderCachedTimeline();",
-      "if (!caughtUp && held.readMode !== readMode) renderCachedTimeline();"]);
+    ["if (!caughtUp && (held.readMode !== readModes.mode() || rowsMissDone())) renderCachedTimeline();",
+      "if (!caughtUp && held.readMode !== readModes.mode()) renderCachedTimeline();"]);
   assert.equal((await run(control)).collapsed, "false", "the first visit's landing did not hold without the reset; the control proves nothing");
 });
 

@@ -1689,8 +1689,8 @@ const DONE_FOLLOWS = ["    followDoneEverywhere(requested, column);\n    // Befo
 /** ...the same in `restoreMessages`. */
 const UNDO_FOLLOWS = ["    followDoneEverywhere(restored, column);\n    if (lastDismissal", "    if (lastDismissal"];
 /** The check that draws a held view's rows again as it is shown, where they say otherwise than its copy. */
-const HELD_REDRAWS = ["if (!caughtUp && (held.readMode !== readMode || rowsMissDone())) renderCachedTimeline();",
-  "if (!caughtUp && held.readMode !== readMode) renderCachedTimeline();"];
+const HELD_REDRAWS = ["if (!caughtUp && (held.readMode !== readModes.mode() || rowsMissDone())) renderCachedTimeline();",
+  "if (!caughtUp && held.readMode !== readModes.mode()) renderCachedTimeline();"];
 
 /**
  * The channel of `threadData` opened in All, then Main read for itself as its poll reads it, so that
@@ -2512,7 +2512,7 @@ test("`#311 sent-read-waits-for-done`: under Hide read without threads a reply t
   }
   assert.deepStrictEqual((await heldHere(failing, lookedAlways)).asked, [], "the control changed what a failed Done asks");
   const offList = brokenScript("  return inColumn(columns.main, () => ids.every((id) => doneState().archived.has(String(id))));\n",
-    "  return inColumn(columns.main, () => todoMode || ids.every((id) => doneState().archived.has(String(id))));\n");
+    "  return inColumn(columns.main, () => readModes.hiding() || ids.every((id) => doneState().archived.has(String(id))));\n");
   const offListFailed = await heldHere(failing, offList);
   assert.deepStrictEqual(offListFailed.whileSaving, [], "the control waited no longer");
   assert.deepStrictEqual(offListFailed.asked, [target],

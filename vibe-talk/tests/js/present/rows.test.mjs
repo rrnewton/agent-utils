@@ -262,3 +262,26 @@ test("`#624 voice-page-modularity`: where the bookmark's line stands among the r
   assert.equal(bookmarkSpot(rows, { message_id: "9", place: "above", timestamp: "never" }, never), null);
   assert.equal(bookmarkSpot([], { message_id: "1" }, never), null);
 });
+
+test("`#624 voice-page-modularity`: the read mode, what an old record means, the cycle and the kept copy, from the module alone", () => {
+  const { createReadMode, savedReadMode, nextReadMode, READ_MODES, READ_MODE_KEY } = ROWS;
+  assert.deepStrictEqual([...READ_MODES], ["show", "fold", "hide"]);
+  assert.deepStrictEqual(READ_MODES.map(nextReadMode), ["fold", "hide", "show"]);
+  assert.equal(savedReadMode({ read: "collapse" }), "fold", "an older page's Collapse read is not Fold read");
+  assert.equal(savedReadMode({ read: "hide" }), "hide");
+  assert.equal(savedReadMode({ todo: true }), "hide", "a record saying only todo is not Hide read");
+  assert.equal(savedReadMode({}), "show");
+  const kept = new Map();
+  const modes = createReadMode({ storage: () => ({ getItem: () => null, setItem: (key, value) => kept.set(key, value), removeItem() {} }) });
+  assert.equal(modes.mode(), "show");
+  assert.equal(modes.hiding(), false);
+  modes.set("hide");
+  assert.equal(modes.hiding(), true);
+  assert.equal(kept.size, 0, "setting the mode kept it before the page asked");
+  modes.keep();
+  assert.equal(kept.get(READ_MODE_KEY), "hide");
+  modes.set("fold");
+  assert.equal(modes.hiding(), false);
+  const refusing = createReadMode({ storage: () => ({ getItem: () => null, setItem: () => { throw new Error("full"); }, removeItem() {} }) });
+  refusing.keep();
+});

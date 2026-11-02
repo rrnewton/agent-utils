@@ -3055,7 +3055,7 @@ let overscrollFootSince = null;
  */
 function overscrollContext() {
   return JSON.stringify([columnsShown, threadListShown, currentScreen, currentView, columns.side.mode,
-    readMode, inColumn(columns.side, () => [channelContextKey(), pinsView().only, searchKey()])]);
+    readModes.mode(), inColumn(columns.side, () => [channelContextKey(), pinsView().only, searchKey()])]);
 }
 
 /** Whether the room may be open: the right column on screen at a desk, where web/voice.css gives it a box. */
@@ -5596,7 +5596,7 @@ function searchEmptySentence(loaded) {
   // `#606 server-side-search`: a thread stands for its replies in Main, so the replies held here were
   // searched; the ones All has not brought were not.
   if (threadingSupported && selection().view === "main") return `${said} ${MAIN_REPLIES_SEARCHED}`;
-  if (todoMode && !threadingSupported) return `${said} Hide read is on — press h for Show read to search older messages.`;
+  if (readModes.hiding() && !threadingSupported) return `${said} Hide read is on — press h for Show read to search older messages.`;
   return said;
 }
 
@@ -9522,7 +9522,7 @@ function viewFromKeyboard(which, repeat) {
 function readModeFromKeyboard() {
   if (!channelOnScreen() || el("todo-filter").hidden) return false;
   cycleReadMode();
-  setStatus(READ_MODE_SAID[readMode]);
+  setStatus(READ_MODE_SAID[readModes.mode()]);
   return true;
 }
 
@@ -13045,7 +13045,7 @@ function drawHeldRows(rows, freshAt, freshness) {
  * channel would show a reload a channel with its dealt-with messages missing.
  */
 function saveChannelScope() {
-  if (!selectedChannelId() || (todoMode && !threadingSupported) || !screenBelongsToToken()) return;
+  if (!selectedChannelId() || (readModes.hiding() && !threadingSupported) || !screenBelongsToToken()) return;
   const cache = readMessageCache();
   if (!cache) return;
   const key = String(selectedChannelId());
@@ -13086,7 +13086,7 @@ function saveChannelScope() {
  */
 function hydrateChannelScope() {
   const channel = selectedChannelId();
-  if (!channel || (todoMode && !threadingSupported)) return false;
+  if (!channel || (readModes.hiding() && !threadingSupported)) return false;
   screenBelongsToToken();
   if (threadingSupported) {
     if (channelStore.current().channel !== String(channel)) loadCanon(channel);
@@ -13833,8 +13833,8 @@ function saveUiState() {
     view: currentView === "discord" ? "discord" : "voice",
     // Hide read, as every page has kept it, and beside it the read mode it is one of (`#221
     // read-modes`): a page from before the modes reads `todo` and ignores `read`.
-    todo: todoMode,
-    read: readMode,
+    todo: readModes.hiding(),
+    read: readModes.mode(),
     channel,
     place: heldPlace && heldPlace.key === placeKey() ? heldPlace.place : null,
     channels: chosenViews,
@@ -14545,7 +14545,7 @@ function rememberChannelContext() {
     dismissed: doneState().archived,
     // `#221 read-modes`. The read mode its rows were drawn under, so a mode chosen elsewhere since
     // redraws them on the way back rather than showing what the old mode left.
-    readMode,
+    readMode: readModes.mode(),
   });
 }
 
@@ -14782,7 +14782,7 @@ async function changeChannelView(view, threadId = null, summary = null, origin =
     // just left, above all, whose replies Main's chips count (`#222 unread-replies`). A message marked
     // Done, or put back, in another view meanwhile is in this view's copy already, not yet on its
     // rows (`#306 done-stale-across-views`).
-    if (!caughtUp && (held.readMode !== readMode || rowsMissDone())) renderCachedTimeline();
+    if (!caughtUp && (held.readMode !== readModes.mode() || rowsMissDone())) renderCachedTimeline();
     else syncUnreadReplies();
     renderChannelFreshness();
     // A thread read behind its held rows for replies they lack is entered at its newest, where those
@@ -21067,7 +21067,7 @@ function bookmarkListRefusal(anchor) {
  * list. Older than the window, nothing is known.
  */
 function todoWindowHolds(at) {
-  if (!todoMode || threadingSupported || String(todoView.channelId) !== String(currentChannelId())) return false;
+  if (!readModes.hiding() || threadingSupported || String(todoView.channelId) !== String(currentChannelId())) return false;
   if (todoView.complete) return true;
   const from = Date.parse(String(todoView.from || ""));
   return Number.isFinite(from) && at >= from;
@@ -22014,7 +22014,7 @@ async function seekMessage(target, arrive, openAll) {
       if (ticket !== replyJumpTicket || context !== channelContextKey()) return;
       if (arrive() || hiddenAsRead()) return;
     }
-    if (todoMode && !threadingSupported) {
+    if (readModes.hiding() && !threadingSupported) {
       setStatus("Not in this list — Hide read is on.");
     } else if (historyReadToStart()) {
       setStatus("Not in this channel's history.");
@@ -24664,7 +24664,7 @@ const SEARCH_OLDER_TAP_MS = 500;
 
 /** Everything a walk for the search depends on: a change in any of them ends it, and clears its note. */
 const searchKey = () => JSON.stringify([filterKey(), searchOpen ? searchIdentity(searchQuery) : null, searchOpen && linksOnly,
-  [...hiddenLinkKinds], authorChoosing(), readMode]);
+  [...hiddenLinkKinds], authorChoosing(), readModes.mode()]);
 
 /**
  * Whether the step back of the column being worked on offers to search further back: a filter choosing
@@ -24674,7 +24674,7 @@ const searchKey = () => JSON.stringify([filterKey(), searchOpen ? searchIdentity
  */
 function searchOffered() {
   return readRunsSuspended() && currentView === "discord" && selection().view !== "threads" && !pinsView().only &&
-    olderPages().moreAbove === true && !(todoMode && !threadingSupported) && (!sideActive || sideShowing());
+    olderPages().moreAbove === true && !(readModes.hiding() && !threadingSupported) && (!sideActive || sideShowing());
 }
 
 /** The view a column shows, as a sentence names it. */
@@ -24768,7 +24768,7 @@ function historyReach() {
     else return reach;
   } else {
     // Hide read's own list is a to-do list, not a stretch of the channel (`loadTodo`).
-    if (todoMode || olderPages().moreAbove === undefined) return reach;
+    if (readModes.hiding() || olderPages().moreAbove === undefined) return reach;
     // Drawn from this device: what was saved, and nothing it may have missed since.
     reach.saved = plainSaved;
     if (plainGapFrom !== null) floor = plainGapFrom;
@@ -26301,7 +26301,7 @@ async function loadDiscord(options) {
   // poll, Refresh, entering the view, changing channel — so the mode is honoured HERE rather than
   // at four call sites, one of which would eventually be forgotten and overwrite the filtered
   // list with the unfiltered one.
-  if (todoMode) {
+  if (readModes.hiding()) {
     return loadTodo(options);
   }
   // `remote-ops-audit` W7. As for a timeline read (`loadTimeline`).
@@ -26417,11 +26417,15 @@ function drawChannelPage(payload, area, at) {
  * Is the reader looking at the to-do list rather than the whole channel? Kept across a reload with
  * the rest of what was on screen, in `UI_STATE_KEY`. `#189 restore-ui-state`.
  *
- * Since `#221 read-modes` this is Hide read, the third of the read modes: `readMode === "hide"`,
- * written only where `readMode` is. It keeps its own name because every read path already asks it
- * the one question it answers, which is whether read messages are left out of the list.
+ * Since `#221 read-modes` this is Hide read, the third of the read modes: the mode being "hide", set
+ * only with it. It keeps a question of its own (`readModes.hiding()`) because every read path already
+ * asks it the one question it answers, which is whether read messages are left out of the list.
  */
-let todoMode = false;
+// The mode itself, its names (READ_MODES, READ_MODE_LABELS, READ_MODE_VERBS, READ_MODE_SAID,
+// READ_MODE_TITLES), its kept copy (READ_MODE_KEY), what an old record means (`savedReadMode`) and the
+// cycle (`nextReadMode`) are web/src/present/rows' (`createReadMode`, `#624 voice-page-modularity`):
+// `readModes.mode()` is the mode, and `readModes.hiding()` this question.
+const readModes = createReadMode({ storage: () => deviceStorage() });
 
 // --- the read modes: Show read, Fold read, Hide read ----------------------------------------------
 //
@@ -26458,45 +26462,6 @@ let todoMode = false;
 // mode, and the read run before it is a line only under Fold read. Show read shows what is read:
 // a mode that said "Show read" while hiding messages on entry would be a button that lies, and the
 // owner's root, "… 45 read messages …", first unread is Fold read's own drawing.
-
-/** The read modes, in the order a tap on the button moves through them. */
-const READ_MODES = ["show", "fold", "hide"];
-
-/** What the button calls each mode: the mode the list is in, not the act a tap performs. */
-const READ_MODE_LABELS = { show: "Show read", fold: "Fold read", hide: "Hide read" };
-
-/**
- * The first word of each name, in a span of its own so that a desk's dock row can stand the name in
- * two short lines: `#218 desktop-dock` fitted that row to "Hide read" with nothing to spare, and
- * "Collapse read" (now Fold read) on one line beside its icon would push the dock onto a second row. Never
- * drawn alone — a lone "Hide" or "Fold" reads as the act a tap performs. See web/voice.css.
- */
-const READ_MODE_VERBS = { show: "Show", fold: "Fold", hide: "Hide" };
-
-/** What h says on the status line of each mode it moves to (`readModeFromKeyboard`). `#432 read-mode-unify`. */
-const READ_MODE_SAID = {
-  show: "Show read: everything shown.",
-  fold: "Fold read: read runs folded.",
-  hide: "Hide read: read ones hidden.",
-};
-
-/** The sentence under the pointer for each mode: what it does, and where a tap goes next. */
-const READ_MODE_TITLES = {
-  show: "Read messages are shown, greyed. Tap to fold each run of them into one line.",
-  fold: "Each run of read messages, or of read threads, is one line; tap a line to open it. Tap to hide read messages.",
-  hide: "Read messages are hidden. Tap to show them again.",
-};
-
-/** The mode the list is in: one of `READ_MODES`. Kept with the rest of the UI state. */
-let readMode = "show";
-
-/**
- * The read mode's own kept copy, for the server (`#457 settings-server-side`). The mode itself
- * lives in the UI-state record with the view it belongs to; this mirror is written wherever the
- * mode changes, so the settings sync can carry the mode — a messaging choice — without carrying
- * the view record (this window's place in a channel, which is navigation, not a setting).
- */
-const READ_MODE_KEY = "vibe-talk.voice.read-mode";
 
 /**
  * The runs of read messages, and the ones the reader has opened, per view (`viewKey`), as the ids of
@@ -26539,16 +26504,6 @@ function foldedOneIds(key) {
  **/
 // Kept per column: `listState().runRows` (`freshListState`, `#624 voice-page-modularity`).
 
-/** The mode a saved UI record holds: its own `read` when it has one, and otherwise its `todo`. */
-function savedReadMode(saved) {
-  // `#432 read-mode-unify`. Fold read was "Collapse read", and a record kept then still means it.
-  if (saved.read === "collapse") return "fold";
-  return READ_MODES.includes(saved.read) ? saved.read : saved.todo ? "hide" : "show";
-}
-
-/** The mode after `mode`, round the cycle. */
-const nextReadMode = (mode) => READ_MODES[(READ_MODES.indexOf(mode) + 1) % READ_MODES.length];
-
 /**
  * The button, saying the mode: its word, its icon (drawn by web/voice.css off `data-read-mode`), and
  * to a screen reader the mode and where a tap goes. `aria-pressed` is the tri-state ARIA gives a
@@ -26556,7 +26511,7 @@ const nextReadMode = (mode) => READ_MODES[(READ_MODES.indexOf(mode) + 1) % READ_
  */
 function renderReadModeControl() {
   const button = el("todo-filter");
-  const label = READ_MODE_LABELS[readMode];
+  const label = READ_MODE_LABELS[readModes.mode()];
   // Two words in two spans, so a desk can stack them; made here when the markup's are absent.
   const words = el("todo-filter-label");
   let verb = childByClass(words, "read-mode-verb");
@@ -26568,20 +26523,20 @@ function renderReadModeControl() {
     noun.textContent = " read";
     words.replaceChildren(verb, noun);
   }
-  if (verb.textContent !== READ_MODE_VERBS[readMode]) verb.textContent = READ_MODE_VERBS[readMode];
+  if (verb.textContent !== READ_MODE_VERBS[readModes.mode()]) verb.textContent = READ_MODE_VERBS[readModes.mode()];
   // The mode's own icon, and only it, by `hidden`: an icon is something a test of the dock can ask
   // for by that attribute, as it asks of every other control's.
   for (const icon of [...button.children]) {
     if (!String(icon.getAttribute("class") || "").split(/\s+/).includes("read-mode-icon")) continue;
-    const mine = icon.getAttribute("data-mode") === readMode;
+    const mine = icon.getAttribute("data-mode") === readModes.mode();
     if (icon.hasAttribute("hidden") === mine) icon.toggleAttribute("hidden", !mine);
   }
   // Written only when they change: this runs with every redraw of the controls.
   const said = {
-    "data-read-mode": readMode,
-    "aria-pressed": readMode === "hide" ? "true" : readMode === "fold" ? "mixed" : "false",
-    "aria-label": `${label}. Tap for ${READ_MODE_LABELS[nextReadMode(readMode)]}`,
-    title: READ_MODE_TITLES[readMode],
+    "data-read-mode": readModes.mode(),
+    "aria-pressed": readModes.mode() === "hide" ? "true" : readModes.mode() === "fold" ? "mixed" : "false",
+    "aria-label": `${label}. Tap for ${READ_MODE_LABELS[nextReadMode(readModes.mode())]}`,
+    title: READ_MODE_TITLES[readModes.mode()],
   };
   for (const [name, value] of Object.entries(said)) {
     if (button.getAttribute(name) !== value) button.setAttribute(name, value);
@@ -26622,7 +26577,7 @@ function readRunsSuspended() {
  * chose is untouched, and closing the search brings it back. Without threads Hide read is a read of
  * its own (`loadTodo`), and stays in force.
  */
-const hidingRead = () => todoMode && !(threadingSupported && readRunsSuspended());
+const hidingRead = () => readModes.hiding() && !(threadingSupported && readRunsSuspended());
 
 /**
  * Run `change`, a change of the filters, and draw each column again from what it holds when it made Hide
@@ -26716,7 +26671,7 @@ function applyReadRuns() {
   const key = viewKey();
   const forced = foldedOneIds(key);
   // `#480 fold-one-message-key`: messages folded away one by one collapse in any read mode.
-  const collapsing = (readMode === "fold" || forced.size > 0) && !readRunsSuspended();
+  const collapsing = (readModes.mode() === "fold" || forced.size > 0) && !readRunsSuspended();
   if (!collapsing && listState().runRows === 0) return;
   const list = el("discord-log");
   const rows = [...list.children];
@@ -26727,7 +26682,7 @@ function applyReadRuns() {
   // does, by the attribute the pass has just set from the same rule.
   const placed = collapsing ? readRunPlan(rows, key, (row) => !isOpenThreadRoot(row, rootId) &&
     !row.hasAttribute("data-coalesce") && !row.hasAttribute("data-unread-replies") &&
-    ((readMode === "fold" && rowIsRead(row)) || idsOf(row).some((id) => forced.has(id))),
+    ((readModes.mode() === "fold" && rowIsRead(row)) || idsOf(row).some((id) => forced.has(id))),
     idsOf, forced) : new Map();
   listState().runRows = placed.size;
   const want = (row) => placed.get(row) || { role: null, count: 0 };
@@ -26834,7 +26789,7 @@ function liveUnpackedRow(row) {
 
 /** Cycle to the next read mode. The Hide read button's tap. */
 function cycleReadMode() {
-  setReadMode(nextReadMode(readMode));
+  setReadMode(nextReadMode(readModes.mode()));
 }
 
 /**
@@ -26957,7 +26912,7 @@ function renderTodoControls() {
   renderReadModeControl();
   el("inbox-note").hidden = !hidingRead();
   const clear = el("clear-backlog");
-  clear.hidden = threadingSupported || !todoMode || listState().backlog === 0;
+  clear.hidden = threadingSupported || !readModes.hiding() || listState().backlog === 0;
   clear.textContent = backlogIsArmed()
     ? `Clear ${listState().backlog}?`
     : `Clear the backlog (${listState().backlog})`;
@@ -27196,7 +27151,7 @@ function appendChannelRow(arriving, live = false, folded = false) {
   else append();
   // A live arrival and an acknowledged send are both what a reload should show next.
   save();
-  if (!todoMode) {
+  if (!readModes.hiding()) {
     return;
   }
   todoView = {
@@ -27426,7 +27381,7 @@ async function refreshAfterInboxChange() {
     saveChannelScope();
     return;
   }
-  if (todoMode) {
+  if (readModes.hiding()) {
     const kept = [...el("discord-log").children].filter((row) => {
       const ids = idsOf(row);
       return ids.length === 0 || !ids.every((id) => doneState().archived.has(id));
@@ -27739,7 +27694,7 @@ async function dismissMessages(body, bump = body.messages ? singleDoneBump(body.
     const staged = bump ? stageBookmark(bump.channel, bump.to) : null;
     move = staged;
     if (staged) inOtherColumn(renderScrollTools);
-    listed = todoMode && !threadingSupported ? [...el("discord-log").children] : null;
+    listed = readModes.hiding() && !threadingSupported ? [...el("discord-log").children] : null;
     await refreshAfterInboxChange();
     renderTodoControls();
     setStatus(`Saving ${requested.length} local change${requested.length === 1 ? "" : "s"}…`);
@@ -27781,7 +27736,7 @@ async function dismissMessages(body, bump = body.messages ? singleDoneBump(body.
       for (const id of added) if (back.has(id)) doneState().archived.delete(id);
       mirrorArchived(mirrored.filter((id) => back.has(id)), false);
       // ...and the rows it took off under Hide read without threads, while that list is still on screen.
-      if (listed && todoMode && !threadingSupported && String(selectedChannelId()) === String(channel)) {
+      if (listed && readModes.hiding() && !threadingSupported && String(selectedChannelId()) === String(channel)) {
         putBackRowsOff(listed, back);
       }
       guardQuietly(refreshAfterInboxChange)();
@@ -27900,7 +27855,7 @@ async function restoreMessages(ids) {
     settled = true;
     // Saved: what waits on it need not wait for the read below as well.
     saving();
-    if (todoMode && !threadingSupported) {
+    if (readModes.hiding() && !threadingSupported) {
       await loadTodo({ keepPosition: true, ownAct: true, readAs: "mutation" });
     }
   } catch (error) {
@@ -28153,27 +28108,23 @@ async function clearBacklog() {
  */
 function setReadMode(mode) {
   if (!READ_MODES.includes(mode)) return;
-  const wasHiding = todoMode;
+  const wasHiding = readModes.hiding();
   const read = keepingFilterPlace(() => {
-    readMode = mode;
-    todoMode = mode === "hide";
+    readModes.set(mode);
     // Runs opened under Fold read are a way of looking at that list, and the reader has just
     // chosen another way: coming back to Fold read folds them all again.
     readRuns.clear();
     // Kept across a reload, as the reader left it. `#189 restore-ui-state`.
     uiStateSettled = true;
     saveUiState();
-    try {
-      deviceStorage().setItem(READ_MODE_KEY, mode);
-    } catch (_error) {
-      // The UI-state record above is the restore; this copy is only the sync's.
-    }
+    // The UI-state record above is the restore; this copy is only the sync's.
+    readModes.keep();
     disarmBacklog();
     // An undo belongs to the act it undoes, and leaving the view is the reader moving on. Keeping
     // it would offer to restore messages into a list they are no longer looking at. Showing or
     // collapsing what is read leaves every message in the list, so the undo stays between those two.
-    if (todoMode !== wasHiding) lastDismissal = null;
-    if (!todoMode) {
+    if (readModes.hiding() !== wasHiding) lastDismissal = null;
+    if (!readModes.hiding()) {
       listState().backlog = 0;
     }
     renderTodoControls();
@@ -28183,10 +28134,10 @@ function setReadMode(mode) {
       // `#404 threads-unpack-all`. And inside every unpacked block.
       sideCardsDrawn = "";
       if (sideColumnUp()) renderSideColumn();
-    } else if (todoMode !== wasHiding) {
+    } else if (readModes.hiding() !== wasHiding) {
       // A read of another route, which keeps the reader's place as a refresh does and is placed again
       // when it lands. What it brings is the reader's own act, not something that arrived.
-      return (todoMode ? loadTodo : loadDiscord)({ keepPosition: true, ownAct: true, readAs: "enter" });
+      return (readModes.hiding() ? loadTodo : loadDiscord)({ keepPosition: true, ownAct: true, readAs: "enter" });
     } else {
       // Show read and Fold read are the same read of the channel, drawn two ways.
       applyReadRuns();
@@ -28648,7 +28599,7 @@ function noiseRuleRow(rule, index) {
  * server already left the placeholders out and said how many it left, so that number is the one.
  */
 function noiseTally() {
-  if (!threadingSupported && todoMode) {
+  if (!threadingSupported && readModes.hiding()) {
     return { matched: todoView.noise || 0, total: todoView.window || 0 };
   }
   const loaded = threadingSupported
@@ -30340,7 +30291,7 @@ function answeredRow(id) {
 function doneWhereNotDrawn(id) {
   if (threadingSupported && channelStore.current().channel === String(selectedChannelId()) &&
       channelStore.current().dismissed.has(id)) return true;
-  return inColumn(columns.main, () => doneState().archived.has(id) || (todoMode && !threadingSupported));
+  return inColumn(columns.main, () => doneState().archived.has(id) || (readModes.hiding() && !threadingSupported));
 }
 
 /**
@@ -31945,8 +31896,8 @@ function renderSideCards() {
   const main = mainRowsOnScreen() ? mainRowMessages(new Set(cards.map(({ choice }) => choice.id))) : [];
   // `#532 shift-o-latency`. What the whole list is drawn under, then each thread's card and block, then
   // Main's messages: a pass that changes one thread draws that thread again and keeps every other one.
-  const whole = JSON.stringify([order, readMode, readRunsSuspended(), cardPacking.mode(),
-    main.length ? [readMode, combineMessages, readAloudOwner().nowPlaying ? readAloudOwner().nowPlaying.id : "", readAloudOwner().pendingRead] : ""]);
+  const whole = JSON.stringify([order, readModes.mode(), readRunsSuspended(), cardPacking.mode(),
+    main.length ? [readModes.mode(), combineMessages, readAloudOwner().nowPlaying ? readAloudOwner().nowPlaying.id : "", readAloudOwner().pendingRead] : ""]);
   const parts = cards.map(sideCardParts);
   const signature = JSON.stringify([whole, parts, main.map((message) => [messageLook(message), readLook(message)])]);
   const more = olderThreadsToRead();
@@ -32379,7 +32330,7 @@ let unpackSuspendedDrawn = false;
 function filterSideCards() {
   // A filter choosing rows opens every run, and closing it folds them again: unpacked blocks' runs, and
   // under Fold read the runs of read threads over the cards (`foldCardRuns`, `#432 read-mode-unify`).
-  if ((unpackOnScreen() || readMode === "fold") && readRunsSuspended() !== unpackSuspendedDrawn) {
+  if ((unpackOnScreen() || readModes.mode() === "fold") && readRunsSuspended() !== unpackSuspendedDrawn) {
     unpackSuspendedDrawn = readRunsSuspended();
     sideCardsDrawn = "";
     renderSideCards();
@@ -33034,9 +32985,9 @@ function unpackNeedsRead(choice, held) {
 function placeUnpackRuns(choice, rows) {
   const key = viewKey("thread", choice.id);
   const forced = foldedOneIds(key);
-  const placed = (readMode === "fold" || forced.size > 0) && !readRunsSuspended()
+  const placed = (readModes.mode() === "fold" || forced.size > 0) && !readRunsSuspended()
     ? readRunPlan(rows, key, (row) => !row.hasAttribute("data-root-child") &&
-      ((readMode === "fold" && rowIsRead(row)) || idsOf(row).some((id) => forced.has(id))), idsOf, forced)
+      ((readModes.mode() === "fold" && rowIsRead(row)) || idsOf(row).some((id) => forced.has(id))), idsOf, forced)
     : new Map();
   for (const row of rows) {
     const { role, count } = placed.get(row) || { role: null, count: 0 };
@@ -33068,7 +33019,7 @@ function unpackSignature(choice, held) {
   const opened = readRuns.opened(viewKey("thread", choice.id));
   const cover = channelStore.current().views.get(viewKey("thread", choice.id));
   const view = cardView(choice);
-  return JSON.stringify([choice.id, readMode, readRunsSuspended(), hideEmptyMessages, combineMessages,
+  return JSON.stringify([choice.id, readModes.mode(), readRunsSuspended(), hideEmptyMessages, combineMessages,
     view.mode, view.cut ? view.cut.head : 0, view.cut && choice.root ? renderedHtmlOf(choice.root) || rawTextOf(choice.root) : "",
     held.map(messageLook), hidingRead() ? unpackReadSignature(held) : "",
     opened ? [...opened].sort() : [], unpackReads.get(choice.id) || "", readAloudOwner().nowPlaying ? readAloudOwner().nowPlaying.id : "", readAloudOwner().pendingRead,
@@ -33567,7 +33518,7 @@ function cardRunRows(head) {
 function foldCardRuns(list) {
   const rows = /** @type {HTMLElement[]} */ ([...list.children]);
   const items = rows.filter((row) => row.hasAttribute("data-card") || row.hasAttribute("data-main-row"));
-  const placed = readMode === "fold" && !readRunsSuspended()
+  const placed = readModes.mode() === "fold" && !readRunsSuspended()
     ? readRunPlan(items, cardRunKey(), cardRunRead, cardRunIds) : new Map();
   const isItem = new Set(items);
   /** @type {{row: HTMLElement, threads: number, messages: number} | null} */
@@ -35145,7 +35096,7 @@ const liveEvents = createLiveEvents();
 
 /** The view a read of the column being worked on is for: its context, and the to-do list apart. */
 function readHoldKey() {
-  return !threadingSupported && todoMode ? `${channelContextKey()} todo` : channelContextKey();
+  return !threadingSupported && readModes.hiding() ? `${channelContextKey()} todo` : channelContextKey();
 }
 
 /**
@@ -35253,7 +35204,7 @@ function abandonedReadStands(read) {
     return read.canon === channelStore.current() && channelStore.current().channel === read.channel &&
       read.number === readOrder.asked();
   }
-  return read.generation === loadState().generation && !todoMode;
+  return read.generation === loadState().generation && !readModes.hiding();
 }
 
 /**
@@ -35378,7 +35329,7 @@ function currentDiscordLoad(generation, channel, readingTodo) {
   return (
     generation === loadState().generation &&
     String(channel) === String(selectedChannelId()) &&
-    readingTodo === todoMode
+    readingTodo === readModes.hiding()
   );
 }
 
@@ -37702,7 +37653,7 @@ function restateChannelSeam() {
   if (el("channel-summary").children.length === 0) {
     return;
   }
-  if (todoMode) {
+  if (readModes.hiding()) {
     renderChannelSeam(todoSummary());
     return;
   }
@@ -38621,10 +38572,10 @@ el("hide-empty-messages").addEventListener("change", () => {
       if (selection().view === "threads") el("thread-list").replaceChildren(...threadCards(timelineRows().threads));
     });
     renderSideColumn();
-  } else if (hideEmptyMessages && !todoMode) {
+  } else if (hideEmptyMessages && !readModes.hiding()) {
     regroupChannelRows();
   } else {
-    guardQuietly(() => (todoMode ? loadTodo : loadDiscord)({ keepPosition: true, ownAct: true, readAs: "mutation" }))();
+    guardQuietly(() => (readModes.hiding() ? loadTodo : loadDiscord)({ keepPosition: true, ownAct: true, readAs: "mutation" }))();
   }
   setStatus(el("hide-empty-messages").checked
     ? "messages with nothing in them are hidden."
@@ -40227,13 +40178,9 @@ barPlacement.set(barPlacement.stored());
 // The read mode as the reader left it, before the first row is drawn or read. `#189
 // restore-ui-state`, and `#221 read-modes`: a record an older page kept says only Hide read or not.
 if (savedUi) {
-  readMode = savedReadMode(savedUi);
-  todoMode = readMode === "hide";
-  try {
-    deviceStorage().setItem(READ_MODE_KEY, readMode);
-  } catch (_error) {
-    // As in `setReadMode`: the record just read is the restore either way.
-  }
+  readModes.set(savedReadMode(savedUi));
+  // As in `setReadMode`: the record just read is the restore either way.
+  readModes.keep();
 }
 showView("voice");
 renderEmptyState();

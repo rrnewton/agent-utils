@@ -61,3 +61,15 @@ export {
 export type { CardPacking, CardPackingDependencies } from "./packing.ts";
 export { bookmarkSpot } from "./bookmark.ts";
 export type { BookmarkAnchorFacts, BookmarkRow } from "./bookmark.ts";
+export {
+  READ_MODES,
+  READ_MODE_KEY,
+  READ_MODE_LABELS,
+  READ_MODE_SAID,
+  READ_MODE_TITLES,
+  READ_MODE_VERBS,
+  createReadMode,
+  nextReadMode,
+  savedReadMode,
+} from "./readmode.ts";
+export type { ReadMode, ReadModeDependencies } from "./readmode.ts";
