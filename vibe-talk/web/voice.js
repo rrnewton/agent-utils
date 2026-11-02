@@ -30456,13 +30456,16 @@ function cardState(choice, read) {
  * `#624 voice-page-modularity`); the read itself, and drawing what it brought, are here.
  */
 const unpackReadQueue = createUnpackReads({
-  read: async (id) => {
+  fetch: async (id) => {
     const channel = String(selectedChannelId());
     if (channelStore.current().channel !== channel) loadCanon(channel);
     const held = heldNow(channelStore.current());
     const path = withThreadQuery(
       `/api/v1/channels/${encodeURIComponent(channel)}/timeline?view=thread&limit=${DISCORD_PAGE_LIMIT}&reason=threads`, id);
-    const payload = await readTimeline(path, undefined);
+    return { channel, held, payload: await readTimeline(path, undefined) };
+  },
+  land: (id, fetched) => {
+    const { channel, held, payload } = /** @type {{channel: string, held: Map<string, any>, payload: any}} */ (fetched);
     if (String(selectedChannelId()) !== channel) return false;
     foldTimelinePage(payload, false, "thread", id, held);
     return true;

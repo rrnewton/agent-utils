@@ -699,7 +699,8 @@ test("`#624 voice-page-modularity`: unpacking reads each thread once, three at a
   const ended = [];
   let landed = true;
   const reads = createUnpackReads({
-    read: (id) => new Promise((resolve, reject) => pending.set(id, { resolve, reject })),
+    fetch: (id) => new Promise((resolve, reject) => pending.set(id, { resolve, reject })),
+    land: (_id, fetched) => fetched,
     ended: (id) => ended.push(id),
     guard: (run) => { run(); },
   });

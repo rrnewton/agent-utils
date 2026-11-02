@@ -16,11 +16,13 @@ export interface UnpackedThread {
 
 /** What the reads ask of the page. */
 export interface UnpackReadsDependencies {
+  /** Ask the server for thread `id`'s newest page; rejects where it failed. */
+  fetch(id: string): Promise<unknown>;
   /**
-   * Read thread `id`'s newest page and fold it into the store: true where it landed for the channel it
-   * was asked for, false where the reader had moved on; rejects where it failed.
+   * Fold what `fetch` brought for thread `id` into the store, in the same turn as the read ends: true where
+   * it landed for the channel it was asked for, false where the reader had moved on.
    */
-  read(id: string): Promise<boolean>;
+  land(id: string, fetched: unknown): boolean;
   /** A read has ended, landed, moved past or failed: draw again what it may have brought. */
   ended(id: string): void;
   /** Run the read, its failures caught quietly (`guardQuietly`). */
@@ -72,7 +74,8 @@ export function createUnpackReads(deps: UnpackReadsDependencies): UnpackReads {
   /** One thread's newest page, folded into the store, its block drawn again from what it brought. */
   async function readUnpackThread(id: string): Promise<void> {
     try {
-      if (!await deps.read(id)) {
+      const fetched = await deps.fetch(id);
+      if (!deps.land(id, fetched)) {
         unpackReads.delete(id);
         unpackReadCounts.delete(id);
         return;
