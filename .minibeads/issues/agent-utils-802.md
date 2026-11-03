@@ -1,6 +1,6 @@
 ---
 title: 'chat-delivery-latency-emoji: an opt-in delivered reaction that shows ack-to-delivered minutes'
-status: open
+status: closed
 priority: 3
 issue_type: feature
 assignee: mu-transcript@devbig014
@@ -11,6 +11,7 @@ depends_on:
   agent-utils-714: blocks
 created_at: 2026-11-03T01:37:46.258002759+00:00
 updated_at: 2026-11-03T01:37:46.258002759+00:00
+closed_at: 2026-11-03T06:44:10.875415+00:00
 ---
 
 # Description
