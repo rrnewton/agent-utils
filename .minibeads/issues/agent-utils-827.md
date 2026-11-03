@@ -23,3 +23,7 @@ For each repeat offender decide, with evidence: LOAD (memory or CPU contention i
 - The full-gate pass rate, measured the same way over a working day after the fixes, is at least 90%.
 - Each step listed above has a recorded verdict (load or race) and either a fix or a reason it was left.
 - No step is fixed by skipping it or by lengthening a sleep.
+
+# Notes
+
+- [opus 5.5] 2026-11-03 ~18:00 ET: vibe-talk.test.page-0 failed a full gate on the #532 Shift+O latency budget ("a Shift+O took over 50 ms: 88.6, 93.9, 122.9, 49.0") while gating #828, which does not touch that code; it passed in the lane's inner loop. A 50 ms wall-clock budget is the kind of check the owner's timeout rule says must not turn red under contention.
