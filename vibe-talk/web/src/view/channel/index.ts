@@ -97,3 +97,5 @@ export { createLayoutShown } from "./layoutshown.ts";
 export type { Layout, LayoutShown } from "./layoutshown.ts";
 export { createCardsDrawn } from "./cardsdrawn.ts";
 export type { CardsDrawn, KeptCards } from "./cardsdrawn.ts";
+export { UNPACK_NEAR_PX, createUnpackWatch } from "./unpackwatch.ts";
+export type { UnpackWatch, UnpackWatchDependencies } from "./unpackwatch.ts";

@@ -27693,7 +27693,7 @@ function placeChildren(list, wanted) {
   const keep = new Set(wanted);
   for (const child of [...list.children]) {
     if (keep.has(/** @type {HTMLElement} */ (child))) continue;
-    if (unpackObserver !== null) unpackObserver.unobserve(child);
+    unpackWatch.unwatch(child);
     list.removeChild(child);
   }
   let at = list.firstElementChild;
@@ -27773,10 +27773,7 @@ function renderSideCards() {
     // (`cardsDrawn.forget`: something the signatures do not say has changed).
     const keep = cardsDrawn.redraw(signature, whole);
     keepingCardPlace(() => {
-      if (!keep && unpackObserver !== null) {
-        unpackObserver.disconnect();
-        unpackObserver = null;
-      }
+      if (!keep) unpackWatch.stop();
       const kept = cards.map((card) => (keep ? cardsDrawn.kept().threads.get(card.choice.id) : undefined));
       // A card that says the same is kept, its counts brought up to date where they changed: putting a new
       // element in the list costs its every row laid out again, a count changed in place does not.
@@ -28417,9 +28414,6 @@ function refilterSideCards() {
 // CARD_STATES, THREADS_UNPACKED_KEY, THREAD_CARD_STATES_KEY; `#624 voice-page-modularity`).
 const cardPacking = createCardPacking({ storage: () => deviceStorage() });
 
-/** How far below the cards on screen a block starts its read, in px: about one screenful ahead. */
-const UNPACK_NEAR_PX = 400;
-
 /** Whether the cards on screen are the Threads view's, where each thread is packed or unpacked from its card. */
 const cardsCycle = () => threadListOnScreen() && columns.side.mode === "list";
 
@@ -28464,8 +28458,11 @@ const unpackReadQueue = createUnpackReads({
   guard: (run) => guardQuietly(run)(),
 });
 
-/** The observer that reads a thread as its block nears the screen, made when first wanted. */
-let unpackObserver = null;
+/**
+ * The blocks read as they near the screen, through one observer made when first wanted: web/src/view/channel's
+ * (`createUnpackWatch`, UNPACK_NEAR_PX; `#624 voice-page-modularity`).
+ */
+const unpackWatch = createUnpackWatch({ root: () => leftEl("side-scroll"), read: (id) => queueUnpackRead(id) });
 
 /** Whether `choice`'s card says a summary rather than its root's words (`#405 root-under-summary`). */
 const cardIsSummarized = (choice) => {
@@ -28816,20 +28813,7 @@ function unpackMessages(choice, held, withRoot) {
 
 /** Read thread `id` for its block as `row` nears the screen; at once where nothing can watch. */
 function watchUnpackBlock(row, id) {
-  if (typeof IntersectionObserver !== "function") {
-    queueUnpackRead(id);
-    return;
-  }
-  if (unpackObserver === null) {
-    unpackObserver = new IntersectionObserver((entries) => {
-      for (const entry of entries) {
-        if (!entry.isIntersecting) continue;
-        unpackObserver.unobserve(entry.target);
-        queueUnpackRead(String(entry.target.getAttribute("data-unpack-thread")));
-      }
-    }, { root: leftEl("side-scroll"), rootMargin: `${UNPACK_NEAR_PX}px` });
-  }
-  unpackObserver.observe(row);
+  unpackWatch.watch(row, id);
 }
 
 /** Queue thread `id`'s newest page for its block, `UNPACK_READS_AT_ONCE` at a time. */
@@ -29843,10 +29827,7 @@ function closeSideThread() {
 function resetSideColumn(reopen = false) {
   // `#404 threads-unpack-all`. Unpack reads were the last channel's.
   unpackReadQueue.forget();
-  if (unpackObserver !== null) {
-    unpackObserver.disconnect();
-    unpackObserver = null;
-  }
+  unpackWatch.stop();
   endSearchWalk(columns.side);
   columns.side.searchNote = null;
   // `#262 search-load-older`. And the cards' walk, and what the last one found: they were this channel's.

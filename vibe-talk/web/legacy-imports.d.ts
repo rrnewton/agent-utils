@@ -267,6 +267,7 @@ declare const createSeamLines: LegacyImports["createSeamLines"];
 declare const createInputKinds: LegacyImports["createInputKinds"];
 declare const createCardPlaces: LegacyImports["createCardPlaces"];
 declare const createColumnWork: LegacyImports["createColumnWork"];
+declare const createUnpackWatch: LegacyImports["createUnpackWatch"];
 declare const createCardsDrawn: LegacyImports["createCardsDrawn"];
 declare const createLayoutShown: LegacyImports["createLayoutShown"];
 declare const createArming: LegacyImports["createArming"];

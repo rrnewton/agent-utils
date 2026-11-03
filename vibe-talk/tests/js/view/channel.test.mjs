@@ -652,3 +652,44 @@ test("`#624 voice-page-modularity`: the cards keep what they drew only under the
   assert.throws(() => drawn.whileOpening(() => { throw new Error("drawn wrong"); }), /drawn wrong/);
   assert.deepStrictEqual([seen, drawn.opening()], [[true], false]);
 });
+
+test("`#624 voice-page-modularity`: a block is read as it nears the screen, through one observer, and at once where nothing can watch", () => {
+  const { createUnpackWatch, UNPACK_NEAR_PX } = CHANNEL_VIEW;
+  const read = [];
+  const root = { name: "side-scroll" };
+  const row = (id) => ({ getAttribute: (name) => (name === "data-unpack-thread" ? id : null) });
+  assert.equal(typeof globalThis.IntersectionObserver, "undefined", "the premise: node has no observer");
+  createUnpackWatch({ root: () => root, read: (id) => read.push(id) }).watch(row("t0"), "t0");
+  assert.deepStrictEqual(read, ["t0"], "nothing can watch: read at once");
+  const made = [];
+  globalThis.IntersectionObserver = class {
+    constructor(callback, options) {
+      this.callback = callback;
+      this.options = options;
+      this.watched = new Set();
+      made.push(this);
+    }
+    observe(target) { this.watched.add(target); }
+    unobserve(target) { this.watched.delete(target); }
+    disconnect() { this.watched.clear(); this.gone = true; }
+  };
+  try {
+    const watch = createUnpackWatch({ root: () => root, read: (id) => read.push(id) });
+    const [a, b, c] = [row("t1"), row("t2"), row("t3")];
+    watch.watch(a, "t1");
+    watch.watch(b, "t2");
+    assert.equal(made.length, 1, "one observer for every block");
+    assert.deepStrictEqual(made[0].options, { root, rootMargin: `${UNPACK_NEAR_PX}px` });
+    made[0].callback([{ isIntersecting: false, target: a }, { isIntersecting: true, target: b }]);
+    assert.deepStrictEqual(read, ["t0", "t2"], "only the block near the screen is read");
+    assert.deepStrictEqual([...made[0].watched], [a], "and watched no more");
+    watch.unwatch(a);
+    assert.equal(made[0].watched.size, 0);
+    watch.stop();
+    assert.equal(made[0].gone, true);
+    watch.watch(c, "t3");
+    assert.equal(made.length, 2, "stopped, the next block makes a new observer");
+  } finally {
+    delete globalThis.IntersectionObserver;
+  }
+});
