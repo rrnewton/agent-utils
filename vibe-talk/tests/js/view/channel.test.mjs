@@ -693,3 +693,17 @@ test("`#624 voice-page-modularity`: a block is read as it nears the screen, thro
     delete globalThis.IntersectionObserver;
   }
 });
+
+test("`#624 voice-page-modularity`: the cards note when read runs stand suspended, and dress unpacked rows later only inside the pass", () => {
+  const { createCardsDrawn } = CHANNEL_VIEW;
+  const drawn = createCardsDrawn();
+  assert.equal(drawn.noteSuspended(false), false, "drawn unsuspended, and still so");
+  assert.equal(drawn.noteSuspended(true), true, "a filter now chooses rows");
+  assert.equal(drawn.noteSuspended(true), false, "and it was noted");
+  assert.equal(drawn.dressedAfter(), false);
+  const seen = [];
+  drawn.whileDressedAfter(true, () => seen.push(drawn.dressedAfter()));
+  drawn.whileDressedAfter(false, () => seen.push(drawn.dressedAfter()));
+  assert.throws(() => drawn.whileDressedAfter(true, () => { throw new Error("drawn wrong"); }), /drawn wrong/);
+  assert.deepStrictEqual([seen, drawn.dressedAfter()], [[true, false], false]);
+});

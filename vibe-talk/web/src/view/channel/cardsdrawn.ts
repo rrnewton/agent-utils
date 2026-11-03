@@ -1,9 +1,10 @@
 // What the thread list's cards were last drawn from (`#281 view-keys`, `#532 shift-o-latency`; `#624
 // voice-page-modularity`, moved from the legacy script into view/channel): the signature of the last pass,
 // so a pass that changes nothing draws nothing; the elements it drew, which the next pass under the same
-// whole keeps where it can; how many cards there are and how many the search and the read mode leave; and
-// whether the cards are being opened. Building the cards, and what each signature says, are the page's
-// (`renderSideCards`, `filterSideCards`).
+// whole keeps where it can; whether read runs stood suspended when the blocks under the cards were drawn; how
+// many cards there are and how many the search and the read mode leave; whether the cards are being opened;
+// and whether the cards, drawn next, dress the unpacked rows again themselves. Building the cards, and what
+// each signature says, are the page's (`renderSideCards`, `filterSideCards`).
 
 /**
  * What the last pass over the cards drew: the whole list's signature, each thread's card and block by its
@@ -31,6 +32,11 @@ export interface CardsDrawn<Thread, Run> {
   kept(): KeptCards<Thread, Run>;
   /** The pass has drawn `drawn`. */
   keep(drawn: KeptCards<Thread, Run>): void;
+  /**
+   * Whether read runs stand suspended now (a filter choosing rows opens every run, and closing it folds them
+   * again): whether that is not how the blocks were last drawn.
+   */
+  noteSuspended(suspended: boolean): boolean;
   /** The cards there are, and how many the search and the read mode leave, as the last count found. */
   count(): { readonly cards: number; readonly shown: number };
   setCount(cards: number, shown: number): void;
@@ -38,6 +44,15 @@ export interface CardsDrawn<Thread, Run> {
   opening(): boolean;
   /** Open the cards with `fn`, and stop opening however it returns. */
   whileOpening(fn: () => void): void;
+  /**
+   * `#532 shift-o-latency`. True while a pass over the left column's rows is made for a Done or a put back
+   * made on a row unpacked under the cards: the cards are drawn next, and they dress again the one block
+   * whose messages changed, so the pass leaves every unpacked row alone rather than dress them all again
+   * for nothing.
+   */
+  dressedAfter(): boolean;
+  /** Run `fn` with `dressedAfter` set to `after`, and clear it however `fn` returns. */
+  whileDressedAfter(after: boolean, fn: () => void): void;
 }
 
 /** Nothing drawn, nothing counted. */
@@ -46,6 +61,8 @@ export function createCardsDrawn<Thread, Run>(): CardsDrawn<Thread, Run> {
   let keptCards: KeptCards<Thread, Run> = { whole: "", threads: new Map(), main: new Map() };
   let counted = { cards: 0, shown: 0 };
   let cardsOpening = false;
+  let suspendedDrawn = false;
+  let unpackDressedAfter = false;
 
   return {
     changed: (signature) => signature !== drawnFrom,
@@ -61,6 +78,11 @@ export function createCardsDrawn<Thread, Run>(): CardsDrawn<Thread, Run> {
     keep(drawn) {
       keptCards = drawn;
     },
+    noteSuspended(suspended) {
+      const changed = suspended !== suspendedDrawn;
+      suspendedDrawn = suspended;
+      return changed;
+    },
     count: () => counted,
     setCount(cards, shown) {
       counted = { cards, shown };
@@ -72,6 +94,15 @@ export function createCardsDrawn<Thread, Run>(): CardsDrawn<Thread, Run> {
         fn();
       } finally {
         cardsOpening = false;
+      }
+    },
+    dressedAfter: () => unpackDressedAfter,
+    whileDressedAfter(after, fn) {
+      unpackDressedAfter = after;
+      try {
+        fn();
+      } finally {
+        unpackDressedAfter = false;
       }
     },
   };

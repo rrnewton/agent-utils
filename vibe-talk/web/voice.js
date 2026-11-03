@@ -18085,7 +18085,8 @@ function renderChannelRows() {
   paintAllThreadFocus();
   // `#407 unpack-row-parity`. Whatever this pass was for — a read aloud starting or ending, a pin, a
   // reply sent — the rows unpacked under the cards are dressed again with it, as message rows.
-  if (!columnWork.side() && !unpackDressedAfter) dressUnpackedRows();
+  // `cardsDrawn.dressedAfter`: not where the cards drawn next dress the one block that changed (`redrawUnpackBlock`).
+  if (!columnWork.side() && !cardsDrawn.dressedAfter()) dressUnpackedRows();
   // `#540 read-aloud-desktop`. And a card whose first message a read is reading, or has asked for.
   if (!columnWork.side()) readAloudOwner().paintReadingCards();
   // `#419 threads-view-main-messages`. Main's messages among the cards are Main's rows' messages: what
@@ -18097,14 +18098,6 @@ function renderChannelRows() {
   if (replyDocked) placeInlineReply();
   else if (pendingReply) reopenPendingReply();
 }
-
-/**
- * `#532 shift-o-latency`. True while a pass over the left column's rows is made for a Done or a put back
- * made on a row unpacked under the cards (`followDoneEverywhere`): the cards are drawn next, and they
- * dress again the one block whose messages changed (`redrawUnpackBlock`), so the pass leaves every
- * unpacked row alone rather than dress them all again for nothing.
- */
-let unpackDressedAfter = false;
 
 /**
  * Dress every message row unpacked under the cards again from what the page holds now
@@ -24913,17 +24906,14 @@ function followDoneEverywhere(ids, madeIn) {
   }
   if (madeIn === columns.side && !sideShowing()) {
     // The cards, drawn at the end of this, dress the rows of what changed among them.
-    unpackDressedAfter = sideColumnUp();
-    try {
+    cardsDrawn.whileDressedAfter(sideColumnUp(), () => {
       inColumn(columns.main, () => {
         doneState().archived = caughtUp(doneState().archived);
         // Its rows, or under Hide read which rows it draws; else Main's roots' counts of unread replies.
         if (rowsMissDone()) renderCachedTimeline();
         else syncUnreadReplies();
       });
-    } finally {
-      unpackDressedAfter = false;
-    }
+    });
   }
   if (madeIn !== columns.side && sideShowing()) {
     inColumn(columns.side, () => {
@@ -28002,19 +27992,15 @@ function placeOpenedCards() {
  * facts (`markReplyMatch`). Nothing is read as the search is typed: a reply the page does not hold is
  * found once the cards' own walk further back has read it (`searchReplies`, `#262 search-load-older`).
  */
-/** Whether read runs stood suspended when the blocks were last drawn (`filterSideCards`). */
-let unpackSuspendedDrawn = false;
-
 function filterSideCards() {
   // A filter choosing rows opens every run, and closing it folds them again: unpacked blocks' runs, and
   // under Fold read the runs of read threads over the cards (`foldCardRuns`, `#432 read-mode-unify`).
-  if ((unpackOnScreen() || readModes.mode() === "fold") && readRunsSuspended() !== unpackSuspendedDrawn) {
-    unpackSuspendedDrawn = readRunsSuspended();
+  // Noted whether or not the blocks are drawn again (`cardsDrawn.noteSuspended`).
+  if (cardsDrawn.noteSuspended(readRunsSuspended()) && (unpackOnScreen() || readModes.mode() === "fold")) {
     cardsDrawn.forget();
     renderSideCards();
     return;
   }
-  unpackSuspendedDrawn = readRunsSuspended();
   // `#606 server-side-search`. The shared language, message by message: a thread with any hit is
   // chosen, by its card's own words or by a reply the page holds.
   const node = searchField.open() ? searchParsed(searchField.query()).node : null;
