@@ -22,7 +22,7 @@ printf '%s\n' "$*" >> "$FAKE_SLACK_DIR/argv.log"
 while [ "${1#--}" != "$1" ]; do shift; done
 case "$1 $2" in
   "slack.user describe")
-    if [ -f "$FAKE_SLACK_DIR/author-slow" ]; then sleep 0.65; fi
+    if [ -f "$FAKE_SLACK_DIR/author-slow" ]; then sleep 0.45; fi
     if [ -f "$FAKE_SLACK_DIR/author-timeout" ]; then sleep 1.2; fi
     cat "$FAKE_SLACK_DIR/resolve.json" ;;
   "slack.reaction add")

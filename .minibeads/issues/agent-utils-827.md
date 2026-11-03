@@ -41,6 +41,6 @@ For each repeat offender decide, with evidence: LOAD (memory or CPU contention i
 
 Failing cases are delivery-ordering assertions (`primary/muse14/resumed-drain` python rc 75, `delivered-once-in-order`, herdr-agent `send/possibly-submitted*`): both editions behave the same solo; in full gates the wall-clock delivery windows flip under cross-gate host contention. These steps already run in the serial solo phase per gate; the remaining contention is other gates' main phases. No sleep lengthening allowed; candidate fix is CPU-budget-based pacing in the differential harness, to be measured.
 
-### rust.chat-subscription.slack — LOAD-suspect (verdict pending reproduction)
+### rust.chat-subscription.slack — LOAD (fixed)
 
-`directory::rejection_lookup_and_write_share_one_deadline_even_through_the_warm_wrapper` (gate-742c): expected `unknown`, got `not_applied` — a shared-deadline classification that flips when the host is slow. Reproduce under load before fixing.
+`directory::rejection_lookup_and_write_share_one_deadline_even_through_the_warm_wrapper` (gate-742c): expected outcome `unknown` (write began, killed at the shared 1000 ms deadline), got `not_applied` (write never began). The fake lookup slept 0.65 s of the 1.0 s deadline, leaving only ~0.35 s for two process spawns; under gate load the lookup phase consumed the whole deadline. Fix: the fake's `author-slow` latency is 0.45 s, restoring spawn headroom within the same deadline (no deadline or sleep was lengthened; the sibling persistence test still exceeds the deadline: 0.45 + 0.65 > 1.0). Verified: 19/19 directory tests pass; under artificial saturation (4 spinners on 2 cores, test pinned to the same 2 cores) 1 failure in 60 runs, versus failing in ordinary full gates before.
