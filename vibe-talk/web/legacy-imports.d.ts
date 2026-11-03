@@ -252,6 +252,7 @@ declare const createRowGestures: LegacyImports["createRowGestures"];
 declare const createSeamLines: LegacyImports["createSeamLines"];
 declare const createInputKinds: LegacyImports["createInputKinds"];
 declare const createCardPlaces: LegacyImports["createCardPlaces"];
+declare const createPinSync: LegacyImports["createPinSync"];
 declare const createThreadHues: LegacyImports["createThreadHues"];
 declare const neighbourStayed: LegacyImports["neighbourStayed"];
 declare const rowNeighbours: LegacyImports["rowNeighbours"];

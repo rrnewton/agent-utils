@@ -336,3 +336,59 @@ test("`#624 voice-page-modularity`: thread colours are remembered per channel, t
   await turn();
   assert.equal(JSON.parse(store.get(THREAD_HUES_KEY)).v, 2, "another version's memory is not overwritten");
 });
+
+test("`#624 voice-page-modularity`: pins are read only for a revision not held, changed at once, rolled back where refused, and said", async () => {
+  const { createPinSync } = CHANNEL_VIEW;
+  const { createPins } = await moduleForTests("src/core/annotations/index.ts");
+  const pins = createPins();
+  const said = [];
+  const reads = [];
+  const writes = [];
+  let drawn = 0;
+  let refuse = null;
+  let list = { channel_id: "C1", revision: 3, limit: 50, pins: [] };
+  const guarded = [];
+  const sync = createPinSync({
+    pins,
+    channel: () => "C1",
+    forget: (channel) => pins.forget(channel),
+    read: async (channel) => { reads.push(channel); return list; },
+    write: async (channel, id, request) => {
+      writes.push([id, request === null ? "DELETE" : "PUT"]);
+      if (refuse) throw refuse;
+      const pin = request ? { message_id: id, ...request(), content_html: "", truncated: false, pinned_at_ms: 1 } : null;
+      list = { ...list, revision: list.revision + 1, pins: pin ? [...list.pins, pin] : list.pins.filter((one) => one.message_id !== id) };
+      return { revision: list.revision, pin, unpinned: [] };
+    },
+    drawn: () => { drawn += 1; },
+    guard: (run) => { guarded.push(run()); },
+    online: () => true,
+    status: (text) => said.push(text),
+    service: () => "Slack",
+    now: () => 1000,
+  });
+  sync.noteRevision(3);
+  await Promise.all(guarded);
+  assert.deepStrictEqual(reads, ["C1"], "a revision not held is read");
+  sync.noteRevision(3);
+  assert.equal(guarded.length, 1, "the revision held is not read again");
+  const message = { id: "M1", author: "Ada", author_id: "U1", content: "hello", timestamp: "2026-11-02T00:00:00Z" };
+  await sync.toggle([message]);
+  await Promise.all(guarded);
+  assert.deepStrictEqual(writes, [["M1", "PUT"]]);
+  assert.deepStrictEqual(reads, ["C1", "C1"], "a revision moved by the change is read again");
+  assert.equal(pins.isPinned("C1", "M1"), true);
+  assert.equal(said.at(-1), "Pinned here, not in Slack.");
+  refuse = { detail: "the store is full" };
+  await sync.toggle([message]);
+  assert.equal(pins.isPinned("C1", "M1"), true, "a refused unpin is rolled back");
+  assert.equal(said.at(-1), "That message was not unpinned: the store is full");
+  assert.ok(drawn >= 3);
+  const kept = sync.kept({ message_id: "M9", author: "Bo", author_id: "U2", author_is_bot: false, content: "cut", content_html: "",
+    truncated: true, timestamp: "t", thread_id: "T1", thread_root: false, pinned_at_ms: 1 }, "C1");
+  assert.equal(kept.content, "cut…", "a shortened snapshot says so");
+  assert.equal(kept.thread.id, "T1");
+  assert.equal(sync.isKept(kept), true);
+  assert.equal(sync.isKept(message), false);
+  assert.equal(sync.isKept("M9"), false);
+});

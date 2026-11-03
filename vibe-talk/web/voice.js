@@ -25851,8 +25851,25 @@ function freshPinsView() {
 function pinsView() {
   return activeColumn.pins;
 }
-/** Rows of the filter drawn from what a pin kept, rather than from the message itself. */
-const keptByPin = new WeakSet();
+/**
+ * Keeping this channel's pins current and changing them, what a pin keeps of a message, and the rows drawn
+ * from what a pin kept (web/src/view/channel `createPinSync`, `#624 voice-page-modularity`).
+ */
+const pinSync = createPinSync({
+  pins: pinStore,
+  channel: () => currentChannelId(),
+  forget: (channel) => forgetPins(channel),
+  read: (channel) => apiDecoded("PinsResponse", `/api/v1/channels/${encodeURIComponent(channel)}/pins`),
+  write: (channel, id, request) => queueInboxWrite(() => apiDecoded("PinChangeResponse",
+    `/api/v1/channels/${encodeURIComponent(channel)}/pins/${encodeURIComponent(id)}`,
+    request ? { method: "PUT", body: request() } : { method: "DELETE" })),
+  drawn: () => renderPins(),
+  guard: (run) => guardQuietly(run)(),
+  online: () => navigator.onLine !== false,
+  status: (text) => setStatus(text),
+  service: () => channelDirectory.providerName() || "the chat service",
+  now: () => Date.now(),
+});
 /**
  * True while `syncPinnedList` builds the filter's rows, so `discordNode` gives each one the way into
  * its thread. A flag rather than a parameter, because every other caller hands `discordNode` to
@@ -25873,60 +25890,14 @@ function forgetPins(channel = "") {
   pinsView().drawn = "";
 }
 
-/**
- * A read said what revision this channel's pins are at: read the list when that is not the
- * revision of the one held, and never otherwise. A server that keeps no pins sends none, and then
- * there is nothing to keep current.
- */
+/** A read said what revision this channel's pins are at: read the list when the one held is not at it (`PinSync.noteRevision`). */
 function notePinsRevision(revision) {
-  const channel = currentChannelId();
-  if (typeof revision !== "number" || !channel) return;
-  if (pinStore.channel() !== channel) forgetPins(channel);
-  if (pinStore.revision() === revision) return;
-  // One read at a time: a revision noted while one is out is checked against what it brings back.
-  const flight = pinStore.inFlight();
-  if (flight && flight.channel === channel) {
-    flight.noted = revision;
-    return;
-  }
-  guardQuietly(loadPins)();
+  pinSync.noteRevision(revision);
 }
 
-/** Read the list now if this channel's has never been read: the filter is about to show it. */
+/** Read the list now if this channel's has never been read: the filter is about to show it (`PinSync.ensure`). */
 function ensurePins() {
-  const channel = currentChannelId();
-  if (!channel) return;
-  if (pinStore.channel() !== channel) forgetPins(channel);
-  const flight = pinStore.inFlight();
-  if (pinStore.revision() === null && !(flight && flight.channel === channel)) guardQuietly(loadPins)();
-}
-
-/** Read this channel's pins, and draw what changed. */
-async function loadPins() {
-  const channel = currentChannelId();
-  if (!channel) return;
-  if (pinStore.channel() !== channel) forgetPins(channel);
-  const read = pinStore.startRead(channel);
-  try {
-    const payload = await apiDecoded("PinsResponse", `/api/v1/channels/${encodeURIComponent(channel)}/pins`);
-    if (!pinStore.isCurrent(read) || currentChannelId() !== channel) return;
-    applyPinsList(payload);
-  } catch (error) {
-    if (!pinStore.isCurrent(read) || currentChannelId() !== channel) return;
-    // SAID, by the filter that would have shown them; a channel read is not failed for it.
-    pinStore.failed(error.detail || error.message || "the server did not answer");
-    renderPins();
-  } finally {
-    pinStore.endRead(read);
-  }
-  // A read that landed meanwhile named a revision this list is not at: read once more.
-  if (read.noted !== null && read.noted !== pinStore.revision() && currentChannelId() === channel) await loadPins();
-}
-
-/** Take a list the server sent as the truth, with this page's unanswered changes laid over it. */
-function applyPinsList(payload) {
-  pinStore.apply(payload);
-  renderPins();
+  pinSync.ensure();
 }
 
 /** Every row's chip and Pin item, and the filter's list, re-derived from `pins`. */
@@ -25943,7 +25914,7 @@ function drawRowPin(row) {
     setAttributeIfChanged(
       chip,
       "title",
-      rowMessages(row).some((message) => keptByPin.has(message))
+      rowMessages(row).some((message) => pinSync.isKept(message))
         ? "Pinned on this server. This is the copy kept when it was pinned; the message is older " +
             "than what is loaded."
         : "Pinned on this server, for every device. The chat service's own pins are not changed."
@@ -25969,57 +25940,6 @@ function renderPins() {
   if (pinsView().only) settlePendingFilterPlace();
 }
 
-/** What a pin keeps of `message`, as this page will show it until the server says what it kept. */
-function provisionalPin(message) {
-  return {
-    message_id: String(message.id),
-    author: String(message.author || ""),
-    author_id: String(message.author_id || ""),
-    author_is_bot: message.author_is_bot === true,
-    content: String(message.content === null || message.content === undefined ? "" : message.content),
-    // Drawn as the message is until the server's own copy of the pin arrives; never sent.
-    content_html: renderedHtmlOf(message),
-    ...(message.heading ? { heading: message.heading } : {}),
-    ...(message.upstream_url ? { upstream_url: message.upstream_url } : {}),
-    truncated: false,
-    timestamp: String(message.timestamp || ""),
-    thread_id: threadOf(message),
-    thread_root: Boolean(message.thread && message.thread.is_root === true),
-    pinned_at_ms: Date.now(),
-  };
-}
-
-/** A message drawn from what its pin kept, for a pin older than anything loaded. */
-function keptMessage(pin, channel) {
-  /** @type {VibeTalk.Message} */
-  const message = {
-    id: pin.message_id,
-    channel_id: channel,
-    author: pin.author,
-    author_id: pin.author_id,
-    author_is_bot: pin.author_is_bot,
-    timestamp: pin.timestamp,
-    spoken_time: "",
-    reply_to: null,
-    // An ellipsis where the server cut it, so a shortened text does not read as the whole message.
-    // The server renders the snapshot with the same ellipsis after it. `#217 markdown-blocks`.
-    content: pin.truncated ? `${pin.content}…` : pin.content,
-  };
-  if (renderedHtmlOf(pin) !== "") message.content_html = pin.content_html;
-  // `#242 rich-headers`. Found by the server in the same text, ellipsis and all.
-  if (pin.heading) message.heading = pin.heading;
-  // `#408 copy-upstream-link`. Formed by the server as the pin was served, as a loaded
-  // message's is, so a row drawn from a pin alone offers the link too.
-  if (typeof pin.upstream_url === "string" && pin.upstream_url !== "") message.upstream_url = pin.upstream_url;
-  if (pin.thread_id) {
-    message.thread = {
-      id: pin.thread_id, root_message_id: null, is_root: pin.thread_root, reply_count: null, reply_count_exact: false,
-    };
-  }
-  keptByPin.add(message);
-  return message;
-}
-
 /**
  * The Pinned filter's messages: every pin in this channel, in the order the messages were sent.
  * The message itself where this page holds it — from any view, and whether or not it is Done,
@@ -26033,7 +25953,7 @@ function pinnedMessages() {
     ? [...channelStore.current().threads.map((summary) => summary.root).filter(Boolean), ...channelStore.current().messages, ...timelineRows().messages]
     : [...el("discord-log").children].flatMap(rowMessages);
   for (const message of loaded) held.set(String(message.id), message);
-  return inTimeOrder(pinStore.entries().map(([id, pin]) => held.get(id) || keptMessage(pin, channel)), "timestamp");
+  return inTimeOrder(pinStore.entries().map(([id, pin]) => held.get(id) || pinSync.kept(pin, channel)), "timestamp");
 }
 
 /**
@@ -26054,7 +25974,7 @@ function syncPinnedList() {
   // drawn without one, and its row gains the link only by being drawn again.
   const drawn = JSON.stringify([combineMessages, hideEmptyMessages, channelStore.current().scope, threadingSupported,
     ...messages.map((m) => [m.id, m.timestamp, m.content, renderedHtmlOf(m), m.author, threadOf(m), isNoise(m),
-      keptByPin.has(m), reactionsDrawn(m), m.heading || null, editedDrawn(m), upstreamUrlOf(m)])]);
+      pinSync.isKept(m), reactionsDrawn(m), m.heading || null, editedDrawn(m), upstreamUrlOf(m)])]);
   if (drawn === pinsView().drawn) return;
   pinsView().drawn = drawn;
   drawingPinnedRows = true;
@@ -26095,77 +26015,12 @@ function setPinnedOnly(on, keepPlace = true) {
   requestVisibleSummaries();
 }
 
-/** What a pin write sends: the row as this page holds it. Its id is the path's. */
-function pinRequest(message) {
-  const pin = provisionalPin(message);
-  return {
-    author: pin.author, author_id: pin.author_id, author_is_bot: pin.author_is_bot, content: pin.content,
-    timestamp: pin.timestamp, thread_id: pin.thread_id, thread_root: pin.thread_root,
-  };
-}
-
 /**
- * Pin a row, or unpin it — every message it stands for. Shown at once and rolled back, with a
- * sentence saying why, if the server refuses; refused out loud, and not queued, when offline.
+ * Pin a row, or unpin it — every message it stands for (`PinSync.toggle`). Shown at once and rolled back,
+ * with a sentence saying why, if the server refuses; refused out loud, and not queued, when offline.
  */
-async function togglePin(messages) {
-  const channel = currentChannelId();
-  if (!channel || messages.length === 0) return;
-  if (pinStore.channel() !== channel) forgetPins(channel);
-  const pinning = !messages.some((message) => isPinnedId(message.id));
-  const act = pinning ? "pinned" : "unpinned";
-  if (navigator.onLine === false) {
-    setStatus(`Offline — nothing was ${act}. Try again once the connection is back.`);
-    return;
-  }
-  const before = new Map(messages.map((message) => [String(message.id), pinStore.held(String(message.id))]));
-  for (const message of messages) {
-    const id = String(message.id);
-    pinStore.stage(id, pinning ? provisionalPin(message) : null);
-  }
-  renderPins();
-  const unpinned = [];
-  let revision = null;
-  let answered = 0;
-  try {
-    for (const message of messages) {
-      const id = String(message.id);
-      const path = `/api/v1/channels/${encodeURIComponent(channel)}/pins/${encodeURIComponent(id)}`;
-      // In the queue the archive writes use, so a run of taps reaches the server in order.
-      const answer = await queueInboxWrite(() => apiDecoded("PinChangeResponse", path,
-        pinning ? { method: "PUT", body: pinRequest(message) } : { method: "DELETE" }));
-      answered += 1;
-      if (pinStore.channel() !== channel) continue;
-      // At the bound the server unpinned the oldest pin to make room, and named it.
-      pinStore.answered(id, answer.pin, answer.unpinned);
-      for (const gone of answer.unpinned) unpinned.push(String(gone));
-      revision = answer.revision;
-    }
-  } catch (error) {
-    if (pinStore.channel() === channel) {
-      // Back to what it was — for the messages the server did not answer for. Any it did are
-      // its truth now, and the list is read again to be sure of them.
-      for (const message of messages.slice(answered)) {
-        const id = String(message.id);
-        pinStore.rollback(id, before.get(id));
-      }
-      renderPins();
-      if (answered > 0) guardQuietly(loadPins)();
-    }
-    setStatus(error.network
-      ? `Offline — that message was not ${act}. Try again once the connection is back.`
-      : `That message was not ${act}: ${error.detail || error.message}`);
-    return;
-  }
-  if (pinStore.channel() !== channel) return;
-  renderPins();
-  // The list's revision has moved; read it again unless this change is all that moved it.
-  notePinsRevision(revision);
-  const service = channelDirectory.providerName() || "the chat service";
-  if (!pinning) setStatus("Unpinned.");
-  else if (unpinned.length > 0) {
-    setStatus(`Pinned. The oldest pin here was unpinned to stay at ${pinStore.limit() || "the limit of"} pins.`);
-  } else setStatus(`Pinned here, not in ${service}.`);
+function togglePin(messages) {
+  return pinSync.toggle(messages);
 }
 
 // --- messages read automatically ------------------------------------------------------------------
