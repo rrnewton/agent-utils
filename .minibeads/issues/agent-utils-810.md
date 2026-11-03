@@ -1,13 +1,14 @@
 ---
 title: 'restore-write-agents-trusts-stale-lifecycle: restore --write-agents must not drop agents that are alive'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: mu-restore@devbig030
 labels:
 - agentctl
 created_at: 2026-11-03T08:45:50.739371834+00:00
-updated_at: 2026-11-03T08:45:50.739371834+00:00
+updated_at: 2026-11-03T09:36:47.847195230+00:00
+closed_at: 2026-11-03T09:36:47.847195099+00:00
 ---
 
 # Description
