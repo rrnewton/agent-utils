@@ -98,6 +98,7 @@ export {
   NEWLINE_KEYS,
   createComposerGrow,
   createComposerKeys,
+  createOnScreenKeyboard,
   focusAtEnd,
   isComposer,
   watchBoxInsertions as watchInsertions,

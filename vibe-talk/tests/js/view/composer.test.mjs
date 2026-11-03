@@ -88,3 +88,45 @@ test("`#624 voice-page-modularity`: the boxes that grow, on stand-in elements, f
   grow.keepInView(element("side-compose-text"));
   assert.deepStrictEqual(record.kept_in_view, [["side-composer", "side-scroll"]]);
 });
+
+test("`#624 voice-page-modularity`: a focused field with the visual viewport a keyboard short is a keyboard, and the stylesheet is told", () => {
+  const { createOnScreenKeyboard, KEYBOARD_SETTLE_MS } = VIEW_COMPOSER;
+  const attrs = new Map();
+  const props = new Map();
+  const root = {
+    clientWidth: 400, clientHeight: 800,
+    setAttribute: (name, value) => attrs.set(name, value), getAttribute: (name) => attrs.get(name) ?? null,
+    style: { setProperty: (name, value) => props.set(name, value) },
+  };
+  const field = { tagName: "TEXTAREA", id: "channel-compose-text", type: "textarea", isContentEditable: false, getClientRects: () => [] };
+  const els = {
+    "read-speed-box": { id: "read-speed-box" }, "speed-popover": { hidden: true }, "keyboard-debug": { checked: false },
+    "keyboard-debug-readout": { hidden: true, style: {} },
+  };
+  let focus = null;
+  let viewport = { height: 800, scale: 1, offsetTop: 0 };
+  const timers = [];
+  const keyboard = createOnScreenKeyboard({
+    clock: { setTimeout: (run, ms) => { timers.push({ run, ms }); return timers.length; }, clearTimeout: (h) => { timers[h - 1] = null; } },
+    lookup: (id) => els[id] || { id, getClientRects: () => [] },
+    el: (id) => els[id],
+    viewport: () => viewport, innerHeight: () => 800, scrollY: () => 0, root: () => root,
+    activeElement: () => focus, virtualKeyboard: () => undefined, computedStyle: () => null, closeSpeedPopover: () => {},
+  });
+  keyboard.noteKeyboard();
+  assert.equal(attrs.get("data-keyboard"), undefined, "nothing focused, nothing up");
+  focus = field;
+  viewport = { height: 450, scale: 1, offsetTop: 0 };
+  keyboard.noteKeyboard();
+  assert.equal(attrs.get("data-keyboard"), "open", "a field in focus and the viewport 350px short");
+  assert.equal(timers.at(-1).ms, KEYBOARD_SETTLE_MS, "the jump's moment lasts the settle time");
+  viewport = { height: 760, scale: 1, offsetTop: 0 };
+  keyboard.noteKeyboard();
+  assert.equal(attrs.get("data-keyboard"), "closed", "a toolbar's worth is no keyboard");
+  keyboard.showKeyboardDebug(true);
+  assert.equal(els["keyboard-debug"].checked, true);
+  assert.equal(els["keyboard-debug-readout"].hidden, false);
+  assert.match(els["keyboard-debug-readout"].textContent, /^keyboard closed {2}box channel-compose-text \(focus\)/);
+  keyboard.showKeyboardDebug(false);
+  assert.equal(els["keyboard-debug-readout"].hidden, true);
+});

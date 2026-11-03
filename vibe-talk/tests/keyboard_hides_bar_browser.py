@@ -88,8 +88,8 @@ IOS_VISUAL_PX = 330
 END_PADDING_PX = 12
 # How far Safari pans the visual viewport down over the focused field after its keyboard comes up.
 IOS_PAN_PX = 200
-# How long the page goes on making its jump as the viewport moves (`KEYBOARD_SETTLE_MS` in web/voice.js),
-# and a little over.
+# How long the page goes on making its jump as the viewport moves (`KEYBOARD_SETTLE_MS` in
+# web/src/view/composer/keyboard.ts), and a little over.
 SETTLE_WAIT_MS = 1500
 
 # Safari's keyboard, played to the page: a visual viewport that shrinks and pans over a layout that keeps
