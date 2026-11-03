@@ -3489,7 +3489,7 @@ test("`#281 view-keys` x `#280 scroll-stability`: Ctrl+1 to Ctrl+4 show each vie
   // foot of the thread list leaves them above it.
   const twoOnly = await run(brokenScript(
     "if (!sideColumnUp() || screens.screen() !== \"main\" || screens.view() !== \"discord\") return false;",
-    "if (!columnsShown || screens.screen() !== \"main\" || screens.view() !== \"discord\") return false;"));
+    "if (!layoutShown.columns() || screens.screen() !== \"main\" || screens.view() !== \"discord\") return false;"));
   assert.deepStrictEqual(twoOnly, { ...real, cardGrewFoot: false });
 });
 

@@ -93,3 +93,5 @@ export { createArming } from "./arming.ts";
 export type { Arming, ArmingDependencies } from "./arming.ts";
 export { createColumnWork } from "./columnwork.ts";
 export type { ColumnWork, WorkedColumn } from "./columnwork.ts";
+export { createLayoutShown } from "./layoutshown.ts";
+export type { Layout, LayoutShown } from "./layoutshown.ts";

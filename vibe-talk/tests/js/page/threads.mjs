@@ -2152,7 +2152,7 @@ test("`#281 view-keys` x `#279 thread-card-focus`: the thread list's cards are t
   // THE CONTROLS: the replies button selecting on the right only, which is not drawn over the thread
   // list; and the cards on screen taken to be the right column's in two columns alone.
   const { page: opener, data: given } = await manyThreadColumns(4, null, brokenScript(
-    "  if (threadListShown) return openThreadFromList(id, summary);\n  const opened = selectSideThread(id, summary);",
+    "  if (layoutShown.threadList()) return openThreadFromList(id, summary);\n  const opened = selectSideThread(id, summary);",
     "  const opened = selectSideThread(id, summary);"));
   await press(opener, opener.el("scroll-area"), "3", { ctrlKey: true });
   await openerOf(cardRow(opener, given.threads[1].id)).click();
@@ -2161,7 +2161,7 @@ test("`#281 view-keys` x `#279 thread-card-focus`: the thread list's cards are t
     "the control's replies button opened the thread, so this test cannot see it fail to");
   const { page: cards, data: held } = await manyThreadColumns(4, null, brokenScript(
     "  if (sideColumnUp()) return columns.side.mode === \"list\" ? leftEl(\"side-cards\") : null;",
-    "  if (columnsShown) return columns.side.mode === \"list\" ? leftEl(\"side-cards\") : null;"));
+    "  if (layoutShown.columns()) return columns.side.mode === \"list\" ? leftEl(\"side-cards\") : null;"));
   await press(cards, cards.el("scroll-area"), "3", { ctrlKey: true });
   await cardOf(cards, held.threads[1].id).click();
   await cards.settle();

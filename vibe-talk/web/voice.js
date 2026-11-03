@@ -632,7 +632,7 @@ function voiceTranscript() {
     get currentScreen() { return screens.screen(); },
     get currentView() { return screens.view(); },
     get cardsOpening() { return cardsOpening; },
-    get threadListShown() { return threadListShown; },
+    get threadListShown() { return layoutShown.threadList(); },
     get tokenScope() { return serverFacts.tokenScope(); },
     get voiceSendSetting() { return agentSettings.sendSetting(); },
     get hasEnded() { return voiceCall().hasEnded; },
@@ -726,7 +726,7 @@ function readAloudOwner() {
     get currentView() { return screens.view(); },
     get selectedChannelId() { return selectedChannelId; },
     get shownChannelList() { return /** @type {() => HTMLOListElement} */ (shownChannelList); },
-    get threadListShown() { return threadListShown; },
+    get threadListShown() { return layoutShown.threadList(); },
     get sideColumnUp() { return sideColumnUp; },
     get sideShowing() { return sideShowing; },
     get rowOnScreen() { return rowOnScreen; },
@@ -981,9 +981,9 @@ function screenLevels(name, depth = 0) {
 function channelLevels() {
   if (screens.view() !== "discord") return [];
   const levels = [];
-  if (columnsShown) {
+  if (layoutShown.columns()) {
     if (columns.side.mode === "thread") levels.push("side");
-  } else if (threadListShown) {
+  } else if (layoutShown.threadList()) {
     levels.push(...underThreadList(), "list");
   } else if (selection().view === "thread") {
     if (selection().origin === "list" && threadListOffered()) levels.push(...underThreadList(), "list");
@@ -1003,7 +1003,7 @@ function channelLevels() {
 function underThreadList() {
   const channel = String(selectedChannelId() || "");
   const listBefore = layoutChoice.listBefore();
-  if (listBefore.layout === "two") return columnsFit && sideThreads.has(channel) ? ["side"] : [];
+  if (listBefore.layout === "two") return layoutShown.fit() && sideThreads.has(channel) ? ["side"] : [];
   const thread = listBefore.layout === "one" && listBefore.channel === channel && listBefore.view === "thread";
   return thread && listBefore.thread ? ["thread"] : [];
 }
@@ -1116,11 +1116,11 @@ function channelPlace() {
   if (!channel) return null;
   /** @type {ChannelPlace} */
   const place = { screen: "main", channel, layout: "one", view: null, thread: null, origin: null, side: null };
-  if (columnsShown) {
+  if (layoutShown.columns()) {
     place.layout = "two";
     const side = columns.side.mode === "thread" ? sideThreads.get(channel) : null;
     place.side = side ? String(side.id) : null;
-  } else if (threadListShown) {
+  } else if (layoutShown.threadList()) {
     place.layout = "list";
   } else {
     place.view = selection().view;
@@ -1153,7 +1153,7 @@ function notePlace() {
 function channelPlaceShowable(place) {
   if (!place) return true;
   if (place.channel !== String(selectedChannelId() || "")) return false;
-  if (place.layout === "two") return columnsFit && threadListOffered() && (!place.side || threadStillKnown(place.side));
+  if (place.layout === "two") return layoutShown.fit() && threadListOffered() && (!place.side || threadStillKnown(place.side));
   if (place.layout === "list") return threadListOffered();
   if (place.view === "thread") return Boolean(place.thread) && threadStillKnown(place.thread);
   return place.view === "main" || providerFacts.threading();
@@ -1188,7 +1188,7 @@ function showChannelPlaceWithin(place) {
   if (place.layout === "list") {
     chooseView("threads");
   } else if (place.layout === "two") {
-    if (!columnsShown) chooseView("columns");
+    if (!layoutShown.columns()) chooseView("columns");
     const shown = columns.side.mode === "thread" ? sideThreads.get(place.channel) : null;
     if (place.side && (!shown || String(shown.id) !== place.side)) selectSideThread(place.side);
     else if (!place.side && columns.side.mode === "thread") closeSideByX();
@@ -1311,13 +1311,13 @@ const DEEP_LINK_WAITS = 600;
 // (`#624 voice-page-modularity`).
 const deepLinks = createDeepLinks({
   search: () => window.location.search || "",
-  // A layout the page itself restores (`columnsRestoring` — a turned or resized window) is no choice.
-  arriving: () => visits.arriving() || columnsRestoring,
+  // A layout the page itself restores (`layoutShown.restoring()` — a turned or resized window) is no choice.
+  arriving: () => visits.arriving() || layoutShown.restoring(),
 });
 
 /**
  * Note a choice of view or channel the reader made, for `applyDeepLink` to lose to. A layout
- * the page itself restores (`columnsRestoring` — a turned or resized window) is no choice.
+ * the page itself restores (`layoutShown.restoring()` — a turned or resized window) is no choice.
  */
 function noteDeepLinkReaderMove() {
   deepLinks.noteReaderMove();
@@ -2596,7 +2596,7 @@ const {
  * and lands them on the foot of what it leaves rather than in blank room fitted to another card.
  */
 function overscrollContext() {
-  return JSON.stringify([columnsShown, threadListShown, screens.screen(), screens.view(), columns.side.mode,
+  return JSON.stringify([layoutShown.columns(), layoutShown.threadList(), screens.screen(), screens.view(), columns.side.mode,
     readModes.mode(), inColumn(columns.side, () => [channelContextKey(), pinsView().only, searchKey()])]);
 }
 
@@ -6386,7 +6386,7 @@ const channelPane = {
   scroller: () => leftEl("scroll-area"),
   // None while the thread list is up on its own: the left column is behind it. `#281 view-keys`.
   list: () => inColumn(columns.main, () =>
-    (screens.screen() === "main" && screens.view() === "discord" && !threadListShown &&
+    (screens.screen() === "main" && screens.view() === "discord" && !layoutShown.threadList() &&
       (pinsView().only || selection().view !== "threads") ? shownChannelList() : null)),
   head: () => floatingClearance(leftEl("scroll-area")),
   // The chips float over the foot of the list, the read-aloud strip stands on them while a read
@@ -7511,7 +7511,7 @@ function threadFromKeyboard(target) {
     opener.click();
     // In two columns the keys go into the thread with it, as from a message's tag; in one column the
     // rows the focus was on have been replaced by the rows of the thread.
-    if (columnsShown) focusList(sidePane);
+    if (layoutShown.columns()) focusList(sidePane);
     else settleFocus();
     return true;
   }
@@ -7524,7 +7524,7 @@ function threadFromKeyboard(target) {
   // for its first reply, and the keys leave it there.
   if (starting && isComposer(document.activeElement)) return true;
   // In two columns the thread is selected on the right, and the keys go with it. `#229`.
-  if (columnsShown) {
+  if (layoutShown.columns()) {
     focusList(sidePane);
     return true;
   }
@@ -7544,7 +7544,7 @@ function leaveThread() {
 function threadOutFromKeyboard() {
   // In two columns, from the right column back to Main on the left; the thread stays where it is.
   // `#229 desktop-two-column`.
-  if (columnsShown) {
+  if (layoutShown.columns()) {
     if (!columnWork.side() || screens.screen() !== "main" || screens.view() !== "discord") return false;
     // `#277 thread-card-focus`. A thread entered from its card goes back out to the cards, as → came
     // in: the X, and the keys on the card it was entered from.
@@ -7571,7 +7571,7 @@ function threadOutFromKeyboard() {
  * address bar, so it is not taken.
  */
 function columnFromKeyboard(right) {
-  if (!columnsShown || !channelOnScreen()) return false;
+  if (!layoutShown.columns() || !channelOnScreen()) return false;
   focusList(right ? sidePane : channelPane);
   return true;
 }
@@ -11459,7 +11459,7 @@ function renderSideFreshness() {
   const line = leftEl("side-freshness");
   let state = "fresh";
   let text = "";
-  if (columnsShown && columns.side.mode === "thread") {
+  if (layoutShown.columns() && columns.side.mode === "thread") {
     [state, text] = inColumn(columns.side, () =>
       [loadState().freshness, staleWords(loadState().freshness, loadState().freshAt, loadState().refreshing)]);
   } else if (sideColumnUp()) {
@@ -11479,7 +11479,7 @@ function renderSideFreshness() {
   const toggle = () => {
     line.hidden = hide;
   };
-  if (columnsShown && columns.side.mode === "thread") inColumn(columns.side, () => holdingReader(toggle));
+  if (layoutShown.columns() && columns.side.mode === "thread") inColumn(columns.side, () => holdingReader(toggle));
   // `#261 two-column-connectors`: and a reader of the cards keeps theirs, the foot above all.
   else keepingCardPlace(toggle);
 }
@@ -12366,7 +12366,7 @@ async function changeChannelView(view, threadId = null, summary = null, origin =
   // the layout, not by the reader's choice, and the right column's thread is not a view the channel
   // opens in. Leaving two columns goes back to the choice made in one.
   // `#281 view-keys`: nor behind the thread list, whose left column is Main for the same reason.
-  if (!columnsShown && !threadListShown && !columnWork.side() && !columnsRestoring) {
+  if (!layoutShown.columns() && !layoutShown.threadList() && !columnWork.side() && !layoutShown.restoring()) {
     const chosen = viewOnScreen();
     if (chosen) uiState.remember(chosen);
     // The Threads list is not a view a channel opens in: picked, it leaves the channel to its default.
@@ -13126,8 +13126,8 @@ const VIEW_CHOICES = [["main", "Main"], ["flat", "All"], ["threads", "Thread lis
 
 /** What the picker's value is for the view on screen: one of `VIEW_CHOICES`, or `thread:<id>`. */
 function viewChoiceOnScreen() {
-  if (columnsShown) return "columns";
-  if (threadListShown) return "threads";
+  if (layoutShown.columns()) return "columns";
+  if (layoutShown.threadList()) return "threads";
   if (selection().view === "thread" && selection().threadId) return `thread:${selection().threadId}`;
   return selection().view === "flat" ? "flat" : "main";
 }
@@ -13143,10 +13143,10 @@ function renderThreadSelect() {
   if (providerFacts.threading()) {
     options.push(["flat", "All"]);
     // `#281 view-keys`. The thread list, and two columns, are of a channel that has threads to list.
-    // Two columns only where this window draws them (`columnsFit`): a phone is offered none.
+    // Two columns only where this window draws them (`layoutShown.fit()`): a phone is offered none.
     if (threadListOffered()) {
       options.push(["threads", "Thread list"]);
-      if (columnsFit) options.push(["columns", "Two columns"]);
+      if (layoutShown.fit()) options.push(["columns", "Two columns"]);
     }
     const choices = threadChoices();
     const shown = choices.slice(0, THREAD_SELECT_LIMIT);
@@ -13229,12 +13229,12 @@ function onThreadSelect() {
   }
   if (!value.startsWith("thread:")) return undefined;
   const id = value.slice("thread:".length);
-  if (!columnsShown && !threadListShown && selection().view === "thread" && String(selection().threadId) === id) return undefined;
+  if (!layoutShown.columns() && !layoutShown.threadList() && selection().view === "thread" && String(selection().threadId) === id) return undefined;
   // The store's summary when it has one. Never the option's own words: the heading names the
   // thread from the store, and a shortened name handed in here would be shortened twice.
   const summary = channelStore.current().threads.find((held) => String(held.id) === id) || null;
   // From the thread list, as a card opens it: across the window, Esc back to the list. `#281 view-keys`.
-  if (threadListShown) return openThreadFromList(id, summary);
+  if (layoutShown.threadList()) return openThreadFromList(id, summary);
   const opened = openThread(id, summary);
   // In two columns the thread is selected on the right, and the picker goes on saying two columns.
   renderThreadSelect();
@@ -13300,16 +13300,16 @@ async function refreshThreadDirectory() {
 function openThread(id, summary = null) {
   if (!providerFacts.threading() || !id) return;
   // `#229 desktop-two-column`. In two columns a thread is selected on the right, and Main stays.
-  if (columnsShown) return selectSideThread(String(id), summary);
+  if (layoutShown.columns()) return selectSideThread(String(id), summary);
   // `#281 view-keys`. From the thread list on its own, across the window, with the way back to it.
-  if (threadListShown) return openThreadFromList(String(id), summary);
+  if (layoutShown.threadList()) return openThreadFromList(String(id), summary);
   return changeChannelView("thread", String(id), summary);
 }
 
 function closeThread() {
   // In two columns, leaving the thread on the right is its X. `#229 desktop-two-column`. The thread
   // list on its own shows cards only, never a thread, so from it there is none to leave. `#281 view-keys`.
-  if (columnWork.side()) return columnsShown ? closeSideThread() : undefined;
+  if (columnWork.side()) return layoutShown.columns() ? closeSideThread() : undefined;
   if (selection().view !== "thread") return;
   // `#281 view-keys`. A thread opened from the thread list goes back to the list — or, where the
   // channel has none to show any more, to the view it opens in.
@@ -13665,7 +13665,7 @@ function paintThreadBadge(badge, id, replies, unanswered) {
  */
 function startThread(id) {
   const opened = openThread(id);
-  inColumn(columnsShown ? columns.side : columns.main, () => {
+  inColumn(layoutShown.columns() ? columns.side : columns.main, () => {
     const box = el("channel-compose-text");
     // The box is at the foot of the thread, and writing in it is going there: as far as shows it.
     if (shownNode(box) && !box.disabled) focusMinimally(box);
@@ -14130,7 +14130,7 @@ function toggleAllThreadFocus(id) {
  */
 function clearAllThreadFocus() {
   return inColumn(columns.main, () => {
-    if (!channelOnScreen() || threadListShown || pinsView().only || selection().view !== "flat") return false;
+    if (!channelOnScreen() || layoutShown.threadList() || pinsView().only || selection().view !== "flat") return false;
     const channel = String(selectedChannelId());
     if (!allThreadFocus.has(channel)) return false;
     allThreadFocus.delete(channel);
@@ -19215,7 +19215,7 @@ async function seekMessage(target, arrive, openAll) {
     }
     // Never in two columns, whose left column is Main by the layout, and whose right column is a thread
     // a reply's arrow or a gathering does not leave. `#229 desktop-two-column`.
-    if (!columnsShown && openAll()) {
+    if (!layoutShown.columns() && openAll()) {
       setStatus("Not in this view — opening All…");
       // The reader went somewhere else while All was being read: the tap is over.
       const stillAll = () =>
@@ -19782,7 +19782,7 @@ function gatherFromReply(reply) {
 function toggleGathered(parent, row) {
   // `#229 desktop-two-column`. On Main in two columns the replies are the thread on the right: the
   // chip selects it there rather than gathering them here, where they would show twice side by side.
-  const root = columnsShown && !columnWork.side() ? rowMessages(row)[0] : null;
+  const root = layoutShown.columns() && !columnWork.side() ? rowMessages(row)[0] : null;
   if (root && threadOf(root) && root.thread.is_root === true) return openThread(threadOf(root));
   if (gatheredParent() === String(parent)) {
     scatterReplies();
@@ -22153,7 +22153,7 @@ function olderControlPressed() {
  */
 function searchOlderFromField() {
   if (sideCardsShown()) {
-    const left = columnsShown && inColumn(columns.main, () => searchOffered() && columns.main.searchWalk === null);
+    const left = layoutShown.columns() && inColumn(columns.main, () => searchOffered() && columns.main.searchWalk === null);
     const cards = !left || lastPane === sidePane;
     // The cards' walk under way is not the left column's to end.
     if (cards && repliesWalks.current() !== null) return false;
@@ -25935,7 +25935,7 @@ function gatherForReply(list) {
   if (rootOfOpenThread(replyTarget)) return false;
   // Not where the right column shows that thread already: it would be drawn twice side by side, as N
   // replies on a root in two columns declines to (`toggleGathered`).
-  const shownRight = columnsShown && !columnWork.side() && columns.side.mode === "thread"
+  const shownRight = layoutShown.columns() && !columnWork.side() && columns.side.mode === "thread"
     ? inColumn(columns.side, () => String(selection().threadId || "")) : "";
   const own = selection().view === "main" && headsAnsweredThread(replyTarget) ? threadOf(replyTarget) : null;
   const thread = own !== null && own !== shownRight ? own : null;
@@ -26274,7 +26274,7 @@ function reportColumnReply(entry) {
     return;
   }
   // Where the row is: in the column it was sent from while that column shows where it went.
-  const named = columnsShown ? (column === columns.side ? "the right column" : "the left column") : "the list";
+  const named = layoutShown.columns() ? (column === columns.side ? "the right column" : "the left column") : "the list";
   const drawn = (column === columns.main || sideShowing()) && inColumn(column, () => outboxRow(entry.id) !== null);
   const where = drawn ? `at the foot of ${named}` : "with it where it was sent";
   // A refusal after some parts went (`#444 send-refusal-reason`) is failed too, and part of it is in.
@@ -26729,106 +26729,29 @@ const layoutChoice = createLayoutChoice({
   },
 });
 
-/** Whether two columns are on screen now. */
-let columnsShown = false;
-
-/** Whether the thread list is on screen now, on its own over the left column. `#281 view-keys`. */
-let threadListShown = false;
-
 /**
- * Where the reader of the left column was as the thread list came up, read by `readerPlace` on Main or
- * All, with a send card at the foot of that column's list still in it, before it is docked; in which of
- * the two views, and on which channel. Null when the left column showed neither. `#280 scroll-stability`
- * x `#269 approval-card-inline`.
+ * Which layout of the channel is on screen — one column, two, or the thread list — whether this window
+ * draws two columns, the one-column view asked for with the layout, whether the page itself is putting a
+ * view back, and the reader's places held across a change of layout for the way back: one owner in
+ * web/src/view/channel/layoutshown.ts (`#624 voice-page-modularity`), which says what each place is for.
  *
- * Main, behind the list, cannot keep that place itself. In Chromium the card stands 396px tall at the
- * foot of a phone's list and 246px docked, so as it goes, a reader nearer the foot than the difference
- * is left at the foot of a list now too short to keep them where they were; and the view keys'
- * switches between Main and All keep the place they measure, with the card gone from the list on the
- * way in and back in it on the way out. So the place is put back as the card comes back
- * (`leaveThreadList`), before the left column's view is decided.
- *
- * ...and put back in All as well, card or no card, when it was read in All and All is what the way out
- * shows: Esc, the list having been chosen from All, or Ctrl+2. All is Main behind the list, and Main
- * lacks All's replies, so a place near All's foot was clamped at Main's, and the way back read Main's
- * reader as on its newest line and took All to its foot. In Chromium every reader 30 to 175px up All
- * came back at its foot without a card, and with one, 200 and 225px up too.
- *
- * @type {{place: ReturnType<typeof readerPlace>, view: string, channel: string} | null}
+ * @type {import("./src/view/channel/index.ts").LayoutShown<
+ *   {view: string, thread: string | null, summary: any, origin: string | null},
+ *   {place: ReturnType<typeof readerPlace>, view: string, channel: string},
+ *   {place: {newest: boolean, id: string | null, offset: number}, placed: {newest: boolean, id: string | null, offset: number} | null, channel: string},
+ *   {left: NonNullable<ReturnType<typeof leftColumnPlace>>, placed: NonNullable<ReturnType<typeof leftColumnPlace>>, from: "one" | "two"}>}
  */
-let listHeldPlace = null;
-
-/**
- * Where the reader was in the cards of the thread list, held while two columns brought from it are up,
- * for the way back: `place`, read in the list, and `placed`, where two columns' cards then put them;
- * on which channel. Set as two columns come from the list, spent by the next change of layout, and let
- * go as the cards are opened afresh. `#280 scroll-stability` x `#269 approval-card-inline` x `#281
- * view-keys`.
- *
- * A send card docked under the list takes its height from the foot of the cards, so their column is
- * that much shorter there than beside Main, where the card is back at the foot of Main's list. A reader
- * up the cards nearer their foot than that is at the foot in two columns, which is only geometry, as
- * Main behind the cards is too short to keep a reader near its foot. But the way back read them as at
- * the foot, and put them at the list's foot too. In Chromium at a desk, the long draft's card 246px tall,
- * every reader 60 to 300px up the cards came back at the list's foot by Ctrl+4 and Ctrl+3: one 300px up
- * kept their card in two columns, 10px from the foot, inside the slack, and moved about 290px. So the
- * place read in the list is put back on the way back, where the reader left the cards where two columns
- * put them; one who moved them is placed where they are, as before.
- *
- * @type {{place: {newest: boolean, id: string | null, offset: number}, placed: {newest: boolean, id: string | null, offset: number} | null, channel: string} | null}
- */
-let listCardsHeld = null;
-
-/**
- * Where the reader of the left column was before the last change between one column and two (`left`,
- * read by `renderColumns`), and where that change left them (`placed`), for the way back: the change
- * back to layout `from` puts them where they were there, unless they have moved since. Set by each change
- * between one column and two, spent by the next change of layout. `#269 approval-card-inline` x `#280
- * scroll-stability`.
- *
- * A change of layout keeps the place it reads, but not always where it goes, and a place it could not
- * keep was lost on the way back. Main lacks All's replies, so a reader up All near its foot is at Main's
- * foot in two columns, which is only geometry; but Ctrl+2 then read them as on Main's newest line and took
- * All to its foot: in Chromium at a desk a reader 40px up All with a long draft opened by More, and one
- * 30px up with no draft at all. And the card at the foot is taller in two columns' narrower left column,
- * so a reader 40px up Main there was at Main's foot in one column by Ctrl+1, and Ctrl+4 kept them at the
- * foot. So the place read before is put back on the way back where the reader left the column as the
- * change left it (`keepLeftColumnPlace`); one who moved it is placed where they are now.
- *
- * @type {{left: NonNullable<ReturnType<typeof leftColumnPlace>>, placed: NonNullable<ReturnType<typeof leftColumnPlace>>, from: "one" | "two"} | null}
- */
-let leftColumnHeld = null;
+const layoutShown = createLayoutShown();
 
 /** Whether the right column is on screen: beside Main, or on its own as the thread list. */
-const sideColumnUp = () => columnsShown || threadListShown;
+const sideColumnUp = layoutShown.sideUp;
 
 /**
  * Whether the thread list is what is on screen now: the layout, on the channel of the main screen. It
  * waits behind the call's view and the other screens, as two columns do, and the left column's call
  * pane, its box included, is not covered there.
  */
-const threadListOnScreen = () => threadListShown && screens.screen() === "main" && screens.view() === "discord";
-
-/**
- * Whether this window draws two columns: the layout button has a box, which web/voice.css gives it
- * only on a desk at least 1000px wide. Asked where `renderColumns` decides, never per redraw, because
- * asking lays the page out; the picker offers two columns by it.
- */
-let columnsFit = false;
-
-/**
- * The one-column view a key or the picker asked for with the layout, for the change of layout to show
- * instead of the view the channel opens in: `{view, thread, summary, origin}`, or null.
- *
- * @type {{view: string, thread: string | null, summary: any, origin: string | null} | null}
- */
-let oneColumnWanted = null;
-
-/**
- * True while leaving two columns puts back the view last chosen in one: that is the reader's choice
- * already, and recording it again would turn a channel's default into a choice nobody made.
- */
-let columnsRestoring = false;
+const threadListOnScreen = () => layoutShown.threadList() && screens.screen() === "main" && screens.view() === "discord";
 
 /**
  * By channel, the thread the right column shows, as `{id, summary}`, for this session: two columns
@@ -26881,7 +26804,7 @@ function columnSteps() {
 }
 
 /** Whether the right column is showing a thread now. */
-const sideShowing = () => columnsShown && columns.side.mode === "thread";
+const sideShowing = () => layoutShown.columns() && columns.side.mode === "thread";
 
 /**
  * Run `fn` in every column showing the channel's messages: the left, and the right while it shows a
@@ -26977,8 +26900,7 @@ function renderColumns() {
   renderColumnToggle();
   const screen = leftEl("screen-main");
   const fit = toggleHasBox();
-  const fitChanged = fit !== columnsFit;
-  columnsFit = fit;
+  const fitChanged = layoutShown.noteFit(fit);
   let want = columnsOffered() && layoutChoice.chosen() !== "one" ? layoutChoice.chosen() : null;
   // Two columns in a window too narrow for them: the layout they were chosen from — the thread list, or
   // one column — until it is wide enough, the choice kept for then. `#281 view-keys`.
@@ -26995,7 +26917,7 @@ function renderColumns() {
   }
   // The call's view is one list. Two columns, or the thread list, wait behind it, as they were.
   if (screens.view() === "discord") {
-    const now = columnsShown ? "two" : threadListShown ? "list" : "one";
+    const now = layoutShown.layout();
     const next = want !== null && sideHasBox() ? want : "one";
     if (next !== now) moveLayout(now, next, cards, left);
     else if (fitChanged) renderThreadSelect();
@@ -27023,7 +26945,7 @@ function renderColumns() {
  *
  * `#280 scroll-stability` x `#269 approval-card-inline`. Back from two columns to the thread list they
  * were brought from, the reader still where two columns put them in the cards: where they were in the
- * list (`listCardsHeld`). A send card docked under the list makes its column of cards shorter than two
+ * list (`layoutShown.holdListCards`). A send card docked under the list makes its column of cards shorter than two
  * columns' right column, so a reader near the foot of the list was at the foot in two columns, and that
  * is no reason to be at the foot of the list.
  *
@@ -27031,7 +26953,7 @@ function renderColumns() {
  * BEFORE THE LAYOUT CHANGED (`left`, read by `renderColumns` before it did): in the view the left column
  * goes to, Main into two columns and the view chosen out of them, or in the view it stays on, put back
  * once the picker says the new layout (`keepLeftColumnPlace`). See `leftColumnPlace`. And back to the
- * layout the last change came from, where they were there, unless they moved since (`leftColumnHeld`).
+ * layout the last change came from, where they were there, unless they moved since (`layoutShown.holdLeftColumn`).
  *
  * @param {"one" | "list" | "two"} now
  * @param {"one" | "list" | "two"} next
@@ -27040,10 +26962,8 @@ function renderColumns() {
  */
 function moveLayout(now, next, cards = null, left = null) {
   // Spent by this change of layout, whatever it is.
-  const held = listCardsHeld;
-  listCardsHeld = null;
-  const heldLeft = leftColumnHeld;
-  leftColumnHeld = null;
+  const held = layoutShown.takeListCards();
+  const heldLeft = layoutShown.takeLeftColumn();
   // `#269 approval-card-inline` x `#280 scroll-stability`. Back to the layout the last change came from,
   // the left column's reader where that change left them: where they were there.
   const leftBack = left && heldLeft && heldLeft.from === next && sameLeftPlace(left, heldLeft.placed) ? heldLeft.left : null;
@@ -27068,10 +26988,10 @@ function moveLayout(now, next, cards = null, left = null) {
     // Where the card the list's place was on has gone since, the place two columns had.
     placeCardAnchor(place, true);
   }
-  if (place && kept && now === "list" && next === "two") listCardsHeld = { place: kept, placed: cardAnchor(), channel };
+  if (place && kept && now === "list" && next === "two") layoutShown.holdListCards({ place: kept, placed: cardAnchor(), channel });
   if (left && now !== "list" && next !== "list") {
     const placed = leftColumnPlace();
-    if (placed) leftColumnHeld = { left, placed, from: now };
+    if (placed) layoutShown.holdLeftColumn({ left, placed, from: now });
   }
   if (handOff) handOff();
 }
@@ -27080,7 +27000,7 @@ function moveLayout(now, next, cards = null, left = null) {
  * Where the reader of the left column is, read by `renderColumns` before a change of layout draws that
  * column at another width: the place `readerPlace` reads there, and the view of the channel it was read
  * in. Null where the reader cannot see that column, behind the thread list (which holds its own place,
- * `listHeldPlace`), or behind the call's view. `#269 approval-card-inline` x `#280 scroll-stability`.
+ * `layoutShown.holdListPlace`), or behind the call's view. `#269 approval-card-inline` x `#280 scroll-stability`.
  *
  * At a desk the left column is about the window's width in one column and half of it in two, so the
  * moment `data-columns` changes every row of its list is drawn at another width, and so is the send card
@@ -27096,7 +27016,7 @@ function moveLayout(now, next, cards = null, left = null) {
  * @returns {{place: ReturnType<typeof readerPlace>, view: string, channel: string} | null}
  */
 function leftColumnPlace() {
-  if (screens.screen() !== "main" || screens.view() !== "discord" || threadListShown) return null;
+  if (screens.screen() !== "main" || screens.view() !== "discord" || layoutShown.threadList()) return null;
   return inColumn(columns.main, () => ({
     place: readerPlace(),
     view: selection().view,
@@ -27111,7 +27031,7 @@ function leftColumnPlace() {
  * itself (`changeChannelView`). `#269 approval-card-inline` x `#280 scroll-stability`.
  *
  * ...or, back to the layout the last change came from, where the reader was there (`back`,
- * `leftColumnHeld`), where the column is on the view that was read in: Main or All, whichever the way
+ * `layoutShown.holdLeftColumn`), where the column is on the view that was read in: Main or All, whichever the way
  * back shows.
  *
  * @param {NonNullable<ReturnType<typeof leftColumnPlace>>} left
@@ -27119,7 +27039,7 @@ function leftColumnPlace() {
  */
 function keepLeftColumnPlace(left, back = null) {
   inColumn(columns.main, () => {
-    if (screens.screen() !== "main" || screens.view() !== "discord" || threadListShown) return;
+    if (screens.screen() !== "main" || screens.view() !== "discord" || layoutShown.threadList()) return;
     if (selection().view !== "main" && selection().view !== "flat") return;
     const channel = String(selectedChannelId());
     const kept = [back, left].find((one) => one !== null && one.view === selection().view && one.channel === channel);
@@ -27196,7 +27116,7 @@ function noteListBefore() {
 function threadListBack() {
   if (columnWork.side()) return inColumn(columns.main, threadListBack);
   const before = layoutChoice.listBefore();
-  if (before.layout === "two" && columnsFit) {
+  if (before.layout === "two" && layoutShown.fit()) {
     layoutChoice.restoreBeforeColumns(before.columns);
     setLayout("two");
   } else {
@@ -27236,7 +27156,7 @@ function columnsFromKeyboard() {
   if (!channelOnScreen()) return false;
   toggleColumns();
   // The choice is kept as the button keeps it; a window too narrow to show it says so.
-  if (layoutChoice.chosen() === "two" && !columnsShown) setStatus(COLUMNS_TOO_NARROW);
+  if (layoutChoice.chosen() === "two" && !layoutShown.columns()) setStatus(COLUMNS_TOO_NARROW);
   return true;
 }
 
@@ -27282,7 +27202,7 @@ function chooseView(which) {
   }
   if (which === "columns") {
     setLayout("two");
-    if (!columnsShown) setStatus(COLUMNS_TOO_NARROW);
+    if (!layoutShown.columns()) setStatus(COLUMNS_TOO_NARROW);
     return;
   }
   chooseOneColumn({ view: which, thread: null, summary: null, origin: null });
@@ -27297,11 +27217,10 @@ function chooseView(which) {
 function chooseOneColumn(target) {
   if (columnWork.side()) return inColumn(columns.main, () => chooseOneColumn(target));
   noteDeepLinkReaderMove();
-  oneColumnWanted = target;
+  layoutShown.askOneColumn(target);
   setLayout("one");
   // Already one column: no change of layout showed it.
-  const left = oneColumnWanted;
-  oneColumnWanted = null;
+  const left = layoutShown.takeOneColumn();
   if (left) showOneColumnView(left, true);
 }
 
@@ -27344,12 +27263,7 @@ function showOneColumnView(target, record, place = null) {
     guardQuietly(show)();
     return;
   }
-  columnsRestoring = true;
-  try {
-    guardQuietly(show)();
-  } finally {
-    columnsRestoring = false;
-  }
+  layoutShown.whileRestoring(guardQuietly(show));
 }
 
 /** Keep the view on screen as its channel's choice, in one column, where nothing switched views to do it. */
@@ -27396,7 +27310,7 @@ function leftColumnToMain(place = null) {
  * @param {ReturnType<typeof leftColumnPlace>} [left]
  */
 function enterColumns(from = "one", left = null) {
-  columnsShown = true;
+  layoutShown.setColumns(true);
   const channel = String(selectedChannelId());
   const open = selection().view === "thread" && selection().threadId
     ? { id: String(selection().threadId), summary: selection().thread }
@@ -27412,7 +27326,7 @@ function enterColumns(from = "one", left = null) {
 }
 
 /**
- * Out of two columns: to the view last chosen in one column, or the one asked for (`oneColumnWanted`);
+ * Out of two columns: to the view last chosen in one column, or the one asked for (`layoutShown.askOneColumn`);
  * or to the thread list, the left column staying Main behind it. The right column keeps what it shows,
  * held, so two columns come back to it at once.
  *
@@ -27437,7 +27351,7 @@ function leaveColumns(next = "one", left = null) {
   if (waiting) pendingReply = waiting;
   // `#262 search-load-older`. The right column's walk for the search ends: its list is put aside, held.
   endSearchWalk(columns.side);
-  columnsShown = false;
+  layoutShown.setColumns(false);
   // ...and the cards' walk, unless the cards stay, across the window as the thread list.
   if (next !== "list") endRepliesWalk();
   if (columns.side.mode === "thread") {
@@ -27468,8 +27382,7 @@ function leaveColumns(next = "one", left = null) {
  * @param {ReturnType<typeof readerPlace> | null} [place]
  */
 function showOneColumnLeft(place = null) {
-  const wanted = oneColumnWanted;
-  oneColumnWanted = null;
+  const wanted = layoutShown.takeOneColumn();
   if (wanted) {
     showOneColumnView(wanted, true, place);
     return;
@@ -27488,13 +27401,13 @@ function showOneColumnLeft(place = null) {
  * @param {ReturnType<typeof leftColumnPlace>} [left]
  */
 function enterThreadList(from = "one", left = null) {
-  threadListShown = true;
+  layoutShown.setThreadList(true);
   // `#280 scroll-stability`. Where the reader of the left column is, read while a card is still at the
-  // foot of its list, for the way out of the list (`listHeldPlace`). `#269 approval-card-inline`: read
+  // foot of its list, for the way out of the list (`layoutShown.holdListPlace`). `#269 approval-card-inline`: read
   // before the layout changed (`left`, `leftColumnPlace`), where it did: from two columns, Main is drawn
   // across the window behind the list, its rows and the card at another width than the reader saw.
-  listHeldPlace = inColumn(columns.main, () => (selection().view === "main" || selection().view === "flat"
-    ? { place: left ? left.place : readerPlace(), view: selection().view, channel: String(selectedChannelId()) } : null));
+  layoutShown.holdListPlace(inColumn(columns.main, () => (selection().view === "main" || selection().view === "flat"
+    ? { place: left ? left.place : readerPlace(), view: selection().view, channel: String(selectedChannelId()) } : null)));
   // `#269 approval-card-inline`. A send card waiting at the foot of the left column, behind the list
   // now, is docked under the cards (`placePostCard`) BEFORE they are opened or put back, so that the
   // foot they are placed at is the one above it.
@@ -27527,7 +27440,7 @@ function leaveThreadList(next = "one") {
   // reader is at (`changeChannelView`). Told only after, and only where the view stayed, a reader at
   // All's foot was drawn in All on the rows they could see above the card: in Chromium 369px above All's
   // foot on a phone and 337px at a desk, Send off screen. The place read as the list came up, with the
-  // card still in Main's list, is what is put back, where it still holds (`listHeldPlace`): the card's
+  // card still in Main's list, is what is put back, where it still holds (`layoutShown.holdListPlace`): the card's
   // going moved a reader near the foot.
   //
   // ...and a place read in All is put back in All as well, card or no card, once the way out has shown
@@ -27538,9 +27451,8 @@ function leaveThreadList(next = "one") {
   const carded = voiceTranscript().postWatch.shown !== null;
   const follows = carded && liveFollowers().main;
   const shown = `${selection().view}|${selection().threadId}`;
-  const held = listHeldPlace;
-  listHeldPlace = null;
-  threadListShown = false;
+  const held = layoutShown.takeListPlace();
+  layoutShown.setThreadList(false);
   // `#419 threads-view-main-messages`. The main channel's box back under the left column's list.
   renderMainToggle();
   renderOrderToggle();
@@ -28080,8 +27992,8 @@ function rememberCardPlace() {
 
 /** Show the cards in the right column, the reader placed in them as `placeOpenedCards` says. */
 function openSideCards() {
-  // A place held for the way back to the thread list is not one in cards opened afresh (`listCardsHeld`).
-  listCardsHeld = null;
+  // A place held for the way back to the thread list is not one in cards opened afresh (`layoutShown.holdListCards`).
+  layoutShown.takeListCards();
   // Nor the room past the foot held for a card packed in them (`#459 pack-keeps-card-still`).
   closeOverextend();
   columns.side.mode = "list";
@@ -28614,7 +28526,7 @@ const unpackOnScreen = () => cardsCycle() && (cardPacking.mode() !== "packed" ||
 /** The Unpack chip: offered over the Threads view's cards, saying its state; `mixed` for Unpack unread. */
 function renderUnpackToggle() {
   const button = leftEl("side-unpack");
-  const offered = columns.side.mode === "list" && threadListShown;
+  const offered = columns.side.mode === "list" && layoutShown.threadList();
   if (button.hidden === offered) button.hidden = !offered;
   const unpackMode = cardPacking.mode();
   const pressed = unpackMode === "all" ? "true" : unpackMode === "unread" ? "mixed" : "false";
@@ -29006,7 +28918,7 @@ const mainRowsOnScreen = () => mainRowsShown && threadListOnScreen() && columns.
 /** Main channel: offered over the Threads view's cards, as Unpack msgs is, and pressed as the reader left it. */
 function renderMainToggle() {
   const button = leftEl("side-main");
-  const offered = columns.side.mode === "list" && threadListShown;
+  const offered = columns.side.mode === "list" && layoutShown.threadList();
   if (button.hidden === offered) button.hidden = !offered;
   const pressed = mainRowsShown ? "true" : "false";
   if (button.getAttribute("aria-pressed") !== pressed) button.setAttribute("aria-pressed", pressed);
@@ -29058,7 +28970,7 @@ const cardOrderOnScreen = () => (threadListOnScreen() && columns.side.mode === "
 /** The order chip: offered over the Threads view's cards, as Main channel is, saying the order they are in. */
 function renderOrderToggle() {
   const button = leftEl("side-order");
-  const offered = columns.side.mode === "list" && threadListShown;
+  const offered = columns.side.mode === "list" && layoutShown.threadList();
   if (button.hidden === offered) button.hidden = !offered;
   const order = THREAD_ORDERS[threadOrders.current()];
   const next = THREAD_ORDERS[threadOrderAfter(threadOrders.current())];
@@ -29533,7 +29445,7 @@ function cardCountParts(prefix, replies, unread, empty = "") {
  */
 function enterCard(id, summary, row) {
   if (row.parentNode !== leftEl("side-cards")) return openThread(id, summary);
-  if (threadListShown) return openThreadFromList(id, summary);
+  if (layoutShown.threadList()) return openThreadFromList(id, summary);
   const opened = selectSideThread(id, summary);
   columns.side.fromCards = true;
   if (sideShowing()) focusList(sidePane);
@@ -29914,7 +29826,7 @@ function selectSideThread(id, summary = null) {
   noteDeepLinkReaderMove();
   const thread = String(id);
   const channel = String(selectedChannelId());
-  if (!columnsShown || !channel) return undefined;
+  if (!layoutShown.columns() || !channel) return undefined;
   // Entered from its card, `enterCard` says so once this returns. `#277 thread-card-focus`.
   columns.side.fromCards = false;
   const known = summary || channelStore.current().threads.find((held) => String(held.id) === thread) || null;
@@ -30019,7 +29931,7 @@ function resetSideColumn(reopen = false) {
     return;
   }
   // `#281 view-keys`. The thread list shows cards, whatever two columns had selected on the right.
-  if (threadListShown) {
+  if (layoutShown.threadList()) {
     columns.side.mode = "list";
     showSideList();
     return;
@@ -30100,7 +30012,7 @@ function inSideThread(message) {
 
 const columnLinks = createColumnLinks({
   lookup: (id) => leftEl(id),
-  onTwoColumns: () => columnsShown && screens.screen() === "main" && screens.view() === "discord",
+  onTwoColumns: () => layoutShown.columns() && screens.screen() === "main" && screens.view() === "discord",
   sideMode: () => columns.side.mode,
   mainList: () => channelPane.list(),
   openThread: () => sideThreadChoice(),
@@ -32158,7 +32070,7 @@ function applyClientConfig(config) {
   // The picker already holds a channel; the flags above are the deployment's, and that channel's
   // own provider may answer differently.
   applyChannelProvider();
-  // The clear-unread control is offered only to a token that may change it (`tokenScope`, above), on
+  // The clear-unread control is offered only to a token that may change it (`serverFacts.tokenScope`), on
   // a channel whose provider can, which `applyChannelProvider` has just settled.
   upstreamClearBox.render();
   // `#46 conversation-replay`. What the SERVER permits, which is not the same as what the reader
@@ -33747,7 +33659,7 @@ let sideUnderLists = null;
 /**
  * `#280 scroll-stability` x `#269 approval-card-inline` x `#281 view-keys`. The cards were just put back
  * where the reader had them in the thread list, on the way back to it from two columns (`moveLayout`,
- * `listCardsHeld`), in their column as it now stands, with everything now under it: told to the right
+ * `layoutShown.holdListCards`), in their column as it now stands, with everything now under it: told to the right
  * column's keeper, which measures what grows under the cards from there. The send card that change moved
  * into the dock under the list, and the picker's new name if it wrapped the dock, are not the dock growing
  * under a reader at the foot of two columns' cards. Counted as growth, they took anyone within the slack
@@ -33897,7 +33809,7 @@ if (typeof window.ResizeObserver === "function") {
   // What the column is showing: a change of it is not the content changing under the reader. Beside Main
   // or on its own as the thread list (`#281 view-keys`), which is a change of what it shows too.
   const contextOf = () => (sideColumnUp()
-    ? `${columnsShown ? "two" : "list"}|${screens.screen()}|${screens.view()}|${columns.side.mode}|${inColumn(columns.side, () => `${channelContextKey()}|${pinsView().only}`)}`
+    ? `${layoutShown.columns() ? "two" : "list"}|${screens.screen()}|${screens.view()}|${columns.side.mode}|${inColumn(columns.side, () => `${channelContextKey()}|${pinsView().only}`)}`
     : "one");
   // On the newest line, and scrolled to it. What the column shows is noted only by this observer's
   // passes, which a change of it always brings: not on every scroll event.

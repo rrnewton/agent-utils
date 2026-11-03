@@ -602,3 +602,30 @@ test("`#624 voice-page-modularity`: the code works on the left column except ins
   assert.equal(work.side(), false, "a throw still puts the left column back");
   assert.equal(work.inColumn(columns.main, () => "same"), "same", "the column already worked on runs as it is");
 });
+
+test("`#624 voice-page-modularity`: the layout on screen, and each place held for the way back, taken once", () => {
+  const { createLayoutShown } = CHANNEL_VIEW;
+  const shown = createLayoutShown();
+  assert.deepStrictEqual([shown.layout(), shown.sideUp(), shown.fit()], ["one", false, false]);
+  shown.setThreadList(true);
+  assert.deepStrictEqual([shown.layout(), shown.sideUp(), shown.threadList()], ["list", true, true]);
+  shown.setThreadList(false);
+  shown.setColumns(true);
+  assert.deepStrictEqual([shown.layout(), shown.sideUp(), shown.columns()], ["two", true, true]);
+  assert.equal(shown.noteFit(true), true, "the window now draws two columns");
+  assert.equal(shown.noteFit(true), false, "and saying so again changes nothing");
+  assert.equal(shown.fit(), true);
+  shown.askOneColumn({ view: "flat" });
+  assert.deepStrictEqual(shown.takeOneColumn(), { view: "flat" });
+  assert.equal(shown.takeOneColumn(), null, "the view asked for is shown once");
+  for (const [hold, take] of [["holdListPlace", "takeListPlace"], ["holdListCards", "takeListCards"], ["holdLeftColumn", "takeLeftColumn"]]) {
+    assert.equal(shown[take](), null, `${take}: nothing held yet`);
+    shown[hold]({ channel: "c1" });
+    assert.deepStrictEqual(shown[take](), { channel: "c1" }, `${take}: what was held`);
+    assert.equal(shown[take](), null, `${take}: spent by the change that took it`);
+  }
+  const seen = [];
+  shown.whileRestoring(() => seen.push(shown.restoring()));
+  assert.throws(() => shown.whileRestoring(() => { throw new Error("drawn wrong"); }), /drawn wrong/);
+  assert.deepStrictEqual([seen, shown.restoring()], [[true], false], "restoring only while putting a view back, throw or not");
+});

@@ -6362,8 +6362,8 @@ test("`#269 approval-card-inline` x `#281 view-keys` x `#280 scroll-stability`: 
 
 /** The parts of a broken copy that put the page back as it was before review's second round. */
 const CAME_UNDER = "  if (coming) cardCameUnderLists(gap);\n";
-const HELD_ALWAYS = '  listHeldPlace = inColumn(columns.main, () => (selection().view === "main" || selection().view === "flat"\n';
-const HELD_WITH_CARD = "  listHeldPlace = inColumn(columns.main, () => (voiceTranscript().postWatch.shown !== null && " +
+const HELD_ALWAYS = '  layoutShown.holdListPlace(inColumn(columns.main, () => (selection().view === "main" || selection().view === "flat"\n';
+const HELD_WITH_CARD = "  layoutShown.holdListPlace(inColumn(columns.main, () => (voiceTranscript().postWatch.shown !== null && " +
   'leftEl("post-confirm").getAttribute("data-place") === "channel" && (selection().view === "main" || selection().view === "flat")\n';
 
 test("`#269 approval-card-inline` x `#281 view-keys` x `#280 scroll-stability`: A DRAFT ARRIVING UNDER THE THREAD LIST leaves a Main reader up the list on their row, behind the cards and back by Cmd-1, Esc and Cmd-4, offered the jump — the box at Main's foot shrinking to one line in the same layout not taken for their being at the foot — and keeps one at Main's foot at it", async () => {
@@ -6566,7 +6566,7 @@ test("`#280 scroll-stability` x `#269 approval-card-inline` x `#281 view-keys`: 
   // THE CONTROLS. No place held in the list's cards: whoever two columns read as at the foot of the cards is
   // put at the list's foot. The reader up the cards in two columns too is kept as before.
   const unheld = await run(brokenScript(
-    "  if (place && kept && now === \"list\" && next === \"two\") listCardsHeld = { place: kept, placed: cardAnchor(), channel };\n",
+    "  if (place && kept && now === \"list\" && next === \"two\") layoutShown.holdListCards({ place: kept, placed: cardAnchor(), channel });\n",
     ""));
   assert.deepStrictEqual(unheld, {
     ...real, nearMain: false, nearTwo: false, midMain: false, midTwo: false, slackMain: false, slackTwo: false,
@@ -6966,7 +6966,7 @@ test("`#269 approval-card-inline` x `#280 scroll-stability`: A READER WHO SEES O
 });
 
 // ...and from the dock under the thread list. The place a trip through the list puts back is read as the list
-// comes up (`listHeldPlace`), and for a reader who saw only the card it is the card. Gone from under the cards
+// comes up (`layoutShown.holdListPlace`), and for a reader who saw only the card it is the card. Gone from under the cards
 // by the way back, Send tapped there or the draft settled elsewhere, it put nobody anywhere: in Chromium Esc or
 // Cmd+1 left a reader who had been 40 or 60px up Main 182 or 202px above its foot, and Cmd+2 353px above All's,
 // offered the jump and no longer following.
