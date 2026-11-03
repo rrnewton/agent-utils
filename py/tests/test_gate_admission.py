@@ -68,6 +68,31 @@ def test_an_exclusive_run_waits_for_an_empty_box_and_blocks_new_gates(tmp_path: 
     assert "class=exclusive" in exclusive_out
 
 
+def test_a_nested_exclusive_gate_releases_its_parent_and_waits_for_other_gates(
+    tmp_path: Path,
+) -> None:
+    order = tmp_path / "order.txt"
+    holder = _start(
+        tmp_path, "--", PY, "-c",
+        f"import time; time.sleep(3); open({str(order)!r}, 'a').write('holder\\n')",
+    )
+    _wait_for_runs(tmp_path, 1)
+    nested_script = (
+        "import subprocess, sys\n"
+        f"done = subprocess.run([sys.executable, {str(GATE)!r}, '--exclusive', '--', "
+        f"sys.executable, '-c', \"open({str(order)!r}, 'a').write('nested\\\\n')\"])\n"
+        "sys.exit(done.returncode)\n"
+    )
+    outer = _start(tmp_path, "--", PY, "-c", nested_script)
+    outer_out, _ = outer.communicate(timeout=60)
+    holder.communicate(timeout=30)
+    assert outer.returncode == 0
+    # The nested exclusive phase ran alone: after the unrelated holder gate
+    # finished, never beside it, and without deadlocking on its own parent.
+    assert order.read_text().splitlines() == ["holder", "nested"]
+    assert "class=exclusive" in outer_out
+
+
 def test_status_reports_finished_runs(tmp_path: Path) -> None:
     done = _start(tmp_path, "--", PY, "-c", "pass")
     done.communicate(timeout=30)

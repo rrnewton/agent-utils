@@ -117,12 +117,19 @@ steps:
       # inflating the other differential steps that continue to share the general baseline above.
       hard_mem_max_bytes: 536870912
 
+  # The herdr-run and agentctl differentials below carry the gate-exclusive
+  # label: scripts/validate.py runs them after the main phase, one at a time
+  # under a fresh gate.py --exclusive admission. They assert exact outcomes
+  # of small wall clocks inside agentctl (Herdr probes against a Python fake
+  # Herdr, a 300 ms git check-ignore), so under shared-gate contention the
+  # two editions classify the same pane differently and the step goes red
+  # while passing every exclusive rerun (#725 validate-speed).
   - group: herdr-run
     job: differential
     desc: herdr-run Python and Rust commands agree
     cmd: python3 cross/differential.py --tool herdr-run
     jobs_flag: ""
-    labels: [validation-cross, component-herdr-run]
+    labels: [validation-cross, component-herdr-run, gate-exclusive]
     timeout: 600
     cpu_timeout: 1200
     hint: *cross_hint
@@ -132,7 +139,7 @@ steps:
     desc: herdr-agent Python and Rust commands agree
     cmd: python3 cross/differential.py --tool herdr-agent
     jobs_flag: ""
-    labels: [validation-cross, component-agentctl]
+    labels: [validation-cross, component-agentctl, gate-exclusive]
     timeout: 600
     cpu_timeout: 1200
     hint: *cross_hint
@@ -142,7 +149,7 @@ steps:
     desc: agentctl Python and Rust commands agree (group shard 1 of 3)
     cmd: python3 cross/differential.py --tool agentctl --shard 0/3
     jobs_flag: ""
-    labels: [validation-cross, component-agentctl]
+    labels: [validation-cross, component-agentctl, gate-exclusive]
     # Sharded by group (see cross/agentctl_differential.py shard_groups):
     # one 1200 s serial node timed out under multi-gate load; three shorter
     # nodes keep each wall well inside the same budget without raising it.
@@ -159,7 +166,7 @@ steps:
     desc: agentctl Python and Rust commands agree (group shard 2 of 3)
     cmd: python3 cross/differential.py --tool agentctl --shard 1/3
     jobs_flag: ""
-    labels: [validation-cross, component-agentctl]
+    labels: [validation-cross, component-agentctl, gate-exclusive]
     timeout: 1200
     cpu_timeout: 2400
     hint:
@@ -173,7 +180,7 @@ steps:
     desc: agentctl Python and Rust commands agree (group shard 3 of 3)
     cmd: python3 cross/differential.py --tool agentctl --shard 2/3
     jobs_flag: ""
-    labels: [validation-cross, component-agentctl]
+    labels: [validation-cross, component-agentctl, gate-exclusive]
     timeout: 1200
     cpu_timeout: 2400
     hint:

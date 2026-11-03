@@ -583,6 +583,45 @@ TIMING_COMMAND_MARKERS = (
 )
 
 
+#: DAG label for steps that must run alone on the host: under a fresh
+#: `gate.py --exclusive` admission, one step at a time, after the main phase.
+#: These steps assert exact outcomes of small wall clocks inside the tools
+#: they compare (agentctl's Herdr probes against a Python fake Herdr), so
+#: sharing the box with another gate's steps — not the step budgets — turns
+#: them red; exclusive reruns pass. See validation/cross.dag.yaml.
+GATE_EXCLUSIVE_LABEL = "gate-exclusive"
+
+
+def partition_gate_exclusive(
+    steps: dict[str, dict[str, object]], chosen: set[str]
+) -> tuple[list[str], list[str]]:
+    """Split chosen tags into the main phase and the gate-exclusive phase.
+
+    Both lists keep graph order. A chosen step that depends on an exclusive
+    step joins the exclusive phase too: running it in the main phase would
+    pull its exclusive dependency in beside everything else.
+    """
+
+    def labels(tag: str) -> set[str]:
+        raw = steps[tag].get("labels")
+        return {label for label in raw if isinstance(label, str)} if isinstance(raw, list) else set()
+
+    exclusive = {tag for tag in chosen if GATE_EXCLUSIVE_LABEL in labels(tag)}
+    changed = True
+    while changed:
+        changed = False
+        for tag in chosen - exclusive:
+            raw_deps = steps[tag].get("deps")
+            deps = raw_deps if isinstance(raw_deps, list) else []
+            if any(dep in exclusive for dep in deps if isinstance(dep, str)):
+                exclusive.add(tag)
+                changed = True
+    return (
+        [tag for tag in steps if tag in chosen and tag not in exclusive],
+        [tag for tag in steps if tag in exclusive],
+    )
+
+
 def _is_timing_gate(command: str) -> bool:
     if "cross/differential.py" in command:
         tokens = command.split()
@@ -623,6 +662,7 @@ def run(
     timing_dir: Path | None = None,
     host: Mapping[str, str] | None = None,
     keep_going: bool = False,
+    gate_exclusive_phases: tuple[list[str], list[str]] | None = None,
 ) -> int:
     """Execute one flattened dagrun graph for the selected contract.
 
@@ -631,34 +671,31 @@ def run(
     (see ``scripts/case_timings.py``). `host` is the validate.env settings, added to the
     graph's environment only. With `keep_going`, a failed step no longer aborts the steps
     that do not depend on it (dagrun --keep-going), so one run reports every independent
-    failure. `#362 ci-failure-masking`.
+    failure. `#362 ci-failure-masking`. Steps labelled `gate-exclusive` run after the
+    main phase, one at a time under a fresh `gate.py --exclusive` admission, so no
+    other gate's steps share the host with them.
     """
 
     cpu_count = os.cpu_count() or 1
     max_cpus = os.environ.get("VALIDATE_MAX_CPUS", str(min(32, cpu_count)))
     max_steps = os.environ.get("VALIDATE_MAX_STEPS", str(min(24, cpu_count)))
-    command = [
-        str(REPO_ROOT / "common" / "bin" / "dagrun"),
-        "run",
-        "--dag",
-        str(REPO_ROOT / "validation.dag.yaml"),
-        "--max-steps",
-        max_steps,
-        "--max-cpus",
-        max_cpus,
-        "--planner",
-        "critical-path",
-        "--profile",
-    ]
-    if not all_contract:
-        labels = {GROUP_LABELS[group] for group in selected}
-        labels.update(f"component-{name}" for name in components)
-        command.extend(("--labels", ",".join(sorted(labels))))
-    if keep_going:
-        command.append("--keep-going")
+
+    def dagrun_command() -> list[str]:
+        return [
+            str(REPO_ROOT / "common" / "bin" / "dagrun"),
+            "run",
+            "--dag",
+            str(REPO_ROOT / "validation.dag.yaml"),
+            "--max-steps",
+            max_steps,
+            "--max-cpus",
+            max_cpus,
+            "--planner",
+            "critical-path",
+            "--profile",
+        ]
+
     extra = os.environ.get("VALIDATE_DAGRUN_FLAGS", os.environ.get("BOX_FLAGS", ""))
-    command.extend(shlex.split(extra))
-    print(f"\n=== flattened validation DAG ({len(command)} argv entries) ===", flush=True)
     env = dict(os.environ)
     env.update(host or {})
     if coverage_dir is not None:
@@ -668,10 +705,58 @@ def run(
         # An ambient nested marker would classify the whole run as an
         # alternate-environment rerun and empty the primary report.
         env.pop(case_timings.TIMING_NESTED_ENV, None)
-    done = subprocess.run(command, cwd=REPO_ROOT, check=False, env=env)
-    if done.returncode != 0:
+
+    # `main` computes the phase split from the canonical graph and passes it
+    # in; without it (direct callers, the graph-contract tests) the run is
+    # the historical single dagrun invocation.
+    main_tags, exclusive_tags = gate_exclusive_phases or ([], [])
+    result = 0
+    if exclusive_tags:
+        # Steps labelled gate-exclusive run afterwards, one at a time, each
+        # under a fresh exclusive gate admission (see partition_gate_exclusive).
+        print(
+            f"\nvalidate: {len(exclusive_tags)} gate-exclusive step(s) run alone "
+            f"after the main phase: {', '.join(exclusive_tags)}",
+            flush=True,
+        )
+    if main_tags or not exclusive_tags:
+        command = dagrun_command()
+        if exclusive_tags:
+            command.extend(("--selected", ",".join(main_tags)))
+        elif not all_contract:
+            labels = {GROUP_LABELS[group] for group in selected}
+            labels.update(f"component-{name}" for name in components)
+            command.extend(("--labels", ",".join(sorted(labels))))
+        if keep_going:
+            command.append("--keep-going")
+        command.extend(shlex.split(extra))
+        print(f"\n=== flattened validation DAG ({len(command)} argv entries) ===", flush=True)
+        done = subprocess.run(command, cwd=REPO_ROOT, check=False, env=env)
+        result = done.returncode
+    if result == 0 or keep_going:
+        for tag in exclusive_tags:
+            # gate.py releases this run's own admission slot before queueing
+            # (the parent is blocked here), then this step runs alone: no
+            # other gate's steps share the host while it runs.
+            command = [
+                sys.executable,
+                str(Path(__file__).with_name("gate.py")),
+                "--exclusive",
+                "--",
+                *dagrun_command(),
+                "--selected",
+                tag,
+                *shlex.split(extra),
+            ]
+            print(f"\n=== gate-exclusive step {tag} (runs alone) ===", flush=True)
+            done = subprocess.run(command, cwd=REPO_ROOT, check=False, env=env)
+            if done.returncode != 0 and result == 0:
+                result = done.returncode
+            if result != 0 and not keep_going:
+                break
+    if result != 0:
         print("\nvalidate: FAILED in flattened validation DAG", file=sys.stderr)
-    return done.returncode
+    return result
 
 
 def report(
@@ -859,6 +944,20 @@ def self_test() -> int:
     """Check mapping and rename semantics offline, without running the build."""
     failures: list[str] = []
     manifest = load_manifest()
+
+    synthetic_steps: dict[str, dict[str, object]] = {
+        "cross.solo": {"labels": [GATE_EXCLUSIVE_LABEL], "deps": []},
+        "cross.dependent": {"labels": [], "deps": ["cross.solo"]},
+        "cross.plain": {"labels": [], "deps": []},
+    }
+    main_tags, exclusive_tags = partition_gate_exclusive(
+        synthetic_steps, {"cross.solo", "cross.dependent", "cross.plain"}
+    )
+    if main_tags != ["cross.plain"] or exclusive_tags != ["cross.solo", "cross.dependent"]:
+        failures.append(
+            "gate-exclusive partition: a dependent of an exclusive step must "
+            f"join the exclusive phase; got main={main_tags} exclusive={exclusive_tags}"
+        )
 
     def expect(
         paths: list[str], want: set[str], why: str, want_components: set[str] | None = None
@@ -1452,6 +1551,10 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     all_contract = args.all or selected == ALL_GROUPS
+    graph_steps, graph_chosen = selected_graph(
+        selected, components, all_contract=all_contract
+    )
+    phases = partition_gate_exclusive(graph_steps, graph_chosen)
     # Every selected cross node must leave a record; one that does not cannot be confirmed.
     expected = selected_cross_nodes(selected, components, all_contract=all_contract)
     expected_timing = selected_timing_gates(
@@ -1469,6 +1572,7 @@ def main(argv: list[str] | None = None) -> int:
             timing_dir=Path(timings),
             host=host,
             keep_going=args.keep_going,
+            gate_exclusive_phases=phases if phases[1] else None,
         )
         if code != 0:
             return code

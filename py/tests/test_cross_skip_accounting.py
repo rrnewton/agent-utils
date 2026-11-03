@@ -1676,6 +1676,7 @@ def _validate_with_one_cross_node(
         timing_dir: Path,
         host: object = None,
         keep_going: bool = False,
+        gate_exclusive_phases: object = None,
     ) -> int:
         assert all_contract
         assert host == {}

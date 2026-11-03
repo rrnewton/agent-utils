@@ -18,6 +18,12 @@ measurement (`scripts/gate status`). Admission state lives outside the
 repository (default /tmp/dev-agent-utils-gate-admission, override with
 $GATE_ADMISSION_DIR); tickets and runs are files, reaped when their pid dies,
 so a killed lane never holds a slot forever.
+
+An admitted run's children see $GATE_ADMISSION_RUN_ID. A gate invoked from
+inside an admitted run (validate.py's gate-exclusive phase) releases the
+parent's slot before queueing: the parent is blocked on that call, so holding
+its slot would deadlock, and the nested call must still wait for — and block —
+every other gate as a fresh exclusive ticket.
 """
 from __future__ import annotations
 
@@ -176,6 +182,15 @@ class Admission:
 
 def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
     adm = Admission(state_dir(), args.slots)
+    # A gate invoked from inside an admitted gate (validate.py running its
+    # gate-exclusive steps) must not queue behind its own parent: the parent
+    # process is blocked waiting for this call and will never finish. Release
+    # the parent's slot first; this call then queues as a fresh top-level
+    # ticket, so an exclusive phase still waits for every other gate and
+    # blocks new ones, with no deadlock.
+    parent_run = os.environ.get("GATE_ADMISSION_RUN_ID")
+    if parent_run:
+        adm.finish(parent_run)
     run_id, _ = adm.enqueue(args.cls, command)
     queued_at = time.time()
     last_pos = -1
@@ -195,7 +210,9 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
     started = time.time()
     rc = 1
     try:
-        rc = subprocess.run(command).returncode
+        rc = subprocess.run(
+            command, env={**os.environ, "GATE_ADMISSION_RUN_ID": run_id}
+        ).returncode
     finally:
         adm.finish(run_id)
         adm.record({"id": run_id, "class": args.cls, "command": command,
