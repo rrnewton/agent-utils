@@ -1101,6 +1101,7 @@ function channelLevels() {
  */
 function underThreadList() {
   const channel = String(selectedChannelId() || "");
+  const listBefore = layoutChoice.listBefore();
   if (listBefore.layout === "two") return columnsFit && sideThreads.has(channel) ? ["side"] : [];
   const thread = listBefore.layout === "one" && listBefore.channel === channel && listBefore.view === "thread";
   return thread && listBefore.thread ? ["thread"] : [];
@@ -12234,8 +12235,9 @@ function reconcileChannelSnapshot(before) {
 // is a preference of the device rather than a place, so it comes from the shared record whichever
 // window wrote that. What the right column shows in two columns is kept for the session only
 // (`sideThreads`), in memory, which is already the window's own. `#281 view-keys`: and the layout —
-// one column, the thread list on its own, or two columns — is the window's own as well (`COLUMNS_KEY`),
-// so each of the four views Ctrl+1 to Ctrl+4 choose is what a reload of that window comes back to.
+// one column, the thread list on its own, or two columns — is the window's own as well (`COLUMNS_KEY`,
+// web/src/core/navigation/layout.ts), so each of the four views Ctrl+1 to Ctrl+4 choose is what a reload
+// of that window comes back to.
 //
 // The window's storage, not its address: a channel in the URL would outlive a reload too, but it
 // would ride along in every link copied out of the address bar, and every route, the installed
@@ -27762,85 +27764,21 @@ function followReplyStore() {
 // a filter — is drawn in each (`eachColumn`).
 
 /**
- * The layout chosen: "two", "list" for the thread list on its own, or anything else for one column.
- * `#281 view-keys`: this window's own (`windowItem`), which a reload of it comes back to, as `#265
- * window-channel-memory` keeps its channel and view; and the device's, which a brand-new window opens
- * in — the layout chosen last, in any window.
- */
-const COLUMNS_KEY = "vibe-talk.voice.columns";
-
-/** The layout this window opens in: its own choice, else the device's, else one column. */
-function storedLayoutChoice() {
-  let device = null;
-  try {
-    device = deviceStorage().getItem(COLUMNS_KEY);
-  } catch (_error) {
-    device = null;
-  }
-  const own = windowItem(COLUMNS_KEY);
-  const stored = own !== null ? own : device;
-  return stored === "two" || stored === "list" ? stored : "one";
-}
-
-/**
- * The layout the reader chose: "one", "list" or "two". Applied where it is offered — a channel with
- * threads to list — and two columns only where the window is wide enough for them.
+ * The layout the reader chose ("one", "list" or "two"), the one-column layout two columns' button goes
+ * back to, and what the thread list was chosen from (`ListBefore`), each this window's own and kept for
+ * its next reload, the layout the device's too: one owner in web/src/core/navigation/layout.ts (`#624
+ * voice-page-modularity`), read from storage here, where the page always read them.
  *
- * @type {"one" | "list" | "two"}
+ * @typedef {import("./src/core/navigation/index.ts").ListBefore} ListBefore
  */
-let layoutChosen = storedLayoutChoice();
-
-/**
- * What the thread list was chosen from, which Esc on it goes back to (`threadListBack`): two columns,
- * with the layout their button went back to then, or one column and the view it showed — a channel's
- * Main, All, or a thread with where that was opened from.
- *
- * @typedef {{layout: "one" | "two", columns?: string, channel?: string, view?: string,
- *   thread?: string | null, origin?: string | null}} ListBefore
- */
-
-/**
- * Where this window's layouts were chosen from: the layout two columns' button goes back to
- * (`layoutBeforeColumns`), and the view Esc on the thread list goes back to (`listBefore`). `#281
- * view-keys`. The window's own, as its layout is (`COLUMNS_KEY`), so a reload of either still has its
- * way back: two columns in a window too narrow for them still show the thread list they came from, and
- * the list still goes back to Main or All.
- */
-const LAYOUT_BEFORE_KEY = "vibe-talk.voice.columns-before";
-
-/** What `LAYOUT_BEFORE_KEY` holds for this window, or an empty record where it holds nothing usable. */
-function storedLayoutBefore() {
-  try {
-    const held = JSON.parse(windowItem(LAYOUT_BEFORE_KEY) || "null");
-    return held !== null && typeof held === "object" ? held : {};
-  } catch (_error) {
-    return {};
-  }
-}
-
-/** Whether `before` is something the thread list can go back to (see `ListBefore`). */
-const validListBefore = (before) => before !== null && typeof before === "object" &&
-  (before.layout === "two" || (before.layout === "one" && typeof before.channel === "string" &&
-    REOPENED_VIEWS.includes(before.view) && (before.view !== "thread" ||
-      (typeof before.thread === "string" && before.thread !== "" && ["main", "flat"].includes(before.origin)))));
-
-const layoutBefore = storedLayoutBefore();
-
-/**
- * The one-column layout two columns were chosen from, "one" or "list": what the layout button goes back to.
- *
- * @type {"one" | "list" | "two"}
- */
-let layoutBeforeColumns = ["one", "list"].includes(layoutBefore.columns) ? layoutBefore.columns
-  : layoutChosen === "list" ? "list" : "one";
-
-/**
- * What the thread list was chosen from, for Esc on it. One column on the view its channel opens in
- * where nothing says otherwise.
- *
- * @type {ListBefore}
- */
-let listBefore = validListBefore(layoutBefore.list) ? layoutBefore.list : { layout: "one" };
+const layoutChoice = createLayoutChoice({
+  device: deviceStorageOnUse(),
+  window: {
+    getItem: (key) => windowStorage().getItem(key),
+    setItem: (key, value) => windowStorage().setItem(key, value),
+    removeItem: (key) => windowStorage().removeItem(key),
+  },
+});
 
 /** Whether two columns are on screen now. */
 let columnsShown = false;
@@ -28091,10 +28029,10 @@ function renderColumnToggle() {
   const button = leftEl("column-toggle");
   const offered = columnsOffered();
   if (button.hidden === offered) button.hidden = !offered;
-  const chosen = layoutChosen === "two";
+  const chosen = layoutChoice.chosen() === "two";
   button.setAttribute("aria-pressed", chosen ? "true" : "false");
   const title = !chosen ? "Show Main and a thread side by side"
-    : layoutBeforeColumns === "list" ? "Back to the thread list" : "Back to one column";
+    : layoutChoice.beforeColumns() === "list" ? "Back to the thread list" : "Back to one column";
   if (button.title !== title) button.title = title;
 }
 
@@ -28124,10 +28062,10 @@ function renderColumns() {
   const fit = toggleHasBox();
   const fitChanged = fit !== columnsFit;
   columnsFit = fit;
-  let want = columnsOffered() && layoutChosen !== "one" ? layoutChosen : null;
+  let want = columnsOffered() && layoutChoice.chosen() !== "one" ? layoutChoice.chosen() : null;
   // Two columns in a window too narrow for them: the layout they were chosen from — the thread list, or
   // one column — until it is wide enough, the choice kept for then. `#281 view-keys`.
-  if (want === "two" && !fit) want = layoutBeforeColumns === "list" ? "list" : null;
+  if (want === "two" && !fit) want = layoutChoice.beforeColumns() === "list" ? "list" : null;
   // `#280 scroll-stability`. Where the reader is in the cards, read before the layout changes the width
   // they are drawn at: between the thread list and two columns they are kept, and put back there.
   const cards = currentView === "discord" && screen.getAttribute("data-columns") !== want ? cardAnchor() : null;
@@ -28296,21 +28234,6 @@ function sameLeftPlace(now, placed) {
   return !x && !y && typeof a.card === "number" && typeof b.card === "number" && Math.abs(a.card - b.card) <= 1;
 }
 
-/** Keep `layout` as the one chosen: this window's, and the device's for the next new window. */
-function keepLayoutChoice(layout) {
-  try {
-    deviceStorage().setItem(COLUMNS_KEY, layout);
-  } catch (_error) {
-    // A browser that refuses storage still honours the choice for this session.
-  }
-  keepWindowItem(COLUMNS_KEY, layout);
-}
-
-/** Keep where this window's layouts were chosen from, for its next reload (`LAYOUT_BEFORE_KEY`). */
-function keepLayoutBefore() {
-  keepWindowItem(LAYOUT_BEFORE_KEY, JSON.stringify({ columns: layoutBeforeColumns, list: listBefore }));
-}
-
 /**
  * Choose layout `layout`, keep the choice, and show it where it can be shown. Two columns chosen in a
  * window too narrow for them are kept for when it is wider, as the layout button always kept them.
@@ -28324,11 +28247,8 @@ function setLayout(layout, back = false) {
   // From the left column, whichever column asked: the layout changes what the left column shows.
   if (sideActive) return inColumn(columns.main, () => setLayout(layout, back));
   noteDeepLinkReaderMove();
-  if (layout === "list" && layoutChosen !== "list" && !back) noteListBefore();
-  if (layout !== "two") layoutBeforeColumns = layout;
-  layoutChosen = layout;
-  keepLayoutChoice(layout);
-  keepLayoutBefore();
+  if (layout === "list" && layoutChoice.chosen() !== "list" && !back) noteListBefore();
+  layoutChoice.choose(layout);
   renderColumns();
   renderThreadSelect();
 }
@@ -28340,16 +28260,14 @@ function setLayout(layout, back = false) {
  * Esc would be that thread, and the thread's the list, round and round.
  */
 function noteListBefore() {
-  if (layoutChosen === "two") {
-    listBefore = { layout: "two", columns: layoutBeforeColumns };
-    return;
-  }
-  if (selection().view === "thread" && selection().origin === "list") return;
-  const thread = selection().view === "thread" && selection().threadId ? String(selection().threadId) : null;
-  listBefore = {
-    layout: "one", channel: String(selectedChannelId() || ""),
-    view: thread ? "thread" : selection().view, thread, origin: thread ? selection().origin : null,
-  };
+  layoutChoice.noteListBefore(() => {
+    if (selection().view === "thread" && selection().origin === "list") return null;
+    const thread = selection().view === "thread" && selection().threadId ? String(selection().threadId) : null;
+    return {
+      layout: "one", channel: String(selectedChannelId() || ""),
+      view: thread ? "thread" : selection().view, thread, origin: thread ? selection().origin : null,
+    };
+  });
 }
 
 /**
@@ -28360,9 +28278,9 @@ function noteListBefore() {
  */
 function threadListBack() {
   if (sideActive) return inColumn(columns.main, threadListBack);
-  const before = listBefore;
+  const before = layoutChoice.listBefore();
   if (before.layout === "two" && columnsFit) {
-    if (before.columns === "one" || before.columns === "list") layoutBeforeColumns = before.columns;
+    layoutChoice.restoreBeforeColumns(before.columns);
     setLayout("two");
   } else {
     chooseOneColumn(oneColumnBeforeList(before));
@@ -28401,7 +28319,7 @@ function columnsFromKeyboard() {
   if (!channelOnScreen()) return false;
   toggleColumns();
   // The choice is kept as the button keeps it; a window too narrow to show it says so.
-  if (layoutChosen === "two" && !columnsShown) setStatus(COLUMNS_TOO_NARROW);
+  if (layoutChoice.chosen() === "two" && !columnsShown) setStatus(COLUMNS_TOO_NARROW);
   return true;
 }
 
@@ -28411,7 +28329,7 @@ const COLUMNS_TOO_NARROW = "Two columns need a wider window; they come back when
 /** The reader pressed the layout button: two columns, or back to the layout they were chosen from. */
 function toggleColumns() {
   // Back to the thread list, out of two columns, is not a choice of it: its Esc still goes where it did.
-  if (layoutChosen === "two") setLayout(layoutBeforeColumns, true);
+  if (layoutChoice.chosen() === "two") setLayout(layoutChoice.beforeColumns(), true);
   else setLayout("two");
   settleFocus();
 }

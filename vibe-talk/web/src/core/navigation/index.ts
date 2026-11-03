@@ -16,3 +16,5 @@ export { createLinkJumps, ownLevel } from "./jumps.ts";
 export type { LinkJump, LinkJumps, LinkSpot } from "./jumps.ts";
 export { BACK_DEPTH_MAX, BACK_STATE_KEY, BACK_TRAVERSAL_MS, createBackStack } from "./backstack.ts";
 export type { BackEntryFacts, BackHistoryPort, BackStack, BackStackDependencies } from "./backstack.ts";
+export { COLUMNS_KEY, LAYOUT_BEFORE_KEY, createLayoutChoice } from "./layout.ts";
+export type { Layout, LayoutChoice, LayoutChoiceDependencies, ListBefore } from "./layout.ts";

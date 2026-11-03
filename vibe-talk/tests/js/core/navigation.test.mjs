@@ -227,6 +227,46 @@ test("`#624 voice-page-modularity`: the Back entries take an earlier load's entr
   }).start(), false, "a host with no history has nothing to listen to");
 });
 
+test("`#624 voice-page-modularity`: the layout is the window's, else the device's, and remembers what two columns and the list were chosen from", () => {
+  const { createLayoutChoice, COLUMNS_KEY, LAYOUT_BEFORE_KEY } = NAVIGATION;
+  const storage = (map, refuse = false) => ({
+    getItem: (key) => { if (refuse) throw new Error("SecurityError"); return map.has(key) ? map.get(key) : null; },
+    setItem: (key, value) => { if (refuse) throw new Error("QuotaExceededError"); map.set(key, value); },
+    removeItem: (key) => map.delete(key),
+  });
+  const device = new Map([[COLUMNS_KEY, "two"]]);
+  const windowed = new Map();
+  const fresh = createLayoutChoice({ device: storage(device), window: storage(windowed) });
+  assert.equal(fresh.chosen(), "two", "a new window opens in the device's layout");
+  assert.equal(fresh.beforeColumns(), "one");
+  assert.deepStrictEqual(fresh.listBefore(), { layout: "one" });
+  fresh.noteListBefore(() => assert.fail("two columns need no view"));
+  assert.deepStrictEqual(fresh.listBefore(), { layout: "two", columns: "one" });
+  fresh.choose("list");
+  assert.equal(fresh.beforeColumns(), "list", "a one-column layout is what two columns go back to");
+  assert.equal(device.get(COLUMNS_KEY), "list");
+  assert.deepStrictEqual(JSON.parse(windowed.get(LAYOUT_BEFORE_KEY)), { columns: "list", list: { layout: "two", columns: "one" } });
+  fresh.noteListBefore(() => null);
+  assert.deepStrictEqual(fresh.listBefore(), { layout: "two", columns: "one" }, "a thread opened from the list is not noted");
+  const one = { layout: "one", channel: "C1", view: "thread", thread: "T1", origin: "main" };
+  fresh.noteListBefore(() => one);
+  fresh.choose("one");
+  const reloaded = createLayoutChoice({ device: storage(new Map()), window: storage(windowed) });
+  assert.equal(reloaded.chosen(), "one", "a reload of the window keeps its own layout");
+  assert.deepStrictEqual(reloaded.listBefore(), one);
+  reloaded.restoreBeforeColumns("bogus");
+  assert.equal(reloaded.beforeColumns(), "one");
+  reloaded.restoreBeforeColumns("list");
+  assert.equal(reloaded.beforeColumns(), "list");
+  windowed.set(LAYOUT_BEFORE_KEY, JSON.stringify({ list: { layout: "one", channel: "C1", view: "thread", thread: "", origin: "main" } }));
+  assert.deepStrictEqual(createLayoutChoice({ device: storage(new Map()), window: storage(windowed) }).listBefore(), { layout: "one" },
+    "a kept way back that cannot be gone back to is none");
+  const refused = createLayoutChoice({ device: storage(new Map(), true), window: storage(new Map(), true) });
+  assert.equal(refused.chosen(), "one");
+  refused.choose("two");
+  assert.equal(refused.chosen(), "two", "refused storage still honours the choice for the session");
+});
+
 test("`#624 voice-page-modularity`: a place reads back from the query it writes, and a bad escape or an absurd value says nothing", () => {
   const { deepLinkParams, deepLinkPart, deepLinkQuery, DEEP_LINK_VIEWS } = NAVIGATION;
   const ref = { provider: "slack", channel: "C 1", message: "M1", thread: "T1" };
