@@ -67,6 +67,18 @@ struct Fake {
     crashing: RefCell<Option<PathBuf>>,
     /// systemd-run refuses a property containing this text.
     refuse_property: RefCell<Option<String>>,
+    /// How long a restart's stop of the old process takes (clock time).
+    restart_delay: Cell<Duration>,
+    /// When each process started (clock time), by pid.
+    starts: RefCell<BTreeMap<u32, SystemTime>>,
+    /// How long after a bridge process starts its first stream event lands.
+    event_delay: Cell<Duration>,
+    /// How long `stop` takes (clock time).
+    stop_delay: Cell<Duration>,
+    /// Chat-health runs so far, and the run after which the bridge dies.
+    health_runs: Cell<usize>,
+    die_after_health_runs: Cell<usize>,
+    died: Cell<bool>,
     /// Every systemd-run and systemctl call, for assertions.
     calls: RefCell<Vec<String>>,
 }
@@ -94,6 +106,13 @@ impl Fake {
             drop_in_dir,
             crashing: RefCell::new(None),
             refuse_property: RefCell::new(None),
+            restart_delay: Cell::new(Duration::ZERO),
+            starts: RefCell::default(),
+            event_delay: Cell::new(Duration::ZERO),
+            stop_delay: Cell::new(Duration::ZERO),
+            health_runs: Cell::new(0),
+            die_after_health_runs: Cell::new(usize::MAX),
+            died: Cell::new(false),
             calls: RefCell::default(),
         }
     }
@@ -131,6 +150,7 @@ impl Fake {
         }
         let pid = self.next_pid.get();
         self.next_pid.set(pid + 1);
+        self.starts.borrow_mut().insert(pid, self.clock.get());
         self.exes.borrow_mut().insert(pid, program);
         let environment = parsed
             .environment()
@@ -231,6 +251,7 @@ impl Host for Fake {
 
     fn stop(&self, unit: &str) -> Result<(), String> {
         self.calls.borrow_mut().push(format!("stop {unit}"));
+        self.clock.set(self.clock.get() + self.stop_delay.get());
         let mut units = self.units.borrow_mut();
         let transient = units.get(unit).is_some_and(|unit| unit.transient);
         if transient && !self.sticky.get() {
@@ -254,6 +275,8 @@ impl Host for Fake {
 
     fn restart(&self, unit: &str) -> Result<(), String> {
         self.calls.borrow_mut().push(format!("restart {unit}"));
+        // Stopping the old process takes this long inside the restart.
+        self.clock.set(self.clock.get() + self.restart_delay.get());
         Fake::start(self, unit);
         Ok(())
     }
@@ -429,11 +452,42 @@ impl Host for Fake {
         _environment: &[(String, String)],
     ) -> Result<(i32, String), String> {
         assert!(args.iter().any(|arg| arg == "health"));
+        self.health_runs.set(self.health_runs.get() + 1);
+        if !self.died.get() && self.health_runs.get() > self.die_after_health_runs.get() {
+            self.died.set(true);
+            let state_dir = args
+                .windows(2)
+                .find(|pair| pair[0] == "--bridge-state")
+                .map(|pair| pair[1].as_str())
+                .unwrap_or("");
+            let unit = self
+                .units
+                .borrow()
+                .iter()
+                .find(|(_, unit)| {
+                    unit.loaded.contains("chat run")
+                        && unit.active == "active"
+                        && unit.loaded.contains(state_dir)
+                })
+                .map(|(name, _)| name.clone());
+            if let Some(unit) = unit {
+                Fake::start(self, &unit);
+            }
+        }
+        let state_dir = args
+            .windows(2)
+            .find(|pair| pair[0] == "--bridge-state")
+            .map(|pair| pair[1].as_str())
+            .unwrap_or("");
         let pid = self
             .units
             .borrow()
             .values()
-            .find(|unit| unit.loaded.contains("chat run") && unit.active == "active")
+            .find(|unit| {
+                unit.loaded.contains("chat run")
+                    && unit.active == "active"
+                    && unit.loaded.contains(state_dir)
+            })
             .and_then(|unit| unit.pid);
         if self.bridge_down.get() {
             return Ok((
@@ -442,13 +496,18 @@ impl Host for Fake {
                     .to_string(),
             ));
         }
+        let started = pid.and_then(|pid| self.starts.borrow().get(&pid).copied());
+        let age = match started {
+            Some(started) if self.clock.get() >= started + self.event_delay.get() => 1,
+            _ => 3_600,
+        };
         Ok((
             0,
             json!({
                 "verdict": "ok",
                 "problems": {"down": [], "degraded": []},
                 "service": {"running": true, "pid": pid},
-                "event_stream": {"last_item_age_seconds": 1},
+                "event_stream": {"last_item_age_seconds": age},
             })
             .to_string(),
         ))
@@ -975,6 +1034,88 @@ fn definitions_compare_words_not_quoting() {
 }
 
 #[test]
+fn refresh_health_window_counts_from_the_new_process_start() {
+    // #795: stopping the old bridge takes 100 s inside the restart and
+    // its first stream event lands 45 s after the new process starts.
+    // A 120 s health window counted from the restart call would expire
+    // before that event; counted from the process start it does not.
+    let world = world();
+    let registry = world.registry.to_string_lossy().into_owned();
+    world.fake.add_unit_file(
+        "slowbridge.service",
+        &format!(
+            "[Unit]\nDescription=slow bridge\n\n[Service]\nEnvironment=PATH=/usr/bin:/bin\nExecStart=/state/bin/agentctl-old --registry {registry} chat run --bridge-state /state/slowbridge\nRestart=on-failure\n"
+        ),
+    );
+    world.fake.restart_delay.set(Duration::from_secs(100));
+    world.fake.event_delay.set(Duration::from_secs(45));
+    let (services, _) = discover(&world.fake, &Tables, &world.registry).unwrap();
+    let mut only = options(&world);
+    only.only = vec!["slowbridge.service".into()];
+    only.health_timeout = Duration::from_secs(120);
+    let report = refresh(&world.fake, &services, &only).unwrap();
+    assert_eq!(report.exit_code, 0, "{}", report.text);
+    let row = &report.document["services"][0];
+    assert_eq!(row["action"], "refreshed", "{row}");
+    assert!(
+        row["health"].as_str().unwrap().contains("100 s"),
+        "the report says how long the stop took: {row}"
+    );
+}
+
+#[test]
+fn refresh_does_not_count_the_stop_as_stay_up_time() {
+    // #795 review: the stay-up soak (SOAK) must be measured from the
+    // new process's start, not from before the stop. A 100 s stop and
+    // a first passing probe must not count as the process staying up:
+    // when it dies seconds later, the refresh must fail, not succeed.
+    let world = world();
+    let registry = world.registry.to_string_lossy().into_owned();
+    world.fake.add_unit_file(
+        "slowbridge.service",
+        &format!(
+            "[Unit]\nDescription=slow bridge\n\n[Service]\nEnvironment=PATH=/usr/bin:/bin\nExecStart=/state/bin/agentctl-old --registry {registry} chat run --bridge-state /state/slowbridge\nRestart=on-failure\n"
+        ),
+    );
+    world.fake.restart_delay.set(Duration::from_secs(100));
+    // Preflight (run 1) and the first forward probe (run 2) pass; the
+    // process dies before the next probe.
+    world.fake.die_after_health_runs.set(2);
+    let (services, _) = discover(&world.fake, &Tables, &world.registry).unwrap();
+    let mut only = options(&world);
+    only.only = vec!["slowbridge.service".into()];
+    only.health_timeout = Duration::from_secs(120);
+    let report = refresh(&world.fake, &services, &only).unwrap();
+    assert_eq!(report.exit_code, 1, "{}", report.text);
+    assert_eq!(
+        report.document["services"][0]["action"], "rolled-back",
+        "{}",
+        report.text
+    );
+}
+
+#[test]
+fn refresh_health_window_counts_from_the_new_process_start_transient() {
+    // #795: same window rule on the transient path, where the time is
+    // spent stopping and unloading the old unit.
+    let world = world();
+    world.fake.stop_delay.set(Duration::from_secs(100));
+    world.fake.event_delay.set(Duration::from_secs(45));
+    let (services, _) = discover(&world.fake, &Tables, &world.registry).unwrap();
+    let mut only = options(&world);
+    only.only = vec!["bridge".into()];
+    only.health_timeout = Duration::from_secs(120);
+    let report = refresh(&world.fake, &services, &only).unwrap();
+    assert_eq!(report.exit_code, 0, "{}", report.text);
+    let row = &report.document["services"][0];
+    assert_eq!(row["action"], "refreshed", "{row}");
+    assert!(
+        row["health"].as_str().unwrap().contains("100 s"),
+        "the report says how long the stop took: {row}"
+    );
+}
+
+#[test]
 fn a_unit_that_stays_loaded_after_stop_is_started_again_from_its_own_definition() {
     let world = world();
     let before = world.fake.service_text("watch.service");
@@ -1078,6 +1219,7 @@ fn the_bridge_must_run_with_the_snapshots_plugin_home() {
         bridge,
         Path::new("/state/bin/agentctl-old"),
         &expected,
+        UNIX_EPOCH,
         UNIX_EPOCH,
         Duration::from_secs(60),
     )

@@ -529,23 +529,28 @@ fn preflight(host: &dyn Host, service: &Service) -> Result<String, String> {
     Err(last)
 }
 
-/// Wait for `service` to run `binary` and pass the check for its kind, started at `started`.
+/// Wait for `service` to run `binary` and pass the check for its kind. The
+/// freshness probes ("since the restart") measure from `started`, taken before
+/// the old process was stopped; the stay-up soak and the timeout measure from
+/// `process_started`, when the new process exists — the stop in between is not
+/// stay-up time (#795).
 pub fn health(
     host: &dyn Host,
     service: &Service,
     binary: &Path,
     environment: &[(String, String)],
     started: SystemTime,
+    process_started: SystemTime,
     timeout: Duration,
 ) -> Result<String, String> {
-    let deadline = started + timeout;
+    let deadline = process_started + timeout;
     let mut last;
     let mut first_pid: Option<u32> = None;
     loop {
         let outcome = probe(host, service, binary, environment, started, &mut first_pid);
         let now = host.now();
         match outcome {
-            Ok(detail) if now.duration_since(started).unwrap_or_default() >= SOAK => {
+            Ok(detail) if now.duration_since(process_started).unwrap_or_default() >= SOAK => {
                 return Ok(detail)
             }
             Ok(detail) => last = format!("passing, waiting to see it stay up: {detail}"),
@@ -554,7 +559,7 @@ pub fn health(
         }
         if now >= deadline {
             return Err(format!(
-                "no healthy state within {} s: {last}",
+                "no healthy state within {} s of the new process start: {last}",
                 timeout.as_secs()
             ));
         }
@@ -1242,6 +1247,7 @@ fn apply(
             check_replay(host, &service.unit, check, expected, &new_exec_argv(plan))
                 .map_err(early)?;
             record().map_err(early)?;
+            let began = host.now();
             host.stop(&service.unit).map_err(|error| Failure {
                 rollback: restore_transient(
                     host,
@@ -1255,7 +1261,6 @@ fn apply(
                 changed: true,
             })?;
             host.reset_failed(&service.unit);
-            let started = host.now();
             let outcome = wait_unloaded(host, &service.unit)
                 .and_then(|()| host.systemd_run(forward))
                 .and_then(|()| {
@@ -1271,12 +1276,12 @@ fn apply(
                     }
                 })
                 .and_then(|()| {
-                    health(
+                    health_after_stop(
                         host,
                         service,
                         &options.snapshot.agentctl(),
                         &new_environment,
-                        started,
+                        began,
                         timeout,
                     )
                 });
@@ -1331,7 +1336,7 @@ fn apply(
                     timeout,
                 )
             };
-            let started = host.now();
+            let began = host.now();
             let outcome = host
                 .daemon_reload()
                 .and_then(|()| {
@@ -1352,12 +1357,12 @@ fn apply(
                 })
                 .and_then(|()| host.restart(&service.unit))
                 .and_then(|()| {
-                    health(
+                    health_after_stop(
                         host,
                         service,
                         &options.snapshot.agentctl(),
                         &new_environment,
-                        started,
+                        began,
                         timeout,
                     )
                 });
@@ -1441,6 +1446,46 @@ fn wait_unloaded(host: &dyn Host, unit: &str) -> Result<(), String> {
     }
 }
 
+/// Health-check after a stop-and-start, with the soak and the window
+/// counted from the new process start: `began` was taken before the old
+/// process was stopped, and the new process exists now — stopping an
+/// old bridge can spend the unit's whole TimeoutStopSec, and that time
+/// is not the new process's to prove itself in (#795). The report
+/// detail says how long the new process took to start after the stop
+/// began.
+fn health_after_stop(
+    host: &dyn Host,
+    service: &Service,
+    binary: &Path,
+    environment: &[(String, String)],
+    began: SystemTime,
+    timeout: Duration,
+) -> Result<String, String> {
+    let process_started = host.now();
+    let stop_took = process_started.duration_since(began).unwrap_or_default();
+    health(
+        host,
+        service,
+        binary,
+        environment,
+        began,
+        process_started,
+        timeout,
+    )
+    .map(|detail| {
+        format!(
+            "{detail}; the new process started {} s after the stop began",
+            stop_took.as_secs()
+        )
+    })
+    .map_err(|error| {
+        format!(
+            "{error} (stopping the old process took {} s)",
+            stop_took.as_secs()
+        )
+    })
+}
+
 /// Stale check units: ones whose refresh process is gone.
 pub fn reap_check_units(host: &dyn Host) {
     let Ok(units) = host.service_units() else {
@@ -1490,9 +1535,9 @@ fn restore_transient(
     environment: &[(String, String)],
     timeout: Duration,
 ) -> Result<String, String> {
+    let began = host.now();
     let _ = host.stop(&service.unit);
     host.reset_failed(&service.unit);
-    let started = host.now();
     if wait_unloaded(host, &service.unit).is_ok() {
         host.systemd_run(rollback)?;
     } else {
@@ -1515,15 +1560,8 @@ fn restore_transient(
             difference(original, &actual)
         ));
     }
-    health(
-        host,
-        service,
-        &service.binary,
-        environment,
-        started,
-        timeout,
-    )
-    .map_err(|error| format!("restored to the old definition and binary, but {error}"))
+    health_after_stop(host, service, &service.binary, environment, began, timeout)
+        .map_err(|error| format!("restored to the old definition and binary, but {error}"))
 }
 
 fn restore_drop_in(
@@ -1542,18 +1580,11 @@ fn restore_drop_in(
             Err(error) => return Err(format!("{}: {error}", path.display())),
         },
     }
+    let began = host.now();
     host.daemon_reload()?;
-    let started = host.now();
     host.restart(&service.unit)?;
-    health(
-        host,
-        service,
-        &service.binary,
-        environment,
-        started,
-        timeout,
-    )
-    .map_err(|error| format!("restored to the old definition and binary, but {error}"))
+    health_after_stop(host, service, &service.binary, environment, began, timeout)
+        .map_err(|error| format!("restored to the old definition and binary, but {error}"))
 }
 
 fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {

@@ -195,7 +195,10 @@ alone and the run stops, so a problem it already had (a bridge whose target
 agent is gone, say) is never blamed on the new build or rolled back over.
 
 After the change, within `--health-timeout` (default 120 seconds; a watcher
-gets at least its `--pass-budget-seconds` plus 90 seconds), and for at least
+gets at least its `--pass-budget-seconds` plus 90 seconds) — counted from the
+new process's start, so however long stopping the old process took (a bridge
+can spend its whole 90-second stop timeout) is added to the window and said
+in the report — and for at least
 30 seconds, the unit must be active with one main process that runs the new
 binary (compared by canonical path; for a script without `exec`, a child of the
 shell that does); a changed main process means a crash and restart. Then, by
