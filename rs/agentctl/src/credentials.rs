@@ -134,7 +134,6 @@ impl CredentialFile {
 /// A credential file with a problem, as `delivery-alarm.json` lists it. It holds no ages, so the
 /// alarm changes only when a problem starts, changes kind or ends.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct CredentialProblem {
     pub(crate) variable: String,
     /// `missing`, `unreadable`, `expired` or `expiring`.

@@ -10596,6 +10596,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 reject_reaction: ReactionSetting::Inherit,
                 backend_configuration: None,
                 outbound_command: Some(chat_runtime::OutboundCommandConfiguration {
+                    unknown: Default::default(),
                     executable: "/definitely/missing/helper".into(),
                     arguments: Vec::new(),
                     environment: Vec::new(),
@@ -10671,6 +10672,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 reject_reaction: ReactionSetting::Inherit,
                 backend_configuration: None,
                 outbound_command: Some(chat_runtime::OutboundCommandConfiguration {
+                    unknown: Default::default(),
                     executable: helper,
                     arguments: vec!["-c".to_owned(), script],
                     environment: Vec::new(),
@@ -10738,6 +10740,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 reject_reaction: ReactionSetting::Inherit,
                 backend_configuration: None,
                 outbound_command: Some(chat_runtime::OutboundCommandConfiguration {
+                    unknown: Default::default(),
                     executable: "/definitely/missing/helper".into(),
                     arguments: Vec::new(),
                     environment: Vec::new(),
@@ -10837,6 +10840,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 reject_reaction: ReactionSetting::Inherit,
                 backend_configuration: None,
                 outbound_command: Some(chat_runtime::OutboundCommandConfiguration {
+                    unknown: Default::default(),
                     executable: helper,
                     arguments: vec!["-c".to_owned(), script],
                     environment: Vec::new(),
@@ -13061,6 +13065,7 @@ esac
             reject_reaction: ReactionSetting::Inherit,
             backend_configuration: None,
             outbound_command: Some(chat_runtime::OutboundCommandConfiguration {
+                unknown: Default::default(),
                 executable: "/fixture/outbound-helper".into(),
                 arguments: Vec::new(),
                 environment: Vec::new(),
@@ -13494,6 +13499,7 @@ esac
             fixture,
             true,
             Some(chat_runtime::OutboundCommandConfiguration {
+                unknown: Default::default(),
                 executable: helper,
                 arguments: vec!["-c".to_owned(), "exit 3".to_owned()],
                 environment: Vec::new(),

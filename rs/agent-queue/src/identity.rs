@@ -31,8 +31,11 @@ const MAX_ANCESTRY: usize = 4096;
 /// Across separate invocations, Linux exposes no persistent handle in this schema;
 /// reuse of the same PID by the same executable within one scheduler tick remains a
 /// theoretical ambiguity. The identity never independently authorizes a signal to the PID.
+///
+/// A key a newer version added is ignored, not kept: an identity is compared for equality with
+/// one observed afresh, which would never match a kept key, so this build compares the fields it
+/// knows.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct ProcessIdentity {
     /// Identity schema version.
     pub version: u32,

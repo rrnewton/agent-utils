@@ -116,7 +116,6 @@ impl Kind {
 
 /// The bridge's own identity at the provider, as the configuration names it.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Sender {
     /// The provider's id of the account the bridge posts as.
     #[serde(default)]
@@ -127,6 +126,10 @@ pub struct Sender {
     /// Whether that account is a bot.
     #[serde(default = "yes")]
     pub bot: bool,
+    /// Keys a newer agentctl added, kept when this record is written back (#809
+    /// chat-bridge-json-forward-compat).
+    #[serde(flatten)]
+    pub unknown: crate::forward_compat::KeptKeys,
 }
 
 fn yes() -> bool {
@@ -135,7 +138,6 @@ fn yes() -> bool {
 
 /// How a sink is reached with `curl`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Curl {
     /// The `curl` executable; `curl` on `PATH` when absent.
     #[serde(default)]
@@ -143,11 +145,14 @@ pub struct Curl {
     /// Extra arguments, before the ones the worker gives.
     #[serde(default)]
     pub arguments: Vec<String>,
+    /// Keys a newer agentctl added, kept when this record is written back (#809
+    /// chat-bridge-json-forward-compat).
+    #[serde(flatten)]
+    pub unknown: crate::forward_compat::KeptKeys,
 }
 
 /// One configured sink.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct SinkConfig {
     /// Lowercase letters, digits and hyphens: the name of its directory.
     pub name: String,
@@ -166,6 +171,10 @@ pub struct SinkConfig {
     /// How it is reached.
     #[serde(default)]
     pub curl: Curl,
+    /// Keys a newer agentctl added, kept when this record is written back (#809
+    /// chat-bridge-json-forward-compat).
+    #[serde(flatten)]
+    pub unknown: crate::forward_compat::KeptKeys,
 }
 
 fn default_max_queued() -> usize {
@@ -178,7 +187,6 @@ fn default_max_age_seconds() -> u64 {
 
 /// `event-sinks.json`.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct SinksFile {
     /// Always 1.
     pub version: u32,
@@ -188,6 +196,10 @@ pub struct SinksFile {
     /// The sinks.
     #[serde(default)]
     pub sinks: Vec<SinkConfig>,
+    /// Keys a newer agentctl added, kept when this record is written back (#809
+    /// chat-bridge-json-forward-compat).
+    #[serde(flatten)]
+    pub unknown: crate::forward_compat::KeptKeys,
 }
 
 impl SinksFile {
@@ -720,7 +732,12 @@ fn read_config(path: &Path) -> Result<Option<SinksFile>, String> {
         return Err(format!("it is larger than {MAX_CONFIG_BYTES} bytes"));
     }
     let bytes = fs::read(path).map_err(|error| error.to_string())?;
-    let config: SinksFile = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    let document: Value = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    // A key a newer agentctl added is named once and ignored (#809
+    // chat-bridge-json-forward-compat).
+    let (config, unknown): (SinksFile, _) =
+        crate::forward_compat::decode_kept(&document).map_err(|error| error.to_string())?;
+    crate::forward_compat::warn_unknown(path, &unknown);
     config.validate()?;
     Ok(Some(config))
 }
@@ -961,6 +978,31 @@ mod tests {
             EventSink::load(&dir, "coordinator").is_none(),
             "a token outside the state directory"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #809 chat-bridge-json-forward-compat: a key a newer agentctl added, at the top, in a sink
+    /// or in its curl settings, is read around and named.
+    #[test]
+    fn keys_a_newer_agentctl_added_to_the_sinks_file_are_read_around() {
+        let dir = temp_dir("newer-sinks");
+        let path = dir.join(SINKS_FILE);
+        write_private(&dir.join("sink.token"), "secret-token-1\n");
+        write_private(
+            &path,
+            r#"{"version": 1, "future": 1, "sinks": [
+                {"name": "reader", "url": "https://reader.example/", "token_file": "sink.token",
+                 "kinds": ["message.posted"], "later": true, "curl": {"newer": "x"}}]}"#,
+        );
+        let document: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read")).expect("JSON");
+        let (config, mut unknown): (SinksFile, _) =
+            crate::forward_compat::decode_kept(&document).expect("read around");
+        unknown.sort();
+        assert_eq!(unknown, ["future", "later", "newer"]);
+        assert_eq!(config.sinks.len(), 1);
+        assert!(read_config(&path).expect("loads").is_some());
+        assert!(EventSink::load(&dir, "coordinator").is_some());
         let _ = fs::remove_dir_all(&dir);
     }
 

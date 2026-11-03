@@ -146,6 +146,22 @@ _REQUEST_RECORD_FIELDS = frozenset({
 })
 
 
+_warned_unknown_keys: set[str] = set()
+
+
+def _warn_unknown_keys(label: str, keys: Iterable[str]) -> None:
+    """Print, once per process for each kind of record and set of keys, that a record holds keys
+    this edition does not know and reads around (#809 chat-bridge-json-forward-compat)."""
+    warning = (
+        f"agentctl: warning: a {label} has key(s) this agentctl does not know: "
+        f"{', '.join(json.dumps(key) for key in sorted(keys))}; reading around them "
+        "(a newer agentctl may use them)"
+    )
+    if warning not in _warned_unknown_keys:
+        _warned_unknown_keys.add(warning)
+        print(warning, file=sys.stderr)
+
+
 @dataclass(frozen=True)
 class _OutputSubscription:
     """Immutable owner-validated cache snapshot, never a public bypass flag."""
@@ -690,8 +706,12 @@ class Config:
     def parse(cls, document: dict[str, object]) -> Config:
         """Validate explicit sender, target, and transport configuration."""
         encoded_json(document, CONFIG)
-        if set(document) - set(cls.__dataclass_fields__):
-            raise ValueError("unknown chat configuration field")
+        # A field a newer agentctl added is named once and ignored (#809
+        # chat-bridge-json-forward-compat); the target's identity assertions stay strict.
+        unknown = set(document) - set(cls.__dataclass_fields__)
+        if unknown:
+            _warn_unknown_keys("chat configuration", unknown)
+            document = {key: value for key, value in document.items() if key not in unknown}
         space = get_str(document, "space", "chat config")
         if (len(space.encode("utf-8")) > _MAX_RESOURCE_BYTES
                 or re.fullmatch(r"spaces/[A-Za-z0-9_-]+", space) is None):

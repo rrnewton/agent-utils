@@ -595,11 +595,14 @@ fn repr(value: Option<&str>) -> String {
 
 /// One earlier name of a renamed agent, oldest first in [`AgentRecord::name_history`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct NameHistoryEntry {
     name: String,
     renamed_at: f64,
     journal_id: String,
+    /// Keys a newer agentctl added, kept when this record is written back (#809
+    /// chat-bridge-json-forward-compat).
+    #[serde(flatten)]
+    unknown: crate::forward_compat::KeptKeys,
 }
 
 /// Validate a record's earlier names: each a valid name with a time and a unique journal id.
@@ -1706,17 +1709,21 @@ impl ManagedApi for HerdrClient {
 
 /// Recovery provenance, separate from the observed live-routing identity.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct NativeSession {
     schema: String,
     agent: String,
     value: String,
     source: String,
+    /// Keys a newer agentctl added, kept when this record is written back (#809
+    /// chat-bridge-json-forward-compat).
+    #[serde(flatten)]
+    unknown: crate::forward_compat::KeptKeys,
 }
 
 impl NativeSession {
     fn new(agent: &str, value: &str, source: &str) -> Self {
         Self {
+            unknown: Default::default(),
             schema: "agentctl-native-session/v1".to_owned(),
             agent: agent.to_owned(),
             value: value.to_owned(),
@@ -7754,6 +7761,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                     }
                 }
                 record.name_history.push(NameHistoryEntry {
+                    unknown: Default::default(),
                     name: old.to_owned(),
                     renamed_at: journal.started_at,
                     journal_id: journal.journal_id.clone(),

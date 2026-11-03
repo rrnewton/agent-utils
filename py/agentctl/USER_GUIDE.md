@@ -395,11 +395,13 @@ slot directory) still uses the project's profiles. The file is deliberately
 project-local and untracked. `agentctl`
 requires `.agentctl/` to match a Git ignore rule, requires the directory and
 file to be owned by the current user with no group or other permissions, and
-refuses symlinks, hard links, unknown fields inside a profile, malformed text,
-NUL, and credential-shaped environment or argument names. An unknown top-level
-key is not refused: `agentctl` prints one warning naming it and ignores it, so a
-key added by a newer `agentctl` never stops an older one that reads the same
-file.
+refuses symlinks, hard links, malformed text, NUL, and credential-shaped
+environment or argument names. A key it does not know is not refused, at the top,
+inside a profile or inside its `agentcloud` settings: `agentctl` prints one
+warning naming each such key by its path (`profiles.worker.surprise`) and
+ignores it, so a key added by a newer `agentctl` never stops an older one that
+reads the same file. Check that warning after editing the file: a misspelt key
+is reported there, not refused.
 
 ```json
 {
@@ -1045,9 +1047,9 @@ The report is `REPORT_DIR/BOOT_ID.json` (default
 with no refusal, 75 otherwise. `--boot` marks the report as the boot unit's run.
 
 The configuration is `REGISTRY/restore.json`; every key is optional except the
-schema. An unknown top-level key is warned about and ignored, so a key added by
-a newer `agentctl` does not stop an older one; unknown keys inside an
-`also_registered` or `timers` entry are refused:
+schema. A key it does not know, at the top or inside an `also_registered`,
+`scheduled` or `timers` entry, is named by its path in a warning and ignored, so a key added by
+a newer `agentctl` does not stop an older one:
 
 ```json
 {

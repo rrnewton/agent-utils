@@ -285,7 +285,8 @@ def test_project_configuration_accepts_the_shared_term_backend_key(tmp_path: Pat
 def test_project_configuration_ignores_unknown_top_level_keys_with_one_warning(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
 ) -> None:
-    # A key a newer agentctl adds must not break this one; a misspelled profile key still does.
+    # A key a newer agentctl adds must not break this one, at the top or inside a profile (#809
+    # chat-bridge-json-forward-compat); each is named, by its path, in one warning.
     import agentctl.profiles as profiles_module
     monkeypatch.setattr(profiles_module, "_warned_unknown_keys", False)
     _write_project_configuration(tmp_path, "project-agents")
@@ -298,14 +299,19 @@ def test_project_configuration_ignores_unknown_top_level_keys_with_one_warning(
     assert load_configuration(tmp_path)[2] == "project-agents"
     load_configuration(tmp_path)
     assert capsys.readouterr().err == (
-        f"agentctl: warning: profile config {path} has top-level key(s) this agentctl does not "
+        f"agentctl: warning: profile config {path} has key(s) this agentctl does not "
         "know: a_future, zz_future; ignoring them (a newer agentctl may use them)\n"
     )
+    monkeypatch.setattr(profiles_module, "_warned_unknown_keys", False)
     document["profiles"] = {"worker": {"harness": "codex", "mode": "interactive", "surprise": 1}}
     path.write_text(json.dumps(document), encoding="utf-8")
     path.chmod(0o600)
-    with pytest.raises(AgentDeliveryError):
-        load_configuration(tmp_path)
+    assert "worker" in load_configuration(tmp_path)[1]
+    assert capsys.readouterr().err == (
+        f"agentctl: warning: profile config {path} has key(s) this agentctl does not "
+        "know: a_future, profiles.worker.surprise, zz_future; ignoring them (a newer agentctl may "
+        "use them)\n"
+    )
 
 
 @pytest.mark.parametrize(
@@ -687,7 +693,6 @@ def test_python_refuses_attach_self_and_names_the_rust_edition(
     ({"agentcloud": {"provision": True, "node_id": "node-a"}}, "choose one"),
     ({"agentcloud": {"workspace": "relative"}}, "absolute path"),
     ({"agentcloud": {"harness": "claude"}}, "claude-code"),
-    ({"agentcloud": {"provison": True}}, "unknown fields"),
     ({"agentcloud": {"provision": "yes"}}, "true or false"),
     ({"agentcloud": {"title": "{nme}"}}, "unknown placeholder"),
     ({"agentcloud": {"title": "open {name"}}, "unknown placeholder"),

@@ -51,22 +51,28 @@ fn fail(message: impl Into<String>) -> AgentError {
 
 /// Another registry that names the coordinator, such as a chat bridge's.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub struct AlsoRegistered {
     /// The other agent registry directory.
     pub registry: PathBuf,
     /// The coordinator's name in that registry.
     pub name: String,
+    /// Keys a newer agentctl added, kept when this record is written back (#809
+    /// chat-bridge-json-forward-compat).
+    #[serde(flatten)]
+    pub unknown: crate::forward_compat::KeptKeys,
 }
 
 /// A timer the watch keeps firing.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub struct TimerWatch {
     /// The user timer unit, for example `health-tick.timer`.
     pub unit: String,
     /// Alarm when the timer last fired longer ago than this many seconds.
     pub max_age_seconds: u64,
+    /// Keys a newer agentctl added, kept when this record is written back (#809
+    /// chat-bridge-json-forward-compat).
+    #[serde(flatten)]
+    pub unknown: crate::forward_compat::KeptKeys,
 }
 
 /// One scheduled command from the team spec (#743): `agentctl install-units
@@ -74,7 +80,6 @@ pub struct TimerWatch {
 /// `.timer` user unit pair, so a team's periodic job survives a reboot instead of
 /// living in a `systemd-run` transient.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub struct ScheduledUnit {
     /// Slug naming the unit pair (lowercase letters, digits, hyphens).
     pub name: String,
@@ -82,6 +87,10 @@ pub struct ScheduledUnit {
     pub on_calendar: String,
     /// The command the timer runs, as an argv whose first element is absolute.
     pub command: Vec<String>,
+    /// Keys a newer agentctl added, kept when this record is written back (#809
+    /// chat-bridge-json-forward-compat).
+    #[serde(flatten)]
+    pub unknown: crate::forward_compat::KeptKeys,
 }
 
 /// Whether `value` is a calendar schedule systemd can take literally: one line of
@@ -177,15 +186,52 @@ impl RestoreConfig {
         };
         let config: Self = serde_json::from_str(&text)
             .map_err(|error| fail(format!("invalid {}: {error}", path.display())))?;
-        if let Some(names) = config.unknown.names() {
+        let unknown = config.unknown_paths();
+        if !unknown.is_empty() {
             eprintln!(
-                "agentctl: warning: {} has top-level key(s) this agentctl does not know: \
-                 {names}; ignoring them (a newer agentctl may use them)",
-                path.display()
+                "agentctl: warning: {} has key(s) this agentctl does not know: {}; ignoring \
+                 them (a newer agentctl may use them)",
+                path.display(),
+                unknown.join(", ")
             );
         }
         config.validate(&path)?;
         Ok(config)
+    }
+
+    /// The dotted paths of the keys this build does not know, at the top and inside each of
+    /// `also_registered`, `scheduled` and `timers` (#809 chat-bridge-json-forward-compat), sorted.
+    fn unknown_paths(&self) -> Vec<String> {
+        let mut paths: Vec<String> = self.unknown.keys().cloned().collect();
+        for (index, entry) in self.also_registered.iter().enumerate() {
+            paths.extend(
+                entry
+                    .unknown
+                    .0
+                    .keys()
+                    .map(|key| format!("also_registered[{index}].{key}")),
+            );
+        }
+        for (index, entry) in self.scheduled.iter().enumerate() {
+            paths.extend(
+                entry
+                    .unknown
+                    .0
+                    .keys()
+                    .map(|key| format!("scheduled[{index}].{key}")),
+            );
+        }
+        for (index, timer) in self.timers.iter().enumerate() {
+            paths.extend(
+                timer
+                    .unknown
+                    .0
+                    .keys()
+                    .map(|key| format!("timers[{index}].{key}")),
+            );
+        }
+        paths.sort();
+        paths
     }
 
     /// Take the registry's designated coordinator (`agentctl coordinator set`) when
@@ -2506,7 +2552,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_top_level_keys_are_ignored_but_duplicates_and_nested_keys_are_refused() {
+    fn unknown_keys_are_ignored_at_every_level_but_duplicates_are_refused() {
         let directory =
             std::env::temp_dir().join(format!("restore-unknown-{}", std::process::id()));
         fs::create_dir_all(&directory).unwrap();
@@ -2520,9 +2566,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.units, ["bridge.service"]);
-        assert_eq!(config.unknown.names().unwrap(), "a_future, zz_future");
+        assert_eq!(config.unknown_paths(), ["a_future", "zz_future"]);
+        // A key a newer agentctl added inside a timer is read around too (#809
+        // chat-bridge-json-forward-compat), and named by its path.
+        let config = load(
+            r#"{"schema": "agentctl-restore/v1", "timers": [{"unit": "t.timer", "max_age_seconds": 60, "surprise": 1}], "z": 1}"#,
+        )
+        .unwrap();
+        assert_eq!(config.unknown_paths(), ["timers[0].surprise", "z"]);
         for refused in [
-            r#"{"schema": "agentctl-restore/v1", "timers": [{"unit": "t.timer", "max_age_seconds": 60, "surprise": 1}]}"#,
             r#"{"schema": "agentctl-restore/v1", "units": ["a.service"], "units": ["b.service"]}"#,
             r#"{"schema": "agentctl-restore/v1", "also_registered": [{"registry": "/r", "name": "a", "name": "b"}]}"#,
             r#"{"schema": "agentctl-restore/v1", "x": 1, "x": 2}"#,
@@ -2530,7 +2582,7 @@ mod tests {
             assert!(load(refused).is_err(), "{refused}");
         }
         let error = load(
-            "{\"schema\": \"agentctl-restore/v1\",\n \"timers\": [{\"unit\": \"t.timer\", \"max_age_seconds\": 60, \"surprise\": 1}]}",
+            "{\"schema\": \"agentctl-restore/v1\",\n \"timers\": [{\"unit\": \"t.timer\", \"max_age_seconds\": \"sixty\"}]}",
         )
         .unwrap_err()
         .to_string();
@@ -2564,11 +2616,16 @@ mod tests {
             r##"{"schema": "agentctl-restore/v1", "scheduled": [{"name": "a", "on_calendar": "daily", "command": ["true"]}]}"##,
             r##"{"schema": "agentctl-restore/v1", "scheduled": [{"name": "a", "on_calendar": "daily", "command": []}]}"##,
             r##"{"schema": "agentctl-restore/v1", "scheduled": [{"name": "Bad Name", "on_calendar": "daily", "command": ["/bin/true"]}]}"##,
-            // Unknown keys inside an entry stay strict.
-            r##"{"schema": "agentctl-restore/v1", "scheduled": [{"name": "a", "on_calendar": "daily", "command": ["/bin/true"], "surprise": 1}]}"##,
         ] {
             assert!(load(refused).is_err(), "{refused}");
         }
+        // A key a newer agentctl added inside an entry is read around and named, as in the rest
+        // of the file (#809 chat-bridge-json-forward-compat).
+        let config = load(
+            r##"{"schema": "agentctl-restore/v1", "scheduled": [{"name": "a", "on_calendar": "daily", "command": ["/bin/true"], "surprise": 1}]}"##,
+        )
+        .unwrap();
+        assert_eq!(config.unknown_paths(), ["scheduled[0].surprise"]);
         fs::remove_dir_all(&directory).unwrap();
     }
 }

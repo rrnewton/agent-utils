@@ -28,7 +28,6 @@ pub(crate) type ValidateTarget<'a> =
 
 /// One request to point the bridge at another agent, as `chat repoint` records it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct RepointRequest {
     /// Increases by one with each request; an outcome names the request it settled.
     pub generation: u64,
@@ -48,7 +47,6 @@ pub struct RepointRequest {
 /// One request whose prompt may already have reached the previous agent, so it is not typed into
 /// the new one: an operator settles it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct UncertainRequest {
     /// The request key.
     pub key: String,
@@ -58,7 +56,6 @@ pub struct UncertainRequest {
 
 /// What applying one [`RepointRequest`] did.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct RepointOutcome {
     /// The generation of the request this settled.
     pub generation: u64,
@@ -156,7 +153,6 @@ impl RepointOutcome {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct TargetDocument {
     version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]

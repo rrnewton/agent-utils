@@ -1291,3 +1291,20 @@ def test_the_caller_is_the_agent_whose_pinned_harness_is_its_nearest_ancestor(
     assert manager.caller_agent() == "outer"
     monkeypatch.setattr(sh, "boot_id", lambda: "11111111-1111-1111-1111-111111111111")
     assert manager.caller_agent() is None
+
+
+def test_nested_keys_a_newer_agentctl_added_survive_a_rewrite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #809 chat-bridge-json-forward-compat: a key inside a name history entry is kept, as the
+    # Rust edition keeps it.
+    manager, _fake, _pane = _started(tmp_path, monkeypatch, "worker")
+    record_path = manager._directory("worker") / "agent.json"
+    document = json.loads(record_path.read_text(encoding="utf-8"))
+    document["name_history"] = [{"name": "older", "renamed_at": 1.0,
+                                 "journal_id": "0123456789abcdef0123456789abcdef",
+                                 "future": {"on": True}}]
+    record_path.write_text(json.dumps(document), encoding="utf-8")
+    manager._save(manager.get("worker"))
+    rewritten = json.loads(record_path.read_text(encoding="utf-8"))
+    assert rewritten["name_history"][0]["future"] == {"on": True}

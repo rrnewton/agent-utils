@@ -382,6 +382,26 @@ def test_config_builds_cached_constant_time_sender_index() -> None:
     assert config.allowed_sender_set is first
 
 
+def test_config_reads_around_a_field_a_newer_agentctl_added(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # #809 chat-bridge-json-forward-compat: named once and ignored; a target identity assertion
+    # this edition does not know is still refused, since ignoring it would widen the target.
+    chat_module._warned_unknown_keys.clear()
+    assert Config.parse(_config(future_setting={"on": True})) == Config.parse(_config())
+    Config.parse(_config(future_setting=1))
+    assert capsys.readouterr().err == (
+        'agentctl: warning: a chat configuration has key(s) this agentctl does not know: '
+        '"future_setting"; reading around them (a newer agentctl may use them)\n'
+    )
+    target = {
+        "pane_id": "w1:p1", "expected_agent": "codex", "expected_workspace": "workspace",
+        "expected_cwd": "/work/project", "expected_newer": "x",
+    }
+    with pytest.raises(ValueError, match="unknown target identity assertion"):
+        Config.parse(_config(target=target))
+
+
 def test_malformed_disallowed_message_cannot_advance_cursor(tmp_path: Path) -> None:
     rig = Rig(tmp_path / "state")
     try:

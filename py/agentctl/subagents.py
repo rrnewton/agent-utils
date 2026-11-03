@@ -176,7 +176,8 @@ def _name_history(value: object, path: Path) -> list[dict[str, object]]:
     history: list[dict[str, object]] = []
     journals: set[str] = set()
     for entry in value:
-        if not isinstance(entry, dict) or set(entry) != {"name", "renamed_at", "journal_id"}:
+        # A key a newer agentctl added is kept (#809 chat-bridge-json-forward-compat).
+        if not isinstance(entry, dict) or not {"name", "renamed_at", "journal_id"} <= set(entry):
             raise AgentDeliveryError(f"invalid name history in {path}")
         name, renamed_at, journal_id = entry["name"], entry["renamed_at"], entry["journal_id"]
         if (not isinstance(name, str) or not _NAME.fullmatch(name)
@@ -186,7 +187,7 @@ def _name_history(value: object, path: Path) -> list[dict[str, object]]:
                 or journal_id in journals):
             raise AgentDeliveryError(f"invalid name history in {path}")
         journals.add(journal_id)
-        history.append({"name": name, "renamed_at": renamed_at, "journal_id": journal_id})
+        history.append(dict(entry))
     return history
 
 
@@ -607,11 +608,13 @@ class AgentRecord:
             raw_identity = document.get(key)
             if raw_identity is None:
                 return None
+            # A key a newer agentctl added is ignored: an identity is compared with one observed
+            # afresh (#809 chat-bridge-json-forward-compat).
             if (not isinstance(raw_identity, dict)
-                    or set(raw_identity) != {
+                    or not {
                         "version", "boot_id", "pid", "starttime_ticks",
                         "executable_device", "executable_inode",
-                    }):
+                    } <= set(raw_identity)):
                 raise AgentDeliveryError(f"invalid {key.replace('_', ' ')} in {path}")
             identity = cast(dict[str, object], raw_identity)
             integers = [
@@ -683,7 +686,7 @@ class AgentRecord:
         fields["environment_names"] = list(names)
         native = document.get("native_session")
         if native is not None:
-            if (not isinstance(native, dict) or set(native) != {"schema", "agent", "value", "source"}
+            if (not isinstance(native, dict) or not {"schema", "agent", "value", "source"} <= set(native)
                     or native.get("schema") != "agentctl-native-session/v1"
                     or native.get("agent") != document["harness"]
                     or native.get("source") not in ("observed", "asserted")

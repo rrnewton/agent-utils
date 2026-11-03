@@ -52,13 +52,24 @@ A top-level key this agentctl does not know (one a newer agentctl reads) is
 named in a warning and otherwise ignored, so a configuration written for a newer
 build still starts an older one; `chat init` does not store it, because its
 value was never checked. The required keys (`subscription_plugin`,
-`channel_ids`, `allowed_senders`, `agent_name`, `agent_label`) stay required,
-and unknown keys inside `outbound_command` and `reply_alias_range` are refused.
-A key beside `backend_configuration`'s `schema` and `data` is treated like an
-unknown top-level key; the keys inside `data` are the plugin's to judge.
-The saved `bridge.json` follows the same rule at its top level and in its
-`config`: a key a newer build saved there is ignored with a warning and kept
-when an older build rewrites the file (`grant-limit`, `repoint`).
+`channel_ids`, `allowed_senders`, `agent_name`, `agent_label`) stay required.
+A key beside `backend_configuration`'s `schema` and `data`, or inside
+`outbound_command`, `labels`, `reply_alias_range` or a `relay_channels` entry,
+is treated like an unknown top-level key and named by its path; the keys inside
+`data` are the plugin's to judge. The saved `bridge.json` follows the same rule
+at every level: a key a newer build saved there is ignored with a warning and
+kept when an older build rewrites the file (`grant-limit`, `repoint`), except
+inside `reply_alias_range`, where it is dropped.
+
+The other files in the state directory follow it too, so a rollback to an older
+build reads a state a newer one wrote: a key it does not know in a request,
+reply, checkpoint, alarm or other record is named once per file in a warning
+and read around. A request or reply record keeps the key when the older build
+rewrites it; the other records drop it at their next write. Two records stay
+strict: a sender grant, because an older build that ignored a newer key
+narrowing a grant would grant more than meant, and the provider part of
+`delivery-alarm-sources.json`, where a key it cannot read makes the saved value
+untrusted, so the provider record is read again rather than reported clear.
 
 The subscription plugin is discovered below `$AGENTCTL_HOME/plugins` (default
 `~/.agentctl/plugins`) using its private manifest. A manifest key this agentctl
@@ -368,7 +379,9 @@ confirms it.
 
 Configure sinks in `event-sinks.json` in the bridge's state directory, mode
 0600. It chooses the executable that delivers records, so a file that another
-user owns, or that others can write, is refused and no sinks run. If the file is absent, no sinks run. When a bridge is re-initialised after its state was moved aside, pass
+user owns, or that others can write, is refused and no sinks run. A key this
+agentctl does not know, at the top, in a sink or in its `curl` settings, is named
+once in a warning and ignored. If the file is absent, no sinks run. When a bridge is re-initialised after its state was moved aside, pass
 `chat init --from OLD-DIR`: the old state's `event-sinks.json` and each sink's
 token file are copied into the new state (never replacing a configuration it
 already has), and the init report lists what was copied and any missing token.

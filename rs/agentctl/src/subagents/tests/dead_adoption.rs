@@ -429,6 +429,7 @@ fn dead_adoption_retirement_refuses_a_valid_cloud_record_before_any_control_call
     record.session_value = Some(session.to_owned());
     record.native_session = Some(NativeSession::new("agentcloud", session, "observed"));
     record.agentcloud = Some(cloud::CloudRecord {
+        unknown: Default::default(),
         launch: cloud::CloudLaunch::default(),
         agentterm: tool.display().to_string(),
         endpoint: Some("wss://example.invalid/ws".to_owned()),

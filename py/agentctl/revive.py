@@ -59,7 +59,8 @@ def journals(manager: ManagedAgents) -> list[dict[str, object]]:
         with manager._pinned_parent_directory(directory, label="revive journal directory") as parent:
             pinned = _PinnedAgentDirectory("revive", directory, parent.descriptor, parent.device, parent.inode)
             value = json.loads(manager._record_bytes(pinned, file_name=path.name))
-        if not isinstance(value, dict) or set(value) != _JOURNAL_KEYS:
+        # A key a newer agentctl added is kept and ignored (#809 chat-bridge-json-forward-compat).
+        if not isinstance(value, dict) or not _JOURNAL_KEYS <= set(value):
             raise AgentDeliveryError("invalid revive journal")
         journal = cast(dict[str, object], value)
         name, old, new, started, proof = (journal[key] for key in ("name", "old_token", "new_token", "started_at", "proof"))
@@ -82,7 +83,7 @@ def journals(manager: ManagedAgents) -> list[dict[str, object]]:
                     not isinstance(journal["ready_record_sha256"], str)
                     or not _SHA256.fullmatch(journal["ready_record_sha256"])))
                 or (journal["phase"] != "launching" and journal["ready_record_sha256"] is None)
-                or not isinstance(proof, dict) or set(proof) != _PROOF_KEYS):
+                or not isinstance(proof, dict) or not _PROOF_KEYS <= set(proof)):
             raise AgentDeliveryError("invalid revive journal")
         _validate_proof(cast(dict[str, object], proof))
         found.append(journal)
@@ -107,7 +108,7 @@ def _validate_proof(proof: dict[str, object]) -> None:
             raise AgentDeliveryError("invalid missing revive presentation proof")
     else:
         shell = proof["shell"]
-        if not isinstance(shell, dict) or set(shell) != {"version", "boot_id", "pid", "starttime_ticks", "executable_device", "executable_inode"}:
+        if not isinstance(shell, dict) or not {"version", "boot_id", "pid", "starttime_ticks", "executable_device", "executable_inode"} <= set(shell):
             raise AgentDeliveryError("invalid revive shell proof")
         # The record decoder is the shared strict identity validator.
         identity = AgentRecord._from_value({

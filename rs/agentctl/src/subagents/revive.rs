@@ -184,7 +184,6 @@ fn checkpoint(_point: &str) -> Result<()> {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Proof {
     kind: String,
     pane_id: String,
@@ -197,6 +196,10 @@ struct Proof {
     reported_session_value: Option<String>,
     shell: Option<CustomProcessIdentity>,
     shell_executable: Option<String>,
+    /// Keys a newer agentctl added, kept when this record is written back (#809
+    /// chat-bridge-json-forward-compat).
+    #[serde(flatten)]
+    unknown: crate::forward_compat::KeptKeys,
 }
 
 /// Authority to exclude exactly one dead presentation from this recovery's session census.
@@ -366,7 +369,6 @@ impl Proof {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Journal {
     #[serde(skip)]
     expected_bytes: Vec<u8>,
@@ -384,6 +386,10 @@ struct Journal {
     stopped_record_sha256: String,
     ready_record_sha256: Option<String>,
     proof: Proof,
+    /// Keys a newer agentctl added, kept when this record is written back (#809
+    /// chat-bridge-json-forward-compat).
+    #[serde(flatten)]
+    unknown: crate::forward_compat::KeptKeys,
 }
 
 pub(super) fn token(value: &str) -> bool {
@@ -1403,6 +1409,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                                 ));
                             }
                             Ok(Some(Proof {
+                                unknown: Default::default(),
                                 kind: "missing".to_owned(),
                                 pane_id: pane.to_owned(),
                                 tab_id: tab.to_owned(),
@@ -1486,6 +1493,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             return Err(fail(format!("owned pane is also registered as {owner:?}")));
         }
         let proof = Proof {
+            unknown: Default::default(),
             kind: "idle_shell".to_owned(),
             pane_id: pane.to_owned(),
             tab_id: tab.to_owned(),
@@ -2165,6 +2173,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         self.save(&candidate)?;
         checkpoint("candidate-prepared")?;
         let mut journal = Journal {
+            unknown: Default::default(),
             expected_bytes: Vec::new(),
             schema: SCHEMA.to_owned(),
             name: agent_name.to_owned(),

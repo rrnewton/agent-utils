@@ -310,9 +310,6 @@ def _agentcloud_settings(name: str, raw: object) -> dict[str, object]:
         raw = {}
     if not isinstance(raw, dict):
         raise AgentDeliveryError(f"{label} agentcloud must be an object")
-    unknown = sorted(set(raw) - _CLOUD_FIELDS)
-    if unknown:
-        raise AgentDeliveryError(f"{label} agentcloud has unknown fields: {', '.join(unknown)}")
     driver = raw.get("harness")
     if driver is not None and driver not in _CLOUD_DRIVERS:
         raise AgentDeliveryError(
@@ -375,10 +372,6 @@ def _profile(name: str, raw: object) -> LaunchProfile:
         raise AgentDeliveryError(f"invalid profile name {name!r}; use lowercase letters, digits, and hyphens")
     if not isinstance(raw, dict):
         raise AgentDeliveryError(f"profile {name!r} must be an object")
-    allowed = {"harness", "mode", "model", "reasoning_effort", "argv", "env", "agentcloud", "record_edges"}
-    unknown = sorted(set(raw) - allowed)
-    if unknown:
-        raise AgentDeliveryError(f"profile {name!r} has unknown fields: {', '.join(unknown)}")
     # Only the Rust edition records control edges; this edition accepts the switch and records none.
     if "record_edges" in raw and not isinstance(raw["record_edges"], bool):
         raise AgentDeliveryError(f"profile {name!r} record_edges must be true or false")
@@ -606,15 +599,32 @@ def _launch_env(value: object) -> LaunchEnv | None:
 # Unknown top-level keys are warned about once and ignored rather than refused, so a key a newer
 # agentctl adds never breaks an older one reading the same file. Keys inside a profile stay strict.
 _KNOWN_TOP_LEVEL_KEYS = frozenset({"schema", "profiles", "workspace", "wrkslots", "term_backend", "launch_env"})
+_PROFILE_FIELDS = frozenset({
+    "harness", "mode", "model", "reasoning_effort", "argv", "env", "agentcloud", "record_edges",
+})
+
+
+def _unknown_key_paths(raw: dict[str, object]) -> set[str]:
+    """Name, by dotted path, each key a newer agentctl may have added (#809
+    chat-bridge-json-forward-compat): at the top, in a profile, or in its agentcloud settings."""
+    paths = set(raw) - _KNOWN_TOP_LEVEL_KEYS
+    for name, profile in cast(dict[str, object], raw["profiles"]).items():
+        if not isinstance(profile, dict):
+            continue
+        paths |= {f"profiles.{name}.{key}" for key in set(profile) - _PROFILE_FIELDS}
+        cloud = profile.get("agentcloud")
+        if isinstance(cloud, dict):
+            paths |= {f"profiles.{name}.agentcloud.{key}" for key in set(cloud) - _CLOUD_FIELDS}
+    return paths
 _warned_unknown_keys = False
 
 
 def unknown_keys_warning(path: Path, unknown: set[str]) -> str | None:
-    """Return the one-line warning for top-level keys this edition does not know, if any."""
+    """Return the one-line warning for keys this edition does not know, if any."""
     if not unknown:
         return None
     return (
-        f"agentctl: warning: profile config {path} has top-level key(s) this agentctl does not know: "
+        f"agentctl: warning: profile config {path} has key(s) this agentctl does not know: "
         f"{', '.join(sorted(unknown))}; ignoring them (a newer agentctl may use them)"
     )
 
@@ -667,7 +677,7 @@ def load_configuration(
     _launch_env(raw.get("launch_env"))
     workspace = _workspace(raw.get("workspace"))
     # Only a file that loads is warned about, so a refusal reads the same in both editions.
-    warning = unknown_keys_warning(path, set(raw) - _KNOWN_TOP_LEVEL_KEYS)
+    warning = unknown_keys_warning(path, _unknown_key_paths(raw))
     global _warned_unknown_keys
     if warning is not None and not _warned_unknown_keys:
         _warned_unknown_keys = True

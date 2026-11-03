@@ -585,6 +585,27 @@ fn old_records_default_recovery_fields_and_preserve_unknown_metadata() {
     );
 }
 
+/// #809 chat-bridge-json-forward-compat: keys a newer agentctl added inside an agent record's
+/// nested records are kept when this build rewrites the record.
+#[test]
+fn nested_keys_a_newer_agentctl_added_survive_a_rewrite() {
+    let fixture = Fixture::new();
+    fixture.start(None);
+    let path = fixture.root.join("registry/agents/worker/agent.json");
+    let mut document = agent::read_private_json(&path).unwrap();
+    assert!(document["native_session"].is_object(), "{document}");
+    document["native_session"]["future"] = json!(1);
+    document["name_history"] = json!([{"name": "older", "renamed_at": 1.0,
+        "journal_id": "0123456789abcdef0123456789abcdef", "future": {"on": true}}]);
+    agent::atomic_json(&path, &document).unwrap();
+    let manager = fixture.manager();
+    let record = manager.load("worker").expect("a newer record loads");
+    manager.save(&record).expect("rewrite");
+    let rewritten = agent::read_private_json(&path).unwrap();
+    assert_eq!(rewritten["name_history"][0]["future"], json!({"on": true}));
+    assert_eq!(rewritten["native_session"]["future"], json!(1));
+}
+
 #[test]
 fn malformed_or_conflicting_recovery_metadata_is_rejected() {
     let fixture = Fixture::new();
@@ -603,10 +624,6 @@ fn malformed_or_conflicting_recovery_metadata_is_rejected() {
         (
             "native_session",
             json!({"schema": "agentctl-native-session/v1", "agent": "codex", "value": "another-thread", "source": "asserted"}),
-        ),
-        (
-            "native_session",
-            json!({"schema": "agentctl-native-session/v1", "agent": "codex", "value": "thread", "source": "observed", "unexpected": true}),
         ),
         (
             "native_session",

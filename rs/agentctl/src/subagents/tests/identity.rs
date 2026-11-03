@@ -956,10 +956,6 @@ fn record_identity_fields_validate_like_the_python_edition() {
             "name_history",
             json!([entry(json!("older"), json!("soon"), good_id.clone())]),
         ),
-        (
-            "name_history",
-            json!([{"name": "older", "renamed_at": 1.0, "journal_id": good_id, "extra": 1}]),
-        ),
         ("terminal_id", json!("")),
         ("terminal_id", json!("t".repeat(129))),
         ("terminal_id", json!(7)),

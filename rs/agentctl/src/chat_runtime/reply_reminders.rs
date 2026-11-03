@@ -51,7 +51,6 @@ const REMINDER_MESSAGE_PREFIX: &str = "chat-reminder-";
 /// `reply-reminders.json`: when reminders started, which requests were reminded, and the
 /// reminder the queue has not settled yet, if any.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct ReplyReminderRecord {
     schema: String,
     /// When reminders started for this state, in milliseconds since the Unix epoch.
@@ -65,7 +64,6 @@ pub(crate) struct ReplyReminderRecord {
 
 /// One request a reminder named.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct RemindedRequest {
     pub(crate) key: String,
     /// The reply ID the reminder named it by.
@@ -76,7 +74,6 @@ pub(crate) struct RemindedRequest {
 
 /// A reminder recorded before it was queued, until the queue settles it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct PendingReminder {
     /// Its identifier in the coordinator's queue.
     pub(crate) message_id: String,

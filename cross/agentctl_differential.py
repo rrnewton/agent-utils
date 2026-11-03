@@ -432,6 +432,16 @@ def _launch_specs(harness: Harness, report: Report) -> None:
         config.chmod(0o600)
     _pair(harness, report, newer, "primary/unknown-top-level-config",
           ("profiles", "--cwd", "<ROOT>"), 0)
+    # So is a key inside a profile or its agentcloud settings, named by its path (#809
+    # chat-bridge-json-forward-compat).
+    for root in (newer.python_root, newer.rust_root):
+        config = root / ".agentctl" / "profiles.json"
+        config.write_text(json.dumps({"schema": "agentctl-profiles/v1", "profiles": {
+            "worker": {"harness": "codex", "mode": "interactive", "argv": [], "env": {},
+                       "surprise": True},
+        }}), encoding="utf-8")
+    _pair(harness, report, newer, "primary/unknown-profile-key",
+          ("profiles", "--cwd", "<ROOT>"), 0)
     # ... but a duplicate key is refused there as everywhere else in the file.
     for root in (newer.python_root, newer.rust_root):
         config = root / ".agentctl" / "profiles.json"
@@ -691,7 +701,6 @@ def _profiles(harness: Harness, report: Report) -> None:
                 ("bool", "pid", True),
                 ("overflow", "starttime_ticks", 1 << 64),
                 ("zero-device", "executable_device", 0),
-                ("unknown", "unexpected", 1),
             )
             for label, field, value in malformed_variants:
                 for root, original in original_records.items():
@@ -709,6 +718,20 @@ def _profiles(harness: Harness, report: Report) -> None:
                     (root / "registry/agents/worker/agent.json").write_text(
                         json.dumps(original), encoding="utf-8"
                     )
+            # A key a newer agentctl added to the identity is ignored by both editions (#809
+            # chat-bridge-json-forward-compat).
+            for root, original in original_records.items():
+                changed = json.loads(json.dumps(original))
+                changed["custom_process_identity"]["unexpected"] = 1
+                (root / "registry/agents/worker/agent.json").write_text(
+                    json.dumps(changed), encoding="utf-8"
+                )
+            _pair(harness, report, case, "primary/profile/watermelon/identity-newer-key",
+                  ("status", "worker", *_COMMON), 0)
+            for root, original in original_records.items():
+                (root / "registry/agents/worker/agent.json").write_text(
+                    json.dumps(original), encoding="utf-8"
+                )
             prompt = "Muse literal $(unexpanded) delivery\nsecond line"
             _pair(harness, report, case, "primary/profile/watermelon/send", (
                 "send", "worker", prompt, "--message-id", "muse-first", *_COMMON,
@@ -1002,7 +1025,7 @@ def _profile_refusals(harness: Harness, report: Report) -> None:
     base = {"schema": "agentctl-profiles/v1", "profiles": {
         "worker": {"harness": "codex", "mode": "interactive", "argv": [], "env": {}}
     }}
-    for label in ("nonignored", "permissions", "symlink", "unknown-field"):
+    for label in ("nonignored", "permissions", "symlink"):
         case = harness.case(f"primary-profile-refusal-{label}")
         for root in (case.python_root, case.rust_root):
             init_case_repository(root)
@@ -1011,8 +1034,6 @@ def _profile_refusals(harness: Harness, report: Report) -> None:
             directory = root / ".agentctl"
             directory.mkdir(mode=0o700)
             document = json.loads(json.dumps(base))
-            if label == "unknown-field":
-                document["profiles"]["worker"]["surprise"] = True
             target = directory / "profiles.json"
             if label == "symlink":
                 real = directory / "real.json"

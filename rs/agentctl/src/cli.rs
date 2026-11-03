@@ -3679,6 +3679,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     let harness = value.harness.unwrap_or_else(|| "codex".to_owned());
                     let cloud = if harness == "agentcloud" {
                         Some(CloudLaunch {
+                            unknown: Default::default(),
                             harness: value.cloud_harness,
                             provision: value.provision,
                             envspec: value.envspec,

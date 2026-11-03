@@ -61,7 +61,6 @@ const RESERVED_CREATE_OPTIONS: [&str; 14] = [
 
 /// Agentcloud-specific settings for `agentctl start --harness agentcloud`.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct CloudLaunch {
     /// Session driver for `agentcloudctl create --harness`; `None` keeps the server default.
     #[serde(default)]
@@ -84,6 +83,10 @@ pub struct CloudLaunch {
     /// Session title for `agentcloudctl create --title`; `None` uses the agent name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Keys a newer agentctl added, kept when this record is written back (#809
+    /// chat-bridge-json-forward-compat).
+    #[serde(flatten)]
+    pub unknown: crate::forward_compat::KeptKeys,
 }
 
 fn single_line(value: &str) -> bool {
@@ -336,6 +339,10 @@ pub(super) struct CloudRecord {
     /// and archives the record; halting or archiving it would end the caller itself.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(super) attached_self: bool,
+    /// Keys a newer agentctl added, kept when this record is written back (#809
+    /// chat-bridge-json-forward-compat).
+    #[serde(flatten)]
+    pub(super) unknown: crate::forward_compat::KeptKeys,
 }
 
 impl CloudRecord {
@@ -702,6 +709,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             &options,
             reasoning_effort,
             CloudRecord {
+                unknown: Default::default(),
                 launch,
                 agentterm: agentterm.display().to_string(),
                 endpoint: Some(endpoint.clone()),
@@ -909,6 +917,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             &options,
             None,
             CloudRecord {
+                unknown: Default::default(),
                 launch: CloudLaunch::default(),
                 agentterm: agentterm.display().to_string(),
                 endpoint: Some(endpoint.clone()),

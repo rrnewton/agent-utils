@@ -34,7 +34,6 @@ const MAX_DEPTH: usize = 64;
 
 /// One edge from an agent record to the agent that created or manages it.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct Edge {
     /// The other agent's name when the edge was written.
     pub(crate) agent: String,
@@ -44,17 +43,24 @@ pub(crate) struct Edge {
     pub(crate) token: String,
     /// How the edge was established: [`PROOF_ANCESTRY`] or [`PROOF_ASSIGNED`].
     pub(crate) proof: String,
+    /// Keys a newer agentctl added, kept when this record is written back (#809
+    /// chat-bridge-json-forward-compat).
+    #[serde(flatten)]
+    pub(crate) unknown: crate::forward_compat::KeptKeys,
 }
 
 /// The registry's coordinator designation, `REGISTRY/coordinator.json`.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct Designation {
     schema: String,
     pub(crate) name: String,
     pub(crate) token: String,
     set_at: f64,
     set_by: Option<Edge>,
+    /// Keys a newer agentctl added, kept when this record is written back (#809
+    /// chat-bridge-json-forward-compat).
+    #[serde(flatten)]
+    pub(crate) unknown: crate::forward_compat::KeptKeys,
 }
 
 /// The per-host coordinator index (schema `agentctl-coordinator-index/v1`):
@@ -816,6 +822,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         let (index, _) = ancestry.nearest(anchored.iter().map(|(_, identity)| *identity))?;
         let record = anchored[index].0;
         Some(Edge {
+            unknown: Default::default(),
             agent: record.name.clone(),
             registry: self.registry_text(),
             token: record.token.clone(),
@@ -1117,6 +1124,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             )));
         }
         let designation = Designation {
+            unknown: Default::default(),
             schema: DESIGNATION_SCHEMA.to_owned(),
             name: record.name.clone(),
             token: record.token.clone(),
@@ -1333,6 +1341,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             ManageAction::By(manager) => {
                 let record = self.load(manager)?;
                 Some(Edge {
+                    unknown: Default::default(),
                     agent: record.name.clone(),
                     registry: self.registry_text(),
                     token: record.token,
@@ -1544,6 +1553,7 @@ mod tests {
 
     fn edge(agent: &str, token: &str) -> Option<Edge> {
         Some(Edge {
+            unknown: Default::default(),
             agent: agent.to_owned(),
             registry: "/r".to_owned(),
             token: token.to_owned(),

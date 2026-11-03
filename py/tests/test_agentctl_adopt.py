@@ -178,9 +178,7 @@ def test_malformed_foreign_shell_identities_are_rejected(
     missing = json.loads(json.dumps(original))
     del missing["foreign_shell_identity"]["starttime_ticks"]
     variants.append(missing)
-    unknown = json.loads(json.dumps(original))
-    unknown["foreign_shell_identity"]["unexpected"] = 1
-    variants.append(unknown)
+    # A key a newer agentctl added is ignored, not refused (#809 chat-bridge-json-forward-compat).
     wrong_adapter = json.loads(json.dumps(original))
     wrong_adapter["adapter"] = "herdr"
     variants.append(wrong_adapter)

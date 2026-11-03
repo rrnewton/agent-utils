@@ -535,7 +535,6 @@ pub struct BackendConfigurationDocument {
 
 /// Operator-selected one-shot outbound helper configuration.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct OutboundCommandConfiguration {
     /// Absolute canonical native helper executable.
     pub executable: PathBuf,
@@ -551,6 +550,10 @@ pub struct OutboundCommandConfiguration {
     /// Cooperative process-exit grace before whole-group termination.
     #[serde(default = "default_outbound_shutdown_grace_millis")]
     pub shutdown_grace_millis: u64,
+    /// Keys a newer agentctl added, kept when this record is written back (#809
+    /// chat-bridge-json-forward-compat).
+    #[serde(flatten)]
+    pub unknown: crate::forward_compat::KeptKeys,
 }
 
 impl OutboundCommandConfiguration {
@@ -771,7 +774,6 @@ fn warn_unknown_keys(path: &Path, unknown: &BTreeMap<String, Value>) {
 /// spaces; neither kind holds `·`, `]`, a line break or another control character, and each is at
 /// most 64 bytes.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct PromptLabels {
     /// Provider sender ID to display name, such as `"U0EXAMPLE": "Ada Lovelace"`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -779,6 +781,10 @@ pub struct PromptLabels {
     /// Provider channel ID to display name, such as `"C0EXAMPLE": "#team-chat"`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub channels: BTreeMap<String, String>,
+    /// Keys a newer agentctl added, kept when this record is written back (#809
+    /// chat-bridge-json-forward-compat).
+    #[serde(flatten)]
+    pub unknown: crate::forward_compat::KeptKeys,
 }
 
 /// Longest label [`PromptLabels`] accepts, in bytes.
@@ -823,7 +829,6 @@ impl PromptLabels {
 /// bare project); one bot per team is the normal case, and several sender IDs
 /// may map to the same team. Owner posts in a relay channel are not requests.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct RelayChannelConfig {
     /// Provider channel or space identifier.
     pub channel: String,
@@ -832,6 +837,10 @@ pub struct RelayChannelConfig {
     pub peer_senders: BTreeMap<String, String>,
     /// The one command relay posts are piped to (argv, never a shell).
     pub command: Vec<String>,
+    /// Keys a newer agentctl added, kept when this record is written back (#809
+    /// chat-bridge-json-forward-compat).
+    #[serde(flatten)]
+    pub unknown: crate::forward_compat::KeptKeys,
 }
 
 impl BridgeConfiguration {
@@ -859,7 +868,6 @@ impl BridgeConfiguration {
 /// bridge's: it is neither reported to the agent as matching no request nor skipped by the
 /// counter. A number the bridge assigned before its range changed still names its request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ReplyAliasRange {
     /// The lowest number assigned; at least 1.
     pub first: u64,
@@ -1099,28 +1107,54 @@ impl BridgeConfiguration {
         Ok(())
     }
 
-    /// The keys this build does not know, at the top and beside `backend_configuration`'s
-    /// `schema` and `data`, each with `prefix` before its dotted path.
+    /// The keys this build does not know, at the top, beside `backend_configuration`'s `schema`
+    /// and `data`, and inside `outbound_command`, `labels` and each of `relay_channels`, each with
+    /// `prefix` before its dotted path.
     fn unknown_keys(&self, prefix: &str) -> BTreeMap<String, Value> {
-        let top = self
-            .unknown
-            .iter()
-            .map(|(key, value)| (format!("{prefix}{key}"), value));
-        let backend = self.backend_configuration.iter().flat_map(|backend| {
-            backend
-                .unknown
-                .iter()
-                .map(move |(key, value)| (format!("{prefix}backend_configuration.{key}"), value))
-        });
-        top.chain(backend)
-            .map(|(key, value)| (key, value.clone()))
-            .collect()
+        let mut found: BTreeMap<String, Value> = BTreeMap::new();
+        let mut add = |inner: &str, keys: &BTreeMap<String, Value>| {
+            for (key, value) in keys {
+                found.insert(format!("{prefix}{inner}{key}"), value.clone());
+            }
+        };
+        add("", &self.unknown);
+        if let Some(backend) = &self.backend_configuration {
+            add("backend_configuration.", &backend.unknown);
+        }
+        if let Some(command) = &self.outbound_command {
+            add("outbound_command.", &command.unknown.0);
+        }
+        if let Some(labels) = &self.labels {
+            add("labels.", &labels.unknown.0);
+        }
+        for (index, relay) in self.relay_channels.iter().enumerate() {
+            add(&format!("relay_channels[{index}]."), &relay.unknown.0);
+        }
+        found
+    }
+
+    /// Forget the keys this build does not know, at every level [`Self::unknown_keys`] reads.
+    fn forget_unknown_keys(&mut self) {
+        self.unknown.clear();
+        if let Some(backend) = self.backend_configuration.as_mut() {
+            backend.unknown.clear();
+        }
+        if let Some(command) = self.outbound_command.as_mut() {
+            command.unknown.0.clear();
+        }
+        if let Some(labels) = self.labels.as_mut() {
+            labels.unknown.0.clear();
+        }
+        for relay in &mut self.relay_channels {
+            relay.unknown.0.clear();
+        }
     }
 
     /// Read a bounded, private owner-only configuration document, warning once about top-level
     /// keys this build does not know.
     pub fn load_private(path: &Path) -> Result<Self> {
-        let configuration: Self = read_document(path, 1 << 20)?;
+        // Decoded quietly: the warning below names each unknown key by its path.
+        let configuration: Self = decode_document(&read_artifact_bytes(path, 1 << 20)?)?;
         configuration.validate()?;
         warn_unknown_keys(path, &configuration.unknown_keys(""));
         Ok(configuration)
@@ -1207,7 +1241,6 @@ struct ConfigurationEnvelope {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Checkpoint {
     version: u32,
     cursor: Option<String>,
@@ -1258,21 +1291,18 @@ impl Checkpoint {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct BoundaryMessageGuard {
     request_key: String,
     message_fingerprint: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct AdmissionRequestIntent {
     request_key: String,
     message_fingerprint: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct DeferredAdmissionGuard {
     target_cursor: String,
     provider_sequence: u64,
@@ -1284,7 +1314,6 @@ struct DeferredAdmissionGuard {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct AdmissionIntent {
     version: u32,
     #[serde(default)]
@@ -1417,7 +1446,6 @@ enum CommitReceiptPhase {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct CommitReceipt {
     version: u32,
     phase: CommitReceiptPhase,
@@ -1464,7 +1492,6 @@ enum GapPhase {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct GapDiagnostic {
     version: u32,
     phase: GapPhase,
@@ -1570,7 +1597,6 @@ impl GapRetryBoundary {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct CheckpointGapRetryRecord {
     version: u32,
     // Missing means the original checkpoint-only authority; never broaden an old audit.
@@ -1679,7 +1705,6 @@ fn bytes_sha256(bytes: &[u8]) -> String {
 /// so a deterministic refusal is not retried. `accept-checkpoint-boundary` is the operator path
 /// when the offered batch is a checkpoint and every saved boundary message is a stored request.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct BoundaryMismatch {
     version: u32,
     cursor: String,
@@ -1775,7 +1800,6 @@ pub struct CheckpointBoundaryAcceptance<'a> {
 
 /// Why one saved boundary message is safe to drop from the replay boundary.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct BoundaryAcceptanceMessage {
     request_key: String,
     message_fingerprint: String,
@@ -1793,7 +1817,6 @@ struct BoundaryAcceptanceMessage {
 /// batch sequence, cursor, fingerprint, event count, message guards) and the configuration, so it
 /// authorizes nothing once that boundary is replaced or the configuration changes.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct BoundaryAcceptanceRecord {
     version: u32,
     cursor: String,
@@ -1879,7 +1902,6 @@ enum RetirementPhase {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RetiredReplyReceipt {
     ordinal: u32,
     send_request_id: String,
@@ -1900,7 +1922,6 @@ enum LegacyRetirementPhaseV1 {
 // provider receipts inline, so it must be decoded through this closed schema before any v2 header
 // deserialization or destructive recovery.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct LegacyRetirementRecordV1 {
     version: u32,
     phase: LegacyRetirementPhaseV1,
@@ -2017,7 +2038,6 @@ impl LegacyRetirementRecordV1 {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RetirementReceiptChunk {
     version: u32,
     retirement_sequence: u64,
@@ -2067,7 +2087,6 @@ impl RetirementReceiptChunk {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RetirementRecord {
     version: u32,
     phase: RetirementPhase,
@@ -2097,7 +2116,7 @@ struct RetirementRecord {
     retired_at_millis: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 enum RetirementDocument {
     Current(RetirementRecord),
@@ -2151,7 +2170,6 @@ impl RetirementRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RetiredRouteIndex {
     version: u32,
     retirement_sequence: u64,
@@ -2183,7 +2201,6 @@ impl RetiredRouteIndex {
 /// Unavailable reply marker identifiers already reported to the coordinator, oldest first, and
 /// the prompt the coordinator queue still holds for more of them.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct FenceFeedbackRecord {
     version: u32,
     reported: Vec<String>,
@@ -2191,7 +2208,6 @@ struct FenceFeedbackRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct PendingFenceFeedback {
     unavailable: Vec<String>,
     prompt: String,
@@ -2283,7 +2299,6 @@ operator deletes fence-feedback.json from the bridge state directory, which forg
 /// assigned twice, even across a restart or a rollback to a release that does not read this
 /// file, so a block still on screen under an old alias never reaches a newer request.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ReplyAliasRecord {
     version: u32,
     /// The lowest number neither assigned nor skipped.
@@ -2303,7 +2318,6 @@ struct ReplyAliasRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ReplyAliasEntry {
     alias: u64,
     request_key: String,
@@ -2315,7 +2329,6 @@ struct ReplyAliasEntry {
 /// borders. A table redrawn in one of the ways the userguide lists for stored replies, such as at
 /// another width or as one `Header: value` line per cell, can read as new text.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct WithheldReply {
     alias: u64,
     plain: String,
@@ -2561,7 +2574,6 @@ fn current_reply_id(record: &RequestRecord, alias: Option<u64>) -> String {
 
 /// Recent reply reservations (including unknown outcomes) and tripped threads.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ReplyBreakerRecord {
     version: u32,
     sends: Vec<ThreadEvent>,
@@ -2569,7 +2581,6 @@ struct ReplyBreakerRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ThreadEvent {
     channel_id: String,
     thread_id: String,
@@ -2672,7 +2683,6 @@ impl SettlementKind {
 
 /// The durable record of one settlement: who settled a request, when, and why.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct RequestSettlement {
     /// `delivered` or `abandoned`.
     #[serde(rename = "as")]
@@ -2684,6 +2694,10 @@ pub struct RequestSettlement {
     /// Why, when the operator gave one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Keys a newer agentctl added, kept when this record is written back (#809
+    /// chat-bridge-json-forward-compat).
+    #[serde(flatten)]
+    pub unknown: crate::forward_compat::KeptKeys,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2696,7 +2710,6 @@ enum AckPhase {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct SavedMessage {
     channel_id: String,
     message_id: String,
@@ -2710,14 +2723,12 @@ struct SavedMessage {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ProviderPayloadDocument {
     schema: String,
     data: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RequestRecord {
     version: u32,
     key: String,
@@ -2781,6 +2792,10 @@ struct RequestRecord {
     /// An operator's settlement of an uncertain delivery (`chat settle`, #784).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     settlement: Option<RequestSettlement>,
+    /// Keys a newer agentctl added, kept when this record is written back (#809
+    /// chat-bridge-json-forward-compat).
+    #[serde(flatten)]
+    unknown: crate::forward_compat::KeptKeys,
 }
 
 impl SavedMessage {
@@ -2808,6 +2823,7 @@ impl RequestRecord {
         let key = message_key(&source)?;
         let ack_request_id = ack_reaction.map(|_| random_operation_uuid()).transpose()?;
         Ok(Self {
+            unknown: Default::default(),
             version: STATE_VERSION,
             phase: RequestPhase::Pending,
             reply_nonce: random_reply_nonce()?,
@@ -3154,7 +3170,6 @@ impl DeliveryEntry {
 /// the state directory each time the list changes. It holds no ages, so the file changes only
 /// when a request becomes stalled, is typed or retired, or changes its phase or reason.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct DeliveryAlarm {
     pub(crate) schema: String,
     pub(crate) stall_after_seconds: u64,
@@ -3164,7 +3179,6 @@ pub(crate) struct DeliveryAlarm {
 
 /// One stalled request in a [`DeliveryAlarm`].
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct StalledRequest {
     pub(crate) key: String,
     /// `pending`, `submitting` or `delivery_uncertain`.
@@ -3201,7 +3215,6 @@ impl DeliveryAlarm {
 /// many were lost, the first request that lost one, and whether losses are going on now, so the
 /// service logs one line when they start rather than one for each.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ReceiptReactionLoss {
     schema: String,
     lost: u64,
@@ -3215,7 +3228,6 @@ struct ReceiptReactionLoss {
 /// How many ✅ receipt reactions this state lost because too many were waiting, and the request
 /// that lost the first, as `chat status` and `delivery-alarm.json` report them.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct LostReceiptReactions {
     pub(crate) count: u64,
     pub(crate) oldest_key: Option<String>,
@@ -3226,7 +3238,6 @@ pub(crate) struct LostReceiptReactions {
 /// the helper accepts only the acknowledgement's own emoji, so the reaction is dropped rather than
 /// tried again, and this record keeps the refusals visible.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ReceiptReactionRefusal {
     schema: String,
     refused: u64,
@@ -3243,7 +3254,6 @@ struct ReceiptReactionRefusal {
 
 /// The reaction a refusal was counted for, by request key and saved operation ID.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RefusalInFlight {
     key: String,
     request_id: String,
@@ -3253,7 +3263,6 @@ struct RefusalInFlight {
 /// refused, and the helper's newest reason, as `chat status` and `delivery-alarm.json` report
 /// them.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct RefusedReceiptReactions {
     pub(crate) count: u64,
     pub(crate) oldest_key: Option<String>,
@@ -3268,7 +3277,6 @@ pub(crate) struct RefusedReceiptReactions {
 /// a final answer about that one operation, not a failure of the path, so it neither starts nor
 /// ends a failure.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ProviderHealthRecord {
     schema: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3279,7 +3287,6 @@ struct ProviderHealthRecord {
 
 /// A path that failed and has not worked since: see [`ProviderHealthRecord`].
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct PathFailure {
     /// When the first of these failures happened.
     pub(crate) down_since_millis: u64,
@@ -3322,7 +3329,6 @@ impl PathFailure {
 ///
 /// A separate file from `provider-health.json`, so a binary that does not know it ignores it.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ServiceHealthRecord {
     schema: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3333,6 +3339,9 @@ struct ServiceHealthRecord {
 
 /// The paths that are down, as `chat status` and `delivery-alarm.json` report them: those whose
 /// failure [`PathFailure::alarming`] says to report.
+// Strict on purpose (#809 chat-bridge-json-forward-compat): an absent field here means that path
+// is clear, so a key this build cannot read makes the saved sources record untrusted, and the
+// scan reads the provider record again, rather than reading it as clear.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ProviderDown {
@@ -3349,7 +3358,6 @@ pub(crate) struct ProviderDown {
 /// survives a restart and a failed write of `delivery-alarm.json`; with no value it names the
 /// record as unreadable instead of reporting it clear.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct AlarmSources {
     schema: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3500,7 +3508,6 @@ pub(crate) fn allowed_sender_refusal_alarm(summary: Option<Value>) -> Option<Val
 /// reaction, and the file is removed once the reaction is on. The record names the message itself
 /// because the request may be retired before its reaction is added.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ReceiptReactionRecord {
     schema: String,
     key: String,
@@ -3544,7 +3551,6 @@ impl ReceiptReactionRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ReplyRecord {
     version: u32,
     request_key: String,
@@ -3576,6 +3582,10 @@ struct ReplyRecord {
     /// permanently. Retries reuse it, so an uncertain fallback is never posted twice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     send_fallback_request_id: Option<String>,
+    /// Keys a newer agentctl added, kept when this record is written back (#809
+    /// chat-bridge-json-forward-compat).
+    #[serde(flatten)]
+    unknown: crate::forward_compat::KeptKeys,
 }
 
 impl ReplyRecord {
@@ -3588,6 +3598,7 @@ impl ReplyRecord {
         }
         let send_request_id = random_operation_uuid()?;
         let mut record = Self {
+            unknown: Default::default(),
             version: STATE_VERSION,
             request_key: request_key.to_owned(),
             ordinal,
@@ -5866,13 +5877,10 @@ pub fn select_plugin(
 impl BridgeState {
     /// Create a new private bridge state directory.
     ///
-    /// Top-level keys of `config` this build does not know are not stored: their values were
-    /// never checked, and could hold a secret the state must not keep.
+    /// Keys of `config` this build does not know, at any level, are not stored: their values
+    /// were never checked, and could hold a secret the state must not keep.
     pub fn initialize(root: &Path, mut config: BridgeConfiguration) -> Result<Self> {
-        config.unknown.clear();
-        if let Some(backend) = config.backend_configuration.as_mut() {
-            backend.unknown.clear();
-        }
+        config.forget_unknown_keys();
         config.validate()?;
         // The receipt marks a request the agent admitted as input, so a
         // new state does not take it as the acknowledgement as well. A state made before keeps
@@ -6018,7 +6026,9 @@ impl BridgeState {
                 agent::validate_private_directory(&directory, label, false)?;
             }
         }
-        let envelope: ConfigurationEnvelope = read_document(&root.join("bridge.json"), 1 << 20)?;
+        // Decoded quietly: the warning below names each unknown key by its path.
+        let envelope: ConfigurationEnvelope =
+            decode_document(&read_artifact_bytes(&root.join("bridge.json"), 1 << 20)?)?;
         if envelope.version != STATE_VERSION {
             return Err(ChatRuntimeError::invalid(format!(
                 "chat state has unsupported version {}",
@@ -9720,6 +9730,7 @@ impl BridgeState {
             request.delivered_at_millis = Some(now_millis);
         }
         request.settlement = Some(RequestSettlement {
+            unknown: Default::default(),
             kind,
             by: by.to_owned(),
             at_millis: now_millis,
@@ -18530,22 +18541,40 @@ fn encoded_document_bytes<T: Serialize>(value: &T) -> Result<usize> {
         .ok_or_else(|| ChatRuntimeError::invalid("encoded document length overflow"))
 }
 
-fn read_document<T: for<'de> Deserialize<'de>>(path: &Path, maximum: usize) -> Result<T> {
+fn read_document<T: for<'de> Deserialize<'de> + Serialize>(
+    path: &Path,
+    maximum: usize,
+) -> Result<T> {
     read_document_sized(path, maximum).map(|(value, _)| value)
 }
 
-fn read_document_sized<T: for<'de> Deserialize<'de>>(
+/// Read the record at `path`, warning once about keys a newer agentctl added, which it reads
+/// around (#809 chat-bridge-json-forward-compat).
+fn read_document_sized<T: for<'de> Deserialize<'de> + Serialize>(
     path: &Path,
     maximum: usize,
 ) -> Result<(T, u64)> {
     let bytes = read_artifact_bytes(path, maximum)?;
     let size = u64::try_from(bytes.len())
         .map_err(|_| ChatRuntimeError::invalid("chat artifact size exceeds u64"))?;
-    Ok((decode_document(&bytes)?, size))
+    let (decoded, unknown) = decode_tolerant(&bytes)?;
+    crate::forward_compat::warn_unknown(path, &unknown);
+    Ok((decoded, size))
 }
 
-fn decode_document<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T> {
-    chat_subscription_plugin::decode_strict_json(bytes)
+/// Decode one record, reading around the keys a newer agentctl added.
+fn decode_document<T: for<'de> Deserialize<'de> + Serialize>(bytes: &[u8]) -> Result<T> {
+    decode_tolerant(bytes).map(|(decoded, _)| decoded)
+}
+
+/// Decode one record and name the keys in it that this build does not know. Duplicate keys and
+/// trailing data are refused, as in every frame.
+fn decode_tolerant<T: for<'de> Deserialize<'de> + Serialize>(
+    bytes: &[u8],
+) -> Result<(T, Vec<String>)> {
+    let value: Value = chat_subscription_plugin::decode_strict_json(bytes)
+        .map_err(|error| ChatRuntimeError::invalid(error.to_string()))?;
+    crate::forward_compat::decode(value)
         .map_err(|error| ChatRuntimeError::invalid(error.to_string()))
 }
 
@@ -19521,6 +19550,86 @@ mod tests {
         destination
     }
 
+    /// #809 chat-bridge-json-forward-compat: a bridge with every optional feature off writes the
+    /// same `bridge.json` keys as the first version did, so an older agentctl reads it. A new
+    /// setting must leave the file alone while it is off.
+    #[test]
+    fn a_bridge_with_every_optional_feature_off_writes_only_the_original_keys() {
+        let mut configuration = config();
+        configuration.ack_reaction = ReactionSetting::Inherit;
+        configuration.slack_format = None;
+        let root = temporary("default-off-bridge");
+        BridgeState::initialize(&root, configuration).expect("initialize");
+        let stored: Value = serde_json::from_str(
+            &fs::read_to_string(root.join("bridge.json")).expect("bridge.json"),
+        )
+        .expect("JSON");
+        let keys = |value: &Value| {
+            value
+                .as_object()
+                .expect("object")
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(keys(&stored), ["config", "version"]);
+        assert_eq!(
+            keys(&stored["config"]),
+            [
+                "agent_label",
+                "agent_name",
+                "allowed_senders",
+                "channel_ids",
+                "max_grant_seconds",
+                "outbound_enabled",
+                "subscription_plugin"
+            ]
+        );
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// #809 chat-bridge-json-forward-compat: a request or reply record a newer agentctl wrote
+    /// with a key this build does not know is read, and rewriting it keeps the key.
+    #[test]
+    fn records_written_by_a_newer_agentctl_keep_its_keys_through_a_rewrite() {
+        let (state, key, root) = state_with_reply("newer-records", "an answer");
+        let request_path = state.request_path(&key);
+        let reply_path = state.reply_path(&key, 1);
+        for path in [&request_path, &reply_path] {
+            let mut document: Value =
+                serde_json::from_slice(&fs::read(path).expect("record")).expect("JSON");
+            document["future_field"] = json!({"on": true});
+            write_document(path, &document).expect("newer record");
+        }
+        let (request, unknown): (RequestRecord, _) =
+            decode_tolerant(&fs::read(&request_path).expect("request")).expect("read around");
+        assert_eq!(unknown, ["future_field"], "named for the warning");
+        assert_eq!(
+            request.unknown.0.keys().collect::<Vec<_>>(),
+            ["future_field"]
+        );
+        let mut transport = FakeReplyTransport::default();
+        assert!(state
+            .publish_one(&key, &mut transport)
+            .expect("sent")
+            .is_some());
+        for path in [&request_path, &reply_path] {
+            let rewritten: Value =
+                serde_json::from_slice(&fs::read(path).expect("record")).expect("JSON");
+            assert_eq!(
+                rewritten["future_field"],
+                json!({"on": true}),
+                "{}",
+                path.display()
+            );
+        }
+        assert_eq!(
+            state.read_reply(&key, 1).expect("reply").phase,
+            ReplyPhase::Sent
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
     fn config() -> BridgeConfiguration {
         BridgeConfiguration {
             unknown: Default::default(),
@@ -19608,9 +19717,21 @@ mod tests {
         assert!(!stored.contains("subscription_secret"), "{stored}");
         assert!(!stored.contains("newer_backend_key"), "{stored}");
         fs::remove_dir_all(&root).expect("cleanup");
+        // A key a newer agentctl added inside a nested object is read around too (#809
+        // chat-bridge-json-forward-compat), named by its path, and not stored by `initialize`.
         let mut nested = serde_json::to_value(config()).expect("configuration");
         nested["outbound_command"] = json!({"executable": "/bin/true", "surprise": 1});
-        assert!(serde_json::from_value::<BridgeConfiguration>(nested).is_err());
+        let nested: BridgeConfiguration =
+            serde_json::from_value(nested).expect("a nested unknown key is read around");
+        assert_eq!(
+            nested.unknown_keys("").keys().collect::<Vec<_>>(),
+            ["outbound_command.surprise"]
+        );
+        let root = temporary("unknown-nested-config-key");
+        BridgeState::initialize(&root, nested).expect("initialize with a nested unknown key");
+        let stored = fs::read_to_string(root.join("bridge.json")).expect("bridge.json");
+        assert!(!stored.contains("surprise"), "{stored}");
+        fs::remove_dir_all(&root).expect("cleanup");
 
         // A bridge.json written by a newer agentctl loads, and an older one rewriting it keeps
         // the keys it does not know.
@@ -19621,6 +19742,7 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(&path).expect("bridge.json")).expect("JSON");
         document["future_envelope"] = json!(1);
         document["config"]["future_setting"] = json!({"on": true});
+        document["config"]["labels"] = json!({"future_label": "x"});
         write_document(&path, &document).expect("newer bridge.json");
         let state = BridgeState::open(&root).expect("open a newer bridge.json");
         assert_eq!(
@@ -19634,6 +19756,7 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(&path).expect("bridge.json")).expect("JSON");
         assert_eq!(rewritten["future_envelope"], json!(1));
         assert_eq!(rewritten["config"]["future_setting"], json!({"on": true}));
+        assert_eq!(rewritten["config"]["labels"]["future_label"], json!("x"));
         assert_eq!(rewritten["config"]["max_grant_seconds"], json!(3_600));
         fs::remove_dir_all(&root).expect("cleanup");
 
@@ -20093,6 +20216,7 @@ mod tests {
         let mut configuration = config();
         configuration.channel_ids = vec!["spaces/example".to_owned(), "relay/channel".to_owned()];
         configuration.relay_channels = vec![RelayChannelConfig {
+            unknown: Default::default(),
             channel: "relay/channel".to_owned(),
             peer_senders: BTreeMap::from([("bots/peer".to_owned(), "sim@host-b".to_owned())]),
             command: vec![script_path.to_string_lossy().into_owned()],
@@ -20195,6 +20319,7 @@ mod tests {
         let mut configuration = config();
         configuration.channel_ids = vec!["spaces/example".to_owned(), "relay/channel".to_owned()];
         configuration.relay_channels = vec![RelayChannelConfig {
+            unknown: Default::default(),
             channel: "relay/channel".to_owned(),
             peer_senders: BTreeMap::from([("bots/peer".to_owned(), "sim@host-b".to_owned())]),
             command: vec![script_path.to_string_lossy().into_owned()],
@@ -20280,6 +20405,7 @@ mod tests {
         let mut configuration = config();
         configuration.channel_ids = vec!["spaces/example".to_owned(), "relay/channel".to_owned()];
         configuration.relay_channels = vec![RelayChannelConfig {
+            unknown: Default::default(),
             channel: "relay/channel".to_owned(),
             peer_senders: BTreeMap::from([("bots/peer".to_owned(), "sim@host-b".to_owned())]),
             command: vec![script_path.to_string_lossy().into_owned()],
@@ -20287,6 +20413,7 @@ mod tests {
         // One sender mapped to two teams is a setup error (one bot per team).
         let mut shared = configuration.clone();
         shared.relay_channels.push(RelayChannelConfig {
+            unknown: Default::default(),
             channel: "relay/other".to_owned(),
             peer_senders: BTreeMap::from([("bots/peer".to_owned(), "tools@host-b".to_owned())]),
             command: vec![script_path.to_string_lossy().into_owned()],
@@ -32792,6 +32919,7 @@ spaces/example/messages/parent:\n> what about this part?\n"
         let root = temporary("prompt-labels-fence");
         let mut configuration = config();
         configuration.labels = Some(PromptLabels {
+            unknown: Default::default(),
             senders: BTreeMap::from([("users/owner".to_owned(), "Ada Lovelace".to_owned())]),
             channels: BTreeMap::from([("spaces/example".to_owned(), "#team-chat".to_owned())]),
         });
@@ -32826,6 +32954,7 @@ spaces/example/messages/parent:\n> what about this part?\n"
         // A label that would break the header's grammar is refused.
         for bad in ["Ada  Lovelace", "Ada]", "Ada · L", "Ada via Bob", " Ada"] {
             let labels = PromptLabels {
+                unknown: Default::default(),
                 senders: BTreeMap::from([("users/owner".to_owned(), bad.to_owned())]),
                 channels: BTreeMap::new(),
             };
@@ -39548,9 +39677,15 @@ If you have trouble, run: agentctl chat help 001"
         );
         let decoded: DeliveryAlarm = serde_json::from_value(document.clone()).expect("decode");
         assert_eq!(decoded, alarm);
+        // A key a newer agentctl added is read around and named (#809
+        // chat-bridge-json-forward-compat).
         let mut extended = document;
         extended["unexpected"] = Value::from(1);
-        assert!(serde_json::from_value::<DeliveryAlarm>(extended).is_err());
+        extended["stalled"][0]["later"] = Value::from("x");
+        let (decoded, unknown) =
+            crate::forward_compat::decode::<DeliveryAlarm>(extended).expect("read around");
+        assert_eq!(decoded, alarm);
+        assert_eq!(unknown, ["stalled[0].later", "unexpected"]);
     }
 
     #[test]

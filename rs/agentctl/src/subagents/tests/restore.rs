@@ -394,15 +394,19 @@ fn restore_configuration_is_strict() {
         json!({"schema": "agentctl-restore/v1", "units": ["a b.service"]}),
         json!({"schema": "agentctl-restore/v1", "also_registered": [{"registry": "relative", "name": "x"}]}),
         json!({"schema": "agentctl-restore/v1", "timers": [{"unit": "tick.service", "max_age_seconds": 60}]}),
-        json!({"schema": "agentctl-restore/v1", "also_registered": [{"registry": "/r", "name": "x", "unknown": true}]}),
     ] {
         fs::write(registry.join("restore.json"), document.to_string()).unwrap();
         assert!(RestoreConfig::load(&registry).is_err(), "{document}");
     }
-    // An unknown top-level key, as a newer agentctl may write, is warned about and ignored.
-    let document = json!({"schema": "agentctl-restore/v1", "unknown": true});
-    fs::write(registry.join("restore.json"), document.to_string()).unwrap();
-    assert!(RestoreConfig::load(&registry).is_ok());
+    // An unknown key, as a newer agentctl may write, is warned about and ignored, at the top and
+    // inside a nested entry (#809 chat-bridge-json-forward-compat).
+    for document in [
+        json!({"schema": "agentctl-restore/v1", "unknown": true}),
+        json!({"schema": "agentctl-restore/v1", "also_registered": [{"registry": "/r", "name": "x", "unknown": true}]}),
+    ] {
+        fs::write(registry.join("restore.json"), document.to_string()).unwrap();
+        assert!(RestoreConfig::load(&registry).is_ok(), "{document}");
+    }
     fs::remove_file(registry.join("restore.json")).unwrap();
     assert_eq!(
         RestoreConfig::load(&registry)
@@ -478,10 +482,12 @@ fn watch_restarts_a_timer_that_never_fires_and_starts_its_service_when_needed() 
     let config = RestoreConfig {
         timers: vec![
             TimerWatch {
+                unknown: Default::default(),
                 unit: "observer.timer".to_owned(),
                 max_age_seconds: 1800,
             },
             TimerWatch {
+                unknown: Default::default(),
                 unit: "tick.timer".to_owned(),
                 max_age_seconds: 1800,
             },
@@ -611,6 +617,7 @@ fn restore_revives_the_coordinator_first_re_registers_it_and_queues_one_notice()
     let registry = fixture.root.join("registry");
     let config = RestoreConfig {
         also_registered: vec![crate::restore::AlsoRegistered {
+            unknown: Default::default(),
             registry: bridge.clone(),
             name: "bridge-coordinator".to_owned(),
         }],
@@ -726,6 +733,7 @@ fn watch_reports_a_timer_whose_service_fails_on_every_run_without_restarting_it(
     let config = RestoreConfig {
         units: Vec::new(),
         timers: vec![TimerWatch {
+            unknown: Default::default(),
             unit: "observer.timer".to_owned(),
             max_age_seconds: 1800,
         }],
@@ -1177,6 +1185,7 @@ fn timer_config(fixture: &Fixture, unit: &str) -> RestoreConfig {
     RestoreConfig {
         units: Vec::new(),
         timers: vec![TimerWatch {
+            unknown: Default::default(),
             unit: unit.to_owned(),
             max_age_seconds: 1800,
         }],

@@ -523,6 +523,7 @@ mod tests {
 
     fn scheduled(name: &str, on_calendar: &str, command: &[&str]) -> crate::restore::ScheduledUnit {
         crate::restore::ScheduledUnit {
+            unknown: Default::default(),
             name: name.to_owned(),
             on_calendar: on_calendar.to_owned(),
             command: command.iter().map(|item| item.to_string()).collect(),

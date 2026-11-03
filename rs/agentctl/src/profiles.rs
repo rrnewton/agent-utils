@@ -101,15 +101,9 @@ struct Document {
 pub(crate) type UnknownKeys = UniqueMap<IgnoredValue>;
 
 impl UnknownKeys {
-    /// The keys, sorted, joined with ", ".
-    pub(crate) fn names(&self) -> Option<String> {
-        (!self.0.is_empty()).then(|| {
-            self.0
-                .keys()
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
+    /// The keys, sorted.
+    pub(crate) fn keys(&self) -> impl Iterator<Item = &String> {
+        self.0.keys()
     }
 }
 
@@ -170,18 +164,38 @@ impl<'de> Deserialize<'de> for IgnoredValue {
     }
 }
 
-/// The one-line warning for top-level keys this build does not know, or `None` when there are none.
-fn unknown_keys_warning(path: &Path, unknown: &UnknownKeys) -> Option<String> {
-    unknown.names().map(|names| {
+/// The one-line warning naming `paths`, the dotted paths of keys this build does not know, or
+/// `None` when there are none.
+fn unknown_paths_warning(path: &Path, mut paths: Vec<String>) -> Option<String> {
+    paths.sort();
+    (!paths.is_empty()).then(|| {
         format!(
-            "agentctl: warning: profile config {} has top-level key(s) this agentctl does not know: {names}; ignoring them (a newer agentctl may use them)",
+            "agentctl: warning: profile config {} has key(s) this agentctl does not know: {}; ignoring them (a newer agentctl may use them)",
             path.display(),
+            paths.join(", ")
         )
     })
 }
 
+/// The dotted paths of the keys this build does not know inside profile `name`, which a newer
+/// agentctl may have added (#809 chat-bridge-json-forward-compat); they are forgotten, so they
+/// never reach a launch or the public listing.
+fn take_unknown_profile_keys(name: &str, raw: &mut RawProfile) -> Vec<String> {
+    let mut paths: Vec<String> = std::mem::take(&mut raw.unknown.0)
+        .into_keys()
+        .map(|key| format!("profiles.{name}.{key}"))
+        .collect();
+    if let Some(cloud) = raw.agentcloud.as_mut() {
+        paths.extend(
+            std::mem::take(&mut cloud.unknown.0)
+                .into_keys()
+                .map(|key| format!("profiles.{name}.agentcloud.{key}")),
+        );
+    }
+    paths
+}
+
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawProfile {
     harness: String,
     mode: String,
@@ -195,6 +209,10 @@ struct RawProfile {
     agentcloud: Option<CloudLaunch>,
     #[serde(default)]
     record_edges: Option<bool>,
+    /// Keys a newer agentctl added (#809 chat-bridge-json-forward-compat): named in the load
+    /// warning, then forgotten. A profile is never written back from here.
+    #[serde(flatten)]
+    unknown: crate::forward_compat::KeptKeys,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -1145,17 +1163,21 @@ pub(crate) fn load_configuration(
             ))
         }
     };
+    let mut unknown: Vec<String> = document.unknown.0.keys().cloned().collect();
     let profiles = document
         .profiles
         .0
         .into_iter()
-        .map(|(name, profile)| validate(name.clone(), profile).map(|value| (name, value)))
+        .map(|(name, mut profile)| {
+            unknown.extend(take_unknown_profile_keys(&name, &mut profile));
+            validate(name.clone(), profile).map(|value| (name, value))
+        })
         .collect::<Result<BTreeMap<_, _>, _>>()?;
     wrkslots_value(document.wrkslots.as_ref())?;
     backend_value(document.term_backend.as_ref())?;
     launch_env_value(document.launch_env.as_ref())?;
     // Only a file that loads is warned about, so a refusal reads the same in both editions.
-    if let Some(warning) = unknown_keys_warning(&path, &document.unknown) {
+    if let Some(warning) = unknown_paths_warning(&path, unknown) {
         static WARNED: std::sync::Once = std::sync::Once::new();
         WARNED.call_once(|| eprintln!("{warning}"));
     }
@@ -1688,7 +1710,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_top_level_keys_are_ignored_with_a_warning_but_profile_keys_stay_strict() {
+    fn unknown_keys_are_ignored_with_a_warning_at_every_level() {
         use serde_json::json;
         let document: Document = serde_json::from_value(json!({
             "schema": SCHEMA,
@@ -1697,15 +1719,20 @@ mod tests {
             "profiles": {"worker": {"harness": "codex", "mode": "interactive"}}
         }))
         .unwrap();
-        assert_eq!(document.unknown.names().unwrap(), "another, future_key");
-        let warning =
-            unknown_keys_warning(Path::new("/p/.agentctl/profiles.json"), &document.unknown)
-                .unwrap();
+        assert_eq!(
+            document.unknown.keys().collect::<Vec<_>>(),
+            ["another", "future_key"]
+        );
+        let warning = unknown_paths_warning(
+            Path::new("/p/.agentctl/profiles.json"),
+            document.unknown.0.keys().cloned().collect(),
+        )
+        .unwrap();
         assert!(
             warning.contains("does not know: another, future_key;"),
             "{warning}"
         );
-        assert!(unknown_keys_warning(Path::new("/p"), &UnknownKeys::default()).is_none());
+        assert!(unknown_paths_warning(Path::new("/p"), Vec::new()).is_none());
         // Duplicate keys are refused inside an unknown key's value and among unknown keys, as
         // everywhere else in the file.
         for text in [
@@ -1714,11 +1741,24 @@ mod tests {
         ] {
             assert!(serde_json::from_str::<Document>(text).is_err(), "{text}");
         }
-        let strict = serde_json::from_value::<Document>(json!({
+        // A key a newer agentctl added inside a profile, or inside its agentcloud settings, is
+        // named by its path and forgotten (#809 chat-bridge-json-forward-compat).
+        let mut document = serde_json::from_value::<Document>(json!({
             "schema": SCHEMA,
-            "profiles": {"worker": {"harness": "codex", "mode": "interactive", "surprise": 1}}
-        }));
-        assert!(strict.is_err());
+            "profiles": {"worker": {"harness": "agentcloud", "mode": "interactive",
+                                    "surprise": 1, "agentcloud": {"provison": true}}}
+        }))
+        .expect("profile keys this build does not know are read around");
+        let (name, mut raw) = document.profiles.0.pop_first().expect("one profile");
+        assert_eq!(
+            take_unknown_profile_keys(&name, &mut raw),
+            [
+                "profiles.worker.surprise",
+                "profiles.worker.agentcloud.provison"
+            ]
+        );
+        assert!(raw.unknown.is_empty());
+        assert!(raw.agentcloud.expect("agentcloud").unknown.is_empty());
     }
 
     #[test]
@@ -2138,11 +2178,5 @@ mod tests {
                 "{expected:?} not in {message:?}"
             );
         }
-        assert!(serde_json::from_value::<RawProfile>(serde_json::json!({
-            "harness": "agentcloud",
-            "mode": "interactive",
-            "agentcloud": {"provison": true}
-        }))
-        .is_err());
     }
 }

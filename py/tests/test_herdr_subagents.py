@@ -1888,9 +1888,7 @@ def test_malformed_custom_process_identities_are_rejected(
     missing = json.loads(json.dumps(original))
     del missing["custom_process_identity"]["starttime_ticks"]
     variants.append(missing)
-    unknown = json.loads(json.dumps(original))
-    unknown["custom_process_identity"]["unexpected"] = 1
-    variants.append(unknown)
+    # A key a newer agentctl added is ignored, not refused (#809 chat-bridge-json-forward-compat).
     for record_field, record_value in (
         ("adapter", "herdr"),
         ("harness", "codex"),

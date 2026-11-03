@@ -124,9 +124,15 @@ def test_malformed_token_is_not_echoed_in_diagnostics(
     assert not http.requests
 
 
-def test_misspelled_authority_option_is_refused() -> None:
-    with pytest.raises(ValueError, match="unknown chat configuration"):
+def test_misspelled_authority_option_is_named_and_a_missing_one_refused(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # #809 chat-bridge-json-forward-compat: an unknown key is named, not refused, so a key a newer
+    # agentctl added never stops this one; the required key it misspells is still missing.
+    chat_module._warned_unknown_keys.clear()
+    with pytest.raises((ValueError, TypeError)):
         Config.parse({"agent_naem": "coordinator"})
+    assert '"agent_naem"' in capsys.readouterr().err
 
 
 def test_token_command_refreshes_on_every_page_and_send(

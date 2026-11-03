@@ -61,7 +61,6 @@ enum RejectionPhase {
 /// is evicted, replay still reconstructs the same operation UUID, rather than inventing a
 /// second operation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RejectionRecord {
     key: String,
     channel_id: String,
@@ -146,7 +145,6 @@ impl RejectionRecord {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RejectionDocument {
     schema: String,
     provider: String,
