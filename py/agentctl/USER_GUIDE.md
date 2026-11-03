@@ -1060,7 +1060,8 @@ a newer `agentctl` does not stop an older one; unknown keys inside an
   "herdr_wait_seconds": 300,
   "report_dir": "/home/me/.local/state/agentctl/restore",
   "herdr_unit": "herdr-server.service",
-  "timers": [{"unit": "health-tick.timer", "max_age_seconds": 5400}]
+  "timers": [{"unit": "health-tick.timer", "max_age_seconds": 5400}],
+  "scheduled": [{"name": "nightly-backup", "on_calendar": "daily", "command": ["/home/me/bin/backup", "--quiet"]}]
 }
 ```
 
@@ -1086,7 +1087,15 @@ what fixes the boot race. With `--bridge NAME` (repeatable) it writes only
 installed this way survives a reboot instead of vanishing with the
 `systemd-run` transient it replaces, and `agentctl services refresh` then
 updates it in place like any other unit file; the bridge's old transient must
-be stopped before the unit is enabled, so the two never serve one channel. It refuses to replace a file that
+be stopped before the unit is enabled, so the two never serve one channel. With `--scheduled` it writes only the
+timer pairs the spec's `scheduled` list names: each entry renders as
+`agentctl-scheduled-NAME.service` (a oneshot running the entry's `command`
+argv, whose first element is an absolute path) and
+`agentctl-scheduled-NAME.timer` (`OnCalendar` from the entry, `Persistent=true`
+so a period missed while the host was off fires at the next boot), both with
+`ConditionHost` set to the installing host so a unit directory shared with
+another host stays inert there. Enable the timers with
+`systemctl --user enable --now agentctl-scheduled-NAME.timer`. It refuses to replace a file that
 differs unless `--force`, supports `--dry-run`, and never enables, starts, or
 reloads anything; its output lists the `systemctl --user` commands to run after
 review. Keep `resume_agents_on_restore = false` in Herdr's configuration: Herdr

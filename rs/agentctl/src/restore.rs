@@ -69,6 +69,33 @@ pub struct TimerWatch {
     pub max_age_seconds: u64,
 }
 
+/// One scheduled command from the team spec (#743): `agentctl install-units
+/// --scheduled` renders it as a persistent `agentctl-scheduled-NAME.service` plus
+/// `.timer` user unit pair, so a team's periodic job survives a reboot instead of
+/// living in a `systemd-run` transient.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ScheduledUnit {
+    /// Slug naming the unit pair (lowercase letters, digits, hyphens).
+    pub name: String,
+    /// systemd `OnCalendar=` value, for example `daily` or `Mon 06:00`.
+    pub on_calendar: String,
+    /// The command the timer runs, as an argv whose first element is absolute.
+    pub command: Vec<String>,
+}
+
+/// Whether `value` is a calendar schedule systemd can take literally: one line of
+/// letters, digits, and the punctuation calendar syntax uses, with no specifier,
+/// quote, or command separator.
+pub(crate) fn calendar_schedule(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.trim() == value
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b" -,.:/*".contains(&byte))
+}
+
 fn default_startup_delay() -> u64 {
     20
 }
@@ -126,6 +153,10 @@ pub struct RestoreConfig {
     /// Timers the watch keeps firing.
     #[serde(default)]
     pub timers: Vec<TimerWatch>,
+    /// Scheduled commands `install-units --scheduled` renders as persistent
+    /// timer/service user unit pairs (#743).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scheduled: Vec<ScheduledUnit>,
     /// Top-level keys this build does not know, named in a warning and otherwise ignored.
     #[serde(flatten)]
     pub(crate) unknown: UnknownKeys,
@@ -195,6 +226,7 @@ impl RestoreConfig {
             report_dir: None,
             herdr_unit: None,
             timers: Vec::new(),
+            scheduled: Vec::new(),
             unknown: UnknownKeys::default(),
         }
     }
@@ -249,6 +281,32 @@ impl RestoreConfig {
             return Err(invalid(
                 "timers need a .timer unit and a positive max_age_seconds",
             ));
+        }
+        let mut scheduled_names = std::collections::BTreeSet::new();
+        for entry in &self.scheduled {
+            if !agent_name(&entry.name) || !scheduled_names.insert(&entry.name) {
+                return Err(invalid("scheduled entries need unique agent-style names"));
+            }
+            if !calendar_schedule(&entry.on_calendar) {
+                return Err(invalid(
+                    "scheduled on_calendar is not a plain calendar schedule",
+                ));
+            }
+            let Some(program) = entry.command.first() else {
+                return Err(invalid("scheduled command must not be empty"));
+            };
+            if !Path::new(program).is_absolute()
+                || entry.command.iter().any(|argument| {
+                    argument.is_empty()
+                        || argument
+                            .chars()
+                            .any(|c| c.is_control() || c == '\n' || c == '\r')
+                })
+            {
+                return Err(invalid(
+                    "scheduled command needs an absolute program and plain arguments",
+                ));
+            }
         }
         if self.startup_delay_seconds > 600 || self.herdr_wait_seconds > 3600 {
             return Err(invalid(
@@ -2477,6 +2535,40 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("line 2"), "{error}");
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn scheduled_entries_load_and_are_validated() {
+        let directory =
+            std::env::temp_dir().join(format!("restore-scheduled-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(CONFIG_FILE);
+        let load = |text: &str| {
+            fs::write(&path, text).unwrap();
+            RestoreConfig::load(&directory)
+        };
+        let config = load(
+            r##"{"schema": "agentctl-restore/v1", "scheduled": [{"name": "nightly-backup", "on_calendar": "Mon 06:00", "command": ["/home/me/bin/backup", "--quiet"]}]}"##,
+        )
+        .unwrap();
+        assert_eq!(config.scheduled.len(), 1);
+        assert_eq!(config.scheduled[0].name, "nightly-backup");
+        assert_eq!(config.scheduled[0].command.len(), 2);
+        for refused in [
+            // A duplicate name would render one pair over another.
+            r##"{"schema": "agentctl-restore/v1", "scheduled": [{"name": "a", "on_calendar": "daily", "command": ["/bin/true"]}, {"name": "a", "on_calendar": "hourly", "command": ["/bin/true"]}]}"##,
+            // A schedule is one literal calendar line, never a command separator.
+            r##"{"schema": "agentctl-restore/v1", "scheduled": [{"name": "a", "on_calendar": "daily; rm -rf /", "command": ["/bin/true"]}]}"##,
+            // The program must be absolute so the unit does not depend on PATH.
+            r##"{"schema": "agentctl-restore/v1", "scheduled": [{"name": "a", "on_calendar": "daily", "command": ["true"]}]}"##,
+            r##"{"schema": "agentctl-restore/v1", "scheduled": [{"name": "a", "on_calendar": "daily", "command": []}]}"##,
+            r##"{"schema": "agentctl-restore/v1", "scheduled": [{"name": "Bad Name", "on_calendar": "daily", "command": ["/bin/true"]}]}"##,
+            // Unknown keys inside an entry stay strict.
+            r##"{"schema": "agentctl-restore/v1", "scheduled": [{"name": "a", "on_calendar": "daily", "command": ["/bin/true"], "surprise": 1}]}"##,
+        ] {
+            assert!(load(refused).is_err(), "{refused}");
+        }
         fs::remove_dir_all(&directory).unwrap();
     }
 }

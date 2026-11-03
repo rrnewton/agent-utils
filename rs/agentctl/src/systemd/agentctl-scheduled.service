@@ -1,0 +1,12 @@
+# Installed by `agentctl install-units --scheduled` from the team spec (the `scheduled`
+# entry @NAME@ in restore.json). Runs the spec's command as a persistent user unit
+# driven by agentctl-scheduled-@NAME@.timer, instead of a `systemd-run` transient a
+# reboot deletes. ConditionHost keeps the pair inert on any other host that shares
+# this unit directory.
+[Unit]
+Description=agentctl scheduled command @NAME@
+ConditionHost=@HOST@
+
+[Service]
+Type=oneshot
+ExecStart=@COMMAND@

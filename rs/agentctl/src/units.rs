@@ -19,6 +19,8 @@ const AGENT_WATCH: &str = include_str!("systemd/agent-watch.service");
 const BRIDGE_AFTER_HERDR: &str = include_str!("systemd/bridge-after-herdr.conf");
 const HEADLESS: &str = include_str!("systemd/agentctl-headless.service");
 const BRIDGE: &str = include_str!("systemd/agentctl-bridge.service");
+const SCHEDULED_SERVICE: &str = include_str!("systemd/agentctl-scheduled.service");
+const SCHEDULED_TIMER: &str = include_str!("systemd/agentctl-scheduled.timer");
 
 type Result<T> = std::result::Result<T, AgentError>;
 
@@ -237,6 +239,112 @@ pub fn install_bridge(options: &InstallOptions, name: &str) -> Result<Value> {
     }))
 }
 
+/// One argument of a scheduled command as systemd takes it literally in an
+/// `ExecStart=` line: no white space, quotes, backslash, control character, `$`, `;`,
+/// or backtick; `%` is escaped as `%%`.
+fn scheduled_argument(argument: &str) -> Result<String> {
+    if argument.is_empty()
+        || argument.chars().any(|character| {
+            character.is_whitespace() || character.is_control() || "\"'\\$;`".contains(character)
+        })
+    {
+        return Err(fail(format!(
+            "scheduled command argument cannot be rendered literally: {argument:?}"
+        )));
+    }
+    Ok(argument.replace('%', "%%"))
+}
+
+/// The `ConditionHost=` value: this host's name, taken literally.
+fn scheduled_host(host: &str) -> Result<String> {
+    if host.is_empty()
+        || !host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+    {
+        return Err(fail(format!(
+            "host name cannot be rendered in ConditionHost: {host:?}"
+        )));
+    }
+    Ok(host.to_owned())
+}
+
+/// The persistent timer/service pair one `scheduled` spec entry renders as, on the
+/// host named `host`: `(relative path, contents)` for the service, then the timer.
+pub fn rendered_scheduled(
+    entry: &crate::restore::ScheduledUnit,
+    host: &str,
+) -> Result<Vec<(PathBuf, String)>> {
+    bridge_name(&entry.name)?;
+    let host = scheduled_host(host)?;
+    if !crate::restore::calendar_schedule(&entry.on_calendar) {
+        return Err(fail(format!(
+            "scheduled {:?} on_calendar is not a plain calendar schedule: {:?}",
+            entry.name, entry.on_calendar
+        )));
+    }
+    let Some(program) = entry.command.first() else {
+        return Err(fail(format!(
+            "scheduled {:?} command must not be empty",
+            entry.name
+        )));
+    };
+    let mut rendered = unit_path("scheduled program", Path::new(program))?;
+    for argument in &entry.command[1..] {
+        rendered.push(' ');
+        rendered.push_str(&scheduled_argument(argument)?);
+    }
+    let base = format!("agentctl-scheduled-{}", entry.name);
+    Ok(vec![
+        (
+            PathBuf::from(format!("{base}.service")),
+            SCHEDULED_SERVICE
+                .replace("@HOST@", &host)
+                .replace("@COMMAND@", &rendered)
+                .replace("@NAME@", &entry.name),
+        ),
+        (
+            PathBuf::from(format!("{base}.timer")),
+            SCHEDULED_TIMER
+                .replace("@HOST@", &host)
+                .replace("@SCHEDULE@", &entry.on_calendar.replace('%', "%%"))
+                .replace("@NAME@", &entry.name),
+        ),
+    ])
+}
+
+/// Write every `scheduled` entry of the registry's team spec as a persistent
+/// timer/service pair for this host; refuse to replace a different existing file
+/// without `force`. Enables and starts nothing.
+pub fn install_scheduled(options: &InstallOptions) -> Result<Value> {
+    let config = crate::restore::RestoreConfig::load(&options.registry)?;
+    if config.scheduled.is_empty() {
+        return Err(fail(
+            "the team spec (restore.json) names no scheduled entries; add a \
+             \"scheduled\" list of {name, on_calendar, command} first",
+        ));
+    }
+    let host = crate::subagents::local_hostname()
+        .ok_or_else(|| fail("cannot determine this host's name for the units' ConditionHost"))?;
+    let mut files = Vec::new();
+    let mut timers = Vec::new();
+    for entry in &config.scheduled {
+        files.extend(rendered_scheduled(entry, &host)?);
+        timers.push(format!("agentctl-scheduled-{}.timer", entry.name));
+    }
+    let (written, unchanged) = write_files(options, &files)?;
+    Ok(json!({
+        "dry_run": options.dry_run,
+        "written": written,
+        "unchanged": unchanged,
+        "next_steps": [
+            "review the files",
+            "systemctl --user daemon-reload",
+            format!("systemctl --user enable --now {}", timers.join(" ")),
+        ],
+    }))
+}
+
 /// Write only the unit of the headless agent `name`; refuse to replace a different existing
 /// file without `force`. Enables and starts nothing.
 pub fn install_headless(
@@ -410,6 +518,120 @@ mod tests {
         assert_eq!(report["written"].as_array().unwrap().len(), 1);
         assert!(dest.join("agentctl-bridge-coordinator.service").is_file());
         assert!(!dest.join("agent-watch.service").exists());
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    fn scheduled(name: &str, on_calendar: &str, command: &[&str]) -> crate::restore::ScheduledUnit {
+        crate::restore::ScheduledUnit {
+            name: name.to_owned(),
+            on_calendar: on_calendar.to_owned(),
+            command: command.iter().map(|item| item.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn scheduled_pair_is_persistent_host_bound_and_fully_rendered() {
+        let entry = scheduled(
+            "nightly-backup",
+            "Mon 06:00",
+            &["/home/owner/bin/backup", "--quiet", "50%"],
+        );
+        let files = rendered_scheduled(&entry, "host-one.example").unwrap();
+        let names = files
+            .iter()
+            .map(|(path, _)| path.display().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "agentctl-scheduled-nightly-backup.service",
+                "agentctl-scheduled-nightly-backup.timer"
+            ]
+        );
+        let (service, timer) = (&files[0].1, &files[1].1);
+        assert!(
+            service.contains("ConditionHost=host-one.example\n"),
+            "{service}"
+        );
+        assert!(
+            service.contains("ExecStart=/home/owner/bin/backup --quiet 50%%\n"),
+            "{service}"
+        );
+        assert!(service.contains("Type=oneshot"), "{service}");
+        assert!(
+            timer.contains("ConditionHost=host-one.example\n"),
+            "{timer}"
+        );
+        assert!(timer.contains("OnCalendar=Mon 06:00\n"), "{timer}");
+        assert!(
+            timer.contains("Unit=agentctl-scheduled-nightly-backup.service\n"),
+            "{timer}"
+        );
+        assert!(timer.contains("Persistent=true\n"), "{timer}");
+        assert!(timer.contains("WantedBy=timers.target\n"), "{timer}");
+        for (_, contents) in &files {
+            assert!(!contents.contains('@'), "{contents}");
+        }
+    }
+
+    #[test]
+    fn scheduled_rendering_refuses_unrenderable_entries() {
+        for entry in [
+            scheduled("Bad Name", "daily", &["/bin/true"]),
+            scheduled("ok", "daily; rm -rf /", &["/bin/true"]),
+            scheduled("ok", "daily", &["true"]),
+            scheduled("ok", "daily", &[]),
+            scheduled("ok", "daily", &["/bin/echo", "two words"]),
+            scheduled("ok", "daily", &["/bin/echo", "$HOME"]),
+        ] {
+            assert!(rendered_scheduled(&entry, "host-one").is_err(), "{entry:?}");
+        }
+        assert!(rendered_scheduled(&scheduled("ok", "daily", &["/bin/true"]), "bad host").is_err());
+    }
+
+    #[test]
+    fn install_scheduled_writes_every_spec_pair_and_nothing_else() {
+        let dest = scratch("scheduled");
+        let registry = dest.join("registry");
+        fs::create_dir_all(&registry).unwrap();
+        let mut chosen = options(&dest);
+        chosen.registry = registry.clone();
+        // Without a spec entry there is nothing to write, and that is said out loud.
+        assert!(install_scheduled(&chosen).is_err());
+        fs::write(
+            registry.join("restore.json"),
+            r#"{"schema": "agentctl-restore/v1", "scheduled": [
+                {"name": "nightly-backup", "on_calendar": "daily", "command": ["/home/owner/bin/backup"]},
+                {"name": "hourly-tick", "on_calendar": "hourly", "command": ["/home/owner/bin/tick"]}
+            ]}"#,
+        )
+        .unwrap();
+        let host = crate::subagents::local_hostname().unwrap();
+        let report = install_scheduled(&chosen).unwrap();
+        assert_eq!(report["written"].as_array().unwrap().len(), 4);
+        for name in [
+            "agentctl-scheduled-nightly-backup.service",
+            "agentctl-scheduled-nightly-backup.timer",
+            "agentctl-scheduled-hourly-tick.service",
+            "agentctl-scheduled-hourly-tick.timer",
+        ] {
+            assert!(dest.join(name).is_file(), "{name}");
+        }
+        assert!(!dest.join("agent-watch.service").exists());
+        let timer = fs::read_to_string(dest.join("agentctl-scheduled-hourly-tick.timer")).unwrap();
+        assert!(
+            timer.contains(&format!("ConditionHost={host}\n")),
+            "{timer}"
+        );
+        assert!(
+            report["next_steps"][2]
+                .as_str()
+                .unwrap()
+                .contains("enable --now agentctl-scheduled-nightly-backup.timer"),
+            "{report}"
+        );
+        let again = install_scheduled(&chosen).unwrap();
+        assert_eq!(again["unchanged"].as_array().unwrap().len(), 4);
         let _ = fs::remove_dir_all(&dest);
     }
 

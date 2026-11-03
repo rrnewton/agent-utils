@@ -1,0 +1,14 @@
+# Installed by `agentctl install-units --scheduled` from the team spec (the `scheduled`
+# entry @NAME@ in restore.json). Persistent=true fires a run missed while the host
+# was off at the next boot, so a reboot does not silently skip a period.
+[Unit]
+Description=agentctl scheduled command @NAME@ timer
+ConditionHost=@HOST@
+
+[Timer]
+OnCalendar=@SCHEDULE@
+Unit=agentctl-scheduled-@NAME@.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target
