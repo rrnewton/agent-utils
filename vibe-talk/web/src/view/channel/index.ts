@@ -87,3 +87,5 @@ export { createPackSlides } from "./packslide.ts";
 export type { PackSlides, PackSlidesDependencies } from "./packslide.ts";
 export { createScrollKeeping } from "./scrollkeep.ts";
 export type { ScrollKeeping, ScrollKeepingDependencies, ScrollMark } from "./scrollkeep.ts";
+export { createCardFlight } from "./cardflight.ts";
+export type { CardFlight, CardFlightDependencies } from "./cardflight.ts";

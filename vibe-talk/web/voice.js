@@ -30040,90 +30040,29 @@ function cardFlightStart(id) {
 }
 
 /**
- * The card moving up while it is: the card at the top, the pane fading in under it, and the timer that
- * ends both should the browser never say their animations ended — a thread closed as it opens, its
- * card no longer drawn. Null with none.
- *
- * @type {{card: HTMLElement, pane: HTMLElement, timer: ReturnType<typeof setTimeout>} | null}
+ * The card moving up while it is, moving it, and ending it by its animations or a timer: one owner in
+ * web/src/view/channel/cardflight.ts (`#624 voice-page-modularity`). The page destructures its commands
+ * under their old names.
  */
-let cardFlight = null;
-
-/**
- * Move `card`, at the top of a thread just opened, up from `from`, where its card in the list was, and
- * fade in `pane`, the thread under it. Nothing without a place to come from, with no time to do it in
- * (`cardFlightMs`), with the card not drawn, or with nowhere to go.
- *
- * @param {HTMLElement} card
- * @param {DOMRect | {left: number, top: number} | null} from
- * @param {HTMLElement} pane
- */
-function flyThreadCard(card, from, pane) {
-  // A card still moving from the last thread stops where it is going: this one starts afresh.
-  endCardFlight();
-  if (!from || !drawnOnPage(card)) return;
-  const ms = cardFlightMs();
-  if (!(ms > 0)) return;
-  const to = card.getBoundingClientRect();
-  const dx = from.left - to.left;
-  const dy = from.top - to.top;
-  if (Math.abs(dx) < 1 && Math.abs(dy) < 1) return;
-  card.style.setProperty("--flight-x", `${dx}px`);
-  card.style.setProperty("--flight-y", `${dy}px`);
-  card.setAttribute("data-flying", "");
-  pane.setAttribute("data-arriving", "");
-  // The fade under it (180 ms after 60) ends inside this too, at the stylesheet's own length.
-  cardFlight = { card, pane, timer: setTimeout(endCardFlight, ms + 100) };
-  // The line from the root follows the card up, each frame it moves.
-  if (!columnLinksShown() || typeof requestAnimationFrame !== "function") return;
-  const follow = () => {
-    if (!card.hasAttribute("data-flying")) return;
-    drawColumnLinks();
-    requestAnimationFrame(follow);
-  };
-  requestAnimationFrame(follow);
-}
+const cardFlightOwner = createCardFlight({
+  clock: clockOnUse(),
+  ms: () => cardFlightMs(),
+  drawn: (node) => drawnOnPage(node),
+  linksShown: () => columnLinksShown(),
+  drawLinks: () => drawColumnLinks(),
+  scheduleLinks: () => scheduleColumnLinks(),
+  frame: (run) => {
+    if (typeof requestAnimationFrame !== "function") return false;
+    requestAnimationFrame(run);
+    return true;
+  },
+});
+const { flyThreadCard, endCardFlightPart, endCardFlight } = cardFlightOwner;
 
 /** Whether `node` and everything it is in are drawn: none of them `hidden`. */
 function drawnOnPage(node) {
   for (let at = node; at; at = /** @type {HTMLElement} */ (at.parentNode)) if (at.hidden) return false;
   return true;
-}
-
-/**
- * The browser says `node`'s animation ended: the card at the top is at its place, or the thread has
- * faded in. Each ends its own part; the second to end ends the flight. An animation of something in it
- * is not its own.
- *
- * @param {HTMLElement} node
- * @param {any} event
- */
-function endCardFlightPart(node, event) {
-  const flight = cardFlight;
-  if (!flight || !event || event.target !== node) return;
-  if (node === flight.card) {
-    node.removeAttribute("data-flying");
-    // Drawn once more where the card came to rest.
-    scheduleColumnLinks();
-  } else if (node === flight.pane) {
-    node.removeAttribute("data-arriving");
-  } else {
-    return;
-  }
-  if (!flight.card.hasAttribute("data-flying") && !flight.pane.hasAttribute("data-arriving")) {
-    clearTimeout(flight.timer);
-    cardFlight = null;
-  }
-}
-
-/** End the card's move and the thread's fade, if they are under way, wherever they have got to. */
-function endCardFlight() {
-  const flight = cardFlight;
-  if (!flight) return;
-  cardFlight = null;
-  clearTimeout(flight.timer);
-  flight.card.removeAttribute("data-flying");
-  flight.pane.removeAttribute("data-arriving");
-  scheduleColumnLinks();
 }
 
 /** The right column with no thread selected: its cards, and the thread list read behind them. */

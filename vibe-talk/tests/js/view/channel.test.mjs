@@ -517,3 +517,49 @@ test("`#624 voice-page-modularity`: the reader is left on the message their eye 
   keep.followIfPinned(true, 1, "discord");
   assert.equal(calls.at(-1), "newest");
 });
+
+test("`#624 voice-page-modularity`: the card at the top of a thread moves up from its card, and each part ends with its own animation", () => {
+  const { createCardFlight } = CHANNEL_VIEW;
+  const node = (top) => {
+    const attrs = new Map();
+    const style = new Map();
+    return {
+      style: { setProperty: (name, value) => style.set(name, value), getPropertyValue: (name) => style.get(name) || "" },
+      setAttribute: (name, value) => attrs.set(name, value), removeAttribute: (name) => attrs.delete(name),
+      hasAttribute: (name) => attrs.has(name), getBoundingClientRect: () => ({ left: 10, top }),
+    };
+  };
+  const timers = [];
+  let ms = 300;
+  let links = 0;
+  let scheduled = 0;
+  const flight = createCardFlight({
+    clock: { setTimeout: (run, wait) => { timers.push({ run, wait }); return timers.length; }, clearTimeout: (h) => { timers[h - 1] = null; } },
+    ms: () => ms, drawn: () => true, linksShown: () => false, drawLinks: () => { links += 1; }, scheduleLinks: () => { scheduled += 1; },
+    frame: () => true,
+  });
+  const card = node(0);
+  const pane = node(100);
+  flight.flyThreadCard(card, { left: 10, top: 240 }, pane);
+  assert.equal(card.hasAttribute("data-flying"), true);
+  assert.equal(card.style.getPropertyValue("--flight-y"), "240px", "it starts where its card was");
+  assert.equal(pane.hasAttribute("data-arriving"), true);
+  assert.equal(timers[0].wait, 400, "the timer outlasts the stylesheet's length");
+  flight.endCardFlightPart(card, { target: {} });
+  assert.equal(card.hasAttribute("data-flying"), true, "an animation of something in the card is not its own");
+  flight.endCardFlightPart(card, { target: card });
+  assert.equal(card.hasAttribute("data-flying"), false);
+  assert.equal(scheduled, 1);
+  flight.endCardFlightPart(pane, { target: pane });
+  assert.equal(timers[0], null, "the second part ending ends the flight");
+  ms = 0;
+  flight.flyThreadCard(card, { left: 10, top: 240 }, pane);
+  assert.equal(card.hasAttribute("data-flying"), false, "less motion: nothing moves");
+  ms = 300;
+  flight.flyThreadCard(card, null, pane);
+  assert.equal(card.hasAttribute("data-flying"), false, "no card on screen to come from");
+  flight.flyThreadCard(card, { left: 10, top: 240 }, pane);
+  flight.endCardFlight();
+  assert.equal(card.hasAttribute("data-flying") || pane.hasAttribute("data-arriving"), false, "ended wherever it had got to");
+  assert.equal(links, 0, "no line followed with the lines not drawn");
+});

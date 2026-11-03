@@ -3584,7 +3584,7 @@ test("`#298 thread-card-header`: the card moves up only from a card on screen â€
       assert.deepStrictEqual(moved(page), [false, false], `the card moved ${arrange ? "for a reader who asked for less motion" : "with no time to do it in"}`);
       assert.equal(page.el("side-thread-card").hidden, false);
     }
-    const { page } = await linkedColumns(16, (p) => p.preferReducedMotion(), brokenScript("  if (!(ms > 0)) return;\n", ""));
+    const { page } = await linkedColumns(16, (p) => p.preferReducedMotion(), await brokenModule([{ file: "src/view/channel/cardflight.ts", find: "    if (!(ms > 0)) return;\n", replace: "" }]));
     await showCard(page, 8);
     await openerOf(threadCard(page, 8)).click();
     await page.settle();
