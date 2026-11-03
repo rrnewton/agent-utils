@@ -1,12 +1,13 @@
 ---
 title: 'services-refresh-health-window-from-start: count the refresh health window from the new process start'
-status: open
+status: closed
 priority: 3
 issue_type: bug
 labels:
 - agentctl
 created_at: 2026-11-02T23:21:25.022172767+00:00
 updated_at: 2026-11-02T23:21:25.022172767+00:00
+closed_at: 2026-11-03T18:42:07.419560+00:00
 ---
 
 # Description
