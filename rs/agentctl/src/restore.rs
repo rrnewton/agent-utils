@@ -96,6 +96,10 @@ pub struct RestoreConfig {
     /// Registered names restore leaves alone and does not count, for example a stale record.
     #[serde(default)]
     pub exclude: Vec<String>,
+    /// Desired state (#742): when present, only these agents (plus the coordinator) are
+    /// restored; every other registered name stays retired, for example finished lanes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agents: Option<Vec<String>>,
     /// Seconds between two lane launches (default 20).
     #[serde(default = "default_startup_delay")]
     pub startup_delay_seconds: u64,
@@ -171,6 +175,7 @@ impl RestoreConfig {
             also_registered: Vec::new(),
             units: Vec::new(),
             exclude: Vec::new(),
+            agents: None,
             startup_delay_seconds: default_startup_delay(),
             herdr_wait_seconds: default_herdr_wait(),
             report_dir: None,
@@ -198,6 +203,11 @@ impl RestoreConfig {
             .any(|name| !agent_name(name) || self.coordinator.as_deref() == Some(name.as_str()))
         {
             return Err(invalid("exclude names agents, and never the coordinator"));
+        }
+        if let Some(agents) = self.agents.as_ref() {
+            if agents.iter().any(|name| !agent_name(name)) {
+                return Err(invalid("agents names agents"));
+            }
         }
         if self
             .also_registered
@@ -1388,6 +1398,13 @@ pub fn restore<A: ManagedApi + ?Sized>(
                 agents.push(json!({"name": name, "action": "excluded", "reason": "listed in restore.json exclude"}));
                 continue;
             }
+            if let Some(desired) = config.agents.as_ref() {
+                if !desired.iter().any(|wanted| wanted == name) {
+                    agents.push(json!({"name": name, "action": "excluded", "reason": "not listed in restore.json agents (desired state)"}));
+                    continue;
+                }
+            }
+            eprintln!("agentctl restore: restoring {name}");
             let mut row = recover_agent(&manager, name, options);
             let launched = matches!(row["action"].as_str(), Some("revived"));
             if let (Some(wrkslots), Some(agent), true) = (

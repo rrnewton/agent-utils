@@ -701,6 +701,25 @@ fn restore_leaves_excluded_records_alone_and_never_excludes_the_coordinator() {
 }
 
 #[test]
+fn restore_with_a_desired_agents_list_leaves_unlisted_records_retired() {
+    let fixture = Fixture::new();
+    let old = dead_agent(&fixture);
+    let host = ScriptedHost::new();
+    let registry = fixture.root.join("registry");
+    let config = RestoreConfig {
+        agents: Some(vec!["someone-else".to_owned()]),
+        ..config(&fixture, None)
+    };
+    let report = restore(&fixture.client, &registry, &host, &config, &options(None)).unwrap();
+    assert_eq!(report["agents"][0]["action"], "excluded");
+    assert_eq!(
+        report["agents"][0]["reason"],
+        "not listed in restore.json agents (desired state)"
+    );
+    assert_eq!(fixture.manager().load("lane").unwrap().token, old.token);
+}
+
+#[test]
 fn a_restore_on_the_boot_its_agents_were_pinned_on_says_no_restart_and_keeps_crons() {
     let fixture = Fixture::new();
     fixture
