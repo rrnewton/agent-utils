@@ -897,8 +897,8 @@ _AUDIT_CACHE_KEY_BYTES = 32
 _AUDIT_CACHE_STATE_BYTES_LIMIT = 64 * 1024 * 1024
 _AUDIT_CACHE_WORK_LIMIT = 100_000
 _AUDIT_CACHE_WALL_SECONDS = 5.0
-# Total cache-glob planning time per audit, across every subject (audit plans under the shared
-# state lock, and writers default to not waiting for it).
+# Total cache-glob planning time per audit, across every subject (planning runs outside
+# the state lock after a short-lock snapshot, #797).
 _AUDIT_CACHE_PLAN_TOTAL_SECONDS = 30.0
 
 
@@ -35269,6 +35269,7 @@ def _cmd_audit(args: argparse.Namespace) -> int:
         registry_started = metrics.start()
         _refuse_partial_state(config, allow_validate_batch_seals=True)
         states, _archives = _validate_global_state(config)
+        snapshot_revision = _audit_registry_revision(states)
         records = [record for state in states for record in state.slots]
         event_logs = {
             state.machine: _load_events(config, state.machine) for state in states
@@ -35293,402 +35294,436 @@ def _cmd_audit(args: argparse.Namespace) -> int:
                 "validation_seals": len(seal_targets),
             },
         )
-        liveness_started = metrics.start()
-        # Validation rows are answered by their runs, agent rows by the
-        # registered command; see _validation_run_liveness_states.
-        registered_liveness = _owner_liveness_states(config, records)
-        agent_subjects = sum(record.slot_type != "validate" for record in records)
-        metrics.finish(
-            "liveness",
-            liveness_started,
-            {
-                "batch_invocations": int(
-                    bool(agent_subjects) and config.liveness_batch_command is not None
-                ),
-                "legacy_invocations": (
-                    0 if config.liveness_batch_command is not None else agent_subjects
-                ),
-                "subjects": agent_subjects,
-                "validation_run_subjects": len(records) - agent_subjects,
-            },
-        )
-        census_started = metrics.start()
-        process_census: _ProcessPathCensus | None = None
-        process_census_error: str | None = None
-        if records:
-            try:
-                process_census = _capture_process_path_census(
-                    [_slot_directory(config, record.slot, record.slot_type) for record in records]
-                )
-            except Refusal as exc:
-                process_census_error = f"process/path census failed: {exc}"
-        metrics.finish(
-            "process-census",
-            census_started,
-            {
-                "census_attempted": int(bool(records)),
-                "slot_paths": len(records),
-            },
-        )
-        on_disk: set[tuple[str, str]] = set()
-        for slot_type, root in _slot_roots(config).items():
-            if not root.exists():
-                continue
-            try:
-                on_disk.update(
-                    (slot_type, entry.name)
-                    for entry in root.iterdir()
-                    if entry.is_dir()
-                    and not entry.is_symlink()
-                    and not entry.name.startswith("EVENTS.")
-                    and not _is_representation_directory(config, entry)
-                    and not (
-                        slot_type == "agent"
-                        and entry == _validate_slots_directory(config)
-                    )
-                )
-            except OSError as exc:
-                raise Refusal(f"cannot enumerate worktree slots in {root}: {exc}") from exc
-        registered = {(record.slot_type, record.slot) for record in records}
-        rows: list[dict[str, object]] = []
-        running_agent_count = 0
-        audit_vcs = _AuditGitVcs()
-        # A Git worktree registered inside a row's slot that no checkout of
-        # the row names (a nested helper such as `<slot>/.base-<hex>`) makes
-        # remove refuse through _assert_command_registry_storage, so audit
-        # must not call that slot DELETABLE. Measured 2026-10-19: a slot audit
-        # reported DELETABLE was refused by remove for exactly this.
-        stray_registrations: dict[tuple[str, str], list[str]] = {}
-        stray_registration_error: str | None = None
+    liveness_started = metrics.start()
+    # Validation rows are answered by their runs, agent rows by the
+    # registered command; see _validation_run_liveness_states.
+    registered_liveness = _owner_liveness_states(config, records)
+    agent_subjects = sum(record.slot_type != "validate" for record in records)
+    metrics.finish(
+        "liveness",
+        liveness_started,
+        {
+            "batch_invocations": int(
+                bool(agent_subjects) and config.liveness_batch_command is not None
+            ),
+            "legacy_invocations": (
+                0 if config.liveness_batch_command is not None else agent_subjects
+            ),
+            "subjects": agent_subjects,
+            "validation_run_subjects": len(records) - agent_subjects,
+        },
+    )
+    census_started = metrics.start()
+    process_census: _ProcessPathCensus | None = None
+    process_census_error: str | None = None
+    if records:
         try:
-            for finding in _registry_storage_inconsistencies(
-                config, states, vcs=audit_vcs, verify_row_identity=False
-            ):
-                if (
-                    finding.kind == "git-registration-without-row"
-                    and finding.slot_type is not None
-                    and finding.slot is not None
-                ):
-                    stray_registrations.setdefault(
-                        (finding.slot_type, finding.slot), []
-                    ).append(finding.detail)
+            process_census = _capture_process_path_census(
+                [_slot_directory(config, record.slot, record.slot_type) for record in records]
+            )
         except Refusal as exc:
-            stray_registration_error = (
-                f"cannot list Git worktree registrations inside the managed root: {exc}"
-            )
-        cache_planned: dict[str, tuple[CacheDirectory, ...]] = {}
-        cache_errors: dict[str, str] = {}
-        record_cache_subjects: dict[tuple[str, str, int], str] = {}
-        unregistered_cache_subjects: dict[tuple[str, str], str] = {}
-        plan_targets: list[tuple[str, Sequence[Checkout] | CacheSlot]] = []
-        # A validation row is judged by completed validation removal, which is
-        # what remove --validate-complete and remove-validate-batch perform:
-        # its nested repositories are judged as that removal judges them.
-        validation_subjects: set[str] = set()
-        for record in records:
-            subject = f"record:{record.machine}:{record.slot}:{record.generation}"
-            record_cache_subjects[(record.machine, record.slot, record.generation)] = subject
-            plan_targets.append((subject, record.checkouts))
-            if record.slot_type == "validate":
-                validation_subjects.add(subject)
-        for slot_type, slot in sorted(on_disk - registered):
-            subject = f"unregistered:{slot_type}:{slot}"
-            unregistered_cache_subjects[(slot_type, slot)] = subject
-            if slot_type != "agent":
-                cache_planned[subject] = ()
-                continue
-            journal_slot = journal_slots.get(slot)
-            plan_targets.append(
-                (
-                    subject,
-                    journal_slot
-                    if journal_slot is not None
-                    else CacheSlot(slot, config.machine, (), "unregistered"),
+            process_census_error = f"process/path census failed: {exc}"
+    metrics.finish(
+        "process-census",
+        census_started,
+        {
+            "census_attempted": int(bool(records)),
+            "slot_paths": len(records),
+        },
+    )
+    on_disk: set[tuple[str, str]] = set()
+    for slot_type, root in _slot_roots(config).items():
+        if not root.exists():
+            continue
+        try:
+            on_disk.update(
+                (slot_type, entry.name)
+                for entry in root.iterdir()
+                if entry.is_dir()
+                and not entry.is_symlink()
+                and not entry.name.startswith("EVENTS.")
+                and not _is_representation_directory(config, entry)
+                and not (
+                    slot_type == "agent"
+                    and entry == _validate_slots_directory(config)
                 )
             )
-        # Recursive cache globs can reach arbitrarily large ignored trees. Work
-        # (directory listings) is a shared, finite resource: each subject may
-        # use an equal share of what earlier subjects left, so an expensive
-        # subject exhausts only its own work share, never a cheap peer's.
-        # Wall time is not divided the same way: dividing the fixed wall
-        # allowance by the subject count gave a large fleet (26 subjects, a
-        # 5-second allowance) under 0.2s each, so every slow-but-completing
-        # walk failed planning and alone forced BLOCKED. Each subject
-        # therefore gets the full --cache-wall-seconds as its own planning
-        # allowance; a walk that fits that allowance completes however many
-        # peers exist, and only a walk that exceeds it reports
-        # _CachePlanExhausted. Total planning wall time is bounded by
-        # subjects * allowance, which the caller accepted by choosing the
-        # per-subject allowance -- and by --cache-plan-total-seconds across
-        # every subject, because the shared state lock is held while planning
-        # and writers default to not waiting for it. A subject that starts
-        # after the total is spent gets only what is left, and reports that.
-        plan_started = metrics.start()
-        plan_work = _AuditWorkBudget(args.cache_work_limit)
-        plan_total_left = plan_total_seconds
-        plan_exhausted = 0
-        for position, (subject, target) in enumerate(plan_targets):
-            remaining_subjects = len(plan_targets) - position
-            share = _CachePlanBudget(
-                _AuditWorkBudget(plan_work.remaining // remaining_subjects),
-                min(args.cache_wall_seconds, plan_total_left),
-                args.cache_wall_seconds,
-                total_seconds=plan_total_seconds,
-            )
-            try:
-                cache_planned[subject] = (
-                    _cache_slot_directories(config, target, vcs=audit_vcs, budget=share)
-                    if isinstance(target, CacheSlot)
-                    else _cache_directories(config, target, vcs=audit_vcs, budget=share)
-                )
-            except Refusal as exc:
-                cache_planned[subject] = ()
-                cache_errors[subject] = str(exc)
-                plan_exhausted += isinstance(exc, _CachePlanExhausted)
-            if subject in validation_subjects:
-                cache_planned[subject] = tuple(
-                    dataclasses.replace(cache, nested_git=_NESTED_GIT_VALIDATION_COMPLETE)
-                    for cache in cache_planned[subject]
-                )
-            plan_work.consumed += share.work.consumed
-            plan_total_left = max(0.0, plan_total_left - share.spent)
-        metrics.finish(
-            "cache-planning",
-            plan_started,
-            {
-                "directories_listed": plan_work.consumed,
-                "exhausted_subjects": plan_exhausted,
-                "subjects": len(plan_targets),
-            },
+        except OSError as exc:
+            raise Refusal(f"cannot enumerate worktree slots in {root}: {exc}") from exc
+    registered = {(record.slot_type, record.slot) for record in records}
+    rows: list[dict[str, object]] = []
+    running_agent_count = 0
+    audit_vcs = _AuditGitVcs()
+    # A Git worktree registered inside a row's slot that no checkout of
+    # the row names (a nested helper such as `<slot>/.base-<hex>`) makes
+    # remove refuse through _assert_command_registry_storage, so audit
+    # must not call that slot DELETABLE. Measured 2026-10-19: a slot audit
+    # reported DELETABLE was refused by remove for exactly this.
+    stray_registrations: dict[tuple[str, str], list[str]] = {}
+    stray_registration_error: str | None = None
+    try:
+        for finding in _registry_storage_inconsistencies(
+            config, states, vcs=audit_vcs, verify_row_identity=False
+        ):
+            if (
+                finding.kind == "git-registration-without-row"
+                and finding.slot_type is not None
+                and finding.slot is not None
+            ):
+                stray_registrations.setdefault(
+                    (finding.slot_type, finding.slot), []
+                ).append(finding.detail)
+    except Refusal as exc:
+        stray_registration_error = (
+            f"cannot list Git worktree registrations inside the managed root: {exc}"
         )
-        cache_started = metrics.start()
-        cache_state_path = None
-        cache_storage_error = None
-        if any(cache_planned.values()):
-            try:
-                cache_state_path = _audit_cache_state_path(config, args.cache_census_state)
-            except (OSError, Refusal) as exc:
-                if args.cache_census_state is not None:
-                    # Explicit path errors are CLI refusals. An unavailable
-                    # default cache is only unavailable accounting evidence.
-                    raise
-                cache_storage_error = f"default audit cache storage is unavailable: {exc}"
-        cache_measurements, cache_work = _audit_cache_census(
+    cache_planned: dict[str, tuple[CacheDirectory, ...]] = {}
+    cache_errors: dict[str, str] = {}
+    record_cache_subjects: dict[tuple[str, str, int], str] = {}
+    unregistered_cache_subjects: dict[tuple[str, str], str] = {}
+    plan_targets: list[tuple[str, Sequence[Checkout] | CacheSlot]] = []
+    # A validation row is judged by completed validation removal, which is
+    # what remove --validate-complete and remove-validate-batch perform:
+    # its nested repositories are judged as that removal judges them.
+    validation_subjects: set[str] = set()
+    for record in records:
+        subject = f"record:{record.machine}:{record.slot}:{record.generation}"
+        record_cache_subjects[(record.machine, record.slot, record.generation)] = subject
+        plan_targets.append((subject, record.checkouts))
+        if record.slot_type == "validate":
+            validation_subjects.add(subject)
+    for slot_type, slot in sorted(on_disk - registered):
+        subject = f"unregistered:{slot_type}:{slot}"
+        unregistered_cache_subjects[(slot_type, slot)] = subject
+        if slot_type != "agent":
+            cache_planned[subject] = ()
+            continue
+        journal_slot = journal_slots.get(slot)
+        plan_targets.append(
+            (
+                subject,
+                journal_slot
+                if journal_slot is not None
+                else CacheSlot(slot, config.machine, (), "unregistered"),
+            )
+        )
+    # Recursive cache globs can reach arbitrarily large ignored trees. Work
+    # (directory listings) is a shared, finite resource: each subject may
+    # use an equal share of what earlier subjects left, so an expensive
+    # subject exhausts only its own work share, never a cheap peer's.
+    # Wall time is not divided the same way: dividing the fixed wall
+    # allowance by the subject count gave a large fleet (26 subjects, a
+    # 5-second allowance) under 0.2s each, so every slow-but-completing
+    # walk failed planning and alone forced BLOCKED. Each subject
+    # therefore gets the full --cache-wall-seconds as its own planning
+    # allowance; a walk that fits that allowance completes however many
+    # peers exist, and only a walk that exceeds it reports
+    # _CachePlanExhausted. Total planning wall time is bounded by
+    # subjects * allowance, which the caller accepted by choosing the
+    # per-subject allowance -- and by --cache-plan-total-seconds across
+    # every subject, bounding total planning wall time even though
+    # planning now runs outside the state lock (#797). A subject that starts
+    # after the total is spent gets only what is left, and reports that.
+    plan_started = metrics.start()
+    plan_work = _AuditWorkBudget(args.cache_work_limit)
+    plan_total_left = plan_total_seconds
+    plan_exhausted = 0
+    for position, (subject, target) in enumerate(plan_targets):
+        remaining_subjects = len(plan_targets) - position
+        share = _CachePlanBudget(
+            _AuditWorkBudget(plan_work.remaining // remaining_subjects),
+            min(args.cache_wall_seconds, plan_total_left),
+            args.cache_wall_seconds,
+            total_seconds=plan_total_seconds,
+        )
+        try:
+            cache_planned[subject] = (
+                _cache_slot_directories(config, target, vcs=audit_vcs, budget=share)
+                if isinstance(target, CacheSlot)
+                else _cache_directories(config, target, vcs=audit_vcs, budget=share)
+            )
+        except Refusal as exc:
+            cache_planned[subject] = ()
+            cache_errors[subject] = str(exc)
+            plan_exhausted += isinstance(exc, _CachePlanExhausted)
+        if subject in validation_subjects:
+            cache_planned[subject] = tuple(
+                dataclasses.replace(cache, nested_git=_NESTED_GIT_VALIDATION_COMPLETE)
+                for cache in cache_planned[subject]
+            )
+        plan_work.consumed += share.work.consumed
+        plan_total_left = max(0.0, plan_total_left - share.spent)
+    metrics.finish(
+        "cache-planning",
+        plan_started,
+        {
+            "directories_listed": plan_work.consumed,
+            "exhausted_subjects": plan_exhausted,
+            "subjects": len(plan_targets),
+        },
+    )
+    cache_started = metrics.start()
+    cache_state_path = None
+    cache_storage_error = None
+    if any(cache_planned.values()):
+        try:
+            cache_state_path = _audit_cache_state_path(config, args.cache_census_state)
+        except (OSError, Refusal) as exc:
+            if args.cache_census_state is not None:
+                # Explicit path errors are CLI refusals. An unavailable
+                # default cache is only unavailable accounting evidence.
+                raise
+            cache_storage_error = f"default audit cache storage is unavailable: {exc}"
+    cache_measurements, cache_work = _audit_cache_census(
+        config,
+        states,
+        cache_planned,
+        cache_errors,
+        state_path=cache_state_path,
+        work_limit=args.cache_work_limit,
+        wall_seconds=args.cache_wall_seconds,
+        storage_error=cache_storage_error,
+    )
+    metrics.finish("cache-census", cache_started, cache_work)
+    records_started = metrics.start()
+    for record in records:
+        row, running = _audit_record(
             config,
-            states,
-            cache_planned,
-            cache_errors,
-            state_path=cache_state_path,
-            work_limit=args.cache_work_limit,
-            wall_seconds=args.cache_wall_seconds,
-            storage_error=cache_storage_error,
-        )
-        metrics.finish("cache-census", cache_started, cache_work)
-        records_started = metrics.start()
-        for record in records:
-            row, running = _audit_record(
-                config,
-                record,
-                events=event_logs[record.machine],
-                vcs=audit_vcs,
-                process_census=process_census,
-                process_census_error=process_census_error,
-                registered_liveness=registered_liveness[
+            record,
+            events=event_logs[record.machine],
+            vcs=audit_vcs,
+            process_census=process_census,
+            process_census_error=process_census_error,
+            registered_liveness=registered_liveness[
+                (record.machine, record.slot, record.generation)
+            ],
+            cache_measurement=cache_measurements[
+                record_cache_subjects[
                     (record.machine, record.slot, record.generation)
-                ],
-                cache_measurement=cache_measurements[
-                    record_cache_subjects[
-                        (record.machine, record.slot, record.generation)
-                    ]
-                ],
+                ]
+            ],
+        )
+        journal_slot = journal_slots.get(record.slot)
+        if journal_slot is not None:
+            reasons = row["reasons"]
+            assert isinstance(reasons, list)
+            reasons.insert(
+                0,
+                f"interrupted {journal_slot.state.replace('-', ' ')} requires "
+                "wrkslots recover",
             )
-            journal_slot = journal_slots.get(record.slot)
-            if journal_slot is not None:
-                reasons = row["reasons"]
-                assert isinstance(reasons, list)
+            row["verdict"] = "BLOCKED"
+        sealed = seal_by_slot.get((record.machine, record.slot))
+        if sealed is not None:
+            sealed_generation, _sealed_path = sealed
+            reasons = row["reasons"]
+            assert isinstance(reasons, list)
+            if sealed_generation == record.generation:
                 reasons.insert(
                     0,
-                    f"interrupted {journal_slot.state.replace('-', ' ')} requires "
-                    "wrkslots recover",
+                    "interrupted validation-batch seal requires wrkslots recover",
                 )
                 row["verdict"] = "BLOCKED"
-            sealed = seal_by_slot.get((record.machine, record.slot))
-            if sealed is not None:
-                sealed_generation, _sealed_path = sealed
+            else:
+                reasons.insert(
+                    0,
+                    "validation-batch seal cannot be attributed to the active "
+                    f"generation: sealed={sealed_generation} "
+                    f"active={record.generation}",
+                )
+                row["verdict"] = "UNKNOWN"
+            represented_seals.add(
+                (record.machine, record.slot, sealed_generation)
+            )
+        if row["verdict"] in ("DELETABLE", "BLOCKED"):
+            strays = stray_registrations.get((record.slot_type, record.slot), [])
+            if stray_registration_error is not None:
+                strays = [stray_registration_error]
+            if strays and not _path_is_absent(
+                _slot_directory(config, record.slot, record.slot_type)
+            ):
                 reasons = row["reasons"]
                 assert isinstance(reasons, list)
-                if sealed_generation == record.generation:
-                    reasons.insert(
-                        0,
-                        "interrupted validation-batch seal requires wrkslots recover",
-                    )
-                    row["verdict"] = "BLOCKED"
-                else:
-                    reasons.insert(
-                        0,
-                        "validation-batch seal cannot be attributed to the active "
-                        f"generation: sealed={sealed_generation} "
-                        f"active={record.generation}",
-                    )
-                    row["verdict"] = "UNKNOWN"
-                represented_seals.add(
-                    (record.machine, record.slot, sealed_generation)
-                )
-            if row["verdict"] in ("DELETABLE", "BLOCKED"):
-                strays = stray_registrations.get((record.slot_type, record.slot), [])
-                if stray_registration_error is not None:
-                    strays = [stray_registration_error]
-                if strays and not _path_is_absent(
-                    _slot_directory(config, record.slot, record.slot_type)
-                ):
-                    reasons = row["reasons"]
-                    assert isinstance(reasons, list)
-                    reasons.extend(strays)
-                    row["verdict"] = "BLOCKED"
-            rows.append(row)
-            running_agent_count += int(running)
-        metrics.finish(
-            "registered-rows",
-            records_started,
-            {"rows": len(records)},
-        )
-        storage_started = metrics.start()
-        for slot_type, slot in sorted(on_disk - registered):
-            journal_slot = journal_slots.get(slot)
-            sealed = seal_by_slot.get((config.machine, slot))
-            cache_measurement = cache_measurements[
-                unregistered_cache_subjects[(slot_type, slot)]
-            ]
-            rows.append(
-                {
-                    "slot": slot,
-                    "slot_type": slot_type,
-                    "machine": (
-                        journal_slot.machine
-                        if journal_slot is not None
-                        else (config.machine if sealed is not None else None)
-                    ),
-                    "agent": None,
-                    "generation": None if sealed is None else sealed[0],
-                    "record_sha256": None,
-                    "verdict": "BLOCKED",
-                    "reasons": [
-                        (
-                            f"interrupted {journal_slot.state.replace('-', ' ')} requires "
-                            "wrkslots recover"
-                            if journal_slot is not None
-                            else (
-                                "interrupted validation-batch seal requires wrkslots recover"
-                                if sealed is not None
-                                else (
-                                    "validation directory has no active registry row; preserve "
-                                    "and inspect it, and use import-existing only for a "
-                                    "demonstrably live owner; destructive ownerless Git "
-                                    "worktree recovery is disabled"
-                                    if slot_type == "validate"
-                                    else "directory has no active registry row; inspect or "
-                                    "import it"
-                                )
-                            )
-                        )
-                    ],
-                    "owner_state": (
-                        journal_slot.state
-                        if journal_slot is not None
-                        else (
-                            "validation-batch-seal"
-                            if sealed is not None
-                            else "unregistered"
-                        )
-                    ),
-                    "liveness_state": "unverifiable",
-                    "cache_bytes": cache_measurement.bytes,
-                    "cache_error": cache_measurement.error,
-                    "cache_status": cache_measurement.status,
-                }
-            )
-            if sealed is not None:
-                represented_seals.add((config.machine, slot, sealed[0]))
-        for journal_slot in sorted(journal_slots.values(), key=lambda item: item.slot):
-            if any(
-                slot == journal_slot.slot
-                for _slot_type, slot in registered | on_disk
-            ):
-                continue
-            rows.append(
-                {
-                    "slot": journal_slot.slot,
-                    "slot_type": None,
-                    "machine": journal_slot.machine,
-                    "agent": None,
-                    "generation": None,
-                    "record_sha256": None,
-                    "verdict": "BLOCKED",
-                    "reasons": [
+                reasons.extend(strays)
+                row["verdict"] = "BLOCKED"
+        rows.append(row)
+        running_agent_count += int(running)
+    metrics.finish(
+        "registered-rows",
+        records_started,
+        {"rows": len(records)},
+    )
+    storage_started = metrics.start()
+    for slot_type, slot in sorted(on_disk - registered):
+        journal_slot = journal_slots.get(slot)
+        sealed = seal_by_slot.get((config.machine, slot))
+        cache_measurement = cache_measurements[
+            unregistered_cache_subjects[(slot_type, slot)]
+        ]
+        rows.append(
+            {
+                "slot": slot,
+                "slot_type": slot_type,
+                "machine": (
+                    journal_slot.machine
+                    if journal_slot is not None
+                    else (config.machine if sealed is not None else None)
+                ),
+                "agent": None,
+                "generation": None if sealed is None else sealed[0],
+                "record_sha256": None,
+                "verdict": "BLOCKED",
+                "reasons": [
+                    (
                         f"interrupted {journal_slot.state.replace('-', ' ')} requires "
                         "wrkslots recover"
-                    ],
-                    "owner_state": journal_slot.state,
-                    "liveness_state": "unverifiable",
-                    "cache_bytes": 0,
-                    "cache_error": None,
-                    "cache_status": "complete",
-                }
-            )
-        for machine, slot, generation, sealed_path in seal_targets:
-            if (machine, slot, generation) in represented_seals:
-                continue
-            rows.append(
-                {
-                    "slot": slot,
-                    "slot_type": "validate",
-                    "machine": machine,
-                    "agent": None,
-                    "generation": generation,
-                    "record_sha256": None,
-                    "verdict": "BLOCKED",
-                    "reasons": [
-                        "interrupted validation-batch seal requires wrkslots recover; "
-                        f"recorded path={sealed_path}"
-                    ],
-                    "owner_state": "validation-batch-seal",
-                    "liveness_state": "unverifiable",
-                    "cache_bytes": 0,
-                    "cache_error": None,
-                    "cache_status": "complete",
-                }
-            )
-        for seal_error_machine, journal_name, error in seal_errors:
-            rows.append(
-                {
-                    "slot": journal_name,
-                    "slot_type": "validate",
-                    "machine": seal_error_machine,
-                    "agent": None,
-                    "generation": None,
-                    "record_sha256": None,
-                    "verdict": "UNKNOWN",
-                    "reasons": [
-                        f"validation-batch seal evidence is unreadable: {error}"
-                    ],
-                    "owner_state": "validation-batch-seal",
-                    "liveness_state": "unverifiable",
-                    "cache_bytes": 0,
-                    "cache_error": None,
-                    "cache_status": "complete",
-                }
-            )
-        worktree_count = len(on_disk)
-        disk = _disk_status(config)
-        metrics.finish(
-            "storage",
-            storage_started,
-            {
-                "on_disk_rows": len(on_disk),
-                "output_rows": len(rows),
-                "unregistered_rows": len(on_disk - registered),
-            },
+                        if journal_slot is not None
+                        else (
+                            "interrupted validation-batch seal requires wrkslots recover"
+                            if sealed is not None
+                            else (
+                                "validation directory has no active registry row; preserve "
+                                "and inspect it, and use import-existing only for a "
+                                "demonstrably live owner; destructive ownerless Git "
+                                "worktree recovery is disabled"
+                                if slot_type == "validate"
+                                else "directory has no active registry row; inspect or "
+                                "import it"
+                            )
+                        )
+                    )
+                ],
+                "owner_state": (
+                    journal_slot.state
+                    if journal_slot is not None
+                    else (
+                        "validation-batch-seal"
+                        if sealed is not None
+                        else "unregistered"
+                    )
+                ),
+                "liveness_state": "unverifiable",
+                "cache_bytes": cache_measurement.bytes,
+                "cache_error": cache_measurement.error,
+                "cache_status": cache_measurement.status,
+            }
         )
+        if sealed is not None:
+            represented_seals.add((config.machine, slot, sealed[0]))
+    for journal_slot in sorted(journal_slots.values(), key=lambda item: item.slot):
+        if any(
+            slot == journal_slot.slot
+            for _slot_type, slot in registered | on_disk
+        ):
+            continue
+        rows.append(
+            {
+                "slot": journal_slot.slot,
+                "slot_type": None,
+                "machine": journal_slot.machine,
+                "agent": None,
+                "generation": None,
+                "record_sha256": None,
+                "verdict": "BLOCKED",
+                "reasons": [
+                    f"interrupted {journal_slot.state.replace('-', ' ')} requires "
+                    "wrkslots recover"
+                ],
+                "owner_state": journal_slot.state,
+                "liveness_state": "unverifiable",
+                "cache_bytes": 0,
+                "cache_error": None,
+                "cache_status": "complete",
+            }
+        )
+    for machine, slot, generation, sealed_path in seal_targets:
+        if (machine, slot, generation) in represented_seals:
+            continue
+        rows.append(
+            {
+                "slot": slot,
+                "slot_type": "validate",
+                "machine": machine,
+                "agent": None,
+                "generation": generation,
+                "record_sha256": None,
+                "verdict": "BLOCKED",
+                "reasons": [
+                    "interrupted validation-batch seal requires wrkslots recover; "
+                    f"recorded path={sealed_path}"
+                ],
+                "owner_state": "validation-batch-seal",
+                "liveness_state": "unverifiable",
+                "cache_bytes": 0,
+                "cache_error": None,
+                "cache_status": "complete",
+            }
+        )
+    for seal_error_machine, journal_name, error in seal_errors:
+        rows.append(
+            {
+                "slot": journal_name,
+                "slot_type": "validate",
+                "machine": seal_error_machine,
+                "agent": None,
+                "generation": None,
+                "record_sha256": None,
+                "verdict": "UNKNOWN",
+                "reasons": [
+                    f"validation-batch seal evidence is unreadable: {error}"
+                ],
+                "owner_state": "validation-batch-seal",
+                "liveness_state": "unverifiable",
+                "cache_bytes": 0,
+                "cache_error": None,
+                "cache_status": "complete",
+            }
+        )
+    worktree_count = len(on_disk)
+    disk = _disk_status(config)
+    metrics.finish(
+        "storage",
+        storage_started,
+        {
+            "on_disk_rows": len(on_disk),
+            "output_rows": len(rows),
+            "unregistered_rows": len(on_disk - registered),
+        },
+    )
+    # Revalidate the snapshot under a short lock before publishing (#797):
+    # planning and census ran unlocked, so a registry change in between
+    # must not be published as current. Affected rows become UNKNOWN.
+    with _locked(config.control / "ACTIVE", exclusive=False, wait_seconds=args.wait_lock):
+        # Revision-only re-read: no event replay, no record parsing.
+        current_identity = [
+            {
+                "machine": machine,
+                "revision": _as_int(
+                    _as_mapping(
+                        _read_json(_active_path(config, machine), "active state"),
+                        "active state",
+                    )["revision"],
+                    "active state.revision",
+                ),
+            }
+            for machine in _state_machines(config)
+        ]
+        current_revision = hashlib.sha256(
+            json.dumps(
+                sorted(current_identity, key=lambda item: item["machine"]),
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+    if current_revision != snapshot_revision:
+        for row in rows:
+            row["verdict"] = "UNKNOWN"
+            reasons = row.get("reasons")
+            if isinstance(reasons, list):
+                reasons.append(
+                    "registry changed during audit; this row was measured "
+                    "against a stale snapshot and is reported as unknown"
+                )
     sorted_rows = sorted(rows, key=lambda row: str(row["slot"]))
     attention = [
         row
@@ -62288,8 +62323,8 @@ usage or audit gate unknown, 3 fail-closed refusal.
         help=(
             "total time cache-glob planning may spend walking directories across every "
             "subject; a subject that starts after it is spent gets only what is left and "
-            "reports a cache error naming this allowance. Audit plans under the shared "
-            "state lock, so this bounds how long planning holds it "
+            "reports a cache error naming this allowance. Audit snapshots the registry "
+            "under a short lock and plans outside it, so this bounds total planning time "
             f"(default: {_AUDIT_CACHE_PLAN_TOTAL_SECONDS:g})"
         ),
     )

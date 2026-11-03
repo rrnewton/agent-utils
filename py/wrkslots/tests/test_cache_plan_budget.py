@@ -481,7 +481,7 @@ def test_planning_total_bounds_every_subject_and_says_so(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    # Audit plans under the shared state lock, so total planning time is capped
+    # Audit snapshots under a short lock and plans outside it (#797); total planning time is capped
     # across subjects; once it is spent a subject gets only what is left, and
     # its error names the total rather than its own allowance.
     config, _deep_cache, _cheap_cache = _planning_audit(tmp_path, monkeypatch)

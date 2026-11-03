@@ -6301,6 +6301,35 @@ pub(crate) fn parse_audit(
             .unwrap_or_default()
             .cmp(b.get("slot").and_then(Value::as_str).unwrap_or_default())
     });
+    // Revalidate the snapshot before publishing (#797): planning and
+    // census ran outside the state lock, so a registry revision change
+    // in between must not be published as current.
+    let current_machines = discover_machines(&cfg.control)?;
+    let mut current_revisions: Vec<(String, i64)> = Vec::new();
+    for machine in &current_machines {
+        let document = active_document(root, &cfg, machine)?;
+        current_revisions.push((
+            machine.clone(),
+            document
+                .get("revision")
+                .and_then(Value::as_i64)
+                .unwrap_or(0),
+        ));
+    }
+    if current_revisions != shard_revisions {
+        for row in &mut rows {
+            if let Some(object) = row.as_object_mut() {
+                object.insert("verdict".to_string(), Value::String("UNKNOWN".to_string()));
+                if let Some(reasons) = object.get_mut("reasons").and_then(Value::as_array_mut) {
+                    reasons.push(Value::String(
+                        "registry changed during audit; this row was measured \
+                         against a stale snapshot and is reported as unknown"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+    }
     let worktree_count = on_disk.len();
     let disk = disk_status(&cfg, &config);
     let attention: Vec<String> = first_seen_names(

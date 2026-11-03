@@ -211,7 +211,7 @@ pub(crate) enum Command {
         /// Cache traversal wall budget in seconds for this invocation
         #[arg(long, value_name = "SECONDS", default_value_t = 5.0)]
         cache_wall_seconds: f64,
-        /// Total cache-glob planning time in seconds across every subject (audit plans under the shared state lock)
+        /// Total cache-glob planning time in seconds across every subject (audit plans outside the state lock after a short-lock snapshot)
         #[arg(long, value_name = "SECONDS", default_value_t = 30.0)]
         cache_plan_total_seconds: f64,
         /// Exit non-zero on attention (1) or unknown (2) slots
@@ -287,7 +287,7 @@ pub(crate) enum Command {
         /// Cache traversal wall budget in seconds for this invocation
         #[arg(long, value_name = "SECONDS", default_value_t = 5.0)]
         cache_wall_seconds: f64,
-        /// Total cache-glob planning time in seconds across every subject (audit plans under the shared state lock)
+        /// Total cache-glob planning time in seconds across every subject (audit plans outside the state lock after a short-lock snapshot)
         #[arg(long, value_name = "SECONDS", default_value_t = 30.0)]
         cache_plan_total_seconds: f64,
     },

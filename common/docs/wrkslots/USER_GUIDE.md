@@ -263,8 +263,9 @@ cache globs before the census: every directory listing is one work unit, and the
 spent walking is charged. Each subject may use an equal share of the work units earlier
 subjects left, and the full `--cache-wall-seconds` of walking time for itself, so a large
 fleet does not starve a slow-but-completing walk. `--cache-plan-total-seconds` (default 30
-seconds) bounds planning time across all subjects, because audit plans while holding the
-shared state lock and writers do not wait for it by default; a subject that starts after
+seconds) bounds planning time across all subjects; audit snapshots the registry under a
+short state lock and plans outside it (#797), so writers are not refused for the length of
+an audit; a subject that starts after
 that total is spent gets only what is left. Git observations made while planning
 are not charged. The planning time bound is checked between directory listings, not
 enforced by a worker, so a listing that blocks is not interrupted. A subject whose
