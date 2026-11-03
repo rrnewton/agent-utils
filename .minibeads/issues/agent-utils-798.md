@@ -1,13 +1,14 @@
 ---
 title: 'merge-queue-serve-sync-label: serve syncs a ready label inside its cycle'
-status: open
+status: closed
 priority: 2
-assignee: cl-mq@devbig030
 issue_type: feature
+assignee: cl-mq@devbig030
 labels:
 - merge-queue
 created_at: 2026-11-02T23:56:36.134199027+00:00
-updated_at: 2026-11-02T23:56:36.134199027+00:00
+updated_at: 2026-11-03T00:42:46.511151323+00:00
+closed_at: 2026-11-03T00:42:46.511151183+00:00
 ---
 
 # Description
