@@ -1,6 +1,6 @@
 ---
 title: 'voice-page-action-menu: a hamburger menu for common actions and a real Voice/Channel button'
-status: open
+status: closed
 priority: 0
 issue_type: feature
 assignee: cl-refactor@devbig030
@@ -9,7 +9,8 @@ labels:
 depends_on:
   agent-utils-819: blocks
 created_at: 2026-11-03T15:53:06.395147387+00:00
-updated_at: 2026-11-03T15:53:06.395147387+00:00
+updated_at: 2026-11-03T18:43:26.911190737+00:00
+closed_at: 2026-11-03T18:43:26.911190617+00:00
 ---
 
 # Description
