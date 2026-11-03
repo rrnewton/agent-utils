@@ -11,3 +11,5 @@ export { BOOKMARK_UNDO_MS, createBookmarkUndo } from "./undo.ts";
 export type { BookmarkRemoval, BookmarkUndo, BookmarkUndoDependencies } from "./undo.ts";
 export { LEGACY_MARKER_READS, MARKER_KEY, createLegacyMarker } from "./legacy.ts";
 export type { LegacyMarker, LegacyMarkerDependencies } from "./legacy.ts";
+export { createBookmarkWrites } from "./bookmarkwrites.ts";
+export type { BookmarkOutcome, BookmarkWrites, BookmarkWritesDependencies } from "./bookmarkwrites.ts";

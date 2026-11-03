@@ -146,3 +146,50 @@ test("`#624 voice-page-modularity`: the old place marker is read once, looked fo
   none.drop();
   assert.equal(none.id(), null);
 });
+
+test("`#624 voice-page-modularity`: a bookmark write goes in order, conditional where asked, not sent after a failed Done, and says what came of it", async () => {
+  const { createBookmarks, createBookmarkWrites, sameAnchor } = ANNOTATIONS;
+  const bookmarks = createBookmarks({ bumpEpoch: () => {} });
+  const calls = [];
+  const said = [];
+  let refuse = null;
+  const writes = createBookmarkWrites({
+    bookmarks,
+    queue: (write) => write(),
+    put: async (channel, body) => {
+      calls.push(["PUT", channel, body]);
+      if (refuse) throw refuse;
+      return { bookmark: { revision: 2, anchor: { message_id: body.message_id, timestamp: body.timestamp, place: body.place, thread_id: null } }, bookmark_notice: "" };
+    },
+    remove: async (channel, revision) => { calls.push(["DELETE", channel, revision]); return { bookmark: { revision: 3, anchor: null }, bookmark_notice: "" }; },
+    isAnswer: (body) => Boolean(body && body.bookmark && typeof body.bookmark.revision === "number"),
+    channel: () => "C1",
+    anchor: (channel) => { const held = bookmarks.held(channel); return held ? held.anchor : null; },
+    same: (one, other) => sameAnchor(one, other),
+    redraw: () => said.push("redraw"),
+    save: () => said.push("save"),
+    status: (text) => said.push(text),
+    error: (text) => said.push(`error: ${text}`),
+  });
+  const anchor = { message_id: "M1", timestamp: "2026-11-02T00:00:00Z", place: "above", thread_id: null };
+  const move = bookmarks.stage("C1", anchor);
+  assert.equal(await writes.send(move), "saved");
+  assert.deepStrictEqual(calls[0], ["PUT", "C1", anchor], "an unconditional write sends no revision");
+  assert.ok(said.includes("save"));
+  const cancelled = bookmarks.stage("C1", null);
+  assert.equal(await writes.send(cancelled, { after: Promise.resolve(false) }), "cancelled");
+  assert.equal(calls.length, 1, "nothing is sent after the Done write it follows failed");
+  refuse = { status: 409, body: { bookmark: { revision: 9, anchor: null }, bookmark_notice: "" } };
+  const moved = bookmarks.stage("C1", { ...anchor, message_id: "M2" });
+  assert.equal(await writes.send(moved, { conditional: true }), "moved");
+  assert.equal(calls.at(-1)[2].if_revision, 2, "a conditional write sends the revision held");
+  assert.ok(said.includes("Bookmark moved on another device."));
+  refuse = { status: 500, detail: "the store is down" };
+  const failed = bookmarks.stage("C1", { ...anchor, message_id: "M3" });
+  assert.equal(await writes.send(failed), "failed");
+  assert.deepStrictEqual(said.slice(-2), ["The bookmark was not saved.", "error: The bookmark could not be saved: the store is down"]);
+  said.length = 0;
+  refuse = { status: 500, detail: "again" };
+  assert.equal(await writes.send(bookmarks.stage("C1", { ...anchor, message_id: "M4" }), { quiet: true }), "failed");
+  assert.ok(!said.some((line) => line.startsWith("The bookmark")), "a quiet write says nothing");
+});

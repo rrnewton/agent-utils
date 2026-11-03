@@ -18927,68 +18927,42 @@ function stageBookmark(channel, anchor) {
 }
 
 /**
- * Write a staged change, in order behind the Done writes. `conditional` sends the revision held when
- * the write goes, so it is refused if another device moved the bookmark since this page last heard.
- * `after`, when given, is the Done write this one follows: when that fails, this one is not sent and
- * the change is taken back with it. Never throws: a failure is taken back and said.
+ * Writing a staged bookmark change to the server, in order behind the Done writes, and settling and saying
+ * what came of it (web/src/core/annotations `createBookmarkWrites`, `#624 voice-page-modularity`).
+ */
+const bookmarkWrites = createBookmarkWrites({
+  bookmarks: bookmarkStore,
+  queue: (write) => queueInboxWrite(write),
+  put: (channel, body) => apiDecoded("BookmarkResponse", `/api/v1/channels/${encodeURIComponent(channel)}/bookmark`,
+    { method: "PUT", body }),
+  remove: (channel, revision) => {
+    const route = `/api/v1/channels/${encodeURIComponent(channel)}/bookmark`;
+    return apiDecoded("BookmarkResponse", revision === null ? route : `${route}?if_revision=${revision}`, { method: "DELETE" });
+  },
+  isAnswer: (body) => VibeTalkContract.is("BookmarkResponse", body),
+  channel: () => currentChannelId(),
+  anchor: (channel) => bookmarkAnchor(channel),
+  same: (one, other) => sameAnchor(one, other),
+  redraw: () => redrawBookmark(),
+  save: () => {
+    if (!sideActive) saveChannelScope();
+  },
+  status: (text) => setStatus(text),
+  error: (text) => showError(text),
+});
+
+/**
+ * Write a staged change, in order behind the Done writes (`BookmarkWrites.send`). `conditional` sends the
+ * revision held when the write goes, so it is refused if another device moved the bookmark since this page
+ * last heard. `after`, when given, is the Done write this one follows: when that fails, this one is not
+ * sent and the change is taken back with it. Never throws: a failure is taken back and said.
  *
  * @param {{channel: string, before: VibeTalk.BookmarkAnchor | null, anchor: VibeTalk.BookmarkAnchor | null, token: object}} move
  * @param {{conditional?: boolean, after?: Promise<boolean> | null, quiet?: boolean}} [options]
  * @returns {Promise<"saved" | "moved" | "failed" | "cancelled">}
  */
-function sendBookmark(move, { conditional = false, after = null, quiet = false } = {}) {
-  const { channel } = move;
-  return queueInboxWrite(async () => {
-    /** @type {"saved" | "moved" | "failed" | "cancelled"} */
-    let outcome = "failed";
-    let answer = null;
-    let problem = null;
-    try {
-      if (after && !(await after)) {
-        outcome = "cancelled";
-      } else {
-        const revision = conditional ? bookmarkStore.revision(channel) : null;
-        const route = `/api/v1/channels/${encodeURIComponent(channel)}/bookmark`;
-        answer = move.anchor
-          ? await apiDecoded("BookmarkResponse", route, {
-            method: "PUT",
-            body: { ...move.anchor, ...(revision === null ? {} : { if_revision: revision }) },
-          })
-          : await apiDecoded("BookmarkResponse", revision === null ? route : `${route}?if_revision=${revision}`,
-            { method: "DELETE" });
-        outcome = "saved";
-      }
-    } catch (error) {
-      if (error && error.status === 409 && VibeTalkContract.is("BookmarkResponse", error.body)) {
-        answer = error.body;
-        outcome = "moved";
-      } else {
-        problem = error;
-      }
-    } finally {
-      bookmarkStore.writeEnded(channel);
-    }
-    // The server's revision taken, and its anchor where the change is still this one's; taken back
-    // where the write failed (`Bookmarks.settle`).
-    const settled = bookmarkStore.settle(move, answer);
-    // Gone with the credential that made it (`forgetBookmarks`): nothing to settle, or to say.
-    if (!settled) return outcome;
-    const { mine } = settled;
-    const shownBefore = settled.before;
-    const now = bookmarkAnchor(channel);
-    if (!sameAnchor(shownBefore, now) && channel === currentChannelId()) redrawBookmark();
-    // Kept with the device's copy of the channel, for a page opened offline.
-    if (channel === currentChannelId() && !sideActive) saveChannelScope();
-    // Short, for a phone's status line; the reason a write failed goes where every failure does.
-    if (outcome === "moved" && mine && !quiet) {
-      setStatus("Bookmark moved on another device.");
-    } else if (outcome === "failed" && problem && !quiet && mine) {
-      // Only for the change still shown: one made since (Undo, say) has its own write, which says.
-      setStatus("The bookmark was not saved.");
-      showError(`The bookmark could not be saved: ${problem.detail || problem.message}`);
-    }
-    return outcome;
-  });
+function sendBookmark(move, options = {}) {
+  return bookmarkWrites.send(move, options);
 }
 
 /** Whether the list in the column being worked on draws a bookmark at all, and if not, why not. */
