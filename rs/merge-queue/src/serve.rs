@@ -46,6 +46,10 @@ use crate::state::{write_json, Config, State};
 pub const DEFAULT_POLL_MS: u64 = 250;
 /// Default interval in seconds between `git ls-remote` base polls.
 pub const DEFAULT_BASE_POLL_SECS: u64 = 30;
+/// Default seconds between label syncs (`serve --sync-every`).
+pub const DEFAULT_SYNC_EVERY_SECS: u64 = 60;
+/// Pull requests one label sync lists at most (as `sync --limit`'s default).
+const SYNC_LIMIT: u32 = 300;
 /// Heartbeat age in seconds after which `status` calls a live pid stale
 /// when the caller does not override it.
 pub const DEFAULT_STALE_AFTER_SECS: u64 = 10;
@@ -145,6 +149,18 @@ pub struct Heartbeat {
     /// Consecutive failed work cycles (reset by a clean one).
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub failed_cycles: u32,
+    /// Label this daemon syncs (`serve --sync-label`); empty when it does not.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sync_label: String,
+    /// RFC 3339 UTC time of the last successful label sync.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub last_sync_at: String,
+    /// What the last successful label sync did, in one line.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub last_sync: String,
+    /// Why the most recent label sync failed; cleared by a successful one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sync_error: String,
 }
 
 impl Heartbeat {
@@ -172,6 +188,10 @@ impl Heartbeat {
             working_since_unix: 0,
             next_retry_at: String::new(),
             failed_cycles: 0,
+            sync_label: String::new(),
+            last_sync_at: String::new(),
+            last_sync: String::new(),
+            sync_error: String::new(),
         }
     }
 
@@ -700,6 +720,11 @@ pub struct ServeOptions {
     /// Deadline for one notification send; a send still running then has
     /// its process group killed and counts as a failed attempt.
     pub notify_timeout: Duration,
+    /// Also ingest pull requests carrying this label, inside the loop and
+    /// under the writer lock (`serve --sync-label`).
+    pub sync_label: Option<String>,
+    /// Interval between label syncs.
+    pub sync_every: Duration,
 }
 
 impl Default for ServeOptions {
@@ -713,6 +738,8 @@ impl Default for ServeOptions {
             max_batch: None,
             agentctl: None,
             notify_timeout: notify::DEFAULT_SEND_TIMEOUT,
+            sync_label: None,
+            sync_every: Duration::from_secs(DEFAULT_SYNC_EVERY_SECS),
         }
     }
 }
@@ -913,6 +940,69 @@ fn sweep_notifications(
     }
 }
 
+/// One label sync under the writer lock. Returns whether it ran (a busy lock
+/// means retry on the next poll). Failures are logged and recorded in the
+/// heartbeat, never returned: syncing must not stop validation.
+fn sync_label(
+    state: &State,
+    config: &Config,
+    label: &str,
+    notifier: &notify::Notifier,
+    heartbeat: &mut Heartbeat,
+) -> bool {
+    let lock = match state.lock() {
+        Ok(lock) => lock,
+        Err(_) => return false,
+    };
+    let source = crate::sync::ReadySource::Label(label.to_owned());
+    match crate::sync::sync(
+        state,
+        config,
+        &source,
+        SYNC_LIMIT,
+        Some(&lock),
+        Some(notifier),
+    ) {
+        Ok(report) => {
+            let list = |prs: &[i64]| {
+                prs.iter()
+                    .map(|pr| format!("#{pr}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            let mut summary = format!(
+                "{} listed, submitted [{}], withdrawn [{}]",
+                report.listed,
+                list(&report.submitted),
+                list(&report.withdrawn)
+            );
+            if !report.refused.is_empty() {
+                let refused: Vec<i64> = report.refused.iter().map(|(pr, _)| *pr).collect();
+                summary.push_str(&format!(", refused [{}]", list(&refused)));
+            }
+            if !report.submitted.is_empty()
+                || !report.withdrawn.is_empty()
+                || !report.refused.is_empty()
+            {
+                eprintln!("merge-queue serve: sync --label {label}: {summary}");
+            }
+            for (pr, why) in &report.refused {
+                eprintln!("merge-queue serve: sync --label {label}: refused #{pr}: {why}");
+            }
+            heartbeat.last_sync_at = now();
+            heartbeat.last_sync = summary;
+            heartbeat.sync_error.clear();
+        }
+        Err(error) => {
+            if heartbeat.sync_error != error {
+                eprintln!("merge-queue serve: sync --label {label} failed: {error}");
+            }
+            heartbeat.sync_error = error;
+        }
+    }
+    true
+}
+
 fn trigger_label(items: bool, base: bool, retry: bool, backoff: bool) -> String {
     let parts: Vec<&str> = [
         (items, "items"),
@@ -954,6 +1044,12 @@ pub fn serve(state: &State, options: &ServeOptions) -> Result<i32, String> {
     // Fail loudly before the first cycle when a configured tool is missing
     // (e.g. `cargo` under a systemd unit with no toolchain on PATH).
     preflight(&config, options.agentctl.as_deref())?;
+    if options.sync_label.is_some() && config.github.repo.is_empty() {
+        return Err(
+            "--sync-label needs a hosting repository; remedy: run `merge-queue init --github-repo OWNER/NAME` (or set github.repo in config.json)"
+                .to_owned(),
+        );
+    }
     // Held (and so the single-daemon guarantee kept) until this returns.
     let _serve_lock = acquire_serve_lock(state)?;
     reset_shutdown();
@@ -963,6 +1059,7 @@ pub fn serve(state: &State, options: &ServeOptions) -> Result<i32, String> {
     let git = ops::repo(state, &config)?;
     let window = options.depth.unwrap_or(config.depth).max(1);
     let mut heartbeat = Heartbeat::new(std::process::id(), window, options.shadow);
+    heartbeat.sync_label = options.sync_label.clone().unwrap_or_default();
     match state.items() {
         Ok(items) => heartbeat.queued = RetrySchedule::of(&items, &now()).queued,
         Err(error) => heartbeat.last_error = items_error_message(&error),
@@ -993,12 +1090,23 @@ pub fn serve(state: &State, options: &ServeOptions) -> Result<i32, String> {
     let mut retry_seen = String::new();
     // Backoff retry after failed work cycles: when, and as RFC 3339 text.
     let mut failure_retry: Option<(Instant, String)> = None;
+    // When the last label sync ran (`--sync-label`); `None` means due now.
+    let mut last_sync: Option<Instant> = None;
 
     'outer: loop {
         if shutdown_requested() {
             break 'outer;
         }
         heartbeat.cycles += 1;
+        // Ingest the label first, so what it submits is seen by this
+        // iteration's items fingerprint and validated without waiting a poll.
+        if let Some(label) = &options.sync_label {
+            if last_sync.is_none_or(|at| at.elapsed() >= options.sync_every)
+                && sync_label(state, &config, label, &notifier, &mut heartbeat)
+            {
+                last_sync = Some(Instant::now());
+            }
+        }
         let fingerprint = items_fingerprint(state);
         let items_changed = fingerprint != last_fingerprint;
 
@@ -1457,6 +1565,25 @@ pub fn render_status(report: &StatusReport) -> String {
                 if !h.last_error.is_empty() {
                     out.push_str(&format!("  last error: {}\n", h.last_error));
                 }
+                if !h.sync_label.is_empty() {
+                    out.push_str(&format!(
+                        "  sync: label {} · last {}{}\n",
+                        h.sync_label,
+                        if h.last_sync_at.is_empty() {
+                            "-"
+                        } else {
+                            h.last_sync_at.as_str()
+                        },
+                        if h.last_sync.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" ({})", h.last_sync)
+                        }
+                    ));
+                }
+                if !h.sync_error.is_empty() {
+                    out.push_str(&format!("  sync error: {}\n", h.sync_error));
+                }
             }
         }
         Liveness::NotRunning => {
@@ -1610,6 +1737,37 @@ mod unit {
         let report = collect_status(&state, 10).unwrap();
         assert!(!report.shadow);
         assert!(render_status(&report).contains("mode: live"));
+        let _ = std::fs::remove_dir_all(&state.root);
+    }
+
+    #[test]
+    fn status_shows_the_label_sync_and_its_last_error() {
+        let state = temp_state("sync-status");
+        std::fs::write(state.serve_pid_path(), format!("{}\n", std::process::id())).unwrap();
+        let mut heartbeat = Heartbeat::new(std::process::id(), 2, false);
+        heartbeat.sync_label = "mq-ready".to_owned();
+        heartbeat.last_sync_at = "2026-11-02T23:00:00Z".to_owned();
+        heartbeat.last_sync = "3 listed, submitted [#7], withdrawn []".to_owned();
+        heartbeat.sync_error = "HTTP 502: bad gateway".to_owned();
+        heartbeat.touch();
+        write_heartbeat(&state, &heartbeat).unwrap();
+        let text = render_status(&collect_status(&state, 10).unwrap());
+        assert!(
+            text.contains(
+                "sync: label mq-ready · last 2026-11-02T23:00:00Z (3 listed, submitted [#7], withdrawn [])"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("sync error: HTTP 502: bad gateway"), "{text}");
+        // A daemon that does not sync says nothing about syncing.
+        let mut quiet = Heartbeat::new(std::process::id(), 2, false);
+        quiet.touch();
+        write_heartbeat(&state, &quiet).unwrap();
+        let text = render_status(&collect_status(&state, 10).unwrap());
+        assert!(
+            !text.contains("sync:") && !text.contains("sync error"),
+            "{text}"
+        );
         let _ = std::fs::remove_dir_all(&state.root);
     }
 

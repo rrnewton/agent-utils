@@ -627,3 +627,133 @@ fn a_failed_review_fetch_fails_closed() {
         "#2 was never approved: {all}"
     );
 }
+
+fn heartbeat(fx: &Fixture) -> Value {
+    let common = std::path::PathBuf::from(git(&fx.queue(), &["rev-parse", "--git-common-dir"]));
+    let dir = if common.is_absolute() {
+        common
+    } else {
+        fx.queue().join(common)
+    };
+    let text = std::fs::read_to_string(dir.join("merge-queue").join("serve.heartbeat.json"))
+        .expect("heartbeat");
+    serde_json::from_str(&text).unwrap()
+}
+
+const SERVE_ONCE: [&str; 6] = [
+    "serve",
+    "--once",
+    "--poll-ms",
+    "50",
+    "--base-poll-secs",
+    "0",
+];
+
+#[test]
+fn serve_syncs_its_label_and_validates_what_it_submits_in_the_same_cycle() {
+    // A pull request labelled ready that nobody submits is ingested by the daemon itself, under
+    // its own writer lock, and validated in the same loop iteration.
+    let fx = Fixture::new("serve-sync-label");
+    let gh = stub(&fx);
+    fx.mq_ok(&[
+        "init",
+        "--github-repo",
+        "owner/name",
+        "--gh",
+        &gh.stub,
+        "--validator",
+        "command",
+        "--validator-run",
+        "exit 0",
+    ]);
+    let h1 = pull_request(&fx, 1, &[("one", "1\n")]);
+    std::fs::write(&gh.list, listing(&[(1, &h1, false, &["mq-ready"])])).unwrap();
+    let mut args = SERVE_ONCE.to_vec();
+    args.extend(["--sync-label", "mq-ready"]);
+    let out = fx.mq_env(&args, &env(&gh));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let all = items(&fx);
+    assert_eq!(item(&all, 1)["source"], "label:mq-ready", "{all}");
+    assert_eq!(item(&all, 1)["status"], "landed", "{all}");
+    let hb = heartbeat(&fx);
+    assert_eq!(hb["sync_label"], "mq-ready", "{hb}");
+    assert!(
+        hb["last_sync"].as_str().unwrap().contains("submitted [#1]"),
+        "{hb}"
+    );
+    assert!(hb.get("sync_error").is_none(), "{hb}");
+    let log = std::fs::read_to_string(&gh.log).unwrap();
+    assert!(log.contains("--label mq-ready"), "{log}");
+}
+
+#[test]
+fn a_failed_label_sync_never_blocks_validation() {
+    let fx = Fixture::new("serve-sync-fails");
+    let gh = stub(&fx);
+    fx.mq_ok(&[
+        "init",
+        "--github-repo",
+        "owner/name",
+        "--gh",
+        &gh.stub,
+        "--validator",
+        "command",
+        "--validator-run",
+        "exit 0",
+    ]);
+    pull_request(&fx, 1, &[("one", "1\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "pr1"]);
+    std::fs::write(
+        &gh.stub,
+        "#!/bin/sh\necho 'HTTP 502: bad gateway' >&2\nexit 1\n",
+    )
+    .unwrap();
+    let mut args = SERVE_ONCE.to_vec();
+    args.extend(["--sync-label", "mq-ready"]);
+    let out = fx.mq_env(&args, &env(&gh));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("sync --label mq-ready failed"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(item(&items(&fx), 1)["status"], "landed");
+    let hb = heartbeat(&fx);
+    assert!(
+        hb["sync_error"].as_str().unwrap().contains("bad gateway"),
+        "{hb}"
+    );
+}
+
+#[test]
+fn serve_sync_label_needs_a_hosting_repository() {
+    let fx = Fixture::new("serve-sync-no-repo");
+    fx.mq_ok(&[
+        "init",
+        "--validator",
+        "command",
+        "--validator-run",
+        "exit 0",
+    ]);
+    let mut args = SERVE_ONCE.to_vec();
+    args.extend(["--sync-label", "mq-ready"]);
+    let out = fx.mq(&args);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--sync-label needs a hosting repository"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // An interval without a label is a usage error, not a silent no-op.
+    let mut args = SERVE_ONCE.to_vec();
+    args.extend(["--sync-every", "60"]);
+    assert_eq!(fx.mq(&args).status.code(), Some(2));
+}

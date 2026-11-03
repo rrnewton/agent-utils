@@ -302,6 +302,19 @@ SIGINT or SIGTERM during a stop exits immediately. `merge-queue run` stops the s
 | `--max-batch N` | the configured `max_batch` | Override the batch size for work cycles. |
 | `--agentctl WORD` | configured | Command (and leading arguments) to run instead of the configured agentctl for notifications. Repeatable. Supplement: `MERGE_QUEUE_AGENTCTL` (shell-style words) when neither flag nor config names one. |
 | `--notify-timeout-secs N` | `30` | Seconds one notification send may run; then its whole process group is killed and the send counts as a failed attempt (minimum 1). |
+| `--sync-label LABEL` | none | Also ingest pull requests carrying LABEL, inside the daemon's own loop: the same ingestion as `merge-queue sync --label LABEL` (one batched list call, approval at head when configured, withdrawal when the label goes away), under the writer lock the work cycle uses. Needs `github.repo`. |
+| `--sync-every SECS` | `60` | Seconds between label syncs (with `--sync-label`; minimum 10). Each sync spends at least one hosting API request. |
+
+With `--sync-label LABEL` the daemon ingests labelled pull requests itself, so a change
+labelled ready that nobody submits is never missed. Each sync runs at the top of a loop
+iteration, before the daemon looks for new work, under the same writer lock the work cycle
+takes (never a second writer). What it submits is therefore validated in the same iteration.
+A busy lock (a `run` or another command holding it) retries on the next poll. A failed sync
+(the hosting service down, the request budget spent) is logged once per distinct error and
+recorded as `sync_error` in the heartbeat and `status`. It never stops validation of what is
+already queued. A successful sync records `last_sync_at` and a one-line summary.
+Notifications its withdrawals owe go out through the daemon's own `--agentctl` and send
+timeout.
 
 With `--shadow` the daemon is a soak harness: it plans, validates and would land exactly as a
 live daemon would, but every landing advances only the in-memory simulated base. Run reports

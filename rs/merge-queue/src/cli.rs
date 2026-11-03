@@ -361,6 +361,19 @@ enum Command {
         /// cycle, at most 3 attempts per transition). Minimum 1.
         #[arg(long, default_value_t = 30, value_name = "SECS")]
         notify_timeout_secs: u64,
+        /// Also ingest pull requests carrying LABEL, inside the daemon's own
+        /// loop: the same ingestion as `merge-queue sync --label LABEL` (one
+        /// batched list call, approval at head when configured, withdrawal
+        /// when the label goes away), under the writer lock the work cycle
+        /// uses, so there is no second writer. A failed sync is logged and
+        /// recorded in the heartbeat and never stops validation. Needs
+        /// `github.repo` configured.
+        #[arg(long, value_name = "LABEL")]
+        sync_label: Option<String>,
+        /// Seconds between label syncs (with --sync-label; minimum 10). Each
+        /// sync spends at least one hosting API request.
+        #[arg(long, default_value_t = serve::DEFAULT_SYNC_EVERY_SECS, value_name = "SECS", requires = "sync_label")]
+        sync_every: u64,
     },
     /// Render and install the systemd user unit for `serve`, with the
     /// toolchain directory (containing `cargo`) resolved explicitly at
@@ -794,7 +807,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                 _ => return Err("choose a ready source: --label, --all-open or --file".to_owned()),
             };
             let lock = if dry_run { None } else { Some(state.lock()?) };
-            let report = crate::sync::sync(&state, &config, &source, limit, lock.as_ref())?;
+            let report = crate::sync::sync(&state, &config, &source, limit, lock.as_ref(), None)?;
             if json {
                 let text = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
                 println!("{text}");
@@ -928,6 +941,8 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             max_batch,
             agentctl,
             notify_timeout_secs,
+            sync_label,
+            sync_every,
         } => serve::serve(
             &state,
             &ServeOptions {
@@ -943,6 +958,8 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     Some(agentctl)
                 },
                 notify_timeout: std::time::Duration::from_secs(notify_timeout_secs.max(1)),
+                sync_label,
+                sync_every: std::time::Duration::from_secs(sync_every.max(10)),
             },
         ),
         Command::InstallServeUnit {

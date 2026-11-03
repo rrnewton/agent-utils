@@ -192,13 +192,16 @@ fn entries_from_file(path: &PathBuf) -> Result<Vec<Entry>, String> {
 ///
 /// `lock` is the queue writer lock the caller holds; `None` is a dry run,
 /// which reports what would change and writes nothing. The notification
-/// sweep a withdrawal triggers runs under that same lock.
+/// sweep a withdrawal triggers runs under that same lock, with `notifier`
+/// (the daemon passes its own, so its `--agentctl` and send timeout apply)
+/// or, when `None`, the configured one.
 pub fn sync(
     state: &State,
     config: &Config,
     source: &ReadySource,
     limit: u32,
     lock: Option<&Lock>,
+    notifier: Option<&crate::notify::Notifier>,
 ) -> Result<SyncReport, String> {
     let dry_run = lock.is_none();
     let tag = source.tag();
@@ -364,8 +367,15 @@ pub fn sync(
             // from, and the sweep dedups, so a later daemon cycle will
             // not resend. Best-effort, as in `serve`: a failed send is
             // recorded on the item and never fails the sync.
-            let notifier = crate::notify::Notifier::resolve(None, config);
-            if let Err(error) = crate::notify::sweep_locked(state, lock, config, &notifier) {
+            let configured;
+            let notifier = match notifier {
+                Some(notifier) => notifier,
+                None => {
+                    configured = crate::notify::Notifier::resolve(None, config);
+                    &configured
+                }
+            };
+            if let Err(error) = crate::notify::sweep_locked(state, lock, config, notifier) {
                 eprintln!("merge-queue sync: notification sweep failed: {error}");
             }
         }
