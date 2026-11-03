@@ -2,6 +2,7 @@
 title: 'relay-poll-receipts-during-hold: read receipts on our in-custody relay threads while the Slack budget holds'
 status: open
 priority: 2
+assignee: mu-transcript@devbig014
 issue_type: bug
 labels:
 - chat
