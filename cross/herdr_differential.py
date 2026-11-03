@@ -3569,17 +3569,25 @@ _ACCOUNT_REFUSALS = ".account-refusals.log"
 #: The ``herdr`` the fake is reached through. It reads what the call was handed before an
 #: interpreter can change it -- a Python interpreter ignores SIGPIPE and SIGXFSZ for itself as it
 #: starts, and a launcher in front of one may ignore more -- and runs ``fake_herdr.py`` beside it.
-#: ``read`` and ``case`` are built in, so the ignored signals are those of the very process
-#: herdr-run started; ``od`` reads that process's environment from ``/proc``, which is fixed at
-#: ``exec``, entry by entry and in order.
+#: ``cat`` reads that process's status from ``/proc`` in one buffered pass -- a
+#: ``read``-builtin loop over it gets a transient empty stream in ~0.1% of spawns under
+#: concurrent spawn load, which recorded a bogus empty mask -- and ``od`` reads that
+#: process's environment from ``/proc``, which is fixed at ``exec``, entry by entry and
+#: in order.
 _E2E_LAUNCHER = """\
 #!/bin/sh
 signals=
-while IFS= read -r line; do
-  case $line in
-    SigIgn:*) signals=${{line#SigIgn:}}; break ;;
+attempt=0
+while [ -z "$signals" ] && [ "$attempt" -lt 3 ]; do
+  attempt=$((attempt + 1))
+  status_text=$(cat "/proc/$$/status" 2>/dev/null)
+  case "$status_text" in
+    *SigIgn:*)
+      signals=${{status_text#*SigIgn:}}
+      signals=$(printf '%s' "$signals" | head -n 1)
+      ;;
   esac
-done < "/proc/$$/status"
+done
 PATH=/usr/bin:/bin
 HERDR_E2E_HANDED_SIGNALS=$signals
 HERDR_E2E_HANDED_ENVIRON=$(od -An -v -tx1 "/proc/$$/environ" | tr -d ' \\n')
