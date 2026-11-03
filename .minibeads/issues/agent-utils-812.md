@@ -1,13 +1,14 @@
 ---
 title: 'merge-queue-donor-identity-and-prune: compare embedded revisions, not binary hashes; prune dead donor jobs'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: cl-mq@devbig030
 labels:
 - merge-queue
 created_at: 2026-11-03T09:50:15.566290909+00:00
-updated_at: 2026-11-03T09:50:15.566290909+00:00
+updated_at: 2026-11-03T13:02:55.610057728+00:00
+closed_at: 2026-11-03T13:02:55.610057577+00:00
 ---
 
 # Description

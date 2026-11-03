@@ -1,13 +1,14 @@
 ---
 title: 'merge-queue-validator-exec-failure-not-red: a validator that cannot run is an infrastructure refusal, never a red verdict'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: cl-mq@devbig030
 labels:
 - merge-queue
 created_at: 2026-11-03T11:09:26.739150948+00:00
-updated_at: 2026-11-03T11:09:26.739150948+00:00
+updated_at: 2026-11-03T13:02:55.614713428+00:00
+closed_at: 2026-11-03T13:02:55.614713268+00:00
 ---
 
 # Description

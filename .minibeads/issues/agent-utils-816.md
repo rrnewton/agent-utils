@@ -1,13 +1,14 @@
 ---
 title: 'merge-queue-red-verdict-survives-probe-failure: a known red ejects even if the probe cannot run; every retry is bounded'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: cl-mq@devbig030
 labels:
 - merge-queue
 created_at: 2026-11-03T11:59:56.940228245+00:00
-updated_at: 2026-11-03T11:59:56.940228245+00:00
+updated_at: 2026-11-03T13:02:55.618974394+00:00
+closed_at: 2026-11-03T13:02:55.618974253+00:00
 ---
 
 # Description

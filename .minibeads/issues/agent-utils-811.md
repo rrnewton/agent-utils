@@ -1,13 +1,14 @@
 ---
 title: 'agentctl-start-codex-0164-readiness: detect readiness for the Codex v0.164.0 composer'
-status: open
+status: closed
 priority: 1
-assignee: cl-mq@devbig030
 issue_type: bug
+assignee: cl-mq@devbig030
 labels:
 - agentctl
 created_at: 2026-11-03T08:45:50.745201925+00:00
-updated_at: 2026-11-03T08:45:50.745201925+00:00
+updated_at: 2026-11-03T13:02:55.605275455+00:00
+closed_at: 2026-11-03T13:02:55.605275295+00:00
 ---
 
 # Description
