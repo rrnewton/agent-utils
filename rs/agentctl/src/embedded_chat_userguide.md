@@ -3116,8 +3116,9 @@ for `--stale-after` (default 5 minutes; the Slack provider sends a heartbeat
 every 30 seconds while idle), the subscription or send path is down, the owner
 loop is failing, requests are stalled untyped or have uncertain delivery, a
 reply was retried 20 or more times or will never be sent, a captured reply is
-still unsent after 10 minutes, the reply breaker holds a thread back, a
-repoint is not applied yet, the target's record names no native session and its
+still unsent after 10 minutes (one held back after a restart is reported as
+held instead), the reply breaker holds a thread back, a restart held replies
+back as stale, a repoint is not applied yet, the target's record names no native session and its
 transcript was discovered or not found at all (the line names the transcript
 read, or says replies come only from the screen, and how the conversation gets
 bound), or the target's transcript holds reply blocks the bridge never captured. Each uncertain request is listed with its reason,
@@ -3145,6 +3146,24 @@ command writes nothing and never contacts the chat provider. Exit status: 0 OK,
 3 DEGRADED, 1 DOWN or STALLED, so a timer or another agent can act on it; when
 a bridge is up but typing into a dead pane, `chat repoint` fixes it without a
 restart.
+
+A restarted bridge does not post replies that are no longer what the
+coordinator would say. When `chat run` starts, it holds back each reply it has
+not sent that was captured `--hold-replies-older-than` ago or longer (default
+15m; `0` holds only the next case, `off` holds nothing), or whose thread has
+moved on because a later request in the same thread already has a reply sent.
+It lists them in `held-replies.json` in the state directory, logs each as
+`HELD STALE REPLY`, and tells the coordinator once, as a reply reminder is
+typed, with the commands that send or drop each. `chat held` lists them, oldest
+first, as `KEY/ORDINAL` with when each was captured, why it is held and its
+first 300 characters (`--json`: schema `agentctl-chat-held/v1`, whole texts);
+`chat held --send KEY/ORDINAL` takes the hold off so the service sends the
+reply as it is, and `chat held --drop KEY/ORDINAL` marks it never to be sent,
+so the request's later replies go out. To change a held reply, drop it and send
+the new text with `chat reply`. Either wakes a running service. A reply that
+comes after a held one in the same request waits behind it, in order; replies
+captured after the start are never held. `chat status` and `chat health` list
+the held replies.
 
 `chat latency` reports how long each request took to reach each stage, from
 the bridge's own records, since chat providers such as Slack record no time on

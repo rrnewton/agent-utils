@@ -35,10 +35,13 @@ use crate::agent::{self, DrainOptions, QueueMessageState};
 use crate::subagents::{ManagedAgents, ManagedApi};
 
 mod grants;
+mod held_replies;
 mod observe;
 mod rejections;
 mod reply_reminders;
 mod repoint;
+
+pub use held_replies::{parse_held_handle, HeldReply, HoldReason, DEFAULT_HOLD_REPLIES_OLDER_THAN};
 
 pub use grants::{parse_grant_duration, SenderGrant, DEFAULT_MAX_GRANT_SECONDS};
 pub use observe::{parse_rfc3339_millis, RequestTimes, UnsentReply};
@@ -8420,6 +8423,9 @@ impl BridgeState {
         status["stages"] = Value::Object(stages);
         status["relay_alarms"] = relay_alarms;
         status["repoint"] = self.repoint_status_locked();
+        // The replies a restart held back as stale (#781 chat-no-stale-replies-on-restart).
+        status["held_replies"] = serde_json::to_value(self.held_replies_locked()?)
+            .map_err(|error| ChatRuntimeError::invalid(error.to_string()))?;
         Ok(status).map(|mut status| {
             if let Some(object) = status.as_object_mut() {
                 object.insert("slack_format".to_owned(), Value::from(slack_format));
@@ -12539,9 +12545,17 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
                 Err(error) => return Err(error),
             };
             let original_send_ordinal = request.next_send_ordinal;
+            let mut held = false;
             while request.next_send_ordinal < request.next_reply_ordinal {
                 let mut reply = self.read_reply(key, request.next_send_ordinal)?;
                 if reply.phase != ReplyPhase::Sent && reply.phase != ReplyPhase::Failed {
+                    // A reply a restart held as stale waits for the coordinator's word, and the
+                    // request's later replies wait behind it (#781
+                    // chat-no-stale-replies-on-restart).
+                    if self.reply_held_locked(key, reply.ordinal)? {
+                        held = true;
+                        break;
+                    }
                     // A tripped breaker holds the reply in its current phase; nothing is lost.
                     self.reserve_reply_send_locked(&request.message, &reply.send_request_id)?;
                     reply.phase = ReplyPhase::Sending;
@@ -12553,10 +12567,13 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
                 request.next_send_ordinal = request.next_send_ordinal.saturating_add(1);
             }
             let pointer_changed = request.next_send_ordinal != original_send_ordinal;
-            if pointer_changed || request.next_send_ordinal >= request.next_reply_ordinal {
+            if pointer_changed || held || request.next_send_ordinal >= request.next_reply_ordinal {
                 if pointer_changed {
                     self.write_request_accounted(&request, &mut checkpoint)?;
                     self.persist_checkpoint(&mut checkpoint)?;
+                }
+                if held {
+                    return Ok(None);
                 }
                 if request.next_send_ordinal >= request.next_reply_ordinal {
                     // Retry a retirement that faulted after the prior Sent transition without
@@ -18595,6 +18612,146 @@ mod tests {
             )
             .expect("capture reply");
         (state, key, root)
+    }
+
+    /// #781 chat-no-stale-replies-on-restart: a reply left unsent across a restart and older
+    /// than the bound is held at start, listed and not sent, until the coordinator sends it; a
+    /// fresh one is not held; a dropped one is never sent.
+    #[test]
+    fn a_stale_reply_is_held_at_start_until_the_coordinator_sends_or_drops_it() {
+        let bound = DEFAULT_HOLD_REPLIES_OLDER_THAN;
+        let (state, key, root) = state_with_reply("held-stale", "an old answer");
+        let captured = state.read_reply(&key, 1).expect("reply").captured_at_millis;
+        assert!(state
+            .hold_stale_replies(captured + 60_000, bound)
+            .expect("fresh")
+            .is_empty());
+        let held = state
+            .hold_stale_replies(captured + 4 * 3_600_000, bound)
+            .expect("stale");
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert_eq!((held[0].ordinal, held[0].reason), (1, HoldReason::Stale));
+        assert_eq!(state.held_replies().expect("listed"), held);
+        let mut transport = FakeReplyTransport::default();
+        assert_eq!(state.publish_one(&key, &mut transport).expect("held"), None);
+        assert!(transport.submissions.is_empty());
+        // Another start keeps it held, and reports it only once.
+        assert!(state
+            .hold_stale_replies(captured + 5 * 3_600_000, bound)
+            .expect("again")
+            .is_empty());
+        assert_eq!(state.held_replies().expect("still").len(), 1);
+        let handle = held[0].handle();
+        assert_eq!(
+            parse_held_handle(&handle).expect("handle"),
+            (key.clone(), 1)
+        );
+        state.release_held_reply(&key, 1).expect("send");
+        assert!(state.held_replies().expect("released").is_empty());
+        assert!(state
+            .publish_one(&key, &mut transport)
+            .expect("sent")
+            .is_some());
+        assert_eq!(transport.submissions.len(), 1);
+        fs::remove_dir_all(root).expect("cleanup");
+
+        let (state, key, root) = state_with_reply("held-drop", "never send this");
+        let captured = state.read_reply(&key, 1).expect("reply").captured_at_millis;
+        state
+            .hold_stale_replies(captured + 4 * 3_600_000, bound)
+            .expect("stale");
+        state.drop_held_reply(&key, 1).expect("drop");
+        assert_eq!(
+            state.read_reply(&key, 1).expect("reply").phase,
+            ReplyPhase::Failed
+        );
+        assert!(state.held_replies().expect("dropped").is_empty());
+        let mut transport = FakeReplyTransport::default();
+        assert_eq!(
+            state.publish_one(&key, &mut transport).expect("nothing"),
+            None
+        );
+        assert!(transport.submissions.is_empty());
+        assert!(state.release_held_reply(&key, 1).is_err(), "no longer held");
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// #781 chat-no-stale-replies-on-restart: a fresh unsent reply is still held when a later
+    /// request in the same thread already has its reply sent, so the thread's answer is not
+    /// followed by an outdated one.
+    #[test]
+    fn a_reply_whose_thread_has_moved_on_is_held_even_when_fresh() {
+        let (state, first, root) =
+            state_with_old_request("held-overtaken", config_without_reaction());
+        // The owner's next message in the same thread, admitted later.
+        std::thread::sleep(Duration::from_millis(5));
+        let message = InboundMessage::new(
+            ChannelId::new("spaces/example").expect("channel"),
+            MessageId::new("spaces/example/messages/3").expect("message"),
+            ThreadId::new("spaces/example/threads/1").expect("thread"),
+            SenderId::new("users/owner").expect("sender"),
+            "never mind, do this instead",
+            "2026-09-21T12:00:00Z",
+            false,
+        )
+        .expect("normalized message");
+        let second = state
+            .admit_batch(
+                &DeliveryBatch::new(
+                    EventSequence::new(3).expect("sequence"),
+                    ProviderCursor::new("cursor-3").expect("cursor"),
+                    DeliveryId::new("delivery-3-3").expect("delivery"),
+                    vec![CommittableEvent::message_created(message)],
+                )
+                .expect("delivery"),
+            )
+            .expect("admission")
+            .new_request_keys
+            .into_iter()
+            .next()
+            .expect("second key");
+        for (key, body) in [(&first, "the first answer"), (&second, "the newer answer")] {
+            state
+                .set_delivery_phase(key, RequestPhase::Delivered, None)
+                .expect("mark delivered");
+            let route = state
+                .next_reply_route(key)
+                .expect("route")
+                .expect("open route");
+            state
+                .capture_replies(
+                    key,
+                    &format!(
+                        "<CHAT_REPLY_{}>\n{body}\n</CHAT_REPLY_{}>",
+                        route.identifier, route.identifier
+                    ),
+                )
+                .expect("capture reply");
+        }
+        let mut transport = FakeReplyTransport::default();
+        assert!(state
+            .publish_one(&second, &mut transport)
+            .expect("sent")
+            .is_some());
+        let captured = state
+            .read_reply(&first, 1)
+            .expect("reply")
+            .captured_at_millis;
+        let bound = DEFAULT_HOLD_REPLIES_OLDER_THAN;
+        let held = state
+            .hold_stale_replies(captured + 1_000, bound)
+            .expect("hold");
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert_eq!(
+            (held[0].key.as_str(), held[0].ordinal, held[0].reason),
+            (first.as_str(), 1, HoldReason::Overtaken)
+        );
+        assert_eq!(
+            state.publish_one(&first, &mut transport).expect("held"),
+            None
+        );
+        assert_eq!(transport.submissions.len(), 1);
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]

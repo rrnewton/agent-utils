@@ -19,17 +19,20 @@
 //!    capture refused because its table could be read only from the screen, which draws it
 //!    mangled (see `chat_runtime::SCREEN_FALLBACK_AFTER`), is told the same way;
 //! 3. records where the text comes from, and the misses, in `reply-source.json` for
-//!    `chat health`.
+//!    `chat health`;
+//! 4. tells the coordinator, once, of the replies a restart held back as stale (#781
+//!    chat-no-stale-replies-on-restart; see `chat_runtime::HeldReply`), with the `chat held`
+//!    commands that send or drop each.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use serde_json::{json, Value};
 
 use crate::agent::DrainOptions;
 use crate::chat_runtime::{
-    self, BridgeState, PendingReminder, ReminderCandidate, ReminderOutcome, RootMessageTransport,
-    TranscriptBlock,
+    self, BridgeState, HeldReply, PendingReminder, ReminderCandidate, ReminderOutcome,
+    RootMessageTransport, TranscriptBlock,
 };
 use crate::chat_transcript::ReplySource;
 use crate::subagents::{ManagedAgents, ManagedApi};
@@ -46,6 +49,18 @@ pub(crate) const CAPTURE_MISS_GRACE: Duration = Duration::from_secs(2 * 60);
 const NOTICE_RETRY: Duration = Duration::from_secs(60);
 /// The prefix of a capture-miss notice's ID in the coordinator's queue.
 const NOTICE_MESSAGE_PREFIX: &str = "chat-capture-miss-";
+/// The prefix of a held-replies notice's ID in the coordinator's queue.
+const HELD_NOTICE_PREFIX: &str = "chat-held-replies-";
+/// Most held replies a notice names, with their commands.
+const MAX_HELD_LISTED: usize = 10;
+
+/// A notice to the coordinator that is typed as a reply reminder is, until it is given.
+#[derive(Debug)]
+struct Notice {
+    message_id: String,
+    prompt: String,
+    tried_at_millis: Option<u64>,
+}
 
 /// A request whose reply block the coordinator's transcript holds while the bridge holds no
 /// reply to it.
@@ -119,6 +134,10 @@ pub(crate) struct ReplySourceWatch {
     bind_problem: Option<String>,
     /// The record last written, written again only when it changes.
     written: Option<Value>,
+    /// The held replies the coordinator has been told of, by handle.
+    held_told: BTreeSet<String>,
+    /// The held-replies notice not given yet.
+    held_notice: Option<Notice>,
 }
 
 impl Default for ReplySourceWatch {
@@ -128,6 +147,8 @@ impl Default for ReplySourceWatch {
             told: BTreeMap::new(),
             bind_problem: None,
             written: None,
+            held_told: BTreeSet::new(),
+            held_notice: None,
         }
     }
 }
@@ -248,7 +269,96 @@ impl ReplySourceWatch {
         }
         post_owner_notices(owner, state, transport, "capture-miss warning");
         self.tell_coordinator(state, manager, stop, delivery, now);
+        self.announce_held(state, manager, stop, delivery, now);
         self.record(state, &source, now);
+    }
+
+    /// Tell the coordinator, once, of the replies held back as stale that it has not been told
+    /// of, naming the `chat held` command that sends or drops each.
+    fn announce_held<A: ManagedApi + ?Sized>(
+        &mut self,
+        state: &BridgeState,
+        manager: &ManagedAgents<'_, A>,
+        stop: &StopState,
+        delivery: DrainOptions,
+        now: u64,
+    ) {
+        let held = match state.held_replies() {
+            Ok(held) => held,
+            Err(error) => {
+                service_log(format_args!(
+                    "agentctl: the held replies cannot be read; a later scan tries again: {error}"
+                ));
+                return;
+            }
+        };
+        self.held_told
+            .retain(|handle| held.iter().any(|entry| entry.handle() == *handle));
+        let fresh: Vec<&HeldReply> = held
+            .iter()
+            .filter(|entry| !self.held_told.contains(&entry.handle()))
+            .collect();
+        if !fresh.is_empty() {
+            for entry in &fresh {
+                service_log(format_args!(
+                    "agentctl: HELD STALE REPLY: reply {} of request {}, captured {}, is held: {}",
+                    entry.ordinal,
+                    entry.key.get(..12).unwrap_or(&entry.key),
+                    chat_runtime::utc_timestamp(entry.captured_at_millis),
+                    entry.reason.describe()
+                ));
+            }
+            self.held_told
+                .extend(fresh.iter().map(|entry| entry.handle()));
+            self.held_notice = Some(Notice {
+                message_id: format!("{HELD_NOTICE_PREFIX}{now}"),
+                prompt: held_notice(state, &held, now),
+                tried_at_millis: None,
+            });
+        }
+        let retry = u64::try_from(NOTICE_RETRY.as_millis()).unwrap_or(u64::MAX);
+        let Some(notice) = self.held_notice.as_mut() else {
+            return;
+        };
+        if stop.is_stopped()
+            || notice
+                .tried_at_millis
+                .is_some_and(|at| now.saturating_sub(at) < retry)
+        {
+            return;
+        }
+        notice.tried_at_millis = Some(now);
+        let notes = TypingNotes::default();
+        let outcome = chat_runtime::deliver_reminder(
+            state,
+            &TypingWatch {
+                delivery: &CancellableDelivery {
+                    manager,
+                    runtime: StopRuntime::new(stop),
+                },
+                notes: &notes,
+                state,
+                receipts: stop.ack_queue.as_ref(),
+            },
+            &PendingReminder {
+                message_id: notice.message_id.clone(),
+                keys: held.iter().map(|entry| entry.key.clone()).collect(),
+                prompt: notice.prompt.clone(),
+            },
+            delivery,
+        );
+        let given = !matches!(outcome, ReminderOutcome::Withdrawn(_));
+        service_log(format_args!(
+            "agentctl: held-replies notice {}",
+            if given {
+                outcome.describe()
+            } else {
+                format!("{}; tried again in {}s", outcome.describe(), retry / 1000)
+            }
+        ));
+        if given {
+            self.held_notice = None;
+        }
     }
 
     /// Bind `session` into `agent`'s record, logging a failure once until it changes.
@@ -370,6 +480,45 @@ impl ReplySourceWatch {
         state.note_reply_source(&written);
         self.written = Some(document);
     }
+}
+
+/// The notice that tells the coordinator of the replies `held` back as stale at `now`.
+pub(super) fn held_notice(state: &BridgeState, held: &[HeldReply], now: u64) -> String {
+    let mut lines = vec![format!(
+        "[chat-bridge] The chat bridge restarted and is holding back {} of your replies that it \
+had not sent: each was captured long ago, or its thread has moved on, so it is not sent unless \
+you say so. For each, send it as it is, or drop it (to change it, drop it and send the new text \
+with `agentctl chat reply`):",
+        held.len()
+    )];
+    for entry in held.iter().take(MAX_HELD_LISTED) {
+        let preview: String = state
+            .held_reply_text(&entry.key, entry.ordinal)
+            .unwrap_or_default()
+            .chars()
+            .take(120)
+            .collect::<String>()
+            .replace('\n', " ");
+        let send = state.held_command("send", &entry.handle());
+        let drop = state.held_command("drop", &entry.handle());
+        lines.push(format!(
+            "- reply {} captured {} min ago ({}): \"{preview}\"\n  send: {}\n  drop: {}",
+            entry.ordinal,
+            now.saturating_sub(entry.captured_at_millis) / 60_000,
+            entry.reason.describe(),
+            send.as_deref()
+                .unwrap_or("agentctl chat held --send KEY/ORDINAL"),
+            drop.as_deref()
+                .unwrap_or("agentctl chat held --drop KEY/ORDINAL")
+        ));
+    }
+    if held.len() > MAX_HELD_LISTED {
+        lines.push(format!(
+            "- and {} more: `agentctl chat held` lists them all",
+            held.len() - MAX_HELD_LISTED
+        ));
+    }
+    lines.join("\n")
 }
 
 /// The notice that tells the coordinator its reply to `miss` did not go out, and why.

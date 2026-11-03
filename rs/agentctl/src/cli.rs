@@ -1507,6 +1507,11 @@ enum ChatCommand {
         after_help = "Examples:\n  agentctl chat sent 007\n  agentctl chat sent\n  agentctl chat sent --bridge-state ~/.local/state/agentctl/chat --request <KEY> --json\n\nWith a reply ID it lists that request's replies. Without --bridge-state or --bridge it finds the\nbridge as `chat reply` does.\n\nEach reply shows when it was sent (or captured, while unsent, or for a record kept before send\ntimes were recorded, which it says) in UTC and how long ago, its\nnumber within its request, the request key, the chat message and thread it answers, and its\noutcome: `sent as <provider message ID>` once the chat provider accepted it, `captured, not yet\nsent`, or `send in progress or outcome unknown`, which the service retries with the same\noperation ID so it is never posted twice. The first 300 characters of each reply follow, every\nline prefixed with `> `. --json prints one document (schema agentctl-chat-sent/v1) with the\nsame fields, times as Unix milliseconds, and each reply's whole text.\n\nThe bridge holds only the replies of requests that are not retired, so the chat thread itself\nis the complete record. It reads under the shared state lock and never writes state or\ncontacts Herdr, a helper, or a provider."
     )]
     Sent(ChatSent),
+    /// List the replies a restarted bridge holds back as stale, or send or drop one
+    #[command(
+        after_help = "Examples:\n  agentctl chat held\n  agentctl chat held --bridge-state ~/.local/state/agentctl/chat --send <KEY>/2\n  agentctl chat held --drop <KEY>/2\n\nWhen `chat run` starts, it holds back each reply it has not sent that was captured\n--hold-replies-older-than ago or longer (default 15m), or whose thread has moved on (a later request\nin the same thread already has a reply sent), and tells the coordinator, rather than post a reply that\nis no longer what it would say (#781 chat-no-stale-replies-on-restart). Without --send or --drop this\nlists them, oldest first: each as KEY/ORDINAL, when it was captured, why it is held, and its first 300\ncharacters; --json prints one document (schema agentctl-chat-held/v1) with each reply's whole text.\n--send KEY/ORDINAL takes the hold off, so the service sends the reply as it is; --drop KEY/ORDINAL\nmarks it never to be sent, so the request's later replies go out. To change a held reply, drop it and\nsend the new text with `chat reply`. Either prints one JSON object (reply, outcome released or\ndropped, service_woken) and wakes a service running on the state, as `chat reply` does. Without\n--bridge-state or --bridge it finds the bridge as `chat reply` does. Exit status: 0 on success; 1\nwhen the state cannot be read or written or KEY/ORDINAL names no held reply; 2 for a usage error."
+    )]
+    Held(ChatHeld),
     /// Publish one explicit operator message through the configured helper: a new root message,
     /// or with --thread-id a reply in an existing thread
     #[command(
@@ -1699,6 +1704,21 @@ struct ChatSent {
     )]
     last: u32,
     /// Print one JSON document with each reply's whole text instead of the text listing
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct ChatHeld {
+    #[command(flatten)]
+    target: ChatTarget,
+    /// Take the hold off this reply, KEY/ORDINAL as the listing names it, so the service sends it
+    #[arg(long, value_name = "KEY/ORDINAL", conflicts_with = "drop")]
+    send: Option<String>,
+    /// Drop this reply, KEY/ORDINAL as the listing names it: it is never sent
+    #[arg(long, value_name = "KEY/ORDINAL")]
+    drop: Option<String>,
+    /// Print the listing as one JSON document with each reply's whole text
     #[arg(long)]
     json: bool,
 }
@@ -1978,6 +1998,9 @@ struct ChatRun {
     /// Stop chat run with exit status 70 when its owner loop makes no round for DURATION, so that a unit with Restart=on-failure starts it again (default: 5m). Units: s, m or h; a bare number is seconds; at least 60s and at most 1h, and 0 runs no watchdog. Every blocking step of a round is bounded well below it: a delivery waits at most 5 s for the coordinator's queue and target locks and ends --ready-timeout plus 30 s after it starts, leaving the request pending for the next pass. The loop rewrites owner-loop-alive in the state directory as it turns; `chat health` reports a running service whose loop has not turned for DURATION as STALLED. The watchdog records the stall as the owner loop's failure, stops the service (cancelling the Herdr call the loop waits on), and ends the process itself if the loop has not ended 30 s later.
     #[arg(long, value_name = "DURATION", default_value = "5m", hide_default_value = true, value_parser = stall_restart_after)]
     stall_restart_after: StallRestartAfter,
+    /// When chat run starts, hold back each reply it has not sent that was captured DURATION or longer ago, or whose thread has moved on (a later request in the same thread already has a reply sent), instead of posting it (default: 15m). The coordinator is told; `chat held` lists them and sends or drops each; `chat status` and `chat health` show them. Units: s, m or h, from 1m to 168h; a bare number is seconds; 0 holds only replies whose thread has moved on, and off holds nothing. Replies captured after the start are never held.
+    #[arg(long, value_name = "DURATION", default_value = "15m", hide_default_value = true, value_parser = hold_replies_older_than)]
+    hold_replies_older_than: HoldRepliesOlderThan,
 }
 
 #[derive(Args)]
@@ -2172,6 +2195,18 @@ fn owner_alarm_duration(value: &str) -> Result<OwnerAlarmAfter, String> {
     crate::stale_composer::parse_duration(value)
         .map(|duration| OwnerAlarmAfter(Some(duration)))
         .map_err(|error| format!("{error}, or off"))
+}
+/// `chat run --hold-replies-older-than`: the age bound, or `None` (`off`) when nothing is held.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HoldRepliesOlderThan(Option<Duration>);
+fn hold_replies_older_than(value: &str) -> Result<HoldRepliesOlderThan, String> {
+    match value.trim() {
+        "off" => Ok(HoldRepliesOlderThan(None)),
+        "0" => Ok(HoldRepliesOlderThan(Some(Duration::ZERO))),
+        value => crate::stale_composer::parse_duration(value)
+            .map(|bound| HoldRepliesOlderThan(Some(bound)))
+            .map_err(|error| format!("{error}, 0, or off")),
+    }
 }
 /// `chat run --stall-restart-after`: the stall bound, or `None` when no watchdog runs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4607,6 +4642,18 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
             write_text(&listing).map_err(Failure::Output)?;
             Ok(0)
         }
+        ChatCommand::Held(value) => {
+            let resolved = chat_target(&registry, &herdr_bin, &value.target, None)?;
+            let action = match (&value.send, &value.drop) {
+                (Some(handle), _) => crate::chat_service::HeldAction::Send(handle.clone()),
+                (None, Some(handle)) => crate::chat_service::HeldAction::Drop(handle.clone()),
+                (None, None) => crate::chat_service::HeldAction::List,
+            };
+            let output = crate::chat_service::held(&resolved.state, &action, value.json)
+                .map_err(Failure::Chat)?;
+            write_text(&output).map_err(Failure::Output)?;
+            Ok(0)
+        }
         ChatCommand::Publish(value) => {
             let body = value.read_message().map_err(Failure::Usage)?;
             let result = crate::chat_service::publish(
@@ -4730,6 +4777,7 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
                     offer_reply_command: value.offer_reply_command,
                     stale_composer_clear_after: value.stale_composer_clear_after,
                     stall_restart_after: value.stall_restart_after.0,
+                    hold_replies_older_than: value.hold_replies_older_than.0,
                     reply_reminders: value.reply_reminder_idle.0.map(|idle| {
                         crate::chat_service::ReplyReminderSettings {
                             idle,

@@ -638,3 +638,71 @@ fn migrate_state_never_replaces_an_existing_bridge() {
         .join("bridge.json")
         .is_file());
 }
+
+/// #781 chat-no-stale-replies-on-restart: `chat held` lists a reply a restart held back, as text
+/// and as JSON with its whole text; `--send` takes the hold off and prints the outcome; a handle
+/// that names no held reply exits 1.
+#[test]
+fn chat_held_lists_a_held_reply_and_send_takes_the_hold_off() {
+    let scratch = Scratch::new("held");
+    let state = scratch.state.to_str().expect("UTF-8 state").to_owned();
+    let held = |arguments: &[&str]| {
+        let mut words = vec!["held", "--bridge-state", state.as_str()];
+        words.extend_from_slice(arguments);
+        scratch.chat(&words, &[])
+    };
+    let listed = held(&[]);
+    assert_eq!(listed.code, Some(0), "{}", listed.stderr);
+    assert_eq!(listed.stdout, "no replies are held\n");
+    let reply = scratch.file("reply.md", b"an answer from before the restart\n");
+    assert_stored(
+        &scratch.reply_with(&scratch.reply_id, &reply),
+        &scratch.result("stored", 1),
+    );
+    let bridge = BridgeState::open(&scratch.state).expect("open state");
+    let entries = bridge
+        .hold_stale_replies(
+            u64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_millis(),
+            )
+            .expect("millis")
+                + 4 * 3_600_000,
+            agentctl::chat_runtime::DEFAULT_HOLD_REPLIES_OLDER_THAN,
+        )
+        .expect("hold");
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    let handle = format!("{}/1", scratch.key);
+    let listed = held(&[]);
+    assert_eq!(listed.code, Some(0), "{}", listed.stderr);
+    assert!(listed.stdout.starts_with(&handle), "{}", listed.stdout);
+    assert!(
+        listed
+            .stdout
+            .contains("> an answer from before the restart"),
+        "{}",
+        listed.stdout
+    );
+    let document = held(&["--json"]);
+    assert_eq!(document.code, Some(0), "{}", document.stderr);
+    let document: Value = serde_json::from_str(&document.stdout).expect("one JSON document");
+    assert_eq!(document["schema"], "agentctl-chat-held/v1");
+    assert_eq!(document["held"][0]["reply"], handle.as_str());
+    assert_eq!(document["held"][0]["reason"], "stale");
+    assert_eq!(
+        document["held"][0]["text"],
+        "an answer from before the restart"
+    );
+    let sent = held(&["--send", &handle]);
+    assert_eq!(sent.code, Some(0), "{}", sent.stderr);
+    let sent: Value = serde_json::from_str(&sent.stdout).expect("one JSON object");
+    assert_eq!(
+        sent,
+        json!({"reply": handle, "outcome": "released", "service_woken": false})
+    );
+    assert_eq!(held(&[]).stdout, "no replies are held\n");
+    assert_failed(&held(&["--drop", &handle]), 1, "");
+    assert_failed(&held(&["--drop", "not-a-handle"]), 1, "KEY/ORDINAL");
+}

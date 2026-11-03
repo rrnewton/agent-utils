@@ -341,6 +341,8 @@ struct Observed {
     binding: Option<(String, Option<String>)>,
     /// `reply-source.json`: where reply text comes from, and the capture misses.
     reply_source: Option<Value>,
+    /// The replies a restart held back as stale.
+    held: Vec<chat_runtime::HeldReply>,
     now: u64,
 }
 
@@ -373,6 +375,7 @@ pub fn health<A: ManagedApi + ?Sized>(
             &state.config().agent_name,
         ),
         reply_source: state.reply_source_record(),
+        held: state.held_replies()?,
         registry,
         now,
     };
@@ -397,6 +400,7 @@ fn assess(observed: Observed, options: HealthOptions) -> Health {
         registry,
         binding,
         reply_source,
+        held,
         now,
     } = observed;
     let configuration = &configuration;
@@ -610,9 +614,23 @@ fn assess(observed: Observed, options: HealthOptions) -> Health {
             ),
         });
     }
+    // Held replies wait for the coordinator on purpose: they are reported below, not as stuck
+    // (#781 chat-no-stale-replies-on-restart).
+    if !held.is_empty() {
+        problems.degraded.push(format!(
+            "{} reply(ies) held back as stale after a restart, waiting for the coordinator to send \
+             or drop each (`agentctl chat held`)",
+            held.len()
+        ));
+    }
     let stuck_millis = u64::try_from(UNSENT_REPLY_STUCK.as_millis()).unwrap_or(u64::MAX);
     let stuck_replies = unsent
         .iter()
+        .filter(|reply| {
+            !held
+                .iter()
+                .any(|entry| entry.key == reply.key && entry.ordinal == reply.ordinal)
+        })
         .filter(|reply| {
             !loops
                 .iter()
@@ -768,6 +786,15 @@ fn assess(observed: Observed, options: HealthOptions) -> Health {
     if let Some(line) = &binding_line {
         let _ = writeln!(text, "{line}");
     }
+    for entry in held.iter().take(MAX_LISTED) {
+        let _ = writeln!(
+            text,
+            "  held: {} captured {}: {}",
+            entry.handle(),
+            when(Some(entry.captured_at_millis), now),
+            entry.reason.describe()
+        );
+    }
     if let Some(source) = source {
         let _ = writeln!(
             text,
@@ -888,6 +915,7 @@ fn assess(observed: Observed, options: HealthOptions) -> Health {
             "native_session": session,
         })),
         "reply_source": reply_source,
+        "held_replies": held,
     });
     Health {
         verdict,
@@ -949,6 +977,7 @@ mod tests {
             registry: choose_registry(Path::new("/registry"), None),
             binding: Some(("claude".to_owned(), Some("s-1".to_owned()))),
             reply_source: None,
+            held: Vec::new(),
             now: NOW,
         }
     }
@@ -1079,6 +1108,42 @@ mod tests {
         assert!(health
             .text
             .contains("reply text: transcript /t/s-1.jsonl (e)"));
+    }
+
+    #[test]
+    fn replies_held_after_a_restart_are_degraded_and_not_called_stuck() {
+        let mut observed = healthy();
+        observed.held = vec![chat_runtime::HeldReply {
+            key: "a".repeat(64),
+            ordinal: 1,
+            captured_at_millis: NOW - 4 * 3_600_000,
+            held_at_millis: NOW - 60_000,
+            reason: chat_runtime::HoldReason::Stale,
+        }];
+        observed.unsent = vec![UnsentReply {
+            key: "a".repeat(64),
+            ordinal: 1,
+            phase: "pending".to_owned(),
+            captured_at_millis: Some(NOW - 4 * 3_600_000),
+            send_attempts: Some(0),
+            last_send_failure_code: None,
+            last_send_failure_at_millis: None,
+            send_permanent_failure: None,
+        }];
+        let health = assess(observed, options());
+        assert_eq!(health.verdict, "degraded", "{}", health.text);
+        assert!(
+            health.text.contains("held back as stale"),
+            "{}",
+            health.text
+        );
+        assert!(
+            !health.text.contains("unsent for more than"),
+            "{}",
+            health.text
+        );
+        assert!(health.text.contains(&format!("held: {}/1", "a".repeat(64))));
+        assert_eq!(health.document["held_replies"][0]["reason"], "stale");
     }
 
     #[test]

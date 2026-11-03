@@ -464,6 +464,98 @@ pub fn sent_replies(
     Ok(BridgeState::inspect(state_root)?.sent_replies(request, last, json)?)
 }
 
+/// What `chat held` does: list the held replies, or send or drop one, named `KEY/ORDINAL`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HeldAction {
+    /// List them.
+    List,
+    /// Take the hold off one, so the service sends it.
+    Send(String),
+    /// Drop one, so it is never sent.
+    Drop(String),
+}
+
+/// `chat held` (#781 chat-no-stale-replies-on-restart): the replies a restarted bridge holds
+/// back as stale, listed as text or, with `json`, one JSON document; or the outcome of sending
+/// or dropping one, as JSON. Sending or dropping one wakes a running service, as `chat reply`
+/// does, so the reply, or the request's later replies, go out at once.
+///
+/// # Errors
+///
+/// A state that cannot be read or written, or a `KEY/ORDINAL` that names no held reply.
+pub fn held(
+    state_root: &Path,
+    action: &HeldAction,
+    json: bool,
+) -> Result<String, ChatServiceError> {
+    let state = BridgeState::inspect(state_root)?;
+    let handle = match action {
+        HeldAction::List => {
+            let held = state.held_replies()?;
+            if json {
+                let replies: Vec<Value> = held
+                    .iter()
+                    .map(|entry| {
+                        json!({
+                            "reply": entry.handle(),
+                            "request": entry.key,
+                            "ordinal": entry.ordinal,
+                            "captured_at_millis": entry.captured_at_millis,
+                            "held_at_millis": entry.held_at_millis,
+                            "reason": entry.reason,
+                            "text": state.held_reply_text(&entry.key, entry.ordinal).unwrap_or_default(),
+                        })
+                    })
+                    .collect();
+                return Ok(format!(
+                    "{}\n",
+                    json!({"schema": "agentctl-chat-held/v1", "held": replies})
+                ));
+            }
+            if held.is_empty() {
+                return Ok("no replies are held\n".to_owned());
+            }
+            let now = chat_runtime::unix_millis();
+            let mut text = String::new();
+            for entry in &held {
+                text.push_str(&format!(
+                    "{} captured {} ({} ago), held: {}\n",
+                    entry.handle(),
+                    chat_runtime::utc_timestamp(entry.captured_at_millis),
+                    age_text(now.saturating_sub(entry.captured_at_millis)),
+                    entry.reason.describe()
+                ));
+                let body = state
+                    .held_reply_text(&entry.key, entry.ordinal)
+                    .unwrap_or_default();
+                for line in body.chars().take(300).collect::<String>().lines() {
+                    text.push_str(&format!("> {line}\n"));
+                }
+            }
+            text.push_str(
+                "send one as it is with `chat held --send KEY/ORDINAL`, or drop it with \
+                 `chat held --drop KEY/ORDINAL`\n",
+            );
+            return Ok(text);
+        }
+        HeldAction::Send(handle) | HeldAction::Drop(handle) => handle,
+    };
+    let (key, ordinal) = chat_runtime::parse_held_handle(handle)?;
+    let (outcome, entry) = match action {
+        HeldAction::Send(_) => ("released", state.release_held_reply(&key, ordinal)?),
+        _ => ("dropped", state.drop_held_reply(&key, ordinal)?),
+    };
+    let service_woken = wake_service(state_root, &key);
+    Ok(format!(
+        "{}\n",
+        json!({
+            "reply": entry.handle(),
+            "outcome": outcome,
+            "service_woken": service_woken,
+        })
+    ))
+}
+
 /// Publish one explicit owner/operator message without mutating durable bridge state: a new root
 /// message, or, with `thread_id`, a reply in an existing thread of the same channel.
 ///
@@ -1075,6 +1167,12 @@ pub struct RunSettings {
     /// starts it again; `chat health` reports such a loop as stalled. `None`, the default here,
     /// runs no watchdog; `chat run` uses [`DEFAULT_STALL_RESTART_AFTER`] unless told otherwise.
     pub stall_restart_after: Option<Duration>,
+    /// At start, hold back the unsent replies captured this long ago or longer, and those whose
+    /// thread has moved on, for the coordinator to send or drop (#781
+    /// chat-no-stale-replies-on-restart; see [`chat_runtime::HeldReply`]). `None`, the default
+    /// here, holds nothing; `chat run` uses [`chat_runtime::DEFAULT_HOLD_REPLIES_OLDER_THAN`]
+    /// unless told otherwise.
+    pub hold_replies_older_than: Option<Duration>,
 }
 
 /// Record this bridge in the per-user bridge index, and say how its prompts print commands: the
@@ -1198,6 +1296,26 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
             ))
             .with_reply_source(source)
     };
+    // Replies this start finds unsent and stale are held back before any pass can send them
+    // (#781 chat-no-stale-replies-on-restart).
+    if let Some(older_than) = settings.hold_replies_older_than {
+        match state.hold_stale_replies(chat_runtime::unix_millis(), older_than) {
+            Ok(held) => {
+                for entry in held {
+                    service_log(format_args!(
+                        "agentctl: held reply {} of request {} at start ({}); the coordinator is \
+                         told, and `chat held` sends or drops it",
+                        entry.ordinal,
+                        entry.key.get(..12).unwrap_or(&entry.key),
+                        entry.reason.describe()
+                    ));
+                }
+            }
+            Err(error) => service_log(format_args!(
+                "agentctl: stale replies could not be held at start, so they may be sent: {error}"
+            )),
+        }
+    }
     let _resume_request = state.subscribe_request()?;
     validate_service_outbound(state.config())?;
     if headless {
@@ -15100,6 +15218,45 @@ esac
         fn following(&self) -> bool {
             true
         }
+    }
+
+    /// #781 chat-no-stale-replies-on-restart: the coordinator's notice of a held reply shows its
+    /// start and names the commands that send it as it is or drop it.
+    #[test]
+    fn the_held_replies_notice_names_the_commands_that_send_or_drop_each() {
+        let (state, key, root) = state_with_request();
+        state
+            .put_delivery_phase(&key, RequestPhase::Delivered, None)
+            .expect("delivered");
+        let id = state
+            .reply_reminder_candidates()
+            .expect("candidates")
+            .candidates
+            .remove(0)
+            .reply_id;
+        let capture = state
+            .capture_snapshot(&format!(
+                "<CHAT_REPLY_{id}>\nthe deploy is done\n</CHAT_REPLY_{id}>\n"
+            ))
+            .expect("captured");
+        assert_eq!(capture.replies.len(), 1, "{capture:?}");
+        let now = chat_runtime::unix_millis() + 4 * 3_600_000;
+        let held = state
+            .hold_stale_replies(now, chat_runtime::DEFAULT_HOLD_REPLIES_OLDER_THAN)
+            .expect("held");
+        assert_eq!(held.len(), 1, "{held:?}");
+        let notice = reply_source::held_notice(&state, &held, now);
+        assert!(notice.starts_with("[chat-bridge]"), "{notice}");
+        assert!(notice.contains("\"the deploy is done\""), "{notice}");
+        assert!(notice.contains(" chat held --bridge-state "), "{notice}");
+        let handle = held[0].handle();
+        for action in ["send", "drop"] {
+            assert!(
+                notice.contains(&format!(" --{action} {handle}")),
+                "{notice}"
+            );
+        }
+        fs::remove_dir_all(root).ok();
     }
 
     /// #783 chat-reply-capture-miss slice (d): a table read only from the screen while a
