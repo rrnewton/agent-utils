@@ -11134,7 +11134,7 @@ function walkCursorOwed() {
   }
   // A page that said more exists and carried no cursor, whatever the view's cover: one a
   // server before `#510 cache-serve-every-read` answered from its message cache.
-  if (discordWalkCursorOwed) return true;
+  if (channelReads.cursorOwed()) return true;
   if (!providerFacts.threading()) return false;
   const cover = channelStore.current().views.get(viewKey());
   return Boolean(cover && cover.fromAll && cover.live && cover.more);
@@ -11335,7 +11335,7 @@ function clearChannelScreen() {
   doneState().archived = new Set();
   olderPages().moreAbove = false;
   olderPages().cursor = null;
-  discordWalkCursorOwed = false;
+  channelReads.payCursor();
   listState().newestId = null;
   el("discord-log").replaceChildren();
   el("thread-list").replaceChildren();
@@ -12429,7 +12429,7 @@ async function changeChannelView(view, threadId = null, summary = null, origin =
   const rows = held || covered ? [] : heldViewRows();
   olderPages().moreAbove = held ? held.more : false;
   olderPages().cursor = held ? held.cursor : null;
-  discordWalkCursorOwed = false;
+  channelReads.payCursor();
   listState().newestId = held ? held.newest : null;
   // The rows on screen stay until the new view's replace them, unless there is nothing to draw.
   if (held || (!covered && rows.length === 0)) {
@@ -14683,7 +14683,7 @@ function applyTimelinePage(payload, older = false, saved = false, delta = false,
       (olderPages().moreAbove !== false && !olderPages().cursor))) {
     olderPages().moreAbove = payload.has_more === true;
     olderPages().cursor = payload.next_before || null;
-    discordWalkCursorOwed = payload.has_more === true && !payload.next_before;
+    channelReads.oweCursor(payload.has_more === true && !payload.next_before);
   }
   const cover = channelStore.current().views.get(viewKey());
   if (cover && !saved && !delta) cover.cursor = olderPages().cursor;
@@ -15074,7 +15074,7 @@ async function loadTimeline(options) {
           timelineRows().messages = [];
           timelineRows().threads = [];
           olderPages().cursor = null;
-          discordWalkCursorOwed = false;
+          channelReads.payCursor();
           olderPages().moreAbove = false;
           channelStore.current().views.delete(viewKey());
           deltas.length = 0;
@@ -21634,11 +21634,9 @@ function freshOlderPages() {
 function olderPages() {
   return columnWork.active().older;
 }
-// The last live page said more exists above but carried no cursor to walk back on — a page a
-// server before `#510 cache-serve-every-read` answered from its message cache (`#384
-// cache-serve`); a server now mints a cursor of its own for such a page. The first step back
-// then owes the view a read of its own newest page first (`readWalkCursor`).
-let discordWalkCursorOwed = false;
+// Whether the last live page said more exists above but carried no cursor to walk back on, so that the
+// first step back owes the view a read of its own newest page first (`readWalkCursor`), is the channel
+// reads' (`channelReads.cursorOwed`, web/src/core/sync, `#624 voice-page-modularity`).
 
 /** `has_more` absent means a server too old to say — which is UNKNOWN, and never "no". */
 const normaliseHasMore = (hasMore) => (typeof hasMore === "boolean" ? hasMore : undefined);
@@ -23976,7 +23974,7 @@ async function loadTodo(options) {
     // scroll to the top prepend unfiltered rows into a filtered list.
     olderPages().moreAbove = false;
     olderPages().cursor = null;
-    discordWalkCursorOwed = false;
+    channelReads.payCursor();
     renderOlderControl();
     listState().backlog = messages.length;
     // Quoted, never rewritten: `#61 unread-status` is one posture and it is stated on the server.
@@ -33531,7 +33529,7 @@ function changeSelectedChannel() {
   restoreChannelComposer();
   olderPages().moreAbove = false;
   olderPages().cursor = null;
-  discordWalkCursorOwed = false;
+  channelReads.payCursor();
   listState().newestId = null;
   el("discord-log").replaceChildren();
   // The summary goes with the rows it is about. It is written only inside `loadDiscord`, which

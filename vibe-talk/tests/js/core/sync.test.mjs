@@ -467,3 +467,16 @@ test("`#624 voice-page-modularity`: one channel read on the wire, the view it is
   assert.equal(reads.release([left, right]), null, "nothing queued");
   assert.equal(reads.busy(), false);
 });
+
+test("`#624 voice-page-modularity`: a live page with more above and no cursor owes the walk one, until it is paid", () => {
+  const { createChannelReads } = SYNC;
+  const reads = createChannelReads();
+  assert.equal(reads.cursorOwed(), false);
+  reads.oweCursor(true);
+  assert.equal(reads.cursorOwed(), true);
+  reads.payCursor();
+  assert.equal(reads.cursorOwed(), false);
+  reads.oweCursor(true);
+  reads.oweCursor(false);
+  assert.equal(reads.cursorOwed(), false, "a later page with a cursor owes none");
+});

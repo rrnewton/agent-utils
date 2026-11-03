@@ -3,6 +3,7 @@
 // at a time across both columns, the view the one out is for, and the read queued behind it by the column it
 // is for — one each, so a read of the thread on the right never stands in for a refresh of Main or the
 // other way round. The one queued read stands for every trigger that asked meanwhile (`joinQueuedReads`).
+// And whether the last live page said more exists above but carried no cursor to walk back on.
 // Reading, and what each read draws, are the page's (`loadDiscord`, `finishDiscordLoad`).
 
 import { joinQueuedReads } from "./streams.ts";
@@ -32,6 +33,17 @@ export interface ChannelReads<Column> {
    * that has one is taken, or null.
    */
   release(columns: readonly Column[]): { column: Column; options: QueuedReadOptions | undefined } | null;
+  /**
+   * Whether the last live page said more exists above but carried no cursor to walk back on — a page a server
+   * before `#510 cache-serve-every-read` answered from its message cache (`#384 cache-serve`); a server now
+   * mints a cursor of its own for such a page. The first step back then owes the view a read of its own
+   * newest page first.
+   */
+  cursorOwed(): boolean;
+  /** A live page has landed: whether it owes the walk a cursor. */
+  oweCursor(owed: boolean): void;
+  /** The cursor is owed no longer: read, or the view is another. */
+  payCursor(): void;
 }
 
 /** No read out, none queued. */
@@ -39,6 +51,7 @@ export function createChannelReads<Column>(): ChannelReads<Column> {
   let discordFetchInFlight = false;
   let timelineReadContext: string | null = null;
   const discordQueuedLoads = new Map<Column, { options: QueuedReadOptions | undefined }>();
+  let discordWalkCursorOwed = false;
 
   return {
     busy: () => discordFetchInFlight,
@@ -69,6 +82,13 @@ export function createChannelReads<Column>(): ChannelReads<Column> {
       const queued = discordQueuedLoads.get(next) as { options: QueuedReadOptions | undefined };
       discordQueuedLoads.delete(next);
       return { column: next, options: queued.options };
+    },
+    cursorOwed: () => discordWalkCursorOwed,
+    oweCursor(owed) {
+      discordWalkCursorOwed = owed;
+    },
+    payCursor() {
+      discordWalkCursorOwed = false;
     },
   };
 }
