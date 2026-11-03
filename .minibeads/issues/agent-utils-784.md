@@ -1,6 +1,6 @@
 ---
 title: 'chat-settle-uncertain: an operator command to settle a delivery_uncertain chat request'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 assignee: mu-restore2@devbig030
@@ -9,7 +9,8 @@ labels:
 depends_on:
   agent-utils-804: blocks
 created_at: 2026-11-02T18:18:28.744355350+00:00
-updated_at: 2026-11-03T02:01:04.802555918+00:00
+updated_at: 2026-11-03T16:58:07.491898636+00:00
+closed_at: 2026-11-03T16:58:07.491898506+00:00
 ---
 
 # Description
