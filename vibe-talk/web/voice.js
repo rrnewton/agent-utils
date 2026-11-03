@@ -20970,7 +20970,7 @@ function discordNode(messages) {
   // the row's left, where nothing else on the row is. Not in the Pinned list (`#206 pin-message`):
   // that is a flat list of what was kept, drawn without the reply gutter, and what a pin answers is
   // the channel's business — the jump walks the channel's own views, which are not on screen there.
-  if (message.reply_to && !drawingPinnedRows && !drawingMainRows) li.replaceChildren(replyArrow(li), ...li.children);
+  if (message.reply_to && !rowDrawing.pinned() && !rowDrawing.main()) li.replaceChildren(replyArrow(li), ...li.children);
   // The SAME call the voice transcript makes, on the same arguments, so the two lists cannot end
   // up with two idioms for the one behaviour. `#47 scrollback-stability`. The one extra argument
   // is the message id, which is what `#49 cached-summaries` keys a summary under — the transcript
@@ -21032,7 +21032,7 @@ function discordNode(messages) {
   // replies each row has (`renderReplyCounts`) finds the button without walking the row's text.
   li.replyButton = reply;
   // A row of the Pinned filter offers the way into its message's thread whatever view is under it.
-  addThreadDecoration(acts, message, li, drawingPinnedRows || drawingMainRows);
+  addThreadDecoration(acts, message, li, rowDrawing.pinned() || rowDrawing.main());
   // A provider write, distinct from the reversible local Done/archive below. Most providers do
   // not expose this operation, so the server advertises it explicitly and the control stays out
   // of the interface unless the selected provider supports it.
@@ -25114,11 +25114,11 @@ const pinSync = createPinSync({
   now: () => Date.now(),
 });
 /**
- * True while `syncPinnedList` builds the filter's rows, so `discordNode` gives each one the way into
- * its thread. A flag rather than a parameter, because every other caller hands `discordNode` to
- * `map`, which would pass it an index.
+ * Whether `syncPinnedList` is building the filter's rows, or `mainRows` Main's rows among the cards, so
+ * `discordNode` gives each one the way into its thread: flags, one owner in web/src/view/channel/rowdrawing.ts
+ * (`#624 voice-page-modularity`), which says why they are not parameters.
  */
-let drawingPinnedRows = false;
+const rowDrawing = createRowDrawing();
 
 const currentChannelId = () => String(selectedChannelId() || "");
 
@@ -25220,12 +25220,7 @@ function syncPinnedList() {
       pinSync.isKept(m), reactionsDrawn(m), m.heading || null, editedDrawn(m), upstreamUrlOf(m)])]);
   if (drawn === pinsView().drawn) return;
   pinsView().drawn = drawn;
-  drawingPinnedRows = true;
-  try {
-    list.replaceChildren(...glom(messages).map(discordNode));
-  } finally {
-    drawingPinnedRows = false;
-  }
+  rowDrawing.whilePinned(() => list.replaceChildren(...glom(messages).map(discordNode)));
 }
 
 /**
@@ -28967,9 +28962,6 @@ function mainRowMessages(carded) {
   return inTimeOrder(messages, "timestamp");
 }
 
-/** While Main's rows are built: they offer the way into a thread, as All's do, and point at nothing. */
-let drawingMainRows = false;
-
 /**
  * Main's messages `messages`, one run between two cards, as rows of the cards' list: built and dressed
  * as every list's rows are, in the right column, whose list the keys and the mouse move them in.
@@ -28979,18 +28971,13 @@ let drawingMainRows = false;
  * @returns {HTMLElement[]}
  */
 function mainRows(messages, tally) {
-  drawingMainRows = true;
-  let rows;
-  try {
-    rows = glom(messages).map((group) => {
-      const row = discordNode(group);
-      row.setAttribute("data-main-row", "");
-      row.className = `${row.className} main-row`;
-      return row;
-    });
-  } finally {
-    drawingMainRows = false;
-  }
+  // They offer the way into a thread, as All's do, and point at nothing (`rowDrawing.main`).
+  const rows = rowDrawing.whileMain(() => glom(messages).map((group) => {
+    const row = discordNode(group);
+    row.setAttribute("data-main-row", "");
+    row.className = `${row.className} main-row`;
+    return row;
+  }));
   const viewing = String(selectedChannelId());
   const pass = { tally, answered: answeredBy(rows, viewing), viewing, inMain: false, inAll: false };
   for (const row of rows) dressChannelRow(row, pass);

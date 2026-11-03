@@ -722,3 +722,13 @@ test("`#624 voice-page-modularity`: what stands under the lists, as each keeper 
   under.noteSide({ list: 500, dock: 50 });
   assert.deepStrictEqual(under.side(), { list: 500, dock: 50 }, "the right column's note is its own");
 });
+
+test("`#624 voice-page-modularity`: which rows are being built is said only while they are, and their builder's answer comes back", () => {
+  const { createRowDrawing } = CHANNEL_VIEW;
+  const drawing = createRowDrawing();
+  assert.deepStrictEqual([drawing.pinned(), drawing.main()], [false, false]);
+  assert.deepStrictEqual(drawing.whilePinned(() => [drawing.pinned(), drawing.main()]), [true, false]);
+  assert.deepStrictEqual(drawing.whileMain(() => [drawing.pinned(), drawing.main()]), [false, true]);
+  assert.throws(() => drawing.whileMain(() => { throw new Error("drawn wrong"); }), /drawn wrong/);
+  assert.deepStrictEqual([drawing.pinned(), drawing.main()], [false, false], "a throw still stops it");
+});
