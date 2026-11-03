@@ -3,7 +3,7 @@ title: 'restore-installed-units: persistent user units instead of transients, in
 status: open
 priority: 1
 issue_type: feature
-assignee: mu-restore2@devbig030
+assignee: mu-restore@devbig030
 labels:
 - agentctl
 depends_on:
