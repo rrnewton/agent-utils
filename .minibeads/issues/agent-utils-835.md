@@ -1,13 +1,14 @@
 ---
 title: 'change-classifier-known-nodes: refuse a classification whose payload names an unknown node'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 assignee: cl-mq@devbig030
 labels:
 - change-classifier
 created_at: 2026-11-03T22:28:17.417117210+00:00
-updated_at: 2026-11-03T22:28:17.417117210+00:00
+updated_at: 2026-11-03T22:37:57.360103824+00:00
+closed_at: 2026-11-03T22:37:57.360103664+00:00
 ---
 
 # Description
