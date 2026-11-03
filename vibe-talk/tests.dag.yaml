@@ -1626,16 +1626,16 @@ steps:
   # wall.
   - group: check
     job: reply-continuity-browser
-    desc: Reply opening under the message in the list without moving it, the box under its row through a resize, Send and Cancel moving nothing, and Quote reply, in current Chromium at 1280x800 and 412x915, and Quote reply moving no row at 393 and 360 wide
+    desc: Reply opening under the message in the list without moving it, the box under its row through a resize, Send and Cancel moving nothing, and Quote reply, in current Chromium at 1280x800 and 412x915, and Quote reply moving no row at 393 and 360 wide; and the Draft chip finding a draft in the box, a quick reply and a reply, across a reload, newest first
     labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/reply_continuity_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
     timeout: 150
-    cpu_timeout: 110
+    cpu_timeout: 140
     hint:
       resources: {browser: 1}
-      est_duration_s: 40
+      est_duration_s: 50
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 

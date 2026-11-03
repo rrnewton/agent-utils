@@ -969,6 +969,16 @@
               <span id="jump-bookmark-label">Bookmark</span>
             </button>
             <!--
+              `#819 voice-page-quoted-reply-and-draft-chip`. Draft: up whenever the channel on screen holds a
+              reply or a message started and not sent, anywhere in it: the box at the foot or a thread's, a
+              reply under its message, a quick reply. A tap opens the newest, focused; another, the next.
+              See `renderDraftChip`.
+            -->
+            <button id="draft-chip" class="chip draft-chip" type="button" hidden>
+              <span class="draft-chip-icon" aria-hidden="true"></span>
+              <span id="draft-chip-label">Draft</span>
+            </button>
+            <!--
               `#49 cached-summaries`. Summary mode is OPT-IN and it is a mode, not a per-row
               control: collapsing to a prefix stays the default and costs nothing, and a button on
               every long row would spend a model call every time a thumb slipped. It lives beside

@@ -1089,6 +1089,105 @@ def quick_reply_walk(walk: Walk) -> None:
                       "fourth, written and tapped away from, open with its quote under the message")
 
 
+# `#819 voice-page-quoted-reply-and-draft-chip`: what the Draft chip says, what is focused, and its words.
+DRAFT_JS = """() => {
+  const chip = document.getElementById('draft-chip');
+  const focused = document.activeElement;
+  const quick = document.getElementById('quick-reply');
+  return {
+    chip: chip.hidden || !chip.getClientRects().length ? null : document.getElementById('draft-chip-label').textContent,
+    focused: focused ? focused.id : null,
+    value: focused && 'value' in focused ? focused.value : null,
+    quick: !quick.hidden,
+    reply: !document.getElementById('column-reply').hidden,
+  };
+}"""
+
+
+def drafts_walk(walk: Walk) -> None:
+    """`#819 voice-page-quoted-reply-and-draft-chip`. A draft in each place a reply is written: the box at the
+    channel's foot, a reply under its message, a quick reply closed by Esc. The Draft chip is up from the
+    first and counts them; after a reload it still does; and each tap opens the next, newest first, focused,
+    with its words: the reply, the quick reply, the box, and round to the reply again."""
+    page = walk.page
+
+    def state() -> Json:
+        found: object = page.evaluate(DRAFT_JS)
+        assert isinstance(found, dict)
+        return {str(key): value for key, value in found.items()}
+
+    def open_channel() -> None:
+        page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
+        if page.evaluate("() => document.getElementById('discord-log').closest('[hidden]') !== null"):
+            page.click("#view-switch")
+        walk.wait_for(f"() => document.querySelectorAll('#discord-log > li[data-id]').length === {COUNT}",
+                      "drafts: the channel did not open")
+        walk.settled()
+
+    page.fill("#api-token", TOKEN)
+    page.click("#save-token")
+    open_channel()
+    walk.check(state()["chip"] is None, f"drafts: a chip with no draft: {state()}")
+    # The box at the channel's foot.
+    page.click("#channel-compose-text")
+    page.keyboard.type("composer draft")
+    walk.wait_for("() => !document.getElementById('draft-chip').hidden", "drafts: no chip for the box's draft")
+    walk.check(state()["chip"] == "Draft", f"drafts: the chip says {state()['chip']!r} for one draft")
+    page.evaluate("() => document.activeElement && document.activeElement.blur()")
+    # A quick reply, closed by Esc with words in it.
+    quick_row = message_id(COUNT - 2)
+    page.evaluate(f"() => document.querySelector(\"#discord-log > li[data-id='{quick_row}']\").scrollIntoView({{block: 'center'}})")
+    walk.settled()
+    page.evaluate(SELECTION_JS, [quick_row, 4, 20, True])
+    walk.wait_for("() => !document.getElementById('selection-chip').hidden", "drafts: no Quoted reply chip")
+    walk.press("#selection-chip")
+    walk.wait_for("() => !document.getElementById('quick-reply').hidden", "drafts: the chip opened no quick reply")
+    page.keyboard.type("quick draft")
+    page.keyboard.press("Escape")
+    walk.wait_for("() => document.getElementById('quick-reply').hidden", "drafts: Esc left the quick reply up")
+    walk.wait_for("() => document.getElementById('draft-chip-label').textContent === 'Drafts (2)'",
+                  "drafts: the chip did not count the quick reply's draft")
+    # A reply under its message, put away with Cancel.
+    reply_row = message_id(30)
+    walk.place(30, page.viewport_size["height"] * 0.3 if page.viewport_size else 200)
+    walk.press(f"#discord-log > li[data-id='{reply_row}'] .reply-button")
+    walk.wait_for(OPEN, "drafts: Reply did not open")
+    page.keyboard.type("reply draft")
+    walk.press("#reply-cancel")
+    walk.wait_for(CLOSED, "drafts: Cancel did not put the reply away")
+    walk.wait_for("() => document.getElementById('draft-chip-label').textContent === 'Drafts (3)'",
+                  "drafts: the chip did not count the reply's draft")
+    walk.shot("drafts-chip")
+    # A reload: every draft is still found.
+    page.reload(wait_until="load")
+    open_channel()
+    walk.wait_for("() => document.getElementById('draft-chip-label').textContent === 'Drafts (3)'"
+                  " && !document.getElementById('draft-chip').hidden",
+                  f"drafts: after a reload the chip says {state()['chip']!r}")
+    # Each tap: the next draft, newest first, opened and focused with its words.
+    expected = (("reply-text", "reply draft"), ("quick-reply-text", "quick draft"),
+                ("channel-compose-text", "composer draft"), ("reply-text", "reply draft"))
+    for turn, (box, words) in enumerate(expected):
+        walk.press("#draft-chip")
+        walk.wait_for(f"() => document.activeElement && document.activeElement.id === '{box}'",
+                      f"drafts, tap {turn + 1}: #{box} did not take the focus: {state()}")
+        walk.settled()
+        now = state()
+        walk.check(str(now["value"]).endswith(words), f"drafts, tap {turn + 1}: #{box} holds {now['value']!r}")
+        if box == "quick-reply-text":
+            walk.check(now["quick"] is True, f"drafts, tap {turn + 1}: the quick reply is not open: {now}")
+            walk.shot("drafts-quick")
+            # Left open: the next tap on the chip puts it away as its draft, not as a tap elsewhere would.
+        elif box == "reply-text":
+            walk.check(now["reply"] is True, f"drafts, tap {turn + 1}: the reply is not open: {now}")
+        else:
+            page.evaluate("() => document.activeElement && document.activeElement.blur()")
+    walk.check(state()["chip"] == "Drafts (3)", f"drafts: after the round the chip says {state()['chip']!r}")
+    walk.notes.append("a draft in the box, a quick reply and a reply each raised and counted the Draft chip, which "
+                      "still counted all three after a reload and opened each in turn, newest first, focused with "
+                      "its words (the quick reply left open put away by the next tap, kept), then the newest again")
+
+
 def triple_click_case(walk: Walk, list_box: dict[str, float]) -> None:
     """A triple-click on a message of one paragraph, at a desk: Quote reply, and the paragraph quoted.
 
@@ -1309,12 +1408,15 @@ def main() -> int:
         # `#727 vt-selection-quick-reply`, quoting sentences of a long last message from the list's foot.
         ("1280x800-quick-reply", 1280, 800, False, "dark"),
         ("412x915-quick-reply", 412, 915, True, "dark"),
+        # `#819 voice-page-quoted-reply-and-draft-chip`, a draft in each place, found again by the Draft chip.
+        ("1280x800-drafts", 1280, 800, False, "dark"),
+        ("412x915-drafts", 412, 915, True, "dark"),
     )
     report: list[str] = []
     with sync_playwright() as playwright:
         for label, width, height, phone, scheme in runs:
             api = (FakeApi(messages=layout_messages()) if label.endswith("quote-layout")
-                   else FakeApi(messages=quick_messages(), reply_author=OWNER) if label.endswith("quick-reply")
+                   else FakeApi(messages=quick_messages(), reply_author=OWNER) if label.endswith(("quick-reply", "drafts"))
                    else FakeApi(empty_threads=label.endswith("new-thread")))
             server, thread, url = serve(api, web_root)
             try:
@@ -1341,6 +1443,8 @@ def main() -> int:
                         quote_layout_walk(walk)
                     elif label.endswith("quick-reply"):
                         quick_reply_walk(walk)
+                    elif label.endswith("drafts"):
+                        drafts_walk(walk)
                     elif api.empty_threads:
                         new_thread_walk(walk)
                     elif scheme == "dark":

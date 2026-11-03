@@ -71,6 +71,10 @@
 //     position under the current message and should be open and visible." With words in it, the box's
 //     quote and words become the message's reply draft and its reply opens in the stream under it, as
 //     Reply opens it (`putDownQuickReply`); with none, the box just closes.
+//   * NEVER LOST. `#819 voice-page-quoted-reply-and-draft-chip`, after the owner lost a dictated reply: what
+//     is written in the box is kept on the device as it is written, not only as the box closes, so a reload
+//     or a crashed tab with the box open still has it; each write is told to the page (`noteDraft`), whose
+//     Draft chip finds it again and opens the box on its message (`openQuickDraft`).
 
 import type { Message } from "../../contract/index.ts";
 import { quoteBlock } from "../../present/rows/index.ts";
@@ -153,6 +157,15 @@ export interface QuickReplySend {
   readonly placement?: "unknown";
 }
 
+/** Where the quick replies' drafts are kept, by key, as the page's draft stores keep theirs. */
+export interface QuickReplyDraftStore {
+  get(key: string): string | undefined;
+  set(key: string, text: string): void;
+  delete(key: string): void;
+  /** Write them to the device; whether it kept them. */
+  save(): boolean;
+}
+
 /** What quoting asks of the page. */
 export interface QuotingDependencies {
   /** The element with this id, as the page's own lookup finds it. */
@@ -177,6 +190,13 @@ export interface QuotingDependencies {
    * opened on (or the row drawing that message now).
    */
   toStream(row: QuotedRow, message: Message, text: string): void;
+  /**
+   * `#819 voice-page-quoted-reply-and-draft-chip`. Where quick replies closed unsent are kept, by message and
+   * quoted words, on the device.
+   */
+  readonly drafts: QuickReplyDraftStore;
+  /** A quick reply's draft `key`, in channel `channel`, was written, and holds words or not now. */
+  noteDraft(key: string, channel: string, written: boolean): void;
 }
 
 /** The quoting owner's commands. */
@@ -207,6 +227,14 @@ export interface Quoting {
   putDownQuickReply(): void;
   /** Send the quick reply, then close it. */
   sendQuickReply(): Promise<void>;
+  /** `#819`. Something was written in the open box: kept now, on the device. */
+  noteQuickReplyInput(): void;
+  /** `#819`. Whether quick reply draft `key` still holds words. */
+  quickDraftLive(key: string): boolean;
+  /** `#819`. The message quick reply draft `key` answers, by id. */
+  quickDraftMessage(key: string): string;
+  /** `#819`. Open the quick reply kept under `key` on `row`, the row drawing its message: under the row's top. */
+  openQuickDraft(key: string, row: QuotedRow): void;
 }
 
 /** Nothing held, no box open. */
@@ -222,7 +250,7 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
    */
   let quickReply: { row: QuotedRow; message: Message; channel: string; quote: string; key: string; box: Box | null } | null = null;
   /** What was written in quick replies closed unsent, by message and quoted words (`quickReplyKey`). */
-  const quickReplyDrafts = new Map<string, string>();
+  const quickReplyDrafts = deps.drafts;
   /**
    * The list a quick reply holds still, and where it was: from the box's opening until the reader moves
    * it, the list neither follows the newest message nor keeps its foot. `rows` is the list of rows kept
@@ -405,6 +433,22 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
   /** The key a quick reply's draft is kept under: its channel, the message, and the words it quotes. */
   const quickReplyKey = (channel: string, id: string, quote: string): string => `${channel}\n${id}\n${quote}`;
 
+  /** A key's parts, as `quickReplyKey` joined them: the quote may itself hold line breaks. */
+  const keyParts = (key: string): { channel: string; id: string; quote: string } => {
+    const [channel = "", id = "", ...quote] = key.split("\n");
+    return { channel, id, quote: quote.join("\n") };
+  };
+
+  /** Keep what is written under `key` now, on the device, and tell the page where it changed. */
+  function keepQuickDraft(key: string, channel: string, written: string): void {
+    // Opened and put away again unchanged, a draft is no newer than it was.
+    if ((quickReplyDrafts.get(key) || "") === (written.trim() ? written : "")) return;
+    if (written.trim()) quickReplyDrafts.set(key, written);
+    else quickReplyDrafts.delete(key);
+    quickReplyDrafts.save();
+    deps.noteDraft(key, channel, written.trim() !== "");
+  }
+
   /** Whether `area` is held still for a quick reply (`quickReplyHold`). */
   const quickReplyHolds = (area: unknown): boolean => quickReplyHold !== null && quickReplyHold.area === area;
 
@@ -438,11 +482,19 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
     const quote = takeQuote(held.button).trim();
     const message = rowMessages(held.row)[0];
     if (!message || quote === "") return;
+    openQuickReplyFor(held.row, message, quote, box);
+  }
+
+  /**
+   * Open the quick reply to `message`, drawn by `row`, quoting `quote`, under `box`: with any draft kept for
+   * the same words, focused, the caret at its end. The chip's press and the Draft chip both come here.
+   */
+  function openQuickReplyFor(row: QuotedRow, message: Message, quote: string, box: Box | null): void {
     if (quickReply) closeQuickReply();
     const channel = String(deps.selectedChannelId() || "");
     const key = quickReplyKey(channel, String(message.id), quote);
-    quickReply = { row: held.row, message, channel, quote, key, box };
-    holdQuickReplyList(listOf(held.row));
+    quickReply = { row, message, channel, quote, key, box };
+    holdQuickReplyList(listOf(row));
     const form = deps.byId("quick-reply");
     setTextIfChanged(deps.byId("quick-reply-quote"), quote);
     deps.byId("quick-reply-text").value = quickReplyDrafts.get(key) || "";
@@ -491,9 +543,7 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
   /** Close the quick reply, keeping what was written for the same words (`quickReplyDrafts`). */
   function closeQuickReply(): void {
     if (!quickReply) return;
-    const written = deps.byId("quick-reply-text").value;
-    if (written.trim()) quickReplyDrafts.set(quickReply.key, written);
-    else quickReplyDrafts.delete(quickReply.key);
+    keepQuickDraft(quickReply.key, quickReply.channel, deps.byId("quick-reply-text").value);
     quickReply = null;
     setHiddenIfChanged(deps.byId("quick-reply"), true);
     deps.byId("quick-reply-text").blur();
@@ -512,9 +562,10 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
       closeQuickReply();
       return;
     }
+    // Into the stream's draft first, and only then let go of its own (`#819`): never in neither.
+    deps.toStream(open.row, open.message, `${quoteBlock(open.quote)}${written}`);
     deps.byId("quick-reply-text").value = "";
     closeQuickReply();
-    deps.toStream(open.row, open.message, `${quoteBlock(open.quote)}${written}`);
   }
 
   /** Send the quick reply: the quoted words and what was written, in the message's thread; then close it. */
@@ -544,16 +595,31 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
       marksRead: deps.replyMarksRead(open.message, text),
       ...(route.unknown ? { placement: "unknown" as const } : {}),
     });
-    quickReplyDrafts.delete(open.key);
     deps.byId("quick-reply-text").value = "";
     closeQuickReply();
     await completion;
   }
 
+  function noteQuickReplyInput(): void {
+    if (quickReply) keepQuickDraft(quickReply.key, quickReply.channel, deps.byId("quick-reply-text").value);
+  }
+
+  function openQuickDraft(key: string, row: QuotedRow): void {
+    const { id, quote } = keyParts(key);
+    const message = rowMessages(row).find((one) => String(one.id) === id) || rowMessages(row)[0];
+    if (!message || !quote) return;
+    const rect = row.getBoundingClientRect();
+    // Under the row's first line, its header: the words it quoted were somewhere in the message below.
+    const top = Number(rect.top) || 0;
+    openQuickReplyFor(row, message, quote, { top, bottom: top + QUICK_REPLY_GAP_PX * 3, left: rect.left, right: rect.right });
+  }
+
   return {
     held: () => quoteHeld, holdQuote, noteQuoteSelection, takeQuote, placeSelectionChip, pressSelectionChip,
     quickReplyHolds, quickReplyListMoved, quickReplyOpen: () => quickReply !== null, placeQuickReply,
-    closeQuickReply, putDownQuickReply, sendQuickReply,
+    closeQuickReply, putDownQuickReply, sendQuickReply, noteQuickReplyInput, openQuickDraft,
+    quickDraftLive: (key) => Boolean((quickReplyDrafts.get(key) || "").trim()),
+    quickDraftMessage: (key) => keyParts(key).id,
   };
 }
 

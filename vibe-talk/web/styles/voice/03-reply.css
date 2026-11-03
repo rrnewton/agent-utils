@@ -226,6 +226,24 @@
   --pencil-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 20h4L19 9l-4-4L4 16z'/%3E%3Cpath d='M13 7l4 4'/%3E%3C/svg%3E");
 }
 
+/* `#819 voice-page-quoted-reply-and-draft-chip`. The Draft chip over the list: the accent and its pencil, as
+   a row's Draft, filled so it stands out among the chips, since a draft it shows is one nothing else does. */
+#draft-chip {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--panel);
+  font-weight: 700;
+}
+
+.draft-chip-icon {
+  width: 0.95em;
+  height: 0.95em;
+  background: currentColor;
+  -webkit-mask: var(--pencil-mask) center / contain no-repeat;
+  mask: var(--pencil-mask) center / contain no-repeat;
+  --pencil-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 20h4L19 9l-4-4L4 16z'/%3E%3Cpath d='M13 7l4 4'/%3E%3C/svg%3E");
+}
+
 /* `#726 vt-selection-chip`. "Quoted reply" under words selected in a message, placed by web/voice.js from
    the selection's box. Absolute against the layout viewport, which never scrolls (nothing on this page is
    fixed, `#226`), over the lists, and a finger's width tall: it is pressed with the thumb that selected. */

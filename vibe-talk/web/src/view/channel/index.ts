@@ -59,7 +59,7 @@ export {
   SELECTION_CHIP_HANDLES_PX,
   createQuoting,
 } from "./quoting.ts";
-export type { HeldQuote, QuickReplySend, QuoteRoute, QuotedRow, Quoting, QuotingDependencies } from "./quoting.ts";
+export type { HeldQuote, QuickReplyDraftStore, QuickReplySend, QuoteRoute, QuotedRow, Quoting, QuotingDependencies } from "./quoting.ts";
 export { PULL_ARM_PX, PULL_EDGE_SLACK_PX, PULL_LABELS, PULL_RESULT_MS, PULL_RISE_PX, PULL_WAIT_MS, createPullToRefresh } from "./pull.ts";
 export type { PullFreshness, PullToRefresh, PullToRefreshDependencies, PullTouch } from "./pull.ts";
 export {

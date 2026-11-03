@@ -2250,6 +2250,23 @@ const channelContexts = new Map();
 const channelDrafts = createChannelDrafts({ storage: deviceStorageOnUse(), makeRoom: () => dropMessageCache() });
 
 /**
+ * `#819 voice-page-quoted-reply-and-draft-chip`. What was written in quick replies and not sent, by channel,
+ * message and quoted words, kept on the device as it is written: the same kind of store, under its own key.
+ *
+ * @type {import("./src/core/outbox/index.ts").ChannelDrafts}
+ */
+const quickDrafts = createChannelDrafts({ storage: deviceStorageOnUse(), makeRoom: () => dropMessageCache(), key: QUICK_DRAFTS_KEY });
+
+/**
+ * `#819 voice-page-quoted-reply-and-draft-chip`. Every draft by where it is written, its channel and when it
+ * was last written, kept on the device, for the Draft chip to find them newest first (web/src/core/outbox
+ * `createDraftLedger`). The owner lost a dictated reply.
+ *
+ * @type {import("./src/core/outbox/index.ts").DraftLedger}
+ */
+const draftLedger = createDraftLedger({ storage: deviceStorageOnUse(), makeRoom: () => dropMessageCache(), now: () => Date.now() });
+
+/**
  * A column's own record of its message box (`#624 voice-page-modularity`, plan step 15, as
  * `freshOlderPages`): `key`, the box the column is composing in (`channelComposerKey`), whose draft
  * `channelDrafts` holds.
@@ -12123,11 +12140,14 @@ function saveChannelDrafts() {
 function rememberChannelDraft() {
   if (!composerState().key) return;
   const text = el("channel-compose-text").value;
+  const before = channelDrafts.get(composerState().key) || "";
   if (text) channelDrafts.set(composerState().key, text);
   else channelDrafts.delete(composerState().key);
   if (!saveChannelDrafts()) {
     el("channel-compose-state").textContent = CHANNEL_DRAFT_REFUSED;
   }
+  // `#819 voice-page-quoted-reply-and-draft-chip`. Found again by the Draft chip; no newer for being unchanged.
+  if (text !== before) noteDraft("composer", composerState().key, String(selectedChannelId() || ""), Boolean(text.trim()));
 }
 
 function restoreChannelComposer() {
@@ -12143,6 +12163,8 @@ function restoreChannelComposer() {
   renderChannelNavigation();
   // `#340 composer-grow-box`. The draft put back is the box's height too.
   fitGrowingBox(el("channel-compose-text"));
+  // `#819 voice-page-quoted-reply-and-draft-chip`. Another channel's drafts, or this one's again.
+  renderDraftChip();
 }
 
 function rememberChannelContext() {
@@ -17273,6 +17295,7 @@ async function editOutgoingMessage(id) {
     setStatus(EDIT_DRAFT_REFUSED);
     return;
   }
+  noteDraft("composer", key, entry.channel, true);
   dropOutgoing(entry.id);
   let column = showing();
   // A thread's message, edited from All: its box is the thread's, so the thread opens, with it.
@@ -17309,6 +17332,7 @@ function editOutgoingReply(entry, text) {
     setStatus(EDIT_DRAFT_REFUSED);
     return;
   }
+  noteDraft("reply", id, entry.channel, true);
   dropOutgoing(entry.id);
   renderDraftMarkers();
   const row = /** @type {HTMLLIElement | null} */ ([...el("discord-log").children].find((li) => idsOf(li)[0] === id) || null);
@@ -17468,6 +17492,7 @@ async function sendChannelMessage() {
   channelDrafts.delete(key);
   // A failed outbox write leaves the previous durable draft available as a last resort.
   if (outbox.storageOkay()) saveChannelDrafts();
+  noteDraft("composer", key, String(channel), false);
   el("channel-compose-text").value = "";
   fitGrowingBox(el("channel-compose-text"));
   el("channel-compose-state").textContent = "";
@@ -25449,6 +25474,7 @@ function rememberDraft() {
   // By the id as a string, the key a reload reads them back under and `draftMarker` asks by.
   const id = String(replyTarget.id);
   const had = replyDrafts.has(id);
+  const before = replyDrafts.get(id) || "";
   const text = el("reply-text").value;
   if (text.trim()) {
     replyDrafts.set(id, text);
@@ -25456,6 +25482,8 @@ function rememberDraft() {
     replyDrafts.delete(id);
   }
   replyDrafts.setStartsThread(id, Boolean(text.trim()) && replyBoundForThread());
+  // `#819 voice-page-quoted-reply-and-draft-chip`. Found again by the Draft chip; no newer for being unchanged.
+  if ((replyDrafts.get(id) || "") !== before) noteDraft("reply", id, String(replyChannelId || selectedChannelId() || ""), replyDrafts.has(id));
   // `#193 compose-draft-loss`. The row's Draft comes and goes with the draft.
   if (replyDrafts.has(id) !== had) renderDraftMarkers();
   // ...and SAY SO when the browser refuses. The read-back was here from the start and its answer
@@ -25519,6 +25547,196 @@ function renderDraftMarkers() {
   }
 }
 
+// --- every draft, found again: the Draft chip ----------------------------------------------------
+//
+// `#819 voice-page-quoted-reply-and-draft-chip`. The owner lost a dictated reply: written in a quick reply,
+// closed, and nowhere to be seen. A draft kept where nothing on the screen shows it is a draft lost. So a
+// chip over the list, in the accent, says Draft whenever the channel on screen holds one anywhere: the main
+// box or a thread's, a reply in the stream, a quick reply. A tap goes to the newest and opens it, focused;
+// with several, each tap goes to the next, newest first, round to the newest again. The drafts are their
+// own stores' (`channelDrafts`, `replyDrafts`, `quickDrafts`); where and when each was written is the
+// ledger's (`draftLedger`), and a draft written before the ledger kept its place is found too, oldest.
+
+/** The last draft the chip went to, in which channel, so the next tap goes on from it. */
+let draftChipLast = { channel: "", draft: "" };
+
+/** A draft's identity: where it is written and its key there. */
+const draftIdentity = (draft) => `${draft.kind}\n${draft.key}`;
+
+/**
+ * A draft was written (or emptied): kept in the ledger with its channel and the time, or let go, and the chip
+ * drawn again.
+ *
+ * @param {import("./src/core/outbox/index.ts").DraftKind} kind
+ * @param {string} key
+ * @param {string} channel
+ * @param {boolean} written
+ */
+function noteDraft(kind, key, channel, written) {
+  const had = draftLedger.has(kind, key);
+  if (written && channel) draftLedger.touch(kind, key, channel);
+  else draftLedger.drop(kind, key);
+  draftLedger.save();
+  // Drawn again where a draft came or went, or was emptied (one the ledger never knew of counts too); a
+  // keystroke in one already counted changes nothing shown.
+  if (!written || had !== draftLedger.has(kind, key)) renderDraftChip();
+}
+
+/**
+ * Whether `draft` still holds words in its store.
+ *
+ * @param {import("./src/core/outbox/index.ts").DraftEntry} draft
+ */
+function draftHeld(draft) {
+  const store = draft.kind === "composer" ? channelDrafts : draft.kind === "reply" ? replyDrafts : quickDrafts;
+  return Boolean((store.get(draft.key) || "").trim());
+}
+
+/**
+ * Whether the chip offers `draft`: it holds words, and its message, for a reply or a quick reply, is not one
+ * removed from the channel, which leaves nothing to answer (the draft is kept, and not offered).
+ *
+ * @param {import("./src/core/outbox/index.ts").DraftEntry} draft
+ */
+function draftLive(draft) {
+  if (!draftHeld(draft)) return false;
+  if (draft.kind === "composer") return true;
+  const message = draft.kind === "reply" ? draft.key : quoteOwner.quickDraftMessage(draft.key);
+  return !(channelStore.current().channel === draft.channel && channelStore.current().removed.has(message));
+}
+
+/**
+ * The drafts of the channel on screen, newest first: the ledger's, then any its stores hold that it does not
+ * know of — written before it, or put back by an edit — oldest.
+ *
+ * @returns {import("./src/core/outbox/index.ts").DraftEntry[]}
+ */
+function draftsHere() {
+  const channel = String(selectedChannelId() || "");
+  if (!channel) return [];
+  const known = draftLedger.inChannel(channel, draftLive);
+  const seen = new Set(known.map(draftIdentity));
+  /** @type {import("./src/core/outbox/index.ts").DraftEntry[]} */
+  const more = [];
+  const add = (kind, key) => {
+    const draft = { kind, key, channel, at: 0 };
+    if (!seen.has(draftIdentity(draft)) && draftLive(draft)) more.push(draft);
+  };
+  for (const key of channelDrafts.keys()) {
+    let parts = null;
+    try {
+      parts = JSON.parse(key);
+    } catch (_error) {
+      parts = null;
+    }
+    if (Array.isArray(parts) && String(parts[0]) === channel) add("composer", key);
+  }
+  for (const key of quickDrafts.keys()) if (key.startsWith(`${channel}\n`)) add("quick", key);
+  if (channelStore.current().channel === channel) {
+    const held = new Set(channelStore.current().messages.map((message) => String(message.id)));
+    for (const id of replyDrafts.ids()) if (held.has(id)) add("reply", id);
+  }
+  return [...known, ...more];
+}
+
+/** The chip: up while the channel on screen holds a draft, saying how many where there are several. */
+function renderDraftChip() {
+  const chip = leftEl("draft-chip");
+  const count = draftsHere().length;
+  const hidden = count === 0;
+  if (chip.hidden !== hidden) chip.hidden = hidden;
+  setTextIfChanged(leftEl("draft-chip-label"), count > 1 ? `Drafts (${count})` : "Draft");
+  const title = count > 1
+    ? `${count} replies or messages you started here and have not sent. Tap for the newest; tap again for the next.`
+    : "A reply or message you started here and have not sent. Tap to open it.";
+  if (chip.getAttribute("title") !== title) chip.setAttribute("title", title);
+}
+
+/**
+ * The row drawing message `id` in a list on screen, and its column: the left column's first, then the
+ * right's while it shows a thread or the cards.
+ *
+ * @param {string} id
+ * @returns {{row: HTMLLIElement, column: ColumnFields} | null}
+ */
+function draftRow(id) {
+  for (const column of [columns.main, ...(sideColumnUp() ? [columns.side] : [])]) {
+    const row = inColumn(column, () => /** @type {HTMLLIElement | undefined} */ (
+      [...el("discord-log").children].find((li) => !(/** @type {HTMLElement} */ (li)).hidden &&
+        rowMessages(li).some((message) => String(message.id) === id))));
+    if (row) return { row, column };
+  }
+  return null;
+}
+
+/**
+ * Go to `draft` and open it, focused: its box, its reply under its message, or its quick reply on its
+ * message; a message not drawn is jumped to first, as a link to it is.
+ *
+ * @param {import("./src/core/outbox/index.ts").DraftEntry} draft
+ */
+async function openDraft(draft) {
+  if (draft.kind === "composer") {
+    let thread = null;
+    try {
+      thread = JSON.parse(draft.key)[1] || null;
+    } catch (_error) {
+      thread = null;
+    }
+    const shows = () => [columns.main, ...(sideShowing() ? [columns.side] : [])].find((column) => column.composer.key === draft.key) || null;
+    let column = shows();
+    if (!column && thread) {
+      await openThread(String(thread));
+      column = shows();
+    } else if (!column) {
+      await closeThread();
+      column = shows();
+    }
+    // The box at the foot stands aside while a reply is open in the stream: that reply put down, its draft kept.
+    if (column && replyDocked) closeReply({ restore: false, refocus: false });
+    if (column) inColumn(column, () => focusAtEnd(el("channel-compose-text")));
+    return;
+  }
+  const id = draft.kind === "reply" ? draft.key : quoteOwner.quickDraftMessage(draft.key);
+  let found = draftRow(id);
+  if (!found) {
+    await jumpToMessageLink({ service: "", channel: draft.channel, message: id, thread: null });
+    found = draftRow(id);
+  }
+  if (!found) {
+    setStatus("That draft's message is not in this channel's list now; it is kept until it is.");
+    return;
+  }
+  const { row, column } = found;
+  inColumn(column, () => {
+    row.scrollIntoView({ block: "center" });
+    if (draft.kind === "reply") {
+      // To the draft's own message first, where the row draws it among others: Reply answers the first.
+      const messages = rowMessages(row);
+      const own = messages.filter((message) => String(message.id) === id);
+      openReply([...own, ...messages.filter((message) => String(message.id) !== id)], row);
+    }
+    else quoteOwner.openQuickDraft(draft.key, row);
+  });
+}
+
+/** A tap on the chip: the newest draft, or the one after the last it went to. */
+async function pressDraftChip() {
+  // A quick reply open is put away, its words kept as its draft (not put down into the stream as a tap
+  // elsewhere would): the chip goes on from it to the next.
+  if (quoteOwner.quickReplyOpen()) closeQuickReply();
+  const drafts = draftsHere();
+  if (drafts.length === 0) {
+    renderDraftChip();
+    return;
+  }
+  const channel = String(selectedChannelId() || "");
+  const at = draftChipLast.channel === channel ? drafts.findIndex((draft) => draftIdentity(draft) === draftChipLast.draft) : -1;
+  const next = drafts[(at + 1) % drafts.length];
+  draftChipLast = { channel, draft: draftIdentity(next) };
+  await openDraft(next);
+}
+
 // --- quoting part of a message in the reply to it ------------------------------------------------
 //
 // `#267 quote-reply`, `#726 vt-selection-chip`, `#727 vt-selection-quick-reply`. The selection Quote
@@ -25536,6 +25754,8 @@ const quoteOwner = createQuoting({
   replyMarksRead: (message, text) => replyMarksRead(message, text),
   queueOutgoingMessage: (send) => queueOutgoingMessage(send),
   toStream: (row, message, text) => quickReplyToStream(row, message, text),
+  drafts: quickDrafts,
+  noteDraft: (key, channel, written) => noteDraft("quick", key, channel, written),
 });
 const {
   noteQuoteSelection, takeQuote, placeSelectionChip, pressSelectionChip, quickReplyHolds,
@@ -25557,6 +25777,7 @@ function quickReplyToStream(row, message, text) {
   const prior = replyDrafts.get(id) || "";
   replyDrafts.set(id, prior.trim() ? `${text}\n\n${prior}` : text);
   replyDrafts.save();
+  noteDraft("reply", id, String(selectedChannelId() || ""), true);
   renderDraftMarkers();
   // The row the box was opened on, unless a redraw has replaced it since: then the one drawing the message.
   const drawn = row.parentNode && rowShown(row) ? row : paneRowFor(channelPane, id) || paneRowFor(sidePane, id);
@@ -25729,6 +25950,7 @@ async function sendReply() {
   replyDrafts.delete(String(target.id));
   replyDrafts.setStartsThread(String(target.id), false);
   if (outbox.storageOkay()) replyDrafts.save();
+  noteDraft("reply", String(target.id), String(replyChannelId || ""), false);
   renderDraftMarkers();
   replyQuote = null;
   el("reply-text").value = "";
@@ -32574,11 +32796,14 @@ el("quick-reply-text").addEventListener("keydown", (event) => {
   return onComposerKey(event, guardQuietly(sendQuickReply), el("quick-reply-text"));
 });
 watchBoxInsertions(el("quick-reply-text"));
+// `#819 voice-page-quoted-reply-and-draft-chip`. Kept on the device as it is written, dictation included.
+el("quick-reply-text").addEventListener("input", () => quoteOwner.noteQuickReplyInput());
+leftEl("draft-chip").addEventListener("click", () => guardQuietly(pressDraftChip)());
 document.addEventListener("pointerdown", (event) => {
   if (!quoteOwner.quickReplyOpen()) return;
   const target = /** @type {any} */ (event && event.target);
   if (target && (nodeWithin(el("quick-reply"), target) || nodeWithin(leftEl("selection-chip"), target) ||
-    nodeWithin(leftEl("read-steer-quote"), target))) return;
+    nodeWithin(leftEl("read-steer-quote"), target) || nodeWithin(leftEl("draft-chip"), target))) return;
   putDownQuickReply();
 }, { capture: true });
 document.addEventListener("scroll", (event) => quickReplyListMoved(event && event.target), { capture: true, passive: true });
@@ -32886,6 +33111,11 @@ el("undo-send-dismiss").addEventListener("click", () => {
 el("undo-bookmark").addEventListener("click", undoBookmarkRemoval);
 el("forget-dismissed-sends").addEventListener("click", forgetDismissedSends);
 channelDrafts.load();
+// `#819 voice-page-quoted-reply-and-draft-chip`. The quick replies' drafts, and where every draft is.
+quickDrafts.load();
+draftLedger.load();
+// What the ledger kept of drafts sent, emptied or overwritten elsewhere since is let go of.
+draftLedger.prune(draftHeld);
 for (const view of ["main", "threads", "flat"]) {
   el(`channel-view-${view}`).addEventListener("click", guardQuietly(() => changeChannelView(view)));
 }

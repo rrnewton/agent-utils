@@ -398,3 +398,42 @@ test("`#624 voice-page-modularity`: a dismissed send's Undo is offered for SEND_
   assert.equal(timers[2], null);
   assert.equal(ended, 2);
 });
+
+test("`#819 voice-page-quoted-reply-and-draft-chip`: the draft ledger finds a channel's live drafts newest first, across a reload", () => {
+  const { createDraftLedger, createChannelDrafts, DRAFT_LEDGER_KEY, QUICK_DRAFTS_KEY } = OUTBOX;
+  const saved = new Map();
+  const storage = { getItem: (key) => (saved.has(key) ? saved.get(key) : null), setItem: (key, value) => saved.set(key, String(value)), removeItem: (key) => saved.delete(key) };
+  let clock = 1000;
+  const ledger = createDraftLedger({ storage, makeRoom() {}, now: () => clock });
+  ledger.touch("composer", '["c1",null]', "c1");
+  clock = 2000;
+  ledger.touch("reply", "m1", "c1");
+  clock = 3000;
+  ledger.touch("quick", "c1\nm2\nwords", "c1");
+  ledger.touch("reply", "m9", "c2");
+  const live = new Set(['["c1",null]', "m1", "c1\nm2\nwords", "m9"]);
+  assert.deepStrictEqual(ledger.inChannel("c1", (entry) => live.has(entry.key)).map((entry) => entry.kind), ["quick", "reply", "composer"]);
+  live.delete("m1");
+  assert.deepStrictEqual(ledger.inChannel("c1", (entry) => live.has(entry.key)).map((entry) => entry.key), ["c1\nm2\nwords", '["c1",null]'],
+    "a draft its store no longer holds is not offered");
+  ledger.drop("quick", "c1\nm2\nwords");
+  assert.equal(ledger.has("quick", "c1\nm2\nwords"), false);
+  ledger.prune((entry) => entry.key !== "m9");
+  assert.equal(ledger.has("reply", "m9"), false, "a draft its store no longer holds is let go of");
+  assert.equal(ledger.has("reply", "m1"), true);
+  assert.equal(ledger.save(), true);
+  assert.ok(saved.has(DRAFT_LEDGER_KEY));
+  const again = createDraftLedger({ storage, makeRoom() {}, now: () => 0 });
+  again.load();
+  assert.deepStrictEqual(again.inChannel("c1", () => true).map((entry) => [entry.kind, entry.at]), [["reply", 2000], ["composer", 1000]]);
+  saved.set(DRAFT_LEDGER_KEY, "{broken");
+  const broken = createDraftLedger({ storage, makeRoom() {}, now: () => 0 });
+  broken.load();
+  assert.deepStrictEqual(broken.inChannel("c1", () => true), [], "a damaged record leaves an empty ledger");
+  // The quick replies' drafts: the boxes' kind of store under their own key.
+  const quick = createChannelDrafts({ storage, makeRoom() {}, key: QUICK_DRAFTS_KEY });
+  quick.set("c1\nm2\nwords", "half a thought");
+  assert.equal(quick.save(), true);
+  assert.deepStrictEqual(JSON.parse(saved.get(QUICK_DRAFTS_KEY)), { "c1\nm2\nwords": "half a thought" });
+  assert.deepStrictEqual(quick.keys(), ["c1\nm2\nwords"]);
+});

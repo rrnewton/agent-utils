@@ -46,6 +46,8 @@ export interface ReplyDrafts {
   startsThread(id: string): boolean;
   /** Message `id`'s draft is, or is not, bound for a new thread. */
   setStartsThread(id: string, on: boolean): void;
+  /** `#819`. The messages with a draft, by id. */
+  ids(): string[];
 }
 
 /** An owner holding no drafts. */
@@ -56,6 +58,7 @@ export function createReplyDrafts(deps: ReplyDraftsDependencies): ReplyDrafts {
   const draftStartsThread = new Set<string>();
   const storedExactly = (encoded: string): boolean => storedExactlyIn(deps.storage, DRAFTS_KEY, encoded);
   return {
+    ids: () => [...drafts.keys()],
     has: (id) => drafts.has(id),
     get: (id) => drafts.get(id),
     set(id, text) {

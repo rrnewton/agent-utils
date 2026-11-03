@@ -9,11 +9,19 @@ import { storedExactly as storedExactlyIn } from "./storage.ts";
 /** Where the device keeps them, by box key. */
 const CHANNEL_DRAFTS_KEY = "vibe-talk.channel-drafts";
 
+/**
+ * `#819 voice-page-quoted-reply-and-draft-chip`. Where the device keeps the quick replies closed unsent, by
+ * channel, message and quoted words: the same kind of store, under its own key.
+ */
+const QUICK_DRAFTS_KEY = "vibe-talk.quick-reply-drafts";
+
 /** What the owner asks of the page. */
 export interface ChannelDraftsDependencies {
   readonly storage: StoragePort;
   /** The device's quota is full: give up the saved channel rows first (`dropMessageCache`). */
   makeRoom(): void;
+  /** Where the device keeps them; the message boxes' key unless said. */
+  readonly key?: string;
 }
 
 /** The owner's named commands. */
@@ -32,13 +40,17 @@ export interface ChannelDrafts {
   save(): boolean;
   /** Take back what the device kept; storage absent or an interrupted write leaves none. */
   load(): void;
+  /** `#819`. The keys of the boxes with a draft. */
+  keys(): string[];
 }
 
 /** An owner holding no drafts. */
 export function createChannelDrafts(deps: ChannelDraftsDependencies): ChannelDrafts {
   const channelDrafts = new Map<string, string>();
-  const storedExactly = (encoded: string): boolean => storedExactlyIn(deps.storage, CHANNEL_DRAFTS_KEY, encoded);
+  const storageKey = deps.key || CHANNEL_DRAFTS_KEY;
+  const storedExactly = (encoded: string): boolean => storedExactlyIn(deps.storage, storageKey, encoded);
   return {
+    keys: () => [...channelDrafts.keys()],
     get: (key) => channelDrafts.get(key),
     set(key, text) {
       channelDrafts.set(key, text);
@@ -58,7 +70,7 @@ export function createChannelDrafts(deps: ChannelDraftsDependencies): ChannelDra
     },
     load() {
       try {
-        const saved: unknown = JSON.parse(deps.storage.getItem(CHANNEL_DRAFTS_KEY) || "{}");
+        const saved: unknown = JSON.parse(deps.storage.getItem(storageKey) || "{}");
         for (const [key, value] of Object.entries((saved || {}) as object)) {
           if (typeof value === "string") channelDrafts.set(key, value);
         }
@@ -68,3 +80,6 @@ export function createChannelDrafts(deps: ChannelDraftsDependencies): ChannelDra
     },
   };
 }
+
+// What the page and the tests use of it.
+export { QUICK_DRAFTS_KEY };

@@ -118,6 +118,8 @@ export interface ElementById {
   "dismissed-sends": HTMLOListElement;
   "dismissed-sends-state": HTMLParagraphElement;
   "dock": HTMLElement;
+  "draft-chip": HTMLButtonElement;
+  "draft-chip-label": HTMLSpanElement;
   "empty-line": HTMLParagraphElement;
   "empty-state": HTMLDivElement;
   "enter-sends": HTMLInputElement;
