@@ -1,13 +1,14 @@
 ---
 title: 'agentctl-queue-only-drain: deliver queued prompts at the next turn boundary instead of parking them'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: mu-restore2@devbig030
 labels:
 - agentctl
 created_at: 2026-11-03T02:01:04.799043542+00:00
-updated_at: 2026-11-03T02:14:48.266117861+00:00
+updated_at: 2026-11-03T06:10:15.659593716+00:00
+closed_at: 2026-11-03T06:10:15.659593575+00:00
 ---
 
 # Description
