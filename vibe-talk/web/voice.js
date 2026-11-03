@@ -299,7 +299,7 @@ const settingsReadouts = mountSettingsReadouts({
   deploymentHost: () => deploymentHost(),
   pageOutOfDate: () => pageOutOfDate(),
   get pageBuild() { return PAGE_BUILD; },
-  get serverPageBuild() { return serverPageBuild; },
+  get serverPageBuild() { return serverFacts.pageBuild(); },
   get voice() { return conversationalVoice; },
   renderFolds: () => settingsFolds.renderAll(),
   deviceSettings: () => deviceSettings(),
@@ -633,7 +633,7 @@ function voiceTranscript() {
     get currentView() { return screens.view(); },
     get cardsOpening() { return cardsOpening; },
     get threadListShown() { return threadListShown; },
-    get tokenScope() { return tokenScope; },
+    get tokenScope() { return serverFacts.tokenScope(); },
     get voiceSendSetting() { return agentSettings.sendSetting(); },
     get hasEnded() { return voiceCall().hasEnded; },
     set hasEnded(value) { voiceCall().hasEnded = value; },
@@ -9992,19 +9992,22 @@ const PAGE_BUILD = (() => {
   }
 })();
 
-/** The page build the server last said it serves (`page_build`), or "" before a read has said. */
-let serverPageBuild = "";
+/**
+ * What the server has said about itself — the page build it serves, the scope it saw on the saved token,
+ * whether it names threads, and whether its `/client-config` has answered in this page: one owner in
+ * web/src/core/api/serverfacts.ts (`#624 voice-page-modularity`).
+ */
+const serverFacts = createServerFacts();
 
 /** Take what read `payload` says of the server's page build, and draw what it means for this page. */
 function noteServerPageBuild(payload) {
   const build = payload && typeof payload.page_build === "string" ? payload.page_build : "";
-  if (!build || build === serverPageBuild) return;
-  serverPageBuild = build;
+  if (!serverFacts.notePageBuild(build)) return;
   settingsReadouts.pageBuild();
 }
 
 /** Whether the server serves a newer page than this one runs: both builds known, and different. */
-const pageOutOfDate = () => PAGE_BUILD !== "" && serverPageBuild !== "" && serverPageBuild !== PAGE_BUILD;
+const pageOutOfDate = () => PAGE_BUILD !== "" && serverFacts.pageBuild() !== "" && serverFacts.pageBuild() !== PAGE_BUILD;
 
 /** The device's copy of K, kept on the server for every device (`#457 settings-server-side`). */
 const CARD_MAX_LINES_KEY = DEVICE_SETTINGS.cardMaxLines.key;
@@ -10149,8 +10152,8 @@ const SUMMARY_WAIT_MS = 60000;
 /** When, after a thread's last activity, the Threads list is read again for the summary on its way. */
 const SUMMARY_READ_STEPS_MS = [2000, 5000, 10000, 20000, 40000];
 
-/** Whether this server names threads (`thread_names_supported`): whether a summary may be on its way. */
-let threadNamesSupported = false;
+// Whether this server names threads (`thread_names_supported`), so whether a summary may be on its way, is the
+// server facts' (`ServerFacts.threadNames`).
 
 /** "…", marked so the stylesheet may draw it apart from the words. */
 const cardEllipsis = () => styled("span", "card-ellipsis", "…");
@@ -10299,7 +10302,7 @@ function continuationOf(root, cut) {
  * and its last activity is within `SUMMARY_WAIT_MS`.
  */
 function cardPending(choice) {
-  if (!threadNamesSupported || !choice || !choice.root || cardIsSummarized(choice)) return false;
+  if (!serverFacts.threadNames() || !choice || !choice.root || cardIsSummarized(choice)) return false;
   if (!Number.isFinite(choice.at) || Date.now() - choice.at >= SUMMARY_WAIT_MS) return false;
   if (!cardCut(choice.root) || !rootOverflowsCard(choice.root)) return false;
   return knownReplies(choice) > 0;
@@ -10474,7 +10477,7 @@ function onVisibility() {
   // and after any absence the stream delivered something in, the poll came due in, or that let the
   // stream go.
   if ((away >= VISIBLE_REFRESH_MS || owed !== null || pollDue || resume !== null) &&
-      screens.view() === "discord" && providerFacts.threading() && clientConfigApplied && selectedChannelId()) {
+      screens.view() === "discord" && providerFacts.threading() && serverFacts.configApplied() && selectedChannelId()) {
     refreshQuietly(async () => {
       try {
         if (owed === "mutation") refreshAfterLiveMutation();
@@ -10565,8 +10568,8 @@ function loadState() {
  * drawn shows no loading line. `#220 view-switch-instant`.
  **/
 // Kept per column: `loadState().refreshing` (`freshLoadState`, `#624 voice-page-modularity`).
-/** Whether `/client-config` has answered in this page, as opposed to the saved shell standing in. */
-let clientConfigApplied = false;
+// Whether `/client-config` has answered in this page, as opposed to the saved shell standing in, is the server
+// facts' (`ServerFacts.configApplied`).
 /** The fingerprint of the token the channel rows on screen were read or drawn for. */
 let screenIdentity = tokenFingerprint(token());
 
@@ -12049,7 +12052,7 @@ const threadHues = createThreadHues({
   now: () => Date.now(),
   channelRecord: (id) => channelDirectory.channels().find((candidate) => String(candidate.id) === String(id)),
   selected: () => String(selectedChannelId()),
-  writeToken: () => tokenScope === "write",
+  writeToken: () => serverFacts.tokenScope() === "write",
   held: () => channelStore.current(),
   timeOf: (record) => timeOf(record, "timestamp"),
   threadOf: (message) => threadOf(message),
@@ -22208,7 +22211,7 @@ const serverSearchOwner = createServerSearch({
 const serverSearchNow = () => serverSearchOwner.state();
 
 /** Whether the server keeps a copy this page may search: an open cache, and not the read-only token. */
-const serverCopyOpen = () => serverCacheBox.open() && tokenScope !== "read";
+const serverCopyOpen = () => serverCacheBox.open() && serverFacts.tokenScope() !== "read";
 
 /** What identifies the server's search wanted now, or "" for none. */
 function serverSearchKeyNow() {
@@ -22253,7 +22256,7 @@ const SERVER_SEARCH_REASONS = {
 /** The server's part of the line, for the scopes it answered with. Never more than they say. */
 function serverScopeWords() {
   const serverSearch = serverSearchNow();
-  if (tokenScope === "read") return `server: not searched (${SERVER_SEARCH_REASONS.read_scope})`;
+  if (serverFacts.tokenScope() === "read") return `server: not searched (${SERVER_SEARCH_REASONS.read_scope})`;
   if (!serverCopyOpen()) return "server: keeps no copy";
   if (serverSearch.failed) return `server: could not be searched (${serverSearch.failed})`;
   if (serverSearch.loading && serverSearch.scopes.length === 0) return "server: searching…";
@@ -22400,7 +22403,7 @@ const searchFurtherRunning = () => gathering.state().channel !== "" &&
 
 /** Whether Search further back is offered: one channel, a copy the server keeps, not yet whole. */
 function searchFurtherOffered() {
-  if (serverSearchNow().key === "" || searchAllChannels || !serverCopyOpen() || tokenScope === "read") return false;
+  if (serverSearchNow().key === "" || searchAllChannels || !serverCopyOpen() || serverFacts.tokenScope() === "read") return false;
   const scope = serverSearchNow().scopes[0];
   return Boolean(scope) && scope.state === "searched" && !scope.whole;
 }
@@ -25370,7 +25373,7 @@ async function markNotNoise(ids) {
 const agentSettings = mountAgentSettings({
   lookup: (id) => el(id),
   decoded: (type, path, options) => apiDecoded(type, path, options),
-  writable: () => tokenScope === "write",
+  writable: () => serverFacts.tokenScope() === "write",
   showError: (text) => showError(text),
   setStatus: (text) => setStatus(text),
   addDetail: (text) => addDetail(text),
@@ -25381,7 +25384,7 @@ const agentSettings = mountAgentSettings({
 const agentPrefix = mountAgentPrefix({
   lookup: (id) => el(id),
   decoded: (type, path, options) => apiDecoded(type, path, options),
-  writable: () => tokenScope === "write",
+  writable: () => serverFacts.tokenScope() === "write",
   showError: (text) => showError(text),
   setStatus: (text) => setStatus(text),
 });
@@ -25418,7 +25421,7 @@ let voicePromptForCall = null;
 const serverCacheBox = mountServerCache({
   lookup: (id) => el(id),
   decoded: (type, path, options) => apiDecoded(type, path, options),
-  writable: () => tokenScope === "write",
+  writable: () => serverFacts.tokenScope() === "write",
   renderFolds: () => settingsFolds.renderAll(),
   renderHistory: () => channelHistoryBox.render(),
 });
@@ -27369,7 +27372,7 @@ function recordViewChoice() {
  */
 function leftColumnToMain(place = null) {
   if (selection().view === "main") return;
-  if (clientConfigApplied) {
+  if (serverFacts.configApplied()) {
     guardQuietly(() => changeChannelView("main", null, null, null, place))();
   } else {
     // A reopen, before sign-in has answered: Main drawn from what this device saved, with no read.
@@ -29899,7 +29902,7 @@ function drawnOnPage(node) {
 function showSideList() {
   openSideCards();
   // Not before sign-in has answered: the reopen's read reads the list behind the cards then.
-  if (clientConfigApplied) guardQuietly(refreshThreadDirectory)();
+  if (serverFacts.configApplied()) guardQuietly(refreshThreadDirectory)();
 }
 
 /**
@@ -30491,7 +30494,7 @@ function pollDiscord() {
     // either, and it asks again first.
     let refused = false;
     try {
-      refused = !clientConfigApplied && !(await signIn());
+      refused = !serverFacts.configApplied() && !(await signIn());
       const since = replayLedger.started();
       if (!refused) await loadDiscord({ keepPosition: true, reason: "poll" });
       // `#229 desktop-two-column`. And the right column's thread, or its list of threads: another
@@ -30876,11 +30879,8 @@ const RELAY_KEY = "vibe-talk.voice.relay";
 
 // How often the server reads the channel, how it delivers live updates, and whether the selected provider can
 // move its own read cursor are the provider facts' (`ProviderFacts`, `#624 voice-page-modularity`).
-/**
- * `read` or `write`: the scope the server saw on the saved token. Null from an older server that
- * does not say, which keeps the old behaviour of asking and reading the refusal.
- */
-let tokenScope = null;
+// The scope the server saw on the saved token (`read`, `write`, or null from an older server that does not
+// say) is the server facts' (`ServerFacts.tokenScope`).
 /**
  * The stream the page follows — which channel, its generation, the last event id it saw, whether it is
  * attached and whether that attach resumed, the reads waiting for it, and the loop that reads it and
@@ -31755,7 +31755,7 @@ const channelSettings = mountChannelSettings({
   directory: channelDirectory,
   allChannels: ALL_CHANNELS,
   undescribedService: UNDESCRIBED_SERVICE,
-  tokenScope: () => tokenScope,
+  tokenScope: () => serverFacts.tokenScope(),
   selectedChannelId: () => selectedChannelId(),
   serviceLabel: (key) => serviceLabel(key),
   chatServiceName: () => chatServiceName(),
@@ -31972,7 +31972,7 @@ const channelHistoryBox = mountChannelHistory({
   allChannelsChosen: () => channelSettings.allChannelsChosen(),
   knownChannel: (id) => knownChannel(id),
   cacheOpen: () => serverCacheBox.open(),
-  writable: () => tokenScope === "write",
+  writable: () => serverFacts.tokenScope() === "write",
   setTimeout: (run, ms) => setTimeout(run, ms),
   clearTimeout: (timer) => clearTimeout(timer),
 });
@@ -32061,7 +32061,7 @@ function applyClientConfig(config) {
   providerFacts.setThreading(config.threading_supported === true);
   channelDirectory.setCapability("threading", providerFacts.threading());
   // `#528 thread-card-markdown-and-cap`: whether a long first message's summary may be on its way.
-  threadNamesSupported = config.thread_names_supported === true;
+  serverFacts.setThreadNames(config.thread_names_supported === true);
   learnProviders(config.providers);
   whoIsWho.setDeploymentCodingAgents(config);
   // The selected backend owns its display name. An older server leaves it unspecified, so the
@@ -32124,7 +32124,7 @@ function applyClientConfig(config) {
   // and, with the token's scope, by Settings' picker as it is filled, which offers All channels only
   // where one channel can take Clear unread (`#351 settings-polish`). So both before the pickers.
   channelDirectory.setCapability("upstreamClear", config.upstream_clear_supported === true);
-  tokenScope = ["read", "write"].includes(config.token_scope) ? config.token_scope : null;
+  serverFacts.setTokenScope(config.token_scope);
   // `#457 settings-server-side`. Only a server that says it keeps settings is asked for
   // them: an older one is never probed for a route it has not got.
   settingsSync().setSupported(config.client_settings_supported === true);
@@ -32196,7 +32196,7 @@ function applyClientConfig(config) {
   // arriving message has to be able to reach a call that is happening on the OTHER tab. Following
   // only the visible view would mean the relay was off precisely while the reader was talking.
   startChannelStream(selectedChannelId());
-  clientConfigApplied = true;
+  serverFacts.markConfigApplied();
   saveCacheShell(config);
   // ...and the views chosen in channels it no longer lists, as their saved rows went: a thread's
   // summary is the credential's reading too. `#205 channel-view-memory`.
@@ -32391,7 +32391,7 @@ function settingsSync() {
       clock: browserPorts().clock,
       decoded: apiDecoded,
       token,
-      tokenScope: () => tokenScope,
+      tokenScope: () => serverFacts.tokenScope(),
       apply: applySyncedSetting,
       status: renderSettingsSyncState,
       landed: summariesSettingLanded,

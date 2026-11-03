@@ -23,3 +23,19 @@ test("`#624 voice-page-modularity`: a failed request in words, from the requests
     "a refusal below 500 is the server's own sentence");
   assert.equal(readableFailure(null, "slack"), "");
 });
+
+test("`#624 voice-page-modularity`: what the server says of itself is kept, a scope only as read or write, a page build only when it is news", () => {
+  const facts = SERVER_API.createServerFacts();
+  assert.deepStrictEqual([facts.tokenScope(), facts.threadNames(), facts.configApplied(), facts.pageBuild()], [null, false, false, ""]);
+  facts.setTokenScope("write");
+  assert.equal(facts.tokenScope(), "write");
+  facts.setTokenScope("admin");
+  assert.equal(facts.tokenScope(), null, "a scope this page does not know is none");
+  facts.setThreadNames(true);
+  facts.markConfigApplied();
+  assert.deepStrictEqual([facts.threadNames(), facts.configApplied()], [true, true]);
+  assert.equal(facts.notePageBuild(""), false, "no build said");
+  assert.equal(facts.notePageBuild("abc"), true);
+  assert.equal(facts.notePageBuild("abc"), false, "the build held is no news");
+  assert.equal(facts.pageBuild(), "abc");
+});

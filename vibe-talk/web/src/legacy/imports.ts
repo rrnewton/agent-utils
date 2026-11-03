@@ -20,7 +20,7 @@ export {
   searchSubject,
 } from "../core/search/index.ts";
 export { speechHoldFrom } from "../core/speech/index.ts";
-export { createApi, isSlowFailure, readableFailure } from "../core/api/index.ts";
+export { createApi, createServerFacts, isSlowFailure, readableFailure } from "../core/api/index.ts";
 
 export { allReachesThread, answerUnplaced, answeredThread, coverViewOf, createChannelDirectory, createChannelStore, createCopyOrder, createIdentities, createPlainReach, createProviderFacts, createRemovals, createSummaries, createTodoView, createUnpackReads, emptyTally, exactReplyCount, foldDeltaIn, foldLiveIn, foldPageIn, heldAsSent, heldNow, inTimeOrder, inViewOf, markDoneIn, namedRecord, newerPage, newerPageSpeaksFor, noteReplyGapsIn, pageFoldIn, placeFromPageIn, projectionOf, refreshFailed, replyTallyOf, restoreCanon, savedTimelineOf, settleDoneIn, summaryKey, tallyRecord, threadOf, timeOf, unplacedToAsk, unseenRepliesIn, upsertThreadSummary, viewOfKey } from "../core/channels/index.ts";
 export { anchorOfMessage, createBookmarkUndo, createBookmarkWrites, createBookmarks, createLegacyMarker, createPins, createReadLedger, isBookmarkState, sameAnchor } from "../core/annotations/index.ts";

@@ -13,6 +13,7 @@ declare const createRepliesWalk: LegacyImports["createRepliesWalk"];
 declare const createParsedQueries: LegacyImports["createParsedQueries"];
 declare const createServerSearch: LegacyImports["createServerSearch"];
 declare const createApi: LegacyImports["createApi"];
+declare const createServerFacts: LegacyImports["createServerFacts"];
 declare const createWebPorts: LegacyImports["createWebPorts"];
 declare const childByClass: LegacyImports["childByClass"];
 declare const nodeWithin: LegacyImports["nodeWithin"];
