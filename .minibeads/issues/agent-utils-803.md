@@ -2,6 +2,7 @@
 title: 'agentctl-test-flakes: three agentctl unit tests fail under a loaded gate'
 status: open
 priority: 2
+assignee: mu-validate@devbig030
 issue_type: bug
 labels:
 - agentctl
