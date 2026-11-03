@@ -2273,6 +2273,10 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     if (strip.hidden) root.removeAttribute("data-read-strip");
     // Held through a jump, it says what it said: a held read's jump cues its block up held.
     else if (nowPlaying !== null) root.setAttribute("data-read-strip", readingPaused() ? "paused" : "playing");
+    // `#819 voice-page-quoted-reply-and-draft-chip`. The strip says so itself, on a desk too, for what it
+    // shows only while its read is held: Quote reply.
+    if (strip.hidden) strip.removeAttribute("data-held");
+    else if (nowPlaying !== null) strip.toggleAttribute("data-held", readingPaused());
   }
 
   /** A read is playing or held, or moving to another of its blocks (`readJumpPending`). */

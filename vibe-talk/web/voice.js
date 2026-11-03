@@ -32557,6 +32557,9 @@ document.addEventListener("selectionchange", noteQuoteSelection);
 // `#726 vt-selection-chip`. Pressed without taking the selection or the focus from the words it quotes.
 leftEl("selection-chip").addEventListener("mousedown", (event) => event.preventDefault());
 leftEl("selection-chip").addEventListener("click", pressSelectionChip);
+// `#819 voice-page-quoted-reply-and-draft-chip`. Its twin in the paused read's strip, pressed the same way.
+leftEl("read-steer-quote").addEventListener("mousedown", (event) => event.preventDefault());
+leftEl("read-steer-quote").addEventListener("click", pressSelectionChip);
 // `#727 vt-selection-quick-reply`. The floating box: its keys, Send and Cancel, a tap outside (which puts
 // what was written back under its message: `putDownQuickReply`), and the list the reader moves letting it go.
 el("quick-reply-send").addEventListener("click", () => guardQuietly(sendQuickReply)());
@@ -32574,7 +32577,8 @@ watchBoxInsertions(el("quick-reply-text"));
 document.addEventListener("pointerdown", (event) => {
   if (!quoteOwner.quickReplyOpen()) return;
   const target = /** @type {any} */ (event && event.target);
-  if (target && (nodeWithin(el("quick-reply"), target) || nodeWithin(leftEl("selection-chip"), target))) return;
+  if (target && (nodeWithin(el("quick-reply"), target) || nodeWithin(leftEl("selection-chip"), target) ||
+    nodeWithin(leftEl("read-steer-quote"), target))) return;
   putDownQuickReply();
 }, { capture: true });
 document.addEventListener("scroll", (event) => quickReplyListMoved(event && event.target), { capture: true, passive: true });

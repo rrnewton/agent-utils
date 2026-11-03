@@ -1085,6 +1085,13 @@
             <!-- `#380 read-aloud-timeline`. The read as a line of its blocks, each as wide as it
                  is long: those heard, the one being read, those to come. A tap on one reads from
                  there. Filled by web/voice.js, one button a block. -->
+            <!-- `#819 voice-page-quoted-reply-and-draft-chip`. Quote reply, while words are selected in a
+                 message and the read is paused: here, at the foot of the screen, far from the selection,
+                 whose chip the phone's own handles and Copy bar can cover. Shown with that chip by
+                 web/src/view/channel's quoting; the stylesheet draws it only while the read is held
+                 (`data-held`). -->
+            <button id="read-steer-quote" class="read-steer-quote" type="button" hidden
+              title="Reply to this message, starting with the words you selected in it quoted">Quote reply</button>
             <div id="read-timeline" role="group" aria-label="Blocks of the message"></div>
           </div>
         </section>

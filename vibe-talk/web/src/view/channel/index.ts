@@ -53,8 +53,10 @@ export {
   QUICK_REPLY_MAX_WIDTH_PX,
   QUOTE_HOLD_MS,
   QUOTE_REPLY_TITLE,
+  SELECTION_BAR_ROOM_PX,
   SELECTION_CHIP_EDGE_PX,
   SELECTION_CHIP_GAP_PX,
+  SELECTION_CHIP_HANDLES_PX,
   createQuoting,
 } from "./quoting.ts";
 export type { HeldQuote, QuickReplySend, QuoteRoute, QuotedRow, Quoting, QuotingDependencies } from "./quoting.ts";

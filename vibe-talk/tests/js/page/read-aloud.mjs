@@ -1437,8 +1437,10 @@ test("`#442 read-strip-order`: the strip reads its arrows and k of n in the mark
   const strip = HTML_CODE.slice(HTML_CODE.indexOf('id="read-steer"'), HTML_CODE.indexOf('id="read-timeline"'));
   const ids = [...strip.matchAll(/\bid="(read-[\w-]+)"/g)].map((match) => match[1]);
   // `#627 scrubber-thumb-arrows`: the fat Previous and Next section, the count, the thin Previous and Next block.
+  // `#819 voice-page-quoted-reply-and-draft-chip`: and Quote reply, a line of its own over the blocks.
   assert.deepEqual(ids, ["read-steer", "read-steer-grip", "read-section-prev", "read-section-next", "read-steer-count",
-    "read-prev", "read-next"], "the strip's controls are not the grip, the section arrows, the count and the block arrows alone");
+    "read-prev", "read-next", "read-steer-quote"],
+    "the strip's controls are not the grip, the section arrows, the count, the block arrows and Quote reply alone");
   assert.ok(!PAGE_ELEMENTS.has("read-pause") && !PAGE_ELEMENTS.has("read-stop"), "the strip still has a Pause or a Stop of its own");
   // The bar under the list keeps both: Read (the Pause of a read playing) and Stop beside it.
   assert.ok(PAGE_ELEMENTS.has("read-aloud") && PAGE_ELEMENTS.has("read-aloud-stop"), "the bar lost its Pause or its Stop");

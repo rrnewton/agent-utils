@@ -388,6 +388,7 @@ export interface ElementById {
   "read-steer": HTMLDivElement;
   "read-steer-count": HTMLSpanElement;
   "read-steer-grip": HTMLButtonElement;
+  "read-steer-quote": HTMLButtonElement;
   "read-timeline": HTMLDivElement;
   "reading-full-group": HTMLElement;
   "reading-width": HTMLInputElement;

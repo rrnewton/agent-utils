@@ -4072,12 +4072,51 @@ test("`#726 vt-selection-chip`: words selected in one message put Quoted reply j
 
   // THE CONTROL: placed over the words, where a phone's own action bar stands, the chip is not under them.
   const control = await quotePage(null, await brokenModule([{ file: "src/view/channel/quoting.ts",
-    find: "      Math.min(box.bottom + SELECTION_CHIP_GAP_PX, viewHeight - SELECTION_CHIP_EDGE_PX - height));",
-    replace: "      Math.min(box.top - SELECTION_CHIP_GAP_PX - height, viewHeight - SELECTION_CHIP_EDGE_PX - height));" }]));
+    find: "      Math.min(box.bottom + selectionChipGap, viewHeight - SELECTION_CHIP_EDGE_PX - height));",
+    replace: "      Math.min(box.top - selectionChipGap - height, viewHeight - SELECTION_CHIP_EDGE_PX - height));" }]));
   const words = wordsIn(rowWithId(control, "1000000000000000001"));
   await control.selectText(words, null, "about the runner");
   assert.notEqual(chipAt(control)?.top, words.getBoundingClientRect().bottom + gap,
     "with the chip placed over the words it still read as under them, so this test cannot see where it stands");
+});
+
+test("`#819 voice-page-quoted-reply-and-draft-chip`: after a touch the chip stands clear of the phone's handles, of its Copy bar where that goes under the words, and over them where there is no room under", async () => {
+  const gap = sourceConstant("SELECTION_CHIP_GAP_PX");
+  const handles = sourceConstant("SELECTION_CHIP_HANDLES_PX");
+  const bar = sourceConstant("SELECTION_BAR_ROOM_PX");
+  const page = await quotePage();
+  const first = rowWithId(page, "1000000000000000001");
+  const words = () => wordsIn(first).getBoundingClientRect();
+  const height = () => page.el("selection-chip").getBoundingClientRect().height;
+  await page.documentEvent("pointerdown", { pointerType: "touch", target: wordsIn(first) });
+  await page.selectText(wordsIn(first), null, "about the runner");
+  assert.ok(words().top >= bar, `the premise: room for the bar over the words (${words().top}px)`);
+  assert.equal(chipAt(page)?.top, words().bottom + handles, "the chip is not clear of the handles under the words");
+  // The window shown from lower down (a keyboard's pan): the words too near its top for the bar over them.
+  page.viewport.offsetTop = words().top - bar + 10;
+  await page.selectText(wordsIn(first), null, "about the run");
+  assert.equal(chipAt(page)?.top, words().bottom + handles + bar, "the chip stands where the bar goes under the words");
+  page.viewport.offsetTop = 0;
+  // No room under the words for the handles and the chip: over the words, above where the bar stands.
+  page.viewport.layout = words().bottom + handles + height() + sourceConstant("SELECTION_CHIP_EDGE_PX") - 1;
+  await page.selectText(wordsIn(first), null, "about the runner");
+  assert.equal(chipAt(page)?.top, words().top - bar - height(), "the chip did not go over the words and the bar");
+  page.viewport.layout = 852;
+  await page.clearSelection();
+  page.expireTimers(sourceConstant("QUOTE_HOLD_MS"));
+  // With the mouse nothing of the browser's stands under the words: the chip just under them, as before.
+  await page.documentEvent("pointerdown", { pointerType: "mouse", target: wordsIn(first) });
+  await page.selectText(wordsIn(first), null, "about the runner");
+  assert.equal(chipAt(page)?.top, words().bottom + gap, "the mouse's chip moved away from the words");
+
+  // THE CONTROL: placed after a touch as after the mouse, the chip stands on the handles, and this sees it.
+  const control = await quotePage(null, await brokenModule([{ file: "src/view/channel/quoting.ts",
+    find: "  const touch = deps.inputKind() === \"touch\";\n", replace: "  const touch = false;\n" }]));
+  const theirs = wordsIn(rowWithId(control, "1000000000000000001"));
+  await control.documentEvent("pointerdown", { pointerType: "touch", target: theirs });
+  await control.selectText(theirs, null, "about the runner");
+  assert.notEqual(chipAt(control)?.top, theirs.getBoundingClientRect().bottom + handles,
+    "with the chip placed as for the mouse it still read as clear of the handles");
 });
 
 test("`#726 vt-selection-chip`: a press of the chip quotes the words it stands under, and never takes the selection first", async () => {

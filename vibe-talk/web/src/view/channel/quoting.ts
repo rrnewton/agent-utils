@@ -85,8 +85,22 @@ const QUOTE_HOLD_MS = 2000;
 /** Reply's tooltip while it is Quote reply. No channel data. */
 const QUOTE_REPLY_TITLE = "Reply to this message, starting with the words you selected in it quoted";
 
-/** How far under the selection the chip stands, in CSS pixels: clear of a phone's selection handles. */
+/** How far under the selection the chip stands after the mouse or the keys, in CSS pixels. */
 const SELECTION_CHIP_GAP_PX = 14;
+
+/**
+ * `#819 voice-page-quoted-reply-and-draft-chip`. How far under the selection the chip stands after a touch,
+ * in CSS pixels: clear of the selection handles the phone's browser hangs under the words' two ends, which
+ * take a touch on them for themselves, over anything the page draws.
+ */
+const SELECTION_CHIP_HANDLES_PX = 36;
+
+/**
+ * `#819 voice-page-quoted-reply-and-draft-chip`. The room the phone's own bar for a selection (Copy, Share,
+ * Select all) takes over the words, in CSS pixels. With less than this above them, the browser puts the bar
+ * under them instead, past the handles, where the chip would stand; so the chip stands under the bar.
+ */
+const SELECTION_BAR_ROOM_PX = 72;
 
 /** How close to the window's edges the chip may stand, in CSS pixels. */
 const SELECTION_CHIP_EDGE_PX = 8;
@@ -200,6 +214,8 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
   let quoteHeld: HeldQuote | null = null;
   /** The animation frame the chip's next placing waits for, or null. */
   let selectionChipFrame: number | null = null;
+  /** How far under the words the chip was last placed (`drawSelectionChip`). */
+  let selectionChipGap = SELECTION_CHIP_GAP_PX;
   /**
    * The quick reply open now, or null: the row and message it answers, its channel, the words it quotes,
    * the key its draft is kept under, and the selection's box it stands under.
@@ -321,11 +337,15 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
     const chip = deps.byId("selection-chip");
     const box = quoteHeld ? selectionBox() : null;
     // A touch's held selection, gone from the page, keeps the chip where it was until the hold ends.
+    // `#819 voice-page-quoted-reply-and-draft-chip`. And its twin in the read's strip, which nothing covers.
+    const twin = deps.byId("read-steer-quote");
     if (!quoteHeld || (box === null && chip.hidden)) {
       setHiddenIfChanged(chip, true);
+      setHiddenIfChanged(twin, true);
       return;
     }
     setHiddenIfChanged(chip, false);
+    setHiddenIfChanged(twin, false);
     if (box === null) return;
     const size = chip.getBoundingClientRect();
     const width = Number(size.width) || 0;
@@ -334,8 +354,21 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
     const viewHeight = window.innerHeight || 0;
     const left = Math.max(SELECTION_CHIP_EDGE_PX,
       Math.min((box.left + box.right) / 2 - width / 2, viewWidth - SELECTION_CHIP_EDGE_PX - width));
-    const top = Math.max(SELECTION_CHIP_EDGE_PX,
-      Math.min(box.bottom + SELECTION_CHIP_GAP_PX, viewHeight - SELECTION_CHIP_EDGE_PX - height));
+    // `#819 voice-page-quoted-reply-and-draft-chip`. After a touch, what the browser draws for the selection
+    // takes touches on it over every layer of the page: the handles under the words, and the bar of Copy
+    // and Share, which goes under them where there is no room over them. The chip stands clear of both.
+    const touch = deps.inputKind() === "touch";
+    const visual = window.visualViewport;
+    const shownTop = visual ? Number(visual.offsetTop) || 0 : 0;
+    const barUnder = touch && box.top - shownTop < SELECTION_BAR_ROOM_PX;
+    selectionChipGap = !touch ? SELECTION_CHIP_GAP_PX : SELECTION_CHIP_HANDLES_PX + (barUnder ? SELECTION_BAR_ROOM_PX : 0);
+    let top = Math.max(SELECTION_CHIP_EDGE_PX,
+      Math.min(box.bottom + selectionChipGap, viewHeight - SELECTION_CHIP_EDGE_PX - height));
+    // No room under the words for that: over them, above where the bar stands there.
+    if (touch && top < box.bottom + selectionChipGap) {
+      top = Math.max(SELECTION_CHIP_EDGE_PX, box.top - SELECTION_BAR_ROOM_PX - height);
+      selectionChipGap = top - box.bottom;
+    }
     chip.style.left = `${Math.round(left)}px`;
     chip.style.top = `${Math.round(top)}px`;
   }
@@ -427,7 +460,7 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
     const chip = deps.byId("selection-chip");
     if (chip.hidden) return null;
     const rect = chip.getBoundingClientRect();
-    const top = rect.top - SELECTION_CHIP_GAP_PX;
+    const top = rect.top - selectionChipGap;
     return { top, bottom: top, left: rect.left, right: rect.right };
   }
 
@@ -525,4 +558,7 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
 }
 
 // What the page and the tests use of it.
-export { QUICK_REPLY_GAP_PX, QUICK_REPLY_MAX_WIDTH_PX, QUOTE_HOLD_MS, QUOTE_REPLY_TITLE, SELECTION_CHIP_EDGE_PX, SELECTION_CHIP_GAP_PX };
+export {
+  QUICK_REPLY_GAP_PX, QUICK_REPLY_MAX_WIDTH_PX, QUOTE_HOLD_MS, QUOTE_REPLY_TITLE, SELECTION_BAR_ROOM_PX, SELECTION_CHIP_EDGE_PX,
+  SELECTION_CHIP_GAP_PX, SELECTION_CHIP_HANDLES_PX,
+};

@@ -26,6 +26,14 @@ Resume. The read must go on within a few seconds — the device voice from the s
 paused in, every later sentence after it in order; the agent's voice with its audio clock moving on to its
 third block — with no error shown, and the reply posted to the message being read.
 
+`#819 voice-page-quoted-reply-and-draft-chip`. The owner lost a dictated reply: in Reading mode with the
+reader paused, the Quoted reply chip under selected words "cannot be pressed", as if something floating
+covered it. So, with the agent's voice paused in its second block, on a phone's screen by touch and at a
+desk by the mouse: words are selected near the top, the middle and the foot of the list, and at each the
+chip is the topmost thing at its centre and around it, as is its twin, Quote reply in the read's
+strip; a press of the chip opens the quick reply focused, which takes typed words and words committed as
+dictation does, and sends them quoted; and a press of the twin opens it too.
+
 Pass --web-root DIR to run against another copy of the page (the one before #554 fails at the device
 voice's resume), and --screenshots DIR to keep PNGs.
 """
@@ -220,6 +228,172 @@ def walk(desk: Desk, api: VoicesApi, voice: str) -> None:
     desk.shot("4-resumed")
 
 
+# `#819`: the words of the message being read, from offset `start` of its longest run of text to `end`,
+# selected, and their box.
+SELECT_JS = """([list, id, start, end]) => {
+  const row = document.querySelector(`#${list} > li[data-id='${id}']`);
+  const walker = document.createTreeWalker(row.querySelector('.body'), NodeFilter.SHOW_TEXT);
+  let text = null;
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) if (!text || node.data.length > text.data.length) text = node;
+  const range = document.createRange();
+  range.setStart(text, Math.min(start, text.data.length - 1));
+  range.setEnd(text, Math.min(end, text.data.length));
+  getSelection().removeAllRanges();
+  getSelection().addRange(range);
+  const r = range.getBoundingClientRect();
+  return {top: r.top, bottom: r.bottom};
+}"""
+
+# `#819`: whether `id`'s element is what a finger meets at its centre, at its top and foot in the middle, and at
+# the middle of each rounded end (half its height in: a pill's corners are not its own), and if not, what is.
+TOPMOST_JS = """(id) => {
+  const node = document.getElementById(id);
+  if (!node || node.hidden || !node.getClientRects().length) return {shown: false};
+  const r = node.getBoundingClientRect();
+  const [x, y] = [r.left + r.width / 2, r.top + r.height / 2];
+  const points = [[x, y], [x, r.top + 2], [x, r.bottom - 2], [r.left + r.height / 2, y], [r.right - r.height / 2, y]];
+  const over = points.map(([x, y]) => document.elementFromPoint(x, y)).filter((at) => !node.contains(at))
+    .map((at) => (at && (at.id || String(at.className) || at.tagName)) || 'nothing');
+  return {shown: true, over, box: {top: r.top, bottom: r.bottom, left: r.left, right: r.right}};
+}"""
+
+
+def press(page: Page, selector: str, touch: bool) -> None:
+    box = page.locator(selector).first.bounding_box()
+    check(box is not None, f"{selector} is not drawn to press")
+    assert box is not None
+    x, y = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+    if touch:
+        page.touchscreen.tap(x, y)
+    else:
+        page.mouse.click(x, y)
+
+
+def quote_walk(desk: Desk, api: VoicesApi, touch: bool) -> None:
+    """`#819`: the chip, and its twin in the strip, pressed in a paused read; the quick reply typed and dictated into."""
+    page = desk.page
+    sign_in(desk)
+    press(page, "#read-aloud", touch)
+    desk.settled()
+    row = f"#{LIST} > li[data-id='{MESSAGE}']"
+    page.evaluate("(selector) => document.querySelector(selector).scrollIntoView({block: 'center'})", row)
+    desk.settled()
+    body = page.locator(f"{row} .body").first.bounding_box()
+    assert body is not None
+    press_at = (body["x"] + 12, body["y"] + min(10, body["height"] / 2))
+    if touch:
+        page.touchscreen.tap(*press_at)
+    else:
+        page.mouse.click(*press_at)
+    desk.wait_for("() => !document.getElementById('read-steer').hidden"
+                  " && document.getElementById('read-steer-count').textContent === '2 of 3'",
+                  "quote: the read never reached its second block", 10)
+    # Playing, the strip steers only: Quote reply waits for the read to be held.
+    page.evaluate(SELECT_JS, [LIST, MESSAGE, 2, 22])
+    desk.wait_for("() => !document.getElementById('selection-chip').hidden", "quote: no chip while the read plays")
+    desk.check(page.evaluate("() => document.getElementById('read-steer-quote').getClientRects().length") == 0,
+               "quote: the strip offered Quote reply while the read played")
+    page.evaluate("() => getSelection().removeAllRanges()")
+    press(page, "#read-aloud", touch)
+    desk.settled()
+    desk.check(label(page) == "Resume", f"quote: Pause left Read saying {label(page)!r}")
+    desk.check(page.evaluate("() => document.documentElement.getAttribute('data-read-strip')") == "paused",
+               "quote: the strip does not say the read is paused")
+    area = page.locator("#scroll-area").bounding_box()
+    assert area is not None
+    places = []
+    for share in (0.15, 0.5, 0.8):
+        words = page.evaluate(SELECT_JS, [LIST, MESSAGE, 2, 22])
+        page.evaluate("(dy) => { document.getElementById('scroll-area').scrollTop += dy; }",
+                      words["top"] - (area["y"] + area["height"] * share))
+        desk.settled()
+        words = page.evaluate(SELECT_JS, [LIST, MESSAGE, 2, 22])
+        desk.wait_for("() => !document.getElementById('selection-chip').hidden", f"quote at {share}: no chip under the words")
+        desk.settled()
+        for twin, other in (("selection-chip", "read-steer-quote"), ("read-steer-quote", "selection-chip")):
+            found = page.evaluate(TOPMOST_JS, twin)
+            desk.check(found["shown"] is True, f"quote at {share}: #{twin} is not shown")
+            # Each may stand over the other near the foot: a press of either is the same press.
+            over = [one for one in found["over"] if one != other]
+            desk.check(over == [], f"quote at {share}: #{twin} is covered by {over} at {found['box']}")
+        places.append(f"{words['top']:.0f}")
+        if share == 0.5:
+            desk.shot("quote-paused")
+    # The chip pressed: the quick reply, focused, typed into and dictated into, and sent quoted.
+    words = page.evaluate(SELECT_JS, [LIST, MESSAGE, 2, 22])
+    desk.wait_for("() => !document.getElementById('selection-chip').hidden", "quote: no chip to press")
+    desk.settled()
+    sent = len(api.posted())
+    press(page, "#selection-chip", touch)
+    desk.wait_for("() => !document.getElementById('quick-reply').hidden", "quote: the chip opened no quick reply")
+    desk.wait_for("() => document.activeElement === document.getElementById('quick-reply-text')",
+                  "quote: the quick reply did not take the focus")
+    page.keyboard.type("typed, ")
+    # What a phone's dictation leaves: text committed whole, as an input method commits it.
+    page.keyboard.insert_text("and dictated")
+    value = page.evaluate("() => document.getElementById('quick-reply-text').value")
+    desk.check(value.endswith("typed, and dictated"), f"quote: the quick reply holds {value!r}")
+    desk.shot("quote-typed")
+    press(page, "#quick-reply-send", touch)
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline and len(api.posted()) <= sent:
+        page.wait_for_timeout(25)
+    posted = api.posted()[sent:]
+    text = str(posted[0].get("text", "")) if posted else ""
+    desk.check(len(posted) == 1 and posted[0].get("reply_to") == MESSAGE and text.startswith("> ")
+               and text.endswith("\n\ntyped, and dictated"), f"quote: what was posted was {posted}")
+    # The twin in the strip, pressed: the quick reply too.
+    # Once the reply has landed and its message's row is drawn again with it.
+    page.wait_for_timeout(800)
+    desk.settled()
+    page.evaluate(SELECT_JS, [LIST, MESSAGE, 30, 50])
+    desk.wait_for("() => !document.getElementById('read-steer-quote').hidden"
+                  " && document.getElementById('read-steer-quote').getClientRects().length > 0",
+                  "quote: no Quote reply in the strip")
+    desk.settled()
+    press(page, "#read-steer-quote", touch)
+    desk.wait_for("() => !document.getElementById('quick-reply').hidden", "quote: the strip's Quote reply opened no quick reply")
+    quoted = page.evaluate("() => document.getElementById('quick-reply-quote').textContent")
+    desk.check(bool(quoted.strip()), "quote: the strip's Quote reply quoted nothing")
+    press(page, "#quick-reply-cancel", touch)
+    desk.wait_for("() => document.getElementById('quick-reply').hidden", "quote: Cancel left the quick reply up")
+    desk.check(label(page) == "Resume", f"quote: the read was not left paused: Read says {label(page)!r}")
+    error = page.evaluate("() => document.getElementById('error').textContent")
+    desk.check(error == "", f"quote: an error was shown: {error!r}")
+    desk.notes.append(f"the chip and the strip's Quote reply topmost with words at {', '.join(places)}px; the chip's "
+                      "quick reply typed into, dictated into and sent quoted; the strip's opened it too")
+
+
+def run_quote(chromium: BrowserType, args: argparse.Namespace, touch: bool) -> str:
+    api = VoicesApi()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler(api))
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    width, height = PHONE if touch else (1280, 800)
+    try:
+        with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-pause-quote-") as profile:
+            context = chromium.launch_persistent_context(
+                profile, headless=True, executable_path=args.browser_executable,
+                viewport={"width": width, "height": height}, color_scheme="dark", has_touch=touch, is_mobile=touch)
+            version = context.browser.version if context.browser else "Chromium"
+            page = context.pages[0]
+            errors: list[str] = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            page.add_init_script(AUDIO_PROBE)
+            desk = Desk(page, args.screenshots, f"pause-quote-{width}", width, height)
+            page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
+            quote_walk(desk, api, touch)
+            check(not errors, f"quote {width}x{height}: the page threw: {errors}")
+            context.close()
+            return f"{version}, a paused read at {width}x{height} by {'touch' if touch else 'mouse'}: " + "; ".join(desk.notes)
+    finally:
+        api.stopping.set()
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
 def run(chromium: BrowserType, args: argparse.Namespace, voice: str) -> str:
     api = VoicesApi()
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler(api))
@@ -276,6 +450,9 @@ def main() -> int:
     with sync_playwright() as playwright:
         for voice in (("agent", "device") if args.voice == "both" else (args.voice,)):
             report.append(run(playwright.chromium, args, voice))
+        if args.voice == "both":
+            for touch in (True, False):
+                report.append(run_quote(playwright.chromium, args, touch))
     for line in report:
         print(line)
     return 0

@@ -5223,6 +5223,12 @@ const TUNING_BANDS = {
   SELECTION_CHIP_GAP_PX: [8, 24,
     "how far under a selection the Quoted reply chip stands (#726 vt-selection-chip): closer and a phone's " +
     "selection handles, which hang under the words, cover it; further and it reads as belonging to the next line"],
+  SELECTION_CHIP_HANDLES_PX: [28, 56,
+    "how far under a selection the chip stands after a touch (#819 voice-page-quoted-reply-and-draft-chip): closer " +
+    "and the browser's selection handles, which take a touch for themselves, stand on it; further and it is far from the words"],
+  SELECTION_BAR_ROOM_PX: [56, 96,
+    "the room over the words a phone's own Copy and Share bar takes (#819 voice-page-quoted-reply-and-draft-chip): " +
+    "less and a selection with that bar put under it has the chip under the bar too; more and the chip leaves the words early"],
   SELECTION_CHIP_EDGE_PX: [4, 16,
     "how close to the window's edge the chip may stand (#726 vt-selection-chip): closer and a rounded phone " +
     "screen cuts it; further and a selection near the edge has its chip pushed away from it"],

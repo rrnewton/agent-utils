@@ -109,6 +109,29 @@
   border-radius: 1.4rem;
 }
 
+/* `#819 voice-page-quoted-reply-and-draft-chip`. Quote reply in the strip, while words are selected in a
+   paused read: a line of its own over the blocks, the strip's width and a thumb's height, far from the
+   selection and whatever the phone's browser draws over it. Only while the read is paused. */
+#read-steer-quote {
+  display: none;
+  pointer-events: auto;
+  flex: 1 0 100%;
+  min-height: 2.75rem;
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  background: var(--panel);
+  color: var(--accent);
+  font: inherit;
+  font-weight: 600;
+  touch-action: manipulation;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+#read-steer[data-held] #read-steer-quote:not([hidden]) {
+  display: block;
+}
+
 #read-timeline {
   pointer-events: auto;
   display: flex;

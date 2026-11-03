@@ -520,7 +520,7 @@ steps:
   # and the agent's voice from its block.
   - group: check
     job: read-pause-reply-browser
-    desc: a read paused, the message replied to and sent, then resumed, by both voices in current Chromium at 393x852 touch, the read going on from where it was held
+    desc: a read paused, the message replied to and sent, then resumed, by both voices in current Chromium at 393x852 touch, the read going on from where it was held; and in a paused read, at 393x852 by touch and 1280x800 by mouse, the Quoted reply chip and the strip's Quote reply topmost wherever the words are, the quick reply typed and dictated into and sent quoted
     labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/read_pause_reply_browser.py
     jobs_flag: ""
@@ -529,7 +529,7 @@ steps:
     cpu_timeout: 60
     hint:
       resources: {browser: 1}
-      est_duration_s: 25
+      est_duration_s: 30
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
