@@ -56,3 +56,7 @@ Its single failure that day, `test_rust_mcp_matches_python`, sits in the family 
 ### Remaining acceptance
 
 The >=90% full-gate pass rate is measured over a working day after these fixes land; it cannot be observed inside this session. The three fixes above (reply-ID hyphen parsing, parent-death probe race, shared-deadline headroom) plus #815/#818 remove the repeat offenders with daily counts 4, 3, 3, 2 and 2 from the 2026-11-03 list.
+
+## Fixes landed (mu-validate, 2026-11-03)
+
+[muse watermelon-full-preview] Landed on main as 086a381d: reply-ID hyphen parsing (`rs/agentctl/src/cli.rs`), parent-death probe race (`py/tests/test_herdr_chat_transport.py`), shared-deadline spawn headroom (`rs/chat-subscription-slack/tests/directory.rs`). Gate green on the stack (only failure was rustfmt on my own edit, fixed and rerun exclusively PASS). Overlap on landing was `rs/agentctl/src/cli.rs` + this issue file (another lane's note appended); combined tree verified (fmt OK; cli 41, chat_reply 10, directory 19, parent-death 4 tests pass) before landing. Left open: the >=90% full-gate pass rate must be measured over a working day after landing.
