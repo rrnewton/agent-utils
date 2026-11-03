@@ -1,12 +1,13 @@
 ---
 title: 'agent-teams-relay-signature-scope: sign envelope kind/topic/supersedes fields'
-status: open
+status: closed
 priority: 3
 issue_type: task
 labels:
 - agent-teams
 created_at: 2026-11-03T00:52:06.961097167+00:00
 updated_at: 2026-11-03T00:52:06.961097167+00:00
+closed_at: 2026-11-03T19:11:04.522858+00:00
 ---
 
 # Description
