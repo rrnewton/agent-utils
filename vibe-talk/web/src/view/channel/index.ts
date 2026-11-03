@@ -99,3 +99,5 @@ export { createCardsDrawn } from "./cardsdrawn.ts";
 export type { CardsDrawn, KeptCards } from "./cardsdrawn.ts";
 export { UNPACK_NEAR_PX, createUnpackWatch } from "./unpackwatch.ts";
 export type { UnpackWatch, UnpackWatchDependencies } from "./unpackwatch.ts";
+export { createUnderLists } from "./underlists.ts";
+export type { MainUnderListNote, UnderListNote, UnderLists } from "./underlists.ts";

@@ -707,3 +707,18 @@ test("`#624 voice-page-modularity`: the cards note when read runs stand suspende
   assert.throws(() => drawn.whileDressedAfter(true, () => { throw new Error("drawn wrong"); }), /drawn wrong/);
   assert.deepStrictEqual([seen, drawn.dressedAfter()], [[true, false], false]);
 });
+
+test("`#624 voice-page-modularity`: what stands under the lists, as each keeper noted it, and the send card's moves told to Main's", () => {
+  const { createUnderLists } = CHANNEL_VIEW;
+  const under = createUnderLists();
+  under.cardMoved(40);
+  under.cardCame(12);
+  assert.deepStrictEqual([under.main(), under.side()], [null, null], "nothing before the first report");
+  under.noteMain({ list: 600, dock: 50 });
+  under.cardMoved(246);
+  assert.deepStrictEqual(under.main(), { list: 600, dock: 296 }, "a move of the card is no growth");
+  under.cardCame(12);
+  assert.deepStrictEqual(under.main(), { list: 600, dock: 296, gap: 12 });
+  under.noteSide({ list: 500, dock: 50 });
+  assert.deepStrictEqual(under.side(), { list: 500, dock: 50 }, "the right column's note is its own");
+});

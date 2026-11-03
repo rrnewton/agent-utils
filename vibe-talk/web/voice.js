@@ -33539,14 +33539,12 @@ function heightUnderLists() {
 }
 
 /**
- * What the dock-growth keeper of Main's list (below) noted at its last report: the list's height and
- * `heightUnderLists`, and, from a send card that has come up docked under the thread list since, how
- * far from the foot of Main's list its reader was before it did (`cardCameUnderLists`). Null before the
- * first.
- *
- * @type {{list: number, dock: number, gap?: number} | null}
+ * What the dock-growth keepers of Main's list and of the right column (below) noted at their last reports:
+ * each list's height and `heightUnderLists`, and Main's reader's distance from its foot as a send card came
+ * up docked under the thread list (`cardCameUnderLists`). One owner in web/src/view/channel/underlists.ts
+ * (`#624 voice-page-modularity`).
  */
-let mainUnderLists = null;
+const underLists = createUnderLists();
 
 /**
  * `#280 scroll-stability` x `#281 view-keys`. The send card moved into the dock under the thread list
@@ -33559,7 +33557,7 @@ let mainUnderLists = null;
  * @param {number} px
  */
 function cardMovedUnderLists(px) {
-  if (mainUnderLists !== null) mainUnderLists = { ...mainUnderLists, dock: mainUnderLists.dock + px };
+  underLists.cardMoved(px);
 }
 
 /**
@@ -33571,17 +33569,8 @@ function cardMovedUnderLists(px) {
  * @param {number} gap
  */
 function cardCameUnderLists(gap) {
-  if (mainUnderLists !== null) mainUnderLists = { ...mainUnderLists, gap };
+  underLists.cardCame(gap);
 }
-
-/**
- * What the dock-growth keeper of the right column (below) noted at its last report, or as the cards were
- * last put back where the reader had them in the thread list (`cardsPlacedUnderLists`): the column's
- * height and `heightUnderLists`. Null before the first.
- *
- * @type {{list: number, dock: number} | null}
- */
-let sideUnderLists = null;
 
 /**
  * `#280 scroll-stability` x `#269 approval-card-inline` x `#281 view-keys`. The cards were just put back
@@ -33594,7 +33583,7 @@ let sideUnderLists = null;
  * card 246px tall, a reader put back 160px up the list's cards was pulled to its foot.
  */
 function cardsPlacedUnderLists() {
-  sideUnderLists = { list: leftEl("side-scroll").clientHeight, dock: heightUnderLists() };
+  underLists.noteSide({ list: leftEl("side-scroll").clientHeight, dock: heightUnderLists() });
 }
 // `#218 desktop-dock`. On a desk the dock is one row of controls or two, and which depends on what
 // is in it — a call going live, a long channel name, a label changing length. When it grows it takes
@@ -33628,10 +33617,10 @@ if (typeof window.ResizeObserver === "function") {
   new window.ResizeObserver(() => {
     const area = el("scroll-area");
     const now = { list: area.clientHeight, dock: heightUnderLists() };
-    const seen = mainUnderLists;
+    const seen = underLists.main();
     const grew = seen !== null && seen.list > 0 && screens.screen() === "main" ? now.dock - seen.dock : 0;
     const shrank = seen !== null && seen.list > 0 && now.list < seen.list;
-    mainUnderLists = now;
+    underLists.noteMain(now);
     // `#727 vt-selection-quick-reply`. A list held still for a quick reply is left where it is, as a
     // phone's keyboard comes up for the box and goes again.
     if (quickReplyHolds(area)) {
@@ -33678,14 +33667,14 @@ if (typeof window.ResizeObserver === "function") {
   new window.ResizeObserver(() => {
     const area = leftEl("side-scroll");
     const now = { list: area.clientHeight, dock: heightUnderLists() };
-    const seen = sideUnderLists;
+    const seen = underLists.side();
     const grew = seen !== null && seen.list > 0 && screens.screen() === "main" ? now.dock - seen.dock : 0;
     // `#336 draft-return-thread-list`. Not a report from another screen, where the column is not drawn: back on
     // the main screen the growth is reckoned from the column as the reader left it, so a send card that docked
     // under the thread list while Settings or Help was up is the dock growing under them, as it is when it
     // comes while they are on the list. Taken from the hidden column instead, it was no growth at all, and a
     // reader who had left from the foot of the cards came back the card's height above it.
-    if (screens.screen() === "main") sideUnderLists = now;
+    if (screens.screen() === "main") underLists.noteSide(now);
     // `#429 keyboard-hides-bar`. A box being written in this list, kept in view as the keyboard shrinks it.
     if (screens.screen() === "main" && keepWrittenBox(area, seen, now)) return;
     if (sideColumnUp() && screens.view() === "discord" && columns.side.mode === "list") {
