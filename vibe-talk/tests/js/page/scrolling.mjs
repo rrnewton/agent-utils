@@ -56,10 +56,8 @@ test("YOUR OWN TURN DOES NOT YANK YOU TO THE BOTTOM once you have scrolled up", 
 
   // The control: the OLD rule, an unconditional scroll on every arrival. It has to fail.
   const control = await parked(
-    brokenScript(
-      'function followIfPinned(pinned, turns = 0, view = "voice") {\n  if (pinned && currentView === view) {',
-      'function followIfPinned(pinned, turns = 0, view = "voice") {\n  if (true) {'
-    )
+    await brokenModule([{ file: "src/view/channel/scrollkeep.ts",
+      find: "    if (pinned && deps.currentView() === view) {", replace: "    if (true) {" }])
   );
   assert.notEqual(
     control.area.scrollTop,
@@ -106,10 +104,9 @@ test("COLLAPSING A MESSAGE ABOVE THE VIEWPORT LEAVES THE READER LOOKING AT THE S
   // The control: the same page with the restore deleted. The whole test rests on the fixture being
   // able to SEE the difference, so it has to be shown seeing it.
   const control = await run(
-    brokenScript(
-      "  area.scrollTop += mark.anchor.getBoundingClientRect().top - mark.top;",
-      "  void mark;"
-    )
+    await brokenModule([{ file: "src/view/channel/scrollkeep.ts",
+      find: "    area.scrollTop += (mark.anchor as Element).getBoundingClientRect().top - mark.top;",
+      replace: "    void mark;" }])
   );
   assert.notEqual(
     control.moved,
@@ -731,10 +728,9 @@ test("LOADING OLDER MESSAGES LEAVES THE READER LOOKING AT THE SAME LINE", async 
 
   // THE CONTROL. Without it the fixture could be one that never moves scrollTop at all.
   const control = await run(
-    brokenScript(
-      "  area.scrollTop += mark.anchor.getBoundingClientRect().top - mark.top;",
-      "  void mark;"
-    )
+    await brokenModule([{ file: "src/view/channel/scrollkeep.ts",
+      find: "    area.scrollTop += (mark.anchor as Element).getBoundingClientRect().top - mark.top;",
+      replace: "    void mark;" }])
   );
   assert.notEqual(
     control.moved,
@@ -749,10 +745,9 @@ test("LOADING OLDER MESSAGES LEAVES THE READER LOOKING AT THE SAME LINE", async 
   // first child of the log is a perfectly natural thing to measure, and after a prepend it is not
   // the same row it was.
   const wrongAnchor = await run(
-    brokenScript(
-      "  area.scrollTop += mark.anchor.getBoundingClientRect().top - mark.top;",
-      '  area.scrollTop += el("discord-log").children[0].getBoundingClientRect().top - mark.top;'
-    )
+    await brokenModule([{ file: "src/view/channel/scrollkeep.ts",
+      find: "    area.scrollTop += (mark.anchor as Element).getBoundingClientRect().top - mark.top;",
+      replace: '    area.scrollTop += (el("discord-log").children[0] as Element).getBoundingClientRect().top - mark.top;' }])
   );
   assert.notEqual(
     wrongAnchor.moved,

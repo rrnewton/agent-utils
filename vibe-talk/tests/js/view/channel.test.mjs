@@ -484,3 +484,36 @@ test("`#624 voice-page-modularity`: a packed card's gap holds and closes by slid
   slides.slideIntoPlace(card, { key: "another item", top: 160 });
   assert.equal(below.played.length, 1, "an item that is not the one measured before moves nothing");
 });
+
+test("`#624 voice-page-modularity`: the reader is left on the message their eye was on across a change, followed only from the newest line", () => {
+  const { createScrollKeeping } = CHANNEL_VIEW;
+  let shift = 0;
+  const row = (id, top) => ({ id, parentNode: {}, getAttribute: () => null, getBoundingClientRect: () => ({ top: top + shift, bottom: top + shift + 40 }) });
+  const rows = [row("a", -80), row("b", -40), row("c", 0), row("d", 40)];
+  const log = { id: "discord-log", children: rows };
+  const area = { scrollTop: 300, getBoundingClientRect: () => ({ top: 0 }) };
+  const chip = { hidden: true, getBoundingClientRect: () => ({ top: 0 }) };
+  const els = { "discord-log": log, "pinned-log": { id: "pinned-log", children: [] }, "scroll-area": area, "load-older": chip, transcript: { children: [] } };
+  let bottom = false;
+  const calls = [];
+  const keep = createScrollKeeping({
+    el: (id) => els[id], onMain: () => true, currentView: () => "discord", channelView: () => "main", pinnedOnly: () => false,
+    heldFilterRow: () => null, searchWalk: () => null, atBottom: () => bottom,
+    scrollToNewest: () => calls.push("newest"), renderJumpNewest: () => calls.push("jump"),
+    setJumpNewest: (on, view, turns) => calls.push(["chip", view, turns]),
+  });
+  assert.equal(keep.visibleList(), log);
+  assert.equal(keep.scrollAnchor(area), rows[2], "the first row not scrolled off the top");
+  keep.preservingScroll(() => { shift = 25; });
+  assert.equal(area.scrollTop, 325, "a change above moved the row down 25px, and the reader with it");
+  assert.deepStrictEqual(calls, ["jump"]);
+  bottom = true;
+  keep.preservingScroll(() => {});
+  assert.equal(calls.at(-1), "newest", "a reader on the newest line follows it");
+  keep.followIfPinned(false, 2);
+  assert.deepStrictEqual(calls.at(-1), ["chip", "voice", 2], "a reader scrolled away is told, not moved");
+  keep.followIfPinned(true, 1, "voice");
+  assert.deepStrictEqual(calls.at(-1), ["chip", "voice", 1], "a turn for a list not on screen raises its chip");
+  keep.followIfPinned(true, 1, "discord");
+  assert.equal(calls.at(-1), "newest");
+});

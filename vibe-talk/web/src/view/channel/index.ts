@@ -85,3 +85,5 @@ export { OVERSCROLL_IDLE_MS, OVERSCROLL_REST_MS, createFootRooms } from "./footr
 export type { FootRooms, FootRoomsDependencies } from "./footroom.ts";
 export { createPackSlides } from "./packslide.ts";
 export type { PackSlides, PackSlidesDependencies } from "./packslide.ts";
+export { createScrollKeeping } from "./scrollkeep.ts";
+export type { ScrollKeeping, ScrollKeepingDependencies, ScrollMark } from "./scrollkeep.ts";

@@ -823,7 +823,7 @@ function readAloudOwner() {
     get dismissMessages() { return dismissMessages; },
     get currentView() { return currentView; },
     get selectedChannelId() { return selectedChannelId; },
-    get shownChannelList() { return shownChannelList; },
+    get shownChannelList() { return /** @type {() => HTMLOListElement} */ (shownChannelList); },
     get threadListShown() { return threadListShown; },
     get sideColumnUp() { return sideColumnUp; },
     get sideShowing() { return sideShowing; },
@@ -2857,162 +2857,28 @@ const packSlider = createPackSlides({
 });
 const { finishPackSlide, slideKey, itemAfterBlock, slideIntoPlace } = packSlider;
 
-/** The list the reader is actually looking at. Both panes share one scrolling element. */
-function visibleList() {
-  return el(currentView === "discord"
-    ? (selection().view === "threads" && !pinsView().only ? "thread-list" : shownChannelList().id)
-    : "transcript");
-}
-
 /**
- * The channel's rows as they are on screen: the Pinned filter's list while it is on, and the
- * channel's own otherwise. `#206 pin-message`. Everything that acts on "the rows the reader can
- * see" asks this rather than naming `#discord-log`, which stays the channel's list underneath.
+ * Leaving the reader looking at the same thing across a change: the list on screen, the message their eye
+ * is on, where they are captured as and put back by, and following a new turn only where they were at the
+ * newest line (web/src/view/channel `createScrollKeeping`, `#624 voice-page-modularity`), in the column
+ * being worked on. The page destructures them under their old names.
  */
-function shownChannelList() {
-  return el(pinsView().only ? "pinned-log" : "discord-log");
-}
-
-/**
- * The message the reader's eye is on: the first one not already scrolled off the top.
- *
- * This is the anchor everything below is measured against. A browser has its own scroll anchoring,
- * and it is exactly the wrong tool here — it is defeated by a mutation ABOVE the viewport, which
- * is precisely what collapsing a message the reader has already scrolled past is.
- */
-function scrollAnchor(area) {
-  const edge = area.getBoundingClientRect().top;
-  const items = visibleList().children;
-  for (const li of items) {
-    // A row hidden in a collapsed run of read messages has no box to be looking at. `#221 read-modes`.
-    if (li.getAttribute("data-read-run") === "member") continue;
-    if (li.getBoundingClientRect().bottom > edge) {
-      return li;
-    }
-  }
-  return items.length > 0 ? items[items.length - 1] : null;
-}
-
-/**
- * Run a mutation and leave the reader looking at the same thing afterwards.
- *
- * Capture the anchor's offset, mutate, measure it again, and move the scroll position by the
- * difference. Explicit, because the alternative is trusting browser scroll anchoring, and the
- * whole point is that it does not hold for a change made above the viewport.
- *
- * A reader who was already at the bottom is the one exception: for them "the same thing" IS the
- * newest line, so the view follows it.
- */
-function preservingScroll(mutate) {
-  const mark = captureScroll();
-  mutate();
-  restoreScroll(mark);
-}
-
-/**
- * `preservingScroll` for a change that resizes the list's window or the room at its head — the
- * error panel above #scroll-area, the freshness pill's room inside it. Browser scroll anchoring
- * holds for neither, so the line being read, or the newest line, would move by the change's height:
- * 74-89px for a failed refresh's panel (`#33 error-banner-scroll-shift`).
- *
- * Not for a reader at the very top, nor off the main screen. At the top the first row is the
- * anchor, and holding it would scroll the header out of view: that reader is meant to see the
- * header move down. Off the main screen there is no list on screen to hold.
- */
-function holdingReader(mutate) {
-  if (currentScreen === "main" && el("scroll-area").scrollTop > 0) preservingScroll(mutate);
-  else mutate();
-}
-
-/**
- * Where the reader is: WHICH message their eye is on, and how far down the viewport it sits.
- *
- * Split out of `preservingScroll` so that `#51 reply-view` can use the same mechanism across a
- * screen change, where the two halves are separated by everything the reader does on the reply
- * screen. One mechanism, two callers: an anchor is strictly better than a saved `scrollTop` here
- * as well, because hiding an element is allowed to reset its scroll position to zero — and a
- * restore expressed as a DELTA against the anchor is correct whether the browser did that or not.
- */
-function captureScroll() {
-  const area = el("scroll-area");
-  // `#243 filter-keeps-selection`. While a filter change holds a message in place, that message is
-  // where the reader is, and the newest line is not followed: nothing but the reader moves it.
-  const held = heldFilterRow();
-  if (held) return { pinned: false, anchor: held, top: held.getBoundingClientRect().top };
-  // `#262 search-load-older`. While a walk for the search reads older pages, its control holds still and
-  // the matches open under it — never the newest line followed, on a list short enough to be at its
-  // foot — until the reader scrolls it away, which lets it go. At the head of the list it may have moved
-  // without the reader: the sentence above it that nothing matched goes once something does, and there is
-  // no room above to keep it where it stood. Measured only while a walk runs.
-  const walk = activeColumn.searchWalk;
-  if (walk && walk.anchored) {
-    const chip = el("load-older");
-    const top = chip.getBoundingClientRect().top;
-    if (!chip.hidden && (Math.abs(top - walk.chipTop) <= 1 || area.scrollTop <= 1)) {
-      walk.chipTop = top;
-      return { pinned: false, anchor: chip, top };
-    }
-    walk.anchored = false;
-  }
-  const anchor = scrollAnchor(area);
-  return {
-    pinned: atBottom(area),
-    anchor,
-    top: anchor ? anchor.getBoundingClientRect().top : 0,
-  };
-}
-
-/** Put the reader back where `captureScroll` found them. */
-function restoreScroll(mark) {
-  const area = el("scroll-area");
-  if (mark.pinned) {
-    scrollToNewest();
-    return;
-  }
-  // A list that was replaced while we were away has taken the anchor with it, and there is nothing
-  // left to measure against; leaving the position alone beats jumping somewhere arbitrary.
-  if (!mark.anchor || !mark.anchor.parentNode) {
-    renderJumpNewest();
-    return;
-  }
-  // An anchor that has just joined a collapsed run of read messages is held by the run's line,
-  // where it went. `#221 read-modes`.
-  const shown = shownRowFor(mark.anchor);
-  if (shown !== mark.anchor) mark = { ...mark, anchor: shown };
-  area.scrollTop += mark.anchor.getBoundingClientRect().top - mark.top;
-  // Wherever that put the reader decides the jump, now: up the history it is offered, on the
-  // newest line it is not. `#207 scrollback-jump`.
-  renderJumpNewest();
-}
-
-/**
- * A turn arrived. Follow it only if the reader had not scrolled away.
- *
- * `pinned` is measured BEFORE the append, because appending is itself what changes the answer.
- * When it is false the scroll position is left exactly alone and the "Newest" chip appears —
- * silently leaving the reader in place would be the other half of the same defect, since they
- * would have no way of knowing something had arrived at all.
- *
- * AND ONLY WHILE THE TRANSCRIPT IS THE LIST ON SCREEN. `pinned` is measured on #scroll-area, which
- * both panes share, so a turn arriving while the reader is over on the channel was asking "is the
- * reader at the bottom of the CHANNEL?" and following the answer: it scrolled the channel and put
- * the channel's chip away, and it never raised the transcript's. A call goes on talking while you
- * read a backlog, so that is the ordinary case, not a corner — and its cost was silence. The turn
- * belongs to a list nobody is looking at, so the only right act is to raise that list's chip.
- */
-function followIfPinned(pinned, turns = 0, view = "voice") {
-  if (pinned && currentView === view) {
-    scrollToNewest();
-    return;
-  }
-  // Named explicitly: `line()` and `seam()` append to the transcript, so they leave `view` as the
-  // transcript's. Letting it default to `currentView` would raise a chip over the channel list. The
-  // send card (`#269 approval-card-inline`) is the one caller that names a view: it is the next
-  // message of whichever list is on screen. `turns` is how many new turns this was, for the count
-  // the jump shows: a turn growing as it is spoken, a seam or the card is a change below and not
-  // another message. `#207 scrollback-jump`.
-  setJumpNewest(true, view, turns);
-}
+const scrollKeeping = createScrollKeeping({
+  el: (id) => el(id),
+  onMain: () => currentScreen === "main",
+  currentView: () => currentView,
+  channelView: () => selection().view,
+  pinnedOnly: () => pinsView().only,
+  heldFilterRow: () => heldFilterRow(),
+  searchWalk: () => activeColumn.searchWalk,
+  atBottom: (area) => atBottom(area),
+  scrollToNewest: () => scrollToNewest(),
+  renderJumpNewest: () => renderJumpNewest(),
+  setJumpNewest: (on, view, turns) => setJumpNewest(on, view, turns),
+});
+const {
+  visibleList, shownChannelList, scrollAnchor, preservingScroll, holdingReader, captureScroll, restoreScroll, followIfPinned,
+} = scrollKeeping;
 
 /** The invitation only makes sense while there is nothing else in the transcript. */
 function renderEmptyState() {

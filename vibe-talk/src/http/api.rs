@@ -3532,7 +3532,12 @@ mod tests {
     }
 
     fn voice_source() -> String {
-        page_source::page_source(&["src/view/voice", "src/present/call", "src/core/speech"])
+        page_source::page_source(&[
+            "src/view/voice",
+            "src/present/call",
+            "src/core/speech",
+            "src/view/channel/scrollkeep.ts",
+        ])
     }
 
     fn channel_name_source() -> String {
