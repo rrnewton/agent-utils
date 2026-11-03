@@ -176,6 +176,8 @@ declare const createThreadOrder: LegacyImports["createThreadOrder"];
 declare const inThreadOrder: LegacyImports["inThreadOrder"];
 declare const threadOrderAfter: LegacyImports["threadOrderAfter"];
 declare const LINK_KINDS: LegacyImports["LINK_KINDS"];
+declare const upstreamAppUrlOf: LegacyImports["upstreamAppUrlOf"];
+declare const upstreamUrlOf: LegacyImports["upstreamUrlOf"];
 declare const LINK_KINDS_KEY: LegacyImports["LINK_KINDS_KEY"];
 declare const createLinkKinds: LegacyImports["createLinkKinds"];
 declare const hiddenKindWords: LegacyImports["hiddenKindWords"];

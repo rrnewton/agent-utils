@@ -383,3 +383,16 @@ test("`#624 voice-page-modularity`: the order of the Threads view's cards, kept 
   order.set("created");
   assert.equal(order.current(), "created", "a refused write lost the choice for this session");
 });
+
+test("`#624 voice-page-modularity`: a message's upstream addresses are read only in the one shape each href may take", () => {
+  const { upstreamUrlOf, upstreamAppUrlOf } = ROWS;
+  assert.equal(upstreamUrlOf({ upstream_url: "https://example.slack.com/archives/C1/p1" }), "https://example.slack.com/archives/C1/p1");
+  assert.equal(upstreamUrlOf({ upstream_url: "http://example.com/x" }), null, "only https");
+  assert.equal(upstreamUrlOf({ upstream_url: "https://exa mple.com" }), null, "no spaces");
+  assert.equal(upstreamUrlOf({ upstream_url: "javascript:alert(1)" }), null);
+  assert.equal(upstreamUrlOf(null), null);
+  assert.equal(upstreamAppUrlOf({ upstream_app_url: "slack://channel?team=T1&id=C2&message=1.2&thread_ts=1.0" }),
+    "slack://channel?team=T1&id=C2&message=1.2&thread_ts=1.0");
+  assert.equal(upstreamAppUrlOf({ upstream_app_url: "slack://channel?team=T1&id=C2&evil=1" }), null);
+  assert.equal(upstreamAppUrlOf({ upstream_app_url: "https://example.com" }), null);
+});

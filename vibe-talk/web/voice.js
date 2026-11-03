@@ -22141,22 +22141,8 @@ async function markReadThroughHere(row, upstreamId) {
   setStatus(upstream ? `Marked ${count} read here and in ${service}.` : `Marked ${count} read.`);
 }
 
-/**
- * A message's own address in the service it came from, as the server formed it and the message
- * carries it, or null where none came back. The one read of it: the ⋯ menu's "Open in …" link
- * and the l key's copy both take the address from here, so the two are offered together and
- * never disagree about it. `#408 copy-upstream-link`, `#409 open-upstream-link`.
- *
- * The address lands in an href, the one sink that is not plain text, so nothing is read here
- * that `HTTP_ADDRESS` has not passed: the server forms only https addresses, and one of any
- * other shape is no address to offer, to open or to copy.
- *
- * @param {any} message
- */
-function upstreamUrlOf(message) {
-  const url = message && typeof message.upstream_url === "string" ? message.upstream_url : "";
-  return /^https:\/\//i.test(url) && !/\s/.test(url) && HTTP_ADDRESS.test(url) ? url : null;
-}
+// A message's own addresses in its service, web (`upstreamUrlOf`) and app (`upstreamAppUrlOf`), each read
+// only in the one shape its href may take, are web/src/present/rows's (`#624 voice-page-modularity`).
 
 /**
  * Where this device opens Slack links: in Slack's app or in the browser (`#481
@@ -22168,21 +22154,6 @@ function upstreamUrlOf(message) {
 function storedSlackOpen() {
   // A browser refusing storage reads as a browser tab (`DEVICE_SETTINGS.slackOpen.refused`).
   return deviceSettings().get(DEVICE_SETTINGS.slackOpen);
-}
-
-
-
-/**
- * A message's address in its service's own app, as the server formed it (`slack://` for Slack;
- * `#481 slack-app-deep-link`), or null. The counterpart of `upstreamUrlOf` with that sink's own
- * shape: only the one scheme and the parts a Slack app address is made of pass, so nothing a
- * message carries can put another scheme in the href.
- *
- * @param {any} message
- */
-function upstreamAppUrlOf(message) {
-  const url = message && typeof message.upstream_app_url === "string" ? message.upstream_app_url : "";
-  return /^slack:\/\/channel\?team=T[A-Z0-9]+&id=[A-Z0-9]+(&message=[0-9.]+)?(&thread_ts=[0-9.]+)?$/.test(url) ? url : null;
 }
 
 /**
