@@ -34,3 +34,5 @@ export { createMutationRefresh } from "./coalesce.ts";
 export type { MutationRefresh, MutationRefreshDependencies } from "./coalesce.ts";
 export { createChannelReads } from "./reads.ts";
 export type { ChannelReads } from "./reads.ts";
+export { createArrivalCount, createChannelInFlight } from "./inflight.ts";
+export type { ArrivalCount, ChannelInFlight } from "./inflight.ts";

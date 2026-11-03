@@ -11034,7 +11034,7 @@ function foldLiveMessage(message, live = false, replayed = false, read = null) {
   return foldLiveIn(channelStore.current(), message, live, replayed, read, {
     ledger: copyLedger,
     orderNow: () => orderNow(),
-    nextArrival: () => ++unplacedArrivals,
+    nextArrival: () => unplacedArrivals.next(),
   });
 }
 
@@ -12975,7 +12975,8 @@ const THREAD_SELECT_LIMIT = 8;
 const THREAD_TITLE_CHARS = 28;
 
 const threadDirectoryReadAt = new Map();
-let threadDirectoryInFlight = null;
+/** The channel whose thread directory is being read, one at a time (web/src/core/sync `createChannelInFlight`). */
+const threadDirectoryInFlight = createChannelInFlight();
 /**
  * `#231 two-column-polish`. By channel, how the thread list's newest read failed, "offline" or
  * "failed", until one lands; and when the newest that landed did. What the right column's line says
@@ -13281,9 +13282,9 @@ function onThreadSelect() {
 async function refreshThreadDirectory() {
   const channel = String(selectedChannelId());
   if (!providerFacts.threading() || !channel || channelStore.current().scope) return;
-  if (threadDirectoryInFlight === channel) return;
+  if (threadDirectoryInFlight.isFor(channel)) return;
   if (Date.now() - (threadDirectoryReadAt.get(channel) || 0) < THREAD_DIRECTORY_REFRESH_MS) return;
-  threadDirectoryInFlight = channel;
+  threadDirectoryInFlight.begin(channel);
   threadDirectoryReadAt.set(channel, Date.now());
   // `remote-ops-audit`: the right column's list of threads, read beside Main (`readSideColumn`).
   const base = `/api/v1/channels/${encodeURIComponent(channel)}/timeline?view=threads&limit=${DISCORD_PAGE_LIMIT}` +
@@ -13329,7 +13330,7 @@ async function refreshThreadDirectory() {
       renderSideFreshness();
     }
   } finally {
-    if (threadDirectoryInFlight === channel) threadDirectoryInFlight = null;
+    threadDirectoryInFlight.end(channel);
   }
 }
 
@@ -14295,8 +14296,8 @@ const COUNTS_SOON_MS = 10000;
 const countsAllReadAt = new Map();
 /** @type {Map<string, Map<string, number>>} by channel: what outran the store then, thread id to count */
 const countsAllReadFor = new Map();
-/** @type {string | null} the channel whose read of All for Main's counts is on the wire */
-let countsAllReadInFlight = null;
+/** The channel whose read of All for Main's counts is on the wire (web/src/core/sync `createChannelInFlight`). */
+const countsAllReadInFlight = createChannelInFlight();
 
 /** `readAllForCounts`, once the read of Main being folded now has been drawn. */
 function queueReadAllForCounts() {
@@ -14331,7 +14332,7 @@ function outrunningThreads() {
  */
 async function readAllForCounts(channel, soon = false) {
   if (!providerFacts.threading() || !channel || String(selectedChannelId()) !== channel || selection().view !== "main" ||
-      channelStore.current().channel !== channel || channelStore.current().scope || countsAllReadInFlight !== null ||
+      channelStore.current().channel !== channel || channelStore.current().scope || countsAllReadInFlight.busy() ||
       document.visibilityState === "hidden") return;
   const all = channelStore.current().views.get(viewKey("flat"));
   const now = Date.now();
@@ -14340,7 +14341,7 @@ async function readAllForCounts(channel, soon = false) {
   const saw = countsAllReadFor.get(channel);
   if (![...outrun].some(([id, count]) => !(saw && (saw.get(id) || 0) >= count))) return;
   countsAllReadAt.set(channel, now);
-  countsAllReadInFlight = channel;
+  countsAllReadInFlight.begin(channel);
   // What the page can speak for: the store's copies as it is sent, and those older than it (`copyOrder`).
   // One the store gains while it is out — a reply the stream delivers, placed by a delta of All while
   // this page is still on its way, or the reader's own send — is newer than the page, which would take
@@ -14348,7 +14349,7 @@ async function readAllForCounts(channel, soon = false) {
   // undo; one it loses, the page would put back.
   const read = { context: JSON.stringify([channel, "flat", null]), channel, view: "flat", thread: null, canon: channelStore.current(),
     held: heldNow(channelStore.current()) };
-  const seen = unplacedArrivals;
+  const seen = unplacedArrivals.count();
   try {
     const payload = await within(CHANNEL_READ_TIMEOUT_MS, (signal) => readTimeline(
       `/api/v1/channels/${encodeURIComponent(channel)}/timeline?view=flat&limit=${DISCORD_PAGE_LIMIT}&reason=counts`,
@@ -14379,7 +14380,7 @@ async function readAllForCounts(channel, soon = false) {
     // The counts stay as they were until a read of All or of the thread; the next read of Main past
     // the interval asks again.
   } finally {
-    countsAllReadInFlight = null;
+    countsAllReadInFlight.end();
   }
 }
 
@@ -14998,7 +14999,7 @@ async function loadTimeline(options) {
     for (;;) {
       const path = timelinePath(null, sent, readReasonOf(options));
       // What the stream had left unplaced when this went out, which a newest page of All answers for.
-      const seenArrivals = unplacedArrivals;
+      const seenArrivals = unplacedArrivals.count();
       // `#310 stale-live-read-flicker`. And the store's copies as it went out: a newest page is folded
       // only over the copies older than it (`pageFold`). A message the stream drew while it was out is
       // newer than it, and this page, landing after, redrew the column without it until the next read
@@ -16093,10 +16094,13 @@ async function placeReplyTarget(entry) {
 // that view up to date as well. A late answer asks again for what it could not answer; a failure waits
 // for the next read of the channel to end.
 
-/** How many messages the stream has left unplaced in this page, in any channel: the clock `unplacedSince` reads. */
-let unplacedArrivals = 0;
-/** The channel whose placing read is on the wire, or null. */
-let placingReadInFlight = null;
+/**
+ * How many messages the stream has left unplaced in this page, in any channel: the clock `unplacedSince` reads;
+ * and the channel whose placing read is on the wire, one at a time (web/src/core/sync `createArrivalCount`,
+ * `createChannelInFlight`, `#624 voice-page-modularity`).
+ */
+const unplacedArrivals = createArrivalCount();
+const placingReadInFlight = createChannelInFlight();
 
 // Which unplaced messages no read of All has answered for (`unplacedToAsk`), a read of All answering for
 // them (`answerUnplaced`), and whether the store holds what it held when a read was sent (`heldAsSent`) are
@@ -16174,10 +16178,10 @@ function queuePlaceUnplaced() {
 async function placeUnplaced() {
   const channel = String(selectedChannelId());
   if (!providerFacts.threading() || !channel || channelStore.current().channel !== channel || channelStore.current().scope ||
-      placingReadInFlight !== null || channelReads.busy() || document.visibilityState === "hidden" ||
+      placingReadInFlight.busy() || channelReads.busy() || document.visibilityState === "hidden" ||
       placeUnplacedWaits(channel)) return;
   if (unplacedToAsk(channelStore.current()).length === 0) return;
-  placingReadInFlight = channel;
+  placingReadInFlight.begin(channel);
   const canon = channelStore.current();
   const all = canon.views.get(viewKey("flat"));
   let sent = all && all.live && all.newest && Date.now() - (all.fullAt || 0) < TIMELINE_RECONCILE_MS
@@ -16188,7 +16192,7 @@ async function placeUnplaced() {
   try {
     for (;;) {
       /** @type {PlacingRead} */
-      const read = { key, channel, canon, sent, seen: unplacedArrivals, sentAt: Date.now(),
+      const read = { key, channel, canon, sent, seen: unplacedArrivals.count(), sentAt: Date.now(),
         live: liveEvents.seen(channel), news: liveEvents.news(channel), number: 0,
         held: heldNow(canon), removals: liveEvents.removals(channel) };
       const path = `${base}${sent ? `&after=${encodeURIComponent(sent)}` : ""}&reason=place`;
@@ -16223,7 +16227,7 @@ async function placeUnplaced() {
     // Asked again when the next read of the channel ends, and, once given up on, when the server has
     // stopped reading for it (`placeUnplacedWaits`).
   } finally {
-    placingReadInFlight = null;
+    placingReadInFlight.end();
     if (again) queuePlaceUnplaced();
   }
 }

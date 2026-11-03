@@ -480,3 +480,20 @@ test("`#624 voice-page-modularity`: a live page with more above and no cursor ow
   reads.oweCursor(false);
   assert.equal(reads.cursorOwed(), false, "a later page with a cursor owes none");
 });
+
+test("`#624 voice-page-modularity`: one read of a kind on the wire per channel, and the count of arrivals left unplaced", () => {
+  const { createChannelInFlight, createArrivalCount } = SYNC;
+  const flight = createChannelInFlight();
+  assert.deepStrictEqual([flight.busy(), flight.channel(), flight.isFor("c1")], [false, null, false]);
+  flight.begin("c1");
+  assert.deepStrictEqual([flight.busy(), flight.channel(), flight.isFor("c1"), flight.isFor("c2")], [true, "c1", true, false]);
+  flight.end("c2");
+  assert.equal(flight.channel(), "c1", "another channel's end leaves this one's read on the wire");
+  flight.end("c1");
+  assert.equal(flight.busy(), false);
+  flight.begin("c2");
+  flight.end();
+  assert.equal(flight.busy(), false, "an end naming no channel ends whatever is on the wire");
+  const arrivals = createArrivalCount();
+  assert.deepStrictEqual([arrivals.count(), arrivals.next(), arrivals.next(), arrivals.count()], [0, 1, 2, 2]);
+});

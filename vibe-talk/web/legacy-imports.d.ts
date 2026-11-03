@@ -62,6 +62,8 @@ declare const createReadHolds: LegacyImports["createReadHolds"];
 declare const createReadOrder: LegacyImports["createReadOrder"];
 declare const createReplayLedger: LegacyImports["createReplayLedger"];
 declare const createChannelReads: LegacyImports["createChannelReads"];
+declare const createArrivalCount: LegacyImports["createArrivalCount"];
+declare const createChannelInFlight: LegacyImports["createChannelInFlight"];
 declare const createStandInRetries: LegacyImports["createStandInRetries"];
 declare const createChannelPoll: LegacyImports["createChannelPoll"];
 declare const LIVE_RETRY_MS: LegacyImports["LIVE_RETRY_MS"];
