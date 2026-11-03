@@ -103,3 +103,5 @@ export { createUnderLists } from "./underlists.ts";
 export type { MainUnderListNote, UnderListNote, UnderLists } from "./underlists.ts";
 export { createRowDrawing } from "./rowdrawing.ts";
 export type { RowDrawing } from "./rowdrawing.ts";
+export { createFilterChanges } from "./filterchanges.ts";
+export type { FilterChanges, FilterWalk } from "./filterchanges.ts";

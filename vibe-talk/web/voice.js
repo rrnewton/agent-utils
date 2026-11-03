@@ -4847,7 +4847,7 @@ function drawSeams(list) {
       }
     }
   };
-  if (!columnWork.side() && filterChanging === 0 && screens.screen() === "main" && screens.view() === "discord" && list === visibleList()) {
+  if (!columnWork.side() && !filterChanges.changing() && screens.screen() === "main" && screens.view() === "discord" && list === visibleList()) {
     // While a filter change holds a message in place (`#243 filter-keeps-selection`), the hold places
     // the reader, not this: the held message goes back where the change put it, as after every other
     // redraw around it (`keepFilterHold`) — kept where it happens to be in the middle of a redraw, it
@@ -4955,11 +4955,12 @@ function filterState() {
   return columnWork.active().filter;
 }
 
-/** True while a filter change is under way, so a filter turned off inside another is placed once, by the outer. */
-let filterChanging = 0;
-
-/** The walk back to an anchor older than anything loaded, while it is under way: the left column's alone. */
-let filterWalk = null;
+/**
+ * Whether a filter change is under way, so a filter turned off inside another is placed once, by the outer;
+ * and the walk back to an anchor older than anything loaded, while it is under way, the left column's alone:
+ * one owner in web/src/view/channel/filterchanges.ts (`#624 voice-page-modularity`).
+ */
+const filterChanges = createFilterChanges();
 
 /** How many older pages a filter change reads, at most, to find the message it is keeping. */
 const FILTER_WALK_PAGES = 10;
@@ -4973,8 +4974,7 @@ const FILTER_WALK_STATUS = "Loading earlier messages…";
  * said something else there since.
  */
 function endFilterWalk() {
-  if (filterWalk === null) return;
-  filterWalk = null;
+  if (!filterChanges.endWalk()) return;
   inColumn(columns.main, renderOlderControl);
   if (!el("status-line").hidden && el("status").textContent === FILTER_WALK_STATUS) dismissStatus();
 }
@@ -5181,7 +5181,7 @@ function filterAnchor() {
  * @returns {T}
  */
 function keepingFilterPlace(change) {
-  if (filterChanging > 0) return change();
+  if (filterChanges.changing()) return change();
   /** @type {Array<[ColumnFields, FilterAnchor | null, boolean]>} */
   const kept = [];
   eachColumn(() => {
@@ -5193,13 +5193,7 @@ function keepingFilterPlace(change) {
   });
   // A walk back for an earlier change is over: this one decides where the reader goes.
   endFilterWalk();
-  filterChanging += 1;
-  let result;
-  try {
-    result = change();
-  } finally {
-    filterChanging -= 1;
-  }
+  const result = filterChanges.whileChanging(change);
   const place = (landed = false) => {
     for (const [column, anchor, wasEmptied] of kept) {
       if (column === columns.side && !sideShowing()) continue;
@@ -5346,10 +5340,9 @@ function olderThanLoaded(anchor) {
 async function walkToFilterAnchor(anchor) {
   // `#262 search-load-older`. A walk for the search gives way to this one.
   endSearchWalks();
-  const walk = { context: channelContextKey() };
-  filterWalk = walk;
+  const walk = filterChanges.startWalk(channelContextKey());
   const area = el("scroll-area");
-  const current = () => filterWalk === walk && walk.context === channelContextKey() && !pinsView().only &&
+  const current = () => filterChanges.isWalk(walk) && walk.context === channelContextKey() && !pinsView().only &&
     screens.screen() === "main" && screens.view() === "discord";
   area.scrollTop = 0;
   renderOlderControl();
@@ -5377,7 +5370,7 @@ async function walkToFilterAnchor(anchor) {
       area.scrollTop = 0;
     }
   } finally {
-    if (filterWalk === walk) {
+    if (filterChanges.isWalk(walk)) {
       const place = !scrolled && walk.context === channelContextKey() && !pinsView().only;
       endFilterWalk();
       if (place) {
@@ -5397,7 +5390,7 @@ async function walkToFilterAnchor(anchor) {
  */
 function settlePendingFilterPlace() {
   const hold = filterState().hold;
-  if (hold === null || hold.ids !== null || hold.key !== filterKey() || listEmptied() || filterChanging > 0) return;
+  if (hold === null || hold.ids !== null || hold.key !== filterKey() || listEmptied() || filterChanges.changing()) return;
   placeFilterAnchor(hold.origin, true);
 }
 
@@ -21651,7 +21644,7 @@ function renderOlderControl() {
   if (button.hidden !== hidden) button.hidden = hidden;
   // `#243 filter-keeps-selection`. A walk back to the message a filter change is keeping says what it
   // is doing, where the reader waits for it.
-  const walking = filterWalk !== null && !columnWork.side();
+  const walking = filterChanges.walking() && !columnWork.side();
   const offered = !walking && walk === null && searchOffered();
   // A tap while a step of the scroll's is on the wire starts the search, which takes that step as its
   // first page; and a walk under way is stopped by one, unless it is already stopping.
@@ -21881,7 +21874,7 @@ function renderSearchOlderNote() {
  */
 function searchWalkHolds(walk, column) {
   return !walk.ended && column.searchWalk === walk && searchKey() === walk.key &&
-    channelContextKey() === walk.context && replyJumpTicket === walk.ticket && filterWalk === null &&
+    channelContextKey() === walk.context && replyJumpTicket === walk.ticket && !filterChanges.walking() &&
     (column !== columns.side || sideShowing());
 }
 
@@ -21954,7 +21947,7 @@ function searchWalkNote(walk, reason, failure = null) {
  * this section stop it, and say what it found. Does nothing where the step back does not offer it.
  */
 function searchOlder() {
-  if (!searchOffered() || columnWork.active().searchWalk || (filterWalk !== null && !columnWork.side())) return Promise.resolve();
+  if (!searchOffered() || columnWork.active().searchWalk || (filterChanges.walking() && !columnWork.side())) return Promise.resolve();
   const column = columnWork.active();
   // `#229 desktop-two-column`. The column the walk is in, which its work after every wait is done in.
   const steps = columnSteps();
@@ -22110,7 +22103,7 @@ function olderControlPressed() {
     if (Date.now() - walk.started >= SEARCH_OLDER_TAP_MS) stopSearchWalk(columnWork.active());
     return undefined;
   }
-  if (searchOffered() && !(filterWalk !== null && !columnWork.side())) return searchOlder();
+  if (searchOffered() && !(filterChanges.walking() && !columnWork.side())) return searchOlder();
   return loadOlder();
 }
 

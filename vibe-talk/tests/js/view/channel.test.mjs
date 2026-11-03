@@ -732,3 +732,20 @@ test("`#624 voice-page-modularity`: which rows are being built is said only whil
   assert.throws(() => drawing.whileMain(() => { throw new Error("drawn wrong"); }), /drawn wrong/);
   assert.deepStrictEqual([drawing.pinned(), drawing.main()], [false, false], "a throw still stops it");
 });
+
+test("`#624 voice-page-modularity`: a filter change nested in another is one change, and each walk back knows whether it is still the one under way", () => {
+  const { createFilterChanges } = CHANNEL_VIEW;
+  const changes = createFilterChanges();
+  assert.equal(changes.changing(), false);
+  const seen = changes.whileChanging(() => [changes.changing(), changes.whileChanging(() => changes.changing())]);
+  assert.deepStrictEqual([seen, changes.changing()], [[true, true], false]);
+  assert.throws(() => changes.whileChanging(() => { throw new Error("placed wrong"); }), /placed wrong/);
+  assert.equal(changes.changing(), false, "a throw still ends the change");
+  assert.equal(changes.endWalk(), false, "no walk to end");
+  const first = changes.startWalk("c1");
+  assert.deepStrictEqual([first.context, changes.walking(), changes.isWalk(first)], ["c1", true, true]);
+  const second = changes.startWalk("c1");
+  assert.deepStrictEqual([changes.isWalk(first), changes.isWalk(second)], [false, true], "overtaken by another");
+  assert.equal(changes.endWalk(), true);
+  assert.deepStrictEqual([changes.walking(), changes.isWalk(second)], [false, false]);
+});
