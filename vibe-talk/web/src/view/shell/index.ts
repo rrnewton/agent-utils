@@ -9,3 +9,5 @@ export { createUndoStamps } from "./undo.ts";
 export type { UndoStamps } from "./undo.ts";
 export { SCREENS, createScreens } from "./screens.ts";
 export type { Screens } from "./screens.ts";
+export { ACTION_MENU_ITEMS, createActionMenu } from "./actionmenu.ts";
+export type { ActionMenu, ActionMenuDependencies } from "./actionmenu.ts";

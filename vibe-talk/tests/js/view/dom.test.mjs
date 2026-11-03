@@ -232,3 +232,25 @@ test("`#624 voice-page-modularity`: the screens remember where Settings and Help
   screens.setView("discord");
   assert.equal(screens.view(), "discord");
 });
+
+test("`#820 voice-page-action-menu`: the action menu's open state on its opener and the menu together, and its line where no item has work", () => {
+  const { createActionMenu, ACTION_MENU_ITEMS } = VIEW_SHELL;
+  const nodes = {};
+  const node = (hidden) => ({ hidden, attributes: {}, setAttribute(name, value) { this.attributes[name] = value; } });
+  for (const id of ACTION_MENU_ITEMS) nodes[id] = node(true);
+  nodes["action-menu"] = node(true);
+  nodes["action-menu-open"] = node(false);
+  nodes["action-menu-empty"] = node(true);
+  let changes = 0;
+  const menu = createActionMenu({ byId: (id) => nodes[id], changed: () => { changes += 1; } });
+  menu.setOpen(true);
+  assert.deepStrictEqual([menu.open(), nodes["action-menu"].hidden, nodes["action-menu-open"].attributes["aria-expanded"], changes],
+    [true, false, "true", 1]);
+  assert.equal(nodes["action-menu-empty"].hidden, false, "no item has work: the line says so");
+  nodes["expand-all"].hidden = false;
+  menu.render();
+  assert.equal(nodes["action-menu-empty"].hidden, true, "an item with work hides the line");
+  menu.setOpen(false);
+  assert.deepStrictEqual([menu.open(), nodes["action-menu"].hidden, nodes["action-menu-open"].attributes["aria-expanded"], changes],
+    [false, true, "false", 2]);
+});

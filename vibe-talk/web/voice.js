@@ -900,7 +900,7 @@ function openMenus() {
   if (rowMenus.open()) open.push("menu:row");
   if (!el("speed-popover").hidden) open.push("menu:pace");
   if (promptsOpen) open.push("menu:prompts");
-  if (actionMenuOpen) open.push("menu:actions");
+  if (actionMenu.open()) open.push("menu:actions");
   // `#348 settings-dynamic-lists`. The pop-out over Recently dismissed, on Settings.
   if (!el("dismissed-send-popout").hidden) open.push("menu:dismissed");
   return open;
@@ -930,7 +930,7 @@ function closeOpenMenu(name) {
     el("prompts-open").focus();
     return true;
   }
-  if (name === "menu:actions" && actionMenuOpen) {
+  if (name === "menu:actions" && actionMenu.open()) {
     setActionMenuOpen(false);
     el("action-menu-open").focus();
     return true;
@@ -3601,7 +3601,7 @@ function renderScrollTools() {
   // `#204 reply-arrow`. The other way back: to the reply a jump left, while it is off screen.
   el("back-to-reply").hidden = screens.view() !== "discord" || replyReturnRow() === null;
   // `#820 voice-page-action-menu`. Those three are the action menu's items: its empty line follows them.
-  if (actionMenuOpen) renderActionMenu();
+  if (actionMenu.open()) actionMenu.render();
   // `#193 compose-draft-loss`. The way back from a Dismiss in the outbox, on the channel only.
   renderSendUndo();
   // `#420 bookmark-clear`. ...and from taking the bookmark away, in its own channel.
@@ -9245,28 +9245,13 @@ const cannedPrompts = mountCannedPrompts({
  */
 let promptsOpen = false;
 
-/** `#820 voice-page-action-menu`. Whether the list's action menu is open. */
-let actionMenuOpen = false;
-
 /**
- * Open or close the channel's action menu, and say so on its opener. An open menu is a level, with an
+ * `#820 voice-page-action-menu`. The list's action menu, open or not, and its line for a list with nothing to
+ * do: web/src/view/shell `createActionMenu` (`#624 voice-page-modularity`). An open menu is a level, with an
  * entry of its own, as the tray is (`#304 back-gesture-in-app`).
- *
- * @param {boolean} open
  */
-function setActionMenuOpen(open) {
-  actionMenuOpen = open === true;
-  if (actionMenuOpen) renderActionMenu();
-  el("action-menu").hidden = !actionMenuOpen;
-  el("action-menu-open").setAttribute("aria-expanded", actionMenuOpen ? "true" : "false");
-  scheduleBackSync();
-}
-
-/** The menu's line for a list with nothing to expand, collapse or summarize: shown where no item is. */
-function renderActionMenu() {
-  const none = ["expand-all", "collapse-all", "summarise"].every((id) => el(id).hidden);
-  if (el("action-menu-empty").hidden !== !none) el("action-menu-empty").hidden = !none;
-}
+const actionMenu = createActionMenu({ byId: (id) => /** @type {any} */ (el(id)), changed: () => scheduleBackSync() });
+const setActionMenuOpen = actionMenu.setOpen;
 
 /**
  * Open or shut the tray, and say so on the button.
@@ -9802,7 +9787,7 @@ function renderControlBar() {
     setPromptsOpen(false);
   }
   // `#820 voice-page-action-menu`. The same for the channel's action menu.
-  if (el("action-menu-open").hidden && actionMenuOpen) setActionMenuOpen(false);
+  if (el("action-menu-open").hidden && actionMenu.open()) setActionMenuOpen(false);
   const members = [
     el("open-settings"),
     el("view-switch"),
@@ -33104,7 +33089,7 @@ for (const entry of CANNED_PROMPTS) {
 // escape from.
 el("prompts-open").addEventListener("click", () => setPromptsOpen(!promptsOpen));
 // `#820 voice-page-action-menu`. The action menu's opener, a toggle as the tray's is.
-el("action-menu-open").addEventListener("click", () => setActionMenuOpen(!actionMenuOpen));
+el("action-menu-open").addEventListener("click", () => setActionMenuOpen(!actionMenu.open()));
 setActionMenuOpen(false);
 // ...and stated once at load, rather than left to the first tap. The markup ships shut, but shut is
 // a state the opener has to be ASSERTING for a screen reader to hear it — an `aria-expanded` that
