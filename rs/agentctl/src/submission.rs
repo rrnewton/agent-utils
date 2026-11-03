@@ -1482,6 +1482,14 @@ pub(crate) mod fake {
             stage(&mut state, text);
         }
 
+        /// The harness puts another returned prompt back behind the draft
+        /// already in the composer (#825): the placeholders concatenate.
+        pub(crate) fn leave_another_draft(&self, text: &str) {
+            let mut state = self.state();
+            assert!(!state.composer.is_empty(), "the composer must hold a draft");
+            stage(&mut state, text);
+        }
+
         /// Codex's Escape during a turn: the turn ends and every input it held for the turn
         /// moves back into the composer, one after another, where Enter submits them.
         pub(crate) fn interrupt(&self) {
@@ -1507,10 +1515,13 @@ pub(crate) mod fake {
         let newlines = body.matches('\n').count();
         if state.harness == "claude" && newlines >= 3 {
             state.paste_counter += 1;
-            state.placeholder = Some(format!(
-                "[Pasted text #{} +{newlines} lines]",
-                state.paste_counter
-            ));
+            let label = format!("[Pasted text #{} +{newlines} lines]", state.paste_counter);
+            // A second paste behind one already held concatenates its
+            // placeholder, as Claude Code draws it (#825).
+            state.placeholder = Some(match state.placeholder.take() {
+                Some(held) => format!("{held}{label}"),
+                None => label,
+            });
         }
         if state.harness == "codex"
             && state
@@ -4164,6 +4175,34 @@ mod tests {
                 .contains("typed by agentctl for lane-a"),
             "{record}"
         );
+    }
+
+    /// #825 agentctl-stranded-multi-paste: two prompts a working Claude
+    /// Code pane had queued came back as two concatenated placeholders.
+    /// Both labels are recorded deliveries, so the next drain submits the
+    /// pair and delivers its own prompt behind the turn that starts.
+    #[test]
+    fn two_stranded_claude_pastes_are_submitted_by_the_next_drain() {
+        let first = format!("{LANE}\nalpha one\nalpha two\nalpha three\nalpha four");
+        let second = format!("{LANE}\nbravo one\nbravo two\nbravo three\nbravo four");
+        let queue = TypedQueue::new("claude-multi-stranded");
+        queue.typed_drawn("first", &first, 1.0, "[Pastedtext#1+4lines]");
+        queue.typed_drawn("second", &second, 2.0, "[Pastedtext#2+4lines]");
+        let screen = FakeScreen::new("claude", true);
+        screen.leave_draft(&first);
+        screen.leave_another_draft(&second);
+        let drawn = screen.render();
+        assert!(
+            drawn.contains("[Pasted text #1 +4 lines][Pasted text #2 +4 lines]"),
+            "{drawn}"
+        );
+        let owner = format!("{OWNER}\nstatus?");
+        receipt(submit_following(&screen, &queue, &owner, Some("Enter")));
+        assert_eq!(taken(&screen), [format!("{first}{second}"), owner]);
+        for id in ["first", "second"] {
+            let record = queue.record(id);
+            assert!(record["draft_recovered_at"].is_number(), "{id}: {record}");
+        }
     }
 
     /// #731 agentctl-paste-tail-flush: a split paste leaves only its last

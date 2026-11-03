@@ -37,7 +37,11 @@
 //! text shows. The numbered form is stronger: `#K` is the harness's paste counter, and a
 //! history recall draws a recalled prompt as a new paste with a new number, so a draft whose
 //! label exactly matches the last delivery's recorded `paste_label` is agentctl's own however
-//! that delivery was recorded, `processed/` included (#808 agentctl-stranded-draft).
+//! that delivery was recorded, `processed/` included (#808 agentctl-stranded-draft). A
+//! composer holding several returned prompts at once — concatenated placeholders, or a
+//! placeholder beside the literal start of another delivery — is agentctl's when every piece
+//! matches a different recent delivery that way (#825 agentctl-stranded-multi-paste); any
+//! piece that matches nothing makes the whole draft unattributed.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -385,6 +389,13 @@ pub(crate) fn find(
     let Draft::Text(rows) = draft else {
         return None;
     };
+    // A composer made of several pieces agentctl typed (#825): concatenated
+    // paste placeholders, or a placeholder beside the literal start of
+    // another delivery, as a working Claude Code pane puts back the prompts
+    // it had queued behind a turn that ended without taking them.
+    if let Some(found) = composite_match(&records, rows, vouching) {
+        return Some(found);
+    }
     // Several prompts in one draft, as Codex moves the inputs it held for an interrupted turn
     // back into its composer: a run of consecutive deliveries, oldest first, each framed, whose
     // texts the draft holds one after another.
@@ -427,6 +438,125 @@ pub(crate) fn find(
         }
     }
     None
+}
+
+/// One piece of a composer draft, for [`composite_match`].
+enum Segment {
+    /// `[Pasted text #K +M lines]`, as its compact recorded label.
+    Paste(String),
+    /// `[Pasted Content N chars]`.
+    Chars(usize),
+    /// Literal text between placeholders.
+    Literal(String),
+}
+
+/// Split a draft whose text shows into its placeholder and literal pieces,
+/// or `None` when it holds no placeholder at all.
+fn segments(rows: &str) -> Option<Vec<Segment>> {
+    let mut out: Vec<Segment> = Vec::new();
+    let mut literal = String::new();
+    let mut rest = rows;
+    let mut placeholders = 0;
+    while !rest.is_empty() {
+        if rest.starts_with('[') {
+            if let Some(end) = rest.find(']') {
+                let token = &rest[..=end];
+                match Draft::from_composer(token) {
+                    Draft::PastedLines(label) => {
+                        let text = std::mem::take(&mut literal);
+                        if !text.trim().is_empty() {
+                            out.push(Segment::Literal(text));
+                        }
+                        out.push(Segment::Paste(label));
+                        placeholders += 1;
+                        rest = &rest[end + 1..];
+                        continue;
+                    }
+                    Draft::Placeholder(length) => {
+                        let text = std::mem::take(&mut literal);
+                        if !text.trim().is_empty() {
+                            out.push(Segment::Literal(text));
+                        }
+                        out.push(Segment::Chars(length));
+                        placeholders += 1;
+                        rest = &rest[end + 1..];
+                        continue;
+                    }
+                    Draft::Text(_) => {}
+                }
+            }
+        }
+        let mut chars = rest.chars();
+        let Some(first) = chars.next() else { break };
+        literal.push(first);
+        rest = chars.as_str();
+    }
+    if !literal.trim().is_empty() {
+        out.push(Segment::Literal(literal));
+    }
+    (placeholders > 0 && out.len() > 1).then_some(out)
+}
+
+/// Whether a composer made only of pieces agentctl typed is agentctl's
+/// (#825): every placeholder must name a recorded delivery (a numbered
+/// label exactly, as in [`find`]; a character count under the same rule as
+/// a single placeholder), and every literal piece must be the start of a
+/// framed recorded delivery, each piece a different delivery. Anything
+/// else in the composer attributes nothing.
+fn composite_match(records: &[Record], rows: &str, vouching: Vouching) -> Option<TypedPrompt> {
+    // `records` is already bounded: the latest few deliveries whose files
+    // changed within the text lookback.
+    let segments = segments(rows)?;
+    let mut used: Vec<&PathBuf> = Vec::new();
+    let mut matched: Vec<&Record> = Vec::new();
+    for segment in &segments {
+        let found = records.iter().find(|record| {
+            if used.contains(&&record.1) {
+                return false;
+            }
+            let quarantined = record
+                .1
+                .parent()
+                .and_then(Path::file_name)
+                .is_some_and(|phase| phase == "failed");
+            typed_texts(&record.2).into_iter().any(|text| {
+                if !framed(text) {
+                    return false;
+                }
+                match segment {
+                    Segment::Paste(label) => record
+                        .2
+                        .get("paste_label")
+                        .and_then(Value::as_str)
+                        .is_some_and(|held| held == label),
+                    Segment::Chars(length) => {
+                        paste_length(text) == *length
+                            && (vouching == Vouching::Recent || quarantined)
+                    }
+                    Segment::Literal(literal) => {
+                        let start = without_sent_fields(&compact(literal));
+                        !start.is_empty() && without_sent_fields(&compact(text)).starts_with(&start)
+                    }
+                }
+            })
+        })?;
+        used.push(&found.1);
+        matched.push(found);
+    }
+    let last = matched
+        .iter()
+        .max_by(|left, right| left.0.total_cmp(&right.0))?;
+    let mut rest: Vec<&Record> = matched
+        .iter()
+        .copied()
+        .filter(|record| record.1 != last.1)
+        .collect();
+    rest.sort_by(|left, right| left.0.total_cmp(&right.0));
+    let others: Vec<(String, PathBuf)> = rest
+        .iter()
+        .map(|record| (message_id(&record.1), record.1.clone()))
+        .collect();
+    Some(typed_prompt(&last.1, &last.2, others))
 }
 
 /// The queue message ID a record's file name holds.
@@ -882,6 +1012,80 @@ message number {index:02}"
             &Draft::from_composer("[Pasted text #179 +4 lines]"),
             Vouching::Unproven,
             now
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn two_stranded_placeholders_from_two_deliveries_are_ours_together() {
+        // #825: two prompts queued behind a working Claude Code turn came
+        // back into the composer as two concatenated paste placeholders.
+        let directory = Scratch::new("multi-stranded");
+        let queue = directory.0.as_path();
+        let first = format!("{HEADER}\none");
+        let second = format!("{HEADER}\none\ntwo\nthree\nfour");
+        record(
+            queue,
+            "processed",
+            "first",
+            &json!({"text": first, "inflight_at": 1.0, "paste_label": "[Pastedtext#231+1lines]"}),
+        );
+        record(
+            queue,
+            "processed",
+            "second",
+            &json!({"text": second, "inflight_at": 2.0, "paste_label": "[Pastedtext#232+4lines]"}),
+        );
+        let found = find(
+            queue,
+            &Draft::from_composer("[Pasted text #231 +1 lines][Pasted text #232 +4 lines]"),
+            Vouching::Unproven,
+            SystemTime::now(),
+        )
+        .expect("both placeholders are recorded deliveries");
+        assert_eq!(found.id, "second");
+        assert_eq!(found.others.len(), 1);
+        assert_eq!(found.others[0].0, "first");
+    }
+
+    #[test]
+    fn a_placeholder_followed_by_the_start_of_another_delivery_is_ours() {
+        // #825: a stranded paste, then the literal start of a second
+        // delivery that came back into the composer as text.
+        let directory = Scratch::new("paste-then-text");
+        let queue = directory.0.as_path();
+        let first = format!("{HEADER}\none\ntwo\nthree\nfour");
+        let second = format!("{HEADER}\nbody of the second prompt follows here");
+        record(
+            queue,
+            "processed",
+            "first",
+            &json!({"text": first, "inflight_at": 1.0, "paste_label": "[Pastedtext#233+4lines]"}),
+        );
+        record(
+            queue,
+            "processed",
+            "second",
+            &json!({"text": second, "inflight_at": 2.0}),
+        );
+        let draft = format!("[Pasted text #233 +4 lines]{second}");
+        let found = find(
+            queue,
+            &Draft::from_composer(&draft),
+            Vouching::Unproven,
+            SystemTime::now(),
+        )
+        .expect("placeholder plus delivered text is ours");
+        assert_eq!(found.id, "second");
+        assert_eq!(found.others.len(), 1);
+        // The same placeholder in front of a person's own words attributes
+        // nothing: the literal part is no delivery's start.
+        let foreign = "[Pasted text #233 +4 lines]my own half-written note";
+        assert!(find(
+            queue,
+            &Draft::from_composer(foreign),
+            Vouching::Unproven,
+            SystemTime::now()
         )
         .is_none());
     }
