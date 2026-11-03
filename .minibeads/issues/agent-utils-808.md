@@ -1,6 +1,6 @@
 ---
 title: 'agentctl-stranded-draft-blocks-delivery: an agentctl-typed draft left in a working composer blocks every later delivery'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: mu-restore2@devbig030
@@ -8,7 +8,8 @@ labels:
 - agentctl
 - agent-teams
 created_at: 2026-11-03T06:59:31.858965183+00:00
-updated_at: 2026-11-03T06:59:31.858965183+00:00
+updated_at: 2026-11-03T13:14:49.028797878+00:00
+closed_at: 2026-11-03T13:14:49.028797718+00:00
 ---
 
 # Description
