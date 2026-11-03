@@ -1108,15 +1108,9 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             .and_then(|(name, designation)| self.designated_generation_process(name, designation));
         let record = self.load(agent_name)?;
         // Never designate a target that never started (#747): a half-failed handover
-        // would strand inter-team delivery on a dead record.
-        let dead = record.lifecycle == "launch_failed"
-            || record
-                .harness_anchor()
-                .or(record.custom_process_identity.as_ref())
-                .is_some_and(|identity| {
-                    self.client.process_liveness(identity) == ProcessLiveness::Dead
-                });
-        if dead {
+        // would strand inter-team delivery on a launch_failed record. A running record
+        // whose harness died stays designatable: the designation follows its revive.
+        if record.lifecycle == "launch_failed" {
             return Err(fail(format!(
                 "coordinator target {agent_name:?} is not alive (lifecycle {}); start or revive it first",
                 record.lifecycle

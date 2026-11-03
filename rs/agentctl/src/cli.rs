@@ -418,6 +418,12 @@ struct Restore {
     /// Startup-readiness deadline for each revived harness in seconds, greater than 0 and at most 300 (default: 30)
     #[arg(long, default_value = "30", value_parser = startup_seconds, value_name = "SECONDS")]
     startup_timeout: f64,
+    /// Write the desired-state agents list in restore.json from the live non-coordinator records: previews the change and writes nothing unless --apply is also given. Example: agentctl restore --write-agents --apply
+    #[arg(long, conflicts_with_all = ["boot", "force", "dry_run"])]
+    write_agents: bool,
+    /// Actually write restore.json (with --write-agents); without it the change is only previewed
+    #[arg(long, requires = "write_agents")]
+    apply: bool,
 }
 
 #[derive(Args)]
@@ -3029,6 +3035,11 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             .map_err(Failure::Inbox);
         }
         Commands::Restore(value) => {
+            if value.write_agents {
+                let report = crate::restore::spec_write_agents(&args.registry, value.apply)?;
+                write_json(&report).map_err(Failure::Output)?;
+                return Ok(0);
+            }
             let client = HerdrClient::with_executable("direct", &args.herdr_bin)
                 .map_err(AgentError::from)?;
             let mut config = crate::restore::RestoreConfig::load(&args.registry)?;

@@ -1287,6 +1287,65 @@ fn notice_text(report: &Value, boot_time: Option<u64>, path: &Path) -> String {
 }
 
 /// Run the restore and return its report; the report is also written unless `dry_run`.
+/// Refresh the desired-state `agents` list in `<registry>/restore.json` from the live,
+/// non-coordinator records (#742 spec slice). Preview by default; `apply` writes
+/// atomically, preserving every other key. Creates a minimal file when none exists.
+pub fn spec_write_agents(registry: &Path, apply: bool) -> Result<Value> {
+    let config = RestoreConfig::load(registry)?;
+    let coordinator = config.coordinator.clone().or_else(|| {
+        let text = fs::read_to_string(registry.join("coordinator.json")).ok()?;
+        serde_json::from_str::<Value>(&text).ok()?["name"]
+            .as_str()
+            .map(str::to_owned)
+    });
+    let mut desired: Vec<String> = Vec::new();
+    for name in registered_names(registry)? {
+        if coordinator.as_deref() == Some(name.as_str()) {
+            continue;
+        }
+        let directory = agent_queue::registry::directory(registry, &name)
+            .map_err(|error| fail(error.to_string()))?;
+        let Ok(text) = fs::read_to_string(directory.join("agent.json")) else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        if record["lifecycle"] == "running" {
+            desired.push(name);
+        }
+    }
+    desired.sort();
+    let before = config.agents.clone().unwrap_or_default();
+    let added: Vec<&String> = desired.iter().filter(|n| !before.contains(n)).collect();
+    let removed: Vec<&String> = before.iter().filter(|n| !desired.contains(n)).collect();
+    if apply {
+        let path = registry.join(CONFIG_FILE);
+        let mut document: Value = fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_else(|| {
+                let mut document = json!({"schema": CONFIG_SCHEMA});
+                if let Some(name) = coordinator.as_ref() {
+                    document["coordinator"] = json!(name);
+                }
+                document
+            });
+        document["agents"] = json!(desired);
+        crate::agent::atomic_json(&path, &document)?;
+    }
+    Ok(json!({
+        "action": if apply { "written" } else { "preview" },
+        "coordinator": coordinator,
+        "before": before,
+        "after": desired,
+        "added": added,
+        "removed": removed,
+    }))
+}
+
+/// Repair whatever differs from the desired state: revive the coordinator, then the
+/// agents, then start the units, and write the per-boot report.
 pub fn restore<A: ManagedApi + ?Sized>(
     client: &A,
     registry: &Path,
@@ -2253,6 +2312,36 @@ mod tests {
         .unwrap();
         assert_eq!(row["generation"], 3);
         assert_eq!(*host.status_calls.borrow(), 2);
+    }
+
+    #[test]
+    fn spec_write_agents_previews_then_writes_only_the_agents_key() {
+        let registry = std::env::temp_dir().join(format!("spec-agents-{}", std::process::id()));
+        let live = registry.join("agents").join("lane");
+        let dead = registry.join("agents").join("done");
+        fs::create_dir_all(&live).unwrap();
+        fs::create_dir_all(&dead).unwrap();
+        fs::write(live.join("agent.json"), "{\"lifecycle\":\"running\"}").unwrap();
+        fs::write(dead.join("agent.json"), "{\"lifecycle\":\"stopped\"}").unwrap();
+        fs::write(
+            registry.join(CONFIG_FILE),
+            "{\"schema\":\"agentctl-restore/v1\",\"coordinator\":\"lead\",\"units\":[\"b.service\"]}",
+        )
+        .unwrap();
+        let preview = spec_write_agents(&registry, false).unwrap();
+        assert_eq!(preview["action"], "preview");
+        assert_eq!(preview["after"], json!(["lane"]));
+        assert!(fs::read_to_string(registry.join(CONFIG_FILE))
+            .unwrap()
+            .contains("b.service"));
+        let written = spec_write_agents(&registry, true).unwrap();
+        assert_eq!(written["action"], "written");
+        let document: Value =
+            serde_json::from_str(&fs::read_to_string(registry.join(CONFIG_FILE)).unwrap()).unwrap();
+        assert_eq!(document["agents"], json!(["lane"]));
+        assert_eq!(document["units"], json!(["b.service"]));
+        assert_eq!(document["coordinator"], "lead");
+        let _ = fs::remove_dir_all(&registry);
     }
 
     #[test]
