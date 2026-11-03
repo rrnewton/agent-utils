@@ -12,6 +12,7 @@
 export {
   createGathering,
   createParsedQueries,
+  createRepliesWalk,
   createSearchField,
   createServerSearch,
   searchQueryMatches,

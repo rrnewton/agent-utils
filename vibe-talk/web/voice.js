@@ -22930,7 +22930,7 @@ function searchOlderFromField() {
     const left = columnsShown && inColumn(columns.main, () => searchOffered() && columns.main.searchWalk === null);
     const cards = !left || lastPane === sidePane;
     // The cards' walk under way is not the left column's to end.
-    if (cards && repliesWalk !== null) return false;
+    if (cards && repliesWalks.current() !== null) return false;
     if (cards && repliesSearchOffered()) {
       guardQuietly(searchReplies)();
       return true;
@@ -23259,11 +23259,8 @@ function chooseSearchAllChannels(on) {
 //
 // THE PAGE ONLY. It reads All's older pages as a step back in All does; nothing on the server is new.
 
-/** The cards' walk back through All's older pages for the search, while one is under way, or null. */
-let repliesWalk = null;
-
-/** What the last cards' walk found, under its control, until the search changes, or null. */
-let repliesNote = /** @type {{key: string, text: string} | null} */ (null);
+// The cards' walk under way and what the last one found, and the walk itself: one owner in
+// web/src/core/search/replies.ts (`#624 voice-page-modularity`), made below where its parts are.
 
 /** Everything the cards' walk depends on: a change in either ends it, and clears its note. */
 const repliesKey = () => JSON.stringify([String(selectedChannelId()), searchField.open() ? searchIdentity(searchField.query()) : null]);
@@ -23303,19 +23300,12 @@ const cardsFound = () => /** @type {HTMLElement[]} */ ([...leftEl("side-cards").
 
 /** Whether cards' walk `walk` is still the reader's: the same search, the same store, the cards still up. */
 function repliesWalkHolds(walk) {
-  return !walk.ended && repliesWalk === walk && repliesKey() === walk.key && channelStore.current() === walk.canon &&
-    sideColumnUp() && columns.side.mode === "list";
+  return repliesWalks.holds(walk);
 }
 
 /** End the cards' walk where it is, saying nothing of it; its read on the wire is aborted. Its promise, or null. */
 function endRepliesWalk() {
-  const walk = repliesWalk;
-  if (!walk) return null;
-  walk.ended = true;
-  repliesWalk = null;
-  if (walk.controller) walk.controller.abort();
-  renderRepliesSearch();
-  return walk.promise;
+  return repliesWalks.end();
 }
 
 /**
@@ -23324,12 +23314,13 @@ function endRepliesWalk() {
  * ends first. The reader's place in the cards is kept as either comes or goes (`keepingCardPlace`).
  */
 function renderRepliesSearch() {
-  if (repliesWalk && !repliesWalkHolds(repliesWalk)) {
+  const under = repliesWalks.current();
+  if (under && !repliesWalkHolds(under)) {
     endRepliesWalk();
     return;
   }
-  const walk = repliesWalk;
-  if (repliesNote && repliesNote.key !== repliesKey()) repliesNote = null;
+  const walk = repliesWalks.current();
+  const said = repliesWalks.noteFor(repliesKey);
   const button = /** @type {HTMLButtonElement} */ (leftEl("side-search-replies"));
   const note = leftEl("side-replies-note");
   const offered = walk !== null || repliesSearchOffered();
@@ -23341,7 +23332,6 @@ function renderRepliesSearch() {
     const floor = repliesFloor();
     label = floor === null ? "Search thread replies" : `Search replies before ${searchMomentWords(floor)}`;
   }
-  const said = repliesNote ? repliesNote.text : "";
   const draw = () => {
     if (button.hidden === offered) button.hidden = !offered;
     setTextIfChanged(note, said);
@@ -23431,145 +23421,70 @@ function repliesEndNote(walk, reason, failure = null) {
 }
 
 /**
+ * The cards' walk back through All's older pages for the search, while one is under way, and what the last
+ * one found (web/src/core/search `createRepliesWalk`, `#624 voice-page-modularity`): the bounds at the head
+ * of this section, the reads, and how it ended. Reading a page, folding it and drawing the control are here.
+ */
+const repliesWalks = createRepliesWalk({
+  now: () => Date.now(),
+  pages: SEARCH_OLDER_PAGES,
+  budgetMs: SEARCH_OLDER_MS,
+  hits: SEARCH_OLDER_HITS,
+  tapMs: SEARCH_OLDER_TAP_MS,
+  offered: () => repliesSearchOffered(),
+  endOthers: () => {
+    const others = [endSearchWalk(columns.main), endSearchWalk(columns.side)].filter((one) => one !== null);
+    endFilterWalk();
+    return others;
+  },
+  cursor: () => {
+    const cover = allCover();
+    return cover && cover.live && cover.more === true ? cover.cursor || null : null;
+  },
+  key: () => repliesKey(),
+  canon: () => channelStore.current(),
+  channel: () => String(selectedChannelId()),
+  cardsFound: () => cardsFound(),
+  controller: () => (typeof AbortController === "function" ? new AbortController() : null),
+  matcher: () => {
+    const node = searchParsed(searchField.query()).node;
+    return (message) => node !== null && messageMatches(node, message);
+  },
+  threadOf: (message) => threadOf(message),
+  isRoot: (message) => /** @type {any} */ (message).thread.is_root,
+  allLoaded: () => allLoaded(),
+  holds: (walk) => repliesKey() === walk.key && channelStore.current() === walk.canon &&
+    sideColumnUp() && columns.side.mode === "list",
+  heldNow: () => heldNow(channelStore.current()),
+  read: (channel, before, signal) => readTimeline(
+    `/api/v1/channels/${encodeURIComponent(channel)}/timeline?view=flat&limit=${DISCORD_PAGE_LIMIT}` +
+    `${before === null ? "" : `&before=${encodeURIComponent(before)}`}&reason=search`,
+    // The signal of the `AbortController` made by `controller` above.
+    signal ? { signal: /** @type {AbortSignal} */ (signal) } : undefined),
+  // The page read is the timeline response `read` brought (`readTimeline`).
+  fold: (page, newest, held, walk) => foldRepliesPage(/** @type {VibeTalk.TimelineResponse} */ (page), newest,
+    /** @type {any} */ (held), walk),
+  render: () => renderRepliesSearch(),
+  failed: () => setStatus("Could not search further back — try again."),
+  ending: (walk, reason, failure) => repliesWalkNote(walk, reason, failure),
+});
+
+/**
  * Search the cards' threads' older replies: read All's older pages into the store until the bounds at
  * the head of this section stop it, and say what it found. Does nothing where the cards do not offer it.
  */
 function searchReplies() {
-  if (!repliesSearchOffered() || repliesWalk !== null) return Promise.resolve();
-  // One at a time on the page: a column's walk ends, and is waited for, so two reads never overlap. A
-  // filter change's walk back gives way.
-  const others = [endSearchWalk(columns.main), endSearchWalk(columns.side)].filter((one) => one !== null);
-  endFilterWalk();
-  const cover = allCover();
-  const walk = {
-    key: repliesKey(),
-    canon: channelStore.current(),
-    channel: String(selectedChannelId()),
-    // The cards found already, which nothing this walk reads is counted as having found.
-    held: new Set(cardsFound()),
-    // The threads the pages it read brought a message of: only their cards are its finds.
-    brought: /** @type {Set<string>} */ (new Set()),
-    // The threads of the replies it read that say every word of the search.
-    matched: /** @type {Set<string>} */ (new Set()),
-    // Where All goes on back from: its own cursor while it is live, else the one its newest page gives.
-    cursor: /** @type {string | null} */ (cover && cover.live && cover.more === true ? cover.cursor || null : null),
-    cursorRead: false,
-    pages: 0,
-    read: 0,
-    found: 0,
-    arrived: 0,
-    started: Date.now(),
-    controller: typeof AbortController === "function" ? new AbortController() : null,
-    stopping: false,
-    ended: false,
-    promise: /** @type {Promise<void> | null} */ (null),
-  };
-  repliesWalk = walk;
-  repliesNote = null;
-  renderRepliesSearch();
-  const count = () => {
-    walk.found = cardsFound().filter((id) => !walk.held.has(id) && walk.brought.has(id)).length;
-  };
-  const node = searchParsed(searchField.query()).node;
-  /** @param {VibeTalk.TimelineResponse} payload */
-  const note = (payload) => {
-    for (const message of payload.messages || []) {
-      const id = threadOf(message);
-      if (!id) continue;
-      walk.brought.add(id);
-      // `#606 server-side-search`: a reply the shared language matches, on its own.
-      if (!message.thread.is_root && node !== null && messageMatches(node, message)) walk.matched.add(id);
-    }
-  };
-  walk.promise = (async () => {
-    let reason = "done";
-    /** @type {unknown} what the read that failed threw */
-    let failure = null;
-    try {
-      if (others.length > 0) await Promise.all(others.map((one) => one.catch(() => {})));
-      let last = 0;
-      while (walk.pages < SEARCH_OLDER_PAGES) {
-        if (!repliesWalkHolds(walk) || walk.stopping) break;
-        if (allLoaded()) {
-          reason = "start";
-          break;
-        }
-        if (walk.pages > 0 && Date.now() - walk.started + last > SEARCH_OLDER_MS) {
-          reason = "budget";
-          break;
-        }
-        const owed = walk.cursor === null;
-        if (owed && walk.cursorRead) {
-          reason = "nowhere";
-          break;
-        }
-        walk.cursorRead = walk.cursorRead || owed;
-        if (!owed) walk.pages += 1;
-        renderRepliesSearch();
-        const held = owed ? heldNow(channelStore.current()) : null;
-        const path = `/api/v1/channels/${encodeURIComponent(walk.channel)}/timeline?view=flat&limit=${DISCORD_PAGE_LIMIT}` +
-          `${owed ? "" : `&before=${encodeURIComponent(String(walk.cursor))}`}&reason=search`;
-        const began = Date.now();
-        const payload = await readTimeline(path, walk.controller ? { signal: walk.controller.signal } : undefined);
-        if (!owed) last = Date.now() - began;
-        if (!repliesWalkHolds(walk)) break;
-        foldRepliesPage(payload, owed, held, walk);
-        note(payload);
-        walk.cursor = payload.has_more === true ? payload.next_before || null : null;
-        if (!owed) {
-          walk.read += 1;
-          walk.arrived += (payload.messages || []).length;
-        }
-        count();
-        // How many have come so far, on the control (`searchWalkProgress`).
-        renderRepliesSearch();
-        if (walk.stopping || walk.found >= SEARCH_OLDER_HITS) break;
-      }
-      if (walk.stopping) reason = "stopped";
-      else if (reason === "done" && allLoaded()) reason = "start";
-    } catch (error) {
-      if (walk.ended || walk.stopping || (walk.controller && walk.controller.signal.aborted)) {
-        reason = walk.stopping ? "stopped" : "done";
-      } else {
-        reason = "failed";
-        failure = error;
-        // The failure itself is reported where every failed read is; this says the search stopped, and
-        // the note under the control says why (`repliesEndNote`).
-        setStatus("Could not search further back — try again.");
-        throw error;
-      }
-    } finally {
-      if (repliesWalk === walk) {
-        // A walk another search, another list or another channel has taken over from says nothing there.
-        const holds = repliesWalkHolds(walk);
-        if (holds) count();
-        repliesWalk = null;
-        const text = holds ? repliesWalkNote(walk, reason, failure) : "";
-        repliesNote = text ? { key: walk.key, text } : null;
-        renderRepliesSearch();
-      }
-    }
-  })();
-  return walk.promise;
+  return repliesWalks.search();
 }
 
 /** Stop the cards' walk at the end of the read on the wire, which is aborted; its control says "Stopping…". */
 function stopRepliesWalk() {
-  const walk = repliesWalk;
-  if (!walk || walk.stopping) return;
-  walk.stopping = true;
-  if (walk.controller) walk.controller.abort();
-  renderRepliesSearch();
+  repliesWalks.stop();
 }
 
 /** The cards' control pressed: Stop while a walk is under way (not in its first moments), else a walk. */
 function repliesControlPressed() {
-  const walk = repliesWalk;
-  if (walk) {
-    if (Date.now() - walk.started >= SEARCH_OLDER_TAP_MS) stopRepliesWalk();
-    return undefined;
-  }
-  return searchReplies();
+  return repliesWalks.pressed();
 }
 
 /**
@@ -31103,7 +31018,7 @@ function resetSideColumn(reopen = false) {
   columns.side.searchNote = null;
   // `#262 search-load-older`. And the cards' walk, and what the last one found: they were this channel's.
   endRepliesWalk();
-  repliesNote = null;
+  repliesWalks.forgetNote();
   inColumn(columns.side, () => {
     dropReplyArrowTap();
     gatherState().gathered = null;

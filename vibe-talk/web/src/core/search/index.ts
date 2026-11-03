@@ -27,3 +27,5 @@ export { SEARCH_MARK_DELAY_MS, createSearchField } from "./field.ts";
 export type { SearchField, SearchFieldDependencies } from "./field.ts";
 export { createParsedQueries } from "./parsed.ts";
 export type { ParsedQueries, ParsedQuery } from "./parsed.ts";
+export { createRepliesWalk } from "./replies.ts";
+export type { RepliesPage, RepliesWalk, RepliesWalkDependencies, RepliesWalkState } from "./replies.ts";

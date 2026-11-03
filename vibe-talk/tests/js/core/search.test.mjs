@@ -179,3 +179,80 @@ test("`#624 voice-page-modularity`: the Links filter is the search field's, off 
   field.setLinks(false);
   assert.equal(field.links(), false);
 });
+
+test("`#624 voice-page-modularity`: the cards' walk reads All back within its bounds, counts its finds, and says how it ended", async () => {
+  const { createRepliesWalk } = SEARCH;
+  let now = 0;
+  let cards = ["T0"];
+  let offered = true;
+  let holding = true;
+  const reads = [];
+  const pages = [];
+  const said = [];
+  let renders = 0;
+  const walks = createRepliesWalk({
+    now: () => now, pages: 3, budgetMs: 15000, hits: 2, tapMs: 500,
+    offered: () => offered,
+    endOthers: () => [],
+    cursor: () => null,
+    key: () => "k1",
+    canon: () => "store",
+    channel: () => "C1",
+    cardsFound: () => cards,
+    controller: () => null,
+    matcher: () => (message) => message.text.includes("kestrel"),
+    threadOf: (message) => message.thread,
+    isRoot: (message) => message.root === true,
+    allLoaded: () => false,
+    holds: () => holding,
+    heldNow: () => "held",
+    read: async (channel, before) => { reads.push([channel, before]); return pages.shift(); },
+    fold: (page, newest, held) => { if (newest) assert.equal(held, "held"); },
+    render: () => { renders += 1; },
+    failed: () => said.push("failed"),
+    ending: (walk, reason) => `${reason}: ${walk.found} found, ${walk.matched.size} matched, ${walk.read} read`,
+  });
+  pages.push(
+    { messages: [], has_more: true, next_before: "c1" },
+    { messages: [{ thread: "T1", text: "kestrel", root: false }], has_more: true, next_before: "c2" },
+    { messages: [{ thread: "T2", text: "owl", root: false }], has_more: true, next_before: "c3" },
+  );
+  const going = walks.search();
+  assert.notEqual(walks.current(), null);
+  assert.equal(await walks.search(), undefined, "one walk at a time");
+  cards = ["T0", "T1", "T2"];
+  await going;
+  assert.deepStrictEqual(reads, [["C1", null], ["C1", "c1"], ["C1", "c2"]], "All's newest first where it has no cursor, then back");
+  assert.equal(walks.current(), null);
+  assert.equal(walks.noteFor(() => "k1"), "done: 2 found, 1 matched, 2 read", "it ended on the page bringing its second find");
+  assert.equal(walks.noteFor(() => "k2"), "", "a change of search forgets the note");
+  assert.ok(renders > 0);
+  offered = false;
+  await walks.search();
+  assert.equal(walks.current(), null, "nothing where the cards do not offer it");
+  offered = true;
+  pages.push({ messages: [], has_more: true, next_before: "c1" });
+  let release;
+  pages.push(new Promise((resolve) => { release = resolve; }));
+  const stopped = walks.search();
+  await new Promise((resolve) => setImmediate(resolve));
+  walks.pressed();
+  assert.equal(walks.current().stopping, false, "a press in the walk's first moments is no Stop");
+  now = 600;
+  walks.pressed();
+  assert.equal(walks.current().stopping, true);
+  release({ messages: [], has_more: true, next_before: "c9" });
+  await stopped;
+  assert.match(walks.noteFor(() => "k1"), /^stopped:/);
+  pages.push({ messages: [], has_more: true, next_before: "c1" });
+  holding = true;
+  const taken = walks.search();
+  holding = false;
+  await taken;
+  assert.equal(walks.noteFor(() => "k1"), "", "a walk something else took over says nothing");
+  holding = true;
+  pages.push(Promise.reject(new Error("refused")));
+  await assert.rejects(walks.search(), /refused/);
+  assert.deepStrictEqual(said, ["failed"]);
+  assert.match(walks.noteFor(() => "k1"), /^failed:/);
+});
