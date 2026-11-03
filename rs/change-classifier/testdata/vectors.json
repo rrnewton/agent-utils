@@ -36,7 +36,9 @@
     {"input": "M\tcore/src/a.rs\nA\tdocs/new.md", "paths": ["core/src/a.rs", "docs/new.md"]},
     {"input": "R087\tcore/src/old.rs\tengine-fast/src/new.rs", "paths": ["core/src/old.rs", "engine-fast/src/new.rs"], "note": "a rename counts both sides"},
     {"input": "C100\tsrc/a.rs\tsrc/b.rs", "paths": ["src/a.rs", "src/b.rs"]},
-    {"input": "plain/path.rs\n\nD\tgone.rs", "paths": ["plain/path.rs", "gone.rs"], "note": "bare paths pass through; blank lines are skipped"}
+    {"input": "plain/path.rs\n\nD\tgone.rs", "paths": ["plain/path.rs", "gone.rs"], "note": "bare paths pass through; blank lines are skipped"},
+    {"input": "README.md", "paths": ["README.md"], "note": "a bare path starting with R is a path, not a rename status"},
+    {"input": "Cargo.lock\nCHANGELOG.md\nM\tcore/src/a.rs", "paths": ["Cargo.lock", "CHANGELOG.md", "core/src/a.rs"], "note": "nor is one starting with C a copy status: dropping it could hide a path that forces the full suite"}
   ],
   "policies": {
     "sample": {

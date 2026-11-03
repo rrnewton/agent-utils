@@ -187,6 +187,36 @@ fn classify_reads_paths_from_arguments_or_standard_input() {
     let got: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(got["verdict"], "full");
     assert_eq!(got["unknown"], serde_json::json!(["scripts/new.sh"]));
+    // A bare path is a path whatever letter it starts with: `Cargo.lock` is not a copy status,
+    // and dropping it would select only the command-line tests.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_change-classify"))
+        .args([
+            "classify",
+            "--policy",
+            policy.to_str().unwrap(),
+            "--paths",
+            "-",
+            "--json",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"Cargo.lock\ncli/src/main.rs\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let got: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(got["verdict"], "full", "{got}");
+    assert!(
+        got["reasons"]
+            .to_string()
+            .contains("Cargo.lock → force_full"),
+        "{got}"
+    );
     // No paths at all is a usage error, not a verdict.
     let out = classify_bin(&["classify", "--policy", policy.to_str().unwrap()], &dir);
     assert_eq!(out.status.code(), Some(2));

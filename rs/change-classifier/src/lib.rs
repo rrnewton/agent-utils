@@ -508,28 +508,25 @@ pub fn classify(policy: &Policy, paths: &[String]) -> Classification {
 }
 
 /// Parse `git diff --name-status` output into changed paths, counting both sides of a rename
-/// or copy (its source may be in another component than its destination). A line holding only
-/// a path passes through.
+/// or copy (its source may be in another component than its destination). A line without a tab
+/// is a bare path and passes through whole, whatever letter it starts with (`README.md` and
+/// `Cargo.lock` are paths, not rename or copy statuses).
 pub fn parse_name_status(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     for line in text.lines() {
-        let mut fields = line.split('\t');
-        let Some(first) = fields.next() else {
-            continue;
-        };
-        let status = first.trim();
-        if status.starts_with('R') || status.starts_with('C') {
-            out.extend(
-                fields
-                    .map(str::trim)
-                    .filter(|field| !field.is_empty())
-                    .map(str::to_owned),
-            );
-        } else if let Some(path) = fields.next().or(Some(status)) {
-            let path = path.trim();
+        let Some((status, rest)) = line.split_once('\t') else {
+            let path = line.trim();
             if !path.is_empty() {
                 out.push(path.to_owned());
             }
+            continue;
+        };
+        let status = status.trim();
+        let mut fields = rest.split('\t').map(str::trim);
+        if status.starts_with('R') || status.starts_with('C') {
+            out.extend(fields.filter(|field| !field.is_empty()).map(str::to_owned));
+        } else if let Some(path) = fields.next().filter(|path| !path.is_empty()) {
+            out.push(path.to_owned());
         }
     }
     out
