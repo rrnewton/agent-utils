@@ -586,3 +586,19 @@ test("`#624 voice-page-modularity`: the backlog control asks twice, and disarms 
   assert.equal(timers[2], null);
   assert.equal(drawn, 5);
 });
+
+test("`#624 voice-page-modularity`: the code works on the left column except inside inColumn, which always puts it back", () => {
+  const { createColumnWork } = CHANNEL_VIEW;
+  const columns = { main: { name: "main", left: false }, side: { name: "side", left: false } };
+  const work = createColumnWork(columns);
+  assert.equal(work.active(), columns.main);
+  assert.equal(work.side(), false);
+  const seen = work.inColumn(columns.side, () => [work.active().name, work.side()]);
+  assert.deepStrictEqual(seen, ["side", true]);
+  assert.equal(work.active(), columns.main, "the left column is worked on again");
+  assert.equal(columns.side.left, true, "the right column was worked on and left");
+  assert.equal(columns.main.left, false);
+  assert.throws(() => work.inColumn(columns.side, () => { throw new Error("drawn wrong"); }), /drawn wrong/);
+  assert.equal(work.side(), false, "a throw still puts the left column back");
+  assert.equal(work.inColumn(columns.main, () => "same"), "same", "the column already worked on runs as it is");
+});

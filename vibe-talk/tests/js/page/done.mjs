@@ -1846,7 +1846,7 @@ test("`#306 done-stale-across-views`: the right column's thread, put away with t
   // THE CONTROLS. Without the right column's copy brought into line while it is put away, or without its
   // rows drawn again as it comes back, the reply shows there as not Done.
   const unfollowed = await run(brokenScript(
-    "  if (!sideShowing() && activeColumn !== columns.side && columns.side.left) {", "  if (false) {"));
+    "  if (!sideShowing() && columnWork.active() !== columns.side && columns.side.left) {", "  if (false) {"));
   assert.equal(unfollowed.page.el("side-log").children.find((li) => li.getAttribute("data-id") === "202").getAttribute("data-archived"),
     "false", "without the right column's copy brought into line it showed the Done, so this test cannot see it");
   const undrawn = await run(brokenScript("      if (rowsMissDone()) renderCachedTimeline();\n      return undefined;",

@@ -185,10 +185,15 @@ const columns = {
     rows: freshTimelineRows(), selection: freshSelection(), composer: freshComposerState(), done: freshDoneState(),
     place: freshScrollPlace(), gather: freshGatherState() },
 };
-/** The column the code is working on now. The left one, except inside `inColumn`. */
-let activeColumn = columns.main;
-/** Whether that is the right column, for `el`, which asks on every call. */
-let sideActive = false;
+/**
+ * The column the code is working on now — the left one, except inside `inColumn` — and whether that is the
+ * right one, for `el`, which asks on every call: one owner in web/src/view/channel/columnwork.ts (`#624
+ * voice-page-modularity`). The page destructures `useColumn` and `inColumn` under their old names.
+ *
+ * @type {import("./src/view/channel/index.ts").ColumnWork<ColumnFields>}
+ */
+const columnWork = createColumnWork(columns);
+const { useColumn, inColumn } = columnWork;
 
 /**
  * `#349 channel-settings-all`. The value of Settings' channel picker's first choice, All channels:
@@ -209,7 +214,7 @@ const ALL_CHANNELS = "*";
 function el(id) {
   // The column worked on decides (web/src/view/dom `elementIn`, `#624 voice-page-modularity`).
   // Typed by the id, as the JSDoc above says; the lookup itself answers an HTMLElement.
-  return /** @type {any} */ (elementIn(id, sideActive, COLUMN_IDS));
+  return /** @type {any} */ (elementIn(id, columnWork.side(), COLUMN_IDS));
 }
 
 /**
@@ -944,7 +949,7 @@ function backLevels() {
  * @returns {string[]}
  */
 function screenLevelsNow() {
-  if (sideActive) return inColumn(columns.main, screenLevelsNow);
+  if (columnWork.side()) return inColumn(columns.main, screenLevelsNow);
   const levels = screenLevels(screens.screen());
   // On top of everything, in every browser: see "A MENU IS AN ENTRY TOO".
   levels.push(...openMenus());
@@ -1105,7 +1110,7 @@ const visits = createVisits();
 
 /** The place on the channel now, read in the left column, whose state is the page's; null on the call's view. */
 function channelPlace() {
-  if (sideActive) return inColumn(columns.main, channelPlace);
+  if (columnWork.side()) return inColumn(columns.main, channelPlace);
   if (screens.view() !== "discord") return null;
   const channel = String(selectedChannelId() || "");
   if (!channel) return null;
@@ -1167,7 +1172,7 @@ function placeShowable(place) {
  * @param {ChannelPlace} place
  */
 function showChannelPlace(place) {
-  if (sideActive) return inColumn(columns.main, () => showChannelPlace(place));
+  if (columnWork.side()) return inColumn(columns.main, () => showChannelPlace(place));
   // Arriving, not choosing: Back and Forward, and a link being applied. `#462 webapp-deep-links`.
   return deepLinks.arrive(() => showChannelPlaceWithin(place));
 }
@@ -1221,7 +1226,7 @@ function showPlace(place) {
  * the rule above. Always takes the chord, so it is never the browser's Back or Forward.
  */
 function placeFromKeyboard(step) {
-  if (sideActive) return inColumn(columns.main, () => placeFromKeyboard(step));
+  if (columnWork.side()) return inColumn(columns.main, () => placeFromKeyboard(step));
   const menus = openMenus();
   if (menus.length > 0) {
     closeOpenMenu(menus[menus.length - 1]);
@@ -1746,7 +1751,7 @@ const linkJumps = createLinkJumps();
  * @returns {LinkSpot}
  */
 function linkJumpSpot() {
-  const column = sideActive ? "side" : "main";
+  const column = columnWork.side() ? "side" : "main";
   const place = channelPlace();
   const mark = captureScroll();
   const anchor = mark.anchor;
@@ -2212,7 +2217,7 @@ function freshSelection(view = "thread") {
 
 /** The column being worked on's record of what it is showing (`freshSelection`). */
 function selection() {
-  return activeColumn.selection;
+  return columnWork.active().selection;
 }
 /**
  * A column's own record of the rows its list was last drawn from (`#624 voice-page-modularity`, plan
@@ -2227,7 +2232,7 @@ function freshTimelineRows() {
 
 /** The column being worked on's record of the rows its list was last drawn from (`freshTimelineRows`). */
 function timelineRows() {
-  return activeColumn.rows;
+  return columnWork.active().rows;
 }
 const channelContexts = new Map();
 /**
@@ -2251,7 +2256,7 @@ function freshComposerState() {
 
 /** The column being worked on's record of its message box (`freshComposerState`). */
 function composerState() {
-  return activeColumn.composer;
+  return columnWork.active().composer;
 }
 
 // Local send records never enter the provider message list or its read/archive/reply machinery.
@@ -2303,7 +2308,7 @@ let outgoingSequence = 0;
  * every attempt at one that settles is told (`reportColumnReply`) until it is sent or leaves the
  * outbox. For this page only: a reload shows the outbox as it is, with nothing to tell.
  *
- * @type {Map<string, typeof activeColumn>}
+ * @type {Map<string, ColumnFields>}
  */
 const columnReplies = new Map();
 /**
@@ -2728,7 +2733,7 @@ const scrollKeeping = createScrollKeeping({
   channelView: () => selection().view,
   pinnedOnly: () => pinsView().only,
   heldFilterRow: () => heldFilterRow(),
-  searchWalk: () => activeColumn.searchWalk,
+  searchWalk: () => columnWork.active().searchWalk,
   atBottom: (area) => atBottom(area),
   scrollToNewest: () => scrollToNewest(),
   renderJumpNewest: () => renderJumpNewest(),
@@ -3349,7 +3354,7 @@ function freshScrollPlace() {
 
 /** The column being worked on's record of where its list stands (`freshScrollPlace`). */
 function scrollPlace() {
-  return activeColumn.place;
+  return columnWork.active().place;
 }
 
 /**
@@ -3429,7 +3434,7 @@ function renderJumpNewest() {
     const area = el("scroll-area");
     // `#338 column-overscroll`. From the foot of the rows, the room past it fitted to them first: a reader
     // in that room is at the newest, and is offered no way down to where they already are.
-    if (sideActive) fitOverscroll(area);
+    if (columnWork.side()) fitOverscroll(area);
     const gap = footGap(area);
     if (gap <= BOTTOM_SLACK_PX) {
       // At the newest, which is also all of a list too short to scroll. Nothing is below to jump
@@ -3438,7 +3443,7 @@ function renderJumpNewest() {
       jumpNewestWanted[screens.view()] = false;
       // ...nor a reply that did not go, whose outbox row is down here (`#277 reply-in-column`). Only
       // from a list with a height: a column not drawn is at no foot.
-      if ((area.clientHeight || 0) > 0 && screens.view() === "discord") unseenColumnReplies[activeColumn.name] = null;
+      if ((area.clientHeight || 0) > 0 && screens.view() === "discord") unseenColumnReplies[columnWork.active().name] = null;
     } else if (gap > SCROLLBACK_PX) {
       inScrollback[screens.view()] = true;
     }
@@ -3492,7 +3497,7 @@ function visibleFolds() {
   // the cards' list: the messages unpacked under them, which are folded as a thread's are (`#407
   // unpack-row-parity`), and none where nothing is unpacked, a card being no fold. `#301
   // semicolon-expand-cycle`, whose keys work in either column.
-  const list = sideActive && columns.side.mode !== "thread" ? leftEl("side-cards") : visibleList();
+  const list = columnWork.side() && columns.side.mode !== "thread" ? leftEl("side-cards") : visibleList();
   // Nor the rows of a collapsed run of read messages, whose text is behind its line. `#221 read-modes`.
   return foldsOf(list).filter((entry) => !entry.li.hasAttribute("data-read-run"));
 }
@@ -3510,7 +3515,7 @@ function freshScrollTools() {
 
 /** The column being worked on's record of its scroll tools' pass (`freshScrollTools`). */
 function scrollTools() {
-  return activeColumn.tools;
+  return columnWork.active().tools;
 }
 
 /**
@@ -3537,7 +3542,7 @@ function renderScrollTools() {
   scrollTools().owed = false;
   // `#229 desktop-two-column`. The right column's chip is its jump to the newest message. The rest
   // float over the left column and act on it.
-  if (sideActive) {
+  if (columnWork.side()) {
     applySearch();
     // `#240 reading-bookmark`. The right column draws the line only on the anchor's thread.
     placeBookmarkLine();
@@ -3685,7 +3690,7 @@ const foldSteps = new Map();
 
 /** The list of the column being worked on, as its pane names it: the column, and what it shows. */
 function foldStepKey() {
-  const pane = sideActive ? sidePane : channelPane;
+  const pane = columnWork.side() ? sidePane : channelPane;
   return `${pane.name}|${pane.context()}`;
 }
 
@@ -3720,7 +3725,7 @@ function nextFoldStep(from, way, folds) {
  * row inside it, which a fold may cut off. Null with no row showing.
  */
 function foldStepAnchor() {
-  const pane = sideActive ? sidePane : channelPane;
+  const pane = columnWork.side() ? sidePane : channelPane;
   const chosen = markedRow(pane, markOf(pane));
   const row = chosen && rowInView(pane, chosen) ? chosen : paneRows(pane).find((one) => rowInView(pane, one));
   return row ? anchorAt(row) : null;
@@ -3737,7 +3742,7 @@ function foldStepAnchor() {
  */
 function foldStepField(target) {
   const node = /** @type {HTMLElement | null} */ (target || null);
-  const pane = sideActive ? sidePane : channelPane;
+  const pane = columnWork.side() ? sidePane : channelPane;
   const area = pane.scroller();
   if (!node || !isTextField(node) || !nodeWithin(area, node)) return null;
   const box = node.getBoundingClientRect();
@@ -3763,7 +3768,7 @@ function applyFoldStep(step, folds, field = null) {
     entryState().landing = null;
     entryState().threadOwed = null;
     entryState().threadAwaitsRead = false;
-    const area = (sideActive ? sidePane : channelPane).scroller();
+    const area = (columnWork.side() ? sidePane : channelPane).scroller();
     const top = field.getBoundingClientRect().top;
     for (const entry of folds) setFolded(entry, !openAtStep(step, entry));
     area.scrollTop += field.getBoundingClientRect().top - top;
@@ -3775,7 +3780,7 @@ function applyFoldStep(step, folds, field = null) {
   if (anchor) {
     placeFilterAnchor(anchor);
     const row = anchor.row;
-    const head = (sideActive ? sidePane : channelPane).head();
+    const head = (columnWork.side() ? sidePane : channelPane).head();
     if (filterState().hold !== null && filterState().hold.row === row && row.getBoundingClientRect().bottom <= head) {
       const area = el("scroll-area");
       area.scrollTop += row.getBoundingClientRect().top - head;
@@ -4044,7 +4049,7 @@ function applySearch() {
   const openedCards = openedCardGaps(false);
   for (const id of SEARCH_LISTS) {
     // The call's transcript is the left column's. `#229 desktop-two-column`.
-    if (sideActive && id === "transcript") continue;
+    if (columnWork.side() && id === "transcript") continue;
     const list = el(id);
     const counts = scope.includes(id);
     for (const row of list.children) {
@@ -4106,15 +4111,15 @@ function applySearch() {
   renderReplyLinks();
   // `#206 pin-message`. Over the Pinned filter the denominator is the channel's PINS, all of them.
   const pinned = pinsView().only && screens.view() === "discord";
-  activeColumn.searched = { matched, loaded, tally, pinned };
+  columnWork.active().searched = { matched, loaded, tally, pinned };
   renderSearchCount(typed, links, author !== "everyone");
   // `#262 search-load-older`. The step back offers to search further back while a filter chooses rows,
   // and a walk that the change of filter just made nobody's ends here, before anything below says what
   // it found. And in one column on Main, a search nothing matches offers All, which has the replies.
   if (screens.view() === "discord") renderOlderControl();
-  if (!sideActive) renderSearchInAll();
+  if (!columnWork.side()) renderSearchInAll();
   // `#605 server-side-search`. The server's copy, asked again when the search wanted has changed.
-  if (!sideActive) scheduleServerSearch();
+  if (!columnWork.side()) scheduleServerSearch();
   if (pinned) {
     const sentence = pinnedEmptySentence(loaded, matched, typed, links ? tally : null, author);
     el("search-empty").textContent = sentence;
@@ -4143,7 +4148,7 @@ function applySearch() {
   const empty = !typed || matched > 0 || loaded === 0;
   // `#262 search-load-older`. How far back the search has looked, and what it cannot see. Not rewritten
   // while a walk reads older pages, so a status says it once, when the walk is over, and not per page.
-  if (!activeColumn.searchWalk) setTextIfChanged(el("search-empty"), empty ? SEARCH_EMPTY_LOADED : searchEmptySentence(loaded));
+  if (!columnWork.active().searchWalk) setTextIfChanged(el("search-empty"), empty ? SEARCH_EMPTY_LOADED : searchEmptySentence(loaded));
   el("search-empty").hidden = empty;
   // `#410 inline-reply-editor`. A reply open in the stream: under its row while the search shows it.
   if (replyDocked) placeInlineReply();
@@ -4676,7 +4681,7 @@ function openedGapIds(create) {
     openedGaps.clear();
     openedGapsFor = searches;
   }
-  const key = JSON.stringify([viewKey(), sideActive, String(selectedChannelId())]);
+  const key = JSON.stringify([viewKey(), columnWork.side(), String(selectedChannelId())]);
   const held = openedGaps.get(key) || null;
   if (held || !create) return held;
   const made = new Set();
@@ -4858,7 +4863,7 @@ function drawSeams(list) {
       }
     }
   };
-  if (!sideActive && filterChanging === 0 && screens.screen() === "main" && screens.view() === "discord" && list === visibleList()) {
+  if (!columnWork.side() && filterChanging === 0 && screens.screen() === "main" && screens.view() === "discord" && list === visibleList()) {
     // While a filter change holds a message in place (`#243 filter-keeps-selection`), the hold places
     // the reader, not this: the held message goes back where the change put it, as after every other
     // redraw around it (`keepFilterHold`) — kept where it happens to be in the middle of a redraw, it
@@ -4963,7 +4968,7 @@ function freshFilterState() {
 
 /** The column being worked on's record of its filters' hold (`freshFilterState`). */
 function filterState() {
-  return activeColumn.filter;
+  return columnWork.active().filter;
 }
 
 /** True while a filter change is under way, so a filter turned off inside another is placed once, by the outer. */
@@ -5117,7 +5122,7 @@ function heldFilterRow() {
  */
 function readerActed() {
   filterState().hold = null;
-  if (!sideActive) endFilterWalk();
+  if (!columnWork.side()) endFilterWalk();
 }
 
 /**
@@ -5153,7 +5158,7 @@ function keepFilterHold() {
 function filterAnchor() {
   if (screens.screen() !== "main") return null;
   const area = el("scroll-area");
-  const pane = screens.view() === "discord" ? (sideActive ? sidePane : channelPane) : null;
+  const pane = screens.view() === "discord" ? (columnWork.side() ? sidePane : channelPane) : null;
   const mark = pane ? markOf(pane) : null;
   const chosen = pane ? markedRow(pane, mark) : null;
   const showing = Boolean(pane && mark && chosen && rowInView(pane, chosen));
@@ -5193,10 +5198,10 @@ function filterAnchor() {
  */
 function keepingFilterPlace(change) {
   if (filterChanging > 0) return change();
-  /** @type {Array<[typeof activeColumn, FilterAnchor | null, boolean]>} */
+  /** @type {Array<[ColumnFields, FilterAnchor | null, boolean]>} */
   const kept = [];
   eachColumn(() => {
-    kept.push([activeColumn, filterAnchor(), listEmptied()]);
+    kept.push([columnWork.active(), filterAnchor(), listEmptied()]);
     // A landing a thread's entry made, or still owes, is spent: the reader has acted since. `#221`.
     entryState().landing = null;
     entryState().threadOwed = null;
@@ -5283,7 +5288,7 @@ function placeFilterAnchor(anchor, wasEmptied = false, walked = false) {
   // The message's own top where it is part of a combined row (`messageTop`), the row's otherwise.
   area.scrollTop += messageTop(placed, row ? id : null) - listPlaceTop(area) - offset;
   carrySelection(anchor, placed, substitute !== null);
-  const pane = screens.view() === "discord" ? (sideActive ? sidePane : channelPane) : null;
+  const pane = screens.view() === "discord" ? (columnWork.side() ? sidePane : channelPane) : null;
   const mark = pane ? markOf(pane) : null;
   filterState().hold = {
     key: filterKey(), row: placed, ids: idsOf(placed), at: area.scrollTop, origin: anchor,
@@ -5301,7 +5306,7 @@ function placeFilterAnchor(anchor, wasEmptied = false, walked = false) {
  */
 function carrySelection(anchor, row, substituted) {
   if (anchor.selected === null || screens.view() !== "discord") return;
-  const pane = sideActive ? sidePane : channelPane;
+  const pane = columnWork.side() ? sidePane : channelPane;
   if (rowOf(pane, row) !== row) return;
   if (substituted) {
     if (anchor.focused) takeRow(pane, row, true);
@@ -5340,7 +5345,7 @@ function filterHiddenSentence(anchor, walked) {
 
 /** Whether the anchor's message is older than everything the channel's list has loaded, with more above it. */
 function olderThanLoaded(anchor) {
-  if (sideActive || screens.view() !== "discord" || pinsView().only || olderPages().moreAbove !== true ||
+  if (columnWork.side() || screens.view() !== "discord" || pinsView().only || olderPages().moreAbove !== true ||
       !Number.isFinite(anchor.time)) return false;
   const loaded = threadingSupported ? timelineRows().messages : [...el("discord-log").children].flatMap(rowMessages);
   const times = loaded.map((message) => timeOf(message, "timestamp")).filter(Number.isFinite);
@@ -6873,7 +6878,7 @@ function onPaneFocus(pane, event) {
  * stands in front of the channel's): nothing.
  */
 function selectLanded(row) {
-  const pane = sideActive ? sidePane : channelPane;
+  const pane = columnWork.side() ? sidePane : channelPane;
   if (rowOf(pane, row) !== row) return;
   if (drawnBy()) takeRow(pane, row, focusFollowsSelection());
   else noteRow(pane, row);
@@ -7535,7 +7540,7 @@ function threadOutFromKeyboard() {
   // In two columns, from the right column back to Main on the left; the thread stays where it is.
   // `#229 desktop-two-column`.
   if (columnsShown) {
-    if (!sideActive || screens.screen() !== "main" || screens.view() !== "discord") return false;
+    if (!columnWork.side() || screens.screen() !== "main" || screens.view() !== "discord") return false;
     // `#277 thread-card-focus`. A thread entered from its card goes back out to the cards, as → came
     // in: the X, and the keys on the card it was entered from.
     if (columns.side.mode === "thread" && columns.side.fromCards) {
@@ -7916,7 +7921,7 @@ const channelOnScreen = () => screens.screen() === "main" && screens.view() === 
  * @param {boolean} repeat
  */
 function voiceFromKeyboard(repeat) {
-  if (sideActive) return inColumn(columns.main, () => voiceFromKeyboard(repeat));
+  if (columnWork.side()) return inColumn(columns.main, () => voiceFromKeyboard(repeat));
   const covering = screens.screen() === "settings" || screens.screen() === "help";
   if (!(screens.screen() === "main" || (covering && screens.beforeSettings() === "main"))) {
     return false;
@@ -7929,7 +7934,7 @@ function voiceFromKeyboard(repeat) {
 
 function viewFromKeyboard(which, repeat) {
   // A view is the page's, whichever column the keys are in.
-  if (sideActive) return inColumn(columns.main, () => viewFromKeyboard(which, repeat));
+  if (columnWork.side()) return inColumn(columns.main, () => viewFromKeyboard(which, repeat));
   const channel = String(selectedChannelId() || "");
   const covering = screens.screen() === "settings" || screens.screen() === "help";
   // Settings and Help are left for the screen they were opened over, which is the channel's only when
@@ -7965,7 +7970,7 @@ function readModeFromKeyboard() {
  */
 function filterFromKeyboard(which) {
   // The bar and its Pinned filter are the left column's, whichever column the keys are in. `#229`.
-  if (sideActive) return inColumn(columns.main, () => filterFromKeyboard(which));
+  if (columnWork.side()) return inColumn(columns.main, () => filterFromKeyboard(which));
   // Over the thread list on its own they would filter the column behind it. `#281 view-keys`.
   if (!channelOnScreen() || threadListOnScreen()) return false;
   if (!searchField.open()) setSearchOpen(true);
@@ -8048,7 +8053,7 @@ function composeFromKeyboard() {
   }
   const box = el("channel-compose-text");
   if (!channelOnScreen() || behindThreadList(box)) return false;
-  if (!shownNode(box)) return sideActive ? inColumn(columns.main, composeFromKeyboard) : false;
+  if (!shownNode(box)) return columnWork.side() ? inColumn(columns.main, composeFromKeyboard) : false;
   // The box is at the foot of the list, and writing in it is going there: as far as shows it.
   focusMinimally(box);
   return true;
@@ -8099,7 +8104,7 @@ function writeFromKeyboard() {
     else if (held && nodeWithin(leftEl("scroll-tools"), held)) pane = channelPane;
     else pane = paneFor(held);
   }
-  return inColumn(pane ? paneColumn(pane) : activeColumn, composeFromKeyboard);
+  return inColumn(pane ? paneColumn(pane) : columnWork.active(), composeFromKeyboard);
 }
 
 /**
@@ -8114,7 +8119,7 @@ function threadListHasBox() {
 function newestFromComposer(target) {
   // The box of the column the key is in: the thread's on the right, in two columns. `#229`.
   if (!target || target !== el("channel-compose-text") || String(target.value || "") !== "") return false;
-  const pane = sideActive ? sidePane : channelPane;
+  const pane = columnWork.side() ? sidePane : channelPane;
   const rows = paneRows(pane);
   if (rows.length === 0) return false;
   selectRow(pane, rows[rows.length - 1]);
@@ -8279,7 +8284,7 @@ function goBack() {
   else if (threadListOnScreen()) threadListBack();
   // Not over the right column's cards, whose column still holds the thread it showed last: that Back
   // was the X with nothing to close, and put the cards back at their foot. `#277 thread-card-focus`.
-  else if (channelOnScreen() && selection().view === "thread" && !(sideActive && columns.side.mode === "list")) leaveThread();
+  else if (channelOnScreen() && selection().view === "thread" && !(columnWork.side() && columns.side.mode === "list")) leaveThread();
   else return false;
   return true;
 }
@@ -9908,7 +9913,7 @@ function collapsedLinesChanged(value) {
     return n;
   };
   if (screens.screen() !== "main") return apply();
-  /** @type {Array<[typeof activeColumn, ReturnType<typeof captureScroll>]>} */
+  /** @type {Array<[ColumnFields, ReturnType<typeof captureScroll>]>} */
   const held = [[columns.main, inColumn(columns.main, captureScroll)]];
   if (sideShowing()) held.push([columns.side, inColumn(columns.side, captureScroll)]);
   let n = DEFAULT_COLLAPSED_LINES;
@@ -10539,7 +10544,7 @@ function freshLoadState() {
 
 /** The column being worked on's record of its reads' state (`freshLoadState`). */
 function loadState() {
-  return activeColumn.load;
+  return columnWork.active().load;
 }
 
 /*
@@ -11006,7 +11011,7 @@ function projectView(view = selection().view, thread = selection().threadId) {
 function syncCanonDismissed() {
   if (!threadingSupported || channelStore.current().channel !== String(selectedChannelId())) return;
   // `#407 unpack-row-parity`. Over the cards the right column has no rows on screen to speak for.
-  if (sideActive && columns.side.mode !== "thread") return;
+  if (columnWork.side() && columns.side.mode !== "thread") return;
   for (const message of timelineRows().messages) {
     const id = String(message.id);
     if (doneState().archived.has(id)) channelStore.current().dismissed.add(id);
@@ -11280,7 +11285,7 @@ function hydrateFromCache() {
 /** Take every channel row off the screen and out of memory. */
 function clearChannelScreen() {
   // From the left column, whichever column's read found the credential refused. `#229`.
-  if (sideActive) return inColumn(columns.main, clearChannelScreen);
+  if (columnWork.side()) return inColumn(columns.main, clearChannelScreen);
   ++loadState().generation;
   readAloudOwner().stopReading();
   readAloudOwner().readingMode = false;
@@ -11331,7 +11336,7 @@ function screenBelongsToToken() {
 
 /** Sign-out, another token, or a refusal: nothing this credential read may stay behind. */
 function forgetMessages() {
-  if (sideActive) return inColumn(columns.main, forgetMessages);
+  if (columnWork.side()) return inColumn(columns.main, forgetMessages);
   // `#277 reply-in-column`. A reply open in a column answers a message that is going; its words are
   // kept as a draft, as every reply put down is.
   putDockedReplyAway();
@@ -11383,7 +11388,7 @@ function setChannelFreshness(state) {
 function renderChannelFreshness() {
   // The pill floats over the left column and speaks for it. `#229 desktop-two-column`: the right
   // column's freshness is its own, said on a line of that column (`#231 two-column-polish`).
-  if (sideActive) {
+  if (columnWork.side()) {
     renderSideFreshness();
     return;
   }
@@ -11714,7 +11719,7 @@ const placeKey = () => JSON.stringify([String(selectedChannelId()), viewKey()]);
  */
 function holdChannelPlace() {
   // A reopen comes back to one list: the left column's. `#229 desktop-two-column`.
-  if (sideActive) return;
+  if (columnWork.side()) return;
   if (screens.screen() !== "main" || screens.view() !== "discord" || !REOPENED_VIEWS.includes(selection().view)) return;
   const mark = captureScroll();
   const anchor = mark.anchor;
@@ -11754,7 +11759,7 @@ function viewOnScreen() {
  */
 function saveUiState() {
   // What is on screen is recorded from the left column, whichever column asked. `#229`.
-  if (sideActive) return inColumn(columns.main, saveUiState);
+  if (columnWork.side()) return inColumn(columns.main, saveUiState);
   const identity = tokenFingerprint(token());
   if (!uiState.settled() || !identity) return;
   const channel = String(selectedChannelId());
@@ -11872,7 +11877,7 @@ function channelContextKey() {
   const key = [selectedChannelId(), selection().view, selection().threadId];
   // `#229 desktop-two-column`. The right column's views are its own: a thread shown there and the
   // same thread shown in one column are two lists of rows, never one held context moved between them.
-  return JSON.stringify(sideActive ? [...key, "side"] : key);
+  return JSON.stringify(columnWork.side() ? [...key, "side"] : key);
 }
 
 function channelComposerKey() {
@@ -12086,7 +12091,7 @@ function threadCount(count, exact) {
 function renderChannelNavigation() {
   // `#229 desktop-two-column`. The right column names its thread in a heading of its own; what is
   // this pass's there is which of its lists is up and where its box posts.
-  if (sideActive) {
+  if (columnWork.side()) {
     renderColumnLists();
     renderSideColumn();
     return;
@@ -12223,7 +12228,7 @@ function readerPlace() {
  */
 function channelCard() {
   const card = leftEl("post-confirm");
-  return !sideActive && screens.view() === "discord" && !card.hidden && card.getAttribute("data-place") === "channel"
+  return !columnWork.side() && screens.view() === "discord" && !card.hidden && card.getAttribute("data-place") === "channel"
     ? card : null;
 }
 
@@ -12305,11 +12310,11 @@ async function readBehindSwitch() {
 async function changeChannelView(view, threadId = null, summary = null, origin = null, before = null) {
   noteDeepLinkReaderMove();
   // `#277 reply-in-column`. The list a reply open in this column answers a message of is going.
-  if (replyDocked && activeColumn === replyColumn) putDockedReplyAway();
+  if (replyDocked && columnWork.active() === replyColumn) putDockedReplyAway();
   // Before the view goes: where the reader is, and how current what they are reading is — what a
   // view drawn from held rows is as current as. Where a change of layout brings the switch, where the
   // reader of the left column was before it (`before`, `leftColumnPlace`).
-  const place = before && !sideActive ? before : readerPlace();
+  const place = before && !columnWork.side() ? before : readerPlace();
   const from = selection().view;
   const came = { freshAt: loadState().freshAt, freshness: loadState().freshness };
   // `#206 pin-message`. Choosing a view is asking to see it, and the Pinned filter shows the same
@@ -12353,7 +12358,7 @@ async function changeChannelView(view, threadId = null, summary = null, origin =
   // the layout, not by the reader's choice, and the right column's thread is not a view the channel
   // opens in. Leaving two columns goes back to the choice made in one.
   // `#281 view-keys`: nor behind the thread list, whose left column is Main for the same reason.
-  if (!columnsShown && !threadListShown && !sideActive && !columnsRestoring) {
+  if (!columnsShown && !threadListShown && !columnWork.side() && !columnsRestoring) {
     const chosen = viewOnScreen();
     if (chosen) uiState.remember(chosen);
     // The Threads list is not a view a channel opens in: picked, it leaves the channel to its default.
@@ -12652,7 +12657,7 @@ function freshEntryState() {
 
 /** The column being worked on's record of entering a view (`freshEntryState`). */
 function entryState() {
-  return activeColumn.entry;
+  return columnWork.active().entry;
 }
 
 // The thread entered and still owed its landing, as its `channelContextKey`, or null. Kept per column: `entryState().threadOwed` (`freshEntryState`, `#624 voice-page-modularity`).
@@ -13185,7 +13190,7 @@ function renderThreadSelect() {
  * the left column's, whichever column asks.
  */
 function renderThreadHeading() {
-  if (sideActive) return inColumn(columns.main, renderThreadHeading);
+  if (columnWork.side()) return inColumn(columns.main, renderThreadHeading);
   if (selection().view !== "thread") return undefined;
   paintThreadCard(leftEl("thread-card"), openThreadChoice(), replyTally());
   const back = leftEl("thread-back");
@@ -13296,7 +13301,7 @@ function openThread(id, summary = null) {
 function closeThread() {
   // In two columns, leaving the thread on the right is its X. `#229 desktop-two-column`. The thread
   // list on its own shows cards only, never a thread, so from it there is none to leave. `#281 view-keys`.
-  if (sideActive) return columnsShown ? closeSideThread() : undefined;
+  if (columnWork.side()) return columnsShown ? closeSideThread() : undefined;
   if (selection().view !== "thread") return;
   // `#281 view-keys`. A thread opened from the thread list goes back to the list — or, where the
   // channel has none to show any more, to the view it opens in.
@@ -13994,7 +13999,7 @@ function allThreadSelected() {
 
 /** Whether the rows being drawn are All's, which only the left column shows: the only rows with strips. */
 function drawingAll() {
-  return !sideActive && selection().view === "flat";
+  return !columnWork.side() && selection().view === "flat";
 }
 
 /**
@@ -14062,7 +14067,7 @@ function threadStrip(row) {
  * message of is let go, so All is never all dimmed with nothing at full strength.
  */
 function paintAllThreadFocus() {
-  if (sideActive) return;
+  if (columnWork.side()) return;
   const list = el("discord-log");
   const channel = String(selectedChannelId());
   let id = selection().view === "flat" ? allThreadSelected() : null;
@@ -14562,7 +14567,7 @@ function withReadReason(path, options) {
 
 /** The word a step back sends: `search` while the column's walk for the search is under way. */
 function olderReadReason() {
-  return activeColumn.searchWalk ? "search" : "older";
+  return columnWork.active().searchWalk ? "search" : "older";
 }
 
 /**
@@ -15131,7 +15136,7 @@ function foldLateTimelinePage(payload, read) {
   if (!threadingSupported || channelStore.current() !== read.canon || read.canon.channel !== read.channel ||
       String(selectedChannelId()) !== read.channel) return;
   // Asked in the column the read was for, which is the one whose view it may be. `#229`.
-  if (read.column && read.column !== activeColumn) {
+  if (read.column && read.column !== columnWork.active()) {
     inColumn(read.column, () => foldLateTimelinePage(payload, read));
     return;
   }
@@ -15147,7 +15152,7 @@ function foldLateTimelinePage(payload, read) {
     const landing = entryLandingMark();
     noteArchived(payload, false);
     // Words and all, unless a read of this view is queued behind this one: it draws them.
-    catchUpHeldView(!discordQueuedLoads.has(activeColumn));
+    catchUpHeldView(!discordQueuedLoads.has(columnWork.active()));
     renderChannelFreshness();
     if (entryState().readOwed === read.context) entryState().readOwed = null;
     if (landing) keepEntryLanding(landing);
@@ -15748,7 +15753,7 @@ const outgoingRoomWatch = typeof window.ResizeObserver === "function"
  * @returns {HTMLElement[]}
  */
 function placeOutgoingInPlace(rows) {
-  const drawn = outgoingInPlaceDrawn.get(activeColumn) || { anchors: [], groups: [] };
+  const drawn = outgoingInPlaceDrawn.get(columnWork.active()) || { anchors: [], groups: [] };
   for (const anchor of drawn.anchors) {
     anchor.removeAttribute("data-outgoing-anchor");
     anchor.style.removeProperty("anchor-name");
@@ -15761,13 +15766,13 @@ function placeOutgoingInPlace(rows) {
   // Not under the Pinned filter, which shows pinned messages and nothing else (`#206 pin-message`): the
   // rows go to the foot, which is hidden there.
   if (pinsView().only) {
-    outgoingInPlaceDrawn.set(activeColumn, { anchors: [], groups: [] });
+    outgoingInPlaceDrawn.set(columnWork.active(), { anchors: [], groups: [] });
     return rows;
   }
   // `#500 sent-receipts-pile-up`. Or the Threads view's cards, over the left column's list: a reply sent
   // from the box under an unpacked row (`#407 unpack-row-parity`) stays under that row, not at the foot
   // of the cards, until it is drawn there or its receipt goes; never under the same message in Main.
-  const cards = activeColumn === columns.main && sideCardsShown() ? [leftEl("side-cards")] : [];
+  const cards = columnWork.active() === columns.main && sideCardsShown() ? [leftEl("side-cards")] : [];
   /** @type {Map<HTMLElement, {list: HTMLElement, rows: HTMLElement[]}>} */
   const under = new Map();
   /** @type {HTMLElement[]} */
@@ -15795,7 +15800,7 @@ function placeOutgoingInPlace(rows) {
   const next = { anchors: [], groups: [] };
   let n = 0;
   for (const [anchor, { list, rows: placed }] of under) {
-    const name = `--outgoing-${activeColumn === columns.side ? "side" : "main"}-${n++}`;
+    const name = `--outgoing-${columnWork.active() === columns.side ? "side" : "main"}-${n++}`;
     const group = document.createElement("ol");
     group.className = "messages outgoing-inplace";
     group.setAttribute("aria-label", "Outgoing reply");
@@ -15811,7 +15816,7 @@ function placeOutgoingInPlace(rows) {
     next.anchors.push(anchor);
     next.groups.push(group);
   }
-  outgoingInPlaceDrawn.set(activeColumn, next);
+  outgoingInPlaceDrawn.set(columnWork.active(), next);
   return foot;
 }
 
@@ -16319,7 +16324,7 @@ function followPlacement() {
  * (`reportColumnReply`, `#277 reply-in-column`). Never saved: a reload shows the outbox as it is.
  *
  * @param {any} request
- * @param {typeof activeColumn | null} [column]
+ * @param {ColumnFields | null} [column]
  */
 function queueOutgoingMessage(request, column = null) {
   let id;
@@ -17272,7 +17277,7 @@ async function editOutgoingMessage(id) {
   const key = JSON.stringify([entry.channel, entry.threadId || null]);
   // The column whose box that is now, if one is showing it: this one first, then the other.
   const boxShown = () => String(selectedChannelId()) === entry.channel && composerState().key === key;
-  const showing = () => [activeColumn, activeColumn === columns.main ? columns.side : columns.main]
+  const showing = () => [columnWork.active(), columnWork.active() === columns.main ? columns.side : columns.main]
     .find((column) => (column === columns.main || sideShowing()) && inColumn(column, boxShown)) || null;
   // From the store, which every keystroke in the box writes, and which holds the draft of a box no
   // column is showing.
@@ -18087,19 +18092,19 @@ function renderChannelRows() {
   // unread as the rows' chips do, so it follows the same arrivals, reads and Done, in either column;
   // and so does the card at the top of a thread across the window.
   paintSideThreadCard(tally);
-  if (!sideActive && selection().view === "thread") paintThreadCard(leftEl("thread-card"), openThreadChoice(), tally);
+  if (!columnWork.side() && selection().view === "thread") paintThreadCard(leftEl("thread-card"), openThreadChoice(), tally);
   // `#299 all-thread-strip`. The thread selected in All, on the rows as they now stand: a live reply of
   // it arrives at full strength, any other message dimmed.
   paintAllThreadFocus();
   // `#407 unpack-row-parity`. Whatever this pass was for — a read aloud starting or ending, a pin, a
   // reply sent — the rows unpacked under the cards are dressed again with it, as message rows.
-  if (!sideActive && !unpackDressedAfter) dressUnpackedRows();
+  if (!columnWork.side() && !unpackDressedAfter) dressUnpackedRows();
   // `#540 read-aloud-desktop`. And a card whose first message a read is reading, or has asked for.
-  if (!sideActive) readAloudOwner().paintReadingCards();
+  if (!columnWork.side()) readAloudOwner().paintReadingCards();
   // `#419 threads-view-main-messages`. Main's messages among the cards are Main's rows' messages: what
   // changed them here (a message posted from the box at the foot, an arrival, a Done) is drawn there too.
   // Drawn again only where something they draw changed (`renderSideCards`).
-  if (!sideActive && mainRowsOnScreen()) renderSideCards();
+  if (!columnWork.side() && mainRowsOnScreen()) renderSideCards();
   // `#410 inline-reply-editor`. A reply open in the stream, under its row as the rows now stand; and
   // one waiting for its message, opened again once the message is drawn.
   if (replyDocked) placeInlineReply();
@@ -18282,7 +18287,7 @@ const bookmarkWrites = createBookmarkWrites({
   same: (one, other) => sameAnchor(one, other),
   redraw: () => redrawBookmark(),
   save: () => {
-    if (!sideActive) saveChannelScope();
+    if (!columnWork.side()) saveChannelScope();
   },
   status: (text) => setStatus(text),
   error: (text) => showError(text),
@@ -18367,13 +18372,13 @@ function placeBookmarkLine() {
   const settled = target && drawn.length === 1 && drawn[0] === target.row &&
     target.row.getAttribute("data-bookmark") === target.place && target.row.bookmarkLine &&
     target.row.bookmarkLine.parentNode === target.row;
-  bookmarkDrawn[activeColumn.name] = target;
-  if (!sideActive) adoptLegacyMarker();
+  bookmarkDrawn[columnWork.active().name] = target;
+  if (!columnWork.side()) adoptLegacyMarker();
   if (settled || (!target && drawn.length === 0)) return;
   // The line moved, and each row's ⋯ item saying what it will do, by web/src/view/channel.
   const apply = () => drawBookmarkLine(drawn, target);
   // The reader does not move: a line drawn or taken away above them changes the height above them.
-  if (!sideActive && screens.screen() === "main" && screens.view() === "discord") preservingScroll(apply);
+  if (!columnWork.side() && screens.screen() === "main" && screens.view() === "discord") preservingScroll(apply);
   else apply();
 }
 
@@ -18418,7 +18423,7 @@ function adoptLegacyMarker() {
  * against the list's own edges rather than the chips', so showing the chip cannot change the answer.
  */
 function renderJumpBookmark() {
-  if (sideActive) return;
+  if (columnWork.side()) return;
   const chip = leftEl("jump-bookmark");
   /** @type {"up" | "down" | null} */
   let direction = null;
@@ -18450,7 +18455,7 @@ function renderJumpBookmark() {
  * and the message below it selected. False when the list draws no line.
  */
 function landOnBookmark() {
-  if (sideActive) return inColumn(columns.main, landOnBookmark);
+  if (columnWork.side()) return inColumn(columns.main, landOnBookmark);
   const target = bookmarkDrawn.main;
   if (!target || !target.row.bookmarkLine || target.row.parentNode !== el("discord-log")) return false;
   const area = el("scroll-area");
@@ -18483,7 +18488,7 @@ function rowAmongCards(row) {
  * window, or the Threads view of one column.
  */
 const bookmarksOffScreen = () => threadListOnScreen() ||
-  (screens.view() === "discord" && !sideActive && threadingSupported && selection().view === "threads");
+  (screens.view() === "discord" && !columnWork.side() && threadingSupported && selection().view === "threads");
 
 /** b, m and the chip: back to the bookmark, walking back through older pages when it is further back. */
 async function jumpToBookmark() {
@@ -18491,7 +18496,7 @@ async function jumpToBookmark() {
     setStatus(NO_BOOKMARK_IN_THREADS);
     return;
   }
-  if (sideActive) return inColumn(columns.main, jumpToBookmark);
+  if (columnWork.side()) return inColumn(columns.main, jumpToBookmark);
   // A jump the reader asks for lets go of a filter change's held message (#243 filter-keeps-selection),
   // as Newest and the reply arrow do, whether it came from b, m or the Bookmark chip.
   readerActed();
@@ -18515,7 +18520,7 @@ function bookmarkJumpFromKeyboard() {
     setStatus(NO_BOOKMARK_IN_THREADS);
     return true;
   }
-  if (sideActive) return inColumn(columns.main, bookmarkJumpFromKeyboard);
+  if (columnWork.side()) return inColumn(columns.main, bookmarkJumpFromKeyboard);
   if (!channelOnScreen()) return false;
   guardQuietly(jumpToBookmark)();
   return true;
@@ -18576,7 +18581,7 @@ const { drawBookmarkLine } = createBookmarkLines({
     // line was above, ringed, as a key or the mouse selects. Not after a tap, which selects silently
     // (`drawnBy`) and leaves no ring.
     if (focused && drawnBy() && row.parentNode === el("discord-log") && rowShown(row)) {
-      takeRow(sideActive ? sidePane : channelPane, row, true);
+      takeRow(columnWork.side() ? sidePane : channelPane, row, true);
     }
   }),
 });
@@ -18862,7 +18867,7 @@ function freshReplyArrows() {
 
 /** The column being worked on's record of its reply arrows (`freshReplyArrows`). */
 function replyArrows() {
-  return activeColumn.arrows;
+  return columnWork.active().arrows;
 }
 
 // The reply the last jump left, as `{ id, context }`, while "Back to reply" is offered; else null. Kept per column: `replyArrows().back` (`freshReplyArrows`, `#624 voice-page-modularity`).
@@ -19513,7 +19518,7 @@ function freshGatherState() {
 
 /** The column being worked on's record of what is gathered in its list (`freshGatherState`). */
 function gatherState() {
-  return activeColumn.gather;
+  return columnWork.active().gather;
 }
 
 /**
@@ -19531,7 +19536,7 @@ function freshListState() {
 
 /** The column being worked on's record of what its list has drawn (`freshListState`). */
 function listState() {
-  return activeColumn.list;
+  return columnWork.active().list;
 }
 
 // Whether the channel's rows are drawn gathered now, so putting them back has something to undo. Kept per column: `listState().rowsGathered` (`freshListState`, `#624 voice-page-modularity`).
@@ -19769,7 +19774,7 @@ function gatherFromReply(reply) {
 function toggleGathered(parent, row) {
   // `#229 desktop-two-column`. On Main in two columns the replies are the thread on the right: the
   // chip selects it there rather than gathering them here, where they would show twice side by side.
-  const root = columnsShown && !sideActive ? rowMessages(row)[0] : null;
+  const root = columnsShown && !columnWork.side() ? rowMessages(row)[0] : null;
   if (root && threadOf(root) && root.thread.is_root === true) return openThread(threadOf(root));
   if (gatheredParent() === String(parent)) {
     scatterReplies();
@@ -21591,7 +21596,7 @@ function freshOlderPages() {
 
 /** The column being worked on's record of its older pages (`freshOlderPages`). */
 function olderPages() {
-  return activeColumn.older;
+  return columnWork.active().older;
 }
 // The last live page said more exists above but carried no cursor to walk back on — a page a
 // server before `#510 cache-serve-every-read` answered from its message cache (`#384
@@ -21658,15 +21663,15 @@ function renderOlderControl() {
   const button = el("load-older");
   // `#262 search-load-older`. A walk for the search that a change has made nobody's ends first, so
   // nothing below says it is still searching.
-  const running = activeColumn.searchWalk;
-  if (running && !searchWalkHolds(running, activeColumn)) endSearchWalk(activeColumn);
-  const walk = activeColumn.searchWalk;
+  const running = columnWork.active().searchWalk;
+  if (running && !searchWalkHolds(running, columnWork.active())) endSearchWalk(columnWork.active());
+  const walk = columnWork.active().searchWalk;
   // Not over the Pinned filter: its list is every pin already, and older history adds none.
   const hidden = olderPages().moreAbove !== true || pinsView().only;
   if (button.hidden !== hidden) button.hidden = hidden;
   // `#243 filter-keeps-selection`. A walk back to the message a filter change is keeping says what it
   // is doing, where the reader waits for it.
-  const walking = filterWalk !== null && !sideActive;
+  const walking = filterWalk !== null && !columnWork.side();
   const offered = !walking && walk === null && searchOffered();
   // A tap while a step of the scroll's is on the wire starts the search, which takes that step as its
   // first page; and a walk under way is stopped by one, unless it is already stopping.
@@ -21749,7 +21754,7 @@ const searchKey = () => JSON.stringify([filterKey(), searchField.open() ? search
  */
 function searchOffered() {
   return readRunsSuspended() && screens.view() === "discord" && selection().view !== "threads" && !pinsView().only &&
-    olderPages().moreAbove === true && !(readModes.hiding() && !threadingSupported) && (!sideActive || sideShowing());
+    olderPages().moreAbove === true && !(readModes.hiding() && !threadingSupported) && (!columnWork.side() || sideShowing());
 }
 
 /** The view a column shows, as a sentence names it. */
@@ -21883,9 +21888,9 @@ function serviceWords() {
 /** What the last walk in the column being worked on found, under its control, until the search changes. */
 function renderSearchOlderNote() {
   const note = el("search-older-note");
-  const held = activeColumn.searchNote;
-  if (held && held.key !== searchKey()) activeColumn.searchNote = null;
-  const said = activeColumn.searchNote ? activeColumn.searchNote.text : "";
+  const held = columnWork.active().searchNote;
+  if (held && held.key !== searchKey()) columnWork.active().searchNote = null;
+  const said = columnWork.active().searchNote ? columnWork.active().searchNote.text : "";
   setTextIfChanged(note, said);
   if (note.hidden !== (said === "")) note.hidden = said === "";
 }
@@ -21904,7 +21909,7 @@ function searchWalkHolds(walk, column) {
  * End `column`'s walk where it is, saying nothing of it: the read on the wire is aborted, and its
  * control says what it says with no walk. The walk's promise, to wait for, or null with none.
  *
- * @param {typeof activeColumn} column
+ * @param {ColumnFields} column
  */
 function endSearchWalk(column) {
   const walk = column.searchWalk;
@@ -21969,8 +21974,8 @@ function searchWalkNote(walk, reason, failure = null) {
  * this section stop it, and say what it found. Does nothing where the step back does not offer it.
  */
 function searchOlder() {
-  if (!searchOffered() || activeColumn.searchWalk || (filterWalk !== null && !sideActive)) return Promise.resolve();
-  const column = activeColumn;
+  if (!searchOffered() || columnWork.active().searchWalk || (filterWalk !== null && !columnWork.side())) return Promise.resolve();
+  const column = columnWork.active();
   // `#229 desktop-two-column`. The column the walk is in, which its work after every wait is done in.
   const steps = columnSteps();
   // One at a time on the page: a walk in the other column ends, and is waited for, so two reads never
@@ -22006,7 +22011,7 @@ function searchOlder() {
     promise: /** @type {Promise<void> | null} */ (null),
   };
   column.searchWalk = walk;
-  activeColumn.searchNote = null;
+  columnWork.active().searchNote = null;
   renderOlderControl();
   renderJumpNewest();
   walk.promise = (async () => {
@@ -22120,12 +22125,12 @@ function stopSearchWalk(column) {
  * that, and else one step back, as ever.
  */
 function olderControlPressed() {
-  const walk = activeColumn.searchWalk;
+  const walk = columnWork.active().searchWalk;
   if (walk) {
-    if (Date.now() - walk.started >= SEARCH_OLDER_TAP_MS) stopSearchWalk(activeColumn);
+    if (Date.now() - walk.started >= SEARCH_OLDER_TAP_MS) stopSearchWalk(columnWork.active());
     return undefined;
   }
-  if (searchOffered() && !(filterWalk !== null && !sideActive)) return searchOlder();
+  if (searchOffered() && !(filterWalk !== null && !columnWork.side())) return searchOlder();
   return loadOlder();
 }
 
@@ -23750,7 +23755,7 @@ function freshDoneState() {
 
 /** The column being worked on's record of what it shows as Done (`freshDoneState`). */
 function doneState() {
-  return activeColumn.done;
+  return columnWork.active().done;
 }
 
 /**
@@ -24013,7 +24018,7 @@ function appendChannelRow(arriving, live = false, folded = false) {
   const message = threadingSupported && !folded ? foldLiveMessage(arriving, live) : arriving;
   // Saved once, from the left column: the store is the channel's, not a column's. `#229`.
   const save = () => {
-    if (!sideActive) saveChannelScope();
+    if (!columnWork.side()) saveChannelScope();
   };
   if ([...el("discord-log").children].some((row) => idsOf(row).includes(String(message.id)))) {
     if (threadingSupported) save();
@@ -24285,7 +24290,7 @@ async function refreshAfterInboxChange() {
   // `#407 unpack-row-parity`. An act on a row unpacked under the cards is made in the right column,
   // which draws no thread of its own while it shows them: what changed is drawn in the cards, and its
   // left-over thread is neither drawn nor written over the store.
-  if (sideActive && columns.side.mode !== "thread") {
+  if (columnWork.side() && columns.side.mode !== "thread") {
     renderSideColumn();
     return;
   }
@@ -24572,7 +24577,7 @@ async function dismissMessages(body, bump = body.messages ? singleDoneBump(body.
   // Done here from now on, and saved only once the write below is (`doneSaved`).
   const saved = noteDoneSaving(requested);
   // `#229 desktop-two-column`. Done is the message's, so the other column shows it Done as well.
-  const column = activeColumn;
+  const column = columnWork.active();
   // What the lines in the `try` change, for a refusal to take back. `#326 refused-undo-restores-done`:
   // from the notes above on, everything is in the `try`, so a slip in drawing the Done before its write
   // is queued takes back exactly what the Done changed, the ledger told no write went (`sent`), and only
@@ -24723,7 +24728,7 @@ async function restoreMessages(ids) {
   // `#327 done-races-remaining`): settled once the write has been answered and a refusal taken back.
   const saving = noteDoneSaving(restored);
   // `#229 desktop-two-column`. Put back in the other column as well.
-  const column = activeColumn;
+  const column = columnWork.active();
   // What the lines in the `try` change, for a refusal to take back: from the notes above on, a slip
   // before the write is queued takes back exactly what the put back changed, the ledger told no write
   // went (`sent`), as in `dismissMessages` (`#326 refused-undo-restores-done`).
@@ -24906,7 +24911,7 @@ function caughtUpDone(copy, ids) {
  * `mirrorArchived` taking it back changes nothing in it.
  *
  * @param {string[]} ids
- * @param {typeof activeColumn} madeIn
+ * @param {ColumnFields} madeIn
  */
 function followDoneEverywhere(ids, madeIn) {
   if (!threadingSupported || channelStore.current().channel !== String(selectedChannelId())) return;
@@ -24914,7 +24919,7 @@ function followDoneEverywhere(ids, madeIn) {
   /** @param {Set<string>} copy */
   const caughtUp = (copy) => caughtUpDone(copy, named);
   for (const held of channelContexts.values()) held.dismissed = caughtUp(held.dismissed);
-  if (!sideShowing() && activeColumn !== columns.side && columns.side.left) {
+  if (!sideShowing() && columnWork.active() !== columns.side && columns.side.left) {
     inColumn(columns.side, () => {
       doneState().archived = caughtUp(doneState().archived);
     });
@@ -25110,7 +25115,7 @@ function freshPinsView() {
 
 /** The column being worked on's record of its Pinned filter (`freshPinsView`). */
 function pinsView() {
-  return activeColumn.pins;
+  return columnWork.active().pins;
 }
 /**
  * Keeping this channel's pins current and changing them, what a pin keeps of a message, and the rows drawn
@@ -25622,7 +25627,7 @@ let replyQuote = null;
 function openReply(messages, from = null, quote = "", focus = true) {
   // `#407 unpack-row-parity`. A row unpacked under the cards acts in the right column, which shows no
   // thread to answer in or come back to: its reply is the left column's, drawn in the cards' list.
-  if (sideActive && columns.side.mode !== "thread") {
+  if (columnWork.side() && columns.side.mode !== "thread") {
     inColumn(columns.main, () => openReply(messages, from, quote, focus));
     return;
   }
@@ -25656,7 +25661,7 @@ function openReply(messages, from = null, quote = "", focus = true) {
   replyRouting = replyRoute(message, bound);
   el("reply-branch").checked = Boolean(replyRouting.branch) && bound;
   el("reply-branch-row").hidden = !replyRouting.branch;
-  replyColumn = activeColumn;
+  replyColumn = columnWork.active();
   el("reply-target-meta").textContent = `to ${
     message.author_is_bot ? `${message.author} (bot)` : String(message.author)
   } · id ${message.id}`;
@@ -25870,7 +25875,7 @@ const ANCHORS = Boolean(window.CSS && typeof window.CSS.supports === "function" 
  * cards (`#407 unpack-row-parity`: its reply is the left column's, drawn in the right one's list).
  */
 function replyKeysHere() {
-  return activeColumn === replyColumn || (replyDocked && activeColumn === paneColumn(replyPane()));
+  return columnWork.active() === replyColumn || (replyDocked && columnWork.active() === paneColumn(replyPane()));
 }
 
 /** The list Reply was pressed on: the row's, where it is on one of the channel's lists; else the column's. */
@@ -25916,18 +25921,18 @@ function gatherForReply(list) {
   const id = String(replyTarget.id);
   // What a sent reply left gathered is put back by the next Reply, as N replies on another message puts
   // the first back: one gathering at a time.
-  if (gatherState().gathered && gatherState().gathered.byReply && gatherState().gathered.parent !== id) inColumn(gatherState().gathered.column || activeColumn, putRepliesBack);
+  if (gatherState().gathered && gatherState().gathered.byReply && gatherState().gathered.parent !== id) inColumn(gatherState().gathered.column || columnWork.active(), putRepliesBack);
   if (list !== el("discord-log") || rowsChosen()) return false;
   if (gatheredParent() === id) return false;
   if (rootOfOpenThread(replyTarget)) return false;
   // Not where the right column shows that thread already: it would be drawn twice side by side, as N
   // replies on a root in two columns declines to (`toggleGathered`).
-  const shownRight = columnsShown && !sideActive && columns.side.mode === "thread"
+  const shownRight = columnsShown && !columnWork.side() && columns.side.mode === "thread"
     ? inColumn(columns.side, () => String(selection().threadId || "")) : "";
   const own = selection().view === "main" && headsAnsweredThread(replyTarget) ? threadOf(replyTarget) : null;
   const thread = own !== null && own !== shownRight ? own : null;
   if (thread === null && gatherReport(id).gathered === 0) return false;
-  gatherState().gathered = { parent: id, context: channelContextKey(), byReply: true, thread, column: activeColumn };
+  gatherState().gathered = { parent: id, context: channelContextKey(), byReply: true, thread, column: columnWork.active() };
   renderChannelRows();
   renderScrollTools();
   return true;
@@ -26214,7 +26219,7 @@ function renderReplyingMarks() {
 
 /** Whether `message` is the one a reply open in the column being worked on answers. */
 function replyingTo(message) {
-  return replyDocked && replyTarget !== null && activeColumn === replyColumn &&
+  return replyDocked && replyTarget !== null && columnWork.active() === replyColumn &&
     String(/** @type {any} */ (message).id) === String(/** @type {any} */ (replyTarget).id);
 }
 
@@ -26287,11 +26292,11 @@ function outboxRow(id) {
  * sent since, Retried, or dismissed is let go.
  */
 function unseenColumnReply() {
-  const id = unseenColumnReplies[activeColumn.name];
+  const id = unseenColumnReplies[columnWork.active().name];
   if (id === null) return null;
   const entry = outbox.get(id);
   if (!entry || (entry.state !== "failed" && entry.state !== "unconfirmed") || outgoingRetries.has(id)) {
-    unseenColumnReplies[activeColumn.name] = null;
+    unseenColumnReplies[columnWork.active().name] = null;
     return null;
   }
   return outboxRow(id) ? entry : null;
@@ -26347,7 +26352,7 @@ function unseenColumnReply() {
  * from first, then the left, then the right while it shows a thread. Null where no column draws it.
  *
  * @param {string} id
- * @returns {{column: typeof activeColumn, row: HTMLElement} | null}
+ * @returns {{column: ColumnFields, row: HTMLElement} | null}
  */
 function answeredRow(id) {
   for (const column of [replyColumn, columns.main, columns.side]) {
@@ -26378,7 +26383,7 @@ function doneWhereNotDrawn(id) {
  * no column, by what the page holds (`doneWhereNotDrawn`).
  *
  * @param {string} id
- * @param {{column: typeof activeColumn, row: HTMLElement} | null} [found]
+ * @param {{column: ColumnFields, row: HTMLElement} | null} [found]
  */
 function answeredDone(id, found = answeredRow(id)) {
   return inColumn(found ? found.column : columns.main, () => (found
@@ -26825,40 +26830,8 @@ let columnsRestoring = false;
  */
 const sideThreads = new Map();
 
-/**
- * Work on column `column` from now on: its records (`ColumnFields`) are the ones the accessors reach.
- * The column put aside has been worked on and `left`, which `followDoneEverywhere` asks of the right
- * column; the one taken up has not. (`#624 voice-page-modularity`, plan step 15: every field group is
- * a record on the column now, so nothing is swapped through module variables.)
- */
-function useColumn(column) {
-  if (column === activeColumn) return;
-  activeColumn.left = true;
-  column.left = false;
-  activeColumn = column;
-  sideActive = column === columns.side;
-}
-
-/**
- * Run `fn` working on column `column`, and work on the one before again however it returns. What
- * `fn` returns is returned: a promise from an `async` function, whose work after its first wait is
- * no longer in here (see `columnSteps`).
- *
- * @template T
- * @param {typeof activeColumn} column
- * @param {() => T} fn
- * @returns {T}
- */
-function inColumn(column, fn) {
-  const was = activeColumn;
-  if (column === was) return fn();
-  useColumn(column);
-  try {
-    return fn();
-  } finally {
-    useColumn(was);
-  }
-}
+// Working on a column (`useColumn`) and running in one (`inColumn`) are the column work's (above, `#624
+// voice-page-modularity`): the column put aside has been worked on and `left`, the one taken up has not.
 
 /**
  * `fn`, bound to the column being worked on now: a control made while a column is drawn acts in that
@@ -26868,7 +26841,7 @@ function inColumn(column, fn) {
  * @returns {(...args: any[]) => any}
  */
 function inThisColumn(fn) {
-  const column = activeColumn;
+  const column = columnWork.active();
   return (...args) => inColumn(column, () => fn(...args));
 }
 
@@ -26885,7 +26858,7 @@ function inThisColumn(fn) {
  * always waits, may stand between the two.
  */
 function columnSteps() {
-  const column = activeColumn;
+  const column = columnWork.active();
   let resumed = false;
   return {
     column,
@@ -26921,7 +26894,7 @@ function eachColumn(fn) {
  */
 function inOtherColumn(fn) {
   if (!sideShowing()) return;
-  inColumn(sideActive ? columns.main : columns.side, fn);
+  inColumn(columnWork.side() ? columns.main : columns.side, fn);
 }
 
 /**
@@ -27181,7 +27154,7 @@ function sameLeftPlace(now, placed) {
  */
 function setLayout(layout, back = false) {
   // From the left column, whichever column asked: the layout changes what the left column shows.
-  if (sideActive) return inColumn(columns.main, () => setLayout(layout, back));
+  if (columnWork.side()) return inColumn(columns.main, () => setLayout(layout, back));
   noteDeepLinkReaderMove();
   if (layout === "list" && layoutChoice.chosen() !== "list" && !back) noteListBefore();
   layoutChoice.choose(layout);
@@ -27213,7 +27186,7 @@ function noteListBefore() {
  * then; else one column, on the view it showed (`oneColumnBeforeList`).
  */
 function threadListBack() {
-  if (sideActive) return inColumn(columns.main, threadListBack);
+  if (columnWork.side()) return inColumn(columns.main, threadListBack);
   const before = layoutChoice.listBefore();
   if (before.layout === "two" && columnsFit) {
     layoutChoice.restoreBeforeColumns(before.columns);
@@ -27314,7 +27287,7 @@ function chooseView(which) {
  * @param {{view: string, thread: string | null, summary: any, origin: string | null}} target
  */
 function chooseOneColumn(target) {
-  if (sideActive) return inColumn(columns.main, () => chooseOneColumn(target));
+  if (columnWork.side()) return inColumn(columns.main, () => chooseOneColumn(target));
   noteDeepLinkReaderMove();
   oneColumnWanted = target;
   setLayout("one");
@@ -27373,7 +27346,7 @@ function showOneColumnView(target, record, place = null) {
 
 /** Keep the view on screen as its channel's choice, in one column, where nothing switched views to do it. */
 function recordViewChoice() {
-  if (sideColumnUp() || sideActive) return;
+  if (sideColumnUp() || columnWork.side()) return;
   const chosen = viewOnScreen();
   if (chosen) uiState.remember(chosen);
   uiState.settle();
@@ -30007,7 +29980,7 @@ function resetSideColumn(reopen = false) {
   });
   // Made afresh, as when it was first used: only while it is not the column worked on, whose records
   // are live.
-  if (activeColumn !== columns.side) {
+  if (columnWork.active() !== columns.side) {
     columns.side.left = false;
     columns.side.older = freshOlderPages();
     columns.side.arrows = freshReplyArrows();
@@ -30084,7 +30057,7 @@ async function readSideColumn(reason, since = null) {
  * changed that fails after its first page keeps its record, which no refresh begun before it can
  * act on: the chain ran queued behind that refresh's read of Main, and its failure is that read's.
  *
- * @type {Map<typeof activeColumn, {context: string, read: number, full: boolean}>}
+ * @type {Map<ColumnFields, {context: string, read: number, full: boolean}>}
  */
 const columnReadsSent = new Map();
 
@@ -30098,7 +30071,7 @@ const columnReadsSent = new Map();
  * poll would leave the edit unread.
  */
 function answeredSince(since, reason) {
-  const sent = columnReadsSent.get(activeColumn);
+  const sent = columnReadsSent.get(columnWork.active());
   return Boolean(sent) && sent.read > since && sent.context === channelContextKey() &&
     (sent.full || forwardCursor(reason) !== null);
 }
@@ -30358,7 +30331,7 @@ function abandonedReadStands(read) {
  * delta lands only where it still continues the view's cover and needs no page after it.
  *
  * @param {VibeTalk.TimelineResponse} payload
- * @param {{context: string, channel: string, view: string, thread: any, canon: any, column: typeof activeColumn,
+ * @param {{context: string, channel: string, view: string, thread: any, canon: any, column: ColumnFields,
  *   sent: string | null, held: Map<string, any>}} read
  */
 function landAbandonedTimelineRead(payload, read) {
@@ -30417,7 +30390,7 @@ let timelineReadContext = null;
  * The read queued behind the one on the wire, by the column it is for: one each, so a read of the
  * thread on the right never stands in for a refresh of Main or the other way round. `#229`.
  *
- * @type {Map<typeof activeColumn, {options: any}>}
+ * @type {Map<ColumnFields, {options: any}>}
  */
 const discordQueuedLoads = new Map();
 /**
@@ -30447,13 +30420,13 @@ const replayLedger = createReplayLedger();
  * @param {{keepPosition?: boolean, quiet?: boolean, ownAct?: boolean, reason?: string | (string | undefined)[], readAs?: string}} [options]
  */
 function queueDiscordLoad(options) {
-  const queued = discordQueuedLoads.get(activeColumn);
+  const queued = discordQueuedLoads.get(columnWork.active());
   if (!queued) {
-    discordQueuedLoads.set(activeColumn, { options });
+    discordQueuedLoads.set(columnWork.active(), { options });
     return;
   }
   // Every reason kept, the newest options otherwise, `quiet` from either (web/src/core/sync `joinQueuedReads`).
-  discordQueuedLoads.set(activeColumn, { options: joinQueuedReads(queued.options, options) });
+  discordQueuedLoads.set(columnWork.active(), { options: joinQueuedReads(queued.options, options) });
 }
 
 /**
@@ -30461,7 +30434,7 @@ function queueDiscordLoad(options) {
  * left column's first, in its own column. `column` is the column of the read that has just ended,
  * whose loading line goes when nothing is queued behind it.
  */
-async function finishDiscordLoad(column = activeColumn) {
+async function finishDiscordLoad(column = columnWork.active()) {
   discordFetchInFlight = false;
   timelineReadContext = null;
   const next = [columns.main, columns.side].find((one) => discordQueuedLoads.has(one));
@@ -33424,7 +33397,7 @@ function readEnteredChannel(keepPosition) {
 // one across would ask the server to step back from a message that is not there.
 function changeSelectedChannel() {
   // From the left column, whichever column the key that asked for it was in. `#229 desktop-two-column`.
-  if (sideActive) return inColumn(columns.main, changeSelectedChannel);
+  if (columnWork.side()) return inColumn(columns.main, changeSelectedChannel);
   noteDeepLinkReaderMove();
   // `#277 reply-in-column`. A reply open in a column answers a message of the channel being left.
   putDockedReplyAway();
@@ -33956,7 +33929,7 @@ if (typeof window.ResizeObserver === "function") {
     if (!sideColumnUp() || screens.screen() !== "main" || screens.view() !== "discord") return false;
     if (columns.side.mode === "list") return !cardsOpening;
     return inColumn(columns.side, () => {
-      const walk = activeColumn.searchWalk;
+      const walk = columnWork.active().searchWalk;
       return !entryLandingHolds() && heldFilterRow() === null && !(walk && walk.anchored);
     });
   };

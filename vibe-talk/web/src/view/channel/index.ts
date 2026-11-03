@@ -91,3 +91,5 @@ export { createCardFlight } from "./cardflight.ts";
 export type { CardFlight, CardFlightDependencies } from "./cardflight.ts";
 export { createArming } from "./arming.ts";
 export type { Arming, ArmingDependencies } from "./arming.ts";
+export { createColumnWork } from "./columnwork.ts";
+export type { ColumnWork, WorkedColumn } from "./columnwork.ts";

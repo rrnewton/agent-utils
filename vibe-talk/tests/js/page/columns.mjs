@@ -3465,7 +3465,7 @@ test("`#298 thread-card-header`: the card across the window counts the thread's 
   const always = await run(brokenScript("  if (threadCardsDrawn.get(card.id) === signature) return;\n", ""));
   assert.ok(always.writes > 0, "the negative control wrote nothing either, so the check above proves nothing");
   const heading = await run(brokenScript(
-    "  if (!sideActive && selection().view === \"thread\") paintThreadCard(leftEl(\"thread-card\"), openThreadChoice(), tally);\n", ""));
+    "  if (!columnWork.side() && selection().view === \"thread\") paintThreadCard(leftEl(\"thread-card\"), openThreadChoice(), tally);\n", ""));
   assert.notDeepStrictEqual(heading.counted, counted, "the negative control counted the Done anyway, so the check above proves nothing");
 });
 
