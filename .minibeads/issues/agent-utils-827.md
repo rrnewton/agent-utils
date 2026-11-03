@@ -32,3 +32,15 @@ For each repeat offender decide, with evidence: LOAD (memory or CPU contention i
 ### rust.agentctl.test — REAL BUG (fixed)
 
 [muse watermelon-full-preview] Failing cases `chat_reply::a_reply_id_alone_finds_the_bridge_and_its_request_through_the_index` and `chat_reply::a_bridge_targeting_the_caller_is_chosen_and_an_ambiguous_one_is_refused` (gate-742c and others) were not load: the reply ID is `{base64url nonce}_{ordinal}` (`current_reply_id` in `rs/agentctl/src/chat_runtime.rs`), and a nonce starting with `-` (probability ~1/64 per ID) made clap refuse the positional ID as an unknown option (`unexpected argument '-3' found`, exit 2) in exactly the `agentctl chat reply ID` form a prompt prints. Fix: `allow_hyphen_values` on the positional reply ID of `chat reply`, `chat sent`, `chat thread`, and `chat help` in `rs/agentctl/src/cli.rs`, with a parse regression test (`chat_reply_id_may_start_with_a_hyphen`). This also explains part of the `cross.agentctl.differential-*` and `python.agentctl.shard-*` flakiness whenever their cases mint reply IDs. `directory::rejection_lookup_and_write_share_one_deadline_even_through_the_warm_wrapper` also failed in gate-742c; verdict pending (deadline-shaped, likely LOAD).
+
+### python.agentctl.shard-0 — RACE in the test probe (fixed)
+
+`test_command_parent_death_reaps_supervisor_and_adapter_group[anchor]` (gate-742i): the probe subprocess died with `IndexError` reading the descendants file the adapter creates empty and then writes PIDs into; the outer test then timed out at 12 s. The probe already retried on `FileNotFoundError` but not on an empty/partial read. Fixed in `py/tests/test_herdr_chat_transport.py`: empty/partial reads count as not-ready. All 4 parametrizations pass.
+
+### cross.agentctl.differential-* / herdr-agent — LOAD (verdict, fix pending measurement)
+
+Failing cases are delivery-ordering assertions (`primary/muse14/resumed-drain` python rc 75, `delivered-once-in-order`, herdr-agent `send/possibly-submitted*`): both editions behave the same solo; in full gates the wall-clock delivery windows flip under cross-gate host contention. These steps already run in the serial solo phase per gate; the remaining contention is other gates' main phases. No sleep lengthening allowed; candidate fix is CPU-budget-based pacing in the differential harness, to be measured.
+
+### rust.chat-subscription.slack — LOAD-suspect (verdict pending reproduction)
+
+`directory::rejection_lookup_and_write_share_one_deadline_even_through_the_warm_wrapper` (gate-742c): expected `unknown`, got `not_applied` — a shared-deadline classification that flips when the host is slow. Reproduce under load before fixing.

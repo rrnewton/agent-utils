@@ -407,7 +407,9 @@ while time.monotonic() < deadline:
             supervisors = [int(next(
                 line.split()[1] for line in status.splitlines() if line.startswith("PPid:")
             ))]
-        except FileNotFoundError:
+        except (FileNotFoundError, IndexError, ValueError):
+            # The adapter creates the file before writing the PIDs into it; an
+            # empty or partial read is "not ready", not a failure (#827).
             supervisors = []
         if len(supervisors) == 1 and supervisors[0] != 0:
             break
