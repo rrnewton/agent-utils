@@ -1706,7 +1706,11 @@ struct ChatSent {
     #[command(flatten)]
     target: ChatTarget,
     /// Only the replies of the request whose prompt gave this reply ID
-    #[arg(value_name = "REPLY_ID", conflicts_with = "request", allow_hyphen_values = true)]
+    #[arg(
+        value_name = "REPLY_ID",
+        conflicts_with = "request",
+        allow_hyphen_values = true
+    )]
     reply_id: Option<String>,
     /// Only this request's replies: its exact 64-character lowercase hexadecimal key
     #[arg(long, value_name = "KEY")]
@@ -5370,10 +5374,9 @@ mod tests {
     fn chat_reply_id_may_start_with_a_hyphen() {
         // Reply IDs are `{base64url nonce}_{ordinal}`; a nonce starting with `-` was refused
         // as an unknown option (#827), in exactly the positional form a prompt prints.
-        let cli = Cli::try_parse_from([
-            "agentctl", "chat", "reply", "-3abc_1", "--file", "reply.md",
-        ])
-        .unwrap();
+        let cli =
+            Cli::try_parse_from(["agentctl", "chat", "reply", "-3abc_1", "--file", "reply.md"])
+                .unwrap();
         let Some(Commands::Chat(chat)) = cli.command else {
             panic!("chat");
         };
