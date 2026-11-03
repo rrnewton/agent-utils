@@ -103,6 +103,7 @@ export {
   NEWLINE_KEYS,
   createComposerGrow,
   createComposerKeys,
+  createDictation,
   createOnScreenKeyboard,
   focusAtEnd,
   isComposer,

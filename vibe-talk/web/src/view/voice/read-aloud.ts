@@ -67,9 +67,23 @@ interface DrawnBlock { element: Element; kind: string; piece: number; pieces: nu
 type Position = [Node, number];
 interface Sentence { from: Position; to: Position; length: number }
 
+/** A box on screen, in the viewport's pixels. */
+export interface ScreenBox { top: number; bottom: number; left: number; right: number }
+
+/**
+ * `#821 voice-page-read-aloud-react`. What a pause held: the message being read, the words heard there (the
+ * sentence lit, else the block or its piece being read), and where they stand on the screen.
+ */
+export interface HeldSentence { readonly id: string; readonly text: string; readonly box: ScreenBox | null }
+
 /** Live page dependencies; constructing the owner performs no I/O or event registration. */
 export interface ReadAloudDependencies<Column = unknown> {
   el<K extends string>(id: K): K extends keyof ElementById ? ElementById[K] : HTMLElement;
+  /**
+   * `#821 voice-page-read-aloud-react`. React: open a quoted reply to message `id` on `text`, the words a
+   * pause held, under `box` where they stood.
+   */
+  openSentenceReply(id: string, text: string, box: ScreenBox | null): void;
   leftEl(id: string): HTMLElement;
   deviceSettings(): DeviceSettings;
   guardQuietly(fn: () => unknown): () => Promise<unknown>;
@@ -968,6 +982,9 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     // Invalidate every read in flight, not only the one that is audible. A fetch that has not come
     // back yet is still going to build a player unless its ticket is stale.
     readingTicket += 1;
+    // `#821 voice-page-read-aloud-react`. Nothing is held once the read is gone.
+    heldSentence = null;
+    heldAnchor = null;
     const wasPending = pendingRead !== null;
     pendingRead = null;
     // `#487 read-aloud-recovery`. A read waiting to start again after it was cut off held the media
@@ -1720,6 +1737,17 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
   let litSentence = "";
   /** The first text node of each row's sentences when it was lit (`showReadingSentence`). */
   let litSentenceNodes: Node[] = [];
+  /** `#821 voice-page-read-aloud-react`. The lit sentence's words and its range in the first row, with the light. */
+  let litSentenceText = "";
+  let litSentenceRange: Range | null = null;
+  /**
+   * `#821 voice-page-read-aloud-react`. What the last pause held, captured as it held (`holdReadingSentence`):
+   * a snapshot, so React replies to the words that were heard whatever is drawn again after. Null while the
+   * read plays, or with nothing it could hold.
+   */
+  let heldSentence: HeldSentence | null = null;
+  /** `#821`. What the held words are drawn in (their range, or their block), to find them again at React's press. */
+  let heldAnchor: { getBoundingClientRect(): DOMRect } | null = null;
 
   function sentenceHighlightSupported() {
     return typeof CSS !== "undefined" && CSS !== null && Boolean(CSS.highlights) &&
@@ -1837,6 +1865,8 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     if (sentenceTimer !== null) clearTimeout(sentenceTimer);
     sentenceTimer = null;
     litSentence = "";
+    litSentenceText = "";
+    litSentenceRange = null;
     if (sentenceHighlightSupported()) CSS.highlights.delete(SENTENCE_HIGHLIGHT);
   }
 
@@ -1873,6 +1903,8 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
         readAloudContext === null) {
       if (litSentence !== "") CSS.highlights.delete(SENTENCE_HIGHLIGHT);
       litSentence = "";
+      litSentenceText = "";
+      litSentenceRange = null;
       return;
     }
     const listed = playing.blocks![segment.part] && playing.blocks![segment.part]![segment.block!]!;
@@ -1909,6 +1941,78 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     CSS.highlights.set(SENTENCE_HIGHLIGHT, new Highlight(...ranges));
     litSentence = key;
     litSentenceNodes = lit.map((one) => one!.sentences[0]!.from[0]!);
+    litSentenceRange = ranges[0] || null;
+    litSentenceText = litSentenceRange ? wordsOf(litSentenceRange.toString()) : "";
+  }
+
+  /** Text as it reads: each run of spaces one, the ends trimmed. */
+  function wordsOf(text: string) {
+    return text.replace(/\s+/g, " ").trim();
+  }
+
+  /** `element`'s box on screen, or null where it has none. */
+  function boxOf(element: { getBoundingClientRect(): DOMRect } | null): ScreenBox | null {
+    if (!element) return null;
+    const rect = element.getBoundingClientRect();
+    return { top: Number(rect.top) || 0, bottom: Number(rect.bottom) || 0, left: Number(rect.left) || 0, right: Number(rect.right) || 0 };
+  }
+
+  /**
+   * `#821 voice-page-read-aloud-react`. The words being heard in `playing` now, and where: the sentence lit,
+   * after one last look at the instant of the pause; where none is lit, the sentence the device voice is
+   * saying (it says one at a time); else (one block, a browser without highlights) the piece of the block
+   * being read, or the block, or the message's words. Null where the read draws nothing to hold.
+   */
+  function sentenceHeardNow(playing: Playing): { held: HeldSentence; anchor: { getBoundingClientRect(): DOMRect } | null } | null {
+    showReadingSentence();
+    const segment = playing.segments ? playing.segments[playing.segment || 0] : null;
+    // The message the words are in: a row of several reads them one part at a time, each its message's.
+    const id = segment && Array.isArray(playing.parts) && playing.parts[segment.part] ? String(playing.parts[segment.part]) : playing.id;
+    const holding = (text: string, anchor: { getBoundingClientRect(): DOMRect } | null) =>
+      ({ held: { id, text, box: boxOf(anchor) }, anchor });
+    if (litSentenceText !== "") return holding(litSentenceText, litSentenceRange);
+    const row = readingRowsOf(playing.id).sort((one, other) => Number(rowSeen(other)) - Number(rowSeen(one)))[0];
+    if (!row) return null;
+    const spoken = playing.utterance && typeof playing.utterance.text === "string" ? wordsOf(playing.utterance.text) : "";
+    if (spoken !== "") return holding(spoken, childByClass(row, "body"));
+    const drawn = segment && segment.block !== null ? preparedBlocksOf(row, segment.part) : null;
+    const block = drawn && segment ? drawn[segment.block!] : null;
+    if (block) {
+      const piece = readPieceOf(block);
+      const shown = shownTextOf(block.element).text;
+      const text = wordsOf(piece ? shown.slice(piece.start, piece.end) : shown);
+      if (text !== "") return holding(text, block.element);
+    }
+    const body = childByClass(row, "body") as HTMLElement | null;
+    // As drawn, a line between paragraphs, not their text run together.
+    const text = body ? wordsOf(String(body.innerText || body.textContent || "")) : "";
+    return text !== "" ? holding(text, body) : null;
+  }
+
+  /**
+   * `#821 voice-page-read-aloud-react`. The pause has held: the light stays on the sentence heard, which
+   * nothing looks for again until the read carries on (a voice whose pause empties its engine would
+   * otherwise take the light off), and what it held is what React replies to.
+   */
+  function holdReadingSentence(heard: { held: HeldSentence; anchor: { getBoundingClientRect(): DOMRect } | null } | null) {
+    if (sentenceTimer !== null) clearTimeout(sentenceTimer);
+    sentenceTimer = null;
+    heldSentence = heard ? heard.held : null;
+    heldAnchor = heard ? heard.anchor : null;
+  }
+
+  /** `#821 voice-page-read-aloud-react`. Whether a read of one block is paused on words: React stands alone. */
+  function reactAlone() {
+    return readingPosition() === "" && readingPaused() && heldSentence !== null;
+  }
+
+  /** `#821 voice-page-read-aloud-react`. React, pressed: a quoted reply on the words the pause held. */
+  function reactToHeldSentence() {
+    const held = heldSentence;
+    if (!readingPaused() || held === null) return;
+    // Where the words stand now: the list may have moved since the pause.
+    const box = heldAnchor ? boxOf(heldAnchor) : null;
+    deps.openSentenceReply(held.id, held.text, box && box.bottom > box.top ? box : held.box);
   }
 
   /** "2 of 5" for a read of several parts; "" for a read of one, or none. */
@@ -1955,9 +2059,14 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     // read cut off is tried again (`recoverRead`). `renderReadLayout` takes it away if either ends
     // without a block playing. (On a desk too: there it no longer blinks out on a Next.)
     const held = position === "" && !wasHidden && (readJumpPending || readRecovering);
-    strip.hidden = position === "" && !held;
+    // `#821 voice-page-read-aloud-react`. A read of one block draws no strip; paused on words, it draws React
+    // alone in one, where a read of several has it beside the arrows.
+    const alone = reactAlone();
+    strip.hidden = position === "" && !held && !alone;
+    strip.toggleAttribute("data-react-only", alone);
     renderReadTransport();
     if (!held) renderReadTimeline();
+    if (alone && wasHidden) placeReadSteer();
     if (position === "") return;
     deps.el("read-steer-count").textContent = position;
     deps.el("read-next").disabled = nowPlaying!.segment! + 1 >= nowPlaying!.segments!.length;
@@ -2215,6 +2324,12 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     const paused = readingPaused();
     const strip = deps.el("read-steer");
     if (strip) strip.setAttribute("data-paused", paused ? "true" : "false");
+    // `#821 voice-page-read-aloud-react`. React, while a pause holds words to reply to.
+    const react = deps.el("read-react");
+    if (react) {
+      const hidden = !paused || heldSentence === null;
+      if (react.hidden !== hidden) react.hidden = hidden;
+    }
     const button = deps.el("read-aloud");
     if (button) {
       button.setAttribute("data-paused", paused ? "true" : "false");
@@ -2264,19 +2379,17 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
   function renderReadLayout() {
     const strip = deps.el("read-steer");
     if (!strip) return;
-    // A strip held up through a jump or a recovery (`renderReadSteer`) goes when that ends with nothing playing.
-    if (!strip.hidden && readingPosition() === "" && !readJumpPending && !readRecovering) {
+    // A strip held up through a jump or a recovery (`renderReadSteer`) goes when that ends with nothing playing;
+    // one standing for React alone (`#821`) stays while the pause holds words.
+    if (!strip.hidden && readingPosition() === "" && !readJumpPending && !readRecovering && !reactAlone()) {
       strip.hidden = true;
       renderReadTimeline();
     }
     const root = document.documentElement;
-    if (strip.hidden) root.removeAttribute("data-read-strip");
+    // `#821`: a strip standing for React alone is no read in progress: the layout stays as it was.
+    if (strip.hidden || strip.hasAttribute("data-react-only")) root.removeAttribute("data-read-strip");
     // Held through a jump, it says what it said: a held read's jump cues its block up held.
     else if (nowPlaying !== null) root.setAttribute("data-read-strip", readingPaused() ? "paused" : "playing");
-    // `#819 voice-page-quoted-reply-and-draft-chip`. The strip says so itself, on a desk too, for what it
-    // shows only while its read is held: Quote reply.
-    if (strip.hidden) strip.removeAttribute("data-held");
-    else if (nowPlaying !== null) strip.toggleAttribute("data-held", readingPaused());
   }
 
   /** A read is playing or held, or moving to another of its blocks (`readJumpPending`). */
@@ -2305,6 +2418,9 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
   function pauseReading() {
     const playing = nowPlaying;
     if (playing === null || playing.paused) return;
+    // `#821 voice-page-read-aloud-react`. What is being heard, read before the transport holds: the device
+    // voice's pause empties its engine, and with it what the sentence is timed by.
+    const heard = sentenceHeardNow(playing);
     const audio = playing.audio;
     if (typeof playing.pauseTransport === "function") {
       playing.pauseTransport();
@@ -2317,8 +2433,10 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
       return;
     }
     nowPlaying = { ...nowPlaying!, paused: true, wasHeld: true };
+    holdReadingSentence(heard);
     mediaSessionState("paused");
-    renderReadTransport();
+    // The strip and the transport, React with them (`renderReadSteer` draws the transport too).
+    renderReadSteer();
   }
 
   /**
@@ -2437,6 +2555,9 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
   function resumeReading() {
     const playing = nowPlaying;
     if (playing === null || !playing.paused) return;
+    // `#821 voice-page-read-aloud-react`. Carried on: nothing is held, and the light goes on with the read.
+    heldSentence = null;
+    heldAnchor = null;
     // What it was held on has gone (see `heldReadStale`): read the held block again instead of
     // resuming onto a dead URL or a closed context and failing the whole read. A transport that
     // repairs itself (the device voice re-speaks its held chunk) is left to it.
@@ -2469,7 +2590,8 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
       if (begun && typeof begun.catch === "function") begun.catch(again);
     }
     mediaSessionState("playing");
-    renderReadTransport();
+    renderReadSteer();
+    showReadingSentence();
   }
 
   /**
@@ -3036,6 +3158,8 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
   renderReadTransport,
   readInProgress,
   toggleReadingPaused,
+  reactToHeldSentence,
+  get heldSentence() { return heldSentence; },
   readAloud
   };
 }

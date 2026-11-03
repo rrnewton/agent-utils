@@ -34,6 +34,16 @@ chip is the topmost thing at its centre and around it, as is its twin, Quote rep
 strip; a press of the chip opens the quick reply focused, which takes typed words and words committed as
 dictation does, and sends them quoted; and a press of the twin opens it too.
 
+`#821 voice-page-read-aloud-react`. With the agent's voice reading the long first message, at 360x780, 375x812
+and 412x915 by touch and 1280x800 by mouse: the sentence being said is lit; Pause holds it, the same range lit
+a second later, and React stands at the far right of the arrows' row, the arrows and the count between the
+row's edge and React, every arrow and React at least 48px tall on a phone (52px drawn), the row one line.
+React opens the quick reply quoting exactly the lit sentence, focused; a stand-in recognition (the browser's
+`webkitSpeechRecognition`, which a phone's Chrome has) is started by the press, says it listens, and its words,
+unsure then settled, land in the box, which the Draft chip then counts. And with no recognition at all, React
+still opens the box focused and says to use the keyboard's microphone. The device voice, whose pause empties
+its engine and lights no sentence, holds the block being read instead, and React quotes that.
+
 Pass --web-root DIR to run against another copy of the page (the one before #554 fails at the device
 voice's resume), and --screenshots DIR to keep PNGs.
 """
@@ -394,6 +404,185 @@ def run_quote(chromium: BrowserType, args: argparse.Namespace, touch: bool) -> s
         thread.join()
 
 
+# `#821`: a stand-in for the browser's speech recognition, which says "please check" unsure and then settles on
+# "please check the replica", and records that it was started.
+FAKE_RECOGNITION = """(() => {
+  window.recognitionStarts = 0;
+  class FakeRecognition {
+    constructor() { this.lang = ''; this.continuous = true; this.interimResults = false; this.onresult = null; this.onerror = null; this.onend = null; }
+    start() {
+      window.recognitionStarts += 1;
+      const say = (words, isFinal) => this.onresult && this.onresult({resultIndex: 0, results: [Object.assign([{transcript: words}], {isFinal})]});
+      setTimeout(() => say('please check', false), 150);
+      setTimeout(() => say('please check the replica', true), 450);
+      setTimeout(() => this.onend && this.onend(), 700);
+    }
+    abort() {}
+  }
+  window.SpeechRecognition = FakeRecognition;
+  window.webkitSpeechRecognition = FakeRecognition;
+})();"""
+
+# `#821`: a browser with no speech recognition at all.
+NO_RECOGNITION = """(() => {
+  for (const name of ['SpeechRecognition', 'webkitSpeechRecognition']) {
+    try { Object.defineProperty(window, name, {value: undefined, configurable: true, writable: true}); } catch (_error) {}
+  }
+})();"""
+
+# `#821`: the lit sentence's words, and the strip's controls' boxes.
+LIT_JS = """() => {
+  const lit = CSS.highlights && CSS.highlights.get('read-aloud-sentence');
+  const range = lit ? [...lit][0] : null;
+  return range ? range.toString().replace(/\\s+/g, ' ').trim() : null;
+}"""
+STRIP_JS = """() => {
+  const box = (id) => { const n = document.getElementById(id); if (!n || n.hidden || !n.getClientRects().length) return null;
+    const r = n.getBoundingClientRect(); return {left: r.left, right: r.right, top: r.top, bottom: r.bottom, width: r.width, height: r.height}; };
+  return {strip: box('read-steer'), react: box('read-react'), count: box('read-steer-count'),
+          arrows: ['read-section-prev', 'read-section-next', 'read-prev', 'read-next'].map(box), timeline: box('read-timeline'),
+          width: document.documentElement.clientWidth};
+}"""
+
+
+def react_walk(desk: Desk, api: VoicesApi, voice: str, touch: bool, recognition: bool) -> None:
+    """`#821`: a paused read's React, its held sentence, its layout, and the box it opens."""
+    page = desk.page
+    sign_in(desk)
+    if voice == "device":
+        page.click("#audio-source")
+        desk.wait_for("() => document.getElementById('audio-source').getAttribute('aria-checked') === 'false'",
+                      "react: the audio switch did not choose the device voice")
+    press(page, "#read-aloud", touch)
+    desk.settled()
+    row = f"#{LIST} > li[data-id='{MESSAGE}']"
+    page.evaluate("(selector) => document.querySelector(selector).scrollIntoView({block: 'center'})", row)
+    desk.settled()
+    body = page.locator(f"{row} .body").first.bounding_box()
+    assert body is not None
+    if touch:
+        page.touchscreen.tap(body["x"] + 12, body["y"] + min(10, body["height"] / 2))
+    else:
+        page.mouse.click(body["x"] + 12, body["y"] + min(10, body["height"] / 2))
+    if voice == "device":
+        wait_until(page, "() => window.deviceSpeech.filter((one) => one.started !== null).length >= 2",
+                   "react, device: the read never reached its second sentence")
+    else:
+        desk.wait_for("() => !document.getElementById('read-steer').hidden"
+                      " && document.getElementById('read-steer-count').textContent === '2 of 3'",
+                      "react: the read never reached its second block", 10)
+        wait_until(page, f"() => ({LIT_JS})() !== null", "react: no sentence is lit while the read plays")
+    desk.check(page.evaluate("() => document.getElementById('read-react').hidden") is True,
+               "react: React is offered while the read plays")
+    press(page, "#read-aloud", touch)
+    desk.settled()
+    desk.check(label(page) == "Resume", f"react: Pause left Read saying {label(page)!r}")
+    held = page.evaluate(LIT_JS) if voice == "agent" else None
+    page.wait_for_timeout(1000)
+    if voice == "agent":
+        desk.check(held is not None and page.evaluate(LIT_JS) == held,
+                   f"react: the light did not hold on {held!r} through the pause: {page.evaluate(LIT_JS)!r}")
+    layout = page.evaluate(STRIP_JS)
+    react = layout["react"]
+    desk.check(isinstance(react, dict), f"react: React is not offered while the read is paused: {layout}")
+    arrows = [one for one in layout["arrows"] if one]
+    if voice == "device":
+        # A read of one block draws no arrows: its strip stands for React alone.
+        desk.check(not arrows, f"react, device: a one-block read's strip draws arrows: {layout}")
+    if voice == "agent":
+        desk.check(len(arrows) == 4, f"react: the four arrows are not all drawn: {layout}")
+        centres = [(one["top"] + one["bottom"]) / 2 for one in [*arrows, react, layout["count"]]]
+        desk.check(max(centres) - min(centres) <= 4, f"react: the arrows' row is more than one line: {layout}")
+        desk.check(all(react["left"] >= one["right"] - 0.5 for one in arrows) and react["left"] >= layout["count"]["right"] - 0.5,
+                   f"react: React is not at the right of the arrows and the count: {layout}")
+        desk.check(react["right"] >= layout["strip"]["right"] - 24, f"react: React is not at the strip's far right: {layout}")
+        if touch:
+            small = [one for one in [*arrows, react] if one["height"] < 48 or (one in arrows and one["width"] < 48)]
+            desk.check(not small, f"react: a phone's arrow or React is under 48px: {small}")
+            desk.check(layout["strip"]["right"] <= layout["width"] + 0.5, f"react: the strip runs past the screen: {layout}")
+        # The arrows stand between the row's edge and React, not at its right edge.
+        left_room = arrows[0]["left"] - layout["strip"]["left"]
+        desk.check(left_room > 8, f"react: the arrows are not centred in the row React leaves: {layout}")
+        # A long read's count, "12 of 12", still leaves the row one line with React in it.
+        page.evaluate("() => { document.getElementById('read-steer-count').textContent = '12 of 12'; }")
+        wide = page.evaluate(STRIP_JS)
+        tops = [(one["top"] + one["bottom"]) / 2 for one in [*[one for one in wide["arrows"] if one], wide["react"], wide["count"]]]
+        desk.check(max(tops) - min(tops) <= 4, f"react: with a two-digit count the row wraps: {wide}")
+        page.evaluate("() => { document.getElementById('read-steer-count').textContent = '2 of 3'; }")
+    found = page.evaluate("() => { const n = document.getElementById('read-react'); const r = n.getBoundingClientRect();"
+                          " const at = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);"
+                          " return at === n || n.contains(at); }")
+    desk.check(found is True, "react: something covers React")
+    desk.shot("react-paused")
+    sent_drafts = page.evaluate("() => document.getElementById('draft-chip').hidden")
+    press(page, "#read-react", touch)
+    desk.wait_for("() => !document.getElementById('quick-reply').hidden", "react: React opened no quick reply")
+    desk.wait_for("() => document.activeElement === document.getElementById('quick-reply-text')",
+                  "react: the quick reply did not take the focus")
+    quote = page.evaluate("() => document.getElementById('quick-reply-quote').textContent.replace(/\\s+/g, ' ').trim()")
+    if voice == "agent":
+        desk.check(quote == held, f"react: the quick reply quotes {quote!r}, not the lit sentence {held!r}")
+    else:
+        words = " ".join(" ".join(paragraphs_of(MESSAGE)).split())
+        desk.check(bool(quote) and quote in words, f"react, device: the quick reply quotes {quote!r}, not words of the message")
+    if recognition:
+        desk.wait_for("() => window.recognitionStarts === 1", "react: React started no recognition")
+        desk.wait_for("() => document.getElementById('quick-reply').hasAttribute('data-listening')"
+                      " || document.getElementById('quick-reply-text').value.includes('please')",
+                      "react: the box shows no listening state")
+        desk.wait_for("() => document.getElementById('quick-reply-text').value.endsWith('please check the replica')",
+                      "react: the settled words did not land in the box", 5)
+        desk.wait_for("() => !document.getElementById('quick-reply').hasAttribute('data-listening')",
+                      "react: the box still listens after the recognition ended", 5)
+        desk.shot("react-dictated")
+        page.keyboard.press("Escape")
+        desk.wait_for("() => document.getElementById('quick-reply').hidden", "react: Esc left the quick reply up")
+        desk.wait_for("() => !document.getElementById('draft-chip').hidden", "react: the Draft chip does not count the reply")
+        desk.check(sent_drafts is True, "react: a draft chip was up before React")
+    else:
+        state = page.evaluate("() => document.getElementById('quick-reply-state').textContent")
+        desk.check("microphone on your keyboard" in str(state), f"react, no recognition: the box says {state!r}")
+        page.keyboard.press("Escape")
+    desk.check(label(page) == "Resume", f"react: the read did not stay paused: Read says {label(page)!r}")
+    desk.notes.append(f"React {'quoted the held sentence ' + repr(held[:30]) if held else 'quoted the held block'}, "
+                      + ("dictation landed in the box and the Draft chip counted it" if recognition else
+                         "with no recognition the box focused and pointed at the keyboard's microphone"))
+
+
+def run_react(chromium: BrowserType, args: argparse.Namespace, voice: str, size: tuple[int, int], touch: bool,
+              recognition: bool) -> str:
+    api = VoicesApi()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler(api))
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    width, height = size
+    try:
+        with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-react-") as profile:
+            context = chromium.launch_persistent_context(
+                profile, headless=True, executable_path=args.browser_executable,
+                viewport={"width": width, "height": height}, color_scheme="dark", has_touch=touch, is_mobile=touch)
+            version = context.browser.version if context.browser else "Chromium"
+            page = context.pages[0]
+            errors: list[str] = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            page.add_init_script(AUDIO_PROBE)
+            if voice == "device":
+                page.add_init_script(ANDROID_VOICE)
+            page.add_init_script(FAKE_RECOGNITION if recognition else NO_RECOGNITION)
+            desk = Desk(page, args.screenshots, f"react-{voice}-{width}", width, height)
+            page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
+            react_walk(desk, api, voice, touch, recognition)
+            check(not errors, f"react {width}x{height}: the page threw: {errors}")
+            context.close()
+            return f"{version}, React at {width}x{height}, the {voice} voice: " + "; ".join(desk.notes)
+    finally:
+        api.stopping.set()
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
 def run(chromium: BrowserType, args: argparse.Namespace, voice: str) -> str:
     api = VoicesApi()
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler(api))
@@ -453,6 +642,11 @@ def main() -> int:
         if args.voice == "both":
             for touch in (True, False):
                 report.append(run_quote(playwright.chromium, args, touch))
+            # `#821 voice-page-read-aloud-react`.
+            for size, touch in (((360, 780), True), ((375, 812), True), ((412, 915), True), ((1280, 800), False)):
+                report.append(run_react(playwright.chromium, args, "agent", size, touch, True))
+            report.append(run_react(playwright.chromium, args, "agent", (412, 915), True, False))
+            report.append(run_react(playwright.chromium, args, "device", (412, 915), True, True))
     for line in report:
         print(line)
     return 0

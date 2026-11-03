@@ -130,3 +130,50 @@ test("`#624 voice-page-modularity`: a focused field with the visual viewport a k
   keyboard.showKeyboardDebug(false);
   assert.equal(els["keyboard-debug-readout"].hidden, true);
 });
+
+test("`#821 voice-page-read-aloud-react`: dictation writes unsure then settled words after what the box held, says it listens, and falls back to the keyboard's microphone", () => {
+  const { createDictation, DICTATION_LISTENING, DICTATION_UNAVAILABLE } = VIEW_COMPOSER;
+  const box = { value: "Yes," };
+  const said = [];
+  const heard = [];
+  let settled = 0;
+  let made = null;
+  class Fake {
+    constructor() { made = this; this.started = false; this.aborted = false; }
+    start() { this.started = true; }
+    abort() { this.aborted = true; }
+  }
+  const deps = (recognition) => ({
+    recognition: () => recognition, lang: () => "en-GB", box: () => box,
+    say: (text) => said.push(text), listening: (on) => heard.push(on), settled: () => { settled += 1; },
+  });
+  const dictation = createDictation(deps(Fake));
+  assert.equal(dictation.start(), true);
+  assert.deepStrictEqual([made.started, made.lang, made.interimResults, made.continuous], [true, "en-GB", true, false]);
+  assert.deepStrictEqual([said.at(-1), heard.at(-1), dictation.active()], [DICTATION_LISTENING, true, true]);
+  const result = (words, isFinal) => ({ resultIndex: 0, results: [Object.assign([{ transcript: words }], { isFinal })] });
+  made.onresult(result("the replica", false));
+  assert.deepStrictEqual([box.value, settled], ["Yes, the replica", 0], "unsure words show, and are not kept yet");
+  made.onresult(result("the replica is done", true));
+  assert.deepStrictEqual([box.value, settled], ["Yes, the replica is done", 1], "settled words are kept as the draft");
+  made.onend();
+  assert.deepStrictEqual([heard.at(-1), said.at(-1), dictation.active()], [false, "", false]);
+  // Refused (no microphone, no permission): the line says to use the keyboard's.
+  dictation.start();
+  made.onerror({ error: "not-allowed" });
+  assert.deepStrictEqual([said.at(-1), dictation.active()], [DICTATION_UNAVAILABLE, false]);
+  // Stopped as the box closes, mid-utterance: the recognition is let go, the words in the box kept, and what
+  // it says after (its own "aborted") changes nothing.
+  dictation.start();
+  made.onresult(result("and the dashboards", false));
+  dictation.stop();
+  assert.deepStrictEqual([made.aborted, dictation.active(), box.value], [true, false, "Yes, the replica is done and the dashboards"]);
+  const quiet = said.length;
+  made.onerror({ error: "aborted" });
+  made.onend();
+  assert.equal(said.length, quiet, "a recognition already let go still spoke");
+  // No recognition in this browser at all.
+  const none = createDictation(deps(null));
+  assert.equal(none.start(), false);
+  assert.equal(said.at(-1), DICTATION_UNAVAILABLE);
+});

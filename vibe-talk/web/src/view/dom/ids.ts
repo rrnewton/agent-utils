@@ -383,6 +383,7 @@ export interface ElementById {
   "read-on-device": HTMLButtonElement;
   "read-pace-help": HTMLParagraphElement;
   "read-prev": HTMLButtonElement;
+  "read-react": HTMLButtonElement;
   "read-section-next": HTMLButtonElement;
   "read-section-prev": HTMLButtonElement;
   "read-speed": HTMLButtonElement;

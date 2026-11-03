@@ -36,6 +36,7 @@ declare const COMPOSER_FIELDS: LegacyImports["COMPOSER_FIELDS"];
 declare const NEWLINE_KEYS: LegacyImports["NEWLINE_KEYS"];
 declare const createComposerKeys: LegacyImports["createComposerKeys"];
 declare const createOnScreenKeyboard: LegacyImports["createOnScreenKeyboard"];
+declare const createDictation: LegacyImports["createDictation"];
 declare const watchInsertions: LegacyImports["watchInsertions"];
 declare const wireNewlineKey: LegacyImports["wireNewlineKey"];
 declare const createNavigation: LegacyImports["createNavigation"];

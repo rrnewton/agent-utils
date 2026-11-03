@@ -706,6 +706,7 @@ var pageReadAloud;
 function readAloudOwner() {
   if (!pageReadAloud) pageReadAloud = createReadAloud({
     get el() { return el; },
+    openSentenceReply: (id, text, box) => openSentenceReply(id, text, box),
     get leftEl() { return leftEl; },
     get deviceSettings() { return deviceSettings; },
     get guardQuietly() { return guardQuietly; },
@@ -25757,6 +25758,39 @@ async function openDraft(draft) {
   });
 }
 
+/**
+ * `#821 voice-page-read-aloud-react`. React, from a paused read: the quick reply on the words it held, on the
+ * row drawing their message, focused, its draft kept and found as any quick reply's; and the microphone
+ * started in the box where the browser can hear (the press is the gesture it needs), else the line says to
+ * use the keyboard's. The read stays paused behind it: carrying on is the reader's own tap.
+ *
+ * @param {string} id
+ * @param {string} text
+ * @param {{top: number, bottom: number, left: number, right: number} | null} box
+ */
+function openSentenceReply(id, text, box) {
+  const found = draftRow(id);
+  if (!found) {
+    setStatus("That message is not on screen to reply to.");
+    return;
+  }
+  inColumn(found.column, () => quoteOwner.openSentenceReply(found.row, id, text, box));
+  if (!el("quick-reply").hidden) dictation.start();
+}
+
+/**
+ * `#821 voice-page-read-aloud-react`. Speaking into the quick reply (web/src/view/composer `createDictation`):
+ * what it settles on is kept as the draft, as typing is.
+ */
+const dictation = createDictation({
+  recognition: () => /** @type {any} */ (window).SpeechRecognition || /** @type {any} */ (window).webkitSpeechRecognition || null,
+  lang: () => (typeof navigator === "object" && navigator && navigator.language) || "en-US",
+  box: () => el("quick-reply-text"),
+  say: (text) => setTextIfChanged(el("quick-reply-state"), text),
+  listening: (on) => el("quick-reply").toggleAttribute("data-listening", on),
+  settled: () => quoteOwner.noteQuickReplyInput(),
+});
+
 /** A tap on the chip: the newest draft, or the one after the last it went to. */
 async function pressDraftChip() {
   // A quick reply open is put away, its words kept as its draft (not put down into the stream as a tap
@@ -25793,6 +25827,9 @@ const quoteOwner = createQuoting({
   toStream: (row, message, text) => quickReplyToStream(row, message, text),
   drafts: quickDrafts,
   noteDraft: (key, channel, written) => noteDraft("quick", key, channel, written),
+  // `#821 voice-page-read-aloud-react`. The microphone stops whenever the box closes: Send, Cancel, Esc, a tap
+  // elsewhere, another reply.
+  closed: () => dictation.stop(),
 });
 const {
   noteQuoteSelection, takeQuote, placeSelectionChip, pressSelectionChip, quickReplyHolds,
@@ -32836,11 +32873,14 @@ watchBoxInsertions(el("quick-reply-text"));
 // `#819 voice-page-quoted-reply-and-draft-chip`. Kept on the device as it is written, dictation included.
 el("quick-reply-text").addEventListener("input", () => quoteOwner.noteQuickReplyInput());
 leftEl("draft-chip").addEventListener("click", () => guardQuietly(pressDraftChip)());
+// `#821 voice-page-read-aloud-react`. React, in the paused read's strip.
+el("read-react").addEventListener("click", () => readAloudOwner().reactToHeldSentence());
 document.addEventListener("pointerdown", (event) => {
   if (!quoteOwner.quickReplyOpen()) return;
   const target = /** @type {any} */ (event && event.target);
   if (target && (nodeWithin(el("quick-reply"), target) || nodeWithin(leftEl("selection-chip"), target) ||
-    nodeWithin(leftEl("read-steer-quote"), target) || nodeWithin(leftEl("draft-chip"), target))) return;
+    nodeWithin(leftEl("read-steer-quote"), target) || nodeWithin(leftEl("draft-chip"), target) ||
+    nodeWithin(leftEl("read-react"), target))) return;
   putDownQuickReply();
 }, { capture: true });
 document.addEventListener("scroll", (event) => quickReplyListMoved(event && event.target), { capture: true, passive: true });

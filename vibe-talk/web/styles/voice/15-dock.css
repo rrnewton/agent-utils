@@ -128,7 +128,7 @@
   user-select: none;
 }
 
-#read-steer[data-held] #read-steer-quote:not([hidden]) {
+#read-steer[data-paused="true"] #read-steer-quote:not([hidden]) {
   display: block;
 }
 
@@ -186,6 +186,37 @@
 
 .read-steer-button:disabled {
   opacity: 0.45;
+}
+
+/* `#821 voice-page-read-aloud-react`. React at the far right of the arrows' row, while the read is paused:
+   the two auto margins share the row's slack, so the arrows and the count stand centred in what React
+   leaves; with React away (the read playing) the one left takes it all, and they stand at the right as
+   `#627` put them, under the thumb. In the accent: it is the act a pause is for. */
+#read-section-prev,
+#read-react {
+  margin-inline-start: auto;
+}
+
+#read-react {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #fff;
+  font-weight: 700;
+}
+
+#read-react[hidden] {
+  display: none;
+}
+
+/* `#821`. A paused read of one block draws its strip for React alone: no arrows, count or blocks to steer. */
+#read-steer[data-react-only] > :not(#read-react):not(#read-steer-quote) {
+  display: none;
+}
+
+/* `#821`. The quick reply listening: its edge in the accent, as a live microphone. */
+#quick-reply[data-listening] {
+  border-width: 2px;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 35%, transparent), 0 4px 18px rgb(0 0 0 / 0.3);
 }
 
 /* `#627 scrubber-thumb-arrows`. Four arrows where the words were: the fat pair steps a section, the
@@ -272,6 +303,37 @@
 
   :root[data-read-strip] #read-timeline {
     padding-inline: 0;
+  }
+
+  /* `#821 voice-page-read-aloud-react`, the owner: in Reading mode on a phone the arrows get bigger targets,
+     52px, React as tall, their glyphs a step up; the count gives way first, and the gaps, so the row still
+     fits a 360px phone with React in it. */
+  #read-steer .read-steer-arrow {
+    min-width: 3.25rem;
+    min-height: 3.25rem;
+  }
+
+  #read-steer .read-steer-arrow svg {
+    width: 1.75rem;
+    height: 1.75rem;
+  }
+
+  #read-react {
+    min-height: 3.25rem;
+    min-width: 3.25rem;
+    padding: 0 0.45rem;
+    font-size: 0.9rem;
+  }
+
+  #read-steer {
+    gap: 0.2rem;
+  }
+
+  /* "12 of 12" fits beside React at 360px in this type. */
+  #read-steer-count {
+    min-width: 2.5rem;
+    font-size: 0.75rem;
+    white-space: nowrap;
   }
 
   :root[data-read-strip] #frame-body {

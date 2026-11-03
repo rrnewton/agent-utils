@@ -131,7 +131,7 @@ export interface HeldQuote {
 }
 
 /** A box in the viewport's pixels. */
-interface Box {
+export interface Box {
   top: number;
   bottom: number;
   left: number;
@@ -197,6 +197,8 @@ export interface QuotingDependencies {
   readonly drafts: QuickReplyDraftStore;
   /** A quick reply's draft `key`, in channel `channel`, was written, and holds words or not now. */
   noteDraft(key: string, channel: string, written: boolean): void;
+  /** `#821 voice-page-read-aloud-react`. The box has closed, however it did: whatever listens into it stops. */
+  closed(): void;
 }
 
 /** The quoting owner's commands. */
@@ -235,6 +237,12 @@ export interface Quoting {
   quickDraftMessage(key: string): string;
   /** `#819`. Open the quick reply kept under `key` on `row`, the row drawing its message: under the row's top. */
   openQuickDraft(key: string, row: QuotedRow): void;
+  /**
+   * `#821 voice-page-read-aloud-react`. React: the quick reply to message `id`, drawn by `row`, quoting `quote`,
+   * the words a paused read held, under `box`, where they stood (or the row's top). Its draft is kept and
+   * found as any quick reply's.
+   */
+  openSentenceReply(row: QuotedRow, id: string, quote: string, box: Box | null): void;
 }
 
 /** Nothing held, no box open. */
@@ -545,6 +553,7 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
     if (!quickReply) return;
     keepQuickDraft(quickReply.key, quickReply.channel, deps.byId("quick-reply-text").value);
     quickReply = null;
+    deps.closed();
     setHiddenIfChanged(deps.byId("quick-reply"), true);
     deps.byId("quick-reply-text").blur();
   }
@@ -604,6 +613,14 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
     if (quickReply) keepQuickDraft(quickReply.key, quickReply.channel, deps.byId("quick-reply-text").value);
   }
 
+  function openSentenceReply(row: QuotedRow, id: string, quote: string, box: Box | null): void {
+    const message = rowMessages(row).find((one) => String(one.id) === id) || rowMessages(row)[0];
+    if (!message || !quote.trim()) return;
+    const rect = row.getBoundingClientRect();
+    const top = Number(rect.top) || 0;
+    openQuickReplyFor(row, message, quote.trim(), box || { top, bottom: top + QUICK_REPLY_GAP_PX * 3, left: rect.left, right: rect.right });
+  }
+
   function openQuickDraft(key: string, row: QuotedRow): void {
     const { id, quote } = keyParts(key);
     const message = rowMessages(row).find((one) => String(one.id) === id) || rowMessages(row)[0];
@@ -617,7 +634,7 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
   return {
     held: () => quoteHeld, holdQuote, noteQuoteSelection, takeQuote, placeSelectionChip, pressSelectionChip,
     quickReplyHolds, quickReplyListMoved, quickReplyOpen: () => quickReply !== null, placeQuickReply,
-    closeQuickReply, putDownQuickReply, sendQuickReply, noteQuickReplyInput, openQuickDraft,
+    closeQuickReply, putDownQuickReply, sendQuickReply, noteQuickReplyInput, openQuickDraft, openSentenceReply,
     quickDraftLive: (key) => Boolean((quickReplyDrafts.get(key) || "").trim()),
     quickDraftMessage: (key) => keyParts(key).id,
   };
