@@ -1,13 +1,14 @@
 ---
 title: 'chat-bridge-warning-backoff: back off repeated delivery warnings and thread them'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: cl-start@devbig030
 labels:
 - agentctl
 created_at: 2026-11-03T22:00:33.296025718+00:00
-updated_at: 2026-11-03T22:00:33.296025718+00:00
+updated_at: 2026-11-03T23:05:00+00:00
+closed_at: 2026-11-03T23:05:00+00:00
 ---
 
 # Description
@@ -48,4 +49,10 @@ updated_at: 2026-11-03T22:00:33.296025718+00:00
   - The service test `the_owner_alarm_repeats_in_its_thread_across_a_restart_until_acknowledged`: thread, restart, ack keeping the request pending, recovery in the thread.
 - **Docs:** the chat user guide, and the `chat run --owner-alarm-after` and `chat alarm` help.
 
-Remaining: the feasibility note on a "replace message" operation (last bullet of the Design), to be linked here.
+Landed as 0a2f112f.
+
+## Resolution
+
+[opus 5.5] Closed. The behaviour above landed in 0a2f112f. The feasibility note on a "replace message" operation (the last bullet of the Design) is
+https://github.com/rrnewton/dev-agent-utils/blob/main/ai_docs/2026-11-03-chat-replace-message-feasibility.md
+In short: nothing edits or deletes a chat message today, but every provider can. The note proposes an additive outbound update/delete action and a defaulted `replace()` on the transports, used for alarms and status cards only. It would be a new issue if wanted.
