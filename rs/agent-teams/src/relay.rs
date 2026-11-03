@@ -1629,6 +1629,58 @@ fn relay_in_envelope(
             }
         }
     }
+    // Another local team's signed copy (#806 relay-in-ignore-own-host): a message between two
+    // teams on this host is delivered directly and also mirrored into the relay channel, so
+    // this host reads its own copy back. Its authority is the signing key that team@host keeps
+    // on this host (relay/keys), not a trusted peer key: verified by it, the copy takes the
+    // ledger path like any admitted envelope (`duplicate-known` after the direct delivery,
+    // delivered when the relay copy is the only one), never a stranger. A signed copy claiming
+    // this host that no local key verifies is an impersonation: quarantined with an alarm.
+    if from_host == this_host && embedded_key.is_some() {
+        let local = own_public_key(state, &from_team, &from_host);
+        if local.is_some() && embedded_key == local.as_deref() && verify_envelope(envelope) {
+            log_event(
+                state,
+                &json!({"event": "relay-in", "outcome": "own-host", "route": route, "id": id, "from_team": from_team}),
+            );
+            return relay_deliver(
+                state,
+                this_host,
+                route,
+                peer_sender,
+                channel,
+                thread,
+                text,
+                envelope,
+                declaration,
+                entry,
+                &id,
+                true,
+            );
+        }
+        let reason = if local.is_none() {
+            "claims this host, but this host keeps no signing key for the sender team"
+        } else if embedded_key != local.as_deref() {
+            "claims this host, but is not signed with this host's key for the sender team"
+        } else {
+            "claims this host, but its signature does not verify"
+        };
+        record_stranger(
+            state,
+            declaration,
+            entry,
+            peer_sender,
+            envelope,
+            text,
+            reason,
+        )?;
+        let mut out = receipt_for(
+            "quarantined",
+            "stranger: claims this host without its signing key; alarm raised to the coordinator",
+        );
+        out.outcome = "stranger-quarantined".to_string();
+        return Ok(post_receipt(state, entry, channel, thread, &id, out));
+    }
     let trusted = trusted_key(state, &from_team, &from_host);
     let signed_mode = trusted.is_some() || embedded_key.is_some();
     if signed_mode {

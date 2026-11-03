@@ -512,7 +512,13 @@ removes one; re-keying needs `--replace`. trust-key also releases
 quarantined posts claiming that team@host and closes their alarms.
 Signed admission
 consults the trusted key and the declaration's peer list, never the
-sender mapping, so key-only trust is exactly what a shared bot needs. Onboarding is `relay setup`: it suggests the per-fleet channel
+sender mapping, so key-only trust is exactly what a shared bot needs. A
+signed copy from another team on this same host, such as the relay mirror
+of a delivery between two local teams, needs no trust-key: it is admitted
+on the signing key that team keeps on this host (`relay/keys`), so after
+the direct delivery it is a quiet duplicate, and when the relay copy is
+the only one it is delivered. A signed copy claiming this host that no
+local key verifies is an impersonation: quarantined, with an alarm. Onboarding is `relay setup`: it suggests the per-fleet channel
 name (`#relay-<fleet>`), tells the owner exactly what to create and whom
 to invite on Slack or Discord, and prints the bridge, declaration, and
 route snippets to apply. Agents never create channels.

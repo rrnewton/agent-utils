@@ -702,7 +702,8 @@ fn shared_bot_signed_identity_admits_forgery_is_stranger() {
     let _ = agent_teams::relay::ensure_signing_key(&world.state, "sim", "host-a").expect("key");
     let (id, post) = world.send_sim_to_tools("signed hello", "relay-signed-1");
     assert!(post.contains("\"relay\""), "envelope is signed: {post}");
-    // Unknown key yet: a stranger, quarantined and loud.
+    // Unknown key yet: a stranger, quarantined and loud (the key set aside: see set_key_aside).
+    world.set_key_aside("sim");
     let outcome = world.relay_in(SHARED, &post);
     assert_eq!(outcome["outcome"], "stranger-quarantined", "{outcome}");
     assert!(
@@ -714,6 +715,7 @@ fn shared_bot_signed_identity_admits_forgery_is_stranger() {
     );
     // Announce carries the public key; owner confirmation trusts it and
     // the quarantined post drains exactly once.
+    world.restore_key("sim");
     let (_, public) =
         agent_teams::relay::ensure_signing_key(&world.state, "sim", "host-a").expect("key");
     let mut announce = agent_teams::relay::build_announce(
@@ -1166,6 +1168,18 @@ impl World {
         );
         std::fs::write(self.config.join("agent-teams/routes.d/relay.json"), routes)
             .expect("routes rewrite");
+    }
+    /// Set `team`'s signing key aside, so this host keeps none for it. The world runs every team
+    /// on host-a, and a post signed with a key this host keeps is admitted on that key (#806
+    /// relay-in-ignore-own-host), so a test of a team whose key is not trusted yet hides the key
+    /// while that team is a stranger, as if it lived on another host.
+    fn set_key_aside(&self, team: &str) {
+        let key = self.state.join(format!("relay/keys/{team}@host-a.json"));
+        std::fs::rename(&key, key.with_extension("aside")).expect("set the key aside");
+    }
+    fn restore_key(&self, team: &str) {
+        let key = self.state.join(format!("relay/keys/{team}@host-a.json"));
+        std::fs::rename(key.with_extension("aside"), &key).expect("restore the key");
     }
     fn ensure_signing_key(&self, team: &str) -> String {
         agent_teams::relay::ensure_signing_key(&self.state, team, "host-a")
@@ -2288,12 +2302,14 @@ fn trust_key_admits_signed_posts_releases_quarantine_and_rekeys_explicitly() {
         .expect("trust tools");
     // Before trust-key: a sim-signed post through the shared bot is refused.
     let post = signed_post(&world, "tm-sim-79000000000000a1", "release me after trust");
+    world.set_key_aside("sim");
     let outcome = world.relay_in(BOT1, &post);
     assert!(
         !matches!(outcome["outcome"].as_str(), Some("accepted" | "known")),
         "refused before trust: {outcome}"
     );
     assert_eq!(agent_teams::relay::quarantined_posts(&world.state).len(), 1);
+    world.restore_key("sim");
     // trust-key releases it through signed admission and closes its alarm.
     let (code, out, err) = world.run(&["relay", "trust-key", "sim@host-a", "--json"]);
     assert_eq!(code, 0, "trust-key: {out} {err}");
@@ -2389,5 +2405,78 @@ fn trust_key_never_binds_a_key_from_the_local_probe_for_another_host() {
     assert!(
         agent_teams::relay::trusted_key(&world.state, "sim", "host-b").is_none(),
         "local probe must not bind host-a's key as host-b's"
+    );
+}
+
+/// #806 relay-in-ignore-own-host: with two relay-enabled teams on one host and neither local
+/// key trusted, a message between them is delivered directly, and its mirror copy, signed with
+/// the key the sender team keeps on this host, is a quiet duplicate when relay-in reads it back:
+/// no quarantine and no stranger alarm. A signed copy claiming this host with another key is an
+/// impersonation, quarantined with an alarm.
+#[test]
+fn own_host_mirror_copy_is_admitted_on_the_local_key_without_trust() {
+    let world = World::new();
+    world.write_teams(MIRROR_TEAMS_LOCAL);
+    let post = world.root.join("bin/post.sh");
+    world.write_relay_route(true, &post.to_string_lossy());
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    world.ensure_signing_key("sim");
+    world.ensure_signing_key("tools");
+    assert!(
+        agent_teams::relay::trusted_key(&world.state, "sim", "host-a").is_none(),
+        "no trust-key workaround"
+    );
+    let (code, out, err) = world.run(&[
+        "send",
+        "tools@host-a",
+        "--from-team",
+        "sim",
+        "--text",
+        "Same host, no trusted keys.",
+        "--key",
+        "own-host-1",
+        "--json",
+    ]);
+    assert_eq!(code, 75, "direct accepted: {out} {err}");
+    let value: serde_json::Value = serde_json::from_str(&out).expect("send json");
+    let id = value["id"].as_str().expect("id").to_string();
+    let posts = world.channel_posts();
+    assert_eq!(posts.len(), 1, "one mirror post: {posts:?}");
+    let outcome = world.relay_in(BOT1, &posts[0]);
+    assert_eq!(outcome["outcome"], "known", "{outcome}");
+    assert_eq!(world.copies_of("tools", &id), 1, "exactly once");
+    assert!(agent_teams::relay::quarantined_posts(&world.state).is_empty());
+    assert!(agent_teams::relay::alarms(&world.state).is_empty());
+    let log = std::fs::read_to_string(world.state.join("team-log.jsonl")).unwrap_or_default();
+    assert!(log.contains("\"own-host\""), "{log}");
+
+    // The same claim signed with a key this host does not keep for sim@host-a.
+    let elsewhere = world.root.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).expect("other state");
+    let mut forged = agent_teams::envelope::build_envelope(
+        "tm-sim-7878787812121212",
+        "kforged",
+        "sim",
+        "host-a",
+        1,
+        "harness-ancestry",
+        "tools",
+        "host-a",
+        "info",
+        None,
+        &[],
+        false,
+        agent_teams::timeutil::now_unix_ms(),
+        agent_teams::timeutil::now_unix_ms() + 7_200_000,
+        None,
+        "not really from this host",
+    );
+    agent_teams::relay::sign_envelope(&elsewhere, &mut forged).expect("sign elsewhere");
+    let outcome = world.relay_in(BOT1, &agent_teams::relay::render_post(&forged));
+    assert_eq!(outcome["outcome"], "stranger-quarantined", "{outcome}");
+    assert!(!world.ledger_has("tools", "tm-sim-7878787812121212"));
+    assert!(
+        !agent_teams::relay::alarms(&world.state).is_empty(),
+        "alarm raised"
     );
 }
