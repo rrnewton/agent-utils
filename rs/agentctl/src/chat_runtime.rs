@@ -17136,8 +17136,16 @@ fn invalid_rendered_character(character: char) -> bool {
         || ('\u{7f}'..='\u{9f}').contains(&character)
 }
 
+/// A fresh reply nonce. A nonce that would start with `-` is drawn again, since a reply ID that
+/// starts with `-` reads as an option when it is typed as `chat reply ID` (#799
+/// chat-reply-id-leading-dash); one draw in 64 starts that way.
 fn random_reply_nonce() -> Result<String> {
-    Ok(base64url_nonce(random_bytes()?))
+    loop {
+        let nonce = base64url_nonce(random_bytes()?);
+        if !nonce.starts_with('-') {
+            return Ok(nonce);
+        }
+    }
 }
 
 /// The outbound operation ID for one bridge-posted relay receipt.
@@ -18837,6 +18845,22 @@ mod tests {
         assert_eq!(base64url_nonce([0; 16]), "AAAAAAAAAAAAAAAAAAAAAA");
         assert!(valid_nonce("AAAAAAAAAAAAAAAAAAAAAA"));
         assert!(!valid_nonce("AAAAAAAAAAAAAAAAAAAAAA="));
+    }
+
+    /// #799 chat-reply-id-leading-dash: a reply ID that starts with `-` reads as an option when
+    /// typed as `chat reply ID`, so no fresh nonce starts that way. One draw in 64 would, so 2,000
+    /// draws catch a regression all but certainly.
+    #[test]
+    fn no_fresh_reply_nonce_starts_with_a_dash() {
+        assert!(
+            base64url_nonce([0xf8; 16]).starts_with('-'),
+            "the encoding can"
+        );
+        for _ in 0..2_000 {
+            let nonce = random_reply_nonce().expect("nonce");
+            assert!(valid_nonce(&nonce), "{nonce}");
+            assert!(!nonce.starts_with('-'), "{nonce}");
+        }
     }
 
     fn text_prefix_batch(texts: &[&str]) -> DeliveryBatch {

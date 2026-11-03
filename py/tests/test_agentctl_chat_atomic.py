@@ -2500,3 +2500,11 @@ def test_queue_failure_and_recovery_writes_share_the_fixed_slot(
         assert result.quarantined == ("queued",)
         assert (tmp_path / "queue" / "failed" / "queued.json.error").exists()
     assert not (tmp_path / ".atomic" / "staged.json").exists()
+
+
+def test_no_fresh_reply_nonce_starts_with_a_dash() -> None:
+    """#799 chat-reply-id-leading-dash: a reply ID that starts with `-` reads as an option when
+    typed as `chat reply ID`; one draw in 64 would, so 2,000 draws catch a regression."""
+    for _ in range(2_000):
+        nonce = chat_module._reply_nonce()
+        assert len(nonce) == 22 and not nonce.startswith("-"), nonce

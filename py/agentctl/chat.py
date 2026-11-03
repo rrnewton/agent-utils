@@ -184,6 +184,15 @@ class _AuxPopulationSnapshot:
     queue_fixed_reservation: int
 
 
+def _reply_nonce() -> str:
+    """A fresh reply nonce that does not start with `-`: a reply ID that does reads as an option
+    when typed as `chat reply ID` (#799 chat-reply-id-leading-dash)."""
+    while True:
+        nonce = secrets.token_urlsafe(16)
+        if not nonce.startswith("-"):
+            return nonce
+
+
 class _ServiceTerminated(BaseException):
     """Exit through owned cleanup, bypassing ordinary adapter-error retries."""
 
@@ -2375,7 +2384,7 @@ class Bridge:
             if self.config.outbound_mode == "enabled" and self.config.reply_mode == "tagged":
                 # Persist an unpredictable marker before the prompt can reach the TUI.
                 # Source text cannot know it; retained output from another request cannot match it.
-                record["reply_nonce"] = secrets.token_urlsafe(16)
+                record["reply_nonce"] = _reply_nonce()
                 record["reply_protocol"] = 3
                 record["reply_next_ordinal"] = 1
             record_bytes = len(encoded_json(record, REQUEST))
