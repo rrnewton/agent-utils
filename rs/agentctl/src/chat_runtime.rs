@@ -695,6 +695,16 @@ pub struct BridgeConfiguration {
     /// the agent's pane, or a headless agent's model started it): see [`Self::receipt_emoji`].
     #[serde(default, skip_serializing_if = "ReactionSetting::is_inherit")]
     pub receipt_reaction: ReactionSetting,
+    /// Show the ack-to-delivered minutes in the receipt reaction (#802
+    /// chat-delivery-latency-emoji): under 30 s it stays the receipt emoji,
+    /// then :one: .. :keycap_ten: by rounded minutes, and
+    /// :hourglass_flowing_sand: from 10.5 minutes. Off by default.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub delivery_latency_reaction: bool,
+    /// Allow the `[latency-test N]` per-message override (#802); off by
+    /// default and only meaningful with `delivery_latency_reaction`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub delivery_latency_test_override: bool,
     /// The rejection feedback for a human message that cannot create a request: see
     /// [`Self::reject_emoji`].
     #[serde(default, skip_serializing_if = "ReactionSetting::is_inherit")]
@@ -908,6 +918,34 @@ impl BridgeConfiguration {
         channel_id: &str,
     ) -> std::result::Result<Option<SlackFormat>, String> {
         selected_slack_format(&self.slack_format_by_channel, self.slack_format, channel_id)
+    }
+
+    /// The receipt emoji for one request under `delivery_latency_reaction`
+    /// (#802): `default` under 30 s, a keycap digit for the rounded
+    /// minutes 1-10, and the flowing hourglass from 10.5 minutes up.
+    #[must_use]
+    pub fn delivery_latency_emoji(&self, seconds: u64, default: &str) -> String {
+        if seconds < 30 || !self.delivery_latency_reaction {
+            return default.to_owned();
+        }
+        const KEYCAPS: [&str; 10] = [
+            "1\u{fe0f}\u{20e3}",
+            "2\u{fe0f}\u{20e3}",
+            "3\u{fe0f}\u{20e3}",
+            "4\u{fe0f}\u{20e3}",
+            "5\u{fe0f}\u{20e3}",
+            "6\u{fe0f}\u{20e3}",
+            "7\u{fe0f}\u{20e3}",
+            "8\u{fe0f}\u{20e3}",
+            "9\u{fe0f}\u{20e3}",
+            "\u{1f51f}",
+        ];
+        let minutes = (seconds + 30) / 60;
+        if minutes >= 11 {
+            "\u{23f3}".to_owned()
+        } else {
+            KEYCAPS[(minutes - 1) as usize].to_owned()
+        }
     }
 
     /// The receipt emoji this bridge actually adds, or `None` when it adds none: the receipt is
@@ -8917,12 +8955,30 @@ impl BridgeState {
                 saves.lost.push(key.to_owned());
                 continue;
             }
+            // #802: with delivery_latency_reaction on, the receipt shows
+            // the ack-to-delivered minutes; a `[latency-test N]` marker in
+            // the message (N seconds) overrides the measured duration.
+            let emoji = if self.config.delivery_latency_reaction {
+                let measured = request
+                    .delivered_at_millis
+                    .unwrap_or_else(unix_millis)
+                    .saturating_sub(request.admitted_at_millis)
+                    / 1_000;
+                let seconds = if self.config.delivery_latency_test_override {
+                    latency_test_override(&request.message.text).unwrap_or(measured)
+                } else {
+                    measured
+                };
+                self.config.delivery_latency_emoji(seconds, receipt)
+            } else {
+                receipt.to_owned()
+            };
             let record = ReceiptReactionRecord {
                 schema: RECEIPT_REACTION_SCHEMA.to_owned(),
                 key: key.to_owned(),
                 channel_id: request.message.channel_id,
                 message_id: request.message.message_id,
-                emoji: receipt.to_owned(),
+                emoji,
                 request_id: random_operation_uuid()?,
                 error: None,
                 recorded_at_millis: unix_millis(),
@@ -9245,6 +9301,19 @@ impl BridgeState {
                 if let Some(mut record) = self.read_receipt_reaction(key)? {
                     if record.request_id == snapshot.request_id {
                         let detail = bounded_detail(&detail, MAX_RECEIPT_REACTION_ERROR_BYTES);
+                        // #802: a refused latency reaction falls back to
+                        // the ordinary receipt under a fresh operation ID.
+                        if refused && self.config.delivery_latency_reaction {
+                            if let Some(default) = self.config.receipt_emoji_in_use() {
+                                if snapshot.emoji != default {
+                                    record.emoji = default.to_owned();
+                                    record.request_id = random_operation_uuid()?;
+                                    record.error = None;
+                                    write_document(&path, &record)?;
+                                    return Ok(None);
+                                }
+                            }
+                        }
                         if refused {
                             self.finalize_receipt_reaction_refusal(
                                 key,
@@ -9366,6 +9435,7 @@ impl BridgeState {
         let refused = self.refused_receipt_reactions_locked()?;
         Ok(json!({
             "reaction": self.config.receipt_emoji_in_use(),
+            "delivery_latency_reaction": self.config.delivery_latency_reaction,
             "waiting": keys.len(),
             "failing": failing,
             "lost": lost.count,
@@ -17986,6 +18056,18 @@ fn validate_outbound_body(agent_label: &str, body: &str) -> Result<()> {
     Ok(())
 }
 
+/// The per-message test override for #802: `[latency-test N]` in a
+/// message makes its receipt use N seconds as the ack-to-delivered
+/// duration, so the emoji mapping can be checked without waiting.
+fn latency_test_override(text: &str) -> Option<u64> {
+    let rest = text.trim_start().strip_prefix("[latency-test ")?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    if digits.is_empty() || !rest[digits.len()..].starts_with(']') {
+        return None;
+    }
+    digits.parse().ok()
+}
+
 pub(crate) fn unix_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -18762,6 +18844,8 @@ mod tests {
             outbound_enabled: true,
             ack_reaction: ReactionSetting::Emoji("🤖".to_owned()),
             receipt_reaction: ReactionSetting::Inherit,
+            delivery_latency_reaction: false,
+            delivery_latency_test_override: false,
             reject_reaction: ReactionSetting::Inherit,
             backend_configuration: None,
             outbound_command: None,
@@ -33573,6 +33657,7 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
             state.status().expect("status")["receipt_reactions"],
             serde_json::json!({
                 "reaction": "\u{2705}",
+                "delivery_latency_reaction": false,
                 "waiting": 1,
                 "failing": 0,
                 "lost": 0,
@@ -33604,6 +33689,7 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
             state.status().expect("status")["receipt_reactions"],
             serde_json::json!({
                 "reaction": "\u{2705}",
+                "delivery_latency_reaction": false,
                 "waiting": 1,
                 "failing": 1,
                 "lost": 0,
@@ -33644,6 +33730,7 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
             state.status().expect("status")["receipt_reactions"],
             serde_json::json!({
                 "reaction": "\u{2705}",
+                "delivery_latency_reaction": false,
                 "waiting": 0,
                 "failing": 0,
                 "lost": 0,
@@ -34051,6 +34138,43 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
         // The state keeps the keys absent, so a later change of the default reaches it.
         assert!(saved.get("ack_reaction").is_none(), "{saved}");
         assert!(saved.get("receipt_reaction").is_none(), "{saved}");
+    }
+
+    #[test]
+    fn delivery_latency_emoji_maps_each_boundary() {
+        // #802 chat-delivery-latency-emoji boundary table.
+        let mut config: BridgeConfiguration =
+            serde_json::from_value(config_document_with(&json!({}))).expect("decode");
+        assert!(!config.delivery_latency_reaction);
+        assert_eq!(
+            config.delivery_latency_emoji(600, "✅"),
+            "✅",
+            "off by default"
+        );
+        config.delivery_latency_reaction = true;
+        let cases = [
+            (29, "✅"),
+            (30, "1\u{fe0f}\u{20e3}"),
+            (89, "1\u{fe0f}\u{20e3}"),
+            (90, "2\u{fe0f}\u{20e3}"),
+            (320, "5\u{fe0f}\u{20e3}"),
+            (629, "\u{1f51f}"),
+            (630, "\u{23f3}"),
+        ];
+        for (seconds, expected) in cases {
+            assert_eq!(
+                config.delivery_latency_emoji(seconds, "✅"),
+                expected,
+                "{seconds}s"
+            );
+        }
+        assert_eq!(
+            latency_test_override("[latency-test 300] please"),
+            Some(300)
+        );
+        assert_eq!(latency_test_override("please [latency-test 300]"), None);
+        assert_eq!(latency_test_override("[latency-test 300"), None);
+        assert_eq!(latency_test_override("nothing here"), None);
     }
 
     #[test]

@@ -244,6 +244,17 @@ bundled Slack provider: 👀 for acknowledgement (Slack `eyes`), ✅ for receipt
 | `receipt_reaction` | inherit ✅ | use this emoji | no receipt |
 | `reject_reaction` | inherit ❌ | use this emoji | no rejection feedback |
 
+`delivery_latency_reaction` (default `false`, #802 chat-delivery-latency-emoji):
+when `true`, the receipt reaction shows how long delivery took
+(admission to delivered, rounded to the nearest minute). Under
+30 s it is the ordinary receipt emoji; then :one: :two: :three: :four:
+:five: :six: :seven: :eight: :nine: :keycap_ten: for 1-10 minutes, and
+:hourglass_flowing_sand: from 10.5 minutes. For testing, one message can
+force the encoding with a `[latency-test N]` marker (N seconds) at the
+very start of its text, and only when the test-only configuration key
+`delivery_latency_test_override` is also `true`; that message's receipt
+uses N as its delivery duration.
+
 An emoji is one line of at most 64 bytes. A key left absent stays absent in the
 saved bridge state, so a later agentctl with a different default changes the
 bridge's reaction too; a key that is set keeps its value. Only an acknowledged

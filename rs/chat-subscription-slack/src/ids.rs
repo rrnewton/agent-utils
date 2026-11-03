@@ -214,6 +214,16 @@ pub fn reaction_name(emoji: &str) -> Option<String> {
         "👍" => "+1",
         "👌" => "ok_hand",
         "⏳" => "hourglass_flowing_sand",
+        "1️⃣" => "one",
+        "2️⃣" => "two",
+        "3️⃣" => "three",
+        "4️⃣" => "four",
+        "5️⃣" => "five",
+        "6️⃣" => "six",
+        "7️⃣" => "seven",
+        "8️⃣" => "eight",
+        "9️⃣" => "nine",
+        "🔟" => "keycap_ten",
         "🎉" => "tada",
         "❌" => "x",
         "⚠" => "warning",
@@ -296,5 +306,15 @@ mod tests {
                 Some(reaction.slack_name)
             );
         }
+    }
+}
+
+#[test]
+fn every_delivery_latency_emoji_has_a_slack_name() {
+    // #802: every output of delivery_latency_emoji (keycaps, ten, hourglass).
+    for emoji in [
+        "1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟", "⏳",
+    ] {
+        assert!(reaction_name(emoji).is_some(), "{emoji}");
     }
 }
