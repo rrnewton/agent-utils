@@ -2,6 +2,7 @@
 title: 'dagrun-memory-cap-headroom: profile-derived memory caps keep headroom above observed peaks'
 status: open
 priority: 2
+assignee: mu-validate@devbig030
 issue_type: bug
 labels:
 - dagrun
@@ -16,8 +17,8 @@ updated_at: 2026-11-03T14:48:19.160164248+00:00
 
 # Design
 
-- Profile-derived memory caps keep headroom above the observed peak (a margin such as max(25%, 512 MiB)), and a cap never ratchets down to the latest peak alone.
-- An OOM kill under a profile-derived cap is reported as a cap problem (naming the step, the cap and the recorded peaks), so it is not mistaken for a test failure.
+- Profile-derived memory caps mirror the owner's CPU rule: cap = observed peak plus max(25%, 512 MiB), never exactly the peak, and a cap never ratchets down to the latest peak alone.
+- An OOM kill under a profile-derived cap is reported as a cap problem (re-profile; naming the step, the cap and the recorded peaks), not a test failure.
 - Audit the other steps whose applied cap is within the margin of their recorded peak and list them.
 
 # Acceptance Criteria
