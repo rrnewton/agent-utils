@@ -3054,6 +3054,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     dry_run: value.dry_run,
                     startup_timeout: Duration::from_secs_f64(value.startup_timeout),
                     wrkslots: crate::subagents::project_wrkslots(&args.registry),
+                    herdr_bin: args.herdr_bin.clone(),
                 },
             )?;
             report["trigger"] = json!(if value.boot { "boot" } else { "manual" });

@@ -786,6 +786,25 @@ fn restore_leaves_excluded_records_alone_and_never_excludes_the_coordinator() {
 }
 
 #[test]
+fn restore_reports_a_herdr_version_mismatch() {
+    let fixture = Fixture::new();
+    let _old = dead_agent(&fixture);
+    let host = ScriptedHost::new();
+    host.answer("--version", 0, "herdr 9.9.9", "");
+    let registry = fixture.root.join("registry");
+    let mut opts = options(None);
+    opts.herdr_bin = PathBuf::from("/fake/herdr");
+    let config = RestoreConfig {
+        herdr_version: Some("8.0.0".to_owned()),
+        ..config(&fixture, None)
+    };
+    let report = restore(&fixture.client, &registry, &host, &config, &opts).unwrap();
+    assert_eq!(report["herdr_version"]["ok"], false);
+    assert_eq!(report["herdr_version"]["expected"], "8.0.0");
+    assert_eq!(report["herdr_version"]["observed"], "herdr 9.9.9");
+}
+
+#[test]
 fn restore_without_the_certificate_revives_nothing_and_names_the_fetch() {
     let fixture = Fixture::new();
     let _old = dead_agent(&fixture);

@@ -107,6 +107,10 @@ pub struct RestoreConfig {
     /// Command that fetches the user certificate, printed verbatim when it is missing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub certificate_fetch: Option<String>,
+    /// Expected Herdr version (#742): restore reports a mismatch against the version
+    /// the configured Herdr binary prints, so an in-place update cannot lie silently.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub herdr_version: Option<String>,
     /// Seconds between two lane launches (default 20).
     #[serde(default = "default_startup_delay")]
     pub startup_delay_seconds: u64,
@@ -185,6 +189,7 @@ impl RestoreConfig {
             agents: None,
             certificate_file: None,
             certificate_fetch: None,
+            herdr_version: None,
             startup_delay_seconds: default_startup_delay(),
             herdr_wait_seconds: default_herdr_wait(),
             report_dir: None,
@@ -421,6 +426,8 @@ pub struct RestoreOptions {
     pub startup_timeout: Duration,
     /// The slot manager, when the project configures one (see `profiles.json` `wrkslots`).
     pub wrkslots: Option<PathBuf>,
+    /// The Herdr binary whose `--version` the version pin checks.
+    pub herdr_bin: PathBuf,
 }
 
 /// The default report directory: `$XDG_STATE_HOME/agentctl/restore`, else under the home.
@@ -1446,6 +1453,28 @@ pub fn restore<A: ManagedApi + ?Sized>(
             true
         }
     };
+    // Version pin (#742): name a Herdr update instead of restoring against it silently.
+    if let Some(expected) = config.herdr_version.as_deref() {
+        if !options.herdr_bin.as_os_str().is_empty() {
+            let argv = vec![
+                options.herdr_bin.display().to_string(),
+                "--version".to_owned(),
+            ];
+            let observed = host.run(&argv, None, Duration::from_secs(15));
+            let observed_text = observed.stdout.trim().to_owned();
+            let ok = observed.status == Some(0) && observed_text.contains(expected);
+            report["herdr_version"] = json!({
+                "expected": expected,
+                "observed": observed_text,
+                "ok": ok,
+            });
+            if !ok {
+                eprintln!(
+                    "agentctl restore: warning: herdr version mismatch: expected {expected}, observed {observed_text:?}"
+                );
+            }
+        }
+    }
     report["herdr"] = wait_for_herdr(client, host, Duration::from_secs(config.herdr_wait_seconds));
     // Desired state includes Herdr up (#742): start its unit and wait again.
     if report["herdr"]["ready"] != true {
