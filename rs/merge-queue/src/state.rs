@@ -518,8 +518,15 @@ pub struct IdentityConfig {
 }
 
 /// Queue configuration stored in `config.json`.
+///
+/// Unknown top-level fields are tolerated, not rejected: a config written by
+/// a newer build (for example one that sets a flag this build does not know)
+/// must still load on an older binary, or a config-first rollout bricks every
+/// command on the lagging host. The unknown fields are captured verbatim in
+/// `unknown_fields`, preserved on rewrite, and named in a startup warning so
+/// the operator knows to upgrade the binary.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Config {
     /// Schema identifier.
     pub schema: String,
@@ -599,6 +606,11 @@ pub struct Config {
     pub land: LandConfig,
     /// Push-notification configuration (state-change messages via agentctl).
     pub notify: NotifyConfig,
+    /// Top-level fields this build does not know, captured verbatim so a
+    /// newer config loads (and round-trips) on an older binary. See the
+    /// struct-level note.
+    #[serde(flatten)]
+    pub unknown_fields: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 impl Default for Config {
@@ -631,6 +643,7 @@ impl Default for Config {
             donors: DonorsConfig::default(),
             land: LandConfig::default(),
             notify: NotifyConfig::default(),
+            unknown_fields: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -786,6 +799,18 @@ impl State {
             ));
         }
         let config: Config = read_json(&self.config_path())?;
+        if !config.unknown_fields.is_empty() {
+            let names: Vec<&str> = config.unknown_fields.keys().map(String::as_str).collect();
+            let revision = crate::build_info::revision()
+                .map_or_else(|| "unknown".to_owned(), |r| r.describe());
+            eprintln!(
+                "merge-queue: warning: {} sets unknown field(s) {} — ignored by this build \
+                 (revision {revision}); the config may be newer than the binary, so upgrade \
+                 merge-queue if those settings should take effect",
+                self.config_path().display(),
+                names.join(", "),
+            );
+        }
         if config.schema != CONFIG_SCHEMA {
             return Err(format!(
                 "{} has schema {:?}; this merge-queue reads {CONFIG_SCHEMA:?}",
@@ -921,6 +946,28 @@ mod unit {
         let mut disabled = config.clone();
         disabled.command = String::new();
         assert!(!disabled.covers("gen/all.txt"));
+    }
+
+    #[test]
+    fn config_tolerates_and_preserves_unknown_fields() {
+        // A config written by a newer build must load on an older binary:
+        // rejecting it bricks every command on the lagging host.
+        let text =
+            r#"{"schema": "merge-queue-config/v1", "recount_pins": true, "future_flag": {"x": 1}}"#;
+        let config: Config = serde_json::from_str(text).expect("unknown fields must not refuse");
+        assert!(config.recount_pins);
+        assert_eq!(config.unknown_fields.len(), 1);
+        assert!(config.unknown_fields.contains_key("future_flag"));
+        // Round-trip keeps the unknown field, so a rewrite by the older
+        // binary does not silently delete the newer setting.
+        let written = serde_json::to_string(&config).expect("serialize");
+        assert!(written.contains("\"future_flag\""));
+        let reread: Config = serde_json::from_str(&written).expect("reread");
+        assert_eq!(reread, config);
+        // A config with no unknown fields stays clean.
+        let plain: Config =
+            serde_json::from_str(r#"{"schema": "merge-queue-config/v1"}"#).expect("plain");
+        assert!(plain.unknown_fields.is_empty());
     }
 
     #[test]
