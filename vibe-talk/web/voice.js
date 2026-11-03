@@ -1927,7 +1927,7 @@ function returnFromLinkJump() {
   const jump = linkJumps.undo();
   if (!jump) return;
   // A walk the jump's seek is still making is over: its next step finds another ticket.
-  replyJumpTicket += 1;
+  replyJumpTicket.bump();
   linkJumps.returnStarted();
   void guardQuietly(returnToLinkSpot)(jump.spot).finally(() => {
     linkJumps.returnEnded();
@@ -18893,8 +18893,12 @@ const REPLY_LANDING_GAP_PX = 8;
 /** The arrow's accessible name and its tooltip. No channel data in it, for the reason Reply has none. */
 const REPLY_JUMP_NAME = "Jump to the message this answers";
 
-/** Every tap on an arrow takes a ticket, and a walk whose ticket has moved on stops where it is. */
-let replyJumpTicket = 0;
+/**
+ * Every tap on an arrow takes a ticket, and a walk whose ticket has moved on stops where it is: a generation,
+ * bumped by each tap and by the way back from a jump (web/src/core/sync `createStreamGeneration`, `#624
+ * voice-page-modularity`).
+ */
+const replyJumpTicket = createStreamGeneration();
 
 /**
  * A column's own record of its reply arrows and jumps (`#624 voice-page-modularity`, plan step 15, as
@@ -19225,7 +19229,8 @@ async function seekMessage(target, arrive, openAll) {
   endFilterWalk();
   endSearchWalks();
   try {
-    const ticket = ++replyJumpTicket;
+    replyJumpTicket.bump();
+    const ticket = replyJumpTicket.current();
     const channel = String(selectedChannelId());
     if (arrive()) return;
     // The reader's own filter, said plainly rather than walked past: the message is loaded, read,
@@ -19253,7 +19258,7 @@ async function seekMessage(target, arrive, openAll) {
       setStatus("Not in this view — opening All…");
       // The reader went somewhere else while All was being read: the tap is over.
       const stillAll = () =>
-        ticket === replyJumpTicket && String(selectedChannelId()) === channel && selection().view === "flat";
+        ticket === replyJumpTicket.current() && String(selectedChannelId()) === channel && selection().view === "flat";
       try {
         const opening = changeChannelView("flat");
         steps.pause();
@@ -19300,11 +19305,11 @@ async function seekMessage(target, arrive, openAll) {
         steps.resume();
         // The failure itself is reported where every failed read is; this only stops the status
         // line from going on saying a walk is under way.
-        if (ticket === replyJumpTicket) setStatus("Could not look further back.");
+        if (ticket === replyJumpTicket.current()) setStatus("Could not look further back.");
         throw error;
       }
       // Another tap, another channel or another view: this walk is nobody's any more.
-      if (ticket !== replyJumpTicket || context !== channelContextKey()) return;
+      if (ticket !== replyJumpTicket.current() || context !== channelContextKey()) return;
       if (arrive() || hiddenAsRead()) return;
     }
     if (readModes.hiding() && !providerFacts.threading()) {
@@ -21939,7 +21944,7 @@ function renderSearchOlderNote() {
  */
 function searchWalkHolds(walk, column) {
   return !walk.ended && column.searchWalk === walk && searchKey() === walk.key &&
-    channelContextKey() === walk.context && replyJumpTicket === walk.ticket && !filterChanges.walking() &&
+    channelContextKey() === walk.context && replyJumpTicket.current() === walk.ticket && !filterChanges.walking() &&
     (column !== columns.side || sideShowing());
 }
 
@@ -22031,7 +22036,7 @@ function searchOlder() {
   const walk = {
     key: searchKey(),
     context: channelContextKey(),
-    ticket: replyJumpTicket,
+    ticket: replyJumpTicket.current(),
     held: new Set([...el("discord-log").children].flatMap(idsOf)),
     pages: 0,
     // The steps that landed, Main's own newest page among them (`walkCursorOwed`): what a stopped walk read.
