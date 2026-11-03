@@ -15899,7 +15899,7 @@ function renderOutgoingEverywhere() {
 // send that landed though its answer was lost and that a later read already counts, until it is settled
 // (`settleFromServer`).
 
-// `pendingThreadsKey` as it stood when the rows were last passed over for it is the pending threads' own
+// The pending threads' key as it stood when the rows were last passed over for it is their own
 // (`pendingThreads.noteDrawn`, web/src/core/outbox, `#624 voice-page-modularity`).
 
 /**
@@ -15930,11 +15930,6 @@ function pendingInto(thread) {
 /** The threads of the channel on screen sends in the outbox go into, each with when its newest was written. */
 function pendingThreadTimes() {
   return pendingThreads.times();
-}
-
-/** Which threads of the channel on screen have sends counting in them, and how many: for redraws. */
-function pendingThreadsKey() {
-  return pendingThreads.key();
 }
 
 /**
