@@ -786,6 +786,26 @@ fn restore_leaves_excluded_records_alone_and_never_excludes_the_coordinator() {
 }
 
 #[test]
+fn restore_without_the_certificate_revives_nothing_and_names_the_fetch() {
+    let fixture = Fixture::new();
+    let _old = dead_agent(&fixture);
+    let host = ScriptedHost::new();
+    let registry = fixture.root.join("registry");
+    let config = RestoreConfig {
+        certificate_file: Some(fixture.root.join("missing-cert.pem")),
+        certificate_fetch: Some("fetch-cert --user".to_owned()),
+        ..config(&fixture, None)
+    };
+    let report = restore(&fixture.client, &registry, &host, &config, &options(None)).unwrap();
+    assert_eq!(report["certificate"]["present"], false);
+    assert_eq!(report["certificate"]["remedy"], "fetch-cert --user");
+    assert_eq!(report["complete"], false);
+    assert!(report["agents"]
+        .as_array()
+        .is_none_or(|rows| rows.is_empty()));
+}
+
+#[test]
 fn restore_with_a_desired_agents_list_leaves_unlisted_records_retired() {
     let fixture = Fixture::new();
     let old = dead_agent(&fixture);

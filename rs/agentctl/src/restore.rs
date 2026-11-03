@@ -100,6 +100,13 @@ pub struct RestoreConfig {
     /// restored; every other registered name stays retired, for example finished lanes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agents: Option<Vec<String>>,
+    /// User certificate file that must exist before any agent can start (#742): restore
+    /// checks it first and, when missing, names the fetch command instead of reviving.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate_file: Option<PathBuf>,
+    /// Command that fetches the user certificate, printed verbatim when it is missing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate_fetch: Option<String>,
     /// Seconds between two lane launches (default 20).
     #[serde(default = "default_startup_delay")]
     pub startup_delay_seconds: u64,
@@ -176,6 +183,8 @@ impl RestoreConfig {
             units: Vec::new(),
             exclude: Vec::new(),
             agents: None,
+            certificate_file: None,
+            certificate_fetch: None,
             startup_delay_seconds: default_startup_delay(),
             herdr_wait_seconds: default_herdr_wait(),
             report_dir: None,
@@ -1412,8 +1421,45 @@ pub fn restore<A: ManagedApi + ?Sized>(
             .collect::<Vec<_>>()),
         _ => json!([]),
     };
+    // The certificate comes first (#742): without it every harness refuses to start,
+    // so name the exact fetch command and revive nothing.
+    let certificate_ok = match config.certificate_file.as_ref() {
+        Some(path) if !path.is_file() => {
+            report["certificate"] = json!({
+                "present": false,
+                "path": path,
+                "remedy": config.certificate_fetch.clone().unwrap_or_else(|| format!("fetch the user certificate to {}", path.display())),
+            });
+            eprintln!(
+                "agentctl restore: user certificate missing at {}; run: {}",
+                path.display(),
+                report["certificate"]["remedy"].as_str().unwrap_or_default()
+            );
+            false
+        }
+        Some(path) => {
+            report["certificate"] = json!({"present": true, "path": path});
+            true
+        }
+        None => {
+            report["certificate"] = json!({"present": null, "detail": "not configured"});
+            true
+        }
+    };
     report["herdr"] = wait_for_herdr(client, host, Duration::from_secs(config.herdr_wait_seconds));
-    let herdr_ready = report["herdr"]["ready"] == true;
+    // Desired state includes Herdr up (#742): start its unit and wait again.
+    if report["herdr"]["ready"] != true {
+        if let Some(unit) = config.herdr_unit.as_deref() {
+            if !options.dry_run {
+                let _ = systemctl(host, "start", unit);
+                report["herdr"]["started_unit"] = json!(unit);
+                report["herdr"] =
+                    wait_for_herdr(client, host, Duration::from_secs(config.herdr_wait_seconds));
+                report["herdr"]["started_unit"] = json!(unit);
+            }
+        }
+    }
+    let herdr_ready = certificate_ok && report["herdr"]["ready"] == true;
     let manager = ManagedAgents::new(client, registry)?;
     let mut coordinator_ok = config.coordinator.is_none();
     if herdr_ready {
