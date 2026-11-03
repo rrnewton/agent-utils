@@ -22,6 +22,7 @@ declare const SCREENS: LegacyImports["SCREENS"];
 declare const createChipsOverComposer: LegacyImports["createChipsOverComposer"];
 declare const createScreens: LegacyImports["createScreens"];
 declare const createActionMenu: LegacyImports["createActionMenu"];
+declare const createChannelPick: LegacyImports["createChannelPick"];
 declare const createShellNotices: LegacyImports["createShellNotices"];
 declare const createUndoStamps: LegacyImports["createUndoStamps"];
 declare const copyText: LegacyImports["copyText"];

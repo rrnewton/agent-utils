@@ -254,3 +254,13 @@ test("`#820 voice-page-action-menu`: the action menu's open state on its opener 
   assert.deepStrictEqual([menu.open(), nodes["action-menu"].hidden, nodes["action-menu-open"].attributes["aria-expanded"], changes],
     [false, true, "false", 2]);
 });
+
+test("`#624 voice-page-modularity`: the channel picker opened by Ctrl+K is remembered until a choice or Esc forgets it", () => {
+  const { createChannelPick } = VIEW_SHELL;
+  const pick = createChannelPick();
+  assert.equal(pick.byKey(), false);
+  pick.openedByKey();
+  assert.equal(pick.byKey(), true);
+  pick.forget();
+  assert.equal(pick.byKey(), false);
+});

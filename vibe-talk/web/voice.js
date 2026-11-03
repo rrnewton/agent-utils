@@ -8174,16 +8174,16 @@ function stepChannel(event) {
 
 /**
  * Whether the channel picker was opened by Ctrl+K (Cmd+K) and no channel has been chosen from it
- * since. See `channelPicked`.
+ * since: web/src/view/shell `createChannelPick` (`#624 voice-page-modularity`). See `channelPicked`.
  */
-let channelPickByKey = false;
+const channelPickByKey = createChannelPick();
 
 /** Ctrl+K (Cmd+K): the channel picker, open (question 11). See `channelPicked` for the way back. */
 function pickChannel() {
   if (!channelOnScreen()) return false;
   const picker = el("discord-channel");
   if (picker.hidden || picker.disabled) return false;
-  channelPickByKey = true;
+  channelPickByKey.openedByKey();
   picker.focus();
   if (typeof picker.showPicker === "function") {
     try {
@@ -8207,8 +8207,8 @@ function pickChannel() {
  * the list however it was reached (`onEscape`).
  */
 function channelPicked() {
-  if (!channelPickByKey || document.activeElement !== el("discord-channel")) return;
-  channelPickByKey = false;
+  if (!channelPickByKey.byKey() || document.activeElement !== el("discord-channel")) return;
+  channelPickByKey.forget();
   settleFocus();
 }
 
@@ -8359,7 +8359,7 @@ function onEscape(event, target) {
     return true;
   }
   if (isBarPicker(target)) {
-    channelPickByKey = false;
+    channelPickByKey.forget();
     focusList(paneFor(target));
     return true;
   }
