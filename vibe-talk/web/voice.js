@@ -25596,11 +25596,8 @@ function renderDraftMarkers() {
 // own stores' (`channelDrafts`, `replyDrafts`, `quickDrafts`); where and when each was written is the
 // ledger's (`draftLedger`), and a draft written before the ledger kept its place is found too, oldest.
 
-/** The last draft the chip went to, in which channel, so the next tap goes on from it. */
-let draftChipLast = { channel: "", draft: "" };
-
-/** A draft's identity: where it is written and its key there. */
-const draftIdentity = (draft) => `${draft.kind}\n${draft.key}`;
+/** Which draft the chip's next tap goes to: the one after the last it went to (web/src/core/outbox `createDraftRound`). */
+const draftRound = createDraftRound();
 
 /**
  * A draft was written (or emptied): kept in the ledger with its channel and the time, or let go, and the chip
@@ -25811,11 +25808,8 @@ async function pressDraftChip() {
     renderDraftChip();
     return;
   }
-  const channel = String(selectedChannelId() || "");
-  const at = draftChipLast.channel === channel ? drafts.findIndex((draft) => draftIdentity(draft) === draftChipLast.draft) : -1;
-  const next = drafts[(at + 1) % drafts.length];
-  draftChipLast = { channel, draft: draftIdentity(next) };
-  await openDraft(next);
+  const next = draftRound.next(drafts, String(selectedChannelId() || ""));
+  if (next) await openDraft(next);
 }
 
 // --- quoting part of a message in the reply to it ------------------------------------------------

@@ -439,3 +439,13 @@ test("`#819 voice-page-quoted-reply-and-draft-chip`: the draft ledger finds a ch
   assert.deepStrictEqual(JSON.parse(saved.get(QUICK_DRAFTS_KEY)), { "c1\nm2\nwords": "half a thought" });
   assert.deepStrictEqual(quick.keys(), ["c1\nm2\nwords"]);
 });
+
+test("`#819 voice-page-quoted-reply-and-draft-chip`: the Draft chip's round goes newest first, on from the last, and starts again in another channel", () => {
+  const { createDraftRound } = OUTBOX;
+  const round = createDraftRound();
+  const drafts = [{ kind: "reply", key: "m2" }, { kind: "quick", key: "c1\nm1\nq" }, { kind: "composer", key: '["c1",null]' }];
+  assert.equal(round.next([], "c1"), null);
+  assert.deepStrictEqual([0, 1, 2, 3].map(() => round.next(drafts, "c1").key), ["m2", "c1\nm1\nq", '["c1",null]', "m2"]);
+  assert.equal(round.next(drafts, "c2").key, "m2", "another channel starts at its newest");
+  assert.equal(round.next(drafts.slice(1), "c2").key, "c1\nm1\nq", "the last one gone, the round starts at the newest");
+});

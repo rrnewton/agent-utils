@@ -10,8 +10,8 @@ export type { OwnPosts, OwnPostsDependencies } from "./own.ts";
 export { outgoingFromSaved, savedWire } from "./saved.ts";
 export type { OutgoingEntry, OutgoingPart, OutgoingWire } from "./saved.ts";
 export { QUICK_DRAFTS_KEY, createChannelDrafts } from "./drafts.ts";
-export { DRAFT_LEDGER_KEY, createDraftLedger } from "./draftledger.ts";
-export type { DraftEntry, DraftKind, DraftLedger, DraftLedgerDependencies } from "./draftledger.ts";
+export { DRAFT_LEDGER_KEY, createDraftLedger, createDraftRound, draftIdentity } from "./draftledger.ts";
+export type { DraftEntry, DraftKind, DraftLedger, DraftLedgerDependencies, DraftRound } from "./draftledger.ts";
 export type { ChannelDrafts, ChannelDraftsDependencies } from "./drafts.ts";
 export {
   SEND_SNIPPET_CHARS,

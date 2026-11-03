@@ -102,5 +102,33 @@ export function createDraftLedger(deps: DraftLedgerDependencies): DraftLedger {
   };
 }
 
+/** A draft's identity: where it is written and its key there. */
+export function draftIdentity(draft: { readonly kind: DraftKind; readonly key: string }): string {
+  return `${draft.kind}\n${draft.key}`;
+}
+
+/** The Draft chip's round: which draft its next tap goes to. */
+export interface DraftRound {
+  /**
+   * The draft a tap goes to among `drafts` (newest first) in channel `channel`: the one after the last it went
+   * to there, round to the newest again; the newest where it last went elsewhere, or to a draft gone since.
+   */
+  next<Entry extends { readonly kind: DraftKind; readonly key: string }>(drafts: readonly Entry[], channel: string): Entry | null;
+}
+
+/** Gone nowhere yet. */
+export function createDraftRound(): DraftRound {
+  let last = { channel: "", draft: "" };
+  return {
+    next(drafts, channel) {
+      if (drafts.length === 0) return null;
+      const at = last.channel === channel ? drafts.findIndex((draft) => draftIdentity(draft) === last.draft) : -1;
+      const next = drafts[(at + 1) % drafts.length]!;
+      last = { channel, draft: draftIdentity(next) };
+      return next;
+    },
+  };
+}
+
 // What the page and the tests use of it.
 export { DRAFT_LEDGER_KEY };
