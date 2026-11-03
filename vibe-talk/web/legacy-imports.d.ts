@@ -36,6 +36,7 @@ declare const UI_STATE_KEY: LegacyImports["UI_STATE_KEY"];
 declare const UI_STATE_VERSION: LegacyImports["UI_STATE_VERSION"];
 declare const createDeepLinks: LegacyImports["createDeepLinks"];
 declare const createUiState: LegacyImports["createUiState"];
+declare const createBackStack: LegacyImports["createBackStack"];
 declare const createLinkJumps: LegacyImports["createLinkJumps"];
 declare const createVisits: LegacyImports["createVisits"];
 declare const deepLinkQuery: LegacyImports["deepLinkQuery"];

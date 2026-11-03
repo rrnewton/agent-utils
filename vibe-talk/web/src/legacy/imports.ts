@@ -24,7 +24,7 @@ export { createApi, isSlowFailure, readableFailure } from "../core/api/index.ts"
 
 export { allReachesThread, answerUnplaced, answeredThread, coverViewOf, createChannelDirectory, createChannelStore, createCopyOrder, createIdentities, createRemovals, createSummaries, createUnpackReads, emptyTally, exactReplyCount, foldDeltaIn, foldLiveIn, foldPageIn, heldAsSent, heldNow, inTimeOrder, inViewOf, markDoneIn, namedRecord, newerPage, newerPageSpeaksFor, noteReplyGapsIn, pageFoldIn, placeFromPageIn, projectionOf, refreshFailed, replyTallyOf, restoreCanon, savedTimelineOf, settleDoneIn, summaryKey, tallyRecord, threadOf, timeOf, unplacedToAsk, unseenRepliesIn, upsertThreadSummary, viewOfKey } from "../core/channels/index.ts";
 export { anchorOfMessage, createBookmarkUndo, createBookmarks, createPins, createReadLedger, isBookmarkState, sameAnchor } from "../core/annotations/index.ts";
-export { REOPENED_VIEWS, UI_STATE_CHARS, UI_STATE_KEY, UI_STATE_VERSION, createDeepLinks, createLinkJumps, createNavigation, createUiState, createVisits, deepLinkQuery, visitKey } from "../core/navigation/index.ts";
+export { REOPENED_VIEWS, UI_STATE_CHARS, UI_STATE_KEY, UI_STATE_VERSION, createBackStack, createDeepLinks, createLinkJumps, createNavigation, createUiState, createVisits, deepLinkQuery, visitKey } from "../core/navigation/index.ts";
 export {
   DISCORD_POLL_MS,
   LIVE_RETRY_MS,

@@ -155,6 +155,78 @@ test("`#624 voice-page-modularity`: a jump is a level over what was open, a late
   assert.equal(ownLevel("menu:x") && ownLevel("help") && !ownLevel("thread"), true);
 });
 
+test("`#624 voice-page-modularity`: the Back entries push one per level opened, go back through those closed, and a Back closes down to its entry", async () => {
+  const { createBackStack, BACK_STATE_KEY, BACK_TRAVERSAL_MS } = NAVIGATION;
+  const entries = [{ state: null }];
+  let at = 0;
+  const history = {
+    get state() { return entries[at].state; },
+    pushState(state) { entries.splice(at + 1); entries.push({ state }); at += 1; },
+    replaceState(state) { entries[at] = { state }; },
+    back() { this.go(-1); },
+    go(delta) { traversals.push(delta); },
+  };
+  const traversals = [];
+  const timers = [];
+  let levels = [];
+  const closed = [];
+  const notes = [];
+  const stack = createBackStack({
+    clock: { setTimeout: (run, ms) => { timers.push({ run, ms }); return timers.length; }, clearTimeout: (h) => { timers[h - 1] = null; } },
+    session: "s1",
+    history: () => history,
+    index: () => at,
+    mayPush: () => true,
+    levels: () => [...levels],
+    close: (tag) => { closed.push(tag); levels = levels.slice(0, -1); },
+    failed: (message) => notes.push(["failed", message]),
+    notePlace: () => notes.push("place"),
+    syncAddress: () => notes.push("address"),
+    applyLink: () => notes.push("link"),
+  });
+  const turn = () => new Promise((resolve) => setImmediate(resolve));
+  stack.schedule();
+  await turn();
+  assert.deepStrictEqual(notes, [], "nothing is kept in step before the start");
+  assert.equal(stack.start(), true);
+  assert.equal(history.scrollRestoration, "manual");
+  assert.deepStrictEqual(history.state, { [BACK_STATE_KEY]: { session: "s1", depth: 0, tag: "top" } });
+  levels = ["list", "thread"];
+  stack.schedule();
+  stack.schedule();
+  await turn();
+  assert.deepStrictEqual(notes, ["place", "address", "link"], "two asks in one task are one sync");
+  assert.deepStrictEqual(entries.map((entry) => entry.state[BACK_STATE_KEY].tag), ["top", "list", "thread"]);
+  levels = ["list"];
+  stack.schedule();
+  await turn();
+  assert.deepStrictEqual(traversals, [-1], "a level closed by its own control is gone back through");
+  assert.equal(timers[0].ms, BACK_TRAVERSAL_MS);
+  at = 1;
+  stack.pop(history.state);
+  assert.deepStrictEqual(closed, [], "the page's own going-back closes nothing more");
+  assert.equal(timers[0], null, "landing stops the wait");
+  stack.pop(entries[0].state);
+  at = 0;
+  assert.deepStrictEqual(closed, ["list"], "a Back closes down to the depth of the entry it lands on");
+});
+
+test("`#624 voice-page-modularity`: the Back entries take an earlier load's entry at its depth, clamped by the browser's index", () => {
+  const { createBackStack, BACK_STATE_KEY } = NAVIGATION;
+  let state = { [BACK_STATE_KEY]: { session: "s0", depth: 5, tag: "thread" } };
+  const history = { get state() { return state; }, pushState() {}, replaceState(next) { state = next; }, back() {}, go() {} };
+  const stack = createBackStack({
+    clock: { setTimeout: () => 0, clearTimeout: () => {} }, session: "s1", history: () => history, index: () => 2,
+    mayPush: () => true, levels: () => [], close: () => {}, failed: () => {}, notePlace: () => {}, syncAddress: () => {}, applyLink: () => {},
+  });
+  stack.start();
+  assert.deepStrictEqual(state, { [BACK_STATE_KEY]: { session: "s1", depth: 2, tag: "thread" } });
+  assert.equal(createBackStack({
+    clock: { setTimeout: () => 0, clearTimeout: () => {} }, session: "s1", history: () => null, index: () => null,
+    mayPush: () => true, levels: () => [], close: () => {}, failed: () => {}, notePlace: () => {}, syncAddress: () => {}, applyLink: () => {},
+  }).start(), false, "a host with no history has nothing to listen to");
+});
+
 test("`#624 voice-page-modularity`: a place reads back from the query it writes, and a bad escape or an absurd value says nothing", () => {
   const { deepLinkParams, deepLinkPart, deepLinkQuery, DEEP_LINK_VIEWS } = NAVIGATION;
   const ref = { provider: "slack", channel: "C 1", message: "M1", thread: "T1" };

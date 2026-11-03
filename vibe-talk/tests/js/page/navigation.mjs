@@ -3021,7 +3021,7 @@ test("`#304 back-gesture-in-app`: a thread opened is one entry at the page's own
   // thread open; with no entry pushed at all, it leaves the app from inside the thread — the owner's report.
   const deaf = await threadThenGesture(brokenScript('window.addEventListener("popstate", onBackPop);', ""));
   assert.equal(deaf.after.thread, true, "the control without a popstate listener closed the thread anyway");
-  const flat = await threadThenGesture(brokenScript('history.pushState(backEntry(at + 1, levels[at]), "");', ""));
+  const flat = await threadThenGesture(await brokenModule([{ file: "src/core/navigation/backstack.ts", find: 'history.pushState(backEntry(at + 1, levels[at]), "");', replace: "" }]));
   assert.equal(flat.opened.grew, 0, "the control that pushes nothing pushed an entry");
   assert.equal(flat.after.left, true, "the control that pushes nothing did not leave the app from the thread");
   assert.equal(flat.after.thread, true);
@@ -3068,7 +3068,7 @@ test("`#304 back-gesture-in-app`: NESTED — the thread list, a thread opened fr
   assert.equal(third.left, true, "the third gesture, at the top, did not leave the app");
 
   // NEGATIVE CONTROL: a popstate that closes everything rather than down to its entry's depth skips the list.
-  const greedy = await listThreadWalk(brokenScript("closeBackLevelsTo(closeTo);", "closeBackLevelsTo(0);"));
+  const greedy = await listThreadWalk(await brokenModule([{ file: "src/core/navigation/backstack.ts", find: "closeBackLevelsTo(closeTo);", replace: "closeBackLevelsTo(0);" }]));
   assert.notEqual(greedy.seen[2].layout, "list", "the control that closes everything still came back to the list");
 });
 
@@ -3113,7 +3113,7 @@ test("`#304 back-gesture-in-app`: THE ON-SCREEN WAYS OUT close at once and go ba
   }
   // NEGATIVE CONTROL: a page that never goes back through an entry leaves the stale one under the next gesture.
   const stale = await closeThenGesture(openFirstThread, (page) => page.el("thread-back").click(),
-    brokenScript("if (!backTraversalStuck) goBackThrough(history, depth - wanted);", ""));
+    await brokenModule([{ file: "src/core/navigation/backstack.ts", find: "if (!backTraversalStuck) goBackThrough(history, depth - wanted);", replace: "" }]));
   assert.deepStrictEqual(stale.closed.asked, [], "the control went back through an entry");
   assert.equal(stale.left, false, "the control's gesture left the app despite the stale entry");
 });
@@ -3221,16 +3221,19 @@ test("`#304 back-gesture-in-app`: A RELOAD that reopens nothing goes back throug
   // one; one that never clamps asks to go past the tab's first entry, which the browser ignores; and one
   // that takes a Forward for a Back makes the stale entry its base, over the base it had.
   const based = await reloadedThenThread(true, {
-    script: brokenScript("const depth = earlier ? Math.min(earlier.depth, index === null ? BACK_DEPTH_MAX : index, BACK_DEPTH_MAX) : 0;",
-      "const depth = 0;") });
+    script: await brokenModule([{ file: "src/core/navigation/backstack.ts",
+      find: "const depth = earlier ? Math.min(earlier.depth, index === null ? BACK_DEPTH_MAX : index, BACK_DEPTH_MAX) : 0;",
+      replace: "const depth = 0;" }]) });
   assert.deepStrictEqual(based.loaded.asked, [], "the control that reloads at depth nought went back through entries");
   await based.page.browserBack();
   assert.equal(based.page.left, false, "the control's gesture at the top did not land on a stale entry");
-  const unclamped = await claiming(brokenScript("Math.min(earlier.depth, index === null ? BACK_DEPTH_MAX : index, BACK_DEPTH_MAX)",
-    "Math.min(earlier.depth, BACK_DEPTH_MAX)"));
+  const unclamped = await claiming(await brokenModule([{ file: "src/core/navigation/backstack.ts",
+    find: "Math.min(earlier.depth, index === null ? BACK_DEPTH_MAX : index, BACK_DEPTH_MAX)",
+    replace: "Math.min(earlier.depth, BACK_DEPTH_MAX)" }]));
   await unclamped.traverse();
   assert.deepStrictEqual(unclamped.history.refused, [-5], "the control that never clamps did not ask past the first entry");
-  const blind = await forward(brokenScript("} else if (moved !== null && moved > 0) {", "} else if (false) {"));
+  const blind = await forward(await brokenModule([{ file: "src/core/navigation/backstack.ts",
+    find: "} else if (moved !== null && moved > 0) {", replace: "} else if (false) {" }]));
   await blind.browserBack();
   assert.equal(blind.left, false, "the control that takes a Forward for a Back left the app in one press");
 });
@@ -3400,25 +3403,29 @@ test("`#304 back-gesture-in-app`: A RELOAD in a thread opened from the thread li
   // nought, and a Back onto an entry it did not make closing everything — closes the thread and the
   // list in the one press before any touch; with only the base at depth nought, in an installed app the
   // Backs after the last thing closes are spent on the earlier load's entries.
-  const firstMade = brokenScript("const depth = earlier ? Math.min(earlier.depth, index === null ? BACK_DEPTH_MAX : index, BACK_DEPTH_MAX) : 0;",
-    "const depth = 0;").replace("    target = Math.max(0, wasOpen - 1);\n", "    target = 0;\n");
-  assert.ok(!firstMade.includes("    target = Math.max(0, wasOpen - 1);\n"), "the negative control's second patch found nothing");
+  const firstMade = await brokenModule([
+    { file: "src/core/navigation/backstack.ts",
+      find: "const depth = earlier ? Math.min(earlier.depth, index === null ? BACK_DEPTH_MAX : index, BACK_DEPTH_MAX) : 0;",
+      replace: "const depth = 0;" },
+    { file: "src/core/navigation/backstack.ts", find: "target = Math.max(0, wasOpen - 1);", replace: "target = 0;" },
+  ]);
   const greedy = await reloadWalk({ script: firstMade });
   assert.equal(greedy.gestures[0].thread, false);
   assert.equal(greedy.gestures[0].layout, null, "the control that closes everything on an earlier load's entry kept the list");
   assert.equal(greedy.gestures[0].picker, "flat");
-  const stale = await reloadWalk({ leading: false, activation: null, script: brokenScript(
-    "const depth = earlier ? Math.min(earlier.depth, index === null ? BACK_DEPTH_MAX : index, BACK_DEPTH_MAX) : 0;", "const depth = 0;") });
+  const stale = await reloadWalk({ leading: false, activation: null, script: await brokenModule([{ file: "src/core/navigation/backstack.ts",
+    find: "const depth = earlier ? Math.min(earlier.depth, index === null ? BACK_DEPTH_MAX : index, BACK_DEPTH_MAX) : 0;",
+    replace: "const depth = 0;" }]) });
   assert.equal(stale.gestures[1].layout, null, "fixture: the control's second Back did not close the list");
   assert.ok(stale.gestures[1].index > 0, "the control that reloads at depth nought left no entry under its base");
   assert.ok(stale.gestures.length > 3, "the control's presses after the last thing closed were not spent on stale entries");
   // ...and a page that closes down to the depth of the entry landed on, however many things wait over it,
   // closes the list with the thread.
-  const deep = await short(brokenScript("closeTo = Math.max(target, wasOpen - Math.max(0, from - target));", "closeTo = target;"));
+  const deep = await short(await brokenModule([{ file: "src/core/navigation/backstack.ts", find: "closeTo = Math.max(target, wasOpen - Math.max(0, from - target));", replace: "closeTo = target;" }]));
   assert.equal(deep.after.layout, null, "the control that closes down to the entry's depth kept the list");
-  const unadopted = await jumpedFrom(brokenScript("return earlier && earlier.depth < backAdopted ? earlier : null;", "return null;"));
+  const unadopted = await jumpedFrom(await brokenModule([{ file: "src/core/navigation/backstack.ts", find: "return earlier && earlier.depth < backAdopted ? earlier : null;", replace: "return null;" }]));
   assert.equal(unadopted.layout, "list", "the control that takes no earlier load's entry for its depth closed both on a jump");
-  const everything = await foreign(brokenScript("    target = Math.max(0, wasOpen - 1);\n", "    target = 0;\n"));
+  const everything = await foreign(await brokenModule([{ file: "src/core/navigation/backstack.ts", find: "target = Math.max(0, wasOpen - 1);", replace: "target = 0;" }]));
   assert.equal(everything.after.layout, null, "the control that closes everything on someone else's entry kept the list");
 });
 

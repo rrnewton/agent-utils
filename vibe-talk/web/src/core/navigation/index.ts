@@ -14,3 +14,5 @@ export { createDeepLinks } from "./deeplinks.ts";
 export type { DeepLinkWanted, DeepLinks, DeepLinksDependencies } from "./deeplinks.ts";
 export { createLinkJumps, ownLevel } from "./jumps.ts";
 export type { LinkJump, LinkJumps, LinkSpot } from "./jumps.ts";
+export { BACK_DEPTH_MAX, BACK_STATE_KEY, BACK_TRAVERSAL_MS, createBackStack } from "./backstack.ts";
+export type { BackEntryFacts, BackHistoryPort, BackStack, BackStackDependencies } from "./backstack.ts";

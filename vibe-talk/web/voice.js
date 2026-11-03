@@ -945,36 +945,27 @@ function signedOutByRename() {
 // entry would close the thing under the menu and leave the menu open. With an entry, every Back closes
 // the menu first, and a close watcher would have nothing left to do.
 
-/** The key the page's own history entries keep their facts under, in `history.state`. */
-const BACK_STATE_KEY = "vibeTalkBack";
 /** This page load's own name for the entries it makes: an entry with another is from before a reload. */
 const BACK_SESSION = `${Date.now().toString(36)}.${Math.random().toString(36).slice(2, 10)}`;
-/** How long a going-back the page asked for may take to land before the page stops waiting for it. */
-const BACK_TRAVERSAL_MS = 2000;
-/** The deepest an earlier load's entry is taken to be: more than anything the page opens is ever deep. */
-const BACK_DEPTH_MAX = 16;
 
-/** Whether the page keeps its history in step yet: from the end of the script, once every part is defined. */
-let backStarted = false;
-/** What the page's entries above its base stand for, the first-opened first: as many as the entry it is on is deep. */
-let backTags = /** @type {string[]} */ ([]);
-/** A going-back the page asked for and has not yet seen land: the depth it goes to, and the timer that stops waiting. */
-let backTraversal = /** @type {{target: number, timer: any} | null} */ (null);
-/** A going-back never landed: none is asked for again until the browser's history moves. */
-let backTraversalStuck = false;
-/** The levels, as `backLevels` says them, that a Back could not close: nothing is pushed for them again until they change. */
-let backRefused = /** @type {string | null} */ (null);
-/** An entry is wanted, but the reader has not touched the page yet: it is pushed at their first touch. */
-let backDeferred = false;
-/** Whether a `syncBackStack` is already due at the end of this task. */
-let backSyncDue = false;
-/** Where the browser was in the tab's history when the page last looked (`historyIndex`), to tell a Back from a Forward. */
-let backIndex = /** @type {number | null} */ (null);
-/**
- * How deep the earlier load's entries under this load's reach: one an earlier load made, less deep than
- * this, is taken for this load's own, at the depth it says. Nought where the page opened on none.
- */
-let backAdopted = 0;
+// The page's own history entries: what those above its base stand for, a going-back asked for and not yet
+// landed, an entry put off until the reader's first touch, the levels a Back could not close, how deep the
+// earlier load's entries reach, and the browser's place when last looked; pushing, replacing and going back
+// through them as levels open and close: one owner in web/src/core/navigation/backstack.ts (`#624
+// voice-page-modularity`). What is open (`backLevels`) and how each level closes (`closeBackLevel`) are here.
+const backStack = createBackStack({
+  clock: clockOnUse(),
+  session: BACK_SESSION,
+  history: () => backHistory(),
+  index: () => historyIndex(),
+  mayPush: () => mayPushHistory(),
+  levels: () => backLevels(),
+  close: (tag) => closeBackLevel(tag),
+  failed: (message) => showError(message),
+  notePlace: () => notePlace(),
+  syncAddress: () => syncDeepLinkAddress(),
+  applyLink: () => guardQuietly(applyDeepLink)(),
+});
 
 /** The window's history, where it can be written; null in a host without one. */
 function backHistory() {
@@ -982,36 +973,6 @@ function backHistory() {
   if (!history || typeof history.pushState !== "function" || typeof history.replaceState !== "function" ||
       typeof history.back !== "function" || typeof history.go !== "function") return null;
   return history;
-}
-
-/** The state of the page's entry at `depth`, standing for `tag`. */
-function backEntry(depth, tag) {
-  return { [BACK_STATE_KEY]: { session: BACK_SESSION, depth, tag } };
-}
-
-/** The facts of an entry this page load made, or null: no state, somebody else's, or one from before a reload. */
-function liveBackEntry(state) {
-  const facts = state && typeof state === "object" ? state[BACK_STATE_KEY] : null;
-  if (!facts || typeof facts !== "object" || facts.session !== BACK_SESSION) return null;
-  return Number.isInteger(facts.depth) && facts.depth >= 0 ? facts : null;
-}
-
-/** The facts of an entry an earlier load of the page made — another load's name — or null. */
-function earlierLoadEntry(state) {
-  const facts = state && typeof state === "object" ? state[BACK_STATE_KEY] : null;
-  if (!facts || typeof facts !== "object" || typeof facts.session !== "string" || facts.session === BACK_SESSION) return null;
-  return Number.isInteger(facts.depth) && facts.depth >= 0 ? facts : null;
-}
-
-/**
- * The facts of an entry the page stands on: one this load made, or one of the earlier load's under it
- * (`backAdopted`), which the page takes for its own at the depth it says. Null for any other.
- */
-function standingBackEntry(state) {
-  const live = liveBackEntry(state);
-  if (live) return live;
-  const earlier = earlierLoadEntry(state);
-  return earlier && earlier.depth < backAdopted ? earlier : null;
 }
 
 /**
@@ -1023,21 +984,6 @@ function historyIndex() {
   const navigation = typeof window === "object" && window ? window.navigation : null;
   const entry = navigation ? navigation.currentEntry : null;
   return entry && Number.isInteger(entry.index) && entry.index >= 0 ? entry.index : null;
-}
-
-/** `backTags` cut or padded to `depth`: what the page knows of the entries up to the one it is on. */
-function fitBackTags(depth) {
-  const tags = backTags.slice(0, depth);
-  while (tags.length < depth) tags.push("");
-  return tags;
-}
-
-/** Make the entry the browser is on this load's own, at `depth`, standing for `tag` ("top" at depth nought). */
-function ownBackEntry(history, depth, tag) {
-  const named = depth === 0 ? "top" : tag;
-  history.replaceState(backEntry(depth, named), "");
-  backTags = fitBackTags(depth);
-  if (depth > 0) backTags[depth - 1] = named;
 }
 
 /** Whether the page may push an entry now: not before the reader has ever touched it, where the browser says. */
@@ -1179,194 +1125,19 @@ function closeBackLevel(tag) {
   else if (tag === "jump") returnFromLinkJump();
 }
 
-/**
- * Close from the top until no more than `target` levels are open. A level its close leaves open is
- * noted (`backRefused`) and the closing stops: pushing an entry for it again would make a Back that
- * never gets out.
- */
-function closeBackLevelsTo(target) {
-  for (let step = 0; step < 16; step += 1) {
-    const levels = backLevels();
-    if (levels.length <= target) return;
-    const said = levels.join(" ");
-    try {
-      closeBackLevel(levels[levels.length - 1]);
-    } catch (error) {
-      showError(error && error.message ? error.message : String(error));
-    }
-    if (backLevels().join(" ") === said) {
-      backRefused = said;
-      return;
-    }
-    // `#543 in-app-message-links`. Undoing a jump puts back everything under it as it was, whatever
-    // is open as it begins: nothing under it is closed on its account.
-    if (levels[levels.length - 1] === "jump") return;
-  }
-}
-
-/** Put the history in step with what is open, at the end of the task that changed it. */
+/** Put the history in step with what is open, at the end of the task that changed it (`BackStack.schedule`). */
 function scheduleBackSync() {
-  if (!backStarted || backSyncDue) return;
-  backSyncDue = true;
-  Promise.resolve().then(() => {
-    // `#423 back-key-consistency`. Whatever moved the history, the place the reader is at now.
-    try {
-      notePlace();
-    } catch (_error) {
-      // A place that cannot be read is not noted: Back and Forward go on through the others.
-    }
-    try {
-      syncBackStack();
-    } catch (_error) {
-      // A browser that refuses a history call leaves the page as it was, with no entry to go back to.
-      backSyncDue = false;
-    }
-    // `#462 webapp-deep-links`. The address in step with the place just noted; and the place a
-    // link named, applied once there is a channel to apply it to (a no-op from then on).
-    try {
-      syncDeepLinkAddress();
-    } catch (_error) {
-      // An address that cannot be written leaves the last one standing.
-    }
-    guardQuietly(applyDeepLink)();
-  });
-}
-
-/**
- * Put the history in step with `backLevels`: an entry pushed for each level opened, the top one
- * replaced for a level that gave way to another, and entries gone back through for levels closed.
- * The depth is read from the browser's entry each time, never only from what the page remembers, so a
- * push the browser ignored is not counted, and nothing is ever gone back through below the page's own
- * entry: the page never takes the reader out of the app.
- */
-function syncBackStack() {
-  backSyncDue = false;
-  if (!backStarted) return;
-  const history = backHistory();
-  if (!history || backTraversal) return;
-  const levels = backLevels();
-  const said = levels.join(" ");
-  if (backRefused !== null && backRefused !== said) backRefused = null;
-  const entry = liveBackEntry(history.state);
-  if (!entry) {
-    history.replaceState(backEntry(0, "top"), "");
-    backTags = [];
-  } else if (entry.depth !== backTags.length) {
-    backTags = fitBackTags(entry.depth);
-  }
-  const depth = backTags.length;
-  const wanted = backRefused === null ? levels.length : Math.min(levels.length, depth);
-  if (wanted < depth) {
-    if (!backTraversalStuck) goBackThrough(history, depth - wanted);
-    return;
-  }
-  backDeferred = wanted > depth && !mayPushHistory();
-  if (wanted > depth && !backDeferred) {
-    for (let at = depth; at < wanted; at += 1) {
-      history.pushState(backEntry(at + 1, levels[at]), "");
-      const now = liveBackEntry(history.state);
-      // A push the browser ignored (it throttles a flood of them) is not counted.
-      if (!now || now.depth !== at + 1) break;
-      backTags.push(levels[at]);
-    }
-    backTraversalStuck = false;
-  }
-  const top = backTags.length;
-  if (top > 0 && levels[top - 1] !== undefined && backTags[top - 1] !== levels[top - 1]) {
-    history.replaceState(backEntry(top, levels[top - 1]), "");
-    backTags[top - 1] = levels[top - 1];
-  }
-  backIndex = historyIndex();
-}
-
-/** Go back through the page's top `count` entries, for levels already closed, and wait for it to land. */
-function goBackThrough(history, count) {
-  const target = backTags.length - count;
-  backTags = backTags.slice(0, target);
-  backTraversal = { target, timer: setTimeout(backTraversalLost, BACK_TRAVERSAL_MS) };
-  if (count === 1) history.back();
-  else history.go(-count);
-}
-
-/** A going-back that never landed: the page believes the browser's entry, and asks for no more until it moves. */
-function backTraversalLost() {
-  if (!backTraversal) return;
-  backTraversal = null;
-  backTraversalStuck = true;
-  const history = backHistory();
-  const entry = history ? liveBackEntry(history.state) : null;
-  backTags = fitBackTags(entry ? entry.depth : 0);
-  scheduleBackSync();
+  backStack.schedule();
 }
 
 /**
  * The browser went back (or forward) to another entry: close one thing for each entry it went back
- * through — down to the entry's depth, where the history is in step — as the Back of each thing closed
- * would. The page's own going-back, for levels it had already closed, lands here too,
- * and closes nothing more. An entry of the earlier load's under this one's is taken for this load's,
- * at its depth (`backAdopted`); one the page cannot account for is never taken for a depth — reached by
- * a Back it closes the top thing open, one press for one thing, and reached by a Forward it is gone back
- * through — and either way it is this load's own entry from here on.
+ * through, as the Back of each thing closed would (`BackStack.pop`).
  *
  * @param {PopStateEvent} event
  */
 function onBackPop(event) {
-  if (!backStarted) return;
-  const history = backHistory();
-  if (!history) return;
-  const state = event ? event.state : null;
-  const awaited = backTraversal;
-  if (awaited) {
-    clearTimeout(awaited.timer);
-    backTraversal = null;
-  }
-  backTraversalStuck = false;
-  const from = backTags.length;
-  const index = historyIndex();
-  const moved = index !== null && backIndex !== null ? index - backIndex : null;
-  backIndex = index;
-  const entry = standingBackEntry(state);
-  const wasOpen = backLevels().length;
-  let target;
-  let closeTo;
-  if (entry) {
-    target = entry.depth;
-    // As many things as entries gone back through, from the top: down to the entry's depth where the
-    // history is in step, and no further where something open still waits for its entry (`backDeferred`).
-    closeTo = Math.max(target, wasOpen - Math.max(0, from - target));
-  } else if (awaited) {
-    // The page's own going-back, landed somewhere it cannot read: where it asked to go.
-    target = awaited.target;
-    closeTo = target;
-  } else if (moved !== null && moved > 0) {
-    // A Forward, as the Navigation API says, onto an entry nobody can say the depth of: above where the
-    // page was by as many as it moved, so that nothing closes and the page goes back down to what is open.
-    target = from + moved;
-    closeTo = wasOpen;
-  } else {
-    // A Back onto one: the top thing open closes, and nothing more.
-    target = Math.max(0, wasOpen - 1);
-    closeTo = target;
-  }
-  if (!entry || entry.session !== BACK_SESSION) {
-    ownBackEntry(history, target, entry ? String(entry.tag) : "");
-    // Under an entry of the earlier load's, the rest of that load's; under one nobody can account for, nothing.
-    if (entry) backAdopted = target;
-    else if (!awaited && !(moved !== null && moved > 0)) backAdopted = 0;
-  } else {
-    backTags = fitBackTags(target);
-  }
-  if (!awaited || target !== awaited.target) closeBackLevelsTo(closeTo);
-  syncBackStack();
-  // `#462 webapp-deep-links`. The entry landed on carries the address it was left with, which
-  // may name a place the reader has since left (entries are pushed as levels open, places move
-  // after): say where the reader stands now, on this entry. A further traversal the sync just
-  // started lands with its own pop, and that one says it then.
-  try {
-    if (!backTraversal) syncDeepLinkAddress();
-  } catch (_error) {
-    // An address that cannot be written leaves the entry's own standing.
-  }
+  backStack.pop(event ? event.state : null);
 }
 
 /**
@@ -1377,24 +1148,11 @@ function onBackPop(event) {
  * (`#280 scroll-stability`); and an entry put off until the reader's first touch is pushed then.
  */
 function startBackStack() {
-  backStarted = true;
-  const history = backHistory();
-  if (history) {
-    try {
-      history.scrollRestoration = "manual";
-    } catch (_error) {
-      // A host whose history will not take it moves nothing on a Back anyway: the page does not scroll.
-    }
-    const earlier = earlierLoadEntry(history.state);
-    const index = historyIndex();
-    const depth = earlier ? Math.min(earlier.depth, index === null ? BACK_DEPTH_MAX : index, BACK_DEPTH_MAX) : 0;
-    ownBackEntry(history, depth, earlier ? String(earlier.tag) : "");
-    backAdopted = depth;
-    backIndex = index;
+  if (backStack.start()) {
     window.addEventListener("popstate", onBackPop);
   }
   const touched = () => {
-    if (backDeferred) scheduleBackSync();
+    if (backStack.deferred()) scheduleBackSync();
   };
   for (const type of ["pointerup", "keydown", "click"]) document.addEventListener(type, touched, true);
   scheduleBackSync();
