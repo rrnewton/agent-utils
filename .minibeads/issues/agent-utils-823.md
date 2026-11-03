@@ -1,13 +1,14 @@
 ---
 title: 'merge-queue-change-features: per-change features and a proposal for one shared change classifier'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 assignee: cl-mq@devbig030
 labels:
 - merge-queue
 created_at: 2026-11-03T16:12:59.057600878+00:00
-updated_at: 2026-11-03T16:12:59.057600878+00:00
+updated_at: 2026-11-03T18:14:15.200096889+00:00
+closed_at: 2026-11-03T18:14:15.200096769+00:00
 ---
 
 # Description

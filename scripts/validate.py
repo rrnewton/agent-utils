@@ -203,6 +203,8 @@ PREFIX_RULES: tuple[tuple[str, frozenset[str]], ...] = (
     ("rs/agent-teams/", frozenset({RUST})),
     ("common/docs/agent-teams/", frozenset({DOCS, RUST})),
     ("rs/merge-queue/", frozenset({RUST})),
+    ("rs/change-classifier/", frozenset({RUST})),
+    ("common/docs/change-classifier/", frozenset({DOCS, RUST})),
     ("common/docs/merge-queue/", frozenset({DOCS, RUST})),
     ("cross/", frozenset({CROSS})),
     ("common/docs/", frozenset({DOCS})),
@@ -1218,6 +1220,12 @@ def self_test() -> int:
         {RUST},
         "the Rust-only merge-queue tool selects the Rust gate and the crate tests, not everything",
         {"merge-queue"},
+    )
+    expect(
+        ["rs/change-classifier/testdata/vectors.json"],
+        {RUST},
+        "the shared change classifier re-tests itself and the merge queue that embeds it",
+        {"change-classifier", "merge-queue"},
     )
     expect(
         ["common/docs/merge-queue/USER_GUIDE.md"],

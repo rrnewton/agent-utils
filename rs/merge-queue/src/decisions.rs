@@ -125,6 +125,24 @@ pub struct Features {
     pub ci_only: bool,
     /// Soft-green evidence: the submitter's own validation claim, if any.
     pub claim: Option<ClaimEvidence>,
+    /// The shared change classifier's answer, when `classifier.policy` is configured and the
+    /// policy and the change's paths were readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classification: Option<ChangeClass>,
+}
+
+/// What the configured test-footprint policy says of a change (see the `change-classifier`
+/// crate).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChangeClass {
+    /// `skip`, `selective` or `full`.
+    pub verdict: String,
+    /// Paths that matched no rule.
+    pub unknown: usize,
+    /// Every path forces the full suite (build and CI configuration).
+    pub only_force_full: bool,
+    /// Every path is inert.
+    pub only_inert: bool,
 }
 
 /// What the submitter said it ran before submitting.
@@ -235,6 +253,9 @@ pub struct Sources<'a> {
     pub git: Option<&'a Git>,
     /// For the CI-only feature.
     pub priority: &'a PriorityConfig,
+    /// Test-footprint policy path in the repository (`classifier.policy`), read at the plan's
+    /// base; empty for none.
+    pub classifier_policy: &'a str,
 }
 
 fn str_field<'v>(value: &'v Value, key: &str) -> &'v str {
@@ -324,6 +345,16 @@ pub fn from_report(report: &Value, sources: &Sources<'_>, reconstructed: bool) -
         .flatten()
         .collect();
     let mut features: BTreeMap<i64, Features> = BTreeMap::new();
+    // The shared classifier's policy as of the plan's base, when one is configured.
+    let classifier = (!sources.classifier_policy.is_empty() && !plan_base.is_empty())
+        .then(|| {
+            let text = sources.git?.run(&[
+                "show",
+                &format!("{plan_base}:{}", sources.classifier_policy),
+            ]);
+            change_classifier::Policy::from_json(&text.ok()?).ok()
+        })
+        .flatten();
     let mut feature = |pr: i64, head: &str| -> Features {
         features
             .entry(pr)
@@ -331,10 +362,18 @@ pub fn from_report(report: &Value, sources: &Sources<'_>, reconstructed: bool) -
                 let item = sources.items.get(&pr);
                 let planned = planned.get(&pr);
                 let stat = sources.git.and_then(|git| diff_stat(git, &plan_base, head));
-                let components: BTreeSet<String> = stat
-                    .iter()
-                    .flat_map(|(_, _, paths)| paths.iter().map(|path| component(path)))
-                    .collect();
+                let classified = classifier
+                    .as_ref()
+                    .zip(stat.as_ref())
+                    .map(|(policy, stat)| change_classifier::classify(policy, &stat.2));
+                // The shared classifier's buckets when there is one; else first directories.
+                let components: BTreeSet<String> = match &classified {
+                    Some(classified) => classified.components.clone(),
+                    None => stat
+                        .iter()
+                        .flat_map(|(_, _, paths)| paths.iter().map(|path| component(path)))
+                        .collect(),
+                };
                 Features {
                     lines_added: stat.as_ref().map(|stat| stat.0),
                     lines_deleted: stat.as_ref().map(|stat| stat.1),
@@ -369,6 +408,12 @@ pub fn from_report(report: &Value, sources: &Sources<'_>, reconstructed: bool) -
                             policy: claim.policy.clone(),
                             at_head: claim.commit.is_empty() || head.starts_with(&claim.commit),
                         }),
+                    classification: classified.map(|classified| ChangeClass {
+                        verdict: classified.verdict.as_str().to_owned(),
+                        unknown: classified.unknown.len(),
+                        only_force_full: classified.only_force_full(),
+                        only_inert: classified.only_inert(),
+                    }),
                 }
             })
             .clone()

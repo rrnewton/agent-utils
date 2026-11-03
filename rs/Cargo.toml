@@ -19,6 +19,7 @@ members = [
     "agent-usage",
     "agent-teams",
     "merge-queue",
+    "change-classifier",
 ]
 
 [workspace.package]

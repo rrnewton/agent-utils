@@ -35,6 +35,7 @@ NON_PUBLISHED_RUST_BINARIES = (
     "agent-usage",
     "agentctl-slack-outbound",
     "agentctl-slack-plugin",
+    "change-classify",
     "chat-subscription-fake-plugin",
     "gh-paced",
     "merge-queue",

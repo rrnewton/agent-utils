@@ -356,6 +356,12 @@ enum Command {
         /// paths; the queue never applies it. Repeatable.
         #[arg(long, value_name = "PATTERN")]
         ci_path: Vec<String>,
+        /// Test-footprint policy file in the repository (version 2, such as
+        /// `ci/test-footprints.json`), read at each plan's base: decision-log features then use
+        /// its components and verdict (the shared change classifier). Default: none, and
+        /// components are first directories.
+        #[arg(long, value_name = "PATH", default_value = "")]
+        classifier_policy: String,
         /// Generated-file path pattern the queue regenerates instead of treating its conflicts
         /// as real (exact path, directory with or without a trailing slash, or `*` wildcards).
         /// Repeatable.
@@ -1019,6 +1025,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             union_path,
             priority_label,
             ci_path,
+            classifier_policy,
             regen_path,
             regen_command,
             regen_build,
@@ -1083,6 +1090,9 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                         priority_label
                     },
                     ci_paths: ci_path,
+                },
+                classifier: crate::state::ClassifierConfig {
+                    policy: classifier_policy,
                 },
                 regenerate: RegenerateConfig {
                     paths: regen_path,
@@ -1525,6 +1535,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     items: &items,
                     git: Some(&git),
                     priority: &config.priority,
+                    classifier_policy: &config.classifier.policy,
                 };
                 crate::decisions::reconstruct(&state.root, &sources, since, until)?
             } else {

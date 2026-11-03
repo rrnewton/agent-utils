@@ -890,3 +890,85 @@ fn every_validation_leaves_one_decision_record_and_stats_summarise_them() {
     let text = fx.mq_ok(&["stats", "--reconstruct"]);
     assert!(text.contains("Not reconstructable:"), "{text}");
 }
+
+#[test]
+fn decision_features_use_the_shared_classifier_policy_at_the_plan_base() {
+    let fx = Fixture::new("run-classifier");
+    fx.write("tests/t0", "ok\n");
+    fx.write(
+        "policy.json",
+        r#"{"version": 2,
+            "force_full": ["ci/**"],
+            "ci_irrelevant": ["docs/**"],
+            "footprints": [
+              {"paths": ["tests/**"], "nodes": ["test.suite"], "component": "suite"},
+              {"paths": ["src/**"], "nodes": ["test.lib"]}
+            ]}"#,
+    );
+    fx.commit_all("seed tests and policy");
+    git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
+    fx.mq_ok(&[
+        "init",
+        "--remote",
+        "origin",
+        "--validator",
+        "command",
+        "--validator-run",
+        RUNNER,
+        "--max-batch",
+        "4",
+        "--ci-path",
+        "ci/",
+        "--classifier-policy",
+        "policy.json",
+    ]);
+    fx.branch("ci", &[("ci/run.sh", "echo\n")]);
+    fx.branch(
+        "multi",
+        &[
+            ("tests/m", "ok\n"),
+            ("src/lib.rs", "x\n"),
+            ("docs/m.md", "m\n"),
+        ],
+    );
+    fx.branch("edit-a", &[("shared.txt", "one\n2\n3\n4\n5\n")]);
+    fx.branch("edit-b", &[("shared.txt", "uno\n2\n3\n4\n5\n")]);
+    for (pr, name) in [(1, "ci"), (2, "multi"), (3, "edit-a"), (4, "edit-b")] {
+        fx.mq_ok(&["submit", &pr.to_string(), "--head", name]);
+    }
+    let r = report(&fx.mq_ok(&["run", "--json"]));
+    assert_eq!(landed_prs(&r), vec![vec![1, 2, 3]], "{r}");
+    let records = decision_records(&fx);
+    let features = |pr: i64| -> Value {
+        records[0]["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["pr"] == pr)
+            .map(|c| c["features"].clone())
+            .unwrap()
+    };
+    let ci = features(1);
+    assert_eq!(ci["ci_only"], true, "{ci}");
+    assert_eq!(ci["classification"]["verdict"], "full", "{ci}");
+    assert_eq!(ci["classification"]["only_force_full"], true, "{ci}");
+    assert_eq!(ci["components"], serde_json::json!([]), "{ci}");
+    let multi = features(2);
+    assert_eq!(multi["ci_only"], false);
+    assert_eq!(multi["files"], 3, "{multi}");
+    assert_eq!(
+        multi["components"],
+        serde_json::json!(["src", "suite"]),
+        "{multi}"
+    );
+    assert_eq!(multi["classification"]["verdict"], "selective", "{multi}");
+    assert_eq!(multi["classification"]["unknown"], 0, "{multi}");
+    // #3 and #4 rewrite the same line: #3 lands and recorded its conflict.
+    let conflicting = features(3);
+    assert_eq!(conflicting["conflict_degree"], 1, "{conflicting}");
+    assert_eq!(
+        conflicting["classification"]["verdict"], "full",
+        "{conflicting}"
+    );
+    assert_eq!(conflicting["classification"]["unknown"], 1, "{conflicting}");
+}

@@ -67,6 +67,7 @@ project's own rules, and reports substance back to the owner.
 | Task tracking | [`minibeads`](https://github.com/rrnewton/minibeads) (`mb`) | optional, submodule | A dependency-aware issue tracker that keeps each issue as a Markdown file in the repository: a coordinator files a task, claims it for the subagent it starts, and the subagent closes it when the work lands; `mb ready` lists what is unblocked. A separate project, pinned as the submodule `ext/minibeads`. No other tool depends on it (see below). |
 | Landing | `pr-landing-planner` | experimental | Produces an advisory, conflict- and CI-aware plan for landing a queue of pull requests. |
 | Merge queue | `merge-queue` | experimental | Runs locally: changes marked ready are ordered by priority and the exact conflict graph, chunked into batches, validated as combined trees with per-test results, and landed only when green. |
+| Change classification | `change-classify` | experimental | Classifies a change's paths against one test-footprint policy (skip, selective or full, with components), so test selection and the merge queue read the same buckets. |
 
 **Task trackers are a la carte too.** The suite's convention is two tiers:
 GitHub Issues for serious bugs and reports from outside, and a local tracker
@@ -165,11 +166,13 @@ These tools are independently installable and follow the same package
 documentation and artifact checks. They are explicit exceptions to the
 two-language implementation and behavioral-differential contract.
 
-`gh-paced`, `agent-usage` and `merge-queue` are Rust-only tools. They are built
-from `rs/gh-paced`, `rs/agent-usage` and `rs/merge-queue` and ship in no package
-index; see the [gh-paced quickstart](common/docs/gh-paced/QUICKSTART.md), the
-[agent-usage quickstart](common/docs/agent-usage/QUICKSTART.md) and the
-[merge-queue quickstart](common/docs/merge-queue/QUICKSTART.md).
+`gh-paced`, `agent-usage`, `merge-queue` and `change-classify` are Rust-only
+tools. They are built from `rs/gh-paced`, `rs/agent-usage`, `rs/merge-queue` and
+`rs/change-classifier` and ship in no package index; see the
+[gh-paced quickstart](common/docs/gh-paced/QUICKSTART.md), the
+[agent-usage quickstart](common/docs/agent-usage/QUICKSTART.md), the
+[merge-queue quickstart](common/docs/merge-queue/QUICKSTART.md) and the
+[change-classifier quickstart](common/docs/change-classifier/QUICKSTART.md).
 
 ## Persistent coding agents
 

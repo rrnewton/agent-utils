@@ -73,6 +73,7 @@ EXPECTED_COMPONENTS = frozenset(
     {
         "agentctl",
         "agent-teams",
+        "change-classifier",
         "agent-usage",
         "dagrun",
         "experiment-runner",
@@ -88,7 +89,9 @@ EXPECTED_COMPONENTS = frozenset(
     }
 )
 
-RUST_ONLY_COMPONENTS = frozenset({"agent-teams", "agent-usage", "gh-paced", "merge-queue"})
+RUST_ONLY_COMPONENTS = frozenset(
+    {"agent-teams", "agent-usage", "change-classifier", "gh-paced", "merge-queue"}
+)
 
 
 class ManifestError(ValueError):

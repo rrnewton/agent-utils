@@ -94,6 +94,7 @@ This command creates the state directory and writes `config.json`.
 | `--max-depth N` | `0` | The largest the adaptive window may grow: +1 per landed batch, halved per red batch, never below 1. `0` keeps the window fixed at `--depth`. |
 | `--union-path PATTERN` | none | A Git attribute pattern merged with Git's `union` driver, when probing conflicts and when combining changes. Repeatable. Only for line-oriented, append-only files (see "Union merges"). |
 | `--priority-label LABEL` | `mq-priority` | The label that makes a pull request a priority change when `sync` reads it from the hosting service, compared without regard to case. `-` turns it off. See "Priority changes". |
+| `--classifier-policy PATH` | none | A test-footprint policy in the repository (version 2, such as `ci/test-footprints.json`), read at each plan's base commit. Decision-log features then take their components and a verdict from it, through the shared change classifier (`change-classify userguide`). |
 | `--ci-path PATTERN` | none | A CI or validation-infrastructure path (exact path, directory with or without a trailing slash, or `*` wildcards). `plan` suggests the priority label for a change that touches only these paths; the queue never applies the label itself. Repeatable. |
 | `--regen-path PATTERN` | none | A generated file (exact path, directory with or without a trailing slash, or `*` wildcards) whose conflicts the queue resolves by regenerating it instead of holding the change. Repeatable. See "Generated files". |
 | `--regen-command CMD` | empty | Shell command, run as `sh -c` at the root of the candidate checkout, that rewrites every generated file from its sources deterministically. Runs with `MQ_PR` (change number), `MQ_REGEN_PATHS` (space-separated generated patterns) and `MQ_CONFLICTED` (space-separated conflicted paths, empty for a non-conflict refresh) set. Required with `--regen-path`. |
@@ -651,6 +652,7 @@ An **item record** (`items/<pr>.json`) has these fields:
 | `validator` | empty | How validation runs; see below. |
 | `land` | `push` from `init` | How a validated candidate reaches the base; see below. |
 | `notify` | empty | `{agentctl}` command words for state-change notifications (see "Notifications"). |
+| `classifier` | absent | `{policy}`: the test-footprint policy path for decision-log features (see `--classifier-policy`). Left out of the file while unset. |
 | `decisions` | absent | `{keep_days, max_bytes}`: bounds of the decision log, pruned after every run (absent or `0`: 90 days and 64 MiB; the newest day file is always kept). Left out of the file while both are defaults. |
 
 **`validator`** fields (the `init` flags of the same names set them):
@@ -1084,8 +1086,13 @@ Each change's `features`, for the log and for future batching priors:
 
 - `lines_added`, `lines_deleted`, `files`: its size against the plan's base (`null` when Git no
   longer has its commits).
-- `components`: the first directory of each changed path (`(root)` for a file at the top), a
-  queue-local bucketing.
+- `components`: with `classifier.policy` set, the components the shared change classifier
+  names (its footprints' components and `backend:ID` per backend rule); otherwise the first
+  directory of each changed path (`(root)` for a file at the top).
+- `classification`: with `classifier.policy` set and readable at the plan's base, `{verdict,
+  unknown, only_force_full, only_inert}`: the policy's `skip`, `selective` or `full` for the
+  change, how many paths matched no rule, and whether every path forces the full suite or is
+  inert.
 - `conflict_degree` and `priority` as the plan saw them, and `prioritized`.
 - `trigger`: how it entered the queue, `submit` or the `sync` source (`label:NAME`, `file:PATH`).
 - `ci_only`: every changed path is a configured CI path (`priority.ci_paths`).

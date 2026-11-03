@@ -1,0 +1,26 @@
+[package]
+name = "change-classifier"
+version = "0.1.0"
+description = "Classify a change's paths against a test-footprint policy: skip, selective or full, with components"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[[bin]]
+name = "change-classify"
+path = "src/main.rs"
+
+[lib]
+name = "change_classifier"
+path = "src/lib.rs"
+
+[lints]
+workspace = true

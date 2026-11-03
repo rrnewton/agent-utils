@@ -96,6 +96,16 @@
         "py/tests/test_herdr_subagents.py"
       ]
     },
+    "change-classifier": {
+      "source_prefixes": [
+        "common/docs/change-classifier/",
+        "rs/change-classifier/"
+      ],
+      "reverse_dependencies": [
+        "merge-queue"
+      ],
+      "test_files": []
+    },
     "dagrun": {
       "source_prefixes": [
         "common/docs/dagrun/",

@@ -2010,6 +2010,7 @@ impl<'a> Runner<'a> {
             items: &items,
             git: Some(&self.git),
             priority: &self.config.priority,
+            classifier_policy: &self.config.classifier.policy,
         };
         let decisions = crate::decisions::from_report(&value, &sources, false);
         crate::decisions::append(&self.state.root, &decisions, &self.config.decisions)

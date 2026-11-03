@@ -278,6 +278,19 @@ impl DecisionsConfig {
     }
 }
 
+/// The shared change classifier (the `change-classifier` crate) for decision-log features.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClassifierConfig {
+    /// Test-footprint policy (version 2) in the repository, read at each plan's base commit,
+    /// such as `ci/test-footprints.json`. Empty: components are first directories.
+    pub policy: String,
+}
+
+fn is_default_classifier(value: &ClassifierConfig) -> bool {
+    *value == ClassifierConfig::default()
+}
+
 fn is_default_decisions(value: &DecisionsConfig) -> bool {
     *value == DecisionsConfig::default()
 }
@@ -574,6 +587,9 @@ pub struct Config {
     /// Decision-log bounds.
     #[serde(skip_serializing_if = "is_default_decisions")]
     pub decisions: DecisionsConfig,
+    /// Shared change classifier.
+    #[serde(skip_serializing_if = "is_default_classifier")]
+    pub classifier: ClassifierConfig,
     /// Validation configuration.
     pub validator: ValidatorConfig,
     /// Donor-validator settings (used when `validator.offload` is not off).
@@ -610,6 +626,7 @@ impl Default for Config {
             peers: std::collections::BTreeMap::new(),
             priority: PriorityConfig::default(),
             decisions: DecisionsConfig::default(),
+            classifier: ClassifierConfig::default(),
             validator: ValidatorConfig::default(),
             donors: DonorsConfig::default(),
             land: LandConfig::default(),
