@@ -11330,7 +11330,7 @@ function saveChannelScope() {
       more: olderPages().moreAbove !== false,
       cursor: null,
       // `#578 search-status-clarity`: where the rows saved stop being one stretch, if they do.
-      gapFrom: plainGapFrom,
+      gapFrom: plainReach.gapFrom(),
       dismissed: [...doneState().archived].filter((id) => shown.has(id)),
       bookmark: bookmarkToSave(key),
     };
@@ -11370,7 +11370,7 @@ function hydrateChannelScope() {
   try {
     el("discord-log").replaceChildren();
     const loaded = applyNewestPage(payload, true);
-    plainGapFrom = Number.isFinite(entry.gapFrom) ? entry.gapFrom : null;
+    plainReach.restore(entry.gapFrom);
     renderChannelSeam(channelSummary(loaded, loadedIsWhole(), channelName(payload.channel)));
   } catch (_error) {
     clearChannelScreen();
@@ -21921,7 +21921,7 @@ function oldestLoadedMs() {
 // read carried joins it. One that does not — the page was away while more than a page of messages
 // arrived — leaves a gap the rows do not show, and the cover keeps where it is (`cover.dense`): the
 // messages above it are the stretch, and those below are SCATTERED. Without threads, the plain page's
-// newest read does the same (`plainGapFrom`). Rows saved on this device that no read has checked claim
+// newest read does the same (`PlainReach.gapFrom`). Rows saved on this device that no read has checked claim
 // no stretch at all, nor does a list no read has said anything of.
 //
 // ALL ON A CHAT SERVICE WITH THREADS IS TOP-LEVEL MESSAGES FIRST. Its pages hold every top-level message
@@ -21939,15 +21939,11 @@ function oldestLoadedMs() {
 // here says either searched.
 
 /**
- * Without threads: the instant of the oldest message of the newest read that did not reach down into
- * the rows already loaded, which are scattered below it; null while every row loaded is one stretch.
- *
- * @type {number | null}
+ * Without threads: the instant below which the rows loaded are scattered, and whether the rows on screen
+ * were drawn from this device with no read landed since (web/src/core/channels `createPlainReach`, `#624
+ * voice-page-modularity`).
  */
-let plainGapFrom = null;
-
-/** Without threads: whether the rows on screen were drawn from this device, and no read has landed since. */
-let plainSaved = false;
+const plainReach = createPlainReach();
 
 /** @typedef {import("./src/present/notices/index.ts").HistoryReach} HistoryReach */
 
@@ -21982,8 +21978,8 @@ function historyReach() {
     // Hide read's own list is a to-do list, not a stretch of the channel (`loadTodo`).
     if (readModes.hiding() || olderPages().moreAbove === undefined) return reach;
     // Drawn from this device: what was saved, and nothing it may have missed since.
-    reach.saved = plainSaved;
-    if (plainGapFrom !== null) floor = plainGapFrom;
+    reach.saved = plainReach.saved();
+    if (plainReach.gapFrom() !== null) floor = plainReach.gapFrom();
     else if (olderPages().moreAbove === false) reach.start = true;
     else floor = -Infinity;
   }
@@ -22869,12 +22865,8 @@ function applyNewestPage(payload, saved = false) {
   // reaches down into what was loaded, so messages may lie between that no read brought, and the rows
   // kept are scattered below the page (`historyReach`). Once a gap, always one, until a fresh list.
   const keptRows = kept.filter(isMessageRow);
-  plainSaved = saved;
-  if (keptRows.length === 0) plainGapFrom = null;
-  else if (keptRows.length === before.length && messages.length > 0) {
-    const from = Date.parse(String(messages[0].timestamp || ""));
-    if (Number.isFinite(from)) plainGapFrom = plainGapFrom === null ? from : Math.max(plainGapFrom, from);
-  }
+  plainReach.noteNewest(saved, keptRows.length, before.length, messages.length,
+    messages.length > 0 ? messages[0].timestamp : undefined);
   list.replaceChildren(...kept, ...glom(messages).map(discordNode));
   // The archive BEFORE the derivation that reads it. `kept` rows were already on screen and their
   // ids are still in the set from the read that brought them, so a reset here would un-grey them.

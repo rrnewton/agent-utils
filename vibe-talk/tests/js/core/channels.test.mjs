@@ -750,3 +750,23 @@ test("`#624 voice-page-modularity`: Hide read's own list keeps what its read sai
   assert.equal(todo.state().window, 0, "a window not said is the messages it holds");
   assert.equal(todo.holdsFrom(0, "C1"), true, "a whole channel holds everything");
 });
+
+test("`#624 voice-page-modularity`: a plain channel's rows are one stretch until a newest read leaves older rows scattered below it", () => {
+  const reach = CHANNELS.createPlainReach();
+  assert.equal(reach.gapFrom(), null);
+  reach.noteNewest(false, 3, 3, 50, "2026-11-02T10:00:00Z");
+  assert.equal(reach.gapFrom(), Date.parse("2026-11-02T10:00:00Z"), "every row kept is older than the page: a gap");
+  reach.noteNewest(false, 3, 3, 50, "2026-11-02T09:00:00Z");
+  assert.equal(reach.gapFrom(), Date.parse("2026-11-02T10:00:00Z"), "once a gap, always one, at the newest such edge");
+  reach.noteNewest(false, 2, 3, 50, "2026-11-02T11:00:00Z");
+  assert.equal(reach.gapFrom(), Date.parse("2026-11-02T10:00:00Z"), "a page that reached some of the rows leaves the gap as it was");
+  reach.noteNewest(true, 0, 3, 50, "2026-11-02T11:00:00Z");
+  assert.equal(reach.gapFrom(), null, "a fresh list is one stretch");
+  assert.equal(reach.saved(), true);
+  reach.restore(42);
+  assert.equal(reach.gapFrom(), 42);
+  reach.restore("garbage");
+  assert.equal(reach.gapFrom(), null);
+  reach.noteNewest(false, 3, 3, 0, "2026-11-02T10:00:00Z");
+  assert.equal(reach.gapFrom(), null, "an empty page says nothing of a gap");
+});

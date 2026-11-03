@@ -58,3 +58,5 @@ export { UNPACK_READS_AT_ONCE, createUnpackReads } from "./unpackreads.ts";
 export type { UnpackReads, UnpackReadsDependencies, UnpackedThread } from "./unpackreads.ts";
 export { createTodoView } from "./todo.ts";
 export type { TodoRead, TodoState, TodoView } from "./todo.ts";
+export { createPlainReach } from "./plainreach.ts";
+export type { PlainReach } from "./plainreach.ts";

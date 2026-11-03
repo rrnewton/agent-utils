@@ -119,6 +119,7 @@ declare const createChannelDirectory: LegacyImports["createChannelDirectory"];
 declare const createSummaries: LegacyImports["createSummaries"];
 declare const summaryKey: LegacyImports["summaryKey"];
 declare const createIdentities: LegacyImports["createIdentities"];
+declare const createPlainReach: LegacyImports["createPlainReach"];
 declare const createTodoView: LegacyImports["createTodoView"];
 declare const exactReplyCount: LegacyImports["exactReplyCount"];
 declare const replyTallyOf: LegacyImports["replyTallyOf"];
