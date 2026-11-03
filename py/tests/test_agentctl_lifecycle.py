@@ -39,6 +39,12 @@ def test_send_queue_only_persists_pending_without_typing(tmp_path: Path, monkeyp
     assert (queue / "inbox" / "queue-only-1.json").is_file()
     with pytest.raises(AgentDeliveryError):
         manager.queue_only("worker", "queued for later", message_id="queue-only-1")
+    # A drain pass types the parked prompt (#804): the watcher's interval does
+    # exactly this, so nothing waits for another send.
+    drained = manager.drain("worker", ready_timeout=0, deliver_while_working=True)
+    assert drained.outcome == "delivered"
+    assert drained.delivered == ("queue-only-1",)
+    assert manager.queue_only("worker", "second", message_id="queue-only-2").pending == ("queue-only-2",)
 
 
 def test_start_holds_its_generation_lock_through_brief_and_returned_status(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

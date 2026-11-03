@@ -10158,6 +10158,13 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         self.send_holding_no_lock_while_waiting(agent_name, text, options, message_id, false)
     }
 
+    /// An interactive agent's pending prompts as `(id, queued_at millis)`, oldest
+    /// first (#804): the watcher drains these and reports their ages.
+    pub fn pending_prompts(&self, agent_name: &str) -> Result<Vec<(String, Option<u64>)>> {
+        let queue = self.queue(agent_name)?;
+        agent::pending_prompts(&queue)
+    }
+
     /// Queue a prompt for an interactive agent and return at once, without waiting
     /// for its pane (#746): the prompt is durable in its queue and typed by the next
     /// drain. Headless and cloud agents already return once journaled, so callers

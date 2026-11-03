@@ -2672,6 +2672,28 @@ pub(crate) fn queued_prompts(root: &Path) -> AgentResult<Vec<String>> {
     Ok(agent_queue::queue::pending_identifiers(root)?)
 }
 
+/// The pending prompts with their `queued_at` (Unix milliseconds) when the item
+/// records one, oldest first: what a watcher needs to say how long a prompt has
+/// waited, not only that one waits (#804 agentctl-queue-only-drain).
+pub(crate) fn pending_prompts(root: &Path) -> AgentResult<Vec<(String, Option<u64>)>> {
+    let directories = agent_queue::queue::QueueDirectories::new(root);
+    let mut prompts = Vec::new();
+    for identifier in agent_queue::queue::pending_identifiers(root)? {
+        let queued_at = [&directories.inbox, &directories.inbox_v2]
+            .iter()
+            .map(|lane| lane.join(format!("{identifier}.json")))
+            .find(|path| path.is_file())
+            .and_then(|path| agent_queue::queue::load_message(&path).ok())
+            .and_then(|document| {
+                document
+                    .get("queued_at")
+                    .and_then(|value| value.as_u64().or_else(|| value.as_f64().map(|v| v as u64)))
+            });
+        prompts.push((identifier, queued_at));
+    }
+    Ok(prompts)
+}
+
 /// Take the prompt `message_id` back out of the queue's inbox, untyped, and say whether it was
 /// there to take. It holds the queue's delivery lock, which a drain holds while it types, so a
 /// prompt is either taken out or typed, never both. A prompt in any other phase is left as it is:
@@ -4421,6 +4443,36 @@ mod tests {
             Some("queue-only-1"),
         )
         .is_err());
+    }
+
+    #[test]
+    fn a_queued_prompt_is_typed_at_a_working_claudes_next_tool_boundary() {
+        let directory = TestDirectory::new("queue-only-boundary");
+        let (fake, target) =
+            working_claude(crate::submission::fake::FakeScreen::new("claude", true));
+        let queued = queue_identified_managed(
+            &target,
+            directory.path(),
+            "queued while working",
+            None,
+            Some("queue-only-boundary-1"),
+        )
+        .expect("queue");
+        assert_eq!(queued.outcome, QueueOutcome::Pending);
+        assert!(
+            fake.screen.as_ref().unwrap().state().pastes.is_empty(),
+            "nothing typed while the prompt is only queued"
+        );
+        // The watcher's drain, delivering while working, types it at the boundary.
+        let runtime = FakeRuntime::default();
+        let result =
+            drain_with_runtime(&fake, &target, directory.path(), while_working(), &runtime)
+                .expect("drain");
+        assert_eq!(result.outcome, QueueOutcome::Delivered);
+        assert_eq!(result.delivered, ["queue-only-boundary-1"]);
+        let screen = fake.screen.as_ref().unwrap().state();
+        assert_eq!(screen.pastes.len(), 1);
+        assert!(screen.pastes[0].contains("queued while working"));
     }
 
     #[test]

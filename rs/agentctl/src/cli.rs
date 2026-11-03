@@ -740,6 +740,9 @@ struct Watch {
     /// Directory for health.json (default: $XDG_STATE_HOME/agentctl/watch)
     #[arg(long, value_name = "DIR")]
     state_dir: Option<PathBuf>,
+    /// Minutes a queued prompt may stay pending before the pass reports it as stale, naming the agent and the age (default: 10)
+    #[arg(long, default_value = "10", value_name = "MINUTES", value_parser = clap::value_parser!(u16).range(1..=1440))]
+    queue_stale_minutes: u16,
 }
 
 #[derive(Args)]
@@ -1314,7 +1317,7 @@ struct Send {
     /// Hard wall-clock limit in seconds for the whole send, counted from its start: waits for the agent's lock, the queue and pane locks, and readiness all end by then, and a send that has not typed its prompt gives up with exit 75, leaving the prompt pending (safe to retry) and every lock released. A prompt being typed is finished first (bounded by --working-timeout). Interactive agents only (default: send_deadline_seconds in the registry's settings.json, else 600)
     #[arg(long, value_name = "SECONDS", value_parser = positive_seconds)]
     deadline: Option<f64>,
-    /// Queue the prompt and return at once with outcome pending, without waiting for the agent's pane: for messages that must never block on a mid-turn agent, such as a coordinator's or a restore's. The prompt is durable in the queue and typed by the next drain. Interactive agents only (headless and cloud sends already return once journaled)
+    /// Queue the prompt and return at once with outcome pending, without waiting for the agent's pane: for messages that must never block on a mid-turn agent, such as a coordinator's or a restore's. The prompt is durable in the queue; the running `agentctl watch` types it on its next pass (at once when idle, at the next tool boundary for a working Muse or Claude Code agent), as does any later send or `agentctl drain`. Interactive agents only (headless and cloud sends already return once journaled)
     #[arg(long, conflicts_with_all = ["urgent", "deadline"])]
     queue_only: bool,
     #[command(flatten)]
@@ -3056,6 +3059,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     check_only: value.check_only,
                     wrkslots: crate::subagents::project_wrkslots(&args.registry),
                     state_dir: value.state_dir,
+                    queue_stale: Duration::from_secs(u64::from(value.queue_stale_minutes) * 60),
                 },
             )?;
             write_json(&health).map_err(Failure::Output)?;

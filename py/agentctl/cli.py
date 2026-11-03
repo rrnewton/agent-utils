@@ -191,7 +191,7 @@ def parser() -> argparse.ArgumentParser:
     send.add_argument("--message-id", metavar="ID", help="caller-selected interactive request ID; duplicate IDs are rejected")
     send.add_argument("--model", metavar="MODEL", help="model override for this headless turn only")
     send.add_argument("--queue-only", action="store_true",
-        help="interactive only: queue the prompt and return at once with outcome pending, without waiting for the agent's pane; for messages that must never block on a mid-turn agent (default: off)")
+        help="interactive only: queue the prompt and return at once with outcome pending, without waiting for the agent's pane; the running agentctl watch types it on its next pass (at once when idle, at the next tool boundary for a working Muse or Claude Code agent), as does any later send or drain (default: off)")
     drain = command("drain", "Deliver safely pending interactive requests; never replay uncertain submissions.",
         "agentctl drain reviewer --ready-timeout 0", named=True)
     _delivery(drain)

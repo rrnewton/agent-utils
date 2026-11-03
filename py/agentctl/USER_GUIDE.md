@@ -1776,8 +1776,13 @@ Slash commands still wait for idle or done.
 A message that must never block its sender on a busy agent — a coordinator's
 notice, a restore's catch-up — goes with `send --queue-only`: the prompt is
 durable in the target's queue and the command returns at once with outcome
-`pending` and the prompt's ID; the next drain types it. It refuses a duplicate
-`--message-id`, exactly as a draining send does.
+`pending` and the prompt's ID. It is not parked: the running `agentctl watch`
+types it on its next pass (every `--interval`, 60 seconds by default) — at
+once for an idle agent, at the next tool boundary for a working Muse or
+Claude Code agent — and any later send or `agentctl drain` types it too. A
+prompt still pending past `--queue-stale-minutes` (10 by default) is a watch
+finding that names the agent and the oldest prompt's age. It refuses a
+duplicate `--message-id`, exactly as a draining send does.
 
 The Rust edition also delivers ordinary follow-ups to a working Muse pane by
 default. Muse keeps its editor typeable while a turn runs: Enter there steers the

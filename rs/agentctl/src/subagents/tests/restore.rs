@@ -239,6 +239,87 @@ fn restore_queues_a_catch_up_for_each_revived_agent_without_blocking() {
 }
 
 #[test]
+fn watch_types_a_queued_prompt_and_reports_a_stale_one() {
+    let fixture = Fixture::new();
+    fixture
+        .manager()
+        .start(
+            "lane",
+            &fixture.root,
+            StartOptions {
+                workspace_id: Some("workspace".to_owned()),
+                brief: Some("task".to_owned()),
+                ..StartOptions::default()
+            },
+        )
+        .unwrap();
+    // A queue-only prompt sits pending until a drain types it (#804).
+    fixture
+        .manager()
+        .queue_identified("lane", "queued while idle", None, Some("watch-drain-1"))
+        .unwrap();
+    assert_eq!(fixture.manager().pending_prompts("lane").unwrap().len(), 1);
+    let host = ScriptedHost::new();
+    let config = config(&fixture, None);
+    let registry = fixture.root.join("registry");
+    let findings = watch_once(
+        &fixture.client,
+        &registry,
+        &host,
+        &config,
+        &WatchOptions {
+            interval: Duration::from_secs(60),
+            once: true,
+            check_only: false,
+            wrkslots: None,
+            state_dir: None,
+            queue_stale: Duration::from_secs(600),
+        },
+    );
+    let queue = findings.iter().find(|row| row["check"] == "queue").unwrap();
+    assert_eq!(queue["subject"], "lane", "{findings:?}");
+    assert_eq!(queue["ok"], true, "{findings:?}");
+    assert!(
+        fixture
+            .manager()
+            .pending_prompts("lane")
+            .unwrap()
+            .is_empty(),
+        "the pass typed the queued prompt"
+    );
+    // Check-only reports an old prompt as stale, naming the agent, and types nothing.
+    fixture
+        .manager()
+        .queue_identified("lane", "queued long ago", None, Some("watch-stale-1"))
+        .unwrap();
+    let findings = watch_once(
+        &fixture.client,
+        &registry,
+        &host,
+        &config,
+        &WatchOptions {
+            interval: Duration::from_secs(60),
+            once: true,
+            check_only: true,
+            wrkslots: None,
+            state_dir: None,
+            queue_stale: Duration::ZERO,
+        },
+    );
+    let queue = findings.iter().find(|row| row["check"] == "queue").unwrap();
+    assert_eq!(queue["ok"], false, "{findings:?}");
+    assert!(
+        queue["detail"].as_str().unwrap().contains("oldest"),
+        "{findings:?}"
+    );
+    assert_eq!(
+        fixture.manager().pending_prompts("lane").unwrap().len(),
+        1,
+        "check-only typed nothing"
+    );
+}
+
+#[test]
 fn restore_dry_run_changes_nothing_and_reads_slot_warnings() {
     let fixture = Fixture::new();
     dead_agent(&fixture);
@@ -421,6 +502,7 @@ fn watch_restarts_a_timer_that_never_fires_and_starts_its_service_when_needed() 
             check_only: false,
             wrkslots: None,
             state_dir: Some(fixture.root.join("watch")),
+            queue_stale: Duration::from_secs(600),
         },
     );
     let timers = findings
@@ -468,6 +550,7 @@ fn watch_reports_a_failed_unit_it_cannot_start() {
             check_only: false,
             wrkslots: None,
             state_dir: None,
+            queue_stale: Duration::from_secs(600),
         },
     );
     let unit = findings.iter().find(|row| row["check"] == "unit").unwrap();
@@ -592,6 +675,7 @@ fn watch_tells_a_live_coordinator_once_an_hour_about_what_it_could_not_repair() 
         check_only: false,
         wrkslots: None,
         state_dir: Some(fixture.root.join("watch")),
+        queue_stale: Duration::from_secs(600),
     };
     let first =
         crate::restore::watch(&fixture.client, &registry, &host, &config, &options).unwrap();
@@ -658,6 +742,7 @@ fn watch_reports_a_timer_whose_service_fails_on_every_run_without_restarting_it(
             check_only: false,
             wrkslots: None,
             state_dir: None,
+            queue_stale: Duration::from_secs(600),
         },
     );
     let timer = findings.iter().find(|row| row["check"] == "timer").unwrap();
@@ -883,6 +968,7 @@ fn slot_image_finding(fixture: &Fixture, host: &ScriptedHost) -> Value {
             check_only: false,
             wrkslots: Some(PathBuf::from("/opt/wrkslots")),
             state_dir: None,
+            queue_stale: Duration::from_secs(600),
         },
     );
     findings
@@ -1022,6 +1108,7 @@ fn watch_pass(fixture: &Fixture, host: &ScriptedHost, config: &RestoreConfig) ->
             check_only: false,
             wrkslots: None,
             state_dir: None,
+            queue_stale: Duration::from_secs(600),
         },
     )
 }
@@ -1090,6 +1177,7 @@ fn watch_never_repairs_or_alerts_on_a_unit_it_could_not_check() {
             check_only: false,
             wrkslots: None,
             state_dir: Some(fixture.root.join("watch")),
+            queue_stale: Duration::from_secs(600),
         },
     )
     .unwrap();
