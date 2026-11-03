@@ -1,15 +1,16 @@
 ---
 title: 'agentctl-handover: atomic agentctl handover OLD NEW'
-status: open
+status: closed
 priority: 2
-assignee: mu-restore@devbig030
 issue_type: feature
+assignee: mu-restore@devbig030
 labels:
 - agentctl
 depends_on:
   agent-utils-740: parent-child
 created_at: 2026-11-02T16:13:53.517942881+00:00
-updated_at: 2026-11-02T16:13:53.517942881+00:00
+updated_at: 2026-11-03T04:23:59.768814298+00:00
+closed_at: 2026-11-03T04:23:59.768814178+00:00
 ---
 
 # Description
