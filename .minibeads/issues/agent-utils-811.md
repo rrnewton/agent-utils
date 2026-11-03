@@ -2,6 +2,7 @@
 title: 'agentctl-start-codex-0164-readiness: detect readiness for the Codex v0.164.0 composer'
 status: open
 priority: 1
+assignee: cl-mq@devbig030
 issue_type: bug
 labels:
 - agentctl
