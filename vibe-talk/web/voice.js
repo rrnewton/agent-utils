@@ -11368,8 +11368,7 @@ function onVisibility() {
   inOtherColumn(() => {
     if (replyArrows().owed) measureReplyArrows();
   });
-  const resume = liveResumeAfterHidden;
-  liveResumeAfterHidden = null;
+  const resume = hiddenStream.takeResume();
   const pollDue = channelPoll.paused() && channelPoll.dueAt() <= voiceCall().visibleAt;
   // `#203 incremental-refresh`. Coming back to the channel after a while is the moment a reader
   // most wants it current, and a phone held the poll's timer the whole time it was away. Only what
@@ -32321,32 +32320,21 @@ function pollDiscord() {
 // than "Live · updated" from the stream's going until it is back, which is the only thing a reader
 // can see of this, and only in the moment after a return.
 
-/** How long a hidden page with no call keeps its live stream: two minutes. */
-const LIVE_HIDDEN_CLOSE_MS = 120000;
-/** Whether the stream delivered a message for this channel while the page was hidden. */
-let liveArrivedHidden = false;
-/** Whether it delivered an edit or a removal then, which a read answers. */
-let mutationArrivedHidden = false;
-/** The timer that lets the stream go while the page stays hidden, or null. */
-let liveHiddenTimer = null;
-/** The stream let go while hidden, to resume: `{ channel, from, generation }`, or null. */
-let liveResumeAfterHidden = null;
+// What arrived while hidden, the timer that lets the stream go after `LIVE_HIDDEN_CLOSE_MS` with no call
+// listening, and the stream let go to resume: one owner in web/src/core/sync/hidden.ts (`#624
+// voice-page-modularity`).
+const hiddenStream = createHiddenStream({
+  clock: clockOnUse(),
+  follow: { channel: () => liveFollow.channel(), lastEventId: () => liveFollow.lastEventId(), generation: () => liveFollow.generation() },
+  hidden: () => document.hidden,
+  callListening: () => Boolean(voiceCall().session.socket),
+  stop: () => stopChannelStream(),
+});
 
 /** The page went out of sight: stop what can wait for it to come back. */
 function pauseWhileHidden() {
   channelPoll.pause();
-  if (liveHiddenTimer === null && liveFollow.channel() !== null) {
-    liveHiddenTimer = setTimeout(letStreamGoWhileHidden, LIVE_HIDDEN_CLOSE_MS);
-  }
-}
-
-/** Still hidden, and no call is listening: close the stream, keeping where it was up to. */
-function letStreamGoWhileHidden() {
-  liveHiddenTimer = null;
-  if (!document.hidden || liveFollow.channel() === null || voiceCall().session.socket) return;
-  const resume = { channel: String(liveFollow.channel()), from: liveFollow.lastEventId() };
-  stopChannelStream();
-  liveResumeAfterHidden = { ...resume, generation: liveFollow.generation() };
+  hiddenStream.hide();
 }
 
 /** Follow the stream let go while hidden again, from its last event, unless something else has since. */
@@ -32372,14 +32360,7 @@ function resumePolling(how) {
  * a message, which the server places (its thread, its counts) — or null for nothing.
  */
 function catchUpHiddenArrivals() {
-  if (liveHiddenTimer !== null) {
-    clearTimeout(liveHiddenTimer);
-    liveHiddenTimer = null;
-  }
-  const mutation = mutationArrivedHidden;
-  const arrived = liveArrivedHidden || replayLedger.waiting() > 0;
-  mutationArrivedHidden = false;
-  liveArrivedHidden = false;
+  const { mutation, arrived } = hiddenStream.takeArrivals(() => replayLedger.waiting() > 0);
   if (arrived && currentView === "discord" && threadingSupported &&
       channelStore.current().channel === String(selectedChannelId()) && channelStore.current().views.has(viewKey())) {
     const area = el("scroll-area");
@@ -32968,7 +32949,7 @@ let liveMutationRefreshNeeded = false;
 function refreshAfterLiveMutation() {
   // `#226 page-energy-profile`. Not for a hidden page: the read that coming back makes answers it.
   if (threadingSupported && document.hidden) {
-    mutationArrivedHidden = true;
+    hiddenStream.noteMutation();
     return;
   }
   liveMutationRefreshNeeded = true;
@@ -33054,7 +33035,7 @@ function receiveLiveMessage(message, selfPosted, replayed, fromTail) {
       if (!held || places) {
         if (held) takeThreadRecord(message);
         else foldLiveMessage(message, true, replayed);
-        liveArrivedHidden = true;
+        hiddenStream.noteMessage();
         followReplyStore();
       }
       renderOutgoingEverywhere();
@@ -33189,7 +33170,7 @@ function placesHeld(message) {
  */
 function placeFromEdit(message) {
   takeThreadRecord(message);
-  if (document.hidden) liveArrivedHidden = true;
+  if (document.hidden) hiddenStream.noteMessage();
   else followPlacement();
 }
 

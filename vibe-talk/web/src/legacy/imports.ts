@@ -34,6 +34,7 @@ export {
   VISIBLE_REFRESH_MS,
   createChannelFollow,
   createChannelPoll,
+  createHiddenStream,
   createLiveEvents,
   createReadHolds,
   createReadOrder,

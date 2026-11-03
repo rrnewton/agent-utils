@@ -363,3 +363,48 @@ test("`#624 voice-page-modularity`: the channel's poll is armed, held while the 
   poll.resume("now");
   assert.equal(polls, 2);
 });
+
+test("`#624 voice-page-modularity`: a hidden page lets its stream go after LIVE_HIDDEN_CLOSE_MS with no call, keeps where it was, and coming back takes what arrived", () => {
+  const { createHiddenStream, LIVE_HIDDEN_CLOSE_MS } = SYNC;
+  const timers = new Map();
+  let next = 0;
+  let channel = "C1";
+  let generation = 4;
+  let hidden = true;
+  let call = false;
+  let stops = 0;
+  const stream = createHiddenStream({
+    clock: { setTimeout: (run, ms) => { next += 1; timers.set(next, { run, ms }); return next; }, clearTimeout: (h) => timers.delete(h) },
+    follow: { channel: () => channel, lastEventId: () => "e9", generation: () => generation },
+    hidden: () => hidden,
+    callListening: () => call,
+    stop: () => { stops += 1; channel = null; generation += 1; },
+  });
+  const fire = () => { for (const [h, t] of [...timers]) { timers.delete(h); t.run(); } };
+  stream.hide();
+  stream.hide();
+  assert.deepStrictEqual([...timers.values()].map((t) => t.ms), [LIVE_HIDDEN_CLOSE_MS], "hidden twice arms one timer");
+  call = true;
+  fire();
+  assert.equal(stops, 0, "a call listening keeps the stream");
+  assert.equal(stream.takeResume(), null);
+  call = false;
+  stream.hide();
+  fire();
+  assert.equal(stops, 1);
+  assert.deepStrictEqual(stream.takeResume(), { channel: "C1", from: "e9", generation: 5 });
+  assert.equal(stream.takeResume(), null, "a resume is taken once");
+  stream.noteMessage();
+  stream.noteMutation();
+  assert.deepStrictEqual(stream.takeArrivals(() => false), { mutation: true, arrived: true });
+  assert.deepStrictEqual(stream.takeArrivals(() => false), { mutation: false, arrived: false }, "what arrived is taken once");
+  assert.deepStrictEqual(stream.takeArrivals(() => true), { mutation: false, arrived: true }, "replays waiting are an arrival");
+  channel = "C1";
+  stream.hide();
+  stream.takeArrivals(() => false);
+  assert.equal(timers.size, 0, "coming back stops the timer");
+  hidden = false;
+  stream.hide();
+  fire();
+  assert.equal(stops, 1, "a page shown again when the timer runs keeps its stream");
+});

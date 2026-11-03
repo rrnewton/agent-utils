@@ -28,3 +28,5 @@ export { createLiveEvents } from "./live.ts";
 export type { LiveEvents } from "./live.ts";
 export { LIVE_ATTACH_WAIT_MS, createChannelFollow } from "./follow.ts";
 export type { ChannelFollow, ChannelFollowDependencies, StreamResponse } from "./follow.ts";
+export { LIVE_HIDDEN_CLOSE_MS, createHiddenStream } from "./hidden.ts";
+export type { HiddenResume, HiddenStream, HiddenStreamDependencies } from "./hidden.ts";
