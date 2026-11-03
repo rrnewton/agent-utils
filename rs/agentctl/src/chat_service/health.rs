@@ -574,7 +574,7 @@ fn assess(observed: Observed, options: HealthOptions) -> Health {
     }
     let uncertain: Vec<&RequestTimes> = times
         .iter()
-        .filter(|request| request.phase == "delivery_uncertain")
+        .filter(|request| request.phase == "delivery_uncertain" && request.settlement.is_none())
         .collect();
     if !uncertain.is_empty() {
         problems.degraded.push(format!(
@@ -996,6 +996,7 @@ mod tests {
             delivery_error: (phase == "delivery_uncertain").then(|| "typed, then lost".to_owned()),
             replies_captured: replies,
             replies_closed: false,
+            settlement: None,
         }
     }
 

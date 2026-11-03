@@ -230,6 +230,7 @@ mod tests {
             delivery_error: None,
             replies_captured: u32::from(reply.is_some()),
             replies_closed: false,
+            settlement: None,
         }
     }
 

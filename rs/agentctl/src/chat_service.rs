@@ -444,6 +444,24 @@ pub fn inspect_request(state_root: &Path, key: &str) -> Result<Value, ChatServic
     Ok(BridgeState::inspect(state_root)?.inspect_request(key)?)
 }
 
+/// Settle one `delivery_uncertain` request by operator decision (#784): the
+/// bridge must be stopped, so its conductor cannot be mid-delivery.
+pub fn settle_request(
+    state_root: &Path,
+    identifier: &str,
+    kind: crate::chat_runtime::SettlementKind,
+    by: &str,
+    reason: Option<&str>,
+) -> Result<Value, ChatServiceError> {
+    Ok(BridgeState::open(state_root)?.settle_request(
+        identifier,
+        kind,
+        by,
+        reason,
+        crate::chat_runtime::unix_millis(),
+    )?)
+}
+
 /// Render one thread's retained messages without writes or external service access.
 pub fn thread_history(
     state_root: &Path,

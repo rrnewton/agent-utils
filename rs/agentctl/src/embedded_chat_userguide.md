@@ -2025,7 +2025,14 @@ the first scan can list prompts that no pass has tried yet.
 A request is stalled once 60 seconds have passed since its admission while its
 prompt is not recorded as typed, that is, while its phase is not `delivered`.
 A `delivery_uncertain` request therefore stays stalled until an operator
-settles it, even after the agent has stored or sent a reply to it.
+settles it, even after the agent has stored or sent a reply to it. Settling is
+`agentctl chat settle KEY --as delivered|abandoned [--reason TEXT] [--by NAME]`
+with the bridge stopped, where KEY is the request key or its reply alias:
+`delivered` counts the request delivered because the operator verified the
+prompt reached the agent, `abandoned` writes it off. The settlement (who,
+when, why) is recorded on the request itself, shows in `chat inspect`, and is
+final; `chat health` lists the requests still unsettled as its uncertain
+blocker, and a settled one stops counting there and in `chat status`.
 
 The service logs a line when a scan first finds a request stalled. The line
 names the request's key and age and the reason its record keeps, or says

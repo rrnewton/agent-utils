@@ -32,6 +32,8 @@ pub struct RequestTimes {
     pub replies_captured: u32,
     /// Whether the request's replies are closed.
     pub replies_closed: bool,
+    /// An operator settlement's kind (`delivered` or `abandoned`), when settled (#784).
+    pub settlement: Option<String>,
 }
 
 /// One reply that is not sent, as `chat health` reports it. Retry fields are read when the
@@ -174,6 +176,10 @@ impl BridgeState {
                 delivery_error: record.delivery_error.clone(),
                 replies_captured: record.reply_count,
                 replies_closed: record.reply_closed,
+                settlement: record
+                    .settlement
+                    .as_ref()
+                    .map(|settlement| settlement.kind.as_str().to_owned()),
                 key: record.key,
             });
         }

@@ -1491,6 +1491,11 @@ enum ChatCommand {
     Latency(ChatLatency),
     /// Inspect one exact active retained request without writes or external access
     Inspect(ChatInspect),
+    /// Settle one delivery_uncertain request as delivered or abandoned, with a durable record
+    #[command(
+        after_help = "Example: agentctl chat settle R7 --bridge-state DIR --as delivered --reason \"the prompt is on the agent's screen\"\n\nKEY is the request key or its reply alias (as printed in the request prompt). The bridge must be stopped. A settled request is final: health and status stop counting it as uncertain, and the settlement (who, when, why) stays on the request for `chat inspect`."
+    )]
+    Settle(ChatSettle),
     /// Explain how to answer a chat request: the reply markers, and the commands for when they
     /// cannot do the job; with a chat subcommand's name, print that subcommand's help
     #[command(
@@ -1817,6 +1822,33 @@ struct ChatInspect {
     /// Exact 64-character lowercase hexadecimal request key
     #[arg(long)]
     request: String,
+}
+
+/// How a settled request counts (`chat settle --as`).
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum SettleAs {
+    /// The prompt did reach the agent
+    Delivered,
+    /// The prompt is written off
+    Abandoned,
+}
+
+#[derive(Args)]
+struct ChatSettle {
+    #[command(flatten)]
+    state: ChatState,
+    /// Request key (64 lowercase hex) or reply alias from the request prompt
+    #[arg(value_name = "KEY")]
+    key: String,
+    /// Settle the request as delivered or abandoned
+    #[arg(long, value_name = "AS", required = true)]
+    settle_as: SettleAs,
+    /// Why, recorded durably with the settlement (default: none recorded)
+    #[arg(long, value_name = "TEXT")]
+    reason: Option<String>,
+    /// Who is settling it, recorded durably (default: the current agent identity, else `operator`)
+    #[arg(long, value_name = "NAME")]
+    by: Option<String>,
 }
 
 #[derive(Args)]
@@ -4651,6 +4683,26 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
             let result =
                 crate::chat_service::inspect_request(&value.state.dir(&registry), &value.request)
                     .map_err(Failure::Chat)?;
+            write_json(&result).map_err(Failure::Output)?;
+            Ok(0)
+        }
+        ChatCommand::Settle(value) => {
+            let by = value.by.clone().unwrap_or_else(|| {
+                crate::sender_header::resolve_current(None, std::env::var("AGENTCTL_AGENT").ok())
+                    .label()
+                    .to_owned()
+            });
+            let result = crate::chat_service::settle_request(
+                &value.state.dir(&registry),
+                &value.key,
+                match value.settle_as {
+                    SettleAs::Delivered => crate::chat_runtime::SettlementKind::Delivered,
+                    SettleAs::Abandoned => crate::chat_runtime::SettlementKind::Abandoned,
+                },
+                &by,
+                value.reason.as_deref(),
+            )
+            .map_err(Failure::Chat)?;
             write_json(&result).map_err(Failure::Output)?;
             Ok(0)
         }

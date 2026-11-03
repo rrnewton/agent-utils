@@ -2649,6 +2649,43 @@ pub(crate) enum RequestPhase {
     DeliveryUncertain,
 }
 
+/// How an operator settled a `delivery_uncertain` request (`chat settle`, #784).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettlementKind {
+    /// The prompt did reach the agent; count the request delivered.
+    Delivered,
+    /// The prompt is written off; the request stops counting as uncertain.
+    Abandoned,
+}
+
+impl SettlementKind {
+    /// The serialized name, as reports print it.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Delivered => "delivered",
+            Self::Abandoned => "abandoned",
+        }
+    }
+}
+
+/// The durable record of one settlement: who settled a request, when, and why.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestSettlement {
+    /// `delivered` or `abandoned`.
+    #[serde(rename = "as")]
+    pub kind: SettlementKind,
+    /// Who settled it, as the operator named themselves.
+    pub by: String,
+    /// When, Unix milliseconds.
+    pub at_millis: u64,
+    /// Why, when the operator gave one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum AckPhase {
@@ -2741,6 +2778,9 @@ struct RequestRecord {
     /// When this request was folded into a latency summary (#801).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     latency_folded_at: Option<u64>,
+    /// An operator's settlement of an uncertain delivery (`chat settle`, #784).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    settlement: Option<RequestSettlement>,
 }
 
 impl SavedMessage {
@@ -2803,6 +2843,7 @@ impl RequestRecord {
             latency_effort: None,
             latency_adapter: None,
             latency_folded_at: None,
+            settlement: None,
             key,
             message: source,
         })
@@ -2883,6 +2924,21 @@ impl RequestRecord {
                 return Err(ChatRuntimeError::invalid(format!(
                     "saved request {label} timestamp precedes admission"
                 )));
+            }
+        }
+        if let Some(settlement) = &self.settlement {
+            validate_single_line(&settlement.by, "settlement author", 200)?;
+            if let Some(reason) = settlement.reason.as_deref() {
+                validate_optional_single_line_or_multiline(reason, "settlement reason", 2_000)?;
+            }
+            let consistent = match settlement.kind {
+                SettlementKind::Delivered => self.phase == RequestPhase::Delivered,
+                SettlementKind::Abandoned => self.phase == RequestPhase::DeliveryUncertain,
+            };
+            if !consistent || settlement.at_millis < self.admitted_at_millis {
+                return Err(ChatRuntimeError::invalid(
+                    "saved request settlement is inconsistent with its phase",
+                ));
             }
         }
         if let Some(delivered) = self.delivered_at_millis {
@@ -9611,7 +9667,71 @@ impl BridgeState {
                 "error": request.ack_error,
             },
             "reply_closed": request.reply_closed,
+            "settlement": request.settlement,
             "replies": replies,
+        }))
+    }
+
+    /// Settle a `delivery_uncertain` request by operator decision (#784
+    /// chat-settle-uncertain): `delivered` counts it delivered, `abandoned`
+    /// writes it off. The settlement (who, when, why) is durable on the request
+    /// itself. Refused for any other phase, for one already settled, and while a
+    /// delivery could still be in flight: the caller must stop the bridge (the
+    /// request lock then excludes the conductor, as for gap approvals).
+    pub fn settle_request(
+        &self,
+        identifier: &str,
+        kind: SettlementKind,
+        by: &str,
+        reason: Option<&str>,
+        now_millis: u64,
+    ) -> Result<Value> {
+        validate_single_line(by, "settlement author", 200)?;
+        if let Some(reason) = reason {
+            validate_optional_single_line_or_multiline(reason, "settlement reason", 2_000)?;
+        }
+        let key = if valid_key(identifier) {
+            identifier.to_owned()
+        } else {
+            self.request_for_reply_id(identifier)?
+                .ok_or_else(|| {
+                    ChatRuntimeError::invalid(format!(
+                        "no retained request is named by {identifier:?}: expected a request key or a reply alias"
+                    ))
+                })?
+        };
+        let state_lock = open_existing_private_state_lock(&self.root.join(".state.lock"))?;
+        state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let mut request = self.read_request(&key)?;
+        if request.settlement.is_some() {
+            return Err(ChatRuntimeError::invalid(format!(
+                "request {key} is already settled; a settlement is final"
+            )));
+        }
+        if request.phase != RequestPhase::DeliveryUncertain {
+            return Err(ChatRuntimeError::invalid(format!(
+                "request {key} is {}; only a delivery_uncertain request can be settled",
+                request_phase_name(&request.phase)
+            )));
+        }
+        if kind == SettlementKind::Delivered {
+            request.phase = RequestPhase::Delivered;
+            request.delivery_started_at_millis.get_or_insert(now_millis);
+            request.delivered_at_millis = Some(now_millis);
+        }
+        request.settlement = Some(RequestSettlement {
+            kind,
+            by: by.to_owned(),
+            at_millis: now_millis,
+            reason: reason.map(str::to_owned),
+        });
+        request.validate(&key)?;
+        write_document(&self.request_path(&key), &request)?;
+        Ok(json!({
+            "request_key": key,
+            "settled_as": kind.as_str(),
+            "settlement": request.settlement,
+            "phase": request_phase_name(&request.phase),
         }))
     }
 
@@ -14791,6 +14911,13 @@ fn request_stage(record: &RequestRecord, replies_sent: u32) -> &'static str {
     if replies_sent > 0 {
         return "replied";
     }
+    if record
+        .settlement
+        .as_ref()
+        .is_some_and(|settlement| settlement.kind == SettlementKind::Abandoned)
+    {
+        return "cancelled";
+    }
     match record.phase {
         RequestPhase::Delivered => "started",
         RequestPhase::DeliveryUncertain
@@ -19120,6 +19247,84 @@ mod tests {
             "the fallback must not reuse the refused operation id"
         );
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn an_uncertain_request_settles_delivered_or_abandoned_and_only_once() {
+        let (state, key, root) = state_with_old_request("settle", config_without_reaction());
+        // A request that is not uncertain cannot be settled.
+        assert!(state
+            .settle_request(&key, SettlementKind::Delivered, "operator", None, 5_000)
+            .is_err());
+        state
+            .set_delivery_phase(&key, RequestPhase::DeliveryUncertain, Some("fixture"))
+            .expect("make uncertain");
+        let settled_at = state
+            .read_request(&key)
+            .expect("request")
+            .admitted_at_millis
+            + 6_000;
+        let report = state
+            .settle_request(
+                &key,
+                SettlementKind::Delivered,
+                "operator",
+                Some("seen on screen"),
+                settled_at,
+            )
+            .expect("settle delivered");
+        assert_eq!(report["settled_as"], "delivered");
+        assert_eq!(report["phase"], "delivered");
+        let request = state.read_request(&key).expect("request");
+        assert_eq!(request.phase, RequestPhase::Delivered);
+        assert_eq!(request.delivered_at_millis, Some(settled_at));
+        let settlement = request.settlement.expect("settlement recorded");
+        assert_eq!(settlement.by, "operator");
+        assert_eq!(settlement.reason.as_deref(), Some("seen on screen"));
+        // A settlement is final, and the record reopens valid.
+        assert!(state
+            .settle_request(&key, SettlementKind::Abandoned, "operator", None, 7_000)
+            .is_err());
+        let reopened = BridgeState::open(&root).expect("reopen");
+        assert_eq!(
+            reopened.read_request(&key).expect("request").phase,
+            RequestPhase::Delivered
+        );
+        assert_eq!(
+            reopened.request_times().expect("times")[0]
+                .settlement
+                .as_deref(),
+            Some("delivered")
+        );
+        fs::remove_dir_all(&root).expect("cleanup");
+
+        let (state, key, root) =
+            state_with_old_request("settle-abandoned", config_without_reaction());
+        state
+            .set_delivery_phase(&key, RequestPhase::DeliveryUncertain, Some("fixture"))
+            .expect("make uncertain");
+        let settled_at = state
+            .read_request(&key)
+            .expect("request")
+            .admitted_at_millis
+            + 6_000;
+        let report = state
+            .settle_request(
+                &key,
+                SettlementKind::Abandoned,
+                "operator",
+                None,
+                settled_at,
+            )
+            .expect("settle abandoned");
+        assert_eq!(report["phase"], "delivery_uncertain");
+        let times = state.request_times().expect("times");
+        assert_eq!(times[0].settlement.as_deref(), Some("abandoned"));
+        // No alias or unknown identifier settles anything.
+        assert!(state
+            .settle_request("no-such-request", SettlementKind::Abandoned, "op", None, 1)
+            .is_err());
+        fs::remove_dir_all(&root).expect("cleanup");
     }
 
     #[test]
