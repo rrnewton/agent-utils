@@ -1,6 +1,6 @@
 ---
 title: 'herdr-run-e2e-readiness-race: the herdr-run differential''s readiness cases diverge under normal load'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: mu-validate@devbig030
@@ -8,7 +8,8 @@ labels:
 - herdr-run
 - validation
 created_at: 2026-11-03T11:40:29.473065688+00:00
-updated_at: 2026-11-03T11:40:29.473065688+00:00
+updated_at: 2026-11-03T23:04:02.064502992+00:00
+closed_at: 2026-11-03T23:04:02.064502822+00:00
 ---
 
 # Description

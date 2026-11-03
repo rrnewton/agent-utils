@@ -1,14 +1,15 @@
 ---
 title: 'dagrun-memory-cap-headroom: profile-derived memory caps keep headroom above observed peaks'
-status: open
+status: closed
 priority: 2
-assignee: mu-validate@devbig030
 issue_type: bug
+assignee: mu-validate@devbig030
 labels:
 - dagrun
 - validation
 created_at: 2026-11-03T14:48:19.160164248+00:00
-updated_at: 2026-11-03T14:48:19.160164248+00:00
+updated_at: 2026-11-03T23:04:02.068423136+00:00
+closed_at: 2026-11-03T23:04:02.068423006+00:00
 ---
 
 # Description
