@@ -1,7 +1,8 @@
 ---
 title: 'relay-in-ignore-own-host: relay-in ignores copies its own host posted before key checks'
 status: open
-priority: 2
+priority: 1
+assignee: cl-start@devbig030
 issue_type: bug
 labels:
 - agent-teams
@@ -15,10 +16,12 @@ updated_at: 2026-11-03T02:06:36.894337228+00:00
 
 # Design
 
-relay-in recognises copies that this host itself posted (the envelope's from team@host is a local team of this host and the post's ID is in this host's own outbox or mirror record) and ignores them before any key or sender check: no admission, no quarantine, no alarm, and a team-log event saying so. A post that claims a local team@host but is NOT in this host's own records is still checked and alarmed as today, because that would be an impersonation.
+relay-in treats an envelope whose from.host is THIS host as its own copy: it verifies the signature against the local signing key for that team@host (relay/keys), then records `ignored-own-host`, or `duplicate-known` when the ledger already has the ID. It never treats such a copy as a stranger. An own-host envelope whose signature does not verify against the local key is still quarantined with an alarm, because that would be an impersonation.
+
+Same-host cross-team traffic stays mirrored: the owner wants it visible in the relay channel. Until this lands, the workaround is `agent-teams relay trust-key TEAM@THISHOST` for every local relay-enabled team (applied on both hosts on 2026-11-02).
 
 # Acceptance Criteria
 
-- With two relay-enabled teams on one host and neither local key trusted, a message between them produces its direct delivery and no quarantine or alarm on that host.
-- A forged post claiming a local team@host, absent from this host's outbox, is still quarantined with an alarm.
+- With two relay-enabled teams on one host and neither local key trusted, a message between them produces its direct delivery, an `ignored-own-host` or `duplicate-known` relay-in record, and no quarantine or alarm on that host.
+- An envelope claiming this host whose signature fails against the local key is still quarantined with an alarm.
 - Tests cover both cases.
