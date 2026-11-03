@@ -89,3 +89,5 @@ export { createScrollKeeping } from "./scrollkeep.ts";
 export type { ScrollKeeping, ScrollKeepingDependencies, ScrollMark } from "./scrollkeep.ts";
 export { createCardFlight } from "./cardflight.ts";
 export type { CardFlight, CardFlightDependencies } from "./cardflight.ts";
+export { createArming } from "./arming.ts";
+export type { Arming, ArmingDependencies } from "./arming.ts";

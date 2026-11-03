@@ -563,3 +563,26 @@ test("`#624 voice-page-modularity`: the card at the top of a thread moves up fro
   assert.equal(card.hasAttribute("data-flying") || pane.hasAttribute("data-arriving"), false, "ended wherever it had got to");
   assert.equal(links, 0, "no line followed with the lines not drawn");
 });
+
+test("`#624 voice-page-modularity`: the backlog control asks twice, and disarms by itself after its window", () => {
+  const { createArming } = CHANNEL_VIEW;
+  const timers = [];
+  let drawn = 0;
+  const arming = createArming({
+    clock: { setTimeout: (run, ms) => { timers.push({ run, ms }); return timers.length; }, clearTimeout: (h) => { timers[h - 1] = null; } },
+    ms: () => 4000, drawn: () => { drawn += 1; },
+  });
+  assert.equal(arming.armed(), false);
+  arming.arm();
+  assert.equal(arming.armed(), true);
+  assert.equal(timers[0].ms, 4000);
+  arming.arm();
+  assert.equal(timers[0], null, "arming again starts the window afresh");
+  timers[1].run();
+  assert.equal(arming.armed(), false, "the window passed");
+  arming.arm();
+  arming.disarm();
+  assert.equal(arming.armed(), false);
+  assert.equal(timers[2], null);
+  assert.equal(drawn, 5);
+});

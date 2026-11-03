@@ -24003,24 +24003,21 @@ function renderTodoControls() {
 }
 
 // Bulk and destructive, so it asks twice — the same armed idiom the Clear control on the dock
-// uses, and the same window, because a reader who has learnt one has learnt the other.
-let backlogArmedTimer = null;
-const backlogIsArmed = () => backlogArmedTimer !== null;
+// uses, and the same window, because a reader who has learnt one has learnt the other
+// (web/src/view/channel `createArming`, `#624 voice-page-modularity`).
+const backlogArming = createArming({
+  clock: clockOnUse(),
+  ms: () => voiceTranscript().CLEAR_ARMED_MS,
+  drawn: () => renderTodoControls(),
+});
+const backlogIsArmed = () => backlogArming.armed();
 
 function disarmBacklog() {
-  if (backlogArmedTimer !== null) {
-    clearTimeout(backlogArmedTimer);
-    backlogArmedTimer = null;
-  }
-  renderTodoControls();
+  backlogArming.disarm();
 }
 
 function armBacklog() {
-  if (backlogArmedTimer !== null) {
-    clearTimeout(backlogArmedTimer);
-  }
-  backlogArmedTimer = setTimeout(disarmBacklog, voiceTranscript().CLEAR_ARMED_MS);
-  renderTodoControls();
+  backlogArming.arm();
 }
 
 /**

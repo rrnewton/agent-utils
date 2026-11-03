@@ -255,6 +255,7 @@ declare const createRowGestures: LegacyImports["createRowGestures"];
 declare const createSeamLines: LegacyImports["createSeamLines"];
 declare const createInputKinds: LegacyImports["createInputKinds"];
 declare const createCardPlaces: LegacyImports["createCardPlaces"];
+declare const createArming: LegacyImports["createArming"];
 declare const createCardFlight: LegacyImports["createCardFlight"];
 declare const createScrollKeeping: LegacyImports["createScrollKeeping"];
 declare const createPackSlides: LegacyImports["createPackSlides"];
