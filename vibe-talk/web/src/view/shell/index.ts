@@ -5,3 +5,5 @@ export { BANNER_DISMISS_MS, STATUS_DISMISS_MS, createShellNotices } from "./noti
 export type { ShellNotices, ShellNoticesDependencies } from "./notices.ts";
 export { CHIPS_PILL_REM, createChipsOverComposer } from "./chips.ts";
 export type { ChipsOverComposer, ChipsOverComposerDependencies } from "./chips.ts";
+export { createUndoStamps } from "./undo.ts";
+export type { UndoStamps } from "./undo.ts";

@@ -206,3 +206,9 @@ test("`#624 voice-page-modularity`: the chips stand on the channel's box where i
   chips.placeChipsOverComposer();
   assert.equal(props.get("--composer-top"), "0px", "a box below the screen leaves them at the foot");
 });
+
+test("`#624 voice-page-modularity`: undo stamps only rise, so two offers up at once always have an order", () => {
+  const stamps = VIEW_SHELL.createUndoStamps();
+  assert.deepStrictEqual([stamps.next(), stamps.next(), stamps.next()], [1, 2, 3]);
+  assert.equal(VIEW_SHELL.createUndoStamps().next(), 1, "each page load counts from the start");
+});

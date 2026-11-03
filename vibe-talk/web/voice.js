@@ -2365,12 +2365,11 @@ const dismissedSendsView = mountDismissedSends({
  * (`lastDismissal`), a send dismissed from the outbox (`sendUndo`), a bookmark taken away
  * (`bookmarkUndos`) — and a stamp is never reused, so two offers up at once always have an order.
  */
-let undoSeq = 0;
+const undoStamps = createUndoStamps();
 
-/** The next undo stamp: later acts stamp higher. */
+/** The next undo stamp: later acts stamp higher (web/src/view/shell `createUndoStamps`). */
 function nextUndoAt() {
-  undoSeq += 1;
-  return undoSeq;
+  return undoStamps.next();
 }
 
 /**

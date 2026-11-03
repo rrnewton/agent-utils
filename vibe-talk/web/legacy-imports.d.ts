@@ -18,6 +18,7 @@ declare const childByClass: LegacyImports["childByClass"];
 declare const nodeWithin: LegacyImports["nodeWithin"];
 declare const createChipsOverComposer: LegacyImports["createChipsOverComposer"];
 declare const createShellNotices: LegacyImports["createShellNotices"];
+declare const createUndoStamps: LegacyImports["createUndoStamps"];
 declare const copyText: LegacyImports["copyText"];
 declare const shownNode: LegacyImports["shownNode"];
 declare const elementIn: LegacyImports["elementIn"];
