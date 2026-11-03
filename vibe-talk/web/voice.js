@@ -18985,10 +18985,7 @@ function bookmarkListRefusal(anchor) {
  * list. Older than the window, nothing is known.
  */
 function todoWindowHolds(at) {
-  if (!readModes.hiding() || threadingSupported || String(todoView.channelId) !== String(currentChannelId())) return false;
-  if (todoView.complete) return true;
-  const from = Date.parse(String(todoView.from || ""));
-  return Number.isFinite(from) && at >= from;
+  return readModes.hiding() && !threadingSupported && todoView.holdsFrom(at, currentChannelId());
 }
 
 /**
@@ -24640,28 +24637,14 @@ async function loadTodo(options) {
  * Kept rather than recomputed from the payload at the call site, because the payload is not the
  * only thing that changes the list: a message arriving on the live stream adds a row without any
  * read at all, and the head of the list, the backlog count and the bulk control all have to move
- * with it or the view contradicts itself.
+ * with it or the view contradicts itself. One owner in web/src/core/channels (`createTodoView`, `#624
+ * voice-page-modularity`).
  */
-let todoView = { left: 0, window: 0, noise: 0, complete: false, from: null, channelId: null };
+const todoView = createTodoView();
 
-/** Take down what a `/todo` answer said about itself. */
+/** Take down what a `/todo` answer said about itself (`TodoView.note`), and Settings' count of the noise in it. */
 function noteTodoRead(payload) {
-  const left = (payload.messages || []).length;
-  todoView = {
-    left,
-    window: typeof payload.window === "number" ? payload.window : left,
-    // `#196 auto-read-noise`. How many of the window the server left out as read automatically.
-    // The rows are not here to count, so Settings' count comes from this in to-do mode.
-    noise: typeof payload.noise === "number" ? payload.noise : 0,
-    complete: payload.complete === true,
-    // When the window's oldest message was sent, left or not. `#240 reading-bookmark`: whether a
-    // message the list leaves out is in the window, so read (`todoWindowHolds`).
-    from: typeof payload.window_from === "string" ? payload.window_from : null,
-    // The ID, not the name it was wearing at the time. `#39 channel-alias` lets the owner rename
-    // a channel from Settings without re-reading it, and a name captured here would leave this
-    // line saying what the channel used to be called.
-    channelId: payload.channel ? payload.channel.id : null,
-  };
+  todoView.note(payload);
   noiseSettings.renderCount();
 }
 
@@ -24673,8 +24656,8 @@ function noteTodoRead(payload) {
  * the window is the channel's own only when the server says the set is whole.
  */
 function todoSummary() {
-  const { left, window, complete } = todoView;
-  const label = channelName(knownChannel(todoView.channelId));
+  const { left, window, complete, channelId } = todoView.state();
+  const label = channelName(knownChannel(channelId));
   if (left === 0) {
     return `nothing left to deal with in ${label}`;
   }
@@ -24764,14 +24747,8 @@ function appendChannelRow(arriving, live = false, folded = false) {
   if (!readModes.hiding()) {
     return;
   }
-  todoView = {
-    ...todoView,
-    left: todoView.left + 1,
-    // The channel gained a message too, so the SUBSET and the window it is a subset of both grow.
-    // Leaving the window alone would read as the backlog catching up with a channel that stood
-    // still.
-    window: todoView.window + 1,
-  };
+  // The channel gained a message too, so the SUBSET and the window it is a subset of both grow.
+  todoView.arrived();
   listState().backlog += 1;
   renderChannelSeam(todoSummary());
   renderTodoControls();
@@ -25004,7 +24981,7 @@ async function refreshAfterInboxChange() {
     if (listState().rowsGathered) renderChannelRows();
     else renderReplyLinks();
     listState().backlog = el("discord-log").children.length;
-    todoView = { ...todoView, left: listState().backlog };
+    todoView.setLeft(listState().backlog);
     renderChannelSeam(todoSummary());
     renderTodoControls();
     // The Pinned filter's rows are drawn from the archive too: a pin dealt with there greys there.
@@ -26012,7 +25989,7 @@ const noiseSettings = mountNoiseRules({
  */
 function noiseTally() {
   if (!threadingSupported && readModes.hiding()) {
-    return { matched: todoView.noise || 0, total: todoView.window || 0 };
+    return { matched: todoView.state().noise || 0, total: todoView.state().window || 0 };
   }
   const loaded = threadingSupported
     ? timelineRows().messages

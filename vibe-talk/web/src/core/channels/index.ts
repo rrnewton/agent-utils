@@ -56,3 +56,5 @@ export type { ChannelDirectory, DeploymentCapabilities } from "./directory.ts";
 export { answerUnplaced, heldAsSent, unplacedToAsk } from "./unplaced.ts";
 export { UNPACK_READS_AT_ONCE, createUnpackReads } from "./unpackreads.ts";
 export type { UnpackReads, UnpackReadsDependencies, UnpackedThread } from "./unpackreads.ts";
+export { createTodoView } from "./todo.ts";
+export type { TodoRead, TodoState, TodoView } from "./todo.ts";

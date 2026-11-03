@@ -732,3 +732,21 @@ test("`#624 voice-page-modularity`: unpacking reads each thread once, three at a
   reads.forget();
   assert.equal(reads.state("t4"), undefined);
 });
+
+test("`#624 voice-page-modularity`: Hide read's own list keeps what its read said, restated as rows come and go", () => {
+  const todo = CHANNELS.createTodoView();
+  assert.deepStrictEqual(todo.state(), { left: 0, window: 0, noise: 0, complete: false, from: null, channelId: null });
+  todo.note({ messages: [{}, {}], window: 30, noise: 4, complete: false, window_from: "2026-11-01T00:00:00Z", channel: { id: "C1" } });
+  assert.deepStrictEqual(todo.state(), { left: 2, window: 30, noise: 4, complete: false, from: "2026-11-01T00:00:00Z", channelId: "C1" });
+  todo.arrived();
+  assert.equal(todo.state().left, 3);
+  assert.equal(todo.state().window, 31, "the window grows with the channel");
+  todo.setLeft(1);
+  assert.equal(todo.state().left, 1);
+  assert.equal(todo.holdsFrom(Date.parse("2026-11-02T00:00:00Z"), "C1"), true);
+  assert.equal(todo.holdsFrom(Date.parse("2026-10-30T00:00:00Z"), "C1"), false, "older than the window, nothing is known");
+  assert.equal(todo.holdsFrom(Date.parse("2026-11-02T00:00:00Z"), "C2"), false, "another channel");
+  todo.note({ messages: [], complete: true, channel: { id: "C1" } });
+  assert.equal(todo.state().window, 0, "a window not said is the messages it holds");
+  assert.equal(todo.holdsFrom(0, "C1"), true, "a whole channel holds everything");
+});
