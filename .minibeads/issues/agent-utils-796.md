@@ -1,13 +1,14 @@
 ---
 title: 'wrkslots-reclaim-slot-state-homes: removing a slot leaves its per-slot state home behind'
-status: open
+status: closed
 priority: 1
-assignee: mu-rust@devbig030
 issue_type: feature
+assignee: mu-rust@devbig030
 labels:
 - wrkslots
 created_at: 2026-11-02T23:49:09.491856250+00:00
-updated_at: 2026-11-02T23:49:09.491856250+00:00
+updated_at: 2026-11-03T05:33:44.201884088+00:00
+closed_at: 2026-11-03T05:33:44.201883908+00:00
 ---
 
 # Description
