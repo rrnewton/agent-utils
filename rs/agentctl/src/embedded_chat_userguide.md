@@ -2302,7 +2302,7 @@ DURATION` (default `5m`; `off` turns it off; units as for
 message to the first configured channel through the outbound helper:
 
 ```text
-[chat-bridge WARNING] 2 of your messages to coord have not reached it, the oldest sent 6 min ago ("are you there?"). Why: request remains pending: pane w1:p2 did not become idle/done within 0s; last status=staged. Text that agentctl did not type is in coord's input box, so it is left alone; submit or clear it there, and delivery resumes. This warning repeats every 5 min until they are delivered.
+[chat-bridge WARNING] 2 of your messages to coord have not reached it, the oldest sent 6 min ago ("are you there?"). Why: request remains pending: pane w1:p2 did not become idle/done within 0s; last status=staged. Text that agentctl did not type is in coord's input box, so it is left alone; submit or clear it there, and delivery resumes. The next reminder comes in this thread in 5 min unless they are delivered; `agentctl chat alarm ack` silences it until the held messages or the reason change.
 ```
 
 The reason is the one the oldest waiting request's last attempt recorded (cut
@@ -2310,12 +2310,29 @@ to 600 characters, with any quoted composer text removed, as `chat status`
 shows it). A request that waits only because the agent is working (its last
 attempt said `last status=working` or `coordinator is not ready`, or none has
 been made yet) is no fault and is not counted: a Claude Code coordinator run
-without `--deliver-while-working` takes no prompt during a turn. The warning is
-posted again every DURATION while any request still waits that long, and when
-none does any more, one line says `[chat-bridge] Your messages to coord are
-being delivered again.` The alarm's memory lasts for the whole `chat run`, so
-an owner loop restarted after a transient failure neither repeats it early nor
-forgets a quarantine it has not reported.
+without `--deliver-while-working` takes no prompt during a turn.
+
+The warning backs off rather than repeating the same post every DURATION (#830
+chat-bridge-warning-backoff). The first warning of an episode is a top-level
+post; each repeat, which opens with `Still:`, is a reply in its thread, after 1,
+3, 6 and 12 times DURATION and then every 36 times it (5, 15, 30 and 60 minutes,
+then every 3 hours, by default). The backoff starts again, still in the same
+thread, when the held requests change or the kind of reason does (text the
+agent did not type, an unsent draft, refused input, a status disagreement, a
+missing pane, anything else). When none waits any more, one line in the thread
+says `[chat-bridge] Your messages to coord are being delivered again.`; a later
+failure starts a new episode with a new top-level warning. A provider that
+cannot post in a thread gets the repeat at the top level, which then starts the
+thread. The episode, with its first warning's message, is saved in
+`owner-alarm.json` in the state directory, so a restarted bridge carries on in
+the same thread instead of warning at the top level again.
+
+`agentctl chat alarm` shows the episode (`--json`: schema
+`agentctl-chat-alarm/v1`). `chat alarm ack` silences it until the held requests
+or the reason change, `chat alarm snooze DURATION` silences it for that long,
+and `chat alarm clear` takes both off; they are saved in
+`owner-alarm-silence.json` and read at the next scan. None of them touches a
+request: the held messages stay queued and are delivered when they can be.
 
 A request whose prompt was quarantined as a PROBABLE MISROUTE (the pane failed
 its recipient check right after input was written, so the prompt may have

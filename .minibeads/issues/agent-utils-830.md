@@ -28,3 +28,24 @@ updated_at: 2026-11-03T22:00:33.296025718+00:00
 - A change of stuck set or reason resets the backoff; recovery then failure resets it.
 - ack and snooze work and keep the requests durable; both are documented in help.
 - The feasibility note is linked here.
+
+# Notes
+
+## Delivered in the first commit
+
+[opus 5.5]
+- **Backoff.** The owner alarm backs off per episode: one top-level warning, then each repeat (opening "Still:") as a reply in its thread. Repeats come after 1, 3, 6 and 12 times `--owner-alarm-after`, then every 36 times it: 5, 15, 30 and 60 minutes, then every 3 hours, by default.
+- **Resets.** An episode's fingerprint is the kind of reason plus the held request keys. The kinds are foreign draft, unsent draft, refused input, status disagreement, missing pane, and other. The exact words of the reason are not used, since they change with every attempt. A change of fingerprint restarts the backoff in the same thread. Recovery is announced in the thread, and a later failure starts a new top-level warning.
+- **Restarts.** The episode, including its first warning's message and thread, is saved in `owner-alarm.json` (schema agentctl-chat-owner-alarm/v1), so a restarted bridge carries on in the same thread.
+- **Threads.** `RootMessageTransport::publish_in_thread` is new; the helper's send path implements it. A provider that refuses a thread gets the repeat at the top level, which then starts the thread.
+- **ack and snooze.** `agentctl chat alarm [status|ack|snooze DURATION|clear] [--json]` reads and writes `owner-alarm-silence.json`. ack silences until the fingerprint changes; snooze silences until a time. Neither touches a request.
+- **Compatibility.** `delivery-alarm.json`, `ProviderDown` and the other #809 records are unchanged.
+- **Later "replace message".** The saved first-warning message ID leaves room to rewrite it in place.
+- **Tests:**
+  - `four_hours_stuck_post_few_warnings_and_one_at_the_top_level`: 5 posts in 4 hours, 1 top-level.
+  - The reset test: set change, reason change, recovery then failure.
+  - The ack/snooze test.
+  - The service test `the_owner_alarm_repeats_in_its_thread_across_a_restart_until_acknowledged`: thread, restart, ack keeping the request pending, recovery in the thread.
+- **Docs:** the chat user guide, and the `chat run --owner-alarm-after` and `chat alarm` help.
+
+Remaining: the feasibility note on a "replace message" operation (last bullet of the Design), to be linked here.

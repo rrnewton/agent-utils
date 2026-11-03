@@ -3752,6 +3752,23 @@ pub trait RootMessageTransport {
         &mut self,
         submission: RootMessageSubmission<'_>,
     ) -> std::result::Result<String, OutboundFailure>;
+
+    /// Post the same body as a reply in the thread `thread_id`, as the owner alarm posts its
+    /// repeats in its first warning's thread (#830 chat-bridge-warning-backoff). A transport that
+    /// cannot refuses as not applied and not retryable, and the caller posts at the top level.
+    fn publish_in_thread(
+        &mut self,
+        submission: RootMessageSubmission<'_>,
+        thread_id: &str,
+    ) -> std::result::Result<String, OutboundFailure> {
+        let _ = (submission, thread_id);
+        Err(OutboundFailure {
+            code: "thread_unsupported".to_owned(),
+            detail: "this transport cannot post in a thread".to_owned(),
+            outcome: OutboundOutcome::NotApplied,
+            retryable: false,
+        })
+    }
 }
 
 /// One idempotent ensure-reaction request.
@@ -4340,6 +4357,22 @@ impl RootMessageTransport for CommandOutboundTransport {
             submission.request_id,
         );
         Ok(message_id)
+    }
+
+    fn publish_in_thread(
+        &mut self,
+        submission: RootMessageSubmission<'_>,
+        thread_id: &str,
+    ) -> std::result::Result<String, OutboundFailure> {
+        ReplyTransport::send(
+            self,
+            ReplySubmission {
+                channel_id: submission.channel_id,
+                thread_id,
+                body: submission.body,
+                request_id: submission.request_id,
+            },
+        )
     }
 }
 

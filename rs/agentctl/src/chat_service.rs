@@ -486,6 +486,110 @@ pub fn sent_replies(
     Ok(BridgeState::inspect(state_root)?.sent_replies(request, last, json)?)
 }
 
+/// What `chat alarm` does (#830 chat-bridge-warning-backoff).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AlarmAction {
+    /// Show the warning's episode and any acknowledgement or snooze.
+    Status,
+    /// Silence the warning until the held messages or the reason change.
+    Ack,
+    /// Silence the warning for this long.
+    Snooze(Duration),
+    /// Take the acknowledgement and snooze off.
+    Clear,
+}
+
+/// `chat alarm`: the owner alarm's episode as text or, with `json`, one JSON document; or the
+/// outcome of an acknowledgement, snooze or clear, as JSON. Neither touches a request: the held
+/// messages are still delivered when they can be, and a running service reads the change at its
+/// next scan.
+///
+/// # Errors
+///
+/// A state that cannot be read or written, or an acknowledgement with no warning to acknowledge.
+pub fn alarm(
+    state_root: &Path,
+    action: &AlarmAction,
+    json: bool,
+) -> Result<String, ChatServiceError> {
+    let state = BridgeState::inspect(state_root)?;
+    let episode = state
+        .small_document(owner_alarm::STATE_FILE)
+        .and_then(|document| crate::forward_compat::decode::<owner_alarm::Saved>(document).ok())
+        .and_then(|(saved, _)| saved.episode);
+    let mut silence = read_alarm_silence(&state).unwrap_or_default();
+    let now = chat_runtime::unix_millis();
+    let outcome = match action {
+        AlarmAction::Status => {
+            if json {
+                return Ok(format!(
+                    "{}\n",
+                    json!({"schema": "agentctl-chat-alarm/v1", "episode": episode,
+                           "silence": silence})
+                ));
+            }
+            let mut text = match &episode {
+                None => "no messages are held, so no warning is repeating\n".to_owned(),
+                Some(episode) => format!(
+                    "{} message(s) held since {}; {} warning(s) posted{}; next due {}\n",
+                    episode.held,
+                    chat_runtime::utc_timestamp(episode.started_at_millis),
+                    episode.posts,
+                    episode
+                        .root_message_id
+                        .as_deref()
+                        .map(|root| format!(", the first as {root}"))
+                        .unwrap_or_default(),
+                    episode
+                        .next_post_millis
+                        .map_or_else(|| "now".to_owned(), chat_runtime::utc_timestamp)
+                ),
+            };
+            if let Some(until) = silence.snoozed_until_millis.filter(|until| *until > now) {
+                text.push_str(&format!(
+                    "snoozed until {}\n",
+                    chat_runtime::utc_timestamp(until)
+                ));
+            }
+            if let (Some(acked), Some(episode)) = (&silence.acked_fingerprint, &episode) {
+                if *acked == episode.fingerprint {
+                    text.push_str(
+                        "acknowledged: silent until the held messages or the reason change\n",
+                    );
+                }
+            }
+            return Ok(text);
+        }
+        AlarmAction::Ack => {
+            let Some(episode) = episode else {
+                return Err(ChatServiceError::Generation(
+                    "nothing to acknowledge: no messages are held".to_owned(),
+                ));
+            };
+            silence.acked_fingerprint = Some(episode.fingerprint.clone());
+            silence.acked_at_millis = Some(now);
+            json!({"outcome": "acknowledged", "held": episode.held})
+        }
+        AlarmAction::Snooze(duration) => {
+            let until = now.saturating_add(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX));
+            silence.snoozed_until_millis = Some(until);
+            json!({"outcome": "snoozed", "until_millis": until,
+                   "until": chat_runtime::utc_timestamp(until)})
+        }
+        AlarmAction::Clear => {
+            silence.acked_fingerprint = None;
+            silence.acked_at_millis = None;
+            silence.snoozed_until_millis = None;
+            json!({"outcome": "cleared"})
+        }
+    };
+    silence.schema = owner_alarm::SILENCE_SCHEMA.to_owned();
+    let document = serde_json::to_value(&silence)
+        .map_err(|error| ChatServiceError::Generation(error.to_string()))?;
+    state.write_small_document(owner_alarm::SILENCE_FILE, &document)?;
+    Ok(format!("{outcome}\n"))
+}
+
 /// What `chat held` does: list the held replies, or send or drop one, named `KEY/ORDINAL`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HeldAction {
@@ -6913,8 +7017,10 @@ fn headless_owner_loop_pass<A: ManagedApi + ?Sized>(
 }
 
 /// Post the owner alarm's notices that the request records `entries`, as the last scan read
-/// them, make due, if the alarm is on: see [`owner_alarm`]. A notice that cannot be posted, for want of an outbound helper, a channel or
-/// a working post, is logged instead.
+/// them, make due, if the alarm is on: see [`owner_alarm`]. A notice that cannot be posted, for
+/// want of an outbound helper, a channel or a working post, is logged instead. The alarm's
+/// episode is read back from the state directory once per run and saved there when it changes,
+/// and the operator's `chat alarm ack` or `snooze` is read at every step.
 fn owner_alarm_step(
     alarm: Option<&mut owner_alarm::OwnerAlarm>,
     entries: &[chat_runtime::DeliveryEntry],
@@ -6925,14 +7031,145 @@ fn owner_alarm_step(
     let Some(alarm) = alarm else {
         return;
     };
+    if !alarm.restored {
+        let saved = state
+            .small_document(owner_alarm::STATE_FILE)
+            .and_then(|document| crate::forward_compat::decode::<owner_alarm::Saved>(document).ok())
+            .filter(|(saved, _)| saved.schema == owner_alarm::STATE_SCHEMA)
+            .and_then(|(saved, _)| saved.episode);
+        alarm.restore(saved);
+    }
+    let silence = read_alarm_silence(state).unwrap_or_default();
+    let before = alarm.episode().cloned();
     let configuration = state.config();
     let notices = alarm.due(
         entries,
         &configuration.agent_label,
         chat_runtime::unix_millis(),
         herdr_idle,
+        &silence,
     );
-    post_owner_notices(notices, state, transport, "owner alarm");
+    post_alarm_notices(alarm, notices, state, transport);
+    if alarm.episode() != before.as_ref() {
+        let saved = owner_alarm::Saved {
+            schema: owner_alarm::STATE_SCHEMA.to_owned(),
+            episode: alarm.episode().cloned(),
+            unknown: crate::forward_compat::KeptKeys::default(),
+        };
+        let written = serde_json::to_value(&saved)
+            .map_err(|error| error.to_string())
+            .and_then(|document| {
+                state
+                    .write_small_document(owner_alarm::STATE_FILE, &document)
+                    .map_err(|error| error.to_string())
+            });
+        if let Err(error) = written {
+            service_log(format_args!(
+                "agentctl: the owner alarm's episode could not be saved, so a restart may warn \
+                 at the top level again: {error}"
+            ));
+        }
+    }
+}
+
+/// The operator's acknowledgement or snooze of the owner alarm, if one is saved and readable.
+fn read_alarm_silence(state: &BridgeState) -> Option<owner_alarm::Silence> {
+    state
+        .small_document(owner_alarm::SILENCE_FILE)
+        .and_then(|document| crate::forward_compat::decode::<owner_alarm::Silence>(document).ok())
+        .map(|(silence, _)| silence)
+}
+
+/// Post the owner alarm's `notices` to the bridge's first channel, each where it says: at the
+/// top level, or in its episode's thread. A repeat whose thread the provider refuses is posted
+/// at the top level instead, and starts the thread the next repeats go to.
+fn post_alarm_notices(
+    alarm: &mut owner_alarm::OwnerAlarm,
+    notices: Vec<owner_alarm::Notice>,
+    state: &BridgeState,
+    transport: Option<&mut dyn RootMessageTransport>,
+) {
+    if notices.is_empty() {
+        return;
+    }
+    let configuration = state.config();
+    let channel = configuration.channel_ids.first();
+    let (Some(transport), Some(channel), true) =
+        (transport, channel, configuration.outbound_enabled)
+    else {
+        for notice in &notices {
+            service_log(format_args!(
+                "agentctl: owner alarm not posted (the bridge has no outbound helper or channel): \
+                 {}",
+                notice.text
+            ));
+        }
+        return;
+    };
+    for notice in notices {
+        let request_id = match chat_runtime::random_operation_uuid() {
+            Ok(id) => id,
+            Err(error) => {
+                service_log(format_args!(
+                    "agentctl: owner alarm not posted: {error}: {}",
+                    notice.text
+                ));
+                continue;
+            }
+        };
+        let submission = RootMessageSubmission {
+            channel_id: channel,
+            body: &notice.text,
+            request_id: &request_id,
+        };
+        if let Err(error) = chat_runtime::validate_root_message_submission(&submission) {
+            service_log(format_args!(
+                "agentctl: owner alarm refused: {error}: {}",
+                notice.text
+            ));
+            continue;
+        }
+        let posted = match &notice.place {
+            owner_alarm::Place::Thread(thread) => {
+                match transport.publish_in_thread(submission.clone(), thread) {
+                    Err(failure)
+                        if failure.outcome == chat_runtime::OutboundOutcome::NotApplied
+                            && !failure.retryable =>
+                    {
+                        service_log(format_args!(
+                            "agentctl: owner alarm could not be posted in its thread {thread} \
+                             ({failure}); posting it at the top level"
+                        ));
+                        transport
+                            .publish_root(submission)
+                            .map(|message| (message, true))
+                    }
+                    other => other.map(|message| (message, false)),
+                }
+            }
+            place => transport
+                .publish_root(submission)
+                .map(|message| (message, *place == owner_alarm::Place::EpisodeRoot)),
+        };
+        match posted {
+            Ok((message, starts_thread)) => {
+                service_log(format_args!(
+                    "agentctl: owner alarm posted to {channel} as {message}: {}",
+                    notice.text
+                ));
+                if starts_thread {
+                    alarm.root_posted(
+                        &message,
+                        crate::chat_trace::trace_thread_id(channel, &message),
+                    );
+                }
+            }
+            Err(error) => service_log(format_args!(
+                "agentctl: owner alarm not posted: {error}: {}",
+                notice.text
+            )),
+        }
+    }
 }
 
 /// Post `notices` to the bridge's first channel as top-level messages, each logged under `label`.
@@ -15518,6 +15755,9 @@ esac
     #[derive(Default)]
     struct RecordingRoots {
         posts: Vec<(String, String)>,
+        /// Replies posted in a thread, as (thread, body), when `threads` is set.
+        threaded: Vec<(String, String)>,
+        threads: bool,
     }
 
     impl RootMessageTransport for RecordingRoots {
@@ -15528,6 +15768,27 @@ esac
             self.posts
                 .push((submission.channel_id.to_owned(), submission.body.to_owned()));
             Ok(format!("spaces/example/messages/post-{}", self.posts.len()))
+        }
+
+        fn publish_in_thread(
+            &mut self,
+            submission: RootMessageSubmission<'_>,
+            thread_id: &str,
+        ) -> std::result::Result<String, OutboundFailure> {
+            if !self.threads {
+                return Err(OutboundFailure {
+                    code: "thread_unsupported".to_owned(),
+                    detail: "no threads here".to_owned(),
+                    outcome: chat_runtime::OutboundOutcome::NotApplied,
+                    retryable: false,
+                });
+            }
+            self.threaded
+                .push((thread_id.to_owned(), submission.body.to_owned()));
+            Ok(format!(
+                "spaces/example/messages/reply-{}",
+                self.threaded.len()
+            ))
         }
     }
 
@@ -15713,6 +15974,110 @@ esac
         watch.step(&state, &manager, &stop, delivery, Some(&mut roots));
         assert_eq!(roots.posts.len(), 1, "{:?}", roots.posts);
         fs::remove_dir_all(root).ok();
+    }
+
+    /// #830 chat-bridge-warning-backoff: the alarm's repeats go to its first warning's thread,
+    /// a restarted bridge carries on in that thread, `chat alarm ack` silences it while the
+    /// request stays queued, and the end is announced in the thread.
+    #[test]
+    fn the_owner_alarm_repeats_in_its_thread_across_a_restart_until_acknowledged() {
+        let (state, key, root) = state_with_request();
+        let reason = "request remains pending: the Muse editor holds a draft that agentctl did \
+                      not type (12 characters on 1 row(s))";
+        state
+            .put_delivery_phase(&key, RequestPhase::Pending, Some(reason))
+            .expect("pending");
+        let mut watch = DeliveryWatch::new(DeliveryTiming {
+            retry_interval: Duration::from_secs(3_600),
+            stall_after: Duration::ZERO,
+            stall_repeat: Duration::from_secs(3_600),
+        });
+        let mut routes = RouteCache::new(Vec::new());
+        let mut roots = RecordingRoots {
+            threads: true,
+            ..RecordingRoots::default()
+        };
+        watch.scan(&state, &RecordingDelivery::default(), &mut routes);
+        let mut owner = Some(owner_alarm::OwnerAlarm::new(Duration::ZERO));
+        owner_alarm_step(
+            owner.as_mut(),
+            &watch.entries,
+            &state,
+            Some(&mut roots),
+            false,
+        );
+        assert_eq!(
+            roots.posts.len(),
+            1,
+            "one top-level warning: {:?}",
+            roots.posts
+        );
+        let thread = "spaces/example/threads/post-1";
+        let status = alarm_status(&root);
+        assert_eq!(status["episode"]["thread_id"], thread, "{status}");
+        assert_eq!(status["episode"]["posts"], 1);
+        // A restarted bridge reads the episode back and repeats in the thread.
+        let mut owner = Some(owner_alarm::OwnerAlarm::new(Duration::ZERO));
+        owner_alarm_step(
+            owner.as_mut(),
+            &watch.entries,
+            &state,
+            Some(&mut roots),
+            false,
+        );
+        assert_eq!(roots.posts.len(), 1, "{:?}", roots.posts);
+        assert_eq!(roots.threaded.len(), 1, "{:?}", roots.threaded);
+        assert_eq!(roots.threaded[0].0, thread);
+        assert!(roots.threaded[0].1.contains("Still: 1 of your messages"));
+        // Acknowledged: silent, and the request is still queued.
+        let acked = alarm(&root, &AlarmAction::Ack, false).expect("ack");
+        assert!(acked.contains("\"outcome\":\"acknowledged\""), "{acked}");
+        for _ in 0..5 {
+            owner_alarm_step(
+                owner.as_mut(),
+                &watch.entries,
+                &state,
+                Some(&mut roots),
+                false,
+            );
+        }
+        assert_eq!(roots.threaded.len(), 1, "{:?}", roots.threaded);
+        assert_eq!(
+            state.inspect_request(&key).expect("request")["phase"],
+            "pending"
+        );
+        let text = alarm(&root, &AlarmAction::Status, false).expect("status");
+        assert!(text.contains("acknowledged"), "{text}");
+        state
+            .put_delivery_phase(&key, RequestPhase::Delivered, None)
+            .expect("delivered");
+        watch.scan(&state, &RecordingDelivery::default(), &mut routes);
+        owner_alarm_step(
+            owner.as_mut(),
+            &watch.entries,
+            &state,
+            Some(&mut roots),
+            false,
+        );
+        assert_eq!(
+            roots.threaded.last().expect("resumed"),
+            &(
+                thread.to_owned(),
+                "[chat-bridge] Your messages to coordinator are being delivered again.".to_owned()
+            )
+        );
+        assert_eq!(alarm_status(&root)["episode"], Value::Null);
+        assert!(
+            alarm(&root, &AlarmAction::Ack, false).is_err(),
+            "nothing held"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// `chat alarm --json` for the state at `root`.
+    fn alarm_status(root: &Path) -> Value {
+        serde_json::from_str(&alarm(root, &AlarmAction::Status, true).expect("status"))
+            .expect("JSON")
     }
 
     /// #720 agentctl-muse-stale-draft: a request left waiting raises the owner alarm in the

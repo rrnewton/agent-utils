@@ -294,6 +294,46 @@ impl BridgeState {
         }
     }
 
+    /// Replace the small document `name` in the state directory with `document`, privately and
+    /// atomically: the owner alarm's state and silence (#830 chat-bridge-warning-backoff).
+    ///
+    /// # Errors
+    ///
+    /// The document cannot be written.
+    pub(crate) fn write_small_document(&self, name: &str, document: &Value) -> Result<()> {
+        let path = self.root.join(name);
+        let temporary = self.root.join(format!(".{name}.tmp"));
+        let written = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&temporary)
+            .and_then(|mut file| {
+                use std::io::Write;
+                writeln!(file, "{document}")?;
+                file.sync_all()
+            })
+            .and_then(|()| fs::rename(&temporary, &path));
+        if written.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        written.map_err(ChatRuntimeError::Io)
+    }
+
+    /// The small document `name` in the state directory, when it exists and parses.
+    #[must_use]
+    pub(crate) fn small_document(&self, name: &str) -> Option<Value> {
+        let file = fs::File::open(self.root.join(name)).ok()?;
+        let mut text = String::new();
+        std::io::Read::read_to_string(
+            &mut std::io::Read::take(file, MAX_REPLY_SOURCE_BYTES),
+            &mut text,
+        )
+        .ok()?;
+        serde_json::from_str(&text).ok()
+    }
+
     /// `reply-source.json`, when a service built with it recorded one and it parses.
     #[must_use]
     pub fn reply_source_record(&self) -> Option<Value> {

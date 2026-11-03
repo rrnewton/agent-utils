@@ -1523,6 +1523,12 @@ enum ChatCommand {
         after_help = "Examples:\n  agentctl chat held\n  agentctl chat held --bridge-state ~/.local/state/agentctl/chat --send <KEY>/2\n  agentctl chat held --drop <KEY>/2\n\nWhen `chat run` starts, it holds back each reply it has not sent that was captured\n--hold-replies-older-than ago or longer (default 15m), or whose thread has moved on (a later request\nin the same thread already has a reply sent), and tells the coordinator, rather than post a reply that\nis no longer what it would say (#781 chat-no-stale-replies-on-restart). Without --send or --drop this\nlists them, oldest first: each as KEY/ORDINAL, when it was captured, why it is held, and its first 300\ncharacters; --json prints one document (schema agentctl-chat-held/v1) with each reply's whole text.\n--send KEY/ORDINAL takes the hold off, so the service sends the reply as it is; --drop KEY/ORDINAL\nmarks it never to be sent, so the request's later replies go out. To change a held reply, drop it and\nsend the new text with `chat reply`. Either prints one JSON object (reply, outcome released or\ndropped, service_woken) and wakes a service running on the state, as `chat reply` does. Without\n--bridge-state or --bridge it finds the bridge as `chat reply` does. Exit status: 0 on success; 1\nwhen the state cannot be read or written or KEY/ORDINAL names no held reply; 2 for a usage error."
     )]
     Held(ChatHeld),
+    /// Show, acknowledge or snooze the warning a bridge repeats while your messages do not reach
+    /// its agent
+    #[command(
+        after_help = "Examples:\n  agentctl chat alarm\n  agentctl chat alarm ack\n  agentctl chat alarm snooze 2h --bridge-state ~/.local/state/agentctl/chat\n  agentctl chat alarm clear\n\nWhile messages wait undelivered for --owner-alarm-after (default 5m), chat run posts a\n[chat-bridge WARNING] (#830 chat-bridge-warning-backoff). The first warning of an episode is a\ntop-level post; each repeat is a reply in its thread, after 1, 3, 6 and 12 times\n--owner-alarm-after, then every 36 times it (5, 15, 30, 60 min, then every 3 h by default). The\nbackoff starts again when the held messages or the kind of reason change; after delivery resumes\nand fails again, a new top-level warning starts a new thread.\n\nstatus (the default) shows the episode: how many messages are held and since when, the warnings\nposted, and when the next is due; --json prints one document (schema agentctl-chat-alarm/v1).\nack silences the warning until the held messages or the reason change. snooze DURATION silences it\nfor that long (units s, m or h, from 1m to 168h). clear takes both off. None of them touches a\nrequest: the held messages stay queued and are delivered when they can be, and a running chat run\nreads the change at its next scan. ack, snooze and clear print one JSON object with the outcome.\nWithout --bridge-state or --bridge it finds the bridge as chat reply does. Exit status: 0 on\nsuccess; 1 when the state cannot be read or written, or for ack when no messages are held; 2 for a\nusage error."
+    )]
+    Alarm(ChatAlarm),
     /// Publish one explicit operator message through the configured helper: a new root message,
     /// or with --thread-id a reply in an existing thread
     #[command(
@@ -1717,6 +1723,30 @@ struct ChatSent {
     /// Print one JSON document with each reply's whole text instead of the text listing
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Args)]
+struct ChatAlarm {
+    #[command(flatten)]
+    target: ChatTarget,
+    /// What to do: status (show the warning's episode), ack, snooze or clear
+    #[arg(value_enum, default_value = "status")]
+    action: AlarmVerb,
+    /// For snooze: how long, such as 2h (units s, m or h, from 1m to 168h)
+    #[arg(value_name = "DURATION", required_if_eq("action", "snooze"))]
+    duration: Option<String>,
+    /// Print the status as one JSON document
+    #[arg(long)]
+    json: bool,
+}
+
+/// `chat alarm`'s ACTION.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
+enum AlarmVerb {
+    Status,
+    Ack,
+    Snooze,
+    Clear,
 }
 
 #[derive(Args)]
@@ -2040,7 +2070,7 @@ struct ChatRun {
     /// Clear text left unsubmitted in the coordinator's composer once it has blocked a request and stayed unchanged for DURATION, such as 30m (default: off). Units: s, m or h; a bare number is seconds; at least 1m. The text is first saved with mode 0600 under the state directory's composer-backups/, then deleted with editing keys and the composer proved empty, and then posted once to the first configured channel through the outbound helper with a "[chat-bridge WARNING]" notice; delivery then resumes. Any change to the text restarts the wait, nothing is cleared while the agent works, and a failed clear leaves the text and posts nothing. Requires an outbound helper; applies only to this run.
     #[arg(long, value_name = "DURATION", value_parser = stale_composer_duration)]
     stale_composer_clear_after: Option<Duration>,
-    /// Warn the owner in the chat once a request has waited undelivered for DURATION, such as 10m (default: 5m; off turns it off). Units: s, m or h; a bare number is seconds; at least 1m. A request that waits only because the agent is working (its last attempt said `last status=working`) does not count. The warning, posted to the first configured channel through the outbound helper as a "[chat-bridge WARNING]", says how many requests wait, how long the oldest has, and the reason the last attempt gave (such as text agentctl did not type in the coordinator's input box, which it never submits or clears), and is repeated every DURATION until they are delivered; then one line says delivery resumed. A request quarantined as a PROBABLE MISROUTE (never typed again by itself) is reported at once, with the start of the message and a request to send it again. Without an outbound helper the warnings are only logged; applies only to this run.
+    /// Warn the owner in the chat once a request has waited undelivered for DURATION, such as 10m (default: 5m; off turns it off). Units: s, m or h; a bare number is seconds; at least 1m. A request that waits only because the agent is working (its last attempt said `last status=working`) does not count. The warning, posted to the first configured channel through the outbound helper as a "[chat-bridge WARNING]", says how many requests wait, how long the oldest has, and the reason the last attempt gave (such as text agentctl did not type in the coordinator's input box, which it never submits or clears). Repeats back off (#830): the first warning of an episode is a top-level post and each repeat a reply in its thread, after 1, 3, 6 and 12 times DURATION, then every 36 times it; the backoff starts again when the held requests or the kind of reason change, and when they are delivered one line in the thread says delivery resumed. `chat alarm` shows, acknowledges or snoozes it. A request quarantined as a PROBABLE MISROUTE (never typed again by itself) is reported at once, with the start of the message and a request to send it again. Without an outbound helper the warnings are only logged; applies only to this run.
     #[arg(long, value_name = "DURATION", default_value = "5m", hide_default_value = true, value_parser = owner_alarm_duration)]
     owner_alarm_after: OwnerAlarmAfter,
     /// Remind a Claude Code coordinator, once, of each chat request whose prompt was typed and that it has not answered, once it has been idle for DURATION since that prompt was typed (default: 60s). Units: s, m or h; a bare number is seconds; at least 10s and at most 12h, and 0 turns reminders off. Idle means Herdr reports the pane idle or done, the pane shows no running turn, and `claude agents --json` reports the pane's session idle. Right before a reminder, the session's transcript (`<session>.jsonl` under the session's CLAUDE_CONFIG_DIR or ~/.claude `projects`) is read, and a request whose reply ID heads a complete reply block in the agent's ordinary text there is left out and never reminded, since that reply was printed though no read of the pane showed it. The reminder names the reply IDs it has received no reply for, says that a reply written only in thinking is not delivered, prints for each the `agentctl chat sent --request` command to check what the bridge holds before sending anything again, and mentions `agentctl chat reply`; it is recorded in reply-reminders.json before it is queued, is typed only into an idle pane and never behind another queued prompt, never through --deliver-while-working, and is taken back out of the queue if it is not typed within 10 seconds (or --ready-timeout if shorter). A reminder taken back holds off the next until the coordinator has been seen working and idle again, or for twice DURATION, doubling with each in a row, up to 60 minutes. Requests delivered before reminders first started for the state directory, or more than 24 hours ago, are never reminded, so DURATION plus the time the coordinator works after a prompt must stay under 24 hours. Needs outbound_enabled; applies only to this run.
@@ -4856,6 +4886,31 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
             )
             .map_err(Failure::Chat)?;
             write_text(&listing).map_err(Failure::Output)?;
+            Ok(0)
+        }
+        ChatCommand::Alarm(value) => {
+            let action = match (value.action, &value.duration) {
+                (AlarmVerb::Snooze, Some(duration)) => crate::chat_service::AlarmAction::Snooze(
+                    crate::stale_composer::parse_duration(duration).map_err(Failure::Usage)?,
+                ),
+                (AlarmVerb::Snooze, None) => {
+                    return Err(Failure::Usage(
+                        "chat alarm snooze needs a DURATION".to_owned(),
+                    ))
+                }
+                (_, Some(_)) => {
+                    return Err(Failure::Usage(
+                        "chat alarm takes a DURATION only with snooze".to_owned(),
+                    ))
+                }
+                (AlarmVerb::Status, None) => crate::chat_service::AlarmAction::Status,
+                (AlarmVerb::Ack, None) => crate::chat_service::AlarmAction::Ack,
+                (AlarmVerb::Clear, None) => crate::chat_service::AlarmAction::Clear,
+            };
+            let resolved = chat_target(&registry, &herdr_bin, &value.target, None)?;
+            let output = crate::chat_service::alarm(&resolved.state, &action, value.json)
+                .map_err(Failure::Chat)?;
+            write_text(&output).map_err(Failure::Output)?;
             Ok(0)
         }
         ChatCommand::Held(value) => {
