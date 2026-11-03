@@ -142,6 +142,52 @@ function searchWalkWords(walk: EndedWalk, reason: string, facts: WalkFacts): str
   return `${lead}None of the ${fetched}${back}${back ? "," : ""} match.`;
 }
 
-export { messagesWords, reachBackWords, reachClause, searchMomentWords, searchWalkProgress, searchWalkWords };
-export type { EndedWalk, WalkFacts };
+/** What the cards' walk's ending sentence needs of the page besides the walk. */
+interface RepliesWalkFacts {
+  /** The chat service as a sentence names it (the page's `serviceWords`). */
+  readonly service: string;
+  /** The walk's time budget, in seconds (`SEARCH_OLDER_MS`). */
+  readonly budgetSeconds: number;
+  /** The instant All's pages reach back to now (`repliesFloor`), or null where that is not known. */
+  readonly floor: number | null;
+  /** Why the read that failed failed (`failureWords`); asked only for a failure. */
+  failure(): string;
+}
+
+/**
+ * How the cards' walk back through All's older pages for the search ended, and what it found (`#578
+ * search-status-clarity`): in messages fetched and threads found, never pages, and always something, a
+ * failure with why. `reason` is "failed", "stopped", "start", "nowhere", "budget", or anything else for a
+ * walk that ran its pages; `walk.found` counts threads.
+ */
+function repliesWalkWords(walk: EndedWalk, reason: string, facts: RepliesWalkFacts): string {
+  const service = facts.service;
+  const fetched = `${walk.arrived} older message${walk.arrived === 1 ? "" : "s"} fetched from ${service}` +
+    `${reason === "budget" ? ` in ${facts.budgetSeconds} s` : ""}`;
+  const span = walk.read > 0 ? fetched : `All's newest messages, fetched from ${service}`;
+  const threads = `${walk.found} thread${walk.found === 1 ? "" : "s"}`;
+  const back = reachBackWords(facts.floor);
+  if (reason === "failed") {
+    return `Could not fetch older messages from ${service}: ${facts.failure()}.` +
+      `${walk.read > 0 ? ` Before that, ${fetched}${back}.` : ""} Press the button again to retry.`;
+  }
+  if (reason === "stopped") {
+    if (walk.read === 0 && walk.found === 0) return "Stopped before any older messages arrived.";
+    return walk.found > 0 ? `Stopped. Found ${threads} in ${span}.` : `Stopped. No more threads match in ${span}${back}.`;
+  }
+  if (reason === "start") {
+    return walk.found > 0 ? `Reached the start of this channel. Found ${threads}.` : "Reached the start of this channel; no more threads match.";
+  }
+  // A page saying older history exists, with no place to go on from.
+  const stuck = reason === "nowhere" ? ` ${sentenceStart(service)} gave no way further back.` : "";
+  if (walk.read > 0 && walk.arrived === 0 && walk.found === 0) {
+    return `${sentenceStart(service)} sent nothing older this time, though it says older messages exist. Press the ` +
+      `button again to keep going.${stuck}`;
+  }
+  if (walk.found === 0) return `No more threads match in ${span}${back}.${stuck}`;
+  return `Found ${threads} in ${span}${back}.${stuck}`;
+}
+
+export { messagesWords, reachBackWords, reachClause, repliesWalkWords, searchMomentWords, searchWalkProgress, searchWalkWords };
+export type { EndedWalk, RepliesWalkFacts, WalkFacts };
 export type { HistoryReach };

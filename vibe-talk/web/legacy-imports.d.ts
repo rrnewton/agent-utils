@@ -215,6 +215,7 @@ declare const reachClause: LegacyImports["reachClause"];
 declare const searchMomentWords: LegacyImports["searchMomentWords"];
 declare const searchWalkProgress: LegacyImports["searchWalkProgress"];
 declare const searchWalkWords: LegacyImports["searchWalkWords"];
+declare const repliesWalkWords: LegacyImports["repliesWalkWords"];
 declare const serviceReadWords: LegacyImports["serviceReadWords"];
 declare const forgetElisionCounts: LegacyImports["forgetElisionCounts"];
 declare const isNoise: LegacyImports["isNoise"];

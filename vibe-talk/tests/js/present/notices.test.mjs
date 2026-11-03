@@ -73,3 +73,23 @@ test("`#624 voice-page-modularity`: what a walk further back says when it ends, 
   assert.equal(searchWalkWords(walk(50, 2), "budget", facts()), "Found 2 more matches among 50 older messages fetched from Slack in 20 s.");
   assert.equal(searchWalkWords(walk(1, 0), "stopped", facts()), "Stopped. None of the 1 older message fetched from Slack match.");
 });
+
+test("`#624 voice-page-modularity`: the cards' walk says how it ended in threads and messages, always something", () => {
+  const { repliesWalkWords } = NOTICES;
+  const walk = (read, arrived, found) => ({ read, arrived, found });
+  let asked = 0;
+  const facts = (floor = null) => ({ service: "Slack", budgetSeconds: 20, floor, failure: () => { asked += 1; return "the connection dropped"; } });
+  assert.equal(repliesWalkWords(walk(0, 0, 0), "stopped", facts()), "Stopped before any older messages arrived.");
+  assert.equal(asked, 0, "the failure is asked about only for a failure");
+  assert.equal(repliesWalkWords(walk(2, 100, 3), "stopped", facts()), "Stopped. Found 3 threads in 100 older messages fetched from Slack.");
+  assert.equal(repliesWalkWords(walk(0, 0, 1), "start", facts()), "Reached the start of this channel. Found 1 thread.");
+  assert.equal(repliesWalkWords(walk(1, 50, 0), "start", facts()), "Reached the start of this channel; no more threads match.");
+  assert.equal(repliesWalkWords(walk(1, 50, 0), "failed", facts()),
+    "Could not fetch older messages from Slack: the connection dropped. Before that, 50 older messages fetched from Slack. Press the button again to retry.");
+  assert.equal(asked, 1);
+  assert.equal(repliesWalkWords(walk(0, 0, 0), "done", facts()), "No more threads match in All's newest messages, fetched from Slack.");
+  assert.equal(repliesWalkWords(walk(3, 0, 0), "nowhere", facts()),
+    "Slack sent nothing older this time, though it says older messages exist. Press the button again to keep going. Slack gave no way further back.");
+  assert.match(repliesWalkWords(walk(2, 100, 2), "budget", facts()), /^Found 2 threads in 100 older messages fetched from Slack in 20 s\.$/);
+  assert.match(repliesWalkWords(walk(2, 100, 0), "done", facts(Date.UTC(2026, 9, 3, 9, 2))), /^No more threads match in 100 older messages fetched from Slack, back to .+\.$/);
+});

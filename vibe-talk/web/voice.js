@@ -23414,40 +23414,20 @@ function repliesUnlisted(walk) {
 }
 
 /**
- * How cards' walk `walk` ended, and what it found: see the head of this section. In messages fetched and
- * threads found, never pages (`#578 search-status-clarity`), and always something, a failure with why.
+ * How cards' walk `walk` ended, and what it found: see the head of this section, and web/src/present/notices
+ * `repliesWalkWords`; from this page's service name, budget and All's reach.
  *
  * @param {any} walk
  * @param {string} reason
  * @param {unknown} [failure] what the read that failed threw, with `reason` "failed"
  */
 function repliesEndNote(walk, reason, failure = null) {
-  const service = serviceWords();
-  const fetched = `${walk.arrived} older message${walk.arrived === 1 ? "" : "s"} fetched from ${service}` +
-    `${reason === "budget" ? ` in ${Math.round(SEARCH_OLDER_MS / 1000)} s` : ""}`;
-  const span = walk.read > 0 ? fetched : `All's newest messages, fetched from ${service}`;
-  const threads = `${walk.found} thread${walk.found === 1 ? "" : "s"}`;
-  const floor = repliesFloor();
-  const back = reachBackWords(floor);
-  if (reason === "failed") {
-    return `Could not fetch older messages from ${service}: ${failureWords(failure)}.` +
-      `${walk.read > 0 ? ` Before that, ${fetched}${back}.` : ""} Press the button again to retry.`;
-  }
-  if (reason === "stopped") {
-    if (walk.read === 0 && walk.found === 0) return "Stopped before any older messages arrived.";
-    return walk.found > 0 ? `Stopped. Found ${threads} in ${span}.` : `Stopped. No more threads match in ${span}${back}.`;
-  }
-  if (reason === "start") {
-    return walk.found > 0 ? `Reached the start of this channel. Found ${threads}.` : "Reached the start of this channel; no more threads match.";
-  }
-  // A page saying older history exists, with no place to go on from.
-  const stuck = reason === "nowhere" ? ` ${sentenceStart(service)} gave no way further back.` : "";
-  if (walk.read > 0 && walk.arrived === 0 && walk.found === 0) {
-    return `${sentenceStart(service)} sent nothing older this time, though it says older messages exist. Press the ` +
-      `button again to keep going.${stuck}`;
-  }
-  if (walk.found === 0) return `No more threads match in ${span}${back}.${stuck}`;
-  return `Found ${threads} in ${span}${back}.${stuck}`;
+  return repliesWalkWords(walk, reason, {
+    service: serviceWords(),
+    budgetSeconds: Math.round(SEARCH_OLDER_MS / 1000),
+    floor: repliesFloor(),
+    failure: () => failureWords(failure),
+  });
 }
 
 /**
