@@ -4,13 +4,12 @@
 
 type LegacyImports = typeof import("./src/legacy/imports.ts");
 
-declare const searchPositiveTerms: LegacyImports["searchPositiveTerms"];
 declare const searchQueryMatches: LegacyImports["searchQueryMatches"];
-declare const searchQueryParse: LegacyImports["searchQueryParse"];
 declare const searchQueryTree: LegacyImports["searchQueryTree"];
 declare const searchSubject: LegacyImports["searchSubject"];
 declare const createGathering: LegacyImports["createGathering"];
 declare const createSearchField: LegacyImports["createSearchField"];
+declare const createParsedQueries: LegacyImports["createParsedQueries"];
 declare const createServerSearch: LegacyImports["createServerSearch"];
 declare const createApi: LegacyImports["createApi"];
 declare const createWebPorts: LegacyImports["createWebPorts"];

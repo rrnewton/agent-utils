@@ -137,9 +137,9 @@ test("`#624 voice-page-modularity`: the bar's picker shows the selection, and a 
 test("`#624 voice-page-modularity`: page.pure reaches only what is still the legacy script's own, and the prelude's names only as its bindings", () => {
   const page = newPage();
   assert.equal(page.pure("selectedChannelId()"), "", "a binding of the legacy script's own was refused");
-  assert.throws(() => page.pure("searchQueryParse"), /reaches searchQueryParse, which the page takes from web\/src/);
+  assert.throws(() => page.pure("searchQueryTree"), /reaches searchQueryTree, which the page takes from web\/src/);
   assert.throws(() => page.pure('JSON.stringify(messageLinkRef("slack:C1:2"))'), /reaches messageLinkRef/);
-  assert.equal(typeof page.preludeBinding("searchQueryParse"), "function");
+  assert.equal(typeof page.preludeBinding("searchQueryTree"), "function");
   assert.throws(() => page.preludeBinding("selectedChannelId"), /not a name the page takes from its modules/);
 });
 

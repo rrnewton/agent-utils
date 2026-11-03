@@ -156,3 +156,14 @@ test("`#624 voice-page-modularity`: the search field's state, and its hits marke
   field.setMarked("");
   assert.equal(field.marked(), "");
 });
+
+test("`#624 voice-page-modularity`: a query is parsed once per change of its text, with its words to mark", () => {
+  const queries = SEARCH.createParsedQueries();
+  const first = queries.parsed("kestrel -owl");
+  assert.equal(first.query, "kestrel -owl");
+  assert.deepStrictEqual(first.terms, SEARCH.searchPositiveTerms(SEARCH.searchQueryParse("kestrel -owl")));
+  assert.equal(queries.parsed("kestrel -owl"), first, "the same text was parsed again");
+  const blank = queries.parsed("   ");
+  assert.equal(blank.node, null, "spaces are no search");
+  assert.notEqual(queries.parsed("kestrel -owl"), first, "a change of text and back parses afresh");
+});

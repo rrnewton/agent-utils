@@ -25,3 +25,5 @@ export { SEARCH_FURTHER_POLL_MS, createGathering } from "./gather.ts";
 export type { Gathering, GatheringDependencies, GatheringState } from "./gather.ts";
 export { SEARCH_MARK_DELAY_MS, createSearchField } from "./field.ts";
 export type { SearchField, SearchFieldDependencies } from "./field.ts";
+export { createParsedQueries } from "./parsed.ts";
+export type { ParsedQueries, ParsedQuery } from "./parsed.ts";

@@ -1897,10 +1897,11 @@ test("`#521 server-side-search`: the page's search language folds, parses, match
   // `#624 voice-page-modularity`: the page runs the same functions, by the prelude, under the names
   // its legacy script has always called them by.
   const page = newPage();
-  for (const name of ["searchQueryParse", "searchQueryTree", "searchQueryMatches", "searchSubject", "searchPositiveTerms"]) {
+  // Its parse runs inside the parsed-query owner (`createParsedQueries`), which keeps the last one.
+  for (const name of ["createParsedQueries", "searchQueryTree", "searchQueryMatches", "searchSubject"]) {
     assert.equal(typeof page.preludeBinding(name), "function", name);
   }
-  const node = page.preludeBinding("searchQueryParse")("from:Ada (a OR b) -c");
+  const { node } = page.preludeBinding("createParsedQueries")().parsed("from:Ada (a OR b) -c");
   assert.deepEqual(JSON.parse(JSON.stringify(page.preludeBinding("searchQueryTree")(node))),
     JSON.parse(JSON.stringify(SEARCH_LANGUAGE.searchQueryTree(SEARCH_LANGUAGE.searchQueryParse("from:Ada (a OR b) -c")))));
 });

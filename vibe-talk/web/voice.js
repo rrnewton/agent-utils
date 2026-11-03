@@ -4557,17 +4557,12 @@ const SEARCH_EMPTY_LOADED = "Nothing in the messages loaded so far matches that 
 // shows when any of them matches, and a row that holds no message (a turn of the call, a card) is
 // matched by the text it declares (`data-search`).
 
-/** The query parsed, and the words to mark, for the last text asked about: one parse per change. */
-let searchParse = { query: /** @type {string | null} */ (null), node: /** @type {any} */ (null),
-  terms: /** @type {string[]} */ ([]) };
+/** The query parsed, and the words to mark, for the last text asked about: one parse per change (web/src/core/search). */
+const parsedQueries = createParsedQueries();
 
 /** `query` parsed by the shared language: its tree (null for no search) and its words to mark. */
 function searchParsed(query) {
-  if (searchParse.query !== query) {
-    const node = searchQueryParse(query);
-    searchParse = { query, node, terms: searchPositiveTerms(node) };
-  }
-  return searchParse;
+  return parsedQueries.parsed(query);
 }
 
 /** Whether `query` is a search at all: some term, not only spaces or operators. */

@@ -11,11 +11,10 @@
 
 export {
   createGathering,
+  createParsedQueries,
   createSearchField,
   createServerSearch,
-  searchPositiveTerms,
   searchQueryMatches,
-  searchQueryParse,
   searchQueryTree,
   searchSubject,
 } from "../core/search/index.ts";
