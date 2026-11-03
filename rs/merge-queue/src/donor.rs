@@ -53,6 +53,10 @@ pub struct ToolIdentity {
     /// repository), by name, as the queue host answered when it published the job.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tools: BTreeMap<String, String>,
+    /// Source revision of the merge-queue binary (see `build.rs`). Builds of one revision are
+    /// not byte-identical across hosts, so the revision is compared, never a binary's hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_queue: Option<crate::build_info::Revision>,
 }
 
 /// A verdict reduced to what two validations of one commit can be compared on.
@@ -369,11 +373,39 @@ pub fn tool_answers(
     Ok(answers)
 }
 
-/// The identity the queue requires for `validator`, computed on this host.
+/// The identity the queue requires for `validator`, computed on this host. A merge-queue
+/// binary with no clean source revision cannot be matched by any donor, so it is refused.
 pub fn tool_identity(validator: &ValidatorConfig, cwd: &Path) -> Result<ToolIdentity, String> {
+    let revision = crate::build_info::revision();
+    if let Some(problem) = crate::build_info::unusable(revision.as_ref()) {
+        return Err(format!("{problem}; donors compare it with their own"));
+    }
     Ok(ToolIdentity {
         validator_digest: validator_digest(validator)?,
         tools: tool_answers(validator, cwd)?,
+        merge_queue: revision,
+    })
+}
+
+/// How the donor's merge-queue revision differs from the queue host's, or `None` when they
+/// agree: the donor's is usable (recorded, and clean unless dirty builds are allowed) and
+/// equal to the queue host's.
+pub fn revision_mismatch(
+    queue: Option<&crate::build_info::Revision>,
+    donor: Option<&crate::build_info::Revision>,
+) -> Option<String> {
+    if let Some(problem) = crate::build_info::unusable(donor) {
+        return Some(problem);
+    }
+    let describe = |revision: Option<&crate::build_info::Revision>| {
+        revision.map_or_else(|| "no recorded revision".to_owned(), |r| r.describe())
+    };
+    (queue != donor).then(|| {
+        format!(
+            "this donor's merge-queue is built from {}, the queue host's from {}",
+            describe(donor),
+            describe(queue)
+        )
     })
 }
 
@@ -763,15 +795,41 @@ impl Store {
 
     /// The queue no longer wants job `id`.
     pub fn cancel(&self, id: &str, reason: &str) -> Result<(), String> {
+        self.cancel_live(id, reason).map(|_| ())
+    }
+
+    /// Cancel job `id` if it is still queued or leased; returns whether it was. Its donor is
+    /// told to stop on its next renewal, and its receipt is refused.
+    pub fn cancel_live(&self, id: &str, reason: &str) -> Result<bool, String> {
         let _lock = self.lock()?;
         let mut job = self.read(id)?;
         if matches!(job.state, JobState::Done | JobState::Cancelled) {
-            return Ok(());
+            return Ok(false);
         }
         job.state = JobState::Cancelled;
         job.lease = None;
         job.history.push(format!("{}: cancelled: {reason}", now()));
-        self.write(&job)
+        self.write(&job)?;
+        Ok(true)
+    }
+
+    /// Cancel every queued or leased job with `reason`; returns their ids. A run calls this
+    /// before it publishes anything: runs never overlap, so a live job then is one an earlier
+    /// run left behind when it did not finish, and its candidate is gone.
+    pub fn cancel_all_live(&self, reason: &str) -> Result<Vec<String>, String> {
+        let live: Vec<String> = self
+            .jobs()?
+            .into_iter()
+            .filter(|job| matches!(job.state, JobState::Queued | JobState::Leased))
+            .map(|job| job.id)
+            .collect();
+        let mut cancelled = Vec::new();
+        for id in live {
+            if self.cancel_live(&id, reason)? {
+                cancelled.push(id);
+            }
+        }
+        Ok(cancelled)
     }
 
     /// The job's current record.
@@ -1211,9 +1269,12 @@ impl Worker<'_> {
         backoff: &Mutex<Option<std::time::Instant>>,
         lost: &Mutex<String>,
     ) -> Result<(), Unreported> {
+        let revision = crate::build_info::revision();
         let have =
             tool_answers(&job.validator, &self.options.clone).map_err(Unreported::Declined)?;
-        if let Some(difference) = tool_mismatch(&job.tool.tools, &have) {
+        let difference = revision_mismatch(job.tool.merge_queue.as_ref(), revision.as_ref())
+            .or_else(|| tool_mismatch(&job.tool.tools, &have));
+        if let Some(difference) = difference {
             *backoff
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) =
@@ -1281,6 +1342,7 @@ impl Worker<'_> {
                 tool: ToolIdentity {
                     validator_digest: digest.clone(),
                     tools: have.clone(),
+                    merge_queue: revision.clone(),
                 },
                 merge_queue_version: env!("CARGO_PKG_VERSION").to_owned(),
                 effective_selection: ran.effective_selection.clone(),
@@ -1324,6 +1386,12 @@ pub fn run_donor(options: &DonorOptions) -> Result<i32, String> {
             options.clone.display()
         ));
     }
+    let revision = crate::build_info::revision();
+    if let Some(problem) = crate::build_info::unusable(revision.as_ref()) {
+        return Err(format!(
+            "{problem}; a donor's merge-queue must match the queue host's revision"
+        ));
+    }
     crate::interrupt::install();
     let jobs = options.jobs.max(1);
     let worker = Worker {
@@ -1336,10 +1404,11 @@ pub fn run_donor(options: &DonorOptions) -> Result<i32, String> {
     let active = AtomicUsize::new(0);
     let jobs_text = jobs.to_string();
     eprintln!(
-        "merge-queue donor {}: on {}, up to {jobs} job(s), clone {}",
+        "merge-queue donor {}: on {}, up to {jobs} job(s), clone {}, merge-queue {}",
         options.name,
         worker.host,
-        options.clone.display()
+        options.clone.display(),
+        revision.as_ref().map_or_else(String::new, |r| r.describe())
     );
     std::thread::scope(|scope| -> Result<(), String> {
         loop {
@@ -1456,7 +1525,14 @@ mod unit {
 
     fn publish(store: &Store, commit: &str) -> Job {
         let validator = validator();
-        let tool = tool_identity(&validator, Path::new(".")).unwrap();
+        let tool = ToolIdentity {
+            validator_digest: validator_digest(&validator).unwrap(),
+            tools: BTreeMap::new(),
+            merge_queue: Some(crate::build_info::Revision {
+                commit: "a".repeat(40),
+                dirty: false,
+            }),
+        };
         store
             .publish(
                 commit,
@@ -1586,5 +1662,29 @@ mod unit {
             Renewal::Stop { reason } if reason.contains("cancelled")
         ));
         assert!(store.claim("d2", "h2", 1).unwrap().is_none());
+    }
+
+    #[test]
+    fn revisions_match_only_when_equal_and_usable() {
+        use crate::build_info::Revision;
+        let at = |commit: char, dirty: bool| Revision {
+            commit: commit.to_string().repeat(40),
+            dirty,
+        };
+        let same = at('a', false);
+        assert!(revision_mismatch(Some(&same), Some(&same.clone())).is_none());
+        let other = revision_mismatch(Some(&at('a', false)), Some(&at('b', false))).unwrap();
+        assert!(
+            other.contains(&"b".repeat(40)) && other.contains(&"a".repeat(40)),
+            "{other}"
+        );
+        // The queue host recorded nothing (an older queue, or a binary built outside Git).
+        let none = revision_mismatch(None, Some(&same)).unwrap();
+        assert!(none.contains("no recorded revision"), "{none}");
+        // A donor that recorded nothing is refused whatever the queue host has.
+        let missing = revision_mismatch(Some(&same), None).unwrap();
+        assert!(missing.contains("no source revision"), "{missing}");
+        // A dirty donor never matches a clean queue host.
+        assert!(revision_mismatch(Some(&same), Some(&at('a', true))).is_some());
     }
 }

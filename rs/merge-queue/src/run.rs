@@ -72,6 +72,8 @@ struct Donors {
     mode: crate::state::Offload,
     /// Tool identity computed on this host when the run started.
     tool: crate::donor::ToolIdentity,
+    /// Jobs this run published and has not settled yet: (job id, candidate commit).
+    published: Mutex<Vec<(String, String)>>,
 }
 
 /// What a peer queue's run did, when `--with-peers` drained it first.
@@ -573,11 +575,26 @@ impl<'a> Runner<'a> {
             let mut store = crate::donor::Store::new(&state.root);
             store.lease_secs = config.donors.lease();
             match crate::donor::tool_identity(&config.validator, &config.repo) {
-                Ok(tool) => Some(Donors {
-                    store,
-                    mode: offload,
-                    tool,
-                }),
+                Ok(tool) => {
+                    match store.cancel_all_live(
+                        "superseded: the run that published it ended without settling it",
+                    ) {
+                        Ok(swept) if !swept.is_empty() => eprintln!(
+                            "merge-queue: cancelled {} donor job(s) an earlier run left live",
+                            swept.len()
+                        ),
+                        Ok(_) => {}
+                        Err(error) => {
+                            eprintln!("merge-queue: cannot sweep earlier donor jobs: {error}")
+                        }
+                    }
+                    Some(Donors {
+                        store,
+                        mode: offload,
+                        tool,
+                        published: Mutex::new(Vec::new()),
+                    })
+                }
                 // Compare mode never lets the donor side affect local validation.
                 Err(error) if offload == crate::state::Offload::Compare => {
                     eprintln!("merge-queue: donors off for this run: {error}");
@@ -1409,7 +1426,37 @@ impl<'a> Runner<'a> {
             &self.config.validator,
             &donors.tool,
         )?;
+        lock(&donors.published).push((published.id.clone(), job.commit.clone()));
         Ok(published.id)
+    }
+
+    /// Cancel this run's donor jobs the queue no longer wants. A job whose candidate is now in
+    /// the base landed; once the run has `ended`, every job still live was superseded (the
+    /// next run plans and publishes its candidates afresh). The donor of a cancelled job stops
+    /// on its next renewal, and its receipt is refused.
+    fn prune_donor_jobs(&self, ended: bool) {
+        let Some(donors) = &self.donors else {
+            return;
+        };
+        let base = lock(&self.base).clone();
+        let mut published = lock(&donors.published);
+        published.retain(|(id, commit)| {
+            let landed = !base.is_empty()
+                && (*commit == base || self.git.is_ancestor(commit, &base).unwrap_or(false));
+            let reason = if landed {
+                "its candidate landed"
+            } else if ended {
+                "superseded: the run that published it ended without landing its candidate"
+            } else {
+                return true;
+            };
+            match donors.store.cancel_live(id, reason) {
+                Ok(true) => self.event("donor", &format!("job {id} cancelled: {reason}")),
+                Ok(false) => {}
+                Err(error) => self.event("donor", &format!("cannot cancel job {id}: {error}")),
+            }
+            false
+        });
     }
 
     /// Validate `job` on donors only (offload `decide`): publish, wait for an accepted
@@ -1558,6 +1605,7 @@ impl<'a> Runner<'a> {
     }
 
     fn finish(&self, stop: String) -> Result<RunReport, String> {
+        self.prune_donor_jobs(true);
         let report = {
             let mut report = lock(&self.report).clone();
             report.stopped = stop;
@@ -2095,6 +2143,7 @@ impl<'a> Runner<'a> {
             flaky,
             note: note.to_owned(),
         });
+        self.prune_donor_jobs(false);
         Ok(())
     }
 

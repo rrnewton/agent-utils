@@ -36,7 +36,11 @@ Examples:
 
 /// Local merge queue: order, batch, validate and land ready changes while keeping the base green.
 #[derive(Debug, Parser)]
-#[command(name = "merge-queue", version, after_help = AFTER_HELP)]
+#[command(
+    name = "merge-queue",
+    version = crate::build_info::version_text(),
+    after_help = AFTER_HELP
+)]
 struct Cli {
     /// State directory. Default: $MERGE_QUEUE_STATE, else `merge-queue/` inside the Git common
     /// directory of --repo (or of the current directory), so every worktree shares one queue.
@@ -223,6 +227,14 @@ fn donor_command(state: &State, action: DonorCommand) -> Result<i32, String> {
             }
             let count =
                 |state: crate::donor::JobState| jobs.iter().filter(|j| j.state == state).count();
+            let revision = crate::build_info::revision();
+            println!(
+                "merge-queue here: {}",
+                match crate::build_info::unusable(revision.as_ref()) {
+                    None => revision.as_ref().map_or_else(String::new, |r| r.describe()),
+                    Some(problem) => format!("unusable for donors: {problem}"),
+                }
+            );
             println!(
                 "donor jobs: {} queued, {} leased, {} done, {} cancelled",
                 count(crate::donor::JobState::Queued),
@@ -413,8 +425,10 @@ enum Command {
         #[arg(long, default_value = "off", value_parser = ["off", "compare", "decide"])]
         offload: String,
         /// A tool the validation depends on, as NAME=COMMAND (repeatable): the command prints
-        /// its identity (a tool repository's commit, a toolchain version). A donor whose
-        /// answer differs from the queue host's refuses the job.
+        /// its identity (a tool repository's commit, a toolchain version; never a hash of a
+        /// binary, since builds differ byte for byte across hosts). A donor whose answer
+        /// differs from the queue host's refuses the job. merge-queue's own revision (the
+        /// second line of --version) is always compared.
         #[arg(long, value_name = "NAME=COMMAND")]
         tool_identity: Vec<String>,
         /// Delete ignored files (build caches) from reused checkouts before each validation.

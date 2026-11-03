@@ -123,7 +123,7 @@ This command creates the state directory and writes `config.json`.
 | `--refusal-max-retries N` | `3` | Extra attempts after an admission refusal (exit `75`, or a non-zero exit whose first output line starts with `COULD_NOT_RUN` and that attributed no failed test) within one `run`, each after a backoff delay. A refusal is never a pass and never red: the change stays queued. |
 | `--refusal-backoff-secs SECS` | `2` | Base backoff between refusal retries, doubled per attempt and capped at 60 seconds. `0` means no delay. The same backoff sets the deferred change's next retry time. |
 | `--offload MODE` | `off` | Where validations run: `off` (in this process, as always), `compare` (in this process, which decides, and also on donors, whose receipts are only compared) or `decide` (on donors only; an accepted receipt is the verdict). See "Donor validators". |
-| `--tool-identity NAME=COMMAND` | none | A tool the validation depends on (repeatable): the command prints its identity, for example a tool repository's commit or a toolchain version. Donors whose answer differs decline the job. |
+| `--tool-identity NAME=COMMAND` | none | A tool the validation depends on (repeatable): the command prints its identity, for example a tool repository's commit or a toolchain version, never a hash of a binary (builds are not byte-identical across hosts). Donors whose answer differs decline the job. merge-queue's own revision is always compared. |
 | `--timeout SECS` | `0` | Seconds before one validation is killed (its whole process group) and its selected tests count as errors. `0` means no limit. |
 | `--clean-ignored` | off | Also delete ignored files (build caches) from a reused checkout before each validation. By default they are kept, which makes validations fast but trusts the build to be hermetic with respect to them. |
 | `--land DRIVER` | `push` | `push` or `command` (see "Land drivers"). |
@@ -773,11 +773,30 @@ about 25 MB/s, so the default takes about ten seconds. A candidate that adds mor
 over the base is normally a sign of a stale base.
 
 **Tool identity and receipts.** A job carries the validator settings, the selection (decided on
-the queue host) and the tool identity: a digest of those settings plus the answers of the
-configured `validator.tool_identity` commands, for example the commit of each tool repository
-and the pinned toolchain. The commands run in the queue's repository on the queue host and in
-the donor's clone on the donor. A donor whose answers differ declines the job loudly (naming
-each difference), backs off claiming for `--mismatch-backoff-secs`, and never runs it.
+the queue host) and the tool identity, which has three parts:
+- a digest of those settings;
+- the merge-queue revision of the queue host's binary;
+- the answers of the configured `validator.tool_identity` commands, for example the commit of
+  each tool repository and the pinned toolchain.
+
+The commands run in the queue's repository on the queue host and in the donor's clone on the
+donor. A donor whose revision or answers differ declines the job loudly (naming each
+difference), backs off claiming for `--mismatch-backoff-secs`, and never runs it.
+
+Identify a tool by the revision it was built from, never by a hash of its binary: two builds of
+one revision on different hosts are not byte-identical, so binary hashes never match. merge-queue
+records its own revision at build time and prints it as the second line of `--version`
+(`commit <sha>`, with ` (dirty)` after it when the build had uncommitted changes):
+- A build inside a Git checkout records that checkout's `HEAD`. It is dirty when this crate, its
+  path dependency, or the workspace manifest or lock file has uncommitted or untracked changes.
+- A build outside a checkout (from an archive) records nothing unless the builder sets
+  `MERGE_QUEUE_SOURCE_COMMIT` (the full commit) and optionally `MERGE_QUEUE_SOURCE_DIRTY` (`0` or
+  `1`).
+
+A binary that recorded no revision, or a dirty one, cannot be matched. A queue host with such a
+binary publishes nothing: `compare` mode runs with donors off and a warning, and `decide` mode
+refuses to start. A donor with one refuses to start. For development and tests,
+`MERGE_QUEUE_ALLOW_DIRTY=1` on every host accepts dirty builds, compared by commit only.
 
 The receipt (`merge-queue-receipt/v1`) names:
 - the job, the donor and its host, the commit and tree it validated, and the tool identity it
@@ -793,9 +812,20 @@ The queue accepts it only if all of these hold:
 Every refusal is recorded in the job's history. Validation timeouts are the validator's own
 (`validator.timeout_secs`), enforced on the donor exactly as locally.
 
-**Stops and discards.** A stop request or a discarded speculative candidate cancels the job.
-In `decide` mode a job no donor takes within `donors.claim_timeout_secs` stops the run with an
-error that asks whether a donor is running and whether its tools match. Nothing is ejected
+**Stops, discards and dead candidates.** A stop request or a discarded speculative candidate
+cancels the job. So does a candidate the queue no longer wants:
+- When a batch lands, every job whose candidate is now in the base is cancelled ("its candidate
+  landed").
+- When a run ends, every job it published that is still queued or leased is cancelled as
+  superseded: the next run plans its candidates afresh and publishes new jobs.
+- A run starts by cancelling any job an earlier run left live because it was killed before it
+  finished.
+
+A donor holding a cancelled job is told to stop on its next lease renewal, and a receipt for the
+job is refused. In `compare` mode this means a comparison is recorded only when the donor reports
+before the local verdict lands the candidate, so a donor slower than the queue host compares
+little. In `decide` mode a job no donor takes within `donors.claim_timeout_secs` stops the run with
+an error that asks whether a donor is running and whether its tools match. Nothing is ejected
 either way.
 
 ## Using it on a repository validated by a dagrun DAG

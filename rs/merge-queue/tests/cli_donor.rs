@@ -30,8 +30,58 @@ fn command(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Command {
     for (key, value) in IDENTITY.iter().chain(env) {
         command.env(key, value);
     }
+    // Tests build from a working tree that may hold uncommitted changes.
+    command.env("MERGE_QUEUE_ALLOW_DIRTY", "1");
     command.env_remove("MERGE_QUEUE_STATE");
     command
+}
+
+/// The revision `merge-queue --version` reports.
+fn own_revision() -> String {
+    let out = Command::new(bin()).arg("--version").output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let line = text
+        .lines()
+        .find_map(|line| line.strip_prefix("commit "))
+        .unwrap_or_else(|| panic!("no commit line in {text:?}"));
+    let commit = line.split(' ').next().unwrap().to_owned();
+    assert!(
+        commit.len() == 40 && commit.bytes().all(|b| b.is_ascii_hexdigit()),
+        "a test build comes from a checkout and records its revision: {text:?}"
+    );
+    commit
+}
+
+fn job_path(fx: &Fixture, id: &str) -> PathBuf {
+    state_dir(fx)
+        .join("donor")
+        .join("jobs")
+        .join(format!("{id}.json"))
+}
+
+/// Run `merge-queue donor VERB --job ID` in the queue with `stdin`; (success, stdout, stderr).
+fn donor_call(fx: &Fixture, verb: &str, id: &str, stdin: &str) -> (bool, String, String) {
+    let mut child = command(&fx.queue(), &["donor", verb, "--job", id], &[])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stdin.as_bytes())
+            .unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
 }
 
 fn state_dir(fx: &Fixture) -> PathBuf {
@@ -186,6 +236,14 @@ fn decide_mode_lands_a_candidate_on_a_donor_receipt_alone() {
     assert_eq!(job["state"], "done", "{job}");
     assert_eq!(job["receipt"]["donor"]["name"], "d1", "{job}");
     assert_eq!(job["receipt"]["commit"], fx.remote_main(), "{job}");
+    // Both sides name the merge-queue revision they run, the one `--version` prints.
+    let revision = own_revision();
+    assert_eq!(
+        job["tool"]["merge_queue"]["commit"],
+        revision.as_str(),
+        "{job}"
+    );
+    assert_eq!(job["receipt"]["tool"], job["tool"], "{job}");
     // Job files are the owner's alone, and no token is ever shown.
     let dir = state_dir(&fx).join("donor").join("jobs");
     for entry in std::fs::read_dir(&dir).unwrap().flatten() {
@@ -195,6 +253,7 @@ fn decide_mode_lands_a_candidate_on_a_donor_receipt_alone() {
     }
     let status = fx.mq_ok(&["donor", "status"]);
     assert!(status.contains("1 done"), "{status}");
+    assert!(status.contains("merge-queue here: "), "{status}");
     assert!(!fx.mq_ok(&["donor", "status", "--json"]).contains("token"));
     assert!(!String::from_utf8_lossy(&out.stderr).contains("token"));
 }
@@ -385,33 +444,38 @@ fn a_bundle_over_the_limit_is_refused_and_the_donor_declines() {
 fn compare_mode_lands_on_the_local_verdict_and_records_disagreement() {
     // A donor whose environment differs (here it fails where the queue host passes) must
     // never decide: the local verdict lands, and the disagreement is recorded.
+    // The local validation takes a while, so the donor reports before the candidate lands
+    // (a job whose candidate already landed is cancelled).
     let fx = Fixture::new("donor-compare");
     fx.mq_ok(&[
         "init",
         "--validator",
         "command",
         "--validator-run",
-        r#"[ -z "$DONOR_ENV_DIFFERS" ]"#,
+        r#"[ -n "$DONOR" ] || sleep 8; [ -z "$DONOR_ENV_DIFFERS" ]"#,
         "--offload",
         "compare",
     ]);
     two_changes(&fx);
     let clone = donor_clone(&fx, "donor-host");
-    let out = command(&fx.queue(), &["run", "--json"], &[])
-        .output()
-        .unwrap();
+    let run = spawn_run(&fx, &[]);
+    wait_for("a published job", Duration::from_secs(30), || {
+        !jobs(&fx).is_empty()
+    });
+    let out = donor(
+        &fx,
+        &clone,
+        "d1",
+        &[("DONOR", "1"), ("DONOR_ENV_DIFFERS", "1")],
+    );
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    let (code, _, stderr) = finish(run);
+    assert_eq!(code, Some(0), "{stderr}");
     assert_eq!(item_status(&fx, 1), "landed");
-    let out = donor(&fx, &clone, "d1", &[("DONOR_ENV_DIFFERS", "1")]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
     let job = &jobs(&fx)[0];
     assert_eq!(job["local"]["green"], true, "{job}");
     assert_eq!(
@@ -427,18 +491,186 @@ fn compare_mode_lands_on_the_local_verdict_and_records_disagreement() {
     // The same environment agrees.
     fx.branch("c", &[("c.txt", "c\n")]);
     fx.mq_ok(&["submit", "3", "--head", "c"]);
-    fx.mq_ok(&["run", "--json"]);
-    let out = donor(&fx, &clone, "d1", &[]);
+    let run = spawn_run(&fx, &[]);
+    wait_for("a second published job", Duration::from_secs(30), || {
+        jobs(&fx).len() == 2
+    });
+    let out = donor(&fx, &clone, "d1", &[("DONOR", "1")]);
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    let (code, _, stderr) = finish(run);
+    assert_eq!(code, Some(0), "{stderr}");
     let status = fx.mq_ok(&["donor", "status"]);
     assert!(
         status.contains("compare: 1 of 2 receipts match"),
         "{status}"
     );
+}
+
+#[test]
+fn a_donor_built_from_another_revision_declines_and_nothing_is_ejected() {
+    let fx = Fixture::new("donor-revision");
+    fx.mq_ok(&[
+        "init",
+        "--validator",
+        "command",
+        "--validator-run",
+        "exit 0",
+        "--offload",
+        "decide",
+    ]);
+    set_config(&fx, |config| {
+        config["donors"] = serde_json::json!({"claim_timeout_secs": 4})
+    });
+    two_changes(&fx);
+    let clone = donor_clone(&fx, "donor-host");
+    let run = spawn_run(&fx, &[]);
+    wait_for("a published job", Duration::from_secs(30), || {
+        !jobs(&fx).is_empty()
+    });
+    // The queue host's merge-queue came from another revision.
+    let id = jobs(&fx)[0]["id"].as_str().unwrap().to_owned();
+    let path = job_path(&fx, &id);
+    let mut job: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let elsewhere = "0".repeat(40);
+    job["tool"]["merge_queue"] = serde_json::json!({"commit": elsewhere});
+    std::fs::write(&path, serde_json::to_string_pretty(&job).unwrap()).unwrap();
+    let out = donor(&fx, &clone, "d1", &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("DECLINED"), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "this donor's merge-queue is built from {}",
+            own_revision()
+        )) && stderr.contains(&format!("the queue host's from {elsewhere}")),
+        "{stderr}"
+    );
+    let (code, report, _) = finish(run);
+    assert_eq!(code, Some(3));
+    assert!(report["ejected"].as_array().unwrap().is_empty(), "{report}");
+    assert_eq!(jobs(&fx)[0]["declined_by"], serde_json::json!(["d1"]));
+}
+
+#[test]
+fn a_job_whose_candidate_lands_while_leased_is_cancelled_and_its_receipt_refused() {
+    let fx = Fixture::new("donor-landed");
+    fx.mq_ok(&[
+        "init",
+        "--validator",
+        "command",
+        "--validator-run",
+        "sleep 3",
+        "--offload",
+        "compare",
+    ]);
+    two_changes(&fx);
+    let run = spawn_run(&fx, &[]);
+    wait_for("a published job", Duration::from_secs(30), || {
+        !jobs(&fx).is_empty()
+    });
+    // A donor holds the lease while the local verdict lands the candidate.
+    let claimed: Value = serde_json::from_str(&fx.mq_ok(&[
+        "donor", "claim", "--donor", "slow", "--host", "h", "--jobs", "1",
+    ]))
+    .unwrap();
+    let id = claimed["job"]["id"].as_str().unwrap().to_owned();
+    let token = claimed["job"]["lease"]["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (code, _, stderr) = finish(run);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(item_status(&fx, 1), "landed");
+    let job = jobs(&fx)
+        .into_iter()
+        .find(|j| j["id"] == id.as_str())
+        .unwrap();
+    assert_eq!(job["state"], "cancelled", "{job}");
+    assert!(
+        job["history"]
+            .to_string()
+            .contains("cancelled: its candidate landed"),
+        "{job}"
+    );
+    // The donor's next renewal stops it, and its receipt is refused.
+    let (ok, out, err) = donor_call(&fx, "renew", &id, &token);
+    assert!(ok, "{err}");
+    let renewal: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(renewal["renewal"], "stop", "{renewal}");
+    assert!(
+        renewal["reason"].as_str().unwrap().contains("cancelled"),
+        "{renewal}"
+    );
+    let receipt = serde_json::json!({
+        "schema": "merge-queue-receipt/v1",
+        "job": id,
+        "donor": {"name": "slow", "host": "h"},
+        "commit": job["commit"],
+        "tree": job["tree"],
+        "tool": job["tool"],
+        "merge_queue_version": "0.1.0",
+        "exit": 0,
+        "results": {"results": {}},
+        "elapsed_ms": 1,
+        "started_at": "2026-11-03T00:00:00Z",
+        "finished_at": "2026-11-03T00:00:01Z",
+        "log_tail": "",
+        "log_path": "",
+    });
+    let (ok, _, err) = donor_call(
+        &fx,
+        "report",
+        &id,
+        &serde_json::json!({"token": token, "receipt": receipt}).to_string(),
+    );
+    assert!(!ok);
+    assert!(err.contains("was cancelled"), "{err}");
+    let job = jobs(&fx)
+        .into_iter()
+        .find(|j| j["id"] == id.as_str())
+        .unwrap();
+    assert!(job["receipt"].is_null(), "{job}");
+}
+
+#[test]
+fn a_job_left_by_a_killed_run_is_cancelled_by_the_next_run() {
+    let fx = Fixture::new("donor-sweep");
+    fx.mq_ok(&[
+        "init",
+        "--validator",
+        "command",
+        "--validator-run",
+        "exit 0",
+        "--offload",
+        "decide",
+    ]);
+    set_config(&fx, |config| {
+        config["donors"] = serde_json::json!({"claim_timeout_secs": 2})
+    });
+    two_changes(&fx);
+    let mut run = spawn_run(&fx, &[]);
+    wait_for("a published job", Duration::from_secs(30), || {
+        !jobs(&fx).is_empty()
+    });
+    // Killed outright: it settles nothing.
+    run.kill().unwrap();
+    run.wait().unwrap();
+    let stale = jobs(&fx)[0]["id"].as_str().unwrap().to_owned();
+    assert_eq!(jobs(&fx)[0]["state"], "queued");
+    let (_, _, stderr) = finish(spawn_run(&fx, &[]));
+    assert!(
+        stderr.contains("cancelled 1 donor job(s) an earlier run left live"),
+        "{stderr}"
+    );
+    let job = jobs(&fx)
+        .into_iter()
+        .find(|j| j["id"] == stale.as_str())
+        .unwrap();
+    assert_eq!(job["state"], "cancelled", "{job}");
+    assert!(job["history"].to_string().contains("superseded"), "{job}");
 }
 
 #[test]
