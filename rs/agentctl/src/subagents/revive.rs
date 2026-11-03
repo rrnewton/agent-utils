@@ -894,12 +894,20 @@ fn fresh_selector(harness: &str, arguments: Vec<String>, session: &str) -> Resul
         })
 }
 
-/// The project's configured wrkslots, unless `AGENTCTL_WRKSLOTS_BIN` already names one.
+/// The project's configured wrkslots, unless `AGENTCTL_WRKSLOTS_BIN` already names one:
+/// the `wrkslots` key of profiles.json, else the team folder's `bin/wrkslots` (#742).
+/// PATH is never consulted: a non-login shell's PATH silently hung restore for 300 s.
 pub(super) fn configured_wrkslots(registry: &Path) -> Result<Option<PathBuf>> {
     if std::env::var_os(WRKSLOTS_BIN_ENV).is_some_and(|value| !value.is_empty()) {
         return Ok(None);
     }
-    Ok(crate::profiles::wrkslots_for_registry(registry)?.map(PathBuf::from))
+    if let Some(configured) = crate::profiles::wrkslots_for_registry(registry)? {
+        return Ok(Some(PathBuf::from(configured)));
+    }
+    let team = registry
+        .parent()
+        .map(|root| root.join("bin").join("wrkslots"));
+    Ok(team.filter(|candidate| fs::metadata(candidate).is_ok_and(|metadata| metadata.is_file())))
 }
 
 fn validate_census(panes: &[Pane]) -> Result<()> {

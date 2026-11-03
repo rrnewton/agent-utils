@@ -5443,8 +5443,9 @@ const LAUNCH_ENV_RELAY_REFUSAL: &str = "profile config launch_env does not apply
 /// Environment variable naming the wrkslots executable, overriding `PATH`.
 pub const WRKSLOTS_BIN_ENV: &str = "AGENTCTL_WRKSLOTS_BIN";
 
-/// The project's slot manager: `AGENTCTL_WRKSLOTS_BIN`, then the `wrkslots` key of the project's
-/// `.agentctl/profiles.json`, then `wrkslots` on PATH.
+/// The project's slot manager (#742): `AGENTCTL_WRKSLOTS_BIN`, then the `wrkslots` key
+/// of the project's `.agentctl/profiles.json`, then the team folder's `bin/wrkslots`.
+/// PATH is never consulted.
 pub(crate) fn project_wrkslots(registry: &Path) -> Option<PathBuf> {
     revive::configured_wrkslots(registry)
         .ok()
@@ -5453,17 +5454,9 @@ pub(crate) fn project_wrkslots(registry: &Path) -> Option<PathBuf> {
 }
 
 fn wrkslots_executable() -> Option<PathBuf> {
-    if let Some(value) = std::env::var_os(WRKSLOTS_BIN_ENV).filter(|value| !value.is_empty()) {
-        return Some(PathBuf::from(value));
-    }
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|directory| directory.join("wrkslots"))
-        .find(|candidate| {
-            fs::metadata(candidate).is_ok_and(|metadata| {
-                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
-            })
-        })
+    std::env::var_os(WRKSLOTS_BIN_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
 }
 
 /// Ask the slot manager for the exec-only command line that boxes a pane shell.

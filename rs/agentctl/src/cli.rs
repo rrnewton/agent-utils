@@ -2525,6 +2525,23 @@ impl From<StopFailure> for Failure {
         Self::Stop(error)
     }
 }
+/// Resolve the Herdr binary without PATH alone (#742): an explicit path wins, then the
+/// `herdr` key of profiles.json, then the team folder's `bin/herdr`.
+fn resolve_herdr_bin(registry: &Path, given: &Path) -> PathBuf {
+    if given.components().count() > 1 {
+        return given.to_path_buf();
+    }
+    if let Ok(Some(configured)) = crate::profiles::herdr_for_registry(registry) {
+        return PathBuf::from(configured);
+    }
+    if let Some(team) = registry.parent().map(|root| root.join("bin").join("herdr")) {
+        if team.is_file() {
+            return team;
+        }
+    }
+    given.to_path_buf()
+}
+
 fn write_json(value: &impl Serialize) -> io::Result<()> {
     let mut output = io::stdout().lock();
     serde_json::to_writer_pretty(&mut output, value)?;
@@ -3075,8 +3092,9 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 write_json(&report).map_err(Failure::Output)?;
                 return Ok(0);
             }
-            let client = HerdrClient::with_executable("direct", &args.herdr_bin)
-                .map_err(AgentError::from)?;
+            let herdr_bin = resolve_herdr_bin(&args.registry, &args.herdr_bin);
+            let client =
+                HerdrClient::with_executable("direct", &herdr_bin).map_err(AgentError::from)?;
             let mut config = crate::restore::RestoreConfig::load(&args.registry)?;
             let designation_problem = designation_problem(&client, &args.registry, &mut config);
             let mut report = crate::restore::restore(
@@ -3089,7 +3107,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     dry_run: value.dry_run,
                     startup_timeout: Duration::from_secs_f64(value.startup_timeout),
                     wrkslots: crate::subagents::project_wrkslots(&args.registry),
-                    herdr_bin: args.herdr_bin.clone(),
+                    herdr_bin: herdr_bin.clone(),
                 },
             )?;
             report["trigger"] = json!(if value.boot { "boot" } else { "manual" });

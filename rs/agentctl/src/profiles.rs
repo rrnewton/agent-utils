@@ -1293,6 +1293,14 @@ pub(crate) fn wrkslots_for_registry(registry: &Path) -> Result<Option<String>, A
     }
 }
 
+/// The `herdr` key of the project's `.agentctl/profiles.json`, when configured (#742).
+pub(crate) fn herdr_for_registry(registry: &Path) -> Result<Option<String>, AgentError> {
+    match registry_policy(registry)? {
+        Some(object) => wrkslots_value(object.get("herdr")),
+        None => Ok(None),
+    }
+}
+
 /// Most directories `launch_env.path_prepend` may name.
 const MAX_PATH_PREPEND: usize = 16;
 /// Longest path `launch_env` accepts, in bytes.
