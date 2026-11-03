@@ -293,6 +293,39 @@ def _rule_matches(path: str, prefix: str) -> bool:
     return path.startswith(prefix) if prefix.endswith("/") else path == prefix
 
 
+def _longest_prefix_groups(path: str) -> frozenset[str] | None:
+    """The groups named by the longest matching prefix rule for `path`."""
+
+    best: frozenset[str] | None = None
+    best_len = -1
+    for prefix, groups in PREFIX_RULES:
+        if _rule_matches(path, prefix) and len(prefix) > best_len:
+            best, best_len = groups, len(prefix)
+    return best
+
+
+def _cross_shared_trigger(paths: list[str], selected: frozenset[str]) -> bool:
+    """Whether the cross group was triggered by an input shared by every tool.
+
+    A trigger from another tool's files under `cross/` selects only that
+    tool's gate-exclusive steps. A trigger from outside `cross/` — workspace
+    manifests, shared launchers, examples — can change every paired
+    implementation at once, as can the shared differential runner itself.
+    """
+
+    if CROSS not in selected:
+        return False
+    for path in paths:
+        if path == "cross/differential.py":
+            return True
+        if path.startswith("cross/"):
+            continue
+        groups = _longest_prefix_groups(path)
+        if groups is not None and CROSS in groups:
+            return True
+    return False
+
+
 def selection_for(
     paths: list[str], *, manifest: Manifest | None = None
 ) -> tuple[frozenset[str], dict[str, str], frozenset[str], dict[str, str]]:
@@ -307,12 +340,7 @@ def selection_for(
     because: dict[str, str] = {group: "always" for group in ALWAYS}
     for path in sorted(paths):
         path_components, _ = components_for_paths([path], active_manifest)
-        best: frozenset[str] | None = None
-        best_len = -1
-        for prefix, groups in PREFIX_RULES:
-            if _rule_matches(path, prefix):
-                if len(prefix) > best_len:
-                    best, best_len = groups, len(prefix)
+        best = _longest_prefix_groups(path)
         # Root `make mypy` scans the whole checkout, not only `py/`. A Python helper stored in an
         # otherwise prose-only directory is executable validation input and must not inherit the
         # directory's exemption. That includes the website's demo recorders under site/demos/.
@@ -583,41 +611,86 @@ TIMING_COMMAND_MARKERS = (
 )
 
 
-#: DAG label for steps that must run alone on the host: under a fresh
-#: `gate.py --exclusive` admission, one step at a time, after the main phase.
-#: These steps assert exact outcomes of small wall clocks inside the tools
-#: they compare (agentctl's Herdr probes against a Python fake Herdr), so
-#: sharing the box with another gate's steps — not the step budgets — turns
-#: them red; exclusive reruns pass. See validation/cross.dag.yaml.
+#: DAG label for steps that must run alone on the host: after the main phase,
+#: under one fresh `gate.py --exclusive` admission per gate, one step at a
+#: time. These steps assert exact outcomes of small wall clocks inside the
+#: tools they compare (agentctl's Herdr probes against a Python fake Herdr),
+#: so sharing the box with another gate's steps — not the step budgets —
+#: turns them red; exclusive reruns pass. Running the five in parallel inside
+#: the one admission also diverged (a verified-idle-composer probe timed out
+#: beside its four siblings), so the phase is serial within the admission:
+#: still one queue slot per gate. See validation/cross.dag.yaml.
 GATE_EXCLUSIVE_LABEL = "gate-exclusive"
 
 
 def partition_gate_exclusive(
-    steps: dict[str, dict[str, object]], chosen: set[str]
+    steps: dict[str, dict[str, object]],
+    chosen: set[str],
+    *,
+    components: frozenset[str] | None = None,
+    keep_all: bool = False,
 ) -> tuple[list[str], list[str]]:
     """Split chosen tags into the main phase and the gate-exclusive phase.
 
     Both lists keep graph order. A chosen step that depends on an exclusive
     step joins the exclusive phase too: running it in the main phase would
     pull its exclusive dependency in beside everything else.
+
+    Unless `keep_all`, an exclusive step is kept only when one of its
+    `component-*` labels names a selected component: the selection map
+    (validation/components.json) says which paths can change each tool's
+    behaviour, and a change that cannot affect a tool must not pay for its
+    wall-clock-sensitive differential — above all not at exclusive-admission
+    prices. `keep_all` is for `--all`, the unclassified-path fail-safe (which
+    selects every group), and cross-group triggers from outside `cross/`
+    (workspace manifests, shared launchers) that can change every paired
+    implementation at once.
     """
 
     def labels(tag: str) -> set[str]:
         raw = steps[tag].get("labels")
         return {label for label in raw if isinstance(label, str)} if isinstance(raw, list) else set()
 
-    exclusive = {tag for tag in chosen if GATE_EXCLUSIVE_LABEL in labels(tag)}
+    labelled = {tag for tag in chosen if GATE_EXCLUSIVE_LABEL in labels(tag)}
+    exclusive = set(labelled)
+    if not keep_all and components is not None:
+        # A filtered-out exclusive step is not selected at all: it must not
+        # fall back into the main phase, where it would run beside every
+        # other step — the exact condition the label exists to avoid.
+        exclusive = {
+            tag
+            for tag in exclusive
+            if any(
+                label.removeprefix("component-") in components
+                for label in labels(tag)
+                if label.startswith("component-")
+            )
+        }
+    dropped = labelled - exclusive
     changed = True
     while changed:
         changed = False
-        for tag in chosen - exclusive:
+        for tag in chosen - dropped:
             raw_deps = steps[tag].get("deps")
             deps = raw_deps if isinstance(raw_deps, list) else []
-            if any(dep in exclusive for dep in deps if isinstance(dep, str)):
+            if any(dep in dropped for dep in deps if isinstance(dep, str)):
+                # A step that depends on a filtered-out exclusive step cannot
+                # run either: dagrun would pull the dependency in beside
+                # everything else, or fail for its absence.
+                dropped.add(tag)
+                exclusive.discard(tag)
+                changed = True
+            elif tag not in exclusive and any(
+                dep in exclusive for dep in deps if isinstance(dep, str)
+            ):
                 exclusive.add(tag)
                 changed = True
     return (
-        [tag for tag in steps if tag in chosen and tag not in exclusive],
+        [
+            tag
+            for tag in steps
+            if tag in chosen and tag not in labelled and tag not in exclusive and tag not in dropped
+        ],
         [tag for tag in steps if tag in exclusive],
     )
 
@@ -672,22 +745,22 @@ def run(
     graph's environment only. With `keep_going`, a failed step no longer aborts the steps
     that do not depend on it (dagrun --keep-going), so one run reports every independent
     failure. `#362 ci-failure-masking`. Steps labelled `gate-exclusive` run after the
-    main phase, one at a time under a fresh `gate.py --exclusive` admission, so no
-    other gate's steps share the host with them.
+    main phase, one at a time under one fresh `gate.py --exclusive` admission, so no
+    other gate's steps — and none of their own siblings — share the host with them.
     """
 
     cpu_count = os.cpu_count() or 1
     max_cpus = os.environ.get("VALIDATE_MAX_CPUS", str(min(32, cpu_count)))
     max_steps = os.environ.get("VALIDATE_MAX_STEPS", str(min(24, cpu_count)))
 
-    def dagrun_command() -> list[str]:
+    def dagrun_command(max_steps_override: str | None = None) -> list[str]:
         return [
             str(REPO_ROOT / "common" / "bin" / "dagrun"),
             "run",
             "--dag",
             str(REPO_ROOT / "validation.dag.yaml"),
             "--max-steps",
-            max_steps,
+            max_steps_override or max_steps,
             "--max-cpus",
             max_cpus,
             "--planner",
@@ -712,11 +785,12 @@ def run(
     main_tags, exclusive_tags = gate_exclusive_phases or ([], [])
     result = 0
     if exclusive_tags:
-        # Steps labelled gate-exclusive run afterwards, one at a time, each
-        # under a fresh exclusive gate admission (see partition_gate_exclusive).
+        # Steps labelled gate-exclusive run afterwards, one at a time under
+        # ONE fresh exclusive gate admission (see partition_gate_exclusive):
+        # one queue slot per gate, nothing from any other gate beside them.
         print(
             f"\nvalidate: {len(exclusive_tags)} gate-exclusive step(s) run alone "
-            f"after the main phase: {', '.join(exclusive_tags)}",
+            f"after the main phase, one at a time under one admission: {', '.join(exclusive_tags)}",
             flush=True,
         )
     if main_tags or not exclusive_tags:
@@ -733,27 +807,33 @@ def run(
         print(f"\n=== flattened validation DAG ({len(command)} argv entries) ===", flush=True)
         done = subprocess.run(command, cwd=REPO_ROOT, check=False, env=env)
         result = done.returncode
-    if result == 0 or keep_going:
-        for tag in exclusive_tags:
-            # gate.py releases this run's own admission slot before queueing
-            # (the parent is blocked here), then this step runs alone: no
-            # other gate's steps share the host while it runs.
-            command = [
-                sys.executable,
-                str(Path(__file__).with_name("gate.py")),
-                "--exclusive",
-                "--",
-                *dagrun_command(),
-                "--selected",
-                tag,
-                *shlex.split(extra),
-            ]
-            print(f"\n=== gate-exclusive step {tag} (runs alone) ===", flush=True)
-            done = subprocess.run(command, cwd=REPO_ROOT, check=False, env=env)
-            if done.returncode != 0 and result == 0:
-                result = done.returncode
-            if result != 0 and not keep_going:
-                break
+    if exclusive_tags and (result == 0 or keep_going):
+        # gate.py releases this run's own admission slot before queueing
+        # (the parent is blocked here), then these steps run under the one
+        # exclusive admission: no other gate's steps share the host while
+        # they run. One admission per gate, however many steps it has.
+        # --max-steps 1 keeps the steps serial inside the admission: run
+        # together, the five still diverged (a verified-idle-composer probe
+        # timed out beside its siblings), so alone means alone.
+        command = [
+            sys.executable,
+            str(Path(__file__).with_name("gate.py")),
+            "--exclusive",
+            "--",
+            *dagrun_command(max_steps_override="1"),
+            "--selected",
+            ",".join(exclusive_tags),
+        ]
+        if keep_going:
+            command.append("--keep-going")
+        command.extend(shlex.split(extra))
+        print(
+            f"\n=== gate-exclusive phase ({len(exclusive_tags)} step(s), one admission, serial) ===",
+            flush=True,
+        )
+        done = subprocess.run(command, cwd=REPO_ROOT, check=False, env=env)
+        if done.returncode != 0 and result == 0:
+            result = done.returncode
     if result != 0:
         print("\nvalidate: FAILED in flattened validation DAG", file=sys.stderr)
     return result
@@ -860,15 +940,24 @@ def selected_graph(
 
 
 def selected_cross_nodes(
-    selected: frozenset[str], components: frozenset[str], *, all_contract: bool
+    selected: frozenset[str],
+    components: frozenset[str],
+    *,
+    all_contract: bool,
+    chosen_tags: set[str] | None = None,
 ) -> list[str]:
     """Tags of the selected nodes that run ``cross/differential.py``, in graph order.
 
     Each of them writes a coverage record when it reaches a verdict, so after a passing run a
-    missing record means that node's coverage cannot be confirmed.
+    missing record means that node's coverage cannot be confirmed. `chosen_tags`
+    overrides the graph selection when the caller has already applied the
+    gate-exclusive phase split, so the expectation names exactly the nodes
+    that will run.
     """
 
     steps, chosen = selected_graph(selected, components, all_contract=all_contract)
+    if chosen_tags is not None:
+        chosen = set(chosen_tags)
     return [
         tag
         for tag, step in steps.items()
@@ -879,15 +968,23 @@ def selected_cross_nodes(
 
 
 def selected_timing_gates(
-    selected: frozenset[str], components: frozenset[str], *, all_contract: bool
+    selected: frozenset[str],
+    components: frozenset[str],
+    *,
+    all_contract: bool,
+    chosen_tags: set[str] | None = None,
 ) -> list[str]:
     """Tags of the selected timing-capable nodes, in graph order.
 
     Each of them emits a normalized per-case record when it runs, so after a
     passing run a missing record means that gate's cases cannot be confirmed.
+    `chosen_tags` overrides the graph selection when the caller has already
+    applied the gate-exclusive phase split.
     """
 
     steps, chosen = selected_graph(selected, components, all_contract=all_contract)
+    if chosen_tags is not None:
+        chosen = set(chosen_tags)
     return [
         tag
         for tag, step in steps.items()
@@ -898,16 +995,25 @@ def selected_timing_gates(
 
 
 def report_selected_graph(
-    selected: frozenset[str], components: frozenset[str], *, all_contract: bool
+    selected: frozenset[str],
+    components: frozenset[str],
+    *,
+    all_contract: bool,
+    chosen_tags: set[str] | None = None,
 ) -> None:
     """Print the exact flattened nodes and resources selected by the public graph loader.
 
     CI consumes the ``NEED resource:*`` lines when provisioning optional runtimes. Deriving them
     from the selected graph prevents a component label from activating (for example) a browser
     gate while a second, coarser group-name heuristic incorrectly skips browser installation.
+    `chosen_tags` overrides the graph selection when the caller has already
+    applied the gate-exclusive phase split, so the plan names exactly the
+    nodes that will run.
     """
 
     steps, chosen = selected_graph(selected, components, all_contract=all_contract)
+    if chosen_tags is not None:
+        chosen = set(chosen_tags)
     resources = sorted(
         {
             resource
@@ -958,6 +1064,38 @@ def self_test() -> int:
             "gate-exclusive partition: a dependent of an exclusive step must "
             f"join the exclusive phase; got main={main_tags} exclusive={exclusive_tags}"
         )
+
+    scoped_steps: dict[str, dict[str, object]] = {
+        "cross.mine": {"labels": [GATE_EXCLUSIVE_LABEL, "component-agentctl"], "deps": []},
+        "cross.theirs": {"labels": [GATE_EXCLUSIVE_LABEL, "component-herdr-run"], "deps": []},
+        "cross.plain": {"labels": [], "deps": []},
+        "cross.blocked": {"labels": [], "deps": ["cross.theirs"]},
+    }
+    scoped_main, scoped_exclusive = partition_gate_exclusive(
+        scoped_steps,
+        {"cross.mine", "cross.theirs", "cross.plain", "cross.blocked"},
+        components=frozenset({"agentctl"}),
+    )
+    if scoped_main != ["cross.plain"] or scoped_exclusive != ["cross.mine"]:
+        failures.append(
+            "gate-exclusive partition: a step whose component was not selected "
+            "must be dropped entirely, not run in the main phase; got "
+            f"main={scoped_main} exclusive={scoped_exclusive}"
+        )
+
+    for shared_paths, want_shared in (
+        (["cross/dagrun/cli.py"], False),
+        (["cross/dagrun/cli.py", "rs/Cargo.toml"], True),
+        (["cross/differential.py"], True),
+        (["rs/Cargo.toml"], True),
+        (["examples/demo.py"], True),
+    ):
+        shared_selected, _, _, _ = selection_for(shared_paths, manifest=manifest)
+        if _cross_shared_trigger(shared_paths, shared_selected) != want_shared:
+            failures.append(
+                "gate-exclusive selection: shared cross inputs must keep every "
+                f"differential while another tool's cross files must not; paths={shared_paths}"
+            )
 
     def expect(
         paths: list[str], want: set[str], why: str, want_components: set[str] | None = None
@@ -1536,29 +1674,55 @@ def main(argv: list[str] | None = None) -> int:
         selected, because, components, component_because = selection_for(paths)
         report(selected, because, components, component_because, paths)
 
+    all_contract = args.all or selected == ALL_GROUPS
+    graph_steps, graph_chosen = selected_graph(
+        selected, components, all_contract=all_contract
+    )
+    # The gate-exclusive steps are component-selected (see
+    # partition_gate_exclusive), so a cross-group trigger from another tool's
+    # files under cross/ does not select them. A cross-group trigger from
+    # outside cross/ — workspace manifests, shared launchers, examples — can
+    # change every paired implementation at once, so it keeps them all, as
+    # do --all and the unclassified-path fail-safe (both make all_contract or
+    # select every group). The shared differential runner
+    # (cross/differential.py, owned by repository-infrastructure in the map)
+    # is named explicitly for the same reason.
+    cross_shared_trigger = _cross_shared_trigger(paths, selected)
+    if cross_shared_trigger and not all_contract:
+        labelled: set[str] = set()
+        for tag, step in graph_steps.items():
+            raw_labels = step.get("labels")
+            if isinstance(raw_labels, list) and GATE_EXCLUSIVE_LABEL in {
+                label for label in raw_labels if isinstance(label, str)
+            }:
+                labelled.add(tag)
+        graph_chosen = graph_chosen | labelled
+    phases = partition_gate_exclusive(
+        graph_steps,
+        graph_chosen,
+        components=components,
+        keep_all=all_contract or cross_shared_trigger,
+    )
+    final_chosen = set(phases[0]) | set(phases[1])
     if args.list:
         report_selected_graph(
             selected,
             components,
-            all_contract=args.all or selected == ALL_GROUPS,
+            all_contract=all_contract,
+            chosen_tags=final_chosen,
         )
         return 0
-
     try:
         host = host_env(os.environ)
     except HostEnvError as error:
         print(f"validate: {error}", file=sys.stderr)
         return 2
-
-    all_contract = args.all or selected == ALL_GROUPS
-    graph_steps, graph_chosen = selected_graph(
-        selected, components, all_contract=all_contract
-    )
-    phases = partition_gate_exclusive(graph_steps, graph_chosen)
     # Every selected cross node must leave a record; one that does not cannot be confirmed.
-    expected = selected_cross_nodes(selected, components, all_contract=all_contract)
+    expected = selected_cross_nodes(
+        selected, components, all_contract=all_contract, chosen_tags=final_chosen
+    )
     expected_timing = selected_timing_gates(
-        selected, components, all_contract=all_contract
+        selected, components, all_contract=all_contract, chosen_tags=final_chosen
     )
     with (
         tempfile.TemporaryDirectory(prefix="validate-cross-coverage-") as coverage,

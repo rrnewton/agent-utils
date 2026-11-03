@@ -25,6 +25,9 @@
         "common/docs/chat-subscription-plugin/",
         "common/docs/chat-subscription/",
         "common/docs/term-backend/",
+        "cross/agentctl_differential.py",
+        "cross/agentctl_nested_records.py",
+        "cross/herdr_agent_differential.py",
         "py/agentctl/",
         "py/bin/agentctl",
         "py/bin/herdr-agent",
@@ -191,6 +194,8 @@
     "herdr-run": {
       "source_prefixes": [
         "common/docs/herdr-run/",
+        "cross/herdr_differential.py",
+        "cross/herdr_e2e/",
         "py/bin/herdr-run",
         "py/herdr_run/",
         "py/tests/herdr_fake.py",
