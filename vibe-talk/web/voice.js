@@ -4658,17 +4658,9 @@ const rowsChosen = () => readRunsSuspended();
 // ids of their messages: as a collapsed run's opened state is kept (`readRuns`), because the
 // rows are rebuilt under the reader. Held under the searches that chose the rows (`searchKey`) and
 // forgotten the moment any filter changes: an opened run is an act on THIS search's list, and a new
-// word typed is a new list. The thread cards keep theirs beside them (`openedCardGaps`).
-
-/**
- * The opened runs of every view, under the searches as they stood when each was opened.
- *
- * @type {Map<string, Set<string>>}
- */
-const openedGaps = new Map();
-
-/** The `searchKey` the opened runs belong to: a change of any filter forgets them all. */
-let openedGapsFor = "";
+// word typed is a new list. The thread cards keep theirs beside them (`openedCardGaps`). One owner keeps
+// both, in web/src/core/search/opened.ts (`#624 voice-page-modularity`).
+const openedGaps = createOpenedGaps();
 
 /**
  * This column's view's set of opened messages, or null when it has none and `create` does not ask
@@ -4678,17 +4670,7 @@ let openedGapsFor = "";
  * @returns {Set<string> | null}
  */
 function openedGapIds(create) {
-  const searches = searchKey();
-  if (searches !== openedGapsFor) {
-    openedGaps.clear();
-    openedGapsFor = searches;
-  }
-  const key = JSON.stringify([viewKey(), columnWork.side(), String(selectedChannelId())]);
-  const held = openedGaps.get(key) || null;
-  if (held || !create) return held;
-  const made = new Set();
-  openedGaps.set(key, made);
-  return made;
+  return openedGaps.ids(searchKey(), JSON.stringify([viewKey(), columnWork.side(), String(selectedChannelId())]), create);
 }
 
 // The lines themselves, made once on their row and kept, are web/src/view/channel's (`createSeamLines`,
@@ -28134,9 +28116,6 @@ function filterSideCards() {
 // with no search choosing. The line is the channel gap's own (`.row-seam`, on the card after its
 // run), and a tap opens its run the same way: shown, not matched, until the search changes.
 
-/** The opened runs among the cards, and the searches they belong to, as `openedGaps` keeps them. */
-let openedCardGapState = null;
-
 /**
  * The opened card runs under the searches as they stand — thread ids, and the ids of Main's
  * messages among the cards — or null when there are none and `create` does not ask for them.
@@ -28146,16 +28125,8 @@ let openedCardGapState = null;
  * @returns {{threads: Set<string>, ids: Set<string>} | null}
  */
 function openedCardGaps(create) {
-  const key = JSON.stringify([searchKey(), String(selectedChannelId())]);
-  // Forgotten the moment any filter changes, as among messages (`openedGapIds`): leaving the state
-  // behind a mismatched key would bring its runs back when the reader typed their way back to the
-  // same words, never having opened them under this search.
-  if (openedCardGapState && openedCardGapState.key !== key) openedCardGapState = null;
-  if (!openedCardGapState) {
-    if (!create) return null;
-    openedCardGapState = { key, threads: new Set(), ids: new Set() };
-  }
-  return openedCardGapState;
+  // Forgotten the moment any filter changes, as among messages (`openedGapIds`).
+  return openedGaps.cards(JSON.stringify([searchKey(), String(selectedChannelId())]), create);
 }
 
 /**

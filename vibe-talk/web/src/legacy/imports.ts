@@ -11,6 +11,7 @@
 
 export {
   createGathering,
+  createOpenedGaps,
   createParsedQueries,
   createRepliesWalk,
   createSearchField,

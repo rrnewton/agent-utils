@@ -29,3 +29,5 @@ export { createParsedQueries } from "./parsed.ts";
 export type { ParsedQueries, ParsedQuery } from "./parsed.ts";
 export { createRepliesWalk } from "./replies.ts";
 export type { RepliesPage, RepliesWalk, RepliesWalkDependencies, RepliesWalkState } from "./replies.ts";
+export { createOpenedGaps } from "./opened.ts";
+export type { OpenedCardRuns, OpenedGaps } from "./opened.ts";

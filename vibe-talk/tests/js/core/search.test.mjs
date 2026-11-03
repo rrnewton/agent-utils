@@ -256,3 +256,20 @@ test("`#624 voice-page-modularity`: the cards' walk reads All back within its bo
   assert.deepStrictEqual(said, ["failed"]);
   assert.match(walks.noteFor(() => "k1"), /^failed:/);
 });
+
+test("`#624 voice-page-modularity`: opened runs are held per view and among the cards, and forgotten as the searches change", () => {
+  const { createOpenedGaps } = SEARCH;
+  const gaps = createOpenedGaps();
+  assert.equal(gaps.ids("s1", "main", false), null, "nothing opened, nothing made");
+  gaps.ids("s1", "main", true).add("m1");
+  assert.deepStrictEqual([...gaps.ids("s1", "main", false)], ["m1"]);
+  assert.equal(gaps.ids("s1", "flat", false), null, "each view its own");
+  assert.equal(gaps.ids("s2", "main", false), null, "a change of search forgets every view's");
+  assert.equal(gaps.ids("s1", "main", false), null, "and typing back to the old words does not bring them back");
+  assert.equal(gaps.cards("k1", false), null);
+  const cards = gaps.cards("k1", true);
+  cards.threads.add("t1");
+  assert.equal(gaps.cards("k1", false), cards);
+  assert.equal(gaps.cards("k2", false), null, "another key forgets the cards'");
+  assert.equal(gaps.cards("k1", false), null);
+});
