@@ -1,13 +1,14 @@
 ---
 title: 'agent-record-schema-forward-compat: versioned agent-record schemas tolerate keys a newer version added'
-status: open
+status: closed
 priority: 2
-assignee: cl-mq@devbig030
 issue_type: bug
+assignee: cl-mq@devbig030
 labels:
 - agentctl
 created_at: 2026-11-03T10:14:01.600972177+00:00
-updated_at: 2026-11-03T10:14:01.600972177+00:00
+updated_at: 2026-11-03T20:10:05.658462580+00:00
+closed_at: 2026-11-03T20:10:05.658462210+00:00
 ---
 
 # Description

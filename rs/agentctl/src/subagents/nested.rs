@@ -1,8 +1,16 @@
 //! Nested `agentctl-session/v2` and `agentctl-session/v3` registry rows.
 //!
 //! These rows keep launch intent once, under a canonical `launch` object, instead of beside the
-//! mutable fields. A row is accepted only with exactly its schema's key set and launch contract,
-//! decoded into the ordinary [`AgentRecord`], and written back in the same nested form. A
+//! mutable fields. A row is accepted with at least its schema's key set and its launch contract,
+//! decoded into the ordinary [`AgentRecord`], and written back in the same nested form.
+//!
+//! A key a newer agentctl added (#813 agent-record-schema-forward-compat) is read around and
+//! kept: at the top of the row, in `launch` and its `executable`, and in the v3 `native_session`
+//! and `goal` objects. A write-back keeps an unknown top-level key as it was, and an unknown key
+//! of `native_session` or `goal` while that object's own fields are unchanged; a new session or
+//! goal object drops them, as a replaced object in a flat record does (#809). `anchor`, which
+//! migrates the row to flat schema 1, does not carry them over. Process identities ignore
+//! unknown keys, because they are compared for equality. A
 //! write-back refuses a record whose launch intent changed, because the nested form keeps that
 //! intent in one place only. `anchor` is the one operation that rewrites a nested row as flat
 //! schema 1, since anchors exist only there.
@@ -52,6 +60,10 @@ const V2_FIELDS: [&str; 9] = [
 ];
 /// Keys only a v3 row carries: one native session object and one goal object.
 const V3_FIELDS: [&str; 3] = ["native_session", "goal", "custom_process_identity"];
+/// Keys of a v3 native session object.
+const NATIVE_FIELDS: [&str; 4] = ["schema", "agent", "value", "source"];
+/// Keys of a v3 goal object (`agentctl-goal/v1`).
+const GOAL_FIELDS: [&str; 4] = ["schema", "objective", "message_id", "native_command"];
 /// Keys of a v1 launch specification; v2 adds `permission_mode`.
 const LAUNCH_FIELDS: [&str; 14] = [
     "schema",
@@ -90,6 +102,49 @@ pub(super) struct NestedRecord {
     extensions: Map<String, Value>,
     /// How the native session was bound: `observed`, `asserted`, or unknown.
     session_source: Option<String>,
+    /// Top-level keys a newer agentctl added, written back as they were.
+    unknown: Map<String, Value>,
+    /// The v3 `native_session` object as read, for the keys a newer agentctl added to it.
+    native_read: Option<Map<String, Value>>,
+    /// The v3 `goal` object as read, likewise.
+    goal_read: Option<Map<String, Value>>,
+}
+
+/// Every key a row of `schema` must carry.
+fn expected_fields(schema: &str) -> BTreeSet<&'static str> {
+    let mut expected: BTreeSet<&str> = COMMON_FIELDS.into_iter().collect();
+    expected.extend(if schema == SESSION_V2 {
+        &V2_FIELDS[..]
+    } else {
+        &V3_FIELDS[..]
+    });
+    expected
+}
+
+/// Whether `object` carries at least `fields`.
+fn has_fields(object: &Map<String, Value>, fields: &[&str]) -> bool {
+    fields.iter().all(|field| object.contains_key(*field))
+}
+
+/// `read`'s keys beyond `fields`, put back into `written` when `written` still has the same
+/// values for every field in `same` (the object was not replaced).
+fn keep_unknown(
+    written: &mut Value,
+    read: Option<&Map<String, Value>>,
+    fields: &[&str],
+    same: &[&str],
+) {
+    let (Some(read), Some(object)) = (read, written.as_object_mut()) else {
+        return;
+    };
+    if same.iter().any(|key| read.get(*key) != object.get(*key)) {
+        return;
+    }
+    for (key, value) in read {
+        if !fields.contains(&key.as_str()) {
+            object.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
 }
 
 /// Decode `document` if it is a nested v2 or v3 row, or return `None` so the caller decodes it
@@ -136,11 +191,24 @@ fn decode_nested(source: &Map<String, Value>, schema: &str, path: &Path) -> Resu
             .cloned()
             .unwrap_or_default()
     };
+    let expected = expected_fields(schema);
+    let v3_object = |key: &str| {
+        (schema == SESSION_V3)
+            .then(|| source.get(key).and_then(Value::as_object).cloned())
+            .flatten()
+    };
     record.nested = Some(NestedRecord {
         schema: schema.to_owned(),
         launch: object("launch"),
         extensions: object("extensions"),
         session_source,
+        unknown: source
+            .iter()
+            .filter(|(key, _)| !expected.contains(key.as_str()))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+        native_read: v3_object("native_session"),
+        goal_read: v3_object("goal"),
     });
     Ok(record)
 }
@@ -176,13 +244,20 @@ fn normalize(
 ) -> Result<Map<String, Value>> {
     let path = path.display();
     let invalid = |what: &str| fail(format!("{what}: {path}"));
-    let mut expected: BTreeSet<&str> = COMMON_FIELDS.into_iter().collect();
-    expected.extend(if schema == SESSION_V2 {
-        &V2_FIELDS[..]
-    } else {
-        &V3_FIELDS[..]
-    });
-    if document.keys().map(String::as_str).collect::<BTreeSet<_>>() != expected {
+    let expected = expected_fields(schema);
+    // Launch intent and session state each have one place in a row: a launch field, a flat
+    // projection of one, or the other schema's session fields at the top is a second authority,
+    // not a key a newer agentctl added.
+    let second_authority = |key: &str| {
+        !expected.contains(key)
+            && (LAUNCH_FIELDS.contains(&key)
+                || matches!(key, "permission_mode" | "arguments")
+                || V2_FIELDS.contains(&key)
+                || V3_FIELDS.contains(&key))
+    };
+    if !expected.iter().all(|key| document.contains_key(*key))
+        || document.keys().any(|key| second_authority(key))
+    {
         return Err(fail(format!(
             "invalid agent record {schema} fields: {path}"
         )));
@@ -198,7 +273,7 @@ fn normalize(
         Some(value) if LAUNCH_SCHEMAS.contains(&value) => {}
         _ => return Err(invalid("invalid agent record launch schema")),
     }
-    if launch.keys().map(String::as_str).collect::<BTreeSet<_>>() != launch_fields {
+    if !launch_fields.iter().all(|key| launch.contains_key(*key)) {
         return Err(invalid("invalid agent record launch fields"));
     }
     let lifecycle = document.get("lifecycle").and_then(Value::as_str);
@@ -263,8 +338,7 @@ fn normalize(
     let executable = field("executable");
     if !executable.is_null()
         && !executable.as_object().is_some_and(|identity| {
-            identity.keys().map(String::as_str).collect::<BTreeSet<_>>()
-                == BTreeSet::from(["path", "device", "inode"])
+            has_fields(identity, &["path", "device", "inode"])
                 && identity.get("path").is_some_and(absolute)
                 && ["device", "inode"].iter().all(|key| {
                     identity
@@ -322,13 +396,16 @@ fn normalize(
     if !extensions_valid {
         return Err(invalid("invalid agent record extensions"));
     }
+    // Keys a newer agentctl added stay out of the flat record: they must not pass for flat
+    // fields of the same name. The nested record writes them back.
     let mut normalized: Map<String, Value> = document
         .iter()
         .filter(|(key, _)| {
-            !matches!(
-                key.as_str(),
-                "schema" | "launch" | "extensions" | "native_session"
-            )
+            expected.contains(key.as_str())
+                && !matches!(
+                    key.as_str(),
+                    "schema" | "launch" | "extensions" | "native_session"
+                )
         })
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
@@ -359,8 +436,7 @@ fn normalize(
                 }
             }
             Value::Object(native)
-                if native.keys().map(String::as_str).collect::<BTreeSet<_>>()
-                    == BTreeSet::from(["schema", "agent", "value", "source"])
+                if has_fields(native, &NATIVE_FIELDS)
                     && native.get("schema").and_then(Value::as_str)
                         == Some("agentctl-native-session/v1")
                     && matches!(
@@ -384,8 +460,7 @@ fn normalize(
             .get("goal")
             .and_then(Value::as_object)
             .filter(|goal| {
-                goal.keys().map(String::as_str).collect::<BTreeSet<_>>()
-                    == BTreeSet::from(["schema", "objective", "message_id", "native_command"])
+                has_fields(goal, &GOAL_FIELDS)
                     && goal.get("schema").and_then(Value::as_str) == Some("agentctl-goal/v1")
             });
         let Some(goal) = goal else {
@@ -515,16 +590,30 @@ impl NestedRecord {
                     "source": self.session_source.as_deref().unwrap_or("observed"),
                 })
             });
-            fields.insert("native_session".to_owned(), json!(native));
-            fields.insert(
-                "goal".to_owned(),
-                json!({
-                    "schema": "agentctl-goal/v1",
-                    "objective": record.goal,
-                    "message_id": record.goal_message_id,
-                    "native_command": record.goal_command,
-                }),
+            let mut native = json!(native);
+            keep_unknown(
+                &mut native,
+                self.native_read.as_ref(),
+                &NATIVE_FIELDS,
+                &NATIVE_FIELDS,
             );
+            fields.insert("native_session".to_owned(), native);
+            let mut goal = json!({
+                "schema": "agentctl-goal/v1",
+                "objective": record.goal,
+                "message_id": record.goal_message_id,
+                "native_command": record.goal_command,
+            });
+            keep_unknown(
+                &mut goal,
+                self.goal_read.as_ref(),
+                &GOAL_FIELDS,
+                &GOAL_FIELDS,
+            );
+            fields.insert("goal".to_owned(), goal);
+        }
+        for (key, value) in &self.unknown {
+            fields.entry(key.clone()).or_insert_with(|| value.clone());
         }
         Ok(sorted(document))
     }
@@ -591,6 +680,8 @@ impl AgentRecord {
     /// Turn a nested record into flat schema 1, returning the schema it had. An asserted
     /// session stays asserted: it moves to `goal_session_id` and never becomes observed.
     pub(super) fn migrate_nested_to_flat(&mut self) -> Option<String> {
+        // Keys a newer agentctl added to the nested row describe that row's schema, and a flat
+        // record may know the same name as one of its own fields, so they are not carried over.
         let nested = self.nested.take()?;
         if nested.session_source.as_deref() == Some("asserted") {
             self.goal_session_id = self.session_value.take().or(self.goal_session_id.take());

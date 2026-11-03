@@ -307,15 +307,23 @@ fn v2_bind_session_keeps_only_the_asserted_goal_session() {
 
 #[test]
 fn nested_launch_rejects_duplicate_flat_authority() {
-    let fixture = Fixture::new();
-    let mut nested = started_nested(&fixture);
-    nested["harness"] = json!("claude");
-    store(&fixture, &nested);
-    let error = fixture.manager().read_record("worker").unwrap_err();
-    assert!(
-        error.to_string().contains("agentctl-session/v2 fields"),
-        "{error}"
-    );
+    // A key a newer agentctl added is kept (#813), but a second launch or session authority
+    // never is.
+    for (key, value) in [
+        ("harness", json!("claude")),
+        ("arguments", json!(["--x"])),
+        ("native_session", Value::Null),
+    ] {
+        let fixture = Fixture::new();
+        let mut nested = started_nested(&fixture);
+        nested[key] = value;
+        store(&fixture, &nested);
+        let error = fixture.manager().read_record("worker").unwrap_err();
+        assert!(
+            error.to_string().contains("agentctl-session/v2 fields"),
+            "{key}: {error}"
+        );
+    }
 }
 
 /// One malformed nested row: the words its refusal contains and how the row is changed.
@@ -688,4 +696,85 @@ fn a_record_keeps_any_well_formed_effective_effort() {
             "{malformed:?}"
         );
     }
+}
+
+#[test]
+fn keys_a_newer_agentctl_added_to_a_v2_row_are_read_around_and_kept() {
+    // #813 agent-record-schema-forward-compat: at the top (even one named like a flat field),
+    // in the launch specification and in its executable identity.
+    let fixture = Fixture::new();
+    let mut nested = started_nested(&fixture);
+    nested["future_row_field"] = json!({"from": "a newer agentctl"});
+    nested["slot"] = json!("not-a-flat-slot-here");
+    nested["launch"]["future_launch_field"] = json!([1, 2]);
+    nested["launch"]["argv"][0] = json!("/opt/codex/bin/codex");
+    nested["launch"]["executable"] = json!({
+        "path": "/opt/codex/bin/codex", "device": 7, "inode": 9, "future_identity_field": true
+    });
+    store(&fixture, &nested);
+
+    let record = fixture.manager().read_record("worker").unwrap();
+    assert_eq!(
+        record.slot, None,
+        "an unknown nested key is not a flat field"
+    );
+    assert!(
+        !record.extra.contains_key("future_row_field") && !record.extra.contains_key("slot"),
+        "{:?}",
+        record.extra
+    );
+    fixture.manager().pause("worker", true).unwrap();
+    let mut expected = nested;
+    expected["paused"] = json!(true);
+    assert_eq!(stored(&fixture), expected);
+
+    // anchor migrates the row to schema 1; the nested row's unknown keys are not carried over,
+    // and the one named like a flat field never becomes that field.
+    fixture.manager().pause("worker", false).unwrap();
+    let anchored = fixture.manager().anchor("worker", false, None).unwrap();
+    assert_eq!(anchored["migrated_from"], "agentctl-session/v2");
+    let flat = stored(&fixture);
+    assert_eq!(flat["schema"], 1);
+    assert!(flat.get("future_row_field").is_none(), "{flat}");
+    assert_eq!(
+        flat.get("slot").unwrap_or(&Value::Null),
+        &Value::Null,
+        "{flat}"
+    );
+}
+
+#[test]
+fn keys_a_newer_agentctl_added_to_v3_objects_survive_until_the_object_is_replaced() {
+    let fixture = Fixture::new();
+    fixture.start(None);
+    let mut nested = as_v3(
+        nested_v2_record(&stored(&fixture)),
+        json!({
+            "schema": "agentctl-native-session/v1",
+            "agent": "codex",
+            "value": "first-session",
+            "source": "asserted",
+            "observed_at": "2026-11-03T10:00:00Z",
+        }),
+    );
+    nested["goal"]["future_goal_field"] = json!("kept");
+    store(&fixture, &nested);
+    fixture
+        .client
+        .report_session
+        .store(false, Ordering::Relaxed);
+
+    let record = fixture.manager().read_record("worker").unwrap();
+    assert_eq!(record.document().unwrap(), nested);
+    fixture.manager().pause("worker", true).unwrap();
+    assert_eq!(stored(&fixture)["native_session"], nested["native_session"]);
+    assert_eq!(stored(&fixture)["goal"], nested["goal"]);
+
+    // A new session is a new object: what a newer build said of the old one goes with it.
+    let mut record = fixture.manager().read_record("worker").unwrap();
+    record.bind_asserted_session("second-session");
+    let rewritten = record.document().unwrap();
+    assert_eq!(rewritten["native_session"]["value"], "second-session");
+    assert!(rewritten["native_session"].get("observed_at").is_none());
+    assert_eq!(rewritten["goal"]["future_goal_field"], "kept");
 }

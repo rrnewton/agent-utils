@@ -8,8 +8,10 @@
 //! replaced by an explicit resume, so a profile edited after launch does not change what a
 //! revived agent runs.
 //!
-//! The spec lives in the record under `launch_spec`. Both editions validate the same strict
-//! shape and preserve the key through every lifecycle operation.
+//! The spec lives in the record under `launch_spec`. Both editions validate the same shape and
+//! preserve the key through every lifecycle operation. A key a newer agentctl added to the spec
+//! or to its `native_session` is read around and kept, since the spec is stored as written
+//! (#813 agent-record-schema-forward-compat); a replay uses the fields this build knows.
 
 use super::*;
 
@@ -80,13 +82,14 @@ fn kind(value: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
 }
 
-/// Prove the spec's exact shape for a record of `harness`, or refuse.
+/// Prove the spec's shape for a record of `harness`, or refuse. Keys beyond the known ones are
+/// allowed and kept.
 pub(super) fn validate(value: &Value, harness: &str, label: &str) -> Result<()> {
     let refuse = |detail: &str| fail(format!("invalid launch spec ({detail}) in {label}"));
     let Some(spec) = value.as_object() else {
         return Err(refuse("fields"));
     };
-    if spec.len() != KEYS.len() || KEYS.iter().any(|key| !spec.contains_key(*key)) {
+    if KEYS.iter().any(|key| !spec.contains_key(*key)) {
         return Err(refuse("fields"));
     }
     if spec["schema"] != SCHEMA
@@ -169,8 +172,7 @@ pub(super) fn validate(value: &Value, harness: &str, label: &str) -> Result<()> 
     let native = &spec["native_session"];
     if !native.is_null() {
         let valid = native.as_object().is_some_and(|object| {
-            object.len() == 3
-                && object.get("agent").and_then(Value::as_str) == Some(harness)
+            object.get("agent").and_then(Value::as_str) == Some(harness)
                 && object.get("value").is_some_and(text)
                 && object
                     .get("source")
@@ -415,7 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn specs_are_strict_and_bounded() {
+    fn specs_are_checked_and_bounded() {
         let argv = strings(&["--model", "m"]);
         let names = strings(&["B", "A", "A"]);
         let spec = build(SpecFields {
@@ -457,9 +459,14 @@ mod tests {
                 "accepted {key}"
             );
         }
+        // Keys a newer agentctl added are allowed (#813); a missing known key is not.
         let mut extra = spec.clone();
         extra["unexpected"] = json!(true);
-        assert!(validate(&extra, "codex", "test").is_err());
+        extra["native_session"]["unexpected"] = json!(true);
+        validate(&extra, "codex", "test").unwrap();
+        let mut missing = spec.clone();
+        missing.as_object_mut().unwrap().remove("workspace_label");
+        assert!(validate(&missing, "codex", "test").is_err());
         let long = vec!["x".repeat(MAX_ARGUMENT_BYTES + 1)];
         assert!(!bounded_arguments(&long));
         assert!(program_matches(

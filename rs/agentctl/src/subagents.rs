@@ -657,14 +657,15 @@ struct RenameJournal {
 }
 
 impl RenameJournal {
-    /// Validate one rename journal written by either edition.
+    /// Validate one rename journal written by either edition. A key a newer agentctl added is
+    /// ignored (#813 agent-record-schema-forward-compat): a journal is written once, finished
+    /// with the fields this build knows, and removed, never rewritten.
     fn parse(value: &Value, path: &Path) -> Result<Self> {
         let invalid = || fail(format!("invalid rename journal: {}", path.display()));
         let object = value.as_object().ok_or_else(invalid)?;
-        if object.len() != RENAME_JOURNAL_KEYS.len()
-            || RENAME_JOURNAL_KEYS
-                .iter()
-                .any(|key| !object.contains_key(*key))
+        if RENAME_JOURNAL_KEYS
+            .iter()
+            .any(|key| !object.contains_key(*key))
         {
             return Err(invalid());
         }

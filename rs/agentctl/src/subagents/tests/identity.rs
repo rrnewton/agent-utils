@@ -991,8 +991,12 @@ fn rename_journals_validate_like_the_python_edition() {
     });
     let journal = RenameJournal::parse(&valid, path).unwrap();
     assert_eq!(journal.document(), valid);
+    // A key a newer agentctl added is ignored (#813): the journal is read, and finishing it
+    // uses the fields this build knows.
+    let mut newer = valid.clone();
+    newer["future_field"] = json!({"also": "rename this"});
+    assert_eq!(RenameJournal::parse(&newer, path).unwrap(), journal);
     let mutations: Vec<(&str, Option<Value>)> = vec![
-        ("extra", Some(json!(1))),
         ("terminal_id", None),
         ("schema", Some(json!("agentctl-rename/v2"))),
         ("token", Some(json!("other-token"))),

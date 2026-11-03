@@ -9,7 +9,9 @@ replays it with the conversation selector replaced by an explicit resume, so a c
 to a profile after launch does not change what a revived agent runs.
 
 The spec lives in the record under ``launch_spec``. Both editions validate the same
-strict shape and preserve the key through every lifecycle operation.
+shape and preserve the key through every lifecycle operation. A key a newer agentctl
+added to the spec or its native session is read around and kept (#813
+agent-record-schema-forward-compat); a replay uses the fields this build knows.
 """
 from __future__ import annotations
 
@@ -66,11 +68,15 @@ def _bounded_arguments(argv: object) -> bool:
 
 
 def validate(value: object, *, harness: str, label: str) -> dict[str, object]:
-    """Return the spec unchanged after proving its exact shape, or refuse."""
+    """Return the spec unchanged after proving its shape, or refuse.
+
+    Keys a newer agentctl added to the spec or its native session are allowed and kept, since
+    the spec is stored as written (#813 agent-record-schema-forward-compat).
+    """
     def refuse(detail: str) -> AgentDeliveryError:
         return AgentDeliveryError(f"invalid launch spec ({detail}) in {label}")
 
-    if not isinstance(value, dict) or set(value) != _KEYS:
+    if not isinstance(value, dict) or not _KEYS <= set(value):
         raise refuse("fields")
     spec = cast(dict[str, object], value)
     captured = spec["captured_at"]
@@ -111,7 +117,7 @@ def validate(value: object, *, harness: str, label: str) -> dict[str, object]:
         raise refuse("workspace label")
     native = spec["native_session"]
     if native is not None:
-        if (not isinstance(native, dict) or set(native) != {"agent", "value", "source"}
+        if (not isinstance(native, dict) or not {"agent", "value", "source"} <= set(native)
                 or native.get("agent") != harness or not _text(native.get("value"))
                 or native.get("source") not in NATIVE_SOURCES):
             raise refuse("native session")

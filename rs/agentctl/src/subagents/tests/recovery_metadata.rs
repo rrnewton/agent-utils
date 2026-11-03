@@ -606,6 +606,27 @@ fn nested_keys_a_newer_agentctl_added_survive_a_rewrite() {
     assert_eq!(rewritten["native_session"]["future"], json!(1));
 }
 
+/// #813 agent-record-schema-forward-compat: the launch spec (`agentctl-launch-spec/v1`) and its
+/// native session keep keys a newer agentctl added through a rewrite.
+#[test]
+fn launch_spec_keys_a_newer_agentctl_added_survive_a_rewrite() {
+    let fixture = Fixture::new();
+    fixture.start(None);
+    let path = fixture.root.join("registry/agents/worker/agent.json");
+    let mut document = agent::read_private_json(&path).unwrap();
+    assert!(document["launch_spec"].is_object(), "{document}");
+    document["launch_spec"]["future_spec_field"] = json!({"replay": "hint"});
+    if document["launch_spec"]["native_session"].is_object() {
+        document["launch_spec"]["native_session"]["future_native_field"] = json!(2);
+    }
+    agent::atomic_json(&path, &document).unwrap();
+    let manager = fixture.manager();
+    let record = manager.load("worker").expect("a newer launch spec loads");
+    manager.save(&record).expect("rewrite");
+    let rewritten = agent::read_private_json(&path).unwrap();
+    assert_eq!(rewritten["launch_spec"], document["launch_spec"]);
+}
+
 #[test]
 fn malformed_or_conflicting_recovery_metadata_is_rejected() {
     let fixture = Fixture::new();

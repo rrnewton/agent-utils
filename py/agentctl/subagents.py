@@ -142,11 +142,58 @@ def _capture_native_session(record: AgentRecord, info: AgentPaneInfo) -> None:
         record.native_session = _native_session(provider, info.session_value, "observed")
 
 
+_NESTED_COMMON_FIELDS = frozenset({
+    "schema", "name", "token", "created_at", "lifecycle", "launch",
+    "workspace_id", "tab_id", "pane_id", "startup_warning",
+    "effective_reasoning_effort", "error", "paused",
+    "pane_reported_by_agentctl", "foreign_shell_identity",
+    "runner_identity", "extensions",
+})
+_NESTED_V2_FIELDS = frozenset({
+    "session_agent", "session_value", "goal", "goal_delivery",
+    "goal_session_id", "goal_command", "goal_messages",
+    "goal_message_id", "custom_process_identity",
+})
+_NESTED_V3_FIELDS = frozenset({"native_session", "goal", "custom_process_identity"})
+_NESTED_LAUNCH_FIELDS = frozenset({
+    "schema", "harness", "cwd", "adapter", "mode", "backend",
+    "model", "resume", "profile", "argv", "environment_names",
+    "runtime_home", "runtime_ownership", "executable",
+})
+_NATIVE_FIELDS = frozenset({"schema", "agent", "value", "source"})
+_GOAL_FIELDS = frozenset({"schema", "objective", "message_id", "native_command"})
+
+
+def _nested_expected(schema: object) -> frozenset[str]:
+    """Every key a nested row of ``schema`` must carry."""
+    return _NESTED_COMMON_FIELDS | (
+        _NESTED_V2_FIELDS if schema == "agentctl-session/v2" else _NESTED_V3_FIELDS
+    )
+
+
+def _keep_unknown(
+    written: dict[str, object] | None, read: object, fields: frozenset[str],
+) -> dict[str, object] | None:
+    """``written`` plus ``read``'s keys beyond ``fields``, when every field is unchanged."""
+    if written is None or not isinstance(read, dict):
+        return written
+    if any(read.get(key) != written.get(key) for key in fields):
+        return written
+    for key, value in read.items():
+        if key not in fields:
+            written.setdefault(key, copy.deepcopy(value))
+    return written
+
+
 def _validate_rename_journal(value: object, path: Path) -> dict[str, object]:
-    """Validate one rename journal written by either edition."""
+    """Validate one rename journal written by either edition.
+
+    A key a newer agentctl added is ignored (#813 agent-record-schema-forward-compat): a journal
+    is written once, finished with the fields this build knows, and removed, never rewritten.
+    """
     keys = {"schema", "token", "old", "new", "adapter", "pane_id", "tab_id",
             "terminal_id", "workspace_id", "journal_id", "started_at"}
-    if not isinstance(value, dict) or set(value) != keys:
+    if not isinstance(value, dict) or not keys <= set(value):
         raise AgentDeliveryError(f"invalid rename journal: {path}")
     journal = cast(dict[str, object], value)
     started = journal["started_at"]
@@ -509,7 +556,7 @@ class AgentRecord:
                 "custom_process_identity": custom_identity,
             })
         else:
-            document["native_session"] = (
+            native: dict[str, object] | None = (
                 None if self.session_value is None else {
                     "schema": "agentctl-native-session/v1",
                     "agent": self.session_agent or self.harness,
@@ -517,12 +564,20 @@ class AgentRecord:
                     "source": self._session_source or "observed",
                 }
             )
-            document["goal"] = {
+            goal: dict[str, object] = {
                 "schema": "agentctl-goal/v1",
                 "objective": self.goal,
                 "message_id": self.goal_message_id,
                 "native_command": self.goal_command,
             }
+            # Keys a newer agentctl added to these objects stay while the object's own fields
+            # are unchanged; a new session or goal drops them (#813).
+            document["native_session"] = _keep_unknown(
+                native, self._nested_storage.get("native_session"), _NATIVE_FIELDS,
+            )
+            document["goal"] = _keep_unknown(
+                goal, self._nested_storage.get("goal"), _GOAL_FIELDS,
+            )
             document["custom_process_identity"] = custom_identity
         return document
 
@@ -728,40 +783,33 @@ class AgentRecord:
     def _normalize_nested_storage(
         cls, document: dict[str, object], path: Path,
     ) -> dict[str, object]:
-        """Decode v2/v3 rows at the boundary while leaving launch data canonical."""
+        """Decode v2/v3 rows at the boundary while leaving launch data canonical.
+
+        A key a newer agentctl added (#813 agent-record-schema-forward-compat) is read around:
+        it stays out of the flat record and is written back from the nested storage. A second
+        launch or session authority at the top is refused, never kept.
+        """
         schema = document.get("schema")
-        common = {
-            "schema", "name", "token", "created_at", "lifecycle", "launch",
-            "workspace_id", "tab_id", "pane_id", "startup_warning",
-            "effective_reasoning_effort", "error", "paused",
-            "pane_reported_by_agentctl", "foreign_shell_identity",
-            "runner_identity", "extensions",
+        expected = _nested_expected(schema)
+        second_authority = {
+            key for key in document
+            if key not in expected and key in (
+                _NESTED_LAUNCH_FIELDS | {"permission_mode", "arguments"}
+                | _NESTED_V2_FIELDS | _NESTED_V3_FIELDS
+            )
         }
-        expected = (
-            common | {
-                "session_agent", "session_value", "goal", "goal_delivery",
-                "goal_session_id", "goal_command", "goal_messages",
-                "goal_message_id", "custom_process_identity",
-            }
-            if schema == "agentctl-session/v2"
-            else common | {"native_session", "goal", "custom_process_identity"}
-        )
-        if set(document) != expected:
+        if not expected <= set(document) or second_authority:
             raise AgentDeliveryError(f"invalid agent record {schema} fields: {path}")
         launch_value = document.get("launch")
         if not isinstance(launch_value, dict):
             raise AgentDeliveryError(f"invalid agent record launch specification: {path}")
         launch = cast(dict[str, object], launch_value)
-        launch_fields = {
-            "schema", "harness", "cwd", "adapter", "mode", "backend",
-            "model", "resume", "profile", "argv", "environment_names",
-            "runtime_home", "runtime_ownership", "executable",
-        }
+        launch_fields = set(_NESTED_LAUNCH_FIELDS)
         if launch.get("schema") == "agentctl-launch/v2":
             launch_fields.add("permission_mode")
         elif launch.get("schema") not in _NESTED_LAUNCH_SCHEMAS:
             raise AgentDeliveryError(f"invalid agent record launch schema: {path}")
-        if set(launch) != launch_fields:
+        if not launch_fields <= set(launch):
             raise AgentDeliveryError(f"invalid agent record launch fields: {path}")
         lifecycle = document.get("lifecycle")
         if lifecycle not in {
@@ -815,7 +863,7 @@ class AgentRecord:
         executable = launch.get("executable")
         if executable is not None and (
             not isinstance(executable, dict)
-            or set(executable) != {"path", "device", "inode"}
+            or not {"path", "device", "inode"} <= set(executable)
             or not isinstance(executable.get("path"), str)
             or not os.path.isabs(cast(str, executable["path"]))
             or any(not isinstance(executable.get(key), int)
@@ -867,7 +915,8 @@ class AgentRecord:
             raise AgentDeliveryError(f"invalid agent record extensions: {path}")
         normalized = {
             key: value for key, value in document.items()
-            if key not in {"schema", "launch", "extensions", "native_session"}
+            if key in expected
+            and key not in {"schema", "launch", "extensions", "native_session"}
         }
         normalized.update({
             "schema": 1,
@@ -892,7 +941,7 @@ class AgentRecord:
                     "goal_session_id": None,
                 })
             elif (isinstance(native, dict)
-                    and set(native) == {"schema", "agent", "value", "source"}
+                    and _NATIVE_FIELDS <= set(native)
                     and native.get("schema") == "agentctl-native-session/v1"
                     and native.get("source") in ("observed", "asserted")
                     and native.get("agent") == harness
@@ -908,9 +957,7 @@ class AgentRecord:
                 raise AgentDeliveryError(f"invalid agent record native session: {path}")
             goal = document.get("goal")
             if (not isinstance(goal, dict)
-                    or set(goal) != {
-                        "schema", "objective", "message_id", "native_command",
-                    }
+                    or not _GOAL_FIELDS <= set(goal)
                     or goal.get("schema") != "agentctl-goal/v1"):
                 raise AgentDeliveryError(f"invalid agent record goal state: {path}")
             normalized.update({
@@ -5771,6 +5818,8 @@ class ManagedAgents:
                 if record._nested_storage is not None:
                     # Anchors live only in flat schema-1 records, so the record is rewritten
                     # in that format. An asserted session must not become an observed one.
+                    # Keys a newer agentctl added to the nested row describe that schema, and the
+                    # flat record may know the same name, so they are not carried over (#813).
                     migrated_from = record._nested_storage.get("schema")
                     if record._session_source == "asserted":
                         record.goal_session_id = record.session_value or record.goal_session_id

@@ -1,6 +1,7 @@
 """Lifecycle regressions for visible subagents, including failures and ownership changes."""
 from __future__ import annotations
 
+import copy
 import json
 import re
 from collections.abc import Callable
@@ -1094,17 +1095,97 @@ def test_v3_bind_session_persists_one_asserted_native_authority(
     assert reloaded.target().session_value is None
 
 
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [("harness", "claude"), ("arguments", ["--x"]), ("native_session", None)],
+)
 def test_nested_launch_rejects_duplicate_flat_authority(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, key: str, value: object,
 ) -> None:
+    # A key a newer agentctl added is kept (#813), but a second launch or session authority
+    # never is.
     manager, _fake = setup(tmp_path, monkeypatch)
     manager.start("worker", cwd=str(tmp_path), harness="codex")
     path = manager.registry / "agents" / "worker" / "agent.json"
     nested = _nested_v2_record(json.loads(path.read_text(encoding="utf-8")))
-    nested["harness"] = "claude"
+    nested[key] = value
     path.write_text(json.dumps(nested), encoding="utf-8")
     with pytest.raises(AgentDeliveryError, match="agentctl-session/v2 fields"):
         manager.get("worker")
+
+
+def test_keys_a_newer_agentctl_added_to_a_v2_row_are_read_around_and_kept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #813 agent-record-schema-forward-compat: at the top (even one named like a flat field),
+    # in the launch specification and in its executable identity.
+    manager, _fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="codex")
+    path = manager.registry / "agents" / "worker" / "agent.json"
+    nested = _nested_v2_record(json.loads(path.read_text(encoding="utf-8")))
+    nested["future_row_field"] = {"from": "a newer agentctl"}
+    nested["slot"] = "not-a-flat-slot-here"
+    launch = cast(dict[str, object], nested["launch"])
+    launch["future_launch_field"] = [1, 2]
+    cast(list[object], launch["argv"])[0] = "/opt/codex/bin/codex"
+    launch["executable"] = {
+        "path": "/opt/codex/bin/codex", "device": 7, "inode": 9, "future_identity_field": True,
+    }
+    path.write_text(json.dumps(nested), encoding="utf-8")
+
+    record = manager.get("worker")
+    assert record.slot is None, "an unknown nested key is not a flat field"
+    assert "future_row_field" not in record._unknown and "slot" not in record._unknown
+    manager.pause("worker", paused=True)
+    expected = copy.deepcopy(nested)
+    expected["paused"] = True
+    assert json.loads(path.read_text(encoding="utf-8")) == expected
+
+    manager.pause("worker", paused=False)
+    anchored = manager.anchor("worker")
+    assert anchored["migrated_from"] == "agentctl-session/v2"
+    # anchor migrates the row to schema 1; the nested row's unknown keys are not carried over,
+    # and the one named like a flat field never becomes that field.
+    flat = json.loads(path.read_text(encoding="utf-8"))
+    assert flat["schema"] == 1
+    assert "future_row_field" not in flat
+    assert flat.get("slot") is None
+
+
+def test_keys_a_newer_agentctl_added_to_v3_objects_survive_until_the_object_is_replaced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="codex")
+    path = manager.registry / "agents" / "worker" / "agent.json"
+    nested = _nested_v2_record(json.loads(path.read_text(encoding="utf-8")))
+    nested["schema"] = "agentctl-session/v3"
+    nested.pop("session_agent")
+    nested.pop("session_value")
+    nested["native_session"] = {
+        "schema": "agentctl-native-session/v1", "agent": "codex", "value": "first-session",
+        "source": "asserted", "observed_at": "2026-11-03T10:00:00Z",
+    }
+    nested["goal"] = {
+        "schema": "agentctl-goal/v1", "objective": nested.pop("goal"),
+        "message_id": nested.pop("goal_message_id"),
+        "native_command": nested.pop("goal_command"), "future_goal_field": "kept",
+    }
+    for key in ("goal_delivery", "goal_session_id", "goal_messages"):
+        nested.pop(key)
+    path.write_text(json.dumps(nested), encoding="utf-8")
+
+    record = manager.get("worker")
+    assert record.to_document() == nested
+    # A new session is a new object: what a newer build said of the old one goes with it.
+    record.session_agent = "codex"
+    record.session_value = "second-session"
+    record.goal_session_id = "second-session"
+    rewritten = record.to_document()
+    native = cast(dict[str, object], rewritten["native_session"])
+    assert native["value"] == "second-session"
+    assert "observed_at" not in native
+    assert cast(dict[str, object], rewritten["goal"])["future_goal_field"] == "kept"
 
 
 @pytest.mark.parametrize(

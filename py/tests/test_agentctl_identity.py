@@ -1308,3 +1308,21 @@ def test_nested_keys_a_newer_agentctl_added_survive_a_rewrite(
     manager._save(manager.get("worker"))
     rewritten = json.loads(record_path.read_text(encoding="utf-8"))
     assert rewritten["name_history"][0]["future"] == {"on": True}
+
+
+def test_a_rename_journal_from_a_newer_agentctl_is_read_around_its_new_keys() -> None:
+    # #813 agent-record-schema-forward-compat: a journal is written once, finished with the
+    # fields this build knows, and removed, so a key a newer build added is ignored.
+    path = Path("/registry/.renames/123-4.json")
+    valid = {
+        "schema": "agentctl-rename/v1", "token": "123-4", "old": "worker", "new": "reviewer",
+        "adapter": "herdr", "pane_id": "w1:p1", "tab_id": "w1:t1", "terminal_id": None,
+        "workspace_id": "w1", "journal_id": "0123456789abcdef0123456789abcdef",
+        "started_at": 1_760_000_000.25,
+    }
+    newer = dict(valid, future_field={"also": "this"})
+    assert subagents._validate_rename_journal(newer, path)["new"] == "reviewer"
+    missing = dict(valid)
+    missing.pop("terminal_id")
+    with pytest.raises(AgentDeliveryError, match="invalid rename journal"):
+        subagents._validate_rename_journal(missing, path)

@@ -191,8 +191,8 @@ _REFUSALS: tuple[tuple[str, str, Callable[[dict[str, object]], object]], ...] = 
     ("missing-field", _V2, lambda row: row.pop("extensions")),
     ("launch-not-object", _V2, lambda row: row.update(launch=[])),
     ("launch-schema", _V2, lambda row: _launch(row).update(schema="agentctl-launch/v9")),
-    ("launch-extra-field", _V2, lambda row: _launch(row).update(extra=None)),
-    ("v1-permission-mode", _V2, lambda row: _launch(row).update(permission_mode=None)),
+    ("v2-flat-argument-authority", _V2, lambda row: row.update(arguments=["--x"])),
+    ("v3-flat-session-authority", _V3, lambda row: row.update(session_value="session-1")),
     ("v2-permission-mode", _V2, lambda row: _launch(row).update(
         schema="agentctl-launch/v2", permission_mode="bypass")),
     ("lifecycle", _V2, lambda row: row.update(lifecycle="banana")),
@@ -294,8 +294,40 @@ def _rows(harness: Harness, report: Report) -> None:
     _retire_fixture_processes(case)
 
 
+#: Keys a newer agentctl might add to a v3 row (#813 agent-record-schema-forward-compat).
+_FUTURE = {"future_row_field": {"from": "a newer agentctl"}}
+
+
+def _with_future_keys(root: Path) -> dict[str, object]:
+    row = _fixture(root, _V3, native_session=dict(
+        _native("session-1", "observed"), observed_at="2026-11-03T10:00:00Z"))
+    row.update(copy.deepcopy(_FUTURE))
+    _launch(row)["future_launch_field"] = [1, 2]
+    cast(dict[str, object], row["goal"])["future_goal_field"] = "kept"
+    return row
+
+
+def _future_keys(harness: Harness, report: Report) -> None:
+    """Both editions read a v3 row with keys a newer agentctl added and keep them alike."""
+    label = "nested/future-keys"
+    case = _started(harness, report, label)
+    if case is None:
+        return
+    _write(case, _with_future_keys)
+    _pair(harness, report, case, label + "/status", ("status", "worker", *_COMMON))
+    _pair(harness, report, case, label + "/pause", ("pause", "worker", *_COMMON))
+    _same_rows(report, case, label + "/pause-written-back", lambda row: (
+        row.get("paused") is True
+        and row.get("future_row_field") == _FUTURE["future_row_field"]
+        and _launch(row).get("future_launch_field") == [1, 2]
+        and _row(row.get("native_session")).get("observed_at") == "2026-11-03T10:00:00Z"
+        and _row(row.get("goal")).get("future_goal_field") == "kept"))
+    _retire_fixture_processes(case)
+
+
 def nested_records(harness: Harness, report: Report) -> None:
     """Both editions read, write back and anchor the same v2/v3 rows identically."""
+    _future_keys(harness, report)
     _v2_observed(harness, report)
     _v3_asserted(harness, report)
     _rows(harness, report)

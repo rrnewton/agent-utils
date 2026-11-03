@@ -208,6 +208,30 @@ def test_record_with_a_malformed_spec_is_refused(tmp_path: Path, monkeypatch: py
         manager.get("worker")
 
 
+def test_launch_spec_keys_a_newer_agentctl_added_survive_a_rewrite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #813 agent-record-schema-forward-compat: the spec and its native session.
+    manager, _fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="codex")
+    path = manager._directory("worker") / "agent.json"
+    document = json.loads(path.read_text())
+    document["launch_spec"]["future_spec_field"] = {"replay": "hint"}
+    if isinstance(document["launch_spec"]["native_session"], dict):
+        document["launch_spec"]["native_session"]["future_native_field"] = 2
+    path.write_text(json.dumps(document))
+    manager.pause("worker", paused=True)
+    assert json.loads(path.read_text())["launch_spec"] == document["launch_spec"]
+    spec = dict(document["launch_spec"], native_session={
+        "agent": "codex", "value": "x", "source": "argv", "future": True,
+    })
+    assert launch_spec.validate(spec, harness="codex", label="test") == spec
+    missing = dict(spec)
+    missing.pop("workspace_label")
+    with pytest.raises(AgentDeliveryError, match=r"invalid launch spec \(fields\)"):
+        launch_spec.validate(missing, harness="codex", label="test")
+
+
 def test_wrkslots_comes_from_the_environment_then_project_configuration_then_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
