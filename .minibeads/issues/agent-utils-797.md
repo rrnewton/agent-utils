@@ -1,11 +1,12 @@
 ---
 title: 'wrkslots-audit-lock-free-planning: plan and measure caches outside the shared state lock'
-status: open
+status: closed
 priority: 2
-assignee: mu-rust@devbig030
 issue_type: feature
+assignee: mu-rust@devbig030
 created_at: 2026-11-02T23:54:46.248089304+00:00
-updated_at: 2026-11-02T23:54:46.248089304+00:00
+updated_at: 2026-11-03T08:38:47.359550453+00:00
+closed_at: 2026-11-03T08:38:47.359550272+00:00
 ---
 
 # Description
