@@ -300,6 +300,33 @@ impl Git {
             .collect())
     }
 
+    /// Conflict-marker lines in the files that differ between two commits,
+    /// as `path:line: text` at commit `to`. A committed merge-conflict
+    /// marker makes downstream files unparseable (a JSON DAG with markers
+    /// once reached main), so callers refuse before validating.
+    pub fn conflict_markers(&self, from: &str, to: &str) -> Result<Vec<String>, String> {
+        let files = self.diff_files(from, to)?;
+        if files.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut args: Vec<&str> = vec![
+            "grep",
+            "-n",
+            "-E",
+            "^<<<<<<< |^=======$|^>>>>>>> ",
+            to,
+            "--",
+        ];
+        args.extend(files.iter().map(String::as_str));
+        // git grep exits 1 when nothing matches: that is the clean case.
+        let output = self.output(self.command(&args), "git grep (conflict markers)", &[0, 1])?;
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect())
+    }
+
     /// Files that differ between two commits.
     pub fn diff_files(&self, from: &str, to: &str) -> Result<BTreeSet<String>, String> {
         Ok(self
@@ -722,6 +749,29 @@ mod unit {
             vec!["a.txt".to_owned()]
         );
         assert!(git.merge_conflicts(&a, &b).unwrap().is_empty());
+    }
+
+    #[test]
+    fn conflict_markers_reports_only_changed_files() {
+        let tmp = TempDir::new("git-markers");
+        let git = init(&tmp.0);
+        let base = git.rev_parse("main").unwrap();
+        let marked = branch(
+            &tmp.0,
+            "marked",
+            "main",
+            &[(
+                "dag.json",
+                "{\n<<<<<<< HEAD\n\"a\": 1944,\n=======\n\"a\": 1975,\n>>>>>>> other\n}\n",
+            )],
+        );
+        let markers = git.conflict_markers(&base, &marked).unwrap();
+        assert_eq!(markers.len(), 3, "got: {markers:?}");
+        assert!(markers.iter().all(|line| line.contains("dag.json")));
+        // A clean change reports nothing, and an unchanged marked file in
+        // the base is not re-reported for an unrelated change.
+        let clean = branch(&tmp.0, "clean", "main", &[("b.txt", "b\n")]);
+        assert!(git.conflict_markers(&base, &clean).unwrap().is_empty());
     }
 
     #[test]

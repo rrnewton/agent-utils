@@ -1198,6 +1198,18 @@ impl<'a> Runner<'a> {
             prefixes.push(tip.clone());
         }
         self.requeue(&held, "a dependency did not combine");
+        // Landing guard: a committed merge-conflict marker in the candidate
+        // makes downstream files unparseable (a marked-up JSON DAG once
+        // reached main through a landing that never parsed it). Refuse
+        // before any validation runs.
+        let markers = self.git.conflict_markers(parent, &tip)?;
+        if !markers.is_empty() {
+            return Err(format!(
+                "candidate {} contains conflict marker(s); refusing to validate: {}",
+                short(&tip),
+                markers.join("; ")
+            ));
+        }
         Ok((
             Candidate {
                 prs: kept,
