@@ -327,6 +327,34 @@ impl Git {
             .collect())
     }
 
+    /// Conflict-marker lines at any commit in `from..to`, restricted to the
+    /// machine-parsed files whose breakage is silent (`ci/dag/*.json`,
+    /// `Cargo.lock` at any depth). A tip can resolve markers an intermediate
+    /// commit introduced, but the intermediate commit still lands in
+    /// history and breaks bisection, so range history is guarded too.
+    /// Output lines carry the commit: `rev:path:line: text`.
+    pub fn conflict_markers_in_range(&self, from: &str, to: &str) -> Result<Vec<String>, String> {
+        let range = format!("{from}..{to}");
+        let commits: Vec<String> = self
+            .run(&["rev-list", &range])?
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect();
+        if commits.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut args: Vec<&str> = vec!["grep", "-n", "-E", "^<<<<<<< |^=======$|^>>>>>>> "];
+        args.extend(commits.iter().map(String::as_str));
+        args.extend(["--", "ci/dag/*.json", "Cargo.lock", ":(glob)**/Cargo.lock"]);
+        let output = self.output(self.command(&args), "git grep (range markers)", &[0, 1])?;
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect())
+    }
+
     /// Files that differ between two commits.
     pub fn diff_files(&self, from: &str, to: &str) -> Result<BTreeSet<String>, String> {
         Ok(self
@@ -772,6 +800,44 @@ mod unit {
         // the base is not re-reported for an unrelated change.
         let clean = branch(&tmp.0, "clean", "main", &[("b.txt", "b\n")]);
         assert!(git.conflict_markers(&base, &clean).unwrap().is_empty());
+    }
+
+    #[test]
+    fn conflict_markers_in_range_catches_resolved_intermediate() {
+        let tmp = TempDir::new("git-range-markers");
+        let git = init(&tmp.0);
+        write(&tmp.0, "ci/dag/validate.json", "{}\n");
+        git_add_commit(&tmp.0);
+        let base = git.rev_parse("main").unwrap();
+        let marked = branch(
+            &tmp.0,
+            "marked",
+            "main",
+            &[(
+                "ci/dag/validate.json",
+                "<<<<<<< HEAD\n\"a\": 1\n=======\n\"a\": 2\n>>>>>>> x\n",
+            )],
+        );
+        // A later commit resolves the markers; the tip is clean...
+        let fixed = branch(
+            &tmp.0,
+            "fixed",
+            &marked,
+            &[("ci/dag/validate.json", "{\"a\": 2}\n")],
+        );
+        assert!(git.conflict_markers(&base, &fixed).unwrap().is_empty());
+        // ...but the range still names the intermediate commit's markers.
+        let hits = git.conflict_markers_in_range(&base, &fixed).unwrap();
+        assert_eq!(hits.len(), 3, "got: {hits:?}");
+        assert!(hits
+            .iter()
+            .all(|line| line.contains("ci/dag/validate.json")));
+        // Non-guarded files are out of scope for the range check.
+        let other = branch(&tmp.0, "other", "main", &[("notes.txt", "<<<<<<< HEAD\n")]);
+        assert!(git
+            .conflict_markers_in_range(&base, &other)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

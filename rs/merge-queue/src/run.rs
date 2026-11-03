@@ -1210,6 +1210,16 @@ impl<'a> Runner<'a> {
                 markers.join("; ")
             ));
         }
+        // Intermediate commits land in history too: markers a later commit
+        // resolves still break bisection at that commit.
+        let history_markers = self.git.conflict_markers_in_range(parent, &tip)?;
+        if !history_markers.is_empty() {
+            return Err(format!(
+                "candidate {} range contains conflict marker(s) in an intermediate commit; refusing to validate: {}",
+                short(&tip),
+                history_markers.join("; ")
+            ));
+        }
         Ok((
             Candidate {
                 prs: kept,
