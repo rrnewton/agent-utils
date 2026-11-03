@@ -392,9 +392,11 @@ export interface ElementById {
   "read-speed-label": HTMLSpanElement;
   "read-speed-up": HTMLButtonElement;
   "read-steer": HTMLDivElement;
+  "read-steer-balance": HTMLSpanElement;
   "read-steer-count": HTMLSpanElement;
   "read-steer-grip": HTMLButtonElement;
   "read-steer-quote": HTMLButtonElement;
+  "read-steer-row": HTMLDivElement;
   "read-timeline": HTMLDivElement;
   "reading-full-group": HTMLElement;
   "reading-width": HTMLInputElement;

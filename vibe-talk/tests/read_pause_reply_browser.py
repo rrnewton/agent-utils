@@ -439,10 +439,36 @@ LIT_JS = """() => {
 STRIP_JS = """() => {
   const box = (id) => { const n = document.getElementById(id); if (!n || n.hidden || !n.getClientRects().length) return null;
     const r = n.getBoundingClientRect(); return {left: r.left, right: r.right, top: r.top, bottom: r.bottom, width: r.width, height: r.height}; };
-  return {strip: box('read-steer'), react: box('read-react'), count: box('read-steer-count'),
+  return {strip: box('read-steer'), row: box('read-steer-row'), balance: box('read-steer-balance'),
+          react: box('read-react'), count: box('read-steer-count'),
           arrows: ['read-section-prev', 'read-section-next', 'read-prev', 'read-next'].map(box), timeline: box('read-timeline'),
           width: document.documentElement.clientWidth};
 }"""
+
+
+def check_nav_row(desk: Desk, where: str, touch: bool) -> None:
+    """`#828 voice-page-read-nav-center`: the arrows' row is one line, "k of n" at its exact centre, two arrows a
+    side of it, React at the right and its balance, as wide, at the left; on a phone every target a thumb's."""
+    layout = desk.page.evaluate(STRIP_JS)
+    react, count, row, balance = layout["react"], layout["count"], layout["row"], layout["balance"]
+    arrows = [one for one in layout["arrows"] if one]
+    desk.check(isinstance(react, dict) and isinstance(count, dict) and isinstance(row, dict) and isinstance(balance, dict)
+               and len(arrows) == 4, f"{where}: the row lacks React, the count, the balance or an arrow: {layout}")
+    middles = [(one["top"] + one["bottom"]) / 2 for one in [*arrows, react, count]]
+    desk.check(max(middles) - min(middles) <= 4, f"{where}: the arrows' row is more than one line: {layout}")
+    off = (count["left"] + count["right"]) / 2 - (row["left"] + row["right"]) / 2
+    desk.check(abs(off) <= 2, f"{where}: the count stands {off:.1f}px off the row's centre: {layout}")
+    desk.check(abs(balance["width"] - react["width"]) <= 1, f"{where}: the balance is not as wide as React: {layout}")
+    lean = (count["left"] - arrows[0]["left"]) - (arrows[3]["right"] - count["right"])
+    desk.check(abs(lean) <= 2, f"{where}: the arrows lean {lean:.1f}px to one side of the count: {layout}")
+    desk.check(all(react["left"] >= one["right"] - 0.5 for one in arrows) and react["left"] >= count["right"] - 0.5,
+               f"{where}: React is not at the right of the arrows and the count: {layout}")
+    desk.check(arrows[0]["left"] - layout["strip"]["left"] >= react["width"],
+               f"{where}: the first arrow stands too near the row's left edge: {layout}")
+    desk.check(layout["strip"]["right"] <= layout["width"] + 0.5, f"{where}: the strip runs past the screen: {layout}")
+    if touch:
+        small = [one for one in [*arrows, react] if one["height"] < 48 or (one in arrows and one["width"] < 44)]
+        desk.check(not small, f"{where}: a phone's arrow or React is under its size: {small}")
 
 
 def react_walk(desk: Desk, api: VoicesApi, voice: str, touch: bool, recognition: bool) -> None:
@@ -472,8 +498,11 @@ def react_walk(desk: Desk, api: VoicesApi, voice: str, touch: bool, recognition:
                       " && document.getElementById('read-steer-count').textContent === '2 of 3'",
                       "react: the read never reached its second block", 10)
         wait_until(page, f"() => ({LIT_JS})() !== null", "react: no sentence is lit while the read plays")
-    desk.check(page.evaluate("() => document.getElementById('read-react').hidden") is True,
-               "react: React is offered while the read plays")
+    # `#828`: React is there while the read plays, and the row is centred with it.
+    desk.check(page.evaluate("() => { const n = document.getElementById('read-react'); return !n.hidden && !n.disabled"
+                             " && n.getClientRects().length > 0; }") is True, "react: React is not offered while the read plays: " + str(page.evaluate("() => { const s = document.getElementById('read-steer'); const n = document.getElementById('read-react'); return [s.hidden, s.getAttribute('data-react-only'), n.hidden, n.disabled, n.getClientRects().length, getComputedStyle(s).display]; }")))
+    if voice == "agent":
+        check_nav_row(desk, "react, playing", touch)
     press(page, "#read-aloud", touch)
     desk.settled()
     desk.check(label(page) == "Resume", f"react: Pause left Read saying {label(page)!r}")
@@ -490,24 +519,10 @@ def react_walk(desk: Desk, api: VoicesApi, voice: str, touch: bool, recognition:
         # A read of one block draws no arrows: its strip stands for React alone.
         desk.check(not arrows, f"react, device: a one-block read's strip draws arrows: {layout}")
     if voice == "agent":
-        desk.check(len(arrows) == 4, f"react: the four arrows are not all drawn: {layout}")
-        centres = [(one["top"] + one["bottom"]) / 2 for one in [*arrows, react, layout["count"]]]
-        desk.check(max(centres) - min(centres) <= 4, f"react: the arrows' row is more than one line: {layout}")
-        desk.check(all(react["left"] >= one["right"] - 0.5 for one in arrows) and react["left"] >= layout["count"]["right"] - 0.5,
-                   f"react: React is not at the right of the arrows and the count: {layout}")
-        desk.check(react["right"] >= layout["strip"]["right"] - 24, f"react: React is not at the strip's far right: {layout}")
-        if touch:
-            small = [one for one in [*arrows, react] if one["height"] < 48 or (one in arrows and one["width"] < 48)]
-            desk.check(not small, f"react: a phone's arrow or React is under 48px: {small}")
-            desk.check(layout["strip"]["right"] <= layout["width"] + 0.5, f"react: the strip runs past the screen: {layout}")
-        # The arrows stand between the row's edge and React, not at its right edge.
-        left_room = arrows[0]["left"] - layout["strip"]["left"]
-        desk.check(left_room > 8, f"react: the arrows are not centred in the row React leaves: {layout}")
-        # A long read's count, "12 of 12", still leaves the row one line with React in it.
+        check_nav_row(desk, "react, paused", touch)
+        # A long read's count, "12 of 12", still leaves the row one line, centred, with React in it.
         page.evaluate("() => { document.getElementById('read-steer-count').textContent = '12 of 12'; }")
-        wide = page.evaluate(STRIP_JS)
-        tops = [(one["top"] + one["bottom"]) / 2 for one in [*[one for one in wide["arrows"] if one], wide["react"], wide["count"]]]
-        desk.check(max(tops) - min(tops) <= 4, f"react: with a two-digit count the row wraps: {wide}")
+        check_nav_row(desk, "react, a two-digit count", touch)
         page.evaluate("() => { document.getElementById('read-steer-count').textContent = '2 of 3'; }")
     found = page.evaluate("() => { const n = document.getElementById('read-react'); const r = n.getBoundingClientRect();"
                           " const at = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);"
@@ -544,6 +559,21 @@ def react_walk(desk: Desk, api: VoicesApi, voice: str, touch: bool, recognition:
         desk.check("microphone on your keyboard" in str(state), f"react, no recognition: the box says {state!r}")
         page.keyboard.press("Escape")
     desk.check(label(page) == "Resume", f"react: the read did not stay paused: Read says {label(page)!r}")
+    if voice == "agent":
+        # `#828`: React pressed while the read plays pauses it on the sentence being heard and quotes that.
+        press(page, "#read-aloud", touch)
+        desk.wait_for("() => document.getElementById('read-aloud-label').textContent === 'Pause'",
+                      "react: Resume did not carry the read on")
+        wait_until(page, f"() => ({LIT_JS})() !== null", "react: no sentence is lit once the read carries on")
+        press(page, "#read-react", touch)
+        desk.wait_for("() => !document.getElementById('quick-reply').hidden", "react, playing: React opened no quick reply")
+        desk.check(label(page) == "Resume", f"react, playing: React did not pause the read: Read says {label(page)!r}")
+        lit = page.evaluate(LIT_JS)
+        again = page.evaluate("() => document.getElementById('quick-reply-quote').textContent.replace(/\\s+/g, ' ').trim()")
+        desk.check(lit is not None and again == lit, f"react, playing: the quick reply quotes {again!r}, not the lit sentence {lit!r}")
+        desk.shot("react-playing")
+        page.keyboard.press("Escape")
+        desk.notes.append(f"React while playing paused and quoted {str(lit)[:30]!r}")
     desk.notes.append(f"React {'quoted the held sentence ' + repr(held[:30]) if held else 'quoted the held block'}, "
                       + ("dictation landed in the box and the Draft chip counted it" if recognition else
                          "with no recognition the box focused and pointed at the keyboard's microphone"))
@@ -643,7 +673,9 @@ def main() -> int:
             for touch in (True, False):
                 report.append(run_quote(playwright.chromium, args, touch))
             # `#821 voice-page-read-aloud-react`.
-            for size, touch in (((360, 780), True), ((375, 812), True), ((412, 915), True), ((1280, 800), False)):
+            # `#828 voice-page-read-nav-center`: and a narrow window with a mouse.
+            for size, touch in (((360, 780), True), ((375, 812), True), ((412, 915), True), ((1280, 800), False),
+                                ((400, 800), False)):
                 report.append(run_react(playwright.chromium, args, "agent", size, touch, True))
             report.append(run_react(playwright.chromium, args, "agent", (412, 915), True, False))
             report.append(run_react(playwright.chromium, args, "device", (412, 915), True, True))

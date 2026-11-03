@@ -168,10 +168,11 @@ MEDIA_PROBE = """(() => {
 })();"""
 
 # `#442 read-strip-order`. The strip's drawn controls (not its timeline line), in markup order and
-# in the order they stand left to right, and how far their middles stray from one line.
+# in the order they stand left to right, and how far their middles stray from one line. `#828
+# voice-page-read-nav-center`: the arrows' row is a box of its own, its balance holding the desk's grip.
 STRIP_LAYOUT = """() => {
-  const strip = document.getElementById('read-steer');
-  const drawn = [...strip.children].filter((e) => e.id !== 'read-timeline' && e.getClientRects().length > 0);
+  const row = document.getElementById('read-steer-row');
+  const drawn = [...row.querySelectorAll('button, #read-steer-count')].filter((e) => e.getClientRects().length > 0);
   const boxes = drawn.map((e) => [e.id, e.getBoundingClientRect()]);
   const mids = boxes.map(([, b]) => (b.top + b.bottom) / 2);
   return {
@@ -183,20 +184,19 @@ STRIP_LAYOUT = """() => {
 
 # `#537 scrub-bar-no-play-pause`: no Pause or Stop on the strip; the bar under the list has both.
 # `#627 scrubber-thumb-arrows`: the fat section arrows, the count, the thin block arrows.
-STRIP_ORDER = ["read-section-prev", "read-section-next", "read-steer-count", "read-prev", "read-next"]
+# `#828 voice-page-read-nav-center`: React after them, there while the read plays.
+STRIP_ORDER = ["read-section-prev", "read-section-next", "read-steer-count", "read-prev", "read-next", "read-react"]
 
-# `#627 scrubber-thumb-arrows`. The arrows' boxes, and the strip's inner right edge (its box less its
-# padding and border), where on a phone the group stands.
+# `#627 scrubber-thumb-arrows`. The arrows' boxes; `#828 voice-page-read-nav-center`, and the row's and the
+# count's, whose centres are one.
 ARROW_LAYOUT = """() => {
-  const strip = document.getElementById('read-steer');
-  const box = strip.getBoundingClientRect();
-  const style = getComputedStyle(strip);
-  const inner = box.right - parseFloat(style.paddingRight) - parseFloat(style.borderRightWidth);
+  const row = document.getElementById('read-steer-row').getBoundingClientRect();
+  const count = document.getElementById('read-steer-count').getBoundingClientRect();
   const arrows = ['read-section-prev', 'read-section-next', 'read-prev', 'read-next'].map((id) => {
     const b = document.getElementById(id).getBoundingClientRect();
     return { id, left: b.left, right: b.right, width: b.width, height: b.height };
   });
-  return { stripLeft: box.left, stripWidth: box.width, inner, arrows };
+  return { rowCentre: (row.left + row.right) / 2, countCentre: (count.left + count.right) / 2, arrows };
 }"""
 
 # The bar's Read (Pause while a read plays) and the Stop on its left: drawn, side by side, in one row,
@@ -755,7 +755,7 @@ def main() -> int:
                 return layout
 
             def check_strip_order(page: Page, where: str, desk: bool = False) -> None:
-                # `#442 read-strip-order`, `#537`, `#627`: the four arrows and k of n alone, in one line, the
+                # `#442 read-strip-order`, `#537`, `#627`: the four arrows and k of n (`#828`: and React), in one line, the
                 # markup's order on screen. The grip that moves it is drawn on a desk only.
                 layout = page.evaluate(STRIP_LAYOUT)
                 want = (["read-steer-grip"] if desk else []) + STRIP_ORDER
@@ -766,15 +766,10 @@ def main() -> int:
                 for arrow in arrows["arrows"]:
                     check(arrow["width"] >= 44 and arrow["height"] >= 44,
                           f"{arrow['id']} is a {arrow['width']:.0f}x{arrow['height']:.0f}px target at {where}, under 44px")
-                if not desk:
-                    # `#627`: on a phone the group stands packed at the right edge, the left of the row
-                    # empty (spread to both edges, the fat Previous stood at the left edge).
-                    last, first = arrows["arrows"][-1], arrows["arrows"][0]
-                    check(abs(arrows["inner"] - last["right"]) <= 1,
-                          f"the thin Next stands {arrows['inner'] - last['right']:.1f}px off the strip's right edge at {where}")
-                    check(first["left"] - arrows["stripLeft"] >= arrows["stripWidth"] / 4,
-                          f"the fat Previous stands {first['left'] - arrows['stripLeft']:.1f}px from the strip's left edge"
-                          f" of {arrows['stripWidth']:.0f}px at {where}: the arrows are not together on the right")
+                # `#828 voice-page-read-nav-center` (once `#627` packed them at a phone's right edge): "k of n" at
+                # the row's centre, on a phone and a desk alike.
+                off = arrows["countCentre"] - arrows["rowCentre"]
+                check(abs(off) <= 2, f"the count stands {off:.1f}px off the row's centre at {where}")
 
             def check_bar_stop(page: Page, where: str, tallest: float = 44) -> BarLayout:
                 # A phone's target is 44px at least; a desk's row is 2.25rem (36px) throughout.

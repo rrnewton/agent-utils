@@ -593,6 +593,8 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
       audio: { pause: () => { engine.cancel(); if (typeof engine.resume === "function") engine.resume(); } }, urls: [],
       utterance: null, speechTimer: null, parts, chunk: 0, paused: false, stale: false,
       pauseTransport: null, resumeTransport: null };
+    // `#828 voice-page-read-nav-center`: its strip, React alone, from the first word.
+    renderReadSteer();
     const current = () => ticket === readingTicket && nowPlaying !== null && nowPlaying!.id === id;
     const fail = (error: unknown) => {
       if (!current()) return;
@@ -2001,13 +2003,22 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     heldAnchor = heard ? heard.anchor : null;
   }
 
-  /** `#821 voice-page-read-aloud-react`. Whether a read of one block is paused on words: React stands alone. */
+  /**
+   * `#821 voice-page-read-aloud-react`. Whether a read of one block draws React alone, with no arrows to steer:
+   * `#828 voice-page-read-nav-center`, while it plays or is held (where the pause held nothing, React is there
+   * and cannot be pressed).
+   */
   function reactAlone() {
-    return readingPosition() === "" && readingPaused() && heldSentence !== null;
+    return readingPosition() === "" && nowPlaying !== null;
   }
 
-  /** `#821 voice-page-read-aloud-react`. React, pressed: a quoted reply on the words the pause held. */
+  /**
+   * `#821 voice-page-read-aloud-react`. React, pressed: a quoted reply on the words the pause held. `#828
+   * voice-page-read-nav-center`: pressed while the read plays, it pauses the read first, which holds the
+   * sentence being heard, and replies to that at once.
+   */
   function reactToHeldSentence() {
+    if (nowPlaying !== null && !readingPaused()) pauseReading();
     const held = heldSentence;
     if (!readingPaused() || held === null) return;
     // Where the words stand now: the list may have moved since the pause.
@@ -2059,14 +2070,17 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     // read cut off is tried again (`recoverRead`). `renderReadLayout` takes it away if either ends
     // without a block playing. (On a desk too: there it no longer blinks out on a Next.)
     const held = position === "" && !wasHidden && (readJumpPending || readRecovering);
-    // `#821 voice-page-read-aloud-react`. A read of one block draws no strip; paused on words, it draws React
-    // alone in one, where a read of several has it beside the arrows.
-    const alone = reactAlone();
+    // `#821 voice-page-read-aloud-react`. A read of one block draws React alone in its strip (`reactAlone`),
+    // where a read of several has it beside the arrows.
+    // `#828`: so too a strip of React alone held up through a wait (a read of one block cut off and tried again).
+    const alone = reactAlone() || (held && strip.hasAttribute("data-react-only"));
     strip.hidden = position === "" && !held && !alone;
     strip.toggleAttribute("data-react-only", alone);
     renderReadTransport();
     if (!held) renderReadTimeline();
     if (alone && wasHidden) placeReadSteer();
+    // The count of a read before it says nothing of this one.
+    if (alone) deps.el("read-steer-count").textContent = "";
     if (position === "") return;
     deps.el("read-steer-count").textContent = position;
     deps.el("read-next").disabled = nowPlaying!.segment! + 1 >= nowPlaying!.segments!.length;
@@ -2324,11 +2338,17 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     const paused = readingPaused();
     const strip = deps.el("read-steer");
     if (strip) strip.setAttribute("data-paused", paused ? "true" : "false");
-    // `#821 voice-page-read-aloud-react`. React, while a pause holds words to reply to.
+    // `#821 voice-page-read-aloud-react`. React, while a pause holds words to reply to; `#828
+    // voice-page-read-nav-center`, and while the read plays, when pressing it pauses on what is being heard.
+    // A pause that held nothing has nothing to reply to.
+    // Through a jump's or a recovery's wait it keeps its place in the row, which stays centred, and waits too.
     const react = deps.el("read-react");
     if (react) {
-      const hidden = !paused || heldSentence === null;
+      const waiting = nowPlaying === null && (readJumpPending || readRecovering);
+      const hidden = nowPlaying === null && !waiting;
       if (react.hidden !== hidden) react.hidden = hidden;
+      const idle = waiting || (paused && heldSentence === null);
+      if (react.disabled !== idle) react.disabled = idle;
     }
     const button = deps.el("read-aloud");
     if (button) {
@@ -2380,7 +2400,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     const strip = deps.el("read-steer");
     if (!strip) return;
     // A strip held up through a jump or a recovery (`renderReadSteer`) goes when that ends with nothing playing;
-    // one standing for React alone (`#821`) stays while the pause holds words.
+    // one standing for React alone (`#821`) stays while the read plays or its pause holds words.
     if (!strip.hidden && readingPosition() === "" && !readJumpPending && !readRecovering && !reactAlone()) {
       strip.hidden = true;
       renderReadTimeline();

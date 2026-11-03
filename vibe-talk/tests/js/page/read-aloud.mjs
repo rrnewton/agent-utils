@@ -1092,10 +1092,14 @@ test("`#627 scrubber-thumb-arrows`: four arrows, each a 44px target with its own
   }
   assert.match(cssBlock(".read-steer-arrow"), /min-width:\s*2\.75rem/, "an arrow's target is narrower than 44px");
   assert.match(cssBlock(".read-steer-button"), /min-height:\s*2\.75rem/, "an arrow's target is shorter than 44px");
-  // On a phone the group stands at the right edge, under the right thumb, not spread to both edges.
+  // `#828 voice-page-read-nav-center` (once at a phone's right edge): the row centres the group, never spread to
+  // both edges, and keeps it to one line.
   const phone = cssRules(CSS_CODE, ":root[data-read-strip] #read-steer").join("\n");
-  assert.match(phone, /justify-content:\s*flex-end/, "on a phone the arrows do not stand at the right edge");
-  assert.doesNotMatch(phone, /space-between/, "on a phone the arrows are still spread to the two edges");
+  assert.doesNotMatch(phone, /justify-content:\s*flex-end/, "on a phone the arrows still stand at the right edge");
+  const row = cssBlock("#read-steer-row");
+  assert.match(row, /justify-content:\s*center/, "the arrows' row does not centre its group");
+  assert.match(row, /flex-wrap:\s*nowrap/, "the arrows' row can wrap");
+  assert.doesNotMatch(phone + row, /space-between/, "on a phone the arrows are still spread to the two edges");
 });
 
 test("`#627 scrubber-thumb-arrows`: the fat arrows jump between the sections a message's headings begin", async () => {
@@ -1438,9 +1442,10 @@ test("`#442 read-strip-order`: the strip reads its arrows and k of n in the mark
   const ids = [...strip.matchAll(/\bid="(read-[\w-]+)"/g)].map((match) => match[1]);
   // `#627 scrubber-thumb-arrows`: the fat Previous and Next section, the count, the thin Previous and Next block.
   // `#819 voice-page-quoted-reply-and-draft-chip`: and Quote reply, a line of its own over the blocks.
-  // `#821 voice-page-read-aloud-react`: React, at the far right of the arrows' row, before it.
-  assert.deepEqual(ids, ["read-steer", "read-steer-grip", "read-section-prev", "read-section-next", "read-steer-count",
-    "read-prev", "read-next", "read-react", "read-steer-quote"],
+  // `#821 voice-page-read-aloud-react`: React, at the right of the arrows' row, before it. `#828
+  // voice-page-read-nav-center`: the row a box of its own, opening on the balance that holds the grip.
+  assert.deepEqual(ids, ["read-steer", "read-steer-row", "read-steer-balance", "read-steer-grip", "read-section-prev",
+    "read-section-next", "read-steer-count", "read-prev", "read-next", "read-react", "read-steer-quote"],
     "the strip's controls are not the grip, the section arrows, the count, the block arrows, React and Quote reply alone");
   assert.ok(!PAGE_ELEMENTS.has("read-pause") && !PAGE_ELEMENTS.has("read-stop"), "the strip still has a Pause or a Stop of its own");
   // The bar under the list keeps both: Read (the Pause of a read playing) and Stop beside it.
@@ -1453,6 +1458,17 @@ test("`#442 read-strip-order`: the strip reads its arrows and k of n in the mark
     }
   }
 });
+
+/**
+ * `#828 voice-page-read-nav-center`. A read of one block playing: its strip is up for React alone, which
+ * can be pressed, with no arrows or count to steer by.
+ */
+function assertReactAlone(page, why) {
+  assert.equal(page.el("read-steer").hidden, false, `${why}: a one-block read draws no strip for React`);
+  assert.ok(page.el("read-steer").hasAttribute("data-react-only"), `${why}: a one-block read's strip draws its arrows`);
+  assert.equal(page.el("read-react").hidden, false, `${why}: a one-block read offers no React`);
+  assert.equal(page.el("read-react").disabled, false, `${why}: React cannot be pressed while the read plays`);
+}
 
 /** Reading mode is off: the Read button says Read and is not the way-out colour, nothing plays. */
 function assertReadingModeLeft(page, why) {
@@ -1505,12 +1521,12 @@ test("`#442 read-strip-order`: Read is Pause with Stop beside it while a read pl
   await page.settle();
   assertReadingModeLeft(page, "the bar's Stop");
 
-  // A message of one block has no strip; the bar's Stop is its one-tap way out.
+  // A message of one block has no arrows (`#828`: its strip holds React alone); the bar's Stop is its one-tap way out.
   await page.el("read-aloud").click();
   await page.settle();
   await rows[1].dispatch("click", {});
   await page.settle();
-  assert.equal(page.el("read-steer").hidden, true, "the premise: a one-block read has no strip");
+  assertReactAlone(page, "the premise");
   assert.equal(page.el("read-aloud-stop").hidden, false, "a one-block read has no Stop in the bar");
   await page.el("read-aloud-stop").click();
   await page.settle();
@@ -1601,8 +1617,13 @@ test("`scrubber-full-width`: a jump that waits for its block keeps the strip and
   assert.equal(page.el("read-steer-count").text(), "1 of 3", "the held strip does not say where the read was");
   assert.equal(page.el("read-timeline").children.length, blocks, "the held strip lost its timeline");
   assert.equal(readStrip(page), "playing", "the playback layout dropped for the jump's wait");
+  // `#828 voice-page-read-nav-center`: React keeps its place in the row through the wait, which stays centred,
+  // and waits too.
+  assert.deepStrictEqual([page.el("read-react").hidden, page.el("read-react").disabled], [false, true],
+    "React left the row, or can be pressed, through the jump's wait");
   await page.settle();
   assert.equal(page.el("read-steer-count").text(), "2 of 3", "the jump did not land");
+  assert.equal(page.el("read-react").disabled, false, "React still waits once the jump landed");
   assert.equal(readStrip(page), "playing");
 
   await page.el("read-next").click();
@@ -1784,7 +1805,7 @@ test("`#451 read-strip-followups`: a read started with s outside reading mode ha
   await press(page, page.el("scroll-area"), "ArrowDown");
   await press(page, page.el("scroll-area"), "s");
   await page.settle();
-  assert.equal(page.el("read-steer").hidden, true, "the premise: a one-block read has no strip");
+  assertReactAlone(page, "the premise");
   assert.equal(page.el("read-aloud-stop").hidden, false, "a read started with s has no Stop in the bar");
   assert.equal(page.el("read-aloud-label").text(), "Pause", "Read does not pause a read started with s");
   assert.equal(page.el("read-aloud").getAttribute("aria-pressed"), "false", "starting the read entered reading mode");
@@ -1941,7 +1962,7 @@ test("a block that says nothing is drawn and skipped, and a message of ONE block
   await page.settle();
   const whole = page.audioStreams.at(-1);
   assert.match(whole.url, /ticket-for-1000000000000000002\?selection=tap-[0-9a-f]{16}$/, "a one-block message was read by block");
-  assert.equal(page.el("read-steer").hidden, true, "a one-block read shows the steering strip");
+  assertReactAlone(page, "a one-block read");
   const mark = page.el("discord-log").children[1].descendants().find((n) => n.className === "msg-author reading-mark");
   assert.equal(mark.text(), "reading");
 });
@@ -3448,6 +3469,8 @@ test("A READ CUT OFF BY A RESTART prepares again and carries on from the block i
   // `scrubber-full-width`: the strip, and a phone's layout for it, stay up through the wait.
   assert.equal(page.el("read-steer").hidden, false, "the strip went for the wait to try again");
   assert.equal(page.el("read-steer-count").text(), "2 of 3");
+  assert.deepStrictEqual([page.el("read-react").hidden, page.el("read-react").disabled], [false, true],
+    "`#828`: React left the row, or can be pressed, through the wait to try again");
   assert.equal(readStrip(page), "playing", "the playback layout dropped for the wait to try again");
   assert.equal(page.expireTimers(SPEECH_PIECES.READ_RECOVERY_WAITS_MS[0]), 1, "nothing waited to try again");
   await page.settle();

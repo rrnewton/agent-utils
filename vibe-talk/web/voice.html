@@ -1044,43 +1044,51 @@
             still step a block.
           -->
           <div id="read-steer" role="group" aria-label="Reading position" hidden>
-            <button id="read-steer-grip" type="button" aria-label="Move the reading controls"
-              title="Drag to move. Arrow keys move it too; double-click, or Home, puts it back on the chips row.">
-              <svg viewBox="0 0 8 16" aria-hidden="true" fill="currentColor">
-                <circle cx="2" cy="3" r="1.2" /><circle cx="6" cy="3" r="1.2" />
-                <circle cx="2" cy="8" r="1.2" /><circle cx="6" cy="8" r="1.2" />
-                <circle cx="2" cy="13" r="1.2" /><circle cx="6" cy="13" r="1.2" />
-              </svg>
-            </button>
-            <button id="read-section-prev" class="read-steer-button read-steer-arrow" type="button" data-weight="fat"
-              aria-label="Previous section" title="Previous section">
-              <svg viewBox="0 0 24 24" aria-hidden="true" fill="currentColor"><path d="M1.5 12 12.5 2v6H22v8h-9.5v6Z" /></svg>
-            </button>
-            <button id="read-section-next" class="read-steer-button read-steer-arrow" type="button" data-weight="fat"
-              aria-label="Next section" title="Next section">
-              <svg viewBox="0 0 24 24" aria-hidden="true" fill="currentColor"><path d="M22.5 12 11.5 2v6H2v8h9.5v6Z" /></svg>
-            </button>
-            <span id="read-steer-count" aria-live="polite"></span>
-            <button id="read-prev" class="read-steer-button read-steer-arrow" type="button" data-weight="thin"
-              aria-label="Previous block" title="Previous block">
-              <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.25"
-                stroke-linecap="round" stroke-linejoin="round"><path d="M20 12H4M11 5l-7 7 7 7" /></svg>
-            </button>
-            <button id="read-next" class="read-steer-button read-steer-arrow" type="button" data-weight="thin"
-              aria-label="Next block" title="Next block">
-              <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.25"
-                stroke-linecap="round" stroke-linejoin="round"><path d="M4 12h16M13 5l7 7-7 7" /></svg>
-            </button>
-            <!-- `#537 scrub-bar-no-play-pause`. No Pause or Stop here: the bar under the list has both
-                 (Read is the Pause of a read playing, and Stop beside it), so the strip steers. -->
-            <!-- `#380 read-aloud-timeline`. The read as a line of its blocks, each as wide as it
-                 is long: those heard, the one being read, those to come. A tap on one reads from
-                 there. Filled by web/voice.js, one button a block. -->
-            <!-- `#821 voice-page-read-aloud-react`. React, while the read is paused: a quoted reply on the
-                 sentence it held, the microphone started where the browser can hear. At the row's far
-                 right, the arrows and the count centred in what is left (web/voice.css). -->
-            <button id="read-react" class="read-steer-button" type="button" hidden
-              title="Reply to the sentence the read is paused on, quoting it">React</button>
+            <!-- `#828 voice-page-read-nav-center`. ONE LINE, THE COUNT AT ITS CENTRE. The owner, 2026-11-03: "I want it
+                 in the same row. I don't want to add another row." The arrows stand two a side of "k of n", React
+                 after them at the right, and at the left an invisible spacer as wide as React, always kept, so
+                 the count is the row's exact middle. The desk's grip stands inside the spacer. -->
+            <div id="read-steer-row">
+              <span id="read-steer-balance">
+                <button id="read-steer-grip" type="button" aria-label="Move the reading controls"
+                  title="Drag to move. Arrow keys move it too; double-click, or Home, puts it back on the chips row.">
+                  <svg viewBox="0 0 8 16" aria-hidden="true" fill="currentColor">
+                    <circle cx="2" cy="3" r="1.2" /><circle cx="6" cy="3" r="1.2" />
+                    <circle cx="2" cy="8" r="1.2" /><circle cx="6" cy="8" r="1.2" />
+                    <circle cx="2" cy="13" r="1.2" /><circle cx="6" cy="13" r="1.2" />
+                  </svg>
+                </button>
+              </span>
+              <button id="read-section-prev" class="read-steer-button read-steer-arrow" type="button" data-weight="fat"
+                aria-label="Previous section" title="Previous section">
+                <svg viewBox="0 0 24 24" aria-hidden="true" fill="currentColor"><path d="M1.5 12 12.5 2v6H22v8h-9.5v6Z" /></svg>
+              </button>
+              <button id="read-section-next" class="read-steer-button read-steer-arrow" type="button" data-weight="fat"
+                aria-label="Next section" title="Next section">
+                <svg viewBox="0 0 24 24" aria-hidden="true" fill="currentColor"><path d="M22.5 12 11.5 2v6H2v8h9.5v6Z" /></svg>
+              </button>
+              <span id="read-steer-count" aria-live="polite"></span>
+              <button id="read-prev" class="read-steer-button read-steer-arrow" type="button" data-weight="thin"
+                aria-label="Previous block" title="Previous block">
+                <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.25"
+                  stroke-linecap="round" stroke-linejoin="round"><path d="M20 12H4M11 5l-7 7 7 7" /></svg>
+              </button>
+              <button id="read-next" class="read-steer-button read-steer-arrow" type="button" data-weight="thin"
+                aria-label="Next block" title="Next block">
+                <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.25"
+                  stroke-linecap="round" stroke-linejoin="round"><path d="M4 12h16M13 5l7 7-7 7" /></svg>
+              </button>
+              <!-- `#537 scrub-bar-no-play-pause`. No Pause or Stop here: the bar under the list has both
+                   (Read is the Pause of a read playing, and Stop beside it), so the strip steers. -->
+              <!-- `#380 read-aloud-timeline`. The read as a line of its blocks, each as wide as it
+                   is long: those heard, the one being read, those to come. A tap on one reads from
+                   there. Filled by web/voice.js, one button a block. -->
+              <!-- `#821 voice-page-read-aloud-react`. React: a quoted reply on the sentence being read, the microphone
+                   started where the browser can hear. `#828 voice-page-read-nav-center`: always there while a read
+                   is; pressed while it plays, it pauses the read on that sentence first. At the row's right. -->
+              <button id="read-react" class="read-steer-button" type="button" hidden
+                title="Pause and reply to the sentence being read, quoting it">React</button>
+            </div>
             <!-- `#819 voice-page-quoted-reply-and-draft-chip`. Quote reply, while words are selected in a
                  message and the read is paused: here, at the foot of the screen, far from the selection,
                  whose chip the phone's own handles and Copy bar can cover. Shown with that chip by
