@@ -607,7 +607,8 @@ async function reloadThreads(store, data, script = SCRIPT, days = 1) {
 }
 
 /** The negative control: a page that never stores a thread's colour, as before `#396`. */
-const forgetsHues = () => brokenScript("    deviceStorage().setItem(THREAD_HUES_KEY,", "    void (THREAD_HUES_KEY,");
+const forgetsHues = () => brokenModule([{ file: "src/view/channel/hues.ts",
+  find: "deps.storage.setItem(THREAD_HUES_KEY,", replace: "void (THREAD_HUES_KEY," }]);
 
 test("`#396 thread-color-memory`: every thread keeps its colour across a reload that draws them in another order", async () => {
   const run = async (script) => {
@@ -620,7 +621,7 @@ test("`#396 thread-color-memory`: every thread keeps its colour across a reload 
   assert.equal(new Set(Object.values(before)).size, 3, "the premise: three threads, three colours");
   assert.deepStrictEqual(after, before, "the reload drew the threads in different colours");
   // The control: in memory alone the reload's order decides, which is the defect the owner saw.
-  const forgot = await run(forgetsHues());
+  const forgot = await run(await forgetsHues());
   assert.notDeepStrictEqual(forgot.after, forgot.before, "the premise: the order the reload draws in matters");
 });
 
@@ -675,7 +676,7 @@ test("`#396 thread-color-memory`: every thread keeps its colour across a trip to
   assert.equal(new Set(Object.values(before)).size, 3, "the premise: three threads, three colours");
   assert.deepStrictEqual(Object.keys(elsewhere).sort(), ["O-first", "O-second"], "the premise: the other channel's threads were drawn");
   assert.deepStrictEqual(after, before, "coming back to the channel recoloured its threads");
-  const forgot = await run(forgetsHues());
+  const forgot = await run(await forgetsHues());
   assert.notDeepStrictEqual(forgot.after, forgot.before, "the premise: the order the return draws in matters");
 });
 
@@ -791,7 +792,8 @@ const threadDataIds = () => threadsOf(["T-north", "T-south"]);
 const HUE_APART = 45;
 
 /** The pre-`#414` page: a new thread takes the widest arc's middle, whoever is beside it. */
-const ignoresNeighbours = () => brokenScript("  hue = spreadThreadHue(hue, used, threadHueNeighbours(key));\n", "");
+const ignoresNeighbours = () => brokenModule([{ file: "src/view/channel/hues.ts",
+  find: "      hue = spreadThreadHue(hue, used, threadHueNeighbours(key));\n", replace: "" }]);
 
 /**
  * The owner's case: a channel that remembers 24 threads, a day later, posts three more in a row.
@@ -836,7 +838,7 @@ test("`#414 thread-hue-spread`: three new threads in a row after 24 remembered o
   const { apart, pair } = closestNeighbours(before, old);
   assert.ok(apart >= HUE_APART, `${pair} were drawn ${apart}° apart on the first page`);
   // The control: the widest arc alone puts newcomers in the slivers between remembered colours.
-  const blind = await threeAfterTwentyFour(ignoresNeighbours());
+  const blind = await threeAfterTwentyFour(await ignoresNeighbours());
   const worst = closestNeighbours(blind.after, [...blind.old, ...blind.fresh]);
   assert.ok(worst.apart < HUE_APART, `the premise: without the re-roll some neighbours come out alike (closest ${worst.apart}°)`);
 });

@@ -77,3 +77,5 @@ export { createCardPlaces, neighbourStayed, rowNeighbours, sameCardPlace } from 
 export type { CardPlace, CardPlaces, CardPlacesDependencies, Neighbours } from "./cardplace.ts";
 export { createInputKinds } from "./input.ts";
 export type { InputKind, InputKinds, InputKindsDependencies } from "./input.ts";
+export { THREAD_HUES_KEY, THREAD_HUES_PER_CHANNEL, THREAD_HUES_SEEDED_KEY, THREAD_HUES_SEEN_REFRESH_MS, THREAD_HUES_TOTAL, THREAD_HUES_VERSION, THREAD_HUE_NEIGHBOURS, THREAD_HUE_RECENT, createThreadHues } from "./hues.ts";
+export type { ThreadHues, ThreadHuesDependencies } from "./hues.ts";

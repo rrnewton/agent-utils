@@ -286,3 +286,53 @@ test("`#624 voice-page-modularity`: what the reader used last, said on the root,
   const fresh = createInputKinds({ root: () => root });
   assert.equal(fresh.mouseMoved({ pointerType: "mouse", clientX: 1, clientY: 1 }), true, "the first move before the keys did not count");
 });
+
+test("`#624 voice-page-modularity`: thread colours are remembered per channel, the server's win, and a new one keeps its distance", async () => {
+  const { createThreadHues, THREAD_HUES_KEY, THREAD_HUES_SEEDED_KEY } = CHANNEL_VIEW;
+  const store = new Map();
+  let channel = "C1";
+  const posts = [];
+  const make = () => createThreadHues({
+    storage: { getItem: (key) => store.get(key) ?? null, setItem: (key, value) => store.set(key, value), removeItem: (key) => store.delete(key) },
+    now: () => 1000,
+    channelRecord: (id) => (id === "C1" ? { provider: "slack" } : undefined),
+    selected: () => channel,
+    writeToken: () => true,
+    held: () => ({ channel, threads: [], messages: [] }),
+    timeOf: () => NaN,
+    threadOf: () => null,
+    post: async (where, hues) => { posts.push([where, hues]); return { hues: { T1: 17 } }; },
+  });
+  const turn = () => new Promise((resolve) => setImmediate(resolve));
+  const hues = make();
+  const first = hues.hue("T1");
+  const second = hues.hue("T2");
+  assert.equal(first, 210, "the first thread on an empty wheel");
+  assert.ok(Math.min(Math.abs(first - second), 360 - Math.abs(first - second)) >= 45, "a new thread keeps its distance");
+  assert.equal(hues.hue("T1"), first, "a thread keeps its colour");
+  await turn();
+  const scope = JSON.stringify(["slack", "C1"]);
+  assert.deepStrictEqual(JSON.parse(store.get(THREAD_HUES_KEY)).channels[scope], { T1: [first, 1000], T2: [second, 1000] });
+  const again = make();
+  again.restore("C1");
+  assert.equal(again.hue("T2"), second, "a reload puts the colours back");
+  again.noteServerIn([{ thread: { id: "T2", hue: 33 } }], [], "C1");
+  assert.equal(again.hue("T2"), 33, "the server's colour wins");
+  again.noteServerIn([{ thread: { id: "T2", hue: 99 } }], [], "C1");
+  assert.equal(again.hue("T2"), 33, "and is never recoloured");
+  const seeding = make();
+  await seeding.seed("C1");
+  await seeding.seed("C1");
+  assert.equal(posts.length, 1, "colours are offered once a load");
+  assert.equal(posts[0][0], "C1");
+  assert.ok(JSON.parse(store.get(THREAD_HUES_SEEDED_KEY)).scopes[scope] !== undefined);
+  await make().seed("C1");
+  assert.equal(posts.length, 1, "a scope the server took is not offered again");
+  assert.equal(seeding.hue("T1"), 17, "the answer's colours are adopted");
+  store.set(THREAD_HUES_KEY, JSON.stringify({ v: 2, channels: {} }));
+  const other = make();
+  channel = "C2";
+  other.hue("T9");
+  await turn();
+  assert.equal(JSON.parse(store.get(THREAD_HUES_KEY)).v, 2, "another version's memory is not overwritten");
+});
