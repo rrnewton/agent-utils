@@ -408,6 +408,11 @@ def run_quote(chromium: BrowserType, args: argparse.Namespace, touch: bool) -> s
 # "please check the replica", and records that it was started.
 FAKE_RECOGNITION = """(() => {
   window.recognitionStarts = 0;
+  // `#829`: the box's inputmode each time it takes the focus, to show the keyboard was down before it did.
+  window.focusModes = [];
+  document.addEventListener('focusin', (event) => {
+    if (event.target && event.target.id === 'quick-reply-text') window.focusModes.push(event.target.getAttribute('inputmode'));
+  }, true);
   class FakeRecognition {
     constructor() { this.lang = ''; this.continuous = true; this.interimResults = false; this.onresult = null; this.onerror = null; this.onend = null; }
     start() {
@@ -415,9 +420,9 @@ FAKE_RECOGNITION = """(() => {
       const say = (words, isFinal) => this.onresult && this.onresult({resultIndex: 0, results: [Object.assign([{transcript: words}], {isFinal})]});
       setTimeout(() => say('please check', false), 150);
       setTimeout(() => say('please check the replica', true), 450);
-      setTimeout(() => this.onend && this.onend(), 700);
+      setTimeout(() => this.onend && this.onend(), window.recognitionLasts || 1500);
     }
-    abort() {}
+    abort() { window.recognitionAborts = (window.recognitionAborts || 0) + 1; }
   }
   window.SpeechRecognition = FakeRecognition;
   window.webkitSpeechRecognition = FakeRecognition;
@@ -444,6 +449,31 @@ STRIP_JS = """() => {
           arrows: ['read-section-prev', 'read-section-next', 'read-prev', 'read-next'].map(box), timeline: box('read-timeline'),
           width: document.documentElement.clientWidth};
 }"""
+
+
+# `#829`: the microphone badge's place against the quick reply's lower-left corner, and the box's keyboard.
+MIC_JS = """() => {
+  const box = document.getElementById('quick-reply').getBoundingClientRect();
+  const mic = document.getElementById('quick-reply-mic');
+  const m = mic.getBoundingClientRect();
+  const text = document.getElementById('quick-reply-text');
+  const at = document.elementFromPoint((m.left + m.right) / 2, (m.top + m.bottom) / 2);
+  return {shown: !mic.hidden && mic.getClientRects().length > 0, corner: m.left <= box.left && m.right >= box.left
+            && m.top <= box.bottom && m.bottom >= box.bottom, onScreen: m.left >= 0 && m.bottom <= innerHeight,
+          topmost: at === mic || mic.contains(at), inputmode: text.getAttribute('inputmode'),
+          focused: document.activeElement === text, focusModes: window.focusModes || []};
+}"""
+
+
+def check_listening(desk: Desk, where: str) -> None:
+    """`#829 voice-page-dictation-polish`: listening, the box keeps the focus with the keyboard down, and the
+    microphone badge hangs off its lower-left corner, on screen and on top."""
+    mic = desk.page.evaluate(MIC_JS)
+    desk.check(mic["inputmode"] == "none" and mic["focused"], f"{where}: the keyboard is not kept down in a focused box: {mic}")
+    desk.check(bool(mic["focusModes"]) and mic["focusModes"][-1] == "none",
+               f"{where}: the box took the focus before the keyboard was kept down: {mic}")
+    desk.check(mic["shown"] and mic["corner"] and mic["onScreen"] and mic["topmost"],
+               f"{where}: the microphone badge is not on the box's lower-left corner: {mic}")
 
 
 def check_nav_row(desk: Desk, where: str, touch: bool) -> None:
@@ -542,6 +572,7 @@ def react_walk(desk: Desk, api: VoicesApi, voice: str, touch: bool, recognition:
         desk.check(bool(quote) and quote in words, f"react, device: the quick reply quotes {quote!r}, not words of the message")
     if recognition:
         desk.wait_for("() => window.recognitionStarts === 1", "react: React started no recognition")
+        check_listening(desk, "react, listening")
         desk.wait_for("() => document.getElementById('quick-reply').hasAttribute('data-listening')"
                       " || document.getElementById('quick-reply-text').value.includes('please')",
                       "react: the box shows no listening state")
@@ -549,6 +580,9 @@ def react_walk(desk: Desk, api: VoicesApi, voice: str, touch: bool, recognition:
                       "react: the settled words did not land in the box", 5)
         desk.wait_for("() => !document.getElementById('quick-reply').hasAttribute('data-listening')",
                       "react: the box still listens after the recognition ended", 5)
+        ended = page.evaluate(MIC_JS)
+        desk.check(not ended["shown"] and ended["inputmode"] is None,
+                   f"react: the badge or the kept-down keyboard outlived the recognition: {ended}")
         desk.shot("react-dictated")
         page.keyboard.press("Escape")
         desk.wait_for("() => document.getElementById('quick-reply').hidden", "react: Esc left the quick reply up")
@@ -557,6 +591,10 @@ def react_walk(desk: Desk, api: VoicesApi, voice: str, touch: bool, recognition:
     else:
         state = page.evaluate("() => document.getElementById('quick-reply-state').textContent")
         desk.check("microphone on your keyboard" in str(state), f"react, no recognition: the box says {state!r}")
+        # `#829`: nothing listens, so the keyboard, the way to speak here, is not kept down, and no badge shows.
+        unheard = page.evaluate(MIC_JS)
+        desk.check(unheard["inputmode"] is None and not unheard["shown"],
+                   f"react, no recognition: the keyboard is kept down or the badge shows: {unheard}")
         page.keyboard.press("Escape")
     desk.check(label(page) == "Resume", f"react: the read did not stay paused: Read says {label(page)!r}")
     if voice == "agent":
@@ -565,6 +603,7 @@ def react_walk(desk: Desk, api: VoicesApi, voice: str, touch: bool, recognition:
         desk.wait_for("() => document.getElementById('read-aloud-label').textContent === 'Pause'",
                       "react: Resume did not carry the read on")
         wait_until(page, f"() => ({LIT_JS})() !== null", "react: no sentence is lit once the read carries on")
+        page.evaluate("() => { window.recognitionLasts = 60000; }")
         press(page, "#read-react", touch)
         desk.wait_for("() => !document.getElementById('quick-reply').hidden", "react, playing: React opened no quick reply")
         desk.check(label(page) == "Resume", f"react, playing: React did not pause the read: Read says {label(page)!r}")
@@ -572,6 +611,25 @@ def react_walk(desk: Desk, api: VoicesApi, voice: str, touch: bool, recognition:
         again = page.evaluate("() => document.getElementById('quick-reply-quote').textContent.replace(/\\s+/g, ' ').trim()")
         desk.check(lit is not None and again == lit, f"react, playing: the quick reply quotes {again!r}, not the lit sentence {lit!r}")
         desk.shot("react-playing")
+        if recognition:
+            # `#829`: a tap in the box brings the keyboard back and listens on; a tap on the badge stops it.
+            desk.wait_for("() => window.recognitionStarts === 2", "react, playing: React started no recognition")
+            check_listening(desk, "react, playing, listening")
+            press(page, "#quick-reply-text", touch)
+            tapped = page.evaluate(MIC_JS)
+            desk.check(tapped["inputmode"] is None and tapped["shown"],
+                       f"react: a tap in the box did not bring the keyboard back while listening on: {tapped}")
+            press(page, "#quick-reply-mic", touch)
+            desk.wait_for("() => document.getElementById('quick-reply-mic').hidden"
+                          " && !document.getElementById('quick-reply').hasAttribute('data-listening')",
+                          "react: a tap on the badge did not stop listening")
+            stopped = page.evaluate("() => ({aborts: window.recognitionAborts || 0,"
+                                    " open: !document.getElementById('quick-reply').hidden,"
+                                    " focused: document.activeElement === document.getElementById('quick-reply-text'),"
+                                    " inputmode: document.getElementById('quick-reply-text').getAttribute('inputmode')})")
+            desk.check(stopped["aborts"] >= 1 and stopped["open"] and stopped["focused"] and stopped["inputmode"] is None,
+                       f"react: the badge's tap did not stop only the listening, the box focused: {stopped}")
+            desk.notes.append("listening kept the keyboard down under a corner badge that stopped it")
         page.keyboard.press("Escape")
         desk.notes.append(f"React while playing paused and quoted {str(lit)[:30]!r}")
     desk.notes.append(f"React {'quoted the held sentence ' + repr(held[:30]) if held else 'quoted the held block'}, "

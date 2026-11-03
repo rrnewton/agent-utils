@@ -245,6 +245,60 @@
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 35%, transparent), 0 4px 18px rgb(0 0 0 / 0.3);
 }
 
+/* `#829 voice-page-dictation-polish`. The microphone badge, hanging off the listening box's lower-left corner
+   as a reaction hangs off a message: small and round, breathing gently (still where the reader asks for less
+   motion), its target a thumb's though its disc is small. */
+#quick-reply-mic {
+  position: absolute;
+  left: -0.5rem;
+  /* Only a little below the box: placed low, the box stands 8px over the screen's foot or the keyboard. */
+  bottom: -0.25rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
+  border: 2px solid var(--panel);
+  border-radius: 50%;
+  background: var(--accent);
+  color: #fff;
+  box-shadow: 0 1px 4px rgb(0 0 0 / 0.4);
+  touch-action: manipulation;
+  animation: quick-reply-mic-pulse 1.6s ease-in-out infinite;
+}
+
+#quick-reply-mic::before {
+  content: "";
+  position: absolute;
+  inset: -0.45rem;
+  border-radius: 50%;
+}
+
+#quick-reply-mic[hidden] {
+  display: none;
+}
+
+#quick-reply-mic svg {
+  width: 1.1rem;
+  height: 1.1rem;
+}
+
+@keyframes quick-reply-mic-pulse {
+  0%, 100% {
+    box-shadow: 0 1px 4px rgb(0 0 0 / 0.4), 0 0 0 0 color-mix(in srgb, var(--accent) 55%, transparent);
+  }
+  50% {
+    box-shadow: 0 1px 4px rgb(0 0 0 / 0.4), 0 0 0 6px color-mix(in srgb, var(--accent) 0%, transparent);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #quick-reply-mic {
+    animation: none;
+  }
+}
+
 /* `#627 scrubber-thumb-arrows`. Four arrows where the words were: the fat pair steps a section, the
    thin pair a block, all pointing along the timeline under them. The thin glyph is a hairline, and its
    target is still a 44px square: a thin arrow is a fine step, not a small button. */

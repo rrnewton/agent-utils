@@ -4,6 +4,11 @@
 // into its voice mode, so where the browser has no recognition, or refuses it (no microphone, no permission,
 // no network: Chrome's recognition is a server's), the box stays focused and a line says to use the keyboard's
 // microphone. Which box, what the line says and keeping what was heard as a draft are the page's.
+//
+// `#829 voice-page-dictation-polish`: while it listens the phone's keyboard stays down, so it does not cover the
+// reply being spoken. The box keeps the focus and its caret but asks for no keyboard (`inputmode="none"`),
+// from before it takes the focus where the page can say so (`quietKeyboard`), until a tap in the box asks
+// for the keyboard back (`showKeyboard`), or the listening stops, ends or fails.
 
 /** The browser's recognition, as far as this reads it (`SpeechRecognition`, `webkitSpeechRecognition`). */
 export interface Recognition {
@@ -30,7 +35,7 @@ export interface DictationDependencies {
   /** The language to hear, as the browser names it (`navigator.language`). */
   lang(): string;
   /** The box the words go into. */
-  box(): HTMLTextAreaElement | HTMLInputElement;
+  box(): Pick<HTMLTextAreaElement, "value" | "getAttribute" | "setAttribute" | "removeAttribute">;
   /** Say `text` on the box's state line ("" clears it). */
   say(text: string): void;
   /** The microphone is listening now, or not: for the box's look. */
@@ -51,14 +56,45 @@ export interface Dictation {
   stop(): void;
   /** Whether it is listening now. */
   active(): boolean;
+  /**
+   * The box is about to take the focus to be spoken into: where the browser can hear, keep the keyboard down
+   * from the start. `start` keeps it down; anything that does not listen after gives it back.
+   */
+  quietKeyboard(): void;
+  /** The keyboard back (a tap in the box), listening or not. */
+  showKeyboard(): void;
 }
 
 /** Not listening. */
 export function createDictation(deps: DictationDependencies): Dictation {
   let recognition: Recognition | null = null;
+  // The box's own `inputmode` while the keyboard is kept down (null: it had none); undefined while it is not.
+  let keyboardWas: string | null | undefined;
+
+  function quiet(): void {
+    const box = deps.box();
+    if (keyboardWas === undefined) keyboardWas = box.getAttribute("inputmode");
+    box.setAttribute("inputmode", "none");
+  }
+
+  function restore(): void {
+    if (keyboardWas === undefined) return;
+    const box = deps.box();
+    if (keyboardWas === null) box.removeAttribute("inputmode");
+    else box.setAttribute("inputmode", keyboardWas);
+    keyboardWas = undefined;
+  }
+
+  // Where it cannot listen, the line says so and the keyboard is the way to speak.
+  function unavailable(): false {
+    restore();
+    deps.say(DICTATION_UNAVAILABLE);
+    return false;
+  }
 
   function finish(said: string | null): void {
     recognition = null;
+    restore();
     deps.listening(false);
     deps.say(said === null ? "" : said);
   }
@@ -67,16 +103,12 @@ export function createDictation(deps: DictationDependencies): Dictation {
     start() {
       if (recognition !== null) return true;
       const Make = deps.recognition();
-      if (Make === null) {
-        deps.say(DICTATION_UNAVAILABLE);
-        return false;
-      }
+      if (Make === null) return unavailable();
       let heard: Recognition;
       try {
         heard = new Make();
       } catch (_error) {
-        deps.say(DICTATION_UNAVAILABLE);
-        return false;
+        return unavailable();
       }
       heard.lang = deps.lang();
       heard.continuous = false;
@@ -113,10 +145,10 @@ export function createDictation(deps: DictationDependencies): Dictation {
       try {
         heard.start();
       } catch (_error) {
-        deps.say(DICTATION_UNAVAILABLE);
-        return false;
+        return unavailable();
       }
       recognition = heard;
+      quiet();
       deps.listening(true);
       deps.say(DICTATION_LISTENING);
       return true;
@@ -132,6 +164,10 @@ export function createDictation(deps: DictationDependencies): Dictation {
       }
     },
     active: () => recognition !== null,
+    quietKeyboard() {
+      if (deps.recognition() !== null) quiet();
+    },
+    showKeyboard: restore,
   };
 }
 

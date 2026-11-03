@@ -133,7 +133,7 @@ test("`#624 voice-page-modularity`: a focused field with the visual viewport a k
 
 test("`#821 voice-page-read-aloud-react`: dictation writes unsure then settled words after what the box held, says it listens, and falls back to the keyboard's microphone", () => {
   const { createDictation, DICTATION_LISTENING, DICTATION_UNAVAILABLE } = VIEW_COMPOSER;
-  const box = { value: "Yes," };
+  const box = { value: "Yes,", getAttribute: () => null, setAttribute: () => {}, removeAttribute: () => {} };
   const said = [];
   const heard = [];
   let settled = 0;
@@ -176,4 +176,65 @@ test("`#821 voice-page-read-aloud-react`: dictation writes unsure then settled w
   const none = createDictation(deps(null));
   assert.equal(none.start(), false);
   assert.equal(said.at(-1), DICTATION_UNAVAILABLE);
+});
+
+test("`#829 voice-page-dictation-polish`: the keyboard stays down while dictation listens, and comes back on a tap, a stop, the end or a failure", () => {
+  const { createDictation } = VIEW_COMPOSER;
+  const attributes = new Map();
+  const box = {
+    value: "",
+    getAttribute: (name) => (attributes.has(name) ? attributes.get(name) : null),
+    setAttribute: (name, value) => attributes.set(name, String(value)),
+    removeAttribute: (name) => attributes.delete(name),
+  };
+  let made = null;
+  class Fake {
+    constructor() { made = this; }
+    start() {}
+    abort() {}
+  }
+  const deps = (recognition) => ({
+    recognition: () => recognition, lang: () => "en-GB", box: () => box, say: () => {}, listening: () => {}, settled: () => {},
+  });
+  const mode = () => box.getAttribute("inputmode");
+  const dictation = createDictation(deps(Fake));
+  // Before the box takes the focus, and through the listening that follows.
+  dictation.quietKeyboard();
+  assert.equal(mode(), "none", "the keyboard is not kept down before the box takes the focus");
+  dictation.start();
+  assert.equal(mode(), "none", "the keyboard comes up while dictation listens");
+  dictation.showKeyboard();
+  assert.deepStrictEqual([mode(), dictation.active()], [null, true], "a tap in the box did not bring the keyboard back alone");
+  made.onend();
+  dictation.start();
+  assert.equal(mode(), "none");
+  made.onend();
+  assert.equal(mode(), null, "the keyboard stays down after the recognition ended");
+  dictation.start();
+  made.onerror({ error: "network" });
+  assert.equal(mode(), null, "the keyboard stays down after the recognition failed");
+  // A second reply opened while one listens: that listening stopped first, the keyboard is down before the
+  // box takes the focus again.
+  dictation.start();
+  dictation.stop();
+  dictation.quietKeyboard();
+  assert.equal(mode(), "none", "a reply opened while one listened lets the keyboard up before its focus");
+  dictation.start();
+  dictation.stop();
+  // The box's own mode is put back as it was.
+  box.setAttribute("inputmode", "text");
+  dictation.start();
+  dictation.stop();
+  assert.equal(mode(), "text", "stopping did not put the box's own inputmode back");
+  // Where the browser cannot listen, the keyboard is never kept down: it is the way to speak.
+  box.removeAttribute("inputmode");
+  const none = createDictation(deps(null));
+  none.quietKeyboard();
+  assert.equal(mode(), null, "the keyboard is kept down where nothing can listen");
+  // Kept down for a start that then fails: given back.
+  class Refusing extends Fake { start() { throw new Error("not-allowed"); } }
+  const refused = createDictation(deps(Refusing));
+  refused.quietKeyboard();
+  assert.equal(refused.start(), false);
+  assert.equal(mode(), null, "a start that failed left the keyboard down");
 });

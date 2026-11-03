@@ -366,6 +366,7 @@ export interface ElementById {
   "pull-refresh": HTMLDivElement;
   "quick-reply": HTMLDivElement;
   "quick-reply-cancel": HTMLButtonElement;
+  "quick-reply-mic": HTMLButtonElement;
   "quick-reply-quote": HTMLElement;
   "quick-reply-send": HTMLButtonElement;
   "quick-reply-state": HTMLParagraphElement;

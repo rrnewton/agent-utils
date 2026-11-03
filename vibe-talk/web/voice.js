@@ -25755,8 +25755,13 @@ function openSentenceReply(id, text, box) {
     setStatus("That message is not on screen to reply to.");
     return;
   }
+  // `#829 voice-page-dictation-polish`: the keyboard kept down from before the box takes the focus. A reply
+  // opened while one listens (React again) stops that listening first, whose end would give the keyboard back.
+  dictation.stop();
+  dictation.quietKeyboard();
   inColumn(found.column, () => quoteOwner.openSentenceReply(found.row, id, text, box));
   if (!el("quick-reply").hidden) dictation.start();
+  else dictation.showKeyboard();
 }
 
 /**
@@ -25768,7 +25773,11 @@ const dictation = createDictation({
   lang: () => (typeof navigator === "object" && navigator && navigator.language) || "en-US",
   box: () => el("quick-reply-text"),
   say: (text) => setTextIfChanged(el("quick-reply-state"), text),
-  listening: (on) => el("quick-reply").toggleAttribute("data-listening", on),
+  listening: (on) => {
+    el("quick-reply").toggleAttribute("data-listening", on);
+    // `#829 voice-page-dictation-polish`: the microphone badge, while it listens.
+    el("quick-reply-mic").hidden = !on;
+  },
   settled: () => quoteOwner.noteQuickReplyInput(),
 });
 
@@ -32841,6 +32850,11 @@ el("quick-reply-text").addEventListener("keydown", (event) => {
 watchBoxInsertions(el("quick-reply-text"));
 // `#819 voice-page-quoted-reply-and-draft-chip`. Kept on the device as it is written, dictation included.
 el("quick-reply-text").addEventListener("input", () => quoteOwner.noteQuickReplyInput());
+// `#829 voice-page-dictation-polish`. A tap in the box while it listens asks for the keyboard back; a tap on
+// the microphone badge stops listening, the focus staying in the box.
+el("quick-reply-text").addEventListener("pointerdown", () => dictation.showKeyboard());
+el("quick-reply-mic").addEventListener("mousedown", (event) => event.preventDefault());
+el("quick-reply-mic").addEventListener("click", () => dictation.stop());
 leftEl("draft-chip").addEventListener("click", () => guardQuietly(pressDraftChip)());
 // `#821 voice-page-read-aloud-react`. React, in the paused read's strip.
 el("read-react").addEventListener("click", () => readAloudOwner().reactToHeldSentence());
