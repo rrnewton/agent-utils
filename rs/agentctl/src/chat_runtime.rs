@@ -11344,12 +11344,17 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
     }
 
     /// The ordinal of the newest reply of `key` with the text of `body`, as a capture compares
-    /// texts.
+    /// texts: the same text, or one that reads the same once rendered.
     fn stored_ordinal_locked(&self, key: &str, body: &str) -> Result<u32> {
         let plain = ReplyIdentity::of(body).plain;
         let request = self.read_request(key)?;
         for ordinal in (1..request.next_reply_ordinal).rev() {
             if ReplyIdentity::of(&self.read_reply(key, ordinal)?.body).plain == plain {
+                return Ok(ordinal);
+            }
+        }
+        for ordinal in (1..request.next_reply_ordinal).rev() {
+            if same_reply_rendered(&self.read_reply(key, ordinal)?.body, body) {
                 return Ok(ordinal);
             }
         }
@@ -12076,24 +12081,31 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
                 }
                 body = clean;
             }
-            if transcript.only.contains(&block.body) {
-                if stored_bodies.is_none() {
-                    let mut bodies = Vec::new();
-                    for ordinal in 1..request.next_reply_ordinal {
-                        bodies.push(self.read_reply(key, ordinal)?.body);
-                    }
-                    stored_bodies = Some(bodies);
+            // A block that reads, once rendered, like a reply the request holds is that reply
+            // again: a transcript block of a reply stored from the screen before the transcript
+            // held it, or a screen rendering of a reply that `chat reply` stored with its source
+            // text, whose table the identity checks above cannot match, so it was posted twice
+            // (#783 chat-reply-capture-miss).
+            if stored_bodies.is_none() {
+                let mut bodies = Vec::new();
+                for ordinal in 1..request.next_reply_ordinal {
+                    bodies.push(self.read_reply(key, ordinal)?.body);
                 }
-                let earlier = stored_bodies
-                    .iter()
-                    .flatten()
-                    .chain(unwritten.iter().map(|(_, reply)| &reply.body));
-                if earlier
-                    .into_iter()
-                    .any(|earlier| same_rendered_text(earlier, body))
-                {
-                    continue;
+                stored_bodies = Some(bodies);
+            }
+            let earlier = stored_bodies
+                .iter()
+                .flatten()
+                .chain(unwritten.iter().map(|(_, reply)| &reply.body));
+            let only_transcript = transcript.only.contains(&block.body);
+            if earlier.into_iter().any(|earlier| {
+                if only_transcript {
+                    same_rendered_text(earlier, body)
+                } else {
+                    same_reply_rendered(earlier, body)
                 }
+            }) {
+                continue;
             }
             let from_transcript = body != &block.body || transcript.only.contains(body);
             if expected > MAX_REPLY_ORDINAL {
@@ -16732,6 +16744,34 @@ fn same_rendered_text(left: &str, right: &str) -> bool {
     left_keys
         .iter()
         .any(|key| !key.is_empty() && right_keys.iter().any(|other| sorted(key) == sorted(other)))
+}
+
+/// Whether `later` is the reply `earlier` again, as a terminal draws them (#783
+/// chat-reply-capture-miss): the same characters in the same order once whitespace, box drawing
+/// and inline markup are set aside, or, between a Markdown source and a screen rendering of it
+/// (exactly one of the two with Markdown table rows), the same characters in another order, as
+/// when a table's cells wrap. Two screen readings, or two sources, must read the same in order:
+/// tables whose cells trade places are different replies.
+fn same_reply_rendered(earlier: &str, later: &str) -> bool {
+    use agent_harness::replies::{label_key, rendered_equivalent, rendered_key};
+    let keys = |text: &str| [rendered_key(text), label_key(text)];
+    let (earlier_keys, later_keys) = (keys(earlier), keys(later));
+    if earlier_keys
+        .iter()
+        .any(|key| !key.is_empty() && later_keys.contains(key))
+    {
+        return true;
+    }
+    let markdown_table = |text: &str| {
+        text.lines().any(|line| {
+            let line = line.trim();
+            line.len() > 1 && line.starts_with('|') && line.ends_with('|')
+        })
+    };
+    markdown_table(earlier) != markdown_table(later)
+        && (same_rendered_text(earlier, later)
+            || rendered_equivalent(earlier, later)
+            || rendered_equivalent(later, earlier))
 }
 
 /// The most transcript blocks remembered as settled before the memory starts over.
@@ -29178,6 +29218,48 @@ opening line for, the reply block marked {nonce}_2, so that block was not sent.\
             .capture_snapshot(&reply_block(&id, DRAWN))
             .expect("screen again");
         assert!(capture.replies.is_empty(), "{capture:?}");
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// #783 chat-reply-capture-miss slice (c): a reply sent with `chat reply` is not posted again
+    /// when a capture reads its rendering on the screen, with no transcript to pair the two, and
+    /// a reply first captured from the screen is not sent again by `chat reply` with its source
+    /// text. Another reply under the same ID is still stored.
+    #[test]
+    fn a_command_reply_and_its_screen_rendering_are_one_reply() {
+        let (state, key, nonce, root) = open_request("command-then-screen");
+        let id = format!("{nonce}_1");
+        let stored = state
+            .submit_reply(&key, &id, WRITTEN)
+            .expect("command reply");
+        assert!(
+            matches!(&stored, ReplyStoreOutcome::Stored(reply) if reply.ordinal == 1),
+            "{stored:?}"
+        );
+        let capture = state
+            .capture_snapshot(&reply_block(&id, DRAWN))
+            .expect("screen capture");
+        assert!(capture.replies.is_empty(), "{capture:?}");
+        let capture = state
+            .capture_snapshot(&reply_block(&id, "A second, different reply."))
+            .expect("another reply");
+        assert_eq!(capture.replies, [(key.clone(), vec![2])]);
+        fs::remove_dir_all(root).expect("cleanup");
+
+        let (state, key, nonce, root) = open_request("screen-then-command");
+        let id = format!("{nonce}_1");
+        let capture = state
+            .capture_snapshot(&reply_block(&id, DRAWN))
+            .expect("screen capture");
+        assert_eq!(capture.replies, [(key.clone(), vec![1])]);
+        let stored = state
+            .submit_reply(&key, &id, WRITTEN)
+            .expect("command reply");
+        assert!(
+            matches!(&stored, ReplyStoreOutcome::Stored(reply)
+                if reply.ordinal == 1 && reply.already_stored),
+            "{stored:?}"
+        );
         fs::remove_dir_all(root).expect("cleanup");
     }
 

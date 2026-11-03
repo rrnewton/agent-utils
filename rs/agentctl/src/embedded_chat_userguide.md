@@ -896,7 +896,12 @@ nonempty, hold no terminal control characters, fit in 30,000 UTF-8 bytes once
 the agent label is added, and have no line that is a reply marker line. A closed
 or retired request takes no more replies. A text the request already holds,
 read from the screen or stored by an earlier command, is not stored again, so
-running the command twice sends that text once. The command prints one JSON
+running the command twice sends that text once. Nor is a text that reads the
+same as a held reply once drawn on the screen (whitespace, box drawing and
+inline markup aside; between a Markdown source and its screen rendering, also
+with a table's cells wrapped): a reply sent with the command and then read from
+the screen in its rendered form, or the other way round, is sent once, and the
+command answers `already_stored` with the held reply's ordinal. The command prints one JSON
 object with `request`, `reply_id`, `outcome` (`stored` or `already_stored`),
 `ordinal`, `phase` and `service_woken`, and exits 0. A refused reply exits 1
 with the reason on standard error and stores nothing; that includes an empty or
