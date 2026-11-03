@@ -62,6 +62,9 @@ case "$1" in
   reap-stray-worktrees)
     if [ "$2" = "--help" ]; then echo "Usage: --root --machine --repository --apply --format"; exit 0; fi
     echo "RS reap-stray-worktrees $@" ;;
+  reclaim-orphan-state)
+    if [ "$2" = "--help" ]; then echo "Usage: --root --machine --apply --format"; exit 0; fi
+    echo "RS reclaim-orphan-state $@" ;;
   classify-create-journals)
     if [ "$2" = "--help" ]; then echo "Usage: --root --machine --agent --slot-type --format"; exit 0; fi
     echo "RS classify-create-journals $@" ;;
@@ -215,6 +218,14 @@ def test_reap_stray_worktrees_runs_in_rust(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert result.stdout.startswith("RS reap-stray-worktrees reap-stray-worktrees --repository repo1")
     assert "cmd=reap-stray-worktrees edition=rust rc=0" in log.read_text()
+
+
+def test_reclaim_orphan_state_runs_in_rust(tmp_path: Path) -> None:
+    root, log = _sandbox(tmp_path)
+    result = _run(root, log, "reclaim-orphan-state")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("RS reclaim-orphan-state reclaim-orphan-state")
+    assert "cmd=reclaim-orphan-state edition=rust rc=0" in log.read_text()
 
 
 def test_classify_create_journals_runs_in_rust(tmp_path: Path) -> None:

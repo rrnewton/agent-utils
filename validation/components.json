@@ -414,6 +414,8 @@
         "py/wrkslots/tests/test_reanchor_liveness.py",
         "py/wrkslots/tests/test_reap_stray_rust.py",
         "py/wrkslots/tests/test_reap_stray_worktrees.py",
+        "py/wrkslots/tests/test_reclaim_slot_state.py",
+        "py/wrkslots/tests/test_reclaim_state_rust.py",
         "py/wrkslots/tests/test_record_holds_rust.py",
         "py/wrkslots/tests/test_recover_absent_write_rust.py",
         "py/wrkslots/tests/test_recover_batch_text_rust.py",

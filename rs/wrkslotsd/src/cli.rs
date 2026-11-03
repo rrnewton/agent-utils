@@ -904,6 +904,21 @@ pub(crate) enum Command {
         #[arg(long, value_name = "NAME")]
         machine: Option<String>,
     },
+    /// Report or reclaim slot-state homes whose slot is already archived (#796)
+    ReclaimOrphanState {
+        /// Reclaim each reapable orphan home (default: report only)
+        #[arg(long = "apply")]
+        apply_mode: bool,
+        /// Output format: human prints the orphan lines; json prints the payload
+        #[arg(long, value_name = "FORMAT", default_value = "human", value_parser = ["human", "json"])]
+        format: String,
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
     /// Resume a journal or start bounded ownerless validation cleanup (writer; fixture registries only until cutover)
     Recover {
         /// Live current coordinator PID recorded with recovery
@@ -2399,6 +2414,26 @@ pub fn run() -> u8 {
             Ok((text, retained_any)) => {
                 print!("{text}");
                 return if apply_mode && retained_any { 1 } else { 0 };
+            }
+            Err(error) => {
+                eprintln!("wrkslotsd: {error}");
+                return 1;
+            }
+        },
+        Command::ReclaimOrphanState {
+            apply_mode,
+            format,
+            root,
+            machine,
+        } => match crate::reclaim_state::reclaim_orphan_state(
+            root.as_deref(),
+            machine.as_deref(),
+            apply_mode,
+            format == "json",
+        ) {
+            Ok(text) => {
+                print!("{text}");
+                return 0;
             }
             Err(error) => {
                 eprintln!("wrkslotsd: {error}");

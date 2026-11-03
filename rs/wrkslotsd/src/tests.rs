@@ -5046,6 +5046,7 @@ fn cli_surface_contains_no_executor_or_mutation_subcommand() {
             "recover-absent-agent-rows",
             "recover-absent-agent-rows-text",
             "reap-stray-worktrees",
+            "reclaim-orphan-state",
             "recover-unbound-owner",
             "transfer-owner",
             "create",

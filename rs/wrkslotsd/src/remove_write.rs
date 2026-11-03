@@ -1458,6 +1458,7 @@ pub(crate) fn remove_slot(
             "remove for slot type '{slot_type}' stays with the Python edition for now"
         ));
     }
+    crate::reclaim_state::prepare_reclaim(&cfg.control, &slot_type, slot)?;
     // Re-verify the coordinator generation under the mutation locks.
     let coordinator_now = read_process_identity(coordinator_pid).map_err(|_| {
         format!("coordinator PID {coordinator_pid} exited before the locked removal boundary")
@@ -2115,12 +2116,14 @@ pub(crate) fn remove_slot(
     )?;
     clear_journal(&cfg, &selected, &journal)?;
     validate_global(root, &cfg)?;
+    let state_home_reclaimed = crate::reclaim_state::reclaim_home(&cfg.control, &slot_type, slot);
     Ok(json!({
         "machine": selected,
         "slot": slot,
         "generation": generation,
         "outcome": "removed and archived",
         "archive_id": archive_id,
+        "state_home_reclaimed": state_home_reclaimed,
     }))
 }
 

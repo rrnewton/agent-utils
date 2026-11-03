@@ -74,6 +74,7 @@ mod plan;
 mod policy;
 mod read_handoff_write;
 mod reap_strays;
+mod reclaim_state;
 mod record_holds;
 mod recover_absent_write;
 mod recover_cache_write;

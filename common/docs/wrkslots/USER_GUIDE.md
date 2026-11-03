@@ -669,6 +669,18 @@ it judged. The slot-removed event lists each deleted repository with `contents_j
 Removal of a validation slot without `--validate-complete` still refuses any nested `.git`. Audit
 judges a validation row's caches the same way, so it predicts this removal.
 
+## Slot-state homes
+
+A slot's private state home (`slot-state/<slot_type>/<slot>` under the control
+directory) is reclaimed by `wrkslots remove` together with the slot itself:
+removal refuses while a live process uses the home, and any git repository in
+the home whose HEAD no remote-tracking ref holds is first kept as a verified
+salvage bundle under `wrkslots-salvage/state-home/`. Homes left behind by
+slots that were already removed are listed by `wrkslots reclaim-orphan-state`
+(read-only plan by default, keyed to the archived slot records);
+`wrkslots reclaim-orphan-state --apply` reclaims them under the same gates,
+and refuses while the retire freeze is set.
+
 ## Handoffs and retirement
 
 Write a new handoff outside the checkout while its exact owner is still live:

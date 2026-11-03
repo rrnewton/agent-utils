@@ -78,6 +78,7 @@ case "$CMD" in
     freeze) RUST_CMD="freeze" ;;
     classify-create-journals) RUST_CMD="classify-create-journals" ;;
     reap-stray-worktrees) RUST_CMD="reap-stray-worktrees" ;;
+    reclaim-orphan-state) RUST_CMD="reclaim-orphan-state" ;;
     unpushed|adopt|heartbeat|release|hold|unhold|finish|remove|write-handoff|read-handoff|transfer-owner|recover-unbound-owner|recover-absent-agent-row|recover-ownerless-agent-worktree|recover-ownerless-agent-clone|recover-ownerless-agent-cache|recover)
         RUST_CMD="$CMD" ;;
     *) run_python "$CMD" "${ORIGINAL[@]}" ;;

@@ -29655,6 +29655,197 @@ def _stray_live_uses(path: Path) -> list[str]:
     return uses
 
 
+def _slot_state_home(config: Config, slot_type: str, slot: str) -> Path:
+    """The slot's private state home under the control directory (#796)."""
+    return config.control / "slot-state" / slot_type / slot
+
+
+def _state_home_git_repos(home: Path) -> list[Path]:
+    """Git worktree roots anywhere under a slot-state home (bounded walk)."""
+    repos: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(home):
+        current = Path(dirpath)
+        if ".git" in dirnames:
+            repos.append(current)
+            dirnames.remove(".git")
+        elif ".git" in filenames:
+            repos.append(current)
+        dirnames[:] = [
+            name for name in dirnames if not (current / name).is_symlink()
+        ]
+    return sorted(repos, key=str)
+
+
+def _state_home_unpushed_head(repo: Path, vcs: _GitVcs) -> str | None:
+    """HEAD commit of a state-home repo that no remote-tracking ref holds."""
+    head = vcs._run(repo, ["rev-parse", "--verify", "HEAD"], check=False)
+    if head.returncode != 0:
+        return None
+    sha = head.stdout.strip()
+    contained = vcs._run(
+        repo,
+        ["for-each-ref", "--contains", sha, "--format=%(refname)", "refs/remotes/"],
+        check=False,
+    )
+    if contained.returncode != 0:
+        return sha
+    if any(line.strip() for line in contained.stdout.splitlines()):
+        return None
+    return sha
+
+
+def _salvage_state_home_repo(
+    config: Config, slot_type: str, slot: str, repo: Path, head: str, vcs: _GitVcs
+) -> Path:
+    """Bundle one unpushed state-home repo under the salvage archive (#796)."""
+    archive_root = _default_salvage_archive_root(config)
+    directory = (
+        archive_root / _LOCAL_SALVAGE_DIRECTORY / "state-home" / f"{slot_type}-{slot}"
+    )
+    directory.mkdir(parents=True, exist_ok=True)
+    label = "-".join(repo.parts[-2:]) if len(repo.parts) > 1 else repo.name
+    bundle = directory / f"{label}-{head[:12]}.bundle"
+    if not bundle.exists():
+        temp_bundle = directory / f".{bundle.name}.tmp.{os.getpid()}"
+        made = vcs._run(
+            repo, ["bundle", "create", str(temp_bundle), "HEAD"], check=False
+        )
+        if made.returncode != 0:
+            with contextlib.suppress(FileNotFoundError):
+                temp_bundle.unlink()
+            raise Refusal(
+                f"cannot bundle unpushed git in slot state home {repo}: "
+                f"{made.stderr.strip()}"
+            )
+        verified = vcs._run(repo, ["bundle", "verify", str(temp_bundle)], check=False)
+        heads = vcs._run(repo, ["bundle", "list-heads", str(temp_bundle)], check=False)
+        if verified.returncode != 0 or head not in heads.stdout:
+            with contextlib.suppress(FileNotFoundError):
+                temp_bundle.unlink()
+            raise Refusal(
+                f"salvage bundle for state home {repo} did not verify for {head}"
+            )
+        temp_bundle.replace(bundle)
+    return bundle
+
+
+def _prepare_state_home_reclaim(
+    config: Config, slot_type: str, slot: str, vcs: _GitVcs
+) -> list[Path]:
+    """Safety gate for reclaiming a slot-state home (#796).
+
+    Refuses while any live process uses the home; bundles every git repo
+    whose HEAD no remote-tracking ref holds. Returns the salvage bundles.
+    """
+    home = _slot_state_home(config, slot_type, slot)
+    if not home.exists():
+        return []
+    uses = _stray_live_uses(home)
+    if uses:
+        raise Refusal(
+            f"slot state home {home} is in use by a live process "
+            f"({'; '.join(uses)}); refusing to reclaim it"
+        )
+    bundles: list[Path] = []
+    for repo in _state_home_git_repos(home):
+        head = _state_home_unpushed_head(repo, vcs)
+        if head is not None:
+            bundles.append(
+                _salvage_state_home_repo(config, slot_type, slot, repo, head, vcs)
+            )
+    return bundles
+
+
+def _reclaim_slot_state_home(config: Config, slot_type: str, slot: str) -> bool:
+    """Delete a slot-state home already cleared by _prepare_state_home_reclaim."""
+    home = _slot_state_home(config, slot_type, slot)
+    if not home.exists():
+        return False
+    shutil.rmtree(home)
+    return True
+
+
+def _cmd_reclaim_orphan_state(args: argparse.Namespace) -> int:
+    """Plan or reclaim state homes whose slot is already archived (#796).
+
+    Read-only plan by default; --apply deletes, after the liveness and
+    unpushed-git gates, and refuses while the retire freeze is set.
+    """
+    config = _load_config(args.project_root, args.machine)
+    if args.apply:
+        _assert_not_retire_frozen(config, "reclaim-orphan-state")
+    states = _load_all_active(config)
+    active = {(record.slot_type, record.slot) for state in states for record in state.slots}
+    archived: set[tuple[str, str]] = set()
+    for archive in _load_all_archives(config):
+        for raw_record in archive.records:
+            archived.add(
+                (
+                    _as_str(raw_record.get("slot_type", "agent"), "archived slot_type"),
+                    _as_str(raw_record.get("slot"), "archived slot"),
+                )
+            )
+    vcs = _GitVcs()
+    base = config.control / "slot-state"
+    rows: list[dict[str, object]] = []
+    if base.is_dir():
+        for slot_type in sorted(os.listdir(base)):
+            type_dir = base / slot_type
+            if not type_dir.is_dir():
+                continue
+            for slot in sorted(os.listdir(type_dir)):
+                home = type_dir / slot
+                if not home.is_dir() or (slot_type, slot) in active:
+                    continue
+                if (slot_type, slot) not in archived:
+                    continue
+                rows.append(
+                    {"slot": slot, "slot_type": slot_type, "home": str(home)}
+                )
+    outcomes: list[dict[str, object]] = []
+    for row in rows:
+        slot = str(row["slot"])
+        slot_type = str(row["slot_type"])
+        home = Path(str(row["home"]))
+        if not args.apply:
+            uses = _stray_live_uses(home)
+            outcomes.append(
+                {
+                    **row,
+                    "outcome": "retained-live" if uses else "planned",
+                    "live_uses": uses,
+                }
+            )
+            continue
+        try:
+            bundles = _prepare_state_home_reclaim(config, slot_type, slot, vcs)
+        except Refusal as exc:
+            outcomes.append({**row, "outcome": "retained", "reason": str(exc)})
+            continue
+        _reclaim_slot_state_home(config, slot_type, slot)
+        outcomes.append(
+            {
+                **row,
+                "outcome": "reclaimed",
+                "salvage_bundles": [str(bundle) for bundle in bundles],
+            }
+        )
+    if getattr(args, "format", "human") == "json":
+        payload: dict[str, object] = {
+            "applied": bool(args.apply),
+            "orphans": outcomes,
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        for item in outcomes:
+            print(
+                f"slot={item['slot']} slot_type={item['slot_type']} "
+                f"outcome={item['outcome']} home={item['home']}"
+            )
+        print(f"orphan-state-homes={len(outcomes)} applied={bool(args.apply)}")
+    return 0
+
+
 def _cmd_reap_stray_worktrees(args: argparse.Namespace) -> int:
     """Report (or with --apply, reap) stray Git worktree registrations (#775).
 
@@ -39164,6 +39355,9 @@ def _cmd_remove_in_scope(
         state = _load_active(config, require_repository=False)
         record = _find_record(state, args.slot)
         _expected_generation(record, args.expected_generation)
+        _prepare_state_home_reclaim(
+            config, record.slot_type, record.slot, _GitVcs()
+        )
         if attest_agent is not None and (
             record.slot_type != "agent" or record.agent != attest_agent
         ):
@@ -39925,8 +40119,13 @@ def _cmd_remove_in_scope(
         agent_batch.nested_git_evidence[:] = [
             dict(item) for item in finish_context.nested_git_evidence
         ]
+    state_home_reclaimed = _reclaim_slot_state_home(
+        config, record.slot_type, record.slot
+    )
     if emit:
         print(f"removed and archived slot={record.slot} generation={record.generation}")
+        if state_home_reclaimed:
+            print(f"reclaimed slot-state home slot={record.slot}")
         if finish_context is not None:
             _print_nested_git_evidence(finish_context.nested_git_evidence)
     return 0
@@ -62894,6 +63093,28 @@ usage or audit gate unknown, 3 fail-closed refusal.
         help="result format (default: human)",
     )
     reap_stray.set_defaults(handler=_cmd_reap_stray_worktrees)
+    reclaim_orphan = subparsers.add_parser(
+        "reclaim-orphan-state",
+        description=(
+            "Report slot-state homes whose slot is already archived. With --apply, "
+            "reclaim each after the liveness and unpushed-git gates (unpushed git is "
+            "kept as a salvage bundle); refuses under the retire freeze."
+        ),
+        help="report or reclaim orphaned slot-state homes",
+        formatter_class=_HelpFormatter,
+    )
+    reclaim_orphan.add_argument(
+        "--apply",
+        action="store_true",
+        help="reclaim each reapable orphan home (default: report only)",
+    )
+    reclaim_orphan.add_argument(
+        "--format",
+        choices=("human", "json"),
+        default="human",
+        help="result format (default: human)",
+    )
+    reclaim_orphan.set_defaults(handler=_cmd_reclaim_orphan_state)
 
     clean_caches = subparsers.add_parser(
         "clean-caches",
