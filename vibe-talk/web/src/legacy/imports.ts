@@ -74,6 +74,7 @@ export {
   answersEnter,
   childByClass,
   classWords,
+  copyText,
   elementIn,
   focusMinimally,
   isLink,

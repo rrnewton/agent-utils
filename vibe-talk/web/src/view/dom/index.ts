@@ -7,3 +7,5 @@ export type { ElementById } from "./ids.ts";
 export { classWords, setClassWord } from "./classes.ts";
 export { sayingNodes, setAttributeIfChanged, setClassNameIfChanged, setHiddenIfChanged, setTextIfChanged, tagNameOf } from "./changes.ts";
 export { UNTYPED_INPUTS, answersEnter, isLink, isTextField, keepsOwnKeys, pressedBySpace, scrollsItself } from "./targets.ts";
+export { copyText, copyThroughTextarea } from "./clipboard.ts";
+export type { TextClipboard } from "./clipboard.ts";

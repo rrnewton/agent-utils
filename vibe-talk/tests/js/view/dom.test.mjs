@@ -75,3 +75,31 @@ test("`#624 voice-page-modularity`: where a key landed — a field typed in, a c
   assert.equal(scrollsItself(node("TEXTAREA", { scrollHeight: 101, clientHeight: 100 })), false, "a pixel's rounding is not a page");
   assert.equal(scrollsItself(node("DIV", { scrollHeight: 500, clientHeight: 100 })), false);
 });
+
+test("`#624 voice-page-modularity`: plain text goes on the clipboard by its API, else through a hidden textarea, and says whether it went", async () => {
+  const { copyText } = VIEW_DOM;
+  const written = [];
+  assert.equal(await copyText("hello", () => ({ writeText: async (text) => { written.push(text); } })), true);
+  assert.deepStrictEqual(written, ["hello"]);
+  const was = globalThis.document;
+  const events = [];
+  const focused = { focus: () => events.push("focus back") };
+  globalThis.document = {
+    activeElement: focused,
+    body: { append: (node) => { events.push("append"); node.parentNode = { removeChild: () => events.push("remove") }; } },
+    createElement: () => ({ style: {}, setAttribute: () => {}, focus: () => events.push("focus scratch"), select: () => events.push("select") }),
+    execCommand: (command) => { events.push(command); return true; },
+  };
+  try {
+    assert.equal(await copyText("x", () => ({ writeText: async () => { throw new Error("NotAllowedError"); } })), true,
+      "a refused API falls back to the textarea");
+    assert.deepStrictEqual(events, ["append", "focus scratch", "select", "copy", "remove", "focus back"]);
+    events.length = 0;
+    assert.equal(await copyText("x", () => { throw new ReferenceError("navigator is not defined"); }), true,
+      "a host with no clipboard falls back too");
+    globalThis.document.execCommand = undefined;
+    assert.equal(await copyText("x", () => null), false, "neither works: says so");
+  } finally {
+    globalThis.document = was;
+  }
+});

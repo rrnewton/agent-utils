@@ -22203,60 +22203,14 @@ async function copyMessageText(text) {
 }
 
 /**
- * Put `value` on the clipboard as plain text; whether it went.
- *
- * The asynchronous Clipboard API first: it needs a secure context and a user gesture, both of which a
- * tap on the ⋯ menu over HTTPS provides, and a key gives as well. Where that API is absent, or refuses
- * (as it does with the document not focused), the old selection-and-copy path through a hidden textarea
- * (`copyThroughTextarea`). False when neither works, for the caller to say so: never a silent no-op the
- * reader mistakes for a copy.
+ * Put `value` on the clipboard as plain text; whether it went (web/src/view/dom `copyText`: the
+ * asynchronous Clipboard API, else a hidden textarea's copy; `#624 voice-page-modularity`). False when
+ * neither works, for the caller to say so.
  *
  * @param {string} value
  */
-async function writeClipboardText(value) {
-  try {
-    if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
-      await navigator.clipboard.writeText(value);
-      return true;
-    }
-  } catch (_error) {
-    // Refused: the old way may still be allowed.
-  }
-  return copyThroughTextarea(value);
-}
-
-/**
- * Copy `value` as the browser copies a selection: in a textarea out of sight, selected, by
- * `execCommand("copy")`. The textarea is fixed at the corner of the window, so taking the focus scrolls
- * nothing, and the focus goes back where it was, so the keys still move the list. Whether it went.
- *
- * @param {string} value
- */
-function copyThroughTextarea(value) {
-  if (typeof document.execCommand !== "function" || !document.body) return false;
-  const back = /** @type {HTMLElement | null} */ (document.activeElement);
-  const scratch = document.createElement("textarea");
-  scratch.value = value;
-  scratch.setAttribute("readonly", "");
-  scratch.setAttribute("aria-hidden", "true");
-  scratch.setAttribute("tabindex", "-1");
-  scratch.style.position = "fixed";
-  scratch.style.top = "0";
-  scratch.style.left = "0";
-  scratch.style.opacity = "0";
-  document.body.append(scratch);
-  let copied = false;
-  try {
-    scratch.focus({ preventScroll: true });
-    scratch.select();
-    copied = document.execCommand("copy");
-  } catch (_error) {
-    copied = false;
-  } finally {
-    if (scratch.parentNode) scratch.parentNode.removeChild(scratch);
-    if (back && back !== document.body && typeof back.focus === "function") back.focus({ preventScroll: true });
-  }
-  return copied;
+function writeClipboardText(value) {
+  return copyText(value, () => navigator.clipboard);
 }
 
 // `#62 message-count-accuracy`, carried across from the older page at `/` (gone since `#302

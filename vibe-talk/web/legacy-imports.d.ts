@@ -16,6 +16,7 @@ declare const createApi: LegacyImports["createApi"];
 declare const createWebPorts: LegacyImports["createWebPorts"];
 declare const childByClass: LegacyImports["childByClass"];
 declare const nodeWithin: LegacyImports["nodeWithin"];
+declare const copyText: LegacyImports["copyText"];
 declare const shownNode: LegacyImports["shownNode"];
 declare const elementIn: LegacyImports["elementIn"];
 declare const focusMinimally: LegacyImports["focusMinimally"];
