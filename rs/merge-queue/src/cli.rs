@@ -12,8 +12,8 @@ use crate::plan::{render, short};
 use crate::run::{self, RunOptions, RunReport, Runner};
 use crate::serve::{self, ServeOptions};
 use crate::state::{
-    ClassRule, Config, GitHubConfig, IdentityConfig, LandConfig, NotifyConfig, RegenerateConfig,
-    State, ValidatorConfig, DEFAULT_DEPTH, DEFAULT_MAX_BATCH, DEFAULT_PRIORITY,
+    ClassRule, Config, GitHubConfig, IdentityConfig, LandConfig, NotifyConfig, PriorityConfig,
+    RegenerateConfig, State, ValidatorConfig, DEFAULT_DEPTH, DEFAULT_MAX_BATCH, DEFAULT_PRIORITY,
 };
 use crate::tests::{parse_selection, ValidationClaim};
 
@@ -346,6 +346,16 @@ enum Command {
         /// Repeatable.
         #[arg(long, value_name = "PATTERN")]
         union_path: Vec<String>,
+        /// Label that makes a pull request a priority change when `sync` reads it: planned
+        /// ahead of all other work and validated in a batch of its own (it still lands only on
+        /// its own exact green). Compared without regard to case; `-` turns it off.
+        #[arg(long, value_name = "LABEL", default_value = crate::state::DEFAULT_PRIORITY_LABEL)]
+        priority_label: String,
+        /// Path pattern of CI or validation infrastructure (exact path, directory, or `*`
+        /// wildcards). `plan` suggests the priority label for a change touching only these
+        /// paths; the queue never applies it. Repeatable.
+        #[arg(long, value_name = "PATTERN")]
+        ci_path: Vec<String>,
         /// Generated-file path pattern the queue regenerates instead of treating its conflicts
         /// as real (exact path, directory with or without a trailing slash, or `*` wildcards).
         /// Repeatable.
@@ -517,6 +527,11 @@ enum Command {
         /// Validate and land this change in a batch of its own.
         #[arg(long)]
         solo: bool,
+        /// A priority change (as the priority label does for `sync`): planned ahead of all
+        /// other work and validated in a batch of its own. It still lands only on its own exact
+        /// green.
+        #[arg(long)]
+        prioritized: bool,
         /// Who is submitting (agent or person).
         #[arg(long, default_value = "")]
         by: String,
@@ -970,6 +985,8 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             depth,
             max_depth,
             union_path,
+            priority_label,
+            ci_path,
             regen_path,
             regen_command,
             regen_build,
@@ -1026,6 +1043,14 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                 depth: depth.max(1),
                 max_depth,
                 union_paths: union_path,
+                priority: PriorityConfig {
+                    label: if priority_label == crate::state::DEFAULT_PRIORITY_LABEL {
+                        String::new()
+                    } else {
+                        priority_label
+                    },
+                    ci_paths: ci_path,
+                },
                 regenerate: RegenerateConfig {
                     paths: regen_path,
                     command: regen_command,
@@ -1127,6 +1152,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             priority,
             after,
             solo,
+            prioritized,
             by,
             title,
             tested_with,
@@ -1157,6 +1183,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     title,
                     after,
                     solo,
+                    prioritized,
                     claim,
                     source: String::new(),
                     requires: requires
@@ -1174,10 +1201,15 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                 None => String::new(),
             };
             println!(
-                "queued #{} at {} (priority {}){claim}",
+                "queued #{} at {} (priority {}{}){claim}",
                 item.pr,
                 short(&item.head),
-                item.priority
+                item.priority,
+                if item.prioritized {
+                    ", front of the queue"
+                } else {
+                    ""
+                }
             );
             Ok(0)
         }
@@ -1277,7 +1309,11 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                         "#{:<7} {:<10} {:<8} {:<10} {:<10} {}",
                         item.pr,
                         item.status.as_str(),
-                        item.priority,
+                        if item.prioritized {
+                            format!("{}!", item.priority)
+                        } else {
+                            item.priority.to_string()
+                        },
                         short(&item.head),
                         tested,
                         item.title

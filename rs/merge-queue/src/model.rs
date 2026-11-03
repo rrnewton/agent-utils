@@ -115,6 +115,11 @@ pub struct Item {
     /// Validate and land this change in a batch of its own (a risky change).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub solo: bool,
+    /// A priority change (the configured priority label, or `submit --prioritized`): planned
+    /// ahead of all other work and validated in a batch of its own, so a red result can neither
+    /// hide behind nor eject unrelated changes. It still lands only on its own exact green.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub prioritized: bool,
     /// Land this change as its own commits (a fast-forward), never replayed, because another
     /// repository pins one of them. Implies a batch of its own.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -310,6 +315,9 @@ pub struct PlannedItem {
     pub files: usize,
     /// Number of queued changes it textually conflicts with.
     pub conflict_degree: usize,
+    /// A priority change, planned ahead of all other work.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub prioritized: bool,
 }
 
 /// Pairwise textual conflict between two queued heads (from `git merge-tree`).
@@ -344,6 +352,10 @@ pub struct Plan {
     pub conflicts: Vec<Conflict>,
     /// Directed dependencies `(before, after)` the plan respected.
     pub dependencies: Vec<(i64, i64)>,
+    /// Queued changes, not yet priority changes, that touch only the configured CI paths: a
+    /// suggestion to add the priority label, which the queue never applies itself.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suggest_priority: Vec<i64>,
 }
 
 /// Plan schema identifier.

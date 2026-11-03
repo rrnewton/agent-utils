@@ -93,6 +93,8 @@ This command creates the state directory and writes `config.json`.
 | `--depth N` | `2` | The initial window (batches validating at the same time) and the number of concurrent probes during a culprit search (at least 1). |
 | `--max-depth N` | `0` | The largest the adaptive window may grow: +1 per landed batch, halved per red batch, never below 1. `0` keeps the window fixed at `--depth`. |
 | `--union-path PATTERN` | none | A Git attribute pattern merged with Git's `union` driver, when probing conflicts and when combining changes. Repeatable. Only for line-oriented, append-only files (see "Union merges"). |
+| `--priority-label LABEL` | `mq-priority` | The label that makes a pull request a priority change when `sync` reads it from the hosting service, compared without regard to case. `-` turns it off. See "Priority changes". |
+| `--ci-path PATTERN` | none | A CI or validation-infrastructure path (exact path, directory with or without a trailing slash, or `*` wildcards). `plan` suggests the priority label for a change that touches only these paths; the queue never applies the label itself. Repeatable. |
 | `--regen-path PATTERN` | none | A generated file (exact path, directory with or without a trailing slash, or `*` wildcards) whose conflicts the queue resolves by regenerating it instead of holding the change. Repeatable. See "Generated files". |
 | `--regen-command CMD` | empty | Shell command, run as `sh -c` at the root of the candidate checkout, that rewrites every generated file from its sources deterministically. Runs with `MQ_PR` (change number), `MQ_REGEN_PATHS` (space-separated generated patterns) and `MQ_CONFLICTED` (space-separated conflicted paths, empty for a non-conflict refresh) set. Required with `--regen-path`. |
 | `--regen-when WHEN` | `conflict` | `conflict`: regenerate after a change whose combination conflicted in, or changed, a generated file (a textual merge of generated files need not be the regenerated output). `always`: regenerate after every change. Either way regeneration happens per change, so every prefix is a self-consistent tree. |
@@ -148,8 +150,8 @@ and sets its status back to `queued`.
 | `--priority N` | `100` | Lower values land first. |
 | `--after PR` | none | A change that must land first. Repeatable. |
 | `--solo` | off | Validate and land this change in a batch of its own. Use it for risky changes. |
+| `--prioritized` | off | A priority change, as the priority label makes one under `sync`: planned ahead of all other work and validated in a batch of its own. It still lands only on its own exact green. See "Priority changes". |
 | `--by NAME` | empty | Who is submitting (an agent or a person). |
-| `--notify NAME` | empty | agentctl session name the `serve` daemon notifies exactly once per state change (landed, ejected, refusal-deferred, escalated, withdrawn). Stored on the item next to `submitted_by`; resubmitting without it keeps the recorded name. Ready files set it per line with `notify=NAME`. |
 | `--notify NAME` | empty | agentctl session name the `serve` daemon notifies exactly once per state change (landed, ejected, refusal-deferred, escalated, withdrawn). Stored on the item next to `submitted_by`; resubmitting without it keeps the recorded name. Ready files set it per line with `notify=NAME`. |
 | `--title TEXT` | empty | A one-line description. |
 | `--tested-with SELECTION` | none | The tests you ran on this head: `all`, a comma- or space-separated list of test IDs, or `@FILE` with one ID per line (`#` starts a comment). This becomes the change's validation claim. Without it, the change has no claim. |
@@ -197,19 +199,13 @@ ready; missing review data never approves. Under the rule the author becomes the
 target only when the change has no `--notify` subscription yet. The report's `unapproved` field names the rest; a queued one is withdrawn (its
 submitter is notified through the withdrawn notification) instead of resubmitted, and a later
 sync listing it with an approval at its new head re-queues it.
-With `require_approval_at_head` (off by default), the batched list call also carries reviews
-(and is charged 3 requests per hundred results): only a pull request whose current head commit
-is approved, by full commit id, in the latest verdict of a reviewer with write access (`OWNER`,
-`MEMBER`, `COLLABORATOR`), with no such reviewer's latest verdict requesting changes, counts as
-ready; missing review data never approves. Under the rule the author becomes the notification
-target only when the change has no `--notify` subscription yet. The report's `unapproved` field names the rest; a queued one is withdrawn (its
-submitter is notified through the withdrawn notification) instead of resubmitted, and a later
-sync listing it with an approval at its new head re-queues it.
 Priorities come from labels such as `p10` or `priority-10`, the landing planner's convention;
-lower lands first, and the default is 100. When `--close-prs` is set, `sync` also retries closes
+lower lands first, and the default is 100. A pull request carrying the priority label
+(`mq-priority` unless `init --priority-label` names another) becomes a priority change; adding or
+removing the label resubmits it (see "Priority changes"). When `--close-prs` is set, `sync` also retries closes
 that were postponed. Exit status is 1 if any submission was refused.
 
-Ready-file lines look like `PR [SHA] [head=REF] [priority=N] [after=N,N] [solo] [by=NAME] [notify=NAME]`, and
+Ready-file lines look like `PR [SHA] [head=REF] [priority=N] [after=N,N] [solo] [prioritized] [by=NAME] [notify=NAME]`, and
 `#` starts a comment. Without `head=`, the head is `refs/pull/PR/head`.
 
 ### `merge-queue withdraw PR`
@@ -228,7 +224,8 @@ only deferred is returned at once too, without waiting for its backoff.
 
 This command prints the queued changes as a table with the columns `PR`, `STATUS`, `PRIO`, `HEAD`,
 `TESTED` and `TITLE`. `TESTED` shows the scope of the submitter's claim (`complete`, `focused`,
-or `-` when there is none), so focused submissions are visible at a glance.
+or `-` when there is none), so focused submissions are visible at a glance. `PRIO` ends in `!` for a
+priority change.
 
 | Option | Default | Meaning |
 |---|---|---|
@@ -245,9 +242,10 @@ the plan. It changes only the queue's private refs, never the queue state.
 | `--max-batch N` | the configured `max_batch` | Override the batch size for this plan. |
 | `--json` | off | Print the plan as JSON, using schema `merge-queue-plan/v1` (below). |
 
-The human form lists the batches with each change's priority and file count, then the held
-changes, then the conflict clusters (connected groups of conflicting changes with two or more
-members).
+The human form lists the batches with each change's priority and file count (and `priority,`
+before them for a priority change), then the held changes, then the conflict clusters (connected
+groups of conflicting changes with two or more members), then any changes for which the priority
+label is suggested.
 
 ### `merge-queue run`
 
@@ -500,14 +498,19 @@ on which files two changes share.
 5. **A conflict-free subset.** The queue does no repair. Once one of two conflicting changes
    lands, the other conflicts with the base, so both cannot land in the same round. The queue
    walks the changes in dependency order and picks the best-ranked ready change each time. The
-   rank is: lower priority value first; then fewer conflicts with other eligible changes; then
+   rank is: priority changes, and the changes they must land after, first; then lower priority
+   value; then fewer conflicts with other eligible changes; then
    earlier submission; then lower number. A change that conflicts with one already chosen is held
    as `conflicts-with-queued`. Preferring fewer conflicts is a greedy maximum-independent-set
    heuristic. When one change conflicts with many independent ones, it lands more changes per
    round than first-come-first-served.
 6. **Batches.** The chosen order is cut into batches of at most `max_batch` changes. A `--solo`
-   change closes the open batch and gets a batch of its own. Each batch has a `note` saying why
-   it was cut: `max-batch`, `solo`, or empty for the last one.
+   change, an exact change and a priority change each close the open batch and get a batch of
+   their own. Each batch has a `note` saying why it was cut: `max-batch`, `solo`, `exact`,
+   `priority`, or empty for the last one.
+7. **Label suggestions.** A queued change that is not a priority change and touches only the
+   configured CI paths (`priority.ci_paths`) is listed in `suggest_priority`. It is a suggestion
+   only; the queue never applies a label.
 
 | Held kind | Unblocking action |
 |---|---|
@@ -527,12 +530,13 @@ on which files two changes share.
   "base": "main",
   "base_sha": "<40 hex>",
   "items": [{"pr": 42, "head": "<sha>", "priority": 50, "submitted_at": "...",
-             "files": 3, "conflict_degree": 1}],
+             "files": 3, "conflict_degree": 1, "prioritized": true}],
   "batches": [{"index": 0, "prs": [42, 43], "note": "max-batch"}],
   "held": [{"pr": 41, "kind": "conflicts-with-queued", "reason": "...",
             "with": [42], "paths": ["src/cli.rs"]}],
   "conflicts": [{"a": 41, "b": 42, "paths": ["src/cli.rs"]}],
-  "dependencies": [[42, 43]]
+  "dependencies": [[42, 43]],
+  "suggest_priority": [44]
 }
 ```
 
@@ -542,6 +546,8 @@ on which files two changes share.
   left out when empty.
 - In `held`, `with` and `paths` are left out when empty.
 - `dependencies` holds `[before, after]` pairs that the plan respected.
+- `prioritized` is present (and `true`) only for a priority change. `suggest_priority` lists the
+  changes the priority label is suggested for, and is left out when empty.
 
 ## State directory
 
@@ -577,7 +583,7 @@ another writer holds it.
 
 An **item record** (`items/<pr>.json`) has these fields:
 
-- `pr`, `head_ref`, `head`, `priority`, `submitted_at`, `submitted_by`, `notify`, `notify_delivery`, `title`, `after`, `solo`.
+- `pr`, `head_ref`, `head`, `priority`, `submitted_at`, `submitted_by`, `notify`, `notify_delivery`, `title`, `after`, `solo`, `prioritized` (present only when `true`).
 - `claim`: `{selection, policy, scope, commit}`. `selection` is `{"kind":"all"}` or
   `{"kind":"tests","tests":["step","step::case"]}`.
 - `status`: `queued`, `landed`, `ejected` or `withdrawn`.
@@ -602,10 +608,10 @@ An **item record** (`items/<pr>.json`) has these fields:
 | `depth` | `2` | The initial window and the culprit-search probe width. |
 | `max_depth` | `0` | The largest adaptive window; `0` means fixed at `depth`. |
 | `union_paths` | `[]` | Attribute patterns merged with Git's union driver (see "Union merges"). |
+| `priority` | absent | `{label, ci_paths}`: the priority label (absent or empty: `mq-priority`; `-`: off) and the CI path patterns for label suggestions. Left out of the file while both are defaults. See "Priority changes". |
 | `regenerate` | empty | `{paths, command, when}`; see "Generated files". |
 | `exact_sha` | `false` | The exact-commit rule. |
 | `trust_base` | `false` | Skip probing the base in culprit searches. |
-| `require_approval_at_head` | `false` | Approval-at-head rule for GitHub ready sources; see `--require-approval-at-head`. |
 | `require_approval_at_head` | `false` | Approval-at-head rule for GitHub ready sources; see `--require-approval-at-head`. |
 | `classify` | `[]` | `[{pattern, class}]` failure classes; see `--classify`. |
 | `peers` | `{}` | Peer queue name to state directory. |
@@ -1015,6 +1021,25 @@ The base moves only to a commit whose exact tree passed validation (the bors rul
    ejections) and everything behind it is rebuilt on the new base and validated again.
 9. **Obligations.** Every focused landing leaves an obligation until a green complete run
    (`widen`, or `run --widen`) covers that commit or a later one. A red complete run leaves it open.
+
+## Priority changes
+
+A change that repairs the CI or validation infrastructure unblocks everything behind it, so it
+should not wait its turn. Mark it as a priority change: give the pull request the priority label
+(`mq-priority` by default; `init --priority-label` names another, and `sync` matches it without
+regard to case), submit it with `--prioritized`, or add `prioritized` to its ready-file line.
+
+- **Planned first.** A priority change, and any change it must land after, ranks ahead of all
+  other work, whatever their numeric priorities. It also wins a conflict with an ordinary change.
+- **Validated alone.** It gets a batch of its own, so it is validated directly on the base. A
+  red result names only it: it cannot hide behind unrelated changes, and it cannot get them
+  ejected. Batches speculatively stacked on it are rebuilt, as behind any red batch.
+- **Landed only on its own green.** Nothing is skipped: it lands only when its own exact commit
+  validates green, like every other change.
+
+With `init --ci-path PATTERN` (repeatable; `priority.ci_paths`), `plan` names the queued changes
+that touch only those paths as candidates for the label. The queue never applies the label: a
+person or agent decides.
 
 ## Changes across repositories
 

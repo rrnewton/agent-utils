@@ -87,6 +87,8 @@ struct Entry {
     priority: i64,
     after: Vec<i64>,
     solo: bool,
+    /// Carries the priority label (or `prioritized` in a ready file).
+    prioritized: bool,
     title: String,
     by: String,
     notify: String,
@@ -103,7 +105,7 @@ struct Entry {
 pub type ReadyLine = (i64, Vec<(String, String)>);
 
 /// Parse a ready-list file. Each line: `PR [SHA] [head=REF] [priority=N] [after=N,N] [solo]
-/// [by=NAME] [notify=NAME]`; `#` starts a comment. Without `head=`, the head is
+/// [prioritized] [by=NAME] [notify=NAME]`; `#` starts a comment. Without `head=`, the head is
 /// `refs/pull/PR/head`.
 pub fn parse_ready_file(text: &str) -> Result<Vec<ReadyLine>, String> {
     let mut entries = Vec::new();
@@ -127,7 +129,9 @@ pub fn parse_ready_file(text: &str) -> Result<Vec<ReadyLine>, String> {
         for word in words {
             match word.split_once('=') {
                 Some((key, value)) => fields.push((key.to_owned(), value.to_owned())),
-                None if word == "solo" => fields.push(("solo".to_owned(), String::new())),
+                None if word == "solo" || word == "prioritized" => {
+                    fields.push((word.to_owned(), String::new()));
+                }
                 None if word.len() >= 7 && word.chars().all(|c| c.is_ascii_hexdigit()) => {
                     fields.push(("sha".to_owned(), word.to_owned()));
                 }
@@ -152,6 +156,7 @@ fn entries_from_file(path: &PathBuf) -> Result<Vec<Entry>, String> {
                 priority: DEFAULT_PRIORITY,
                 after: Vec::new(),
                 solo: false,
+                prioritized: false,
                 title: String::new(),
                 by: String::new(),
                 notify: String::new(),
@@ -177,6 +182,7 @@ fn entries_from_file(path: &PathBuf) -> Result<Vec<Entry>, String> {
                         }
                     }
                     "solo" => entry.solo = true,
+                    "prioritized" => entry.prioritized = true,
                     "by" => entry.by = value,
                     "notify" => entry.notify = value,
                     "title" => entry.title = value.replace('_', " "),
@@ -252,6 +258,7 @@ pub fn sync(
                         head: pr.head,
                         after: Vec::new(),
                         solo: false,
+                        prioritized: config.priority.labelled(&labels),
                         title: pr.title,
                         by: author.clone(),
                         // Under the approval rule the author is the
@@ -293,6 +300,7 @@ pub fn sync(
                 && !entry.head.is_empty()
                 && item.head.starts_with(&entry.head)
                 && item.priority == entry.priority
+                && item.prioritized == entry.prioritized
         });
         let settled = current.is_some_and(|item| {
             matches!(item.status, ItemStatus::Landed)
@@ -320,6 +328,7 @@ pub fn sync(
             title: entry.title,
             after: entry.after,
             solo: entry.solo,
+            prioritized: entry.prioritized,
             claim: None,
             source: tag.clone(),
             requires: Vec::new(),

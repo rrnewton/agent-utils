@@ -102,6 +102,9 @@ merge-queue bench --prs 16 --test-secs 1   # serial lander vs the queue on a syn
   after you submit it, the change is held as `head-moved` until you submit it again.
 - Lower `--priority` lands first (default 100). Among changes of equal priority, the one with
   fewer conflicts is preferred, then the one submitted first.
+- A change that fixes CI goes to the front: give it the `mq-priority` label (or submit it with
+  `--prioritized`). It is validated first, in a batch of its own, and still lands only on its own
+  green.
 - `merge-queue withdraw 41` takes a change out of the queue. Submitting it again puts it back with
   its history.
 - `merge-queue userguide` documents every command, the state layout, the configuration, the

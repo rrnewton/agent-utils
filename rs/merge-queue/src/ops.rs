@@ -6,8 +6,8 @@ use crate::git::Git;
 use crate::model::{now, Held, Item, ItemStatus, Plan, Requirement};
 use crate::plan::{make_plan, probe_first_stage, probe_with_options, PlanOptions, ProbeOptions};
 use crate::probe_cache::probe_config_hash;
-use crate::state::RegenerateConfig;
 use crate::state::{Config, State};
+use crate::state::{PriorityConfig, RegenerateConfig};
 use crate::tests::ValidationClaim;
 
 /// Private ref holding the fetched base.
@@ -132,6 +132,8 @@ pub struct Submission {
     pub after: Vec<i64>,
     /// Land alone.
     pub solo: bool,
+    /// A priority change: planned ahead of all other work, validated alone.
+    pub prioritized: bool,
     /// Submitter's validation claim.
     pub claim: Option<ValidationClaim>,
     /// `sync` source that produced this submission; empty for a direct `submit`.
@@ -224,6 +226,7 @@ fn submit_resolved(
         title: submission.title,
         after: submission.after,
         solo: submission.solo,
+        prioritized: submission.prioritized,
         claim: submission.claim,
         exact: existing.as_ref().is_some_and(|old| old.exact),
         requires: submission.requires,
@@ -375,7 +378,10 @@ pub fn plan(state: &State, config: &Config, max_batch: usize) -> Result<Plan, St
         &config.base,
         &base_sha,
         &probe,
-        PlanOptions { max_batch },
+        PlanOptions {
+            max_batch,
+            priority: config.priority.clone(),
+        },
     ))
 }
 
@@ -395,6 +401,7 @@ pub struct PlanContinuation {
     regenerate: RegenerateConfig,
     probe_options: ProbeOptions,
     max_batch: usize,
+    priority: PriorityConfig,
     external: BTreeMap<i64, Held>,
 }
 
@@ -430,6 +437,7 @@ impl PlanContinuation {
             &probe,
             PlanOptions {
                 max_batch: self.max_batch,
+                priority: self.priority.clone(),
             },
         ))
     }
@@ -476,7 +484,10 @@ pub fn plan_staged(
         &config.base,
         &base_sha,
         &probe,
-        PlanOptions { max_batch },
+        PlanOptions {
+            max_batch,
+            priority: config.priority.clone(),
+        },
     );
     let continuation = PlanContinuation {
         git,
@@ -487,6 +498,7 @@ pub fn plan_staged(
         regenerate,
         probe_options,
         max_batch,
+        priority: config.priority.clone(),
         external,
     };
     Ok((partial, continuation))

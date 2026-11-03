@@ -562,6 +562,7 @@ mod unit {
             title: String::new(),
             after: vec![],
             solo: false,
+            prioritized: false,
             exact: false,
             requires: vec![],
             claim: None,

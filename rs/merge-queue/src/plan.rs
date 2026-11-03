@@ -7,9 +7,13 @@
 //!
 //! Without repair, two changes that textually conflict cannot both land this round: once one
 //! lands, the other conflicts with the base and needs a rebase. The plan therefore picks a
-//! conflict-free subset. Priority decides first; among equal priorities the change with fewer
+//! conflict-free subset. Priority changes (the priority label) and the changes they depend on
+//! come first; then the numeric priority decides; among equal priorities the change with fewer
 //! conflicts wins (a greedy maximum-independent-set heuristic, which lands more changes per round
 //! than first-come-first-served when one change conflicts with many), then submission time.
+//!
+//! A priority change is validated in a batch of its own: it reaches the base first, and a red
+//! result touches no other change.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -24,7 +28,7 @@ use crate::model::{
     now, Conflict, Held, Item, ItemStatus, Plan, PlannedBatch, PlannedItem, PLAN_SCHEMA,
 };
 use crate::probe_cache::{probe_config_hash, BaseEntry, PairAncestry, PairEntry, ProbeCache};
-use crate::state::DEFAULT_PROBE_PARALLELISM;
+use crate::state::{PriorityConfig, DEFAULT_PROBE_PARALLELISM};
 
 /// How one probing run used its cache and its concurrency bound.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -417,13 +421,17 @@ fn probe_impl(
 }
 
 /// Planning knobs.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PlanOptions {
     /// Maximum changes per batch (at least 1).
     pub max_batch: usize,
+    /// Priority label and CI paths (for the label suggestion).
+    pub priority: PriorityConfig,
 }
 
-type Rank<'a> = (i64, usize, &'a str, i64);
+/// Not at the front (priority changes and their dependencies sort first), then priority,
+/// conflict degree, submission time and number.
+type Rank<'a> = (bool, i64, usize, &'a str, i64);
 
 /// Order and chunk the queued items. `all_items` may include landed and ejected records, which
 /// satisfy or block explicit dependencies; only `Queued` items are planned.
@@ -636,9 +644,29 @@ pub fn make_plan(
         .iter()
         .map(|pr| (*pr, degree(&held, *pr)))
         .collect();
+    // The front of the queue: priority changes and, transitively, what they must land after.
+    let mut front: BTreeSet<i64> = queued
+        .iter()
+        .filter(|item| item.prioritized)
+        .map(|item| item.pr)
+        .collect();
+    let mut stack: Vec<i64> = front.iter().copied().collect();
+    while let Some(pr) = stack.pop() {
+        for dep in preds.get(&pr).into_iter().flatten() {
+            if front.insert(*dep) {
+                stack.push(*dep);
+            }
+        }
+    }
     let rank = |pr: i64| -> Rank<'_> {
         let item = by_pr[&pr];
-        (item.priority, degrees[&pr], item.submitted_at.as_str(), pr)
+        (
+            !front.contains(&pr),
+            item.priority,
+            degrees[&pr],
+            item.submitted_at.as_str(),
+            pr,
+        )
     };
     let mut remaining: BTreeSet<i64> = queued_set.clone();
     let mut decided: BTreeSet<i64> = BTreeSet::new();
@@ -723,14 +751,18 @@ pub fn make_plan(
         }
     };
     for pr in &selected {
-        if by_pr[pr].solo || by_pr[pr].exact {
+        let item = by_pr[pr];
+        if item.solo || item.exact || item.prioritized {
             close(&mut current, &mut batches, "");
             current.push(*pr);
-            close(
-                &mut current,
-                &mut batches,
-                if by_pr[pr].exact { "exact" } else { "solo" },
-            );
+            let note = if item.exact {
+                "exact"
+            } else if item.prioritized {
+                "priority"
+            } else {
+                "solo"
+            };
+            close(&mut current, &mut batches, note);
             continue;
         }
         current.push(*pr);
@@ -754,7 +786,19 @@ pub fn make_plan(
             submitted_at: item.submitted_at.clone(),
             files: probe.files.get(&item.pr).map_or(0, BTreeSet::len),
             conflict_degree: degrees[&item.pr],
+            prioritized: item.prioritized,
         })
+        .collect();
+    let suggest_priority = queued
+        .iter()
+        .filter(|item| {
+            !item.prioritized
+                && probe
+                    .files
+                    .get(&item.pr)
+                    .is_some_and(|files| options.priority.only_ci_paths(files))
+        })
+        .map(|item| item.pr)
         .collect();
     Plan {
         schema: PLAN_SCHEMA.to_owned(),
@@ -766,6 +810,7 @@ pub fn make_plan(
         held: held.into_values().collect(),
         conflicts: probe.conflicts.clone(),
         dependencies: dependencies.into_iter().collect(),
+        suggest_priority,
     }
 }
 
@@ -808,7 +853,8 @@ pub fn render(plan: &Plan) -> String {
             .iter()
             .map(|pr| {
                 let item = by_pr[pr];
-                format!("#{pr} (p{}, {} files)", item.priority, item.files)
+                let front = if item.prioritized { "priority, " } else { "" };
+                format!("#{pr} ({front}p{}, {} files)", item.priority, item.files)
             })
             .collect();
         let note = if batch.note.is_empty() {
@@ -834,6 +880,12 @@ pub fn render(plan: &Plan) -> String {
         for cluster in clusters {
             out.push_str(&format!("  {}\n", list(&cluster)));
         }
+    }
+    if !plan.suggest_priority.is_empty() {
+        out.push_str(&format!(
+            "Suggested priority label (changes only CI paths; never applied by the queue): {}\n",
+            list(&plan.suggest_priority)
+        ));
     }
     out
 }
@@ -867,6 +919,7 @@ mod unit {
             title: String::new(),
             after: vec![],
             solo: false,
+            prioritized: false,
             claim: None,
             exact: false,
             requires: vec![],
@@ -907,7 +960,10 @@ mod unit {
     }
 
     fn opts(max_batch: usize) -> PlanOptions {
-        PlanOptions { max_batch }
+        PlanOptions {
+            max_batch,
+            ..PlanOptions::default()
+        }
     }
 
     #[test]
@@ -947,6 +1003,91 @@ mod unit {
         let plan = make_plan(&items, "main", "B", &probe, opts(4));
         assert_eq!(plan.batches[0].prs, vec![1]);
         assert_eq!(plan.held.len(), 2);
+    }
+
+    #[test]
+    fn a_priority_change_goes_first_in_a_batch_of_its_own() {
+        // Queued last and with the worst numeric priority, behind three ordinary changes.
+        let mut items = vec![
+            item(1, 100, "t1"),
+            item(2, 100, "t2"),
+            item(3, 100, "t3"),
+            item(4, 500, "t4"),
+        ];
+        items[3].prioritized = true;
+        let plan = make_plan(&items, "main", "B", &probe_for(&items), opts(4));
+        let batches: Vec<_> = plan.batches.iter().map(|b| b.prs.clone()).collect();
+        assert_eq!(batches, vec![vec![4], vec![1, 2, 3]]);
+        assert_eq!(plan.batches[0].note, "priority");
+        assert!(render(&plan).contains("#4 (priority, p500"));
+    }
+
+    #[test]
+    fn a_priority_change_wins_a_conflict_and_pulls_its_dependency_forward() {
+        // #4 is prioritized and must land after #3; #1 conflicts with #4.
+        let mut items = vec![
+            item(1, 10, "t1"),
+            item(2, 100, "t2"),
+            item(3, 100, "t3"),
+            item(4, 100, "t4"),
+        ];
+        items[3].prioritized = true;
+        items[3].after = vec![3];
+        let mut probe = probe_for(&items);
+        probe.conflicts = vec![conflict(1, 4)];
+        let plan = make_plan(&items, "main", "B", &probe, opts(4));
+        let batches: Vec<_> = plan.batches.iter().map(|b| b.prs.clone()).collect();
+        assert_eq!(batches, vec![vec![3], vec![4], vec![2]]);
+        assert_eq!(plan.held.len(), 1);
+        assert_eq!(plan.held[0].pr, 1);
+        assert_eq!(plan.held[0].kind, "conflicts-with-queued");
+    }
+
+    #[test]
+    fn changes_touching_only_ci_paths_get_a_label_suggestion() {
+        let mut items = vec![item(1, 100, "t1"), item(2, 100, "t2"), item(3, 100, "t3")];
+        items[2].prioritized = true;
+        let mut probe = probe_for(&items);
+        probe.files.insert(1, ["ci/run.sh".to_owned()].into());
+        probe
+            .files
+            .insert(2, ["ci/run.sh".to_owned(), "src/lib.rs".to_owned()].into());
+        probe
+            .files
+            .insert(3, ["validation.dag.yaml".to_owned()].into());
+        let options = PlanOptions {
+            max_batch: 4,
+            priority: PriorityConfig {
+                ci_paths: vec!["ci".into(), "*.dag.yaml".into()],
+                ..PriorityConfig::default()
+            },
+        };
+        let plan = make_plan(&items, "main", "B", &probe, options);
+        // #2 also touches source; #3 already carries the label.
+        assert_eq!(plan.suggest_priority, vec![1]);
+        assert!(render(&plan).contains("Suggested priority label"));
+        // No CI paths configured: no suggestion.
+        let plan = make_plan(&items, "main", "B", &probe, opts(4));
+        assert!(plan.suggest_priority.is_empty());
+    }
+
+    #[test]
+    fn the_priority_label_is_configurable_and_case_blind() {
+        let labels = |names: &[&str]| names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
+        let default = PriorityConfig::default();
+        assert!(default.labelled(&labels(&["bug", "MQ-Priority"])));
+        assert!(!default.labelled(&labels(&["p1"])));
+        let custom = PriorityConfig {
+            label: "ci-fix".into(),
+            ..PriorityConfig::default()
+        };
+        assert!(custom.labelled(&labels(&["ci-fix"])));
+        assert!(!custom.labelled(&labels(&["mq-priority"])));
+        let off = PriorityConfig {
+            label: "-".into(),
+            ..PriorityConfig::default()
+        };
+        assert!(!off.labelled(&labels(&["mq-priority", "-"])));
     }
 
     #[test]

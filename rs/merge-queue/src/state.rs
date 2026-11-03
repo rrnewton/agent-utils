@@ -39,6 +39,8 @@ pub const DEFAULT_DEPTH: usize = 2;
 pub const DEFAULT_PROBE_PARALLELISM: usize = 32;
 /// Default priority for a submitted change; lower lands first.
 pub const DEFAULT_PRIORITY: i64 = pr_landing_planner::priority::DEFAULT_PRIORITY;
+/// Default name of the label that puts a change at the front of the queue.
+pub const DEFAULT_PRIORITY_LABEL: &str = "mq-priority";
 
 /// How validation runs.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -189,6 +191,60 @@ impl DonorsConfig {
     }
 }
 
+/// The front of the queue: which changes are planned ahead of all other work.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PriorityConfig {
+    /// Label that marks a pull request as a priority change when `sync` reads it from the
+    /// hosting service (compared without regard to case). Empty means
+    /// [`DEFAULT_PRIORITY_LABEL`]; `-` turns the label off.
+    pub label: String,
+    /// Path patterns of CI and validation infrastructure (exact path, directory, or `*`
+    /// wildcards, as for `regenerate.paths`). `plan` suggests the label for a change touching
+    /// only these paths; it never applies the label itself.
+    pub ci_paths: Vec<String>,
+}
+
+impl PriorityConfig {
+    /// The label `sync` honours, or `None` when it is turned off.
+    pub fn label(&self) -> Option<&str> {
+        match self.label.as_str() {
+            "" => Some(DEFAULT_PRIORITY_LABEL),
+            "-" => None,
+            label => Some(label),
+        }
+    }
+
+    /// Whether `labels` carry the priority label.
+    pub fn labelled(&self, labels: &[String]) -> bool {
+        self.label().is_some_and(|wanted| {
+            labels
+                .iter()
+                .any(|label| label.eq_ignore_ascii_case(wanted))
+        })
+    }
+
+    /// Whether every one of `files` (at least one) is CI or validation infrastructure.
+    pub fn only_ci_paths<'a>(&self, files: impl IntoIterator<Item = &'a String>) -> bool {
+        let mut any = false;
+        for path in files {
+            any = true;
+            if !self
+                .ci_paths
+                .iter()
+                .any(|pattern| pattern_covers(pattern, path))
+            {
+                return false;
+            }
+        }
+        any && !self.ci_paths.is_empty()
+    }
+}
+
+fn is_default_priority(value: &PriorityConfig) -> bool {
+    *value == PriorityConfig::default()
+}
+
 fn is_default_donors(value: &DonorsConfig) -> bool {
     *value == DonorsConfig::default()
 }
@@ -287,17 +343,24 @@ impl RegenerateConfig {
     /// cover an unrelated path.
     pub fn covers(&self, path: &str) -> bool {
         self.enabled()
-            && self.paths.iter().any(|pattern| {
-                path_matches(pattern, path)
-                    || (!pattern.contains('*')
-                        && path.starts_with(&format!("{}/", pattern.trim_end_matches('/'))))
-            })
+            && self
+                .paths
+                .iter()
+                .any(|pattern| pattern_covers(pattern, path))
     }
 
     /// Whether to regenerate after every change, not only after a generated-file conflict.
     pub fn always(&self) -> bool {
         self.when == "always"
     }
+}
+
+/// [`path_matches`], where a pattern without wildcards also covers everything under it as a
+/// directory (`dir` as well as `dir/`).
+fn pattern_covers(pattern: &str, path: &str) -> bool {
+    path_matches(pattern, path)
+        || (!pattern.contains('*')
+            && path.starts_with(&format!("{}/", pattern.trim_end_matches('/'))))
 }
 
 /// Match a path against a pattern: exact, directory prefix (`dir/`), or `*` wildcards.
@@ -460,6 +523,9 @@ pub struct Config {
     /// Peer queues by name: other repositories' merge-queue state directories. A change may
     /// require a commit on a peer's base; `run --with-peers` drains those peers first.
     pub peers: std::collections::BTreeMap<String, PathBuf>,
+    /// Priority label and CI paths (the front of the queue).
+    #[serde(skip_serializing_if = "is_default_priority")]
+    pub priority: PriorityConfig,
     /// Validation configuration.
     pub validator: ValidatorConfig,
     /// Donor-validator settings (used when `validator.offload` is not off).
@@ -493,6 +559,7 @@ impl Default for Config {
             classify: Vec::new(),
             github: GitHubConfig::default(),
             peers: std::collections::BTreeMap::new(),
+            priority: PriorityConfig::default(),
             validator: ValidatorConfig::default(),
             donors: DonorsConfig::default(),
             land: LandConfig::default(),

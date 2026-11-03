@@ -703,3 +703,71 @@ fn adaptive_window_grows_on_landings_and_halves_on_red() {
         }
     }
 }
+
+fn validated(report: &Value) -> Vec<(String, Vec<i64>)> {
+    report["validations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| {
+            let prs = v["prs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p.as_i64().unwrap())
+                .collect();
+            (v["purpose"].as_str().unwrap().to_owned(), prs)
+        })
+        .collect()
+}
+
+#[test]
+fn a_priority_change_queued_behind_three_ordinary_ones_is_validated_first() {
+    let fx = setup("run-priority", &["--max-batch", "4", "--depth", "1"]);
+    for name in ["a", "b", "c", "ci"] {
+        fx.branch(name, &[(&format!("tests/{name}"), "ok\n")]);
+    }
+    for (pr, name) in [(1, "a"), (2, "b"), (3, "c")] {
+        fx.mq_ok(&["submit", &pr.to_string(), "--head", name]);
+    }
+    let out = fx.mq_ok(&["submit", "4", "--head", "ci", "--prioritized"]);
+    assert!(out.contains("front of the queue"), "{out}");
+    let r = report(&fx.mq_ok(&["run", "--json"]));
+    // Validated first, alone, then the ordinary batch.
+    assert_eq!(
+        validated(&r),
+        vec![
+            ("batch".to_owned(), vec![4]),
+            ("batch".to_owned(), vec![1, 2, 3])
+        ]
+    );
+    assert_eq!(landed_prs(&r), vec![vec![4], vec![1, 2, 3]]);
+    // It landed on its own green at that exact commit.
+    let first = &r["validations"][0];
+    assert_eq!(r["landed"][0]["claim"]["commit"], first["commit"]);
+    assert!(first["results"].to_string().contains("pass"), "{first}");
+}
+
+#[test]
+fn a_red_priority_change_ejects_only_itself_and_never_lands() {
+    let fx = setup("run-priority-red", &["--max-batch", "4", "--depth", "2"]);
+    for (pr, name) in [(1, "a"), (2, "b"), (3, "c")] {
+        fx.branch(name, &[(&format!("tests/{name}"), "ok\n")]);
+        fx.mq_ok(&["submit", &pr.to_string(), "--head", name]);
+    }
+    fx.branch("ci", &[("tests/ci", "FAIL\n")]);
+    fx.mq_ok(&["submit", "4", "--head", "ci", "--prioritized"]);
+    let r = report(&fx.mq_ok(&["run", "--json"]));
+    let runs = validated(&r);
+    assert_eq!(runs[0], ("batch".to_owned(), vec![4]));
+    // No validation combined the red priority change with an ordinary one.
+    for (_, prs) in &runs {
+        assert!(!(prs.contains(&4) && prs.len() > 1), "{runs:?}");
+    }
+    assert_eq!(landed_prs(&r), vec![vec![1, 2, 3]]);
+    let ejected = r["ejected"].as_array().unwrap();
+    assert_eq!(ejected.len(), 1, "{ejected:?}");
+    assert_eq!(ejected[0]["pr"], 4);
+    assert_eq!(status(&fx, 4), "ejected");
+    assert!(!remote_files(&fx).contains("tests/ci"));
+}

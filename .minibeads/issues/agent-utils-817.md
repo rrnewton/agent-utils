@@ -1,13 +1,14 @@
 ---
 title: 'merge-queue-priority-label: a labelled change goes to the front of the queue, still landing only on its own green'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 assignee: cl-mq@devbig030
 labels:
 - merge-queue
 created_at: 2026-11-03T14:04:31.711153227+00:00
-updated_at: 2026-11-03T14:04:31.711153227+00:00
+updated_at: 2026-11-03T14:27:09.095683518+00:00
+closed_at: 2026-11-03T14:27:09.095683387+00:00
 ---
 
 # Description

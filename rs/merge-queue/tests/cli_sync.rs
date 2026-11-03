@@ -235,7 +235,7 @@ fn a_ready_file_needs_no_api_call() {
     let file = fx.root.join("ready.txt");
     std::fs::write(
         &file,
-        "# lanes append here\n1 head=a priority=20\n2 head=b after=1 solo\n",
+        "# lanes append here\n1 head=a priority=20\n2 head=b after=1 solo prioritized\n",
     )
     .unwrap();
     let out = fx.mq_ok(&["sync", "--file", file.to_str().unwrap(), "--json"]);
@@ -246,6 +246,52 @@ fn a_ready_file_needs_no_api_call() {
     assert_eq!(item(&all, 1)["priority"], 20);
     assert_eq!(item(&all, 2)["after"], serde_json::json!([1]));
     assert_eq!(item(&all, 2)["solo"], true);
+    assert_eq!(item(&all, 2)["prioritized"], true);
+    assert!(item(&all, 1).get("prioritized").is_none());
+}
+
+#[test]
+fn the_configured_priority_label_puts_a_change_at_the_front_and_resubmits_on_change() {
+    let fx = Fixture::new("sync-priority-label");
+    let gh = stub(&fx);
+    fx.mq_ok(&[
+        "init",
+        "--github-repo",
+        "owner/name",
+        "--gh",
+        &gh.stub,
+        "--priority-label",
+        "ci-fix",
+    ]);
+    let config = std::fs::read_to_string(fx.queue().join(".git/merge-queue/config.json")).unwrap();
+    assert!(config.contains("\"ci-fix\""), "{config}");
+    let h1 = pull_request(&fx, 1, &[("one", "1\n")]);
+    let h2 = pull_request(&fx, 2, &[("two", "2\n")]);
+    // The default label means nothing once another is configured.
+    std::fs::write(
+        &gh.list,
+        listing(&[
+            (1, &h1, false, &["CI-Fix"]),
+            (2, &h2, false, &["mq-priority"]),
+        ]),
+    )
+    .unwrap();
+    sync_json(&fx, &gh, &["--all-open", "--limit", "100"]);
+    let all = items(&fx);
+    assert_eq!(item(&all, 1)["prioritized"], true);
+    assert!(item(&all, 2).get("prioritized").is_none());
+    let plan: Value = serde_json::from_str(&fx.mq_ok(&["plan", "--json"])).unwrap();
+    assert_eq!(plan["batches"][0]["prs"], serde_json::json!([1]));
+    assert_eq!(plan["batches"][0]["note"], "priority");
+    // Adding the label to an unchanged head resubmits it at the front.
+    std::fs::write(
+        &gh.list,
+        listing(&[(1, &h1, false, &["CI-Fix"]), (2, &h2, false, &["ci-fix"])]),
+    )
+    .unwrap();
+    let r = sync_json(&fx, &gh, &["--all-open", "--limit", "100"]);
+    assert_eq!(r["submitted"], serde_json::json!([2]));
+    assert_eq!(item(&items(&fx), 2)["prioritized"], true);
 }
 
 #[test]
