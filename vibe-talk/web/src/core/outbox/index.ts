@@ -28,3 +28,5 @@ export { DRAFTS_KEY, createReplyDrafts } from "./replydrafts.ts";
 export type { ReplyDrafts, ReplyDraftsDependencies } from "./replydrafts.ts";
 export { createPendingThreads } from "./pending.ts";
 export type { PendingSend, PendingThreads, PendingThreadsDependencies } from "./pending.ts";
+export { SEND_UNDO_MS, createSendUndo } from "./sendundo.ts";
+export type { SendDismissal, SendUndo, SendUndoDependencies } from "./sendundo.ts";

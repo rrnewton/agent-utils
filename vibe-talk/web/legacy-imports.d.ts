@@ -82,6 +82,7 @@ declare const DISMISSED_SENDS_DAYS: LegacyImports["DISMISSED_SENDS_DAYS"];
 declare const createChannelDrafts: LegacyImports["createChannelDrafts"];
 declare const createPendingThreads: LegacyImports["createPendingThreads"];
 declare const createReplyDrafts: LegacyImports["createReplyDrafts"];
+declare const createSendUndo: LegacyImports["createSendUndo"];
 declare const createDismissedSends: LegacyImports["createDismissedSends"];
 declare const createOutboxStore: LegacyImports["createOutboxStore"];
 declare const OWN_POST_GRACE_MS: LegacyImports["OWN_POST_GRACE_MS"];

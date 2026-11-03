@@ -58,6 +58,7 @@ export {
   createOwnPosts,
   createPendingThreads,
   createReplyDrafts,
+  createSendUndo,
   editableSend as outboxEditable,
   nextRetryAt,
   outgoingFromSaved as entryFromSaved,

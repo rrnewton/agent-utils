@@ -2324,8 +2324,7 @@ const unseenColumnReplies = { main: null, side: null };
 // `#193 compose-draft-loss`. A send dismissed from the outbox, kept for Undo and then for a while
 // longer. See "taking a send back"; how many are kept, for how long and where are web/src/core/outbox's
 // (`DISMISSED_SENDS_LIMIT`, `DISMISSED_SENDS_DAYS`, `#624 voice-page-modularity`).
-/** How long the Undo chip offers to take a Dismiss back. */
-const SEND_UNDO_MS = 15000;
+// How long the Undo chip offers to take a Dismiss back is web/src/core/outbox's (`SEND_UNDO_MS`).
 // How much of a message a control quotes to name it is web/src/core/outbox's (`sendSnippet`).
 // How much of a message's first line names its row in Recently dismissed to a screen reader is
 // web/src/present/settings's (`DISMISSED_LABEL_CHARS`, `#624 voice-page-modularity`).
@@ -2374,9 +2373,10 @@ function nextUndoAt() {
 
 /**
  * The dismissal the Undo chip takes back while it is up: the entry's id, its wait for an automatic
- * send if it had one, and the chip's timer.
+ * send if it had one, its stamp, and the chip's timer (web/src/core/outbox `createSendUndo`, `#624
+ * voice-page-modularity`).
  */
-let sendUndo = null;
+const sendUndo = createSendUndo({ clock: clockOnUse(), ended: () => renderSendUndo() });
 
 /** Whether the last `showView` put the reader back rather than taking them to the newest. */
 let viewRestored = false;
@@ -7999,8 +7999,12 @@ function liveUndos() {
   if (lastDismissal !== null) {
     held.push({ at: lastDismissal.at || 0, run: () => guardQuietly(undoDismissal)() });
   }
-  if (sendUndo && dismissedSends.find(sendUndo.id)) {
-    held.push({ at: sendUndo.at || 0, run: () => { if (sendUndo) putBackDismissedSend(sendUndo.id); } });
+  const sendOffer = sendUndo.current();
+  if (sendOffer && dismissedSends.find(sendOffer.id)) {
+    held.push({ at: sendOffer.at || 0, run: () => {
+      const offer = sendUndo.current();
+      if (offer) putBackDismissedSend(offer.id);
+    } });
   }
   const bookmarkOffer = bookmarkUndos.current();
   if (bookmarkOffer && bookmarkOffer.channel === currentChannelId()) {
@@ -17362,8 +17366,7 @@ function dismissOutgoingMessage(id) {
   const hold = waiting ? { at: waiting.at, offline: waiting.offline, unsent: waiting.unsent,
     identity: waiting.identity, retriesUsed: entry.retriesUsed || 0 } : null;
   dropOutgoing(id);
-  if (sendUndo) clearTimeout(sendUndo.timer);
-  sendUndo = { id, hold, at: nextUndoAt(), timer: setTimeout(endSendUndo, SEND_UNDO_MS) };
+  sendUndo.offer({ id, hold, at: nextUndoAt() });
   renderSendUndo();
   dismissedSendsView.render();
   setStatus(kept
@@ -17372,15 +17375,14 @@ function dismissOutgoingMessage(id) {
 }
 
 function endSendUndo() {
-  if (sendUndo) clearTimeout(sendUndo.timer);
-  sendUndo = null;
-  renderSendUndo();
+  sendUndo.end();
 }
 
 /** The Undo chip: up while a Dismiss can be taken back from it, naming the message dismissed. */
 function renderSendUndo() {
   const chip = el("undo-send-dismiss");
-  const held = sendUndo ? dismissedSends.find(sendUndo.id) : null;
+  const offer = sendUndo.current();
+  const held = offer ? dismissedSends.find(offer.id) : null;
   chip.hidden = !held || currentView !== "discord";
   const label = held ? `Undo dismiss: “${sendSnippet(unsentText(held.entry))}”` : "Undo dismiss";
   if (chip.textContent !== label) chip.textContent = label;
@@ -17397,7 +17399,9 @@ function putBackDismissedSend(id) {
   if (entry && !outbox.has(entry.id)) {
     // In the order it was written among the sends still there, as it was before it was dismissed.
     outbox.putBackInOrder(entry);
-    const hold = sendUndo && sendUndo.id === id ? sendUndo.hold : null;
+    const offer = sendUndo.current();
+    // The wait the dismissal kept, as `dismissOutgoingMessage` made it: its time, offline, unsent, identity and retries.
+    const hold = /** @type {any} */ (offer && offer.id === id ? offer.hold : null);
     if (hold && hold.identity === tokenFingerprint(token())) {
       entry.retriesUsed = hold.retriesUsed;
       // Waiting for the connection by what the browser says now: one that came back while the send
@@ -17408,7 +17412,8 @@ function putBackDismissedSend(id) {
   // The outbox holds it again before the copy goes.
   persistOutgoingMessages();
   dismissedSends.remove(held);
-  if (sendUndo && sendUndo.id === id) endSendUndo();
+  const offered = sendUndo.current();
+  if (offered && offered.id === id) endSendUndo();
   renderOutgoingEverywhere();
   dismissedSendsView.render();
   if (!entry) return;
@@ -33101,7 +33106,8 @@ loadOutgoingMessages();
 loadDismissedSends();
 dismissedSendsView.render();
 el("undo-send-dismiss").addEventListener("click", () => {
-  if (sendUndo) putBackDismissedSend(sendUndo.id);
+  const offer = sendUndo.current();
+  if (offer) putBackDismissedSend(offer.id);
 });
 // `#420 bookmark-clear`.
 el("undo-bookmark").addEventListener("click", undoBookmarkRemoval);

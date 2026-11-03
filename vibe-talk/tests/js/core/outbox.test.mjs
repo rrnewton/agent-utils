@@ -374,3 +374,27 @@ test("`#624 voice-page-modularity`: the threads sends in the outbox go into, cou
   assert.equal(pending.into("t1"), 1);
   assert.equal(pending.key(), "d t1=1");
 });
+
+test("`#624 voice-page-modularity`: a dismissed send's Undo is offered for SEND_UNDO_MS, one at a time", () => {
+  const { createSendUndo, SEND_UNDO_MS } = OUTBOX;
+  const timers = [];
+  let ended = 0;
+  const undo = createSendUndo({
+    clock: { setTimeout: (run, ms) => { timers.push({ run, ms }); return timers.length; }, clearTimeout: (h) => { timers[h - 1] = null; } },
+    ended: () => { ended += 1; },
+  });
+  assert.equal(undo.current(), null);
+  undo.offer({ id: "o1", hold: null, at: 1 });
+  assert.deepStrictEqual({ ...undo.current(), timer: undefined }, { id: "o1", hold: null, at: 1, timer: undefined });
+  assert.equal(timers[0].ms, SEND_UNDO_MS);
+  undo.offer({ id: "o2", hold: { at: 5 }, at: 2 });
+  assert.equal(timers[0], null, "a new offer replaces the one up");
+  assert.equal(undo.current().id, "o2");
+  timers[1].run();
+  assert.equal(undo.current(), null, "the chip's time ran out");
+  assert.equal(ended, 1);
+  undo.offer({ id: "o3", hold: null, at: 3 });
+  undo.end();
+  assert.equal(timers[2], null);
+  assert.equal(ended, 2);
+});
