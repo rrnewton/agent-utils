@@ -6226,7 +6226,7 @@ test("`#336 draft-return-thread-list` x `#280 scroll-stability`: A DRAFT ARRIVIN
 
   // THE CONTROL: the keeper's report from the hidden column kept. The reader who left from the foot comes back
   // the card's height above it; the one up the cards is on their card all the same.
-  const hiddenKept = await run(brokenScript("    if (currentScreen === \"main\") sideUnderLists = now;\n",
+  const hiddenKept = await run(brokenScript("    if (screens.screen() === \"main\") sideUnderLists = now;\n",
     "    sideUnderLists = now;\n"));
   assert.deepStrictEqual(hiddenKept, { ...real, settings0: false, help0: false });
 });

@@ -344,10 +344,10 @@ if (typeof window.ResizeObserver === "function") {
     const area = el("scroll-area");
     // `#221 read-modes`. A reader just landed on a thread's first unread is reading that, however near
     // the end of the list it is: the chips changed because the entry opened the message's fold.
-    const landed = currentScreen === "main" && currentView === "discord" && entryLandingHolds();
+    const landed = screens.screen() === "main" && screens.view() === "discord" && entryLandingHolds();
     // `#243 filter-keeps-selection`: nor one whose message a filter change holds in place. `#241 voice-composer`:
     // the call's transcript follows too, not only the channel.
-    const pinned = !landed && currentScreen === "main" && followsNewest(area);
+    const pinned = !landed && screens.screen() === "main" && followsNewest(area);
     const room = height > 0 ? `calc(${height}px + 0.5rem)` : "0px";
     el("frame-body").style.setProperty("--scroll-tools-clearance", room);
     // `#433 read-strip-low`. The row's height itself, without the half-rem the room keeps over
@@ -383,8 +383,8 @@ if (typeof window.ResizeObserver === "function") {
     const height = el("read-steer").offsetHeight || 0;
     const room = height > 0 ? `calc(${height}px + 0.5rem)` : "0px";
     const area = el("scroll-area");
-    const landed = currentScreen === "main" && currentView === "discord" && entryLandingHolds();
-    const pinned = !landed && currentScreen === "main" && followsNewest(area);
+    const landed = screens.screen() === "main" && screens.view() === "discord" && entryLandingHolds();
+    const pinned = !landed && screens.screen() === "main" && followsNewest(area);
     el("frame-body").style.setProperty("--read-steer-clearance", room);
     // `scrubber-full-width`. The height itself, without the air: on a phone the strip playing is a
     // row of its own over the dock, and the list ends at its top edge (`data-read-strip`). Held on
@@ -418,7 +418,7 @@ if (typeof window.ResizeObserver === "function") {
 const chipsOverComposer = createChipsOverComposer({
   lookup: (id) => leftEl(id),
   el: (id) => el(id),
-  onChannel: () => currentScreen === "main" && currentView === "discord",
+  onChannel: () => screens.screen() === "main" && screens.view() === "discord",
   rootFontPx: () => rootFontPx(),
   root: () => document.documentElement,
   placeReadSteer: () => readAloudOwner().placeReadSteer(),
@@ -503,8 +503,8 @@ function voiceCall() {
     get fitGrowingBox() { return fitGrowingBox; },
     get leftEl() { return leftEl; },
     get keepBoxInView() { return keepBoxInView; },
-    get currentScreen() { return currentScreen; },
-    get currentView() { return currentView; },
+    get currentScreen() { return screens.screen(); },
+    get currentView() { return screens.view(); },
     get CANNED_PROMPTS() { return /** @type {import("./src/view/settings/index.ts").CannedPrompt[]} */ (CANNED_PROMPTS); },
     get token() { return token; },
     get apiDecoded() { return apiDecoded; },
@@ -624,8 +624,8 @@ function voiceTranscript() {
     get api() { return api; },
     get apiDecoded() { return apiDecoded; },
     get columns() { return columns; },
-    get currentScreen() { return currentScreen; },
-    get currentView() { return currentView; },
+    get currentScreen() { return screens.screen(); },
+    get currentView() { return screens.view(); },
     get cardsOpening() { return cardsOpening; },
     get threadListShown() { return threadListShown; },
     get tokenScope() { return tokenScope; },
@@ -718,7 +718,7 @@ function readAloudOwner() {
     get eachColumn() { return eachColumn; },
     get renderChannelRows() { return renderChannelRows; },
     get dismissMessages() { return dismissMessages; },
-    get currentView() { return currentView; },
+    get currentView() { return screens.view(); },
     get selectedChannelId() { return selectedChannelId; },
     get shownChannelList() { return /** @type {() => HTMLOListElement} */ (shownChannelList); },
     get threadListShown() { return threadListShown; },
@@ -945,7 +945,7 @@ function backLevels() {
  */
 function screenLevelsNow() {
   if (sideActive) return inColumn(columns.main, screenLevelsNow);
-  const levels = screenLevels(currentScreen);
+  const levels = screenLevels(screens.screen());
   // On top of everything, in every browser: see "A MENU IS AN ENTRY TOO".
   levels.push(...openMenus());
   return levels;
@@ -961,8 +961,8 @@ function screenLevelsNow() {
 function screenLevels(name, depth = 0) {
   if (depth > 2) return [];
   if (name === "main") return channelLevels();
-  if (name === "settings") return [...screenLevels(screenBeforeSettings, depth + 1), "settings"];
-  if (name === "help") return [...screenLevels(helpReturn, depth + 1), "help"];
+  if (name === "settings") return [...screenLevels(screens.beforeSettings(), depth + 1), "settings"];
+  if (name === "help") return [...screenLevels(screens.helpReturn(), depth + 1), "help"];
   return [];
 }
 
@@ -974,7 +974,7 @@ function screenLevels(name, depth = 0) {
  * @returns {string[]}
  */
 function channelLevels() {
-  if (currentView !== "discord") return [];
+  if (screens.view() !== "discord") return [];
   const levels = [];
   if (columnsShown) {
     if (columns.side.mode === "thread") levels.push("side");
@@ -1106,7 +1106,7 @@ const visits = createVisits();
 /** The place on the channel now, read in the left column, whose state is the page's; null on the call's view. */
 function channelPlace() {
   if (sideActive) return inColumn(columns.main, channelPlace);
-  if (currentView !== "discord") return null;
+  if (screens.view() !== "discord") return null;
   const channel = String(selectedChannelId() || "");
   if (!channel) return null;
   /** @type {ChannelPlace} */
@@ -1129,13 +1129,13 @@ function channelPlace() {
 
 /** The place the reader is at now: the channel's, or Settings or Help over the screen they were opened from. */
 function currentPlace() {
-  if (currentScreen === "main") return channelPlace();
-  if (currentScreen !== "settings" && currentScreen !== "help") return null;
-  const under = screenBeforeSettings === "main" ? channelPlace() : null;
-  const open = currentScreen === "help" ? helpFolds.entries().find((entry) => entry.open) : null;
+  if (screens.screen() === "main") return channelPlace();
+  if (screens.screen() !== "settings" && screens.screen() !== "help") return null;
+  const under = screens.beforeSettings() === "main" ? channelPlace() : null;
+  const open = screens.screen() === "help" ? helpFolds.entries().find((entry) => entry.open) : null;
   return {
-    screen: currentScreen, channel: String(selectedChannelId() || ""), under,
-    from: currentScreen === "help" ? helpReturn : null, entry: open ? String(open.id).replace(/^help-/, "") : null,
+    screen: screens.screen(), channel: String(selectedChannelId() || ""), under,
+    from: screens.screen() === "help" ? screens.helpReturn() : null, entry: open ? String(open.id).replace(/^help-/, "") : null,
   };
 }
 
@@ -1174,7 +1174,7 @@ function showChannelPlace(place) {
 
 /** `showChannelPlace`, with `#462 webapp-deep-links`'s arriving-not-choosing already noted. */
 function showChannelPlaceWithin(place) {
-  if (currentScreen !== "main" || currentView !== "discord") return undefined;
+  if (screens.screen() !== "main" || screens.view() !== "discord") return undefined;
   const now = channelPlace();
   if (now && now.layout === "one" && now.view === "thread" && now.origin === "list" && place.layout === "list") leaveThread();
   else if (now && now.layout === "list" && place.layout !== "list") threadListBack();
@@ -1202,16 +1202,16 @@ function showChannelPlaceWithin(place) {
 
 /** Go to place `place`: off the screens over the channel, the channel on the place under, and on to its screen. */
 function showPlace(place) {
-  if (currentScreen === "help" && visitKey(place) !== visitKey(currentPlace())) closeHelp();
+  if (screens.screen() === "help" && visitKey(place) !== visitKey(currentPlace())) closeHelp();
   const under = place.screen === "main" ? place : place.under;
-  if (currentScreen === "settings" && (place.screen === "main" || (place.screen === "help" && place.from !== "settings"))) {
+  if (screens.screen() === "settings" && (place.screen === "main" || (place.screen === "help" && place.from !== "settings"))) {
     closeSettings();
   }
-  if (currentScreen === "main" && under) showChannelPlace(under);
-  if (place.screen === "settings" && currentScreen !== "settings") showScreen("settings");
-  if (place.screen === "help" && currentScreen !== "help") {
-    if (place.from === "settings" && currentScreen !== "settings") showScreen("settings");
-    helpReturn = currentScreen;
+  if (screens.screen() === "main" && under) showChannelPlace(under);
+  if (place.screen === "settings" && screens.screen() !== "settings") showScreen("settings");
+  if (place.screen === "help" && screens.screen() !== "help") {
+    if (place.from === "settings" && screens.screen() !== "settings") showScreen("settings");
+    screens.setHelpReturn(screens.screen());
     showHelp(place.entry);
   }
 }
@@ -1227,7 +1227,7 @@ function placeFromKeyboard(step) {
     closeOpenMenu(menus[menus.length - 1]);
     return true;
   }
-  if (currentScreen === "main" && currentView !== "discord") {
+  if (screens.screen() === "main" && screens.view() !== "discord") {
     setStatus("Back and Forward go through the channel's views; the call has none.");
     return true;
   }
@@ -1243,7 +1243,7 @@ function placeFromKeyboard(step) {
     showPlace(place);
     notePlace();
   })) {
-    if (currentScreen === "main") settleFocus();
+    if (screens.screen() === "main") settleFocus();
     return true;
   }
   // Nothing noted behind, as after a reload or a change of channel that opened on something over a view
@@ -1252,7 +1252,7 @@ function placeFromKeyboard(step) {
     const levels = backLevels().filter((tag) => tag !== "reply" && !tag.startsWith("menu:"));
     if (levels.length > 0) {
       closeBackLevel(levels[levels.length - 1]);
-      if (currentScreen === "main") settleFocus();
+      if (screens.screen() === "main") settleFocus();
       return true;
     }
   }
@@ -1367,7 +1367,7 @@ function deepLinkFor(ref) {
 function syncDeepLinkAddress() {
   const history = backHistory();
   if (!history || typeof window !== "object" || !window.location) return;
-  const place = currentScreen === "main" ? channelPlace() : null;
+  const place = screens.screen() === "main" ? channelPlace() : null;
   if (!place) return;
   const focused = deepLinks.focus();
   const focus = focused && focused.channel === place.channel &&
@@ -1447,7 +1447,7 @@ async function applyDeepLink() {
   // own open would simply overwrite it. Giving up here is not final — the next place noted
   // kicks this again (`scheduleBackSync`); applied is only ever set past this wait.
   if (!await waitForDeepLink(() => Boolean(token()) && channelDirectory.channels().length > 0 &&
-      Boolean(selectedChannelId()) && currentScreen === "main" && currentView === "discord")) return;
+      Boolean(selectedChannelId()) && screens.screen() === "main" && screens.view() === "discord")) return;
   deepLinks.markApplied();
   // A reader who chose a channel or a view while that wait ran is not moved at all — least
   // of all half-moved, onto the link's channel in a view of their own choosing.
@@ -1465,7 +1465,7 @@ async function applyDeepLink() {
       deepLinks.arrive(() => changeSelectedChannel());
     }
   }
-  if (currentView !== "discord") showView("discord");
+  if (screens.view() !== "discord") showView("discord");
   const channel = String(selectedChannelId());
   const startPlace = channelPlace();
   const startVisit = visits.position();
@@ -1799,7 +1799,7 @@ function arriveAtPlace(place) {
  * @param {MessageLinkRef} ref
  */
 async function jumpToMessageLink(ref) {
-  if (currentScreen !== "main" || currentView !== "discord") return undefined;
+  if (screens.screen() !== "main" || screens.view() !== "discord") return undefined;
   // Where the reader is, in the column the link was tapped in; the jump itself is the left column's.
   const spot = linkJumpSpot();
   return inColumn(columns.main, () => jumpFromSpot(ref, spot));
@@ -1814,8 +1814,8 @@ async function jumpToMessageLink(ref) {
  * @param {MessageLinkRef} ref
  */
 async function jumpToSentMessage(ref) {
-  if (currentScreen !== "main") return undefined;
-  const fromCall = currentView !== "discord";
+  if (screens.screen() !== "main") return undefined;
+  const fromCall = screens.view() !== "discord";
   /** @type {LinkSpot} */
   const spot = fromCall
     ? { place: null, column: "main", pinned: false, anchor: null, offset: 0, focus: deepLinks.focus(), call: true }
@@ -1932,7 +1932,7 @@ async function returnToLinkSpot(spot) {
   const ticket = linkJumps.nextTicket();
   // `#580 open-in-chat-jump`. A jump from the call's view goes back to it, where the reader was.
   if (spot.call) {
-    if (currentScreen !== "main" || currentView === "voice") return;
+    if (screens.screen() !== "main" || screens.view() === "voice") return;
     uiState.settle();
     showView("voice");
     stopDiscordPolling();
@@ -1940,7 +1940,7 @@ async function returnToLinkSpot(spot) {
     return;
   }
   const place = spot.place;
-  if (!place || currentScreen !== "main" || currentView !== "discord") return;
+  if (!place || screens.screen() !== "main" || screens.view() !== "discord") return;
   if (!channelDirectory.channels().some((channel) => String(channel.id) === place.channel)) return;
   if (String(selectedChannelId()) !== place.channel) {
     arriveOnChannel(place.channel);
@@ -1980,28 +1980,25 @@ function putBackOnSpot(spot) {
 // the sign-in screen; the connection details and the knobs live in settings; the main screen is
 // the transcript and the two controls, and nothing else.
 
-const SCREENS = ["signin", "main", "settings", "help"];
+// The screens (`SCREENS`), which is up, where Settings' and Help's ways out go, and the view the main
+// screen shows: one owner in web/src/view/shell/screens.ts (`#624 voice-page-modularity`).
+const screens = createScreens();
 
 /** What the header calls each screen that is a DESTINATION rather than the app itself. */
 const SCREEN_TITLES = { settings: "Settings", help: "Help" };
 
-let screenBeforeSettings = "signin";
-let currentScreen = "signin";
-
-/**
- * Where Back on Help goes: Settings, which is where Help is opened from, unless `?` opened it
- * (`keysFromKeyboard`). Put back to Settings whenever Help is left, by `showScreen`.
- */
-let helpReturn = "settings";
+// Where Back on Help goes — Settings, which is where Help is opened from, unless `?` opened it
+// (`keysFromKeyboard`) — and where Settings' way out goes are the screens' (`Screens.helpReturn`,
+// `Screens.beforeSettings`), put back as each screen is arrived at (`Screens.arrive`).
 
 function showScreen(name) {
-  const previous = currentScreen;
+  const previous = screens.screen();
   // `#338 column-overscroll`. The room past the right column's foot goes with the main screen: a reader who
   // was in it comes back to the foot.
   if (name !== "main") closeOverscroll();
   // The channel list is about to be hidden, and a hidden list has nothing left to measure: the
   // reader's message is noted now, for a reopen. `#189 restore-ui-state`.
-  if (currentScreen === "main" && name !== "main") holdChannelPlace();
+  if (screens.screen() === "main" && name !== "main") holdChannelPlace();
   // `#269 approval-card-inline`. ...and the list about to be shown again is whole when it is first laid out:
   // a draft docked under the screen being left is back at its foot BEFORE it is shown (`postCardBackToMain`).
   if (name === "main" && previous !== "main") voiceTranscript().postCardBackToMain();
@@ -2051,15 +2048,11 @@ function showScreen(name) {
   // Help is reached FROM settings and returns TO it, so it must not become the thing settings
   // remembers to go back to — that would make the gear's way out lead into the document the
   // reader just left. `#85 voice-desktop-review`.
-  if (name !== "settings" && name !== "help") {
-    screenBeforeSettings = name;
-  }
   // `#224 keyboard-shortcuts`. Help left by any way at all (its Back, Esc, or the search or Settings
   // key, which leave it as Settings' Back does) forgets where `?` opened it from: the next Help, from
   // a `?` in Settings, goes back to Settings. Here rather than in each way out, so that a way out
-  // added later cannot leave a stale answer behind.
-  if (previous === "help" && name !== "help") helpReturn = "settings";
-  currentScreen = name;
+  // added later cannot leave a stale answer behind (`Screens.arrive`).
+  screens.arrive(name, previous);
   // The jump is about the list on the main screen, and is gone with it. `#207 scrollback-jump`. Back on
   // the main screen it is decided at the end, on the list as it is then laid out (below).
   if (!main) renderJumpNewest();
@@ -2113,7 +2106,7 @@ function showScreen(name) {
 function closeSettings() {
   const held = /** @type {HTMLElement | null} */ (document.activeElement);
   if (held && !focusLost() && typeof held.blur === "function") held.blur();
-  showScreen(screenBeforeSettings);
+  showScreen(screens.beforeSettings());
 }
 
 // --- Settings, folded -----------------------------------------------------------------------------
@@ -2165,7 +2158,8 @@ const helpFolds = mountHelpFolds({
   byId: (id) => document.getElementById(id),
 });
 
-let currentView = "voice";
+// The view the main screen shows ("voice" for the call's, "discord" for the channel's) is the screens'
+// (`Screens.view`, `#624 voice-page-modularity`).
 
 /**
  * The call, or the channel. One switch with two positions, and the word on it names the position
@@ -2386,14 +2380,14 @@ function showView(name) {
   if (name !== "discord") putDockedReplyAway();
   // Written down BEFORE the panes swap, because after that the scroll position belongs to
   // whichever pane is now up and says nothing about where the reader was.
-  const leaving = currentView;
+  const leaving = screens.view();
   if (leaving && leaving !== name) {
     const area = el("scroll-area");
     viewScroll[leaving] = { top: area.scrollTop, atNewest: atBottom(area) };
     // ...and, leaving the channel, the message the reader was on, for a reopen. `#189 restore-ui-state`.
     if (leaving === "discord") holdChannelPlace();
   }
-  currentView = name;
+  screens.setView(name);
   el("pane-voice").hidden = name !== "voice";
   el("pane-discord").hidden = name !== "discord";
   // `#269 approval-card-inline`. A waiting draft is the next message of the list now on screen, put
@@ -2457,7 +2451,7 @@ function showView(name) {
   // Above all off the view switch: left holding the focus from the click that pressed it, it took
   // the next Space as another press and switched straight back. Only on the main screen: a view
   // changed behind Settings must not take the focus from the control the reader is on there.
-  if (leaving !== name && currentScreen === "main") settleFocus();
+  if (leaving !== name && screens.screen() === "main") settleFocus();
   // `#304 back-gesture-in-app`. The call's view waits in front of whatever the channel had open.
   scheduleBackSync();
 }
@@ -2592,14 +2586,14 @@ const {
  * and lands them on the foot of what it leaves rather than in blank room fitted to another card.
  */
 function overscrollContext() {
-  return JSON.stringify([columnsShown, threadListShown, currentScreen, currentView, columns.side.mode,
+  return JSON.stringify([columnsShown, threadListShown, screens.screen(), screens.view(), columns.side.mode,
     readModes.mode(), inColumn(columns.side, () => [channelContextKey(), pinsView().only, searchKey()])]);
 }
 
 /** Whether the room may be open: the right column on screen at a desk, where web/voice.css gives it a box. */
 function overscrollOffered() {
   const room = leftEl("side-overscroll");
-  return currentScreen === "main" && currentView === "discord" && sideColumnUp() &&
+  return screens.screen() === "main" && screens.view() === "discord" && sideColumnUp() &&
     typeof room.getClientRects === "function" && room.getClientRects().length > 0;
 }
 
@@ -2729,8 +2723,8 @@ const { finishPackSlide, slideKey, itemAfterBlock, slideIntoPlace } = packSlider
  */
 const scrollKeeping = createScrollKeeping({
   el: (id) => el(id),
-  onMain: () => currentScreen === "main",
-  currentView: () => currentView,
+  onMain: () => screens.screen() === "main",
+  currentView: () => screens.view(),
   channelView: () => selection().view,
   pinnedOnly: () => pinsView().only,
   heldFilterRow: () => heldFilterRow(),
@@ -3280,7 +3274,7 @@ function renderSummaries() {
 function summaryTargets() {
   // `#211 link-filter`. A summary stands in for a row's text, and under the Links filter that text
   // is not on screen: a summary asked for there is one paid for and never seen.
-  if (!summaryRows.mode() || currentView !== "discord" || (searchField.open() && searchField.links())) {
+  if (!summaryRows.mode() || screens.view() !== "discord" || (searchField.open() && searchField.links())) {
     return [];
   }
   // A server that has said it has no summariser will say it again for every row, and each of
@@ -3375,7 +3369,7 @@ const jumpNewestWanted = {
  * 0 for a change below that is not a new message (a turn still being spoken, a seam), `null` for
  * messages that cannot be counted.
  */
-function setJumpNewest(wanted, view = currentView, arrived = 0) {
+function setJumpNewest(wanted, view = screens.view(), arrived = 0) {
   const held = jumpNewestWanted[view];
   if (!wanted) jumpNewestWanted[view] = false;
   else if (arrived === null || held === true) jumpNewestWanted[view] = true;
@@ -3431,7 +3425,7 @@ function renderJumpNewest() {
   let unsent = null;
   // Only over a list on screen. Anywhere else #scroll-area is hidden and measures nothing at all,
   // and taking that zero for "at the newest" would forget where the list was left.
-  if (currentScreen === "main") {
+  if (screens.screen() === "main") {
     const area = el("scroll-area");
     // `#338 column-overscroll`. From the foot of the rows, the room past it fitted to them first: a reader
     // in that room is at the newest, and is offered no way down to where they already are.
@@ -3440,25 +3434,25 @@ function renderJumpNewest() {
     if (gap <= BOTTOM_SLACK_PX) {
       // At the newest, which is also all of a list too short to scroll. Nothing is below to jump
       // to, and nothing that arrived is still unseen.
-      inScrollback[currentView] = false;
-      jumpNewestWanted[currentView] = false;
+      inScrollback[screens.view()] = false;
+      jumpNewestWanted[screens.view()] = false;
       // ...nor a reply that did not go, whose outbox row is down here (`#277 reply-in-column`). Only
       // from a list with a height: a column not drawn is at no foot.
-      if ((area.clientHeight || 0) > 0 && currentView === "discord") unseenColumnReplies[activeColumn.name] = null;
+      if ((area.clientHeight || 0) > 0 && screens.view() === "discord") unseenColumnReplies[activeColumn.name] = null;
     } else if (gap > SCROLLBACK_PX) {
-      inScrollback[currentView] = true;
+      inScrollback[screens.view()] = true;
     }
     // ...and never over a list the filters emptied (`#212 link-filter`, from review). Every row in
     // it is hidden, so there is no newest message to go to: the jump would only take the reader past
     // the sentence saying why to the composer under it, which `placeFilterAnchor` scrolled them up from.
-    shown = !listEmptied() && (inScrollback[currentView] || jumpNewestWanted[currentView] !== false);
+    shown = !listEmptied() && (inScrollback[screens.view()] || jumpNewestWanted[screens.view()] !== false);
     // `#277 reply-in-column`. A reply sent from this column that did not go raises it too, over the same
     // lists: the way down is the way to its Retry.
-    if (currentView === "discord") unsent = unseenColumnReply();
+    if (screens.view() === "discord") unsent = unseenColumnReply();
     if (unsent !== null && !shown) shown = !listEmptied();
   }
   // The arrival changes what the ONE control says, rather than raising a second one beside it.
-  const arrived = jumpNewestWanted[currentView];
+  const arrived = jumpNewestWanted[screens.view()];
   const count = typeof arrived === "number" && arrived > 0 ? arrived : 0;
   const many = count > JUMP_COUNT_MAX ? `${JUMP_COUNT_MAX}+` : String(count);
   // `#277 reply-in-column`. So does a reply sent from this column that did not go, before anything
@@ -3563,13 +3557,13 @@ function renderScrollTools() {
   // enough in it to be worth condensing. Offering it over the voice transcript would be offering
   // a mode that changes nothing, since a voice turn has no message id to key a summary under.
   el("summarise").hidden =
-    currentView !== "discord" || !folds.some((entry) => entry.id !== null);
+    screens.view() !== "discord" || !folds.some((entry) => entry.id !== null);
   el("summarise").disabled = summaryRows.disabledByServer() !== "";
   el("summarise").title = summaryRows.disabledByServer()
     ? `Summaries are unavailable on this server: ${summaryRows.disabledByServer()}`
     : "Show a one-line summary in place of each long message.";
   // `#204 reply-arrow`. The other way back: to the reply a jump left, while it is off screen.
-  el("back-to-reply").hidden = currentView !== "discord" || replyReturnRow() === null;
+  el("back-to-reply").hidden = screens.view() !== "discord" || replyReturnRow() === null;
   // `#193 compose-draft-loss`. The way back from a Dismiss in the outbox, on the channel only.
   renderSendUndo();
   // `#420 bookmark-clear`. ...and from taking the bookmark away, in its own channel.
@@ -3850,7 +3844,7 @@ const searchField = createSearchField({
       eachColumn(renderScrollTools);
       if (sideColumnUp()) filterSideCards();
     };
-    if (currentScreen === "main") preservingScroll(mark);
+    if (screens.screen() === "main") preservingScroll(mark);
     else mark();
   },
 });
@@ -3987,7 +3981,7 @@ function searchable(row, ...parts) {
 /** The lists the reader can actually see right now, which is what a count may speak for. */
 function searchScope() {
   return SEARCH_LISTS.filter(
-    (id) => !el(id).hidden && (id === "transcript") === (currentView === "voice")
+    (id) => !el(id).hidden && (id === "transcript") === (screens.view() === "voice")
   );
 }
 
@@ -4111,13 +4105,13 @@ function applySearch() {
   // against, and the pass above has just decided that.
   renderReplyLinks();
   // `#206 pin-message`. Over the Pinned filter the denominator is the channel's PINS, all of them.
-  const pinned = pinsView().only && currentView === "discord";
+  const pinned = pinsView().only && screens.view() === "discord";
   activeColumn.searched = { matched, loaded, tally, pinned };
   renderSearchCount(typed, links, author !== "everyone");
   // `#262 search-load-older`. The step back offers to search further back while a filter chooses rows,
   // and a walk that the change of filter just made nobody's ends here, before anything below says what
   // it found. And in one column on Main, a search nothing matches offers All, which has the replies.
-  if (currentView === "discord") renderOlderControl();
+  if (screens.view() === "discord") renderOlderControl();
   if (!sideActive) renderSearchInAll();
   // `#605 server-side-search`. The server's copy, asked again when the search wanted has changed.
   if (!sideActive) scheduleServerSearch();
@@ -4139,7 +4133,7 @@ function applySearch() {
     return;
   }
   if (author !== "everyone") {
-    const sentence = currentView === "discord" && selection().view === "threads"
+    const sentence = screens.view() === "discord" && selection().view === "threads"
       ? "This is a list of threads, and who wrote what is in their messages — open a thread to see it."
       : matched > 0 || loaded === 0 ? "" : authorEmptySentence(author, typed, false);
     el("search-empty").textContent = sentence;
@@ -4168,7 +4162,7 @@ function applySearch() {
 function searchInAllOffered(searched) {
   return searched !== null && !searched.pinned && searched.matched === 0 && searched.loaded > 0 && searchField.open() &&
     !searchField.links() && authorChoosing() === "everyone" && searchTyped(searchField.query()) &&
-    currentView === "discord" && threadingSupported && !sideColumnUp() && selection().view === "main";
+    screens.view() === "discord" && threadingSupported && !sideColumnUp() && selection().view === "main";
 }
 
 /**
@@ -4210,7 +4204,7 @@ function searchInAll() {
  * @param {number} loaded How many messages are loaded in this column, as the count says it.
  */
 function searchEmptySentence(loaded) {
-  if (currentView !== "discord" || selection().view === "threads") return SEARCH_EMPTY_LOADED;
+  if (screens.view() !== "discord" || selection().view === "threads") return SEARCH_EMPTY_LOADED;
   const view = channelViewWords();
   const reach = historyReach();
   let said;
@@ -4338,7 +4332,7 @@ function linksEmptySentence(loaded, tally, matched, author = "everyone") {
   // The Threads list is a list of THREADS. Its rows have no text of their own to hold a link, so an
   // empty list there is not "no links" — it is the wrong list to look in, and the reader is told
   // where the links are.
-  if (currentView === "discord" && selection().view === "threads") {
+  if (screens.view() === "discord" && selection().view === "threads") {
     return "This is a list of threads, and links are in their messages — open a thread to see its links.";
   }
   // An empty list explains itself in the pane's own words.
@@ -4739,7 +4733,7 @@ function openSearchGap(row, below) {
   if (first === null) return null;
   // The reader keeps their place, as opening a collapsed run keeps it: rows growth above them is
   // the list's, not a jump in it. Only where this list is the one on screen.
-  if (currentScreen === "main" && currentView === "discord") preservingScroll(applySearch);
+  if (screens.screen() === "main" && screens.view() === "discord") preservingScroll(applySearch);
   else applySearch();
   return first;
 }
@@ -4864,7 +4858,7 @@ function drawSeams(list) {
       }
     }
   };
-  if (!sideActive && filterChanging === 0 && currentScreen === "main" && currentView === "discord" && list === visibleList()) {
+  if (!sideActive && filterChanging === 0 && screens.screen() === "main" && screens.view() === "discord" && list === visibleList()) {
     // While a filter change holds a message in place (`#243 filter-keeps-selection`), the hold places
     // the reader, not this: the held message goes back where the change put it, as after every other
     // redraw around it (`keepFilterHold`) — kept where it happens to be in the middle of a redraw, it
@@ -5085,7 +5079,7 @@ function nearestShownRow(anchor) {
 function currentFilterHold() {
   const hold = filterState().hold;
   if (hold === null) return null;
-  if (currentScreen !== "main" || hold.key !== filterKey()) {
+  if (screens.screen() !== "main" || hold.key !== filterKey()) {
     filterState().hold = null;
     return null;
   }
@@ -5157,9 +5151,9 @@ function keepFilterHold() {
 
 /** Measure the anchor of a filter change in the column being worked on, or null with no list on screen. */
 function filterAnchor() {
-  if (currentScreen !== "main") return null;
+  if (screens.screen() !== "main") return null;
   const area = el("scroll-area");
-  const pane = currentView === "discord" ? (sideActive ? sidePane : channelPane) : null;
+  const pane = screens.view() === "discord" ? (sideActive ? sidePane : channelPane) : null;
   const mark = pane ? markOf(pane) : null;
   const chosen = pane ? markedRow(pane, mark) : null;
   const showing = Boolean(pane && mark && chosen && rowInView(pane, chosen));
@@ -5249,7 +5243,7 @@ function keepingFilterPlace(change) {
  * again. A list filled again with no anchor to go back to opens at its newest line, as a list does.
  */
 function placeFilterAnchor(anchor, wasEmptied = false, walked = false) {
-  if (currentScreen !== "main") return;
+  if (screens.screen() !== "main") return;
   const area = el("scroll-area");
   if (listEmptied()) {
     area.scrollTop = 0;
@@ -5289,7 +5283,7 @@ function placeFilterAnchor(anchor, wasEmptied = false, walked = false) {
   // The message's own top where it is part of a combined row (`messageTop`), the row's otherwise.
   area.scrollTop += messageTop(placed, row ? id : null) - listPlaceTop(area) - offset;
   carrySelection(anchor, placed, substitute !== null);
-  const pane = currentView === "discord" ? (sideActive ? sidePane : channelPane) : null;
+  const pane = screens.view() === "discord" ? (sideActive ? sidePane : channelPane) : null;
   const mark = pane ? markOf(pane) : null;
   filterState().hold = {
     key: filterKey(), row: placed, ids: idsOf(placed), at: area.scrollTop, origin: anchor,
@@ -5306,7 +5300,7 @@ function placeFilterAnchor(anchor, wasEmptied = false, walked = false) {
  * selection go to the message shown in its place, as `keepSelection` hands them on.
  */
 function carrySelection(anchor, row, substituted) {
-  if (anchor.selected === null || currentView !== "discord") return;
+  if (anchor.selected === null || screens.view() !== "discord") return;
   const pane = sideActive ? sidePane : channelPane;
   if (rowOf(pane, row) !== row) return;
   if (substituted) {
@@ -5346,7 +5340,7 @@ function filterHiddenSentence(anchor, walked) {
 
 /** Whether the anchor's message is older than everything the channel's list has loaded, with more above it. */
 function olderThanLoaded(anchor) {
-  if (sideActive || currentView !== "discord" || pinsView().only || olderPages().moreAbove !== true ||
+  if (sideActive || screens.view() !== "discord" || pinsView().only || olderPages().moreAbove !== true ||
       !Number.isFinite(anchor.time)) return false;
   const loaded = threadingSupported ? timelineRows().messages : [...el("discord-log").children].flatMap(rowMessages);
   const times = loaded.map((message) => timeOf(message, "timestamp")).filter(Number.isFinite);
@@ -5367,7 +5361,7 @@ async function walkToFilterAnchor(anchor) {
   filterWalk = walk;
   const area = el("scroll-area");
   const current = () => filterWalk === walk && walk.context === channelContextKey() && !pinsView().only &&
-    currentScreen === "main" && currentView === "discord";
+    screens.screen() === "main" && screens.view() === "discord";
   area.scrollTop = 0;
   renderOlderControl();
   renderJumpNewest();
@@ -5664,7 +5658,7 @@ const heldLinks = (row) => (row.linkView ? row.linkView.links : []);
 
 /** Which list the reader is in, so a place kept in one is never restored in another. */
 const filterPlace = () =>
-  [currentView, currentChannelId(), selection().view, selection().threadId || ""].join("\u0000");
+  [screens.view(), currentChannelId(), selection().view, selection().threadId || ""].join("\u0000");
 
 /**
  * Turn the Links filter on or off, the reader's message kept where it is on the screen — or, under
@@ -5750,7 +5744,7 @@ function cycleAuthorFilter() {
  * in the channel's view leaves his own out, and the sentence says how to see them.
  */
 function authorEmptySentence(author, searching, pinned) {
-  return authorEmptyWords(author, searching, pinned, () => currentView === "discord" && hidingRead() && markOwnRead);
+  return authorEmptyWords(author, searching, pinned, () => screens.view() === "discord" && hidingRead() && markOwnRead);
 }
 
 // --- the kinds of link under Links ----------------------------------------------------------------
@@ -5915,7 +5909,7 @@ const LIST_BOXES = [
  * @returns {HTMLElement | null}
  */
 function boxBeingWritten(area) {
-  if (currentScreen !== "main") return null;
+  if (screens.screen() !== "main") return null;
   const held = document.activeElement;
   for (const [field, box] of LIST_BOXES) {
     if (held === leftEl(field) && nodeWithin(area, leftEl(box))) return leftEl(box);
@@ -6382,7 +6376,7 @@ const channelPane = {
   scroller: () => leftEl("scroll-area"),
   // None while the thread list is up on its own: the left column is behind it. `#281 view-keys`.
   list: () => inColumn(columns.main, () =>
-    (currentScreen === "main" && currentView === "discord" && !threadListShown &&
+    (screens.screen() === "main" && screens.view() === "discord" && !threadListShown &&
       (pinsView().only || selection().view !== "threads") ? shownChannelList() : null)),
   head: () => floatingClearance(leftEl("scroll-area")),
   // The chips float over the foot of the list, the read-aloud strip stands on them while a read
@@ -6414,7 +6408,7 @@ const channelPane = {
 const sidePane = {
   name: "side",
   scroller: () => leftEl("side-scroll"),
-  list: () => (currentScreen === "main" && currentView === "discord" && sideColumnUp()
+  list: () => (screens.screen() === "main" && screens.view() === "discord" && sideColumnUp()
     ? leftEl(columns.side.mode === "thread" ? "side-log" : "side-cards") : null),
   head: () => leftEl("side-scroll").getBoundingClientRect().top,
   foot: () => {
@@ -6465,8 +6459,8 @@ function paneFor(node) {
  * the pane `node` is in (or the pane `paneFor` picks), elsewhere the screen.
  */
 function visibleScroller(node = document.activeElement) {
-  if (currentScreen === "main") return (paneFor(node) || KEY_PANES[0]).scroller();
-  return el(`screen-${currentScreen}`);
+  if (screens.screen() === "main") return (paneFor(node) || KEY_PANES[0]).scroller();
+  return el(`screen-${screens.screen()}`);
 }
 
 /**
@@ -6755,7 +6749,7 @@ function mouseMoved(event) {
  * again. `#239 single-selection`.
  */
 function focusFollowsSelection() {
-  if (currentScreen !== "main") return false;
+  if (screens.screen() !== "main") return false;
   if (focusLost()) return true;
   const held = document.activeElement;
   if (isTextField(held) || keepsOwnKeys(held)) return false;
@@ -6804,7 +6798,7 @@ function onPointerMove(event) {
   driftFromColumnGlide();
   // A button held is a drag (text being selected, a scrollbar dragged), not a message being chosen.
   if (event.buttons) return;
-  if (currentScreen !== "main") return;
+  if (screens.screen() !== "main") return;
   // `#298 thread-card-header`. The card at the top of the right column's thread is what its link joins
   // to its root, and the mouse resting on it glides Main to that root, as on a card in the list.
   const header = leftEl("side-thread-card");
@@ -6827,11 +6821,11 @@ function onPointerDown(event) {
   if (kind === "mouse") mouseInUse();
   else if (kind) touchInUse();
   const target = event && event.target;
-  if (currentScreen !== "main" || !target) return;
+  if (screens.screen() !== "main" || !target) return;
   const pane = KEY_PANES.find((each) => { const list = each.list(); return list !== null && nodeWithin(list, target); });
   if (pane) inColumn(paneColumn(pane), readerActed);
   // The call's transcript, which no key moves through, is a list of messages a filter keeps a place in too.
-  else if (currentView !== "discord" && nodeWithin(el("transcript"), target)) inColumn(columns.main, readerActed);
+  else if (screens.view() !== "discord" && nodeWithin(el("transcript"), target)) inColumn(columns.main, readerActed);
 }
 
 /**
@@ -6954,7 +6948,7 @@ function focusList(pane) {
 function settleFocus() {
   const held = document.activeElement;
   if (held && isTextField(held) && shownNode(held) && !behindThreadList(held) && !inColumnGone(held)) return;
-  focusList(currentScreen === "main" ? paneFor(held) : null);
+  focusList(screens.screen() === "main" ? paneFor(held) : null);
 }
 
 /**
@@ -7052,7 +7046,7 @@ function routeScrollKey(event, target) {
   }
   if (target && nodeWithin(area, target)) {
     openOverscrollForKey(area, event);
-    const pane = currentScreen === "main" ? paneFor(target) : null;
+    const pane = screens.screen() === "main" ? paneFor(target) : null;
     if (pane && pane.row === target && (paging || key === " ")) {
       followPageScroll(pane, target, key === "PageUp" || (key === " " && Boolean(event.shiftKey)));
     }
@@ -7541,7 +7535,7 @@ function threadOutFromKeyboard() {
   // In two columns, from the right column back to Main on the left; the thread stays where it is.
   // `#229 desktop-two-column`.
   if (columnsShown) {
-    if (!sideActive || currentScreen !== "main" || currentView !== "discord") return false;
+    if (!sideActive || screens.screen() !== "main" || screens.view() !== "discord") return false;
     // `#277 thread-card-focus`. A thread entered from its card goes back out to the cards, as → came
     // in: the X, and the keys on the card it was entered from.
     if (columns.side.mode === "thread" && columns.side.fromCards) {
@@ -7556,7 +7550,7 @@ function threadOutFromKeyboard() {
   }
   // The thread list shows cards, not a thread: there is none on screen to leave. `#281 view-keys`.
   if (threadListOnScreen()) return false;
-  if (currentScreen !== "main" || currentView !== "discord" || selection().view !== "thread") return false;
+  if (screens.screen() !== "main" || screens.view() !== "discord" || selection().view !== "thread") return false;
   leaveThread();
   return true;
 }
@@ -7883,7 +7877,7 @@ async function copyNow(copy) {
 // --- views, filters and channels
 
 /** Whether the list of the channel is the one on screen: where the keys about messages and views apply. */
-const channelOnScreen = () => currentScreen === "main" && currentView === "discord";
+const channelOnScreen = () => screens.screen() === "main" && screens.view() === "discord";
 
 /**
  * Ctrl+1 to Ctrl+4 (Cmd on an Apple keyboard): Main, All, the thread list, and two columns, the four
@@ -7923,13 +7917,13 @@ const channelOnScreen = () => currentScreen === "main" && currentView === "disco
  */
 function voiceFromKeyboard(repeat) {
   if (sideActive) return inColumn(columns.main, () => voiceFromKeyboard(repeat));
-  const covering = currentScreen === "settings" || currentScreen === "help";
-  if (!(currentScreen === "main" || (covering && screenBeforeSettings === "main"))) {
+  const covering = screens.screen() === "settings" || screens.screen() === "help";
+  if (!(screens.screen() === "main" || (covering && screens.beforeSettings() === "main"))) {
     return false;
   }
   if (repeat) return true;
   if (covering) closeSettings();
-  if (currentView !== "voice") pressViewSwitch();
+  if (screens.view() !== "voice") pressViewSwitch();
   return true;
 }
 
@@ -7937,15 +7931,15 @@ function viewFromKeyboard(which, repeat) {
   // A view is the page's, whichever column the keys are in.
   if (sideActive) return inColumn(columns.main, () => viewFromKeyboard(which, repeat));
   const channel = String(selectedChannelId() || "");
-  const covering = currentScreen === "settings" || currentScreen === "help";
+  const covering = screens.screen() === "settings" || screens.screen() === "help";
   // Settings and Help are left for the screen they were opened over, which is the channel's only when
   // that is the main screen.
-  if (!channel || !(currentScreen === "main" || (covering && screenBeforeSettings === "main"))) {
+  if (!channel || !(screens.screen() === "main" || (covering && screens.beforeSettings() === "main"))) {
     return false;
   }
   if (repeat) return true;
   if (covering) closeSettings();
-  if (currentView !== "discord") pressViewSwitch();
+  if (screens.view() !== "discord") pressViewSwitch();
   if (!channelOnScreen()) return false;
   chooseView(which);
   settleFocus();
@@ -8045,7 +8039,7 @@ function composeFromKeyboard() {
     leftEl("reply-text").focus();
     return true;
   }
-  if (currentScreen === "main" && currentView === "voice") {
+  if (screens.screen() === "main" && screens.view() === "voice") {
     const agent = leftEl("compose-text");
     if (!shownNode(agent)) return false;
     // Its own focus listener brings the whole box into view (`keepComposerInView`).
@@ -8092,14 +8086,14 @@ function composeFromKeyboard() {
  * left only where it has neither. Settings and Help are screens over the view, not views, and are left.
  */
 function writeFromKeyboard() {
-  if (currentScreen === "settings" || currentScreen === "help") closeSettings();
+  if (screens.screen() === "settings" || screens.screen() === "help") closeSettings();
   if (threadListOnScreen() && !threadListHasBox()) threadListBack();
   const held = document.activeElement;
   // Already in a message box on screen: it stays there, even beside a reply open in its column.
   if (isComposer(held) && shownNode(held) && !behindThreadList(held) && !inColumnGone(held)) return true;
   /** @type {KeyPane | null} */
   let pane = null;
-  if (currentScreen === "main") {
+  if (screens.screen() === "main") {
     // The chips over a column's foot are outside its scroller and still that column's.
     if (held && nodeWithin(leftEl("side-tools"), held)) pane = sidePane;
     else if (held && nodeWithin(leftEl("scroll-tools"), held)) pane = channelPane;
@@ -8196,8 +8190,8 @@ function channelPicked() {
  * it did anything.
  */
 function searchFromKeyboard() {
-  if (currentScreen === "settings" || currentScreen === "help") closeSettings();
-  if (currentScreen !== "main") return false;
+  if (screens.screen() === "settings" || screens.screen() === "help") closeSettings();
+  if (screens.screen() !== "main") return false;
   if (!searchField.open()) setSearchOpen(true);
   const field = el("search-field");
   field.focus();
@@ -8231,11 +8225,11 @@ function searchFromAnywhere() {
  * it did anything.
  */
 function settingsFromKeyboard() {
-  if (currentScreen === "settings" || currentScreen === "help") {
+  if (screens.screen() === "settings" || screens.screen() === "help") {
     closeSettings();
     return true;
   }
-  if (currentScreen === "main" || currentScreen === "signin") {
+  if (screens.screen() === "main" || screens.screen() === "signin") {
     showScreen("settings");
     return true;
   }
@@ -8244,7 +8238,7 @@ function settingsFromKeyboard() {
 
 /** Leave Help: back to Settings, or to wherever `?` was pressed (`helpReturn`). */
 function closeHelp() {
-  showScreen(helpReturn);
+  showScreen(screens.helpReturn());
 }
 
 /**
@@ -8253,9 +8247,9 @@ function closeHelp() {
  * the gear reaches. Ctrl+/ (Cmd+/) was this until `#344 search-shortcut` gave it to the search.
  */
 function keysFromKeyboard() {
-  if (currentScreen !== "help") {
-    if (!["main", "signin", "settings"].includes(currentScreen)) return false;
-    helpReturn = currentScreen;
+  if (screens.screen() !== "help") {
+    if (!["main", "signin", "settings"].includes(screens.screen())) return false;
+    screens.setHelpReturn(screens.screen());
   }
   showHelp("keyboard");
   return true;
@@ -8266,7 +8260,7 @@ function keysFromKeyboard() {
  * c and Ctrl+S write in it, and Back puts it down — before it leaves a thread.
  */
 function replyOnScreen() {
-  return replyDocked && currentScreen === "main";
+  return replyDocked && screens.screen() === "main";
 }
 
 /**
@@ -8279,8 +8273,8 @@ function replyOnScreen() {
  * sight of the keys, as it is. Escape runs in the column of the keys (`paneColumn`).
  */
 function goBack() {
-  if (currentScreen === "settings") closeSettings();
-  else if (currentScreen === "help") closeHelp();
+  if (screens.screen() === "settings") closeSettings();
+  else if (screens.screen() === "help") closeHelp();
   else if (replyOnScreen() && replyKeysHere()) closeReply();
   else if (threadListOnScreen()) threadListBack();
   // Not over the right column's cards, whose column still holds the thread it showed last: that Back
@@ -8320,7 +8314,7 @@ function onEscape(event, target) {
   // `#348 settings-dynamic-lists`. The pop-out over Recently dismissed, before Settings itself.
   if (closeOpenMenu("menu:dismissed")) return true;
   if (closeDetailsOn(target)) return true;
-  if (searchField.open() && currentScreen === "main") {
+  if (searchField.open() && screens.screen() === "main") {
     setSearchOpen(false);
     settleFocus();
     return true;
@@ -8347,7 +8341,7 @@ function onEscape(event, target) {
  * with text in it: the first Escape leaves the picker and the next goes Back.
  */
 function isBarPicker(node) {
-  return currentScreen === "main" && Boolean(node) && ["discord-channel", "thread-select"].includes(String(node.id || ""));
+  return screens.screen() === "main" && Boolean(node) && ["discord-channel", "thread-select"].includes(String(node.id || ""));
 }
 
 /** Keep a key from the browser's own default for it. */
@@ -9014,7 +9008,7 @@ function onPageKey(event) {
   if (macFieldEditKey(event, target)) return;
   // `#229 desktop-two-column`. In the column of the list the key is for: the one the focus is in,
   // else the one the keys moved last.
-  const pane = currentScreen === "main" ? paneFor(target) : null;
+  const pane = screens.screen() === "main" ? paneFor(target) : null;
   inColumn(pane ? paneColumn(pane) : columns.main, () => dispatchKey(event, target));
 }
 
@@ -9046,7 +9040,7 @@ function onEverywhereKey(event) {
   if (event.repeat) return;
   keysInUse();
   const target = /** @type {HTMLElement} */ (event.target || document.activeElement);
-  const pane = currentScreen === "main" ? paneFor(target) : null;
+  const pane = screens.screen() === "main" ? paneFor(target) : null;
   inColumn(pane ? paneColumn(pane) : columns.main, () => binding.run(event, target));
 }
 
@@ -9738,7 +9732,7 @@ const PACK_VIEWS = {
  * up with a different opinion about whether the gear is reachable.
  */
 function renderControlBar() {
-  const main = currentScreen === "main";
+  const main = screens.screen() === "main";
   // PER MEMBER, not the bar as a whole. The gear is reachable from the sign-in screen today and
   // must stay so — hiding the bar wholesale off the main screen would take it away.
   //
@@ -9748,7 +9742,7 @@ function renderControlBar() {
   // to the agent... then the UI shifts and I lose the toggle". The message box is in the call's
   // transcript now, so the switch is on the main screen in every state, a call and a draft included.
   el("view-switch").hidden = !main;
-  el("open-settings").hidden = Object.prototype.hasOwnProperty.call(SCREEN_TITLES, currentScreen);
+  el("open-settings").hidden = Object.prototype.hasOwnProperty.call(SCREEN_TITLES, screens.screen());
   // The pack, by the same rule and as a LOOP rather than by name: `#60 canned-prompt-buttons` adds
   // members here, and a member added later is decided by the same line as the rest.
   //
@@ -9760,7 +9754,7 @@ function renderControlBar() {
     const views = PACK_VIEWS[member.id] || [];
     const unavailable = (member.id === "audio-source" && readAloudOwner().agentReadAloud === null) ||
       (member.id === "column-toggle" && !columnsOffered());
-    member.hidden = unavailable || !main || !views.includes(currentView);
+    member.hidden = unavailable || !main || !views.includes(screens.view());
   }
   // A menu whose button has gone must go with it. Leaving Voice or leaving the main screen takes
   // the opener off the strip, and a tray left standing under a button that is no longer there is an
@@ -9778,12 +9772,12 @@ function renderControlBar() {
   // suppressed by the bar's placement either: since `#197 floating-search`
   // the glass and its field float over the top of the LIST, so they never compete with the bar
   // for width — in the dock or in the header.
-  el("search-toggle").hidden = currentScreen !== "main";
+  el("search-toggle").hidden = screens.screen() !== "main";
   el("search-field").hidden = el("search-toggle").hidden || !searchField.open();
   el("search-count").hidden = el("search-field").hidden;
   // `#206 pin-message`. Beside the glass while the bar is open, and over the channel only: a pin is
   // a channel message, and the call's transcript has none to filter to.
-  el("pinned-filter").hidden = el("search-field").hidden || currentView !== "discord";
+  el("pinned-filter").hidden = el("search-field").hidden || screens.view() !== "discord";
   // `#211 link-filter`. Beside Pinned while the bar is open, and over the call view as well: it
   // filters what the search filters, and a turn can hold a link as a channel message can.
   el("links-filter").hidden = el("search-field").hidden;
@@ -9913,7 +9907,7 @@ function collapsedLinesChanged(value) {
     messagePreferences.collapsedLines.saved(n);
     return n;
   };
-  if (currentScreen !== "main") return apply();
+  if (screens.screen() !== "main") return apply();
   /** @type {Array<[typeof activeColumn, ReturnType<typeof captureScroll>]>} */
   const held = [[columns.main, inColumn(columns.main, captureScroll)]];
   if (sideShowing()) held.push([columns.side, inColumn(columns.side, captureScroll)]);
@@ -10385,7 +10379,7 @@ function watchPendingSummaries(choices, source) {
 
 /** A summary on its way is owed a read: the Threads list read now, past its spacing, and the cards drawn again. */
 async function summaryWatchFired() {
-  if (currentView !== "discord") return;
+  if (screens.view() !== "discord") return;
   threadDirectoryReadAt.delete(String(selectedChannelId()));
   await refreshThreadDirectory();
   renderThreadHeading();
@@ -10470,7 +10464,7 @@ function onVisibility() {
   // and after any absence the stream delivered something in, the poll came due in, or that let the
   // stream go.
   if ((away >= VISIBLE_REFRESH_MS || owed !== null || pollDue || resume !== null) &&
-      currentView === "discord" && threadingSupported && clientConfigApplied && selectedChannelId()) {
+      screens.view() === "discord" && threadingSupported && clientConfigApplied && selectedChannelId()) {
     refreshQuietly(async () => {
       try {
         if (owed === "mutation") refreshAfterLiveMutation();
@@ -11410,7 +11404,7 @@ function renderChannelFreshness() {
   // "Offline" or "Refresh failed" standing, `#188 pull-refresh-bottom`), and — since `#197
   // floating-search` put the search glass on the same line — to the open search bar, which grows
   // along that line across the top of the list.
-  pill.hidden = text === "" || currentView !== "discord" ||
+  pill.hidden = text === "" || screens.view() !== "discord" ||
     (!gesture.hidden && gesture.getAttribute("data-edge") !== "end") || searchField.open();
   reserveFreshnessRoom(text !== "");
 }
@@ -11499,7 +11493,7 @@ function reserveFreshnessRoom(reserve) {
     else pane.removeAttribute("data-freshness");
   };
   // The pane is not on screen in the other view; the list that is must not be moved on its behalf.
-  if (currentView === "discord") holdingReader(toggle);
+  if (screens.view() === "discord") holdingReader(toggle);
   else toggle();
 }
 
@@ -11721,7 +11715,7 @@ const placeKey = () => JSON.stringify([String(selectedChannelId()), viewKey()]);
 function holdChannelPlace() {
   // A reopen comes back to one list: the left column's. `#229 desktop-two-column`.
   if (sideActive) return;
-  if (currentScreen !== "main" || currentView !== "discord" || !REOPENED_VIEWS.includes(selection().view)) return;
+  if (screens.screen() !== "main" || screens.view() !== "discord" || !REOPENED_VIEWS.includes(selection().view)) return;
   const mark = captureScroll();
   const anchor = mark.anchor;
   uiState.holdPlace({
@@ -11776,7 +11770,7 @@ function saveUiState() {
   const record = {
     v: UI_STATE_VERSION,
     identity,
-    view: currentView === "discord" ? "discord" : "voice",
+    view: screens.view() === "discord" ? "discord" : "voice",
     // Hide read, as every page has kept it, and beside it the read mode it is one of (`#221
     // read-modes`): a page from before the modes reads `todo` and ignores `read`.
     todo: readModes.hiding(),
@@ -11825,7 +11819,7 @@ function reopenSavedView() {
   if (uiState.settled()) return;
   uiState.settle();
   const saved = uiState.saved();
-  if (saved && saved.view === "discord" && selectedChannelId() && currentView !== "discord") {
+  if (saved && saved.view === "discord" && selectedChannelId() && screens.view() !== "discord") {
     showView("discord");
     returnToSavedPlace();
     holdChannelPlace();
@@ -11863,7 +11857,7 @@ function payReopenRead() {
       reopenReadOwed = reopenReadOwed || owed;
       return;
     }
-    if (currentView !== "discord" || replayLedger.started() !== owed.after) return;
+    if (screens.view() !== "discord" || replayLedger.started() !== owed.after) return;
     // Merged into the rows the snapshot drew, keeping the reader's message, as a channel change
     // does; with nothing drawn it is a first visit and settles on the newest.
     readEnteredChannel(loadState().freshAt > 0);
@@ -12097,7 +12091,7 @@ function renderChannelNavigation() {
     renderSideColumn();
     return;
   }
-  const inChannel = currentView === "discord";
+  const inChannel = screens.view() === "discord";
   // `gchat-thread-selector`. Choosing Main, All, or a thread is the bar's thread picker now, so the
   // tabs that used to sit over the list stay hidden; the heading still names an open thread.
   el("channel-navigation").hidden = !inChannel || selection().view !== "thread";
@@ -12205,7 +12199,7 @@ function readerPlace() {
   const area = el("scroll-area");
   const top = area.getBoundingClientRect().top;
   const bottom = top + (area.clientHeight || 0);
-  const listed = currentView === "discord" && selection().view !== "threads" && !pinsView().only
+  const listed = screens.view() === "discord" && selection().view !== "threads" && !pinsView().only
     ? [...el("discord-log").children] : [];
   const seen = listed
     .map((row) => ({ row, box: row.getBoundingClientRect() }))
@@ -12216,7 +12210,7 @@ function readerPlace() {
   const footCard = channelCard();
   const footBox = footCard ? footCard.getBoundingClientRect() : null;
   return {
-    pinned: currentView === "discord" && atBottom(area),
+    pinned: screens.view() === "discord" && atBottom(area),
     seen,
     card: box && box.bottom > top && box.top < bottom ? box.top : null,
     cardSeen: Boolean(footBox && footBox.bottom > top && footBox.top < bottom),
@@ -12229,7 +12223,7 @@ function readerPlace() {
  */
 function channelCard() {
   const card = leftEl("post-confirm");
-  return !sideActive && currentView === "discord" && !card.hidden && card.getAttribute("data-place") === "channel"
+  return !sideActive && screens.view() === "discord" && !card.hidden && card.getAttribute("data-place") === "channel"
     ? card : null;
 }
 
@@ -12890,7 +12884,7 @@ function placeEntryLanding(row, first) {
 function entryLandingHolds() {
   const landing = entryState().landing;
   if (landing === null) return false;
-  const holds = currentScreen === "main" && currentView === "discord" && selection().view === "thread" &&
+  const holds = screens.screen() === "main" && screens.view() === "discord" && selection().view === "thread" &&
     !pinsView().only && landing.key === channelContextKey() && landing.row.parentNode === el("discord-log") &&
     landing.row.getBoundingClientRect().height > 0 && Math.abs(el("scroll-area").scrollTop - landing.at) <= 1;
   if (!holds) entryState().landing = null;
@@ -14736,7 +14730,7 @@ function holdingMessage(mutate) {
     return;
   }
   const held = heldRowAfter(position);
-  if (held && currentView === "discord") area.scrollTop += held.row.getBoundingClientRect().top - held.top;
+  if (held && screens.view() === "discord") area.scrollTop += held.row.getBoundingClientRect().top - held.top;
   renderJumpNewest();
 }
 
@@ -16865,7 +16859,7 @@ async function dispatchOutgoingMessage(entry, job) {
     // elision-word-count` line. Not while a filter
     // change holds a message in place (`#243 filter-keeps-selection`).
     const here = entry.channel === selectedChannelId();
-    const pinned = here && currentView === "discord" && followsNewest(el("scroll-area"));
+    const pinned = here && screens.view() === "discord" && followsNewest(el("scroll-area"));
     // `#229 desktop-two-column`. The right column's reader on its newest line follows it too.
     const sidePinned = here && sideShowing() && inColumn(columns.side, () => followsNewest(el("scroll-area")));
     noteSelfAuthor(parts[0].author_id);
@@ -17383,7 +17377,7 @@ function renderSendUndo() {
   const chip = el("undo-send-dismiss");
   const offer = sendUndo.current();
   const held = offer ? dismissedSends.find(offer.id) : null;
-  chip.hidden = !held || currentView !== "discord";
+  chip.hidden = !held || screens.view() !== "discord";
   const label = held ? `Undo dismiss: “${sendSnippet(unsentText(held.entry))}”` : "Undo dismiss";
   if (chip.textContent !== label) chip.textContent = label;
 }
@@ -18379,7 +18373,7 @@ function placeBookmarkLine() {
   // The line moved, and each row's ⋯ item saying what it will do, by web/src/view/channel.
   const apply = () => drawBookmarkLine(drawn, target);
   // The reader does not move: a line drawn or taken away above them changes the height above them.
-  if (!sideActive && currentScreen === "main" && currentView === "discord") preservingScroll(apply);
+  if (!sideActive && screens.screen() === "main" && screens.view() === "discord") preservingScroll(apply);
   else apply();
 }
 
@@ -18429,7 +18423,7 @@ function renderJumpBookmark() {
   /** @type {"up" | "down" | null} */
   let direction = null;
   const anchor = bookmarkAnchor();
-  if (currentScreen === "main" && currentView === "discord" && anchor && bookmarkListRefusal(anchor) === "" &&
+  if (screens.screen() === "main" && screens.view() === "discord" && anchor && bookmarkListRefusal(anchor) === "" &&
       !bookmarksOffScreen()) {
     const target = bookmarkDrawn.main;
     if (!target) {
@@ -18489,7 +18483,7 @@ function rowAmongCards(row) {
  * window, or the Threads view of one column.
  */
 const bookmarksOffScreen = () => threadListOnScreen() ||
-  (currentView === "discord" && !sideActive && threadingSupported && selection().view === "threads");
+  (screens.view() === "discord" && !sideActive && threadingSupported && selection().view === "threads");
 
 /** b, m and the chip: back to the bookmark, walking back through older pages when it is further back. */
 async function jumpToBookmark() {
@@ -18623,7 +18617,7 @@ function endBookmarkUndo() {
 function renderBookmarkUndo() {
   const chip = leftEl("undo-bookmark");
   const undo = bookmarkUndos.current();
-  const shown = undo !== null && currentView === "discord" && undo.channel === currentChannelId();
+  const shown = undo !== null && screens.view() === "discord" && undo.channel === currentChannelId();
   if (chip.hidden === shown) chip.hidden = !shown;
 }
 
@@ -21754,7 +21748,7 @@ const searchKey = () => JSON.stringify([filterKey(), searchField.open() ? search
  * empty sentence says how out instead.
  */
 function searchOffered() {
-  return readRunsSuspended() && currentView === "discord" && selection().view !== "threads" && !pinsView().only &&
+  return readRunsSuspended() && screens.view() === "discord" && selection().view !== "threads" && !pinsView().only &&
     olderPages().moreAbove === true && !(readModes.hiding() && !threadingSupported) && (!sideActive || sideShowing());
 }
 
@@ -22208,7 +22202,7 @@ const serverCopyOpen = () => serverCacheBox.open() && tokenScope !== "read";
 
 /** What identifies the server's search wanted now, or "" for none. */
 function serverSearchKeyNow() {
-  if (!searchField.open() || currentScreen !== "main" || currentView !== "discord" || !searchTyped(searchField.query())) return "";
+  if (!searchField.open() || screens.screen() !== "main" || screens.view() !== "discord" || !searchTyped(searchField.query())) return "";
   const channel = String(selectedChannelId() || "");
   if (!channel) return "";
   return JSON.stringify([searchAllChannels ? "*" : channel, searchIdentity(searchField.query())]);
@@ -22872,7 +22866,7 @@ function maybeLoadOlder() {
   // Not at the head of the Pinned list, which is every pin already: older history adds none to it, and
   // a step taken behind it reads for a list that is not on screen. A pin older than what is loaded is
   // walked back to when the filter goes (`walkToFilterAnchor`, `#243 filter-keeps-selection`).
-  if (currentView !== "discord" || pinsView().only || olderPages().moreAbove !== true || olderPages().inFlight) {
+  if (screens.view() !== "discord" || pinsView().only || olderPages().moreAbove !== true || olderPages().inFlight) {
     return;
   }
   // `#262 search-load-older`. Nor while a filter chooses rows, where the step back offers a bounded walk
@@ -23014,8 +23008,8 @@ function takeDeferredOlder() {
 const pullToRefresh = createPullToRefresh({
   byId: (id) => /** @type {any} */ (el(id)),
   scrollArea: () => el("scroll-area"),
-  onChannelList: () => currentScreen === "main" && currentView === "discord",
-  inChannelView: () => currentView === "discord",
+  onChannelList: () => screens.screen() === "main" && screens.view() === "discord",
+  inChannelView: () => screens.view() === "discord",
   atBottom: (area, slack) => (slack === undefined ? atBottom(area) : atBottom(area, slack)),
   fetchInFlight: () => discordFetchInFlight,
   olderInFlight: () => olderPages().inFlight,
@@ -23157,10 +23151,10 @@ function landedReadPosition(area, keepPosition, sentAtNewest) {
 function channelReadPosition(area) {
   // A message a filter change holds in place is the one kept, and the newest line is not followed.
   // `#243 filter-keeps-selection`.
-  const anchor = currentView === "discord" ? heldFilterRow() || scrollAnchor(area) : null;
+  const anchor = screens.view() === "discord" ? heldFilterRow() || scrollAnchor(area) : null;
   const anchorIds = anchor ? idsOf(anchor) : [];
   return {
-    wasAtNewest: currentView === "discord" && followsNewest(area),
+    wasAtNewest: screens.view() === "discord" && followsNewest(area),
     previousTop: area.scrollTop,
     anchorId: anchor ? anchor.getAttribute("data-context-id") || anchorIds[0] || null : null,
     anchorTop: anchor ? anchor.getBoundingClientRect().top : 0,
@@ -23641,7 +23635,7 @@ function applyReadRuns() {
     }
   };
   // Only where the list is the one on screen: anywhere else there is no reader in it to hold.
-  if (currentScreen === "main" && currentView === "discord") preservingScroll(apply);
+  if (screens.screen() === "main" && screens.view() === "discord") preservingScroll(apply);
   else apply();
   // Which row is directly above a reply has changed with what is drawn, and its arrow with it.
   renderReplyLinks();
@@ -25633,7 +25627,7 @@ function openReply(messages, from = null, quote = "", focus = true) {
     return;
   }
   // Only on the channel's lists, where every Reply is: with none on screen the draft waits for its row.
-  if (currentScreen !== "main" || currentView !== "discord") return;
+  if (screens.screen() !== "main" || screens.view() !== "discord") return;
   pendingReply = null;
   // `#410 inline-reply-editor`. A reply already open in the stream is put down first, its words kept as
   // Cancel keeps them and what it gathered put back, and the box moves to this message: the row pressed
@@ -26147,7 +26141,7 @@ function leaveDockedReply(id, how = {}) {
  * redraw of a list while one waits, and by the layout two columns went to once it is drawn.
  */
 function reopenPendingReply() {
-  if (pendingReply === null || !pendingReply.ready || replyDocked || currentScreen !== "main" || currentView !== "discord") return;
+  if (pendingReply === null || !pendingReply.ready || replyDocked || screens.screen() !== "main" || screens.view() !== "discord") return;
   // Not under a reader writing in a box: the box would go from under their hands. A later redraw asks again.
   const held = document.activeElement;
   if (isComposer(held) && held !== leftEl("reply-text")) return;
@@ -26800,7 +26794,7 @@ const sideColumnUp = () => columnsShown || threadListShown;
  * waits behind the call's view and the other screens, as two columns do, and the left column's call
  * pane, its box included, is not covered there.
  */
-const threadListOnScreen = () => threadListShown && currentScreen === "main" && currentView === "discord";
+const threadListOnScreen = () => threadListShown && screens.screen() === "main" && screens.view() === "discord";
 
 /**
  * Whether this window draws two columns: the layout button has a box, which web/voice.css gives it
@@ -26963,7 +26957,7 @@ function threadListOffered() {
  * the stylesheet decides (`#column-toggle` is drawn only in the desktop block at 1000px and wider).
  */
 function columnsOffered() {
-  return currentScreen === "main" && currentView === "discord" && threadListOffered();
+  return screens.screen() === "main" && screens.view() === "discord" && threadListOffered();
 }
 
 /** The layout button: whether it is offered, and whether it is pressed. */
@@ -26998,7 +26992,7 @@ function toggleHasBox() {
  * Reply comes back to the layout as it was.
  */
 function renderColumns() {
-  if (currentScreen !== "main") return;
+  if (screens.screen() !== "main") return;
   renderColumnToggle();
   const screen = leftEl("screen-main");
   const fit = toggleHasBox();
@@ -27010,7 +27004,7 @@ function renderColumns() {
   if (want === "two" && !fit) want = layoutChoice.beforeColumns() === "list" ? "list" : null;
   // `#280 scroll-stability`. Where the reader is in the cards, read before the layout changes the width
   // they are drawn at: between the thread list and two columns they are kept, and put back there.
-  const cards = currentView === "discord" && screen.getAttribute("data-columns") !== want ? cardAnchor() : null;
+  const cards = screens.view() === "discord" && screen.getAttribute("data-columns") !== want ? cardAnchor() : null;
   // `#269 approval-card-inline` x `#280 scroll-stability`. And where the reader of the left column is,
   // read before the layout draws that column at another width (`leftColumnPlace`).
   const left = screen.getAttribute("data-columns") !== want ? leftColumnPlace() : null;
@@ -27019,7 +27013,7 @@ function renderColumns() {
     else screen.removeAttribute("data-columns");
   }
   // The call's view is one list. Two columns, or the thread list, wait behind it, as they were.
-  if (currentView === "discord") {
+  if (screens.view() === "discord") {
     const now = columnsShown ? "two" : threadListShown ? "list" : "one";
     const next = want !== null && sideHasBox() ? want : "one";
     if (next !== now) moveLayout(now, next, cards, left);
@@ -27121,7 +27115,7 @@ function moveLayout(now, next, cards = null, left = null) {
  * @returns {{place: ReturnType<typeof readerPlace>, view: string, channel: string} | null}
  */
 function leftColumnPlace() {
-  if (currentScreen !== "main" || currentView !== "discord" || threadListShown) return null;
+  if (screens.screen() !== "main" || screens.view() !== "discord" || threadListShown) return null;
   return inColumn(columns.main, () => ({
     place: readerPlace(),
     view: selection().view,
@@ -27144,7 +27138,7 @@ function leftColumnPlace() {
  */
 function keepLeftColumnPlace(left, back = null) {
   inColumn(columns.main, () => {
-    if (currentScreen !== "main" || currentView !== "discord" || threadListShown) return;
+    if (screens.screen() !== "main" || screens.view() !== "discord" || threadListShown) return;
     if (selection().view !== "main" && selection().view !== "flat") return;
     const channel = String(selectedChannelId());
     const kept = [back, left].find((one) => one !== null && one.view === selection().view && one.channel === channel);
@@ -27575,7 +27569,7 @@ function leaveThreadList(next = "one") {
   if (next !== "two") endRepliesWalk();
   voiceTranscript().placePostCard();
   const followed = inColumn(columns.main, () => {
-    const holds = held !== null && currentScreen === "main" && currentView === "discord" &&
+    const holds = held !== null && screens.screen() === "main" && screens.view() === "discord" &&
       selection().view === "main" && String(selectedChannelId()) === held.channel;
     if (holds && keepReaderPlace(held.place)) return held.place.pinned;
     if (follows) scrollToNewest();
@@ -27583,7 +27577,7 @@ function leaveThreadList(next = "one") {
   });
   if (next === "one") showOneColumnLeft();
   const backInAll = next === "one" && held !== null && held.view === "flat" && inColumn(columns.main, () =>
-    currentScreen === "main" && currentView === "discord" && selection().view === "flat" &&
+    screens.screen() === "main" && screens.view() === "discord" && selection().view === "flat" &&
     String(selectedChannelId()) === held.channel && keepReaderPlace(held.place));
   if (carded && (backInAll ? !held.place.pinned : !followed && `${selection().view}|${selection().threadId}` === shown)) {
     inColumn(columns.main, () => followIfPinned(false, 0, "discord"));
@@ -30125,7 +30119,7 @@ function inSideThread(message) {
 
 const columnLinks = createColumnLinks({
   lookup: (id) => leftEl(id),
-  onTwoColumns: () => columnsShown && currentScreen === "main" && currentView === "discord",
+  onTwoColumns: () => columnsShown && screens.screen() === "main" && screens.view() === "discord",
   sideMode: () => columns.side.mode,
   mainList: () => channelPane.list(),
   openThread: () => sideThreadChoice(),
@@ -30406,7 +30400,7 @@ const channelPoll = createChannelPoll({
   clock: clockOnUse(),
   now: () => Date.now(),
   hidden: () => document.hidden,
-  onChannel: () => currentView === "discord",
+  onChannel: () => screens.view() === "discord",
   take: (delay) => standInRetries.take(delay),
   poll: () => pollDiscord(),
 });
@@ -30527,7 +30521,7 @@ function pollDiscord() {
       // Main's read and read for that (`#231 two-column-polish`).
       if (!refused) await readSideColumn("poll", since);
     } finally {
-      if (currentView === "discord" && !refused) {
+      if (screens.view() === "discord" && !refused) {
         scheduleDiscordPoll();
       }
     }
@@ -30601,7 +30595,7 @@ function resumePolling(how) {
  */
 function catchUpHiddenArrivals() {
   const { mutation, arrived } = hiddenStream.takeArrivals(() => replayLedger.waiting() > 0);
-  if (arrived && currentView === "discord" && threadingSupported &&
+  if (arrived && screens.view() === "discord" && threadingSupported &&
       channelStore.current().channel === String(selectedChannelId()) && channelStore.current().views.has(viewKey())) {
     const area = el("scroll-area");
     const position = channelReadPosition(area);
@@ -31315,7 +31309,7 @@ function receiveLiveMessage(message, selfPosted, replayed, fromTail) {
   // identical on both paths. A live feed is not a reason to relax element construction.
   const area = el("scroll-area");
   // Not while a filter change holds a message in place: nothing but the reader moves it. `#243`.
-  const wasAtNewest = currentView === "discord" && followsNewest(area);
+  const wasAtNewest = screens.view() === "discord" && followsNewest(area);
   // `#549 own-read-stored`. One of his is drawn as it starts: read, when he said so.
   if (!replayed) noteStartsRead([message]);
   appendChannelRow(message, true);
@@ -31344,7 +31338,7 @@ function receiveLiveMessage(message, selfPosted, replayed, fromTail) {
  * @returns {{main: boolean, side: boolean}}
  */
 function liveFollowers() {
-  const follows = () => currentScreen === "main" && currentView === "discord" &&
+  const follows = () => screens.screen() === "main" && screens.view() === "discord" &&
     !entryLandingHolds() && followsNewest(el("scroll-area"));
   return {
     main: inColumn(columns.main, follows),
@@ -31471,7 +31465,7 @@ function awaitReplayRead(key, channel, arrivedAfter) {
   // a newest page, or a complete delta. A delta of additions says nothing about either.
   if (replayLedger.awaitRead(key, channel, arrivedAfter)) return;
   // `#226 page-energy-profile`. A hidden page leaves it waiting for the read coming back makes.
-  if (!discordFetchInFlight && currentView === "discord" && !document.hidden) {
+  if (!discordFetchInFlight && screens.view() === "discord" && !document.hidden) {
     refreshQuietly(() => loadDiscord({ keepPosition: true, reason: "replay" }))();
   }
 }
@@ -31494,7 +31488,7 @@ function awaitReplayRead(key, channel, arrivedAfter) {
 function settleReplays(read, page) {
   replayLedger.settle(read, page, String(selectedChannelId()));
   // The stream's replay is answered by a read of the left column's view. `#229 desktop-two-column`.
-  if (page && replayLedger.waiting() && currentView === "discord" && !discordQueuedLoads.has(columns.main)) {
+  if (page && replayLedger.waiting() && screens.view() === "discord" && !discordQueuedLoads.has(columns.main)) {
     inColumn(columns.main, () => queueDiscordLoad({ keepPosition: true, reason: "replay" }));
   }
 }
@@ -33067,7 +33061,7 @@ el("post-confirm-more").addEventListener("click", () => {
   const pinned = atBottom(leftEl("scroll-area"));
   voiceTranscript().postWatch.unfolded = !voiceTranscript().postWatch.unfolded;
   voiceTranscript().showPostProposal(voiceTranscript().postWatch.shown);
-  if (currentScreen === "main") followIfPinned(pinned, 0, currentView);
+  if (screens.screen() === "main") followIfPinned(pinned, 0, screens.view());
 });
 el("open-settings").addEventListener("click", () => showScreen("settings"));
 el("dismiss-error").addEventListener("click", clearError);
@@ -33381,7 +33375,7 @@ el("view-switch").addEventListener("click", pressViewSwitch);
 
 /** The view switch, pressed: the call's view or the channel's, whichever is not up. */
 function pressViewSwitch() {
-  const next = currentView === "voice" ? "discord" : "voice";
+  const next = screens.view() === "voice" ? "discord" : "voice";
   // The reader's own move, so the record follows it from here on. `#189 restore-ui-state`.
   uiState.settle();
   showView(next);
@@ -33409,7 +33403,7 @@ function readEnteredChannel(keepPosition) {
       await readSideColumn(keepPosition ? "visible" : "enter", since);
     } finally {
       // Armed after a failure too: offline is exactly when the reader needs the page to try again.
-      if (currentView === "discord") {
+      if (screens.view() === "discord") {
         scheduleDiscordPoll();
       }
     }
@@ -33492,7 +33486,7 @@ function changeSelectedChannel() {
   // A stream follows ONE channel, and a cursor from the old one means nothing in the new one —
   // the same reason the walk-back cursor is dropped two lines above.
   startChannelStream(selectedChannelId());
-  return loadDiscord(saved && currentView === "discord" ? { keepPosition: true, reason: "enter" } : { reason: "enter" });
+  return loadDiscord(saved && screens.view() === "discord" ? { keepPosition: true, reason: "enter" } : { reason: "enter" });
 }
 // `#624 voice-page-modularity`. A channel the reader chose on the picker is the selection's first,
 // before anything that reads it hears of the change.
@@ -33747,7 +33741,7 @@ if (typeof window.ResizeObserver === "function") {
  */
 function heightUnderLists() {
   const card = leftEl("post-confirm");
-  const docked = currentScreen === "main" && !card.hidden && card.getAttribute("data-place") === "dock";
+  const docked = screens.screen() === "main" && !card.hidden && card.getAttribute("data-place") === "dock";
   return (el("dock").offsetHeight || 0) + (docked ? card.offsetHeight || 0 : 0);
 }
 
@@ -33842,7 +33836,7 @@ if (typeof window.ResizeObserver === "function") {
     const area = el("scroll-area");
     const now = { list: area.clientHeight, dock: heightUnderLists() };
     const seen = mainUnderLists;
-    const grew = seen !== null && seen.list > 0 && currentScreen === "main" ? now.dock - seen.dock : 0;
+    const grew = seen !== null && seen.list > 0 && screens.screen() === "main" ? now.dock - seen.dock : 0;
     const shrank = seen !== null && seen.list > 0 && now.list < seen.list;
     mainUnderLists = now;
     // `#727 vt-selection-quick-reply`. A list held still for a quick reply is left where it is, as a
@@ -33892,16 +33886,16 @@ if (typeof window.ResizeObserver === "function") {
     const area = leftEl("side-scroll");
     const now = { list: area.clientHeight, dock: heightUnderLists() };
     const seen = sideUnderLists;
-    const grew = seen !== null && seen.list > 0 && currentScreen === "main" ? now.dock - seen.dock : 0;
+    const grew = seen !== null && seen.list > 0 && screens.screen() === "main" ? now.dock - seen.dock : 0;
     // `#336 draft-return-thread-list`. Not a report from another screen, where the column is not drawn: back on
     // the main screen the growth is reckoned from the column as the reader left it, so a send card that docked
     // under the thread list while Settings or Help was up is the dock growing under them, as it is when it
     // comes while they are on the list. Taken from the hidden column instead, it was no growth at all, and a
     // reader who had left from the foot of the cards came back the card's height above it.
-    if (currentScreen === "main") sideUnderLists = now;
+    if (screens.screen() === "main") sideUnderLists = now;
     // `#429 keyboard-hides-bar`. A box being written in this list, kept in view as the keyboard shrinks it.
-    if (currentScreen === "main" && keepWrittenBox(area, seen, now)) return;
-    if (sideColumnUp() && currentView === "discord" && columns.side.mode === "list") {
+    if (screens.screen() === "main" && keepWrittenBox(area, seen, now)) return;
+    if (sideColumnUp() && screens.view() === "discord" && columns.side.mode === "list") {
       if (!cardsOpening && grew > 0 && atBottom(area, BOTTOM_SLACK_PX + grew)) followFoot(area);
       return;
     }
@@ -33949,7 +33943,7 @@ if (typeof window.ResizeObserver === "function") {
   // What the column is showing: a change of it is not the content changing under the reader. Beside Main
   // or on its own as the thread list (`#281 view-keys`), which is a change of what it shows too.
   const contextOf = () => (sideColumnUp()
-    ? `${columnsShown ? "two" : "list"}|${currentScreen}|${currentView}|${columns.side.mode}|${inColumn(columns.side, () => `${channelContextKey()}|${pinsView().only}`)}`
+    ? `${columnsShown ? "two" : "list"}|${screens.screen()}|${screens.view()}|${columns.side.mode}|${inColumn(columns.side, () => `${channelContextKey()}|${pinsView().only}`)}`
     : "one");
   // On the newest line, and scrolled to it. What the column shows is noted only by this observer's
   // passes, which a change of it always brings: not on every scroll event.
@@ -33959,7 +33953,7 @@ if (typeof window.ResizeObserver === "function") {
   // Whether the reader may be kept on the newest line now: the right column on screen, and no other rule
   // holding a place in it.
   const free = () => {
-    if (!sideColumnUp() || currentScreen !== "main" || currentView !== "discord") return false;
+    if (!sideColumnUp() || screens.screen() !== "main" || screens.view() !== "discord") return false;
     if (columns.side.mode === "list") return !cardsOpening;
     return inColumn(columns.side, () => {
       const walk = activeColumn.searchWalk;

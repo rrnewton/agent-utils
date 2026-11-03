@@ -1538,8 +1538,8 @@ test("a list the filters empty is shown from its head, where it says why, and fi
   await tapKind(unplaced, "pr");
   assert.ok(unplaced.el("scroll-area").scrollTop > 0, "the test cannot see a reader left below the sentence");
   const jumping = await run(brokenScript(
-    "    shown = !listEmptied() && (inScrollback[currentView] || jumpNewestWanted[currentView] !== false);",
-    "    shown = inScrollback[currentView] || jumpNewestWanted[currentView] !== false;"));
+    "    shown = !listEmptied() && (inScrollback[screens.view()] || jumpNewestWanted[screens.view()] !== false);",
+    "    shown = inScrollback[screens.view()] || jumpNewestWanted[screens.view()] !== false;"));
   await tapKind(jumping, "pr");
   await jumping.el("scroll-area").dispatch("scroll");
   assert.equal(jumping.el("jump-newest").hidden, false, "the test cannot see a jump offered over an emptied list");

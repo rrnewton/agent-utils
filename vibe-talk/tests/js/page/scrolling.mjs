@@ -3488,8 +3488,8 @@ test("`#281 view-keys` x `#280 scroll-stability`: Ctrl+1 to Ctrl+4 show each vie
   // The right column's reader kept on its foot in two columns only: a card growing under a reader at the
   // foot of the thread list leaves them above it.
   const twoOnly = await run(brokenScript(
-    "if (!sideColumnUp() || currentScreen !== \"main\" || currentView !== \"discord\") return false;",
-    "if (!columnsShown || currentScreen !== \"main\" || currentView !== \"discord\") return false;"));
+    "if (!sideColumnUp() || screens.screen() !== \"main\" || screens.view() !== \"discord\") return false;",
+    "if (!columnsShown || screens.screen() !== \"main\" || screens.view() !== \"discord\") return false;"));
   assert.deepStrictEqual(twoOnly, { ...real, cardGrewFoot: false });
 });
 
@@ -3558,7 +3558,7 @@ test("`#281 view-keys` x `#280 scroll-stability`: the dock growing under the car
   // above their foot, in the thread list and beside Main — further than the slack, so this is the defect and
   // not a rounding — and the reader up the cards and the window losing height come out the same.
   const threadOnly = await run(brokenScript(
-    "    if (sideColumnUp() && currentView === \"discord\" && columns.side.mode === \"list\") {\n" +
+    "    if (sideColumnUp() && screens.view() === \"discord\" && columns.side.mode === \"list\") {\n" +
     "      if (!cardsOpening && grew > 0 && atBottom(area, BOTTOM_SLACK_PX + grew)) followFoot(area);\n" +
     "      return;\n    }\n",
     ""));

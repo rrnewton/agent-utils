@@ -1492,7 +1492,7 @@ test("...and the dock and the chips changing as the thread opens leave the first
     "    if (entryLandingHolds()) {\n      placeEntryLanding(entryState().landing.row, entryState().landing.first);\n      return;\n    }\n", ""));
   assert.deepStrictEqual(dockOnly, { ...real, afterDock: false, afterChips: false });
   const chipsOnly = await run(brokenScript(
-    "const landed = currentScreen === \"main\" && currentView === \"discord\" && entryLandingHolds();",
+    "const landed = screens.screen() === \"main\" && screens.view() === \"discord\" && entryLandingHolds();",
     "const landed = false;", 2));
   assert.deepStrictEqual(chipsOnly, { ...real, afterChips: false });
 });

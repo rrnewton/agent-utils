@@ -1918,10 +1918,10 @@ def thread_list_away_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, 
                   f" them: {before}")
             if there == "gear":
                 page.click("#open-settings")
-                page.wait_for_function("() => currentScreen === 'settings'", timeout=5000)
+                page.wait_for_function("() => screens.screen() === 'settings'", timeout=5000)
             else:
                 page.keyboard.press("?")
-                page.wait_for_function("() => currentScreen === 'help'", timeout=5000)
+                page.wait_for_function("() => screens.screen() === 'help'", timeout=5000)
             page.wait_for_timeout(300)
             propose(page, api, serial, LONG_DRAFT)
             page.wait_for_timeout(400)
@@ -1929,7 +1929,7 @@ def thread_list_away_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, 
                 page.click("#close-settings" if there == "gear" else "#close-help")
             else:
                 page.keyboard.press("Escape")
-            page.wait_for_function("() => currentScreen === 'main'", timeout=5000)
+            page.wait_for_function("() => screens.screen() === 'main'", timeout=5000)
             for when in ("", " a second later"):
                 page.wait_for_timeout(1000 if when else 400)
                 after = thread_list_measure(page)
@@ -2537,7 +2537,7 @@ def settings_trip_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, siz
             how = (("the gear" if there == "gear" else "the gear and Help") +
                    (" and Back" if back == "back" else " and Esc"))
             page.click("#open-settings")
-            page.wait_for_function("() => currentScreen === 'settings'", timeout=5000)
+            page.wait_for_function("() => screens.screen() === 'settings'", timeout=5000)
             page.wait_for_timeout(300)
             docked = page.evaluate("() => { const c = document.getElementById('post-confirm');"
                                    " return [c.parentElement.id, c.getAttribute('data-place'), c.hidden]; }")
@@ -2545,19 +2545,19 @@ def settings_trip_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, siz
                   f"{where}: the premise, the card docked under Settings: {docked}")
             if there == "help":
                 page.click("#open-help")
-                page.wait_for_function("() => currentScreen === 'help'", timeout=5000)
+                page.wait_for_function("() => screens.screen() === 'help'", timeout=5000)
                 page.wait_for_timeout(300)
                 if back == "back":
                     page.click("#close-help")
                 else:
                     page.keyboard.press("Escape")
-                page.wait_for_function("() => currentScreen === 'settings'", timeout=5000)
+                page.wait_for_function("() => screens.screen() === 'settings'", timeout=5000)
                 page.wait_for_timeout(200)
             if back == "back":
                 page.click("#close-settings")
             else:
                 page.keyboard.press("Escape")
-            page.wait_for_function("() => currentScreen === 'main'", timeout=5000)
+            page.wait_for_function("() => screens.screen() === 'main'", timeout=5000)
             for when in ("", " a second later"):
                 page.wait_for_timeout(1000 if when else 400)
                 after = page.evaluate(CARD_ALONE_JS)
@@ -2654,7 +2654,7 @@ def help_key_trip_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, siz
                       f"{where}: the premise, a reader {up}px up {view} who sees the opened card and no row: {before}")
             how = f"{key} for Help, {HELP_KEY_CHANGES[change]} and {HELP_KEY_BACKS[back]}"
             page.keyboard.press(key)
-            page.wait_for_function("() => currentScreen === 'help'", timeout=5000)
+            page.wait_for_function("() => screens.screen() === 'help'", timeout=5000)
             page.wait_for_timeout(300)
             docked = page.evaluate("() => { const c = document.getElementById('post-confirm');"
                                    " return [c.parentElement.id, c.getAttribute('data-place'), c.hidden]; }")
@@ -2680,7 +2680,7 @@ def help_key_trip_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, siz
                 page.tap("#close-help")
             else:
                 page.go_back()
-            page.wait_for_function("() => currentScreen === 'main'", timeout=5000)
+            page.wait_for_function("() => screens.screen() === 'main'", timeout=5000)
             for when in ("", " a second later"):
                 page.wait_for_timeout(1400 if when else 400)
                 after = page.evaluate(CARD_ALONE_JS)
@@ -2762,13 +2762,13 @@ def chips_room_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, size: 
                     check(rect(before, "gap") == up and (not card or up == 0 or before["row"] is False),
                           f"{where}: the premise, a reader {up}px up All{alone}: {before}")
                     page.click("#open-settings")
-                    page.wait_for_function("() => currentScreen === 'settings'", timeout=5000)
+                    page.wait_for_function("() => screens.screen() === 'settings'", timeout=5000)
                     page.wait_for_timeout(400)
                     if back == "back":
                         page.click("#close-settings")
                     else:
                         page.keyboard.press("Escape")
-                    page.wait_for_function("() => currentScreen === 'main'", timeout=5000)
+                    page.wait_for_function("() => screens.screen() === 'main'", timeout=5000)
                     page.wait_for_timeout(500)
                     after = page.evaluate(CARD_ALONE_JS)
                     now = still(page)["first"]
@@ -2842,13 +2842,13 @@ def jump_after_settings_case(page: Page, url: str, voice: FakeVoice, api: FakeAp
                   (before["jump"] is None) == (up < 64) and (on_call or isinstance(first, dict)),
                   f"{where}: the premise, a reader {up}px up {view} with no card: {before}, first row {first}")
             page.click("#open-settings")
-            page.wait_for_function("() => currentScreen === 'settings'", timeout=5000)
+            page.wait_for_function("() => screens.screen() === 'settings'", timeout=5000)
             page.wait_for_timeout(400)
             if back == "back":
                 page.click("#close-settings")
             else:
                 page.keyboard.press("Escape")
-            page.wait_for_function("() => currentScreen === 'main'", timeout=5000)
+            page.wait_for_function("() => screens.screen() === 'main'", timeout=5000)
             for when in ("", " a second later"):
                 page.wait_for_timeout(1000 if when else 400)
                 after = page.evaluate(CARD_ALONE_JS)

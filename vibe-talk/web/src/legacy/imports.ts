@@ -92,7 +92,7 @@ export {
   shownNode,
   tagNameOf,
 } from "../view/dom/index.ts";
-export { createChipsOverComposer, createShellNotices, createUndoStamps } from "../view/shell/index.ts";
+export { SCREENS, createChipsOverComposer, createScreens, createShellNotices, createUndoStamps } from "../view/shell/index.ts";
 export {
   COMPOSER_FIELDS,
   COMPOSER_GROW_BOXES,

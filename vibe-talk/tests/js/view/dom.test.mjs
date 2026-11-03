@@ -212,3 +212,23 @@ test("`#624 voice-page-modularity`: undo stamps only rise, so two offers up at o
   assert.deepStrictEqual([stamps.next(), stamps.next(), stamps.next()], [1, 2, 3]);
   assert.equal(VIEW_SHELL.createUndoStamps().next(), 1, "each page load counts from the start");
 });
+
+test("`#624 voice-page-modularity`: the screens remember where Settings and Help go back to, as each screen is arrived at", () => {
+  const { createScreens, SCREENS } = VIEW_SHELL;
+  assert.deepStrictEqual([...SCREENS], ["signin", "main", "settings", "help"]);
+  const screens = createScreens();
+  assert.deepStrictEqual([screens.screen(), screens.view(), screens.beforeSettings(), screens.helpReturn()], ["signin", "voice", "signin", "settings"]);
+  screens.arrive("main", "signin");
+  screens.arrive("settings", "main");
+  assert.equal(screens.beforeSettings(), "main", "Settings goes back to the screen it was opened from");
+  screens.arrive("help", "settings");
+  assert.equal(screens.beforeSettings(), "main", "Help is never what Settings goes back to");
+  screens.arrive("main", "help");
+  screens.setHelpReturn("main");
+  screens.arrive("help", "main");
+  assert.equal(screens.helpReturn(), "main", "? opened Help from the main screen");
+  screens.arrive("settings", "help");
+  assert.equal(screens.helpReturn(), "settings", "Help left by any way forgets where ? opened it");
+  screens.setView("discord");
+  assert.equal(screens.view(), "discord");
+});
