@@ -90,6 +90,16 @@ pub struct Waiting {
 impl Drop for Waiting {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
+        // Leave no directories behind either: a caller that only waited (a
+        // refused revive, a send that never got the lock) must not change the
+        // registry tree. `remove_dir` only succeeds when the directory is
+        // empty, so a concurrent waiter's record is never disturbed.
+        if let Some(agent_directory) = self.path.parent() {
+            let _ = fs::remove_dir(agent_directory);
+            if let Some(waiting_root) = agent_directory.parent() {
+                let _ = fs::remove_dir(waiting_root);
+            }
+        }
     }
 }
 
@@ -337,6 +347,9 @@ mod tests {
 
         drop(waiting);
         assert_eq!(contention(&registry, "worker")["waiters"], json!([]));
+        // The wait leaves nothing in the registry tree, not even the
+        // `.waiting/worker` directories it created to become visible.
+        assert!(!registry.join(".waiting").exists());
         let _ = fs::remove_dir_all(&registry);
     }
 
