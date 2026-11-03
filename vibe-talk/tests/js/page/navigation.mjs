@@ -2518,7 +2518,7 @@ test("a channel reopens in the view chosen in it, one nobody chose a view in ope
   await pickThread(page, "flat");
   await page.setVisibility("hidden");
   const mainByDefault = reloadTwoChannels(page.storage,
-    brokenScript('  return threadingSupported ? "flat" : "main";', '  return "main";'));
+    brokenScript('  return providerFacts.threading() ? "flat" : "main";', '  return "main";'));
   await reopenedChannel(mainByDefault);
   assert.equal(mainByDefault.el("discord-channel").value, OTHER_CHANNEL.id);
   assert.equal(mainByDefault.el("thread-select").value, "flat", "All, picked, gave way to the default");

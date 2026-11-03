@@ -2929,7 +2929,7 @@ test("`#326 refused-undo-restores-done`: a put back from its row that the server
 //       list until the next read.
 
 /** The lines of `noteArchived` that give a copy the store's state for a message the read does not speak for, for a negative control. */
-const COPY_TAKES_STORE = ["  if (threadingSupported && channelStore.current().channel === String(selectedChannelId())) {\n    for (const id of readLedger.writtenIds()) {",
+const COPY_TAKES_STORE = ["  if (providerFacts.threading() && channelStore.current().channel === String(selectedChannelId())) {\n    for (const id of readLedger.writtenIds()) {",
   "  if (false) {\n    for (const id of readLedger.writtenIds()) {"];
 /** The wait of Through here for a Done on its way on a row it covers, for a negative control. */
 const THROUGH_WAITS = [

@@ -1156,7 +1156,7 @@ function channelPlaceShowable(place) {
   if (place.layout === "two") return columnsFit && threadListOffered() && (!place.side || threadStillKnown(place.side));
   if (place.layout === "list") return threadListOffered();
   if (place.view === "thread") return Boolean(place.thread) && threadStillKnown(place.thread);
-  return place.view === "main" || threadingSupported;
+  return place.view === "main" || providerFacts.threading();
 }
 
 /** Whether `place` can be shown now: its channel the one chosen, and what it shows still there. */
@@ -1535,7 +1535,7 @@ async function applyDeepLink() {
   }
   const target = wanted.message.message;
   await seekMessage(target, () => landOnDeepLink(target),
-    () => threadingSupported && selection().view !== "flat" && answeredElsewhere(target));
+    () => providerFacts.threading() && selection().view !== "flat" && answeredElsewhere(target));
   if (!rowHolding(target)) {
     deepLinks.setFocus(null);
     syncDeepLinkAddress();
@@ -1602,7 +1602,7 @@ const messagePreferences = mountMessagePreferences({
   applyMarkOwnRead: (on) => applyMarkOwnRead(on),
   applyHideEmptyMessages: (on) => applyHideEmptyMessages(on),
   redrawHiddenEmptyMessages: () => {
-    if (threadingSupported) {
+    if (providerFacts.threading()) {
         eachColumn(renderCachedTimeline);
         // ...and the thread cards, whose unread counts it changes: the Threads list's, which that redraw
         // leaves alone, and the right column's.
@@ -1637,7 +1637,7 @@ function applyInAppLinks(on) {
  * column's rows, the thread list's cards and the right column's.
  */
 function redrawMessageLinks() {
-  if (threadingSupported) {
+  if (providerFacts.threading()) {
     eachColumn(renderCachedTimeline);
     eachColumn(() => {
       if (selection().view === "threads") el("thread-list").replaceChildren(...threadCards(timelineRows().threads));
@@ -1871,11 +1871,11 @@ async function jumpFromSpot(ref, spot, options = {}) {
     const now = channelPlace();
     /** @type {ChannelPlace | null} */
     let place = null;
-    const want = threadingSupported && ref.message && !(now && now.layout === "two") ? options.view || null : null;
+    const want = providerFacts.threading() && ref.message && !(now && now.layout === "two") ? options.view || null : null;
     if (want === "flat") {
       // All: every message in the order sent, a reply among them, so no thread is opened.
       place = { screen: "main", channel, layout: "one", view: "flat", thread: null, origin: null, side: null };
-    } else if (ref.thread && threadingSupported) {
+    } else if (ref.thread && providerFacts.threading()) {
       const origin = want === "main" ? "main"
         : now && now.layout === "one" && (now.view === "main" || now.view === "flat") ? now.view
           : now && now.view === "thread" && (now.origin === "main" || now.origin === "flat") ? now.origin
@@ -1903,7 +1903,7 @@ async function jumpFromSpot(ref, spot, options = {}) {
     const target = ref.message;
     // A Back while the walk looks further back ends it: nothing lands over the place put back.
     await seekMessage(target, () => linkJumps.current(ticket) && landOnDeepLink(target, Boolean(options.center)),
-      () => linkJumps.current(ticket) && threadingSupported && selection().view !== "flat" && answeredElsewhere(target));
+      () => linkJumps.current(ticket) && providerFacts.threading() && selection().view !== "flat" && answeredElsewhere(target));
     if (linkJumps.current(ticket) && !rowHolding(target)) deepLinks.setFocus(null);
   } finally {
     // Landed, or given up: what is open now is the jump's, and what opens after is over it.
@@ -1965,7 +1965,7 @@ async function returnToLinkSpot(spot) {
   if (put()) return;
   const anchor = spot.anchor;
   await inColumn(column, () => seekMessage(anchor, () => linkJumps.current(ticket) && putBackOnSpot(spot),
-    () => threadingSupported && selection().view !== "flat" && answeredElsewhere(anchor)));
+    () => providerFacts.threading() && selection().view !== "flat" && answeredElsewhere(anchor)));
 }
 
 /** Put the row `spot` names at the height it was, in the column being worked on; false when it is not drawn. */
@@ -2199,7 +2199,12 @@ const helpFolds = mountHelpFolds({
  */
 const viewScroll = { voice: null, discord: null };
 
-let threadingSupported = false;
+/**
+ * What the selected channel's chat service can do — threads, its own read cursor, how its live updates are
+ * delivered and how often the server reads it: one owner in web/src/core/channels/providerfacts.ts (`#624
+ * voice-page-modularity`).
+ */
+const providerFacts = createProviderFacts();
 let channelHasThreads = false;
 /**
  * A column's own record of what it is showing (`#624 voice-page-modularity`, plan step 15, as
@@ -2474,8 +2479,8 @@ function showView(name) {
 const connectionReadouts = mountConnectionReadouts({
   lookup: (id) => el(id),
   live: {
-    get delivery() { return liveDelivery; },
-    get pollSeconds() { return livePollSeconds; },
+    get delivery() { return providerFacts.liveDelivery(); },
+    get pollSeconds() { return providerFacts.livePollSeconds(); },
     attached: () => liveFollow.attached(),
   },
 });
@@ -3953,7 +3958,7 @@ function rowMatches(row, node, text) {
 function threadsWithHits(node) {
   /** @type {Set<string>} */
   const hits = new Set();
-  if (!node || !threadingSupported || channelStore.current().channel !== String(selectedChannelId())) return hits;
+  if (!node || !providerFacts.threading() || channelStore.current().channel !== String(selectedChannelId())) return hits;
   for (const message of channelStore.current().messages) {
     const id = threadOf(message);
     if (id && message.thread.is_root === false && messageMatches(node, message)) hits.add(String(id));
@@ -4019,7 +4024,7 @@ function applySearch() {
   const marking = searchField.open() ? searchParsed(searchField.marked()).terms : [];
   // In Main a root stands for its thread, and among the Threads list's cards a thread with any hit is
   // chosen: the threads whose held replies match.
-  const replyHits = typed && threadingSupported && (selection().view === "main" || selection().view === "threads")
+  const replyHits = typed && providerFacts.threading() && (selection().view === "main" || selection().view === "threads")
     ? threadsWithHits(node) : null;
   const links = searchField.open() && searchField.links();
   // `#251 author-filter`. Whose messages, ANDed with the rest.
@@ -4167,7 +4172,7 @@ function applySearch() {
 function searchInAllOffered(searched) {
   return searched !== null && !searched.pinned && searched.matched === 0 && searched.loaded > 0 && searchField.open() &&
     !searchField.links() && authorChoosing() === "everyone" && searchTyped(searchField.query()) &&
-    screens.view() === "discord" && threadingSupported && !sideColumnUp() && selection().view === "main";
+    screens.view() === "discord" && providerFacts.threading() && !sideColumnUp() && selection().view === "main";
 }
 
 /**
@@ -4233,8 +4238,8 @@ function searchEmptySentence(loaded) {
   // are where a reply is found. Most of why a search on the left of two columns finds nothing.
   // `#606 server-side-search`: a thread stands for its replies in Main, so the replies held here were
   // searched; the ones All has not brought were not.
-  if (threadingSupported && selection().view === "main") return `${said} ${MAIN_REPLIES_SEARCHED}`;
-  if (readModes.hiding() && !threadingSupported) return `${said} Hide read is on — press h for Show read to search older messages.`;
+  if (providerFacts.threading() && selection().view === "main") return `${said} ${MAIN_REPLIES_SEARCHED}`;
+  if (readModes.hiding() && !providerFacts.threading()) return `${said} Hide read is on — press h for Show read to search older messages.`;
   return said;
 }
 
@@ -5337,7 +5342,7 @@ function filterHiddenSentence(anchor, walked) {
   if (walked && olderThanLoaded(anchor)) return `Over ${FILTER_WALK_PAGES} pages back — oldest is here.`;
   // Under Hide read a channel without threads reads only what is left, so a message it hides is in
   // no list this page holds; with threads it is held, and drawn in none.
-  if (hidingRead() && (!threadingSupported || timelineRows().messages.some((message) => anchor.ids.includes(String(message.id))))) {
+  if (hidingRead() && (!providerFacts.threading() || timelineRows().messages.some((message) => anchor.ids.includes(String(message.id))))) {
     return "Hide read hides it — nearest is here.";
   }
   return "Not in this view — nearest is here.";
@@ -5347,7 +5352,7 @@ function filterHiddenSentence(anchor, walked) {
 function olderThanLoaded(anchor) {
   if (columnWork.side() || screens.view() !== "discord" || pinsView().only || olderPages().moreAbove !== true ||
       !Number.isFinite(anchor.time)) return false;
-  const loaded = threadingSupported ? timelineRows().messages : [...el("discord-log").children].flatMap(rowMessages);
+  const loaded = providerFacts.threading() ? timelineRows().messages : [...el("discord-log").children].flatMap(rowMessages);
   const times = loaded.map((message) => timeOf(message, "timestamp")).filter(Number.isFinite);
   return times.length === 0 || anchor.time < Math.min(...times);
 }
@@ -10469,7 +10474,7 @@ function onVisibility() {
   // and after any absence the stream delivered something in, the poll came due in, or that let the
   // stream go.
   if ((away >= VISIBLE_REFRESH_MS || owed !== null || pollDue || resume !== null) &&
-      screens.view() === "discord" && threadingSupported && clientConfigApplied && selectedChannelId()) {
+      screens.view() === "discord" && providerFacts.threading() && clientConfigApplied && selectedChannelId()) {
     refreshQuietly(async () => {
       try {
         if (owed === "mutation") refreshAfterLiveMutation();
@@ -11009,7 +11014,7 @@ function projectView(view = selection().view, thread = selection().threadId) {
 
 /** The read state of the rows on screen is the store's read state for those rows. */
 function syncCanonDismissed() {
-  if (!threadingSupported || channelStore.current().channel !== String(selectedChannelId())) return;
+  if (!providerFacts.threading() || channelStore.current().channel !== String(selectedChannelId())) return;
   // `#407 unpack-row-parity`. Over the cards the right column has no rows on screen to speak for.
   if (columnWork.side() && columns.side.mode !== "thread") return;
   for (const message of timelineRows().messages) {
@@ -11096,7 +11101,7 @@ function walkCursorOwed() {
   // A page that said more exists and carried no cursor, whatever the view's cover: one a
   // server before `#510 cache-serve-every-read` answered from its message cache.
   if (discordWalkCursorOwed) return true;
-  if (!threadingSupported) return false;
+  if (!providerFacts.threading()) return false;
   const cover = channelStore.current().views.get(viewKey());
   return Boolean(cover && cover.fromAll && cover.live && cover.more);
 }
@@ -11116,7 +11121,7 @@ function walkCursorOwed() {
  * at once, ready for its first reply, wherever the root was found. Its read still follows.
  */
 function heldViewRows() {
-  if (!threadingSupported || (selection().view !== "flat" && selection().view !== "thread") ||
+  if (!providerFacts.threading() || (selection().view !== "flat" && selection().view !== "thread") ||
       channelStore.current().channel !== String(selectedChannelId())) return [];
   const base = channelStore.current().views.get(viewKey(selection().view === "flat" ? "main" : "flat"));
   const rows = !base || (base.more && base.floor === null) ? [] : channelStore.current().messages.filter((message) =>
@@ -11172,13 +11177,13 @@ function drawHeldRows(rows, freshAt, freshness) {
  * channel would show a reload a channel with its dealt-with messages missing.
  */
 function saveChannelScope() {
-  if (!selectedChannelId() || (readModes.hiding() && !threadingSupported) || !screenBelongsToToken()) return;
+  if (!selectedChannelId() || (readModes.hiding() && !providerFacts.threading()) || !screenBelongsToToken()) return;
   const cache = readMessageCache();
   if (!cache) return;
   const key = String(selectedChannelId());
   const now = Date.now();
   let entry = null;
-  if (threadingSupported) {
+  if (providerFacts.threading()) {
     if (channelStore.current().channel !== key) return;
     syncCanonDismissed();
     // The store as the device keeps it (web/src/core/channels `savedTimelineOf`).
@@ -11213,9 +11218,9 @@ function saveChannelScope() {
  */
 function hydrateChannelScope() {
   const channel = selectedChannelId();
-  if (!channel || (readModes.hiding() && !threadingSupported)) return false;
+  if (!channel || (readModes.hiding() && !providerFacts.threading())) return false;
   screenBelongsToToken();
-  if (threadingSupported) {
+  if (providerFacts.threading()) {
     if (channelStore.current().channel !== String(channel)) loadCanon(channel);
     inheritAllCover(selection().view, selection().threadId, selection().thread);
     return drawProjection();
@@ -11260,8 +11265,8 @@ function hydrateFromCache() {
   const cache = readMessageCache();
   if (!cache || !cache.shell) return false;
   const shell = cache.shell;
-  threadingSupported = shell.threading_supported === true;
-  channelDirectory.setCapability("threading", threadingSupported);
+  providerFacts.setThreading(shell.threading_supported === true);
+  channelDirectory.setCapability("threading", providerFacts.threading());
   channelDirectory.setChannels(shell.channels);
   learnProviders(shell.providers);
   whoIsWho.setDeploymentCodingAgents(shell);
@@ -11273,7 +11278,7 @@ function hydrateFromCache() {
   channelSettings.fillServiceSelect();
   fillChannelSelect("settings-channel");
   const provider = providerOfChannel(selectedChannelId());
-  if (provider) threadingSupported = provider.threading_supported === true;
+  if (provider) providerFacts.setThreading(provider.threading_supported === true);
   channelSettings.renderChannelBox();
   // Before the composer and the rows: both are the view's. `#189 restore-ui-state`.
   openChannelView();
@@ -11399,7 +11404,7 @@ function renderChannelFreshness() {
   // CURRENT IS SAID TOO, not left blank: a blank pill reads the same as a page that never managed
   // to refresh, which is what a reader opening the app in the car could not tell apart.
   const current = loadState().freshAt
-    ? `${liveFollow.attached() && liveDelivery !== "off" ? "Live · updated" : "Updated"} ${at}` +
+    ? `${liveFollow.attached() && providerFacts.liveDelivery() !== "off" ? "Live · updated" : "Updated"} ${at}` +
       (refreshing ? " · refreshing…" : "")
     : "";
   const text = staleWords(loadState().freshness, loadState().freshAt, refreshing) || current;
@@ -11512,7 +11517,7 @@ function reserveFreshnessRoom(reserve) {
  * offline — and a read of its own would be a second one.
  */
 function reconcileChannelSnapshot(before) {
-  if (before.key === channelContextKey() && before.threading === threadingSupported) return;
+  if (before.key === channelContextKey() && before.threading === providerFacts.threading()) return;
   clearChannelScreen();
   openChannelView();
   channelHasThreads = false;
@@ -11613,7 +11618,7 @@ function keepWindowItem(key, value) {
  * default to Main. I want All."
  */
 function defaultChannelView() {
-  return threadingSupported ? "flat" : "main";
+  return providerFacts.threading() ? "flat" : "main";
 }
 
 // The record itself — read back from this window's storage and the device's, checked on the way back
@@ -11663,7 +11668,7 @@ function openingChannelView() {
       const thread = wanted.thread || (wanted.message && wanted.message.thread) || null;
       if (wanted.view === "main") return { view: "main", thread: null, summary: null, origin: "main" };
       if (wanted.view === "all") return { view: "flat", thread: null, summary: null, origin: "main" };
-      if ((wanted.view === "thread" || (!wanted.view && thread)) && thread && threadingSupported) {
+      if ((wanted.view === "thread" || (!wanted.view && thread)) && thread && providerFacts.threading()) {
         // The very thread this channel already opens in — a reload standing on its own
         // address: the kept choice below says where its Back goes (the thread list it was
         // opened from, say), and a link naming the same thread must not rewrite that.
@@ -11675,7 +11680,7 @@ function openingChannelView() {
       }
     }
   }
-  const chosen = threadingSupported ? uiState.chosenView(channel) : undefined;
+  const chosen = providerFacts.threading() ? uiState.chosenView(channel) : undefined;
   const fallback = defaultChannelView();
   if (chosen && chosen.channelView === "thread" && !threadStillKnown(chosen.thread.id)) {
     uiState.forgetChosen((id) => id === channel);
@@ -11867,7 +11872,7 @@ function payReopenRead() {
     // does; with nothing drawn it is a first visit and settles on the newest.
     readEnteredChannel(loadState().freshAt > 0);
   };
-  if (threadingSupported) whenLiveAttached(pay);
+  if (providerFacts.threading()) whenLiveAttached(pay);
   else pay();
 }
 
@@ -11945,7 +11950,7 @@ const REPLY_TO_REMOVED =
 function replyRoute(message, bound = false) {
   /** @type {{ thread: string | null, branch: string | null, into: string | null, unknown: boolean, removed: boolean, note: string }} */
   const route = { thread: null, branch: null, into: null, unknown: false, removed: false, note: "" };
-  if (!threadingSupported) return { ...route, thread: threadOf(message) };
+  if (!providerFacts.threading()) return { ...route, thread: threadOf(message) };
   if (removedUpstream(message.id)) return { ...route, unknown: true, removed: true, note: REPLY_TO_REMOVED };
   if (selection().view === "thread" && selection().threadId) {
     return { ...route, thread: String(selection().threadId), note: "Posts in this thread." };
@@ -12373,7 +12378,7 @@ async function changeChannelView(view, threadId = null, summary = null, origin =
   // A thread opens at its newest, and Back returns to the place its view was left at, as before.
   const keepPlace = (view === "main" || view === "flat") &&
     (from === "main" || from === "flat" || (from === "thread" && !held));
-  const sameStore = threadingSupported && channelStore.current().channel === String(selectedChannelId());
+  const sameStore = providerFacts.threading() && channelStore.current().channel === String(selectedChannelId());
   // `#222 unread-replies`. A thread whose root reports replies the store has not brought — the tap on
   // "1 new" — is drawn from what is held as any other, and read behind it however it is drawn: from
   // rows held since an earlier visit, or a cover saved on the device, neither of which has the reply
@@ -12505,7 +12510,7 @@ async function changeChannelView(view, threadId = null, summary = null, origin =
  * True when it gave the view a cover or freshened one, which the snapshot then has to be told.
  */
 function inheritAllCover(view, threadId = null, summary = null) {
-  if (!threadingSupported || channelStore.current().channel !== String(selectedChannelId())) return false;
+  if (!providerFacts.threading() || channelStore.current().channel !== String(selectedChannelId())) return false;
   const all = channelStore.current().views.get(viewKey("flat"));
   if (!all || (view !== "main" && view !== "thread")) return false;
   const key = viewKey(view, threadId);
@@ -12571,7 +12576,7 @@ function sameWords(held, arriving) {
  * queued behind it, which is what draws that view (`discordQueuedLoads`).
  */
 function catchUpHeldView(words = true) {
-  const projected = threadingSupported ? projectView() : null;
+  const projected = providerFacts.threading() ? projectView() : null;
   if (!projected) return false;
   const cover = channelStore.current().views.get(viewKey());
   if (cover.landedHidden) {
@@ -12606,7 +12611,7 @@ function catchUpHeldView(words = true) {
  * the store covers: one being read for itself is drawn by that read.
  */
 function catchUpFromAll() {
-  if (!threadingSupported || (selection().view !== "main" && selection().view !== "thread") ||
+  if (!providerFacts.threading() || (selection().view !== "main" && selection().view !== "thread") ||
       channelStore.current().channel !== String(selectedChannelId()) || !channelStore.current().views.has(viewKey())) return;
   if (inheritAllCover(selection().view, selection().threadId, selection().thread)) {
     loadState().freshAt = channelStore.current().views.get(viewKey()).at;
@@ -13021,7 +13026,7 @@ function threadLabel(choice, chars = THREAD_TITLE_CHARS) {
 function threadIndex() {
   /** @type {Map<string, ReturnType<typeof threadChoice>>} */
   const byId = new Map();
-  if (!threadingSupported || channelStore.current().channel !== String(selectedChannelId())) return byId;
+  if (!providerFacts.threading() || channelStore.current().channel !== String(selectedChannelId())) return byId;
   // `#466 reply-promotes-thread`. The threads sends in the outbox are going into, and when the newest
   // was written: a root a send answers is a thread to read, as new as that send. And so is one whose
   // reply the store holds, whatever its count still says: the reply just sent, before any read says so.
@@ -13132,7 +13137,7 @@ function renderThreadSelect() {
   const select = el("thread-select");
   /** @type {Array<[string, string]>} */
   const options = [["main", "Main"]];
-  if (threadingSupported) {
+  if (providerFacts.threading()) {
     options.push(["flat", "All"]);
     // `#281 view-keys`. The thread list, and two columns, are of a channel that has threads to list.
     // Two columns only where this window draws them (`columnsFit`): a phone is offered none.
@@ -13166,8 +13171,8 @@ function renderThreadSelect() {
   // columns in a window too narrow for them — is not left standing as if it had been.
   select.value = current;
   // A provider without threads has nothing to choose; the picker stays, saying so by being inert.
-  select.disabled = !threadingSupported;
-  const why = threadingSupported
+  select.disabled = !providerFacts.threading();
+  const why = providerFacts.threading()
     ? "Which view of the channel to read: Main, All, the thread list, two columns, or one thread."
     : "This channel's chat service does not offer threads here, so Main is the whole channel.";
   // `#406 command-bar-one-row`. On a desk a name too long for the bar ends in an ellipsis, and the
@@ -13176,7 +13181,7 @@ function renderThreadSelect() {
   const title = shownThread ? `${threadName(shownThread, Infinity)}\n${why}` : why;
   if (select.title !== title) select.title = title;
   // Its description says why it is inert, when it is; a picker that chooses needs none.
-  setTextIfChanged(leftEl("thread-select-note"), threadingSupported ? "" : why);
+  setTextIfChanged(leftEl("thread-select-note"), providerFacts.threading() ? "" : why);
   // The right column's heading and cards name threads from the same store.
   if (sideColumnUp()) renderSideColumn();
 }
@@ -13236,7 +13241,7 @@ function onThreadSelect() {
 /** Read the channel's thread list in the background, so the selector names every thread. */
 async function refreshThreadDirectory() {
   const channel = String(selectedChannelId());
-  if (!threadingSupported || !channel || channelStore.current().scope) return;
+  if (!providerFacts.threading() || !channel || channelStore.current().scope) return;
   if (threadDirectoryInFlight === channel) return;
   if (Date.now() - (threadDirectoryReadAt.get(channel) || 0) < THREAD_DIRECTORY_REFRESH_MS) return;
   threadDirectoryInFlight = channel;
@@ -13290,7 +13295,7 @@ async function refreshThreadDirectory() {
 }
 
 function openThread(id, summary = null) {
-  if (!threadingSupported || !id) return;
+  if (!providerFacts.threading() || !id) return;
   // `#229 desktop-two-column`. In two columns a thread is selected on the right, and Main stays.
   if (columnsShown) return selectSideThread(String(id), summary);
   // `#281 view-keys`. From the thread list on its own, across the window, with the way back to it.
@@ -13362,7 +13367,7 @@ function olderThreadsToRead() {
  */
 async function loadOlderThreads() {
   const channel = String(selectedChannelId());
-  if (!threadingSupported || !channel || channelStore.current().scope) return;
+  if (!providerFacts.threading() || !channel || channelStore.current().scope) return;
   const pages = threadPagesFor(channel);
   if (pages.loading) return;
   const generation = ++pages.generation;
@@ -13513,7 +13518,7 @@ function backgroundRead(options) {
 function addThreadDecoration(meta, message, row, everyThread = false) {
   const id = threadOf(message);
   // The scope is the channel itself: its root opens nothing it is not already showing.
-  if (!threadingSupported || !id || (selection().view === "thread" && !everyThread) || id === channelStore.current().scope) return;
+  if (!providerFacts.threading() || !id || (selection().view === "thread" && !everyThread) || id === channelStore.current().scope) return;
   // THE WAY INTO A THREAD, on every row of one that is not already inside it: in All, on every
   // message, coloured by its thread; in Main, on the roots, which are the only rows of a thread Main
   // shows; and on a row of the Pinned filter, which mixes every view's messages, whichever view is
@@ -13766,7 +13771,7 @@ function heldUnansweredRoot(id) {
  * @returns {ReplyTally}
  */
 function replyTally() {
-  if (!threadingSupported || channelStore.current().channel !== String(selectedChannelId())) return emptyTally();
+  if (!providerFacts.threading() || channelStore.current().channel !== String(selectedChannelId())) return emptyTally();
   return replyTallyOf(channelStore.current(), stillToDo);
 }
 
@@ -13861,7 +13866,7 @@ function holdsUnreadReplies(message, tally) {
  * @returns {(message: any) => boolean}
  */
 function readFilterKeeps(thread = selection().view === "thread" ? openThreadChoice() : null) {
-  const counting = threadingSupported && selection().view === "main" && thread === null;
+  const counting = providerFacts.threading() && selection().view === "main" && thread === null;
   // `#405 root-under-summary`. Under a summarized card the root is kept however read it is: it is
   // the first child the card's words are about, and Hide read hiding it would leave the summary
   // heading a thread whose first message cannot be seen. A raw card already says the root.
@@ -14151,7 +14156,7 @@ function threadStripFromKeyboard(target) {
  * pass over the rows redraws the chips and decides the runs again.
  */
 function syncUnreadReplies() {
-  if (!threadingSupported || selection().view !== "main" || channelStore.current().channel !== String(selectedChannelId())) return;
+  if (!providerFacts.threading() || selection().view !== "main" || channelStore.current().channel !== String(selectedChannelId())) return;
   if (hidingRead()) {
     const keeps = readFilterKeeps();
     const wanted = timelineRows().messages.filter((message) => !hiddenEmpty(message) && keeps(message))
@@ -14286,7 +14291,7 @@ function outrunningThreads() {
  * late-counts-resurrect`).
  */
 async function readAllForCounts(channel, soon = false) {
-  if (!threadingSupported || !channel || String(selectedChannelId()) !== channel || selection().view !== "main" ||
+  if (!providerFacts.threading() || !channel || String(selectedChannelId()) !== channel || selection().view !== "main" ||
       channelStore.current().channel !== channel || channelStore.current().scope || countsAllReadInFlight !== null ||
       document.visibilityState === "hidden") return;
   const all = channelStore.current().views.get(viewKey("flat"));
@@ -14447,14 +14452,14 @@ function markHeldDone(ids, done, settles = false) {
   const marked = ids.map(String);
   // The epoch moves, and each has one more write on its way (`ReadLedger.writeStarted`).
   readLedger.writeStarted(marked);
-  const canon = threadingSupported && channelStore.current().channel === String(selectedChannelId())
+  const canon = providerFacts.threading() && channelStore.current().channel === String(selectedChannelId())
     ? channelStore.current() : null;
   // The store's part (web/src/core/channels `markDoneIn`): its read state, and the gaps Done settles.
   return markDoneIn(canon, marked, done, settles, stillToDo);
 }
 
 /** Whether Done issued now is issued from Main's list, where roots say they have new replies (`markHeldDone`). */
-const doneSettlesHere = () => threadingSupported && selection().view === "main" && !pinsView().only;
+const doneSettlesHere = () => providerFacts.threading() && selection().view === "main" && !pinsView().only;
 
 // `settleUnknownReplies` is web/src/core/channels's (`#624 voice-page-modularity`).
 
@@ -14696,7 +14701,7 @@ const BOUNDED_ALL_NOTICE = /^(Some threads\x27 replies are not in All|Flat view 
  */
 function allNoticeWords(notice) {
   // Only the notice that All left replies out: a forum's own words on All, say, are another matter.
-  if (!notice || !threadingSupported || selection().view !== "flat" || !BOUNDED_ALL_NOTICE.test(notice)) return notice;
+  if (!notice || !providerFacts.threading() || selection().view !== "flat" || !BOUNDED_ALL_NOTICE.test(notice)) return notice;
   const tally = replyTally();
   let lacking = 0;
   let unknown = false;
@@ -14741,7 +14746,7 @@ function holdingMessage(mutate) {
 
 /** Re-project the already fetched timeline after a local preference or archive change. */
 function renderCachedTimeline() {
-  if (!threadingSupported || selection().view === "threads") return;
+  if (!providerFacts.threading() || selection().view === "threads") return;
   const keeps = readFilterKeeps();
   const shown = timelineRows().messages.filter((message) => !hiddenEmpty(message) && (!hidingRead() || keeps(message)));
   const redraw = () => {
@@ -15133,7 +15138,7 @@ async function loadTimeline(options) {
  * `read.held`, when the read gives it, is the store's copies as it was sent (`pageFold`).
  */
 function foldLateTimelinePage(payload, read) {
-  if (!threadingSupported || channelStore.current() !== read.canon || read.canon.channel !== read.channel ||
+  if (!providerFacts.threading() || channelStore.current() !== read.canon || read.canon.channel !== read.channel ||
       String(selectedChannelId()) !== read.channel) return;
   // Asked in the column the read was for, which is the one whose view it may be. `#229`.
   if (read.column && read.column !== columnWork.active()) {
@@ -15462,7 +15467,7 @@ function ownPostStands(id) {
 function storeKeepsOwnPosts(channel) {
   const provider = providerOfChannel(channel);
   return provider ? provider.threading_supported === true
-    : threadingSupported && channel === String(selectedChannelId());
+    : providerFacts.threading() && channel === String(selectedChannelId());
 }
 
 /**
@@ -16108,7 +16113,7 @@ function placeUnplacedWaits(channel) {
 
 /** `placeUnplaced`, once the read ending now has drawn what it brought. */
 function queuePlaceUnplaced() {
-  if (!threadingSupported || channelStore.current().unplaced.size === 0) return;
+  if (!providerFacts.threading() || channelStore.current().unplaced.size === 0) return;
   Promise.resolve().then(placeUnplaced).catch(() => {});
 }
 
@@ -16131,7 +16136,7 @@ function queuePlaceUnplaced() {
  */
 async function placeUnplaced() {
   const channel = String(selectedChannelId());
-  if (!threadingSupported || !channel || channelStore.current().channel !== channel || channelStore.current().scope ||
+  if (!providerFacts.threading() || !channel || channelStore.current().channel !== channel || channelStore.current().scope ||
       placingReadInFlight !== null || discordFetchInFlight || document.visibilityState === "hidden" ||
       placeUnplacedWaits(channel)) return;
   if (unplacedToAsk(channelStore.current()).length === 0) return;
@@ -16285,7 +16290,7 @@ function placeFromPage(payload, canon, number, held = null) {
  * thread is not news there. Main's counts, the thread picker, the cards and an open Reply follow.
  */
 function followPlacement() {
-  if (!threadingSupported || channelStore.current().channel !== String(selectedChannelId())) return;
+  if (!providerFacts.threading() || channelStore.current().channel !== String(selectedChannelId())) return;
   eachColumn(() => {
     const projected = selection().view === "threads" ? null : projectView();
     if (!projected) return;
@@ -18311,7 +18316,7 @@ function sendBookmark(move, options = {}) {
 function bookmarkListRefusal(anchor) {
   if (pinsView().only) return "The bookmark is not in Pinned.";
   if (readRunsSuspended()) return "Close the search to see the bookmark.";
-  if (!threadingSupported) return "";
+  if (!providerFacts.threading()) return "";
   if (selection().view === "main" || selection().view === "flat") return "";
   if (selection().view === "thread") {
     return anchor.thread_id && String(anchor.thread_id) === String(selection().threadId)
@@ -18327,7 +18332,7 @@ function bookmarkListRefusal(anchor) {
  * list. Older than the window, nothing is known.
  */
 function todoWindowHolds(at) {
-  return readModes.hiding() && !threadingSupported && todoView.holdsFrom(at, currentChannelId());
+  return readModes.hiding() && !providerFacts.threading() && todoView.holdsFrom(at, currentChannelId());
 }
 
 /**
@@ -18488,7 +18493,7 @@ function rowAmongCards(row) {
  * window, or the Threads view of one column.
  */
 const bookmarksOffScreen = () => threadListOnScreen() ||
-  (screens.view() === "discord" && !columnWork.side() && threadingSupported && selection().view === "threads");
+  (screens.view() === "discord" && !columnWork.side() && providerFacts.threading() && selection().view === "threads");
 
 /** b, m and the chip: back to the bookmark, walking back through older pages when it is further back. */
 async function jumpToBookmark() {
@@ -18706,7 +18711,7 @@ function mainHeldFrom() {
  * @returns {VibeTalk.BookmarkAnchor | null}
  */
 function heldBackByMain(to, target, rows, done) {
-  if (!to || !threadingSupported || selection().view !== "thread") return to;
+  if (!to || !providerFacts.threading() || selection().view !== "thread") return to;
   if (channelStore.current().channel !== currentChannelId()) return null;
   const anchor = bookmarkAnchor();
   const times = [Date.parse(String(anchor ? anchor.timestamp : "")), rowSentMs(target.row)].filter(Number.isFinite);
@@ -19150,7 +19155,7 @@ function answeredElsewhere(id) {
  */
 function historyReadToStart() {
   if (olderPages().moreAbove !== false) return false;
-  if (!threadingSupported) return true;
+  if (!providerFacts.threading()) return true;
   const cover = channelStore.current().views.get(viewKey());
   return Boolean(cover) && cover.more === false;
 }
@@ -19161,7 +19166,7 @@ async function jumpToAnswered(reply) {
   const from = String(reply.getAttribute("data-id") || "");
   if (!target) return;
   await seekMessage(target, () => landOnAnswered(target, from),
-    () => threadingSupported && selection().view !== "flat" && answeredElsewhere(target));
+    () => providerFacts.threading() && selection().view !== "flat" && answeredElsewhere(target));
 }
 
 /**
@@ -19190,7 +19195,7 @@ async function seekMessage(target, arrive, openAll) {
     // and Hide read is the reason it is not drawn. No walk would find it. Asked again wherever the
     // list has just changed, because All, or an older page, may be what brings the message in.
     const hiddenAsRead = () => {
-      if (!(hidingRead() && threadingSupported && !rowHolding(target) &&
+      if (!(hidingRead() && providerFacts.threading() && !rowHolding(target) &&
           timelineRows().messages.some((message) => String(message.id) === target))) {
         return false;
       }
@@ -19200,7 +19205,7 @@ async function seekMessage(target, arrive, openAll) {
     if (hiddenAsRead()) return;
     // `#386 hide-empty-messages`. Nor would any walk find an empty message while the reader hides those:
     // the store holds it, and no list draws it.
-    const held = threadingSupported ? heldMessage(target) : null;
+    const held = providerFacts.threading() ? heldMessage(target) : null;
     if (held && hiddenEmpty(held)) {
       setStatus("Settings hides that empty message.");
       return;
@@ -19265,7 +19270,7 @@ async function seekMessage(target, arrive, openAll) {
       if (ticket !== replyJumpTicket || context !== channelContextKey()) return;
       if (arrive() || hiddenAsRead()) return;
     }
-    if (readModes.hiding() && !threadingSupported) {
+    if (readModes.hiding() && !providerFacts.threading()) {
       setStatus("Not in this list — Hide read is on.");
     } else if (historyReadToStart()) {
       setStatus("Not in this channel's history.");
@@ -19542,7 +19547,7 @@ function listState() {
 // Whether the channel's rows are drawn gathered now, so putting them back has something to undo. Kept per column: `listState().rowsGathered` (`freshListState`, `#624 voice-page-modularity`).
 
 /** Whether the list on screen is one replies are gathered in: All, or a provider's only list. */
-const gatheringView = () => !threadingSupported || selection().view === "flat";
+const gatheringView = () => !providerFacts.threading() || selection().view === "flat";
 
 /** The message whose replies are gathered in the list on screen, or null. */
 function gatheredParent() {
@@ -19586,7 +19591,7 @@ function replyLinks(messages) {
     if (!parents.has(child)) parents.set(child, []);
     parents.get(child).push(parent);
   };
-  if (threadingSupported) {
+  if (providerFacts.threading()) {
     const held = heldMessagesById();
     for (const message of messages) {
       const record = heldThreadRecord(message, held.get(String(message.id)) || null);
@@ -19598,7 +19603,7 @@ function replyLinks(messages) {
   for (const message of messages) {
     const own = String(message.id);
     link(own, String(message.reply_to || ""));
-    const thread = threadingSupported ? threadOf(message) : null;
+    const thread = providerFacts.threading() ? threadOf(message) : null;
     if (thread !== null && heads.has(thread)) link(own, heads.get(thread));
   }
   return { children, parents, heads };
@@ -19610,7 +19615,7 @@ function replyLinks(messages) {
  * them still joins the messages drawn either side of it.
  */
 function withHeldMessages(messages) {
-  if (!threadingSupported) return messages;
+  if (!providerFacts.threading()) return messages;
   const ids = new Set(messages.map((message) => String(message.id)));
   return [...messages, ...timelineRows().messages.filter((message) => !ids.has(String(message.id)))];
 }
@@ -19803,7 +19808,7 @@ async function gatherReplies(parent, from, headOf = (id) => (rowHolding(id) ? id
     if (head === null) return false;
     gatherNow(head, anchor, anchorTop);
     return true;
-  }, () => threadingSupported && selection().view !== "flat");
+  }, () => providerFacts.threading() && selection().view !== "flat");
 }
 
 /** The gathering itself, once the parent's row is in the list. */
@@ -20141,7 +20146,7 @@ function heldReplies(rows) {
   const viewing = String(selectedChannelId());
   /** @type {Map<string, any>} */
   const held = new Map();
-  if (threadingSupported && channelStore.current().channel === viewing) {
+  if (providerFacts.threading() && channelStore.current().channel === viewing) {
     for (const message of channelStore.current().messages) held.set(String(message.id), message);
   }
   for (const row of rows) {
@@ -20164,7 +20169,7 @@ function heldReplies(rows) {
     add(String(message.reply_to), id, timeOf(message, "timestamp"));
     said.add(`${message.reply_to}\n${String(message.content || "").trim()}`);
   }
-  const pointers = !threadingSupported || replies.size > 0;
+  const pointers = !providerFacts.threading() || replies.size > 0;
   for (const entry of outbox.values()) {
     if (entry.channel !== viewing || !entry.replyTo) continue;
     const first = entry.parts[0];
@@ -20278,7 +20283,7 @@ function renderReplyCounts() {
   }
   // From Main or a thread, a reply this view does not show is one All does, unless Hide read leaves
   // it out there too: by the store's read state, as the unread counts go (`replyTally`).
-  const elsewhere = threadingSupported && selection().view !== "flat";
+  const elsewhere = providerFacts.threading() && selection().view !== "flat";
   const reachable = (id) => {
     if (drawn.has(id)) return true;
     const message = held.get(id);
@@ -20392,7 +20397,7 @@ function replyMarker(row) {
 /** A tap on a circle: the walk the arrow's jump makes, down to reply `target`, the `at`th of `of`. */
 async function jumpToReply(target, at, of) {
   await seekMessage(target, () => landOnReply(target, at, of),
-    () => threadingSupported && selection().view !== "flat" && answeredElsewhere(target));
+    () => providerFacts.threading() && selection().view !== "flat" && answeredElsewhere(target));
 }
 
 /** Take the reader to reply `target` if a row on screen holds it, as `landOnAnswered` does; else false. */
@@ -20529,7 +20534,7 @@ function startsRead(message) {
  */
 function noteStartsRead(messages) {
   const fresh = messages.filter((message) => startsRead(message) &&
-    !(threadingSupported && heldMessage(String(message.id))) && !readLedger.written(String(message.id)));
+    !(providerFacts.threading() && heldMessage(String(message.id))) && !readLedger.written(String(message.id)));
   if (fresh.length === 0) return;
   const epoch = readLedger.bump();
   const here = String(selectedChannelId());
@@ -20537,7 +20542,7 @@ function noteStartsRead(messages) {
     const id = String(message.id);
     readLedger.seed(id, epoch);
     if (String(message.channel_id) !== here) continue;
-    if (threadingSupported && channelStore.current().channel === here) channelStore.current().dismissed.add(id);
+    if (providerFacts.threading() && channelStore.current().channel === here) channelStore.current().dismissed.add(id);
     doneState().archived.add(id);
   }
 }
@@ -21072,7 +21077,7 @@ function discordNode(messages) {
   // WHOLE to a screen reader, which hears the item without the caption beside it.
   upstreamRead.textContent = `In ${service} only · whole space`;
   upstreamRead.setAttribute("aria-label", `Mark read in ${service} only · whole space`);
-  upstreamRead.hidden = !upstreamReadMarkSupported;
+  upstreamRead.hidden = !providerFacts.upstreamReadMark();
   // A combined row stands for every constituent in order. Marking through the NEWEST one includes
   // the complete row; using its first id would leave an invisible tail unread upstream.
   const upstreamBoundary = messages[messages.length - 1];
@@ -21200,15 +21205,15 @@ function discordNode(messages) {
   const readThrough = document.createElement("button");
   readThrough.className = "row-read-through-button";
   readThrough.setAttribute("type", "button");
-  readThrough.textContent = upstreamReadMarkSupported ? `Through here · also in ${service}` : "Through here";
+  readThrough.textContent = providerFacts.upstreamReadMark() ? `Through here · also in ${service}` : "Through here";
   readThrough.setAttribute(
     "aria-label",
-    upstreamReadMarkSupported ? `Mark read through here · also in ${service}` : "Mark read through here"
+    providerFacts.upstreamReadMark() ? `Mark read through here · also in ${service}` : "Mark read through here"
   );
   readThrough.setAttribute(
     "title",
     "Mark this message and every message above it in this list as Done here" +
-      (upstreamReadMarkSupported ? `, and move ${service}'s own read marker for the whole space.` : ".")
+      (providerFacts.upstreamReadMark() ? `, and move ${service}'s own read marker for the whole space.` : ".")
   );
   sayRowShortcut(readThrough, "row-read-through-button");
   readThrough.addEventListener("click", inThisColumn(() => {
@@ -21415,7 +21420,7 @@ async function markReadThroughHere(row, upstreamId) {
   let upstream = false;
   const service = channelDirectory.providerName() || "the chat service";
   const count = `${ids.length} message${ids.length === 1 ? "" : "s"}`;
-  if (upstreamReadMarkSupported && upstreamId) {
+  if (providerFacts.upstreamReadMark() && upstreamId) {
     // `#327 done-races-remaining`. The chat service's marker, which cannot be moved back, is moved only
     // once every message it covers is Done with its Done saved, as Shift+E and a sent reply wait
     // (`doneSaved`): a Done still on its way of a row drawn Done already, which this leaves out of its own,
@@ -21754,12 +21759,12 @@ const searchKey = () => JSON.stringify([filterKey(), searchField.open() ? search
  */
 function searchOffered() {
   return readRunsSuspended() && screens.view() === "discord" && selection().view !== "threads" && !pinsView().only &&
-    olderPages().moreAbove === true && !(readModes.hiding() && !threadingSupported) && (!columnWork.side() || sideShowing());
+    olderPages().moreAbove === true && !(readModes.hiding() && !providerFacts.threading()) && (!columnWork.side() || sideShowing());
 }
 
 /** The view a column shows, as a sentence names it. */
 function channelViewWords() {
-  if (!threadingSupported) return "this channel";
+  if (!providerFacts.threading()) return "this channel";
   return selection().view === "thread" ? "this thread" : selection().view === "flat" ? "All" : "Main";
 }
 
@@ -21825,13 +21830,13 @@ function historyReach() {
   const weight = (row) => Math.max(1, idsOf(row).length);
   const total = rows.reduce((sum, row) => sum + weight(row), 0);
   // A channel with no thread at all has nothing in All but its top-level messages.
-  const topLevel = threadingSupported && selection().view === "flat" && channelHasThreads;
+  const topLevel = providerFacts.threading() && selection().view === "flat" && channelHasThreads;
   /** @type {HistoryReach} */
   const reach = { total, proven: false, saved: false, dense: 0, scattered: total, from: null, start: false,
     whole: false, topLevel, threads: 0, full: 0 };
   /** @type {number | null} below this instant, a row is scattered */
   let floor = null;
-  if (threadingSupported) {
+  if (providerFacts.threading()) {
     const cover = channelStore.current().channel === String(selectedChannelId()) ? channelStore.current().views.get(viewKey()) : undefined;
     if (!cover) return reach;
     // Saved on this device and not read since: what it held when saved, and nothing it may have missed.
@@ -22500,7 +22505,7 @@ const sideCardsShown = () => cardsOnScreen() === leftEl("side-cards");
 
 /** Whether the cards offer to search their threads' older replies: see the head of this section. */
 function repliesSearchOffered() {
-  return threadingSupported && sideCardsShown() && searchField.open() && searchTyped(searchField.query()) &&
+  return providerFacts.threading() && sideCardsShown() && searchField.open() && searchTyped(searchField.query()) &&
     channelStore.current().channel === String(selectedChannelId()) && !channelStore.current().scope && !allLoaded();
 }
 
@@ -22778,7 +22783,7 @@ function loadOlder(signal) {
   const abort = signal && typeof signal === "object" && "aborted" in signal ? signal : undefined;
   if (olderPages().step === null) {
     // The step is this column's, and so is forgetting it, in the task it ends in. `#229`.
-    olderPages().step = (threadingSupported ? loadOlderTimeline(abort) : loadOlderPage(abort)).finally(inThisColumn(() => {
+    olderPages().step = (providerFacts.threading() ? loadOlderTimeline(abort) : loadOlderPage(abort)).finally(inThisColumn(() => {
       olderPages().step = null;
     }));
   }
@@ -23239,7 +23244,7 @@ function heldRowAfter(position) {
  */
 async function loadDiscord(options) {
   screenBelongsToToken();
-  if (threadingSupported) return loadTimeline(options);
+  if (providerFacts.threading()) return loadTimeline(options);
   // `#50 todo-view`. Every path that re-reads the channel comes through here — the background
   // poll, Refresh, entering the view, changing channel — so the mode is honoured HERE rather than
   // at four call sites, one of which would eventually be forgotten and overwrite the filtered
@@ -23518,7 +23523,7 @@ function readRunsSuspended() {
  * chose is untouched, and closing the search brings it back. Without threads Hide read is a read of
  * its own (`loadTodo`), and stays in force.
  */
-const hidingRead = () => readModes.hiding() && !(threadingSupported && readRunsSuspended());
+const hidingRead = () => readModes.hiding() && !(providerFacts.threading() && readRunsSuspended());
 
 /**
  * Run `change`, a change of the filters, and draw each column again from what it holds when it made Hide
@@ -23782,7 +23787,7 @@ function noteArchived(payload, replace) {
   // copy takes its state for each such message from there. The walk visits every message this page has
   // written Done or put back since it was loaded (`localReadWrites` only grows): a few hundred at most in
   // a long session, against a read that has just drawn its page, so it is not bounded further.
-  if (threadingSupported && channelStore.current().channel === String(selectedChannelId())) {
+  if (providerFacts.threading() && channelStore.current().channel === String(selectedChannelId())) {
     for (const id of readLedger.writtenIds()) {
       if (readSpeaksFor(payload, id)) continue;
       if (channelStore.current().dismissed.has(id)) doneState().archived.add(id);
@@ -23853,7 +23858,7 @@ function renderTodoControls() {
   renderReadModeControl();
   el("inbox-note").hidden = !hidingRead();
   const clear = el("clear-backlog");
-  clear.hidden = threadingSupported || !readModes.hiding() || listState().backlog === 0;
+  clear.hidden = providerFacts.threading() || !readModes.hiding() || listState().backlog === 0;
   clear.textContent = backlogIsArmed()
     ? `Clear ${listState().backlog}?`
     : `Clear the backlog (${listState().backlog})`;
@@ -23888,7 +23893,7 @@ function armBacklog() {
  * a mixture of two answers.
  */
 async function loadTodo(options) {
-  if (threadingSupported) return loadTimeline(options);
+  if (providerFacts.threading()) return loadTimeline(options);
   const generation = ++loadState().generation;
   const keepPosition = Boolean(options && options.keepPosition);
   const channel = selectedChannelId();
@@ -24015,16 +24020,16 @@ function todoSummary() {
 function appendChannelRow(arriving, live = false, folded = false) {
   // The store's copy, which may keep a thread record this one arrived without. `folded`: the caller
   // folded it already, for every column at once (`appendToColumns`).
-  const message = threadingSupported && !folded ? foldLiveMessage(arriving, live) : arriving;
+  const message = providerFacts.threading() && !folded ? foldLiveMessage(arriving, live) : arriving;
   // Saved once, from the left column: the store is the channel's, not a column's. `#229`.
   const save = () => {
     if (!columnWork.side()) saveChannelScope();
   };
   if ([...el("discord-log").children].some((row) => idsOf(row).includes(String(message.id)))) {
-    if (threadingSupported) save();
+    if (providerFacts.threading()) save();
     return;
   }
-  if (threadingSupported) {
+  if (providerFacts.threading()) {
     const id = threadOf(message);
     if (selection().view === "threads" ||
         (selection().view === "thread" && id !== selection().threadId) ||
@@ -24091,7 +24096,7 @@ function appendChannelRow(arriving, live = false, folded = false) {
  * copy the stream replayed (`foldLiveMessage`).
  */
 function appendToColumns(arriving, live = false, replayed = false) {
-  const message = threadingSupported ? foldLiveMessage(arriving, live, replayed) : arriving;
+  const message = providerFacts.threading() ? foldLiveMessage(arriving, live, replayed) : arriving;
   inColumn(columns.main, () => appendChannelRow(message, live, true));
   if (sideShowing()) inColumn(columns.side, () => appendChannelRow(message, live, true));
   return message;
@@ -24294,7 +24299,7 @@ async function refreshAfterInboxChange() {
     renderSideColumn();
     return;
   }
-  if (threadingSupported) {
+  if (providerFacts.threading()) {
     renderCachedTimeline();
     saveChannelScope();
     return;
@@ -24612,7 +24617,7 @@ async function dismissMessages(body, bump = body.messages ? singleDoneBump(body.
     const staged = bump ? stageBookmark(bump.channel, bump.to) : null;
     move = staged;
     if (staged) inOtherColumn(renderScrollTools);
-    listed = readModes.hiding() && !threadingSupported ? [...el("discord-log").children] : null;
+    listed = readModes.hiding() && !providerFacts.threading() ? [...el("discord-log").children] : null;
     await refreshAfterInboxChange();
     renderTodoControls();
     setStatus(`Saving ${requested.length} local change${requested.length === 1 ? "" : "s"}…`);
@@ -24654,7 +24659,7 @@ async function dismissMessages(body, bump = body.messages ? singleDoneBump(body.
       for (const id of added) if (back.has(id)) doneState().archived.delete(id);
       mirrorArchived(mirrored.filter((id) => back.has(id)), false);
       // ...and the rows it took off under Hide read without threads, while that list is still on screen.
-      if (listed && readModes.hiding() && !threadingSupported && String(selectedChannelId()) === String(channel)) {
+      if (listed && readModes.hiding() && !providerFacts.threading() && String(selectedChannelId()) === String(channel)) {
         putBackRowsOff(listed, back);
       }
       guardQuietly(refreshAfterInboxChange)();
@@ -24773,7 +24778,7 @@ async function restoreMessages(ids) {
     settled = true;
     // Saved: what waits on it need not wait for the read below as well.
     saving();
-    if (readModes.hiding() && !threadingSupported) {
+    if (readModes.hiding() && !providerFacts.threading()) {
       await loadTodo({ keepPosition: true, ownAct: true, readAs: "mutation" });
     }
   } catch (error) {
@@ -24914,7 +24919,7 @@ function caughtUpDone(copy, ids) {
  * @param {ColumnFields} madeIn
  */
 function followDoneEverywhere(ids, madeIn) {
-  if (!threadingSupported || channelStore.current().channel !== String(selectedChannelId())) return;
+  if (!providerFacts.threading() || channelStore.current().channel !== String(selectedChannelId())) return;
   const named = ids.map(String);
   /** @param {Set<string>} copy */
   const caughtUp = (copy) => caughtUpDone(copy, named);
@@ -24956,7 +24961,7 @@ function followDoneEverywhere(ids, madeIn) {
  * to be drawn again as they are shown. `#306 done-stale-across-views`.
  */
 function rowsMissDone() {
-  if (!threadingSupported || selection().view === "threads") return false;
+  if (!providerFacts.threading() || selection().view === "threads") return false;
   const rows = [...el("discord-log").children];
   if (rows.some((row) => {
     const ids = idsOf(row);
@@ -25046,7 +25051,7 @@ function setReadMode(mode) {
       listState().backlog = 0;
     }
     renderTodoControls();
-    if (threadingSupported) {
+    if (providerFacts.threading()) {
       // One read mode, for both columns. `#229 desktop-two-column`.
       eachColumn(renderCachedTimeline);
       // `#404 threads-unpack-all`. And inside every unpacked block.
@@ -25215,7 +25220,7 @@ function pinnedMessages() {
   const channel = currentChannelId();
   if (pinStore.channel() !== channel || pinStore.size() === 0) return [];
   const held = new Map();
-  const loaded = threadingSupported && channelStore.current().channel === channel
+  const loaded = providerFacts.threading() && channelStore.current().channel === channel
     ? [...channelStore.current().threads.map((summary) => summary.root).filter(Boolean), ...channelStore.current().messages, ...timelineRows().messages]
     : [...el("discord-log").children].flatMap(rowMessages);
   for (const message of loaded) held.set(String(message.id), message);
@@ -25238,7 +25243,7 @@ function syncPinnedList() {
   // tag confirmed by a later read brings a heading to a message whose text has not changed. And its
   // own address in its service (`#409 open-upstream-link`): a later read can form one for a message
   // drawn without one, and its row gains the link only by being drawn again.
-  const drawn = JSON.stringify([combineMessages, hideEmptyMessages, channelStore.current().scope, threadingSupported,
+  const drawn = JSON.stringify([combineMessages, hideEmptyMessages, channelStore.current().scope, providerFacts.threading(),
     ...messages.map((m) => [m.id, m.timestamp, m.content, renderedHtmlOf(m), m.author, threadOf(m), isNoise(m),
       pinSync.isKept(m), reactionsDrawn(m), m.heading || null, editedDrawn(m), upstreamUrlOf(m)])]);
   if (drawn === pinsView().drawn) return;
@@ -25319,10 +25324,10 @@ const noiseSettings = mountNoiseRules({
  * server already left the placeholders out and said how many it left, so that number is the one.
  */
 function noiseTally() {
-  if (!threadingSupported && readModes.hiding()) {
+  if (!providerFacts.threading() && readModes.hiding()) {
     return { matched: todoView.state().noise || 0, total: todoView.state().window || 0 };
   }
-  const loaded = threadingSupported
+  const loaded = providerFacts.threading()
     ? timelineRows().messages
     : [...el("discord-log").children].flatMap(rowMessages);
   return { matched: loaded.filter(isNoise).length, total: loaded.length };
@@ -25352,7 +25357,7 @@ async function markNotNoise(ids) {
   for (const message of copies) {
     if (rescued.has(String(message.id))) message.noise = false;
   }
-  if (threadingSupported) eachColumn(() => guardQuietly(refreshAfterInboxChange)());
+  if (providerFacts.threading()) eachColumn(() => guardQuietly(refreshAfterInboxChange)());
   else await refreshAfterInboxChange();
   const count = rescued.size;
   setStatus(
@@ -25900,7 +25905,7 @@ function rootOfOpenThread(message) {
 
 /** Whether `message` heads a thread with replies: on Main's root, Reply gathers them under it. */
 function headsAnsweredThread(message) {
-  const thread = threadingSupported ? threadOf(message) : null;
+  const thread = providerFacts.threading() ? threadOf(message) : null;
   if (thread === null || message.thread.is_root !== true) return false;
   const said = threadReplies(thread, message).count;
   return (typeof said === "number" && said > 0) ||
@@ -26372,9 +26377,9 @@ function answeredRow(id) {
  * @param {string} id
  */
 function doneWhereNotDrawn(id) {
-  if (threadingSupported && channelStore.current().channel === String(selectedChannelId()) &&
+  if (providerFacts.threading() && channelStore.current().channel === String(selectedChannelId()) &&
       channelStore.current().dismissed.has(id)) return true;
-  return inColumn(columns.main, () => doneState().archived.has(id) || (readModes.hiding() && !threadingSupported));
+  return inColumn(columns.main, () => doneState().archived.has(id) || (readModes.hiding() && !providerFacts.threading()));
 }
 
 /**
@@ -26399,7 +26404,7 @@ function answeredDone(id, found = answeredRow(id)) {
  * @param {string[]} ids
  */
 function doneHeldHere(ids) {
-  if (threadingSupported && channelStore.current().channel === String(selectedChannelId())) {
+  if (providerFacts.threading() && channelStore.current().channel === String(selectedChannelId())) {
     return ids.every((id) => channelStore.current().dismissed.has(String(id)));
   }
   return inColumn(columns.main, () => ids.every((id) => doneState().archived.has(String(id))));
@@ -26481,7 +26486,7 @@ function channelMarksUpstream(channel) {
  * @param {string | null} thread
  */
 function rootThisStarts(channel, thread) {
-  if (!threadingSupported || !thread || channelStore.current().channel !== String(channel)) return null;
+  if (!providerFacts.threading() || !thread || channelStore.current().channel !== String(channel)) return null;
   const root = heldUnansweredRoot(thread);
   if (!root) return null;
   const key = String(thread);
@@ -26921,7 +26926,7 @@ function followInOtherColumn() {
  */
 function threadListOffered() {
   const channel = String(selectedChannelId() || "");
-  return threadingSupported && channel !== "" && !(channelStore.current().channel === channel && channelStore.current().scope);
+  return providerFacts.threading() && channel !== "" && !(channelStore.current().channel === channel && channelStore.current().scope);
 }
 
 /**
@@ -27253,7 +27258,7 @@ function toggleColumns() {
  */
 function chooseView(which) {
   noteDeepLinkReaderMove();
-  if (which !== "main" && !threadingSupported) {
+  if (which !== "main" && !providerFacts.threading()) {
     setStatus("No threads here: Main is all of it.");
     renderThreadSelect();
     return;
@@ -30214,7 +30219,7 @@ const liveEvents = createLiveEvents();
 
 /** The view a read of the column being worked on is for: its context, and the to-do list apart. */
 function readHoldKey() {
-  return !threadingSupported && readModes.hiding() ? `${channelContextKey()} todo` : channelContextKey();
+  return !providerFacts.threading() && readModes.hiding() ? `${channelContextKey()} todo` : channelContextKey();
 }
 
 /**
@@ -30318,7 +30323,7 @@ function abandonRead(answer, read, land, settled = null) {
 function abandonedReadStands(read) {
   if (String(selectedChannelId()) !== read.channel) return false;
   if (liveEvents.seen(read.channel) !== read.live) return false;
-  if (threadingSupported) {
+  if (providerFacts.threading()) {
     return read.canon === channelStore.current() && channelStore.current().channel === read.channel &&
       read.number === readOrder.asked();
   }
@@ -30568,7 +30573,7 @@ function resumePolling(how) {
  */
 function catchUpHiddenArrivals() {
   const { mutation, arrived } = hiddenStream.takeArrivals(() => replayLedger.waiting() > 0);
-  if (arrived && screens.view() === "discord" && threadingSupported &&
+  if (arrived && screens.view() === "discord" && providerFacts.threading() &&
       channelStore.current().channel === String(selectedChannelId()) && channelStore.current().views.has(viewKey())) {
     const area = el("scroll-area");
     const position = channelReadPosition(area);
@@ -30869,13 +30874,8 @@ const RELAY_COALESCE_MS = 1200;
 /** Persisted like the microphone settings. */
 const RELAY_KEY = "vibe-talk.voice.relay";
 
-/** Seconds between the server's own reads of the channel; 0 means it is not watching at all. */
-let livePollSeconds = 0;
-/** `off`, `poll`, or `push`, as reported by the server. */
-let liveDelivery = "off";
-
-/** Whether the selected provider can move its own read cursor. Default-off for older servers. */
-let upstreamReadMarkSupported = false;
+// How often the server reads the channel, how it delivers live updates, and whether the selected provider can
+// move its own read cursor are the provider facts' (`ProviderFacts`, `#624 voice-page-modularity`).
 /**
  * `read` or `write`: the scope the server saw on the saved token. Null from an older server that
  * does not say, which keeps the old behaviour of asking and reading the refusal.
@@ -30890,7 +30890,7 @@ let tokenScope = null;
 const liveFollow = createChannelFollow({
   clock: clockOnUse(),
   token: () => token(),
-  delivery: () => liveDelivery,
+  delivery: () => providerFacts.liveDelivery(),
   // NOT `EventSource`: see the head of this section.
   open: (path, headers) => fetch(path, { headers }),
   decoder: () => new TextDecoder(),
@@ -31104,13 +31104,13 @@ function onStreamFrame(frame) {
   if (frame.event === "message_update" || frame.event === "message_delete") {
     // `#308 live-reply-in-main`. An edit is a copy too: one that names the thread of a message the
     // store holds without one places it at once, whatever the read below brings.
-    if (threadingSupported && frame.event === "message_update" && VibeTalkContract.is("LiveMessageEvent", payload) &&
+    if (providerFacts.threading() && frame.event === "message_update" && VibeTalkContract.is("LiveMessageEvent", payload) &&
         placesHeld(payload.message)) {
       placeFromEdit(payload.message);
     }
     // ...and a removal says the message is gone upstream, whatever the read below brings: no answer
     // sent before it may put the message back.
-    if (threadingSupported && frame.event === "message_delete" && VibeTalkContract.is("LiveDeleteEvent", payload)) {
+    if (providerFacts.threading() && frame.event === "message_delete" && VibeTalkContract.is("LiveDeleteEvent", payload)) {
       noteLiveRemoval(payload.channel_id, payload.message_id,
         typeof payload.observed_ms === "number" ? payload.observed_ms : null);
     }
@@ -31118,7 +31118,7 @@ function onStreamFrame(frame) {
     // it waits for such a read rather than making its own. The page's copy of the message says
     // nothing about which edit it has seen, so no page can answer for it sooner.
     // `#43 replay-burst-double-read`.
-    if (threadingSupported && payload && payload.from_tail === true) {
+    if (providerFacts.threading() && payload && payload.from_tail === true) {
       const message = payload.message || {};
       const id = frame.event === "message_update" ? message.id : payload.message_id;
       const channel = frame.event === "message_update" ? message.channel_id : payload.channel_id;
@@ -31166,7 +31166,7 @@ const mutationRefresh = createMutationRefresh({
 /** Coalesce a burst of edits/deletes into authoritative re-reads without leaving a stale tail. */
 function refreshAfterLiveMutation() {
   // `#226 page-energy-profile`. Not for a hidden page: the read that coming back makes answers it.
-  if (threadingSupported && document.hidden) {
+  if (providerFacts.threading() && document.hidden) {
     hiddenStream.noteMutation();
     return;
   }
@@ -31205,14 +31205,14 @@ function receiveLiveMessage(message, selfPosted, replayed, fromTail) {
     loadState().freshAt = Date.now();
     renderChannelFreshness();
   }
-  if (!threadingSupported && discordFetchInFlight) {
+  if (!providerFacts.threading() && discordFetchInFlight) {
     // This event is newer evidence than a read already on the wire. Invalidate that snapshot
     // even when the event's ID is already visible from a POST acknowledgement; otherwise it
     // could erase the row after this event retired its durable send receipt.
     ++loadState().generation;
     if (!discordQueuedLoads.has(columns.main)) queueDiscordLoad({ keepPosition: true, readAs: "live" });
   }
-  if (threadingSupported) {
+  if (providerFacts.threading()) {
     // A replayed copy is from when it was published, so the store's copy is at least as new — its
     // reply count, its edits — and is the one kept. Asked before the row is folded in, which would
     // make every message look already held. A held message is already in the view drawn from the
@@ -31517,7 +31517,7 @@ let watchAllAbort = null;
 /** Follow every watched channel for the call that has just connected. */
 function startWatchAll() {
   stopWatchAll();
-  if (!watchAllSupported || liveDelivery === "off" || !token()) return;
+  if (!watchAllSupported || providerFacts.liveDelivery() === "off" || !token()) return;
   const generation = watchAllGeneration.current();
   guardQuietly(() => followWatchAll(generation))();
 }
@@ -31785,19 +31785,7 @@ const channelSettings = mountChannelSettings({
  */
 function applyChannelProvider() {
   const provider = providerOfChannel(selectedChannelId());
-  threadingSupported = provider
-    ? provider.threading_supported === true
-    : channelDirectory.capabilities().threading;
-  upstreamReadMarkSupported = provider
-    ? provider.upstream_read_mark_supported === true
-    : channelDirectory.capabilities().upstreamReadMark;
-  liveDelivery =
-    provider && ["off", "poll", "push"].includes(provider.live_delivery)
-      ? provider.live_delivery
-      : channelDirectory.capabilities().liveDelivery;
-  livePollSeconds = provider
-    ? Number(provider.live_poll_seconds) || 0
-    : channelDirectory.capabilities().livePollSeconds;
+  providerFacts.fromProvider(provider, channelDirectory.capabilities());
   renderLiveState();
 }
 
@@ -32070,8 +32058,8 @@ function applyClientConfig(config) {
     readAloudOwner().storedReadAudioSource() || (readAloudOwner().witReadAloud ? "wit" : readAloudOwner().agentReadAloud ? "agent" : "device"), false);
   if (readAloudOwner().witReadAloud) void readAloudOwner().loadWitVoices();
   readAloudOwner().applyReadSpeed(readAloudOwner().readSpeed);
-  threadingSupported = config.threading_supported === true;
-  channelDirectory.setCapability("threading", threadingSupported);
+  providerFacts.setThreading(config.threading_supported === true);
+  channelDirectory.setCapability("threading", providerFacts.threading());
   // `#528 thread-card-markdown-and-cap`: whether a long first message's summary may be on its way.
   threadNamesSupported = config.thread_names_supported === true;
   learnProviders(config.providers);
@@ -32151,17 +32139,10 @@ function applyClientConfig(config) {
   // the render at load ran against an empty picker and listed nothing whatever was stored.
   channelSettings.renderChannelBox();
   restoreChannelComposer();
-  // `#44 live-push`. The server says whether it is watching the channel at all, and how often.
-  // Without it the page would have to infer "live" from a stream that is attached and silent —
-  // which is exactly what a quiet channel looks like, so the indicator would be a guess.
-  livePollSeconds = Number(config.live_poll_seconds) || 0;
-  liveDelivery = ["off", "poll", "push"].includes(config.live_delivery)
-    ? config.live_delivery
-    : livePollSeconds > 0
-      ? "poll"
-      : "off";
-  upstreamReadMarkSupported = config.upstream_read_mark_supported === true;
-  channelDirectory.setCapability("upstreamReadMark", upstreamReadMarkSupported);
+  // `#44 live-push`. The server says whether it is watching the channel at all, and how often
+  // (`ProviderFacts.fromConfig`): without it a quiet channel and an unwatched one look the same.
+  providerFacts.fromConfig(config);
+  channelDirectory.setCapability("upstreamReadMark", providerFacts.upstreamReadMark());
   // `#195 send-resilience`. Read per channel, by `channelPostsOnce`, when a send fails.
   channelDirectory.setCapability("idempotentPosts", config.idempotent_posts_supported === true);
   // `#252 thread-button-state`. Read per channel, by `channelRepliesInThread`, for a reply's route.
@@ -32172,8 +32153,8 @@ function applyClientConfig(config) {
   // ...and back on when the server can summarise again and the owner's setting still says so.
   else if (!summaryRows.disabledByServer() && !summaryRows.mode() && storedSummarizeCollapsed()) setSummaryMode(true);
   renderScrollTools();
-  channelDirectory.setCapability("liveDelivery", liveDelivery);
-  channelDirectory.setCapability("livePollSeconds", livePollSeconds);
+  channelDirectory.setCapability("liveDelivery", providerFacts.liveDelivery());
+  channelDirectory.setCapability("livePollSeconds", providerFacts.livePollSeconds());
   // The picker already holds a channel; the flags above are the deployment's, and that channel's
   // own provider may answer differently.
   applyChannelProvider();
@@ -32267,7 +32248,7 @@ async function signIn() {
     payReopenRead();
     return true;
   }
-  const drawn = { key: channelContextKey(), threading: threadingSupported };
+  const drawn = { key: channelContextKey(), threading: providerFacts.threading() };
   applyClientConfig(config);
   reconcileChannelSnapshot(drawn);
   clearError();

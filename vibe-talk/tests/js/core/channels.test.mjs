@@ -770,3 +770,23 @@ test("`#624 voice-page-modularity`: a plain channel's rows are one stretch until
   reach.noteNewest(false, 3, 3, 0, "2026-11-02T10:00:00Z");
   assert.equal(reach.gapFrom(), null, "an empty page says nothing of a gap");
 });
+
+test("`#624 voice-page-modularity`: the selected service's facts come from its provider, else the deployment, else nothing", () => {
+  const facts = CHANNELS.createProviderFacts();
+  assert.deepStrictEqual([facts.threading(), facts.upstreamReadMark(), facts.liveDelivery(), facts.livePollSeconds()], [false, false, "off", 0]);
+  facts.fromConfig({ live_poll_seconds: 45, upstream_read_mark_supported: true });
+  assert.deepStrictEqual([facts.liveDelivery(), facts.livePollSeconds(), facts.upstreamReadMark()], ["poll", 45, true], "a server that polls and says no delivery delivers by poll");
+  facts.fromConfig({ live_delivery: "push", live_poll_seconds: 0 });
+  assert.equal(facts.liveDelivery(), "push");
+  facts.fromConfig({ live_delivery: "carrier pigeon" });
+  assert.equal(facts.liveDelivery(), "off", "an unknown delivery with no poll is off");
+  const deployment = { threading: true, upstreamReadMark: false, upstreamClear: false, idempotentPosts: false, repliesInThread: false, liveDelivery: "poll", livePollSeconds: 30 };
+  facts.fromProvider(null, deployment);
+  assert.deepStrictEqual([facts.threading(), facts.liveDelivery(), facts.livePollSeconds()], [true, "poll", 30], "no provider described: the deployment speaks");
+  facts.fromProvider({ threading_supported: false, live_delivery: "push", live_poll_seconds: "12", upstream_read_mark_supported: true }, deployment);
+  assert.deepStrictEqual([facts.threading(), facts.upstreamReadMark(), facts.liveDelivery(), facts.livePollSeconds()], [false, true, "push", 12]);
+  facts.fromProvider({ live_delivery: "smoke" }, deployment);
+  assert.equal(facts.liveDelivery(), "poll", "a provider's unknown delivery falls back to the deployment's");
+  facts.setThreading(true);
+  assert.equal(facts.threading(), true);
+});
