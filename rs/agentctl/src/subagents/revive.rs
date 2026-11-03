@@ -981,6 +981,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         &self,
         record: &AgentRecord,
         startup_timeout: Duration,
+        reuse_pane: Option<String>,
     ) -> Result<LaunchPlan> {
         if record.lifecycle != "running" {
             return Err(fail("record lifecycle is not running"));
@@ -1021,7 +1022,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             return Err(fail("recorded starting directory changed"));
         }
         if let Some(spec) = record.launch_spec.as_ref() {
-            return self.spec_launch_plan(record, spec, cwd, startup_timeout);
+            return self.spec_launch_plan(record, spec, cwd, startup_timeout, reuse_pane);
         }
         // Muse with no recorded conversation starts fresh with a handoff brief (#741).
         let auto_fresh_muse = record.harness == "muse"
@@ -1059,6 +1060,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             startup_timeout,
             ..StartOptions::default()
         };
+        options.reuse_pane = reuse_pane;
         if auto_fresh_muse {
             options.brief = Some(format!(
                 "You are {name}, restarted fresh after an outage because Muse cannot resume \
@@ -1145,6 +1147,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         spec: &Value,
         cwd: PathBuf,
         startup_timeout: Duration,
+        reuse_pane: Option<String>,
     ) -> Result<LaunchPlan> {
         let names = spec["environment_names"]
             .as_array()
@@ -1185,6 +1188,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             startup_timeout,
             ..StartOptions::default()
         };
+        options.reuse_pane = reuse_pane;
         if !names.is_empty() {
             let Some(profile_name) = record.profile.as_deref() else {
                 return Err(fail(
@@ -1710,7 +1714,6 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         record: &AgentRecord,
         timeout: Duration,
     ) -> Result<(LaunchPlan, Proof)> {
-        let plan = self.revive_launch_plan(record, timeout)?;
         match self.revive_liveness(record) {
             ProcessLiveness::Dead => {}
             ProcessLiveness::Alive => return Err(fail("recorded harness process is alive")),
@@ -1719,6 +1722,17 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             }
         }
         let proof = self.revive_proof(record)?;
+        // Pane reuse (#744): a proved idle shell is relaunched in place. Custom panes
+        // are the ones Herdr restores as shells; owned native presentations are
+        // already closed and replaced by revive cleanup. A pane that still reports
+        // a session is excluded from the census and relaunched elsewhere instead:
+        // a candidate on that pane could not be told apart from the stale report.
+        let reuse_pane = (proof.kind == "idle_shell"
+            && proof.reported_agent.is_none()
+            && proof.reported_session_value.is_none()
+            && matches!(record.adapter.as_str(), "herdr-pane" | "herdr-relay"))
+        .then(|| proof.pane_id.clone());
+        let plan = self.revive_launch_plan(record, timeout, reuse_pane)?;
         Ok((plan, proof))
     }
 
@@ -2189,7 +2203,12 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         }
         checkpoint("launched")?;
         self.verify_candidate(&candidate, &record, &journal.proof)?;
-        if self.record_bytes(&pinned)? != original || self.revive_proof(&record)? != journal.proof {
+        // Pane reuse (#744): the candidate already relaunched in the old pane,
+        // so the idle-shell proof cannot be re-derived; it was proved at launch.
+        let reused = candidate.pane_id.as_deref() == Some(journal.proof.pane_id.as_str());
+        if self.record_bytes(&pinned)? != original
+            || (!reused && self.revive_proof(&record)? != journal.proof)
+        {
             return Err(fail(
                 "revive source changed after candidate launch; journal retained",
             ));
@@ -2291,10 +2310,13 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                         ));
                     }
                 }
-                if self.revive_proof(old)? != journal.proof {
+                // Pane reuse (#744): the candidate already relaunched in this pane,
+                // so the idle-shell proof cannot be re-derived; it was proved at launch.
+                let reused = candidate.pane_id.as_deref() == Some(journal.proof.pane_id.as_str());
+                if !reused && self.revive_proof(old)? != journal.proof {
                     return Err(fail("original idle shell proof changed before retirement"));
                 }
-                if journal.proof.kind == "idle_shell" {
+                if journal.proof.kind == "idle_shell" && !reused {
                     let text = self.bounded_terminal_text(&journal.proof.pane_id)?;
                     let output = document_bytes_with_limit(
                         &json!({ "text":text, "captured_at":journal.started_at,
@@ -2305,7 +2327,8 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                     atomic_replace_bytes(&pinned, "output.json", &output)
                         .map_err(|error| *error.error)?;
                 }
-                if self.record_bytes(&pinned)? != bytes || self.revive_proof(old)? != journal.proof
+                if self.record_bytes(&pinned)? != bytes
+                    || (!reused && self.revive_proof(old)? != journal.proof)
                 {
                     return Err(fail("revive source changed immediately before retirement"));
                 }
@@ -2362,9 +2385,16 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             journal.phase = "published".to_owned();
             self.write_revive_journal(Some(&before), journal)?;
         }
-        let current = self.revive_proof(old)?;
+        // Pane reuse (#744): the candidate relaunched in the old idle shell, so the
+        // pane and tab stay; the old presentation proof no longer describes them.
+        let reused = candidate.pane_id.as_deref() == Some(journal.proof.pane_id.as_str());
+        let current = if reused {
+            journal.proof.clone()
+        } else {
+            self.revive_proof(old)?
+        };
         // An adopted agent's pane was never agentctl's to close, even as an idle shell.
-        let keep_pane = old.is_foreign() && current.kind != "missing";
+        let keep_pane = reused || (old.is_foreign() && current.kind != "missing");
         if current.kind != "missing" && !keep_pane {
             if current != journal.proof {
                 return Err(fail(
@@ -2410,6 +2440,35 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             .map_err(|error| fail(error.to_string()))?;
         Self::verify_pinned_agent_directory(&root)?;
         candidate.storage_directory = None;
+        if reused {
+            // Record the reuse for wrkslots' owner classification (#744, #777).
+            let previous_pid = old
+                .harness_identity
+                .as_ref()
+                .map(|identity| identity.pid)
+                .or_else(|| old.custom_process_identity.as_ref().map(|i| i.pid));
+            let current_pid = candidate
+                .harness_identity
+                .as_ref()
+                .map(|identity| identity.pid)
+                .or_else(|| candidate.custom_process_identity.as_ref().map(|i| i.pid));
+            let current = (
+                candidate.pane_id.clone(),
+                candidate.terminal_id.clone(),
+                current_pid,
+            );
+            super::record_reanchor(
+                &mut candidate,
+                (
+                    Some(journal.proof.pane_id.clone()),
+                    journal.proof.terminal_id.clone(),
+                    previous_pid,
+                ),
+                current,
+                "reuse",
+            );
+            self.save(&candidate)?;
+        }
         let mut result = self.status_record(&candidate)?;
         result["revived"] = json!(true);
         result["previous_token"] = json!(journal.old_token);

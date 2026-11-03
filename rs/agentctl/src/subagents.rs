@@ -5376,6 +5376,10 @@ const READINESS_PROBE_INTERVAL: Duration = Duration::from_millis(500);
 pub struct StartOptions {
     /// Existing workspace ID, or the current workspace / shared `subagents` default.
     pub workspace_id: Option<String>,
+    /// Launch into this existing pane instead of creating a tab (revive pane reuse,
+    /// #744): the caller must have proved it is a descendant-free idle shell whose
+    /// pane, tab, workspace, and cwd match the record.
+    pub reuse_pane: Option<String>,
     /// Owner-configured launch profile selected by the caller, retained for recovery.
     pub profile: Option<String>,
     /// Herdr agent kind.
@@ -5605,6 +5609,7 @@ impl Default for StartOptions {
     fn default() -> Self {
         Self {
             workspace_id: None,
+            reuse_pane: None,
             profile: None,
             harness: "codex".to_owned(),
             model: None,
@@ -9233,6 +9238,24 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             &format!("managed-workspace:{default_label}"),
             "workspace allocation lock",
         )?;
+        // Pane reuse (#744): launch into the proved idle shell instead of a new tab.
+        if let Some(pane) = options.reuse_pane.as_deref() {
+            let panes = self.client.panes()?;
+            let found = panes
+                .iter()
+                .find(|item| item.pane_id == pane)
+                .ok_or_else(|| fail(format!("reuse pane {pane} no longer exists")))?;
+            if !self.client.pane_is_idle_shell(pane)? {
+                return Err(fail(format!(
+                    "reuse pane {pane} is not a descendant-free idle shell"
+                )));
+            }
+            record.workspace_id = Some(found.workspace_id.clone());
+            record.tab_id = Some(found.tab_id.clone());
+            record.pane_id = Some(found.pane_id.clone());
+            self.save(record)?;
+            return Ok(());
+        }
         let selected = options
             .workspace_id
             .clone()
@@ -15137,6 +15160,7 @@ pub(crate) mod tests {
                 );
             }
             self.started.store(true, Ordering::Relaxed);
+            self.dead_panes.lock().unwrap().remove(pane);
             Ok(())
         }
         fn start_pane_agent(
@@ -15154,6 +15178,8 @@ pub(crate) mod tests {
                 .insert(pane.to_owned(), (kind.to_owned(), arguments.to_vec()));
             self.started.store(true, Ordering::Relaxed);
             self.custom_alive.store(true, Ordering::Relaxed);
+            // Launching a harness into a pane makes it live again (pane reuse, #744).
+            self.dead_panes.lock().unwrap().remove(pane);
             let mut identity = Self::custom_identity();
             if self.fresh_presentations.load(Ordering::Relaxed) {
                 let generation = self.environments.lock().unwrap().len() as u64 - 1;

@@ -691,6 +691,51 @@ fn revive_muse_preserves_globals_before_the_resume_subcommand() {
 }
 
 #[test]
+fn revive_reuses_a_proved_idle_shell_pane_and_records_the_reanchor() {
+    // Pane reuse (#744): the dead harness left a plain shell in its own pane,
+    // reporting no session, so revive relaunches there instead of a new tab.
+    let (fixture, old) = recoverable("muse", true);
+    let result = fixture
+        .manager()
+        .revive("worker", false, None, TIMEOUT)
+        .unwrap();
+    assert_eq!(result["revived"], true);
+    assert_eq!(result["pane_closed"], false);
+    assert_eq!(result["tab_closed"], false);
+    let resumed = fixture.manager().load("worker").unwrap();
+    assert_eq!(resumed.pane_id, old.pane_id);
+    assert_eq!(resumed.tab_id, old.tab_id);
+    assert!(fixture.client.closed.lock().unwrap().is_empty());
+    assert_eq!(fixture.client.environments.lock().unwrap().len(), 1);
+    let reanchors = resumed.extra["reanchors"].as_array().unwrap();
+    let entry = reanchors.last().unwrap();
+    assert_eq!(entry["reason"], "reuse");
+    assert_eq!(entry["previous"]["pane_id"], old.pane_id.clone().unwrap());
+    assert_eq!(entry["current"]["pane_id"], old.pane_id.unwrap());
+    assert_eq!(entry["slot_generation"], serde_json::Value::Null);
+}
+
+#[test]
+fn revive_reuse_recovers_after_an_interruption_without_a_new_tab() {
+    let (fixture, old) = recoverable("muse", true);
+    super::super::revive::fail_once("launched");
+    assert!(fixture
+        .manager()
+        .revive("worker", false, None, TIMEOUT)
+        .is_err());
+    let result = fixture
+        .manager()
+        .revive("worker", false, None, TIMEOUT)
+        .unwrap();
+    assert_eq!(result["revived"], true);
+    assert_eq!(result["pane_closed"], false);
+    let resumed = fixture.manager().load("worker").unwrap();
+    assert_eq!(resumed.pane_id, old.pane_id);
+    assert!(fixture.client.closed.lock().unwrap().is_empty());
+    assert_eq!(fixture.client.environments.lock().unwrap().len(), 1);
+}
+
+#[test]
 fn revive_resumes_muse_with_a_proved_stale_native_report_and_reconciles_each_boundary() {
     for interruption in [None, Some("launched"), Some("ready"), Some("archived")] {
         let (fixture, old) = recoverable("muse", true);
