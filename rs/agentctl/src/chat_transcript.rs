@@ -15,13 +15,24 @@
 //! conversation or is replaced is followed. A coordinator with no transcript, or one that cannot
 //! be read, leaves every reply with its screen text, as before; each change in what is read is
 //! logged once.
+//!
+//! A record can name no conversation and no process that names one, as an adopted coordinator's
+//! can. Its transcript is then discovered (#783 chat-reply-capture-miss): first from the harness
+//! process running in the coordinator's Herdr pane (the process whose environment names the
+//! pane), then, for Claude Code, as the newest transcript in the coordinator's project directory
+//! that mentions the reply ID of a request delivered to it. A conversation found through a live
+//! process, for a record that names none, is offered for binding ([`ReplySource`]); one found only
+//! by its content is read but never bound.
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use agent_harness::{replies, Event, Follower, Hints};
+use agent_harness::{replies, Event, Follower, Hints, Located};
+use serde::{Deserialize, Serialize};
 
 use crate::chat_runtime::{TranscriptBlock, TranscriptReplies};
 
@@ -41,14 +52,56 @@ const SETTLE_STEP: Duration = Duration::from_millis(200);
 /// Most reply IDs remembered as waited for.
 const MAX_WAITED: usize = 256;
 
+/// Most transcripts in a project directory that discovery by content reads, newest first.
+const DISCOVER_FILES: usize = 8;
+/// How far before its end discovery by content reads each transcript.
+const DISCOVER_TAIL_BYTES: u64 = 8 * 1024 * 1024;
+
 /// What finds the coordinator now: its harness's name and what locates its transcript.
 pub(crate) type Resolve = Box<dyn Fn() -> Option<(String, Hints)> + Send>;
+/// What finds the coordinator's transcript when [`Resolve`] does not: see [`discover`].
+pub(crate) type Discover = Box<dyn Fn() -> Option<Discovered> + Send>;
+/// The reply IDs of the requests delivered to the coordinator and not answered yet.
+pub(crate) type Expected = Box<dyn Fn() -> Vec<String> + Send>;
 /// Where log lines go.
 pub(crate) type Log = Box<dyn Fn(String) + Send>;
+
+/// A transcript that discovery found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Discovered {
+    /// The harness whose transcript it is.
+    pub(crate) harness: String,
+    /// The file, and the evidence that chose it.
+    pub(crate) located: Located,
+    /// The conversation id to bind into the record: only for a conversation a live process
+    /// names, for a Claude Code record that names none.
+    pub(crate) bind: Option<String>,
+}
+
+/// Where the bridge's reply text comes from now, as the last look for the transcript found it:
+/// what the owner loop records for `chat health`, and the conversation it binds.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ReplySource {
+    /// The transcript read, if any.
+    pub(crate) path: Option<PathBuf>,
+    /// Why that file, or why none.
+    pub(crate) evidence: String,
+    /// Whether the record named nothing that found it, so discovery did.
+    pub(crate) discovered: bool,
+    /// A conversation a live process names, for a Claude Code record that names none: the owner
+    /// loop binds it into the record.
+    pub(crate) unbound_session: Option<String>,
+}
+
+/// The [`ReplySource`] the transcript reader shares with the owner loop: `None` until the first
+/// look.
+pub(crate) type SharedReplySource = Arc<Mutex<Option<ReplySource>>>;
 
 /// The coordinator's transcript, followed for its reply blocks.
 pub(crate) struct CoordinatorTranscript {
     resolve: Resolve,
+    discover: Option<Discover>,
+    source: Option<SharedReplySource>,
     log: Log,
     follower: Option<Follower>,
     located_at: Option<Instant>,
@@ -74,6 +127,8 @@ impl CoordinatorTranscript {
     pub(crate) fn new(resolve: Resolve, log: Log) -> Self {
         Self {
             resolve,
+            discover: None,
+            source: None,
             log,
             follower: None,
             located_at: None,
@@ -84,9 +139,48 @@ impl CoordinatorTranscript {
         }
     }
 
-    /// Follow the transcript of agent `name` in `registry`, as its record describes it.
-    pub(crate) fn for_agent(registry: PathBuf, name: String, log: Log) -> Self {
-        Self::new(Box::new(move || record_hints(&registry, &name)), log)
+    /// Follow the transcript of agent `name` in `registry`, as its record describes it, or as
+    /// [`discover`] finds it, confirmed by content against the reply IDs `expected` gives;
+    /// sharing where the text comes from through `source`.
+    pub(crate) fn for_agent(
+        registry: PathBuf,
+        name: String,
+        log: Log,
+        expected: Expected,
+        source: SharedReplySource,
+    ) -> Self {
+        let resolve = {
+            let (registry, name) = (registry.clone(), name.clone());
+            Box::new(move || record_hints(&registry, &name)) as Resolve
+        };
+        let mut transcript = Self::new(resolve, log);
+        transcript.discover = Some(Box::new(move || {
+            discover(
+                &registry,
+                &name,
+                Path::new("/proc"),
+                &crate::harness::claude::config_roots(),
+                &expected,
+            )
+        }));
+        transcript.source = Some(source);
+        transcript
+    }
+
+    /// Discover the transcript with `discover` when `resolve` finds none.
+    #[cfg(test)]
+    fn with_discovery(mut self, discover: Discover, source: SharedReplySource) -> Self {
+        self.discover = Some(discover);
+        self.source = Some(source);
+        self
+    }
+
+    fn share(&self, source: ReplySource) {
+        if let Some(shared) = &self.source {
+            *shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(source);
+        }
     }
 
     fn report(&mut self, line: String) {
@@ -106,19 +200,41 @@ impl CoordinatorTranscript {
             return;
         }
         self.located_at = Some(Instant::now());
-        let found = (self.resolve)().and_then(|(harness, hints)| {
-            let reader = agent_harness::transcript(&harness)?;
-            Some((reader, reader.locate(&hints)?))
-        });
-        let Some((reader, found)) = found else {
+        let found = (self.resolve)()
+            .and_then(|(harness, hints)| {
+                let reader = agent_harness::transcript(&harness)?;
+                let located = reader.locate(&hints)?;
+                // Without a recorded conversation, Claude Code's file is found only through the
+                // live process that names it: a conversation the record lacks.
+                let bind = (hints.session.is_none() && harness == "claude")
+                    .then(|| session_of(&located.path))
+                    .flatten();
+                Some((reader, located, false, bind))
+            })
+            .or_else(|| {
+                let found = (self.discover.as_ref()?)()?;
+                let reader = agent_harness::transcript(&found.harness)?;
+                Some((reader, found.located, true, found.bind))
+            });
+        let Some((reader, found, discovered, bind)) = found else {
             self.follower = None;
-            self.report(
-                "agentctl: no transcript of the coordinator was found; replies keep the text read \
-                 from its screen"
+            let line = "agentctl: no transcript of the coordinator was found; replies keep the \
+                        text read from its screen";
+            self.share(ReplySource {
+                evidence: "no transcript of the coordinator was found: its record names no \
+                           conversation or process that finds one, and none was discovered"
                     .to_owned(),
-            );
+                ..ReplySource::default()
+            });
+            self.report(line.to_owned());
             return;
         };
+        self.share(ReplySource {
+            path: Some(found.path.clone()),
+            evidence: found.evidence.clone(),
+            discovered,
+            unbound_session: bind,
+        });
         if self
             .follower
             .as_ref()
@@ -132,10 +248,15 @@ impl CoordinatorTranscript {
             FIRST_READ_BYTES,
         ));
         self.report(format!(
-            "agentctl: reply text comes from the coordinator's {} transcript {} ({})",
+            "agentctl: reply text comes from the coordinator's {} transcript {} ({}{})",
             reader.name(),
             found.path.display(),
-            found.evidence
+            found.evidence,
+            if discovered {
+                "; discovered: the coordinator's record names no conversation that finds it"
+            } else {
+                ""
+            }
         ));
     }
 
@@ -232,17 +353,7 @@ fn record_hints(registry: &Path, name: &str) -> Option<(String, Hints)> {
         .join("agent.json");
     let record: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
     let harness = record["harness"].as_str()?.to_owned();
-    // A conversation id is recorded as a string, or as an object holding it under `value`.
-    let session = ["native_session", "session_value", "resume"]
-        .iter()
-        .find_map(|key| {
-            let value = &record[*key];
-            value
-                .as_str()
-                .or_else(|| value["value"].as_str())
-                .filter(|value| !value.is_empty())
-        })
-        .map(str::to_owned);
+    let session = record_hints_session(&record);
     let hints = Hints {
         pid: record
             .pointer("/harness_identity/pid")
@@ -253,6 +364,160 @@ fn record_hints(registry: &Path, name: &str) -> Option<(String, Hints)> {
         ..Hints::default()
     };
     Some((harness, hints))
+}
+
+/// The harness of agent `name` in `registry` and the conversation its record names, if any, for
+/// `chat health`; `None` when the record cannot be read.
+pub(crate) fn recorded_conversation(
+    registry: &Path,
+    name: &str,
+) -> Option<(String, Option<String>)> {
+    let path = agent_queue::registry::directory(registry, name)
+        .ok()?
+        .join("agent.json");
+    let record: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    Some((
+        record["harness"].as_str()?.to_owned(),
+        record_hints_session(&record),
+    ))
+}
+
+/// The conversation id of a Claude Code transcript: its file's stem.
+fn session_of(path: &Path) -> Option<String> {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty() && !stem.contains(['/', '\0']))
+        .map(str::to_owned)
+}
+
+/// The transcript of agent `name` in `registry` when its record finds none (#783
+/// chat-reply-capture-miss), looked for in two ways:
+///
+/// 1. through the processes in `proc_root` whose environment names the agent's Herdr pane
+///    (`HERDR_PANE_ID`), lowest process id first, located as the record's own process would be;
+/// 2. for Claude Code, as the newest of the [`DISCOVER_FILES`] most recently written transcripts
+///    of conversations begun in the agent's working directory under any of `claude_configs`
+///    (listed by the lister #741's revive discovery uses) whose last
+///    [`DISCOVER_TAIL_BYTES`] mention `CHAT_REPLY_<ID>>` for an ID `expected` gives: a request
+///    the bridge delivered to the agent and that has no reply yet.
+///
+/// Only the first, for a Claude Code record that names no conversation, offers the conversation
+/// for binding.
+fn discover(
+    registry: &Path,
+    name: &str,
+    proc_root: &Path,
+    claude_configs: &[PathBuf],
+    expected: &dyn Fn() -> Vec<String>,
+) -> Option<Discovered> {
+    let path = agent_queue::registry::directory(registry, name)
+        .ok()?
+        .join("agent.json");
+    let record: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    let harness = record["harness"].as_str()?.to_owned();
+    let reader = agent_harness::transcript(&harness)?;
+    let cwd = record["cwd"].as_str().map(PathBuf::from);
+    let names_session = record_hints_session(&record).is_some();
+    if let Some(pane) = record["pane_id"].as_str().filter(|pane| !pane.is_empty()) {
+        for pid in pane_processes(proc_root, pane) {
+            let hints = Hints {
+                pid: Some(pid),
+                cwd: cwd.clone(),
+                proc_root: proc_root.to_path_buf(),
+                ..Hints::default()
+            };
+            if let Some(mut located) = reader.locate(&hints) {
+                located.evidence = format!("{}, running in its pane {pane}", located.evidence);
+                let bind = (harness == "claude" && !names_session)
+                    .then(|| session_of(&located.path))
+                    .flatten();
+                return Some(Discovered {
+                    harness,
+                    located,
+                    bind,
+                });
+            }
+        }
+    }
+    if harness != "claude" {
+        return None;
+    }
+    let cwd = cwd?;
+    let expected = expected();
+    if expected.is_empty() {
+        return None;
+    }
+    let transcripts =
+        crate::harness::claude::project_transcripts(claude_configs, &cwd, &|stem: &str| {
+            !stem.is_empty() && !stem.contains(['/', '\0'])
+        });
+    for transcript in transcripts.into_iter().take(DISCOVER_FILES) {
+        let Some(tail) = tail_text(&transcript.path, DISCOVER_TAIL_BYTES) else {
+            continue;
+        };
+        if let Some(identifier) = expected
+            .iter()
+            .find(|identifier| tail.contains(&format!("CHAT_REPLY_{identifier}>")))
+        {
+            let evidence = format!(
+                "the newest transcript of a conversation begun in {} that mentions reply ID \
+                 {identifier} of a request delivered to the agent",
+                cwd.display()
+            );
+            return Some(Discovered {
+                harness,
+                located: Located {
+                    path: transcript.path,
+                    evidence,
+                },
+                bind: None,
+            });
+        }
+    }
+    None
+}
+
+/// The conversation id a record names: recorded as a string, or as an object holding it under
+/// `value`.
+fn record_hints_session(record: &serde_json::Value) -> Option<String> {
+    ["native_session", "session_value", "resume"]
+        .iter()
+        .find_map(|key| {
+            let value = &record[*key];
+            value
+                .as_str()
+                .or_else(|| value["value"].as_str())
+                .filter(|value| !value.is_empty())
+        })
+        .map(str::to_owned)
+}
+
+/// The processes in `proc_root` whose environment names the Herdr pane `pane`, lowest first.
+fn pane_processes(proc_root: &Path, pane: &str) -> Vec<u32> {
+    let Ok(entries) = std::fs::read_dir(proc_root) else {
+        return Vec::new();
+    };
+    let mut found: Vec<u32> = entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| {
+            crate::inbox::environment_value(proc_root, &pid.to_string(), "HERDR_PANE_ID")
+                .is_some_and(|value| value == pane)
+        })
+        .collect();
+    found.sort_unstable();
+    found
+}
+
+/// The last `bytes` of the file at `path`, as text.
+fn tail_text(path: &Path, bytes: u64) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let length = file.metadata().ok()?.len();
+    let from = length.saturating_sub(bytes);
+    file.seek(SeekFrom::Start(from)).ok()?;
+    let mut text = Vec::new();
+    file.take(length - from).read_to_end(&mut text).ok()?;
+    Some(String::from_utf8_lossy(&text).into_owned())
 }
 
 #[cfg(test)]
@@ -392,5 +657,185 @@ mod tests {
         assert_eq!(hints.session.as_deref(), Some("s-9"));
         assert_eq!(record_hints(&registry, "absent"), None);
         fs::remove_dir_all(registry).ok();
+    }
+
+    /// A registry holding agent `coord` with the record `record`.
+    fn registry_with(root: &Path, record: &serde_json::Value) -> PathBuf {
+        let registry = root.join("registry");
+        let directory = registry.join("agents/coord");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("agent.json"), record.to_string()).unwrap();
+        registry
+    }
+
+    #[test]
+    fn a_record_naming_no_conversation_is_discovered_through_the_process_in_its_pane() {
+        let root = scratch("discover-pane");
+        let home = root.join("home");
+        let proc_root = root.join("proc");
+        // Process 4242 runs in pane wX:p1 and names its conversation; 4100 runs in another pane.
+        for (pid, pane) in [(4242, "wX:p1"), (4100, "wX:p9")] {
+            fs::create_dir_all(proc_root.join(pid.to_string())).unwrap();
+            fs::write(
+                proc_root.join(format!("{pid}/environ")),
+                format!("HOME={}\0HERDR_PANE_ID={pane}\0", home.display()),
+            )
+            .unwrap();
+            fs::create_dir_all(home.join(".claude/sessions")).unwrap();
+            fs::write(
+                home.join(format!(".claude/sessions/{pid}.json")),
+                format!(r#"{{"sessionId":"s-{pid}","cwd":"/work"}}"#),
+            )
+            .unwrap();
+        }
+        let project = home.join(".claude/projects/-work");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("s-4242.jsonl"), "").unwrap();
+        fs::write(project.join("s-4100.jsonl"), "").unwrap();
+        let none = || Vec::new();
+
+        let registry = registry_with(
+            &root,
+            &serde_json::json!({"harness": "claude", "cwd": "/work", "pane_id": "wX:p1"}),
+        );
+        let found = discover(&registry, "coord", &proc_root, &[], &none).expect("discovered");
+        assert_eq!(found.located.path, project.join("s-4242.jsonl"));
+        assert!(
+            found.located.evidence.contains("running in its pane wX:p1"),
+            "{}",
+            found.located.evidence
+        );
+        assert_eq!(
+            found.bind.as_deref(),
+            Some("s-4242"),
+            "a live process: bind"
+        );
+
+        // A record that names a conversation already is read the same way, never rebound.
+        let registry = registry_with(
+            &root,
+            &serde_json::json!({"harness": "claude", "cwd": "/work", "pane_id": "wX:p1",
+                "native_session": {"agent": "claude", "value": "s-old"}}),
+        );
+        let found = discover(&registry, "coord", &proc_root, &[], &none).expect("discovered");
+        assert_eq!(found.bind, None);
+
+        // No process in the pane, and no reply ID to confirm a file by: nothing.
+        let registry = registry_with(
+            &root,
+            &serde_json::json!({"harness": "claude", "cwd": "/work", "pane_id": "wX:p5"}),
+        );
+        assert_eq!(
+            discover(
+                &registry,
+                "coord",
+                &proc_root,
+                &[home.join(".claude")],
+                &none
+            ),
+            None
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn discovery_by_content_needs_a_delivered_reply_id_and_never_binds() {
+        let root = scratch("discover-content");
+        let config = root.join("claude");
+        let project = config.join("projects/-work");
+        fs::create_dir_all(&project).unwrap();
+        let older = project.join("s-a.jsonl");
+        let newer = project.join("s-b.jsonl");
+        fs::write(
+            &older,
+            entry(
+                "<CHAT_REPLY_77>\nDone.\n</CHAT_REPLY_77>",
+                "2026-11-02T18:00:00Z",
+            ),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(&newer, entry("Another session.", "2026-11-02T18:00:01Z")).unwrap();
+        let registry = registry_with(
+            &root,
+            &serde_json::json!({"harness": "claude", "cwd": "/work", "pane_id": "wX:p1"}),
+        );
+        let proc_root = root.join("proc");
+        let configs = [root.join("absent"), config.clone()];
+
+        let found = discover(&registry, "coord", &proc_root, &configs, &|| {
+            vec!["5".to_owned(), "77".to_owned()]
+        })
+        .expect("confirmed by its content");
+        assert_eq!(found.located.path, older, "the newest file holding the ID");
+        assert!(found.located.evidence.contains("reply ID 77"));
+        assert_eq!(found.bind, None, "content alone never binds");
+        for expected in [vec![], vec!["7".to_owned()]] {
+            assert_eq!(
+                discover(&registry, "coord", &proc_root, &configs, &|| expected
+                    .clone()),
+                None,
+                "{expected:?}"
+            );
+        }
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn a_discovered_transcript_is_read_and_shared_as_discovered() {
+        let root = scratch("discover-read");
+        let path = root.join("s-live.jsonl");
+        fs::write(
+            &path,
+            entry(
+                "<CHAT_REPLY_031>\n| a | b |\n</CHAT_REPLY_031>",
+                "2026-11-02T18:00:20Z",
+            ),
+        )
+        .unwrap();
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&logs);
+        let shared: SharedReplySource = Arc::default();
+        let discovered = path.clone();
+        let mut source = CoordinatorTranscript::new(
+            Box::new(|| None),
+            Box::new(move |line| log.lock().unwrap().push(line)),
+        )
+        .with_discovery(
+            Box::new(move || {
+                Some(Discovered {
+                    harness: "claude".to_owned(),
+                    located: Located {
+                        path: discovered.clone(),
+                        evidence: "process 4242 names it".to_owned(),
+                    },
+                    bind: Some("s-live".to_owned()),
+                })
+            }),
+            Arc::clone(&shared),
+        );
+        let blocks = source.blocks();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].body, "| a | b |");
+        assert_eq!(
+            shared.lock().unwrap().clone(),
+            Some(ReplySource {
+                path: Some(path),
+                evidence: "process 4242 names it".to_owned(),
+                discovered: true,
+                unbound_session: Some("s-live".to_owned()),
+            })
+        );
+        assert!(logs.lock().unwrap()[0].contains("discovered"));
+
+        // Nothing found at all is shared too, with no path.
+        let shared: SharedReplySource = Arc::default();
+        let mut source = CoordinatorTranscript::new(Box::new(|| None), Box::new(|_| {}))
+            .with_discovery(Box::new(|| None), Arc::clone(&shared));
+        assert!(source.blocks().is_empty());
+        let none = shared.lock().unwrap().clone().expect("shared");
+        assert_eq!(none.path, None);
+        assert!(!none.discovered);
+        fs::remove_dir_all(root).ok();
     }
 }

@@ -484,6 +484,77 @@ fn read_transcript(lines: &[&[u8]], activity: &mut super::transcript::Activity) 
     activity.set_open_tools(open);
 }
 
+/// Where Claude Code may keep its configuration, and so its transcripts: `$CLAUDE_CONFIG_DIR`,
+/// then `~/.claude`.
+#[must_use]
+pub fn config_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(directory) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|value| !value.is_empty())
+    {
+        roots.push(PathBuf::from(directory));
+    }
+    if let Some(home) = super::home() {
+        roots.push(home.join(".claude"));
+    }
+    roots
+}
+
+/// One Claude Code transcript in a project directory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectTranscript {
+    /// Its conversation id: the file's stem.
+    pub session: String,
+    /// The file.
+    pub path: PathBuf,
+    /// When it was last written.
+    pub modified: std::time::SystemTime,
+}
+
+/// The Claude Code transcripts of conversations begun in `cwd`, under any of `roots`
+/// (`<root>/projects/<project>/<session>.jsonl`), newest first. Only files whose stem `valid`
+/// accepts as a conversation id are listed. A directory says nothing about which conversation
+/// is whose, so each caller confirms the one it wants by its content: session discovery for
+/// revive (#741 restore-native-sessions) by the working directory its head names, the chat
+/// bridge (#783 chat-reply-capture-miss) by a delivered reply ID its tail names.
+#[must_use]
+pub fn project_transcripts(
+    roots: &[PathBuf],
+    cwd: &std::path::Path,
+    valid: &dyn Fn(&str) -> bool,
+) -> Vec<ProjectTranscript> {
+    let project = agent_harness::claude::project_name(cwd);
+    let mut found = Vec::new();
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(root.join("projects").join(&project)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(session) = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .filter(|stem| valid(stem))
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            let Ok(modified) = entry.metadata().and_then(|metadata| metadata.modified()) else {
+                continue;
+            };
+            found.push(ProjectTranscript {
+                session,
+                path,
+                modified,
+            });
+        }
+    }
+    found.sort_by_key(|transcript| std::cmp::Reverse(transcript.modified));
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::transcript::{Activity, Hints, ToolLimit};

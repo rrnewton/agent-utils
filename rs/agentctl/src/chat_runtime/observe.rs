@@ -61,6 +61,11 @@ const PROVIDER_ALIVE_FILE: &str = "provider-alive";
 /// The marker file whose modification time is the owner loop's last round, and whose text is the
 /// stall bound it runs with, in whole seconds (`0`: no bound).
 const OWNER_LOOP_ALIVE_FILE: &str = "owner-loop-alive";
+/// Where the coordinator's reply text comes from, and the replies its transcript holds that the
+/// bridge never captured, as the owner loop last recorded them (#783 chat-reply-capture-miss).
+const REPLY_SOURCE_FILE: &str = "reply-source.json";
+/// The largest `reply-source.json` read.
+const MAX_REPLY_SOURCE_BYTES: u64 = 256 * 1024;
 
 fn modified_age(path: &Path, now_millis: u64) -> Option<u64> {
     let modified = fs::metadata(path)
@@ -259,6 +264,41 @@ impl BridgeState {
             .filter(|seconds| *seconds > 0)
             .map(Duration::from_secs);
         Some((age, bound))
+    }
+
+    /// Rewrite `reply-source.json` in the state directory with `document`: where the
+    /// coordinator's reply text comes from and the capture misses, which the owner loop records
+    /// when they change. Nothing is synced; a failure is ignored.
+    pub(crate) fn note_reply_source(&self, document: &Value) {
+        let path = self.root.join(REPLY_SOURCE_FILE);
+        let temporary = self.root.join(format!(".{REPLY_SOURCE_FILE}.tmp"));
+        let written = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&temporary)
+            .and_then(|mut file| {
+                use std::io::Write;
+                writeln!(file, "{document}")
+            })
+            .and_then(|()| fs::rename(&temporary, &path));
+        if written.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+    }
+
+    /// `reply-source.json`, when a service built with it recorded one and it parses.
+    #[must_use]
+    pub fn reply_source_record(&self) -> Option<Value> {
+        let file = fs::File::open(self.root.join(REPLY_SOURCE_FILE)).ok()?;
+        let mut text = String::new();
+        std::io::Read::read_to_string(
+            &mut std::io::Read::take(file, MAX_REPLY_SOURCE_BYTES),
+            &mut text,
+        )
+        .ok()?;
+        serde_json::from_str(&text).ok()
     }
 
     /// The process holding this state's runner lease, that is the running `chat run`, if any.

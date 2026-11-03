@@ -11512,6 +11512,50 @@ its drain would also type, so it was not queued",
         session_id: &str,
         goal_command: Option<&[String]>,
     ) -> Result<Value> {
+        let _lock = self.lock(agent_name)?;
+        let _identity_lock = self.identity_lock()?;
+        self.bind_session_locked(agent_name, session_id, goal_command)
+    }
+
+    /// [`Self::bind_session`] for a Claude Code conversation that the chat bridge found through
+    /// the live process in the agent's pane, for a record that names none (#783
+    /// chat-reply-capture-miss). The checks and the record written are `bind_session`'s; only
+    /// its locks are tried rather than waited for, since the bridge's owner loop must not wait
+    /// out a sender that holds them: a busy record is an error saying so, and the bridge tries
+    /// again at a later scan. `Ok(false)` when there is nothing to bind: the record is not a
+    /// running Claude Code agent's, or already names a conversation.
+    pub(crate) fn bind_discovered_session(
+        &self,
+        agent_name: &str,
+        session_id: &str,
+    ) -> Result<bool> {
+        let names_none = |record: &AgentRecord| {
+            record.harness == "claude"
+                && record.lifecycle == "running"
+                && record.native_session.is_none()
+                && record.session_value.is_none()
+                && record.goal_session_id.is_none()
+                && record.resume.is_none()
+        };
+        if !names_none(&self.load(agent_name)?) {
+            return Ok(false);
+        }
+        let _locks = self.try_record_locks(agent_name, "session bind")?;
+        if !names_none(&self.load(agent_name)?) {
+            return Ok(false);
+        }
+        self.bind_session_locked(agent_name, session_id, None)?;
+        Ok(true)
+    }
+
+    /// The body of [`Self::bind_session`], under the agent's lifecycle lock and the registry's
+    /// identity lock, which the caller holds.
+    fn bind_session_locked(
+        &self,
+        agent_name: &str,
+        session_id: &str,
+        goal_command: Option<&[String]>,
+    ) -> Result<Value> {
         if session_id.is_empty() || session_id.contains('\0') {
             return Err(fail(
                 "native session id must be nonempty and contain no NUL",
@@ -11525,8 +11569,6 @@ its drain would also type, so it was not queued",
         }) {
             return Err(fail("goal command must be a nonempty argument vector"));
         }
-        let _lock = self.lock(agent_name)?;
-        let _identity_lock = self.identity_lock()?;
         let mut record = self.load(agent_name)?;
         let info = self.checked(&record)?;
         let recovery_session = record

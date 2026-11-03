@@ -5645,6 +5645,8 @@ pub struct BridgeState {
     typed_retirements: Arc<std::sync::Mutex<VecDeque<(String, u64)>>>,
     // The coordinator's transcript, read for the clean text of its replies; also process-local.
     transcript_replies: Option<Arc<std::sync::Mutex<Box<dyn TranscriptReplies>>>>,
+    // Where that transcript reader last found the text, shared with it; also process-local.
+    reply_source: Option<crate::chat_transcript::SharedReplySource>,
     // Digests of the request keys and texts of transcript blocks a capture already settled,
     // stored or found already held, so later captures do not weigh them again.
     transcript_settled: Arc<std::sync::Mutex<BTreeSet<[u8; 32]>>>,
@@ -5782,6 +5784,7 @@ impl BridgeState {
             receipt_when_started: false,
             typed_retirements: Arc::default(),
             transcript_replies: None,
+            reply_source: None,
             transcript_settled: Arc::default(),
             #[cfg(test)]
             admission_fault_after: Arc::new(std::sync::Mutex::new(None)),
@@ -5883,6 +5886,7 @@ impl BridgeState {
             receipt_when_started: false,
             typed_retirements: Arc::default(),
             transcript_replies: None,
+            reply_source: None,
             transcript_settled: Arc::default(),
             #[cfg(test)]
             admission_fault_after: Arc::new(std::sync::Mutex::new(None)),
@@ -5970,8 +5974,30 @@ impl BridgeState {
         self
     }
 
+    /// Learn where the transcript reader finds the coordinator's reply text from `source`, which
+    /// the reader shares (#783 chat-reply-capture-miss).
+    #[must_use]
+    pub(crate) fn with_reply_source(
+        mut self,
+        source: crate::chat_transcript::SharedReplySource,
+    ) -> Self {
+        self.reply_source = Some(source);
+        self
+    }
+
+    /// Where the transcript reader last found the coordinator's reply text; `None` without a
+    /// reader, or before its first look.
+    pub(crate) fn reply_source(&self) -> Option<crate::chat_transcript::ReplySource> {
+        self.reply_source.as_ref().and_then(|source| {
+            source
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        })
+    }
+
     /// The transcript's complete reply blocks read up to now; none without a transcript.
-    fn transcript_blocks(&self) -> Vec<TranscriptBlock> {
+    pub(crate) fn transcript_blocks(&self) -> Vec<TranscriptBlock> {
         self.transcript_replies
             .as_ref()
             .map_or_else(Vec::new, |source| {
@@ -9671,6 +9697,14 @@ and running this, once per reply: {command}"
             shell_word(reply_id)?,
         );
         (neutral_capture_syntax(&command) == command).then_some(command)
+    }
+
+    /// The `chat reply` command that sends the reply to request `key`, whose reply ID is
+    /// `reply_id`, as its prompt would print it, or else the explicit one: a capture-miss notice
+    /// prints it (#783 chat-reply-capture-miss).
+    pub(crate) fn capture_miss_reply_command(&self, key: &str, reply_id: &str) -> Option<String> {
+        self.reply_command(env::current_exe(), key, reply_id)
+            .or_else(|| self.explicit_reply_command(key, reply_id))
     }
 
     /// The explicit `chat reply` command, whatever [`PromptCommands`] says: `chat help` prints it

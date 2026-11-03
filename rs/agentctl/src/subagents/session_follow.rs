@@ -25,51 +25,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         if session_matches(&initial, &info) {
             return Ok(false);
         }
-        // Observers never wait behind a sender or identity writer.
-        let location = agent_queue::registry::locate(&self.registry, agent_name)
-            .map_err(|error| fail(error.to_string()))?;
-        let (lock_path, _) =
-            agent_queue::registry::lock_paths(&self.registry, agent_name, location);
-        let lock = agent::open_private_lock(&lock_path, "agent lifecycle lock")?;
-        lock.try_lock_exclusive()
-            .map_err(|_| fail("session follow deferred: lifecycle busy"))?;
-        // A layout-1 agent is also locked where layout 2 locks it, as every new build does.
-        let _current = if location == agent_queue::registry::Location::Legacy {
-            let (current_path, _) = agent_queue::registry::lock_paths(
-                &self.registry,
-                agent_name,
-                agent_queue::registry::Location::Current,
-            );
-            agent::create_private_directory(
-                &agent_queue::registry::locks_directory(&self.registry),
-                "agent lock collection",
-                false,
-                true,
-            )?;
-            let current = agent::open_private_lock(&current_path, "agent lifecycle lock")?;
-            current
-                .try_lock_exclusive()
-                .map_err(|_| fail("session follow deferred: lifecycle busy"))?;
-            Some(current)
-        } else {
-            None
-        };
-        if !crate::registry_layout::lock_still_current(
-            &self.registry,
-            agent_name,
-            location,
-            &lock,
-            &lock_path,
-        )? {
-            return Err(fail(
-                "session follow deferred: the agent moved between registry layouts",
-            ));
-        }
-        let identity =
-            agent::open_private_lock(&self.registry.join(".identity.lock"), "agent identity lock")?;
-        identity
-            .try_lock_exclusive()
-            .map_err(|_| fail("session follow deferred: identity busy"))?;
+        let _locks = self.try_record_locks(agent_name, "session follow")?;
         let mut record = self.load(agent_name)?;
         if record.token != initial.token || record != initial {
             return Err(fail("session follow deferred: record changed"));
@@ -128,5 +84,60 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         )?;
         self.save(&record)?;
         Ok(true)
+    }
+
+    /// The agent's lifecycle lock (in both layouts for a layout-1 agent, as every new build
+    /// locks it) and the registry's identity lock, taken without waiting: an observer never
+    /// waits behind a sender or an identity writer. `what` names the caller in a refusal.
+    pub(super) fn try_record_locks(
+        &self,
+        agent_name: &str,
+        what: &str,
+    ) -> Result<Vec<std::fs::File>> {
+        let location = agent_queue::registry::locate(&self.registry, agent_name)
+            .map_err(|error| fail(error.to_string()))?;
+        let (lock_path, _) =
+            agent_queue::registry::lock_paths(&self.registry, agent_name, location);
+        let lock = agent::open_private_lock(&lock_path, "agent lifecycle lock")?;
+        lock.try_lock_exclusive()
+            .map_err(|_| fail(format!("{what} deferred: lifecycle busy")))?;
+        let mut locks = Vec::new();
+        if location == agent_queue::registry::Location::Legacy {
+            let (current_path, _) = agent_queue::registry::lock_paths(
+                &self.registry,
+                agent_name,
+                agent_queue::registry::Location::Current,
+            );
+            agent::create_private_directory(
+                &agent_queue::registry::locks_directory(&self.registry),
+                "agent lock collection",
+                false,
+                true,
+            )?;
+            let current = agent::open_private_lock(&current_path, "agent lifecycle lock")?;
+            current
+                .try_lock_exclusive()
+                .map_err(|_| fail(format!("{what} deferred: lifecycle busy")))?;
+            locks.push(current);
+        }
+        if !crate::registry_layout::lock_still_current(
+            &self.registry,
+            agent_name,
+            location,
+            &lock,
+            &lock_path,
+        )? {
+            return Err(fail(format!(
+                "{what} deferred: the agent moved between registry layouts"
+            )));
+        }
+        locks.push(lock);
+        let identity =
+            agent::open_private_lock(&self.registry.join(".identity.lock"), "agent identity lock")?;
+        identity
+            .try_lock_exclusive()
+            .map_err(|_| fail(format!("{what} deferred: identity busy")))?;
+        locks.push(identity);
+        Ok(locks)
     }
 }

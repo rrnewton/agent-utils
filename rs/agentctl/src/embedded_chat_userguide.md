@@ -841,6 +841,27 @@ keeps the text read from the screen, and replies are told apart as they always
 are. Screen reads decide everything else: delivery, readiness, forms and
 feedback.
 
+A record that names no conversation, and no process that finds one (as an
+adopted coordinator's can), does not leave the bridge on screen text alone. The
+transcript is then discovered: first through the harness process whose
+environment names the coordinator's Herdr pane, then, for Claude Code, as the
+newest of the 8 most recently written transcripts in the coordinator's project
+directory whose last 8 MiB mention the reply ID of a request delivered to it
+and not answered. A Claude Code conversation found through a live process is
+bound into a record that names none, exactly as `bind-session` binds one and
+with its checks (a conversation another record holds or another live pane
+reports is refused), at the next scan that finds the record's locks free: the
+bridge never waits for them. A transcript found only by its content is read but never
+bound. At each scan the bridge also looks for capture misses: a request
+delivered and not answered whose reply block the transcript has held for 2
+minutes or more. Each is logged as `CAPTURE MISS`, posted to the channel once
+as a `[chat-bridge WARNING]`, and told once to the coordinator, as a reply
+reminder is typed (only while it is ready, never behind another prompt), with
+the `chat reply` command that sends the reply; a notice it was not given is
+tried again at most every minute while the miss lasts. The bridge records where
+reply text comes from, and the current misses, in `reply-source.json` in its
+state directory.
+
 A reply printed between its two marker lines reaches the user only if the
 service reads it from the agent's screen, and a terminal agent can redraw or
 clear its screen before that read. With `chat run --offer-reply-command`, an
@@ -3072,8 +3093,11 @@ for `--stale-after` (default 5 minutes; the Slack provider sends a heartbeat
 every 30 seconds while idle), the subscription or send path is down, the owner
 loop is failing, requests are stalled untyped or have uncertain delivery, a
 reply was retried 20 or more times or will never be sent, a captured reply is
-still unsent after 10 minutes, the reply breaker holds a thread back, or a
-repoint is not applied yet. Each uncertain request is listed with its reason,
+still unsent after 10 minutes, the reply breaker holds a thread back, a
+repoint is not applied yet, the target's record names no native session and its
+transcript was discovered or not found at all (the line names the transcript
+read, or says replies come only from the screen, and how the conversation gets
+bound), or the target's transcript holds reply blocks the bridge never captured. Each uncertain request is listed with its reason,
 and each retry loop with its attempt count and last failure code. The running
 service touches `provider-alive` in the state directory, at most every 5
 seconds, whenever its provider subscription delivers anything; a service built

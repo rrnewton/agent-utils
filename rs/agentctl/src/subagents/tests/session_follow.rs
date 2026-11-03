@@ -128,3 +128,65 @@ fn session_follow_validates_launch_metadata_before_changing_queue_binding() {
     );
     assert!(fixture.client.runs.lock().unwrap().is_empty());
 }
+
+/// #783 chat-reply-capture-miss: the chat bridge binds a Claude Code conversation that a live
+/// process names into a record that names none, never waiting for a busy record and never
+/// replacing a conversation a record names.
+#[test]
+fn a_discovered_conversation_is_bound_only_into_a_free_record_that_names_none() {
+    let fixture = Fixture::new();
+    fixture
+        .client
+        .report_session
+        .store(false, Ordering::Relaxed);
+    fixture.adopt();
+    let manager = fixture.manager();
+    let mut record = manager.read_record("foreign").unwrap();
+    record.harness = "claude".into();
+    record.session_agent = None;
+    record.session_value = None;
+    record.native_session = None;
+    manager.save(&record).unwrap();
+    let bytes = fs::read(fixture.root.join("registry/agents/foreign/agent.json")).unwrap();
+    {
+        let _busy = manager.lock("foreign").unwrap();
+        let error = manager
+            .bind_discovered_session("foreign", "s-live")
+            .unwrap_err();
+        assert!(error.to_string().contains("lifecycle busy"), "{error}");
+    }
+    assert_eq!(
+        fs::read(fixture.root.join("registry/agents/foreign/agent.json")).unwrap(),
+        bytes
+    );
+    assert!(manager
+        .bind_discovered_session("foreign", "bad\0id")
+        .is_err());
+    assert!(manager
+        .bind_discovered_session("foreign", "s-live")
+        .unwrap());
+    let native = manager
+        .read_record("foreign")
+        .unwrap()
+        .native_session
+        .unwrap();
+    assert_eq!(native.value, "s-live");
+    assert_eq!(
+        native.source, "asserted",
+        "recorded as bind-session records it"
+    );
+    assert!(!manager
+        .bind_discovered_session("foreign", "s-other")
+        .unwrap());
+    assert_eq!(
+        manager
+            .read_record("foreign")
+            .unwrap()
+            .native_session
+            .unwrap()
+            .value,
+        "s-live"
+    );
+    assert!(fixture.client.runs.lock().unwrap().is_empty());
+    assert!(fixture.client.keys_sent.lock().unwrap().is_empty());
+}

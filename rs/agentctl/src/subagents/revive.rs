@@ -21,18 +21,7 @@ fn claude_config_roots() -> Vec<PathBuf> {
         .with(|roots| roots.borrow().clone())
         .unwrap_or_default();
     #[cfg(not(test))]
-    let mut roots = Vec::new();
-    #[cfg(not(test))]
-    if let Some(directory) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|value| !value.is_empty())
-    {
-        roots.push(PathBuf::from(directory));
-    }
-    #[cfg(not(test))]
-    if let Some(home) = crate::harness::home() {
-        roots.push(home.join(".claude"));
-    }
-    #[cfg(not(test))]
-    roots
+    crate::harness::claude::config_roots()
 }
 
 /// Whether a Claude Code transcript of `session` begun in `cwd` exists under any of `roots`:
@@ -76,45 +65,14 @@ pub(super) fn discover_claude_session(
     if record.harness != "claude" {
         return None;
     }
-    let encoded: String = record
-        .cwd
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    let mut best: Option<(std::time::SystemTime, String)> = None;
-    for root in roots {
-        let dir = root.join("projects").join(&encoded);
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            if !valid_metadata_text(stem) {
-                continue;
-            }
-            let Ok(head) = fs::read(&path)
-                .map(|b| String::from_utf8_lossy(&b[..b.len().min(65536)]).into_owned())
-            else {
-                continue;
-            };
-            if !head.contains(&record.cwd) {
-                continue;
-            }
-            let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) else {
-                continue;
-            };
-            if best.as_ref().is_none_or(|(t, _)| mtime > *t) {
-                best = Some((mtime, stem.to_owned()));
-            }
-        }
-    }
-    best.map(|(_, value)| NativeSession::new("claude", &value, "observed"))
+    crate::harness::claude::project_transcripts(roots, Path::new(&record.cwd), &valid_metadata_text)
+        .into_iter()
+        .find(|transcript| {
+            fs::read(&transcript.path).is_ok_and(|bytes| {
+                String::from_utf8_lossy(&bytes[..bytes.len().min(65536)]).contains(&record.cwd)
+            })
+        })
+        .map(|transcript| NativeSession::new("claude", &transcript.session, "observed"))
 }
 
 /// Discover a Codex session for `record` (#741): newest `rollout-*-<thread>.jsonl` under

@@ -337,6 +337,10 @@ struct Observed {
     stranded_sinks: Option<String>,
     /// [`choose_registry`].
     registry: RegistryChoice,
+    /// The target's harness and the conversation its record names, when its record is readable.
+    binding: Option<(String, Option<String>)>,
+    /// `reply-source.json`: where reply text comes from, and the capture misses.
+    reply_source: Option<Value>,
     now: u64,
 }
 
@@ -364,6 +368,11 @@ pub fn health<A: ManagedApi + ?Sized>(
         unsent: state.unsent_replies()?,
         stranded_sinks: stranded_sink_config(state_root).map(|path| path.display().to_string()),
         configuration: state.config().clone(),
+        binding: crate::chat_transcript::recorded_conversation(
+            &registry.probe,
+            &state.config().agent_name,
+        ),
+        reply_source: state.reply_source_record(),
         registry,
         now,
     };
@@ -386,6 +395,8 @@ fn assess(observed: Observed, options: HealthOptions) -> Health {
         unsent,
         stranded_sinks,
         registry,
+        binding,
+        reply_source,
         now,
     } = observed;
     let configuration = &configuration;
@@ -464,6 +475,67 @@ fn assess(observed: Observed, options: HealthOptions) -> Health {
             "event sinks are configured in the older state {old} but not in this state, so \
              posts are not pushed to them; carry them over with `chat init --from` on the old \
              state directory, or copy its event-sinks.json and token files here"
+        ));
+    }
+
+    // A coordinator whose record names no conversation may have its transcript found only by
+    // discovery, or not at all, which leaves reply text to its screen (#783
+    // chat-reply-capture-miss).
+    let headless = target["headless"].as_bool() == Some(true);
+    let source = reply_source.as_ref().map(|record| &record["source"]);
+    let binding_line = match (&binding, headless) {
+        (Some((harness, None)), false) if agent_harness::transcript(harness).is_some() => {
+            let agent = &configuration.agent_name;
+            let found_by_record = source.is_some_and(|source| {
+                !source["path"].is_null() && source["discovered"] != Value::Bool(true)
+            });
+            let reading = match source {
+                None => "the running service records no reply source, so its transcript may not \
+                         be found and reply text may come only from its screen"
+                    .to_owned(),
+                Some(source) if source["path"].is_null() => {
+                    "no transcript of it was found, so reply text comes only from its screen"
+                        .to_owned()
+                }
+                Some(source) => format!(
+                    "the bridge reads its transcript {} ({})",
+                    source["path"].as_str().unwrap_or("?"),
+                    source["evidence"].as_str().unwrap_or("?")
+                ),
+            };
+            let remedy = match source.and_then(|source| source["unbound_session"].as_str()) {
+                Some(session) => format!(
+                    "; the bridge binds conversation {session}, which a live process names, \
+                     once the record's locks are free"
+                ),
+                None => format!("; bind it with `agentctl bind-session {agent} SESSION_ID`"),
+            };
+            let line = format!("target {agent} has no native session binding: {reading}{remedy}");
+            if !found_by_record {
+                problems.degraded.push(line.clone());
+            }
+            Some(line)
+        }
+        _ => None,
+    };
+    let misses: Vec<&Value> = reply_source
+        .as_ref()
+        .and_then(|record| record["capture_misses"].as_array())
+        .map(|misses| misses.iter().collect())
+        .unwrap_or_default();
+    if runner.is_some() && !misses.is_empty() {
+        problems.degraded.push(format!(
+            "{} reply block(s) in {}'s transcript were never captured (reply ID {}); the owner \
+             and {} were warned",
+            misses.len(),
+            configuration.agent_name,
+            misses
+                .iter()
+                .take(MAX_LISTED)
+                .map(|miss| miss["reply_id"].as_str().unwrap_or("?"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            configuration.agent_name
         ));
     }
 
@@ -693,6 +765,27 @@ fn assess(observed: Observed, options: HealthOptions) -> Health {
             ": NOT ALIVE"
         }
     );
+    if let Some(line) = &binding_line {
+        let _ = writeln!(text, "{line}");
+    }
+    if let Some(source) = source {
+        let _ = writeln!(
+            text,
+            "reply text: {}",
+            match source["path"].as_str() {
+                Some(path) => format!(
+                    "transcript {path} ({}){}",
+                    source["evidence"].as_str().unwrap_or("?"),
+                    if source["discovered"] == Value::Bool(true) {
+                        ", discovered"
+                    } else {
+                        ""
+                    }
+                ),
+                None => "the screen only: no transcript was found".to_owned(),
+            }
+        );
+    }
     let _ = writeln!(text, "last admitted: {}", when(last_admitted, now));
     let _ = writeln!(text, "last delivered: {}", when(last_delivered, now));
     let _ = writeln!(text, "last reply sent: {}", when(last_replied, now));
@@ -790,6 +883,11 @@ fn assess(observed: Observed, options: HealthOptions) -> Health {
         "service_health": status["service_health"],
         "repoint": status["repoint"],
         "registry": registry.document,
+        "binding": binding.as_ref().map(|(harness, session)| json!({
+            "harness": harness,
+            "native_session": session,
+        })),
+        "reply_source": reply_source,
     });
     Health {
         verdict,
@@ -849,6 +947,8 @@ mod tests {
             unsent: Vec::new(),
             stranded_sinks: None,
             registry: choose_registry(Path::new("/registry"), None),
+            binding: Some(("claude".to_owned(), Some("s-1".to_owned()))),
+            reply_source: None,
             now: NOW,
         }
     }
@@ -894,6 +994,91 @@ mod tests {
             health.document["event_sinks"]["stranded_config"],
             "/state/coord.old-gap-20261102/event-sinks.json"
         );
+    }
+
+    #[test]
+    fn a_target_without_a_session_binding_or_with_uncaptured_replies_is_degraded() {
+        let unbound = |source: Option<Value>| Observed {
+            binding: Some(("claude".to_owned(), None)),
+            reply_source: source.map(|source| json!({"source": source, "capture_misses": []})),
+            ..healthy()
+        };
+        // No reply source recorded (an older service): it may read only the screen.
+        let health = assess(unbound(None), options());
+        assert_eq!(health.verdict, "degraded", "{}", health.text);
+        assert!(
+            health
+                .text
+                .contains("target coord has no native session binding"),
+            "{}",
+            health.text
+        );
+        assert!(health
+            .text
+            .contains("agentctl bind-session coord SESSION_ID"));
+        // Nothing found: the screen only.
+        let health = assess(
+            unbound(Some(
+                json!({"path": null, "evidence": "none", "discovered": false}),
+            )),
+            options(),
+        );
+        assert_eq!(health.verdict, "degraded", "{}", health.text);
+        assert!(health
+            .text
+            .contains("reply text comes only from its screen"));
+        assert!(health.text.contains("reply text: the screen only"));
+        // Discovered through a live process: read, and about to be bound.
+        let health = assess(
+            unbound(Some(
+                json!({"path": "/t/s-live.jsonl", "evidence": "process 7 names it",
+                "discovered": true, "unbound_session": "s-live"}),
+            )),
+            options(),
+        );
+        assert_eq!(health.verdict, "degraded", "{}", health.text);
+        assert!(
+            health.text.contains("the bridge binds conversation s-live"),
+            "{}",
+            health.text
+        );
+        assert_eq!(health.document["binding"]["native_session"], Value::Null);
+        // Found through the record's own process: said, but no problem.
+        let health = assess(
+            unbound(Some(
+                json!({"path": "/t/s-1.jsonl", "evidence": "process 7 names it",
+                "discovered": false}),
+            )),
+            options(),
+        );
+        assert_eq!(health.verdict, "ok", "{}", health.text);
+        assert!(health.text.contains("has no native session binding"));
+        // A headless target has no transcript reader: nothing to say.
+        let mut headless = unbound(None);
+        headless.target.0 =
+            json!({"agent": "coord", "headless": true, "status": "idle", "alive": true});
+        assert_eq!(assess(headless, options()).verdict, "ok");
+
+        // A reply block the bridge never captured.
+        let health = assess(
+            Observed {
+                reply_source: Some(json!({
+                    "source": {"path": "/t/s-1.jsonl", "evidence": "e", "discovered": false},
+                    "capture_misses": [{"key": "a", "reply_id": "31", "block_at_millis": NOW}],
+                })),
+                ..healthy()
+            },
+            options(),
+        );
+        assert_eq!(health.verdict, "degraded", "{}", health.text);
+        assert!(
+            health.text.contains("never captured (reply ID 31)"),
+            "{}",
+            health.text
+        );
+        assert!(health
+            .text
+            .contains("reply text: transcript /t/s-1.jsonl (e)"));
     }
 
     #[test]

@@ -49,6 +49,7 @@ pub mod owner_alarm;
 #[cfg(test)]
 mod rejection_tests;
 mod reply_reminders;
+mod reply_source;
 mod repoint;
 mod sender_grants;
 
@@ -1172,13 +1173,30 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
         state
     } else {
         let agent = state.config().agent_name.clone();
-        state.with_transcript_replies(Box::new(
-            crate::chat_transcript::CoordinatorTranscript::for_agent(
-                manager.registry().to_owned(),
-                agent,
-                Box::new(service_log),
-            ),
-        ))
+        let records = state.clone();
+        let source = crate::chat_transcript::SharedReplySource::default();
+        state
+            .with_transcript_replies(Box::new(
+                crate::chat_transcript::CoordinatorTranscript::for_agent(
+                    manager.registry().to_owned(),
+                    agent,
+                    Box::new(service_log),
+                    Box::new(move || {
+                        records
+                            .reply_reminder_candidates()
+                            .map(|found| {
+                                found
+                                    .candidates
+                                    .into_iter()
+                                    .map(|candidate| candidate.reply_id)
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    }),
+                    source.clone(),
+                ),
+            ))
+            .with_reply_source(source)
     };
     let _resume_request = state.subscribe_request()?;
     validate_service_outbound(state.config())?;
@@ -4681,6 +4699,8 @@ fn run_owner_loop_with_health<A: ManagedApi + ?Sized>(
     // Kept across passes, so a pass restarted after a transient failure neither posts the
     // alarm again at once nor forgets a quarantine it has not told (#720).
     let mut owner_alarm = options.owner_alarm_after.map(owner_alarm::OwnerAlarm::new);
+    // Kept across passes too, so a capture miss is told once (#783 chat-reply-capture-miss).
+    let mut reply_watch = reply_source::ReplySourceWatch::default();
     let mut reminders = reminders;
     let mut health = health;
     let mut backoff = ProviderBackoff::new();
@@ -4734,6 +4754,7 @@ fn run_owner_loop_with_health<A: ManagedApi + ?Sized>(
                 transport,
                 &mut stale_composer,
                 &mut owner_alarm,
+                &mut reply_watch,
                 &mut reminders,
                 &mut health,
             ),
@@ -5207,6 +5228,7 @@ fn owner_loop<A: ManagedApi + ?Sized>(
     // Kept across passes, so a pass restarted after a transient failure neither posts the
     // alarm again at once nor forgets a quarantine it has not told (#720).
     let mut owner_alarm = options.owner_alarm_after.map(owner_alarm::OwnerAlarm::new);
+    let mut reply_watch = reply_source::ReplySourceWatch::default();
     let mut reminders = reminders;
     let mut health = ServiceHealth::new(manager.registry());
     owner_loop_pass(
@@ -5223,6 +5245,7 @@ fn owner_loop<A: ManagedApi + ?Sized>(
         transport,
         &mut stale_composer,
         &mut owner_alarm,
+        &mut reply_watch,
         &mut reminders,
         &mut health,
     )
@@ -5245,6 +5268,7 @@ fn owner_loop_pass<A: ManagedApi + ?Sized>(
     transport: &mut Option<CommandOutboundTransport>,
     stale_composer: &mut Option<StaleComposerRun>,
     owner_alarm: &mut Option<owner_alarm::OwnerAlarm>,
+    reply_watch: &mut reply_source::ReplySourceWatch,
     reminders: &mut Option<ReplyReminders>,
     health: &mut ServiceHealth,
 ) -> Result<(), ChatServiceError> {
@@ -5554,6 +5578,13 @@ fn owner_loop_pass<A: ManagedApi + ?Sized>(
                 state,
                 outbound(control.transport),
                 herdr_idle,
+            );
+            reply_watch.step(
+                state,
+                manager,
+                stop,
+                options.delivery,
+                outbound(control.transport),
             );
         }
         if let Some(run) = stale_composer.as_mut().filter(|_| scanned) {
@@ -6452,16 +6483,29 @@ fn owner_alarm_step(
         chat_runtime::unix_millis(),
         herdr_idle,
     );
+    post_owner_notices(notices, state, transport, "owner alarm");
+}
+
+/// Post `notices` to the bridge's first channel as top-level messages, each logged under `label`.
+/// A notice that cannot be posted, for want of an outbound helper, a channel or a working post,
+/// is logged instead.
+fn post_owner_notices(
+    notices: Vec<String>,
+    state: &BridgeState,
+    transport: Option<&mut dyn RootMessageTransport>,
+    label: &str,
+) {
     if notices.is_empty() {
         return;
     }
+    let configuration = state.config();
     let channel = configuration.channel_ids.first();
     let (Some(transport), Some(channel), true) =
         (transport, channel, configuration.outbound_enabled)
     else {
         for notice in &notices {
             service_log(format_args!(
-                "agentctl: owner alarm not posted (the bridge has no outbound helper or channel): {notice}"
+                "agentctl: {label} not posted (the bridge has no outbound helper or channel): {notice}"
             ));
         }
         return;
@@ -6471,7 +6515,7 @@ fn owner_alarm_step(
             Ok(id) => id,
             Err(error) => {
                 service_log(format_args!(
-                    "agentctl: owner alarm not posted: {error}: {notice}"
+                    "agentctl: {label} not posted: {error}: {notice}"
                 ));
                 continue;
             }
@@ -6482,18 +6526,16 @@ fn owner_alarm_step(
             request_id: &request_id,
         };
         if let Err(error) = chat_runtime::validate_root_message_submission(&submission) {
-            service_log(format_args!(
-                "agentctl: owner alarm refused: {error}: {notice}"
-            ));
+            service_log(format_args!("agentctl: {label} refused: {error}: {notice}"));
             continue;
         }
         match transport.publish_root(submission) {
             Ok(message) => service_log(format_args!(
-                "agentctl: owner alarm posted to {channel} as {message}: {notice}"
+                "agentctl: {label} posted to {channel} as {message}: {notice}"
             )),
             Err(error) => {
                 service_log(format_args!(
-                    "agentctl: owner alarm not posted: {error}: {notice}"
+                    "agentctl: {label} not posted: {error}: {notice}"
                 ));
             }
         }
@@ -15010,6 +15052,77 @@ esac
                 .push((submission.channel_id.to_owned(), submission.body.to_owned()));
             Ok(format!("spaces/example/messages/post-{}", self.posts.len()))
         }
+    }
+
+    /// A transcript reader for a test: fixed blocks.
+    #[derive(Debug)]
+    struct HeldBlocks(Vec<chat_runtime::TranscriptBlock>);
+
+    impl chat_runtime::TranscriptReplies for HeldBlocks {
+        fn blocks(&mut self) -> Vec<chat_runtime::TranscriptBlock> {
+            self.0.clone()
+        }
+
+        fn settle(&mut self, _identifiers: &[String]) {}
+    }
+
+    /// #783 chat-reply-capture-miss: a reply block the coordinator's transcript holds while the
+    /// bridge holds no reply to its request warns the owner once, and is recorded, with where
+    /// the reply text comes from, for `chat health`.
+    #[test]
+    fn a_reply_block_the_bridge_never_captured_warns_the_owner_once() {
+        let fixture = crate::subagents::tests::Fixture::new();
+        let (state, key, root) = state_with_request();
+        state
+            .put_delivery_phase(&key, RequestPhase::Delivered, None)
+            .expect("delivered");
+        let candidate = state
+            .reply_reminder_candidates()
+            .expect("candidates")
+            .candidates
+            .remove(0);
+        let source = crate::chat_transcript::SharedReplySource::default();
+        *source.lock().unwrap() = Some(crate::chat_transcript::ReplySource {
+            path: Some("/t/s-1.jsonl".into()),
+            evidence: "process 7 names it".into(),
+            discovered: true,
+            unbound_session: None,
+        });
+        let state = state
+            .with_transcript_replies(Box::new(HeldBlocks(vec![chat_runtime::TranscriptBlock {
+                identifier: candidate.reply_id.clone(),
+                body: "| a | b |".into(),
+                at_millis: Some(candidate.delivered_at_millis),
+            }])))
+            .with_reply_source(source);
+        let stop = StopState::default();
+        let manager = fixture.manager();
+        let delivery = DrainOptions {
+            ready_timeout: Duration::ZERO,
+            ..DrainOptions::default()
+        };
+        let mut watch = reply_source::ReplySourceWatch::with_grace(Duration::ZERO);
+        let mut roots = RecordingRoots::default();
+        watch.step(&state, &manager, &stop, delivery, Some(&mut roots));
+        assert_eq!(roots.posts.len(), 1, "{:?}", roots.posts);
+        assert!(roots.posts[0].1.starts_with("[chat-bridge WARNING]"));
+        assert!(
+            roots.posts[0]
+                .1
+                .contains(&format!("reply ID {}", candidate.reply_id)),
+            "{}",
+            roots.posts[0].1
+        );
+        let record = state.reply_source_record().expect("recorded");
+        assert_eq!(
+            record["capture_misses"][0]["reply_id"],
+            candidate.reply_id.as_str()
+        );
+        assert_eq!(record["source"]["discovered"], true);
+        // Told once, however many scans see it.
+        watch.step(&state, &manager, &stop, delivery, Some(&mut roots));
+        assert_eq!(roots.posts.len(), 1, "{:?}", roots.posts);
+        fs::remove_dir_all(root).ok();
     }
 
     /// #720 agentctl-muse-stale-draft: a request left waiting raises the owner alarm in the
