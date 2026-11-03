@@ -146,7 +146,9 @@
  * It WRAPS. The list is meant to grow — custom prompts are the next thing — and a row of icons
  * that scrolled sideways would have the reachability problem the bar has, in a smaller box.
  */
-#prompts-tray {
+/* `#820 voice-page-action-menu`. The channel's action menu hangs where the tray does, and looks as it does. */
+#prompts-tray,
+#action-menu {
   position: absolute;
   left: 0;
   right: 0;
@@ -163,11 +165,13 @@
   box-shadow: 0 0.4rem 1.2rem rgb(0 0 0 / 35%);
 }
 
-#control-bar[data-placement="bottom"] #prompts-tray {
+#control-bar[data-placement="bottom"] #prompts-tray,
+#control-bar[data-placement="bottom"] #action-menu {
   bottom: calc(100% + 0.35rem);
 }
 
-#control-bar[data-placement="top"] #prompts-tray {
+#control-bar[data-placement="top"] #prompts-tray,
+#control-bar[data-placement="top"] #action-menu {
   top: calc(100% + 0.35rem);
 }
 
@@ -295,3 +299,16 @@ textarea {
   resize: vertical;
 }
 
+#action-menu[hidden] {
+  display: none;
+}
+
+/* A pressed item says so, as Summaries' chip did: the mode is on. */
+#action-menu .tray-button[aria-pressed="true"] {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+#action-menu-empty {
+  margin: 0.3rem 0.4rem;
+}

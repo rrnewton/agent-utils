@@ -53,7 +53,11 @@ FOCUS_JS = """() => {
 
 BLUR_JS = "() => { if (document.activeElement) document.activeElement.blur(); }"
 
-SHOW_CHIPS_JS = "() => { for (const id of ['jump-newest', 'side-jump-newest']) document.getElementById(id).hidden = false; }"
+# Each list scrolled up from its foot, which puts up its jump to the newest message. `#820 voice-page-action-menu`:
+# forced up by its `hidden` alone, the jump was put away again by the page as soon as the chip row changed
+# height, which it did once Expand all and Summaries no longer stood in it.
+SHOW_CHIPS_JS = "() => { for (const id of ['scroll-area', 'side-scroll']) document.getElementById(id).scrollTop = 0; }"
+CHIPS_SHOWN_JS = "() => ['jump-newest', 'side-jump-newest'].every((id) => !document.getElementById(id).hidden)"
 
 
 def focus(walk: Walk) -> str:
@@ -124,10 +128,12 @@ def thread_open(walk: Walk) -> None:
     # A column's chips are outside its scroller and still that column's: each chip's box, whichever
     # column holds the selection. Shown as when each list is scrolled up; a hidden chip takes no focus.
     page.evaluate(SHOW_CHIPS_JS)
+    page.wait_for_function(CHIPS_SHOWN_JS, timeout=5_000)
     page.focus("#jump-newest")
     chord(walk, "on the left column's chip, the selection on the right", "channel-compose-text")
     select_row(walk, FIRST_ROW)
     page.evaluate(SHOW_CHIPS_JS)
+    page.wait_for_function(CHIPS_SHOWN_JS, timeout=5_000)
     page.focus("#side-jump-newest")
     chord(walk, "on the right column's chip, the selection on the left", "side-compose-text")
     walk.notes.append("with a thread open on the right, Ctrl+S went to the right column's box from its selected "

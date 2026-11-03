@@ -427,7 +427,7 @@ STATE_JS = """(id) => {
     height: area.clientHeight,
     focus: held ? (held.id || held.tagName.toLowerCase() + (held.dataset && held.dataset.id ? '#' + held.dataset.id : '')) : null,
     screen: screens.find((name) => !document.getElementById('screen-' + name).hidden) || null,
-    view: document.getElementById('view-switch').getAttribute('aria-checked') === 'true' ? 'discord' : 'voice',
+    view: document.getElementById('view-switch').getAttribute('aria-pressed') === 'true' ? 'discord' : 'voice',
     search: !document.getElementById('search-field').hidden,
     keys: window.__keys || [],
   };
@@ -678,7 +678,7 @@ def call_view_write_keys(walk: Walk) -> None:
     """`#248 composer-key` with `#241 voice-composer`: on the call's view Ctrl+S goes to the agent's box."""
     first_row = '#discord-log > li[data-id]'
     walk.page.click("#view-switch")
-    walk.page.wait_for_function("() => document.getElementById('view-switch').getAttribute('aria-checked') === 'false'")
+    walk.page.wait_for_function("() => document.getElementById('view-switch').getAttribute('aria-pressed') === 'false'")
     walk.page.focus("#scroll-area")
     state = walk.key("Control+s")
     check(walk.last_key()["prevented"] is True, "Ctrl+S on the call's view reached the browser's Save page")
@@ -1622,7 +1622,7 @@ def main() -> int:
             # A click on the view switch and back: the switch must not keep the focus, or Space
             # presses it again.
             page.click("#view-switch")
-            page.wait_for_function("() => document.getElementById('view-switch').getAttribute('aria-checked') === 'false'")
+            page.wait_for_function("() => document.getElementById('view-switch').getAttribute('aria-pressed') === 'false'")
             with page.expect_response(lambda response: "/timeline" in response.url) as read:
                 page.click("#view-switch")
             read.value.finished()
@@ -1655,7 +1655,7 @@ def main() -> int:
             mac_cdp.send("Emulation.setUserAgentOverride", {"userAgent": agent, "platform": "MacIntel"})
             mac.goto(url, wait_until="load")
             mac.wait_for_selector("#view-switch", state="visible", timeout=10_000)
-            if mac.evaluate("() => document.getElementById('view-switch').getAttribute('aria-checked')") != "true":
+            if mac.evaluate("() => document.getElementById('view-switch').getAttribute('aria-pressed')") != "true":
                 mac.click("#view-switch")
             mac.wait_for_selector(first_row, state="visible", timeout=10_000)
             check(mac.evaluate("() => navigator.platform") == "MacIntel", "the Mac's platform was not emulated")

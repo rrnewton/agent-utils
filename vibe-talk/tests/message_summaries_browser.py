@@ -317,6 +317,8 @@ def toggle_walk(chromium: BrowserType, args: argparse.Namespace, label: str, wid
     page.select_option("#thread-select", "flat")
     desk.wait_for("() => document.querySelectorAll('#discord-log > li[data-id]').length === 24", "All did not come back")
     desk.settled()
+    # `#820 voice-page-action-menu`: Summaries is an item of the action menu now.
+    page.click("#action-menu-open")
     page.click("#summarise")
     desk.wait_for("() => document.querySelectorAll('#discord-log > li[data-summarised=\"true\"]').length === 0",
                   "turned off by the chip, rows still show summaries")

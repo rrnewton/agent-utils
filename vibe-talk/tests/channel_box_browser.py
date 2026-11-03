@@ -183,7 +183,7 @@ def sign_in(page: Page, url: str) -> None:
     page.fill("#api-token", TOKEN)
     page.click("#save-token")
     page.wait_for_selector("#view-switch", state="visible", timeout=10_000)
-    if page.evaluate("() => document.getElementById('view-switch').getAttribute('aria-checked')") != "true":
+    if page.evaluate("() => document.getElementById('view-switch').getAttribute('aria-pressed')") != "true":
         page.click("#view-switch")
     page.wait_for_selector(FIRST_ROW, state="visible", timeout=10_000)
 

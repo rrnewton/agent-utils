@@ -721,6 +721,7 @@ def main_walk(reader: Reader) -> None:
     reader.scroll_main(0.5)
     before = reader.first()
     asked = api.summaries_asked
+    page.click("#action-menu-open")  # `#820 voice-page-action-menu`: Summaries is in the action menu.
     page.click("#summarise")
     deadline = time.monotonic() + 5
     while api.summaries_asked <= asked and time.monotonic() < deadline:
@@ -728,6 +729,7 @@ def main_walk(reader: Reader) -> None:
     reader.check(api.summaries_asked > asked, "Summaries on asked for no summary")
     reader.quiet(int(api.summary_delay * 1000) + 900)
     reader.still(before, "summaries arriving")
+    page.click("#action-menu-open")  # `#820 voice-page-action-menu`: Summaries is in the action menu.
     page.click("#summarise")
     reader.quiet()
     reader.still(before, "Summaries off")

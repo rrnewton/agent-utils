@@ -189,7 +189,8 @@
 
   /* The tray opens above the dock across its width, placed against the dock, whose padding box is
      the whole window. */
-  #control-bar[data-placement="bottom"] #prompts-tray {
+  #control-bar[data-placement="bottom"] #prompts-tray,
+  #control-bar[data-placement="bottom"] #action-menu {
     left: var(--dock-inset);
     right: var(--dock-inset);
   }
@@ -379,12 +380,12 @@
      title shows. So the channel's picker does not shrink at all — a share of the shrinking, however
      small, is a fraction of a pixel the text no longer fits, and the ellipsis turns that into a
      visible "…" — and is capped instead at what the pack has left once its other members are at
-     their floors: the view picker's 5rem, the audio button's 2.25rem and the two gaps between
-     them. Until the view picker is down to its floor the channel's name is whole; past that, it is
+     their floors: the view picker's 5rem, the audio button's 2.25rem, the action menu's opener's
+     2.25rem (`#820`) and the three gaps between them. Until the view picker is down to its floor the channel's name is whole; past that, it is
      the channel's that ends in the ellipsis, and nothing is pushed out of the pack. */
   #discord-channel {
     flex-shrink: 0;
-    max-width: min(24rem, 100% - 5rem - 2.25rem - 2 * 0.4rem);
+    max-width: min(24rem, 100% - 5rem - 2 * 2.25rem - 3 * 0.4rem);
   }
 
   /* The row's height, and a little less air inside it: at the default column the switch is what

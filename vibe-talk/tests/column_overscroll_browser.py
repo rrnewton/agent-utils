@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The right column scrolls on past its foot into blank room at a desk, in real Chromium at 1280x800 and 1920x1080.
+"""The right column scrolls on past its foot into blank room at a desk, in real Chromium at 1280x700 and 1920x1080.
 
 `#338 column-overscroll`. The owner, 2026-10-15: on a desktop monitor the newest thread in the right column
 sits at the very bottom of the screen, where the reader's attention is but which is the least comfortable
@@ -37,7 +37,7 @@ At each size, in two columns with a mouse:
   foot, the reply on screen, nothing offered as new (FOLLOW) -> PgDn goes on to the end of the room, the
   last reply's top at the middle (PAGING) -> a short reply arriving there moves nothing for 1.5 s sampled
   at every frame and is drawn on screen in the room (STILL), and PgDn again brings its top to the middle:
-  the room was fitted to it (FIT) -> End lands on the foot and closes the room (END). At 1280x800 the
+  the room was fitted to it (FIT) -> End lands on the foot and closes the room (END). At 1280x700 the
   thread's own message box under its last reply already holds that reply's top above the middle at the
   foot, so there PgDn and the wheel at the foot open no room (LIMIT).
 
@@ -87,10 +87,13 @@ import page_sources
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType
 
-# (label, width, height, whether the short thread has room past its foot): the two desks the issue names. At
-# 1280x800 the thread's own message box under its last reply already holds that reply's top above the middle
-# of the column at the foot, so there it has none; at 1920x1080 it has.
-SIZES = (("desk-1280", 1280, 800, False), ("desk-1920", 1920, 1080, True))
+# (label, width, height, whether the short thread has room past its foot): the two desks the issue names, the
+# first a shorter window. At 1280x700 the thread's own message box under its last reply already holds that
+# reply's top above the middle of the column at the foot, so there it has none; at 1920x1080 it has.
+# `#820 voice-page-action-menu`: at 1280x800 it did only while Expand all and Summaries stood in the chip row
+# over the left list, whose height the columns' feet keep room for; in the action menu now, they keep none,
+# and the reply's top is 37px below the middle there.
+SIZES = (("desk-1280", 1280, 700, False), ("desk-1920", 1920, 1080, True))
 # The desk the negative controls are walked at: the one where the thread has room past its foot.
 CONTROL_SIZE = SIZES[1]
 # The thread of short replies, the channel's newest.

@@ -200,8 +200,9 @@ a.search-hit-link {
 .switch {
   display: inline-flex;
   align-items: center;
-  gap: 0.5rem;
-  padding: 0.25rem 0.7rem 0.25rem 0.3rem;
+  justify-content: center;
+  min-height: 2.25rem;
+  padding: 0.2rem 0.65rem;
   background: var(--bg);
   border: 1px solid var(--edge);
   border-radius: 999px;
@@ -214,41 +215,19 @@ a.search-hit-link {
   -webkit-user-select: none;
 }
 
-.switch-track {
-  position: relative;
-  display: inline-block;
-  width: 2.5rem;
-  height: 1.4rem;
-  border-radius: 999px;
-  background: var(--edge);
-  transition: background 140ms ease;
-}
-
-.switch-knob {
-  position: absolute;
-  top: 0.15rem;
-  left: 0.15rem;
-  width: 1.1rem;
-  height: 1.1rem;
-  border-radius: 50%;
-  background: var(--ink);
-  transition: transform 140ms ease;
-}
-
-/* Checked means "the other view": the knob travels, the track lights, and the word changes. All
-   three say the same thing, so the state survives being read quickly. */
-.switch[aria-checked="true"] .switch-track {
+/* `#820 voice-page-action-menu`. Pressed means the channel's view: filled in the accent, and the word
+   says Channel. Both say the same thing, so the state survives being read quickly. */
+.switch[aria-pressed="true"] {
   background: var(--accent);
-}
-
-.switch[aria-checked="true"] .switch-knob {
-  transform: translateX(1.1rem);
-  background: #fff;
+  border-color: var(--accent);
+  color: #fff;
 }
 
 .switch-word {
   min-width: 3.6rem;
-  text-align: left;
+  text-align: center;
+  font-size: 0.85rem;
+  font-weight: 600;
   letter-spacing: 0.01em;
 }
 

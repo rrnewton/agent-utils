@@ -24,7 +24,14 @@ of the page from before the change) the phone's dock is measured under that page
 control's box must be the same to the pixel.
 
 Against the page from before the change it fails at 1280x800 on the long thread, whose reading buttons
-wrap onto a second row. It reuses keyboard_browser's fixture: its fake API and asset server. --web-root DIR runs it
+wrap onto a second row.
+
+`#820 voice-page-action-menu`, at 393x852 by touch and 1280x800 by mouse, on a channel whose newest messages
+are long: the hamburger, just left of the channel picker, opens the action menu over the list; Expand all
+in it opens every message and shuts the menu, Collapse all is then offered and folds them again, and
+Summaries is offered; none of the three floats in the chip row any more; Escape shuts the menu and gives
+the focus back to the hamburger. The view button says the view on screen and is pressed on the channel's,
+by a tap and by Enter and Space from the keys. It reuses keyboard_browser's fixture: its fake API and asset server. --web-root DIR runs it
 against another copy of the page; --screenshots DIR keeps a PNG of each step; --port N serves the
 fixture on that port (default: one the system picks).
 """
@@ -215,7 +222,7 @@ def large_font_after_call(browser: Browser, url: str, width: int, height: int, n
     bar's floor the pane wraps its own buttons, as a last resort, and nothing is drawn over anything."""
     page = open_page(browser, url, width, height)
     page.click("#view-switch")
-    page.wait_for_function("() => document.getElementById('view-switch').getAttribute('aria-checked') !== 'true'",
+    page.wait_for_function("() => document.getElementById('view-switch').getAttribute('aria-pressed') !== 'true'",
                            timeout=10_000)
     page.evaluate("() => { document.documentElement.style.fontSize = '24px'; }")
     page.evaluate(AFTER_CALL_JS)
@@ -227,6 +234,115 @@ def large_font_after_call(browser: Browser, url: str, width: int, height: int, n
     notes.append(f"{width}x{height} at a 24px default font after a call: nothing drawn over anything, the dock "
                  f"{number(state['dock'], 'height'):.0f}px tall")
     page.context.close()
+
+
+# `#820 voice-page-action-menu`: the menu, its items, the chips over the list, and the view button.
+MENU_JS = """() => {
+  const shown = (id) => { const n = document.getElementById(id); return Boolean(n && !n.hidden && n.getClientRects().length); };
+  const box = (id) => { const r = document.getElementById(id).getBoundingClientRect(); return {left: r.left, right: r.right, top: r.top, bottom: r.bottom}; };
+  const tools = document.getElementById('scroll-tools');
+  return {
+    open: shown('action-menu'), expanded: document.getElementById('action-menu-open').getAttribute('aria-expanded'),
+    expand: shown('expand-all'), collapse: shown('collapse-all'), summaries: shown('summarise'),
+    floating: ['expand-all', 'collapse-all', 'summarise'].filter((id) => tools.contains(document.getElementById(id))),
+    folded: document.querySelectorAll('#discord-log > li[data-collapsed="true"]').length,
+    hamburger: box('action-menu-open'), picker: box('discord-channel'),
+    focus: document.activeElement ? document.activeElement.id : null,
+    pressed: document.getElementById('view-switch').getAttribute('aria-pressed'),
+    word: document.getElementById('view-switch-label').textContent,
+  };
+}"""
+
+
+def count(value: object) -> int:
+    """A count the page measured, read out of its JSON answer."""
+    assert isinstance(value, int), value
+    return value
+
+
+def menu_state(page: Page) -> Json:
+    found: object = page.evaluate(MENU_JS)
+    assert isinstance(found, dict)
+    return {str(key): value for key, value in found.items()}
+
+
+def press(page: Page, selector: str, touch: bool) -> None:
+    box = page.locator(selector).first.bounding_box()
+    check(box is not None, f"{selector} is not drawn to press")
+    assert box is not None
+    if touch:
+        page.touchscreen.tap(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+    else:
+        page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+
+
+def action_menu(browser: Browser, url: str, width: int, height: int, touch: bool, shots: Path | None,
+                notes: list[str]) -> None:
+    """`#820 voice-page-action-menu`: the hamburger's menu of the channel's actions, and the view button."""
+    where = f"{width}x{height} menu"
+    page = open_page(browser, url, width, height, mobile=touch)
+    errors: list[str] = []
+    page.on("pageerror", lambda error: errors.append(str(error)))
+    page.wait_for_timeout(300)
+    now = menu_state(page)
+    check(now["pressed"] == "true" and now["word"] == "Channel", f"{where}: the view button on the channel says {now}")
+    check(now["open"] is False and now["expanded"] == "false", f"{where}: the menu is open before it is asked for: {now}")
+    check(now["floating"] == [], f"{where}: {now['floating']} still float in the chip row")
+    check(now["hamburger"]["right"] <= now["picker"]["left"] + 0.5,  # type: ignore[index]
+          f"{where}: the hamburger is not left of the channel picker: {now['hamburger']} {now['picker']}")
+    folded = count(now["folded"])
+    check(folded > 0, f"{where}: the premise, long messages folded in the list: {now}")
+    press(page, "#action-menu-open", touch)
+    page.wait_for_timeout(200)
+    now = menu_state(page)
+    check(now["open"] is True and now["expanded"] == "true", f"{where}: the hamburger opened no menu: {now}")
+    check(now["expand"] is True and now["summaries"] is True, f"{where}: Expand all and Summaries are not offered: {now}")
+    shot(page, shots, f"{width}x{height}-action-menu")
+    press(page, "#expand-all", touch)
+    page.wait_for_timeout(300)
+    now = menu_state(page)
+    check(now["open"] is False, f"{where}: choosing Expand all left the menu open: {now}")
+    check(count(now["folded"]) == 0, f"{where}: Expand all left {now['folded']} messages folded")
+    press(page, "#action-menu-open", touch)
+    page.wait_for_timeout(200)
+    now = menu_state(page)
+    check(now["collapse"] is True and now["expand"] is False, f"{where}: with every message open, the menu offers {now}")
+    press(page, "#collapse-all", touch)
+    page.wait_for_timeout(300)
+    now = menu_state(page)
+    check(count(now["folded"]) >= folded and now["open"] is False, f"{where}: Collapse all did not fold them again: {now}")
+    # Escape shuts it, the focus back on the hamburger.
+    page.click("#action-menu-open")
+    page.wait_for_timeout(150)
+    page.keyboard.press("Escape")
+    page.wait_for_timeout(150)
+    now = menu_state(page)
+    check(now["open"] is False and now["focus"] == "action-menu-open", f"{where}: Escape left {now}")
+    # The view button: a press, then Enter and Space from the keys.
+    press(page, "#view-switch", touch)
+    page.wait_for_timeout(300)
+    now = menu_state(page)
+    check(now["pressed"] == "false" and now["word"] == "Voice", f"{where}: a press on the view button left {now}")
+    page.focus("#view-switch")
+    page.keyboard.press("Enter")
+    page.wait_for_timeout(300)
+    now = menu_state(page)
+    check(now["pressed"] == "true" and now["word"] == "Channel", f"{where}: Enter on the view button left {now}")
+    # Coming to the channel puts the keys in its list, as it always has: back on the button for Space.
+    page.focus("#view-switch")
+    page.keyboard.press(" ")
+    page.wait_for_timeout(300)
+    now = menu_state(page)
+    check(now["pressed"] == "false" and now["word"] == "Voice", f"{where}: Space on the view button left {now}")
+    # The call's transcript folds too: the menu is on the call's view as well.
+    check(page.is_visible("#action-menu-open"), f"{where}: no action menu on the call's view")
+    check(page.get_attribute("#view-switch", "aria-label") == "Channel view",
+          f"{where}: the view button's name changed with it: {page.get_attribute('#view-switch', 'aria-label')!r}")
+    check(not errors, f"{where}: the page threw: {errors}")
+    page.context.close()
+    notes.append(f"{where}: the hamburger left of the picker opened the menu, Expand all opened {folded} folded "
+                 "messages and shut it, Collapse all folded them again, Summaries offered, none of them in the chip "
+                 "row, Escape shut it onto the hamburger; the view button pressed on the channel, by a tap, Enter and Space")
 
 
 def phone_boxes(browser: Browser, url: str, shots: Path | None, tag: str) -> dict[str, list[dict[str, float | str]]]:
@@ -295,6 +411,11 @@ def main() -> int:
     if args.screenshots is not None:
         args.screenshots.mkdir(parents=True, exist_ok=True)
     servers = [serve(page_sources.served(args.web_root), args.port)]
+    # `#820 voice-page-action-menu`: a channel whose newest messages are long, so there is something to fold.
+    long_server, long_thread, long_api = serve(page_sources.served(args.web_root), 0)
+    for held in long_api.messages[-4:]:
+        if held.get("thread") is None:
+            held["content"] = kb.LONG
     if args.baseline_web_root is not None:
         servers.append(serve(args.baseline_web_root, args.port + 1 if args.port else 0))
     urls = [f"http://127.0.0.1:{server.server_port}/" for server, _, _ in servers]
@@ -316,11 +437,18 @@ def main() -> int:
             else:
                 notes.append("393x852 phone: bar one row above the pane's tile, the dock spanning the window and the "
                              "same height in Main, All, Thread list and the long thread")
+            long_url = f"http://127.0.0.1:{long_server.server_port}/"
+            action_menu(browser, long_url, 393, 852, True, args.screenshots, notes)
+            action_menu(browser, long_url, 1280, 800, False, args.screenshots, notes)
             version = browser.version
             browser.close()
         print(f"Chromium {version}: " + "; ".join(notes))
         return 0
     finally:
+        long_api.stopping.set()
+        long_server.shutdown()
+        long_server.server_close()
+        long_thread.join()
         for server, thread, api in servers:
             api.stopping.set()
             server.shutdown()

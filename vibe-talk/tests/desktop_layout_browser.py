@@ -413,7 +413,9 @@ def columns_walk(desk: Desk) -> None:
     desk.wait_for("() => document.getElementById('side-list-state').textContent.trim() !== ''",
                   "the empty thread list says nothing")
     # The agent's replies opened whole, so the boxes are the long ones the owner photographed.
-    if page.is_visible("#expand-all"):
+    # `#820 voice-page-action-menu`: Expand all is an item of the action menu now, opened for it.
+    if page.evaluate("() => !document.getElementById('expand-all').hidden"):
+        page.click("#action-menu-open")
         page.click("#expand-all")
     page.evaluate("() => { const s = document.getElementById('scroll-area'); s.scrollTop = s.scrollHeight; }")
     page.wait_for_timeout(200)

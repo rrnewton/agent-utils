@@ -412,7 +412,7 @@ def mac_walk(reader: Reader, context: BrowserContext, origin: str, errors: list[
     cdp.send("Emulation.setUserAgentOverride", {"userAgent": agent, "platform": "MacIntel"})
     mac.goto(f"{origin}/", wait_until="load")
     mac.wait_for_selector("#view-switch", state="visible", timeout=10_000)
-    if mac.evaluate("() => document.getElementById('view-switch').getAttribute('aria-checked')") != "true":
+    if mac.evaluate("() => document.getElementById('view-switch').getAttribute('aria-pressed')") != "true":
         mac.click("#view-switch")
     other = Reader(Desk(mac, reader.desk.screenshots, f"{reader.desk.label}-mac", reader.desk.width, reader.desk.height),
                    cdp, reader.api)

@@ -3230,7 +3230,9 @@ def tile_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
             page.click("#view-switch")
             page.wait_for_selector('#discord-log > li[data-id="211"]', timeout=10_000)
             page.evaluate("() => { const a = document.getElementById('scroll-area'); a.scrollTop = a.scrollHeight; }")
-            page.wait_for_selector("#summarise", state="visible", timeout=10_000)
+            # `#820 voice-page-action-menu`: Summaries is an item of the action menu now.
+            page.wait_for_function("() => !document.getElementById('summarise').hidden", timeout=10_000)
+            page.click("#action-menu-open")
             page.click("#summarise")
             wait_for(f"() => {row(SUMMARISED_ROW)}.getAttribute('data-summarised') === 'true'",
                      "the long row at the newest line was not summarised")
@@ -3460,7 +3462,7 @@ def dock_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
                     page.mouse.click(spot_x, spot_y)
                 else:
                     page.click("#view-switch")
-                until("() => document.getElementById('view-switch').getAttribute('aria-checked') === "
+                until("() => document.getElementById('view-switch').getAttribute('aria-pressed') === "
                       f"{json.dumps(checked)}", why)
 
             flick("true", "a click where the switch stood on the call view did not open the channel")

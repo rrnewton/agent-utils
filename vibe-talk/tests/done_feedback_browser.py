@@ -592,7 +592,8 @@ def walk_chip(walk: Walk, width: int) -> str:
     chips = laid["chips"]
     assert isinstance(chips, list)
     ids = [str(chip["id"]) for chip in chips]
-    check({"jump-newest", "undo-dismiss", "expand-all"} <= set(ids), f"at {width}px the chips up are {ids}")
+    # `#820 voice-page-action-menu`: Expand all is the action menu's now, off the chip row.
+    check({"jump-newest", "undo-dismiss"} <= set(ids), f"at {width}px the chips up are {ids}")
     named = chip_lines(laid, width)
     name = laid["name"]
     label, title, aria = str(laid["label"]), str(laid["title"]), str(laid["aria"])

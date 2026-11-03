@@ -420,7 +420,7 @@ test("hang up comes before talk in the markup, so talk lands under the right thu
   assert.ok(pane.indexOf('id="clear-view"') < hangUp);
 });
 
-test("the view control is ONE switch carrying the word for the view you are in", async () => {
+test("the view control is ONE button carrying the word for the view you are in, pressed on the channel's", async () => {
   // What this replaces: two text labels, one outlined and one plain, which read as one item having
   // been disabled rather than as the unselected half of a pair.
   assert.equal(PAGE_IDS.has("tab-voice"), false, "the two-label pseudo-tabs are gone");
@@ -430,32 +430,34 @@ test("the view control is ONE switch carrying the word for the view you are in",
   await signIn(page);
   const label = page.el("view-switch-label");
   assert.equal(label.textContent, "Voice", "the switch must name the view you are IN");
-  assert.equal(page.el("view-switch").getAttribute("aria-checked"), "false");
+  // `#820 voice-page-action-menu`. A real button, pressed on the channel's view.
+  assert.equal(page.el("view-switch").getAttribute("aria-pressed"), "false");
 
   await page.el("view-switch").click();
   await page.settle();
 
   assert.equal(page.tab(), "discord");
   assert.equal(label.textContent, "Channel", "the word did not follow the switch");
-  assert.equal(page.el("view-switch").getAttribute("aria-checked"), "true");
+  assert.equal(page.el("view-switch").getAttribute("aria-pressed"), "true");
 
   await page.el("view-switch").click();
   assert.equal(page.tab(), "voice");
   assert.equal(label.textContent, "Voice");
 });
 
-test("the switch is a switch: a knob that moves, and a track that changes with it", () => {
-  // Three signals for one state — word, knob position, track colour — so it survives being read
-  // quickly, at arm's length, by somebody who is not looking for it.
+test("the view control is a real button: pressed on the channel's view, filled in the accent", () => {
+  // Two signals for one state — the word and the fill — so it survives being read quickly, at arm's
+  // length, by somebody who is not looking for it. `#820 voice-page-action-menu`, the owner: the
+  // voice/channel toggle becomes "a smaller real button with a pressed visual style", its label the
+  // view on screen. Before it, a switch with a track and a knob, wider than any other member of the bar.
   // RE-SLICED by `#58 control-bar`: the switch and the gear both live in the bar now, and the gear
   // comes FIRST, so the old bounds (from the switch to the gear) run backwards and would silently
   // return an empty string — a test that passes by having nothing to look at.
   const html = barSlice(HTML.indexOf('id="view-switch"'));
-  assert.match(html, /role="switch"/, "a switch has to announce itself as one");
-  assert.match(html, /class="switch-track"/);
-  assert.match(html, /class="switch-knob"/);
-  assert.match(cssBlock('.switch[aria-checked="true"] .switch-knob'), /transform:\s*translateX/);
-  assert.match(cssBlock('.switch[aria-checked="true"] .switch-track'), /background:\s*var\(--accent\)/);
+  assert.match(html, /<button\s[^>]*id="view-switch"|id="view-switch"[^>]*>/);
+  assert.match(html, /aria-pressed="false"/, "the button does not say whether it is pressed");
+  assert.doesNotMatch(html, /role="switch"|switch-track|switch-knob/, "the knob and track are still drawn");
+  assert.match(cssBlock('.switch[aria-pressed="true"]'), /background:\s*var\(--accent\)/, "pressed is not filled in the accent");
 });
 
 test("settings is a gear, not the word Settings", () => {
@@ -581,9 +583,9 @@ test("THE BAR IS A CONTAINER THAT PACKS, NOT A TWO-ITEM LAYOUT", () => {
   // bar, so that is arithmetic rather than a worry.
   assert.match(pack, /overflow-x:\s*auto/, "the bar clips or wraps once it is full");
   assert.doesNotMatch(pack, /flex-wrap:\s*wrap/);
-  const track = Number(/width:\s*([\d.]+)rem/.exec(cssBlock(".switch-track"))[1]);
+  // `#820 voice-page-action-menu`: the switch is a button with its word now, no longer the widest member.
   const word = Number(/min-width:\s*([\d.]+)rem/.exec(cssBlock(".switch-word"))[1]);
-  assert.ok(track + word > 5, `the switch is ${track + word}rem wide; the packing claim above is stale`);
+  assert.ok(word > 3, `the view button's word is ${word}rem wide; the packing claim above is stale`);
 
   // "Sized like the existing Sound / Clear controls", which is the issue's own phrase. Derived
   // from `.control-mini` rather than restated, so the two cannot drift apart silently.
@@ -824,13 +826,8 @@ function minBoxPx(selector) {
 function switchPx() {
   const outer = cssBlock(".switch");
   const border = lengthPx((cssValue(outer, "border") || "0").split(/\s+/)[0]) * 2;
-  return (
-    minBoxPx(".switch-track") +
-    minBoxPx(".switch-word") +
-    lengthPx(cssValue(outer, "gap")) +
-    paddingXPx(outer) +
-    border
-  );
+  // `#820 voice-page-action-menu`: its word alone, since the track and knob went.
+  return minBoxPx(".switch-word") + paddingXPx(outer) + border;
 }
 
 /**

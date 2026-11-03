@@ -2582,9 +2582,15 @@ test("the jump is the FIRST thing in the chip row, drawn at its left end with th
   const tools = HTML_CODE.slice(HTML_CODE.indexOf('id="scroll-tools"'));
   assert.equal(/\bid="([^"]+)"/.exec(tools.slice('id="scroll-tools"'.length))[1], "jump-newest",
     "the jump is not the first thing in the chip row");
-  for (const id of ["jump-bookmark", "summarise", "undo-dismiss", "expand-all", "collapse-all"]) {
+  for (const id of ["jump-bookmark", "undo-dismiss"]) {
     assertMarkupContains("scroll-tools", id);
     assert.ok(markupPlace("jump-newest").at < markupPlace(id).at, `#${id} comes before the jump`);
+  }
+  // `#820 voice-page-action-menu`. Expand all, Collapse all and Summaries are the action menu's items now,
+  // off the chip row that floats over the list; Undo and the jump stay on it.
+  for (const id of ["summarise", "expand-all", "collapse-all"]) {
+    assertMarkupContains("action-menu", id);
+    assert.equal(markupHolds("scroll-tools", id), false, `#${id} still floats in the chip row`);
   }
   // `#240 reading-bookmark`. The jump to the bookmark is DIRECTLY right of it, and while it is up it
   // takes the auto margin from the jump beside it, so the two stand together at the left.

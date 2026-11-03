@@ -4,6 +4,9 @@
 
 /** The shell's element ids, each with its element's DOM type. */
 export interface ElementById {
+  "action-menu": HTMLDivElement;
+  "action-menu-empty": HTMLParagraphElement;
+  "action-menu-open": HTMLButtonElement;
   "add-channel": HTMLButtonElement;
   "add-channel-fields": HTMLDivElement;
   "add-channel-state": HTMLParagraphElement;

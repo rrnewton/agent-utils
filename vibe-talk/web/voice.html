@@ -979,20 +979,11 @@
               <span id="draft-chip-label">Draft</span>
             </button>
             <!--
-              `#49 cached-summaries`. Summary mode is OPT-IN and it is a mode, not a per-row
-              control: collapsing to a prefix stays the default and costs nothing, and a button on
-              every long row would spend a model call every time a thumb slipped. It lives beside
-              "Collapse all" because the two act on the same thing — what a folded message shows.
-            -->
-            <!--
               `#204 reply-arrow`. The way back from a reply's arrow: offered only while the reply
               that was tapped is off the screen, because the jump took the reader away from it.
               See `landOnAnswered`.
             -->
             <button id="back-to-reply" class="chip" type="button" hidden>Back to reply</button>
-            <button id="summarise" class="chip" type="button" aria-pressed="false" hidden>
-              <span id="summarise-label">Summaries</span>
-            </button>
             <!--
               `#50 todo-view`. The way back from a dismissal, including a bulk one. It carries the
               exact set the server said it cleared, so it restores that and nothing else — and it
@@ -1012,16 +1003,6 @@
               Shift+B, the ⋯ item), for a few seconds after. See `removeBookmark`.
             -->
             <button id="undo-bookmark" class="chip" type="button" hidden>Undo remove bookmark</button>
-            <!-- The pair. Collapse all shipped alone, which made the fold a one-way door at the
-                 list level: you could put every message away and then had to open them one at a
-                 time. Each is present only when it has work to do, so at rest neither is here, in a
-                 fully-folded list only Expand is, and in a mixed list both are. -->
-            <button id="expand-all" class="chip" type="button" hidden>
-              <span id="expand-all-label">Expand all</span>
-            </button>
-            <button id="collapse-all" class="chip" type="button" hidden>
-              <span id="collapse-all-label">Collapse all</span>
-            </button>
           </div>
 
           <!--
@@ -1040,7 +1021,7 @@
             and the stylesheet does not draw the grip there.
 
             `#433 read-strip-low`: it stands directly on the chips row above (#scroll-tools, the
-            row with Collapse all and Expand all), as low as it can sit: under the thumb, with
+            row with the jump to the newest message and Undo), as low as it can sit: under the thumb, with
             the rest of the screen left to the messages above it. IN THIS SECTION, anchored to
             #screen-main exactly as the chips are: anchored to #frame-body instead, its measured
             hug was off by the send card's height whenever that card docked in the frame's third
@@ -1788,8 +1769,8 @@
                         really NOT liking the summaries of collapsed messages ... I also want a toggle to turn
                         summarization off on messages. But I want to keep summarization on for thread cards."
                         Off, a collapsed message shows its opening lines, nothing is asked for, and the server
-                        refuses a summary anything asks for anyway (`summaries_off`). The Summaries chip over the
-                        list is this same switch. Thread cards are summarised by the server's thread namer and
+                        refuses a summary anything asks for anyway (`summaries_off`). Summaries in the action menu
+                        (`#820`) is this same switch. Thread cards are summarised by the server's thread namer and
                         do not read it. Synced, as the other switches in Messages are.
                       -->
                       <label class="toggle">
@@ -3217,8 +3198,8 @@
                 shows a one-line summary written by a model in place of its opening lines, marked
                 <em>summary</em> and tinted in its thread's colour. <strong>More</strong> opens the
                 message itself. Each summary is a call to a model, asked only for the messages you
-                scroll to, and kept once made. The <strong>Summaries</strong> chip over the list is the
-                same switch.
+                scroll to, and kept once made. <strong>Summaries</strong> in the menu
+                beside the channel's name is the same switch.
               </p>
               <p class="hint">
                 It is <strong>off</strong> unless you turn it on, and off nothing is summarised: collapsed
@@ -3828,6 +3809,20 @@
               A `select`, not a button that opens something: the platform's own picker is the one
               a thumb already knows, and it needs no menu of this page's invention.
             -->
+            <!--
+              `#820 voice-page-action-menu`. The channel's actions, in one menu: a hamburger just LEFT
+              of the channel picker, opening #action-menu over the list. Expand all or Collapse all,
+              and Summaries, were chips floating over the list, crowding it; they are the menu's items
+              now. Undo and the jump to the newest message still float, as they answer what just
+              happened. A toggle, as the prompts' opener is, and Escape and the back gesture close it.
+            -->
+            <button id="action-menu-open" class="bar-button" type="button" aria-expanded="false"
+                    aria-controls="action-menu" aria-label="Actions"
+                    title="Actions on this channel: expand or collapse every message, summaries">
+              <svg class="mini-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+                <path d="M4.5 7h15M4.5 12h15M4.5 17h15" />
+              </svg>
+            </button>
             <select id="discord-channel" class="bar-select" aria-label="channel"
                     title="Which channel this view is reading. Changing it starts that channel at its newest message."></select>
 
@@ -3959,6 +3954,33 @@
             live there too, and for the same reason: `renderCannedPrompts` swaps them for the
             disabled sentence and back, so a copy here would go stale on the first swap.
           -->
+          <!--
+            `#820 voice-page-action-menu`. The menu the hamburger opens: out of the bar's flow, hung off
+            whichever edge the bar rests against, as the prompts' tray is. Each item is shown only where
+            it has work to do, as the chips were; with none, a line says so. Choosing one closes it.
+          -->
+          <div id="action-menu" role="group" aria-label="Channel actions" hidden>
+            <!-- The pair. Collapse all shipped alone, which made the fold a one-way door at the
+                 list level: you could put every message away and then had to open them one at a
+                 time. Each is present only when it has work to do, so at rest neither is here, in a
+                 fully-folded list only Expand is, and in a mixed list both are. -->
+            <button id="expand-all" class="tray-button" type="button" hidden>
+              <span id="expand-all-label" class="tray-label">Expand all</span>
+            </button>
+            <button id="collapse-all" class="tray-button" type="button" hidden>
+              <span id="collapse-all-label" class="tray-label">Collapse all</span>
+            </button>
+            <!--
+              `#49 cached-summaries`. Summary mode is OPT-IN and it is a mode, not a per-row
+              control: collapsing to a prefix stays the default and costs nothing, and a button on
+              every long row would spend a model call every time a thumb slipped. It lives beside
+              "Collapse all" because the two act on the same thing — what a folded message shows.
+            -->
+            <button id="summarise" class="tray-button" type="button" aria-pressed="false" hidden>
+              <span id="summarise-label" class="tray-label">Summaries</span>
+            </button>
+            <p id="action-menu-empty" class="hint" hidden>Nothing to expand, collapse or summarize here.</p>
+          </div>
           <div id="prompts-tray" role="group" aria-label="Canned prompts" hidden>
             <button
               id="canned-summary"
@@ -3993,18 +4015,19 @@
             </button>
           </div>
 
-          <!-- ONE switch, not two labels. It carries the word for the view you are in, and a knob
-               that moves, so it reads as a control with two positions rather than as one item that
-               has been disabled. -->
+          <!-- ONE button, not two labels. `#820 voice-page-action-menu`: a smaller real button where a
+               switch with a sliding knob was, its word the view you are in (Voice or Channel), and
+               pressed, in the accent, on the channel's; a press shows the other view. Its name for a
+               screen reader stays "Channel view", pressed or not, as a toggle's name must: a name
+               that changed with it would hear "Voice, not pressed" as the voice being off. -->
           <button
             id="view-switch"
             class="switch"
             type="button"
-            role="switch"
-            aria-checked="false"
-            aria-label="switch between the call and the channel"
+            aria-pressed="false"
+            aria-label="Channel view"
+            title="Showing the call. Press to show the channel."
           >
-            <span class="switch-track" aria-hidden="true"><span class="switch-knob"></span></span>
             <span id="view-switch-label" class="switch-word">Voice</span>
           </button>
         </div>

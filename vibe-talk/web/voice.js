@@ -899,6 +899,7 @@ function openMenus() {
   if (rowMenus.open()) open.push("menu:row");
   if (!el("speed-popover").hidden) open.push("menu:pace");
   if (promptsOpen) open.push("menu:prompts");
+  if (actionMenuOpen) open.push("menu:actions");
   // `#348 settings-dynamic-lists`. The pop-out over Recently dismissed, on Settings.
   if (!el("dismissed-send-popout").hidden) open.push("menu:dismissed");
   return open;
@@ -926,6 +927,11 @@ function closeOpenMenu(name) {
   if (name === "menu:prompts" && promptsOpen) {
     setPromptsOpen(false);
     el("prompts-open").focus();
+    return true;
+  }
+  if (name === "menu:actions" && actionMenuOpen) {
+    setActionMenuOpen(false);
+    el("action-menu-open").focus();
     return true;
   }
   if (name === "menu:dismissed" && !el("dismissed-send-popout").hidden) return dismissedSendsView.close();
@@ -2422,8 +2428,9 @@ function showView(name) {
   // there BEFORE the place in that list is restored, which counts it.
   voiceTranscript().placePostCard();
   const discord = name === "discord";
-  el("view-switch").setAttribute("aria-checked", discord ? "true" : "false");
+  el("view-switch").setAttribute("aria-pressed", discord ? "true" : "false");
   el("view-switch-label").textContent = discord ? "Channel" : "Voice";
+  el("view-switch").title = discord ? "Showing the channel. Press to show the call." : "Showing the call. Press to show the channel.";
   // Both panes share ONE scroll container, so a switch swaps the content out from under a
   // scrollTop that belonged to the other pane. On a FIRST entry, landing on the newest message is
   // right and landing at the top is badly wrong: arriving at the top of a long channel means
@@ -3592,6 +3599,8 @@ function renderScrollTools() {
     : "Show a one-line summary in place of each long message.";
   // `#204 reply-arrow`. The other way back: to the reply a jump left, while it is off screen.
   el("back-to-reply").hidden = screens.view() !== "discord" || replyReturnRow() === null;
+  // `#820 voice-page-action-menu`. Those three are the action menu's items: its empty line follows them.
+  if (actionMenuOpen) renderActionMenu();
   // `#193 compose-draft-loss`. The way back from a Dismiss in the outbox, on the channel only.
   renderSendUndo();
   // `#420 bookmark-clear`. ...and from taking the bookmark away, in its own channel.
@@ -8313,7 +8322,7 @@ function closeDetailsOn(target) {
 function onEscape(event, target) {
   if (closeRowMenuOnEscape(event)) return true;
   // The pace popover and the prompts tray, as the back gesture closes them (`#304 back-gesture-in-app`).
-  if (closeOpenMenu("menu:pace") || closeOpenMenu("menu:prompts")) return true;
+  if (closeOpenMenu("menu:pace") || closeOpenMenu("menu:prompts") || closeOpenMenu("menu:actions")) return true;
   // `#348 settings-dynamic-lists`. The pop-out over Recently dismissed, before Settings itself.
   if (closeOpenMenu("menu:dismissed")) return true;
   if (closeDetailsOn(target)) return true;
@@ -9235,6 +9244,29 @@ const cannedPrompts = mountCannedPrompts({
  */
 let promptsOpen = false;
 
+/** `#820 voice-page-action-menu`. Whether the list's action menu is open. */
+let actionMenuOpen = false;
+
+/**
+ * Open or close the channel's action menu, and say so on its opener. An open menu is a level, with an
+ * entry of its own, as the tray is (`#304 back-gesture-in-app`).
+ *
+ * @param {boolean} open
+ */
+function setActionMenuOpen(open) {
+  actionMenuOpen = open === true;
+  if (actionMenuOpen) renderActionMenu();
+  el("action-menu").hidden = !actionMenuOpen;
+  el("action-menu-open").setAttribute("aria-expanded", actionMenuOpen ? "true" : "false");
+  scheduleBackSync();
+}
+
+/** The menu's line for a list with nothing to expand, collapse or summarize: shown where no item is. */
+function renderActionMenu() {
+  const none = ["expand-all", "collapse-all", "summarise"].every((id) => el(id).hidden);
+  if (el("action-menu-empty").hidden !== !none) el("action-menu-empty").hidden = !none;
+}
+
 /**
  * Open or shut the tray, and say so on the button.
  *
@@ -9709,6 +9741,9 @@ const barPlacement = mountBarPlacement({
  */
 const PACK_VIEWS = {
   "audio-source": ["discord"],
+  // `#820 voice-page-action-menu`. The list's actions: Expand or Collapse all, on the call's transcript as on
+  // the channel, and Summaries on the channel.
+  "action-menu-open": ["discord", "voice"],
   "discord-channel": ["discord"],
   // `gchat-thread-selector`. Main, All, or one thread of the channel picked beside it.
   "thread-select": ["discord"],
@@ -9765,6 +9800,8 @@ function renderControlBar() {
   if (el("prompts-open").hidden && promptsOpen) {
     setPromptsOpen(false);
   }
+  // `#820 voice-page-action-menu`. The same for the channel's action menu.
+  if (el("action-menu-open").hidden && actionMenuOpen) setActionMenuOpen(false);
   const members = [
     el("open-settings"),
     el("view-switch"),
@@ -33042,6 +33079,9 @@ for (const entry of CANNED_PROMPTS) {
 // which is the only interaction model that needs no second control and no tap-outside handler to
 // escape from.
 el("prompts-open").addEventListener("click", () => setPromptsOpen(!promptsOpen));
+// `#820 voice-page-action-menu`. The action menu's opener, a toggle as the tray's is.
+el("action-menu-open").addEventListener("click", () => setActionMenuOpen(!actionMenuOpen));
+setActionMenuOpen(false);
 // ...and stated once at load, rather than left to the first tap. The markup ships shut, but shut is
 // a state the opener has to be ASSERTING for a screen reader to hear it — an `aria-expanded` that
 // only appears after somebody has already opened the tray is no use to the reader who needs it.
@@ -33605,6 +33645,15 @@ el("clear-backlog").addEventListener("click", guardQuietly(clearBacklog));
 el("undo-dismiss").addEventListener("click", guardQuietly(undoDismissal));
 // `#564 message-summary-toggle`. The chip is Settings' switch, kept and synced like it.
 el("summarise").addEventListener("click", () => applySummarizeCollapsed(!storedSummarizeCollapsed()));
+// `#820 voice-page-action-menu`. Those three are the action menu's items: choosing one closes it, after the
+// item's own act (registered just above), and gives the keys back to its opener rather than to nothing.
+for (const id of ["expand-all", "collapse-all", "summarise"]) {
+  el(id).addEventListener("click", () => {
+    const inside = nodeWithin(el("action-menu"), document.activeElement);
+    setActionMenuOpen(false);
+    if (inside) el("action-menu-open").focus({ preventScroll: true });
+  });
+}
 el("jump-newest").addEventListener("click", jumpToNewest);
 // `#129 message-search`. The glass is a toggle, and the second tap is the way out: a control that
 // only ever opens leaves the reader looking for a close button that is not on a phone keyboard.

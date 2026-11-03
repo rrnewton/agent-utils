@@ -4451,7 +4451,7 @@ SCENES: tuple[Scene, ...] = (
             ),
             (
                 "the switch reads as thrown",
-                "document.getElementById('view-switch').getAttribute('aria-checked') === 'true'",
+                "document.getElementById('view-switch').getAttribute('aria-pressed') === 'true'",
             ),
             (
                 "there are several real messages rendered",
@@ -4541,8 +4541,9 @@ SCENES: tuple[Scene, ...] = (
                 "b.getBoundingClientRect().height > window.__foldedHeight + 10; })()",
             ),
             (
-                "the offer to put the list back is on screen, because something IS open",
-                "window.__visible('collapse-all')",
+                # `#820 voice-page-action-menu`: offered in the action menu, which is shut in the picture.
+                "the offer to put the list back is made, because something IS open",
+                "!document.getElementById('collapse-all').hidden",
             ),
         ),
     ),
@@ -4566,7 +4567,7 @@ SCENES: tuple[Scene, ...] = (
                 # left open by the scene before it, and a picture of two chips filed under a name
                 # that mentions one is evidence for a state the walk was never in.
                 "nothing is open, so this is a picture of the ONE chip it says it is",
-                "!window.__visible('collapse-all')",
+                "document.getElementById('collapse-all').hidden",
             ),
             (
                 "the arrival did NOT drag the reader to the bottom",
@@ -7512,7 +7513,7 @@ def check_state_controls() -> list[str]:
         # the whole content of state 12; "a turn arrived and the view did not move" is the whole
         # content of state 13.
         "12-collapsed-long-transcript": "data-collapsed",
-        "13-jump-to-newest": ("jump-newest", "!window.__visible('collapse-all')"),
+        "13-jump-to-newest": ("jump-newest", "document.getElementById('collapse-all').hidden"),
         # `#55 voice-desktop-app`. Both pinned to a MEASUREMENT rather than to an element being on
         # screen: the whole content of state 14 is that the column is narrower than the window it
         # sits in, and the whole content of state 15 is that the control really moved it. A scene

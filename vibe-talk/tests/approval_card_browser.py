@@ -2712,18 +2712,21 @@ def help_key_trip_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, siz
 
 
 # Point 20: the chips over the foot of the list on screen, by id, and the room the lists keep for them.
+# `#820 voice-page-action-menu`: Summaries and Expand all are the action menu's items now, off the chips row,
+# so the chip that floats here is Undo, after a Done.
 CHIPS_JS = """() => {
   const shown = (id) => {
     const n = document.getElementById(id);
     return Boolean(n && !n.hidden && n.getClientRects().length);
   };
-  return { summarise: shown('summarise'), expand: shown('expand-all'),
+  return { undo: shown('undo-dismiss'),
            room: getComputedStyle(document.getElementById('channel-composer')).marginTop };
 }"""
 
 
 def chips_room_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, size: tuple[int, int]) -> str:
-    """Point 20, on the phone: All with Summarise and Expand all up, a reader 40 or 60px above its foot goes to
+    """Point 20, on the phone: All with a chip up over its foot (Undo, after a Done; since `#820` Summaries and
+    Expand all are in the action menu), a reader 40 or 60px above its foot goes to
     Settings and comes back where they were, with no card and with a long draft opened by More that is all
     they see; one at the foot is at it again. The chips are measured at nothing while their screen is hidden,
     and the room the lists keep for them used to go with that, so the list came back short of it and the
@@ -2741,9 +2744,13 @@ def chips_room_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, size: 
                                timeout=10_000)
         page.wait_for_timeout(300)
         view_key(page, "Meta", 2, None, None)
+        # A Done on the oldest message on screen: its Undo floats over the foot of the list.
+        page.evaluate("() => { const row = document.querySelector('#discord-log > li[data-id] .done-button'); row.click(); }")
+        page.wait_for_function("() => !document.getElementById('undo-dismiss').hidden", timeout=5000)
+        page.wait_for_timeout(300)
         chips = page.evaluate(CHIPS_JS)
-        check(chips["summarise"] is True and chips["expand"] is True and chips["room"] != "0px",
-              f"{where}: the premise, Summarise and Expand all up over All, the channel's box keeping room: {chips}")
+        check(chips["undo"] is True and chips["room"] != "0px",
+              f"{where}: the premise, Undo up over All, the channel's box keeping room for it: {chips}")
         for card in (False, True):
             if card:
                 propose(page, api, 201, LONG_DRAFT)
@@ -2791,7 +2798,7 @@ def chips_room_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, size: 
     finally:
         api.threaded = False
         api.older_threads = 0
-    return (f"{where}: a reader 40 and 60px up All with Summarise and Expand all up where they were by Back and Esc,"
+    return (f"{where}: a reader 40 and 60px up All with Undo up where they were by Back and Esc,"
             " card or no card, and one at its foot at it again")
 
 
