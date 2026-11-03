@@ -141,6 +141,11 @@ test("`#624 voice-page-modularity`: the status line says a thing, takes itself a
   notices.dismissStatus();
   assert.equal(el("status-line").hidden, false, "while the service is silent the line says so");
   assert.equal(el("status").textContent, silent);
+  silent = null;
+  notices.setStatus("Ready.");
+  notices.holdStatus();
+  assert.equal(timers.at(-1), null, "a held line has no timer to take it away");
+  assert.equal(el("status-line").hidden, false);
 });
 
 test("`#624 voice-page-modularity`: the error panel stays twelve seconds, or until acted on, and the details are kept for Settings", () => {

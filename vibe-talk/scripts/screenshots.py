@@ -3532,7 +3532,7 @@ def _act_settings_dismissed_popout(driver: Driver) -> None:
     Close at the foot is what keeping the shadow off the pill once did.
     """
     _act_settings_dismissed_list(driver)
-    driver.js("(() => { setStatus('Ready.'); clearTimeout(statusTimer); return true; })()")
+    driver.js("(() => { setStatus('Ready.'); shellNotices.holdStatus(); return true; })()")
     driver.page.mouse.move(1, 1)
     driver.settle(200)
     lit_layout = cast(DimLayout, driver.js(POPOUT_DIM_LAYOUT_JS))
@@ -3576,7 +3576,7 @@ def _act_settings_dismissed_popout(driver: Driver) -> None:
     driver.settle(200)
     bare_layout = cast(FootLayout, driver.js(POPOUT_FOOT_LAYOUT_JS))
     bare = decode_png(driver.page.screenshot(scale="css", animations="disabled"))
-    driver.page.evaluate("(text) => { setStatus(text); clearTimeout(statusTimer); }", POPOUT_FOOT_STATUS)
+    driver.page.evaluate("(text) => { setStatus(text); shellNotices.holdStatus(); }", POPOUT_FOOT_STATUS)
     driver.settle(200)
     foot = cast(FootLayout, driver.js(POPOUT_FOOT_LAYOUT_JS))
     pilled = decode_png(driver.page.screenshot(scale="css", animations="disabled"))

@@ -34,6 +34,8 @@ export interface ShellNotices {
   setStatus(text: unknown): void;
   /** Take the status line away: a hide, not an erase. */
   dismissStatus(): void;
+  /** Keep the status line up as it is, its timer let go, until it is said again or taken away: for a picture of it. */
+  holdStatus(): void;
   /** The state dot beside the line: idle, working, live, unresponsive, ended, suspended, error. */
   setState(name: string): void;
   /** Show a failure in the error panel: for twelve seconds, or until the reader acts with `stay`. */
@@ -148,6 +150,10 @@ export function createShellNotices(deps: ShellNoticesDependencies): ShellNotices
   return {
     setStatus,
     dismissStatus,
+    holdStatus() {
+      if (statusTimer !== null) deps.clock.clearTimeout(statusTimer);
+      statusTimer = null;
+    },
     setState,
     showError,
     clearError,
