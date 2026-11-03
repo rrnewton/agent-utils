@@ -1,13 +1,14 @@
 ---
 title: 'chat-reply-capture-miss: a well-formed reply block from an agent with no session binding was never captured'
-status: open
+status: closed
 priority: 0
-assignee: cl-start@devbig030
 issue_type: bug
+assignee: cl-start@devbig030
 labels:
 - agentctl
 created_at: 2026-11-02T18:07:43.775996897+00:00
-updated_at: 2026-11-02T20:31:06.383913247+00:00
+updated_at: 2026-11-03T05:39:48.619875126+00:00
+closed_at: 2026-11-03T05:39:48.619874505+00:00
 ---
 
 # Description
@@ -39,3 +40,9 @@ updated_at: 2026-11-02T20:31:06.383913247+00:00
 - Tests: discovery through the pane process and by content (never bound), the shared reply source, the try-lock bind (busy refused, never rebinding), miss detection and its boundaries, one owner warning per miss with the record written, and the health verdicts. Slices (c) and (d) remain open.
 
 [opus 5.5] Slice (c) delivered (dedupe). Keying on the reply ID alone would be wrong: under a short alias every reply of a request shares one ID, so it would also drop a later, different reply sent under it. A capture now skips any block that reads, once drawn, the same as a reply the request already holds: the same characters in order once whitespace, box drawing and inline markup are set aside; or, between a Markdown source and its screen rendering (exactly one of the two with Markdown table rows), the same characters with a table's cells wrapped. That covers the incident: `chat reply` stored the transcript's text, then the restart's capture read the box-drawn rendering of the same reply. The reverse order, screen first and then `chat reply` with the source, answers `already_stored` with the held ordinal. Two screen readings, or two sources, must still read the same in order, so tables whose cells trade places stay separate replies; the existing column-by-column redraw refusal is unchanged. Test: chat_runtime a_command_reply_and_its_screen_rendering_are_one_reply (both orders, plus a different reply under the same ID still stored); all 646 chat tests pass. Slice (d) remains open.
+
+[opus 5.5] Slice (d) delivered (screen text as the last resort). The pairing used to let the screen win: a screen block that paired with nothing was stored from the screen when the transcript held a same-ID block of about its length, which is how a mangled table went out. Now that screen block takes the transcript's text, and a block a capture already settled still claims its screen block, so a later read of it adds nothing. While a transcript is followed (new TranscriptReplies::following, false by default), a screen block the transcript does not pair is held back for up to 60 s from first sight. After that a block without a table is stored as drawn (the last resort), and a block with a table is refused once, logged as SCREEN TABLE REFUSED, posted to the owner as a [chat-bridge WARNING], and told to the coordinator with the chat reply command, through the slice (b) notice path. Command replies and transcript-only blocks are never held. Tests: a_same_id_screen_block_the_pairing_misses_takes_the_transcript_text, screen_text_is_the_last_resort_while_a_transcript_is_followed, a_table_read_only_from_the_screen_is_refused_and_told_once; the old screen-wins test now expects the transcript text. All 648 chat tests pass.
+
+## Resolution
+
+[opus 5.5] All four asks are delivered: (a) bounded owner loop plus stall watchdog, restart and STALLED health (c45c920c); (b) session discovery and binding, capture-miss alarm and binding health (79301e9a); (c) no second post of a reply's screen rendering after chat reply, or the reverse (e40deb26); (d) transcript text over screen text, screen text only as a bounded last resort, tables refused with an alarm (this commit).

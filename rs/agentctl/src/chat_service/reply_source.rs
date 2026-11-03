@@ -15,7 +15,9 @@
 //!    logged and posted to the owner as a `[chat-bridge WARNING]` once, and the coordinator is
 //!    told once, as a reply reminder is typed (only while it is ready, never behind another
 //!    prompt), with the `chat reply` command that sends the reply; a notice it was not given is
-//!    tried again at most every [`NOTICE_RETRY`] while the miss lasts;
+//!    tried again at most every [`NOTICE_RETRY`] while the miss lasts. A reply block that a
+//!    capture refused because its table could be read only from the screen, which draws it
+//!    mangled (see `chat_runtime::SCREEN_FALLBACK_AFTER`), is told the same way;
 //! 3. records where the text comes from, and the misses, in `reply-source.json` for
 //!    `chat health`.
 
@@ -83,10 +85,21 @@ pub(crate) fn find_misses(
         .collect()
 }
 
+/// Why a reply did not go out.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Kind {
+    /// The transcript holds its block, and no capture stored it.
+    Uncaptured,
+    /// Its block was read only from the screen, and refused because its table would be sent
+    /// mangled (see `chat_runtime::SCREEN_FALLBACK_AFTER`).
+    ScreenTable,
+}
+
 /// What one miss has been told.
 #[derive(Debug)]
 struct Told {
     miss: Miss,
+    kind: Kind,
     /// The coordinator has been given its notice, or may have been.
     coordinator: bool,
     /// When the coordinator was last tried, in Unix milliseconds.
@@ -159,10 +172,50 @@ impl ReplySourceWatch {
             }
         };
         let misses = find_misses(&candidates, &state.transcript_blocks(), now, self.grace);
-        // A miss answered since, by `chat reply` or a later capture, is no longer one.
-        self.told
-            .retain(|key, _| misses.iter().any(|miss| miss.key == *key));
+        // A miss answered since, by `chat reply` or a later capture, is no longer one; nor is a
+        // refused screen table whose request has been answered.
+        self.told.retain(|key, told| match told.kind {
+            Kind::Uncaptured => misses.iter().any(|miss| miss.key == *key),
+            Kind::ScreenTable => candidates.iter().any(|candidate| candidate.key == *key),
+        });
         let mut owner = Vec::new();
+        for refusal in state.take_screen_refusals() {
+            if self.told.contains_key(&refusal.key)
+                || !candidates
+                    .iter()
+                    .any(|candidate| candidate.key == refusal.key)
+            {
+                continue;
+            }
+            service_log(format_args!(
+                "agentctl: SCREEN TABLE REFUSED: a reply block for reply ID {} (request {}) holds \
+                 a table that was read only from the screen, and the coordinator's transcript has \
+                 held no such block since {}; it was not sent",
+                refusal.identifier,
+                refusal.key.get(..12).unwrap_or(&refusal.key),
+                chat_runtime::utc_timestamp(refusal.first_seen_millis)
+            ));
+            owner.push(format!(
+                "[chat-bridge WARNING] {agent} wrote a reply with a table to your message (reply \
+                 ID {}), but the bridge could read it only from the screen, where tables are \
+                 drawn mangled, so it was not posted. {agent} has been asked to send it again.",
+                refusal.identifier
+            ));
+            self.told.insert(
+                refusal.key.clone(),
+                Told {
+                    miss: Miss {
+                        key: refusal.key,
+                        reply_id: refusal.identifier,
+                        block_at_millis: refusal.first_seen_millis,
+                    },
+                    kind: Kind::ScreenTable,
+                    coordinator: false,
+                    tried_at_millis: None,
+                    attempts: 0,
+                },
+            );
+        }
         for miss in &misses {
             if self.told.contains_key(&miss.key) {
                 continue;
@@ -186,6 +239,7 @@ impl ReplySourceWatch {
                 miss.key.clone(),
                 Told {
                     miss: miss.clone(),
+                    kind: Kind::Uncaptured,
                     coordinator: false,
                     tried_at_millis: None,
                     attempts: 0,
@@ -254,7 +308,7 @@ impl ReplySourceWatch {
                     told.attempts
                 ),
                 keys: vec![told.miss.key.clone()],
-                prompt: coordinator_notice(state, &told.miss, now),
+                prompt: coordinator_notice(state, &told.miss, told.kind, now),
             };
             let notes = TypingNotes::default();
             let outcome = chat_runtime::deliver_reminder(
@@ -292,6 +346,10 @@ impl ReplySourceWatch {
             .map(|told| {
                 json!({
                     "key": told.miss.key,
+                    "kind": match told.kind {
+                        Kind::Uncaptured => "uncaptured",
+                        Kind::ScreenTable => "screen-table-refused",
+                    },
                     "reply_id": told.miss.reply_id,
                     "block_at_millis": told.miss.block_at_millis,
                     "coordinator_told": told.coordinator,
@@ -314,21 +372,29 @@ impl ReplySourceWatch {
     }
 }
 
-/// The notice that tells the coordinator its reply to `miss` was never captured.
-fn coordinator_notice(state: &BridgeState, miss: &Miss, now: u64) -> String {
+/// The notice that tells the coordinator its reply to `miss` did not go out, and why.
+fn coordinator_notice(state: &BridgeState, miss: &Miss, kind: Kind, now: u64) -> String {
     let send = state
         .capture_miss_reply_command(&miss.key, &miss.reply_id)
         .map_or_else(
             || "with `agentctl chat reply`, which `agentctl chat help` describes".to_owned(),
             |command| format!("with `{command}`, after writing the reply's text to that file"),
         );
+    let what = match kind {
+        Kind::Uncaptured => format!(
+            "your transcript holds the reply you printed {} min ago, but the bridge stored \
+nothing for it and posted nothing",
+            now.saturating_sub(miss.block_at_millis) / 60_000
+        ),
+        Kind::ScreenTable => "the bridge could read your reply only from the screen, which draws \
+its table mangled, and your transcript holds no such block, so it posted nothing"
+            .to_owned(),
+    };
     format!(
-        "[chat-bridge WARNING] The chat bridge did not capture your reply to the chat request with \
-reply ID {}: your transcript holds the reply you printed {} min ago, but the bridge stored \
-nothing for it and posted nothing. Send that reply again {send}. If you already sent it another \
-way, ignore this notice; it is sent only once.",
-        miss.reply_id,
-        now.saturating_sub(miss.block_at_millis) / 60_000
+        "[chat-bridge WARNING] The chat bridge did not send your reply to the chat request with \
+reply ID {}: {what}. Send that reply again {send}. If you already sent it another way, ignore \
+this notice; it is sent only once.",
+        miss.reply_id
     )
 }
 

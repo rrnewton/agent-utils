@@ -5120,6 +5120,35 @@ pub(crate) trait TranscriptReplies: Send + fmt::Debug {
     /// markers of `identifiers`: a harness can draw a block before it writes it. Each ID is
     /// waited for at most once.
     fn settle(&mut self, identifiers: &[String]);
+
+    /// Whether a transcript file is followed now. While one is, a screen block it does not
+    /// pair is held back rather than sent with its rendered text (#783
+    /// chat-reply-capture-miss): see [`SCREEN_FALLBACK_AFTER`].
+    fn following(&self) -> bool {
+        false
+    }
+}
+
+/// How long a screen block that a followed transcript does not pair is held back, from when a
+/// capture first read it, for the transcript to catch up (#783 chat-reply-capture-miss). After
+/// that, a block without a table is stored with its screen text, the last resort, and a block
+/// with a table, which a screen draws mangled, is refused and told to the owner and the
+/// coordinator.
+pub(crate) const SCREEN_FALLBACK_AFTER: Duration = Duration::from_secs(60);
+/// Most screen blocks remembered as held back before the memory starts over.
+const MAX_HELD_SCREEN_BLOCKS: usize = 4_096;
+/// Screen blocks held back, by `transcript_digest`: when a capture first read each, in Unix
+/// milliseconds, and whether it was refused.
+type HeldScreenBlocks = BTreeMap<[u8; 32], (u64, bool)>;
+
+/// A reply block read only from the screen and refused because its table would be sent
+/// mangled (#783 chat-reply-capture-miss), for the owner loop to tell.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ScreenTableRefusal {
+    pub(crate) key: String,
+    pub(crate) identifier: String,
+    /// When a capture first read the block, in Unix milliseconds.
+    pub(crate) first_seen_millis: u64,
 }
 
 /// One retained pane snapshot captured across all active request nonces.
@@ -5647,6 +5676,11 @@ pub struct BridgeState {
     transcript_replies: Option<Arc<std::sync::Mutex<Box<dyn TranscriptReplies>>>>,
     // Where that transcript reader last found the text, shared with it; also process-local.
     reply_source: Option<crate::chat_transcript::SharedReplySource>,
+    // Screen blocks held back while a transcript is followed: when a capture first read each,
+    // by `transcript_digest`, and whether it was refused; also process-local.
+    screen_held: Arc<std::sync::Mutex<HeldScreenBlocks>>,
+    // Screen-table refusals the owner loop has not told yet; also process-local.
+    screen_refusals: Arc<std::sync::Mutex<Vec<ScreenTableRefusal>>>,
     // Digests of the request keys and texts of transcript blocks a capture already settled,
     // stored or found already held, so later captures do not weigh them again.
     transcript_settled: Arc<std::sync::Mutex<BTreeSet<[u8; 32]>>>,
@@ -5785,6 +5819,8 @@ impl BridgeState {
             typed_retirements: Arc::default(),
             transcript_replies: None,
             reply_source: None,
+            screen_held: Arc::default(),
+            screen_refusals: Arc::default(),
             transcript_settled: Arc::default(),
             #[cfg(test)]
             admission_fault_after: Arc::new(std::sync::Mutex::new(None)),
@@ -5887,6 +5923,8 @@ impl BridgeState {
             typed_retirements: Arc::default(),
             transcript_replies: None,
             reply_source: None,
+            screen_held: Arc::default(),
+            screen_refusals: Arc::default(),
             transcript_settled: Arc::default(),
             #[cfg(test)]
             admission_fault_after: Arc::new(std::sync::Mutex::new(None)),
@@ -6046,6 +6084,74 @@ impl BridgeState {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .settle(&identifiers);
         }
+    }
+
+    /// Whether the transcript reader follows a transcript file now; see
+    /// [`TranscriptReplies::following`].
+    fn transcript_following(&self) -> bool {
+        self.transcript_replies.as_ref().is_some_and(|source| {
+            source
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .following()
+        })
+    }
+
+    /// When a capture first read the screen block `body` of request `key` and whether it was
+    /// refused, remembering `now_millis` as its first sight if it is new.
+    fn screen_first_seen(&self, key: &str, body: &str, now_millis: u64) -> (u64, bool) {
+        let mut held = self
+            .screen_held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A bound: forgetting only restarts a block's hold.
+        if held.len() > MAX_HELD_SCREEN_BLOCKS {
+            held.clear();
+        }
+        *held
+            .entry(transcript_digest(key, body))
+            .or_insert((now_millis, false))
+    }
+
+    /// Remember that the screen block `body` of request `key` was refused, and queue the
+    /// refusal for the owner loop.
+    fn refuse_screen_table(&self, key: &str, identifier: &str, body: &str, first_seen: u64) {
+        self.screen_held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(transcript_digest(key, body), (first_seen, true));
+        self.screen_refusals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(ScreenTableRefusal {
+                key: key.to_owned(),
+                identifier: identifier.to_owned(),
+                first_seen_millis: first_seen,
+            });
+    }
+
+    /// Move every held screen block's first sight back by `by`, as if that time had passed.
+    #[cfg(test)]
+    pub(crate) fn age_screen_holds(&self, by: Duration) {
+        let by = u64::try_from(by.as_millis()).unwrap_or(u64::MAX);
+        for (first_seen, _) in self
+            .screen_held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values_mut()
+        {
+            *first_seen = first_seen.saturating_sub(by);
+        }
+    }
+
+    /// The screen-table refusals not taken yet, oldest first.
+    pub(crate) fn take_screen_refusals(&self) -> Vec<ScreenTableRefusal> {
+        std::mem::take(
+            &mut *self
+                .screen_refusals
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
     /// The transcript blocks captures already settled; see [`transcript_digest`].
@@ -10113,6 +10219,7 @@ and the replies captured for them. The provider's own thread is the complete rec
         }
         // The transcript is read before the state lock is taken, so its reads never hold it.
         let transcript = self.transcript_blocks();
+        let following = self.transcript_following();
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
@@ -10253,7 +10360,8 @@ and the replies captured for them. The provider's own thread is the complete rec
                 .as_ref()
                 .and_then(|record| Some(record.withheld_identities(record.alias_of(key)?)))
                 .unwrap_or_default();
-            let text = transcript_text.remove(&nonce).unwrap_or_default();
+            let mut text = transcript_text.remove(&nonce).unwrap_or_default();
+            text.hold_screen = following;
             let capture = self.capture_scanned_replies_locked(
                 key,
                 &found.blocks,
@@ -11896,6 +12004,7 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
     ) -> Result<ReplyCapture> {
         // The transcript is read before the state lock is taken, so its reads never hold it.
         let transcript = self.transcript_blocks();
+        let following = self.transcript_following();
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
@@ -11970,9 +12079,10 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
                     .zip(aliases.as_ref())
                     .map(|(alias, record)| record.withheld_identities(alias))
                     .unwrap_or_default();
-                let text = transcript_text
+                let mut text = transcript_text
                     .remove(&request.reply_nonce)
                     .unwrap_or_default();
+                text.hold_screen = following;
                 let capture = self.capture_scanned_replies_locked(
                     key,
                     &found.blocks,
@@ -12108,6 +12218,30 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
                 continue;
             }
             let from_transcript = body != &block.body || transcript.only.contains(body);
+            // Screen text is the last resort while a transcript is followed (#783
+            // chat-reply-capture-miss): a block the transcript does not pair waits for it to catch
+            // up. Past the wait a plain block is stored as the screen drew it, but a table, which
+            // a screen draws mangled, is refused once and told to the owner and the coordinator.
+            if transcript.hold_screen && !from_transcript {
+                let now = unix_millis();
+                let (first_seen, refused_before) = self.screen_first_seen(key, body, now);
+                if refused_before {
+                    continue;
+                }
+                let held_for = now.saturating_sub(first_seen);
+                if u128::from(held_for) < SCREEN_FALLBACK_AFTER.as_millis() {
+                    continue;
+                }
+                if agent_harness::replies::has_table(body) {
+                    self.refuse_screen_table(key, &block.identifier, body, first_seen);
+                    refused.push(refusal(
+                        &"its table was read only from the screen, which draws tables mangled, \
+                          and the coordinator's transcript holds no such block; it was not sent, \
+                          and the owner and the coordinator were told",
+                    ));
+                    continue;
+                }
+            }
             if expected > MAX_REPLY_ORDINAL {
                 refused.push(refusal(&"reply ordinal space is exhausted"));
                 continue;
@@ -16627,8 +16761,9 @@ fn merge_transcript_blocks(
         return merged;
     }
     let mut paired = vec![false; candidates.len()];
-    // The rendered lengths of screen blocks no transcript block pairs with, by nonce and ID.
-    let mut unpaired: BTreeMap<(String, String), Vec<usize>> = BTreeMap::new();
+    // The screen blocks no transcript block pairs with, with their rendered lengths, by nonce
+    // and ID.
+    let mut unpaired: BTreeMap<(String, String), Vec<(usize, String)>> = BTreeMap::new();
     for (nonce, found) in by_nonce.iter() {
         for block in &found.blocks {
             if let Some(index) = candidates.iter().rposition(|(owner, source, _)| {
@@ -16645,36 +16780,46 @@ fn merge_transcript_blocks(
                 unpaired
                     .entry((nonce.clone(), block.identifier.clone()))
                     .or_default()
-                    .push(rendered_key(&block.body).chars().count());
+                    .push((
+                        rendered_key(&block.body).chars().count(),
+                        block.body.clone(),
+                    ));
             }
         }
     }
     let shown = rendered_key(rendered);
     for (index, (nonce, source, seen)) in candidates.iter().enumerate() {
-        if paired[index] || *seen {
+        if paired[index] {
             continue;
         }
         let key = rendered_key(&source.body);
         let label = agent_harness::replies::label_key(&source.body);
+        // A screen block under the same ID that pairs with nothing and is about as long is most
+        // likely this block drawn in a way the pairing does not know, as a table can be: the
+        // screen block takes this block's text, which the screen may have drawn mangled (#783
+        // chat-reply-capture-miss).
+        let length = key.chars().count();
+        if let Some(screens) = unpaired.get_mut(&((*nonce).to_owned(), source.identifier.clone())) {
+            if let Some(position) = screens
+                .iter()
+                .position(|(shown, _)| shown * 4 >= length * 3 && length * 4 >= shown * 3)
+            {
+                let (_, screen) = screens.remove(position);
+                let text = merged.entry((*nonce).to_owned()).or_default();
+                text.clean.insert(screen, source.body.clone());
+                text.consumed.insert(source.body.clone());
+                continue;
+            }
+        }
+        // A block a capture settled is not added again; it only claims its screen block above.
+        if *seen {
+            continue;
+        }
         // Visible elsewhere on the screen: the screen path handles it. A short text is visible
         // inside almost any screen, so it is not judged that way.
         if [&key, &label]
             .iter()
             .any(|key| key.chars().count() >= MIN_VISIBLE_KEY_CHARS && shown.contains(key.as_str()))
-        {
-            continue;
-        }
-        // A screen block under the same ID that pairs with nothing and is about as long is most
-        // likely this block drawn in a way the pairing does not know: it is stored from the
-        // screen, and this block waits (it is not settled) rather than be sent beside it.
-        let length = key.chars().count();
-        if unpaired
-            .get(&((*nonce).to_owned(), source.identifier.clone()))
-            .is_some_and(|lengths| {
-                lengths
-                    .iter()
-                    .any(|shown| shown * 4 >= length * 3 && length * 4 >= shown * 3)
-            })
         {
             continue;
         }
@@ -16715,6 +16860,9 @@ struct TranscriptText {
     only: BTreeSet<String>,
     /// Every transcript text this capture weighed for the request, settled once it is stored.
     consumed: BTreeSet<String>,
+    /// The blocks are a screen's and a transcript is followed, so a screen block the transcript
+    /// does not pair is held back (#783 chat-reply-capture-miss): see [`SCREEN_FALLBACK_AFTER`].
+    hold_screen: bool,
 }
 
 /// The shortest rendered text judged visible elsewhere on a screen by containment.
@@ -29056,6 +29204,7 @@ opening line for, the reply block marked {nonce}_2, so that block was not sent.\
     struct FixedTranscript {
         blocks: Vec<TranscriptBlock>,
         settled: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+        following: bool,
     }
 
     impl TranscriptReplies for FixedTranscript {
@@ -29065,6 +29214,10 @@ opening line for, the reply block marked {nonce}_2, so that block was not sent.\
 
         fn settle(&mut self, identifiers: &[String]) {
             self.settled.lock().unwrap().push(identifiers.to_vec());
+        }
+
+        fn following(&self) -> bool {
+            self.following
         }
     }
 
@@ -29263,6 +29416,90 @@ opening line for, the reply block marked {nonce}_2, so that block was not sent.\
         fs::remove_dir_all(root).expect("cleanup");
     }
 
+    /// `state` following a transcript file that holds `blocks`, with every request's prompt
+    /// delivered: screen blocks it does not pair are held back (#783 chat-reply-capture-miss).
+    fn with_followed_transcript(state: &BridgeState, blocks: Vec<TranscriptBlock>) -> BridgeState {
+        let state = with_transcript(state, Vec::new());
+        state.with_transcript_replies(Box::new(FixedTranscript {
+            blocks,
+            following: true,
+            ..FixedTranscript::default()
+        }))
+    }
+
+    /// #783 chat-reply-capture-miss slice (d): a screen block under the same ID that the pairing
+    /// cannot match to the transcript's block, as a mangled table, takes the transcript's text.
+    #[test]
+    fn a_same_id_screen_block_the_pairing_misses_takes_the_transcript_text() {
+        let (state, key, nonce, root) = open_request("transcript-wins");
+        let id = format!("{nonce}_1");
+        // The screen cut a cell short, so the two no longer read the same.
+        let mangled = DRAWN.replace("admitted to delivered", "admitted to deliv…");
+        let state = with_transcript(
+            &state,
+            vec![transcript_block(&id, WRITTEN, Some(unix_millis() + 1_000))],
+        );
+        let capture = state
+            .capture_snapshot(&reply_block(&id, &mangled))
+            .expect("capture");
+        assert_eq!(capture.replies, [(key.clone(), vec![1])]);
+        assert_eq!(capture.transcript_replies, [(key.clone(), vec![1])]);
+        assert_eq!(state.read_reply(&key, 1).expect("reply").body, WRITTEN);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// #783 chat-reply-capture-miss slice (d): while a transcript is followed, a screen block it
+    /// does not pair waits for it; past the wait a plain block is stored as drawn, and a table is
+    /// refused once and queued for the owner loop to tell. A command reply is never held.
+    #[test]
+    fn screen_text_is_the_last_resort_while_a_transcript_is_followed() {
+        let (state, key, nonce, root) = open_request("screen-last-resort");
+        let id = format!("{nonce}_1");
+        let state = with_followed_transcript(&state, Vec::new());
+        let plain = "Plain words, as drawn.";
+        let capture = state
+            .capture_snapshot(&reply_block(&id, plain))
+            .expect("plain, held");
+        assert!(capture.replies.is_empty(), "{capture:?}");
+        let capture = state
+            .capture_snapshot(&reply_block(&id, DRAWN))
+            .expect("table, held");
+        assert!(capture.replies.is_empty(), "{capture:?}");
+        assert!(capture.refused.is_empty(), "{capture:?}");
+        assert!(state.take_screen_refusals().is_empty());
+        state.age_screen_holds(SCREEN_FALLBACK_AFTER);
+        let capture = state
+            .capture_snapshot(&reply_block(&id, plain))
+            .expect("plain, past the wait");
+        assert_eq!(capture.replies, [(key.clone(), vec![1])]);
+        let capture = state
+            .capture_snapshot(&reply_block(&id, DRAWN))
+            .expect("table, past the wait");
+        assert!(capture.replies.is_empty(), "{capture:?}");
+        assert_eq!(capture.refused.len(), 1, "{capture:?}");
+        let refusals = state.take_screen_refusals();
+        assert_eq!(refusals.len(), 1, "{refusals:?}");
+        assert_eq!(
+            (refusals[0].key.as_str(), refusals[0].identifier.as_str()),
+            (key.as_str(), id.as_str())
+        );
+        // Refused once: a later read of it is skipped quietly.
+        let capture = state
+            .capture_snapshot(&reply_block(&id, DRAWN))
+            .expect("table again");
+        assert!(
+            capture.replies.is_empty() && capture.refused.is_empty(),
+            "{capture:?}"
+        );
+        assert!(state.take_screen_refusals().is_empty());
+        // `chat reply` is the way to send it, and is never held.
+        let stored = state
+            .submit_reply(&key, &id, WRITTEN)
+            .expect("command reply");
+        assert!(matches!(stored, ReplyStoreOutcome::Stored(_)), "{stored:?}");
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
     #[test]
     fn a_capture_for_one_request_takes_the_transcript_text_too() {
         let (state, key, nonce, root) = open_request("transcript-one-request");
@@ -29306,9 +29543,10 @@ opening line for, the reply block marked {nonce}_2, so that block was not sent.\
     }
 
     #[test]
-    fn a_screen_block_drawn_in_an_unknown_way_is_stored_once_from_the_screen() {
+    fn a_screen_block_drawn_in_an_unknown_way_takes_the_transcript_text_once() {
         // The terminal drew the task box in a way the pairing does not know, so the screen block
-        // pairs with nothing; the transcript block about as long waits instead of going out too.
+        // pairs with nothing; the transcript block about as long gives it its text (#783
+        // chat-reply-capture-miss), and a later read of the same screen block adds nothing.
         let (state, key, nonce, root) = open_request("transcript-unpaired");
         let id = format!("{nonce}_1");
         let written = "- [x] the release build passed and its checks are green on the host";
@@ -29319,8 +29557,8 @@ opening line for, the reply block marked {nonce}_2, so that block was not sent.\
             .capture_snapshot(&reply_block(&id, drawn))
             .expect("capture");
         assert_eq!(capture.replies, [(key.clone(), vec![1])]);
-        assert!(capture.transcript_replies.is_empty(), "{capture:?}");
-        assert_eq!(state.read_reply(&key, 1).expect("reply").body, drawn);
+        assert_eq!(capture.transcript_replies, [(key.clone(), vec![1])]);
+        assert_eq!(state.read_reply(&key, 1).expect("reply").body, written);
         assert!(reader
             .capture_snapshot(&reply_block(&id, drawn))
             .expect("again")
@@ -29409,6 +29647,7 @@ opening line for, the reply block marked {nonce}_2, so that block was not sent.\
             .with_transcript_replies(Box::new(FixedTranscript {
                 blocks: Vec::new(),
                 settled: Arc::clone(&settled),
+                ..FixedTranscript::default()
             }));
         let id = format!("{nonce}_1");
         reader.settle_transcript(&format!(

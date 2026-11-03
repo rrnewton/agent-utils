@@ -15066,6 +15066,80 @@ esac
         fn settle(&mut self, _identifiers: &[String]) {}
     }
 
+    /// A followed transcript that holds no reply blocks.
+    #[derive(Debug)]
+    struct FollowedEmpty;
+
+    impl chat_runtime::TranscriptReplies for FollowedEmpty {
+        fn blocks(&mut self) -> Vec<chat_runtime::TranscriptBlock> {
+            Vec::new()
+        }
+
+        fn settle(&mut self, _identifiers: &[String]) {}
+
+        fn following(&self) -> bool {
+            true
+        }
+    }
+
+    /// #783 chat-reply-capture-miss slice (d): a table read only from the screen while a
+    /// transcript is followed is refused past the wait, and the owner is warned once.
+    #[test]
+    fn a_table_read_only_from_the_screen_is_refused_and_told_once() {
+        let fixture = crate::subagents::tests::Fixture::new();
+        let (state, key, root) = state_with_request();
+        state
+            .put_delivery_phase(&key, RequestPhase::Delivered, None)
+            .expect("delivered");
+        let candidate = state
+            .reply_reminder_candidates()
+            .expect("candidates")
+            .candidates
+            .remove(0);
+        let source = crate::chat_transcript::SharedReplySource::default();
+        *source.lock().unwrap() = Some(crate::chat_transcript::ReplySource {
+            path: Some("/t/s-1.jsonl".into()),
+            evidence: "process 7 names it".into(),
+            discovered: false,
+            unbound_session: None,
+        });
+        let state = state
+            .with_transcript_replies(Box::new(FollowedEmpty))
+            .with_reply_source(source);
+        let id = &candidate.reply_id;
+        let table =
+            format!("<CHAT_REPLY_{id}>\n│ Leg │ Time │\n│ one │ 5 s  │\n</CHAT_REPLY_{id}>\n");
+        assert!(state
+            .capture_snapshot(&table)
+            .expect("held")
+            .replies
+            .is_empty());
+        state.age_screen_holds(chat_runtime::SCREEN_FALLBACK_AFTER);
+        let capture = state.capture_snapshot(&table).expect("refused");
+        assert!(capture.replies.is_empty(), "{capture:?}");
+        assert_eq!(capture.refused.len(), 1, "{capture:?}");
+        let stop = StopState::default();
+        let manager = fixture.manager();
+        let delivery = DrainOptions {
+            ready_timeout: Duration::ZERO,
+            ..DrainOptions::default()
+        };
+        let mut watch = reply_source::ReplySourceWatch::default();
+        let mut roots = RecordingRoots::default();
+        watch.step(&state, &manager, &stop, delivery, Some(&mut roots));
+        assert_eq!(roots.posts.len(), 1, "{:?}", roots.posts);
+        assert!(
+            roots.posts[0].1.contains("with a table"),
+            "{}",
+            roots.posts[0].1
+        );
+        let record = state.reply_source_record().expect("recorded");
+        assert_eq!(record["capture_misses"][0]["kind"], "screen-table-refused");
+        watch.step(&state, &manager, &stop, delivery, Some(&mut roots));
+        assert_eq!(roots.posts.len(), 1, "told once: {:?}", roots.posts);
+        fs::remove_dir_all(root).ok();
+    }
+
     /// #783 chat-reply-capture-miss: a reply block the coordinator's transcript holds while the
     /// bridge holds no reply to its request warns the owner once, and is recorded, with where
     /// the reply text comes from, for `chat health`.

@@ -826,10 +826,11 @@ when its cells wrap. A paired block is skipped if the request already holds
 either text, and otherwise stored with the transcript's text. A complete
 transcript block that pairs with no screen block is stored even when no read of
 the screen shows it, as when Claude Code collapsed it or it scrolled away,
-unless its text (of at least 24 such characters) is visible elsewhere on the
-screen, a stored reply of the request reads the same in that sense, or a screen
-block under the same ID that pairs with nothing is about as long; then the
-screen's block is stored and the transcript's waits. A transcript block a
+unless a screen block under the same ID that pairs with nothing is about as
+long, which then takes the transcript's text (a screen can draw a table so that
+no rule pairs the two, and the screen's text is the mangled one), or its text
+(of at least 24 such characters) is visible elsewhere on the screen, or a stored
+reply of the request reads the same in that sense. A transcript block a
 capture stored, or found already held, is not weighed again by that service. Before a capture the service waits up to one
 second, once per reply ID, for the transcript to hold a block whose closing
 marker the screen already shows on a row of its own. The service log names the
@@ -839,7 +840,13 @@ stored with transcript text. With no transcript, for a headless coordinator, or
 with `AGENTCTL_CHAT_REPLY_TEXT=screen` in the service's environment, every reply
 keeps the text read from the screen, and replies are told apart as they always
 are. Screen reads decide everything else: delivery, readiness, forms and
-feedback.
+feedback. While a transcript is followed, screen text is the last resort: a
+screen block the transcript does not pair is held back for up to 60 seconds
+from when a capture first read it, for the transcript to catch up. After that a
+block without a table is stored as the screen drew it, and a block with a
+table, which a screen draws mangled, is refused once, logged as `SCREEN TABLE
+REFUSED`, posted to the channel as a `[chat-bridge WARNING]`, and told to the
+coordinator with the `chat reply` command that sends it, as a capture miss is.
 
 A record that names no conversation, and no process that finds one (as an
 adopted coordinator's can), does not leave the bridge on screen text alone. The

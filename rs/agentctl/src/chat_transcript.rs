@@ -343,6 +343,10 @@ impl TranscriptReplies for CoordinatorTranscript {
             self.waited.pop_front();
         }
     }
+
+    fn following(&self) -> bool {
+        self.follower.is_some()
+    }
 }
 
 /// The harness and transcript hints of agent `name` in `registry`, from its record: the pinned
