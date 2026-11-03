@@ -59,3 +59,43 @@ def test_reanchor_generation_mismatch_is_none(
 ) -> None:
     record = _record(tmp_path, monkeypatch, generation=2)
     assert wrkslots_cli._reanchor_liveness(record) is None  # type: ignore[arg-type]
+
+
+def test_real_agentctl_writer_records_reanchor() -> None:
+    """The real #744 writer appends the agreed entry on anchor --replace.
+
+    Runs agentctl's own Rust test, which drives ManagedAgents::anchor with
+    --replace against its fake Herdr client and asserts the agent.json
+    `reanchors` entry (reason restart-same-pane, current pid, null
+    slot_generation) that the reader above consumes.
+    """
+    import subprocess
+
+    repo = Path(__file__).resolve().parents[3]
+    result = subprocess.run(
+        [
+            "cargo", "test", "--quiet", "--locked",
+            "--manifest-path", str(repo / "rs" / "Cargo.toml"),
+            "-p", "agentctl", "--lib",
+            "anchor_refuses_a_changed_harness_without_replace",
+        ],
+        cwd=repo, capture_output=True, text=True, check=False, timeout=900,
+    )
+    assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-2000:]
+
+
+def test_writer_shaped_entry_is_alive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The exact entry record_reanchor emits (null generation) reads alive."""
+    record = _record(tmp_path, monkeypatch, generation=None)
+    document = json.loads(
+        (tmp_path / "agents" / "agent-a" / "agent.json").read_text()
+    )
+    entry = document["reanchors"][0]
+    entry["reason"] = "restart-same-pane"
+    (tmp_path / "agents" / "agent-a" / "agent.json").write_text(json.dumps(document))
+    answer = wrkslots_cli._reanchor_liveness(record)  # type: ignore[arg-type]
+    assert answer is not None
+    assert answer.state == "alive"
+    assert "re-registered" in answer.detail
