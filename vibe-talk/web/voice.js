@@ -32942,8 +32942,19 @@ function onStreamFrame(frame) {
   }
 }
 
-let liveMutationRefreshRunning = false;
-let liveMutationRefreshNeeded = false;
+// Whether a re-read for live edits is owed or running, and the loop that waits out a read in flight and
+// reads again for edits arriving during it: web/src/core/sync/coalesce.ts (`#624 voice-page-modularity`).
+const mutationRefresh = createMutationRefresh({
+  clock: clockOnUse(),
+  busy: () => discordFetchInFlight,
+  read: async () => {
+    const since = replayLedger.started();
+    await loadDiscord({ keepPosition: true, reason: "mutation" });
+    // An edit may be in the thread on the right. `#229 desktop-two-column`.
+    await readSideColumn("mutation", since);
+  },
+  launch: (run) => refreshQuietly(run)(),
+});
 
 /** Coalesce a burst of edits/deletes into authoritative re-reads without leaving a stale tail. */
 function refreshAfterLiveMutation() {
@@ -32952,30 +32963,7 @@ function refreshAfterLiveMutation() {
     hiddenStream.noteMutation();
     return;
   }
-  liveMutationRefreshNeeded = true;
-  if (liveMutationRefreshRunning) {
-    return;
-  }
-  liveMutationRefreshRunning = true;
-  refreshQuietly(async () => {
-    try {
-      while (liveMutationRefreshNeeded) {
-        liveMutationRefreshNeeded = false;
-        // If an ordinary page read is already in flight, wait for it. It may have started before
-        // the adapter applied this mutation, so treating it as the refresh could preserve a stale
-        // row forever.
-        while (discordFetchInFlight) {
-          await new Promise((resolve) => setTimeout(resolve, 50));
-        }
-        const since = replayLedger.started();
-        await loadDiscord({ keepPosition: true, reason: "mutation" });
-        // An edit may be in the thread on the right. `#229 desktop-two-column`.
-        await readSideColumn("mutation", since);
-      }
-    } finally {
-      liveMutationRefreshRunning = false;
-    }
-  })();
+  mutationRefresh.request();
 }
 
 /**

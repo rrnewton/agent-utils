@@ -54,6 +54,7 @@ declare const createChannelPoll: LegacyImports["createChannelPoll"];
 declare const LIVE_RETRY_MS: LegacyImports["LIVE_RETRY_MS"];
 declare const createStreamGeneration: LegacyImports["createStreamGeneration"];
 declare const createChannelFollow: LegacyImports["createChannelFollow"];
+declare const createMutationRefresh: LegacyImports["createMutationRefresh"];
 declare const createHiddenStream: LegacyImports["createHiddenStream"];
 declare const joinQueuedReads: LegacyImports["joinQueuedReads"];
 declare const deltaCursor: LegacyImports["deltaCursor"];

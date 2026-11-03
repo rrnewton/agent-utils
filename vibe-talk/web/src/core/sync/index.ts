@@ -30,3 +30,5 @@ export { LIVE_ATTACH_WAIT_MS, createChannelFollow } from "./follow.ts";
 export type { ChannelFollow, ChannelFollowDependencies, StreamResponse } from "./follow.ts";
 export { LIVE_HIDDEN_CLOSE_MS, createHiddenStream } from "./hidden.ts";
 export type { HiddenResume, HiddenStream, HiddenStreamDependencies } from "./hidden.ts";
+export { createMutationRefresh } from "./coalesce.ts";
+export type { MutationRefresh, MutationRefreshDependencies } from "./coalesce.ts";

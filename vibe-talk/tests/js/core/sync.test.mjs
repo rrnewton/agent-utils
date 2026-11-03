@@ -408,3 +408,41 @@ test("`#624 voice-page-modularity`: a hidden page lets its stream go after LIVE_
   fire();
   assert.equal(stops, 1, "a page shown again when the timer runs keeps its stream");
 });
+
+test("`#624 voice-page-modularity`: a burst of live edits is one re-read, one arriving during it is one more, and a read in flight is waited out", async () => {
+  const { createMutationRefresh } = SYNC;
+  const timers = [];
+  let busy = true;
+  let reads = 0;
+  let release = null;
+  let launched = null;
+  const refresh = createMutationRefresh({
+    clock: { setTimeout: (run, ms) => { timers.push({ run, ms }); return timers.length; }, clearTimeout: () => {} },
+    busy: () => busy,
+    read: () => { reads += 1; return new Promise((resolve) => { release = resolve; }); },
+    launch: (run) => { launched = run(); },
+  });
+  const settle = () => new Promise((resolve) => setImmediate(resolve));
+  refresh.request();
+  refresh.request();
+  await settle();
+  assert.equal(reads, 0, "an ordinary read in flight is waited for");
+  assert.deepStrictEqual(timers.map((t) => t.ms), [50]);
+  busy = false;
+  timers.shift().run();
+  await settle();
+  assert.equal(reads, 1, "two edits before the read began are one read");
+  refresh.request();
+  refresh.request();
+  release();
+  await settle();
+  assert.equal(reads, 2, "edits during the read are one read more");
+  release();
+  await launched;
+  assert.equal(reads, 2);
+  refresh.request();
+  await settle();
+  assert.equal(reads, 3, "the loop ended, a new edit starts it again");
+  release();
+  await launched;
+});

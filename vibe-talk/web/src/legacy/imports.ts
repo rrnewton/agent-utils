@@ -36,6 +36,7 @@ export {
   createChannelPoll,
   createHiddenStream,
   createLiveEvents,
+  createMutationRefresh,
   createReadHolds,
   createReadOrder,
   createReplayLedger,
