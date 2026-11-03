@@ -1,13 +1,14 @@
 ---
 title: 'voice-page-quoted-reply-and-draft-chip: the quoted-reply button always works; a Draft chip finds every unsent draft'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 assignee: cl-refactor@devbig030
 labels:
 - vibe-talk
 created_at: 2026-11-03T15:53:06.387811132+00:00
-updated_at: 2026-11-03T15:53:06.387811132+00:00
+updated_at: 2026-11-03T18:14:25.295348515+00:00
+closed_at: 2026-11-03T18:14:25.295348395+00:00
 ---
 
 # Description
