@@ -789,6 +789,290 @@ fn shared_bot_signed_identity_admits_forgery_is_stranger() {
 }
 
 #[test]
+fn envelope_v2_signature_covers_scope_fields_and_v1_envelopes_still_verify() {
+    // #800: v2 covers kind/topic/supersedes/in_reply_to/private/key;
+    // a v1-only envelope (sig2 and version removed) still verifies.
+    let world = World::new();
+    std::fs::create_dir_all(&world.state).unwrap();
+    agent_teams::relay::ensure_signing_key(&world.state, "sim", "host-a").expect("key");
+    let mut envelope = agent_teams::envelope::build_envelope(
+        "tm-sim-8000000000000001",
+        "original-key",
+        "sim",
+        "host-a",
+        1,
+        "harness-ancestry",
+        "tools",
+        "host-a",
+        "request",
+        Some("scope-topic"),
+        &["tm-sim-8000000000000000".to_string()],
+        true,
+        agent_teams::timeutil::now_unix_ms(),
+        agent_teams::timeutil::now_unix_ms() + 7_200_000,
+        Some("tm-tools-8000000000000000"),
+        "v2 scope body",
+    );
+    agent_teams::relay::sign_envelope(&world.state, &mut envelope).expect("sign");
+    assert_eq!(envelope["relay"]["v"], 2, "signing emits v2: {envelope}");
+    assert!(
+        envelope["relay"]["sig2"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()),
+        "signing emits sig2: {envelope}"
+    );
+    assert!(
+        agent_teams::relay::verify_envelope(&envelope),
+        "v2 verifies"
+    );
+
+    for (field, value) in [
+        ("kind", serde_json::json!("info")),
+        ("topic", serde_json::json!("other-topic")),
+        ("private", serde_json::json!(false)),
+        ("key", serde_json::json!("replaced-key")),
+    ] {
+        let mut tampered = envelope.clone();
+        tampered[field] = value;
+        assert!(
+            !agent_teams::relay::verify_envelope(&tampered),
+            "{field} is covered by v2"
+        );
+    }
+    let mut tampered = envelope.clone();
+    tampered["supersedes"] = serde_json::json!([]);
+    assert!(
+        !agent_teams::relay::verify_envelope(&tampered),
+        "supersedes covered"
+    );
+    let mut tampered = envelope.clone();
+    tampered["reply_to"]["in_reply_to"] = serde_json::json!("tm-tools-8000000000000099");
+    assert!(
+        !agent_teams::relay::verify_envelope(&tampered),
+        "in_reply_to covered"
+    );
+
+    let mut v1_only = envelope.clone();
+    let relay = v1_only["relay"].as_object_mut().unwrap();
+    relay.remove("sig2");
+    relay.remove("v");
+    assert!(
+        agent_teams::relay::verify_envelope(&v1_only),
+        "v1-only envelope still verifies"
+    );
+
+    let mut corrupt_v2 = envelope;
+    corrupt_v2["relay"]["sig2"] = serde_json::json!("00".repeat(64));
+    assert!(
+        !agent_teams::relay::verify_envelope(&corrupt_v2),
+        "bad sig2 rejected"
+    );
+}
+
+#[test]
+fn sticky_v2_sender_has_stripped_sig2_refused_after_first_v2() {
+    // #800 sticky per-peer upgrade: a sender never seen with v2 passes
+    // v1; once a v2 post verifies, a stripped sig2 post is refused
+    // with a downgrade integrity alarm.
+    const SHARED: &str = "USHAREDBOT";
+    let world = World::new();
+    world.init_tools(&format!("relay-coord:{CHAN}:{SHARED}=sim@host-b"));
+    let (_, sim_public) =
+        agent_teams::relay::ensure_signing_key(&world.state, "sim", "host-b").expect("sim key");
+    agent_teams::relay::trust_key(&world.state, "sim", "host-b", &sim_public, "test")
+        .expect("trust sim");
+
+    // Post one envelope from sim@host-b, optionally stripped to v1.
+    let post = |n: u64, body: &str, strip: bool| -> String {
+        let mut envelope = agent_teams::envelope::build_envelope(
+            &format!("tm-sim-80000000000001{n:02}"),
+            &format!("relay-v2-sticky-{n}"),
+            "sim",
+            "host-b",
+            i64::try_from(n).unwrap(),
+            "harness-ancestry",
+            "tools",
+            "host-a",
+            "request",
+            None,
+            &[],
+            false,
+            agent_teams::timeutil::now_unix_ms(),
+            agent_teams::timeutil::now_unix_ms() + 7_200_000,
+            None,
+            body,
+        );
+        agent_teams::relay::sign_envelope(&world.state, &mut envelope).expect("sign");
+        if strip {
+            let relay = envelope["relay"].as_object_mut().unwrap();
+            relay.remove("sig2");
+            relay.remove("v");
+        }
+        agent_teams::relay::render_post(&envelope)
+    };
+
+    // Never seen with v2: v1-only passes.
+    let outcome = world.relay_in(SHARED, &post(1, "v1 before upgrade", true));
+    assert_eq!(
+        outcome["outcome"], "accepted",
+        "v1-only before sticky: {outcome}"
+    );
+    assert!(world.ledger_has("tools", "tm-sim-8000000000000101"));
+
+    // First v2 post verifies and sticks.
+    let outcome = world.relay_in(SHARED, &post(2, "first v2", false));
+    assert_eq!(outcome["outcome"], "accepted", "first v2: {outcome}");
+    assert!(world.ledger_has("tools", "tm-sim-8000000000000102"));
+
+    // Same sender, sig2 stripped: refused as a downgrade.
+    let outcome = world.relay_in(SHARED, &post(3, "stripped after upgrade", true));
+    assert_eq!(outcome["outcome"], "downgrade-quarantined", "{outcome}");
+    assert!(
+        !world.ledger_has("tools", "tm-sim-8000000000000103"),
+        "downgrade not delivered"
+    );
+    assert!(
+        agent_teams::relay::alarms(&world.state).iter().any(|a| {
+            a["kind"] == "integrity"
+                && a["reason"]
+                    .as_str()
+                    .is_some_and(|r| r.contains("downgrade"))
+        }),
+        "downgrade integrity alarm: {:?}",
+        agent_teams::relay::alarms(&world.state)
+    );
+}
+
+#[test]
+fn envelope_v2_material_cannot_be_shifted_across_fields() {
+    // #800 review: newline-joined fields are ambiguous. kind="a\nb",
+    // topic="c" must not sign the same material as kind="a",
+    // topic="b\nc"; a supersedes id must not absorb the private line;
+    // wrong-typed fields are refused at sign and at verify.
+    let world = World::new();
+    std::fs::create_dir_all(&world.state).unwrap();
+    agent_teams::relay::ensure_signing_key(&world.state, "sim", "host-a").expect("key");
+    let build = |kind: &str, topic: Option<&str>, supersedes: Vec<String>| {
+        agent_teams::envelope::build_envelope(
+            "tm-sim-8000000000000010",
+            "ambiguity-key",
+            "sim",
+            "host-a",
+            1,
+            "harness-ancestry",
+            "tools",
+            "host-a",
+            kind,
+            topic,
+            &supersedes,
+            true,
+            1_760_000_000_000,
+            1_760_000_000_000 + 7_200_000,
+            None,
+            "ambiguity body",
+        )
+    };
+    let mut signed = build("a\nb", Some("c"), vec!["tm-sim-1".to_string()]);
+    agent_teams::relay::sign_envelope(&world.state, &mut signed).expect("sign");
+    let relay_block = signed["relay"].clone();
+
+    let mut shifted = build("a", Some("b\nc"), vec!["tm-sim-1".to_string()]);
+    shifted["relay"] = relay_block.clone();
+    assert!(
+        !agent_teams::relay::verify_envelope(&shifted),
+        "kind/topic newline shift must not verify"
+    );
+
+    let mut shifted = build("request", None, vec!["a\ntrue".to_string()]);
+    shifted.as_object_mut().unwrap().remove("private");
+    shifted["relay"] = relay_block;
+    let mut reference = build("request", None, vec!["a".to_string()]);
+    agent_teams::relay::sign_envelope(&world.state, &mut reference).expect("sign reference");
+    shifted["relay"] = reference["relay"].clone();
+    assert!(
+        !agent_teams::relay::verify_envelope(&shifted),
+        "supersedes newline shift must not verify"
+    );
+
+    // Wrong-typed: topic as an array verifies as absent under v1-style
+    // get(); under v2 it must be refused, and signing it must fail.
+    let mut wrong = build("request", None, vec![]);
+    agent_teams::relay::sign_envelope(&world.state, &mut wrong).expect("sign typed");
+    wrong["topic"] = serde_json::json!(["x"]);
+    assert!(
+        !agent_teams::relay::verify_envelope(&wrong),
+        "wrong-typed topic refused at verify"
+    );
+    let mut wrong = build("request", None, vec![]);
+    wrong["key"] = serde_json::json!(5);
+    assert!(
+        agent_teams::relay::sign_envelope(&world.state, &mut wrong).is_err(),
+        "wrong-typed key refused at sign"
+    );
+}
+
+#[test]
+fn sticky_v2_reset_readmits_sig_only_envelopes() {
+    // #800 recovery: after a peer rolls back to a v1 build, the owner
+    // resets that key's sticky v2 record and sig-only envelopes flow
+    // again. The downgrade alarm names the reset command.
+    const SHARED: &str = "USHAREDBOT";
+    let world = World::new();
+    world.init_tools(&format!("relay-coord:{CHAN}:{SHARED}=sim@host-b"));
+    let (_, sim_public) =
+        agent_teams::relay::ensure_signing_key(&world.state, "sim", "host-b").expect("sim key");
+    agent_teams::relay::trust_key(&world.state, "sim", "host-b", &sim_public, "test")
+        .expect("trust sim");
+    let post = |n: u64, body: &str, strip: bool| -> String {
+        let mut envelope = agent_teams::envelope::build_envelope(
+            &format!("tm-sim-80000000000002{n:02}"),
+            &format!("relay-v2-reset-{n}"),
+            "sim",
+            "host-b",
+            i64::try_from(n).unwrap(),
+            "harness-ancestry",
+            "tools",
+            "host-a",
+            "request",
+            None,
+            &[],
+            false,
+            agent_teams::timeutil::now_unix_ms(),
+            agent_teams::timeutil::now_unix_ms() + 7_200_000,
+            None,
+            body,
+        );
+        agent_teams::relay::sign_envelope(&world.state, &mut envelope).expect("sign");
+        if strip {
+            let relay = envelope["relay"].as_object_mut().unwrap();
+            relay.remove("sig2");
+            relay.remove("v");
+        }
+        agent_teams::relay::render_post(&envelope)
+    };
+    let outcome = world.relay_in(SHARED, &post(1, "first v2", false));
+    assert_eq!(outcome["outcome"], "accepted", "first v2: {outcome}");
+    let outcome = world.relay_in(SHARED, &post(2, "stripped", true));
+    assert_eq!(outcome["outcome"], "downgrade-quarantined", "{outcome}");
+    assert!(
+        agent_teams::relay::alarms(&world.state).iter().any(|a| {
+            a["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("reset-sig-v2"))
+        }),
+        "downgrade alarm names the recovery: {:?}",
+        agent_teams::relay::alarms(&world.state)
+    );
+    assert!(
+        agent_teams::relay::reset_trusted_key_sig_v2(&world.state, "sim", "host-b").expect("reset"),
+        "reset records a change"
+    );
+    let outcome = world.relay_in(SHARED, &post(3, "sig-only after reset", true));
+    assert_eq!(outcome["outcome"], "accepted", "after reset: {outcome}");
+    assert!(world.ledger_has("tools", "tm-sim-8000000000000203"));
+}
+
+#[test]
 fn slack_mangled_own_announce_is_ignored_not_stranger() {
     // Exact live shape: Slack strips the fence info string, leaving a bare
     // ``` fence around the announce JSON. Our own announce must loop back

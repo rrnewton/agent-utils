@@ -598,6 +598,72 @@ fn envelope_material(envelope: &Value) -> String {
     )
 }
 
+/// Encode one optional string field unambiguously: `-1:` for
+/// null/absent, else its byte length, a colon, then the bytes. No
+/// field content can move a byte across a boundary.
+fn encode_v2_field(value: Option<&str>) -> String {
+    match value {
+        None => "-1:".to_string(),
+        Some(text) => format!("{}:{text}", text.len()),
+    }
+}
+
+/// A string field's value for v2: None for null/absent, the string
+/// for a string, and a hard refusal (None from the caller) for any
+/// other JSON type — a number or array must not canonicalise as
+/// absent.
+fn v2_string(envelope: &Value, path: &[&str]) -> Option<Option<String>> {
+    let mut value = envelope;
+    for key in path {
+        value = value.get(key).unwrap_or(&Value::Null);
+    }
+    match value {
+        Value::Null => Some(None),
+        Value::String(text) => Some(Some(text.clone())),
+        _ => None,
+    }
+}
+
+/// The v2 signed material (#800): every v1 field, in the same order
+/// (that prefix is frozen), plus the routing fields v1 left unsigned —
+/// kind, topic, supersedes, private, reply_to.in_reply_to and key.
+/// The tail is length-prefixed field by field (see `encode_v2_field`),
+/// so a newline inside any field or supersedes id cannot shift bytes
+/// into a neighbour. Wrong-typed covered fields make the material
+/// unrepresentable: signing and verification both refuse them.
+fn envelope_material_v2(envelope: &Value) -> Option<String> {
+    let kind = v2_string(envelope, &["kind"])?;
+    let topic = v2_string(envelope, &["topic"])?;
+    let key = v2_string(envelope, &["key"])?;
+    let in_reply_to = v2_string(envelope, &["reply_to", "in_reply_to"])?;
+    let private = match envelope.get("private").unwrap_or(&Value::Null) {
+        Value::Null => None,
+        Value::Bool(value) => Some(if *value { "true" } else { "false" }.to_string()),
+        _ => return None,
+    };
+    let supersedes = match envelope.get("supersedes").unwrap_or(&Value::Null) {
+        Value::Null => None,
+        Value::Array(items) => {
+            let mut encoded = format!("{}:", items.len());
+            for item in items {
+                encoded.push_str(&encode_v2_field(Some(item.as_str()?)));
+            }
+            Some(encoded)
+        }
+        _ => return None,
+    };
+    Some(format!(
+        "agent-teams-envelope/v2\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+        envelope_material(envelope),
+        encode_v2_field(kind.as_deref()),
+        encode_v2_field(topic.as_deref()),
+        supersedes.unwrap_or_else(|| "-1:".to_string()),
+        encode_v2_field(private.as_deref()),
+        encode_v2_field(in_reply_to.as_deref()),
+        encode_v2_field(key.as_deref()),
+    ))
+}
+
 /// Sign one envelope in place with its sender team@host's key.
 pub fn sign_envelope(state: &Path, envelope: &mut Value) -> DataResult<()> {
     let team = envelope["from"]["team"].as_str().unwrap_or("").to_string();
@@ -611,16 +677,27 @@ pub fn sign_envelope(state: &Path, envelope: &mut Value) -> DataResult<()> {
     let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
     use ed25519_dalek::Signer as _;
     let signature = signing.sign(envelope_material(envelope).as_bytes());
-    envelope["relay"] = json!({"pubkey": public, "sig": bytes_hex(&signature.to_bytes())});
+    let Some(material_v2) = envelope_material_v2(envelope) else {
+        return Err(DataError::new(
+            "envelope",
+            "a v2-covered field (kind, topic, supersedes, private, reply_to.in_reply_to, key) has the wrong JSON type",
+        ));
+    };
+    let signature_v2 = signing.sign(material_v2.as_bytes());
+    envelope["relay"] = json!({
+        "v": 2,
+        "pubkey": public,
+        "sig": bytes_hex(&signature.to_bytes()),
+        "sig2": bytes_hex(&signature_v2.to_bytes()),
+    });
     Ok(())
 }
 
-/// Verify an envelope's signature against its embedded public key.
-pub fn verify_envelope(envelope: &Value) -> bool {
+fn verify_signature(envelope: &Value, field: &str, material: &[u8]) -> bool {
     let Some(public) = envelope["relay"]["pubkey"].as_str() else {
         return false;
     };
-    let Some(sig) = envelope["relay"]["sig"].as_str() else {
+    let Some(sig) = envelope["relay"][field].as_str() else {
         return false;
     };
     let (Some(public), Some(sig)) = (hex_bytes(public), hex_bytes(sig)) else {
@@ -637,8 +714,31 @@ pub fn verify_envelope(envelope: &Value) -> bool {
     };
     let signature = ed25519_dalek::Signature::from_bytes(&sig);
     use ed25519_dalek::Verifier as _;
-    key.verify(envelope_material(envelope).as_bytes(), &signature)
-        .is_ok()
+    key.verify(material, &signature).is_ok()
+}
+
+/// Whether an envelope carries a v2 signature at all (valid or not).
+fn envelope_has_sig2(envelope: &Value) -> bool {
+    envelope
+        .get("relay")
+        .and_then(|relay| relay.get("sig2"))
+        .is_some()
+}
+
+/// Verify an envelope's signature against its embedded public key.
+/// An envelope carrying `sig2` must verify under the v2 material —
+/// there is no fallback to the v1 signature, so stripping or forging
+/// v2 cannot be laundered through v1. An envelope without `sig2`
+/// verifies under v1 exactly as before (#800).
+pub fn verify_envelope(envelope: &Value) -> bool {
+    if envelope_has_sig2(envelope) {
+        match envelope_material_v2(envelope) {
+            Some(material) => verify_signature(envelope, "sig2", material.as_bytes()),
+            None => false,
+        }
+    } else {
+        verify_signature(envelope, "sig", envelope_material(envelope).as_bytes())
+    }
 }
 
 fn receipt_material(id: &str, state_name: &str, team: &str, host: &str) -> String {
@@ -726,6 +826,84 @@ pub fn trusted_keys(state: &Path) -> Vec<Value> {
     store_list(&store, "keys").to_vec()
 }
 
+/// Whether this team@host's trusted key has verified an envelope v2
+/// signature, so sig-only envelopes from it are downgrades (#800).
+pub fn trusted_key_requires_sig_v2(state: &Path, team: &str, host: &str) -> bool {
+    let store = load_store(state);
+    store_list(&store, "keys").iter().any(|entry| {
+        entry.get("team").and_then(Value::as_str) == Some(team)
+            && entry.get("host").and_then(Value::as_str) == Some(host)
+            && entry.get("sig_v2").and_then(Value::as_bool) == Some(true)
+    })
+}
+
+fn note_trusted_key_sig_v2_locked(
+    state: &Path,
+    team: &str,
+    host: &str,
+    pubkey: &str,
+) -> DataResult<bool> {
+    let mut store = load_store(state);
+    let Some(keys) = store.get_mut("keys").and_then(Value::as_array_mut) else {
+        return Ok(false);
+    };
+    let Some(entry) = keys.iter_mut().find(|entry| {
+        entry.get("team").and_then(Value::as_str) == Some(team)
+            && entry.get("host").and_then(Value::as_str) == Some(host)
+            && entry.get("pubkey").and_then(Value::as_str) == Some(pubkey)
+    }) else {
+        return Ok(false);
+    };
+    if entry.get("sig_v2").and_then(Value::as_bool) == Some(true) {
+        return Ok(false);
+    }
+    entry["sig_v2"] = json!(true);
+    entry["sig_v2_seen_at"] = json!(format_rfc3339_ms(now_unix_ms()));
+    save_store(state, &store)?;
+    Ok(true)
+}
+
+/// Record, next to a trusted key, that it has verified an envelope v2
+/// signature (#800 sticky per-peer upgrade). Written atomically with
+/// the relay store under its lock. Returns whether this call recorded
+/// the upgrade (false when already recorded, or when the named key is
+/// not the trusted one).
+pub fn note_trusted_key_sig_v2(
+    state: &Path,
+    team: &str,
+    host: &str,
+    pubkey: &str,
+) -> DataResult<bool> {
+    let _lock = lock_store(state)?;
+    note_trusted_key_sig_v2_locked(state, team, host, pubkey)
+}
+
+/// Clear one trusted key's sticky v2 record (#800 recovery): the
+/// peer's build rolled back to v1, so sig-only envelopes from it are
+/// admitted again until it next verifies a v2 signature. Matched per
+/// team@host (one key per team@host in the store). Returns whether a
+/// record was cleared.
+pub fn reset_trusted_key_sig_v2(state: &Path, team: &str, host: &str) -> DataResult<bool> {
+    let _lock = lock_store(state)?;
+    let mut store = load_store(state);
+    let Some(keys) = store.get_mut("keys").and_then(Value::as_array_mut) else {
+        return Ok(false);
+    };
+    let Some(entry) = keys.iter_mut().find(|entry| {
+        entry.get("team").and_then(Value::as_str) == Some(team)
+            && entry.get("host").and_then(Value::as_str) == Some(host)
+            && entry.get("sig_v2").and_then(Value::as_bool) == Some(true)
+    }) else {
+        return Ok(false);
+    };
+    if let Some(record) = entry.as_object_mut() {
+        record.remove("sig_v2");
+        record.remove("sig_v2_seen_at");
+    }
+    save_store(state, &store)?;
+    Ok(true)
+}
+
 /// Remove the trusted key for one team@host. Returns whether one existed.
 pub fn untrust_key(state: &Path, team: &str, host: &str) -> DataResult<bool> {
     let _lock = lock_store(state)?;
@@ -782,14 +960,30 @@ pub fn trust_key(
         .get_mut("keys")
         .and_then(Value::as_array_mut)
         .ok_or_else(|| DataError::new("relay-store", "keys is not a list"))?;
+    // Reconfirming the same key keeps its sticky v2 record (#800);
+    // confirming a different key for the team@host resets it.
+    let sticky = keys
+        .iter()
+        .find(|entry| {
+            entry.get("team").and_then(Value::as_str) == Some(team)
+                && entry.get("host").and_then(Value::as_str) == Some(host)
+                && entry.get("pubkey").and_then(Value::as_str) == Some(pubkey)
+                && entry.get("sig_v2").and_then(Value::as_bool) == Some(true)
+        })
+        .and_then(|entry| entry.get("sig_v2_seen_at").cloned());
     keys.retain(|entry| {
         !(entry.get("team").and_then(Value::as_str) == Some(team)
             && entry.get("host").and_then(Value::as_str) == Some(host))
     });
-    keys.push(json!({
+    let mut record = json!({
         "team": team, "host": host, "pubkey": pubkey, "source": source,
         "confirmed_at": format_rfc3339_ms(now_unix_ms()),
-    }));
+    });
+    if let Some(seen_at) = sticky {
+        record["sig_v2"] = json!(true);
+        record["sig_v2_seen_at"] = seen_at;
+    }
+    keys.push(record);
     save_store(state, &store)
 }
 
@@ -1684,10 +1878,50 @@ fn relay_in_envelope(
     let trusted = trusted_key(state, &from_team, &from_host);
     let signed_mode = trusted.is_some() || embedded_key.is_some();
     if signed_mode {
+        // Sticky per-peer upgrade (#800): once this trusted key has
+        // verified a v2 signature, a sig-only envelope from it is a
+        // downgrade, not a v1 peer.
+        let downgrade = trusted.is_some()
+            && embedded_key == trusted.as_deref()
+            && entry.peers.contains_key(peer_sender)
+            && !envelope_has_sig2(envelope)
+            && trusted_key_requires_sig_v2(state, &from_team, &from_host);
+        if downgrade {
+            let reason = format!(
+                "downgrade: sender's trusted key has verified envelope signature v2; \
+                 sig-only (v1) envelope refused. Recovery: if {from_team}@{from_host} \
+                 rolled back to a v1 build, run `agent-teams relay reset-sig-v2 \
+                 {from_team}@{from_host}` (or relay untrust-key + trust-key) to admit \
+                 its sig-only envelopes again"
+            );
+            let qid = record_integrity_reason(
+                state,
+                route,
+                peer_sender,
+                channel,
+                text,
+                envelope,
+                &id,
+                reason.clone(),
+            )
+            .unwrap_or_else(|_| id.to_string());
+            log_event(
+                state,
+                &json!({"event": "relay-in", "outcome": "downgrade-quarantined", "id": id, "quarantine_id": qid}),
+            );
+            let mut out = receipt_for("quarantined", &reason);
+            out.outcome = "downgrade-quarantined".to_string();
+            return Ok(post_receipt(state, entry, channel, thread, &id, out));
+        }
         let admitted_signed = trusted.is_some()
             && embedded_key == trusted.as_deref()
             && entry.peers.contains_key(peer_sender)
             && verify_envelope(envelope);
+        if admitted_signed && envelope_has_sig2(envelope) {
+            // First verified v2 from this trusted key sticks.
+            let _ =
+                note_trusted_key_sig_v2(state, &from_team, &from_host, embedded_key.unwrap_or(""));
+        }
         if !admitted_signed {
             let reason = if trusted.is_none() {
                 "unknown signing key: no confirmed key for the sender team"
@@ -2304,6 +2538,31 @@ fn record_integrity_confirmed(
          possible tampering or an unrecognised provider rewrite; not delivered",
         if signed { "signed" } else { "declared" }
     );
+    record_integrity_reason(
+        state,
+        route,
+        peer_sender,
+        channel,
+        text,
+        envelope,
+        id,
+        reason,
+    )
+}
+
+/// Quarantine one post under the `integrity` alarm kind with a
+/// caller-named reason (a signature downgrade, #800).
+#[allow(clippy::too_many_arguments)]
+fn record_integrity_reason(
+    state: &Path,
+    route: &str,
+    peer_sender: &str,
+    channel: &str,
+    text: &str,
+    envelope: &Value,
+    id: &str,
+    reason: String,
+) -> DataResult<String> {
     let declarations = load_declarations(state).unwrap_or_default();
     let Some((_, _, declaration)) = declarations.iter().find(|(_, _, declaration)| {
         declaration.relay_channels.iter().any(|entry| {

@@ -118,6 +118,10 @@ the poster's sender ID and can post into a channel)
                                        quarantined posts claiming TEAM@HOST.
   relay keys [--json]                  List trusted signing keys.
   relay untrust-key TEAM@HOST          Remove a trusted signing key.
+  relay reset-sig-v2 TEAM@HOST         Clear a trusted key's sticky v2
+                                       record after that peer rolled back
+                                       to a v1 build, so its sig-only
+                                       envelopes are admitted again.
 
 DOCS
   quickstart | userguide | help [CMD] | --help | --version
@@ -2374,6 +2378,7 @@ fn cmd_relay(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
         Some("trust-key") => cmd_relay_trust_key(globals, args),
         Some("keys") => cmd_relay_keys(globals, args),
         Some("untrust-key") => cmd_relay_untrust_key(globals, args),
+        Some("reset-sig-v2") => cmd_relay_reset_sig_v2(globals, args),
         Some("ban") => cmd_relay_ban(globals, args),
         Some("unban") => cmd_relay_unban(globals, args),
         Some("alarms") => cmd_relay_alarms(globals, args),
@@ -2381,7 +2386,7 @@ fn cmd_relay(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
         Some("quarantine") => cmd_relay_quarantine(globals, args),
         _ => Err(err(
             "usage",
-            "relay subcommands: setup, status, announce, teams, confirm, trust-key, keys, untrust-key, ban, unban, alarms, keygen, quarantine",
+            "relay subcommands: setup, status, announce, teams, confirm, trust-key, keys, untrust-key, reset-sig-v2, ban, unban, alarms, keygen, quarantine",
         )),
     }
 }
@@ -3107,6 +3112,31 @@ fn cmd_relay_untrust_key(globals: &Globals, args: &[String]) -> Result<i32, Data
         Ok(0)
     } else {
         println!("no trusted signing key recorded for {team}@{host}");
+        Ok(1)
+    }
+}
+
+fn cmd_relay_reset_sig_v2(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
+    let target = positional(args)
+        .into_iter()
+        .nth(1)
+        .ok_or_else(|| err("usage", "relay reset-sig-v2 needs TEAM@HOST"))?;
+    let (team, host) = target
+        .split_once('@')
+        .filter(|(team, host)| !team.is_empty() && !host.is_empty())
+        .ok_or_else(|| {
+            err(
+                "usage",
+                format!("relay reset-sig-v2 needs TEAM@HOST, not {target:?}"),
+            )
+        })?;
+    if crate::relay::reset_trusted_key_sig_v2(&globals.state, team, host)? {
+        println!(
+            "cleared the sticky envelope-v2 record for {team}@{host}: its sig-only envelopes are admitted again until it next verifies a v2 signature"
+        );
+        Ok(0)
+    } else {
+        println!("no sticky envelope-v2 record for {team}@{host}");
         Ok(1)
     }
 }
