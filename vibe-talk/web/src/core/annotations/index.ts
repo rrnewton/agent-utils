@@ -9,3 +9,5 @@ export { createPins } from "./pins.ts";
 export type { Pins, PinsRead } from "./pins.ts";
 export { BOOKMARK_UNDO_MS, createBookmarkUndo } from "./undo.ts";
 export type { BookmarkRemoval, BookmarkUndo, BookmarkUndoDependencies } from "./undo.ts";
+export { LEGACY_MARKER_READS, MARKER_KEY, createLegacyMarker } from "./legacy.ts";
+export type { LegacyMarker, LegacyMarkerDependencies } from "./legacy.ts";

@@ -84,6 +84,7 @@ declare const OWN_POST_GRACE_MS: LegacyImports["OWN_POST_GRACE_MS"];
 declare const createOwnPosts: LegacyImports["createOwnPosts"];
 declare const anchorOfMessage: LegacyImports["anchorOfMessage"];
 declare const createBookmarks: LegacyImports["createBookmarks"];
+declare const createLegacyMarker: LegacyImports["createLegacyMarker"];
 declare const createBookmarkUndo: LegacyImports["createBookmarkUndo"];
 declare const createReadLedger: LegacyImports["createReadLedger"];
 declare const createPins: LegacyImports["createPins"];

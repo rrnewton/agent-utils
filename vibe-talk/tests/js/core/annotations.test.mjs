@@ -125,3 +125,24 @@ test("`#624 voice-page-modularity`: a removed bookmark's Undo is offered for BOO
   undo.end();
   assert.deepStrictEqual([undo.current(), drawn, timers.size], [null, 2, 0]);
 });
+
+test("`#624 voice-page-modularity`: the old place marker is read once, looked for a bounded number of reads, and dropped from storage", () => {
+  const { createLegacyMarker, MARKER_KEY, LEGACY_MARKER_READS } = ANNOTATIONS;
+  const store = new Map([[MARKER_KEY, "M7"]]);
+  const storage = { getItem: (key) => store.get(key) ?? null, setItem: (key, value) => store.set(key, value), removeItem: (key) => store.delete(key) };
+  const marker = createLegacyMarker({ storage });
+  assert.equal(marker.id(), "M7");
+  for (let read = 1; read < LEGACY_MARKER_READS; read += 1) marker.noteRead();
+  assert.equal(marker.exhausted(), false);
+  marker.noteRead();
+  assert.equal(marker.exhausted(), true);
+  marker.drop();
+  assert.equal(marker.id(), null);
+  assert.equal(store.has(MARKER_KEY), false);
+  const refused = { getItem: () => { throw new Error("SecurityError"); }, setItem: () => {}, removeItem: () => { throw new Error("SecurityError"); } };
+  const none = createLegacyMarker({ storage: refused });
+  assert.equal(none.id(), null, "a browser refusing storage has no old marker");
+  none.noteRead();
+  none.drop();
+  assert.equal(none.id(), null);
+});

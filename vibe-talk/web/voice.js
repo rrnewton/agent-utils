@@ -86,7 +86,6 @@ function takePairingCode() {
 const COLLAPSED_LINES_KEY = DEVICE_SETTINGS.collapsedLines.key;
 const READ_SPEED_KEY = DEVICE_SETTINGS.readSpeed.key;
 const MARK_OWN_KEY = DEVICE_SETTINGS.markOwnRead.key;
-const MARKER_KEY = "vibe-talk.voice.place-marker";
 const COMBINE_KEY = DEVICE_SETTINGS.combineMessages.key;
 const HIDE_EMPTY_KEY = DEVICE_SETTINGS.hideEmptyMessages.key;
 const RICH_HEADERS_KEY = DEVICE_SETTINGS.richHeaders.key;
@@ -18851,22 +18850,11 @@ const bookmarkStore = createBookmarks({ bumpEpoch: () => readLedger.bump() });
 const bookmarkDrawn = { main: null, side: null };
 
 /**
- * How many channel reads the old place marker is looked for in before it is dropped unfound
- * (`adoptLegacyMarker`): the look is a pass over the list on every redraw, and an id whose message
- * is never loaded again would be looked for in every redraw of every session.
+ * The id the old place marker left in this browser, read from the device here as the page starts, and the
+ * channel reads that have looked for its message, up to `LEGACY_MARKER_READS` (web/src/core/annotations
+ * `createLegacyMarker`, `#624 voice-page-modularity`).
  */
-const LEGACY_MARKER_READS = 50;
-
-/** The channel reads that carried a bookmark while the old place marker was still looked for. */
-let legacyMarkerReads = 0;
-
-/** The id the old place marker left in this browser, until it is adopted or dropped. */
-let legacyMarker = null;
-try {
-  legacyMarker = deviceStorage().getItem(MARKER_KEY);
-} catch (_error) {
-  legacyMarker = null;
-}
+const legacyMarker = createLegacyMarker({ storage: deviceStorageOnUse() });
 
 /** This channel's bookmark as held, or null. */
 function heldBookmark(channel = currentChannelId()) {
@@ -18906,7 +18894,7 @@ function redrawBookmark() {
  */
 function noteBookmark(payload) {
   if (!payload || !isBookmarkState(payload.bookmark)) return;
-  if (legacyMarker !== null) legacyMarkerReads += 1;
+  legacyMarker.noteRead();
   const channel = String((payload.channel && payload.channel.id) || currentChannelId());
   const moved = bookmarkStore.note(channel, payload.bookmark, sentEpochOf(payload));
   if (moved && channel === currentChannelId()) redrawBookmark();
@@ -19081,33 +19069,29 @@ function placeBookmarkLine() {
   else apply();
 }
 
-/** Forget the old place marker, here and in the browser's storage. */
+/** Forget the old place marker, here and in the browser's storage (`LegacyMarker.drop`). */
 function dropLegacyMarker() {
-  legacyMarker = null;
-  try {
-    deviceStorage().removeItem(MARKER_KEY);
-  } catch (_error) {
-    // A browser that refuses storage asks again next time, and the server already has it then.
-  }
+  legacyMarker.drop();
 }
 
 /**
  * The old place marker, moved to the server: the first time its message is drawn in a channel the
  * server says has no bookmark, the bookmark goes above it, and the browser's copy is dropped. Found
  * in a channel that has one already, it is simply dropped: the owner has a place there. Not found
- * within `LEGACY_MARKER_READS` channel reads, it is dropped too: its message is no longer read.
+ * within `LEGACY_MARKER_READS` channel reads (web/src/core/annotations), it is dropped too: its message is
+ * no longer read.
  */
 function adoptLegacyMarker() {
-  if (legacyMarker === null) return;
+  if (legacyMarker.id() === null) return;
   const channel = currentChannelId();
   const held = heldBookmark(channel);
   if (!held || !held.known || bookmarkStore.writing(channel)) return;
-  const row = rowHolding(legacyMarker);
+  const row = rowHolding(legacyMarker.id());
   if (!row) {
-    if (legacyMarkerReads >= LEGACY_MARKER_READS) dropLegacyMarker();
+    if (legacyMarker.exhausted()) dropLegacyMarker();
     return;
   }
-  const id = legacyMarker;
+  const id = legacyMarker.id();
   dropLegacyMarker();
   if (held.anchor) return;
   const messages = rowMessages(row);
