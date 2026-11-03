@@ -33,3 +33,7 @@ updated_at: 2026-11-03T15:55:39.676569469+00:00
 - On Android Chrome, dictation starts automatically with a visible microphone state when supported; otherwise the box is focused for the keyboard microphone.
 - The design note is linked from this issue.
 - In Reading mode on a phone layout the forward/back buttons measure at least 48 px (target 52-56 px) and the row still fits with React.
+
+# Notes
+
+- [opus 5.5] Design note (2026-11-03, design only): ai_docs/2026-11-03-read-aloud-react-design.md in the private harness repository (commit fc477f4f). Key points: hold the spoken sentence on pause with an explicit heldSentence captured in pauseReading; React as the last child of the read-steer row, shown only when paused, cluster centred with React far right; 52 px arrows and React on coarse pointers (ship the size bump with this issue, not #820); reuse #819 by factoring openQuickReply into openQuickReplyFor plus a sentence-reply entry point (shared drafts and Draft chip); dictation via webkitSpeechRecognition started by the React tap, focus-only fallback; browser test plan.
