@@ -82,6 +82,34 @@ fn a_working_muse_takes_an_ordinary_prompt_by_steering_its_turn() {
 }
 
 #[test]
+fn a_watchers_drain_types_a_queued_prompt_into_a_busy_muse() {
+    // #804 live finding: queue-only prompts sat pending in working Muse lanes
+    // while the watcher reported typed 0 with no error. The shared drain the
+    // watchers run must steer one in, exactly as a send does.
+    let fixture = Fixture::new();
+    let manager = start_busy_muse(&fixture, false);
+    manager
+        .queue_identified("worker", "queued while busy", None, Some("watch-queued"))
+        .unwrap();
+    let rows = manager.drain_pending(
+        std::time::Duration::from_secs(600),
+        false,
+        crate::agent::now_millis(),
+    );
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["name"], "worker");
+    assert_eq!(rows[0]["typed"], 1, "{rows:?}");
+    assert_eq!(rows[0]["remaining"], 0, "{rows:?}");
+    assert_eq!(rows[0]["stale"], false, "{rows:?}");
+    assert!(
+        rows[0]["oldest_seconds"]
+            .as_u64()
+            .is_some_and(|age| age < 60),
+        "age is an age, not an epoch: {rows:?}"
+    );
+}
+
+#[test]
 fn a_follow_up_muse_never_accepts_is_taken_back_out_and_stays_pending() {
     let fixture = Fixture::new();
     let manager = start_busy_muse(&fixture, false);

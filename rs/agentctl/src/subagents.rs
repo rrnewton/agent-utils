@@ -10201,8 +10201,8 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 .filter_map(|(_, at)| *at)
                 .min()
                 .map(|at| now_millis.saturating_sub(at) / 1000);
-            let (typed, remaining, drain_error) = if check_only {
-                (0, pending.len(), None)
+            let (typed, remaining, drain_error, blocked) = if check_only {
+                (0, pending.len(), None, None)
             } else {
                 let drained = self.drain(
                     name,
@@ -10214,14 +10214,49 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                         ..DrainOptions::default()
                     },
                 );
-                let remaining = self
+                let blocked = match &drained {
+                    Ok(result) => result.blocked.clone(),
+                    Err(_) => None,
+                };
+                let drain_error = drained.err().map(|error| error.to_string());
+                let mut remaining = self
                     .pending_prompts(name)
                     .map(|left| left.len())
                     .unwrap_or(pending.len());
+                // A working Muse or Claude Code pane's typeable frame can fall
+                // between the probes above (#804 live finding): retry the oldest
+                // prompt the way an urgent send does, waiting inside the call
+                // for the boundary instead of sampling it.
+                let harness = row["harness"].as_str().unwrap_or_default();
+                if remaining > 0 && (harness == "muse" || harness.starts_with("claude")) {
+                    if let Some((identifier, _)) = self
+                        .pending_prompts(name)
+                        .ok()
+                        .and_then(|left| left.into_iter().next())
+                    {
+                        let _ = self.drain_one(
+                            name,
+                            &identifier,
+                            DrainOptions {
+                                ready_timeout: std::time::Duration::from_secs(60),
+                                working_timeout: std::time::Duration::from_secs(10),
+                                deadline: Some(std::time::Duration::from_secs(75)),
+                                deliver_while_working: true,
+                                max_attempts: 1,
+                                ..DrainOptions::default()
+                            },
+                        );
+                        remaining = self
+                            .pending_prompts(name)
+                            .map(|left| left.len())
+                            .unwrap_or(remaining);
+                    }
+                }
                 (
                     pending.len().saturating_sub(remaining),
                     remaining,
-                    drained.err().map(|error| error.to_string()),
+                    drain_error,
+                    blocked,
                 )
             };
             rows.push(json!({
@@ -10233,6 +10268,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 "stale": remaining > 0
                     && oldest_seconds.is_some_and(|seconds| seconds >= stale.as_secs()),
                 "drain_error": drain_error,
+                "blocked": blocked,
             }));
         }
         rows
@@ -11139,6 +11175,35 @@ its drain would also type, so it was not queued",
         let info = self.checked(&record)?;
         self.client.focus_pane(&info.pane_id)?;
         Ok(json!({"name": agent_name, "pane_id": info.pane_id, "paused": record.paused}))
+    }
+
+    /// Drain only the one queued prompt `identifier`, waiting inside the call for
+    /// its pane's boundary as an urgent send does (#804). The watcher's drain
+    /// retries a working Muse or Claude Code prompt this way after its probes
+    /// left it pending.
+    pub fn drain_one(
+        &self,
+        agent_name: &str,
+        identifier: &str,
+        options: DrainOptions,
+    ) -> Result<QueueResult> {
+        let (_lock, _probe) = self.delivery_lock(agent_name, options, None, true)?;
+        let record = self.load(agent_name)?;
+        record.supported()?;
+        record.input_allowed()?;
+        let queue = self.queue(&record.name)?;
+        let client = WorkspaceClient {
+            client: self.client,
+            record: &record,
+            goal_objective: Mutex::new(None),
+            custom_submission: Mutex::new(None),
+            queue: Some(&queue),
+            registry: Some(&self.registry),
+            check_prompt: true,
+            expected_workspace: self.project_workspace()?,
+            readback: None,
+        };
+        agent::drain_priority_managed(&client, &self.target(&record)?, &queue, identifier, options)
     }
 
     /// Drain only prompts known not to have been injected.

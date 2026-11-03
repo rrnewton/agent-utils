@@ -2020,8 +2020,12 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
 
             // Typing into a working pane relies on the agent to queue the prompt; one it never
             // accepts is taken back out of the composer so that it stays safely pending. So is a
-            // prompt whose sender asked for that, wherever it is typed.
-            let followup_key = if info.status == "working" {
+            // prompt whose sender asked for that, wherever it is typed. A caller that opted in
+            // to deliver-while-working keeps that opt-in even when the pane did not yet read
+            // `working` at this moment: submitting a recovered draft starts a turn during
+            // typing itself, and the new prompt must queue behind it rather than wait for a
+            // later pass that may never see the pane idle (#804).
+            let followup_key = if info.status == "working" || options.deliver_while_working {
                 crate::harness_tui::followup_tui(info.agent.as_deref())
                     .map(|adapter| adapter.working_submit_key())
             } else {
@@ -2324,6 +2328,29 @@ pub(crate) fn send_priority_managed<A: AgentApi + ?Sized>(
         message_id,
         (&SystemRuntime::default(), true),
         true,
+    )
+}
+
+/// Drain only the one already-queued prompt `identifier`, with the full internal
+/// readiness wait an urgent send gets (#804): the watcher's lock-free probes can
+/// miss a working Muse or Claude Code pane's typeable frame between passes, so a
+/// prompt they left pending is retried here, where the wait polls the screen
+/// until the boundary arrives or the timeout ends.
+pub(crate) fn drain_priority_managed<A: AgentApi + ?Sized>(
+    client: &A,
+    target: &Target,
+    root: &Path,
+    identifier: &str,
+    options: DrainOptions,
+) -> AgentResult<QueueResult> {
+    drain_with_runtime_binding(
+        client,
+        target,
+        root,
+        options,
+        &SystemRuntime::default(),
+        true,
+        Some(identifier.to_owned()),
     )
 }
 
@@ -2672,9 +2699,10 @@ pub(crate) fn queued_prompts(root: &Path) -> AgentResult<Vec<String>> {
     Ok(agent_queue::queue::pending_identifiers(root)?)
 }
 
-/// The pending prompts with their `queued_at` (Unix milliseconds) when the item
+/// The pending prompts with their enqueue time (Unix milliseconds) when the item
 /// records one, oldest first: what a watcher needs to say how long a prompt has
-/// waited, not only that one waits (#804 agentctl-queue-only-drain).
+/// waited, not only that one waits (#804 agentctl-queue-only-drain). The stored
+/// `queued_at` is Unix seconds (a float), never milliseconds.
 pub(crate) fn pending_prompts(root: &Path) -> AgentResult<Vec<(String, Option<u64>)>> {
     let directories = agent_queue::queue::QueueDirectories::new(root);
     let mut prompts = Vec::new();
@@ -2687,7 +2715,8 @@ pub(crate) fn pending_prompts(root: &Path) -> AgentResult<Vec<(String, Option<u6
             .and_then(|document| {
                 document
                     .get("queued_at")
-                    .and_then(|value| value.as_u64().or_else(|| value.as_f64().map(|v| v as u64)))
+                    .and_then(Value::as_f64)
+                    .map(|seconds| (seconds * 1000.0) as u64)
             });
         prompts.push((identifier, queued_at));
     }
@@ -5186,6 +5215,70 @@ mod tests {
         .unwrap();
         assert_eq!(result.delivered.len(), 1);
         assert_eq!(screen().submitted, [lane, owner]);
+    }
+
+    /// #804 live finding (coordinator pane): a drain that opted in to
+    /// deliver-while-working recovers an agentctl draft, which starts a turn,
+    /// and must still type the next prompt behind that turn. The pane did not
+    /// read `working` when typing began, so the opt-in cannot be gated on the
+    /// status sampled at that moment, or an always-working coordinator's mail
+    /// parks forever.
+    #[test]
+    fn a_deliver_while_working_drain_queues_behind_the_turn_its_recovered_draft_started() {
+        let directory = TestDirectory::new("claude-stale-paste-working-drain");
+        let fake =
+            FakeAgent::with_screen(crate::submission::fake::FakeScreen::new("claude", false));
+        {
+            let mut state = fake.state.lock().expect("fake state");
+            let info = state.infos.get_mut("w1:p1").expect("pane info");
+            info.agent = Some("claude".to_owned());
+            info.session_agent = Some("claude".to_owned());
+        }
+        let target = Target {
+            session_agent: Some("claude".to_owned()),
+            expected_agent: Some("claude".to_owned()),
+            ..target()
+        };
+        let screen = || fake.screen.as_ref().unwrap().state();
+        screen().drop_submit_keys = true;
+        let lane =
+            "[from lane-a via agentctl · reply: agentctl send lane-a]\none\ntwo\nthree\nfour";
+        let runtime = FakeRuntime::default();
+        let error = send_with_runtime(
+            &fake,
+            &target,
+            directory.path(),
+            lane,
+            DrainOptions::default(),
+            &runtime,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("NOT submitted"), "{error}");
+        assert!(screen().composer.contains("four"), "left in the composer");
+
+        screen().drop_submit_keys = false;
+        screen().keys.clear();
+        let owner = "[from Ada via slack #team · sent: 2026.11.01:06:21 EST · reply: <r3>]\nhi";
+        // The draft is submitted and starts a turn; this drain opted in to
+        // typing into a working Claude Code, so the owner's prompt is typed
+        // and queued behind that turn instead of waiting for a later pass.
+        let result = send_with_runtime(
+            &fake,
+            &target,
+            directory.path(),
+            owner,
+            DrainOptions {
+                deliver_while_working: true,
+                max_attempts: 1,
+                ready_timeout: Duration::ZERO,
+                ..DrainOptions::default()
+            },
+            &runtime,
+        )
+        .unwrap();
+        assert_eq!(result.outcome, QueueOutcome::Delivered);
+        assert_eq!(screen().submitted, [lane]);
+        assert_eq!(screen().queued, [owner]);
     }
 
     /// An idle Codex reads `unknown`, never `staged`, and a composer holding a draft is not an
