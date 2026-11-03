@@ -334,12 +334,13 @@ fn probe_options_for(state: &State, config: &Config, git: &Git) -> ProbeOptions 
     // Probe results depend only on commit IDs and the merge configuration, so they are
     // cached in the state directory across runs; misses run under the configured bound.
     let config_material = format!(
-        "union={:?};regen-paths={:?};regen-when={:?};regen-set={};combine={}",
+        "union={:?};regen-paths={:?};regen-when={:?};regen-set={};combine={};recount={}",
         config.union_paths,
         config.regenerate.paths,
         config.regenerate.when,
         !config.regenerate.command.trim().is_empty(),
-        config.combine.as_str()
+        config.combine.as_str(),
+        config.recount_pins
     );
     // Merge answers also depend on attributes and merge configuration outside the queue's own
     // settings, and on the Git version; a change to any of them must not reuse old answers.
@@ -365,11 +366,12 @@ pub fn plan(state: &State, config: &Config, max_batch: usize) -> Result<Plan, St
     let git = repo(state, config)?;
     let (base_sha, current) = refresh(&git, config, &heads)?;
     let regenerate = config.regenerate.clone();
+    let recount = config.recount_pins;
     let mut probe = probe_with_options(
         &git,
         &base_sha,
         &current,
-        &|path| regenerate.covers(path),
+        &|path| regenerate.covers(path) || (recount && path == crate::recount::PIN_PATH),
         probe_options_for(state, config, &git),
     )?;
     probe.external = peer_holds(config, &items)?;
@@ -399,6 +401,7 @@ pub struct PlanContinuation {
     base_sha: String,
     heads: BTreeMap<i64, Option<String>>,
     regenerate: RegenerateConfig,
+    recount: bool,
     probe_options: ProbeOptions,
     max_batch: usize,
     priority: PriorityConfig,
@@ -422,11 +425,12 @@ impl PlanContinuation {
     /// per-head base entries and no pair at all on a warm cache.
     pub fn finish(self) -> Result<Plan, String> {
         let regenerate = self.regenerate.clone();
+        let recount = self.recount;
         let mut probe = probe_with_options(
             &self.git,
             &self.base_sha,
             &self.heads,
-            &|path| regenerate.covers(path),
+            &|path| regenerate.covers(path) || (recount && path == crate::recount::PIN_PATH),
             self.probe_options.clone(),
         )?;
         probe.external = self.external.clone();
@@ -469,12 +473,13 @@ pub fn plan_staged(
     let git = repo(state, config)?;
     let (base_sha, current) = refresh(&git, config, &heads)?;
     let regenerate = config.regenerate.clone();
+    let recount = config.recount_pins;
     let probe_options = probe_options_for(state, config, &git);
     let mut probe = probe_first_stage(
         &git,
         &base_sha,
         &current,
-        &|path| regenerate.covers(path),
+        &|path| regenerate.covers(path) || (recount && path == crate::recount::PIN_PATH),
         probe_options.clone(),
     )?;
     let external = peer_holds(config, &items)?;
@@ -496,6 +501,7 @@ pub fn plan_staged(
         base_sha,
         heads: current,
         regenerate,
+        recount,
         probe_options,
         max_batch,
         priority: config.priority.clone(),

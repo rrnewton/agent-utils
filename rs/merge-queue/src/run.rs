@@ -298,6 +298,9 @@ pub struct RunReport {
     /// Batches deferred after a validation refusal (still queued, retry after backoff).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub deferred: Vec<Deferred>,
+    /// Changes skipped at batch construction (still queued), with the named reason.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub recount_skips: Vec<RecountSkip>,
     /// Generated files regenerated on candidates.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub regenerated: Vec<Regeneration>,
@@ -324,6 +327,15 @@ pub struct RunReport {
     pub windows: Vec<usize>,
     /// Changes landed per hour of wall time.
     pub prs_per_hour: f64,
+}
+
+/// One change skipped at batch construction (still queued).
+#[derive(Clone, Debug, Serialize)]
+pub struct RecountSkip {
+    /// Change skipped.
+    pub pr: i64,
+    /// Named reason, e.g. `recount-pins refused: ...`.
+    pub reason: String,
 }
 
 /// One regeneration of generated files on a candidate.
@@ -990,6 +1002,99 @@ impl<'a> Runner<'a> {
         let mut conflicts = Vec::new();
         let mut held = Vec::new();
         let regen = self.config.regenerate.clone();
+        // Recount pre-check: a change whose pins cannot be recounted is
+        // skipped from this batch (it stays queued) with a named reason;
+        // the batch itself never fails for one change. Deltas of the
+        // surviving changes drive the per-prefix recount below.
+        let recount = self.config.recount_pins;
+        let mut base_text: Option<String> = None;
+        let mut accepted: BTreeMap<i64, BTreeMap<(String, usize), i64>> = BTreeMap::new();
+        let mut applied: BTreeMap<(String, usize), i64> = BTreeMap::new();
+        if recount {
+            base_text = self.git.show_file(parent, crate::recount::PIN_PATH)?;
+            let base_pins = base_text
+                .as_deref()
+                .map(|text| crate::recount::parse_pins(text).pins)
+                .unwrap_or_default();
+            let base_map: BTreeMap<(String, usize), u64> = crate::recount::keys(&base_pins)
+                .into_iter()
+                .zip(base_pins.iter().map(|pin| pin.value))
+                .collect();
+            let mut running: BTreeMap<(String, usize), i64> = base_map
+                .iter()
+                .map(|(key, value)| (key.clone(), *value as i64))
+                .collect();
+            applied = running.clone();
+            let mut skips: Vec<(i64, String)> = Vec::new();
+            for pr in prs {
+                if skipped.contains(pr) {
+                    continue;
+                }
+                let head = items[pr].head.clone();
+                let delta = (|| -> Result<BTreeMap<(String, usize), i64>, String> {
+                    let mergebase = self
+                        .git
+                        .merge_base(parent, &head)
+                        .map_err(|error| format!("no merge base with the batch base: {error}"))?;
+                    let mb_text = self.git.show_file(&mergebase, crate::recount::PIN_PATH)?;
+                    let head_text = self.git.show_file(&head, crate::recount::PIN_PATH)?;
+                    crate::recount::change_deltas(
+                        base_text.as_deref(),
+                        mb_text.as_deref(),
+                        head_text.as_deref(),
+                    )
+                })();
+                match delta {
+                    Err(detail) => {
+                        skips.push((*pr, format!("recount-pins refused: {detail}")));
+                    }
+                    Ok(delta) => {
+                        if let Some((name, index, next, base_value)) =
+                            crate::recount::below_base(&base_map, &running, &delta)
+                        {
+                            skips.push((
+                                *pr,
+                                format!(
+                                    "recount-pins refused: resolved value {next} for pin {name:?} (occurrence {index}) is below base {base_value}"
+                                ),
+                            ));
+                        } else {
+                            for (key, d) in &delta {
+                                *running.entry(key.clone()).or_insert(0) += d;
+                            }
+                            accepted.insert(*pr, delta);
+                        }
+                    }
+                }
+            }
+            if !skips.is_empty() {
+                let refused: Vec<i64> = skips.iter().map(|(pr, _)| *pr).collect();
+                for (pr, reason) in &skips {
+                    skipped.insert(*pr);
+                    self.event("recount-skip", &format!("#{pr}: {reason}"));
+                    lock(&self.report).recount_skips.push(RecountSkip {
+                        pr: *pr,
+                        reason: reason.clone(),
+                    });
+                }
+                self.requeue(&refused, "recount-pins refused");
+                if !self.simulating() {
+                    let records: Vec<crate::decisions::SkipRecord> = skips
+                        .iter()
+                        .map(|(pr, reason)| crate::decisions::SkipRecord {
+                            decision: "skip".to_owned(),
+                            pr: *pr,
+                            reason: reason.clone(),
+                            run: lock(&self.report).run.clone(),
+                            at: now(),
+                        })
+                        .collect();
+                    if let Err(error) = crate::decisions::append_skips(&self.state.root, &records) {
+                        self.event("decisions", &format!("skip log not written: {error}"));
+                    }
+                }
+            }
+        }
         for pr in prs {
             if skipped.contains(pr) {
                 continue;
@@ -1017,7 +1122,7 @@ impl<'a> Runner<'a> {
                 &item.head,
                 &exclude,
                 &message,
-                &|path| regen.covers(path),
+                &|path| regen.covers(path) || (recount && path == crate::recount::PIN_PATH),
             )?;
             let (next, conflicted) = match combined {
                 Combined::Clean(next) => (next, Vec::new()),
@@ -1068,6 +1173,23 @@ impl<'a> Runner<'a> {
                         continue;
                     }
                 }
+            } else {
+                next
+            };
+            // Recount this prefix: base plus the deltas of the changes kept
+            // so far, regardless of what regeneration produced. Exact
+            // changes keep their own commits and are never rewritten.
+            let next = if recount && !item.exact {
+                if let Some(delta) = accepted.get(pr).cloned() {
+                    for (key, d) in &delta {
+                        *applied.entry(key.clone()).or_insert(0) += d;
+                    }
+                }
+                let values: BTreeMap<(String, usize), u64> = applied
+                    .iter()
+                    .map(|(key, value)| (key.clone(), (*value).max(0) as u64))
+                    .collect();
+                self.recount_apply(&next, *pr, &values, base_text.as_deref())?
             } else {
                 next
             };
@@ -1252,6 +1374,81 @@ impl<'a> Runner<'a> {
                 commit: commit.clone(),
             });
             Ok(Ok(commit))
+        })();
+        self.slots.give(slot);
+        result
+    }
+
+    /// Rewrite the pin counts on `tip` to `values` and commit the result;
+    /// returns `tip` unchanged when the counts already match (or there is
+    /// no pin file to rewrite). Only the numbers change.
+    fn recount_apply(
+        &self,
+        tip: &str,
+        pr: i64,
+        values: &BTreeMap<(String, usize), u64>,
+        base_text: Option<&str>,
+    ) -> Result<String, String> {
+        if values.is_empty() {
+            return Ok(tip.to_owned());
+        }
+        let slot = self.slots.take();
+        let result = (|| -> Result<String, String> {
+            let checkout = self.slots.checkout(slot, tip)?;
+            let path = checkout.join(crate::recount::PIN_PATH);
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                return Ok(tip.to_owned());
+            };
+            // A still-conflicted file has no single comment set; the base
+            // text is the template and only the numbers move.
+            let rewritten = if crate::recount::has_conflict_markers(&text) {
+                match base_text {
+                    Some(base) => crate::recount::rewrite_pins(base, values),
+                    None => return Ok(tip.to_owned()),
+                }
+            } else {
+                crate::recount::rewrite_pins(&text, values)
+            };
+            if rewritten == text {
+                return Ok(tip.to_owned());
+            }
+            std::fs::write(&path, &rewritten)
+                .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+            let mut wt = Git::new(&checkout);
+            wt.identity = self.git.identity.clone();
+            wt.run(&["add", "--", crate::recount::PIN_PATH])?;
+            let message = format!("merge-queue: recount pins after #{pr}");
+            let mut command = Command::new("git");
+            command
+                .arg("-C")
+                .arg(&checkout)
+                .args(["commit", "-q", "--no-verify", "-m", &message]);
+            if let Some((name, email)) = &self.git.identity {
+                command
+                    .env("GIT_AUTHOR_NAME", name)
+                    .env("GIT_AUTHOR_EMAIL", email)
+                    .env("GIT_COMMITTER_NAME", name)
+                    .env("GIT_COMMITTER_EMAIL", email);
+            }
+            let committed = command
+                .output()
+                .map_err(|error| format!("cannot commit recounted pins: {error}"))?;
+            if !committed.status.success() {
+                return Err(format!(
+                    "cannot commit recounted pins: {}",
+                    String::from_utf8_lossy(&committed.stderr).trim()
+                ));
+            }
+            let commit = wt.rev_parse("HEAD")?;
+            self.event(
+                "recount",
+                &format!(
+                    "#{pr}: recounted {} at {}",
+                    crate::recount::PIN_PATH,
+                    short(&commit)
+                ),
+            );
+            Ok(commit)
         })();
         self.slots.give(slot);
         result
@@ -3222,6 +3419,12 @@ pub fn render_report(report: &RunReport) -> String {
     }
     if !report.stopped.is_empty() {
         out.push_str(&format!("\n**Stopped:** {}\n", report.stopped));
+    }
+    if !report.recount_skips.is_empty() {
+        out.push_str("\n## Skipped at construction (still queued)\n\n");
+        for skip in &report.recount_skips {
+            out.push_str(&format!("- #{}: {}\n", skip.pr, skip.reason));
+        }
     }
     if !report.would_validate.is_empty() {
         out.push_str("\n## Would validate\n\n");

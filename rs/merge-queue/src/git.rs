@@ -184,6 +184,20 @@ impl Git {
         })
     }
 
+    /// Contents of `path` at `commit`, or `None` when the path does not exist there.
+    pub fn show_file(&self, commit: &str, path: &str) -> Result<Option<String>, String> {
+        let spec = format!("{commit}:{path}");
+        match self.run(&["show", &spec]) {
+            Ok(text) => Ok(Some(text)),
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// Best common ancestor of two commits.
+    pub fn merge_base(&self, left: &str, right: &str) -> Result<String, String> {
+        self.run(&["merge-base", left, right])
+    }
+
     /// Whether `ancestor` is an ancestor of (or equal to) `descendant`.
     pub fn is_ancestor(&self, ancestor: &str, descendant: &str) -> Result<bool, String> {
         let output = self.output(
