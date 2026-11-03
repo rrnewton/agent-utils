@@ -1,13 +1,14 @@
 ---
 title: 'agentctl-stranded-multi-paste: attribute composers holding several agentctl pastes or paste plus delivered text'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: mu-restore2@devbig030
 labels:
 - agentctl
 created_at: 2026-11-03T18:04:46.642771266+00:00
-updated_at: 2026-11-03T18:04:46.642771266+00:00
+updated_at: 2026-11-03T18:55:53.400143171+00:00
+closed_at: 2026-11-03T18:55:53.400143051+00:00
 ---
 
 # Description
