@@ -1766,6 +1766,18 @@ struct ChatLatency {
     /// Print one JSON document instead of the text report
     #[arg(long)]
     json: bool,
+    /// #801: show per-profile stage summaries instead of the request listing (only "profile")
+    #[arg(long, value_name = "WHAT")]
+    by: Option<String>,
+    /// With --by profile: first ET day, YYYY-MM-DD (default: every folded day)
+    #[arg(long, value_name = "DAY")]
+    since_day: Option<String>,
+    /// With --by profile: last ET day, YYYY-MM-DD (default: today)
+    #[arg(long, value_name = "DAY")]
+    until: Option<String>,
+    /// With --by profile: fold existing bridge records once (idempotent)
+    #[arg(long)]
+    backfill: bool,
 }
 
 /// `chat latency --since`: Unix milliseconds of a duration back from now, or of an RFC 3339 time.
@@ -4500,7 +4512,7 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
             }
             Ok(report.exit_code())
         }
-        ChatCommand::Latency(value) => {
+        ChatCommand::Latency(value) if value.by.is_none() && !value.backfill => {
             let (document, text) = crate::chat_service::latency::latency(
                 &value.state.dir(&registry),
                 crate::chat_service::latency::LatencyOptions {
@@ -4513,6 +4525,104 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
                 write_json(&document).map_err(Failure::Output)?;
             } else {
                 write_text(&text).map_err(Failure::Output)?;
+            }
+            Ok(0)
+        }
+        ChatCommand::Latency(value) => {
+            let state = value.state.dir(&registry);
+            if value.backfill {
+                let bridge = crate::chat_runtime::BridgeState::inspect(&state)
+                    .map_err(|e| Failure::Usage(e.to_string()))?;
+                let folded = bridge
+                    .fold_latency_summaries_public()
+                    .map_err(|e| Failure::Usage(e.to_string()))?;
+                eprintln!(
+                    "agentctl: folded {folded} request(s) into {}",
+                    state.join("latency").display()
+                );
+            }
+            let today = crate::chat_latency::et_date(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0.0, |d| d.as_secs_f64()),
+            );
+            if value.by.as_deref().is_some_and(|by| by != "profile") {
+                return Err(Failure::Usage("--by accepts only \"profile\"".to_owned()));
+            }
+            let valid_day = |day: &str| {
+                day.len() == 10
+                    && day.as_bytes().get(4) == Some(&b'-')
+                    && day.as_bytes().get(7) == Some(&b'-')
+                    && day.chars().all(|c| c.is_ascii_digit() || c == '-')
+            };
+            let since = value.since_day.as_deref().unwrap_or("0000-01-01");
+            let until = value.until.as_deref().unwrap_or(&today);
+            if !valid_day(since) || !valid_day(until) {
+                return Err(Failure::Usage(
+                    "--since-day/--until need YYYY-MM-DD".to_owned(),
+                ));
+            }
+            let summaries = crate::chat_latency::read_window(&state, since, until);
+            // Merge each profile's days before computing quantiles.
+            let mut by_profile: std::collections::BTreeMap<
+                (String, String, String),
+                Vec<&crate::chat_latency::Summary>,
+            > = std::collections::BTreeMap::new();
+            for summary in &summaries {
+                by_profile
+                    .entry((
+                        summary.model.clone(),
+                        summary.effort.clone(),
+                        summary.adapter.clone(),
+                    ))
+                    .or_default()
+                    .push(summary);
+            }
+            if value.json {
+                let profiles: Vec<_> = by_profile
+                    .iter()
+                    .map(|((model, effort, adapter), group)| {
+                        let merged = crate::chat_latency::merge(group);
+                        let stages: serde_json::Map<_, _> = merged
+                            .iter()
+                            .map(|(stage, counts)| {
+                                (
+                                    stage.clone(),
+                                    serde_json::json!({
+                                        "n": counts.iter().sum::<u32>(),
+                                        "median": crate::chat_latency::quantile_bucket(counts, 0.5).map(crate::chat_latency::bucket_label),
+                                        "p90": crate::chat_latency::quantile_bucket(counts, 0.9).map(crate::chat_latency::bucket_label),
+                                        "counts": counts,
+                                    }),
+                                )
+                            })
+                            .collect();
+                        serde_json::json!({"model": model, "effort": effort, "adapter": adapter, "folded": group.iter().map(|s| s.folded).sum::<u64>(), "stages": stages})
+                    })
+                    .collect();
+                write_json(&serde_json::json!({"profiles": profiles})).map_err(Failure::Output)?;
+            } else {
+                for ((model, effort, adapter), group) in &by_profile {
+                    println!(
+                        "{model} / {effort} / {adapter} ({} requests)",
+                        group.iter().map(|s| s.folded).sum::<u64>()
+                    );
+                    let merged = crate::chat_latency::merge(group);
+                    for stage in crate::chat_latency::STAGES {
+                        let counts = &merged[stage];
+                        let total: u32 = counts.iter().sum();
+                        if total == 0 {
+                            continue;
+                        }
+                        let median = crate::chat_latency::quantile_bucket(counts, 0.5)
+                            .map(crate::chat_latency::bucket_label)
+                            .unwrap_or_default();
+                        let p90 = crate::chat_latency::quantile_bucket(counts, 0.9)
+                            .map(crate::chat_latency::bucket_label)
+                            .unwrap_or_default();
+                        println!("  {stage}: n={total} median {median} p90 {p90}");
+                    }
+                }
             }
             Ok(0)
         }

@@ -1261,7 +1261,8 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
         .with_prompt_commands(prompt_commands)
         .with_reply_command_offered(offer_reply_command)
         .with_command_only_replies(headless)
-        .with_receipt_when_started(headless);
+        .with_receipt_when_started(headless)
+        .with_latency_profile(Some(manager.registry().to_path_buf()), headless);
     // A headless coordinator's screen is never read, so it needs no clean text for screen
     // blocks; every other coordinator's reply text comes from its transcript where that holds it
     // (#710 chat-transcript-extraction). AGENTCTL_CHAT_REPLY_TEXT=screen keeps the screen's text.
@@ -1436,6 +1437,7 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
     });
     let cancellation: SharedCancellation =
         Arc::new(Mutex::new(ProviderCancellationRegistry::default()));
+    let _ = state.fold_latency_summaries_public();
     let output_wake: SharedWake = Arc::new(Mutex::new(None));
     let overflowed = Arc::new(AtomicBool::new(false));
     let (signal_handle, signal_thread) = spawn_signal_worker(

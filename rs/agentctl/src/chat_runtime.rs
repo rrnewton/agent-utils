@@ -2731,6 +2731,16 @@ struct RequestRecord {
     /// channel, so it is reported once, not on every pass.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     uncertain_reported_at_millis: Option<u64>,
+    /// #801 profile tagged at delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    latency_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    latency_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    latency_adapter: Option<String>,
+    /// When this request was folded into a latency summary (#801).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    latency_folded_at: Option<u64>,
 }
 
 impl SavedMessage {
@@ -2789,6 +2799,10 @@ impl RequestRecord {
             ack_completed_at_millis: None,
             delivery_error: None,
             uncertain_reported_at_millis: None,
+            latency_model: None,
+            latency_effort: None,
+            latency_adapter: None,
+            latency_folded_at: None,
             key,
             message: source,
         })
@@ -5725,6 +5739,10 @@ pub struct BridgeState {
     // Digests of the request keys and texts of transcript blocks a capture already settled,
     // stored or found already held, so later captures do not weigh them again.
     transcript_settled: Arc<std::sync::Mutex<BTreeSet<[u8; 32]>>>,
+    /// #801 registry read at delivery for the profile tag; process-local.
+    latency_registry: Option<std::path::PathBuf>,
+    /// #801 adapter at delivery: the bridge manager's headless verdict.
+    latency_headless: bool,
     #[cfg(test)]
     admission_fault_after: Arc<std::sync::Mutex<Option<usize>>>,
     #[cfg(test)]
@@ -5863,6 +5881,8 @@ impl BridgeState {
             screen_held: Arc::default(),
             screen_refusals: Arc::default(),
             transcript_settled: Arc::default(),
+            latency_registry: None,
+            latency_headless: false,
             #[cfg(test)]
             admission_fault_after: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
@@ -5967,6 +5987,8 @@ impl BridgeState {
             screen_held: Arc::default(),
             screen_refusals: Arc::default(),
             transcript_settled: Arc::default(),
+            latency_registry: None,
+            latency_headless: false,
             #[cfg(test)]
             admission_fault_after: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
@@ -6043,6 +6065,74 @@ impl BridgeState {
     pub fn with_receipt_when_started(mut self, when_started: bool) -> Self {
         self.receipt_when_started = when_started;
         self
+    }
+
+    /// Read the coordinator's profile from `registry` at delivery and
+    /// tag requests with it (#801); `headless` is the bridge manager's
+    /// adapter verdict.
+    #[must_use]
+    pub fn with_latency_profile(
+        mut self,
+        registry: Option<std::path::PathBuf>,
+        headless: bool,
+    ) -> Self {
+        self.latency_registry = registry;
+        self.latency_headless = headless;
+        self
+    }
+
+    /// The (model, effort, adapter) profile read from the registry now;
+    /// any failed lookup records "unknown" and never fails delivery.
+    fn latency_profile_now(&self) -> (String, String, String) {
+        let unknown = || "unknown".to_owned();
+        let Some(registry) = &self.latency_registry else {
+            return (
+                unknown(),
+                unknown(),
+                if self.latency_headless {
+                    "headless".into()
+                } else {
+                    "tui".into()
+                },
+            );
+        };
+        let record = agent_queue::registry::directory(registry, &self.config.agent_name)
+            .ok()
+            .and_then(|dir| std::fs::read(dir.join("agent.json")).ok())
+            .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok());
+        let Some(record) = record else {
+            return (
+                unknown(),
+                unknown(),
+                if self.latency_headless {
+                    "headless".into()
+                } else {
+                    "tui".into()
+                },
+            );
+        };
+        let model = match record["model"].as_str() {
+            Some(model) => model.to_owned(),
+            None => record["profile"]
+                .as_str()
+                .map(|profile| format!("profile:{profile}"))
+                .unwrap_or_else(|| "unknown".to_owned()),
+        };
+        let effort = record["effective_reasoning_effort"]
+            .as_str()
+            .or_else(|| record["reasoning_effort"].as_str())
+            .or_else(|| record["effort"].as_str())
+            .unwrap_or("unknown")
+            .to_owned();
+        (
+            model,
+            effort,
+            if self.latency_headless {
+                "headless".into()
+            } else {
+                "tui".into()
+            },
+        )
     }
 
     /// Take the text of the coordinator's replies from `source`, its transcript, wherever the
@@ -10192,6 +10282,133 @@ and the replies captured for them. The provider's own thread is the complete rec
             .collect())
     }
 
+    /// Fold one request into the latency summaries and mark its record
+    /// first, so a crash cannot double-count (#801). The caller holds
+    /// whatever state lock its path already holds.
+    fn fold_latency_one(
+        &self,
+        record: &RequestRecord,
+        checkpoint: &mut Checkpoint,
+        mark: bool,
+    ) -> Result<bool> {
+        if record.latency_folded_at.is_some() || (record.reply_count == 0 && !record.reply_closed) {
+            return Ok(false);
+        }
+        if mark {
+            let mut updated = record.clone();
+            updated.latency_folded_at = Some(unix_millis());
+            self.write_request_accounted(&updated, checkpoint)?;
+        }
+        self.fold_latency_summary(record)?;
+        Ok(true)
+    }
+
+    /// One request's stage durations and ET day; the first reply is
+    /// read at ordinal 1 (ordinals start at 1) while it still exists.
+    fn latency_durations(&self, record: &RequestRecord) -> (String, [Option<u64>; 6]) {
+        let posted = parse_rfc3339_millis(&record.message.created_at);
+        let admitted = record.admitted_at_millis;
+        let ack = record.ack_completed_at_millis;
+        let delivered = record.delivered_at_millis;
+        let first_reply = if record.reply_count > 0 {
+            self.read_reply(&record.key, 1)
+                .ok()
+                .map(|reply| reply.captured_at_millis)
+        } else {
+            None
+        };
+        let durations: [Option<u64>; 6] = [
+            posted.map(|p| admitted.saturating_sub(p)),
+            ack.map(|a| a.saturating_sub(admitted)),
+            match (ack, delivered) {
+                (Some(a), Some(d)) => Some(d.saturating_sub(a)),
+                _ => None,
+            },
+            match (delivered, first_reply) {
+                (Some(d), Some(r)) => Some(r.saturating_sub(d)),
+                _ => None,
+            },
+            match (posted, first_reply) {
+                (Some(p), Some(r)) => Some(r.saturating_sub(p)),
+                _ => None,
+            },
+            match (ack, delivered) {
+                (None, Some(d)) => Some(d.saturating_sub(admitted)),
+                _ => None,
+            },
+        ];
+        let day = crate::chat_latency::et_date(admitted as f64 / 1_000.0);
+        (day, durations)
+    }
+
+    /// Write one request's stage durations into its summary file; the
+    /// record's folded mark is the caller's job (#801).
+    fn write_latency_summary(
+        &self,
+        record: &RequestRecord,
+        day: &str,
+        durations: &[Option<u64>; 6],
+    ) -> Result<()> {
+        crate::chat_latency::fold(
+            &self.root,
+            self.root
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("bridge"),
+            &self.config.agent_name,
+            record.latency_model.as_deref().unwrap_or("unknown"),
+            record.latency_effort.as_deref().unwrap_or("unknown"),
+            record.latency_adapter.as_deref().unwrap_or("unknown"),
+            day,
+            durations,
+        )
+        .map_err(ChatRuntimeError::invalid)?;
+        Ok(())
+    }
+
+    fn fold_latency_summary(&self, record: &RequestRecord) -> Result<()> {
+        let (day, durations) = self.latency_durations(record);
+        self.write_latency_summary(record, &day, &durations)
+    }
+
+    /// Fold every request that has its first reply (or is closed) and has
+    /// not been folded yet into the latency summaries (#801), marking
+    /// each record so live folding and backfill never double-count.
+    /// Takes the state lock exclusively and re-reads each record under
+    /// it; a bad record is skipped, never aborting the loop.
+    /// Public wrapper for the CLI backfill (#801).
+    pub fn fold_latency_summaries_public(&self) -> Result<usize> {
+        self.fold_latency_summaries()
+    }
+
+    pub(crate) fn fold_latency_summaries(&self) -> Result<usize> {
+        let lock = open_existing_private_state_lock(&self.root.join(".state.lock"))?;
+        fs2::FileExt::lock_exclusive(&lock).map_err(ChatRuntimeError::Io)?;
+        let keys: Vec<String> = self
+            .request_records()?
+            .into_iter()
+            .map(|(record, _)| record.key)
+            .collect();
+        let mut folded = 0;
+        for key in keys {
+            let Ok(record) = self.read_request(&key) else {
+                continue;
+            };
+            let mut checkpoint = self.read_checkpoint()?;
+            match self.fold_latency_one(&record, &mut checkpoint, true) {
+                Ok(true) => {
+                    self.persist_checkpoint(&mut checkpoint)?;
+                    folded += 1;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    eprintln!("agentctl: latency fold skipped {key}: {error}");
+                }
+            }
+        }
+        Ok(folded)
+    }
+
     /// Return requests whose durable reaction operation awaits reconciliation.
     pub fn pending_ack_keys(&self) -> Result<Vec<String>> {
         let _snapshot = self.lock_state_snapshot()?;
@@ -11832,6 +12049,18 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
                 self.retirement_boundary()?;
             }
         }
+        // Capture the latency summary input before the records are
+        // removed (#801); it is written only after the retirement
+        // checkpoint commits below, so a faulted retirement can lose
+        // a count but never fold twice.
+        let latency_input = self
+            .read_request(&retirement.request_key)
+            .ok()
+            .filter(|record| record.latency_folded_at.is_none())
+            .map(|record| {
+                let (day, durations) = self.latency_durations(&record);
+                (record, day, durations)
+            });
         for ordinal in 1..=retirement.reply_count {
             remove_if_exists(&self.reply_path(&retirement.request_key, ordinal))?;
             self.retirement_boundary()?;
@@ -11871,6 +12100,14 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         validate_checkpoint(&next_checkpoint)?;
         write_document(&self.root.join("checkpoint.json"), &next_checkpoint)?;
         *checkpoint = next_checkpoint;
+        if let Some((record, day, durations)) = &latency_input {
+            if let Err(error) = self.write_latency_summary(record, day, durations) {
+                eprintln!(
+                    "agentctl: latency summary write failed at retirement for {}: {error}",
+                    record.key
+                );
+            }
+        }
         self.retirement_boundary()?;
         retirement.phase = RetirementPhase::Retired;
         retirement.retired_at_millis = Some(unix_millis());
@@ -12201,6 +12438,7 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         withheld: &[ReplyIdentity],
         transcript: &TranscriptText,
     ) -> Result<ReplyCapture> {
+        let mut latency_first_reply: Option<RequestRecord> = None;
         let mut request = self.read_request(key)?;
         if request.reply_closed {
             return Ok(ReplyCapture::default());
@@ -12372,6 +12610,12 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
                 unwritten.push((path, reply));
             }
             request.reply_count = request.reply_count.saturating_add(1);
+            if request.reply_count == 1 && request.latency_folded_at.is_none() {
+                // Mark the in-memory record the capture path writes last;
+                // the summary folds after the final writes below.
+                request.latency_folded_at = Some(unix_millis());
+                latency_first_reply = Some(request.clone());
+            }
             request.reply_bytes = next_request_bytes;
             checkpoint.reply_count = next_state_count;
             checkpoint.reply_bytes = next_state_bytes;
@@ -12408,6 +12652,14 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
             checkpoint.request_bytes = request_bytes;
             checkpoint.updated_at_millis = unix_millis();
             write_document(&self.root.join("checkpoint.json"), &checkpoint)?;
+        }
+        if let Some(record) = &latency_first_reply {
+            if let Err(error) = self.fold_latency_summary(record) {
+                eprintln!(
+                    "agentctl: latency summary write failed at first reply for {}: {error}",
+                    record.key
+                );
+            }
         }
         Ok(ReplyCapture {
             ordinals: captured,
@@ -12866,6 +13118,12 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
             let completed = causal_wall_millis(record.admitted_at_millis);
             let started = *record.delivery_started_at_millis.get_or_insert(completed);
             record.delivered_at_millis = Some(causal_wall_millis(started));
+            if record.latency_model.is_none() {
+                let (model, effort, adapter) = self.latency_profile_now();
+                record.latency_model = Some(model);
+                record.latency_effort = Some(effort);
+                record.latency_adapter = Some(adapter);
+            }
         }
         record.delivery_error = detail.map(|value| bounded_detail(value, 2_000));
         let mut checkpoint = self.read_checkpoint()?;
@@ -18752,6 +19010,76 @@ mod tests {
         );
         assert_eq!(transport.submissions.len(), 1);
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn latency_live_fold_marks_record_and_records_reply_stages() {
+        // #801: tagging at delivery + live fold at first reply.
+        let (state, key, root) = state_with_reply("latency-live", "timed body");
+        let record = state.read_request(&key).expect("request");
+        assert!(record.latency_model.is_some(), "tag written at delivery");
+        assert!(record.latency_effort.is_some(), "effort tagged at delivery");
+        assert!(
+            matches!(record.latency_adapter.as_deref(), Some("tui" | "headless")),
+            "adapter tagged at delivery"
+        );
+        assert!(record.latency_folded_at.is_some(), "marked at first reply");
+        let summaries = crate::chat_latency::read_window(&root, "0000-01-01", "9999-12-31");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].folded, 1);
+        let total = |stage: &str| summaries[0].stages[stage].iter().sum::<u32>();
+        assert_eq!(total("delivered_to_first_reply"), 1, "reply stage recorded");
+        assert_eq!(total("posted_to_first_reply"), 1);
+        // Backfill twice more: counts unchanged (idempotent).
+        state.fold_latency_summaries_public().expect("backfill 1");
+        state.fold_latency_summaries_public().expect("backfill 2");
+        let again = crate::chat_latency::read_window(&root, "0000-01-01", "9999-12-31");
+        assert_eq!(again[0].folded, 1, "backfill never double counts");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn latency_retire_calls_fold_at_most_once() {
+        // #801: repeated retire_if_eligible_locked calls count once.
+        let (state, key, root) = state_with_reply("latency-retire", "retire body");
+        // Undo the live fold: clear the mark and wipe the summaries, so
+        // retirement is the only folder left.
+        let mut checkpoint = state.read_checkpoint().expect("checkpoint");
+        let mut record = state.read_request(&key).expect("request");
+        record.latency_folded_at = None;
+        state
+            .write_request_accounted(&record, &mut checkpoint)
+            .expect("unmark");
+        state
+            .persist_checkpoint(&mut checkpoint)
+            .expect("persist unmark");
+        std::fs::remove_dir_all(root.join("latency")).ok();
+        // Not yet eligible (reply unsent, replies open): no fold may happen,
+        // however often retirement is attempted.
+        for _ in 0..3 {
+            let _ = state.retire_if_eligible_locked(&mut checkpoint, &key);
+        }
+        let summaries = crate::chat_latency::read_window(&root, "0000-01-01", "9999-12-31");
+        assert_eq!(
+            summaries.iter().map(|s| s.folded).sum::<u64>(),
+            0,
+            "ineligible retirement attempts must not fold"
+        );
+        // Make it eligible and retire: exactly one fold, from retirement.
+        let mut transport = FakeReplyTransport::default();
+        state.publish_one(&key, &mut transport).expect("publish");
+        state.close_replies(&key).expect("close and retire");
+        assert!(!state.request_path(&key).exists(), "request retired");
+        for _ in 0..2 {
+            let _ = state.retire_if_eligible_locked(&mut checkpoint, &key);
+        }
+        let summaries = crate::chat_latency::read_window(&root, "0000-01-01", "9999-12-31");
+        assert_eq!(
+            summaries.iter().map(|s| s.folded).sum::<u64>(),
+            1,
+            "retirement folds exactly once"
+        );
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

@@ -72,3 +72,5 @@ pub const AGENTCTL_SKILL: &str = include_str!("embedded_agentctl_skill.md");
 pub const INBOX_USER_GUIDE: &str = include_str!("embedded_inbox_userguide.md");
 /// One-screen introduction to the coordinator inbox.
 pub const INBOX_QUICKSTART: &str = include_str!("embedded_inbox_quickstart.md");
+
+pub mod chat_latency;
