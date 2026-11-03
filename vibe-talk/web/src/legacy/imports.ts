@@ -35,6 +35,7 @@ export {
   VISIBLE_REFRESH_MS,
   createChannelFollow,
   createChannelPoll,
+  createChannelReads,
   createHiddenStream,
   createLiveEvents,
   createMutationRefresh,
@@ -45,7 +46,6 @@ export {
   createStreamGeneration,
   deltaCursor,
   isCursorRefusal,
-  joinQueuedReads,
   readEventStream as readEventFrames,
   staleAsOf as syncStaleAsOf,
 } from "../core/sync/index.ts";

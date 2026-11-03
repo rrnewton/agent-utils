@@ -446,3 +446,24 @@ test("`#624 voice-page-modularity`: a burst of live edits is one re-read, one ar
   release();
   await launched;
 });
+
+test("`#624 voice-page-modularity`: one channel read on the wire, the view it is for, and one joined read queued per column", () => {
+  const { createChannelReads } = SYNC;
+  const reads = createChannelReads();
+  const [left, right] = [{ name: "main" }, { name: "side" }];
+  assert.deepStrictEqual([reads.busy(), reads.readContext()], [false, null]);
+  assert.equal(reads.claim("ctx-main"), true);
+  assert.deepStrictEqual([reads.busy(), reads.readContext()], [true, "ctx-main"]);
+  assert.equal(reads.claim("ctx-all"), false, "one read at a time");
+  assert.equal(reads.readContext(), "ctx-main", "and the refused one changes nothing");
+  reads.queue(right, { reason: "poll" });
+  reads.queue(left, { reason: "live", quiet: true });
+  reads.queue(left, { reason: "reset", keepPosition: true });
+  assert.deepStrictEqual(reads.pending(left), { reason: ["live", "reset"], keepPosition: true, quiet: true }, "joined");
+  assert.deepStrictEqual(reads.release([left, right]), { column: left, options: { reason: ["live", "reset"], keepPosition: true, quiet: true } });
+  assert.deepStrictEqual([reads.busy(), reads.readContext(), reads.queued(left), reads.queued(right)], [false, null, false, true]);
+  assert.equal(reads.claim(null), true);
+  reads.drop(right);
+  assert.equal(reads.release([left, right]), null, "nothing queued");
+  assert.equal(reads.busy(), false);
+});

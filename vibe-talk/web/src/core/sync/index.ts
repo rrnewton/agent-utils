@@ -32,3 +32,5 @@ export { LIVE_HIDDEN_CLOSE_MS, createHiddenStream } from "./hidden.ts";
 export type { HiddenResume, HiddenStream, HiddenStreamDependencies } from "./hidden.ts";
 export { createMutationRefresh } from "./coalesce.ts";
 export type { MutationRefresh, MutationRefreshDependencies } from "./coalesce.ts";
+export { createChannelReads } from "./reads.ts";
+export type { ChannelReads } from "./reads.ts";

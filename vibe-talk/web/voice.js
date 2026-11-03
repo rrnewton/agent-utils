@@ -1533,7 +1533,7 @@ async function applyDeepLink() {
   const movesBeforeSeek = deepLinks.readerMoves();
   // The first read of the view now open, waited for as a seek waits for All to land.
   await waitForDeepLink(() => String(selectedChannelId()) !== channel ||
-    (channelStore.current().views.has(viewKey()) && !discordFetchInFlight));
+    (channelStore.current().views.has(viewKey()) && !channelReads.busy()));
   if (epoch !== deepLinks.epoch() || String(selectedChannelId()) !== channel) return;
   // Chosen while the read landed: the seek would walk views the reader just left.
   if (deepLinks.readerMoves() !== movesBeforeSeek) {
@@ -1784,7 +1784,7 @@ function withLinkJumps(levels) {
 /** Wait for the channel on screen to have read the view it shows, or to be left; false when it was left. */
 async function linkJumpRead(channel, ticket) {
   await waitForDeepLink(() => !linkJumps.current(ticket) || String(selectedChannelId()) !== channel ||
-    (replayLedger.started() > 0 && channelStore.current().views.has(viewKey()) && !discordFetchInFlight));
+    (replayLedger.started() > 0 && channelStore.current().views.has(viewKey()) && !channelReads.busy()));
   return linkJumps.current(ticket) && String(selectedChannelId()) === channel;
 }
 
@@ -12442,7 +12442,7 @@ async function changeChannelView(view, threadId = null, summary = null, origin =
   loadState().freshness = held ? held.freshness : "fresh";
   if (held) doneState().archived = held.dismissed;
   // A read still on the wire is for the view the reader left: no loading line over this one.
-  renderChannelLoading(discordFetchInFlight, true);
+  renderChannelLoading(channelReads.busy(), true);
   restoreChannelComposer();
   renderOlderControl();
   voiceCall().renderControls();
@@ -12475,7 +12475,7 @@ async function changeChannelView(view, threadId = null, summary = null, origin =
     // behind a read of another view still on the wire; one of this view lands here by itself.
     // ...and so does a thread whose root reports replies the held rows lack (`#222 unread-replies`).
     if (outrun || (sameStore && view !== "threads" && !channelStore.current().views.has(viewKey()) &&
-        timelineReadContext !== channelContextKey())) {
+        channelReads.readContext() !== channelContextKey())) {
       await readBehindSwitch();
     }
     return;
@@ -12513,7 +12513,7 @@ async function changeChannelView(view, threadId = null, summary = null, origin =
   el("discord-log").replaceChildren();
   el("thread-list").replaceChildren();
   el("channel-summary").replaceChildren();
-  if (discordFetchInFlight) renderChannelLoading(true);
+  if (channelReads.busy()) renderChannelLoading(true);
   scrollToNewest();
   await loadDiscord({ reason: "enter" });
 }
@@ -12612,7 +12612,7 @@ function sameWords(held, arriving) {
  * a count or a time that changed on one card would rebuild them all, and its own read draws them.
  *
  * `words` false compares ids alone, as before: for a read overtaken by a read of the same view
- * queued behind it, which is what draws that view (`discordQueuedLoads`).
+ * queued behind it, which is what draws that view (`channelReads.queued`).
  */
 function catchUpHeldView(words = true) {
   const projected = providerFacts.threading() ? projectView() : null;
@@ -14928,12 +14928,10 @@ async function loadTimeline(options) {
   const channel = String(selectedChannelId());
   const [view, thread, canon] = [selection().view, selection().threadId, channelStore.current()];
   if (!channel) return;
-  if (discordFetchInFlight) {
+  if (!channelReads.claim(context)) {
     queueDiscordLoad(options);
     return;
   }
-  discordFetchInFlight = true;
-  timelineReadContext = context;
   const read = replayLedger.start();
   const area = el("scroll-area");
   const position = channelReadPosition(area);
@@ -15053,7 +15051,7 @@ async function loadTimeline(options) {
           canon.views.get(viewKey(view, thread)).landedHidden = true;
           if (context === channelContextKey()) {
             // Words and all, unless that read is queued behind this one: it draws them.
-            catchUpHeldView(!discordQueuedLoads.has(steps.column));
+            catchUpHeldView(!channelReads.queued(steps.column));
             renderChannelFreshness();
           } else if (view === "flat") {
             catchUpFromAll();
@@ -15196,7 +15194,7 @@ function foldLateTimelinePage(payload, read) {
     const landing = entryLandingMark();
     noteArchived(payload, false);
     // Words and all, unless a read of this view is queued behind this one: it draws them.
-    catchUpHeldView(!discordQueuedLoads.has(columnWork.active()));
+    catchUpHeldView(!channelReads.queued(columnWork.active()));
     renderChannelFreshness();
     if (entryState().readOwed === read.context) entryState().readOwed = null;
     if (landing) keepEntryLanding(landing);
@@ -16176,7 +16174,7 @@ function queuePlaceUnplaced() {
 async function placeUnplaced() {
   const channel = String(selectedChannelId());
   if (!providerFacts.threading() || !channel || channelStore.current().channel !== channel || channelStore.current().scope ||
-      placingReadInFlight !== null || discordFetchInFlight || document.visibilityState === "hidden" ||
+      placingReadInFlight !== null || channelReads.busy() || document.visibilityState === "hidden" ||
       placeUnplacedWaits(channel)) return;
   if (unplacedToAsk(channelStore.current()).length === 0) return;
   placingReadInFlight = channel;
@@ -19268,7 +19266,7 @@ async function seekMessage(target, arrive, openAll) {
       // on the wire when the tap came: All's read is queued behind it, and `changeChannelView`
       // returned with nothing drawn. Waited for, as a pull up waits for a read already in flight,
       // because until All has landed an empty list says nothing about where the message is.
-      while (discordFetchInFlight && !channelStore.current().views.has(viewKey()) && stillAll()) {
+      while (channelReads.busy() && !channelStore.current().views.has(viewKey()) && stillAll()) {
         steps.pause();
         await new Promise((resolve) => setTimeout(resolve, PULL_WAIT_MS));
         steps.resume();
@@ -23054,7 +23052,7 @@ const pullToRefresh = createPullToRefresh({
   onChannelList: () => screens.screen() === "main" && screens.view() === "discord",
   inChannelView: () => screens.view() === "discord",
   atBottom: (area, slack) => (slack === undefined ? atBottom(area) : atBottom(area, slack)),
-  fetchInFlight: () => discordFetchInFlight,
+  fetchInFlight: () => channelReads.busy(),
   olderInFlight: () => olderPages().inFlight,
   takeDeferredOlder: () => takeDeferredOlder(),
   undeferOlder: () => {
@@ -23295,11 +23293,11 @@ async function loadDiscord(options) {
     setStatus(NO_CHANNEL_TO_READ);
     return;
   }
-  if (discordFetchInFlight) {
+  // Not a timeline read: no view's read is out (`channelReads.readContext`).
+  if (!channelReads.claim(null)) {
     queueDiscordLoad(options);
     return;
   }
-  discordFetchInFlight = true;
   const area = el("scroll-area");
   const position = channelReadPosition(area);
   renderChannelLoading(true);
@@ -23921,7 +23919,7 @@ function armBacklog() {
 /**
  * Read the to-do list and put it on screen.
  *
- * Shares `discordFetchInFlight` with `loadDiscord` rather than having a flag of its own: they
+ * Shares `channelReads` with `loadDiscord` rather than having a flag of its own: they
  * write to the same list, and two reads racing to `replaceChildren` is how a view ends up showing
  * a mixture of two answers.
  */
@@ -23934,11 +23932,11 @@ async function loadTodo(options) {
     setStatus(NO_CHANNEL_TO_READ);
     return;
   }
-  if (discordFetchInFlight) {
+  // Not a timeline read: no view's read is out (`channelReads.readContext`).
+  if (!channelReads.claim(null)) {
     queueDiscordLoad(options);
     return;
   }
-  discordFetchInFlight = true;
   const area = el("scroll-area");
   const position = channelReadPosition(area);
   renderChannelLoading(true);
@@ -30502,22 +30500,18 @@ const channelPoll = createChannelPoll({
   take: (delay) => standInRetries.take(delay),
   poll: () => pollDiscord(),
 });
-let discordFetchInFlight = false;
-// The view a timeline read on the wire is for (`channelContextKey`), or null: a switch back to a
-// view whose read is still out lets that read land rather than queueing another. `#220
-// view-switch-instant`.
-let timelineReadContext = null;
+/**
+ * The channel's reads on the wire: one at a time across both columns, the view a timeline read out is for
+ * (`channelContextKey`; `#220 view-switch-instant`), and the read queued behind it by the column it is for
+ * (`#229`): one owner in web/src/core/sync/reads.ts (`#624 voice-page-modularity`).
+ *
+ * @type {import("./src/core/sync/index.ts").ChannelReads<ColumnFields>}
+ */
+const channelReads = createChannelReads();
 // Every requested replacement gets a generation, including one that arrives while another request
 // is in flight. Only the newest generation may draw. The newest blocked request is queued so a
 // channel switch cannot be swallowed by a refresh of the channel the reader just left.
 // Kept per column: `loadState().generation` (`freshLoadState`, `#624 voice-page-modularity`).
-/**
- * The read queued behind the one on the wire, by the column it is for: one each, so a read of the
- * thread on the right never stands in for a refresh of Main or the other way round. `#229`.
- *
- * @type {Map<ColumnFields, {options: any}>}
- */
-const discordQueuedLoads = new Map();
 /**
  * How many timeline reads have gone on the wire, the newest of them that landed (and that could answer
  * an edit or a removal), that count when the live stream last attached, and the replayed events
@@ -30545,13 +30539,8 @@ const replayLedger = createReplayLedger();
  * @param {{keepPosition?: boolean, quiet?: boolean, ownAct?: boolean, reason?: string | (string | undefined)[], readAs?: string}} [options]
  */
 function queueDiscordLoad(options) {
-  const queued = discordQueuedLoads.get(columnWork.active());
-  if (!queued) {
-    discordQueuedLoads.set(columnWork.active(), { options });
-    return;
-  }
   // Every reason kept, the newest options otherwise, `quiet` from either (web/src/core/sync `joinQueuedReads`).
-  discordQueuedLoads.set(columnWork.active(), { options: joinQueuedReads(queued.options, options) });
+  channelReads.queue(columnWork.active(), options);
 }
 
 /**
@@ -30560,17 +30549,14 @@ function queueDiscordLoad(options) {
  * whose loading line goes when nothing is queued behind it.
  */
 async function finishDiscordLoad(column = columnWork.active()) {
-  discordFetchInFlight = false;
-  timelineReadContext = null;
-  const next = [columns.main, columns.side].find((one) => discordQueuedLoads.has(one));
-  if (next) {
-    const queued = discordQueuedLoads.get(next);
-    discordQueuedLoads.delete(next);
-    await inColumn(next, () => loadDiscord(queued.options));
+  const queued = channelReads.release([columns.main, columns.side]);
+  if (queued) {
+    const next = queued.column;
+    await inColumn(next, () => loadDiscord(/** @type {any} */ (queued.options)));
     // The read handed on may not have gone at all: a poll put off while the server still reads one
     // given up on (`readHeld`, `remote-ops-audit` W7). Then no read is out, and its column's loading
     // line, which nothing else would take down, goes here.
-    if (!discordFetchInFlight) inColumn(next, () => renderChannelLoading(false));
+    if (!channelReads.busy()) inColumn(next, () => renderChannelLoading(false));
     return;
   }
   inColumn(column, () => renderChannelLoading(false));
@@ -31270,7 +31256,7 @@ function onStreamFrame(frame) {
 // reads again for edits arriving during it: web/src/core/sync/coalesce.ts (`#624 voice-page-modularity`).
 const mutationRefresh = createMutationRefresh({
   clock: clockOnUse(),
-  busy: () => discordFetchInFlight,
+  busy: () => channelReads.busy(),
   read: async () => {
     const since = replayLedger.started();
     await loadDiscord({ keepPosition: true, reason: "mutation" });
@@ -31322,12 +31308,12 @@ function receiveLiveMessage(message, selfPosted, replayed, fromTail) {
     loadState().freshAt = Date.now();
     renderChannelFreshness();
   }
-  if (!providerFacts.threading() && discordFetchInFlight) {
+  if (!providerFacts.threading() && channelReads.busy()) {
     // This event is newer evidence than a read already on the wire. Invalidate that snapshot
     // even when the event's ID is already visible from a POST acknowledgement; otherwise it
     // could erase the row after this event retired its durable send receipt.
     ++loadState().generation;
-    if (!discordQueuedLoads.has(columns.main)) queueDiscordLoad({ keepPosition: true, readAs: "live" });
+    if (!channelReads.queued(columns.main)) queueDiscordLoad({ keepPosition: true, readAs: "live" });
   }
   if (providerFacts.threading()) {
     // A replayed copy is from when it was published, so the store's copy is at least as new — its
@@ -31555,7 +31541,7 @@ function awaitReplayRead(key, channel, arrivedAfter) {
   // a newest page, or a complete delta. A delta of additions says nothing about either.
   if (replayLedger.awaitRead(key, channel, arrivedAfter)) return;
   // `#226 page-energy-profile`. A hidden page leaves it waiting for the read coming back makes.
-  if (!discordFetchInFlight && screens.view() === "discord" && !document.hidden) {
+  if (!channelReads.busy() && screens.view() === "discord" && !document.hidden) {
     refreshQuietly(() => loadDiscord({ keepPosition: true, reason: "replay" }))();
   }
 }
@@ -31578,7 +31564,7 @@ function awaitReplayRead(key, channel, arrivedAfter) {
 function settleReplays(read, page) {
   replayLedger.settle(read, page, String(selectedChannelId()));
   // The stream's replay is answered by a read of the left column's view. `#229 desktop-two-column`.
-  if (page && replayLedger.waiting() && screens.view() === "discord" && !discordQueuedLoads.has(columns.main)) {
+  if (page && replayLedger.waiting() && screens.view() === "discord" && !channelReads.queued(columns.main)) {
     inColumn(columns.main, () => queueDiscordLoad({ keepPosition: true, reason: "replay" }));
   }
 }
