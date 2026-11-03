@@ -392,3 +392,49 @@ test("`#624 voice-page-modularity`: pins are read only for a revision not held, 
   assert.equal(sync.isKept(message), false);
   assert.equal(sync.isKept("M9"), false);
 });
+
+test("`#624 voice-page-modularity`: the rooms past the right column's foot open from a rested foot, are the foot while open, and close behind the reader", () => {
+  const { createFootRooms, OVERSCROLL_REST_MS, OVERSCROLL_IDLE_MS } = CHANNEL_VIEW;
+  const box = (top) => ({ style: { height: "" }, getBoundingClientRect: () => ({ top: top(), height: 0 }) });
+  const rows = 1000;
+  const area = {
+    clientHeight: 400, clientTop: 0, scrollTop: 600,
+    get scrollHeight() { return rows + (Number.parseFloat(overscrollBox.style.height) || 0) + (Number.parseFloat(overextendBox.style.height) || 0); },
+    getBoundingClientRect: () => ({ top: 0 }),
+  };
+  const overscrollBox = box(() => rows - area.scrollTop);
+  const overextendBox = box(() => rows + (Number.parseFloat(overscrollBox.style.height) || 0) - area.scrollTop);
+  const card = { getBoundingClientRect: () => ({ top: rows - 100 - area.scrollTop, height: 100 }) };
+  const timers = [];
+  let context = "c1";
+  const rooms = createFootRooms({
+    clock: { setTimeout: (run, ms) => { timers.push({ run, ms }); return timers.length; }, clearTimeout: (h) => { timers[h - 1] = null; } },
+    side: () => area, overscrollBox: () => overscrollBox, overextendBox: () => overextendBox,
+    context: () => context, offered: () => true, sideUp: () => true, lastCard: () => card,
+    paddingBottom: () => 0, pageStep: () => 360,
+  });
+  assert.equal(rooms.footGap(area), 0, "at the foot");
+  rooms.scrolled(1000);
+  rooms.wheel({ timeStamp: 1000 + OVERSCROLL_REST_MS - 1, deltaY: 100, deltaMode: 0, ctrlKey: false });
+  assert.equal(rooms.overscrollRoom(area), 0, "a turn that may have brought the reader to the foot opens nothing");
+  rooms.wheel({ timeStamp: 1000 + 3 * OVERSCROLL_REST_MS, deltaY: 100, deltaMode: 0, ctrlKey: false });
+  assert.equal(rooms.overscrollRoom(area), 100, "the last card's top can come to the middle: 200 less the 100 it stands above the end");
+  assert.equal(area.scrollTop, 700, "the turn that opened it is scrolled into it");
+  assert.equal(rooms.footGap(area), -100, "in the room, the foot is above");
+  assert.equal(rooms.footTop(area), 600);
+  assert.equal(timers.at(-1).ms, OVERSCROLL_IDLE_MS);
+  rooms.followFoot(area);
+  assert.equal(area.scrollTop, 700, "a follower in the room stays where they are");
+  context = "c2";
+  assert.equal(rooms.overscrollRoom(area), 0, "a room left open over something else closes as it is measured");
+  assert.equal(overscrollBox.style.height, "");
+  area.scrollTop = 600;
+  rooms.sizeOverextend(area, 650);
+  assert.equal(rooms.overextendRoom(area), 50, "a card held 50px past the foot gets 50px of room");
+  area.scrollTop = 620;
+  rooms.fitOverextend(area);
+  assert.equal(rooms.overextendRoom(area), 20, "going up takes the room from under the reader");
+  rooms.toFoot(area);
+  assert.equal(rooms.overextendRoom(area), 0);
+  assert.equal(area.scrollTop, rows, "to the foot");
+});

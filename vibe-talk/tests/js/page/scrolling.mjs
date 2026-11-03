@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import { BOTTOM_SLACK_PX, CHANNEL, CHARS_PER_LINE, CSS_CODE, CSS_UNCONDITIONAL, DESKTOP_QUERY,
   DISCORD_POLL_MS, HTML_CODE, LINE_PX, PAGE_CODE, PAGE_ELEMENTS, PAGE_IDS, PULL_ARM_PX,
   PULL_WAIT_MS, RELAY_FENCE_OPEN, SCRIPT, SCRIPT_CODE, SCROLLBACK_PX, SCROLL_VIEWPORT_PX,
-  SHORT_MESSAGE, assertMarkupContains, assistantSays, atBottomOf, brokenModule, brokenScript,
+  SHORT_MESSAGE, assertMarkupContains, assistantSays, atBottomOf, brokenModule, brokenScript, brokenScriptEach,
   channelSummaryText, countingChannel, cssBlock, cssBlockIn, cssBlockOutside, cssRules, deliver,
   errorResponse, fillTranscript, focused, foldButton, gate, helpEntry, holdChannelReads,
   inTwoColumns, json, jumpSaysArrived, jumpShown, longMessage, manyThreadColumns, markupHolds,
@@ -3678,17 +3678,18 @@ test("`#338 column-overscroll`: at a desk PgDn or Space at the foot of the right
   });
 
   // THE CONTROLS. The room not counted as the foot: in it the reader is up the list.
-  const notFoot = await run(brokenScript(
-    "  return area.scrollHeight - room - area.scrollTop - (area.clientHeight || 0);\n",
-    "  return area.scrollHeight - area.scrollTop - (area.clientHeight || 0);\n"));
+  const notFoot = await run(await brokenModule([{ file: "src/view/channel/footroom.ts",
+    find: "    return area.scrollHeight - room - area.scrollTop - (area.clientHeight || 0);\n",
+    replace: "    return area.scrollHeight - area.scrollTop - (area.clientHeight || 0);\n" }]));
   assert.deepStrictEqual(notFoot, { ...real, atNewest: false });
   // End and the chip landing where the room already is, rather than closing it: the reader stays in it.
-  const kept = await run(brokenScript(
-    "  if (area === leftEl(\"side-scroll\")) closeOverscroll();\n  area.scrollTop = area.scrollHeight;\n}",
-    "  area.scrollTop = area.scrollHeight;\n}").replace(
-    "  if (el(\"scroll-area\") === leftEl(\"side-scroll\")) closeOverscroll();\n", "").replace(
-    "  el(\"jump-newest\").addEventListener(\"click\", inThisColumn(() => {\n    closeOverscroll();\n",
-    "  el(\"jump-newest\").addEventListener(\"click\", inThisColumn(() => {\n"));
+  const kept = await run(await brokenModule([{ file: "src/view/channel/footroom.ts",
+    find: "    if (area === deps.side()) closeOverscroll();\n    area.scrollTop = area.scrollHeight;\n  }",
+    replace: "    area.scrollTop = area.scrollHeight;\n  }" }], brokenScriptEach(
+    ["  if (el(\"scroll-area\") === leftEl(\"side-scroll\")) closeOverscroll();\n", ""],
+    ["  el(\"jump-newest\").addEventListener(\"click\", inThisColumn(() => {\n    closeOverscroll();\n",
+      "  el(\"jump-newest\").addEventListener(\"click\", inThisColumn(() => {\n"],
+  )));
   assert.deepStrictEqual(kept, { ...real, endClosed: false, chipClosed: false });
 });
 
@@ -3734,9 +3735,9 @@ test("`#338 column-overscroll` x `#280 scroll-stability`: THE LAST CARD SHRINKIN
     "    const was = footing;\n"));
   assert.deepStrictEqual(unheld, { ...real, held: 2 * LINE_PX, atEnd: false });
   // The room kept whatever the list's length: blank room left under two cards that do not scroll.
-  const kept = await run(brokenScript(
-    "  if (area.scrollHeight - (area.clientHeight || 0) > footTop(area) + 1) return true;\n  closeOverscroll();\n  return false;\n",
-    "  return true;\n"));
+  const kept = await run(await brokenModule([{ file: "src/view/channel/footroom.ts",
+    find: "    if (area.scrollHeight - (area.clientHeight || 0) > footTop(area) + 1) return true;\n    closeOverscroll();\n    return false;\n",
+    replace: "    return true;\n" }]));
   assert.deepStrictEqual(kept, { ...real, shortClosed: false });
 });
 

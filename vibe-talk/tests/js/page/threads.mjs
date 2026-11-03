@@ -2938,7 +2938,9 @@ test("`#459 pack-keeps-card-still`: the room is one way — scrolling up takes i
   };
   assert.deepStrictEqual(await run(SCRIPT), { shrank: 30, backDown: 0, closed: true, footIsEnd: true });
   // THE CONTROL. The room not fitted as the reader scrolls: they scroll straight back down into it.
-  const kept = await run(brokenScript("  // `#459 pack-keeps-card-still`. The room held for a card goes as the reader goes up out of it.\n  fitOverextend(area);\n", ""));
+  const kept = await run(await brokenModule([{ file: "src/view/channel/footroom.ts",
+    find: "      // `#459 pack-keeps-card-still`. The room held for a card goes as the reader goes up out of it.\n      fitOverextend(area);\n",
+    replace: "" }]));
   assert.ok(kept.backDown > 0, "the control: with the room left standing, the reader could not scroll back into it");
 });
 
@@ -2969,7 +2971,8 @@ test("`#459 pack-keeps-card-still`: a reply arriving while the room is open fill
   };
   assert.deepStrictEqual(await run(SCRIPT), { moved: 0, filled: true, closed: true, atFoot: true });
   // THE CONTROL. The foot followed as if the room were not there: the reply yanks the view up by its height.
-  const yanked = await run(brokenScript("  if (overextendRoom(area) > 0) {\n    fitOverextend(area);\n    if (overextend !== null) return;\n  }\n", ""));
+  const yanked = await run(await brokenModule([{ file: "src/view/channel/footroom.ts",
+    find: "    if (overextendRoom(area) > 0) {\n      fitOverextend(area);\n      if (overextend !== null) return;\n    }\n", replace: "" }]));
   assert.ok(yanked.moved < 0, `the control: following the foot through the room did not move the card (${yanked.moved})`);
 });
 

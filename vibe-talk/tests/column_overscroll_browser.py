@@ -271,18 +271,21 @@ def arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
+# The rooms past the right column's foot, moved from voice.js into a module (`#624 voice-page-modularity`).
+FOOT_ROOMS = "src/view/channel/footroom.ts"
+
 # Each negative control: its name, the file of the page it changes, the texts it takes out and what it puts in
 # their place, and the checks (by their tags) one of which must be the one that fails.
 Control = tuple[str, str, tuple[tuple[str, str], ...], tuple[str, ...]]
 CONTROLS: tuple[Control, ...] = (
     ("no room drawn", "voice.css",
      (("  #side-scroll > #side-overscroll {\n    display: block;\n  }\n", ""),), ("WHEEL",)),
-    ("the room not the foot", "voice.js",
-     (("  return area.scrollHeight - room - area.scrollTop - (area.clientHeight || 0);\n",
-       "  return area.scrollHeight - area.scrollTop - (area.clientHeight || 0);\n"),), ("JUMP", "FOLLOW")),
-    ("a follower in the room taken to the foot", "voice.js",
-     (("    if (overscroll !== null && area.scrollTop >= footTop(area) - 0.5) return;\n", ""),), ("STILL",)),
-    ("no rest asked of the wheel", "voice.js",
+    ("the room not the foot", FOOT_ROOMS,
+     (("    return area.scrollHeight - room - area.scrollTop - (area.clientHeight || 0);\n",
+       "    return area.scrollHeight - area.scrollTop - (area.clientHeight || 0);\n"),), ("JUMP", "FOLLOW")),
+    ("a follower in the room taken to the foot", FOOT_ROOMS,
+     (("      if (overscroll !== null && area.scrollTop >= footTop(area) - 0.5) return;\n", ""),), ("STILL",)),
+    ("no rest asked of the wheel", FOOT_ROOMS,
      (("const OVERSCROLL_REST_MS = 150;\n", "const OVERSCROLL_REST_MS = 0;\n"),), ("DETENT",)),
     ("the last card's change of size neither fitted to nor held", "voice.js",
      (("  fitOverscroll(pane.scroller());\n  pane.scroller().scrollTop += row.getBoundingClientRect().top - before;\n",
@@ -296,9 +299,9 @@ CONTROLS: tuple[Control, ...] = (
 
 
 def page_rest_ms(root: Path) -> float:
-    """The wheel's rest as the page at `root` states it (`OVERSCROLL_REST_MS` in voice.js)."""
-    found = re.search(r"^const OVERSCROLL_REST_MS = (\d+);$", page_sources.source_text(root, "voice.js"), re.MULTILINE)
-    check(found is not None, f"{root / 'voice.js'} no longer states OVERSCROLL_REST_MS")
+    """The wheel's rest as the page at `root` states it (`OVERSCROLL_REST_MS` in its foot rooms' module)."""
+    found = re.search(r"^const OVERSCROLL_REST_MS = (\d+);$", page_sources.source_text(root, FOOT_ROOMS), re.MULTILINE)
+    check(found is not None, f"{FOOT_ROOMS} no longer states OVERSCROLL_REST_MS")
     assert found is not None
     return float(found.group(1))
 

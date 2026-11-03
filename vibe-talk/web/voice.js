@@ -2699,33 +2699,28 @@ function atBottom(area, slack = BOTTOM_SLACK_PX) {
 // asks whether it has one (`overscrollOffered`), as it asks whether the right column has (`sideHasBox`).
 
 /**
- * The room open past the foot of the right column: its height in px, what the column showed as it was
- * opened (`overscrollContext`), the wait to close it once the reader rests at the foot, and where the last
- * card stood while the reader was last seen in the room (`noteOverscrollReader`). Null while closed.
- *
- * @type {{px: number, context: string, idle: ReturnType<typeof setTimeout> | null,
- *   reader: {row: Element, top: number, height: number} | null} | null}
+ * The rooms past the foot of the right column — the reader's (`#338 column-overscroll`) and the one held
+ * for a card (`#459 pack-keeps-card-still`) — with every measure of the foot, fitting, following, and the
+ * wheel's and scroll's part in them: one owner in web/src/view/channel/footroom.ts (`#624
+ * voice-page-modularity`). What the column shows, whether it is up, and its last card are here.
  */
-let overscroll = null;
-
-/** How long the wheel rests before a turn of it at the foot opens the room: longer than between its turns. */
-const OVERSCROLL_REST_MS = 150;
-
-/** How long the room stays open with the reader resting at the foot, not in it, before it closes. */
-const OVERSCROLL_IDLE_MS = 700;
-
-/** When the wheel last turned over the right column (`Event.timeStamp`), for `OVERSCROLL_REST_MS`. */
-let overscrollWheelAt = -Infinity;
-
-/**
- * Since when the right column's list has been at its foot, by its scroll events (`Event.timeStamp`), or null
- * while it is not. The browser scrolls for a turn of the wheel before the page hears of the turn, so a list
- * found at its foot may have been brought there by that very turn: only one that has rested there as long
- * as the wheel rests (`OVERSCROLL_REST_MS`) was there before it.
- *
- * @type {number | null}
- */
-let overscrollFootSince = null;
+const footRooms = createFootRooms({
+  clock: clockOnUse(),
+  side: () => leftEl("side-scroll"),
+  overscrollBox: () => leftEl("side-overscroll"),
+  overextendBox: () => leftEl("side-overextend"),
+  context: () => overscrollContext(),
+  offered: () => overscrollOffered(),
+  sideUp: () => sideColumnUp(),
+  lastCard: () => lastColumnCard(),
+  paddingBottom: (area) => (typeof window.getComputedStyle === "function"
+    ? parseFloat(window.getComputedStyle(area).paddingBottom) || 0 : 0),
+  pageStep: (area) => pageStep(area),
+});
+const {
+  overscrollRoom, overextendRoom, footGap, footTop, closeOverscroll, waitOverscrollIdle, openOverscroll, fitOverscroll,
+  noteOverscrollReader, holdOverscrollReader, followFoot, toFoot, closeOverextend, sizeOverextend, fitOverextend,
+} = footRooms;
 
 /**
  * What the right column shows, for the room opened over it: the room closes on anything else. The search
@@ -2745,55 +2740,6 @@ function overscrollOffered() {
 }
 
 /**
- * How far `area` scrolls past the foot of its rows: the room open in the right column over what it shows
- * now, else 0. A room left open over something else is closed here, before anything measures by it: a
- * measure with a side effect, which every measure of the foot goes through (`footGap`, `footTop`).
- *
- * @param {HTMLElement} area
- */
-function overscrollRoom(area) {
-  if (overscroll === null || area !== leftEl("side-scroll")) return 0;
-  if (overscroll.context !== overscrollContext() || !overscrollOffered()) {
-    closeOverscroll();
-    return 0;
-  }
-  return overscroll.px;
-}
-
-/**
- * How far the rows of `area` run below what it shows: 0 at the foot, and below 0 past it, in the room
- * open there (`overscrollRoom`).
- *
- * @param {HTMLElement} area
- */
-function footGap(area) {
-  // The room first: asking for it can close it (`overscrollRoom`), which takes its height out of
-  // the list and clamps where the reader stands — heights read before it would count the room
-  // twice, and a reader in it would measure a room's height short of the foot they are past.
-  const room = overscrollRoom(area) + overextendRoom(area);
-  return area.scrollHeight - room - area.scrollTop - (area.clientHeight || 0);
-}
-
-/**
- * The scroll position of the foot of `area`: its newest row, and the box under it, at the bottom of what
- * it shows.
- *
- * @param {HTMLElement} area
- */
-function footTop(area) {
-  const room = overscrollRoom(area) + overextendRoom(area);
-  return Math.max(0, area.scrollHeight - room - (area.clientHeight || 0));
-}
-
-/** Close the room. Below the screen whenever the reader is not in it, so nothing on screen moves then. */
-function closeOverscroll() {
-  if (overscroll === null) return;
-  if (overscroll.idle !== null) clearTimeout(overscroll.idle);
-  overscroll = null;
-  leftEl("side-overscroll").style.height = "";
-}
-
-/**
  * The last card of the right column that is drawn: its last thread card over the cards, else the last row
  * of its thread, a reply still in the outbox under it included. Null where none is drawn.
  */
@@ -2810,177 +2756,6 @@ function lastColumnCard() {
     }
   }
   return null;
-}
-
-/**
- * The room `area` needs past its foot for the top of its last card to come up to half its height: as
- * much as half of it, less how far above the end of the rows (the room's own top) that card's top is,
- * and the scroller's padding under them. 0 where the card is already at the middle or above at the foot.
- *
- * @param {HTMLElement} area
- */
-function overscrollFit(area) {
-  const last = lastColumnCard();
-  if (!last) return 0;
-  const pad = typeof window.getComputedStyle === "function"
-    ? parseFloat(window.getComputedStyle(area).paddingBottom) || 0 : 0;
-  const above = leftEl("side-overscroll").getBoundingClientRect().top - last.getBoundingClientRect().top;
-  return Math.max(0, Math.round((area.clientHeight || 0) / 2 - above - pad));
-}
-
-/**
- * Close the room once the reader has rested at the foot without going into it. Waited for again on every
- * scroll while the room is open.
- */
-function waitOverscrollIdle() {
-  if (overscroll === null) return;
-  if (overscroll.idle !== null) clearTimeout(overscroll.idle);
-  overscroll.idle = setTimeout(() => {
-    if (overscroll === null) return;
-    overscroll.idle = null;
-    const area = leftEl("side-scroll");
-    if (overscrollRoom(area) > 0 && area.scrollTop <= footTop(area) + 1) closeOverscroll();
-  }, OVERSCROLL_IDLE_MS);
-}
-
-/**
- * Give the open room `px`, or close it where even that leaves a list too short to scroll past its foot.
- * Whether it is still open.
- *
- * @param {HTMLElement} area
- * @param {number} px
- */
-function sizeOverscroll(area, px) {
-  if (overscroll === null) return false;
-  overscroll.px = px;
-  const room = leftEl("side-overscroll");
-  if (room.style.height !== `${px}px`) room.style.height = `${px}px`;
-  if (area.scrollHeight - (area.clientHeight || 0) > footTop(area) + 1) return true;
-  closeOverscroll();
-  return false;
-}
-
-/**
- * Open the room for the reader of `area` going on down from its foot — a turn of the wheel, a page key,
- * Space, ↓ past the last message — in the same task as that event, before the browser scrolls for it.
- * Only in the right column at a desk, only from the foot, and only where the last card is not already at
- * the middle at the foot and the room gives the list somewhere to go. Whether the room is open.
- *
- * @param {HTMLElement} area
- */
-function openOverscroll(area) {
-  if (area !== leftEl("side-scroll")) return false;
-  if (overscrollRoom(area) > 0) {
-    waitOverscrollIdle();
-    return true;
-  }
-  // `#459 pack-keeps-card-still`. Not over the room a card held where it stood left: the reader is past
-  // the foot already, and that room only ever gives way.
-  if (overextendRoom(area) > 0) return false;
-  if (!overscrollOffered() || footGap(area) > 1) return false;
-  const px = overscrollFit(area);
-  if (px < 1) return false;
-  overscroll = { px, context: overscrollContext(), idle: null, reader: null };
-  if (!sizeOverscroll(area, px)) return false;
-  waitOverscrollIdle();
-  return true;
-}
-
-/**
- * Fit the open room to the last card again, after the rows or the column changed size: closed where the
- * reader is back up above the foot, the last card is at the middle or above at the foot, or the list is
- * now too short to scroll past its foot even with the room (a search or a filter left few rows).
- *
- * @param {HTMLElement} area
- */
-function fitOverscroll(area) {
-  if (overscrollRoom(area) === 0 || overscroll === null) return;
-  const px = overscrollFit(area);
-  if (px < 1 || area.scrollTop < footTop(area) - 1) {
-    closeOverscroll();
-    return;
-  }
-  sizeOverscroll(area, px);
-}
-
-/**
- * Note where the last card of the right column stands on screen, its top from the scroller's and its
- * height, while the reader of `area` is in the room past its foot (the foot above the bottom of the
- * column), else nothing: what `holdOverscrollReader` keeps. At every scroll of the column, and after a
- * place the page itself gave the reader there.
- *
- * @param {HTMLElement} area
- */
-function noteOverscrollReader(area) {
-  if (overscroll === null || area !== leftEl("side-scroll")) return;
-  const row = area.scrollTop > footTop(area) + 0.5 ? lastColumnCard() : null;
-  if (overscroll === null) return;
-  const box = row ? row.getBoundingClientRect() : null;
-  overscroll.reader = row && box
-    ? { row, top: box.top - area.getBoundingClientRect().top, height: box.height }
-    : null;
-}
-
-/**
- * `#280 scroll-stability` in the room past the right column's foot: THE LAST CARD CHANGING SIZE under a
- * reader in the room — highlighted, put out, drawn shorter — with nothing scrolled. The room is fitted to
- * it at once, and the card left where the reader had it. A card that shrank took the end of the list up
- * by what it lost, the browser clamped the reader to the new end, and the card dropped by that much on
- * screen, the room fitted to it only after the frame was drawn and then longer than where the reader was
- * left. Only the card's own change of size: a change above it is the browser's scroll anchoring and the
- * redraws' own place-keeping to answer for. From where the rows' sizes are reported, before paint (the
- * right column's foot keeper), and by a press that changes the card (`toggleLitCard`).
- *
- * @param {HTMLElement} area
- */
-function holdOverscrollReader(area) {
-  if (overscroll === null || overscrollRoom(area) === 0) return;
-  const held = overscroll.reader;
-  fitOverscroll(area);
-  if (overscroll === null || held === null) return;
-  if (held.row === lastColumnCard()) {
-    const box = held.row.getBoundingClientRect();
-    const moved = box.top - area.getBoundingClientRect().top - held.top;
-    if (Math.abs(box.height - held.height) > 0.5 && Math.abs(moved) > 0.5) area.scrollTop += moved;
-  }
-  noteOverscrollReader(area);
-}
-
-/**
- * Keep the reader of `area` on its newest line: at the foot, where `scrollTop = scrollHeight` always put
- * them. A reader in the room past the right column's foot is on that line already, and stays exactly
- * where they are while the foot is still on screen, the room fitted to the last card first: a reply that
- * came in opens in the room, under the card they are reading. One taller than they are past the foot
- * takes them on to the foot, and the room closes behind them. `#338 column-overscroll`.
- *
- * @param {HTMLElement} area
- */
-function followFoot(area) {
-  // `#459 pack-keeps-card-still`. A reader in the room a card held where it stood left past the foot stays
-  // exactly where they are while what came fits in it; what does not takes them on to the foot.
-  if (overextendRoom(area) > 0) {
-    fitOverextend(area);
-    if (overextend !== null) return;
-  }
-  if (overscrollRoom(area) > 0) {
-    fitOverscroll(area);
-    if (overscroll !== null && area.scrollTop >= footTop(area) - 0.5) return;
-    closeOverscroll();
-  }
-  area.scrollTop = area.scrollHeight;
-}
-
-/**
- * Take the reader of `area` to its foot, out of the room past it: a landing, and the reader's own way to
- * the newest line, which put them where a list opens. `#338 column-overscroll`.
- *
- * @param {HTMLElement} area
- */
-function toFoot(area) {
-  // `#459 pack-keeps-card-still`. Out of the room a card held where it stood left, too.
-  if (area === leftEl("side-scroll")) closeOverextend();
-  if (area === leftEl("side-scroll")) closeOverscroll();
-  area.scrollTop = area.scrollHeight;
 }
 
 // --- room past the foot held for a card packed where it stands -------------------------------------
@@ -3005,76 +2780,8 @@ function toFoot(area) {
 // room it is the foot while it is open (`footGap`), and it closes as the reader goes back up past the
 // foot, when the column shows something else, and by the reader's own way to the newest line (`toFoot`).
 
-/**
- * The room open past the foot for a card held where it stood: its height in px and what the column showed
- * as it was opened (`overscrollContext`). Null while closed.
- *
- * @type {{px: number, context: string} | null}
- */
-let overextend = null;
-
-/**
- * How far `area` scrolls past the foot for a card held where it stood, else 0; closed here, before
- * anything measures by it, where the column shows something else (as `overscrollRoom`).
- *
- * @param {HTMLElement} area
- */
-function overextendRoom(area) {
-  if (overextend === null || area !== leftEl("side-scroll")) return 0;
-  if (overextend.context !== overscrollContext() || !sideColumnUp()) {
-    closeOverextend();
-    return 0;
-  }
-  return overextend.px;
-}
-
-/** Close the room held for a card. */
-function closeOverextend() {
-  if (overextend === null) return;
-  overextend = null;
-  leftEl("side-overextend").style.height = "";
-}
-
-/**
- * Give `area` the room past its foot that lets it scroll to `top`, and no more: closed where it already
- * scrolls that far without it. Fitting it again (`fit`) never makes it taller, and closes it within a pixel
- * of the foot: the end of the rows is fractional and the browser rounds the scroll range, so a room fitted
- * up to wherever the reader stands could leave them a pixel more to scroll each time, and grow under them. How far it scrolls without it is measured from where the room starts, the
- * end of the rows as laid out, rather than from `scrollHeight`, which counts the rows sliding into a gap
- * (`#460 pack-gap-slide`) where they are drawn: fitted by that, the room would be short by the slide, and
- * the browser's clamp would take the reader up as the slide ended.
- *
- * @param {HTMLElement} area
- * @param {number} top
- */
-function sizeOverextend(area, top, fit = false) {
-  overextendRoom(area);
-  const pad = typeof window.getComputedStyle === "function"
-    ? parseFloat(window.getComputedStyle(area).paddingBottom) || 0 : 0;
-  const end = area.scrollTop + leftEl("side-overextend").getBoundingClientRect().top -
-    area.getBoundingClientRect().top - (area.clientTop || 0);
-  const furthest = end + pad - (area.clientHeight || 0);
-  const want = top - furthest;
-  const px = fit && overextend !== null ? Math.min(overextend.px, Math.ceil(want)) : Math.ceil(want);
-  if (px < 1 || (fit && want < 1)) {
-    closeOverextend();
-    return;
-  }
-  if (overextend === null) overextend = { px, context: overscrollContext() };
-  overextend.px = px;
-  const room = leftEl("side-overextend");
-  if (room.style.height !== `${px}px`) room.style.height = `${px}px`;
-}
-
-/**
- * Fit the room held for a card to where the reader of `area` now stands: as far past the foot as they are,
- * so a reader who went up has it taken from under them, and rows that came at the foot take its place.
- *
- * @param {HTMLElement} area
- */
-function fitOverextend(area) {
-  if (overextendRoom(area) > 0) sizeOverextend(area, area.scrollTop, true);
-}
+// The room held for a card, its measure, closing and fitting (`overextendRoom`, `closeOverextend`,
+// `sizeOverextend`, `fitOverextend`) are the foot rooms' owner's, above (`#624 voice-page-modularity`).
 
 /**
  * Run `change` to the cards with thread `id`'s card held exactly where it is on the screen, past the foot
@@ -35069,21 +34776,7 @@ leftEl("side-scroll").addEventListener("scroll", scheduleColumnLinks, PASSIVE);
 // this page: it has already found the list at its end and moved nothing by the time the room opens, so the
 // turn that opened it is scrolled here, by as much as the browser would have; the turns after it the browser
 // scrolls into the room itself.
-leftEl("side-scroll").addEventListener("wheel", (/** @type {WheelEvent} */ event) => {
-  const rested = event.timeStamp - overscrollWheelAt >= OVERSCROLL_REST_MS;
-  overscrollWheelAt = event.timeStamp;
-  if (!rested || event.deltaY <= 0 || event.ctrlKey || overscroll !== null) return;
-  const area = leftEl("side-scroll");
-  // A list too short to scroll has no scroll events, and rests at its foot as it rests at its head.
-  const resting = overscrollFootSince !== null
-    ? event.timeStamp - overscrollFootSince >= OVERSCROLL_REST_MS
-    : area.scrollHeight - (area.clientHeight || 0) <= 1;
-  if (!resting || !openOverscroll(area)) return;
-  // A line is 40px, as Chromium scrolls one; a page is what a page key moves (`pageStep`).
-  const px = event.deltaMode === 1 ? event.deltaY * 40 : event.deltaMode === 2 ? event.deltaY * pageStep(area) : event.deltaY;
-  if (typeof area.scrollBy === "function") area.scrollBy({ top: px, behavior: "smooth" });
-  else area.scrollTop += px;
-}, PASSIVE);
+leftEl("side-scroll").addEventListener("wheel", (/** @type {WheelEvent} */ event) => footRooms.wheel(event), PASSIVE);
 // `#460 pack-gap-slide`. The reader's own wheel or key on the list ends a slide at once: what they act on is
 // where it is laid out. Not a scroll, which the page's own place-keeping makes too; nor a press or a touch,
 // whose click lands on what was under the pointer as it went down, which ending the slide would move.
@@ -35094,20 +34787,8 @@ for (const type of ["wheel", "keydown"]) {
 // the foot without going into it (`waitOverscrollIdle`). A reader in it is noted where they have the last
 // card, for `holdOverscrollReader`.
 leftEl("side-scroll").addEventListener("scroll", (/** @type {Event | undefined} */ event) => {
-  const area = leftEl("side-scroll");
   // A browser's scroll event always carries its time; the page suite fires its scroll listeners with none.
-  const at = event ? event.timeStamp : -Infinity;
-  // `#459 pack-keeps-card-still`. The room held for a card goes as the reader goes up out of it.
-  fitOverextend(area);
-  if (footGap(area) > 1) overscrollFootSince = null;
-  else if (overscrollFootSince === null) overscrollFootSince = at;
-  if (overscroll === null || overscrollRoom(area) === 0) return;
-  if (area.scrollTop < footTop(area) - 1) {
-    closeOverscroll();
-    return;
-  }
-  waitOverscrollIdle();
-  noteOverscrollReader(area);
+  footRooms.scrolled(event ? event.timeStamp : -Infinity);
 }, PASSIVE);
 document.addEventListener("visibilitychange", scheduleColumnLinks);
 

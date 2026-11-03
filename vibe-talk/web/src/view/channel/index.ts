@@ -81,3 +81,5 @@ export { THREAD_HUES_KEY, THREAD_HUES_PER_CHANNEL, THREAD_HUES_SEEDED_KEY, THREA
 export type { ThreadHues, ThreadHuesDependencies } from "./hues.ts";
 export { createPinSync } from "./pins.ts";
 export type { PinSync, PinSyncDependencies } from "./pins.ts";
+export { OVERSCROLL_IDLE_MS, OVERSCROLL_REST_MS, createFootRooms } from "./footroom.ts";
+export type { FootRooms, FootRoomsDependencies } from "./footroom.ts";
