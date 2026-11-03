@@ -554,6 +554,10 @@ pub struct Config {
     /// make no API call and carry no review data).
     #[serde(default)]
     pub require_approval_at_head: bool,
+    /// Recount the generated count pins after merging each batch instead of
+    /// treating their conflicts as real: see `recount`. Off by default.
+    #[serde(default)]
+    pub recount_pins: bool,
     /// Identity for commits the queue creates.
     pub identity: IdentityConfig,
     /// Failure classes: failed tests matching a rule's pattern are labelled with its class in
@@ -599,6 +603,7 @@ impl Default for Config {
             exact_sha: false,
             trust_base: false,
             require_approval_at_head: false,
+            recount_pins: false,
             identity: IdentityConfig::default(),
             classify: Vec::new(),
             github: GitHubConfig::default(),

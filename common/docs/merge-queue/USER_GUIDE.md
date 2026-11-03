@@ -643,6 +643,7 @@ An **item record** (`items/<pr>.json`) has these fields:
 | `exact_sha` | `false` | The exact-commit rule. |
 | `trust_base` | `false` | Skip probing the base in culprit searches. |
 | `require_approval_at_head` | `false` | Approval-at-head rule for GitHub ready sources; see `--require-approval-at-head`. |
+| `recount_pins` | `false` | Recount the generated count pins after merging each batch (base plus each change's own delta); see `--recount-pins`. A change whose pins cannot be recounted is skipped from its batch and stays queued. |
 | `classify` | `[]` | `[{pattern, class}]` failure classes; see `--classify`. |
 | `peers` | `{}` | Peer queue name to state directory. |
 | `identity` | empty | `{name, email}` for commits the queue creates. |

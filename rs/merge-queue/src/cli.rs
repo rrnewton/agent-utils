@@ -420,6 +420,11 @@ enum Command {
         /// notified. Off by default.
         #[arg(long)]
         require_approval_at_head: bool,
+        /// Recount the generated count pins after merging each batch
+        /// (base plus each change's own delta) instead of treating their
+        /// conflicts as real. Off by default.
+        #[arg(long)]
+        recount_pins: bool,
         /// After landing, close each landed pull request with a pointer to the landed commit
         /// (budgeted; postponed closes are retried by `sync`).
         #[arg(long)]
@@ -1030,6 +1035,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             api_budget_file,
             anonymous_fetch,
             require_approval_at_head,
+            recount_pins,
             close_prs,
             net_wrapper,
             validator,
@@ -1087,6 +1093,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                 exact_sha,
                 trust_base,
                 require_approval_at_head,
+                recount_pins,
                 identity: IdentityConfig {
                     name: identity_name,
                     email: identity_email,

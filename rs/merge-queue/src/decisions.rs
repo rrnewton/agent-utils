@@ -565,6 +565,46 @@ pub fn append(
     prune(&dir, bounds, Utc::now())
 }
 
+/// One batch-construction skip: a change left out of its batch (it stays
+/// queued), with the named reason. Written beside the validation records.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SkipRecord {
+    /// Always `skip`.
+    pub decision: String,
+    /// Change left out of the batch.
+    pub pr: i64,
+    /// Named reason, e.g. `recount-pins refused: ...`.
+    pub reason: String,
+    /// Run that decided it (`runs/<id>/`).
+    pub run: String,
+    /// RFC 3339 UTC time.
+    pub at: String,
+}
+
+/// Append skip records to `decisions/skips.jsonl` (one JSON object per line).
+pub fn append_skips(state_root: &Path, skips: &[SkipRecord]) -> Result<(), String> {
+    if skips.is_empty() {
+        return Ok(());
+    }
+    let dir = dir(state_root);
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
+    let path = dir.join("skips.jsonl");
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+    for skip in skips {
+        let line = serde_json::to_string(skip)
+            .map_err(|error| format!("cannot encode a skip record: {error}"))?;
+        file.write_all(line.as_bytes())
+            .and_then(|()| file.write_all(b"\n"))
+            .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+    }
+    Ok(())
+}
+
 /// Delete day files older than the age bound, then the oldest until the total fits the size
 /// bound. The newest file is always kept.
 pub fn prune(dir: &Path, bounds: &DecisionsConfig, now: DateTime<Utc>) -> Result<(), String> {
