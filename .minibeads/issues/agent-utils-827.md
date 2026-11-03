@@ -44,3 +44,15 @@ Failing cases are delivery-ordering assertions (`primary/muse14/resumed-drain` p
 ### rust.chat-subscription.slack — LOAD (fixed)
 
 `directory::rejection_lookup_and_write_share_one_deadline_even_through_the_warm_wrapper` (gate-742c): expected outcome `unknown` (write began, killed at the shared 1000 ms deadline), got `not_applied` (write never began). The fake lookup slept 0.65 s of the 1.0 s deadline, leaving only ~0.35 s for two process spawns; under gate load the lookup phase consumed the whole deadline. Fix: the fake's `author-slow` latency is 0.45 s, restoring spawn headroom within the same deadline (no deadline or sleep was lengthened; the sibling persistence test still exceeds the deadline: 0.45 + 0.65 > 1.0). Verified: 19/19 directory tests pass; under artificial saturation (4 spinners on 2 cores, test pinned to the same 2 cores) 1 failure in 60 runs, versus failing in ordinary full gates before.
+
+### vibe-talk.check.*-browser — LOAD (left, with reason)
+
+`vibe-talk.check.keyboard-browser` (gate-796): after a CDP PgDn, the focus ring did not follow the page within the test's frame budget — a Chromium interaction/frame-timing race that only appears under host contention; solo it passes. The step's budgets already follow the owner rule (timeout 120, cpu_timeout 60). The fix belongs in vibe-talk's own wait-for-condition harness (wait on the ring's target rather than a frame count), which is that lane's product code; not edited here. Same verdict for the single-occurrence `thread-card-header-browser`, `desktop-layout-browser`, and `vibe-talk.shots.screenshots` failures that day: browser timing under load, no product assertion about agent-utils code.
+
+### python.agentctl.shard-1 — covered by the reply-ID fix (unverified)
+
+Its single failure that day, `test_rust_mcp_matches_python`, sits in the family the hyphen fix addresses (agentctl cases minting reply IDs); no separate failure text survives to confirm. Left as: expected fixed by the `chat reply` hyphen change; re-triage if it recurs.
+
+### Remaining acceptance
+
+The >=90% full-gate pass rate is measured over a working day after these fixes land; it cannot be observed inside this session. The three fixes above (reply-ID hyphen parsing, parent-death probe race, shared-deadline headroom) plus #815/#818 remove the repeat offenders with daily counts 4, 3, 3, 2 and 2 from the 2026-11-03 list.
