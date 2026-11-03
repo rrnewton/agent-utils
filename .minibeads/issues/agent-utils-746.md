@@ -1,6 +1,6 @@
 ---
 title: 'restore-im-back: deterministic I''m-back summary and catch-up prompts after a restore'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 assignee: mu-restore2@devbig030
@@ -9,7 +9,8 @@ labels:
 depends_on:
   agent-utils-740: parent-child
 created_at: 2026-11-02T16:13:53.514054293+00:00
-updated_at: 2026-11-02T23:02:53.446232862+00:00
+updated_at: 2026-11-03T03:43:30.025373740+00:00
+closed_at: 2026-11-03T03:43:30.025373430+00:00
 ---
 
 # Description
