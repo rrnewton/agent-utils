@@ -1,15 +1,16 @@
 ---
 title: 'agent-teams-relay-trust-key: trust a second team''s relay key without a bot mapping'
-status: open
+status: closed
 priority: 2
-assignee: mu-mirror@devbig014
 issue_type: feature
+assignee: mu-mirror@devbig014
 labels:
 - agent-teams
 depends_on:
   agent-utils-769: blocks
 created_at: 2026-11-02T19:58:18.254307332+00:00
-updated_at: 2026-11-02T19:58:18.254307332+00:00
+updated_at: 2026-11-03T00:58:56.480366310+00:00
+closed_at: 2026-11-03T00:58:56.480366170+00:00
 ---
 
 # Description
