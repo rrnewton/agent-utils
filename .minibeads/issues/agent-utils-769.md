@@ -1,13 +1,14 @@
 ---
 title: 'relay-rescan-settle-latency: relay posts wait up to about 11.5 min after a bridge restart'
-status: open
+status: closed
 priority: 3
-assignee: mu-mirror@devbig014
 issue_type: task
+assignee: mu-mirror@devbig014
 labels:
 - agentctl
 created_at: 2026-11-02T16:26:35.786357109+00:00
-updated_at: 2026-11-02T16:26:35.786357109+00:00
+updated_at: 2026-11-03T00:43:24.406752714+00:00
+closed_at: 2026-11-03T00:43:24.406752594+00:00
 ---
 
 # Description
