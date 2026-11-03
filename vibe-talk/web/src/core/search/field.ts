@@ -1,6 +1,7 @@
-// The search field's state (`#129 message-search`, `#249 search-highlight`; `#624 voice-page-modularity`,
-// moved from the legacy script into core/search): whether the field is open, what is in it, the text whose
-// hits are drawn, and marking those hits once the typing pauses. Filtering the rows, drawing the marks and
+// The search field's state (`#129 message-search`, `#249 search-highlight`, `#212 link-filter`; `#624
+// voice-page-modularity`, moved from the legacy script into core/search): whether the field is open, what is
+// in it, whether the Links filter beside it is on, the text whose hits are drawn, and marking those hits once
+// the typing pauses. Filtering the rows, drawing the marks and
 // the field itself are the page's; why it filters rather than fetches is told where the legacy script
 // opens the section.
 
@@ -27,6 +28,9 @@ export interface SearchField {
   /** What is in the field. Read from here rather than from the input, so the filter has one source. */
   query(): string;
   setQuery(text: string): void;
+  /** Whether the Links filter is on. Only while the search bar is open: closing it turns this off. */
+  links(): boolean;
+  setLinks(on: boolean): void;
   /**
    * The text whose hits are drawn (`#249 search-highlight`): the query once the typing pauses.
    *
@@ -50,6 +54,7 @@ export interface SearchField {
 export function createSearchField(deps: SearchFieldDependencies): SearchField {
   let searchOpen = false;
   let searchQuery = "";
+  let linksOnly = false;
   let markedQuery = "";
   /** The marking a keystroke put off, or null. */
   let searchMarkTimer: TimerHandle | null = null;
@@ -71,6 +76,10 @@ export function createSearchField(deps: SearchFieldDependencies): SearchField {
     query: () => searchQuery,
     setQuery(text) {
       searchQuery = text;
+    },
+    links: () => linksOnly,
+    setLinks(on) {
+      linksOnly = on;
     },
     marked: () => markedQuery,
     setMarked(text) {

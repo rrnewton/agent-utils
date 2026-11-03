@@ -3942,7 +3942,7 @@ function renderSummaries() {
 function summaryTargets() {
   // `#211 link-filter`. A summary stands in for a row's text, and under the Links filter that text
   // is not on screen: a summary asked for there is one paid for and never seen.
-  if (!summaryRows.mode() || currentView !== "discord" || (searchField.open() && linksOnly)) {
+  if (!summaryRows.mode() || currentView !== "discord" || (searchField.open() && searchField.links())) {
     return [];
   }
   // A server that has said it has no summariser will say it again for every row, and each of
@@ -4155,7 +4155,7 @@ function renderJumpNewest() {
  * (`#211 link-filter`): Expand all and Collapse all would change only what cannot be seen.
  */
 function visibleFolds() {
-  if (searchField.open() && linksOnly) return [];
+  if (searchField.open() && searchField.links()) return [];
   // In the right column while it shows the cards, not its thread's rows, which are not on screen, but
   // the cards' list: the messages unpacked under them, which are folded as a thread's are (`#407
   // unpack-row-parity`), and none where nothing is unpacked, a card being no fold. `#301
@@ -4684,7 +4684,7 @@ function applySearch() {
   // chosen: the threads whose held replies match.
   const replyHits = typed && threadingSupported && (selection().view === "main" || selection().view === "threads")
     ? threadsWithHits(node) : null;
-  const links = searchField.open() && linksOnly;
+  const links = searchField.open() && searchField.links();
   // `#251 author-filter`. Whose messages, ANDed with the rest.
   const author = authorChoosing();
   // `#215 reply-coalesce`. A filter that takes rows away shows a subset of the channel in time order,
@@ -4829,7 +4829,7 @@ function applySearch() {
  */
 function searchInAllOffered(searched) {
   return searched !== null && !searched.pinned && searched.matched === 0 && searched.loaded > 0 && searchField.open() &&
-    !linksOnly && authorChoosing() === "everyone" && searchTyped(searchField.query()) &&
+    !searchField.links() && authorChoosing() === "everyone" && searchTyped(searchField.query()) &&
     currentView === "discord" && threadingSupported && !sideColumnUp() && selection().view === "main";
 }
 
@@ -4934,7 +4934,7 @@ function renderSearchCount(typed, links, author = false) {
 
 /** The count in the bar again, from what each column last counted: for a change of layout that redrew no row. */
 function refreshSearchCount() {
-  renderSearchCount(searchField.open() && searchTyped(searchField.query()), searchField.open() && linksOnly,
+  renderSearchCount(searchField.open() && searchTyped(searchField.query()), searchField.open() && searchField.links(),
     authorChoosing() !== "everyone");
 }
 
@@ -6169,8 +6169,8 @@ function showSearchOpen(open) {
 // `data-links-view`). So every act on a row still works on it, and a row a poll redraws is redrawn
 // filtered by the pass that draws everything else, `applySearch`.
 
-/** Whether the Links filter is on. Only while the search bar is open: closing it turns this off. */
-let linksOnly = false;
+// Whether the Links filter is on is the search field's (`SearchField.links`, web/src/core/search,
+// `#624 voice-page-modularity`): only while the search bar is open; closing it turns this off.
 
 // Finding the links in a text (linksIn, markdownLinkAt, bareLinkAt, trimAddress, HTTP_ADDRESS) is
 // web/src/foundation/'s (`#624 voice-page-modularity`).
@@ -6334,9 +6334,9 @@ const filterPlace = () =>
  * filter-keeps-selection`). A reader on the newest line stays on it.
  */
 function setLinksOnly(on) {
-  if (on === linksOnly) return;
+  if (on === searchField.links()) return;
   keepingFilterPlace(() => liftingHideRead(() => {
-    linksOnly = on;
+    searchField.setLinks(on);
     el("links-filter").setAttribute("aria-pressed", on ? "true" : "false");
     // `#212 link-filter`. The kinds of link come up under it, or go, and the room the list makes for
     // them with them — before anything below measures the list.
@@ -6502,7 +6502,7 @@ function setLinksRaw(on) {
  * the first row is never underneath them.
  */
 function renderLinkKinds() {
-  const up = linksOnly && !el("links-filter").hidden;
+  const up = searchField.links() && !el("links-filter").hidden;
   el("link-kinds").hidden = !up;
   if (up) el("screen-main").setAttribute("data-link-kinds", "");
   else el("screen-main").removeAttribute("data-link-kinds");
@@ -8639,7 +8639,7 @@ function filterFromKeyboard(which) {
   if (!searchField.open()) setSearchOpen(true);
   if (which === "pinned") setPinnedOnly(!pinsView().only);
   else if (which === "author") cycleAuthorFilter();
-  else setLinksOnly(!linksOnly);
+  else setLinksOnly(!searchField.links());
   focusList(channelPane);
   return true;
 }
@@ -22519,7 +22519,7 @@ const SEARCH_OLDER_HITS = 3;
 const SEARCH_OLDER_TAP_MS = 500;
 
 /** Everything a walk for the search depends on: a change in any of them ends it, and clears its note. */
-const searchKey = () => JSON.stringify([filterKey(), searchField.open() ? searchIdentity(searchField.query()) : null, searchField.open() && linksOnly,
+const searchKey = () => JSON.stringify([filterKey(), searchField.open() ? searchIdentity(searchField.query()) : null, searchField.open() && searchField.links(),
   [...linkKinds.hidden()], authorChoosing(), readModes.mode()]);
 
 /**
@@ -24396,7 +24396,7 @@ function openThreadRootId() {
 
 /** Whether a filter is choosing rows: then every match is shown, and no run hides one behind a line. */
 function readRunsSuspended() {
-  return searchField.open() && (linksOnly || authorFilters.chosen() !== "everyone" || searchTyped(searchField.query()));
+  return searchField.open() && (searchField.links() || authorFilters.chosen() !== "everyone" || searchTyped(searchField.query()));
 }
 
 /**
@@ -33750,7 +33750,7 @@ function settingsSyncView() {
       keepingFilterPlace(() => {
         linkKinds.reloadRaw();
         renderLinkKinds();
-        if (searchField.open() && linksOnly) eachColumn(renderScrollTools);
+        if (searchField.open() && searchField.links()) eachColumn(renderScrollTools);
       });
     },
     threadsUnpacked: () => {
@@ -35109,7 +35109,7 @@ el("search-toggle").addEventListener("click", () => setSearchOpen(!searchField.o
 // `#206 pin-message`. A toggle, like the glass beside it.
 el("pinned-filter").addEventListener("click", () => setPinnedOnly(!pinsView().only));
 // `#211 link-filter`. The same, for links.
-el("links-filter").addEventListener("click", () => setLinksOnly(!linksOnly));
+el("links-filter").addEventListener("click", () => setLinksOnly(!searchField.links()));
 // `#251 author-filter`. Everyone, Mine, Theirs, in turn.
 el("author-filter").addEventListener("click", cycleAuthorFilter);
 // `#212 link-filter`. And each kind of link under it, a toggle of its own.

@@ -167,3 +167,15 @@ test("`#624 voice-page-modularity`: a query is parsed once per change of its tex
   assert.equal(blank.node, null, "spaces are no search");
   assert.notEqual(queries.parsed("kestrel -owl"), first, "a change of text and back parses afresh");
 });
+
+test("`#624 voice-page-modularity`: the Links filter is the search field's, off until turned on", () => {
+  const field = SEARCH.createSearchField({ clock: { setTimeout: () => 0, clearTimeout: () => {} }, redraw: (apply) => apply() });
+  assert.equal(field.links(), false);
+  field.setLinks(true);
+  assert.equal(field.links(), true);
+  field.setOpen(true);
+  field.setQuery("deploy");
+  assert.equal(field.links(), true, "the text and the filter are separate");
+  field.setLinks(false);
+  assert.equal(field.links(), false);
+});
