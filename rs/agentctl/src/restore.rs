@@ -1974,79 +1974,34 @@ pub fn watch_once<A: ManagedApi + ?Sized>(
     if herdr_up {
         if let Ok(manager) = ManagedAgents::new(client, registry) {
             let now_millis = (host.now() * 1000.0) as u64;
-            if let Ok(rows) = manager.watch_rows() {
-                for row in rows {
-                    let Some(name) = row["name"].as_str() else {
-                        continue;
-                    };
-                    if row["mode"].as_str() == Some("headless") {
-                        continue;
-                    }
-                    let Ok(pending) = manager.pending_prompts(name) else {
-                        continue;
-                    };
-                    if pending.is_empty() {
-                        continue;
-                    }
-                    let oldest = pending
-                        .iter()
-                        .filter_map(|(_, at)| *at)
-                        .min()
-                        .map(|at| now_millis.saturating_sub(at) / 1000);
-                    let age = oldest
-                        .map(|seconds| format!("; oldest {seconds}s"))
-                        .unwrap_or_default();
+            for row in manager.drain_pending(options.queue_stale, options.check_only, now_millis) {
+                let name = row["name"].as_str().unwrap_or("?").to_owned();
+                let age = row["oldest_seconds"]
+                    .as_u64()
+                    .map(|seconds| format!("; oldest {seconds}s"))
+                    .unwrap_or_default();
+                let remaining = row["remaining"].as_u64().unwrap_or(0);
+                let stale = row["stale"] == true;
+                findings.push(finding(
+                    "queue",
+                    &name,
+                    remaining == 0 || !stale,
                     if options.check_only {
-                        let stale =
-                            oldest.is_some_and(|seconds| seconds >= options.queue_stale.as_secs());
-                        findings.push(finding(
-                            "queue",
-                            name,
-                            !stale,
-                            format!("{} prompt(s) queued{age}", pending.len()),
-                            Value::Null,
-                        ));
-                        continue;
-                    }
-                    let drained = manager.drain(
-                        name,
-                        DrainOptions {
-                            ready_timeout: Duration::from_secs(10),
-                            working_timeout: Duration::from_secs(10),
-                            deadline: Some(Duration::from_secs(30)),
-                            deliver_while_working: true,
-                            ..DrainOptions::default()
-                        },
-                    );
-                    let remaining = manager
-                        .pending_prompts(name)
-                        .map(|left| left.len())
-                        .unwrap_or(pending.len());
-                    let typed = pending.len().saturating_sub(remaining);
-                    let stale =
-                        oldest.is_some_and(|seconds| seconds >= options.queue_stale.as_secs());
-                    findings.push(finding(
-                        "queue",
-                        name,
-                        remaining == 0 || !stale,
+                        format!("{} prompt(s) queued{age}", row["queued"])
+                    } else {
                         format!(
-                            "{} prompt(s) queued{age}; typed {typed} this pass, {remaining} still pending{}",
-                            pending.len(),
-                            if stale && remaining > 0 {
-                                " (past the stale threshold)"
-                            } else {
-                                ""
-                            }
-                        ),
-                        match drained {
-                            Ok(result) => json!(result),
-                            Err(error) => json!({"drain_error": error.to_string()}),
-                        },
-                    ));
-                }
+                            "{} prompt(s) queued{age}; typed {} this pass, {remaining} still pending{}",
+                            row["queued"],
+                            row["typed"],
+                            if stale { " (past the stale threshold)" } else { "" }
+                        )
+                    },
+                    row,
+                ));
             }
         }
     }
+
     if let (Some(name), true) = (config.coordinator.as_deref(), herdr_up) {
         if let Ok(manager) = ManagedAgents::new(client, registry) {
             let plan = manager.revive(name, true, None, Duration::from_secs(30));

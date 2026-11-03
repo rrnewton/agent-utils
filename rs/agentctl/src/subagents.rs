@@ -10165,6 +10165,79 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         agent::pending_prompts(&queue)
     }
 
+    /// Drain every interactive agent's pending queue once, bounded per agent
+    /// (#804 agentctl-queue-only-drain): a queued prompt is typed at once when its
+    /// agent is idle, and at the next tool boundary when a Muse or Claude Code
+    /// agent is working (deliver-while-working). With `check_only`, nothing is
+    /// typed and the rows only report. Each row names the agent, how many were
+    /// queued and typed, how many remain, and the oldest prompt's age in seconds;
+    /// `stale` marks a remainder older than `stale`. Headless agents are left to
+    /// their own wake path. This is the one drain both watchers run.
+    pub fn drain_pending(
+        &self,
+        stale: std::time::Duration,
+        check_only: bool,
+        now_millis: u64,
+    ) -> Vec<Value> {
+        let mut rows = Vec::new();
+        let Ok(agents) = self.watch_rows() else {
+            return rows;
+        };
+        for row in agents {
+            let Some(name) = row["name"].as_str() else {
+                continue;
+            };
+            if row["mode"].as_str() == Some("headless") {
+                continue;
+            }
+            let Ok(pending) = self.pending_prompts(name) else {
+                continue;
+            };
+            if pending.is_empty() {
+                continue;
+            }
+            let oldest_seconds = pending
+                .iter()
+                .filter_map(|(_, at)| *at)
+                .min()
+                .map(|at| now_millis.saturating_sub(at) / 1000);
+            let (typed, remaining, drain_error) = if check_only {
+                (0, pending.len(), None)
+            } else {
+                let drained = self.drain(
+                    name,
+                    DrainOptions {
+                        ready_timeout: std::time::Duration::from_secs(10),
+                        working_timeout: std::time::Duration::from_secs(10),
+                        deadline: Some(std::time::Duration::from_secs(30)),
+                        deliver_while_working: true,
+                        ..DrainOptions::default()
+                    },
+                );
+                let remaining = self
+                    .pending_prompts(name)
+                    .map(|left| left.len())
+                    .unwrap_or(pending.len());
+                (
+                    pending.len().saturating_sub(remaining),
+                    remaining,
+                    drained.err().map(|error| error.to_string()),
+                )
+            };
+            rows.push(json!({
+                "name": name,
+                "queued": pending.len(),
+                "typed": typed,
+                "remaining": remaining,
+                "oldest_seconds": oldest_seconds,
+                "stale": remaining > 0
+                    && oldest_seconds.is_some_and(|seconds| seconds >= stale.as_secs()),
+                "drain_error": drain_error,
+            }));
+        }
+        rows
+    }
+
     /// Queue a prompt for an interactive agent and return at once, without waiting
     /// for its pane (#746): the prompt is durable in its queue and typed by the next
     /// drain. Headless and cloud agents already return once journaled, so callers

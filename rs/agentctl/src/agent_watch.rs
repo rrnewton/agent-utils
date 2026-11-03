@@ -154,6 +154,9 @@ pub struct WatchAgentsOptions {
     pub loop_hold: Duration,
     /// Recorded gate step durations, for a step running past its p95.
     pub step_history: crate::work_state::StepHistory,
+    /// A queued prompt pending longer than this is reported with its age (#804
+    /// agentctl-queue-only-drain); every pass also drains the queues.
+    pub queue_stale: Duration,
 }
 
 /// The auto-interrupt policy (#574 harness-adapters): the watcher interrupts an agent's turn
@@ -893,6 +896,17 @@ pub trait Probe {
     /// For each registered agent that senders are waiting to deliver to, its name and the
     /// [`crate::lock_wait::contention`] report. The default sees no waits.
     fn delivery_waits(&mut self) -> Vec<(String, Value)> {
+        Vec::new()
+    }
+    /// Drain every interactive agent's queued prompts once (#804), returning one
+    /// row per agent that had any (see `ManagedAgents::drain_pending`). The
+    /// default drains nothing, for probes that only observe.
+    fn drain_queues(
+        &mut self,
+        _stale: Duration,
+        _check_only: bool,
+        _now_millis: u64,
+    ) -> Vec<Value> {
         Vec::new()
     }
     /// The visible rows of each agent the last [`Self::observe`] read a screen for, by name, for
@@ -2706,6 +2720,18 @@ fn watch_agents_once(
     // First, as a priority sender: the other notices wait for the coordinator's lock like any
     // ordinary sender, so behind a jam on the coordinator they would hold this one up.
     let delivery_waits = report_delivery_jams(probe, notifier, state, now, options);
+    // Queued prompts are typed here, not parked (#804): this pass drains every
+    // interactive agent's queue, and a remainder past the stale threshold keeps
+    // the pass not-ok with the agent and the oldest prompt's age named.
+    let queue_drains = if probe_error.is_null() {
+        probe.drain_queues(
+            options.queue_stale,
+            options.check_only,
+            (now * 1000.0) as u64,
+        )
+    } else {
+        Vec::new()
+    };
     let owner_waits = report_waiting_owner_prompts(probe, notifier, state, now, options);
     let quarantines = report_quarantines(probe, notifier, state, now, options);
     // Idle sweep (#731 agentctl-paste-tail-flush): submit a draft of ours
@@ -2777,6 +2803,7 @@ fn watch_agents_once(
             && scrolled.is_empty()
             && unchecked.is_empty()
             && owner_waits.iter().all(|row| row["stuck"] != true)
+            && queue_drains.iter().all(|row| row["stale"] != true)
             && episodes.iter().all(|row| {
                 // A finished child is news for its coordinator, not a fault in the team.
                 row["kind"] == EpisodeKind::ChildDone.as_str()
@@ -2791,6 +2818,7 @@ fn watch_agents_once(
         "child_done": child_done,
         "waiting": state.pending.len(),
         "delivery_waits": delivery_waits,
+        "queue_drains": queue_drains,
         "owner_waits": owner_waits,
         "quarantines": quarantines,
         "draft_sweeps": draft_sweeps,
@@ -4110,6 +4138,13 @@ impl<A: ManagedApi + ?Sized> Probe for ManagedProbe<'_, A> {
             .count()
     }
 
+    fn drain_queues(&mut self, stale: Duration, check_only: bool, now_millis: u64) -> Vec<Value> {
+        let Ok(manager) = ManagedAgents::new(self.client, &self.registry) else {
+            return Vec::new();
+        };
+        manager.drain_pending(stale, check_only, now_millis)
+    }
+
     /// Only an agent with a waiter record can have waiters, so the record directories name
     /// every candidate, the coordinator included.
     fn delivery_waits(&mut self) -> Vec<(String, Value)> {
@@ -4573,6 +4608,7 @@ mod tests {
             loop_repeats: 3,
             loop_hold: Duration::from_secs(600),
             step_history: crate::work_state::StepHistory::default(),
+            queue_stale: Duration::from_secs(600),
         }
     }
 
@@ -4604,6 +4640,43 @@ mod tests {
                 self.0.remove(0)
             })
         }
+    }
+
+    /// A probe that reports one stale queued prompt, as a drain pass found it.
+    struct QueueProbe;
+
+    impl Probe for QueueProbe {
+        fn observe(&mut self) -> Result<Vec<Observation>> {
+            Ok(vec![observation("lane", "idle", None)])
+        }
+        fn drain_queues(
+            &mut self,
+            _stale: Duration,
+            _check_only: bool,
+            _now_millis: u64,
+        ) -> Vec<Value> {
+            vec![json!({
+                "name": "lane", "queued": 2, "typed": 0, "remaining": 2,
+                "oldest_seconds": 3600, "stale": true, "drain_error": null,
+            })]
+        }
+    }
+
+    #[test]
+    fn a_stale_queued_prompt_is_in_the_report_and_keeps_the_pass_not_ok() {
+        let options = options();
+        let mut state = WatchState::default();
+        let mut notifier = RecordingNotifier::default();
+        let report = watch_agents_once(
+            &mut QueueProbe,
+            &mut notifier,
+            &mut state,
+            1_000.0,
+            &options,
+        );
+        assert_eq!(report["ok"], false, "{report}");
+        assert_eq!(report["queue_drains"][0]["name"], "lane");
+        assert_eq!(report["queue_drains"][0]["oldest_seconds"], 3600);
     }
 
     /// A probe whose only finding is a scripted wait for the coordinator's lifecycle lock.
