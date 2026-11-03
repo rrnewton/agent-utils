@@ -746,6 +746,33 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Throughput metrics for a window, from the decision log (one record per validation):
+    /// batch-width distribution, success rate by width, changes landed per validate-hour and
+    /// ready-to-land latency percentiles.
+    Stats {
+        /// Window start (inclusive): an RFC 3339 time, or a duration before now such as `24h`,
+        /// `90m` or `7d`.
+        #[arg(long, default_value = "24h", value_name = "TIME")]
+        since: String,
+        /// Window end (exclusive): an RFC 3339 time, or a duration before now. Default: now.
+        #[arg(long, value_name = "TIME")]
+        until: Option<String>,
+        /// Count only validations of this mode: `run` (real landings), `shadow` (simulated
+        /// landings) or `widen`. Default: every mode.
+        #[arg(long, value_parser = ["run", "shadow", "widen"])]
+        mode: Option<String>,
+        /// Rebuild the records from the run reports under `runs/` instead of reading the
+        /// decision log, for windows before the log existed, and list what cannot be
+        /// reconstructed.
+        #[arg(long)]
+        reconstruct: bool,
+        /// Print the metrics as JSON; with --records, the records themselves as JSON lines.
+        #[arg(long)]
+        json: bool,
+        /// Print the window's decision records (JSON lines) instead of the metrics.
+        #[arg(long)]
+        records: bool,
+    },
     /// Measure landing throughput of the queue against a serial lander on a synthetic repository.
     Bench {
         /// Number of changes in the synthetic queue.
@@ -1464,6 +1491,71 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                 .iter()
                 .any(|v| !v.green() && !v.refused && !v.cancelled);
             Ok(if red || refused { 3 } else { 0 })
+        }
+        Command::Stats {
+            since,
+            until,
+            mode,
+            reconstruct,
+            json,
+            records,
+        } => {
+            let now = chrono::Utc::now();
+            let since = crate::decisions::parse_bound(&since, now)?;
+            let until = match until {
+                Some(text) => crate::decisions::parse_bound(&text, now)?,
+                None => now + chrono::Duration::seconds(1),
+            };
+            let (mut decisions, notes) = if reconstruct {
+                let config = state.config()?;
+                let items: std::collections::BTreeMap<i64, crate::model::Item> = state
+                    .items()?
+                    .into_iter()
+                    .map(|item| (item.pr, item))
+                    .collect();
+                let git = crate::git::Git::new(&config.repo);
+                let sources = crate::decisions::Sources {
+                    items: &items,
+                    git: Some(&git),
+                    priority: &config.priority,
+                };
+                crate::decisions::reconstruct(&state.root, &sources, since, until)?
+            } else {
+                (
+                    crate::decisions::read(&state.root, since, until)?,
+                    Vec::new(),
+                )
+            };
+            if let Some(mode) = &mode {
+                decisions.retain(|decision| &decision.mode == mode);
+            }
+            if records {
+                for decision in &decisions {
+                    println!(
+                        "{}",
+                        serde_json::to_string(decision).map_err(|e| e.to_string())?
+                    );
+                }
+                return Ok(0);
+            }
+            let mut stats = crate::decisions::stats(&decisions, since, until);
+            if reconstruct {
+                stats.reconstructed = true;
+                stats.not_reconstructable = crate::decisions::NOT_RECONSTRUCTABLE
+                    .iter()
+                    .map(|line| (*line).to_owned())
+                    .chain(notes)
+                    .collect();
+            }
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&stats).map_err(|e| e.to_string())?
+                );
+            } else {
+                print!("{}", crate::decisions::render(&stats));
+            }
+            Ok(0)
         }
         Command::Obligations { all, json } => {
             let obligations: Vec<_> = state

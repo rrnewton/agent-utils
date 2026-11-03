@@ -1,13 +1,14 @@
 ---
 title: 'merge-queue-decision-log: one record per planned validate, and merge-queue stats'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 assignee: cl-mq@devbig030
 labels:
 - merge-queue
 created_at: 2026-11-03T16:12:59.051433942+00:00
-updated_at: 2026-11-03T16:12:59.051433942+00:00
+updated_at: 2026-11-03T16:26:34.854593254+00:00
+closed_at: 2026-11-03T16:26:34.854592964+00:00
 ---
 
 # Description

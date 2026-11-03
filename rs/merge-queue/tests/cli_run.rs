@@ -771,3 +771,122 @@ fn a_red_priority_change_ejects_only_itself_and_never_lands() {
     assert_eq!(status(&fx, 4), "ejected");
     assert!(!remote_files(&fx).contains("tests/ci"));
 }
+
+fn decision_records(fx: &Fixture) -> Vec<Value> {
+    fx.mq_ok(&["stats", "--records"])
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+#[test]
+fn every_validation_leaves_one_decision_record_and_stats_summarise_them() {
+    let fx = setup("run-decisions", &["--max-batch", "4", "--depth", "1"]);
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.branch("b", &[("tests/b", "FAIL\n")]);
+    fx.branch("c", &[("tests/c", "ok\n")]);
+    fx.branch("d", &[("tests/d", "ok\n")]);
+    for (pr, name) in [(1, "a"), (2, "b"), (3, "c"), (4, "d")] {
+        fx.mq_ok(&["submit", &pr.to_string(), "--head", name]);
+    }
+    let r = report(&fx.mq_ok(&["run", "--json"]));
+    assert_eq!(landed_prs(&r), vec![vec![1, 3, 4]]);
+    let records = decision_records(&fx);
+    let validations = r["validations"].as_array().unwrap();
+    assert_eq!(records.len(), validations.len(), "{records:?}");
+    let batch = &records[0];
+    assert_eq!(batch["purpose"], "batch");
+    assert_eq!(batch["width"], 4);
+    assert_eq!(batch["outcome"], "red");
+    assert_eq!(batch["culprit"], 2, "{batch}");
+    assert_eq!(batch["speculation"]["depth"], 1, "{batch}");
+    assert_eq!(batch["base"], r["base_start"], "{batch}");
+    assert!(batch["predicted_pass"].is_null());
+    assert_eq!(batch["validator"]["kind"], "local");
+    assert!(batch["cost"]["wall_s"].as_f64().unwrap() > 0.0);
+    #[cfg(target_os = "linux")]
+    assert!(batch["cost"]["cpu_s"].is_number(), "{batch}");
+    let change = &batch["changes"][1];
+    assert_eq!(change["pr"], 2);
+    assert_eq!(change["features"]["files"], 1, "{change}");
+    assert_eq!(change["features"]["lines_added"], 1, "{change}");
+    assert_eq!(
+        change["features"]["components"],
+        serde_json::json!(["tests"])
+    );
+    assert_eq!(change["features"]["trigger"], "submit");
+    let remainder = records
+        .iter()
+        .find(|d| d["purpose"] == "remainder")
+        .unwrap();
+    assert_eq!(remainder["landed"]["prs"], serde_json::json!([1, 3, 4]));
+    assert!(remainder["landed"]["at"].is_string());
+    for change in remainder["changes"].as_array().unwrap() {
+        assert!(
+            change["ready_to_land_s"].as_f64().unwrap() >= 0.0,
+            "{change}"
+        );
+    }
+    let stats: Value = serde_json::from_str(&fx.mq_ok(&["stats", "--json"])).unwrap();
+    assert_eq!(stats["widths"]["batches"], 1, "{stats}");
+    assert_eq!(stats["widths"]["counts"]["4"], 1, "{stats}");
+    assert_eq!(stats["success_by_width"]["4"]["red"], 1, "{stats}");
+    assert_eq!(stats["landed"], 3, "{stats}");
+    assert_eq!(stats["culprits"], 1, "{stats}");
+    assert_eq!(stats["ready_to_land_s"]["count"], 3, "{stats}");
+    assert!(stats["landed_per_validate_hour"].as_f64().unwrap() > 0.0);
+    let text = fx.mq_ok(&["stats"]);
+    assert!(text.contains("width 4: 0 green, 1 red"), "{text}");
+    // A window before the run holds nothing.
+    let empty: Value = serde_json::from_str(&fx.mq_ok(&[
+        "stats",
+        "--json",
+        "--since",
+        "2020-01-01T00:00:00Z",
+        "--until",
+        "2020-01-02T00:00:00Z",
+    ]))
+    .unwrap();
+    assert_eq!(empty["landed"], 0);
+    assert!(fx
+        .mq_ok(&["stats", "--mode", "shadow", "--records"])
+        .is_empty());
+
+    // Reconstruction from the run report alone, as for a run before the log existed: drop the
+    // log and the fields older reports lack.
+    let state = fx.queue().join(".git/merge-queue");
+    std::fs::remove_dir_all(state.join("decisions")).unwrap();
+    for entry in std::fs::read_dir(state.join("runs")).unwrap().flatten() {
+        let path = entry.path().join("report.json");
+        let mut old: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        for v in old["validations"].as_array_mut().unwrap() {
+            for key in ["parent", "speculation", "cpu_ms", "donor"] {
+                v.as_object_mut().unwrap().remove(key);
+            }
+        }
+        for e in old["ejected"].as_array_mut().unwrap() {
+            e.as_object_mut().unwrap().remove("found_by");
+        }
+        for l in old["landed"].as_array_mut().unwrap() {
+            l.as_object_mut().unwrap().remove("at");
+        }
+        std::fs::write(&path, serde_json::to_string(&old).unwrap()).unwrap();
+    }
+    assert!(fx.mq_ok(&["stats", "--records"]).is_empty());
+    let rebuilt: Value =
+        serde_json::from_str(&fx.mq_ok(&["stats", "--reconstruct", "--json"])).unwrap();
+    for key in ["widths", "success_by_width", "landed", "culprits"] {
+        assert_eq!(rebuilt[key], stats[key], "{key}: {rebuilt}");
+    }
+    assert_eq!(rebuilt["ready_to_land_s"]["count"], 3, "{rebuilt}");
+    assert_eq!(rebuilt["reconstructed"], true);
+    assert_eq!(rebuilt["cpu_known"], 0);
+    let missing = rebuilt["not_reconstructable"].to_string();
+    assert!(
+        missing.contains("cpu_s") && missing.contains("speculation"),
+        "{missing}"
+    );
+    let text = fx.mq_ok(&["stats", "--reconstruct"]);
+    assert!(text.contains("Not reconstructable:"), "{text}");
+}

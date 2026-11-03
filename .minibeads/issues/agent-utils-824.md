@@ -1,13 +1,14 @@
 ---
 title: 'merge-queue-stats-backfill: reconstruct the last day''s queue metrics from existing state'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 assignee: cl-mq@devbig030
 labels:
 - merge-queue
 created_at: 2026-11-03T16:12:59.063422232+00:00
-updated_at: 2026-11-03T16:12:59.063422232+00:00
+updated_at: 2026-11-03T16:26:34.870267751+00:00
+closed_at: 2026-11-03T16:26:34.870267621+00:00
 ---
 
 # Description

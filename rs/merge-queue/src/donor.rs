@@ -306,6 +306,9 @@ pub struct Receipt {
     pub results: TestResults,
     /// Wall time of the validation.
     pub elapsed_ms: u64,
+    /// CPU time of the validation on the donor, when it could be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_ms: Option<u64>,
     /// RFC 3339 UTC start and finish.
     pub started_at: String,
     /// RFC 3339 UTC finish.
@@ -1584,6 +1587,7 @@ impl Worker<'_> {
                 refused: ran.refused,
                 results: ran.results.clone(),
                 elapsed_ms: ran.elapsed.as_millis() as u64,
+                cpu_ms: ran.cpu.map(|cpu| cpu.as_millis() as u64),
                 started_at,
                 finished_at: now(),
                 log_tail: log_text[tail_start..].to_owned(),

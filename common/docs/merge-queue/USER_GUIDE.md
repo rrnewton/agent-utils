@@ -435,6 +435,35 @@ This command lists widening obligations: id, landed commit, changes, what they w
 with, and status (`open`, or discharged green). An open obligation whose complete run was red
 shows that run. `--all` includes discharged ones; `--json` prints the records.
 
+### `merge-queue stats`
+
+This command summarises the decision log (see "The decision log") for a window: the batch-width
+distribution (average, minimum, maximum and a count per width), the success rate per width
+(green over green plus red; refused and cancelled batches have no verdict), wall and CPU
+validate-hours, changes landed per validate-hour, culprits named, and ready-to-land latency
+percentiles (nearest rank). Shadow runs count too, with their simulated landings; `--mode`
+separates them.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--since TIME` | `24h` | Window start (inclusive): an RFC 3339 time, or a duration before now (`30s`, `90m`, `24h`, `7d`). A record belongs to the window its validation ended in. |
+| `--until TIME` | now | Window end (exclusive), in the same forms. |
+| `--mode MODE` | every mode | Count only `run` (real landings), `shadow` (simulated landings) or `widen` validations. |
+| `--reconstruct` | off | Rebuild the records from the run reports under `runs/` instead of reading the log, for windows before the log existed. The output lists what cannot be reconstructed (below). |
+| `--records` | off | Print the window's records as JSON lines instead of the metrics. |
+| `--json` | off | Print the metrics as JSON. |
+
+`--reconstruct` reads each run's `report.json` (and, for a run killed before it wrote one, its
+`validations/*/record.json`, which give no landings or ejections) and the item histories. It
+recovers every validation's changes, commit, purpose, width, wall time, selection, outcome and
+failed tests; what it landed, and when (from the landing event in the item history); each
+change's ready time (its last submission before the validation ended); the culprit of a red batch
+(the one failed-tests ejection among its changes); the donor of a donor validation (from the
+first line of its log, while the log exists); and the features below (sizes need the commits to
+still be in the queue's repository). It cannot recover the CPU time, the speculation depth and
+window per batch, or the base a candidate was combined onto, which no earlier report recorded,
+nor a predicted pass probability, which nothing computes yet.
+
 ### `merge-queue bench`
 
 This command builds a throwaway bare remote with `--prs` independent changes (a seeded fraction
@@ -562,6 +591,7 @@ on which files two changes share.
   items/<pr>.json        one record per submitted change
   notifications/        notification report files the daemon sends with `--file`
   runs/<run-id>/         one directory per run (layout below)
+  decisions/<day>.jsonl  the decision log: one record per validation, by UTC day (see "The decision log")
   obligations/<id>.json  one record per focused landing still owed a complete run
   scratch/slot-<n>/      one reused worktree per concurrent validation
   donor/lock             fixed: donor job store lock (held for milliseconds)
@@ -620,6 +650,7 @@ An **item record** (`items/<pr>.json`) has these fields:
 | `validator` | empty | How validation runs; see below. |
 | `land` | `push` from `init` | How a validated candidate reaches the base; see below. |
 | `notify` | empty | `{agentctl}` command words for state-change notifications (see "Notifications"). |
+| `decisions` | absent | `{keep_days, max_bytes}`: bounds of the decision log, pruned after every run (absent or `0`: 90 days and 64 MiB; the newest day file is always kept). Left out of the file while both are defaults. |
 
 **`validator`** fields (the `init` flags of the same names set them):
 
@@ -1022,6 +1053,48 @@ The base moves only to a commit whose exact tree passed validation (the bors rul
 9. **Obligations.** Every focused landing leaves an obligation until a green complete run
    (`widen`, or `run --widen`) covers that commit or a later one. A red complete run leaves it open.
 
+## The decision log
+
+With fewer validation slots than candidates, every run chooses which speculative validations to
+run. Each validation leaves one JSON record in `decisions/<YYYY-MM-DD>.jsonl` (the UTC day it
+ended), written when the run finishes, so those choices can be measured and the metrics they move
+optimised. `merge-queue stats` reads it. Its fields (schema `merge-queue-decision/v1`):
+
+- `at`, `started_at`: when the validation ended and started. `run`, `mode` (`run`, `shadow` or
+  `widen`), `validation` (its number in the run) and `purpose` (`batch`, `probe`, `remainder`,
+  `widen`).
+- `changes`: the candidate's changes in combine order, each with its `head`, `ready_at` (its last
+  submission before the validation ended), `ready_to_land_s` (only on the validation that landed
+  it) and `features`.
+- `commit`, `base` (the commit the changes were combined onto) and `width` (number of changes).
+- `speculation`: for a batch, `{depth, window}`: 1 for a batch on the base, 2 for one on top of an
+  unvalidated batch, and the window when it started.
+- `predicted_pass`: the predicted probability of a green result; `null` until batching priors
+  exist.
+- `validator`: `{kind, host}`, `local` or `donor` with the donor's `NAME@HOST`.
+- `cost`: `{wall_s, cpu_s}`. CPU time is the runner's and its waited-for descendants', read from
+  `/proc` as the runner exits; `null` where it cannot be read (a killed runner, a system without
+  `/proc`).
+- `selection` (`all` or `N tests`), `outcome` (`green`, `red`, `refused` or `cancelled`),
+  `failed` (the failed tests of a red validation), `culprit` (the change a red batch's or
+  remainder's search ejected) and `landed` (`{at, prs}` on the validation that landed changes).
+
+Each change's `features`, for the log and for future batching priors:
+
+- `lines_added`, `lines_deleted`, `files`: its size against the plan's base (`null` when Git no
+  longer has its commits).
+- `components`: the first directory of each changed path (`(root)` for a file at the top), a
+  queue-local bucketing.
+- `conflict_degree` and `priority` as the plan saw them, and `prioritized`.
+- `trigger`: how it entered the queue, `submit` or the `sync` source (`label:NAME`, `file:PATH`).
+- `ci_only`: every changed path is a configured CI path (`priority.ci_paths`).
+- `claim`: soft-green evidence, the submitter's own validation claim: `{scope, tests, policy,
+  at_head}`, `at_head` saying the claim names the submitted head (or no commit).
+
+The log is pruned after every run to `decisions.keep_days` (default 90) and
+`decisions.max_bytes` (default 64 MiB), oldest day first; the newest day is always kept. Writing it
+never fails a run: a failure is recorded as a `decisions` event.
+
 ## Priority changes
 
 A change that repairs the CI or validation infrastructure unblocks everything behind it, so it
@@ -1207,6 +1280,9 @@ before and after, what landed (changes, commit, the claim it was validated with,
 `note` for a partly landed batch), what was ejected and why, changes returned to the queue, new
 obligations, the batches a dry run `would_validate`, and a table of every validation: purpose
 (`batch`, `probe`, `remainder`, `widen`), changes, commit, selection and policy, result (green,
-red with the failed tests, or `cancelled`), `start_ms` (since the run began) and `elapsed_ms`. The
+red with the failed tests, or `cancelled`), `start_ms` (since the run began) and `elapsed_ms`,
+and when known `parent` (the commit the changes were combined onto), `speculation`, `cpu_ms`
+and `donor`. Each landing has its `at` time, and a culprit's ejection names the red validation
+whose search `found_by` it. The
 summary gives wall time, total validation time, `max_concurrent` (the most validations running at
 once), the AIMD `windows` trace and `prs_per_hour` (changes landed per hour of wall time).

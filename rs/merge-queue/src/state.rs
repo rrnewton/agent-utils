@@ -12,6 +12,7 @@
 //!   items/<pr>.json        one record per submitted change
 //!   notifications/         notification reports sent by the daemon (`notify`)
 //!   runs/<run-id>/         one directory per `run`: plan, events, validations, report
+//!   decisions/<day>.jsonl  one record per validation, by UTC day (see `decisions`)
 //!   obligations/<id>.json  one record per focused landing still owed a complete run
 //!   scratch/<name>/        candidate worktrees, removed after use
 //! ```
@@ -239,6 +240,46 @@ impl PriorityConfig {
         }
         any && !self.ci_paths.is_empty()
     }
+}
+
+/// Default age bound of the decision log, in days.
+pub const DEFAULT_DECISIONS_KEEP_DAYS: u32 = 90;
+/// Default size bound of the decision log, in bytes.
+pub const DEFAULT_DECISIONS_MAX_BYTES: u64 = 64 << 20;
+
+/// Bounds of the decision log (`decisions/`), pruned after every run.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DecisionsConfig {
+    /// Days of records kept; 0 means [`DEFAULT_DECISIONS_KEEP_DAYS`].
+    pub keep_days: u32,
+    /// Total bytes kept (the newest day is always kept); 0 means
+    /// [`DEFAULT_DECISIONS_MAX_BYTES`].
+    pub max_bytes: u64,
+}
+
+impl DecisionsConfig {
+    /// Resolved age bound in days.
+    pub fn keep_days(&self) -> u32 {
+        if self.keep_days == 0 {
+            DEFAULT_DECISIONS_KEEP_DAYS
+        } else {
+            self.keep_days
+        }
+    }
+
+    /// Resolved size bound in bytes.
+    pub fn max_bytes(&self) -> u64 {
+        if self.max_bytes == 0 {
+            DEFAULT_DECISIONS_MAX_BYTES
+        } else {
+            self.max_bytes
+        }
+    }
+}
+
+fn is_default_decisions(value: &DecisionsConfig) -> bool {
+    *value == DecisionsConfig::default()
 }
 
 fn is_default_priority(value: &PriorityConfig) -> bool {
@@ -526,6 +567,9 @@ pub struct Config {
     /// Priority label and CI paths (the front of the queue).
     #[serde(skip_serializing_if = "is_default_priority")]
     pub priority: PriorityConfig,
+    /// Decision-log bounds.
+    #[serde(skip_serializing_if = "is_default_decisions")]
+    pub decisions: DecisionsConfig,
     /// Validation configuration.
     pub validator: ValidatorConfig,
     /// Donor-validator settings (used when `validator.offload` is not off).
@@ -560,6 +604,7 @@ impl Default for Config {
             github: GitHubConfig::default(),
             peers: std::collections::BTreeMap::new(),
             priority: PriorityConfig::default(),
+            decisions: DecisionsConfig::default(),
             validator: ValidatorConfig::default(),
             donors: DonorsConfig::default(),
             land: LandConfig::default(),

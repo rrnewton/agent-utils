@@ -89,6 +89,11 @@ pub struct Ran {
     /// requested one (dagrun runs whole steps, so case IDs collapse to
     /// their steps). `None` means the requested selection ran as-is.
     pub effective_selection: Option<Selection>,
+    /// CPU time (user plus system) of the runner and the descendants it waited for, when it
+    /// could be read (Linux `/proc`, a runner that exited by itself); `None` otherwise.
+    pub cpu: Option<Duration>,
+    /// The donor that ran it (`NAME@HOST`); `None` for a validation run here.
+    pub donor: Option<String>,
 }
 
 /// What one culprit-search probe actually observed.
@@ -300,6 +305,33 @@ struct Finished {
     interrupted: Option<String>,
     /// The runner could not be started at all (no such file, not executable).
     spawn_error: Option<String>,
+    /// CPU time of the runner and the descendants it waited for (see [`exited_cpu`]).
+    cpu: Option<Duration>,
+}
+
+/// Clock ticks per second in `/proc/<pid>/stat`: `USER_HZ`, 100 on every Linux ABI.
+const USER_HZ: u64 = 100;
+
+/// CPU time (user plus system, its own and its waited-for descendants') of process `pid`, read
+/// from `/proc/<pid>/stat` while it is a zombie: it has exited and not been reaped yet, so the
+/// accounting is final. `None` while it still runs, or where there is no `/proc`.
+fn exited_cpu(pid: u32) -> Option<Duration> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Fields after the parenthesised command name, which may itself contain spaces.
+    let fields: Vec<&str> = stat
+        .get(stat.rfind(')')? + 1..)?
+        .split_whitespace()
+        .collect();
+    if fields.first() != Some(&"Z") {
+        return None;
+    }
+    // utime, stime, cutime and cstime are fields 14 to 17 of the whole line.
+    let ticks: u64 = fields
+        .get(11..15)?
+        .iter()
+        .map(|field| field.parse::<u64>().ok())
+        .sum::<Option<u64>>()?;
+    Some(Duration::from_millis(ticks * 1000 / USER_HZ))
 }
 
 /// The command a validation runs: the admission prefix, then the runner's argv.
@@ -402,11 +434,14 @@ fn run_logged(
                 cancelled: false,
                 interrupted: None,
                 spawn_error: Some(error),
+                cpu: None,
             });
         }
     };
     let limit = (config.timeout_secs > 0).then(|| Duration::from_secs(config.timeout_secs));
     loop {
+        // Read before reaping: once `try_wait` reaps the runner its accounting is gone.
+        let cpu = exited_cpu(child.id());
         if let Some(status) = child
             .try_wait()
             .map_err(|error| format!("cannot wait for validation: {error}"))?
@@ -420,6 +455,7 @@ fn run_logged(
                 cancelled: interrupted.is_some(),
                 interrupted,
                 spawn_error: None,
+                cpu,
             });
         }
         let stopping = crate::interrupt::requested();
@@ -458,6 +494,7 @@ fn run_logged(
                 interrupted: stopping
                     .then(|| crate::interrupt::check("this validation finished").unwrap_err()),
                 spawn_error: None,
+                cpu: None,
             });
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -619,6 +656,8 @@ impl Validator for CommandValidator {
             refused,
             cannot_execute,
             effective_selection: None,
+            cpu: finished.cpu,
+            donor: None,
         })
     }
 }
@@ -788,6 +827,8 @@ impl Validator for DagrunValidator {
                     refused: false,
                     cannot_execute: None,
                     effective_selection: Some(Selection::default()),
+                    cpu: None,
+                    donor: None,
                 });
             }
             argv.push("--selected".to_owned());
@@ -837,6 +878,8 @@ impl Validator for DagrunValidator {
             refused,
             cannot_execute,
             effective_selection: whole_steps,
+            cpu: finished.cpu,
+            donor: None,
         })
     }
 }
@@ -1099,6 +1142,8 @@ dagrun: PASS - 1 passed";
                 refused: false,
                 cannot_execute: None,
                 effective_selection: None,
+                cpu: None,
+                donor: None,
             };
             assert_eq!(ran.probe_observation(), ProbeObservation::Unknown);
             assert_ne!(ran.probe_observation(), ProbeObservation::Pass);

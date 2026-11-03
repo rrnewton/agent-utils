@@ -256,6 +256,22 @@ fn decide_mode_lands_a_candidate_on_a_donor_receipt_alone() {
     assert!(status.contains("merge-queue here: "), "{status}");
     assert!(!fx.mq_ok(&["donor", "status", "--json"]).contains("token"));
     assert!(!String::from_utf8_lossy(&out.stderr).contains("token"));
+    // The decision log names the donor that validated the landed batch.
+    let records = fx.mq_ok(&["stats", "--records"]);
+    let decision: serde_json::Value =
+        serde_json::from_str(records.lines().next().unwrap()).unwrap();
+    assert_eq!(decision["validator"]["kind"], "donor", "{decision}");
+    assert!(
+        decision["validator"]["host"]
+            .as_str()
+            .is_some_and(|host| host.starts_with("d1@")),
+        "{decision}"
+    );
+    assert_eq!(
+        decision["landed"]["prs"],
+        serde_json::json!([1, 2]),
+        "{decision}"
+    );
 }
 
 #[test]

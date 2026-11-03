@@ -109,6 +109,8 @@ pub struct Landed {
     /// Set when only part of a batch landed (a per-change driver stopped midway).
     #[serde(skip_serializing_if = "String::is_empty")]
     pub note: String,
+    /// RFC 3339 UTC landing time.
+    pub at: String,
 }
 
 /// One ejected change.
@@ -130,6 +132,9 @@ pub struct Ejection {
     pub classes: Vec<String>,
     /// Report file.
     pub report: PathBuf,
+    /// The red validation whose culprit search named this change; absent for other kinds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub found_by: Option<usize>,
 }
 
 /// One batch deferred after a validation refusal: still queued, retry after backoff.
@@ -188,6 +193,18 @@ pub struct ValidationRecord {
     pub elapsed_ms: u64,
     /// Directory with the log and results.
     pub dir: PathBuf,
+    /// The commit the changes were combined onto (empty in records from older builds).
+    #[serde(default)]
+    pub parent: String,
+    /// A batch's place in the speculation window.
+    #[serde(default)]
+    pub speculation: Option<Speculation>,
+    /// CPU time in milliseconds, when it could be read.
+    #[serde(default)]
+    pub cpu_ms: Option<u64>,
+    /// The donor that ran it (`NAME@HOST`); absent when it ran here.
+    #[serde(default)]
+    pub donor: Option<String>,
 }
 
 impl ValidationRecord {
@@ -219,7 +236,7 @@ impl ValidationRecord {
 impl Serialize for ValidationRecord {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("ValidationRecord", 15)?;
+        let mut state = serializer.serialize_struct("ValidationRecord", 19)?;
         state.serialize_field("id", &self.id)?;
         state.serialize_field("purpose", &self.purpose)?;
         state.serialize_field("prs", &self.prs)?;
@@ -243,6 +260,18 @@ impl Serialize for ValidationRecord {
         state.serialize_field("start_ms", &self.start_ms)?;
         state.serialize_field("elapsed_ms", &self.elapsed_ms)?;
         state.serialize_field("dir", &self.dir)?;
+        if !self.parent.is_empty() {
+            state.serialize_field("parent", &self.parent)?;
+        }
+        if let Some(speculation) = &self.speculation {
+            state.serialize_field("speculation", speculation)?;
+        }
+        if let Some(cpu_ms) = self.cpu_ms {
+            state.serialize_field("cpu_ms", &cpu_ms)?;
+        }
+        if let Some(donor) = &self.donor {
+            state.serialize_field("donor", donor)?;
+        }
         state.end()
     }
 }
@@ -431,8 +460,22 @@ struct Job {
     purpose: &'static str,
     prs: Vec<i64>,
     commit: String,
+    /// The commit `prs` were combined onto (the commit itself for `widen`).
+    parent: String,
+    /// Where a batch sat in the speculation window when it started; `None` for every other
+    /// purpose.
+    speculation: Option<Speculation>,
     selection: Selection,
     policy: String,
+}
+
+/// A batch's place in the speculation window.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Speculation {
+    /// 1 for a batch on the base, 2 for one on top of an unvalidated batch, and so on.
+    pub depth: usize,
+    /// The window (most batches validating at once) when it started.
+    pub window: usize,
 }
 
 type JobResult = Result<(usize, Ran), String>;
@@ -874,6 +917,8 @@ impl<'a> Runner<'a> {
                     purpose: "batch",
                     prs: candidate.prs.clone(),
                     commit: candidate.tip.clone(),
+                    parent: candidate.parent.clone(),
+                    speculation: None,
                     selection: chosen.selection.clone(),
                     policy: chosen.policy.clone(),
                 }])
@@ -1448,6 +1493,10 @@ impl<'a> Runner<'a> {
             start_ms,
             elapsed_ms: ran.elapsed.as_millis() as u64,
             dir: dir.clone(),
+            parent: job.parent,
+            speculation: job.speculation,
+            cpu_ms: ran.cpu.map(|cpu| cpu.as_millis() as u64),
+            donor: ran.donor.clone(),
         };
         write_json(&dir.join("record.json"), &record)?;
         self.event(
@@ -1581,6 +1630,8 @@ impl<'a> Runner<'a> {
             refused: false,
             cannot_execute: None,
             effective_selection: None,
+            cpu: None,
+            donor: None,
         };
         loop {
             if let Err(why) = crate::interrupt::check("a donor receipt arrived") {
@@ -1742,7 +1793,29 @@ impl<'a> Runner<'a> {
         write_json(&self.run_dir.join("report.json"), &report)?;
         std::fs::write(self.run_dir.join("report.md"), render_report(&report))
             .map_err(|error| format!("cannot write report: {error}"))?;
+        // One decision record per validation. The log is an observation, so a failure to write
+        // it is reported and never fails the run.
+        if let Err(error) = self.log_decisions(&report) {
+            self.event("decisions", &format!("decision log not written: {error}"));
+        }
         Ok(report)
+    }
+
+    /// Append this run's validations to the decision log (see [`crate::decisions`]).
+    fn log_decisions(&self, report: &RunReport) -> Result<(), String> {
+        if report.validations.is_empty() {
+            return Ok(());
+        }
+        let value = serde_json::to_value(report)
+            .map_err(|error| format!("cannot encode the run report: {error}"))?;
+        let items = lock(&self.items).clone();
+        let sources = crate::decisions::Sources {
+            items: &items,
+            git: Some(&self.git),
+            priority: &self.config.priority,
+        };
+        let decisions = crate::decisions::from_report(&value, &sources, false);
+        crate::decisions::append(&self.state.root, &decisions, &self.config.decisions)
     }
 
     /// Plan, then drain. Returns the reason the run stopped early, or an empty string.
@@ -1958,6 +2031,11 @@ impl<'a> Runner<'a> {
                             purpose: "batch",
                             prs: candidate.prs.clone(),
                             commit: candidate.tip.clone(),
+                            parent: candidate.parent.clone(),
+                            speculation: Some(Speculation {
+                                depth: flights.len() + 1,
+                                window,
+                            }),
                             selection: chosen.selection.clone(),
                             policy: chosen.policy.clone(),
                         };
@@ -2161,6 +2239,7 @@ impl<'a> Runner<'a> {
             failed: failed.to_vec(),
             classes,
             report,
+            found_by: None,
         });
         Ok(())
     }
@@ -2261,6 +2340,7 @@ impl<'a> Runner<'a> {
             validations,
             flaky,
             note: note.to_owned(),
+            at: now(),
         });
         self.prune_donor_jobs(false);
         Ok(())
@@ -2560,6 +2640,11 @@ impl<'a> Runner<'a> {
                         &reason,
                         &failed.iter().cloned().collect::<Vec<_>>(),
                     )?;
+                    // The latest red validation of this candidate (the batch, or a remainder
+                    // after an earlier ejection) is the one whose search named the culprit.
+                    if let Some(ejection) = lock(&self.report).ejected.last_mut() {
+                        ejection.found_by = validations.last().copied();
+                    }
                     self.drop_dependents(culprit, pending);
                     let rebuilt = self.build_and_eject(
                         &current.parent,
@@ -2588,6 +2673,8 @@ impl<'a> Runner<'a> {
                             purpose: "remainder",
                             prs: rebuilt.prs.clone(),
                             commit: rebuilt.tip.clone(),
+                            parent: rebuilt.parent.clone(),
+                            speculation: None,
                             selection: delta.clone(),
                             policy: if exact {
                                 chosen.policy.clone()
@@ -2834,6 +2921,8 @@ impl<'a> Runner<'a> {
                     purpose: "probe",
                     prs: candidate.prs[..*i].to_vec(),
                     commit: self.regenerated_prefix(candidate, *i)?,
+                    parent: candidate.parent.clone(),
+                    speculation: None,
                     selection: focus.clone(),
                     policy: "failed-tests".to_owned(),
                 });
@@ -2882,6 +2971,8 @@ impl<'a> Runner<'a> {
                 purpose: "widen",
                 prs: open.iter().flat_map(|o| o.prs.clone()).collect(),
                 commit: base.clone(),
+                parent: base.clone(),
+                speculation: None,
                 selection: Selection::All,
                 policy: "all".to_owned(),
             }])
@@ -3003,6 +3094,8 @@ fn receipt_ran(receipt: &crate::donor::Receipt, dir: &std::path::Path) -> Result
         refused: receipt.refused,
         cannot_execute: None,
         effective_selection: receipt.effective_selection.clone(),
+        cpu: receipt.cpu_ms.map(Duration::from_millis),
+        donor: Some(format!("{}@{}", receipt.donor.name, receipt.donor.host)),
     })
 }
 
@@ -3336,6 +3429,10 @@ mod unit {
             start_ms: 0,
             elapsed_ms: 10,
             dir: PathBuf::from("validations/0001-batch"),
+            parent: String::new(),
+            speculation: None,
+            cpu_ms: None,
+            donor: None,
         }
     }
 
@@ -3409,6 +3506,7 @@ mod unit {
                 failed: vec![TestId::step("a")],
                 classes: vec![],
                 report: PathBuf::from("ejections/7.md"),
+                found_by: None,
             }],
             ..RunReport::default()
         };
