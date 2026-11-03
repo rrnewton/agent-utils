@@ -4017,6 +4017,11 @@ mod tests {
             self.record_in("failed", id, text, at, label);
         }
 
+        /// A prompt the drain typed and proved delivered, drawn as `label`.
+        fn typed_drawn(&self, id: &str, text: &str, at: f64, label: &str) {
+            self.record_in("processed", id, text, at, Some(label));
+        }
+
         fn record_in(&self, phase: &str, id: &str, text: &str, at: f64, label: Option<&str>) {
             let mut record = serde_json::json!({"id": id, "text": text,
                                                 "delivery_state": phase, "inflight_at": at});
@@ -4130,6 +4135,35 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// #808 agentctl-stranded-draft-blocks-delivery: a long prompt a drain
+    /// typed into a working Claude Code pane was proved delivered, yet the
+    /// paste itself sat unsubmitted in the composer and every later drain
+    /// refused to append. The placeholder's paste number is the one
+    /// agentctl recorded, so the next drain submits the draft and then
+    /// delivers its own prompt behind the turn that starts.
+    #[test]
+    fn a_stranded_proved_claude_paste_is_submitted_by_the_next_drain() {
+        let lane = format!("{LANE}\nfirst finding\nsecond finding\nthird finding\nfourth finding");
+        let queue = TypedQueue::new("claude-stranded");
+        queue.typed_drawn("lane", &lane, 1.0, "[Pastedtext#1+4lines]");
+        let screen = FakeScreen::new("claude", true);
+        screen.leave_draft(&lane);
+        let drawn = screen.render();
+        assert!(drawn.contains("[Pasted text #1 +4 lines]"), "{drawn}");
+        let owner = format!("{OWNER}\nstatus?");
+        receipt(submit_following(&screen, &queue, &owner, Some("Enter")));
+        assert_eq!(taken(&screen), [lane.clone(), owner]);
+        assert_eq!(screen.state().keys, ["Enter", "Enter"]);
+        let record = queue.record("lane");
+        assert!(
+            record["draft_recovered_evidence"]
+                .as_str()
+                .unwrap()
+                .contains("typed by agentctl for lane-a"),
+            "{record}"
+        );
     }
 
     /// #731 agentctl-paste-tail-flush: a split paste leaves only its last

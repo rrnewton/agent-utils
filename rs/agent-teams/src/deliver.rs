@@ -247,6 +247,12 @@ impl AgentctlQueueDeliverer {
         // exits right after answering, which would kill a thread mid-drain
         // (live-trial finding, 2026-10-25). The helper (`drain-one`)
         // survives us, holds the per-agent lock, and logs content-free.
+        let helper_stderr = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(state.join(format!("auto-drain-{}.stderr.log", self.agent)))
+            .map(std::process::Stdio::from)
+            .unwrap_or_else(|_| std::process::Stdio::null());
         let spawned = std::process::Command::new(self_binary())
             .args([
                 "drain-one",
@@ -267,7 +273,7 @@ impl AgentctlQueueDeliverer {
             ])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(helper_stderr)
             .spawn();
         let outcome = if spawned.is_ok() {
             "spawned"
@@ -379,6 +385,24 @@ pub fn run_auto_drain(
         return;
     }
     log("started");
+    // Keep the drain's own output: a refusal reason (exit 75 with the
+    // blocked detail) must stay readable in the state directory instead of
+    // being discarded (#808). Both streams land in the one file; the event
+    // log above stays content-free.
+    let drain_log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(state.join(format!("auto-drain-{agent}.stderr.log")));
+    let (drain_stdout, drain_stderr) = match drain_log {
+        Ok(file) => match file.try_clone() {
+            Ok(clone) => (
+                std::process::Stdio::from(clone),
+                std::process::Stdio::from(file),
+            ),
+            Err(_) => (std::process::Stdio::null(), std::process::Stdio::null()),
+        },
+        Err(_) => (std::process::Stdio::null(), std::process::Stdio::null()),
+    };
     let spawned = crate::proof::agentctl_command()
         .arg("--registry")
         .arg(registry)
@@ -397,8 +421,8 @@ pub fn run_auto_drain(
             "60",
         ])
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(drain_stdout)
+        .stderr(drain_stderr)
         .spawn();
     let mut child = match spawned {
         Ok(child) => child,

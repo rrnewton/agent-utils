@@ -19,6 +19,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
+/// Tests that point `AGENT_TEAMS_AGENTCTL`/`AGENT_TEAMS_SELF_BIN` at a fake
+/// binary share process-wide environment, so they take this lock.
+static FAKE_BIN_ENV_LOCK: Mutex<()> = Mutex::new(());
+
 /// A tiny xorshift PRNG: deterministic from the seed, replayable.
 struct Rng(u64);
 
@@ -887,6 +891,9 @@ fn auto_drain_spawns_bounded_helper() {
     };
     let fake_self = write_script("fake-self", &helper_record);
     let fake_agentctl = write_script("fake-agentctl", &drain_record);
+    let _env_guard = FAKE_BIN_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     // Only this test uses these variables in this test binary.
     unsafe {
         std::env::set_var("AGENT_TEAMS_SELF_BIN", &fake_self);
@@ -969,6 +976,55 @@ fn auto_drain_spawns_bounded_helper() {
         std::env::remove_var("AGENT_TEAMS_SELF_BIN");
         std::env::remove_var("AGENT_TEAMS_AGENTCTL");
     }
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+/// #808: an auto-drain that refuses keeps its reason. The drain's stdout
+/// and stderr land in a log file under the state directory, instead of
+/// being discarded, so an operator can read why delivery is blocked.
+#[test]
+fn auto_drain_keeps_the_drain_output_in_the_state_directory() {
+    use agent_teams::deliver::run_auto_drain;
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let state = temp_state("auto-drain-stderr");
+    let script = state.join("fake-agentctl");
+    {
+        let mut file = std::fs::File::create(&script).expect("script");
+        writeln!(file, "#!/bin/sh").expect("script");
+        writeln!(
+            file,
+            "echo 'composer already holds unsubmitted text; nothing was typed' >&2"
+        )
+        .expect("script");
+        writeln!(file, "exit 75").expect("script");
+    }
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("mode");
+    let _env_guard = FAKE_BIN_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    unsafe {
+        std::env::set_var("AGENT_TEAMS_AGENTCTL", &script);
+    }
+    let queue_dir = state.join("queue");
+    run_auto_drain(
+        &state,
+        &queue_dir,
+        &state,
+        "coordinator",
+        "tm-sim-3333333333333333",
+        5,
+        None,
+    );
+    unsafe {
+        std::env::remove_var("AGENT_TEAMS_AGENTCTL");
+    }
+    let log = std::fs::read_to_string(state.join("auto-drain-coordinator.stderr.log"))
+        .expect("the drain output is kept in the state directory");
+    assert!(
+        log.contains("composer already holds unsubmitted text"),
+        "log: {log}"
+    );
     let _ = std::fs::remove_dir_all(&state);
 }
 

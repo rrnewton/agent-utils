@@ -838,6 +838,10 @@ struct WatchState {
     /// agentctl-paste-tail-flush), by agent.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     draft_sweeps: BTreeMap<String, DraftSweep>,
+    /// Composer drafts agentctl cannot attribute (#808): left untouched,
+    /// tracked so their blocking age can be reported.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    unattributed_drafts: BTreeMap<String, DraftSweep>,
 }
 
 /// One agent's unsent draft of ours under the idle sweep (#731
@@ -3142,6 +3146,7 @@ fn sweep_editor_drafts(
         };
         let Some(draft) = crate::submission::composer_draft(&view) else {
             state.draft_sweeps.remove(&agent);
+            state.unattributed_drafts.remove(&agent);
             continue;
         };
         let Some(queue) = probe.agent_queue(&agent) else {
@@ -3154,9 +3159,64 @@ fn sweep_editor_drafts(
             UNIX_EPOCH + Duration::from_secs_f64(now.max(0.0)),
         );
         let Some(prompt) = prompt else {
+            // Not ours that we can prove: it may be a person typing, so it
+            // is never flushed or cleared — but it blocks every delivery to
+            // this pane, so it is a finding with its first line and how long
+            // it has blocked (#808).
             state.draft_sweeps.remove(&agent);
+            let fingerprint = format!("{:016x}", stable_hash(&format!("{draft:?}")));
+            let entry = state
+                .unattributed_drafts
+                .entry(agent.clone())
+                .or_insert_with(|| DraftSweep {
+                    first_seen: now,
+                    fingerprint: fingerprint.clone(),
+                    failures: 0,
+                    blocked_reported: false,
+                });
+            if entry.fingerprint != fingerprint {
+                *entry = DraftSweep {
+                    first_seen: now,
+                    fingerprint: fingerprint.clone(),
+                    failures: 0,
+                    blocked_reported: false,
+                };
+            }
+            let age = (now - entry.first_seen).max(0.0);
+            let first_line: String = view
+                .composer
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .unwrap_or_default()
+                .chars()
+                .take(120)
+                .collect();
+            let mut row = json!({"agent": agent, "draft": "unattributed",
+                                 "first_line": first_line,
+                                 "age_seconds": age, "blocked_seconds": age});
+            if !options.check_only
+                && age >= DRAFT_SWEEP_AGE.as_secs_f64()
+                && !entry.blocked_reported
+            {
+                entry.blocked_reported = true;
+                let _ = notifier.notify_urgent(
+                    &coordinator,
+                    &format!(
+                        "BLOCKED: {agent}'s composer holds unsubmitted text agentctl \
+                         cannot attribute ({first_line:?}); deliveries to {agent} have \
+                         been blocked for {}s. It may be a person's draft: press Enter \
+                         in {agent}'s pane to send it, or clear it.",
+                        age as u64
+                    ),
+                    &format!("draft-unattributed:{agent}:{fingerprint}"),
+                );
+                row["blocked"] = json!(true);
+            }
+            rows.push(row);
             continue;
         };
+        state.unattributed_drafts.remove(&agent);
         let fingerprint = format!("{:016x}", stable_hash(&format!("{draft:?}")));
         let entry = state
             .draft_sweeps
@@ -5124,22 +5184,57 @@ mod tests {
         );
         assert_eq!(rows[0]["action"], "waiting", "{rows:?}");
         assert!(notifier.flushes.is_empty());
-        // Foreign text: never flushed, never noticed.
-        probe.screens = vec![(
-            "worker".into(),
-            sweep_screen("a person's own half-written note"),
-            "claude".into(),
-        )];
+        let _ = std::fs::remove_dir_all(&queue);
+    }
+
+    #[test]
+    fn a_foreign_draft_is_left_alone_and_reported_with_its_age() {
+        // #808: text agentctl cannot attribute may be a person's, so it is
+        // never flushed — but it blocks every delivery to the pane, so the
+        // watcher reports it with its first line and how long it has blocked.
+        let queue = sweep_queue("foreign", 1_000.0);
+        let mut probe = SweepProbe {
+            queue: queue.clone(),
+            screens: vec![(
+                "worker".into(),
+                sweep_screen("a person's own half-written note"),
+                "claude".into(),
+            )],
+        };
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
         let screens = probe.screens.clone();
         let rows = sweep_editor_drafts(
             &mut probe,
             &mut notifier,
             &mut state,
             screens,
-            9_999.0,
+            5_000.0,
             &options(),
         );
-        assert!(rows.is_empty(), "{rows:?}");
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["draft"], "unattributed", "{rows:?}");
+        assert_eq!(rows[0]["first_line"], "a person's own half-written note");
+        assert_eq!(rows[0]["age_seconds"], 0.0, "{rows:?}");
+        assert!(notifier.flushes.is_empty(), "never flushed");
+        // Two minutes on, the same draft is older, and the coordinator is
+        // told once.
+        let screens = probe.screens.clone();
+        let rows = sweep_editor_drafts(
+            &mut probe,
+            &mut notifier,
+            &mut state,
+            screens,
+            5_120.0,
+            &options(),
+        );
+        assert_eq!(rows[0]["age_seconds"], 120.0, "{rows:?}");
+        let notices: Vec<&String> = notifier
+            .urgent
+            .iter()
+            .filter(|id| id.starts_with("draft-unattributed:worker:"))
+            .collect();
+        assert_eq!(notices.len(), 1, "{:?}", notifier.urgent);
         assert!(notifier.flushes.is_empty());
         let _ = std::fs::remove_dir_all(&queue);
     }

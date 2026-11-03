@@ -34,7 +34,10 @@
 //! `[Pasted text #K +M lines]`. A person's paste of the same size is not rare among many long
 //! prompts, so such a draft matches only the very last prompt typed, of exactly that size,
 //! within [`PLACEHOLDER_LOOKBACK`], a shorter window than [`TEXT_LOOKBACK`] for a draft whose
-//! text shows.
+//! text shows. The numbered form is stronger: `#K` is the harness's paste counter, and a
+//! history recall draws a recalled prompt as a new paste with a new number, so a draft whose
+//! label exactly matches the last delivery's recorded `paste_label` is agentctl's own however
+//! that delivery was recorded, `processed/` included (#808 agentctl-stranded-draft).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -361,6 +364,14 @@ pub(crate) fn find(
                         || (text_matches(rows, text)
                             && (vouching == Vouching::Recent || quarantined))
                 }
+                // A numbered paste placeholder matches only the record
+                // holding that exact label: the number is the harness's own
+                // paste counter, which a history recall cannot reproduce (a
+                // recalled prompt is drawn as a new paste with a new
+                // number), so it attributes the draft however the delivery
+                // was recorded (#808). A character-count placeholder carries
+                // no such proof and keeps the rule above.
+                Draft::PastedLines(_) => placeholder_matches(draft, text, document),
                 _ => {
                     placeholder_matches(draft, text, document)
                         && (vouching == Vouching::Recent || quarantined)
@@ -834,6 +845,45 @@ message number {index:02}"
             "a pasted 5 lines",
             "never the text"
         );
+    }
+
+    #[test]
+    fn a_stranded_paste_placeholder_with_its_recorded_number_is_ours_even_when_processed() {
+        // #808: a drain typed a long prompt into a working Claude Code pane
+        // and proved delivery, so its record sits in `processed/`; Claude
+        // later left the paste itself unsubmitted in the composer. The
+        // placeholder carries the paste number agentctl recorded when it
+        // typed it, which a history recall cannot reproduce (a recalled
+        // prompt is drawn as a new paste with a new number), so the exact
+        // label attributes the draft even under `Unproven`.
+        let directory = Scratch::new("stranded");
+        let queue = directory.0.as_path();
+        let text = format!("{HEADER}\none\ntwo\nthree\nfour");
+        record(
+            queue,
+            "processed",
+            "stranded",
+            &json!({"text": text, "inflight_at": 2.0, "paste_label": "[Pastedtext#178+4lines]"}),
+        );
+        let now = SystemTime::now();
+        assert_eq!(
+            find(
+                queue,
+                &Draft::from_composer("[Pasted text #178 +4 lines]"),
+                Vouching::Unproven,
+                now
+            )
+            .map(|found| found.id),
+            Some("stranded".to_owned())
+        );
+        // A different paste number is a person's paste, never ours.
+        assert!(find(
+            queue,
+            &Draft::from_composer("[Pasted text #179 +4 lines]"),
+            Vouching::Unproven,
+            now
+        )
+        .is_none());
     }
 
     #[test]
