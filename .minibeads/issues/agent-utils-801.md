@@ -1,6 +1,6 @@
 ---
 title: 'chat-latency-summaries: fixed-size coordinator response statistics by model, effort and adapter'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 assignee: mu-transcript@devbig014
@@ -11,6 +11,7 @@ depends_on:
   agent-utils-714: blocks
 created_at: 2026-11-03T01:33:23.392921411+00:00
 updated_at: 2026-11-03T01:33:23.392921411+00:00
+closed_at: 2026-11-03T10:03:13.547513+00:00
 ---
 
 # Description
