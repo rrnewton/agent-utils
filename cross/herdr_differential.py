@@ -619,6 +619,38 @@ def _ignoring_raw(signals: Sequence[int]) -> Callable[[], None]:
     return hand_over
 
 
+def _canonical_signal_dispositions() -> None:
+    """A ``preexec_fn`` that hands a process the default action for every signal.
+
+    End-to-end cases compare the ignored signals each Herdr call was handed, and both
+    editions faithfully hand on the dispositions they were themselves started with (see
+    ``py/herdr_run/client.py`` and ``rs/herdr-run/src/client.rs``). What the harness
+    happens to hold when it forks an edition is ambient, not chosen: the C library takes
+    signals 32 and 33 for itself once the harness process starts a thread, so the same
+    call records ``[]`` in one step and ``[3, 32, 33]`` in another, and the comparison
+    goes red on the spawn chain instead of on anything an edition decided (#815). Giving
+    every end-to-end edition process the same explicit dispositions makes the recorded
+    set a constant of the fixture. The modes that hand signals deliberately
+    (``signals-ignored``, ``sigchld-ignored``, ``sigint-ignored``) keep their own
+    preexec and are untouched.
+    """
+    import ctypes
+
+    number = _RT_SIGACTION.get(os.uname().machine)
+    libc = ctypes.CDLL(None, use_errno=True)
+    default = (ctypes.c_uint64 * 4)(0, 0, 0, 0)  # SIG_DFL, no flags, no restorer, empty mask
+    for signal_number in range(1, 65):
+        if signal_number in (signal.SIGKILL, signal.SIGSTOP):
+            continue
+        if number is not None:
+            libc.syscall(number, signal_number, default, None, 8)
+        else:
+            try:
+                signal.signal(signal_number, signal.SIG_DFL)
+            except (OSError, ValueError):
+                pass
+
+
 def _ignore_sigchld() -> None:
     """Start a process with SIGCHLD ignored, which a caller can hand down across ``exec``."""
     signal.signal(signal.SIGCHLD, signal.SIG_IGN)
@@ -662,6 +694,12 @@ def _run_captured(
     preexec: Callable[[], None] | None = None,
     close_fds: bool = True,
 ) -> Outcome:
+    # Every edition the harness starts gets the same signal dispositions unless a
+    # mode hands it some deliberately (those pass their own preexec): the handed
+    # comparison records what an edition was started with, so ambient harness
+    # state must not be what decides it (#815; see _canonical_signal_dispositions).
+    if preexec is None:
+        preexec = _canonical_signal_dispositions
     try:
         completed = subprocess.run(
             list(argv),
@@ -3786,6 +3824,7 @@ class _E2EEdition:
             capture_output=True,
             check=False,
             timeout=TIMEOUT_SECONDS,
+            preexec_fn=_canonical_signal_dispositions,
         )
 
     def shells(self) -> dict[str, int]:

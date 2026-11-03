@@ -215,6 +215,7 @@
       ],
       "reverse_dependencies": [],
       "test_files": [
+        "py/tests/test_herdr_differential_signals.py",
         "py/tests/test_herdr_run_allowlist.py",
         "py/tests/test_herdr_run_cli.py",
         "py/tests/test_herdr_run_client.py",
