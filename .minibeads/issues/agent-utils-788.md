@@ -1,13 +1,14 @@
 ---
 title: 'wrkslots-remove-nested-submodule-worktree: removing a finished slot is refused when nested submodules hold an absolute core.worktree'
-status: open
+status: closed
 priority: 1
-assignee: mu-rust@devbig030
 issue_type: bug
+assignee: mu-rust@devbig030
 labels:
 - wrkslots
 created_at: 2026-11-02T19:03:14.047701199+00:00
-updated_at: 2026-11-02T19:03:14.047701199+00:00
+updated_at: 2026-11-03T03:07:21.246729615+00:00
+closed_at: 2026-11-03T03:07:21.246729505+00:00
 ---
 
 # Description

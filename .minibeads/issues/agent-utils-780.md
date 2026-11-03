@@ -1,13 +1,14 @@
 ---
 title: 'wrkslots-retire-freeze: a per-host switch that refuses every slot retirement and removal'
-status: open
+status: closed
 priority: 0
-assignee: mu-rust@devbig030
 issue_type: feature
+assignee: mu-rust@devbig030
 labels:
 - wrkslots
 created_at: 2026-11-02T17:30:03.603445311+00:00
-updated_at: 2026-11-02T17:30:03.603445311+00:00
+updated_at: 2026-11-03T03:07:21.243500700+00:00
+closed_at: 2026-11-03T03:07:21.243500590+00:00
 ---
 
 # Description

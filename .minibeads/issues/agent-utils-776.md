@@ -1,13 +1,14 @@
 ---
 title: 'wrkslots-could-not-determine-route: a could_not_determine cleanup verdict comes once with an actionable route'
-status: open
+status: closed
 priority: 2
-assignee: mu-rust@devbig030
 issue_type: task
+assignee: mu-rust@devbig030
 labels:
 - wrkslots
 created_at: 2026-11-02T16:58:21.499843803+00:00
-updated_at: 2026-11-02T16:58:21.499843803+00:00
+updated_at: 2026-11-03T03:07:10.623904635+00:00
+closed_at: 2026-11-03T03:07:10.623904505+00:00
 ---
 
 # Description

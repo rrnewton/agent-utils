@@ -1,13 +1,14 @@
 ---
 title: 'wrkslots-stray-worktree-reap: reap stray git worktree registrations nobody owns'
-status: open
+status: closed
 priority: 2
-assignee: mu-rust@devbig030
 issue_type: task
+assignee: mu-rust@devbig030
 labels:
 - wrkslots
 created_at: 2026-11-02T16:58:21.496057941+00:00
-updated_at: 2026-11-02T16:58:21.496057941+00:00
+updated_at: 2026-11-03T03:07:10.620194604+00:00
+closed_at: 2026-11-03T03:07:10.620194464+00:00
 ---
 
 # Description

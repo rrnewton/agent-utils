@@ -1,13 +1,14 @@
 ---
 title: 'wrkslots-reregistered-pane: classify a slot whose herdr pane was re-registered by another agent'
-status: open
+status: closed
 priority: 2
-assignee: mu-rust@devbig030
 issue_type: task
+assignee: mu-rust@devbig030
 labels:
 - wrkslots
 created_at: 2026-11-02T16:58:21.503919572+00:00
-updated_at: 2026-11-02T16:58:21.503919572+00:00
+updated_at: 2026-11-03T03:07:10.627046588+00:00
+closed_at: 2026-11-03T03:07:10.627046458+00:00
 ---
 
 # Description
