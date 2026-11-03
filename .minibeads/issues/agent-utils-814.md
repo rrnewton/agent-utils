@@ -20,6 +20,8 @@ updated_at: 2026-11-03T11:09:26.739150948+00:00
 - Donors: a donor that cannot run the validator declines the job (no receipt), with the same naming.
 - Startup preflight (the #787 local-merge-queue preflight) resolves the validator command and fails loudly at serve startup when it cannot be found.
 - Documentation recommends that the serve unit set an explicit PATH.
+- Donor receipts: in DECIDE mode a COULD_NOT_RUN or refused donor receipt counts as NO verdict: the job is re-queued (or falls back to local validation) with an alarm, exactly like the exec-failure rule. In COMPARE mode it is recorded as "could not run", not as a comparison. (Second finding of the first live donor trial: a COULD_NOT_RUN receipt, exit 75, validation never ran, was marked DONE instead of re-queued.)
+- Donor setup: the validate start_unit required the donor worktree's origin URL to string-match the managed repository's, .git suffix included. Normalize the comparison (with or without .git; https and ssh forms of the same repository), have the donor preflight check it, and document it in the donor setup.
 
 # Acceptance Criteria
 
@@ -27,3 +29,5 @@ updated_at: 2026-11-03T11:09:26.739150948+00:00
 - A test where a shell-wrapped validator reports command-not-found behaves the same.
 - A donor that cannot run the validator declines the job.
 - serve refuses to start (or warns, per its preflight mode) when the validator command does not resolve.
+- In decide mode a COULD_NOT_RUN or refused donor receipt re-queues the job with an alarm; in compare mode it is counted as "could not run".
+- A donor whose clone's origin differs from the managed repository only by .git suffix or https/ssh form is accepted; a genuinely different repository is refused by the donor preflight.
