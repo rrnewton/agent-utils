@@ -37,6 +37,7 @@ pub mod progress_metric;
 pub(crate) mod prompt_time;
 pub mod registry_layout;
 pub mod restore;
+pub mod restore_notice;
 pub mod sender_header;
 pub mod services;
 pub(crate) mod skill_install;

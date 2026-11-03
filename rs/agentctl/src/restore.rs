@@ -1434,9 +1434,12 @@ pub fn restore<A: ManagedApi + ?Sized>(
     // A dry run never completes; this says whether the same run for real would.
     report["would_complete"] = json!(herdr_ready && coordinator_ok && refused == 0);
     report["notice"] = Value::Null;
+    let summary = config
+        .coordinator
+        .as_deref()
+        .map(|_| notice_text(&report, host.boot_time(), &path));
     if !options.dry_run && herdr_ready && coordinator_ok {
-        if let Some(name) = config.coordinator.as_deref() {
-            let text = notice_text(&report, host.boot_time(), &path);
+        if let (Some(name), Some(text)) = (config.coordinator.as_deref(), summary.clone()) {
             let message_id = format!("restore-{}", &boot_id[..8.min(boot_id.len())]);
             let options = DrainOptions {
                 ready_timeout: Duration::from_secs(60),
@@ -1458,6 +1461,20 @@ pub fn restore<A: ManagedApi + ?Sized>(
             };
         }
     }
+    // The "I'm back" summary to every bridge registry and each revived agent's
+    // catch-up prompt, queued without blocking (#746 restore-im-back).
+    report["im_back"] = if !options.dry_run && herdr_ready && coordinator_ok {
+        json!(crate::restore_notice::after_restore(
+            client,
+            registry,
+            config,
+            &report,
+            summary.as_deref(),
+            &boot_id,
+        ))
+    } else {
+        Value::Null
+    };
     report["finished_at"] = json!(host.now());
     if !options.dry_run {
         write_report(&path, &report)?;

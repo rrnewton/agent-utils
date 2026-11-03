@@ -206,6 +206,39 @@ fn restore_remounts_first_revives_then_starts_units_and_is_idempotent() {
 }
 
 #[test]
+fn restore_queues_a_catch_up_for_each_revived_agent_without_blocking() {
+    let fixture = Fixture::new();
+    dead_agent(&fixture);
+    let host = ScriptedHost::new();
+    let config = config(&fixture, None);
+    let registry = fixture.root.join("registry");
+    let report = restore(&fixture.client, &registry, &host, &config, &options(None)).unwrap();
+    assert_eq!(report["agents"][0]["action"], "revived", "{report}");
+    let catch_up = &report["im_back"]["catch_up"];
+    assert_eq!(catch_up.as_array().unwrap().len(), 1, "{report}");
+    assert_eq!(catch_up[0]["name"], "lane");
+    assert_eq!(catch_up[0]["action"], "queued");
+    assert_eq!(catch_up[0]["outcome"], "pending");
+    // The prompt is durable in the lane's queue under its boot-scoped ID, and says
+    // to continue.
+    let queue = fixture.manager().queue("lane").unwrap();
+    let prompts = agent::queued_prompts(&queue).unwrap();
+    assert_eq!(prompts, ["restore-catchup-11111111-lane"], "{prompts:?}");
+    let item: Value = serde_json::from_slice(
+        &fs::read(
+            queue
+                .join("inbox")
+                .join("restore-catchup-11111111-lane.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(item["text"].as_str().unwrap().contains("continue where"));
+    // No coordinator was configured, so no bridge summary was posted.
+    assert_eq!(report["im_back"]["bridges"], json!([]));
+}
+
+#[test]
 fn restore_dry_run_changes_nothing_and_reads_slot_warnings() {
     let fixture = Fixture::new();
     dead_agent(&fixture);
