@@ -135,6 +135,18 @@ enum DonorCommand {
         #[arg(long)]
         decline: bool,
     },
+    /// Queue host: print what a donor checks before claiming, as JSON: the URL of the queue
+    /// repository's remote and this merge-queue's revision (`donor run` asks for it).
+    Info,
+    /// Exit 0 when two repository URLs name the same repository (`https` and `ssh` forms,
+    /// with or without `.git`), 1 otherwise; prints both normalized forms. For a validator
+    /// that checks its checkout's origin.
+    SameRepository {
+        /// One URL.
+        a: String,
+        /// The other.
+        b: String,
+    },
     /// List donor jobs, leases (never their tokens) and compare-mode verdicts.
     Status {
         /// Print JSON.
@@ -166,6 +178,20 @@ fn donor_command(state: &State, action: DonorCommand) -> Result<i32, String> {
     let store = donor_store(state, &config);
     match action {
         DonorCommand::Run { .. } => Err("donor run is handled before the queue state".to_owned()),
+        DonorCommand::SameRepository { .. } => {
+            Err("donor same-repository is handled before the queue state".to_owned())
+        }
+        DonorCommand::Info => {
+            let info = crate::donor::QueueInfo {
+                remote_url: crate::donor::remote_url(&config.repo, &config.remote),
+                merge_queue: crate::build_info::revision(),
+            };
+            println!(
+                "{}",
+                serde_json::to_string(&info).map_err(|error| error.to_string())?
+            );
+            Ok(0)
+        }
         DonorCommand::Claim { donor, host, jobs } => {
             let cap = config.donors.max_jobs_per_donor;
             let jobs = if cap > 0 { jobs.min(cap) } else { jobs };
@@ -242,6 +268,11 @@ fn donor_command(state: &State, action: DonorCommand) -> Result<i32, String> {
                 count(crate::donor::JobState::Done),
                 count(crate::donor::JobState::Cancelled)
             );
+            let could_not_run: usize = jobs.iter().map(|j| j.could_not_run.len()).sum();
+            if could_not_run > 0 {
+                // Receipts that said validation never ran: no verdict, no comparison.
+                println!("could not run: {could_not_run} receipt(s), each queued again");
+            }
             let compared: Vec<&String> =
                 jobs.iter().filter_map(|j| j.comparison.as_ref()).collect();
             if !compared.is_empty() {
@@ -861,6 +892,16 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                 println!("speedup: {:.2}x", report.speedup);
             }
             return Ok(0);
+        }
+        Command::Donor {
+            action: DonorCommand::SameRepository { a, b },
+        } => {
+            let (key_a, key_b) = (
+                crate::donor::repository_key(&a),
+                crate::donor::repository_key(&b),
+            );
+            println!("{key_a}\n{key_b}");
+            return Ok(if key_a == key_b { 0 } else { 1 });
         }
         Command::Donor {
             action:

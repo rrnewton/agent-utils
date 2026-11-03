@@ -178,6 +178,93 @@ fn refusal_exit75_keeps_change_queued_and_is_neither_red_nor_pass() {
     assert_eq!(plan["held"][0]["kind"], "validation-refused", "{plan}");
 }
 
+/// A validator that cannot execute: the change stays queued with no verdict, the refusal
+/// names the command and PATH, and it is retried with backoff (#814).
+fn assert_cannot_execute(tag: &str, validator_run: &str, files: &[(&str, &str)], names: &str) {
+    let fx = Fixture::new(tag);
+    fx.write("tests/t0", "ok\n");
+    for (path, text) in files {
+        fx.write(path, text);
+    }
+    fx.commit_all("seed");
+    git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
+    fx.mq_ok(&[
+        "init",
+        "--remote",
+        "origin",
+        "--validator",
+        "command",
+        "--validator-run",
+        validator_run,
+        "--refusal-max-retries",
+        "1",
+        "--refusal-backoff-secs",
+        "1",
+    ]);
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    let before = fx.remote_main();
+    let out = fx.mq(&["run", "--json"]);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let r = report(&String::from_utf8_lossy(&out.stdout));
+    assert!(r["landed"].as_array().unwrap().is_empty(), "{r}");
+    assert!(r["ejected"].as_array().unwrap().is_empty(), "{r}");
+    // Retried within the run after the backoff, refused both times, never red.
+    let validations = r["validations"].as_array().unwrap();
+    assert_eq!(validations.len(), 2, "{r}");
+    for v in validations {
+        assert_eq!(v["refused"], true, "{v}");
+        assert_eq!(v["failed"], serde_json::json!([]), "{v}");
+    }
+    let reason = r["deferred"][0]["reason"].as_str().unwrap().to_owned();
+    for part in [
+        "the validator could not execute",
+        "exit 127: a command was not found",
+        names,
+        "PATH=",
+    ] {
+        assert!(reason.contains(part), "{part:?} missing from {reason}");
+    }
+    assert_eq!(fx.remote_main(), before);
+    assert_eq!(status(&fx, 1), "queued");
+    let items: Value = serde_json::from_str(&fx.mq_ok(&["list", "--all", "--json"])).unwrap();
+    let item = &items.as_array().unwrap()[0];
+    assert_eq!(item["last_refusal"].as_str().unwrap(), reason, "{item}");
+    assert!(
+        !item["next_retry_at"].as_str().unwrap().is_empty(),
+        "{item}"
+    );
+    assert!(
+        !item["history"].to_string().contains("failed-tests"),
+        "{item}"
+    );
+}
+
+#[test]
+fn a_nonexistent_validator_binary_is_an_infrastructure_refusal_not_red() {
+    assert_cannot_execute(
+        "run-exec-missing",
+        "/nonexistent/mq-validator --check",
+        &[],
+        "/nonexistent/mq-validator",
+    );
+}
+
+#[test]
+fn a_shell_wrapper_whose_tool_is_missing_is_an_infrastructure_refusal_not_red() {
+    assert_cannot_execute(
+        "run-exec-wrapper",
+        "sh ./validate.sh",
+        &[("validate.sh", "echo checking\nmq-missing-tool-xyz --all\n")],
+        "mq-missing-tool-xyz",
+    );
+}
+
 #[test]
 fn refusal_is_retried_with_backoff_and_then_lands() {
     // Refuse twice (exit 75), then pass: the same run retries and lands.

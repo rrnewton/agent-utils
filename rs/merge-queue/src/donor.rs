@@ -27,6 +27,80 @@ use crate::tests::{Selection, TestResults};
 pub const JOB_SCHEMA: &str = "merge-queue-donor-job/v1";
 /// Schema of a receipt.
 pub const RECEIPT_SCHEMA: &str = "merge-queue-receipt/v1";
+/// A repository URL reduced to what names the repository, so the forms of one repository
+/// compare equal: the scheme (`https`, `http`, `ssh`, `git`, `git+ssh`, or scp-like
+/// `user@host:path`), the user, the port, a trailing `/` and a `.git` suffix are dropped, and
+/// the host is lowercased. A local path (or `file://` URL) stays a path.
+pub fn repository_key(url: &str) -> String {
+    let url = url.trim();
+    let trim_path = |path: &str| {
+        let path = path.trim_matches('/');
+        path.strip_suffix(".git")
+            .unwrap_or(path)
+            .trim_end_matches('/')
+            .to_owned()
+    };
+    let remote = |authority: &str, path: &str| {
+        let host = authority.rsplit('@').next().unwrap_or(authority);
+        let host = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
+        format!("{host}/{}", trim_path(path))
+    };
+    let local = |path: &str| {
+        let path = path.trim_end_matches('/');
+        format!(
+            "file:{}",
+            path.strip_suffix(".git")
+                .unwrap_or(path)
+                .trim_end_matches('/')
+        )
+    };
+    if let Some(path) = url.strip_prefix("file://") {
+        return local(path);
+    }
+    if let Some((_, rest)) = url.split_once("://") {
+        let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+        return remote(authority, path);
+    }
+    // scp-like `[user@]host:path`: a colon before any slash (a local path has none).
+    match url.split_once(':') {
+        Some((authority, path)) if !authority.contains('/') && !authority.is_empty() => {
+            remote(authority, path)
+        }
+        _ => local(url),
+    }
+}
+
+/// Whether two repository URLs name the same repository (see [`repository_key`]).
+pub fn same_repository(a: &str, b: &str) -> bool {
+    repository_key(a) == repository_key(b)
+}
+
+/// `donor info` output: what a donor checks before it claims anything.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct QueueInfo {
+    /// URL of the queue repository's remote, or `None` for a purely local queue.
+    #[serde(default)]
+    pub remote_url: Option<String>,
+    /// The queue host's merge-queue revision, when its binary recorded one.
+    #[serde(default)]
+    pub merge_queue: Option<crate::build_info::Revision>,
+}
+
+/// The URL of `remote` in the repository at `dir`, or `remote` itself when it is already a URL.
+pub fn remote_url(dir: &Path, remote: &str) -> Option<String> {
+    if remote.is_empty() {
+        return None;
+    }
+    git_in(dir, &["remote", "get-url", remote])
+        .ok()
+        .map(|url| url.trim().to_owned())
+        .filter(|url| !url.is_empty())
+        .or_else(|| (remote.contains("://") || remote.contains(':')).then(|| remote.to_owned()))
+}
+
+/// Receipts saying validation could not run that one donor may return for one job before it
+/// is left out of that job.
+pub const COULD_NOT_RUN_LIMIT: usize = 3;
 /// Seconds a lease lasts without a renewal.
 pub const DEFAULT_LEASE_SECS: u64 = 120;
 
@@ -137,6 +211,10 @@ pub struct Job {
     /// the job is cancelled instead of queued again if the lease ends without one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub candidate_gone: Option<String>,
+    /// Receipts that said validation could not run (admission refused, exit 75), as
+    /// `donor: detail`, oldest first. None is a verdict: each re-queued the job.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub could_not_run: Vec<String>,
 }
 
 impl Job {
@@ -626,6 +704,7 @@ impl Store {
             local: None,
             comparison: None,
             candidate_gone: None,
+            could_not_run: Vec::new(),
         };
         self.write(&job)?;
         Ok(job)
@@ -805,6 +884,64 @@ impl Store {
                 .push(format!("{}: refused a receipt: {reason}", now()));
             self.write(&job)?;
             return Err(reason);
+        }
+        if receipt.refused || receipt.exit == Some(crate::validate::REFUSAL_EXIT) {
+            // Validation never ran: no verdict in either mode, so the job goes back to the
+            // queue. A donor that keeps answering this way is left out of it.
+            let last = receipt
+                .log_tail
+                .lines()
+                .map(str::trim)
+                .rfind(|line| !line.is_empty())
+                .unwrap_or("");
+            let detail = format!(
+                "exit {}{}",
+                receipt
+                    .exit
+                    .map_or_else(|| "none".to_owned(), |code| code.to_string()),
+                if last.is_empty() {
+                    String::new()
+                } else {
+                    format!(", last output: {last}")
+                }
+            );
+            job.could_not_run
+                .push(format!("{}: {detail}", receipt.donor.name));
+            let by_this_donor = job
+                .could_not_run
+                .iter()
+                .filter(|entry| entry.starts_with(&format!("{}: ", receipt.donor.name)))
+                .count();
+            job.lease = None;
+            job.state = if job.candidate_gone.is_some() {
+                JobState::Cancelled
+            } else {
+                JobState::Queued
+            };
+            let mut note = format!(
+                "{}: {} on {} could not run the validation ({detail}); no verdict, {}",
+                now(),
+                receipt.donor.name,
+                receipt.donor.host,
+                if job.state == JobState::Queued {
+                    "queued again"
+                } else {
+                    "cancelled (the queue no longer wants the candidate)"
+                }
+            );
+            if by_this_donor >= COULD_NOT_RUN_LIMIT && !job.declined_by.contains(&lease.donor) {
+                job.declined_by.push(lease.donor.clone());
+                note.push_str(&format!(
+                    "; {} could not run it {by_this_donor} times and will not get it again",
+                    lease.donor
+                ));
+            }
+            job.history.push(note);
+            self.write(&job)?;
+            return Err(format!(
+                "the receipt says validation could not run ({detail}); no verdict, the job is \
+                 queued again"
+            ));
         }
         job.state = JobState::Done;
         job.lease = None;
@@ -1393,6 +1530,17 @@ impl Worker<'_> {
             if let Some(why) = &ran.interrupted {
                 return Err(Unreported::Released(format!("donor stopping: {why}")));
             }
+            // A validator this host cannot execute says nothing about the candidate: no
+            // receipt, and another donor (or this one, once fixed) takes the job.
+            if let Some(why) = &ran.cannot_execute {
+                *backoff
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(std::time::Instant::now() + self.options.mismatch_backoff);
+                return Err(Unreported::Declined(format!(
+                    "this donor cannot run the validator: {why}"
+                )));
+            }
             if ran.cancelled {
                 let reason = lost
                     .lock()
@@ -1430,6 +1578,14 @@ impl Worker<'_> {
                 log_tail: log_text[tail_start..].to_owned(),
                 log_path: ran.log.display().to_string(),
             };
+            if receipt.refused {
+                // The queue answers a could-not-run receipt by queueing the job again; do not
+                // claim straight back.
+                *backoff
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(std::time::Instant::now() + self.options.mismatch_backoff);
+            }
             let body = serde_json::to_vec(&Report {
                 token: token.to_owned(),
                 receipt,
@@ -1467,6 +1623,7 @@ pub fn run_donor(options: &DonorOptions) -> Result<i32, String> {
             "{problem}; a donor's merge-queue must match the queue host's revision"
         ));
     }
+    preflight_against_queue(options, &route, revision.as_ref())?;
     crate::interrupt::install();
     let jobs = options.jobs.max(1);
     let worker = Worker {
@@ -1546,6 +1703,59 @@ pub fn run_donor(options: &DonorOptions) -> Result<i32, String> {
         Ok(())
     })?;
     Ok(0)
+}
+
+/// Before claiming anything, check this donor against the queue: its clone's remote must be
+/// the queue's repository (in any URL form of it), and a different merge-queue revision is
+/// reported now rather than on every job. A queue too old to answer `donor info` is only warned
+/// about.
+fn preflight_against_queue(
+    options: &DonorOptions,
+    route: &Route,
+    revision: Option<&crate::build_info::Revision>,
+) -> Result<(), String> {
+    let info = match route
+        .call(&["donor", "info"], b"", ROUTE_TIMEOUT)
+        .and_then(|out| serde_json::from_slice::<QueueInfo>(&out).map_err(|e| e.to_string()))
+    {
+        Ok(info) => info,
+        Err(error) => {
+            eprintln!(
+                "merge-queue donor {}: warning: the queue did not answer `donor info` ({error}); \
+                 its repository and revision are not checked before claiming",
+                options.name
+            );
+            return Ok(());
+        }
+    };
+    if let (Some(queue), Some(ours)) = (
+        info.remote_url.as_deref(),
+        remote_url(&options.clone, &options.remote),
+    ) {
+        if !same_repository(queue, &ours) {
+            return Err(format!(
+                "--clone {} has remote {:?} at {ours}, which is not the queue's repository \
+                 {queue}; clone the queue's repository (any URL form of it works)",
+                options.clone.display(),
+                options.remote
+            ));
+        }
+        if queue != ours {
+            eprintln!(
+                "merge-queue donor {}: remote {:?} is {ours}, the queue's is {queue}: the same \
+                 repository in another form",
+                options.name, options.remote
+            );
+        }
+    }
+    if let Some(difference) = revision_mismatch(info.merge_queue.as_ref(), revision) {
+        eprintln!(
+            "merge-queue donor {}: warning: {difference}; every job will be declined until \
+             they match",
+            options.name
+        );
+    }
+    Ok(())
 }
 
 /// `donor claim` output.
@@ -1800,5 +2010,24 @@ mod unit {
             .unwrap();
         assert_eq!(store.get(&released.id).unwrap().state, JobState::Cancelled);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repository_keys_ignore_url_form_but_not_the_repository() {
+        for (a, b) in [
+            ("https://github.com/o/r.git", "git@github.com:o/r"),
+            ("ssh://git@GitHub.com:22/o/r/", "https://github.com/o/r"),
+            ("git+ssh://me@host/o/r.git", "host:o/r"),
+            ("/srv/r.git", "file:///srv/r/"),
+        ] {
+            assert!(same_repository(a, b), "{a} vs {b}");
+        }
+        for (a, b) in [
+            ("https://github.com/o/r", "https://github.com/o/other"),
+            ("https://github.com/o/r", "https://gitlab.com/o/r"),
+            ("/srv/r", "/srv/other"),
+        ] {
+            assert!(!same_repository(a, b), "{a} vs {b}");
+        }
     }
 }

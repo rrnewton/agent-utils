@@ -31,6 +31,9 @@ use crate::tests::{Outcome, Selection, TestId, TestResult, TestResults};
 /// failure of the change under validation (`EX_TEMPFAIL`).
 pub const REFUSAL_EXIT: i32 = 75;
 
+/// How the reason for a validator that could not execute begins (see [`Ran::cannot_execute`]).
+pub const CANNOT_EXECUTE: &str = "the validator could not execute";
+
 /// Marker printed by an admission wrapper when it refuses to run validation at all.
 pub const REFUSAL_MARKER: &str = "COULD_NOT_RUN";
 
@@ -76,9 +79,12 @@ pub struct Ran {
     /// Opaque handle the runner wrote to `$MQ_HANDLE_FILE`, if any; passed back as
     /// `$MQ_RERUN_FROM` to a later validation of the same commit.
     pub handle: Option<String>,
-    /// Admission refused to run validation at all (exit 75 or `COULD_NOT_RUN`): validation
-    /// did not run, so this is neither green nor red.
+    /// Admission refused to run validation at all (exit 75 or `COULD_NOT_RUN`), or the
+    /// validator could not execute: validation did not run, so this is neither green nor red.
     pub refused: bool,
+    /// Why the validator could not execute (it could not start, or exited 126 or 127 without
+    /// reporting a failed test), naming the command and `PATH`. Always also `refused`.
+    pub cannot_execute: Option<String>,
     /// Effective selection actually run, when the runner collapses the
     /// requested one (dagrun runs whole steps, so case IDs collapse to
     /// their steps). `None` means the requested selection ran as-is.
@@ -292,6 +298,60 @@ struct Finished {
     cancelled: bool,
     /// Set when a stop request or an outside kill signal ended it (see [`Ran::interrupted`]).
     interrupted: Option<String>,
+    /// The runner could not be started at all (no such file, not executable).
+    spawn_error: Option<String>,
+}
+
+/// The command a validation runs: the admission prefix, then the runner's argv.
+fn full_argv(config: &ValidatorConfig, argv: &[String]) -> Vec<String> {
+    config
+        .admission
+        .iter()
+        .cloned()
+        .chain(argv.iter().cloned())
+        .collect()
+}
+
+/// Why a validation that could not execute says nothing about the change, or `None` when it
+/// ran. It could not execute when the runner failed to start, or exited 126 (a command was
+/// found but could not run) or 127 (a command was not found, the shell's answer when the
+/// validator or a tool it calls is missing from `PATH`) without reporting any failed test
+/// itself. The reason names the command and the `PATH` it ran with, for the operator.
+fn cannot_execute(
+    config: &ValidatorConfig,
+    argv: &[String],
+    finished: &Finished,
+    log_text: &str,
+    reported_failures: bool,
+) -> Option<String> {
+    let what = match (&finished.spawn_error, finished.exit) {
+        _ if finished.cancelled => return None,
+        (Some(error), _) => error.clone(),
+        (None, Some(127)) if !reported_failures => "exit 127: a command was not found".to_owned(),
+        (None, Some(126)) if !reported_failures => {
+            "exit 126: a command was found but could not be executed".to_owned()
+        }
+        _ => return None,
+    };
+    let mut detail = format!(
+        "{CANNOT_EXECUTE} ({what}): command {}; PATH={}",
+        shell_words::join(full_argv(config, argv)),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    if finished.spawn_error.is_none() {
+        if let Some(last) = log_text
+            .lines()
+            .map(str::trim)
+            .rfind(|line| !line.is_empty())
+        {
+            let cut = last
+                .char_indices()
+                .nth(200)
+                .map_or(last, |(end, _)| &last[..end]);
+            detail.push_str(&format!("; last output: {cut}"));
+        }
+    }
+    Some(detail)
 }
 
 /// Run a shell command under the admission prefix with a timeout; output goes to `log`.
@@ -312,12 +372,7 @@ fn run_logged(
     let err = file
         .try_clone()
         .map_err(|error| format!("cannot clone log handle: {error}"))?;
-    let full: Vec<String> = config
-        .admission
-        .iter()
-        .cloned()
-        .chain(argv.iter().cloned())
-        .collect();
+    let full = full_argv(config, argv);
     let mut command = Command::new(&full[0]);
     command
         .args(&full[1..])
@@ -334,9 +389,22 @@ fn run_logged(
         command.process_group(0);
     }
     let started = Instant::now();
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("cannot start {}: {error}", full[0]))?;
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let error = format!("cannot start {}: {error}", full[0]);
+            if let Ok(mut log) = std::fs::OpenOptions::new().append(true).open(log) {
+                let _ = writeln!(log, "merge-queue: {error}");
+            }
+            return Ok(Finished {
+                exit: None,
+                elapsed: started.elapsed(),
+                cancelled: false,
+                interrupted: None,
+                spawn_error: Some(error),
+            });
+        }
+    };
     let limit = (config.timeout_secs > 0).then(|| Duration::from_secs(config.timeout_secs));
     loop {
         if let Some(status) = child
@@ -351,6 +419,7 @@ fn run_logged(
                 elapsed: started.elapsed(),
                 cancelled: interrupted.is_some(),
                 interrupted,
+                spawn_error: None,
             });
         }
         let stopping = crate::interrupt::requested();
@@ -388,6 +457,7 @@ fn run_logged(
                 cancelled,
                 interrupted: stopping
                     .then(|| crate::interrupt::check("this validation finished").unwrap_err()),
+                spawn_error: None,
             });
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -473,12 +543,7 @@ impl Validator for CommandValidator {
         );
         let log = out.join("run.log");
         let argv = vec!["sh".to_owned(), "-c".to_owned(), self.0.run.clone()];
-        let Finished {
-            exit,
-            elapsed,
-            cancelled,
-            interrupted,
-        } = run_logged(&self.0, &argv, checkout, &env, &log, cancel)?;
+        let finished = run_logged(&self.0, &argv, checkout, &env, &log, cancel)?;
         let mut results = TestResults::default();
         if let Ok(text) = std::fs::read_to_string(&results_path) {
             for line in text.lines().filter(|line| !line.trim().is_empty()) {
@@ -504,6 +569,15 @@ impl Validator for CommandValidator {
             // No results file: a runner that prints dagrun-style verdict lines still attributes.
             results = parse_step_lines(&std::fs::read_to_string(&log).unwrap_or_default());
         }
+        // Failures the runner reported itself, before unreported tests inherit its exit status.
+        let reported_failures = !results.attributed_failures().is_empty();
+        let Finished {
+            exit,
+            elapsed,
+            cancelled,
+            ..
+        } = finished;
+        let interrupted = finished.interrupted.clone();
         if results.results.is_empty() {
             results.unattributed = true;
             let outcome = if exit == Some(0) {
@@ -526,8 +600,10 @@ impl Validator for CommandValidator {
         }
         results.require(selection);
         let log_text = std::fs::read_to_string(&log).unwrap_or_default();
-        let refused =
-            !cancelled && is_refusal(exit, &log_text, !results.attributed_failures().is_empty());
+        let cannot_execute =
+            cannot_execute(&self.0, &argv, &finished, &log_text, reported_failures);
+        let refused = cannot_execute.is_some()
+            || (!cancelled && is_refusal(exit, &log_text, reported_failures));
         if refused {
             // Validation did not run: keep no test verdict from this attempt.
             results = TestResults::default();
@@ -541,6 +617,7 @@ impl Validator for CommandValidator {
             interrupted,
             handle: read_handle(out),
             refused,
+            cannot_execute,
             effective_selection: None,
         })
     }
@@ -709,6 +786,7 @@ impl Validator for DagrunValidator {
                     interrupted: None,
                     handle: None,
                     refused: false,
+                    cannot_execute: None,
                     effective_selection: Some(Selection::default()),
                 });
             }
@@ -717,12 +795,14 @@ impl Validator for DagrunValidator {
         }
         let env = [("DAGRUN_LOG_DIR", journal_dir.display().to_string())];
         let log = out.join("run.log");
+        let finished = run_logged(&self.0, &argv, checkout, &env, &log, cancel)?;
         let Finished {
             exit,
             elapsed,
             cancelled,
-            interrupted,
-        } = run_logged(&self.0, &argv, checkout, &env, &log, cancel)?;
+            ..
+        } = finished;
+        let interrupted = finished.interrupted.clone();
         let journal =
             std::fs::read_to_string(journal_dir.join("journal.jsonl")).unwrap_or_default();
         let mut results = parse_journal(&journal);
@@ -736,10 +816,13 @@ impl Validator for DagrunValidator {
         let whole_steps = selection
             .tests()
             .map(|tests| Selection::of(tests.iter().map(TestId::whole_step)));
+        let reported_failures = !results.attributed_failures().is_empty();
         results.require(whole_steps.as_ref().unwrap_or(selection));
         let log_text = std::fs::read_to_string(&log).unwrap_or_default();
-        let refused =
-            !cancelled && is_refusal(exit, &log_text, !results.attributed_failures().is_empty());
+        let cannot_execute =
+            cannot_execute(&self.0, &argv, &finished, &log_text, reported_failures);
+        let refused = cannot_execute.is_some()
+            || (!cancelled && is_refusal(exit, &log_text, reported_failures));
         if refused {
             results = TestResults::default();
         }
@@ -752,6 +835,7 @@ impl Validator for DagrunValidator {
             interrupted,
             handle: read_handle(out),
             refused,
+            cannot_execute,
             effective_selection: whole_steps,
         })
     }
@@ -768,6 +852,74 @@ mod unit {
             run: run.into(),
             ..ValidatorConfig::default()
         }
+    }
+
+    #[test]
+    fn a_validator_that_cannot_execute_is_refused_naming_the_command_and_path() {
+        let tmp = TempDir::new("validate-exec");
+        let never = AtomicBool::new(false);
+        let tests = Selection::of([TestId::step("a")]);
+        // The shell cannot find the command (exit 127), with or without a test selection.
+        for selection in [Selection::All, tests.clone()] {
+            let v = from_config(&config("/nonexistent/mq-validator --run")).unwrap();
+            let ran = v
+                .run(&tmp.0, &selection, &tmp.0.join("missing"), &never)
+                .unwrap();
+            assert!(ran.refused() && !ran.green() && ran.failed().is_empty());
+            let why = ran.cannot_execute.unwrap();
+            assert!(why.starts_with(CANNOT_EXECUTE), "{why}");
+            assert!(why.contains("exit 127") && why.contains("/nonexistent/mq-validator"));
+            assert!(why.contains("PATH="), "{why}");
+        }
+        // Found but not executable (exit 126).
+        std::fs::write(tmp.0.join("plain.sh"), "exit 0\n").unwrap();
+        let v = from_config(&config("./plain.sh")).unwrap();
+        let ran = v
+            .run(&tmp.0, &Selection::All, &tmp.0.join("plain"), &never)
+            .unwrap();
+        assert!(ran.cannot_execute.unwrap().contains("exit 126"));
+        // An admission prefix that does not exist never starts.
+        let mut admitted = config("exit 0");
+        admitted.admission = vec!["/nonexistent/gate".to_owned()];
+        let ran = from_config(&admitted)
+            .unwrap()
+            .run(&tmp.0, &Selection::All, &tmp.0.join("gate"), &never)
+            .unwrap();
+        let why = ran.cannot_execute.unwrap();
+        assert!(why.contains("cannot start /nonexistent/gate"), "{why}");
+        // Nor does a dagrun launcher that is not there.
+        let dagrun = ValidatorConfig {
+            kind: "dagrun".into(),
+            dagrun: "/nonexistent/dagrun".into(),
+            dag: "validation.dag.yaml".into(),
+            ..ValidatorConfig::default()
+        };
+        let ran = from_config(&dagrun)
+            .unwrap()
+            .run(&tmp.0, &tests, &tmp.0.join("dagrun"), &never)
+            .unwrap();
+        assert!(ran.refused() && ran.failed().is_empty());
+        assert!(ran.cannot_execute.unwrap().contains("/nonexistent/dagrun"));
+    }
+
+    #[test]
+    fn exit_127_with_a_reported_failure_is_red() {
+        let tmp = TempDir::new("validate-exec-red");
+        let never = AtomicBool::new(false);
+        let v = from_config(&config(
+            r#"echo '{"id":"a","outcome":"fail"}' >> "$MQ_RESULTS"; exit 127"#,
+        ))
+        .unwrap();
+        let ran = v
+            .run(
+                &tmp.0,
+                &Selection::of([TestId::step("a")]),
+                &tmp.0.join("out"),
+                &never,
+            )
+            .unwrap();
+        assert!(ran.cannot_execute.is_none() && !ran.refused());
+        assert_eq!(ran.failed(), BTreeSet::from([TestId::step("a")]));
     }
 
     #[test]
@@ -945,6 +1097,7 @@ dagrun: PASS - 1 passed";
                 interrupted: None,
                 handle: None,
                 refused: false,
+                cannot_execute: None,
                 effective_selection: None,
             };
             assert_eq!(ran.probe_observation(), ProbeObservation::Unknown);

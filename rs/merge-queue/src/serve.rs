@@ -536,9 +536,12 @@ pub fn preflight_with_path(
         Ok(())
     } else {
         Err(format!(
-            "serve preflight failed: {}; remedy: install the named tool(s) or add their \
-             directory to the service PATH (see `merge-queue install-serve-unit`)",
-            missing.join("; ")
+            "serve preflight failed: {}; PATH={}; remedy: install the named tool(s) or add \
+             their directory to the service PATH (see `merge-queue install-serve-unit`)",
+            missing.join("; "),
+            path_env
+                .map(|path| path.to_string_lossy())
+                .unwrap_or_default()
         ))
     }
 }
@@ -881,11 +884,40 @@ fn run_cycle(
                     report.stopped.as_str()
                 }
             );
+            for deferred in &report.deferred {
+                let prs = deferred
+                    .prs
+                    .iter()
+                    .map(|pr| format!("#{pr}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                eprintln!(
+                    "merge-queue serve: deferred {prs} (still queued, retry after {}): {}",
+                    deferred.retry_after, deferred.reason
+                );
+            }
+            // A validator that cannot execute is the host's problem, not the changes': no
+            // verdict, and the operator is told what to fix.
+            let alarm = report
+                .deferred
+                .iter()
+                .find(|deferred| deferred.reason.starts_with(crate::validate::CANNOT_EXECUTE));
+            if let Some(deferred) = alarm {
+                eprintln!(
+                    "merge-queue serve: ALARM: {}; fix the validator or the service PATH",
+                    deferred.reason
+                );
+            }
             if report.stopped.is_empty() {
-                heartbeat.last_error.clear();
+                heartbeat.last_error = alarm
+                    .map(|deferred| format!("ALARM: {}", deferred.reason))
+                    .unwrap_or_default();
                 true
             } else {
-                heartbeat.last_error = format!("run stopped: {}", report.stopped);
+                heartbeat.last_error = match alarm {
+                    Some(deferred) => format!("ALARM: {}", deferred.reason),
+                    None => format!("run stopped: {}", report.stopped),
+                };
                 false
             }
         }

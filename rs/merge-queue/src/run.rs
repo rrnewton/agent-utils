@@ -516,8 +516,12 @@ fn retry_after_time(delay: Duration) -> String {
     at.format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
-/// Human detail for a refused validation.
+/// Human detail for a refused validation: for a validator that could not execute, what
+/// happened, the command and the `PATH` it ran with.
 fn refusal_detail(ran: &Ran) -> String {
+    if let Some(why) = &ran.cannot_execute {
+        return why.clone();
+    }
     match ran.exit {
         Some(code) => format!("exit {code} ({})", crate::validate::REFUSAL_MARKER),
         None => format!("no exit status ({})", crate::validate::REFUSAL_MARKER),
@@ -1493,6 +1497,7 @@ impl<'a> Runner<'a> {
         );
         let claim_timeout = Duration::from_secs(self.config.donors.claim_timeout());
         let mut waiting_since = Instant::now();
+        let mut could_not_run = 0;
         let started = Instant::now();
         let stopped = |cancelled: bool, interrupted: Option<String>| Ran {
             results: TestResults::default(),
@@ -1503,6 +1508,7 @@ impl<'a> Runner<'a> {
             interrupted,
             handle: None,
             refused: false,
+            cannot_execute: None,
             effective_selection: None,
         };
         loop {
@@ -1517,6 +1523,16 @@ impl<'a> Runner<'a> {
                 return Ok(stopped(true, None));
             }
             let record = donors.store.get(&published)?;
+            for entry in record.could_not_run.iter().skip(could_not_run) {
+                // No verdict: the job is queued again; the operator should look at that donor.
+                let alarm = format!(
+                    "v{id}: ALARM: donor job {published}: {entry} reported that validation could \
+                     not run; no verdict, queued again"
+                );
+                eprintln!("merge-queue: {alarm}");
+                self.event("donor", &alarm);
+            }
+            could_not_run = record.could_not_run.len();
             match record.state {
                 crate::donor::JobState::Done => {
                     let receipt = record.receipt.ok_or_else(|| {
@@ -2798,6 +2814,7 @@ fn receipt_ran(receipt: &crate::donor::Receipt, dir: &std::path::Path) -> Result
         interrupted: None,
         handle: None,
         refused: receipt.refused,
+        cannot_execute: None,
         effective_selection: receipt.effective_selection.clone(),
     })
 }

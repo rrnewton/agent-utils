@@ -436,6 +436,76 @@ fn serve_shadow_is_the_remedy_when_land_driver_is_none() {
 }
 
 #[test]
+fn serve_preflight_refuses_a_validator_that_does_not_resolve() {
+    let fx = Fixture::new("serve-preflight-validator");
+    fx.write("tests/t0", "ok\n");
+    fx.commit_all("seed tests");
+    git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
+    fx.mq_ok(&[
+        "init",
+        "--remote",
+        "origin",
+        "--validator",
+        "command",
+        "--validator-run",
+        "/nonexistent/mq-validator --check",
+    ]);
+    let out = fx.mq(&["serve", "--once", "--poll-ms", "50"]);
+    assert!(!out.status.success());
+    let text = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        text.contains("/nonexistent/mq-validator not found (needed by validator.run)"),
+        "{text}"
+    );
+    assert!(text.contains("PATH="), "{text}");
+}
+
+#[test]
+fn serve_alarms_when_the_validator_cannot_execute_and_ejects_nothing() {
+    // A wrapper inside the checkout passes preflight, then cannot find the tool it calls.
+    let fx = Fixture::new("serve-exec-alarm");
+    fx.write("tests/t0", "ok\n");
+    fx.write("validate.sh", "mq-missing-tool-xyz --all\n");
+    fx.commit_all("seed tests");
+    git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
+    fx.mq_ok(&[
+        "init",
+        "--remote",
+        "origin",
+        "--validator",
+        "command",
+        "--validator-run",
+        "sh ./validate.sh",
+        "--refusal-max-retries",
+        "0",
+        "--refusal-backoff-secs",
+        "60",
+    ]);
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    let out = fx.mq(&["serve", "--once", "--poll-ms", "50"]);
+    let text = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        text.contains("ALARM: the validator could not execute"),
+        "{text}"
+    );
+    assert!(
+        text.contains("mq-missing-tool-xyz") && text.contains("PATH="),
+        "{text}"
+    );
+    assert_eq!(item_status(&fx, 1), "queued");
+    let hb = heartbeat(&fx);
+    assert!(
+        hb["last_error"]
+            .as_str()
+            .unwrap()
+            .starts_with("ALARM: the validator could not execute"),
+        "{hb}"
+    );
+    assert!(!hb["next_retry_at"].as_str().unwrap().is_empty(), "{hb}");
+}
+
+#[test]
 fn serve_preflight_refuses_when_regen_tool_is_missing_from_path() {
     let fx = Fixture::new("serve-preflight");
     fx.write("tests/t0", "ok\n");

@@ -706,6 +706,158 @@ fn a_job_left_by_a_killed_run_is_cancelled_by_the_next_run() {
     assert!(job["history"].to_string().contains("superseded"), "{job}");
 }
 
+/// A donor whose validation never ran (admission refused, exit 75) returns no verdict: the
+/// job is queued again with an alarm, and nothing is ejected (#814).
+#[test]
+fn a_could_not_run_receipt_is_no_verdict_and_requeues_with_an_alarm() {
+    let fx = Fixture::new("donor-could-not-run");
+    fx.mq_ok(&[
+        "init",
+        "--validator",
+        "command",
+        "--validator-run",
+        r#"if [ -n "$DONOR" ]; then echo COULD_NOT_RUN; exit 75; fi; exit 0"#,
+        "--offload",
+        "decide",
+    ]);
+    set_config(&fx, |config| {
+        config["donors"] = serde_json::json!({"claim_timeout_secs": 4})
+    });
+    two_changes(&fx);
+    let clone = donor_clone(&fx, "donor-host");
+    let run = spawn_run(&fx, &[]);
+    wait_for("a published job", Duration::from_secs(30), || {
+        !jobs(&fx).is_empty()
+    });
+    let out = donor(&fx, &clone, "d1", &[("DONOR", "1")]);
+    let donor_err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(donor_err.contains("could not run"), "{donor_err}");
+    let (code, report, stderr) = finish(run);
+    assert_eq!(code, Some(3), "{stderr}");
+    assert!(stderr.contains("ALARM"), "{stderr}");
+    assert!(stderr.contains("could not run"), "{stderr}");
+    assert!(report["ejected"].as_array().unwrap().is_empty(), "{report}");
+    assert!(report["landed"].as_array().unwrap().is_empty(), "{report}");
+    assert_eq!(item_status(&fx, 1), "queued");
+    let job = &jobs(&fx)[0];
+    assert!(job["receipt"].is_null(), "{job}");
+    assert_eq!(job["could_not_run"].as_array().unwrap().len(), 1, "{job}");
+    assert!(
+        job["history"]
+            .to_string()
+            .contains("could not run the validation (exit 75"),
+        "{job}"
+    );
+    let status = fx.mq_ok(&["donor", "status"]);
+    assert!(status.contains("could not run: 1 receipt(s)"), "{status}");
+}
+
+#[test]
+fn compare_mode_counts_a_could_not_run_receipt_and_compares_nothing() {
+    let fx = Fixture::new("donor-compare-could-not-run");
+    fx.mq_ok(&[
+        "init",
+        "--validator",
+        "command",
+        "--validator-run",
+        r#"if [ -n "$DONOR" ]; then echo COULD_NOT_RUN; exit 75; fi; sleep 8"#,
+        "--offload",
+        "compare",
+    ]);
+    two_changes(&fx);
+    let clone = donor_clone(&fx, "donor-host");
+    let run = spawn_run(&fx, &[]);
+    wait_for("a published job", Duration::from_secs(30), || {
+        !jobs(&fx).is_empty()
+    });
+    let _ = donor(&fx, &clone, "d1", &[("DONOR", "1")]);
+    let (code, _, stderr) = finish(run);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(item_status(&fx, 1), "landed");
+    let job = &jobs(&fx)[0];
+    assert!(job["comparison"].is_null(), "{job}");
+    assert_eq!(job["could_not_run"].as_array().unwrap().len(), 1, "{job}");
+    let status = fx.mq_ok(&["donor", "status"]);
+    assert!(status.contains("could not run: 1 receipt(s)"), "{status}");
+    assert!(!status.contains("receipts match"), "{status}");
+}
+
+#[test]
+fn a_donor_that_cannot_execute_the_validator_declines() {
+    let fx = Fixture::new("donor-exec-missing");
+    fx.mq_ok(&[
+        "init",
+        "--validator",
+        "command",
+        "--validator-run",
+        r#"if [ -n "$DONOR" ]; then mq-missing-tool-xyz; else exit 0; fi"#,
+        "--offload",
+        "decide",
+    ]);
+    set_config(&fx, |config| {
+        config["donors"] = serde_json::json!({"claim_timeout_secs": 4})
+    });
+    two_changes(&fx);
+    let clone = donor_clone(&fx, "donor-host");
+    let run = spawn_run(&fx, &[]);
+    wait_for("a published job", Duration::from_secs(30), || {
+        !jobs(&fx).is_empty()
+    });
+    let out = donor(&fx, &clone, "d1", &[("DONOR", "1")]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("DECLINED"), "{stderr}");
+    assert!(
+        stderr.contains("this donor cannot run the validator")
+            && stderr.contains("exit 127")
+            && stderr.contains("PATH="),
+        "{stderr}"
+    );
+    let (code, report, _) = finish(run);
+    assert_eq!(code, Some(3));
+    assert!(report["ejected"].as_array().unwrap().is_empty(), "{report}");
+    let job = &jobs(&fx)[0];
+    assert!(job["receipt"].is_null(), "{job}");
+    assert_eq!(job["declined_by"], serde_json::json!(["d1"]), "{job}");
+}
+
+#[test]
+fn a_donor_clone_of_another_repository_refuses_to_start() {
+    let fx = Fixture::new("donor-origin");
+    fx.mq_ok(&[
+        "init",
+        "--validator",
+        "command",
+        "--validator-run",
+        "exit 0",
+        "--offload",
+        "decide",
+    ]);
+    let clone = donor_clone(&fx, "donor-host");
+    let origin = git(&clone, &["remote", "get-url", "origin"])
+        .trim()
+        .to_owned();
+    // The same repository in another form is accepted.
+    git(
+        &clone,
+        &["remote", "set-url", "origin", &format!("file://{origin}/")],
+    );
+    let out = donor(&fx, &clone, "d1", &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("the same repository in another form"),
+        "{stderr}"
+    );
+    // Another repository is refused before claiming anything.
+    git(&fx.root, &["init", "-q", "--bare", "other.git"]);
+    let other = fx.root.join("other.git").display().to_string();
+    git(&clone, &["remote", "set-url", "origin", &other]);
+    let out = donor(&fx, &clone, "d1", &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(stderr.contains("not the queue's repository"), "{stderr}");
+}
+
 #[test]
 fn offload_off_publishes_nothing() {
     let fx = Fixture::new("donor-off");

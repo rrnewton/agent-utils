@@ -369,10 +369,14 @@ service does not inherit a login shell's `PATH`, so the installer resolves the t
 directory at install time (from `rustup which cargo`, then `cargo` on `PATH`, then
 `$CARGO_HOME/bin` or `~/.cargo/bin`; override with `--toolchain-bin DIR`) and writes it
 as an absolute `Environment=PATH=...` in the rendered unit. At startup `serve` also
-refuses, naming the missing tool (for example `cargo not found`), when any executable
-its configured regenerate/validator commands name does not resolve. Relative paths such as
-`common/bin/dagrun` name files inside the candidate checkout, which exist only at run time,
-so they are not checked.
+refuses, naming the missing tool (for example `cargo not found`) and the `PATH` it searched,
+when any executable its configured regenerate/validator commands name does not resolve. Relative
+paths such as `common/bin/dagrun` name files inside the candidate checkout, which exist only at
+run time, so they are not checked. Tools such a wrapper calls are not checked either. A tool
+missing at run time is an infrastructure refusal (see **A validator that cannot execute** under
+Validators), never a red verdict. Set an explicit `Environment=PATH=...` in any unit you write
+yourself, naming every directory the validator and the tools it calls live in: a service's
+default `PATH` is much shorter than a login shell's.
 
 The unit sets `KillMode=mixed`, so `systemctl stop` (or a restart) signals only the daemon. The
 daemon then cancels its own validations and records them as cancelled before it exits (see
@@ -693,6 +697,24 @@ future, `plan` holds the change as `validation-refused`; after it passes, the ne
 validates it again. A refusal in a culprit-search probe or a widening run defers the same way
 (no culprit is named, no obligation is discharged or marked red).
 
+**A validator that cannot execute is a refusal too.** When the runner (or the admission prefix,
+or the dagrun launcher) cannot be started, or it exits `126` (a command was found but could not
+run) or `127` (a command was not found, which is the shell's answer when the validator or a tool
+it calls is missing from `PATH`) without reporting a failed test itself, validation never ran.
+The host is at fault, not the change, so this is handled exactly like an admission refusal:
+there is no verdict, the change stays queued, and the validation is retried with backoff. The
+refusal reason names what happened, the command, the `PATH` it ran with and the runner's last
+output line, for example:
+
+```text
+the validator could not execute (exit 127: a command was not found): command sh -c 'sh ./validate.sh'; PATH=/usr/bin:/bin; last output: ./validate.sh: line 1: mytool: command not found
+```
+
+The reason goes into the item's `last_refusal` and history, the run report's `deferred` entry,
+and the `refusal-deferred` notification. `serve` also prints it as an `ALARM:` line and keeps it
+in the heartbeat's `last_error` until a clean cycle. A runner that reports failed tests and then
+exits `127` is still red: its own results are evidence.
+
 **Verdict lines.** A `command` runner that writes no results file but prints dagrun-style verdict
 lines (`[step] ✓ PASS ...`, `[step] ✗ FAIL ...`, `[step] SKIPPED ...`) is still attributed per
 step from its output.
@@ -742,6 +764,16 @@ exactly the in-process path. The two other modes:
   validating by running a donor of its own (`donor run --queue 'merge-queue --repo QUEUE'
   --clone QUEUE --name local --jobs 2`), so its local capacity is one donor among several.
   Remote donors add capacity.
+
+**Donor setup: the same repository.** `--clone` must be a clone of the queue's repository.
+Before it claims anything, `donor run` asks the queue host for its repository's remote URL
+(`donor info`) and compares it with the URL of its own `--remote`. A different repository
+refuses to start. The same repository in another URL form is accepted with a note: `https://`,
+`ssh://`, scp-like `git@host:path`, with or without `.git`, a trailing `/`, a user or a port.
+`donor info` also reports the queue host's merge-queue revision, and a donor whose revision
+differs warns at startup. A validator that checks its checkout's origin itself should compare
+the same way. `merge-queue donor same-repository URL URL` exits `0` when two URLs name one
+repository and prints both normalized forms.
 
 **Transport: no new ports.** A donor reaches the queue only by running this tool on the queue
 host through its `--queue` route. Each request appends its arguments to the route, for example
@@ -811,6 +843,15 @@ The queue accepts it only if all of these hold:
 
 Every refusal is recorded in the job's history. Validation timeouts are the validator's own
 (`validator.timeout_secs`), enforced on the donor exactly as locally.
+
+**Validation that never ran on a donor.** A donor that cannot execute the validator (see
+**A validator that cannot execute**) declines the job with that reason and backs off, and it
+sends no receipt. A receipt that says validation could not run (admission refused, exit `75` or
+`COULD_NOT_RUN`) is no verdict in either mode. The job goes back to the queue, and the attempt
+is recorded in the job's `could_not_run` list. `donor status` shows "could not run: N
+receipt(s)", and compare mode compares nothing for it. In `decide` mode the waiting run prints an
+`ALARM:` line naming the donor. A donor that answers this way three times for one job is left
+out of that job.
 
 **Stops, discards and dead candidates.** A stop request or a discarded speculative candidate
 cancels the job. So does a candidate the queue no longer wants:
