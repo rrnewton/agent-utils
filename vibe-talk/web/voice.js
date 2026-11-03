@@ -11867,15 +11867,14 @@ function reopenSavedView() {
     showView("discord");
     returnToSavedPlace();
     holdChannelPlace();
-    reopenReadOwed = { after: replayLedger.started() };
+    reopenReadOwed.owe(replayLedger.started());
   }
   saveUiState();
 }
 
 /**
- * The read a reopen owes the channel it put on screen, or null: `after` is the count of timeline
- * reads when it was owed, so a read the reader made since — by the switch, by changing channel —
- * has read the channel and paid it.
+ * The read a reopen owes the channel it put on screen: one owner in web/src/core/sync/reopen.ts (`#624
+ * voice-page-modularity`), which says why it waits.
  *
  * NOT READ AT LOAD, though the rows are drawn then. A read sent before `/client-config` answers
  * uses a token nobody has proved: refused, its failure lands over sign-in's own explanation of the
@@ -11884,7 +11883,7 @@ function reopenSavedView() {
  * tail — an agent's placeholder edited in place, on nearly every reopen — waits on it in vain, and
  * makes a second read of the same newest page.
  */
-let reopenReadOwed = null;
+const reopenReadOwed = createReopenRead();
 
 /**
  * Read what the reopen put on screen, once sign-in has answered: at once on a channel without
@@ -11892,13 +11891,12 @@ let reopenReadOwed = null;
  * has attached. A refusal reads nothing, and leaves it owed to the token that replaces this one.
  */
 function payReopenRead() {
-  const owed = reopenReadOwed;
+  const owed = reopenReadOwed.take();
   if (!owed) return;
-  reopenReadOwed = null;
   const pay = () => {
     // Signed out while it waited: owed to the next sign-in, as after a refusal.
     if (!token()) {
-      reopenReadOwed = reopenReadOwed || owed;
+      reopenReadOwed.keep(owed);
       return;
     }
     if (screens.view() !== "discord" || replayLedger.started() !== owed.after) return;

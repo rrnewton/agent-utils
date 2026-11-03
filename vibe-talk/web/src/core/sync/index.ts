@@ -36,3 +36,5 @@ export { createChannelReads } from "./reads.ts";
 export type { ChannelReads } from "./reads.ts";
 export { createArrivalCount, createChannelInFlight } from "./inflight.ts";
 export type { ArrivalCount, ChannelInFlight } from "./inflight.ts";
+export { createReopenRead } from "./reopen.ts";
+export type { OwedRead, ReopenRead } from "./reopen.ts";

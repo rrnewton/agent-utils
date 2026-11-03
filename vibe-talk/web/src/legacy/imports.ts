@@ -43,6 +43,7 @@ export {
   createMutationRefresh,
   createReadHolds,
   createReadOrder,
+  createReopenRead,
   createReplayLedger,
   createStandInRetries,
   createStreamGeneration,

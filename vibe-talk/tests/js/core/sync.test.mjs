@@ -497,3 +497,17 @@ test("`#624 voice-page-modularity`: one read of a kind on the wire per channel, 
   const arrivals = createArrivalCount();
   assert.deepStrictEqual([arrivals.count(), arrivals.next(), arrivals.next(), arrivals.count()], [0, 1, 2, 2]);
 });
+
+test("`#624 voice-page-modularity`: a reopen owes one read, taken once, and kept for later where nothing newer is owed", () => {
+  const { createReopenRead } = SYNC;
+  const reopen = createReopenRead();
+  assert.equal(reopen.take(), null);
+  reopen.owe(3);
+  const owed = reopen.take();
+  assert.deepStrictEqual([owed, reopen.take()], [{ after: 3 }, null]);
+  reopen.keep(owed);
+  assert.deepStrictEqual(reopen.take(), { after: 3 }, "kept for the next sign-in");
+  reopen.owe(5);
+  reopen.keep(owed);
+  assert.deepStrictEqual(reopen.take(), { after: 5 }, "a newer debt is not replaced by the old one");
+});

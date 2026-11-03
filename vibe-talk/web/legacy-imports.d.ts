@@ -62,6 +62,7 @@ declare const createReadHolds: LegacyImports["createReadHolds"];
 declare const createReadOrder: LegacyImports["createReadOrder"];
 declare const createReplayLedger: LegacyImports["createReplayLedger"];
 declare const createChannelReads: LegacyImports["createChannelReads"];
+declare const createReopenRead: LegacyImports["createReopenRead"];
 declare const createArrivalCount: LegacyImports["createArrivalCount"];
 declare const createChannelInFlight: LegacyImports["createChannelInFlight"];
 declare const createStandInRetries: LegacyImports["createStandInRetries"];
