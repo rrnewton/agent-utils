@@ -6455,10 +6455,11 @@ _CENSORED_STORE_CSV = (
 )
 
 #: What ``g.learned``'s six identical 2147483648 B samples must produce, written out literally:
-#: the 9/10 nearest-rank percentile of six equal values is that value, plus the 20% margin
-#: (429496729 B). Naming it here rather than recomputing it from the builds' own constants is
-#: what makes this a contract instead of a restatement of whatever they currently do.
-_LEARNED_EXPECTED_BYTES = 2576980377
+#: the 9/10 nearest-rank percentile of six equal values is that value, plus the #818 margin
+#: (max(25%, 512 MiB) = 536870912 B). Naming it here rather than recomputing it from the builds'
+#: own constants is what makes this a contract instead of a restatement of whatever they
+#: currently do.
+_LEARNED_EXPECTED_BYTES = 2684354560
 
 #: Every step that this store makes the builds DECLINE authors a hint of 17179869184 B, above the
 #: largest peak any of them recorded (8589934592 B for ``g.pinned``, 2147483648 B for the rest).
@@ -6494,7 +6495,8 @@ def _memory_feedback_reaches_admission(
 
     Without the flag the authored floor survives and admission models 53687091200 B. With the
     explicit flag, six uncensored samples are enough to lower that floor: the censoring-aware
-    estimate adds the 20% feedback margin (25769803776 B), then admission models 32212254720 B.
+    estimate adds the #818 margin (peak + max(25%, 512 MiB) = 26843545600 B), then admission
+    models 33554432000 B.
     Both are named literally: this proves that ordinary feedback cannot lower an author's number
     while the deliberately requested, evidence-gated path still can.
     """
@@ -6535,10 +6537,10 @@ def _memory_feedback_reaches_admission(
     }
     if (
         seen != {"py/off": "53687091200", "rs/off": "53687091200",
-                 "py/on": "32212254720", "rs/on": "32212254720"}
+                 "py/on": "33554432000", "rs/on": "33554432000"}
         or any(o.returncode != 0 for o in (*off.values(), *on.values()))
-        or "rss_baseline_bytes=25769803776" not in on["py"].stderr
-        or "rss_baseline_bytes=25769803776" not in on["rs"].stderr
+        or "rss_baseline_bytes=26843545600" not in on["py"].stderr
+        or "rss_baseline_bytes=26843545600" not in on["rs"].stderr
     ):
         rep.bad("memory-feedback/reaches-max-mem-admission", f"footprints={seen!r}")
     else:

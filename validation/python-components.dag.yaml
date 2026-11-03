@@ -344,7 +344,16 @@ steps:
     labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
     timeout: 1500
     cpu_timeout: 2400
-    hint: *wrkslots_test_hint
+    # #818: this shard holds test_reanchor_liveness.py, which runs `cargo test -p agentctl`
+    # inside the step; measured uncapped peak inside dagrun is 4.2 GiB, so its baseline is
+    # sized from that peak (cap = baseline x 1.25 keeps the peak + max(25%, 512 MiB) rule),
+    # not from the 1.5 GiB anchor the other shards share.
+    hint:
+      resources: {lifecycle-io: 1}
+      est_duration_s: 300
+      classification: latency-bound
+      preferred_inner_jobs: 2
+      rss_baseline_bytes: 5153960755
 
   - group: wrkslots
     job: shard-4

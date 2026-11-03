@@ -26,6 +26,7 @@ from dagrun.memory_feedback import (
 from dagrun.model import DagConfig, IntentionalSkipReason, ResourceHint, Step
 
 GIB = 1024**3
+MIB = 1024**2
 
 
 def _row(
@@ -204,23 +205,33 @@ def test_the_legacy_oom_column_still_censors_when_the_event_counter_is_absent() 
 def test_enough_quiet_samples_produce_a_percentile_estimate_with_margin() -> None:
     """The expected bytes are written out LITERALLY. Recomputing them from
     ``DEFAULT_MARGIN_PCT`` would pin the arithmetic to whatever the constant happens to be, so
-    changing 20 to 0 would leave the test green while every learned cap lost its headroom."""
+    changing 25 to 0 would leave the test green while every learned cap lost its headroom."""
     rows = [_row(peak=str(2 * GIB)) for _ in range(6)]
 
     admission = memory_admission_from_rows(rows)["g.build"]
 
     assert admission.source == "profile"
     assert admission.uncensored_samples == 6
-    assert admission.margin_pct == 20
+    assert admission.margin_pct == 25
     # Every sample is exactly 2147483648 B, so the 9/10 percentile is 2147483648 B and the whole
-    # difference is the 20% margin: 2147483648 + 429496729 = 2576980377.
-    assert admission.rss_baseline_bytes == 2576980377
+    # difference is the 25% margin: 2147483648 + 536870912 = 2684354560 (#818: peak plus
+    # max(25%, 512 MiB), never exactly the peak).
+    assert admission.rss_baseline_bytes == 2684354560
     assert not admission.censoring_excluded_samples()
 
 
-def test_the_default_margin_is_twenty_percent() -> None:
+def test_a_small_peak_gets_the_512_mib_margin_floor() -> None:
+    """#818: for a small peak the 512 MiB floor beats 25%, so the cap is P + 512 MiB."""
+    rows = [_row(peak=str(100 * MIB)) for _ in range(6)]
+
+    admission = memory_admission_from_rows(rows)["g.build"]
+
+    assert admission.rss_baseline_bytes == 100 * MIB + 512 * MIB
+
+
+def test_the_default_margin_is_twenty_five_percent() -> None:
     """Named once, here, so a change to the shipped headroom has to be made deliberately."""
-    assert DEFAULT_MARGIN_PCT == 20
+    assert DEFAULT_MARGIN_PCT == 25
 
 
 def test_the_default_minimum_uncensored_sample_count_is_five() -> None:
@@ -263,7 +274,8 @@ def test_the_estimate_never_falls_below_the_largest_censored_peak() -> None:
     assert admission.uncensored_samples == 5
     assert admission.censored_samples == 1
     assert admission.censored_floor_bytes == 8 * GIB
-    assert admission.rss_baseline_bytes == 8 * GIB
+    # The floor plus #818 headroom: 8589934592 + 2147483648.
+    assert admission.rss_baseline_bytes == 10737418240
     assert admission.censoring_excluded_samples()
 
 
@@ -271,8 +283,9 @@ def test_the_estimate_never_falls_below_the_largest_uncensored_peak() -> None:
     """The percentile can sit under the maximum; the maximum is a thing that really happened.
 
     Nine 1 GiB samples and one 6 GiB sample: n=10, so the 9/10 nearest-rank percentile is the
-    9th smallest (1073741824 B) and +20% is 1288490188 B — under the 6442450944 B this step
-    really used. The floor, not the percentile, must decide, and the number is named literally.
+    9th smallest (1073741824 B) — far under the 6442450944 B this step really used. The
+    largest peak, not the percentile, must decide, with #818 headroom over it:
+    6442450944 + 1610612736 = 8053063680, named literally.
     """
     rows = [_row(peak=str(GIB)) for _ in range(9)]
     rows.append(_row(peak=str(6 * GIB)))
@@ -282,7 +295,7 @@ def test_the_estimate_never_falls_below_the_largest_uncensored_peak() -> None:
     assert admission.observed_peak_bytes == 6 * GIB
     assert admission.rss_baseline_bytes is not None
     assert admission.rss_baseline_bytes >= 6 * GIB
-    assert admission.rss_baseline_bytes == 6442450944
+    assert admission.rss_baseline_bytes == 8053063680
 
 
 def test_every_peak_censored_keeps_the_static_hint_and_says_so() -> None:
@@ -633,8 +646,8 @@ def test_the_derived_baseline_reaches_max_mem_admission(tmp_path: Path) -> None:
 
     * Without the flag, the ordinary feedback takes the peak at face value: 21474836480 B, and
       ``--max-mem`` models a worst case of 26843545600 B.
-    * With it, the censoring-aware estimate adds the 20% margin (25769803776 B) and the modeled
-      worst case rises to 32212254720 B.
+    * With it, the censoring-aware estimate adds the #818 margin (peak + max(25%, 512 MiB) =
+      26843545600 B) and the modeled worst case rises to 33554432000 B.
 
     Both numbers are named literally. A wiring change that applied the estimate AFTER admission
     had already read the config would leave the second equal to the first.
@@ -663,8 +676,8 @@ def test_the_derived_baseline_reaches_max_mem_admission(tmp_path: Path) -> None:
     assert off_rc == 0, off_err
     assert on_rc == 0, on_err
     assert "worst-case 26843545600 bytes" in off_err, off_err
-    assert "rss_baseline_bytes=25769803776" in on_err, on_err
-    assert "worst-case 32212254720 bytes" in on_err, on_err
+    assert "rss_baseline_bytes=26843545600" in on_err, on_err
+    assert "worst-case 33554432000 bytes" in on_err, on_err
 
 
 def test_a_censored_peak_cannot_reach_max_mem_admission_once_the_flag_is_on(

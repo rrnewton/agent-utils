@@ -2178,11 +2178,13 @@ class Runner:
             self._emit(f"[{step.tag}] ✗ FAIL   {step.desc} ({dur}s, {outcome.reason})")
             if oomed:
                 self._emit(
-                    f"[{step.tag}] ▲ MEMORY CAP HIT: the kernel reported an OOM at its "
+                    f"[{step.tag}] ▲ MEMORY CAP PROBLEM: [{step.tag}] was OOM-killed at its "
                     f"inner cgroup "
                     f"MemoryMax (cap≈{_fmt_bytes(mem_max)}, peak≈{_fmt_bytes(peak)}). "
-                    "Confirm this is genuine growth, not an unbounded leak, before raising the "
-                    "step's rss_baseline_bytes / hard_mem_max_bytes hint."
+                    "This is a cap problem, not a test failure: re-profile the step and size "
+                    "its cap above the recorded peaks with headroom (peak + max(25%, 512 MiB)); "
+                    "raise rss_baseline_bytes / hard_mem_max_bytes only after confirming the "
+                    "growth is genuine, not an unbounded leak."
                 )
             if pids_events > 0:
                 self._emit(

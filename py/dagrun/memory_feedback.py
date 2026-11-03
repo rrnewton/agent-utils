@@ -49,6 +49,7 @@ from dagrun.model import DagConfig, Step
 
 __all__ = [
     "DEFAULT_MARGIN_PCT",
+    "MIN_MARGIN_BYTES",
     "DEFAULT_MIN_UNCENSORED_SAMPLES",
     "Censoring",
     "PeakObservation",
@@ -64,9 +65,13 @@ __all__ = [
 #: sample is a measurement, not a distribution; a cap derived from it would move on every run.
 DEFAULT_MIN_UNCENSORED_SAMPLES = 5
 
-#: Headroom added above the percentile, as a percentage. The percentile describes the samples
-#: that were taken; the margin covers the run that has not happened yet.
-DEFAULT_MARGIN_PCT = 20
+#: Headroom added above the largest considered peak, as a percentage. The samples describe the
+#: runs that were taken; the margin covers the run that has not happened yet.
+DEFAULT_MARGIN_PCT = 25
+
+#: Smallest headroom above a peak, in bytes: a small step's percentage alone would leave it
+#: bytes from its ceiling, so the margin is ``max(25%, 512 MiB)`` (#818).
+MIN_MARGIN_BYTES = 536_870_912
 
 
 class Censoring(Enum):
@@ -326,12 +331,12 @@ def memory_admission_from_rows(
     cap learned from two different workloads, and the count of rows dropped for this reason is
     reported in the reason string rather than being silently absorbed.
 
-    The estimate for a step with enough uncensored evidence is::
+    The estimate for a step with enough uncensored evidence is the largest of the percentile,
+    the largest uncensored peak, and the largest censored peak, plus headroom of
+    ``max(25%, 512 MiB)`` over that largest peak (#818).
 
-        max(percentile(uncensored peaks) * (1 + margin), max uncensored peak, max censored peak)
-
-    The percentile is the central estimate; the two maxima are floors. A censored peak reaches
-    the result ONLY through that floor, so it can raise a cap and can never lower one.
+    The two maxima are floors. A censored peak reaches the result ONLY through that floor, so
+    it can raise a cap and can never lower one, and the result is never exactly a peak.
     """
     observations: dict[str, list[PeakObservation]] = {}
     dropped_by_sha: dict[str, int] = {}
@@ -435,9 +440,16 @@ def _admission_for_step(
             ),
         )
     central = _high_percentile(uncensored)
-    with_margin = central + (central * margin_pct) // 100
-    estimate = max(with_margin, observed or 0, floor or 0)
-    detail = f"{len(uncensored)} uncensored sample(s), {_PERCENTILE} percentile +{margin_pct}%"
+    # The cap keeps headroom above the LARGEST considered peak — the percentile, the largest
+    # uncensored peak, and the censored floor alike — never exactly at it (#818): the margin is
+    # max(margin_pct%, MIN_MARGIN_BYTES), so a step that once touched its ceiling is next given
+    # strictly more than it proved it needs.
+    peak_base = max(central, observed or 0, floor or 0)
+    estimate = peak_base + max((peak_base * margin_pct) // 100, MIN_MARGIN_BYTES)
+    detail = (
+        f"{len(uncensored)} uncensored sample(s), {_PERCENTILE} percentile "
+        f"+{margin_pct}% (min 512 MiB headroom)"
+    )
     if censored:
         detail += f", floored at the largest of {len(censored)} censored peak(s)"
     if unknown:

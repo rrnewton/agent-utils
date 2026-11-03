@@ -4504,10 +4504,12 @@ fn run_step(ctx: StepCtx) {
         )));
         if oomed {
             emit(&format!(
-                "[{tag}] \u{25b2} MEMORY CAP HIT: the kernel reported an OOM at its inner \
+                "[{tag}] \u{25b2} MEMORY CAP PROBLEM: [{tag}] was OOM-killed at its inner \
                  cgroup MemoryMax \
-                 (cap\u{2248}{}, peak\u{2248}{}). Confirm this is genuine growth, not an unbounded \
-                 leak, before raising the step's rss_baseline_bytes / hard_mem_max_bytes hint.",
+                 (cap\u{2248}{}, peak\u{2248}{}). This is a cap problem, not a test failure: \
+                 re-profile the step and size its cap above the recorded peaks with headroom \
+                 (peak + max(25%, 512 MiB)); raise rss_baseline_bytes / hard_mem_max_bytes only \
+                 after confirming the growth is genuine, not an unbounded leak.",
                 fmt_bytes(mem_max),
                 fmt_bytes(peak)
             ));

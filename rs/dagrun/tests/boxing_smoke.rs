@@ -72,8 +72,8 @@ fn boxing_oom_kills_a_step_past_its_cap() {
         "boxed run should FAIL (exit 1) when the step is OOM-killed; got {code:?}\n{combined}"
     );
     assert!(
-        combined.contains("OOM-KILLED") || combined.contains("MEMORY CAP HIT"),
-        "expected an OOM-KILLED / MEMORY CAP HIT report proving the inner memory cap fired:\n{combined}"
+        combined.contains("OOM-KILLED") || combined.contains("MEMORY CAP PROBLEM"),
+        "expected an OOM-KILLED / MEMORY CAP PROBLEM report proving the inner memory cap fired:\n{combined}"
     );
 }
 
@@ -178,7 +178,7 @@ fn boxed_oom_does_not_truncate_a_neighbour_artifact() {
     );
     assert!(
         combined.contains("mem.offender")
-            && (combined.contains("OOM-KILLED") || combined.contains("MEMORY CAP HIT")),
+            && (combined.contains("OOM-KILLED") || combined.contains("MEMORY CAP PROBLEM")),
         "failure attribution must name the OOM offender:\n{combined}"
     );
     let owns_outer_scope = combined.contains("containment OBSERVED");

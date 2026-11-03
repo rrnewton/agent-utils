@@ -102,7 +102,7 @@ fn default_small_cap_boxes_an_undeclared_step() {
          {breach_code:?}\n{breach_out}"
     );
     assert!(
-        breach_out.contains("OOM-KILLED") || breach_out.contains("MEMORY CAP HIT"),
+        breach_out.contains("OOM-KILLED") || breach_out.contains("MEMORY CAP PROBLEM"),
         "expected the inner memory cap to fire on the undeclared step:\n{breach_out}"
     );
 
@@ -178,7 +178,7 @@ fn unsafe_no_cgroups_is_the_explicit_opt_out() {
          {code:?}\n{out}"
     );
     assert!(
-        !out.contains("OOM-KILLED") && !out.contains("MEMORY CAP HIT"),
+        !out.contains("OOM-KILLED") && !out.contains("MEMORY CAP PROBLEM"),
         "no inner memory cap must fire in the deliberate unboxed mode:\n{out}"
     );
     assert!(

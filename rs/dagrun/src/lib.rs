@@ -80,7 +80,7 @@ pub use io::{
 pub use memory_feedback::{
     apply_memory_admissions, load_memory_admissions, memory_admission_from_rows,
     memory_admission_line, peak_observation_from_row, Censoring, MemoryAdmission, PeakObservation,
-    DEFAULT_MARGIN_PCT, DEFAULT_MIN_UNCENSORED_SAMPLES,
+    DEFAULT_MARGIN_PCT, DEFAULT_MIN_UNCENSORED_SAMPLES, MIN_MARGIN_BYTES,
 };
 pub use model::{
     cmdtype_env_with_inner_jobs, cmdtype_extra_args, command_uses_extra_args,

@@ -36,9 +36,13 @@ use crate::model::{DagConfig, Step};
 /// sample is a measurement, not a distribution; a cap derived from it would move on every run.
 pub const DEFAULT_MIN_UNCENSORED_SAMPLES: usize = 5;
 
-/// Headroom added above the percentile, as a percentage. The percentile describes the samples that
-/// were taken; the margin covers the run that has not happened yet.
-pub const DEFAULT_MARGIN_PCT: i64 = 20;
+/// Headroom added above the largest considered peak, as a percentage. The samples describe the
+/// runs that were taken; the margin covers the run that has not happened yet.
+pub const DEFAULT_MARGIN_PCT: i64 = 25;
+
+/// Smallest headroom above a peak, in bytes: a small step's percentage alone would leave it
+/// bytes from its ceiling, so the margin is `max(25%, 512 MiB)` (#818).
+pub const MIN_MARGIN_BYTES: i64 = 536_870_912;
 
 const RSS_PCTL_NUM: i64 = 9;
 const RSS_PCTL_DEN: i64 = 10;
@@ -313,10 +317,10 @@ impl MemoryAdmission {
 /// `profile_base_sha`, when given, restricts the evidence to rows recorded against that source
 /// revision; the count dropped for that reason is reported in the reason rather than absorbed.
 ///
-/// The estimate for a step with enough uncensored evidence is
-/// `max(percentile(uncensored) * (1 + margin), max uncensored, max censored)`. The percentile is
-/// the central estimate; the two maxima are floors, so a censored peak can raise a cap and can
-/// never lower one.
+/// The estimate for a step with enough uncensored evidence is the largest of the percentile,
+/// the largest uncensored peak, and the largest censored peak, plus headroom of
+/// `max(25%, 512 MiB)` over that largest peak (#818). The two maxima are floors, so a censored
+/// peak can raise a cap and can never lower one, and the result is never exactly a peak.
 pub fn memory_admission_from_rows(
     rows: &[HashMap<String, String>],
     min_uncensored_samples: usize,
@@ -451,12 +455,14 @@ fn admission_for_step(
         return admission;
     }
     let central = high_percentile(&uncensored);
-    let with_margin = central + (central * margin_pct) / 100;
-    let estimate = with_margin
-        .max(observed.unwrap_or(0))
-        .max(floor.unwrap_or(0));
+    // The cap keeps headroom above the LARGEST considered peak — the percentile, the largest
+    // uncensored peak, and the censored floor alike — never exactly at it (#818): the margin is
+    // max(margin_pct%, MIN_MARGIN_BYTES), so a step that once touched its ceiling is next given
+    // strictly more than it proved it needs.
+    let base = central.max(observed.unwrap_or(0)).max(floor.unwrap_or(0));
+    let estimate = base + (base * margin_pct / 100).max(MIN_MARGIN_BYTES);
     let mut detail = format!(
-        "{} uncensored sample(s), {} percentile +{margin_pct}%",
+        "{} uncensored sample(s), {} percentile +{margin_pct}% (min 512 MiB headroom)",
         uncensored.len(),
         admission.percentile
     );
@@ -791,7 +797,7 @@ mod tests {
     fn enough_quiet_samples_produce_a_percentile_estimate_with_margin() {
         // The expected bytes are written out LITERALLY. Recomputing them from
         // DEFAULT_MARGIN_PCT would pin the arithmetic to whatever the constant happens to be, so
-        // changing 20 to 0 would leave the test green while every learned cap lost its headroom.
+        // changing 25 to 0 would leave the test green while every learned cap lost its headroom.
         let rows: Vec<_> = (0..6)
             .map(|_| row(&[("peak_bytes", "2147483648")]))
             .collect();
@@ -804,17 +810,34 @@ mod tests {
         let a = &admissions["g.build"];
         assert_eq!(a.source, "profile");
         assert_eq!(a.uncensored_samples, 6);
-        assert_eq!(a.margin_pct, 20);
+        assert_eq!(a.margin_pct, 25);
         // Every sample is exactly 2147483648 B, so the 9/10 percentile is 2147483648 B and the
-        // whole difference is the 20% margin: 2147483648 + 429496729 = 2576980377.
-        assert_eq!(a.rss_baseline_bytes, Some(2576980377));
+        // whole difference is the 25% margin: 2147483648 + 536870912 = 2684354560 (#818: peak
+        // plus max(25%, 512 MiB), never exactly the peak).
+        assert_eq!(a.rss_baseline_bytes, Some(2684354560));
         assert!(!a.censoring_excluded_samples());
     }
 
     #[test]
-    fn the_default_margin_is_twenty_percent() {
+    fn a_small_peak_gets_the_512_mib_margin_floor() {
+        // #818: for a small peak the 512 MiB floor beats 25%, so the cap is P + 512 MiB.
+        let rows: Vec<_> = (0..6)
+            .map(|_| row(&[("peak_bytes", "104857600")]))
+            .collect();
+        let admissions = memory_admission_from_rows(
+            &rows,
+            DEFAULT_MIN_UNCENSORED_SAMPLES,
+            DEFAULT_MARGIN_PCT,
+            None,
+        );
+        let a = &admissions["g.build"];
+        assert_eq!(a.rss_baseline_bytes, Some(104857600 + 536870912));
+    }
+
+    #[test]
+    fn the_default_margin_is_twenty_five_percent() {
         // Named once, here, so a change to the shipped headroom has to be made deliberately.
-        assert_eq!(DEFAULT_MARGIN_PCT, 20);
+        assert_eq!(DEFAULT_MARGIN_PCT, 25);
     }
 
     #[test]
@@ -915,9 +938,10 @@ mod tests {
     fn the_estimate_never_falls_below_the_largest_uncensored_peak() {
         // The percentile can sit under the maximum; the maximum is a thing that really happened.
         // Nine 1 GiB samples and one 6 GiB sample: n=10, so the 9/10 nearest-rank percentile is
-        // the 9th smallest = 1073741824 B, and +20% is 1288490188 B — under the 6442450944 B this
-        // step really used. The floor, not the percentile, must decide, and the expected number is
-        // written out literally so that removing the floor cannot leave this green.
+        // the 9th smallest = 1073741824 B — far under the 6442450944 B this step really used.
+        // The largest peak, not the percentile, must decide, with #818 headroom over it:
+        // 6442450944 + 1610612736 = 8053063680, written out literally so that removing the
+        // floor cannot leave this green.
         let mut rows: Vec<_> = (0..9).map(|_| row(&[])).collect();
         rows.push(row(&[("peak_bytes", "6442450944")]));
         let admissions = memory_admission_from_rows(
@@ -930,13 +954,14 @@ mod tests {
         assert_eq!(a.uncensored_samples, 10);
         assert_eq!(a.censored_samples, 0);
         assert_eq!(a.observed_peak_bytes, Some(6442450944));
-        assert_eq!(a.rss_baseline_bytes, Some(6442450944));
+        assert_eq!(a.rss_baseline_bytes, Some(8053063680));
     }
 
     #[test]
     fn the_estimate_never_falls_below_the_largest_censored_peak() {
-        // Five quiet 1 GiB samples would justify 1.2 GiB. One sample that hit an 8 GiB ceiling
-        // says the step has wanted 8 GiB at least once, so 1.2 GiB is a number it has exceeded.
+        // Five quiet 1 GiB samples would justify 1.5 GiB. One sample that hit an 8 GiB ceiling
+        // says the step has wanted 8 GiB at least once, so 1.5 GiB is a number it has exceeded;
+        // the estimate is that floor plus #818 headroom: 8589934592 + 2147483648.
         let mut rows: Vec<_> = (0..5).map(|_| row(&[])).collect();
         rows.push(row(&[
             ("peak_bytes", "8589934592"),
@@ -952,7 +977,7 @@ mod tests {
         assert_eq!(a.uncensored_samples, 5);
         assert_eq!(a.censored_samples, 1);
         assert_eq!(a.censored_floor_bytes, Some(8 * GIB));
-        assert_eq!(a.rss_baseline_bytes, Some(8 * GIB));
+        assert_eq!(a.rss_baseline_bytes, Some(10737418240));
     }
 
     #[test]
