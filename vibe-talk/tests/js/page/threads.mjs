@@ -9,7 +9,7 @@ import { join } from "node:path";
 
 import { WEB } from "../../../web/page_sources.mjs";
 
-import { brokenModule, BASE_CSS, BIG, BIG_ROOT, CHANNEL, CHARS_PER_LINE, CSS_CODE, CSS_UNCONDITIONAL,
+import { PAGE_CODE, brokenModule, BASE_CSS, BIG, BIG_ROOT, CHANNEL, CHARS_PER_LINE, CSS_CODE, CSS_UNCONDITIONAL,
   DESKTOP_QUERY, DISCORD_POLL_MS, FakeElement, HOLD_MS, HOVER_QUERY, HTML_CODE, LINE_PX,
   MESSAGE_CACHE_KEY, OTHER_CHANNEL, PRESENT_ROWS, SCRIPT, SCRIPT_CODE, SCROLLBACK_PX,
   SCROLL_VIEWPORT_PX, SETTINGS, SMALL, THREADS_MAIN_STORAGE, TWO_COLUMN_QUERY, UNPACK_STORAGE,
@@ -343,7 +343,8 @@ test("the floating chips keep their height clear above the composer, and never s
   // two-column-connectors`' links) may follow.
   assert.match(SCRIPT_CODE, /renderJumpNewest\(\);\s*(\/\/[^\n]*\n\s*)*placeChipsOverComposer\(\);[^{}]*\}, 0\);/,
     "the box moving without a scroll leaves the chips where they were");
-  assert.match(SCRIPT_CODE, /"--composer-top", `\$\{top\}px`/, "nothing writes the box's top edge for the stylesheet");
+  // Written by the chips' owner (web/src/view/shell `createChipsOverComposer`, `#624 voice-page-modularity`).
+  assert.match(PAGE_CODE, /"--composer-top", `\$\{top\}px`/, "nothing writes the box's top edge for the stylesheet");
 });
 
 test("ON THE CALL'S VIEW TOO, the chips' room growing under the box keeps a following reader at the foot", async () => {

@@ -12,7 +12,7 @@ import { WEB } from "../../../web/page_sources.mjs";
 import { BASE_CSS, BOTTOM_SLACK_PX, CHANNEL, CODER, COLLAPSE_OVER_CHARS, CSS_CODE, DESKTOP_QUERY,
   DISCORD_POLL_MS, HTML_CODE, MODULE_CODE, NOISE_MATCHING, OWN, OWN_READ_APPLY_ARM_MS, PAGE_ELEMENTS, PULL_ARM_PX,
   RUN_THREAD, SCRIPT, SCRIPT_CODE, SPEECH_PIECES, assertMarkupContains, atBottomOf, bookmarkAt,
-  brokenModule, brokenScript, channelRow, cssBlock, cssBlockIn, cssBlockOutside, cssRules,
+  PAGE_CODE, brokenModule, brokenScript, channelRow, cssBlock, cssBlockIn, cssBlockOutside, cssRules,
   delayedReply, deliver, doneButton, errorResponse, focusOn, foldButton, helpEntry, hold,
   inReadingMode, joined, json, keyboardPageAtTop, longMessage, mainOnlyThreadPage, markupPlace,
   message, newPage, openReplyOn, optionText, outgoingRetry, outgoingRows, outgoingSpinner,
@@ -1861,9 +1861,10 @@ test("`#451 read-strip-followups`: a moved strip is held in the window again whe
   assert.deepEqual(stripOffset(page), ["-450px", "-548px"],
     "a grip key after the growth started from the place the window no longer allows");
   // The composer's growth holds it by the same call, where the box's top edge is written: the
-  // fixture lays no box out, so this half is read where it is written, as its neighbours are.
-  const composerTop = SCRIPT_CODE.indexOf('"--composer-top"');
-  assert.ok(composerTop >= 0 && SCRIPT_CODE.slice(composerTop, composerTop + 400).includes("placeReadSteer()"),
+  // fixture lays no box out, so this half is read where it is written, as its neighbours are: in the page's
+  // code, its modules included (web/src/view/shell `createChipsOverComposer`, `#624 voice-page-modularity`).
+  const composerTop = PAGE_CODE.indexOf('"--composer-top"');
+  assert.ok(composerTop >= 0 && PAGE_CODE.slice(composerTop, composerTop + 400).includes("placeReadSteer()"),
     "the composer moving the strip's band holds no moved strip in the window");
 });
 

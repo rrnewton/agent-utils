@@ -414,55 +414,16 @@ if (typeof window.ResizeObserver === "function") {
 // stands the chips, and the status pill and the pull's report on them, on the higher of their own
 // place and that edge. On every scroll, so measured only near the end of the list: further up the
 // box is below the screen, and three numbers the jump reads already say so.
-let composerTop = 0;
-
-/** How far the status pill reaches above the chips, in rem: its gap and its least height (`#status-line`). */
-const CHIPS_PILL_REM = 2.4;
-
-function placeChipsOverComposer() {
-  let top = 0;
-  // `#269 approval-card-inline`. A draft waiting above the channel's box is part of what they stand
-  // on: they float over the messages above it, never over its Send. Docked under another screen, the
-  // pill stands on the card in the same way, and under the thread list too (`#281 view-keys`), where
-  // the channel's box is behind the list and out of sight.
-  const card = leftEl("post-confirm");
-  const carded = !card.hidden && card.parentNode === leftEl("pane-discord");
-  const docked = !card.hidden && card.getAttribute("data-place") === "dock";
-  if (currentScreen === "main" && currentView === "discord" && !docked) {
-    const area = leftEl("scroll-area");
-    const box = leftEl("channel-composer");
-    const below = area.scrollHeight - area.scrollTop - (area.clientHeight || 0);
-    const lowest = (box.offsetHeight || 0) + (carded ? card.offsetHeight || 0 : 0);
-    if (below < (area.clientHeight || 0) + lowest) {
-      const foot = leftEl("screen-main").getBoundingClientRect().bottom;
-      const edge = box.getBoundingClientRect();
-      const cardEdge = carded ? card.getBoundingClientRect() : null;
-      // The strip they float in at the foot: half a rem off it, the chips, and the pill over them.
-      // `#433 read-strip-low`: and the read-aloud strip between them while a read is up.
-      const steer = el("read-steer");
-      const strip = rootFontPx() * (0.5 + CHIPS_PILL_REM) + leftEl("scroll-tools").getBoundingClientRect().height +
-        (steer && !steer.hidden ? steer.getBoundingClientRect().height + rootFontPx() * 0.5 : 0);
-      const reaches = edge.bottom > foot - strip || (cardEdge !== null && cardEdge.bottom > foot - strip);
-      if (reaches) top = Math.max(0, Math.round(foot - (cardEdge ? cardEdge.top : edge.top)));
-    }
-  } else if (docked) {
-    top = Math.max(0, Math.round(leftEl("frame-body").getBoundingClientRect().bottom - card.getBoundingClientRect().top));
-    // `scrubber-full-width`. A phone's strip playing is a row at the screen's foot, over the card:
-    // what stands on the card stands on the strip as well (the stylesheet's floor for the strip is
-    // the larger of the two, not their sum).
-    const steer = el("read-steer");
-    if (steer && !steer.hidden && document.documentElement.getAttribute("data-read-strip") !== null &&
-        steer.getBoundingClientRect().bottom >= leftEl("screen-main").getBoundingClientRect().bottom - 1) {
-      top += Math.round(steer.getBoundingClientRect().height);
-    }
-  }
-  if (top === composerTop) return;
-  composerTop = top;
-  leftEl("frame-body").style.setProperty("--composer-top", `${top}px`);
-  // `#451 read-strip-followups`: the band the strip floats in just moved with the box, so a strip
-  // put somewhere on a desk is held inside the window against where it now docks.
-  readAloudOwner().placeReadSteer();
-}
+// (web/src/view/shell `createChipsOverComposer`, `#624 voice-page-modularity`; `CHIPS_PILL_REM` there.)
+const chipsOverComposer = createChipsOverComposer({
+  lookup: (id) => leftEl(id),
+  el: (id) => el(id),
+  onChannel: () => currentScreen === "main" && currentView === "discord",
+  rootFontPx: () => rootFontPx(),
+  root: () => document.documentElement,
+  placeReadSteer: () => readAloudOwner().placeReadSteer(),
+});
+const { placeChipsOverComposer } = chipsOverComposer;
 
 /**
  * The status line, the state dot beside it, the error panel and the connection details: one owner in

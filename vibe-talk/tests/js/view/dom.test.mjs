@@ -171,3 +171,33 @@ test("`#624 voice-page-modularity`: the error panel stays twelve seconds, or unt
   timers.at(-1).run();
   assert.equal(el("connection-banner").hidden, true);
 });
+
+test("`#624 voice-page-modularity`: the chips stand on the channel's box where it reaches into their strip", () => {
+  const { createChipsOverComposer } = VIEW_SHELL;
+  const props = new Map();
+  let steered = 0;
+  const box = (fields) => ({ hidden: false, offsetHeight: 0, parentNode: null, getAttribute: () => null,
+    getBoundingClientRect: () => ({ top: 0, bottom: 0, height: 0 }), ...fields });
+  const els = {
+    "post-confirm": box({ hidden: true }),
+    "pane-discord": box({}),
+    "scroll-area": box({ scrollHeight: 2000, scrollTop: 1600, clientHeight: 400 }),
+    "channel-composer": box({ offsetHeight: 80, getBoundingClientRect: () => ({ top: 700, bottom: 780 }) }),
+    "screen-main": box({ getBoundingClientRect: () => ({ bottom: 800 }) }),
+    "scroll-tools": box({ getBoundingClientRect: () => ({ height: 40 }) }),
+    "read-steer": box({ hidden: true }),
+    "frame-body": box({ style: { setProperty: (name, value) => props.set(name, value) } }),
+  };
+  const chips = createChipsOverComposer({
+    lookup: (id) => els[id], el: (id) => els[id], onChannel: () => true, rootFontPx: () => 16,
+    root: () => ({ getAttribute: () => null }), placeReadSteer: () => { steered += 1; },
+  });
+  chips.placeChipsOverComposer();
+  assert.equal(props.get("--composer-top"), "100px", "the box's top edge is 100px above the foot");
+  assert.equal(steered, 1);
+  chips.placeChipsOverComposer();
+  assert.equal(steered, 1, "nothing moved, nothing held again");
+  els["scroll-area"].scrollTop = 0;
+  chips.placeChipsOverComposer();
+  assert.equal(props.get("--composer-top"), "0px", "a box below the screen leaves them at the foot");
+});
