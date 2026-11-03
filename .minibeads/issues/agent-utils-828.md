@@ -1,13 +1,14 @@
 ---
 title: 'voice-page-read-nav-center: centre the N of M indicator in one row and keep React always visible'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 assignee: cl-refactor@devbig030
 labels:
 - vibe-talk
 created_at: 2026-11-03T22:00:33.282856901+00:00
-updated_at: 2026-11-03T22:00:33.282856901+00:00
+updated_at: 2026-11-03T23:50:21.706677800+00:00
+closed_at: 2026-11-03T23:50:21.706677660+00:00
 ---
 
 # Description
