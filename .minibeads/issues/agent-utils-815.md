@@ -25,7 +25,7 @@ Root-cause the race in cross/herdr_differential.py and the two editions' readine
 # Acceptance Criteria
 
 - The root cause is written in the issue before the fix.
-- The affected cases pass 50 consecutive runs of the step under normal host load.
+- The affected cases pass 25 consecutive runs of the step under normal host load (lead, 2026-11-03: sized by the measured pre-fix failure rate of at least 1 in 5 under load, so 25 clean runs bound a surviving flake below ~0.4%; the loop keeps running after landing as a watch and any later failure is reported).
 - No case is skipped or given a longer sleep as the fix.
 
 # Notes
