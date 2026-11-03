@@ -2675,7 +2675,34 @@ impl HerdrClient {
                 .is_some_and(|value| !value.is_empty()),
             foreground_matches,
             scroll_offset_from_bottom: info.scroll.map(|scroll| scroll.offset_from_bottom),
+            harness_binary_replaced: self
+                .harness_binary_replaced_with_cancellation(pane_id, cancelled),
         })
+    }
+    /// Whether a foreground process of `pane_id` runs an executable that was
+    /// replaced on disk after it started (its `/proc/PID/exe` link reads
+    /// `... (deleted)`). Read-only; any doubt is `false`.
+    pub fn harness_binary_replaced(&self, pane_id: &str) -> bool {
+        self.harness_binary_replaced_with_cancellation(pane_id, &|| false)
+    }
+    pub(crate) fn harness_binary_replaced_with_cancellation(
+        &self,
+        pane_id: &str,
+        cancelled: &dyn Fn() -> bool,
+    ) -> bool {
+        let Ok(state) = self.pane_process_state(pane_id, cancelled) else {
+            return false;
+        };
+        state
+            .processes
+            .iter()
+            .filter_map(|process| process.get("pid").and_then(Value::as_u64))
+            .filter(|pid| *pid != state.shell_pid)
+            .any(|pid| {
+                fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|target| {
+                    crate::submission::exe_link_replaced(&target.to_string_lossy())
+                })
+            })
     }
     /// Invoke and validate the corresponding Herdr agent-control operation.
     pub fn prompt_agent(&self, pane_id: &str, text: &str) -> Result<()> {

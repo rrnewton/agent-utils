@@ -3138,7 +3138,7 @@ fn held_hint(agent: &str, kind: &str, reason: &str) -> String {
     match kind {
         "composer-unreadable" => format!(
             "agentctl cannot find {agent}'s input box: the pane's terminal grid reads blank while \
-             Herdr reports the harness alive and working, so it types nothing. Look at the pane \
+             its harness is alive (the blank_grid state), so it types nothing. Look at the pane \
              (`agentctl attach {agent}`); if it stays blank, the harness has likely stopped \
              drawing (a redraw key did not help in the case seen): restart it on the same \
              session in that pane, then run `agentctl anchor {agent} --replace`. "

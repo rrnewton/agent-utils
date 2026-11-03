@@ -3042,8 +3042,11 @@ impl crate::blank_working::CoordinatorAlert for CoordinatorNotifier<'_> {
         use crate::agent_watch::Notifier as _;
         let text = format!(
             "blank-working: {agent} has shown a blank terminal grid for {minutes:.1} minutes \
-             (first seen at Unix {since:.0}) while its OSC title reports it working; its harness \
-             TUI may be hung. Inspect it with `agentctl status {agent}` and `agentctl read {agent}`."
+             (first seen at Unix {since:.0}) while its OSC title reports it working: the {state} \
+             state, its harness renderer silent while the agent runs. A resize or redraw does not \
+             restore it; restart the harness child-first with --resume. Inspect it with \
+             `agentctl status {agent}` and `agentctl read {agent}`.",
+            state = crate::submission::BLANK_GRID_STATE,
         );
         let message_id = format!("blank-working-{agent}-{since:.0}");
         self.notifier

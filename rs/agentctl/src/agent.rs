@@ -4607,6 +4607,7 @@ mod tests {
                         interactive_ready: true,
                         foreground_matches: true,
                         scroll_offset_from_bottom: Some(0),
+                        harness_binary_replaced: false,
                     }),
                     Duration::from_secs(15),
                 )
@@ -4636,6 +4637,7 @@ mod tests {
                 interactive_ready: true,
                 foreground_matches: true,
                 scroll_offset_from_bottom: Some(0),
+                harness_binary_replaced: false,
             });
         }
         let fake = FakeAgent::with_screen(screen);

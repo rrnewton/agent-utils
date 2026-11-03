@@ -116,6 +116,23 @@ pub enum Submission {
 /// it is never a `possibly_submitted` outcome (exit 76).
 pub const COMPOSER_UNREADABLE_KIND: &str = "composer_unreadable";
 
+/// The named state behind every [`COMPOSER_UNREADABLE_KIND`] refusal: the
+/// harness is alive in its pane but its terminal grid is empty. Long-running
+/// Claude Code processes were seen in it with their renderer silent (no frame
+/// written to the terminal, even after a resize) while the agent loop and the
+/// OSC title kept working. Every one had its binary replaced on disk since it
+/// started, though most such processes keep drawing, so the replacement is a
+/// marker rather than the cause. No resize or redraw restores the state; a
+/// child-first restart with `--resume` does (#836 herdr-blank-grid-claude).
+pub const BLANK_GRID_STATE: &str = "blank_grid";
+
+/// Whether a `/proc/PID/exe` link target names an executable that was
+/// replaced or removed on disk after the process started.
+#[must_use]
+pub fn exe_link_replaced(target: &str) -> bool {
+    target.ends_with(" (deleted)")
+}
+
 /// Herdr facts about one pane, probed without typing anything.
 ///
 /// `working` is Herdr's agent status (for example from the OSC title) rather
@@ -132,6 +149,9 @@ pub struct ComposerProbe {
     pub foreground_matches: bool,
     /// `scroll.offset_from_bottom` when Herdr reports geometry.
     pub scroll_offset_from_bottom: Option<u64>,
+    /// A foreground harness process runs an executable that was replaced on
+    /// disk after it started ([`exe_link_replaced`]).
+    pub harness_binary_replaced: bool,
 }
 
 /// Whether `screen`, once rendered, is blank: every cell whitespace.
@@ -145,6 +165,12 @@ pub fn is_ansi_blank(screen: &str) -> bool {
         .all(|(plain, _)| plain.iter().all(|c| c.is_whitespace()))
 }
 
+/// Whether `detail` reports the [`BLANK_GRID_STATE`].
+#[must_use]
+pub fn is_blank_grid(detail: &str) -> bool {
+    is_composer_unreadable(detail) && detail.contains(&format!(": {BLANK_GRID_STATE}:"))
+}
+
 /// Whether `detail` is a [`COMPOSER_UNREADABLE_KIND`] refusal.
 #[must_use]
 pub fn is_composer_unreadable(detail: &str) -> bool {
@@ -154,10 +180,13 @@ pub fn is_composer_unreadable(detail: &str) -> bool {
 /// The `composer_unreadable` refusal for `pane_id`, or `None`.
 ///
 /// Some only when the rendered screen is ansi-blank and `probe` proves the
-/// harness is still there and working (`working`, `interactive_ready` and a
-/// matching foreground pid). Every other blank or unreadable screen keeps the
-/// generic refusal, so a genuinely absent composer is never misclassified.
-/// The detail carries the blank and scroll facts for `delivery_error`.
+/// harness is still there (`interactive_ready` and a matching foreground pid)
+/// and either working or running a binary replaced on disk since it started
+/// (an idle harness in the [`BLANK_GRID_STATE`] shows no title spinner, but
+/// the replaced binary marks it). Every other blank or unreadable screen
+/// keeps the generic refusal, so a genuinely absent composer is never
+/// misclassified. The detail names the [`BLANK_GRID_STATE`], the blank,
+/// scroll and binary facts, and the cure, for `delivery_error`.
 pub fn composer_unreadable_reason(
     pane_id: &str,
     harness: &str,
@@ -166,7 +195,10 @@ pub fn composer_unreadable_reason(
     waited: Duration,
 ) -> Option<String> {
     let probe = probe?;
-    if !(probe.working && probe.interactive_ready && probe.foreground_matches) {
+    if !(probe.interactive_ready
+        && probe.foreground_matches
+        && (probe.working || probe.harness_binary_replaced))
+    {
         return None;
     }
     if !is_ansi_blank(screen) {
@@ -176,10 +208,15 @@ pub fn composer_unreadable_reason(
         .scroll_offset_from_bottom
         .map_or_else(|| "unknown".to_owned(), |offset| offset.to_string());
     Some(format!(
-        "{COMPOSER_UNREADABLE_KIND}: pane {pane_id} does not show a recognisable {harness} \
-         composer after {:.1}s; ansi_blank=true scroll_offset_from_bottom={scroll} \
-         working=true interactive_ready=true foreground_match=true; nothing was typed",
-        waited.as_secs_f64()
+        "{COMPOSER_UNREADABLE_KIND}: {BLANK_GRID_STATE}: pane {pane_id} does not show a \
+         recognisable {harness} composer after {:.1}s; ansi_blank=true \
+         scroll_offset_from_bottom={scroll} working={} interactive_ready=true \
+         foreground_match=true harness_binary_replaced={}; a resize or redraw does not \
+         restore this state: if it persists, restart the harness child-first with --resume; \
+         nothing was typed",
+        waited.as_secs_f64(),
+        probe.working,
+        probe.harness_binary_replaced,
     ))
 }
 
@@ -1864,6 +1901,7 @@ mod tests {
                 interactive_ready: true,
                 foreground_matches: true,
                 scroll_offset_from_bottom: Some(2),
+                harness_binary_replaced: false,
             });
         }
         let timeouts = SubmitTimeouts {
@@ -1893,6 +1931,7 @@ mod tests {
             interactive_ready: true,
             foreground_matches: true,
             scroll_offset_from_bottom: Some(0),
+            harness_binary_replaced: false,
         };
         assert_eq!(
             composer_unreadable_reason(
@@ -1904,11 +1943,103 @@ mod tests {
             )
             .as_deref(),
             Some(
-                "composer_unreadable: pane w16:pD does not show a recognisable claude composer \
-                 after 15.0s; ansi_blank=true scroll_offset_from_bottom=0 working=true \
-                 interactive_ready=true foreground_match=true; nothing was typed"
+                "composer_unreadable: blank_grid: pane w16:pD does not show a recognisable \
+                 claude composer after 15.0s; ansi_blank=true scroll_offset_from_bottom=0 \
+                 working=true interactive_ready=true foreground_match=true \
+                 harness_binary_replaced=false; a resize or redraw does not restore this state: \
+                 if it persists, restart the harness child-first with --resume; nothing was typed"
             )
         );
+    }
+
+    #[test]
+    fn a_replaced_harness_binary_names_the_blank_grid_state_and_its_cure() {
+        // Captured 2026-11-03 from a coordinator pane whose Claude Code process
+        // had run ~31 h, its binary replaced on disk by an upgrade: the visible
+        // grid is whitespace, the harness idle (no title spinner), its
+        // foreground process alive. A resize made it write nothing (#836).
+        let captured = include_str!("../testdata/blank-grid/claude-renderer-silent.txt");
+        assert!(is_ansi_blank(captured));
+        let screen = FakeScreen::new("claude", false);
+        {
+            let mut state = screen.state();
+            state.screen_override = Some(captured.to_owned());
+            state.probe = Some(ComposerProbe {
+                working: false,
+                interactive_ready: true,
+                foreground_matches: true,
+                scroll_offset_from_bottom: Some(0),
+                harness_binary_replaced: true,
+            });
+        }
+        let timeouts = SubmitTimeouts {
+            composer: Duration::from_millis(300),
+            ..SubmitTimeouts::default()
+        };
+        let reason = refusal(submit_with(&screen, "status?", timeouts).0);
+        assert!(is_composer_unreadable(&reason), "{reason}");
+        assert!(is_blank_grid(&reason), "{reason}");
+        for fact in [
+            "working=false",
+            "harness_binary_replaced=true",
+            "child-first with --resume",
+            "nothing was typed",
+        ] {
+            assert!(reason.contains(fact), "{fact}: {reason}");
+        }
+        let state = screen.state();
+        assert!(
+            state.pastes.is_empty() && state.keys.is_empty(),
+            "{state:?}"
+        );
+    }
+
+    #[test]
+    fn a_working_blank_grid_is_named_with_its_binary_fact() {
+        let reason = composer_unreadable_reason(
+            "w1:p1",
+            "claude",
+            "  \n\n",
+            Some(ComposerProbe {
+                working: true,
+                interactive_ready: true,
+                foreground_matches: true,
+                scroll_offset_from_bottom: None,
+                harness_binary_replaced: false,
+            }),
+            Duration::from_secs(15),
+        )
+        .unwrap();
+        assert!(is_blank_grid(&reason), "{reason}");
+        assert!(reason.contains("harness_binary_replaced=false"), "{reason}");
+        assert!(reason.contains("working=true"), "{reason}");
+        // A screen with content is never the blank-grid state.
+        assert!(composer_unreadable_reason(
+            "w1:p1",
+            "claude",
+            "❯ \n",
+            Some(ComposerProbe {
+                working: true,
+                interactive_ready: true,
+                foreground_matches: true,
+                scroll_offset_from_bottom: None,
+                harness_binary_replaced: true,
+            }),
+            Duration::from_secs(15),
+        )
+        .is_none());
+        assert!(!is_blank_grid(
+            "pane w1:p1 does not show a recognisable claude composer"
+        ));
+    }
+
+    #[test]
+    fn replaced_executables_are_read_from_the_proc_exe_link() {
+        assert!(exe_link_replaced(
+            "/usr/local/bin/claude_code/claude (deleted)"
+        ));
+        assert!(!exe_link_replaced("/usr/local/bin/claude_code/claude"));
+        assert!(!exe_link_replaced("/opt/deleted/bin/codex"));
     }
 
     #[test]
@@ -1920,12 +2051,21 @@ mod tests {
                 interactive_ready: true,
                 foreground_matches: true,
                 scroll_offset_from_bottom: None,
+                harness_binary_replaced: false,
             }),
             Some(ComposerProbe {
                 working: true,
                 interactive_ready: true,
                 foreground_matches: false,
                 scroll_offset_from_bottom: None,
+                harness_binary_replaced: false,
+            }),
+            Some(ComposerProbe {
+                working: false,
+                interactive_ready: true,
+                foreground_matches: false,
+                scroll_offset_from_bottom: None,
+                harness_binary_replaced: true,
             }),
         ] {
             let screen = FakeScreen::new("codex", false);

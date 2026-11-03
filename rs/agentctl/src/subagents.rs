@@ -1257,6 +1257,11 @@ pub trait ManagedApi: AgentApi {
             "harness process verification is unavailable",
         ))
     }
+    /// Does a foreground process of the pane run an executable replaced on disk since it
+    /// started? `false` when unknown.
+    fn harness_binary_replaced(&self, _pane: &str) -> bool {
+        false
+    }
     /// The argument vector of one pinned process generation; `None` when it cannot be read.
     fn process_command_line(&self, _expected: &CustomProcessIdentity) -> Option<Vec<String>> {
         None
@@ -1611,6 +1616,9 @@ impl ManagedApi for HerdrClient {
         kind: &str,
     ) -> crate::error::Result<Option<CustomProcessIdentity>> {
         HerdrClient::harness_identity(self, pane, kind)
+    }
+    fn harness_binary_replaced(&self, pane: &str) -> bool {
+        HerdrClient::harness_binary_replaced(self, pane)
     }
     fn verify_harness_identity(
         &self,
@@ -3506,6 +3514,7 @@ impl<A: ManagedApi + ?Sized> GuardedInput for GuardedTerminal<'_, '_, A> {
                 .is_some_and(|value| !value.is_empty()),
             foreground_matches,
             scroll_offset_from_bottom: info.scroll.map(|scroll| scroll.offset_from_bottom),
+            harness_binary_replaced: client.harness_binary_replaced(pane_id),
         })
     }
     fn read_screen(&self, pane_id: &str) -> crate::error::Result<String> {
