@@ -132,6 +132,19 @@ pub struct Job {
     /// `match`, or `mismatch: ...`, once both the local verdict and a receipt are in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comparison: Option<String>,
+    /// Why the queue no longer wants the candidate, when a compare-mode job was kept for the
+    /// donor holding its lease: its receipt is still compared (it cannot affect landing), but
+    /// the job is cancelled instead of queued again if the lease ends without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_gone: Option<String>,
+}
+
+impl Job {
+    /// A comparison recorded after the queue had stopped wanting the candidate (a donor slower
+    /// than the queue host).
+    pub fn compared_after_landing(&self) -> bool {
+        self.comparison.is_some() && self.candidate_gone.is_some()
+    }
 }
 
 impl Receipt {
@@ -524,14 +537,24 @@ impl Store {
                 continue;
             };
             if lease.expires_unix <= at {
-                job.state = JobState::Queued;
                 job.lease = None;
-                job.history.push(format!(
-                    "{}: lease of {} on {} expired; queued again",
-                    now(),
-                    lease.donor,
-                    lease.host
-                ));
+                if let Some(gone) = &job.candidate_gone {
+                    job.state = JobState::Cancelled;
+                    job.history.push(format!(
+                        "{}: lease of {} on {} expired; cancelled: {gone}",
+                        now(),
+                        lease.donor,
+                        lease.host
+                    ));
+                } else {
+                    job.state = JobState::Queued;
+                    job.history.push(format!(
+                        "{}: lease of {} on {} expired; queued again",
+                        now(),
+                        lease.donor,
+                        lease.host
+                    ));
+                }
                 self.write(&job)?;
             }
         }
@@ -602,6 +625,7 @@ impl Store {
             declined_by: Vec::new(),
             local: None,
             comparison: None,
+            candidate_gone: None,
         };
         self.write(&job)?;
         Ok(job)
@@ -699,7 +723,11 @@ impl Store {
         let _lock = self.lock()?;
         let mut job = self.leased(id, token, unix_now())?;
         let donor = job.lease.take().map(|l| l.donor).unwrap_or_default();
-        job.state = JobState::Queued;
+        job.state = if job.candidate_gone.is_some() {
+            JobState::Cancelled
+        } else {
+            JobState::Queued
+        };
         job.history.push(format!(
             "{}: {} by {donor}: {reason}",
             now(),
@@ -781,10 +809,15 @@ impl Store {
         job.state = JobState::Done;
         job.lease = None;
         job.history.push(format!(
-            "{}: receipt from {} on {} accepted",
+            "{}: receipt from {} on {} accepted{}",
             now(),
             receipt.donor.name,
-            receipt.donor.host
+            receipt.donor.host,
+            if job.candidate_gone.is_some() {
+                " after the queue had stopped wanting the candidate (compared only)"
+            } else {
+                ""
+            }
         ));
         if let Some(local) = &job.local {
             job.comparison = Some(compare(local, &receipt.verdict()));
@@ -811,6 +844,48 @@ impl Store {
         job.history.push(format!("{}: cancelled: {reason}", now()));
         self.write(&job)?;
         Ok(true)
+    }
+
+    /// The queue no longer wants job `id`'s candidate, in compare mode: a queued job is
+    /// cancelled, a leased one is kept for its donor (see [`Job::candidate_gone`]). Returns
+    /// whether the job changed.
+    pub fn retire(&self, id: &str, reason: &str) -> Result<bool, String> {
+        let _lock = self.lock()?;
+        self.expire(unix_now())?;
+        let mut job = self.read(id)?;
+        match job.state {
+            JobState::Queued => {
+                job.state = JobState::Cancelled;
+                job.history.push(format!("{}: cancelled: {reason}", now()));
+            }
+            JobState::Leased if job.candidate_gone.is_none() => {
+                job.candidate_gone = Some(reason.to_owned());
+                job.history.push(format!(
+                    "{}: {reason}; kept for its leased donor, whose receipt is still compared",
+                    now()
+                ));
+            }
+            _ => return Ok(false),
+        }
+        self.write(&job)?;
+        Ok(true)
+    }
+
+    /// Retire every queued or leased job with `reason` (compare mode); returns their ids.
+    pub fn retire_all_live(&self, reason: &str) -> Result<Vec<String>, String> {
+        let live: Vec<String> = self
+            .jobs()?
+            .into_iter()
+            .filter(|job| matches!(job.state, JobState::Queued | JobState::Leased))
+            .map(|job| job.id)
+            .collect();
+        let mut retired = Vec::new();
+        for id in live {
+            if self.retire(&id, reason)? {
+                retired.push(id);
+            }
+        }
+        Ok(retired)
     }
 
     /// Cancel every queued or leased job with `reason`; returns their ids. A run calls this
@@ -1686,5 +1761,44 @@ mod unit {
         assert!(missing.contains("no source revision"), "{missing}");
         // A dirty donor never matches a clean queue host.
         assert!(revision_mismatch(Some(&same), Some(&at('a', true))).is_some());
+    }
+
+    #[test]
+    fn a_retired_job_is_compared_only_by_its_leased_donor() {
+        let dir = std::env::temp_dir().join(format!("mq-retire-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = Store::new(&dir);
+        store.lease_secs = 1;
+        // A queued job is cancelled outright.
+        let queued = publish(&store, &"1".repeat(40));
+        assert!(store.retire(&queued.id, "its candidate landed").unwrap());
+        assert_eq!(store.get(&queued.id).unwrap().state, JobState::Cancelled);
+        // A leased one stays with its donor; when the lease ends it is cancelled, not queued.
+        let leased = publish(&store, &"2".repeat(40));
+        let claimed = store.claim("d1", "h1", 1).unwrap().unwrap();
+        assert_eq!(claimed.id, leased.id);
+        assert!(store.retire(&leased.id, "its candidate landed").unwrap());
+        let job = store.get(&leased.id).unwrap();
+        assert_eq!(job.state, JobState::Leased);
+        assert_eq!(job.candidate_gone.as_deref(), Some("its candidate landed"));
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert_eq!(store.get(&leased.id).unwrap().state, JobState::Cancelled);
+        assert!(store.claim("d2", "h2", 1).unwrap().is_none());
+        // A retired job its donor gives back is cancelled too.
+        store.lease_secs = 60;
+        let released = publish(&store, &"3".repeat(40));
+        let token = store
+            .claim("d1", "h1", 1)
+            .unwrap()
+            .unwrap()
+            .lease
+            .unwrap()
+            .token;
+        store.retire(&released.id, "superseded").unwrap();
+        store
+            .release(&released.id, &token, "giving back", false)
+            .unwrap();
+        assert_eq!(store.get(&released.id).unwrap().state, JobState::Cancelled);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -822,11 +822,14 @@ cancels the job. So does a candidate the queue no longer wants:
   finished.
 
 A donor holding a cancelled job is told to stop on its next lease renewal, and a receipt for the
-job is refused. In `compare` mode this means a comparison is recorded only when the donor reports
-before the local verdict lands the candidate, so a donor slower than the queue host compares
-little. In `decide` mode a job no donor takes within `donors.claim_timeout_secs` stops the run with
-an error that asks whether a donor is running and whether its tools match. Nothing is ejected
-either way.
+job is refused. In `compare` mode only unleased jobs are cancelled this way. A leased job is
+kept for its donor, because its receipt cannot affect landing and the comparison is still worth
+having. It is compared when it arrives, and `donor status` counts it under "compared after
+landing", which shows when donors are slower than the queue host. If that lease ends without a
+receipt (it expires, or the donor gives the job back), the job is cancelled rather than queued
+again. In `decide` mode a job no donor takes within `donors.claim_timeout_secs` stops the run
+with an error that asks whether a donor is running and whether its tools match. Nothing is
+ejected either way.
 
 ## Using it on a repository validated by a dagrun DAG
 

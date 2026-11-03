@@ -250,6 +250,10 @@ fn donor_command(state: &State, action: DonorCommand) -> Result<i32, String> {
                     "compare: {matched} of {} receipts match the local verdict",
                     compared.len()
                 );
+                // Receipts that arrived after the candidate landed or was superseded: the
+                // donor is slower than the queue host.
+                let late = jobs.iter().filter(|j| j.compared_after_landing()).count();
+                println!("compared after landing: {late} of {}", compared.len());
             }
             for job in &jobs {
                 let who = match (&job.lease, &job.receipt) {

@@ -576,11 +576,20 @@ impl<'a> Runner<'a> {
             store.lease_secs = config.donors.lease();
             match crate::donor::tool_identity(&config.validator, &config.repo) {
                 Ok(tool) => {
-                    match store.cancel_all_live(
-                        "superseded: the run that published it ended without settling it",
-                    ) {
+                    let reason = "superseded: the run that published it ended without settling it";
+                    let swept = if offload == crate::state::Offload::Compare {
+                        store.retire_all_live(reason)
+                    } else {
+                        store.cancel_all_live(reason)
+                    };
+                    match swept {
                         Ok(swept) if !swept.is_empty() => eprintln!(
-                            "merge-queue: cancelled {} donor job(s) an earlier run left live",
+                            "merge-queue: {} {} donor job(s) an earlier run left live",
+                            if offload == crate::state::Offload::Compare {
+                                "retired"
+                            } else {
+                                "cancelled"
+                            },
                             swept.len()
                         ),
                         Ok(_) => {}
@@ -1450,8 +1459,15 @@ impl<'a> Runner<'a> {
             } else {
                 return true;
             };
-            match donors.store.cancel_live(id, reason) {
-                Ok(true) => self.event("donor", &format!("job {id} cancelled: {reason}")),
+            // In compare mode a leased job's receipt can still be compared (it cannot affect
+            // landing), so only an unleased job is cancelled.
+            let retired = if donors.mode == crate::state::Offload::Compare {
+                donors.store.retire(id, reason)
+            } else {
+                donors.store.cancel_live(id, reason)
+            };
+            match retired {
+                Ok(true) => self.event("donor", &format!("job {id} retired: {reason}")),
                 Ok(false) => {}
                 Err(error) => self.event("donor", &format!("cannot cancel job {id}: {error}")),
             }

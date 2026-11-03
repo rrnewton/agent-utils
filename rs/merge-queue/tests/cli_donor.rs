@@ -444,8 +444,8 @@ fn a_bundle_over_the_limit_is_refused_and_the_donor_declines() {
 fn compare_mode_lands_on_the_local_verdict_and_records_disagreement() {
     // A donor whose environment differs (here it fails where the queue host passes) must
     // never decide: the local verdict lands, and the disagreement is recorded.
-    // The local validation takes a while, so the donor reports before the candidate lands
-    // (a job whose candidate already landed is cancelled).
+    // The local validation takes a while, so the donor claims before the candidate lands (a
+    // job nobody had claimed by then is cancelled).
     let fx = Fixture::new("donor-compare");
     fx.mq_ok(&[
         "init",
@@ -555,7 +555,7 @@ fn a_donor_built_from_another_revision_declines_and_nothing_is_ejected() {
 }
 
 #[test]
-fn a_job_whose_candidate_lands_while_leased_is_cancelled_and_its_receipt_refused() {
+fn compare_mode_keeps_a_leased_job_after_landing_and_compares_its_late_receipt() {
     let fx = Fixture::new("donor-landed");
     fx.mq_ok(&[
         "init",
@@ -588,22 +588,13 @@ fn a_job_whose_candidate_lands_while_leased_is_cancelled_and_its_receipt_refused
         .into_iter()
         .find(|j| j["id"] == id.as_str())
         .unwrap();
-    assert_eq!(job["state"], "cancelled", "{job}");
-    assert!(
-        job["history"]
-            .to_string()
-            .contains("cancelled: its candidate landed"),
-        "{job}"
-    );
-    // The donor's next renewal stops it, and its receipt is refused.
+    assert_eq!(job["state"], "leased", "{job}");
+    assert_eq!(job["candidate_gone"], "its candidate landed", "{job}");
+    // The donor carries on, and its receipt is compared (it cannot affect landing).
     let (ok, out, err) = donor_call(&fx, "renew", &id, &token);
     assert!(ok, "{err}");
     let renewal: Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(renewal["renewal"], "stop", "{renewal}");
-    assert!(
-        renewal["reason"].as_str().unwrap().contains("cancelled"),
-        "{renewal}"
-    );
+    assert_eq!(renewal["renewal"], "continue", "{renewal}");
     let receipt = serde_json::json!({
         "schema": "merge-queue-receipt/v1",
         "job": id,
@@ -617,8 +608,6 @@ fn a_job_whose_candidate_lands_while_leased_is_cancelled_and_its_receipt_refused
         "elapsed_ms": 1,
         "started_at": "2026-11-03T00:00:00Z",
         "finished_at": "2026-11-03T00:00:01Z",
-        "log_tail": "",
-        "log_path": "",
     });
     let (ok, _, err) = donor_call(
         &fx,
@@ -626,13 +615,57 @@ fn a_job_whose_candidate_lands_while_leased_is_cancelled_and_its_receipt_refused
         &id,
         &serde_json::json!({"token": token, "receipt": receipt}).to_string(),
     );
-    assert!(!ok);
-    assert!(err.contains("was cancelled"), "{err}");
+    assert!(ok, "{err}");
     let job = jobs(&fx)
         .into_iter()
         .find(|j| j["id"] == id.as_str())
         .unwrap();
-    assert!(job["receipt"].is_null(), "{job}");
+    assert_eq!(job["state"], "done", "{job}");
+    assert_eq!(job["comparison"], "match", "{job}");
+    let status = fx.mq_ok(&["donor", "status"]);
+    assert!(
+        status.contains("compared after landing: 1 of 1"),
+        "{status}"
+    );
+}
+
+#[test]
+fn an_unleased_job_whose_candidate_landed_is_cancelled() {
+    let fx = Fixture::new("donor-unleased");
+    fx.mq_ok(&[
+        "init",
+        "--validator",
+        "command",
+        "--validator-run",
+        "exit 0",
+        "--offload",
+        "compare",
+    ]);
+    two_changes(&fx);
+    let (code, _, stderr) = finish(spawn_run(&fx, &[]));
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(item_status(&fx, 1), "landed");
+    let job = &jobs(&fx)[0];
+    assert_eq!(job["state"], "cancelled", "{job}");
+    assert!(
+        job["history"]
+            .to_string()
+            .contains("cancelled: its candidate landed"),
+        "{job}"
+    );
+    // A donor that comes later finds nothing to do.
+    let clone = donor_clone(&fx, "donor-host");
+    let out = donor(&fx, &clone, "d1", &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("took"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
