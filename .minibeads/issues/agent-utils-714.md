@@ -1,6 +1,6 @@
 ---
 title: 'chat-transcript-primary: chat main-session trace: an opt-in mode that posts the agent''s non-reply transcript text to a daily trace thread'
-status: open
+status: closed
 priority: 2
 assignee: mu-transcript@devbig014
 issue_type: feature
@@ -10,6 +10,7 @@ depends_on:
   agent-utils-710: related
 created_at: 2026-10-30T21:05:06.461345010+00:00
 updated_at: 2026-10-30T21:05:06.461345010+00:00
+closed_at: 2026-11-03T17:19:28.069863+00:00
 ---
 
 # Description
