@@ -830,3 +830,50 @@ magnitude, but measured from 2026-10-28.
 ### Settings and Help owner batch (2026-11-02)
 
 * [codex gpt-6-astra] #624 voice-page-modularity: `view/settings` now owns the service/channel box, hidden channels, aliases, voice approval/prefix/prompt editors, canned prompts, microphone/audio preference editors, automatic-read rules, apply-to-existing/Undo receipt, message preference presentation, resume/live readouts and Settings sync application. Portable wording joins `present/settings`, with the architecture rule allowing its shared wording dependency on `present/rows`; the existing Help folds and `IdentityReader` boundary are reused. Feature owners still apply message/link/thread choices, and shell/keyboard composition and boot order stay in the legacy composition for step 17. Source readers and negative controls follow their modules; independent-instance, stale-read, timer-disposal and partial-Undo tests exercise the new owners. This is a behaviour-preserving move.
+
+### The view/channel lane, batches 16 to 24 (2026-11-02 to 2026-11-03)
+
+[opus 5.5, the view/channel lane.] Nine batches landed, each of three or four owners, each behind its own full
+gate and adversarial review (Reviews 20 to 28 in the lane's handoff). From batch 22 on, moves take whole groups
+of functions, not only their state: a factory owns the state and the functions, and the legacy script
+destructures the functions under their old names, so its callers do not change.
+
+| Measure | 2026-11-01 | 2026-11-03 |
+| --- | --- | --- |
+| `web/voice.js` lines | about 55,200 | 34,137 |
+| Top-level `let`s in `web/voice.js` | 334 | 101 |
+| Top-level functions in `web/voice.js` | 2,035 | 1,199 |
+| Handwritten TypeScript under `web/src` | about 14,700 lines | about 44,400 lines |
+
+What moved, by package:
+
+* `core/navigation`: the places visited for Back and Forward (`createVisits`), the link the page opened by
+  (`createDeepLinks`), the jumps taken by links (`createLinkJumps`), the page's own history entries behind a
+  history port (`createBackStack`), and the layout chosen with where it was chosen from (`createLayoutChoice`).
+* `core/sync`: what the live stream holds while the page is hidden (`createHiddenStream`) and the coalescing of
+  live edits into re-reads (`createMutationRefresh`).
+* `core/search`: the last parse (`createParsedQueries`), the Links filter (joined `createSearchField`), and the
+  cards' replies walk (`createRepliesWalk`), its ending sentence in `present/notices`.
+* `core/annotations`: the old place marker (`createLegacyMarker`) and writing a bookmark change
+  (`createBookmarkWrites`).
+* `core/channels`: Hide read's own list (`createTodoView`) and a plain channel's reach (`createPlainReach`).
+* `view/channel`: thread colours (`createThreadHues`), pin sync (`createPinSync`), the rooms past the right
+  column's foot (`createFootRooms`), the pack gap's slide (`createPackSlides`), keeping the reader across a
+  change (`createScrollKeeping`), the card moving up as its thread opens (`createCardFlight`) and the backlog's
+  arming (`createArming`); `present/rows` took the upstream addresses and `view/dom` the clipboard.
+* `view/composer`: the on-screen keyboard and its readout (`createOnScreenKeyboard`).
+* `view/shell`, opened for step 17 (`web/architecture.mjs`): the status line, error panel and connection
+  details (`createShellNotices`) and the chips standing on the channel's box (`createChipsOverComposer`).
+
+Lessons from these batches:
+
+* A function moved into a factory and destructured is a `const`, not a hoisted declaration: every reference
+  before its line must be inside a function, a getter or a thunk. Each review checks this.
+* `scripts/screenshots.py` evaluates page globals by name, as the Python walks read page constants: grep
+  `vibe-talk/scripts` for every moved name (batch 24 missed `statusTimer`; the gate's screenshots step caught it).
+* A new named `*_MS` constant needs a tuning band; keep a moved inline number inline.
+* `dagrun --selected` takes `A,B,C`; a repeated flag keeps only the last.
+
+What is left for the lane: the reply editor's state, the thread pack/unpack section, the read and refresh
+machinery (`loadTimeline`, `loadDiscord`), the shell's screen and view state (`currentScreen`, `currentView`,
+read by 26 test sites), the column core (`activeColumn`, `sideActive`), keyboard dispatch and boot order.
