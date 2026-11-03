@@ -2325,15 +2325,16 @@ const outgoingJobs = new Map();
 // under. Never saved. See `scheduleOutgoingMessage`.
 const outgoingWaiters = new Map();
 const outgoingQueuedUnder = new Map();
-let outgoingPumping = false;
-let outgoingPumpAgain = false;
+/** One pass at a time over the outbox, a pass asked for during one going round again (web/src/core/outbox `createOutboxPump`). */
+const outgoingPump = createOutboxPump();
 /**
  * Entries waiting to go out again on their own, by id: when (`at`), or when the connection returns
  * (`offline`); whether nothing has been attempted yet (`unsent`); the credential it was armed
  * under (`identity`); and its timer. Never saved: see `planOutgoingRetry`.
  */
 const outgoingRetries = new Map();
-let outgoingSequence = 0;
+/** The running number in new sends' ids (web/src/core/outbox `createSendNumbers`). */
+const outgoingSequence = createSendNumbers();
 /**
  * `#277 reply-in-column`. Replies sent from a column, by outbox id, and the column each was sent from:
  * every attempt at one that settles is told (`reportColumnReply`) until it is sent or leaves the
@@ -16371,7 +16372,7 @@ function followPlacement() {
 function queueOutgoingMessage(request, column = null) {
   let id;
   do {
-    id = `outgoing-${Date.now().toString(36)}-${++outgoingSequence}-${Math.random().toString(36).slice(2, 9)}`;
+    id = `outgoing-${Date.now().toString(36)}-${outgoingSequence.next()}-${Math.random().toString(36).slice(2, 9)}`;
   } while (outbox.has(id));
   const entry = {
     id, ...request, originView: selection().view, createdAt: Date.now(),
@@ -16550,24 +16551,15 @@ function settleOutgoing(id) {
 
 /** Start every queued message that has nothing to wait for any more, in the order written. */
 function pumpOutgoing() {
-  // Starting one can finish it at once — signed out, offline — and that asks for a pump of its own.
-  if (outgoingPumping) {
-    outgoingPumpAgain = true;
-    return;
-  }
-  outgoingPumping = true;
-  try {
-    do {
-      outgoingPumpAgain = false;
-      for (const entry of [...outbox.values()]) {
-        if (outbox.get(entry.id) !== entry || entry.state !== "sending" ||
-            entry.phase !== "queued" || outgoingJobs.has(entry.id) || outgoingBlocker(entry)) continue;
-        startOutgoing(entry);
-      }
-    } while (outgoingPumpAgain);
-  } finally {
-    outgoingPumping = false;
-  }
+  // Starting one can finish it at once — signed out, offline — and that asks for a pump of its own, which
+  // makes this one go round again (`outgoingPump`).
+  outgoingPump.pump(() => {
+    for (const entry of [...outbox.values()]) {
+      if (outbox.get(entry.id) !== entry || entry.state !== "sending" ||
+          entry.phase !== "queued" || outgoingJobs.has(entry.id) || outgoingBlocker(entry)) continue;
+      startOutgoing(entry);
+    }
+  });
 }
 
 /** One attempt for a message whose turn it is: placing a reply, or the POST. */

@@ -89,6 +89,8 @@ declare const underDraft: LegacyImports["underDraft"];
 declare const unsentText: LegacyImports["unsentText"];
 declare const DISMISSED_SENDS_DAYS: LegacyImports["DISMISSED_SENDS_DAYS"];
 declare const createChannelDrafts: LegacyImports["createChannelDrafts"];
+declare const createOutboxPump: LegacyImports["createOutboxPump"];
+declare const createSendNumbers: LegacyImports["createSendNumbers"];
 declare const QUICK_DRAFTS_KEY: LegacyImports["QUICK_DRAFTS_KEY"];
 declare const createDraftLedger: LegacyImports["createDraftLedger"];
 declare const createDraftRound: LegacyImports["createDraftRound"];

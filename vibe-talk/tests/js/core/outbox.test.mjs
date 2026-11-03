@@ -449,3 +449,24 @@ test("`#819 voice-page-quoted-reply-and-draft-chip`: the Draft chip's round goes
   assert.equal(round.next(drafts, "c2").key, "m2", "another channel starts at its newest");
   assert.equal(round.next(drafts.slice(1), "c2").key, "c1\nm1\nq", "the last one gone, the round starts at the newest");
 });
+
+test("`#624 voice-page-modularity`: the outbox pump runs one pass at a time, going round again for a pass asked during one", () => {
+  const { createOutboxPump, createSendNumbers } = OUTBOX;
+  const pump = createOutboxPump();
+  const passes = [];
+  let asks = 2;
+  const pass = () => {
+    passes.push(passes.length);
+    if (asks > 0) {
+      asks -= 1;
+      pump.pump(() => passes.push("nested"));
+    }
+  };
+  pump.pump(pass);
+  assert.deepStrictEqual(passes, [0, 1, 2], "a pass asked during one made it go round, never nesting");
+  assert.throws(() => pump.pump(() => { throw new Error("start failed"); }), /start failed/);
+  pump.pump(() => passes.push("after"));
+  assert.equal(passes.at(-1), "after", "a throw leaves the pump idle for the next");
+  const numbers = createSendNumbers();
+  assert.deepStrictEqual([numbers.next(), numbers.next()], [1, 2]);
+});
