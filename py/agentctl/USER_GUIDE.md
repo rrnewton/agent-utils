@@ -1806,6 +1806,13 @@ duplicate `--message-id`, exactly as a draining send does. The watcher that
 types them is `watch-agents` (the unit teams actually run): every pass drains
 each interactive agent's queue and reports `queue_drains`, with a prompt past
 `--queue-stale-minutes` keeping the pass not ok; `watch` runs the same drain.
+A stale queue held by a refusal that types nothing (an unreadable composer, a
+refused recipient check, a draft in the editor; not a busy agent) is also
+escalated by `watch-agents`, once per hold, as a priority sender. The
+coordinator is told about an agent's held queue. When the held queue is the
+coordinator's own, where that notice would wait too, each local agent with a
+message held there is told instead, and agent-teams senders are named in the
+report's `held` rows (their receipts carry the hold as `held`).
 
 The Rust edition also delivers ordinary follow-ups to a working Muse pane by
 default. Muse keeps its editor typeable while a turn runs: Enter there steers the

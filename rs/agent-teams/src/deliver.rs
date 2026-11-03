@@ -393,15 +393,14 @@ pub fn run_auto_drain(
         .create(true)
         .append(true)
         .open(state.join(format!("auto-drain-{agent}.stderr.log")));
-    let (drain_stdout, drain_stderr) = match drain_log {
+    // Standard output (the drain's JSON report) is read here, so a refusal can be noted in the
+    // ledger (#834), and then appended to the same file.
+    let (mut drain_log, drain_stderr) = match drain_log {
         Ok(file) => match file.try_clone() {
-            Ok(clone) => (
-                std::process::Stdio::from(clone),
-                std::process::Stdio::from(file),
-            ),
-            Err(_) => (std::process::Stdio::null(), std::process::Stdio::null()),
+            Ok(clone) => (Some(clone), std::process::Stdio::from(file)),
+            Err(_) => (None, std::process::Stdio::null()),
         },
-        Err(_) => (std::process::Stdio::null(), std::process::Stdio::null()),
+        Err(_) => (None, std::process::Stdio::null()),
     };
     let spawned = crate::proof::agentctl_command()
         .arg("--registry")
@@ -421,7 +420,7 @@ pub fn run_auto_drain(
             "60",
         ])
         .stdin(std::process::Stdio::null())
-        .stdout(drain_stdout)
+        .stdout(std::process::Stdio::piped())
         .stderr(drain_stderr)
         .spawn();
     let mut child = match spawned {
@@ -435,15 +434,34 @@ pub fn run_auto_drain(
             return;
         }
     };
+    // Read on its own thread, so a long report can never fill the pipe and stall the drain.
+    let report = child.stdout.take().map(|mut stdout| {
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = std::io::Read::read_to_string(&mut stdout, &mut text);
+            text
+        })
+    });
     let deadline =
         std::time::Instant::now() + std::time::Duration::from_secs(ready_timeout_seconds + 420);
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
+                let report = report
+                    .and_then(|reader| reader.join().ok())
+                    .unwrap_or_default();
+                if let Some(log) = drain_log.as_mut() {
+                    let _ = std::io::Write::write_all(log, report.as_bytes());
+                }
                 // Fold the queue's terminal state into the team ledger so
-                // senders' receipts can leave `accepted` (gap 2).
+                // senders' receipts can leave `accepted` (gap 2); a refusal
+                // that typed nothing is noted as a hold (#834).
                 if let Some(team) = team.filter(|team| !team.is_empty()) {
-                    let _ = crate::ledger::reconcile_queue_delivery(state, team, id);
+                    if crate::ledger::reconcile_queue_delivery(state, team, id).is_none() {
+                        if let Some(reason) = drain_blocked_reason(&report) {
+                            crate::ledger::note_held(state, team, id, &reason);
+                        }
+                    }
                 }
                 if status.success() {
                     log("done");
@@ -471,6 +489,18 @@ pub fn run_auto_drain(
             }
         }
     }
+}
+
+/// The `blocked` reason of the last JSON report in `agentctl drain`'s standard output: why
+/// it left prompts pending without typing them (an unreadable composer, a draft it did not
+/// type, a refused recipient check). `None` when no report gives one.
+pub fn drain_blocked_reason(stdout: &str) -> Option<String> {
+    serde_json::Deserializer::from_str(stdout)
+        .into_iter::<Value>()
+        .map_while(Result::ok)
+        .filter_map(|report| report.get("blocked")?.as_str().map(str::to_owned))
+        .filter(|reason| !reason.trim().is_empty())
+        .last()
 }
 
 impl AgentctlQueueDeliverer {

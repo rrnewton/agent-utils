@@ -1881,6 +1881,37 @@ mod tests {
     }
 
     #[test]
+    fn the_captured_blank_coordinator_screen_is_classified_as_the_incident_recorded_it() {
+        // #834: the start of `herdr pane read --source visible --ansi` of the coordinator pane
+        // that refused eleven messages for an hour: rows of CRLF with stray spaces, no text.
+        let captured = "\r\n\r\n\r\n\r\n  \r\n  \r\n    \r\n    \r\n\r\n\r\n    \r\n\r\n\r\n\r\n\
+                        \r\n\r\n\r\n\r\n\r\n\r\n    \r\n\r\n    \r\n\r\n\r\n\r\n\r\n\r\n  \r\n\
+                        \r\n  \r\n    \r\n\r\n\r\n\r\n\r\n   \r\n\r\n\r\n   \r\n\r\n  \r\n      \r\n   ";
+        assert!(is_ansi_blank(captured));
+        let probe = ComposerProbe {
+            working: true,
+            interactive_ready: true,
+            foreground_matches: true,
+            scroll_offset_from_bottom: Some(0),
+        };
+        assert_eq!(
+            composer_unreadable_reason(
+                "w16:pD",
+                "claude",
+                captured,
+                Some(probe),
+                Duration::from_secs(15)
+            )
+            .as_deref(),
+            Some(
+                "composer_unreadable: pane w16:pD does not show a recognisable claude composer \
+                 after 15.0s; ansi_blank=true scroll_offset_from_bottom=0 working=true \
+                 interactive_ready=true foreground_match=true; nothing was typed"
+            )
+        );
+    }
+
+    #[test]
     fn blank_screen_without_working_proof_keeps_the_generic_refusal() {
         for probe in [
             None,

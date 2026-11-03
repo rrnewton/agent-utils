@@ -236,7 +236,12 @@ with `--strict`.
   different body under the same ID is a `conflict`. Refusals of the message
   are durable; refusals of the route (wrong host, unlisted relay) leave no
   ledger entry.
-- `receipt ID [--team T]` — a pure read; never recovers.
+- `receipt ID [--team T]` — a pure read; never recovers. An `accepted`
+  entry whose delivery drain typed nothing (an unreadable composer, a draft
+  in the agent's editor, a refused recipient check) also carries `held`
+  {since, reason, checked_at}, and its `detail` begins "held at the
+  receiver since", so a sender learns that its message is waiting and why.
+  Delivery removes `held`.
 - `fence ID --team T --not-after TIME` — bars an ID before it arrives, so a
   sender may move to another contact.
 

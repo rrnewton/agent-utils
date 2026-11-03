@@ -1117,6 +1117,55 @@ fn reconcile_folds_queue_terminal_state_into_the_ledger() {
         reconcile_queue_delivery(&state, "tools", stuck).as_deref(),
         Some("possibly_submitted")
     );
+
+    // #834: a drain that typed nothing leaves the entry accepted but held, with the reason,
+    // and the sender's receipt says so; delivery ends the hold.
+    use agent_teams::ledger::note_held;
+    let held = "tm-sim-7777777777777777";
+    deliver(held, 3);
+    let unreadable = "composer_unreadable: pane w1:p1 does not show a recognisable claude \
+                      composer after 15.0s; ansi_blank=true; nothing was typed";
+    let report = json!({"pending": [held], "blocked": unreadable, "outcome": "pending"});
+    let report = format!("{}\n", serde_json::to_string_pretty(&report).unwrap());
+    let reason = agent_teams::deliver::drain_blocked_reason(&report).expect("blocked reason");
+    assert_eq!(reason, unreadable);
+    assert_eq!(
+        agent_teams::deliver::drain_blocked_reason("{\"blocked\": null}"),
+        None
+    );
+    assert!(note_held(&state, "tools", held, &reason));
+    let answer = receipt(&state, "tools", held);
+    assert_eq!(answer["state"], "accepted", "{answer}");
+    assert_eq!(answer["held"]["reason"], unreadable, "{answer}");
+    let since = answer["held"]["since"].clone();
+    assert!(
+        answer["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("held at the receiver since "),
+        "{answer}"
+    );
+    // A later refusal keeps when the hold began.
+    assert!(note_held(&state, "tools", held, "a draft is there"));
+    let answer = receipt(&state, "tools", held);
+    assert_eq!(answer["held"]["since"], since, "{answer}");
+    assert_eq!(answer["held"]["reason"], "a draft is there", "{answer}");
+    move_item(held, "processed");
+    assert_eq!(
+        reconcile_queue_delivery(&state, "tools", held).as_deref(),
+        Some("delivered")
+    );
+    let answer = receipt(&state, "tools", held);
+    assert_eq!(answer["state"], "delivered", "{answer}");
+    assert!(answer["held"].is_null(), "{answer}");
+    // Only a pending accepted item is ever marked held.
+    assert!(!note_held(&state, "tools", held, &reason));
+    assert!(!note_held(
+        &state,
+        "tools",
+        "tm-sim-8888888888888888",
+        &reason
+    ));
     let _ = std::fs::remove_dir_all(&state);
 }
 

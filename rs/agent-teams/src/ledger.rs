@@ -812,6 +812,10 @@ pub fn reconcile_queue_delivery(state: &Path, team: &str, id: &str) -> Option<St
     };
     entry["state"] = json!(new_state);
     entry["detail"] = json!(detail);
+    // A terminal state ends any hold the receiver reported (#834).
+    if let Some(entry) = entry.as_object_mut() {
+        entry.remove("held");
+    }
     entry["delivered_at"] = if new_state == "delivered" {
         json!(format_rfc3339_ms(now_unix_ms()))
     } else {
@@ -821,6 +825,54 @@ pub fn reconcile_queue_delivery(state: &Path, team: &str, id: &str) -> Option<St
     unlock(lock);
     written.ok()?;
     Some(new_state.to_string())
+}
+
+/// Record that an accepted entry's queue item is held at this receiver (#834
+/// agentctl-composer-unreadable-escalation): the drain that ran for it typed nothing and
+/// gave `reason`, such as an unreadable composer. The entry stays `accepted` (it may still be
+/// typed), but `held` {since, reason, checked_at} and `detail` say why it has not been, so a
+/// sender asking for a receipt learns that its message is waiting and why instead of seeing a
+/// bare `accepted`. `since` keeps the first report. Returns whether the entry was written:
+/// only an `accepted` entry whose queue item is still pending is.
+pub fn note_held(state: &Path, team: &str, id: &str, reason: &str) -> bool {
+    use agent_queue::queue::MessageState;
+    let Ok(lock) = lock_ledger(&ledger_dir(state, team)) else {
+        return false;
+    };
+    let written = (|| {
+        let mut entry = read_entry(state, team, id)?;
+        if entry_state(&entry) != "accepted" {
+            return None;
+        }
+        let target = entry.get("target")?;
+        if target.get("kind").and_then(Value::as_str) != Some("agentctl-queue") {
+            return None;
+        }
+        let queue_dir = agent_queue::registry::relocated(&PathBuf::from(
+            target.get("queue_dir").and_then(Value::as_str)?,
+        ));
+        if !matches!(
+            agent_queue::queue::message_state(&queue_dir, id)
+                .ok()
+                .flatten(),
+            Some(MessageState::Pending)
+        ) {
+            return None;
+        }
+        let now = format_rfc3339_ms(now_unix_ms());
+        let since = entry
+            .get("held")
+            .and_then(|held| held.get("since"))
+            .and_then(Value::as_str)
+            .map_or_else(|| now.clone(), str::to_owned);
+        entry["detail"] = json!(format!(
+            "held at the receiver since {since}: nothing was typed; {reason}"
+        ));
+        entry["held"] = json!({"since": since, "reason": reason, "checked_at": now});
+        write_json_atomic(&entry_path(state, team, id), &entry).ok()
+    })();
+    unlock(lock);
+    written.is_some()
 }
 
 /// Sender/ledger states after which an entry can never move again and
@@ -953,6 +1005,7 @@ pub fn receipt(state: &Path, team: &str, id: &str) -> Value {
             "id": id,
             "state": entry_state(&entry),
             "detail": entry.get("detail"),
+            "held": entry.get("held"),
             "sender": entry.get("sender"),
             "recorded_at": entry.get("recorded_at"),
         }),

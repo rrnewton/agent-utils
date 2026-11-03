@@ -856,7 +856,7 @@ struct WatchAgents {
     /// Say on standard error what each pass checks: every agent's status and how long its check took, and the pass's totals
     #[arg(long)]
     verbose: bool,
-    /// Minutes a queued prompt may stay pending before the pass reports it as stale, naming the agent and the age; every pass drains the queues first (default: 10)
+    /// Minutes a queued prompt may stay pending before the pass reports it as stale, naming the agent and the age; every pass drains the queues first (default: 10). A stale queue held by a refusal that typed nothing (an unreadable composer, a refused recipient check, a draft in the editor) is escalated once per hold: the coordinator is told, or, when the held queue is the coordinator's own, each local agent with a message held there
     #[arg(long, default_value = "10", value_name = "MINUTES", value_parser = clap::value_parser!(u16).range(1..=1440))]
     queue_stale_minutes: u16,
 }

@@ -827,6 +827,10 @@ struct WatchState {
     /// so each is reported once; forgotten once older than [`QUARANTINE_LOOKBACK_SECONDS`].
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     quarantines_reported: BTreeMap<String, f64>,
+    /// For each agent whose stale queue is held by a refusal that typed nothing and was
+    /// escalated (#834), the kind of refusal escalated, so one hold is told once.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    held_reported: BTreeMap<String, String>,
     /// Fingerprint of the agent-teams declaration flag set last notified to
     /// the coordinator (#721), so a standing flag is told once, not per pass.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -940,6 +944,12 @@ pub trait Probe {
     /// Every owner (chat-bridge) request waiting undelivered in a registered agent's queue. The
     /// default sees none.
     fn waiting_owner_prompts(&mut self) -> Vec<WaitingOwnerPrompt> {
+        Vec::new()
+    }
+    /// The sender of each prompt pending in `agent`'s queue, from its sender header (#834):
+    /// `(message id, sender, route)`, such as `("01…", "cl-mq", "agentctl")` or
+    /// `("tm-…", "lead@host", "agent-teams")`. The default knows none.
+    fn queued_senders(&mut self, _agent: &str) -> Vec<(String, String, String)> {
         Vec::new()
     }
     /// Every prompt quarantined as a probable misroute at or after `since` (Unix seconds). The
@@ -2727,7 +2737,7 @@ fn watch_agents_once(
     // Queued prompts are typed here, not parked (#804): this pass drains every
     // interactive agent's queue, and a remainder past the stale threshold keeps
     // the pass not-ok with the agent and the oldest prompt's age named.
-    let queue_drains = if probe_error.is_null() {
+    let mut queue_drains = if probe_error.is_null() {
         probe.drain_queues(
             options.queue_stale,
             options.check_only,
@@ -2736,6 +2746,7 @@ fn watch_agents_once(
     } else {
         Vec::new()
     };
+    let held = report_held_queues(probe, notifier, state, &mut queue_drains, now, options);
     let owner_waits = report_waiting_owner_prompts(probe, notifier, state, now, options);
     let quarantines = report_quarantines(probe, notifier, state, now, options);
     // Idle sweep (#731 agentctl-paste-tail-flush): submit a draft of ours
@@ -2823,6 +2834,7 @@ fn watch_agents_once(
         "waiting": state.pending.len(),
         "delivery_waits": delivery_waits,
         "queue_drains": queue_drains,
+        "held": held,
         "owner_waits": owner_waits,
         "quarantines": quarantines,
         "draft_sweeps": draft_sweeps,
@@ -3096,6 +3108,166 @@ fn report_waiting_owner_prompts(
         rows.push(row);
     }
     state.owner_stuck_reported = still;
+    rows
+}
+
+/// The kind of refusal that holds a queue and typed nothing, for the escalation (#834), or
+/// `None` for a reason that is no fault of the pane (a busy agent, a lock wait) or not one of
+/// these refusals.
+fn held_kind(reason: &str) -> Option<&'static str> {
+    if crate::chat_service::owner_alarm::waiting_on_busy_agent(Some(reason)) {
+        None
+    } else if crate::submission::is_composer_unreadable(reason)
+        || reason.contains("composer_unreadable")
+    {
+        Some("composer-unreadable")
+    } else if reason.contains("refusing input") {
+        Some("input-refused")
+    } else if reason.contains("did not type")
+        || reason.contains("last status=staged")
+        || reason.contains("unsent draft")
+    {
+        Some("draft")
+    } else {
+        None
+    }
+}
+
+/// What to do about a queue held by a refusal of `kind`, as one sentence ending in a space.
+fn held_hint(agent: &str, kind: &str, reason: &str) -> String {
+    match kind {
+        "composer-unreadable" => format!(
+            "agentctl cannot find {agent}'s input box: the pane's terminal grid reads blank while \
+             Herdr reports the harness alive and working, so it types nothing. Look at the pane \
+             (`agentctl attach {agent}`); if it stays blank, the harness has likely stopped \
+             drawing (a redraw key did not help in the case seen): restart it on the same \
+             session in that pane, then run `agentctl anchor {agent} --replace`. "
+        ),
+        "input-refused" => format!(
+            "agentctl cannot prove that the pane still runs {agent}; the reason names the check \
+             that failed and what to run. "
+        ),
+        _ => owner_wait_hint(agent, reason),
+    }
+}
+
+/// Escalate each queue this pass's drain left stale behind a refusal that typed nothing (#834
+/// agentctl-composer-unreadable-escalation): an unreadable composer, a refused recipient check,
+/// or a draft in the way. Such a queue fails silently otherwise: its senders see their messages
+/// accepted, and the agent never sees them. Once per hold (per agent and kind of refusal), the
+/// coordinator is told, as a priority sender; about the coordinator itself, whose own queue
+/// that notice would wait in, each local agent with a message held there is told instead, and
+/// agent-teams senders are named in the row (their receipts carry the hold). The stale
+/// threshold is `--queue-stale-minutes`. Returns one row per held queue; the drain row gains
+/// `held`.
+fn report_held_queues(
+    probe: &mut dyn Probe,
+    notifier: &mut dyn Notifier,
+    state: &mut WatchState,
+    queue_drains: &mut [Value],
+    now: f64,
+    options: &WatchAgentsOptions,
+) -> Vec<Value> {
+    let mut rows = Vec::new();
+    let mut still = BTreeMap::new();
+    for drain in queue_drains.iter_mut() {
+        if drain["stale"] != true {
+            continue;
+        }
+        let Some(agent) = drain["name"].as_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(reason) = drain["blocked"]
+            .as_str()
+            .or_else(|| drain["drain_error"].as_str())
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        let Some(kind) = held_kind(&reason) else {
+            continue;
+        };
+        drain["held"] = json!(kind);
+        let remaining = drain["remaining"].as_u64().unwrap_or(0);
+        let minutes = drain["oldest_seconds"].as_u64().unwrap_or(0) / 60;
+        let mut row = json!({"agent": agent, "kind": kind, "remaining": remaining,
+                             "oldest_minutes": minutes, "reason": reason});
+        if state.held_reported.get(&agent).map(String::as_str) == Some(kind) {
+            still.insert(agent.clone(), kind.to_owned());
+            row["reported"] = json!(true);
+            rows.push(row);
+            continue;
+        }
+        let hint = held_hint(&agent, kind, &reason);
+        let mut recipients = Vec::new();
+        let mut remote = Vec::new();
+        if agent == options.coordinator {
+            let mut mine: BTreeMap<String, usize> = BTreeMap::new();
+            for (_, sender, route) in probe.queued_senders(&agent) {
+                if route.starts_with("agentctl") {
+                    if sender != agent {
+                        *mine.entry(sender).or_default() += 1;
+                    }
+                } else if !remote.contains(&sender) {
+                    remote.push(sender);
+                }
+            }
+            for (sender, count) in mine {
+                let (count, verb) = if count == 1 {
+                    ("1 of your messages".to_owned(), "has")
+                } else {
+                    (format!("{count} of your messages"), "have")
+                };
+                recipients.push((
+                    sender,
+                    format!(
+                        "[agentctl watch-agents] {count} to {agent} {verb} not reached it: its \
+                         queue holds {remaining}, the oldest for {minutes} min, and every attempt \
+                         types nothing. Why: {reason}. {hint}{agent} has not seen them and is \
+                         not told; they are typed once its pane recovers. If yours cannot wait, \
+                         reach the owner another way."
+                    ),
+                ));
+            }
+        } else {
+            recipients.push((
+                options.coordinator.clone(),
+                format!(
+                    "[agentctl watch-agents] messages to {agent} are held: {remaining} waiting, \
+                     the oldest for {minutes} min, and every attempt types nothing. Why: \
+                     {reason}. {hint}"
+                ),
+            ));
+        }
+        row["remote_senders"] = json!(remote);
+        if options.check_only {
+            row["due"] = json!(true);
+            rows.push(row);
+            continue;
+        }
+        let mut told = Vec::new();
+        let mut errors = Vec::new();
+        for (recipient, text) in &recipients {
+            let message_id = format!("agent-watch-held-{agent}-{recipient}-{}", now as u64);
+            match notifier.notify_urgent(recipient, text, &message_id) {
+                Ok(_) => told.push(recipient.clone()),
+                Err(error) => errors.push(json!({"to": recipient, "error": error.to_string()})),
+            }
+        }
+        // Told once a notice is queued, or when there is no one here to tell (only agent-teams
+        // senders, whose receipts carry the hold); a hold whose every notice failed is tried
+        // again next pass.
+        if !told.is_empty() || recipients.is_empty() {
+            still.insert(agent.clone(), kind.to_owned());
+            row["reported"] = json!(true);
+        }
+        row["told"] = json!(told);
+        if !errors.is_empty() {
+            row["errors"] = json!(errors);
+        }
+        rows.push(row);
+    }
+    state.held_reported = still;
     rows
 }
 
@@ -4063,6 +4235,26 @@ fn message_excerpt(text: &str) -> String {
 }
 
 impl<A: ManagedApi + ?Sized> Probe for ManagedProbe<'_, A> {
+    fn queued_senders(&mut self, agent: &str) -> Vec<(String, String, String)> {
+        let Ok(directory) = agent_queue::registry::directory(&self.registry, agent) else {
+            return Vec::new();
+        };
+        let queue = directory.join("queue");
+        let mut found = Vec::new();
+        for lane in ["inbox", "inbox.v2"] {
+            for (path, _) in queue_records(&queue.join(lane)) {
+                let Ok(Value::Object(document)) = crate::agent::read_private_json(&path) else {
+                    continue;
+                };
+                let text = document.get("text").and_then(Value::as_str).unwrap_or("");
+                let Some(header) = text.lines().next().and_then(crate::sender_header::parse) else {
+                    continue;
+                };
+                found.push((record_id(&path, &document), header.sender, header.route));
+            }
+        }
+        found
+    }
     fn waiting_owner_prompts(&mut self) -> Vec<WaitingOwnerPrompt> {
         let mut found = Vec::new();
         for (agent, queue) in agent_queues(&self.registry) {
@@ -4737,6 +4929,169 @@ mod tests {
         assert_eq!(report["ok"], false, "{report}");
         assert_eq!(report["queue_drains"][0]["name"], "lane");
         assert_eq!(report["queue_drains"][0]["oldest_seconds"], 3600);
+    }
+
+    /// The refusal the incident recorded (#834), verbatim but for the pane.
+    const UNREADABLE: &str = "composer_unreadable: pane w16:pD does not show a recognisable \
+                              claude composer after 15.0s; ansi_blank=true \
+                              scroll_offset_from_bottom=0 working=true interactive_ready=true \
+                              foreground_match=true; nothing was typed";
+
+    /// A probe whose queue for `agent` stays held by a scripted refusal, with these senders.
+    struct HeldProbe {
+        agent: String,
+        oldest_seconds: u64,
+        blocked: Option<String>,
+        senders: Vec<(String, String, String)>,
+    }
+
+    impl Probe for HeldProbe {
+        fn observe(&mut self) -> Result<Vec<Observation>> {
+            Ok(Vec::new())
+        }
+        fn drain_queues(
+            &mut self,
+            stale: Duration,
+            _check_only: bool,
+            _now_millis: u64,
+        ) -> Vec<Value> {
+            vec![json!({
+                "name": self.agent, "queued": self.senders.len(), "typed": 0,
+                "remaining": self.senders.len(), "oldest_seconds": self.oldest_seconds,
+                "stale": self.oldest_seconds >= stale.as_secs(), "drain_error": null,
+                "blocked": self.blocked,
+            })]
+        }
+        fn queued_senders(&mut self, _agent: &str) -> Vec<(String, String, String)> {
+            self.senders.clone()
+        }
+    }
+
+    fn sender(id: &str, name: &str, route: &str) -> (String, String, String) {
+        (id.to_owned(), name.to_owned(), route.to_owned())
+    }
+
+    #[test]
+    fn a_coordinator_queue_held_by_an_unreadable_composer_tells_its_local_senders_once() {
+        let options = options();
+        let mut state = WatchState::default();
+        let mut notifier = RecordingNotifier::default();
+        let mut probe = HeldProbe {
+            agent: "coordinator".to_owned(),
+            oldest_seconds: 300,
+            blocked: Some(UNREADABLE.to_owned()),
+            senders: vec![
+                sender("01a", "mu-validate", "agentctl"),
+                sender("01b", "mu-validate", "agentctl --urgent"),
+                sender("01c", "cl-start", "agentctl"),
+                sender("tm-1", "agent-utils@lead-host", "agent-teams"),
+                sender("tm-2", "agent-utils@lead-host", "agent-teams"),
+            ],
+        };
+        // Five minutes: below --queue-stale-minutes (10), nothing.
+        let report = watch_agents_once(&mut probe, &mut notifier, &mut state, 1_000.0, &options);
+        assert_eq!(report["held"], json!([]), "{report}");
+        assert!(notifier.sent.is_empty());
+        // Past it: each local sender is told, never the coordinator, whose queue is the one held.
+        probe.oldest_seconds = 660;
+        let report = watch_agents_once(&mut probe, &mut notifier, &mut state, 1_360.0, &options);
+        assert_eq!(report["ok"], false, "{report}");
+        let row = &report["held"][0];
+        assert_eq!(row["kind"], "composer-unreadable", "{report}");
+        assert_eq!(row["told"], json!(["cl-start", "mu-validate"]), "{report}");
+        assert_eq!(
+            row["remote_senders"],
+            json!(["agent-utils@lead-host"]),
+            "{report}"
+        );
+        assert_eq!(report["queue_drains"][0]["held"], "composer-unreadable");
+        let recipients: Vec<&str> = notifier.sent.iter().map(|(to, _, _)| to.as_str()).collect();
+        assert_eq!(recipients, ["cl-start", "mu-validate"]);
+        let text = &notifier.sent[1].1;
+        assert!(
+            text.starts_with(
+                "[agentctl watch-agents] 2 of your messages to coordinator have not reached it: \
+                 its queue holds 5, the oldest for 11 min"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("Why: composer_unreadable: pane w16:pD"),
+            "{text}"
+        );
+        assert!(
+            text.contains("`agentctl anchor coordinator --replace`"),
+            "{text}"
+        );
+        assert!(notifier.sent[0]
+            .1
+            .contains("1 of your messages to coordinator has"));
+        assert_eq!(notifier.urgent.len(), 2, "sent as a priority sender");
+        // One hold is told once, however long it lasts.
+        probe.oldest_seconds = 7_200;
+        watch_agents_once(&mut probe, &mut notifier, &mut state, 7_000.0, &options);
+        assert_eq!(notifier.sent.len(), 2);
+        // A different refusal is a new hold.
+        probe.blocked = Some(
+            "refusing input to agent 'coordinator': the anchored claude process (pid 7) has \
+             exited; nothing was typed"
+                .to_owned(),
+        );
+        let report = watch_agents_once(&mut probe, &mut notifier, &mut state, 7_100.0, &options);
+        assert_eq!(report["held"][0]["kind"], "input-refused", "{report}");
+        assert_eq!(notifier.sent.len(), 4);
+        // Delivered: the hold ends, and a later one is told again.
+        probe.oldest_seconds = 0;
+        watch_agents_once(&mut probe, &mut notifier, &mut state, 7_200.0, &options);
+        assert!(state.held_reported.is_empty());
+        probe.oldest_seconds = 900;
+        watch_agents_once(&mut probe, &mut notifier, &mut state, 8_200.0, &options);
+        assert_eq!(notifier.sent.len(), 6);
+    }
+
+    #[test]
+    fn a_held_worker_queue_tells_the_coordinator_and_a_busy_one_tells_no_one() {
+        let options = options();
+        let mut state = WatchState::default();
+        let mut notifier = RecordingNotifier::default();
+        let mut probe = HeldProbe {
+            agent: "cl-mq".to_owned(),
+            oldest_seconds: 1_800,
+            blocked: Some(
+                "pane w1:p2 did not become idle/done within 10s; last status=working".to_owned(),
+            ),
+            senders: vec![sender("01a", "coordinator", "agentctl")],
+        };
+        // Waiting behind a long turn is no refusal: the stale row stays, no one is told.
+        let report = watch_agents_once(&mut probe, &mut notifier, &mut state, 1_000.0, &options);
+        assert_eq!(report["held"], json!([]), "{report}");
+        assert!(notifier.sent.is_empty());
+        probe.blocked = Some(UNREADABLE.replace("w16:pD", "w1:p2"));
+        let report = watch_agents_once(&mut probe, &mut notifier, &mut state, 1_100.0, &options);
+        assert_eq!(
+            report["held"][0]["told"],
+            json!(["coordinator"]),
+            "{report}"
+        );
+        let (to, text, _) = &notifier.sent[0];
+        assert_eq!(to, "coordinator");
+        assert!(
+            text.starts_with(
+                "[agentctl watch-agents] messages to cl-mq are held: 1 waiting, the oldest for \
+                 30 min, and every attempt types nothing."
+            ),
+            "{text}"
+        );
+        assert!(text.contains("`agentctl attach cl-mq`"), "{text}");
+        // --check-only reports the hold without telling anyone.
+        let check = WatchAgentsOptions {
+            check_only: true,
+            ..options.clone()
+        };
+        let mut fresh = WatchState::default();
+        let report = watch_agents_once(&mut probe, &mut notifier, &mut fresh, 1_200.0, &check);
+        assert_eq!(report["held"][0]["due"], true, "{report}");
+        assert_eq!(notifier.sent.len(), 1);
     }
 
     /// A probe whose only finding is a scripted wait for the coordinator's lifecycle lock.
