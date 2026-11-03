@@ -1471,3 +1471,375 @@ fn relay_poll_stops_at_half_the_shared_budget() {
     subscription.close().unwrap();
     fs::remove_dir_all(&directory).unwrap();
 }
+
+// --- #805 relay-poll-receipts-during-hold ---
+
+clock!(relay_hold_clock, RELAY_HOLD_NOW);
+clock!(relay_hold_bound_clock, RELAY_HOLD_BOUND_NOW);
+clock!(relay_log_clock, RELAY_LOG_NOW);
+
+fn bot_message(ts: &str, thread_ts: Option<&str>, user: &str, text: &str) -> SlackMessage {
+    let mut message = listed(ts, thread_ts, user, text, &[]);
+    message.subtype = Some("bot_message".to_owned());
+    message
+}
+
+fn drain_batches(subscription: &mut ChatSubscription) {
+    while let Some(batch) = next_batch_within(subscription, 3) {
+        subscription.commit_durable(&batch).unwrap();
+    }
+}
+
+#[test]
+fn relay_poll_during_budget_hold_reads_receipt_on_tracked_thread() {
+    // #805: with the shared budget holding after a rate limit, the relay
+    // poll still lists the threads of tracked relay posts, so a receipt
+    // posted during the hold is read within one poll interval.
+    let directory = scratch("relay-hold");
+    let fake = FakeTransport::new();
+    fake.push_script(vec![FakeStep::Idle; 14]);
+    let root = ts(T0 + 10_000);
+    let reply = ts(T0 + 11_000);
+    fake.push_history(bot_message(&root, None, RELAY_PEER, "relay envelope"));
+    fake.push_history(bot_message(&reply, Some(&root), RELAY_PEER, "first reply"));
+    let budget =
+        chat_subscription_slack::budget::CallBudget::at(&directory.join("budget.json"), 20);
+    let mut extra = relay_extra();
+    extra["rescan_budget_key"] = json!(directory.to_str().unwrap());
+    let mut backend = backend(&fake, relay_hold_clock);
+    let mut subscription =
+        ChatSubscription::open(&mut backend, &relay_request(&directory, extra)).unwrap();
+    commit_next(&mut subscription);
+    RELAY_HOLD_NOW.store(T0 + 12_000, Ordering::SeqCst);
+    drain_batches(&mut subscription);
+    let tracked = fake.state().scans.len();
+    assert!(
+        fake.state().scans[..tracked]
+            .iter()
+            .any(|(_, thread, _, _)| thread.as_deref() == Some(root.as_str())),
+        "thread tracked before the hold: {:?}",
+        fake.state().scans
+    );
+    // Another bridge was rate-limited listing history; the shared
+    // budget now holds, caused by conversations.history.
+    budget.block_for(T0 + 3_600_000, "conversations.history");
+    let receipt = ts(T0 + 13_000);
+    fake.push_history(bot_message(
+        &receipt,
+        Some(&root),
+        RELAY_PEER,
+        "receipt: delivered",
+    ));
+    RELAY_HOLD_NOW.store(T0 + 18_000, Ordering::SeqCst);
+    let batch = next_batch_long(&mut subscription).expect("receipt read during the hold");
+    let message = single_message(&batch);
+    assert!(message.is_thread_reply());
+    assert_eq!(
+        message.message_id().as_str(),
+        format!("{CHANNEL}/messages/{receipt}")
+    );
+    subscription.commit_durable(&batch).unwrap();
+    let hold_scans = &fake.state().scans[tracked..];
+    assert!(
+        !hold_scans.is_empty() && hold_scans.len() <= 3,
+        "bounded thread listings during the hold: {hold_scans:?}"
+    );
+    assert!(
+        hold_scans
+            .iter()
+            .all(|(_, thread, _, _)| thread.as_deref() == Some(root.as_str())),
+        "only thread listings during the hold, no history: {hold_scans:?}"
+    );
+    subscription.close().unwrap();
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn relay_poll_during_budget_hold_lists_at_most_three_threads() {
+    // #805 bound: however many relay threads are tracked, one poll
+    // during a hold makes at most 3 thread listings.
+    let directory = scratch("relay-hold-bound");
+    let fake = FakeTransport::new();
+    fake.push_script(vec![FakeStep::Idle; 14]);
+    let mut roots = Vec::new();
+    for i in 0..4_u64 {
+        let root = ts(T0 + 10_000 + i * 2_000);
+        let reply = ts(T0 + 11_000 + i * 2_000);
+        fake.push_history(bot_message(&root, None, RELAY_PEER, "relay envelope"));
+        fake.push_history(bot_message(&reply, Some(&root), RELAY_PEER, "first reply"));
+        roots.push(root);
+    }
+    let budget =
+        chat_subscription_slack::budget::CallBudget::at(&directory.join("budget.json"), 20);
+    let mut extra = relay_extra();
+    extra["rescan_budget_key"] = json!(directory.to_str().unwrap());
+    let mut backend = backend(&fake, relay_hold_bound_clock);
+    let mut subscription =
+        ChatSubscription::open(&mut backend, &relay_request(&directory, extra)).unwrap();
+    commit_next(&mut subscription);
+    RELAY_HOLD_BOUND_NOW.store(T0 + 12_000, Ordering::SeqCst);
+    drain_batches(&mut subscription);
+    let tracked = fake.state().scans.len();
+    budget.block_for(T0 + 3_600_000, "conversations.history");
+    for (i, root) in roots.iter().enumerate() {
+        let receipt = ts(T0 + 30_000 + i as u64 * 1_000);
+        fake.push_history(bot_message(
+            &receipt,
+            Some(root),
+            RELAY_PEER,
+            "receipt: delivered",
+        ));
+    }
+    RELAY_HOLD_BOUND_NOW.store(T0 + 18_000, Ordering::SeqCst);
+    drain_batches(&mut subscription);
+    let hold_scans = &fake.state().scans[tracked..];
+    let thread_listings = hold_scans.iter().filter(|scan| scan.1.is_some()).count();
+    assert_eq!(
+        thread_listings, 3,
+        "at most 3 thread listings in one held poll: {hold_scans:?}"
+    );
+    assert!(
+        hold_scans.iter().all(|scan| scan.1.is_some()),
+        "no history listings during the hold: {hold_scans:?}"
+    );
+    subscription.close().unwrap();
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn relay_poll_during_replies_caused_hold_lists_no_threads() {
+    // #805 guard: a hold caused by conversations.replies itself must
+    // not be spent listing threads; that method is the limited one.
+    let directory = scratch("relay-hold-replies");
+    let fake = FakeTransport::new();
+    fake.push_script(vec![FakeStep::Idle; 14]);
+    let root = ts(T0 + 10_000);
+    let reply = ts(T0 + 11_000);
+    fake.push_history(bot_message(&root, None, RELAY_PEER, "relay envelope"));
+    fake.push_history(bot_message(&reply, Some(&root), RELAY_PEER, "first reply"));
+    let budget =
+        chat_subscription_slack::budget::CallBudget::at(&directory.join("budget.json"), 20);
+    let mut extra = relay_extra();
+    extra["rescan_budget_key"] = json!(directory.to_str().unwrap());
+    let mut backend = backend(&fake, relay_hold_clock);
+    let mut subscription =
+        ChatSubscription::open(&mut backend, &relay_request(&directory, extra)).unwrap();
+    commit_next(&mut subscription);
+    RELAY_HOLD_NOW.store(T0 + 12_000, Ordering::SeqCst);
+    drain_batches(&mut subscription);
+    let tracked = fake.state().scans.len();
+    budget.block_for(T0 + 3_600_000, "conversations.replies");
+    let receipt = ts(T0 + 13_000);
+    fake.push_history(bot_message(
+        &receipt,
+        Some(&root),
+        RELAY_PEER,
+        "receipt: delivered",
+    ));
+    RELAY_HOLD_NOW.store(T0 + 18_000, Ordering::SeqCst);
+    assert!(
+        next_batch_within(&mut subscription, 3).is_none(),
+        "no receipt is read during a replies-caused hold"
+    );
+    assert_eq!(
+        fake.state().scans.len(),
+        tracked,
+        "no listing at all during a replies-caused hold: {:?}",
+        fake.state().scans
+    );
+    subscription.close().unwrap();
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+clock!(relay_hold_fresh_clock, RELAY_HOLD_FRESH_NOW);
+clock!(relay_hold_unknown_clock, RELAY_HOLD_UNKNOWN_NOW);
+clock!(relay_hold_limited_clock, RELAY_HOLD_LIMITED_NOW);
+
+fn tracked_subscription(
+    name: &str,
+    clock: fn() -> u64,
+    now: &AtomicU64,
+    roots_and_replies: &[(&str, &str)],
+) -> (ChatSubscription, FakeTransport, PathBuf, PathBuf) {
+    let directory = scratch(name);
+    let fake = FakeTransport::new();
+    fake.push_script(vec![FakeStep::Idle; 16]);
+    for (root, reply) in roots_and_replies {
+        fake.push_history(bot_message(root, None, RELAY_PEER, "relay envelope"));
+        fake.push_history(bot_message(reply, Some(root), RELAY_PEER, "first reply"));
+    }
+    let mut extra = relay_extra();
+    extra["rescan_budget_key"] = json!(directory.to_str().unwrap());
+    let mut backend = backend(&fake, clock);
+    let mut subscription =
+        ChatSubscription::open(&mut backend, &relay_request(&directory, extra)).unwrap();
+    commit_next(&mut subscription);
+    now.store(T0 + 12_000, Ordering::SeqCst);
+    drain_batches(&mut subscription);
+    let budget_path = directory.join("budget.json");
+    (subscription, fake, directory, budget_path)
+}
+
+#[test]
+fn relay_poll_during_hold_reads_receipt_on_fresh_post_with_no_earlier_reply() {
+    // #805 review fix 1: a relay post whose thread was never listed
+    // (its first reply IS the receipt) is still a held-poll candidate,
+    // because the poll tracks the root when it first sees it.
+    let directory = scratch("relay-hold-fresh");
+    let fake = FakeTransport::new();
+    fake.push_script(vec![FakeStep::Idle; 14]);
+    let root = ts(T0 + 10_000);
+    fake.push_history(bot_message(&root, None, RELAY_PEER, "relay envelope"));
+    let budget =
+        chat_subscription_slack::budget::CallBudget::at(&directory.join("budget.json"), 20);
+    let mut extra = relay_extra();
+    extra["rescan_budget_key"] = json!(directory.to_str().unwrap());
+    let mut backend = backend(&fake, relay_hold_fresh_clock);
+    let mut subscription =
+        ChatSubscription::open(&mut backend, &relay_request(&directory, extra)).unwrap();
+    commit_next(&mut subscription);
+    RELAY_HOLD_FRESH_NOW.store(T0 + 12_000, Ordering::SeqCst);
+    drain_batches(&mut subscription);
+    let tracked = fake.state().scans.len();
+    assert!(
+        fake.state().scans[..tracked]
+            .iter()
+            .all(|scan| scan.1.is_none()),
+        "no thread was listed before the hold: {:?}",
+        fake.state().scans
+    );
+    budget.block_for(T0 + 3_600_000, "conversations.history");
+    let receipt = ts(T0 + 13_000);
+    fake.push_history(bot_message(
+        &receipt,
+        Some(&root),
+        RELAY_PEER,
+        "receipt: delivered",
+    ));
+    RELAY_HOLD_FRESH_NOW.store(T0 + 18_000, Ordering::SeqCst);
+    let batch = next_batch_long(&mut subscription).expect("receipt on a fresh post read in hold");
+    assert_eq!(
+        single_message(&batch).message_id().as_str(),
+        format!("{CHANNEL}/messages/{receipt}")
+    );
+    subscription.commit_durable(&batch).unwrap();
+    subscription.close().unwrap();
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn relay_poll_during_unknown_cause_hold_lists_no_threads() {
+    // #805 review fix 2: a hold with no recorded method (written by an
+    // older bridge, or by one whose own writes dropped the field) is
+    // unsafe: list nothing.
+    let root = ts(T0 + 10_000);
+    let reply = ts(T0 + 11_000);
+    let (mut subscription, fake, directory, budget_path) = tracked_subscription(
+        "relay-hold-unknown",
+        relay_hold_unknown_clock,
+        &RELAY_HOLD_UNKNOWN_NOW,
+        &[(&root, &reply)],
+    );
+    let tracked = fake.state().scans.len();
+    let budget = chat_subscription_slack::budget::CallBudget::at(&budget_path, 20);
+    budget.block(T0 + 3_600_000);
+    let receipt = ts(T0 + 13_000);
+    fake.push_history(bot_message(
+        &receipt,
+        Some(&root),
+        RELAY_PEER,
+        "receipt: delivered",
+    ));
+    RELAY_HOLD_UNKNOWN_NOW.store(T0 + 18_000, Ordering::SeqCst);
+    assert!(
+        next_batch_within(&mut subscription, 3).is_none(),
+        "no receipt is read during an unknown-cause hold"
+    );
+    assert_eq!(
+        fake.state().scans.len(),
+        tracked,
+        "no listing during an unknown-cause hold: {:?}",
+        fake.state().scans
+    );
+    subscription.close().unwrap();
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn relay_poll_stops_held_listings_when_one_is_rate_limited() {
+    // #805 review fix 3: a rate limit during the held listings stops
+    // them; the poll must not go on listing against the limited method.
+    let root_a = ts(T0 + 10_000);
+    let reply_a = ts(T0 + 11_000);
+    let root_b = ts(T0 + 20_000);
+    let reply_b = ts(T0 + 21_000);
+    let (mut subscription, fake, directory, budget_path) = tracked_subscription(
+        "relay-hold-limited",
+        relay_hold_limited_clock,
+        &RELAY_HOLD_LIMITED_NOW,
+        &[(&root_a, &reply_a), (&root_b, &reply_b)],
+    );
+    let tracked = fake.state().scans.len();
+    let budget = chat_subscription_slack::budget::CallBudget::at(&budget_path, 20);
+    budget.block_for(T0 + 3_600_000, "conversations.history");
+    for (i, root) in [&root_a, &root_b].iter().enumerate() {
+        let receipt = ts(T0 + 30_000 + i as u64 * 1_000);
+        fake.push_history(bot_message(
+            &receipt,
+            Some(root),
+            RELAY_PEER,
+            "receipt: delivered",
+        ));
+    }
+    fake.state()
+        .scan_failures
+        .push_back(TransportError::not_applied(
+            "slack_rate_limited",
+            "Slack rate-limited request conversations.replies. Retry after 60 seconds. \
+             {\"retry_after_seconds\":60}",
+            true,
+        ));
+    RELAY_HOLD_LIMITED_NOW.store(T0 + 18_000, Ordering::SeqCst);
+    drain_batches(&mut subscription);
+    let hold_scans = &fake.state().scans[tracked..];
+    let thread_listings = hold_scans.iter().filter(|scan| scan.1.is_some()).count();
+    assert_eq!(
+        thread_listings, 1,
+        "held listings stop at the first rate limit: {hold_scans:?}"
+    );
+    subscription.close().unwrap();
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn rate_limited_listing_logs_method_and_channel() {
+    // #805: every rate-limited listing is logged with the Slack method
+    // and channel, so the trigger can be found in the plugin logs.
+    let directory = scratch("relay-ratelimit-log");
+    let fake = FakeTransport::new();
+    fake.push_script(vec![FakeStep::Idle; 10]);
+    let root = ts(T0 + 10_000);
+    fake.push_history(bot_message(&root, None, RELAY_PEER, "relay envelope"));
+    fake.state()
+        .scan_failures
+        .push_back(TransportError::not_applied(
+            "slack_rate_limited",
+            "Slack rate-limited request conversations.history. Retry after 0 seconds. \
+             {\"retry_after_seconds\":0}",
+            true,
+        ));
+    let mut backend = backend(&fake, relay_log_clock);
+    let mut subscription =
+        ChatSubscription::open(&mut backend, &relay_request(&directory, relay_extra())).unwrap();
+    commit_next(&mut subscription);
+    RELAY_LOG_NOW.store(T0 + 12_000, Ordering::SeqCst);
+    let batch = next_batch_long(&mut subscription).expect("relay batch after the retry");
+    subscription.commit_durable(&batch).unwrap();
+    let logged = log(&directory);
+    assert!(
+        logged.contains("conversations.history") && logged.contains(CHANNEL),
+        "rate-limit log line names method and channel: {logged}"
+    );
+    subscription.close().unwrap();
+    fs::remove_dir_all(&directory).unwrap();
+}

@@ -123,7 +123,13 @@
 //! Admission, the ledger, and dedup are the rescan's own (`admit`, `consider`, the same
 //! queue and pending record), so a post the general rescan also finds is delivered once.
 //! Every listing spends the same host-wide budget ([`crate::budget`]), and a budget refusal
-//! or a rate limit backs the relay poll off exactly as it backs off a pass. The poll also
+//! or a rate limit backs the relay poll off exactly as it backs off a pass. One exception
+//! keeps delivery receipts from starving during a hold (#805): when the budget is holding
+//! every bridge back, the poll may still list at most three already-tracked relay threads
+//! per poll, spending past the back-off but never past the half-budget headroom — unless
+//! the hold was caused by `conversations.replies` itself, whose Retry-After is honoured in
+//! full. Each rate-limited listing is logged with its method and channel, and the budget
+//! records the causing method with the hold. The poll also
 //! stops for the minute once half the per-minute budget is used, so a burst cannot starve
 //! the owner-channel general rescan. At the fastest
 //! setting (5 s) one relay channel costs at most 12 history listings a minute plus one
@@ -1021,6 +1027,9 @@ struct Rescan {
     relay_failures: u32,
 }
 
+/// Thread listings one relay poll may still make during a budget hold
+/// (#805 relay-poll-receipts-during-hold).
+const MAX_HOLD_THREAD_LISTINGS: usize = 3;
 const MAX_NOTED: usize = 1_024;
 const MAX_TRACKED_THREADS: usize = 1_024;
 /// Carried replies remembered per thread.
@@ -1043,6 +1052,9 @@ struct Spend<'a> {
     thread_calls: usize,
     usage: Option<crate::budget::Usage>,
     refused: Option<crate::budget::Refusal>,
+    /// Spend ignoring a recorded back-off: only for the bounded thread
+    /// listings a held relay poll may still make (#805).
+    ignore_back_off: bool,
 }
 
 /// Whether every reply a thread gained since its last listing (`seen`, at most [`SEEN_TTL_MILLIS`]
@@ -1677,6 +1689,23 @@ impl SlackDriver {
                     continue;
                 }
                 self.consider(rescan, &row.message, floor, ripe, &mut found);
+                // Track a fresh relay post at once: its first reply is
+                // usually the receipt, so its thread must already be a
+                // held-poll candidate before any reply exists (#805).
+                if row
+                    .message
+                    .thread_ts
+                    .as_deref()
+                    .is_none_or(|thread| thread == row.message.message_ts)
+                {
+                    if let Some(root_micros) = ids::ts_micros(&row.message.message_ts) {
+                        let key = message_key(channel, &row.message.message_ts);
+                        let entry = rescan.threads.entry(key).or_insert(root_micros);
+                        if *entry < root_micros {
+                            *entry = root_micros;
+                        }
+                    }
+                }
                 if let Some(latest) = row
                     .latest_reply
                     .as_deref()
@@ -1768,6 +1797,22 @@ impl SlackDriver {
                 }
             }
         }
+        // During a budget hold the poll listed nothing above; still read
+        // receipts on tracked relay threads, bounded (#805).
+        let held_listings = if matches!(spend.refused, Some(crate::budget::Refusal::Blocked(_))) {
+            self.hold_thread_listings(
+                rescan,
+                &mut spend,
+                now,
+                floor,
+                ripe,
+                &started,
+                &mut yielded,
+                &mut found,
+            )
+        } else {
+            0
+        };
         rescan
             .queue
             .make_contiguous()
@@ -1775,7 +1820,13 @@ impl SlackDriver {
         // Scheduling mirrors a pass: a budget refusal or a rate limit
         // backs the poll off the same way, other failures exponentially.
         let interval_millis = u64::try_from(interval.as_millis()).unwrap_or(u64::MAX);
-        if let Some(refusal) = spend.refused {
+        if held_listings > 0 {
+            rescan.relay_next_due_millis = now.saturating_add(interval_millis);
+            self.diagnostics.log(&format!(
+                "relay poll: budget hold; listed {held_listings} tracked relay thread(s) for receipts; next poll in {} s",
+                interval_millis / 1_000
+            ));
+        } else if let Some(refusal) = spend.refused {
             let cap = u64::try_from(rescan::MAX_RATE_LIMIT_BACKOFF.as_millis()).unwrap_or(u64::MAX);
             let until = match refusal {
                 crate::budget::Refusal::Blocked(until) => until
@@ -1873,6 +1924,143 @@ impl SlackDriver {
         }
     }
 
+    /// During a budget hold, list at most [`MAX_HOLD_THREAD_LISTINGS`]
+    /// tracked relay threads so receipts on relay posts are still read
+    /// (#805). Never when the hold was caused by `conversations.replies`
+    /// itself: that method is the limited one, and its back-off (at
+    /// least its Retry-After) is honoured in full. Listings still count
+    /// against the shared budget and stop at the same half-budget
+    /// headroom as a normal poll. Returns the listings made.
+    #[allow(clippy::too_many_arguments)]
+    fn hold_thread_listings(
+        &mut self,
+        rescan: &mut Rescan,
+        spend: &mut Spend<'_>,
+        now: u64,
+        floor: u128,
+        ripe: u128,
+        started: &Instant,
+        yielded: &mut bool,
+        found: &mut Vec<String>,
+    ) -> usize {
+        let Some(budget) = spend.budget else {
+            return 0;
+        };
+        let Some((_, method)) = budget.blocked(now) else {
+            return 0;
+        };
+        match method.as_deref() {
+            Some("conversations.replies") => {
+                self.diagnostics.log(
+                    "relay poll: budget hold was caused by conversations.replies; listing no threads during it",
+                );
+                return 0;
+            }
+            Some(_) => {}
+            None => {
+                // A hold written by an older bridge (or rewritten by one
+                // that drops the field) names no method: unknown is unsafe.
+                self.diagnostics.log(
+                    "relay poll: budget hold names no causing method; listing no threads during it",
+                );
+                return 0;
+            }
+        }
+        let mut candidates: Vec<(u128, String, String)> = rescan
+            .threads
+            .iter()
+            .filter_map(|(key, through)| {
+                let (channel, root) = key.split_once('/')?;
+                self.config
+                    .relay_peers
+                    .contains_key(channel)
+                    .then(|| (*through, channel.to_owned(), root.to_owned()))
+            })
+            .collect();
+        // The threads read most recently are the ones receipts are
+        // likeliest to be waiting on.
+        candidates.sort_by(|a, b| b.cmp(a));
+        candidates.truncate(MAX_HOLD_THREAD_LISTINGS);
+        let before = spend.thread_calls;
+        spend.ignore_back_off = true;
+        'candidates: for (through, channel, root) in candidates {
+            let usage = budget.usage(now);
+            if usage.per_minute > 0 && usage.used >= usage.per_minute / 2 {
+                break 'candidates;
+            }
+            let peers = self
+                .config
+                .relay_peers
+                .get(&channel)
+                .cloned()
+                .unwrap_or_default();
+            let key = message_key(&channel, &root);
+            let oldest = micros_ts(floor.max(through));
+            let mut listed_through = through;
+            let mut token: Option<String> = None;
+            let mut complete = false;
+            let mut overflowed = false;
+            let mut failed = false;
+            for _ in 0..rescan::MAX_THREAD_PAGES {
+                if self.rescan_stop(started, yielded, true) {
+                    break 'candidates;
+                }
+                let query = ScanQuery {
+                    channel_id: &channel,
+                    thread_ts: Some(&root),
+                    oldest: &oldest,
+                    page_token: token.as_deref(),
+                };
+                let listed = match self.scan_listing(&query, started, yielded, spend) {
+                    Ok(listed) => listed,
+                    Err(error) => {
+                        failed = true;
+                        // A rate limit during the held listings stops
+                        // them: do not list on against the method just
+                        // limited (#805).
+                        if rescan::rate_limit_delay(&error).is_some() {
+                            break 'candidates;
+                        }
+                        break;
+                    }
+                };
+                for row in &listed.messages {
+                    if row.message.message_ts == root {
+                        continue;
+                    }
+                    if !row
+                        .message
+                        .user_id
+                        .as_deref()
+                        .is_some_and(|author| peers.iter().any(|peer| peer == author))
+                    {
+                        overflowed = true;
+                        continue;
+                    }
+                    overflowed |= !self.consider(rescan, &row.message, floor, ripe, found);
+                    if let Some(at) = ids::ts_micros(&row.message.message_ts) {
+                        if at <= ripe {
+                            listed_through = listed_through.max(at);
+                        }
+                    }
+                }
+                token = listed.next_page_token;
+                if token.is_none() {
+                    complete = true;
+                    break;
+                }
+            }
+            if complete && !overflowed && !failed {
+                rescan.threads.insert(key, listed_through);
+            }
+            if matches!(spend.refused, Some(crate::budget::Refusal::Spent(_))) {
+                break 'candidates;
+            }
+        }
+        spend.ignore_back_off = false;
+        spend.thread_calls - before
+    }
+
     /// One bounded pass over every configured channel's history and the threads in it with
     /// replies not yet listed; see the module documentation.
     /// One rescan listing. A rate-limited listing is retried in-pass after the wait Slack
@@ -1913,7 +2101,7 @@ impl SlackDriver {
             if let Some(budget) = spend.budget {
                 // This bridge's own retry after the wait Slack named is not held by the back-off
                 // it recorded for the others (#615 chat-file-messages); it still counts.
-                let taken = if retries > 0 {
+                let taken = if retries > 0 || spend.ignore_back_off {
                     budget.take_ignoring_back_off((self.now_millis)())
                 } else {
                     budget.take((self.now_millis)())
@@ -1941,6 +2129,19 @@ impl SlackDriver {
                     let Some(delay) = rescan::rate_limit_delay(&error) else {
                         return Err(error);
                     };
+                    // Name the listing that hit the limit (method plus
+                    // channel) so the trigger can be found in the logs,
+                    // and record the method with the shared back-off:
+                    // a hold it causes must not be spent on that method.
+                    let method = if query.thread_ts.is_some() {
+                        "conversations.replies"
+                    } else {
+                        "conversations.history"
+                    };
+                    self.diagnostics.log(&format!(
+                        "listing rate-limited: {method} in channel {} ({}: {})",
+                        query.channel_id, error.code, error.detail
+                    ));
                     // Every bridge listing as this identity backs off with this one.
                     if let Some(budget) = spend.budget {
                         let wait = u64::try_from(delay.as_millis())
@@ -1950,7 +2151,7 @@ impl SlackDriver {
                                 u64::try_from(rescan::MAX_RATE_LIMIT_BACKOFF.as_millis())
                                     .unwrap_or(u64::MAX),
                             );
-                        budget.block((self.now_millis)().saturating_add(wait));
+                        budget.block_for((self.now_millis)().saturating_add(wait), method);
                     }
                     retries += 1;
                     pending = Some((error, delay));

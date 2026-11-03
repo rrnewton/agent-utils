@@ -56,11 +56,15 @@ pub struct CallBudget {
     per_minute: u64,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct State {
     window_start_millis: u64,
     used: u64,
     blocked_until_millis: u64,
+    /// The listing method whose rate limit set the back-off, when known
+    /// (#805): a hold caused by `conversations.replies` must not be spent
+    /// listing threads, while one caused by `conversations.history` may.
+    blocked_method: Option<String>,
 }
 
 impl CallBudget {
@@ -165,14 +169,41 @@ impl CallBudget {
     /// Make every bridge of this identity back off until `until` (milliseconds); an earlier
     /// instant than one already set changes nothing.
     pub fn block(&self, until: u64) {
+        self.block_inner(until, None);
+    }
+
+    /// As [`Self::block`], recording the listing method whose rate limit
+    /// caused the back-off (`conversations.history` or
+    /// `conversations.replies`), so a held poll can tell whether listing
+    /// threads would spend the very method that is limited (#805).
+    pub fn block_for(&self, until: u64, method: &str) {
+        self.block_inner(until, Some(method));
+    }
+
+    fn block_inner(&self, until: u64, method: Option<&str>) {
         let _ = self.update(|state| {
             if until > state.blocked_until_millis {
                 state.blocked_until_millis = until;
+                state.blocked_method = method.map(str::to_owned);
                 true
             } else {
                 false
             }
         });
+    }
+
+    /// The back-off in force at `now`: until when, and which listing
+    /// method caused it, when either is known.
+    #[must_use]
+    pub fn blocked(&self, now: u64) -> Option<(u64, Option<String>)> {
+        let mut out = None;
+        let _ = self.update(|state| {
+            if now < state.blocked_until_millis {
+                out = Some((state.blocked_until_millis, state.blocked_method.clone()));
+            }
+            false
+        });
+        out
     }
 
     /// The calls made in the current window as of `now`, without spending one.
@@ -218,6 +249,7 @@ impl CallBudget {
                 "window_start_millis": state.window_start_millis,
                 "used": state.used,
                 "blocked_until_millis": state.blocked_until_millis,
+                "blocked_method": state.blocked_method,
             }))
             .map_err(std::io::Error::other)?;
             file.seek(SeekFrom::Start(0))?;
@@ -244,6 +276,7 @@ fn parse(text: &str) -> State {
         window_start_millis: number("window_start_millis"),
         used: number("used"),
         blocked_until_millis: number("blocked_until_millis"),
+        blocked_method: value["blocked_method"].as_str().map(str::to_owned),
     }
 }
 
@@ -322,6 +355,33 @@ mod tests {
         for at in 50_000..50_010 {
             assert!(one.take(at).is_ok());
         }
+        fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn a_block_records_which_method_caused_it() {
+        // #805: a held poll may list threads unless conversations.replies
+        // caused the hold, so the causing method is recorded with it.
+        let path = scratch("method");
+        let budget = CallBudget::at(&path, 20);
+        budget.block_for(50_000, "conversations.replies");
+        assert_eq!(
+            budget.blocked(10_000),
+            Some((50_000, Some("conversations.replies".to_owned())))
+        );
+        // An earlier instant does not replace the recorded hold.
+        budget.block_for(20_000, "conversations.history");
+        assert_eq!(
+            budget.blocked(10_000),
+            Some((50_000, Some("conversations.replies".to_owned())))
+        );
+        // A later hold replaces it, and the hold ends at its instant.
+        budget.block_for(80_000, "conversations.history");
+        assert_eq!(
+            budget.blocked(60_000),
+            Some((80_000, Some("conversations.history".to_owned())))
+        );
+        assert_eq!(budget.blocked(80_000), None);
         fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
