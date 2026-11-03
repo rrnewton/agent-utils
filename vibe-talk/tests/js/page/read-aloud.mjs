@@ -97,7 +97,7 @@ test("tapping Read with no error showing leaves a reader near the newest line wh
   };
   const held = await readNearTheBottom(SCRIPT);
   assert.equal(held, 0, `tapping Read moved the reader by ${held}px`);
-  const moved = await readNearTheBottom(brokenScript("  if (box.hidden) return;\n", ""));
+  const moved = await readNearTheBottom(await brokenModule([{ file: "src/view/shell/notices.ts", find: "    if (box.hidden) return;\n", replace: "" }]));
   assert.ok(moved > 0, "the negative control did not snap the reader, so the check above proves nothing");
 });
 

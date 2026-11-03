@@ -91,6 +91,7 @@ export {
   shownNode,
   tagNameOf,
 } from "../view/dom/index.ts";
+export { createShellNotices } from "../view/shell/index.ts";
 export {
   COMPOSER_FIELDS,
   COMPOSER_GROW_BOXES,

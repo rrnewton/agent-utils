@@ -315,8 +315,8 @@ settingsReadouts.serverHost();
 // the connection detail on the settings screen, a conversation boundary is a seam in the
 // transcript, and the live/muted/idle state is on the controls themselves. What is left is a thing
 // that was true a moment ago.
-const STATUS_DISMISS_MS = 6000;
-let statusTimer = null;
+// The line, the state dot, the error panel and the connection details are view/shell's (`createShellNotices`,
+// below, `STATUS_DISMISS_MS`; `#624 voice-page-modularity`).
 
 // The floating chips can wrap or disappear as actions become available. Keep the banner above
 // their measured height instead of giving both overlays the same bottom edge. Observing the tools
@@ -464,54 +464,29 @@ function placeChipsOverComposer() {
   readAloudOwner().placeReadSteer();
 }
 
-const setStatus = (text) => {
-  if (statusTimer !== null) {
-    clearTimeout(statusTimer);
-  }
-  // UN-HIDE FIRST, then write. An `aria-live` region whose element is `display: none` when its
-  // text changes announces nothing at all; the order here is what makes it speak.
-  el("status-line").hidden = false;
-  el("status").textContent = redact(text);
-  statusTimer = setTimeout(dismissStatus, STATUS_DISMISS_MS);
-};
-
 /**
- * Take it away.
- *
- * A HIDE, NOT AN ERASE, and that is deliberate twice over: the text is still there for anything
- * that wants to know what was last said, and a dozen assertions in the page suite read
- * `#status`'s textContent after the moment it was set.
+ * The status line, the state dot beside it, the error panel and the connection details: one owner in
+ * web/src/view/shell/notices.ts (`#624 voice-page-modularity`). The page destructures its commands under
+ * their old names; taking the credential out of what is said (`redact`) and holding the reader as the panel
+ * comes and goes are the page's.
  */
-function dismissStatus() {
-  if (statusTimer !== null) {
-    clearTimeout(statusTimer);
-    statusTimer = null;
-  }
-  // `voice-unresponsive-signal`: while the service is not answering, the line falls back to
-  // saying so rather than to nothing. Hiding it would leave the call looking fine again.
-  if (voiceCall().session.health && voiceCall().session.health.unresponsive) {
-    el("status").textContent = voiceCall().UNRESPONSIVE_STATUS;
-    return;
-  }
-  el("status-line").hidden = true;
-}
+const shellNotices = createShellNotices({
+  clock: clockOnUse(),
+  el: (id) => el(id),
+  redact: (text) => redact(text),
+  // `voice-unresponsive-signal`: while the service is not answering, the line falls back to saying so.
+  unresponsive: () => (voiceCall().session.health && voiceCall().session.health.unresponsive
+    ? voiceCall().UNRESPONSIVE_STATUS : null),
+  holdingReader: (mutate) => holdingReader(mutate),
+  detailChanged: (text) => connectionReadouts.detail(text),
+});
+const { setStatus, dismissStatus, setState, showError, clearError, showDetail, addDetail, dismissBanner } = shellNotices;
 
-/**
- * One of: idle, working, live, unresponsive, ended, suspended, error. web/voice.css colours the
- * dot from this.
- *
- * `suspended` is `#54 resume-recovery`: the socket died while the page was in the background. It
- * is deliberately neither `ended` (which says the reader chose to hang up) nor `error` (which says
- * something is broken), because it is neither, and calling it either one is the defect.
- *
- * `unresponsive` is `voice-unresponsive-signal`: the socket is open and the call may recover, but
- * the service has stopped producing anything audible or readable. It is not `live`, which is what
- * the page used to say through a whole call of silence, and not `error`, which says the call is
- * broken and clears itself after a few seconds.
- */
-const setState = (name) => {
-  el("status-line").setAttribute("data-state", name);
-};
+// The state dot (`setState`): one of idle, working, live, unresponsive, ended, suspended, error, which
+// web/voice.css colours. `suspended` is `#54 resume-recovery`: the socket died while the page was in the
+// background, neither `ended` (the reader chose to hang up) nor `error` (something is broken). `unresponsive`
+// is `voice-unresponsive-signal`: the socket is open and the call may recover, but the service has stopped
+// producing anything audible or readable.
 
 // Nothing this page displays may contain a credential.
 //
@@ -536,49 +511,10 @@ function redact(text) {
 // The whole point of an earlier pass: a failure is SHOWN, in the page, in words the owner can act
 // on. The reported bug was that a 502 naming a missing API-key permission appeared only in the dev
 // console, so the only visible symptom was a page that did nothing. The panel lives outside the
-// three screens so it is visible on whichever one is up.
-let errorTimer = null;
+// three screens so it is visible on whichever one is up. `showError` and `clearError` are the shell notices'
+// (above). `#268 voice-call-drops`: `stay` keeps the panel until the reader acts — a new call, or its dismiss —
+// instead of taking it away after twelve seconds, because a driver glances back at the screen a minute later.
 
-/**
- * @param {string} text
- * @param {{stay?: boolean}} [options] `stay` keeps the panel until the reader acts — a new call, or
- *   its dismiss — instead of taking it away after twelve seconds. `#268 voice-call-drops`: the reason
- *   a call ended that the reader did not end stays, because a driver glances back at the screen a
- *   minute later, not within twelve seconds.
- */
-function showError(text, options) {
-  const box = el("error-wrap");
-  // Try again is offered by one error only, and it shows it after this; see `reportUnreachable`.
-  el("retry-start").hidden = true;
-  // So is Read with device voice, by a cloud read that failed (`cloudReadFailed`).
-  el("read-on-device").hidden = true;
-  holdingReader(() => {
-    el("error").textContent = redact(text);
-    el("error").hidden = false;
-    box.hidden = false;
-  });
-  setState("error");
-  if (errorTimer !== null) clearTimeout(errorTimer);
-  errorTimer = options && options.stay ? null : setTimeout(clearError, 12000);
-}
-
-function clearError() {
-  const box = el("error-wrap");
-  if (errorTimer !== null) clearTimeout(errorTimer);
-  errorTimer = null;
-  // `#209 voice-socket-open`. Try again belongs to the one error that offers it.
-  el("retry-start").hidden = true;
-  el("read-on-device").hidden = true;
-  // Most callers clear on the way into an action — Read, Talk, sign-in — whether or not anything is
-  // showing. With nothing to take away there is nothing to hold, and holding anyway would snap a
-  // reader within BOTTOM_SLACK_PX of the newest line down onto it.
-  if (box.hidden) return;
-  holdingReader(() => {
-    el("error").textContent = "";
-    el("error").hidden = true;
-    box.hidden = true;
-  });
-}
 // Call state and controls are owned by view/voice. Construction performs no I/O.
 voiceCall();
 
@@ -2572,9 +2508,8 @@ function showView(name) {
 // a variable rather than read back out of the DOM, so appending to it cannot pick up a redaction
 // marker and re-redact it.
 
-const BANNER_DISMISS_MS = 8000;
-let connectionDetail = "";
-let bannerTimer = null;
+// The details, the banner and its dismissal are the shell notices' (`showDetail`, `addDetail`, `dismissBanner`,
+// `BANNER_DISMISS_MS`, above).
 
 /** The permanent connection readouts; their live values stay with the channel's owner. */
 const connectionReadouts = mountConnectionReadouts({
@@ -2585,37 +2520,6 @@ const connectionReadouts = mountConnectionReadouts({
     attached: () => liveFollow.attached(),
   },
 });
-
-function renderDetail() {
-  const text = redact(connectionDetail);
-  el("connection-detail").textContent = text;
-  // `#348 settings-dynamic-lists`. Settings draws it as a readout, one part to a line; the banner
-  // keeps the one line it has room for.
-  connectionReadouts.detail(text);
-}
-
-function showDetail(text) {
-  connectionDetail = String(text);
-  renderDetail();
-  el("connection-banner").hidden = false;
-  if (bannerTimer !== null) {
-    clearTimeout(bannerTimer);
-  }
-  bannerTimer = setTimeout(dismissBanner, BANNER_DISMISS_MS);
-}
-
-function addDetail(text) {
-  connectionDetail = `${connectionDetail} · ${text}`;
-  renderDetail();
-}
-
-function dismissBanner() {
-  if (bannerTimer !== null) {
-    clearTimeout(bannerTimer);
-    bannerTimer = null;
-  }
-  el("connection-banner").hidden = true;
-}
 
 // --- transcript -----------------------------------------------------------------------------
 

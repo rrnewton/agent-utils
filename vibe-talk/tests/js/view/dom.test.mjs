@@ -103,3 +103,71 @@ test("`#624 voice-page-modularity`: plain text goes on the clipboard by its API,
     globalThis.document = was;
   }
 });
+
+/** What stands over every screen (web/src/view/shell). */
+const VIEW_SHELL = await moduleForTests("src/view/shell/index.ts");
+
+/** A shell's elements, each with its text, its hidden state and its attributes. */
+function elements() {
+  const made = new Map();
+  return (id) => {
+    if (!made.has(id)) {
+      const attrs = new Map();
+      made.set(id, { id, hidden: true, textContent: "", setAttribute: (name, value) => attrs.set(name, value), getAttribute: (name) => attrs.get(name) ?? null });
+    }
+    return made.get(id);
+  };
+}
+
+test("`#624 voice-page-modularity`: the status line says a thing, takes itself away, and falls back while the service is silent", () => {
+  const { createShellNotices, STATUS_DISMISS_MS } = VIEW_SHELL;
+  const el = elements();
+  const timers = [];
+  let silent = null;
+  const notices = createShellNotices({
+    clock: { setTimeout: (run, ms) => { timers.push({ run, ms }); return timers.length; }, clearTimeout: (h) => { timers[h - 1] = null; } },
+    el, redact: (text) => String(text).replace("secret-token-1", "[redacted]"), unresponsive: () => silent,
+    holdingReader: (mutate) => mutate(), detailChanged: () => {},
+  });
+  notices.setStatus("Saved with secret-token-1.");
+  assert.equal(el("status-line").hidden, false);
+  assert.equal(el("status").textContent, "Saved with [redacted].", "a credential never reaches the line");
+  assert.equal(timers[0].ms, STATUS_DISMISS_MS);
+  timers[0].run();
+  assert.equal(el("status-line").hidden, true);
+  assert.equal(el("status").textContent, "Saved with [redacted].", "a hide, not an erase");
+  silent = "The voice service is not answering.";
+  notices.setStatus("Something else.");
+  notices.dismissStatus();
+  assert.equal(el("status-line").hidden, false, "while the service is silent the line says so");
+  assert.equal(el("status").textContent, silent);
+});
+
+test("`#624 voice-page-modularity`: the error panel stays twelve seconds, or until acted on, and the details are kept for Settings", () => {
+  const { createShellNotices, BANNER_DISMISS_MS } = VIEW_SHELL;
+  const el = elements();
+  const timers = [];
+  const details = [];
+  const notices = createShellNotices({
+    clock: { setTimeout: (run, ms) => { timers.push({ run, ms }); return timers.length; }, clearTimeout: (h) => { timers[h - 1] = null; } },
+    el, redact: (text) => String(text), unresponsive: () => null, holdingReader: (mutate) => mutate(),
+    detailChanged: (text) => details.push(text),
+  });
+  notices.showError("HTTP 502");
+  assert.equal(el("error-wrap").hidden, false);
+  assert.equal(el("status-line").getAttribute("data-state"), "error");
+  assert.equal(timers.at(-1).ms, 12000);
+  timers.at(-1).run();
+  assert.equal(el("error-wrap").hidden, true);
+  notices.showError("The call dropped.", { stay: true });
+  assert.equal(timers.filter(Boolean).length, 0, "a reason that stays has no timer");
+  notices.clearError();
+  assert.equal(el("error").textContent, "");
+  notices.showDetail("live stream attached");
+  notices.addDetail("dropped once");
+  assert.deepStrictEqual(details, ["live stream attached", "live stream attached · dropped once"]);
+  assert.equal(el("connection-banner").hidden, false);
+  assert.equal(timers.at(-1).ms, BANNER_DISMISS_MS);
+  timers.at(-1).run();
+  assert.equal(el("connection-banner").hidden, true);
+});
