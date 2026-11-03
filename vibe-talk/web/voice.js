@@ -2834,24 +2834,6 @@ function keepingCardStill(id, change, slide = false) {
 // of their own; not while a reply is open under a row, whose box is anchored to it; and ended at once by
 // the reader's own wheel or key on the list, any redraw of the cards, or another pack.
 
-/** The slides running, to end them (`finishPackSlide`). @type {Set<Animation>} */
-const packSlides = new Set();
-
-/**
- * The card a slide is for and its own rows, drawn over what slides (`data-slide-over`): what is below starts
- * where it was, over the room the card or its rows just took, and would cover them, and take a press meant
- * for them, until it had slid away.
- *
- * @type {Set<HTMLElement>}
- */
-const slideOver = new Set();
-
-/** The slides ended or done: the card and its rows drawn in the list's order again. */
-function endSlideOver() {
-  for (const item of slideOver) item.removeAttribute("data-slide-over");
-  slideOver.clear();
-}
-
 /** A duration the stylesheet says on #screen-main, in ms: 0 where it says none (`cardFlightMs`). */
 function screenMotionMs(name) {
   const style = typeof window.getComputedStyle === "function" ? window.getComputedStyle(leftEl("screen-main")) : null;
@@ -2860,101 +2842,20 @@ function screenMotionMs(name) {
   return parsed ? Number(parsed[1]) * (parsed[2] === "s" ? 1000 : 1) : 0;
 }
 
-/** End every slide at once: everything drawn where it is laid out. */
-function finishPackSlide() {
-  for (const motion of [...packSlides]) motion.finish();
-  packSlides.clear();
-  endSlideOver();
-}
-
-/** What an item of the cards is across a redraw, which draws every item anew: its kind and its id. */
-function slideKey(item) {
-  return JSON.stringify([item.tagName, item.id || "", item.hasAttribute("data-card"), item.getAttribute("data-unpack-thread") || "",
-    item.getAttribute("data-id") || item.getAttribute("data-ids") || ""]);
-}
-
 /**
- * The items drawn after card `row`'s thread, in order: the cards' items after its unpacked rows, then
- * what follows the cards in their list (Main's box, `#419 threads-view-main-messages`). Only those shown.
- *
- * @param {HTMLElement} row
- * @returns {HTMLElement[]}
+ * The slides running and the card drawn over them, ending them, what an item of the cards is across a
+ * redraw, the items after a card's thread, and the slide itself: one owner in
+ * web/src/view/channel/packslide.ts (`#624 voice-page-modularity`). Its durations are the stylesheet's.
  */
-function itemsAfterBlock(row) {
-  const id = row.getAttribute("data-id");
-  const cards = leftEl("side-cards");
-  const items = /** @type {HTMLElement[]} */ ([...cards.children]);
-  const after = items.slice(items.indexOf(row) + 1).filter((item) => item.getAttribute("data-unpack-thread") !== id);
-  const below = /** @type {HTMLElement[]} */ ([...leftEl("side-list").children]).slice([...leftEl("side-list").children].indexOf(cards) + 1);
-  return [...after, ...below].filter((item) => rowShown(item) &&
-    (typeof item.getClientRects !== "function" || item.getClientRects().length > 0));
-}
-
-/** The first item drawn after card `row`'s thread, or null. @param {HTMLElement} row */
-function itemAfterBlock(row) {
-  return itemsAfterBlock(row)[0] || null;
-}
-
-/**
- * Card `row` was just packed or unpacked and held still, and the first item after its thread stood at
- * `was.top` before: draw everything after the thread on the screen where it was, hold it there a moment
- * (packed), and let it slide home.
- *
- * @param {HTMLElement} row
- * @param {{key: string, top: number}} was
- */
-function slideIntoPlace(row, was) {
-  const slideMs = screenMotionMs("--pack-slide");
-  if (slideMs <= 0 || replyDocked || document.hidden) return;
-  const items = itemsAfterBlock(row);
-  if (!items.length || typeof items[0].animate !== "function" || slideKey(items[0]) !== was.key) return;
-  const area = leftEl("side-scroll");
-  const stage = area.getBoundingClientRect();
-  const height = area.clientHeight || stage.height;
-  const moved = was.top - items[0].getBoundingClientRect().top;
-  if (Math.abs(moved) < 1) return;
-  const shift = Math.sign(moved) * Math.min(Math.abs(moved), height);
-  // Packed, the gap holds first; unpacked, the room opens at once.
-  const holdMs = moved > 0 ? screenMotionMs("--pack-gap-hold") : 0;
-  const total = holdMs + slideMs;
-  const ease = "cubic-bezier(0.2, 0, 0, 1)";
-  const from = `translateY(${shift}px)`;
-  const frames = holdMs > 0
-    ? [{ transform: from }, { transform: from, offset: holdMs / total, easing: ease }, { transform: "none" }]
-    : [{ transform: from, easing: ease }, { transform: "none" }];
-  const play = (/** @type {HTMLElement} */ item, /** @type {Keyframe[]} */ keyframes) => {
-    const motion = item.animate(keyframes, { duration: total });
-    packSlides.add(motion);
-    const done = () => {
-      packSlides.delete(motion);
-      if (packSlides.size === 0) endSlideOver();
-    };
-    motion.addEventListener("finish", done);
-    motion.addEventListener("cancel", done);
-  };
-  const id = row.getAttribute("data-id");
-  for (const item of [row, .../** @type {HTMLElement[]} */ ([...leftEl("side-cards").children])
-    .filter((one) => one.getAttribute("data-unpack-thread") === id)]) {
-    item.setAttribute("data-slide-over", "");
-    slideOver.add(item);
-  }
-  for (const item of items) {
-    const box = item.getBoundingClientRect();
-    // On the screen where it is drawn from, or where it comes to: the rest neither seen nor moved.
-    if (Math.min(box.top, box.top + shift) >= stage.bottom) break;
-    if (Math.max(box.bottom, box.bottom + shift) <= stage.top) continue;
-    play(item, frames);
-  }
-  // Unpacked, the thread's own rows fade in as the cards slide down from under them.
-  if (moved < 0) {
-    for (const item of /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children])) {
-      if (item.getAttribute("data-unpack-thread") !== id || !rowShown(item)) continue;
-      const box = item.getBoundingClientRect();
-      if (box.bottom <= stage.top || box.top >= stage.bottom) continue;
-      play(item, [{ opacity: 0, easing: ease }, { opacity: 1 }]);
-    }
-  }
-}
+const packSlider = createPackSlides({
+  cards: () => leftEl("side-cards"),
+  list: () => leftEl("side-list"),
+  area: () => leftEl("side-scroll"),
+  motionMs: (name) => screenMotionMs(name),
+  replyDocked: () => replyDocked,
+  hidden: () => document.hidden,
+});
+const { finishPackSlide, slideKey, itemAfterBlock, slideIntoPlace } = packSlider;
 
 /** The list the reader is actually looking at. Both panes share one scrolling element. */
 function visibleList() {

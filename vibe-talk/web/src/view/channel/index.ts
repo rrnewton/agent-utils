@@ -83,3 +83,5 @@ export { createPinSync } from "./pins.ts";
 export type { PinSync, PinSyncDependencies } from "./pins.ts";
 export { OVERSCROLL_IDLE_MS, OVERSCROLL_REST_MS, createFootRooms } from "./footroom.ts";
 export type { FootRooms, FootRoomsDependencies } from "./footroom.ts";
+export { createPackSlides } from "./packslide.ts";
+export type { PackSlides, PackSlidesDependencies } from "./packslide.ts";

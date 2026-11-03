@@ -438,3 +438,49 @@ test("`#624 voice-page-modularity`: the rooms past the right column's foot open 
   assert.equal(rooms.overextendRoom(area), 0);
   assert.equal(area.scrollTop, rows, "to the foot");
 });
+
+test("`#624 voice-page-modularity`: a packed card's gap holds and closes by sliding what is below it on the screen, and ends at once", () => {
+  const { createPackSlides } = CHANNEL_VIEW;
+  const item = (attrs, top, height = 50) => {
+    const map = new Map(Object.entries(attrs));
+    const node = {
+      tagName: "LI", id: "", hidden: false, className: "", played: [],
+      getAttribute: (name) => (map.has(name) ? map.get(name) : null),
+      hasAttribute: (name) => map.has(name),
+      setAttribute: (name, value) => map.set(name, value),
+      removeAttribute: (name) => map.delete(name),
+      getBoundingClientRect: () => ({ top: top(), bottom: top() + height }),
+      getClientRects: () => [{}],
+      animate: (frames, options) => {
+        const listeners = {};
+        const motion = { frames, options, addEventListener: (type, run) => { listeners[type] = run; }, finish: () => listeners.finish() };
+        node.played.push(motion);
+        return motion;
+      },
+    };
+    return node;
+  };
+  let shiftUp = 0;
+  const card = item({ "data-card": "", "data-id": "T1" }, () => 0);
+  const below = item({ "data-card": "", "data-id": "T2" }, () => 60 - shiftUp);
+  const offscreen = item({ "data-card": "", "data-id": "T3" }, () => 2000);
+  const cards = { children: [card, below, offscreen] };
+  const list = { children: [cards] };
+  const area = { clientHeight: 500, getBoundingClientRect: () => ({ top: 0, bottom: 500, height: 500 }) };
+  const slides = createPackSlides({
+    cards: () => cards, list: () => list, area: () => area,
+    motionMs: (name) => (name === "--pack-slide" ? 200 : 100), replyDocked: () => false, hidden: () => false,
+  });
+  assert.equal(slides.itemAfterBlock(card), below);
+  const was = { key: slides.slideKey(below), top: 160 };
+  slides.slideIntoPlace(card, was);
+  assert.equal(below.played.length, 1, "what is below on the screen slides");
+  assert.equal(offscreen.played.length, 0, "what is off the screen does not");
+  assert.equal(below.played[0].options.duration, 300, "packed: the gap holds, then closes");
+  assert.equal(below.played[0].frames[0].transform, "translateY(100px)");
+  assert.equal(card.hasAttribute("data-slide-over"), true, "the card is drawn over what slides");
+  slides.finishPackSlide();
+  assert.equal(card.hasAttribute("data-slide-over"), false, "ended at once, drawn in the list's order again");
+  slides.slideIntoPlace(card, { key: "another item", top: 160 });
+  assert.equal(below.played.length, 1, "an item that is not the one measured before moves nothing");
+});
