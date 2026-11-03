@@ -18,10 +18,22 @@ Classify one change.
 | `--head REV` | `HEAD` | The change's head, with `--base`. |
 | `--repo DIR` | `.` | The repository to diff in, with `--base`. |
 | `--paths PATH...` | none | The changed paths instead of `--base`. `-` reads them from standard input, one per line; a `git diff --name-status` listing is accepted too. |
+| `--known-nodes FILE` | no check | The node names the policy may use: a JSON array of strings, or one name per line (blank lines and lines starting with `#` skipped). When a matched rule names a node outside the list, the classification is refused (below). |
 | `--json` | off | Print the whole classification as JSON (below). |
 
 The text form prints the verdict, the components, the selected nodes and the reasons. Exit status
-is 0 for any verdict and 2 for a usage or policy error.
+is 0 for any verdict, 2 for a usage, policy or known-node-list error, and 3 for a refusal.
+
+**Known nodes.** A policy can go stale: a footprint keeps naming a node after the node was renamed
+or removed. With `--known-nodes`, every rule a changed path matched (a footprint, or a
+`backend`-tier rule's `extra_nodes`, groups expanded) is checked against the list, whatever the
+verdict. If any names an unknown node, nothing is classified: standard error names each node and
+the rule that named it (`footprint N (COMPONENT)` or `backend rule ID`), `--json` prints
+`{"refused": "unknown-nodes", "unknown_nodes": [{"node": ..., "rule": ...}]}`, and the exit status
+is 3. The selection is never trimmed to the known nodes, since that could run less than the
+policy meant. Rules no path matched are not checked. Names are compared exactly: list any alias
+your own tooling resolves a policy name to under the name the policy uses. The library equivalent
+is `classify_known`.
 
 ### `change-classify glob PATTERN PATH`
 
@@ -118,7 +130,8 @@ verdict with its own policy (for example, allow selective runs only for some bac
 cases (`{pattern, path, match}`), `git diff --name-status` parsing cases (`{input, paths}`),
 sample policies, and classification cases (`{name, policy, paths, expect}`, where `expect` names
 the verdict and any of `nodes`, `e2e_all`, `e2e_backends`, `backend_rules`, `backend_lanes`,
-`components`, `unknown` and per-path `classes`). They are the contract between this crate and
+`components`, `unknown` and per-path `classes`). A case with `known_nodes` runs the known-node check; its `expect` is
+either a classification as above or `{"refused": [{"node", "rule"}, ...]}`, the sorted refusal. They are the contract between this crate and
 every consumer that shares it: a change to glob or rule-order semantics must keep them passing,
 or change them together with a replay of each consumer's history, and the consumers are told
 before it lands.

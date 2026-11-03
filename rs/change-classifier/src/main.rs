@@ -6,7 +6,10 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use change_classifier::{changed_paths, check_vectors, classify, glob_match, Policy, VECTORS};
+use change_classifier::{
+    changed_paths, check_vectors, classify, classify_known, glob_match, parse_known_nodes, Policy,
+    VECTORS,
+};
 use clap::{Parser, Subcommand};
 
 /// Classify a change's paths against a test-footprint policy (version 2): `skip` (every path
@@ -27,6 +30,8 @@ enum Command {
     /// Examples:
     ///   change-classify classify --policy ci/test-footprints.json --base origin/main
     ///   git diff --name-only A B | change-classify classify --policy P --paths - --json
+    ///   change-classify classify --policy P --base origin/main --known-nodes nodes.txt
+    #[command(verbatim_doc_comment)]
     Classify {
         /// Policy file (a resolved footprint file, `version` 2).
         #[arg(long, value_name = "FILE")]
@@ -45,7 +50,14 @@ enum Command {
         /// `git diff --name-status` listing is accepted too).
         #[arg(long, value_name = "PATH", num_args = 1..)]
         paths: Vec<String>,
-        /// Print the classification as JSON.
+        /// Known node names: refuse (exit status 3) when a matched rule names a node outside
+        /// this list, naming each node and the rule, instead of classifying. FILE is a JSON
+        /// array of strings or one node per line (blank lines and `#` comments skipped). Every
+        /// matched rule is checked, whatever the verdict. Default: no check.
+        #[arg(long, value_name = "FILE")]
+        known_nodes: Option<PathBuf>,
+        /// Print the classification as JSON (a refusal as `{"refused": "unknown-nodes",
+        /// "unknown_nodes": [{"node", "rule"}, ...]}`).
         #[arg(long)]
         json: bool,
     },
@@ -84,9 +96,19 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             head,
             repo,
             paths,
+            known_nodes,
             json,
         } => {
             let policy = Policy::load(&policy)?;
+            let known = match &known_nodes {
+                Some(file) => Some(
+                    std::fs::read_to_string(file)
+                        .map_err(|error| format!("cannot read {}: {error}", file.display()))
+                        .and_then(|text| parse_known_nodes(&text))
+                        .map_err(|error| format!("{}: {error}", file.display()))?,
+                ),
+                None => None,
+            };
             let paths = match (base, paths.as_slice()) {
                 (Some(base), _) => changed_paths(&repo, &base, &head)?,
                 (None, [dash]) if dash == "-" => {
@@ -99,7 +121,27 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 (None, []) => return Err("give --base REV or --paths PATH...".to_owned()),
                 (None, list) => list.to_vec(),
             };
-            let result = classify(&policy, &paths);
+            let result = match &known {
+                None => classify(&policy, &paths),
+                Some(known) => match classify_known(&policy, &paths, known) {
+                    Ok(result) => result,
+                    Err(refusal) => {
+                        if json {
+                            let doc = serde_json::json!({
+                                "refused": "unknown-nodes",
+                                "unknown_nodes": refusal.unknown_nodes,
+                            });
+                            say!(
+                                "{}",
+                                serde_json::to_string_pretty(&doc)
+                                    .map_err(|error| error.to_string())?
+                            );
+                        }
+                        eprintln!("change-classify: {refusal}");
+                        return Ok(ExitCode::from(3));
+                    }
+                },
+            };
             if json {
                 say!(
                     "{}",

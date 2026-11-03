@@ -221,3 +221,97 @@ fn classify_reads_paths_from_arguments_or_standard_input() {
     let out = classify_bin(&["classify", "--policy", policy.to_str().unwrap()], &dir);
     assert_eq!(out.status.code(), Some(2));
 }
+
+#[test]
+fn known_nodes_refuse_a_stale_rule_and_otherwise_change_nothing() {
+    let dir = temp("known");
+    let policy = sample_policy(&dir);
+    let policy = policy.to_str().unwrap();
+    let all = dir.join("all.json");
+    std::fs::write(
+        &all,
+        r#"["build.workspace", "test.core", "lint.fmt", "lint.clippy", "test.cli"]"#,
+    )
+    .unwrap();
+    let stale = dir.join("stale.txt");
+    std::fs::write(
+        &stale,
+        "# current nodes\ntest.core\n\nbuild.workspace\nlint.fmt\n",
+    )
+    .unwrap();
+    let args = [
+        "classify",
+        "--policy",
+        policy,
+        "--json",
+        "--paths",
+        "core/src/a.rs",
+    ];
+
+    // Every named node known: the same classification as without the list.
+    let plain = classify_bin(&args, &dir);
+    let mut with_all = args.to_vec();
+    with_all.extend(["--known-nodes", all.to_str().unwrap()]);
+    let checked = classify_bin(&with_all, &dir);
+    assert!(plain.status.success() && checked.status.success());
+    assert_eq!(plain.stdout, checked.stdout);
+
+    // A node the list lacks: refused, naming the node and the rule; nothing trimmed.
+    let mut with_stale = args.to_vec();
+    with_stale.extend(["--known-nodes", stale.to_str().unwrap()]);
+    let out = classify_bin(&with_stale, &dir);
+    assert_eq!(out.status.code(), Some(3));
+    let got: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        got,
+        serde_json::json!({"refused": "unknown-nodes",
+            "unknown_nodes": [{"node": "lint.clippy", "rule": "footprint 0 (core)"}]})
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("`lint.clippy` (named by footprint 0 (core))"),
+        "{stderr}"
+    );
+    let text = classify_bin(
+        &[
+            "classify",
+            "--policy",
+            policy,
+            "--known-nodes",
+            stale.to_str().unwrap(),
+            "--paths",
+            "core/src/a.rs",
+        ],
+        &dir,
+    );
+    assert_eq!(text.status.code(), Some(3));
+    assert!(text.stdout.is_empty());
+
+    // An unreadable or malformed list is an error, not a verdict.
+    let bad = dir.join("bad.json");
+    std::fs::write(&bad, r#"["test.core", 7]"#).unwrap();
+    let mut with_bad = args.to_vec();
+    with_bad.extend(["--known-nodes", bad.to_str().unwrap()]);
+    let out = classify_bin(&with_bad, &dir);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not a JSON array of strings"));
+}
+
+#[test]
+fn a_changed_refusal_expectation_fails_by_name() {
+    let dir = temp("refusal-vectors");
+    let tampered = change_classifier::VECTORS.replace(
+        r#""expect": {"refused": [{"node": "e2e.fast", "rule": "backend rule fast"}]}"#,
+        r#""expect": {"refused": [{"node": "e2e.fast", "rule": "footprint 9 (x)"}]}"#,
+    );
+    assert_ne!(tampered, change_classifier::VECTORS);
+    let file = dir.join("vectors.json");
+    std::fs::write(&file, tampered).unwrap();
+    let out = classify_bin(&["check-vectors", file.to_str().unwrap()], &dir);
+    assert_eq!(out.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("FAIL known nodes: a backend rule's extra node is refused"),
+        "{text}"
+    );
+}

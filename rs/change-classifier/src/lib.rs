@@ -28,6 +28,10 @@
 //! anything else gives [`Verdict::Selective`] with the selected nodes. The classifier never
 //! narrows past that: a consumer may still widen a selective verdict with its own policy.
 //!
+//! [`classify_known`] also checks every matched rule's nodes against a list of known node names
+//! and refuses the classification, naming each unknown node and its rule, when the policy names
+//! a node the list lacks (a stale policy).
+//!
 //! A backend rule key `NAME_paths` other than `paths` holds globs relative to the directory
 //! `NAME/` (a vendored or submodule tree): `vendor_paths: ["fast-sys/**"]` matches the changed
 //! path `vendor/fast-sys/src/lib.rs`.
@@ -507,6 +511,101 @@ pub fn classify(policy: &Policy, paths: &[String]) -> Classification {
     out
 }
 
+/// A node a matched rule named that is not in the known-node list.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct UnknownNode {
+    /// The node, groups expanded.
+    pub node: String,
+    /// The rule that named it: `footprint N (COMPONENT)` or `backend rule ID`.
+    pub rule: String,
+}
+
+/// A classification refused because a matched rule named nodes outside the known-node list (a
+/// stale policy): never trimmed to the known nodes, since the trimmed selection could run less
+/// than the policy meant.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct KnownNodeRefusal {
+    /// Each offending node and the rule that named it, sorted.
+    pub unknown_nodes: Vec<UnknownNode>,
+}
+
+impl std::fmt::Display for KnownNodeRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let list: Vec<String> = self
+            .unknown_nodes
+            .iter()
+            .map(|entry| format!("`{}` (named by {})", entry.node, entry.rule))
+            .collect();
+        write!(
+            f,
+            "refused: matched rules name {} node(s) not in the known-node list: {}",
+            list.len(),
+            list.join(", ")
+        )
+    }
+}
+
+/// Parse a known-node list: a JSON array of strings, or one node per line (blank lines and
+/// lines starting with `#` are skipped).
+pub fn parse_known_nodes(text: &str) -> Result<BTreeSet<String>, String> {
+    if text.trim_start().starts_with('[') {
+        let nodes: Vec<String> = serde_json::from_str(text)
+            .map_err(|error| format!("known-node list is not a JSON array of strings: {error}"))?;
+        return Ok(nodes.into_iter().collect());
+    }
+    Ok(text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_owned)
+        .collect())
+}
+
+/// [`classify`], refusing when a matched rule (a footprint, or a `backend`-tier rule's
+/// `extra_nodes`) names a node that is not in `known`, whatever the verdict.
+pub fn classify_known(
+    policy: &Policy,
+    paths: &[String],
+    known: &BTreeSet<String>,
+) -> Result<Classification, KnownNodeRefusal> {
+    let out = classify(policy, paths);
+    let mut unknown = BTreeSet::new();
+    let mut check = |refs: &[String], rule: String| {
+        let mut nodes = BTreeSet::new();
+        // Groups were checked when the policy was loaded.
+        let _ = policy.expand(refs, &mut nodes, &mut BTreeSet::new());
+        for node in nodes.into_iter().filter(|node| !known.contains(node)) {
+            unknown.insert(UnknownNode {
+                node,
+                rule: rule.clone(),
+            });
+        }
+    };
+    for entry in &out.paths {
+        for &index in &entry.footprints {
+            let footprint = &policy.footprints[index];
+            check(
+                &footprint.nodes,
+                format!("footprint {index} ({})", footprint.component),
+            );
+        }
+        for rule in policy
+            .backend_rules
+            .iter()
+            .filter(|rule| rule.tier != "core" && entry.backend_rules.contains(&rule.id))
+        {
+            check(&rule.extra_nodes, format!("backend rule {}", rule.id));
+        }
+    }
+    if unknown.is_empty() {
+        Ok(out)
+    } else {
+        Err(KnownNodeRefusal {
+            unknown_nodes: unknown.into_iter().collect(),
+        })
+    }
+}
+
 /// Parse `git diff --name-status` output into changed paths, counting both sides of a rename
 /// or copy (its source may be in another component than its destination). A line without a tab
 /// is a bare path and passes through whole, whatever letter it starts with (`README.md` and
@@ -606,8 +705,39 @@ pub fn check_vectors(text: &str) -> Result<(usize, Vec<VectorFailure>), String> 
             fail(name, format!("unknown policy {}", case["policy"]));
             continue;
         };
-        let got = classify(policy, &strings(&case["paths"]));
+        let paths = strings(&case["paths"]);
         let want = &case["expect"];
+        let got = match case.get("known_nodes") {
+            None => classify(policy, &paths),
+            Some(known) => {
+                let known = strings(known).into_iter().collect();
+                match (classify_known(policy, &paths, &known), want.get("refused")) {
+                    (Err(refusal), Some(expected)) => {
+                        let actual =
+                            serde_json::to_value(&refusal.unknown_nodes).unwrap_or(Value::Null);
+                        if &actual != expected {
+                            fail(name, format!("refused {actual} expected {expected}"));
+                        }
+                        continue;
+                    }
+                    (Err(refusal), None) => {
+                        fail(name, format!("unexpectedly {refusal}"));
+                        continue;
+                    }
+                    (Ok(got), Some(expected)) => {
+                        fail(
+                            name,
+                            format!(
+                                "verdict {} but expected refused {expected}",
+                                got.verdict.as_str()
+                            ),
+                        );
+                        continue;
+                    }
+                    (Ok(got), None) => got,
+                }
+            }
+        };
         if want["verdict"].as_str() != Some(got.verdict.as_str()) {
             fail(
                 name.clone(),
@@ -689,6 +819,15 @@ mod unit {
         assert!(error.contains("unknown group @MISSING"), "{error}");
         let error = Policy::from_json(r#"{"version": 3}"#).unwrap_err();
         assert!(error.contains("version 3"), "{error}");
+    }
+
+    #[test]
+    fn known_node_lists_are_json_arrays_or_lines() {
+        let want: BTreeSet<String> = ["a.b", "c.d"].map(str::to_owned).into();
+        assert_eq!(parse_known_nodes(r#"["a.b", "c.d", "a.b"]"#).unwrap(), want);
+        assert_eq!(parse_known_nodes("# nodes\n a.b \n\nc.d\n").unwrap(), want);
+        assert!(parse_known_nodes("[1]").is_err());
+        assert!(parse_known_nodes("").unwrap().is_empty());
     }
 
     #[test]

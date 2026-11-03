@@ -93,6 +93,24 @@
     {"name": "the core rule wins over a selective backend rule", "policy": "sample", "paths": ["engine-fast/src/lib.rs", "vendor/shared/x.rs"],
      "expect": {"verdict": "full", "backend_rules": ["fast", "shared"], "backend_lanes": ["fast-lane", "all-lanes"]}},
     {"name": "a renamed file counts at both ends", "policy": "sample", "paths": ["core/src/old.rs", "engine-fast/src/new.rs"],
-     "expect": {"verdict": "selective", "components": ["core", "backend:fast"], "e2e_all": true}}
+     "expect": {"verdict": "selective", "components": ["core", "backend:fast"], "e2e_all": true}},
+    {"name": "known nodes: all known classifies as without the list", "policy": "sample", "paths": ["core/src/a.rs", "engine-fast/src/lib.rs"],
+     "known_nodes": ["build.workspace", "test.core", "lint.fmt", "lint.clippy", "test.fast", "e2e.fast", "test.cli"],
+     "expect": {"verdict": "selective", "nodes": ["build.workspace", "test.core", "lint.fmt", "lint.clippy", "test.fast", "e2e.fast"], "e2e_backends": ["fast"]}},
+    {"name": "known nodes: a node reached through a group is refused with the footprint named", "policy": "sample", "paths": ["core/src/a.rs"],
+     "known_nodes": ["build.workspace", "test.core", "lint.fmt"],
+     "expect": {"refused": [{"node": "lint.clippy", "rule": "footprint 0 (core)"}]}},
+    {"name": "known nodes: a backend rule's extra node is refused with the rule named", "policy": "sample", "paths": ["engine-fast/src/lib.rs", "cli/src/main.rs"],
+     "known_nodes": ["test.fast", "test.cli"],
+     "expect": {"refused": [{"node": "e2e.fast", "rule": "backend rule fast"}]}},
+    {"name": "known nodes: a matched rule is checked even when the verdict is full", "policy": "sample", "paths": ["ci/build.yml", "scripts/new.sh", "cli/src/main.rs"],
+     "known_nodes": ["test.core"],
+     "expect": {"refused": [{"node": "test.cli", "rule": "footprint 1 (command-line)"}]}},
+    {"name": "known nodes: rules that did not match are not checked", "policy": "sample", "paths": ["cli/src/main.rs", "docs/a.md"],
+     "known_nodes": ["test.cli"],
+     "expect": {"verdict": "selective", "nodes": ["test.cli"]}},
+    {"name": "known nodes: a skip has nothing to check", "policy": "sample", "paths": ["docs/a.md"],
+     "known_nodes": [],
+     "expect": {"verdict": "skip", "nodes": []}}
   ]
 }
