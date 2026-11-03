@@ -629,3 +629,26 @@ test("`#624 voice-page-modularity`: the layout on screen, and each place held fo
   assert.throws(() => shown.whileRestoring(() => { throw new Error("drawn wrong"); }), /drawn wrong/);
   assert.deepStrictEqual([seen, shown.restoring()], [[true], false], "restoring only while putting a view back, throw or not");
 });
+
+test("`#624 voice-page-modularity`: the cards keep what they drew only under the same whole, and never once forgotten", () => {
+  const { createCardsDrawn } = CHANNEL_VIEW;
+  const drawn = createCardsDrawn();
+  assert.equal(drawn.changed(""), false, "nothing drawn reads as drawn from nothing");
+  assert.equal(drawn.changed("s1"), true);
+  assert.equal(drawn.redraw("s1", "w1"), false, "the first pass keeps nothing");
+  drawn.keep({ whole: "w1", threads: new Map([["t1", "card"]]), main: new Map() });
+  assert.equal(drawn.changed("s1"), false, "the same signature draws nothing");
+  assert.equal(drawn.redraw("s2", "w1"), true, "under the same whole, what was drawn is kept");
+  assert.equal(drawn.kept().threads.get("t1"), "card");
+  assert.equal(drawn.redraw("s3", "w2"), false, "under another whole it is not");
+  drawn.forget();
+  assert.equal(drawn.changed("s3"), true, "forgotten: the next pass draws whatever it is");
+  assert.equal(drawn.redraw("s3", "w1"), false, "and keeps nothing");
+  assert.deepStrictEqual(drawn.count(), { cards: 0, shown: 0 });
+  drawn.setCount(5, 2);
+  assert.deepStrictEqual(drawn.count(), { cards: 5, shown: 2 });
+  const seen = [];
+  drawn.whileOpening(() => seen.push(drawn.opening()));
+  assert.throws(() => drawn.whileOpening(() => { throw new Error("drawn wrong"); }), /drawn wrong/);
+  assert.deepStrictEqual([seen, drawn.opening()], [[true], false]);
+});

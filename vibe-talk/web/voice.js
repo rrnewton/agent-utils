@@ -631,7 +631,7 @@ function voiceTranscript() {
     get columns() { return columns; },
     get currentScreen() { return screens.screen(); },
     get currentView() { return screens.view(); },
-    get cardsOpening() { return cardsOpening; },
+    get cardsOpening() { return cardsDrawn.opening(); },
     get threadListShown() { return layoutShown.threadList(); },
     get tokenScope() { return serverFacts.tokenScope(); },
     get voiceSendSetting() { return agentSettings.sendSetting(); },
@@ -4280,9 +4280,6 @@ function refreshSearchCount() {
     authorChoosing() !== "everyone");
 }
 
-/** The cards there are, and how many the search and the read mode leave, as `filterSideCards` last counted. */
-let sideCardCount = { cards: 0, shown: 0 };
-
 /**
  * The bar's count over the thread list on its own: how many cards the text matches, of how many, while
  * something is typed. `#281 view-keys`. Links and whose messages are not offered over cards, which
@@ -4290,7 +4287,7 @@ let sideCardCount = { cards: 0, shown: 0 };
  */
 function sayCardCount() {
   const typed = searchField.open() && searchTyped(searchField.query());
-  const { cards, shown } = sideCardCount;
+  const { cards, shown } = cardsDrawn.count();
   setTextIfChanged(el("search-count"), typed ? `${shown} of ${cards} thread${cards === 1 ? "" : "s"}` : "");
 }
 
@@ -10029,7 +10026,7 @@ function applyCardMaxLines(value, redraw = true) {
   // `#528 thread-card-markdown-and-cap`: what a card clamped to K lines is clamped to (web/voice.css).
   messagePreferences.cardMaxLines.render(n);
   if (changed) {
-    sideCardsDrawn = "";
+    cardsDrawn.forget();
     threadCardsDrawn.clear();
     if (sideColumnUp()) renderSideColumn();
     if (selection().view === "thread") renderThreadHeading();
@@ -23682,7 +23679,7 @@ function openReadRun(row) {
   // what its cards and rows stand for, and the cards drawn again.
   if (thread === null && row.parentNode === leftEl("side-cards")) {
     readRuns.open(cardRunKey(), cardRunRows(row).flatMap(cardRunIds));
-    sideCardsDrawn = "";
+    cardsDrawn.forget();
     renderSideColumn();
     keepSelection();
     return;
@@ -23695,7 +23692,7 @@ function openReadRun(row) {
   if (folded) for (const id of ids) folded.delete(id);
   if (folded && folded.size === 0) foldedOnes.delete(key);
   if (thread !== null) {
-    sideCardsDrawn = "";
+    cardsDrawn.forget();
     renderSideColumn();
     // The block is new rows: the selection, its Tab stop and its focus go to the run's first row's.
     keepSelection();
@@ -25058,7 +25055,7 @@ function setReadMode(mode) {
       // One read mode, for both columns. `#229 desktop-two-column`.
       eachColumn(renderCachedTimeline);
       // `#404 threads-unpack-all`. And inside every unpacked block.
-      sideCardsDrawn = "";
+      cardsDrawn.forget();
       if (sideColumnUp()) renderSideColumn();
     } else if (readModes.hiding() !== wasHiding) {
       // A read of another route, which keeps the reader's place as a refresh does and is placed again
@@ -27657,9 +27654,6 @@ function cardMessageCount(choice, tally) {
   return { messages: Math.max(held, known) + 1, exact: known >= held && known >= 0 };
 }
 
-/** What the cards were last drawn from, so a pass that changes nothing draws nothing. */
-let sideCardsDrawn = "";
-
 /**
  * One thread as the cards draw it, in parts (`renderSideCards`, `#532 shift-o-latency`): `card`, what its
  * card says; `counts`, what it counts (its age, replies, unread and whether it is read, which a card
@@ -27679,9 +27673,13 @@ let sideCardsDrawn = "";
  * read state or what was folded away is dressed again and its runs placed again, in place. So a Done or
  * a fold in one thread costs that thread's card, not every thread unpacked.
  *
- * @type {{whole: string, threads: Map<string, {parts: CardParts, card: HTMLElement, rows: HTMLElement[]}>, main: Map<string, HTMLElement[]>}}
+ * What the cards were last drawn from, so a pass that changes nothing draws nothing, what that pass drew,
+ * what the last count found, and whether the cards are being opened: one owner in
+ * web/src/view/channel/cardsdrawn.ts (`#624 voice-page-modularity`).
+ *
+ * @type {import("./src/view/channel/index.ts").CardsDrawn<{parts: CardParts, card: HTMLElement, rows: HTMLElement[]}, HTMLElement[]>}
  */
-let sideCardsKept = { whole: "", threads: new Map(), main: new Map() };
+const cardsDrawn = createCardsDrawn();
 
 /**
  * One thread's parts as a pass over the cards finds them (`CardParts`).
@@ -27788,17 +27786,16 @@ function renderSideCards() {
   const parts = cards.map(sideCardParts);
   const signature = JSON.stringify([whole, parts, main.map((message) => [messageLook(message), readLook(message)])]);
   const more = olderThreadsToRead();
-  if (signature !== sideCardsDrawn) {
+  if (cardsDrawn.changed(signature)) {
     // Kept only from a pass under the same whole, and never where the cards were asked to be drawn anew
-    // (`sideCardsDrawn` emptied: something the signatures do not say has changed).
-    const keep = sideCardsDrawn !== "" && sideCardsKept.whole === whole;
-    sideCardsDrawn = signature;
+    // (`cardsDrawn.forget`: something the signatures do not say has changed).
+    const keep = cardsDrawn.redraw(signature, whole);
     keepingCardPlace(() => {
       if (!keep && unpackObserver !== null) {
         unpackObserver.disconnect();
         unpackObserver = null;
       }
-      const kept = cards.map((card) => (keep ? sideCardsKept.threads.get(card.choice.id) : undefined));
+      const kept = cards.map((card) => (keep ? cardsDrawn.kept().threads.get(card.choice.id) : undefined));
       // A card that says the same is kept, its counts brought up to date where they changed: putting a new
       // element in the list costs its every row laid out again, a count changed in place does not.
       const cardRows = cards.map((card, at) => {
@@ -27834,7 +27831,7 @@ function renderSideCards() {
           return was.rows;
         });
       }) : [];
-      /** @type {typeof sideCardsKept.threads} */
+      /** @type {ReturnType<typeof cardsDrawn.kept>["threads"]} */
       const threads = new Map(cards.map((card, at) =>
         [card.choice.id, { parts: parts[at], card: cardRows[at], rows: unpacked ? blocks[at] : [] }]));
       const drawn = cards.map((card, at) => [cardRows[at], ...(unpacked ? blocks[at] : [])]);
@@ -27851,7 +27848,7 @@ function renderSideCards() {
           if (run.length === 0) return [];
           // By its messages as drawn: a Done or a put back is in how a row is dressed, done again below.
           const key = JSON.stringify(run.map(messageLook));
-          const was = keep ? sideCardsKept.main.get(key) : undefined;
+          const was = keep ? cardsDrawn.kept().main.get(key) : undefined;
           const rows = was || mainRows(run, tally);
           if (was) redressMainRows(rows, tally);
           mainKept.set(key, rows);
@@ -27861,7 +27858,7 @@ function renderSideCards() {
       const wanted = [...drawn.flatMap((rows, at) => [...between[at], ...rows]), ...between[drawn.length]];
       if (keep) placeChildren(list, wanted);
       else list.replaceChildren(...wanted);
-      sideCardsKept = { whole, threads, main: mainKept };
+      cardsDrawn.keep({ whole, threads, main: mainKept });
       // `#432 read-mode-unify`. Under Fold read, the runs of read threads and Main's read messages.
       foldCardRuns(list);
       filterSideCards();
@@ -27931,7 +27928,7 @@ function renderSideCards() {
 /** The reader's place in the cards. */
 const cardPlaces = createCardPlaces({
   lookup: (id) => leftEl(id),
-  readable: () => sideColumnUp() && columns.side.mode === "list" && !cardsOpening,
+  readable: () => sideColumnUp() && columns.side.mode === "list" && !cardsDrawn.opening(),
   atBottom: (area) => atBottom(area),
   followFoot: (area) => followFoot(area),
   litCard: () => litCard(),
@@ -27973,9 +27970,6 @@ function keepingCardPlace(change, follow = false) {
   cardPlaces.keeping(change, follow);
 }
 
-/** True while the cards are being opened, which places the reader once they are drawn. */
-let cardsOpening = false;
-
 /**
  * By channel, where the reader was in the cards when a thread was selected from them, for this
  * session: closing the thread comes back there. `#261 two-column-connectors`.
@@ -27997,12 +27991,7 @@ function openSideCards() {
   // Nor the room past the foot held for a card packed in them (`#459 pack-keeps-card-still`).
   closeOverextend();
   columns.side.mode = "list";
-  cardsOpening = true;
-  try {
-    renderSideMode();
-  } finally {
-    cardsOpening = false;
-  }
+  cardsDrawn.whileOpening(renderSideMode);
   placeOpenedCards();
 }
 
@@ -28042,7 +28031,7 @@ function filterSideCards() {
   // under Fold read the runs of read threads over the cards (`foldCardRuns`, `#432 read-mode-unify`).
   if ((unpackOnScreen() || readModes.mode() === "fold") && readRunsSuspended() !== unpackSuspendedDrawn) {
     unpackSuspendedDrawn = readRunsSuspended();
-    sideCardsDrawn = "";
+    cardsDrawn.forget();
     renderSideCards();
     return;
   }
@@ -28116,7 +28105,7 @@ function filterSideCards() {
   const state = [olderThreadsFailure(), sideListState(rows.length, unread, shown)].filter((part) => part !== "").join(" ");
   setTextIfChanged(leftEl("side-list-state"), state);
   if (leftEl("side-list-state").hidden !== (state === "")) leftEl("side-list-state").hidden = state === "";
-  sideCardCount = { cards: rows.length, shown };
+  cardsDrawn.setCount(rows.length, shown);
   if (threadListOnScreen()) sayCardCount();
   // `#262 search-load-older`. The way to their threads' older replies, as the search and All's reach say.
   renderRepliesSearch();
@@ -28495,7 +28484,7 @@ const unpackReadQueue = createUnpackReads({
     return true;
   },
   ended: (id) => {
-    sideCardsDrawn = "";
+    cardsDrawn.forget();
     if (sideColumnUp()) renderSideColumn();
     // `#410 inline-reply-editor`. A thread gathered under its root in Main draws what the read brought.
     const wanting = gatherState().gathered && gatherState().gathered.thread === id ? gatherState().gathered.column : null;
@@ -28544,7 +28533,7 @@ function renderUnpackToggle() {
 function setUnpackMode(mode) {
   cardPacking.setMode(mode, String(selectedChannelId()));
   renderUnpackToggle();
-  sideCardsDrawn = "";
+  cardsDrawn.forget();
   if (!sideColumnUp()) return;
   // `#459 pack-keeps-card-still`. The card the reader is plainly on held still, as one packed by itself is;
   // with none, their place kept as for any change to the cards.
@@ -28589,7 +28578,7 @@ function setCardState(id, state) {
   cardPacking.choose(String(selectedChannelId()), id, state);
   // `#460 pack-gap-slide`: what is below the thread slides into its new place.
   keepingCardStill(id, () => {
-    sideCardsDrawn = "";
+    cardsDrawn.forget();
     renderSideColumn();
     // The card is drawn anew: the selection, its Tab stop and its focus go to the new one.
     keepSelection();
@@ -28933,7 +28922,7 @@ function setMainRowsShown(on) {
     // A browser that refuses storage still honours the choice for this session.
   }
   renderMainToggle();
-  sideCardsDrawn = "";
+  cardsDrawn.forget();
   if (sideColumnUp()) keepingCardPlace(renderSideColumn);
   placeMainCard();
 }
@@ -28994,7 +28983,7 @@ function renderOrderToggle() {
 function setThreadOrder(order) {
   threadOrders.set(order);
   renderOrderToggle();
-  sideCardsDrawn = "";
+  cardsDrawn.forget();
   if (!sideColumnUp()) return;
   const mark = markOf(sidePane);
   const selected = mark && mark.card !== false ? mark.id : null;
@@ -29923,7 +29912,7 @@ function resetSideColumn(reopen = false) {
   leftEl("side-notice").hidden = true;
   leftEl("side-older").hidden = true;
   leftEl("side-loading").hidden = true;
-  sideCardsDrawn = "";
+  cardsDrawn.forget();
   leftEl("side-cards").replaceChildren();
   if (!sideColumnUp() || !reopen) {
     columns.side.mode = "list";
@@ -32415,12 +32404,12 @@ function settingsSyncView() {
     threadsUnpacked: () => {
       cardPacking.reloadMode();
       renderUnpackToggle();
-      sideCardsDrawn = "";
+      cardsDrawn.forget();
       if (sideColumnUp()) renderSideColumn();
     },
     threadCardStates: () => {
       cardPacking.reloadChoices();
-      sideCardsDrawn = "";
+      cardsDrawn.forget();
       if (sideColumnUp()) renderSideColumn();
     },
     threadsMain: () => {
@@ -33762,7 +33751,7 @@ if (typeof window.ResizeObserver === "function") {
     // `#429 keyboard-hides-bar`. A box being written in this list, kept in view as the keyboard shrinks it.
     if (screens.screen() === "main" && keepWrittenBox(area, seen, now)) return;
     if (sideColumnUp() && screens.view() === "discord" && columns.side.mode === "list") {
-      if (!cardsOpening && grew > 0 && atBottom(area, BOTTOM_SLACK_PX + grew)) followFoot(area);
+      if (!cardsDrawn.opening() && grew > 0 && atBottom(area, BOTTOM_SLACK_PX + grew)) followFoot(area);
       return;
     }
     if (!sideShowing()) return;
@@ -33820,7 +33809,7 @@ if (typeof window.ResizeObserver === "function") {
   // holding a place in it.
   const free = () => {
     if (!sideColumnUp() || screens.screen() !== "main" || screens.view() !== "discord") return false;
-    if (columns.side.mode === "list") return !cardsOpening;
+    if (columns.side.mode === "list") return !cardsDrawn.opening();
     return inColumn(columns.side, () => {
       const walk = columnWork.active().searchWalk;
       return !entryLandingHolds() && heldFilterRow() === null && !(walk && walk.anchored);

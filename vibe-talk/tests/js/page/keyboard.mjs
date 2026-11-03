@@ -5023,7 +5023,7 @@ test("`#532 shift-o-latency`: four Shift+O and four e in an unpacked Threads vie
   // THE CONTROL: the list drawn anew on every pass, as before: the same presses build rows, so the
   // checks above can see it.
   const control = await shiftOPage(brokenScriptEach(
-    ['const keep = sideCardsDrawn !== "" && sideCardsKept.whole === whole;', "const keep = false;"]));
+    ["const keep = cardsDrawn.redraw(signature, whole);", "const keep = (cardsDrawn.redraw(signature, whole), false);"]));
   await mouseOnto(control, unpackedRow(control, "9532115"));
   const redrawn = await pressesInPlace(control, "O", { shiftKey: true }, 1, own);
   assert.ok(redrawn.built > 0 && !redrawn.kept, "the negative control did not draw the list again");

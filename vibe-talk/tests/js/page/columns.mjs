@@ -1210,8 +1210,8 @@ test("`#231 two-column-polish` x `#226 page-energy-profile`: with the cards up, 
   // The control: the cards redrawn on every pass, as they were before they kept what they were drawn
   // from. The same refresh has to build them again, or the check above could not see it.
   // `#532 shift-o-latency`: and nothing kept from the pass before, which a pass that changed nothing keeps.
-  const control = await quietPoll(brokenScriptEach(["  if (signature !== sideCardsDrawn) {", "  if (true) {"],
-    ['const keep = sideCardsDrawn !== "" && sideCardsKept.whole === whole;', "const keep = false;"]));
+  const control = await quietPoll(brokenScriptEach(["  if (cardsDrawn.changed(signature)) {", "  if (true) {"],
+    ["const keep = cardsDrawn.redraw(signature, whole);", "const keep = (cardsDrawn.redraw(signature, whole), false);"]));
   assert.ok(builtSince(control.page, control.made, "li") >= control.cards.length,
     "the negative control did not redraw the cards, so the check above proves nothing");
 });

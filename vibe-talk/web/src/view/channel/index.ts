@@ -95,3 +95,5 @@ export { createColumnWork } from "./columnwork.ts";
 export type { ColumnWork, WorkedColumn } from "./columnwork.ts";
 export { createLayoutShown } from "./layoutshown.ts";
 export type { Layout, LayoutShown } from "./layoutshown.ts";
+export { createCardsDrawn } from "./cardsdrawn.ts";
+export type { CardsDrawn, KeptCards } from "./cardsdrawn.ts";

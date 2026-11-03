@@ -3559,7 +3559,7 @@ test("`#281 view-keys` x `#280 scroll-stability`: the dock growing under the car
   // not a rounding — and the reader up the cards and the window losing height come out the same.
   const threadOnly = await run(brokenScript(
     "    if (sideColumnUp() && screens.view() === \"discord\" && columns.side.mode === \"list\") {\n" +
-    "      if (!cardsOpening && grew > 0 && atBottom(area, BOTTOM_SLACK_PX + grew)) followFoot(area);\n" +
+    "      if (!cardsDrawn.opening() && grew > 0 && atBottom(area, BOTTOM_SLACK_PX + grew)) followFoot(area);\n" +
     "      return;\n    }\n",
     ""));
   assert.ok(GROWTH > BOTTOM_SLACK_PX, "the premise: a second row is more than the slack");
