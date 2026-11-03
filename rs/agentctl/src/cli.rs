@@ -1652,7 +1652,7 @@ struct ChatHelp {
     #[command(flatten)]
     target: ChatTarget,
     /// A request's reply ID, as its prompt gives it, or a chat subcommand's name
-    #[arg(value_name = "REPLY_ID|COMMAND")]
+    #[arg(value_name = "REPLY_ID|COMMAND", allow_hyphen_values = true)]
     topic: Option<String>,
 }
 
@@ -1706,7 +1706,7 @@ struct ChatSent {
     #[command(flatten)]
     target: ChatTarget,
     /// Only the replies of the request whose prompt gave this reply ID
-    #[arg(value_name = "REPLY_ID", conflicts_with = "request")]
+    #[arg(value_name = "REPLY_ID", conflicts_with = "request", allow_hyphen_values = true)]
     reply_id: Option<String>,
     /// Only this request's replies: its exact 64-character lowercase hexadecimal key
     #[arg(long, value_name = "KEY")]
@@ -1893,7 +1893,7 @@ struct ChatThread {
     #[command(flatten)]
     target: ChatTarget,
     /// The thread of the request whose prompt gave this reply ID
-    #[arg(value_name = "REPLY_ID")]
+    #[arg(value_name = "REPLY_ID", allow_hyphen_values = true)]
     reply_id: Option<String>,
     /// Exact provider thread ID; the command a request prompt prints already quotes it for the shell
     #[arg(long, value_name = "THREAD", allow_hyphen_values = true)]
@@ -1991,9 +1991,9 @@ impl ChatPublish {
 struct ChatReply {
     #[command(flatten)]
     target: ChatTarget,
-    /// Reply ID that the request's prompt gives in its two marker lines (one that starts with `-`
-    /// goes after `--`, or in --reply-id)
-    #[arg(value_name = "REPLY_ID")]
+    /// Reply ID that the request's prompt gives in its two marker lines (IDs are base64url and
+    /// may start with `-`, so a hyphen-leading value is this ID, not an option)
+    #[arg(value_name = "REPLY_ID", allow_hyphen_values = true)]
     reply_id_word: Option<String>,
     /// Exact 64-character lowercase hexadecimal request key (default: the request whose prompt
     /// gave the reply ID)
@@ -5364,6 +5364,30 @@ mod tests {
             None,
             "nothing queued, no warning"
         );
+    }
+
+    #[test]
+    fn chat_reply_id_may_start_with_a_hyphen() {
+        // Reply IDs are `{base64url nonce}_{ordinal}`; a nonce starting with `-` was refused
+        // as an unknown option (#827), in exactly the positional form a prompt prints.
+        let cli = Cli::try_parse_from([
+            "agentctl", "chat", "reply", "-3abc_1", "--file", "reply.md",
+        ])
+        .unwrap();
+        let Some(Commands::Chat(chat)) = cli.command else {
+            panic!("chat");
+        };
+        let ChatCommand::Reply(reply) = chat.command else {
+            panic!("reply");
+        };
+        assert_eq!(reply.reply_id_word.as_deref(), Some("-3abc_1"));
+        for words in [
+            vec!["agentctl", "chat", "sent", "-3abc_1"],
+            vec!["agentctl", "chat", "thread", "-3abc_1"],
+            vec!["agentctl", "chat", "help", "-3abc_1"],
+        ] {
+            assert!(Cli::try_parse_from(words.clone()).is_ok(), "{words:?}");
+        }
     }
 
     #[test]

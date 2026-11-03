@@ -27,3 +27,8 @@ For each repeat offender decide, with evidence: LOAD (memory or CPU contention i
 # Notes
 
 - [opus 5.5] 2026-11-03 ~18:00 ET: vibe-talk.test.page-0 failed a full gate on the #532 Shift+O latency budget ("a Shift+O took over 50 ms: 88.6, 93.9, 122.9, 49.0") while gating #828, which does not touch that code; it passed in the lane's inner loop. A 50 ms wall-clock budget is the kind of check the owner's timeout rule says must not turn red under contention.
+## Triage (mu-validate, 2026-11-03)
+
+### rust.agentctl.test — REAL BUG (fixed)
+
+[muse watermelon-full-preview] Failing cases `chat_reply::a_reply_id_alone_finds_the_bridge_and_its_request_through_the_index` and `chat_reply::a_bridge_targeting_the_caller_is_chosen_and_an_ambiguous_one_is_refused` (gate-742c and others) were not load: the reply ID is `{base64url nonce}_{ordinal}` (`current_reply_id` in `rs/agentctl/src/chat_runtime.rs`), and a nonce starting with `-` (probability ~1/64 per ID) made clap refuse the positional ID as an unknown option (`unexpected argument '-3' found`, exit 2) in exactly the `agentctl chat reply ID` form a prompt prints. Fix: `allow_hyphen_values` on the positional reply ID of `chat reply`, `chat sent`, `chat thread`, and `chat help` in `rs/agentctl/src/cli.rs`, with a parse regression test (`chat_reply_id_may_start_with_a_hyphen`). This also explains part of the `cross.agentctl.differential-*` and `python.agentctl.shard-*` flakiness whenever their cases mint reply IDs. `directory::rejection_lookup_and_write_share_one_deadline_even_through_the_warm_wrapper` also failed in gate-742c; verdict pending (deadline-shaped, likely LOAD).
