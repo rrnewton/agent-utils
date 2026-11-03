@@ -1,6 +1,6 @@
 ---
 title: 'voice-page-read-aloud-react: pause read-aloud on a sentence and reply to exactly that sentence by voice'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 assignee: cl-refactor@devbig030
@@ -9,7 +9,8 @@ labels:
 depends_on:
   agent-utils-820: blocks
 created_at: 2026-11-03T15:55:39.676569469+00:00
-updated_at: 2026-11-03T15:55:39.676569469+00:00
+updated_at: 2026-11-03T19:30:03.105105936+00:00
+closed_at: 2026-11-03T19:30:03.105105785+00:00
 ---
 
 # Description
