@@ -364,6 +364,8 @@ test("`#624 voice-page-modularity`: the threads sends in the outbox go into, cou
   assert.deepStrictEqual([pending.into("t1"), pending.into("t2"), pending.into("t9")], [2, 1, 0]);
   assert.deepStrictEqual([...pending.times()], [["t1", 20], ["t2", 30]]);
   assert.equal(pending.key(), "c t1=2 t2=1");
+  // `#624 voice-page-modularity`: the rows passed over for it once, and not again until the key moves.
+  assert.deepStrictEqual([pending.noteDrawn(), pending.noteDrawn()], [true, false]);
   pending.into("t1");
   assert.equal(worked, 1, "the counts were worked out again with nothing changed");
   version = 2;

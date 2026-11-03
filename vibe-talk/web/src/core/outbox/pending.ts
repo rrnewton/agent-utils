@@ -50,6 +50,11 @@ export interface PendingThreads {
   times(): Map<string, number>;
   /** Which threads of the channel on screen have sends counting in them, and how many: for redraws. */
   key(): string;
+  /**
+   * The rows are being passed over for the pending threads: whether `key()` changed since they last were
+   * (a send going into a thread, or gone from the outbox, changes that thread's count and its card), noting it.
+   */
+  noteDrawn(): boolean;
 }
 
 /** Worked out at the first question. */
@@ -65,6 +70,9 @@ export function createPendingThreads<Message>(deps: PendingThreadsDependencies<M
     const record = answered ? deps.threadRecordOf(answered) : null;
     return record ? String(record.id) : null;
   }
+
+  /** `key()` as it stood when the rows were last passed over for it (`noteDrawn`). */
+  let drawnKey = "";
 
   /** `pendingByThread`'s last answer, and what it was worked out for. */
   let pendingCache = { key: "", threads: new Map<string, { count: number; at: number }>() };
@@ -98,9 +106,17 @@ export function createPendingThreads<Message>(deps: PendingThreadsDependencies<M
       return held ? held.count : 0;
     },
     times: () => new Map([...pendingByThread()].map(([thread, { at }]) => [thread, at])),
-    key() {
-      const viewing = String(deps.channel());
-      return [viewing, ...[...pendingByThread()].sort().map(([thread, { count }]) => `${thread}=${count}`)].join(" ");
+    key: pendingKey,
+    noteDrawn() {
+      const key = pendingKey();
+      if (key === drawnKey) return false;
+      drawnKey = key;
+      return true;
     },
   };
+
+  function pendingKey(): string {
+    const viewing = String(deps.channel());
+    return [viewing, ...[...pendingByThread()].sort().map(([thread, { count }]) => `${thread}=${count}`)].join(" ");
+  }
 }

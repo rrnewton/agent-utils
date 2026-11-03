@@ -15867,12 +15867,10 @@ function placeOutgoingInPlace(rows) {
 function renderOutgoingEverywhere() {
   // `#466 reply-promotes-thread`. A send going into a thread, or gone from the outbox, changes that
   // thread's count and whether the Threads view has a card for it: every row, and the cards, again.
-  const key = pendingThreadsKey();
-  if (key === drawnPendingThreads) {
+  if (!pendingThreads.noteDrawn()) {
     eachColumn(renderOutgoingMessages);
     return;
   }
-  drawnPendingThreads = key;
   eachColumn(() => {
     renderChannelRows();
     if (selection().view === "threads") el("thread-list").replaceChildren(...threadCards(timelineRows().threads));
@@ -15901,8 +15899,8 @@ function renderOutgoingEverywhere() {
 // send that landed though its answer was lost and that a later read already counts, until it is settled
 // (`settleFromServer`).
 
-/** `pendingThreadsKey` as it stood when the rows were last passed over for it. */
-let drawnPendingThreads = "";
+// `pendingThreadsKey` as it stood when the rows were last passed over for it is the pending threads' own
+// (`pendingThreads.noteDrawn`, web/src/core/outbox, `#624 voice-page-modularity`).
 
 /**
  * Which thread each send in the outbox posts into, and how many sends count in each thread of the channel
