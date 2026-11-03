@@ -15,6 +15,8 @@ updated_at: 2026-11-03T18:54:14.118160019+00:00
 
 When coordb confirms every relay host runs a build that signs v2, flip the floor: reject sig-only envelopes from any sender whose key is trusted (the same downgrade quarantine as the sticky path), regardless of whether that key has been seen with v2. Do not guess a date in code; land on the fleet confirmation.
 
+Note on the frozen v1 prefix: it is still "\n"-joined and unescaped, so the fully canonical end state is a v3 that length-prefixes the v1 fields too; do that v3 when the v1 floor flips here, not before.
+
 Recovery from a downgrade (both today, per-peer, and after this floor flips): if a peer's build rolls back to v1 after it once sent v2, its sig-only envelopes are downgrade-quarantined. The operator clears that key's sticky record with `agent-teams relay reset-sig-v2 TEAM@HOST` (or `relay untrust-key TEAM@HOST` followed by `relay trust-key TEAM@HOST`); sig-only envelopes are then admitted again until the peer next verifies a v2 signature. The downgrade alarm text names this recovery. Note the matching is per team@host while the record sits on that team@host's one trusted key, so the reset is effectively per pubkey.
 
 # Acceptance Criteria
