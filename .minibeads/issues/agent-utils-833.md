@@ -26,3 +26,6 @@ updated_at: 2026-11-03T22:00:33.323062265+00:00
 
 - Browser test: the toggle hides and shows trace posts and threads, and the choice is remembered per channel.
 - Ingest test: the metadata is recognised; the root-title fallback works.
+
+# Notes
+- [opus 5.5] 2026-11-03 18:08 ET: the owner REPLACED this toggle plan with a transcript design (hidden by default, a "Transcripts" selector entry, a Raw / Summary toggle with hourly summary cards). A design note in the harness ai_docs comes first and the owner reviews it before code; this issue is folded into that design (see the note, once linked here).

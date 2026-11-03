@@ -16,8 +16,8 @@ updated_at: 2026-11-03T22:00:33.308647159+00:00
 
 # Design
 
-- Move the trigger label to its own short leading line (for example an italic "after agent <name>") or into metadata only; never glue it to the text.
-- Tag every trace post (root and replies) with message metadata, for example event_type "agentctl.trace" with payload {agent, trigger, trace_day}, through the existing post-metadata path (#465). Other providers get an equivalent marker where possible.
+- Tag every trace post with Slack message metadata (owner, 2026-11-03 18:08 ET): event_type "agentctl_trace", payload {v:1, kind:"root"|"entry", agent, team, session, day (ET date), seq, trigger}, through the existing post-metadata path (#465). Other providers get an equivalent marker where possible.
+- The root keeps the fixed title "<agent> main session trace, <date> ET". Entries drop the glued "— after:" prefix entirely: the trigger goes into metadata only.
 - Apply the #794-style outbound escaping the chat-reply path uses: bare names like preemptions.rs must not auto-link, and relative links must not show as raw link markup.
 
 # Acceptance Criteria
