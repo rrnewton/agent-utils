@@ -1,7 +1,7 @@
 //! Push notifications for item state changes, sent by the `serve` daemon.
 //!
 //! An item submitted with `--notify <name>` owes exactly one message per
-//! state change — `landed`, `ejected`, `refusal-deferred`, `withdrawn` —
+//! state change — `landed`, `ejected`, `refusal-deferred`, `escalated`, `withdrawn` —
 //! delivered as:
 //!
 //! ```text
@@ -60,7 +60,7 @@ pub const AGENTCTL_ENV: &str = "MERGE_QUEUE_AGENTCTL";
 pub struct Transition {
     /// Dedup key persisted on the item (`verdict:head:discriminator`).
     pub key: String,
-    /// `landed`, `ejected`, `refusal-deferred` or `withdrawn`.
+    /// `landed`, `ejected`, `refusal-deferred`, `escalated` or `withdrawn`.
     pub verdict: &'static str,
 }
 
@@ -91,6 +91,14 @@ pub fn desired_transition(item: &Item) -> Option<Transition> {
                 history_count(item, "withdrawn")
             ),
             verdict: "withdrawn",
+        }),
+        ItemStatus::Queued if !item.escalated.is_empty() => Some(Transition {
+            key: format!(
+                "escalated:{}:{}",
+                item.head,
+                history_count(item, "escalated")
+            ),
+            verdict: "escalated",
         }),
         ItemStatus::Queued if item.validation_refusals > 0 && !item.last_refusal.is_empty() => {
             Some(Transition {
@@ -300,6 +308,13 @@ pub fn render_report(state: &State, item: &Item, transition: &Transition) -> Str
     match transition.verdict {
         "landed" => {
             text.push_str(&format!("landed_main_sha: {}\n", item.landed_as));
+        }
+        "escalated" => {
+            text.push_str(&format!("escalated: {}\n", item.escalated));
+            text.push_str(&format!(
+                "remedy: fix what kept validation from running, then `merge-queue retry {}`\n",
+                item.pr
+            ));
         }
         "refusal-deferred" => {
             text.push_str(&format!("refusal: {}\n", item.last_refusal));
@@ -555,6 +570,7 @@ mod unit {
             validation_refusals: 0,
             next_retry_at: String::new(),
             last_refusal: String::new(),
+            escalated: String::new(),
             deciding_report: String::new(),
             deciding_failed: vec![],
             notify_delivery: NotifyDelivery::default(),
@@ -586,6 +602,12 @@ mod unit {
         // A later refusal is a new transition; the landed key differs too.
         deferred.validation_refusals = 3;
         assert_ne!(desired_transition(&deferred).unwrap().key, transition.key);
+        // Escalation to the owner outranks the refusal it ended.
+        deferred.escalated = "validation did not run 3 time(s)".to_owned();
+        deferred.log("escalated", "validation did not run 3 time(s)");
+        let escalated = desired_transition(&deferred).unwrap();
+        assert_eq!(escalated.verdict, "escalated");
+        assert!(escalated.key.starts_with("escalated:"), "{}", escalated.key);
     }
 
     #[test]

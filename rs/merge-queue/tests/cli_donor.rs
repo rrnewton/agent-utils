@@ -753,6 +753,45 @@ fn a_could_not_run_receipt_is_no_verdict_and_requeues_with_an_alarm() {
 }
 
 #[test]
+fn could_not_run_receipts_are_bounded_and_the_batch_is_refused() {
+    let fx = Fixture::new("donor-could-not-run-bound");
+    fx.mq_ok(&[
+        "init",
+        "--validator",
+        "command",
+        "--validator-run",
+        r#"if [ -n "$DONOR" ]; then echo COULD_NOT_RUN; exit 75; fi; exit 0"#,
+        "--offload",
+        "decide",
+        "--refusal-max-retries",
+        "0",
+    ]);
+    set_config(
+        &fx,
+        |config| {
+            config["donors"] = serde_json::json!({"max_could_not_run": 1, "claim_timeout_secs": 30})
+        },
+    );
+    two_changes(&fx);
+    let clone = donor_clone(&fx, "donor-host");
+    let run = spawn_run(&fx, &[]);
+    wait_for("a published job", Duration::from_secs(30), || {
+        !jobs(&fx).is_empty()
+    });
+    let _ = donor(&fx, &clone, "d1", &[("DONOR", "1")]);
+    let (code, report, stderr) = finish(run);
+    assert_eq!(code, Some(3), "{stderr}");
+    assert!(report["ejected"].as_array().unwrap().is_empty(), "{report}");
+    let reason = report["deferred"][0]["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("could-not-run receipts (the bound)"),
+        "{reason}"
+    );
+    assert_eq!(jobs(&fx)[0]["state"], "cancelled");
+    assert_eq!(item_status(&fx, 1), "queued");
+}
+
+#[test]
 fn compare_mode_counts_a_could_not_run_receipt_and_compares_nothing() {
     let fx = Fixture::new("donor-compare-could-not-run");
     fx.mq_ok(&[

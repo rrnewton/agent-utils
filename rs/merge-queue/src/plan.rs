@@ -500,6 +500,24 @@ pub fn make_plan(
     // change is not ejected, and no test is blamed.
     let at = now();
     for item in &queued {
+        // Escalated to its owner after the bounded number of deferrals: held, not retried,
+        // until `merge-queue retry` clears it.
+        if !item.escalated.is_empty() {
+            hold(
+                &mut held,
+                Held {
+                    pr: item.pr,
+                    kind: "escalated".into(),
+                    reason: format!(
+                        "escalated to its owner: {}; `merge-queue retry {}` returns it to the queue",
+                        item.escalated, item.pr
+                    ),
+                    with: vec![],
+                    paths: vec![],
+                },
+            );
+            continue;
+        }
         if item.is_deferred_at(&at) {
             hold(
                 &mut held,
@@ -857,6 +875,7 @@ mod unit {
             validation_refusals: 0,
             next_retry_at: String::new(),
             last_refusal: String::new(),
+            escalated: String::new(),
             deciding_report: String::new(),
             deciding_failed: vec![],
             status: ItemStatus::Queued,
@@ -960,6 +979,17 @@ mod unit {
         let plan = make_plan(&items, "main", "B", &probe_for(&items), opts(4));
         assert!(plan.held.is_empty());
         assert_eq!(plan.batches[0].prs, vec![1, 2]);
+    }
+
+    #[test]
+    fn escalated_change_is_held_until_retry() {
+        let mut items = vec![item(1, 100, "t1"), item(2, 100, "t2")];
+        items[0].escalated = "validation did not run 3 time(s)".into();
+        let plan = make_plan(&items, "main", "B", &probe_for(&items), opts(4));
+        assert_eq!(plan.batches[0].prs, vec![2]);
+        assert_eq!(plan.held[0].pr, 1);
+        assert_eq!(plan.held[0].kind, "escalated");
+        assert!(plan.held[0].reason.contains("merge-queue retry 1"));
     }
 
     #[test]

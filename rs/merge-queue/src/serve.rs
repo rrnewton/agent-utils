@@ -908,16 +908,30 @@ fn run_cycle(
                     deferred.reason
                 );
             }
+            // Bounded retry: changes past `validator.max_deferrals` are held for their owner.
+            let escalated: Vec<String> = report
+                .deferred
+                .iter()
+                .flat_map(|deferred| deferred.escalated.iter())
+                .map(|pr| format!("#{pr}"))
+                .collect();
+            let alarm_text = if escalated.is_empty() {
+                alarm.map(|deferred| format!("ALARM: {}", deferred.reason))
+            } else {
+                let text = format!(
+                    "ALARM: {} escalated to the owner (validation did not run the bounded number \
+                     of times); held until `merge-queue retry`",
+                    escalated.join(" ")
+                );
+                eprintln!("merge-queue serve: {text}");
+                Some(text)
+            };
             if report.stopped.is_empty() {
-                heartbeat.last_error = alarm
-                    .map(|deferred| format!("ALARM: {}", deferred.reason))
-                    .unwrap_or_default();
+                heartbeat.last_error = alarm_text.unwrap_or_default();
                 true
             } else {
-                heartbeat.last_error = match alarm {
-                    Some(deferred) => format!("ALARM: {}", deferred.reason),
-                    None => format!("run stopped: {}", report.stopped),
-                };
+                heartbeat.last_error =
+                    alarm_text.unwrap_or_else(|| format!("run stopped: {}", report.stopped));
                 false
             }
         }

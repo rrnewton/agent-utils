@@ -143,6 +143,10 @@ pub struct Deferred {
     pub retry_after: String,
     /// Refusal count recorded on the changes after this deferral.
     pub refusals: u32,
+    /// Changes that reached `validator.max_deferrals` with this deferral: escalated to their
+    /// owner and held until `merge-queue retry`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub escalated: Vec<i64>,
 }
 
 /// One validation the run performed.
@@ -578,6 +582,7 @@ impl<'a> Runner<'a> {
         } else {
             let mut store = crate::donor::Store::new(&state.root);
             store.lease_secs = config.donors.lease();
+            store.could_not_run_limit = config.donors.could_not_run_limit();
             match crate::donor::tool_identity(&config.validator, &config.repo) {
                 Ok(tool) => {
                     let reason = "superseded: the run that published it ended without settling it";
@@ -636,11 +641,27 @@ impl<'a> Runner<'a> {
         let (run_id, run_dir) = state.new_run()?;
         let events = std::fs::File::create(run_dir.join("events.jsonl"))
             .map_err(|error| format!("cannot create events log: {error}"))?;
-        let items = state
+        let items: BTreeMap<i64, Item> = state
             .items()?
             .into_iter()
             .map(|item| (item.pr, item))
             .collect();
+        // Changes escalated to their owner are held: never built into a candidate until
+        // `merge-queue retry`. A shadow run reads its own ledger, since it writes no items.
+        let mut held: BTreeSet<i64> = items
+            .values()
+            .filter(|item| item.status == ItemStatus::Queued && !item.escalated.is_empty())
+            .map(|item| item.pr)
+            .collect();
+        if simulate {
+            for (pr, entry) in state.shadow_refusals()? {
+                if !entry.escalated.is_empty()
+                    && items.get(&pr).is_some_and(|item| item.head == entry.head)
+                {
+                    held.insert(pr);
+                }
+            }
+        }
         // One slot per concurrent validation, plus one for selection queries.
         let slots = Slots::new(
             git.clone(),
@@ -666,7 +687,7 @@ impl<'a> Runner<'a> {
             slots,
             items: Mutex::new(items),
             deps: Mutex::new(BTreeMap::new()),
-            excluded: Mutex::new(BTreeSet::new()),
+            excluded: Mutex::new(held),
             landed_heads: Mutex::new(Vec::new()),
             simulated: Mutex::new(None),
             base: Mutex::new(String::new()),
@@ -716,42 +737,77 @@ impl<'a> Runner<'a> {
     }
 
     /// Record a refusal deferral for `prs`: each change stays `queued`, its refusal count
-    /// grows, and `next_retry_at` is set from the backoff for that count. Returns the
-    /// retry-after time and the new refusal count (from the first change).
+    /// grows, and `next_retry_at` is set from the backoff for that count. A change whose count
+    /// reaches `validator.max_deferrals` is escalated to its owner instead: held, with an
+    /// alarm, until `merge-queue retry`. Shadow runs, which write no items, count in the
+    /// shadow ledger so the bound holds there too. Returns the retry-after time and the new
+    /// refusal count (from the first change).
     fn defer_refusal(&self, prs: &[i64], detail: &str) -> Result<(String, u32), String> {
         let base = self.config.validator.refusal_backoff();
+        let limit = self.config.validator.deferral_limit();
+        let escalation = |count: u32| {
+            format!("validation did not run {count} time(s) (the bound is {limit}); last: {detail}")
+        };
         let mut retry_after = String::new();
         let mut refusals = 0u32;
+        let mut escalated = Vec::new();
         if !self.simulating() {
             let mut items = lock(&self.items);
             for pr in prs {
                 if let Some(item) = items.get_mut(pr) {
                     item.validation_refusals = item.validation_refusals.saturating_add(1);
                     refusals = item.validation_refusals;
-                    let delay = refusal_backoff(item.validation_refusals.saturating_sub(1), base);
-                    retry_after = retry_after_time(delay);
-                    item.next_retry_at = retry_after.clone();
                     item.last_refusal = detail.to_owned();
                     item.deciding_report = self.run_dir.join("report.md").display().to_string();
                     item.deciding_failed.clear();
-                    item.log(
-                        "validation-refused",
-                        format!(
-                            "{detail}; stays queued, retry after {} (refusal {})",
-                            item.next_retry_at, item.validation_refusals
-                        ),
-                    );
+                    if item.validation_refusals >= limit {
+                        item.escalated = escalation(item.validation_refusals);
+                        item.next_retry_at.clear();
+                        let note = item.escalated.clone();
+                        item.log("escalated", note);
+                        escalated.push(*pr);
+                    } else {
+                        let delay =
+                            refusal_backoff(item.validation_refusals.saturating_sub(1), base);
+                        retry_after = retry_after_time(delay);
+                        item.next_retry_at = retry_after.clone();
+                        item.log(
+                            "validation-refused",
+                            format!(
+                                "{detail}; stays queued, retry after {} (refusal {} of {limit})",
+                                item.next_retry_at, item.validation_refusals
+                            ),
+                        );
+                    }
                     self.state.save_item(item)?;
                 }
             }
         } else {
-            // Simulated runs record the deferral in the report only; the backoff is the
-            // base delay for a first refusal.
-            retry_after = retry_after_time(refusal_backoff(0, base));
-            refusals = 1;
+            let items = lock(&self.items);
+            let mut ledger = self.state.shadow_refusals()?;
+            for pr in prs {
+                let head = items
+                    .get(pr)
+                    .map(|item| item.head.clone())
+                    .unwrap_or_default();
+                let entry = ledger.entry(*pr).or_default();
+                if entry.head != head {
+                    *entry = crate::state::ShadowRefusal {
+                        head,
+                        ..Default::default()
+                    };
+                }
+                entry.refusals = entry.refusals.saturating_add(1);
+                refusals = entry.refusals;
+                if entry.refusals >= limit {
+                    entry.escalated = escalation(entry.refusals);
+                    escalated.push(*pr);
+                }
+            }
+            self.state.save_shadow_refusals(&ledger)?;
         }
         if retry_after.is_empty() {
-            retry_after = retry_after_time(refusal_backoff(0, base));
+            retry_after = retry_after_time(refusal_backoff(refusals.saturating_sub(1), base));
             refusals = refusals.max(1);
         }
         lock(&self.report).deferred.push(Deferred {
@@ -759,6 +815,7 @@ impl<'a> Runner<'a> {
             reason: detail.to_owned(),
             retry_after: retry_after.clone(),
             refusals,
+            escalated: escalated.clone(),
         });
         self.event(
             "validation-refused",
@@ -767,6 +824,20 @@ impl<'a> Runner<'a> {
                 list(prs)
             ),
         );
+        if !escalated.is_empty() {
+            let alarm = format!(
+                "ALARM: {} escalated to the owner: {}; held until `merge-queue retry {}`",
+                list(&escalated),
+                escalation(refusals),
+                escalated
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+            eprintln!("merge-queue: {alarm}");
+            self.event("escalated", &alarm);
+        }
         Ok((retry_after, refusals))
     }
 
@@ -1546,6 +1617,22 @@ impl<'a> Runner<'a> {
                         ),
                     );
                     return receipt_ran(&receipt, dir);
+                }
+                crate::donor::JobState::Cancelled
+                    if record.could_not_run.len() >= donors.store.could_not_run_limit =>
+                {
+                    // Donors never ran it: no verdict; the batch is refused (and deferred,
+                    // within the deferral bound) like a validator that cannot execute.
+                    let mut ran = stopped(false, None);
+                    ran.refused = true;
+                    ran.cannot_execute = Some(format!(
+                        "{} on donors: job {published} collected {} could-not-run receipts \
+                         (the bound): {}",
+                        crate::validate::CANNOT_EXECUTE,
+                        record.could_not_run.len(),
+                        record.could_not_run.join("; ")
+                    ));
+                    return Ok(ran);
                 }
                 crate::donor::JobState::Cancelled => {
                     return Err(format!(
@@ -2386,8 +2473,13 @@ impl<'a> Runner<'a> {
         let mut validations = vec![vid];
         let mut flaky = BTreeSet::new();
         let mut carried = false;
+        // The red run attributed its failures to named tests (not only an exit status).
+        let mut attributed = !ran.results.unattributed && !seen_failed.is_empty();
         loop {
             match self.find_culprit(&current, &focus, &seen_failed)? {
+                Culprit::Refused(detail) if attributed => {
+                    return self.red_without_probe(&current, &seen_failed, &detail, pending);
+                }
                 Culprit::Refused(detail) => {
                     let (retry_after, _) = self.defer_refusal(&current.prs, &detail)?;
                     return Ok(BatchOutcome::Deferred(
@@ -2549,6 +2641,7 @@ impl<'a> Runner<'a> {
                         .chain(not_passed(&rran))
                         .collect();
                     seen_failed = rran.failed();
+                    attributed = !rran.results.unattributed && !seen_failed.is_empty();
                     focus = if rran.results.unattributed {
                         delta
                     } else {
@@ -2559,6 +2652,100 @@ impl<'a> Runner<'a> {
                 }
             }
         }
+    }
+
+    /// A red validation that named failed tests, whose follow-up probe could not run. The red
+    /// run is the verdict; the probe would only have narrowed it (which change, or flaky?), so
+    /// its failure is recorded and never turns a known red into a retry. A single change is
+    /// ejected (or, under `validator.red_without_probe: hold`, held for its owner). Several
+    /// changes cannot be told apart without probes: each goes back as a batch of its own, so
+    /// its own validation (of a different commit) decides it.
+    fn red_without_probe(
+        &self,
+        current: &Candidate,
+        failed: &BTreeSet<TestId>,
+        detail: &str,
+        pending: &mut VecDeque<Vec<i64>>,
+    ) -> Result<BatchOutcome, String> {
+        let skipped = format!(
+            "culprit narrowing and the flaky check were skipped: the probe could not run ({detail})"
+        );
+        let failed_ids = failed.iter().cloned().collect::<Vec<_>>();
+        if let [pr] = current.prs[..] {
+            let reason = format!(
+                "{} failed in the validation of #{pr} on top of {}; {skipped}",
+                ids(&failed_ids),
+                short(&current.parent)
+            );
+            self.event("narrowing-skipped", &reason);
+            if self.config.validator.hold_red_without_probe() {
+                self.hold_for_owner(&[pr], &reason)?;
+                return Ok(BatchOutcome::Deferred(
+                    format!("#{pr} held for its owner: {reason}"),
+                    vec![pr],
+                ));
+            }
+            self.eject(pr, "failed-tests", &reason, &failed_ids)?;
+            self.drop_dependents(pr, pending);
+            return Ok(BatchOutcome::Done);
+        }
+        self.event(
+            "narrowing-skipped",
+            &format!(
+                "{} failed in {}; {skipped}; validating each change on its own",
+                ids(&failed_ids),
+                list(&current.prs)
+            ),
+        );
+        for pr in current.prs.iter().rev() {
+            pending.push_front(vec![*pr]);
+        }
+        Ok(BatchOutcome::Done)
+    }
+
+    /// Hold `prs` for their owner with `reason` (escalated, as after the deferral bound), with
+    /// an alarm. Shadow runs record it in the shadow ledger.
+    fn hold_for_owner(&self, prs: &[i64], reason: &str) -> Result<(), String> {
+        if !self.simulating() {
+            let mut items = lock(&self.items);
+            for pr in prs {
+                if let Some(item) = items.get_mut(pr) {
+                    item.escalated = reason.to_owned();
+                    item.next_retry_at.clear();
+                    item.deciding_report = self.run_dir.join("report.md").display().to_string();
+                    item.log("escalated", reason);
+                    self.state.save_item(item)?;
+                }
+            }
+        } else {
+            let items = lock(&self.items);
+            let mut ledger = self.state.shadow_refusals()?;
+            for pr in prs {
+                let head = items
+                    .get(pr)
+                    .map(|item| item.head.clone())
+                    .unwrap_or_default();
+                let entry = ledger.entry(*pr).or_default();
+                entry.head = head;
+                entry.escalated = reason.to_owned();
+            }
+            self.state.save_shadow_refusals(&ledger)?;
+        }
+        lock(&self.excluded).extend(prs.iter().copied());
+        lock(&self.report).deferred.push(Deferred {
+            prs: prs.to_vec(),
+            reason: reason.to_owned(),
+            retry_after: String::new(),
+            refusals: 0,
+            escalated: prs.to_vec(),
+        });
+        let alarm = format!(
+            "ALARM: {} escalated to the owner: {reason}; held until `merge-queue retry`",
+            list(prs)
+        );
+        eprintln!("merge-queue: {alarm}");
+        self.event("escalated", &alarm);
+        Ok(())
     }
 
     /// Search the candidate's prefixes for the first change that makes `focus` fail, running only

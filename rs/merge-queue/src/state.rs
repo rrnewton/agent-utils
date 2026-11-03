@@ -88,7 +88,24 @@ pub struct ValidatorConfig {
     /// publishes a donor job; a donor whose answers differ refuses the job.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub tool_identity: std::collections::BTreeMap<String, String>,
+    /// Times a change may be deferred because validation did not run (an admission refusal, a
+    /// validator that cannot execute, a probe that could not run, donors that could not run)
+    /// before it is escalated to its owner and held until `merge-queue retry` (0 = 3).
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    pub max_deferrals: u32,
+    /// What a red validation that names failed tests does when the follow-up probe cannot
+    /// run: `eject` (empty, the default: the red run is the verdict) or `hold` (escalate the
+    /// change to its owner instead).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub red_without_probe: String,
 }
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
+/// Default bound on deferrals, and on could-not-run receipts per donor job.
+pub const DEFAULT_RETRY_BOUND: u32 = 3;
 
 /// Where validations run (`validator.offload`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -129,9 +146,21 @@ pub struct DonorsConfig {
     /// Seconds a published job may wait unclaimed before the run stops with an error
     /// (offload `decide`; 0 = 900). Nothing is ejected.
     pub claim_timeout_secs: u64,
+    /// Receipts saying validation could not run that one job may collect before it is
+    /// cancelled, and that one donor may return for it before it is left out (0 = 3).
+    pub max_could_not_run: u32,
 }
 
 impl DonorsConfig {
+    /// Resolved could-not-run bound.
+    pub fn could_not_run_limit(&self) -> usize {
+        if self.max_could_not_run == 0 {
+            DEFAULT_RETRY_BOUND as usize
+        } else {
+            self.max_could_not_run as usize
+        }
+    }
+
     /// Resolved lease length.
     pub fn lease(&self) -> u64 {
         if self.lease_secs == 0 {
@@ -181,6 +210,20 @@ impl ValidatorConfig {
     /// Resolved base backoff in seconds (stored verbatim; 0 = no delay).
     pub fn refusal_backoff(&self) -> u64 {
         self.refusal_backoff_secs
+    }
+
+    /// Resolved deferral bound.
+    pub fn deferral_limit(&self) -> u32 {
+        if self.max_deferrals == 0 {
+            DEFAULT_RETRY_BOUND
+        } else {
+            self.max_deferrals
+        }
+    }
+
+    /// Whether a red run whose probe cannot run holds the change instead of ejecting it.
+    pub fn hold_red_without_probe(&self) -> bool {
+        self.red_without_probe == "hold"
     }
 }
 
@@ -507,7 +550,45 @@ pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
         .map_err(|error| format!("cannot rename into {}: {error}", path.display()))
 }
 
+/// One change's refusal bookkeeping in shadow mode, where runs never write item records: the
+/// deferral bound must hold there too.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ShadowRefusal {
+    /// The head the count is for; a new head starts again from zero.
+    pub head: String,
+    /// Deferrals of this head so far.
+    pub refusals: u32,
+    /// Why it was escalated, once the bound was reached (held until `merge-queue retry`).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub escalated: String,
+}
+
 impl State {
+    /// Path of the shadow-mode refusal ledger (one map, keyed by change number).
+    pub fn shadow_refusals_path(&self) -> PathBuf {
+        self.root.join("shadow-refusals.json")
+    }
+
+    /// The shadow-mode refusal ledger; empty when there is none.
+    pub fn shadow_refusals(
+        &self,
+    ) -> Result<std::collections::BTreeMap<i64, ShadowRefusal>, String> {
+        let path = self.shadow_refusals_path();
+        if !path.exists() {
+            return Ok(Default::default());
+        }
+        read_json(&path)
+    }
+
+    /// Replace the shadow-mode refusal ledger.
+    pub fn save_shadow_refusals(
+        &self,
+        ledger: &std::collections::BTreeMap<i64, ShadowRefusal>,
+    ) -> Result<(), String> {
+        write_json(&self.shadow_refusals_path(), ledger)
+    }
+
     /// Open (without creating) the state directory at `root`.
     pub fn at(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }

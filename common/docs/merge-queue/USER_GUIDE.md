@@ -5,7 +5,7 @@ changes as ready to land. The queue orders them, splits them into batches, valid
 exact combined tree, and lands only trees that passed. It runs where your clone is. There is no
 hosted service, no webhook and no inbound connection.
 
-Commands: `init`, `submit`, `withdraw`, `list` and `plan` decide what can land; `run` builds,
+Commands: `init`, `submit`, `withdraw`, `retry`, `list` and `plan` decide what can land; `run` builds,
 validates and lands it; `serve` runs that loop forever so nobody has to drive it by hand, and
 `status` reports whether the daemon is alive; `widen` and `obligations` track focused landings
 until the complete suite has run; `bench` measures the landing rate against a serial lander on
@@ -122,6 +122,8 @@ This command creates the state directory and writes `config.json`.
 | `--admission WORD` | none | A command prefix every validation runs under, such as a host admission wrapper. Repeat it for several words. |
 | `--refusal-max-retries N` | `3` | Extra attempts after an admission refusal (exit `75`, or a non-zero exit whose first output line starts with `COULD_NOT_RUN` and that attributed no failed test) within one `run`, each after a backoff delay. A refusal is never a pass and never red: the change stays queued. |
 | `--refusal-backoff-secs SECS` | `2` | Base backoff between refusal retries, doubled per attempt and capped at 60 seconds. `0` means no delay. The same backoff sets the deferred change's next retry time. |
+| `--max-deferrals N` | `3` | How many times a change may be deferred because validation did not run (an admission refusal, a validator that cannot execute, a probe or donors that could not run) before it is escalated to its owner and held until `merge-queue retry` (see "Bounded retry"). |
+| `--red-without-probe MODE` | `eject` | What a red validation that names failed tests does when its follow-up probe cannot run: `eject` the change (the red run is the verdict) or `hold` it for its owner. |
 | `--offload MODE` | `off` | Where validations run: `off` (in this process, as always), `compare` (in this process, which decides, and also on donors, whose receipts are only compared) or `decide` (on donors only; an accepted receipt is the verdict). See "Donor validators". |
 | `--tool-identity NAME=COMMAND` | none | A tool the validation depends on (repeatable): the command prints its identity, for example a tool repository's commit or a toolchain version, never a hash of a binary (builds are not byte-identical across hosts). Donors whose answer differs decline the job. merge-queue's own revision is always compared. |
 | `--timeout SECS` | `0` | Seconds before one validation is killed (its whole process group) and its selected tests count as errors. `0` means no limit. |
@@ -147,8 +149,8 @@ and sets its status back to `queued`.
 | `--after PR` | none | A change that must land first. Repeatable. |
 | `--solo` | off | Validate and land this change in a batch of its own. Use it for risky changes. |
 | `--by NAME` | empty | Who is submitting (an agent or a person). |
-| `--notify NAME` | empty | agentctl session name the `serve` daemon notifies exactly once per state change (landed, ejected, refusal-deferred, withdrawn). Stored on the item next to `submitted_by`; resubmitting without it keeps the recorded name. Ready files set it per line with `notify=NAME`. |
-| `--notify NAME` | empty | agentctl session name the `serve` daemon notifies exactly once per state change (landed, ejected, refusal-deferred, withdrawn). Stored on the item next to `submitted_by`; resubmitting without it keeps the recorded name. Ready files set it per line with `notify=NAME`. |
+| `--notify NAME` | empty | agentctl session name the `serve` daemon notifies exactly once per state change (landed, ejected, refusal-deferred, escalated, withdrawn). Stored on the item next to `submitted_by`; resubmitting without it keeps the recorded name. Ready files set it per line with `notify=NAME`. |
+| `--notify NAME` | empty | agentctl session name the `serve` daemon notifies exactly once per state change (landed, ejected, refusal-deferred, escalated, withdrawn). Stored on the item next to `submitted_by`; resubmitting without it keeps the recorded name. Ready files set it per line with `notify=NAME`. |
 | `--title TEXT` | empty | A one-line description. |
 | `--tested-with SELECTION` | none | The tests you ran on this head: `all`, a comma- or space-separated list of test IDs, or `@FILE` with one ID per line (`#` starts a comment). This becomes the change's validation claim. Without it, the change has no claim. |
 | `--policy NAME` | `manual` | The name of the policy that chose `--tested-with`, for example `path-routing`. |
@@ -214,6 +216,13 @@ Ready-file lines look like `PR [SHA] [head=REF] [priority=N] [after=N,N] [solo] 
 
 This command marks a queued change `withdrawn`. `--reason TEXT` (default `withdrawn by submitter`)
 is recorded in the change's history. Submitting the change again puts it back in the queue.
+
+### `merge-queue retry PR...`
+
+This command returns changes that were escalated to their owner (see "Bounded retry") to the
+queue: it clears the escalation, the refusal count and the backoff, in the item records and in
+the shadow ledger. Run it once whatever kept validation from running is fixed. A change that is
+only deferred is returned at once too, without waiting for its backoff.
 
 ### `merge-queue list`
 
@@ -625,6 +634,9 @@ An **item record** (`items/<pr>.json`) has these fields:
 - `clean_ignored`: also delete ignored files from reused checkouts (default `false`).
 - `offload`: `off` (or absent; the default), `compare` or `decide` (see "Donor validators").
 - `tool_identity`: `{name: command}`, the tools a validation depends on, checked on donors.
+- `max_deferrals`: deferrals before a change is escalated to its owner (absent or `0`: `3`).
+- `red_without_probe`: `hold` holds a red change whose probe cannot run for its owner; absent
+  (the default) ejects it.
 
 **`donors`** fields (only read when `validator.offload` is not off; absent means the defaults):
 
@@ -634,6 +646,8 @@ An **item record** (`items/<pr>.json`) has these fields:
 - `max_jobs_per_donor`: the most leases one donor may hold (default `0`: what the donor asks for).
 - `claim_timeout_secs`: in `decide` mode, how long a job may wait with no donor holding it
   before the run stops with an error (default `900`). Nothing is ejected.
+- `max_could_not_run`: could-not-run receipts one job may collect before it is cancelled, and
+  one donor may return for it before it is left out (absent or `0`: `3`).
 
 **`land`** fields:
 
@@ -714,6 +728,27 @@ The reason goes into the item's `last_refusal` and history, the run report's `de
 and the `refusal-deferred` notification. `serve` also prints it as an `ALARM:` line and keeps it
 in the heartbeat's `last_error` until a clean cycle. A runner that reports failed tests and then
 exits `127` is still red: its own results are evidence.
+
+**Bounded retry.** Validation that did not run is retried, but never forever. Each deferral of
+a change counts, whatever caused it: an admission refusal, a validator that cannot execute, a
+culprit-search probe that could not run on an unattributed red, or donors that could not run.
+When a change reaches `validator.max_deferrals` (default `3`), it is escalated to its owner
+instead of deferred again. The change stays `queued` with an `escalated` reason, `plan` holds
+it as `escalated`, and no run builds it into a candidate. Its `--notify` recipient gets an
+`escalated` notification, and the run and `serve` print an `ALARM:` line (also kept in the
+heartbeat's `last_error`). `merge-queue retry PR` returns it once the cause is fixed. A new head
+starts the count again. Shadow runs write no item records, so they count in
+`<state>/shadow-refusals.json` and hold escalated changes the same way.
+
+**A red run is a verdict even when its probe cannot run.** After a red validation the queue
+probes the failed tests on prefixes of the batch, to name the culprit change and to tell a flaky
+test from a real failure. When such a probe cannot run (refused, or the validator cannot
+execute) and the red run named failed tests, the red run still decides. A batch of one change
+is ejected, with a reason saying that culprit narrowing and the flaky check were skipped, or
+held for its owner under `validator.red_without_probe: hold`. A larger batch cannot be split
+without probes, so each of its changes goes back as a batch of its own, validated on its own
+commit. A red run with no attributed failures is deferred within the bound. The red commit
+itself is never validated again.
 
 **Verdict lines.** A `command` runner that writes no results file but prints dagrun-style verdict
 lines (`[step] ✓ PASS ...`, `[step] ✗ FAIL ...`, `[step] SKIPPED ...`) is still attributed per
@@ -850,8 +885,10 @@ sends no receipt. A receipt that says validation could not run (admission refuse
 `COULD_NOT_RUN`) is no verdict in either mode. The job goes back to the queue, and the attempt
 is recorded in the job's `could_not_run` list. `donor status` shows "could not run: N
 receipt(s)", and compare mode compares nothing for it. In `decide` mode the waiting run prints an
-`ALARM:` line naming the donor. A donor that answers this way three times for one job is left
-out of that job.
+`ALARM:` line naming the donor. A donor that answers this way `donors.max_could_not_run` times
+(default `3`) for one job is left out of that job. A job that collects that many such receipts
+is cancelled. A `decide` run waiting on it then counts the batch as refused, and the deferral
+bound applies (see "Bounded retry").
 
 **Stops, discards and dead candidates.** A stop request or a discarded speculative candidate
 cancels the job. So does a candidate the queue no longer wants:

@@ -241,6 +241,13 @@ fn submit_resolved(
         } else {
             String::new()
         },
+        escalated: if same_head {
+            existing
+                .as_ref()
+                .map_or_else(String::new, |old| old.escalated.clone())
+        } else {
+            String::new()
+        },
         last_refusal: if same_head {
             existing
                 .as_ref()
@@ -283,6 +290,37 @@ pub fn withdraw(state: &State, pr: i64, why: &str) -> Result<Item, String> {
     item.deciding_failed.clear();
     item.log("withdrawn", why);
     state.save_item(&item)?;
+    Ok(item)
+}
+
+/// Return an escalated (or deferred) change to the queue: clear its escalation, refusal
+/// count and backoff, here and in the shadow ledger. The owner runs this once whatever kept
+/// validation from running is fixed.
+pub fn retry(state: &State, pr: i64) -> Result<Item, String> {
+    let mut item = state
+        .item(pr)?
+        .ok_or_else(|| format!("#{pr} is not in the queue"))?;
+    if item.status != ItemStatus::Queued {
+        return Err(format!("#{pr} is {}, not queued", item.status.as_str()));
+    }
+    let was = if item.escalated.is_empty() {
+        format!("{} refusal(s)", item.validation_refusals)
+    } else {
+        format!("escalated: {}", item.escalated)
+    };
+    item.escalated.clear();
+    item.validation_refusals = 0;
+    item.next_retry_at.clear();
+    item.last_refusal.clear();
+    item.log(
+        "retry",
+        format!("returned to the queue by its owner (was {was})"),
+    );
+    state.save_item(&item)?;
+    let mut ledger = state.shadow_refusals()?;
+    if ledger.remove(&pr).is_some() {
+        state.save_shadow_refusals(&ledger)?;
+    }
     Ok(item)
 }
 

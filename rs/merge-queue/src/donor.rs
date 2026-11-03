@@ -98,9 +98,6 @@ pub fn remote_url(dir: &Path, remote: &str) -> Option<String> {
         .or_else(|| (remote.contains("://") || remote.contains(':')).then(|| remote.to_owned()))
 }
 
-/// Receipts saying validation could not run that one donor may return for one job before it
-/// is left out of that job.
-pub const COULD_NOT_RUN_LIMIT: usize = 3;
 /// Seconds a lease lasts without a renewal.
 pub const DEFAULT_LEASE_SECS: u64 = 120;
 
@@ -342,6 +339,9 @@ pub struct Store {
     dir: PathBuf,
     /// Lease length in seconds.
     pub lease_secs: u64,
+    /// Could-not-run receipts one job may collect before it is cancelled, and one donor may
+    /// return for it before it is left out (`donors.max_could_not_run`).
+    pub could_not_run_limit: usize,
 }
 
 /// The store's lock, held only for one short operation.
@@ -524,6 +524,7 @@ impl Store {
         Self {
             dir: state_root.join("donor"),
             lease_secs: DEFAULT_LEASE_SECS,
+            could_not_run_limit: crate::state::DEFAULT_RETRY_BOUND as usize,
         }
     }
 
@@ -912,8 +913,11 @@ impl Store {
                 .iter()
                 .filter(|entry| entry.starts_with(&format!("{}: ", receipt.donor.name)))
                 .count();
+            // Bounded: past the limit the job is cancelled, and a waiting decide-mode run
+            // counts that as a refusal (which its own deferral bound escalates).
+            let exhausted = job.could_not_run.len() >= self.could_not_run_limit;
             job.lease = None;
-            job.state = if job.candidate_gone.is_some() {
+            job.state = if job.candidate_gone.is_some() || exhausted {
                 JobState::Cancelled
             } else {
                 JobState::Queued
@@ -924,12 +928,19 @@ impl Store {
                 receipt.donor.name,
                 receipt.donor.host,
                 if job.state == JobState::Queued {
-                    "queued again"
+                    "queued again".to_owned()
+                } else if exhausted {
+                    format!(
+                        "cancelled: {} could-not-run receipts reach the bound ({})",
+                        job.could_not_run.len(),
+                        self.could_not_run_limit
+                    )
                 } else {
-                    "cancelled (the queue no longer wants the candidate)"
+                    "cancelled (the queue no longer wants the candidate)".to_owned()
                 }
             );
-            if by_this_donor >= COULD_NOT_RUN_LIMIT && !job.declined_by.contains(&lease.donor) {
+            if by_this_donor >= self.could_not_run_limit && !job.declined_by.contains(&lease.donor)
+            {
                 job.declined_by.push(lease.donor.clone());
                 note.push_str(&format!(
                     "; {} could not run it {by_this_donor} times and will not get it again",

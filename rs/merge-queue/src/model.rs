@@ -143,6 +143,11 @@ pub struct Item {
     /// Detail of the most recent refusal (exit status and marker), for the operator.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub last_refusal: String,
+    /// Why the change was escalated to its owner, when validation did not run the bounded
+    /// number of times (or a red run's probe could not run under `red_without_probe: hold`).
+    /// The change stays `queued` but is held until `merge-queue retry` clears this.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub escalated: String,
     /// Run report (`runs/<id>/report.md`) of the run that decided the
     /// current transition, recorded at the transition itself. Notifications
     /// link this, not whatever run happens to be newest.

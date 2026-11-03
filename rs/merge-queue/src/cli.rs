@@ -170,6 +170,7 @@ fn read_token() -> Result<String, String> {
 fn donor_store(state: &State, config: &Config) -> crate::donor::Store {
     let mut store = crate::donor::Store::new(&state.root);
     store.lease_secs = config.donors.lease();
+    store.could_not_run_limit = config.donors.could_not_run_limit();
     store
 }
 
@@ -454,6 +455,15 @@ enum Command {
         /// at 60). 0 = no delay.
         #[arg(long, default_value_t = crate::state::DEFAULT_REFUSAL_BACKOFF_SECS)]
         refusal_backoff_secs: u64,
+        /// Times a change may be deferred because validation did not run (refusals, a
+        /// validator that cannot execute, a probe or donors that could not run) before it is
+        /// escalated to its owner and held until `merge-queue retry`.
+        #[arg(long, default_value_t = crate::state::DEFAULT_RETRY_BOUND)]
+        max_deferrals: u32,
+        /// A red validation naming failed tests whose follow-up probe cannot run: `eject`
+        /// the change (the red run is the verdict) or `hold` it for its owner.
+        #[arg(long, default_value = "eject", value_parser = ["eject", "hold"])]
+        red_without_probe: String,
         /// Where validations run: `off` (in this process; the default), `compare` (in this
         /// process, which decides, and also on donors, whose receipts are only compared), or
         /// `decide` (on donors only; an accepted receipt is the verdict).
@@ -558,6 +568,14 @@ enum Command {
         /// Reason recorded in the change's history.
         #[arg(long, default_value = "withdrawn by submitter")]
         reason: String,
+    },
+    /// Return changes escalated to their owner (validation did not run the bounded number of
+    /// times) to the queue: clears the escalation, the refusal count and the backoff. Run it
+    /// once whatever kept validation from running is fixed.
+    Retry {
+        /// Change numbers.
+        #[arg(required = true)]
+        prs: Vec<i64>,
     },
     /// List changes and their status.
     List {
@@ -981,6 +999,8 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             timeout,
             refusal_max_retries,
             refusal_backoff_secs,
+            max_deferrals,
+            red_without_probe,
             offload,
             tool_identity,
             clean_ignored,
@@ -1060,6 +1080,16 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     clean_ignored,
                     refusal_max_retries,
                     refusal_backoff_secs,
+                    max_deferrals: if max_deferrals == crate::state::DEFAULT_RETRY_BOUND {
+                        0
+                    } else {
+                        max_deferrals
+                    },
+                    red_without_probe: if red_without_probe == "eject" {
+                        String::new()
+                    } else {
+                        red_without_probe
+                    },
                     offload: if offload == "off" {
                         String::new()
                     } else {
@@ -1212,6 +1242,14 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             let _lock = state.lock()?;
             let item = ops::withdraw(&state, pr, &reason)?;
             println!("withdrew #{}", item.pr);
+            Ok(0)
+        }
+        Command::Retry { prs } => {
+            let _lock = state.lock()?;
+            for pr in prs {
+                ops::retry(&state, pr)?;
+                println!("#{pr} is back in the queue");
+            }
             Ok(0)
         }
         Command::List { all, json } => {

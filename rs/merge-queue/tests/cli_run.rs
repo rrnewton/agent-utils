@@ -265,6 +265,163 @@ fn a_shell_wrapper_whose_tool_is_missing_is_an_infrastructure_refusal_not_red() 
     );
 }
 
+/// The validator for #816: a full run (`MQ_SELECTION=all`) is red, attributing `t0`, when
+/// the checkout holds `bad.txt`; any probe (a test selection) is refused with exit 75.
+const RED_UNLESS_PROBE: &str = r#"if [ "$MQ_SELECTION" = tests ]; then echo COULD_NOT_RUN; exit 75; fi
+if [ -f bad.txt ]; then echo '{"id":"t0","outcome":"fail"}' >> "$MQ_RESULTS"; exit 1; fi
+echo '{"id":"t0","outcome":"pass"}' >> "$MQ_RESULTS"; exit 0"#;
+
+fn items(fx: &Fixture) -> Vec<Value> {
+    let items: Value = serde_json::from_str(&fx.mq_ok(&["list", "--all", "--json"])).unwrap();
+    items.as_array().unwrap().clone()
+}
+
+#[test]
+fn a_red_validation_is_a_verdict_even_when_the_probe_cannot_run() {
+    let fx = setup_validator(
+        "run-red-probe-refused",
+        RED_UNLESS_PROBE,
+        &["--refusal-max-retries", "0", "--refusal-backoff-secs", "0"],
+    );
+    fx.branch("a", &[("bad.txt", "x\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    let out = fx.mq(&["run", "--json"]);
+    let r = report(&String::from_utf8_lossy(&out.stdout));
+    assert_eq!(r["ejected"].as_array().unwrap().len(), 1, "{r}");
+    assert_eq!(r["ejected"][0]["pr"], 1, "{r}");
+    assert_eq!(r["ejected"][0]["kind"], "failed-tests", "{r}");
+    let reason = r["ejected"][0]["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("narrowing and the flaky check were skipped"),
+        "{reason}"
+    );
+    assert!(r["deferred"].as_array().is_none_or(|d| d.is_empty()), "{r}");
+    // One full validation and one refused probe: the red commit is never validated again.
+    let purposes = purposes(&r);
+    assert_eq!(
+        purposes.iter().filter(|p| *p != "probe").count(),
+        1,
+        "{purposes:?}"
+    );
+    assert_eq!(status(&fx, 1), "ejected");
+    let history = items(&fx)[0]["history"].to_string();
+    assert_eq!(history.matches("\"ejected\"").count(), 1, "{history}");
+}
+
+#[test]
+fn a_red_batch_whose_probe_cannot_run_is_validated_change_by_change() {
+    let fx = setup_validator(
+        "run-red-batch-probe-refused",
+        RED_UNLESS_PROBE,
+        &[
+            "--refusal-max-retries",
+            "0",
+            "--refusal-backoff-secs",
+            "0",
+            "--max-batch",
+            "2",
+        ],
+    );
+    fx.branch("a", &[("a.txt", "a\n")]);
+    fx.branch("b", &[("bad.txt", "x\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    fx.mq_ok(&["submit", "2", "--head", "b"]);
+    let out = fx.mq(&["run", "--json"]);
+    let r = report(&String::from_utf8_lossy(&out.stdout));
+    assert_eq!(landed_prs(&r), vec![vec![1]], "{r}");
+    assert_eq!(r["ejected"].as_array().unwrap().len(), 1, "{r}");
+    assert_eq!(r["ejected"][0]["pr"], 2, "{r}");
+    assert_eq!(status(&fx, 1), "landed");
+    assert_eq!(status(&fx, 2), "ejected");
+}
+
+#[test]
+fn hold_mode_escalates_a_red_whose_probe_cannot_run_and_retry_releases_it() {
+    let fx = setup_validator(
+        "run-red-probe-hold",
+        RED_UNLESS_PROBE,
+        &[
+            "--refusal-max-retries",
+            "0",
+            "--refusal-backoff-secs",
+            "0",
+            "--red-without-probe",
+            "hold",
+        ],
+    );
+    fx.branch("a", &[("bad.txt", "x\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    let out = fx.mq(&["run", "--json"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("ALARM: #1 escalated to the owner"),
+        "{stderr}"
+    );
+    let r = report(&String::from_utf8_lossy(&out.stdout));
+    assert!(r["ejected"].as_array().unwrap().is_empty(), "{r}");
+    assert_eq!(status(&fx, 1), "queued");
+    assert!(!items(&fx)[0]["escalated"].as_str().unwrap().is_empty());
+    let plan: Value = serde_json::from_str(&fx.mq_ok(&["plan", "--json"])).unwrap();
+    assert_eq!(plan["held"][0]["kind"], "escalated", "{plan}");
+    fx.mq_ok(&["retry", "1"]);
+    assert!(items(&fx)[0]["escalated"].is_null());
+    let plan: Value = serde_json::from_str(&fx.mq_ok(&["plan", "--json"])).unwrap();
+    assert!(plan["held"].as_array().unwrap().is_empty(), "{plan}");
+}
+
+/// Deferrals are bounded: after `--max-deferrals` the change is escalated, held, and no
+/// longer validated until `retry`.
+fn assert_deferrals_bounded(tag: &str, run: &[&str]) {
+    let fx = setup_validator(
+        tag,
+        "echo COULD_NOT_RUN; exit 75",
+        &[
+            "--refusal-max-retries",
+            "0",
+            "--refusal-backoff-secs",
+            "0",
+            "--max-deferrals",
+            "2",
+        ],
+    );
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    let first = fx.mq(run);
+    assert!(!String::from_utf8_lossy(&first.stderr).contains("ALARM"));
+    let second = fx.mq(run);
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(
+        stderr.contains("ALARM: #1 escalated to the owner"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("did not run 2 time(s) (the bound is 2)"),
+        "{stderr}"
+    );
+    let r = report(&String::from_utf8_lossy(&second.stdout));
+    assert_eq!(r["deferred"][0]["escalated"], serde_json::json!([1]), "{r}");
+    // Held: the next run validates nothing.
+    let third = fx.mq(run);
+    let r = report(&String::from_utf8_lossy(&third.stdout));
+    assert!(r["validations"].as_array().unwrap().is_empty(), "{r}");
+    assert_eq!(status(&fx, 1), "queued");
+    // The owner returns it once the cause is fixed.
+    fx.mq_ok(&["retry", "1"]);
+    let fourth = fx.mq(run);
+    let r = report(&String::from_utf8_lossy(&fourth.stdout));
+    assert_eq!(r["validations"].as_array().unwrap().len(), 1, "{r}");
+}
+
+#[test]
+fn deferrals_are_bounded_then_escalated_to_the_owner() {
+    assert_deferrals_bounded("run-deferral-bound", &["run", "--json"]);
+}
+
+#[test]
+fn shadow_runs_bound_deferrals_too() {
+    assert_deferrals_bounded("run-deferral-bound-shadow", &["run", "--json", "--shadow"]);
+}
+
 #[test]
 fn refusal_is_retried_with_backoff_and_then_lands() {
     // Refuse twice (exit 75), then pass: the same run retries and lands.
