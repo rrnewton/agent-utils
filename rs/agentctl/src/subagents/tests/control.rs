@@ -143,6 +143,34 @@ fn adopt_records_only_the_adopting_agent_as_manager() {
 }
 
 #[test]
+fn coordinator_set_refuses_a_launch_failed_target() {
+    let fixture = Fixture::new();
+    let manager = fixture.manager();
+    register(&fixture, "coordinator", 88);
+    let mut record = manager.load("coordinator").unwrap();
+    record.lifecycle = "launch_failed".to_owned();
+    manager.save(&record).unwrap();
+    let error = manager.coordinator_set("coordinator").unwrap_err();
+    assert!(error.to_string().contains("not alive"), "{error}");
+    assert_eq!(manager.coordinator_show().unwrap()["designated"], false);
+}
+
+#[test]
+fn handover_designates_the_new_coordinator_before_stopping_the_old() {
+    let fixture = Fixture::new();
+    let manager = fixture.manager();
+    register(&fixture, "coord-old", 88);
+    register(&fixture, "coord-new", 99);
+    manager.coordinator_set("coord-old").unwrap();
+    let report = manager.handover("coord-old", "coord-new").unwrap();
+    assert_eq!(report["new"], "coord-new");
+    assert_eq!(
+        manager.designated_coordinator().unwrap().as_deref(),
+        Some("coord-new")
+    );
+}
+
+#[test]
 fn the_designation_names_one_generation_and_reports_what_became_of_it() {
     let fixture = Fixture::new();
     let manager = fixture.manager();

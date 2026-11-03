@@ -264,6 +264,9 @@ enum Commands {
         after_help = "Examples:\n  agentctl handback coordinator\n  agentctl handback coordinator --wait 120\n\nEvery process running Claude Code on the session gets SIGTERM, and SIGKILL after half of --wait;\nhandback then waits for the holder to record the end and release the headless lock (it refuses\nwhile a takeover is still stopping the wrapper), closes the takeover tab, clears the record's takeover mark, and starts\nthe wrapper: through `systemctl --user start` when the wrapper ran under its systemd unit at\ntakeover, otherwise (or when that unit will not start) as a detached process. The wrapper resumes the session, so it sees the\ninteractive turns."
     )]
     Handback(HandbackArgs),
+    /// Atomically hand the coordinator designation from OLD to NEW: verify NEW is alive (reviving it when dead), designate NEW, then stop OLD (#747)
+    #[command(after_help = "Example: agentctl handover coord-old coord-new")]
+    Handover(HandoverArgs),
     /// Internal: the pane command of a takeover (holds the headless lock and runs the interactive Claude Code)
     #[command(hide = true)]
     TakeoverHold(TakeoverHold),
@@ -645,6 +648,16 @@ struct TakeoverArgs {
     /// Claude Code executable for the interactive session (default: the one the wrapper ran when it was named by absolute path, else claude on the tab's PATH)
     #[arg(long, value_name = "PATH")]
     claude_bin: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct HandoverArgs {
+    /// Current coordinator to stop after the handover
+    #[arg(value_name = "OLD")]
+    old: String,
+    /// New coordinator to designate (started, or a dead record to revive)
+    #[arg(value_name = "NEW")]
+    new: String,
 }
 
 #[derive(Args)]
@@ -3993,6 +4006,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 claude_bin: value.claude_bin.clone(),
             },
         )?,
+        Commands::Handover(value) => manager.handover(&value.old, &value.new)?,
         Commands::Handback(value) => {
             manager.handback_headless(&value.agent.name, Duration::from_secs(value.wait))?
         }

@@ -1107,6 +1107,21 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             .zip(previous.as_ref())
             .and_then(|(name, designation)| self.designated_generation_process(name, designation));
         let record = self.load(agent_name)?;
+        // Never designate a target that never started (#747): a half-failed handover
+        // would strand inter-team delivery on a dead record.
+        let dead = record.lifecycle == "launch_failed"
+            || record
+                .harness_anchor()
+                .or(record.custom_process_identity.as_ref())
+                .is_some_and(|identity| {
+                    self.client.process_liveness(identity) == ProcessLiveness::Dead
+                });
+        if dead {
+            return Err(fail(format!(
+                "coordinator target {agent_name:?} is not alive (lifecycle {}); start or revive it first",
+                record.lifecycle
+            )));
+        }
         let designation = Designation {
             schema: DESIGNATION_SCHEMA.to_owned(),
             name: record.name.clone(),
@@ -1130,6 +1145,38 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             Err(error) => json!({"registered": false, "error": error.to_string()}),
         };
         Ok(report)
+    }
+
+    /// Atomic coordinator handover (#747): verify the new coordinator is alive (reviving
+    /// its record first when it is dead), designate it, and only then stop the old one.
+    /// Any failure before designation leaves the old coordinator running and designated.
+    pub fn handover(&self, old_name: &str, new_name: &str) -> Result<Value> {
+        if old_name == new_name {
+            return Err(fail("handover needs two different agent names"));
+        }
+        let record = self.load(new_name)?;
+        let alive = record.lifecycle != "launch_failed"
+            && record
+                .harness_anchor()
+                .or(record.custom_process_identity.as_ref())
+                .is_none_or(|identity| {
+                    self.client.process_liveness(identity) != ProcessLiveness::Dead
+                });
+        let revived = if alive {
+            false
+        } else {
+            self.revive(new_name, false, None, std::time::Duration::from_secs(30))?;
+            true
+        };
+        let designation = self.coordinator_set(new_name)?;
+        let stopped = self.stop(old_name)?;
+        Ok(json!({
+            "old": old_name,
+            "new": new_name,
+            "revived_new": revived,
+            "designation": designation,
+            "stopped": stopped,
+        }))
     }
 
     /// Whether `agent_name`'s recorded harness process is positively gone (kernel evidence of a
