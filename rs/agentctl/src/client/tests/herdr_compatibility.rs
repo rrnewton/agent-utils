@@ -43,7 +43,10 @@ fn configure_codex(herdr: &FakeExecutable, pid: u32, executable: &Path, screen: 
         "agent_get_calls": 0,
         "mutate_on_final_agent_get": null,
         "fail_prelaunch_snapshot": false,
-        "starts": 0
+        "starts": 0,
+        "renames": [],
+        "screen_after_reads": null,
+        "reads": 0
     });
     fs::write(herdr.root.join("frame.json"), frame.to_string()).unwrap();
     fs::write(
@@ -64,6 +67,10 @@ elif args[:2] == ['pane', 'get']:
         raise SystemExit('prelaunch inspection unavailable')
     print(json.dumps({'result': {'pane': state['pane']}}))
 elif args[:2] == ['pane', 'read']:
+    state['reads'] += 1
+    later = state['screen_after_reads']
+    if later is not None and state['reads'] > later['after']:
+        state['screen'] = later['screen']
     print(state['screen'], end='')
     change = state['mutate_after_read']
     if change == 'process':
@@ -82,9 +89,19 @@ elif args[:2] == ['agent', 'start']:
     raise SystemExit(state['startup']['status'])
 elif args[:2] == ['agent', 'get']:
     state['agent_get_calls'] += 1
+    if state['named'] is None:
+        path.write_text(json.dumps(state))
+        print(json.dumps({'error': {'code': 'agent_not_found', 'message': 'agent target ' + args[2] + ' not found'}, 'id': 'cli:agent:get'}), file=sys.stderr)
+        raise SystemExit(1)
     if state['agent_get_calls'] == 2 and state['mutate_on_final_agent_get'] is not None:
         state['named'].update(state['mutate_on_final_agent_get'])
     print(json.dumps({'result': {'agent': state['named']}}))
+elif args[:2] == ['agent', 'rename']:
+    state['renames'].append(args[2:])
+    state['named'] = {'name': args[3], 'pane_id': args[2], 'tab_id': state['pane']['tab_id'], 'terminal_id': state['pane']['terminal_id']}
+    print(json.dumps({'result': {'agent': state['named']}}))
+elif args[:2] == ['agent', 'explain']:
+    print('agent: codex\nstate: unknown\nmanifest: bundled 2026.09.23.1\nrule: none\nfallback_reason: codex_state_ambiguous')
 else:
     raise SystemExit('unexpected test command')
 path.write_text(json.dumps(state))
@@ -322,6 +339,133 @@ fn herdr_093_start_accepts_only_the_exact_codex_timeout_with_independent_ready_p
 
     configure_start(&herdr, process.0.id(), &executable, IDLE_CODEX);
     start_once(&herdr, "claude", false);
+}
+
+/// The Codex v0.164.0 composer, captured from a pane Herdr 0.9.3 reported `unknown`.
+const CODEX_0164_IDLE: &str = include_str!("../../../testdata/codex/v0164-idle-composer.ansi");
+
+fn frame_of(herdr: &FakeExecutable) -> Value {
+    serde_json::from_slice(&fs::read(herdr.root.join("frame.json")).unwrap()).unwrap()
+}
+
+/// Herdr 0.9.3 drops the name of an agent whose startup wait timed out and never applies it,
+/// though Codex keeps running in the pane: agentctl proves the pane ready, then names it.
+#[test]
+fn herdr_093_timeout_that_drops_the_name_is_named_once_the_pane_is_proved_ready() {
+    let herdr = FakeExecutable::new("{}");
+    let executable = fs::canonicalize("/bin/sleep").unwrap();
+    let process = spawn_test_process(&executable);
+    let mut frame = configure_start(&herdr, process.0.id(), &executable, CODEX_0164_IDLE);
+    frame["named"] = Value::Null;
+    fs::write(herdr.root.join("frame.json"), frame.to_string()).unwrap();
+    start_once(&herdr, "codex", true);
+    let frame = frame_of(&herdr);
+    assert_eq!(frame["renames"], serde_json::json!([["pane", "worker"]]));
+    assert_eq!(frame["named"]["pane_id"], "pane");
+
+    // Nothing is named until the pane is proved ready.
+    for screen in [
+        "Codex\nInstalling plugins for preset\n",
+        "Codex\nWorking (7s)\n»\n  ? for shortcuts\n",
+        "Codex\n» operator draft\n  ? for shortcuts\n",
+    ] {
+        let mut frame = configure_start(&herdr, process.0.id(), &executable, screen);
+        frame["named"] = Value::Null;
+        fs::write(herdr.root.join("frame.json"), frame.to_string()).unwrap();
+        start_once(&herdr, "codex", false);
+        assert_eq!(
+            frame_of(&herdr)["renames"],
+            serde_json::json!([]),
+            "{screen:?}"
+        );
+    }
+    // Nor when the pane changed terminal since the launch.
+    let mut frame = configure_start(&herdr, process.0.id(), &executable, CODEX_0164_IDLE);
+    frame["named"] = Value::Null;
+    frame["launched_pane"]["terminal_id"] = Value::from("another");
+    fs::write(herdr.root.join("frame.json"), frame.to_string()).unwrap();
+    start_once(&herdr, "codex", false);
+    assert_eq!(frame_of(&herdr)["renames"], serde_json::json!([]));
+}
+
+/// Codex can still be drawing its composer when Herdr gives up; agentctl keeps looking for up
+/// to the startup timeout again (at most 15 s).
+#[test]
+fn herdr_093_timeout_waits_a_grace_period_for_the_composer() {
+    let herdr = FakeExecutable::new("{}");
+    let executable = fs::canonicalize("/bin/sleep").unwrap();
+    let process = spawn_test_process(&executable);
+    let mut frame = configure_start(
+        &herdr,
+        process.0.id(),
+        &executable,
+        "Codex\nInstalling plugins for preset\n",
+    );
+    frame["named"] = Value::Null;
+    frame["screen_after_reads"] = serde_json::json!({"after": 1, "screen": CODEX_0164_IDLE});
+    fs::write(herdr.root.join("frame.json"), frame.to_string()).unwrap();
+    let result = herdr
+        .client()
+        .start_agent("worker", "codex", "pane", &[], Duration::from_secs(5));
+    assert!(result.is_ok(), "{result:?}");
+    let frame = frame_of(&herdr);
+    assert_eq!(frame["starts"], 1);
+    assert_eq!(frame["renames"], serde_json::json!([["pane", "worker"]]));
+}
+
+/// A start that does time out says what Herdr and the screen showed.
+#[test]
+fn startup_timeout_reports_the_observed_agent_status_name_and_screen() {
+    let herdr = FakeExecutable::new("{}");
+    let executable = fs::canonicalize("/bin/sleep").unwrap();
+    let process = spawn_test_process(&executable);
+    let screen = "Codex\n\nerror: the argument '--no-alt-screen' cannot be used multiple times\n\n";
+    let mut frame = configure_start(&herdr, process.0.id(), &executable, screen);
+    frame["named"] = Value::Null;
+    fs::write(herdr.root.join("frame.json"), frame.to_string()).unwrap();
+    let error = herdr
+        .client()
+        .start_agent("worker", "codex", "pane", &[], Duration::from_millis(25))
+        .unwrap_err()
+        .to_string();
+    for part in [
+        "timed out waiting for agent startup",
+        "observed: Herdr reports agent codex with status unknown",
+        "(rule none, fallback codex_state_ambiguous)",
+        "the name \"worker\" was not applied",
+        "screen: Codex | error: the argument '--no-alt-screen' cannot be used multiple times",
+    ] {
+        assert!(error.contains(part), "{part:?} missing from {error}");
+    }
+    // Any harness kind gets the observation, not only Codex.
+    configure_start(&herdr, process.0.id(), &executable, screen);
+    let error = herdr
+        .client()
+        .start_agent("worker", "claude", "pane", &[], Duration::from_millis(25))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("observed: Herdr reports agent codex"),
+        "{error}"
+    );
+    assert!(error.contains("named \"worker\""), "{error}");
+}
+
+#[test]
+fn startup_screen_evidence_keeps_the_last_rows_and_cuts_long_ones() {
+    let screen = (1..=9)
+        .map(|row| format!("row {row}\n\n"))
+        .collect::<String>();
+    assert_eq!(
+        startup_screen_evidence(&screen),
+        "row 4 | row 5 | row 6 | row 7 | row 8 | row 9"
+    );
+    let long = format!("{}é", "x".repeat(200));
+    assert_eq!(
+        startup_screen_evidence(&long),
+        format!("{}…", "x".repeat(160))
+    );
+    assert_eq!(startup_screen_evidence("\n  \n"), "");
 }
 
 /// A resumed Codex with an active goal starts working at once and is never idle at Herdr's

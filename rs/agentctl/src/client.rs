@@ -911,6 +911,34 @@ fn missing_pane(error: &AdapterError) -> bool {
 /// How often a refused launch looks at its pane again.
 const SHELL_READINESS_POLL: Duration = Duration::from_millis(250);
 
+/// The longest a Codex launch is watched for readiness after Herdr's own startup wait timed
+/// out (never longer than the startup timeout itself).
+const CODEX_STARTUP_GRACE: Duration = Duration::from_secs(15);
+
+/// How often that watch looks at the pane again.
+const CODEX_STARTUP_POLL: Duration = Duration::from_millis(500);
+
+/// How many of the last non-blank screen rows a startup timeout quotes.
+const STARTUP_SCREEN_ROWS: usize = 6;
+
+/// The startup screen rows a timeout quotes: the last [`STARTUP_SCREEN_ROWS`] non-blank rows,
+/// trimmed, each cut to 160 characters, joined with ` | `.
+fn startup_screen_evidence(screen: &str) -> String {
+    let rows = screen
+        .lines()
+        .map(str::trim)
+        .filter(|row| !row.is_empty())
+        .collect::<Vec<_>>();
+    rows[rows.len().saturating_sub(STARTUP_SCREEN_ROWS)..]
+        .iter()
+        .map(|row| match row.char_indices().nth(160) {
+            Some((end, _)) => format!("{}…", &row[..end]),
+            None => (*row).to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
 /// One look at a pane that Herdr refused as busy.
 enum ShellObservation {
     /// No agent, and the pane's shell alone in the foreground.
@@ -1274,11 +1302,22 @@ impl HerdrClient {
             .then(|| arguments[1].as_str());
             if codex_startup_timeout(&result)
                 && initial.as_ref().is_some_and(|initial| {
-                    self.codex_ready_after_startup_timeout(name, initial, resumed)
-                        .unwrap_or(false)
+                    self.codex_ready_after_startup_timeout(
+                        name,
+                        initial,
+                        resumed,
+                        timeout.min(CODEX_STARTUP_GRACE),
+                    )
                 })
             {
                 return Ok(());
+            }
+            if herdr_error_code(&result.stderr).as_deref() == Some("timeout") {
+                return Err(AdapterError::unavailable(format!(
+                    "agent start {name:?}: {}; {}",
+                    stderr_detail(&result),
+                    self.startup_observation(name, pane_id)
+                )));
             }
             return Err(AdapterError::unavailable(format!(
                 "agent start {name:?}: {}",
@@ -1374,7 +1413,9 @@ impl HerdrClient {
         ))
     }
 
-    /// Prove a Codex launch ready after Herdr's exact startup timeout.
+    /// Prove a Codex launch ready after Herdr's exact startup timeout, looking again until
+    /// `grace` has passed: Codex can still be drawing its composer (a startup hook, a slow
+    /// gateway) when Herdr gives up.
     ///
     /// Herdr waits for an idle prompt. A fresh harness can instead sit at an unknown status with
     /// an idle composer. A harness resuming `resumed` with an active goal starts working at once
@@ -1386,15 +1427,45 @@ impl HerdrClient {
         name: &str,
         initial: &AgentPaneInfo,
         resumed: Option<&str>,
-    ) -> Result<bool> {
+        grace: Duration,
+    ) -> bool {
         if initial.agent.is_some()
             || initial
                 .terminal_id
                 .as_deref()
                 .is_none_or(|value| value.is_empty() || value.contains('\0'))
         {
-            return Ok(false);
+            return false;
         }
+        let deadline = Instant::now() + grace;
+        loop {
+            if self
+                .codex_ready_once_after_startup_timeout(name, initial, resumed)
+                .unwrap_or(false)
+            {
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            thread::sleep(CODEX_STARTUP_POLL.min(remaining));
+        }
+    }
+
+    /// One observation for [`Self::codex_ready_after_startup_timeout`].
+    ///
+    /// Herdr 0.9.3 drops the name of an agent whose startup wait timed out, and never applies
+    /// it later, though the harness keeps running in the pane and Herdr still reports it there.
+    /// When `name` resolves to no agent at all, the pane is proved ready exactly as for a named
+    /// agent, then its agent is given `name` and the name must resolve to the same pane and
+    /// terminal before the final re-confirmation.
+    fn codex_ready_once_after_startup_timeout(
+        &self,
+        name: &str,
+        initial: &AgentPaneInfo,
+        resumed: Option<&str>,
+    ) -> Result<bool> {
         let info = self.pane_info(&initial.pane_id)?;
         if info.pane_id != initial.pane_id
             || info.workspace_id != initial.workspace_id
@@ -1404,13 +1475,21 @@ impl HerdrClient {
         {
             return Ok(false);
         }
-        let named = self.agent_identity(name)?;
-        if named.pane_id != info.pane_id
-            || named.tab_id != info.tab_id
-            || named.terminal_id != info.terminal_id
-        {
-            return Ok(false);
-        }
+        let same_presentation = |named: &AgentIdentity| {
+            named.pane_id == info.pane_id
+                && named.tab_id == info.tab_id
+                && named.terminal_id == info.terminal_id
+        };
+        let named = match self.agent_identity(name) {
+            Ok(named) if same_presentation(&named) => Some(named),
+            Ok(_) => return Ok(false),
+            Err(error)
+                if herdr_error_code(&error.to_string()).as_deref() == Some("agent_not_found") =>
+            {
+                None
+            }
+            Err(error) => return Err(error),
+        };
         let Some(identity) = self.harness_identity(&info.pane_id, "codex")? else {
             return Ok(false);
         };
@@ -1425,9 +1504,58 @@ impl HerdrClient {
         if !working && !self.codex_idle_ready_with_cancellation(&info, &|| false)? {
             return Ok(false);
         }
+        let named = match named {
+            Some(named) => named,
+            None => {
+                self.rename_agent(&info.pane_id, name)?;
+                let named = self.agent_identity(name)?;
+                if !same_presentation(&named) {
+                    return Ok(false);
+                }
+                named
+            }
+        };
         Ok(self.agent_identity(name)? == named
             && self.pane_info(&info.pane_id)? == info
             && self.verify_harness_identity(&info.pane_id, &identity)?)
+    }
+
+    /// What a timed-out `agent start` left in its pane, for the error: Herdr's agent kind and
+    /// status, its screen-rule verdict, whether `name` was applied, and the last screen rows.
+    /// Each part is best effort; one Herdr cannot answer is reported as unavailable.
+    fn startup_observation(&self, name: &str, pane_id: &str) -> String {
+        let pane = match self.pane_info(pane_id) {
+            Ok(info) => format!(
+                "Herdr reports agent {} with status {}",
+                info.agent.as_deref().unwrap_or("none"),
+                info.status
+            ),
+            Err(error) => format!("pane {pane_id} unavailable ({error})"),
+        };
+        let verdict = self
+            .invoke_with_timeout(&strings(&["agent", "explain", pane_id]), CONTROL_TIMEOUT)
+            .ok()
+            .filter(|completed| completed.status == 0)
+            .map(|completed| explain_rule_summary(&completed.stdout))
+            .unwrap_or_else(|| "no screen-rule verdict".to_owned());
+        let naming = match self.agent_identity(name) {
+            Ok(named) if named.pane_id == pane_id => format!("named {name:?}"),
+            Ok(named) => format!("the name {name:?} belongs to pane {}", named.pane_id),
+            Err(error)
+                if herdr_error_code(&error.to_string()).as_deref() == Some("agent_not_found") =>
+            {
+                format!("the name {name:?} was not applied")
+            }
+            Err(_) => format!("the name {name:?} could not be checked"),
+        };
+        let screen = match self.read(pane_id, "visible", None) {
+            Ok(screen) => match startup_screen_evidence(&screen) {
+                rows if rows.is_empty() => "blank".to_owned(),
+                rows => rows,
+            },
+            Err(_) => "unreadable".to_owned(),
+        };
+        format!("observed: {pane} ({verdict}); {naming}; screen: {screen}")
     }
 
     fn pane_process_state(
@@ -3098,6 +3226,25 @@ fn parse_explain(stdout: &str) -> Explained {
         state,
         title_working,
     }
+}
+
+/// `agent explain`'s matched rule and any fallback reason, as `rule R, fallback F`.
+fn explain_rule_summary(stdout: &str) -> String {
+    let field = |key: &str| {
+        stdout.lines().find_map(|line| {
+            line.split_once(':')
+                .filter(|(name, _)| name.trim() == key)
+                .map(|(_, value)| value.trim().to_owned())
+        })
+    };
+    let mut summary = format!(
+        "rule {}",
+        field("rule").unwrap_or_else(|| "none".to_owned())
+    );
+    if let Some(reason) = field("fallback_reason") {
+        summary.push_str(&format!(", fallback {reason}"));
+    }
+    summary
 }
 
 fn parse_pane_info(result: &Map<String, Value>, pane_id: &str) -> Result<AgentPaneInfo> {

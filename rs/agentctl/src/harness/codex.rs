@@ -822,4 +822,13 @@ mod tests {
         assert_eq!(transcript_path(&hints), Some(main));
         std::fs::remove_dir_all(home).ok();
     }
+
+    #[test]
+    fn the_v0164_composer_reads_idle() {
+        // Codex v0.164.0 draws its composer inside a shaded box, prompt glyph `›` in bold and
+        // the placeholder dimmed; Herdr 0.9.3's bundled manifest has no rule for it and reports
+        // the agent `unknown`, so readiness rests on this screen check.
+        let screen = include_str!("../../testdata/codex/v0164-idle-composer.ansi");
+        assert!(idle_composer(screen), "{screen:?}");
+    }
 }

@@ -844,10 +844,15 @@ def _suggestion13_timeout_client(
 ) -> tuple[HerdrClient, AgentPaneInfo, list[list[str]], list[str]]:
     client, info, _identity, screens = _suggestion13_codex_readiness(monkeypatch)
     initial = replace(info, agent=None, session_agent=None, session_value=None)
+    # Only `agent start` is recorded: these tests check it is never repeated. A timeout's
+    # observation (`agent explain`, `pane read`) gets the same failed reply, so it reports
+    # those parts unavailable. No grace period: each proof is observed once.
     calls: list[list[str]] = []
+    monkeypatch.setattr(client_module, "CODEX_STARTUP_GRACE_SECONDS", 0.0)
 
     def run(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
-        calls.append(list(command))
+        if list(command[1:3]) == ["agent", "start"]:
+            calls.append(list(command))
         return subprocess.CompletedProcess(command, returncode, stdout, stderr)
 
     monkeypatch.setattr(client, "_run", run)
@@ -901,6 +906,110 @@ def test_exact_codex_start_timeout_refuses_working_without_resume_proof(
     with pytest.raises(HerdrUnavailable, match="timed out waiting for agent startup"):
         client.start_agent("worker", "codex", info.pane_id, arguments, timeout=1)
     assert len(calls) == 1
+
+
+def _unnamed_after_timeout(
+    client: HerdrClient, info: AgentPaneInfo, monkeypatch: pytest.MonkeyPatch,
+) -> list[tuple[str, str]]:
+    """Herdr 0.9.3 after a startup timeout: the agent runs in the pane but has no name until
+    ``rename_agent`` applies one."""
+    renames: list[tuple[str, str]] = []
+
+    def identity(name: str) -> AgentIdentity:
+        if not renames:
+            raise HerdrUnavailable(
+                f'agent get {name!r}: {{"error":{{"code":"agent_not_found",'
+                f'"message":"agent target {name} not found"}},"id":"cli:agent:get"}}'
+            )
+        return AgentIdentity(name, info.pane_id, info.tab_id, info.terminal_id)
+
+    monkeypatch.setattr(client, "agent_identity", identity)
+    monkeypatch.setattr(client, "rename_agent", lambda pane, name: renames.append((pane, name)))
+    return renames
+
+
+def test_exact_codex_timeout_names_the_agent_herdr_left_unnamed_once_proved_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, info, calls, screens = _suggestion13_timeout_client(monkeypatch)
+    renames = _unnamed_after_timeout(client, info, monkeypatch)
+    client.start_agent("worker", "codex", info.pane_id, ("--no-alt-screen",), timeout=1)
+    assert len(calls) == 1 and screens == ["screen"] and renames == [("p1", "worker")]
+
+
+@pytest.mark.parametrize("screen", [
+    "Installing plugins for preset\n", "› human draft\n  GPT · /work\n",
+    "›\n  esc to interrupt\n  GPT · /work\n",
+])
+def test_exact_codex_timeout_names_nothing_before_the_pane_is_proved_ready(
+    screen: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, info, calls, _screens = _suggestion13_timeout_client(monkeypatch)
+    renames = _unnamed_after_timeout(client, info, monkeypatch)
+    monkeypatch.setattr(client, "read_screen", lambda _pane: screen)
+    with pytest.raises(HerdrUnavailable, match="the name \"worker\" was not applied"):
+        client.start_agent("worker", "codex", info.pane_id, timeout=1)
+    assert len(calls) == 1 and renames == []
+
+
+def test_exact_codex_timeout_waits_a_grace_period_for_the_composer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, info, calls, _screens = _suggestion13_timeout_client(monkeypatch)
+    monkeypatch.setattr(client_module, "CODEX_STARTUP_GRACE_SECONDS", 15.0)
+    renames = _unnamed_after_timeout(client, info, monkeypatch)
+    reads: list[str] = []
+
+    def screen(_pane: str) -> str:
+        reads.append("screen")
+        if len(reads) == 1:
+            return "Installing plugins for preset\n"
+        return "› \x1b[2mAsk Codex to do anything\x1b[0m\n  GPT default · /work\n"
+
+    monkeypatch.setattr(client, "read_screen", screen)
+    client.start_agent("worker", "codex", info.pane_id, timeout=5)
+    assert len(calls) == 1 and len(reads) == 2 and renames == [("p1", "worker")]
+
+
+def test_start_timeout_reports_the_observed_agent_status_name_and_screen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, info, _calls, _screens = _suggestion13_timeout_client(monkeypatch)
+    _unnamed_after_timeout(client, info, monkeypatch)
+    monkeypatch.setattr(client, "read_screen", lambda _pane: "Installing plugins\n")
+    screen = "Codex\n\nerror: the argument '--no-alt-screen' cannot be used multiple times\n\n"
+
+    def run(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if list(command[1:3]) == ["agent", "explain"]:
+            return subprocess.CompletedProcess(command, 0, (
+                "agent: codex\nstate: unknown\nmanifest: bundled 2026.09.23.1\nrule: none\n"
+                "fallback_reason: codex_state_ambiguous\n"), "")
+        if list(command[1:3]) == ["pane", "read"]:
+            return subprocess.CompletedProcess(command, 0, screen, "")
+        return subprocess.CompletedProcess(command, 1, "", _SUGGESTION13_START_TIMEOUT)
+
+    monkeypatch.setattr(client, "_run", run)
+    monkeypatch.setattr(client, "pane_info", lambda _pane: info)
+    with pytest.raises(HerdrUnavailable) as raised:
+        client.start_agent("worker", "codex", info.pane_id, timeout=1)
+    message = str(raised.value)
+    for part in (
+        "timed out waiting for agent startup",
+        "observed: Herdr reports agent codex with status unknown",
+        "(rule none, fallback codex_state_ambiguous)",
+        'the name "worker" was not applied',
+        "screen: Codex | error: the argument '--no-alt-screen' cannot be used multiple times",
+    ):
+        assert part in message, (part, message)
+
+
+def test_startup_screen_evidence_keeps_the_last_rows_and_cuts_long_ones() -> None:
+    screen = "".join(f"row {row}\n\n" for row in range(1, 10))
+    assert client_module._startup_screen_evidence(screen) == (
+        "row 4 | row 5 | row 6 | row 7 | row 8 | row 9"
+    )
+    assert client_module._startup_screen_evidence("x" * 200 + "é") == "x" * 160 + "…"
+    assert client_module._startup_screen_evidence("\n  \n") == ""
 
 
 @pytest.mark.parametrize("returncode,stdout,stderr", [

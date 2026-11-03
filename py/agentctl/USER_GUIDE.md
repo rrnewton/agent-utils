@@ -592,7 +592,16 @@ terminal, and native identity before and after reading the screen. Busy input,
 drafts, menus, and trust prompts still block delivery. The reported status
 remains `unknown`. A startup timeout is accepted only for Herdr's exact startup
 timeout response and this positive readiness proof; other launch errors remain
-failures.
+failures. Codex can still be drawing its composer when Herdr gives up (a startup
+hook, a slow gateway), so after that timeout agentctl keeps looking for up to the
+startup timeout again, at most 15 seconds more. Herdr 0.9.3 also drops the name
+of an agent whose startup wait timed out, though Codex keeps running in the
+pane; once the pane is proved ready, agentctl names its agent with `herdr agent
+rename` and checks that the name resolves to the same pane and terminal. Any
+`agent start` that still times out reports what it observed: Herdr's agent kind
+and status, its screen-rule verdict, whether the name was applied, and the last
+six non-blank screen rows (an argument error or a stuck startup screen shows up
+there).
 
 Muse is launched through Herdr's generic `pane run` interface. `agentctl`
 resolves the installed executable, launches a shell-quoted literal argv,

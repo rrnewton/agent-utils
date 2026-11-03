@@ -1192,7 +1192,7 @@ struct Start {
     /// Record no created_by or managed_by edge naming the calling agent (default: record them when the caller is a registered agent of this registry; a profile's "record_edges": false does the same)
     #[arg(long)]
     no_edges: bool,
-    /// Seconds to wait for harness startup, greater than zero and at most 300; also bounds the wait for the new tab's shell when Herdr refuses the launch as agent_pane_busy
+    /// Seconds to wait for harness startup, greater than zero and at most 300; also bounds the wait for the new tab's shell when Herdr refuses the launch as agent_pane_busy. When Herdr's own wait for a Codex harness times out, agentctl keeps checking the pane for an idle composer for up to the same time again (at most 15 seconds more); a start that still fails reports Herdr's agent kind and status, whether the name was applied, and the last screen rows
     #[arg(long, default_value = "30", value_parser = startup_seconds)]
     startup_timeout: f64,
     /// With --mode headless: register the agent without starting its wrapper, for a supervisor

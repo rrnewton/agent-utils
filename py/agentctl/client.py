@@ -108,6 +108,41 @@ def _is_codex_startup_timeout(completed: subprocess.CompletedProcess[str]) -> bo
     })
 
 
+# The longest a Codex launch is watched for readiness after Herdr's own startup wait timed
+# out (never longer than the startup timeout itself), and how often it looks again.
+CODEX_STARTUP_GRACE_SECONDS = 15.0
+CODEX_STARTUP_POLL_SECONDS = 0.5
+# How many of the last non-blank screen rows a startup timeout quotes.
+STARTUP_SCREEN_ROWS = 6
+
+
+def _quoted(value: str) -> str:
+    """``value`` in double quotes, as the Rust edition's ``{:?}`` writes a plain name."""
+    return json.dumps(value)
+
+
+def _startup_screen_evidence(screen: str) -> str:
+    """The startup screen rows a timeout quotes: the last ``STARTUP_SCREEN_ROWS`` non-blank
+    rows, trimmed, each cut to 160 characters, joined with `` | ``."""
+    rows = [row.strip() for row in screen.splitlines() if row.strip()]
+    return " | ".join(
+        row if len(row) <= 160 else row[:160] + "…" for row in rows[-STARTUP_SCREEN_ROWS:]
+    )
+
+
+def _explain_rule_summary(stdout: str) -> str:
+    """``agent explain``'s matched rule and any fallback reason, as ``rule R, fallback F``."""
+    fields: dict[str, str] = {}
+    for line in stdout.splitlines():
+        key, separator, value = line.partition(":")
+        if separator and key.strip() not in fields:
+            fields[key.strip()] = value.strip()
+    summary = f"rule {fields.get('rule', 'none')}"
+    if "fallback_reason" in fields:
+        summary += f", fallback {fields['fallback_reason']}"
+    return summary
+
+
 def muse_startup_metadata(screen: str) -> tuple[str | None, str | None]:
     """Return a bounded Muse downgrade warning and its explicit effective effort.
 
@@ -1096,19 +1131,24 @@ class HerdrClient:
             if kind == "codex" and initial is not None and _is_codex_startup_timeout(completed):
                 resumed = (arguments[1] if len(arguments) >= 2 and arguments[0] == "resume"
                            and not arguments[1].startswith("-") else None)
-                try:
-                    if self._codex_ready_after_startup_timeout(name, initial, resumed):
-                        return
-                except HerdrUnavailable:
-                    # A failed or unavailable proof does not erase the launch failure.
-                    pass
+                if self._codex_ready_after_startup_timeout(
+                    name, initial, resumed, grace=min(timeout, CODEX_STARTUP_GRACE_SECONDS),
+                ):
+                    return
             detail = (completed.stderr or completed.stdout).strip() or f"exit {completed.returncode}"
+            if herdr_error_code(completed.stderr or "") == "timeout":
+                raise HerdrUnavailable(
+                    f"agent start {name!r}: {detail}; {self._startup_observation(name, pane_id)}"
+                )
             raise HerdrUnavailable(f"agent start {name!r}: {detail}")
 
     def _codex_ready_after_startup_timeout(
         self, name: str, initial: AgentPaneInfo, resumed: str | None = None,
+        *, grace: float = 0.0,
     ) -> bool:
-        """Prove a Codex launch ready after Herdr's exact startup timeout.
+        """Prove a Codex launch ready after Herdr's exact startup timeout, looking again until
+        ``grace`` seconds have passed: Codex can still be drawing its composer (a startup hook,
+        a slow gateway) when Herdr gives up.
 
         Herdr waits for an idle prompt. A fresh harness can instead sit at an unknown status
         with an idle composer. A harness resuming ``resumed`` with an active goal starts
@@ -1118,13 +1158,43 @@ class HerdrClient:
         """
         if initial.agent is not None or not initial.terminal_id or "\0" in initial.terminal_id:
             return False
+        deadline = time.monotonic() + grace
+        while True:
+            try:
+                if self._codex_ready_once_after_startup_timeout(name, initial, resumed):
+                    return True
+            except HerdrUnavailable:
+                # A failed or unavailable proof does not erase the launch failure.
+                pass
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            self._sleep(min(CODEX_STARTUP_POLL_SECONDS, remaining))
+
+    def _codex_ready_once_after_startup_timeout(
+        self, name: str, initial: AgentPaneInfo, resumed: str | None,
+    ) -> bool:
+        """One observation for :meth:`_codex_ready_after_startup_timeout`.
+
+        Herdr 0.9.3 drops the name of an agent whose startup wait timed out, and never applies
+        it later, though the harness keeps running in the pane and Herdr still reports it
+        there. When ``name`` resolves to no agent at all, the pane is proved ready exactly as
+        for a named agent, then its agent is given ``name`` and the name must resolve to the
+        same pane and terminal before the final re-confirmation.
+        """
         info = self.pane_info(initial.pane_id)
         if ((info.pane_id, info.workspace_id, info.cwd, info.tab_id, info.terminal_id)
                 != (initial.pane_id, initial.workspace_id, initial.cwd, initial.tab_id, initial.terminal_id)):
             return False
-        named = self.agent_identity(name)
-        if ((named.pane_id, named.tab_id, named.terminal_id)
-                != (info.pane_id, info.tab_id, info.terminal_id)):
+        presentation = (info.pane_id, info.tab_id, info.terminal_id)
+        named: AgentIdentity | None
+        try:
+            named = self.agent_identity(name)
+        except HerdrUnavailable as exc:
+            if herdr_error_code(str(exc)) != "agent_not_found":
+                raise
+            named = None
+        if named is not None and (named.pane_id, named.tab_id, named.terminal_id) != presentation:
             return False
         identity = self.harness_identity(info.pane_id, "codex")
         if identity is None:
@@ -1135,8 +1205,42 @@ class HerdrClient:
                    and (info.session_agent is None) == (info.session_value is None))
         if not working and not self.codex_idle_ready(info):
             return False
+        if named is None:
+            self.rename_agent(info.pane_id, name)
+            named = self.agent_identity(name)
+            if (named.pane_id, named.tab_id, named.terminal_id) != presentation:
+                return False
         return (self.agent_identity(name) == named and self.pane_info(info.pane_id) == info
                 and self.verify_harness_identity(info.pane_id, identity))
+
+    def _startup_observation(self, name: str, pane_id: str) -> str:
+        """What a timed-out ``agent start`` left in its pane, for the error: Herdr's agent kind
+        and status, its screen-rule verdict, whether ``name`` was applied, and the last screen
+        rows. Each part is best effort; one Herdr cannot answer is reported as unavailable."""
+        try:
+            info = self.pane_info(pane_id)
+            pane = f"Herdr reports agent {info.agent or 'none'} with status {info.status}"
+        except HerdrUnavailable as exc:
+            pane = f"pane {pane_id} unavailable ({exc})"
+        try:
+            completed = self._invoke(["agent", "explain", pane_id])
+            verdict = (_explain_rule_summary(completed.stdout) if completed.returncode == 0
+                       else "no screen-rule verdict")
+        except HerdrUnavailable:
+            verdict = "no screen-rule verdict"
+        try:
+            named = self.agent_identity(name)
+            naming = (f"named {_quoted(name)}" if named.pane_id == pane_id
+                      else f"the name {_quoted(name)} belongs to pane {named.pane_id}")
+        except HerdrUnavailable as exc:
+            naming = (f"the name {_quoted(name)} was not applied"
+                      if herdr_error_code(str(exc)) == "agent_not_found"
+                      else f"the name {_quoted(name)} could not be checked")
+        try:
+            screen = _startup_screen_evidence(self.read(pane_id, source="visible")) or "blank"
+        except HerdrUnavailable:
+            screen = "unreadable"
+        return f"observed: {pane} ({verdict}); {naming}; screen: {screen}"
 
     def _harness_executable(self, kind: str) -> str:
         if not kind or any(
