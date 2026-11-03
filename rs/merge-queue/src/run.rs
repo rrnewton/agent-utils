@@ -62,6 +62,16 @@ pub struct RunOptions {
     pub quiet: bool,
     /// First drain the peer queues whose changes this queue's changes require.
     pub with_peers: bool,
+    /// Override `validator.offload` (`off`, `compare` or `decide`).
+    pub offload: Option<String>,
+}
+
+/// Donor validators for this run (offload `compare` or `decide`).
+struct Donors {
+    store: crate::donor::Store,
+    mode: crate::state::Offload,
+    /// Tool identity computed on this host when the run started.
+    tool: crate::donor::ToolIdentity,
 }
 
 /// What a peer queue's run did, when `--with-peers` drained it first.
@@ -542,6 +552,8 @@ pub struct Runner<'a> {
     handles: Mutex<BTreeMap<String, (String, PathBuf)>>,
     /// Budgeted hosting client, when landed pull requests are to be closed.
     hosting: Option<crate::github::Hosting>,
+    /// Donor validators, when `validator.offload` is not off.
+    donors: Option<Donors>,
 }
 
 impl<'a> Runner<'a> {
@@ -549,6 +561,31 @@ impl<'a> Runner<'a> {
     pub fn new(state: &'a State, options: RunOptions) -> Result<Self, String> {
         let config = state.config()?;
         let validator = from_config(&config.validator)?;
+        let offload = crate::state::Offload::parse(
+            options
+                .offload
+                .as_deref()
+                .unwrap_or(config.validator.offload.as_str()),
+        )?;
+        let donors = if offload == crate::state::Offload::Off || options.dry_run {
+            None
+        } else {
+            let mut store = crate::donor::Store::new(&state.root);
+            store.lease_secs = config.donors.lease();
+            match crate::donor::tool_identity(&config.validator, &config.repo) {
+                Ok(tool) => Some(Donors {
+                    store,
+                    mode: offload,
+                    tool,
+                }),
+                // Compare mode never lets the donor side affect local validation.
+                Err(error) if offload == crate::state::Offload::Compare => {
+                    eprintln!("merge-queue: donors off for this run: {error}");
+                    None
+                }
+                Err(error) => return Err(format!("offload decide: {error}")),
+            }
+        };
         let simulate = options.shadow || options.dry_run;
         if !simulate && !matches!(config.land.driver.as_str(), "push" | "command") {
             return Err(format!(
@@ -617,6 +654,7 @@ impl<'a> Runner<'a> {
             } else {
                 None
             },
+            donors,
             options,
         })
     }
@@ -1243,14 +1281,47 @@ impl<'a> Runner<'a> {
                 ]
             })
             .unwrap_or_default();
-        let slot = self.slots.take();
         let start_ms = self.started.elapsed().as_millis() as u64;
-        let result = self.slots.checkout(slot, &job.commit).and_then(|checkout| {
-            self.validator
-                .run_with(&checkout, &job.selection, &dir, cancel, &extra)
-        });
-        self.slots.give(slot);
-        let ran = result?;
+        let ran = match &self.donors {
+            Some(donors) if donors.mode == crate::state::Offload::Decide => {
+                self.donor_validate(donors, id, &job, &dir, cancel)?
+            }
+            _ => {
+                // Compare mode: donors validate the same commit too, but only the local
+                // verdict decides; a donor that cannot publish never affects it.
+                let compared = self.donors.as_ref().and_then(|donors| {
+                    self.publish(donors, &job)
+                        .map_err(|error| {
+                            self.event(
+                                "donor",
+                                &format!("v{id}: not published for comparison: {error}"),
+                            )
+                        })
+                        .ok()
+                        .map(|published| (donors, published))
+                });
+                let slot = self.slots.take();
+                let result = self.slots.checkout(slot, &job.commit).and_then(|checkout| {
+                    self.validator
+                        .run_with(&checkout, &job.selection, &dir, cancel, &extra)
+                });
+                self.slots.give(slot);
+                if let Some((donors, published)) = compared {
+                    let recorded = match &result {
+                        Ok(ran) if !ran.cancelled && ran.interrupted.is_none() => {
+                            donors.store.record_local(&published, local_verdict(ran))
+                        }
+                        _ => donors
+                            .store
+                            .cancel(&published, "the local validation did not finish"),
+                    };
+                    if let Err(error) = recorded {
+                        self.event("donor", &format!("v{id}: comparison not recorded: {error}"));
+                    }
+                }
+                result?
+            }
+        };
         if let Some(handle) = &ran.handle {
             lock(&self.handles).insert(job.commit.clone(), (handle.clone(), dir.clone()));
         }
@@ -1317,6 +1388,105 @@ impl<'a> Runner<'a> {
             return Err(format!("v{id}: {why}"));
         }
         Ok((id, ran))
+    }
+
+    /// Publish `job` for donors; returns the donor job id.
+    fn publish(&self, donors: &Donors, job: &Job) -> Result<String, String> {
+        let tree = self.git.tree_of(&job.commit)?;
+        let base = {
+            let report = lock(&self.report);
+            if report.base_start.is_empty() {
+                lock(&self.base).clone()
+            } else {
+                report.base_start.clone()
+            }
+        };
+        let published = donors.store.publish(
+            &job.commit,
+            &tree,
+            &base,
+            &job.selection,
+            &self.config.validator,
+            &donors.tool,
+        )?;
+        Ok(published.id)
+    }
+
+    /// Validate `job` on donors only (offload `decide`): publish, wait for an accepted
+    /// receipt, and read it as this validation's result. A discarded candidate or a stop
+    /// cancels the donor job.
+    fn donor_validate(
+        &self,
+        donors: &Donors,
+        id: usize,
+        job: &Job,
+        dir: &std::path::Path,
+        cancel: &AtomicBool,
+    ) -> Result<Ran, String> {
+        let published = self.publish(donors, job)?;
+        self.event(
+            "donor",
+            &format!("v{id}: published as donor job {published}"),
+        );
+        let claim_timeout = Duration::from_secs(self.config.donors.claim_timeout());
+        let mut waiting_since = Instant::now();
+        let started = Instant::now();
+        let stopped = |cancelled: bool, interrupted: Option<String>| Ran {
+            results: TestResults::default(),
+            exit: None,
+            elapsed: started.elapsed(),
+            log: dir.join("run.log"),
+            cancelled,
+            interrupted,
+            handle: None,
+            refused: false,
+            effective_selection: None,
+        };
+        loop {
+            if let Err(why) = crate::interrupt::check("a donor receipt arrived") {
+                let _ = donors.store.cancel(&published, "the queue is stopping");
+                return Ok(stopped(true, Some(why)));
+            }
+            if cancel.load(Ordering::Relaxed) {
+                let _ = donors
+                    .store
+                    .cancel(&published, "the candidate was discarded");
+                return Ok(stopped(true, None));
+            }
+            let record = donors.store.get(&published)?;
+            match record.state {
+                crate::donor::JobState::Done => {
+                    let receipt = record.receipt.ok_or_else(|| {
+                        format!("donor job {published} is done without a receipt")
+                    })?;
+                    self.event(
+                        "donor",
+                        &format!(
+                            "v{id}: receipt from {} on {}",
+                            receipt.donor.name, receipt.donor.host
+                        ),
+                    );
+                    return receipt_ran(&receipt, dir);
+                }
+                crate::donor::JobState::Cancelled => {
+                    return Err(format!(
+                        "donor job {published} was cancelled outside this run"
+                    ));
+                }
+                crate::donor::JobState::Leased => waiting_since = Instant::now(),
+                crate::donor::JobState::Queued => {
+                    if waiting_since.elapsed() > claim_timeout {
+                        let _ = donors.store.cancel(&published, "no donor took it in time");
+                        return Err(format!(
+                            "no donor took job {published} for {}s (attempts so far: {}); is a donor running (`merge-queue donor run`), and do its tools match? Nothing was ejected",
+                            claim_timeout.as_secs(),
+                            record.attempts
+                        ));
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
     }
 
     /// The policy's selection for `commit` relative to `base`.
@@ -2527,6 +2697,44 @@ fn discard(
     while let Some(flight) = flights.pop_back() {
         pending.push_front(flight.candidate.prs);
     }
+}
+
+/// The local verdict compare mode records beside a donor's.
+fn local_verdict(ran: &Ran) -> crate::donor::Verdict {
+    crate::donor::Verdict {
+        green: ran.green(),
+        refused: ran.refused,
+        failed: ran
+            .results
+            .attributed_failures()
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+    }
+}
+
+/// An accepted receipt read as a local validation's result; the log keeps its tail.
+fn receipt_ran(receipt: &crate::donor::Receipt, dir: &std::path::Path) -> Result<Ran, String> {
+    let log = dir.join("run.log");
+    std::fs::write(
+        &log,
+        format!(
+            "merge-queue: validated by donor {} on {} (full log there: {})\n{}",
+            receipt.donor.name, receipt.donor.host, receipt.log_path, receipt.log_tail
+        ),
+    )
+    .map_err(|error| format!("cannot write {}: {error}", log.display()))?;
+    Ok(Ran {
+        results: receipt.results.clone(),
+        exit: receipt.exit,
+        elapsed: Duration::from_millis(receipt.elapsed_ms),
+        log,
+        cancelled: false,
+        interrupted: None,
+        handle: None,
+        refused: receipt.refused,
+        effective_selection: receipt.effective_selection.clone(),
+    })
 }
 
 /// Sleep for `delay`, returning early when a stop is requested.

@@ -30,7 +30,9 @@ Examples:
   merge-queue widen
   merge-queue serve
   merge-queue serve --shadow
-  merge-queue status";
+  merge-queue status
+  merge-queue donor run --queue 'ssh qhost merge-queue --repo /srv/q' --clone ~/q --name h2 --jobs 2
+  merge-queue donor status";
 
 /// Local merge queue: order, batch, validate and land ready changes while keeping the base green.
 #[derive(Debug, Parser)]
@@ -45,6 +47,226 @@ struct Cli {
     repo: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
+}
+
+/// `merge-queue donor` verbs.
+#[derive(Debug, Subcommand)]
+enum DonorCommand {
+    /// Run a donor: claim jobs from the queue through --queue, validate each exact candidate
+    /// in a checkout of --clone, and report receipts. Stops on SIGINT/SIGTERM, giving its jobs
+    /// back.
+    Run {
+        /// Command that runs the queue's merge-queue on the queue host, to which each request
+        /// is appended; shell words, for example
+        /// 'agentcloudctl node exec --node HOST -- /path/merge-queue --repo /path/queue'
+        /// (or 'ssh HOST merge-queue --repo ...', or a local merge-queue path).
+        #[arg(long, value_name = "COMMAND")]
+        queue: String,
+        /// This host's clone of the queue's repository (candidate checkouts are worktrees of it).
+        #[arg(long, value_name = "DIR")]
+        clone: PathBuf,
+        /// Remote of --clone to fetch the base from before asking for a bundle ("" = never fetch).
+        #[arg(long, default_value = "origin")]
+        remote: String,
+        /// Donor name, unique among the queue's donors.
+        #[arg(long)]
+        name: String,
+        /// Most jobs this donor runs at once.
+        #[arg(long, default_value_t = 1)]
+        jobs: usize,
+        /// Seconds between claims while idle.
+        #[arg(long, default_value_t = 5)]
+        poll_secs: u64,
+        /// Work directory for checkouts and logs (default: merge-queue-donor/ inside --clone's Git directory).
+        #[arg(long, value_name = "DIR")]
+        work: Option<PathBuf>,
+        /// Seconds to stop claiming after declining a job because this host's tools differ.
+        #[arg(long, default_value_t = 300)]
+        mismatch_backoff_secs: u64,
+        /// Exit once no job is running and none is available (scripts and tests).
+        #[arg(long)]
+        until_idle: bool,
+    },
+    /// Queue host: lease the oldest job this donor may take; prints `{"job": ...}` (the job
+    /// carries the lease token) or `{"job": null}`.
+    Claim {
+        /// Donor name.
+        #[arg(long)]
+        donor: String,
+        /// Donor host.
+        #[arg(long, default_value = "")]
+        host: String,
+        /// Most leases this donor holds at once.
+        #[arg(long, default_value_t = 1)]
+        jobs: usize,
+    },
+    /// Queue host: extend a lease (token on stdin); prints continue or stop.
+    Renew {
+        /// Job id.
+        #[arg(long)]
+        job: String,
+    },
+    /// Queue host: write the candidate's git bundle to stdout (token on stdin).
+    Bundle {
+        /// Job id.
+        #[arg(long)]
+        job: String,
+    },
+    /// Queue host: submit a receipt (`{"token", "receipt"}` JSON on stdin); exits 1 with the
+    /// reason when it is refused.
+    Report {
+        /// Job id.
+        #[arg(long)]
+        job: String,
+    },
+    /// Queue host: give a job back (token on stdin); it is queued again.
+    Release {
+        /// Job id.
+        #[arg(long)]
+        job: String,
+        /// Why.
+        #[arg(long, default_value = "released")]
+        reason: String,
+        /// Never hand this job to this donor again (it cannot run it).
+        #[arg(long)]
+        decline: bool,
+    },
+    /// List donor jobs, leases (never their tokens) and compare-mode verdicts.
+    Status {
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// The lease token a donor sends on stdin.
+fn read_token() -> Result<String, String> {
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)
+        .map_err(|error| format!("cannot read the lease token from stdin: {error}"))?;
+    let token = text.trim().to_owned();
+    if token.is_empty() {
+        return Err("no lease token on stdin".to_owned());
+    }
+    Ok(token)
+}
+
+fn donor_store(state: &State, config: &Config) -> crate::donor::Store {
+    let mut store = crate::donor::Store::new(&state.root);
+    store.lease_secs = config.donors.lease();
+    store
+}
+
+fn donor_command(state: &State, action: DonorCommand) -> Result<i32, String> {
+    let config = state.config()?;
+    let store = donor_store(state, &config);
+    match action {
+        DonorCommand::Run { .. } => Err("donor run is handled before the queue state".to_owned()),
+        DonorCommand::Claim { donor, host, jobs } => {
+            let cap = config.donors.max_jobs_per_donor;
+            let jobs = if cap > 0 { jobs.min(cap) } else { jobs };
+            let job = store.claim(&donor, &host, jobs)?;
+            let text = serde_json::to_string(&crate::donor::Claimed { job })
+                .map_err(|error| error.to_string())?;
+            println!("{text}");
+            Ok(0)
+        }
+        DonorCommand::Renew { job } => {
+            let renewal = store.renew(&job, &read_token()?)?;
+            println!(
+                "{}",
+                serde_json::to_string(&renewal).map_err(|error| error.to_string())?
+            );
+            Ok(0)
+        }
+        DonorCommand::Bundle { job } => {
+            let record = store.for_bundle(&job, &read_token()?)?;
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            crate::donor::write_bundle(
+                &config.repo,
+                &state.root.join("donor").join("scratch"),
+                &record,
+                config.donors.max_bundle(),
+                &mut out,
+            )?;
+            Ok(0)
+        }
+        DonorCommand::Report { job } => {
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)
+                .map_err(|error| format!("cannot read the report from stdin: {error}"))?;
+            let report: crate::donor::Report = serde_json::from_str(&text)
+                .map_err(|error| format!("unreadable report: {error}"))?;
+            store.report(&job, &report.token, report.receipt)?;
+            println!("{{\"accepted\": true}}");
+            Ok(0)
+        }
+        DonorCommand::Release {
+            job,
+            reason,
+            decline,
+        } => {
+            store.release(&job, &read_token()?, &reason, decline)?;
+            Ok(0)
+        }
+        DonorCommand::Status { json } => {
+            let jobs = store.jobs()?;
+            if json {
+                let view: Vec<serde_json::Value> =
+                    jobs.iter().map(crate::donor::redacted).collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&view).map_err(|error| error.to_string())?
+                );
+                return Ok(0);
+            }
+            let count =
+                |state: crate::donor::JobState| jobs.iter().filter(|j| j.state == state).count();
+            println!(
+                "donor jobs: {} queued, {} leased, {} done, {} cancelled",
+                count(crate::donor::JobState::Queued),
+                count(crate::donor::JobState::Leased),
+                count(crate::donor::JobState::Done),
+                count(crate::donor::JobState::Cancelled)
+            );
+            let compared: Vec<&String> =
+                jobs.iter().filter_map(|j| j.comparison.as_ref()).collect();
+            if !compared.is_empty() {
+                let matched = compared.iter().filter(|c| c.as_str() == "match").count();
+                println!(
+                    "compare: {matched} of {} receipts match the local verdict",
+                    compared.len()
+                );
+            }
+            for job in &jobs {
+                let who = match (&job.lease, &job.receipt) {
+                    (Some(lease), _) => format!(" leased to {} on {}", lease.donor, lease.host),
+                    (None, Some(receipt)) => {
+                        format!(" by {} on {}", receipt.donor.name, receipt.donor.host)
+                    }
+                    _ => String::new(),
+                };
+                println!(
+                    "  {} {:?} {}{}{}{}",
+                    job.id,
+                    job.state,
+                    &job.commit[..job.commit.len().min(12)],
+                    who,
+                    if job.attempts > 1 {
+                        format!(", attempt {}", job.attempts)
+                    } else {
+                        String::new()
+                    },
+                    job.comparison
+                        .as_ref()
+                        .map(|c| format!(", {c}"))
+                        .unwrap_or_default()
+                );
+            }
+            Ok(0)
+        }
+    }
 }
 
 // `init` carries many flags; the enum is parsed once per process, so its size is irrelevant.
@@ -185,6 +407,16 @@ enum Command {
         /// at 60). 0 = no delay.
         #[arg(long, default_value_t = crate::state::DEFAULT_REFUSAL_BACKOFF_SECS)]
         refusal_backoff_secs: u64,
+        /// Where validations run: `off` (in this process; the default), `compare` (in this
+        /// process, which decides, and also on donors, whose receipts are only compared), or
+        /// `decide` (on donors only; an accepted receipt is the verdict).
+        #[arg(long, default_value = "off", value_parser = ["off", "compare", "decide"])]
+        offload: String,
+        /// A tool the validation depends on, as NAME=COMMAND (repeatable): the command prints
+        /// its identity (a tool repository's commit, a toolchain version). A donor whose
+        /// answer differs from the queue host's refuses the job.
+        #[arg(long, value_name = "NAME=COMMAND")]
+        tool_identity: Vec<String>,
         /// Delete ignored files (build caches) from reused checkouts before each validation.
         #[arg(long)]
         clean_ignored: bool,
@@ -326,6 +558,10 @@ enum Command {
         /// Print the run report as JSON instead of Markdown.
         #[arg(long)]
         json: bool,
+        /// Override `validator.offload` for this run: `off`, `compare` (donors validate too;
+        /// their receipts are only compared with the local verdict) or `decide` (donors only).
+        #[arg(long, value_parser = ["off", "compare", "decide"])]
+        offload: Option<String>,
     },
     /// Run the queue forever: watch for submitted changes and a moving base, land batches.
     Serve {
@@ -374,6 +610,10 @@ enum Command {
         /// sync spends at least one hosting API request.
         #[arg(long, default_value_t = serve::DEFAULT_SYNC_EVERY_SECS, value_name = "SECS", requires = "sync_label")]
         sync_every: u64,
+        /// Override `validator.offload` for this run: `off`, `compare` (donors validate too;
+        /// their receipts are only compared with the local verdict) or `decide` (donors only).
+        #[arg(long, value_parser = ["off", "compare", "decide"])]
+        offload: Option<String>,
     },
     /// Render and install the systemd user unit for `serve`, with the
     /// toolchain directory (containing `cargo`) resolved explicitly at
@@ -392,6 +632,13 @@ enum Command {
         /// Print the rendered unit instead of writing it.
         #[arg(long)]
         print: bool,
+    },
+    /// Donor validators: other hosts validate queued candidates and return exact-SHA receipts
+    /// (see the user guide's "Donor validators"). `run` is the donor daemon; the other verbs
+    /// are what a donor calls on the queue host through its route.
+    Donor {
+        #[command(subcommand)]
+        action: DonorCommand,
     },
     /// Show daemon liveness, the current window and slot occupancy.
     Status {
@@ -597,6 +844,42 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             }
             return Ok(0);
         }
+        Command::Donor {
+            action:
+                DonorCommand::Run {
+                    queue,
+                    clone,
+                    remote,
+                    name,
+                    jobs,
+                    poll_secs,
+                    work,
+                    mismatch_backoff_secs,
+                    until_idle,
+                },
+        } => {
+            let queue = shell_words::split(&queue)
+                .map_err(|error| format!("--queue {queue:?}: {error}"))?;
+            let work = match work {
+                Some(work) => work,
+                None => {
+                    let dir =
+                        crate::git::Git::new(&clone).run(&["rev-parse", "--absolute-git-dir"])?;
+                    PathBuf::from(dir).join("merge-queue-donor")
+                }
+            };
+            return crate::donor::run_donor(&crate::donor::DonorOptions {
+                queue,
+                clone,
+                remote,
+                name,
+                jobs,
+                poll: std::time::Duration::from_secs(poll_secs.max(1)),
+                work,
+                mismatch_backoff: std::time::Duration::from_secs(mismatch_backoff_secs),
+                until_idle,
+            });
+        }
         _ => {}
     }
     let repo = repo_dir(cli.repo)?;
@@ -639,6 +922,8 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             timeout,
             refusal_max_retries,
             refusal_backoff_secs,
+            offload,
+            tool_identity,
             clean_ignored,
             land,
             land_command,
@@ -716,6 +1001,22 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     clean_ignored,
                     refusal_max_retries,
                     refusal_backoff_secs,
+                    offload: if offload == "off" {
+                        String::new()
+                    } else {
+                        offload
+                    },
+                    tool_identity: tool_identity
+                        .iter()
+                        .map(|spec| {
+                            spec.split_once('=')
+                                .filter(|(name, command)| !name.is_empty() && !command.is_empty())
+                                .map(|(name, command)| (name.to_owned(), command.to_owned()))
+                                .ok_or_else(|| {
+                                    format!("--tool-identity {spec:?}: expected NAME=COMMAND")
+                                })
+                        })
+                        .collect::<Result<_, _>>()?,
                 },
                 land: LandConfig {
                     driver: land,
@@ -909,6 +1210,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             widen,
             with_peers,
             json,
+            offload,
         } => {
             let _lock = state.lock()?;
             // Ctrl-C or a service stop cancels the validations and stops with no verdict
@@ -926,6 +1228,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     widen,
                     quiet: false,
                     with_peers,
+                    offload,
                 },
             )?;
             let report = runner.run()?;
@@ -943,6 +1246,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             notify_timeout_secs,
             sync_label,
             sync_every,
+            offload,
         } => serve::serve(
             &state,
             &ServeOptions {
@@ -960,6 +1264,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                 notify_timeout: std::time::Duration::from_secs(notify_timeout_secs.max(1)),
                 sync_label,
                 sync_every: std::time::Duration::from_secs(sync_every.max(10)),
+                offload,
             },
         ),
         Command::InstallServeUnit {
@@ -994,6 +1299,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             );
             Ok(0)
         }
+        Command::Donor { action } => donor_command(&state, action),
         Command::Status {
             json,
             stale_after_secs,

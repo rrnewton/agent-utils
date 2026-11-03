@@ -122,6 +122,8 @@ This command creates the state directory and writes `config.json`.
 | `--admission WORD` | none | A command prefix every validation runs under, such as a host admission wrapper. Repeat it for several words. |
 | `--refusal-max-retries N` | `3` | Extra attempts after an admission refusal (exit `75`, or a non-zero exit whose first output line starts with `COULD_NOT_RUN` and that attributed no failed test) within one `run`, each after a backoff delay. A refusal is never a pass and never red: the change stays queued. |
 | `--refusal-backoff-secs SECS` | `2` | Base backoff between refusal retries, doubled per attempt and capped at 60 seconds. `0` means no delay. The same backoff sets the deferred change's next retry time. |
+| `--offload MODE` | `off` | Where validations run: `off` (in this process, as always), `compare` (in this process, which decides, and also on donors, whose receipts are only compared) or `decide` (on donors only; an accepted receipt is the verdict). See "Donor validators". |
+| `--tool-identity NAME=COMMAND` | none | A tool the validation depends on (repeatable): the command prints its identity, for example a tool repository's commit or a toolchain version. Donors whose answer differs decline the job. |
 | `--timeout SECS` | `0` | Seconds before one validation is killed (its whole process group) and its selected tests count as errors. `0` means no limit. |
 | `--clean-ignored` | off | Also delete ignored files (build caches) from a reused checkout before each validation. By default they are kept, which makes validations fast but trusts the build to be hermetic with respect to them. |
 | `--land DRIVER` | `push` | `push` or `command` (see "Land drivers"). |
@@ -254,6 +256,7 @@ ejects them. It writes everything to `runs/<run-id>/` and prints the run report.
 | `--max-batches N` | `0` | Stop after this many batches. `0` drains the plan. |
 | `--widen` | off | After draining, run the complete suite once to discharge open obligations. Skipped in `--shadow` and `--dry-run` runs, because obligations are real state. |
 | `--with-peers` | off | First drain each peer queue that holds a change some queued change here requires; the report lists those runs under `peer_runs`. |
+| `--offload MODE` | configured | Override `validator.offload` for this run: `off`, `compare` or `decide`. |
 | `--json` | off | Print the report as JSON instead of Markdown. |
 
 The exit status is `3` when the run stopped early; the report's `stopped` field says why. An
@@ -304,6 +307,7 @@ SIGINT or SIGTERM during a stop exits immediately. `merge-queue run` stops the s
 | `--notify-timeout-secs N` | `30` | Seconds one notification send may run; then its whole process group is killed and the send counts as a failed attempt (minimum 1). |
 | `--sync-label LABEL` | none | Also ingest pull requests carrying LABEL, inside the daemon's own loop: the same ingestion as `merge-queue sync --label LABEL` (one batched list call, approval at head when configured, withdrawal when the label goes away), under the writer lock the work cycle uses. Needs `github.repo`. |
 | `--sync-every SECS` | `60` | Seconds between label syncs (with `--sync-label`; minimum 10). Each sync spends at least one hosting API request. |
+| `--offload MODE` | configured | Override `validator.offload` for this run: `off`, `compare` or `decide`. |
 
 With `--sync-label LABEL` the daemon ingests labelled pull requests itself, so a change
 labelled ready that nobody submits is never missed. Each sync runs at the top of a loop
@@ -388,6 +392,22 @@ The tick-hub launcher alternative ships at `rs/merge-queue/tick-hub-merge-queue.
 runs `merge-queue status` as a gate and emits an action asking for a restart when the daemon is
 not healthy, plus a heartbeat-freshness health check. Edit its paths, then
 `tick-hub tick --config rs/merge-queue/tick-hub-merge-queue.yaml`.
+
+### `merge-queue donor`
+
+Donor validators (see "Donor validators"). `donor run` is the donor daemon, run on any host with
+a clone of the queue's repository. The other verbs are what a donor calls on the queue host
+through its route; an operator uses only `status`.
+
+| Verb | What it does |
+|---|---|
+| `run --queue CMD --clone DIR --name NAME [--jobs N]` | Claim jobs through the route, validate each exact candidate in a worktree of `DIR`, report receipts. Options: `--remote` (default `origin`; fetched for the base), `--poll-secs` (default 5), `--work DIR` (default `merge-queue-donor/` in the clone's Git directory), `--mismatch-backoff-secs` (default 300), `--until-idle`. SIGINT/SIGTERM gives running jobs back and exits. |
+| `status [--json]` | Jobs by state, leases (never their tokens), and in `compare` mode how many receipts matched the local verdict. |
+| `claim --donor NAME [--host H] [--jobs N]` | Lease the oldest job this donor may take; prints `{"job": ...}` (with the token) or `{"job": null}`. |
+| `renew --job ID` | Token on stdin. Prints `{"renewal": "continue", ...}` or `{"renewal": "stop", "reason": ...}`. |
+| `bundle --job ID` | Token on stdin. Writes the candidate's git bundle to stdout. |
+| `report --job ID` | `{"token", "receipt"}` on stdin. Exits 1 with the reason when the receipt is refused. |
+| `release --job ID [--reason R] [--decline]` | Token on stdin. Gives the job back; `--decline` means this donor never gets it again. |
 
 ### `merge-queue widen`
 
@@ -519,15 +539,15 @@ on which files two changes share.
   serve.lock             fixed: single-daemon lock (flock held by a running `serve`)
   serve.pid              fixed: `serve` daemon pid (informational; removed on a graceful stop)
   serve.heartbeat.json   fixed: `serve` heartbeat, rewritten every cycle
-  serve.pid              fixed: `serve` daemon pid (removed on a graceful stop)
-  serve.heartbeat.json   fixed: `serve` heartbeat, rewritten every cycle
   union.attributes       fixed: generated from union_paths, when set
   items/<pr>.json        one record per submitted change
-  notifications/        notification report files the daemon sends with `--file`
   notifications/        notification report files the daemon sends with `--file`
   runs/<run-id>/         one directory per run (layout below)
   obligations/<id>.json  one record per focused landing still owed a complete run
   scratch/slot-<n>/      one reused worktree per concurrent validation
+  donor/lock             fixed: donor job store lock (held for milliseconds)
+  donor/jobs/<id>.json   one record per donor job (mode 0600: it holds the lease token)
+  donor/scratch/         bundles being sent to donors (removed after each)
 ```
 
 A run directory holds `plan.json` (the plan it started from), `events.jsonl` (every step, in
@@ -599,6 +619,17 @@ An **item record** (`items/<pr>.json`) has these fields:
   at 60 seconds (default `2`; `0` means no delay).
 - `timeout_secs`: `0` means no limit.
 - `clean_ignored`: also delete ignored files from reused checkouts (default `false`).
+- `offload`: `off` (or absent; the default), `compare` or `decide` (see "Donor validators").
+- `tool_identity`: `{name: command}`, the tools a validation depends on, checked on donors.
+
+**`donors`** fields (only read when `validator.offload` is not off; absent means the defaults):
+
+- `lease_secs`: how long a lease lasts without a renewal (default `120`; a donor renews every
+  quarter of it).
+- `max_bundle_bytes`: the largest candidate bundle served to a donor (default 256 MiB).
+- `max_jobs_per_donor`: the most leases one donor may hold (default `0`: what the donor asks for).
+- `claim_timeout_secs`: in `decide` mode, how long a job may wait with no donor holding it
+  before the run stops with an error (default `900`). Nothing is ejected.
 
 **`land`** fields:
 
@@ -689,6 +720,83 @@ a red single-change batch costs exactly one targeted rerun.
 per-step verdicts come from the run journal (`journal.jsonl` under a private `DAGRUN_LOG_DIR`):
 `step_end` gives pass or fail with the wall time, `step_skip` gives skip. A case-level ID narrows
 nothing for this kind; its whole step runs.
+
+## Donor validators
+
+The queue validates every candidate on its own host, which caps throughput at that host's few
+concurrent validations while other hosts sit idle. Donor validators let other hosts take queued
+validations, run them with the same validator, and return receipts for the exact candidate.
+Landing never moves: only the queue host writes to the base, fast-forward to the next green
+candidate, exactly as without donors.
+
+**Strictly opt-in.** `validator.offload` is `off` unless an operator sets it, and `off` is
+exactly the in-process path. The two other modes:
+
+- `compare`: the queue validates in process as always, and that verdict alone decides. Every
+  validation is also published for donors. When a donor's receipt arrives, it is compared with
+  the local verdict, and `donor status` counts how many matched. Run this first: a donor whose
+  environment differs subtly shows up as a mismatch and never lands anything. Switch to
+  `decide` only after a run of matching verdicts.
+- `decide`: validations run on donors only, and an accepted receipt is the verdict, with the
+  same culprit search, flaky detection and obligations as a local result. The queue host keeps
+  validating by running a donor of its own (`donor run --queue 'merge-queue --repo QUEUE'
+  --clone QUEUE --name local --jobs 2`), so its local capacity is one donor among several.
+  Remote donors add capacity.
+
+**Transport: no new ports.** A donor reaches the queue only by running this tool on the queue
+host through its `--queue` route. Each request appends its arguments to the route, for example
+`agentcloudctl node exec --node QUEUEHOST -- /path/merge-queue --repo /path/queue`,
+`ssh QUEUEHOST merge-queue --repo ...`, or a local path. The route is the authentication: only
+someone who can already run commands on the queue host as its owner can change the store.
+Requests are short calls that print JSON. The lease token travels on stdin, never in arguments,
+so it never appears in process listings, logs or `status`.
+
+**Leases.** Each validation becomes a job in `<state>/donor/jobs/`, behind its own lock: donors
+never wait for the writer lock a running work cycle holds. A claim leases the oldest job the
+donor has not declined to exactly one donor, with a fresh random token.
+- The donor renews every quarter of `donors.lease_secs`. A renewal answers "stop" when the job
+  was cancelled (its candidate was discarded, or the queue is stopping) or the lease is no
+  longer the donor's, and the donor then kills its run.
+- A donor that dies stops renewing, its lease expires, and the job goes back to the queue for
+  the next claimant. A job never runs twice at once, and a late receipt from the old holder is
+  refused.
+- `donor run --jobs N` bounds a donor's concurrent jobs, and `donors.max_jobs_per_donor` caps
+  every donor on the queue side.
+
+**The candidate tree.** Candidates (merges, regenerations) exist only in the queue's
+repository. A donor whose clone already has the commit uses it (the queue host's own donor
+always does). Otherwise the donor fetches `--remote` so it has the job's base, then asks for a
+bundle of the candidate over the base. It checks that the commit and tree are exactly the job's
+before running anything. A bundle over `donors.max_bundle_bytes` (default 256 MiB) is refused,
+and the donor declines the job, leaving it to a donor that has the commits. A route carries
+about 25 MB/s, so the default takes about ten seconds. A candidate that adds more than that
+over the base is normally a sign of a stale base.
+
+**Tool identity and receipts.** A job carries the validator settings, the selection (decided on
+the queue host) and the tool identity: a digest of those settings plus the answers of the
+configured `validator.tool_identity` commands, for example the commit of each tool repository
+and the pinned toolchain. The commands run in the queue's repository on the queue host and in
+the donor's clone on the donor. A donor whose answers differ declines the job loudly (naming
+each difference), backs off claiming for `--mismatch-backoff-secs`, and never runs it.
+
+The receipt (`merge-queue-receipt/v1`) names:
+- the job, the donor and its host, the commit and tree it validated, and the tool identity it
+  checked;
+- its merge-queue version, the exit status, whether admission refused, the per-test results,
+  the timing, the end of the log, and where the full log stays on the donor host.
+
+The queue accepts it only if all of these hold:
+- the lease is live and the token and donor name match;
+- the commit and tree are the job's;
+- the tool identity equals the one the queue computed when it published the job.
+
+Every refusal is recorded in the job's history. Validation timeouts are the validator's own
+(`validator.timeout_secs`), enforced on the donor exactly as locally.
+
+**Stops and discards.** A stop request or a discarded speculative candidate cancels the job.
+In `decide` mode a job no donor takes within `donors.claim_timeout_secs` stops the run with an
+error that asks whether a donor is running and whether its tools match. Nothing is ejected
+either way.
 
 ## Using it on a repository validated by a dagrun DAG
 

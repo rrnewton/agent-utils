@@ -10,6 +10,7 @@
 
 pub mod bench;
 pub mod cli;
+pub mod donor;
 pub mod git;
 pub mod github;
 pub mod interrupt;

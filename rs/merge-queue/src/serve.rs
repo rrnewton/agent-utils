@@ -725,6 +725,8 @@ pub struct ServeOptions {
     pub sync_label: Option<String>,
     /// Interval between label syncs.
     pub sync_every: Duration,
+    /// Override `validator.offload` for work cycles.
+    pub offload: Option<String>,
 }
 
 impl Default for ServeOptions {
@@ -740,6 +742,7 @@ impl Default for ServeOptions {
             notify_timeout: notify::DEFAULT_SEND_TIMEOUT,
             sync_label: None,
             sync_every: Duration::from_secs(DEFAULT_SYNC_EVERY_SECS),
+            offload: None,
         }
     }
 }
@@ -850,6 +853,7 @@ fn run_cycle(
         depth: options.depth,
         max_batch: options.max_batch,
         quiet: true,
+        offload: options.offload.clone(),
         ..RunOptions::default()
     };
     let outcome = Runner::new(state, run_options)

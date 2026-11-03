@@ -77,6 +77,91 @@ pub struct ValidatorConfig {
     /// 0 means no delay between retries (used by tests).
     #[serde(default = "default_refusal_backoff_secs")]
     pub refusal_backoff_secs: u64,
+    /// Where validations run: empty or `off` (in this process, the default), `compare` (in
+    /// this process, which decides, and also published to donors so their receipts are
+    /// compared with the local verdict), or `decide` (published to donors only; an accepted
+    /// receipt is the verdict). See the user guide's "Donor validators".
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub offload: String,
+    /// Commands naming the tools a validation depends on, by name (for example the commit of
+    /// each tool repository, or a toolchain version). The queue host runs them when it
+    /// publishes a donor job; a donor whose answers differ refuses the job.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub tool_identity: std::collections::BTreeMap<String, String>,
+}
+
+/// Where validations run (`validator.offload`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Offload {
+    /// In this process only.
+    Off,
+    /// In this process (deciding) and on donors (compared).
+    Compare,
+    /// On donors only.
+    Decide,
+}
+
+impl Offload {
+    /// Parse a setting value.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "" | "off" => Ok(Self::Off),
+            "compare" => Ok(Self::Compare),
+            "decide" => Ok(Self::Decide),
+            other => Err(format!(
+                "validator.offload is {other:?}; expected off, compare or decide"
+            )),
+        }
+    }
+}
+
+/// Donor-validator settings (the queue side).
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DonorsConfig {
+    /// Seconds a lease lasts without a renewal (0 = 120).
+    pub lease_secs: u64,
+    /// Largest candidate bundle served to a donor, in bytes (0 = 256 MiB). A bigger one is
+    /// refused and the donor declines the job, leaving it to a donor that has the commits.
+    pub max_bundle_bytes: u64,
+    /// Most leases one donor may hold at once (0 = what the donor asks for).
+    pub max_jobs_per_donor: usize,
+    /// Seconds a published job may wait unclaimed before the run stops with an error
+    /// (offload `decide`; 0 = 900). Nothing is ejected.
+    pub claim_timeout_secs: u64,
+}
+
+impl DonorsConfig {
+    /// Resolved lease length.
+    pub fn lease(&self) -> u64 {
+        if self.lease_secs == 0 {
+            120
+        } else {
+            self.lease_secs
+        }
+    }
+
+    /// Resolved bundle limit.
+    pub fn max_bundle(&self) -> u64 {
+        if self.max_bundle_bytes == 0 {
+            256 * 1024 * 1024
+        } else {
+            self.max_bundle_bytes
+        }
+    }
+
+    /// Resolved claim timeout.
+    pub fn claim_timeout(&self) -> u64 {
+        if self.claim_timeout_secs == 0 {
+            900
+        } else {
+            self.claim_timeout_secs
+        }
+    }
+}
+
+fn is_default_donors(value: &DonorsConfig) -> bool {
+    *value == DonorsConfig::default()
 }
 
 fn default_refusal_max_retries() -> usize {
@@ -334,6 +419,9 @@ pub struct Config {
     pub peers: std::collections::BTreeMap<String, PathBuf>,
     /// Validation configuration.
     pub validator: ValidatorConfig,
+    /// Donor-validator settings (used when `validator.offload` is not off).
+    #[serde(skip_serializing_if = "is_default_donors")]
+    pub donors: DonorsConfig,
     /// Landing configuration.
     pub land: LandConfig,
     /// Push-notification configuration (state-change messages via agentctl).
@@ -363,6 +451,7 @@ impl Default for Config {
             github: GitHubConfig::default(),
             peers: std::collections::BTreeMap::new(),
             validator: ValidatorConfig::default(),
+            donors: DonorsConfig::default(),
             land: LandConfig::default(),
             notify: NotifyConfig::default(),
         }
