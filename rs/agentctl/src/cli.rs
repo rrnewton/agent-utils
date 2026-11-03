@@ -3087,14 +3087,15 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             .map_err(Failure::Inbox);
         }
         Commands::Restore(value) => {
-            if value.write_agents {
-                let report = crate::restore::spec_write_agents(&args.registry, value.apply)?;
-                write_json(&report).map_err(Failure::Output)?;
-                return Ok(0);
-            }
             let herdr_bin = resolve_herdr_bin(&args.registry, &args.herdr_bin);
             let client =
                 HerdrClient::with_executable("direct", &herdr_bin).map_err(AgentError::from)?;
+            if value.write_agents {
+                let report =
+                    crate::restore::spec_write_agents(&client, &args.registry, value.apply)?;
+                write_json(&report).map_err(Failure::Output)?;
+                return Ok(0);
+            }
             let mut config = crate::restore::RestoreConfig::load(&args.registry)?;
             let designation_problem = designation_problem(&client, &args.registry, &mut config);
             let mut report = crate::restore::restore(

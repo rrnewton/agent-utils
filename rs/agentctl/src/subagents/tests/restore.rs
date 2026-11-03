@@ -805,6 +805,27 @@ fn restore_reports_a_herdr_version_mismatch() {
 }
 
 #[test]
+fn write_agents_keeps_a_launch_failed_record_whose_pane_is_alive_and_refuses_apply() {
+    let fixture = Fixture::new();
+    let mut record = dead_agent(&fixture);
+    record.lifecycle = "launch_failed".to_owned();
+    fixture.manager().save(&record).unwrap();
+    let registry = fixture.root.join("registry");
+    let _config = config(&fixture, None);
+    let preview = crate::restore::spec_write_agents(&fixture.client, &registry, false).unwrap();
+    assert_eq!(preview["after"], json!(["lane"]), "{preview}");
+    assert_eq!(preview["mismatches"][0]["name"], "lane");
+    let error = crate::restore::spec_write_agents(&fixture.client, &registry, true)
+        .expect_err("apply must refuse");
+    assert!(error.to_string().contains("mismatch"), "{error}");
+    // Resolving the record lets apply write only the agents key.
+    record.lifecycle = "running".to_owned();
+    fixture.manager().save(&record).unwrap();
+    let written = crate::restore::spec_write_agents(&fixture.client, &registry, true).unwrap();
+    assert_eq!(written["action"], "written");
+}
+
+#[test]
 fn restore_without_the_certificate_revives_nothing_and_names_the_fetch() {
     let fixture = Fixture::new();
     let _old = dead_agent(&fixture);

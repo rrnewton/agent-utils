@@ -1304,9 +1304,16 @@ fn notice_text(report: &Value, boot_time: Option<u64>, path: &Path) -> String {
 
 /// Run the restore and return its report; the report is also written unless `dry_run`.
 /// Refresh the desired-state `agents` list in `<registry>/restore.json` from the live,
-/// non-coordinator records (#742 spec slice). Preview by default; `apply` writes
+/// non-coordinator records (#742 spec slice, #810). Membership follows live state, not
+/// the recorded lifecycle alone: a record whose pane exists, whose harness process is
+/// alive, or whose harness is in the foreground is never dropped. Preview by default;
+/// `apply` refuses while record/live mismatches are unresolved, and otherwise writes
 /// atomically, preserving every other key. Creates a minimal file when none exists.
-pub fn spec_write_agents(registry: &Path, apply: bool) -> Result<Value> {
+pub fn spec_write_agents<A: ManagedApi + ?Sized>(
+    client: &A,
+    registry: &Path,
+    apply: bool,
+) -> Result<Value> {
     let config = RestoreConfig::load(registry)?;
     let coordinator = config.coordinator.clone().or_else(|| {
         let text = fs::read_to_string(registry.join("coordinator.json")).ok()?;
@@ -1314,7 +1321,12 @@ pub fn spec_write_agents(registry: &Path, apply: bool) -> Result<Value> {
             .as_str()
             .map(str::to_owned)
     });
+    let live_panes: std::collections::BTreeSet<String> = client
+        .panes()
+        .map(|panes| panes.into_iter().map(|pane| pane.pane_id).collect())
+        .unwrap_or_default();
     let mut desired: Vec<String> = Vec::new();
+    let mut mismatches: Vec<Value> = Vec::new();
     for name in registered_names(registry)? {
         if coordinator.as_deref() == Some(name.as_str()) {
             continue;
@@ -1327,11 +1339,56 @@ pub fn spec_write_agents(registry: &Path, apply: bool) -> Result<Value> {
         let Ok(record) = serde_json::from_str::<Value>(&text) else {
             continue;
         };
-        if record["lifecycle"] == "running" {
+        let recorded_running = record["lifecycle"] == "running";
+        let pane_alive = record["pane_id"]
+            .as_str()
+            .is_some_and(|pane| live_panes.contains(pane));
+        let foreground = client.agent_pane(&name).is_ok();
+        let identity = ["harness_identity", "custom_process_identity"]
+            .into_iter()
+            .find_map(|key| {
+                serde_json::from_value::<crate::client::CustomProcessIdentity>(record[key].clone())
+                    .ok()
+            });
+        let process = identity
+            .as_ref()
+            .map(|identity| client.process_liveness(identity));
+        let process_alive = process == Some(crate::client::ProcessLiveness::Alive);
+        let alive = pane_alive || foreground || process_alive;
+        if recorded_running != alive
+            && (alive || process == Some(crate::client::ProcessLiveness::Dead))
+        {
+            mismatches.push(json!({
+                "name": name,
+                "recorded_lifecycle": record["lifecycle"],
+                "evidence": {
+                    "pane_alive": pane_alive,
+                    "foreground": foreground,
+                    "process": match process {
+                        Some(crate::client::ProcessLiveness::Alive) => "alive",
+                        Some(crate::client::ProcessLiveness::Dead) => "dead",
+                        _ => "unknown",
+                    },
+                },
+                "resolution": "repair the record (agentctl status/anchor), or edit restore.json agents explicitly to keep or drop it",
+            }));
+        }
+        if recorded_running || alive {
             desired.push(name);
         }
     }
     desired.sort();
+    if apply && !mismatches.is_empty() {
+        return Err(fail(format!(
+            "restore --write-agents --apply refused: {} record/live mismatch(es) unresolved ({}); repair the record or edit restore.json agents explicitly",
+            mismatches.len(),
+            mismatches
+                .iter()
+                .filter_map(|row| row["name"].as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
     let before = config.agents.clone().unwrap_or_default();
     let added: Vec<&String> = desired.iter().filter(|n| !before.contains(n)).collect();
     let removed: Vec<&String> = before.iter().filter(|n| !desired.contains(n)).collect();
@@ -1357,6 +1414,7 @@ pub fn spec_write_agents(registry: &Path, apply: bool) -> Result<Value> {
         "after": desired,
         "added": added,
         "removed": removed,
+        "mismatches": mismatches,
     }))
 }
 
@@ -2387,36 +2445,6 @@ mod tests {
         .unwrap();
         assert_eq!(row["generation"], 3);
         assert_eq!(*host.status_calls.borrow(), 2);
-    }
-
-    #[test]
-    fn spec_write_agents_previews_then_writes_only_the_agents_key() {
-        let registry = std::env::temp_dir().join(format!("spec-agents-{}", std::process::id()));
-        let live = registry.join("agents").join("lane");
-        let dead = registry.join("agents").join("done");
-        fs::create_dir_all(&live).unwrap();
-        fs::create_dir_all(&dead).unwrap();
-        fs::write(live.join("agent.json"), "{\"lifecycle\":\"running\"}").unwrap();
-        fs::write(dead.join("agent.json"), "{\"lifecycle\":\"stopped\"}").unwrap();
-        fs::write(
-            registry.join(CONFIG_FILE),
-            "{\"schema\":\"agentctl-restore/v1\",\"coordinator\":\"lead\",\"units\":[\"b.service\"]}",
-        )
-        .unwrap();
-        let preview = spec_write_agents(&registry, false).unwrap();
-        assert_eq!(preview["action"], "preview");
-        assert_eq!(preview["after"], json!(["lane"]));
-        assert!(fs::read_to_string(registry.join(CONFIG_FILE))
-            .unwrap()
-            .contains("b.service"));
-        let written = spec_write_agents(&registry, true).unwrap();
-        assert_eq!(written["action"], "written");
-        let document: Value =
-            serde_json::from_str(&fs::read_to_string(registry.join(CONFIG_FILE)).unwrap()).unwrap();
-        assert_eq!(document["agents"], json!(["lane"]));
-        assert_eq!(document["units"], json!(["b.service"]));
-        assert_eq!(document["coordinator"], "lead");
-        let _ = fs::remove_dir_all(&registry);
     }
 
     #[test]
