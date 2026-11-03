@@ -749,3 +749,25 @@ test("`#624 voice-page-modularity`: a filter change nested in another is one cha
   assert.equal(changes.endWalk(), true);
   assert.deepStrictEqual([changes.walking(), changes.isWalk(second)], [false, false]);
 });
+
+test("`#624 voice-page-modularity`: one row menu open at a time, and only the open one's close forgets it", () => {
+  const { createRowMenus } = CHANNEL_VIEW;
+  const menus = createRowMenus();
+  const closedBy = [];
+  const menu = (name) => {
+    const close = () => { closedBy.push(name); menus.closed(close); };
+    return { root: { name }, close, button: { name } };
+  };
+  const [a, b] = [menu("a"), menu("b")];
+  assert.equal(menus.open(), null);
+  menus.opened(a);
+  assert.equal(menus.open(), a);
+  menus.opened(a);
+  assert.deepStrictEqual(closedBy, [], "opening the open one again closes nothing");
+  menus.opened(b);
+  assert.deepStrictEqual([closedBy, menus.open()], [["a"], b], "opening another closes the one open");
+  menus.closed(a.close);
+  assert.equal(menus.open(), b, "a menu already closed forgets nothing");
+  b.close();
+  assert.equal(menus.open(), null);
+});

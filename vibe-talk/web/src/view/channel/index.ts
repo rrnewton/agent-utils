@@ -105,3 +105,5 @@ export { createRowDrawing } from "./rowdrawing.ts";
 export type { RowDrawing } from "./rowdrawing.ts";
 export { createFilterChanges } from "./filterchanges.ts";
 export type { FilterChanges, FilterWalk } from "./filterchanges.ts";
+export { createRowMenus } from "./rowmenu.ts";
+export type { RowMenu, RowMenus } from "./rowmenu.ts";

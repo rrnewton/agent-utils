@@ -896,7 +896,7 @@ function mayPushHistory() {
 /** The menus open now, as levels, in the order Escape closes them. */
 function openMenus() {
   const open = [];
-  if (openRowMenu) open.push("menu:row");
+  if (rowMenus.open()) open.push("menu:row");
   if (!el("speed-popover").hidden) open.push("menu:pace");
   if (promptsOpen) open.push("menu:prompts");
   // `#348 settings-dynamic-lists`. The pop-out over Recently dismissed, on Settings.
@@ -910,8 +910,9 @@ function openMenus() {
  * and the pace popover and the prompts tray give it to their buttons.
  */
 function closeOpenMenu(name) {
-  if (name === "menu:row" && openRowMenu) {
-    const { root, close, button } = openRowMenu;
+  const rowMenu = rowMenus.open();
+  if (name === "menu:row" && rowMenu) {
+    const { root, close, button } = rowMenu;
     const inside = nodeWithin(root, document.activeElement);
     close();
     if (inside && button && typeof button.focus === "function") button.focus({ preventScroll: true });
@@ -6762,7 +6763,7 @@ function keyboardFocused(node) {
  * counterpart, and nothing else does (`dwellColumnGlide`, `#261 two-column-connectors`).
  */
 function pointRow(pane, row) {
-  if (openRowMenu) return;
+  if (rowMenus.open()) return;
   const holding = nodeWithin(row, document.activeElement);
   // Lit is drawn selected (`drawSelection` lights only that), so a move within the row already lit
   // asks no more: not the pane's kept selection, which in the right column switches to that column
@@ -7140,23 +7141,25 @@ function stepSelection(pane, node, direction, held = false) {
  * land on every item the eye can see.
  */
 function menuItems() {
-  if (!openRowMenu) return [];
+  const menu = rowMenus.open();
+  if (!menu) return [];
   const items = [];
   const walk = (node) => {
     for (const kid of node.children || []) {
       if (kid.hidden) continue;
       const tag = String(kid.tagName).toUpperCase();
-      if ((tag === "BUTTON" && kid !== openRowMenu.button) || tag === "A") items.push(kid);
+      if ((tag === "BUTTON" && kid !== menu.button) || tag === "A") items.push(kid);
       else walk(kid);
     }
   };
-  walk(openRowMenu.root);
+  walk(menu.root);
   return items;
 }
 
 /** ↓ and ↑ in an open ⋯ menu move through its items, as the arrows of a menu do, round from the ends. */
 function stepMenu(node, direction) {
-  if (!openRowMenu || !nodeWithin(openRowMenu.root, node)) return false;
+  const menu = rowMenus.open();
+  if (!menu || !nodeWithin(menu.root, node)) return false;
   const items = menuItems();
   if (items.length === 0) return false;
   const at = items.indexOf(node);
@@ -7608,7 +7611,8 @@ function copyLinkFromKeyboard(target) {
   if (url === null) return false;
   // The act the menu's item did when it was the copy, menu shut included: a copy asked with
   // this row's menu open leaves the reader with the said status, not the menu over it.
-  if (openRowMenu && nodeWithin(row, openRowMenu.root)) openRowMenu.close();
+  const menu = rowMenus.open();
+  if (menu && nodeWithin(row, menu.root)) menu.close();
   guardQuietly(() => copyUpstreamLink(url, upstreamServiceName(message)))();
   return true;
 }
@@ -21073,12 +21077,8 @@ function discordNode(messages) {
     moreButton.setAttribute("aria-expanded", open ? "true" : "false");
     // ONE menu open at a time: opening this one closes whichever was open, and a tap anywhere
     // outside it, or Escape, closes it — what a phone's own pop-up menus do.
-    if (open) {
-      if (openRowMenu && openRowMenu.close !== closeMenu) openRowMenu.close();
-      openRowMenu = { root: more, close: closeMenu, button: moreButton };
-    } else if (openRowMenu && openRowMenu.close === closeMenu) {
-      openRowMenu = null;
-    }
+    if (open) rowMenus.opened({ root: more, close: closeMenu, button: moreButton });
+    else rowMenus.closed(closeMenu);
     // `#304 back-gesture-in-app`. An open menu is a level, with an entry of its own.
     scheduleBackSync();
   };
@@ -21310,15 +21310,17 @@ function discordNode(messages) {
 
 /**
  * The one row ⋯ menu that is open, as `{root, close, button}` (`button` being the ⋯ that opened it),
- * or null. `#202 read-through-here`.
+ * or null. `#202 read-through-here`. One owner in web/src/view/channel/rowmenu.ts (`#624
+ * voice-page-modularity`).
  */
-let openRowMenu = null;
+const rowMenus = createRowMenus();
 
 // Whether a node is inside another (`nodeWithin`) is web/src/view/dom's.
 
 /** A tap anywhere outside the open ⋯ menu (or its button) closes it. */
 function closeRowMenuOutside(event) {
-  if (openRowMenu && !nodeWithin(openRowMenu.root, event && event.target)) openRowMenu.close();
+  const menu = rowMenus.open();
+  if (menu && !nodeWithin(menu.root, event && event.target)) menu.close();
 }
 
 /**
