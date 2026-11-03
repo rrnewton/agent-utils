@@ -24,6 +24,7 @@ updated_at: 2026-11-03T15:55:39.676569469+00:00
 - Pressing React opens an inline quoted reply on exactly that sentence, reusing #819's always-pressable quoted reply and its Draft chip, so the reply is never lost.
 - Focus goes into the reply box with the cursor inside. Ideally voice input starts at once so the owner can just speak. A web page cannot switch the Android keyboard into voice mode, so the options are: (a) start in-page dictation automatically on React (Chrome's webkitSpeechRecognition, or the suite's own ASR stack) with a visible microphone state; or (b) only focus the box and let the owner tap the keyboard's microphone. Prefer (a) if it is reliable, with (b) as the fallback.
 - A design note comes first (mu-transcript@devbig014, design only, no voice.js edits): where the read-aloud highlight state lives and how it holds on pause, the navigation-row layout, a dictation feasibility test on Android Chrome, and the reuse points with #819. The build follows it.
+- Owner addition (2026-11-03): in Reading mode on mobile the forward/back navigation buttons get BIGGER touch targets (at least about 48 px, e.g. 52-56 px), still fitting the centred row with React at the far right. It may ship with #820 part 2 instead if that is simpler; record which.
 
 # Acceptance Criteria
 
@@ -31,3 +32,4 @@ updated_at: 2026-11-03T15:55:39.676569469+00:00
 - React opens a quoted reply on exactly the highlighted sentence, with the cursor in the box; the draft shows in the Draft chip.
 - On Android Chrome, dictation starts automatically with a visible microphone state when supported; otherwise the box is focused for the keyboard microphone.
 - The design note is linked from this issue.
+- In Reading mode on a phone layout the forward/back buttons measure at least 48 px (target 52-56 px) and the row still fits with React.
