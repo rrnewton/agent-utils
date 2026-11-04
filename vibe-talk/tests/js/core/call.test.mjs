@@ -60,3 +60,112 @@ test("`#624 voice-page-modularity`: what a reconnect and a draft's fate say in t
   assert.equal(spokenYesSeam("sent").label, "Sent by voice");
   assert.match(spokenYesSeam("gone").detail, /no draft was waiting/);
 });
+
+test("`#624 voice-page-modularity`: a call's audio route, from its microphone to its output, from the module alone", () => {
+  const { createAudioRoute } = CALL;
+  const classify = (label) => (/airpods/i.test(label) ? "bluetooth" : /usb/i.test(label) ? "usb" : "other");
+  const route = createAudioRoute({ classify });
+  assert.equal(route.current(), null, "a route stood before any call");
+  route.noteSink("desk");
+  route.noteOutput("USB speaker");
+  assert.equal(route.current(), null, "an output aimed between calls made a route");
+  route.begin();
+  assert.deepStrictEqual(route.current(), { inputKind: "other", outputKind: "other", inputLabel: "", outputLabel: "", sink: "" });
+  route.noteInput("");
+  route.settleInput("AirPods Pro");
+  assert.deepStrictEqual([route.current().inputKind, route.current().inputLabel, route.current().outputKind],
+    ["bluetooth", "AirPods Pro", "bluetooth"], "an unlabelled track did not take the chosen device's label and kind");
+  route.noteInput("USB headset");
+  route.settleInput("AirPods Pro");
+  assert.deepStrictEqual([route.current().inputKind, route.current().inputLabel], ["usb", "USB headset"],
+    "the chosen device's label replaced the one the track gave");
+  route.noteSink("desk");
+  route.noteOutput("AirPods Pro");
+  assert.deepStrictEqual(route.current(),
+    { inputKind: "usb", outputKind: "bluetooth", inputLabel: "USB headset", outputLabel: "AirPods Pro", sink: "desk" });
+  const first = route.current();
+  route.begin();
+  assert.notEqual(route.current(), first, "a new call's route is the last call's object");
+  route.set(null);
+  assert.equal(route.current(), null);
+  assert.throws(() => route.noteInput("USB headset"), TypeError, "a call that ended mid-open no longer throws at the next update");
+  assert.equal(createAudioRoute({ classify }).current(), null, "two routes share their state");
+});
+
+test("`#624 voice-page-modularity`: the conversational voice as the provider describes it, from the module alone", () => {
+  const { createVoiceProvider } = CALL;
+  const voice = createVoiceProvider();
+  const unnamed = { name: "voice provider", settings_url: null, instance_id: null };
+  assert.deepStrictEqual(voice.current(), unnamed);
+  voice.learn({ name: "  Example voice  ", settings_url: "https://voice.example/agent", instance_id: "agent_1" });
+  assert.deepStrictEqual(voice.current(), { name: "Example voice", settings_url: "https://voice.example/agent", instance_id: "agent_1" });
+  const before = voice.current();
+  voice.learn({ name: "   ", settings_url: 7, instance_id: null });
+  assert.deepStrictEqual(voice.current(), unnamed, "a blank name or a field that is not a string was kept");
+  assert.equal(before.name, "Example voice", "a new description changed the old one in place");
+  for (const described of [undefined, null, false, "Example voice"]) {
+    voice.learn(described);
+    assert.deepStrictEqual(voice.current(), unnamed, `${String(described)} described a voice`);
+  }
+  assert.deepStrictEqual(createVoiceProvider().current(), unnamed, "two descriptions share their state");
+});
+
+test("`#624 voice-page-modularity`: resuming's switch, the clause under the control, and a new call's payload, from the module alone", async () => {
+  const { createCallResume, blankResumeLast } = CALL;
+  const stored = new Map();
+  const storage = {
+    getItem: (key) => (stored.has(key) ? stored.get(key) : null),
+    setItem: (key, value) => { stored.set(key, value); },
+    removeItem: (key) => { stored.delete(key); },
+  };
+  const asked = [];
+  const details = [];
+  let answer = async () => ({ enabled: true, included: 3, dropped: 0, text: "earlier", words: 42 });
+  let renders = 0;
+  const resume = createCallResume({
+    key: "resume-key",
+    storage: () => storage,
+    api: async (path) => { asked.push(path); return answer(); },
+    addDetail: (text) => { details.push(text); },
+    render: () => { renders += 1; },
+  });
+  assert.deepStrictEqual([resume.allowed(), resume.conversationId(), resume.last()], [false, null, blankResumeLast()]);
+  assert.deepStrictEqual([resume.wanted(), resume.armed(), resume.note()], [false, false, "the agent starts fresh"]);
+  // Off: nothing is asked of the server, and the screen is told.
+  assert.equal(await resume.fetchPayload(), null);
+  assert.deepStrictEqual([asked, renders, resume.last()], [[], 1, blankResumeLast()]);
+  resume.setAllowed(true);
+  resume.persist(true);
+  assert.equal(stored.get("resume-key"), "on");
+  resume.setConversationId("conv a/b");
+  assert.deepStrictEqual([resume.wanted(), resume.armed(), resume.note()], [true, true, "the earlier conversation is replayed"]);
+  // Armed: the payload is answered, and the outcome says it went.
+  const payload = await resume.fetchPayload();
+  assert.deepStrictEqual(asked, ["/api/v1/conversations/conv%20a%2Fb/replay"]);
+  assert.equal(payload.text, "earlier");
+  assert.deepStrictEqual(resume.last(), { ...blankResumeLast(), attempted: true, armed: true, words: 42 });
+  // A conversation too long to send any of is not an empty one.
+  answer = async () => ({ enabled: true, included: 0, dropped: 5, text: "" });
+  assert.equal(await resume.fetchPayload(), null);
+  assert.deepStrictEqual(resume.last(), { ...blankResumeLast(), attempted: true, dropped: 5 });
+  assert.equal(resume.note(), "the agent starts fresh — the earlier conversation was too long to replay");
+  answer = async () => ({ enabled: true, included: 0, dropped: 0, text: "" });
+  assert.equal(await resume.fetchPayload(), null);
+  assert.equal(resume.note(), "the agent starts fresh — there was nothing to replay");
+  // A failed read degrades to a fresh call, said in the connection details and never thrown.
+  answer = async () => { throw new Error("offline"); };
+  assert.equal(await resume.fetchPayload(), null);
+  assert.deepStrictEqual(details, ["the earlier conversation could not be replayed: offline"]);
+  assert.deepStrictEqual([resume.armed(), resume.note()], [false, "the agent starts fresh — the earlier conversation could not be read"]);
+  assert.equal(renders, 5, "an attempt's outcome was not shown, or was shown twice");
+  // What a bridge did with the last one, set by the call.
+  resume.setLast({ ...blankResumeLast(), attempted: true, armed: true, dropped: 2, unsent: true });
+  assert.equal(resume.note(), "the earlier conversation is replayed in part");
+  resume.setLast({ ...blankResumeLast(), attempted: true, refused: true });
+  assert.equal(resume.note(), "the agent starts fresh — the voice service took no recap");
+  // A storage that refuses the write: not remembered, and never thrown at the switch.
+  storage.setItem = () => { throw new Error("QuotaExceededError"); };
+  assert.doesNotThrow(() => resume.persist(false));
+  assert.equal(resume.wanted(), true, "a refused write changed what is kept");
+  assert.notEqual(blankResumeLast(), blankResumeLast(), "a blank outcome is shared, so one attempt's marks reach the next");
+});

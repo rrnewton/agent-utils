@@ -33,3 +33,11 @@ export {
   clampReadSpeed,
   clampReadingWidth,
 } from "./bounds.ts";
+export { createCardMaxLines, createCollapsedLines, createQuoteReadPercent } from "./messagelimits.ts";
+export type { CardMaxLines, CardMaxLinesDependencies, CollapsedLines, MessageLimitDependencies, QuoteReadPercent } from "./messagelimits.ts";
+export { createInAppLinks } from "./inapplinks.ts";
+export type { InAppLinks, InAppLinksDependencies } from "./inapplinks.ts";
+export { createEnterSends, createSingleKeys } from "./keychoices.ts";
+export type { EnterSends, KeyChoiceDependencies, SingleKeys } from "./keychoices.ts";
+export { createKeptSwitch } from "./switches.ts";
+export type { KeptSwitch, KeptSwitchDependencies } from "./switches.ts";

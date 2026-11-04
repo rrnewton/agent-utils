@@ -42,3 +42,5 @@ export { createScreenIdentity } from "./screenidentity.ts";
 export type { ScreenIdentity } from "./screenidentity.ts";
 export { createAwayClock } from "./away.ts";
 export type { AwayClock } from "./away.ts";
+export { createWatchAll } from "./watchall.ts";
+export type { Abortable, WatchAll, WatchAllDependencies } from "./watchall.ts";

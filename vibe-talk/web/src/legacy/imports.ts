@@ -28,7 +28,6 @@ export { anchorOfMessage, createBookmarkUndo, createBookmarkWrites, createBookma
 export { REOPENED_VIEWS, UI_STATE_CHARS, UI_STATE_KEY, UI_STATE_VERSION, createBackStack, createDeepLinks, createLayoutChoice, createLinkJumps, createNavigation, createUiState, createViewPlaces, createVisits, deepLinkQuery, visitKey } from "../core/navigation/index.ts";
 export {
   DISCORD_POLL_MS,
-  LIVE_RETRY_MS,
   STALE_AS_OF_MS,
   TIMELINE_DELTA_PAGES,
   TIMELINE_RECONCILE_MS,
@@ -49,9 +48,9 @@ export {
   createScreenIdentity,
   createStandInRetries,
   createStreamGeneration,
+  createWatchAll,
   deltaCursor,
   isCursorRefusal,
-  readEventStream as readEventFrames,
   staleAsOf as syncStaleAsOf,
 } from "../core/sync/index.ts";
 export {
@@ -82,7 +81,7 @@ export {
   unsentText,
   waitingItsTurn as outboxWaitingItsTurn,
 } from "../core/outbox/index.ts";
-export { DEFAULT_CARD_MAX_LINES, DEFAULT_COLLAPSED_LINES, DEFAULT_QUOTE_READ_PERCENT, DEVICE_SETTINGS, IDENTITY_KEY, MAX_COLLAPSED_LINES, MIN_COLLAPSED_LINES, clampCardMaxLines, clampCollapsedLines, clampQuoteReadPercent, createCredentials, createDeviceSettings, createSettingsSync } from "../core/settings/index.ts";
+export { DEFAULT_CARD_MAX_LINES, DEFAULT_COLLAPSED_LINES, DEVICE_SETTINGS, IDENTITY_KEY, MAX_COLLAPSED_LINES, MIN_COLLAPSED_LINES, createCardMaxLines, createCollapsedLines, createCredentials, createDeviceSettings, createEnterSends, createInAppLinks, createKeptSwitch, createQuoteReadPercent, createSettingsSync, createSingleKeys } from "../core/settings/index.ts";
 export { createWebPorts } from "../platform/web/index.ts";
 export {
   answersEnter,
@@ -107,7 +106,7 @@ export {
   shownNode,
   tagNameOf,
 } from "../view/dom/index.ts";
-export { MAC_FIELD_EDIT_LETTERS, SCREENS, chordMatches, createActionMenu, createChannelPick, createChipsOverComposer, createRowShortcuts, createScreens, createShellNotices, createUndoOffer, createUndoStamps, modHeld, swallow, typedKey, typesCharacter } from "../view/shell/index.ts";
+export { MAC_FIELD_EDIT_LETTERS, SCREENS, chordMatches, createActionMenu, createChannelPick, createChipsOverComposer, createPromptsTray, createReplySight, createRowShortcuts, createScreens, createShellNotices, createUndoOffer, createUndoStamps, modHeld, swallow, typedKey, typesCharacter } from "../view/shell/index.ts";
 export {
   COMPOSER_FIELDS,
   COMPOSER_GROW_BOXES,
@@ -142,4 +141,5 @@ export const VibeTalkContract = Object.freeze({ roots, is, decode, decodeTagged 
 export { createReadAloud, createReadingJump, createVoiceCall, createVoiceTranscript } from "../view/voice/index.ts";
 
 export { HELP_TOPICS } from "../present/settings/index.ts";
-export { CANNED_PROMPTS, MIC_TOGGLES, mountAgentPrefix, mountAgentSettings, mountAudioDevices, mountBarPlacement, mountCannedPrompts, mountChannelDirectory, mountChannelHistory, mountChannelSettings, mountConnectionReadouts, mountDismissedSends, mountHelpFolds, mountIdentityList, mountMessagePreferences, mountMicrophoneSettings, mountNoiseRules, mountOwnReadApply, mountPairing, mountReadingWidth, mountResumePreference, mountServerCache, mountSettingsFolds, mountSettingsReadouts, mountSettingsSyncView, mountTextSize, mountUpstreamClear } from "../view/settings/index.ts";
+export { CANNED_PROMPTS, MIC_TOGGLES, mountAgentPrefix, mountAgentSettings, mountAudioDevices, mountBarPlacement, mountCannedPrompts, mountChannelDirectory, mountChannelHistory, mountChannelSettings, mountConnectionReadouts, mountDismissedSends, mountHelpFolds, mountIdentityList, mountMessagePreferences, mountMicrophoneSettings, mountNoiseRules, mountOwnReadApply, mountPairing, mountReadingWidth, mountResumePreference, mountSaveTokenButton, mountServerCache, mountSettingsFolds, mountSettingsReadouts, mountSettingsSyncView, mountTextSize, mountUpstreamClear } from "../view/settings/index.ts";
+export { blankResumeLast, createAudioRoute, createCallResume, createVoiceProvider } from "../core/call/index.ts";

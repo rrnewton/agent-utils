@@ -2984,7 +2984,7 @@ def _act_resume_partial(driver: Driver) -> None:
     replay and lands on the idle pane, where the clause under the large control has to say "in
     part" rather than "replayed".
 
-    A whole call first, because `resumeConversationId` comes from the store: the page learns which
+    A whole call first, because the conversation to resume comes from the store: the page learns which
     conversation a new call would resume from by restoring the most recent one, and a scene that
     assumed an earlier scene had left one behind would fail differently depending on `--only`.
     """

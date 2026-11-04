@@ -2,9 +2,10 @@
 // voice-page-modularity`, moved from the legacy script into core/search). The one owner of a search
 // sent to the server: the search key it answers, its ticket (so a late answer to an old search is
 // dropped), what it found, which channels it covered, how much it examined and where the next page
-// resumes. When the search text changes it waits `SERVER_SEARCH_DELAY_MS` before asking, so typing
-// sends one request, not one per key. Which search the page is showing, the request itself and
-// drawing what came back are the page's, passed in.
+// resumes, and whether it covers every channel the server answers for or only the one on screen
+// (`#search-all-channels`, for the page's life). When the search text changes it waits
+// `SERVER_SEARCH_DELAY_MS` before asking, so typing sends one request, not one per key. Which search
+// the page is showing, the request itself and drawing what came back are the page's, passed in.
 
 import type { Message, SearchResponse, SearchScope } from "../../contract/index.ts";
 import type { ClockPort, TimerHandle } from "../../ports/index.ts";
@@ -59,6 +60,13 @@ export interface ServerSearch {
   more(): Promise<void>;
   /** Forget which search this answers, so the next `schedule` starts it afresh (the copy it searched grew). */
   forget(): void;
+  /** Whether the search covers every channel the server answers for, not only the one on screen. Off at first. */
+  allChannels(): boolean;
+  /**
+   * All channels ticked or unticked, as `Boolean(on)` says; kept for the page's life, whatever is searched.
+   * Nothing is drawn or asked: the page schedules its search again.
+   */
+  chooseAllChannels(on: unknown): void;
 }
 
 /** Nothing searched yet. */
@@ -67,6 +75,8 @@ export function createServerSearch(deps: ServerSearchDependencies): ServerSearch
     key: "", ticket: 0, loading: false, failed: "", hits: [], scopes: [], examined: 0, resume: null,
   };
   let serverSearchTimer: TimerHandle | null = null;
+  /** Whether the search covers every channel (`#search-all-channels`). */
+  let searchAllChannels = false;
 
   async function run(more: boolean): Promise<void> {
     const state = serverSearch;
@@ -118,6 +128,10 @@ export function createServerSearch(deps: ServerSearchDependencies): ServerSearch
     run,
     forget() {
       serverSearch.key = "";
+    },
+    allChannels: () => searchAllChannels,
+    chooseAllChannels(on) {
+      searchAllChannels = Boolean(on);
     },
     more() {
       if (serverSearch.resume === null || serverSearch.loading) return Promise.resolve();

@@ -52,7 +52,6 @@ export interface VoiceCallDependencies {
   guardQuietly: (fn: unknown) => (...args: unknown[]) => Promise<unknown>;
   conversationalVoice: { name: string; settings_url: unknown; instance_id: unknown; };
   setState: (name: unknown) => void;
-  voicePromptForCall: unknown;
   startAwaitingAnswer: { conversationId: string; start: { recap: unknown; previous_end?: string; }; } | null;
   fetchResume: () => Promise<Resume | null>;
   showDetail: (text: unknown) => void;
@@ -1802,6 +1801,13 @@ async function start(options?: { chat?: boolean; }) {
 }
 
 
+/**
+ * What the voice session asked this page to hand the agent of the call being opened, or null (`#272
+ * voice-agent-instructions`). Moved here from the legacy script (`#624 voice-page-modularity`): only the
+ * call reads and writes it.
+ */
+let voicePromptForCall: unknown = null;
+
 /** `start()`'s body, run only while it holds `startInFlight`. */
 async function openConversation(options: {chat?: boolean} | undefined) {
   const chat = Boolean(options && options.chat);
@@ -1828,7 +1834,7 @@ async function openConversation(options: {chat?: boolean} | undefined) {
   session.providerName = String(minted.provider || deps.conversationalVoice.name);
   session.inputRate = minted.input_sample_rate || 16000;
   session.outputRate = minted.output_sample_rate || 16000;
-  deps.voicePromptForCall = minted.agent_prompt || null; // `#272 voice-agent-instructions`
+  voicePromptForCall = minted.agent_prompt || null; // `#272 voice-agent-instructions`
   session.lastTranscriptKey = null;
   session.liveTurns = new Map();
   session.noTextRows = new Map();
@@ -2061,7 +2067,7 @@ function wireCallSocket(socket: WebSocket, socketUrl: string, resume: Resume | n
       initiation.conversation_config_override = { conversation: { text_only: true } };
     }
     // `#272 voice-agent-instructions`. The owner's words, in the form the server chose.
-    const handed = deps.handOverAgentPrompt(initiation, deps.voicePromptForCall);
+    const handed = deps.handOverAgentPrompt(initiation, voicePromptForCall);
     socket.send(JSON.stringify(initiation));
     if (handed.note) {
       socket.send(JSON.stringify(handed.note));

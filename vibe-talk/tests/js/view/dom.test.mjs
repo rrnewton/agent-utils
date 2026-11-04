@@ -355,3 +355,33 @@ test("chords: Ctrl and Cmd alike, letters by place only off ASCII, digits and br
   assert.equal(MAC_FIELD_EDIT_LETTERS.includes("k"), true);
   assert.equal(MAC_FIELD_EDIT_LETTERS.includes("s"), false, "Ctrl+S is the page's on a Mac too");
 });
+
+test("`#846 draft-chip-honest`, `#624 voice-page-modularity`: the reply's last sight is kept by each drawing of the chip, and a frame redraws only when the reply crosses its list's edge", () => {
+  const { createReplySight } = VIEW_SHELL;
+  const sight = createReplySight();
+  assert.equal(sight.crossed(false), false, "out of sight at first: nothing to redraw");
+  assert.equal(sight.crossed(true), true, "it came into sight");
+  assert.equal(sight.crossed(true), false, "still in sight is no crossing");
+  sight.keep(false);
+  assert.equal(sight.crossed(false), false, "a drawing kept it out of sight");
+  assert.equal(sight.crossed(true), true);
+});
+
+test("`#624 voice-page-modularity`: the prompts tray is shut until opened, and says so on its opener and the tray together", () => {
+  const { createPromptsTray } = VIEW_SHELL;
+  const node = (hidden) => ({ hidden, attributes: {}, setAttribute(name, value) { this.attributes[name] = value; } });
+  const nodes = { "prompts-tray": node(true), "prompts-open": node(false) };
+  let changes = 0;
+  const tray = createPromptsTray({ byId: (id) => nodes[id], changed: () => { changes += 1; } });
+  assert.deepStrictEqual([tray.open(), changes], [false, 0], "a new tray was open, or said something before it was asked");
+  tray.setOpen(true);
+  assert.deepStrictEqual([tray.open(), nodes["prompts-tray"].hidden, nodes["prompts-open"].attributes["aria-expanded"], changes],
+    [true, false, "true", 1]);
+  tray.setOpen("yes");
+  assert.equal(tray.open(), false, "something other than true opened the tray");
+  assert.deepStrictEqual([nodes["prompts-tray"].hidden, nodes["prompts-open"].attributes["aria-expanded"], changes], [true, "false", 2],
+    "the tray and its opener came apart, or the back gesture was not told");
+  const other = createPromptsTray({ byId: (id) => nodes[id], changed: () => {} });
+  tray.setOpen(true);
+  assert.equal(other.open(), false, "two trays share their state");
+});

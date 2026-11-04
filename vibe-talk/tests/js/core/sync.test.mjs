@@ -531,3 +531,142 @@ test("away clock: the first hide counts, coming back says how long and starts ov
   assert.equal(clock.show(6000), 5000, "a second hide keeps the first time");
   assert.equal(clock.show(9000), 0, "the clock starts over once visible");
 });
+
+test("`#624 voice-page-modularity`: the stream of every channel attaches, resumes from its cursor, starts again at once after a reset, lets its attach go, and asks a server without it once", async () => {
+  const { createWatchAll, LIVE_RETRY_MS } = SYNC;
+  const timers = new Map();
+  let next = 0;
+  const clock = {
+    setTimeout: (run, ms) => { next += 1; timers.set(next, { run, ms }); return next; },
+    clearTimeout: (handle) => timers.delete(handle),
+  };
+  const fire = (ms) => {
+    for (const [handle, timer] of [...timers]) if (timer.ms === ms) { timers.delete(handle); timer.run(); }
+  };
+  const opened = [];
+  const said = [];
+  const frames = [];
+  const aborted = [];
+  let handles = 0;
+  let token = "t0k";
+  let delivery = "push";
+  let chunks = [];
+  let respond = null;
+  const watch = createWatchAll({
+    clock,
+    token: () => token,
+    delivery: () => delivery,
+    abortable: () => {
+      handles += 1;
+      const id = handles;
+      return { id, abort: () => aborted.push(id) };
+    },
+    open: (path, headers, abort) => {
+      opened.push([path, { ...headers }, abort ? abort.id : null]);
+      return new Promise((resolve) => { respond = resolve; });
+    },
+    decoder: () => ({ decode: (bytes) => (bytes === undefined ? "" : String(bytes)) }),
+    frame: (frame) => {
+      frames.push(frame.event);
+      return frame.event === "reset" ? "reset" : undefined;
+    },
+    dropped: (why) => said.push(`dropped: ${why}`),
+    unsupported: () => said.push("unsupported"),
+    guard: (run) => { run().catch((error) => said.push(`threw: ${error.message}`)); },
+  });
+  const settle = () => new Promise((resolve) => setImmediate(resolve));
+  const body = () => {
+    const queue = chunks;
+    let release;
+    const ended = new Promise((resolve) => { release = resolve; });
+    return {
+      release,
+      response: { ok: true, status: 200, body: { getReader: () => ({
+        read: async () => (queue.length ? { done: false, value: queue.shift() } : (await ended, { done: true })),
+      }) } },
+    };
+  };
+  // Off on the server, or no credential: nothing is asked for.
+  delivery = "off";
+  watch.start();
+  token = "";
+  delivery = "push";
+  watch.start();
+  assert.equal(opened.length, 0, "the stream of every channel was asked for with nothing to deliver or no credential");
+  token = "t0k";
+  // A call's first attach resumes from nothing, and is not attached until the body opens.
+  watch.start();
+  assert.deepStrictEqual(opened[0], ["/api/v1/live/stream", { Authorization: "Bearer t0k" }, 1]);
+  assert.equal(watch.attached(), false);
+  chunks = ["id: w.7\nevent: message\ndata: {}\n\n"];
+  const first = body();
+  respond(first.response);
+  await settle();
+  assert.deepStrictEqual([watch.attached(), watch.resumed(), frames], [true, false, ["message"]]);
+  // It ends: not attached, and the retry after LIVE_RETRY_MS resumes from the cursor.
+  first.release();
+  await settle();
+  assert.equal(watch.attached(), false);
+  assert.equal(opened.length, 1, "a dropped stream was asked for again before the retry delay");
+  fire(LIVE_RETRY_MS);
+  await settle();
+  assert.deepStrictEqual(opened[1][1], { Authorization: "Bearer t0k", "Last-Event-ID": "w.7" });
+  chunks = ["event: reset\ndata:\n\n"];
+  const second = body();
+  respond(second.response);
+  await settle();
+  assert.equal(watch.resumed(), true, "an attach from a cursor was not said to have resumed");
+  // A reset: the stream starts again at once, from now, not over the gap.
+  second.release();
+  await settle();
+  assert.equal(opened.length, 3, "a reset waited out the retry delay");
+  assert.deepStrictEqual(opened[2][1], { Authorization: "Bearer t0k" }, "a reset kept the cursor");
+  // The call ends: the attach now open is let go, and what it answers later reaches nothing.
+  watch.stop();
+  assert.deepStrictEqual(aborted, [3]);
+  assert.equal(watch.attached(), false);
+  respond({ ok: false, status: 503, body: null });
+  await settle();
+  fire(LIVE_RETRY_MS);
+  await settle();
+  assert.equal(opened.length, 3, "a stopped stream was asked for again");
+  assert.deepStrictEqual(said, [], "a stopped stream's answer was reported");
+  // A refusal is reported and retried; a new call starts from no cursor.
+  watch.start();
+  assert.deepStrictEqual(opened[3][1], { Authorization: "Bearer t0k" }, "a new call resumed the last call's stream");
+  respond({ ok: false, status: 503, body: null });
+  await settle();
+  assert.deepStrictEqual(said, ["dropped: it was refused (HTTP 503)"]);
+  fire(LIVE_RETRY_MS);
+  await settle();
+  assert.equal(opened.length, 5);
+  // A server without it answers 404 once, and is not asked again, by a retry or by the next call.
+  respond({ ok: false, status: 404, body: null });
+  await settle();
+  assert.deepStrictEqual(said.slice(1), ["unsupported"]);
+  fire(LIVE_RETRY_MS);
+  watch.start();
+  await settle();
+  assert.equal(opened.length, 5, "a server that said 404 was asked again");
+  assert.deepStrictEqual(aborted, [3, 5], "a start did not let the last attach go first");
+  // Where the browser has no way to let an attach go, it is asked for without one, and stopping is quiet.
+  const plain = [];
+  const bare = createWatchAll({
+    clock,
+    token: () => "t0k",
+    delivery: () => "push",
+    abortable: () => null,
+    open: (path, headers, abort) => {
+      plain.push(abort);
+      return new Promise(() => {});
+    },
+    decoder: () => ({ decode: () => "" }),
+    frame: () => undefined,
+    dropped: () => {},
+    unsupported: () => {},
+    guard: (run) => { run().catch(() => {}); },
+  });
+  bare.start();
+  bare.stop();
+  assert.deepStrictEqual(plain, [null]);
+});

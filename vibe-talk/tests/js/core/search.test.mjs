@@ -273,3 +273,26 @@ test("`#624 voice-page-modularity`: opened runs are held per view and among the 
   assert.equal(gaps.cards("k2", false), null, "another key forgets the cards'");
   assert.equal(gaps.cards("k1", false), null);
 });
+
+test("`#624 voice-page-modularity`: the server search covers the channel on screen until All channels is ticked, for the page's life, and ticking it asks nothing itself", () => {
+  const { createServerSearch } = SEARCH;
+  const clock = testClock();
+  let renders = 0;
+  const asked = [];
+  const owner = createServerSearch({
+    clock,
+    pathFor: () => "/search",
+    fetchAnswer: (path) => { asked.push(path); return Promise.resolve({ hits: [], scopes: [], resume_below_ms: null }); },
+    render: () => { renders += 1; },
+    guard: (fn) => { fn(); },
+  });
+  assert.equal(owner.allChannels(), false, "the channel on screen alone, at first");
+  owner.chooseAllChannels(1);
+  assert.equal(owner.allChannels(), true);
+  assert.deepStrictEqual([renders, clock.timers.size, asked.length], [0, 0, 0], "ticking it drew or asked on its own");
+  owner.schedule("k", true);
+  owner.forget();
+  assert.equal(owner.allChannels(), true, "a new search, or a forgotten one, dropped the choice");
+  owner.chooseAllChannels("");
+  assert.equal(owner.allChannels(), false);
+});

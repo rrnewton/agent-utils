@@ -405,7 +405,7 @@ test("a body the server rendered is counted by the words it shows, a link by its
   })]);
   assert.equal(rows[0].getAttribute("data-collapsed"), "true", "the rendered message did not fold");
   // Spread into this realm's arrays: the page's run in a context of their own.
-  const labels = (text) => [...PRESENT_ROWS.elisionLabels(text, page.pure("collapsedLines"))];
+  const labels = (text) => [...PRESENT_ROWS.elisionLabels(text, page.pure("collapsedLines.current()"))];
   const shown = labels(`${words} the run log`);
   assert.deepStrictEqual(FOLD_WIDTHS_EM.map((_width, at) => labelAt(rows[0], at)), shown,
     "the rendered body is not counted by the words on the screen");
@@ -425,7 +425,7 @@ test("A RICH HEADER'S ROW counts its text without the words the header restates,
     message({ id: "7440000000000000602", content: `${lead}${rest}` }),
   ]);
   assert.ok(textOfRow(rows[0]).children[0].hasAttribute("data-rh"), "the fixture's heading was not shown");
-  const labels = (text) => [...PRESENT_ROWS.elisionLabels(text, page.pure("collapsedLines"))];
+  const labels = (text) => [...PRESENT_ROWS.elisionLabels(text, page.pure("collapsedLines.current()"))];
   assert.deepStrictEqual(FOLD_WIDTHS_EM.map((_width, at) => labelAt(rows[0], at, "on")), labels(rest),
     "with the header showing, the row is not counted by the text under it");
   assert.deepStrictEqual(FOLD_WIDTHS_EM.map((_width, at) => labelAt(rows[0], at, "off")), labels(`${lead}${rest}`),
@@ -526,7 +526,7 @@ test("WHAT THE MODEL HAS NO RULE FOR GETS NO LABEL, and every element the server
   odd.append(page.document.createTextNode(wordsOfLength(200, 4)));
   body.append(odd);
   assert.equal(VIEW_CHANNEL.foldRuns(body), null, "an element with no rule was laid out from a guess");
-  assert.deepStrictEqual([...PRESENT_ROWS.elisionLabels(null, page.pure("collapsedLines"))], FOLD_WIDTHS_EM.map(() => ""));
+  assert.deepStrictEqual([...PRESENT_ROWS.elisionLabels(null, page.pure("collapsedLines.current()"))], FOLD_WIDTHS_EM.map(() => ""));
 });
 
 test("A CHARACTER OF A WIDE SCRIPT IS A PLACE A LINE BREAKS: Chinese after a word fills the line it starts on (#244)", async () => {

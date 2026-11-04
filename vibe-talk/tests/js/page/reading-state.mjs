@@ -5402,7 +5402,7 @@ test("`#728 vt-quote-read-threshold`: a reply quoting under 5% of a message leav
 
   // THE CONTROL: every reply marking what it answers, the one-sentence quote marks the message.
   const control = await longMessagePage(new Map(), brokenScript(
-    "  return quoteMarksRead(quoteShare(text, rawTextOf(target)), quoteReadPercent) ? String(target.id) : null;",
+    "  return quoteMarksRead(quoteShare(text, rawTextOf(target)), quoteReadPercent.current()) ? String(target.id) : null;",
     "  return String(target.id);"));
   await replyAndSend(control, LONG_ID, one);
   assert.deepStrictEqual(control.dismissCalls, [{ messages: [LONG_ID] }],

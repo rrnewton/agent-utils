@@ -3050,7 +3050,8 @@ test("`#388 thread-header-collapse`: the fold is kept on the device — a reload
   assert.deepStrictEqual(await reopened("off"), { right: [false, "true"], wide: [false, "true"] });
   assert.deepStrictEqual(await reopened(null), { right: [false, "true"], wide: [false, "true"] }, "with nothing kept the card is folded");
   // The control: a page that reads nothing kept draws the card open after the reload.
-  const forgot = await reopened("on", brokenScript("return deviceSettings().get(DEVICE_SETTINGS.threadCardFolded);", "return false;"));
+  const forgot = await reopened("on", brokenScript("  setting: DEVICE_SETTINGS.threadCardFolded,\n",
+    "  setting: { ...DEVICE_SETTINGS.threadCardFolded, read: () => false },\n"));
   assert.deepStrictEqual(forgot.right, [false, "true"], "the negative control kept the fold too, so the check above proves nothing");
   // Across the window: a thread from the picker, the card read from the same choice.
   const page = await threadPage("main");

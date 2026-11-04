@@ -177,3 +177,146 @@ test("`#728 vt-quote-read-threshold`: the share a quote must cover is whole perc
   assert.equal(setting.refused.value, 5);
   assert.ok(SYNCED_SETTING_KEYS.includes(setting.key));
 });
+
+test("`#624 voice-page-modularity`: the message limits in force start at their defaults, apply clamped, draw what they apply, and keep only through persist", () => {
+  const { createCardMaxLines, createCollapsedLines, createDeviceSettings, createQuoteReadPercent } = SETTINGS;
+  const kept = new Map();
+  const device = createDeviceSettings({ getItem: (k) => kept.get(k) ?? null, setItem: (k, v) => kept.set(k, v), removeItem: (k) => kept.delete(k) });
+  const refused = () => { throw new Error("SecurityError"); };
+  const off = createDeviceSettings({ getItem: refused, setItem: refused, removeItem: refused });
+  // A browser that accepts a write and keeps nothing: only the read-back can tell.
+  const forgetful = createDeviceSettings({ getItem: () => null, setItem: () => {}, removeItem: () => {} });
+  const drawn = [];
+
+  // `#425 collapsed-lines`.
+  const lines = createCollapsedLines({ deviceSettings: () => device, render: (n) => drawn.push(["lines", n]) });
+  assert.deepStrictEqual([lines.current(), lines.stored()], [3, 3], "the default, and nothing kept reads as it");
+  assert.deepStrictEqual(drawn, [], "nothing is drawn until the page applies a count");
+  assert.equal(lines.apply("99"), 8, "the count applied is the clamped one");
+  assert.deepStrictEqual([lines.current(), drawn, kept.size], [8, [["lines", 8]], 0], "applying draws the count and keeps nothing");
+  assert.equal(lines.persist(8), true);
+  assert.deepStrictEqual([kept.get("vibe-talk.voice.collapsed-lines"), lines.stored()], ["8", 8]);
+  assert.equal(createCollapsedLines({ deviceSettings: () => forgetful, render: () => {} }).persist(5), false, "a write kept nowhere was taken as kept");
+  assert.equal(createCollapsedLines({ deviceSettings: () => off, render: () => {} }).persist(5), false, "a refused write was taken as kept");
+
+  // `#522 thread-card-max-lines`: K, and the cards drawn again only when it changes.
+  const redrawn = [];
+  const cards = createCardMaxLines({ deviceSettings: () => device, render: (n) => drawn.push(["cards", n]), redraw: () => redrawn.push(cards.current()) });
+  assert.equal(cards.current(), 5);
+  assert.equal(cards.apply(5), 5);
+  assert.deepStrictEqual(redrawn, [], "the K already in force drew the cards again");
+  assert.equal(cards.apply(0), 1, "K applied is the clamped one");
+  assert.deepStrictEqual(redrawn, [1], "a changed K draws the cards again, once it is in force");
+  assert.equal(cards.apply(7, false), 7);
+  assert.deepStrictEqual([cards.current(), redrawn], [7, [1]], "at load K is put on and nothing is drawn again");
+  assert.deepStrictEqual(drawn.filter(([what]) => what === "cards").map(([, n]) => n), [5, 1, 7], "every K applied is drawn");
+  assert.equal(kept.has("vibe-talk.voice.thread-card-max-lines"), false, "applying K kept it");
+  assert.equal(cards.persist(7), true);
+  assert.deepStrictEqual([kept.get("vibe-talk.voice.thread-card-max-lines"), cards.stored()], ["7", 7]);
+  assert.equal(createCardMaxLines({ deviceSettings: () => off, render: () => {}, redraw: () => {} }).stored(), 5, "a refused read is the default");
+  assert.equal(createCardMaxLines({ deviceSettings: () => off, render: () => {}, redraw: () => {} }).persist(5), false);
+
+  // `#728 vt-quote-read-threshold`.
+  const share = createQuoteReadPercent({ deviceSettings: () => device, render: (n) => drawn.push(["share", n]) });
+  assert.deepStrictEqual([share.current(), share.stored()], [5, 5]);
+  assert.equal(share.apply(250), 100, "the share applied is the clamped one");
+  assert.equal(share.apply("x"), 5, "a share that is not a number is the default");
+  assert.deepStrictEqual([share.current(), drawn.filter(([what]) => what === "share").map(([, n]) => n)], [5, [100, 5]]);
+  assert.equal(kept.has("vibe-talk.voice.quote-read-percent"), false, "applying the share kept it: keeping is Settings'");
+  kept.set("vibe-talk.voice.quote-read-percent", "40");
+  assert.equal(share.stored(), 40);
+  assert.equal(createQuoteReadPercent({ deviceSettings: () => off, render: () => {} }).stored(), 5, "a refused read is the default");
+
+  // Two owners hold two values.
+  const other = createCollapsedLines({ deviceSettings: () => device, render: () => {} });
+  assert.deepStrictEqual([other.current(), lines.current()], [3, 8], "a second owner shares the first one's count");
+});
+
+test("`#624 voice-page-modularity`: Message links, Enter to send and the single-key shortcuts are on until turned off, kept as they are turned, and honoured where storage is refused", () => {
+  const { createDeviceSettings, createEnterSends, createInAppLinks, createSingleKeys } = SETTINGS;
+  const kept = new Map();
+  const device = createDeviceSettings({ getItem: (k) => kept.get(k) ?? null, setItem: (k, v) => kept.set(k, v), removeItem: (k) => kept.delete(k) });
+  const refused = () => { throw new Error("SecurityError"); };
+  const off = createDeviceSettings({ getItem: refused, setItem: refused, removeItem: refused });
+  const said = [];
+
+  // `#543 in-app-message-links`: drawn, then kept.
+  const LINKS = "vibe-talk.voice.in-app-links";
+  const links = createInAppLinks({ deviceSettings: () => device, render: (on) => said.push(["links", on, kept.get(LINKS) ?? null]) });
+  assert.deepStrictEqual([links.current(), links.stored(), said], [true, true, []], "absent means on, and nothing is drawn yet");
+  links.apply(0);
+  assert.deepStrictEqual([links.current(), said, kept.get(LINKS), links.stored()], [false, [["links", false, null]], "0", false],
+    "the switch is drawn before it is kept, and kept as turned");
+
+  // `#225 enter-to-send`: kept, then said.
+  const ENTER = "vibe-talk.voice.enter-sends";
+  const enter = createEnterSends({ deviceSettings: () => device, render: () => said.push(["enter", enter.current(), kept.get(ENTER) ?? null]) });
+  assert.equal(enter.current(), true);
+  enter.apply("");
+  assert.deepStrictEqual([said.at(-1), enter.stored()], [["enter", false, "0"], false], "Enter to send is kept, then said");
+  enter.apply(true);
+  assert.deepStrictEqual([said.at(-1), enter.stored()], [["enter", true, "1"], true]);
+
+  // `#224 keyboard-shortcuts`: kept, then the keys said; restored at load without either.
+  const KEYS = "vibe-talk.voice.single-keys";
+  const keys = createSingleKeys({ deviceSettings: () => device, render: () => said.push(["keys", keys.current(), kept.get(KEYS) ?? null]) });
+  keys.apply(false);
+  assert.deepStrictEqual([said.at(-1), keys.stored()], [["keys", false, "0"], false], "the switch is kept, then the keys said");
+  const fresh = createSingleKeys({ deviceSettings: () => device, render: () => said.push(["restored"]) });
+  assert.equal(fresh.current(), true, "on until restored");
+  const before = said.length;
+  fresh.restore();
+  assert.deepStrictEqual([fresh.current(), said.length, kept.get(KEYS)], [false, before, "0"], "restoring takes what was kept, and neither says nor keeps it");
+
+  // Storage refused: each choice still holds for the session.
+  const offLinks = createInAppLinks({ deviceSettings: () => off, render: () => {} });
+  const offEnter = createEnterSends({ deviceSettings: () => off, render: () => {} });
+  const offKeys = createSingleKeys({ deviceSettings: () => off, render: () => {} });
+  offLinks.apply(false);
+  offEnter.apply(false);
+  offKeys.apply(false);
+  assert.deepStrictEqual([offLinks.current(), offEnter.current(), offKeys.current()], [false, false, false],
+    "a browser that refuses storage did not honour the choice for the session");
+  offKeys.restore();
+  assert.equal(offKeys.current(), true, "a refused read of the single keys is on");
+  assert.throws(() => offLinks.stored(), /SecurityError/, "a refused read of Message links was swallowed, which its reader never did");
+  assert.throws(() => offEnter.stored(), /SecurityError/, "a refused read of Enter to send was swallowed, which its reader never did");
+});
+
+test("`#624 voice-page-modularity`: a switch kept on the device is on at first or as kept, drawn before it is kept, and holds for the session where storage is refused", () => {
+  const { createKeptSwitch, createDeviceSettings, DEVICE_SETTINGS } = SETTINGS;
+  const kept = new Map();
+  const device = createDeviceSettings({ getItem: (k) => kept.get(k) ?? null, setItem: (k, v) => kept.set(k, v), removeItem: (k) => kept.delete(k) });
+  const seen = [];
+  const combine = createKeptSwitch({ setting: DEVICE_SETTINGS.combineMessages, deviceSettings: () => device, initial: true,
+    render: (on) => seen.push([on, kept.get("vibe-talk.voice.combine") ?? null]) });
+  assert.equal(combine.on(), true);
+  assert.deepStrictEqual([seen, kept.size], [[], 0], "made, it drew and kept nothing");
+  assert.equal(combine.stored(), true, "absent means on");
+  combine.apply(0);
+  assert.equal(combine.on(), false);
+  assert.deepStrictEqual(seen, [[false, null]], "it was not drawn before it was kept");
+  assert.deepStrictEqual([kept.get("vibe-talk.voice.combine"), combine.stored()], ["0", false]);
+  combine.apply("yes");
+  assert.deepStrictEqual([combine.on(), kept.get("vibe-talk.voice.combine")], [true, "1"]);
+  // With no first value: what the device keeps, read once as it is made. Set and keep are apart.
+  kept.set("vibe-talk.voice.threads-main", "on");
+  let reads = 0;
+  const main = createKeptSwitch({ setting: DEVICE_SETTINGS.threadsMain, deviceSettings: () => { reads += 1; return device; } });
+  assert.deepStrictEqual([main.on(), reads], [true, 1]);
+  main.set(false);
+  assert.deepStrictEqual([main.on(), kept.get("vibe-talk.voice.threads-main")], [false, "on"], "set kept something");
+  main.keep(false);
+  assert.equal(kept.get("vibe-talk.voice.threads-main"), "off");
+  // A refusing device: the choice holds for the session, and the stored read is the setting's to answer.
+  const refused = () => { throw new Error("SecurityError"); };
+  const off = createDeviceSettings({ getItem: refused, setItem: refused, removeItem: refused });
+  const own = createKeptSwitch({ setting: DEVICE_SETTINGS.markOwnRead, deviceSettings: () => off, initial: true, render: () => {} });
+  own.apply(false);
+  assert.equal(own.on(), false, "a refused keep undid the choice");
+  assert.throws(() => own.stored(), /SecurityError/, "a setting with no refused value lets the refusal be thrown, as before");
+  const fold = createKeptSwitch({ setting: DEVICE_SETTINGS.threadCardFolded, deviceSettings: () => off });
+  assert.equal(fold.on(), false, "a refused read of the fold is open");
+  fold.keep(true);
+  assert.equal(fold.on(), false, "keeping it changed it");
+});

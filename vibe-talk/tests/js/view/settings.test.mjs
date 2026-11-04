@@ -126,3 +126,33 @@ test("`#624 voice-page-modularity`: Help opens at one entry, folds the rest, and
   assert.ok(help.entries().every((entry) => !entry.open));
   assert.deepStrictEqual(nodes.get("help-keyboard").scrolled, [{ block: "start" }]);
 });
+
+test("`#624 voice-page-modularity`: Save marks itself, puts itself back after a save, and a revert waiting is dropped when it is marked again", () => {
+  const { mountSaveTokenButton } = VIEW_SETTINGS;
+  const button = { textContent: "Save token", className: "", disabled: false };
+  const looked = [];
+  const timers = new Map();
+  let next = 0;
+  const save = mountSaveTokenButton({
+    lookup: (id) => { looked.push(id); return button; },
+    setTimeout: (run, ms) => { next += 1; timers.set(next, { run, ms }); return next; },
+    clearTimeout: (timer) => { timers.delete(timer); },
+  });
+  assert.deepStrictEqual(looked, [], "mounting it touched the page");
+  save.markSave("Saving…", "", true);
+  assert.deepStrictEqual([button.textContent, button.className, button.disabled, looked], ["Saving…", "", true, ["save-token"]]);
+  let reverted = 0;
+  const revert = () => { reverted += 1; save.markSave("Save token", "", false); };
+  save.markSave("Saved", "ok", false);
+  save.revertLater(revert, 2500);
+  assert.deepStrictEqual([...timers.values()].map(({ ms }) => ms), [2500]);
+  // Marked again before it fires: the revert waiting is dropped.
+  save.markSave("Saving…", "", true);
+  assert.equal(timers.size, 0, "a second mark left the revert waiting");
+  save.markSave("Saved", "ok", false);
+  save.revertLater(revert, 2500);
+  const [[handle, { run }]] = [...timers.entries()];
+  timers.delete(handle);
+  run();
+  assert.deepStrictEqual([reverted, button.textContent, button.className, button.disabled], [1, "Save token", "", false]);
+});

@@ -300,7 +300,7 @@ const settingsReadouts = mountSettingsReadouts({
   pageOutOfDate: () => pageOutOfDate(),
   get pageBuild() { return PAGE_BUILD; },
   get serverPageBuild() { return serverFacts.pageBuild(); },
-  get voice() { return conversationalVoice; },
+  get voice() { return voiceProvider.current(); },
   renderFolds: () => settingsFolds.renderAll(),
   deviceSettings: () => deviceSettings(),
 });
@@ -518,16 +518,14 @@ function voiceCall() {
     get pendingRead() { return readAloudOwner().pendingRead; },
     get navigator() { return typeof navigator === "undefined" ? undefined : navigator; },
     get showError() { return showError; },
-    get callAudioRoute() { return callAudioRoute; },
-    set callAudioRoute(value) { callAudioRoute = value; },
+    get callAudioRoute() { return audioRoute.current(); },
+    set callAudioRoute(value) { audioRoute.set(/** @type {import("./src/core/call/index.ts").CallAudioRoute | null} */ (value)); },
     get redact() { return redact; },
     get api() { return api; },
     get clearError() { return clearError; },
     get guardQuietly() { return guardQuietly; },
-    get conversationalVoice() { return conversationalVoice; },
+    get conversationalVoice() { return voiceProvider.current(); },
     get setState() { return setState; },
-    get voicePromptForCall() { return voicePromptForCall; },
-    set voicePromptForCall(value) { voicePromptForCall = value; },
     get startAwaitingAnswer() { return voiceTranscript().startAwaitingAnswer; },
     set startAwaitingAnswer(value) { voiceTranscript().startAwaitingAnswer = value; },
     get fetchResume() { return fetchResume; },
@@ -580,7 +578,7 @@ function voiceCall() {
     get endReplayAnswerWait() { return voiceTranscript().endReplayAnswerWait; },
     get resetSpokenYes() { return voiceTranscript().resetSpokenYes; },
     get armProfileRecap() { return voiceTranscript().armProfileRecap; },
-    get resumeAllowed() { return resumeAllowed; },
+    get resumeAllowed() { return callResume.allowed(); },
     get resumeWanted() { return resumeWanted; },
     get sendReplayFrame() { return voiceTranscript().sendReplayFrame; },
     get watchProfileRecap() { return voiceTranscript().watchProfileRecap; },
@@ -595,8 +593,8 @@ function voiceCall() {
     get settleYesCandidates() { return voiceTranscript().settleYesCandidates; },
     get stopPostWatch() { return voiceTranscript().stopPostWatch; },
     get withdrawArmedRecap() { return voiceTranscript().withdrawArmedRecap; },
-    get resumeLast() { return resumeLast; },
-    set resumeLast(value) { resumeLast = value; },
+    get resumeLast() { return callResume.last(); },
+    set resumeLast(value) { callResume.setLast(/** @type {import("./src/core/call/index.ts").ResumeLast} */ (value)); },
     get renderResumeState() { return renderResumeState; },
     get renderReadModeControl() { return renderReadModeControl; },
     get renderReadTransport() { return readAloudOwner().renderReadTransport; },
@@ -639,11 +637,11 @@ function voiceTranscript() {
     set hasEnded(value) { voiceCall().hasEnded = value; },
     get hasSuspended() { return voiceCall().hasSuspended; },
     set hasSuspended(value) { voiceCall().hasSuspended = value; },
-    get resumeAllowed() { return resumeAllowed; },
-    get resumeConversationId() { return resumeConversationId; },
-    set resumeConversationId(value) { resumeConversationId = value; },
-    get resumeLast() { return resumeLast; },
-    set resumeLast(value) { resumeLast = value; },
+    get resumeAllowed() { return callResume.allowed(); },
+    get resumeConversationId() { return callResume.conversationId(); },
+    set resumeConversationId(value) { callResume.setConversationId(value); },
+    get resumeLast() { return callResume.last(); },
+    set resumeLast(value) { callResume.setLast(value); },
     get relayAnswerAwaited() { return voiceCall().relayAnswerAwaited; },
     get knownChannels() { return channelDirectory.channels(); },
     get chatProviderName() { return channelDirectory.providerName(); },
@@ -900,7 +898,7 @@ function openMenus() {
   const open = [];
   if (rowMenus.open()) open.push("menu:row");
   if (!el("speed-popover").hidden) open.push("menu:pace");
-  if (promptsOpen) open.push("menu:prompts");
+  if (promptsTray.open()) open.push("menu:prompts");
   if (actionMenu.open()) open.push("menu:actions");
   // `#348 settings-dynamic-lists`. The pop-out over Recently dismissed, on Settings.
   if (!el("dismissed-send-popout").hidden) open.push("menu:dismissed");
@@ -926,7 +924,7 @@ function closeOpenMenu(name) {
     el("read-speed").focus();
     return true;
   }
-  if (name === "menu:prompts" && promptsOpen) {
+  if (name === "menu:prompts" && promptsTray.open()) {
     setPromptsOpen(false);
     el("prompts-open").focus();
     return true;
@@ -1591,25 +1589,34 @@ async function copyDeepLink(message) {
 // one jump, however much it changed; what the reader opens after landing is a level over the jump, as
 // anywhere. Several jumps stack, each Back undoing one. Nothing else is pushed: scrolling is no place.
 
-/** Whether a link to a message opens it here. ON unless the reader has turned it off. */
-let inAppLinks = true;
+/**
+ * Whether a link to a message opens it here: ON unless the reader has turned it off, kept on the device and
+ * synced. One owner in web/src/core/settings/inapplinks.ts (`#624 voice-page-modularity`), with what was
+ * stored and turning it on or off; Settings draws it.
+ *
+ * @type {import("./src/core/settings/index.ts").InAppLinks}
+ */
+const inAppLinks = createInAppLinks({
+  deviceSettings: () => deviceSettings(),
+  render: (on) => messagePreferences.inAppLinks.render(on),
+});
 
 /** Settings presents message preferences; each feature still owns and applies its value. */
 const messagePreferences = mountMessagePreferences({
   lookup: (id) => el(id),
   deviceSettings: () => deviceSettings(),
   status: (text) => setStatus(text),
-  persistCollapsedLines: (n) => persistCollapsedLines(n),
+  persistCollapsedLines: (n) => collapsedLines.persist(n),
   changeCollapsedLines: (value) => collapsedLinesChanged(value),
-  persistCardMaxLines: (n) => persistCardMaxLines(n),
+  persistCardMaxLines: (n) => cardMaxLines.persist(n),
   changeCardMaxLines: (value) => cardMaxLinesChanged(value),
-  applyQuoteReadPercent: (value) => applyQuoteReadPercent(value),
-  applyInAppLinks: (on) => applyInAppLinks(on),
+  applyQuoteReadPercent: (value) => quoteReadPercent.apply(value),
+  applyInAppLinks: (on) => inAppLinks.apply(on),
   redrawMessageLinks: () => redrawMessageLinks(),
   applySummarizeCollapsed: (on) => applySummarizeCollapsed(on),
   applyRichHeaders: (on) => applyRichHeaders(on),
-  applyMarkOwnRead: (on) => applyMarkOwnRead(on),
-  applyHideEmptyMessages: (on) => applyHideEmptyMessages(on),
+  applyMarkOwnRead: (on) => ownReadSwitch.apply(on),
+  applyHideEmptyMessages: (on) => hideEmptySwitch.apply(on),
   redrawHiddenEmptyMessages: () => {
     if (providerFacts.threading()) {
         eachColumn(renderCachedTimeline);
@@ -1619,27 +1626,17 @@ const messagePreferences = mountMessagePreferences({
           if (selection().view === "threads") el("thread-list").replaceChildren(...threadCards(timelineRows().threads));
         });
         renderSideColumn();
-      } else if (hideEmptyMessages && !readModes.hiding()) {
+      } else if (hideEmptySwitch.on() && !readModes.hiding()) {
         regroupChannelRows();
       } else {
         guardQuietly(() => (readModes.hiding() ? loadTodo : loadDiscord)({ keepPosition: true, ownAct: true, readAs: "mutation" }))();
       }
   },
-  applyCombineMessages: (on) => applyCombineMessages(on),
+  applyCombineMessages: (on) => combineSwitch.apply(on),
   regroupChannelRows: () => eachColumn(regroupChannelRows),
   chooseOpenInView: (view) => chooseOpenInView(view),
   storedOpenInView: () => storedOpenInView(),
 });
-
-function applyInAppLinks(on) {
-  inAppLinks = Boolean(on);
-  messagePreferences.inAppLinks.render(inAppLinks);
-  try {
-    deviceSettings().keep(DEVICE_SETTINGS.inAppLinks, inAppLinks);
-  } catch (_error) {
-    // A browser that refuses storage still honours the choice for this session.
-  }
-}
 
 /**
  * Draw again every body the switch decides the links of, from what is held, as for Empty messages: each
@@ -1655,11 +1652,6 @@ function redrawMessageLinks() {
   } else {
     eachColumn(regroupChannelRows);
   }
-}
-
-/** What was stored. ABSENT MEANS ON: the default is the behaviour, not merely the initial value. */
-function storedInAppLinks() {
-  return deviceSettings().get(DEVICE_SETTINGS.inAppLinks);
 }
 
 /**
@@ -1696,7 +1688,7 @@ function chooseOpenInView(view) {
 
 /** Whether a link to `ref` is this app's now: the switch on, and its channel one this server reads. */
 function keepsInApp(ref) {
-  return inAppLinks && Boolean(ref) && channelDirectory.channels().some((channel) => String(channel.id) === ref.channel);
+  return inAppLinks.current() && Boolean(ref) && channelDirectory.channels().some((channel) => String(channel.id) === ref.channel);
 }
 
 /** The words for a link to `ref` whose text was only its address: where it goes, in this app's names. */
@@ -2922,8 +2914,17 @@ const FOLD_LESS = "Less";
  * what the fixed three this replaces held by being one number in two files.
  */
 
-/** The collapsed-lines count in force; `applyCollapsedLines` is its only writer. */
-let collapsedLines = DEFAULT_COLLAPSED_LINES;
+/**
+ * The collapsed-lines count in force, with what was stored, putting a count on the page and keeping it: one
+ * owner in web/src/core/settings/messagelimits.ts (`#624 voice-page-modularity`). Its `apply` is the
+ * count's only writer; Settings' slider draws it.
+ *
+ * @type {import("./src/core/settings/index.ts").CollapsedLines}
+ */
+const collapsedLines = createCollapsedLines({
+  deviceSettings: () => deviceSettings(),
+  render: (n) => messagePreferences.collapsedLines.render(n),
+});
 
 // The glyph widths the fold model counts lines by (`WIDE_SCRIPT`, `glyphEm`, `SPACE_EM`, `MONO_EM`,
 // `monoEm`) are a module now: web/src/foundation/ (`#624 voice-page-modularity`).
@@ -3083,7 +3084,7 @@ function foldable(li, meta, body, text, messageId, alsoIds = []) {
   // `#244 elision-word-count`. Counted once, here, from what the row shows; see `foldedTextLine`.
   // Straight after the text, ahead of the summary line below and of the reactions the channel row
   // moves under both, so it reads as the end of the folded message.
-  entry.elided = foldedTextLine(body, text, collapsedLines);
+  entry.elided = foldedTextLine(body, text, collapsedLines.current());
   if (entry.elided) li.append(entry.elided);
   if (entry.id) {
     entry.note = document.createElement("div");
@@ -5778,7 +5779,7 @@ function cycleAuthorFilter() {
  * in the channel's view leaves his own out, and the sentence says how to see them.
  */
 function authorEmptySentence(author, searching, pinned) {
-  return authorEmptyWords(author, searching, pinned, () => screens.view() === "discord" && hidingRead() && markOwnRead);
+  return authorEmptyWords(author, searching, pinned, () => screens.view() === "discord" && hidingRead() && ownReadSwitch.on());
 }
 
 // --- the kinds of link under Links ----------------------------------------------------------------
@@ -6108,7 +6109,7 @@ function keepGrowingBoxInView(field) {
 // web/src/view/composer's, with what a key does in them (`#624 voice-page-modularity`).
 
 /**
- * Does a bare Enter send? ON unless the reader has turned it off — see `storedEnterSends`.
+ * Does a bare Enter send? ON unless the reader has turned it off — see `enterSends.stored`.
  *
  * ON because that is what the channel box always did, and what the call's box did too: the owner
  * asked for the reply screen to agree with them, not for them to change.
@@ -6116,23 +6117,16 @@ function keepGrowingBoxInView(field) {
  * Ctrl+Enter (Cmd+Enter on an Apple keyboard) sends EITHER WAY. So turning this off costs nothing
  * but the habit: the reader who wants Enter for new lines still has a key that sends, and the one
  * who leaves it on can use the chord without first remembering which way the setting is.
+ *
+ * One owner in web/src/core/settings/keychoices.ts (`#624 voice-page-modularity`), with what was stored
+ * and turning it on or off, which keeps the choice and then says it (`renderEnterSends`).
+ *
+ * @type {import("./src/core/settings/index.ts").EnterSends}
  */
-let enterSends = true;
-
-function applyEnterSends(on) {
-  enterSends = Boolean(on);
-  try {
-    deviceSettings().keep(DEVICE_SETTINGS.enterSends, enterSends);
-  } catch (_error) {
-    // A browser that refuses storage still honours the choice for this session.
-  }
-  renderEnterSends();
-}
-
-/** What was stored. ABSENT MEANS ON: the default is the behaviour, not merely the initial value. */
-function storedEnterSends() {
-  return deviceSettings().get(DEVICE_SETTINGS.enterSends);
-}
+const enterSends = createEnterSends({
+  deviceSettings: () => deviceSettings(),
+  render: () => renderEnterSends(),
+});
 
 /**
  * The platforms whose keyboards say Cmd where the rest say Ctrl, as `navigator.platform` begins
@@ -6171,12 +6165,12 @@ function sendChordName() {
  *     hint, so no placeholder or extra line under a box has to carry it.
  */
 function renderEnterSends() {
-  el("enter-sends").checked = enterSends;
-  el("enter-sends-hint").textContent = enterSends
+  el("enter-sends").checked = enterSends.current();
+  el("enter-sends-hint").textContent = enterSends.current()
     ? "Shift+Enter starts a new line, and on a phone's keyboard so does ↵ in the box's corner."
     : `${sendChordName()} sends. Enter starts a new line.`;
   for (const id of COMPOSER_FIELDS) {
-    el(id).setAttribute("enterkeyhint", enterSends ? "send" : "enter");
+    el(id).setAttribute("enterkeyhint", enterSends.current() ? "send" : "enter");
   }
 }
 
@@ -6187,7 +6181,7 @@ function renderEnterSends() {
  *
  * @type {import("./src/view/composer/index.ts").ComposerKeys}
  */
-const composerKeys = createComposerKeys({ now: () => Date.now(), enterSends: () => enterSends });
+const composerKeys = createComposerKeys({ now: () => Date.now(), enterSends: () => enterSends.current() });
 
 /**
  * What a keystroke in a message box does: send, or leave the box to handle it.
@@ -8918,29 +8912,22 @@ const KEYMAP = [
   },
 ];
 
-/** Whether the single-key shortcuts are on. ON unless the reader turned them off: see `storedSingleKeys`. */
-let singleKeys = true;
-
-/** What was stored. ABSENT MEANS ON, as for Enter to send: the default is the behaviour. */
-function storedSingleKeys() {
-  // A browser refusing storage reads as on (`DEVICE_SETTINGS.singleKeys.refused`).
-  return deviceSettings().get(DEVICE_SETTINGS.singleKeys);
-}
-
-/** Turn the single-key shortcuts on or off, keep the choice, and say the keys as they now are. */
-function applySingleKeys(on) {
-  singleKeys = Boolean(on);
-  try {
-    deviceSettings().keep(DEVICE_SETTINGS.singleKeys, singleKeys);
-  } catch (_error) {
-    // A browser that refuses storage still honours the choice for this session.
-  }
-  renderKeyHints();
-}
+/**
+ * Whether the single-key shortcuts are on: ON unless the reader turned them off, kept on the device. One
+ * owner in web/src/core/settings/keychoices.ts (`#624 voice-page-modularity`), with what was stored, its
+ * restoring at load and turning them on or off, which keeps the choice and says the keys as they now are
+ * (`renderKeyHints`).
+ *
+ * @type {import("./src/core/settings/index.ts").SingleKeys}
+ */
+const singleKeys = createSingleKeys({
+  deviceSettings: () => deviceSettings(),
+  render: () => renderKeyHints(),
+});
 
 /** Whether `chord` of `binding` may fire with the focus on `target`. See the rules at the top of this section. */
 function chordAllowed(binding, chord, target) {
-  if (typesCharacter(chord) && !singleKeys) return false;
+  if (typesCharacter(chord) && !singleKeys.current()) return false;
   if (chord.mod || chord.key === "Escape" || binding.inField) return true;
   return !isTextField(target) && !keepsOwnKeys(target);
 }
@@ -9041,7 +9028,7 @@ function chordWords(chord) {
 
 /** The chords of a binding, said: "↓ or j", "1, 2, 3". `live` leaves out what the switch has turned off. */
 function bindingWords(binding, live = false) {
-  const words = binding.chords.filter((chord) => !live || singleKeys || !typesCharacter(chord)).map(chordWords);
+  const words = binding.chords.filter((chord) => !live || singleKeys.current() || !typesCharacter(chord)).map(chordWords);
   return words.length === 2 ? words.join(" or ") : words.join(", ");
 }
 
@@ -9061,7 +9048,7 @@ function controlShortcuts(field) {
   const out = new Map();
   for (const binding of KEYMAP) {
     for (const name of binding[field] || []) {
-      const said = binding.chords.filter((chord) => singleKeys || !typesCharacter(chord)).flatMap(chordShortcuts);
+      const said = binding.chords.filter((chord) => singleKeys.current() || !typesCharacter(chord)).flatMap(chordShortcuts);
       out.set(name, [...(out.get(name) || []), ...said]);
     }
   }
@@ -9087,8 +9074,8 @@ function sayRowShortcut(button, className) {
  */
 function renderKeyHints() {
   const mod = modKeyName();
-  el("single-keys").checked = singleKeys;
-  el("single-keys-hint").textContent = singleKeys
+  el("single-keys").checked = singleKeys.current();
+  el("single-keys-hint").textContent = singleKeys.current()
     ? "Keys such as j, k, e and / act on the messages. Press ? for the list."
     : `Off: Esc, the arrows, Enter and the ${mod} chords still work. ${mod}+? lists them.`;
   for (const [id, said] of controlShortcuts("controls")) {
@@ -9111,7 +9098,7 @@ function renderKeyHints() {
     el(id).setAttribute("title", "Back (Esc)");
   }
   const groups = [];
-  if (!singleKeys) {
+  if (!singleKeys.current()) {
     const off = document.createElement("p");
     off.className = "hint";
     off.textContent = `Single-key shortcuts are off in Settings: only Esc, the arrows, Enter, PgUp, PgDn, Home, End ` +
@@ -9175,17 +9162,15 @@ const cannedPrompts = mountCannedPrompts({
 });
 
 /**
- * Whether the tray of canned prompts is open.
+ * Whether the tray of canned prompts is open, said on its opener and by the tray (`#60
+ * canned-prompt-buttons`): one owner in web/src/view/shell/promptstray.ts (`#624
+ * voice-page-modularity`), which says why it is one button for all of them and why it is not kept.
+ * An open tray is a level, with an entry of its own (`#304 back-gesture-in-app`).
  *
- * ONE BUTTON FOR ALL OF THEM, and the reason is arithmetic rather than tidiness. The bar is a
- * single row on a 375px phone and its width is priced to the edge by the page suite; each canned
- * prompt used to cost it a member, and the list is meant to GROW — custom prompts are the next
- * thing asked for. A tray costs one slot however many prompts are in it.
- *
- * Not persisted, deliberately: it is where a menu happens to be standing, not a preference. It
- * comes back shut on every load, and every render of the bar that takes the button away shuts it.
+ * @type {import("./src/view/shell/index.ts").PromptsTray}
  */
-let promptsOpen = false;
+const promptsTray = createPromptsTray({ byId: (id) => /** @type {any} */ (el(id)), changed: () => scheduleBackSync() });
+const setPromptsOpen = promptsTray.setOpen;
 
 /**
  * `#820 voice-page-action-menu`. The list's action menu, open or not, and its line for a list with nothing to
@@ -9194,20 +9179,6 @@ let promptsOpen = false;
  */
 const actionMenu = createActionMenu({ byId: (id) => /** @type {any} */ (el(id)), changed: () => scheduleBackSync() });
 const setActionMenuOpen = actionMenu.setOpen;
-
-/**
- * Open or shut the tray, and say so on the button.
- *
- * `aria-expanded` on the opener and `hidden` on the tray are the same fact stated to two readers,
- * and both are set here so they cannot come apart.
- */
-function setPromptsOpen(open) {
-  promptsOpen = open === true;
-  el("prompts-tray").hidden = !promptsOpen;
-  el("prompts-open").setAttribute("aria-expanded", promptsOpen ? "true" : "false");
-  // `#304 back-gesture-in-app`. An open tray is a level, with an entry of its own.
-  scheduleBackSync();
-}
 
 // --- the server ------------------------------------------------------------------------------
 
@@ -9459,9 +9430,14 @@ function audioConstraints(settings) {
 // Chromium treats this capture as a call, and the speakerphone/car cases keep it.
 
 
-/** The route of the call in progress, for the readout and the call-end record; null between calls. */
-// eslint-disable-next-line prefer-const -- reassigned at every call start and end.
-let callAudioRoute = null;
+/**
+ * The route of the call in progress, for the readout and the call-end record; null between calls: one
+ * owner in web/src/core/call/audioroute.ts (`#624 voice-page-modularity`). Which device a label names
+ * is {@link classifyAudioDevice}'s.
+ *
+ * @type {import("./src/core/call/index.ts").AudioRoute}
+ */
+const audioRoute = createAudioRoute({ classify: (label) => classifyAudioDevice(label) });
 
 const audioDevices = mountAudioDevices({
   lookup: (id) => el(id),
@@ -9472,7 +9448,7 @@ const audioDevices = mountAudioDevices({
   classifyAudioDevice: (label) => classifyAudioDevice(label),
   stream: () => voiceCall().session.stream,
   audio: () => voiceCall().session.audio,
-  route: () => callAudioRoute,
+  route: () => audioRoute.current(),
 });
 
 /**
@@ -9535,7 +9511,7 @@ function outputSinkSupported() {
  */
 async function openCallMicrophone(mic) {
   let stream = await browserPorts().microphone.open(audioConstraints(mic));
-  callAudioRoute = { inputKind: "other", outputKind: "other", inputLabel: "", outputLabel: "", sink: "" };
+  audioRoute.begin();
   const trackOf = (opened) => (opened && typeof opened.getTracks === "function" ? opened.getTracks()[0] : null);
   const noteTrack = (opened) => {
     const track = trackOf(opened);
@@ -9546,9 +9522,7 @@ async function openCallMicrophone(mic) {
       settings = {};
     }
     const label = deviceLabel(track) || deviceLabel(settings);
-    callAudioRoute.inputKind = classifyAudioDevice(label);
-    callAudioRoute.inputLabel = label;
-    callAudioRoute.outputKind = callAudioRoute.inputKind;
+    audioRoute.noteInput(label);
   };
   noteTrack(stream);
   if (!navigator.mediaDevices || typeof navigator.mediaDevices.enumerateDevices !== "function") return stream;
@@ -9583,9 +9557,7 @@ async function openCallMicrophone(mic) {
   }
   for (const track of fallback.getTracks()) track.stop();
   noteTrack(stream);
-  if (!callAudioRoute.inputLabel) callAudioRoute.inputLabel = deviceLabel(chosen);
-  callAudioRoute.inputKind = classifyAudioDevice(callAudioRoute.inputLabel);
-  callAudioRoute.outputKind = callAudioRoute.inputKind;
+  audioRoute.settleInput(deviceLabel(chosen));
   return stream;
 }
 
@@ -9600,9 +9572,7 @@ async function applyCallOutput(context) {
   if (!prefs.outputId) return;
   try {
     await context.setSinkId(prefs.outputId);
-    if (callAudioRoute) {
-      callAudioRoute.sink = String(context.sinkId || prefs.outputId);
-    }
+    audioRoute.noteSink(String(context.sinkId || prefs.outputId));
   } catch (_error) {
     // The chosen output went away between Settings and the call: the default carries it,
     // and the record keeps the route actually in use rather than the choice that failed.
@@ -9611,10 +9581,7 @@ async function applyCallOutput(context) {
   try {
     const devices = await navigator.mediaDevices.enumerateDevices();
     const chosen = (devices || []).find((d) => d.deviceId === prefs.outputId);
-    if (chosen && callAudioRoute) {
-      callAudioRoute.outputKind = classifyAudioDevice(deviceLabel(chosen));
-      callAudioRoute.outputLabel = deviceLabel(chosen);
-    }
+    if (chosen) audioRoute.noteOutput(deviceLabel(chosen));
   } catch (_error) {
     // No list, no kind: the readout says the sink id instead.
   }
@@ -9725,7 +9692,7 @@ function renderControlBar() {
   // A menu whose button has gone must go with it. Leaving Voice or leaving the main screen takes
   // the opener off the strip, and a tray left standing under a button that is no longer there is an
   // orphan floating over the channel — and, worse, still clickable.
-  if (el("prompts-open").hidden && promptsOpen) {
+  if (el("prompts-open").hidden && promptsTray.open()) {
     setPromptsOpen(false);
   }
   // `#820 voice-page-action-menu`. The same for the channel's action menu.
@@ -9803,32 +9770,9 @@ const textSize = mountTextSize({
   keptAs: (pct) => deviceSettings().keptAs(DEVICE_SETTINGS.msgScale, pct),
 });
 
-/** What was stored, clamped. A missing or corrupt entry is the default, never an error. */
-function storedCollapsedLines() {
-  return deviceSettings().get(DEVICE_SETTINGS.collapsedLines);
-}
-
-/**
- * Put a lines count on the page, and return the one actually applied, which is the clamped one.
- * One property on the root reaches every list, as the reading width's does; the value is ALSO the
- * root's `data-collapsed-lines`, because at 0 the stylesheet hides the folded body outright — a
- * clamp of 0 reads as no clamp in a browser and would show every line (web/voice.css).
- */
-function applyCollapsedLines(value) {
-  collapsedLines = clampCollapsedLines(value);
-  messagePreferences.collapsedLines.render(collapsedLines);
-  return collapsedLines;
-}
-
-/** Store it, and READ IT BACK: private browsing accepts `setItem` and keeps nothing. */
-function persistCollapsedLines(n) {
-  try {
-    deviceSettings().keep(DEVICE_SETTINGS.collapsedLines, n);
-  } catch (_error) {
-    return false;
-  }
-  return deviceSettings().keptAs(DEVICE_SETTINGS.collapsedLines, n);
-}
+// What was stored, putting a count on the page (the root's `--collapsed-lines` and
+// `data-collapsed-lines`) and keeping it, read back, are `collapsedLines`'s: web/src/core/settings
+// (`#624 voice-page-modularity`).
 
 /**
  * Work every drawn fold's hidden-word count out again under the count now in force. A label made
@@ -9845,7 +9789,7 @@ function refreshElisionLines() {
   // there is a label claiming words a raised count has put on the screen.
   for (const id of [...FOLD_LISTS, "side-cards"]) {
     for (const entry of foldsOf(document.getElementById(id))) {
-      const fresh = foldedTextLine(entry.body, entry.foldText, collapsedLines);
+      const fresh = foldedTextLine(entry.body, entry.foldText, collapsedLines.current());
       const old = entry.elided;
       if (old && fresh) old.replaceWith(fresh);
       else if (old && !fresh) old.remove();
@@ -9870,7 +9814,7 @@ function refreshElisionLines() {
  */
 function collapsedLinesChanged(value) {
   const apply = () => {
-    const n = applyCollapsedLines(value);
+    const n = collapsedLines.apply(value);
     refreshElisionLines();
     messagePreferences.collapsedLines.saved(n);
     return n;
@@ -9970,46 +9914,30 @@ const pageOutOfDate = () => PAGE_BUILD !== "" && serverFacts.pageBuild() !== "" 
 /** The device's copy of K, kept on the server for every device (`#457 settings-server-side`). */
 const CARD_MAX_LINES_KEY = DEVICE_SETTINGS.cardMaxLines.key;
 
-/** K in force; `applyCardMaxLines` is its only writer. */
-let cardMaxLines = DEFAULT_CARD_MAX_LINES;
-
-/** What was stored, clamped. A missing or corrupt entry is the default, never an error. */
-function storedCardMaxLines() {
-  // A browser refusing storage reads as the default (`DEVICE_SETTINGS.cardMaxLines.refused`).
-  return deviceSettings().get(DEVICE_SETTINGS.cardMaxLines);
-}
-
-/** Put K on the page, and return the one applied: the slider says it, and every card list is drawn again by it. */
-function applyCardMaxLines(value, redraw = true) {
-  const n = clampCardMaxLines(value);
-  const changed = redraw && n !== cardMaxLines;
-  cardMaxLines = n;
+/**
+ * K in force, with what was stored, putting K on the page and keeping it: one owner in
+ * web/src/core/settings/messagelimits.ts (`#624 voice-page-modularity`). Its `apply` is K's only writer:
+ * the slider says it, and a K that changed draws every card list again by it (`redraw`).
+ *
+ * @type {import("./src/core/settings/index.ts").CardMaxLines}
+ */
+const cardMaxLines = createCardMaxLines({
+  deviceSettings: () => deviceSettings(),
   // `#528 thread-card-markdown-and-cap`: what a card clamped to K lines is clamped to (web/voice.css).
-  messagePreferences.cardMaxLines.render(n);
-  if (changed) {
+  render: (n) => messagePreferences.cardMaxLines.render(n),
+  redraw: () => {
     cardsDrawn.forget();
     threadCardsDrawn.clear();
     if (sideColumnUp()) renderSideColumn();
     if (selection().view === "thread") renderThreadHeading();
     if (selection().view === "threads") el("thread-list").replaceChildren(...threadCards(timelineRows().threads));
-  }
-  return n;
-}
-
-/** Store it, and read it back: private browsing accepts `setItem` and keeps nothing. */
-function persistCardMaxLines(n) {
-  try {
-    deviceSettings().keep(DEVICE_SETTINGS.cardMaxLines, n);
-  } catch (_error) {
-    return false;
-  }
-  return deviceSettings().keptAs(DEVICE_SETTINGS.cardMaxLines, n);
-}
+  },
+});
 
 /** The slider, or − and +: K applied with the cards held where the reader is, and kept. */
 function cardMaxLinesChanged(value) {
   let n = DEFAULT_CARD_MAX_LINES;
-  keepingCardPlace(() => { n = applyCardMaxLines(value); });
+  keepingCardPlace(() => { n = cardMaxLines.apply(value); });
   messagePreferences.cardMaxLines.saved(n);
   return n;
 }
@@ -10032,21 +9960,17 @@ function stepCardMaxLines(direction) {
 /** The device's copy of the share, kept on the server for every device (`#457 settings-server-side`). */
 const QUOTE_READ_PERCENT_KEY = DEVICE_SETTINGS.quoteReadPercent.key;
 
-/** The share in force, a percentage; `applyQuoteReadPercent` is its only writer. */
-let quoteReadPercent = DEFAULT_QUOTE_READ_PERCENT;
-
-/** What was stored, clamped. A missing, corrupt or refused entry is the default. */
-function storedQuoteReadPercent() {
-  return deviceSettings().get(DEVICE_SETTINGS.quoteReadPercent);
-}
-
-/** Put the share on the page, and return the one applied: the slider says it. */
-function applyQuoteReadPercent(value) {
-  const n = clampQuoteReadPercent(value);
-  quoteReadPercent = n;
-  messagePreferences.quoteReadPercent.render(n);
-  return n;
-}
+/**
+ * The share in force, a percentage, with what was stored and putting a share on the page: one owner in
+ * web/src/core/settings/messagelimits.ts (`#624 voice-page-modularity`). Its `apply` is the share's only
+ * writer; Settings' slider draws it, and keeps a changed share.
+ *
+ * @type {import("./src/core/settings/index.ts").QuoteReadPercent}
+ */
+const quoteReadPercent = createQuoteReadPercent({
+  deviceSettings: () => deviceSettings(),
+  render: (n) => messagePreferences.quoteReadPercent.render(n),
+});
 
 /** The slider, or − and +: the share applied, and kept, read back as private browsing keeps nothing. */
 function quoteReadPercentChanged(value) {
@@ -10066,12 +9990,12 @@ function stepQuoteReadPercent(direction) {
  * @param {string} text
  */
 function replyMarksRead(target, text) {
-  return quoteMarksRead(quoteShare(text, rawTextOf(target)), quoteReadPercent) ? String(target.id) : null;
+  return quoteMarksRead(quoteShare(text, rawTextOf(target)), quoteReadPercent.current()) ? String(target.id) : null;
 }
 
 /** Whether `root` is longer than a card shows: more than K card lines of its text, as the server counts. */
 function rootOverflowsCard(root) {
-  return Boolean(root) && cardProxyLines(proxyLinesOf(rawTextOf(root))) > cardMaxLines;
+  return Boolean(root) && cardProxyLines(proxyLinesOf(rawTextOf(root))) > cardMaxLines.current();
 }
 
 // `#528 thread-card-markdown-and-cap`. The owner, 2026-10-26: "a long message with markdown
@@ -10180,11 +10104,11 @@ function cardCut(root) {
 /** `cardCut`'s answer for `root` and the card's words with it, worked out once per root and K. */
 function cardCutEntry(root) {
   const held = cardCuts.get(root);
-  if (held && held.lines === cardMaxLines) return held;
+  if (held && held.lines === cardMaxLines.current()) return held;
   const units = cardUnits(messageBody(root));
   const cut = cutForCard(units.map((unit) => unit.lines), units.map((unit) => unit.mark), units.map((unit) => unit.whole),
     units.map((unit) => unit.heading));
-  const entry = { lines: cardMaxLines, cut, text: foldedCardText(renderedText(cardHead(root, cut))) };
+  const entry = { lines: cardMaxLines.current(), cut, text: foldedCardText(renderedText(cardHead(root, cut))) };
   cardCuts.set(root, entry);
   return entry;
 }
@@ -10202,14 +10126,14 @@ function cardCutEntry(root) {
  */
 function cutForCard(lines, marks = [], wholes = [], headings = []) {
   const total = lines.reduce((sum, n) => sum + n, 0);
-  if (total <= cardMaxLines) return null;
+  if (total <= cardMaxLines.current()) return null;
   let head = 0;
   let used = 0;
-  while (head < lines.length && used + lines[head] <= cardMaxLines) {
+  while (head < lines.length && used + lines[head] <= cardMaxLines.current()) {
     used += lines[head];
     head += 1;
   }
-  while (head > 0 && used + (marks[head - 1] || 0) > cardMaxLines) {
+  while (head > 0 && used + (marks[head - 1] || 0) > cardMaxLines.current()) {
     head -= 1;
     used -= lines[head];
   }
@@ -10365,7 +10289,7 @@ async function summaryWatchFired() {
  */
 function collapsedLinesFromKeyboard(direction, target) {
   if (isTextField(target)) return false;
-  const n = collapsedLinesChanged(collapsedLines + direction);
+  const n = collapsedLinesChanged(collapsedLines.current() + direction);
   setStatus(`Collapsed messages show ${collapsedLinesWords(n)}.`);
   return true;
 }
@@ -15366,7 +15290,7 @@ function outgoingStatus(entry) {
  * `#430 threads-main-own-sent`. The messages this page has sent, by id, for as long as it is open. The
  * owner, 2026-10-22, on a phone: "even when I've toggled Main on in thread list View on mobile. I still
  * don't see the message that I just sent to the main channel." The owner's own messages count as read
- * (`markOwnRead`), so under Hide read the Threads view's main rows, rebuilt through the read filter, left
+ * (`ownReadSwitch`), so under Hide read the Threads view's main rows, rebuilt through the read filter, left
  * it out; Main showed it only because its live append skips that filter, until its next redraw. So a
  * message sent from here is one the read filters keep (`readFilterKeeps`, `mainRowMessages`), in every
  * list alike, for the rest of the page's life: what the reader has just said never vanishes as they say it.
@@ -20426,23 +20350,19 @@ function toggleMessageDetails(li, messages) {
  * existing messages" beside it reaches the rest (`ownReadApply.apply`). What this page does with
  * the flag itself is draw a message of his read before the server's answer for it arrives
  * (`noteStartsRead`).
+ *
+ * On at first, and applied as the device keeps it as the page loads, where ABSENT MEANS ON: the default is
+ * the behaviour, not merely the initial value. One owner in web/src/core/settings/switches.ts
+ * (`#624 voice-page-modularity`).
+ *
+ * @type {import("./src/core/settings/index.ts").KeptSwitch}
  */
-let markOwnRead = true;
-
-function applyMarkOwnRead(on) {
-  markOwnRead = Boolean(on);
-  messagePreferences.markOwnRead.render(markOwnRead);
-  try {
-    deviceSettings().keep(DEVICE_SETTINGS.markOwnRead, markOwnRead);
-  } catch (_error) {
-    // A browser that refuses storage still honours the choice for this session.
-  }
-}
-
-/** What was stored. ABSENT MEANS ON: the default is the behaviour, not merely the initial value. */
-function storedMarkOwnRead() {
-  return deviceSettings().get(DEVICE_SETTINGS.markOwnRead);
-}
+const ownReadSwitch = createKeptSwitch({
+  setting: DEVICE_SETTINGS.markOwnRead,
+  deviceSettings: () => deviceSettings(),
+  initial: true,
+  render: (on) => messagePreferences.markOwnRead.render(on),
+});
 
 /** Settings' apply-to-existing command owns its confirmation and Undo receipt. */
 const ownReadApply = mountOwnReadApply({
@@ -20465,7 +20385,7 @@ const ownReadApply = mountOwnReadApply({
  * server's would draw an agent's message read that the server leaves unread. `#549 own-read-stored`.
  */
 function startsRead(message) {
-  if (!markOwnRead || !message || isNoise(message)) return false;
+  if (!ownReadSwitch.on() || !message || isNoise(message)) return false;
   const id = String(message.author_id || "");
   if (!id) return false;
   const chosen = whoIsWho.choiceOf(id);
@@ -20563,27 +20483,23 @@ function mayLeadToReplies(message) {
       (String(held.thread.root_message_id) === id || (own !== null && threadOf(held) === own)));
 }
 
-/** Are empty messages left out? ON unless the reader has turned it off — see `storedHideEmptyMessages`. */
-let hideEmptyMessages = true;
-
-function applyHideEmptyMessages(on) {
-  hideEmptyMessages = Boolean(on);
-  messagePreferences.hideEmpty.render(hideEmptyMessages);
-  try {
-    deviceSettings().keep(DEVICE_SETTINGS.hideEmptyMessages, hideEmptyMessages);
-  } catch (_error) {
-    // A browser that refuses storage still honours the choice for this session.
-  }
-}
-
-/** What was stored. ABSENT MEANS ON: the default is the behaviour, not merely the initial value. */
-function storedHideEmptyMessages() {
-  return deviceSettings().get(DEVICE_SETTINGS.hideEmptyMessages);
-}
+/**
+ * Are empty messages left out? ON unless the reader has turned it off: on at first, and applied as the
+ * device keeps it as the page loads, where ABSENT MEANS ON: the default is the behaviour, not merely the
+ * initial value. One owner in web/src/core/settings/switches.ts (`#624 voice-page-modularity`).
+ *
+ * @type {import("./src/core/settings/index.ts").KeptSwitch}
+ */
+const hideEmptySwitch = createKeptSwitch({
+  setting: DEVICE_SETTINGS.hideEmptyMessages,
+  deviceSettings: () => deviceSettings(),
+  initial: true,
+  render: (on) => messagePreferences.hideEmpty.render(on),
+});
 
 /** Is `message` left out of the page: empty, while the reader has said to hide those? */
 function hiddenEmpty(message) {
-  return hideEmptyMessages && emptyMessage(message);
+  return hideEmptySwitch.on() && emptyMessage(message);
 }
 readAloudOwner().initializeReadSteerOffset();
 
@@ -20658,28 +20574,23 @@ const { tapRow, actOnRow, foldOnTap, swipeable } = rowGestures;
 //     message, and a reply in some other thread is never part of it (`#463 slack-text-fidelity`).
 
 /**
- * Is the combining on? ON unless the reader has turned it off — see `storedCombineMessages`.
+ * Is the combining on? ON unless the reader has turned it off: on at first, and applied as the device keeps
+ * it as the page loads, where ABSENT MEANS ON: the default is the behaviour, not merely the initial value.
  *
  * A setting rather than a fixed behaviour because the view's other purpose is being able to point
  * at a REAL message, and a reader chasing "did that message exist" wants the rows exactly as
  * Discord has them.
+ *
+ * One owner in web/src/core/settings/switches.ts (`#624 voice-page-modularity`).
+ *
+ * @type {import("./src/core/settings/index.ts").KeptSwitch}
  */
-let combineMessages = true;
-
-function applyCombineMessages(on) {
-  combineMessages = Boolean(on);
-  messagePreferences.combine.render(combineMessages);
-  try {
-    deviceSettings().keep(DEVICE_SETTINGS.combineMessages, combineMessages);
-  } catch (_error) {
-    // A browser that refuses storage still honours the choice for this session.
-  }
-}
-
-/** What was stored. ABSENT MEANS ON: the default is the behaviour, not merely the initial value. */
-function storedCombineMessages() {
-  return deviceSettings().get(DEVICE_SETTINGS.combineMessages);
-}
+const combineSwitch = createKeptSwitch({
+  setting: DEVICE_SETTINGS.combineMessages,
+  deviceSettings: () => deviceSettings(),
+  initial: true,
+  render: (on) => messagePreferences.combine.render(on),
+});
 
 /**
  * A list of messages, oldest first, as the list of ROWS to draw.
@@ -20693,7 +20604,7 @@ function glom(messages) {
   for (const message of messages) {
     if (hiddenEmpty(message)) continue;
     const last = groups[groups.length - 1];
-    if (last && joinsGroup(last[last.length - 1], message, combineMessages)) {
+    if (last && joinsGroup(last[last.length - 1], message, combineSwitch.on())) {
       last.push(message);
     } else {
       groups.push([message]);
@@ -22130,11 +22041,9 @@ function searchOlderFromField() {
 // open, and it asks once per search, a moment after the typing pauses; a change of search, channel or
 // the box asks again, and an answer to an older question is dropped.
 
-/** Whether the server's search covers every channel (`#search-all-channels`), for this page's life. */
-let searchAllChannels = false;
-
 // The search sent to the server — its key, ticket, hits, scopes, how much it examined and where it
-// resumes, and the rest it waits for (SERVER_SEARCH_DELAY_MS) — is web/src/core/search's
+// resumes, the rest it waits for (SERVER_SEARCH_DELAY_MS), and whether it covers every channel
+// (`#search-all-channels`, for this page's life) — is web/src/core/search's
 // (`createServerSearch`, `#624 voice-page-modularity`); which search is on screen, its request and
 // drawing what came back are here.
 const serverSearchOwner = createServerSearch({
@@ -22142,10 +22051,10 @@ const serverSearchOwner = createServerSearch({
   pathFor: (more, resume) => {
     const channel = String(selectedChannelId() || "");
     const zone = readerZone();
-    const below = more ? resume : searchAllChannels ? null : oldestLoadedMs();
+    const below = more ? resume : serverSearchOwner.allChannels() ? null : oldestLoadedMs();
     const params = [`q=${encodeURIComponent(searchField.query())}`, ...(zone ? [`tz=${encodeURIComponent(zone)}`] : []),
       ...(below !== null && below !== undefined ? [`below=${below}`] : [])].join("&");
-    return searchAllChannels ? `/api/v1/search?${params}`
+    return serverSearchOwner.allChannels() ? `/api/v1/search?${params}`
       : `/api/v1/channels/${encodeURIComponent(channel)}/search?${params}`;
   },
   fetchAnswer: (path) => apiDecoded("SearchResponse", path),
@@ -22164,7 +22073,7 @@ function serverSearchKeyNow() {
   if (!searchField.open() || screens.screen() !== "main" || screens.view() !== "discord" || !searchTyped(searchField.query())) return "";
   const channel = String(selectedChannelId() || "");
   if (!channel) return "";
-  return JSON.stringify([searchAllChannels ? "*" : channel, searchIdentity(searchField.query())]);
+  return JSON.stringify([serverSearchOwner.allChannels() ? "*" : channel, searchIdentity(searchField.query())]);
 }
 
 /**
@@ -22210,7 +22119,7 @@ function serverScopeWords() {
   if (scopes.length === 0) return "server: not searched yet";
   const searched = scopes.filter((scope) => scope.state === "searched");
   const more = serverSearch.resume !== null;
-  if (searchAllChannels) {
+  if (serverSearchOwner.allChannels()) {
     const whole = searched.filter((scope) => scope.whole).length;
     // Every channel searched reaches back at least as far as the NEWEST of their reaches, and only
     // when each one says how far it reached.
@@ -22241,7 +22150,7 @@ function searchScopeLine() {
   const page = historyReadToStart() && historyReach().whole ? "this page: back to the first message"
     : from === null ? "this page: nothing loaded" : `this page: back to ${searchMomentWords(from)}`;
   // Over every channel the server searched this channel's newest too: counted once.
-  const total = (searchAllChannels && serverSearchNow().scopes.length > 0 ? 0 : loaded) + serverSearchNow().examined;
+  const total = (serverSearchOwner.allChannels() && serverSearchNow().scopes.length > 0 ? 0 : loaded) + serverSearchNow().examined;
   return ["No upstream search", page, serverScopeWords(), searchFurtherWords(),
     `${total} message${total === 1 ? "" : "s"} searched`].filter((part) => part !== "").join(" · ");
 }
@@ -22258,7 +22167,7 @@ function serverHitNode(hit) {
   who.className = "who";
   who.textContent = String(hit.author || "");
   meta.append(who);
-  if (searchAllChannels) {
+  if (serverSearchOwner.allChannels()) {
     // The answer names every channel it searched, the one the page knows by the owner's name.
     const scope = serverSearchNow().scopes.find((one) => String(one.channel.id) === String(hit.channel_id));
     const where = document.createElement("span");
@@ -22306,7 +22215,7 @@ function renderServerSearch() {
   }
   setTextIfChanged(el("search-scope"), searchScopeLine());
   const checkbox = /** @type {HTMLInputElement} */ (el("search-all-channels"));
-  if (checkbox.checked !== searchAllChannels) checkbox.checked = searchAllChannels;
+  if (checkbox.checked !== serverSearchOwner.allChannels()) checkbox.checked = serverSearchOwner.allChannels();
   const channel = String(selectedChannelId() || "");
   const held = heldMessagesById();
   const fresh = serverSearch.hits.filter((hit) => !(String(hit.channel_id) === channel && held.has(String(hit.id))));
@@ -22349,7 +22258,7 @@ const searchFurtherRunning = () => gathering.state().channel !== "" &&
 
 /** Whether Search further back is offered: one channel, a copy the server keeps, not yet whole. */
 function searchFurtherOffered() {
-  if (serverSearchNow().key === "" || searchAllChannels || !serverCopyOpen() || serverFacts.tokenScope() === "read") return false;
+  if (serverSearchNow().key === "" || serverSearchOwner.allChannels() || !serverCopyOpen() || serverFacts.tokenScope() === "read") return false;
   const scope = serverSearchNow().scopes[0];
   return Boolean(scope) && scope.state === "searched" && !scope.whole;
 }
@@ -22392,7 +22301,7 @@ async function searchFurtherPressed() {
 
 /** All channels ticked or unticked: the server is asked again over the channels it now names. */
 function chooseSearchAllChannels(on) {
-  searchAllChannels = Boolean(on);
+  serverSearchOwner.chooseAllChannels(on);
   scheduleServerSearch();
 }
 
@@ -24015,7 +23924,7 @@ function appendChannelRow(arriving, live = false, folded = false) {
     const rows = [...list.children];
     const last = rows[rows.length - 1];
     const held = rowMessages(last);
-    if (held.length > 0 && joinsGroup(held[held.length - 1], message, combineMessages)) {
+    if (held.length > 0 && joinsGroup(held[held.length - 1], message, combineSwitch.on())) {
       // The row is REBUILT rather than edited: one constructor for a row, wherever it came from.
       list.replaceChildren(...rows.slice(0, -1), discordNode([...held, message]));
     } else {
@@ -25192,7 +25101,7 @@ function syncPinnedList() {
   // tag confirmed by a later read brings a heading to a message whose text has not changed. And its
   // own address in its service (`#409 open-upstream-link`): a later read can form one for a message
   // drawn without one, and its row gains the link only by being drawn again.
-  const drawn = JSON.stringify([combineMessages, hideEmptyMessages, channelStore.current().scope, providerFacts.threading(),
+  const drawn = JSON.stringify([combineSwitch.on(), hideEmptySwitch.on(), channelStore.current().scope, providerFacts.threading(),
     ...messages.map((m) => [m.id, m.timestamp, m.content, renderedHtmlOf(m), m.author, threadOf(m), isNoise(m),
       pinSync.isKept(m), reactionsDrawn(m), m.heading || null, editedDrawn(m), upstreamUrlOf(m)])]);
   if (drawn === pinsView().drawn) return;
@@ -25329,9 +25238,6 @@ const agentPrefix = mountAgentPrefix({
   showError: (text) => showError(text),
   setStatus: (text) => setStatus(text),
 });
-
-/** What the voice session asked this page to hand the agent of the call being opened, or null. */
-let voicePromptForCall = null;
 
 // --- saved messages on this server -----------------------------------------------------------------
 //
@@ -25614,16 +25520,19 @@ function draftsOffScreen() {
 
 /**
  * Whether the reply open in the stream was in sight when the chip was last drawn: a scroll redraws the chip
- * only when that changes (`draftChipFrame`). Kept by every drawing, so it is never stale.
+ * only when that changes (`draftChipFrame`). Kept by every drawing, so it is never stale. One owner in
+ * web/src/view/shell/draftsight.ts (`#624 voice-page-modularity`).
+ *
+ * @type {import("./src/view/shell/index.ts").ReplySight}
  */
-let replyWasInSight = false;
+const replySight = createReplySight();
 
 /**
  * The chip: up while the channel on screen holds a draft whose box is off screen, saying how many where
  * there are several (`#846 draft-chip-honest`).
  */
 function renderDraftChip() {
-  replyWasInSight = Boolean(replyState.docked) && inSight(el("reply-text"), replyPane().scroller());
+  replySight.keep(Boolean(replyState.docked) && inSight(el("reply-text"), replyPane().scroller()));
   const chip = leftEl("draft-chip");
   const count = draftsOffScreen().length;
   const hidden = count === 0;
@@ -28059,7 +27968,7 @@ function renderSideCards() {
   // `#532 shift-o-latency`. What the whole list is drawn under, then each thread's card and block, then
   // Main's messages: a pass that changes one thread draws that thread again and keeps every other one.
   const whole = JSON.stringify([order, readModes.mode(), readRunsSuspended(), cardPacking.mode(),
-    main.length ? [readModes.mode(), combineMessages, readAloudOwner().nowPlaying ? readAloudOwner().nowPlaying.id : "", readAloudOwner().pendingRead] : ""]);
+    main.length ? [readModes.mode(), combineSwitch.on(), readAloudOwner().nowPlaying ? readAloudOwner().nowPlaying.id : "", readAloudOwner().pendingRead] : ""]);
   const parts = cards.map(sideCardParts);
   const signature = JSON.stringify([whole, parts, main.map((message) => [messageLook(message), readLook(message)])]);
   const more = olderThreadsToRead();
@@ -28973,7 +28882,7 @@ function unpackSignature(choice, held) {
   const opened = readRuns.opened(viewKey("thread", choice.id));
   const cover = channelStore.current().views.get(viewKey("thread", choice.id));
   const view = cardView(choice);
-  return JSON.stringify([choice.id, readModes.mode(), readRunsSuspended(), hideEmptyMessages, combineMessages,
+  return JSON.stringify([choice.id, readModes.mode(), readRunsSuspended(), hideEmptySwitch.on(), combineSwitch.on(),
     view.mode, view.cut ? view.cut.head : 0, view.cut && choice.root ? renderedHtmlOf(choice.root) || rawTextOf(choice.root) : "",
     held.map(messageLook), hidingRead() ? unpackReadSignature(held) : "",
     opened ? [...opened].sort() : [], unpackReadQueue.state(choice.id) || "", readAloudOwner().nowPlaying ? readAloudOwner().nowPlaying.id : "", readAloudOwner().pendingRead,
@@ -29138,35 +29047,35 @@ function queueUnpackRead(id) {
 /** The device's choice of Main channel among the cards: "on", or anything else for cards alone. */
 const THREADS_MAIN_KEY = DEVICE_SETTINGS.threadsMain.key;
 
-/** Whether Main channel is pressed, kept on the server (`#457 settings-server-side`). `#419 threads-view-main-messages`. */
-function storedMainRows() {
-  // A browser refusing storage reads as cards alone (`DEVICE_SETTINGS.threadsMain.refused`).
-  return deviceSettings().get(DEVICE_SETTINGS.threadsMain);
-}
-
-/** Whether the main channel's messages stand among the cards. */
-let mainRowsShown = storedMainRows();
+/**
+ * Whether the main channel's messages stand among the cards: Main channel pressed, kept on the server
+ * (`#457 settings-server-side`) and read from the device here, as the page loads; a browser refusing storage
+ * reads as cards alone (`DEVICE_SETTINGS.threadsMain.refused`). `#419 threads-view-main-messages`. One owner
+ * in web/src/core/settings/switches.ts (`#624 voice-page-modularity`).
+ *
+ * @type {import("./src/core/settings/index.ts").KeptSwitch}
+ */
+const mainRowsChoice = createKeptSwitch({
+  setting: DEVICE_SETTINGS.threadsMain,
+  deviceSettings: () => deviceSettings(),
+});
 
 /** Whether Main's messages belong on screen among the cards: pressed, and the Threads view showing cards. */
-const mainRowsOnScreen = () => mainRowsShown && threadListOnScreen() && columns.side.mode === "list";
+const mainRowsOnScreen = () => mainRowsChoice.on() && threadListOnScreen() && columns.side.mode === "list";
 
 /** Main channel: offered over the Threads view's cards, as Unpack msgs is, and pressed as the reader left it. */
 function renderMainToggle() {
   const button = leftEl("side-main");
   const offered = columns.side.mode === "list" && layoutShown.threadList();
   if (button.hidden === offered) button.hidden = !offered;
-  const pressed = mainRowsShown ? "true" : "false";
+  const pressed = mainRowsChoice.on() ? "true" : "false";
   if (button.getAttribute("aria-pressed") !== pressed) button.setAttribute("aria-pressed", pressed);
 }
 
 /** The reader pressed Main channel, or a: kept, and the cards drawn again. */
 function setMainRowsShown(on) {
-  mainRowsShown = on;
-  try {
-    deviceSettings().keep(DEVICE_SETTINGS.threadsMain, on);
-  } catch (_error) {
-    // A browser that refuses storage still honours the choice for this session.
-  }
+  mainRowsChoice.set(on);
+  mainRowsChoice.keep(on);
   renderMainToggle();
   cardsDrawn.forget();
   if (sideColumnUp()) keepingCardPlace(renderSideColumn);
@@ -29176,8 +29085,8 @@ function setMainRowsShown(on) {
 /** a, over the Threads view: Main's messages among the cards, or the cards alone again. Elsewhere, nothing. */
 function mainRowsFromKeyboard() {
   if (!threadListOnScreen() || columns.side.mode !== "list") return false;
-  setMainRowsShown(!mainRowsShown);
-  setStatus(mainRowsShown ? "The main channel's messages among the threads." : "The threads alone.");
+  setMainRowsShown(!mainRowsChoice.on());
+  setStatus(mainRowsChoice.on() ? "The main channel's messages among the threads." : "The threads alone.");
   return true;
 }
 
@@ -29882,25 +29791,29 @@ const THREAD_CARD_FOLD_KEY = DEVICE_SETTINGS.threadCardFolded.key;
 /** The cards at the top of a thread, one per column, and the list each heads. */
 const THREAD_CARD_LISTS = [["thread-card", "scroll-area"], ["side-thread-card", "side-scroll"]];
 
-/** What was stored. ABSENT MEANS OPEN; a browser that refuses storage reads as nothing stored. */
-function storedThreadCardFolded() {
-  // A browser refusing storage reads as open (`DEVICE_SETTINGS.threadCardFolded.refused`).
-  return deviceSettings().get(DEVICE_SETTINGS.threadCardFolded);
-}
+/**
+ * Whether the cards at the top of a thread are folded to a bar: the reader's choice, kept on the device and
+ * read from it here, as the page loads. ABSENT MEANS OPEN; a browser refusing storage reads as open
+ * (`DEVICE_SETTINGS.threadCardFolded.refused`). One owner in web/src/core/settings/switches.ts
+ * (`#624 voice-page-modularity`).
+ *
+ * @type {import("./src/core/settings/index.ts").KeptSwitch}
+ */
+const threadCardFoldChoice = createKeptSwitch({
+  setting: DEVICE_SETTINGS.threadCardFolded,
+  deviceSettings: () => deviceSettings(),
+});
 
-/** Whether the cards at the top of a thread are folded to a bar: the reader's choice, kept on the device. */
-let threadCardFolded = storedThreadCardFolded();
-
-/** Draw the cards at the top of a thread folded or open, as `threadCardFolded` says: written only where it changed. */
+/** Draw the cards at the top of a thread folded or open, as `threadCardFoldChoice` says: written only where it changed. */
 function renderThreadCardFold() {
   for (const [id] of THREAD_CARD_LISTS) {
     const card = leftEl(id);
-    if (card.hasAttribute("data-folded") !== threadCardFolded) {
-      if (threadCardFolded) card.setAttribute("data-folded", "");
+    if (card.hasAttribute("data-folded") !== threadCardFoldChoice.on()) {
+      if (threadCardFoldChoice.on()) card.setAttribute("data-folded", "");
       else card.removeAttribute("data-folded");
     }
     const button = leftEl(`${id}-text`);
-    const expanded = threadCardFolded ? "false" : "true";
+    const expanded = threadCardFoldChoice.on() ? "false" : "true";
     if (button.getAttribute("aria-expanded") !== expanded) button.setAttribute("aria-expanded", expanded);
   }
 }
@@ -29919,7 +29832,7 @@ function threadCardPressed(card, event) {
   }
   const selection = typeof getSelection === "function" ? getSelection() : null;
   if (selection && !selection.isCollapsed && nodeWithin(card, selection.anchorNode)) return;
-  setThreadCardFolded(!threadCardFolded);
+  setThreadCardFolded(!threadCardFoldChoice.on());
 }
 
 /**
@@ -29935,17 +29848,13 @@ function threadCardPressed(card, event) {
  * @param {boolean} folded
  */
 function setThreadCardFolded(folded) {
-  try {
-    deviceSettings().keep(DEVICE_SETTINGS.threadCardFolded, folded);
-  } catch (_error) {
-    // A browser that refuses storage still honours the choice for this session.
-  }
+  threadCardFoldChoice.keep(folded);
   const held = THREAD_CARD_LISTS.filter(([card]) => drawnOnPage(leftEl(card))).map(([, id]) => {
     const area = leftEl(id);
     return { area, top: area.getBoundingClientRect().top, scrolled: area.scrollTop,
       foot: atBottom(area, 1) && overscrollRoom(area) === 0 };
   });
-  threadCardFolded = folded;
+  threadCardFoldChoice.set(folded);
   renderThreadCardFold();
   // From the scroll position read before, not the one now: a list grown under a reader near its foot has
   // been clamped to its new end by the layout that measured it, and adding to that put them further up.
@@ -30746,93 +30655,28 @@ function catchUpHiddenArrivals() {
 
 const RESUME_KEY = "vibe-talk.voice.resume";
 
-/** Whether the SERVER permits it at all, from `/api/v1/client-config`. */
-let resumeAllowed = false;
-/** The conversation a new call would resume from, or null. */
-let resumeConversationId = null;
 /**
- * What the last attempt actually did — not what it was asked to do.
+ * Resuming, as far as this page holds it: whether the server permits it, the conversation a new call
+ * would resume from, what the last attempt actually did, the reader's switch kept under `RESUME_KEY`,
+ * the clause under the large control and the fetch of a new call's payload. One owner in
+ * web/src/core/call/resume.ts (`#624 voice-page-modularity`), which says what each outcome means.
  *
- * `armed` means a payload really went out on the socket. `dropped` is how many older turns the
- * server's budget left behind, which is the difference between "replayed" and "replayed in part".
- * `failed` means the fetch did not answer. And `attempted` without `armed` is the fourth case that
- * is easy to miss: the fetch WORKED and came back with nothing to replay — an earlier conversation
- * in which nothing was actually said. That must not be reported as a resumption, and it must not
- * be reported as a failure either.
- *
- * `dropped` is kept in that fourth case too, and it is what splits it in two. Nothing went out
- * either way, but `dropped > 0` means the budget threw the WHOLE transcript away — a conversation
- * too long to replay, not an empty one. Saying "there was nothing to replay" about it asserts
- * something false about what was said earlier, which is the exact class of lie this feature is
- * written against; it just happens to be a lie about the past rather than about the present.
- *
- * `#331 resume-on-websocket` adds what a `vibe-talk-v1` bridge did with it, each of which takes
- * `armed` back: `unsupported`, the call's session did not list `replay` and was sent nothing;
- * `refused`, it took the frame and answered that it would not use it; `unsent`, the call ended
- * before its session started. `acked` is the one that keeps it: the bridge said it took the record.
- * And `words`, the server's count of what the record held, null where it named none. `replaced`
- * keeps `armed` too, since the record did go: the voice service then replaced the session that took
- * it, and the one that finished the call was sent none (`noteSessionReplaced`).
+ * @type {import("./src/core/call/index.ts").CallResume}
  */
-let resumeLast = blankResumeLast();
-
-/** What the last attempt did, before it has done anything. */
-function blankResumeLast() {
-  return {
-    attempted: false, armed: false, dropped: 0, failed: false, words: null,
-    acked: false, refused: false, unsupported: false, unsent: false, replaced: false,
-  };
-}
-
-const resumeWanted = () => deviceStorage().getItem(RESUME_KEY) === "on";
-
-function persistResume(on) {
-  try {
-    deviceStorage().setItem(RESUME_KEY, on ? "on" : "off");
-  } catch (_error) {
-    // Same as the relay toggle: honoured for this session, not remembered. Better than failing.
-  }
-}
-
-/** Will the NEXT call carry a replay? Everything the screen says is derived from this. */
-const resumeArmed = () =>
-  Boolean(resumeAllowed && resumeWanted() && resumeConversationId && !resumeLast.failed);
-
-/**
- * The clause under the large control, and the one place this feature could lie.
- *
- * Five answers, and every one that begins "the agent starts fresh" carries a different reason:
- * both the off state and the failed one mean the agent starts fresh, and only one of them is what
- * the reader asked for. The two empty ones are split the same way — an earlier conversation that
- * held nothing and one the budget could not fit are the same silence with opposite meanings.
- */
-function resumeNote() {
-  if (!resumeAllowed || !resumeWanted() || !resumeConversationId) {
-    return "the agent starts fresh";
-  }
-  if (resumeLast.failed) {
-    return "the agent starts fresh — the earlier conversation could not be read";
-  }
-  // `#331 resume-on-websocket`. The voice service would not take the last one.
-  if (resumeLast.refused || resumeLast.unsupported) {
-    return "the agent starts fresh — the voice service took no recap";
-  }
-  // A call that ended before its session started was sent nothing, and the next one will be.
-  if (resumeLast.unsent) {
-    return resumeLast.dropped > 0
-      ? "the earlier conversation is replayed in part"
-      : "the earlier conversation is replayed";
-  }
-  if (resumeLast.attempted && !resumeLast.armed) {
-    return resumeLast.dropped > 0
-      ? "the agent starts fresh — the earlier conversation was too long to replay"
-      : "the agent starts fresh — there was nothing to replay";
-  }
-  if (resumeLast.armed && resumeLast.dropped > 0) {
-    return "the earlier conversation is replayed in part";
-  }
-  return "the earlier conversation is replayed";
-}
+const callResume = createCallResume({
+  key: RESUME_KEY,
+  storage: () => deviceStorage(),
+  api: (path) => api(path),
+  addDetail: (text) => addDetail(text),
+  render: () => renderResumeState(),
+});
+const {
+  wanted: resumeWanted,
+  persist: persistResume,
+  armed: resumeArmed,
+  note: resumeNote,
+  fetchPayload: fetchResume,
+} = callResume;
 
 /**
  * What Settings says under Resuming: ONE SHORT LINE per state.
@@ -30848,9 +30692,9 @@ function resumeNote() {
 const resumePreference = mountResumePreference({
   lookup: (id) => el(id),
   read: {
-    get allowed() { return resumeAllowed; },
-    get last() { return resumeLast; },
-    get conversationId() { return resumeConversationId; },
+    get allowed() { return callResume.allowed(); },
+    get last() { return callResume.last(); },
+    get conversationId() { return callResume.conversationId(); },
     get replayUnavailable() { return voiceTranscript().replayUnavailable; },
     wanted: () => resumeWanted(),
   },
@@ -30859,58 +30703,6 @@ const resumePreference = mountResumePreference({
 
 function renderResumeState() {
   resumePreference.render();
-}
-
-/**
- * Fetch the payload for a new call. NEVER throws, and never leaves the state stale.
- *
- * Answers the payload, or null when there is nothing to send — which includes every failure. The
- * caller does not branch on why; the SCREEN does, off `resumeLast`.
- */
-async function fetchResume() {
-  resumeLast = blankResumeLast();
-  if (!resumeAllowed || !resumeWanted() || !resumeConversationId) {
-    renderResumeState();
-    return null;
-  }
-  resumeLast.attempted = true;
-  let payload = null;
-  try {
-    payload = await api(
-      `/api/v1/conversations/${encodeURIComponent(resumeConversationId)}/replay`
-    );
-  } catch (error) {
-    resumeLast = { ...blankResumeLast(), attempted: true, failed: true };
-    // The connection details, not the error panel: a lost reconstruction must not look like a
-    // broken call, and the call is about to open perfectly well.
-    addDetail(`the earlier conversation could not be replayed: ${error.message}`);
-    renderResumeState();
-    return null;
-  }
-  // `included > 0` is the gate, not `text`: an empty transcript answers 200 with an empty payload
-  // on purpose, and sending a "you are resuming" preamble with no record behind it is the false
-  // continuity claim this whole feature is written against.
-  if (!payload || payload.enabled !== true || !(payload.included > 0) || !payload.text) {
-    // Nothing goes out — but `dropped` still has to be carried, because it is the only thing that
-    // separates "the earlier conversation was empty" from "the budget dropped all of it". The
-    // screen says opposite things about those two and only one of them can be true.
-    resumeLast = {
-      ...blankResumeLast(),
-      attempted: true,
-      dropped: Number((payload && payload.dropped) || 0),
-    };
-    renderResumeState();
-    return null;
-  }
-  resumeLast = {
-    ...blankResumeLast(),
-    attempted: true,
-    armed: true,
-    dropped: Number(payload.dropped) || 0,
-    words: typeof payload.words === "number" ? payload.words : null,
-  };
-  renderResumeState();
-  return payload;
 }
 
 // --- the live channel stream -------------------------------------------------------------------
@@ -31167,21 +30959,6 @@ function startChannelStream(channelId, resumeFrom = null) {
   liveFollow.start(channelId, resumeFrom);
 }
 
-/**
- * Hand each Server-Sent Event of `reader` to `onFrame` until the response ends, or `current()` says
- * the stream it belongs to was stopped. Shared by the channel's stream and, since `#337
- * voice-relay-silent`, the stream of every channel. Answers `reset` when a frame's handler said the
- * server reset the stream, and `ended` otherwise.
- *
- * @param {ReadableStreamDefaultReader<Uint8Array>} reader
- * @param {() => boolean} current
- * @param {(frame: {id: string | null, event: string, data: string}) => (string | void)} onFrame
- * @returns {Promise<"reset" | "ended">}
- */
-function readEventStream(reader, current, onFrame) {
-  return readEventFrames(reader, current, onFrame, new TextDecoder());
-}
-
 // One SSE frame, as fields (`parseEventFrame`), is web/src/core/sync's, with the reading
 // (`readEventStream`, `#624 voice-page-modularity`).
 
@@ -31196,7 +30973,7 @@ function onStreamFrame(frame) {
     // `#337 voice-relay-silent`. The re-read puts the channel right; whether a call heard what fell
     // into the gap cannot be known, so it is said — unless the stream of every channel, which
     // carries this channel too, is what the call is hearing from.
-    if (!watchAllAttached && voiceCall().canSendText() && relayMode() !== "off") voiceCall().reportUnrelayed([], "gap");
+    if (!watchAll.attached() && voiceCall().canSendText() && relayMode() !== "off") voiceCall().reportUnrelayed([], "gap");
     setStatus("the live feed fell behind — re-reading the channel.");
     refreshQuietly(() => loadDiscord({ keepPosition: true, reason: "reset" }))();
     // `#457 settings-server-side`. The same gap could hide a settings frame: re-read.
@@ -31619,114 +31396,52 @@ function channelLabel(channelId) {
 // server that predates it answers 404, and the connection details say that only the channel on
 // screen is read out.
 
-/** Bumped on every start and stop of the stream of every channel, as the channel stream's is (`liveFollow`). */
-const watchAllGeneration = createStreamGeneration();
-/** The cursor of the last event it delivered, sent back as `Last-Event-ID` on a reconnect. */
-let watchAllLastEventId = null;
-/** Whether its response body is open now. */
-let watchAllAttached = false;
-/** Whether the attach now open resumed from a cursor: what it replays, the call missed. */
-let watchAllResumed = false;
-/** False once the server answered 404: it cannot stream every channel, and is not asked again. */
-let watchAllSupported = true;
 /**
- * Aborts the attach now open, where the browser can: a call that has ended lets its connection go at
- * once rather than at the stream's next keep-alive, so a phone on HTTP/1.1 does not spend one of
- * its few connections to this server on a stream nobody reads.
+ * The stream of every channel: its generation, the cursor of the last event it delivered, whether its
+ * response body is open and whether that attach resumed from a cursor, whether the server can stream
+ * every channel at all, the handle that lets the attach now open go, and the loop that reads it and
+ * retries, as the channel stream's are (`liveFollow`): one owner in web/src/core/sync/watchall.ts
+ * (`#624 voice-page-modularity`). The request and what each frame means are the page's.
  *
- * @type {AbortController | null}
+ * @type {import("./src/core/sync/index.ts").WatchAll}
  */
-let watchAllAbort = null;
+const watchAll = createWatchAll({
+  clock: clockOnUse(),
+  token: () => token(),
+  delivery: () => providerFacts.liveDelivery(),
+  // Where the browser can, a call that has ended lets its connection go at once rather than at the
+  // stream's next keep-alive, so a phone on HTTP/1.1 does not spend one of its few connections to this
+  // server on a stream nobody reads.
+  abortable: () => (typeof AbortController === "function" ? new AbortController() : null),
+  open: (path, headers, abort) => fetch(path, abort ? { headers, signal: abort.signal } : { headers }),
+  decoder: () => new TextDecoder(),
+  frame: (frame) => onWatchAllFrame(frame),
+  dropped: (why) => addDetail(`the stream of every channel dropped: ${why}`),
+  unsupported: () => addDetail("this server cannot stream every channel at once, so a call reads out new messages only " +
+    "from the channel on screen"),
+  guard: (run) => guardQuietly(run)(),
+});
 
 /** Follow every watched channel for the call that has just connected. */
 function startWatchAll() {
-  stopWatchAll();
-  if (!watchAllSupported || providerFacts.liveDelivery() === "off" || !token()) return;
-  const generation = watchAllGeneration.current();
-  guardQuietly(() => followWatchAll(generation))();
+  watchAll.start();
 }
 
 /** Stop following every channel. Idempotent. */
 function stopWatchAll() {
-  watchAllGeneration.bump();
-  if (watchAllAbort !== null) {
-    try {
-      watchAllAbort.abort();
-    } catch (_error) {
-      // Already finished: there is nothing left to let go.
-    }
-    watchAllAbort = null;
-  }
-  watchAllAttached = false;
-  watchAllResumed = false;
-  watchAllLastEventId = null;
+  watchAll.stop();
 }
 
 /**
- * Read the stream of every channel, and keep reading it, as `liveFollow` does one channel's
- * (web/src/core/sync/follow.ts `followChannel`).
- */
-async function followWatchAll(generation) {
-  while (generation === watchAllGeneration.current()) {
-    let ended = "dropped";
-    try {
-      ended = await readWatchAll(generation);
-    } catch (error) {
-      if (generation !== watchAllGeneration.current()) return;
-      addDetail(`the stream of every channel dropped: ${error.message}`);
-    }
-    if (generation !== watchAllGeneration.current() || ended === "unsupported") return;
-    watchAllAttached = false;
-    // A reset is answered at once, from now: the gap has been said, and waiting would widen it.
-    if (ended === "reset") continue;
-    const resumed = await new Promise((resolve) => {
-      setTimeout(() => resolve(generation === watchAllGeneration.current()), LIVE_RETRY_MS);
-    });
-    if (!resumed) return;
-  }
-}
-
-/**
- * One attach of the stream of every channel, until it ends. Answers how: `unsupported` for a server
- * without it, `reset` when it said the gap cannot be filled, `ended` otherwise.
- */
-async function readWatchAll(generation) {
-  const headers = { Authorization: `Bearer ${token()}` };
-  if (watchAllLastEventId) headers["Last-Event-ID"] = watchAllLastEventId;
-  const resumed = Boolean(watchAllLastEventId);
-  const abort = typeof AbortController === "function" ? new AbortController() : null;
-  watchAllAbort = abort;
-  const response = await fetch("/api/v1/live/stream", abort ? { headers, signal: abort.signal } : { headers });
-  if (generation !== watchAllGeneration.current()) return "ended";
-  if (response.status === 404) {
-    watchAllSupported = false;
-    addDetail("this server cannot stream every channel at once, so a call reads out new messages only " +
-      "from the channel on screen");
-    return "unsupported";
-  }
-  if (!response.ok) {
-    throw new Error(`it was refused (HTTP ${response.status})`);
-  }
-  const body = response.body;
-  if (!body || typeof body.getReader !== "function") {
-    throw new Error("this browser cannot read a streaming response");
-  }
-  watchAllAttached = true;
-  watchAllResumed = resumed;
-  return readEventStream(body.getReader(), () => generation === watchAllGeneration.current(), onWatchAllFrame);
-}
-
-/**
- * One frame of the stream of every channel. Its `id` is the cursor over every channel; a message is
- * relayed as one from the channel's own stream is, under the same guards and the same ledger.
+ * One frame of the stream of every channel, its cursor (the cursor over every channel) already taken
+ * down by `watchAll`, and dropped there on a reset. A message is relayed as one from the channel's own
+ * stream is, under the same guards and the same ledger.
  *
  * @returns {"reset" | undefined} `reset` when the server said it cannot fill the gap
  */
 function onWatchAllFrame(frame) {
-  if (frame.id) watchAllLastEventId = frame.id;
   if (frame.event === "reset") {
     refreshServerSettings().catch(() => {});
-    watchAllLastEventId = null;
     if (voiceCall().canSendText() && relayMode() !== "off") voiceCall().reportUnrelayed([], "gap");
     return "reset";
   }
@@ -31746,7 +31461,7 @@ function onWatchAllFrame(frame) {
   if (payload.self_posted && typeof payload.client_key === "string") settleFromServer(payload.client_key);
   voiceCall().relayToAgent(payload.message, payload.self_posted, payload.replayed, {
     fromTail: payload.from_tail === true,
-    resumed: watchAllResumed,
+    resumed: watchAll.resumed(),
   });
   return undefined;
 }
@@ -32153,11 +31868,14 @@ const noTokenSentence = () => (signedOutByRename() ? NO_TOKEN_AFTER_RENAME : NO_
 // Everything about HOW THE AGENT BEHAVES is owned by the selected provider. The provider trait
 // supplies the human name and, where applicable, a direct settings URL and instance id. The page
 // neither recognizes vendor names nor constructs vendor URLs.
-let conversationalVoice = {
-  name: "voice provider",
-  settings_url: null,
-  instance_id: null,
-};
+
+/**
+ * The conversational voice as the selected provider describes it in client-config: one owner in
+ * web/src/core/call/provider.ts (`#624 voice-page-modularity`).
+ *
+ * @type {import("./src/core/call/index.ts").VoiceProvider}
+ */
+const voiceProvider = createVoiceProvider();
 
 function applyClientConfig(config) {
   const speech = config.read_aloud;
@@ -32219,22 +31937,8 @@ function applyClientConfig(config) {
   // `ownerAuthorId` in web/src/core/channels/identities.ts.
   whoIsWho.setOwnerAuthorId(config && config.owner_author_id);
   whoIsWho.learnOwnerIds(config && config.owner_author_ids);
-  const describedVoice = config && config.conversational_voice;
-  conversationalVoice = {
-    name:
-      describedVoice && typeof describedVoice.name === "string" && describedVoice.name.trim()
-        ? describedVoice.name.trim()
-        : "voice provider",
-    settings_url:
-      describedVoice && typeof describedVoice.settings_url === "string"
-        ? describedVoice.settings_url
-        : null,
-    instance_id:
-      describedVoice && typeof describedVoice.instance_id === "string"
-        ? describedVoice.instance_id
-        : null,
-  };
-  voiceCall().session.providerName = conversationalVoice.name;
+  voiceProvider.learn(config && config.conversational_voice);
+  voiceCall().session.providerName = voiceProvider.current().name;
   settingsReadouts.agentLink();
   // `#39 channel-alias`. Both pickers are drawn from the same list and through the same naming
   // rule, so the name in the bar and the name in Settings are one answer rather than two.
@@ -32287,7 +31991,7 @@ function applyClientConfig(config) {
   upstreamClearBox.render();
   // `#46 conversation-replay`. What the SERVER permits, which is not the same as what the reader
   // has asked for — and the screen has to be able to say which of the two is stopping it.
-  resumeAllowed = config.replay_enabled === true;
+  callResume.setAllowed(config.replay_enabled === true);
   // `#270 voice-transcript-markers`. Records, `records=1` and the send memory's cursor go only to a
   // server that says it takes them.
   voiceTranscript().transcriptRecordsSupported = config.transcript_records_supported === true;
@@ -32400,18 +32104,18 @@ async function signIn() {
 // did the click register, and did the save work? So the button itself changes — immediately on
 // click, and again on the result — and the line under it states what is stored right now.
 const SAVE_LABEL = "Save token";
-let saveRevert = null;
-
-function markSave(label, className, disabled) {
-  const button = el("save-token");
-  button.textContent = label;
-  button.className = className;
-  button.disabled = disabled;
-  if (saveRevert !== null) {
-    clearTimeout(saveRevert);
-    saveRevert = null;
-  }
-}
+/**
+ * The Save button's words, look and state, and the timer putting it back to SAVE_LABEL after a save: one
+ * owner in web/src/view/settings/savetoken.ts (`#624 voice-page-modularity`).
+ *
+ * @type {import("./src/view/settings/index.ts").SaveTokenButton}
+ */
+const saveTokenButton = mountSaveTokenButton({
+  lookup: (id) => el(id),
+  setTimeout: (run, ms) => setTimeout(run, ms),
+  clearTimeout: (timer) => clearTimeout(timer),
+});
+const { markSave } = saveTokenButton;
 
 async function saveToken() {
   clearError();
@@ -32446,7 +32150,7 @@ async function saveToken() {
   markSave("Saved ✓", "ok", false);
   setTokenState("token saved in this browser");
   setStatus("ready");
-  saveRevert = setTimeout(() => {
+  saveTokenButton.revertLater(() => {
     markSave(SAVE_LABEL, "", false);
   }, 2500);
   // Only once the server took it: a refused token stays in the box, to be corrected, not pasted again.
@@ -32570,13 +32274,13 @@ function settingsSyncView() {
     renderIdentities: () => identityList.render(),
     readMode: (value) => setReadMode(value),
     markOwnRead: () => {
-      applyMarkOwnRead(storedMarkOwnRead());
+      ownReadSwitch.apply(ownReadSwitch.stored());
     },
     hideEmptyMessages: () => {
-      applyHideEmptyMessages(storedHideEmptyMessages());
+      hideEmptySwitch.apply(hideEmptySwitch.stored());
     },
     combineMessages: () => {
-      applyCombineMessages(storedCombineMessages());
+      combineSwitch.apply(combineSwitch.stored());
     },
     richHeaders: () => {
       applyRichHeaders(storedRichHeaders());
@@ -32585,18 +32289,18 @@ function settingsSyncView() {
       applySummarizeCollapsed(storedSummarizeCollapsed());
     },
     inAppLinks: () => {
-      applyInAppLinks(storedInAppLinks());
+      inAppLinks.apply(inAppLinks.stored());
       redrawMessageLinks();
     },
     openInView: () => {
       renderOpenInView();
     },
     collapsedLines: () => {
-      applyCollapsedLines(storedCollapsedLines());
+      collapsedLines.apply(collapsedLines.stored());
       refreshElisionLines();
     },
     cardMaxLines: () => {
-      keepingCardPlace(() => applyCardMaxLines(storedCardMaxLines()));
+      keepingCardPlace(() => cardMaxLines.apply(cardMaxLines.stored()));
     },
     readSpeed: () => {
       readAloudOwner().applyReadSpeed(readAloudOwner().storedReadSpeed());
@@ -32608,7 +32312,7 @@ function settingsSyncView() {
       readAloudOwner().setWitVoice(readAloudOwner().storedWitVoice(), false);
     },
     quoteReadPercent: () => {
-      applyQuoteReadPercent(storedQuoteReadPercent());
+      quoteReadPercent.apply(quoteReadPercent.stored());
     },
     relay: () => {
       renderReadNew();
@@ -32636,13 +32340,13 @@ function settingsSyncView() {
       if (sideColumnUp()) renderSideColumn();
     },
     threadsMain: () => {
-      setMainRowsShown(storedMainRows());
+      setMainRowsShown(mainRowsChoice.stored());
     },
     threadOrder: () => {
       setThreadOrder(threadOrders.stored());
     },
     threadCardFold: () => {
-      setThreadCardFolded(storedThreadCardFolded());
+      setThreadCardFolded(threadCardFoldChoice.stored());
     },
   });
   return pageSettingsSyncView;
@@ -32747,14 +32451,15 @@ el("resume-toggle").checked = resumeWanted();
 el("resume-toggle").addEventListener("change", () => {
   // `#331 resume-on-websocket`. Disabled where this server cannot resume, so nothing can change it
   // there; and were something to, the choice is not taken from a switch that is not in force.
-  if (!resumeAllowed) {
+  if (!callResume.allowed()) {
     renderResumeState();
     return;
   }
   const on = el("resume-toggle").checked;
   persistResume(on);
-  // Deliberately NOT clearing `resumeLast`: everything the screen says about resuming is already
-  // gated on the switch, so an outcome from before it was flipped cannot be read out under it.
+  // Deliberately NOT clearing the last outcome (`callResume.last()`): everything the screen says
+  // about resuming is already gated on the switch, so an outcome from before it was flipped cannot
+  // be read out under it.
   // Clearing here as well would be a second place that decides the same thing.
   renderResumeState();
   setStatus(
@@ -32771,19 +32476,19 @@ readingWidthControl.apply(storedReadingWidth());
 textSize.apply(storedMsgScale());
 // `#425 collapsed-lines`. Before anything is drawn, for the same reason: a first list folded at
 // three and refolded at the reader's count a moment later is a jump nobody asked for.
-applyCollapsedLines(storedCollapsedLines());
+collapsedLines.apply(collapsedLines.stored());
 // Before the first card is drawn: nothing to draw again yet.
-applyCardMaxLines(storedCardMaxLines(), false);
-applyQuoteReadPercent(storedQuoteReadPercent());
+cardMaxLines.apply(cardMaxLines.stored(), false);
+quoteReadPercent.apply(quoteReadPercent.stored());
 readAloudOwner().applyReadSpeed(readAloudOwner().storedReadSpeed());
-applyMarkOwnRead(storedMarkOwnRead());
-applyCombineMessages(storedCombineMessages());
-applyHideEmptyMessages(storedHideEmptyMessages());
+ownReadSwitch.apply(ownReadSwitch.stored());
+combineSwitch.apply(combineSwitch.stored());
+hideEmptySwitch.apply(hideEmptySwitch.stored());
 applyRichHeaders(storedRichHeaders());
-applyInAppLinks(storedInAppLinks());
+inAppLinks.apply(inAppLinks.stored());
 renderOpenInView();
 applySummarizeCollapsed(storedSummarizeCollapsed());
-applyEnterSends(storedEnterSends());
+enterSends.apply(enterSends.stored());
 // `#340 composer-grow-box`. Drawn as stored, and stored only once the reader ticks one: absent means off.
 renderComposerGrow(storedComposerGrow());
 for (const id of COMPOSER_GROW_IDS) {
@@ -32841,9 +32546,9 @@ window.addEventListener("keydown", onEverywhereKey, { capture: true });
 // `#296 copy-highlighted-message`. A copy with nothing selected copies the highlighted message.
 document.addEventListener("beforecopy", onPageBeforeCopy);
 document.addEventListener("copy", onPageCopy);
-singleKeys = storedSingleKeys();
+singleKeys.restore();
 renderKeyHints();
-el("single-keys").addEventListener("change", () => applySingleKeys(el("single-keys").checked));
+el("single-keys").addEventListener("change", () => singleKeys.apply(el("single-keys").checked));
 // A click in a list selects its row, so that the next key starts there; the focus arriving in a list
 // makes it the one in use, and a row it lands in the selection. `#239 single-selection`: a real mouse
 // move over a row selects it, and a pointer's kind says whether its click or tap is drawn.
@@ -32981,7 +32686,7 @@ el("summarize-collapsed").addEventListener("change", messagePreferences.summarie
 
 // `#225 enter-to-send`. Nothing to redraw and nothing to say on the status line: the hint under the
 // switch changes in place, and the next Enter in any box follows it.
-el("enter-sends").addEventListener("change", () => applyEnterSends(el("enter-sends").checked));
+el("enter-sends").addEventListener("change", () => enterSends.apply(el("enter-sends").checked));
 
 // `#240 reading-bookmark`. The chip is the left column's, as b is.
 el("jump-bookmark").addEventListener("click", () => guardQuietly(jumpToBookmark)());
@@ -33142,7 +32847,7 @@ for (const entry of CANNED_PROMPTS) {
 // The opener. A plain toggle: the button that shows the tray is the button that hides it again,
 // which is the only interaction model that needs no second control and no tap-outside handler to
 // escape from.
-el("prompts-open").addEventListener("click", () => setPromptsOpen(!promptsOpen));
+el("prompts-open").addEventListener("click", () => setPromptsOpen(!promptsTray.open()));
 // `#820 voice-page-action-menu`. The action menu's opener, a toggle as the tray's is.
 el("action-menu-open").addEventListener("click", () => setActionMenuOpen(!actionMenu.open()));
 setActionMenuOpen(false);
@@ -33280,7 +32985,7 @@ el("side-more-threads").addEventListener("click", guardQuietly(loadOlderThreads)
 leftEl("side-search-replies").addEventListener("click", guardQuietly(repliesControlPressed));
 // `#404 threads-unpack-all`. Every thread's messages under its card, in the Threads view.
 leftEl("side-unpack").addEventListener("click", () => setUnpackMode(cardPacking.nextMode()));
-leftEl("side-main").addEventListener("click", () => setMainRowsShown(!mainRowsShown));
+leftEl("side-main").addEventListener("click", () => setMainRowsShown(!mainRowsChoice.on()));
 // `#426 threads-sort-toggle`. The cards' order, in the Threads view.
 leftEl("side-order").addEventListener("click", () => setThreadOrder(nextThreadOrder()));
 renderUnpackToggle();
@@ -33454,11 +33159,10 @@ el("reply-discard-yes").addEventListener("click", () => answerReplyDiscard(true)
 el("reply-discard-no").addEventListener("click", () => answerReplyDiscard(false));
 // `#846 draft-chip-honest`. A reply open in the stream scrolls on and off screen with its list: the chip
 // follows, once a frame.
-// Redrawn only when the reply crosses its list's edge (`replyWasInSight`), not on every frame of a scroll.
+// Redrawn only when the reply crosses its list's edge (`replySight`), not on every frame of a scroll.
 const draftChipFrame = createOncePerFrame(() => {
   const now = replyState.docked && inSight(el("reply-text"), replyPane().scroller());
-  if (now === replyWasInSight) return;
-  replyWasInSight = now;
+  if (!replySight.crossed(now)) return;
   renderDraftChip();
 }, () => (typeof requestAnimationFrame === "function" ? requestAnimationFrame : null));
 for (const id of ["scroll-area", "side-scroll"]) {
