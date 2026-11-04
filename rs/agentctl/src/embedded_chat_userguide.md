@@ -893,6 +893,34 @@ tried again at most every minute while the miss lasts. The bridge records where
 reply text comes from, and the current misses, in `reply-source.json` in its
 state directory.
 
+The transcript followed is always the current target's (#852
+unknown-tui-bridge). A `chat repoint` drops everything read of the previous
+agent and looks for the new agent's transcript at once; while a headless agent
+is the target nothing is read, since it replies only through `chat reply`. A
+target whose harness writes no transcript agentctl reads, such as one adopted
+with `--harness unknown`, replies through its screen: `chat health` says
+`reply text: the screen only: the target's harness (unknown) writes no
+transcript agentctl reads ...`, and never names another agent's transcript (a
+`reply-source.json` written for the previous agent reads `not looked for yet`
+until the service records the new one).
+
+Its screen is read in the layout above even when its program draws it
+differently. A screen whose every row starts one or more columns in, with turns
+labelled `You: ` and `Agent: ` (as agentterm draws them), loses that margin,
+its input frame at the bottom and any box down its right edge; a `You: ` row is
+read as a prompt row and the wrapped rows of an `Agent: ` row as its text. On
+such a screen a tag that shares its row with other text still counts: in
+`Agent: <CHAT_REPLY_046>` the label is dropped, text after an opening tag on its
+row is the reply's first line, text before a closing tag its last, text after
+a closing tag is dropped, and a row holding both tags is a whole reply. Rows
+are joined where the pane wrapped them at a word boundary. A block under an
+unknown ID, one with no closing tag, and a closing tag with no block are each
+reported to the agent, as on any screen. On every screen, the rows of the
+bridge's own request prompt that name the tags (its `reply: <CHAT_REPLY_ID>`
+header field and its `Reply between a line ...` instruction) are never read as
+tags, and every notice about a reply that did not go out ends by naming
+`agentctl chat reply ID --file FILE`.
+
 A reply printed between its two marker lines reaches the user only if the
 service reads it from the agent's screen, and a terminal agent can redraw or
 clear its screen before that read. With `chat run --offer-reply-command`, an

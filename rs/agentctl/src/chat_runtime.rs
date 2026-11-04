@@ -40,6 +40,7 @@ mod observe;
 mod rejections;
 mod reply_reminders;
 mod repoint;
+mod screen_layout;
 
 pub use held_replies::{parse_held_handle, HeldReply, HoldReason, DEFAULT_HOLD_REPLIES_OLDER_THAN};
 
@@ -5322,6 +5323,11 @@ pub(crate) trait TranscriptReplies: Send + fmt::Debug {
     fn following(&self) -> bool {
         false
     }
+
+    /// Follow `agent`'s transcript from now on (`None`: a headless agent, whose transcript is not
+    /// read), dropping what was read of the agent followed before: a repoint changed the bridge's
+    /// target (#852 unknown-tui-bridge).
+    fn retarget(&mut self, _agent: Option<&str>) {}
 }
 
 /// How long a screen block that a followed transcript does not pair is held back, from when a
@@ -14586,7 +14592,10 @@ pub(crate) fn deliver_fence_feedback_covering(
     } else {
         Vec::new()
     };
-    let prompt = routing_notice(&unavailable, &open, unix_millis());
+    let prompt = format!(
+        "{}\n{REPLY_COMMAND_HINT}",
+        routing_notice(&unavailable, &open, unix_millis())
+    );
     // Covered entries go with the notice only as far as its record holds them and the history
     // keeps them beside the entries the notice names, counting each entry the history holds, as
     // its limit does; the rest are recorded in the write that saves the notice, as far as the
@@ -14839,6 +14848,12 @@ received.",
     }
     lines.join("\n")
 }
+
+/// The last line of every routing notice the coordinator is given, after [`routing_notice`]: the
+/// way to send a reply that the marker lines cannot carry (#852 unknown-tui-bridge).
+const REPLY_COMMAND_HINT: &str = "If a reply cannot get through between the lines, write it to a \
+file and send it with `agentctl chat reply ID --file FILE`, where ID is the reply ID of its \
+request.";
 
 /// The request a block under an unmatched ID was probably meant for: the only open request with
 /// no reply yet whose prompt may have been seen, when there is exactly one and its prompt is
@@ -16607,6 +16622,12 @@ fn scan_reply_blocks_for_nonces(
         ));
     }
     let normalized = rendered.replace("\r\n", "\n");
+    // A TUI that draws its conversation behind a margin is read in the layout below (#852
+    // unknown-tui-bridge), and its rows are read for tags that share a row with other text.
+    let (normalized, lenient_rows) = match screen_layout::normalize(&normalized) {
+        std::borrow::Cow::Owned(laid_out) => (laid_out, true),
+        std::borrow::Cow::Borrowed(_) => (normalized, false),
+    };
     let mut events = ScanEvents::default();
     // The newest opening tag in a row with other text while no block is open, while the rows
     // after it are read for a closing tag of its ID.
@@ -16678,7 +16699,33 @@ fn scan_reply_blocks_for_nonces(
             tag_fence = None;
         }
         let (undecorated, margin, decorated) = undecorate(line);
-        let standalone = parse_marker(&undecorated);
+        // The bridge's own request prompt names the reply tags in its text (`reply:
+        // <CHAT_REPLY_…>` and `Reply between a line <CHAT_REPLY_…> and a line …`); a row of it,
+        // echoed or quoted, is never read for tags (#852 unknown-tui-bridge).
+        let own_prompt = bridge_prompt_row(&undecorated);
+        // On a screen laid out by `screen_layout`, a tag that shares its row with other text is
+        // read leniently as a marker (#852 unknown-tui-bridge): `Agent: <CHAT_REPLY_046>` opens
+        // block 046, text after an opening tag on its row is the first line of the reply, and
+        // text before a closing tag the last. Not in a code fence, a prompt row, tool output, a
+        // tool call's command, or the bridge's own prompt text, nor for a tag inside a backtick
+        // code span, which quotes it.
+        let mut lenient: Option<LenientText> = None;
+        let standalone = parse_marker(&undecorated).or_else(|| {
+            if !lenient_rows
+                || !anchored
+                || own_prompt
+                || fence.is_some()
+                || command.is_some()
+                || prompt_row(stripped)
+                || tool_output_row(stripped)
+                || tool_call(&undecorated, decorated).is_some()
+            {
+                return None;
+            }
+            let (marker, text) = lenient_marker(&undecorated)?;
+            lenient = Some(text);
+            Some(marker)
+        });
         // A prompt row left of an open block's margin starts a new item, so the block ends
         // unclosed. A prompt row inside the margin is part of the block.
         let prompt = prompt_row(stripped)
@@ -16717,7 +16764,7 @@ fn scan_reply_blocks_for_nonces(
         // The tags of open requests in a row with other text. Above the first row at column 0, a
         // row can belong to a prompt echo, such as the request prompt's own instruction, so no
         // tag there is read.
-        let tags = if anchored && standalone.is_none() {
+        let tags = if anchored && standalone.is_none() && !own_prompt {
             row_tags(&undecorated, inline_nonces, aliases)
         } else {
             Vec::new()
@@ -16932,16 +16979,64 @@ fn scan_reply_blocks_for_nonces(
             inline_in_command: None,
         };
 
+        // The text a lenient marker's row holds beside its tag: see `lenient_marker`.
+        let (after_opening, closed_in_row, before_closing) = match lenient {
+            Some(LenientText::Opening { after, closed }) => (Some(after), closed, None),
+            Some(LenientText::Closing { before }) => (None, None, Some(before)),
+            None => (None, None, None),
+        };
+        let lenient_opening = |nonce: &str, margin: String| {
+            let mut opened = opening(nonce, margin.clone());
+            if let Some(after) = after_opening
+                .as_deref()
+                .filter(|text| !text.trim().is_empty())
+            {
+                opened.body.push(format!("{margin}{after}"));
+            }
+            opened
+        };
+        let closed_block = |opened: ActiveReply, margin: &str| {
+            let event = match reply_body(&opened.body, &opened.opening_margin, margin, lenient_rows)
+            {
+                Ok(body) => ScanEvent::Block(ScannedReply {
+                    identifier: opened.identifier,
+                    body,
+                }),
+                Err(error) => ScanEvent::Refused(ReplyRefusal::new(
+                    &opened.identifier,
+                    &opened.body.join("\n"),
+                    error,
+                )),
+            };
+            (opened.nonce, event)
+        };
+
         match (active.take(), marker.closing) {
             // Above the first row at column 0, an opening marker can belong to a prompt echo or
             // tool output whose first row is out of view, so it opens no block. A closing marker
             // after it is read as a partial block, which is never sent.
             (None, false) if !anchored => {}
-            (None, false) => active = expected.map(|nonce| opening(nonce, margin)),
+            (None, false) => {
+                active = expected.map(|nonce| lenient_opening(nonce, margin.clone()));
+                // A row that opens and closes its block, `<CHAT_REPLY_046>Done.</CHAT_REPLY_046>`.
+                if let Some(inner) = closed_in_row.as_deref() {
+                    if let Some(mut opened) = active.take() {
+                        opened.body.clear();
+                        opened.body.push(format!("{margin}{inner}"));
+                        events.push(closed_block(opened, &margin));
+                    }
+                }
+            }
             (None, true) => {
                 let unopened = expected.map(|nonce| {
                     // `head` ends with this closing marker line.
-                    let text = head[..head.len().saturating_sub(1)].join("\n");
+                    let mut text = head[..head.len().saturating_sub(1)].join("\n");
+                    if let Some(before) = before_closing.as_deref() {
+                        if !text.is_empty() {
+                            text.push('\n');
+                        }
+                        text.push_str(before);
+                    }
                     (
                         nonce.to_owned(),
                         PartialBlock::Unopened {
@@ -16966,26 +17061,28 @@ fn scan_reply_blocks_for_nonces(
             }
             (Some(opened), false) => {
                 opened.push_unclosed(&mut events, &mut command);
-                active = expected.map(|nonce| opening(nonce, margin));
+                active = expected.map(|nonce| lenient_opening(nonce, margin.clone()));
+                if let Some(inner) = closed_in_row.as_deref() {
+                    if let Some(mut opened) = active.take() {
+                        opened.body.clear();
+                        opened.body.push(format!("{margin}{inner}"));
+                        events.push(closed_block(opened, &margin));
+                    }
+                }
             }
             (Some(opened), true)
                 if opened.identifier != marker.identifier || opened.protocol != marker.protocol =>
             {
                 opened.push_unclosed(&mut events, &mut command);
             }
-            (Some(opened), true) => {
-                let event = match reply_body(&opened.body, &opened.opening_margin, &margin) {
-                    Ok(body) => ScanEvent::Block(ScannedReply {
-                        identifier: opened.identifier,
-                        body,
-                    }),
-                    Err(error) => ScanEvent::Refused(ReplyRefusal::new(
-                        &opened.identifier,
-                        &opened.body.join("\n"),
-                        error,
-                    )),
-                };
-                events.push((opened.nonce, event));
+            (Some(mut opened), true) => {
+                if let Some(before) = before_closing
+                    .as_deref()
+                    .filter(|text| !text.trim().is_empty())
+                {
+                    opened.body.push(format!("{margin}{before}"));
+                }
+                events.push(closed_block(opened, &margin));
             }
         }
         // A block that a marker opened ends what an opening tag in a row with other text is read
@@ -17540,6 +17637,87 @@ fn parse_marker(line: &str) -> Option<Marker> {
     })
 }
 
+/// The text beside the tag of a marker read leniently from a row with other text (#852
+/// unknown-tui-bridge).
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum LenientText {
+    /// An opening tag: `after` is the row's text after it, the reply's first line; `closed` is
+    /// the text between it and a closing tag of the same ID later in the row, when the row holds
+    /// the whole block. Text before the opening tag, such as a harness's `Agent: ` label, and
+    /// text after the closing tag are dropped.
+    Opening {
+        after: String,
+        closed: Option<String>,
+    },
+    /// A closing tag: `before` is the row's text before it, the reply's last line. Text after it
+    /// is dropped.
+    Closing { before: String },
+}
+
+/// The first reply tag in `row`, a row without its indentation or bullet that is not itself a
+/// marker, and the text beside it, as [`LenientText`] describes. A tag inside a backtick code
+/// span is quoted, so it is passed over.
+fn lenient_marker(row: &str) -> Option<(Marker, LenientText)> {
+    if !row.contains("_REPLY_") {
+        return None;
+    }
+    let tags = all_row_tags(row);
+    let (start, end, marker) = tags.into_iter().find(|(start, _, _)| {
+        // An odd number of backticks before the tag leaves it inside a code span.
+        row[..*start].matches('`').count() % 2 == 0
+    })?;
+    let text = if marker.closing {
+        LenientText::Closing {
+            before: row[..start].trim_end().to_owned(),
+        }
+    } else {
+        let after = &row[end..];
+        let closing = format!("</{}_REPLY_{}>", marker.protocol, marker.identifier);
+        let closed = after.find(&closing).map(|at| after[..at].trim().to_owned());
+        LenientText::Opening {
+            after: after.trim().to_owned(),
+            closed,
+        }
+    };
+    Some((marker, text))
+}
+
+/// Every reply tag in `row`, of any request, from left to right, with its byte range.
+fn all_row_tags(row: &str) -> Vec<(usize, usize, Marker)> {
+    let mut tags = Vec::new();
+    let mut from = 0;
+    while let Some(found) = row[from..].find('<') {
+        let start = from + found;
+        let Some(length) = row[start + 1..].find(['<', '>']) else {
+            break;
+        };
+        let stop = start + 1 + length;
+        if row.as_bytes()[stop] == b'<' {
+            from = stop;
+            continue;
+        }
+        from = stop + 1;
+        if let Some(marker) = parse_marker(&row[start..from]) {
+            tags.push((start, from, marker));
+        }
+    }
+    tags
+}
+
+/// Whether a row, without its indentation or bullet, is text of the bridge's own request prompt
+/// that names the reply tags: the header field `reply: <CHAT_REPLY_…>` or the instruction
+/// `Reply between a line <CHAT_REPLY_…> and a line </CHAT_REPLY_…>, with no tool call …`, whole
+/// or wrapped. Such a row is never read for tags (#852 unknown-tui-bridge).
+fn bridge_prompt_row(row: &str) -> bool {
+    ["reply: <", "a line <"].into_iter().any(|lead| {
+        row.match_indices(lead).any(|(at, _)| {
+            let rest = &row[at + lead.len()..];
+            let rest = rest.strip_prefix('/').unwrap_or(rest);
+            rest.starts_with("CHAT_REPLY_") || rest.starts_with("GCHAT_REPLY_")
+        })
+    }) || (row.contains("_REPLY_") && row.contains(">, with no tool call"))
+}
+
 /// A reply tag inside a row that is not itself a marker, with its request's nonce, as
 /// [`recognized_reply_marker`] reads it.
 #[derive(Clone, Debug)]
@@ -17769,7 +17947,15 @@ fn closing_fence(line: &str, character: char, minimum: usize) -> bool {
     length >= minimum && line[length..].trim().is_empty()
 }
 
-fn reply_body(lines: &[String], opening_margin: &str, closing_margin: &str) -> Result<String> {
+/// The text of a reply block from its rows: the margin its opening and closing lines and its
+/// rows share is removed and soft-wrapped rows are joined, `word_wrapped` saying the pane wraps
+/// at word boundaries (see [`unwrap_soft_wrapped`]).
+fn reply_body(
+    lines: &[String],
+    opening_margin: &str,
+    closing_margin: &str,
+    word_wrapped: bool,
+) -> Result<String> {
     let mut margin_length = opening_margin.len();
     for line in std::iter::once(closing_margin).chain(
         lines
@@ -17793,7 +17979,7 @@ fn reply_body(lines: &[String], opening_margin: &str, closing_margin: &str) -> R
         .iter()
         .map(|line| line.strip_prefix(margin).unwrap_or(line))
         .collect::<Vec<_>>();
-    let body = unwrap_soft_wrapped(&stripped);
+    let body = unwrap_soft_wrapped(&stripped, word_wrapped);
     validate_reply_body(&body)?;
     Ok(body)
 }
@@ -17807,7 +17993,11 @@ fn reply_body(lines: &[String], opening_margin: &str, closing_margin: &str) -> R
 /// break in the reply almost never does. Without this, a reply captured
 /// from pane rows keeps the terminal's wrap as a hard newline, and the
 /// chat post it becomes breaks mid-sentence.
-fn unwrap_soft_wrapped(lines: &[&str]) -> String {
+///
+/// A pane that wraps at word boundaries, as a TUI laid out by `screen_layout` does (#852
+/// unknown-tui-bridge), ends a wrapped row short of its width: with `word_wrapped`, a row
+/// wraps when the next row's first word would not have fit after it.
+fn unwrap_soft_wrapped(lines: &[&str], word_wrapped: bool) -> String {
     let pane_width = lines
         .iter()
         .map(|line| UnicodeWidthStr::width(line.trim_end()))
@@ -17832,7 +18022,7 @@ fn unwrap_soft_wrapped(lines: &[&str]) -> String {
         let join = !was_fenced
             && fence.is_none()
             && merged.last().is_some_and(|last: &String| {
-                soft_wrap_continues(last, line, last_raw_width, pane_width)
+                soft_wrap_continues(last, line, last_raw_width, pane_width, word_wrapped)
             });
         if join {
             let last = merged.last_mut().expect("checked above");
@@ -17849,8 +18039,20 @@ fn unwrap_soft_wrapped(lines: &[&str]) -> String {
 /// Whether `next` only continues `current` because the pane wrapped it:
 /// `current` filled the pane, and `next` starts neither a new structure nor
 /// a new sentence after a sentence-ending `current`.
-fn soft_wrap_continues(current: &str, next: &str, current_width: usize, pane_width: usize) -> bool {
-    if current_width != pane_width {
+fn soft_wrap_continues(
+    current: &str,
+    next: &str,
+    current_width: usize,
+    pane_width: usize,
+    word_wrapped: bool,
+) -> bool {
+    let filled = if word_wrapped {
+        let word = next.split_whitespace().next().unwrap_or("");
+        current_width + 1 + UnicodeWidthStr::width(word) > pane_width
+    } else {
+        current_width == pane_width
+    };
+    if !filled {
         return false;
     }
     let current = current.trim_end();
@@ -18717,7 +18919,15 @@ fn read_artifact_bytes_opened(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    /// `prompt` without the command hint a routing notice ends with.
+    pub(crate) fn without_reply_hint(prompt: &str) -> String {
+        prompt
+            .strip_suffix(&format!("\n{}", super::REPLY_COMMAND_HINT))
+            .unwrap_or(prompt)
+            .to_owned()
+    }
+
     use std::collections::VecDeque;
     use std::num::NonZeroU16;
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -18889,12 +19099,14 @@ mod tests {
     }
 
     impl QueueDelivery {
+        /// The prompts submitted, a routing notice without the command hint every one ends
+        /// with (`a_routing_notice_ends_with_the_reply_command` checks it).
         fn prompts(&self) -> Vec<String> {
             self.submitted
                 .lock()
                 .expect("submission lock")
                 .iter()
-                .map(|(_, prompt)| prompt.clone())
+                .map(|(_, prompt)| without_reply_hint(prompt))
                 .collect()
         }
 
@@ -37102,8 +37314,10 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
         ]
         .into_iter()
         .collect();
-        let joined =
-            unwrap_soft_wrapped(&lines.iter().map(|line| line.trim_end()).collect::<Vec<_>>());
+        let joined = unwrap_soft_wrapped(
+            &lines.iter().map(|line| line.trim_end()).collect::<Vec<_>>(),
+            false,
+        );
         assert!(
             joined.contains("and the wrap broke the sentence"),
             "{joined}"
@@ -37130,8 +37344,10 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
         ]
         .into_iter()
         .collect();
-        let joined =
-            unwrap_soft_wrapped(&lines.iter().map(|line| line.trim_end()).collect::<Vec<_>>());
+        let joined = unwrap_soft_wrapped(
+            &lines.iter().map(|line| line.trim_end()).collect::<Vec<_>>(),
+            false,
+        );
         assert_eq!(joined, lines.join("\n"), "{joined}");
     }
 
@@ -40117,6 +40333,201 @@ If you have trouble, run: agentctl chat help 001"
             state.status().expect("status")["requests"][0]["replies_sent"],
             1
         );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// `rows` as agentterm draws a conversation (#852 unknown-tui-bridge): one column in, with
+    /// its input frame and hints at the bottom.
+    fn agentterm(rows: &[&str]) -> String {
+        let mut screen: Vec<String> = rows.iter().map(|row| format!(" {row}")).collect();
+        screen.extend([
+            String::new(),
+            "╭ idle ─────────────────────────────────────────╮".to_owned(),
+            "│> send a message to coord                      │".to_owned(),
+            "╰ ● host-a ─ opus 5.5 · claude_code ────────────╯".to_owned(),
+            " esc interrupt · ⏎ send · ↓ status".to_owned(),
+        ]);
+        screen.join("\n")
+    }
+
+    /// The rows of the bridge's request prompt for reply ID `id`, as agentterm shows it.
+    fn agentterm_prompt(id: &str) -> Vec<String> {
+        let (opening, closing) = tags_of(id);
+        vec![
+            format!("You: [from U0OWNER via slack C0CHANNEL · reply: {opening} or"),
+            format!("     agentctl chat reply {id}]"),
+            String::new(),
+            "<chat_message>".to_owned(),
+            "Did the post go out?".to_owned(),
+            "</chat_message>".to_owned(),
+            String::new(),
+            format!(
+                "Reply between a line {opening} and a line {closing}, with no tool call between"
+            ),
+            "them; send several replies when that helps.".to_owned(),
+            format!("If you have trouble, run: agentctl chat help {id}"),
+            String::new(),
+        ]
+    }
+
+    #[test]
+    fn an_agentterm_reply_whose_opening_tag_follows_its_label_is_sent() {
+        // #852 unknown-tui-bridge: agentterm draws `Agent: ` before the first row of the agent's
+        // text, one column in, so the opening tag shares its row with the label. The bridge's
+        // own prompt rows, which name both tags, are not read as a block.
+        let (state, key, nonce, root) = open_request("agentterm-label");
+        let id = format!("{nonce}_1");
+        let (opening, closing) = tags_of(&id);
+        let mut rows = agentterm_prompt(&id);
+        rows.extend([
+            format!("Agent: {opening}"),
+            "Yes: the post went out at 5:40 PM, with the link.".to_owned(),
+            closing.clone(),
+            "··· worked 26s · 4 steps".to_owned(),
+        ]);
+        let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+        let capture = state.capture_snapshot(&agentterm(&rows)).expect("capture");
+        assert_eq!(capture.replies, [(key.clone(), vec![1])], "{capture:?}");
+        assert!(capture.unknown_ids.is_empty(), "{capture:?}");
+        assert_eq!(
+            state.read_reply(&key, 1).expect("reply").body,
+            "Yes: the post went out at 5:40 PM, with the link."
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn text_beside_lenient_tags_is_kept_inside_them_and_dropped_outside() {
+        // #852 unknown-tui-bridge: text before an opening tag is dropped, text after it starts the
+        // reply, text before the closing tag ends it, and text after the closing tag is dropped.
+        // A row that holds the whole block is one reply.
+        let (state, key, nonce, root) = open_request("agentterm-lenient-text");
+        let id = format!("{nonce}_1");
+        let (opening, closing) = tags_of(&id);
+        let first = [
+            format!("Agent: Here is my answer: {opening}The post went out."),
+            "It links the explainer.".to_owned(),
+            format!("Both copies match.{closing} (sent)"),
+        ];
+        let rows: Vec<&str> = first.iter().map(String::as_str).collect();
+        let capture = state.capture_snapshot(&agentterm(&rows)).expect("capture");
+        assert_eq!(capture.replies, [(key.clone(), vec![1])], "{capture:?}");
+        assert_eq!(
+            state.read_reply(&key, 1).expect("reply").body,
+            "The post went out.\nIt links the explainer.\nBoth copies match."
+        );
+        let second = [format!(
+            "Agent: {opening}Done, and checked.{closing} trailing"
+        )];
+        let rows: Vec<&str> = second.iter().map(String::as_str).collect();
+        let capture = state.capture_snapshot(&agentterm(&rows)).expect("capture");
+        assert_eq!(capture.replies, [(key.clone(), vec![2])], "{capture:?}");
+        assert_eq!(
+            state.read_reply(&key, 2).expect("reply").body,
+            "Done, and checked."
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn lenient_tags_that_do_not_make_a_block_are_reported_never_dropped() {
+        // #852 unknown-tui-bridge: a block under an ID that matches no request, one with no
+        // closing tag before the next prompt, and a closing tag with no opening tag are each
+        // reported to the agent, so nothing it wrote is lost without a word.
+        let (state, _key, nonce, root) = open_request("agentterm-lenient-errors");
+        let id = format!("{nonce}_1");
+        let (opening, closing) = tags_of(&id);
+        let rows = [
+            "Agent: <CHAT_REPLY_wrong_1>An answer under the wrong ID.".to_owned(),
+            "</CHAT_REPLY_wrong_1>".to_owned(),
+        ];
+        let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+        let capture = state.capture_snapshot(&agentterm(&rows)).expect("capture");
+        assert!(capture.replies.is_empty(), "{capture:?}");
+        assert_eq!(capture.unknown_ids, ["wrong_1".to_owned()]);
+
+        let rows = [
+            format!("Agent: {opening}An answer that never closes."),
+            "You: [from teammate via agentctl] next question".to_owned(),
+        ];
+        let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+        let capture = state.capture_snapshot(&agentterm(&rows)).expect("capture");
+        assert!(capture.replies.is_empty(), "{capture:?}");
+        assert!(
+            capture
+                .unknown_ids
+                .iter()
+                .any(|entry| entry.starts_with(&format!("{id} unclosed "))),
+            "{capture:?}"
+        );
+
+        let rows = [
+            "Agent: Working on it.".to_owned(),
+            format!("An answer that never opened.{closing}"),
+        ];
+        let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+        let capture = state.capture_snapshot(&agentterm(&rows)).expect("capture");
+        assert!(capture.replies.is_empty(), "{capture:?}");
+        assert!(
+            capture
+                .unknown_ids
+                .iter()
+                .any(|entry| entry.starts_with(&format!("{id} unopened "))
+                    || entry.starts_with(&format!("{id} remnant "))),
+            "{capture:?}"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn the_bridges_own_prompt_rows_are_never_read_as_a_block() {
+        // #852 unknown-tui-bridge: the request prompt names both tags in its header field and its
+        // instruction; a screen that shows only the prompt, in agentterm's layout or quoted at
+        // the left edge of another harness's screen, holds no block and nothing to report.
+        let (state, _key, nonce, root) = open_request("bridge-prompt-rows");
+        let id = format!("{nonce}_1");
+        let (opening, closing) = tags_of(&id);
+        let rows = agentterm_prompt(&id);
+        let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+        let capture = state.capture_snapshot(&agentterm(&rows)).expect("capture");
+        assert!(capture.replies.is_empty(), "{capture:?}");
+        assert!(capture.unknown_ids.is_empty(), "{capture:?}");
+        let claude = format!(
+            "⏺ Working on it.\n⏺ The request said: [from U0OWNER · reply: {opening} or agentctl \
+chat reply {id}]\n  Reply between a line {opening} and a line {closing}, with no tool call between \
+them.\n❯\u{a0}\n"
+        );
+        let capture = state.capture_snapshot(&claude).expect("capture");
+        assert!(capture.replies.is_empty(), "{capture:?}");
+        assert!(capture.unknown_ids.is_empty(), "{capture:?}");
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_routing_notice_ends_with_the_reply_command() {
+        // #852 unknown-tui-bridge: every notice about a reply that did not go out says how to
+        // send it by the command instead.
+        let (state, _key, _nonce, root) = open_request("routing-notice-hint");
+        let coordinator = QueueDelivery::default();
+        deliver_fence_feedback_with(
+            &state,
+            &coordinator,
+            &["stray_1".to_owned()],
+            DrainOptions::default(),
+        )
+        .expect("deliver");
+        let submitted = coordinator
+            .submitted
+            .lock()
+            .expect("submission lock")
+            .clone();
+        assert_eq!(submitted.len(), 1);
+        assert!(
+            submitted[0].1.ends_with(&format!("\n{REPLY_COMMAND_HINT}")),
+            "{}",
+            submitted[0].1
+        );
+        assert!(REPLY_COMMAND_HINT.contains("agentctl chat reply ID --file FILE"));
         fs::remove_dir_all(root).expect("cleanup");
     }
 }

@@ -1787,15 +1787,15 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
         .with_command_only_replies(headless)
         .with_receipt_when_started(headless || cloud)
         .with_latency_profile(Some(manager.registry().to_path_buf()), headless);
-    // A headless coordinator's screen is never read, so it needs no clean text for screen
-    // blocks; every other coordinator's reply text comes from its transcript where that holds it
-    // (#710 chat-transcript-extraction). AGENTCTL_CHAT_REPLY_TEXT=screen keeps the screen's text.
-    let state = if headless
-        || std::env::var("AGENTCTL_CHAT_REPLY_TEXT").is_ok_and(|value| value == "screen")
-    {
+    // A coordinator's reply text comes from its transcript where that holds it (#710
+    // chat-transcript-extraction). A headless coordinator's screen is never read, so it needs no
+    // clean text for screen blocks: the reader rests for one, and starts following once a repoint
+    // serves an agent with a screen (#852 unknown-tui-bridge). AGENTCTL_CHAT_REPLY_TEXT=screen
+    // keeps the screen's text.
+    let state = if std::env::var("AGENTCTL_CHAT_REPLY_TEXT").is_ok_and(|value| value == "screen") {
         state
     } else {
-        let agent = state.config().agent_name.clone();
+        let agent = (!headless).then(|| state.config().agent_name.clone());
         let records = state.clone();
         let source = crate::chat_transcript::SharedReplySource::default();
         state
@@ -17915,12 +17915,16 @@ in the reply block marked {id}, so that block was not sent."
             "{}",
             report.notes[0]
         );
+        let runs = fixture.client.runs.lock().expect("runs").clone();
         assert_eq!(
-            *fixture.client.runs.lock().expect("runs"),
+            runs.iter()
+                .map(|run| crate::chat_runtime::tests::without_reply_hint(run))
+                .collect::<Vec<_>>(),
             ["Chat reply not sent: the block marked 001 was written before the chat request with \
 that ID was sent to you, so it was not sent, and no block with the same text will be sent to that \
 request. No open chat request has been sent to you."]
         );
+        assert!(runs[0].ends_with("--file FILE`, where ID is the reply ID of its request."));
         assert!(
             state.inspect_request(&key).expect("inspect request")["replies"]
                 .as_array()

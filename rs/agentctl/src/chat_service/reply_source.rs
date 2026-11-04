@@ -177,11 +177,17 @@ impl ReplySourceWatch {
             // No transcript reader: a headless coordinator, or screen text by request.
             return;
         };
+        let now = chat_runtime::unix_millis();
+        if source.evidence == crate::chat_transcript::HEADLESS_EVIDENCE {
+            // The reader rests while the bridge serves a headless agent: there is no transcript
+            // to miss captures in, and the agent is told of nothing through its screen.
+            self.record(state, &source, now);
+            return;
+        }
         let agent = state.config().agent_name.clone();
         if let Some(session) = &source.unbound_session {
             self.bind(manager, &agent, session);
         }
-        let now = chat_runtime::unix_millis();
         let candidates = match state.reply_reminder_candidates() {
             Ok(candidates) => candidates.candidates,
             Err(error) => {

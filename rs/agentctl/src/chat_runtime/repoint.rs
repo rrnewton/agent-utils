@@ -312,6 +312,29 @@ impl BridgeState {
         state
     }
 
+    /// This state, serving `agent_name`, which is `headless`, an agentcloud session (`cloud`),
+    /// or neither, after a repoint: every process-local setting that depends on the kind of
+    /// target follows it (prompts that give only the `chat reply` command, for a headless agent;
+    /// the receipt given when its prompt is started or journaled, for a headless or cloud agent;
+    /// the latency profile), and the shared transcript reader follows the new agent's
+    /// transcript, or rests for a headless one (#852 unknown-tui-bridge). Nothing keeps reading
+    /// the previous agent.
+    #[must_use]
+    pub(crate) fn serving(&self, agent_name: &str, headless: bool, cloud: bool) -> Self {
+        let mut state = self
+            .retargeted(agent_name)
+            .with_command_only_replies(headless)
+            .with_receipt_when_started(headless || cloud);
+        state.latency_headless = headless;
+        if let Some(source) = &state.transcript_replies {
+            source
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retarget((!headless).then_some(agent_name));
+        }
+        state
+    }
+
     /// Apply `request` to this state, whose agent is the previous one. `validate` checks the new
     /// agent (registered, pane alive, harness detected, and in `request.pane_id` when given) and
     /// gives the pane it is in, or why it cannot be the target. Only one applier may run: the
@@ -635,6 +658,7 @@ mod tests {
         stuck: Mutex<BTreeSet<String>>,
         unreadable: Mutex<BTreeSet<String>>,
         asked: Mutex<Vec<String>>,
+        started: Mutex<Vec<String>>,
     }
 
     impl Queues {
@@ -689,6 +713,13 @@ mod tests {
             panic!("a repoint never reads a pane");
         }
 
+        fn prompt_started(&self, message_id: &str) {
+            self.started
+                .lock()
+                .expect("started lock")
+                .push(message_id.to_owned());
+        }
+
         fn withdraw(
             &self,
             agent_name: &str,
@@ -707,6 +738,100 @@ mod tests {
                 _ => Ok(false),
             }
         }
+    }
+
+    /// A transcript reader that records the agents a repoint tells it to follow.
+    #[derive(Debug)]
+    struct Followed(std::sync::Arc<Mutex<Vec<Option<String>>>>);
+
+    impl crate::chat_runtime::TranscriptReplies for Followed {
+        fn blocks(&mut self) -> Vec<crate::chat_runtime::TranscriptBlock> {
+            Vec::new()
+        }
+
+        fn settle(&mut self, _identifiers: &[String]) {}
+
+        fn retarget(&mut self, agent: Option<&str>) {
+            self.0
+                .lock()
+                .expect("followed lock")
+                .push(agent.map(str::to_owned));
+        }
+    }
+
+    #[test]
+    fn serving_a_new_agent_moves_receipts_and_reply_capture_to_it() {
+        // #852 unknown-tui-bridge: after a repoint, receipts are read from the new agent's queue
+        // (a headless agent's when its model starts the prompt), and the transcript reader follows
+        // the new agent, resting for a headless one, never the previous agent.
+        let fixture = fixture("serving");
+        let followed = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let state = fixture
+            .state
+            .clone()
+            .with_transcript_replies(Box::new(Followed(std::sync::Arc::clone(&followed))));
+        let queues = Queues::default();
+
+        let liaison = state.serving("liaison", true, false);
+        assert_eq!(liaison.config().agent_name, "liaison");
+        assert!(liaison.command_only_replies && liaison.receipt_when_started);
+        assert!(liaison.latency_headless);
+        assert_eq!(*followed.lock().expect("lock"), [None]);
+        let key = admit(&liaison, 1);
+        liaison
+            .set_delivery_phase(&key, RequestPhase::Submitting, None)
+            .expect("submitting");
+        queues.set("old-agent", &key, QueueMessageState::Pending);
+        queues.set("liaison", &key, QueueMessageState::Processed);
+        assert_eq!(liaison.record_processed_prompt(&queues, &key), Ok(true));
+        assert_eq!(
+            *queues.started.lock().expect("lock"),
+            [format!("chat-{key}")]
+        );
+        assert_eq!(
+            queues
+                .asked
+                .lock()
+                .expect("lock")
+                .last()
+                .map(String::as_str),
+            Some("liaison")
+        );
+
+        let back = liaison.serving("coordb", false, false);
+        assert_eq!(back.config().agent_name, "coordb");
+        assert!(!back.command_only_replies && !back.receipt_when_started);
+        assert!(!back.latency_headless);
+        assert_eq!(
+            *followed.lock().expect("lock"),
+            [None, Some("coordb".to_owned())]
+        );
+        let key = admit(&back, 2);
+        back.set_delivery_phase(&key, RequestPhase::Submitting, None)
+            .expect("submitting");
+        queues.set("coordb", &key, QueueMessageState::Processed);
+        assert_eq!(back.record_processed_prompt(&queues, &key), Ok(true));
+        // A pane agent's receipt comes from the typing it verified, not from a started prompt.
+        assert_eq!(queues.started.lock().expect("lock").len(), 1);
+        assert_eq!(
+            queues
+                .asked
+                .lock()
+                .expect("lock")
+                .last()
+                .map(String::as_str),
+            Some("coordb")
+        );
+        assert_eq!(phase(&back, &key).0, RequestPhase::Delivered);
+
+        // An agentcloud session prints its markers in its session output: its receipt comes when
+        // its prompt is journaled, and its prompts still name the marker lines.
+        let cloud = back.serving("cloud-coord", false, true);
+        assert!(cloud.receipt_when_started && !cloud.command_only_replies);
+        assert_eq!(
+            followed.lock().expect("lock").last(),
+            Some(&Some("cloud-coord".to_owned()))
+        );
     }
 
     fn accept(_agent: &str, pane: Option<&str>) -> std::result::Result<Option<String>, String> {

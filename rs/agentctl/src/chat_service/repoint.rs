@@ -225,11 +225,7 @@ pub(super) fn apply_pending<A: ManagedApi + ?Sized>(
         return Ok(Some((outcome, None)));
     }
     let headless = headless.get();
-    let cloud = cloud.get();
-    let next = state
-        .retargeted(&outcome.agent_name)
-        .with_command_only_replies(headless)
-        .with_receipt_when_started(headless || cloud);
+    let next = state.serving(&outcome.agent_name, headless, cloud.get());
     Ok(Some((outcome, Some(next))))
 }
 

@@ -5,7 +5,7 @@ priority: 1
 issue_type: feature
 assignee: cl-start
 created_at: 2026-11-04T22:42:10.018251750+00:00
-updated_at: 2026-11-04T22:42:10.018251750+00:00
+updated_at: 2026-11-05T01:30:00.000000000+00:00
 ---
 
 # Description
@@ -38,3 +38,14 @@ The workaround used on 2026-11-04 was a second agentterm view of the same sessio
 # Notes
 
 P1, owner via the lead (2026-11-04 17:36-17:41 ET). Assigned to cl-start after #848.
+
+## Progress
+
+[opus 5.5] cl-start, 2026-11-04 (P0 landing, owner re-order 17:55 ET: make agentterm work as an unknown TUI first).
+
+- The transcript reader follows the current target: a repoint retargets it (`BridgeState::serving`), dropping what it read of the previous agent, so the new agent's screen replies are no longer held back as unpaired (the 60 s delay and refused tables after a repoint). It rests for a headless target, and is built even when `chat run` starts on one. For a target whose harness writes no transcript agentctl reads (`--harness unknown`), the reply source says the screen. `chat health` never shows a `reply-source.json` recorded for another agent.
+- Receipts follow the target too: the receipt mode, prompts that offer only the command, and the latency profile all switch with the target kind. Tested.
+- Screen capture for margined TUIs (`chat_runtime/screen_layout.rs`). The silent loss happened because agentterm draws every row one column in, and the scanner opens no block above the first row at column 0. Now the margin, the bottom input frame and the right side panel are removed, `You:` rows read as prompt rows and `Agent:` hanging indents are removed. Tested with screens laid out like the recorded agentterm screens, and checked against a real recorded coord7 screen, which yields block 047 whole.
+- Lenient tags on those screens: `Agent: <CHAT_REPLY_N>`, text after an opening tag or before a closing tag is body, text after a closing tag is dropped, and a single-row block works. Word-wrapped rows are joined.
+- On every harness, the bridge's own prompt rows (the `reply: <CHAT_REPLY_N>` header field and the `Reply between a line ...` instruction) are never read as tags. Every routing notice ends with `agentctl chat reply ID --file FILE`.
+- Remaining: (P0b) lenient tags on every harness, plus errors for mangled tags (this reverses the inline-tag policy and its 34 tests); agentterm recognition and transcript harvesting; the auto-fallback to unknown (B); an agentcloud record through its agentterm view.

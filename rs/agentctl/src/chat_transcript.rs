@@ -16,6 +16,14 @@
 //! be read, leaves every reply with its screen text, as before; each change in what is read is
 //! logged once.
 //!
+//! A repoint changes the agent followed ([`TranscriptReplies::retarget`], #852
+//! unknown-tui-bridge): the reader drops what it read of the previous agent and looks for the new
+//! agent's transcript at once. It never goes on reading the previous agent's file, whose
+//! following would hold the new agent's screen replies back as unpaired. A headless target has
+//! no transcript the bridge reads (it replies only through `agentctl chat reply`), so for one the
+//! reader rests, and a target whose harness writes no transcript agentctl reads (`--harness
+//! unknown`) is reported as replying through its screen and `agentctl chat reply`.
+//!
 //! A record can name no conversation and no process that names one, as an adopted coordinator's
 //! can. Its transcript is then discovered (#783 chat-reply-capture-miss): first from the harness
 //! process running in the coordinator's Herdr pane (the process whose environment names the
@@ -97,6 +105,14 @@ pub(crate) struct ReplySource {
 /// look.
 pub(crate) type SharedReplySource = Arc<Mutex<Option<ReplySource>>>;
 
+/// The agent a reader made by [`CoordinatorTranscript::for_agent`] follows: `None` while the
+/// bridge serves a headless agent, whose transcript it does not read.
+type SharedTarget = Arc<Mutex<Option<String>>>;
+
+/// The evidence recorded while the reader rests for a headless target.
+pub(crate) const HEADLESS_EVIDENCE: &str = "the target is headless: the bridge reads no screen or \
+     transcript of it, and its replies come only through `agentctl chat reply`";
+
 /// The coordinator's transcript, followed for its reply blocks.
 pub(crate) struct CoordinatorTranscript {
     resolve: Resolve,
@@ -114,6 +130,8 @@ pub(crate) struct CoordinatorTranscript {
     collect_events: bool,
     trace: bool,
     ever_opened: bool,
+    /// The agent followed, for a reader made by [`Self::for_agent`]; a repoint changes it.
+    target: Option<SharedTarget>,
 }
 
 impl fmt::Debug for CoordinatorTranscript {
@@ -144,35 +162,58 @@ impl CoordinatorTranscript {
             collect_events: false,
             trace: false,
             ever_opened: false,
+            target: None,
         }
     }
 
-    /// Follow the transcript of agent `name` in `registry`, as its record describes it, or as
-    /// [`discover`] finds it, confirmed by content against the reply IDs `expected` gives;
-    /// sharing where the text comes from through `source`.
+    /// Follow the transcript of agent `name` in `registry` (`None`: a headless agent, whose
+    /// transcript is not read), as its record describes it, or as [`discover`] finds it,
+    /// confirmed by content against the reply IDs `expected` gives; sharing where the text comes
+    /// from through `source`. [`TranscriptReplies::retarget`] changes the agent.
     pub(crate) fn for_agent(
         registry: PathBuf,
-        name: String,
+        name: Option<String>,
         log: Log,
         expected: Expected,
         source: SharedReplySource,
     ) -> Self {
+        let target: SharedTarget = Arc::new(Mutex::new(name));
+        let current = |target: &SharedTarget| {
+            target
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        };
         let resolve = {
-            let (registry, name) = (registry.clone(), name.clone());
-            Box::new(move || record_hints(&registry, &name)) as Resolve
+            let (registry, target) = (registry.clone(), Arc::clone(&target));
+            Box::new(move || record_hints(&registry, &current(&target)?)) as Resolve
         };
         let mut transcript = Self::new(resolve, log);
-        transcript.discover = Some(Box::new(move || {
-            discover(
-                &registry,
-                &name,
-                Path::new("/proc"),
-                &crate::harness::claude::config_roots(),
-                &expected,
-            )
-        }));
+        transcript.discover = Some({
+            let target = Arc::clone(&target);
+            Box::new(move || {
+                discover(
+                    &registry,
+                    &current(&target)?,
+                    Path::new("/proc"),
+                    &crate::harness::claude::config_roots(),
+                    &expected,
+                )
+            })
+        });
         transcript.source = Some(source);
+        transcript.target = Some(target);
         transcript
+    }
+
+    /// Whether this reader rests because the bridge serves a headless agent.
+    fn resting(&self) -> bool {
+        self.target.as_ref().is_some_and(|target| {
+            target
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none()
+        })
     }
 
     /// Discover the transcript with `discover` when `resolve` finds none.
@@ -217,7 +258,25 @@ impl CoordinatorTranscript {
             return;
         }
         self.located_at = Some(Instant::now());
-        let found = (self.resolve)()
+        if self.resting() {
+            self.follower = None;
+            self.share(ReplySource {
+                evidence: HEADLESS_EVIDENCE.to_owned(),
+                ..ReplySource::default()
+            });
+            self.report(
+                "agentctl: the bridge serves a headless agent; no transcript is read".to_owned(),
+            );
+            return;
+        }
+        let resolved = (self.resolve)();
+        // A harness agentctl reads no transcript of, such as one driven by the generic screen
+        // rules (`--harness unknown`): its reply text can only come from its screen.
+        let unread_harness = resolved
+            .as_ref()
+            .map(|(harness, _)| harness.clone())
+            .filter(|harness| agent_harness::transcript(harness).is_none());
+        let found = resolved
             .and_then(|(harness, hints)| {
                 let reader = agent_harness::transcript(&harness)?;
                 let located = reader.locate(&hints)?;
@@ -241,10 +300,18 @@ impl CoordinatorTranscript {
                 "agentctl: no transcript of the coordinator was found; replies keep the \
                         text read from its screen"
             };
-            self.share(ReplySource {
-                evidence: "no transcript of the coordinator was found: its record names no \
-                           conversation or process that finds one, and none was discovered"
+            let evidence = match unread_harness {
+                Some(harness) => format!(
+                    "the target's harness ({harness}) writes no transcript agentctl reads: its \
+                     replies come from CHAT_REPLY blocks on its screen, or through `agentctl chat \
+                     reply`"
+                ),
+                None => "no transcript of the coordinator was found: its record names no \
+                         conversation or process that finds one, and none was discovered"
                     .to_owned(),
+            };
+            self.share(ReplySource {
+                evidence,
                 ..ReplySource::default()
             });
             self.report(line.to_owned());
@@ -388,6 +455,34 @@ impl TranscriptReplies for CoordinatorTranscript {
 
     fn following(&self) -> bool {
         self.follower.is_some()
+    }
+
+    fn retarget(&mut self, agent: Option<&str>) {
+        let Some(target) = &self.target else {
+            return;
+        };
+        {
+            let mut current = target
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if current.as_deref() == agent {
+                return;
+            }
+            *current = agent.map(str::to_owned);
+        }
+        // Nothing read of the previous agent stays: its blocks are not this agent's replies, and
+        // a file still followed would hold this agent's screen replies back as unpaired.
+        self.follower = None;
+        self.blocks.clear();
+        self.bytes = 0;
+        self.waited.clear();
+        self.reported = None;
+        self.located_at = None;
+        (self.log)(format!(
+            "agentctl: the bridge now serves {}; its reply text is looked for again",
+            agent.unwrap_or("a headless agent")
+        ));
+        self.relocate();
     }
 }
 
@@ -609,6 +704,137 @@ mod tests {
             }),
             Box::new(move |line| logs.lock().unwrap().push(line)),
         )
+    }
+
+    /// A reader that follows whichever agent its shared target names: agent `NAME`'s Claude
+    /// Code transcript is `homes/NAME/.claude/projects/-work/s-1.jsonl`, and agent `odd` runs a
+    /// harness agentctl reads no transcript of.
+    fn targeted(
+        homes: PathBuf,
+        name: Option<&str>,
+        logs: Arc<Mutex<Vec<String>>>,
+    ) -> (CoordinatorTranscript, SharedReplySource) {
+        let target: SharedTarget = Arc::new(Mutex::new(name.map(str::to_owned)));
+        let resolve = {
+            let target = Arc::clone(&target);
+            Box::new(move || {
+                let name = target.lock().unwrap().clone()?;
+                let harness = if name == "odd" { "unknown" } else { "claude" };
+                Some((
+                    harness.to_owned(),
+                    Hints {
+                        session: Some("s-1".to_owned()),
+                        home: Some(homes.join(&name)),
+                        ..Hints::default()
+                    },
+                ))
+            }) as Resolve
+        };
+        let source = SharedReplySource::default();
+        let mut transcript = CoordinatorTranscript::new(
+            resolve,
+            Box::new(move |line| logs.lock().unwrap().push(line)),
+        );
+        transcript.source = Some(Arc::clone(&source));
+        transcript.target = Some(target);
+        (transcript, source)
+    }
+
+    #[test]
+    fn a_repoint_follows_the_new_agent_and_drops_what_was_read_of_the_previous() {
+        // #852 unknown-tui-bridge: the reader follows the agent the bridge serves now; nothing
+        // read of the previous agent stays, and a headless agent's transcript is not read.
+        let root = scratch("retarget");
+        for (name, identifier) in [("coordb", "007"), ("liaison", "008")] {
+            let project = root.join(format!("{name}/.claude/projects/-work"));
+            fs::create_dir_all(&project).unwrap();
+            fs::write(
+                project.join("s-1.jsonl"),
+                entry(
+                    &format!("<CHAT_REPLY_{identifier}>\nfrom {name}\n</CHAT_REPLY_{identifier}>"),
+                    "2026-11-04T12:00:00Z",
+                ),
+            )
+            .unwrap();
+        }
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let (mut reader, source) = targeted(root.clone(), Some("coordb"), Arc::clone(&logs));
+        let identifiers = |reader: &mut CoordinatorTranscript| {
+            reader
+                .blocks()
+                .into_iter()
+                .map(|block| block.identifier)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(identifiers(&mut reader), ["007"]);
+        let path = |source: &SharedReplySource| source.lock().unwrap().clone().unwrap().path;
+        assert_eq!(
+            path(&source),
+            Some(root.join("coordb/.claude/projects/-work/s-1.jsonl"))
+        );
+
+        reader.retarget(Some("liaison"));
+        assert!(reader.following());
+        assert_eq!(identifiers(&mut reader), ["008"]);
+        assert_eq!(
+            path(&source),
+            Some(root.join("liaison/.claude/projects/-work/s-1.jsonl"))
+        );
+        assert!(logs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line.contains("now serves liaison")));
+        // The same target again changes nothing.
+        let logged = logs.lock().unwrap().len();
+        reader.retarget(Some("liaison"));
+        assert_eq!(logs.lock().unwrap().len(), logged);
+
+        reader.retarget(None);
+        assert!(!reader.following());
+        assert!(identifiers(&mut reader).is_empty());
+        let rested = source.lock().unwrap().clone().unwrap();
+        assert_eq!(rested.path, None);
+        assert_eq!(rested.evidence, HEADLESS_EVIDENCE);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn a_target_whose_harness_writes_no_transcript_replies_through_its_screen() {
+        // #852 unknown-tui-bridge: an agent driven by the generic screen rules has no transcript
+        // agentctl reads, so its reply text comes from its screen, and the source says so.
+        let root = scratch("retarget-unknown");
+        let project = root.join("coordb/.claude/projects/-work");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(
+            project.join("s-1.jsonl"),
+            entry(
+                "<CHAT_REPLY_007>\nold\n</CHAT_REPLY_007>",
+                "2026-11-04T12:00:00Z",
+            ),
+        )
+        .unwrap();
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let (mut reader, source) = targeted(root.clone(), Some("coordb"), logs);
+        assert_eq!(reader.blocks().len(), 1);
+        reader.retarget(Some("odd"));
+        assert!(!reader.following());
+        assert!(reader.blocks().is_empty());
+        let found = source.lock().unwrap().clone().unwrap();
+        assert_eq!(found.path, None);
+        assert!(
+            found
+                .evidence
+                .contains("(unknown) writes no transcript agentctl reads"),
+            "{}",
+            found.evidence
+        );
+        assert!(
+            found.evidence.contains("agentctl chat reply"),
+            "{}",
+            found.evidence
+        );
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]

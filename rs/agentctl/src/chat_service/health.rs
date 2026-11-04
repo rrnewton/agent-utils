@@ -429,6 +429,14 @@ fn assess(observed: Observed, options: HealthOptions) -> Health {
     } = observed;
     let configuration = &configuration;
     let mut problems = Problems::default();
+    // A record written while the bridge served another agent says nothing about this one: the
+    // service writes this agent's at its next scan (#852 unknown-tui-bridge).
+    let stale_source_agent = reply_source
+        .as_ref()
+        .and_then(|record| record["agent"].as_str())
+        .filter(|agent| *agent != configuration.agent_name)
+        .map(str::to_owned);
+    let reply_source = reply_source.filter(|_| stale_source_agent.is_none());
     let process = match runner {
         Some(pid) => json!({"running": true, "pid": pid, "command": runner_command}),
         None => {
@@ -833,8 +841,20 @@ fn assess(observed: Observed, options: HealthOptions) -> Health {
                         ""
                     }
                 ),
-                None => "the screen only: no transcript was found".to_owned(),
+                None => format!(
+                    "the screen only: {}",
+                    source["evidence"]
+                        .as_str()
+                        .unwrap_or("no transcript was found")
+                ),
             }
+        );
+    } else if let Some(previous) = &stale_source_agent {
+        let _ = writeln!(
+            text,
+            "reply text: not looked for yet: the recorded source is the previous agent \
+             {previous}'s, and the service records {}'s at its next scan",
+            configuration.agent_name
         );
     }
     let _ = writeln!(text, "last admitted: {}", when(last_admitted, now));
@@ -1047,6 +1067,53 @@ mod tests {
         assert_eq!(
             health.document["event_sinks"]["stranded_config"],
             "/state/coord.old-gap-20261102/event-sinks.json"
+        );
+    }
+
+    #[test]
+    fn a_reply_source_recorded_for_the_previous_agent_is_not_shown() {
+        // #852 unknown-tui-bridge: after a repoint, the record the service wrote while it served
+        // the previous agent names that agent's transcript and misses; health shows neither.
+        let health = assess(
+            Observed {
+                reply_source: Some(json!({
+                    "agent": "coordb",
+                    "source": {"path": "/t/old.jsonl", "evidence": "e", "discovered": false},
+                    "capture_misses": [{"key": "a", "reply_id": "31", "block_at_millis": NOW}],
+                })),
+                ..healthy()
+            },
+            options(),
+        );
+        assert_eq!(health.verdict, "ok", "{}", health.text);
+        assert!(!health.text.contains("/t/old.jsonl"), "{}", health.text);
+        assert!(
+            health.text.contains(
+                "reply text: not looked for yet: the recorded source is the previous \
+                           agent coordb's"
+            ),
+            "{}",
+            health.text
+        );
+        // The same record written for this agent is shown.
+        let health = assess(
+            Observed {
+                reply_source: Some(json!({
+                    "agent": "coord",
+                    "source": {"path": null, "evidence": "the target's harness (unknown) writes \
+                               no transcript agentctl reads", "discovered": false},
+                    "capture_misses": [],
+                })),
+                ..healthy()
+            },
+            options(),
+        );
+        assert!(
+            health
+                .text
+                .contains("reply text: the screen only: the target's harness (unknown)"),
+            "{}",
+            health.text
         );
     }
 
