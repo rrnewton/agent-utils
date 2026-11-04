@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 use crate::git::{CombineMode, Git};
+use crate::intake;
 use crate::model::ItemStatus;
 use crate::ops::{self, Submission};
 use crate::plan::{render, short};
@@ -84,7 +85,8 @@ enum DonorCommand {
         /// Work directory for checkouts and logs (default: merge-queue-donor/ inside --clone's Git directory).
         #[arg(long, value_name = "DIR")]
         work: Option<PathBuf>,
-        /// Seconds to stop claiming after declining a job because this host's tools differ.
+        /// Seconds to stop claiming after a job whose tools or merge-queue revision this host
+        /// did not match (given back, or declined).
         #[arg(long, default_value_t = 300)]
         mismatch_backoff_secs: u64,
         /// Exit once no job is running and none is available (scripts and tests).
@@ -153,6 +155,22 @@ enum DonorCommand {
         #[arg(long)]
         json: bool,
     },
+}
+
+/// `NAME=COMMAND` arguments of `flag`, by name.
+fn name_commands(
+    flag: &str,
+    specs: &[String],
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    specs
+        .iter()
+        .map(|spec| {
+            spec.split_once('=')
+                .filter(|(name, command)| !name.is_empty() && !command.is_empty())
+                .map(|(name, command)| (name.to_owned(), command.to_owned()))
+                .ok_or_else(|| format!("{flag} {spec:?}: expected NAME=COMMAND"))
+        })
+        .collect()
 }
 
 /// The lease token a donor sends on stdin.
@@ -519,6 +537,13 @@ enum Command {
         /// second line of --version) is always compared.
         #[arg(long, value_name = "NAME=COMMAND")]
         tool_identity: Vec<String>,
+        /// How a donor brings the tool NAME (one of --tool-identity) up to date, as
+        /// NAME=COMMAND (repeatable), for example a fetch of the tool repository. A donor whose
+        /// answer differs from the job's runs it once and asks again: an older donor then takes
+        /// the job; one that still differs declines it. Without one, a donor whose answer
+        /// differs gives the job back instead of declining it.
+        #[arg(long, value_name = "NAME=COMMAND")]
+        tool_refresh: Vec<String>,
         /// Delete ignored files (build caches) from reused checkouts before each validation.
         #[arg(long)]
         clean_ignored: bool,
@@ -547,7 +572,9 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Submit (or resubmit) a change as ready to land.
+    /// Submit (or resubmit) a change as ready to land. While a run holds the writer lock the
+    /// submission is recorded (after checking that the head resolves) and applied, in order,
+    /// as soon as the lock is free: by the daemon's next cycle, a run, or the next command.
     Submit {
         /// Change number (pull-request number).
         pr: i64,
@@ -615,7 +642,9 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Withdraw a queued change.
+    /// Withdraw a queued change. While a run holds the writer lock the withdrawal is recorded
+    /// and applied as soon as the lock is free; the run meanwhile does not land a batch that
+    /// holds the change.
     Withdraw {
         /// Change number.
         pr: i64,
@@ -625,7 +654,8 @@ enum Command {
     },
     /// Return changes escalated to their owner (validation did not run the bounded number of
     /// times) to the queue: clears the escalation, the refusal count and the backoff. Run it
-    /// once whatever kept validation from running is fixed.
+    /// once whatever kept validation from running is fixed. While a run holds the writer lock
+    /// the retry is recorded and applied as soon as the lock is free.
     Retry {
         /// Change numbers.
         #[arg(required = true)]
@@ -1095,6 +1125,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             red_without_probe,
             offload,
             tool_identity,
+            tool_refresh,
             clean_ignored,
             land,
             land_command,
@@ -1107,6 +1138,16 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                 return Err(format!(
                     "{} already exists (use --force to rewrite the config)",
                     state.config_path().display()
+                ));
+            }
+            let tool_identity = name_commands("--tool-identity", &tool_identity)?;
+            let tool_refresh = name_commands("--tool-refresh", &tool_refresh)?;
+            if let Some(name) = tool_refresh
+                .keys()
+                .find(|name| !tool_identity.contains_key(*name))
+            {
+                return Err(format!(
+                    "--tool-refresh {name}: no --tool-identity names that tool"
                 ));
             }
             let config = Config {
@@ -1215,17 +1256,8 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     } else {
                         offload
                     },
-                    tool_identity: tool_identity
-                        .iter()
-                        .map(|spec| {
-                            spec.split_once('=')
-                                .filter(|(name, command)| !name.is_empty() && !command.is_empty())
-                                .map(|(name, command)| (name.to_owned(), command.to_owned()))
-                                .ok_or_else(|| {
-                                    format!("--tool-identity {spec:?}: expected NAME=COMMAND")
-                                })
-                        })
-                        .collect::<Result<_, _>>()?,
+                    tool_identity,
+                    tool_refresh,
                 },
                 land: LandConfig {
                     driver: land,
@@ -1270,7 +1302,6 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             notify,
         } => {
             let config = state.config()?;
-            let _lock = state.lock()?;
             let claim = match tested_with {
                 Some(text) => Some(ValidationClaim::new(
                     parse_selection(&text)?,
@@ -1279,28 +1310,51 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                 )),
                 None => None,
             };
-            let item = ops::submit(
-                &state,
-                &config,
-                Submission {
-                    pr,
-                    head_ref: head,
-                    head: sha,
-                    priority,
-                    by,
-                    notify,
-                    title,
-                    after,
-                    solo,
-                    prioritized,
-                    claim,
-                    source: String::new(),
-                    requires: requires
-                        .iter()
-                        .map(|spec| ops::resolve_requirement(&config, spec))
-                        .collect::<Result<_, _>>()?,
-                },
-            )?;
+            let submission = Submission {
+                pr,
+                head_ref: head,
+                head: sha,
+                priority,
+                by,
+                notify,
+                title,
+                after,
+                solo,
+                prioritized,
+                claim,
+                source: String::new(),
+                requires: requires
+                    .iter()
+                    .map(|spec| ops::resolve_requirement(&config, spec))
+                    .collect::<Result<_, _>>()?,
+                recorded_at: String::new(),
+            };
+            let lock = match state.lock() {
+                Ok(lock) => lock,
+                Err(busy) => {
+                    // A run holds the queue: check the head now, without touching the
+                    // repository the run is using, and record the submission for it.
+                    if submission.pr <= 0 {
+                        return Err(format!("change number must be positive, got {pr}"));
+                    }
+                    let current = ops::peek_head(&state, &config, &submission.head_ref)?;
+                    if !submission.head.is_empty() && !current.starts_with(&submission.head) {
+                        return Err(format!(
+                            "#{pr}: {:?} is at {current}, not the submitted {}",
+                            submission.head_ref, submission.head
+                        ));
+                    }
+                    intake::record(&state, intake::Request::Submit(Box::new(submission)), &busy)?;
+                    println!(
+                        "recorded #{pr} (head now {}) for the next cycle: {busy}; it is applied \
+                         as soon as the writer lock is free",
+                        short(&current)
+                    );
+                    return Ok(0);
+                }
+            };
+            intake::report("merge-queue submit", intake::apply(&state, &config, &lock));
+            let item = ops::submit(&state, &config, submission)?;
             let claim = match &item.claim {
                 Some(claim) => format!(
                     "; validated with {} ({})",
@@ -1338,6 +1392,9 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                 _ => return Err("choose a ready source: --label, --all-open or --file".to_owned()),
             };
             let lock = if dry_run { None } else { Some(state.lock()?) };
+            if let Some(lock) = &lock {
+                intake::report("merge-queue sync", intake::apply(&state, &config, lock));
+            }
             let report = crate::sync::sync(&state, &config, &source, limit, lock.as_ref(), None)?;
             if json {
                 let text = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
@@ -1380,13 +1437,57 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             Ok(if report.refused.is_empty() { 0 } else { 1 })
         }
         Command::Withdraw { pr, reason } => {
-            let _lock = state.lock()?;
+            let config = state.config()?;
+            let lock = match state.lock() {
+                Ok(lock) => lock,
+                Err(busy) => {
+                    let item = state
+                        .item(pr)?
+                        .ok_or_else(|| format!("#{pr} is not in the queue"))?;
+                    if item.status == ItemStatus::Landed {
+                        return Err(format!("#{pr} has already landed"));
+                    }
+                    intake::record(&state, intake::Request::Withdraw { pr, reason }, &busy)?;
+                    println!(
+                        "recorded the withdrawal of #{pr} for the next cycle: {busy}; the run \
+                         does not land a batch holding #{pr}, and the withdrawal is applied as \
+                         soon as the writer lock is free"
+                    );
+                    return Ok(0);
+                }
+            };
+            intake::report(
+                "merge-queue withdraw",
+                intake::apply(&state, &config, &lock),
+            );
             let item = ops::withdraw(&state, pr, &reason)?;
             println!("withdrew #{}", item.pr);
             Ok(0)
         }
         Command::Retry { prs } => {
-            let _lock = state.lock()?;
+            let config = state.config()?;
+            let lock = match state.lock() {
+                Ok(lock) => lock,
+                Err(busy) => {
+                    for pr in &prs {
+                        let item = state
+                            .item(*pr)?
+                            .ok_or_else(|| format!("#{pr} is not in the queue"))?;
+                        if item.status != ItemStatus::Queued {
+                            return Err(format!("#{pr} is {}, not queued", item.status.as_str()));
+                        }
+                    }
+                    for pr in prs {
+                        intake::record(&state, intake::Request::Retry { pr }, &busy)?;
+                        println!(
+                            "recorded the retry of #{pr} for the next cycle: {busy}; it is \
+                             applied as soon as the writer lock is free"
+                        );
+                    }
+                    return Ok(0);
+                }
+            };
+            intake::report("merge-queue retry", intake::apply(&state, &config, &lock));
             for pr in prs {
                 ops::retry(&state, pr)?;
                 println!("#{pr} is back in the queue");
@@ -1454,7 +1555,15 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             json,
             offload,
         } => {
-            let _lock = state.lock()?;
+            let lock = state.lock()?;
+            // Requests recorded while another writer held the queue go in before it is read
+            // (a dry run changes nothing).
+            if !dry_run {
+                intake::report(
+                    "merge-queue run",
+                    intake::apply(&state, &state.config()?, &lock),
+                );
+            }
             // Ctrl-C or a service stop cancels the validations and stops with no verdict
             // instead of orphaning them in their own process groups.
             crate::interrupt::install();

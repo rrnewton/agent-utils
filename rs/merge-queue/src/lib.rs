@@ -15,6 +15,7 @@ pub mod decisions;
 pub mod donor;
 pub mod git;
 pub mod github;
+pub mod intake;
 pub mod interrupt;
 pub mod model;
 pub mod notify;

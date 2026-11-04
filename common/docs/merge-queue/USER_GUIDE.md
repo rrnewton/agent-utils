@@ -131,7 +131,8 @@ This command creates the state directory and writes `config.json`.
 | `--green-flaky-hold-secs SECS` | `7200` | How long a change is held for a ruling after a GREEN_FLAKY or INFRA-BLOCKED result (see "Held for a ruling") before it is re-queued for a fresh validation. |
 | `--red-without-probe MODE` | `eject` | What a red validation that names failed tests does when its follow-up probe cannot run: `eject` the change (the red run is the verdict) or `hold` it for its owner. |
 | `--offload MODE` | `off` | Where validations run: `off` (in this process, as always), `compare` (in this process, which decides, and also on donors, whose receipts are only compared) or `decide` (on donors only; an accepted receipt is the verdict). See "Donor validators". |
-| `--tool-identity NAME=COMMAND` | none | A tool the validation depends on (repeatable): the command prints its identity, for example a tool repository's commit or a toolchain version, never a hash of a binary (builds are not byte-identical across hosts). Donors whose answer differs decline the job. merge-queue's own revision is always compared. |
+| `--tool-identity NAME=COMMAND` | none | A tool the validation depends on (repeatable): the command prints its identity, for example a tool repository's commit or a toolchain version, never a hash of a binary (builds are not byte-identical across hosts). A donor whose answer differs does not run the job (see "Tool identity and receipts"). merge-queue's own revision is always compared. |
+| `--tool-refresh NAME=COMMAND` | none | How a donor brings the tool `NAME` (one of `--tool-identity`) up to date, for example a fetch of the tool repository (repeatable). A donor whose answer differs runs it once and asks again: an older donor then takes the job, and one that still differs declines it. |
 | `--timeout SECS` | `0` | Seconds before one validation is killed (its whole process group) and its selected tests count as errors. `0` means no limit. |
 | `--clean-ignored` | off | Also delete ignored files (build caches) from a reused checkout before each validation. By default they are kept, which makes validations fast but trusts the build to be hermetic with respect to them. |
 | `--land DRIVER` | `push` | `push` or `command` (see "Land drivers"). |
@@ -144,7 +145,8 @@ This command creates the state directory and writes `config.json`.
 This command submits a change as ready to land, or resubmits it. It takes the writer lock and
 fetches the base and this head from the remote into private refs (`refs/merge-queue/...`). It
 then records the exact head commit. Resubmitting a change replaces its record, keeps its history,
-and sets its status back to `queued`.
+and sets its status back to `queued`. While a run holds the writer lock, the submission is
+recorded instead and applied when the lock frees (see "Intake while a run holds the queue").
 
 | Argument | Default | Meaning |
 |---|---|---|
@@ -215,7 +217,9 @@ Ready-file lines look like `PR [SHA] [head=REF] [priority=N] [after=N,N] [solo] 
 ### `merge-queue withdraw PR`
 
 This command marks a queued change `withdrawn`. `--reason TEXT` (default `withdrawn by submitter`)
-is recorded in the change's history. Submitting the change again puts it back in the queue.
+is recorded in the change's history. Submitting the change again puts it back in the queue. While
+a run holds the writer lock, the withdrawal is recorded, and the run does not land a batch that
+holds the change (see "Intake while a run holds the queue").
 
 ### `merge-queue retry PR...`
 
@@ -223,7 +227,32 @@ This command returns changes that were escalated to their owner (see "Bounded re
 queue: it clears the escalation, the refusal count and the backoff, in the item records and in
 the shadow ledger. Run it once whatever kept validation from running is fixed. A change that is
 only deferred is returned at once too, without waiting for its backoff. It is also the ruling
-that ends a hold (see "Held for a ruling"): the change is validated again.
+that ends a hold (see "Held for a ruling"): the change is validated again. While a run holds the
+writer lock, the retry is recorded and applied when the lock frees (see "Intake while a run holds
+the queue").
+
+### Intake while a run holds the queue
+
+A run holds the writer lock from start to finish, which can be many minutes. `submit`,
+`withdraw` and `retry` never wait for it and never fail because of it. When the lock is busy,
+each one records its request as a file under `intake/pending/`, prints `recorded ...` and exits 0.
+The next holder of the lock applies the recorded requests in the order they were recorded,
+before it reads the queue. That holder is the `serve` daemon at its next poll, a `run`, a
+`sync`, or the next `submit`, `withdraw` or `retry` that finds the lock free. A recorded request
+does exactly what the command would have done then, and its history entry notes when it was
+recorded.
+
+- `submit` first checks, without writing to the repository the run is using, that the head
+  resolves (`git ls-remote`), and that it matches `--sha` when one is given. A head that does
+  not resolve is refused at once, as it would be with the lock free.
+- `withdraw` and `retry` first check that the change is in the queue (and, for `retry`, queued).
+  A withdrawal also takes effect inside the run that holds the lock: before landing a batch, the
+  run reads the recorded withdrawals. If one names a change in the batch, the run does not land
+  that batch, stops, and leaves the batch queued. The next cycle applies the withdrawal and
+  validates the rest again.
+- A request that cannot be applied when its turn comes (its change landed meanwhile, its head
+  no longer resolves) is moved to `intake/refused/` with the reason, noted in the change's
+  history (`intake-refused`), and shown by `status` for a week.
 
 ### `merge-queue list`
 
@@ -281,7 +310,8 @@ This command runs the queue forever: deterministic code that is always running, 
 changes and never drive the queue loop by hand. While idle it holds **no** writer lock. It polls
 the `items/` directory fingerprint every `--poll-ms` (default `250`) and polls the remote base
 with a cheap `git ls-remote` every `--base-poll-secs` (default `30`). A changed fingerprint (a
-new `submit`, `sync` or `withdraw`) or a moved base triggers one work cycle: the daemon takes the
+new `submit`, `sync` or `withdraw`, or a request recorded while a run held the lock and applied
+at the top of the next poll) or a moved base triggers one work cycle: the daemon takes the
 writer lock, plans, and runs the same `Runner` path as `run` (the logic is not forked), then
 releases the lock and goes back to idle polling. Two triggers are time-based: a queued change
 whose refusal deferral (`next_retry_at`) has passed is retried without any new submit, and a
@@ -370,11 +400,13 @@ batches a live daemon's heartbeat names: none while it idles, and none when no d
 running (a `run` started by hand reports its own progress). Slots count the `scratch/slot-*`
 checkouts; one is in use only while a validation holds its `scratch/slot-<n>.lock`, since every
 slot keeps its checkout between validations. A failed attempt to take the writer lock shows as
-the daemon's last error until the daemon gets the lock or has nothing queued.
+the daemon's last error until the daemon gets the lock or has nothing queued. Requests recorded
+while a run held the lock show as `intake: N request(s) ...` until they are applied. Requests
+refused when applied show as `intake refused: ...`, and the newest three are named (JSON `intake`).
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--json` | off | Print the status report as JSON (`daemon`, `pid`, `heartbeat`, queue counts, `active_batches`, slots, `remedy`). |
+| `--json` | off | Print the status report as JSON (`daemon`, `pid`, `heartbeat`, queue counts, `active_batches`, slots, `intake`, `remedy`). |
 | `--stale-after-secs N` | `10` | Heartbeat age in seconds after which a live daemon counts as stale. |
 
 ### Running `serve` as a service
@@ -428,7 +460,7 @@ through its route; an operator uses only `status`.
 | `renew --job ID` | Token on stdin. Prints `{"renewal": "continue", ...}` or `{"renewal": "stop", "reason": ...}`. |
 | `bundle --job ID` | Token on stdin. Writes the candidate's git bundle to stdout. |
 | `report --job ID` | `{"token", "receipt"}` on stdin. Exits 1 with the reason when the receipt is refused. |
-| `release --job ID [--reason R] [--decline]` | Token on stdin. Gives the job back; `--decline` means this donor never gets it again. |
+| `release --job ID [--reason R] [--decline]` | Token on stdin. Gives the job back; `--decline` means this donor does not get it again unless the job is re-stamped. |
 
 ### `merge-queue widen`
 
@@ -605,6 +637,8 @@ on which files two changes share.
   obligations/<id>.json  one record per focused landing still owed a complete run
   scratch/slot-<n>/      one reused worktree per concurrent validation
   scratch/slot-<n>.lock  flock held by the run while a validation uses slot <n>
+  intake/pending/<id>.json   one request recorded while a run held the writer lock, until applied
+  intake/refused/<id>.json   one recorded request that could not be applied, with the reason (kept a week)
   donor/lock             fixed: donor job store lock (held for milliseconds)
   donor/jobs/<id>.json   one record per donor job (mode 0600: it holds the lease token)
   donor/scratch/         bundles being sent to donors (removed after each)
@@ -619,8 +653,9 @@ builds are incremental (`validator.clean_ignored` adds `-x`). There is one slot 
 concurrent validation, plus one for selection queries.
 
 Growing collections live in their own subdirectories. Records are written atomically (temporary
-file, then rename). `submit`, `withdraw`, `run` and `widen` take the writer lock and fail fast if
-another writer holds it.
+file, then rename). `run`, `sync` and `widen` take the writer lock and fail fast if another writer
+holds it. `submit`, `withdraw` and `retry` record their request when it is held (see "Intake
+while a run holds the queue").
 
 An **item record** (`items/<pr>.json`) has these fields:
 
@@ -687,6 +722,8 @@ An **item record** (`items/<pr>.json`) has these fields:
 - `clean_ignored`: also delete ignored files from reused checkouts (default `false`).
 - `offload`: `off` (or absent; the default), `compare` or `decide` (see "Donor validators").
 - `tool_identity`: `{name: command}`, the tools a validation depends on, checked on donors.
+- `tool_refresh`: `{name: command}`, how a donor brings each of those tools up to date when its
+  answer differs from a job's (see "Tool identity and receipts").
 - `max_deferrals`: deferrals before a change is escalated to its owner (absent or `0`: `3`).
 - `red_without_probe`: `hold` holds a red change whose probe cannot run for its owner; absent
   (the default) ejects it.
@@ -891,7 +928,8 @@ so it never appears in process listings, logs or `status`.
 
 **Leases.** Each validation becomes a job in `<state>/donor/jobs/`, behind its own lock: donors
 never wait for the writer lock a running work cycle holds. A claim leases the oldest job the
-donor has not declined to exactly one donor, with a fresh random token.
+donor has not declined (see "Tool identity and receipts") to exactly one donor, with a fresh
+random token.
 - The donor renews every quarter of `donors.lease_secs`. A renewal answers "stop" when the job
   was cancelled (its candidate was discarded, or the queue is stopping) or the lease is no
   longer the donor's, and the donor then kills its run.
@@ -918,8 +956,24 @@ the queue host) and the tool identity, which has three parts:
   each tool repository and the pinned toolchain.
 
 The commands run in the queue's repository on the queue host and in the donor's clone on the
-donor. A donor whose revision or answers differ declines the job loudly (naming each
-difference), backs off claiming for `--mismatch-backoff-secs`, and never runs it.
+donor. A donor that does not match the job names each difference, backs off claiming for
+`--mismatch-backoff-secs`, and does not run the job. It declines the job only when it is
+certain it can never match it. Otherwise it gives the job back and is offered it again:
+- **A different merge-queue revision**: only an upgrade can match it, so the donor gives the job
+  back. Once upgraded and restarted, it claims at once and takes the job.
+- **A different tool answer**: the donor runs the tool's `validator.tool_refresh` command (for
+  example a fetch of the tool repository; `init --tool-refresh NAME=COMMAND`) once and asks
+  again. A donor that was older than the job now matches, and runs it. A donor that still
+  differs is newer than the job, or unrelated to it, and declines. It is offered the job again
+  only when the job is re-stamped, after the queue host's tools move. A tool with no refresh
+  command, or whose refresh fails, cannot be put in order, so the donor gives the job back
+  instead of declining it. Refreshes run only on a mismatch, never on a timer, and each is
+  bounded at 120 s.
+
+A queued job is re-stamped with the queue host's current answers at every claim (when the
+queue host can answer them), so every queued job carries the same stamp. A decline with the reason a donor built before this rule
+gave for a mismatch (`this donor's tools differ from the queue host's: ...`) is recorded as a
+release.
 
 Identify a tool by the revision it was built from, never by a hash of its binary: two builds of
 one revision on different hosts are not byte-identical, so binary hashes never match. merge-queue

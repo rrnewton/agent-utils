@@ -97,6 +97,14 @@ pub struct ValidatorConfig {
     /// publishes a donor job; a donor whose answers differ refuses the job.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub tool_identity: std::collections::BTreeMap<String, String>,
+    /// Commands that bring a tool named in `tool_identity` up to date on a donor (for example a
+    /// fetch of the tool repository), by the same names. A donor whose answer for a tool
+    /// differs from the job's runs that tool's command once and asks again. An older donor then
+    /// matches and runs the job. A donor that still differs is newer than the job, or unrelated
+    /// to it, and declines. A tool without a command, or whose command fails, cannot be put in
+    /// order, so the donor gives the job back instead of declining it.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub tool_refresh: std::collections::BTreeMap<String, String>,
     /// Times a change may be deferred because validation did not run (an admission refusal, a
     /// validator that cannot execute, a probe that could not run, donors that could not run)
     /// before it is escalated to its owner and held until `merge-queue retry` (0 = 3).

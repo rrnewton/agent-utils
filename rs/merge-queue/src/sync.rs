@@ -332,6 +332,7 @@ pub fn sync(
             claim: None,
             source: tag.clone(),
             requires: Vec::new(),
+            recorded_at: String::new(),
         });
     }
     let mut withdraw: Vec<i64> = items

@@ -375,7 +375,9 @@ fn a_dead_donor_loses_its_lease_and_its_late_receipt_is_refused() {
 }
 
 #[test]
-fn a_donor_with_different_tools_declines_and_nothing_is_ejected() {
+fn a_donor_with_different_tools_and_no_refresh_gives_the_job_back() {
+    // With no `tool_refresh` the donor cannot tell whether it is older or newer than the job,
+    // so it gives the job back (to be offered it again) instead of declining it forever.
     let fx = Fixture::new("donor-tools");
     fx.mq_ok(&[
         "init",
@@ -401,9 +403,11 @@ fn a_donor_with_different_tools_declines_and_nothing_is_ejected() {
     });
     let out = donor(&fx, &clone, "d1", &[]);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("DECLINED"), "{stderr}");
+    assert!(stderr.contains("gave back"), "{stderr}");
+    assert!(!stderr.contains("DECLINED"), "{stderr}");
     assert!(
-        stderr.contains(r#"toolchain: queue "1.90", donor "1.91""#),
+        stderr.contains(r#"toolchain: queue "1.90", donor "1.91""#)
+            && stderr.contains("validator.tool_refresh has no command for \"toolchain\""),
         "{stderr}"
     );
     let (code, report, _) = finish(run);
@@ -418,7 +422,105 @@ fn a_donor_with_different_tools_declines_and_nothing_is_ejected() {
     assert!(report["ejected"].as_array().unwrap().is_empty(), "{report}");
     assert_eq!(item_status(&fx, 1), "queued");
     let job = &jobs(&fx)[0];
-    assert_eq!(job["declined_by"], serde_json::json!(["d1"]), "{job}");
+    assert!(job.get("declined_by").is_none(), "{job}");
+    assert!(
+        job["history"].to_string().contains("released by d1"),
+        "{job}"
+    );
+}
+
+#[test]
+fn an_older_donor_refreshes_its_tools_and_takes_the_job() {
+    // The validator's tooling moved and the queue host has the new one; the donor's copy is
+    // older. It runs `tool_refresh` (a fetch, in real use), matches, and validates.
+    let fx = Fixture::new("donor-refresh-older");
+    fx.mq_ok(&[
+        "init",
+        "--validator",
+        "command",
+        "--validator-run",
+        "exit 0",
+        "--offload",
+        "decide",
+        "--tool-identity",
+        "toolchain=cat .tool-version",
+        "--tool-refresh",
+        "toolchain=echo 1.91 > .tool-version",
+    ]);
+    std::fs::write(fx.queue().join(".tool-version"), "1.91\n").unwrap();
+    two_changes(&fx);
+    let clone = donor_clone(&fx, "donor-host");
+    std::fs::write(clone.join(".tool-version"), "1.90\n").unwrap();
+    let run = spawn_run(&fx, &[]);
+    wait_for("a published job", Duration::from_secs(30), || {
+        !jobs(&fx).is_empty()
+    });
+    let out = donor(&fx, &clone, "d1", &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("refreshed toolchain for")
+            && stderr.contains(r#"toolchain: queue "1.91", donor "1.90""#),
+        "{stderr}"
+    );
+    let (code, report, stderr) = finish(run);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(
+        report["landed"][0]["prs"],
+        serde_json::json!([1, 2]),
+        "{report}"
+    );
+    let job = &jobs(&fx)[0];
+    assert_eq!(job["state"], "done", "{job}");
+    assert_eq!(
+        job["receipt"]["tool"]["tools"]["toolchain"], "1.91",
+        "{job}"
+    );
+    assert!(job.get("declined_by").is_none(), "{job}");
+}
+
+#[test]
+fn a_donor_still_different_after_refreshing_its_tools_declines() {
+    // After the refresh the donor has the newest tooling, and the job still names another:
+    // the donor is newer than the job (or unrelated to it), so it declines; a claim after the
+    // queue host's tooling moves re-stamps the job and offers it again.
+    let fx = Fixture::new("donor-refresh-newer");
+    fx.mq_ok(&[
+        "init",
+        "--validator",
+        "command",
+        "--validator-run",
+        "exit 0",
+        "--offload",
+        "decide",
+        "--tool-identity",
+        "toolchain=cat .tool-version",
+        "--tool-refresh",
+        "toolchain=echo 1.91 > .tool-version",
+    ]);
+    set_config(&fx, |config| {
+        config["donors"] = serde_json::json!({"claim_timeout_secs": 4})
+    });
+    std::fs::write(fx.queue().join(".tool-version"), "1.90\n").unwrap();
+    two_changes(&fx);
+    let clone = donor_clone(&fx, "donor-host");
+    std::fs::write(clone.join(".tool-version"), "1.91\n").unwrap();
+    let run = spawn_run(&fx, &[]);
+    wait_for("a published job", Duration::from_secs(30), || {
+        !jobs(&fx).is_empty()
+    });
+    let out = donor(&fx, &clone, "d1", &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("DECLINED"), "{stderr}");
+    assert!(
+        stderr.contains("still differ from the job's after refreshing them")
+            && stderr.contains("newer than the job or unrelated to it"),
+        "{stderr}"
+    );
+    let (code, report, _) = finish(run);
+    assert_eq!(code, Some(3));
+    assert!(report["ejected"].as_array().unwrap().is_empty(), "{report}");
+    assert_eq!(jobs(&fx)[0]["declined_by"], serde_json::json!(["d1"]));
 }
 
 #[test]
@@ -527,7 +629,9 @@ fn compare_mode_lands_on_the_local_verdict_and_records_disagreement() {
 }
 
 #[test]
-fn a_donor_built_from_another_revision_declines_and_nothing_is_ejected() {
+fn a_donor_built_from_another_revision_gives_the_job_back_and_nothing_is_ejected() {
+    // Only an upgrade can match a revision, so the donor gives the job back instead of
+    // declining it: once upgraded, it is offered the job again.
     let fx = Fixture::new("donor-revision");
     fx.mq_ok(&[
         "init",
@@ -556,7 +660,8 @@ fn a_donor_built_from_another_revision_declines_and_nothing_is_ejected() {
     std::fs::write(&path, serde_json::to_string_pretty(&job).unwrap()).unwrap();
     let out = donor(&fx, &clone, "d1", &[]);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("DECLINED"), "{stderr}");
+    assert!(stderr.contains("gave back"), "{stderr}");
+    assert!(!stderr.contains("DECLINED"), "{stderr}");
     assert!(
         stderr.contains(&format!(
             "this donor's merge-queue is built from {}",
@@ -567,7 +672,7 @@ fn a_donor_built_from_another_revision_declines_and_nothing_is_ejected() {
     let (code, report, _) = finish(run);
     assert_eq!(code, Some(3));
     assert!(report["ejected"].as_array().unwrap().is_empty(), "{report}");
-    assert_eq!(jobs(&fx)[0]["declined_by"], serde_json::json!(["d1"]));
+    assert!(jobs(&fx)[0].get("declined_by").is_none(), "{:?}", jobs(&fx));
 }
 
 #[test]

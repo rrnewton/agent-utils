@@ -198,8 +198,8 @@ pub struct Job {
     /// What happened to the job, oldest first. Never holds a lease token.
     #[serde(default)]
     pub history: Vec<String>,
-    /// Donors that declined the job (wrong tools, no base, bundle too big); a claim never
-    /// hands it to them again.
+    /// Donors that declined the job (tools still different after a refresh, no base, bundle
+    /// too big); a claim never hands it to them again unless the job is re-stamped.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub declined_by: Vec<String>,
     /// The queue's own verdict for the same commit (offload `compare`).
@@ -511,6 +511,87 @@ pub fn revision_mismatch(
     })
 }
 
+/// Names of the tools whose answers differ from the job's.
+pub fn mismatched_tools(
+    wanted: &BTreeMap<String, String>,
+    have: &BTreeMap<String, String>,
+) -> Vec<String> {
+    wanted
+        .iter()
+        .filter(|(name, value)| have.get(*name) != Some(value))
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// How long one `validator.tool_refresh` command may run on a donor.
+const REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Bring the tools `names` up to date on this host: run each one's `validator.tool_refresh`
+/// command in `cwd`, bounded by [`REFRESH_TIMEOUT`]. Fails on a tool with no such command, or a
+/// command that fails or runs out of time.
+pub fn refresh_tools(
+    validator: &ValidatorConfig,
+    cwd: &Path,
+    names: &[String],
+) -> Result<(), String> {
+    for name in names {
+        let command = validator
+            .tool_refresh
+            .get(name)
+            .ok_or_else(|| format!("validator.tool_refresh has no command for {name:?}"))?;
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .current_dir(cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("cannot run the refresh of {name:?}: {error}"))?;
+        let stderr = child.stderr.take();
+        let errors = std::thread::spawn(move || {
+            let mut buffer = Vec::new();
+            if let Some(mut stderr) = stderr {
+                let _ = stderr.read_to_end(&mut buffer);
+            }
+            buffer
+        });
+        let started = std::time::Instant::now();
+        let status = loop {
+            if let Some(status) = child
+                .try_wait()
+                .map_err(|error| format!("cannot wait for the refresh of {name:?}: {error}"))?
+            {
+                break status;
+            }
+            if started.elapsed() > REFRESH_TIMEOUT {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "the refresh of {name:?} ran out of time ({}s)",
+                    REFRESH_TIMEOUT.as_secs()
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let errors = errors.join().unwrap_or_default();
+        if !status.success() {
+            return Err(format!(
+                "the refresh of {name:?} failed (exit {}): {}",
+                status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&errors).trim()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// How a donor built before mismatch releases began the reason it gave for declining a job its
+/// tools or merge-queue revision did not match. The queue records such a decline as a release:
+/// the donor is offered the job again after its own back-off, so it takes the job once it has
+/// been upgraded or its tools have moved.
+pub const LEGACY_MISMATCH_DECLINE: &str = "this donor's tools differ from the queue host's: ";
+
 /// How the donor's tools differ from the job's, or `None` when they agree.
 pub fn tool_mismatch(
     wanted: &BTreeMap<String, String>,
@@ -769,8 +850,9 @@ impl Store {
     /// Give every queued job published under tool answers other than
     /// [`Store::current_tools`] the current ones. A tool repository that moved after the job
     /// was published (a fix landed in the validator's own tooling) leaves it stamped with
-    /// answers no up-to-date donor has: each such donor declines it and is never offered it
-    /// again, so it would sit queued until it is pruned. The queue host validates with its
+    /// answers no up-to-date donor has: each such donor (still different after its refresh)
+    /// declines it and is never offered it again, so it would sit queued until it is pruned.
+    /// The queue host validates with its
     /// current tools, so the job takes them too, and the donors that declined the old stamp
     /// may claim it again. Leased and finished jobs keep the stamp they ran under. The
     /// caller holds the store lock.
@@ -864,10 +946,19 @@ impl Store {
         } else {
             JobState::Queued
         };
+        // A mismatch is never a decline: the donor may be upgraded, or its tools may move.
+        let mismatch = decline && reason.starts_with(LEGACY_MISMATCH_DECLINE);
+        let decline = decline && !mismatch;
         job.history.push(format!(
-            "{}: {} by {donor}: {reason}",
+            "{}: {} by {donor}{}: {reason}",
             now(),
-            if decline { "declined" } else { "released" }
+            if decline { "declined" } else { "released" },
+            if mismatch {
+                " (declined for a mismatch, which is recorded as a release: it is offered the \
+                 job again)"
+            } else {
+                ""
+            }
         ));
         if decline && !job.declined_by.contains(&donor) {
             job.declined_by.push(donor);
@@ -1310,7 +1401,7 @@ pub struct DonorOptions {
     pub poll: std::time::Duration,
     /// Work directory (checkouts, logs).
     pub work: PathBuf,
-    /// Seconds to stop claiming after declining a job for a tool mismatch.
+    /// Seconds to stop claiming after a job whose tools or revision this donor did not match.
     pub mismatch_backoff: std::time::Duration,
     /// Exit once no job is running and none is available (scripts and tests).
     pub until_idle: bool,
@@ -1352,11 +1443,14 @@ fn has_commit(dir: &Path, commit: &str) -> bool {
 
 /// Why a donor did not report a job.
 enum Unreported {
-    /// The donor cannot run it here; it declined (with the reason) and never gets it again.
+    /// The donor cannot run it here; it declined (with the reason) and does not get it again
+    /// unless the job is re-stamped.
     Declined(String),
     /// The lease is gone or the job was cancelled; nothing to report.
     Lost(String),
-    /// The donor is stopping; the job was given back at once.
+    /// The job was given back at once: the donor is stopping, or it cannot tell yet whether it
+    /// can run the job (its merge-queue revision or its tools differ and cannot be matched
+    /// here), so it is offered the job again later.
     Released(String),
 }
 
@@ -1371,6 +1465,14 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 impl Worker<'_> {
+    /// Stop claiming for the mismatch back-off.
+    fn back_off(&self, backoff: &Mutex<Option<std::time::Instant>>) {
+        *backoff
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(std::time::Instant::now() + self.options.mismatch_backoff);
+    }
+
     fn release(&self, job: &Job, token: &str, reason: &str, decline: bool) {
         let mut args = vec!["donor", "release", "--job", &job.id, "--reason", reason];
         if decline {
@@ -1552,18 +1654,46 @@ impl Worker<'_> {
         lost: &Mutex<String>,
     ) -> Result<(), Unreported> {
         let revision = crate::build_info::revision();
-        let have =
-            tool_answers(&job.validator, &self.options.clone).map_err(Unreported::Declined)?;
-        let difference = revision_mismatch(job.tool.merge_queue.as_ref(), revision.as_ref())
-            .or_else(|| tool_mismatch(&job.tool.tools, &have));
-        if let Some(difference) = difference {
-            *backoff
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                Some(std::time::Instant::now() + self.options.mismatch_backoff);
-            return Err(Unreported::Declined(format!(
-                "this donor's tools differ from the queue host's: {difference}"
+        if let Some(difference) =
+            revision_mismatch(job.tool.merge_queue.as_ref(), revision.as_ref())
+        {
+            // Only an upgrade can match it, here or on the queue host: give the job back
+            // rather than decline it, so this donor is offered it again after its back-off (at
+            // once, if it is restarted upgraded).
+            self.back_off(backoff);
+            return Err(Unreported::Released(format!(
+                "this donor's merge-queue revision differs from the job's: {difference}"
             )));
+        }
+        let mut have =
+            tool_answers(&job.validator, &self.options.clone).map_err(Unreported::Declined)?;
+        let differing = mismatched_tools(&job.tool.tools, &have);
+        if !differing.is_empty() {
+            let before = tool_mismatch(&job.tool.tools, &have).unwrap_or_default();
+            // An older donor catches up and runs the job; only one that still differs after
+            // that (newer than the job, or unrelated) declines it.
+            if let Err(why) = refresh_tools(&job.validator, &self.options.clone, &differing) {
+                self.back_off(backoff);
+                return Err(Unreported::Released(format!(
+                    "this donor's tools differ from the job's ({before}) and cannot be brought up \
+                     to date here ({why}), so it cannot tell whether it is older or newer"
+                )));
+            }
+            have =
+                tool_answers(&job.validator, &self.options.clone).map_err(Unreported::Declined)?;
+            if let Some(after) = tool_mismatch(&job.tool.tools, &have) {
+                self.back_off(backoff);
+                return Err(Unreported::Declined(format!(
+                    "this donor's tools still differ from the job's after refreshing them \
+                     ({after}), so this donor is newer than the job or unrelated to it"
+                )));
+            }
+            eprintln!(
+                "merge-queue donor {}: refreshed {} for {}; its tools now match ({before} before)",
+                self.options.name,
+                differing.join(", "),
+                job.id
+            );
         }
         let digest = validator_digest(&job.validator).map_err(Unreported::Declined)?;
         if digest != job.tool.validator_digest {
@@ -1923,8 +2053,8 @@ mod unit {
         let mut store = Store::new(&temp("restamp"));
         let stale = publish(&store, "c1");
         assert!(stale.tool.tools.is_empty());
-        // A donor whose tools already moved declines the stale stamp, and is never offered
-        // the job again while the stamp stays.
+        // A donor whose tools already moved (still different after its refresh) declines the
+        // stale stamp, and is never offered the job again while the stamp stays.
         let first = store.claim("d1", "h1", 1).unwrap().expect("a job");
         let token = first.lease.as_ref().unwrap().token.clone();
         store
@@ -1950,6 +2080,28 @@ mod unit {
         assert!(store.claim("d2", "h2", 1).unwrap().is_none());
         let job = store.read(&first.id).unwrap();
         assert_eq!(job.tool.tools, moved, "a leased job is not re-stamped");
+    }
+
+    #[test]
+    fn a_mismatch_decline_from_a_donor_built_before_releases_is_recorded_as_a_release() {
+        let store = Store::new(&temp("legacy-mismatch"));
+        let job = publish(&store, "c1");
+        let first = store.claim("d1", "h1", 1).unwrap().expect("a job");
+        let token = first.lease.as_ref().unwrap().token.clone();
+        let reason = format!(
+            "{LEGACY_MISMATCH_DECLINE}this donor's merge-queue is built from a, the queue \
+             host's from b"
+        );
+        store.release(&first.id, &token, &reason, true).unwrap();
+        // Once that donor is upgraded it takes the job: it is offered it again.
+        let again = store.claim("d1", "h1", 1).unwrap().expect("offered again");
+        assert_eq!(again.id, job.id);
+        assert!(again.declined_by.is_empty(), "{:?}", again.declined_by);
+        let text = again.history.join("\n");
+        assert!(
+            text.contains("released by d1 (declined for a mismatch"),
+            "{text}"
+        );
     }
 
     #[test]

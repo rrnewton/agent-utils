@@ -110,8 +110,29 @@ pub fn refresh(
     Ok((base, resolved))
 }
 
+/// The commit a change's head names now, read without writing to the repository (a run may be
+/// using it): `ls-remote` on the remote, or the local ref of a local queue.
+pub fn peek_head(state: &State, config: &Config, head_ref: &str) -> Result<String, String> {
+    let git = repo(state, config)?;
+    let source = source_ref(head_ref);
+    if config.remote.is_empty() {
+        return git
+            .try_rev_parse(&source)
+            .ok_or_else(|| format!("head {head_ref:?} does not resolve"));
+    }
+    git.run_net(&["ls-remote", &config.remote, &source])?
+        .lines()
+        .find_map(|line| {
+            line.split_once('\t')
+                .filter(|(_, name)| *name == source)
+                .map(|(sha, _)| sha.to_owned())
+        })
+        .ok_or_else(|| format!("head {head_ref:?} does not resolve on {}", config.remote))
+}
+
 /// What to record for a submission.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Submission {
     /// Change number.
     pub pr: i64,
@@ -140,6 +161,10 @@ pub struct Submission {
     pub source: String,
     /// Peer commits that must land first.
     pub requires: Vec<Requirement>,
+    /// When the submission was recorded because another writer held the queue (see
+    /// [`crate::intake`]); empty for one applied at once.
+    #[serde(skip)]
+    pub recorded_at: String,
 }
 
 /// Submit (or resubmit) a change. Returns the stored item.
@@ -289,7 +314,7 @@ fn submit_resolved(
         landed_as: String::new(),
         history: existing.map(|old| old.history).unwrap_or_default(),
     };
-    let detail = match &item.claim {
+    let mut detail = match &item.claim {
         Some(claim) => format!(
             "head {current}; submitter validated {} ({}, policy {})",
             claim.selection.summary(),
@@ -298,6 +323,12 @@ fn submit_resolved(
         ),
         None => format!("head {current}; no submitter validation claim"),
     };
+    if !submission.recorded_at.is_empty() {
+        detail.push_str(&format!(
+            "; recorded at {} while another writer held the queue",
+            submission.recorded_at
+        ));
+    }
     item.log("submitted", detail);
     state.save_item(&item)?;
     Ok(item)
@@ -321,6 +352,12 @@ pub fn withdraw(state: &State, pr: i64, why: &str) -> Result<Item, String> {
 /// count and backoff, here and in the shadow ledger. The owner runs this once whatever kept
 /// validation from running is fixed.
 pub fn retry(state: &State, pr: i64) -> Result<Item, String> {
+    retry_recorded(state, pr, "")
+}
+
+/// [`retry`] of a request recorded at `recorded_at` while another writer held the queue (see
+/// [`crate::intake`]); the time goes into the change's history.
+pub fn retry_recorded(state: &State, pr: i64, recorded_at: &str) -> Result<Item, String> {
     let mut item = state
         .item(pr)?
         .ok_or_else(|| format!("#{pr} is not in the queue"))?;
@@ -346,9 +383,14 @@ pub fn retry(state: &State, pr: i64) -> Result<Item, String> {
     item.validation_refusals = 0;
     item.next_retry_at.clear();
     item.last_refusal.clear();
+    let recorded = if recorded_at.is_empty() {
+        String::new()
+    } else {
+        format!("; recorded at {recorded_at} while another writer held the queue")
+    };
     item.log(
         "retry",
-        format!("returned to the queue by its owner (was {was})"),
+        format!("returned to the queue by its owner (was {was}){recorded}"),
     );
     state.save_item(&item)?;
     let mut ledger = state.shadow_refusals()?;

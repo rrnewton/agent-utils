@@ -2980,6 +2980,19 @@ impl<'a> Runner<'a> {
                 ));
             }
         }
+        // A change withdrawn while its batch validated (recorded, since this run holds the
+        // writer lock) is not landed; the withdrawal is applied when the run ends.
+        let withdrawn = crate::intake::pending_withdrawals(self.state);
+        if let Some(pr) = candidate.prs.iter().find(|pr| withdrawn.contains(pr)) {
+            return Ok(BatchOutcome::Stop(
+                format!(
+                    "#{pr} was withdrawn while {} validated; not landing it (the withdrawal is \
+                     applied when this run ends)",
+                    list(&candidate.prs)
+                ),
+                candidate.prs.clone(),
+            ));
+        }
         if self.config.exact_sha && !self.covered(&candidate.tip, &claim.selection) {
             return Ok(BatchOutcome::Stop(
                 format!(

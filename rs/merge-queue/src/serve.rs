@@ -999,6 +999,17 @@ fn work_cycle(
     clean
 }
 
+/// Apply the requests recorded while another writer held the queue, under the writer lock the
+/// caller holds, and log what each did.
+fn apply_intake(state: &State, config: &Config, lock: &crate::state::Lock) {
+    if crate::intake::has_pending(state) {
+        crate::intake::report(
+            "merge-queue serve",
+            crate::intake::apply(state, config, lock),
+        );
+    }
+}
+
 /// Deliver owed notifications under the writer lock the caller holds.
 fn sweep_notifications(
     state: &State,
@@ -1183,6 +1194,13 @@ pub fn serve(state: &State, options: &ServeOptions) -> Result<i32, String> {
             break 'outer;
         }
         heartbeat.cycles += 1;
+        // Requests recorded while a run held the writer lock go in first, in order, so this
+        // iteration's items fingerprint sees them.
+        if crate::intake::has_pending(state) {
+            if let Ok(lock) = state.lock() {
+                apply_intake(state, &config, &lock);
+            }
+        }
         // Ingest the label first, so what it submits is seen by this
         // iteration's items fingerprint and validated without waiting a poll.
         if let Some(label) = &options.sync_label {
@@ -1266,6 +1284,7 @@ pub fn serve(state: &State, options: &ServeOptions) -> Result<i32, String> {
                         match state.lock() {
                             Ok(lock) => {
                                 clear_busy_error(&mut heartbeat, &mut busy_error);
+                                apply_intake(state, &config, &lock);
                                 if let Some(due) = schedule.due.as_ref() {
                                     if *due > retry_seen {
                                         retry_seen.clone_from(due);
@@ -1450,6 +1469,9 @@ pub struct StatusReport {
     /// heartbeat is healthy.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub working_secs: Option<u64>,
+    /// Requests recorded while another writer held the queue: waiting for the
+    /// lock, and refused when applied (see `crate::intake`).
+    pub intake: crate::intake::Summary,
     /// Why the item records cannot be read, when they cannot. The queue is
     /// then unhealthy whatever the daemon's liveness: nothing can be planned.
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -1578,6 +1600,7 @@ pub fn collect_status(state: &State, stale_after_secs: u64) -> Result<StatusRepo
         slots_in_use,
         shadow,
         working_secs,
+        intake: crate::intake::summary(state),
         items_error,
         remedy,
     })
@@ -1707,6 +1730,29 @@ pub fn render_status(report: &StatusReport) -> String {
         "slots: {} in use / {} total\n",
         report.slots_in_use, report.slots_total
     ));
+    let intake = &report.intake;
+    if intake.pending > 0 {
+        out.push_str(&format!(
+            "intake: {} request(s) recorded while a run held the queue, applied when it ends \
+             (oldest {})\n",
+            intake.pending, intake.oldest_pending
+        ));
+    }
+    if intake.refused > 0 {
+        out.push_str(&format!(
+            "intake refused: {} in the last week\n",
+            intake.refused
+        ));
+        for entry in &intake.recent_refusals {
+            out.push_str(&format!(
+                "  {} recorded at {}, refused at {}: {}\n",
+                entry.request.describe(),
+                entry.recorded_at,
+                entry.refused_at,
+                entry.error
+            ));
+        }
+    }
     out
 }
 
