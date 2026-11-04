@@ -31,6 +31,40 @@ def _wait_for_runs(tmp_path: Path, count: int) -> None:
     raise AssertionError("gate runners did not start")
 
 
+def test_finished_runs_append_to_the_durable_ledger(tmp_path: Path) -> None:
+    """#827: every finished run lands in the ledger outside /tmp, with its
+    verdict and failed steps, and `stats` reports the first-run pass rate."""
+    ledger = tmp_path / "ledger.jsonl"
+    env = {**_env(tmp_path), "GATE_LEDGER": str(ledger)}
+    ok = subprocess.run(
+        [PY, str(GATE), "--", PY, "-c",
+         "print('[a.step] ✓ PASS x'); print('validate: OK')"],
+        env=env, capture_output=True, text=True)
+    assert ok.returncode == 0, ok.stdout
+    bad = subprocess.run(
+        [PY, str(GATE), "--", PY, "-c",
+         "print('[b.step] ✗ FAIL y'); print('validate: FAILED'); raise SystemExit(3)"],
+        env=env, capture_output=True, text=True)
+    assert bad.returncode == 3, bad.stdout
+    rerun = subprocess.run(
+        [PY, str(GATE), "--exclusive", "--", PY, "-c", "print('[b.step] ✓ PASS y'); print('validate: OK')"],
+        env=env, capture_output=True, text=True)
+    assert rerun.returncode == 0, rerun.stdout
+
+    import json as _json
+    rows = [_json.loads(line) for line in ledger.read_text().splitlines()]
+    assert [row["verdict"] for row in rows] == ["pass", "fail", "pass"]
+    assert rows[1]["failed_steps"] == ["b.step"] and rows[1]["kind"] == "gate"
+    assert rows[2]["kind"] == "exclusive-rerun" and rows[2]["rerun_passed"] is True
+    assert rows[0]["head_sha"] and rows[0]["finished_utc"].endswith("Z")
+
+    stats = subprocess.run([PY, str(GATE), "stats"], env=env, capture_output=True, text=True)
+    assert stats.returncode == 0, stats.stdout
+    assert "first-run pass rate 50.0%" in stats.stdout
+    assert "failing step b.step: 1" in stats.stdout
+    assert "1/1 exclusive rerun(s) passed" in stats.stdout
+
+
 def test_shared_gates_run_up_to_the_cap_and_queue_the_rest(tmp_path: Path) -> None:
     sleepers = [_start(tmp_path, "--slots", "3", "--", PY, "-c", "import time; time.sleep(4)") for _ in range(3)]
     _wait_for_runs(tmp_path, 3)

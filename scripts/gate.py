@@ -28,20 +28,50 @@ every other gate as a fresh exclusive ticket.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import fcntl
 import json
 import os
+import re
 import subprocess
 import sys
 import time
 import uuid
+from collections import Counter
 from pathlib import Path
 
 DEFAULT_DIR = Path("/tmp/dev-agent-utils-gate-admission")
 
+#: Durable per-run ledger (#827): /tmp history dies with every cleanup, taking the
+#: full-gate pass rate with it, so finished runs also append here, outside /tmp.
+#: Override with $GATE_LEDGER or --ledger.
+DEFAULT_LEDGER = Path("~/.local/state/agent-utils/gate-ledger.jsonl")
+
+_FAILED_STEP = re.compile(r"\[([^\]]+)\] ✗ FAIL")
+_PASSED_STEP = re.compile(r"\[([^\]]+)\] ✓ PASS")
+_VERDICT = re.compile(r"validate: (OK|PARTIAL|FAILED)")
+
 
 def state_dir() -> Path:
     return Path(os.environ.get("GATE_ADMISSION_DIR") or DEFAULT_DIR)
+
+
+def ledger_path(explicit: str | None = None) -> Path:
+    return Path(explicit or os.environ.get("GATE_LEDGER") or DEFAULT_LEDGER).expanduser()
+
+
+def _utc(unix: float) -> str:
+    return dt.datetime.fromtimestamp(unix, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _git_rev_parse(ref: str) -> str | None:
+    try:
+        done = subprocess.run(
+            ["git", "rev-parse", ref], capture_output=True, text=True, timeout=10
+        )
+        return done.stdout.strip() if done.returncode == 0 else None
+    except Exception:
+        return None
 
 
 def _alive(pid: object) -> bool:
@@ -209,17 +239,86 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
     print(f"gate: admitted after {waited:.0f}s (class={args.cls})", flush=True)
     started = time.time()
     rc = 1
+    passed_steps: set[str] = set()
+    failed_steps: set[str] = set()
+    verdict_word: str | None = None
     try:
-        rc = subprocess.run(
-            command, env={**os.environ, "GATE_ADMISSION_RUN_ID": run_id}
-        ).returncode
+        proc = subprocess.Popen(
+            command,
+            env={**os.environ, "GATE_ADMISSION_RUN_ID": run_id},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
+            bufsize=1,
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            sys.stdout.write(line)
+            match = _FAILED_STEP.search(line)
+            if match:
+                failed_steps.add(match.group(1))
+            match = _PASSED_STEP.search(line)
+            if match:
+                passed_steps.add(match.group(1))
+            match = _VERDICT.search(line)
+            if match:
+                verdict_word = match.group(1)
+        rc = proc.wait()
     finally:
+        finished = time.time()
         adm.finish(run_id)
         adm.record({"id": run_id, "class": args.cls, "command": command,
                     "queued_at": queued_at, "started_at": started,
-                    "finished_at": time.time(), "wait_s": round(waited, 2),
-                    "run_s": round(time.time() - started, 2), "exit_code": rc})
+                    "finished_at": finished, "wait_s": round(waited, 2),
+                    "run_s": round(finished - started, 2), "exit_code": rc})
+        _record_ledger(args, command, started, finished, rc,
+                       passed_steps, failed_steps, verdict_word)
     return rc
+
+
+def _record_ledger(
+    args: argparse.Namespace,
+    command: list[str],
+    started: float,
+    finished: float,
+    rc: int,
+    passed_steps: set[str],
+    failed_steps: set[str],
+    verdict_word: str | None,
+) -> None:
+    """Append one durable ledger line for the finished run (#827). Best effort:
+    a ledger failure must never change the gate's own result."""
+
+    try:
+        base: str | None = None
+        if "--base" in command:
+            base = command[command.index("--base") + 1]
+        verdict = {"OK": "pass", "PARTIAL": "partial", "FAILED": "fail"}.get(
+            verdict_word or "", "pass" if rc == 0 else "fail"
+        )
+        kind = "exclusive-rerun" if args.cls == "exclusive" else "gate"
+        line = {
+            "started_utc": _utc(started),
+            "finished_utc": _utc(finished),
+            "base": base,
+            "base_sha": _git_rev_parse(base) if base else None,
+            "head_sha": _git_rev_parse("HEAD"),
+            "selection": "selected" if "--selected" in " ".join(command) else "full",
+            "kind": kind,
+            "steps": len(passed_steps) + len(failed_steps),
+            "failed_steps": sorted(failed_steps),
+            "rerun_passed": (rc == 0) if kind == "exclusive-rerun" else None,
+            "verdict": verdict,
+            "exit_code": rc,
+            "log_path": None,
+        }
+        path = ledger_path(getattr(args, "ledger", None))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as fh:
+            fh.write(json.dumps(line, sort_keys=True) + "\n")
+    except Exception:
+        pass
 
 
 def show_status(args: argparse.Namespace) -> int:
@@ -243,6 +342,52 @@ def show_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _parse_since(text: str) -> float:
+    match = re.fullmatch(r"(\d+)([hd])", text)
+    if match:
+        hours = int(match.group(1)) * (24 if match.group(2) == "d" else 1)
+        return time.time() - hours * 3600
+    return dt.datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+
+
+def show_stats(args: argparse.Namespace) -> int:
+    path = ledger_path(getattr(args, "ledger", None))
+    rows: list[dict[str, object]] = []
+    if path.exists():
+        for raw in path.read_text(errors="replace").splitlines():
+            try:
+                row = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
+    since = _parse_since(args.since) if args.since else 0.0
+    rows = [
+        row for row in rows
+        if dt.datetime.fromisoformat(
+            str(row.get("finished_utc", "1970-01-01T00:00:00Z")).replace("Z", "+00:00")
+        ).timestamp() >= since
+    ]
+    gates = [row for row in rows if row.get("kind") == "gate"]
+    reruns = [row for row in rows if row.get("kind") == "exclusive-rerun"]
+    passed = sum(1 for row in gates if row.get("verdict") == "pass")
+    partial = sum(1 for row in gates if row.get("verdict") == "partial")
+    rate = f"{100.0 * (passed + partial) / len(gates):.1f}%" if gates else "n/a"
+    failures: Counter[str] = Counter()
+    for row in gates:
+        steps = row.get("failed_steps")
+        if isinstance(steps, list):
+            failures.update(str(step) for step in steps)
+    print(f"gate stats: {len(gates)} first-run gate(s), {passed} pass, {partial} partial, "
+          f"{len(gates) - passed - partial} fail; first-run pass rate {rate} "
+          f"({args.since or 'all time'}, ledger {path})")
+    print(f"gate stats: {sum(1 for r in reruns if r.get('rerun_passed'))}/{len(reruns)} "
+          "exclusive rerun(s) passed")
+    for step, count in failures.most_common(10):
+        print(f"gate stats: failing step {step}: {count}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(prog="gate", description="Gate admission: counting slots plus an exclusive class.")
@@ -251,8 +396,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--exclusive", dest="cls", action="store_const", const="exclusive", default="shared",
                         help="run alone: wait for an empty box and block new admissions")
     parser.add_argument("--wait-timeout", type=float, default=0.0, help="give up queueing after N seconds (0 = wait forever)")
+    parser.add_argument("--ledger", default=None,
+                        help="durable ledger path (default ~/.local/state/agent-utils/gate-ledger.jsonl, or $GATE_LEDGER)")
     if argv[:1] == ["status"]:
         return show_status(parser.parse_args([]))
+    if argv[:1] == ["stats"]:
+        stats_parser = argparse.ArgumentParser(prog="gate stats")
+        stats_parser.add_argument("--since", default=None,
+                                  help="window: Nh, Nd, or an ISO date/time (default all time)")
+        stats_parser.add_argument("--ledger", default=None, help="ledger path (see --ledger)")
+        return show_stats(stats_parser.parse_args(argv[1:]))
     if "--" in argv:
         cut = argv.index("--")
         args = parser.parse_args(argv[:cut])
