@@ -34,3 +34,5 @@ export { createPendingThreads } from "./pending.ts";
 export type { PendingSend, PendingThreads, PendingThreadsDependencies } from "./pending.ts";
 export { SEND_UNDO_MS, createSendUndo } from "./sendundo.ts";
 export type { SendDismissal, SendUndo, SendUndoDependencies } from "./sendundo.ts";
+export { createUnconfirmedSends } from "./unconfirmed.ts";
+export type { UnconfirmedSends, UnconfirmedSendsDependencies } from "./unconfirmed.ts";

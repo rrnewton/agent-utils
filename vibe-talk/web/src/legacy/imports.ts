@@ -69,6 +69,7 @@ export {
   createReplyDrafts,
   createSendNumbers,
   createSendUndo,
+  createUnconfirmedSends,
   draftIdentity,
   editableSend as outboxEditable,
   nextRetryAt,

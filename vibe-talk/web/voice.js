@@ -15941,7 +15941,7 @@ function pendingThreadTimes() {
 /**
  * The stream has shown this server's copy of a post made for entry `id` (its `client_key`): the store
  * holds it now and counts it in its thread, so the entry no longer does (`pendingThreads`). Not saved:
- * a reload asks the server instead (`settleUnconfirmedSends`).
+ * a reload asks the server instead (`unconfirmedSends`).
  */
 function noteOutgoingEcho(id) {
   const entry = outbox.get(id);
@@ -17058,13 +17058,16 @@ function settleFromServer(id) {
   scheduleOutgoingMessage(entry);
 }
 
-/** Every unconfirmed send in the outbox, asked of the server once per load (`settleFromServer`). */
-let unconfirmedSettled = false;
-function settleUnconfirmedSends() {
-  if (unconfirmedSettled) return;
-  unconfirmedSettled = true;
-  for (const id of [...outbox.ids()]) settleFromServer(id);
-}
+/**
+ * Every unconfirmed send in the outbox, asked of the server once per load (`settleFromServer`): one owner
+ * in web/src/core/outbox/unconfirmed.ts (`#624 voice-page-modularity`).
+ *
+ * @type {import("./src/core/outbox/index.ts").UnconfirmedSends}
+ */
+const unconfirmedSends = createUnconfirmedSends({
+  ids: () => outbox.ids(),
+  settle: (id) => settleFromServer(id),
+});
 
 /** Take a `202` posting answer's count of parts onto `entry`'s row. */
 function noteOutgoingProgress(entry, answer) {
@@ -32338,7 +32341,7 @@ async function signIn() {
   // it could not start at load, where a saved token is only a claim `/client-config` tests.
   startSettingsSync();
   // `#468 send-dedupe`. What this page left unconfirmed, asked of the server once per load.
-  settleUnconfirmedSends();
+  unconfirmedSends.settleOnce();
   return true;
 }
 

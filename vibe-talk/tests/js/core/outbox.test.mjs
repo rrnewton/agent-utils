@@ -470,3 +470,20 @@ test("`#624 voice-page-modularity`: the outbox pump runs one pass at a time, goi
   const numbers = createSendNumbers();
   assert.deepStrictEqual([numbers.next(), numbers.next()], [1, 2]);
 });
+
+test("unconfirmed sends: every id in the outbox asked once per load, a later call asks nothing", () => {
+  const ids = new Set(["a", "b"]);
+  const asked = [];
+  const sends = OUTBOX.createUnconfirmedSends({
+    ids: () => ids.values(),
+    settle: (id) => {
+      asked.push(id);
+      ids.delete(id);
+    },
+  });
+  sends.settleOnce();
+  assert.deepStrictEqual(asked, ["a", "b"], "a copy of the ids is walked, so an ask that drops its entry skips none");
+  ids.add("c");
+  sends.settleOnce();
+  assert.deepStrictEqual(asked, ["a", "b"], "once per load");
+});

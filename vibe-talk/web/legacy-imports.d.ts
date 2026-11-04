@@ -105,6 +105,7 @@ declare const draftIdentity: LegacyImports["draftIdentity"];
 declare const createPendingThreads: LegacyImports["createPendingThreads"];
 declare const createReplyDrafts: LegacyImports["createReplyDrafts"];
 declare const createSendUndo: LegacyImports["createSendUndo"];
+declare const createUnconfirmedSends: LegacyImports["createUnconfirmedSends"];
 declare const createDismissedSends: LegacyImports["createDismissedSends"];
 declare const createOutboxStore: LegacyImports["createOutboxStore"];
 declare const OWN_POST_GRACE_MS: LegacyImports["OWN_POST_GRACE_MS"];
