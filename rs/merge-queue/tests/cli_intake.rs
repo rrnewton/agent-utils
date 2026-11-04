@@ -12,13 +12,15 @@ use fs2::FileExt;
 use serde_json::Value;
 use support::{git, Fixture};
 
-const IDENTITY: [(&str, &str); 6] = [
+const IDENTITY: [(&str, &str); 7] = [
     ("GIT_AUTHOR_NAME", "Dev"),
     ("GIT_AUTHOR_EMAIL", "dev@example.com"),
     ("GIT_COMMITTER_NAME", "Dev"),
     ("GIT_COMMITTER_EMAIL", "dev@example.com"),
     ("GIT_CONFIG_GLOBAL", "/dev/null"),
     ("GIT_CONFIG_NOSYSTEM", "1"),
+    // Marks a test run (see support/mod.rs).
+    ("TESTTMP", "1"),
 ];
 
 fn state_dir(fx: &Fixture) -> PathBuf {

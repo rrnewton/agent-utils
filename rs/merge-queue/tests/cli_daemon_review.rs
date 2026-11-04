@@ -184,6 +184,8 @@ fn start_daemon(fx: &Fixture) -> Daemon {
         .env("GIT_COMMITTER_EMAIL", "dev@example.com")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        // Marks a test run (see support/mod.rs).
+        .env("TESTTMP", "1")
         .env_remove("MERGE_QUEUE_STATE");
     Daemon(command.spawn().unwrap())
 }

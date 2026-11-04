@@ -12,13 +12,17 @@ pub struct Fixture {
     pub root: PathBuf,
 }
 
-const IDENTITY: [(&str, &str); 6] = [
+const IDENTITY: [(&str, &str); 7] = [
     ("GIT_AUTHOR_NAME", "Dev"),
     ("GIT_AUTHOR_EMAIL", "dev@example.com"),
     ("GIT_COMMITTER_NAME", "Dev"),
     ("GIT_COMMITTER_EMAIL", "dev@example.com"),
     ("GIT_CONFIG_GLOBAL", "/dev/null"),
     ("GIT_CONFIG_NOSYSTEM", "1"),
+    // Marks a test run. Some hosts wrap git in a logger that starts a telemetry process for
+    // every call unless TESTTMP is set; it outlives the call and costs several times the call's
+    // own CPU, and these fixtures make tens of thousands of git calls.
+    ("TESTTMP", "1"),
 ];
 
 impl Fixture {
