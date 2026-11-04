@@ -1,11 +1,12 @@
 ---
 title: 'voice-toggle-colours: Voice is the lit blue state and Channel the darker one'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: cl-refactor
 created_at: 2026-11-04T19:00:42.662342050+00:00
-updated_at: 2026-11-04T19:00:42.662342050+00:00
+updated_at: 2026-11-04T19:28:37.904146191+00:00
+closed_at: 2026-11-04T19:28:37.904146070+00:00
 ---
 
 # Description
