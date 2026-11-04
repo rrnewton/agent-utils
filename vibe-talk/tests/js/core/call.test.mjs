@@ -88,7 +88,9 @@ test("`#624 voice-page-modularity`: a call's audio route, from its microphone to
   assert.notEqual(route.current(), first, "a new call's route is the last call's object");
   route.set(null);
   assert.equal(route.current(), null);
-  assert.throws(() => route.noteInput("USB headset"), TypeError, "a call that ended mid-open no longer throws at the next update");
+  // Kept as the legacy script had it, on purpose (a behaviour-preserving move): an input noted after the call's
+  // route has gone throws. Whether it should is a separate question, not this move's.
+  assert.throws(() => route.noteInput("USB headset"), TypeError, "the move changed what noting an input after the route went does");
   assert.equal(createAudioRoute({ classify }).current(), null, "two routes share their state");
 });
 

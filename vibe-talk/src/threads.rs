@@ -269,8 +269,8 @@ pub const MIN_CARD_MAX_LINES: usize = 1;
 pub const MAX_CARD_MAX_LINES: usize = 12;
 
 /// K from the synced setting's stored value, read as the page reads it (`clampCardMaxLines` in
-/// web/voice.js): absent, blank or not a number is the default; anything else rounded and held
-/// to [`MIN_CARD_MAX_LINES`]..=[`MAX_CARD_MAX_LINES`]. The server parses no other synced
+/// web/src/core/settings/bounds.ts): absent, blank or not a number is the default; anything else
+/// rounded and held to [`MIN_CARD_MAX_LINES`]..=[`MAX_CARD_MAX_LINES`]. The server parses no other synced
 /// setting; this one decides when it spends a model call.
 #[must_use]
 pub fn card_max_lines(value: Option<&str>) -> usize {

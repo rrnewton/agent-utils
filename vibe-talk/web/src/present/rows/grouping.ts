@@ -27,7 +27,7 @@ function isNoise(message: Pick<Message, "noise"> | null | undefined): boolean {
 
 /**
  * Does `message` belong with the one before it? Never while the reader has turned combining off
- * (`combineMessages`, the legacy script's setting, passed in).
+ * (the Combine messages switch, `DEVICE_SETTINGS.combineMessages`, passed in).
  *
  * A missing or unparseable timestamp is a NO. Guessing that two messages were sent together when
  * the page cannot tell when either was sent would be combining on no evidence at all.
