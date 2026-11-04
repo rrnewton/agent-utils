@@ -410,7 +410,7 @@ def build_phases(
     team: TeamData,
     *,
     phase_minutes: int = 30,
-    context_chars: int = 16_000,
+    context_chars: int = 8_000,
     transcript_chars: int = 30_000,
 ) -> tuple[PhaseWindow, ...]:
     """Partition activity into fixed, append-stable UTC windows."""

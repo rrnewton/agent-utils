@@ -6498,7 +6498,7 @@ fn run_refresh(args: &[String], kind: RefreshKind) -> u8 {
         Ok(value) => value,
         Err(code) => return code,
     };
-    let context_chars = match parse_int("--context-chars", 16000) {
+    let context_chars = match parse_int("--context-chars", 8000) {
         Ok(value) => value,
         Err(code) => return code,
     };
@@ -8136,7 +8136,7 @@ fn run_summarize(args: &[String]) -> u8 {
         Ok(value) => value,
         Err(code) => return code,
     };
-    let context_chars = match parse_int("--context-chars", 16000) {
+    let context_chars = match parse_int("--context-chars", 8000) {
         Ok(value) => value,
         Err(code) => return code,
     };

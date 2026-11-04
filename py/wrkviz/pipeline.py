@@ -183,6 +183,7 @@ from wrkviz.summary_registry import (
     PROJECT_OVERVIEW_SUMMARIZER,
     registry_json_obj,
     summarizer_change_for_prompt,
+    summarizer_for_style,
 )
 from wrkviz.summary_artifacts import (
     ARTIFACT_ENVELOPE_FORMAT,
@@ -3421,7 +3422,7 @@ def _agent_name_jobs(
     team: TeamData,
     phases: Sequence[PhaseWindow],
     phase_results: Mapping[str, SummaryResult],
-    context_chars: int = 16_000,
+    context_chars: int = 8_000,
 ) -> tuple[AgentNameJob, ...]:
     """Build hindsight naming inputs after all phase-level work has been summarized."""
 
@@ -3969,6 +3970,34 @@ def _period_range(
 _RollupResolver = Callable[[SummaryJob, bool, bool], SummaryResult | None]
 
 
+#: Prompt version marking a locally synthesized rollup for a period with no
+#: activity (#854). It is not a model prompt version: no model call is made.
+NO_ACTIVITY_PROMPT_VERSION = "no-activity-v1"
+
+
+def _no_activity_summary(key: str, at_ms: int) -> SummaryResult:
+    """Return a local "no activity" result for an empty period; never a model call."""
+
+    identity = hashlib.sha256(
+        f"{NO_ACTIVITY_PROMPT_VERSION}\0{key}".encode("utf-8")
+    ).hexdigest()
+    return SummaryResult(
+        key=key,
+        phrase="No activity",
+        paragraph="No activity was recorded in this period.",
+        work_summary=(),
+        model="none",
+        prompt_version=NO_ACTIVITY_PROMPT_VERSION,
+        input_hash=identity,
+        generated_at=_fallback_generated_at(at_ms),
+        summary_available=True,
+    )
+
+
+def _is_no_activity(result: SummaryResult) -> bool:
+    return result.prompt_version == NO_ACTIVITY_PROMPT_VERSION
+
+
 def _walk_rollups(
     team: TeamData,
     periods: Sequence[Period],
@@ -4035,13 +4064,24 @@ def _walk_rollups(
                 terms,
                 TECHNICAL_ROLLUP_STYLE,
             )[0]
-            result = resolve(
-                job,
-                children_known and not any(_period_key(item) in unknown for item in lower),
-                not any(
-                    _period_key(item) in unknown
-                    for item, _ in _prior_same_level(completed, period)
-                ),
+            # A period with no phases of its own whose children are all
+            # no-activity has nothing to summarize: synthesize locally instead
+            # of paying for a model call (#854).
+            idle = not _phases_in(period, phases) and all(
+                _is_no_activity(previous_results[_period_key(item)]) for item in lower
+            )
+            result = (
+                _no_activity_summary(job.key, period.end_ms)
+                if idle
+                else resolve(
+                    job,
+                    children_known
+                    and not any(_period_key(item) in unknown for item in lower),
+                    not any(
+                        _period_key(item) in unknown
+                        for item, _ in _prior_same_level(completed, period)
+                    ),
+                )
             )
             if result is None:
                 unknown.add(key)
@@ -4061,16 +4101,20 @@ def _walk_rollups(
                 project_overview,
                 {key: result},
             )[0]
-            plain_result = resolve(
-                plain_job,
-                overview_known
-                and children_known
-                and key not in unknown
-                and not any(_period_key(item) in unknown_plain for item in lower),
-                not any(
-                    _period_key(item) in unknown_plain
-                    for item, _ in _prior_same_level(completed_plain, period)
-                ),
+            plain_result = (
+                _no_activity_summary(plain_job.key, period.end_ms)
+                if idle
+                else resolve(
+                    plain_job,
+                    overview_known
+                    and children_known
+                    and key not in unknown
+                    and not any(_period_key(item) in unknown_plain for item in lower),
+                    not any(
+                        _period_key(item) in unknown_plain
+                        for item, _ in _prior_same_level(completed_plain, period)
+                    ),
+                )
             )
             if plain_result is None:
                 unknown_plain.add(key)
@@ -4250,16 +4294,22 @@ def _plan_tree(
             name_stage.to_generate += 1
 
     overview_stage = stage("project overview", OVERVIEW_KIND)
-    overview_stage.total = 1
+    # A team with no phases in the window is idle: no overview (or name) model
+    # call is planned for it (#854). Rollups below become no-activity locally.
+    idle_team = not tree.phases
     overview = cached_summary(
         tree.overview_job, cache, backend, model, reasoning_effort, service_tier
     )
-    if overview is None:
+    if idle_team:
+        overview = _no_activity_summary(tree.overview_job.key, tree.overview_job.end_ms)
+    elif overview is None:
+        overview_stage.total = 1
         overview_stage.to_generate = 1
         overview = _unavailable_summary(
             tree.overview_job.key, tree.overview_job.end_ms, "planned project overview"
         )
     else:
+        overview_stage.total = 1
         overview_stage.cached = 1
 
     rollup_stages: dict[tuple[str, str], StageCount] = {}
@@ -4306,10 +4356,26 @@ def _plan_tree(
         unknown_phase_keys=frozenset(unknown_phase_keys),
         overview_known=overview_stage.cached == 1,
     )
+    # Project-wide calibration (#854): sibling teams' receipts in this archive
+    # price a team with no receipts of its own, instead of the built-in table.
+    teams_dir = tree.summary_root.parent.parent
+    extra_caches = tuple(
+        (root / "cache", root / "name_cache")
+        for root in sorted(teams_dir.glob("*/summary_data"))
+        if root != tree.summary_root
+    )
     return SummaryPlan(
         team_slug=tree.team.team_slug,
         stages=stages,
-        costs=calibrate(cache, name_cache, backend, model, reasoning_effort, rollup_model),
+        costs=calibrate(
+            cache,
+            name_cache,
+            backend,
+            model,
+            reasoning_effort,
+            rollup_model,
+            extra_caches=extra_caches,
+        ),
         prices=prices,
         budget_usd=budget_usd,
         previous_state=_unfinished_state(tree.summary_root),
@@ -4339,7 +4405,7 @@ def _summarize_archive_locked(
     batch_size: int = 6,
     name_batch_size: int = 12,
     phase_minutes: int = 30,
-    context_chars: int = 16_000,
+    context_chars: int = 8_000,
     transcript_chars: int = 30_000,
     codex_command: Sequence[str] = ("codex",),
     claude_command: Sequence[str] = ("claude",),
@@ -4540,23 +4606,43 @@ def _run_summary_tree(
     )
     progress["stage"] = "project overview"
     overview_job = tree.overview_job
-    overview_results, overview_stats = summarize_jobs(
-        (overview_job,),
-        cache,
-        backend,
-        model,
-        max_workers=max_workers,
-        batch_size=batch_size,
-        codex_command=codex_command,
-        claude_command=claude_command,
-        reasoning_effort=reasoning_effort,
-        service_tier=service_tier,
-        guard=guard,
-        muse_command=muse_command,
-        backend_timeout_seconds=backend_timeout_seconds,
-    )
-    project_overview = overview_results[overview_job.key]
-    _validate_project_overview(project_overview, "generated project overview")
+    if phases:
+        overview_results, overview_stats = summarize_jobs(
+            (overview_job,),
+            cache,
+            backend,
+            model,
+            max_workers=max_workers,
+            batch_size=batch_size,
+            codex_command=codex_command,
+            claude_command=claude_command,
+            reasoning_effort=reasoning_effort,
+            service_tier=service_tier,
+            guard=guard,
+            muse_command=muse_command,
+            backend_timeout_seconds=backend_timeout_seconds,
+        )
+        project_overview = overview_results[overview_job.key]
+        _validate_project_overview(project_overview, "generated project overview")
+    else:
+        # Idle team: no phases in the window, so no overview model call (#854).
+        overview_stats = SummaryRunStats(hits=0, misses=0, batches=0)
+        project_overview = SummaryResult(
+            key=overview_job.key,
+            phrase="Insufficient evidence",
+            paragraph=(
+                "Insufficient evidence: no phases fall in the selected window, "
+                "so no project overview was generated."
+            ),
+            work_summary=(),
+            model="none",
+            prompt_version=summarizer_for_style(PROJECT_OVERVIEW_STYLE).prompt_version,
+            input_hash=hashlib.sha256(
+                f"{NO_ACTIVITY_PROMPT_VERSION}\0{overview_job.key}".encode("utf-8")
+            ).hexdigest(),
+            generated_at=_fallback_generated_at(overview_job.end_ms),
+            summary_available=True,
+        )
     changed += _write_project_overview_data(
         archive, team_slug, tree.overview_source, project_overview
     )
@@ -4651,8 +4737,14 @@ def _run_summary_tree(
         + tuple(all_results.values())
         + tuple(all_plain_results.values())
     )
+    # No-activity results are synthesized locally, not model artifacts: they
+    # have no cache entry and stay out of the artifact catalog (#854). The
+    # idle team's local overview is excluded for the same reason.
     catalog_additions = tuple(
-        _summary_catalog_reference(result, "cache") for result in summary_results
+        _summary_catalog_reference(result, "cache")
+        for result in summary_results
+        if not _is_no_activity(result)
+        and not (not phases and result is project_overview)
     ) + tuple(
         _summary_catalog_reference(result, "name_cache")
         for result in agent_names.values()
@@ -4709,7 +4801,7 @@ def plan_summaries(
     model: str,
     *,
     phase_minutes: int = 30,
-    context_chars: int = 16_000,
+    context_chars: int = 8_000,
     transcript_chars: int = 30_000,
     reasoning_effort: str | None = None,
     service_tier: str | None = None,
@@ -4765,7 +4857,7 @@ def summarize_archive(
     batch_size: int = 6,
     name_batch_size: int = 12,
     phase_minutes: int = 30,
-    context_chars: int = 16_000,
+    context_chars: int = 8_000,
     transcript_chars: int = 30_000,
     codex_command: Sequence[str] = ("codex",),
     claude_command: Sequence[str] = ("claude",),
@@ -5500,7 +5592,7 @@ def _build_archive_locked(
         summary_root / "artifacts.json", team_slug
     )
     phases = build_phases(team, phase_minutes=phase_minutes)
-    phase_jobs = _phase_jobs(team, phases, (), 16_000)
+    phase_jobs = _phase_jobs(team, phases, (), 8_000)
     phase_results = _load_phase_summaries(
         archive, team_slug, phases, phase_jobs, summary_catalog
     )

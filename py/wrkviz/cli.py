@@ -465,7 +465,7 @@ def _add_summary(parser: argparse.ArgumentParser) -> None:
         help="agents per hindsight-naming model call",
     )
     parser.add_argument("--phase-minutes", type=int, default=30)
-    parser.add_argument("--context-chars", type=int, default=16000)
+    parser.add_argument("--context-chars", type=int, default=8000)
     parser.add_argument("--transcript-chars", type=int, default=30000)
     parser.add_argument(
         "--codex-command", default="codex", help="Codex executable (primarily for testing/wrappers)"

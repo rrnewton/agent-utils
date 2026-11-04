@@ -23,7 +23,7 @@ from __future__ import annotations
 import math
 import os
 import threading
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -297,12 +297,19 @@ def calibrate(
     model: str,
     reasoning_effort: str | None,
     rollup_model: str | None = None,
+    extra_caches: Sequence[tuple[Path, Path]] = (),
 ) -> CostModel:
     """Return mean usage per job kind from completed receipts of this backend/model/effort.
 
     Calendar rollups are calibrated from the receipts of *rollup_model* (default: *model*), the
     model that writes them. Each kind also gets its mean call duration, or the built-in figure
     for its model when no receipt of that kind is timed.
+
+    *extra_caches* are sibling teams' ``(summary_cache, name_cache)`` pairs from the same
+    archive: their receipts calibrate a team that has none of its own yet, so a new team's
+    plan is priced from project-wide observed usage instead of the built-in table (#854).
+    The team's own receipts are read first and are never diluted by identity: all receipts
+    are pooled per job kind, which is the same mean the built-in table approximates.
     """
 
     if backend == "heuristic":
@@ -310,7 +317,11 @@ def calibrate(
     rollup_model = rollup_model or model
     totals: dict[str, list[float]] = {}
     durations: dict[str, list[float]] = {}
-    for cache_dir, is_names in ((summary_cache, False), (name_cache, True)):
+    cache_dirs = [(summary_cache, False), (name_cache, True)]
+    for extra_summary, extra_names in extra_caches:
+        cache_dirs.append((extra_summary, False))
+        cache_dirs.append((extra_names, True))
+    for cache_dir, is_names in cache_dirs:
         receipts = cache_dir / "_usage" / "receipts"
         if not receipts.is_dir():
             continue

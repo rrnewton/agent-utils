@@ -1256,10 +1256,10 @@ pub fn build_archive_locked(
     let root = summary_root(archive, team_slug)?;
     let catalog_path = root.join("artifacts.json");
     let catalog = load_summary_catalog(&catalog_path, team_slug)?;
-    let phases = build_phases(&team, phase_minutes, 16_000, 30_000)?;
-    let jobs = phase_jobs(&team, &phases, &[], 16_000);
+    let phases = build_phases(&team, phase_minutes, 8_000, 30_000)?;
+    let jobs = phase_jobs(&team, &phases, &[], 8_000);
     let phase_results = load_phase_summaries(archive, team_slug, &phases, &jobs, &catalog)?;
-    let name_jobs = agent_name_jobs(&team, &phases, &phase_results, 16_000);
+    let name_jobs = agent_name_jobs(&team, &phases, &phase_results, 8_000);
     let selected_ids = crate::summary_phases::phase_agent_ids(&team, &phases);
     let agent_names = load_agent_names(archive, &team, &selected_ids, &name_jobs, &catalog)?;
     let project_overview = load_project_overview(archive, &team)?;

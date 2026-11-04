@@ -745,8 +745,13 @@ and the project overview, then each calendar level of rollups built from the lev
 any model call, `summarize` walks that whole tree against the cache and prints a plan: per stage,
 how many jobs are cached, carried forward (below), or need a model call, with estimated tokens
 and, given `--price`, dollars. Estimates are the mean recorded usage per job of each kind from
-this team's own receipts for the same backend, model and effort; a team with no history uses
-built-in figures that err high. With the zero-rated `muse` backend the plan reports `$0.00 model
+this team's own receipts for the same backend, model and effort; a team with no receipts of its
+own is priced from the other teams' receipts in the same archive, and only an archive with no
+receipts at all falls back to built-in figures that err high. Periods with no activity — an
+empty day, or a team with no phases in the window — make no model call at all: their rollups,
+and an idle team's overview, are written locally as "No activity" and render as such. Each
+phase's prompt includes up to `--context-chars` characters of that agent's prior work
+(default 8000). With the zero-rated `muse` backend the plan reports `$0.00 model
 spend` whatever `--price` says, a budget never stops the run, and the plan gives the run's
 expected wall time instead, from the mean duration of the receipts' calls (or built-in per-model
 figures), the batch sizes and `--summary-workers`. `--plan` prints the plan and exits without

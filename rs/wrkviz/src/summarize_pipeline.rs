@@ -784,6 +784,30 @@ fn fallback_generated_at(at_ms: i64) -> String {
     }
 }
 
+/// Prompt version marking a locally synthesized no-activity rollup (#854).
+pub const NO_ACTIVITY_PROMPT_VERSION: &str = "no-activity-v1";
+
+/// A local "no activity" result for an empty period; never a model call.
+pub fn no_activity_summary(key: &str, at_ms: i64) -> SummaryResult {
+    SummaryResult {
+        key: key.to_string(),
+        phrase: "No activity".into(),
+        paragraph: "No activity was recorded in this period.".into(),
+        work_summary: Vec::new(),
+        model: "none".into(),
+        prompt_version: NO_ACTIVITY_PROMPT_VERSION.into(),
+        input_hash: sha256_hex(&format!("{NO_ACTIVITY_PROMPT_VERSION}\0{key}")),
+        generated_at: fallback_generated_at(at_ms),
+        artifact_provenance: None,
+        summary_available: true,
+    }
+}
+
+/// Whether a result is a locally synthesized no-activity rollup.
+pub fn is_no_activity(result: &SummaryResult) -> bool {
+    result.prompt_version == NO_ACTIVITY_PROMPT_VERSION
+}
+
 /// An ephemeral unavailable-summary placeholder.
 pub fn unavailable_summary(key: &str, at_ms: i64, subject: &str) -> SummaryResult {
     let identity = sha256_hex(&format!(
@@ -1156,7 +1180,19 @@ fn walk_rollups(
             let prior_known = !prior_same_level(&completed, period)
                 .iter()
                 .any(|(item, _)| unknown.contains(&period_key(item)));
-            let mut result = resolve(&job, own_known, prior_known)?;
+            // No phases of its own and only no-activity children: synthesize
+            // locally instead of a model call (#854).
+            let idle = phases_in(period, phases).is_empty()
+                && lower.iter().all(|item| {
+                    previous_results
+                        .get(&period_key(item))
+                        .is_some_and(is_no_activity)
+                });
+            let mut result = if idle {
+                Some(no_activity_summary(&job.key, period.end_ms))
+            } else {
+                resolve(&job, own_known, prior_known)?
+            };
             if result.is_none() {
                 unknown.insert(key.clone());
                 result = Some(unavailable_summary(
@@ -1192,7 +1228,11 @@ fn walk_rollups(
             let plain_prior_known = !prior_same_level(&completed_plain, period)
                 .iter()
                 .any(|(item, _)| unknown_plain.contains(&period_key(item)));
-            let mut plain_result = resolve(&plain_job, plain_own_known, plain_prior_known)?;
+            let mut plain_result = if idle {
+                Some(no_activity_summary(&plain_job.key, period.end_ms))
+            } else {
+                resolve(&plain_job, plain_own_known, plain_prior_known)?
+            };
             if plain_result.is_none() {
                 unknown_plain.insert(key.clone());
                 plain_result = Some(unavailable_summary(
@@ -1879,27 +1919,38 @@ fn plan_tree(
     }
 
     let overview_stage = add_stage("project overview", OVERVIEW_KIND, &mut stages);
-    stages[overview_stage].total = 1;
-    let overview_cached = cached_summary(
-        &tree.overview_job,
-        &cache,
-        backend,
-        model,
-        reasoning_effort,
-        service_tier,
-    )?;
-    let overview = match overview_cached {
-        None => {
-            stages[overview_stage].to_generate = 1;
-            unavailable_summary(
-                &tree.overview_job.key,
-                tree.overview_job.end_ms,
-                "planned project overview",
-            )
-        }
-        Some(hit) => {
-            stages[overview_stage].cached = 1;
-            hit
+    // Idle team (no phases in the window): no overview model call (#854).
+    let idle_team = tree.phases.is_empty();
+    let overview_cached = if idle_team {
+        None
+    } else {
+        cached_summary(
+            &tree.overview_job,
+            &cache,
+            backend,
+            model,
+            reasoning_effort,
+            service_tier,
+        )?
+    };
+    let overview = if idle_team {
+        no_activity_summary(&tree.overview_job.key, tree.overview_job.end_ms)
+    } else {
+        match overview_cached {
+            None => {
+                stages[overview_stage].total = 1;
+                stages[overview_stage].to_generate = 1;
+                unavailable_summary(
+                    &tree.overview_job.key,
+                    tree.overview_job.end_ms,
+                    "planned project overview",
+                )
+            }
+            Some(hit) => {
+                stages[overview_stage].total = 1;
+                stages[overview_stage].cached = 1;
+                hit
+            }
         }
     };
     let overview_known = stages[overview_stage].cached == 1;
@@ -1973,6 +2024,29 @@ fn plan_tree(
         overview_known,
     )?;
 
+    // Project-wide calibration (#854): sibling teams' receipts price a team
+    // with no receipts of its own, instead of the built-in table.
+    let teams_dir = tree.summary_root.parent().and_then(Path::parent);
+    let mut extra_roots: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(dir) = teams_dir {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            let mut roots: Vec<std::path::PathBuf> = entries
+                .flatten()
+                .map(|entry| entry.path().join("summary_data"))
+                .filter(|root| *root != tree.summary_root)
+                .collect();
+            roots.sort();
+            extra_roots = roots;
+        }
+    }
+    let extra_pairs: Vec<(std::path::PathBuf, std::path::PathBuf)> = extra_roots
+        .iter()
+        .map(|root| (root.join("cache"), root.join("name_cache")))
+        .collect();
+    let extra_refs: Vec<(&Path, &Path)> = extra_pairs
+        .iter()
+        .map(|(a, b)| (a.as_path(), b.as_path()))
+        .collect();
     Ok(SummaryPlan {
         team_slug: tree.team.team_slug.clone(),
         stages,
@@ -1983,6 +2057,7 @@ fn plan_tree(
             model,
             reasoning_effort,
             Some(rollup_model),
+            &extra_refs,
         ),
         prices: options.prices,
         budget_usd: options.budget_usd,
@@ -2128,21 +2203,50 @@ fn run_summary_tree(
     )?;
     changed += write_agent_name_data(archive, team_slug, &name_jobs_list, &agent_names)?;
     *progress.borrow_mut() = "project overview".to_string();
-    let (overview_results, overview_stats) = summarize_jobs(
-        std::slice::from_ref(&tree.overview_job),
-        &cache,
-        backend,
-        model,
-        options.max_workers,
-        options.batch_size,
-        &options.codex_command,
-        reasoning_effort,
-        service_tier,
-        options.agent_command(backend),
-        guard,
-    )?;
-    let project_overview = overview_results[&tree.overview_job.key].clone();
-    validate_project_overview(&project_overview, "generated project overview")?;
+    // Idle team: no phases in the window, so no overview model call (#854).
+    let (project_overview, overview_stats) = if tree.phases.is_empty() {
+        (
+            SummaryResult {
+                key: tree.overview_job.key.clone(),
+                phrase: "Insufficient evidence".into(),
+                paragraph: "Insufficient evidence: no phases fall in the selected window, \
+                            so no project overview was generated."
+                    .into(),
+                work_summary: Vec::new(),
+                model: "none".into(),
+                prompt_version: crate::summary_registry::summarizer_for_style(
+                    PROJECT_OVERVIEW_STYLE,
+                )
+                .map(|spec| spec.prompt_version.to_string())
+                .unwrap_or_default(),
+                input_hash: sha256_hex(&format!(
+                    "{NO_ACTIVITY_PROMPT_VERSION}\0{}",
+                    tree.overview_job.key
+                )),
+                generated_at: fallback_generated_at(tree.overview_job.end_ms),
+                artifact_provenance: None,
+                summary_available: true,
+            },
+            SummaryRunStats::default(),
+        )
+    } else {
+        let (overview_results, overview_stats) = summarize_jobs(
+            std::slice::from_ref(&tree.overview_job),
+            &cache,
+            backend,
+            model,
+            options.max_workers,
+            options.batch_size,
+            &options.codex_command,
+            reasoning_effort,
+            service_tier,
+            options.agent_command(backend),
+            guard,
+        )?;
+        let project_overview = overview_results[&tree.overview_job.key].clone();
+        validate_project_overview(&project_overview, "generated project overview")?;
+        (project_overview, overview_stats)
+    };
     changed +=
         write_project_overview_data(archive, team_slug, &tree.overview_source, &project_overview)?;
 
@@ -2254,6 +2358,11 @@ fn run_summary_tree(
     summary_results.extend(all_plain_results.values().cloned());
     let mut catalog_additions: Vec<SummaryArtifactReference> = Vec::new();
     for result in &summary_results {
+        // Locally synthesized results are not model artifacts (#854).
+        if is_no_activity(result) || (tree.phases.is_empty() && result.key == project_overview.key)
+        {
+            continue;
+        }
         catalog_additions.push(catalog_reference(result, "cache")?);
     }
     for result in agent_names.values() {

@@ -332,6 +332,7 @@ fn receipt_kind(cache_dir: &Path, first_hash: &str, name_cache: bool) -> Option<
 /// Calendar rollups are calibrated from the receipts of `rollup_model` (default: `model`), the
 /// model that writes them. Each kind also gets its mean call duration, or the built-in figure
 /// for its model when no receipt of that kind is timed.
+#[allow(clippy::too_many_arguments)]
 pub fn calibrate(
     summary_cache: &Path,
     name_cache: &Path,
@@ -339,6 +340,7 @@ pub fn calibrate(
     model: &str,
     reasoning_effort: Option<&str>,
     rollup_model: Option<&str>,
+    extra_caches: &[(&Path, &Path)],
 ) -> CostModel {
     if backend == "heuristic" {
         return CostModel {
@@ -351,7 +353,13 @@ pub fn calibrate(
     let rollup_model = rollup_model.unwrap_or(model);
     let mut totals: BTreeMap<String, [f64; 5]> = BTreeMap::new();
     let mut durations: BTreeMap<String, [f64; 2]> = BTreeMap::new();
-    for (cache_dir, is_names) in [(summary_cache, false), (name_cache, true)] {
+    // Sibling teams' receipts calibrate a team with none of its own (#854).
+    let mut cache_dirs: Vec<(&Path, bool)> = vec![(summary_cache, false), (name_cache, true)];
+    for (extra_summary, extra_names) in extra_caches {
+        cache_dirs.push((extra_summary, false));
+        cache_dirs.push((extra_names, true));
+    }
+    for (cache_dir, is_names) in cache_dirs {
         let receipts = cache_dir.join("_usage").join("receipts");
         if !receipts.is_dir() {
             continue;

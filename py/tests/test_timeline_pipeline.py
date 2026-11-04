@@ -1962,6 +1962,117 @@ def test_summary_window_can_backfill_one_hour_without_other_rollup_levels(
     )
 
 
+def test_plan_and_run_skip_empty_days_and_idle_teams(tmp_path: Path) -> None:
+    """#854: empty days and idle teams make no model calls; they render locally."""
+    team = _team()
+    _write_team(tmp_path, team)
+    day_ms = 86_400_000
+    wide = DateWindow(None, None, START - 2 * day_ms, START + 3 * day_ms)
+
+    plan = plan_summaries(
+        tmp_path,
+        team.team_slug,
+        "heuristic",
+        "offline",
+        summary_window=wide,
+        rollup_kinds=("daily",),
+    )
+    daily = next(s for s in plan.stages if s.name == "daily rollups (technical)")
+    # Five calendar days in the window, one with activity: only it is a job.
+    assert daily.to_generate == 1
+    assert daily.total == 1
+
+    report = summarize_archive(
+        tmp_path,
+        team.team_slug,
+        "heuristic",
+        "offline",
+        summary_window=wide,
+        rollup_kinds=("daily",),
+    )
+    rollup_root = tmp_path / "teams" / team.team_slug / "summary_data" / "rollups" / "daily"
+    records = [json.loads(p.read_text(encoding="utf-8")) for p in rollup_root.glob("*.json")]
+    phrases = [r["technical_summary"]["phrase"] for r in records]
+    assert phrases.count("No activity") == len(phrases) - 1
+    # Only the active day paid for a rollup (one per style).
+    assert report.cache_misses == (
+        report.phases + report.agent_names + report.project_overviews + 2
+    )
+
+    # A window with no phases at all: the team is idle in it.
+    idle_window = DateWindow(None, None, START + 10 * day_ms, START + 12 * day_ms)
+    idle_plan = plan_summaries(
+        tmp_path,
+        team.team_slug,
+        "heuristic",
+        "offline",
+        summary_window=idle_window,
+        rollup_kinds=("daily",),
+    )
+    assert all(s.to_generate == 0 for s in idle_plan.stages)
+    overview_stage = next(s for s in idle_plan.stages if s.name == "project overview")
+    assert overview_stage.total == 0
+
+    idle_report = summarize_archive(
+        tmp_path,
+        team.team_slug,
+        "heuristic",
+        "offline",
+        summary_window=idle_window,
+        rollup_kinds=("daily",),
+    )
+    assert idle_report.cache_misses == 0
+    assert idle_report.project_overviews == 1
+
+
+def test_plan_calibration_uses_sibling_team_receipts(tmp_path: Path) -> None:
+    """#854: a team with no receipts is priced from project-wide receipts."""
+    from wrkviz.budget import PHASE_KIND, calibrate
+    from wrkviz.token_usage import BatchUsageReceipt, TokenUsage
+
+    sibling_cache = tmp_path / "sibling" / "cache"
+    sibling_names = tmp_path / "sibling" / "name_cache"
+    (sibling_cache / "_usage" / "receipts").mkdir(parents=True)
+    sibling_names.mkdir(parents=True)
+    (sibling_cache / "hash-1.json").write_text(
+        json.dumps({"result": {"key": "phase-one"}}), encoding="utf-8"
+    )
+    receipt = BatchUsageReceipt.create(
+        backend="codex",
+        model="m",
+        reasoning_effort=None,
+        service_tier=None,
+        status="completed",
+        started_at="2026-04-01T00:00:00Z",
+        completed_at="2026-04-01T00:01:00Z",
+        input_hashes=("hash-1",),
+        usage=TokenUsage(input_tokens=1000, output_tokens=100),
+        error=None,
+    )
+    (sibling_cache / "_usage" / "receipts" / f"{receipt.receipt_id}.json").write_text(
+        json.dumps(receipt.to_json()), encoding="utf-8"
+    )
+
+    own_cache = tmp_path / "own" / "cache"
+    own_names = tmp_path / "own" / "name_cache"
+    own_cache.mkdir(parents=True)
+    own_names.mkdir(parents=True)
+
+    bare = calibrate(own_cache, own_names, "codex", "m", None)
+    assert PHASE_KIND not in bare.per_job
+
+    pooled = calibrate(
+        own_cache,
+        own_names,
+        "codex",
+        "m",
+        None,
+        extra_caches=((sibling_cache, sibling_names),),
+    )
+    assert pooled.per_job[PHASE_KIND].input_tokens == 1000
+    assert pooled.per_job[PHASE_KIND].samples == 1
+
+
 def test_single_team_export_wide_to_narrow_removes_stale_slice_data(
     tmp_path: Path,
 ) -> None:
