@@ -201,6 +201,33 @@ fn label_sync_submits_withdraws_and_reads_priority_labels() {
 }
 
 #[test]
+fn a_listing_cut_short_by_its_limit_withdraws_nothing_it_did_not_list() {
+    // A listing as long as its limit may have stopped before a change that still carries the
+    // label: that change stays queued. A complete listing still withdraws it.
+    let fx = Fixture::new("sync-truncated");
+    let gh = stub(&fx);
+    fx.mq_ok(&["init", "--github-repo", "owner/name", "--gh", &gh.stub]);
+    let h1 = pull_request(&fx, 1, &[("one", "1\n")]);
+    let h2 = pull_request(&fx, 2, &[("two", "2\n")]);
+    std::fs::write(
+        &gh.list,
+        listing(&[(1, &h1, false, &["ready"]), (2, &h2, false, &["ready"])]),
+    )
+    .unwrap();
+    let r = sync_json(&fx, &gh, &["--label", "ready", "--limit", "100"]);
+    assert_eq!(r["submitted"], serde_json::json!([1, 2]));
+    assert!(r.get("truncated").is_none(), "{r}");
+    std::fs::write(&gh.list, listing(&[(1, &h1, false, &["ready"])])).unwrap();
+    let r = sync_json(&fx, &gh, &["--label", "ready", "--limit", "1"]);
+    assert_eq!(r["truncated"], true, "{r}");
+    assert_eq!(r["withdrawn"], serde_json::json!([]), "{r}");
+    assert_eq!(item(&items(&fx), 2)["status"], "queued");
+    let r = sync_json(&fx, &gh, &["--label", "ready", "--limit", "2"]);
+    assert_eq!(r["withdrawn"], serde_json::json!([2]), "{r}");
+    assert_eq!(item(&items(&fx), 2)["status"], "withdrawn");
+}
+
+#[test]
 fn the_request_budget_refuses_calls_past_its_hourly_limit() {
     let fx = Fixture::new("sync-budget");
     let gh = stub(&fx);
@@ -734,6 +761,46 @@ fn serve_syncs_its_label_and_validates_what_it_submits_in_the_same_cycle() {
     assert!(hb.get("sync_error").is_none(), "{hb}");
     let log = std::fs::read_to_string(&gh.log).unwrap();
     assert!(log.contains("--label mq-ready"), "{log}");
+}
+
+#[test]
+fn a_label_sync_lists_one_page_so_approval_at_head_costs_three_requests() {
+    // The daemon's label sync asks for one page (--sync-limit, default 100). With approval at
+    // head that is charged 3 requests, so it fits a small hourly budget; asking for 300
+    // results was charged 9 and refused here.
+    let fx = Fixture::new("serve-sync-limit");
+    let gh = stub(&fx);
+    fx.mq_ok(&[
+        "init",
+        "--github-repo",
+        "owner/name",
+        "--gh",
+        &gh.stub,
+        "--api-per-hour",
+        "3",
+        "--require-approval-at-head",
+        "--validator",
+        "command",
+        "--validator-run",
+        "exit 0",
+    ]);
+    std::fs::write(&gh.list, listing(&[])).unwrap();
+    let mut args = SERVE_ONCE.to_vec();
+    args.extend(["--sync-label", "mq-ready"]);
+    let out = fx.mq_env(&args, &env(&gh));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let hb = heartbeat(&fx);
+    assert!(hb.get("sync_error").is_none(), "{hb}");
+    assert!(
+        hb["last_sync"].as_str().unwrap().contains("0 listed"),
+        "{hb}"
+    );
+    let log = std::fs::read_to_string(&gh.log).unwrap();
+    assert!(log.contains("--limit 100"), "{log}");
 }
 
 #[test]

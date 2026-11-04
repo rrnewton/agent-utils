@@ -48,8 +48,10 @@ pub const DEFAULT_POLL_MS: u64 = 250;
 pub const DEFAULT_BASE_POLL_SECS: u64 = 30;
 /// Default seconds between label syncs (`serve --sync-every`).
 pub const DEFAULT_SYNC_EVERY_SECS: u64 = 60;
-/// Pull requests one label sync lists at most (as `sync --limit`'s default).
-const SYNC_LIMIT: u32 = 300;
+/// Pull requests one label sync lists at most (`serve --sync-limit`): one page, so a sync is
+/// charged one request of the API budget (three with approval at head), not three pages' worth.
+/// A listing that reaches the limit withdraws nothing it did not list.
+pub const DEFAULT_SYNC_LIMIT: u32 = 100;
 /// Heartbeat age in seconds after which `status` calls a live pid stale
 /// when the caller does not override it.
 pub const DEFAULT_STALE_AFTER_SECS: u64 = 10;
@@ -744,6 +746,8 @@ pub struct ServeOptions {
     pub sync_label: Option<String>,
     /// Interval between label syncs.
     pub sync_every: Duration,
+    /// Pull requests one label sync lists at most.
+    pub sync_limit: u32,
     /// Override `validator.offload` for work cycles.
     pub offload: Option<String>,
 }
@@ -762,6 +766,7 @@ impl Default for ServeOptions {
             notify_timeout: notify::DEFAULT_SEND_TIMEOUT,
             sync_label: None,
             sync_every: Duration::from_secs(DEFAULT_SYNC_EVERY_SECS),
+            sync_limit: DEFAULT_SYNC_LIMIT,
             offload: None,
         }
     }
@@ -1037,6 +1042,7 @@ fn sync_label(
     state: &State,
     config: &Config,
     label: &str,
+    limit: u32,
     notifier: &notify::Notifier,
     heartbeat: &mut Heartbeat,
 ) -> bool {
@@ -1045,14 +1051,7 @@ fn sync_label(
         Err(_) => return false,
     };
     let source = crate::sync::ReadySource::Label(label.to_owned());
-    match crate::sync::sync(
-        state,
-        config,
-        &source,
-        SYNC_LIMIT,
-        Some(&lock),
-        Some(notifier),
-    ) {
+    match crate::sync::sync(state, config, &source, limit, Some(&lock), Some(notifier)) {
         Ok(report) => {
             let list = |prs: &[i64]| {
                 prs.iter()
@@ -1069,6 +1068,11 @@ fn sync_label(
             if !report.refused.is_empty() {
                 let refused: Vec<i64> = report.refused.iter().map(|(pr, _)| *pr).collect();
                 summary.push_str(&format!(", refused [{}]", list(&refused)));
+            }
+            if report.truncated {
+                summary.push_str(&format!(
+                    ", listed the limit ({limit}) so withdrew nothing unlisted: raise --sync-limit"
+                ));
             }
             if !report.submitted.is_empty()
                 || !report.withdrawn.is_empty()
@@ -1205,7 +1209,14 @@ pub fn serve(state: &State, options: &ServeOptions) -> Result<i32, String> {
         // iteration's items fingerprint and validated without waiting a poll.
         if let Some(label) = &options.sync_label {
             if last_sync.is_none_or(|at| at.elapsed() >= options.sync_every)
-                && sync_label(state, &config, label, &notifier, &mut heartbeat)
+                && sync_label(
+                    state,
+                    &config,
+                    label,
+                    options.sync_limit,
+                    &notifier,
+                    &mut heartbeat,
+                )
             {
                 last_sync = Some(Instant::now());
             }

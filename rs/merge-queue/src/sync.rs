@@ -64,6 +64,10 @@ pub struct SyncReport {
     pub unchanged: Vec<i64>,
     /// Changes withdrawn because this source no longer lists them.
     pub withdrawn: Vec<i64>,
+    /// The listing held as many pull requests as the limit allowed, so it may have been cut
+    /// short: a queued change missing from it was not withdrawn.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
     /// Listed changes that are not ready under `require_approval_at_head`
     /// (no approving review at the current head). They are not submitted;
     /// a queued one is also withdrawn (and so appears in `withdrawn`).
@@ -221,6 +225,7 @@ pub fn sync(
         _ => Some(Hosting::new(&config.github, &state.root)?),
     };
     let mut drafts = Vec::new();
+    let mut truncated = false;
     let entries = match source {
         ReadySource::File(path) => entries_from_file(path)?,
         ReadySource::Label(_) | ReadySource::AllOpen => {
@@ -232,6 +237,7 @@ pub fn sync(
             let mut priorities = LabelPriority::new(DEFAULT_LABEL_PATTERN)?;
             let require_approval = config.require_approval_at_head;
             let listed = hosting.list_open(&config.base, label, limit, require_approval)?;
+            truncated = listed.len() as u64 >= u64::from(limit);
             drafts = listed
                 .iter()
                 .filter(|pr| pr.draft)
@@ -277,6 +283,7 @@ pub fn sync(
     };
     report.listed = entries.len();
     report.drafts = drafts;
+    report.truncated = truncated;
     let items: BTreeMap<i64, _> = state.items()?.into_iter().map(|i| (i.pr, i)).collect();
     let listed: std::collections::BTreeSet<i64> = entries.iter().map(|e| e.pr).collect();
     let mut submissions = Vec::new();
@@ -335,10 +342,12 @@ pub fn sync(
             recorded_at: String::new(),
         });
     }
+    // A listing cut short by its limit says nothing about the changes it did not reach: only
+    // a complete one withdraws what it no longer lists.
     let mut withdraw: Vec<i64> = items
         .values()
         .filter(|item| item.status == ItemStatus::Queued && item.source == tag)
-        .filter(|item| !listed.contains(&item.pr))
+        .filter(|item| !truncated && !listed.contains(&item.pr))
         .map(|item| item.pr)
         .collect();
     for pr in &approval_withdraw {

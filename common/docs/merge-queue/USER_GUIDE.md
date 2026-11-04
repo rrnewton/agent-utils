@@ -176,13 +176,15 @@ Reconcile the queue with a ready source. Exactly one of these is required:
 | `--label LABEL` | none | Ready = open pull requests carrying `LABEL`, in one batched API call. |
 | `--all-open` | off | Ready = every open, non-draft pull request targeting the base, in one batched API call. |
 | `--file FILE` | none | Ready = the changes listed in `FILE`, one per line. Makes no API call. |
-| `--limit N` | `300` | Most pull requests to list. Each 100 costs one API request. |
+| `--limit N` | `300` | Most pull requests to list. Each 100 costs one API request. A listing that reaches `N` may have been cut short, so it withdraws nothing it did not list (the report sets `truncated`). |
 | `--dry-run` | off | Report what would change without submitting or withdrawing anything. The list call is still made. |
 | `--json` | off | Print the report as JSON. |
 
 `sync` submits new changes and changes whose head or priority moved, with one fetch for all of
-them. It withdraws only changes that this same source added and no longer lists. A change you
-submitted directly is never withdrawn by a source. Draft pull requests are never ready.
+them. It withdraws only changes that this same source added and no longer lists, and only when
+the listing is complete: a listing as long as `--limit` may have stopped before a change that
+is still ready. A change you submitted directly is never withdrawn by a source. Draft pull
+requests are never ready.
 
 **Label scope (`sync --label`).** The labelled ready set is the only set a label sync touches:
 one batched list call returns open, non-draft pull requests carrying the label (charged one
@@ -350,6 +352,7 @@ SIGINT or SIGTERM during a stop exits immediately. `merge-queue run` stops the s
 | `--notify-timeout-secs N` | `30` | Seconds one notification send may run; then its whole process group is killed and the send counts as a failed attempt (minimum 1). |
 | `--sync-label LABEL` | none | Also ingest pull requests carrying LABEL, inside the daemon's own loop: the same ingestion as `merge-queue sync --label LABEL` (one batched list call, approval at head when configured, withdrawal when the label goes away), under the writer lock the work cycle uses. Needs `github.repo`. |
 | `--sync-every SECS` | `60` | Seconds between label syncs (with `--sync-label`; minimum 10). Each sync spends at least one hosting API request. |
+| `--sync-limit N` | `100` | Pull requests one label sync lists at most (with `--sync-label`). Each 100 costs one request of the budget, three with `require_approval_at_head`, so the default sync costs 1 or 3. A sync that lists `N` may have been cut short, so it withdraws nothing it did not list, and its summary says so. |
 | `--offload MODE` | configured | Override `validator.offload` for this run: `off`, `compare` or `decide`. |
 
 With `--sync-label LABEL` the daemon ingests labelled pull requests itself, so a change

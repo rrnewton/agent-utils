@@ -632,7 +632,8 @@ enum Command {
         /// Ready = the changes listed in FILE, one per line (no API call); see the user guide.
         #[arg(long, value_name = "FILE")]
         file: Option<PathBuf>,
-        /// Most pull requests to list (each 100 costs one API request).
+        /// Most pull requests to list (each 100 costs one API request). A listing that reaches
+        /// the limit may be cut short, so it withdraws nothing it did not list.
         #[arg(long, default_value_t = 300)]
         limit: u32,
         /// Report what would change without submitting or withdrawing anything.
@@ -767,6 +768,11 @@ enum Command {
         /// sync spends at least one hosting API request.
         #[arg(long, default_value_t = serve::DEFAULT_SYNC_EVERY_SECS, value_name = "SECS", requires = "sync_label")]
         sync_every: u64,
+        /// Pull requests one label sync lists at most (with --sync-label). Each 100 costs one
+        /// API request of the budget, three with approval at head. A sync that lists this many
+        /// may have been cut short: it withdraws nothing it did not list, and says so.
+        #[arg(long, default_value_t = serve::DEFAULT_SYNC_LIMIT, value_name = "N", requires = "sync_label", value_parser = clap::value_parser!(u32).range(1..))]
+        sync_limit: u32,
         /// Override `validator.offload` for this run: `off`, `compare` (donors validate too;
         /// their receipts are only compared with the local verdict) or `decide` (donors only).
         #[arg(long, value_parser = ["off", "compare", "decide"])]
@@ -1424,6 +1430,12 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                         report.drafts.iter().map(|pr| format!("#{pr}")).collect();
                     println!("  drafts, not ready: {}", drafts.join(", "));
                 }
+                if report.truncated {
+                    println!(
+                        "  listed the limit ({limit}), so nothing missing from the listing was \
+                         withdrawn; raise --limit if more are ready"
+                    );
+                }
                 for (pr, why) in &report.refused {
                     println!("  refused #{pr}: {why}");
                 }
@@ -1598,6 +1610,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             notify_timeout_secs,
             sync_label,
             sync_every,
+            sync_limit,
             offload,
         } => serve::serve(
             &state,
@@ -1617,6 +1630,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                 notify_timeout: std::time::Duration::from_secs(notify_timeout_secs.max(1)),
                 sync_label,
                 sync_every: std::time::Duration::from_secs(sync_every.max(10)),
+                sync_limit,
                 offload,
             },
         ),
