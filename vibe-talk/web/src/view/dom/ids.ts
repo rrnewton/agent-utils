@@ -273,6 +273,8 @@ export interface ElementById {
   "jump-bookmark-label": HTMLSpanElement;
   "jump-newest": HTMLButtonElement;
   "jump-newest-label": HTMLSpanElement;
+  "jump-reading": HTMLButtonElement;
+  "jump-reading-label": HTMLSpanElement;
   "keyboard-debug": HTMLInputElement;
   "keyboard-debug-hint": HTMLParagraphElement;
   "keyboard-debug-readout": HTMLPreElement;

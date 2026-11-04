@@ -84,6 +84,8 @@ export interface ReadAloudDependencies<Column = unknown> {
    * pause held, under `box` where they stood.
    */
   openSentenceReply(id: string, text: string, box: ScreenBox | null): void;
+  /** `#837 voice-page-jump-to-reading`: the read, or where it is, changed (`readingRowsShown`). */
+  readingMoved(): void;
   leftEl(id: string): HTMLElement;
   deviceSettings(): DeviceSettings;
   guardQuietly(fn: () => unknown): () => Promise<unknown>;
@@ -510,6 +512,26 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
   function listRows(id: string) {
     const list = deps.leftEl(id);
     return list && list.children ? [...list.children] : [];
+  }
+
+  /** The message whose rows `readingRowsShown` last gave, held through a jump's or a recovery's wait. */
+  let readingShownId: string | null = null;
+
+  /**
+   * `#837 voice-page-jump-to-reading`. The rows the message being read is drawn in, in lists on screen: while it
+   * plays or is held, and through a jump's or a recovery's wait for its next block. None otherwise.
+   */
+  function readingRowsShown(): HTMLElement[] {
+    // Through a wait the read is between blocks: nothing plays, and what is asked for may not be asked yet.
+    if (nowPlaying !== null) readingShownId = nowPlaying!.id;
+    else if (!readJumpPending && !readRecovering) readingShownId = null;
+    else if (pendingRead !== null) readingShownId = pendingRead;
+    if (readingShownId === null) return [];
+    const style = typeof window === "object" && typeof window.getComputedStyle === "function" ? window.getComputedStyle : null;
+    // Drawn, and seen: a list laid out but hidden (`visibility`) shows no row to come back to.
+    return (readingRowsOf(String(readingShownId)) as HTMLElement[])
+      .filter((row) => typeof row.getClientRects === "function" && row.getClientRects().length > 0 &&
+        (style === null || style(row).visibility !== "hidden"));
   }
 
   /** Every message row drawn for the read whose first message is `id`, in every list. A card is none. */
@@ -2070,6 +2092,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     // read cut off is tried again (`recoverRead`). `renderReadLayout` takes it away if either ends
     // without a block playing. (On a desk too: there it no longer blinks out on a Next.)
     const held = position === "" && !wasHidden && (readJumpPending || readRecovering);
+    deps.readingMoved();
     // `#821 voice-page-read-aloud-react`. A read of one block draws React alone in its strip (`reactAlone`),
     // where a read of several has it beside the arrows.
     // `#828`: so too a strip of React alone held up through a wait (a read of one block cut off and tried again).
@@ -3179,6 +3202,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
   readInProgress,
   toggleReadingPaused,
   reactToHeldSentence,
+  readingRowsShown,
   get heldSentence() { return heldSentence; },
   readAloud
   };

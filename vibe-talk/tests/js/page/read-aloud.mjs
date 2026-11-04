@@ -1687,7 +1687,10 @@ test("`scrubber-full-width`: on a phone the strip playing is a full-width row on
     "the header gone for playback leaves the list under the notch");
   assert.match(rule(":root[data-read-strip] #side-column"), /--read-steer-clearance:\s*0px;/,
     "the thread list keeps room for a strip it no longer runs under");
-  assert.match(rule(':root[data-read-strip="playing"] #scroll-tools'), /display:\s*none;/, "the chips stay up while the read plays");
+  // `#837 voice-page-jump-to-reading`: all but the way back to the message being read, while it is up (by the text,
+  // as above).
+  assert.match(phone, /:root\[data-read-strip="playing"\] #scroll-tools:not\(:has\(> #jump-reading:not\(\[hidden\]\)\)\),\s*:root\[data-read-strip="playing"\] #scroll-tools > :not\(#jump-reading\)\s*\{\s*display:\s*none;/,
+    "the chips stay up while the read plays");
   assert.equal(cssRules(phone, ":root[data-read-strip] #scroll-tools").length + cssRules(phone, ':root[data-read-strip="paused"] #scroll-tools').length,
     0, "the chips are hidden while the read is held too");
   // A desk is untouched: every rule that reads the attribute is inside a phone's query.

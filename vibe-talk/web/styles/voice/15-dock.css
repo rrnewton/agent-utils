@@ -454,7 +454,8 @@
 
   :root[data-read-strip] #control-bar,
   :root[data-read-strip] #topbar:has(#control-bar-top > #control-bar):not(:has(#close-settings:not([hidden]), #close-help:not([hidden]))),
-  :root[data-read-strip="playing"] #scroll-tools {
+  :root[data-read-strip="playing"] #scroll-tools:not(:has(> #jump-reading:not([hidden]))),
+  :root[data-read-strip="playing"] #scroll-tools > :not(#jump-reading) {
     display: none;
   }
 

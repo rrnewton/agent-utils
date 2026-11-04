@@ -969,6 +969,20 @@
               <span id="jump-bookmark-label">Bookmark</span>
             </button>
             <!--
+              `#837 voice-page-jump-to-reading`. The way back to the message being read aloud, playing or
+              held, beside the other two ways back: up only while none of the rows it is read in is on the
+              screen. A tap brings it back, centred. On a phone it stays while the read plays, when the
+              other chips go. See web/src/view/voice's `createReadingJump`.
+            -->
+            <button id="jump-reading" class="chip" type="button" aria-label="Jump to the message being read" hidden>
+              <svg class="chip-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4Z" />
+                <path d="M15.5 9a4 4 0 0 1 0 6" />
+                <path d="M18 6.5a7.5 7.5 0 0 1 0 11" />
+              </svg>
+              <span id="jump-reading-label">Reading</span>
+            </button>
+            <!--
               `#819 voice-page-quoted-reply-and-draft-chip`. Draft: up whenever the channel on screen holds a
               reply or a message started and not sent, anywhere in it: the box at the foot or a thread's, a
               reply under its message, a quick reply. A tap opens the newest, focused; another, the next.

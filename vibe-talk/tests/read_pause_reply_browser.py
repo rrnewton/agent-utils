@@ -476,6 +476,53 @@ def check_listening(desk: Desk, where: str) -> None:
                f"{where}: the microphone badge is not on the box's lower-left corner: {mic}")
 
 
+# `#837`: the chip back to the message being read, drawn and on top; and where that message stands in its list.
+JUMP_JS = """() => {
+  const chip = document.getElementById('jump-reading');
+  const r = chip.getBoundingClientRect();
+  const drawn = !chip.hidden && chip.getClientRects().length > 0;
+  const at = drawn ? document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2) : null;
+  return {shown: drawn, topmost: !!at && (at === chip || chip.contains(at))};
+}"""
+ROW_PLACE_JS = """(selector) => {
+  const row = document.querySelector(selector);
+  const area = document.getElementById('scroll-area');
+  const r = row.getBoundingClientRect();
+  const a = area.getBoundingClientRect();
+  const bottom = a.top + area.clientHeight;
+  return {off: (r.top + r.bottom) / 2 - (a.top + bottom) / 2, inside: r.top >= a.top - 1 && r.bottom <= bottom + 1,
+          height: r.height, view: area.clientHeight, top: area.scrollTop};
+}"""
+
+
+def check_jump_to_reading(desk: Desk, where: str, touch: bool, row: str, step: bool = False) -> None:
+    """`#837 voice-page-jump-to-reading`: the chip is down while the message being read is on screen, up once the
+    list scrolls it away, on top of what is there; a tap brings the message back centred, and the chip goes."""
+    page = desk.page
+    desk.check(not page.evaluate(JUMP_JS)["shown"], f"{where}: the chip is up with the message being read on screen")
+    page.evaluate("() => { document.getElementById('scroll-area').scrollTop = 0; }")
+    desk.wait_for(f"() => ({JUMP_JS})().shown", f"{where}: no chip once the message being read left the screen")
+    desk.check(page.evaluate(JUMP_JS)["topmost"], f"{where}: something covers the chip")
+    if step:
+        # A step to another block of the read, with the message still away: the chip stays up through the wait.
+        was = page.evaluate("() => document.getElementById('read-steer-count').textContent")
+        page.evaluate("() => { const chip = document.getElementById('jump-reading'); window.jumpReadingDrops = 0;"
+                      " window.jumpReadingWatch = new MutationObserver(() => { if (chip.hidden) window.jumpReadingDrops += 1; });"
+                      " window.jumpReadingWatch.observe(chip, {attributes: true, attributeFilter: ['hidden']}); }")
+        press(page, "#read-prev", touch)
+        desk.wait_for(f"() => document.getElementById('read-steer-count').textContent !== {was!r}",
+                      f"{where}: the step back never landed")
+        page.wait_for_timeout(300)
+        drops = page.evaluate("() => { window.jumpReadingWatch.disconnect(); return window.jumpReadingDrops; }")
+        desk.check(drops == 0, f"{where}: the chip dropped {drops} time(s) through a step's wait")
+        wait_until(page, f"() => ({LIT_JS})() !== null", f"{where}: no sentence is lit after the step")
+    desk.shot(f"jump-reading-{where.split(', ')[-1]}")
+    press(page, "#jump-reading", touch)
+    desk.wait_for(f"() => !({JUMP_JS})().shown", f"{where}: the chip stayed up once it brought the message back")
+    place = page.evaluate(ROW_PLACE_JS, row)
+    desk.check(place["inside"] and abs(place["off"]) <= 2, f"{where}: the message read is not centred in its list: {place}")
+
+
 def check_nav_row(desk: Desk, where: str, touch: bool) -> None:
     """`#828 voice-page-read-nav-center`: the arrows' row is one line, "k of n" at its exact centre, two arrows a
     side of it, React at the right and its balance, as wide, at the left; on a phone every target a thumb's."""
@@ -533,6 +580,7 @@ def react_walk(desk: Desk, api: VoicesApi, voice: str, touch: bool, recognition:
                              " && n.getClientRects().length > 0; }") is True, "react: React is not offered while the read plays: " + str(page.evaluate("() => { const s = document.getElementById('read-steer'); const n = document.getElementById('read-react'); return [s.hidden, s.getAttribute('data-react-only'), n.hidden, n.disabled, n.getClientRects().length, getComputedStyle(s).display]; }")))
     if voice == "agent":
         check_nav_row(desk, "react, playing", touch)
+        check_jump_to_reading(desk, "jump, playing", touch, row, step=True)
     press(page, "#read-aloud", touch)
     desk.settled()
     desk.check(label(page) == "Resume", f"react: Pause left Read saying {label(page)!r}")
@@ -550,6 +598,7 @@ def react_walk(desk: Desk, api: VoicesApi, voice: str, touch: bool, recognition:
         desk.check(not arrows, f"react, device: a one-block read's strip draws arrows: {layout}")
     if voice == "agent":
         check_nav_row(desk, "react, paused", touch)
+        check_jump_to_reading(desk, "jump, paused", touch, row)
         # A long read's count, "12 of 12", still leaves the row one line, centred, with React in it.
         page.evaluate("() => { document.getElementById('read-steer-count').textContent = '12 of 12'; }")
         check_nav_row(desk, "react, a two-digit count", touch)

@@ -707,6 +707,7 @@ function readAloudOwner() {
   if (!pageReadAloud) pageReadAloud = createReadAloud({
     get el() { return el; },
     openSentenceReply: (id, text, box) => openSentenceReply(id, text, box),
+    readingMoved: () => readingJump.refresh(),
     get leftEl() { return leftEl; },
     get deviceSettings() { return deviceSettings; },
     get guardQuietly() { return guardQuietly; },
@@ -3515,7 +3516,26 @@ function renderJumpNewest() {
   // `#240 reading-bookmark`. The chip beside it, on the same occasions: every scroll, restore and
   // screen change asks this one.
   renderJumpBookmark();
+  // `#837 voice-page-jump-to-reading`. And the way back to the message being read: its rows may be new.
+  readingJump.refresh();
 }
+
+/**
+ * `#837 voice-page-jump-to-reading`. The chip back to the message being read aloud (web/src/view/voice
+ * `createReadingJump`), over the main screen only.
+ */
+const readingJump = createReadingJump({
+  chip: () => leftEl("jump-reading"),
+  rows: () => {
+    // Read-aloud as it stands: a page that has read nothing has no owner to make for this.
+    if (screens.screen() !== "main" || !pageReadAloud) return [];
+    const rows = pageReadAloud.readingRowsShown();
+    // The Threads view lays the chips' row out hidden (`visibility`), with the list: no chip to show there.
+    const tools = leftEl("scroll-tools");
+    return rows.length > 0 && typeof window.getComputedStyle === "function" &&
+      window.getComputedStyle(tools).visibility === "hidden" ? [] : rows;
+  },
+});
 
 /**
  * The folds in the list actually on screen. Collapse all acts on what you are looking at — and
@@ -32945,6 +32965,7 @@ el("enter-sends").addEventListener("change", () => applyEnterSends(el("enter-sen
 
 // `#240 reading-bookmark`. The chip is the left column's, as b is.
 el("jump-bookmark").addEventListener("click", () => guardQuietly(jumpToBookmark)());
+leftEl("jump-reading").addEventListener("click", () => readingJump.jump());
 el("back-to-reply").addEventListener("click", backToReply);
 
 el("read-speed-down").addEventListener("click", () => readAloudOwner().stepReadSpeed(-1));

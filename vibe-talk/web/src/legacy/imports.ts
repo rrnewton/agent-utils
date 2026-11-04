@@ -130,7 +130,7 @@ import { decode, decodeTagged, is, roots } from "../contract/index.ts";
  */
 export const VibeTalkContract = Object.freeze({ roots, is, decode, decodeTagged });
 
-export { createVoiceCall, createVoiceTranscript, createReadAloud } from "../view/voice/index.ts";
+export { createReadAloud, createReadingJump, createVoiceCall, createVoiceTranscript } from "../view/voice/index.ts";
 
 export { HELP_TOPICS } from "../present/settings/index.ts";
 export { CANNED_PROMPTS, MIC_TOGGLES, mountAgentPrefix, mountAgentSettings, mountAudioDevices, mountBarPlacement, mountCannedPrompts, mountChannelDirectory, mountChannelHistory, mountChannelSettings, mountConnectionReadouts, mountDismissedSends, mountHelpFolds, mountIdentityList, mountMessagePreferences, mountMicrophoneSettings, mountNoiseRules, mountOwnReadApply, mountPairing, mountReadingWidth, mountResumePreference, mountServerCache, mountSettingsFolds, mountSettingsReadouts, mountSettingsSyncView, mountTextSize, mountUpstreamClear } from "../view/settings/index.ts";
