@@ -400,9 +400,12 @@ enum Command {
         /// queue lands, always exactly validated commits.
         #[arg(long)]
         trust_base: bool,
-        /// Failure class PATTERN=CLASS: failed tests whose ID (or step) matches PATTERN (exact or
-        /// `*` wildcards) are labelled CLASS in ejections and reports. Repeatable.
-        #[arg(long, value_name = "PATTERN=CLASS")]
+        /// Failure class PATTERN=CLASS[=EVIDENCE]: failed tests whose ID (or step) matches
+        /// PATTERN (exact or `*` wildcards) are labelled CLASS in ejections and reports. With
+        /// EVIDENCE (text with `*` wildcards), only when a validation-log line tagged with the
+        /// test's step (`[step] ...`) contains it, e.g.
+        /// `test.*_count=count pin drift=expected * tests to execute, saw *`. Repeatable.
+        #[arg(long, value_name = "PATTERN=CLASS[=EVIDENCE]")]
         classify: Vec<String>,
         /// Name for commits the queue creates (default: Git's configuration).
         #[arg(long, default_value = "")]
@@ -1141,13 +1144,21 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                 classify: classify
                     .iter()
                     .map(|spec| {
-                        spec.split_once('=')
-                            .filter(|(pattern, class)| !pattern.is_empty() && !class.is_empty())
-                            .map(|(pattern, class)| ClassRule {
-                                pattern: pattern.to_owned(),
-                                class: class.to_owned(),
-                            })
-                            .ok_or_else(|| format!("--classify {spec:?}: expected PATTERN=CLASS"))
+                        let mut parts = spec.splitn(3, '=');
+                        match (parts.next(), parts.next(), parts.next()) {
+                            (Some(pattern), Some(class), evidence)
+                                if !pattern.is_empty() && !class.is_empty() =>
+                            {
+                                Ok(ClassRule {
+                                    pattern: pattern.to_owned(),
+                                    class: class.to_owned(),
+                                    evidence: evidence.unwrap_or_default().to_owned(),
+                                })
+                            }
+                            _ => Err(format!(
+                                "--classify {spec:?}: expected PATTERN=CLASS or PATTERN=CLASS=EVIDENCE"
+                            )),
+                        }
                     })
                     .collect::<Result<_, _>>()?,
                 peers: peer

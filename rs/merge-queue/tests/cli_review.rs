@@ -327,3 +327,59 @@ fn count_pin_drift_is_classified_on_the_ejection() {
         .to_string();
     assert!(history.contains("[count pin drift]"), "{history}");
 }
+
+/// Like `COUNTING_RUNNER`, but each failure says why on a line tagged with its step, the way a
+/// dagrun-style runner prints it: a count mismatch, or a crash (a file named `broken`).
+const EVIDENCE_RUNNER: &str = r#"rc=0
+pinned=$(cat tests.count); actual=$(ls tests | wc -l | tr -d ' ')
+o=pass
+if [ -f broken ]; then o=fail; rc=1; echo "[count.tests] the counter crashed: broken fixture"; fi
+if [ "$pinned" != "$actual" ]; then o=fail; rc=1; echo "[count.tests] expected $pinned tests to execute, saw $actual"; fi
+printf '{"id":"count.tests","outcome":"%s"}\n' "$o" >> "$MQ_RESULTS"
+for t in $(ls tests); do printf '{"id":"%s","outcome":"pass"}\n' "$t" >> "$MQ_RESULTS"; done
+exit $rc"#;
+
+#[test]
+fn a_class_with_evidence_labels_only_failures_that_show_it() {
+    let fx = Fixture::new("rv-classify-evidence");
+    fx.write("tests/t0", "ok\n");
+    fx.write("tests.count", "1\n");
+    fx.commit_all("seed");
+    git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
+    fx.mq_ok(&[
+        "init",
+        "--validator",
+        "command",
+        "--validator-run",
+        EVIDENCE_RUNNER,
+        "--max-batch",
+        "2",
+        "--classify",
+        "count.*=count pin drift=expected * tests to execute, saw *",
+    ]);
+    // Count drift: the failure prints the count mismatch, so the label holds.
+    fx.branch("adds-a", &[("tests/a", "ok\n"), ("tests.count", "2\n")]);
+    fx.branch("adds-b", &[("tests/b", "ok\n"), ("tests.count", "2\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "adds-a"]);
+    fx.mq_ok(&["submit", "2", "--head", "adds-b"]);
+    let r = report(&fx.mq_ok(&["run", "--json"]));
+    assert_eq!(r["ejected"][0]["pr"], 2, "{r}");
+    assert_eq!(
+        r["ejected"][0]["classes"],
+        serde_json::json!(["count pin drift"]),
+        "{r}"
+    );
+    // The same test failing for another reason is not count drift.
+    git(&fx.dev(), &["checkout", "-q", "main"]);
+    git(&fx.dev(), &["pull", "-q", "origin", "main"]);
+    fx.branch("breaks", &[("broken", "yes\n")]);
+    fx.mq_ok(&["submit", "3", "--head", "breaks"]);
+    let r = report(&fx.mq_ok(&["run", "--json"]));
+    assert_eq!(r["ejected"][0]["pr"], 3, "{r}");
+    assert_eq!(
+        r["ejected"][0]["failed"],
+        serde_json::json!(["count.tests"]),
+        "{r}"
+    );
+    assert!(r["ejected"][0].get("classes").is_none(), "{r}");
+}

@@ -496,10 +496,28 @@ pub struct ClassRule {
     pub pattern: String,
     /// Label shown in reports and ejection records, e.g. `count pin drift`.
     pub class: String,
+    /// What the failure must say for the class to hold, as text with `*` wildcards that one
+    /// line of the validation log tagged with the test's step (`[step] ...`, the way a
+    /// dagrun-style runner prefixes each step's output) must contain, e.g.
+    /// `expected * tests to execute, saw *`. Empty: the pattern alone decides. Without a
+    /// readable log the rule classifies nothing, so a label always rests on the failure
+    /// itself, never on which test failed. Left out of config.json while empty.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub evidence: String,
 }
 
-/// Class labels for `failed` under `rules`, sorted and without duplicates.
-pub fn classify(rules: &[ClassRule], failed: &[crate::tests::TestId]) -> Vec<String> {
+/// Whether any rule needs the validation log ([`ClassRule::evidence`]).
+pub fn classify_reads_log(rules: &[ClassRule]) -> bool {
+    rules.iter().any(|rule| !rule.evidence.is_empty())
+}
+
+/// Class labels for `failed` under `rules`, sorted and without duplicates. `log` is the text
+/// of the validation logs the failures were seen in, for rules that need evidence.
+pub fn classify(
+    rules: &[ClassRule],
+    failed: &[crate::tests::TestId],
+    log: Option<&str>,
+) -> Vec<String> {
     let mut classes: Vec<String> = failed
         .iter()
         .flat_map(|test| {
@@ -507,7 +525,9 @@ pub fn classify(rules: &[ClassRule], failed: &[crate::tests::TestId]) -> Vec<Str
             rules
                 .iter()
                 .filter(move |rule| {
-                    path_matches(&rule.pattern, &id) || path_matches(&rule.pattern, &test.step)
+                    (path_matches(&rule.pattern, &id) || path_matches(&rule.pattern, &test.step))
+                        && (rule.evidence.is_empty()
+                            || log.is_some_and(|log| shows(log, &test.step, &rule.evidence)))
                 })
                 .map(|rule| rule.class.clone())
         })
@@ -515,6 +535,26 @@ pub fn classify(rules: &[ClassRule], failed: &[crate::tests::TestId]) -> Vec<Str
     classes.sort();
     classes.dedup();
     classes
+}
+
+/// Whether a line of `log` tagged `[step]` contains `evidence` (`*` matches any text).
+fn shows(log: &str, step: &str, evidence: &str) -> bool {
+    let tag = format!("[{step}]");
+    log.lines()
+        .filter(|line| line.contains(&tag))
+        .any(|line| wildcard_contains(evidence, line))
+}
+
+/// Whether `text` contains `pattern`, where each `*` in the pattern matches any text.
+fn wildcard_contains(pattern: &str, text: &str) -> bool {
+    let mut rest = text;
+    for part in pattern.split('*').filter(|part| !part.is_empty()) {
+        match rest.find(part) {
+            Some(at) => rest = &rest[at + part.len()..],
+            None => return false,
+        }
+    }
+    true
 }
 
 /// Push notifications on item state changes, sent by the `serve` daemon
@@ -1017,14 +1057,17 @@ mod unit {
             ClassRule {
                 pattern: "test.crate_count".into(),
                 class: "count pin drift".into(),
+                ..ClassRule::default()
             },
             ClassRule {
                 pattern: "*_unit".into(),
                 class: "count pin drift".into(),
+                ..ClassRule::default()
             },
             ClassRule {
                 pattern: "lint.*".into(),
                 class: "lint".into(),
+                ..ClassRule::default()
             },
         ];
         let failed = [
@@ -1033,16 +1076,51 @@ mod unit {
             TestId::step("build"),
         ];
         assert_eq!(
-            classify(&rules, &failed),
+            classify(&rules, &failed, None),
             vec!["count pin drift".to_owned()]
         );
         assert_eq!(
             classify(
                 &rules,
-                &[TestId::step("lint.fmt"), TestId::step("suite_unit")]
+                &[TestId::step("lint.fmt"), TestId::step("suite_unit")],
+                None
             ),
             vec!["count pin drift".to_owned(), "lint".to_owned()]
         );
-        assert!(classify(&rules, &[TestId::step("other")]).is_empty());
+        assert!(classify(&rules, &[TestId::step("other")], None).is_empty());
+    }
+
+    #[test]
+    fn a_class_with_evidence_needs_the_failure_to_say_so() {
+        let rules = vec![ClassRule {
+            pattern: "test.regular_crates".into(),
+            class: "count pin drift".into(),
+            evidence: "expected * tests to execute, saw *".into(),
+        }];
+        let failed = [TestId::step("test.regular_crates")];
+        let drift = "[test.regular_crates] nextest-test-results: expected 1955 tests to execute, saw 1957; refusing\n";
+        // Real test failures in the same node are not pin drift.
+        let real = "[test.regular_crates] test verify_run_strict_clock_determinism ... FAILED\n\
+                    [test.regular_crates] test result: FAILED. 1970 passed; 5 failed\n";
+        assert_eq!(
+            classify(&rules, &failed, Some(drift)),
+            vec!["count pin drift".to_owned()]
+        );
+        assert!(classify(&rules, &failed, Some(real)).is_empty());
+        // No log, no evidence, no label.
+        assert!(classify(&rules, &failed, None).is_empty());
+        // The evidence must be on the failed step's own lines.
+        let other = "[test.regular_crates_on_host] nextest-test-results: expected 1 tests to execute, saw 2\n";
+        assert!(classify(&rules, &failed, Some(other)).is_empty());
+        assert!(classify_reads_log(&rules));
+        assert!(!classify_reads_log(&[]));
+        // An unset evidence is left out of config.json, so older builds still read it.
+        let written = serde_json::to_string(&ClassRule {
+            pattern: "x".into(),
+            class: "y".into(),
+            evidence: String::new(),
+        })
+        .unwrap();
+        assert_eq!(written, r#"{"pattern":"x","class":"y"}"#);
     }
 }

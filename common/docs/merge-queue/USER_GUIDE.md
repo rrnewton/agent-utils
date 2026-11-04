@@ -102,7 +102,7 @@ This command creates the state directory and writes `config.json`.
 | `--regen-build CMD` | empty | Command run before `--regen-command`, such as building the generator. When it fails, the change is ejected as `regen-build-failed` with the error tail. |
 | `--exact-sha` | off | Exact-commit rule: never carry a validation result to another commit. See "The exact-commit rule". |
 | `--trust-base` | off | Treat the base as green in culprit searches and skip probing it. Sound when only this queue lands on the base, always as exactly validated commits; a broken base would then be blamed on the first change of a red batch. |
-| `--classify PATTERN=CLASS` | none | Label failed tests whose ID, or whose step alone, matches `PATTERN` (exact or `*` wildcards) with `CLASS` in ejection records, reports and item history. One example is `--classify 'test.*_count=count pin drift'`. Repeatable. |
+| `--classify PATTERN=CLASS[=EVIDENCE]` | none | Label failed tests whose ID, or whose step alone, matches `PATTERN` (exact or `*` wildcards) with `CLASS` in ejection records, reports and item history. With `EVIDENCE` (text with `*` wildcards), only when a line of the validation log tagged with the test's step (`[step] ...`) contains it. One example is `--classify 'test.*_count=count pin drift=expected * tests to execute, saw *'`. Repeatable. |
 | `--peer NAME=DIR` | none | A peer queue: another repository's merge-queue state directory. Repeatable. See "Changes across repositories". |
 | `--identity-name NAME`, `--identity-email EMAIL` | Git's configuration | Identity for commits the queue creates: committer of replayed commits, author and committer of merge and regeneration commits. |
 | `--github-repo OWNER/NAME` | empty | Hosting repository for `sync --label`, `sync --all-open` and `--close-prs`. |
@@ -647,7 +647,7 @@ An **item record** (`items/<pr>.json`) has these fields:
 | `trust_base` | `false` | Skip probing the base in culprit searches. |
 | `require_approval_at_head` | `false` | Approval-at-head rule for GitHub ready sources; see `--require-approval-at-head`. |
 | `recount_pins` | `false` | Recount the generated count pins after merging each batch (base plus each change's own delta); see `--recount-pins`. A change whose pins cannot be recounted is skipped from its batch and stays queued. |
-| `classify` | `[]` | `[{pattern, class}]` failure classes; see `--classify`. |
+| `classify` | `[]` | `[{pattern, class, evidence}]` failure classes (`evidence` left out of the file while empty); see `--classify`. |
 | `peers` | `{}` | Peer queue name to state directory. |
 | `identity` | empty | `{name, email}` for commits the queue creates. |
 | `github` | empty | `{repo, gh, max_per_hour, budget_file, anonymous_fetch}`; see "Ready sources and the request budget". |
@@ -1165,6 +1165,14 @@ use is a pinned count, such as the number of tests in a suite. Two changes that 
 and pin the count they saw merge cleanly, but together they break the pin. The search finds the
 second change; it is ejected as `count pin drift` (its pin must be recomputed on the new base),
 and the rest of the batch lands.
+
+A label read from the test's name alone also lands on every other failure of that test: a real
+test failure in a counted suite would be called pin drift, and its author sent to fix the wrong
+thing. Give such a class its evidence, the text the failure itself prints
+(`--classify 'test.*_count=count pin drift=expected * tests to execute, saw *'`). The label then
+needs a line of the validation log tagged with the test's step (`[step] ...`, as a dagrun-style
+runner prefixes each step's output) that contains that text, and a validation whose log cannot be
+read gets no label from the rule.
 
 ## Ready sources and the request budget
 

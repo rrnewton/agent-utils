@@ -1792,7 +1792,12 @@ impl<'a> Runner<'a> {
         } else {
             ran.failed().into_iter().collect()
         };
-        let classes = crate::state::classify(&self.config.classify, &failed);
+        // A class with evidence reads it from this validation's own log.
+        let log_text = (!failed.is_empty()
+            && crate::state::classify_reads_log(&self.config.classify))
+        .then(|| read_lossy(&ran.log))
+        .flatten();
+        let classes = crate::state::classify(&self.config.classify, &failed, log_text.as_deref());
         let record = ValidationRecord {
             id,
             purpose: job.purpose.to_owned(),
@@ -2523,7 +2528,23 @@ impl<'a> Runner<'a> {
         // Whatever led here may rest on a process the stop killed: never eject after a stop.
         crate::interrupt::check(&format!("ejecting #{pr} ({kind})"))?;
         lock(&self.excluded).insert(pr);
-        let classes = crate::state::classify(&self.config.classify, failed);
+        // A class with evidence reads it from the logs of this run's validations that saw
+        // these tests fail.
+        let log_text = (!failed.is_empty()
+            && crate::state::classify_reads_log(&self.config.classify))
+        .then(|| {
+            let logs: Vec<PathBuf> = lock(&self.report)
+                .validations
+                .iter()
+                .filter(|v| v.failed().iter().any(|test| failed.contains(test)))
+                .map(|v| v.log.clone())
+                .collect();
+            logs.iter()
+                .filter_map(|log| read_lossy(log))
+                .collect::<Vec<_>>()
+                .join("\n")
+        });
+        let classes = crate::state::classify(&self.config.classify, failed, log_text.as_deref());
         let class_note = if classes.is_empty() {
             String::new()
         } else {
@@ -3406,6 +3427,13 @@ fn discard(
     while let Some(flight) = flights.pop_back() {
         pending.push_front(flight.candidate.prs);
     }
+}
+
+/// A log file's text, with any bytes that are not UTF-8 replaced; `None` when unreadable.
+fn read_lossy(path: &std::path::Path) -> Option<String> {
+    std::fs::read(path)
+        .ok()
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// The local verdict compare mode records beside a donor's.
