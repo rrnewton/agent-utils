@@ -65,9 +65,15 @@ struct Daemon(Child);
 
 impl Daemon {
     fn start(fx: &Fixture) -> Self {
+        Self::start_with(fx, &[])
+    }
+
+    /// The daemon with extra `serve` arguments.
+    fn start_with(fx: &Fixture, extra: &[&str]) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_merge-queue"));
         command
             .args(["serve", "--poll-ms", "50", "--base-poll-secs", "1"])
+            .args(extra)
             .current_dir(fx.queue())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -151,7 +157,9 @@ fn hold_writer_lock(fx: &Fixture) -> std::fs::File {
 #[test]
 fn a_submission_while_a_run_validates_is_recorded_and_lands_after_it() {
     let (fx, gate) = gated("intake-submit");
-    let _daemon = Daemon::start(&fx);
+    // One batch at a time: the window has no free slot, so the run cannot take the request in
+    // before it ends (cli_intake_window.rs covers a run that has one).
+    let _daemon = Daemon::start_with(&fx, &["--depth", "1"]);
     fx.branch("a", &[("tests/a", "ok\n")]);
     fx.mq_ok(&["submit", "1", "--head", "a"]);
     wait_for("the batch to validate", Duration::from_secs(20), || {

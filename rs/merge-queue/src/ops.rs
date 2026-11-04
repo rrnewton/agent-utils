@@ -1,6 +1,6 @@
 //! Queue operations shared by the command line and tests: refresh, submit, plan.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::git::Git;
 use crate::model::{now, Held, Item, ItemStatus, Plan, Requirement};
@@ -468,6 +468,65 @@ pub fn plan(state: &State, config: &Config, max_batch: usize) -> Result<Plan, St
         &items,
         &config.base,
         &base_sha,
+        &probe,
+        PlanOptions {
+            max_batch,
+            priority: config.priority.clone(),
+        },
+    ))
+}
+
+/// Plan the queued changes a run has not started on top of `tip`, the candidate of the last
+/// batch it has in flight, for a run taking in requests recorded while it held the queue. The
+/// changes in `carried` are already in `tip`, so the plan treats them as landed; the changes in
+/// `skip` (started but not carried by `tip`, or set aside by the run) are not planned. The base
+/// probes run against `tip`, so a change that conflicts with the work in flight is held rather
+/// than planned.
+pub fn plan_on(
+    state: &State,
+    config: &Config,
+    max_batch: usize,
+    tip: &str,
+    carried: &BTreeSet<i64>,
+    skip: &BTreeSet<i64>,
+) -> Result<Plan, String> {
+    let mut items = state.items()?;
+    for item in items
+        .iter_mut()
+        .filter(|item| item.status == ItemStatus::Queued)
+    {
+        if carried.contains(&item.pr) {
+            item.status = ItemStatus::Landed;
+        } else if skip.contains(&item.pr) {
+            item.status = ItemStatus::Withdrawn;
+        }
+    }
+    let heads: Vec<(i64, String)> = items
+        .iter()
+        .filter(|item| item.status == ItemStatus::Queued)
+        .map(|item| (item.pr, item.head_ref.clone()))
+        .collect();
+    let git = repo(state, config)?;
+    let (_, current) = refresh(&git, config, &heads)?;
+    let regenerate = config.regenerate.clone();
+    let recount = config.recount_pins;
+    let pins = config.pins.clone();
+    let mut probe = probe_with_options(
+        &git,
+        tip,
+        &current,
+        &|path| {
+            regenerate.covers(path)
+                || (recount && path == crate::recount::PIN_PATH)
+                || pins.iter().any(|pin| pin.covers(path))
+        },
+        probe_options_for(state, config, &git),
+    )?;
+    probe.external = peer_holds(config, &items)?;
+    Ok(make_plan(
+        &items,
+        &config.base,
+        tip,
         &probe,
         PlanOptions {
             max_batch,

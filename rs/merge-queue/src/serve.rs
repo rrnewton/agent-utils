@@ -877,6 +877,7 @@ fn run_cycle(
     options: &ServeOptions,
     shared: &Mutex<Heartbeat>,
     window: &Arc<Mutex<Vec<Vec<i64>>>>,
+    writer: &crate::state::Lock,
 ) -> bool {
     // The heartbeat's window is what the run publishes as it builds and decides batches (see
     // `refresh_heartbeat`), never the plan: a change the run skips at construction is not in it.
@@ -888,11 +889,18 @@ fn run_cycle(
         offload: options.offload.clone(),
         drain_pid: Some(std::process::id()),
         window: Some(Arc::clone(window)),
+        // A run in progress looks for recorded requests as often as the daemon polls.
+        intake_poll: Some(options.poll),
         ..RunOptions::default()
     };
     let outcome = Runner::new(state, run_options)
         .map_err(|error| format!("run refused: {error}"))
-        .and_then(|runner| runner.run().map_err(|error| format!("run failed: {error}")));
+        .and_then(|runner| {
+            runner
+                .holding(writer)
+                .run()
+                .map_err(|error| format!("run failed: {error}"))
+        });
     let mut heartbeat = lock_heartbeat(shared);
     match outcome {
         Ok(report) => {
@@ -983,8 +991,14 @@ fn clear_busy_error(heartbeat: &mut Heartbeat, busy_error: &mut String) {
     busy_error.clear();
 }
 
-/// Run one work cycle with the heartbeat kept fresh by a helper thread.
-fn work_cycle(state: &State, options: &ServeOptions, heartbeat: &mut Heartbeat) -> bool {
+/// Run one work cycle with the heartbeat kept fresh by a helper thread, under `writer`, the
+/// writer lock the caller holds.
+fn work_cycle(
+    state: &State,
+    options: &ServeOptions,
+    heartbeat: &mut Heartbeat,
+    writer: &crate::state::Lock,
+) -> bool {
     heartbeat.state = "working".to_owned();
     heartbeat.working_since = now();
     heartbeat.working_since_unix = unix_now();
@@ -996,7 +1010,7 @@ fn work_cycle(state: &State, options: &ServeOptions, heartbeat: &mut Heartbeat) 
     let clean = std::thread::scope(|scope| {
         scope.spawn(|| refresh_heartbeat(state, &shared, &done, &window));
         let _stop = SetOnDrop(&done);
-        run_cycle(state, options, &shared, &window)
+        run_cycle(state, options, &shared, &window, writer)
     });
     *heartbeat = shared.into_inner().unwrap_or_else(PoisonError::into_inner);
     heartbeat.state = "idle".to_owned();
@@ -1331,7 +1345,7 @@ pub fn serve(state: &State, options: &ServeOptions) -> Result<i32, String> {
                                         retry_seen.clone_from(due);
                                     }
                                 }
-                                if work_cycle(state, options, &mut heartbeat) {
+                                if work_cycle(state, options, &mut heartbeat, &lock) {
                                     heartbeat.failed_cycles = 0;
                                     failure_retry = None;
                                 } else {

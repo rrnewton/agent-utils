@@ -7,6 +7,10 @@
 //! its head no longer resolves) is kept under `intake/refused/` with the reason, and `status`
 //! shows it.
 //!
+//! A run whose speculative window has room does not wait for its own end: it applies the
+//! requests for changes it has not started, and plans them on top of the batches in flight
+//! (see `run`). Requests for a change it started wait for the run to end.
+//!
 //! `list` and `status` show the waiting requests as `pending-intake`, so a submitter can see its
 //! request was taken. A request identical to the last one waiting for the same change is not
 //! recorded again (the command says it is already recorded), and identical requests recorded
@@ -299,10 +303,28 @@ pub fn pending_withdrawals(state: &State) -> BTreeSet<i64> {
         .collect()
 }
 
+/// Whether a request is waiting for a change not in `busy`.
+pub fn has_pending_except(state: &State, busy: &BTreeSet<i64>) -> bool {
+    pending_entries(state)
+        .iter()
+        .any(|entry| !busy.contains(&entry.request.pr()))
+}
+
 /// Apply every waiting request, oldest first, under the writer lock the caller holds. A request
 /// that cannot be applied is moved to `intake/refused/` with the reason (and noted in its
 /// change's history); the rest still apply. Errs only when the requests cannot be listed.
-pub fn apply(state: &State, config: &Config, _lock: &Lock) -> Result<Vec<Applied>, String> {
+pub fn apply(state: &State, config: &Config, lock: &Lock) -> Result<Vec<Applied>, String> {
+    apply_except(state, config, lock, &BTreeSet::new())
+}
+
+/// [`apply`], except that the requests for a change in `busy` (one a run in progress has
+/// started) stay waiting, in order, for a later apply.
+pub fn apply_except(
+    state: &State,
+    config: &Config,
+    _lock: &Lock,
+    busy: &BTreeSet<i64>,
+) -> Result<Vec<Applied>, String> {
     let mut applied: Vec<Applied> = Vec::new();
     // For each change, the last request applied, its line in `applied`, and how many identical
     // requests recorded right after it were folded into it rather than applied again.
@@ -327,6 +349,9 @@ pub fn apply(state: &State, config: &Config, _lock: &Lock) -> Result<Vec<Applied
             }
         };
         let pr = entry.request.pr();
+        if busy.contains(&pr) {
+            continue;
+        }
         if let Some((previous, line, repeats)) = last.get_mut(&pr) {
             if same(previous, &entry.request) {
                 std::fs::remove_file(&path)

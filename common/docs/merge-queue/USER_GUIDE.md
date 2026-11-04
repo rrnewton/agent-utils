@@ -244,6 +244,26 @@ before it reads the queue. That holder is the `serve` daemon at its next poll, a
 does exactly what the command would have done then, and its history entry notes when it was
 recorded.
 
+The run holding the lock does not make every request wait for its end. Whenever its speculative
+window has a free slot and the run goes on (a batch is in flight, or batches are still to
+start), it applies the requests for the changes it is not busy with: every change except those
+in flight and those it ejected or set aside. It then plans every queued change it has not
+started again, on top of the last batch in flight. A new change can then start validating in
+the free slot at once, and a `--prioritized` one goes before batches that have not started. The
+run checks for requests every `--poll-ms` under `serve` and every 15 seconds under `run`.
+
+- The plan is made on the candidate of the last batch in flight, so a change that conflicts
+  with work in flight is held for the next run, not ejected. A change stacked on a change in
+  flight, or submitted `--after` one, is planned on top of it and depends on it: if that change
+  is ejected, the stacked one is set aside, never rebuilt without it.
+- Landing order does not change. A batch planned this way lands only after every batch beneath
+  it, and a red batch beneath it sends it back to be built again, as for any batch.
+- Requests for a change in flight wait for the run to end (a withdrawal still keeps its batch
+  from landing, below). So do all requests during a drain, and after a run has been taking
+  requests for two hours: it then finishes the batches in flight and ends, so the next run
+  reloads the configuration and the validator's tools. The run report lists what the run
+  applied under `intake`.
+
 - `submit` first checks, without writing to the repository the run is using, that the head
   resolves (`git ls-remote`), and that it matches `--sha` when one is given. A head that does
   not resolve is refused at once, as it would be with the lock free.

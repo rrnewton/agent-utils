@@ -1729,9 +1729,10 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     drain_pid: None,
                     // A one-shot run reports its own progress; no heartbeat shows a window.
                     window: None,
+                    intake_poll: None,
                 },
             )?;
-            let report = runner.run()?;
+            let report = runner.holding(&lock).run()?;
             print_report(&report, json)?;
             Ok(if report.stopped.is_empty() { 0 } else { 3 })
         }

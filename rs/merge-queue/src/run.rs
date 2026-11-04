@@ -21,6 +21,11 @@
 //! on top of the one before; when the head lands, the next batch starts at once. A red head
 //! cancels everything behind it. The window grows by one per landed batch up to `max_depth` and
 //! halves per red batch (AIMD), never below one.
+//!
+//! A run holds the writer lock for its whole length, so `submit`, `withdraw` and `retry` record
+//! their requests instead (see [`crate::intake`]). While a batch is in flight the run takes in
+//! the requests for changes it has not started, and plans them on top of the last batch in
+//! flight, so a free slot does not wait for the run to end.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
@@ -35,7 +40,7 @@ use crate::git::{Combined, Git};
 use crate::model::{now, Discharge, Item, ItemStatus, Obligation, Plan};
 use crate::ops::{self, repo};
 use crate::plan::short;
-use crate::state::{write_json, Config, State};
+use crate::state::{write_json, Config, Lock, State};
 use crate::tests::{Outcome, Scope, Selection, TestId, TestResult, TestResults, ValidationClaim};
 use crate::validate::{from_config, Chosen, ProbeObservation, Ran, Validator};
 
@@ -71,7 +76,18 @@ pub struct RunOptions {
     /// heartbeat's window): what the run built, not the plan, which still names changes the
     /// run skips.
     pub window: Option<Arc<Mutex<Vec<Vec<i64>>>>>,
+    /// How often a run with a batch in flight looks for requests recorded while it holds the
+    /// queue ([`INTAKE_POLL`] when unset).
+    pub intake_poll: Option<Duration>,
 }
+
+/// How often a run with a batch in flight looks for recorded requests, unless
+/// [`RunOptions::intake_poll`] says otherwise.
+pub const INTAKE_POLL: Duration = Duration::from_secs(15);
+
+/// How long a run keeps taking in recorded requests. After that it finishes the batches in
+/// flight and ends, so the next run reloads the configuration and the validator's tools.
+pub const INTAKE_FOR: Duration = Duration::from_secs(2 * 3600);
 
 /// Donor validators for this run (offload `compare` or `decide`).
 struct Donors {
@@ -317,6 +333,10 @@ pub struct RunReport {
     /// Generated files regenerated on candidates.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub regenerated: Vec<Regeneration>,
+    /// Requests recorded while the run held the queue that it applied before it ended, as
+    /// `intake` lines.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub intake: Vec<String>,
     /// Peer queues drained first (`--with-peers`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub peer_runs: Vec<PeerRun>,
@@ -719,6 +739,8 @@ pub struct Runner<'a> {
     hosting: Option<crate::github::Hosting>,
     /// Donor validators, when `validator.offload` is not off.
     donors: Option<Donors>,
+    /// The writer lock the caller holds, when the run may apply recorded requests itself.
+    writer: Option<&'a Lock>,
 }
 
 impl<'a> Runner<'a> {
@@ -858,7 +880,15 @@ impl<'a> Runner<'a> {
             },
             donors,
             options,
+            writer: None,
         })
+    }
+
+    /// Let the run apply requests recorded while it holds the queue under `writer`, the
+    /// writer lock its caller holds (see [`RunOptions::intake_poll`]).
+    pub fn holding(mut self, writer: &'a Lock) -> Self {
+        self.writer = Some(writer);
+        self
     }
 
     fn simulating(&self) -> bool {
@@ -2802,7 +2832,7 @@ impl<'a> Runner<'a> {
             .map(|batch| vec![batch.prs.clone()])
             .unwrap_or_default()
             .into();
-        self.pipeline(&mut pending, continuation)
+        self.pipeline(&mut pending, continuation, max_batch)
     }
 
     /// Record a plan as the run's current plan: dependencies, base,
@@ -2876,6 +2906,133 @@ impl<'a> Runner<'a> {
         Ok(())
     }
 
+    /// Whether this run may take in recorded requests now: it holds the writer lock for real
+    /// (not a shadow or dry run) and has not been taking them for [`INTAKE_FOR`] yet.
+    fn takes_intake(&self) -> bool {
+        self.writer.is_some() && !self.simulating() && self.started.elapsed() < INTAKE_FOR
+    }
+
+    /// Apply the requests recorded for changes this run is not busy with (`busy`: in flight or
+    /// set aside), then plan every queued change it is not busy with on top of `tip`, the
+    /// candidate of its last batch in flight (or the base), and replace `pending` with the
+    /// plan's batches. Nothing here stops the run: when the requests or the plan cannot be
+    /// read, `pending` stays as it was and the changes wait for the next run.
+    fn take_intake(
+        &self,
+        tip: &str,
+        busy: &BTreeSet<i64>,
+        max_batch: usize,
+        pending: &mut VecDeque<Vec<i64>>,
+    ) -> Result<(), String> {
+        let Some(writer) = self.writer else {
+            return Ok(());
+        };
+        let applied = match crate::intake::apply_except(self.state, &self.config, writer, busy) {
+            Ok(applied) => applied,
+            Err(error) => {
+                self.event("intake", &format!("recorded requests not applied: {error}"));
+                return Ok(());
+            }
+        };
+        if applied.is_empty() {
+            return Ok(());
+        }
+        for one in &applied {
+            let line = one.line();
+            self.event("intake", &line);
+            lock(&self.report).intake.push(line);
+        }
+        if let Err(error) = self.plan_intake(tip, busy, max_batch, pending) {
+            self.event(
+                "plan-intake",
+                &format!(
+                    "cannot plan on top of {}: {error}; the changes wait for the next run",
+                    short(tip)
+                ),
+            );
+        }
+        Ok(())
+    }
+
+    /// The planning half of [`Self::take_intake`]; `pending` changes only when it succeeds.
+    fn plan_intake(
+        &self,
+        tip: &str,
+        busy: &BTreeSet<i64>,
+        max_batch: usize,
+        pending: &mut VecDeque<Vec<i64>>,
+    ) -> Result<(), String> {
+        let records = self.state.items()?;
+        {
+            let mut items = lock(&self.items);
+            for item in records {
+                if !busy.contains(&item.pr) {
+                    items.insert(item.pr, item);
+                }
+            }
+        }
+        let carried: BTreeSet<i64> = lock(&self.carried)
+            .get(tip)
+            .map(|prs| prs.iter().copied().collect())
+            .unwrap_or_default();
+        let skip: BTreeSet<i64> = busy.difference(&carried).copied().collect();
+        let plan = ops::plan_on(self.state, &self.config, max_batch, tip, &carried, &skip)?;
+        self.link_to_window(&plan, &carried)?;
+        {
+            let mut deps = lock(&self.deps);
+            for (before, after) in &plan.dependencies {
+                deps.entry(*after).or_default().insert(*before);
+            }
+        }
+        self.event(
+            "plan-intake",
+            &format!(
+                "{} batch(es) on top of {} (carrying {}): {}; {} held",
+                plan.batches.len(),
+                short(tip),
+                list(&carried.iter().copied().collect::<Vec<_>>()),
+                plan.batches
+                    .iter()
+                    .map(|batch| list(&batch.prs))
+                    .collect::<Vec<_>>()
+                    .join(" then "),
+                plan.held.len()
+            ),
+        );
+        *pending = plan.batches.iter().map(|batch| batch.prs.clone()).collect();
+        Ok(())
+    }
+
+    /// Record that each change `plan` batches depends on the changes in `carried` (in flight
+    /// beneath it) it names with `--after` or is stacked on, so that ejecting one of those sets
+    /// it aside instead of rebuilding it without them. Records nothing when an ancestry check
+    /// fails.
+    fn link_to_window(&self, plan: &Plan, carried: &BTreeSet<i64>) -> Result<(), String> {
+        let items = lock(&self.items).clone();
+        let mut links: Vec<(i64, i64)> = Vec::new();
+        for pr in plan.batches.iter().flat_map(|batch| batch.prs.iter()) {
+            let Some(item) = items.get(pr) else {
+                continue;
+            };
+            for beneath in carried {
+                let stacked = match items.get(beneath) {
+                    Some(under) if !under.head.is_empty() && !item.head.is_empty() => {
+                        self.git.is_ancestor(&under.head, &item.head)?
+                    }
+                    _ => false,
+                };
+                if item.after.contains(beneath) || stacked {
+                    links.push((*pr, *beneath));
+                }
+            }
+        }
+        let mut deps = lock(&self.deps);
+        for (pr, beneath) in links {
+            deps.entry(pr).or_default().insert(beneath);
+        }
+        Ok(())
+    }
+
     fn dry_run(&self, pending: &mut VecDeque<Vec<i64>>) -> Result<String, String> {
         let mut started = 0;
         while let Some(prs) = pending.pop_front() {
@@ -2920,7 +3077,9 @@ impl<'a> Runner<'a> {
         &self,
         pending: &mut VecDeque<Vec<i64>>,
         continuation: ops::PlanContinuation,
+        max_batch: usize,
     ) -> Result<String, String> {
+        let poll = self.options.intake_poll.unwrap_or(INTAKE_POLL);
         let mut window = self.width.min(self.max_window);
         let mut flights: VecDeque<Flight> = VecDeque::new();
         std::thread::scope(|scope| {
@@ -2957,6 +3116,33 @@ impl<'a> Runner<'a> {
                             .map_err(|_| "planning thread panicked".to_owned())??;
                         self.adopt_completed(&full, &started_prs, pending)?;
                         full_loaded = true;
+                    }
+                    // Requests recorded while this run holds the queue: when a slot is free and
+                    // the run goes on (a batch in flight, or batches still to start), take them
+                    // in now instead of at the end of the run. The changes this run has not
+                    // started are planned again on top of the last batch in flight, so a new
+                    // change can fill the free slot and a prioritized one goes before batches
+                    // not started yet.
+                    if full_loaded
+                        && want_more
+                        && flights.len() < window
+                        && (!flights.is_empty() || !pending.is_empty())
+                        && self.takes_intake()
+                    {
+                        // In flight or set aside; a change a red batch sent back to `pending`
+                        // is planned again with the rest.
+                        let mut busy: BTreeSet<i64> = flights
+                            .iter()
+                            .flat_map(|flight| flight.candidate.prs.iter().copied())
+                            .collect();
+                        busy.extend(lock(&self.excluded).iter().copied());
+                        if crate::intake::has_pending_except(self.state, &busy) {
+                            let tip = match flights.back() {
+                                Some(last) => last.candidate.tip.clone(),
+                                None => self.current_base()?,
+                            };
+                            self.take_intake(&tip, &busy, max_batch, pending)?;
+                        }
                     }
                     // Fill the window, each new batch on top of the last one in flight.
                     while flights.len() < window
@@ -3044,9 +3230,14 @@ impl<'a> Runner<'a> {
                         }
                         return Ok(String::new());
                     }
-                    let (id, result) = rx
-                        .recv()
-                        .map_err(|_| "validation channel closed".to_owned())?;
+                    let (id, result) = match rx.recv_timeout(poll) {
+                        Ok(message) => message,
+                        // Nothing finished yet: look for recorded requests again.
+                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            return Err("validation channel closed".to_owned());
+                        }
+                    };
                     if let Some(flight) = flights.iter_mut().find(|flight| flight.id == id) {
                         flight.result = Some(result);
                     }
