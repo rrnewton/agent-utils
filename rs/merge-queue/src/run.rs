@@ -419,6 +419,9 @@ struct Slots {
     dir: PathBuf,
     clean_ignored: bool,
     free: Mutex<Vec<usize>>,
+    /// The lock file of each slot taken and not yet given back, held locked meanwhile
+    /// ([`crate::serve::slot_lock_path`]).
+    held: Mutex<BTreeMap<usize, std::fs::File>>,
 }
 
 impl Slots {
@@ -428,12 +431,16 @@ impl Slots {
             dir,
             clean_ignored,
             free: Mutex::new((0..width).rev().collect()),
+            held: Mutex::new(BTreeMap::new()),
         }
     }
 
     fn take(&self) -> usize {
         loop {
             if let Some(slot) = lock(&self.free).pop() {
+                if let Some(file) = self.lock_slot(slot) {
+                    lock(&self.held).insert(slot, file);
+                }
                 return slot;
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -441,7 +448,34 @@ impl Slots {
     }
 
     fn give(&self, slot: usize) {
+        // Dropping the file releases its lock.
+        lock(&self.held).remove(&slot);
         lock(&self.free).push(slot);
+    }
+
+    /// Lock `slot`'s lock file for as long as the slot is taken: a slot keeps its checkout
+    /// between validations, so this lock is how `status` tells a slot in use from an idle one.
+    /// It only feeds that report, so a file that cannot be locked is `None`, never an error.
+    fn lock_slot(&self, slot: usize) -> Option<std::fs::File> {
+        std::fs::create_dir_all(&self.dir).ok()?;
+        let path = crate::serve::slot_lock_path(&self.dir.join(format!("slot-{slot}")));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)
+            .ok()?;
+        // A `status` probe holds a shared lock for an instant: retry for about a second.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if fs2::FileExt::try_lock_exclusive(&file).is_ok() {
+                return Some(file);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// Check out `commit` in slot `slot`, reusing the worktree.

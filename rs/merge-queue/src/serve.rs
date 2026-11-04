@@ -262,7 +262,13 @@ pub fn serve_lock_path(state: &State) -> PathBuf {
 /// free, `None` when the file does not exist (no daemon that takes the lock
 /// ever ran here). The probe takes a shared lock for an instant only.
 pub fn serve_lock_held(state: &State) -> Option<bool> {
-    let file = File::open(serve_lock_path(state)).ok()?;
+    lock_held(&serve_lock_path(state))
+}
+
+/// Whether some process holds a lock on the file at `path`: `None` when there is no such
+/// file. The probe takes a shared lock for an instant only, so lock takers retry briefly.
+fn lock_held(path: &Path) -> Option<bool> {
+    let file = File::open(path).ok()?;
     match FileExt::try_lock_shared(&file) {
         Ok(()) => {
             let _ = FileExt::unlock(&file);
@@ -270,6 +276,14 @@ pub fn serve_lock_held(state: &State) -> Option<bool> {
         }
         Err(_) => Some(true),
     }
+}
+
+/// The file a run holds locked while a validation uses the scratch slot checkout at `slot`
+/// (`scratch/slot-<n>` → `scratch/slot-<n>.lock`).
+pub fn slot_lock_path(slot: &Path) -> PathBuf {
+    let mut name = slot.file_name().unwrap_or_default().to_os_string();
+    name.push(".lock");
+    slot.with_file_name(name)
 }
 
 /// Take the single-daemon lock or explain who holds it. Retries for about a
@@ -323,7 +337,8 @@ pub fn read_heartbeat(state: &State) -> Option<Heartbeat> {
     serde_json::from_str(&text).ok()
 }
 
-/// Count scratch validation slots: `(existing, in use)`.
+/// Count scratch validation slots: `(existing, in use)`. A slot keeps its checkout between
+/// validations, so it is in use only while a run holds its lock file ([`slot_lock_path`]).
 pub fn slot_occupancy(state: &State) -> (usize, usize) {
     let dir = state.scratch_dir();
     let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -338,8 +353,7 @@ pub fn slot_occupancy(state: &State) -> (usize, usize) {
             .is_some_and(|n| n.to_string_lossy().starts_with("slot-"));
         if is_slot && path.is_dir() {
             total += 1;
-            let non_empty = std::fs::read_dir(&path).is_ok_and(|mut it| it.next().is_some());
-            if non_empty {
+            if lock_held(&slot_lock_path(&path)) == Some(true) {
                 in_use += 1;
             }
         }
@@ -831,7 +845,10 @@ fn refresh_heartbeat(state: &State, shared: &Mutex<Heartbeat>, done: &AtomicBool
         std::thread::sleep(Duration::from_millis(50));
         if last.elapsed() >= HEARTBEAT_REFRESH && !done.load(Ordering::SeqCst) {
             last = Instant::now();
+            let (total, in_use) = slot_occupancy(state);
             let mut heartbeat = lock_heartbeat(shared);
+            heartbeat.slots_total = total;
+            heartbeat.slots_in_use = in_use;
             heartbeat.touch();
             let _ = write_heartbeat(state, &heartbeat);
         }
@@ -944,6 +961,15 @@ fn run_cycle(
             false
         }
     }
+}
+
+/// Clear the busy-lock error from the heartbeat once it no longer applies: the daemon got the
+/// lock, or has nothing to do with it. Any other error the heartbeat shows stays.
+fn clear_busy_error(heartbeat: &mut Heartbeat, busy_error: &mut String) {
+    if !busy_error.is_empty() && heartbeat.last_error == *busy_error {
+        heartbeat.last_error.clear();
+    }
+    busy_error.clear();
 }
 
 /// Run one work cycle with the heartbeat kept fresh by a helper thread.
@@ -1149,6 +1175,8 @@ pub fn serve(state: &State, options: &ServeOptions) -> Result<i32, String> {
     let mut failure_retry: Option<(Instant, String)> = None;
     // When the last label sync ran (`--sync-label`); `None` means due now.
     let mut last_sync: Option<Instant> = None;
+    // The busy-lock error the heartbeat shows, until the daemon gets the lock or has no work.
+    let mut busy_error = String::new();
 
     'outer: loop {
         if shutdown_requested() {
@@ -1228,6 +1256,7 @@ pub fn serve(state: &State, options: &ServeOptions) -> Result<i32, String> {
                         trigger_label(items_changed, base_changed, retry_due, backoff_due);
                     if heartbeat.queued == 0 {
                         // Nothing to land: remember the state and stay idle.
+                        clear_busy_error(&mut heartbeat, &mut busy_error);
                         last_fingerprint = fingerprint.clone();
                         failure_retry = None;
                         heartbeat.failed_cycles = 0;
@@ -1236,6 +1265,7 @@ pub fn serve(state: &State, options: &ServeOptions) -> Result<i32, String> {
                     } else {
                         match state.lock() {
                             Ok(lock) => {
+                                clear_busy_error(&mut heartbeat, &mut busy_error);
                                 if let Some(due) = schedule.due.as_ref() {
                                     if *due > retry_seen {
                                         retry_seen.clone_from(due);
@@ -1275,6 +1305,7 @@ pub fn serve(state: &State, options: &ServeOptions) -> Result<i32, String> {
                             }
                             Err(error) => {
                                 heartbeat.last_trigger = "lock-busy".to_owned();
+                                busy_error.clone_from(&error);
                                 heartbeat.last_error = error;
                                 // Do not update last_fingerprint: retry next cycle.
                             }
@@ -1403,12 +1434,12 @@ pub struct StatusReport {
     pub ejected: usize,
     /// Withdrawn items.
     pub withdrawn: usize,
-    /// Current window: batches from the heartbeat (daemon view), falling
-    /// back to the newest run's plan when no daemon heartbeat exists.
+    /// Current window: the batches a live daemon's heartbeat names. Empty while
+    /// the daemon idles, and when no daemon is running.
     pub active_batches: Vec<Vec<i64>>,
     /// Scratch slots that exist.
     pub slots_total: usize,
-    /// Scratch slots holding a checkout.
+    /// Scratch slots a validation is using now.
     pub slots_in_use: usize,
     /// Whether the daemon is in shadow mode (`serve --shadow`): landings
     /// are simulated on a private base and the real base is never pushed.
@@ -1488,9 +1519,12 @@ pub fn collect_status(state: &State, stale_after_secs: u64) -> Result<StatusRepo
     };
     let count = |status: ItemStatus| items.iter().filter(|i| i.status == status).count();
     let (slots_total, slots_in_use) = slot_occupancy(state);
-    let active_batches = match &heartbeat {
-        Some(h) if !h.active_batches.is_empty() => h.active_batches.clone(),
-        _ => newest_run_batches(state),
+    // A live daemon's heartbeat is the authority: no batches there means it is idle, whatever
+    // the newest run planned. A run's report is written when the run ends, so a run directory
+    // can only ever show batches that are no longer active.
+    let active_batches = match (&daemon, &heartbeat) {
+        (Liveness::Running | Liveness::Stale, Some(h)) => h.active_batches.clone(),
+        _ => Vec::new(),
     };
     let working_secs = heartbeat
         .as_ref()
@@ -1547,38 +1581,6 @@ pub fn collect_status(state: &State, stale_after_secs: u64) -> Result<StatusRepo
         items_error,
         remedy,
     })
-}
-
-fn newest_run_batches(state: &State) -> Vec<Vec<i64>> {
-    let Ok(entries) = std::fs::read_dir(state.runs_dir()) else {
-        return Vec::new();
-    };
-    let mut dirs: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
-    dirs.sort();
-    let Some(latest) = dirs.last() else {
-        return Vec::new();
-    };
-    let Ok(text) = std::fs::read_to_string(latest.join("report.json")) else {
-        return Vec::new();
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return Vec::new();
-    };
-    value["plan"]["batches"]
-        .as_array()
-        .map(|batches| {
-            batches
-                .iter()
-                .filter_map(|b| {
-                    b["prs"].as_array().map(|prs| {
-                        prs.iter()
-                            .filter_map(serde_json::Value::as_i64)
-                            .collect::<Vec<_>>()
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// Render the status report as human text.
@@ -1948,5 +1950,81 @@ mod unit {
         let json = r#"{"pid":1,"started_at":"2026-01-01T00:00:00Z","heartbeat_at":"2026-01-01T00:00:00Z","heartbeat_unix":1,"cycles":0,"state":"idle","last_trigger":"startup","last_base_sha":"","queued":0,"active_batches":[],"window":2,"slots_total":0,"slots_in_use":0}"#;
         let heartbeat: Heartbeat = serde_json::from_str(json).unwrap();
         assert!(!heartbeat.shadow);
+    }
+
+    #[test]
+    fn a_slot_is_in_use_only_while_its_lock_is_held() {
+        let state = temp_state("slots");
+        for slot in ["slot-0", "slot-1"] {
+            // A slot keeps its checkout between validations.
+            std::fs::create_dir_all(state.scratch_dir().join(slot).join("src")).unwrap();
+        }
+        assert_eq!(slot_occupancy(&state), (2, 0));
+        let held = File::create(slot_lock_path(&state.scratch_dir().join("slot-1"))).unwrap();
+        FileExt::lock_exclusive(&held).unwrap();
+        assert_eq!(slot_occupancy(&state), (2, 1));
+        drop(held);
+        assert_eq!(slot_occupancy(&state), (2, 0));
+        let _ = std::fs::remove_dir_all(&state.root);
+    }
+
+    #[test]
+    fn only_a_live_daemon_s_heartbeat_names_active_batches() {
+        let state = temp_state("window");
+        // The newest run finished with a planned batch.
+        let run = state.runs_dir().join("20260101T000000Z");
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(
+            run.join("report.json"),
+            r#"{"plan":{"batches":[{"prs":[7,8]}]}}"#,
+        )
+        .unwrap();
+        // A live daemon (this process) that is idle has no active batches.
+        std::fs::write(state.serve_pid_path(), format!("{}\n", std::process::id())).unwrap();
+        let mut heartbeat = Heartbeat::new(std::process::id(), 2, false);
+        heartbeat.touch();
+        write_heartbeat(&state, &heartbeat).unwrap();
+        let report = collect_status(&state, 60).unwrap();
+        assert_eq!(report.daemon, Liveness::Running);
+        assert!(
+            report.active_batches.is_empty(),
+            "{:?}",
+            report.active_batches
+        );
+        assert!(render_status(&report).contains("window: no active batches"));
+        // A working daemon's batches are the window.
+        heartbeat.active_batches = vec![vec![9]];
+        heartbeat.touch();
+        write_heartbeat(&state, &heartbeat).unwrap();
+        assert_eq!(
+            collect_status(&state, 60).unwrap().active_batches,
+            vec![vec![9]]
+        );
+        // A dead daemon validates nothing, whatever its last heartbeat said.
+        std::fs::write(state.serve_pid_path(), "999999999\n").unwrap();
+        let report = collect_status(&state, 60).unwrap();
+        assert_eq!(report.daemon, Liveness::Dead);
+        assert!(
+            report.active_batches.is_empty(),
+            "{:?}",
+            report.active_batches
+        );
+        let _ = std::fs::remove_dir_all(&state.root);
+    }
+
+    #[test]
+    fn a_busy_lock_error_clears_and_other_errors_stay() {
+        let busy_text = "another merge-queue writer holds q/lock (a run in progress?)";
+        let mut heartbeat = Heartbeat::new(1, 2, false);
+        let mut busy = busy_text.to_owned();
+        heartbeat.last_error = busy.clone();
+        clear_busy_error(&mut heartbeat, &mut busy);
+        assert!(heartbeat.last_error.is_empty());
+        assert!(busy.is_empty());
+        // An error of another kind since the busy lock is not the busy lock's to clear.
+        let mut busy = busy_text.to_owned();
+        heartbeat.last_error = "ALARM: the validator cannot execute".to_owned();
+        clear_busy_error(&mut heartbeat, &mut busy);
+        assert_eq!(heartbeat.last_error, "ALARM: the validator cannot execute");
     }
 }

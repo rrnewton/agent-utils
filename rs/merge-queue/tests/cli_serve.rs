@@ -788,3 +788,60 @@ fn run_stops_on_sigterm_mid_validation_without_a_verdict() {
     assert!(!alive(validator), "validation left running");
     assert_stopped_without_verdict(&fx, "stop request");
 }
+
+fn status_json(fx: &Fixture) -> Value {
+    let out = fx.mq(&["status", "--json"]);
+    serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap_or(Value::Null)
+}
+
+#[test]
+fn status_counts_a_slot_and_a_batch_only_while_a_validation_runs() {
+    let fx = Fixture::new("status-occupancy");
+    fx.write("tests/t0", "ok\n");
+    fx.commit_all("seed tests");
+    git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
+    // The validation waits until the test opens the gate.
+    let gate = fx.root.join("gate");
+    let validator = format!("while [ ! -e '{}' ]; do sleep 0.05; done", gate.display());
+    fx.mq_ok(&[
+        "init",
+        "--remote",
+        "origin",
+        "--validator",
+        "command",
+        "--validator-run",
+        &validator,
+    ]);
+    let daemon = Daemon::start(&fx);
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    wait_for("a slot and a batch in use", Duration::from_secs(20), || {
+        let report = status_json(&fx);
+        report["slots_in_use"] == 1 && report["active_batches"] == serde_json::json!([[1]])
+    });
+    // The daemon's own heartbeat keeps the count current during the work cycle.
+    wait_for("the heartbeat's slot count", Duration::from_secs(5), || {
+        heartbeat(&fx)["slots_in_use"] == 1
+    });
+    std::fs::write(&gate, "").unwrap();
+    wait_for("landing", Duration::from_secs(20), || {
+        item_status(&fx, 1) == "landed"
+    });
+    wait_for("idle", Duration::from_secs(10), || {
+        heartbeat(&fx)["state"] == "idle"
+    });
+    // The run planned a batch and left its checkout in a slot; neither is in use now.
+    let report = status_json(&fx);
+    assert_eq!(report["active_batches"], serde_json::json!([]), "{report}");
+    assert!(report["slots_total"].as_u64() >= Some(1), "{report}");
+    assert_eq!(report["slots_in_use"], 0, "{report}");
+    let text = fx.mq_ok(&["status"]);
+    assert!(text.contains("window: no active batches"), "{text}");
+    assert!(text.contains("slots: 0 in use"), "{text}");
+    wait_for(
+        "the heartbeat's idle slot count",
+        Duration::from_secs(5),
+        || heartbeat(&fx)["slots_in_use"] == 0,
+    );
+    daemon.stop();
+}
