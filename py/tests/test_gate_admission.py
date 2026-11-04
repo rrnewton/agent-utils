@@ -12,7 +12,8 @@ PY = sys.executable
 
 
 def _env(tmp_path: Path) -> dict[str, str]:
-    return {**os.environ, "GATE_ADMISSION_DIR": str(tmp_path / "admission")}
+    return {**os.environ, "GATE_ADMISSION_DIR": str(tmp_path / "admission"),
+            "GATE_LEDGER": str(tmp_path / "ledger.jsonl")}
 
 
 def _start(tmp_path: Path, *args: str) -> subprocess.Popen[str]:
