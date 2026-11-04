@@ -28,7 +28,7 @@
 //! already reported, notices still waiting to be sent) is persisted after every pass, so
 //! restarting the watcher does not report the same episode twice.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -157,6 +157,10 @@ pub struct WatchAgentsOptions {
     /// A queued prompt pending longer than this is reported with its age (#804
     /// agentctl-queue-only-drain); every pass also drains the queues.
     pub queue_stale: Duration,
+    /// Who is told, in order, about the coordinator's own queue or composer, which a notice
+    /// must never wait in (#844 watch-notice-route): another coordinator or a liaison agent.
+    /// With none reachable, the watcher logs the notice and raises one owner alarm.
+    pub notice_fallback: Vec<String>,
 }
 
 /// The auto-interrupt policy (#574 harness-adapters): the watcher interrupts an agent's turn
@@ -997,6 +1001,15 @@ pub trait Notifier {
     /// as a priority sender. The default sends it as any other.
     fn notify_urgent(&mut self, coordinator: &str, text: &str, message_id: &str) -> Result<String> {
         self.notify(coordinator, text, message_id)
+    }
+    /// Raise one alarm in the owner's chat for a notice no agent can be told (#844
+    /// watch-notice-route), under `alarm_id`, and return where it was posted. The default has no
+    /// such route.
+    fn owner_alarm(&mut self, text: &str, alarm_id: &str) -> Result<String> {
+        let _ = (text, alarm_id);
+        Err(fail(
+            "no owner alarm route: start the watcher with --owner-alarm-bridge DIR",
+        ))
     }
     /// Withdraw an earlier notice from `recipient`'s queue so a newer one replaces it (#840
     /// watch-notice-backoff): a copy still waiting there is never typed, and one already
@@ -2592,6 +2605,63 @@ fn takes_notices(memory: &AgentMemory, now: f64, options: &WatchAgentsOptions) -
     }
 }
 
+/// Who may be told about `subject`'s own queue or composer (#844 watch-notice-route): the
+/// coordinator, else each `--notice-fallback` in order, but never `subject` itself and never an
+/// agent in `jammed` (one whose queue is held this pass), because a notice queued there waits
+/// behind the very jam it reports; one sat in a stuck coordinator's composer while hundreds more
+/// starved its real messages. `None` means no agent can be told: the caller logs the notice and
+/// raises one owner alarm ([`alarm_owner`]).
+fn notice_route<'a>(
+    subject: &str,
+    jammed: &BTreeSet<String>,
+    options: &'a WatchAgentsOptions,
+) -> Option<&'a str> {
+    std::iter::once(options.coordinator.as_str())
+        .chain(options.notice_fallback.iter().map(String::as_str))
+        .find(|candidate| *candidate != subject && !jammed.contains(*candidate))
+}
+
+/// Raise the one owner alarm for a notice no agent can be told, logging it either way, and
+/// return the row fields that record the outcome.
+fn alarm_owner(notifier: &mut dyn Notifier, text: &str, alarm_id: &str) -> (bool, Value) {
+    log(format_args!(
+        "no agent can be told without queueing it behind the jam it reports; owner alarm \
+         {alarm_id}: {text}"
+    ));
+    match notifier.owner_alarm(text, alarm_id) {
+        Ok(outcome) => (true, json!({"owner_alarm": alarm_id, "outcome": outcome})),
+        Err(error) => {
+            log(format_args!("owner alarm {alarm_id} not raised: {error}"));
+            (
+                false,
+                json!({"owner_alarm": alarm_id, "error": error.to_string()}),
+            )
+        }
+    }
+}
+
+/// Send a notice about `subject`'s own queue or composer, as a priority sender, to whoever
+/// [`notice_route`] picks, or, with no one, log it and raise the owner alarm. Returns the
+/// outcome as row fields; an error means nothing was queued or raised.
+fn tell_about(
+    notifier: &mut dyn Notifier,
+    subject: &str,
+    jammed: &BTreeSet<String>,
+    text: &str,
+    message_id: &str,
+    options: &WatchAgentsOptions,
+) -> Result<Value> {
+    match notice_route(subject, jammed, options) {
+        Some(recipient) => notifier
+            .notify_urgent(recipient, text, message_id)
+            .map(|outcome| json!({"to": recipient, "outcome": outcome})),
+        None => match alarm_owner(notifier, text, message_id) {
+            (true, row) => Ok(row),
+            (false, row) => Err(fail(row["error"].as_str().unwrap_or("owner alarm failed"))),
+        },
+    }
+}
+
 /// Who is told about a notice: the agent's nearest reachable manager, as the pass decided it,
 /// else the configured coordinator.
 fn notice_target<'a>(options: &'a WatchAgentsOptions, notice: &'a PendingNotice) -> &'a str {
@@ -2995,6 +3065,12 @@ fn report_delivery_jams(
     }
     let waits = probe.delivery_waits();
     let threshold = options.delivery_wait.as_secs_f64();
+    // A jammed agent's queue is no place for a notice about any jam (#844 watch-notice-route).
+    let jammed: BTreeSet<String> = waits
+        .iter()
+        .filter(|(_, report)| crate::lock_wait::longest_wait(report) >= threshold)
+        .map(|(agent, _)| agent.clone())
+        .collect();
     let mut rows = Vec::new();
     let mut still_jammed = BTreeMap::new();
     for (agent, report) in &waits {
@@ -3018,11 +3094,11 @@ fn report_delivery_jams(
                      chat requests are caught in it."
                 );
                 let message_id = format!("agent-watch-jam-{agent}-{}", now as u64);
-                match notifier.notify_urgent(&options.coordinator, &text, &message_id) {
+                match tell_about(notifier, agent, &jammed, &text, &message_id, options) {
                     Ok(outcome) => {
                         still_jammed.insert(agent.clone(), now);
                         row["reported"] = json!(true);
-                        row["outcome"] = json!(outcome);
+                        row["outcome"] = outcome;
                     }
                     Err(error) => row["error"] = json!(error.to_string()),
                 }
@@ -3034,7 +3110,7 @@ fn report_delivery_jams(
     rows
 }
 
-/// One agent's owner-stuck notice episode (#840 watch-notice-backoff).
+/// One agent's owner-stuck notice episode (#840 watch-notice-backoff, #844 watch-notice-route).
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 struct OwnerStuckEpisode {
     /// The kind of reason the notices gave (`owner_alarm::reason_kind`); a change restarts the
@@ -3046,23 +3122,35 @@ struct OwnerStuckEpisode {
     last_at: f64,
     /// When the next notice is due (Unix seconds).
     next_at: f64,
-    /// The last notice's queue message ID, withdrawn when a repeat replaces it.
+    /// The live notice's queue message ID, withdrawn when a repeat replaces it or the episode
+    /// ends.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     message_id: Option<String>,
+    /// Whose queue the live notice waits in; absent in a state written before #844, when it was
+    /// always the coordinator's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recipient: Option<String>,
+    /// The episode's one owner alarm was raised (no agent could be told).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    alarmed: bool,
 }
 
 /// Report each agent whose owner (chat-bridge) requests have waited undelivered in its queue
 /// longer than `--owner-stuck-minutes`, with how many, since when, and the reason the last
-/// attempt gave (#720 agentctl-muse-stale-draft). Repeats back off (#840 watch-notice-backoff,
-/// the schedule of the chat bridge's owner alarm, #830): after 1, 3, 6 and 12 thresholds, then
-/// every 36, restarting at one threshold after the last notice when the kind of reason changes.
-/// Each notice names the time it was written (ET) and the age of the oldest held request, and a
-/// repeat first withdraws the previous copy from the coordinator's queue, so at most one copy
-/// waits there. About the coordinator itself, whose own queue the notice would wait in, it is
-/// sent once per episode. A request that waits only because its agent is busy is no fault and
-/// is not counted. Behind a draft in the agent's editor, for one, every delivery is refused
-/// while the agent can look busy all the while, so nothing else would say so. The notice goes
-/// to the coordinator as a priority sender. Returns a row for every agent with an owner request
+/// attempt gave (#720 agentctl-muse-stale-draft). A request that waits only because its agent is
+/// busy is no fault and is not counted; behind a draft in the agent's editor, for one, every
+/// delivery is refused while the agent can look busy all the while, so nothing else would say so.
+///
+/// One notice per episode (#844 watch-notice-route), and never into the stuck agent's own queue:
+/// it goes to the coordinator, else to the first `--notice-fallback`, skipping the agent itself
+/// and any agent whose own owner requests are stuck this pass ([`notice_route`]). Repeats back
+/// off (#840 watch-notice-backoff, the schedule of the chat bridge's owner alarm, #830): after
+/// 1, 3, 6 and 12 thresholds, then every 36, restarting at one threshold after the last notice
+/// when the kind of reason changes. Each repeat replaces the live copy: it withdraws it first,
+/// and while that copy is being typed (or cannot be withdrawn) no second copy is queued beside
+/// it. With no agent to tell, the notice is logged and one owner alarm is raised for the
+/// episode. An episode ends when the requests are delivered; its live notice is withdrawn then.
+/// Notices go as a priority sender. Returns a row for every agent with an owner request
 /// waiting, for the pass report.
 fn report_waiting_owner_prompts(
     probe: &mut dyn Probe,
@@ -3071,13 +3159,16 @@ fn report_waiting_owner_prompts(
     now: f64,
     options: &WatchAgentsOptions,
 ) -> Vec<Value> {
-    use crate::chat_service::owner_alarm::{reason_kind, BACKOFF};
+    use crate::chat_service::owner_alarm::{reason_kind, waiting_on_busy_agent, BACKOFF};
     if options.owner_stuck.is_zero() {
         state.owner_stuck_reported.clear();
         state.owner_stuck_backoff.clear();
         return Vec::new();
     }
     let threshold = options.owner_stuck.as_secs_f64();
+    let is_stuck = |prompt: &WaitingOwnerPrompt| {
+        now - prompt.queued_at >= threshold && !waiting_on_busy_agent(prompt.reason.as_deref())
+    };
     let mut by_agent: BTreeMap<String, Vec<WaitingOwnerPrompt>> = BTreeMap::new();
     for prompt in probe.waiting_owner_prompts() {
         by_agent
@@ -3085,19 +3176,20 @@ fn report_waiting_owner_prompts(
             .or_default()
             .push(prompt);
     }
+    // No agent whose own queue is stuck this pass can be told about another's.
+    let jammed: BTreeSet<String> = by_agent
+        .iter()
+        .filter(|(_, prompts)| prompts.iter().any(&is_stuck))
+        .map(|(agent, _)| agent.clone())
+        .collect();
     let mut rows = Vec::new();
     let mut still = BTreeMap::new();
     let mut episodes = BTreeMap::new();
     for (agent, mut prompts) in by_agent {
         prompts.sort_by(|left, right| left.queued_at.total_cmp(&right.queued_at));
         let oldest = (now - prompts[0].queued_at).max(0.0);
-        let stuck: Vec<&WaitingOwnerPrompt> = prompts
-            .iter()
-            .filter(|prompt| now - prompt.queued_at >= threshold)
-            .filter(|prompt| {
-                !crate::chat_service::owner_alarm::waiting_on_busy_agent(prompt.reason.as_deref())
-            })
-            .collect();
+        let stuck: Vec<&WaitingOwnerPrompt> =
+            prompts.iter().filter(|prompt| is_stuck(prompt)).collect();
         let mut row = json!({"agent": agent, "waiting": prompts.len(),
                              "oldest_seconds": oldest, "stuck": !stuck.is_empty()});
         if stuck.is_empty() {
@@ -3126,55 +3218,96 @@ fn report_waiting_owner_prompts(
                         step: 1,
                         last_at: *at,
                         next_at: at + threshold,
-                        message_id: None,
+                        ..OwnerStuckEpisode::default()
                     })
             })
             .map(|mut episode| {
                 if episode.kind != kind {
                     episode.kind = kind.to_owned();
                     episode.step = 0;
+                    episode.alarmed = false;
                     episode.next_at = episode.last_at + threshold;
                 }
                 episode
             });
-        // A notice about the coordinator's own queue waits in that same queue, so it is sent
-        // once per episode: repeats would only pile up behind whatever holds the queue.
+        let route = notice_route(&agent, &jammed, options).map(str::to_owned);
+        row["notice_to"] = json!(route.as_deref().unwrap_or("owner alarm"));
+        // Without an agent to tell, the episode raises one owner alarm; a failed one is retried
+        // on the backoff.
         let due = match &episode {
             None => true,
-            Some(_) if agent == options.coordinator => false,
+            Some(episode) if route.is_none() && episode.alarmed => false,
             Some(episode) => now >= episode.next_at,
         };
-        if !due {
+        let keep = |still: &mut BTreeMap<String, f64>,
+                    episodes: &mut BTreeMap<String, OwnerStuckEpisode>,
+                    episode: Option<OwnerStuckEpisode>| {
             if let Some(episode) = episode {
                 still.insert(agent.clone(), episode.last_at);
-                row["next_notice_in_seconds"] = json!((episode.next_at - now).max(0.0).round());
                 episodes.insert(agent.clone(), episode);
             }
+        };
+        if !due {
+            if let Some(episode) = &episode {
+                if !episode.alarmed || route.is_some() {
+                    row["next_notice_in_seconds"] = json!((episode.next_at - now).max(0.0).round());
+                }
+            }
+            keep(&mut still, &mut episodes, episode);
             row["reported"] = json!(true);
             rows.push(row);
             continue;
         }
         if options.check_only {
             row["due"] = json!(true);
-            if let Some(episode) = episode {
-                still.insert(agent.clone(), episode.last_at);
-                episodes.insert(agent.clone(), episode);
-            }
+            keep(&mut still, &mut episodes, episode);
             rows.push(row);
             continue;
+        }
+        // Replace, never append: the live copy is withdrawn first, and while it is being typed,
+        // or cannot be withdrawn, no second copy is queued beside it.
+        if let Some(previous) = episode
+            .as_ref()
+            .and_then(|episode| episode.message_id.as_deref())
+        {
+            let holder = episode
+                .as_ref()
+                .and_then(|episode| episode.recipient.as_deref())
+                .unwrap_or(&options.coordinator);
+            match notifier.withdraw(holder, previous) {
+                Ok(outcome) if outcome == "inflight" => {
+                    row["held_back"] = json!({"message_id": previous, "outcome": outcome});
+                    keep(&mut still, &mut episodes, episode);
+                    row["reported"] = json!(true);
+                    rows.push(row);
+                    continue;
+                }
+                Ok(outcome) => {
+                    row["replaced"] = json!({"message_id": previous, "outcome": outcome});
+                }
+                Err(error) => {
+                    row["replace_error"] = json!(error.to_string());
+                    keep(&mut still, &mut episodes, episode);
+                    row["reported"] = json!(true);
+                    rows.push(row);
+                    continue;
+                }
+            }
         }
         let step = episode.as_ref().map_or(0, |episode| episode.step) + 1;
         let wait = threshold * BACKOFF[(step as usize - 1).min(BACKOFF.len() - 1)] as f64;
         let held_since = stuck[0].queued_at;
         let held_minutes = ((now - held_since).max(0.0) / 60.0).floor();
-        let next = if agent == options.coordinator {
-            "It is sent once while this lasts, since it waits in the same queue.".to_owned()
-        } else {
+        let next = if route.is_some() {
             format!(
                 "The next reminder comes in {} min unless they are delivered, and replaces this \
                  one if it is still unread.",
                 (wait / 60.0).round()
             )
+        } else {
+            "No agent can be told without queueing this behind the jam it reports, so this is \
+             the only alarm while it lasts."
+                .to_owned()
         };
         let text = format!(
             "[agentctl watch-agents] {}: the owner's chat messages to {agent} are not being \
@@ -3185,44 +3318,67 @@ fn report_waiting_owner_prompts(
             crate::chat_trace::et_clock(held_since),
             owner_wait_hint(&agent, reason),
         );
-        // Replace, never append: the previous copy, if still unread, is withdrawn first.
-        if let Some(previous) = episode
-            .as_ref()
-            .and_then(|episode| episode.message_id.as_deref())
-        {
-            match notifier.withdraw(&options.coordinator, previous) {
-                Ok(outcome) => {
-                    row["replaced"] = json!({"message_id": previous, "outcome": outcome})
-                }
-                Err(error) => row["replace_error"] = json!(error.to_string()),
-            }
-        }
         let message_id = format!("agent-watch-owner-stuck-{agent}-{}", now as u64);
-        match notifier.notify_urgent(&options.coordinator, &text, &message_id) {
-            Ok(outcome) => {
+        let sent = match route.as_deref() {
+            Some(recipient) => {
+                notifier
+                    .notify_urgent(recipient, &text, &message_id)
+                    .map(|outcome| {
+                        row["outcome"] = json!(outcome);
+                        OwnerStuckEpisode {
+                            kind: kind.to_owned(),
+                            step,
+                            last_at: now,
+                            next_at: now + wait,
+                            message_id: Some(message_id.clone()),
+                            recipient: Some(recipient.to_owned()),
+                            alarmed: false,
+                        }
+                    })
+            }
+            None => {
+                let (raised, outcome) = alarm_owner(notifier, &text, &message_id);
+                row["alarm"] = outcome;
+                Ok(OwnerStuckEpisode {
+                    kind: kind.to_owned(),
+                    step,
+                    last_at: now,
+                    next_at: now + wait,
+                    message_id: None,
+                    recipient: None,
+                    alarmed: raised,
+                })
+            }
+        };
+        match sent {
+            Ok(next_episode) => {
                 still.insert(agent.clone(), now);
-                episodes.insert(
-                    agent.clone(),
-                    OwnerStuckEpisode {
-                        kind: kind.to_owned(),
-                        step,
-                        last_at: now,
-                        next_at: now + wait,
-                        message_id: Some(message_id),
-                    },
-                );
+                episodes.insert(agent.clone(), next_episode);
                 row["reported"] = json!(true);
-                row["outcome"] = json!(outcome);
             }
             Err(error) => {
-                if let Some(episode) = episode {
-                    still.insert(agent.clone(), episode.last_at);
-                    episodes.insert(agent.clone(), episode);
-                }
+                keep(&mut still, &mut episodes, episode);
                 row["error"] = json!(error.to_string());
             }
         }
         rows.push(row);
+    }
+    // An episode that ended (its requests delivered) takes its live notice with it.
+    if !options.check_only {
+        for (agent, ended) in &state.owner_stuck_backoff {
+            if episodes.contains_key(agent) {
+                continue;
+            }
+            if let Some(previous) = ended.message_id.as_deref() {
+                let holder = ended.recipient.as_deref().unwrap_or(&options.coordinator);
+                if let Err(error) = notifier.withdraw(holder, previous) {
+                    log(format_args!(
+                        "the owner-stuck notice {previous} about {agent} could not be withdrawn \
+                         from {holder}'s queue: {error}"
+                    ));
+                }
+            }
+        }
     }
     state.owner_stuck_reported = still;
     state.owner_stuck_backoff = episodes;
@@ -3279,8 +3435,10 @@ fn held_hint(agent: &str, kind: &str, reason: &str) -> String {
 /// or a draft in the way. Such a queue fails silently otherwise: its senders see their messages
 /// accepted, and the agent never sees them. Once per hold (per agent and kind of refusal), the
 /// coordinator is told, as a priority sender; about the coordinator itself, whose own queue
-/// that notice would wait in, each local agent with a message held there is told instead, and
-/// agent-teams senders are named in the row (their receipts carry the hold). The stale
+/// that notice would wait in, each local agent with a message held there is told instead, with
+/// the first `--notice-fallback` ([`notice_route`], which also skips every queue held this
+/// pass), and agent-teams senders are named in the row (their receipts carry the hold). With no
+/// agent route, one owner alarm is raised for the hold (#844 watch-notice-route). The stale
 /// threshold is `--queue-stale-minutes`. Returns one row per held queue; the drain row gains
 /// `held`.
 fn report_held_queues(
@@ -3293,6 +3451,19 @@ fn report_held_queues(
 ) -> Vec<Value> {
     let mut rows = Vec::new();
     let mut still = BTreeMap::new();
+    // Every queue held this pass: none of them is a place for a notice about a hold (#844).
+    let held_now: BTreeSet<String> = queue_drains
+        .iter()
+        .filter(|drain| drain["stale"] == true)
+        .filter(|drain| {
+            drain["blocked"]
+                .as_str()
+                .or_else(|| drain["drain_error"].as_str())
+                .and_then(held_kind)
+                .is_some()
+        })
+        .filter_map(|drain| drain["name"].as_str().map(str::to_owned))
+        .collect();
     for drain in queue_drains.iter_mut() {
         if drain["stale"] != true {
             continue;
@@ -3352,16 +3523,17 @@ fn report_held_queues(
                     ),
                 ));
             }
-        } else {
-            recipients.push((
-                options.coordinator.clone(),
-                format!(
-                    "[agentctl watch-agents] messages to {agent} are held: {remaining} waiting, \
-                     the oldest for {minutes} min, and every attempt types nothing. Why: \
-                     {reason}. {hint}"
-                ),
-            ));
         }
+        // The coordinator, or about its own queue a --notice-fallback; never the held agent.
+        let general = format!(
+            "[agentctl watch-agents] messages to {agent} are held: {remaining} waiting, the \
+             oldest for {minutes} min, and every attempt types nothing. Why: {reason}. {hint}"
+        );
+        let route = notice_route(&agent, &held_now, options).map(str::to_owned);
+        if let Some(recipient) = &route {
+            recipients.push((recipient.clone(), general.clone()));
+        }
+        row["notice_to"] = json!(route.as_deref().unwrap_or("owner alarm"));
         row["remote_senders"] = json!(remote);
         if options.check_only {
             row["due"] = json!(true);
@@ -3375,6 +3547,14 @@ fn report_held_queues(
             match notifier.notify_urgent(recipient, text, &message_id) {
                 Ok(_) => told.push(recipient.clone()),
                 Err(error) => errors.push(json!({"to": recipient, "error": error.to_string()})),
+            }
+        }
+        if route.is_none() {
+            let alarm_id = format!("agent-watch-held-{agent}-{}", now as u64);
+            let (raised, outcome) = alarm_owner(notifier, &general, &alarm_id);
+            row["alarm"] = outcome;
+            if raised {
+                told.push("owner alarm".to_owned());
             }
         }
         // Told once a notice is queued, or when there is no one here to tell (only agent-teams
@@ -3434,7 +3614,8 @@ fn sweep_editor_drafts(
     options: &WatchAgentsOptions,
 ) -> Vec<Value> {
     let mut rows = Vec::new();
-    let coordinator = options.coordinator.clone();
+    // A draft blocks the pane it sits in, so no notice about it goes there (#844).
+    let no_jams = BTreeSet::new();
     for (agent, screen, harness) in screens {
         let Some(view) = crate::submission::composer_view(&harness, &screen) else {
             continue;
@@ -3495,8 +3676,10 @@ fn sweep_editor_drafts(
                 && !entry.blocked_reported
             {
                 entry.blocked_reported = true;
-                let _ = notifier.notify_urgent(
-                    &coordinator,
+                let _ = tell_about(
+                    notifier,
+                    &agent,
+                    &no_jams,
                     &format!(
                         "BLOCKED: {agent}'s composer holds unsubmitted text agentctl \
                          cannot attribute ({first_line:?}); deliveries to {agent} have \
@@ -3505,6 +3688,7 @@ fn sweep_editor_drafts(
                         age as u64
                     ),
                     &format!("draft-unattributed:{agent}:{fingerprint}"),
+                    options,
                 );
                 row["blocked"] = json!(true);
             }
@@ -3547,13 +3731,16 @@ fn sweep_editor_drafts(
         match notifier.flush_draft(&agent) {
             Ok(evidence) => {
                 state.draft_sweeps.remove(&agent);
-                let _ = notifier.notify_urgent(
-                    &coordinator,
+                let _ = tell_about(
+                    notifier,
+                    &agent,
+                    &no_jams,
                     &format!(
                         "agentctl watch flushed an unsent draft agentctl had typed into \
                          {agent}'s editor (idle sweep): {evidence}"
                     ),
                     &format!("draft-swept:{agent}:{}", prompt.id),
+                    options,
                 );
                 rows.push(json!({"agent": agent, "id": prompt.id, "draft": "ours",
                                  "action": "flushed", "detail": evidence}));
@@ -3585,14 +3772,17 @@ fn sweep_editor_drafts(
                     if let Some(entry) = state.draft_sweeps.get_mut(&agent) {
                         entry.blocked_reported = true;
                     }
-                    let _ = notifier.notify_urgent(
-                        &coordinator,
+                    let _ = tell_about(
+                        notifier,
+                        &agent,
+                        &no_jams,
                         &format!(
                             "BLOCKED: agentctl watch could not flush an unsent draft it \
                              typed into {agent}'s editor after {failures} tries: {error}. \
                              Press Enter in {agent}'s pane, or clear it if it is yours."
                         ),
                         &format!("draft-sweep-blocked:{agent}:{}", prompt.id),
+                        options,
                     );
                     row["blocked"] = json!(true);
                 }
@@ -3659,13 +3849,21 @@ fn report_quarantines(
              may have reached another pane, or no agent at all. {resend}"
         );
         let message_id = format!("agent-watch-quarantine-{:016x}", stable_hash(&key));
-        match notifier.notify_urgent(&options.coordinator, &text, &message_id) {
+        // A delivery to this pane just went astray, so the notice goes elsewhere (#844).
+        match tell_about(
+            notifier,
+            agent,
+            &BTreeSet::new(),
+            &text,
+            &message_id,
+            options,
+        ) {
             Ok(outcome) => {
                 state
                     .quarantines_reported
                     .insert(key, prompt.failed_at.max(since));
                 row["reported"] = json!(true);
-                row["outcome"] = json!(outcome);
+                row["outcome"] = outcome;
             }
             Err(error) => row["error"] = json!(error.to_string()),
         }
@@ -4765,6 +4963,8 @@ pub struct ManagedNotifier<'a, A: ManagedApi + ?Sized> {
     registry: PathBuf,
     /// The agent-teams state directory `agent-teams pump` runs against.
     teams_state: PathBuf,
+    /// The chat bridge state directory whose outbound helper posts owner alarms.
+    owner_alarm_bridge: Option<PathBuf>,
 }
 
 impl<'a, A: ManagedApi + ?Sized> ManagedNotifier<'a, A> {
@@ -4774,7 +4974,16 @@ impl<'a, A: ManagedApi + ?Sized> ManagedNotifier<'a, A> {
             client,
             registry: registry.to_owned(),
             teams_state: crate::subagents::agent_teams_state_dir(),
+            owner_alarm_bridge: None,
         }
+    }
+
+    /// Post owner alarms through the outbound helper of the chat bridge whose state directory
+    /// is `bridge` (#844 watch-notice-route); `None` leaves them logged only.
+    #[must_use]
+    pub fn with_owner_alarm_bridge(mut self, bridge: Option<PathBuf>) -> Self {
+        self.owner_alarm_bridge = bridge;
+        self
     }
 }
 
@@ -4824,6 +5033,29 @@ impl<A: ManagedApi + ?Sized> Notifier for ManagedNotifier<'_, A> {
             text,
             message_id,
         )
+    }
+
+    fn owner_alarm(&mut self, text: &str, alarm_id: &str) -> Result<String> {
+        let Some(bridge) = self.owner_alarm_bridge.as_deref() else {
+            return Err(fail(
+                "no owner alarm route: start the watcher with --owner-alarm-bridge DIR",
+            ));
+        };
+        let state = crate::chat_runtime::BridgeState::inspect(bridge)
+            .map_err(|error| fail(format!("cannot read the chat bridge state: {error}")))?;
+        let Some(channel) = state.config().channel_ids.first().cloned() else {
+            return Err(fail(
+                "the chat bridge has no channel to post the owner alarm to",
+            ));
+        };
+        let request_id = crate::chat_runtime::random_operation_uuid()
+            .map_err(|error| fail(error.to_string()))?;
+        let receipt = crate::chat_service::publish(bridge, &channel, None, &request_id, text, None)
+            .map_err(|error| fail(format!("owner alarm {alarm_id} not posted: {error}")))?;
+        Ok(format!(
+            "posted to {channel} as {}",
+            receipt["receipt"]["message_id"].as_str().unwrap_or("?")
+        ))
     }
 
     fn withdraw(&mut self, recipient: &str, message_id: &str) -> Result<String> {
@@ -4995,6 +5227,7 @@ mod tests {
             loop_hold: Duration::from_secs(600),
             step_history: crate::work_state::StepHistory::default(),
             queue_stale: Duration::from_secs(600),
+            notice_fallback: Vec::new(),
         }
     }
 
@@ -5106,6 +5339,28 @@ mod tests {
     }
 
     #[test]
+    fn a_held_coordinator_queue_is_told_to_its_fallback_and_no_alarm_is_raised() {
+        let mut options = options();
+        options.notice_fallback = vec!["liaison".to_owned()];
+        let mut state = WatchState::default();
+        let mut notifier = RecordingNotifier::default();
+        let mut probe = HeldProbe {
+            agent: "coordinator".to_owned(),
+            oldest_seconds: 660,
+            blocked: Some(UNREADABLE.to_owned()),
+            senders: vec![sender("01c", "cl-start", "agentctl")],
+        };
+        let report = watch_agents_once(&mut probe, &mut notifier, &mut state, 1_360.0, &options);
+        let row = &report["held"][0];
+        assert_eq!(row["told"], json!(["cl-start", "liaison"]), "{report}");
+        assert_eq!(row["notice_to"], "liaison");
+        assert!(notifier.alarms.is_empty());
+        assert!(notifier.sent.iter().all(|(to, _, _)| to != "coordinator"));
+        let (_, text, _) = &notifier.sent[1];
+        assert!(text.contains("messages to coordinator are held"), "{text}");
+    }
+
+    #[test]
     fn a_coordinator_queue_held_by_an_unreadable_composer_tells_its_local_senders_once() {
         let options = options();
         let mut state = WatchState::default();
@@ -5132,7 +5387,13 @@ mod tests {
         assert_eq!(report["ok"], false, "{report}");
         let row = &report["held"][0];
         assert_eq!(row["kind"], "composer-unreadable", "{report}");
-        assert_eq!(row["told"], json!(["cl-start", "mu-validate"]), "{report}");
+        // With no --notice-fallback, the owner alarm is raised too (#844 watch-notice-route).
+        assert_eq!(
+            row["told"],
+            json!(["cl-start", "mu-validate", "owner alarm"]),
+            "{report}"
+        );
+        assert_eq!(notifier.alarms.len(), 1);
         assert_eq!(
             row["remote_senders"],
             json!(["agent-utils@lead-host"]),
@@ -5257,7 +5518,9 @@ mod tests {
 
     #[test]
     fn a_long_wait_for_an_agents_lock_is_reported_once_per_jam_as_urgent() {
-        let options = options();
+        let mut options = options();
+        // The jam is the coordinator's own lock, so its fallback is told (#844).
+        options.notice_fallback = vec!["liaison".to_owned()];
         let mut state = WatchState::default();
         let mut notifier = RecordingNotifier::default();
         // 5 min (under the 10 min threshold), 11 min, 12 min, then another sender at the head
@@ -5273,7 +5536,7 @@ mod tests {
         assert_eq!(report["delivery_waits"][0]["reported"], true);
         assert_eq!(notifier.sent.len(), 1);
         let (to, text, id) = &notifier.sent[0];
-        assert_eq!(to, "coordinator");
+        assert_eq!(to, "liaison");
         assert!(
             text.contains("deliveries to coordinator are waiting"),
             "{text}"
@@ -5561,12 +5824,14 @@ mod tests {
         let report = watch_agents_once(&mut probe, &mut notifier, &mut state, 3_000.0, &options);
         assert_eq!(report["owner_waits"][0]["stuck"], false);
         assert!(notifier.sent.is_empty());
-        // The coordinator's own queue: told once per episode, since the notice waits there too.
+        // The coordinator's own queue, with no fallback: never queued there; one owner alarm
+        // per episode (#844 watch-notice-route).
         probe.waiting = vec![waiting("coordinator", "chat-b", 0.0, "a draft is there")];
         watch_agents_once(&mut probe, &mut notifier, &mut state, 3_000.0, &options);
         watch_agents_once(&mut probe, &mut notifier, &mut state, 3_400.0, &options);
         watch_agents_once(&mut probe, &mut notifier, &mut state, 9_000.0, &options);
-        assert_eq!(notifier.sent.len(), 1, "{:?}", notifier.sent);
+        assert!(notifier.sent.is_empty(), "{:?}", notifier.sent);
+        assert_eq!(notifier.alarms.len(), 1, "{:?}", notifier.alarms);
         probe.waiting.clear();
         watch_agents_once(&mut probe, &mut notifier, &mut state, 9_100.0, &options);
         probe.waiting = vec![waiting(
@@ -5576,7 +5841,211 @@ mod tests {
             "a draft is there",
         )];
         watch_agents_once(&mut probe, &mut notifier, &mut state, 9_500.0, &options);
-        assert_eq!(notifier.sent.len(), 2, "a new episode is told again");
+        assert_eq!(notifier.alarms.len(), 2, "a new episode is alarmed again");
+        assert!(notifier.sent.is_empty());
+    }
+
+    // ---- #844 watch-notice-route: one notice per episode, never into the stuck queue --------
+
+    /// Run passes every minute from `from` to `to` (Unix seconds, inclusive).
+    fn minute_passes(
+        probe: &mut DeliveryProbe,
+        notifier: &mut RecordingNotifier,
+        state: &mut WatchState,
+        options: &WatchAgentsOptions,
+        from: f64,
+        to: f64,
+    ) {
+        let mut now = from;
+        while now <= to {
+            watch_agents_once(probe, notifier, state, now, options);
+            now += 60.0;
+        }
+    }
+
+    #[test]
+    fn a_two_hour_stuck_coordinator_leaves_one_live_notice_with_its_fallback() {
+        let mut options = options();
+        options.notice_fallback = vec!["coordinator".to_owned(), "liaison".to_owned()];
+        let mut state = WatchState::default();
+        let mut notifier = RecordingNotifier::default();
+        let mut probe = DeliveryProbe {
+            waiting: vec![waiting("coordinator", "chat-a", 0.0, "a draft is there")],
+            ..DeliveryProbe::default()
+        };
+        minute_passes(
+            &mut probe,
+            &mut notifier,
+            &mut state,
+            &options,
+            0.0,
+            7_200.0,
+        );
+        assert!(
+            notifier.sent.len() >= 2,
+            "repeats replace: {:?}",
+            notifier.sent
+        );
+        assert!(
+            notifier.sent.iter().all(|(to, _, _)| to == "liaison"),
+            "never the stuck coordinator's own queue: {:?}",
+            notifier.sent
+        );
+        assert_eq!(notifier.live(), BTreeMap::from([("liaison".to_owned(), 1)]));
+        assert!(notifier.alarms.is_empty());
+        let report = watch_agents_once(&mut probe, &mut notifier, &mut state, 7_260.0, &options);
+        assert_eq!(report["owner_waits"][0]["notice_to"], "liaison");
+    }
+
+    #[test]
+    fn with_no_route_a_two_hour_episode_raises_one_owner_alarm_and_queues_nothing() {
+        let options = options();
+        let mut state = WatchState::default();
+        let mut notifier = RecordingNotifier::default();
+        let mut probe = DeliveryProbe {
+            waiting: vec![waiting("coordinator", "chat-a", 0.0, "a draft is there")],
+            ..DeliveryProbe::default()
+        };
+        minute_passes(
+            &mut probe,
+            &mut notifier,
+            &mut state,
+            &options,
+            0.0,
+            7_200.0,
+        );
+        assert!(notifier.sent.is_empty(), "{:?}", notifier.sent);
+        assert_eq!(notifier.alarms.len(), 1, "{:?}", notifier.alarms);
+        let (_, text) = &notifier.alarms[0];
+        assert!(
+            text.contains("the owner's chat messages to coordinator"),
+            "{text}"
+        );
+        assert!(text.contains("the only alarm while it lasts"), "{text}");
+    }
+
+    #[test]
+    fn a_failed_owner_alarm_is_retried_on_the_backoff_then_never_repeated() {
+        let options = options();
+        let mut state = WatchState::default();
+        let mut notifier = RecordingNotifier {
+            alarm_fails: true,
+            ..RecordingNotifier::default()
+        };
+        let mut probe = DeliveryProbe {
+            waiting: vec![waiting("coordinator", "chat-a", 0.0, "a draft is there")],
+            ..DeliveryProbe::default()
+        };
+        minute_passes(&mut probe, &mut notifier, &mut state, &options, 0.0, 400.0);
+        assert!(notifier.alarms.is_empty());
+        notifier.alarm_fails = false;
+        minute_passes(
+            &mut probe,
+            &mut notifier,
+            &mut state,
+            &options,
+            420.0,
+            7_200.0,
+        );
+        assert_eq!(notifier.alarms.len(), 1, "{:?}", notifier.alarms);
+        assert!(notifier.sent.is_empty());
+    }
+
+    #[test]
+    fn a_lane_stuck_beside_a_stuck_coordinator_is_told_elsewhere() {
+        let mut options = options();
+        options.notice_fallback = vec!["liaison".to_owned()];
+        let mut state = WatchState::default();
+        let mut notifier = RecordingNotifier::default();
+        let mut probe = DeliveryProbe {
+            waiting: vec![
+                waiting("coordinator", "chat-a", 0.0, "a draft is there"),
+                waiting("lane", "chat-b", 0.0, "a draft is there"),
+            ],
+            ..DeliveryProbe::default()
+        };
+        watch_agents_once(&mut probe, &mut notifier, &mut state, 600.0, &options);
+        let recipients: Vec<&str> = notifier.sent.iter().map(|(to, _, _)| to.as_str()).collect();
+        assert_eq!(recipients, ["liaison", "liaison"], "{:?}", notifier.sent);
+        // The fallback stuck too: no agent is left, so each episode raises its one alarm.
+        let mut state = WatchState::default();
+        let mut notifier = RecordingNotifier::default();
+        probe
+            .waiting
+            .push(waiting("liaison", "chat-c", 0.0, "a draft is there"));
+        watch_agents_once(&mut probe, &mut notifier, &mut state, 600.0, &options);
+        assert!(notifier.sent.is_empty(), "{:?}", notifier.sent);
+        assert_eq!(notifier.alarms.len(), 3);
+    }
+
+    #[test]
+    fn a_repeat_never_queues_beside_a_copy_still_being_typed() {
+        let options = options();
+        let mut state = WatchState::default();
+        let mut notifier = RecordingNotifier {
+            withdraw_outcome: Some("inflight".to_owned()),
+            ..RecordingNotifier::default()
+        };
+        let mut probe = DeliveryProbe {
+            waiting: vec![waiting("lane", "chat-a", 0.0, "a draft is there")],
+            ..DeliveryProbe::default()
+        };
+        minute_passes(
+            &mut probe,
+            &mut notifier,
+            &mut state,
+            &options,
+            0.0,
+            7_200.0,
+        );
+        assert_eq!(notifier.sent.len(), 1, "{:?}", notifier.sent);
+        assert_eq!(notifier.sent[0].0, "coordinator");
+        let report = watch_agents_once(&mut probe, &mut notifier, &mut state, 7_260.0, &options);
+        assert_eq!(report["owner_waits"][0]["held_back"]["outcome"], "inflight");
+        // Once the copy is out of the way, the repeat replaces it.
+        notifier.withdraw_outcome = None;
+        watch_agents_once(&mut probe, &mut notifier, &mut state, 7_320.0, &options);
+        assert_eq!(notifier.sent.len(), 2);
+        assert_eq!(
+            notifier.live(),
+            BTreeMap::from([("coordinator".to_owned(), 1)])
+        );
+    }
+
+    #[test]
+    fn an_ended_episode_withdraws_its_live_notice() {
+        let options = options();
+        let mut state = WatchState::default();
+        let mut notifier = RecordingNotifier::default();
+        let mut probe = DeliveryProbe {
+            waiting: vec![waiting("lane", "chat-a", 0.0, "a draft is there")],
+            ..DeliveryProbe::default()
+        };
+        watch_agents_once(&mut probe, &mut notifier, &mut state, 600.0, &options);
+        assert_eq!(
+            notifier.live(),
+            BTreeMap::from([("coordinator".to_owned(), 1)])
+        );
+        probe.waiting.clear();
+        watch_agents_once(&mut probe, &mut notifier, &mut state, 660.0, &options);
+        assert!(notifier.live().is_empty(), "{:?}", notifier.withdrawn);
+        assert!(state.owner_stuck_backoff.is_empty());
+    }
+
+    #[test]
+    fn notice_routes_skip_the_subject_and_jammed_agents() {
+        let mut options = options();
+        options.notice_fallback = vec!["second".to_owned(), "third".to_owned()];
+        let none = BTreeSet::new();
+        assert_eq!(notice_route("lane", &none, &options), Some("coordinator"));
+        assert_eq!(notice_route("coordinator", &none, &options), Some("second"));
+        let jammed = BTreeSet::from(["second".to_owned()]);
+        assert_eq!(
+            notice_route("coordinator", &jammed, &options),
+            Some("third")
+        );
+        options.notice_fallback.clear();
+        assert_eq!(notice_route("coordinator", &none, &options), None);
     }
 
     #[test]
@@ -5655,13 +6124,50 @@ mod tests {
         flush_fails: bool,
         /// Notices withdrawn so a newer one replaces them, as (recipient, message ID) (#840).
         withdrawn: Vec<(String, String)>,
+        /// The outcome every withdrawal reports (default `set_aside`) (#844).
+        withdraw_outcome: Option<String>,
+        /// Owner alarms raised, as (alarm ID, text) (#844).
+        alarms: Vec<(String, String)>,
+        /// Whether raising an owner alarm fails, as with no route configured (#844).
+        alarm_fails: bool,
+    }
+
+    impl RecordingNotifier {
+        /// Notices queued and not withdrawn since, per recipient: what still waits (#844).
+        fn live(&self) -> BTreeMap<String, usize> {
+            let mut live = BTreeMap::new();
+            for (to, _, id) in &self.sent {
+                if !self
+                    .withdrawn
+                    .iter()
+                    .any(|(at, gone)| at == to && gone == id)
+                {
+                    *live.entry(to.clone()).or_default() += 1;
+                }
+            }
+            live
+        }
     }
 
     impl Notifier for RecordingNotifier {
         fn withdraw(&mut self, recipient: &str, message_id: &str) -> Result<String> {
-            self.withdrawn
-                .push((recipient.to_owned(), message_id.to_owned()));
-            Ok("set_aside".to_owned())
+            let outcome = self
+                .withdraw_outcome
+                .clone()
+                .unwrap_or_else(|| "set_aside".to_owned());
+            if outcome != "inflight" {
+                self.withdrawn
+                    .push((recipient.to_owned(), message_id.to_owned()));
+            }
+            Ok(outcome)
+        }
+
+        fn owner_alarm(&mut self, text: &str, alarm_id: &str) -> Result<String> {
+            if self.alarm_fails {
+                return Err(fail("no owner alarm route"));
+            }
+            self.alarms.push((alarm_id.to_owned(), text.to_owned()));
+            Ok("posted to the owner's chat".to_owned())
         }
 
         fn flush_draft(&mut self, agent: &str) -> Result<String> {
