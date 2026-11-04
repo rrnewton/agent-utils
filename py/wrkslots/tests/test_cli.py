@@ -14,7 +14,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Sequence
+from typing import Sequence, cast
 
 import pytest
 from wrkslots import cli, imagecmd, sandbox, slotimage
@@ -1196,8 +1196,9 @@ def test_in_scope_print_reports_the_private_binds_the_entry_will_create(
     assert _bind_targets(sandbox.writable_set(actual_view)) == [
         str(_home / "nested" / "cache"), str(target)
     ]
+    writable = cast(dict[str, object], planned["writable"])
     assert nested in [
-        item["source"] for item in planned["writable"]["binds"]  # type: ignore[index]
+        item["source"] for item in cast(list[dict[str, object]], writable["binds"])
     ]
 
 
@@ -1351,11 +1352,11 @@ def test_isolated_policy_reports_its_masks_and_the_entry_carries_them(
     # The default spec is unchanged: no policy keys, the configured masks only.
     assert "git_config_masks" not in inherited["view"] and "git_config_policy" not in inherited["view"]  # type: ignore[operator]
     assert inherited["masks"] == {
-        "masks": inherited["view"]["masks"],  # type: ignore[index]
+        "masks": cast(dict[str, object], inherited["view"])["masks"],
         "git_config_policy": "inherit",
         "git_config_masks": [],
     }
-    base = list(inherited["masks"]["masks"])  # type: ignore[index]
+    base = list(cast(list[object], cast(dict[str, object], inherited["masks"])["masks"]))
     assert str(home / ".ssh") in base and str(home / ".gitconfig") not in base
     # Isolated: the same list, then each fixed Git location once, in order.
     assert isolated["masks"] == {

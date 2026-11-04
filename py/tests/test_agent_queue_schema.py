@@ -49,7 +49,7 @@ def validate(instance: object, schema: dict[str, object], root: dict[str, object
     expected = schema.get("type")
     if expected is not None:
         types = expected if isinstance(expected, list) else [expected]
-        if not any(_TYPE_CHECKS[t](instance) for t in types):
+        if not any(_TYPE_CHECKS[t](instance) for t in cast(list[str], types)):
             return [f"{instance!r} is not of type {expected}"]
     if isinstance(instance, str) and "minLength" in schema:
         if len(instance) < cast(int, schema["minLength"]):
